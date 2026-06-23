@@ -266,6 +266,33 @@ async fn jesse(
 
 // ---- Startup --------------------------------------------------------------
 
+/// Percent-encode a query-parameter value, keeping only RFC 3986 unreserved
+/// characters literal. Host/port/token are simple today, but encoding keeps the
+/// payload well-formed for whatever a future advertise-host might contain.
+fn percent_encode(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for b in value.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char)
+            }
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
+}
+
+/// Build the `jesse://pair?…` payload the app scans. MUST match the app's
+/// `JesseConfig.fromPairing` parser exactly.
+fn pairing_payload(host: &str, port: u16, token: &str) -> String {
+    format!(
+        "jesse://pair?host={}&port={}&token={}",
+        percent_encode(host),
+        port,
+        percent_encode(token)
+    )
+}
+
 fn binary_exists(bin: &str) -> bool {
     let p = Path::new(bin);
     if p.is_absolute() || bin.contains('/') {
@@ -309,6 +336,25 @@ async fn main() {
 
     let addr = format!("{}:{}", cfg.bind, cfg.port);
     let state = Arc::new(cfg);
+
+    // Pairing QR — scan it from the app's Settings to fill in host/port/token.
+    // The advertised host defaults to the bound IP (reliably reachable on the
+    // tailnet; the ts.net name has DNS quirks per STATUS.md). Override with
+    // JESSE_ADVERTISE_HOST to force the MagicDNS name into the QR instead.
+    let advertise_host =
+        std::env::var("JESSE_ADVERTISE_HOST").unwrap_or_else(|_| state.bind.clone());
+    let payload = pairing_payload(&advertise_host, state.port, &state.token);
+    let code = qrcode::QrCode::new(payload.as_bytes()).expect("qr encode");
+    let art = code
+        .render::<qrcode::render::unicode::Dense1x2>()
+        .quiet_zone(true)
+        .build();
+    println!("{art}");
+    println!("Pair by scanning the QR above, or enter manually:");
+    println!(
+        "  host={advertise_host}  port={}  token={}",
+        state.port, state.token
+    );
 
     println!("Jesse Bridge → http://{addr}  (vault: {})", state.vault);
     let listener = tokio::net::TcpListener::bind(&addr)
@@ -427,6 +473,22 @@ mod tests {
             Some(p) => std::env::set_var("PATH", p),
             None => std::env::remove_var("PATH"),
         }
+    }
+
+    // ---- pairing payload --------------------------------------------------
+
+    #[test]
+    fn pairing_payload_matches_app_format() {
+        let p = pairing_payload("100.64.0.1", 8765, "deadbeef");
+        assert_eq!(p, "jesse://pair?host=100.64.0.1&port=8765&token=deadbeef");
+    }
+
+    #[test]
+    fn pairing_payload_percent_encodes_reserved() {
+        // A host with a reserved char must be escaped, not left raw.
+        let p = pairing_payload("a b/c", 80, "t&k");
+        assert!(p.contains("host=a%20b%2Fc"));
+        assert!(p.contains("token=t%26k"));
     }
 
     // ---- Config::from_env -------------------------------------------------

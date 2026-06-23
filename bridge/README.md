@@ -21,6 +21,28 @@ export JESSE_BIND="$(tailscale ip -4 | head -1)"   # or 127.0.0.1 for local test
 cargo run --release
 ```
 
+On startup the bridge prints a **pairing QR** plus a plaintext fallback line:
+
+```
+█▀▀▀▀▀█  …  █▀▀▀▀▀█
+…  (terminal QR)  …
+Pair by scanning the QR above, or enter manually:
+  host=100.64.0.1  port=8765  token=<token>
+```
+
+Open the app's **Settings → Scan to pair**, scan that QR, and host/port/token
+fill in automatically — no more typing the token by hand on every restart. The
+QR encodes `jesse://pair?host=…&port=…&token=…`. Manual entry of the printed
+values still works as a fallback.
+
+The advertised host defaults to `JESSE_BIND` (the tailnet IP, which is reliably
+reachable; the `ts.net` name has DNS quirks — see `STATUS.md`). To put the
+MagicDNS hostname in the QR instead, set `JESSE_ADVERTISE_HOST`:
+
+```bash
+export JESSE_ADVERTISE_HOST="build-host.tailnet.ts.net"
+```
+
 A clean `cargo build --release` is the gate — if it doesn't compile, it isn't done.
 
 ## Test from the laptop
@@ -80,6 +102,7 @@ curl -s http://127.0.0.1:8765/jesse \
 | `JESSE_TOKEN` | (required) | Bearer token the phone must send |
 | `JESSE_VAULT` | `~/devel/tag1/jesse` | cwd for `claude -p` (loads CLAUDE.md) |
 | `JESSE_BIND` | `127.0.0.1` | Interface to bind — set to tailnet IP |
+| `JESSE_ADVERTISE_HOST` | value of `JESSE_BIND` | Host written into the pairing QR — set to the MagicDNS `ts.net` name to advertise that instead of the bound IP |
 | `JESSE_PORT` | `8765` | Port |
 | `JESSE_TIMEOUT` | `1800` | Hard ceiling per request (seconds). `0` = unlimited (no timeout — rely on the client's Cancel button) |
 | `JESSE_CLAUDE_BIN` | `claude` | Path to the `claude` binary |
