@@ -277,6 +277,16 @@ fn binary_exists(bin: &str) -> bool {
     false
 }
 
+/// Build the axum router with its shared state. Kept separate from `main` so
+/// tests can drive the same routes via `tower::ServiceExt::oneshot` without
+/// binding a socket. The running server uses exactly this router.
+fn app(state: Arc<Config>) -> Router {
+    Router::new()
+        .route("/health", get(health))
+        .route("/jesse", post(jesse))
+        .with_state(state)
+}
+
 #[tokio::main]
 async fn main() {
     let cfg = Config::from_env();
@@ -300,14 +310,239 @@ async fn main() {
     let addr = format!("{}:{}", cfg.bind, cfg.port);
     let state = Arc::new(cfg);
 
-    let app = Router::new()
-        .route("/health", get(health))
-        .route("/jesse", post(jesse))
-        .with_state(state.clone());
-
     println!("Jesse Bridge → http://{addr}  (vault: {})", state.vault);
     let listener = tokio::net::TcpListener::bind(&addr)
         .await
         .expect("bind failed");
-    axum::serve(listener, app).await.expect("server error");
+    axum::serve(listener, app(state)).await.expect("server error");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::body::{to_bytes, Body};
+    use axum::http::Request;
+    use std::sync::Mutex;
+    use tower::ServiceExt; // for `oneshot`
+
+    // Several tests mutate process-global env (PATH) or read defaults from it.
+    // The default test runner is multi-threaded, so serialize those behind a
+    // lock to keep them from racing each other.
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    fn header_map(auth: Option<&str>) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        if let Some(v) = auth {
+            h.insert("authorization", v.parse().unwrap());
+        }
+        h
+    }
+
+    // ---- check_auth -------------------------------------------------------
+
+    #[test]
+    fn check_auth_empty_token_is_500() {
+        let err = check_auth(&header_map(Some("Bearer anything")), "").unwrap_err();
+        assert_eq!(err.0, StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    #[test]
+    fn check_auth_matching_bearer_ok() {
+        assert!(check_auth(&header_map(Some("Bearer s3cret")), "s3cret").is_ok());
+    }
+
+    #[test]
+    fn check_auth_wrong_token_is_401() {
+        let err = check_auth(&header_map(Some("Bearer nope")), "s3cret").unwrap_err();
+        assert_eq!(err.0, StatusCode::UNAUTHORIZED);
+    }
+
+    #[test]
+    fn check_auth_missing_header_is_401() {
+        let err = check_auth(&header_map(None), "s3cret").unwrap_err();
+        assert_eq!(err.0, StatusCode::UNAUTHORIZED);
+    }
+
+    #[test]
+    fn check_auth_token_without_bearer_prefix_is_401() {
+        // Correct token value but no "Bearer " prefix → still rejected.
+        let err = check_auth(&header_map(Some("s3cret")), "s3cret").unwrap_err();
+        assert_eq!(err.0, StatusCode::UNAUTHORIZED);
+    }
+
+    // ---- build_prompt -----------------------------------------------------
+
+    #[test]
+    fn build_prompt_ask_fresh_wraps_with_ask_preamble() {
+        let p = build_prompt("ask", "what is on Today.md", false, false).unwrap();
+        assert!(p.starts_with(ASK_PREAMBLE));
+        assert!(p.ends_with("what is on Today.md"));
+        assert!(!p.contains(VOICE_SUFFIX));
+    }
+
+    #[test]
+    fn build_prompt_ask_followup_uses_followup_preamble() {
+        let p = build_prompt("ask", "and the second?", true, false).unwrap();
+        assert!(p.starts_with(ASK_FOLLOWUP));
+        assert!(p.ends_with("and the second?"));
+    }
+
+    #[test]
+    fn build_prompt_tell_fresh_and_followup() {
+        let fresh = build_prompt("tell", "remember this", false, false).unwrap();
+        assert!(fresh.starts_with(TELL_PREAMBLE));
+        let followup = build_prompt("tell", "also this", true, false).unwrap();
+        assert!(followup.starts_with(TELL_FOLLOWUP));
+    }
+
+    #[test]
+    fn build_prompt_unknown_mode_is_400() {
+        let err = build_prompt("shout", "hey", false, false).unwrap_err();
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn build_prompt_voice_appends_suffix() {
+        let with_voice = build_prompt("ask", "q", false, true).unwrap();
+        assert!(with_voice.ends_with(VOICE_SUFFIX));
+        let without = build_prompt("ask", "q", false, false).unwrap();
+        assert!(!without.contains(VOICE_SUFFIX));
+    }
+
+    // ---- binary_exists ----------------------------------------------------
+
+    #[test]
+    fn binary_exists_absolute_path() {
+        assert!(binary_exists("/bin/sh"));
+        assert!(!binary_exists("/no/such/bin"));
+    }
+
+    #[test]
+    fn binary_exists_searches_path() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let saved = std::env::var("PATH").ok();
+        std::env::set_var("PATH", "/bin");
+        assert!(binary_exists("sh"));
+        match saved {
+            Some(p) => std::env::set_var("PATH", p),
+            None => std::env::remove_var("PATH"),
+        }
+    }
+
+    // ---- Config::from_env -------------------------------------------------
+
+    #[test]
+    fn config_from_env_defaults() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let saved: Vec<(&str, Option<String>)> = [
+            "JESSE_TOKEN",
+            "JESSE_VAULT",
+            "JESSE_BIND",
+            "JESSE_PORT",
+            "JESSE_CLAUDE_BIN",
+            "JESSE_TIMEOUT",
+        ]
+        .iter()
+        .map(|k| (*k, std::env::var(k).ok()))
+        .collect();
+        for (k, _) in &saved {
+            std::env::remove_var(k);
+        }
+
+        let cfg = Config::from_env();
+        assert_eq!(cfg.token, "");
+        assert_eq!(cfg.bind, "127.0.0.1");
+        assert_eq!(cfg.port, 8765);
+        assert_eq!(cfg.claude_bin, "claude");
+        assert_eq!(cfg.timeout_secs, 1800);
+
+        for (k, v) in saved {
+            match v {
+                Some(val) => std::env::set_var(k, val),
+                None => std::env::remove_var(k),
+            }
+        }
+    }
+
+    // ---- integration via app() router ------------------------------------
+
+    fn test_config() -> Arc<Config> {
+        Arc::new(Config {
+            token: "test-token".to_string(),
+            // Any existing directory works — these tests never reach run_claude.
+            vault: std::env::temp_dir().to_string_lossy().into_owned(),
+            bind: "127.0.0.1".to_string(),
+            port: 8765,
+            claude_bin: "claude".to_string(),
+            timeout_secs: 1800,
+        })
+    }
+
+    async fn body_string(resp: axum::response::Response) -> String {
+        let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        String::from_utf8(bytes.to_vec()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn health_returns_config() {
+        let cfg = test_config();
+        let resp = app(cfg.clone())
+            .oneshot(
+                Request::builder()
+                    .uri("/health")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_string(resp).await;
+        assert!(body.contains(&cfg.vault));
+        assert!(body.contains(&cfg.claude_bin));
+    }
+
+    fn jesse_request(auth: Option<&str>, json: &str) -> Request<Body> {
+        let mut b = Request::builder()
+            .method("POST")
+            .uri("/jesse")
+            .header("content-type", "application/json");
+        if let Some(a) = auth {
+            b = b.header("authorization", a);
+        }
+        b.body(Body::from(json.to_string())).unwrap()
+    }
+
+    #[tokio::test]
+    async fn jesse_no_auth_is_401() {
+        let resp = app(test_config())
+            .oneshot(jesse_request(None, r#"{"mode":"ask","text":"hi"}"#))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn jesse_wrong_token_is_401() {
+        let resp = app(test_config())
+            .oneshot(jesse_request(
+                Some("Bearer wrong"),
+                r#"{"mode":"ask","text":"hi"}"#,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn jesse_bad_mode_is_400() {
+        // Correct token, but build_prompt rejects the mode before run_claude.
+        let resp = app(test_config())
+            .oneshot(jesse_request(
+                Some("Bearer test-token"),
+                r#"{"mode":"shout","text":"hi"}"#,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
 }
