@@ -159,86 +159,175 @@ fn build_prompt(mode: &str, text: &str, is_followup: bool, voice: bool) -> Resul
     Ok(p)
 }
 
+/// What one `claude -p --output-format json` run amounts to — decided from its
+/// output rather than its exit status alone (see `interpret_claude_output`).
+#[derive(Debug)]
+enum ClaudeOutcome {
+    Ok {
+        result: String,
+        session_id: Option<String>,
+    },
+    /// Transient upstream failure (5xx / 429 / 529) — worth retrying.
+    Retryable { message: String, status: u64 },
+    /// Non-retryable failure — surface the message as-is.
+    Fatal { message: String },
+}
+
+/// Truncate to `n` chars without splitting a multibyte boundary.
+fn truncate_chars(s: &str, n: usize) -> String {
+    s.chars().take(n).collect()
+}
+
+/// Interpret one `claude -p --output-format json` run. `claude` can exit
+/// non-zero while still writing a JSON envelope whose `is_error` /
+/// `api_error_status` carry the real cause (e.g. a transient upstream 500), so
+/// parse stdout regardless of exit status and key off that — falling back to
+/// exit status + stderr only when stdout isn't JSON.
+fn interpret_claude_output(stdout: &str, stderr: &str, exit_success: bool) -> ClaudeOutcome {
+    if let Ok(v) = serde_json::from_str::<Value>(stdout) {
+        let is_error = v.get("is_error").and_then(|e| e.as_bool()).unwrap_or(false);
+        if is_error {
+            let status = v.get("api_error_status").and_then(|s| s.as_u64());
+            // `result` holds the human-readable cause; synthesize one if absent.
+            let message = v
+                .get("result")
+                .and_then(|r| r.as_str())
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| match status {
+                    Some(code) => format!("claude API error (status {code})"),
+                    None => "claude reported an error with no detail".to_string(),
+                });
+            return match status {
+                // 5xx and 429 are transient upstream conditions (529 is >= 500).
+                Some(code) if code >= 500 || code == 429 => {
+                    ClaudeOutcome::Retryable { message, status: code }
+                }
+                _ => ClaudeOutcome::Fatal { message },
+            };
+        }
+        // Success envelope — same extraction the bridge has always done.
+        let result = v
+            .get("result")
+            .and_then(|r| r.as_str())
+            .unwrap_or(stdout)
+            .trim()
+            .to_string();
+        let session_id = v
+            .get("session_id")
+            .and_then(|s| s.as_str())
+            .map(|s| s.to_string());
+        return ClaudeOutcome::Ok { result, session_id };
+    }
+
+    // stdout wasn't JSON. On a clean exit, treat it as the raw answer (the
+    // bridge's long-standing fallback). On a failure, surface stderr AND stdout
+    // so a non-JSON failure is never reported blank again.
+    if exit_success {
+        ClaudeOutcome::Ok {
+            result: stdout.trim().to_string(),
+            session_id: None,
+        }
+    } else {
+        let err = truncate_chars(stderr.trim(), 500);
+        let out = truncate_chars(stdout.trim(), 500);
+        ClaudeOutcome::Fatal {
+            message: format!("claude failed (no JSON envelope) — stderr: {err} | stdout: {out}"),
+        }
+    }
+}
+
 /// Invoke headless Claude Code in the vault. Returns (reply_text, session_id).
 /// Pass session_id to continue a thread; the returned id is always captured so
 /// the client can follow up later. Resuming keeps CLAUDE.md loaded and retains
 /// filesystem access — it only adds the prior conversation on top.
+///
+/// Retries transient upstream failures (5xx/429/529) up to 3 attempts total.
+/// A retry re-runs the WHOLE prompt: a transient that lands *mid-Tell* (after an
+/// action was already applied) could in principle double-apply it on the rerun.
+/// Accepted, because the observed transient fails at the API before any work
+/// (0 tokens, $0) — there is nothing to repeat — but the tradeoff is explicit
+/// here in case that ever changes. Only `Retryable` outcomes retry; spawn/io/
+/// timeout failures (which happen before any output exists) do not.
 async fn run_claude(
     cfg: &Config,
     prompt: &str,
     session_id: Option<&str>,
 ) -> Result<(String, Option<String>), ApiError> {
-    let mut cmd = Command::new(&cfg.claude_bin);
-    cmd.arg("-p")
-        .arg(prompt)
-        .arg("--output-format")
-        .arg("json")
-        // Non-interactive: let edits/tools through without a TTY prompt.
-        // PoC-only on a trusted tailnet. Tighten with --allowedTools later.
-        .arg("--permission-mode")
-        .arg("acceptEdits")
-        .current_dir(&cfg.vault) // cwd = vault → CLAUDE.md auto-loads
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true); // killed if the timeout below fires
+    const MAX_ATTEMPTS: u32 = 3; // 1 try + 2 retries
 
-    if let Some(sid) = session_id {
-        cmd.arg("--resume").arg(sid);
-    }
+    for attempt in 1..=MAX_ATTEMPTS {
+        // Fresh Command per attempt — same args, including --resume if present.
+        let mut cmd = Command::new(&cfg.claude_bin);
+        cmd.arg("-p")
+            .arg(prompt)
+            .arg("--output-format")
+            .arg("json")
+            // Non-interactive: let edits/tools through without a TTY prompt.
+            // PoC-only on a trusted tailnet. Tighten with --allowedTools later.
+            .arg("--permission-mode")
+            .arg("acceptEdits")
+            .current_dir(&cfg.vault) // cwd = vault → CLAUDE.md auto-loads
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true); // killed if the timeout below fires
 
-    let child = cmd.spawn().map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("failed to spawn {}: {e}", cfg.claude_bin),
-        )
-    })?;
-
-    let output = if cfg.timeout_secs == 0 {
-        // Unlimited: some agent runs legitimately exceed any fixed cap.
-        // kill_on_drop still reaps the child if this future is dropped.
-        match child.wait_with_output().await {
-            Ok(o) => o,
-            Err(e) => return Err((StatusCode::BAD_GATEWAY, format!("claude io error: {e}"))),
+        if let Some(sid) = session_id {
+            cmd.arg("--resume").arg(sid);
         }
-    } else {
-        match timeout(Duration::from_secs(cfg.timeout_secs), child.wait_with_output()).await {
-            Ok(Ok(o)) => o,
-            Ok(Err(e)) => return Err((StatusCode::BAD_GATEWAY, format!("claude io error: {e}"))),
-            Err(_) => {
-                return Err((
-                    StatusCode::GATEWAY_TIMEOUT,
-                    format!("Jesse timed out after {}s", cfg.timeout_secs),
-                ))
+
+        let child = cmd.spawn().map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("failed to spawn {}: {e}", cfg.claude_bin),
+            )
+        })?;
+
+        let output = if cfg.timeout_secs == 0 {
+            // Unlimited: some agent runs legitimately exceed any fixed cap.
+            // kill_on_drop still reaps the child if this future is dropped.
+            match child.wait_with_output().await {
+                Ok(o) => o,
+                Err(e) => return Err((StatusCode::BAD_GATEWAY, format!("claude io error: {e}"))),
+            }
+        } else {
+            match timeout(Duration::from_secs(cfg.timeout_secs), child.wait_with_output()).await {
+                Ok(Ok(o)) => o,
+                Ok(Err(e)) => {
+                    return Err((StatusCode::BAD_GATEWAY, format!("claude io error: {e}")))
+                }
+                Err(_) => {
+                    return Err((
+                        StatusCode::GATEWAY_TIMEOUT,
+                        format!("Jesse timed out after {}s", cfg.timeout_secs),
+                    ))
+                }
+            }
+        };
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        match interpret_claude_output(&stdout, &stderr, output.status.success()) {
+            ClaudeOutcome::Ok { result, session_id } => return Ok((result, session_id)),
+            ClaudeOutcome::Fatal { message } => return Err((StatusCode::BAD_GATEWAY, message)),
+            ClaudeOutcome::Retryable { message, status } => {
+                if attempt < MAX_ATTEMPTS {
+                    eprintln!(
+                        "claude transient failure (status {status}, attempt \
+                         {attempt}/{MAX_ATTEMPTS}): {message} — retrying"
+                    );
+                    // Short linear backoff: 1s after attempt 1, 2s after attempt 2.
+                    tokio::time::sleep(Duration::from_secs(attempt as u64)).await;
+                    continue;
+                }
+                // Out of attempts — surface the real upstream message.
+                return Err((StatusCode::BAD_GATEWAY, message));
             }
         }
-    };
-
-    if !output.status.success() {
-        let err: String = String::from_utf8_lossy(&output.stderr)
-            .chars()
-            .take(500)
-            .collect();
-        return Err((StatusCode::BAD_GATEWAY, format!("claude failed: {err}")));
     }
 
-    // `--output-format json` returns a JSON envelope with `result` + `session_id`.
-    let out = String::from_utf8_lossy(&output.stdout);
-    match serde_json::from_str::<Value>(&out) {
-        Ok(v) => {
-            let result = v
-                .get("result")
-                .and_then(|r| r.as_str())
-                .unwrap_or(&out)
-                .trim()
-                .to_string();
-            let sid = v
-                .get("session_id")
-                .and_then(|s| s.as_str())
-                .map(|s| s.to_string());
-            Ok((result, sid))
-        }
-        Err(_) => Ok((out.trim().to_string(), None)),
-    }
+    // The loop returns on the last attempt regardless of outcome.
+    unreachable!("run_claude exhausted its loop without returning")
 }
 
 // ---- Handlers -------------------------------------------------------------
@@ -453,6 +542,66 @@ mod tests {
         assert!(with_voice.ends_with(VOICE_SUFFIX));
         let without = build_prompt("ask", "q", false, false).unwrap();
         assert!(!without.contains(VOICE_SUFFIX));
+    }
+
+    // ---- interpret_claude_output ------------------------------------------
+
+    #[test]
+    fn interpret_real_500_envelope_is_retryable() {
+        // The observed cold-start failure: non-zero exit, real cause in stdout.
+        let stdout = r#"{"type":"result","is_error":true,"api_error_status":500,"result":"API Error: 500 Internal server error. This is a server-side issue, usually temporary — try again in a moment.","session_id":"sess-x"}"#;
+        match interpret_claude_output(stdout, "", false) {
+            ClaudeOutcome::Retryable { status, message } => {
+                assert_eq!(status, 500);
+                assert!(message.contains("500"));
+            }
+            other => panic!("expected Retryable, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn interpret_400_envelope_is_fatal() {
+        let stdout = r#"{"is_error":true,"api_error_status":400,"result":"bad request"}"#;
+        match interpret_claude_output(stdout, "", false) {
+            ClaudeOutcome::Fatal { message } => assert!(message.contains("bad request")),
+            other => panic!("expected Fatal, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn interpret_success_envelope_is_ok() {
+        let stdout = r#"{"type":"result","is_error":false,"result":"OK","session_id":"sess-1"}"#;
+        match interpret_claude_output(stdout, "", true) {
+            ClaudeOutcome::Ok { result, session_id } => {
+                assert_eq!(result, "OK");
+                assert_eq!(session_id.as_deref(), Some("sess-1"));
+            }
+            other => panic!("expected Ok, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn interpret_non_json_success_is_raw_ok() {
+        match interpret_claude_output("  just plain text  ", "", true) {
+            ClaudeOutcome::Ok { result, session_id } => {
+                assert_eq!(result, "just plain text");
+                assert!(session_id.is_none());
+            }
+            other => panic!("expected Ok, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn interpret_non_json_failure_is_fatal_and_nonblank() {
+        // The old bug: a non-JSON failure reported nothing. Now both streams show.
+        match interpret_claude_output("partial stdout", "stderr detail", false) {
+            ClaudeOutcome::Fatal { message } => {
+                assert!(!message.is_empty());
+                assert!(message.contains("stderr detail"));
+                assert!(message.contains("partial stdout"));
+            }
+            other => panic!("expected Fatal, got {other:?}"),
+        }
     }
 
     // ---- binary_exists ----------------------------------------------------
