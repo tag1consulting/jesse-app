@@ -1,4 +1,5 @@
 import SwiftUI
+import Combine
 
 struct ContentView: View {
     @State private var mode: JesseMode = .ask
@@ -8,6 +9,12 @@ struct ContentView: View {
     @State private var errorText: String?
     @State private var showSettings = false
     @State private var config = ConfigStore.load()
+
+    // Thinking indicator: the send button fills left→right over 10s; once past
+    // 10s a live seconds counter is appended. Both reset the instant `busy` ends.
+    @State private var elapsed = 0
+    @State private var fillProgress: CGFloat = 0
+    private let tick = Timer.publish(every: 1, on: .main, in: .common).autoconnect()
 
     // Thread continuity. `sessionId` is the last thread we can resume;
     // `continueThread` decides whether the next send resumes it or starts fresh.
@@ -45,16 +52,39 @@ struct ContentView: View {
                 }
 
                 HStack {
+                    // Own the layers so the left→right fill sweeps behind the
+                    // white label with a deterministic z-order: accent base,
+                    // a darker overlay whose width tracks `fillProgress` (only
+                    // while busy), then the spinner + label on top in white.
                     Button(action: { startSend() }) {
+                        // The label drives the height; the accent base and the
+                        // fill sweep sit behind it (sized to match) so neither
+                        // greedily expands. GeometryReader reads the label's
+                        // frame, so the overlay width is exactly fillProgress of
+                        // the button width.
                         HStack {
-                            if busy { ProgressView().padding(.trailing, 4) }
-                            Text(busy ? "Thinking…"
-                                      : (continueThread ? "Follow up" : mode.label))
+                            if busy { ProgressView().tint(.white) }
+                            Text(buttonTitle).foregroundStyle(.white)
                         }
                         .frame(maxWidth: .infinity)
+                        .padding(.vertical, 10)
+                        .background(alignment: .leading) {
+                            ZStack(alignment: .leading) {
+                                Color.accentColor
+                                if busy {
+                                    GeometryReader { geo in
+                                        Rectangle()
+                                            .fill(Color.black.opacity(0.18))
+                                            .frame(width: geo.size.width * fillProgress)
+                                    }
+                                }
+                            }
+                        }
+                        .clipShape(RoundedRectangle(cornerRadius: 10))
                     }
-                    .buttonStyle(.borderedProminent)
-                    .disabled(busy || input.trimmingCharacters(in: .whitespaces).isEmpty)
+                    .buttonStyle(.plain)
+                    .disabled(sendDisabled)
+                    .opacity(dimmed ? 0.5 : 1)
 
                     if busy {
                         Button("Cancel") { sendTask?.cancel() }
@@ -90,6 +120,7 @@ struct ContentView: View {
                 SettingsView(config: $config)
             }
             .onAppear { inbox.drain() }
+            .onReceive(tick) { _ in if busy { elapsed += 1 } }
             .onChange(of: scenePhase) { _, phase in
                 if phase == .active { inbox.drain() }
             }
@@ -104,10 +135,31 @@ struct ContentView: View {
         }
     }
 
+    // Disabled while a run is in flight or there's nothing to send.
+    private var sendDisabled: Bool {
+        busy || input.trimmingCharacters(in: .whitespaces).isEmpty
+    }
+
+    // Dim only the truly-inactive (empty-input) state. While busy we keep full
+    // opacity so the fill sweep and white label stay crisp and readable.
+    private var dimmed: Bool {
+        !busy && input.trimmingCharacters(in: .whitespaces).isEmpty
+    }
+
+    private var buttonTitle: String {
+        guard busy else { return continueThread ? "Follow up" : mode.label }
+        return elapsed > 10 ? "Thinking… \(elapsed)" : "Thinking…"
+    }
+
     private func startSend(voice: Bool = false) {
         inputFocused = false
         errorText = nil
+        elapsed = 0
+        fillProgress = 0
         busy = true
+        // Sweep the fill 0→1 over 10s. The overlay is gated on `busy`, so when
+        // the run ends and `busy` flips false the sweep simply vanishes.
+        withAnimation(.linear(duration: 10)) { fillProgress = 1 }
         let text = input
         let resume = continueThread ? sessionId : nil
         sendTask = Task {
@@ -133,7 +185,11 @@ struct ContentView: View {
                     }
                 }
             }
+            // Reset on every exit — success, error, and cancel. No withAnimation:
+            // the sweep is gated on `busy`, so it's already hidden by now.
             busy = false
+            fillProgress = 0
+            elapsed = 0
             sendTask = nil
         }
     }
