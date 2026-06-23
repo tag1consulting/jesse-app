@@ -80,6 +80,20 @@ struct JesseConfig {
     }
 
     var baseURL: URL? { endpoint("") }
+
+    /// Parse a `jesse://pair?host=…&port=…&token=…` pairing payload (printed as a
+    /// QR by the bridge on startup). Returns nil for anything that isn't a
+    /// well-formed pairing URL with a non-empty host and token. Port defaults to
+    /// 8765 when absent or unparseable.
+    static func fromPairing(_ raw: String) -> JesseConfig? {
+        guard let c = URLComponents(string: raw),
+              c.scheme == "jesse", c.host == "pair" else { return nil }
+        let items = c.queryItems ?? []
+        func v(_ n: String) -> String? { items.first { $0.name == n }?.value }
+        guard let host = v("host"), let token = v("token"),
+              !host.isEmpty, !token.isEmpty else { return nil }
+        return JesseConfig(host: host, port: Int(v("port") ?? "") ?? 8765, token: token)
+    }
 }
 
 enum JesseError: LocalizedError {
