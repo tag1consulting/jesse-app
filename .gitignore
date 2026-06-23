@@ -1,0 +1,12 @@
+# macOS
+.DS_Store
+# Xcode
+build/
+DerivedData/
+*.xcuserstate
+**/xcuserdata/
+# Rust
+target/
+# cruft
+_removed-python/
+*.fuse_hidden*
