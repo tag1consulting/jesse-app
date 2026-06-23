@@ -71,12 +71,17 @@ struct ContentView: View {
                         .background(alignment: .leading) {
                             ZStack(alignment: .leading) {
                                 Color.accentColor
-                                if busy {
-                                    GeometryReader { geo in
-                                        Rectangle()
-                                            .fill(Color.black.opacity(0.18))
-                                            .frame(width: geo.size.width * fillProgress)
-                                    }
+                                // Keep the GeometryReader in the tree at all times
+                                // so the button width is measured before the very
+                                // first send; gate only visibility on `busy`. If
+                                // it were inserted with `if busy`, the first send
+                                // would create it and animate `fillProgress` in the
+                                // same layout pass — width 0, nothing to animate.
+                                GeometryReader { geo in
+                                    Rectangle()
+                                        .fill(Color.black.opacity(0.18))
+                                        .frame(width: geo.size.width * fillProgress)
+                                        .opacity(busy ? 1 : 0)
                                 }
                             }
                         }
