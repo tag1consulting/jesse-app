@@ -105,9 +105,8 @@ struct ContentView: View {
                 }
 
                 ScrollView {
-                    Text(response)
+                    MarkdownText(response)
                         .frame(maxWidth: .infinity, alignment: .leading)
-                        .textSelection(.enabled)
                 }
 
                 Spacer()
