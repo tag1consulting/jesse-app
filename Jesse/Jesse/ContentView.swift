@@ -203,6 +203,9 @@ struct SettingsView: View {
     @State private var port = ""
     @State private var token = ""
 
+    @State private var showScanner = false
+    @State private var scanError: String?
+
     var body: some View {
         NavigationStack {
             Form {
@@ -215,6 +218,19 @@ struct SettingsView: View {
                 }
                 Section("Auth") {
                     SecureField("bearer token", text: $token)
+                    // Pairing augments manual entry — it doesn't replace the
+                    // fields above, which stay as the fallback.
+                    Button {
+                        scanError = nil
+                        showScanner = true
+                    } label: {
+                        Label("Scan to pair", systemImage: "qrcode.viewfinder")
+                    }
+                    if let scanError {
+                        Text(scanError)
+                            .font(.callout)
+                            .foregroundStyle(.red)
+                    }
                 }
             }
             .navigationTitle("Settings")
@@ -236,6 +252,40 @@ struct SettingsView: View {
                 host = config.host
                 port = String(config.port)
                 token = config.token
+            }
+            .sheet(isPresented: $showScanner) {
+                scannerSheet
+            }
+        }
+    }
+
+    private var scannerSheet: some View {
+        NavigationStack {
+            QRScannerView(
+                onScan: { raw in
+                    if let parsed = JesseConfig.fromPairing(raw) {
+                        host = parsed.host
+                        port = String(parsed.port)
+                        token = parsed.token
+                        scanError = nil
+                        showScanner = false
+                    } else {
+                        // Keep the sheet open so the user can retry the scan.
+                        scanError = "That QR isn't a Jesse pairing code."
+                    }
+                },
+                onError: { message in
+                    scanError = message
+                    showScanner = false
+                }
+            )
+            .ignoresSafeArea()
+            .navigationTitle("Scan to pair")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("Cancel") { showScanner = false }
+                }
             }
         }
     }
