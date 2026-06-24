@@ -7,6 +7,8 @@ DerivedData/
 **/xcuserdata/
 # Rust
 target/
+# local agent settings (never commit; may hold machine-local config)
+.claude/
 # cruft
 _removed-python/
 *.fuse_hidden*
