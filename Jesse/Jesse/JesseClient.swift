@@ -102,6 +102,7 @@ enum JesseError: LocalizedError {
     case cannotConnect(String)
     case timedOut(String)
     case insecureBlocked(String)   // ATS refused the cleartext HTTP load
+    case connectionLost            // NSURLErrorNetworkConnectionLost (−1005)
     case transport(String)         // any other URL-loading failure
     case badResponse(Int, String)
     case decoding
@@ -118,6 +119,11 @@ enum JesseError: LocalizedError {
             return "“\(h)” didn't respond in time."
         case .insecureBlocked(let h):
             return "iOS blocked the HTTP connection to “\(h)” (App Transport Security)."
+        case .connectionLost:
+            // The bridge keeps the turn running detached from the connection, so
+            // this is recoverable when a job_id is in flight — the coordinator
+            // re-attaches on foreground rather than showing this as a failure.
+            return "The connection dropped. Reopen Jesse to pick the reply back up."
         case .transport(let msg):
             return msg
         case .badResponse(let code, let body):
@@ -142,6 +148,11 @@ enum JesseError: LocalizedError {
         case NSURLErrorAppTransportSecurityRequiresSecureConnection,
              NSURLErrorSecureConnectionFailed:
             return .insecureBlocked(host)
+        case NSURLErrorNetworkConnectionLost:
+            // Typically the socket dropped because the app was suspended
+            // mid-turn. The bridge keeps the turn alive, so when a job_id is in
+            // flight this is "re-attach on resume", not a failure.
+            return .connectionLost
         default:
             return .transport(ns.localizedDescription)
         }
@@ -173,6 +184,20 @@ struct JesseReply {
     }
 }
 
+/// Outcome of a `POST /jesse`. The bridge either finishes within its grace
+/// window (inline reply, 200) or hands back a job id to poll (202).
+enum JesseSendResult {
+    case reply(JesseReply, jobId: String?)
+    case running(jobId: String)
+}
+
+/// State of a job fetched via `GET /jesse/result/{job_id}`.
+enum JesseResultState {
+    case running
+    case done(JesseReply)
+    case failed(String)
+}
+
 struct JesseClient {
     var config: JesseConfig
 
@@ -188,8 +213,10 @@ struct JesseClient {
     }()
 
     /// Pass `sessionId` to continue a thread; `voice` asks for a SPOKEN: summary.
+    /// Returns either the inline reply (with the job id the bridge assigned) or,
+    /// if the turn outran the grace window, a `running` job id to poll.
     func send(mode: JesseMode, text: String,
-              sessionId: String? = nil, voice: Bool = false) async throws -> JesseReply {
+              sessionId: String? = nil, voice: Bool = false) async throws -> JesseSendResult {
         guard !config.normalizedHost.isEmpty, !config.token.isEmpty,
               let url = config.endpoint("/jesse") else { throw JesseError.notConfigured }
 
@@ -208,14 +235,75 @@ struct JesseClient {
         } catch {
             throw JesseError.from(error, host: config.normalizedHost)
         }
+        return try Self.decodeSend(data: data, resp: resp)
+    }
+
+    /// Poll a job started by `send`. Used after a dropped socket (or while the
+    /// turn outran the grace window) to fetch the completed reply by id.
+    func result(jobId: String) async throws -> JesseResultState {
+        guard !config.normalizedHost.isEmpty, !config.token.isEmpty,
+              let url = config.endpoint("/jesse/result/\(jobId)") else {
+            throw JesseError.notConfigured
+        }
+        var req = URLRequest(url: url)
+        req.httpMethod = "GET"
+        req.setValue("Bearer \(config.token)", forHTTPHeaderField: "Authorization")
+
+        let data: Data, resp: URLResponse
+        do {
+            (data, resp) = try await Self.session.data(for: req)
+        } catch {
+            throw JesseError.from(error, host: config.normalizedHost)
+        }
+        return try Self.decodeResult(data: data, resp: resp)
+    }
+
+    // Body decoding split out as pure, static functions so the wire contract can
+    // be unit-tested without standing up a server.
+
+    static func decodeSend(data: Data, resp: URLResponse) throws -> JesseSendResult {
         guard let http = resp as? HTTPURLResponse else { throw JesseError.decoding }
+        // 202 = still running; hand back the job id to poll. Checked before the
+        // 2xx success branch since 202 is itself a success code.
+        if http.statusCode == 202 {
+            guard let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  let jobId = obj["job_id"] as? String else { throw JesseError.decoding }
+            return .running(jobId: jobId)
+        }
         guard (200..<300).contains(http.statusCode) else {
             throw JesseError.badResponse(http.statusCode,
                                          String(data: data, encoding: .utf8) ?? "")
         }
         guard let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
               let reply = obj["response"] as? String else { throw JesseError.decoding }
-        return JesseReply(text: reply, sessionId: obj["session_id"] as? String)
+        return .reply(JesseReply(text: reply, sessionId: obj["session_id"] as? String),
+                      jobId: obj["job_id"] as? String)
+    }
+
+    static func decodeResult(data: Data, resp: URLResponse) throws -> JesseResultState {
+        guard let http = resp as? HTTPURLResponse else { throw JesseError.decoding }
+        // An unknown/evicted id is a terminal "gone", surfaced as a failure the
+        // coordinator can show and clear — not a transient to keep polling.
+        if http.statusCode == 404 {
+            return .failed("This reply expired before it could be retrieved.")
+        }
+        guard (200..<300).contains(http.statusCode) else {
+            throw JesseError.badResponse(http.statusCode,
+                                         String(data: data, encoding: .utf8) ?? "")
+        }
+        guard let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let status = obj["status"] as? String else { throw JesseError.decoding }
+        switch status {
+        case "running":
+            return .running
+        case "done":
+            guard let text = obj["response"] as? String else { throw JesseError.decoding }
+            return .done(JesseReply(text: text, sessionId: obj["session_id"] as? String))
+        case "failed":
+            return .failed(obj["error"] as? String ?? "Jesse couldn't complete that.")
+        default:
+            throw JesseError.decoding
+        }
     }
 }
 

@@ -6,6 +6,16 @@
 	objectVersion = 77;
 	objects = {
 
+/* Begin PBXContainerItemProxy section */
+		B0D06900000000000000000B /* PBXContainerItemProxy */ = {
+			isa = PBXContainerItemProxy;
+			containerPortal = B0D0680D2FE83E3F00C8C4B0 /* Project object */;
+			proxyType = 1;
+			remoteGlobalIDString = B0D068142FE83E3F00C8C4B0;
+			remoteInfo = Jesse;
+		};
+/* End PBXContainerItemProxy section */
+
 /* Begin PBXFileReference section */
 		B0D068152FE83E3F00C8C4B0 /* Jesse.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = Jesse.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		B0D069000000000000000002 /* JesseTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = JesseTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
@@ -123,24 +133,6 @@
 		};
 /* End PBXNativeTarget section */
 
-/* Begin PBXContainerItemProxy section */
-		B0D06900000000000000000B /* PBXContainerItemProxy */ = {
-			isa = PBXContainerItemProxy;
-			containerPortal = B0D0680D2FE83E3F00C8C4B0 /* Project object */;
-			proxyType = 1;
-			remoteGlobalIDString = B0D068142FE83E3F00C8C4B0;
-			remoteInfo = Jesse;
-		};
-/* End PBXContainerItemProxy section */
-
-/* Begin PBXTargetDependency section */
-		B0D06900000000000000000A /* PBXTargetDependency */ = {
-			isa = PBXTargetDependency;
-			target = B0D068142FE83E3F00C8C4B0 /* Jesse */;
-			targetProxy = B0D06900000000000000000B /* PBXContainerItemProxy */;
-		};
-/* End PBXTargetDependency section */
-
 /* Begin PBXProject section */
 		B0D0680D2FE83E3F00C8C4B0 /* Project object */ = {
 			isa = PBXProject;
@@ -212,6 +204,14 @@
 			runOnlyForDeploymentPostprocessing = 0;
 		};
 /* End PBXSourcesBuildPhase section */
+
+/* Begin PBXTargetDependency section */
+		B0D06900000000000000000A /* PBXTargetDependency */ = {
+			isa = PBXTargetDependency;
+			target = B0D068142FE83E3F00C8C4B0 /* Jesse */;
+			targetProxy = B0D06900000000000000000B /* PBXContainerItemProxy */;
+		};
+/* End PBXTargetDependency section */
 
 /* Begin XCBuildConfiguration section */
 		B0D0681E2FE83E4100C8C4B0 /* Debug */ = {

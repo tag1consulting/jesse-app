@@ -1,190 +1,53 @@
 import SwiftUI
+import SwiftData
 
+// Root of the app: a NavigationStack hosting the thread list. Cross-cutting
+// concerns live here — re-attaching to backgrounded runs on foreground, draining
+// Siri/voice hand-offs into fresh threads — because the stack and its path do.
 struct ContentView: View {
-    @State private var mode: JesseMode = .ask
-    @State private var input = ""
-    @State private var response = ""
-    @State private var busy = false
-    @State private var errorText: String?
-    @State private var showSettings = false
-    @State private var config = ConfigStore.load()
-
-    // Thinking indicator: the send button fills left→right over 10s; once past
-    // 10s a live seconds counter is appended. Both are derived each frame from
-    // `startDate` via a TimelineView, so they're immune to the layout shift the
-    // Cancel button causes on the first send. `startDate` is nil while idle.
-    @State private var startDate: Date?
-
-    // Thread continuity. `sessionId` is the last thread we can resume;
-    // `continueThread` decides whether the next send resumes it or starts fresh.
-    @State private var sessionId: String?
-    @State private var continueThread = false
-
-    @FocusState private var inputFocused: Bool
-
-    // Voice hand-off from Siri + a handle on the in-flight run so Cancel can abort it.
-    @StateObject private var inbox = JesseInbox.shared
+    @Environment(\.modelContext) private var context
+    @Environment(RunCoordinator.self) private var coordinator
     @Environment(\.scenePhase) private var scenePhase
-    @State private var sendTask: Task<Void, Never>?
+
+    @StateObject private var inbox = JesseInbox.shared
+    @State private var path: [JesseThread] = []
+    @State private var config = ConfigStore.load()
+    @State private var showSettings = false
 
     var body: some View {
-        NavigationStack {
-            VStack(spacing: 16) {
-                Picker("Mode", selection: $mode) {
-                    ForEach(JesseMode.allCases) { m in
-                        Text(m.label).tag(m)
-                    }
+        NavigationStack(path: $path) {
+            ThreadListView(path: $path, config: $config, showSettings: $showSettings)
+                .navigationDestination(for: JesseThread.self) { thread in
+                    ThreadDetailView(thread: thread)
                 }
-                .pickerStyle(.segmented)
-
-                TextField(mode == .ask ? "Ask Jesse anything…"
-                                       : "Tell Jesse something…",
-                          text: $input, axis: .vertical)
-                    .textFieldStyle(.roundedBorder)
-                    .lineLimit(2...5)
-                    .focused($inputFocused)
-
-                // Appears only once there's a thread to continue.
-                if sessionId != nil {
-                    Toggle("Continue thread", isOn: $continueThread)
-                        .font(.callout)
+                .sheet(isPresented: $showSettings) {
+                    SettingsView(config: $config)
                 }
-
-                HStack {
-                    // Own the layers so the left→right fill sweeps behind the
-                    // white label with a deterministic z-order: accent base,
-                    // a darker overlay whose width tracks elapsed time (only
-                    // while busy), then the spinner + label on top in white.
-                    //
-                    // The fill is driven by a continuous clock — not a
-                    // `withAnimation` width tween — so it survives the layout
-                    // shift the Cancel button introduces on the first send.
-                    // TimelineView ticks every frame while busy and pauses idle;
-                    // each tick recomputes the fill against *live* geometry.
-                    TimelineView(.animation(minimumInterval: 1.0 / 30.0, paused: !busy)) { context in
-                        let elapsed = (busy ? startDate.map { context.date.timeIntervalSince($0) } : nil) ?? 0
-                        let secs = Int(elapsed)
-                        Button(action: { startSend() }) {
-                            HStack {
-                                if busy { ProgressView().tint(.white) }
-                                Text(busy ? (secs > 10 ? "Thinking… \(secs)" : "Thinking…")
-                                          : (continueThread ? "Follow up" : mode.label))
-                                    .foregroundStyle(.white)
-                            }
-                            .frame(maxWidth: .infinity)
-                            .padding(.vertical, 10)
-                            .background(alignment: .leading) {
-                                ZStack(alignment: .leading) {
-                                    Color.accentColor
-                                    GeometryReader { geo in
-                                        Rectangle()
-                                            .fill(Color.black.opacity(0.18))
-                                            .frame(width: geo.size.width * min(elapsed / 10, 1))
-                                            .opacity(busy ? 1 : 0)
-                                    }
-                                }
-                            }
-                            .clipShape(RoundedRectangle(cornerRadius: 10))
-                        }
-                        .buttonStyle(.plain)
-                        .disabled(sendDisabled)
-                        .opacity(dimmed ? 0.5 : 1)
-                    }
-
-                    if busy {
-                        Button("Cancel") { sendTask?.cancel() }
-                            .buttonStyle(.bordered)
-                    }
-                }
-
-                if let errorText {
-                    Text(errorText)
-                        .font(.callout)
-                        .foregroundStyle(.red)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                }
-
-                ScrollView {
-                    MarkdownText(response)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                }
+        }
+        .onAppear {
+            coordinator.resume(context: context)
+            inbox.drain()
+        }
+        .onChange(of: scenePhase) { _, phase in
+            if phase == .active {
+                coordinator.resume(context: context)
+                inbox.drain()
             }
-            .padding()
-            .navigationTitle("Jesse")
-            .toolbar {
-                ToolbarItem(placement: .topBarTrailing) {
-                    Button { showSettings = true } label: {
-                        Image(systemName: "gearshape")
-                    }
-                }
-            }
-            .sheet(isPresented: $showSettings) {
-                SettingsView(config: $config)
-            }
-            .onAppear { inbox.drain() }
-            .onChange(of: scenePhase) { _, phase in
-                if phase == .active { inbox.drain() }
-            }
-            .onChange(of: inbox.pending) { _, req in
-                guard let req else { return }
-                inbox.pending = nil
-                mode = req.mode
-                input = req.text
-                continueThread = false
-                startSend(voice: true)
-            }
+        }
+        .onChange(of: inbox.pending) { _, req in
+            guard let req else { return }
+            inbox.pending = nil
+            startVoiceThread(req)
         }
     }
 
-    // Disabled while a run is in flight or there's nothing to send.
-    private var sendDisabled: Bool {
-        busy || input.trimmingCharacters(in: .whitespaces).isEmpty
-    }
-
-    // Dim only the truly-inactive (empty-input) state. While busy we keep full
-    // opacity so the fill sweep and white label stay crisp and readable.
-    private var dimmed: Bool {
-        !busy && input.trimmingCharacters(in: .whitespaces).isEmpty
-    }
-
-    private func startSend(voice: Bool = false) {
-        inputFocused = false
-        errorText = nil
-        // Stamp the clock the timeline reads, then go busy — the fill and
-        // counter both derive from this instant.
-        startDate = Date()
-        busy = true
-        let text = input
-        let resume = continueThread ? sessionId : nil
-        sendTask = Task {
-            do {
-                let reply = try await JesseClient(config: config)
-                    .send(mode: mode, text: text, sessionId: resume, voice: voice)
-                response = reply.displayText
-                sessionId = reply.sessionId ?? sessionId
-                input = ""
-                // Auto-arm follow-up when Jesse asks a question back.
-                continueThread = reply.displayText.hasSuffix("?")
-                if voice { Speaker.shared.speak(reply.spokenText) }
-            } catch is CancellationError {
-                // user cancelled — no error banner
-            } catch {
-                let ns = error as NSError
-                if ns.domain == NSURLErrorDomain && ns.code == NSURLErrorCancelled {
-                    // URLSession-level cancel, also silent
-                } else {
-                    errorText = error.localizedDescription
-                    if voice {
-                        Speaker.shared.speak("Sorry, that didn't work. " + error.localizedDescription)
-                    }
-                }
-            }
-            // Reset on every exit — success, error, and cancel. Clearing
-            // `startDate` pauses the timeline and the sweep vanishes with `busy`.
-            busy = false
-            startDate = nil
-            sendTask = nil
-        }
+    // Each voice invocation is its own new thread; the coordinator runs it and
+    // speaks the reply. Land the user directly in the new conversation.
+    private func startVoiceThread(_ req: PendingVoiceRequest) {
+        let thread = JesseThread(mode: req.mode)
+        context.insert(thread)
+        path = [thread]
+        coordinator.send(thread: thread, text: req.text, voice: true, context: context)
     }
 }
 
