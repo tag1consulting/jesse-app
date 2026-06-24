@@ -133,20 +133,25 @@ curl -s http://127.0.0.1:8765/jesse \
 |---|---|---|
 | `JESSE_TOKEN` | (required) | Bearer token the phone must send |
 | `JESSE_VAULT` | `~/devel/tag1/jesse` | cwd for `claude -p` (loads CLAUDE.md) |
-| `JESSE_BIND` | `127.0.0.1` | Interface to bind — set to tailnet IP |
+| `JESSE_BIND` | `127.0.0.1` | Interface to bind — set to tailnet IP. Loopback/tailnet (`100.64.0.0/10`) only unless `JESSE_ALLOW_PUBLIC_BIND=1` |
+| `JESSE_ALLOW_PUBLIC_BIND` | (off) | Set `1`/`true` to allow a non-loopback/non-tailnet bind; otherwise such a bind is a startup error |
+| `JESSE_ALLOWED_TOOLS` | (scoped default) | Comma-separated `--allowedTools` list for the agent (see [`../SECURITY.md`](../SECURITY.md)) |
+| `JESSE_DISALLOWED_TOOLS` | `Bash,WebFetch` | Comma-separated `--disallowedTools` denylist (defense-in-depth) |
+| `JESSE_MAX_CONCURRENCY` | `2` | Max concurrent turns; excess returns `429` |
+| `JESSE_RATE_PER_MIN` | `30` | Accepted requests per rolling minute; bursts beyond it return `429` |
 | `JESSE_ADVERTISE_HOST` | value of `JESSE_BIND` | Host written into the pairing QR — set to the MagicDNS `ts.net` name to advertise that instead of the bound IP |
 | `JESSE_PORT` | `8765` | Port |
-| `JESSE_TIMEOUT` | `1800` | Hard ceiling per request (seconds). `0` = unlimited (no timeout — rely on the client's Cancel button) |
+| `JESSE_TIMEOUT` | `1800` | Hard ceiling per request (seconds), clamped to `1..=3600`. `0` is treated as the 3600s ceiling, not unlimited |
 | `JESSE_GRACE_SECS` | `10` | How long `POST /jesse` holds the connection for the inline fast path before returning `202` and letting the client poll `GET /jesse/result/{job_id}` |
 | `JESSE_JOB_TTL_SECS` | `600` | How long a completed/failed job stays retrievable before TTL eviction |
 | `JESSE_CLAUDE_BIN` | `claude` | Path to the `claude` binary |
 
 The server refuses to start if `JESSE_TOKEN` is unset, the vault isn't a
-directory, or the `claude` binary can't be found.
+directory, the `claude` binary can't be found, or `JESSE_BIND` is an unsafe
+address without the override.
 
 ## Hardening past the PoC
 
-- Swap `--permission-mode acceptEdits` for a scoped `--allowedTools` allowlist.
 - Put it behind `tailscale serve` for real TLS + a stable hostname.
 - Add `--resume`/`--session-id` plumbing if you want richer thread control.
 - Stream with `--output-format stream-json` for live token output.

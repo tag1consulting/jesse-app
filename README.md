@@ -68,16 +68,27 @@ Read this before pairing a second device or running the bridge anywhere shared.
 - **One bearer token is the only authentication.** Every request must send
   `Authorization: Bearer <token>`. Anyone who has the token *and* is on your
   tailnet can read and write your vault. Treat it like a password.
-- **The bridge runs Claude Code with `--permission-mode acceptEdits` inside your
-  vault** — it can read and modify files there ("Tell Jesse" is how capture
-  works). Point `JESSE_VAULT` only at a directory you are comfortable letting it
-  change, and only pair people you trust on your tailnet.
+- **The bridge runs Claude Code under an explicit tool allowlist inside your
+  vault** — `--permission-mode default` plus a scoped `--allowedTools` list
+  (file read/write/search, read-only vault search, and scoped `git`/`mv`/`ls`/
+  `cat`/`find`), with unscoped shell and `WebFetch` denied. It can read and
+  modify files in the vault ("Tell Jesse" is how capture works). Point
+  `JESSE_VAULT` only at a directory you are comfortable letting it change, and
+  only pair people you trust on your tailnet. The allowlist is the only
+  in-process boundary; see [SECURITY.md](SECURITY.md) for the deployment posture
+  it assumes (dedicated low-privilege user, OS sandbox).
 - **Transport is plain HTTP, but confined to the Tailscale tailnet** — a private,
   WireGuard-encrypted network. The traffic is not on the public internet. The iOS
   app's App Transport Security exception is **scoped to `ts.net`**, not a blanket
   `NSAllowsArbitraryLoads`.
-- **The bridge binds only to the tailnet IP (or `127.0.0.1`), never `0.0.0.0`.**
-  It will not answer on your home Wi-Fi or any other interface.
+- **The bridge refuses to bind anything but loopback or tailnet/CGNAT space**
+  (`127.0.0.0/8`, `::1`, `100.64.0.0/10`) — an unsafe bind is a hard startup
+  error unless you set `JESSE_ALLOW_PUBLIC_BIND=1`. It will not answer on your
+  home Wi-Fi or any other interface by default.
+- **Concurrency, request rate, and per-turn time are bounded** so one client
+  can't exhaust the host: `JESSE_MAX_CONCURRENCY` (default 2),
+  `JESSE_RATE_PER_MIN` (default 30), and a hard 3600s timeout ceiling. Excess
+  load is shed with `429`.
 - **The token is never logged by the bridge** and is stored on the phone in the
   **iOS Keychain** (not plaintext `UserDefaults`).
 
@@ -151,13 +162,19 @@ Full table in [`bridge/README.md`](bridge/README.md#knobs-env-vars). Most-used:
 |---|---|---|
 | `JESSE_TOKEN` | **required** | Bearer token the phone must send. The server refuses to start without it. |
 | `JESSE_VAULT` | `~/devel/tag1/jesse` | Working directory for `claude -p`. Must be an existing directory. |
-| `JESSE_BIND` | `127.0.0.1` | Interface to bind. Set to the tailnet IP for phone access. |
+| `JESSE_BIND` | `127.0.0.1` | Interface to bind. Set to the tailnet IP for phone access. Loopback/tailnet only unless `JESSE_ALLOW_PUBLIC_BIND=1`. |
+| `JESSE_ALLOW_PUBLIC_BIND` | _(off)_ | Set to `1` to allow binding a non-loopback/non-tailnet address. Off by default; an unsafe bind is otherwise a startup error. |
+| `JESSE_ALLOWED_TOOLS` | _(scoped default)_ | Comma-separated `--allowedTools` list for the agent. See [SECURITY.md](SECURITY.md). |
+| `JESSE_DISALLOWED_TOOLS` | `Bash,WebFetch` | Comma-separated `--disallowedTools` denylist (defense-in-depth). |
+| `JESSE_MAX_CONCURRENCY` | `2` | Max concurrent turns; excess returns `429`. |
+| `JESSE_RATE_PER_MIN` | `30` | Accepted requests per rolling minute; bursts beyond it return `429`. |
 | `JESSE_ADVERTISE_HOST` | value of `JESSE_BIND` | Host written into the pairing QR. **Set to your `ts.net` MagicDNS name** (see ATS note). |
 | `JESSE_PORT` | `8765` | Port. |
 | `JESSE_CLAUDE_BIN` | `claude` | Path to the `claude` binary. Use an absolute path if it isn't on the bridge's `PATH`. |
 
 The bridge **refuses to start** if `JESSE_TOKEN` is unset, `JESSE_VAULT` isn't a
-directory, or the `claude` binary can't be found — each with a one-line message
+directory, the `claude` binary can't be found, or `JESSE_BIND` is an unsafe
+address without the override — each with a one-line message
 and exit code 1.
 
 ### Keep the laptop awake
