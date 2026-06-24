@@ -119,6 +119,44 @@ curl -s http://127.0.0.1:8765/jesse \
 # → response ends with a line beginning "SPOKEN: "
 ```
 
+## Custom prompt wrappers
+
+Every turn wraps your text in a built-in **Ask** or **Tell** instruction before
+Jesse sees it (the `mode` selects which). Two additive, **stateless** affordances
+let the app customize that wrapper without the bridge holding any per-user state:
+
+**`GET /jesse/prompts`** — returns the current built-in wrappers, the exact const
+strings `build_prompt` applies for a fresh turn, so the app's "default" matches
+what the bridge would use. Same bearer auth as `/jesse`.
+
+```bash
+curl -s http://127.0.0.1:8765/jesse/prompts \
+  -H "Authorization: Bearer $JESSE_TOKEN"
+# → { "ask": "<default ask wrapper>", "tell": "<default tell wrapper>" }
+```
+
+**`POST /jesse` with an optional `"instructions"` field** — when present and
+non-empty, it replaces the **active mode's** wrapper for that one request; when
+absent or blank, the built-in const is used exactly as before (so omitting the
+field reproduces today's behavior byte-for-byte). The bridge still appends its
+own voice/phone-format suffix regardless of the override, so it always owns
+output formatting.
+
+```bash
+curl -s http://127.0.0.1:8765/jesse \
+  -H "Authorization: Bearer $JESSE_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"mode":"ask","text":"What is on Today.md?","instructions":"Answer in one line. Question: "}'
+```
+
+The design is deliberately stateless: the bridge never stores a custom wrapper.
+The app persists the user's edits and sends `instructions` only when a mode is
+actually customized; an empty field always means "use the bridge default" and the
+field is omitted. The standing CLAUDE.md invariant — "Ask" forbids *action* he
+didn't request, never *writing* a durable fact — lives in the default Ask wrapper
+the app seeds its editor from, and the app surfaces it as helper text so a
+customized wrapper preserves it.
+
 ## Prereqs
 
 - Rust toolchain (`rustup`, stable).

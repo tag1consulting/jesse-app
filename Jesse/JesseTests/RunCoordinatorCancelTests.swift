@@ -15,6 +15,7 @@ final class RunCoordinatorCancelTests: XCTestCase {
 
         func send(mode: JesseMode, text: String,
                   sessionId: String?, voice: Bool,
+                  instructions: String?,
                   attachments: [JesseAttachment]) async throws -> JesseSendResult {
             .running(jobId: "job-test")
         }

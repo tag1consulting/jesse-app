@@ -56,11 +56,16 @@ final class RunCoordinator {
 
     private let configProvider: @MainActor () -> JesseConfig
     private let makeClient: @MainActor (JesseConfig) -> any JesseClientProtocol
+    // Resolves the per-mode wrapper override to send (nil = use the bridge
+    // default). Injected so tests can drive it without UserDefaults state.
+    private let instructionsProvider: @MainActor (JesseMode) -> String?
 
     init(config: @escaping @MainActor () -> JesseConfig = { ConfigStore.load() },
-         makeClient: @escaping @MainActor (JesseConfig) -> any JesseClientProtocol = { JesseClient(config: $0) }) {
+         makeClient: @escaping @MainActor (JesseConfig) -> any JesseClientProtocol = { JesseClient(config: $0) },
+         instructions: @escaping @MainActor (JesseMode) -> String? = { PromptStore.override(for: $0) }) {
         self.configProvider = config
         self.makeClient = makeClient
+        self.instructionsProvider = instructions
         self.inFlight = InFlightStore.load()
     }
 
@@ -111,6 +116,9 @@ final class RunCoordinator {
         let mode = thread.modeValue
         let sessionId = thread.sessionId
         let cfg = configProvider()
+        // Resolve the wrapper override on the main actor before detaching the
+        // turn; nil when this mode isn't customized (the bridge uses its default).
+        let instructions = instructionsProvider(mode)
         startDates[threadID] = Date()
 
         // A background grant lets a short turn finish after the app is backgrounded;
@@ -127,6 +135,7 @@ final class RunCoordinator {
             do {
                 let result = try await client.send(mode: mode, text: trimmed,
                                                    sessionId: sessionId, voice: voice,
+                                                   instructions: instructions,
                                                    attachments: attachments)
                 switch result {
                 case .reply(let reply, _):

@@ -457,6 +457,12 @@ struct JesseRequest {
     session_id: Option<String>,   // set to continue a thread (a followup)
     #[serde(default)]
     voice: bool, // voice request → ask for a SPOKEN: summary line, keep it listenable
+    // Optional per-request override of the active mode's wrapper instruction.
+    // When present and non-empty, `build_prompt` uses it in place of the built-in
+    // Ask/Tell const (the `mode` above selects which); VOICE_SUFFIX/PHONE_FORMAT
+    // are still appended. Absent/empty reproduces today's behavior exactly.
+    #[serde(default)]
+    instructions: Option<String>,
     // Files the user attached. Decoded, validated, and written to a per-request
     // scratch dir the headless agent reads; empty for an ordinary turn.
     #[serde(default)]
@@ -498,8 +504,22 @@ fn check_auth(headers: &HeaderMap, token: &str) -> Result<(), ApiError> {
     Ok(())
 }
 
-fn build_prompt(mode: &str, text: &str, is_followup: bool, voice: bool) -> Result<String, ApiError> {
-    let preamble = match (mode, is_followup) {
+/// Wrap the user's text in the active mode's instruction, then append the
+/// voice or phone-format suffix. `mode` (validated here) selects Ask vs Tell and
+/// fresh vs followup. A non-empty `instructions` override replaces the built-in
+/// wrapper for the active mode; the suffix is still appended regardless, so the
+/// bridge always owns voice/phone formatting. With `instructions` absent or
+/// blank the output is byte-identical to the const-only path.
+fn build_prompt(
+    mode: &str,
+    text: &str,
+    is_followup: bool,
+    voice: bool,
+    instructions: Option<&str>,
+) -> Result<String, ApiError> {
+    // Validate the mode and pick the built-in wrapper even when an override is
+    // present — an unknown mode is still a 400, override or not.
+    let default_preamble = match (mode, is_followup) {
         ("ask", false) => ASK_PREAMBLE,
         ("ask", true) => ASK_FOLLOWUP,
         ("tell", false) => TELL_PREAMBLE,
@@ -510,6 +530,10 @@ fn build_prompt(mode: &str, text: &str, is_followup: bool, voice: bool) -> Resul
                 format!("Unknown mode: {mode:?} (use 'ask' or 'tell')"),
             ))
         }
+    };
+    let preamble = match instructions {
+        Some(s) if !s.trim().is_empty() => s,
+        _ => default_preamble,
     };
     let mut p = format!("{preamble}{text}");
     if voice {
@@ -1019,6 +1043,18 @@ async fn health(State(st): State<AppState>) -> Json<Value> {
     Json(json!({ "ok": true, "vault": st.cfg.vault, "claude": st.cfg.claude_bin }))
 }
 
+/// Expose the built-in Ask/Tell wrapper instructions so the app can show them as
+/// the editable "defaults" and reset to them. Returns the exact const strings
+/// `build_prompt` applies for a fresh turn, so the app's default matches what the
+/// bridge would use. Same bearer auth as `/jesse`.
+async fn jesse_prompts(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, ApiError> {
+    check_auth(&headers, &st.cfg.token)?;
+    Ok(Json(json!({ "ask": ASK_PREAMBLE, "tell": TELL_PREAMBLE })))
+}
+
 async fn jesse(
     State(st): State<AppState>,
     headers: HeaderMap,
@@ -1037,7 +1073,13 @@ async fn jesse(
 
     let mode = req.mode.trim().to_lowercase();
     let is_followup = req.session_id.is_some();
-    let prompt = build_prompt(&mode, &req.text, is_followup, req.voice)?;
+    let prompt = build_prompt(
+        &mode,
+        &req.text,
+        is_followup,
+        req.voice,
+        req.instructions.as_deref(),
+    )?;
 
     // Concurrency cap (C3): take a permit before spawning the turn. If none is
     // immediately available, shed load with 429 instead of queuing unboundedly.
@@ -1226,6 +1268,7 @@ fn app(state: AppState) -> Router {
     Router::new()
         .route("/health", get(health))
         .route("/jesse", post(jesse))
+        .route("/jesse/prompts", get(jesse_prompts))
         .route("/jesse/result/:job_id", get(jesse_result))
         .layer(DefaultBodyLimit::max(body_limit))
         .with_state(state)
@@ -1358,7 +1401,7 @@ mod tests {
 
     #[test]
     fn build_prompt_ask_fresh_wraps_with_ask_preamble() {
-        let p = build_prompt("ask", "what is on Today.md", false, false).unwrap();
+        let p = build_prompt("ask", "what is on Today.md", false, false, None).unwrap();
         assert!(p.starts_with(ASK_PREAMBLE));
         assert!(p.contains("what is on Today.md"));
         // Non-voice replies get the phone-formatting hint, not the voice suffix.
@@ -1368,7 +1411,7 @@ mod tests {
 
     #[test]
     fn build_prompt_ask_followup_uses_followup_preamble() {
-        let p = build_prompt("ask", "and the second?", true, false).unwrap();
+        let p = build_prompt("ask", "and the second?", true, false, None).unwrap();
         assert!(p.starts_with(ASK_FOLLOWUP));
         assert!(p.contains("and the second?"));
         assert!(p.ends_with(PHONE_FORMAT));
@@ -1376,29 +1419,85 @@ mod tests {
 
     #[test]
     fn build_prompt_tell_fresh_and_followup() {
-        let fresh = build_prompt("tell", "remember this", false, false).unwrap();
+        let fresh = build_prompt("tell", "remember this", false, false, None).unwrap();
         assert!(fresh.starts_with(TELL_PREAMBLE));
         assert!(fresh.contains("remember this"));
         assert!(fresh.ends_with(PHONE_FORMAT));
-        let followup = build_prompt("tell", "also this", true, false).unwrap();
+        let followup = build_prompt("tell", "also this", true, false, None).unwrap();
         assert!(followup.starts_with(TELL_FOLLOWUP));
         assert!(followup.ends_with(PHONE_FORMAT));
     }
 
     #[test]
     fn build_prompt_unknown_mode_is_400() {
-        let err = build_prompt("shout", "hey", false, false).unwrap_err();
+        let err = build_prompt("shout", "hey", false, false, None).unwrap_err();
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+        // An unknown mode is still a 400 even when an override is supplied.
+        let err = build_prompt("shout", "hey", false, false, Some("custom")).unwrap_err();
         assert_eq!(err.0, StatusCode::BAD_REQUEST);
     }
 
     #[test]
     fn build_prompt_voice_appends_suffix() {
-        let with_voice = build_prompt("ask", "q", false, true).unwrap();
+        let with_voice = build_prompt("ask", "q", false, true, None).unwrap();
         assert!(with_voice.ends_with(VOICE_SUFFIX));
         // Voice and phone formatting are mutually exclusive.
         assert!(!with_voice.contains(PHONE_FORMAT));
-        let without = build_prompt("ask", "q", false, false).unwrap();
+        let without = build_prompt("ask", "q", false, false, None).unwrap();
         assert!(!without.contains(VOICE_SUFFIX));
+    }
+
+    // ---- build_prompt: instructions override ------------------------------
+
+    #[test]
+    fn build_prompt_override_substitutes_active_wrapper() {
+        let custom = "Custom ask wrapper. Question: ";
+        let p = build_prompt("ask", "the question", false, false, Some(custom)).unwrap();
+        // The override replaces the built-in Ask wrapper entirely...
+        assert!(p.starts_with(custom));
+        assert!(!p.contains(ASK_PREAMBLE));
+        assert!(p.contains("the question"));
+        // ...but the bridge still appends the phone-format suffix.
+        assert!(p.ends_with(PHONE_FORMAT));
+    }
+
+    #[test]
+    fn build_prompt_override_still_appends_voice_suffix() {
+        let custom = "Spoken-friendly wrapper: ";
+        let p = build_prompt("tell", "do the thing", false, true, Some(custom)).unwrap();
+        assert!(p.starts_with(custom));
+        assert!(!p.contains(TELL_PREAMBLE));
+        // Voice suffix wins over phone-format even under an override.
+        assert!(p.ends_with(VOICE_SUFFIX));
+        assert!(!p.contains(PHONE_FORMAT));
+    }
+
+    #[test]
+    fn build_prompt_override_applies_on_followup_too() {
+        // The override replaces the active mode's wrapper regardless of fresh vs
+        // followup — a customized mode uses the same instruction on a resumed thread.
+        let custom = "My wrapper: ";
+        let p = build_prompt("ask", "more", true, false, Some(custom)).unwrap();
+        assert!(p.starts_with(custom));
+        assert!(!p.contains(ASK_FOLLOWUP));
+    }
+
+    #[test]
+    fn build_prompt_blank_override_is_byte_identical_to_default() {
+        // An empty or whitespace-only override is treated as absent: the output
+        // must match the const-only path byte for byte, in every mode.
+        for (mode, followup, voice) in [
+            ("ask", false, false),
+            ("ask", true, false),
+            ("tell", false, true),
+            ("tell", true, false),
+        ] {
+            let base = build_prompt(mode, "body", followup, voice, None).unwrap();
+            for blank in [Some(""), Some("   "), Some("\n\t "), None] {
+                let got = build_prompt(mode, "body", followup, voice, blank).unwrap();
+                assert_eq!(got, base, "blank override {blank:?} must equal default");
+            }
+        }
     }
 
     // ---- interpret_claude_output ------------------------------------------
@@ -1639,6 +1738,42 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    // ---- GET /jesse/prompts -----------------------------------------------
+
+    #[tokio::test]
+    async fn prompts_requires_auth() {
+        let resp = app(test_state())
+            .oneshot(
+                Request::builder()
+                    .uri("/jesse/prompts")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn prompts_returns_both_built_in_defaults() {
+        let resp = app(test_state())
+            .oneshot(
+                Request::builder()
+                    .uri("/jesse/prompts")
+                    .header("authorization", "Bearer test-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body: Value = serde_json::from_str(&body_string(resp).await).unwrap();
+        // The exact const strings build_prompt applies, so the app's "default"
+        // matches what the bridge would use for a fresh turn.
+        assert_eq!(body["ask"], ASK_PREAMBLE);
+        assert_eq!(body["tell"], TELL_PREAMBLE);
     }
 
     // ---- job store unit tests ---------------------------------------------
@@ -2377,6 +2512,21 @@ mod tests {
         let json = format!(r#"{{"mode":"ask","text":"hi","attachments":[{many}]}}"#);
         let resp = app(test_state())
             .oneshot(jesse_request(Some("Bearer test-token"), &json))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn jesse_accepts_instructions_field() {
+        // The override field is #[serde(default)] and optional. A request that
+        // carries it must still deserialize; a bad mode then returns 400, proving
+        // the body (with `instructions`) parsed before build_prompt ran.
+        let resp = app(test_state())
+            .oneshot(jesse_request(
+                Some("Bearer test-token"),
+                r#"{"mode":"nope","text":"hi","instructions":"my custom wrapper"}"#,
+            ))
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);

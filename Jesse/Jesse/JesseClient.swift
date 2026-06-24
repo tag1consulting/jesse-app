@@ -288,7 +288,7 @@ enum JesseResultState {
 /// server; `JesseClient` is the only production conformer.
 protocol JesseClientProtocol {
     func send(mode: JesseMode, text: String, sessionId: String?, voice: Bool,
-              attachments: [JesseAttachment]) async throws -> JesseSendResult
+              instructions: String?, attachments: [JesseAttachment]) async throws -> JesseSendResult
     func result(jobId: String) async throws -> JesseResultState
 }
 
@@ -307,10 +307,13 @@ struct JesseClient: JesseClientProtocol {
     }()
 
     /// Pass `sessionId` to continue a thread; `voice` asks for a SPOKEN: summary.
-    /// Returns either the inline reply (with the job id the bridge assigned) or,
-    /// if the turn outran the grace window, a `running` job id to poll.
+    /// A non-empty `instructions` overrides the bridge's built-in wrapper for the
+    /// active mode (the bridge still appends its voice/phone suffix). Returns
+    /// either the inline reply (with the job id the bridge assigned) or, if the
+    /// turn outran the grace window, a `running` job id to poll.
     func send(mode: JesseMode, text: String,
               sessionId: String? = nil, voice: Bool = false,
+              instructions: String? = nil,
               attachments: [JesseAttachment] = []) async throws -> JesseSendResult {
         guard !config.normalizedHost.isEmpty, !config.token.isEmpty,
               let url = config.endpoint("/jesse") else { throw JesseError.notConfigured }
@@ -319,20 +322,9 @@ struct JesseClient: JesseClientProtocol {
         req.httpMethod = "POST"
         req.setValue("application/json", forHTTPHeaderField: "Content-Type")
         req.setValue("Bearer \(config.token)", forHTTPHeaderField: "Authorization")
-        var body: [String: Any] = ["mode": mode.rawValue, "text": text]
-        if let sessionId { body["session_id"] = sessionId }
-        if voice { body["voice"] = true }
-        if !attachments.isEmpty {
-            // Base64-in-JSON: matches the existing JSONSerialization path. The
-            // bridge re-validates type and size; these are sent as-is.
-            body["attachments"] = attachments.map { a in
-                [
-                    "filename": a.filename,
-                    "mime": a.mime,
-                    "data_base64": a.data.base64EncodedString(),
-                ]
-            }
-        }
+        let body = Self.requestBody(mode: mode, text: text, sessionId: sessionId,
+                                    voice: voice, instructions: instructions,
+                                    attachments: attachments)
         req.httpBody = try JSONSerialization.data(withJSONObject: body)
 
         let data: Data, resp: URLResponse
@@ -364,8 +356,55 @@ struct JesseClient: JesseClientProtocol {
         return try Self.decodeResult(data: data, resp: resp)
     }
 
-    // Body decoding split out as pure, static functions so the wire contract can
-    // be unit-tested without standing up a server.
+    /// Fetch the bridge's built-in Ask/Tell wrapper defaults (`GET /jesse/prompts`).
+    /// Mirrors `send`'s URL building and bearer auth. Used by Settings to populate
+    /// the editors and to reset a field to the current bridge default.
+    func fetchPrompts() async throws -> (ask: String, tell: String) {
+        guard !config.normalizedHost.isEmpty, !config.token.isEmpty,
+              let url = config.endpoint("/jesse/prompts") else { throw JesseError.notConfigured }
+        var req = URLRequest(url: url)
+        req.httpMethod = "GET"
+        req.setValue("Bearer \(config.token)", forHTTPHeaderField: "Authorization")
+
+        let data: Data, resp: URLResponse
+        do {
+            (data, resp) = try await Self.session.data(for: req)
+        } catch {
+            throw JesseError.from(error, host: config.normalizedHost)
+        }
+        return try Self.decodePrompts(data: data, resp: resp)
+    }
+
+    // Body encode/decode split out as pure, static functions so the wire contract
+    // can be unit-tested without standing up a server.
+
+    /// Build the `POST /jesse` JSON body. Optional fields are included only when
+    /// they carry content: `instructions` is omitted when nil or blank (so an
+    /// empty override means "use the bridge default"), matching the bridge's
+    /// `#[serde(default)]` shape so omitting a field reproduces today's behavior.
+    static func requestBody(mode: JesseMode, text: String, sessionId: String?,
+                            voice: Bool, instructions: String?,
+                            attachments: [JesseAttachment]) -> [String: Any] {
+        var body: [String: Any] = ["mode": mode.rawValue, "text": text]
+        if let sessionId { body["session_id"] = sessionId }
+        if voice { body["voice"] = true }
+        if let instructions,
+           !instructions.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            body["instructions"] = instructions
+        }
+        if !attachments.isEmpty {
+            // Base64-in-JSON: matches the existing JSONSerialization path. The
+            // bridge re-validates type and size; these are sent as-is.
+            body["attachments"] = attachments.map { a in
+                [
+                    "filename": a.filename,
+                    "mime": a.mime,
+                    "data_base64": a.data.base64EncodedString(),
+                ]
+            }
+        }
+        return body
+    }
 
     static func decodeSend(data: Data, resp: URLResponse) throws -> JesseSendResult {
         guard let http = resp as? HTTPURLResponse else { throw JesseError.decoding }
@@ -410,6 +449,19 @@ struct JesseClient: JesseClientProtocol {
         default:
             throw JesseError.decoding
         }
+    }
+
+    static func decodePrompts(data: Data, resp: URLResponse) throws -> (ask: String, tell: String) {
+        guard let http = resp as? HTTPURLResponse else { throw JesseError.decoding }
+        guard (200..<300).contains(http.statusCode) else {
+            throw JesseError.badResponse(http.statusCode,
+                                         String(data: data, encoding: .utf8) ?? "")
+        }
+        guard let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let ask = obj["ask"] as? String, let tell = obj["tell"] as? String else {
+            throw JesseError.decoding
+        }
+        return (ask: ask, tell: tell)
     }
 }
 

@@ -62,6 +62,15 @@ struct SettingsView: View {
     @State private var showScanner = false
     @State private var scanError: String?
 
+    // Per-mode prompt editors. `*Prompt` is the editable text; `*Default` mirrors
+    // the cached bridge default (for the differs-from-default check and Reset).
+    @State private var askPrompt = ""
+    @State private var tellPrompt = ""
+    @State private var askDefault = ""
+    @State private var tellDefault = ""
+    @State private var promptsError: String?
+    @State private var loadingPrompts = false
+
     var body: some View {
         NavigationStack {
             Form {
@@ -88,6 +97,56 @@ struct SettingsView: View {
                             .foregroundStyle(.red)
                     }
                 }
+
+                Section {
+                    Button {
+                        loadDefaults(fillEmptyOnly: true)
+                    } label: {
+                        Label("Load defaults from bridge", systemImage: "arrow.down.circle")
+                    }
+                    .disabled(loadingPrompts)
+                    if loadingPrompts {
+                        HStack { ProgressView(); Text("Contacting the bridge…").foregroundStyle(.secondary) }
+                    }
+                    if let promptsError {
+                        Text(promptsError)
+                            .font(.callout)
+                            .foregroundStyle(.red)
+                    }
+                } header: {
+                    Text("Prompt customization")
+                } footer: {
+                    Text("Customize how Ask and Tell wrap your message before Jesse sees it. An empty field uses the bridge's built-in default.")
+                }
+
+                Section {
+                    TextEditor(text: $askPrompt)
+                        .frame(minHeight: 120)
+                        .font(.body.monospaced())
+                        .autocorrectionDisabled()
+                        .textInputAutocapitalization(.never)
+                    Button("Reset to default") { resetToDefault(.ask) }
+                        .disabled(loadingPrompts)
+                } header: {
+                    Text("Ask Jesse prompt")
+                } footer: {
+                    // The invariant: "Ask" forbids unrequested action, never writing.
+                    Text("“Ask” means Jesse won’t take actions you didn’t request — but it never stops him from recording a durable fact, correction, or status change to the vault. Leave empty to use the bridge default.")
+                }
+
+                Section {
+                    TextEditor(text: $tellPrompt)
+                        .frame(minHeight: 120)
+                        .font(.body.monospaced())
+                        .autocorrectionDisabled()
+                        .textInputAutocapitalization(.never)
+                    Button("Reset to default") { resetToDefault(.tell) }
+                        .disabled(loadingPrompts)
+                } header: {
+                    Text("Tell Jesse prompt")
+                } footer: {
+                    Text("How a “Tell” is framed for Jesse to capture or act on. Leave empty to use the bridge default.")
+                }
             }
             .navigationTitle("Settings")
             .toolbar {
@@ -97,6 +156,11 @@ struct SettingsView: View {
                                              port: Int(port) ?? 8765,
                                              token: token)
                         ConfigStore.save(config)
+                        // Persist the prompt editors. `save` re-derives each
+                        // mode's customized flag (non-empty AND differs from the
+                        // cached default); an empty field stays "use the default".
+                        PromptStore.save(.ask, text: askPrompt, default: askDefault)
+                        PromptStore.save(.tell, text: tellPrompt, default: tellDefault)
                         dismiss()
                     }
                 }
@@ -108,10 +172,59 @@ struct SettingsView: View {
                 host = config.host
                 port = String(config.port)
                 token = config.token
+                askPrompt = PromptStore.text(.ask)
+                tellPrompt = PromptStore.text(.tell)
+                askDefault = PromptStore.cachedDefault(.ask)
+                tellDefault = PromptStore.cachedDefault(.tell)
             }
             .sheet(isPresented: $showScanner) {
                 scannerSheet
             }
+        }
+    }
+
+    // MARK: - Prompt defaults
+
+    /// Fetch the bridge's built-in wrapper defaults using the host/token the user
+    /// has entered (not necessarily saved yet), so pairing + loading defaults can
+    /// happen in one visit. Returns nil and sets `promptsError` on any failure.
+    private func fetchDefaults() async -> (ask: String, tell: String)? {
+        loadingPrompts = true
+        defer { loadingPrompts = false }
+        promptsError = nil
+        let cfg = JesseConfig(host: host, port: Int(port) ?? 8765, token: token)
+        do {
+            return try await JesseClient(config: cfg).fetchPrompts()
+        } catch {
+            let detail = (error as? JesseError)?.errorDescription ?? error.localizedDescription
+            promptsError = "Couldn’t load defaults — connect to the bridge first. (\(detail))"
+            return nil
+        }
+    }
+
+    /// "Reset to default" for one mode: overwrite that editor with the freshly
+    /// fetched bridge default and cache it. The customized flag clears on Save
+    /// (text then equals the cached default).
+    private func resetToDefault(_ mode: JesseMode) {
+        Task {
+            guard let d = await fetchDefaults() else { return }
+            switch mode {
+            case .ask:  askDefault = d.ask;  askPrompt = d.ask
+            case .tell: tellDefault = d.tell; tellPrompt = d.tell
+            }
+        }
+    }
+
+    /// "Load defaults from bridge": cache both defaults and fill the editors.
+    /// With `fillEmptyOnly`, only blank editors are populated so a custom prompt
+    /// is never clobbered — the first-use affordance for empty editors.
+    private func loadDefaults(fillEmptyOnly: Bool) {
+        Task {
+            guard let d = await fetchDefaults() else { return }
+            askDefault = d.ask
+            tellDefault = d.tell
+            if !fillEmptyOnly || askPrompt.isEmpty { askPrompt = d.ask }
+            if !fillEmptyOnly || tellPrompt.isEmpty { tellPrompt = d.tell }
         }
     }
 
