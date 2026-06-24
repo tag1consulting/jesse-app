@@ -54,6 +54,46 @@ final class MarkdownTextTests: XCTestCase {
                        [.paragraph("This is **bold** and a [link](https://example.com).")])
     }
 
+    func testTableWithAlignmentDelimiters() {
+        let raw = """
+        | Name | Count |
+        |:--|--:|
+        | apples | 3 |
+        | pears | 10 |
+        """
+        XCTAssertEqual(parseMarkdownBlocks(raw), [
+            .table(
+                headers: ["Name", "Count"],
+                rows: [["apples", "3"], ["pears", "10"]],
+                alignments: [.leading, .trailing]
+            ),
+        ])
+    }
+
+    func testPipeLineWithoutDelimiterStaysParagraph() {
+        // Prose containing a pipe but no delimiter row must NOT become a table.
+        let raw = "use a | b to pipe"
+        XCTAssertEqual(parseMarkdownBlocks(raw), [.paragraph("use a | b to pipe")])
+    }
+
+    func testRaggedTableRowPadsAndTruncates() {
+        // A short row (fewer cells than headers) and a long row (extra cells)
+        // both parse without crashing; rendering pads/truncates to header count.
+        let raw = """
+        | A | B | C |
+        | --- | --- | --- |
+        | only-one |
+        | w | x | y | z |
+        """
+        XCTAssertEqual(parseMarkdownBlocks(raw), [
+            .table(
+                headers: ["A", "B", "C"],
+                rows: [["only-one"], ["w", "x", "y", "z"]],
+                alignments: [.leading, .leading, .leading]
+            ),
+        ])
+    }
+
     func testMixedDocument() {
         let raw = """
         # Heading

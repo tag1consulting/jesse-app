@@ -11,12 +11,18 @@ import SwiftUI
 //
 // Parsing is kept separate from rendering so the parser is unit-testable.
 
+/// Per-column horizontal alignment for a GFM pipe table.
+enum TableAlignment: Equatable {
+    case leading, center, trailing
+}
+
 /// One renderable block of a markdown reply.
 enum MarkdownBlock: Equatable {
     case heading(level: Int, text: String)
     case bullet(text: String)
     case numbered(number: Int, text: String)
     case code(String)
+    case table(headers: [String], rows: [[String]], alignments: [TableAlignment])
     case paragraph(String)
 }
 
@@ -46,9 +52,13 @@ func parseMarkdownBlocks(_ raw: String) -> [MarkdownBlock] {
     var codeLines: [String] = []
 
     // Preserve trailing empty lines so blank-line separation is detected.
+    // Index-based so a table can look ahead to its delimiter row and consume
+    // its data rows in one step.
     let lines = raw.components(separatedBy: "\n")
 
-    for line in lines {
+    var i = 0
+    while i < lines.count {
+        let line = lines[i]
         let trimmed = line.trimmingCharacters(in: .whitespaces)
 
         // Fence toggles take priority over everything else.
@@ -63,17 +73,20 @@ func parseMarkdownBlocks(_ raw: String) -> [MarkdownBlock] {
                 flushParagraph()
                 inCode = true
             }
+            i += 1
             continue
         }
 
         if inCode {
             codeLines.append(line)
+            i += 1
             continue
         }
 
         // Blank line: paragraph separator.
         if trimmed.isEmpty {
             flushParagraph()
+            i += 1
             continue
         }
 
@@ -81,6 +94,7 @@ func parseMarkdownBlocks(_ raw: String) -> [MarkdownBlock] {
         if let heading = parseHeading(trimmed) {
             flushParagraph()
             blocks.append(heading)
+            i += 1
             continue
         }
 
@@ -88,6 +102,7 @@ func parseMarkdownBlocks(_ raw: String) -> [MarkdownBlock] {
         if let bulletText = parseBullet(trimmed) {
             flushParagraph()
             blocks.append(.bullet(text: bulletText))
+            i += 1
             continue
         }
 
@@ -95,11 +110,38 @@ func parseMarkdownBlocks(_ raw: String) -> [MarkdownBlock] {
         if let numbered = parseNumbered(trimmed) {
             flushParagraph()
             blocks.append(numbered)
+            i += 1
+            continue
+        }
+
+        // GFM pipe table: a row-looking line (contains '|') IMMEDIATELY followed
+        // by a delimiter row (cells of only '-', ':', spaces, with at least one
+        // '-'). A '|'-containing line *not* followed by a delimiter is just prose
+        // with pipes and falls through to the paragraph branch below.
+        if trimmed.contains("|"),
+           i + 1 < lines.count,
+           isTableDelimiterRow(lines[i + 1]) {
+            flushParagraph()
+            let headers = splitTableRow(trimmed)
+            let alignments = parseTableAlignments(lines[i + 1])
+            var rows: [[String]] = []
+            // Consume following '|'-containing lines as data rows until a
+            // blank or non-row line ends the table.
+            var j = i + 2
+            while j < lines.count {
+                let rowLine = lines[j].trimmingCharacters(in: .whitespaces)
+                guard !rowLine.isEmpty, rowLine.contains("|") else { break }
+                rows.append(splitTableRow(rowLine))
+                j += 1
+            }
+            blocks.append(.table(headers: headers, rows: rows, alignments: alignments))
+            i = j
             continue
         }
 
         // Plain text line — part of the current paragraph.
         paragraphLines.append(trimmed)
+        i += 1
     }
 
     // Close out anything still open.
@@ -140,6 +182,48 @@ private func parseNumbered(_ line: String) -> MarkdownBlock? {
     guard let number = Int(String(chars[0..<i])) else { return nil }
     let text = String(chars[(i + 2)...]).trimmingCharacters(in: .whitespaces)
     return .numbered(number: number, text: text)
+}
+
+/// True if `line` is a GFM table delimiter row: at least one cell, every cell
+/// made only of `-`, `:`, and spaces, and the row contains at least one `-`.
+private func isTableDelimiterRow(_ line: String) -> Bool {
+    let trimmed = line.trimmingCharacters(in: .whitespaces)
+    guard trimmed.contains("|"), trimmed.contains("-") else { return false }
+    let cells = splitTableRow(trimmed)
+    guard !cells.isEmpty else { return false }
+    for cell in cells {
+        let stripped = cell.trimmingCharacters(in: .whitespaces)
+        guard !stripped.isEmpty,
+              stripped.allSatisfy({ $0 == "-" || $0 == ":" }) else {
+            return false
+        }
+    }
+    return true
+}
+
+/// Per-column alignment from a delimiter row: `:---`=leading, `:--:`=center,
+/// `---:`=trailing, plain=leading.
+private func parseTableAlignments(_ line: String) -> [TableAlignment] {
+    splitTableRow(line.trimmingCharacters(in: .whitespaces)).map { cell in
+        let c = cell.trimmingCharacters(in: .whitespaces)
+        let left = c.hasPrefix(":")
+        let right = c.hasSuffix(":")
+        switch (left, right) {
+        case (true, true):  return .center
+        case (false, true): return .trailing
+        default:            return .leading
+        }
+    }
+}
+
+/// Split one pipe-table row into trimmed cells: drop one optional leading and
+/// trailing `|`, split on `|`, trim each cell. (Escaped `\|` is out of scope.)
+private func splitTableRow(_ line: String) -> [String] {
+    var s = Substring(line.trimmingCharacters(in: .whitespaces))
+    if s.hasPrefix("|") { s = s.dropFirst() }
+    if s.hasSuffix("|") { s = s.dropLast() }
+    return s.split(separator: "|", omittingEmptySubsequences: false)
+        .map { $0.trimmingCharacters(in: .whitespaces) }
 }
 
 /// Renders parsed markdown blocks as native SwiftUI views.
@@ -191,8 +275,59 @@ struct MarkdownText: View {
                 )
                 .textSelection(.enabled)
 
+        case let .table(headers, rows, alignments):
+            tableView(headers: headers, rows: rows, alignments: alignments)
+
         case let .paragraph(text):
             inline(text)
+        }
+    }
+
+    /// Render a GFM pipe table as a SwiftUI `Grid` inside a horizontal
+    /// `ScrollView` so a wide table scrolls rather than truncating. Ragged rows
+    /// (fewer cells than headers) pad with empties; extra cells are dropped.
+    @ViewBuilder
+    private func tableView(headers: [String], rows: [[String]], alignments: [TableAlignment]) -> some View {
+        let columns = headers.count
+        ScrollView(.horizontal, showsIndicators: false) {
+            Grid(alignment: .topLeading, horizontalSpacing: 0, verticalSpacing: 0) {
+                GridRow {
+                    ForEach(0..<columns, id: \.self) { col in
+                        cell(headers[col], alignment: alignment(alignments, col))
+                            .fontWeight(.semibold)
+                    }
+                }
+                Divider()
+                ForEach(Array(rows.enumerated()), id: \.offset) { _, row in
+                    GridRow {
+                        ForEach(0..<columns, id: \.self) { col in
+                            cell(col < row.count ? row[col] : "",
+                                 alignment: alignment(alignments, col))
+                        }
+                    }
+                }
+            }
+            .padding(8)
+            .background(
+                RoundedRectangle(cornerRadius: 6)
+                    .fill(Color.secondary.opacity(0.12))
+            )
+        }
+    }
+
+    /// One table cell: inline-styled text, padded and aligned per its column.
+    private func cell(_ text: String, alignment: Alignment) -> some View {
+        inline(text)
+            .padding(.vertical, 2)
+            .padding(.horizontal, 6)
+            .frame(maxWidth: .infinity, alignment: alignment)
+    }
+
+    private func alignment(_ alignments: [TableAlignment], _ col: Int) -> Alignment {
+        switch col < alignments.count ? alignments[col] : .leading {
+        case .leading:  return .leading
+        case .center:   return .center
+        case .trailing: return .trailing
         }
     }
 
