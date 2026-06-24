@@ -40,6 +40,15 @@ final class JesseThread {
         turns.sorted { $0.createdAt < $1.createdAt }
     }
 
+    /// The whole conversation as a role-labeled Markdown transcript, for copy /
+    /// share. Uses each turn's *raw* text so any links or formatting survive,
+    /// with a blank line between turns so it reads cleanly when pasted.
+    var sharedTranscript: String {
+        orderedTurns
+            .map { "**\($0.isUser ? "You" : "Jesse"):** \($0.text)" }
+            .joined(separator: "\n\n")
+    }
+
     /// A short, single-line title derived from the first user message. Used when
     /// a thread is created so the list row reads sensibly before any rename.
     static func deriveTitle(from text: String) -> String {

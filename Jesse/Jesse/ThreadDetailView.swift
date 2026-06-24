@@ -1,5 +1,8 @@
 import SwiftUI
 import SwiftData
+import UIKit
+import PhotosUI
+import UniformTypeIdentifiers
 
 // One conversation: the full turn transcript with the composer pinned at the
 // bottom. Being inside a thread *is* continuing it — every send auto-resumes the
@@ -12,6 +15,13 @@ struct ThreadDetailView: View {
     @State private var input = ""
     @FocusState private var inputFocused: Bool
 
+    // Attachments staged for the next send, plus the pickers' presentation state.
+    @State private var attachments: [JesseAttachment] = []
+    @State private var photoItems: [PhotosPickerItem] = []
+    @State private var showPhotoPicker = false
+    @State private var showFileImporter = false
+    @State private var attachError: String?
+
     private var running: Bool { coordinator.isRunning(thread.id) }
     private var turns: [Turn] { thread.orderedTurns }
 
@@ -23,6 +33,18 @@ struct ThreadDetailView: View {
         .padding()
         .navigationTitle(thread.title.isEmpty ? "New conversation" : thread.title)
         .navigationBarTitleDisplayMode(.inline)
+        .toolbar {
+            ToolbarItem(placement: .topBarTrailing) {
+                // Share the whole conversation as a role-labeled Markdown
+                // transcript. ShareLink gives Copy + the system share sheet for
+                // free. Hidden until there's something to share.
+                if !turns.isEmpty {
+                    ShareLink(item: thread.sharedTranscript) {
+                        Label("Share conversation", systemImage: "square.and.arrow.up")
+                    }
+                }
+            }
+        }
     }
 
     // MARK: - Transcript
@@ -91,6 +113,17 @@ struct ThreadDetailView: View {
                 .disabled(running)
             }
 
+            if let attachError {
+                Text(attachError)
+                    .font(.caption)
+                    .foregroundStyle(.red)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
+
+            if !attachments.isEmpty {
+                attachmentChips
+            }
+
             TextField(thread.modeValue == .ask ? "Ask Jesse anything…"
                                                 : "Tell Jesse something…",
                       text: $input, axis: .vertical)
@@ -99,6 +132,7 @@ struct ThreadDetailView: View {
                 .focused($inputFocused)
 
             HStack {
+                attachButton
                 SendButton(
                     running: running,
                     startDate: coordinator.startDate(for: thread.id),
@@ -112,6 +146,123 @@ struct ThreadDetailView: View {
                 }
             }
         }
+        // iOS 17 imperative presenters, toggled from the paperclip menu.
+        .photosPicker(isPresented: $showPhotoPicker, selection: $photoItems,
+                      maxSelectionCount: AttachmentLimits.maxCount, matching: .images)
+        .fileImporter(isPresented: $showFileImporter,
+                      allowedContentTypes: [.pdf], allowsMultipleSelection: true,
+                      onCompletion: handleFileImport)
+        .onChange(of: photoItems) { _, items in
+            guard !items.isEmpty else { return }
+            Task { await handlePhotoItems(items) }
+        }
+    }
+
+    // MARK: - Attachments UI
+
+    private var attachButton: some View {
+        Menu {
+            Button {
+                attachError = nil
+                showPhotoPicker = true
+            } label: {
+                Label("Photo or Image", systemImage: "photo")
+            }
+            Button {
+                attachError = nil
+                showFileImporter = true
+            } label: {
+                Label("PDF Document", systemImage: "doc")
+            }
+        } label: {
+            Image(systemName: "paperclip")
+                .font(.title3)
+                .frame(width: 38, height: 40)
+        }
+        .accessibilityLabel("Add attachment")
+        .disabled(running || attachments.count >= AttachmentLimits.maxCount)
+    }
+
+    private var attachmentChips: some View {
+        ScrollView(.horizontal, showsIndicators: false) {
+            HStack(spacing: 8) {
+                ForEach(attachments) { att in
+                    HStack(spacing: 6) {
+                        Image(systemName: att.isImage ? "photo" : "doc.text")
+                        Text(att.filename)
+                            .font(.caption)
+                            .lineLimit(1)
+                        Button {
+                            remove(att)
+                        } label: {
+                            Image(systemName: "xmark.circle.fill")
+                                .foregroundStyle(.secondary)
+                        }
+                        .buttonStyle(.plain)
+                        .accessibilityLabel("Remove \(att.filename)")
+                    }
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 6)
+                    .background(Color.secondary.opacity(0.15))
+                    .clipShape(Capsule())
+                }
+            }
+        }
+    }
+
+    private func remove(_ att: JesseAttachment) {
+        attachments.removeAll { $0.id == att.id }
+        attachError = nil
+    }
+
+    @MainActor
+    private func handlePhotoItems(_ items: [PhotosPickerItem]) async {
+        for item in items {
+            // loadTransferable returns Data? and can throw → Data??; flatten.
+            let loaded = try? await item.loadTransferable(type: Data.self)
+            guard let data = loaded ?? nil else {
+                attachError = "Couldn’t load that image."
+                continue
+            }
+            addAttachment(data: data, fallbackName: "Photo")
+        }
+        photoItems = []
+    }
+
+    private func handleFileImport(_ result: Result<[URL], Error>) {
+        switch result {
+        case .success(let urls):
+            for url in urls {
+                let scoped = url.startAccessingSecurityScopedResource()
+                defer { if scoped { url.stopAccessingSecurityScopedResource() } }
+                guard let data = try? Data(contentsOf: url) else {
+                    attachError = "Couldn’t read “\(url.lastPathComponent)”."
+                    continue
+                }
+                addAttachment(data: data, fallbackName: "Document",
+                              suggestedName: url.lastPathComponent)
+            }
+        case .failure(let error):
+            attachError = error.localizedDescription
+        }
+    }
+
+    /// Sniff the type, name it, run the client-side caps, and stage it — or set
+    /// `attachError`. The bridge re-validates all of this as the authority.
+    private func addAttachment(data: Data, fallbackName: String, suggestedName: String? = nil) {
+        guard let mime = JesseAttachment.sniffMime(data) else {
+            attachError = "That file type isn’t supported (images or PDF only)."
+            return
+        }
+        let ext = JesseAttachment.fileExtension(forMime: mime)
+        let name = suggestedName ?? "\(fallbackName) \(attachments.count + 1).\(ext)"
+        let candidate = JesseAttachment(filename: name, mime: mime, data: data)
+        if let reason = AttachmentLimits.rejectionReason(adding: candidate, to: attachments) {
+            attachError = reason
+            return
+        }
+        attachError = nil
+        attachments.append(candidate)
     }
 
     private var sendDisabled: Bool {
@@ -121,9 +272,13 @@ struct ThreadDetailView: View {
     private func send() {
         inputFocused = false
         let text = input
+        let outgoing = attachments
         input = ""
+        attachments = []
+        attachError = nil
         coordinator.clearError(for: thread.id)
-        coordinator.send(thread: thread, text: text, voice: false, context: context)
+        coordinator.send(thread: thread, text: text, voice: false, context: context,
+                         attachments: outgoing)
     }
 }
 
@@ -135,6 +290,23 @@ private struct TurnRow: View {
     let turn: Turn
 
     var body: some View {
+        bubble
+            // Long-press any message to copy or share it. Copies the *raw*
+            // Markdown (`turn.text`), not the rendered text, so links and
+            // formatting are preserved.
+            .contextMenu {
+                Button {
+                    UIPasteboard.general.string = turn.text
+                } label: {
+                    Label("Copy", systemImage: "doc.on.doc")
+                }
+                ShareLink(item: turn.text) {
+                    Label("Share", systemImage: "square.and.arrow.up")
+                }
+            }
+    }
+
+    @ViewBuilder private var bubble: some View {
         if turn.isUser {
             HStack {
                 Spacer(minLength: 40)

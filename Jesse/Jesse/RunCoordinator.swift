@@ -79,7 +79,8 @@ final class RunCoordinator {
 
     /// Start a turn on `thread`. Appends the user message optimistically, then
     /// runs the bridge call on a per-thread task that survives navigation.
-    func send(thread: JesseThread, text: String, voice: Bool, context: ModelContext) {
+    func send(thread: JesseThread, text: String, voice: Bool, context: ModelContext,
+              attachments: [JesseAttachment] = []) {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty, !isRunning(thread.id) else { return }
         let threadID = thread.id
@@ -91,8 +92,15 @@ final class RunCoordinator {
             context.insert(thread)
         }
 
-        // Optimistic user turn — appears in the transcript immediately.
-        let userTurn = Turn(role: .user, text: trimmed)
+        // Optimistic user turn — appears in the transcript immediately. The
+        // persisted/displayed text notes any attachments (the bridge keeps the
+        // files only for the turn), while the *sent* text stays just `trimmed`.
+        var displayText = trimmed
+        if !attachments.isEmpty {
+            let names = attachments.map(\.filename).joined(separator: ", ")
+            displayText += "\n\n📎 Attached: \(names)"
+        }
+        let userTurn = Turn(role: .user, text: displayText)
         thread.turns.append(userTurn)
         if thread.title.isEmpty {
             thread.title = JesseThread.deriveTitle(from: trimmed)
@@ -118,7 +126,8 @@ final class RunCoordinator {
             let client = self.makeClient(cfg)
             do {
                 let result = try await client.send(mode: mode, text: trimmed,
-                                                   sessionId: sessionId, voice: voice)
+                                                   sessionId: sessionId, voice: voice,
+                                                   attachments: attachments)
                 switch result {
                 case .reply(let reply, _):
                     self.finish(threadID: threadID, reply: reply, voice: voice, context: context)

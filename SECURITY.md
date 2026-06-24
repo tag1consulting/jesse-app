@@ -93,6 +93,27 @@ To keep a single client (or a runaway turn) from exhausting the host:
   builds. An unbounded-wait affordance exists only in debug builds.
 - **Output cap** — captured agent stdout is truncated (a few MB) before parsing
   so one pathological run can't balloon memory.
+- **Attachments** — files sent with a turn are bounded by count
+  (`JESSE_MAX_ATTACHMENTS`, default 4), per-file size (`JESSE_MAX_ATTACHMENT_BYTES`,
+  default 10 MB), and combined size (`JESSE_MAX_ATTACHMENTS_TOTAL_BYTES`, default
+  20 MB). The request body limit is sized from these (base64-inflated) so an
+  oversized upload is refused before it's buffered.
+
+## Attachments
+
+Files attached to a turn are untrusted input and handled defensively:
+
+- **Type is sniffed, not believed.** Each blob's real type is detected from its
+  magic bytes and must be on the whitelist (PNG, JPEG, GIF, WebP, HEIC, PDF) *and*
+  match the client-declared MIME; an extension/MIME mismatch is rejected (`400`).
+- **No client filename touches disk.** Files are written to a per-request scratch
+  directory (mode `0700`) under the system temp dir — *not* the vault — with
+  randomized `0600` names and a sniffed extension. The client filename is never
+  used as an on-disk name (path traversal) and is never placed in the prompt
+  (injection); only the random on-disk paths are named to the agent.
+- **Scratch is always cleaned up.** A `Drop` guard removes the whole scratch
+  directory when the turn ends — success, error, or timeout — and survives the
+  internal retry loop, so decoded files never outlive the turn.
 
 ## Reporting
 

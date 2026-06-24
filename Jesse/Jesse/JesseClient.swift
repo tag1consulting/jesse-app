@@ -10,6 +10,91 @@ enum JesseMode: String, CaseIterable, Identifiable {
     var label: String { self == .ask ? "Ask Jesse" : "Tell Jesse" }
 }
 
+/// A file the user picked to send with a turn. `data` is the raw bytes; the
+/// client base64-encodes it for the wire. Held in the composer as a removable
+/// chip and cleared after a successful send.
+struct JesseAttachment: Identifiable, Equatable {
+    let id = UUID()
+    var filename: String
+    var mime: String
+    var data: Data
+
+    var byteCount: Int { data.count }
+    var isImage: Bool { mime.hasPrefix("image/") }
+
+    /// Detect a whitelisted MIME from the file's magic bytes — the same sniff
+    /// the bridge runs — so the declared type always matches the actual bytes
+    /// (a PhotosPicker item may be HEIC even when it looks like a JPEG). Returns
+    /// nil for anything not on the whitelist.
+    static func sniffMime(_ data: Data) -> String? {
+        let b = [UInt8](data.prefix(16))
+        func match(_ ascii: String, at off: Int = 0) -> Bool {
+            let sig = Array(ascii.utf8)
+            guard b.count >= off + sig.count else { return false }
+            return Array(b[off..<off + sig.count]) == sig
+        }
+        if b.starts(with: [0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]) { return "image/png" }
+        if b.starts(with: [0xFF, 0xD8, 0xFF]) { return "image/jpeg" }
+        if match("GIF87a") || match("GIF89a") { return "image/gif" }
+        if match("%PDF-") { return "application/pdf" }
+        if match("RIFF") && match("WEBP", at: 8) { return "image/webp" }
+        if match("ftyp", at: 4) {
+            let brand = b.count >= 12 ? Array(b[8..<12]) : []
+            let brands = ["heic", "heix", "hevc", "hevx", "heim", "heis", "mif1", "msf1"]
+            if brands.contains(where: { Array($0.utf8) == brand }) { return "image/heic" }
+        }
+        return nil
+    }
+
+    /// The on-disk extension matching a whitelisted MIME (for display names).
+    static func fileExtension(forMime mime: String) -> String {
+        switch mime {
+        case "image/png": return "png"
+        case "image/jpeg": return "jpg"
+        case "image/gif": return "gif"
+        case "image/webp": return "webp"
+        case "image/heic": return "heic"
+        case "application/pdf": return "pdf"
+        default: return "bin"
+        }
+    }
+}
+
+/// Client-side attachment limits. Mirror the bridge's server-side caps
+/// (`JESSE_MAX_ATTACHMENT*`) so a file that would be rejected is caught before
+/// it's uploaded; the server still enforces them as the authority.
+enum AttachmentLimits {
+    static let maxCount = 4
+    static let maxBytesPerFile = 10 * 1024 * 1024
+    static let maxBytesTotal = 20 * 1024 * 1024
+
+    /// MIME types the bridge will accept (magic-byte-verified server-side).
+    static let allowedMimes: Set<String> = [
+        "image/png", "image/jpeg", "image/gif", "image/webp", "image/heic",
+        "application/pdf",
+    ]
+
+    /// Validate adding `candidate` to the `existing` set. Returns a
+    /// user-facing error message if it should be rejected, else nil.
+    static func rejectionReason(adding candidate: JesseAttachment,
+                                to existing: [JesseAttachment]) -> String? {
+        if existing.count >= maxCount {
+            return "You can attach at most \(maxCount) files."
+        }
+        if !allowedMimes.contains(candidate.mime) {
+            return "“\(candidate.filename)” isn’t a supported type (images or PDF only)."
+        }
+        if candidate.byteCount > maxBytesPerFile {
+            return "“\(candidate.filename)” is too large (max \(maxBytesPerFile / 1_048_576) MB per file)."
+        }
+        let total = existing.reduce(0) { $0 + $1.byteCount } + candidate.byteCount
+        if total > maxBytesTotal {
+            return "Attachments exceed the \(maxBytesTotal / 1_048_576) MB total limit."
+        }
+        return nil
+    }
+}
+
 struct JesseConfig {
     var host: String   // e.g. "my-laptop.tailnet-1234.ts.net" or a 100.x IP
     var port: Int
@@ -202,7 +287,8 @@ enum JesseResultState {
 /// protocol purely so a fake can exercise the poll loop in tests without a
 /// server; `JesseClient` is the only production conformer.
 protocol JesseClientProtocol {
-    func send(mode: JesseMode, text: String, sessionId: String?, voice: Bool) async throws -> JesseSendResult
+    func send(mode: JesseMode, text: String, sessionId: String?, voice: Bool,
+              attachments: [JesseAttachment]) async throws -> JesseSendResult
     func result(jobId: String) async throws -> JesseResultState
 }
 
@@ -224,7 +310,8 @@ struct JesseClient: JesseClientProtocol {
     /// Returns either the inline reply (with the job id the bridge assigned) or,
     /// if the turn outran the grace window, a `running` job id to poll.
     func send(mode: JesseMode, text: String,
-              sessionId: String? = nil, voice: Bool = false) async throws -> JesseSendResult {
+              sessionId: String? = nil, voice: Bool = false,
+              attachments: [JesseAttachment] = []) async throws -> JesseSendResult {
         guard !config.normalizedHost.isEmpty, !config.token.isEmpty,
               let url = config.endpoint("/jesse") else { throw JesseError.notConfigured }
 
@@ -235,6 +322,17 @@ struct JesseClient: JesseClientProtocol {
         var body: [String: Any] = ["mode": mode.rawValue, "text": text]
         if let sessionId { body["session_id"] = sessionId }
         if voice { body["voice"] = true }
+        if !attachments.isEmpty {
+            // Base64-in-JSON: matches the existing JSONSerialization path. The
+            // bridge re-validates type and size; these are sent as-is.
+            body["attachments"] = attachments.map { a in
+                [
+                    "filename": a.filename,
+                    "mime": a.mime,
+                    "data_base64": a.data.base64EncodedString(),
+                ]
+            }
+        }
         req.httpBody = try JSONSerialization.data(withJSONObject: body)
 
         let data: Data, resp: URLResponse
