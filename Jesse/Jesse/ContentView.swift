@@ -1,5 +1,4 @@
 import SwiftUI
-import Combine
 
 struct ContentView: View {
     @State private var mode: JesseMode = .ask
@@ -11,10 +10,10 @@ struct ContentView: View {
     @State private var config = ConfigStore.load()
 
     // Thinking indicator: the send button fills left→right over 10s; once past
-    // 10s a live seconds counter is appended. Both reset the instant `busy` ends.
-    @State private var elapsed = 0
-    @State private var fillProgress: CGFloat = 0
-    private let tick = Timer.publish(every: 1, on: .main, in: .common).autoconnect()
+    // 10s a live seconds counter is appended. Both are derived each frame from
+    // `startDate` via a TimelineView, so they're immune to the layout shift the
+    // Cancel button causes on the first send. `startDate` is nil while idle.
+    @State private var startDate: Date?
 
     // Thread continuity. `sessionId` is the last thread we can resume;
     // `continueThread` decides whether the next send resumes it or starts fresh.
@@ -54,42 +53,43 @@ struct ContentView: View {
                 HStack {
                     // Own the layers so the left→right fill sweeps behind the
                     // white label with a deterministic z-order: accent base,
-                    // a darker overlay whose width tracks `fillProgress` (only
+                    // a darker overlay whose width tracks elapsed time (only
                     // while busy), then the spinner + label on top in white.
-                    Button(action: { startSend() }) {
-                        // The label drives the height; the accent base and the
-                        // fill sweep sit behind it (sized to match) so neither
-                        // greedily expands. GeometryReader reads the label's
-                        // frame, so the overlay width is exactly fillProgress of
-                        // the button width.
-                        HStack {
-                            if busy { ProgressView().tint(.white) }
-                            Text(buttonTitle).foregroundStyle(.white)
-                        }
-                        .frame(maxWidth: .infinity)
-                        .padding(.vertical, 10)
-                        .background(alignment: .leading) {
-                            ZStack(alignment: .leading) {
-                                Color.accentColor
-                                // Keep the GeometryReader in the tree at all times
-                                // so the button width is measured before the very
-                                // first send; gate only visibility on `busy`. If
-                                // it were inserted with `if busy`, the first send
-                                // would create it and animate `fillProgress` in the
-                                // same layout pass — width 0, nothing to animate.
-                                GeometryReader { geo in
-                                    Rectangle()
-                                        .fill(Color.black.opacity(0.18))
-                                        .frame(width: geo.size.width * fillProgress)
-                                        .opacity(busy ? 1 : 0)
+                    //
+                    // The fill is driven by a continuous clock — not a
+                    // `withAnimation` width tween — so it survives the layout
+                    // shift the Cancel button introduces on the first send.
+                    // TimelineView ticks every frame while busy and pauses idle;
+                    // each tick recomputes the fill against *live* geometry.
+                    TimelineView(.animation(minimumInterval: 1.0 / 30.0, paused: !busy)) { context in
+                        let elapsed = (busy ? startDate.map { context.date.timeIntervalSince($0) } : nil) ?? 0
+                        let secs = Int(elapsed)
+                        Button(action: { startSend() }) {
+                            HStack {
+                                if busy { ProgressView().tint(.white) }
+                                Text(busy ? (secs > 10 ? "Thinking… \(secs)" : "Thinking…")
+                                          : (continueThread ? "Follow up" : mode.label))
+                                    .foregroundStyle(.white)
+                            }
+                            .frame(maxWidth: .infinity)
+                            .padding(.vertical, 10)
+                            .background(alignment: .leading) {
+                                ZStack(alignment: .leading) {
+                                    Color.accentColor
+                                    GeometryReader { geo in
+                                        Rectangle()
+                                            .fill(Color.black.opacity(0.18))
+                                            .frame(width: geo.size.width * min(elapsed / 10, 1))
+                                            .opacity(busy ? 1 : 0)
+                                    }
                                 }
                             }
+                            .clipShape(RoundedRectangle(cornerRadius: 10))
                         }
-                        .clipShape(RoundedRectangle(cornerRadius: 10))
+                        .buttonStyle(.plain)
+                        .disabled(sendDisabled)
+                        .opacity(dimmed ? 0.5 : 1)
                     }
-                    .buttonStyle(.plain)
-                    .disabled(sendDisabled)
-                    .opacity(dimmed ? 0.5 : 1)
 
                     if busy {
                         Button("Cancel") { sendTask?.cancel() }
@@ -108,8 +108,6 @@ struct ContentView: View {
                     MarkdownText(response)
                         .frame(maxWidth: .infinity, alignment: .leading)
                 }
-
-                Spacer()
             }
             .padding()
             .navigationTitle("Jesse")
@@ -124,7 +122,6 @@ struct ContentView: View {
                 SettingsView(config: $config)
             }
             .onAppear { inbox.drain() }
-            .onReceive(tick) { _ in if busy { elapsed += 1 } }
             .onChange(of: scenePhase) { _, phase in
                 if phase == .active { inbox.drain() }
             }
@@ -150,20 +147,13 @@ struct ContentView: View {
         !busy && input.trimmingCharacters(in: .whitespaces).isEmpty
     }
 
-    private var buttonTitle: String {
-        guard busy else { return continueThread ? "Follow up" : mode.label }
-        return elapsed > 10 ? "Thinking… \(elapsed)" : "Thinking…"
-    }
-
     private func startSend(voice: Bool = false) {
         inputFocused = false
         errorText = nil
-        elapsed = 0
-        fillProgress = 0
+        // Stamp the clock the timeline reads, then go busy — the fill and
+        // counter both derive from this instant.
+        startDate = Date()
         busy = true
-        // Sweep the fill 0→1 over 10s. The overlay is gated on `busy`, so when
-        // the run ends and `busy` flips false the sweep simply vanishes.
-        withAnimation(.linear(duration: 10)) { fillProgress = 1 }
         let text = input
         let resume = continueThread ? sessionId : nil
         sendTask = Task {
@@ -189,11 +179,10 @@ struct ContentView: View {
                     }
                 }
             }
-            // Reset on every exit — success, error, and cancel. No withAnimation:
-            // the sweep is gated on `busy`, so it's already hidden by now.
+            // Reset on every exit — success, error, and cancel. Clearing
+            // `startDate` pauses the timeline and the sweep vanishes with `busy`.
             busy = false
-            fillProgress = 0
-            elapsed = 0
+            startDate = nil
             sendTask = nil
         }
     }
