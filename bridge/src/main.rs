@@ -35,6 +35,7 @@ use axum::{
 use serde::Deserialize;
 use serde_json::{json, Value};
 use tokio::process::Command;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio::time::timeout;
 
 // ---- Prompt wrappers — the ONLY difference between Ask and Tell ------------
@@ -80,6 +81,15 @@ clearest form, keep it to 2–3 narrow columns; otherwise avoid tables.)";
 
 // ---- Config (env-driven) --------------------------------------------------
 
+// Hard upper bound on any single turn, regardless of JESSE_TIMEOUT. A request
+// cannot pin a `claude` child (and a concurrency permit) for longer than this.
+const HARD_TIMEOUT_CEILING: u64 = 3600;
+
+// Captured agent stdout is truncated to this many bytes before parsing so one
+// pathological run can't balloon the bridge's memory. The JSON envelope the
+// bridge cares about is kilobytes; multiple MB is already pathological.
+const MAX_OUTPUT_BYTES: usize = 4 * 1024 * 1024;
+
 // Least-privilege default tool allowlist for the headless agent. Scoped to what
 // the vault's Ask/Tell workflows actually need: file read/write/search, the
 // read-only QMD vault-search MCP tools, and a few scoped shell verbs (git for
@@ -108,12 +118,30 @@ struct Config {
     allowed_tools: String,
     // Comma-separated tool denylist passed to `claude --disallowedTools`.
     disallowed_tools: String,
+    // Max concurrent turns. A request that can't get a permit immediately is
+    // rejected with 429 rather than queued unboundedly.
+    max_concurrency: usize,
+    // Per-service rate ceiling (requests accepted per rolling minute). Bursts
+    // beyond this are rejected with 429.
+    rate_per_min: u32,
     // How long POST /jesse holds the connection waiting for the turn before it
     // returns 202 and lets the client poll. A few seconds catches fast turns
     // inline; everything longer is resolved via GET /jesse/result/{job_id}.
     grace_secs: u64,
     // How long a completed/failed job stays retrievable before TTL eviction.
     job_ttl_secs: u64,
+}
+
+/// Clamp a requested per-turn timeout into a sane, bounded range. `0` is treated
+/// as "use the ceiling" rather than "unlimited" so no request can pin a child
+/// forever; any value is capped at `HARD_TIMEOUT_CEILING` and floored at 1s.
+/// The only "unlimited" affordance lives in `run_claude` behind
+/// `#[cfg(debug_assertions)]` and is never reachable in a release build.
+fn clamp_timeout_secs(raw: u64) -> u64 {
+    if raw == 0 {
+        return HARD_TIMEOUT_CEILING;
+    }
+    raw.clamp(1, HARD_TIMEOUT_CEILING)
 }
 
 impl Config {
@@ -130,10 +158,12 @@ impl Config {
                 .unwrap_or(8765),
             claude_bin: std::env::var("JESSE_CLAUDE_BIN")
                 .unwrap_or_else(|_| "claude".to_string()),
-            timeout_secs: std::env::var("JESSE_TIMEOUT")
-                .ok()
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(1800), // was 120; 0 = unlimited (see run_claude)
+            timeout_secs: clamp_timeout_secs(
+                std::env::var("JESSE_TIMEOUT")
+                    .ok()
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(1800),
+            ),
             allowed_tools: std::env::var("JESSE_ALLOWED_TOOLS")
                 .ok()
                 .filter(|s| !s.trim().is_empty())
@@ -142,6 +172,16 @@ impl Config {
                 .ok()
                 .filter(|s| !s.trim().is_empty())
                 .unwrap_or_else(|| DEFAULT_DISALLOWED_TOOLS.to_string()),
+            max_concurrency: std::env::var("JESSE_MAX_CONCURRENCY")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .filter(|n| *n >= 1)
+                .unwrap_or(2),
+            rate_per_min: std::env::var("JESSE_RATE_PER_MIN")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .filter(|n| *n >= 1)
+                .unwrap_or(30),
             grace_secs: std::env::var("JESSE_GRACE_SECS")
                 .ok()
                 .and_then(|s| s.parse().ok())
@@ -185,6 +225,54 @@ fn env_truthy(name: &str) -> bool {
             v == "1" || v == "true" || v == "yes" || v == "on"
         })
         .unwrap_or(false)
+}
+
+// ---- Rate limit (C3) ------------------------------------------------------
+//
+// A single-token bridge needs only one bucket. A classic token bucket: capacity
+// == refill == `rate_per_min` tokens, refilled continuously over a 60s window.
+// One Mutex around two small numbers — lock-light, no background task.
+
+struct RateLimiter {
+    capacity: f64,
+    // Tokens added per second (capacity / 60).
+    refill_per_sec: f64,
+    inner: Mutex<RateState>,
+}
+
+struct RateState {
+    tokens: f64,
+    last: Instant,
+}
+
+impl RateLimiter {
+    fn new(per_min: u32) -> Self {
+        let capacity = per_min.max(1) as f64;
+        RateLimiter {
+            capacity,
+            refill_per_sec: capacity / 60.0,
+            inner: Mutex::new(RateState {
+                tokens: capacity,
+                last: Instant::now(),
+            }),
+        }
+    }
+
+    /// Try to consume one token. Returns true if allowed, false if the caller
+    /// should be rejected with 429.
+    fn allow(&self) -> bool {
+        let now = Instant::now();
+        let mut s = self.inner.lock().unwrap();
+        let elapsed = now.saturating_duration_since(s.last).as_secs_f64();
+        s.tokens = (s.tokens + elapsed * self.refill_per_sec).min(self.capacity);
+        s.last = now;
+        if s.tokens >= 1.0 {
+            s.tokens -= 1.0;
+            true
+        } else {
+            false
+        }
+    }
 }
 
 // ---- Job store — keeps a turn alive past the client connection ------------
@@ -280,11 +368,33 @@ impl JobStore {
     }
 }
 
-/// Shared, cheaply-clonable handler state: read-only config + the job store.
+/// Shared, cheaply-clonable handler state: read-only config, the job store, the
+/// concurrency semaphore, and the rate limiter.
 #[derive(Clone)]
 struct AppState {
     cfg: Arc<Config>,
     jobs: Arc<JobStore>,
+    // Bounds concurrent turns (C3). A permit is held for the life of a turn.
+    sem: Arc<Semaphore>,
+    // Per-service request rate ceiling (C3).
+    limiter: Arc<RateLimiter>,
+}
+
+impl AppState {
+    /// Build shared state from a config, sizing the semaphore and rate limiter
+    /// from it. Used by both `main` and the tests so they exercise the same
+    /// wiring.
+    fn new(cfg: Config) -> Self {
+        let job_ttl = Duration::from_secs(cfg.job_ttl_secs);
+        let sem = Arc::new(Semaphore::new(cfg.max_concurrency.max(1)));
+        let limiter = Arc::new(RateLimiter::new(cfg.rate_per_min));
+        AppState {
+            cfg: Arc::new(cfg),
+            jobs: Arc::new(JobStore::new(job_ttl)),
+            sem,
+            limiter,
+        }
+    }
 }
 
 // ---- Request / response shapes --------------------------------------------
@@ -490,8 +600,15 @@ async fn run_claude(
             )
         })?;
 
-        let output = if cfg.timeout_secs == 0 {
-            // Unlimited: some agent runs legitimately exceed any fixed cap.
+        // "Unlimited" (timeout_secs == 0) is a debug-only affordance and never
+        // compiled into a release build; Config::from_env clamps 0 to the
+        // ceiling, so in release timeout_secs is always >= 1 and bounded.
+        #[cfg(debug_assertions)]
+        let unlimited = cfg.timeout_secs == 0;
+        #[cfg(not(debug_assertions))]
+        let unlimited = false;
+
+        let output = if unlimited {
             // kill_on_drop still reaps the child if this future is dropped.
             match child.wait_with_output().await {
                 Ok(o) => o,
@@ -512,8 +629,13 @@ async fn run_claude(
             }
         };
 
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let stderr = String::from_utf8_lossy(&output.stderr);
+        // Cap captured output so one pathological run can't bloat memory. The
+        // envelope the bridge parses is kilobytes; truncating multi-MB stdout
+        // before the lossy decode is safe (a split multibyte char becomes U+FFFD).
+        let stdout_cap = output.stdout.len().min(MAX_OUTPUT_BYTES);
+        let stderr_cap = output.stderr.len().min(MAX_OUTPUT_BYTES);
+        let stdout = String::from_utf8_lossy(&output.stdout[..stdout_cap]);
+        let stderr = String::from_utf8_lossy(&output.stderr[..stderr_cap]);
         match interpret_claude_output(&stdout, &stderr, output.status.success()) {
             ClaudeOutcome::Ok { result, session_id } => return Ok((result, session_id)),
             ClaudeOutcome::Fatal { message } => return Err((StatusCode::BAD_GATEWAY, message)),
@@ -549,9 +671,33 @@ async fn jesse(
     Json(req): Json<JesseRequest>,
 ) -> Result<Response, ApiError> {
     check_auth(&headers, &st.cfg.token)?;
+
+    // Rate limit before doing any work (C3). A per-service token bucket; bursts
+    // beyond JESSE_RATE_PER_MIN are shed with 429 rather than queued.
+    if !st.limiter.allow() {
+        return Err((
+            StatusCode::TOO_MANY_REQUESTS,
+            "rate limit exceeded".to_string(),
+        ));
+    }
+
     let mode = req.mode.trim().to_lowercase();
     let is_followup = req.session_id.is_some();
     let prompt = build_prompt(&mode, &req.text, is_followup, req.voice)?;
+
+    // Concurrency cap (C3): take a permit before spawning the turn. If none is
+    // immediately available, shed load with 429 instead of queuing unboundedly.
+    // The permit is moved into the spawned task and held for the life of the
+    // turn, so the cap reflects in-flight turns, not just connected clients.
+    let permit = match st.sem.clone().try_acquire_owned() {
+        Ok(p) => p,
+        Err(_) => {
+            return Err((
+                StatusCode::TOO_MANY_REQUESTS,
+                "busy: too many concurrent turns".to_string(),
+            ))
+        }
+    };
 
     // Opportunistic sweep so the map can't grow unbounded between requests.
     st.jobs.evict_expired();
@@ -565,6 +711,8 @@ async fn jesse(
     let jid = job_id.clone();
     let sid = req.session_id.clone();
     let mut handle = tokio::spawn(async move {
+        // Hold the permit for the whole turn, releasing it on task exit.
+        let _permit: OwnedSemaphorePermit = permit;
         let outcome = run_claude(&cfg, &prompt, sid.as_deref()).await;
         jobs.complete(&jid, outcome);
     });
@@ -727,11 +875,7 @@ async fn main() {
     }
 
     let addr = format!("{}:{}", cfg.bind, cfg.port);
-    let job_ttl = Duration::from_secs(cfg.job_ttl_secs);
-    let state = AppState {
-        cfg: Arc::new(cfg),
-        jobs: Arc::new(JobStore::new(job_ttl)),
-    };
+    let state = AppState::new(cfg);
 
     // Pairing QR — scan it from the app's Settings to fill in host/port/token.
     // The advertised host defaults to the bound IP (reliably reachable on the
@@ -1003,18 +1147,15 @@ mod tests {
             timeout_secs: 1800,
             allowed_tools: DEFAULT_ALLOWED_TOOLS.to_string(),
             disallowed_tools: DEFAULT_DISALLOWED_TOOLS.to_string(),
+            max_concurrency: 2,
+            rate_per_min: 30,
             grace_secs: 10,
             job_ttl_secs: 600,
         }
     }
 
     fn test_state() -> AppState {
-        let cfg = test_config();
-        let ttl = Duration::from_secs(cfg.job_ttl_secs);
-        AppState {
-            cfg: Arc::new(cfg),
-            jobs: Arc::new(JobStore::new(ttl)),
-        }
+        AppState::new(test_config())
     }
 
     async fn body_string(resp: axum::response::Response) -> String {
@@ -1246,10 +1387,7 @@ mod tests {
             grace_secs: 1, // force the 202 path
             ..test_config()
         };
-        let st = AppState {
-            cfg: Arc::new(cfg),
-            jobs: Arc::new(JobStore::new(Duration::from_secs(600))),
-        };
+        let st = AppState::new(cfg);
 
         // POST — should hit grace expiry and return 202 with a job_id.
         let resp = app(st.clone())
@@ -1298,10 +1436,7 @@ mod tests {
             grace_secs: 10,
             ..test_config()
         };
-        let st = AppState {
-            cfg: Arc::new(cfg),
-            jobs: Arc::new(JobStore::new(Duration::from_secs(600))),
-        };
+        let st = AppState::new(cfg);
 
         let resp = app(st.clone())
             .oneshot(jesse_request(
@@ -1407,5 +1542,82 @@ mod tests {
         for a in ["0.0.0.0", "192.168.1.10", "8.8.8.8", "example.com", "127.0.0.1"] {
             assert!(is_bind_allowed(a, true), "{a} should be allowed when public");
         }
+    }
+
+    // ---- C3: timeout clamp -------------------------------------------------
+
+    #[test]
+    fn timeout_clamp_treats_zero_as_ceiling() {
+        // 0 means "ceiling", never unlimited.
+        assert_eq!(clamp_timeout_secs(0), HARD_TIMEOUT_CEILING);
+        // Over-ceiling is capped; in-range is unchanged; 1 is the floor.
+        assert_eq!(clamp_timeout_secs(HARD_TIMEOUT_CEILING + 10), HARD_TIMEOUT_CEILING);
+        assert_eq!(clamp_timeout_secs(1800), 1800);
+        assert_eq!(clamp_timeout_secs(1), 1);
+    }
+
+    #[test]
+    fn config_zero_timeout_clamps_to_ceiling() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let saved = std::env::var("JESSE_TIMEOUT").ok();
+        std::env::set_var("JESSE_TIMEOUT", "0");
+        let cfg = Config::from_env();
+        assert_eq!(cfg.timeout_secs, HARD_TIMEOUT_CEILING);
+        match saved {
+            Some(v) => std::env::set_var("JESSE_TIMEOUT", v),
+            None => std::env::remove_var("JESSE_TIMEOUT"),
+        }
+    }
+
+    // ---- C3: concurrency cap ----------------------------------------------
+
+    #[tokio::test]
+    async fn second_concurrent_turn_is_429() {
+        // A fake claude that sleeps long enough that the first turn is still
+        // in-flight (holding the only permit) when the second POST arrives.
+        let script = "#!/bin/sh\nsleep 2\nprintf '%s' '{\"type\":\"result\",\"is_error\":false,\"result\":\"ok\",\"session_id\":\"s\"}'\n";
+        let fake = write_fake_claude(script);
+        let cfg = Config {
+            claude_bin: fake.to_string_lossy().into_owned(),
+            grace_secs: 1,        // first POST returns 202 while the turn runs on
+            max_concurrency: 1,   // exactly one permit
+            ..test_config()
+        };
+        let st = AppState::new(cfg);
+
+        // First POST: occupies the only permit, returns 202 at grace expiry; the
+        // detached turn keeps the permit while the fake claude sleeps.
+        let first = app(st.clone())
+            .oneshot(jesse_request(
+                Some("Bearer test-token"),
+                r#"{"mode":"ask","text":"one"}"#,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(first.status(), StatusCode::ACCEPTED);
+
+        // Second POST while the first turn still holds the permit → 429.
+        let second = app(st.clone())
+            .oneshot(jesse_request(
+                Some("Bearer test-token"),
+                r#"{"mode":"ask","text":"two"}"#,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(second.status(), StatusCode::TOO_MANY_REQUESTS);
+
+        let _ = std::fs::remove_file(&fake);
+    }
+
+    // ---- C3: rate limiter --------------------------------------------------
+
+    #[test]
+    fn rate_limiter_sheds_burst_beyond_capacity() {
+        // Capacity 3: first three allowed, fourth shed.
+        let rl = RateLimiter::new(3);
+        assert!(rl.allow());
+        assert!(rl.allow());
+        assert!(rl.allow());
+        assert!(!rl.allow(), "burst beyond capacity must be rejected");
     }
 }
