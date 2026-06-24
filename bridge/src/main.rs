@@ -9,9 +9,12 @@
 //!     export JESSE_BIND="$(tailscale ip -4 | head -1)"   # or 127.0.0.1 to test
 //!     cargo run --release
 //!
-//! Security model: bind to the Tailscale interface only. The tailnet is
-//! WireGuard-encrypted and ACL-gated; the bearer token is a second factor.
-//! Never bind to 0.0.0.0 on an untrusted network.
+//! Security model: bind to loopback or the Tailscale/CGNAT interface only. The
+//! tailnet is WireGuard-encrypted and ACL-gated; the bearer token is a second
+//! factor. The headless agent runs under an explicit tool allowlist (see
+//! `build_claude_args`); that allowlist is the only in-process boundary — real
+//! isolation (dedicated low-privilege user, OS sandbox) is a deployment concern
+//! documented in SECURITY.md.
 
 use std::collections::HashMap;
 use std::hash::BuildHasher;
@@ -76,6 +79,22 @@ clearest form, keep it to 2–3 narrow columns; otherwise avoid tables.)";
 
 // ---- Config (env-driven) --------------------------------------------------
 
+// Least-privilege default tool allowlist for the headless agent. Scoped to what
+// the vault's Ask/Tell workflows actually need: file read/write/search, the
+// read-only QMD vault-search MCP tools, and a few scoped shell verbs (git for
+// vault history, mv/ls/cat/find for file wrangling). Bare `Bash` is deliberately
+// absent — only the `Bash(<verb>:*)` scopes below are allowed. Override with
+// JESSE_ALLOWED_TOOLS. Keep in sync with the table in SECURITY.md.
+const DEFAULT_ALLOWED_TOOLS: &str = "Read,Write,Edit,Grep,Glob,\
+mcp__qmd__query,mcp__qmd__get,mcp__qmd__multi_get,mcp__qmd__status,\
+Bash(git:*),Bash(mv:*),Bash(ls:*),Bash(cat:*),Bash(find:*)";
+
+// Defense-in-depth: tools that must never run from the bridge even if they slip
+// into the allowlist. Unscoped Bash (arbitrary shell) and WebFetch (SSRF / data
+// exfiltration surface the Ask/Tell workflows don't need). Override with
+// JESSE_DISALLOWED_TOOLS.
+const DEFAULT_DISALLOWED_TOOLS: &str = "Bash,WebFetch";
+
 #[derive(Clone)]
 struct Config {
     token: String,
@@ -84,6 +103,10 @@ struct Config {
     port: u16,
     claude_bin: String,
     timeout_secs: u64,
+    // Comma-separated tool allowlist passed to `claude --allowedTools`.
+    allowed_tools: String,
+    // Comma-separated tool denylist passed to `claude --disallowedTools`.
+    disallowed_tools: String,
     // How long POST /jesse holds the connection waiting for the turn before it
     // returns 202 and lets the client poll. A few seconds catches fast turns
     // inline; everything longer is resolved via GET /jesse/result/{job_id}.
@@ -110,6 +133,14 @@ impl Config {
                 .ok()
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(1800), // was 120; 0 = unlimited (see run_claude)
+            allowed_tools: std::env::var("JESSE_ALLOWED_TOOLS")
+                .ok()
+                .filter(|s| !s.trim().is_empty())
+                .unwrap_or_else(|| DEFAULT_ALLOWED_TOOLS.to_string()),
+            disallowed_tools: std::env::var("JESSE_DISALLOWED_TOOLS")
+                .ok()
+                .filter(|s| !s.trim().is_empty())
+                .unwrap_or_else(|| DEFAULT_DISALLOWED_TOOLS.to_string()),
             grace_secs: std::env::var("JESSE_GRACE_SECS")
                 .ok()
                 .and_then(|s| s.parse().ok())
@@ -356,6 +387,38 @@ fn interpret_claude_output(stdout: &str, stderr: &str, exit_success: bool) -> Cl
     }
 }
 
+/// Build the argument vector for one `claude` invocation (everything after the
+/// binary name). Pure and side-effect-free so it can be unit-tested without
+/// spawning a process. Enforces the C1 least-privilege boundary:
+///   * `--permission-mode default` (never `acceptEdits`/`bypassPermissions`)
+///   * an explicit `--allowedTools` list (always present)
+///   * a `--disallowedTools` denylist as defense-in-depth
+///
+/// A `session_id` adds `--resume <id>` to continue a thread.
+fn build_claude_args(cfg: &Config, prompt: &str, session_id: Option<&str>) -> Vec<String> {
+    let mut args = vec![
+        "-p".to_string(),
+        prompt.to_string(),
+        "--output-format".to_string(),
+        "json".to_string(),
+        // Default permission mode: tools are gated by the allow/deny lists
+        // below rather than auto-accepted. Never acceptEdits/bypassPermissions.
+        "--permission-mode".to_string(),
+        "default".to_string(),
+        "--allowedTools".to_string(),
+        cfg.allowed_tools.clone(),
+    ];
+    if !cfg.disallowed_tools.trim().is_empty() {
+        args.push("--disallowedTools".to_string());
+        args.push(cfg.disallowed_tools.clone());
+    }
+    if let Some(sid) = session_id {
+        args.push("--resume".to_string());
+        args.push(sid.to_string());
+    }
+    args
+}
+
 /// Invoke headless Claude Code in the vault. Returns (reply_text, session_id).
 /// Pass session_id to continue a thread; the returned id is always captured so
 /// the client can follow up later. Resuming keeps CLAUDE.md loaded and retains
@@ -377,23 +440,14 @@ async fn run_claude(
 
     for attempt in 1..=MAX_ATTEMPTS {
         // Fresh Command per attempt — same args, including --resume if present.
+        // Tool access is constrained by the explicit allow/deny lists in
+        // build_claude_args (C1); the agent runs under --permission-mode default.
         let mut cmd = Command::new(&cfg.claude_bin);
-        cmd.arg("-p")
-            .arg(prompt)
-            .arg("--output-format")
-            .arg("json")
-            // Non-interactive: let edits/tools through without a TTY prompt.
-            // PoC-only on a trusted tailnet. Tighten with --allowedTools later.
-            .arg("--permission-mode")
-            .arg("acceptEdits")
+        cmd.args(build_claude_args(cfg, prompt, session_id))
             .current_dir(&cfg.vault) // cwd = vault → CLAUDE.md auto-loads
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true); // killed if the timeout below fires
-
-        if let Some(sid) = session_id {
-            cmd.arg("--resume").arg(sid);
-        }
 
         let child = cmd.spawn().map_err(|e| {
             (
@@ -900,6 +954,8 @@ mod tests {
             port: 8765,
             claude_bin: "claude".to_string(),
             timeout_secs: 1800,
+            allowed_tools: DEFAULT_ALLOWED_TOOLS.to_string(),
+            disallowed_tools: DEFAULT_DISALLOWED_TOOLS.to_string(),
             grace_secs: 10,
             job_ttl_secs: 600,
         }
@@ -1214,5 +1270,66 @@ mod tests {
         assert!(body["job_id"].as_str().is_some(), "200 carries a job_id");
 
         let _ = std::fs::remove_file(&fake);
+    }
+
+    // ---- C1: build_claude_args --------------------------------------------
+
+    #[test]
+    fn build_claude_args_enforces_least_privilege() {
+        let cfg = test_config();
+        let args = build_claude_args(&cfg, "hello", None);
+
+        // --allowedTools is always present, with the configured list as its value.
+        let idx = args
+            .iter()
+            .position(|a| a == "--allowedTools")
+            .expect("--allowedTools must always be present");
+        let allow = &args[idx + 1];
+        assert_eq!(allow, &cfg.allowed_tools);
+
+        // Permission mode is default — never an auto-accept / bypass mode.
+        let pidx = args
+            .iter()
+            .position(|a| a == "--permission-mode")
+            .expect("--permission-mode present");
+        assert_eq!(args[pidx + 1], "default");
+
+        // acceptEdits / bypassPermissions never appear anywhere in the args.
+        for a in &args {
+            assert!(!a.contains("acceptEdits"), "acceptEdits must not appear: {a}");
+            assert!(
+                !a.contains("bypassPermissions"),
+                "bypassPermissions must not appear: {a}"
+            );
+        }
+
+        // Unscoped `Bash` is not in the allowlist — only scoped Bash(...) verbs.
+        let tools: Vec<&str> = allow.split(',').map(|t| t.trim()).collect();
+        assert!(
+            !tools.contains(&"Bash"),
+            "unscoped Bash must not be allowed: {tools:?}"
+        );
+        assert!(
+            tools.iter().any(|t| t.starts_with("Bash(")),
+            "expected scoped Bash(...) entries: {tools:?}"
+        );
+
+        // Defense-in-depth denylist is passed and contains bare Bash.
+        let didx = args
+            .iter()
+            .position(|a| a == "--disallowedTools")
+            .expect("--disallowedTools present");
+        assert!(args[didx + 1].split(',').any(|t| t.trim() == "Bash"));
+    }
+
+    #[test]
+    fn build_claude_args_resume_when_session() {
+        let cfg = test_config();
+        let args = build_claude_args(&cfg, "hi", Some("sess-42"));
+        let ridx = args.iter().position(|a| a == "--resume").expect("--resume");
+        assert_eq!(args[ridx + 1], "sess-42");
+        // No --resume without a session id.
+        let none = build_claude_args(&cfg, "hi", None);
+        assert!(!none.iter().any(|a| a == "--resume"));
     }
 }
