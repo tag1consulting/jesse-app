@@ -55,9 +55,12 @@ final class RunCoordinator {
     @ObservationIgnored private var backgroundIDs: [UUID: UIBackgroundTaskIdentifier] = [:]
 
     private let configProvider: @MainActor () -> JesseConfig
+    private let makeClient: @MainActor (JesseConfig) -> any JesseClientProtocol
 
-    init(config: @escaping @MainActor () -> JesseConfig = { ConfigStore.load() }) {
+    init(config: @escaping @MainActor () -> JesseConfig = { ConfigStore.load() },
+         makeClient: @escaping @MainActor (JesseConfig) -> any JesseClientProtocol = { JesseClient(config: $0) }) {
         self.configProvider = config
+        self.makeClient = makeClient
         self.inFlight = InFlightStore.load()
     }
 
@@ -112,7 +115,7 @@ final class RunCoordinator {
 
         tasks[threadID] = Task { [weak self] in
             guard let self else { return }
-            let client = JesseClient(config: cfg)
+            let client = self.makeClient(cfg)
             do {
                 let result = try await client.send(mode: mode, text: trimmed,
                                                    sessionId: sessionId, voice: voice)
@@ -136,8 +139,18 @@ final class RunCoordinator {
         }
     }
 
+    /// Cancellation is authoritative over the run's state, not just the task.
+    /// We cancel the task *and* clear the run synchronously so the thread is idle
+    /// the instant the user taps Cancel: `inFlight` is dropped (the bridge has no
+    /// cancel endpoint, so the turn keeps running server-side, but the user asked
+    /// to stop, so its eventual result is discarded rather than re-attached) and
+    /// `startDates` is cleared. Dropping the task handle here — together with the
+    /// poll loop's cancelled-exit — means `isRunning` reports `false` immediately;
+    /// the task's own tail still runs to release the background grant.
     func cancel(_ threadID: UUID) {
         tasks[threadID]?.cancel()
+        tasks[threadID] = nil
+        clearRun(threadID)
     }
 
     // MARK: - Resume (foreground re-attach)
@@ -150,7 +163,7 @@ final class RunCoordinator {
             let cfg = configProvider()
             tasks[threadID] = Task { [weak self] in
                 guard let self else { return }
-                let client = JesseClient(config: cfg)
+                let client = self.makeClient(cfg)
                 await self.poll(threadID: threadID, jobId: job.jobId, voice: job.voice,
                                 client: client, context: context)
                 self.tasks[threadID] = nil
@@ -165,19 +178,27 @@ final class RunCoordinator {
     /// (`.connectionLost`) leaves the job persisted and stops quietly — the next
     /// `resume` picks it back up.
     private func poll(threadID: UUID, jobId: String, voice: Bool,
-                      client: JesseClient, context: ModelContext) async {
+                      client: any JesseClientProtocol, context: ModelContext) async {
         while !Task.isCancelled {
             let state: JesseResultState
             do {
                 state = try await client.result(jobId: jobId)
             } catch let error as JesseError {
+                // A user-initiated cancel surfaces here as a cancelled URL load
+                // (mapped to `.transport`). Treat any cancellation as a clean
+                // stop — the run was already cleared by `cancel`, so don't `fail`.
+                if Task.isCancelled { return }
                 if case .connectionLost = error { return } // keep job; retry on resume
                 fail(threadID: threadID, message: error.localizedDescription, voice: voice)
                 return
             } catch {
+                if Task.isCancelled { return }
                 fail(threadID: threadID, message: error.localizedDescription, voice: voice)
                 return
             }
+            // A `.done` can land in the same instant the user cancels; bail before
+            // acting on it so no reply is appended for a cancelled run.
+            if Task.isCancelled { return }
             switch state {
             case .running:
                 try? await Task.sleep(for: .seconds(2))

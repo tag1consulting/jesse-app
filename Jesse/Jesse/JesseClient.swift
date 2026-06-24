@@ -198,7 +198,15 @@ enum JesseResultState {
     case failed(String)
 }
 
-struct JesseClient {
+/// The two bridge calls the coordinator drives a turn with. Pulled behind a
+/// protocol purely so a fake can exercise the poll loop in tests without a
+/// server; `JesseClient` is the only production conformer.
+protocol JesseClientProtocol {
+    func send(mode: JesseMode, text: String, sessionId: String?, voice: Bool) async throws -> JesseSendResult
+    func result(jobId: String) async throws -> JesseResultState
+}
+
+struct JesseClient: JesseClientProtocol {
     var config: JesseConfig
 
     // Agent runs can exceed any fixed cap — that's the point. Raise both timeouts
