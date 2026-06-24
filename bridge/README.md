@@ -72,6 +72,38 @@ Jesse asked and your half-answer are conversation state, not vault facts).
 Resuming keeps `CLAUDE.md` loaded and retains filesystem access — it only adds the
 prior turns on top.
 
+## Surviving a client disconnect (job store)
+
+A turn runs on its own detached task that owns the `claude` child, so it is **no
+longer tied to the HTTP connection**. If the phone suspends and the socket drops
+mid-turn, the turn keeps running to completion instead of being killed — the
+reply is never lost.
+
+`POST /jesse` waits up to a short **grace window** (`JESSE_GRACE_SECS`, default
+`10s`) for the turn:
+
+- Done within grace → **`200`** with the usual `{ mode, response, session_id }`
+  **plus** a `job_id` (additive; existing callers ignore it).
+- Still running at grace expiry → **`202 { "job_id": "...", "status": "running" }`**.
+  The turn keeps running server-side.
+
+Fetch the result later by id:
+
+```bash
+curl -s http://127.0.0.1:8765/jesse/result/<job_id> \
+  -H "Authorization: Bearer $JESSE_TOKEN"
+# → { "status": "running" }
+#   { "status": "done", "response": "...", "session_id": "..." }
+#   { "status": "failed", "error": "..." }
+```
+
+Same bearer auth as `/jesse`. An unknown or evicted id → **`404`**. Completed and
+failed jobs are evicted on a TTL (`JESSE_JOB_TTL_SECS`, default `600s`) so the
+in-memory store can't grow unbounded. The store is in-memory only: a bridge
+restart drops in-flight jobs. That's acceptable for a single-user bridge; the
+escalation path, if cross-restart durability is ever needed, is a disk- or
+queue-backed store.
+
 ## Voice requests
 
 The `/jesse` body accepts an optional `"voice": true` flag. When set, the prompt
@@ -105,6 +137,8 @@ curl -s http://127.0.0.1:8765/jesse \
 | `JESSE_ADVERTISE_HOST` | value of `JESSE_BIND` | Host written into the pairing QR — set to the MagicDNS `ts.net` name to advertise that instead of the bound IP |
 | `JESSE_PORT` | `8765` | Port |
 | `JESSE_TIMEOUT` | `1800` | Hard ceiling per request (seconds). `0` = unlimited (no timeout — rely on the client's Cancel button) |
+| `JESSE_GRACE_SECS` | `10` | How long `POST /jesse` holds the connection for the inline fast path before returning `202` and letting the client poll `GET /jesse/result/{job_id}` |
+| `JESSE_JOB_TTL_SECS` | `600` | How long a completed/failed job stays retrievable before TTL eviction |
 | `JESSE_CLAUDE_BIN` | `claude` | Path to the `claude` binary |
 
 The server refuses to start if `JESSE_TOKEN` is unset, the vault isn't a

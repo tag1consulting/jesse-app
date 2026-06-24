@@ -13,18 +13,22 @@
 //! WireGuard-encrypted and ACL-gated; the bearer token is a second factor.
 //! Never bind to 0.0.0.0 on an untrusted network.
 
+use std::collections::HashMap;
+use std::hash::BuildHasher;
 use std::path::Path;
 use std::process::Stdio;
-use std::sync::Arc;
-use std::time::Duration;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use axum::{
-    extract::State,
+    extract::{Path as UrlPath, State},
     http::{HeaderMap, StatusCode},
+    response::{IntoResponse, Response},
     routing::{get, post},
     Json, Router,
 };
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use serde_json::{json, Value};
 use tokio::process::Command;
 use tokio::time::timeout;
@@ -80,6 +84,12 @@ struct Config {
     port: u16,
     claude_bin: String,
     timeout_secs: u64,
+    // How long POST /jesse holds the connection waiting for the turn before it
+    // returns 202 and lets the client poll. A few seconds catches fast turns
+    // inline; everything longer is resolved via GET /jesse/result/{job_id}.
+    grace_secs: u64,
+    // How long a completed/failed job stays retrievable before TTL eviction.
+    job_ttl_secs: u64,
 }
 
 impl Config {
@@ -100,8 +110,116 @@ impl Config {
                 .ok()
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(1800), // was 120; 0 = unlimited (see run_claude)
+            grace_secs: std::env::var("JESSE_GRACE_SECS")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(10),
+            job_ttl_secs: std::env::var("JESSE_JOB_TTL_SECS")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(600), // 10 min
         }
     }
+}
+
+// ---- Job store — keeps a turn alive past the client connection ------------
+//
+// The phone may suspend (socket drops) mid-turn. The turn runs on its own
+// detached task and lands its result here, keyed by an opaque job id, so a
+// later GET /jesse/result/{job_id} can fetch it. Entries are evicted on a TTL
+// after completion so the map can't grow unbounded. In-memory only — a bridge
+// restart drops in-flight jobs (acceptable for a single-user bridge; the
+// escalation path, if durability is ever needed, is a disk/queue-backed store).
+
+#[derive(Clone)]
+enum JobState {
+    Running,
+    Done {
+        response: String,
+        session_id: Option<String>,
+    },
+    Failed {
+        error: String,
+    },
+}
+
+struct Job {
+    state: JobState,
+    // Set when the job reaches a terminal state; drives TTL eviction.
+    completed_at: Option<Instant>,
+}
+
+struct JobStore {
+    jobs: Mutex<HashMap<String, Job>>,
+    ttl: Duration,
+}
+
+// Monotonic counter guarantees per-process uniqueness; the random high half
+// (a fresh OS-seeded RandomState per id) makes the id opaque. The endpoint is
+// bearer-auth gated, so the id is not itself a security boundary.
+static JOB_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+fn new_job_id() -> String {
+    let n = JOB_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let r = std::collections::hash_map::RandomState::new().hash_one(n);
+    format!("{r:016x}{n:016x}")
+}
+
+impl JobStore {
+    fn new(ttl: Duration) -> Self {
+        JobStore {
+            jobs: Mutex::new(HashMap::new()),
+            ttl,
+        }
+    }
+
+    /// Register a new running job and return its opaque id.
+    fn create(&self) -> String {
+        let id = new_job_id();
+        self.jobs.lock().unwrap().insert(
+            id.clone(),
+            Job {
+                state: JobState::Running,
+                completed_at: None,
+            },
+        );
+        id
+    }
+
+    /// Land a turn's outcome onto its job. A Fatal/io error becomes Failed.
+    fn complete(&self, id: &str, outcome: Result<(String, Option<String>), ApiError>) {
+        let state = match outcome {
+            Ok((response, session_id)) => JobState::Done {
+                response,
+                session_id,
+            },
+            Err((_code, error)) => JobState::Failed { error },
+        };
+        if let Some(job) = self.jobs.lock().unwrap().get_mut(id) {
+            job.state = state;
+            job.completed_at = Some(Instant::now());
+        }
+    }
+
+    fn get(&self, id: &str) -> Option<JobState> {
+        self.jobs.lock().unwrap().get(id).map(|j| j.state.clone())
+    }
+
+    /// Drop completed/failed jobs older than the TTL. Running jobs are kept.
+    fn evict_expired(&self) {
+        let ttl = self.ttl;
+        self.jobs.lock().unwrap().retain(|_, j| match j.completed_at {
+            Some(t) => t.elapsed() < ttl,
+            None => true,
+        });
+    }
+}
+
+/// Shared, cheaply-clonable handler state: read-only config + the job store.
+#[derive(Clone)]
+struct AppState {
+    cfg: Arc<Config>,
+    jobs: Arc<JobStore>,
 }
 
 // ---- Request / response shapes --------------------------------------------
@@ -114,13 +232,6 @@ struct JesseRequest {
     session_id: Option<String>,   // set to continue a thread (a followup)
     #[serde(default)]
     voice: bool, // voice request → ask for a SPOKEN: summary line, keep it listenable
-}
-
-#[derive(Serialize)]
-struct JesseResponse {
-    mode: String,
-    response: String,
-    session_id: Option<String>,
 }
 
 type ApiError = (StatusCode, String);
@@ -340,25 +451,107 @@ async fn run_claude(
 
 // ---- Handlers -------------------------------------------------------------
 
-async fn health(State(cfg): State<Arc<Config>>) -> Json<Value> {
-    Json(json!({ "ok": true, "vault": cfg.vault, "claude": cfg.claude_bin }))
+async fn health(State(st): State<AppState>) -> Json<Value> {
+    Json(json!({ "ok": true, "vault": st.cfg.vault, "claude": st.cfg.claude_bin }))
 }
 
 async fn jesse(
-    State(cfg): State<Arc<Config>>,
+    State(st): State<AppState>,
     headers: HeaderMap,
     Json(req): Json<JesseRequest>,
-) -> Result<Json<JesseResponse>, ApiError> {
-    check_auth(&headers, &cfg.token)?;
+) -> Result<Response, ApiError> {
+    check_auth(&headers, &st.cfg.token)?;
     let mode = req.mode.trim().to_lowercase();
     let is_followup = req.session_id.is_some();
     let prompt = build_prompt(&mode, &req.text, is_followup, req.voice)?;
-    let (response, session_id) = run_claude(&cfg, &prompt, req.session_id.as_deref()).await?;
-    Ok(Json(JesseResponse {
-        mode: req.mode,
-        response,
-        session_id,
-    }))
+
+    // Opportunistic sweep so the map can't grow unbounded between requests.
+    st.jobs.evict_expired();
+    let job_id = st.jobs.create();
+
+    // Run the turn on its OWN task that owns the child. Dropping this request
+    // future (the phone suspends, the socket drops) does not cancel a spawned
+    // tokio task, so the turn always runs to completion and lands in the store.
+    let cfg = st.cfg.clone();
+    let jobs = st.jobs.clone();
+    let jid = job_id.clone();
+    let sid = req.session_id.clone();
+    let mut handle = tokio::spawn(async move {
+        let outcome = run_claude(&cfg, &prompt, sid.as_deref()).await;
+        jobs.complete(&jid, outcome);
+    });
+
+    // Hold the connection up to the grace window for the fast path.
+    let grace = Duration::from_secs(st.cfg.grace_secs);
+    match timeout(grace, &mut handle).await {
+        // Turn finished within grace — return the reply inline as before,
+        // plus the job_id (additive; existing callers ignore the extra field).
+        Ok(join_res) => {
+            if let Err(e) = join_res {
+                return Err((
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("job task failed: {e}"),
+                ));
+            }
+            match st.jobs.get(&job_id) {
+                Some(JobState::Done {
+                    response,
+                    session_id,
+                }) => Ok((
+                    StatusCode::OK,
+                    Json(json!({
+                        "mode": req.mode,
+                        "response": response,
+                        "session_id": session_id,
+                        "job_id": job_id,
+                    })),
+                )
+                    .into_response()),
+                Some(JobState::Failed { error }) => Err((StatusCode::BAD_GATEWAY, error)),
+                // The task joined, so it must have written a terminal state.
+                _ => Err((
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "job finished without a result".to_string(),
+                )),
+            }
+        }
+        // Still running at grace expiry — hand back a job id to poll. The
+        // detached task keeps running; dropping `handle` does not cancel it.
+        Err(_) => Ok((
+            StatusCode::ACCEPTED,
+            Json(json!({ "job_id": job_id, "status": "running" })),
+        )
+            .into_response()),
+    }
+}
+
+/// Fetch a turn's state by job id. This is what the app polls after a dropped
+/// socket. Same bearer auth as `/jesse`. Unknown/expired id → 404.
+async fn jesse_result(
+    State(st): State<AppState>,
+    UrlPath(job_id): UrlPath<String>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, ApiError> {
+    check_auth(&headers, &st.cfg.token)?;
+    st.jobs.evict_expired();
+    match st.jobs.get(&job_id) {
+        Some(JobState::Running) => Ok(Json(json!({ "status": "running" }))),
+        Some(JobState::Done {
+            response,
+            session_id,
+        }) => Ok(Json(json!({
+            "status": "done",
+            "response": response,
+            "session_id": session_id,
+        }))),
+        Some(JobState::Failed { error }) => {
+            Ok(Json(json!({ "status": "failed", "error": error })))
+        }
+        None => Err((
+            StatusCode::NOT_FOUND,
+            "unknown or expired job id".to_string(),
+        )),
+    }
 }
 
 // ---- Startup --------------------------------------------------------------
@@ -404,10 +597,11 @@ fn binary_exists(bin: &str) -> bool {
 /// Build the axum router with its shared state. Kept separate from `main` so
 /// tests can drive the same routes via `tower::ServiceExt::oneshot` without
 /// binding a socket. The running server uses exactly this router.
-fn app(state: Arc<Config>) -> Router {
+fn app(state: AppState) -> Router {
     Router::new()
         .route("/health", get(health))
         .route("/jesse", post(jesse))
+        .route("/jesse/result/:job_id", get(jesse_result))
         .with_state(state)
 }
 
@@ -432,15 +626,19 @@ async fn main() {
     }
 
     let addr = format!("{}:{}", cfg.bind, cfg.port);
-    let state = Arc::new(cfg);
+    let job_ttl = Duration::from_secs(cfg.job_ttl_secs);
+    let state = AppState {
+        cfg: Arc::new(cfg),
+        jobs: Arc::new(JobStore::new(job_ttl)),
+    };
 
     // Pairing QR — scan it from the app's Settings to fill in host/port/token.
     // The advertised host defaults to the bound IP (reliably reachable on the
     // tailnet; the ts.net name has DNS quirks per STATUS.md). Override with
     // JESSE_ADVERTISE_HOST to force the MagicDNS name into the QR instead.
     let advertise_host =
-        std::env::var("JESSE_ADVERTISE_HOST").unwrap_or_else(|_| state.bind.clone());
-    let payload = pairing_payload(&advertise_host, state.port, &state.token);
+        std::env::var("JESSE_ADVERTISE_HOST").unwrap_or_else(|_| state.cfg.bind.clone());
+    let payload = pairing_payload(&advertise_host, state.cfg.port, &state.cfg.token);
     let code = qrcode::QrCode::new(payload.as_bytes()).expect("qr encode");
     let art = code
         .render::<qrcode::render::unicode::Dense1x2>()
@@ -450,10 +648,10 @@ async fn main() {
     println!("Pair by scanning the QR above, or enter manually:");
     println!(
         "  host={advertise_host}  port={}  token={}",
-        state.port, state.token
+        state.cfg.port, state.cfg.token
     );
 
-    println!("Jesse Bridge → http://{addr}  (vault: {})", state.vault);
+    println!("Jesse Bridge → http://{addr}  (vault: {})", state.cfg.vault);
     let listener = tokio::net::TcpListener::bind(&addr)
         .await
         .expect("bind failed");
@@ -693,16 +891,27 @@ mod tests {
 
     // ---- integration via app() router ------------------------------------
 
-    fn test_config() -> Arc<Config> {
-        Arc::new(Config {
+    fn test_config() -> Config {
+        Config {
             token: "test-token".to_string(),
-            // Any existing directory works — these tests never reach run_claude.
+            // Any existing directory works — most tests never reach run_claude.
             vault: std::env::temp_dir().to_string_lossy().into_owned(),
             bind: "127.0.0.1".to_string(),
             port: 8765,
             claude_bin: "claude".to_string(),
             timeout_secs: 1800,
-        })
+            grace_secs: 10,
+            job_ttl_secs: 600,
+        }
+    }
+
+    fn test_state() -> AppState {
+        let cfg = test_config();
+        let ttl = Duration::from_secs(cfg.job_ttl_secs);
+        AppState {
+            cfg: Arc::new(cfg),
+            jobs: Arc::new(JobStore::new(ttl)),
+        }
     }
 
     async fn body_string(resp: axum::response::Response) -> String {
@@ -712,8 +921,8 @@ mod tests {
 
     #[tokio::test]
     async fn health_returns_config() {
-        let cfg = test_config();
-        let resp = app(cfg.clone())
+        let st = test_state();
+        let resp = app(st.clone())
             .oneshot(
                 Request::builder()
                     .uri("/health")
@@ -724,8 +933,8 @@ mod tests {
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
         let body = body_string(resp).await;
-        assert!(body.contains(&cfg.vault));
-        assert!(body.contains(&cfg.claude_bin));
+        assert!(body.contains(&st.cfg.vault));
+        assert!(body.contains(&st.cfg.claude_bin));
     }
 
     fn jesse_request(auth: Option<&str>, json: &str) -> Request<Body> {
@@ -741,7 +950,7 @@ mod tests {
 
     #[tokio::test]
     async fn jesse_no_auth_is_401() {
-        let resp = app(test_config())
+        let resp = app(test_state())
             .oneshot(jesse_request(None, r#"{"mode":"ask","text":"hi"}"#))
             .await
             .unwrap();
@@ -750,7 +959,7 @@ mod tests {
 
     #[tokio::test]
     async fn jesse_wrong_token_is_401() {
-        let resp = app(test_config())
+        let resp = app(test_state())
             .oneshot(jesse_request(
                 Some("Bearer wrong"),
                 r#"{"mode":"ask","text":"hi"}"#,
@@ -763,7 +972,7 @@ mod tests {
     #[tokio::test]
     async fn jesse_bad_mode_is_400() {
         // Correct token, but build_prompt rejects the mode before run_claude.
-        let resp = app(test_config())
+        let resp = app(test_state())
             .oneshot(jesse_request(
                 Some("Bearer test-token"),
                 r#"{"mode":"shout","text":"hi"}"#,
@@ -771,5 +980,239 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    // ---- job store unit tests ---------------------------------------------
+
+    #[test]
+    fn job_ids_are_unique() {
+        let store = JobStore::new(Duration::from_secs(600));
+        let a = store.create();
+        let b = store.create();
+        assert_ne!(a, b);
+        // Both start Running.
+        assert!(matches!(store.get(&a), Some(JobState::Running)));
+        assert!(matches!(store.get(&b), Some(JobState::Running)));
+        // Unknown id is None.
+        assert!(store.get("nope").is_none());
+    }
+
+    #[test]
+    fn job_complete_records_done_and_failed() {
+        let store = JobStore::new(Duration::from_secs(600));
+        let ok = store.create();
+        store.complete(&ok, Ok(("hi".to_string(), Some("sess-1".to_string()))));
+        match store.get(&ok) {
+            Some(JobState::Done {
+                response,
+                session_id,
+            }) => {
+                assert_eq!(response, "hi");
+                assert_eq!(session_id.as_deref(), Some("sess-1"));
+            }
+            other => panic!("expected Done, got {:?}", other.map(|_| ())),
+        }
+
+        let bad = store.create();
+        store.complete(
+            &bad,
+            Err((StatusCode::BAD_GATEWAY, "upstream boom".to_string())),
+        );
+        match store.get(&bad) {
+            Some(JobState::Failed { error }) => assert!(error.contains("boom")),
+            other => panic!("expected Failed, got {:?}", other.map(|_| ())),
+        }
+    }
+
+    #[tokio::test]
+    async fn job_ttl_evicts_completed_only() {
+        let store = JobStore::new(Duration::from_millis(50));
+        let old = store.create();
+        store.complete(&old, Ok(("done".to_string(), None)));
+        let running = store.create(); // never completes — must survive eviction
+        // Wait past the TTL, then complete a fresh one that must NOT be evicted.
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        let fresh = store.create();
+        store.complete(&fresh, Ok(("fresh".to_string(), None)));
+
+        store.evict_expired();
+        assert!(store.get(&old).is_none(), "stale completed job should evict");
+        assert!(
+            matches!(store.get(&running), Some(JobState::Running)),
+            "running job must never evict"
+        );
+        assert!(
+            matches!(store.get(&fresh), Some(JobState::Done { .. })),
+            "recently completed job must survive"
+        );
+    }
+
+    // ---- GET /jesse/result auth + 404 -------------------------------------
+
+    #[tokio::test]
+    async fn result_no_auth_is_401() {
+        let resp = app(test_state())
+            .oneshot(
+                Request::builder()
+                    .uri("/jesse/result/whatever")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn result_unknown_id_is_404() {
+        let resp = app(test_state())
+            .oneshot(
+                Request::builder()
+                    .uri("/jesse/result/does-not-exist")
+                    .header("authorization", "Bearer test-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    // ---- disconnect survival (the load-bearing regression) ----------------
+    //
+    // A fake `claude` that sleeps past the grace window, then prints the canned
+    // result envelope and touches a marker file. POST returns 202 (its request
+    // future is then dropped — the disconnect analog). The detached turn must
+    // still run to completion: the marker appears and GET result → done.
+
+    fn write_fake_claude(script: &str) -> std::path::PathBuf {
+        use std::io::Write;
+        use std::os::unix::fs::PermissionsExt;
+        let n = JOB_COUNTER.fetch_add(1, Ordering::Relaxed);
+        // A pid+counter name keeps parallel test runs from colliding.
+        let path = std::env::temp_dir().join(format!(
+            "jesse-fake-claude-{}-{}.sh",
+            std::process::id(),
+            n
+        ));
+        let mut f = std::fs::File::create(&path).unwrap();
+        f.write_all(script.as_bytes()).unwrap();
+        let mut perms = f.metadata().unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&path, perms).unwrap();
+        path
+    }
+
+    async fn result_status(app_state: &AppState, job_id: &str) -> Value {
+        let resp = app(app_state.clone())
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/jesse/result/{job_id}"))
+                    .header("authorization", "Bearer test-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        serde_json::from_str(&body_string(resp).await).unwrap()
+    }
+
+    #[tokio::test]
+    async fn turn_survives_client_disconnect() {
+        let marker = std::env::temp_dir().join(format!(
+            "jesse-marker-{}-{}.txt",
+            std::process::id(),
+            JOB_COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_file(&marker);
+        // Sleeps 2s (past the 1s grace), prints the result envelope, then marks
+        // completion. If the child were killed on disconnect the marker never
+        // appears and the job never reaches Done.
+        let script = format!(
+            "#!/bin/sh\n\
+             sleep 2\n\
+             printf '%s' '{{\"type\":\"result\",\"is_error\":false,\"result\":\"slow ok\",\"session_id\":\"sess-slow\"}}'\n\
+             touch '{}'\n",
+            marker.display()
+        );
+        let fake = write_fake_claude(&script);
+
+        let cfg = Config {
+            claude_bin: fake.to_string_lossy().into_owned(),
+            grace_secs: 1, // force the 202 path
+            ..test_config()
+        };
+        let st = AppState {
+            cfg: Arc::new(cfg),
+            jobs: Arc::new(JobStore::new(Duration::from_secs(600))),
+        };
+
+        // POST — should hit grace expiry and return 202 with a job_id.
+        let resp = app(st.clone())
+            .oneshot(jesse_request(
+                Some("Bearer test-token"),
+                r#"{"mode":"ask","text":"slow one"}"#,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::ACCEPTED);
+        let body: Value = serde_json::from_str(&body_string(resp).await).unwrap();
+        assert_eq!(body["status"], "running");
+        let job_id = body["job_id"].as_str().unwrap().to_string();
+
+        // The POST future is now dropped (client "disconnected"). Poll until the
+        // detached turn completes — it must, despite the dropped connection.
+        let mut done = None;
+        for _ in 0..50 {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            let v = result_status(&st, &job_id).await;
+            if v["status"] == "done" {
+                done = Some(v);
+                break;
+            }
+        }
+        let done = done.expect("turn must complete despite client disconnect");
+        assert_eq!(done["response"], "slow ok");
+        assert_eq!(done["session_id"], "sess-slow");
+        assert!(
+            marker.exists(),
+            "fake claude ran to completion (not killed on disconnect)"
+        );
+
+        let _ = std::fs::remove_file(&marker);
+        let _ = std::fs::remove_file(&fake);
+    }
+
+    #[tokio::test]
+    async fn fast_turn_returns_inline_200_with_job_id() {
+        // A fake claude that returns immediately → completes within grace → 200
+        // inline, now carrying job_id alongside the unchanged fields.
+        let script = "#!/bin/sh\nprintf '%s' '{\"type\":\"result\",\"is_error\":false,\"result\":\"quick\",\"session_id\":\"sess-fast\"}'\n";
+        let fake = write_fake_claude(script);
+        let cfg = Config {
+            claude_bin: fake.to_string_lossy().into_owned(),
+            grace_secs: 10,
+            ..test_config()
+        };
+        let st = AppState {
+            cfg: Arc::new(cfg),
+            jobs: Arc::new(JobStore::new(Duration::from_secs(600))),
+        };
+
+        let resp = app(st.clone())
+            .oneshot(jesse_request(
+                Some("Bearer test-token"),
+                r#"{"mode":"ask","text":"quick one"}"#,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body: Value = serde_json::from_str(&body_string(resp).await).unwrap();
+        assert_eq!(body["response"], "quick");
+        assert_eq!(body["session_id"], "sess-fast");
+        assert!(body["job_id"].as_str().is_some(), "200 carries a job_id");
+
+        let _ = std::fs::remove_file(&fake);
     }
 }
