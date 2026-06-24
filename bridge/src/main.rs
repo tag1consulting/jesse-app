@@ -150,6 +150,21 @@ struct Config {
     max_attachments: usize,
     max_attachment_bytes: usize,
     max_attachments_total_bytes: usize,
+    // Base directory for per-request attachment scratch dirs. None → the system
+    // temp dir. Set JESSE_SCRATCH_DIR to point this at a sandbox-mounted path if
+    // the bridge is ever confined so it can't read the system temp dir.
+    scratch_dir: Option<String>,
+}
+
+impl Config {
+    /// Resolve the base directory under which per-request scratch dirs are
+    /// created: `JESSE_SCRATCH_DIR` if set, else the system temp dir.
+    fn scratch_base(&self) -> PathBuf {
+        self.scratch_dir
+            .as_deref()
+            .map(PathBuf::from)
+            .unwrap_or_else(std::env::temp_dir)
+    }
 }
 
 /// Clamp a requested per-turn timeout into a sane, bounded range. `0` is treated
@@ -222,6 +237,9 @@ impl Config {
                 .ok()
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(DEFAULT_MAX_ATTACHMENTS_TOTAL_BYTES),
+            scratch_dir: std::env::var("JESSE_SCRATCH_DIR")
+                .ok()
+                .filter(|s| !s.trim().is_empty()),
         }
     }
 }
@@ -933,17 +951,18 @@ fn random_hex() -> String {
     format!("{r:016x}")
 }
 
-/// A per-request scratch directory under the system temp dir (NOT the vault, so
-/// attachments never pollute it; verified that headless `claude` reads paths
-/// here via its Read tool with no `--add-dir`). Removed by `Drop` on every exit
-/// path — success, error, or timeout — so decoded files never outlive the turn.
+/// A per-request scratch directory under `base` (the system temp dir by
+/// default, or `JESSE_SCRATCH_DIR`) — NOT the vault, so attachments never
+/// pollute it; verified that headless `claude` reads paths here via its Read
+/// tool with no `--add-dir`. Removed by `Drop` on every exit path — success,
+/// error, or timeout — so decoded files never outlive the turn.
 struct ScratchDir {
     path: PathBuf,
 }
 
 impl ScratchDir {
-    fn create() -> std::io::Result<ScratchDir> {
-        let path = std::env::temp_dir().join(format!("jesse-attach-{}", random_hex()));
+    fn create(base: &Path) -> std::io::Result<ScratchDir> {
+        let path = base.join(format!("jesse-attach-{}", random_hex()));
         std::fs::DirBuilder::new()
             .recursive(false)
             .mode(0o700)
@@ -1042,7 +1061,7 @@ async fn jesse(
     let (prompt, scratch) = if decoded.is_empty() {
         (prompt, None)
     } else {
-        let scratch = ScratchDir::create().map_err(|e| {
+        let scratch = ScratchDir::create(&st.cfg.scratch_base()).map_err(|e| {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 format!("could not create attachment scratch dir: {e}"),
@@ -1230,6 +1249,14 @@ async fn main() {
             cfg.claude_bin
         );
         std::process::exit(1);
+    }
+    // If a custom attachment scratch base is set, it must already exist — fail
+    // fast rather than surfacing a write error on the first attachment turn.
+    if let Some(dir) = &cfg.scratch_dir {
+        if !Path::new(dir).is_dir() {
+            eprintln!("JESSE_SCRATCH_DIR is not a directory: {dir}");
+            std::process::exit(1);
+        }
     }
 
     // Refuse an unsafe bind (C2) before opening a socket. Only loopback or
@@ -1485,6 +1512,7 @@ mod tests {
             "JESSE_MAX_ATTACHMENTS",
             "JESSE_MAX_ATTACHMENT_BYTES",
             "JESSE_MAX_ATTACHMENTS_TOTAL_BYTES",
+            "JESSE_SCRATCH_DIR",
         ]
         .iter()
         .map(|k| (*k, std::env::var(k).ok()))
@@ -1505,6 +1533,9 @@ mod tests {
             cfg.max_attachments_total_bytes,
             DEFAULT_MAX_ATTACHMENTS_TOTAL_BYTES
         );
+        // No JESSE_SCRATCH_DIR → scratch base falls back to the system temp dir.
+        assert_eq!(cfg.scratch_dir, None);
+        assert_eq!(cfg.scratch_base(), std::env::temp_dir());
 
         for (k, v) in saved {
             match v {
@@ -1534,6 +1565,7 @@ mod tests {
             max_attachments: DEFAULT_MAX_ATTACHMENTS,
             max_attachment_bytes: DEFAULT_MAX_ATTACHMENT_BYTES,
             max_attachments_total_bytes: DEFAULT_MAX_ATTACHMENTS_TOTAL_BYTES,
+            scratch_dir: None,
         }
     }
 
@@ -2247,7 +2279,7 @@ mod tests {
         let dir_path;
         let file_paths;
         {
-            let scratch = ScratchDir::create().expect("create scratch");
+            let scratch = ScratchDir::create(&std::env::temp_dir()).expect("create scratch");
             dir_path = scratch.path.clone();
             // Dir is owner-only (0700).
             let mode = std::fs::metadata(&dir_path).unwrap().permissions().mode();
@@ -2274,6 +2306,32 @@ mod tests {
         for p in &file_paths {
             assert!(!p.exists(), "scratch files must be gone with the dir");
         }
+    }
+
+    #[test]
+    fn scratch_dir_honors_custom_base() {
+        // A custom base (e.g. JESSE_SCRATCH_DIR pointing at a sandbox mount) is
+        // where the per-request dir is created.
+        let base = std::env::temp_dir().join(format!("jesse-base-{}", random_hex()));
+        std::fs::create_dir(&base).unwrap();
+        let created;
+        {
+            let scratch = ScratchDir::create(&base).expect("create under custom base");
+            created = scratch.path.clone();
+            assert_eq!(scratch.path.parent(), Some(base.as_path()));
+            assert!(created.exists());
+        }
+        assert!(!created.exists(), "scratch dir removed on Drop");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn scratch_base_defaults_to_temp_and_honors_override() {
+        let mut cfg = test_config();
+        cfg.scratch_dir = None;
+        assert_eq!(cfg.scratch_base(), std::env::temp_dir());
+        cfg.scratch_dir = Some("/var/jesse-scratch".to_string());
+        assert_eq!(cfg.scratch_base(), PathBuf::from("/var/jesse-scratch"));
     }
 
     #[test]

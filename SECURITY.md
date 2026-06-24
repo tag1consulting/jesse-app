@@ -107,7 +107,8 @@ Files attached to a turn are untrusted input and handled defensively:
   magic bytes and must be on the whitelist (PNG, JPEG, GIF, WebP, HEIC, PDF) *and*
   match the client-declared MIME; an extension/MIME mismatch is rejected (`400`).
 - **No client filename touches disk.** Files are written to a per-request scratch
-  directory (mode `0700`) under the system temp dir — *not* the vault — with
+  directory (mode `0700`) under the system temp dir — *not* the vault —
+  (override the base with `JESSE_SCRATCH_DIR`, e.g. a sandbox-mounted path) with
   randomized `0600` names and a sniffed extension. The client filename is never
   used as an on-disk name (path traversal) and is never placed in the prompt
   (injection); only the random on-disk paths are named to the agent.
