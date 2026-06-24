@@ -64,6 +64,12 @@ be read aloud. Keep it concise and listenable. After your full answer, add a fin
 line beginning exactly with 'SPOKEN: ' containing a one- or two-sentence spoken \
 summary for text-to-speech — plain prose, no markdown, no lists, no URLs.)";
 
+// Appended to non-voice prompts so replies stay readable on a narrow phone
+// screen. Mutually exclusive with VOICE_SUFFIX (voice forbids markdown entirely).
+const PHONE_FORMAT: &str = "\n\n(Formatting: this reply is shown on a narrow phone \
+screen. Prefer short paragraphs and bullet lists. Use Markdown. If a table is the \
+clearest form, keep it to 2–3 narrow columns; otherwise avoid tables.)";
+
 // ---- Config (env-driven) --------------------------------------------------
 
 #[derive(Clone)]
@@ -155,6 +161,8 @@ fn build_prompt(mode: &str, text: &str, is_followup: bool, voice: bool) -> Resul
     let mut p = format!("{preamble}{text}");
     if voice {
         p.push_str(VOICE_SUFFIX);
+    } else {
+        p.push_str(PHONE_FORMAT);
     }
     Ok(p)
 }
@@ -511,7 +519,9 @@ mod tests {
     fn build_prompt_ask_fresh_wraps_with_ask_preamble() {
         let p = build_prompt("ask", "what is on Today.md", false, false).unwrap();
         assert!(p.starts_with(ASK_PREAMBLE));
-        assert!(p.ends_with("what is on Today.md"));
+        assert!(p.contains("what is on Today.md"));
+        // Non-voice replies get the phone-formatting hint, not the voice suffix.
+        assert!(p.ends_with(PHONE_FORMAT));
         assert!(!p.contains(VOICE_SUFFIX));
     }
 
@@ -519,15 +529,19 @@ mod tests {
     fn build_prompt_ask_followup_uses_followup_preamble() {
         let p = build_prompt("ask", "and the second?", true, false).unwrap();
         assert!(p.starts_with(ASK_FOLLOWUP));
-        assert!(p.ends_with("and the second?"));
+        assert!(p.contains("and the second?"));
+        assert!(p.ends_with(PHONE_FORMAT));
     }
 
     #[test]
     fn build_prompt_tell_fresh_and_followup() {
         let fresh = build_prompt("tell", "remember this", false, false).unwrap();
         assert!(fresh.starts_with(TELL_PREAMBLE));
+        assert!(fresh.contains("remember this"));
+        assert!(fresh.ends_with(PHONE_FORMAT));
         let followup = build_prompt("tell", "also this", true, false).unwrap();
         assert!(followup.starts_with(TELL_FOLLOWUP));
+        assert!(followup.ends_with(PHONE_FORMAT));
     }
 
     #[test]
@@ -540,6 +554,8 @@ mod tests {
     fn build_prompt_voice_appends_suffix() {
         let with_voice = build_prompt("ask", "q", false, true).unwrap();
         assert!(with_voice.ends_with(VOICE_SUFFIX));
+        // Voice and phone formatting are mutually exclusive.
+        assert!(!with_voice.contains(PHONE_FORMAT));
         let without = build_prompt("ask", "q", false, false).unwrap();
         assert!(!without.contains(VOICE_SUFFIX));
     }
