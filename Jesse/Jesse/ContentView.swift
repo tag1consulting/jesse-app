@@ -62,16 +62,23 @@ struct SettingsView: View {
     @State private var showScanner = false
     @State private var scanError: String?
 
-    // Per-mode prompt editors. `*Prompt` is the editable text; `*Default` mirrors
+    // Per-mode wrapper editors. `*Prompt` is the editable text; `*Default` mirrors
     // the cached bridge default (for the differs-from-default check and Reset).
     @State private var askPrompt = ""
     @State private var tellPrompt = ""
     @State private var askDefault = ""
     @State private var tellDefault = ""
-    // The fixed safety floors the bridge always prepends, shown read-only. These
-    // are display-only and never feed the editors or the override that's sent.
-    @State private var askFloor = ""
-    @State private var tellFloor = ""
+    // Per-mode floor editors. The floor is always prepended by the bridge; these
+    // only customize its *wording*. Locked by default — an explicit unlock reveals
+    // the editor. `*FloorDefault` is the cached recommended default (for the
+    // differs/reset check); an empty editor falls back to that default (the floor
+    // is never removed).
+    @State private var askFloorText = ""
+    @State private var tellFloorText = ""
+    @State private var askFloorDefault = ""
+    @State private var tellFloorDefault = ""
+    @State private var askFloorUnlocked = false
+    @State private var tellFloorUnlocked = false
     @State private var promptsError: String?
     @State private var loadingPrompts = false
 
@@ -124,36 +131,30 @@ struct SettingsView: View {
                 }
 
                 Section {
-                    fixedFloorView(askFloor)
-                    TextEditor(text: $askPrompt)
-                        .frame(minHeight: 120)
-                        .font(.body.monospaced())
-                        .autocorrectionDisabled()
-                        .textInputAutocapitalization(.never)
+                    bigEditor($askPrompt, editable: true)
                     Button("Reset to default") { resetToDefault(.ask) }
                         .disabled(loadingPrompts)
                 } header: {
                     Text("Ask Jesse prompt")
                 } footer: {
-                    // The invariant lives in the locked floor above; the editor
-                    // only customizes the framing that follows it.
-                    Text("The locked text above is always applied and can’t be removed: “Ask” means Jesse won’t take actions you didn’t request, but he always records a durable fact, correction, or status change to the vault. Your editor only customizes the framing after it. Leave empty to use the bridge default.")
+                    // The invariant lives in the floor section below; the wrapper
+                    // editor only customizes the framing that follows it.
+                    Text("Customizes how an “Ask” wraps your message — the framing that follows the safety floor below. Leave empty to use the bridge default.")
                 }
 
+                floorSection(for: .ask)
+
                 Section {
-                    fixedFloorView(tellFloor)
-                    TextEditor(text: $tellPrompt)
-                        .frame(minHeight: 120)
-                        .font(.body.monospaced())
-                        .autocorrectionDisabled()
-                        .textInputAutocapitalization(.never)
+                    bigEditor($tellPrompt, editable: true)
                     Button("Reset to default") { resetToDefault(.tell) }
                         .disabled(loadingPrompts)
                 } header: {
                     Text("Tell Jesse prompt")
                 } footer: {
-                    Text("The locked text above is always applied and can’t be removed: Jesse always records durable facts to the vault. Your editor only customizes how a “Tell” is framed after it. Leave empty to use the bridge default.")
+                    Text("Customizes how a “Tell” wraps your message — the framing that follows the safety floor below. Leave empty to use the bridge default.")
                 }
+
+                floorSection(for: .tell)
             }
             .navigationTitle("Settings")
             .toolbar {
@@ -164,10 +165,14 @@ struct SettingsView: View {
                                              token: token)
                         ConfigStore.save(config)
                         // Persist the prompt editors. `save` re-derives each
-                        // mode's customized flag (non-empty AND differs from the
+                        // slot's customized flag (non-empty AND differs from the
                         // cached default); an empty field stays "use the default".
-                        PromptStore.save(.ask, text: askPrompt, default: askDefault)
-                        PromptStore.save(.tell, text: tellPrompt, default: tellDefault)
+                        PromptStore.save(.ask, .wrapper, text: askPrompt, default: askDefault)
+                        PromptStore.save(.tell, .wrapper, text: tellPrompt, default: tellDefault)
+                        // Floor overrides: an empty editor falls back to the
+                        // recommended default — the floor itself is never removed.
+                        PromptStore.save(.ask, .floor, text: askFloorText, default: askFloorDefault)
+                        PromptStore.save(.tell, .floor, text: tellFloorText, default: tellFloorDefault)
                         dismiss()
                     }
                 }
@@ -179,12 +184,18 @@ struct SettingsView: View {
                 host = config.host
                 port = String(config.port)
                 token = config.token
-                askPrompt = PromptStore.text(.ask)
-                tellPrompt = PromptStore.text(.tell)
-                askDefault = PromptStore.cachedDefault(.ask)
-                tellDefault = PromptStore.cachedDefault(.tell)
-                askFloor = PromptStore.floor(.ask)
-                tellFloor = PromptStore.floor(.tell)
+                askPrompt = PromptStore.text(.ask, .wrapper)
+                tellPrompt = PromptStore.text(.tell, .wrapper)
+                askDefault = PromptStore.cachedDefault(.ask, .wrapper)
+                tellDefault = PromptStore.cachedDefault(.tell, .wrapper)
+                // Seed each floor editor from its override if customized, else the
+                // cached recommended default; always re-lock on open.
+                askFloorDefault = PromptStore.cachedDefault(.ask, .floor)
+                tellFloorDefault = PromptStore.cachedDefault(.tell, .floor)
+                askFloorText = PromptStore.override(for: .ask, .floor) ?? askFloorDefault
+                tellFloorText = PromptStore.override(for: .tell, .floor) ?? tellFloorDefault
+                askFloorUnlocked = false
+                tellFloorUnlocked = false
             }
             .sheet(isPresented: $showScanner) {
                 scannerSheet
@@ -197,8 +208,9 @@ struct SettingsView: View {
     /// Fetch the bridge's built-in wrapper defaults using the host/token the user
     /// has entered (not necessarily saved yet), so pairing + loading defaults can
     /// happen in one visit. Returns nil and sets `promptsError` on any failure.
-    /// On success it also refreshes the read-only floor cards (and their cache),
-    /// since the fixed floors ride along on the same response.
+    /// On success it also refreshes the cached floor defaults (and the floor
+    /// editors when they aren't customized), since the floors ride along on the
+    /// same response.
     private func fetchDefaults() async -> PromptDefaults? {
         loadingPrompts = true
         defer { loadingPrompts = false }
@@ -206,11 +218,14 @@ struct SettingsView: View {
         let cfg = JesseConfig(host: host, port: Int(port) ?? 8765, token: token)
         do {
             let d = try await JesseClient(config: cfg).fetchPrompts()
-            // Floors are display-only: update the cards and cache, never the editors.
-            askFloor = d.askFloor
-            tellFloor = d.tellFloor
-            PromptStore.cacheFloor(.ask, d.askFloor)
-            PromptStore.cacheFloor(.tell, d.tellFloor)
+            // Cache the recommended floor defaults and refresh the editors when the
+            // user hasn't customized them (a customized floor is preserved).
+            askFloorDefault = d.askFloor
+            tellFloorDefault = d.tellFloor
+            PromptStore.cacheDefault(.ask, .floor, d.askFloor)
+            PromptStore.cacheDefault(.tell, .floor, d.tellFloor)
+            if PromptStore.override(for: .ask, .floor) == nil { askFloorText = d.askFloor }
+            if PromptStore.override(for: .tell, .floor) == nil { tellFloorText = d.tellFloor }
             return d
         } catch {
             let detail = (error as? JesseError)?.errorDescription ?? error.localizedDescription
@@ -219,35 +234,76 @@ struct SettingsView: View {
         }
     }
 
-    /// A read-only card showing a mode's fixed safety floor — the clause the
-    /// bridge always prepends and a custom wrapper can't remove. Empty until a
-    /// fetch populates it, in which case it nudges the user to load defaults.
+    /// A large, internally-scrollable prompt editor used by every prompt text
+    /// area, so long text is fully readable. A disabled editor renders read-only
+    /// but still scrolls — that's how the locked floor view shows its full text.
     @ViewBuilder
-    private func fixedFloorView(_ floor: String) -> some View {
-        RoundedRectangle(cornerRadius: 8)
-            .fill(Color.accentColor.opacity(0.08))
-            .overlay(alignment: .topLeading) {
-                VStack(alignment: .leading, spacing: 6) {
-                    Label("Always applied — can’t be edited", systemImage: "lock.fill")
-                        .font(.caption.weight(.semibold))
-                        .foregroundStyle(.secondary)
-                    if floor.isEmpty {
-                        Text("Load defaults from the bridge to see the fixed safety text.")
-                            .font(.callout)
-                            .foregroundStyle(.secondary)
-                    } else {
-                        Text(floor)
-                            .font(.callout)
-                            .foregroundStyle(.secondary)
-                    }
-                }
-                .padding(12)
-            }
-            .frame(maxWidth: .infinity, minHeight: 88, alignment: .topLeading)
-            .fixedSize(horizontal: false, vertical: true)
+    private func bigEditor(_ text: Binding<String>, editable: Bool) -> some View {
+        TextEditor(text: text)
+            .frame(minHeight: 200)
+            .font(.body.monospaced())
+            .autocorrectionDisabled()
+            .textInputAutocapitalization(.never)
+            .scrollContentBackground(.hidden)
+            .disabled(!editable)
+            .overlay(RoundedRectangle(cornerRadius: 8).stroke(.quaternary))
     }
 
-    /// "Reset to default" for one mode: overwrite that editor with the freshly
+    /// The per-mode safety-floor section: locked by default, editable behind an
+    /// explicit "not recommended" unlock. The floor is always prepended by the
+    /// bridge — unlocking only lets you reword it, and an empty editor falls back
+    /// to the recommended default (it can't be removed).
+    @ViewBuilder
+    private func floorSection(for mode: JesseMode) -> some View {
+        let floorText = floorTextBinding(for: mode)
+        let unlocked = floorUnlockedBinding(for: mode)
+        let customized = PromptStore.override(for: mode, .floor) != nil
+        Section {
+            if unlocked.wrappedValue {
+                Label("Editing the floor can weaken Jesse’s safety guardrail. Only change it if you understand the risk — Jesse always prepends this text to every turn.",
+                      systemImage: "exclamationmark.triangle.fill")
+                    .font(.callout)
+                    .foregroundStyle(.orange)
+                bigEditor(floorText, editable: true)
+                Button("Reset to recommended default") { resetFloorToDefault(mode) }
+                    .disabled(loadingPrompts)
+                Button {
+                    unlocked.wrappedValue = false
+                } label: {
+                    Label("Lock", systemImage: "lock")
+                }
+            } else {
+                Label("Recommended safety floor — locked", systemImage: "lock.fill")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                bigEditor(floorText, editable: false)
+                if customized {
+                    Label("Customized — differs from recommended", systemImage: "exclamationmark.triangle")
+                        .font(.caption)
+                        .foregroundStyle(.orange)
+                }
+                Button {
+                    unlocked.wrappedValue = true
+                } label: {
+                    Label("Unlock to edit (not recommended)", systemImage: "lock.open")
+                }
+            }
+        } header: {
+            Text(mode == .ask ? "Ask safety floor" : "Tell safety floor")
+        } footer: {
+            Text("Always prepended to every turn — Jesse leads with this. Unlock only to customize its wording; an empty editor uses the recommended default (it can’t be removed).")
+        }
+    }
+
+    private func floorTextBinding(for mode: JesseMode) -> Binding<String> {
+        mode == .ask ? $askFloorText : $tellFloorText
+    }
+
+    private func floorUnlockedBinding(for mode: JesseMode) -> Binding<Bool> {
+        mode == .ask ? $askFloorUnlocked : $tellFloorUnlocked
+    }
+
+    /// "Reset to default" for a wrapper: overwrite that editor with the freshly
     /// fetched bridge default and cache it. The customized flag clears on Save
     /// (text then equals the cached default).
     private func resetToDefault(_ mode: JesseMode) {
@@ -260,9 +316,23 @@ struct SettingsView: View {
         }
     }
 
-    /// "Load defaults from bridge": cache both defaults and fill the editors.
-    /// With `fillEmptyOnly`, only blank editors are populated so a custom prompt
-    /// is never clobbered — the first-use affordance for empty editors.
+    /// "Reset to recommended default" for a floor: fetch the recommended floor and
+    /// load it into the editor, staying unlocked. The customized flag clears on
+    /// Save (text then equals the cached default).
+    private func resetFloorToDefault(_ mode: JesseMode) {
+        Task {
+            guard let d = await fetchDefaults() else { return }
+            switch mode {
+            case .ask:  askFloorDefault = d.askFloor;  askFloorText = d.askFloor
+            case .tell: tellFloorDefault = d.tellFloor; tellFloorText = d.tellFloor
+            }
+        }
+    }
+
+    /// "Load defaults from bridge": cache both wrapper defaults and fill the
+    /// editors. With `fillEmptyOnly`, only blank editors are populated so a custom
+    /// prompt is never clobbered — the first-use affordance for empty editors.
+    /// (Floor defaults are refreshed inside `fetchDefaults`.)
     private func loadDefaults(fillEmptyOnly: Bool) {
         Task {
             guard let d = await fetchDefaults() else { return }

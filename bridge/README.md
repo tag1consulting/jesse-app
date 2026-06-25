@@ -137,12 +137,13 @@ curl -s http://127.0.0.1:8765/jesse/prompts \
 #     "ask_floor": "<fixed ask safety floor>", "tell_floor": "<fixed tell floor>" }
 ```
 
-**`POST /jesse` with an optional `"instructions"` field** — when present and
-non-empty, it replaces the **active mode's editable wrapper** for that one
-request; when absent or blank, the built-in const is used exactly as before (so
-omitting the field reproduces today's behavior byte-for-byte). The bridge still
-appends its own voice/phone-format suffix regardless of the override, so it
-always owns output formatting.
+**`POST /jesse` with optional `"instructions"` and `"floor_override"` fields** —
+when present and non-empty, `instructions` replaces the **active mode's editable
+wrapper** for that one request, and `floor_override` replaces the wording of the
+**always-prepended safety floor**; when either is absent or blank, the built-in
+const is used exactly as before (so omitting both reproduces today's behavior
+byte-for-byte). The bridge still appends its own voice/phone-format suffix
+regardless of the overrides, so it always owns output formatting.
 
 ```bash
 curl -s http://127.0.0.1:8765/jesse \
@@ -151,20 +152,22 @@ curl -s http://127.0.0.1:8765/jesse \
   -d '{"mode":"ask","text":"What is on Today.md?","instructions":"Answer in one line. Question: "}'
 ```
 
-**The safety floor is fixed and non-removable.** Each mode has a fixed floor
-(`ask_floor` / `tell_floor`) that `build_prompt` **always prepends** to every
-turn — fresh and followup, voice and non-voice, with or without an
-`instructions` override. The Ask floor carries the standing CLAUDE.md invariant
-("Ask" forbids *action* he didn't request, never *writing* a durable fact); the
-Tell floor carries the universal record-facts invariant. An override customizes
-only the framing **between** the floor and the user's text — it can never drop or
-weaken the floor.
+**The safety floor is always prepended.** Each mode has a floor (`ask_floor` /
+`tell_floor`) that `build_prompt` **always prepends** to every turn — fresh and
+followup, voice and non-voice, with or without overrides. The Ask floor carries
+the standing CLAUDE.md invariant ("Ask" forbids *action* he didn't request, never
+*writing* a durable fact); the Tell floor carries the universal record-facts
+invariant. `floor_override` only changes the floor's **wording**; a blank/absent
+value falls back to the built-in const, so there is no way to send a turn with no
+floor at all. The wrapper override customizes only the framing **between** the
+floor and the user's text.
 
-The design is deliberately stateless: the bridge never stores a custom wrapper.
-The app persists the user's edits and sends `instructions` only when a mode is
-actually customized; an empty field always means "use the bridge default" and the
-field is omitted. The app also fetches the floors and shows them **read-only**, so
-no one re-types a weaker variant inside their own wrapper.
+The design is deliberately stateless: the bridge never stores a custom wrapper or
+floor. The app persists the user's edits and sends `instructions`/`floor_override`
+only when a slot is actually customized; an empty field always means "use the
+bridge default" and the field is omitted. In the app the floor is **unlockable** —
+locked by default, editable only behind an explicit "not recommended" gate — so no
+one reweakens it by accident.
 
 ## Prereqs
 

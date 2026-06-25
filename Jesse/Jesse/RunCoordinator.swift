@@ -59,13 +59,19 @@ final class RunCoordinator {
     // Resolves the per-mode wrapper override to send (nil = use the bridge
     // default). Injected so tests can drive it without UserDefaults state.
     private let instructionsProvider: @MainActor (JesseMode) -> String?
+    // Resolves the per-mode floor override to send (nil = use the bridge's
+    // built-in floor, which is always prepended and never removed). Injected so
+    // tests can drive it without UserDefaults state.
+    private let floorProvider: @MainActor (JesseMode) -> String?
 
     init(config: @escaping @MainActor () -> JesseConfig = { ConfigStore.load() },
          makeClient: @escaping @MainActor (JesseConfig) -> any JesseClientProtocol = { JesseClient(config: $0) },
-         instructions: @escaping @MainActor (JesseMode) -> String? = { PromptStore.override(for: $0) }) {
+         instructions: @escaping @MainActor (JesseMode) -> String? = { PromptStore.wrapperOverride(for: $0) },
+         floor: @escaping @MainActor (JesseMode) -> String? = { PromptStore.floorOverride(for: $0) }) {
         self.configProvider = config
         self.makeClient = makeClient
         self.instructionsProvider = instructions
+        self.floorProvider = floor
         self.inFlight = InFlightStore.load()
     }
 
@@ -116,9 +122,11 @@ final class RunCoordinator {
         let mode = thread.modeValue
         let sessionId = thread.sessionId
         let cfg = configProvider()
-        // Resolve the wrapper override on the main actor before detaching the
-        // turn; nil when this mode isn't customized (the bridge uses its default).
+        // Resolve the wrapper and floor overrides on the main actor before
+        // detaching the turn; nil when this mode isn't customized (the bridge uses
+        // its default wrapper / its built-in floor).
         let instructions = instructionsProvider(mode)
+        let floorOverride = floorProvider(mode)
         startDates[threadID] = Date()
 
         // A background grant lets a short turn finish after the app is backgrounded;
@@ -136,6 +144,7 @@ final class RunCoordinator {
                 let result = try await client.send(mode: mode, text: trimmed,
                                                    sessionId: sessionId, voice: voice,
                                                    instructions: instructions,
+                                                   floorOverride: floorOverride,
                                                    attachments: attachments)
                 switch result {
                 case .reply(let reply, _):

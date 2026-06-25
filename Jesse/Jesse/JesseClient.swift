@@ -299,7 +299,8 @@ enum JesseResultState {
 /// server; `JesseClient` is the only production conformer.
 protocol JesseClientProtocol {
     func send(mode: JesseMode, text: String, sessionId: String?, voice: Bool,
-              instructions: String?, attachments: [JesseAttachment]) async throws -> JesseSendResult
+              instructions: String?, floorOverride: String?,
+              attachments: [JesseAttachment]) async throws -> JesseSendResult
     func result(jobId: String) async throws -> JesseResultState
 }
 
@@ -319,12 +320,15 @@ struct JesseClient: JesseClientProtocol {
 
     /// Pass `sessionId` to continue a thread; `voice` asks for a SPOKEN: summary.
     /// A non-empty `instructions` overrides the bridge's built-in wrapper for the
-    /// active mode (the bridge still appends its voice/phone suffix). Returns
-    /// either the inline reply (with the job id the bridge assigned) or, if the
-    /// turn outran the grace window, a `running` job id to poll.
+    /// active mode; a non-empty `floorOverride` rewords the always-prepended safety
+    /// floor (blank/nil leaves the bridge's built-in floor, which is never removed).
+    /// The bridge still appends its voice/phone suffix. Returns either the inline
+    /// reply (with the job id the bridge assigned) or, if the turn outran the grace
+    /// window, a `running` job id to poll.
     func send(mode: JesseMode, text: String,
               sessionId: String? = nil, voice: Bool = false,
               instructions: String? = nil,
+              floorOverride: String? = nil,
               attachments: [JesseAttachment] = []) async throws -> JesseSendResult {
         guard !config.normalizedHost.isEmpty, !config.token.isEmpty,
               let url = config.endpoint("/jesse") else { throw JesseError.notConfigured }
@@ -335,6 +339,7 @@ struct JesseClient: JesseClientProtocol {
         req.setValue("Bearer \(config.token)", forHTTPHeaderField: "Authorization")
         let body = Self.requestBody(mode: mode, text: text, sessionId: sessionId,
                                     voice: voice, instructions: instructions,
+                                    floorOverride: floorOverride,
                                     attachments: attachments)
         req.httpBody = try JSONSerialization.data(withJSONObject: body)
 
@@ -390,11 +395,13 @@ struct JesseClient: JesseClientProtocol {
     // can be unit-tested without standing up a server.
 
     /// Build the `POST /jesse` JSON body. Optional fields are included only when
-    /// they carry content: `instructions` is omitted when nil or blank (so an
-    /// empty override means "use the bridge default"), matching the bridge's
+    /// they carry content: `instructions` and `floor_override` are omitted when nil
+    /// or blank (so an empty override means "use the bridge default" — for the floor,
+    /// the bridge's built-in floor, which it never drops), matching the bridge's
     /// `#[serde(default)]` shape so omitting a field reproduces today's behavior.
     static func requestBody(mode: JesseMode, text: String, sessionId: String?,
                             voice: Bool, instructions: String?,
+                            floorOverride: String?,
                             attachments: [JesseAttachment]) -> [String: Any] {
         var body: [String: Any] = ["mode": mode.rawValue, "text": text]
         if let sessionId { body["session_id"] = sessionId }
@@ -402,6 +409,10 @@ struct JesseClient: JesseClientProtocol {
         if let instructions,
            !instructions.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             body["instructions"] = instructions
+        }
+        if let floorOverride,
+           !floorOverride.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            body["floor_override"] = floorOverride
         }
         if !attachments.isEmpty {
             // Base64-in-JSON: matches the existing JSONSerialization path. The
