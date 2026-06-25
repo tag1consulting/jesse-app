@@ -36,11 +36,11 @@ QR encodes `jesse://pair?host=…&port=…&token=…`. Manual entry of the print
 values still works as a fallback.
 
 The advertised host defaults to `JESSE_BIND` (the tailnet IP, which is reliably
-reachable; the `ts.net` name has DNS quirks — see `STATUS.md`). To put the
-MagicDNS hostname in the QR instead, set `JESSE_ADVERTISE_HOST`:
+reachable; the `ts.net` name can have DNS quirks). To put the MagicDNS hostname
+in the QR instead, set `JESSE_ADVERTISE_HOST`:
 
 ```bash
-export JESSE_ADVERTISE_HOST="build-host.tailnet.ts.net"
+export JESSE_ADVERTISE_HOST="your-host.tailnet.ts.net"
 ```
 
 A clean `cargo build --release` is the gate — if it doesn't compile, it isn't done.

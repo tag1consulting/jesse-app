@@ -41,10 +41,25 @@ fi
 
 # 2) The bearer token must not be compared with raw ==/!= (timing-unsafe and a
 #    sign the auth path was hand-rolled around the intended check_auth helper).
-if hits="$(grep -nE '(token[[:alnum:]_]*[[:space:]]*(==|!=))|((==|!=)[[:space:]]*[[:alnum:]_.]*token)' "${RS[@]}" || true)"; then
+#    Covers both the `*token* ==/!=` form and the actual H1 shape where the
+#    secret was compared via locals (`got`/`expected`/the authorization header).
+if hits="$(grep -nE '(token[[:alnum:]_]*[[:space:]]*(==|!=))|((==|!=)[[:space:]]*[[:alnum:]_.]*token)|((got|expected|presented|authorization)[[:alnum:]_]*[[:space:]]*(==|!=))|((==|!=)[[:space:]]*(got|expected|presented|authorization))' "${RS[@]}" || true)"; then
   if [ -n "$hits" ]; then
-    flag "raw ==/!= comparison involving a token" "$hits"
+    flag "raw ==/!= comparison involving a token or auth-header value" "$hits"
   fi
+fi
+
+# 2b) Positively assert the auth path actually uses a constant-time primitive.
+#     Guard #2 catching the unsafe form is necessary but not sufficient — a
+#     vacuous pass (no compare at all, or a refactor that drops the check)
+#     would slip through. Require ct_eq / constant_time_eq to be present in the
+#     same file as check_auth.
+AUTH_FILE="$(grep -lE 'fn check_auth' "${RS[@]}" || true)"
+if [ -z "$AUTH_FILE" ]; then
+  flag "check_auth function not found in bridge sources" "expected an fn check_auth"
+elif ! grep -qE 'ct_eq|constant_time_eq' "$AUTH_FILE"; then
+  flag "check_auth's file does not use a constant-time compare (ct_eq/constant_time_eq)" \
+    "$AUTH_FILE"
 fi
 
 # 3) No literal 0.0.0.0 wildcard as a default bind (would expose the bridge on
@@ -61,6 +76,34 @@ if hits="$(grep -nE '/tmp/[^"'"'"']*token|jesse_token' "${RS[@]}" || true)"; the
   if [ -n "$hits" ]; then
     flag "token written to a /tmp path" "$hits"
   fi
+fi
+
+# 5) (R5/T9) No personal infrastructure in tracked files — a real tailnet IP,
+#    MagicDNS/tailnet id, a developer's machine name, or a personal absolute
+#    home path must never ship. Scans the whole tracked tree (STATUS.md and
+#    other internal worklogs are .gitignored, so they are out of scope here).
+PERSONAL='100\.70\.149\.25|tailnet|build-host|/Users/user'
+if git -C "$ROOT" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+  # Exclude this script: it is the one reviewed place those patterns must appear
+  # (as the matcher itself), so it would otherwise flag its own definition.
+  if hits="$(git -C "$ROOT" ls-files -z -- . ':!:scripts/ci-guards.sh' \
+      | xargs -0 grep -nE "$PERSONAL" 2>/dev/null || true)"; then
+    if [ -n "$hits" ]; then
+      flag "personal infra (tailnet IP / MagicDNS / machine name / home path) in a tracked file" "$hits"
+    fi
+  fi
+fi
+
+# 6) (R5/T9) Run a secret scanner over the tree when one is available. gitleaks
+#    is best-effort locally (skipped with a note if absent); CI installs it as a
+#    required step so a leaked credential cannot merge.
+if command -v gitleaks >/dev/null 2>&1; then
+  if ! gitleaks detect --source "$ROOT" --no-banner --redact >/dev/null 2>&1; then
+    flag "gitleaks reported potential secrets" \
+      "$(gitleaks detect --source "$ROOT" --no-banner --redact 2>&1 | tail -20)"
+  fi
+else
+  echo "ci-guards: gitleaks not installed — skipping secret scan locally (enforced in CI)." >&2
 fi
 
 if [ "$fail" -ne 0 ]; then

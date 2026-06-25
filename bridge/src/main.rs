@@ -36,6 +36,7 @@ use axum::{
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
+use subtle::ConstantTimeEq;
 use tokio::process::Command;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio::time::timeout;
@@ -516,15 +517,22 @@ fn check_auth(headers: &HeaderMap, token: &str) -> Result<(), ApiError> {
             "Server misconfigured: JESSE_TOKEN not set".to_string(),
         ));
     }
-    let expected = format!("Bearer {token}");
+    // Missing / non-UTF8 header → treat as empty → falls through to 401.
     let got = headers
         .get("authorization")
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
-    if got != expected {
-        return Err((StatusCode::UNAUTHORIZED, "Unauthorized".to_string()));
+    // The "Bearer " prefix is not secret; strip it with an ordinary
+    // short-circuiting compare. Absent prefix → 401.
+    let unauthorized = || (StatusCode::UNAUTHORIZED, "Unauthorized".to_string());
+    let presented = got.strip_prefix("Bearer ").ok_or_else(unauthorized)?;
+    // Compare only the secret token bytes in constant time. Token length is not
+    // secret, so ct_eq returning false on a length mismatch is fine.
+    if presented.as_bytes().ct_eq(token.as_bytes()).into() {
+        Ok(())
+    } else {
+        Err(unauthorized())
     }
-    Ok(())
 }
 
 /// Wrap the user's text in the active mode's instruction, then append the
