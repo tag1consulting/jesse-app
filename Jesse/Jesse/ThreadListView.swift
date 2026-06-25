@@ -23,12 +23,16 @@ struct ThreadListView: View {
                 }
             } else {
                 List {
-                    ForEach(threads) { thread in
-                        NavigationLink(value: thread) {
-                            ThreadRow(thread: thread, running: coordinator.isRunning(thread.id))
+                    ForEach(groupedSections) { group in
+                        Section(group.section.title()) {
+                            ForEach(group.threads) { thread in
+                                NavigationLink(value: thread) {
+                                    ThreadRow(thread: thread, running: coordinator.isRunning(thread.id))
+                                }
+                            }
+                            .onDelete { delete($0, in: group.threads) }
                         }
                     }
-                    .onDelete(perform: delete)
                 }
             }
         }
@@ -55,9 +59,23 @@ struct ThreadListView: View {
         path.append(thread)
     }
 
-    private func delete(_ offsets: IndexSet) {
+    /// Threads bucketed into date sections, sections newest-first. Threads keep
+    /// the `@Query`'s `updatedAt`-descending order within each section because
+    /// `Dictionary(grouping:)` preserves source order per group. `now` is read
+    /// once here so every thread is classified against the same instant.
+    private var groupedSections: [ThreadGroup] {
+        let now = Date.now
+        let grouped = Dictionary(grouping: threads) {
+            threadSection(for: $0.updatedAt, now: now, calendar: .current)
+        }
+        return grouped
+            .map { ThreadGroup(section: $0.key, threads: $0.value) }
+            .sorted { $0.section.sortKey > $1.section.sortKey }
+    }
+
+    private func delete(_ offsets: IndexSet, in sectionThreads: [JesseThread]) {
         for index in offsets {
-            let thread = threads[index]
+            let thread = sectionThreads[index]
             coordinator.cancel(thread.id)
             context.delete(thread)
         }
@@ -74,6 +92,14 @@ struct ThreadListView: View {
         }
         if changed { try? context.save() }
     }
+}
+
+/// One date-bucketed section of the list. `ThreadSection` is its stable
+/// identity, so SwiftUI re-renders correctly as threads move between buckets.
+private struct ThreadGroup: Identifiable {
+    let section: ThreadSection
+    let threads: [JesseThread]
+    var id: ThreadSection { section }
 }
 
 /// A list row: title, relative last-activity time, and a live dot while running.
