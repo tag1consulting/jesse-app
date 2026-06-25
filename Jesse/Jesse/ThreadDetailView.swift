@@ -65,16 +65,11 @@ struct ThreadDetailView: View {
                         TurnRow(turn: turn)
                             .id(turn.id)
                     }
-                    if running {
-                        ThinkingRow(startDate: coordinator.startDate(for: thread.id))
-                            .id(Self.bottomAnchor)
-                    }
                     if let error = coordinator.error(for: thread.id) {
                         Text(error)
                             .font(.callout)
                             .foregroundStyle(.red)
                             .frame(maxWidth: .infinity, alignment: .leading)
-                            .id(Self.bottomAnchor)
                     }
                     Color.clear.frame(height: 1).id(Self.bottomAnchor)
                 }
@@ -320,23 +315,6 @@ private struct TurnRow: View {
         } else {
             MarkdownText(turn.text)
                 .frame(maxWidth: .infinity, alignment: .leading)
-        }
-    }
-}
-
-/// Live "Thinking…" row — appends a seconds counter past 10s, mirroring the send
-/// button's behavior.
-private struct ThinkingRow: View {
-    let startDate: Date?
-
-    var body: some View {
-        TimelineView(.periodic(from: .now, by: 1)) { context in
-            let secs = startDate.map { Int(context.date.timeIntervalSince($0)) } ?? 0
-            HStack(spacing: 8) {
-                ProgressView()
-                Text(secs > 10 ? "Thinking… \(secs)" : "Thinking…")
-                    .foregroundStyle(.secondary)
-            }
         }
     }
 }
