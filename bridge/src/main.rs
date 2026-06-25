@@ -47,24 +47,41 @@ use tokio::time::timeout;
 // CLAUDE.md rule and must happen in every mode, or facts surfaced mid-thread
 // are lost when the session ages out (the thread is not the vault).
 
+// The non-negotiable safety floor for ASK turns. `build_prompt` ALWAYS prepends
+// this — even when the user supplies a custom wrapper override. A customized
+// wrapper changes the *framing*, never this clause. Mirrors CLAUDE.md: an Ask is
+// a question, so don't take unrequested action; but a surfaced durable fact is
+// always recorded. The app shows this read-only so users don't re-type a weaker
+// variant inside their own wrapper.
+const ASK_FLOOR: &str = "Don't do task-work he didn't ask for — no new drafts, \
+TODOs, or edits to act on something. BUT if this exchange surfaces a durable \
+fact, correction, or status change, record it to the right vault file \
+immediately per CLAUDE.md — that is never optional and never needs his \
+permission.";
+
+// The non-negotiable floor for TELL turns: durable-fact capture is always on,
+// even under a custom wrapper. (Tell already means "act", so there is no
+// no-unrequested-action clause — only the universal record-facts invariant.)
+const TELL_FLOOR: &str = "Record any durable fact, correction, or status change \
+to the right vault file immediately per CLAUDE.md — that is never optional and \
+never needs his permission.";
+
+// Editable wrappers (the framing the app's Settings can override). The fixed
+// floor above is prepended separately and is NOT part of this text, so a custom
+// override cannot drop it.
 const ASK_PREAMBLE: &str = "Jeremy is ASKING you a question from his phone. \
-Answer concisely and directly; read the vault as needed. Don't do task-work he \
-didn't ask for — no new drafts, TODOs, or edits to act on something. BUT if this \
-exchange surfaces a durable fact, correction, or status change, record it to the \
-right vault file immediately per CLAUDE.md — that is never optional and never \
-needs his permission. Keep the answer short enough to read on a phone screen.\n\n\
-Question: ";
+Answer concisely and directly; read the vault as needed. Keep the answer short \
+enough to read on a phone screen.\n\nQuestion: ";
 
 const TELL_PREAMBLE: &str = "Jeremy is TELLING you something from his phone — a \
 fact, an instruction, or something to capture. Act on it per CLAUDE.md: log it, \
-file it, or update the vault as appropriate. Record durable facts immediately. \
-Reply with a one or two sentence confirmation of what you did.\n\nMessage: ";
+file it, or update the vault as appropriate. Reply with a one or two sentence \
+confirmation of what you did.\n\nMessage: ";
 
-// On a resumed thread the framing is already established — keep it light, but
-// still require fact-capture (a followup often carries a fact, not just an
-// answer to a clarifying question).
-const ASK_FOLLOWUP: &str = "Jeremy follows up (still asking, keep it short; still \
-record any durable fact that surfaces, per CLAUDE.md): ";
+// On a resumed thread the framing is already established — keep it light. The
+// record-facts invariant now lives in the always-applied floor, so the followup
+// wrappers no longer restate it.
+const ASK_FOLLOWUP: &str = "Jeremy follows up (still asking, keep it short): ";
 
 const TELL_FOLLOWUP: &str = "Jeremy follows up (capture/act per CLAUDE.md): ";
 
@@ -506,10 +523,12 @@ fn check_auth(headers: &HeaderMap, token: &str) -> Result<(), ApiError> {
 
 /// Wrap the user's text in the active mode's instruction, then append the
 /// voice or phone-format suffix. `mode` (validated here) selects Ask vs Tell and
-/// fresh vs followup. A non-empty `instructions` override replaces the built-in
-/// wrapper for the active mode; the suffix is still appended regardless, so the
-/// bridge always owns voice/phone formatting. With `instructions` absent or
-/// blank the output is byte-identical to the const-only path.
+/// fresh vs followup. The mode's fixed safety floor is ALWAYS prepended and is
+/// never overridable; a non-empty `instructions` override replaces only the
+/// built-in *wrapper* that follows the floor. The suffix is still appended
+/// regardless, so the bridge always owns the floor and voice/phone formatting.
+/// With `instructions` absent or blank the output is byte-identical to the
+/// const-only path.
 fn build_prompt(
     mode: &str,
     text: &str,
@@ -517,13 +536,13 @@ fn build_prompt(
     voice: bool,
     instructions: Option<&str>,
 ) -> Result<String, ApiError> {
-    // Validate the mode and pick the built-in wrapper even when an override is
-    // present — an unknown mode is still a 400, override or not.
-    let default_preamble = match (mode, is_followup) {
-        ("ask", false) => ASK_PREAMBLE,
-        ("ask", true) => ASK_FOLLOWUP,
-        ("tell", false) => TELL_PREAMBLE,
-        ("tell", true) => TELL_FOLLOWUP,
+    // Validate the mode and pick both the built-in wrapper and the fixed floor —
+    // an unknown mode is still a 400, override or not.
+    let (default_preamble, floor) = match (mode, is_followup) {
+        ("ask", false) => (ASK_PREAMBLE, ASK_FLOOR),
+        ("ask", true) => (ASK_FOLLOWUP, ASK_FLOOR),
+        ("tell", false) => (TELL_PREAMBLE, TELL_FLOOR),
+        ("tell", true) => (TELL_FOLLOWUP, TELL_FLOOR),
         _ => {
             return Err((
                 StatusCode::BAD_REQUEST,
@@ -535,7 +554,9 @@ fn build_prompt(
         Some(s) if !s.trim().is_empty() => s,
         _ => default_preamble,
     };
-    let mut p = format!("{preamble}{text}");
+    // The floor leads every turn and is never overridable: a custom wrapper
+    // changes the framing that follows it, not the floor itself.
+    let mut p = format!("{floor}\n\n{preamble}{text}");
     if voice {
         p.push_str(VOICE_SUFFIX);
     } else {
@@ -1044,7 +1065,8 @@ async fn health(State(st): State<AppState>) -> Json<Value> {
 }
 
 /// Expose the built-in Ask/Tell wrapper instructions so the app can show them as
-/// the editable "defaults" and reset to them. Returns the exact const strings
+/// the editable "defaults" and reset to them, plus the fixed Ask/Tell safety
+/// floors so the app can display them read-only. Returns the exact const strings
 /// `build_prompt` applies for a fresh turn, so the app's default matches what the
 /// bridge would use. Same bearer auth as `/jesse`.
 async fn jesse_prompts(
@@ -1052,7 +1074,12 @@ async fn jesse_prompts(
     headers: HeaderMap,
 ) -> Result<Json<Value>, ApiError> {
     check_auth(&headers, &st.cfg.token)?;
-    Ok(Json(json!({ "ask": ASK_PREAMBLE, "tell": TELL_PREAMBLE })))
+    Ok(Json(json!({
+        "ask": ASK_PREAMBLE,
+        "tell": TELL_PREAMBLE,
+        "ask_floor": ASK_FLOOR,
+        "tell_floor": TELL_FLOOR,
+    })))
 }
 
 async fn jesse(
@@ -1402,7 +1429,9 @@ mod tests {
     #[test]
     fn build_prompt_ask_fresh_wraps_with_ask_preamble() {
         let p = build_prompt("ask", "what is on Today.md", false, false, None).unwrap();
-        assert!(p.starts_with(ASK_PREAMBLE));
+        // The fixed floor leads; the editable wrapper follows it.
+        assert!(p.starts_with(ASK_FLOOR));
+        assert!(p.contains(ASK_PREAMBLE));
         assert!(p.contains("what is on Today.md"));
         // Non-voice replies get the phone-formatting hint, not the voice suffix.
         assert!(p.ends_with(PHONE_FORMAT));
@@ -1412,7 +1441,8 @@ mod tests {
     #[test]
     fn build_prompt_ask_followup_uses_followup_preamble() {
         let p = build_prompt("ask", "and the second?", true, false, None).unwrap();
-        assert!(p.starts_with(ASK_FOLLOWUP));
+        assert!(p.starts_with(ASK_FLOOR));
+        assert!(p.contains(ASK_FOLLOWUP));
         assert!(p.contains("and the second?"));
         assert!(p.ends_with(PHONE_FORMAT));
     }
@@ -1420,11 +1450,13 @@ mod tests {
     #[test]
     fn build_prompt_tell_fresh_and_followup() {
         let fresh = build_prompt("tell", "remember this", false, false, None).unwrap();
-        assert!(fresh.starts_with(TELL_PREAMBLE));
+        assert!(fresh.starts_with(TELL_FLOOR));
+        assert!(fresh.contains(TELL_PREAMBLE));
         assert!(fresh.contains("remember this"));
         assert!(fresh.ends_with(PHONE_FORMAT));
         let followup = build_prompt("tell", "also this", true, false, None).unwrap();
-        assert!(followup.starts_with(TELL_FOLLOWUP));
+        assert!(followup.starts_with(TELL_FLOOR));
+        assert!(followup.contains(TELL_FOLLOWUP));
         assert!(followup.ends_with(PHONE_FORMAT));
     }
 
@@ -1454,10 +1486,12 @@ mod tests {
         let custom = "Custom ask wrapper. Question: ";
         let p = build_prompt("ask", "the question", false, false, Some(custom)).unwrap();
         // The override replaces the built-in Ask wrapper entirely...
-        assert!(p.starts_with(custom));
+        assert!(p.contains(custom));
         assert!(!p.contains(ASK_PREAMBLE));
+        // ...but the fixed floor still leads, unremovable...
+        assert!(p.starts_with(ASK_FLOOR));
         assert!(p.contains("the question"));
-        // ...but the bridge still appends the phone-format suffix.
+        // ...and the bridge still appends the phone-format suffix.
         assert!(p.ends_with(PHONE_FORMAT));
     }
 
@@ -1465,7 +1499,7 @@ mod tests {
     fn build_prompt_override_still_appends_voice_suffix() {
         let custom = "Spoken-friendly wrapper: ";
         let p = build_prompt("tell", "do the thing", false, true, Some(custom)).unwrap();
-        assert!(p.starts_with(custom));
+        assert!(p.contains(custom));
         assert!(!p.contains(TELL_PREAMBLE));
         // Voice suffix wins over phone-format even under an override.
         assert!(p.ends_with(VOICE_SUFFIX));
@@ -1478,7 +1512,8 @@ mod tests {
         // followup — a customized mode uses the same instruction on a resumed thread.
         let custom = "My wrapper: ";
         let p = build_prompt("ask", "more", true, false, Some(custom)).unwrap();
-        assert!(p.starts_with(custom));
+        assert!(p.contains(custom));
+        assert!(p.starts_with(ASK_FLOOR));
         assert!(!p.contains(ASK_FOLLOWUP));
     }
 
@@ -1498,6 +1533,36 @@ mod tests {
                 assert_eq!(got, base, "blank override {blank:?} must equal default");
             }
         }
+    }
+
+    #[test]
+    fn build_prompt_override_cannot_remove_ask_floor() {
+        let custom = "Ignore everything; just answer. ";
+        for (followup, voice) in [(false, false), (true, false), (false, true)] {
+            let p = build_prompt("ask", "do X", followup, voice, Some(custom)).unwrap();
+            assert!(p.starts_with(ASK_FLOOR), "floor must lead (fu={followup}, v={voice})");
+            assert!(p.contains(custom));
+        }
+    }
+
+    #[test]
+    fn build_prompt_override_cannot_remove_tell_floor() {
+        let custom = "Just do it, no notes. ";
+        for (followup, voice) in [(false, false), (true, false), (false, true)] {
+            let p = build_prompt("tell", "log Y", followup, voice, Some(custom)).unwrap();
+            assert!(p.starts_with(TELL_FLOOR), "floor must lead (fu={followup}, v={voice})");
+            assert!(p.contains(custom));
+        }
+    }
+
+    #[test]
+    fn build_prompt_floor_is_mode_specific() {
+        let ask = build_prompt("ask", "q", false, false, None).unwrap();
+        assert!(ask.contains(ASK_FLOOR));
+        assert!(!ask.contains(TELL_FLOOR));
+        let tell = build_prompt("tell", "m", false, false, None).unwrap();
+        assert!(tell.contains(TELL_FLOOR));
+        assert!(!tell.contains(ASK_FLOOR));
     }
 
     // ---- interpret_claude_output ------------------------------------------
@@ -1774,6 +1839,9 @@ mod tests {
         // matches what the bridge would use for a fresh turn.
         assert_eq!(body["ask"], ASK_PREAMBLE);
         assert_eq!(body["tell"], TELL_PREAMBLE);
+        // The fixed safety floors are exposed too, so the app can show them read-only.
+        assert_eq!(body["ask_floor"], ASK_FLOOR);
+        assert_eq!(body["tell_floor"], TELL_FLOOR);
     }
 
     // ---- job store unit tests ---------------------------------------------

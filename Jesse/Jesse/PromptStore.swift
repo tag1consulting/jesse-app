@@ -2,17 +2,21 @@ import Foundation
 
 /// Per-mode custom prompt wrappers, persisted in UserDefaults (these aren't
 /// secret, unlike the bearer token, so not Keychain). For each mode we keep
-/// three things:
+/// four things:
 ///   * `text`       — what the user typed into the editor
 ///   * `customized` — an explicit per-mode flag (set when a real override exists)
 ///   * `default`    — the last bridge default we fetched, used both to compare
 ///                    against (an override is only sent when it *differs*) and as
 ///                    the value "Reset to default" restores.
+///   * `floor`      — the fixed, non-overridable safety clause the bridge ALWAYS
+///                    prepends. Cached purely so Settings can show it read-only;
+///                    it never feeds `override(for:)`, the `customized` flag, or
+///                    the editor text.
 ///
 /// The invariant the Settings UI surfaces: an empty field always means "use the
 /// bridge default" — the override is omitted. (And "Ask" forbids *action* he
-/// didn't request, never *writing* a durable fact; that lives in the bridge's
-/// Ask wrapper, which the editor seeds from.)
+/// didn't request, never *writing* a durable fact; that invariant now lives in
+/// the bridge's fixed floor, which a custom wrapper cannot drop.)
 enum PromptStore {
     private static var defaults: UserDefaults { .standard }
 
@@ -34,12 +38,26 @@ enum PromptStore {
         defaults.string(forKey: key(mode, "default")) ?? ""
     }
 
+    /// The fixed safety floor for a mode, as last fetched from the bridge. Empty
+    /// until a fetch populates it. Display-only — see `cacheFloor`.
+    static func floor(_ mode: JesseMode) -> String {
+        defaults.string(forKey: key(mode, "floor")) ?? ""
+    }
+
     // MARK: - Writes
 
     /// Cache the bridge default for a mode (after a successful fetch), without
     /// touching the user's text or customized flag.
     static func cacheDefault(_ mode: JesseMode, _ value: String) {
         defaults.set(value, forKey: key(mode, "default"))
+    }
+
+    /// Cache the bridge's fixed safety floor for a mode (after a successful
+    /// fetch), for read-only display. Deliberately independent of `text`,
+    /// `customized`, and `default`: the floor is enforced by the bridge and is
+    /// never part of the override the app sends.
+    static func cacheFloor(_ mode: JesseMode, _ value: String) {
+        defaults.set(value, forKey: key(mode, "floor"))
     }
 
     /// Persist the editor's `text` and (re)derive the explicit `customized` flag:

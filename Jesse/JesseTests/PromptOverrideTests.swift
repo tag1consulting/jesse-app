@@ -51,10 +51,12 @@ final class PromptOverrideTests: XCTestCase {
     }
 
     func testDecodePromptsValid() throws {
-        let json = #"{"ask":"ASK WRAP","tell":"TELL WRAP"}"#.data(using: .utf8)!
+        let json = #"{"ask":"ASK WRAP","tell":"TELL WRAP","ask_floor":"ASK FLOOR","tell_floor":"TELL FLOOR"}"#.data(using: .utf8)!
         let p = try JesseClient.decodePrompts(data: json, resp: http(200))
         XCTAssertEqual(p.ask, "ASK WRAP")
         XCTAssertEqual(p.tell, "TELL WRAP")
+        XCTAssertEqual(p.askFloor, "ASK FLOOR")
+        XCTAssertEqual(p.tellFloor, "TELL FLOOR")
     }
 
     func testDecodePromptsNon2xxThrows() {
@@ -67,12 +69,19 @@ final class PromptOverrideTests: XCTestCase {
         XCTAssertThrowsError(try JesseClient.decodePrompts(data: json, resp: http(200)))
     }
 
+    func testDecodePromptsMissingFloorThrows() {
+        // A bridge too old to expose the floors can't enforce them — fail rather
+        // than show none.
+        let json = #"{"ask":"ASK WRAP","tell":"TELL WRAP"}"#.data(using: .utf8)!
+        XCTAssertThrowsError(try JesseClient.decodePrompts(data: json, resp: http(200)))
+    }
+
     // MARK: - PromptStore override decision
 
     private func clearPromptDefaults() {
         let d = UserDefaults.standard
         for mode in ["ask", "tell"] {
-            for suffix in ["text", "customized", "default"] {
+            for suffix in ["text", "customized", "default", "floor"] {
                 d.removeObject(forKey: "jesse.prompt.\(mode).\(suffix)")
             }
         }
@@ -102,6 +111,19 @@ final class PromptOverrideTests: XCTestCase {
         PromptStore.save(.tell, text: "", default: "DEFAULT WRAP")
         XCTAssertFalse(PromptStore.customized(.tell))
         XCTAssertNil(PromptStore.override(for: .tell))
+    }
+
+    func testFloorCacheRoundTripsAndIsDisplayOnly() {
+        // Empty before any fetch.
+        XCTAssertEqual(PromptStore.floor(.ask), "")
+        // After caching, it reads back...
+        PromptStore.cacheFloor(.ask, "FIXED ASK FLOOR")
+        XCTAssertEqual(PromptStore.floor(.ask), "FIXED ASK FLOOR")
+        // ...but the floor is display-only: it must not create an override, set
+        // the customized flag, or touch the editor text.
+        XCTAssertNil(PromptStore.override(for: .ask))
+        XCTAssertFalse(PromptStore.customized(.ask))
+        XCTAssertEqual(PromptStore.text(.ask), "")
     }
 
     func testResetToDefaultClearsCustomized() {

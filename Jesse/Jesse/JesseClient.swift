@@ -269,6 +269,17 @@ struct JesseReply {
     }
 }
 
+/// What `GET /jesse/prompts` returns: the two editable wrapper defaults plus the
+/// two fixed safety floors. The floors are display-only — the bridge always
+/// prepends them and a custom wrapper can't drop them — so the app shows them
+/// read-only rather than seeding an editor from them.
+struct PromptDefaults: Equatable {
+    let ask: String
+    let tell: String
+    let askFloor: String
+    let tellFloor: String
+}
+
 /// Outcome of a `POST /jesse`. The bridge either finishes within its grace
 /// window (inline reply, 200) or hands back a job id to poll (202).
 enum JesseSendResult {
@@ -359,7 +370,7 @@ struct JesseClient: JesseClientProtocol {
     /// Fetch the bridge's built-in Ask/Tell wrapper defaults (`GET /jesse/prompts`).
     /// Mirrors `send`'s URL building and bearer auth. Used by Settings to populate
     /// the editors and to reset a field to the current bridge default.
-    func fetchPrompts() async throws -> (ask: String, tell: String) {
+    func fetchPrompts() async throws -> PromptDefaults {
         guard !config.normalizedHost.isEmpty, !config.token.isEmpty,
               let url = config.endpoint("/jesse/prompts") else { throw JesseError.notConfigured }
         var req = URLRequest(url: url)
@@ -451,17 +462,22 @@ struct JesseClient: JesseClientProtocol {
         }
     }
 
-    static func decodePrompts(data: Data, resp: URLResponse) throws -> (ask: String, tell: String) {
+    static func decodePrompts(data: Data, resp: URLResponse) throws -> PromptDefaults {
         guard let http = resp as? HTTPURLResponse else { throw JesseError.decoding }
         guard (200..<300).contains(http.statusCode) else {
             throw JesseError.badResponse(http.statusCode,
                                          String(data: data, encoding: .utf8) ?? "")
         }
+        // All four keys are required: a bridge too old to expose the fixed floors
+        // can't enforce them, so fail rather than silently show none.
         guard let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let ask = obj["ask"] as? String, let tell = obj["tell"] as? String else {
+              let ask = obj["ask"] as? String, let tell = obj["tell"] as? String,
+              let askFloor = obj["ask_floor"] as? String,
+              let tellFloor = obj["tell_floor"] as? String else {
             throw JesseError.decoding
         }
-        return (ask: ask, tell: tell)
+        return PromptDefaults(ask: ask, tell: tell,
+                              askFloor: askFloor, tellFloor: tellFloor)
     }
 }
 

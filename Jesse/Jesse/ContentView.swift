@@ -68,6 +68,10 @@ struct SettingsView: View {
     @State private var tellPrompt = ""
     @State private var askDefault = ""
     @State private var tellDefault = ""
+    // The fixed safety floors the bridge always prepends, shown read-only. These
+    // are display-only and never feed the editors or the override that's sent.
+    @State private var askFloor = ""
+    @State private var tellFloor = ""
     @State private var promptsError: String?
     @State private var loadingPrompts = false
 
@@ -120,6 +124,7 @@ struct SettingsView: View {
                 }
 
                 Section {
+                    fixedFloorView(askFloor)
                     TextEditor(text: $askPrompt)
                         .frame(minHeight: 120)
                         .font(.body.monospaced())
@@ -130,11 +135,13 @@ struct SettingsView: View {
                 } header: {
                     Text("Ask Jesse prompt")
                 } footer: {
-                    // The invariant: "Ask" forbids unrequested action, never writing.
-                    Text("“Ask” means Jesse won’t take actions you didn’t request — but it never stops him from recording a durable fact, correction, or status change to the vault. Leave empty to use the bridge default.")
+                    // The invariant lives in the locked floor above; the editor
+                    // only customizes the framing that follows it.
+                    Text("The locked text above is always applied and can’t be removed: “Ask” means Jesse won’t take actions you didn’t request, but he always records a durable fact, correction, or status change to the vault. Your editor only customizes the framing after it. Leave empty to use the bridge default.")
                 }
 
                 Section {
+                    fixedFloorView(tellFloor)
                     TextEditor(text: $tellPrompt)
                         .frame(minHeight: 120)
                         .font(.body.monospaced())
@@ -145,7 +152,7 @@ struct SettingsView: View {
                 } header: {
                     Text("Tell Jesse prompt")
                 } footer: {
-                    Text("How a “Tell” is framed for Jesse to capture or act on. Leave empty to use the bridge default.")
+                    Text("The locked text above is always applied and can’t be removed: Jesse always records durable facts to the vault. Your editor only customizes how a “Tell” is framed after it. Leave empty to use the bridge default.")
                 }
             }
             .navigationTitle("Settings")
@@ -176,6 +183,8 @@ struct SettingsView: View {
                 tellPrompt = PromptStore.text(.tell)
                 askDefault = PromptStore.cachedDefault(.ask)
                 tellDefault = PromptStore.cachedDefault(.tell)
+                askFloor = PromptStore.floor(.ask)
+                tellFloor = PromptStore.floor(.tell)
             }
             .sheet(isPresented: $showScanner) {
                 scannerSheet
@@ -188,18 +197,54 @@ struct SettingsView: View {
     /// Fetch the bridge's built-in wrapper defaults using the host/token the user
     /// has entered (not necessarily saved yet), so pairing + loading defaults can
     /// happen in one visit. Returns nil and sets `promptsError` on any failure.
-    private func fetchDefaults() async -> (ask: String, tell: String)? {
+    /// On success it also refreshes the read-only floor cards (and their cache),
+    /// since the fixed floors ride along on the same response.
+    private func fetchDefaults() async -> PromptDefaults? {
         loadingPrompts = true
         defer { loadingPrompts = false }
         promptsError = nil
         let cfg = JesseConfig(host: host, port: Int(port) ?? 8765, token: token)
         do {
-            return try await JesseClient(config: cfg).fetchPrompts()
+            let d = try await JesseClient(config: cfg).fetchPrompts()
+            // Floors are display-only: update the cards and cache, never the editors.
+            askFloor = d.askFloor
+            tellFloor = d.tellFloor
+            PromptStore.cacheFloor(.ask, d.askFloor)
+            PromptStore.cacheFloor(.tell, d.tellFloor)
+            return d
         } catch {
             let detail = (error as? JesseError)?.errorDescription ?? error.localizedDescription
             promptsError = "Couldn’t load defaults — connect to the bridge first. (\(detail))"
             return nil
         }
+    }
+
+    /// A read-only card showing a mode's fixed safety floor — the clause the
+    /// bridge always prepends and a custom wrapper can't remove. Empty until a
+    /// fetch populates it, in which case it nudges the user to load defaults.
+    @ViewBuilder
+    private func fixedFloorView(_ floor: String) -> some View {
+        RoundedRectangle(cornerRadius: 8)
+            .fill(Color.accentColor.opacity(0.08))
+            .overlay(alignment: .topLeading) {
+                VStack(alignment: .leading, spacing: 6) {
+                    Label("Always applied — can’t be edited", systemImage: "lock.fill")
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(.secondary)
+                    if floor.isEmpty {
+                        Text("Load defaults from the bridge to see the fixed safety text.")
+                            .font(.callout)
+                            .foregroundStyle(.secondary)
+                    } else {
+                        Text(floor)
+                            .font(.callout)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+                .padding(12)
+            }
+            .frame(maxWidth: .infinity, minHeight: 88, alignment: .topLeading)
+            .fixedSize(horizontal: false, vertical: true)
     }
 
     /// "Reset to default" for one mode: overwrite that editor with the freshly
