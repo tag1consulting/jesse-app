@@ -25,7 +25,7 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use axum::{
     extract::{DefaultBodyLimit, Path as UrlPath, State},
@@ -103,7 +103,22 @@ clearest form, keep it to 2–3 narrow columns; otherwise avoid tables.)";
 
 // Hard upper bound on any single turn, regardless of JESSE_TIMEOUT. A request
 // cannot pin a `claude` child (and a concurrency permit) for longer than this.
-const HARD_TIMEOUT_CEILING: u64 = 3600;
+// Raised to 2h so a long agent turn (a big refactor, a deep vault sweep) can run
+// to completion; the per-request JESSE_TIMEOUT (default 1h) still applies under it.
+const HARD_TIMEOUT_CEILING: u64 = 7200;
+
+// How long a finished-but-unretrieved reply is held before TTL eviction. Raised
+// to 24h so a reply that completes while the phone is away (suspended, off the
+// tailnet) is still there when it re-checks. The clock for a completed job only
+// starts at FIRST successful retrieval (see `DEFAULT_RETRIEVAL_GRACE_SECS`); an
+// unfetched reply gets the full window.
+const DEFAULT_JOB_TTL_SECS: u64 = 86_400;
+
+// Once a completed reply has been fetched at least once, it's kept only this much
+// longer (a short grace so an immediate re-poll still succeeds) rather than for
+// the full TTL — a fetched reply shouldn't linger for a day. This is the old
+// pre-24h window, repurposed as the post-fetch grace.
+const DEFAULT_RETRIEVAL_GRACE_SECS: u64 = 600;
 
 // Captured agent stdout is truncated to this many bytes before parsing so one
 // pathological run can't balloon the bridge's memory. The JSON envelope the
@@ -162,8 +177,19 @@ struct Config {
     // returns 202 and lets the client poll. A few seconds catches fast turns
     // inline; everything longer is resolved via GET /jesse/result/{job_id}.
     grace_secs: u64,
-    // How long a completed/failed job stays retrievable before TTL eviction.
+    // How long a completed/failed job stays retrievable before TTL eviction when
+    // it has NEVER been fetched. The clock starts at first retrieval, not at
+    // completion, so an unfetched reply survives the full window.
     job_ttl_secs: u64,
+    // Once a completed job has been fetched once, how much longer it's kept (a
+    // short grace so a re-poll still works) instead of the full TTL.
+    retrieval_grace_secs: u64,
+    // Directory under which completed job results are persisted (one JSON file
+    // per job, under `<state_dir>/jobs`) so a bridge restart / laptop reboot
+    // doesn't lose a finished-but-unretrieved reply. None disables persistence
+    // (in-memory only). Defaults to `$HOME/.jesse-bridge`. Only the finished
+    // result + metadata is written — never the bearer token or any secret.
+    state_dir: Option<String>,
     // Attachment caps (see the DEFAULT_MAX_ATTACHMENT* consts). Decoded sizes.
     max_attachments: usize,
     max_attachment_bytes: usize,
@@ -182,6 +208,15 @@ impl Config {
             .as_deref()
             .map(PathBuf::from)
             .unwrap_or_else(std::env::temp_dir)
+    }
+
+    /// The directory under which per-job result files are written, or `None`
+    /// when persistence is disabled. `<state_dir>/jobs` keeps the job store's
+    /// files in their own subdir so the state dir can hold other things later.
+    fn jobs_dir(&self) -> Option<PathBuf> {
+        self.state_dir
+            .as_deref()
+            .map(|d| PathBuf::from(d).join("jobs"))
     }
 }
 
@@ -215,7 +250,7 @@ impl Config {
                 std::env::var("JESSE_TIMEOUT")
                     .ok()
                     .and_then(|s| s.parse().ok())
-                    .unwrap_or(1800),
+                    .unwrap_or(3600), // 1h default; clamped to [1, HARD_TIMEOUT_CEILING]
             ),
             allowed_tools: std::env::var("JESSE_ALLOWED_TOOLS")
                 .ok()
@@ -242,7 +277,19 @@ impl Config {
             job_ttl_secs: std::env::var("JESSE_JOB_TTL_SECS")
                 .ok()
                 .and_then(|s| s.parse().ok())
-                .unwrap_or(600), // 10 min
+                .unwrap_or(DEFAULT_JOB_TTL_SECS), // 24h for an unfetched reply
+            retrieval_grace_secs: std::env::var("JESSE_RETRIEVAL_GRACE_SECS")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(DEFAULT_RETRIEVAL_GRACE_SECS),
+            state_dir: std::env::var("JESSE_STATE_DIR")
+                .ok()
+                .filter(|s| !s.trim().is_empty())
+                .or_else(|| {
+                    // Default: a dotdir under HOME. Empty HOME → no default
+                    // (persistence off) rather than writing to a bare "/.jesse-bridge".
+                    (!home.is_empty()).then(|| format!("{home}/.jesse-bridge"))
+                }),
             max_attachments: std::env::var("JESSE_MAX_ATTACHMENTS")
                 .ok()
                 .and_then(|s| s.parse().ok())
@@ -347,10 +394,22 @@ impl RateLimiter {
 //
 // The phone may suspend (socket drops) mid-turn. The turn runs on its own
 // detached task and lands its result here, keyed by an opaque job id, so a
-// later GET /jesse/result/{job_id} can fetch it. Entries are evicted on a TTL
-// after completion so the map can't grow unbounded. In-memory only — a bridge
-// restart drops in-flight jobs (acceptable for a single-user bridge; the
-// escalation path, if durability is ever needed, is a disk/queue-backed store).
+// later GET /jesse/result/{job_id} can fetch it.
+//
+// Eviction model (so a reply that finishes while the phone is away isn't lost):
+//   * A completed-but-NEVER-fetched reply is held for the full `ttl` (24h by
+//     default) — the clock starts at completion only because it's never been
+//     retrieved.
+//   * Once a reply has been fetched at least once, the clock restarts and it's
+//     kept only `retrieval_grace` longer (a short window so an immediate re-poll
+//     still works), then evicted.
+//   * Running jobs are never evicted.
+//
+// Completed results are also PERSISTED to disk (one JSON file per job under
+// `<state_dir>/jobs`) and reloaded on startup, so a bridge restart / laptop
+// reboot doesn't lose a finished reply. Only the finished result + metadata is
+// written — never the bearer token or any secret. Persistence is disabled when
+// `jobs_dir` is None (in-memory only).
 
 #[derive(Clone)]
 enum JobState {
@@ -366,13 +425,22 @@ enum JobState {
 
 struct Job {
     state: JobState,
-    // Set when the job reaches a terminal state; drives TTL eviction.
-    completed_at: Option<Instant>,
+    // Set (wall-clock) when the job reaches a terminal state. SystemTime, not
+    // Instant, so it can be persisted and compared after a restart.
+    completed_at: Option<SystemTime>,
+    // Set (wall-clock) at the FIRST successful retrieval of a terminal result.
+    // Once set, eviction switches from the full TTL to the short post-fetch grace.
+    first_retrieved_at: Option<SystemTime>,
 }
 
 struct JobStore {
     jobs: Mutex<HashMap<String, Job>>,
+    // How long an unfetched completed job is held.
     ttl: Duration,
+    // How long a completed job is kept after its first retrieval.
+    retrieval_grace: Duration,
+    // Where completed results are persisted; None disables persistence.
+    jobs_dir: Option<PathBuf>,
 }
 
 // Monotonic counter guarantees per-process uniqueness; the random high half
@@ -386,15 +454,200 @@ fn new_job_id() -> String {
     format!("{r:016x}{n:016x}")
 }
 
+/// Whether a terminal job should be evicted, given how long ago it completed and
+/// (if ever) was first retrieved. Pure so it can be tested against a fixed clock
+/// rather than the wall clock: never-fetched → evict once `ttl` has passed since
+/// completion; fetched → evict once `retrieval_grace` has passed since that fetch.
+fn job_is_evictable(
+    age_since_complete: Duration,
+    age_since_first_retrieval: Option<Duration>,
+    ttl: Duration,
+    retrieval_grace: Duration,
+) -> bool {
+    match age_since_first_retrieval {
+        Some(since_fetch) => since_fetch >= retrieval_grace,
+        None => age_since_complete >= ttl,
+    }
+}
+
+fn system_time_to_ms(t: SystemTime) -> u64 {
+    t.duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+fn ms_to_system_time(ms: u64) -> SystemTime {
+    UNIX_EPOCH + Duration::from_millis(ms)
+}
+
+/// The on-disk JSON for a completed job, or `None` for a still-running one (which
+/// is never persisted — there's no result yet). Carries only the finished result
+/// and timing metadata; never any secret.
+fn job_to_value(id: &str, job: &Job) -> Option<Value> {
+    let completed_at = job.completed_at?;
+    let (status, response, session_id, error) = match &job.state {
+        JobState::Done {
+            response,
+            session_id,
+        } => ("done", Some(response.clone()), session_id.clone(), None),
+        JobState::Failed { error } => ("failed", None, None, Some(error.clone())),
+        JobState::Running => return None,
+    };
+    Some(json!({
+        "v": 1,
+        "job_id": id,
+        "status": status,
+        "response": response,
+        "session_id": session_id,
+        "error": error,
+        "completed_at_ms": system_time_to_ms(completed_at),
+        "first_retrieved_at_ms": job.first_retrieved_at.map(system_time_to_ms),
+    }))
+}
+
+/// Parse a persisted job file back into `(id, Job)`. Returns `None` for anything
+/// malformed or not a recognized terminal status (the caller deletes such files).
+fn value_to_job(v: &Value) -> Option<(String, Job)> {
+    let id = v.get("job_id")?.as_str()?.to_string();
+    let state = match v.get("status")?.as_str()? {
+        "done" => JobState::Done {
+            response: v
+                .get("response")
+                .and_then(|r| r.as_str())
+                .unwrap_or("")
+                .to_string(),
+            session_id: v
+                .get("session_id")
+                .and_then(|s| s.as_str())
+                .map(|s| s.to_string()),
+        },
+        "failed" => JobState::Failed {
+            error: v
+                .get("error")
+                .and_then(|e| e.as_str())
+                .unwrap_or("Jesse couldn't complete that.")
+                .to_string(),
+        },
+        _ => return None,
+    };
+    let completed_at = Some(
+        v.get("completed_at_ms")
+            .and_then(|m| m.as_u64())
+            .map(ms_to_system_time)
+            .unwrap_or_else(SystemTime::now),
+    );
+    let first_retrieved_at = v
+        .get("first_retrieved_at_ms")
+        .and_then(|m| m.as_u64())
+        .map(ms_to_system_time);
+    Some((
+        id,
+        Job {
+            state,
+            completed_at,
+            first_retrieved_at,
+        },
+    ))
+}
+
+/// Write (or overwrite) a job's result file atomically (temp + rename), 0600.
+/// Best-effort: a persistence failure is logged, never fatal — the in-memory
+/// store still serves the result for this process's lifetime.
+fn persist_job(dir: &Path, id: &str, job: &Job) {
+    let Some(value) = job_to_value(id, job) else {
+        return;
+    };
+    let final_path = dir.join(format!("{id}.json"));
+    let tmp_path = dir.join(format!("{id}.json.tmp"));
+    let write = || -> std::io::Result<()> {
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&tmp_path)?;
+        f.write_all(value.to_string().as_bytes())?;
+        f.sync_all()?;
+        std::fs::rename(&tmp_path, &final_path)
+    };
+    if let Err(e) = write() {
+        eprintln!("warning: could not persist job {id}: {e}");
+        let _ = std::fs::remove_file(&tmp_path);
+    }
+}
+
+fn remove_job_file(dir: &Path, id: &str) {
+    let _ = std::fs::remove_file(dir.join(format!("{id}.json")));
+}
+
+/// Load persisted jobs from `dir`, dropping (and deleting) any that are already
+/// past eviction or unparseable. Returns the survivors to seed the in-memory map.
+fn load_persisted_jobs(dir: &Path, ttl: Duration, retrieval_grace: Duration) -> Vec<(String, Job)> {
+    let mut out = Vec::new();
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return out;
+    };
+    let now = SystemTime::now();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("json") {
+            continue;
+        }
+        let parsed = std::fs::read_to_string(&path)
+            .ok()
+            .and_then(|t| serde_json::from_str::<Value>(&t).ok())
+            .and_then(|v| value_to_job(&v));
+        let Some((id, job)) = parsed else {
+            let _ = std::fs::remove_file(&path);
+            continue;
+        };
+        let age_complete = job
+            .completed_at
+            .map(|t| now.duration_since(t).unwrap_or_default())
+            .unwrap_or_default();
+        let age_retrieved = job
+            .first_retrieved_at
+            .map(|t| now.duration_since(t).unwrap_or_default());
+        if job_is_evictable(age_complete, age_retrieved, ttl, retrieval_grace) {
+            let _ = std::fs::remove_file(&path);
+            continue;
+        }
+        out.push((id, job));
+    }
+    out
+}
+
 impl JobStore {
-    fn new(ttl: Duration) -> Self {
+    /// Build the store, creating the persistence dir (0700) and loading any jobs
+    /// left from a previous run when `jobs_dir` is set.
+    fn new(ttl: Duration, retrieval_grace: Duration, jobs_dir: Option<PathBuf>) -> Self {
+        let mut jobs = HashMap::new();
+        if let Some(dir) = &jobs_dir {
+            if let Err(e) = std::fs::DirBuilder::new()
+                .recursive(true)
+                .mode(0o700)
+                .create(dir)
+            {
+                eprintln!(
+                    "warning: could not create job state dir {}: {e} — persistence disabled this run",
+                    dir.display()
+                );
+            } else {
+                for (id, job) in load_persisted_jobs(dir, ttl, retrieval_grace) {
+                    jobs.insert(id, job);
+                }
+            }
+        }
         JobStore {
-            jobs: Mutex::new(HashMap::new()),
+            jobs: Mutex::new(jobs),
             ttl,
+            retrieval_grace,
+            jobs_dir,
         }
     }
 
-    /// Register a new running job and return its opaque id.
+    /// Register a new running job and return its opaque id. Running jobs are not
+    /// persisted (no result yet).
     fn create(&self) -> String {
         let id = new_job_id();
         self.jobs.lock().unwrap().insert(
@@ -402,12 +655,14 @@ impl JobStore {
             Job {
                 state: JobState::Running,
                 completed_at: None,
+                first_retrieved_at: None,
             },
         );
         id
     }
 
-    /// Land a turn's outcome onto its job. A Fatal/io error becomes Failed.
+    /// Land a turn's outcome onto its job and persist the result. A Fatal/io
+    /// error becomes Failed (still retrievable, so the phone sees the cause).
     fn complete(&self, id: &str, outcome: Result<(String, Option<String>), ApiError>) {
         let state = match outcome {
             Ok((response, session_id)) => JobState::Done {
@@ -416,9 +671,13 @@ impl JobStore {
             },
             Err((_code, error)) => JobState::Failed { error },
         };
-        if let Some(job) = self.jobs.lock().unwrap().get_mut(id) {
+        let mut guard = self.jobs.lock().unwrap();
+        if let Some(job) = guard.get_mut(id) {
             job.state = state;
-            job.completed_at = Some(Instant::now());
+            job.completed_at = Some(SystemTime::now());
+            if let Some(dir) = &self.jobs_dir {
+                persist_job(dir, id, job);
+            }
         }
     }
 
@@ -426,12 +685,46 @@ impl JobStore {
         self.jobs.lock().unwrap().get(id).map(|j| j.state.clone())
     }
 
-    /// Drop completed/failed jobs older than the TTL. Running jobs are kept.
+    /// Fetch a job's state and, if this is the first retrieval of a terminal
+    /// result, stamp `first_retrieved_at` (starting the short post-fetch grace)
+    /// and persist that so the grace survives a restart. Running fetches don't
+    /// start the clock. This is what `GET /jesse/result` uses.
+    fn get_retrieving(&self, id: &str) -> Option<JobState> {
+        let mut guard = self.jobs.lock().unwrap();
+        let job = guard.get_mut(id)?;
+        let state = job.state.clone();
+        let is_terminal = !matches!(job.state, JobState::Running);
+        if is_terminal && job.first_retrieved_at.is_none() {
+            job.first_retrieved_at = Some(SystemTime::now());
+            if let Some(dir) = &self.jobs_dir {
+                persist_job(dir, id, job);
+            }
+        }
+        Some(state)
+    }
+
+    /// Drop (and delete the files of) completed jobs past their eviction point.
+    /// Running jobs are kept. See `job_is_evictable` for the predicate.
     fn evict_expired(&self) {
+        let now = SystemTime::now();
         let ttl = self.ttl;
-        self.jobs.lock().unwrap().retain(|_, j| match j.completed_at {
-            Some(t) => t.elapsed() < ttl,
-            None => true,
+        let retrieval_grace = self.retrieval_grace;
+        let dir = self.jobs_dir.clone();
+        self.jobs.lock().unwrap().retain(|id, j| {
+            let Some(completed) = j.completed_at else {
+                return true; // running — never evict
+            };
+            let age_complete = now.duration_since(completed).unwrap_or_default();
+            let age_retrieved = j
+                .first_retrieved_at
+                .map(|t| now.duration_since(t).unwrap_or_default());
+            let evict = job_is_evictable(age_complete, age_retrieved, ttl, retrieval_grace);
+            if evict {
+                if let Some(d) = &dir {
+                    remove_job_file(d, id);
+                }
+            }
+            !evict
         });
     }
 }
@@ -454,11 +747,13 @@ impl AppState {
     /// wiring.
     fn new(cfg: Config) -> Self {
         let job_ttl = Duration::from_secs(cfg.job_ttl_secs);
+        let retrieval_grace = Duration::from_secs(cfg.retrieval_grace_secs);
+        let jobs_dir = cfg.jobs_dir();
         let sem = Arc::new(Semaphore::new(cfg.max_concurrency.max(1)));
         let limiter = Arc::new(RateLimiter::new(cfg.rate_per_min));
         AppState {
             cfg: Arc::new(cfg),
-            jobs: Arc::new(JobStore::new(job_ttl)),
+            jobs: Arc::new(JobStore::new(job_ttl, retrieval_grace, jobs_dir)),
             sem,
             limiter,
         }
@@ -756,7 +1051,10 @@ async fn run_claude(
                 Err(_) => {
                     return Err((
                         StatusCode::GATEWAY_TIMEOUT,
-                        format!("Jesse timed out after {}s", cfg.timeout_secs),
+                        format!(
+                            "Jesse hit the {}s run limit. Raise JESSE_TIMEOUT to allow longer turns.",
+                            cfg.timeout_secs
+                        ),
                     ))
                 }
             }
@@ -1246,7 +1544,9 @@ async fn jesse_result(
 ) -> Result<Json<Value>, ApiError> {
     check_auth(&headers, &st.cfg.token)?;
     st.jobs.evict_expired();
-    match st.jobs.get(&job_id) {
+    // get_retrieving (not get) so a terminal result's first fetch starts the
+    // short post-fetch grace; until then it's held the full TTL.
+    match st.jobs.get_retrieving(&job_id) {
         Some(JobState::Running) => Ok(Json(json!({ "status": "running" }))),
         Some(JobState::Done {
             response,
@@ -1732,6 +2032,9 @@ mod tests {
             "JESSE_PORT",
             "JESSE_CLAUDE_BIN",
             "JESSE_TIMEOUT",
+            "JESSE_JOB_TTL_SECS",
+            "JESSE_RETRIEVAL_GRACE_SECS",
+            "JESSE_STATE_DIR",
             "JESSE_MAX_ATTACHMENTS",
             "JESSE_MAX_ATTACHMENT_BYTES",
             "JESSE_MAX_ATTACHMENTS_TOTAL_BYTES",
@@ -1749,7 +2052,22 @@ mod tests {
         assert_eq!(cfg.bind, "127.0.0.1");
         assert_eq!(cfg.port, 8765);
         assert_eq!(cfg.claude_bin, "claude");
-        assert_eq!(cfg.timeout_secs, 1800);
+        assert_eq!(cfg.timeout_secs, 3600);
+        // Eviction defaults: 24h hold for an unfetched reply, short post-fetch grace.
+        assert_eq!(cfg.job_ttl_secs, DEFAULT_JOB_TTL_SECS);
+        assert_eq!(cfg.retrieval_grace_secs, DEFAULT_RETRIEVAL_GRACE_SECS);
+        // No JESSE_STATE_DIR → persistence defaults to a dotdir under HOME (when
+        // HOME is set), with job files under `<state_dir>/jobs`.
+        match std::env::var("HOME").ok().filter(|h| !h.is_empty()) {
+            Some(home) => {
+                assert_eq!(cfg.state_dir.as_deref(), Some(format!("{home}/.jesse-bridge").as_str()));
+                assert_eq!(cfg.jobs_dir(), Some(PathBuf::from(format!("{home}/.jesse-bridge/jobs"))));
+            }
+            None => {
+                assert_eq!(cfg.state_dir, None);
+                assert_eq!(cfg.jobs_dir(), None);
+            }
+        }
         assert_eq!(cfg.max_attachments, DEFAULT_MAX_ATTACHMENTS);
         assert_eq!(cfg.max_attachment_bytes, DEFAULT_MAX_ATTACHMENT_BYTES);
         assert_eq!(
@@ -1785,6 +2103,10 @@ mod tests {
             rate_per_min: 30,
             grace_secs: 10,
             job_ttl_secs: 600,
+            retrieval_grace_secs: 600,
+            // No on-disk persistence in tests by default — keeps cargo test off
+            // the real $HOME. The persistence tests build a store with a temp dir.
+            state_dir: None,
             max_attachments: DEFAULT_MAX_ATTACHMENTS,
             max_attachment_bytes: DEFAULT_MAX_ATTACHMENT_BYTES,
             max_attachments_total_bytes: DEFAULT_MAX_ATTACHMENTS_TOTAL_BYTES,
@@ -1907,7 +2229,7 @@ mod tests {
 
     #[test]
     fn job_ids_are_unique() {
-        let store = JobStore::new(Duration::from_secs(600));
+        let store = JobStore::new(Duration::from_secs(600), Duration::from_secs(600), None);
         let a = store.create();
         let b = store.create();
         assert_ne!(a, b);
@@ -1920,7 +2242,7 @@ mod tests {
 
     #[test]
     fn job_complete_records_done_and_failed() {
-        let store = JobStore::new(Duration::from_secs(600));
+        let store = JobStore::new(Duration::from_secs(600), Duration::from_secs(600), None);
         let ok = store.create();
         store.complete(&ok, Ok(("hi".to_string(), Some("sess-1".to_string()))));
         match store.get(&ok) {
@@ -1946,8 +2268,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn job_ttl_evicts_completed_only() {
-        let store = JobStore::new(Duration::from_millis(50));
+    async fn job_ttl_evicts_unfetched_after_ttl_keeps_running() {
+        // ttl 50ms, retrieval grace long: an unfetched completed job ages out on
+        // the ttl; a running job never evicts; a freshly completed one survives.
+        let store = JobStore::new(Duration::from_millis(50), Duration::from_secs(600), None);
         let old = store.create();
         store.complete(&old, Ok(("done".to_string(), None)));
         let running = store.create(); // never completes — must survive eviction
@@ -1957,7 +2281,10 @@ mod tests {
         store.complete(&fresh, Ok(("fresh".to_string(), None)));
 
         store.evict_expired();
-        assert!(store.get(&old).is_none(), "stale completed job should evict");
+        assert!(
+            store.get(&old).is_none(),
+            "stale unfetched completed job should evict on the ttl"
+        );
         assert!(
             matches!(store.get(&running), Some(JobState::Running)),
             "running job must never evict"
@@ -1966,6 +2293,198 @@ mod tests {
             matches!(store.get(&fresh), Some(JobState::Done { .. })),
             "recently completed job must survive"
         );
+    }
+
+    // ---- eviction model: predicate against a fixed clock ------------------
+
+    #[test]
+    fn job_is_evictable_holds_unfetched_for_ttl_then_evicts() {
+        let ttl = Duration::from_secs(86_400); // 24h
+        let grace = Duration::from_secs(600);
+        // Never fetched: held the FULL ttl. Well past the old 600s window it's
+        // still alive — the regression this whole change exists to fix.
+        assert!(!job_is_evictable(Duration::from_secs(700), None, ttl, grace));
+        assert!(!job_is_evictable(Duration::from_secs(86_399), None, ttl, grace));
+        // At/after the ttl it finally evicts.
+        assert!(job_is_evictable(Duration::from_secs(86_400), None, ttl, grace));
+        assert!(job_is_evictable(Duration::from_secs(90_000), None, ttl, grace));
+    }
+
+    #[test]
+    fn job_is_evictable_uses_grace_after_first_fetch() {
+        let ttl = Duration::from_secs(86_400);
+        let grace = Duration::from_secs(600);
+        // Once fetched, the clock is the SHORT grace since that fetch — even if
+        // it completed a long time ago, a recent fetch keeps it for a re-poll.
+        assert!(!job_is_evictable(
+            Duration::from_secs(90_000),
+            Some(Duration::from_secs(60)),
+            ttl,
+            grace
+        ));
+        assert!(!job_is_evictable(
+            Duration::from_secs(90_000),
+            Some(Duration::from_secs(599)),
+            ttl,
+            grace
+        ));
+        // Past the grace since the fetch → evict, regardless of completion age.
+        assert!(job_is_evictable(
+            Duration::from_secs(90_000),
+            Some(Duration::from_secs(600)),
+            ttl,
+            grace
+        ));
+    }
+
+    #[tokio::test]
+    async fn fetched_job_evicts_after_retrieval_grace_unfetched_survives() {
+        // Long ttl, tiny grace: a fetched job ages out on the grace; an unfetched
+        // sibling survives because its (24h-ish) ttl clock hasn't elapsed.
+        let store = JobStore::new(Duration::from_secs(86_400), Duration::from_millis(40), None);
+        let fetched = store.create();
+        store.complete(&fetched, Ok(("fetched".to_string(), None)));
+        let unfetched = store.create();
+        store.complete(&unfetched, Ok(("unfetched".to_string(), None)));
+
+        // First retrieval starts the grace clock for `fetched` only.
+        assert!(matches!(
+            store.get_retrieving(&fetched),
+            Some(JobState::Done { .. })
+        ));
+        // A re-poll within the grace still works.
+        assert!(matches!(
+            store.get_retrieving(&fetched),
+            Some(JobState::Done { .. })
+        ));
+
+        tokio::time::sleep(Duration::from_millis(70)).await;
+        store.evict_expired();
+        assert!(
+            store.get(&fetched).is_none(),
+            "fetched job evicts once the post-fetch grace passes"
+        );
+        assert!(
+            matches!(store.get(&unfetched), Some(JobState::Done { .. })),
+            "an unfetched job must NOT evict on the short grace — it gets the full ttl"
+        );
+    }
+
+    // ---- disk persistence across a simulated restart ----------------------
+
+    fn temp_jobs_dir() -> PathBuf {
+        std::env::temp_dir().join(format!("jesse-jobs-{}", random_hex()))
+    }
+
+    #[test]
+    fn persisted_job_survives_simulated_restart() {
+        let dir = temp_jobs_dir();
+        let ttl = Duration::from_secs(86_400);
+        let grace = Duration::from_secs(600);
+        {
+            let store = JobStore::new(ttl, grace, Some(dir.clone()));
+            let id = store.create();
+            store.complete(&id, Ok(("persisted reply".to_string(), Some("sess-9".to_string()))));
+
+            // A new store over the SAME dir is the restart: it must reload the job.
+            let restarted = JobStore::new(ttl, grace, Some(dir.clone()));
+            match restarted.get(&id) {
+                Some(JobState::Done {
+                    response,
+                    session_id,
+                }) => {
+                    assert_eq!(response, "persisted reply");
+                    assert_eq!(session_id.as_deref(), Some("sess-9"));
+                }
+                other => panic!("reloaded job should be Done, got {:?}", other.map(|_| ())),
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn persisted_failed_job_survives_restart() {
+        let dir = temp_jobs_dir();
+        let ttl = Duration::from_secs(86_400);
+        let grace = Duration::from_secs(600);
+        let id = {
+            let store = JobStore::new(ttl, grace, Some(dir.clone()));
+            let id = store.create();
+            store.complete(&id, Err((StatusCode::GATEWAY_TIMEOUT, "run limit".to_string())));
+            id
+        };
+        let restarted = JobStore::new(ttl, grace, Some(dir.clone()));
+        match restarted.get(&id) {
+            Some(JobState::Failed { error }) => assert!(error.contains("run limit")),
+            other => panic!("reloaded job should be Failed, got {:?}", other.map(|_| ())),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn persisted_job_already_past_ttl_is_not_reloaded() {
+        // A tiny ttl + no grace: by the time the "restart" store loads, the
+        // unfetched job is already past its ttl, so it's dropped (and its file
+        // deleted) on load rather than resurrected.
+        let dir = temp_jobs_dir();
+        let ttl = Duration::from_millis(1);
+        let grace = Duration::from_millis(1);
+        let id = {
+            let store = JobStore::new(ttl, grace, Some(dir.clone()));
+            let id = store.create();
+            store.complete(&id, Ok(("stale".to_string(), None)));
+            id
+        };
+        std::thread::sleep(Duration::from_millis(10));
+        let restarted = JobStore::new(ttl, grace, Some(dir.clone()));
+        assert!(
+            restarted.get(&id).is_none(),
+            "a job already past ttl must not reload after restart"
+        );
+        assert!(
+            !dir.join(format!("{id}.json")).exists(),
+            "an expired job's file should be deleted on load"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn result_endpoint_returns_persisted_job_after_restart() {
+        // End to end: complete a job under one AppState, then build a fresh
+        // AppState over the same state dir (the restart) and GET its result.
+        let state_parent = std::env::temp_dir().join(format!("jesse-state-{}", random_hex()));
+        let cfg1 = Config {
+            state_dir: Some(state_parent.to_string_lossy().into_owned()),
+            ..test_config()
+        };
+        let st1 = AppState::new(cfg1);
+        let id = st1.jobs.create();
+        st1.jobs
+            .complete(&id, Ok(("survives reboot".to_string(), Some("sess-r".to_string()))));
+
+        // New AppState over the same dir = the bridge restarting.
+        let cfg2 = Config {
+            state_dir: Some(state_parent.to_string_lossy().into_owned()),
+            ..test_config()
+        };
+        let st2 = AppState::new(cfg2);
+        let resp = app(st2)
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/jesse/result/{id}"))
+                    .header("authorization", "Bearer test-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body: Value = serde_json::from_str(&body_string(resp).await).unwrap();
+        assert_eq!(body["status"], "done");
+        assert_eq!(body["response"], "survives reboot");
+        assert_eq!(body["session_id"], "sess-r");
+
+        let _ = std::fs::remove_dir_all(&state_parent);
     }
 
     // ---- GET /jesse/result auth + 404 -------------------------------------

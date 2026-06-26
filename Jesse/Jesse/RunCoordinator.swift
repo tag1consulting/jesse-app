@@ -77,9 +77,22 @@ final class RunCoordinator {
 
     // MARK: - Query (read by views)
 
-    /// A run is in flight if a task owns it OR a job is persisted for re-attach.
+    /// A run is *actively* in flight (spinner, Cancel, send disabled): either a
+    /// turn is executing/polling (`startDates`) or a persisted job is waiting to
+    /// be re-attached on foreground (`inFlight`) — but NOT once a recoverable
+    /// error has surfaced. A retained-but-errored job reads as idle-with-Re-check
+    /// (`canRecheck`), not as running. All three reads are observed properties so
+    /// the views update; `tasks` is intentionally not consulted (not observed).
     func isRunning(_ threadID: UUID) -> Bool {
-        tasks[threadID] != nil || inFlight[threadID] != nil
+        (startDates[threadID] != nil || inFlight[threadID] != nil) && errors[threadID] == nil
+    }
+
+    /// True when a turn failed recoverably but its bridge job_id is still retained
+    /// (and persisted) — so the reply may yet be retrievable. Drives the visible
+    /// "Re-check" affordance. A genuinely-gone (past-TTL) turn clears the job, so
+    /// this goes false and only the terminal error remains.
+    func canRecheck(_ threadID: UUID) -> Bool {
+        inFlight[threadID] != nil && errors[threadID] != nil
     }
 
     func startDate(for threadID: UUID) -> Date? { startDates[threadID] }
@@ -96,6 +109,13 @@ final class RunCoordinator {
         guard !trimmed.isEmpty, !isRunning(thread.id) else { return }
         let threadID = thread.id
         errors[threadID] = nil
+        // A new turn supersedes any retained-but-unretrieved job from a prior
+        // recoverable failure on this thread — the user has moved on, so don't
+        // leave a stale job that Re-check or resume could re-attach to.
+        if inFlight[threadID] != nil {
+            inFlight[threadID] = nil
+            InFlightStore.save(inFlight)
+        }
 
         // A new thread isn't in the store until its first send — insert it now so
         // its turns persist and it shows in the list.
@@ -183,27 +203,48 @@ final class RunCoordinator {
     // MARK: - Resume (foreground re-attach)
 
     /// Called when the app returns to the foreground. For every persisted job
-    /// with no live task, start polling its result and reconcile.
+    /// with no live task, start polling its result and reconcile. A retained job
+    /// from a recoverable failure is re-attached too — clearing its stale error
+    /// as the poll restarts — so foregrounding auto-recovers what Re-check does
+    /// by hand.
     func resume(context: ModelContext) {
         for (threadID, job) in inFlight where tasks[threadID] == nil {
-            if startDates[threadID] == nil { startDates[threadID] = Date() }
-            let cfg = configProvider()
-            tasks[threadID] = Task { [weak self] in
-                guard let self else { return }
-                let client = self.makeClient(cfg)
-                await self.poll(threadID: threadID, jobId: job.jobId, voice: job.voice,
-                                client: client, context: context)
-                self.tasks[threadID] = nil
-                self.endBackground(threadID)
-            }
+            reattach(threadID: threadID, job: job, context: context)
+        }
+    }
+
+    /// Manual "Re-check" for one thread: re-attach to its retained job and fetch
+    /// the result now. Ready → delivered into the thread; still running → resumes
+    /// the 2s poll; gone past the bridge TTL → terminal "expired". A no-op if the
+    /// thread is already polling or has no retained job.
+    func recheck(_ threadID: UUID, context: ModelContext) {
+        guard tasks[threadID] == nil, let job = inFlight[threadID] else { return }
+        reattach(threadID: threadID, job: job, context: context)
+    }
+
+    /// Shared re-attach used by both `resume` (auto, on foreground) and `recheck`
+    /// (manual): clear any stale error, mark the thread running, and poll the job.
+    private func reattach(threadID: UUID, job: InFlightJob, context: ModelContext) {
+        errors[threadID] = nil
+        if startDates[threadID] == nil { startDates[threadID] = Date() }
+        let cfg = configProvider()
+        tasks[threadID] = Task { [weak self] in
+            guard let self else { return }
+            let client = self.makeClient(cfg)
+            await self.poll(threadID: threadID, jobId: job.jobId, voice: job.voice,
+                            client: client, context: context)
+            self.tasks[threadID] = nil
+            self.endBackground(threadID)
         }
     }
 
     // MARK: - Internals
 
-    /// Poll `GET /jesse/result/{jobId}` until the turn resolves. A dropped socket
-    /// (`.connectionLost`) leaves the job persisted and stops quietly — the next
-    /// `resume` picks it back up.
+    /// Poll `GET /jesse/result/{jobId}` until the turn resolves. The job_id is
+    /// always retained on a non-terminal failure here (dropped socket, timeout,
+    /// transport error, or a bridge-reported `.failed`) so Re-check — and the
+    /// next `resume` — can pick the reply back up; the run only truly ends, and
+    /// the job is dropped, on `.done` (success) or `.expired` (gone past TTL).
     private func poll(threadID: UUID, jobId: String, voice: Bool,
                       client: any JesseClientProtocol, context: ModelContext) async {
         while !Task.isCancelled {
@@ -213,14 +254,15 @@ final class RunCoordinator {
             } catch let error as JesseError {
                 // A user-initiated cancel surfaces here as a cancelled URL load
                 // (mapped to `.transport`). Treat any cancellation as a clean
-                // stop — the run was already cleared by `cancel`, so don't `fail`.
+                // stop — the run was already cleared by `cancel`, so don't fail.
                 if Task.isCancelled { return }
-                if case .connectionLost = error { return } // keep job; retry on resume
-                fail(threadID: threadID, message: error.localizedDescription, voice: voice)
+                // Every client error in the poll path is recoverable: the job is
+                // retained and the reply stays retrievable. Show it with Re-check.
+                failRecoverable(threadID: threadID, message: error.localizedDescription, voice: voice)
                 return
             } catch {
                 if Task.isCancelled { return }
-                fail(threadID: threadID, message: error.localizedDescription, voice: voice)
+                failRecoverable(threadID: threadID, message: error.localizedDescription, voice: voice)
                 return
             }
             // A `.done` can land in the same instant the user cancels; bail before
@@ -233,7 +275,18 @@ final class RunCoordinator {
                 finish(threadID: threadID, reply: reply, voice: voice, context: context)
                 return
             case .failed(let message):
-                fail(threadID: threadID, message: message, voice: voice)
+                // The bridge ran the turn and reported a failure (e.g. the 504
+                // run-limit). Keep the job retained so Re-check is offered — the
+                // failure could have been transient.
+                failRecoverable(threadID: threadID, message: message, voice: voice)
+                return
+            case .expired:
+                // The bridge no longer has the reply (held its full TTL, now
+                // evicted). This is the only genuinely terminal "gone" state:
+                // drop the job and say so plainly.
+                fail(threadID: threadID,
+                     message: "This reply has expired — it was held but not picked up in time, and Jesse no longer has it.",
+                     voice: voice)
                 return
             }
         }
@@ -251,10 +304,24 @@ final class RunCoordinator {
         clearRun(threadID)
     }
 
+    /// A terminal failure: surface the message and drop everything, including the
+    /// retained job (nothing left to re-check). Used for a genuinely-gone reply
+    /// (`.expired`) and for send-path errors that never got a job_id.
     private func fail(threadID: UUID, message: String, voice: Bool) {
         errors[threadID] = message
         if voice { Speaker.shared.speak("Sorry, that didn't work. " + message) }
         clearRun(threadID)
+    }
+
+    /// A recoverable failure: surface the message but KEEP the retained (and
+    /// already-persisted) job_id so Re-check — and the next foreground `resume` —
+    /// can still fetch the reply. Stops the active run (clears `startDates`) so
+    /// the thread reads as idle-with-Re-check rather than still "Thinking…".
+    /// `inFlight` is deliberately left intact and is not re-saved (it's unchanged).
+    private func failRecoverable(threadID: UUID, message: String, voice: Bool) {
+        errors[threadID] = message
+        startDates[threadID] = nil
+        if voice { Speaker.shared.speak("Sorry, that didn't work yet. " + message) }
     }
 
     /// A `.connectionLost` with a job in flight is recoverable — keep the job and

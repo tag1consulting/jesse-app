@@ -97,12 +97,33 @@ curl -s http://127.0.0.1:8765/jesse/result/<job_id> \
 #   { "status": "failed", "error": "..." }
 ```
 
-Same bearer auth as `/jesse`. An unknown or evicted id → **`404`**. Completed and
-failed jobs are evicted on a TTL (`JESSE_JOB_TTL_SECS`, default `600s`) so the
-in-memory store can't grow unbounded. The store is in-memory only: a bridge
-restart drops in-flight jobs. That's acceptable for a single-user bridge; the
-escalation path, if cross-restart durability is ever needed, is a disk- or
-queue-backed store.
+Same bearer auth as `/jesse`. An unknown or evicted id → **`404`**.
+
+### Eviction model — a finished reply isn't lost while the phone is away
+
+The clock for a completed job starts at its **first successful retrieval**, not at
+completion:
+
+- A finished reply that has **never been fetched** is held for the full
+  **`JESSE_JOB_TTL_SECS`** (default **`86400`** = 24h). So a turn that completes
+  while the phone is suspended or off the tailnet is still there when it re-checks.
+- Once a reply has been **fetched at least once**, it's kept only
+  **`JESSE_RETRIEVAL_GRACE_SECS`** longer (default **`600s`**) — a short window so
+  an immediate re-poll still succeeds — then evicted. A fetched reply shouldn't
+  linger for a day.
+- **Running** jobs are never evicted.
+
+### Persistence across a restart
+
+Completed results are also **persisted to disk** — one JSON file per job under
+**`<JESSE_STATE_DIR>/jobs`** (default `~/.jesse-bridge/jobs`) — and reloaded on
+startup, so a bridge restart or laptop reboot while you're away does **not** lose a
+finished-but-unretrieved reply. The same TTL/eviction applies to reloaded jobs
+(anything already past its window is dropped, and its file deleted, on load).
+
+Only the finished result and its timing metadata are written — **never** the bearer
+token or any secret. Running jobs aren't persisted (there's no result yet). Set
+`JESSE_STATE_DIR=` (empty) to disable persistence and run in-memory only.
 
 ## Voice requests
 
@@ -191,9 +212,11 @@ one reweakens it by accident.
 | `JESSE_RATE_PER_MIN` | `30` | Accepted requests per rolling minute; bursts beyond it return `429` |
 | `JESSE_ADVERTISE_HOST` | value of `JESSE_BIND` | Host written into the pairing QR — set to the MagicDNS `ts.net` name to advertise that instead of the bound IP |
 | `JESSE_PORT` | `8765` | Port |
-| `JESSE_TIMEOUT` | `1800` | Hard ceiling per request (seconds), clamped to `1..=3600`. `0` is treated as the 3600s ceiling, not unlimited |
+| `JESSE_TIMEOUT` | `3600` | Per-request run limit (seconds), clamped to `1..=7200`. `0` is treated as the 7200s ceiling, not unlimited. On overrun the turn returns `504` with an actionable message naming this var |
 | `JESSE_GRACE_SECS` | `10` | How long `POST /jesse` holds the connection for the inline fast path before returning `202` and letting the client poll `GET /jesse/result/{job_id}` |
-| `JESSE_JOB_TTL_SECS` | `600` | How long a completed/failed job stays retrievable before TTL eviction |
+| `JESSE_JOB_TTL_SECS` | `86400` | How long a finished-but-**unfetched** reply stays retrievable (24h). The clock starts at first retrieval, not at completion |
+| `JESSE_RETRIEVAL_GRACE_SECS` | `600` | How much longer a reply is kept **after** its first retrieval (a short re-poll window) instead of the full TTL |
+| `JESSE_STATE_DIR` | `~/.jesse-bridge` | Where completed results are persisted (`<dir>/jobs`) so a restart doesn't lose a reply. Empty disables persistence |
 | `JESSE_CLAUDE_BIN` | `claude` | Path to the `claude` binary |
 
 The server refuses to start if `JESSE_TOKEN` is unset, the vault isn't a

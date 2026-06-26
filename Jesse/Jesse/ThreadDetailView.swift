@@ -66,10 +66,23 @@ struct ThreadDetailView: View {
                             .id(turn.id)
                     }
                     if let error = coordinator.error(for: thread.id) {
-                        Text(error)
-                            .font(.callout)
-                            .foregroundStyle(.red)
-                            .frame(maxWidth: .infinity, alignment: .leading)
+                        let recheckable = coordinator.canRecheck(thread.id)
+                        VStack(alignment: .leading, spacing: 8) {
+                            Text(error)
+                                // Recoverable (still retrievable) reads as a soft
+                                // warning; a genuinely-gone reply reads as an error.
+                                .font(.callout)
+                                .foregroundStyle(recheckable ? .orange : .red)
+                            if recheckable {
+                                Button {
+                                    coordinator.recheck(thread.id, context: context)
+                                } label: {
+                                    Label("Re-check", systemImage: "arrow.clockwise")
+                                }
+                                .buttonStyle(.bordered)
+                            }
+                        }
+                        .frame(maxWidth: .infinity, alignment: .leading)
                     }
                     Color.clear.frame(height: 1).id(Self.bottomAnchor)
                 }
@@ -271,7 +284,9 @@ struct ThreadDetailView: View {
         input = ""
         attachments = []
         attachError = nil
-        coordinator.clearError(for: thread.id)
+        // `coordinator.send` clears the thread's error itself. Don't clear it here
+        // first: while a recoverable error is showing, the retained job_id would
+        // otherwise make `isRunning` read true and silently drop this new send.
         coordinator.send(thread: thread, text: text, voice: false, context: context,
                          attachments: outgoing)
     }

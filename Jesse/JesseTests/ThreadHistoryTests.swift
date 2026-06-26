@@ -74,11 +74,13 @@ final class ThreadHistoryTests: XCTestCase {
         XCTAssertEqual(message, "upstream boom")
     }
 
-    func testDecodeResult404IsFailedNotThrow() throws {
-        // An evicted/unknown job id is terminal "gone", surfaced as .failed.
+    func testDecodeResult404IsExpiredNotThrow() throws {
+        // An evicted/unknown job id is the terminal "gone" state — distinct from
+        // a bridge-reported .failed (which stays re-checkable). It must decode to
+        // .expired rather than throwing.
         let data = "unknown or expired job id".data(using: .utf8)!
-        guard case .failed = try JesseClient.decodeResult(data: data, resp: httpResponse(404)) else {
-            return XCTFail("expected .failed for 404")
+        guard case .expired = try JesseClient.decodeResult(data: data, resp: httpResponse(404)) else {
+            return XCTFail("expected .expired for 404")
         }
     }
 

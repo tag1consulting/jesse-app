@@ -205,10 +205,10 @@ enum JesseError: LocalizedError {
         case .insecureBlocked(let h):
             return "iOS blocked the HTTP connection to “\(h)” (App Transport Security)."
         case .connectionLost:
-            // The bridge keeps the turn running detached from the connection, so
-            // this is recoverable when a job_id is in flight — the coordinator
-            // re-attaches on foreground rather than showing this as a failure.
-            return "The connection dropped. Reopen Jesse to pick the reply back up."
+            // The bridge keeps the turn running detached from the connection and
+            // holds the finished reply, so this is recoverable while a job_id is
+            // retained — tap Re-check (or just reopen Jesse) to pick it back up.
+            return "The connection dropped before the reply came back. It's still being held — tap Re-check to pick it up."
         case .transport(let msg):
             return msg
         case .badResponse(let code, let body):
@@ -292,6 +292,11 @@ enum JesseResultState {
     case running
     case done(JesseReply)
     case failed(String)
+    /// The bridge no longer has this job (404 — evicted past its TTL). Terminal
+    /// and distinct from `.failed`: there is nothing left to re-check, so the
+    /// coordinator drops the retained job_id and shows the one genuinely-final
+    /// "expired" state. Anything short of this keeps the reply re-checkable.
+    case expired
 }
 
 /// The two bridge calls the coordinator drives a turn with. Pulled behind a
@@ -449,10 +454,11 @@ struct JesseClient: JesseClientProtocol {
 
     static func decodeResult(data: Data, resp: URLResponse) throws -> JesseResultState {
         guard let http = resp as? HTTPURLResponse else { throw JesseError.decoding }
-        // An unknown/evicted id is a terminal "gone", surfaced as a failure the
-        // coordinator can show and clear — not a transient to keep polling.
+        // An unknown/evicted id is the one genuinely terminal "gone" state: the
+        // bridge held the reply for its TTL and it's now past. Distinct from a
+        // `.failed` (which stays re-checkable) — the coordinator clears the job.
         if http.statusCode == 404 {
-            return .failed("This reply expired before it could be retrieved.")
+            return .expired
         }
         guard (200..<300).contains(http.statusCode) else {
             throw JesseError.badResponse(http.statusCode,
