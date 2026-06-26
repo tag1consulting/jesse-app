@@ -35,6 +35,16 @@ struct ThreadDetailView: View {
         .navigationBarTitleDisplayMode(.inline)
         .toolbar {
             ToolbarItem(placement: .topBarTrailing) {
+                Button {
+                    thread.toggleFavorite()
+                    try? context.save()
+                } label: {
+                    Label(thread.isFavorite ? "Unfavorite" : "Favorite",
+                          systemImage: thread.isFavorite ? "star.fill" : "star")
+                }
+                .tint(thread.isFavorite ? .yellow : nil)
+            }
+            ToolbarItem(placement: .topBarTrailing) {
                 // Share the whole conversation as a role-labeled Markdown
                 // transcript. ShareLink gives Copy + the system share sheet for
                 // free. Hidden until there's something to share.

@@ -13,28 +13,28 @@ struct ThreadListView: View {
     @Binding var config: JesseConfig
     @Binding var showSettings: Bool
 
+    // Remembered across launches: false = All, true = Favorites only.
+    @AppStorage("threadListFavoritesOnly") private var favoritesOnly = false
+
+    /// Threads the active filter shows. The All view keeps date order untouched;
+    /// Favorites simply narrows to starred threads (no reordering or pinning).
+    private var visible: [JesseThread] {
+        favoritesOnly ? threads.filter(\.isFavorite) : threads
+    }
+
     var body: some View {
-        Group {
-            if threads.isEmpty {
-                ContentUnavailableView {
-                    Label("No conversations yet", systemImage: "bubble.left.and.bubble.right")
-                } description: {
-                    Text("Tap + to start one.")
+        VStack(spacing: 0) {
+            // Only meaningful once there's at least one conversation to filter.
+            if !threads.isEmpty {
+                Picker("Filter", selection: $favoritesOnly) {
+                    Text("All").tag(false)
+                    Text("Favorites").tag(true)
                 }
-            } else {
-                List {
-                    ForEach(groupedSections) { group in
-                        Section(group.section.title()) {
-                            ForEach(group.threads) { thread in
-                                NavigationLink(value: thread) {
-                                    ThreadRow(thread: thread, running: coordinator.isRunning(thread.id))
-                                }
-                            }
-                            .onDelete { delete($0, in: group.threads) }
-                        }
-                    }
-                }
+                .pickerStyle(.segmented)
+                .padding(.horizontal)
+                .padding(.bottom, 8)
             }
+            content
         }
         .navigationTitle("Jesse")
         .toolbar {
@@ -47,6 +47,50 @@ struct ThreadListView: View {
             }
         }
         .onAppear(perform: pruneEmpty)
+    }
+
+    @ViewBuilder
+    private var content: some View {
+        if threads.isEmpty {
+            ContentUnavailableView {
+                Label("No conversations yet", systemImage: "bubble.left.and.bubble.right")
+            } description: {
+                Text("Tap + to start one.")
+            }
+        } else if visible.isEmpty {
+            // Favorites filter on, nothing starred yet. The picker above stays
+            // visible so you can switch back to All.
+            ContentUnavailableView {
+                Label("No favorites yet", systemImage: "star")
+            } description: {
+                Text("Swipe a conversation and tap Favorite to star it.")
+            }
+        } else {
+            List {
+                ForEach(groupedSections) { group in
+                    Section(group.section.title()) {
+                        ForEach(group.threads) { thread in
+                            NavigationLink(value: thread) {
+                                ThreadRow(thread: thread, running: coordinator.isRunning(thread.id))
+                            }
+                            .swipeActions(edge: .leading) {
+                                Button { toggleFavorite(thread) } label: {
+                                    Label(thread.isFavorite ? "Unfavorite" : "Favorite",
+                                          systemImage: thread.isFavorite ? "star.slash" : "star")
+                                }
+                                .tint(.yellow)
+                            }
+                        }
+                        .onDelete { delete($0, in: group.threads) }
+                    }
+                }
+            }
+        }
+    }
+
+    private func toggleFavorite(_ thread: JesseThread) {
+        thread.toggleFavorite()
+        try? context.save()
     }
 
     private func newThread() {
@@ -65,7 +109,7 @@ struct ThreadListView: View {
     /// once here so every thread is classified against the same instant.
     private var groupedSections: [ThreadGroup] {
         let now = Date.now
-        let grouped = Dictionary(grouping: threads) {
+        let grouped = Dictionary(grouping: visible) {
             threadSection(for: $0.updatedAt, now: now, calendar: .current)
         }
         return grouped
@@ -110,8 +154,16 @@ struct ThreadRow: View {
     var body: some View {
         HStack(spacing: 10) {
             VStack(alignment: .leading, spacing: 3) {
-                Text(thread.title.isEmpty ? "New conversation" : thread.title)
-                    .lineLimit(1)
+                HStack(spacing: 5) {
+                    if thread.isFavorite {
+                        Image(systemName: "star.fill")
+                            .font(.caption2)
+                            .foregroundStyle(.yellow)
+                            .accessibilityLabel("Favorite")
+                    }
+                    Text(thread.title.isEmpty ? "New conversation" : thread.title)
+                        .lineLimit(1)
+                }
                 Text(thread.updatedAt, format: .relative(presentation: .named))
                     .font(.caption)
                     .foregroundStyle(.secondary)

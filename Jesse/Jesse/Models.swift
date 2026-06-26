@@ -21,6 +21,12 @@ final class JesseThread {
     var mode: String = JesseMode.ask.rawValue
     // Bridge session for resume; nil until the first reply lands.
     var sessionId: String?
+    // Whether this thread is starred. New property with a default, so SwiftData
+    // lightweight-migrates existing stores with no migration code.
+    var isFavorite: Bool = false
+    // When it was starred; nil whenever `isFavorite` is false. Kept so favorites
+    // could later sort by pin time rather than last activity.
+    var favoritedAt: Date?
 
     @Relationship(deleteRule: .cascade, inverse: \Turn.thread)
     var turns: [Turn] = []
@@ -34,6 +40,18 @@ final class JesseThread {
     }
 
     var modeValue: JesseMode { JesseMode(rawValue: mode) ?? .ask }
+
+    /// Flip the favorite flag, stamping `favoritedAt` when starring and clearing
+    /// it when unstarring. `now` is injectable so tests don't read the clock.
+    func toggleFavorite(now: Date = Date()) {
+        setFavorite(!isFavorite, now: now)
+    }
+
+    /// Set the favorite flag explicitly, keeping `favoritedAt` consistent.
+    func setFavorite(_ value: Bool, now: Date = Date()) {
+        isFavorite = value
+        favoritedAt = value ? now : nil
+    }
 
     /// Turns in chronological order — `turns` itself is an unordered relationship.
     var orderedTurns: [Turn] {
