@@ -32,6 +32,13 @@ Default allowlist (`JESSE_ALLOWED_TOOLS` to override):
 | `mcp__qmd__query`, `mcp__qmd__get`, `mcp__qmd__multi_get`, `mcp__qmd__status` | Read-only QMD vault search — the first step for any vault lookup |
 | `Bash(git:*)` | Vault history / status |
 | `Bash(mv:*)`, `Bash(ls:*)`, `Bash(cat:*)`, `Bash(find:*)` | Scoped file wrangling |
+| `Bash(node todo-list/generate-diet-today.js:*)` | Regenerate the `diet-today.js` dashboard cache from the authoritative CSVs after a food/exercise/weigh-in log (without it, a phone log appends the CSV but leaves the cache stale) |
+| `Bash(node todo-list/validate-diet-today.js:*)`, `Bash(node todo-list/verify-diet-consistency.js:*)` | The generator's two guards — field-contract validation and CSV-vs-cache consistency — run after each regeneration |
+
+These three `node` entries are pinned to the **exact script paths**, never a bare
+`Bash(node:*)`: a bare node scope would allow `node -e "<arbitrary JS>"` —
+arbitrary code execution from a phone request — so only the three named diet-cache
+scripts are permitted (`build_claude_args_enforces_least_privilege` asserts this).
 
 Default denylist (`JESSE_DISALLOWED_TOOLS` to override) — denied even if they
 reach the allowlist:

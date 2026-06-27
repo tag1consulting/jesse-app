@@ -63,9 +63,22 @@ permission.";
 // The non-negotiable floor for TELL turns: durable-fact capture is always on,
 // even under a custom wrapper. (Tell already means "act", so there is no
 // no-unrequested-action clause — only the universal record-facts invariant.)
+//
+// The second sentence is the diet-cache reinforcement: `diet-today.js` is a
+// DERIVED cache, and the headless one-shot agent otherwise tends to hand-edit it
+// (the stale-cache bug class — a phone log left it `meals: []`). It is self-gated
+// ("When the fact is a food/exercise/weigh-in log…"), so it is a no-op on every
+// other Tell. The three `node …` commands are exactly the scopes granted in
+// DEFAULT_ALLOWED_TOOLS; CLAUDE.md's Diet-Logging-Flow owns the full procedure —
+// this only reinforces it so it happens on the phone path every time.
 const TELL_FLOOR: &str = "Record any durable fact, correction, or status change \
 to the right vault file immediately per CLAUDE.md — that is never optional and \
-never needs his permission.";
+never needs his permission. When the fact is a food, exercise, or weigh-in log, \
+`todo-list/diet-today.js` is a DERIVED cache: after appending the CSV row(s), \
+regenerate it by running `node todo-list/generate-diet-today.js`, then verify \
+with `node todo-list/validate-diet-today.js` and \
+`node todo-list/verify-diet-consistency.js` — never hand-edit the meals, weight, \
+or exercise data into it.";
 
 // Editable wrappers (the framing the app's Settings can override). The fixed
 // floor above is prepended separately and is NOT part of this text, so a custom
@@ -145,9 +158,22 @@ const DEFAULT_MAX_ATTACHMENTS_TOTAL_BYTES: usize = 20 * 1024 * 1024;
 // vault history, mv/ls/cat/find for file wrangling). Bare `Bash` is deliberately
 // absent — only the `Bash(<verb>:*)` scopes below are allowed. Override with
 // JESSE_ALLOWED_TOOLS. Keep in sync with the table in SECURITY.md.
+//
+// The three `Bash(node todo-list/<script>.js:*)` scopes let a food/exercise/
+// weigh-in log REGENERATE the dashboard cache (`diet-today.js`) from the CSV
+// source of truth and re-run its two guards — the per-item-log step the vault's
+// Diet-Logging-Flow prescribes. Without them the agent could append the CSV row
+// but not rebuild the cache, leaving `diet-today.js` stale (the 2026-06-27
+// phantom-banana bug). They are pinned to the THREE exact script paths, NOT
+// `Bash(node:*)` — a bare `node` scope would allow `node -e "<arbitrary JS>"`,
+// i.e. arbitrary code execution from a phone request. cwd is the vault (see
+// `run_claude`), so the relative paths resolve there.
 const DEFAULT_ALLOWED_TOOLS: &str = "Read,Write,Edit,Grep,Glob,\
 mcp__qmd__query,mcp__qmd__get,mcp__qmd__multi_get,mcp__qmd__status,\
-Bash(git:*),Bash(mv:*),Bash(ls:*),Bash(cat:*),Bash(find:*)";
+Bash(git:*),Bash(mv:*),Bash(ls:*),Bash(cat:*),Bash(find:*),\
+Bash(node todo-list/generate-diet-today.js:*),\
+Bash(node todo-list/validate-diet-today.js:*),\
+Bash(node todo-list/verify-diet-consistency.js:*)";
 
 // Defense-in-depth: tools that must never run from the bridge even if they slip
 // into the allowlist. Unscoped Bash (arbitrary shell) and WebFetch (SSRF / data
@@ -2690,6 +2716,25 @@ mod tests {
         assert!(
             tools.iter().any(|t| t.starts_with("Bash(")),
             "expected scoped Bash(...) entries: {tools:?}"
+        );
+
+        // `node` is granted ONLY for the three named diet-cache scripts — never a
+        // bare `Bash(node:*)`, which would permit `node -e "<arbitrary JS>"` (RCE
+        // from a phone request). Pin both the presence of the scoped scripts and
+        // the absence of any broader node scope.
+        for script in [
+            "Bash(node todo-list/generate-diet-today.js:*)",
+            "Bash(node todo-list/validate-diet-today.js:*)",
+            "Bash(node todo-list/verify-diet-consistency.js:*)",
+        ] {
+            assert!(
+                tools.contains(&script),
+                "expected scoped node script {script:?} in: {tools:?}"
+            );
+        }
+        assert!(
+            !tools.iter().any(|t| *t == "Bash(node:*)" || *t == "Bash(node)"),
+            "a bare node scope (arbitrary-JS RCE) must never be allowed: {tools:?}"
         );
 
         // Defense-in-depth denylist is passed and contains bare Bash.
