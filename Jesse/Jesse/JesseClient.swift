@@ -299,6 +299,19 @@ enum JesseResultState {
     case expired
 }
 
+/// One decoded frame from the live SSE stream (`GET /jesse/stream/{job_id}`).
+/// Mirrors the bridge's wire events. `reset` carries the full text-so-far (sent
+/// on subscribe and to re-sync after a lag) and REPLACES the partial buffer;
+/// `delta` APPENDS. The three terminal frames mirror `JesseResultState`.
+enum JesseStreamEvent {
+    case reset(String)
+    case delta(String)
+    case activity(String)   // coarse tool name, e.g. "Read" / "Write"
+    case done(JesseReply)
+    case failed(String)
+    case cancelled
+}
+
 /// The two bridge calls the coordinator drives a turn with. Pulled behind a
 /// protocol purely so a fake can exercise the poll loop in tests without a
 /// server; `JesseClient` is the only production conformer.
@@ -309,6 +322,13 @@ protocol JesseClientProtocol {
     func result(jobId: String) async throws -> JesseResultState
     /// Best-effort request to stop an in-flight turn server-side. Idempotent.
     func cancelJob(jobId: String) async throws
+    /// Live token stream for a running turn (`GET /jesse/stream/{job_id}`). Yields
+    /// `reset`/`delta`/`activity` frames as the reply builds, then exactly one
+    /// terminal frame (`done`/`failed`/`cancelled`). Throws on a transport/auth
+    /// failure or a dropped connection — the coordinator then falls back to
+    /// polling `result`. The 202/poll/persist/resume path is the fallback for
+    /// this; streaming never replaces it.
+    func stream(jobId: String) -> AsyncThrowingStream<JesseStreamEvent, Error>
 }
 
 struct JesseClient: JesseClientProtocol {
@@ -406,6 +426,92 @@ struct JesseClient: JesseClientProtocol {
         if (200..<300).contains(http.statusCode) || http.statusCode == 404 { return }
         throw JesseError.badResponse(http.statusCode,
                                      String(data: data, encoding: .utf8) ?? "")
+    }
+
+    /// Open the live SSE stream for a running turn and decode each frame. Reads
+    /// `text/event-stream` with `URLSession.bytes(for:)`, splits on blank-line
+    /// frame boundaries, and maps `event:`/`data:` pairs to `JesseStreamEvent`.
+    /// Comment lines (`:` keep-alives) are skipped. The inner URL task is
+    /// cancelled when the returned stream is torn down (the consumer's task is
+    /// cancelled, e.g. on user Cancel) — which drops the SSE connection so no
+    /// subscriber dangles. Any transport/HTTP failure finishes the stream with a
+    /// throw, signalling the coordinator to fall back to polling.
+    func stream(jobId: String) -> AsyncThrowingStream<JesseStreamEvent, Error> {
+        AsyncThrowingStream { continuation in
+            let task = Task {
+                do {
+                    guard !config.normalizedHost.isEmpty, !config.token.isEmpty,
+                          let url = config.endpoint("/jesse/stream/\(jobId)") else {
+                        throw JesseError.notConfigured
+                    }
+                    var req = URLRequest(url: url)
+                    req.httpMethod = "GET"
+                    req.setValue("Bearer \(config.token)", forHTTPHeaderField: "Authorization")
+                    req.setValue("text/event-stream", forHTTPHeaderField: "Accept")
+
+                    let bytes: URLSession.AsyncBytes, resp: URLResponse
+                    do {
+                        (bytes, resp) = try await Self.session.bytes(for: req)
+                    } catch {
+                        throw JesseError.from(error, host: config.normalizedHost)
+                    }
+                    guard let http = resp as? HTTPURLResponse else { throw JesseError.decoding }
+                    guard (200..<300).contains(http.statusCode) else {
+                        // Includes 404 (unknown/expired) — the coordinator's poll
+                        // fallback resolves what actually happened to the job.
+                        throw JesseError.badResponse(http.statusCode, "")
+                    }
+
+                    var eventName = ""
+                    var dataBuf = ""
+                    func flush() {
+                        defer { eventName = ""; dataBuf = "" }
+                        guard !eventName.isEmpty,
+                              let ev = Self.decodeStreamFrame(event: eventName, data: dataBuf)
+                        else { return }
+                        continuation.yield(ev)
+                    }
+                    for try await line in bytes.lines {
+                        if Task.isCancelled { break }
+                        if line.isEmpty { flush(); continue }     // frame boundary
+                        if line.hasPrefix(":") { continue }       // keep-alive comment
+                        if let v = Self.sseField("event:", line) {
+                            eventName = v
+                        } else if let v = Self.sseField("data:", line) {
+                            dataBuf += v
+                        }
+                    }
+                    flush() // a final frame not followed by a blank line before EOF
+                    continuation.finish()
+                } catch {
+                    continuation.finish(throwing: error)
+                }
+            }
+            continuation.onTermination = { _ in task.cancel() }
+        }
+    }
+
+    /// Strip an SSE field prefix and its single optional leading space.
+    nonisolated private static func sseField(_ prefix: String, _ line: String) -> String? {
+        guard line.hasPrefix(prefix) else { return nil }
+        let rest = line.dropFirst(prefix.count)
+        return rest.hasPrefix(" ") ? String(rest.dropFirst()) : String(rest)
+    }
+
+    /// Decode one SSE frame (`event` name + JSON `data`) into a stream event.
+    nonisolated static func decodeStreamFrame(event: String, data: String) -> JesseStreamEvent? {
+        let obj = (try? JSONSerialization.jsonObject(with: Data(data.utf8))) as? [String: Any]
+        switch event {
+        case "reset": return .reset(obj?["text"] as? String ?? "")
+        case "delta": return .delta(obj?["text"] as? String ?? "")
+        case "activity": return .activity(obj?["name"] as? String ?? "")
+        case "done":
+            return .done(JesseReply(text: obj?["response"] as? String ?? "",
+                                    sessionId: obj?["session_id"] as? String))
+        case "error": return .failed(obj?["error"] as? String ?? "Jesse couldn't complete that.")
+        case "cancelled": return .cancelled
+        default: return nil
+        }
     }
 
     /// Fetch the bridge's built-in Ask/Tell wrapper defaults (`GET /jesse/prompts`).

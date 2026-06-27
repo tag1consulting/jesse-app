@@ -265,6 +265,7 @@ name = "jesse-bridge"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "futures-core",
  "qrcode",
  "serde",
  "serde_json",

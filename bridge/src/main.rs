@@ -22,23 +22,30 @@ use std::io::Write as _;
 use std::net::IpAddr;
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::process::Stdio;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::task::{Context as TaskContext, Poll};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use axum::{
     extract::{DefaultBodyLimit, Path as UrlPath, State},
     http::{HeaderMap, StatusCode},
-    response::{IntoResponse, Response},
+    response::{
+        sse::{Event, KeepAlive, Sse},
+        IntoResponse, Response,
+    },
     routing::{get, post},
     Json, Router,
 };
+use futures_core::Stream;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use subtle::ConstantTimeEq;
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
 use tokio::process::Command;
-use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use tokio::sync::{broadcast, mpsc, OwnedSemaphorePermit, Semaphore};
 use tokio::task::AbortHandle;
 use tokio::time::timeout;
 
@@ -476,6 +483,46 @@ struct Job {
     first_retrieved_at: Option<SystemTime>,
 }
 
+/// A live SSE frame, broadcast to every subscriber of a running job's stream.
+/// Cheap to clone (the broadcast channel hands each subscriber its own copy).
+/// The terminal arms (`Done`/`Error`/`Cancelled`) mirror the three terminal
+/// `JobState`s a poll of `GET /jesse/result` would report.
+#[derive(Clone, Debug)]
+enum StreamFrame {
+    /// Incremental answer text — append to what the client has so far.
+    Delta(String),
+    /// A coarse "Jesse is using the <name> tool" activity hint.
+    Activity(String),
+    /// Terminal: the turn finished. Carries the authoritative final text and
+    /// session id (same values `complete` persisted), not the accumulated deltas.
+    Done {
+        response: String,
+        session_id: Option<String>,
+    },
+    /// Terminal: the turn failed. Carries the human-readable cause.
+    Error(String),
+    /// Terminal: the turn was cancelled (`POST /jesse/cancel`). Surfaced cleanly
+    /// so the phone renders "Cancelled", never an error.
+    Cancelled,
+}
+
+/// Per-job live-stream state: the broadcast sender plus the text accumulated so
+/// far (so a phone that opens the stream a beat late, or reconnects after a
+/// blip, can be replayed the beginning) and the most recent tool-activity hint.
+/// In-memory only and never persisted — only the terminal result persists, via
+/// `complete`. An entry exists for the life of a running job and is removed on
+/// the terminal transition (mirroring `aborts`).
+struct StreamHandle {
+    tx: broadcast::Sender<StreamFrame>,
+    text: String,
+    activity: Option<String>,
+}
+
+/// Broadcast backlog per job. Generous so a briefly-slow subscriber doesn't lag
+/// and force a full re-sync; if it does lag, the SSE handler resends the whole
+/// accumulated buffer as a `reset`, so correctness never depends on this size.
+const STREAM_CHANNEL_CAP: usize = 1024;
+
 struct JobStore {
     jobs: Mutex<HashMap<String, Job>>,
     // Abort handle for each RUNNING job's spawned turn task, keyed by job id.
@@ -484,10 +531,15 @@ struct JobStore {
     // permit. An entry exists only while the job runs: `complete`/`cancel` remove
     // it on the terminal transition, so the map never holds a finished job.
     //
-    // Lock discipline: this mutex and `jobs` are never held simultaneously — each
-    // method takes one, releases it, then takes the other — so there is no lock
-    // ordering between them and no deadlock.
+    // Lock discipline: this mutex, `jobs`, and `streams` are never held
+    // simultaneously — each method takes one, releases it, then takes another —
+    // so there is no lock ordering between them and no deadlock.
     aborts: Mutex<HashMap<String, AbortHandle>>,
+    // Live-stream state for each RUNNING job (broadcast sender + accumulated
+    // text), keyed by job id. Mirrors `aborts`: created when the turn is
+    // registered, removed on the terminal transition. Same lock discipline —
+    // never held while `jobs` or `aborts` is held.
+    streams: Mutex<HashMap<String, StreamHandle>>,
     // How long an unfetched completed job is held.
     ttl: Duration,
     // How long a completed job is kept after its first retrieval.
@@ -696,6 +748,7 @@ impl JobStore {
         JobStore {
             jobs: Mutex::new(jobs),
             aborts: Mutex::new(HashMap::new()),
+            streams: Mutex::new(HashMap::new()),
             ttl,
             retrieval_grace,
             jobs_dir,
@@ -754,6 +807,92 @@ impl JobStore {
         self.aborts.lock().unwrap().insert(id.to_string(), handle);
     }
 
+    // ---- Live stream (SSE) -------------------------------------------------
+    //
+    // Each method touches ONLY the `streams` map and never holds `jobs`/`aborts`
+    // at the same time — the same lock discipline the rest of the store follows.
+
+    /// Open a live stream for a job: install a fresh broadcast channel and an
+    /// empty accumulator. Called once, right after `create`, before the turn is
+    /// spawned, so a subscriber arriving immediately finds the entry.
+    fn stream_register(&self, id: &str) {
+        let (tx, _rx) = broadcast::channel(STREAM_CHANNEL_CAP);
+        self.streams.lock().unwrap().insert(
+            id.to_string(),
+            StreamHandle {
+                tx,
+                text: String::new(),
+                activity: None,
+            },
+        );
+    }
+
+    /// Append a text delta to the accumulator and broadcast it live. A no-op if
+    /// the stream entry is gone (terminal already reached) so a late delta from a
+    /// not-yet-reaped child can't resurrect a finished stream. The accumulator is
+    /// capped at `MAX_OUTPUT_BYTES` so one pathological turn can't bloat memory;
+    /// the authoritative final text comes from the terminal result regardless.
+    fn stream_push_delta(&self, id: &str, delta: &str) {
+        let mut guard = self.streams.lock().unwrap();
+        if let Some(h) = guard.get_mut(id) {
+            if h.text.len() < MAX_OUTPUT_BYTES {
+                h.text.push_str(delta);
+            }
+            let _ = h.tx.send(StreamFrame::Delta(delta.to_string()));
+        }
+    }
+
+    /// Record the latest tool-activity hint and broadcast it. No-op if gone.
+    fn stream_push_activity(&self, id: &str, name: &str) {
+        let mut guard = self.streams.lock().unwrap();
+        if let Some(h) = guard.get_mut(id) {
+            h.activity = Some(name.to_string());
+            let _ = h.tx.send(StreamFrame::Activity(name.to_string()));
+        }
+    }
+
+    /// Clear the accumulated text before a retry re-runs the whole prompt, so a
+    /// rerun doesn't double the buffer. (Retryable failures occur at the API
+    /// before any tokens, so in practice the buffer is already empty here.)
+    fn stream_reset(&self, id: &str) {
+        if let Some(h) = self.streams.lock().unwrap().get_mut(id) {
+            h.text.clear();
+            h.activity = None;
+        }
+    }
+
+    /// Subscribe to a running job's stream: returns the text accumulated so far,
+    /// the latest activity hint, and a receiver for future frames. `None` once
+    /// the job is terminal (entry removed) — the caller then reads the terminal
+    /// state from `jobs` instead. Taking the snapshot and the receiver under the
+    /// one lock means no delta can slip between them (every push also takes it).
+    fn stream_subscribe(
+        &self,
+        id: &str,
+    ) -> Option<(String, Option<String>, broadcast::Receiver<StreamFrame>)> {
+        let guard = self.streams.lock().unwrap();
+        let h = guard.get(id)?;
+        Some((h.text.clone(), h.activity.clone(), h.tx.subscribe()))
+    }
+
+    /// The full accumulated text for a job, if its stream is still live. Used to
+    /// re-sync a subscriber that lagged the broadcast backlog.
+    fn stream_snapshot(&self, id: &str) -> Option<String> {
+        Some(self.streams.lock().unwrap().get(id)?.text.clone())
+    }
+
+    /// Close a job's stream with a terminal frame and remove the entry. The frame
+    /// reaches every current subscriber (they hold receivers); a subscriber that
+    /// arrives afterwards finds no entry and reads the terminal state from `jobs`.
+    /// Removing under the lock makes this write-once: whichever of the turn-task
+    /// (`Done`/`Error`) and `cancel` (`Cancelled`) calls it first wins and the
+    /// other no-ops — mirroring the write-once `jobs` transition.
+    fn stream_finish(&self, id: &str, frame: StreamFrame) {
+        if let Some(h) = self.streams.lock().unwrap().remove(id) {
+            let _ = h.tx.send(frame);
+        }
+    }
+
     /// Cancel a running turn by id. Aborts its task (drop → `kill_on_drop` kills
     /// `claude` and frees the concurrency permit) and marks the job `Cancelled`.
     /// Idempotent and race-safe: an unknown id, or a job already terminal (done,
@@ -765,19 +904,28 @@ impl JobStore {
         if let Some(handle) = self.aborts.lock().unwrap().remove(id) {
             handle.abort();
         }
-        let mut guard = self.jobs.lock().unwrap();
-        match guard.get_mut(id) {
-            None => CancelOutcome::Unknown,
-            Some(job) if matches!(job.state, JobState::Running) => {
-                job.state = JobState::Cancelled;
-                job.completed_at = Some(SystemTime::now());
-                if let Some(dir) = &self.jobs_dir {
-                    persist_job(dir, id, job);
+        let outcome = {
+            let mut guard = self.jobs.lock().unwrap();
+            match guard.get_mut(id) {
+                None => CancelOutcome::Unknown,
+                Some(job) if matches!(job.state, JobState::Running) => {
+                    job.state = JobState::Cancelled;
+                    job.completed_at = Some(SystemTime::now());
+                    if let Some(dir) = &self.jobs_dir {
+                        persist_job(dir, id, job);
+                    }
+                    CancelOutcome::Cancelled
                 }
-                CancelOutcome::Cancelled
+                Some(_) => CancelOutcome::AlreadyTerminal,
             }
-            Some(_) => CancelOutcome::AlreadyTerminal,
+        }; // jobs lock released here, before touching `streams`
+        // We won the transition to Cancelled — close any live stream with a clean
+        // `cancelled` frame. (For AlreadyTerminal/Unknown the turn task's own
+        // terminal frame already fired, or there was never a stream.)
+        if matches!(outcome, CancelOutcome::Cancelled) {
+            self.stream_finish(id, StreamFrame::Cancelled);
         }
+        outcome
     }
 
     fn get(&self, id: &str) -> Option<JobState> {
@@ -999,6 +1147,120 @@ fn truncate_chars(s: &str, n: usize) -> String {
     s.chars().take(n).collect()
 }
 
+/// Classify a parsed terminal `result` object into the bridge's Ok/Retryable/
+/// Fatal outcome — the single place that decides what a finished `claude` turn
+/// amounts to. Shared by `interpret_claude_output` (whole-buffer `json` mode)
+/// and `parse_stream_line` (the terminal `result` line of `stream-json` mode),
+/// so both modes classify identically. `raw` is the original text to fall back
+/// to as the answer when a success envelope somehow lacks a `result` field
+/// (only meaningful for the buffered path; `None` in streaming).
+fn classify_result_value(v: &Value, raw: Option<&str>) -> ClaudeOutcome {
+    let is_error = v.get("is_error").and_then(|e| e.as_bool()).unwrap_or(false);
+    if is_error {
+        let status = v.get("api_error_status").and_then(|s| s.as_u64());
+        // `result` holds the human-readable cause; synthesize one if absent.
+        let message = v
+            .get("result")
+            .and_then(|r| r.as_str())
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| match status {
+                Some(code) => format!("claude API error (status {code})"),
+                None => "claude reported an error with no detail".to_string(),
+            });
+        return match status {
+            // 5xx and 429 are transient upstream conditions (529 is >= 500).
+            Some(code) if code >= 500 || code == 429 => ClaudeOutcome::Retryable {
+                message,
+                status: code,
+            },
+            _ => ClaudeOutcome::Fatal { message },
+        };
+    }
+    // Success envelope — same extraction the bridge has always done.
+    let result = v
+        .get("result")
+        .and_then(|r| r.as_str())
+        .or(raw)
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    let session_id = v
+        .get("session_id")
+        .and_then(|s| s.as_str())
+        .map(|s| s.to_string());
+    ClaudeOutcome::Ok { result, session_id }
+}
+
+/// One line of `claude --output-format stream-json` decoded into what the bridge
+/// cares about. The stream is NDJSON (one JSON object per line); most lines we
+/// ignore. A pure mapping (no I/O) so it's unit-testable against captured
+/// fixtures. See `bridge/README.md` for the verified event schema.
+#[derive(Debug)]
+enum StreamEvent {
+    /// A chunk of the visible answer (a `text_delta` inside a `text` block).
+    /// Thinking deltas carry a different delta type and are deliberately excluded.
+    TextDelta(String),
+    /// The agent started using a tool — surfaced as a coarse activity hint.
+    ToolActivity { name: String },
+    /// The terminal `result` line: classify it exactly as the buffered path does.
+    Done(ClaudeOutcome),
+    /// Anything else (init/system, rate-limit, message envelopes, thinking
+    /// deltas, tool input deltas, …) — carries nothing the bridge needs.
+    Ignore,
+}
+
+/// Map a single NDJSON line from `stream-json` to a `StreamEvent`. Non-JSON or
+/// unrecognized lines are `Ignore`d (the terminal classification still comes
+/// from the `result` line, or from the no-result fallback if it never arrives).
+fn parse_stream_line(line: &str) -> StreamEvent {
+    let line = line.trim();
+    if line.is_empty() {
+        return StreamEvent::Ignore;
+    }
+    let Ok(v) = serde_json::from_str::<Value>(line) else {
+        return StreamEvent::Ignore;
+    };
+    match v.get("type").and_then(|t| t.as_str()) {
+        // The one terminal line — feeds the existing Ok/Retryable/Fatal logic.
+        Some("result") => StreamEvent::Done(classify_result_value(&v, None)),
+        // Token-level events (emitted under --include-partial-messages). The
+        // visible answer streams as `text_delta`s inside a `text` content block;
+        // tool use announces itself with a `tool_use` content-block start.
+        Some("stream_event") => {
+            let event = v.get("event");
+            match event.and_then(|e| e.get("type")).and_then(|t| t.as_str()) {
+                Some("content_block_delta") => {
+                    let delta = event.and_then(|e| e.get("delta"));
+                    let is_text = delta
+                        .and_then(|d| d.get("type"))
+                        .and_then(|t| t.as_str())
+                        == Some("text_delta");
+                    match delta.and_then(|d| d.get("text")).and_then(|t| t.as_str()) {
+                        Some(text) if is_text => StreamEvent::TextDelta(text.to_string()),
+                        _ => StreamEvent::Ignore, // thinking/signature/input deltas
+                    }
+                }
+                Some("content_block_start") => {
+                    let block = event.and_then(|e| e.get("content_block"));
+                    let is_tool = block
+                        .and_then(|b| b.get("type"))
+                        .and_then(|t| t.as_str())
+                        == Some("tool_use");
+                    match block.and_then(|b| b.get("name")).and_then(|n| n.as_str()) {
+                        Some(name) if is_tool => StreamEvent::ToolActivity {
+                            name: name.to_string(),
+                        },
+                        _ => StreamEvent::Ignore,
+                    }
+                }
+                _ => StreamEvent::Ignore,
+            }
+        }
+        _ => StreamEvent::Ignore,
+    }
+}
+
 /// Interpret one `claude -p --output-format json` run. `claude` can exit
 /// non-zero while still writing a JSON envelope whose `is_error` /
 /// `api_error_status` carry the real cause (e.g. a transient upstream 500), so
@@ -1006,39 +1268,9 @@ fn truncate_chars(s: &str, n: usize) -> String {
 /// exit status + stderr only when stdout isn't JSON.
 fn interpret_claude_output(stdout: &str, stderr: &str, exit_success: bool) -> ClaudeOutcome {
     if let Ok(v) = serde_json::from_str::<Value>(stdout) {
-        let is_error = v.get("is_error").and_then(|e| e.as_bool()).unwrap_or(false);
-        if is_error {
-            let status = v.get("api_error_status").and_then(|s| s.as_u64());
-            // `result` holds the human-readable cause; synthesize one if absent.
-            let message = v
-                .get("result")
-                .and_then(|r| r.as_str())
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty())
-                .unwrap_or_else(|| match status {
-                    Some(code) => format!("claude API error (status {code})"),
-                    None => "claude reported an error with no detail".to_string(),
-                });
-            return match status {
-                // 5xx and 429 are transient upstream conditions (529 is >= 500).
-                Some(code) if code >= 500 || code == 429 => {
-                    ClaudeOutcome::Retryable { message, status: code }
-                }
-                _ => ClaudeOutcome::Fatal { message },
-            };
-        }
-        // Success envelope — same extraction the bridge has always done.
-        let result = v
-            .get("result")
-            .and_then(|r| r.as_str())
-            .unwrap_or(stdout)
-            .trim()
-            .to_string();
-        let session_id = v
-            .get("session_id")
-            .and_then(|s| s.as_str())
-            .map(|s| s.to_string());
-        return ClaudeOutcome::Ok { result, session_id };
+        // The parsed envelope is the `result` object; classify it the one way,
+        // shared with the streaming parser's terminal `result` line.
+        return classify_result_value(&v, Some(stdout));
     }
 
     // stdout wasn't JSON. On a clean exit, treat it as the raw answer (the
@@ -1070,8 +1302,15 @@ fn build_claude_args(cfg: &Config, prompt: &str, session_id: Option<&str>) -> Ve
     let mut args = vec![
         "-p".to_string(),
         prompt.to_string(),
+        // Stream the turn as NDJSON so the bridge can read tokens as they arrive
+        // and forward them live. `--verbose` is REQUIRED by `claude` whenever
+        // `-p`/`--print` is combined with `--output-format stream-json` (it errors
+        // out otherwise). `--include-partial-messages` upgrades the stream from
+        // whole-message events to token-level `text_delta`s for true live output.
         "--output-format".to_string(),
-        "json".to_string(),
+        "stream-json".to_string(),
+        "--verbose".to_string(),
+        "--include-partial-messages".to_string(),
         // Default permission mode: tools are gated by the allow/deny lists
         // below rather than auto-accepted. Never acceptEdits/bypassPermissions.
         "--permission-mode".to_string(),
@@ -1090,10 +1329,18 @@ fn build_claude_args(cfg: &Config, prompt: &str, session_id: Option<&str>) -> Ve
     args
 }
 
-/// Invoke headless Claude Code in the vault. Returns (reply_text, session_id).
-/// Pass session_id to continue a thread; the returned id is always captured so
-/// the client can follow up later. Resuming keeps CLAUDE.md loaded and retains
-/// filesystem access — it only adds the prior conversation on top.
+/// Invoke headless Claude Code in the vault, streaming its output. Returns
+/// (reply_text, session_id). Pass session_id to continue a thread; the returned
+/// id is always captured so the client can follow up later. Resuming keeps
+/// CLAUDE.md loaded and retains filesystem access — it only adds the prior
+/// conversation on top.
+///
+/// Unlike the old buffered path, this reads `claude`'s `stream-json` stdout LINE
+/// BY LINE as tokens arrive, pushing each text delta and tool-activity hint onto
+/// the job's broadcast stream (`jobs.stream_*`) so subscribers see the reply
+/// build live. The terminal `result` line is classified by the exact same
+/// Ok/Retryable/Fatal logic as before, and that classified result — not the
+/// streamed deltas — is the authoritative value returned and persisted.
 ///
 /// Retries transient upstream failures (5xx/429/529) up to 3 attempts total.
 /// A retry re-runs the WHOLE prompt: a transient that lands *mid-Tell* (after an
@@ -1101,11 +1348,14 @@ fn build_claude_args(cfg: &Config, prompt: &str, session_id: Option<&str>) -> Ve
 /// Accepted, because the observed transient fails at the API before any work
 /// (0 tokens, $0) — there is nothing to repeat — but the tradeoff is explicit
 /// here in case that ever changes. Only `Retryable` outcomes retry; spawn/io/
-/// timeout failures (which happen before any output exists) do not.
-async fn run_claude(
+/// timeout failures (which happen before any output exists) do not. `kill_on_drop`,
+/// the per-attempt timeout, and the 3-attempt retry are all preserved.
+async fn run_claude_streaming(
     cfg: &Config,
     prompt: &str,
     session_id: Option<&str>,
+    jobs: &JobStore,
+    job_id: &str,
 ) -> Result<(String, Option<String>), ApiError> {
     const MAX_ATTEMPTS: u32 = 3; // 1 try + 2 retries
 
@@ -1118,14 +1368,48 @@ async fn run_claude(
             .current_dir(&cfg.vault) // cwd = vault → CLAUDE.md auto-loads
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
-            .kill_on_drop(true); // killed if the timeout below fires
+            .kill_on_drop(true); // killed if the timeout below fires or the task is dropped
 
-        let child = cmd.spawn().map_err(|e| {
+        let mut child = cmd.spawn().map_err(|e| {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 format!("failed to spawn {}: {e}", cfg.claude_bin),
             )
         })?;
+        let stdout = child.stdout.take().expect("child stdout is piped");
+        let stderr = child.stderr.take().expect("child stderr is piped");
+
+        // Drain stderr concurrently (capped), so a chatty stderr can't deadlock
+        // the stdout pipe and so the no-`result` fallback below has the cause.
+        let stderr_task = tokio::spawn(async move {
+            let mut reader = BufReader::new(stderr);
+            let mut buf = Vec::new();
+            // Bounded by `claude`'s own stderr volume, then truncated for storage.
+            let _ = reader.read_to_end(&mut buf).await;
+            let cap = buf.len().min(MAX_OUTPUT_BYTES);
+            String::from_utf8_lossy(&buf[..cap]).into_owned()
+        });
+
+        // Read stdout to EOF, mapping each NDJSON line and pushing live frames.
+        // Reading to EOF (rather than breaking on the `result` line) also drains
+        // the pipe so the child can exit cleanly. The last `result` line wins.
+        let read_lines = async {
+            let mut lines = BufReader::new(stdout).lines();
+            let mut terminal: Option<ClaudeOutcome> = None;
+            loop {
+                let next = lines.next_line().await.map_err(|e| {
+                    (StatusCode::BAD_GATEWAY, format!("claude io error: {e}"))
+                })?;
+                let Some(line) = next else { break };
+                match parse_stream_line(&line) {
+                    StreamEvent::TextDelta(t) => jobs.stream_push_delta(job_id, &t),
+                    StreamEvent::ToolActivity { name } => jobs.stream_push_activity(job_id, &name),
+                    StreamEvent::Done(outcome) => terminal = Some(outcome),
+                    StreamEvent::Ignore => {}
+                }
+            }
+            Ok::<Option<ClaudeOutcome>, ApiError>(terminal)
+        };
 
         // "Unlimited" (timeout_secs == 0) is a debug-only affordance and never
         // compiled into a release build; Config::from_env clamps 0 to the
@@ -1135,18 +1419,12 @@ async fn run_claude(
         #[cfg(not(debug_assertions))]
         let unlimited = false;
 
-        let output = if unlimited {
-            // kill_on_drop still reaps the child if this future is dropped.
-            match child.wait_with_output().await {
-                Ok(o) => o,
-                Err(e) => return Err((StatusCode::BAD_GATEWAY, format!("claude io error: {e}"))),
-            }
+        // kill_on_drop reaps the child if this future is dropped (timeout / task abort).
+        let terminal = if unlimited {
+            read_lines.await?
         } else {
-            match timeout(Duration::from_secs(cfg.timeout_secs), child.wait_with_output()).await {
-                Ok(Ok(o)) => o,
-                Ok(Err(e)) => {
-                    return Err((StatusCode::BAD_GATEWAY, format!("claude io error: {e}")))
-                }
+            match timeout(Duration::from_secs(cfg.timeout_secs), read_lines).await {
+                Ok(r) => r?,
                 Err(_) => {
                     return Err((
                         StatusCode::GATEWAY_TIMEOUT,
@@ -1159,15 +1437,24 @@ async fn run_claude(
             }
         };
 
-        // Cap captured output so one pathological run can't bloat memory. The
-        // envelope the bridge parses is kilobytes; truncating multi-MB stdout
-        // before the lossy decode is safe (a split multibyte char becomes U+FFFD).
-        let stdout_cap = output.stdout.len().min(MAX_OUTPUT_BYTES);
-        let stderr_cap = output.stderr.len().min(MAX_OUTPUT_BYTES);
-        let stdout = String::from_utf8_lossy(&output.stdout[..stdout_cap]);
-        let stderr = String::from_utf8_lossy(&output.stderr[..stderr_cap]);
-        match interpret_claude_output(&stdout, &stderr, output.status.success()) {
-            ClaudeOutcome::Ok { result, session_id } => return Ok((result, session_id)),
+        // Reap the child and collect its stderr for the no-`result` fallback.
+        let _ = child.wait().await;
+        let stderr = stderr_task.await.unwrap_or_default();
+
+        // The terminal `result` line classifies the run; if the stream ended
+        // without one (crash, killed, non-JSON noise only), fall back to the
+        // buffered interpreter over the captured stderr — always a Fatal here,
+        // since a healthy turn always emits a `result`.
+        let outcome = match terminal {
+            Some(o) => o,
+            None => interpret_claude_output("", &stderr, false),
+        };
+
+        match outcome {
+            ClaudeOutcome::Ok { result, session_id } => {
+                // Match the old 4 MiB storage bound on the persisted reply.
+                return Ok((truncate_chars(&result, MAX_OUTPUT_BYTES), session_id));
+            }
             ClaudeOutcome::Fatal { message } => return Err((StatusCode::BAD_GATEWAY, message)),
             ClaudeOutcome::Retryable { message, status } => {
                 if attempt < MAX_ATTEMPTS {
@@ -1175,6 +1462,9 @@ async fn run_claude(
                         "claude transient failure (status {status}, attempt \
                          {attempt}/{MAX_ATTEMPTS}): {message} — retrying"
                     );
+                    // The whole prompt re-runs; clear any partial accumulation so
+                    // a reconnecting subscriber doesn't see a doubled buffer.
+                    jobs.stream_reset(job_id);
                     // Short linear backoff: 1s after attempt 1, 2s after attempt 2.
                     tokio::time::sleep(Duration::from_secs(attempt as u64)).await;
                     continue;
@@ -1186,7 +1476,7 @@ async fn run_claude(
     }
 
     // The loop returns on the last attempt regardless of outcome.
-    unreachable!("run_claude exhausted its loop without returning")
+    unreachable!("run_claude_streaming exhausted its loop without returning")
 }
 
 // ---- Attachments ----------------------------------------------------------
@@ -1570,6 +1860,9 @@ async fn jesse(
     // Opportunistic sweep so the map can't grow unbounded between requests.
     st.jobs.evict_expired();
     let job_id = st.jobs.create();
+    // Open the live stream before spawning so a phone that opens
+    // `GET /jesse/stream/{job_id}` immediately finds the broadcast channel.
+    st.jobs.stream_register(&job_id);
 
     // Run the turn on its OWN task that owns the child. Dropping this request
     // future (the phone suspends, the socket drops) does not cancel a spawned
@@ -1586,8 +1879,24 @@ async fn jesse(
         // files therefore survive run_claude's internal retries and are cleaned
         // exactly once, here.
         let _scratch = scratch;
-        let outcome = run_claude(&cfg, &prompt, sid.as_deref()).await;
+        let outcome = run_claude_streaming(&cfg, &prompt, sid.as_deref(), &jobs, &jid).await;
         jobs.complete(&jid, outcome);
+        // Close the live stream with the frame matching the state that actually
+        // landed. `complete` is write-once, so a cancel that won the race already
+        // set `Cancelled` (and `cancel` already emitted that frame + removed the
+        // stream entry, making this a no-op). Reading the post-`complete` state
+        // keeps the terminal frame and the stored result perfectly consistent.
+        match jobs.get(&jid) {
+            Some(JobState::Done {
+                response,
+                session_id,
+            }) => jobs.stream_finish(&jid, StreamFrame::Done { response, session_id }),
+            Some(JobState::Failed { error }) => {
+                jobs.stream_finish(&jid, StreamFrame::Error(error))
+            }
+            Some(JobState::Cancelled) => jobs.stream_finish(&jid, StreamFrame::Cancelled),
+            _ => {}
+        }
     });
 
     // Store the task's abort handle so `POST /jesse/cancel/{id}` can stop it.
@@ -1713,6 +2022,162 @@ async fn jesse_cancel(
     Ok(StatusCode::NO_CONTENT)
 }
 
+// ---- Live streaming (SSE) -------------------------------------------------
+
+/// How many SSE events can queue toward one client before its forwarder applies
+/// backpressure. Small: the forwarder uses `send().await`, and the broadcast
+/// backlog (`STREAM_CHANNEL_CAP`) is the real buffer.
+const SSE_FORWARD_BUFFER: usize = 64;
+
+/// The SSE response body: a thin `Stream` over an mpsc receiver fed by a
+/// forwarder task (or pre-seeded with terminal frames). tokio's `mpsc::Receiver`
+/// exposes `poll_recv`, so this needs only `futures_core::Stream` — no extra
+/// stream-adapter dependency. The error type is `Infallible`: a dropped client
+/// just ends the stream, it never errors.
+struct SseBody {
+    rx: mpsc::Receiver<Result<Event, std::convert::Infallible>>,
+}
+
+impl Stream for SseBody {
+    type Item = Result<Event, std::convert::Infallible>;
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<Option<Self::Item>> {
+        self.rx.poll_recv(cx)
+    }
+}
+
+/// Build a named SSE event whose data is a single-line JSON object. JSON-encoding
+/// the payload guarantees no raw newline/CR ever reaches `Event::data` (which
+/// would split the frame or panic), and keeps one logical frame == one `data:`.
+fn sse_event(kind: &str, data: Value) -> Event {
+    Event::default().event(kind).data(data.to_string())
+}
+
+/// A `reset` frame carrying the full text the client should now show. Used for
+/// the initial replay of text-so-far and to re-sync a subscriber that lagged the
+/// broadcast backlog — the client REPLACES its buffer with this, vs appending a
+/// `delta`.
+fn sse_reset(text: &str) -> Event {
+    sse_event("reset", json!({ "text": text }))
+}
+
+/// Translate a broadcast `StreamFrame` into its wire SSE event.
+fn frame_to_event(frame: &StreamFrame) -> Event {
+    match frame {
+        StreamFrame::Delta(text) => sse_event("delta", json!({ "text": text })),
+        StreamFrame::Activity(name) => sse_event("activity", json!({ "name": name })),
+        StreamFrame::Done {
+            response,
+            session_id,
+        } => sse_event(
+            "done",
+            json!({ "response": response, "session_id": session_id }),
+        ),
+        StreamFrame::Error(error) => sse_event("error", json!({ "error": error })),
+        StreamFrame::Cancelled => sse_event("cancelled", json!({})),
+    }
+}
+
+/// `GET /jesse/stream/:job_id` — Server-Sent Events for one turn. Same bearer
+/// auth as `/jesse`. The phone opens this after `POST /jesse` hands back a
+/// `job_id` and renders the reply as it streams.
+///
+/// On subscribe to a RUNNING job: replay the text accumulated so far (a `reset`
+/// frame) plus the latest activity, then forward live frames — `delta`,
+/// `activity`, and one terminal `done` / `error` / `cancelled`. If the job is
+/// already TERMINAL when the stream opens, emit the matching terminal frame
+/// immediately (replaying full text + `done` for a finished turn) and close.
+/// Unknown/expired id → 404. `GET /jesse/result/:job_id` remains the poll
+/// fallback and is unaffected.
+async fn jesse_stream(
+    State(st): State<AppState>,
+    UrlPath(job_id): UrlPath<String>,
+    headers: HeaderMap,
+) -> Result<Response, ApiError> {
+    check_auth(&headers, &st.cfg.token)?;
+    st.jobs.evict_expired();
+
+    let (tx, rx) = mpsc::channel::<Result<Event, std::convert::Infallible>>(SSE_FORWARD_BUFFER);
+
+    if let Some((text, activity, mut brx)) = st.jobs.stream_subscribe(&job_id) {
+        // Live job: replay text-so-far (+ any activity), then forward broadcast
+        // frames on a task that ends when the terminal frame arrives or the
+        // client goes away (the mpsc send fails once the response body is dropped).
+        let _ = tx.try_send(Ok(sse_reset(&text)));
+        if let Some(name) = activity {
+            let _ = tx.try_send(Ok(sse_event("activity", json!({ "name": name }))));
+        }
+        let jobs = st.jobs.clone();
+        let jid = job_id.clone();
+        tokio::spawn(async move {
+            loop {
+                match brx.recv().await {
+                    Ok(frame) => {
+                        let terminal = matches!(
+                            frame,
+                            StreamFrame::Done { .. } | StreamFrame::Error(_) | StreamFrame::Cancelled
+                        );
+                        if tx.send(Ok(frame_to_event(&frame))).await.is_err() {
+                            break; // client disconnected
+                        }
+                        if terminal {
+                            break;
+                        }
+                    }
+                    // Fell behind the backlog — re-sync by resending the full
+                    // accumulated text, so no delta is silently lost.
+                    Err(broadcast::error::RecvError::Lagged(_)) => {
+                        let snapshot = jobs.stream_snapshot(&jid).unwrap_or_default();
+                        if tx.send(Ok(sse_reset(&snapshot))).await.is_err() {
+                            break;
+                        }
+                    }
+                    // Sender dropped without a terminal frame (e.g. the bridge is
+                    // shutting down). End the stream; the client falls back to poll.
+                    Err(broadcast::error::RecvError::Closed) => break,
+                }
+            }
+        });
+    } else {
+        // No live stream — the job is already terminal (or never existed). Emit
+        // the matching frame and close. `get_retrieving` so an already-`done`
+        // job opened only via the stream still starts its post-fetch grace.
+        match st.jobs.get_retrieving(&job_id) {
+            Some(JobState::Done {
+                response,
+                session_id,
+            }) => {
+                let _ = tx.try_send(Ok(sse_reset(&response)));
+                let _ = tx.try_send(Ok(sse_event(
+                    "done",
+                    json!({ "response": response, "session_id": session_id }),
+                )));
+            }
+            Some(JobState::Failed { error }) => {
+                let _ = tx.try_send(Ok(sse_event("error", json!({ "error": error }))));
+            }
+            Some(JobState::Cancelled) => {
+                let _ = tx.try_send(Ok(sse_event("cancelled", json!({}))));
+            }
+            // Running without a stream handle shouldn't happen (the handle is
+            // registered before the turn spawns and removed only at the terminal
+            // transition), but if it does, send nothing and let the client poll.
+            Some(JobState::Running) => {}
+            None => {
+                return Err((
+                    StatusCode::NOT_FOUND,
+                    "unknown or expired job id".to_string(),
+                ))
+            }
+        }
+        // `tx` drops here (not moved into a task), so the stream ends once the
+        // queued terminal frames have been read.
+    }
+
+    Ok(Sse::new(SseBody { rx })
+        .keep_alive(KeepAlive::default())
+        .into_response())
+}
+
 // ---- Startup --------------------------------------------------------------
 
 /// Percent-encode a query-parameter value, keeping only RFC 3986 unreserved
@@ -1766,6 +2231,7 @@ fn app(state: AppState) -> Router {
         .route("/jesse", post(jesse))
         .route("/jesse/prompts", get(jesse_prompts))
         .route("/jesse/result/:job_id", get(jesse_result))
+        .route("/jesse/stream/:job_id", get(jesse_stream))
         .route("/jesse/cancel/:job_id", post(jesse_cancel))
         .layer(DefaultBodyLimit::max(body_limit))
         .with_state(state)
@@ -2940,6 +3406,215 @@ mod tests {
 
         let _ = std::fs::remove_file(&marker);
         let _ = std::fs::remove_file(&fake);
+    }
+
+    // ---- streaming: stream-json line parser -------------------------------
+    //
+    // Fixtures captured from a real `claude --output-format stream-json
+    // --verbose --include-partial-messages` run (see bridge/README.md). The
+    // parser is pure, so these need no process.
+
+    #[test]
+    fn parse_text_delta_is_extracted() {
+        let line = r#"{"type":"stream_event","event":{"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":"Hello "}},"session_id":"s"}"#;
+        match parse_stream_line(line) {
+            StreamEvent::TextDelta(t) => assert_eq!(t, "Hello "),
+            other => panic!("expected TextDelta, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_thinking_delta_is_ignored() {
+        // Thinking streams as `thinking_delta`/`signature_delta`, never as the
+        // visible answer — it must NOT be accumulated.
+        let thinking = r#"{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"pondering"}}}"#;
+        assert!(matches!(parse_stream_line(thinking), StreamEvent::Ignore));
+        let sig = r#"{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":"abc"}}}"#;
+        assert!(matches!(parse_stream_line(sig), StreamEvent::Ignore));
+    }
+
+    #[test]
+    fn parse_tool_use_start_is_activity() {
+        let line = r#"{"type":"stream_event","event":{"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"toolu_1","name":"Read","input":{}}}}"#;
+        match parse_stream_line(line) {
+            StreamEvent::ToolActivity { name } => assert_eq!(name, "Read"),
+            other => panic!("expected ToolActivity, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_terminal_result_ok() {
+        let line = r#"{"type":"result","subtype":"success","is_error":false,"result":"the answer","session_id":"sess-9"}"#;
+        match parse_stream_line(line) {
+            StreamEvent::Done(ClaudeOutcome::Ok { result, session_id }) => {
+                assert_eq!(result, "the answer");
+                assert_eq!(session_id.as_deref(), Some("sess-9"));
+            }
+            other => panic!("expected Done(Ok), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_terminal_result_5xx_is_retryable() {
+        let line = r#"{"type":"result","subtype":"error","is_error":true,"api_error_status":529,"result":"overloaded"}"#;
+        match parse_stream_line(line) {
+            StreamEvent::Done(ClaudeOutcome::Retryable { status, .. }) => assert_eq!(status, 529),
+            other => panic!("expected Done(Retryable), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_terminal_result_4xx_is_fatal() {
+        let line = r#"{"type":"result","is_error":true,"api_error_status":400,"result":"bad request"}"#;
+        match parse_stream_line(line) {
+            StreamEvent::Done(ClaudeOutcome::Fatal { message }) => assert!(message.contains("bad request")),
+            other => panic!("expected Done(Fatal), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_non_json_and_noise_lines_are_ignored() {
+        assert!(matches!(parse_stream_line("not json at all"), StreamEvent::Ignore));
+        assert!(matches!(parse_stream_line("   "), StreamEvent::Ignore));
+        let init = r#"{"type":"system","subtype":"init","session_id":"s","tools":[]}"#;
+        assert!(matches!(parse_stream_line(init), StreamEvent::Ignore));
+        let rate = r#"{"type":"rate_limit_event","rate_limit_info":{"status":"allowed"}}"#;
+        assert!(matches!(parse_stream_line(rate), StreamEvent::Ignore));
+    }
+
+    #[test]
+    fn build_claude_args_requests_partial_stream_json() {
+        // The streaming contract: stream-json + the two flags `claude` requires
+        // for token-level deltas under `-p`.
+        let args = build_claude_args(&test_config(), "hi", None);
+        let pos = |needle: &str| args.iter().position(|a| a == needle);
+        let of = pos("--output-format").expect("--output-format present");
+        assert_eq!(args[of + 1], "stream-json");
+        assert!(pos("--verbose").is_some(), "stream-json + -p requires --verbose");
+        assert!(
+            pos("--include-partial-messages").is_some(),
+            "token-level deltas require --include-partial-messages"
+        );
+    }
+
+    // ---- streaming: GET /jesse/stream/:job_id (SSE) -----------------------
+
+    fn stream_request(auth: Option<&str>, job_id: &str) -> Request<Body> {
+        let mut b = Request::builder()
+            .method("GET")
+            .uri(format!("/jesse/stream/{job_id}"));
+        if let Some(a) = auth {
+            b = b.header("authorization", a);
+        }
+        b.body(Body::empty()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn stream_no_auth_is_401() {
+        let resp = app(test_state())
+            .oneshot(stream_request(None, "whatever"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn stream_unknown_id_is_404() {
+        let resp = app(test_state())
+            .oneshot(stream_request(Some("Bearer test-token"), "does-not-exist"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn stream_running_turn_emits_deltas_then_done() {
+        // A fake claude that emits two text deltas (with a pause between, so the
+        // turn is still running when the phone subscribes) then a terminal result.
+        let script = "#!/bin/sh\n\
+             printf '%s\\n' '{\"type\":\"stream_event\",\"event\":{\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\"Hello \"}}}'\n\
+             sleep 1\n\
+             printf '%s\\n' '{\"type\":\"stream_event\",\"event\":{\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\"world\"}}}'\n\
+             printf '%s\\n' '{\"type\":\"result\",\"is_error\":false,\"result\":\"Hello world\",\"session_id\":\"sess-1\"}'\n";
+        let fake = write_fake_claude(script);
+        let cfg = Config {
+            claude_bin: fake.to_string_lossy().into_owned(),
+            grace_secs: 0, // return 202 immediately so we can stream the live turn
+            ..test_config()
+        };
+        let st = AppState::new(cfg);
+
+        let resp = app(st.clone())
+            .oneshot(jesse_request(
+                Some("Bearer test-token"),
+                r#"{"mode":"ask","text":"greet me"}"#,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::ACCEPTED);
+        let body: Value = serde_json::from_str(&body_string(resp).await).unwrap();
+        let job_id = body["job_id"].as_str().unwrap().to_string();
+
+        // Open the stream while the turn runs; collect the whole SSE body (it ends
+        // when the terminal `done` frame closes the stream).
+        let resp = app(st.clone())
+            .oneshot(stream_request(Some("Bearer test-token"), &job_id))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let sse = body_string(resp).await;
+
+        // Live "world" delta arrives over the broadcast (the turn was still
+        // running at subscribe), then the authoritative done frame.
+        assert!(sse.contains("event: delta"), "expected a live delta frame: {sse}");
+        assert!(sse.contains("world"), "delta text missing: {sse}");
+        assert!(sse.contains("event: done"), "expected a terminal done frame: {sse}");
+        assert!(sse.contains("Hello world"), "final response missing: {sse}");
+        assert!(sse.contains("sess-1"), "session id missing: {sse}");
+
+        let _ = std::fs::remove_file(&fake);
+    }
+
+    #[tokio::test]
+    async fn stream_already_done_replays_full_text_then_done() {
+        // A job that finished before the stream is opened must replay the full
+        // text (a reset frame) and a done frame immediately, then close — no
+        // fake claude needed.
+        let st = test_state();
+        let id = st.jobs.create();
+        st.jobs.complete(
+            &id,
+            Ok(("the whole answer".to_string(), Some("sess-done".to_string()))),
+        );
+
+        let resp = app(st.clone())
+            .oneshot(stream_request(Some("Bearer test-token"), &id))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let sse = body_string(resp).await;
+        assert!(sse.contains("event: reset"), "expected a full-text reset: {sse}");
+        assert!(sse.contains("event: done"), "expected a done frame: {sse}");
+        assert!(sse.contains("the whole answer"), "full text missing: {sse}");
+        assert!(sse.contains("sess-done"), "session id missing: {sse}");
+    }
+
+    #[tokio::test]
+    async fn stream_cancelled_job_emits_cancelled_frame() {
+        // A cancelled job surfaces a clean `cancelled` terminal frame, not an error.
+        let st = test_state();
+        let id = st.jobs.create();
+        st.jobs.stream_register(&id);
+        assert!(matches!(st.jobs.cancel(&id), CancelOutcome::Cancelled));
+
+        let resp = app(st.clone())
+            .oneshot(stream_request(Some("Bearer test-token"), &id))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let sse = body_string(resp).await;
+        assert!(sse.contains("event: cancelled"), "expected a cancelled frame: {sse}");
+        assert!(!sse.contains("event: error"), "cancel must not look like an error: {sse}");
     }
 
     #[tokio::test]

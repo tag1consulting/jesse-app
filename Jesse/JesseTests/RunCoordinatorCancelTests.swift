@@ -37,6 +37,12 @@ final class RunCoordinatorCancelTests: XCTestCase {
             onCancelJob?(jobId)
         }
 
+        // No live stream in these cancel tests — finish immediately so `consume`
+        // falls straight through to the poll loop the tests drive by hand.
+        func stream(jobId: String) -> AsyncThrowingStream<JesseStreamEvent, Error> {
+            AsyncThrowingStream { $0.finish() }
+        }
+
         /// Resolve the parked `result` call with a completed reply.
         func resolveDone(_ text: String) {
             continuation?.resume(returning: .done(JesseReply(text: text, sessionId: nil)))

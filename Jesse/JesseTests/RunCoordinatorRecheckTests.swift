@@ -40,6 +40,12 @@ final class RunCoordinatorRecheckTests: XCTestCase {
         }
 
         func cancelJob(jobId: String) async throws {}
+
+        // No live stream — finishes immediately so `consume` falls back to poll,
+        // which is what these tests exercise.
+        func stream(jobId: String) -> AsyncThrowingStream<JesseStreamEvent, Error> {
+            AsyncThrowingStream { $0.finish() }
+        }
     }
 
     @MainActor
@@ -150,6 +156,10 @@ final class RunCoordinatorRecheckTests: XCTestCase {
         }
 
         func cancelJob(jobId: String) async throws {}
+
+        func stream(jobId: String) -> AsyncThrowingStream<JesseStreamEvent, Error> {
+            AsyncThrowingStream { $0.finish() }
+        }
     }
 
     @MainActor

@@ -49,6 +49,13 @@ final class RunCoordinator {
     private(set) var errors: [UUID: String] = [:]
     // threadID → in-flight bridge job, persisted so it survives a kill.
     private(set) var inFlight: [UUID: InFlightJob] = [:]
+    // threadID → reply text streamed so far, rendered live under the spinner
+    // until the turn finishes (then it's cleared and the real Turn is appended).
+    // Transient and in-memory only — the persisted transcript is the source of
+    // truth; the SSE stream replays this on reconnect.
+    private(set) var partialText: [UUID: String] = [:]
+    // threadID → a coarse "what Jesse is doing" line from tool-use events.
+    private(set) var activity: [UUID: String] = [:]
 
     // Not observed by views — just lifecycle bookkeeping.
     @ObservationIgnored private var tasks: [UUID: Task<Void, Never>] = [:]
@@ -98,6 +105,12 @@ final class RunCoordinator {
     func startDate(for threadID: UUID) -> Date? { startDates[threadID] }
     func error(for threadID: UUID) -> String? { errors[threadID] }
     func clearError(for threadID: UUID) { errors[threadID] = nil }
+
+    /// The reply text streamed so far for a running turn (nil/empty when nothing
+    /// has arrived yet). Rendered live in the transcript while `isRunning`.
+    func partialText(for threadID: UUID) -> String? { partialText[threadID] }
+    /// The current coarse activity line (e.g. "Reading the vault…"), if any.
+    func activity(for threadID: UUID) -> String? { activity[threadID] }
 
     // MARK: - Send
 
@@ -171,8 +184,9 @@ final class RunCoordinator {
                     self.finish(threadID: threadID, reply: reply, voice: voice, context: context)
                 case .running(let jobId):
                     self.persist(threadID: threadID, job: InFlightJob(jobId: jobId, voice: voice))
-                    await self.poll(threadID: threadID, jobId: jobId, voice: voice,
-                                    client: client, context: context)
+                    // Stream the turn live; fall back to polling on any drop.
+                    await self.consume(threadID: threadID, jobId: jobId, voice: voice,
+                                       client: client, context: context)
                 }
             } catch is CancellationError {
                 self.clearRun(threadID)
@@ -244,14 +258,85 @@ final class RunCoordinator {
         tasks[threadID] = Task { [weak self] in
             guard let self else { return }
             let client = self.makeClient(cfg)
-            await self.poll(threadID: threadID, jobId: job.jobId, voice: job.voice,
-                            client: client, context: context)
+            // Reconnect the stream — the bridge replays the text-so-far, so a
+            // foregrounded turn picks up live where it left off — with the same
+            // poll fallback if streaming isn't available.
+            await self.consume(threadID: threadID, jobId: job.jobId, voice: job.voice,
+                               client: client, context: context)
             self.tasks[threadID] = nil
             self.endBackground(threadID)
         }
     }
 
     // MARK: - Internals
+
+    /// Consume the live SSE stream for a running turn, rendering text as it
+    /// arrives, then **fall back to polling** if the stream drops without a
+    /// terminal frame (phone suspended, connection blipped, or an older bridge
+    /// without the endpoint). Terminal frames finish the turn exactly as the poll
+    /// path would: `done` appends the single persisted `Turn` and clears the
+    /// partial buffer; a bridge `error` is recoverable (job retained for
+    /// Re-check); a `cancelled` frame matches a cancel the user already made — no
+    /// `Turn`, no error. A user Cancel cancels this task, which tears down the
+    /// `AsyncThrowingStream` and drops the SSE connection.
+    private func consume(threadID: UUID, jobId: String, voice: Bool,
+                         client: any JesseClientProtocol, context: ModelContext) async {
+        var sawTerminal = false
+        do {
+            for try await event in client.stream(jobId: jobId) {
+                if Task.isCancelled { return }
+                switch event {
+                case .reset(let text):
+                    partialText[threadID] = text
+                case .delta(let chunk):
+                    partialText[threadID, default: ""] += chunk
+                case .activity(let tool):
+                    activity[threadID] = Self.activityLabel(for: tool)
+                case .done(let reply):
+                    sawTerminal = true
+                    finish(threadID: threadID, reply: reply, voice: voice, context: context)
+                    return
+                case .failed(let message):
+                    // The bridge ran the turn and reported a failure mid-stream —
+                    // keep the job retained so Re-check/poll can pick it back up.
+                    sawTerminal = true
+                    failRecoverable(threadID: threadID, message: message, voice: voice)
+                    return
+                case .cancelled:
+                    // The user cancelled (the only source of this frame). cancel()
+                    // already tore the run down; just make sure nothing lingers.
+                    sawTerminal = true
+                    clearRun(threadID)
+                    return
+                }
+            }
+        } catch {
+            // Stream dropped/failed — fall through to the poll fallback below.
+            if Task.isCancelled { return }
+        }
+        if Task.isCancelled { return }
+        // The stream ended without a terminal frame: hand off to polling, which
+        // owns the same finish/fail/expire logic. Clear the partial so the poll's
+        // finished `Turn` is the only rendering (no stale half-reply alongside it).
+        if !sawTerminal {
+            partialText[threadID] = nil
+            activity[threadID] = nil
+            await poll(threadID: threadID, jobId: jobId, voice: voice,
+                       client: client, context: context)
+        }
+    }
+
+    /// Map a coarse tool name from a `tool_use` event to a human activity line.
+    private static func activityLabel(for tool: String) -> String {
+        switch tool {
+        case "Read", "Glob", "Grep": return "Reading the vault…"
+        case "Write", "Edit", "NotebookEdit": return "Writing a file…"
+        case "Bash": return "Running a command…"
+        case "WebFetch", "WebSearch": return "Searching the web…"
+        case "Task": return "Working on it…"
+        default: return "Using \(tool)…"
+        }
+    }
 
     /// Poll `GET /jesse/result/{jobId}` until the turn resolves. The job_id is
     /// always retained on a non-terminal failure here (dropped socket, timeout,
@@ -334,6 +419,10 @@ final class RunCoordinator {
     private func failRecoverable(threadID: UUID, message: String, voice: Bool) {
         errors[threadID] = message
         startDates[threadID] = nil
+        // The live view stops (no longer running); drop any half-streamed text so
+        // it isn't left dangling. A Re-check/resume reconnects and replays it.
+        partialText[threadID] = nil
+        activity[threadID] = nil
         if voice { Speaker.shared.speak("Sorry, that didn't work yet. " + message) }
     }
 
@@ -350,9 +439,12 @@ final class RunCoordinator {
         InFlightStore.save(inFlight)
     }
 
-    /// Clear all transient + persisted run state for a thread.
+    /// Clear all transient + persisted run state for a thread, including any live
+    /// stream buffer (so a finished/cancelled turn leaves no half-streamed text).
     private func clearRun(_ threadID: UUID) {
         startDates[threadID] = nil
+        partialText[threadID] = nil
+        activity[threadID] = nil
         if inFlight[threadID] != nil {
             inFlight[threadID] = nil
             InFlightStore.save(inFlight)

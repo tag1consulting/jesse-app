@@ -147,6 +147,116 @@ Only the finished result and its timing metadata are written — **never** the b
 token or any secret. Running jobs aren't persisted (there's no result yet). Set
 `JESSE_STATE_DIR=` (empty) to disable persistence and run in-memory only.
 
+## Live streaming (SSE)
+
+A turn's reply streams to the phone token-by-token instead of arriving all at
+once. This is **additive** — the 202 / poll / persist / resume path above is
+unchanged and remains the fallback whenever a stream can't be held (phone
+suspended, connection blip, an older client).
+
+### How `claude` is run
+
+The bridge runs the turn as:
+
+```
+claude -p <prompt> --output-format stream-json --verbose --include-partial-messages …
+```
+
+Verified facts about that output (run it yourself to confirm — it's `claude`'s
+format, not ours):
+
+- `--verbose` is **required**: `claude` errors with *"When using --print,
+  --output-format=stream-json requires --verbose"* otherwise.
+- Output is **NDJSON** — one JSON object per line. The bridge reads stdout **line
+  by line** (`BufReader::lines`) as tokens arrive, rather than buffering the whole
+  run with `wait_with_output()`.
+- The lines the bridge cares about (everything else is ignored — `system`/init,
+  `rate_limit_event`, message-envelope events, thinking/signature deltas, tool
+  input deltas):
+  - **Text delta** (the visible answer, token-level under
+    `--include-partial-messages`):
+    `{"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"text_delta","text":"…"}}}`
+    Thinking streams as `thinking_delta`/`signature_delta` and is deliberately
+    **excluded** — only `text_delta` inside a `text` block is the answer.
+  - **Tool use** (drives the activity hint):
+    `{"type":"stream_event","event":{"type":"content_block_start","content_block":{"type":"tool_use","name":"Read",…}}}`
+  - **Terminal result** (the one line that decides the turn):
+    `{"type":"result","is_error":false,"result":"…","session_id":"…"}` —
+    `is_error` / `api_error_status` carry transient (5xx/429/529 → retry) vs fatal
+    failures. This feeds the **same** `Ok`/`Retryable`/`Fatal` classification the
+    buffered path always used (`classify_result_value`), so retry/timeout/
+    3-attempt behavior is preserved. The classified result — **not** the streamed
+    deltas — is the authoritative text returned and persisted.
+
+`parse_stream_line` maps one NDJSON line to an internal `StreamEvent`
+(`TextDelta` / `ToolActivity` / `Done` / `Ignore`) and is pure, so it's unit-tested
+against captured fixtures.
+
+### `GET /jesse/stream/:job_id`
+
+Server-Sent Events for one turn. Same bearer auth as `/jesse`. Open it with the
+`job_id` from `POST /jesse`.
+
+```bash
+curl -N http://127.0.0.1:8765/jesse/stream/<job_id> \
+  -H "Authorization: Bearer $JESSE_TOKEN"
+```
+
+Frames are `event:`/`data:` pairs; each `data:` is a one-line JSON object:
+
+| `event:` | `data:` | Meaning |
+|---|---|---|
+| `reset` | `{"text":"…"}` | **Replace** the shown text with this. Sent first (replay of text-so-far) and to re-sync after a lag. |
+| `delta` | `{"text":"…"}` | **Append** this chunk. |
+| `activity` | `{"name":"Read"}` | Coarse tool-use hint ("reading the vault…"). |
+| `done` | `{"response":"…","session_id":"…"}` | Terminal: final authoritative text + session id. |
+| `error` | `{"error":"…"}` | Terminal: the turn failed. |
+| `cancelled` | `{}` | Terminal: the turn was cancelled (`POST /jesse/cancel`). Surfaced cleanly, not as an error. |
+
+- On subscribe to a **running** job: the accumulated text-so-far is replayed as a
+  `reset` (so a phone that opens the stream a beat late, or reconnects after a
+  blip, doesn't lose the beginning), then live frames follow.
+- If the job is **already terminal** when the stream opens, the matching terminal
+  frame is emitted immediately and the stream closes — including replaying full
+  text + `done` for a finished turn, and `cancelled` for a cancelled one.
+- Unknown / expired id → **404**.
+
+`GET /jesse/result/:job_id` is untouched and remains the **poll fallback**.
+
+### Design (broadcast + accumulate)
+
+Each running job gets an in-memory `StreamHandle` on the `JobStore` — a
+`tokio::sync::broadcast` sender plus the **text accumulated so far** and the last
+activity hint. It mirrors the per-job `aborts` map from the cancel work, with the
+same lock discipline: the `streams`, `jobs`, and `aborts` mutexes are **never held
+simultaneously**. The accumulated buffer is **in-memory only** (for replay to a
+late/reconnecting subscriber) and is **never persisted** — only the terminal
+result persists, via `complete`. The handle is created when the turn is
+registered and removed on the terminal transition.
+
+Terminal frames are **write-once**, mirroring the job state: whichever of the
+turn task (`done`/`error`) and `cancel` (`cancelled`) reaches `stream_finish`
+first wins; the other no-ops. So a turn finishing in the same instant it's
+cancelled can't emit a `done` over a `cancelled` (or vice-versa) — the frame and
+the stored result always agree.
+
+The SSE response body is a small `Stream` over a `tokio::sync::mpsc` receiver fed
+by a per-subscriber forwarder task (only `futures_core::Stream` is named — already
+in the dependency graph via axum, so no new compiled code). If a subscriber lags
+the broadcast backlog, the forwarder re-sends the full accumulated text as a
+`reset` rather than dropping deltas, so correctness never depends on the channel
+capacity.
+
+### When does the phone stream vs. poll?
+
+`POST /jesse` is unchanged: it still holds the connection up to `JESSE_GRACE_SECS`
+and returns the inline `200` (with the full reply) if the turn finishes inside
+that window, else `202 {job_id, status:"running"}`. The phone **streams on the
+`202` path** and renders the reply live; a sub-grace turn returns inline and needs
+no streaming. **Lower `JESSE_GRACE_SECS`** (e.g. `1`) to start streaming sooner —
+the bridge returns `202` quickly and the phone picks up the live tokens (the
+`reset` replays anything produced before it subscribed, so nothing is lost).
+
 ## Voice requests
 
 The `/jesse` body accepts an optional `"voice": true` flag. When set, the prompt
@@ -235,7 +345,7 @@ one reweakens it by accident.
 | `JESSE_ADVERTISE_HOST` | value of `JESSE_BIND` | Host written into the pairing QR — set to the MagicDNS `ts.net` name to advertise that instead of the bound IP |
 | `JESSE_PORT` | `8765` | Port |
 | `JESSE_TIMEOUT` | `3600` | Per-request run limit (seconds), clamped to `1..=7200`. `0` is treated as the 7200s ceiling, not unlimited. On overrun the turn returns `504` with an actionable message naming this var |
-| `JESSE_GRACE_SECS` | `10` | How long `POST /jesse` holds the connection for the inline fast path before returning `202` and letting the client poll `GET /jesse/result/{job_id}` |
+| `JESSE_GRACE_SECS` | `10` | How long `POST /jesse` holds the connection for the inline fast path before returning `202`. On `202` the phone streams live tokens (`GET /jesse/stream/{job_id}`) and/or polls (`GET /jesse/result/{job_id}`). Lower it (e.g. `1`) to start streaming sooner |
 | `JESSE_JOB_TTL_SECS` | `86400` | How long a finished-but-**unfetched** reply stays retrievable (24h). The clock starts at first retrieval, not at completion |
 | `JESSE_RETRIEVAL_GRACE_SECS` | `600` | How much longer a reply is kept **after** its first retrieval (a short re-poll window) instead of the full TTL |
 | `JESSE_STATE_DIR` | `~/.jesse-bridge` | Where completed results are persisted (`<dir>/jobs`) so a restart doesn't lose a reply. Empty disables persistence |
@@ -249,7 +359,8 @@ address without the override.
 
 - Put it behind `tailscale serve` for real TLS + a stable hostname.
 - Add `--resume`/`--session-id` plumbing if you want richer thread control.
-- Stream with `--output-format stream-json` for live token output.
+- ~~Stream with `--output-format stream-json` for live token output.~~ Done — see
+  [Live streaming (SSE)](#live-streaming-sse).
 
 ## Connector caveat
 

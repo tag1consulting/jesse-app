@@ -75,6 +75,25 @@ struct ThreadDetailView: View {
                         TurnRow(turn: turn)
                             .id(turn.id)
                     }
+                    // Live, streaming reply: the partial text as it arrives, plus
+                    // a coarse activity line under the spinner. Cleared and
+                    // replaced by the persisted Turn the instant the turn finishes.
+                    if running {
+                        let partial = coordinator.partialText(for: thread.id) ?? ""
+                        if !partial.isEmpty {
+                            MarkdownText(partial)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                        }
+                        if let activity = coordinator.activity(for: thread.id) {
+                            HStack(spacing: 6) {
+                                ProgressView().controlSize(.small)
+                                Text(activity)
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                            }
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                        }
+                    }
                     if let error = coordinator.error(for: thread.id) {
                         let recheckable = coordinator.canRecheck(thread.id)
                         VStack(alignment: .leading, spacing: 8) {
@@ -100,6 +119,8 @@ struct ThreadDetailView: View {
             }
             .onChange(of: turns.count) { _, _ in scrollToBottom(proxy) }
             .onChange(of: running) { _, _ in scrollToBottom(proxy) }
+            // Keep the newest streamed text in view as it grows.
+            .onChange(of: coordinator.partialText(for: thread.id)) { _, _ in scrollToBottom(proxy) }
             .onAppear { scrollToBottom(proxy, animated: false) }
         }
     }

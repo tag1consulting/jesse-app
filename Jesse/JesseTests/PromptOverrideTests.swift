@@ -218,6 +218,10 @@ final class PromptOverrideTests: XCTestCase {
         }
 
         func cancelJob(jobId: String) async throws {}
+
+        func stream(jobId: String) -> AsyncThrowingStream<JesseStreamEvent, Error> {
+            AsyncThrowingStream { $0.finish() }
+        }
     }
 
     @MainActor
