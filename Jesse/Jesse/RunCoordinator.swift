@@ -181,14 +181,33 @@ final class RunCoordinator {
                                                    attachments: attachments)
                 switch result {
                 case .reply(let reply, _):
+                    // Inline reply. The fixed bridge always returns `.running`
+                    // (it hands back the job_id immediately and never holds the
+                    // connection), so this path is effectively dead — kept only so
+                    // an older bridge that still answers inline doesn't break.
                     self.finish(threadID: threadID, reply: reply, voice: voice, context: context)
                 case .running(let jobId):
+                    // The normal path. `persist` runs FIRST, synchronously, so
+                    // `inFlight` is on disk the instant the job_id arrives — before
+                    // `consume` opens a single socket. Any later drop (stream or
+                    // poll, app suspended) is therefore recoverable via Re-check /
+                    // `resume`, because the id was captured up front. This is the
+                    // app half of the orphan fix: the bridge delivers the id early,
+                    // and we persist it before doing anything that can fail.
                     self.persist(threadID: threadID, job: InFlightJob(jobId: jobId, voice: voice))
                     // Stream (display) and poll (completion) run concurrently; see
                     // `consume`. Polling is not a fallback — it owns the reply.
                     await self.consume(threadID: threadID, jobId: jobId, voice: voice,
                                        client: client, context: context)
                 }
+                // Belt-and-suspenders: if `client.send` itself throws (a flaky
+                // connection drops the POST before its response lands), the bridge
+                // may have created the turn with a job_id the phone never saw —
+                // that one turn is unrecoverable without an id. With the immediate
+                // job_id this window is just the single request/response round-trip
+                // (it used to be the whole multi-second grace hold), which is the
+                // point of the fix. See `handle(error:)` for the connection-lost
+                // case where a job_id *was* already retained.
             } catch is CancellationError {
                 self.clearRun(threadID)
             } catch let error as JesseError {

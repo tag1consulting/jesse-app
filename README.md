@@ -235,9 +235,9 @@ see the ATS note in [Known installation problems](#known-installation-problems).
 - **Threads / follow-ups** — staying in a conversation continues its Claude
   session, so follow-up questions keep context. Starting a new thread is a fresh
   session.
-- **Cancel** — long turns (past the bridge's ~10s grace window) keep running on
-  the laptop and the app polls for the result. Cancel returns the thread to idle
-  immediately and discards the in-flight result.
+- **Cancel** — every turn runs on the laptop and the app polls (and streams) for
+  the result by job id; the bridge hands that id back immediately. Cancel returns
+  the thread to idle at once and discards the in-flight result.
 - **Backgrounding** — if you background the app mid-turn, the bridge keeps the
   turn alive; the reply re-attaches when you reopen the app.
 - **Voice / Siri** — "Ask Jesse…" and "Tell Jesse…" Siri phrases route into a new

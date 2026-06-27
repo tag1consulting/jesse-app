@@ -334,10 +334,22 @@ protocol JesseClientProtocol {
 struct JesseClient: JesseClientProtocol {
     var config: JesseConfig
 
+    /// The URLSession every bridge call goes through. Defaults to the shared
+    /// production session (`sharedSession`); injectable purely so the integration
+    /// tests can supply a session backed by a custom `URLProtocol` stub. Nothing
+    /// in production ever passes this, so the default preserves prior behavior
+    /// byte-for-byte.
+    let session: URLSession
+
+    init(config: JesseConfig, session: URLSession = JesseClient.sharedSession) {
+        self.config = config
+        self.session = session
+    }
+
     // Agent runs can exceed any fixed cap — that's the point. Raise both timeouts
     // to a day; the UI's Cancel button is the escape hatch, not a timer. Keep
     // these >= the bridge's JESSE_TIMEOUT so a server timeout (if set) wins.
-    private static let session: URLSession = {
+    static let sharedSession: URLSession = {
         let c = URLSessionConfiguration.default
         c.timeoutIntervalForRequest = 86_400
         c.timeoutIntervalForResource = 86_400
@@ -372,7 +384,7 @@ struct JesseClient: JesseClientProtocol {
 
         let data: Data, resp: URLResponse
         do {
-            (data, resp) = try await Self.session.data(for: req)
+            (data, resp) = try await session.data(for: req)
         } catch {
             throw JesseError.from(error, host: config.normalizedHost)
         }
@@ -392,7 +404,7 @@ struct JesseClient: JesseClientProtocol {
 
         let data: Data, resp: URLResponse
         do {
-            (data, resp) = try await Self.session.data(for: req)
+            (data, resp) = try await session.data(for: req)
         } catch {
             throw JesseError.from(error, host: config.normalizedHost)
         }
@@ -417,7 +429,7 @@ struct JesseClient: JesseClientProtocol {
 
         let data: Data, resp: URLResponse
         do {
-            (data, resp) = try await Self.session.data(for: req)
+            (data, resp) = try await session.data(for: req)
         } catch {
             throw JesseError.from(error, host: config.normalizedHost)
         }
@@ -451,7 +463,7 @@ struct JesseClient: JesseClientProtocol {
 
                     let bytes: URLSession.AsyncBytes, resp: URLResponse
                     do {
-                        (bytes, resp) = try await Self.session.bytes(for: req)
+                        (bytes, resp) = try await session.bytes(for: req)
                     } catch {
                         throw JesseError.from(error, host: config.normalizedHost)
                     }
@@ -476,12 +488,23 @@ struct JesseClient: JesseClientProtocol {
                         if line.isEmpty { flush(); continue }     // frame boundary
                         if line.hasPrefix(":") { continue }       // keep-alive comment
                         if let v = Self.sseField("event:", line) {
+                            // A new `event:` line starts a new frame. We do NOT rely
+                            // on the blank-line separator above to flush the previous
+                            // one: `URLSession.AsyncBytes.lines` *swallows blank
+                            // lines*, so the `line.isEmpty` boundary never fires for
+                            // a real SSE body. Without this, every `data:` would
+                            // accumulate into one blob and only a single garbled
+                            // event would surface at EOF. Flushing on each new event
+                            // (and on EOF) recovers correct per-frame framing whether
+                            // or not the blank line was delivered. Each bridge frame
+                            // carries exactly one `event:` line, so this is exact.
+                            if !eventName.isEmpty { flush() }
                             eventName = v
                         } else if let v = Self.sseField("data:", line) {
                             dataBuf += v
                         }
                     }
-                    flush() // a final frame not followed by a blank line before EOF
+                    flush() // the final frame (no trailing blank line before EOF)
                     continuation.finish()
                 } catch {
                     continuation.finish(throwing: error)
@@ -526,7 +549,7 @@ struct JesseClient: JesseClientProtocol {
 
         let data: Data, resp: URLResponse
         do {
-            (data, resp) = try await Self.session.data(for: req)
+            (data, resp) = try await session.data(for: req)
         } catch {
             throw JesseError.from(error, host: config.normalizedHost)
         }

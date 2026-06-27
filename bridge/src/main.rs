@@ -207,10 +207,6 @@ struct Config {
     // Per-service rate ceiling (requests accepted per rolling minute). Bursts
     // beyond this are rejected with 429.
     rate_per_min: u32,
-    // How long POST /jesse holds the connection waiting for the turn before it
-    // returns 202 and lets the client poll. A few seconds catches fast turns
-    // inline; everything longer is resolved via GET /jesse/result/{job_id}.
-    grace_secs: u64,
     // How long a completed/failed job stays retrievable before TTL eviction when
     // it has NEVER been fetched. The clock starts at first retrieval, not at
     // completion, so an unfetched reply survives the full window.
@@ -304,10 +300,6 @@ impl Config {
                 .and_then(|s| s.parse().ok())
                 .filter(|n| *n >= 1)
                 .unwrap_or(30),
-            grace_secs: std::env::var("JESSE_GRACE_SECS")
-                .ok()
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(10),
             job_ttl_secs: std::env::var("JESSE_JOB_TTL_SECS")
                 .ok()
                 .and_then(|s| s.parse().ok())
@@ -1933,7 +1925,7 @@ async fn jesse(
     let jobs = st.jobs.clone();
     let jid = job_id.clone();
     let sid = req.session_id.clone();
-    let mut handle = tokio::spawn(async move {
+    let handle = tokio::spawn(async move {
         // Hold the permit for the whole turn, releasing it on task exit.
         let _permit: OwnedSemaphorePermit = permit;
         // Hold the scratch dir for the whole turn; its Drop removes the decoded
@@ -1966,64 +1958,29 @@ async fn jesse(
     // and releases the permit held inside the task.
     st.jobs.set_abort(&job_id, handle.abort_handle());
 
-    // Hold the connection up to the grace window for the fast path.
-    let grace = Duration::from_secs(st.cfg.grace_secs);
-    match timeout(grace, &mut handle).await {
-        // Turn finished within grace — return the reply inline as before,
-        // plus the job_id (additive; existing callers ignore the extra field).
-        Ok(join_res) => {
-            if let Err(e) = join_res {
-                // A cancel landing inside the grace window aborts the task, so the
-                // join resolves to a cancellation here — report it as the clean
-                // terminal `cancelled` rather than a 500.
-                if e.is_cancelled() {
-                    return Ok((
-                        StatusCode::OK,
-                        Json(json!({ "job_id": job_id, "status": "cancelled" })),
-                    )
-                        .into_response());
-                }
-                return Err((
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("job task failed: {e}"),
-                ));
-            }
-            match st.jobs.get(&job_id) {
-                Some(JobState::Done {
-                    response,
-                    session_id,
-                }) => Ok((
-                    StatusCode::OK,
-                    Json(json!({
-                        "mode": req.mode,
-                        "response": response,
-                        "session_id": session_id,
-                        "job_id": job_id,
-                    })),
-                )
-                    .into_response()),
-                Some(JobState::Failed { error }) => Err((StatusCode::BAD_GATEWAY, error)),
-                // A cancel that raced completion just inside the grace window.
-                Some(JobState::Cancelled) => Ok((
-                    StatusCode::OK,
-                    Json(json!({ "job_id": job_id, "status": "cancelled" })),
-                )
-                    .into_response()),
-                // The task joined, so it must have written a terminal state.
-                _ => Err((
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "job finished without a result".to_string(),
-                )),
-            }
-        }
-        // Still running at grace expiry — hand back a job id to poll. The
-        // detached task keeps running; dropping `handle` does not cancel it.
-        Err(_) => Ok((
-            StatusCode::ACCEPTED,
-            Json(json!({ "job_id": job_id, "status": "running" })),
-        )
-            .into_response()),
-    }
+    // Hand back the job_id IMMEDIATELY — never hold the connection. The turn runs
+    // on the detached task above and lands in the job store exactly as before;
+    // the phone always gets the job_id on this first response, then streams
+    // (`GET /jesse/stream/{job_id}`) and/or polls (`GET /jesse/result/{job_id}`)
+    // for the reply. Dropping `handle` here does NOT cancel the spawned task.
+    //
+    // Root cause this fixes: the old grace-hold delivered the job_id LATE (after
+    // up to `JESSE_GRACE_SECS`). If the POST socket dropped during that hold —
+    // phone suspended, NAT/idle timeout — the turn was already running detached
+    // but the phone never received its id, so it could never poll the reply: an
+    // orphaned turn. Returning the id up front shrinks the unrecoverable window
+    // to the single request/response round-trip.
+    //
+    // Tradeoff (belt-and-suspenders): if the network drops before THIS response
+    // reaches the phone, the turn was still created server-side with a job_id the
+    // phone never saw — unavoidably unrecoverable without an id. That window is
+    // now one round-trip instead of a multi-second hold, which is the whole point
+    // of delivering the id eagerly.
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(json!({ "job_id": job_id, "status": "running" })),
+    )
+        .into_response())
 }
 
 /// Fetch a turn's state by job id. This is what the app polls after a dropped
@@ -2777,7 +2734,6 @@ mod tests {
             disallowed_tools: DEFAULT_DISALLOWED_TOOLS.to_string(),
             max_concurrency: 2,
             rate_per_min: 30,
-            grace_secs: 10,
             job_ttl_secs: 600,
             retrieval_grace_secs: 600,
             // No on-disk persistence in tests by default — keeps cargo test off
@@ -3317,7 +3273,6 @@ mod tests {
 
         let cfg = Config {
             claude_bin: fake.to_string_lossy().into_owned(),
-            grace_secs: 1,        // force the 202 path
             max_concurrency: 1,   // a freed slot is observable via available_permits
             ..test_config()
         };
@@ -3429,7 +3384,6 @@ mod tests {
 
         let cfg = Config {
             claude_bin: fake.to_string_lossy().into_owned(),
-            grace_secs: 1, // force the 202 path
             ..test_config()
         };
         let st = AppState::new(cfg);
@@ -3704,7 +3658,6 @@ mod tests {
         let fake = write_fake_claude(script);
         let cfg = Config {
             claude_bin: fake.to_string_lossy().into_owned(),
-            grace_secs: 0, // return 202 immediately so we can stream the live turn
             ..test_config()
         };
         let st = AppState::new(cfg);
@@ -3783,14 +3736,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn fast_turn_returns_inline_200_with_job_id() {
-        // A fake claude that returns immediately → completes within grace → 200
-        // inline, now carrying job_id alongside the unchanged fields.
+    async fn post_returns_202_immediately_even_for_a_fast_turn() {
+        // The grace-hold is gone: POST always returns 202 with the job_id up front,
+        // even when `claude` would finish near-instantly. The reply is fetched via
+        // GET /jesse/result/{job_id}. This is the fix for the orphan bug — the
+        // phone always has the id before any connection drop can matter.
         let script = "#!/bin/sh\nprintf '%s' '{\"type\":\"result\",\"is_error\":false,\"result\":\"quick\",\"session_id\":\"sess-fast\"}'\n";
         let fake = write_fake_claude(script);
         let cfg = Config {
             claude_bin: fake.to_string_lossy().into_owned(),
-            grace_secs: 10,
             ..test_config()
         };
         let st = AppState::new(cfg);
@@ -3802,11 +3756,24 @@ mod tests {
             ))
             .await
             .unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(resp.status(), StatusCode::ACCEPTED, "POST never holds — always 202");
         let body: Value = serde_json::from_str(&body_string(resp).await).unwrap();
-        assert_eq!(body["response"], "quick");
-        assert_eq!(body["session_id"], "sess-fast");
-        assert!(body["job_id"].as_str().is_some(), "200 carries a job_id");
+        assert_eq!(body["status"], "running");
+        let job_id = body["job_id"].as_str().expect("202 carries a job_id").to_string();
+
+        // The detached turn finishes; the reply is retrievable by id.
+        let mut done = None;
+        for _ in 0..50 {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            let v = result_status(&st, &job_id).await;
+            if v["status"] == "done" {
+                done = Some(v);
+                break;
+            }
+        }
+        let done = done.expect("a fast turn still lands in the job store, fetchable by id");
+        assert_eq!(done["response"], "quick");
+        assert_eq!(done["session_id"], "sess-fast");
 
         let _ = std::fs::remove_file(&fake);
     }
@@ -3955,7 +3922,6 @@ mod tests {
         let fake = write_fake_claude(script);
         let cfg = Config {
             claude_bin: fake.to_string_lossy().into_owned(),
-            grace_secs: 1,        // first POST returns 202 while the turn runs on
             max_concurrency: 1,   // exactly one permit
             ..test_config()
         };

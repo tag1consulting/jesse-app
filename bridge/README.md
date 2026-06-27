@@ -79,13 +79,24 @@ longer tied to the HTTP connection**. If the phone suspends and the socket drops
 mid-turn, the turn keeps running to completion instead of being killed — the
 reply is never lost.
 
-`POST /jesse` waits up to a short **grace window** (`JESSE_GRACE_SECS`, default
-`10s`) for the turn:
+`POST /jesse` returns the `job_id` **immediately** — it never holds the
+connection:
 
-- Done within grace → **`200`** with the usual `{ mode, response, session_id }`
-  **plus** a `job_id` (additive; existing callers ignore it).
-- Still running at grace expiry → **`202 { "job_id": "...", "status": "running" }`**.
-  The turn keeps running server-side.
+- Always → **`202 { "job_id": "...", "status": "running" }`**, the instant the
+  turn is spawned. The turn then runs server-side and lands in the job store; the
+  phone fetches the reply via `GET /jesse/result/{job_id}` (poll) and/or
+  `GET /jesse/stream/{job_id}` (live tokens).
+
+> **Why immediate, and not a grace hold?** An earlier design held the connection
+> up to a `JESSE_GRACE_SECS` window so a fast turn could answer inline with a
+> `200`. That delivered the `job_id` *late*: if the socket dropped during the
+> hold (phone suspended, NAT/idle timeout), the turn was already running detached
+> but the phone never received its id — so it could never poll the reply. The
+> turn was **orphaned**. Returning the `job_id` up front shrinks that
+> unrecoverable window from a multi-second hold to a single request/response
+> round-trip. `JESSE_GRACE_SECS` and the inline-`200` path were **removed**
+> (see the CHANGELOG note at the end of this file). There is no inline-reply path
+> anymore — every turn is fetched by id.
 
 Fetch the result later by id:
 
@@ -321,13 +332,13 @@ capacity.
 
 ### When does the phone stream vs. poll?
 
-`POST /jesse` is unchanged: it still holds the connection up to `JESSE_GRACE_SECS`
-and returns the inline `200` (with the full reply) if the turn finishes inside
-that window, else `202 {job_id, status:"running"}`. The phone **streams on the
-`202` path** and renders the reply live; a sub-grace turn returns inline and needs
-no streaming. **Lower `JESSE_GRACE_SECS`** (e.g. `1`) to start streaming sooner —
-the bridge returns `202` quickly and the phone picks up the live tokens (the
-`reset` replays anything produced before it subscribed, so nothing is lost).
+`POST /jesse` always returns `202 {job_id, status:"running"}` immediately (it
+never holds the connection). The phone then **streams** (`GET
+/jesse/stream/{job_id}`) to render the reply live **and polls** (`GET
+/jesse/result/{job_id}`) concurrently for the authoritative completion. The
+`reset` frame replays anything produced before the phone subscribed, so nothing
+is lost even though streaming starts a beat after the turn does. There is no
+inline-reply fast path: every turn — fast or slow — is fetched by id.
 
 ## Voice requests
 
@@ -417,7 +428,6 @@ one reweakens it by accident.
 | `JESSE_ADVERTISE_HOST` | value of `JESSE_BIND` | Host written into the pairing QR — set to the MagicDNS `ts.net` name to advertise that instead of the bound IP |
 | `JESSE_PORT` | `8765` | Port |
 | `JESSE_TIMEOUT` | `3600` | Per-request run limit (seconds), clamped to `1..=7200`. `0` is treated as the 7200s ceiling, not unlimited. On overrun the turn returns `504` with an actionable message naming this var |
-| `JESSE_GRACE_SECS` | `10` | How long `POST /jesse` holds the connection for the inline fast path before returning `202`. On `202` the phone streams live tokens (`GET /jesse/stream/{job_id}`) and/or polls (`GET /jesse/result/{job_id}`). Lower it (e.g. `1`) to start streaming sooner |
 | `JESSE_JOB_TTL_SECS` | `86400` | How long a finished-but-**unfetched** reply stays retrievable (24h). The clock starts at first retrieval, not at completion |
 | `JESSE_RETRIEVAL_GRACE_SECS` | `600` | How much longer a reply is kept **after** its first retrieval (a short re-poll window) instead of the full TTL |
 | `JESSE_STATE_DIR` | `~/.jesse-bridge` | Where completed results are persisted (`<dir>/jobs`) so a restart doesn't lose a reply. Empty disables persistence |
@@ -440,6 +450,30 @@ Headless Claude Code does **not** inherit Cowork's OAuth connectors (Gmail,
 Calendar, Slack, Notion, Drive). Local MCP servers (QMD, Home Assistant, etc.)
 and the filesystem **do** work. PoC scope = vault Q&A + capture, which is fine.
 To use the cloud connectors here, register them in this project's `.mcp.json`.
+
+## CHANGELOG
+
+- **Deliver the `job_id` immediately; never hold `POST /jesse`.** *Root cause:* the
+  bridge held the POST connection up to a `JESSE_GRACE_SECS` grace window (default
+  10s) so a fast turn could answer inline with a `200`. That delivered the
+  `job_id` **too late** — if the socket dropped during the hold (phone suspended,
+  NAT/idle timeout), the turn was already running on its detached task but the
+  phone never received an id, so it could never poll the reply: an **orphaned
+  turn** whose answer was produced and then lost. *Fix:* `POST /jesse` now returns
+  `202 {job_id, status:"running"}` the instant the turn is spawned and never holds
+  the connection. The phone persists the id up front, so any later drop is
+  recoverable via poll/stream/resume; the unrecoverable window shrinks from a
+  multi-second hold to a single request/response round-trip. `JESSE_GRACE_SECS`
+  and the inline-`200` code path were **removed** (not hard-defaulted to 0). The
+  `/jesse/result` and `/jesse/stream` contracts are unchanged.
+
+- **App-side SSE parser fix (uncovered by the new integration tests).** The iOS
+  client's stream parser used blank SSE lines as frame boundaries, but
+  `URLSession.AsyncBytes.lines` *swallows blank lines* — so live deltas never
+  rendered and the parser produced one garbled event at EOF. The parser now also
+  dispatches a frame at each new `event:` line. This only affected the live,
+  display-only token stream; the poll path (which owns completion) always
+  delivered the reply, so no answer was ever lost to it.
 
 ## Note
 
