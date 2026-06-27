@@ -151,8 +151,20 @@ token or any secret. Running jobs aren't persisted (there's no result yet). Set
 
 A turn's reply streams to the phone token-by-token instead of arriving all at
 once. This is **additive** — the 202 / poll / persist / resume path above is
-unchanged and remains the fallback whenever a stream can't be held (phone
-suspended, connection blip, an older client).
+unchanged and remains the authoritative completion path whenever a stream can't
+be held (phone suspended, connection blip, an older client).
+
+> **Client contract: streaming is display-only; the poll owns completion.** The
+> app (`RunCoordinator.consume`) runs the SSE stream and the `GET /jesse/result`
+> poll **concurrently from the start** — polling is *not* a fallback that waits
+> for the stream to end. The stream only drives the live `partialText`/`activity`
+> under the spinner; whichever source produces a terminal outcome first finishes
+> the turn (exactly once), and the other is cancelled. This exists because of a
+> real hang: a half-open stream (opened, then never a frame and never a close —
+> phone suspended, NAT/idle timeout, a wedged proxy) never *ends*, so the old
+> "stream, then fall back to poll once the stream finishes" logic blocked forever
+> and the reply never landed. So: a stalled, erroring, or never-opening stream
+> must never delay or block the reply — the poll resolves it regardless.
 
 ### How `claude` is run
 

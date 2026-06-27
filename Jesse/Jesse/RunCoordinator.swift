@@ -184,7 +184,8 @@ final class RunCoordinator {
                     self.finish(threadID: threadID, reply: reply, voice: voice, context: context)
                 case .running(let jobId):
                     self.persist(threadID: threadID, job: InFlightJob(jobId: jobId, voice: voice))
-                    // Stream the turn live; fall back to polling on any drop.
+                    // Stream (display) and poll (completion) run concurrently; see
+                    // `consume`. Polling is not a fallback — it owns the reply.
                     await self.consume(threadID: threadID, jobId: jobId, voice: voice,
                                        client: client, context: context)
                 }
@@ -258,9 +259,10 @@ final class RunCoordinator {
         tasks[threadID] = Task { [weak self] in
             guard let self else { return }
             let client = self.makeClient(cfg)
-            // Reconnect the stream — the bridge replays the text-so-far, so a
-            // foregrounded turn picks up live where it left off — with the same
-            // poll fallback if streaming isn't available.
+            // Reconnect the stream for live display — the bridge replays the
+            // text-so-far, so a foregrounded turn picks up where it left off —
+            // while the concurrent poll (see `consume`) owns completion, so a
+            // stream that won't reopen never blocks the re-attach.
             await self.consume(threadID: threadID, jobId: job.jobId, voice: job.voice,
                                client: client, context: context)
             self.tasks[threadID] = nil
@@ -270,21 +272,89 @@ final class RunCoordinator {
 
     // MARK: - Internals
 
-    /// Consume the live SSE stream for a running turn, rendering text as it
-    /// arrives, then **fall back to polling** if the stream drops without a
-    /// terminal frame (phone suspended, connection blipped, or an older bridge
-    /// without the endpoint). Terminal frames finish the turn exactly as the poll
-    /// path would: `done` appends the single persisted `Turn` and clears the
-    /// partial buffer; a bridge `error` is recoverable (job retained for
-    /// Re-check); a `cancelled` frame matches a cancel the user already made — no
-    /// `Turn`, no error. A user Cancel cancels this task, which tears down the
-    /// `AsyncThrowingStream` and drops the SSE connection.
+    /// The single terminal result of a turn, produced by whichever concurrent
+    /// child (stream or poll) reaches it first. Mapping it to the finish/fail
+    /// action happens exactly once, in `consume`, so a late second terminal from
+    /// the other source can't double-finish.
+    private enum TurnOutcome {
+        case done(JesseReply)
+        case failed(String)   // recoverable — keep the job for Re-check/resume
+        case expired          // terminal — the reply is gone past its TTL
+        case cancelled        // a server `cancelled` frame (the user's own cancel)
+    }
+
+    /// Drive a running turn to completion by racing two concurrent children under
+    /// this thread's task: (1) a **display** consumer of the live SSE stream that
+    /// only updates `partialText`/`activity`, and (2) the **poll** loop on
+    /// `client.result`. Whichever produces a terminal `TurnOutcome` first finishes
+    /// the turn; the group then cancels the other, so exactly one finish/fail
+    /// action runs — the TaskGroup's first-result semantics are the "already
+    /// finished" guard.
+    ///
+    /// Root cause this guards against: streaming used to be the sole completion
+    /// path. `consume` blocked in `for try await event in client.stream` and only
+    /// fell back to polling once the stream *ended*. A half-open stream — opened,
+    /// then never a frame and never a close (phone suspended, NAT/idle timeout, a
+    /// wedged proxy) — never ends, so the turn hung forever. The fix: **streaming
+    /// is display-only; the poll owns completion.** Polling runs from the start,
+    /// not as a fallback, so a stalled, erroring, or never-opening stream can no
+    /// longer delay or block the reply.
+    ///
+    /// A user Cancel cancels the parent task (and thus the group): both children
+    /// stop, any outcome is dropped (the `Task.isCancelled` guard below), and
+    /// `cancel()`'s own synchronous teardown stands — preserving "ignore a late
+    /// terminal after cancel".
     private func consume(threadID: UUID, jobId: String, voice: Bool,
                          client: any JesseClientProtocol, context: ModelContext) async {
-        var sawTerminal = false
+        let outcome: TurnOutcome? = await withTaskGroup(of: TurnOutcome?.self) { group in
+            group.addTask { await self.streamForDisplay(threadID: threadID, jobId: jobId, client: client) }
+            group.addTask { await self.pollForOutcome(threadID: threadID, jobId: jobId, client: client) }
+            // First non-nil terminal outcome wins; cancel the loser. A nil child
+            // (stream stalled/errored/ended bare, or poll cancelled) just drops
+            // out — keep waiting on the other.
+            for await result in group {
+                if let result {
+                    group.cancelAll()
+                    return result
+                }
+            }
+            return nil
+        }
+        // Apply the one terminal action. Bail if the user cancelled meanwhile so
+        // no reply lands on an already-cleared run.
+        if Task.isCancelled { return }
+        guard let outcome else { return }
+        switch outcome {
+        case .done(let reply):
+            finish(threadID: threadID, reply: reply, voice: voice, context: context)
+        case .failed(let message):
+            // The turn failed recoverably (a bridge `error`/`.failed`, or a
+            // transport error in the poll) — keep the job retained for Re-check.
+            failRecoverable(threadID: threadID, message: message, voice: voice)
+        case .expired:
+            // The bridge no longer has the reply (held its full TTL, now evicted).
+            // The only genuinely terminal "gone" state: drop the job and say so.
+            fail(threadID: threadID,
+                 message: "This reply has expired — it was held but not picked up in time, and Jesse no longer has it.",
+                 voice: voice)
+        case .cancelled:
+            // The user cancelled (the only source of this frame). cancel() already
+            // tore the run down; just make sure nothing lingers.
+            clearRun(threadID)
+        }
+    }
+
+    /// Display-only consumer of the live SSE stream: updates `partialText` and
+    /// `activity` as frames arrive. Returns a terminal `TurnOutcome` if the stream
+    /// happens to win the race (a `done`/`failed`/`cancelled` frame), else `nil` —
+    /// if it errors, stalls into cancellation, or ends without a terminal frame —
+    /// in which case the concurrent poll owns completion. Never finishes the turn
+    /// itself; `consume` applies the single terminal action.
+    private func streamForDisplay(threadID: UUID, jobId: String,
+                                  client: any JesseClientProtocol) async -> TurnOutcome? {
         do {
             for try await event in client.stream(jobId: jobId) {
-                if Task.isCancelled { return }
+                if Task.isCancelled { return nil }
                 switch event {
                 case .reset(let text):
                     partialText[threadID] = text
@@ -293,37 +363,18 @@ final class RunCoordinator {
                 case .activity(let tool):
                     activity[threadID] = Self.activityLabel(for: tool)
                 case .done(let reply):
-                    sawTerminal = true
-                    finish(threadID: threadID, reply: reply, voice: voice, context: context)
-                    return
+                    return .done(reply)
                 case .failed(let message):
-                    // The bridge ran the turn and reported a failure mid-stream —
-                    // keep the job retained so Re-check/poll can pick it back up.
-                    sawTerminal = true
-                    failRecoverable(threadID: threadID, message: message, voice: voice)
-                    return
+                    return .failed(message)
                 case .cancelled:
-                    // The user cancelled (the only source of this frame). cancel()
-                    // already tore the run down; just make sure nothing lingers.
-                    sawTerminal = true
-                    clearRun(threadID)
-                    return
+                    return .cancelled
                 }
             }
         } catch {
-            // Stream dropped/failed — fall through to the poll fallback below.
-            if Task.isCancelled { return }
+            // Stream dropped/failed — display only, so swallow it; the concurrent
+            // poll completes the turn.
         }
-        if Task.isCancelled { return }
-        // The stream ended without a terminal frame: hand off to polling, which
-        // owns the same finish/fail/expire logic. Clear the partial so the poll's
-        // finished `Turn` is the only rendering (no stale half-reply alongside it).
-        if !sawTerminal {
-            partialText[threadID] = nil
-            activity[threadID] = nil
-            await poll(threadID: threadID, jobId: jobId, voice: voice,
-                       client: client, context: context)
-        }
+        return nil
     }
 
     /// Map a coarse tool name from a `tool_use` event to a human activity line.
@@ -338,56 +389,47 @@ final class RunCoordinator {
         }
     }
 
-    /// Poll `GET /jesse/result/{jobId}` until the turn resolves. The job_id is
-    /// always retained on a non-terminal failure here (dropped socket, timeout,
-    /// transport error, or a bridge-reported `.failed`) so Re-check — and the
-    /// next `resume` — can pick the reply back up; the run only truly ends, and
-    /// the job is dropped, on `.done` (success) or `.expired` (gone past TTL).
-    private func poll(threadID: UUID, jobId: String, voice: Bool,
-                      client: any JesseClientProtocol, context: ModelContext) async {
+    /// Poll `GET /jesse/result/{jobId}` until the turn resolves, returning the
+    /// terminal `TurnOutcome` (or `nil` on cancellation). This is the
+    /// authoritative completion path: it runs concurrently with the display stream
+    /// from the start (see `consume`), so a stalled or absent stream never delays
+    /// the reply. The job_id is retained on a recoverable failure — a transport
+    /// error here or a bridge-reported `.failed`, both mapped to `failRecoverable`
+    /// by `consume` — so Re-check and the next `resume` can pick the reply back up;
+    /// the run only truly ends, and the job is dropped, on `.done` (success) or
+    /// `.expired` (gone past TTL).
+    private func pollForOutcome(threadID: UUID, jobId: String,
+                                client: any JesseClientProtocol) async -> TurnOutcome? {
         while !Task.isCancelled {
             let state: JesseResultState
             do {
                 state = try await client.result(jobId: jobId)
-            } catch let error as JesseError {
-                // A user-initiated cancel surfaces here as a cancelled URL load
-                // (mapped to `.transport`). Treat any cancellation as a clean
-                // stop — the run was already cleared by `cancel`, so don't fail.
-                if Task.isCancelled { return }
-                // Every client error in the poll path is recoverable: the job is
-                // retained and the reply stays retrievable. Show it with Re-check.
-                failRecoverable(threadID: threadID, message: error.localizedDescription, voice: voice)
-                return
             } catch {
-                if Task.isCancelled { return }
-                failRecoverable(threadID: threadID, message: error.localizedDescription, voice: voice)
-                return
+                // A user-initiated cancel surfaces here as a cancelled URL load
+                // (mapped to `.transport`). Treat any cancellation as a clean stop
+                // — the run was already cleared by `cancel`. Otherwise every client
+                // error in the poll path is recoverable: the job stays retained and
+                // the reply retrievable, shown with Re-check.
+                if Task.isCancelled { return nil }
+                let message = (error as? JesseError)?.localizedDescription
+                    ?? error.localizedDescription
+                return .failed(message)
             }
             // A `.done` can land in the same instant the user cancels; bail before
-            // acting on it so no reply is appended for a cancelled run.
-            if Task.isCancelled { return }
+            // returning it so no reply is appended for a cancelled run.
+            if Task.isCancelled { return nil }
             switch state {
             case .running:
                 try? await Task.sleep(for: .seconds(2))
             case .done(let reply):
-                finish(threadID: threadID, reply: reply, voice: voice, context: context)
-                return
+                return .done(reply)
             case .failed(let message):
-                // The bridge ran the turn and reported a failure (e.g. the 504
-                // run-limit). Keep the job retained so Re-check is offered — the
-                // failure could have been transient.
-                failRecoverable(threadID: threadID, message: message, voice: voice)
-                return
+                return .failed(message)
             case .expired:
-                // The bridge no longer has the reply (held its full TTL, now
-                // evicted). This is the only genuinely terminal "gone" state:
-                // drop the job and say so plainly.
-                fail(threadID: threadID,
-                     message: "This reply has expired — it was held but not picked up in time, and Jesse no longer has it.",
-                     voice: voice)
-                return
+                return .expired
             }
         }
+        return nil
     }
 
     private func finish(threadID: UUID, reply: JesseReply, voice: Bool, context: ModelContext) {

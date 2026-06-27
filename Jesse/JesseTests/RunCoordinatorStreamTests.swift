@@ -17,6 +17,11 @@ final class RunCoordinatorStreamTests: XCTestCase {
     private final class StreamingFakeClient: JesseClientProtocol {
         var onStreamStarted: (() -> Void)?
         var resultProvider: (() async throws -> JesseResultState)?
+        /// Scripted poll results consumed in order (the last repeats), used when
+        /// `resultProvider` is nil. Lets a test drive a `running → done` cadence
+        /// with no mutable-capture closure. Each call counts via `pollCalls`.
+        var pollResults: [JesseResultState] = []
+        private(set) var pollCalls = 0
         private var continuation: AsyncThrowingStream<JesseStreamEvent, Error>.Continuation?
 
         func send(mode: JesseMode, text: String, sessionId: String?, voice: Bool,
@@ -27,7 +32,11 @@ final class RunCoordinatorStreamTests: XCTestCase {
         }
 
         func result(jobId: String) async throws -> JesseResultState {
+            pollCalls += 1
             if let resultProvider { return try await resultProvider() }
+            if !pollResults.isEmpty {
+                return pollResults[min(pollCalls - 1, pollResults.count - 1)]
+            }
             return .running
         }
 
@@ -157,5 +166,112 @@ final class RunCoordinatorStreamTests: XCTestCase {
         XCTAssertNil(coordinator.partialText(for: thread.id), "partial buffer cleared")
         XCTAssertNil(coordinator.error(for: thread.id), "cancel must not surface an error")
         XCTAssertFalse(coordinator.isRunning(thread.id))
+    }
+
+    /// THE BUG (regression guard): a half-open stream — the SSE connection opens
+    /// and then never yields a frame and never finishes (phone suspended, NAT/idle
+    /// timeout, a wedged proxy). Before the fix, `consume` blocked forever in the
+    /// stream loop and never polled, so the turn hung. Now stream and poll run
+    /// concurrently, so the poll still completes the turn. The poll reports
+    /// `running` then `done`, so this also proves the poll loop iterates past a
+    /// `.running` on its 2s cadence. Must fail (hang → no Jesse turn) before the
+    /// fix and pass after.
+    @MainActor
+    func testStalledStreamStillFinishesViaPoll() async throws {
+        let context = try makeContext()
+        let fake = StreamingFakeClient()
+        // The stream opens but is half-open: never yields, never finishes. (The
+        // test deliberately never calls emit/finishStream/failStream.)
+        let opened = expectation(description: "stream opened")
+        fake.onStreamStarted = { opened.fulfill() }
+        // First poll: still running (forces a 2s sleep). Second: the finished reply.
+        fake.pollResults = [
+            .running,
+            .done(JesseReply(text: "from poll despite a stalled stream", sessionId: "sess-stall")),
+        ]
+        let coordinator = makeCoordinator(fake)
+
+        let thread = JesseThread(mode: .ask)
+        coordinator.send(thread: thread, text: "stall me", voice: false, context: context)
+        await fulfillment(of: [opened], timeout: 2)
+
+        // The stream contributes nothing. Wait past the poll's 2s cadence so its
+        // second fetch (the done) lands and finalizes the turn.
+        try await Task.sleep(for: .milliseconds(2500))
+
+        let jesseTurns = thread.turns.filter { !$0.isUser }
+        XCTAssertEqual(jesseTurns.count, 1, "poll completes the turn even though the stream stalled")
+        XCTAssertEqual(jesseTurns.first?.text, "from poll despite a stalled stream")
+        XCTAssertEqual(thread.sessionId, "sess-stall")
+        XCTAssertGreaterThanOrEqual(fake.pollCalls, 2, "the poll loop iterated past a .running")
+        XCTAssertFalse(coordinator.isRunning(thread.id))
+        XCTAssertNil(coordinator.error(for: thread.id))
+        XCTAssertNil(coordinator.partialText(for: thread.id))
+    }
+
+    /// Poll wins while the stream is mid-delta (it streamed some text but no
+    /// terminal frame): exactly one terminal action, one persisted `Turn`, no
+    /// duplicate from the still-open stream, and the partial buffer cleared.
+    @MainActor
+    func testPollWinsWhileStreamMidDelta() async throws {
+        let context = try makeContext()
+        let fake = StreamingFakeClient()
+        // The poll holds off one beat, then resolves done — long enough for a
+        // delta to render first, short enough to win before any terminal frame.
+        fake.pollResults = [.running, .done(JesseReply(text: "settled by poll", sessionId: "sess-x"))]
+        let opened = expectation(description: "stream opened")
+        fake.onStreamStarted = { opened.fulfill() }
+        let coordinator = makeCoordinator(fake)
+
+        let thread = JesseThread(mode: .ask)
+        coordinator.send(thread: thread, text: "race", voice: false, context: context)
+        await fulfillment(of: [opened], timeout: 2)
+
+        // The stream renders a partial but never sends a terminal frame.
+        fake.emit(.delta("half a thought"))
+        try await settle()
+        XCTAssertEqual(coordinator.partialText(for: thread.id), "half a thought")
+
+        // The poll resolves the turn while the stream is still open mid-delta.
+        try await Task.sleep(for: .milliseconds(2500))
+
+        let jesseTurns = thread.turns.filter { !$0.isUser }
+        XCTAssertEqual(jesseTurns.count, 1, "exactly one terminal action — the poll's")
+        XCTAssertEqual(jesseTurns.first?.text, "settled by poll")
+        XCTAssertNil(coordinator.partialText(for: thread.id), "partial cleared on finish")
+        XCTAssertFalse(coordinator.isRunning(thread.id))
+        XCTAssertNil(coordinator.error(for: thread.id))
+
+        // A late terminal frame from the now-cancelled stream must be a no-op.
+        fake.emit(.done(JesseReply(text: "stream too late", sessionId: "sess-late")))
+        fake.finishStream()
+        try await settle()
+        XCTAssertEqual(thread.turns.filter { !$0.isUser }.count, 1, "no duplicate Turn from the late stream")
+    }
+
+    /// The stream errors immediately (never a usable frame). The concurrent poll
+    /// still completes the turn — streaming is best-effort display only.
+    @MainActor
+    func testStreamErrorsImmediatelyPollCompletes() async throws {
+        let context = try makeContext()
+        let fake = StreamingFakeClient()
+        fake.resultProvider = { .done(JesseReply(text: "poll carried it", sessionId: "sess-e")) }
+        let opened = expectation(description: "stream opened")
+        fake.onStreamStarted = { opened.fulfill() }
+        let coordinator = makeCoordinator(fake)
+
+        let thread = JesseThread(mode: .ask)
+        coordinator.send(thread: thread, text: "broken stream", voice: false, context: context)
+        await fulfillment(of: [opened], timeout: 2)
+
+        // The stream dies the instant it opens, with no terminal frame.
+        fake.failStream(JesseError.connectionLost)
+        try await Task.sleep(for: .milliseconds(100))
+
+        let jesseTurns = thread.turns.filter { !$0.isUser }
+        XCTAssertEqual(jesseTurns.count, 1, "poll completed the turn despite the stream error")
+        XCTAssertEqual(jesseTurns.first?.text, "poll carried it")
+        XCTAssertFalse(coordinator.isRunning(thread.id))
+        XCTAssertNil(coordinator.error(for: thread.id))
     }
 }
