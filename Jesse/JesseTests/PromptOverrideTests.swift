@@ -216,6 +216,8 @@ final class PromptOverrideTests: XCTestCase {
         func result(jobId: String) async throws -> JesseResultState {
             .done(JesseReply(text: "ok", sessionId: nil))
         }
+
+        func cancelJob(jobId: String) async throws {}
     }
 
     @MainActor

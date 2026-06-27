@@ -307,6 +307,8 @@ protocol JesseClientProtocol {
               instructions: String?, floorOverride: String?,
               attachments: [JesseAttachment]) async throws -> JesseSendResult
     func result(jobId: String) async throws -> JesseResultState
+    /// Best-effort request to stop an in-flight turn server-side. Idempotent.
+    func cancelJob(jobId: String) async throws
 }
 
 struct JesseClient: JesseClientProtocol {
@@ -375,6 +377,35 @@ struct JesseClient: JesseClientProtocol {
             throw JesseError.from(error, host: config.normalizedHost)
         }
         return try Self.decodeResult(data: data, resp: resp)
+    }
+
+    /// Best-effort cancel of an in-flight turn (`POST /jesse/cancel/{job_id}`).
+    /// Mirrors `result`'s URL build + bearer auth. The bridge is idempotent — an
+    /// unknown, already-finished, or already-cancelled job all return `204` — so a
+    /// `404` (a bridge that no longer knows the id) is treated as success too:
+    /// there's nothing left to stop. Throws only on a genuine transport/auth
+    /// failure, which the caller fires-and-forgets (the orphan, if any, is reaped
+    /// by the bridge's job TTL).
+    func cancelJob(jobId: String) async throws {
+        guard !config.normalizedHost.isEmpty, !config.token.isEmpty,
+              let url = config.endpoint("/jesse/cancel/\(jobId)") else {
+            throw JesseError.notConfigured
+        }
+        var req = URLRequest(url: url)
+        req.httpMethod = "POST"
+        req.setValue("Bearer \(config.token)", forHTTPHeaderField: "Authorization")
+
+        let data: Data, resp: URLResponse
+        do {
+            (data, resp) = try await Self.session.data(for: req)
+        } catch {
+            throw JesseError.from(error, host: config.normalizedHost)
+        }
+        guard let http = resp as? HTTPURLResponse else { throw JesseError.decoding }
+        // 2xx (the bridge replies 204) or 404 (nothing left to cancel) → success.
+        if (200..<300).contains(http.statusCode) || http.statusCode == 404 { return }
+        throw JesseError.badResponse(http.statusCode,
+                                     String(data: data, encoding: .utf8) ?? "")
     }
 
     /// Fetch the bridge's built-in Ask/Tell wrapper defaults (`GET /jesse/prompts`).

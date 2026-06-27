@@ -39,6 +39,7 @@ use serde_json::{json, Value};
 use subtle::ConstantTimeEq;
 use tokio::process::Command;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use tokio::task::AbortHandle;
 use tokio::time::timeout;
 
 // ---- Prompt wrappers — the ONLY difference between Ask and Tell ------------
@@ -447,6 +448,22 @@ enum JobState {
     Failed {
         error: String,
     },
+    // The client asked to stop the turn (`POST /jesse/cancel/{id}`). The running
+    // task was aborted — dropping its `Child` (kill_on_drop) kills `claude` and
+    // frees the concurrency permit. A distinct terminal state (not `Failed`) so
+    // the phone can render "Cancelled" rather than an error.
+    Cancelled,
+}
+
+/// Result of a `JobStore::cancel`, used only to log what the cancel did. Every
+/// arm is a success on the wire — cancel is idempotent.
+enum CancelOutcome {
+    /// The job was running and has now been aborted + marked `Cancelled`.
+    Cancelled,
+    /// The job had already reached a terminal state; left untouched.
+    AlreadyTerminal,
+    /// No job with this id (never created, or already evicted).
+    Unknown,
 }
 
 struct Job {
@@ -461,6 +478,16 @@ struct Job {
 
 struct JobStore {
     jobs: Mutex<HashMap<String, Job>>,
+    // Abort handle for each RUNNING job's spawned turn task, keyed by job id.
+    // `POST /jesse/cancel/{id}` looks the handle up and aborts it — dropping the
+    // task's `Child` (kill_on_drop) kills `claude` and frees the concurrency
+    // permit. An entry exists only while the job runs: `complete`/`cancel` remove
+    // it on the terminal transition, so the map never holds a finished job.
+    //
+    // Lock discipline: this mutex and `jobs` are never held simultaneously — each
+    // method takes one, releases it, then takes the other — so there is no lock
+    // ordering between them and no deadlock.
+    aborts: Mutex<HashMap<String, AbortHandle>>,
     // How long an unfetched completed job is held.
     ttl: Duration,
     // How long a completed job is kept after its first retrieval.
@@ -517,6 +544,7 @@ fn job_to_value(id: &str, job: &Job) -> Option<Value> {
             session_id,
         } => ("done", Some(response.clone()), session_id.clone(), None),
         JobState::Failed { error } => ("failed", None, None, Some(error.clone())),
+        JobState::Cancelled => ("cancelled", None, None, None),
         JobState::Running => return None,
     };
     Some(json!({
@@ -554,6 +582,7 @@ fn value_to_job(v: &Value) -> Option<(String, Job)> {
                 .unwrap_or("Jesse couldn't complete that.")
                 .to_string(),
         },
+        "cancelled" => JobState::Cancelled,
         _ => return None,
     };
     let completed_at = Some(
@@ -666,6 +695,7 @@ impl JobStore {
         }
         JobStore {
             jobs: Mutex::new(jobs),
+            aborts: Mutex::new(HashMap::new()),
             ttl,
             retrieval_grace,
             jobs_dir,
@@ -689,7 +719,15 @@ impl JobStore {
 
     /// Land a turn's outcome onto its job and persist the result. A Fatal/io
     /// error becomes Failed (still retrievable, so the phone sees the cause).
+    ///
+    /// Terminal states are write-once: the outcome is recorded only if the job is
+    /// still `Running`. This keeps a turn that finishes in the same instant the
+    /// client cancels from clobbering the `Cancelled` state that `cancel` already
+    /// wrote (and vice-versa — whichever wins the lock first sticks).
     fn complete(&self, id: &str, outcome: Result<(String, Option<String>), ApiError>) {
+        // The turn is over — drop its abort handle so the map can't leak. Done in
+        // its own statement so the `aborts` lock is released before taking `jobs`.
+        self.aborts.lock().unwrap().remove(id);
         let state = match outcome {
             Ok((response, session_id)) => JobState::Done {
                 response,
@@ -699,11 +737,46 @@ impl JobStore {
         };
         let mut guard = self.jobs.lock().unwrap();
         if let Some(job) = guard.get_mut(id) {
+            if !matches!(job.state, JobState::Running) {
+                return; // already terminal (e.g. cancelled) — don't clobber it
+            }
             job.state = state;
             job.completed_at = Some(SystemTime::now());
             if let Some(dir) = &self.jobs_dir {
                 persist_job(dir, id, job);
             }
+        }
+    }
+
+    /// Record the abort handle for a running job's turn task so `cancel` can reach
+    /// it. Called once, right after the turn is spawned.
+    fn set_abort(&self, id: &str, handle: AbortHandle) {
+        self.aborts.lock().unwrap().insert(id.to_string(), handle);
+    }
+
+    /// Cancel a running turn by id. Aborts its task (drop → `kill_on_drop` kills
+    /// `claude` and frees the concurrency permit) and marks the job `Cancelled`.
+    /// Idempotent and race-safe: an unknown id, or a job already terminal (done,
+    /// failed, or cancelled), is left untouched — the transition only fires from
+    /// `Running`. Returns the outcome purely for logging.
+    fn cancel(&self, id: &str) -> CancelOutcome {
+        // Take and fire the abort handle first; removing it also prevents a leak.
+        // Released before taking `jobs` to keep the two locks non-overlapping.
+        if let Some(handle) = self.aborts.lock().unwrap().remove(id) {
+            handle.abort();
+        }
+        let mut guard = self.jobs.lock().unwrap();
+        match guard.get_mut(id) {
+            None => CancelOutcome::Unknown,
+            Some(job) if matches!(job.state, JobState::Running) => {
+                job.state = JobState::Cancelled;
+                job.completed_at = Some(SystemTime::now());
+                if let Some(dir) = &self.jobs_dir {
+                    persist_job(dir, id, job);
+                }
+                CancelOutcome::Cancelled
+            }
+            Some(_) => CancelOutcome::AlreadyTerminal,
         }
     }
 
@@ -1517,6 +1590,11 @@ async fn jesse(
         jobs.complete(&jid, outcome);
     });
 
+    // Store the task's abort handle so `POST /jesse/cancel/{id}` can stop it.
+    // Aborting drops the task → drops the `Child` (kill_on_drop) → kills `claude`
+    // and releases the permit held inside the task.
+    st.jobs.set_abort(&job_id, handle.abort_handle());
+
     // Hold the connection up to the grace window for the fast path.
     let grace = Duration::from_secs(st.cfg.grace_secs);
     match timeout(grace, &mut handle).await {
@@ -1524,6 +1602,16 @@ async fn jesse(
         // plus the job_id (additive; existing callers ignore the extra field).
         Ok(join_res) => {
             if let Err(e) = join_res {
+                // A cancel landing inside the grace window aborts the task, so the
+                // join resolves to a cancellation here — report it as the clean
+                // terminal `cancelled` rather than a 500.
+                if e.is_cancelled() {
+                    return Ok((
+                        StatusCode::OK,
+                        Json(json!({ "job_id": job_id, "status": "cancelled" })),
+                    )
+                        .into_response());
+                }
                 return Err((
                     StatusCode::INTERNAL_SERVER_ERROR,
                     format!("job task failed: {e}"),
@@ -1544,6 +1632,12 @@ async fn jesse(
                 )
                     .into_response()),
                 Some(JobState::Failed { error }) => Err((StatusCode::BAD_GATEWAY, error)),
+                // A cancel that raced completion just inside the grace window.
+                Some(JobState::Cancelled) => Ok((
+                    StatusCode::OK,
+                    Json(json!({ "job_id": job_id, "status": "cancelled" })),
+                )
+                    .into_response()),
                 // The task joined, so it must have written a terminal state.
                 _ => Err((
                     StatusCode::INTERNAL_SERVER_ERROR,
@@ -1585,11 +1679,38 @@ async fn jesse_result(
         Some(JobState::Failed { error }) => {
             Ok(Json(json!({ "status": "failed", "error": error })))
         }
+        Some(JobState::Cancelled) => Ok(Json(json!({ "status": "cancelled" }))),
         None => Err((
             StatusCode::NOT_FOUND,
             "unknown or expired job id".to_string(),
         )),
     }
+}
+
+/// Cancel a running turn by job id (`POST /jesse/cancel/{id}`). Same bearer auth
+/// as `/jesse`. Aborts the turn — killing the `claude` child and freeing the
+/// concurrency slot — and marks the job `Cancelled`. **Idempotent:** an unknown
+/// id, an already-finished job, or a repeat cancel all return `204`, never an
+/// error; the phone fires this best-effort and may race the turn's own
+/// completion. Returns no body.
+async fn jesse_cancel(
+    State(st): State<AppState>,
+    UrlPath(job_id): UrlPath<String>,
+    headers: HeaderMap,
+) -> Result<StatusCode, ApiError> {
+    check_auth(&headers, &st.cfg.token)?;
+    match st.jobs.cancel(&job_id) {
+        CancelOutcome::Cancelled => {
+            eprintln!("cancel: job {job_id} aborted by client — claude killed, concurrency slot freed");
+        }
+        CancelOutcome::AlreadyTerminal => {
+            eprintln!("cancel: job {job_id} already finished — no-op");
+        }
+        CancelOutcome::Unknown => {
+            eprintln!("cancel: job {job_id} unknown — no-op (idempotent)");
+        }
+    }
+    Ok(StatusCode::NO_CONTENT)
 }
 
 // ---- Startup --------------------------------------------------------------
@@ -1645,6 +1766,7 @@ fn app(state: AppState) -> Router {
         .route("/jesse", post(jesse))
         .route("/jesse/prompts", get(jesse_prompts))
         .route("/jesse/result/:job_id", get(jesse_result))
+        .route("/jesse/cancel/:job_id", post(jesse_cancel))
         .layer(DefaultBodyLimit::max(body_limit))
         .with_state(state)
 }
@@ -2542,6 +2664,179 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    // ---- POST /jesse/cancel -----------------------------------------------
+
+    /// Fire `POST /jesse/cancel/{id}` with the given (optional) auth header.
+    fn cancel_request(auth: Option<&str>, job_id: &str) -> Request<Body> {
+        let mut b = Request::builder()
+            .method("POST")
+            .uri(format!("/jesse/cancel/{job_id}"));
+        if let Some(a) = auth {
+            b = b.header("authorization", a);
+        }
+        b.body(Body::empty()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn cancel_no_auth_is_401() {
+        let resp = app(test_state())
+            .oneshot(cancel_request(None, "whatever"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn cancel_wrong_token_is_401() {
+        let resp = app(test_state())
+            .oneshot(cancel_request(Some("Bearer wrong"), "whatever"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn cancel_unknown_id_is_idempotent_204() {
+        // An id the bridge never minted (or already evicted) is a clean no-op —
+        // the phone may cancel after the job is long gone.
+        let resp = app(test_state())
+            .oneshot(cancel_request(Some("Bearer test-token"), "does-not-exist"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    }
+
+    #[tokio::test]
+    async fn cancel_done_job_succeeds_without_clobbering_result() {
+        // Cancelling an already-finished job must return success but leave the
+        // stored reply intact (the phone can still retrieve it).
+        let st = test_state();
+        let id = st.jobs.create();
+        st.jobs
+            .complete(&id, Ok(("keep me".to_string(), Some("sess-k".to_string()))));
+
+        let resp = app(st.clone())
+            .oneshot(cancel_request(Some("Bearer test-token"), &id))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+
+        let v = result_status(&st, &id).await;
+        assert_eq!(v["status"], "done");
+        assert_eq!(v["response"], "keep me");
+        assert_eq!(v["session_id"], "sess-k");
+    }
+
+    /// The state machine in isolation — no HTTP, no `claude`. Covers the
+    /// transitions and the write-once invariant that keeps a racing `complete`
+    /// from clobbering a `Cancelled` state (and vice-versa).
+    #[test]
+    fn job_store_cancel_transitions_are_terminal_and_race_safe() {
+        let store = JobStore::new(Duration::from_secs(600), Duration::from_secs(600), None);
+
+        // Unknown id → Unknown, no entry created.
+        assert!(matches!(store.cancel("nope"), CancelOutcome::Unknown));
+        assert!(store.get("nope").is_none());
+
+        // Running → Cancelled, and the state sticks.
+        let running = store.create();
+        assert!(matches!(store.cancel(&running), CancelOutcome::Cancelled));
+        assert!(matches!(store.get(&running), Some(JobState::Cancelled)));
+
+        // Repeat cancel is idempotent (already terminal) and doesn't change it.
+        assert!(matches!(
+            store.cancel(&running),
+            CancelOutcome::AlreadyTerminal
+        ));
+        assert!(matches!(store.get(&running), Some(JobState::Cancelled)));
+
+        // A turn that completes AFTER a cancel must not overwrite Cancelled —
+        // this is the late-completion race the write-once guard exists for.
+        let raced = store.create();
+        assert!(matches!(store.cancel(&raced), CancelOutcome::Cancelled));
+        store.complete(&raced, Ok(("late reply".to_string(), None)));
+        assert!(matches!(store.get(&raced), Some(JobState::Cancelled)));
+
+        // Cancelling a job that already completed leaves the Done result intact.
+        let done = store.create();
+        store.complete(&done, Ok(("kept".to_string(), None)));
+        assert!(matches!(store.cancel(&done), CancelOutcome::AlreadyTerminal));
+        assert!(matches!(store.get(&done), Some(JobState::Done { .. })));
+    }
+
+    #[tokio::test]
+    async fn cancel_running_turn_kills_child_and_frees_slot() {
+        // End to end: a fake claude that sleeps far past the grace window and only
+        // touches its marker at the very end. Start the turn (202), cancel it, and
+        // assert it transitions to `cancelled`, the concurrency slot is freed (the
+        // aborted task drops its permit), and the child never reached its marker.
+        let marker = std::env::temp_dir().join(format!(
+            "jesse-cancel-marker-{}-{}.txt",
+            std::process::id(),
+            JOB_COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_file(&marker);
+        let script = format!(
+            "#!/bin/sh\n\
+             sleep 60\n\
+             touch '{}'\n\
+             printf '%s' '{{\"type\":\"result\",\"is_error\":false,\"result\":\"too late\"}}'\n",
+            marker.display()
+        );
+        let fake = write_fake_claude(&script);
+
+        let cfg = Config {
+            claude_bin: fake.to_string_lossy().into_owned(),
+            grace_secs: 1,        // force the 202 path
+            max_concurrency: 1,   // a freed slot is observable via available_permits
+            ..test_config()
+        };
+        let st = AppState::new(cfg);
+
+        // Start the long turn — it outruns the 1s grace and hands back a job id.
+        let resp = app(st.clone())
+            .oneshot(jesse_request(
+                Some("Bearer test-token"),
+                r#"{"mode":"ask","text":"cancel me"}"#,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::ACCEPTED);
+        let body: Value = serde_json::from_str(&body_string(resp).await).unwrap();
+        let job_id = body["job_id"].as_str().unwrap().to_string();
+        // The turn holds the only permit while it runs.
+        assert_eq!(st.sem.available_permits(), 0, "running turn holds the permit");
+
+        // Cancel it.
+        let resp = app(st.clone())
+            .oneshot(cancel_request(Some("Bearer test-token"), &job_id))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+
+        // The abort drops the task asynchronously; wait for the permit to come back.
+        let mut freed = false;
+        for _ in 0..50 {
+            if st.sem.available_permits() == 1 {
+                freed = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert!(freed, "aborting the turn must free its concurrency slot");
+
+        // The job reads as cleanly cancelled, and the child never hit its marker.
+        let v = result_status(&st, &job_id).await;
+        assert_eq!(v["status"], "cancelled");
+        assert!(
+            !marker.exists(),
+            "the claude child must be killed before it finished its work"
+        );
+
+        let _ = std::fs::remove_file(&marker);
+        let _ = std::fs::remove_file(&fake);
     }
 
     // ---- disconnect survival (the load-bearing regression) ----------------

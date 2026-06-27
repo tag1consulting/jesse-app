@@ -38,6 +38,8 @@ final class RunCoordinatorRecheckTests: XCTestCase {
             case .done(let text): return .done(JesseReply(text: text, sessionId: nil))
             }
         }
+
+        func cancelJob(jobId: String) async throws {}
     }
 
     @MainActor
@@ -146,6 +148,8 @@ final class RunCoordinatorRecheckTests: XCTestCase {
             onResult?()
             return .expired
         }
+
+        func cancelJob(jobId: String) async throws {}
     }
 
     @MainActor

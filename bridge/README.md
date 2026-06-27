@@ -95,9 +95,31 @@ curl -s http://127.0.0.1:8765/jesse/result/<job_id> \
 # → { "status": "running" }
 #   { "status": "done", "response": "...", "session_id": "..." }
 #   { "status": "failed", "error": "..." }
+#   { "status": "cancelled" }
 ```
 
 Same bearer auth as `/jesse`. An unknown or evicted id → **`404`**.
+
+### Cancel an in-flight turn
+
+```bash
+curl -s -X POST http://127.0.0.1:8765/jesse/cancel/<job_id> \
+  -H "Authorization: Bearer $JESSE_TOKEN"
+# → 204 No Content
+```
+
+`POST /jesse/cancel/{job_id}` stops a running turn: it **aborts the turn's task**,
+which drops the `claude` child (`kill_on_drop`) — killing the process so it stops
+burning tokens on a reply nobody will read — and **frees the concurrency slot** the
+turn held. The job moves to a terminal **`cancelled`** state, so a later
+`GET /jesse/result/{job_id}` returns `{ "status": "cancelled" }` (a clean status,
+not a `404`).
+
+Same bearer auth as `/jesse`. **Idempotent:** an unknown id, an already-finished
+job, or a repeat cancel all return **`204`**, never an error — the phone fires this
+best-effort and may race the turn's own completion. A turn that finishes in the
+same instant it's cancelled keeps whichever terminal state landed first (the stored
+reply is never clobbered).
 
 ### Eviction model — a finished reply isn't lost while the phone is away
 

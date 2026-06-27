@@ -188,16 +188,29 @@ final class RunCoordinator {
 
     /// Cancellation is authoritative over the run's state, not just the task.
     /// We cancel the task *and* clear the run synchronously so the thread is idle
-    /// the instant the user taps Cancel: `inFlight` is dropped (the bridge has no
-    /// cancel endpoint, so the turn keeps running server-side, but the user asked
-    /// to stop, so its eventual result is discarded rather than re-attached) and
-    /// `startDates` is cleared. Dropping the task handle here — together with the
-    /// poll loop's cancelled-exit — means `isRunning` reports `false` immediately;
-    /// the task's own tail still runs to release the background grant.
+    /// the instant the user taps Cancel: `inFlight` is dropped and `startDates` is
+    /// cleared. Dropping the task handle here — together with the poll loop's
+    /// cancelled-exit — means `isRunning` reports `false` immediately; the task's
+    /// own tail still runs to release the background grant.
+    ///
+    /// Additionally, if a bridge job is in flight, fire a best-effort server-side
+    /// cancel so the `claude` turn actually stops instead of running to completion
+    /// and burning tokens on a reply nobody will read. The network call is
+    /// detached so the UI is idle instantly regardless of connectivity; if it
+    /// fails (laptop asleep, offline) the orphan runs on and is reaped by the
+    /// bridge's job TTL — the prior status quo. `cancelJob` is idempotent, so a
+    /// race with the turn's natural completion is harmless.
     func cancel(_ threadID: UUID) {
+        // Capture the in-flight job id BEFORE clearRun drops it.
+        let jobId = inFlight[threadID]?.jobId
         tasks[threadID]?.cancel()
         tasks[threadID] = nil
         clearRun(threadID)
+
+        if let jobId {
+            let client = makeClient(configProvider())
+            Task { try? await client.cancelJob(jobId: jobId) }
+        }
     }
 
     // MARK: - Resume (foreground re-attach)
