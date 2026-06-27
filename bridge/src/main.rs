@@ -1290,6 +1290,68 @@ fn interpret_claude_output(stdout: &str, stderr: &str, exit_success: bool) -> Cl
     }
 }
 
+/// Decide the final outcome of a *streamed* turn from its terminal `result` line
+/// (if one arrived) and the text already accumulated from the stream. The whole
+/// point: a turn that produced a visible answer must never be delivered as an
+/// empty bubble or discarded — the streamed text is the safety net under a
+/// success envelope whose `result` field is empty/missing.
+///
+/// Captured `stream-json` shapes this handles (see `bridge/README.md`):
+///   * `Ok` with real `result` text → that authoritative answer (the normal case;
+///     verified that `--include-partial-messages` does NOT empty this field).
+///   * `Ok` but `result` is empty/blank, yet tokens streamed → `Ok` with the
+///     streamed text, keeping the result line's `session_id`. The answer already
+///     reached the client live; an empty `result` field must not erase it.
+///   * No terminal `result` line at all but tokens streamed → `Ok` with the
+///     streamed text (claude emitted an answer, then exited without an error
+///     envelope). `session_id` is unknown here, so `None`.
+///   * `Retryable` / `Fatal` error envelope (`is_error: true`, e.g. an upstream
+///     5xx or `error_max_turns`) → unchanged: still retried / surfaced. A real
+///     failure is never papered over with mid-turn narration.
+///   * No `result` line AND no streamed text → `Fatal` over stderr — a genuine
+///     failure, surfaced (never a silent empty success).
+fn resolve_stream_outcome(
+    terminal: Option<ClaudeOutcome>,
+    streamed: &str,
+    stderr: &str,
+) -> ClaudeOutcome {
+    let streamed = streamed.trim();
+    match terminal {
+        // Success envelope: prefer the authoritative `result`, but fall back to
+        // the streamed text when `result` came back empty/blank.
+        Some(ClaudeOutcome::Ok { result, session_id }) => {
+            if !result.trim().is_empty() {
+                ClaudeOutcome::Ok { result, session_id }
+            } else if !streamed.is_empty() {
+                ClaudeOutcome::Ok {
+                    result: streamed.to_string(),
+                    session_id,
+                }
+            } else {
+                // Success but no answer anywhere — never deliver an empty bubble.
+                ClaudeOutcome::Fatal {
+                    message: "claude returned an empty result and streamed no text"
+                        .to_string(),
+                }
+            }
+        }
+        // Error envelopes (Retryable / Fatal) are surfaced/retried as-is.
+        Some(other) => other,
+        // No terminal `result` line. If the stream nonetheless carried an answer,
+        // deliver it; otherwise this is a real failure — surface it via stderr.
+        None => {
+            if streamed.is_empty() {
+                interpret_claude_output("", stderr, false)
+            } else {
+                ClaudeOutcome::Ok {
+                    result: streamed.to_string(),
+                    session_id: None,
+                }
+            }
+        }
+    }
+}
+
 /// Build the argument vector for one `claude` invocation (everything after the
 /// binary name). Pure and side-effect-free so it can be unit-tested without
 /// spawning a process. Enforces the C1 least-privilege boundary:
@@ -1441,14 +1503,14 @@ async fn run_claude_streaming(
         let _ = child.wait().await;
         let stderr = stderr_task.await.unwrap_or_default();
 
-        // The terminal `result` line classifies the run; if the stream ended
-        // without one (crash, killed, non-JSON noise only), fall back to the
-        // buffered interpreter over the captured stderr — always a Fatal here,
-        // since a healthy turn always emits a `result`.
-        let outcome = match terminal {
-            Some(o) => o,
-            None => interpret_claude_output("", &stderr, false),
-        };
+        // Decide the outcome from the terminal `result` line AND the text already
+        // accumulated from the stream, so a turn that produced a visible answer is
+        // never delivered empty or discarded: an empty/missing `result` on an
+        // otherwise-successful turn falls back to the streamed text. Error
+        // envelopes (Retryable/Fatal) and the genuine no-answer case are surfaced
+        // unchanged. See `resolve_stream_outcome`.
+        let streamed = jobs.stream_snapshot(job_id).unwrap_or_default();
+        let outcome = resolve_stream_outcome(terminal, &streamed, &stderr);
 
         match outcome {
             ClaudeOutcome::Ok { result, session_id } => {
@@ -3494,6 +3556,109 @@ mod tests {
         assert!(
             pos("--include-partial-messages").is_some(),
             "token-level deltas require --include-partial-messages"
+        );
+    }
+
+    // ---- streaming: real-fixture run-outcome regression -------------------
+    //
+    // The regression guard for the "empty bubble" bug: a turn whose terminal
+    // `result` is empty/missing must deliver the answer that already streamed,
+    // not nothing. Fixtures under tests/fixtures/stream/ are REAL `claude
+    // --output-format stream-json --verbose --include-partial-messages` captures
+    // (see bridge/README.md for how each was produced). We feed their lines
+    // through the real `parse_stream_line` + `resolve_stream_outcome` — the exact
+    // path `run_claude_streaming` takes — so the fix can't silently regress.
+
+    const FX_SUCCESS: &str = include_str!("../tests/fixtures/stream/success.ndjson");
+    const FX_EMPTY_RESULT: &str =
+        include_str!("../tests/fixtures/stream/empty_result_success.ndjson");
+    const FX_MISSING_RESULT: &str =
+        include_str!("../tests/fixtures/stream/missing_result.ndjson");
+    const FX_MAX_TURNS: &str = include_str!("../tests/fixtures/stream/error_max_turns.ndjson");
+
+    /// Replay a captured `stream-json` turn exactly as `run_claude_streaming`
+    /// does: accumulate `text_delta`s, keep the last terminal `result`, then let
+    /// `resolve_stream_outcome` decide. `stderr` stands in for the drained child
+    /// stderr the real path passes.
+    fn replay_outcome(fixture: &str, stderr: &str) -> ClaudeOutcome {
+        let mut streamed = String::new();
+        let mut terminal: Option<ClaudeOutcome> = None;
+        for line in fixture.lines() {
+            match parse_stream_line(line) {
+                StreamEvent::TextDelta(t) => streamed.push_str(&t),
+                StreamEvent::Done(o) => terminal = Some(o),
+                StreamEvent::ToolActivity { .. } | StreamEvent::Ignore => {}
+            }
+        }
+        resolve_stream_outcome(terminal, &streamed, stderr)
+    }
+
+    #[test]
+    fn real_success_turn_yields_full_result_text() {
+        // Normal turn: the authoritative `result` text is delivered verbatim.
+        match replay_outcome(FX_SUCCESS, "") {
+            ClaudeOutcome::Ok { result, session_id } => {
+                assert!(
+                    result.contains("This vault is") && result.len() > 600,
+                    "expected the full ~693-char answer, got {} chars",
+                    result.len()
+                );
+                assert_eq!(session_id.as_deref(), Some("0a61d246-062e-4910-b825-44ebd04f0bbd"));
+            }
+            other => panic!("expected Ok with full text, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn empty_result_success_falls_back_to_streamed_text() {
+        // Success envelope but `result` is "" — must deliver the streamed answer
+        // (not an empty bubble), keeping the result line's session_id.
+        match replay_outcome(FX_EMPTY_RESULT, "") {
+            ClaudeOutcome::Ok { result, session_id } => {
+                assert!(
+                    result.contains("This vault is") && !result.trim().is_empty(),
+                    "empty `result` should fall back to streamed text, got {result:?}"
+                );
+                assert_eq!(session_id.as_deref(), Some("0a61d246-062e-4910-b825-44ebd04f0bbd"));
+            }
+            other => panic!("expected Ok with streamed text, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn missing_result_line_with_streamed_text_yields_streamed_text() {
+        // No terminal `result` line at all, but the turn streamed an answer →
+        // deliver it (not the old unconditional Fatal). session_id is unknown.
+        match replay_outcome(FX_MISSING_RESULT, "") {
+            ClaudeOutcome::Ok { result, session_id } => {
+                assert!(result.contains("This vault is"), "got {result:?}");
+                assert!(session_id.is_none(), "no result line → no session_id");
+            }
+            other => panic!("expected Ok with streamed text, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn no_result_and_no_text_is_fatal_with_message() {
+        // The genuine failure: nothing streamed and no result line. Must be a
+        // Fatal carrying the stderr cause — never a blank Ok.
+        match resolve_stream_outcome(None, "", "claude: connection reset") {
+            ClaudeOutcome::Fatal { message } => {
+                assert!(!message.trim().is_empty(), "Fatal must carry a message");
+                assert!(message.contains("connection reset"), "got {message:?}");
+            }
+            other => panic!("expected Fatal, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn error_envelope_with_streamed_text_stays_fatal() {
+        // A real error envelope (error_max_turns, is_error: true, result: null)
+        // must still surface as a failure even though narration text streamed —
+        // mid-turn narration is not the answer and must not masquerade as one.
+        assert!(
+            matches!(replay_outcome(FX_MAX_TURNS, ""), ClaudeOutcome::Fatal { .. }),
+            "error envelope must stay Fatal, not be replaced by streamed narration"
         );
     }
 

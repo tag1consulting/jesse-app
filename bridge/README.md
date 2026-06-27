@@ -185,12 +185,72 @@ format, not ours):
     `is_error` / `api_error_status` carry transient (5xx/429/529 → retry) vs fatal
     failures. This feeds the **same** `Ok`/`Retryable`/`Fatal` classification the
     buffered path always used (`classify_result_value`), so retry/timeout/
-    3-attempt behavior is preserved. The classified result — **not** the streamed
-    deltas — is the authoritative text returned and persisted.
+    3-attempt behavior is preserved. The classified `result` text is the
+    **authoritative** answer **when it's non-empty**; when it isn't, the bridge
+    falls back to the streamed text rather than delivering nothing (see
+    [Captured result schema](#captured-result-schema-and-the-empty-reply-fix)).
 
 `parse_stream_line` maps one NDJSON line to an internal `StreamEvent`
 (`TextDelta` / `ToolActivity` / `Done` / `Ignore`) and is pure, so it's unit-tested
 against captured fixtures.
+
+### Captured result schema and the empty-reply fix
+
+The verified shapes below were **captured from real `claude --output-format
+stream-json --verbose --include-partial-messages` runs in the vault** (2026-06-27,
+`claude` 2.1.195). They are committed as fixtures under
+[`tests/fixtures/stream/`](tests/fixtures/stream/) and replayed by the
+`real_*`/`*_falls_back_*`/`*_stays_fatal` tests through the **real**
+`parse_stream_line` + `resolve_stream_outcome` — the exact path
+`run_claude_streaming` takes — so this can't silently regress.
+
+A healthy terminal `result` line carries the full answer plus a session id:
+
+```json
+{"type":"result","subtype":"success","is_error":false,"api_error_status":null,
+ "result":"This vault is …","session_id":"0a61d246-…","stop_reason":"end_turn"}
+```
+
+**`--include-partial-messages` does NOT empty `result`.** Verified by running the
+same prompt with and without the flag: both terminal lines carry the full answer
+(693 vs 838 chars); the flag only *adds* the token-level `text_delta` events
+(10 vs 0). So the flag is kept — it's what gives live tokens, at no cost to the
+authoritative `result`. (Decision: keep the flag **and** the accumulated-text
+fallback; do not drop the flag.)
+
+The failing shapes — what produced the **empty / lost reply** the user saw:
+
+| Shape | `result` line | Streamed text? | Old behavior | New behavior |
+|---|---|---|---|---|
+| Empty-result success | `subtype:"success", is_error:false, result:""` | yes | `Ok{result:""}` → **empty bubble** | `Ok` with the streamed text (keeps `session_id`) |
+| No result line at all | *(absent — clean exit after streaming)* | yes | unconditional **`Fatal`** → answer discarded | `Ok` with the streamed text |
+| Genuine failure | *(absent)* | no | `Fatal` over stderr | **unchanged** — `Fatal` over stderr (never a blank `Ok`) |
+| Error envelope, e.g. `error_max_turns` | `is_error:true, result:null` | yes (mid-turn narration) | `Fatal` | **unchanged** — stays `Fatal`; narration is not the answer |
+
+The `error_max_turns` row is a real capture (`{"subtype":"error_max_turns",
+"is_error":true,"result":null}` after the model streamed *"I have CLAUDE.md already
+in context… but let me read both files…"*). It is deliberately **left as a
+failure**: an error envelope must surface, and mid-turn narration must not
+masquerade as a finished answer. The fallback only rescues turns that *succeeded*
+(or exited cleanly with no envelope) yet carried no authoritative `result` text.
+
+**Root cause.** The streaming path treated the terminal `result` line's `result`
+field as the *only* source of the answer: an empty-but-`success` `result` was
+returned verbatim as `Ok{result:""}` (an empty reply bubble), and a *missing*
+`result` line was turned into an unconditional `Fatal` — in both cases **discarding
+the answer the bridge had already accumulated token-by-token from the stream**. The
+visible reply existed the whole time, in `JobStore`'s `StreamHandle`; it was just
+never consulted at the decision point.
+
+**Fix.** `resolve_stream_outcome(terminal, streamed, stderr)` is the single place
+that decides a streamed turn's outcome. It prefers the authoritative `result`, but
+when that text is empty/missing it falls back to `jobs.stream_snapshot(job_id)` (the
+accumulated stream text) before ever returning empty. `Retryable` (5xx/429/529) and
+real error envelopes (`is_error:true`) are untouched — they still retry / surface.
+The one genuinely empty case (no `result` line **and** no streamed text) is a
+`Fatal` carrying the stderr cause, **never** a silent `Ok{result:""}`. Verified
+end-to-end against a running bridge (stub `claude` emitting each shape), not just in
+unit tests.
 
 ### `GET /jesse/stream/:job_id`
 
