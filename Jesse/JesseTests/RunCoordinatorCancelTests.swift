@@ -26,9 +26,23 @@ final class RunCoordinatorCancelTests: XCTestCase {
         }
 
         func result(jobId: String) async throws -> JesseResultState {
-            try await withCheckedThrowingContinuation { c in
-                continuation = c
-                onResultCalled?()
+            // A live client's `result` is a URLSession await that throws when its
+            // task is cancelled, so the poll loop's `Task.isCancelled` path resumes
+            // and exits cleanly. A bare `withCheckedThrowingContinuation` would just
+            // park: cancelling the poll task never resumes it, orphaning both the
+            // continuation and the suspended poll task past the test boundary — the
+            // textbook trigger for XCTest's async task-allocator abort. Honor
+            // cancellation the way the real client does so the parked poll resumes.
+            try await withTaskCancellationHandler {
+                try await withCheckedThrowingContinuation { c in
+                    continuation = c
+                    onResultCalled?()
+                }
+            } onCancel: {
+                Task { @MainActor in
+                    continuation?.resume(throwing: CancellationError())
+                    continuation = nil
+                }
             }
         }
 
