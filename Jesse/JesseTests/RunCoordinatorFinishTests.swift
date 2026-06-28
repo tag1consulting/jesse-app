@@ -56,11 +56,37 @@ final class RunCoordinatorFinishTests: XCTestCase {
         return ModelContext(container)
     }
 
+    /// Records what was spoken so a test can assert the spoken line (and that the
+    /// genuinely-empty path speaks nothing through the `finish` seam).
     @MainActor
-    private func makeCoordinator(_ fake: SwitchableClient) -> RunCoordinator {
+    private final class SpeakSpy {
+        var spoken: [String] = []
+        func speak(_ s: String) { spoken.append(s) }
+    }
+
+    /// A save seam whose first call can be forced to throw (then succeed after),
+    /// to drive the save-failure → Re-check → no-duplicate path deterministically.
+    @MainActor
+    private final class SaveSpy {
+        struct ForcedFailure: Error {}
+        var calls = 0
+        var failFirst = false
+        func save(_ context: ModelContext) throws {
+            calls += 1
+            if failFirst && calls == 1 { throw ForcedFailure() }
+            try context.save()
+        }
+    }
+
+    @MainActor
+    private func makeCoordinator(_ fake: SwitchableClient,
+                                 speak: SpeakSpy? = nil,
+                                 save: SaveSpy? = nil) -> RunCoordinator {
         RunCoordinator(
             config: { JesseConfig(host: "laptop", port: 8765, token: "tok") },
-            makeClient: { _ in fake })
+            makeClient: { _ in fake },
+            speak: { s in if let speak { speak.speak(s) } },
+            save: { ctx in if let save { try save.save(ctx) } else { try ctx.save() } })
     }
 
     @MainActor
@@ -180,6 +206,159 @@ final class RunCoordinatorFinishTests: XCTestCase {
         XCTAssertNotNil(coordinator.error(for: thread.id), "an empty reply surfaces a recoverable state")
         XCTAssertTrue(coordinator.canRecheck(thread.id), "the job is retained so Re-check can retry")
         XCTAssertFalse(coordinator.isRunning(thread.id))
+    }
+
+    // MARK: - The spoken-only reply guard (spoken AND recorded, never dropped)
+
+    /// A reply whose content lives ONLY in the `SPOKEN:` line (empty `displayText`,
+    /// non-empty `spokenText`) is a real reply — not "empty." With voice on it must
+    /// be recorded as a `jesse` turn (so the transcript/history aren't blank) AND
+    /// spoken. Pre-fix `finish` saw the empty `displayText` and surfaced Re-check,
+    /// leaving the voice turn both blank and silent.
+    @MainActor
+    func testVoiceOnlySpokenReplyIsSpokenAndRecorded() async throws {
+        let context = try makeContext()
+        let reply = JesseReply(text: "SPOKEN: the roof guy comes Thursday", sessionId: "sess-v")
+        let fake = SwitchableClient(phase: .done(reply))
+        let speak = SpeakSpy()
+        let coordinator = makeCoordinator(fake, speak: speak)
+
+        let thread = JesseThread(mode: .ask)
+        coordinator.send(thread: thread, text: "a question", voice: true, context: context)
+
+        await waitUntil("the spoken-only reply to render as a jesse turn") {
+            !self.jesseTurns(thread).isEmpty
+        }
+
+        XCTAssertEqual(jesseTurns(thread).count, 1, "exactly one jesse turn for a spoken-only reply")
+        XCTAssertEqual(thread.orderedTurns.last?.text, "the roof guy comes Thursday",
+                       "the spoken line is recorded as the turn's text — not lost as 'empty'")
+        XCTAssertEqual(thread.orderedTurns.last?.roleValue, .jesse)
+        XCTAssertEqual(thread.sessionId, "sess-v")
+        XCTAssertEqual(speak.spoken, ["the roof guy comes Thursday"], "the reply is spoken aloud")
+        XCTAssertNil(coordinator.error(for: thread.id), "a spoken-only reply is not an error")
+        XCTAssertNil(coordinator.inFlight[thread.id], "a delivered reply clears the retained job")
+        XCTAssertFalse(coordinator.isRunning(thread.id))
+    }
+
+    /// Only when a reply is *genuinely* empty — both `displayText` and `spokenText`
+    /// trim to "" — does `finish` keep the recoverable error + Re-check, and it
+    /// speaks nothing through the `finish` seam.
+    @MainActor
+    func testGenuinelyEmptyReplyStillSurfacesRecheck() async throws {
+        let context = try makeContext()
+        // Whitespace only → both displayText and spokenText are empty.
+        let fake = SwitchableClient(phase: .done(JesseReply(text: "   \n  ", sessionId: "sess-e")))
+        let speak = SpeakSpy()
+        let coordinator = makeCoordinator(fake, speak: speak)
+
+        let thread = JesseThread(mode: .ask)
+        coordinator.send(thread: thread, text: "a question", voice: true, context: context)
+
+        await waitUntil("the genuinely-empty reply to settle into Re-check") {
+            coordinator.error(for: thread.id) != nil
+        }
+
+        XCTAssertTrue(jesseTurns(thread).isEmpty, "no turn for a genuinely empty reply")
+        XCTAssertNotNil(coordinator.error(for: thread.id), "an empty reply surfaces a recoverable state")
+        XCTAssertTrue(coordinator.canRecheck(thread.id), "the job is retained so Re-check can retry")
+        XCTAssertEqual(speak.spoken, [], "a genuinely empty reply speaks nothing through the finish seam")
+        XCTAssertFalse(coordinator.isRunning(thread.id))
+    }
+
+    /// The same spoken-only reply with voice OFF still records the content as a
+    /// turn (so it isn't lost) but speaks nothing.
+    @MainActor
+    func testNonVoiceSpokenOnlyReplyRecordsTurnButDoesNotSpeak() async throws {
+        let context = try makeContext()
+        let reply = JesseReply(text: "SPOKEN: noted for later", sessionId: "sess-n")
+        let fake = SwitchableClient(phase: .done(reply))
+        let speak = SpeakSpy()
+        let coordinator = makeCoordinator(fake, speak: speak)
+
+        let thread = JesseThread(mode: .ask)
+        coordinator.send(thread: thread, text: "a question", voice: false, context: context)
+
+        await waitUntil("the spoken-only reply to render as a jesse turn") {
+            !self.jesseTurns(thread).isEmpty
+        }
+
+        XCTAssertEqual(jesseTurns(thread).count, 1, "the spoken-only content is recorded, not lost")
+        XCTAssertEqual(thread.orderedTurns.last?.text, "noted for later")
+        XCTAssertEqual(speak.spoken, [], "voice off speaks nothing")
+        XCTAssertNil(coordinator.error(for: thread.id))
+        XCTAssertFalse(coordinator.isRunning(thread.id))
+    }
+
+    // MARK: - Idempotent delivery (a re-entry of finish can't double-append)
+
+    /// A save failure shows the reply (in-memory turn) and retains the job for
+    /// Re-check. A subsequent Re-check that re-polls the SAME completed job must
+    /// NOT append the reply a second time — it sees the idempotency key and only
+    /// retries the (now-succeeding) save, then clears the run.
+    @MainActor
+    func testSaveFailureRetainsRecheckAndRecheckDoesNotDuplicate() async throws {
+        let context = try makeContext()
+        let reply = JesseReply(text: "the durable answer", sessionId: "sess-s")
+        let fake = SwitchableClient(phase: .done(reply))
+        let save = SaveSpy()
+        save.failFirst = true
+        let coordinator = makeCoordinator(fake, save: save)
+
+        let thread = JesseThread(mode: .ask)
+        coordinator.send(thread: thread, text: "a question", voice: false, context: context)
+
+        // First delivery: the save throws → reply shown in memory, error + Re-check,
+        // job retained.
+        await waitUntil("the save failure to surface Re-check") {
+            coordinator.error(for: thread.id) != nil
+        }
+        try await Task.sleep(for: .milliseconds(50)) // let the send task fully unwind
+
+        XCTAssertEqual(jesseTurns(thread).count, 1, "the reply is shown once despite the save failure")
+        XCTAssertEqual(thread.orderedTurns.last?.text, "the durable answer")
+        XCTAssertNotNil(coordinator.error(for: thread.id), "the save failure is surfaced, not swallowed")
+        XCTAssertTrue(coordinator.canRecheck(thread.id), "the job is retained for Re-check")
+        XCTAssertNotNil(coordinator.inFlight[thread.id])
+
+        // Re-check: same completed job, save now succeeds. The idempotency key
+        // (lastDeliveredJobId, set on the live object) makes finish retry the save
+        // only — no second turn.
+        coordinator.recheck(thread.id, context: context)
+
+        await waitUntil("the Re-check to clear the run") {
+            coordinator.inFlight[thread.id] == nil && coordinator.error(for: thread.id) == nil
+        }
+
+        XCTAssertEqual(jesseTurns(thread).count, 1, "Re-check does NOT duplicate the reply")
+        XCTAssertNil(coordinator.error(for: thread.id), "the retried save succeeds and clears the error")
+        XCTAssertNil(coordinator.inFlight[thread.id], "the run is cleared")
+        XCTAssertFalse(coordinator.isRunning(thread.id))
+        XCTAssertEqual(thread.lastDeliveredJobId, "job-finish", "the delivered job is keyed on the thread")
+    }
+
+    /// The narrow idempotency guard: once a job's reply is delivered, a second
+    /// `finish` re-entry for the SAME `jobId` leaves the turn count unchanged.
+    @MainActor
+    func testIdempotentDeliveryIgnoresRepeatJob() async throws {
+        let context = try makeContext()
+        let reply = JesseReply(text: "answered once", sessionId: "sess-i")
+        let fake = SwitchableClient(phase: .done(reply))
+        let coordinator = makeCoordinator(fake)
+
+        let thread = JesseThread(mode: .ask)
+        coordinator.send(thread: thread, text: "a question", voice: false, context: context)
+
+        await waitUntil("the reply to render") { !self.jesseTurns(thread).isEmpty }
+        XCTAssertEqual(jesseTurns(thread).count, 1)
+        XCTAssertEqual(thread.lastDeliveredJobId, "job-finish")
+
+        // Re-enter finish for the same job (e.g. a retained-job re-poll). The key
+        // matches, so no second turn is appended.
+        coordinator.finish(threadID: thread.id, thread: thread, reply: reply,
+                           voice: false, jobId: "job-finish", context: context)
+
+        XCTAssertEqual(jesseTurns(thread).count, 1, "a repeat of the same job appends no second turn")
     }
 
     // MARK: - helpers

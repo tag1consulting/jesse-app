@@ -178,6 +178,36 @@ Re-check shown} — "spinner stops, nothing shown, no error" is unreachable.
   recoverable error (so the bridge's still-held reply is one **Re-check** away),
   rather than clearing into nothing. See `RunCoordinatorFinishTests`.
 
+Two follow-on root causes in the same `finish`, fixed 2026-06-28:
+
+- **A spoken-only reply was dropped as "empty."** The empty-reply guard keyed on
+  `reply.displayText`, which strips the `SPOKEN:` line (see [Voice
+  requests](#voice-requests)). A voice turn whose entire content was that one line
+  therefore had an empty `displayText` and hit the Re-check path — so it both
+  "showed empty" and "stayed silent," losing the answer. **Fix:** split "no content
+  at all" from "content that lives only in the spoken line." When `displayText` is
+  empty but `reply.spokenText` is non-empty, record a `jesse` turn whose text **is**
+  the spoken line (so the transcript/history aren't blank) and speak it when
+  `voice` is on — the same delivery as a normal reply. Only a *genuinely* empty
+  reply (both `displayText` and `spokenText` empty) keeps the recoverable error +
+  Re-check.
+- **A re-entry of `finish` could double-append the reply.** A save failure retains
+  `inFlight`, and Re-check / `resume` legitimately re-polls the same completed job
+  and re-runs `finish` — which appended unconditionally, so the same reply could
+  land twice. **Fix:** `JesseThread.lastDeliveredJobId` is an idempotency key.
+  `finish` takes the `jobId` and, once the thread is resolved and **before**
+  appending, returns early if `target.lastDeliveredJobId == jobId` — retrying only
+  the persist (so a previously-failed save can now succeed) and clearing the run,
+  never a second turn. A new delivery sets the key together with the append. On
+  relaunch nothing is persisted, so the key is absent and Re-check/`resume`
+  delivers exactly once. (`finish` also gained injected `speak`/`save` seams,
+  mirroring the existing `makeClient`/`config` injection, so the tests can assert
+  what was spoken and force a save failure deterministically.) The net invariant:
+  a completing turn is always exactly one of {reply shown — on screen or spoken,
+  recoverable error + Re-check}, with no duplicated turns and no silently-dropped
+  voice reply. See the five `testVoiceOnlySpokenReply…`/`…SaveFailure…`/
+  `…IdempotentDelivery…` cases in `RunCoordinatorFinishTests`.
+
 ## Live streaming (SSE)
 
 A turn's reply streams to the phone token-by-token instead of arriving all at

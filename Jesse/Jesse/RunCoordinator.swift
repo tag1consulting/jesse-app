@@ -70,15 +70,27 @@ final class RunCoordinator {
     // built-in floor, which is always prepended and never removed). Injected so
     // tests can drive it without UserDefaults state.
     private let floorProvider: @MainActor (JesseMode) -> String?
+    // How a spoken reply is voiced. Defaults to the real on-device TTS; injected
+    // so a test can assert what was spoken (and that the genuinely-empty path
+    // speaks nothing). Used only in `finish`.
+    private let speak: @MainActor (String) -> Void
+    // How a turn's mutations are persisted. Defaults to a real `context.save()`;
+    // injected so a test can force a save failure deterministically. Used only in
+    // `finish`.
+    private let save: @MainActor (ModelContext) throws -> Void
 
     init(config: @escaping @MainActor () -> JesseConfig = { ConfigStore.load() },
          makeClient: @escaping @MainActor (JesseConfig) -> any JesseClientProtocol = { JesseClient(config: $0) },
          instructions: @escaping @MainActor (JesseMode) -> String? = { PromptStore.wrapperOverride(for: $0) },
-         floor: @escaping @MainActor (JesseMode) -> String? = { PromptStore.floorOverride(for: $0) }) {
+         floor: @escaping @MainActor (JesseMode) -> String? = { PromptStore.floorOverride(for: $0) },
+         speak: @escaping @MainActor (String) -> Void = { Speaker.shared.speak($0) },
+         save: @escaping @MainActor (ModelContext) throws -> Void = { try $0.save() }) {
         self.configProvider = config
         self.makeClient = makeClient
         self.instructionsProvider = instructions
         self.floorProvider = floor
+        self.speak = speak
+        self.save = save
         self.inFlight = InFlightStore.load()
     }
 
@@ -188,7 +200,7 @@ final class RunCoordinator {
                     // Deliver against the live `thread` reference (the send path
                     // holds it), so there's no fetch-by-id that could miss.
                     self.finish(threadID: threadID, thread: thread, reply: reply,
-                                voice: voice, context: context)
+                                voice: voice, jobId: nil, context: context)
                 case .running(let jobId):
                     // The normal path. `persist` runs FIRST, synchronously, so
                     // `inFlight` is on disk the instant the job_id arrives — before
@@ -358,7 +370,8 @@ final class RunCoordinator {
         guard let outcome else { return }
         switch outcome {
         case .done(let reply):
-            finish(threadID: threadID, thread: thread, reply: reply, voice: voice, context: context)
+            finish(threadID: threadID, thread: thread, reply: reply, voice: voice,
+                   jobId: jobId, context: context)
         case .failed(let message):
             // The turn failed recoverably (a bridge `error`/`.failed`, or a
             // transport error in the poll) — keep the job retained for Re-check.
@@ -465,18 +478,30 @@ final class RunCoordinator {
     }
 
     /// Deliver a completed reply. The invariant: this either shows the reply (a
-    /// `jesse` Turn, persisted) or surfaces a recoverable error + Re-check — it is
-    /// never allowed to `clearRun` into nothing. The three ways the old `finish`
-    /// could silently lose a reply are each now a visible, recoverable state:
+    /// `jesse` Turn, persisted — its content is the screen text, or, for a
+    /// spoken-only reply, the spoken line) or surfaces a recoverable error +
+    /// Re-check — it is never allowed to `clearRun` into nothing, and it never both
+    /// "shows empty" and "stays silent." The ways the old `finish` could silently
+    /// lose a reply are each now a visible, recoverable state:
     ///   1. the thread can't be resolved (the by-id re-fetch returns nil),
-    ///   2. the reply's `displayText` is empty,
+    ///   2. the reply is *genuinely* empty (both screen and spoken text empty),
     ///   3. `context.save()` throws.
+    /// A reply whose content lives only in the `SPOKEN:` line (empty `displayText`,
+    /// non-empty `spokenText`) is a real reply — recorded as a turn and spoken —
+    /// not a silent drop.
+    ///
+    /// Delivery is idempotent on `jobId`: a re-entry of `finish` for a job whose
+    /// reply this thread already received (Re-check / resume re-polling a completed
+    /// job after a save failure retained `inFlight`) does NOT append a second turn —
+    /// it only retries the persist and clears the run. See `lastDeliveredJobId`.
     ///
     /// `thread` is the live reference the send path holds — preferred so the common
     /// case never re-fetches. It's `nil` only on the resume/recheck path (after a
-    /// relaunch), where we fall back to a by-id fetch.
-    private func finish(threadID: UUID, thread: JesseThread?, reply: JesseReply,
-                        voice: Bool, context: ModelContext) {
+    /// relaunch), where we fall back to a by-id fetch. `jobId` is the bridge job
+    /// whose reply this is (`nil` only on the dead inline `.reply` path, which has
+    /// no id to key on).
+    func finish(threadID: UUID, thread: JesseThread?, reply: JesseReply,
+                voice: Bool, jobId: String?, context: ModelContext) {
         // (1) Resolve the destination. Prefer the held reference; fall back to a
         // by-id fetch only when there isn't one (resume/recheck). If neither
         // resolves, keep the job retained and surface Re-check — do NOT drop it.
@@ -489,28 +514,64 @@ final class RunCoordinator {
             return
         }
 
-        // (2) An empty reply is not a turn — surface it instead of appending a
-        // blank `jesse` bubble and clearing the run.
+        // (2) Idempotency: this exact job's reply was already delivered into this
+        // thread (a Re-check / resume re-ran `finish` for a completed job whose
+        // save had failed). Do NOT append again — just finish the bookkeeping:
+        // retry the persist (so a previously-failed save can now succeed), clear
+        // the error, and clear the run. A still-failing retry leaves the recoverable
+        // error + retained job intact, still without a duplicate.
+        if let jobId, target.lastDeliveredJobId == jobId {
+            print("[Jesse] finish: job \(jobId) already delivered to thread \(threadID) — " +
+                  "retrying the save only, not re-appending")
+            do {
+                try save(context)
+            } catch {
+                print("[Jesse] finish: retry save() failed for thread \(threadID): \(error) — " +
+                      "still retaining job_id for Re-check")
+                errors[threadID] = "Showed the reply, but couldn't save it — tap Re-check."
+                startDates[threadID] = nil
+                partialText[threadID] = nil
+                activity[threadID] = nil
+                return
+            }
+            errors[threadID] = nil
+            clearRun(threadID)
+            return
+        }
+
+        // (3) Decide what to record. Prefer the screen text; when it's empty, fall
+        // back to the spoken line — a spoken-only reply's content lives there and
+        // must not be lost. Only when BOTH are empty is the reply genuinely empty,
+        // and we surface Re-check instead of appending a blank turn.
         let displayText = reply.displayText
-        guard !displayText.isEmpty else {
-            print("[Jesse] finish: empty displayText for thread \(threadID) — " +
-                  "surfacing Re-check rather than appending a blank turn")
+        let recordedText: String
+        if !displayText.isEmpty {
+            recordedText = displayText
+        } else if !reply.spokenText.isEmpty {
+            recordedText = reply.spokenText
+        } else {
+            print("[Jesse] finish: genuinely empty reply for thread \(threadID) " +
+                  "(no screen text, no spoken text) — surfacing Re-check rather than a blank turn")
             failRecoverable(threadID: threadID,
                             message: "Jesse's reply came back empty — tap Re-check to fetch it again.",
                             voice: voice)
             return
         }
 
-        let turn = Turn(role: .jesse, text: displayText)
+        let turn = Turn(role: .jesse, text: recordedText)
         target.turns.append(turn)
         target.sessionId = reply.sessionId ?? target.sessionId
         target.updatedAt = Date()
+        if let jobId { target.lastDeliveredJobId = jobId }
 
-        // (3) Real error handling, not `try?`. The in-memory append above already
+        // (4) Real error handling, not `try?`. The in-memory append above already
         // shows the reply; on a save failure, log it and surface a recoverable
-        // error (keeping the job for Re-check) so the failure isn't swallowed.
+        // error (keeping the job for Re-check) so the failure isn't swallowed. The
+        // in-memory turn + idempotency key persist on the live object, so a
+        // same-session Re-check sees the key match (step 2) and retries the save
+        // without re-appending.
         do {
-            try context.save()
+            try save(context)
         } catch {
             print("[Jesse] finish: context.save() failed for thread \(threadID): \(error) — " +
                   "reply is shown but unsaved; retaining job_id for Re-check")
@@ -518,11 +579,11 @@ final class RunCoordinator {
             startDates[threadID] = nil
             partialText[threadID] = nil
             activity[threadID] = nil
-            if voice { Speaker.shared.speak(reply.spokenText) }
+            if voice { speak(reply.spokenText) }
             return
         }
 
-        if voice { Speaker.shared.speak(reply.spokenText) }
+        if voice { speak(reply.spokenText) }
         clearRun(threadID)
     }
 

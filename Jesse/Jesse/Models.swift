@@ -27,6 +27,12 @@ final class JesseThread {
     // When it was starred; nil whenever `isFavorite` is false. Kept so favorites
     // could later sort by pin time rather than last activity.
     var favoritedAt: Date?
+    // The bridge job_id whose reply was last delivered into this thread, used as
+    // an idempotency key so a re-entry of `finish` (Re-check / resume re-polling a
+    // completed job) can't append the same reply twice. New property with a
+    // default, so SwiftData lightweight-migrates existing stores with no migration
+    // code (matching `isFavorite`/`favoritedAt`).
+    var lastDeliveredJobId: String?
 
     @Relationship(deleteRule: .cascade, inverse: \Turn.thread)
     var turns: [Turn] = []
