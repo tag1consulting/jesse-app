@@ -123,6 +123,31 @@ Files attached to a turn are untrusted input and handled defensively:
   directory when the turn ends — success, error, or timeout — and survives the
   internal retry loop, so decoded files never outlive the turn.
 
+## Push notifications (APNs key + device token)
+
+Push is **optional and off by default** (see
+[`bridge/README.md`](bridge/README.md#push-notifications-apns--optional-off-by-default));
+with the `JESSE_APNS_*` vars unset, none of this is active.
+
+- **The APNs signing key (`.p8`) is a secret.** Keep it outside the repo and point
+  `JESSE_APNS_KEY_PATH` at it. The bridge reads it once at startup and holds the
+  decoded key in memory to sign the auth JWT; it is **never logged and never
+  written anywhere**. Do not commit a `.p8` (the magic-byte guard / gitleaks would
+  catch a committed key, but don't rely on that — keep it out of the tree). The
+  short-lived JWT (ES256, ~50-minute reuse) is held in memory only.
+- **The device token is persisted, not secret, but still scoped.** The single
+  registered APNs device token is written to `<JESSE_STATE_DIR>/device.json` with
+  mode `0600` (same discipline as the job store) so it survives a restart. It is
+  user-identifying routing data, not a credential like the bearer token; the token
+  is never logged in full, and only the token (no bearer token or other secret) is
+  written to that file.
+- **Registration and flagging are bearer-auth gated.** `POST /jesse/device` and
+  `POST /jesse/notify/{job_id}` use the same `JESSE_TOKEN` bearer check as every
+  other endpoint, so only a paired client can register a token or request a push.
+- **A push can never affect a turn.** Every push failure (no token, APNs error, a
+  bad key) is logged and swallowed; the turn's stored result is untouched. The
+  push carries only a short alert plus the `job_id` for routing — no vault content.
+
 ## Reporting
 
 This is a single-user personal bridge; there is no formal disclosure process.

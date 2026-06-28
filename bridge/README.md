@@ -455,6 +455,105 @@ bridge default" and the field is omitted. In the app the floor is **unlockable**
 locked by default, editable only behind an explicit "not recommended" gate — so no
 one reweakens it by accident.
 
+## Push notifications (APNs) — optional, off by default
+
+The bridge can send the phone an **APNs alert when a backgrounded turn finishes**,
+so you can leave the app mid-turn and get pinged when Jesse is done (tap the
+notification to reopen the thread and load the reply). This is **fully optional and
+disabled by default**: with the `JESSE_APNS_*` env vars unset, the bridge behaves
+exactly as before and the app degrades to its existing foreground re-attach (open
+the app and the reply is there).
+
+### How it works
+
+- **The phone registers its device token** with `POST /jesse/device` (bearer auth)
+  on first authorization, on token change, and on each foreground. The bridge
+  stores **one** current token (single user), persisted to
+  `<JESSE_STATE_DIR>/device.json` (0600) so it survives a restart. Registration
+  works even when push is disabled — the bridge just won't send.
+- **The phone flags a turn for push only when it actually needs one.** When the
+  app backgrounds with a turn still in flight, it calls
+  `POST /jesse/notify/{job_id}` — *"I'm leaving, ping me."* (We chose this — the
+  "real signal" option (a) — over a `notify: bool` on `POST /jesse`, because it
+  pushes **only** for turns the user actually backgrounded on, never for turns that
+  finished in the foreground.)
+- **At completion**, if push is configured *and* a device token is registered *and*
+  the job was flagged *and* it ended `done`/`failed` (not `cancelled`), the bridge
+  sends one alert push carrying the `job_id` so the tap routes to the right thread.
+  If the turn finished *before* the phone managed to flag it, the notify endpoint
+  fires the push immediately, so the signal is never lost to that race.
+- **A push failure never affects the turn.** No token, an APNs 4xx/5xx, a bad key —
+  all are logged and swallowed; the reply is already stored and retrievable by
+  poll/stream/resume regardless.
+
+The APNs auth JWT (ES256, signed with your `.p8`) is cached and reused for ~50
+minutes (Apple allows up to 60) rather than re-signed per push.
+
+### Endpoints
+
+```bash
+# Register / update this phone's APNs device token (idempotent upsert).
+curl -s -X POST http://127.0.0.1:8765/jesse/device \
+  -H "Authorization: Bearer $JESSE_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"token":"<hex device token>"}'
+# → { "ok": true }
+
+# Ask to be pushed when an in-flight turn completes (the app fires this on
+# background). Idempotent and best-effort; flagging an unknown/finished job is
+# harmless (a finished one pushes immediately).
+curl -s -X POST http://127.0.0.1:8765/jesse/notify/<job_id> \
+  -H "Authorization: Bearer $JESSE_TOKEN"
+# → 204 No Content
+```
+
+Both use the same bearer auth as `/jesse`; a missing/short token is `401`.
+
+### Enabling it (env vars)
+
+Set all four required vars (and the binary picks up the rest). If they're only
+*partially* set, push stays disabled and the bridge logs a one-line warning.
+
+| Var | Required | Purpose |
+|---|---|---|
+| `JESSE_APNS_KEY_PATH` | yes | Path to your APNs auth key `.p8` (PKCS#8). Read once at startup; never logged or committed. |
+| `JESSE_APNS_KEY_ID` | yes | The key's 10-char Key ID (from the Apple Developer portal). |
+| `JESSE_APNS_TEAM_ID` | yes | Your 10-char Apple Developer Team ID (the JWT `iss`). |
+| `JESSE_APNS_TOPIC` | yes | The app's bundle id, sent as `apns-topic` (e.g. `com.tag1.Jesse`, or your own). |
+| `JESSE_APNS_ENV` | no | `sandbox` (default) or `production`. Selects `api.sandbox.push.apple.com` vs `api.push.apple.com`. |
+
+> **Which environment?** An Xcode "Run to device" (development) build uses the
+> **development** APS environment → **`sandbox`** (the default here). A TestFlight /
+> App Store build uses **production** → set `JESSE_APNS_ENV=production`. The token's
+> environment must match the build's `aps-environment` entitlement, or APNs returns
+> `BadDeviceToken`.
+
+```bash
+export JESSE_APNS_KEY_PATH="$HOME/secrets/AuthKey_ABCDE12345.p8"
+export JESSE_APNS_KEY_ID="ABCDE12345"
+export JESSE_APNS_TEAM_ID="C6RPS3BGXX"
+export JESSE_APNS_TOPIC="com.tag1.Jesse"   # your app's bundle id
+# export JESSE_APNS_ENV=production          # only for a TestFlight/App Store build
+cargo run --release
+# logs: "APNs push enabled (host api.sandbox.push.apple.com, topic com.tag1.Jesse)"
+```
+
+### Apple-side setup (one-time)
+
+1. In the **Apple Developer** portal → **Certificates, Identifiers & Profiles → Keys**,
+   create a key with **Apple Push Notifications service (APNs)** enabled. Download the
+   `.p8` (you can only download it once) and note its **Key ID**. Your **Team ID** is
+   on the membership page.
+2. Enable **Push Notifications** for your App ID (the app project already ships the
+   `aps-environment` entitlement; Xcode's automatic signing turns the capability on).
+3. Put the `.p8` somewhere the bridge can read (outside the repo) and point
+   `JESSE_APNS_KEY_PATH` at it. Set the four vars above and restart the bridge.
+
+> End-to-end delivery can't be exercised in CI or the simulator — it needs a real
+> device and a real APNs round-trip. The unit tests cover JWT signing, the payload
+> shape, the completion→push decision, and that a push failure can't disturb a
+> stored result, all without contacting Apple.
+
 ## Prereqs
 
 - Rust toolchain (`rustup`, stable).
@@ -480,8 +579,13 @@ one reweakens it by accident.
 | `JESSE_TIMEOUT` | `3600` | Per-request run limit (seconds), clamped to `1..=7200`. `0` is treated as the 7200s ceiling, not unlimited. On overrun the turn returns `504` with an actionable message naming this var |
 | `JESSE_JOB_TTL_SECS` | `86400` | How long a finished-but-**unfetched** reply stays retrievable (24h). The clock starts at first retrieval, not at completion |
 | `JESSE_RETRIEVAL_GRACE_SECS` | `600` | How much longer a reply is kept **after** its first retrieval (a short re-poll window) instead of the full TTL |
-| `JESSE_STATE_DIR` | `~/.jesse-bridge` | Where completed results are persisted (`<dir>/jobs`) so a restart doesn't lose a reply. Empty disables persistence |
+| `JESSE_STATE_DIR` | `~/.jesse-bridge` | Where completed results are persisted (`<dir>/jobs`) and the device token (`<dir>/device.json`, 0600), so a restart doesn't lose a reply or the token. Empty disables persistence |
 | `JESSE_CLAUDE_BIN` | `claude` | Path to the `claude` binary |
+| `JESSE_APNS_KEY_PATH` | _(off)_ | Path to the APNs auth key `.p8`. Set (with the three below) to enable push; unset → push disabled, behavior unchanged. See [Push notifications](#push-notifications-apns--optional-off-by-default) |
+| `JESSE_APNS_KEY_ID` | _(off)_ | APNs Key ID (10 chars) |
+| `JESSE_APNS_TEAM_ID` | _(off)_ | Apple Developer Team ID (10 chars; the JWT `iss`) |
+| `JESSE_APNS_TOPIC` | _(off)_ | App bundle id, sent as `apns-topic` (e.g. `com.tag1.Jesse`) |
+| `JESSE_APNS_ENV` | `sandbox` | APNs host: `sandbox` (development builds) or `production` (TestFlight/App Store) |
 
 The server refuses to start if `JESSE_TOKEN` is unset, the vault isn't a
 directory, the `claude` binary can't be found, or `JESSE_BIND` is an unsafe

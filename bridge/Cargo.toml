@@ -14,6 +14,18 @@ subtle = "2"
 # (a transitive dep of axum), so naming it directly pulls no new compiled code.
 # The live-stream plumbing itself is tokio::sync::broadcast/mpsc + std.
 futures-core = "0.3"
+# APNs (optional push, disabled unless JESSE_APNS_* is set) needs an HTTP/2 client
+# and ES256 JWT signing — the only justification for these two deps.
+#
+# reqwest: APNs requires HTTP/2 to api.push.apple.com. rustls-only (no OpenSSL /
+# native-tls) keeps the single-static-binary property; webpki-roots bundles the
+# Mozilla trust store so there's no OS cert-store dependency. default-features off
+# so no native-tls is pulled. Only used by the push path; never on a normal turn.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-webpki-roots", "http2"] }
+# ring: ES256 (ECDSA P-256) signing of the APNs auth JWT. ECDSA_P256_SHA256_FIXED
+# emits the raw R||S signature JWS requires. ring is already in the graph (rustls'
+# crypto backend), so this adds no new TLS/crypto stack. Used only to sign the JWT.
+ring = "0.17"
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }   # ServiceExt::oneshot

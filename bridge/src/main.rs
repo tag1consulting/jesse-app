@@ -17,6 +17,7 @@
 //! documented in SECURITY.md.
 
 use std::collections::HashMap;
+use std::future::Future;
 use std::hash::BuildHasher;
 use std::io::Write as _;
 use std::net::IpAddr;
@@ -247,6 +248,14 @@ impl Config {
         self.state_dir
             .as_deref()
             .map(|d| PathBuf::from(d).join("jobs"))
+    }
+
+    /// The file the registered APNs device token is persisted to (sibling of the
+    /// `jobs/` dir), or `None` when persistence is disabled. One file, one token.
+    fn device_file(&self) -> Option<PathBuf> {
+        self.state_dir
+            .as_deref()
+            .map(|d| PathBuf::from(d).join("device.json"))
     }
 }
 
@@ -978,16 +987,29 @@ struct AppState {
     sem: Arc<Semaphore>,
     // Per-service request rate ceiling (C3).
     limiter: Arc<RateLimiter>,
+    // The registered APNs device token (single user). Always present so device
+    // registration works even when push is off; persisted to the state dir.
+    devices: Arc<DeviceStore>,
+    // Job ids the phone asked to be pushed on completion. In-memory only: a
+    // running job isn't persisted, so neither is its notify flag.
+    notify: Arc<NotifyFlags>,
+    // APNs client — `Some` only when JESSE_APNS_* is fully configured AND the key
+    // loaded. `None` → push disabled and the bridge behaves exactly as before.
+    // Set by `main`; `AppState::new` leaves it `None` so tests never touch env
+    // or the network (a test that exercises push installs its own mock client).
+    apns: Option<Arc<ApnsClient>>,
 }
 
 impl AppState {
     /// Build shared state from a config, sizing the semaphore and rate limiter
     /// from it. Used by both `main` and the tests so they exercise the same
-    /// wiring.
+    /// wiring. Push (`apns`) is left `None` here — `main` installs the real client
+    /// after this, and tests that need it set their own mock.
     fn new(cfg: Config) -> Self {
         let job_ttl = Duration::from_secs(cfg.job_ttl_secs);
         let retrieval_grace = Duration::from_secs(cfg.retrieval_grace_secs);
         let jobs_dir = cfg.jobs_dir();
+        let device_file = cfg.device_file();
         let sem = Arc::new(Semaphore::new(cfg.max_concurrency.max(1)));
         let limiter = Arc::new(RateLimiter::new(cfg.rate_per_min));
         AppState {
@@ -995,6 +1017,9 @@ impl AppState {
             jobs: Arc::new(JobStore::new(job_ttl, retrieval_grace, jobs_dir)),
             sem,
             limiter,
+            devices: Arc::new(DeviceStore::new(device_file)),
+            notify: Arc::new(NotifyFlags::new()),
+            apns: None,
         }
     }
 }
@@ -1038,6 +1063,12 @@ struct Attachment {
     filename: String,
     mime: String,
     data_base64: String,
+}
+
+/// Body of `POST /jesse/device`: the phone's APNs device token (hex string).
+#[derive(Deserialize)]
+struct DeviceRequest {
+    token: String,
 }
 
 type ApiError = (StatusCode, String);
@@ -1820,6 +1851,437 @@ fn attachment_prompt_suffix(paths: &[PathBuf]) -> String {
     )
 }
 
+// ---- Push notifications (APNs) — optional, off unless JESSE_APNS_* is set ---
+//
+// Disabled-by-default contract: with the JESSE_APNS_* vars unset, `AppState.apns`
+// is `None` and every push path is a no-op, so the bridge behaves exactly as it
+// did before. When configured, a backgrounded turn the phone flagged via
+// `POST /jesse/notify/{job_id}` fires a single APNs alert when it completes, so
+// the phone can wake and re-attach. A push failure is always logged and swallowed
+// — it must never fail the turn or its stored result.
+
+/// The registered APNs device token for the single user. One current token is
+/// enough; a re-register overwrites it (idempotent upsert). Persisted to
+/// `<state_dir>/device.json` (0600) so it survives a restart, mirroring the job
+/// store. Only the token is written — never the bearer token or any other secret.
+struct DeviceStore {
+    token: Mutex<Option<String>>,
+    path: Option<PathBuf>,
+}
+
+impl DeviceStore {
+    fn new(path: Option<PathBuf>) -> Self {
+        let token = path.as_deref().and_then(load_device_token);
+        DeviceStore {
+            token: Mutex::new(token),
+            path,
+        }
+    }
+
+    /// Idempotent upsert of the current device token (overwrites any prior one),
+    /// persisting it when a state dir is configured.
+    fn set(&self, token: String) {
+        *self.token.lock().unwrap() = Some(token.clone());
+        if let Some(path) = &self.path {
+            persist_device_token(path, &token);
+        }
+    }
+
+    fn get(&self) -> Option<String> {
+        self.token.lock().unwrap().clone()
+    }
+}
+
+fn load_device_token(path: &Path) -> Option<String> {
+    let text = std::fs::read_to_string(path).ok()?;
+    let v: Value = serde_json::from_str(&text).ok()?;
+    v.get("token")
+        .and_then(|t| t.as_str())
+        .map(|s| s.to_string())
+        .filter(|s| !s.is_empty())
+}
+
+/// Write the device token atomically (temp + rename), 0600 — same discipline as
+/// `persist_job`. Best-effort: a failure is logged, never fatal.
+fn persist_device_token(path: &Path, token: &str) {
+    let value = json!({ "v": 1, "token": token });
+    let tmp = path.with_extension("json.tmp");
+    let write = || -> std::io::Result<()> {
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&tmp)?;
+        f.write_all(value.to_string().as_bytes())?;
+        f.sync_all()?;
+        std::fs::rename(&tmp, path)
+    };
+    if let Err(e) = write() {
+        eprintln!("warning: could not persist device token: {e}");
+        let _ = std::fs::remove_file(&tmp);
+    }
+}
+
+/// Job ids the phone asked to be notified about on completion. A flag is consumed
+/// (removed) only when a push is actually fired, so a still-running flagged job
+/// keeps its flag until the real completion. In-memory only — a running job isn't
+/// persisted, so a flag for one need not be either.
+struct NotifyFlags {
+    inner: Mutex<std::collections::HashSet<String>>,
+}
+
+impl NotifyFlags {
+    fn new() -> Self {
+        NotifyFlags {
+            inner: Mutex::new(std::collections::HashSet::new()),
+        }
+    }
+    fn insert(&self, id: &str) {
+        self.inner.lock().unwrap().insert(id.to_string());
+    }
+    /// Remove the flag and report whether it was present. Atomic, so a concurrent
+    /// completion and notify-endpoint can't both take it.
+    fn take(&self, id: &str) -> bool {
+        self.inner.lock().unwrap().remove(id)
+    }
+}
+
+/// Static APNs settings derived from the environment. The `.p8` key is loaded
+/// separately (see `build_apns`) into `ApnsClient.pkcs8_der`.
+#[derive(Clone)]
+struct ApnsConfig {
+    key_id: String,
+    team_id: String,
+    /// The app's bundle id, sent as `apns-topic`.
+    topic: String,
+    /// `api.push.apple.com` (production) or `api.sandbox.push.apple.com` (default).
+    host: String,
+}
+
+impl ApnsConfig {
+    /// Read the APNs settings from the environment. Returns `(key_path, cfg)` only
+    /// when KEY_PATH, KEY_ID, TEAM_ID and TOPIC are all set; otherwise `None`
+    /// (push disabled). A partial config logs a one-line warning so a typo isn't
+    /// silent. `JESSE_APNS_ENV` selects the host and defaults to `sandbox`, since
+    /// an Xcode "Run to device" build uses the development APS environment.
+    fn from_env() -> Option<(String, ApnsConfig)> {
+        let var = |n: &str| {
+            std::env::var(n)
+                .ok()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+        };
+        let key_path = var("JESSE_APNS_KEY_PATH");
+        let key_id = var("JESSE_APNS_KEY_ID");
+        let team_id = var("JESSE_APNS_TEAM_ID");
+        let topic = var("JESSE_APNS_TOPIC");
+        match (key_path, key_id, team_id, topic) {
+            (Some(kp), Some(ki), Some(ti), Some(tp)) => {
+                let env = var("JESSE_APNS_ENV").unwrap_or_else(|| "sandbox".to_string());
+                let host = match env.to_ascii_lowercase().as_str() {
+                    "production" | "prod" => "api.push.apple.com",
+                    _ => "api.sandbox.push.apple.com",
+                }
+                .to_string();
+                Some((
+                    kp,
+                    ApnsConfig {
+                        key_id: ki,
+                        team_id: ti,
+                        topic: tp,
+                        host,
+                    },
+                ))
+            }
+            (kp, ki, ti, tp) => {
+                if kp.is_some() || ki.is_some() || ti.is_some() || tp.is_some() {
+                    eprintln!(
+                        "warning: JESSE_APNS_* is partially set — push disabled. Set \
+                         JESSE_APNS_KEY_PATH, JESSE_APNS_KEY_ID, JESSE_APNS_TEAM_ID and \
+                         JESSE_APNS_TOPIC together."
+                    );
+                }
+                None
+            }
+        }
+    }
+}
+
+/// One APNs HTTP/2 request. Kept behind a trait so the completion→push logic is
+/// unit-testable without hitting Apple (the real impl is reqwest; tests record).
+struct ApnsRequest {
+    host: String,
+    /// `/3/device/<device-token>`.
+    path: String,
+    jwt: String,
+    topic: String,
+    payload: Vec<u8>,
+}
+
+/// The mockable seam for the actual network call. `Ok(status)` for a completed
+/// HTTP exchange (the reqwest impl already maps non-2xx to `Err`), `Err` for a
+/// transport failure. The caller swallows either way.
+trait ApnsTransport: Send + Sync {
+    fn post(&self, req: ApnsRequest) -> Pin<Box<dyn Future<Output = Result<u16, String>> + Send>>;
+}
+
+/// Production transport: an HTTP/2 POST to APNs over rustls.
+struct ReqwestApns {
+    client: reqwest::Client,
+}
+
+impl ApnsTransport for ReqwestApns {
+    fn post(&self, req: ApnsRequest) -> Pin<Box<dyn Future<Output = Result<u16, String>> + Send>> {
+        let client = self.client.clone();
+        Box::pin(async move {
+            let url = format!("https://{}{}", req.host, req.path);
+            let resp = client
+                .post(url)
+                .header("authorization", format!("bearer {}", req.jwt))
+                .header("apns-topic", req.topic)
+                .header("apns-push-type", "alert")
+                .header("content-type", "application/json")
+                .body(req.payload)
+                .send()
+                .await
+                .map_err(|e| format!("apns request error: {e}"))?;
+            let status = resp.status().as_u16();
+            if (200..300).contains(&status) {
+                Ok(status)
+            } else {
+                let body = resp
+                    .bytes()
+                    .await
+                    .map(|b| String::from_utf8_lossy(&b).into_owned())
+                    .unwrap_or_default();
+                Err(format!("apns status {status}: {body}"))
+            }
+        })
+    }
+}
+
+/// How long a minted APNs JWT is reused before re-signing. Apple accepts a token
+/// for up to 60 minutes; refresh a little early.
+const APNS_JWT_TTL: Duration = Duration::from_secs(50 * 60);
+
+/// The configured APNs client: static settings, the ES256 signing key, a cached
+/// JWT, and the (mockable) transport.
+struct ApnsClient {
+    cfg: ApnsConfig,
+    /// PKCS#8 DER of the ES256 signing key (decoded from the `.p8` PEM at startup).
+    pkcs8_der: Vec<u8>,
+    /// Cached `(jwt, minted_at)`, reused for `APNS_JWT_TTL`.
+    jwt_cache: Mutex<Option<(String, Instant)>>,
+    transport: Arc<dyn ApnsTransport>,
+}
+
+impl ApnsClient {
+    /// The current auth JWT, minting (and caching) a fresh one when the cache is
+    /// empty or older than `APNS_JWT_TTL`.
+    fn jwt(&self) -> Result<String, String> {
+        {
+            let g = self.jwt_cache.lock().unwrap();
+            if let Some((tok, at)) = g.as_ref() {
+                if at.elapsed() < APNS_JWT_TTL {
+                    return Ok(tok.clone());
+                }
+            }
+        }
+        let iat = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|e| e.to_string())?
+            .as_secs();
+        let tok = mint_apns_jwt(&self.pkcs8_der, &self.cfg.key_id, &self.cfg.team_id, iat)?;
+        *self.jwt_cache.lock().unwrap() = Some((tok.clone(), Instant::now()));
+        Ok(tok)
+    }
+
+    /// Send a completion alert for `job_id` to `device_token`.
+    async fn push(&self, device_token: &str, job_id: &str) -> Result<(), String> {
+        let jwt = self.jwt()?;
+        let req = ApnsRequest {
+            host: self.cfg.host.clone(),
+            path: format!("/3/device/{device_token}"),
+            jwt,
+            topic: self.cfg.topic.clone(),
+            payload: build_apns_payload(job_id),
+        };
+        self.transport.post(req).await.map(|_| ())
+    }
+}
+
+/// URL-safe base64 without padding — the JWS encoding for the JWT's three parts.
+fn base64url_nopad(bytes: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] =
+        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let b0 = chunk[0] as u32;
+        let b1 = *chunk.get(1).unwrap_or(&0) as u32;
+        let b2 = *chunk.get(2).unwrap_or(&0) as u32;
+        let n = (b0 << 16) | (b1 << 8) | b2;
+        out.push(ALPHABET[(n >> 18) as usize & 63] as char);
+        out.push(ALPHABET[(n >> 12) as usize & 63] as char);
+        if chunk.len() > 1 {
+            out.push(ALPHABET[(n >> 6) as usize & 63] as char);
+        }
+        if chunk.len() > 2 {
+            out.push(ALPHABET[n as usize & 63] as char);
+        }
+    }
+    out
+}
+
+/// Decode a PKCS#8 `.p8` PEM into its DER bytes: strip the `-----BEGIN/END-----`
+/// armor, then base64-decode the body (reusing the bridge's whitespace-tolerant
+/// decoder).
+fn pkcs8_der_from_pem(pem: &str) -> Result<Vec<u8>, String> {
+    let body: String = pem
+        .lines()
+        .filter(|l| !l.trim_start().starts_with("-----"))
+        .collect();
+    if body.trim().is_empty() {
+        return Err("empty PEM body".to_string());
+    }
+    base64_decode(&body).map_err(|e| e.to_string())
+}
+
+/// Sign an APNs auth JWT (ES256): header `{alg:ES256, kid}`, claims `{iss, iat}`,
+/// signed with the `.p8` key. ring's `_FIXED_` variant emits the raw R||S
+/// signature JWS requires (not DER). Pure given (key, ids, iat) so it's testable.
+fn mint_apns_jwt(
+    pkcs8_der: &[u8],
+    key_id: &str,
+    team_id: &str,
+    iat: u64,
+) -> Result<String, String> {
+    let header = json!({ "alg": "ES256", "kid": key_id });
+    let claims = json!({ "iss": team_id, "iat": iat });
+    let signing_input = format!(
+        "{}.{}",
+        base64url_nopad(header.to_string().as_bytes()),
+        base64url_nopad(claims.to_string().as_bytes())
+    );
+    let rng = ring::rand::SystemRandom::new();
+    let key = ring::signature::EcdsaKeyPair::from_pkcs8(
+        &ring::signature::ECDSA_P256_SHA256_FIXED_SIGNING,
+        pkcs8_der,
+        &rng,
+    )
+    .map_err(|_| "invalid APNs signing key (.p8)".to_string())?;
+    let sig = key
+        .sign(&rng, signing_input.as_bytes())
+        .map_err(|_| "APNs JWT signing failed".to_string())?;
+    Ok(format!("{signing_input}.{}", base64url_nopad(sig.as_ref())))
+}
+
+/// The APNs payload for a finished turn: a short alert plus the `job_id` so the
+/// tap routes to the right thread and re-attaches.
+fn build_apns_payload(job_id: &str) -> Vec<u8> {
+    json!({
+        "aps": {
+            "alert": { "title": "Jesse", "body": "Jesse finished" },
+            "sound": "default"
+        },
+        "job_id": job_id
+    })
+    .to_string()
+    .into_bytes()
+}
+
+/// Whether a flagged, terminal job should fire a push: only a `Done` or `Failed`
+/// turn (a `Cancelled` turn means the user is present and chose to stop). Pure.
+fn job_state_is_pushable(state: &JobState) -> bool {
+    matches!(state, JobState::Done { .. } | JobState::Failed { .. })
+}
+
+/// Fire a completion push iff this job is flagged "notify on complete", has
+/// reached a pushable terminal state, push is configured, and a device token is
+/// registered. The flag is consumed only when a push is actually attempted (so a
+/// still-running flagged job keeps it for the real completion), and `take` is
+/// atomic so a concurrent completion + notify-endpoint can't double-push.
+///
+/// Every failure — push not configured, no token, APNs 4xx/5xx, a bad key — is
+/// logged and swallowed: a push must NEVER fail the turn or disturb its stored
+/// result. Called both at job completion and from the notify endpoint (to close
+/// the race where the turn finished before the flag arrived).
+async fn notify_if_complete(
+    apns: Option<&ApnsClient>,
+    devices: &DeviceStore,
+    notify: &NotifyFlags,
+    jobs: &JobStore,
+    job_id: &str,
+) {
+    let Some(apns) = apns else { return };
+    match jobs.get(job_id) {
+        Some(state) if job_state_is_pushable(&state) => {}
+        _ => return, // running / cancelled / gone — nothing to push (yet)
+    }
+    if !notify.take(job_id) {
+        return; // not flagged, or another path already pushed
+    }
+    let Some(token) = devices.get() else {
+        eprintln!("push: job {job_id} flagged but no device registered — skipping");
+        return;
+    };
+    match apns.push(&token, job_id).await {
+        Ok(()) => eprintln!("push: completion alert sent for job {job_id}"),
+        Err(e) => eprintln!("push: APNs send failed for job {job_id}: {e} — swallowed"),
+    }
+}
+
+/// Construct the APNs client from the environment, or `None` when push is
+/// disabled (vars unset) or the key can't be loaded. A bad key is logged and
+/// disables push — never fatal, since push is best-effort and must not block
+/// startup or change the no-APNs behavior.
+fn build_apns() -> Option<Arc<ApnsClient>> {
+    let (key_path, cfg) = ApnsConfig::from_env()?;
+    let pem = match std::fs::read_to_string(&key_path) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!(
+                "warning: could not read JESSE_APNS_KEY_PATH ({key_path}): {e} — push disabled"
+            );
+            return None;
+        }
+    };
+    let der = match pkcs8_der_from_pem(&pem) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("warning: JESSE_APNS_KEY_PATH is not a valid PKCS#8 .p8 ({e}) — push disabled");
+            return None;
+        }
+    };
+    // Validate the key parses as an ES256 signing key now, so a bad key surfaces
+    // at startup rather than silently on the first push.
+    let rng = ring::rand::SystemRandom::new();
+    if ring::signature::EcdsaKeyPair::from_pkcs8(
+        &ring::signature::ECDSA_P256_SHA256_FIXED_SIGNING,
+        &der,
+        &rng,
+    )
+    .is_err()
+    {
+        eprintln!("warning: JESSE_APNS_KEY_PATH did not parse as an ES256 key — push disabled");
+        return None;
+    }
+    let client = match reqwest::Client::builder().build() {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("warning: could not build APNs HTTP client: {e} — push disabled");
+            return None;
+        }
+    };
+    eprintln!("APNs push enabled (host {}, topic {})", cfg.host, cfg.topic);
+    Some(Arc::new(ApnsClient {
+        cfg,
+        pkcs8_der: der,
+        jwt_cache: Mutex::new(None),
+        transport: Arc::new(ReqwestApns { client }),
+    }))
+}
+
 // ---- Handlers -------------------------------------------------------------
 
 async fn health(State(st): State<AppState>) -> Json<Value> {
@@ -1925,6 +2387,10 @@ async fn jesse(
     let jobs = st.jobs.clone();
     let jid = job_id.clone();
     let sid = req.session_id.clone();
+    // Push machinery for the completion notification (no-ops when push is off).
+    let apns = st.apns.clone();
+    let devices = st.devices.clone();
+    let notify = st.notify.clone();
     let handle = tokio::spawn(async move {
         // Hold the permit for the whole turn, releasing it on task exit.
         let _permit: OwnedSemaphorePermit = permit;
@@ -1951,6 +2417,15 @@ async fn jesse(
             Some(JobState::Cancelled) => jobs.stream_finish(&jid, StreamFrame::Cancelled),
             _ => {}
         }
+
+        // Fire the completion push if this turn was flagged for it (the phone
+        // backgrounded mid-turn). A no-op unless push is configured, the job is
+        // flagged, it ended Done/Failed, and a device token is registered. Any
+        // failure is logged and swallowed — the reply is already stored above, so
+        // a push problem can't disturb it. Awaited (not detached) so the push
+        // can't outlive the runtime on shutdown; it adds only ~one HTTP round-trip
+        // to a turn that already finished.
+        notify_if_complete(apns.as_deref(), &devices, &notify, &jobs, &jid).await;
     });
 
     // Store the task's abort handle so `POST /jesse/cancel/{id}` can stop it.
@@ -2027,6 +2502,9 @@ async fn jesse_cancel(
     headers: HeaderMap,
 ) -> Result<StatusCode, ApiError> {
     check_auth(&headers, &st.cfg.token)?;
+    // Drop any pending notify flag — a user who cancels is present and doesn't
+    // want a push, and a Cancelled state isn't pushable anyway.
+    st.notify.take(&job_id);
     match st.jobs.cancel(&job_id) {
         CancelOutcome::Cancelled => {
             eprintln!("cancel: job {job_id} aborted by client — claude killed, concurrency slot freed");
@@ -2038,6 +2516,50 @@ async fn jesse_cancel(
             eprintln!("cancel: job {job_id} unknown — no-op (idempotent)");
         }
     }
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// `POST /jesse/device` — register/update this phone's APNs device token. Same
+/// bearer auth as `/jesse`. Idempotent upsert: a re-register overwrites the
+/// stored token. Persisted (when a state dir is configured) so it survives a
+/// restart. Works even when push is disabled — the bridge just won't send. Never
+/// logs the token.
+async fn jesse_device(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    Json(req): Json<DeviceRequest>,
+) -> Result<Json<Value>, ApiError> {
+    check_auth(&headers, &st.cfg.token)?;
+    let token = req.token.trim().to_string();
+    if token.is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "missing device token".to_string()));
+    }
+    st.devices.set(token);
+    Ok(Json(json!({ "ok": true })))
+}
+
+/// `POST /jesse/notify/{job_id}` — the phone, about to background with this turn
+/// still in flight, asks to be pushed when it completes. Same bearer auth.
+/// Best-effort and idempotent: flagging an unknown/finished job is harmless. If
+/// the turn has ALREADY finished (it beat the phone to the background), the push
+/// is fired now so the signal isn't lost. Returns 204.
+async fn jesse_notify(
+    State(st): State<AppState>,
+    UrlPath(job_id): UrlPath<String>,
+    headers: HeaderMap,
+) -> Result<StatusCode, ApiError> {
+    check_auth(&headers, &st.cfg.token)?;
+    st.notify.insert(&job_id);
+    // Close the race: if the turn already reached a pushable terminal state, push
+    // now; otherwise the flag stays and the completion path pushes later.
+    notify_if_complete(
+        st.apns.as_deref(),
+        &st.devices,
+        &st.notify,
+        &st.jobs,
+        &job_id,
+    )
+    .await;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -2252,6 +2774,8 @@ fn app(state: AppState) -> Router {
         .route("/jesse/result/:job_id", get(jesse_result))
         .route("/jesse/stream/:job_id", get(jesse_stream))
         .route("/jesse/cancel/:job_id", post(jesse_cancel))
+        .route("/jesse/device", post(jesse_device))
+        .route("/jesse/notify/:job_id", post(jesse_notify))
         .layer(DefaultBodyLimit::max(body_limit))
         .with_state(state)
 }
@@ -2298,7 +2822,11 @@ async fn main() {
     }
 
     let addr = format!("{}:{}", cfg.bind, cfg.port);
-    let state = AppState::new(cfg);
+    let mut state = AppState::new(cfg);
+    // Install the APNs client if push is configured (JESSE_APNS_* set and the key
+    // loads). `None` leaves every push path a no-op — the bridge behaves exactly
+    // as it did before. `build_apns` logs whether push is enabled or why it isn't.
+    state.apns = build_apns();
 
     // Pairing QR — scan it from the app's Settings to fill in host/port/token.
     // The advertised host defaults to the bound IP (reliably reachable on the
@@ -4337,5 +4865,383 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    // ---- Push notifications (APNs) ----------------------------------------
+    //
+    // No test ever touches the real APNs endpoint: the push path goes through a
+    // recording `MockApns`, and signing keys are generated in-process so no key
+    // material is committed (gitleaks-safe). The reqwest transport is exercised
+    // only by `build_apns`/`ReqwestApns`, which these don't invoke.
+
+    /// A recording transport: captures every request and returns a fixed result.
+    #[derive(Clone, Default)]
+    struct MockApns {
+        calls: Arc<Mutex<Vec<ApnsRequest>>>,
+        fail: bool,
+    }
+
+    impl ApnsTransport for MockApns {
+        fn post(
+            &self,
+            req: ApnsRequest,
+        ) -> Pin<Box<dyn Future<Output = Result<u16, String>> + Send>> {
+            let calls = self.calls.clone();
+            let fail = self.fail;
+            Box::pin(async move {
+                calls.lock().unwrap().push(req);
+                if fail {
+                    Err("mock apns failure".to_string())
+                } else {
+                    Ok(200)
+                }
+            })
+        }
+    }
+
+    /// Generate a throwaway ES256 key in-process (no committed key material) and
+    /// wrap it in an `ApnsClient` over the given transport.
+    fn test_apns(transport: Arc<dyn ApnsTransport>) -> Arc<ApnsClient> {
+        let rng = ring::rand::SystemRandom::new();
+        let doc = ring::signature::EcdsaKeyPair::generate_pkcs8(
+            &ring::signature::ECDSA_P256_SHA256_FIXED_SIGNING,
+            &rng,
+        )
+        .unwrap();
+        Arc::new(ApnsClient {
+            cfg: ApnsConfig {
+                key_id: "KEYID12345".to_string(),
+                team_id: "TEAMID6789".to_string(),
+                topic: "com.tag1.Jesse".to_string(),
+                host: "api.sandbox.push.apple.com".to_string(),
+            },
+            pkcs8_der: doc.as_ref().to_vec(),
+            jwt_cache: Mutex::new(None),
+            transport,
+        })
+    }
+
+    /// URL-safe-base64 (no pad) decode, for inspecting a minted JWT's parts.
+    fn b64url_decode(s: &str) -> Vec<u8> {
+        let mut t = s.replace('-', "+").replace('_', "/");
+        while !t.len().is_multiple_of(4) {
+            t.push('=');
+        }
+        base64_decode(&t).unwrap()
+    }
+
+    #[test]
+    fn apns_jwt_header_claims_and_signature_shape() {
+        let rng = ring::rand::SystemRandom::new();
+        let doc = ring::signature::EcdsaKeyPair::generate_pkcs8(
+            &ring::signature::ECDSA_P256_SHA256_FIXED_SIGNING,
+            &rng,
+        )
+        .unwrap();
+        let der = doc.as_ref();
+        let jwt = mint_apns_jwt(der, "ABC123DEFG", "TEAMID1234", 1_700_000_000).unwrap();
+
+        let parts: Vec<&str> = jwt.split('.').collect();
+        assert_eq!(parts.len(), 3, "a JWT is header.claims.signature");
+
+        let header: Value = serde_json::from_slice(&b64url_decode(parts[0])).unwrap();
+        assert_eq!(header["alg"], "ES256");
+        assert_eq!(header["kid"], "ABC123DEFG");
+
+        let claims: Value = serde_json::from_slice(&b64url_decode(parts[1])).unwrap();
+        assert_eq!(claims["iss"], "TEAMID1234");
+        assert_eq!(claims["iat"], 1_700_000_000);
+
+        // ES256 over P-256 is a fixed 64-byte R||S signature (what JWS requires).
+        let sig = b64url_decode(parts[2]);
+        assert_eq!(sig.len(), 64);
+
+        // And it actually verifies against the key's public half.
+        let keypair = ring::signature::EcdsaKeyPair::from_pkcs8(
+            &ring::signature::ECDSA_P256_SHA256_FIXED_SIGNING,
+            der,
+            &rng,
+        )
+        .unwrap();
+        let signing_input = format!("{}.{}", parts[0], parts[1]);
+        use ring::signature::KeyPair as _; // brings `public_key()` into scope
+        ring::signature::UnparsedPublicKey::new(
+            &ring::signature::ECDSA_P256_SHA256_FIXED,
+            keypair.public_key().as_ref(),
+        )
+        .verify(signing_input.as_bytes(), &sig)
+        .expect("minted JWT must verify under its own public key");
+    }
+
+    #[test]
+    fn apns_payload_has_alert_and_job_id() {
+        let payload = build_apns_payload("job-xyz");
+        let v: Value = serde_json::from_slice(&payload).unwrap();
+        assert_eq!(v["aps"]["alert"]["title"], "Jesse");
+        assert_eq!(v["aps"]["alert"]["body"], "Jesse finished");
+        assert_eq!(v["aps"]["sound"], "default");
+        assert_eq!(v["job_id"], "job-xyz");
+    }
+
+    #[test]
+    fn pushable_only_for_done_or_failed() {
+        assert!(job_state_is_pushable(&JobState::Done {
+            response: "x".into(),
+            session_id: None
+        }));
+        assert!(job_state_is_pushable(&JobState::Failed { error: "x".into() }));
+        assert!(!job_state_is_pushable(&JobState::Cancelled));
+        assert!(!job_state_is_pushable(&JobState::Running));
+    }
+
+    #[tokio::test]
+    async fn completed_flagged_with_token_pushes() {
+        let mock = MockApns::default();
+        let mut st = test_state();
+        st.apns = Some(test_apns(Arc::new(mock.clone())));
+        st.devices.set("abc123devicetoken".to_string());
+
+        let id = st.jobs.create();
+        st.jobs
+            .complete(&id, Ok(("the answer".to_string(), Some("sess-1".to_string()))));
+        st.notify.insert(&id);
+
+        notify_if_complete(st.apns.as_deref(), &st.devices, &st.notify, &st.jobs, &id).await;
+
+        let calls = mock.calls.lock().unwrap();
+        assert_eq!(calls.len(), 1, "a flagged, completed turn pushes once");
+        let req = &calls[0];
+        assert!(req.path.contains("abc123devicetoken"), "path targets the token");
+        assert_eq!(req.topic, "com.tag1.Jesse");
+        assert_eq!(req.jwt.split('.').count(), 3, "carries a JWT");
+        assert!(String::from_utf8_lossy(&req.payload).contains(&id), "payload carries job_id");
+    }
+
+    #[tokio::test]
+    async fn completed_but_not_flagged_does_not_push() {
+        let mock = MockApns::default();
+        let mut st = test_state();
+        st.apns = Some(test_apns(Arc::new(mock.clone())));
+        st.devices.set("abc123devicetoken".to_string());
+
+        let id = st.jobs.create();
+        st.jobs.complete(&id, Ok(("the answer".to_string(), None)));
+        // No notify.insert — the turn finished in the foreground.
+
+        notify_if_complete(st.apns.as_deref(), &st.devices, &st.notify, &st.jobs, &id).await;
+        assert_eq!(mock.calls.lock().unwrap().len(), 0, "unflagged turn never pushes");
+    }
+
+    #[tokio::test]
+    async fn flagged_but_no_token_does_not_push() {
+        let mock = MockApns::default();
+        let mut st = test_state();
+        st.apns = Some(test_apns(Arc::new(mock.clone())));
+        // No device registered.
+        let id = st.jobs.create();
+        st.jobs.complete(&id, Ok(("a".to_string(), None)));
+        st.notify.insert(&id);
+        notify_if_complete(st.apns.as_deref(), &st.devices, &st.notify, &st.jobs, &id).await;
+        assert_eq!(mock.calls.lock().unwrap().len(), 0, "no token → no push");
+    }
+
+    #[tokio::test]
+    async fn cancelled_flagged_job_does_not_push() {
+        let mock = MockApns::default();
+        let mut st = test_state();
+        st.apns = Some(test_apns(Arc::new(mock.clone())));
+        st.devices.set("tok".to_string());
+        let id = st.jobs.create();
+        st.jobs.stream_register(&id);
+        assert!(matches!(st.jobs.cancel(&id), CancelOutcome::Cancelled));
+        st.notify.insert(&id);
+        notify_if_complete(st.apns.as_deref(), &st.devices, &st.notify, &st.jobs, &id).await;
+        assert_eq!(mock.calls.lock().unwrap().len(), 0, "a cancelled turn isn't pushed");
+    }
+
+    #[tokio::test]
+    async fn push_failure_does_not_disturb_stored_result() {
+        // The mock fails the send; the job result must be untouched and the flag
+        // consumed (so it can't push twice). A push problem never breaks a turn.
+        let mock = MockApns {
+            fail: true,
+            ..Default::default()
+        };
+        let mut st = test_state();
+        st.apns = Some(test_apns(Arc::new(mock.clone())));
+        st.devices.set("tok".to_string());
+
+        let id = st.jobs.create();
+        st.jobs
+            .complete(&id, Ok(("durable answer".to_string(), Some("sess-9".to_string()))));
+        st.notify.insert(&id);
+
+        notify_if_complete(st.apns.as_deref(), &st.devices, &st.notify, &st.jobs, &id).await;
+
+        assert_eq!(mock.calls.lock().unwrap().len(), 1, "the send was attempted");
+        match st.jobs.get(&id) {
+            Some(JobState::Done { response, session_id }) => {
+                assert_eq!(response, "durable answer", "result intact after a push failure");
+                assert_eq!(session_id.as_deref(), Some("sess-9"));
+            }
+            other => panic!("job must stay Done, got {:?}", other.map(|_| ())),
+        }
+    }
+
+    #[tokio::test]
+    async fn push_disabled_is_a_noop() {
+        // apns = None (the default): even a flagged, token-present completion does
+        // nothing — the bridge behaves exactly as before push existed.
+        let st = test_state();
+        assert!(st.apns.is_none());
+        st.devices.set("tok".to_string());
+        let id = st.jobs.create();
+        st.jobs.complete(&id, Ok(("a".to_string(), None)));
+        st.notify.insert(&id);
+        // Just must not panic; there's no transport to record against.
+        notify_if_complete(st.apns.as_deref(), &st.devices, &st.notify, &st.jobs, &id).await;
+        // The flag is left intact (nothing consumed it) — harmless.
+        assert!(st.notify.take(&id));
+    }
+
+    #[tokio::test]
+    async fn notify_running_then_completion_pushes_once() {
+        // The normal sequence: phone flags a still-running job (no push yet, flag
+        // retained), the turn later completes and the completion path pushes once.
+        let mock = MockApns::default();
+        let mut st = test_state();
+        st.apns = Some(test_apns(Arc::new(mock.clone())));
+        st.devices.set("tok".to_string());
+
+        let id = st.jobs.create(); // Running
+        st.notify.insert(&id);
+        notify_if_complete(st.apns.as_deref(), &st.devices, &st.notify, &st.jobs, &id).await;
+        assert_eq!(mock.calls.lock().unwrap().len(), 0, "a running job isn't pushed yet");
+
+        st.jobs.complete(&id, Ok(("done now".to_string(), None)));
+        notify_if_complete(st.apns.as_deref(), &st.devices, &st.notify, &st.jobs, &id).await;
+        assert_eq!(mock.calls.lock().unwrap().len(), 1, "completion pushes exactly once");
+    }
+
+    // ---- POST /jesse/device -----------------------------------------------
+
+    fn device_request(auth: Option<&str>, json: &str) -> Request<Body> {
+        let mut b = Request::builder()
+            .method("POST")
+            .uri("/jesse/device")
+            .header("content-type", "application/json");
+        if let Some(a) = auth {
+            b = b.header("authorization", a);
+        }
+        b.body(Body::from(json.to_string())).unwrap()
+    }
+
+    #[tokio::test]
+    async fn device_register_requires_auth() {
+        let resp = app(test_state())
+            .oneshot(device_request(None, r#"{"token":"deadbeef"}"#))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn device_register_round_trip_stores_token() {
+        let st = test_state();
+        let resp = app(st.clone())
+            .oneshot(device_request(Some("Bearer test-token"), r#"{"token":"deadbeefcafe"}"#))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(st.devices.get().as_deref(), Some("deadbeefcafe"), "token stored");
+
+        // Idempotent upsert: a second register overwrites.
+        let resp = app(st.clone())
+            .oneshot(device_request(Some("Bearer test-token"), r#"{"token":"newtoken99"}"#))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(st.devices.get().as_deref(), Some("newtoken99"));
+    }
+
+    #[tokio::test]
+    async fn device_register_rejects_empty_token() {
+        let resp = app(test_state())
+            .oneshot(device_request(Some("Bearer test-token"), r#"{"token":"   "}"#))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn device_token_survives_restart() {
+        let dir = temp_jobs_dir();
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("device.json");
+        {
+            let store = DeviceStore::new(Some(path.clone()));
+            store.set("persisted-token".to_string());
+        }
+        let restarted = DeviceStore::new(Some(path.clone()));
+        assert_eq!(restarted.get().as_deref(), Some("persisted-token"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---- POST /jesse/notify/{job_id} --------------------------------------
+
+    fn notify_request(auth: Option<&str>, job_id: &str) -> Request<Body> {
+        let mut b = Request::builder()
+            .method("POST")
+            .uri(format!("/jesse/notify/{job_id}"));
+        if let Some(a) = auth {
+            b = b.header("authorization", a);
+        }
+        b.body(Body::empty()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn notify_requires_auth() {
+        let resp = app(test_state())
+            .oneshot(notify_request(None, "some-job"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn notify_flags_and_returns_204() {
+        let st = test_state();
+        let id = st.jobs.create();
+        let resp = app(st.clone())
+            .oneshot(notify_request(Some("Bearer test-token"), &id))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+        // The flag was recorded (running job → not consumed by the race check).
+        assert!(st.notify.take(&id), "running job keeps its notify flag");
+    }
+
+    #[tokio::test]
+    async fn notify_endpoint_pushes_when_job_already_done() {
+        // The race: the turn finished before the phone backgrounded and flagged.
+        // The notify endpoint must push immediately rather than lose the signal.
+        let mock = MockApns::default();
+        let mut st = test_state();
+        st.apns = Some(test_apns(Arc::new(mock.clone())));
+        st.devices.set("tok".to_string());
+
+        let id = st.jobs.create();
+        st.jobs.complete(&id, Ok(("already done".to_string(), None)));
+
+        let resp = app(st.clone())
+            .oneshot(notify_request(Some("Bearer test-token"), &id))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+        assert_eq!(
+            mock.calls.lock().unwrap().len(),
+            1,
+            "flagging an already-finished job pushes immediately"
+        );
     }
 }

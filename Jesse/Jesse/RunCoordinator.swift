@@ -78,19 +78,26 @@ final class RunCoordinator {
     // injected so a test can force a save failure deterministically. Used only in
     // `finish`.
     private let save: @MainActor (ModelContext) throws -> Void
+    // Called after a turn is delivered successfully — the "sensible moment" to ask
+    // for push-notification authorization (not on cold launch). `JesseApp` wires
+    // this to `PushManager`; the default is a no-op so tests never touch
+    // UNUserNotificationCenter.
+    private let onFirstSuccess: @MainActor () -> Void
 
     init(config: @escaping @MainActor () -> JesseConfig = { ConfigStore.load() },
          makeClient: @escaping @MainActor (JesseConfig) -> any JesseClientProtocol = { JesseClient(config: $0) },
          instructions: @escaping @MainActor (JesseMode) -> String? = { PromptStore.wrapperOverride(for: $0) },
          floor: @escaping @MainActor (JesseMode) -> String? = { PromptStore.floorOverride(for: $0) },
          speak: @escaping @MainActor (String) -> Void = { Speaker.shared.speak($0) },
-         save: @escaping @MainActor (ModelContext) throws -> Void = { try $0.save() }) {
+         save: @escaping @MainActor (ModelContext) throws -> Void = { try $0.save() },
+         onFirstSuccess: @escaping @MainActor () -> Void = {}) {
         self.configProvider = config
         self.makeClient = makeClient
         self.instructionsProvider = instructions
         self.floorProvider = floor
         self.speak = speak
         self.save = save
+        self.onFirstSuccess = onFirstSuccess
         self.inFlight = InFlightStore.load()
     }
 
@@ -584,7 +591,34 @@ final class RunCoordinator {
         }
 
         if voice { speak(reply.spokenText) }
+        // A turn just landed successfully — the moment to ask for push permission
+        // (idempotent; PushManager only prompts once and only when configured).
+        onFirstSuccess()
         clearRun(threadID)
+    }
+
+    // MARK: - Push hooks
+
+    /// On backgrounding, ask the bridge to push us when any still-in-flight turn
+    /// finishes — the "I'm leaving, ping me" signal that lets the bridge push only
+    /// when the phone actually needs it. Best-effort and fire-and-forget per job;
+    /// if it fails (offline, laptop asleep), the foreground `resume` still
+    /// re-attaches, so nothing is lost — there's just no push.
+    func notifyBackgroundInFlight() {
+        guard !inFlight.isEmpty else { return }
+        let cfg = configProvider()
+        guard cfg.isConfigured else { return }
+        let client = makeClient(cfg)
+        for job in inFlight.values {
+            let jobId = job.jobId
+            Task { try? await client.notifyOnComplete(jobId: jobId) }
+        }
+    }
+
+    /// The thread whose in-flight job has this id — used to route a notification
+    /// tap to the right conversation. nil if no in-flight job matches.
+    func threadID(forJobId jobId: String) -> UUID? {
+        inFlight.first(where: { $0.value.jobId == jobId })?.key
     }
 
     /// A terminal failure: surface the message and drop everything, including the

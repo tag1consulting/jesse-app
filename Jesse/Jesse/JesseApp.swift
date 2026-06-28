@@ -7,8 +7,13 @@ import SwiftData
 
 @main
 struct JesseApp: App {
-    // App-scoped so in-flight runs outlive the view that started them.
-    @State private var coordinator = RunCoordinator()
+    // Owns the remote-notification + tap callbacks (see PushManager.swift).
+    @UIApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
+    // App-scoped so in-flight runs outlive the view that started them. The
+    // first-successful-turn hook is the moment we ask for push authorization.
+    @State private var coordinator = RunCoordinator(
+        onFirstSuccess: { PushManager.shared.noteSuccessfulTurn() }
+    )
 
     var body: some Scene {
         WindowGroup {

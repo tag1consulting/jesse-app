@@ -166,6 +166,10 @@ struct JesseConfig {
 
     var baseURL: URL? { endpoint("") }
 
+    /// Whether the bridge is paired: a host and token are both set. Gates push
+    /// authorization (don't ask before Jesse is even configured) and registration.
+    var isConfigured: Bool { !normalizedHost.isEmpty && !token.isEmpty }
+
     /// Parse a `jesse://pair?host=…&port=…&token=…` pairing payload (printed as a
     /// QR by the bridge on startup). Returns nil for anything that isn't a
     /// well-formed pairing URL with a non-empty host and token. Port defaults to
@@ -329,6 +333,20 @@ protocol JesseClientProtocol {
     /// polling `result`. The 202/poll/persist/resume path is the fallback for
     /// this; streaming never replaces it.
     func stream(jobId: String) -> AsyncThrowingStream<JesseStreamEvent, Error>
+    /// Register (idempotent upsert) this phone's APNs device token with the bridge
+    /// (`POST /jesse/device`) so it can push when a backgrounded turn finishes.
+    func registerDevice(token: String) async throws
+    /// Ask the bridge to push when `jobId` completes (`POST /jesse/notify/{job_id}`).
+    /// Fired when the app backgrounds with that turn still in flight — "I'm
+    /// leaving, ping me." Best-effort and idempotent.
+    func notifyOnComplete(jobId: String) async throws
+}
+
+extension JesseClientProtocol {
+    // Default no-ops so existing conformers (the test fakes) need not implement
+    // the push methods; only the production `JesseClient` does the real calls.
+    func registerDevice(token: String) async throws {}
+    func notifyOnComplete(jobId: String) async throws {}
 }
 
 struct JesseClient: JesseClientProtocol {
@@ -435,6 +453,59 @@ struct JesseClient: JesseClientProtocol {
         }
         guard let http = resp as? HTTPURLResponse else { throw JesseError.decoding }
         // 2xx (the bridge replies 204) or 404 (nothing left to cancel) → success.
+        if (200..<300).contains(http.statusCode) || http.statusCode == 404 { return }
+        throw JesseError.badResponse(http.statusCode,
+                                     String(data: data, encoding: .utf8) ?? "")
+    }
+
+    /// Register this phone's APNs device token with the bridge
+    /// (`POST /jesse/device`). Idempotent upsert server-side. Bearer auth like
+    /// every other call. Throws on a transport/auth/HTTP failure so the caller
+    /// can retry (registration is fired on first authorization, on token change,
+    /// and on each foreground).
+    func registerDevice(token: String) async throws {
+        guard !config.normalizedHost.isEmpty, !config.token.isEmpty,
+              let url = config.endpoint("/jesse/device") else { throw JesseError.notConfigured }
+        var req = URLRequest(url: url)
+        req.httpMethod = "POST"
+        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        req.setValue("Bearer \(config.token)", forHTTPHeaderField: "Authorization")
+        req.httpBody = try JSONSerialization.data(withJSONObject: ["token": token])
+
+        let data: Data, resp: URLResponse
+        do {
+            (data, resp) = try await session.data(for: req)
+        } catch {
+            throw JesseError.from(error, host: config.normalizedHost)
+        }
+        guard let http = resp as? HTTPURLResponse else { throw JesseError.decoding }
+        guard (200..<300).contains(http.statusCode) else {
+            throw JesseError.badResponse(http.statusCode,
+                                         String(data: data, encoding: .utf8) ?? "")
+        }
+    }
+
+    /// Ask the bridge to push when `jobId` completes (`POST /jesse/notify/{job_id}`).
+    /// Fired as the app backgrounds with that turn in flight. Mirrors `cancelJob`'s
+    /// shape: a `404` (bridge no longer knows the id) is fine — nothing to ping —
+    /// so only a genuine transport/auth/5xx error throws (the caller fires this
+    /// best-effort).
+    func notifyOnComplete(jobId: String) async throws {
+        guard !config.normalizedHost.isEmpty, !config.token.isEmpty,
+              let url = config.endpoint("/jesse/notify/\(jobId)") else {
+            throw JesseError.notConfigured
+        }
+        var req = URLRequest(url: url)
+        req.httpMethod = "POST"
+        req.setValue("Bearer \(config.token)", forHTTPHeaderField: "Authorization")
+
+        let data: Data, resp: URLResponse
+        do {
+            (data, resp) = try await session.data(for: req)
+        } catch {
+            throw JesseError.from(error, host: config.normalizedHost)
+        }
+        guard let http = resp as? HTTPURLResponse else { throw JesseError.decoding }
         if (200..<300).contains(http.statusCode) || http.statusCode == 404 { return }
         throw JesseError.badResponse(http.statusCode,
                                      String(data: data, encoding: .utf8) ?? "")

@@ -10,6 +10,7 @@ struct ContentView: View {
     @Environment(\.scenePhase) private var scenePhase
 
     @StateObject private var inbox = JesseInbox.shared
+    @StateObject private var pushRouter = PushRouter.shared
     @State private var path: [JesseThread] = []
     @State private var config = ConfigStore.load()
     @State private var showSettings = false
@@ -27,17 +28,47 @@ struct ContentView: View {
         .onAppear {
             coordinator.resume(context: context)
             inbox.drain()
+            PushManager.shared.refreshRegistration()
         }
         .onChange(of: scenePhase) { _, phase in
-            if phase == .active {
+            switch phase {
+            case .active:
                 coordinator.resume(context: context)
                 inbox.drain()
+                // Re-register the device token (covers a token change / bridge
+                // restart / host change since last launch).
+                PushManager.shared.refreshRegistration()
+            case .background:
+                // "I'm leaving, ping me": ask the bridge to push when any
+                // still-in-flight turn finishes, so it only pushes when needed.
+                coordinator.notifyBackgroundInFlight()
+            default:
+                break
             }
         }
         .onChange(of: inbox.pending) { _, req in
             guard let req else { return }
             inbox.pending = nil
             startVoiceThread(req)
+        }
+        .onChange(of: pushRouter.pendingJobId) { _, jobId in
+            guard let jobId else { return }
+            pushRouter.pendingJobId = nil
+            openThread(forJobId: jobId)
+        }
+    }
+
+    /// A "Jesse finished" notification was tapped. Find the thread whose in-flight
+    /// job matches (before `resume` delivers and clears it), re-attach to fetch the
+    /// reply, then navigate there.
+    private func openThread(forJobId jobId: String) {
+        let threadID = coordinator.threadID(forJobId: jobId)
+        coordinator.resume(context: context)
+        guard let threadID else { return }
+        var d = FetchDescriptor<JesseThread>(predicate: #Predicate { $0.id == threadID })
+        d.fetchLimit = 1
+        if let thread = try? context.fetch(d).first {
+            path = [thread]
         }
     }
 
