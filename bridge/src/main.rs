@@ -177,8 +177,20 @@ const DEFAULT_MAX_ATTACHMENTS_TOTAL_BYTES: usize = 20 * 1024 * 1024;
 // `Bash(node:*)` — a bare `node` scope would allow `node -e "<arbitrary JS>"`,
 // i.e. arbitrary code execution from a phone request. cwd is the vault (see
 // `run_claude`), so the relative paths resolve there.
+//
+// `Skill(diet-logging)` lets the agent auto-invoke the vault's `diet-logging`
+// skill (`.claude/skills/diet-logging/SKILL.md`) on a food/exercise/weigh-in
+// mention. The Skill tool only LOADS instruction text — it executes nothing
+// itself; every real action the skill prescribes still flows through the
+// already-scoped `Read`/`Write`/`Edit` and the three `Bash(node todo-list/*.js:*)`
+// scripts above, so the action surface is unchanged. It is pinned to the SINGLE
+// named skill, NOT a bare `Skill` (which would let any future vault skill run
+// from a phone request) — the narrowest scope the CLI accepts
+// (verified against claude 2.1.195). cwd is the vault, so the skill is discovered
+// from `.claude/skills/` there.
 const DEFAULT_ALLOWED_TOOLS: &str = "Read,Write,Edit,Grep,Glob,\
 mcp__qmd__query,mcp__qmd__get,mcp__qmd__multi_get,mcp__qmd__status,\
+Skill(diet-logging),\
 Bash(git:*),Bash(mv:*),Bash(ls:*),Bash(cat:*),Bash(find:*),\
 Bash(node todo-list/generate-diet-today.js:*),\
 Bash(node todo-list/validate-diet-today.js:*),\
@@ -4365,6 +4377,19 @@ mod tests {
         assert!(
             !tools.iter().any(|t| *t == "Bash(node:*)" || *t == "Bash(node)"),
             "a bare node scope (arbitrary-JS RCE) must never be allowed: {tools:?}"
+        );
+
+        // The Skill tool is granted ONLY for the named `diet-logging` skill — never
+        // a bare `Skill`, which would let any future vault skill run from a phone
+        // request. The Skill tool loads instruction text only; real actions still
+        // go through the scoped Read/Write/Edit + node scripts above.
+        assert!(
+            tools.contains(&"Skill(diet-logging)"),
+            "expected scoped Skill(diet-logging) in: {tools:?}"
+        );
+        assert!(
+            !tools.contains(&"Skill"),
+            "a bare Skill scope (any-skill from a phone request) must never be allowed: {tools:?}"
         );
 
         // Defense-in-depth denylist is passed and contains bare Bash.
