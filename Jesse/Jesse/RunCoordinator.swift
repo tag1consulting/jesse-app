@@ -185,7 +185,10 @@ final class RunCoordinator {
                     // (it hands back the job_id immediately and never holds the
                     // connection), so this path is effectively dead — kept only so
                     // an older bridge that still answers inline doesn't break.
-                    self.finish(threadID: threadID, reply: reply, voice: voice, context: context)
+                    // Deliver against the live `thread` reference (the send path
+                    // holds it), so there's no fetch-by-id that could miss.
+                    self.finish(threadID: threadID, thread: thread, reply: reply,
+                                voice: voice, context: context)
                 case .running(let jobId):
                     // The normal path. `persist` runs FIRST, synchronously, so
                     // `inFlight` is on disk the instant the job_id arrives — before
@@ -197,8 +200,11 @@ final class RunCoordinator {
                     self.persist(threadID: threadID, job: InFlightJob(jobId: jobId, voice: voice))
                     // Stream (display) and poll (completion) run concurrently; see
                     // `consume`. Polling is not a fallback — it owns the reply.
-                    await self.consume(threadID: threadID, jobId: jobId, voice: voice,
-                                       client: client, context: context)
+                    // Pass the live `thread` reference so completion appends to it
+                    // directly — no fetch-by-id that could resolve to nil and drop
+                    // the reply (the silent-stop bug this guards against).
+                    await self.consume(threadID: threadID, thread: thread, jobId: jobId,
+                                       voice: voice, client: client, context: context)
                 }
                 // Belt-and-suspenders: if `client.send` itself throws (a flaky
                 // connection drops the POST before its response lands), the bridge
@@ -282,8 +288,13 @@ final class RunCoordinator {
             // text-so-far, so a foregrounded turn picks up where it left off —
             // while the concurrent poll (see `consume`) owns completion, so a
             // stream that won't reopen never blocks the re-attach.
-            await self.consume(threadID: threadID, jobId: job.jobId, voice: job.voice,
-                               client: client, context: context)
+            //
+            // No live `thread` reference survives a relaunch, so `finish` falls
+            // back to a by-id fetch here. If that fetch can't resolve the thread,
+            // `finish` surfaces a recoverable error + Re-check rather than dropping
+            // the reply (see `finish`).
+            await self.consume(threadID: threadID, thread: nil, jobId: job.jobId,
+                               voice: job.voice, client: client, context: context)
             self.tasks[threadID] = nil
             self.endBackground(threadID)
         }
@@ -323,7 +334,9 @@ final class RunCoordinator {
     /// stop, any outcome is dropped (the `Task.isCancelled` guard below), and
     /// `cancel()`'s own synchronous teardown stands — preserving "ignore a late
     /// terminal after cancel".
-    private func consume(threadID: UUID, jobId: String, voice: Bool,
+    /// `thread` is the live reference the send path holds; `nil` on the
+    /// resume/recheck path (after a relaunch), where `finish` re-fetches by id.
+    private func consume(threadID: UUID, thread: JesseThread?, jobId: String, voice: Bool,
                          client: any JesseClientProtocol, context: ModelContext) async {
         let outcome: TurnOutcome? = await withTaskGroup(of: TurnOutcome?.self) { group in
             group.addTask { await self.streamForDisplay(threadID: threadID, jobId: jobId, client: client) }
@@ -345,7 +358,7 @@ final class RunCoordinator {
         guard let outcome else { return }
         switch outcome {
         case .done(let reply):
-            finish(threadID: threadID, reply: reply, voice: voice, context: context)
+            finish(threadID: threadID, thread: thread, reply: reply, voice: voice, context: context)
         case .failed(let message):
             // The turn failed recoverably (a bridge `error`/`.failed`, or a
             // transport error in the poll) — keep the job retained for Re-check.
@@ -451,14 +464,64 @@ final class RunCoordinator {
         return nil
     }
 
-    private func finish(threadID: UUID, reply: JesseReply, voice: Bool, context: ModelContext) {
-        if let thread = fetchThread(threadID, context: context) {
-            let turn = Turn(role: .jesse, text: reply.displayText)
-            thread.turns.append(turn)
-            thread.sessionId = reply.sessionId ?? thread.sessionId
-            thread.updatedAt = Date()
-            try? context.save()
+    /// Deliver a completed reply. The invariant: this either shows the reply (a
+    /// `jesse` Turn, persisted) or surfaces a recoverable error + Re-check — it is
+    /// never allowed to `clearRun` into nothing. The three ways the old `finish`
+    /// could silently lose a reply are each now a visible, recoverable state:
+    ///   1. the thread can't be resolved (the by-id re-fetch returns nil),
+    ///   2. the reply's `displayText` is empty,
+    ///   3. `context.save()` throws.
+    ///
+    /// `thread` is the live reference the send path holds — preferred so the common
+    /// case never re-fetches. It's `nil` only on the resume/recheck path (after a
+    /// relaunch), where we fall back to a by-id fetch.
+    private func finish(threadID: UUID, thread: JesseThread?, reply: JesseReply,
+                        voice: Bool, context: ModelContext) {
+        // (1) Resolve the destination. Prefer the held reference; fall back to a
+        // by-id fetch only when there isn't one (resume/recheck). If neither
+        // resolves, keep the job retained and surface Re-check — do NOT drop it.
+        guard let target = thread ?? fetchThread(threadID, context: context) else {
+            print("[Jesse] finish: reply for thread \(threadID) has no resolvable thread " +
+                  "(re-fetch returned nil) — retaining job_id for Re-check, not dropping the reply")
+            failRecoverable(threadID: threadID,
+                            message: "Got the reply but couldn't attach it to this thread — tap Re-check.",
+                            voice: voice)
+            return
         }
+
+        // (2) An empty reply is not a turn — surface it instead of appending a
+        // blank `jesse` bubble and clearing the run.
+        let displayText = reply.displayText
+        guard !displayText.isEmpty else {
+            print("[Jesse] finish: empty displayText for thread \(threadID) — " +
+                  "surfacing Re-check rather than appending a blank turn")
+            failRecoverable(threadID: threadID,
+                            message: "Jesse's reply came back empty — tap Re-check to fetch it again.",
+                            voice: voice)
+            return
+        }
+
+        let turn = Turn(role: .jesse, text: displayText)
+        target.turns.append(turn)
+        target.sessionId = reply.sessionId ?? target.sessionId
+        target.updatedAt = Date()
+
+        // (3) Real error handling, not `try?`. The in-memory append above already
+        // shows the reply; on a save failure, log it and surface a recoverable
+        // error (keeping the job for Re-check) so the failure isn't swallowed.
+        do {
+            try context.save()
+        } catch {
+            print("[Jesse] finish: context.save() failed for thread \(threadID): \(error) — " +
+                  "reply is shown but unsaved; retaining job_id for Re-check")
+            errors[threadID] = "Showed the reply, but couldn't save it — tap Re-check."
+            startDates[threadID] = nil
+            partialText[threadID] = nil
+            activity[threadID] = nil
+            if voice { Speaker.shared.speak(reply.spokenText) }
+            return
+        }
+
         if voice { Speaker.shared.speak(reply.spokenText) }
         clearRun(threadID)
     }

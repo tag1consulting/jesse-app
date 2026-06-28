@@ -158,6 +158,26 @@ Only the finished result and its timing metadata are written — **never** the b
 token or any secret. Running jobs aren't persisted (there's no result yet). Set
 `JESSE_STATE_DIR=` (empty) to disable persistence and run in-memory only.
 
+### App-side counterpart — a delivered reply is never silently dropped
+
+The bridge holding the reply only helps if the app reliably *renders* it once
+fetched. The app's `RunCoordinator.finish` upholds the matching invariant: after a
+turn completes, the app is in **exactly one** of {reply shown, recoverable error +
+Re-check shown} — "spinner stops, nothing shown, no error" is unreachable.
+
+- **Root cause it fixes (2026-06-28).** `finish` previously re-fetched the thread
+  by id (`fetchThread`) and wrapped the whole append-and-save in `if let thread =
+  …`. When that fetch returned nil (the thread wasn't resolvable in the run's
+  `ModelContext`), the body was skipped but `clearRun` still ran — dropping the
+  reply with no turn and no error. `try? context.save()` and an empty `displayText`
+  (appending a blank turn) were the two adjacent silent failures.
+- **Now:** the live `send` path appends to the `JesseThread` reference it already
+  holds (no fetch, no nil risk). The by-id fetch is kept **only** for the
+  resume/recheck path. If that fetch finds nothing, or the reply is empty, or the
+  save throws, `finish` keeps the `job_id` retained and surfaces a distinct
+  recoverable error (so the bridge's still-held reply is one **Re-check** away),
+  rather than clearing into nothing. See `RunCoordinatorFinishTests`.
+
 ## Live streaming (SSE)
 
 A turn's reply streams to the phone token-by-token instead of arriving all at
