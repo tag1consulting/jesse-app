@@ -37,7 +37,11 @@ struct ThreadDetailView: View {
             ToolbarItem(placement: .topBarTrailing) {
                 Button {
                     thread.toggleFavorite()
-                    try? context.save()
+                    do {
+                        try context.save()
+                    } catch {
+                        Log.run.error("favorite toggle save failed: \(error.localizedDescription)")
+                    }
                 } label: {
                     Label(thread.isFavorite ? "Unfavorite" : "Favorite",
                           systemImage: thread.isFavorite ? "star.fill" : "star")
@@ -374,6 +378,10 @@ struct SendButton: View {
     let disabled: Bool
     let action: () -> Void
 
+    /// Seconds for the left→right "thinking" fill to sweep fully across, and the
+    /// threshold past which the elapsed-seconds counter is shown.
+    private static let fillSweepSeconds: Double = 10
+
     var body: some View {
         TimelineView(.animation(minimumInterval: 1.0 / 30.0, paused: !running)) { context in
             let elapsed = (running ? startDate.map { context.date.timeIntervalSince($0) } : nil) ?? 0
@@ -381,7 +389,7 @@ struct SendButton: View {
             Button(action: action) {
                 HStack {
                     if running { ProgressView().tint(.white) }
-                    Text(running ? (secs > 10 ? "Thinking… \(secs)" : "Thinking…") : title)
+                    Text(running ? (secs > Int(Self.fillSweepSeconds) ? "Thinking… \(secs)" : "Thinking…") : title)
                         .foregroundStyle(.white)
                 }
                 .frame(maxWidth: .infinity)
@@ -392,7 +400,7 @@ struct SendButton: View {
                         GeometryReader { geo in
                             Rectangle()
                                 .fill(Color.black.opacity(0.18))
-                                .frame(width: geo.size.width * min(elapsed / 10, 1))
+                                .frame(width: geo.size.width * min(elapsed / Self.fillSweepSeconds, 1))
                                 .opacity(running ? 1 : 0)
                         }
                     }

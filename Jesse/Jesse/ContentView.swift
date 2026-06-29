@@ -192,7 +192,7 @@ struct SettingsView: View {
                 ToolbarItem(placement: .confirmationAction) {
                     Button("Save") {
                         config = JesseConfig(host: host,
-                                             port: Int(port) ?? 8765,
+                                             port: Int(port) ?? JesseConfig.defaultPort,
                                              token: token)
                         ConfigStore.save(config)
                         // Persist the prompt editors. `save` re-derives each
@@ -246,7 +246,7 @@ struct SettingsView: View {
         loadingPrompts = true
         defer { loadingPrompts = false }
         promptsError = nil
-        let cfg = JesseConfig(host: host, port: Int(port) ?? 8765, token: token)
+        let cfg = JesseConfig(host: host, port: Int(port) ?? JesseConfig.defaultPort, token: token)
         do {
             let d = try await JesseClient(config: cfg).fetchPrompts()
             // Cache the recommended floor defaults and refresh the editors when the

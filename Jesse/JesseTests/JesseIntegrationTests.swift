@@ -51,6 +51,8 @@ enum StubResult {
     case failed(String)
     /// 404 — the bridge no longer has the job (past its TTL).
     case expired
+    /// `{"status":"cancelled"}` — the turn was cancelled server-side.
+    case cancelled
     /// The poll connection drops (recoverable transport error).
     case transportDrop
 }
@@ -181,6 +183,8 @@ final class StubURLProtocol: URLProtocol {
             sendJSON(status: 200, ["status": "failed", "error": error])
         case .expired:
             send(status: 404)
+        case .cancelled:
+            sendJSON(status: 200, ["status": "cancelled"])
         case .transportDrop:
             fail(URLError(.networkConnectionLost))
         }
@@ -537,5 +541,46 @@ final class JesseIntegrationTests: XCTestCase {
         XCTAssertTrue(coordinator.canRecheck(thread.id), "a failure stays re-checkable (job retained)")
         XCTAssertFalse(coordinator.isRunning(thread.id))
         XCTAssertTrue(jesseTurns(thread).isEmpty)
+    }
+
+    /// (C1) A poll that observes `{"status":"cancelled"}` on a resumed/rechecked
+    /// job must return the thread to idle — NOT a permanently stuck Re-check.
+    ///
+    /// Pre-fix, `decodeResult` threw `.decoding` on the `cancelled` status (it only
+    /// handled running/done/failed); the poll mapped that to a recoverable failure,
+    /// so Re-check re-polled into the same error forever. This drives the exact
+    /// path: an initial transport drop retains the job (Re-check available), then a
+    /// re-check whose poll returns `cancelled` clears the run cleanly.
+    @MainActor
+    func testCancelledStatusOnResumedJobEndsIdleNotStuckRecheck() async throws {
+        let context = try makeContext()
+        // First poll drops (→ recoverable, job retained); the re-check's poll then
+        // reports the turn was cancelled server-side.
+        let bridge = StubBridge(
+            post: .immediate202(jobId: "job-cancelled"),
+            stream: .failImmediately,
+            results: [.transportDrop, .cancelled])
+        StubURLProtocol.bridge = bridge
+        let coordinator = makeCoordinator(realClient())
+
+        let thread = JesseThread(mode: .ask)
+        coordinator.send(thread: thread, text: "a question", voice: false, context: context)
+
+        // The drop leaves the turn recoverable with the job retained.
+        await waitUntil("the turn to settle recoverably after the drop") {
+            coordinator.canRecheck(thread.id)
+        }
+        XCTAssertTrue(coordinator.canRecheck(thread.id))
+
+        // Re-check: the poll now sees `cancelled` — the run must clear to idle.
+        coordinator.recheck(thread.id, context: context)
+        await waitUntil("the cancelled poll to clear the run to idle") {
+            !coordinator.isRunning(thread.id) && coordinator.inFlight[thread.id] == nil
+        }
+        XCTAssertFalse(coordinator.isRunning(thread.id))
+        XCTAssertNil(coordinator.inFlight[thread.id], "a cancelled job is dropped, not retained")
+        XCTAssertFalse(coordinator.canRecheck(thread.id), "no stuck Re-check after cancellation")
+        XCTAssertNil(coordinator.error(for: thread.id), "cancellation is not surfaced as an error")
+        XCTAssertTrue(jesseTurns(thread).isEmpty, "no reply turn for a cancelled turn")
     }
 }

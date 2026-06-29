@@ -100,7 +100,7 @@ final class AppDelegate: NSObject, UIApplicationDelegate, UNUserNotificationCent
 
     func application(_ application: UIApplication,
                     didFailToRegisterForRemoteNotificationsWithError error: Error) {
-        print("[Jesse] remote notification registration failed: \(error.localizedDescription)")
+        Log.push.error("remote notification registration failed: \(error.localizedDescription)")
     }
 
     // Show the banner (and play the sound) even when the app is foregrounded, so a

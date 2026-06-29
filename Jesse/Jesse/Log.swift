@@ -1,0 +1,33 @@
+import os
+
+// Centralized logging for the app's diagnostics. These replace the scattered
+// `print()` calls that vanished on release builds (print writes to stdout, which
+// a released app has no console for) — os.Logger lands in the unified logging
+// system and is inspectable in Console.app / `log stream`, retroactively too.
+//
+// `AppLog` wraps `os.Logger` with plain-`String` methods so call sites don't each
+// need `import os` (the `privacy:` string-interpolation overloads live in the os
+// module). Every message is logged `.public`: these are our own diagnostic strings
+// — the bearer token and other secrets are never passed here — so redacting them to
+// `<private>` would defeat the point of having them at all.
+struct AppLog {
+    let logger: Logger
+
+    func error(_ message: String) { logger.error("\(message, privacy: .public)") }
+    func notice(_ message: String) { logger.notice("\(message, privacy: .public)") }
+    func debug(_ message: String) { logger.debug("\(message, privacy: .public)") }
+}
+
+enum Log {
+    private static let subsystem = "com.tag1.jesse"
+
+    /// Turn lifecycle: send → consume → finish, and the recoverable/terminal
+    /// failure paths. The silent-loss diagnostics live here.
+    static let run = AppLog(logger: Logger(subsystem: subsystem, category: "run"))
+    /// Spoken-reply audio-session configuration and routing failures.
+    static let speaker = AppLog(logger: Logger(subsystem: subsystem, category: "speaker"))
+    /// Push registration / remote-notification callbacks.
+    static let push = AppLog(logger: Logger(subsystem: subsystem, category: "push"))
+    /// Keychain reads/writes for the bridge config (host/port/token).
+    static let keychain = AppLog(logger: Logger(subsystem: subsystem, category: "keychain"))
+}

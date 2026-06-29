@@ -59,7 +59,10 @@ final class RunCoordinator {
 
     // Not observed by views — just lifecycle bookkeeping.
     @ObservationIgnored private var tasks: [UUID: Task<Void, Never>] = [:]
-    @ObservationIgnored private var backgroundIDs: [UUID: UIBackgroundTaskIdentifier] = [:]
+    // threadID → the granted background-task handle. A box (not a raw id) so the
+    // expiration handler can end the exact id it was granted even if it fires
+    // before the store below — see `BackgroundTasking`.
+    @ObservationIgnored private var backgroundIDs: [UUID: BackgroundTaskHandle] = [:]
 
     private let configProvider: @MainActor () -> JesseConfig
     private let makeClient: @MainActor (JesseConfig) -> any JesseClientProtocol
@@ -75,9 +78,21 @@ final class RunCoordinator {
     // speaks nothing). Used only in `finish`.
     private let speak: @MainActor (String) -> Void
     // How a turn's mutations are persisted. Defaults to a real `context.save()`;
-    // injected so a test can force a save failure deterministically. Used only in
-    // `finish`.
+    // injected so a test can force a save failure deterministically. Used by the
+    // optimistic user-turn save and by `finish`.
     private let save: @MainActor (ModelContext) throws -> Void
+    // Background-task seam. Defaults to the real `UIApplication`-backed tasker;
+    // injected so a test can drive the expiration-before-store race.
+    private let backgroundTasker: BackgroundTasking
+    // How the poll loop waits between polls. Defaults to a real `Task.sleep`;
+    // injected so a test can drive the backoff sequence deterministically without
+    // real waiting.
+    private let pollSleep: @MainActor (TimeInterval) async -> Void
+
+    // threadID → a counter bumped on each stream reset/delta. The poll loop watches
+    // it to snap its backoff back to the fast cadence while the stream is actively
+    // delivering tokens. Not observed by views.
+    @ObservationIgnored private var streamTicks: [UUID: Int] = [:]
     // Called after a turn is delivered successfully — the "sensible moment" to ask
     // for push-notification authorization (not on cold launch). `JesseApp` wires
     // this to `PushManager`; the default is a no-op so tests never touch
@@ -90,6 +105,8 @@ final class RunCoordinator {
          floor: @escaping @MainActor (JesseMode) -> String? = { PromptStore.floorOverride(for: $0) },
          speak: @escaping @MainActor (String) -> Void = { Speaker.shared.speak($0) },
          save: @escaping @MainActor (ModelContext) throws -> Void = { try $0.save() },
+         backgroundTasker: BackgroundTasking = UIKitBackgroundTasking(),
+         pollSleep: @escaping @MainActor (TimeInterval) async -> Void = { try? await Task.sleep(for: .seconds($0)) },
          onFirstSuccess: @escaping @MainActor () -> Void = {}) {
         self.configProvider = config
         self.makeClient = makeClient
@@ -97,8 +114,33 @@ final class RunCoordinator {
         self.floorProvider = floor
         self.speak = speak
         self.save = save
+        self.backgroundTasker = backgroundTasker
+        self.pollSleep = pollSleep
         self.onFirstSuccess = onFirstSuccess
         self.inFlight = InFlightStore.load()
+    }
+
+    // MARK: - Poll cadence (H6)
+
+    /// Poll cadence for an in-flight turn (seconds). Polling starts fast, backs off
+    /// geometrically toward a ceiling while the turn is quiet (so a long turn isn't
+    /// hammered), and snaps back to the fast cadence whenever the live stream shows
+    /// new tokens (the turn is clearly alive and producing output).
+    nonisolated static let pollInterval: TimeInterval = 2
+    nonisolated static let pollIntervalCeiling: TimeInterval = 30
+    nonisolated static let pollBackoffFactor: Double = 5
+
+    /// The next poll interval after `current`: grow by the backoff factor, capped at
+    /// the ceiling. Pure, for direct testing. From `pollInterval`: 2 → 10 → 30 → 30…
+    nonisolated static func nextPollInterval(after current: TimeInterval) -> TimeInterval {
+        min(current * pollBackoffFactor, pollIntervalCeiling)
+    }
+
+    /// Bump the stream-activity counter for a thread — called by the display stream
+    /// on each reset/delta so the poll loop can reset its backoff. Internal so a
+    /// test can simulate stream activity deterministically.
+    func noteStreamActivity(_ threadID: UUID) {
+        streamTicks[threadID, default: 0] += 1
     }
 
     // MARK: - Query (read by views)
@@ -169,7 +211,17 @@ final class RunCoordinator {
             thread.title = JesseThread.deriveTitle(from: trimmed)
         }
         thread.updatedAt = Date()
-        try? context.save()
+        // Real error handling, not `try?`. If this throws the user message is shown
+        // but not persisted, and proceeding would attach the reply to a thread that
+        // may never persist. Surface a recoverable failure (the same shape `finish`
+        // uses) and abort the turn before any bridge call, rather than swallowing it.
+        do {
+            try save(context)
+        } catch {
+            Log.run.error("optimistic user-turn save failed for thread \(threadID): \(error.localizedDescription) — aborting the turn")
+            errors[threadID] = "Couldn't save your message — try sending it again."
+            return
+        }
 
         let mode = thread.modeValue
         let sessionId = thread.sessionId
@@ -182,12 +234,14 @@ final class RunCoordinator {
         startDates[threadID] = Date()
 
         // A background grant lets a short turn finish after the app is backgrounded;
-        // longer turns are re-attached on foreground via `resume`.
-        var bgID = UIApplication.shared.beginBackgroundTask(withName: "jesse.turn") { [weak self] in
-            self?.endBackground(threadID)
+        // longer turns are re-attached on foreground via `resume`. The expiration
+        // handler ends the id via the captured `handle`, so even if it fires before
+        // the dict store below, the granted assertion is always released (M7).
+        let handle = BackgroundTaskHandle()
+        backgroundTasker.beginTask(name: "jesse.turn", handle: handle) { [weak self] in
+            self?.endBackground(threadID, handle: handle)
         }
-        backgroundIDs[threadID] = bgID
-        bgID = .invalid // the dict owns the real id now
+        backgroundIDs[threadID] = handle
 
         tasks[threadID] = Task { [weak self] in
             guard let self else { return }
@@ -325,7 +379,8 @@ final class RunCoordinator {
     /// child (stream or poll) reaches it first. Mapping it to the finish/fail
     /// action happens exactly once, in `consume`, so a late second terminal from
     /// the other source can't double-finish.
-    private enum TurnOutcome {
+    // Internal (not private) so the testable `pollForOutcome` can name it.
+    enum TurnOutcome {
         case done(JesseReply)
         case failed(String)   // recoverable — keep the job for Re-check/resume
         case expired          // terminal — the reply is gone past its TTL
@@ -410,8 +465,10 @@ final class RunCoordinator {
                 switch event {
                 case .reset(let text):
                     partialText[threadID] = text
+                    noteStreamActivity(threadID)
                 case .delta(let chunk):
                     partialText[threadID, default: ""] += chunk
+                    noteStreamActivity(threadID)
                 case .activity(let tool):
                     activity[threadID] = Self.activityLabel(for: tool)
                 case .done(let reply):
@@ -450,8 +507,10 @@ final class RunCoordinator {
     /// by `consume` — so Re-check and the next `resume` can pick the reply back up;
     /// the run only truly ends, and the job is dropped, on `.done` (success) or
     /// `.expired` (gone past TTL).
-    private func pollForOutcome(threadID: UUID, jobId: String,
-                                client: any JesseClientProtocol) async -> TurnOutcome? {
+    func pollForOutcome(threadID: UUID, jobId: String,
+                        client: any JesseClientProtocol) async -> TurnOutcome? {
+        var interval = Self.pollInterval
+        var lastTick = streamTicks[threadID] ?? 0
         while !Task.isCancelled {
             let state: JesseResultState
             do {
@@ -472,13 +531,28 @@ final class RunCoordinator {
             if Task.isCancelled { return nil }
             switch state {
             case .running:
-                try? await Task.sleep(for: .seconds(2))
+                // Snap back to the fast cadence if the live stream delivered new
+                // tokens since the last poll — the turn is clearly alive and
+                // producing output, so poll promptly. Otherwise keep backing off.
+                let tick = streamTicks[threadID] ?? 0
+                if tick != lastTick {
+                    interval = Self.pollInterval
+                    lastTick = tick
+                }
+                await pollSleep(interval)
+                interval = Self.nextPollInterval(after: interval)
             case .done(let reply):
                 return .done(reply)
             case .failed(let message):
                 return .failed(message)
             case .expired:
                 return .expired
+            case .cancelled:
+                // The bridge reports the turn was cancelled server-side. Treat it
+                // exactly like the stream's `cancelled` frame: a clean terminal
+                // state, not a recoverable failure — `consume` drops the job and
+                // returns the thread to idle (no stuck Re-check).
+                return .cancelled
             }
         }
         return nil
@@ -507,13 +581,16 @@ final class RunCoordinator {
     /// relaunch), where we fall back to a by-id fetch. `jobId` is the bridge job
     /// whose reply this is (`nil` only on the dead inline `.reply` path, which has
     /// no id to key on).
-    func finish(threadID: UUID, thread: JesseThread?, reply: JesseReply,
-                voice: Bool, jobId: String?, context: ModelContext) {
+    // Private so callers can't bypass `send()` (which owns the optimistic turn,
+    // persistence, and the stream/poll race). `consume` and the dead inline
+    // `.reply` path are the only callers, both inside this type.
+    private func finish(threadID: UUID, thread: JesseThread?, reply: JesseReply,
+                        voice: Bool, jobId: String?, context: ModelContext) {
         // (1) Resolve the destination. Prefer the held reference; fall back to a
         // by-id fetch only when there isn't one (resume/recheck). If neither
         // resolves, keep the job retained and surface Re-check — do NOT drop it.
         guard let target = thread ?? fetchThread(threadID, context: context) else {
-            print("[Jesse] finish: reply for thread \(threadID) has no resolvable thread " +
+            Log.run.error("finish: reply for thread \(threadID) has no resolvable thread " +
                   "(re-fetch returned nil) — retaining job_id for Re-check, not dropping the reply")
             failRecoverable(threadID: threadID,
                             message: "Got the reply but couldn't attach it to this thread — tap Re-check.",
@@ -528,12 +605,12 @@ final class RunCoordinator {
         // the error, and clear the run. A still-failing retry leaves the recoverable
         // error + retained job intact, still without a duplicate.
         if let jobId, target.lastDeliveredJobId == jobId {
-            print("[Jesse] finish: job \(jobId) already delivered to thread \(threadID) — " +
+            Log.run.notice("finish: job \(jobId) already delivered to thread \(threadID) — " +
                   "retrying the save only, not re-appending")
             do {
                 try save(context)
             } catch {
-                print("[Jesse] finish: retry save() failed for thread \(threadID): \(error) — " +
+                Log.run.error("finish: retry save() failed for thread \(threadID): \(error.localizedDescription) — " +
                       "still retaining job_id for Re-check")
                 errors[threadID] = "Showed the reply, but couldn't save it — tap Re-check."
                 startDates[threadID] = nil
@@ -557,7 +634,7 @@ final class RunCoordinator {
         } else if !reply.spokenText.isEmpty {
             recordedText = reply.spokenText
         } else {
-            print("[Jesse] finish: genuinely empty reply for thread \(threadID) " +
+            Log.run.error("finish: genuinely empty reply for thread \(threadID) " +
                   "(no screen text, no spoken text) — surfacing Re-check rather than a blank turn")
             failRecoverable(threadID: threadID,
                             message: "Jesse's reply came back empty — tap Re-check to fetch it again.",
@@ -580,7 +657,7 @@ final class RunCoordinator {
         do {
             try save(context)
         } catch {
-            print("[Jesse] finish: context.save() failed for thread \(threadID): \(error) — " +
+            Log.run.error("finish: context.save() failed for thread \(threadID): \(error.localizedDescription) — " +
                   "reply is shown but unsaved; retaining job_id for Re-check")
             errors[threadID] = "Showed the reply, but couldn't save it — tap Re-check."
             startDates[threadID] = nil
@@ -670,9 +747,16 @@ final class RunCoordinator {
         }
     }
 
-    private func endBackground(_ threadID: UUID) {
-        if let id = backgroundIDs[threadID], id != .invalid {
-            UIApplication.shared.endBackgroundTask(id)
+    /// End a thread's background grant. The expiration handler passes the captured
+    /// `handle` directly, so the granted id is ended even if expiration fires before
+    /// `send` stored the handle in `backgroundIDs` (M7). Other callers (the task
+    /// tails) pass no handle and fall back to the stored one. Ending sets the id to
+    /// `.invalid`, so a later call for the same thread is a harmless no-op — the
+    /// grant is released exactly once.
+    private func endBackground(_ threadID: UUID, handle: BackgroundTaskHandle? = nil) {
+        if let h = handle ?? backgroundIDs[threadID], h.id != .invalid {
+            backgroundTasker.endTask(h.id)
+            h.id = .invalid
         }
         backgroundIDs[threadID] = nil
     }

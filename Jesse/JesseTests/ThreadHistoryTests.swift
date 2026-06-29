@@ -84,6 +84,17 @@ final class ThreadHistoryTests: XCTestCase {
         }
     }
 
+    func testDecodeResultCancelled() throws {
+        // (C1) The bridge serializes a cancelled job as `{"status":"cancelled"}`
+        // from GET /jesse/result/{id}. It must decode to .cancelled — not throw
+        // .decoding (which the poll mapped to a recoverable failure → a stuck
+        // "Re-check" thread that re-polled into the same error forever).
+        let data = #"{"status":"cancelled"}"#.data(using: .utf8)!
+        guard case .cancelled = try JesseClient.decodeResult(data: data, resp: httpResponse(200)) else {
+            return XCTFail("expected .cancelled")
+        }
+    }
+
     // MARK: - −1005 → .connectionLost mapping
 
     func testNetworkConnectionLostMapsToConnectionLost() {

@@ -73,6 +73,9 @@ final class JesseThread {
             .joined(separator: "\n\n")
     }
 
+    /// Max length of a derived thread title before it's truncated with an ellipsis.
+    static let titleCharacterLimit = 60
+
     /// A short, single-line title derived from the first user message. Used when
     /// a thread is created so the list row reads sensibly before any rename.
     static func deriveTitle(from text: String) -> String {
@@ -81,7 +84,7 @@ final class JesseThread {
             .split(whereSeparator: \.isNewline)
             .joined(separator: " ")
             .trimmingCharacters(in: .whitespaces)
-        let limit = 60
+        let limit = titleCharacterLimit
         guard collapsed.count > limit else { return collapsed }
         return String(collapsed.prefix(limit)).trimmingCharacters(in: .whitespaces) + "…"
     }

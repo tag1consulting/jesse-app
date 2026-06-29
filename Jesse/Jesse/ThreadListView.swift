@@ -90,7 +90,11 @@ struct ThreadListView: View {
 
     private func toggleFavorite(_ thread: JesseThread) {
         thread.toggleFavorite()
-        try? context.save()
+        do {
+            try context.save()
+        } catch {
+            Log.run.error("favorite toggle save failed: \(error.localizedDescription)")
+        }
     }
 
     private func newThread() {
@@ -123,7 +127,11 @@ struct ThreadListView: View {
             coordinator.cancel(thread.id)
             context.delete(thread)
         }
-        try? context.save()
+        do {
+            try context.save()
+        } catch {
+            Log.run.error("thread delete save failed: \(error.localizedDescription)")
+        }
     }
 
     /// Drop threads that were opened but never sent to (no turns) so the list
@@ -134,7 +142,13 @@ struct ThreadListView: View {
             context.delete(thread)
             changed = true
         }
-        if changed { try? context.save() }
+        if changed {
+            do {
+                try context.save()
+            } catch {
+                Log.run.error("pruneEmpty save failed: \(error.localizedDescription)")
+            }
+        }
     }
 }
 

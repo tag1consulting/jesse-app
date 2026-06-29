@@ -14,6 +14,12 @@ struct PendingVoiceRequest: Equatable {
 
 // Cross-launch hand-off: UserDefaults survives a cold launch; the @Published
 // property makes a warm hand-off instant. ContentView drains it on becoming active.
+//
+// `@MainActor` so `pending` is only ever mutated on the main actor — the
+// cold-launch `enqueue` path previously hopped to `DispatchQueue.main` by hand,
+// which left the mutation unprotected under strict concurrency. The annotation
+// makes that invariant compiler-enforced.
+@MainActor
 final class JesseInbox: ObservableObject {
     static let shared = JesseInbox()
     @Published var pending: PendingVoiceRequest?
@@ -24,7 +30,9 @@ final class JesseInbox: ObservableObject {
     func enqueue(mode: JesseMode, text: String) {
         UserDefaults.standard.set(mode.rawValue, forKey: dMode)
         UserDefaults.standard.set(text, forKey: dText)
-        DispatchQueue.main.async { self.drain() }
+        // Already on the main actor; defer the drain to the next runloop tick so the
+        // intent's `perform()` returns first (preserving the prior async behavior).
+        Task { @MainActor in self.drain() }
     }
 
     /// Pick up a queued voice request (call on launch/foreground).

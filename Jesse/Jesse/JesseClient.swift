@@ -96,6 +96,10 @@ enum AttachmentLimits {
 }
 
 struct JesseConfig {
+    /// The bridge's default port (`JESSE_PORT`), used when a pairing payload or a
+    /// stored config omits/can't parse one.
+    static let defaultPort = 8765
+
     var host: String   // e.g. "my-laptop.tailnet-1234.ts.net" or a 100.x IP
     var port: Int
     var token: String
@@ -181,7 +185,7 @@ struct JesseConfig {
         func v(_ n: String) -> String? { items.first { $0.name == n }?.value }
         guard let host = v("host"), let token = v("token"),
               !host.isEmpty, !token.isEmpty else { return nil }
-        return JesseConfig(host: host, port: Int(v("port") ?? "") ?? 8765, token: token)
+        return JesseConfig(host: host, port: Int(v("port") ?? "") ?? JesseConfig.defaultPort, token: token)
     }
 }
 
@@ -248,7 +252,7 @@ enum JesseError: LocalizedError {
     }
 }
 
-struct JesseReply {
+struct JesseReply: Equatable {
     let text: String         // raw response from the bridge
     let sessionId: String?   // carry into the next call to continue the thread
 
@@ -301,13 +305,20 @@ enum JesseResultState {
     /// coordinator drops the retained job_id and shows the one genuinely-final
     /// "expired" state. Anything short of this keeps the reply re-checkable.
     case expired
+    /// The turn was cancelled server-side — the bridge serializes a cancelled job
+    /// as `{"status":"cancelled"}` (see bridge/README.md cancel/eviction). A clean
+    /// terminal state, NOT a failure: the coordinator drops the job and returns the
+    /// thread to idle, mirroring the stream's `cancelled` frame. (Before this was
+    /// handled, the poll path threw `.decoding` on this status → mapped to `.failed`
+    /// → a permanently stuck "Re-check" that re-polled into the same error forever.)
+    case cancelled
 }
 
 /// One decoded frame from the live SSE stream (`GET /jesse/stream/{job_id}`).
 /// Mirrors the bridge's wire events. `reset` carries the full text-so-far (sent
 /// on subscribe and to re-sync after a lag) and REPLACES the partial buffer;
 /// `delta` APPENDS. The three terminal frames mirror `JesseResultState`.
-enum JesseStreamEvent {
+enum JesseStreamEvent: Equatable {
     case reset(String)
     case delta(String)
     case activity(String)   // coarse tool name, e.g. "Read" / "Write"
@@ -545,37 +556,15 @@ struct JesseClient: JesseClientProtocol {
                         throw JesseError.badResponse(http.statusCode, "")
                     }
 
-                    var eventName = ""
-                    var dataBuf = ""
-                    func flush() {
-                        defer { eventName = ""; dataBuf = "" }
-                        guard !eventName.isEmpty,
-                              let ev = Self.decodeStreamFrame(event: eventName, data: dataBuf)
-                        else { return }
-                        continuation.yield(ev)
-                    }
+                    // The line→frame framing is factored into the pure `SSEParser`
+                    // (unit-tested directly via `framesFromLines`); here we just feed
+                    // it lines as they arrive and yield each completed frame live.
+                    var parser = SSEParser()
                     for try await line in bytes.lines {
                         if Task.isCancelled { break }
-                        if line.isEmpty { flush(); continue }     // frame boundary
-                        if line.hasPrefix(":") { continue }       // keep-alive comment
-                        if let v = Self.sseField("event:", line) {
-                            // A new `event:` line starts a new frame. We do NOT rely
-                            // on the blank-line separator above to flush the previous
-                            // one: `URLSession.AsyncBytes.lines` *swallows blank
-                            // lines*, so the `line.isEmpty` boundary never fires for
-                            // a real SSE body. Without this, every `data:` would
-                            // accumulate into one blob and only a single garbled
-                            // event would surface at EOF. Flushing on each new event
-                            // (and on EOF) recovers correct per-frame framing whether
-                            // or not the blank line was delivered. Each bridge frame
-                            // carries exactly one `event:` line, so this is exact.
-                            if !eventName.isEmpty { flush() }
-                            eventName = v
-                        } else if let v = Self.sseField("data:", line) {
-                            dataBuf += v
-                        }
+                        if let ev = parser.consume(line) { continuation.yield(ev) }
                     }
-                    flush() // the final frame (no trailing blank line before EOF)
+                    if let ev = parser.finish() { continuation.yield(ev) }
                     continuation.finish()
                 } catch {
                     continuation.finish(throwing: error)
@@ -606,6 +595,60 @@ struct JesseClient: JesseClientProtocol {
         case "cancelled": return .cancelled
         default: return nil
         }
+    }
+
+    /// Stateful SSE line→frame state machine. Pure (no I/O): `stream` feeds it lines
+    /// as `URLSession.AsyncBytes.lines` yields them and forwards each completed
+    /// frame; tests feed hand-built line arrays via `framesFromLines`. Factored out
+    /// so the framing — the spot the CHANGELOG's blank-line-swallowing bug lived —
+    /// can be unit-tested directly.
+    struct SSEParser {
+        private var eventName = ""
+        private var dataBuf = ""
+
+        /// Feed one line; returns the frame it completes, if any.
+        ///
+        /// A blank line is a frame boundary. A new `event:` line ALSO flushes the
+        /// previous frame, because `URLSession.AsyncBytes.lines` *swallows blank
+        /// lines* — so the blank-line boundary often never arrives and the only
+        /// reliable separator is the next `event:`. `:` lines are SSE comments
+        /// (keep-alives) and are ignored.
+        mutating func consume(_ line: String) -> JesseStreamEvent? {
+            if line.isEmpty { return flush() }          // frame boundary
+            if line.hasPrefix(":") { return nil }       // keep-alive comment
+            if let v = JesseClient.sseField("event:", line) {
+                // A new `event:` line flushes the previous frame — the boundary that
+                // survives swallowed blank lines. Each bridge frame carries exactly
+                // one `event:` line, so this is exact.
+                let completed = eventName.isEmpty ? nil : flush()
+                eventName = v
+                return completed
+            } else if let v = JesseClient.sseField("data:", line) {
+                dataBuf += v
+            }
+            return nil
+        }
+
+        /// Flush the final frame at end of input (no trailing blank line before EOF).
+        mutating func finish() -> JesseStreamEvent? { flush() }
+
+        private mutating func flush() -> JesseStreamEvent? {
+            defer { eventName = ""; dataBuf = "" }
+            guard !eventName.isEmpty else { return nil }
+            return JesseClient.decodeStreamFrame(event: eventName, data: dataBuf)
+        }
+    }
+
+    /// Pure line→frame conversion over a whole sequence of SSE lines, for unit
+    /// testing the framing over hand-built line arrays.
+    nonisolated static func framesFromLines<S: Sequence<String>>(_ lines: S) -> [JesseStreamEvent] {
+        var parser = SSEParser()
+        var out: [JesseStreamEvent] = []
+        for line in lines {
+            if let ev = parser.consume(line) { out.append(ev) }
+        }
+        if let ev = parser.finish() { out.append(ev) }
+        return out
     }
 
     /// Fetch the bridge's built-in Ask/Tell wrapper defaults (`GET /jesse/prompts`).
@@ -705,6 +748,12 @@ struct JesseClient: JesseClientProtocol {
             return .done(JesseReply(text: text, sessionId: obj["session_id"] as? String))
         case "failed":
             return .failed(obj["error"] as? String ?? "Jesse couldn't complete that.")
+        case "cancelled":
+            // The bridge's terminal state for a cancelled turn. A clean status, not
+            // a failure — mirrors the stream's `cancelled` frame (decodeStreamFrame).
+            // Without this case it fell through to `default` → `.decoding`, which the
+            // poll loop turned into a permanently stuck "Re-check".
+            return .cancelled
         default:
             throw JesseError.decoding
         }
@@ -734,18 +783,28 @@ struct JesseClient: JesseClientProtocol {
 enum ConfigStore {
     private static let service = "com.tag1.jesse"
 
+    /// Seam for the Keychain add so a test can force an `OSStatus` failure without a
+    /// real Keychain (the test bundle often lacks Keychain entitlements). Production
+    /// uses `SecItemAdd` directly.
+    nonisolated(unsafe) static var addItem: (CFDictionary, UnsafeMutablePointer<CFTypeRef?>?) -> OSStatus = SecItemAdd
+
     static func load() -> JesseConfig {
         JesseConfig(
             host: read("host") ?? "",
-            port: Int(read("port") ?? "") ?? 8765,
+            port: Int(read("port") ?? "") ?? JesseConfig.defaultPort,
             token: read("token") ?? ""
         )
     }
 
-    static func save(_ c: JesseConfig) {
-        write("host", c.host)
-        write("port", String(c.port))
-        write("token", c.token)
+    /// Persist the config. Returns `false` if any field's write failed (e.g. the
+    /// Keychain was locked), so a caller can surface "couldn't save the token"
+    /// rather than silently losing it.
+    @discardableResult
+    static func save(_ c: JesseConfig) -> Bool {
+        let okHost = write("host", c.host)
+        let okPort = write("port", String(c.port))
+        let okToken = write("token", c.token)
+        return okHost && okPort && okToken
     }
 
     private static func read(_ key: String) -> String? {
@@ -762,7 +821,8 @@ enum ConfigStore {
         return String(data: data, encoding: .utf8)
     }
 
-    private static func write(_ key: String, _ value: String) {
+    @discardableResult
+    private static func write(_ key: String, _ value: String) -> Bool {
         let base: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: service,
@@ -771,6 +831,14 @@ enum ConfigStore {
         SecItemDelete(base as CFDictionary)
         var add = base
         add[kSecValueData as String] = value.data(using: .utf8)
-        SecItemAdd(add as CFDictionary, nil)
+        let status = addItem(add as CFDictionary, nil)
+        if status != errSecSuccess {
+            // Surface, don't swallow: a locked Keychain (or missing entitlement)
+            // would otherwise lose the token with no trace. The status code is not
+            // a secret (the value itself is never logged).
+            Log.keychain.error("SecItemAdd failed for key \(key): OSStatus \(status)")
+            return false
+        }
+        return true
     }
 }

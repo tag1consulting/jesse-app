@@ -24,13 +24,15 @@ final class RunCoordinatorFinishTests: XCTestCase {
         }
         var phase: ResultPhase
         var onResult: (() -> Void)?
+        var sendCount = 0
 
         init(phase: ResultPhase) { self.phase = phase }
 
         func send(mode: JesseMode, text: String, sessionId: String?, voice: Bool,
                   instructions: String?, floorOverride: String?,
                   attachments: [JesseAttachment]) async throws -> JesseSendResult {
-            .running(jobId: "job-finish")
+            sendCount += 1
+            return .running(jobId: "job-finish")
         }
 
         func result(jobId: String) async throws -> JesseResultState {
@@ -64,16 +66,18 @@ final class RunCoordinatorFinishTests: XCTestCase {
         func speak(_ s: String) { spoken.append(s) }
     }
 
-    /// A save seam whose first call can be forced to throw (then succeed after),
-    /// to drive the save-failure → Re-check → no-duplicate path deterministically.
+    /// A save seam whose Nth call(s) can be forced to throw (then succeed after),
+    /// to drive the save-failure paths deterministically. The seam is now used by
+    /// BOTH the optimistic user-turn save (call 1 of a send) and `finish` (a later
+    /// call), so tests target specific 1-based call indices rather than "the first".
     @MainActor
     private final class SaveSpy {
         struct ForcedFailure: Error {}
         var calls = 0
-        var failFirst = false
+        var failOn: Set<Int> = []
         func save(_ context: ModelContext) throws {
             calls += 1
-            if failFirst && calls == 1 { throw ForcedFailure() }
+            if failOn.contains(calls) { throw ForcedFailure() }
             try context.save()
         }
     }
@@ -139,6 +143,37 @@ final class RunCoordinatorFinishTests: XCTestCase {
         XCTAssertFalse(coordinator.isRunning(thread.id))
         XCTAssertNil(coordinator.error(for: thread.id))
         XCTAssertNil(coordinator.inFlight[thread.id], "a delivered reply clears the retained job")
+    }
+
+    // MARK: - The optimistic user-turn save (M5: no silently-swallowed save)
+
+    /// (M5) The optimistic user-turn `context.save()` in `send` was `try?` — a
+    /// throw left the user message shown but unpersisted and let the turn proceed
+    /// to attach a reply to a possibly-doomed thread. It must now surface the
+    /// failure (recoverable, like `finish`) and NOT start the bridge turn.
+    @MainActor
+    func testOptimisticUserTurnSaveFailureSurfacesAndStopsTurn() async throws {
+        let context = try makeContext()
+        let fake = SwitchableClient(phase: .done(JesseReply(text: "unreached", sessionId: nil)))
+        let save = SaveSpy()
+        save.failOn = [1]   // the optimistic user-turn save is call 1 of the send
+        let coordinator = makeCoordinator(fake, save: save)
+
+        let thread = JesseThread(mode: .ask)
+        coordinator.send(thread: thread, text: "a question", voice: false, context: context)
+
+        await waitUntil("the optimistic save failure to surface") {
+            coordinator.error(for: thread.id) != nil
+        }
+        try await Task.sleep(for: .milliseconds(50)) // let any spawned task unwind
+
+        XCTAssertNotNil(coordinator.error(for: thread.id),
+                        "an optimistic-turn save failure must be surfaced, not swallowed")
+        XCTAssertFalse(coordinator.isRunning(thread.id))
+        XCTAssertNil(coordinator.inFlight[thread.id], "no job — the turn never started")
+        XCTAssertEqual(save.calls, 1, "only the optimistic save was attempted before aborting")
+        XCTAssertEqual(fake.sendCount, 0,
+                       "the bridge turn is not started after a failed optimistic save")
     }
 
     // MARK: - The unresolvable-thread guard (no silent drop)
@@ -302,7 +337,9 @@ final class RunCoordinatorFinishTests: XCTestCase {
         let reply = JesseReply(text: "the durable answer", sessionId: "sess-s")
         let fake = SwitchableClient(phase: .done(reply))
         let save = SaveSpy()
-        save.failFirst = true
+        // Optimistic user-turn save (call 1) succeeds; the `finish` save (call 2)
+        // throws; the Re-check's retry save (call 3) succeeds.
+        save.failOn = [2]
         let coordinator = makeCoordinator(fake, save: save)
 
         let thread = JesseThread(mode: .ask)
@@ -337,10 +374,12 @@ final class RunCoordinatorFinishTests: XCTestCase {
         XCTAssertEqual(thread.lastDeliveredJobId, "job-finish", "the delivered job is keyed on the thread")
     }
 
-    /// The narrow idempotency guard: once a job's reply is delivered, a second
-    /// `finish` re-entry for the SAME `jobId` leaves the turn count unchanged.
+    /// The narrow idempotency guard via the public surface: once a job's reply is
+    /// delivered, the run is cleared (no retained job), so a follow-up `recheck` is
+    /// a no-op and can never append a second turn. (`finish` is private — callers
+    /// can't re-enter it directly, only the send/consume/recheck paths can.)
     @MainActor
-    func testIdempotentDeliveryIgnoresRepeatJob() async throws {
+    func testRecheckAfterDeliveryDoesNotDuplicate() async throws {
         let context = try makeContext()
         let reply = JesseReply(text: "answered once", sessionId: "sess-i")
         let fake = SwitchableClient(phase: .done(reply))
@@ -352,13 +391,13 @@ final class RunCoordinatorFinishTests: XCTestCase {
         await waitUntil("the reply to render") { !self.jesseTurns(thread).isEmpty }
         XCTAssertEqual(jesseTurns(thread).count, 1)
         XCTAssertEqual(thread.lastDeliveredJobId, "job-finish")
+        XCTAssertNil(coordinator.inFlight[thread.id], "a delivered reply clears the retained job")
 
-        // Re-enter finish for the same job (e.g. a retained-job re-poll). The key
-        // matches, so no second turn is appended.
-        coordinator.finish(threadID: thread.id, thread: thread, reply: reply,
-                           voice: false, jobId: "job-finish", context: context)
+        // A re-check after delivery: no retained job → a no-op, no second turn.
+        coordinator.recheck(thread.id, context: context)
+        try await Task.sleep(for: .milliseconds(50))
 
-        XCTAssertEqual(jesseTurns(thread).count, 1, "a repeat of the same job appends no second turn")
+        XCTAssertEqual(jesseTurns(thread).count, 1, "re-check after delivery appends no second turn")
     }
 
     // MARK: - helpers
