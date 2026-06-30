@@ -82,6 +82,24 @@ struct ContentView: View {
     }
 }
 
+/// What the Settings "Save" action should do once persistence has been attempted.
+enum SaveOutcome: Equatable {
+    case dismiss
+    case showError
+}
+
+/// The Settings "Save" decision, factored out of the view so it's unit-testable
+/// (a SwiftUI `.alert` is not). Persists the config — the bearer token plus
+/// host/port — to the Keychain first; if that write fails it returns `.showError`
+/// and does NOT run `persistPrompts`, so a failed token write can't half-commit the
+/// prompt editors behind a dismissed sheet. Only on a successful Keychain write
+/// does it run `persistPrompts` (the prompt-editor saves) and return `.dismiss`.
+func settingsSaveOutcome(config: JesseConfig, persistPrompts: () -> Void) -> SaveOutcome {
+    guard ConfigStore.save(config) else { return .showError }
+    persistPrompts()
+    return .dismiss
+}
+
 struct SettingsView: View {
     @Binding var config: JesseConfig
     @Environment(\.dismiss) private var dismiss
@@ -92,6 +110,9 @@ struct SettingsView: View {
 
     @State private var showScanner = false
     @State private var scanError: String?
+    // Set when the Keychain write fails; drives the save-error alert so the sheet
+    // stays open instead of silently dismissing on a token that never persisted.
+    @State private var showSaveError = false
 
     // Per-mode wrapper editors. `*Prompt` is the editable text; `*Default` mirrors
     // the cached bridge default (for the differs-from-default check and Reset).
@@ -188,23 +209,37 @@ struct SettingsView: View {
                 floorSection(for: .tell)
             }
             .navigationTitle("Settings")
+            .alert("Couldn’t save your settings", isPresented: $showSaveError) {
+                Button("OK", role: .cancel) { }
+            } message: {
+                Text("Your token couldn’t be saved to this iPhone’s Keychain, so pairing didn’t finish. Nothing was changed — please tap Save again.")
+            }
             .toolbar {
                 ToolbarItem(placement: .confirmationAction) {
                     Button("Save") {
-                        config = JesseConfig(host: host,
-                                             port: Int(port) ?? JesseConfig.defaultPort,
-                                             token: token)
-                        ConfigStore.save(config)
-                        // Persist the prompt editors. `save` re-derives each
-                        // slot's customized flag (non-empty AND differs from the
-                        // cached default); an empty field stays "use the default".
-                        PromptStore.save(.ask, .wrapper, text: askPrompt, default: askDefault)
-                        PromptStore.save(.tell, .wrapper, text: tellPrompt, default: tellDefault)
-                        // Floor overrides: an empty editor falls back to the
-                        // recommended default — the floor itself is never removed.
-                        PromptStore.save(.ask, .floor, text: askFloorText, default: askFloorDefault)
-                        PromptStore.save(.tell, .floor, text: tellFloorText, default: tellFloorDefault)
-                        dismiss()
+                        let cfg = JesseConfig(host: host,
+                                              port: Int(port) ?? JesseConfig.defaultPort,
+                                              token: token)
+                        // The config (token included) must persist before we commit
+                        // anything else — on a Keychain failure we keep the sheet up
+                        // and surface the error rather than half-committing the
+                        // prompt editors and the in-memory config behind a dismiss.
+                        let outcome = settingsSaveOutcome(config: cfg) {
+                            config = cfg
+                            // Persist the prompt editors. `save` re-derives each
+                            // slot's customized flag (non-empty AND differs from the
+                            // cached default); an empty field stays "use the default".
+                            PromptStore.save(.ask, .wrapper, text: askPrompt, default: askDefault)
+                            PromptStore.save(.tell, .wrapper, text: tellPrompt, default: tellDefault)
+                            // Floor overrides: an empty editor falls back to the
+                            // recommended default — the floor itself is never removed.
+                            PromptStore.save(.ask, .floor, text: askFloorText, default: askFloorDefault)
+                            PromptStore.save(.tell, .floor, text: tellFloorText, default: tellFloorDefault)
+                        }
+                        switch outcome {
+                        case .dismiss:   dismiss()
+                        case .showError: showSaveError = true
+                        }
                     }
                 }
                 ToolbarItem(placement: .cancellationAction) {

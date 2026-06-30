@@ -1487,9 +1487,19 @@ async fn run_claude_streaming(
             String::from_utf8_lossy(&buf[..cap]).into_owned()
         });
 
-        // Read stdout to EOF, mapping each NDJSON line and pushing live frames.
-        // Reading to EOF (rather than breaking on the `result` line) also drains
-        // the pipe so the child can exit cleanly. The last `result` line wins.
+        // Read stdout line by line, mapping each NDJSON line and pushing live
+        // frames, and STOP as soon as the terminal `result` line is parsed.
+        // Completion must be driven by that result line, never by stdout EOF:
+        // EOF only arrives once `claude` AND every grandchild that inherited its
+        // stdout fd (the MCP servers it launches — QMD, Home Assistant, …) close
+        // the pipe, so a single lingering subprocess would otherwise block this
+        // read until the per-attempt timeout, pinning the job as Running long
+        // after the answer (and its `result` line) already arrived. The
+        // stream-json contract emits exactly one terminal `result` line and it is
+        // the last meaningful line, so breaking on it still satisfies "the last
+        // result line wins." The no-`result` fallback below (clean EOF with
+        // accumulated streamed text) is preserved: that path is reached only when
+        // the loop ends via `next_line() == None` without ever seeing a `Done`.
         let read_lines = async {
             let mut lines = BufReader::new(stdout).lines();
             let mut terminal: Option<ClaudeOutcome> = None;
@@ -1501,7 +1511,10 @@ async fn run_claude_streaming(
                 match parse_stream_line(&line) {
                     StreamEvent::TextDelta(t) => jobs.stream_push_delta(job_id, &t),
                     StreamEvent::ToolActivity { name } => jobs.stream_push_activity(job_id, &name),
-                    StreamEvent::Done(outcome) => terminal = Some(outcome),
+                    StreamEvent::Done(outcome) => {
+                        terminal = Some(outcome);
+                        break;
+                    }
                     StreamEvent::Ignore => {}
                 }
             }
@@ -1534,9 +1547,40 @@ async fn run_claude_streaming(
             }
         };
 
-        // Reap the child and collect its stderr for the no-`result` fallback.
-        let _ = child.wait().await;
-        let stderr = stderr_task.await.unwrap_or_default();
+        // Reap the child and collect its stderr — but BOUND both waits so a
+        // child (or, more likely, a grandchild MCP server that inherited
+        // claude's stdio) that won't exit can't pin this task. Once the result
+        // line is parsed the answer is authoritative; reaping is cleanup that
+        // must never delay or block delivery.
+        const REAP_TIMEOUT: Duration = Duration::from_secs(5);
+        let stderr = if terminal.is_some() {
+            // We already have the authoritative `result` line, so stderr is
+            // irrelevant to the outcome (it only feeds the no-`result` Fatal
+            // cause). Don't wait on the child tree at all here — a lingering
+            // grandchild holding the pipe open is exactly the hang this fixes.
+            // Reap in the background, bounded, with an explicit kill; abandon
+            // the stderr drain so a held-open stderr fd can't leak the task.
+            tokio::spawn(async move {
+                if timeout(REAP_TIMEOUT, child.wait()).await.is_err() {
+                    // kill_on_drop is the backstop; make the kill explicit.
+                    let _ = child.start_kill();
+                }
+                stderr_task.abort();
+            });
+            String::new()
+        } else {
+            // No `result` line: clean EOF after streaming (or a genuine
+            // failure). stdout already hit EOF, so the process is finishing and
+            // these waits normally return at once — but bound them anyway so a
+            // grandchild holding a pipe open can't block the fallback path.
+            if timeout(REAP_TIMEOUT, child.wait()).await.is_err() {
+                let _ = child.start_kill();
+            }
+            match timeout(REAP_TIMEOUT, stderr_task).await {
+                Ok(joined) => joined.unwrap_or_default(),
+                Err(_) => String::new(),
+            }
+        };
 
         // Decide the outcome from the terminal `result` line AND the text already
         // accumulated from the stream, so a turn that produced a visible answer is
@@ -3961,6 +4005,162 @@ mod tests {
         );
 
         let _ = std::fs::remove_file(&marker);
+        let _ = std::fs::remove_file(&fake);
+    }
+
+    // ---- completion is driven by the result line, not child-tree EOF -------
+    //
+    // Regression for the hang where a turn stayed Running until the per-attempt
+    // timeout because a subprocess (claude itself, or a grandchild MCP server
+    // that inherited claude's stdout fd) kept the stdout pipe open after the
+    // terminal `result` line had already arrived. The read loop must STOP on the
+    // result line, not read to EOF.
+
+    fn pid_alive(pid: i32) -> bool {
+        // `kill -0` probes for the process without signalling it.
+        std::process::Command::new("kill")
+            .args(["-0", &pid.to_string()])
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+    }
+
+    #[tokio::test]
+    async fn streaming_completes_on_result_line_not_child_exit() {
+        // A fake claude that emits a valid stream-json sequence ending in a
+        // `result` line and THEN sleeps without exiting, keeping stdout open. The
+        // turn must reach Done driven by the result line — well under the (short)
+        // run timeout — instead of blocking on the pipe until the timeout fires.
+        //
+        // FAILING-FIRST: against the pre-fix read-to-EOF loop the `sleep` holds
+        // stdout open, so `next_line()` blocks until the 2s timeout converts the
+        // turn into a GATEWAY_TIMEOUT failure — the job is never `done`, so the
+        // assertion below (done within ~1.5s) fails.
+        let script = "#!/bin/sh\n\
+             printf '%s\\n' '{\"type\":\"stream_event\",\"event\":{\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\"answer\"}}}'\n\
+             printf '%s\\n' '{\"type\":\"result\",\"is_error\":false,\"result\":\"the answer\",\"session_id\":\"sess-rl\"}'\n\
+             sleep 600\n";
+        let fake = write_fake_claude(script);
+        let cfg = Config {
+            claude_bin: fake.to_string_lossy().into_owned(),
+            timeout_secs: 2, // short run limit — Done must beat it, not race it
+            ..test_config()
+        };
+        let st = AppState::new(cfg);
+
+        let resp = app(st.clone())
+            .oneshot(jesse_request(
+                Some("Bearer test-token"),
+                r#"{"mode":"ask","text":"answer me"}"#,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::ACCEPTED);
+        let body: Value = serde_json::from_str(&body_string(resp).await).unwrap();
+        let job_id = body["job_id"].as_str().unwrap().to_string();
+
+        // Poll only up to 1.5s — comfortably under the 2s timeout. The turn must
+        // be `done` from the result line by then; if completion still waited on
+        // child exit it would still be `running` here (and fail at 2s).
+        let mut done = None;
+        for _ in 0..30 {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            let v = result_status(&st, &job_id).await;
+            if v["status"] == "done" {
+                done = Some(v);
+                break;
+            }
+        }
+        let done =
+            done.expect("turn must reach done on the result line, not block on child stdout EOF");
+        assert_eq!(done["response"], "the answer");
+        assert_eq!(done["session_id"], "sess-rl");
+
+        let _ = std::fs::remove_file(&fake);
+    }
+
+    #[tokio::test]
+    async fn streaming_reaps_child_after_result_line() {
+        // The flip side of the fix: after completing on the result line, the
+        // bounded reap must actually kill a child that won't exit on its own, so
+        // the fix doesn't leak a runaway `claude`. The fake records its own pid,
+        // prints the result line, then sleeps far longer than the reap bound.
+        let pidfile = std::env::temp_dir().join(format!(
+            "jesse-reap-pid-{}-{}.txt",
+            std::process::id(),
+            JOB_COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_file(&pidfile);
+        let script = format!(
+            "#!/bin/sh\n\
+             echo $$ > '{}'\n\
+             printf '%s' '{{\"type\":\"result\",\"is_error\":false,\"result\":\"reaped\",\"session_id\":\"sess-reap\"}}'\n\
+             printf '\\n'\n\
+             sleep 600\n",
+            pidfile.display()
+        );
+        let fake = write_fake_claude(&script);
+        let cfg = Config {
+            claude_bin: fake.to_string_lossy().into_owned(),
+            timeout_secs: 2,
+            ..test_config()
+        };
+        let st = AppState::new(cfg);
+
+        let resp = app(st.clone())
+            .oneshot(jesse_request(
+                Some("Bearer test-token"),
+                r#"{"mode":"ask","text":"reap me"}"#,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::ACCEPTED);
+        let body: Value = serde_json::from_str(&body_string(resp).await).unwrap();
+        let job_id = body["job_id"].as_str().unwrap().to_string();
+
+        // The turn lands Done on the result line (same as above).
+        let mut done = false;
+        for _ in 0..30 {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            if result_status(&st, &job_id).await["status"] == "done" {
+                done = true;
+                break;
+            }
+        }
+        assert!(done, "turn must reach done on the result line");
+
+        // Read the child's pid (written before it printed the result line).
+        let pid: i32 = {
+            let mut p = None;
+            for _ in 0..20 {
+                if let Ok(s) = std::fs::read_to_string(&pidfile) {
+                    if let Ok(n) = s.trim().parse() {
+                        p = Some(n);
+                        break;
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            p.expect("fake claude must record its pid")
+        };
+
+        // The background reap kills the lingering child within its bound (5s).
+        // Give it that bound plus a margin; the child must be gone, even though
+        // its own `sleep 600` is nowhere near done.
+        let mut reaped = false;
+        for _ in 0..80 {
+            if !pid_alive(pid) {
+                reaped = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert!(
+            reaped,
+            "the lingering claude child must be killed by the bounded reap, not left running"
+        );
+
+        let _ = std::fs::remove_file(&pidfile);
         let _ = std::fs::remove_file(&fake);
     }
 

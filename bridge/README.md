@@ -267,6 +267,22 @@ format, not ours):
 (`TextDelta` / `ToolActivity` / `Done` / `Ignore`) and is pure, so it's unit-tested
 against captured fixtures.
 
+> **Completion is driven by the `result` line, not stdout EOF.** The read loop
+> **stops the instant it parses the terminal `result` line** rather than reading
+> stdout to EOF. The stream-json contract emits exactly one terminal `result`
+> line and it is the last meaningful line, so "the last result line wins" still
+> holds. This matters because stdout EOF only arrives once `claude` **and every
+> grandchild that inherited its stdout fd** (the MCP servers it launches — QMD,
+> Home Assistant, …) close the pipe; a single lingering subprocess would
+> otherwise keep the read blocked until the per-attempt timeout, pinning the job
+> as Running (and the phone's spinner unresolved) long after the answer already
+> arrived. Reaping the child and draining stderr afterward are **bounded
+> cleanup** (a few-second `REAP_TIMEOUT` plus an explicit `start_kill`), so a
+> child or grandchild that won't exit can never delay or block delivery — the
+> answer is already authoritative once the `result` line is parsed. The
+> no-`result` fallback (clean EOF with accumulated streamed text) is unchanged:
+> it's reached only when stdout ends without a `Done` ever appearing.
+
 ### Captured result schema and the empty-reply fix
 
 The verified shapes below were **captured from real `claude --output-format
