@@ -45,3 +45,105 @@ jobs:
       - name: Source guards (incl. R5 personal-infra + gitleaks)
         working-directory: ${{ github.workspace }}
         run: bash scripts/ci-guards.sh
+
+  ios-app:
+    name: ios-app (build, test)
+    # The app targets iOS 26, whose simulators only run on a macOS 26 (Tahoe)
+    # host — the macos-15 image can build but xcodebuild refuses to offer the
+    # iOS 26 simulators as destinations there.
+    runs-on: macos-26
+    defaults:
+      run:
+        working-directory: Jesse
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Select Xcode
+        uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: latest-stable
+
+      - name: Show toolchain
+        run: |
+          xcodebuild -version
+          xcode-select -p
+
+      - name: Resolve simulator destination
+        id: sim
+        run: |
+          set -euo pipefail
+          # The local gate builds for "iPhone 17", which may not exist on the
+          # runner. Rather than hardcode a device, pick the newest available
+          # iOS runtime and create a fresh iPhone simulator from one of that
+          # runtime's own supported device types. Creating the device (instead
+          # of trusting whatever `simctl` happens to list) guarantees xcodebuild
+          # has a concrete, matching destination id to build and test against.
+          xcrun simctl list runtimes available
+          read -r RUNTIME_ID RUNTIME_VER DEVTYPE DEV_NAME < <(
+            xcrun simctl list runtimes --json | jq -r '
+              .runtimes
+              | map(select(.platform == "iOS" and .isAvailable))
+              | map({
+                  id: .identifier,
+                  ver: .version,
+                  dt: (.supportedDeviceTypes | map(select(.productFamily == "iPhone")) | last)
+                })
+              | map(select(.dt != null))
+              | sort_by(.ver | split(".") | map(tonumber))
+              | last
+              | "\(.id) \(.ver) \(.dt.identifier) \(.dt.name)"
+            '
+          )
+          if [ -z "${RUNTIME_ID:-}" ] || [ -z "${DEVTYPE:-}" ]; then
+            echo "No available iOS runtime with an iPhone device type on the runner" >&2
+            exit 1
+          fi
+          UDID=$(xcrun simctl create "ci-iphone" "$DEVTYPE" "$RUNTIME_ID")
+          xcrun simctl boot "$UDID" || true
+          DEST="platform=iOS Simulator,id=${UDID}"
+          echo "Resolved: ${DEV_NAME} (iOS ${RUNTIME_VER}) -> ${DEST}"
+          echo "destination=${DEST}" >> "$GITHUB_OUTPUT"
+          # Pin the build's deployment target to the runtime we'll actually run
+          # on, so the app installs regardless of which iOS the runner ships.
+          echo "deployment_target=${RUNTIME_VER}" >> "$GITHUB_OUTPUT"
+
+      - name: Build
+        run: |
+          set -euo pipefail
+          xcodebuild build \
+            -scheme Jesse \
+            -destination "${{ steps.sim.outputs.destination }}" \
+            -derivedDataPath build/DerivedData \
+            IPHONEOS_DEPLOYMENT_TARGET=${{ steps.sim.outputs.deployment_target }} \
+            CODE_SIGNING_ALLOWED=NO
+
+      - name: Test
+        run: |
+          set -euo pipefail
+          xcodebuild test \
+            -scheme Jesse \
+            -destination "${{ steps.sim.outputs.destination }}" \
+            -derivedDataPath build/DerivedData \
+            -resultBundlePath build/Result.xcresult \
+            IPHONEOS_DEPLOYMENT_TARGET=${{ steps.sim.outputs.deployment_target }} \
+            CODE_SIGNING_ALLOWED=NO
+
+      - name: Report test count
+        if: always()
+        run: |
+          set -euo pipefail
+          if [ ! -d build/Result.xcresult ]; then
+            echo "No result bundle produced" >&2
+            exit 1
+          fi
+          summary="$(xcrun xcresulttool get test-results summary --path build/Result.xcresult)"
+          total=$(printf '%s' "$summary" | jq -r '.totalTestCount')
+          passed=$(printf '%s' "$summary" | jq -r '.passedTests')
+          failed=$(printf '%s' "$summary" | jq -r '.failedTests')
+          skipped=$(printf '%s' "$summary" | jq -r '.skippedTests')
+          echo "JesseTests: total=${total} passed=${passed} failed=${failed} skipped=${skipped}"
+          echo "### ios-app: ${total} tests (passed ${passed}, failed ${failed}, skipped ${skipped})" >> "$GITHUB_STEP_SUMMARY"
+          if [ "${total}" -le 0 ]; then
+            echo "Expected the test suite to run at least one test, got ${total}" >&2
+            exit 1
+          fi
