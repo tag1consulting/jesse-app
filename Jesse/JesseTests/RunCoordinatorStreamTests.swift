@@ -249,6 +249,54 @@ final class RunCoordinatorStreamTests: XCTestCase {
         XCTAssertEqual(thread.turns.filter { !$0.isUser }.count, 1, "no duplicate Turn from the late stream")
     }
 
+    /// (Bug 3 — defense-in-depth) `consume`'s task group can yield nil with NO user
+    /// cancel: the stream ends bare (no terminal frame) AND the poll returns nil
+    /// because its own task was cancelled out from under it (not the parent). Before
+    /// the fix, `consume`'s `guard let outcome else { return }` then returned
+    /// silently — leaving `startDates`/`inFlight` set so `isRunning` stayed true (a
+    /// spinner forever, no reply, no error, no Re-check). Now that nil-without-cancel
+    /// surfaces a recoverable failure: the run stops (`isRunning == false`) and the
+    /// job_id stays retained (`canRecheck == true`) so Re-check can recover it.
+    ///
+    /// Fails first (pre-fix `consume` returns silently → `isRunning` stays true and
+    /// `canRecheck` is false); passes after the recoverable-failure guard.
+    @MainActor
+    func testGroupYieldsNilWithoutUserCancelSurfacesRecheckNotStuckRunning() async throws {
+        let context = try makeContext()
+        let fake = StreamingFakeClient()
+        let opened = expectation(description: "stream opened")
+        fake.onStreamStarted = { opened.fulfill() }
+        // The poll returns nil-equivalent: it cancels its OWN task and throws,
+        // exactly as a cancelled URL load resolves — so `pollForOutcome`'s
+        // `if Task.isCancelled { return nil }` path fires — WITHOUT the parent
+        // `consume` task being user-cancelled. (Cancelling a child task does not
+        // cancel its parent or siblings.)
+        fake.resultProvider = {
+            withUnsafeCurrentTask { $0?.cancel() }
+            throw CancellationError()
+        }
+        let coordinator = makeCoordinator(fake)
+
+        let thread = JesseThread(mode: .ask)
+        coordinator.send(thread: thread, text: "lose contact", voice: false, context: context)
+        await fulfillment(of: [opened], timeout: 2)
+
+        // End the stream bare (no terminal frame) so the stream child also yields
+        // nil → the group yields nil with the parent not cancelled.
+        fake.finishStream()
+        try await Task.sleep(for: .milliseconds(200))
+
+        XCTAssertFalse(coordinator.isRunning(thread.id),
+                       "a nil outcome with no user cancel must not leave the run marked running")
+        XCTAssertTrue(coordinator.canRecheck(thread.id),
+                      "the job_id is retained so Re-check can pick the reply back up")
+        XCTAssertEqual(thread.turns.filter { !$0.isUser }.count, 0,
+                       "nothing was delivered — no reply turn")
+        XCTAssertNotNil(coordinator.error(for: thread.id),
+                        "the lost-contact state surfaces a recoverable error")
+        XCTAssertNil(coordinator.partialText(for: thread.id), "partial buffer cleared")
+    }
+
     /// The stream errors immediately (never a usable frame). The concurrent poll
     /// still completes the turn — streaming is best-effort display only.
     @MainActor

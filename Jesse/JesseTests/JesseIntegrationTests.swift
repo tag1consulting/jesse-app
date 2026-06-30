@@ -55,6 +55,11 @@ enum StubResult {
     case cancelled
     /// The poll connection drops (recoverable transport error).
     case transportDrop
+    /// The poll opens nothing and never finishes — models a bridge that went
+    /// unreachable mid-turn (Mac asleep, half-open socket). Only a bounded
+    /// per-request deadline (or a teardown) ends it. The result-endpoint twin of
+    /// `framesThenStall`.
+    case stalledResult
 }
 
 /// What `POST /jesse` does.
@@ -187,6 +192,12 @@ final class StubURLProtocol: URLProtocol {
             sendJSON(status: 200, ["status": "cancelled"])
         case .transportDrop:
             fail(URLError(.networkConnectionLost))
+        case .stalledResult:
+            // Open nothing, never finish: the request hangs until the session's
+            // bounded per-request deadline fires (or the loser is torn down). Only
+            // a bounded, non-waiting session can escape this — the whole point of
+            // the fix.
+            while !isCancelled() { Thread.sleep(forTimeInterval: 0.02) }
         }
     }
 
@@ -582,5 +593,77 @@ final class JesseIntegrationTests: XCTestCase {
         XCTAssertFalse(coordinator.canRecheck(thread.id), "no stuck Re-check after cancellation")
         XCTAssertNil(coordinator.error(for: thread.id), "cancellation is not surfaced as an error")
         XCTAssertTrue(jesseTurns(thread).isEmpty, "no reply turn for a cancelled turn")
+    }
+
+    // MARK: Bug 2 — bounded session for the short request/response calls
+
+    /// The root-cause guard for the 24h poll hang. The short request/response calls
+    /// (`result`, `send`, `cancelJob`, `registerDevice`, `notifyOnComplete`) must go
+    /// through a session with a BOUNDED per-request deadline and NO silent
+    /// connectivity-wait, so a bridge that goes unreachable mid-turn makes the poll
+    /// GET *throw* (→ `pollForOutcome` returns `.failed` → recoverable Re-check)
+    /// instead of parking inside `result()` for up to 24h while
+    /// `waitsForConnectivity` waits silently. Fails first against the old single
+    /// `sharedSession` (`waitsForConnectivity == true`, `timeoutIntervalForRequest
+    /// == 86_400`); passes once `session` is the bounded session.
+    func testShortCallsUseBoundedNonWaitingSession() {
+        let c = JesseClient(config: cfg).session.configuration
+        XCTAssertFalse(c.waitsForConnectivity,
+                       "short calls must not wait silently for connectivity — a dead bridge has to throw, not hang")
+        XCTAssertLessThanOrEqual(c.timeoutIntervalForRequest, 60,
+                                 "short calls need a bounded per-request deadline so the poll loop can do its job")
+    }
+
+    /// The SSE stream legitimately stays open for the whole turn, so it keeps its
+    /// own long-lived session — *separate* from the bounded one above. That
+    /// separation is the point: the stream's long timeout can never make the
+    /// completion poll (on the bounded session) wait.
+    func testStreamUsesLongLivedSession() {
+        let c = JesseClient(config: cfg).streamSession.configuration
+        XCTAssertGreaterThanOrEqual(c.timeoutIntervalForResource, 3600,
+                                    "the SSE stream needs a long resource ceiling — agent runs can exceed any fixed cap")
+    }
+
+    /// The behavioral twin of `testHalfOpenStreamStillCompletesViaPoll`: there the
+    /// STREAM stalls and the poll answers. Here the POLL itself stalls — `GET
+    /// /jesse/result` opens nothing and never finishes (the bridge went unreachable
+    /// mid-turn) — and the stream can't help (it fails immediately). With the
+    /// bounded, non-waiting session the stalled poll request times out and throws,
+    /// so `pollForOutcome` returns `.failed` and the turn settles into a recoverable
+    /// Re-check state instead of hanging. Driven on a short (1.5s) bounded session
+    /// so the test is fast — the bound mirrors production's bounded session at speed.
+    /// Against the old 24h/`waitsForConnectivity` session the poll never returns and
+    /// the turn stays running past the wait (verified by temporarily swapping this
+    /// session's config to `timeoutIntervalForRequest = 86_400`,
+    /// `waitsForConnectivity = true`: the `waitUntil` then times out → XCTFail).
+    @MainActor
+    func testStalledResultPollSettlesRecoverablyNotHung() async throws {
+        let context = try makeContext()
+        let bridge = StubBridge(
+            post: .immediate202(jobId: "job-stalled-poll"),
+            stream: .failImmediately,
+            results: [.stalledResult])
+        StubURLProtocol.bridge = bridge
+
+        // A bounded, non-waiting session — production's posture, at 1.5s for speed.
+        let c = URLSessionConfiguration.ephemeral
+        c.protocolClasses = [StubURLProtocol.self]
+        c.timeoutIntervalForRequest = 1.5
+        c.waitsForConnectivity = false
+        let client = JesseClient(config: cfg, session: URLSession(configuration: c))
+        let coordinator = makeCoordinator(client)
+
+        let thread = JesseThread(mode: .ask)
+        coordinator.send(thread: thread, text: "what happened", voice: false, context: context)
+
+        await waitUntil("the stalled poll to settle into a recoverable state", timeout: 6) {
+            coordinator.canRecheck(thread.id)
+        }
+        XCTAssertTrue(coordinator.canRecheck(thread.id),
+                      "a stalled poll on a bounded session times out → recoverable Re-check, not a hang")
+        XCTAssertFalse(coordinator.isRunning(thread.id), "the run must not stay marked running")
+        XCTAssertNotNil(coordinator.inFlight[thread.id], "the job_id is retained for Re-check")
+        XCTAssertNotNil(coordinator.error(for: thread.id))
+        XCTAssertTrue(jesseTurns(thread).isEmpty, "no reply — it's pending a re-check")
     }
 }

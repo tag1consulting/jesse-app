@@ -429,7 +429,19 @@ final class RunCoordinator {
         // Apply the one terminal action. Bail if the user cancelled meanwhile so
         // no reply lands on an already-cleared run.
         if Task.isCancelled { return }
-        guard let outcome else { return }
+        // The group yielded nil without a user cancel: the stream ended bare AND
+        // the poll returned nil (e.g. its task was cancelled out from under us
+        // without the parent being cancelled). Returning silently here would leave
+        // `startDates`/`inFlight` set so `isRunning` stays true — a spinner forever.
+        // Treat it as a recoverable failure instead: the job_id is retained, so
+        // Re-check / the next `resume` can still pick the reply up. consume must
+        // never return with the run still marked running unless the user cancelled.
+        guard let outcome else {
+            failRecoverable(threadID: threadID,
+                            message: "Lost contact with the turn — tap Re-check.",
+                            voice: voice)
+            return
+        }
         switch outcome {
         case .done(let reply):
             finish(threadID: threadID, thread: thread, reply: reply, voice: voice,

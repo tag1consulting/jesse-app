@@ -363,22 +363,61 @@ extension JesseClientProtocol {
 struct JesseClient: JesseClientProtocol {
     var config: JesseConfig
 
-    /// The URLSession every bridge call goes through. Defaults to the shared
-    /// production session (`sharedSession`); injectable purely so the integration
-    /// tests can supply a session backed by a custom `URLProtocol` stub. Nothing
-    /// in production ever passes this, so the default preserves prior behavior
-    /// byte-for-byte.
+    /// The URLSession the **short** request/response calls go through — `send`,
+    /// `result`, `cancelJob`, `registerDevice`, `notifyOnComplete`. Defaults to the
+    /// bounded production session (`boundedSession`); injectable purely so the
+    /// integration tests can supply a session backed by a custom `URLProtocol` stub.
     let session: URLSession
 
-    init(config: JesseConfig, session: URLSession = JesseClient.sharedSession) {
+    /// The URLSession the long-lived **SSE stream** (`stream`) goes through. The
+    /// stream connection legitimately stays open for the whole turn, so it keeps a
+    /// high resource timeout; it is deliberately a *different* session from the
+    /// short calls, so a stalled stream can never make the completion poll wait.
+    /// Defaults to `streamingSession`. When a test injects its own `session` (a
+    /// `URLProtocol` stub) without naming `streamSession`, the stream follows that
+    /// same injected session, so a single stub still serves every endpoint.
+    let streamSession: URLSession
+
+    init(config: JesseConfig,
+         session: URLSession = JesseClient.boundedSession,
+         streamSession: URLSession? = nil) {
         self.config = config
         self.session = session
+        if let streamSession {
+            self.streamSession = streamSession
+        } else if session === JesseClient.boundedSession {
+            // Production path: short calls on the bounded session, the SSE stream
+            // on the long-lived one.
+            self.streamSession = JesseClient.streamingSession
+        } else {
+            // A test injected a stub `session` but no `streamSession`; route the
+            // stream through that same stub so one stub serves all endpoints.
+            self.streamSession = session
+        }
     }
 
-    // Agent runs can exceed any fixed cap — that's the point. Raise both timeouts
-    // to a day; the UI's Cancel button is the escape hatch, not a timer. Keep
-    // these >= the bridge's JESSE_TIMEOUT so a server timeout (if set) wins.
-    static let sharedSession: URLSession = {
+    // The short request/response calls (poll, send, cancel, register, notify) get a
+    // BOUNDED per-request deadline and do NOT wait for connectivity, so each one
+    // always either answers or throws — the completion poll loop can then do its
+    // job. (Before, every call shared one 86_400s / waitsForConnectivity session:
+    // if the bridge went unreachable mid-turn the poll GET neither returned nor
+    // threw for up to 24h, parking the turn forever.) None of these requests
+    // legitimately runs for minutes — only the SSE stream does, and it has its own
+    // session below.
+    static let boundedSession: URLSession = {
+        let c = URLSessionConfiguration.default
+        c.timeoutIntervalForRequest = 30
+        c.timeoutIntervalForResource = 60
+        c.waitsForConnectivity = false
+        return URLSession(configuration: c)
+    }()
+
+    // The SSE stream legitimately stays open for the whole turn — agent runs can
+    // exceed any fixed cap, which is the point. Give it a day-long resource ceiling
+    // and let it wait for connectivity; the UI's Cancel button is the escape hatch.
+    // This session is used ONLY by `stream()`, so its long timeouts can never delay
+    // a short call or the completion poll.
+    static let streamingSession: URLSession = {
         let c = URLSessionConfiguration.default
         c.timeoutIntervalForRequest = 86_400
         c.timeoutIntervalForResource = 86_400
@@ -545,7 +584,7 @@ struct JesseClient: JesseClientProtocol {
 
                     let bytes: URLSession.AsyncBytes, resp: URLResponse
                     do {
-                        (bytes, resp) = try await session.bytes(for: req)
+                        (bytes, resp) = try await streamSession.bytes(for: req)
                     } catch {
                         throw JesseError.from(error, host: config.normalizedHost)
                     }
