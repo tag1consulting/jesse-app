@@ -148,6 +148,11 @@ with the `JESSE_APNS_*` vars unset, none of this is active.
 - **A push can never affect a turn.** Every push failure (no token, APNs error, a
   bad key) is logged and swallowed; the turn's stored result is untouched. The
   push carries only a short alert plus the `job_id` for routing — no vault content.
+- **A dead device token is cleared, not retried forever.** When APNs returns HTTP
+  `410 Gone`, the bridge clears the stored token and persists the cleared state to
+  `device.json`, so a token left dead by an app reinstall or uninstall stops being
+  pushed to (and the phone re-registers on its next foreground). Other push
+  failures are transient and leave the token in place.
 
 ## Reporting
 

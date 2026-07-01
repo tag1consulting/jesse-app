@@ -50,6 +50,28 @@ use tokio::sync::{broadcast, mpsc, OwnedSemaphorePermit, Semaphore};
 use tokio::task::AbortHandle;
 use tokio::time::timeout;
 
+// ---- Poison-tolerant locking (M3) -----------------------------------------
+//
+// Every `std::sync::Mutex` in the bridge guards a plain collection or flag — a
+// HashMap of jobs/streams/aborts, a rate-bucket, a token-bucket, the cached
+// APNs JWT, the notify set, the device token. None of them carry an invariant
+// that a panic mid-update could leave half-applied in a way the next caller
+// can't cope with. So if a thread panics while holding one of these locks, the
+// guarded value is still structurally valid and recovering it is the right move
+// — far better than the default `.lock_ok()`, where one panicked turn
+// poisons the mutex and every subsequent lock panics too, cascading a single
+// failure into a bridge-wide outage. `lock_ok` recovers the guard from a
+// poisoned lock (`PoisonError::into_inner`) instead of unwrapping.
+trait MutexExt<T> {
+    fn lock_ok(&self) -> std::sync::MutexGuard<'_, T>;
+}
+
+impl<T> MutexExt<T> for Mutex<T> {
+    fn lock_ok(&self) -> std::sync::MutexGuard<'_, T> {
+        self.lock().unwrap_or_else(|e| e.into_inner())
+    }
+}
+
 // ---- Prompt wrappers — the ONLY difference between Ask and Tell ------------
 //
 // "Ask" means don't take ACTION he didn't request — NOT "don't write".
@@ -424,7 +446,7 @@ impl RateLimiter {
     /// should be rejected with 429.
     fn allow(&self) -> bool {
         let now = Instant::now();
-        let mut s = self.inner.lock().unwrap();
+        let mut s = self.inner.lock_ok();
         let elapsed = now.saturating_duration_since(s.last).as_secs_f64();
         s.tokens = (s.tokens + elapsed * self.refill_per_sec).min(self.capacity);
         s.last = now;
@@ -557,8 +579,11 @@ struct JobStore {
     ttl: Duration,
     // How long a completed job is kept after its first retrieval.
     retrieval_grace: Duration,
-    // Where completed results are persisted; None disables persistence.
-    jobs_dir: Option<PathBuf>,
+    // Where completed results are persisted. The store computes the serialized
+    // snapshot under the `jobs` lock, releases the lock, then hands it here —
+    // so the blocking disk write never holds `jobs` (H2). `NoopPersister` for an
+    // in-memory-only run.
+    persister: Arc<dyn Persister>,
 }
 
 // Monotonic counter guarantees per-process uniqueness; the random high half
@@ -670,13 +695,13 @@ fn value_to_job(v: &Value) -> Option<(String, Job)> {
     ))
 }
 
-/// Write (or overwrite) a job's result file atomically (temp + rename), 0600.
-/// Best-effort: a persistence failure is logged, never fatal — the in-memory
-/// store still serves the result for this process's lifetime.
-fn persist_job(dir: &Path, id: &str, job: &Job) {
-    let Some(value) = job_to_value(id, job) else {
-        return;
-    };
+/// Write a job's already-serialized result `Value` to its file atomically
+/// (temp + rename), 0600. Takes the serialized snapshot, NOT a `&Job` or the
+/// `JobStore` — so persistence never touches the `jobs` lock and a slow disk
+/// can't serialize the whole bridge (H2). The serialized value is computed by
+/// the caller under the lock, then this blocking write runs after the lock is
+/// released. Best-effort: a failure is logged, never fatal.
+fn write_job_value(dir: &Path, id: &str, value: &Value) {
     let final_path = dir.join(format!("{id}.json"));
     let tmp_path = dir.join(format!("{id}.json.tmp"));
     let write = || -> std::io::Result<()> {
@@ -698,6 +723,105 @@ fn persist_job(dir: &Path, id: &str, job: &Job) {
 
 fn remove_job_file(dir: &Path, id: &str) {
     let _ = std::fs::remove_file(dir.join(format!("{id}.json")));
+}
+
+/// The persistence sink for completed jobs.
+///
+/// The `JobStore` mutates in-memory state under its `jobs` lock and, still under
+/// that lock, ENQUEUES a `write`/`remove` here — an O(1), non-blocking hand-off.
+/// The blocking disk work (`fsync`, `unlink`) runs on a dedicated worker thread,
+/// entirely OFF the `jobs` lock (H2/H3): a slow disk can never serialize the
+/// bridge behind that lock. Enqueuing under the lock also keeps disk ops in the
+/// SAME order as the in-memory transitions, so a stale `write` can never resurrect
+/// a file a later `remove` already deleted (the eviction race). `write`/`remove`
+/// take only the id and the already-serialized `Value` — never the `Job` or the
+/// lock — so a test can drive them while holding the `jobs` lock. Best-effort:
+/// every op is fire-and-forget and must never panic.
+trait Persister: Send + Sync {
+    /// Whether persistence is on. When `false`, the store skips even serializing
+    /// the snapshot — an in-memory-only run pays nothing.
+    fn enabled(&self) -> bool;
+    /// Enqueue a completed job's serialized `Value` for the worker to persist.
+    fn write(&self, id: &str, value: Value);
+    /// Enqueue a job's file for the worker to delete.
+    fn remove(&self, id: &str);
+    /// Block until the worker has processed every op enqueued before this call.
+    /// Used by tests for deterministic assertions; a no-op when there's no worker.
+    #[cfg(test)]
+    fn flush(&self) {}
+}
+
+/// In-memory-only run: persistence disabled, every op a no-op.
+struct NoopPersister;
+impl Persister for NoopPersister {
+    fn enabled(&self) -> bool {
+        false
+    }
+    fn write(&self, _id: &str, _value: Value) {}
+    fn remove(&self, _id: &str) {}
+}
+
+/// One unit of work for the persistence worker thread.
+enum PersistOp {
+    Write(String, Value),
+    Remove(String),
+    /// Round-trip barrier: the worker replies once it reaches this op, so a
+    /// caller can wait for everything before it to have been written/removed.
+    #[cfg(test)]
+    Flush(std::sync::mpsc::SyncSender<()>),
+}
+
+/// The production sink: a single worker thread that owns `dir` and serially
+/// applies `write`/`remove` ops off an unbounded channel. `write`/`remove`/`flush`
+/// only enqueue (instant); the worker does the blocking I/O. The worker exits
+/// when the store (and thus the `Sender`) is dropped.
+struct DiskPersister {
+    tx: std::sync::mpsc::Sender<PersistOp>,
+}
+
+impl DiskPersister {
+    fn new(dir: PathBuf) -> Self {
+        let (tx, rx) = std::sync::mpsc::channel::<PersistOp>();
+        // A plain OS thread (not a Tokio task) so the blocking `fsync`/`unlink`
+        // never occupies an async worker, and so the store works in non-async
+        // tests too. Named for observability; a spawn failure is fatal only here.
+        std::thread::Builder::new()
+            .name("jesse-persist".to_string())
+            .spawn(move || {
+                while let Ok(op) = rx.recv() {
+                    match op {
+                        PersistOp::Write(id, value) => write_job_value(&dir, &id, &value),
+                        PersistOp::Remove(id) => remove_job_file(&dir, &id),
+                        #[cfg(test)]
+                        PersistOp::Flush(reply) => {
+                            let _ = reply.send(());
+                        }
+                    }
+                }
+            })
+            .expect("spawn persistence worker thread");
+        DiskPersister { tx }
+    }
+}
+
+impl Persister for DiskPersister {
+    fn enabled(&self) -> bool {
+        true
+    }
+    fn write(&self, id: &str, value: Value) {
+        let _ = self.tx.send(PersistOp::Write(id.to_string(), value));
+    }
+    fn remove(&self, id: &str) {
+        let _ = self.tx.send(PersistOp::Remove(id.to_string()));
+    }
+    #[cfg(test)]
+    fn flush(&self) {
+        let (reply_tx, reply_rx) = std::sync::mpsc::sync_channel(0);
+        if self.tx.send(PersistOp::Flush(reply_tx)).is_ok() {
+            // FIFO: when this returns, every op enqueued before it is done.
+            let _ = reply_rx.recv();
+        }
+    }
 }
 
 /// Load persisted jobs from `dir`, dropping (and deleting) any that are already
@@ -739,32 +863,47 @@ fn load_persisted_jobs(dir: &Path, ttl: Duration, retrieval_grace: Duration) -> 
 
 impl JobStore {
     /// Build the store, creating the persistence dir (0700) and loading any jobs
-    /// left from a previous run when `jobs_dir` is set.
+    /// left from a previous run when `jobs_dir` is set. A dir that can't be
+    /// created disables persistence for the run (the disk sink is dropped).
     fn new(ttl: Duration, retrieval_grace: Duration, jobs_dir: Option<PathBuf>) -> Self {
         let mut jobs = HashMap::new();
-        if let Some(dir) = &jobs_dir {
+        let mut persister: Arc<dyn Persister> = Arc::new(NoopPersister);
+        if let Some(dir) = jobs_dir {
             if let Err(e) = std::fs::DirBuilder::new()
                 .recursive(true)
                 .mode(0o700)
-                .create(dir)
+                .create(&dir)
             {
                 eprintln!(
                     "warning: could not create job state dir {}: {e} — persistence disabled this run",
                     dir.display()
                 );
             } else {
-                for (id, job) in load_persisted_jobs(dir, ttl, retrieval_grace) {
+                for (id, job) in load_persisted_jobs(&dir, ttl, retrieval_grace) {
                     jobs.insert(id, job);
                 }
+                persister = Arc::new(DiskPersister::new(dir));
             }
         }
+        Self::with_persister(ttl, retrieval_grace, persister, jobs)
+    }
+
+    /// Build a store over an explicit persister and pre-seeded job map. Lets a
+    /// test inject a probe sink (e.g. to prove `complete` persists off the lock)
+    /// while sharing the rest of the wiring with `new`.
+    fn with_persister(
+        ttl: Duration,
+        retrieval_grace: Duration,
+        persister: Arc<dyn Persister>,
+        jobs: HashMap<String, Job>,
+    ) -> Self {
         JobStore {
             jobs: Mutex::new(jobs),
             aborts: Mutex::new(HashMap::new()),
             streams: Mutex::new(HashMap::new()),
             ttl,
             retrieval_grace,
-            jobs_dir,
+            persister,
         }
     }
 
@@ -772,7 +911,7 @@ impl JobStore {
     /// persisted (no result yet).
     fn create(&self) -> String {
         let id = new_job_id();
-        self.jobs.lock().unwrap().insert(
+        self.jobs.lock_ok().insert(
             id.clone(),
             Job {
                 state: JobState::Running,
@@ -790,10 +929,16 @@ impl JobStore {
     /// still `Running`. This keeps a turn that finishes in the same instant the
     /// client cancels from clobbering the `Cancelled` state that `cancel` already
     /// wrote (and vice-versa — whichever wins the lock first sticks).
+    ///
+    /// The in-memory transition happens under the `jobs` lock; the serialized
+    /// snapshot is taken and ENQUEUED for the persistence worker under that lock
+    /// too (an O(1) hand-off). The blocking disk write runs on the worker, off the
+    /// lock (H2), so a slow disk can't stall every other request — while enqueuing
+    /// under the lock keeps disk ops ordered against eviction's `remove`.
     fn complete(&self, id: &str, outcome: Result<(String, Option<String>), ApiError>) {
         // The turn is over — drop its abort handle so the map can't leak. Done in
         // its own statement so the `aborts` lock is released before taking `jobs`.
-        self.aborts.lock().unwrap().remove(id);
+        self.aborts.lock_ok().remove(id);
         let state = match outcome {
             Ok((response, session_id)) => JobState::Done {
                 response,
@@ -801,23 +946,40 @@ impl JobStore {
             },
             Err((_code, error)) => JobState::Failed { error },
         };
-        let mut guard = self.jobs.lock().unwrap();
-        if let Some(job) = guard.get_mut(id) {
-            if !matches!(job.state, JobState::Running) {
-                return; // already terminal (e.g. cancelled) — don't clobber it
-            }
-            job.state = state;
-            job.completed_at = Some(SystemTime::now());
-            if let Some(dir) = &self.jobs_dir {
-                persist_job(dir, id, job);
+        let mut guard = self.jobs.lock_ok();
+        let Some(job) = guard.get_mut(id) else {
+            return;
+        };
+        if !matches!(job.state, JobState::Running) {
+            return; // already terminal (e.g. cancelled) — don't clobber it
+        }
+        job.state = state;
+        job.completed_at = Some(SystemTime::now());
+        self.persist_under_lock(id, job);
+    }
+
+    /// Enqueue a job's serialized snapshot for the persistence worker. Called
+    /// while the `jobs` lock is held (so disk ops stay ordered), but only ENQUEUES
+    /// — the blocking write happens on the worker thread, never under the lock.
+    fn persist_under_lock(&self, id: &str, job: &Job) {
+        if self.persister.enabled() {
+            if let Some(value) = job_to_value(id, job) {
+                self.persister.write(id, value);
             }
         }
+    }
+
+    /// Block until the persistence worker has flushed every op enqueued so far.
+    /// For deterministic tests around the disk; a no-op when persistence is off.
+    #[cfg(test)]
+    fn flush_persistence(&self) {
+        self.persister.flush();
     }
 
     /// Record the abort handle for a running job's turn task so `cancel` can reach
     /// it. Called once, right after the turn is spawned.
     fn set_abort(&self, id: &str, handle: AbortHandle) {
-        self.aborts.lock().unwrap().insert(id.to_string(), handle);
+        self.aborts.lock_ok().insert(id.to_string(), handle);
     }
 
     // ---- Live stream (SSE) -------------------------------------------------
@@ -830,7 +992,7 @@ impl JobStore {
     /// spawned, so a subscriber arriving immediately finds the entry.
     fn stream_register(&self, id: &str) {
         let (tx, _rx) = broadcast::channel(STREAM_CHANNEL_CAP);
-        self.streams.lock().unwrap().insert(
+        self.streams.lock_ok().insert(
             id.to_string(),
             StreamHandle {
                 tx,
@@ -846,7 +1008,7 @@ impl JobStore {
     /// capped at `MAX_OUTPUT_BYTES` so one pathological turn can't bloat memory;
     /// the authoritative final text comes from the terminal result regardless.
     fn stream_push_delta(&self, id: &str, delta: &str) {
-        let mut guard = self.streams.lock().unwrap();
+        let mut guard = self.streams.lock_ok();
         if let Some(h) = guard.get_mut(id) {
             if h.text.len() < MAX_OUTPUT_BYTES {
                 h.text.push_str(delta);
@@ -857,7 +1019,7 @@ impl JobStore {
 
     /// Record the latest tool-activity hint and broadcast it. No-op if gone.
     fn stream_push_activity(&self, id: &str, name: &str) {
-        let mut guard = self.streams.lock().unwrap();
+        let mut guard = self.streams.lock_ok();
         if let Some(h) = guard.get_mut(id) {
             h.activity = Some(name.to_string());
             let _ = h.tx.send(StreamFrame::Activity(name.to_string()));
@@ -868,7 +1030,7 @@ impl JobStore {
     /// rerun doesn't double the buffer. (Retryable failures occur at the API
     /// before any tokens, so in practice the buffer is already empty here.)
     fn stream_reset(&self, id: &str) {
-        if let Some(h) = self.streams.lock().unwrap().get_mut(id) {
+        if let Some(h) = self.streams.lock_ok().get_mut(id) {
             h.text.clear();
             h.activity = None;
         }
@@ -883,7 +1045,7 @@ impl JobStore {
         &self,
         id: &str,
     ) -> Option<(String, Option<String>, broadcast::Receiver<StreamFrame>)> {
-        let guard = self.streams.lock().unwrap();
+        let guard = self.streams.lock_ok();
         let h = guard.get(id)?;
         Some((h.text.clone(), h.activity.clone(), h.tx.subscribe()))
     }
@@ -891,7 +1053,7 @@ impl JobStore {
     /// The full accumulated text for a job, if its stream is still live. Used to
     /// re-sync a subscriber that lagged the broadcast backlog.
     fn stream_snapshot(&self, id: &str) -> Option<String> {
-        Some(self.streams.lock().unwrap().get(id)?.text.clone())
+        Some(self.streams.lock_ok().get(id)?.text.clone())
     }
 
     /// Close a job's stream with a terminal frame and remove the entry. The frame
@@ -901,8 +1063,33 @@ impl JobStore {
     /// (`Done`/`Error`) and `cancel` (`Cancelled`) calls it first wins and the
     /// other no-ops — mirroring the write-once `jobs` transition.
     fn stream_finish(&self, id: &str, frame: StreamFrame) {
-        if let Some(h) = self.streams.lock().unwrap().remove(id) {
+        if let Some(h) = self.streams.lock_ok().remove(id) {
             let _ = h.tx.send(frame);
+        }
+    }
+
+    /// Close a job's live stream with the terminal frame matching its CURRENT
+    /// (post-`complete`/`cancel`) state, so the emitted frame and the stored
+    /// result always agree. `stream_finish` is write-once, so calling this after
+    /// a cancel already emitted `Cancelled` is a no-op. Used by the turn task's
+    /// normal completion path and by `TurnGuard` (so a panicked turn still drives
+    /// a terminal frame, never a permanent Running).
+    fn emit_terminal_frame(&self, id: &str) {
+        match self.get(id) {
+            Some(JobState::Done {
+                response,
+                session_id,
+            }) => self.stream_finish(
+                id,
+                StreamFrame::Done {
+                    response,
+                    session_id,
+                },
+            ),
+            Some(JobState::Failed { error }) => self.stream_finish(id, StreamFrame::Error(error)),
+            Some(JobState::Cancelled) => self.stream_finish(id, StreamFrame::Cancelled),
+            // Still Running or gone — nothing terminal to emit.
+            _ => {}
         }
     }
 
@@ -912,26 +1099,30 @@ impl JobStore {
     /// failed, or cancelled), is left untouched — the transition only fires from
     /// `Running`. Returns the outcome purely for logging.
     fn cancel(&self, id: &str) -> CancelOutcome {
-        // Take and fire the abort handle first; removing it also prevents a leak.
-        // Released before taking `jobs` to keep the two locks non-overlapping.
-        if let Some(handle) = self.aborts.lock().unwrap().remove(id) {
-            handle.abort();
-        }
+        // Write the `Cancelled` transition FIRST, then abort the task. Order
+        // matters: the aborted turn task's `TurnGuard` runs on drop and would mark
+        // the job `Failed` if it still saw `Running` — so the terminal state must
+        // be in place before the abort that triggers that drop. `complete` is
+        // write-once, so the guard then no-ops and `Cancelled` always wins (M2).
         let outcome = {
-            let mut guard = self.jobs.lock().unwrap();
+            let mut guard = self.jobs.lock_ok();
             match guard.get_mut(id) {
                 None => CancelOutcome::Unknown,
                 Some(job) if matches!(job.state, JobState::Running) => {
                     job.state = JobState::Cancelled;
                     job.completed_at = Some(SystemTime::now());
-                    if let Some(dir) = &self.jobs_dir {
-                        persist_job(dir, id, job);
-                    }
+                    self.persist_under_lock(id, job); // enqueue under lock
                     CancelOutcome::Cancelled
                 }
                 Some(_) => CancelOutcome::AlreadyTerminal,
             }
-        }; // jobs lock released here, before touching `streams`
+        }; // jobs lock released here, before aborting / touching `streams`
+        // Now fire the abort handle (drop → `kill_on_drop` kills `claude` and frees
+        // the permit); removing it also prevents a leak. Taken on its own lock,
+        // never overlapping `jobs`.
+        if let Some(handle) = self.aborts.lock_ok().remove(id) {
+            handle.abort();
+        }
         // We won the transition to Cancelled — close any live stream with a clean
         // `cancelled` frame. (For AlreadyTerminal/Unknown the turn task's own
         // terminal frame already fired, or there was never a stream.)
@@ -942,7 +1133,7 @@ impl JobStore {
     }
 
     fn get(&self, id: &str) -> Option<JobState> {
-        self.jobs.lock().unwrap().get(id).map(|j| j.state.clone())
+        self.jobs.lock_ok().get(id).map(|j| j.state.clone())
     }
 
     /// Fetch a job's state and, if this is the first retrieval of a terminal
@@ -950,27 +1141,36 @@ impl JobStore {
     /// and persist that so the grace survives a restart. Running fetches don't
     /// start the clock. This is what `GET /jesse/result` uses.
     fn get_retrieving(&self, id: &str) -> Option<JobState> {
-        let mut guard = self.jobs.lock().unwrap();
+        let mut guard = self.jobs.lock_ok();
         let job = guard.get_mut(id)?;
         let state = job.state.clone();
         let is_terminal = !matches!(job.state, JobState::Running);
         if is_terminal && job.first_retrieved_at.is_none() {
             job.first_retrieved_at = Some(SystemTime::now());
-            if let Some(dir) = &self.jobs_dir {
-                persist_job(dir, id, job);
-            }
+            // Enqueue the updated snapshot under the lock (H2: the worker does the
+            // blocking write). Enqueuing here, under the same lock eviction takes,
+            // keeps this write ordered BEFORE any later `remove` for this id — so a
+            // first-retrieval write can never resurrect a file eviction deletes.
+            self.persist_under_lock(id, job);
         }
         Some(state)
     }
 
     /// Drop (and delete the files of) completed jobs past their eviction point.
     /// Running jobs are kept. See `job_is_evictable` for the predicate.
+    ///
+    /// The `retain` runs under the `jobs` lock but does NO blocking file I/O: it
+    /// only ENQUEUES a `remove` per evicted id (H3) — the worker thread does the
+    /// unlink off the lock, so a slow disk can't hold `jobs` and stall every
+    /// concurrent request. Enqueuing under the lock keeps the unlink ordered after
+    /// any prior write for the same id. Runs on a periodic background task (see
+    /// `spawn_eviction_task`), no longer on the request hot path.
     fn evict_expired(&self) {
         let now = SystemTime::now();
         let ttl = self.ttl;
         let retrieval_grace = self.retrieval_grace;
-        let dir = self.jobs_dir.clone();
-        self.jobs.lock().unwrap().retain(|id, j| {
+        let mut guard = self.jobs.lock_ok();
+        guard.retain(|id, j| {
             let Some(completed) = j.completed_at else {
                 return true; // running — never evict
             };
@@ -980,13 +1180,88 @@ impl JobStore {
                 .map(|t| now.duration_since(t).unwrap_or_default());
             let evict = job_is_evictable(age_complete, age_retrieved, ttl, retrieval_grace);
             if evict {
-                if let Some(d) = &dir {
-                    remove_job_file(d, id);
-                }
+                self.persister.remove(id); // enqueue unlink under lock (worker unlinks)
             }
             !evict
         });
     }
+}
+
+/// Drives a turn's job to a terminal state if the turn body doesn't reach its
+/// own clean completion — i.e. it PANICS (or the task is otherwise dropped while
+/// the job is still Running). Without this, a panic in the spawned turn body
+/// (M2) would leave the job stuck `Running` forever: `complete` is never called,
+/// the stream never gets a terminal frame, and eviction skips running jobs — so
+/// the phone's spinner never resolves.
+///
+/// Held across the turn body and `disarm()`ed once the body has driven the job
+/// terminal itself. On `Drop` while still armed it marks the job `Failed`
+/// (write-once: a no-op if a cancel already won the transition) and emits the
+/// matching terminal stream frame. Cancel writes `Cancelled` BEFORE aborting the
+/// task (see `JobStore::cancel`), so the guard always observes a terminal state
+/// for a cancelled turn and leaves it untouched.
+struct TurnGuard {
+    jobs: Arc<JobStore>,
+    id: String,
+    armed: bool,
+}
+
+impl TurnGuard {
+    fn new(jobs: Arc<JobStore>, id: String) -> Self {
+        TurnGuard {
+            jobs,
+            id,
+            armed: true,
+        }
+    }
+
+    /// Disarm after the turn body has itself driven the job terminal — the normal
+    /// path already emitted the right frame, so `Drop` must do nothing.
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for TurnGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        // The body didn't complete cleanly (panic / unexpected drop). Force a
+        // terminal state so the job can't be stranded Running and the stream
+        // always gets a terminal frame. Both calls are write-once / no-op when a
+        // terminal state already landed (e.g. a racing cancel).
+        self.jobs.complete(
+            &self.id,
+            Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Jesse hit an internal error and couldn't finish that.".to_string(),
+            )),
+        );
+        self.jobs.emit_terminal_frame(&self.id);
+    }
+}
+
+/// How often the background sweep evicts expired jobs. Eviction was moved off
+/// the request hot path (H3); this periodic task is the sole driver in the
+/// running server. A minute is fine — TTLs are in the hundreds-to-tens-of-
+/// thousands of seconds, so a job lingers at most ~60s past its window.
+const EVICTION_INTERVAL: Duration = Duration::from_secs(60);
+
+/// Spawn the periodic eviction sweep. Runs on its own Tokio task for the life of
+/// the process so a slow disk during a sweep can't touch a request. Replaces the
+/// old opportunistic `evict_expired()` calls at the top of the request handlers.
+fn spawn_eviction_task(jobs: Arc<JobStore>) {
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(EVICTION_INTERVAL);
+        // Skip the immediate first tick's burst on a missed deadline; correctness
+        // doesn't depend on cadence, only that the sweep keeps running.
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            tick.tick().await;
+            jobs.evict_expired();
+        }
+    });
 }
 
 /// Shared, cheaply-clonable handler state: read-only config, the job store, the
@@ -1177,9 +1452,29 @@ enum ClaudeOutcome {
     Fatal { message: String },
 }
 
-/// Truncate to `n` chars without splitting a multibyte boundary.
+/// Truncate to `n` chars without splitting a multibyte boundary. Used ONLY for
+/// the short human-facing stderr/stdout error snippets, where "first N
+/// characters" is the intent; the result body is capped in BYTES — see
+/// `truncate_bytes_on_char_boundary`.
 fn truncate_chars(s: &str, n: usize) -> String {
     s.chars().take(n).collect()
+}
+
+/// Truncate `s` to at most `max_bytes` BYTES, ending on a valid UTF-8 char
+/// boundary (the largest boundary ≤ `max_bytes`). This is the correct cap for
+/// `MAX_OUTPUT_BYTES`: `truncate_chars` counts CHARACTERS, so for multibyte
+/// text (CJK, emoji) it could keep up to ~4× the intended byte budget — the M1
+/// bug. The stream accumulator already caps in bytes (`stream_push_delta`), so
+/// this makes the final stored result agree with it.
+fn truncate_bytes_on_char_boundary(s: &str, max_bytes: usize) -> &str {
+    if s.len() <= max_bytes {
+        return s;
+    }
+    let mut end = max_bytes;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
 }
 
 /// Classify a parsed terminal `result` object into the bridge's Ok/Retryable/
@@ -1473,8 +1768,16 @@ async fn run_claude_streaming(
                 format!("failed to spawn {}: {e}", cfg.claude_bin),
             )
         })?;
-        let stdout = child.stdout.take().expect("child stdout is piped");
-        let stderr = child.stderr.take().expect("child stderr is piped");
+        // Map a missing pipe to an error rather than `.expect()` (M2): a panic
+        // here on the spawned turn task would otherwise leave the job stuck
+        // Running forever (complete never called). Both are configured
+        // `Stdio::piped()` above, so this is belt-and-suspenders.
+        let (Some(stdout), Some(stderr)) = (child.stdout.take(), child.stderr.take()) else {
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "claude child stdout/stderr pipe was not captured".to_string(),
+            ));
+        };
 
         // Drain stderr concurrently (capped), so a chatty stderr can't deadlock
         // the stdout pipe and so the no-`result` fallback below has the cause.
@@ -1593,8 +1896,13 @@ async fn run_claude_streaming(
 
         match outcome {
             ClaudeOutcome::Ok { result, session_id } => {
-                // Match the old 4 MiB storage bound on the persisted reply.
-                return Ok((truncate_chars(&result, MAX_OUTPUT_BYTES), session_id));
+                // Cap the stored reply at MAX_OUTPUT_BYTES *bytes* on a char
+                // boundary (M1) — not chars, which for multibyte text could keep
+                // up to ~4× the budget. This matches the byte-based stream cap.
+                return Ok((
+                    truncate_bytes_on_char_boundary(&result, MAX_OUTPUT_BYTES).to_string(),
+                    session_id,
+                ));
             }
             ClaudeOutcome::Fatal { message } => return Err((StatusCode::BAD_GATEWAY, message)),
             ClaudeOutcome::Retryable { message, status } => {
@@ -1937,14 +2245,26 @@ impl DeviceStore {
     /// Idempotent upsert of the current device token (overwrites any prior one),
     /// persisting it when a state dir is configured.
     fn set(&self, token: String) {
-        *self.token.lock().unwrap() = Some(token.clone());
+        *self.token.lock_ok() = Some(token.clone());
         if let Some(path) = &self.path {
             persist_device_token(path, &token);
         }
     }
 
+    /// Clear the stored device token and persist the cleared state (M4). Called
+    /// when APNs reports the token is dead (HTTP 410): the phone must re-register
+    /// before any further push, and a dead token must stop being retried on every
+    /// completion. Persisting the cleared state means the token stays gone across
+    /// a restart, too.
+    fn clear(&self) {
+        *self.token.lock_ok() = None;
+        if let Some(path) = &self.path {
+            persist_device_token(path, "");
+        }
+    }
+
     fn get(&self) -> Option<String> {
-        self.token.lock().unwrap().clone()
+        self.token.lock_ok().clone()
     }
 }
 
@@ -1994,12 +2314,12 @@ impl NotifyFlags {
         }
     }
     fn insert(&self, id: &str) {
-        self.inner.lock().unwrap().insert(id.to_string());
+        self.inner.lock_ok().insert(id.to_string());
     }
     /// Remove the flag and report whether it was present. Atomic, so a concurrent
     /// completion and notify-endpoint can't both take it.
     fn take(&self, id: &str) -> bool {
-        self.inner.lock().unwrap().remove(id)
+        self.inner.lock_ok().remove(id)
     }
 }
 
@@ -2075,9 +2395,11 @@ struct ApnsRequest {
     payload: Vec<u8>,
 }
 
-/// The mockable seam for the actual network call. `Ok(status)` for a completed
-/// HTTP exchange (the reqwest impl already maps non-2xx to `Err`), `Err` for a
-/// transport failure. The caller swallows either way.
+/// The mockable seam for the actual network call. `Ok(status)` for ANY completed
+/// HTTP exchange (the status code, 2xx or not — so the caller can distinguish a
+/// 410 "dead token" from other failures, M4), `Err` only for a transport-level
+/// failure (no HTTP response at all). The caller (`ApnsClient::push`) interprets
+/// the status; a non-2xx is never silently dropped.
 trait ApnsTransport: Send + Sync {
     fn post(&self, req: ApnsRequest) -> Pin<Box<dyn Future<Output = Result<u16, String>> + Send>>;
 }
@@ -2102,19 +2424,24 @@ impl ApnsTransport for ReqwestApns {
                 .send()
                 .await
                 .map_err(|e| format!("apns request error: {e}"))?;
-            let status = resp.status().as_u16();
-            if (200..300).contains(&status) {
-                Ok(status)
-            } else {
-                let body = resp
-                    .bytes()
-                    .await
-                    .map(|b| String::from_utf8_lossy(&b).into_owned())
-                    .unwrap_or_default();
-                Err(format!("apns status {status}: {body}"))
-            }
+            // Return the status for ANY completed response — including non-2xx —
+            // so `push` can act on a 410 (dead token) vs a transient error.
+            Ok(resp.status().as_u16())
         })
     }
+}
+
+/// Outcome of an APNs push attempt, as interpreted from the transport's status.
+/// Lets the caller clear a dead token on `DeadToken` (410) while swallowing every
+/// other failure (M4).
+enum PushOutcome {
+    /// 2xx — the alert was accepted by APNs.
+    Sent,
+    /// 410 — APNs reports the device token is no longer valid. Clear it.
+    DeadToken,
+    /// Any other non-2xx status or a transport error. Logged and swallowed; the
+    /// token is left in place (the failure may be transient).
+    Failed(String),
 }
 
 /// How long a minted APNs JWT is reused before re-signing. Apple accepts a token
@@ -2137,7 +2464,7 @@ impl ApnsClient {
     /// empty or older than `APNS_JWT_TTL`.
     fn jwt(&self) -> Result<String, String> {
         {
-            let g = self.jwt_cache.lock().unwrap();
+            let g = self.jwt_cache.lock_ok();
             if let Some((tok, at)) = g.as_ref() {
                 if at.elapsed() < APNS_JWT_TTL {
                     return Ok(tok.clone());
@@ -2149,13 +2476,19 @@ impl ApnsClient {
             .map_err(|e| e.to_string())?
             .as_secs();
         let tok = mint_apns_jwt(&self.pkcs8_der, &self.cfg.key_id, &self.cfg.team_id, iat)?;
-        *self.jwt_cache.lock().unwrap() = Some((tok.clone(), Instant::now()));
+        *self.jwt_cache.lock_ok() = Some((tok.clone(), Instant::now()));
         Ok(tok)
     }
 
-    /// Send a completion alert for `job_id` to `device_token`.
-    async fn push(&self, device_token: &str, job_id: &str) -> Result<(), String> {
-        let jwt = self.jwt()?;
+    /// Send a completion alert for `job_id` to `device_token`. Maps the APNs
+    /// status to a `PushOutcome`: 2xx → `Sent`, 410 → `DeadToken` (caller clears
+    /// the token), anything else (other non-2xx, JWT-mint failure, transport
+    /// error) → `Failed` (swallowed). Never errors out of band.
+    async fn push(&self, device_token: &str, job_id: &str) -> PushOutcome {
+        let jwt = match self.jwt() {
+            Ok(j) => j,
+            Err(e) => return PushOutcome::Failed(format!("apns jwt: {e}")),
+        };
         let req = ApnsRequest {
             host: self.cfg.host.clone(),
             path: format!("/3/device/{device_token}"),
@@ -2163,7 +2496,13 @@ impl ApnsClient {
             topic: self.cfg.topic.clone(),
             payload: build_apns_payload(job_id),
         };
-        self.transport.post(req).await.map(|_| ())
+        match self.transport.post(req).await {
+            Ok(status) if (200..300).contains(&status) => PushOutcome::Sent,
+            // 410 Gone — APNs's signal that the device token is permanently dead.
+            Ok(410) => PushOutcome::DeadToken,
+            Ok(status) => PushOutcome::Failed(format!("apns status {status}")),
+            Err(e) => PushOutcome::Failed(e),
+        }
     }
 }
 
@@ -2282,8 +2621,16 @@ async fn notify_if_complete(
         return;
     };
     match apns.push(&token, job_id).await {
-        Ok(()) => eprintln!("push: completion alert sent for job {job_id}"),
-        Err(e) => eprintln!("push: APNs send failed for job {job_id}: {e} — swallowed"),
+        PushOutcome::Sent => eprintln!("push: completion alert sent for job {job_id}"),
+        PushOutcome::DeadToken => {
+            // APNs reports the token is dead (410). Clear it so it isn't retried
+            // on every future completion; the phone must re-register (M4).
+            devices.clear();
+            eprintln!("push: device token rejected (410 dead) for job {job_id} — cleared");
+        }
+        PushOutcome::Failed(e) => {
+            eprintln!("push: APNs send failed for job {job_id}: {e} — swallowed")
+        }
     }
 }
 
@@ -2429,8 +2776,9 @@ async fn jesse(
         )
     };
 
-    // Opportunistic sweep so the map can't grow unbounded between requests.
-    st.jobs.evict_expired();
+    // Eviction runs on a periodic background task (`spawn_eviction_task`), NOT
+    // here on the request hot path — a sweep that unlinks files must never block
+    // a turn from starting (H3).
     let job_id = st.jobs.create();
     // Open the live stream before spawning so a phone that opens
     // `GET /jesse/stream/{job_id}` immediately finds the broadcast channel.
@@ -2455,6 +2803,11 @@ async fn jesse(
         // files therefore survive run_claude's internal retries and are cleaned
         // exactly once, here.
         let _scratch = scratch;
+        // If the body below panics, this guard's Drop still drives the job to a
+        // terminal Failed + terminal stream frame (M2) — a panicking turn can
+        // never strand the job in Running forever.
+        let mut guard = TurnGuard::new(jobs.clone(), jid.clone());
+
         let outcome = run_claude_streaming(&cfg, &prompt, sid.as_deref(), &jobs, &jid).await;
         jobs.complete(&jid, outcome);
         // Close the live stream with the frame matching the state that actually
@@ -2462,17 +2815,10 @@ async fn jesse(
         // set `Cancelled` (and `cancel` already emitted that frame + removed the
         // stream entry, making this a no-op). Reading the post-`complete` state
         // keeps the terminal frame and the stored result perfectly consistent.
-        match jobs.get(&jid) {
-            Some(JobState::Done {
-                response,
-                session_id,
-            }) => jobs.stream_finish(&jid, StreamFrame::Done { response, session_id }),
-            Some(JobState::Failed { error }) => {
-                jobs.stream_finish(&jid, StreamFrame::Error(error))
-            }
-            Some(JobState::Cancelled) => jobs.stream_finish(&jid, StreamFrame::Cancelled),
-            _ => {}
-        }
+        jobs.emit_terminal_frame(&jid);
+        // The job reached a terminal state cleanly — disarm the guard so its Drop
+        // is a no-op (the right frame is already out).
+        guard.disarm();
 
         // Fire the completion push if this turn was flagged for it (the phone
         // backgrounded mid-turn). A no-op unless push is configured, the job is
@@ -2522,7 +2868,6 @@ async fn jesse_result(
     headers: HeaderMap,
 ) -> Result<Json<Value>, ApiError> {
     check_auth(&headers, &st.cfg.token)?;
-    st.jobs.evict_expired();
     // get_retrieving (not get) so a terminal result's first fetch starts the
     // short post-fetch grace; until then it's held the full TTL.
     match st.jobs.get_retrieving(&job_id) {
@@ -2691,7 +3036,6 @@ async fn jesse_stream(
     headers: HeaderMap,
 ) -> Result<Response, ApiError> {
     check_auth(&headers, &st.cfg.token)?;
-    st.jobs.evict_expired();
 
     let (tx, rx) = mpsc::channel::<Result<Event, std::convert::Infallible>>(SSE_FORWARD_BUFFER);
 
@@ -2907,6 +3251,9 @@ async fn main() {
     let listener = tokio::net::TcpListener::bind(&addr)
         .await
         .expect("bind failed");
+    // Evict expired jobs on a periodic background task rather than on the request
+    // hot path (H3), so a sweep's file unlinks never delay a turn.
+    spawn_eviction_task(state.jobs.clone());
     axum::serve(listener, app(state)).await.expect("server error");
 }
 
@@ -3211,7 +3558,7 @@ mod tests {
 
     #[test]
     fn binary_exists_searches_path() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = ENV_LOCK.lock_ok();
         let saved = std::env::var("PATH").ok();
         std::env::set_var("PATH", "/bin");
         assert!(binary_exists("sh"));
@@ -3241,7 +3588,7 @@ mod tests {
 
     #[test]
     fn config_from_env_defaults() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = ENV_LOCK.lock_ok();
         let saved: Vec<(&str, Option<String>)> = [
             "JESSE_TOKEN",
             "JESSE_VAULT",
@@ -3601,6 +3948,7 @@ mod tests {
             let store = JobStore::new(ttl, grace, Some(dir.clone()));
             let id = store.create();
             store.complete(&id, Ok(("persisted reply".to_string(), Some("sess-9".to_string()))));
+            store.flush_persistence(); // wait for the off-lock worker to write
 
             // A new store over the SAME dir is the restart: it must reload the job.
             let restarted = JobStore::new(ttl, grace, Some(dir.clone()));
@@ -3627,6 +3975,7 @@ mod tests {
             let store = JobStore::new(ttl, grace, Some(dir.clone()));
             let id = store.create();
             store.complete(&id, Err((StatusCode::GATEWAY_TIMEOUT, "run limit".to_string())));
+            store.flush_persistence(); // wait for the off-lock worker to write
             id
         };
         let restarted = JobStore::new(ttl, grace, Some(dir.clone()));
@@ -3649,6 +3998,7 @@ mod tests {
             let store = JobStore::new(ttl, grace, Some(dir.clone()));
             let id = store.create();
             store.complete(&id, Ok(("stale".to_string(), None)));
+            store.flush_persistence(); // wait for the off-lock worker to write
             id
         };
         std::thread::sleep(Duration::from_millis(10));
@@ -3677,6 +4027,7 @@ mod tests {
         let id = st1.jobs.create();
         st1.jobs
             .complete(&id, Ok(("survives reboot".to_string(), Some("sess-r".to_string()))));
+        st1.jobs.flush_persistence(); // wait for the off-lock worker to write
 
         // New AppState over the same dir = the bridge restarting.
         let cfg2 = Config {
@@ -4654,7 +5005,7 @@ mod tests {
 
     #[test]
     fn config_zero_timeout_clamps_to_ceiling() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = ENV_LOCK.lock_ok();
         let saved = std::env::var("JESSE_TIMEOUT").ok();
         std::env::set_var("JESSE_TIMEOUT", "0");
         let cfg = Config::from_env();
@@ -5100,10 +5451,13 @@ mod tests {
     // only by `build_apns`/`ReqwestApns`, which these don't invoke.
 
     /// A recording transport: captures every request and returns a fixed result.
+    /// `fail` simulates a transport error (`Err`); `status` overrides the returned
+    /// HTTP status (0 → 200), so a test can drive a 410 dead-token response.
     #[derive(Clone, Default)]
     struct MockApns {
         calls: Arc<Mutex<Vec<ApnsRequest>>>,
         fail: bool,
+        status: u16,
     }
 
     impl ApnsTransport for MockApns {
@@ -5113,12 +5467,13 @@ mod tests {
         ) -> Pin<Box<dyn Future<Output = Result<u16, String>> + Send>> {
             let calls = self.calls.clone();
             let fail = self.fail;
+            let status = if self.status == 0 { 200 } else { self.status };
             Box::pin(async move {
-                calls.lock().unwrap().push(req);
+                calls.lock_ok().push(req);
                 if fail {
                     Err("mock apns failure".to_string())
                 } else {
-                    Ok(200)
+                    Ok(status)
                 }
             })
         }
@@ -5233,7 +5588,7 @@ mod tests {
 
         notify_if_complete(st.apns.as_deref(), &st.devices, &st.notify, &st.jobs, &id).await;
 
-        let calls = mock.calls.lock().unwrap();
+        let calls = mock.calls.lock_ok();
         assert_eq!(calls.len(), 1, "a flagged, completed turn pushes once");
         let req = &calls[0];
         assert!(req.path.contains("abc123devicetoken"), "path targets the token");
@@ -5254,7 +5609,7 @@ mod tests {
         // No notify.insert — the turn finished in the foreground.
 
         notify_if_complete(st.apns.as_deref(), &st.devices, &st.notify, &st.jobs, &id).await;
-        assert_eq!(mock.calls.lock().unwrap().len(), 0, "unflagged turn never pushes");
+        assert_eq!(mock.calls.lock_ok().len(), 0, "unflagged turn never pushes");
     }
 
     #[tokio::test]
@@ -5267,7 +5622,7 @@ mod tests {
         st.jobs.complete(&id, Ok(("a".to_string(), None)));
         st.notify.insert(&id);
         notify_if_complete(st.apns.as_deref(), &st.devices, &st.notify, &st.jobs, &id).await;
-        assert_eq!(mock.calls.lock().unwrap().len(), 0, "no token → no push");
+        assert_eq!(mock.calls.lock_ok().len(), 0, "no token → no push");
     }
 
     #[tokio::test]
@@ -5281,7 +5636,7 @@ mod tests {
         assert!(matches!(st.jobs.cancel(&id), CancelOutcome::Cancelled));
         st.notify.insert(&id);
         notify_if_complete(st.apns.as_deref(), &st.devices, &st.notify, &st.jobs, &id).await;
-        assert_eq!(mock.calls.lock().unwrap().len(), 0, "a cancelled turn isn't pushed");
+        assert_eq!(mock.calls.lock_ok().len(), 0, "a cancelled turn isn't pushed");
     }
 
     #[tokio::test]
@@ -5303,7 +5658,7 @@ mod tests {
 
         notify_if_complete(st.apns.as_deref(), &st.devices, &st.notify, &st.jobs, &id).await;
 
-        assert_eq!(mock.calls.lock().unwrap().len(), 1, "the send was attempted");
+        assert_eq!(mock.calls.lock_ok().len(), 1, "the send was attempted");
         match st.jobs.get(&id) {
             Some(JobState::Done { response, session_id }) => {
                 assert_eq!(response, "durable answer", "result intact after a push failure");
@@ -5341,11 +5696,11 @@ mod tests {
         let id = st.jobs.create(); // Running
         st.notify.insert(&id);
         notify_if_complete(st.apns.as_deref(), &st.devices, &st.notify, &st.jobs, &id).await;
-        assert_eq!(mock.calls.lock().unwrap().len(), 0, "a running job isn't pushed yet");
+        assert_eq!(mock.calls.lock_ok().len(), 0, "a running job isn't pushed yet");
 
         st.jobs.complete(&id, Ok(("done now".to_string(), None)));
         notify_if_complete(st.apns.as_deref(), &st.devices, &st.notify, &st.jobs, &id).await;
-        assert_eq!(mock.calls.lock().unwrap().len(), 1, "completion pushes exactly once");
+        assert_eq!(mock.calls.lock_ok().len(), 1, "completion pushes exactly once");
     }
 
     // ---- POST /jesse/device -----------------------------------------------
@@ -5464,9 +5819,372 @@ mod tests {
             .unwrap();
         assert_eq!(resp.status(), StatusCode::NO_CONTENT);
         assert_eq!(
-            mock.calls.lock().unwrap().len(),
+            mock.calls.lock_ok().len(),
             1,
             "flagging an already-finished job pushes immediately"
         );
+    }
+
+    // ---- M1: byte-bounded result truncation -------------------------------
+
+    #[test]
+    fn truncate_bytes_caps_multibyte_on_char_boundary() {
+        // A >4 MB reply of 4-byte chars (emoji). `truncate_chars` keeps
+        // MAX_OUTPUT_BYTES *characters* (~16 MB) — ~4× the intended byte budget,
+        // the M1 bug. The byte-aware cap keeps ≤ MAX_OUTPUT_BYTES bytes on a valid
+        // UTF-8 boundary.
+        let s = "🎉".repeat(2_000_000); // 4 bytes each → ~8 MB
+        assert!(s.len() > MAX_OUTPUT_BYTES);
+
+        // Documents the bug: char-count truncation overshoots the byte cap.
+        assert!(
+            truncate_chars(&s, MAX_OUTPUT_BYTES).len() > MAX_OUTPUT_BYTES,
+            "char-count truncation overshoots the byte cap for multibyte text"
+        );
+
+        let t = truncate_bytes_on_char_boundary(&s, MAX_OUTPUT_BYTES);
+        assert!(t.len() <= MAX_OUTPUT_BYTES, "byte cap respected");
+        assert!(
+            MAX_OUTPUT_BYTES - t.len() < 4,
+            "kept the largest char boundary ≤ the cap"
+        );
+        assert!(t.chars().all(|c| c == '🎉'), "no multibyte char was split");
+        // A string already within the cap is returned unchanged.
+        assert_eq!(
+            truncate_bytes_on_char_boundary("hello", MAX_OUTPUT_BYTES),
+            "hello"
+        );
+    }
+
+    // ---- M3: poison-tolerant locking --------------------------------------
+
+    #[test]
+    fn poisoned_jobs_lock_is_recovered_not_propagated() {
+        let store = Arc::new(JobStore::new(
+            Duration::from_secs(600),
+            Duration::from_secs(600),
+            None,
+        ));
+        let id = store.create();
+
+        // Poison the `jobs` mutex: panic while holding its guard on another thread.
+        let s = store.clone();
+        let poisoned = std::thread::spawn(move || {
+            let _g = s.jobs.lock_ok();
+            panic!("poison the jobs lock");
+        })
+        .join();
+        assert!(poisoned.is_err(), "helper thread panicked, poisoning the lock");
+
+        // With `.lock().unwrap()` every subsequent access would panic, cascading
+        // one failed turn into a bridge-wide outage. `lock_ok` recovers the guard.
+        assert!(matches!(store.get(&id), Some(JobState::Running)));
+        let id2 = store.create();
+        assert!(matches!(store.get(&id2), Some(JobState::Running)));
+        store.complete(&id, Ok(("after poison".into(), None)));
+        assert!(matches!(store.get(&id), Some(JobState::Done { .. })));
+    }
+
+    // ---- H2: persistence takes only the value, runs off the jobs lock -----
+
+    #[test]
+    fn persistence_takes_only_the_value_independent_of_the_jobs_lock() {
+        // H2: the restructure makes persistence take ONLY the serialized snapshot
+        // (`write_job_value(dir, id, &Value)`) — never a `&Job`, never the
+        // `JobStore`, never the `jobs` lock. So a caller can hold the `jobs` lock
+        // and the blocking write still proceeds, which is exactly why a slow disk
+        // can no longer serialize the whole bridge behind that lock.
+        let dir = temp_jobs_dir();
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = JobStore::new(
+            Duration::from_secs(600),
+            Duration::from_secs(600),
+            Some(dir.clone()),
+        );
+        let id = store.create();
+        {
+            // Hold the jobs lock for the entire persist round-trip.
+            let _held = store.jobs.lock_ok();
+            let job = Job {
+                state: JobState::Done {
+                    response: "off-lock".into(),
+                    session_id: Some("s".into()),
+                },
+                completed_at: Some(SystemTime::now()),
+                first_retrieved_at: None,
+            };
+            let value = job_to_value(&id, &job).expect("a terminal job serializes");
+            // Completes here even though we hold the jobs lock.
+            write_job_value(&dir, &id, &value);
+        }
+        assert!(
+            dir.join(format!("{id}.json")).exists(),
+            "persistence runs with only the serialized value, independent of the jobs lock"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn complete_persists_through_the_off_lock_worker() {
+        // End-to-end: `complete` enqueues under the lock and the worker thread does
+        // the blocking write off the lock. `flush_persistence` is the test barrier.
+        let dir = temp_jobs_dir();
+        let store = JobStore::new(
+            Duration::from_secs(600),
+            Duration::from_secs(600),
+            Some(dir.clone()),
+        );
+        let id = store.create();
+        store.complete(&id, Ok(("worker write".into(), None)));
+        store.flush_persistence();
+        assert!(
+            dir.join(format!("{id}.json")).exists(),
+            "the persistence worker wrote the completed job off the jobs lock"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---- H3: eviction is concurrency-safe and unlinks off-lock ------------
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn eviction_under_concurrent_load_no_deadlock_no_lost_jobs() {
+        let dir = temp_jobs_dir();
+        // Long ttl (unfetched survive), tiny grace (fetched expire fast).
+        let store = Arc::new(JobStore::new(
+            Duration::from_secs(86_400),
+            Duration::from_millis(20),
+            Some(dir.clone()),
+        ));
+
+        // Two jobs that must survive every sweep: a running one (never evicted)
+        // and a completed-but-never-fetched one (held the full 24h ttl).
+        let keep_running = store.create();
+        let keep_unfetched = store.create();
+        store.complete(&keep_unfetched, Ok(("keep".into(), None)));
+
+        // Hammer create/complete/get/get_retrieving from many tasks WHILE eviction
+        // sweeps concurrently — the concurrency test the suite was missing.
+        let mut handles = Vec::new();
+        for t in 0..4 {
+            let s = store.clone();
+            handles.push(tokio::spawn(async move {
+                let mut ids = Vec::new();
+                for i in 0..40 {
+                    let id = s.create();
+                    s.complete(&id, Ok((format!("r{t}-{i}"), None)));
+                    let _ = s.get_retrieving(&id); // starts the 20ms grace clock
+                    ids.push(id);
+                    if i % 7 == 0 {
+                        s.evict_expired();
+                    }
+                    tokio::task::yield_now().await;
+                }
+                ids
+            }));
+        }
+        let s = store.clone();
+        let evictor = tokio::spawn(async move {
+            for _ in 0..40 {
+                s.evict_expired();
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+        });
+
+        let mut all_ids = Vec::new();
+        for h in handles {
+            all_ids.extend(h.await.expect("worker must not panic or deadlock"));
+        }
+        evictor.await.expect("evictor must not deadlock");
+
+        // Let the grace lapse for the last-created jobs, then one final sweep, and
+        // flush the persistence worker so the file unlinks are observable.
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        store.evict_expired();
+        store.flush_persistence();
+
+        assert!(
+            matches!(store.get(&keep_running), Some(JobState::Running)),
+            "a running job is never evicted"
+        );
+        assert!(
+            matches!(store.get(&keep_unfetched), Some(JobState::Done { .. })),
+            "an unfetched completed job survives on its long ttl"
+        );
+        for id in &all_ids {
+            assert!(
+                store.get(id).is_none(),
+                "a fetched job past its grace must evict from memory"
+            );
+            assert!(
+                !dir.join(format!("{id}.json")).exists(),
+                "an evicted job's file must be unlinked (off-lock, in order after its write)"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---- H4: bounded reap — a child that EOFs but won't exit can't pin -----
+
+    #[tokio::test]
+    async fn turn_completes_when_claude_eofs_but_does_not_exit() {
+        // A fake claude that prints a full result line, then sleeps without
+        // exiting (the grandchild-holding-the-pipe shape). The post-read
+        // child.wait()/stderr drain are bounded (H4), so the turn completes and
+        // frees its permit on the already-authoritative result — long before the
+        // child's 60s sleep ends.
+        let script = "#!/bin/sh\n\
+             printf '%s\\n' '{\"type\":\"result\",\"is_error\":false,\"result\":\"done fast\",\"session_id\":\"sess-h4\"}'\n\
+             sleep 60\n";
+        let fake = write_fake_claude(script);
+        let cfg = Config {
+            claude_bin: fake.to_string_lossy().into_owned(),
+            max_concurrency: 1,
+            ..test_config()
+        };
+        let st = AppState::new(cfg);
+
+        let resp = app(st.clone())
+            .oneshot(jesse_request(
+                Some("Bearer test-token"),
+                r#"{"mode":"ask","text":"hi"}"#,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::ACCEPTED);
+        let body: Value = serde_json::from_str(&body_string(resp).await).unwrap();
+        let job_id = body["job_id"].as_str().unwrap().to_string();
+
+        // Within a few seconds (≪ the 60s sleep) the turn is Done and the permit
+        // is back — proof the reap is bounded, not pinned by the lingering child.
+        let mut done = false;
+        for _ in 0..50 {
+            if st.sem.available_permits() == 1 {
+                if result_status(&st, &job_id).await["status"] == "done" {
+                    done = true;
+                    break;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert!(
+            done,
+            "turn must complete and free its permit without waiting for the child to exit"
+        );
+        let v = result_status(&st, &job_id).await;
+        assert_eq!(v["response"], "done fast");
+        let _ = std::fs::remove_file(&fake);
+    }
+
+    // ---- M2: a panicking turn body still lands terminal --------------------
+
+    #[tokio::test]
+    async fn panicking_turn_body_lands_failed_with_terminal_frame() {
+        let st = test_state();
+
+        // Control: a panicking body with NO guard strands the job Running — the
+        // exact M2 bug (complete never called, eviction skips running jobs).
+        let unguarded = st.jobs.create();
+        let jobs0 = st.jobs.clone();
+        let u = unguarded.clone();
+        let _ = tokio::spawn(async move {
+            let _hold = (jobs0, u);
+            panic!("unguarded panic");
+        })
+        .await;
+        assert!(
+            matches!(st.jobs.get(&unguarded), Some(JobState::Running)),
+            "without the guard a panicked turn stays stuck Running (the M2 bug)"
+        );
+
+        // With the guard (as wired into the real turn task), the same panic drives
+        // the job to Failed and emits a terminal stream frame.
+        let jid = st.jobs.create();
+        st.jobs.stream_register(&jid);
+        let (_text, _act, mut rx) = st.jobs.stream_subscribe(&jid).unwrap();
+        let jobs = st.jobs.clone();
+        let j = jid.clone();
+        let h = tokio::spawn(async move {
+            let _guard = TurnGuard::new(jobs, j);
+            panic!("boom in the turn body");
+        });
+        assert!(h.await.is_err(), "the turn task panicked");
+
+        assert!(
+            matches!(st.jobs.get(&jid), Some(JobState::Failed { .. })),
+            "a panicked turn body must land Failed, not stay Running"
+        );
+        let mut got_terminal_error = false;
+        while let Ok(frame) = rx.try_recv() {
+            if matches!(frame, StreamFrame::Error(_)) {
+                got_terminal_error = true;
+            }
+        }
+        assert!(
+            got_terminal_error,
+            "the stream must receive a terminal error frame, not stay silent"
+        );
+    }
+
+    // ---- M4: a dead (410) APNs token is cleared ---------------------------
+
+    #[tokio::test]
+    async fn dead_token_410_is_cleared() {
+        let mock = MockApns {
+            status: 410,
+            ..Default::default()
+        };
+        let mut st = test_state();
+        st.apns = Some(test_apns(Arc::new(mock.clone())));
+        st.devices.set("deadtoken".to_string());
+
+        let id = st.jobs.create();
+        st.jobs.complete(&id, Ok(("x".into(), None)));
+        st.notify.insert(&id);
+        notify_if_complete(st.apns.as_deref(), &st.devices, &st.notify, &st.jobs, &id).await;
+
+        assert_eq!(mock.calls.lock_ok().len(), 1, "the push was attempted");
+        assert!(
+            st.devices.get().is_none(),
+            "a 410 must clear the dead device token so it isn't retried forever"
+        );
+    }
+
+    #[tokio::test]
+    async fn non_410_push_error_keeps_token() {
+        let mock = MockApns {
+            status: 503,
+            ..Default::default()
+        };
+        let mut st = test_state();
+        st.apns = Some(test_apns(Arc::new(mock.clone())));
+        st.devices.set("livetoken".to_string());
+
+        let id = st.jobs.create();
+        st.jobs.complete(&id, Ok(("x".into(), None)));
+        st.notify.insert(&id);
+        notify_if_complete(st.apns.as_deref(), &st.devices, &st.notify, &st.jobs, &id).await;
+
+        assert_eq!(
+            st.devices.get().as_deref(),
+            Some("livetoken"),
+            "a transient (non-410) failure must NOT clear the token"
+        );
+    }
+
+    #[test]
+    fn device_clear_persists_across_restart() {
+        let dir = temp_jobs_dir();
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("device.json");
+        let store = DeviceStore::new(Some(path.clone()));
+        store.set("tok".to_string());
+        store.clear();
+        assert!(store.get().is_none(), "clear empties the in-memory token");
+        let restarted = DeviceStore::new(Some(path.clone()));
+        assert!(
+            restarted.get().is_none(),
+            "the cleared token stays cleared across a restart"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

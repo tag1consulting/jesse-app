@@ -146,6 +146,14 @@ completion:
   linger for a day.
 - **Running** jobs are never evicted.
 
+Eviction runs on a **periodic background task** (every 60s), **not** on the
+request hot path. An earlier version swept opportunistically at the top of
+`/jesse`, `/jesse/result`, and `/jesse/stream`, which meant a sweep's file
+unlinks happened **under the jobs lock on a request** — one slow disk could stall
+every concurrent request. The sweep now (a) collects evictions under the lock but
+performs the actual file unlinks off-lock on the persistence worker, and (b) runs
+on its own timer task, so a request never waits on eviction.
+
 ### Persistence across a restart
 
 Completed results are also **persisted to disk** — one JSON file per job under
@@ -157,6 +165,17 @@ finished-but-unretrieved reply. The same TTL/eviction applies to reloaded jobs
 Only the finished result and its timing metadata are written — **never** the bearer
 token or any secret. Running jobs aren't persisted (there's no result yet). Set
 `JESSE_STATE_DIR=` (empty) to disable persistence and run in-memory only.
+
+**Persistence is off-lock and never blocks a request.** The job store mutates its
+in-memory state under the `jobs` lock and, still under that lock, **enqueues** the
+already-serialized snapshot to a dedicated **persistence worker thread** (an O(1)
+hand-off). The blocking disk write (`fsync`) and the eviction unlinks run on that
+worker, entirely off the `jobs` lock — so a slow disk can no longer serialize the
+whole bridge behind a completion, a cancel, or a result poll. Enqueuing under the
+lock also keeps disk ops in the **same order** as the in-memory transitions, so a
+first-retrieval write can never resurrect a file a later eviction deleted.
+Persistence remains **best-effort** (a write failure is logged, never fatal); the
+in-memory store always serves the result for the process's lifetime regardless.
 
 ### App-side counterpart — a delivered reply is never silently dropped
 
@@ -501,6 +520,13 @@ the app and the reply is there).
 - **A push failure never affects the turn.** No token, an APNs 4xx/5xx, a bad key —
   all are logged and swallowed; the reply is already stored and retrievable by
   poll/stream/resume regardless.
+- **A dead device token (APNs `410`) is cleared.** When APNs returns HTTP `410
+  Gone` — its signal that the registered token is permanently dead — the bridge
+  **clears the stored token** (and persists the cleared state to `device.json`) so
+  it isn't retried on every future completion. The phone must re-register
+  (which it already does on each foreground). Any other failure (a transient
+  5xx, a transport error) leaves the token in place to retry. Without this, a
+  stale token after an app reinstall would be re-pushed forever.
 
 The APNs auth JWT (ES256, signed with your `.p8`) is cached and reused for ~50
 minutes (Apple allows up to 60) rather than re-signed per push.
@@ -622,6 +648,33 @@ and the filesystem **do** work. PoC scope = vault Q&A + capture, which is fine.
 To use the cloud connectors here, register them in this project's `.mcp.json`.
 
 ## CHANGELOG
+
+- **Concurrency & robustness hardening (job store, turn task, push).** A set of
+  fixes so a slow disk, a wedged child, a panic, a poisoned lock, or a dead push
+  token can't take the bridge down or strand a turn:
+  - **Persistence is off the `jobs` lock.** `complete`/`cancel`/`get_retrieving`
+    no longer `fsync` while holding the jobs mutex (which serialized every
+    request behind one slow disk). They mutate in memory under the lock and
+    enqueue the serialized snapshot to a dedicated persistence **worker thread**
+    that does the blocking I/O off-lock, in order. (H2)
+  - **Eviction moved off the request path** to a periodic background task, and
+    its file unlinks run off-lock on the same worker (collected under the lock,
+    unlinked after). No request waits on a sweep. (H3)
+  - **A wedged child can't pin a turn.** The post-read `child.wait()` and stderr
+    drain are bounded by `REAP_TIMEOUT`, so a `claude` that EOFs stdout but won't
+    exit (a grandchild holding the pipe) frees its concurrency permit promptly on
+    the already-authoritative `result` line. (H4)
+  - **A panic in the turn body lands the job `Failed`** with a terminal stream
+    frame, via a `TurnGuard` drop-guard — never a permanent `Running` with an
+    unresolved spinner. The `.expect()`s on the child pipes became mapped errors.
+    (M2)
+  - **Lock poisoning is recovered, not propagated.** A `lock_ok` helper recovers
+    a poisoned mutex's guard (the guarded maps are structurally valid), so one
+    panicked turn can't cascade into a bridge-wide outage. (M3)
+  - **The result body is capped in BYTES on a char boundary** (matching the byte
+    cap the stream accumulator already used), not in characters — which for
+    multibyte text could keep up to ~4× the intended 4 MB. (M1)
+  - **A dead APNs token (`410`) is cleared** so it isn't retried forever. (M4)
 
 - **Deliver the `job_id` immediately; never hold `POST /jesse`.** *Root cause:* the
   bridge held the POST connection up to a `JESSE_GRACE_SECS` grace window (default
