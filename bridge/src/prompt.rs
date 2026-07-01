@@ -71,6 +71,92 @@ pub const PHONE_FORMAT: &str = "\n\n(Formatting: this reply is shown on a narrow
 screen. Prefer short paragraphs and bullet lists. Use Markdown. If a table is the \
 clearest form, keep it to 2–3 narrow columns; otherwise avoid tables.)";
 
+// ---- Stateless title endpoint (POST /jesse/title) -------------------------
+//
+// The title path is NOT a turn: no clock header, no safety floor, no
+// voice/phone suffix, no session, no persistence. It is a bare one-shot text
+// transform, so its prompt and its consts live apart from the turn wrappers
+// above.
+
+/// Max bytes of conversation text `POST /jesse/title` will accept. The app sends
+/// a bounded digest of one thread to be titled; anything larger is rejected
+/// (`413`) BEFORE any `claude` spawn, so a title request can never trigger a
+/// giant model call. 16 KiB comfortably fits a digest while staying well under a
+/// real turn's input.
+pub const MAX_TITLE_INPUT_BYTES: usize = 16 * 1024;
+
+/// Hard cap (characters) on the title the endpoint returns, applied after the raw
+/// model reply is clamped to a single line. The instruction asks for ~3–6 words /
+/// ~40 chars; this is the safety clamp so a verbose or run-on reply can never come
+/// back as a long "title". A little above 40 so a legitimately snug title isn't
+/// chopped mid-word.
+pub const MAX_TITLE_CHARS: usize = 60;
+
+/// The fixed instruction wrapped around the conversation digest for the title
+/// endpoint. Asks for ONE very short title only — bare text, no quotes, no
+/// trailing punctuation, no "Title:" prefix — and to keep a good opening as-is or
+/// otherwise rephrase it. It also tells the model not to use tools/read files, so
+/// the one-shot stays fast (the allowlist still applies as defense-in-depth).
+pub const TITLE_INSTRUCTION: &str = "Produce ONE very short title for the conversation \
+below. Aim for roughly 3–6 words, about 40 characters at most. Output ONLY the bare \
+title text — no surrounding quotes, no trailing punctuation, no \"Title:\" prefix, no \
+explanation, no extra lines. If the opening of the text already reads as a good short \
+title, keep it as-is; otherwise rephrase it into a clearer short title. Do not use any \
+tools and do not read any files — just read the text below and return the title.";
+
+/// Build the one-shot prompt for the title endpoint: the fixed instruction, then
+/// the conversation text. Pure and side-effect-free (no clock, no floor).
+pub fn build_title_prompt(text: &str) -> String {
+    format!("{TITLE_INSTRUCTION}\n\nConversation:\n{text}")
+}
+
+/// Clamp a raw model reply down to a single-line title: take the first non-empty
+/// line, strip a leading `Title:` label and a single pair of surrounding quotes,
+/// drop trailing punctuation, and truncate to `MAX_TITLE_CHARS` characters on a
+/// char boundary. Pure, so it's unit-tested. Returns `""` when nothing usable
+/// remains (the handler treats that as "no title" and degrades).
+pub fn sanitize_title(raw: &str) -> String {
+    // First non-empty line only — a well-behaved reply is one line, but guard
+    // against a model that adds an explanation on a second line anyway.
+    let line = raw
+        .lines()
+        .map(str::trim)
+        .find(|l| !l.is_empty())
+        .unwrap_or("");
+    // Strip a leading "Title:" label (case-insensitive) if the model added one.
+    let line = match line.get(..6) {
+        Some(prefix) if prefix.eq_ignore_ascii_case("title:") => line[6..].trim(),
+        _ => line,
+    };
+    // Strip a single pair of matching surrounding quotes (straight or smart).
+    let line = strip_wrapping_quotes(line);
+    // Drop trailing sentence punctuation the instruction asked to omit.
+    let line = line
+        .trim_end_matches(['.', '!', '?', ',', ';', ':'])
+        .trim();
+    // Clamp to MAX_TITLE_CHARS characters (char boundary safe) and re-trim in case
+    // the cut left trailing whitespace.
+    line.chars()
+        .take(MAX_TITLE_CHARS)
+        .collect::<String>()
+        .trim()
+        .to_string()
+}
+
+/// Strip one pair of matching surrounding quotes (straight `"`/`'` or smart
+/// `“ ”`/`‘ ’`) if present and non-empty; otherwise return the input unchanged.
+fn strip_wrapping_quotes(s: &str) -> &str {
+    for (open, close) in [('"', '"'), ('\'', '\''), ('\u{201C}', '\u{201D}'), ('\u{2018}', '\u{2019}')] {
+        if let Some(inner) = s.strip_prefix(open).and_then(|r| r.strip_suffix(close)) {
+            let inner = inner.trim();
+            if !inner.is_empty() {
+                return inner;
+            }
+        }
+    }
+    s
+}
+
 // ---- Per-turn clock header ------------------------------------------------
 //
 // Jesse runs headless (`claude -p`) with no guaranteed sense of the current
@@ -472,6 +558,68 @@ mod tests {
         let tell = bp("tell", "m", false, false, None, None);
         assert!(tell.contains(TELL_FLOOR));
         assert!(!tell.contains(ASK_FLOOR));
+    }
+
+    // ---- Title endpoint ----------------------------------------------------
+
+    #[test]
+    fn build_title_prompt_wraps_text_with_fixed_instruction() {
+        let p = build_title_prompt("hello there");
+        assert!(p.starts_with(TITLE_INSTRUCTION), "instruction must lead: {p:?}");
+        assert!(p.contains("hello there"));
+        // Not a turn: none of the turn scaffolding leaks in.
+        assert!(!p.contains(ASK_FLOOR) && !p.contains(TELL_FLOOR));
+        assert!(!p.contains("Current date/time:"));
+        assert!(!p.contains(PHONE_FORMAT) && !p.contains(VOICE_SUFFIX));
+    }
+    #[test]
+    fn sanitize_title_passes_a_clean_title_through() {
+        assert_eq!(sanitize_title("Weekend Trip Planning"), "Weekend Trip Planning");
+    }
+    #[test]
+    fn sanitize_title_strips_surrounding_quotes() {
+        assert_eq!(sanitize_title("\"Weekend Trip\""), "Weekend Trip");
+        assert_eq!(sanitize_title("'Weekend Trip'"), "Weekend Trip");
+        // Smart quotes too.
+        assert_eq!(sanitize_title("\u{201C}Weekend Trip\u{201D}"), "Weekend Trip");
+    }
+    #[test]
+    fn sanitize_title_strips_title_prefix_and_trailing_punctuation() {
+        assert_eq!(sanitize_title("Title: Weekend Trip"), "Weekend Trip");
+        assert_eq!(sanitize_title("title: Weekend Trip."), "Weekend Trip");
+        assert_eq!(sanitize_title("Weekend Trip!"), "Weekend Trip");
+    }
+    #[test]
+    fn sanitize_title_takes_first_nonempty_line_only() {
+        // A model that adds an explanation on later lines: only the first line is
+        // the title.
+        assert_eq!(
+            sanitize_title("\n\nWeekend Trip\nThis title summarizes the chat."),
+            "Weekend Trip"
+        );
+    }
+    #[test]
+    fn sanitize_title_clamps_to_one_line_at_most_max_chars() {
+        // A long, run-on "title" is clamped to a single line ≤ MAX_TITLE_CHARS.
+        let long = "This is an absurdly long run on title that keeps going well past any \
+                    reasonable short title length";
+        let out = sanitize_title(long);
+        assert!(out.chars().count() <= MAX_TITLE_CHARS, "clamped to cap: {out:?}");
+        assert!(!out.contains('\n'), "single line only");
+        assert!(!out.is_empty());
+    }
+    #[test]
+    fn sanitize_title_empty_or_blank_yields_empty() {
+        assert_eq!(sanitize_title(""), "");
+        assert_eq!(sanitize_title("   \n\t "), "");
+    }
+    #[test]
+    fn sanitize_title_never_splits_a_multibyte_char_at_the_cap() {
+        // A title of multibyte chars clamped at the char cap stays valid UTF-8.
+        let s = "\u{1F389}".repeat(MAX_TITLE_CHARS + 20); // 🎉 × many
+        let out = sanitize_title(&s);
+        assert_eq!(out.chars().count(), MAX_TITLE_CHARS);
+        assert!(out.chars().all(|c| c == '\u{1F389}'));
     }
 
     // ---- Clock header ------------------------------------------------------

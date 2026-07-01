@@ -21,6 +21,13 @@ pub const DEFAULT_JOB_TTL_SECS: u64 = 86_400;
 // pre-24h window, repurposed as the post-fetch grace.
 pub const DEFAULT_RETRIEVAL_GRACE_SECS: u64 = 600;
 
+// Short, fixed timeout for the stateless title endpoint (`POST /jesse/title`).
+// Much tighter than a turn's JESSE_TIMEOUT (default 3600s) because a title is
+// interactive UI latency, not a full agent turn: on overrun the app just
+// degrades to its own derived title. Deliberately a const, not env-tunable — it
+// bounds a UX nicety, not an operator-managed workload.
+pub const TITLE_TIMEOUT_SECS: u64 = 20;
+
 // Captured agent stdout is truncated to this many bytes before parsing so one
 // pathological run can't balloon the bridge's memory. The JSON envelope the
 // bridge cares about is kilobytes; multiple MB is already pathological.

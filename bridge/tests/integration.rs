@@ -906,6 +906,157 @@ use tower::ServiceExt;
         );
     }
     #[tokio::test]
+    async fn title_no_auth_is_401() {
+        let resp = app(test_state())
+            .oneshot(title_request(None, r#"{"text":"hello"}"#))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+    #[tokio::test]
+    async fn title_wrong_token_is_401() {
+        let resp = app(test_state())
+            .oneshot(title_request(Some("Bearer wrong"), r#"{"text":"hello"}"#))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+    #[tokio::test]
+    async fn title_malformed_body_is_400() {
+        // Invalid JSON syntax → the Json extractor rejects with 400 before the
+        // handler body runs.
+        let resp = app(test_state())
+            .oneshot(title_request(Some("Bearer test-token"), r#"{"text": }"#))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+    #[tokio::test]
+    async fn title_happy_path_returns_clamped_short_title() {
+        // A fake claude that emits a valid terminal result line carrying a clean
+        // short title. The endpoint returns it verbatim (nothing to clamp).
+        let script = "#!/bin/sh\nprintf '%s' '{\"type\":\"result\",\"is_error\":false,\"result\":\"Weekend Trip Planning\",\"session_id\":\"x\"}'\n";
+        let fake = write_fake_claude(script);
+        let cfg = Config {
+            claude_bin: fake.to_string_lossy().into_owned(),
+            ..test_config()
+        };
+        let st = AppState::new(cfg);
+
+        let resp = app(st)
+            .oneshot(title_request(
+                Some("Bearer test-token"),
+                r#"{"text":"a long chat about planning a trip this weekend"}"#,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body: Value = serde_json::from_str(&body_string(resp).await).unwrap();
+        assert_eq!(body["title"], "Weekend Trip Planning");
+
+        let _ = std::fs::remove_file(&fake);
+    }
+    #[tokio::test]
+    async fn title_output_longer_than_cap_is_clamped_to_one_line() {
+        // A verbose model reply — a run-on first line PLUS an explanatory second
+        // line. The endpoint must clamp to a single line no longer than the cap.
+        let script = "#!/bin/sh\nprintf '%s' '{\"type\":\"result\",\"is_error\":false,\"result\":\"This is an absurdly long run on title that keeps going well past any reasonable length\\nThis line explains the title and must be dropped\"}'\n";
+        let fake = write_fake_claude(script);
+        let cfg = Config {
+            claude_bin: fake.to_string_lossy().into_owned(),
+            ..test_config()
+        };
+        let st = AppState::new(cfg);
+
+        let resp = app(st)
+            .oneshot(title_request(
+                Some("Bearer test-token"),
+                r#"{"text":"some conversation"}"#,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body: Value = serde_json::from_str(&body_string(resp).await).unwrap();
+        let title = body["title"].as_str().unwrap();
+        assert!(!title.contains('\n'), "title must be a single line: {title:?}");
+        assert!(
+            title.chars().count() <= MAX_TITLE_CHARS,
+            "title must be clamped to MAX_TITLE_CHARS, got {} chars: {title:?}",
+            title.chars().count()
+        );
+        assert!(!title.is_empty());
+
+        let _ = std::fs::remove_file(&fake);
+    }
+    #[tokio::test]
+    async fn title_oversized_input_is_rejected_before_any_claude_spawn() {
+        // A fake claude that touches a marker the instant it runs. An oversized
+        // body must be rejected (413) by the input cap BEFORE any spawn, so the
+        // marker never appears.
+        let marker = std::env::temp_dir().join(format!(
+            "jesse-title-marker-{}-{}.txt",
+            std::process::id(),
+            JOB_COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_file(&marker);
+        let script = format!(
+            "#!/bin/sh\n\
+             touch '{}'\n\
+             printf '%s' '{{\"type\":\"result\",\"is_error\":false,\"result\":\"too late\"}}'\n",
+            marker.display()
+        );
+        let fake = write_fake_claude(&script);
+        let cfg = Config {
+            claude_bin: fake.to_string_lossy().into_owned(),
+            ..test_config()
+        };
+        let st = AppState::new(cfg);
+
+        // One byte over the cap.
+        let oversized = "x".repeat(MAX_TITLE_INPUT_BYTES + 1);
+        let json = format!(r#"{{"text":"{oversized}"}}"#);
+        let resp = app(st)
+            .oneshot(title_request(Some("Bearer test-token"), &json))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+
+        // Give any (erroneously spawned) child a beat, then assert it never ran.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(
+            !marker.exists(),
+            "oversized input must be rejected before claude is ever spawned"
+        );
+
+        let _ = std::fs::remove_file(&marker);
+        let _ = std::fs::remove_file(&fake);
+    }
+    #[tokio::test]
+    async fn title_oneshot_times_out_when_claude_stalls() {
+        // The short timeout bound is enforced: a fake claude that stalls far past
+        // the passed timeout must yield a GATEWAY_TIMEOUT error, not hang. Driven
+        // at the run_claude_oneshot level so a 1s bound can be exercised directly
+        // (the handler uses the fixed TITLE_TIMEOUT_SECS const).
+        let script = "#!/bin/sh\nsleep 60\nprintf '%s' '{\"type\":\"result\",\"is_error\":false,\"result\":\"too slow\"}'\n";
+        let fake = write_fake_claude(script);
+        let cfg = Config {
+            claude_bin: fake.to_string_lossy().into_owned(),
+            ..test_config()
+        };
+
+        let started = std::time::Instant::now();
+        let res = run_claude_oneshot(&cfg, "title this", 1).await;
+        let elapsed = started.elapsed();
+        let err = res.expect_err("a stalling claude must time out, not succeed");
+        assert_eq!(err.0, StatusCode::GATEWAY_TIMEOUT);
+        assert!(
+            elapsed < Duration::from_secs(10),
+            "timeout must fire near the 1s bound, took {elapsed:?}"
+        );
+
+        let _ = std::fs::remove_file(&fake);
+    }
+    #[tokio::test]
     async fn turn_completes_when_claude_eofs_but_does_not_exit() {
         // A fake claude that prints a full result line, then sleeps without
         // exiting (the grandchild-holding-the-pipe shape). The post-read

@@ -110,6 +110,13 @@ To keep a single client (or a runaway turn) from exhausting the host:
   builds. An unbounded-wait affordance exists only in debug builds.
 - **Output cap** — captured agent stdout is truncated (a few MB) before parsing
   so one pathological run can't balloon memory.
+- **Title endpoint** — `POST /jesse/title` is stateless and bearer-auth gated like
+  every other endpoint, and shares the same rate limiter. Its input is capped at
+  `MAX_TITLE_INPUT_BYTES` (16 KiB) — an oversized body is refused with `413`
+  *before any `claude` spawn* — and its single `claude` call is bounded by a short
+  fixed `TITLE_TIMEOUT_SECS` (20s), so it cannot pin a child the way a full turn
+  can. It reuses `build_claude_args`, so the same tool allow/deny posture applies;
+  it creates no job, persists nothing, and its output is clamped before return.
 - **Attachments** — files sent with a turn are bounded by count
   (`JESSE_MAX_ATTACHMENTS`, default 4), per-file size (`JESSE_MAX_ATTACHMENT_BYTES`,
   default 10 MB), and combined size (`JESSE_MAX_ATTACHMENTS_TOTAL_BYTES`, default

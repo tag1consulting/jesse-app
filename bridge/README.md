@@ -518,6 +518,44 @@ bridge default" and the field is omitted. In the app the floor is **unlockable**
 locked by default, editable only behind an explicit "not recommended" gate — so no
 one reweakens it by accident.
 
+## Conversation titles (`POST /jesse/title`)
+
+A lightweight, **stateless** endpoint the app calls to turn one conversation's
+text into a **very short title** (roughly 3–6 words, ~40 chars). It is **not a
+turn**: no job is created, nothing is persisted, no session, no live stream, no
+push, and no eviction interaction — it touches none of the jobs/streams/aborts
+state. It reuses the same `claude` invocation discipline as a turn (same
+`build_claude_args` allow/deny tool posture, `kill_on_drop`, and terminal-result
+classification) via a single bounded `run_claude_oneshot` call.
+
+```bash
+curl -s http://127.0.0.1:8765/jesse/title \
+  -H "Authorization: Bearer $JESSE_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"text":"<a bounded digest of the conversation to title>"}'
+# → { "title": "Weekend Trip Planning" }
+```
+
+- **Auth / rate limit.** Same bearer auth as `/jesse` (constant-time compare;
+  `401` without/with a wrong bearer) and the same per-service rate limiter (`429`
+  on a burst). Same bind/allowlist posture as every other endpoint.
+- **Input cap.** The body is `{ "text": String }` — the app sends a bounded
+  digest. Input is capped at **`MAX_TITLE_INPUT_BYTES` (16 KiB)**; anything larger
+  is rejected with **`413`** *before any `claude` spawn*, so a title request can
+  never trigger a giant model call. A blank body is `400`.
+- **One short call.** Runs `claude -p` **once** with a fixed instruction to return
+  one very short title (no quotes, no trailing punctuation, no `Title:` prefix) —
+  keeping a good opening as-is or otherwise rephrasing it — and bounds it with a
+  **short timeout (`TITLE_TIMEOUT_SECS`, 20s)**, tighter than a normal turn since
+  this is interactive UI latency. The model output is clamped to a single line of
+  at most **`MAX_TITLE_CHARS` (60)** characters before it's returned.
+- **Degrade, never error.** On timeout or any failure the endpoint returns a clean
+  non-2xx (`504`/`502`). **The app must treat "no title" as normal** and fall back
+  to its existing derived title — it is never surfaced to the user as an error, and
+  a title failure is never fatal to the bridge.
+
+Response: `{ "title": String }`.
+
 ## Push notifications (APNs) — optional, off by default
 
 The bridge can send the phone an **APNs alert when a backgrounded turn finishes**,

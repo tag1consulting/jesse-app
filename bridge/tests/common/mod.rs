@@ -80,6 +80,16 @@ use tower::ServiceExt; // ServiceExt::oneshot
         }
         b.body(Body::from(json.to_string())).unwrap()
     }
+    pub fn title_request(auth: Option<&str>, json: &str) -> Request<Body> {
+        let mut b = Request::builder()
+            .method("POST")
+            .uri("/jesse/title")
+            .header("content-type", "application/json");
+        if let Some(a) = auth {
+            b = b.header("authorization", a);
+        }
+        b.body(Body::from(json.to_string())).unwrap()
+    }
     pub fn notify_request(auth: Option<&str>, job_id: &str) -> Request<Body> {
         let mut b = Request::builder()
             .method("POST")

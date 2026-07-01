@@ -495,6 +495,128 @@ pub async fn run_claude_streaming(
     }
 }
 
+/// A stateless, single `claude -p` invocation — the primitive behind
+/// `POST /jesse/title`. It reuses the exact same least-privilege args
+/// (`build_claude_args`, so identical `--permission-mode`/allow/deny posture),
+/// the same `kill_on_drop`, the same terminal-`result`-line classification
+/// (`parse_stream_line` + `resolve_stream_outcome`), and the same bounded-reap
+/// discipline as a turn — but creates NO job, pushes NO live stream, resumes NO
+/// session, persists NOTHING, and touches none of the jobs/streams/aborts
+/// mutexes. The caller passes a short `timeout_secs` (see `TITLE_TIMEOUT_SECS`).
+///
+/// Unlike `run_claude_streaming` there is no retry loop: the title path is a
+/// best-effort UI nicety the caller degrades from on any non-2xx, so a single
+/// bounded attempt keeps latency tight rather than re-running on an upstream blip.
+/// The streamed text is still accumulated locally as the empty-`result` fallback,
+/// so a success envelope with a blank `result` still yields the visible answer.
+pub async fn run_claude_oneshot(
+    cfg: &Config,
+    prompt: &str,
+    timeout_secs: u64,
+) -> Result<String, ApiError> {
+    // Same args as a turn (stream-json + the least-privilege allow/deny lists),
+    // no --resume: a title call is never part of a thread.
+    let mut cmd = Command::new(&cfg.claude_bin);
+    cmd.args(build_claude_args(cfg, prompt, None))
+        .current_dir(&cfg.vault)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+
+    let mut child = cmd.spawn().map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("failed to spawn {}: {e}", cfg.claude_bin),
+        )
+    })?;
+    let (Some(stdout), Some(stderr)) = (child.stdout.take(), child.stderr.take()) else {
+        return Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "claude child stdout/stderr pipe was not captured".to_string(),
+        ));
+    };
+
+    // Drain stderr concurrently (capped) so a chatty stderr can't deadlock the
+    // stdout pipe and so the no-`result` fallback has the failure cause.
+    let stderr_task = tokio::spawn(async move {
+        let mut reader = BufReader::new(stderr);
+        let mut buf = Vec::new();
+        let _ = reader.read_to_end(&mut buf).await;
+        let cap = buf.len().min(MAX_OUTPUT_BYTES);
+        String::from_utf8_lossy(&buf[..cap]).into_owned()
+    });
+
+    // Read stdout line by line, accumulating text deltas into a LOCAL buffer
+    // (not a job store) and stopping the instant the terminal `result` line is
+    // parsed — the same completion rule as a turn.
+    let read_lines = async {
+        let mut lines = BufReader::new(stdout).lines();
+        let mut terminal: Option<ClaudeOutcome> = None;
+        let mut streamed = String::new();
+        loop {
+            let next = lines
+                .next_line()
+                .await
+                .map_err(|e| (StatusCode::BAD_GATEWAY, format!("claude io error: {e}")))?;
+            let Some(line) = next else { break };
+            match parse_stream_line(&line) {
+                StreamEvent::TextDelta(t) => {
+                    if streamed.len() < MAX_OUTPUT_BYTES {
+                        streamed.push_str(&t);
+                    }
+                }
+                StreamEvent::Done(outcome) => {
+                    terminal = Some(outcome);
+                    break;
+                }
+                StreamEvent::ToolActivity { .. } | StreamEvent::Ignore => {}
+            }
+        }
+        Ok::<(Option<ClaudeOutcome>, String), ApiError>((terminal, streamed))
+    };
+
+    let (terminal, streamed) = match timeout(Duration::from_secs(timeout_secs), read_lines).await {
+        Ok(r) => r?,
+        Err(_) => {
+            // Timed out — kill_on_drop reaps the child as this future drops.
+            return Err((
+                StatusCode::GATEWAY_TIMEOUT,
+                format!("title generation exceeded the {timeout_secs}s limit"),
+            ));
+        }
+    };
+
+    // Bounded reap — once we have the authoritative result the child (or a
+    // lingering grandchild) must never delay delivery. Mirrors the turn path.
+    const REAP_TIMEOUT: Duration = Duration::from_secs(5);
+    let stderr = if terminal.is_some() {
+        tokio::spawn(async move {
+            if timeout(REAP_TIMEOUT, child.wait()).await.is_err() {
+                let _ = child.start_kill();
+            }
+            stderr_task.abort();
+        });
+        String::new()
+    } else {
+        if timeout(REAP_TIMEOUT, child.wait()).await.is_err() {
+            let _ = child.start_kill();
+        }
+        match timeout(REAP_TIMEOUT, stderr_task).await {
+            Ok(joined) => joined.unwrap_or_default(),
+            Err(_) => String::new(),
+        }
+    };
+
+    // Same Ok/Retryable/Fatal classification as a turn. No retry: a Retryable
+    // upstream blip is surfaced as a non-2xx the caller degrades from.
+    match resolve_stream_outcome(terminal, &streamed, &stderr) {
+        ClaudeOutcome::Ok { result, .. } => Ok(result),
+        ClaudeOutcome::Fatal { message } | ClaudeOutcome::Retryable { message, .. } => {
+            Err((StatusCode::BAD_GATEWAY, message))
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

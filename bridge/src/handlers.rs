@@ -32,6 +32,12 @@ pub struct DeviceRequest {
     token: String,
 }
 
+/// Body of `POST /jesse/title`: the conversation text to turn into a short title.
+#[derive(Deserialize)]
+pub struct TitleRequest {
+    text: String,
+}
+
 // ---- Handlers -------------------------------------------------------------
 
 /// Liveness probe. Always returns `200 { "ok": true }` with **no auth and no
@@ -321,6 +327,62 @@ pub async fn jesse_notify(
     Ok(StatusCode::NO_CONTENT)
 }
 
+/// `POST /jesse/title` — turn one conversation's text into a VERY SHORT title.
+/// **Stateless and NOT a turn:** no job is created, no session, nothing is
+/// persisted, no live stream, no push, no eviction interaction — it touches none
+/// of the jobs/streams/aborts mutexes. Same bearer auth and same rate limiter as
+/// `/jesse`, reusing the same `claude` invocation discipline via
+/// `run_claude_oneshot` (identical allow/deny tool posture and `kill_on_drop`).
+///
+/// Bounded twice: a strict input cap (`MAX_TITLE_INPUT_BYTES`) rejects an
+/// oversized body with `413` BEFORE any `claude` spawn, and a short timeout
+/// (`TITLE_TIMEOUT_SECS`, tighter than a turn) bounds the run. Any failure or
+/// timeout is a clean non-2xx the app treats as "no title" and degrades from
+/// (falling back to its derived title, never surfacing an error to the user); it
+/// is never fatal to the bridge. The raw model reply is clamped to a single line
+/// of at most `MAX_TITLE_CHARS` before returning `{ "title": ... }`.
+pub async fn jesse_title(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    Json(req): Json<TitleRequest>,
+) -> Result<Json<Value>, ApiError> {
+    check_auth(&headers, &st.cfg.token)?;
+
+    // Same rate limiter as /jesse — a title request is a first-class accepted
+    // request against the per-service bucket, shed with 429 on a burst.
+    if !st.limiter.allow() {
+        return Err((
+            StatusCode::TOO_MANY_REQUESTS,
+            "rate limit exceeded".to_string(),
+        ));
+    }
+
+    let text = req.text.trim();
+    if text.is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "missing text to title".to_string()));
+    }
+    // Strict input cap BEFORE any claude spawn — a title request can never make a
+    // giant model call. Enforced on the trimmed byte length against the named cap.
+    if text.len() > MAX_TITLE_INPUT_BYTES {
+        return Err((
+            StatusCode::PAYLOAD_TOO_LARGE,
+            format!("text exceeds the {MAX_TITLE_INPUT_BYTES}-byte title input cap"),
+        ));
+    }
+
+    // One bounded, stateless claude call. No job store, no stream, no session.
+    let raw = run_claude_oneshot(&st.cfg, &build_title_prompt(text), TITLE_TIMEOUT_SECS).await?;
+    let title = sanitize_title(&raw);
+    if title.is_empty() {
+        // Nothing usable came back — a clean non-2xx the app degrades from.
+        return Err((
+            StatusCode::BAD_GATEWAY,
+            "claude returned no usable title".to_string(),
+        ));
+    }
+    Ok(Json(json!({ "title": title })))
+}
+
 /// Build the axum router with its shared state. Kept separate from `main` so
 /// tests can drive the same routes via `tower::ServiceExt::oneshot` without
 /// binding a socket. The running server uses exactly this router.
@@ -333,6 +395,7 @@ pub fn app(state: AppState) -> Router {
         .route("/health", get(health))
         .route("/jesse", post(jesse))
         .route("/jesse/prompts", get(jesse_prompts))
+        .route("/jesse/title", post(jesse_title))
         .route("/jesse/result/:job_id", get(jesse_result))
         .route("/jesse/stream/:job_id", get(jesse_stream))
         .route("/jesse/cancel/:job_id", post(jesse_cancel))
