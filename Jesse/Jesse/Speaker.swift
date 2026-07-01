@@ -33,21 +33,73 @@ struct SystemAudioSession: AudioSessioning {
     }
 }
 
+/// Speaks an utterance and signals when it finishes. Injected so a test can assert
+/// what was delivered (and that delivery is still attempted when the audio session
+/// fails) without a real `AVSpeechSynthesizer`.
 @MainActor
-final class Speaker: NSObject {
+protocol SpeechSynthesizing: AnyObject {
+    /// Invoked when an utterance finishes or is cancelled, so the owner can tear the
+    /// audio session back down.
+    var onFinish: (() -> Void)? { get set }
+    /// Speak `text` now, interrupting anything in progress (the prior
+    /// `stopSpeaking(.immediate)` + `speak`).
+    func speak(_ text: String)
+    func stop()
+}
+
+/// Production conformer over `AVSpeechSynthesizer`, owning the en-US voice and the
+/// delegate that maps finish/cancel to `onFinish`.
+final class SystemSpeechSynthesizer: NSObject, SpeechSynthesizing {
+    private let synth = AVSpeechSynthesizer()
+    var onFinish: (() -> Void)?
+
+    override init() {
+        super.init()
+        synth.delegate = self
+    }
+
+    func speak(_ text: String) {
+        let u = AVSpeechUtterance(string: text)
+        u.voice = AVSpeechSynthesisVoice(language: "en-US")
+        synth.stopSpeaking(at: .immediate)
+        synth.speak(u)
+    }
+
+    func stop() { synth.stopSpeaking(at: .immediate) }
+}
+
+extension SystemSpeechSynthesizer: AVSpeechSynthesizerDelegate {
+    nonisolated func speechSynthesizer(_ synthesizer: AVSpeechSynthesizer,
+                                       didFinish utterance: AVSpeechUtterance) {
+        Task { @MainActor in self.onFinish?() }
+    }
+
+    nonisolated func speechSynthesizer(_ synthesizer: AVSpeechSynthesizer,
+                                       didCancel utterance: AVSpeechUtterance) {
+        Task { @MainActor in self.onFinish?() }
+    }
+}
+
+@MainActor
+final class Speaker {
     static let shared = Speaker()
 
-    private let synth = AVSpeechSynthesizer()
+    private let synth: SpeechSynthesizing
     private let session: AudioSessioning
 
     /// The last audio-session error, surfaced (not swallowed) for diagnostics and
     /// so a test can assert a routing failure was observed rather than dropped.
     private(set) var lastSessionError: Error?
 
-    init(session: AudioSessioning = SystemAudioSession()) {
+    /// `synth` defaults to the real `AVSpeechSynthesizer`-backed one, constructed on
+    /// the main actor inside the initializer (a non-nil default argument would be
+    /// evaluated off the actor). Tests inject a spy.
+    init(session: AudioSessioning = SystemAudioSession(),
+         synth: SpeechSynthesizing? = nil) {
         self.session = session
-        super.init()
-        synth.delegate = self
+        self.synth = synth ?? SystemSpeechSynthesizer()
+        // Tear the audio session down once speech ends (un-ducking other audio).
+        self.synth.onFinish = { [weak self] in self?.deactivateSession() }
     }
 
     func speak(_ text: String) {
@@ -62,13 +114,10 @@ final class Speaker: NSObject {
             lastSessionError = error
             Log.speaker.error("audio session activate failed: \(error.localizedDescription)")
         }
-        let u = AVSpeechUtterance(string: t)
-        u.voice = AVSpeechSynthesisVoice(language: "en-US")
-        synth.stopSpeaking(at: .immediate)
-        synth.speak(u)
+        synth.speak(t)
     }
 
-    func stop() { synth.stopSpeaking(at: .immediate) }
+    func stop() { synth.stop() }
 
     /// Deactivate the audio session after speech ends, logging (not swallowing) a
     /// failure. Un-ducks other audio that `.duckOthers` was suppressing.
@@ -79,17 +128,5 @@ final class Speaker: NSObject {
             lastSessionError = error
             Log.speaker.error("audio session deactivate failed: \(error.localizedDescription)")
         }
-    }
-}
-
-extension Speaker: AVSpeechSynthesizerDelegate {
-    nonisolated func speechSynthesizer(_ synthesizer: AVSpeechSynthesizer,
-                                       didFinish utterance: AVSpeechUtterance) {
-        Task { @MainActor in self.deactivateSession() }
-    }
-
-    nonisolated func speechSynthesizer(_ synthesizer: AVSpeechSynthesizer,
-                                       didCancel utterance: AVSpeechUtterance) {
-        Task { @MainActor in self.deactivateSession() }
     }
 }

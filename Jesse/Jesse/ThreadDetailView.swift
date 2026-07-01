@@ -85,7 +85,9 @@ struct ThreadDetailView: View {
                     if running {
                         let partial = coordinator.partialText(for: thread.id) ?? ""
                         if !partial.isEmpty {
-                            MarkdownText(partial)
+                            // Coalesced to ~10Hz so a long stream doesn't re-parse
+                            // the whole growing string on every delta (M8).
+                            StreamingPartialText(text: partial, running: running)
                                 .frame(maxWidth: .infinity, alignment: .leading)
                         }
                         if let activity = coordinator.activity(for: thread.id) {
@@ -328,6 +330,23 @@ struct ThreadDetailView: View {
 }
 
 // MARK: - Pieces
+
+/// The live streaming reply, with its markdown parse coalesced to ~10Hz (M8). A
+/// `TimelineView` clock (the same pattern `SendButton` uses) re-evaluates at the
+/// renderer's interval; `MarkdownStreamRenderer` caches the parsed blocks between
+/// ticks, so the O(n²) "re-parse the whole growing string on every delta" is gone.
+/// The persisted Turn renders the complete text once the turn finishes.
+private struct StreamingPartialText: View {
+    let text: String
+    let running: Bool
+    @State private var renderer = MarkdownStreamRenderer()
+
+    var body: some View {
+        TimelineView(.animation(minimumInterval: MarkdownStreamRenderer.interval, paused: !running)) { context in
+            MarkdownText(blocks: renderer.blocks(for: text, now: context.date))
+        }
+    }
+}
 
 /// One message bubble. User turns sit right with a tinted fill; Jesse's replies
 /// render as Markdown on the left.

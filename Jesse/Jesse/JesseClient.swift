@@ -327,6 +327,112 @@ enum JesseStreamEvent: Equatable {
     case cancelled
 }
 
+// MARK: - Wire contract (Codable)
+//
+// The bridge's JSON is modeled as Codable structs so each wire key
+// ("job_id"/"session_id"/"response"/"status"/"error"/…) is a single CodingKey
+// shared by encode and decode — not a magic string duplicated between a hand-built
+// `[String: Any]` and `obj["…"] as? T` casts. Optional fields encode only when
+// present (Swift's synthesized `encodeIfPresent`), so the bytes on the wire are
+// unchanged from the old dictionary that omitted nil/blank fields. `InFlightJob`
+// and `PromptDefaults` already use Codable; this matches them.
+
+/// The `POST /jesse` request body. A nil `sessionId`/`voice`/`instructions`/
+/// `floorOverride`/`attachments` omits its field, reproducing the old
+/// conditionally-built dictionary byte-for-byte and matching the bridge's
+/// `#[serde(default)]` shape. Build it with `JesseClient.makeRequest`, which
+/// normalizes "use the default" (blank override, false voice, no attachments) to
+/// nil so the field drops out.
+nonisolated struct JesseRequest: Encodable, Equatable {
+    let mode: String
+    let text: String
+    let sessionId: String?
+    let voice: Bool?
+    let instructions: String?
+    let floorOverride: String?
+    let attachments: [Attachment]?
+
+    nonisolated struct Attachment: Encodable, Equatable {
+        let filename: String
+        let mime: String
+        let dataBase64: String
+        enum CodingKeys: String, CodingKey {
+            case filename, mime
+            case dataBase64 = "data_base64"
+        }
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case mode, text
+        case sessionId = "session_id"
+        case voice, instructions
+        case floorOverride = "floor_override"
+        case attachments
+    }
+}
+
+/// Decoded `POST /jesse` response. The 200 carries `response` (+`session_id`,
+/// +`job_id`); the 202 carries `job_id`+`status`. One all-optional shape covers
+/// both; `decodeSend` picks the arm by status code and required field.
+nonisolated struct JesseSendResponse: Decodable {
+    let jobId: String?
+    let status: String?
+    let response: String?
+    let sessionId: String?
+    enum CodingKeys: String, CodingKey {
+        case jobId = "job_id"
+        case status, response
+        case sessionId = "session_id"
+    }
+}
+
+/// Decoded `GET /jesse/result/{id}` body: `status` plus the fields that status
+/// implies (`response`/`session_id` for done, `error` for failed).
+nonisolated struct JesseResultResponse: Decodable {
+    let status: String
+    let response: String?
+    let sessionId: String?
+    let error: String?
+    enum CodingKeys: String, CodingKey {
+        case status, response
+        case sessionId = "session_id"
+        case error
+    }
+}
+
+/// Decoded `GET /jesse/prompts` body — all four fields required.
+nonisolated struct JessePromptsResponse: Decodable {
+    let ask: String
+    let tell: String
+    let askFloor: String
+    let tellFloor: String
+    enum CodingKeys: String, CodingKey {
+        case ask, tell
+        case askFloor = "ask_floor"
+        case tellFloor = "tell_floor"
+    }
+}
+
+/// Decoded `data:` payload of one SSE frame. Every field is optional — which one
+/// is meaningful depends on the frame's `event:` name (see `decodeStreamFrame`).
+nonisolated struct JesseStreamFrameData: Decodable {
+    let text: String?
+    let name: String?
+    let response: String?
+    let sessionId: String?
+    let error: String?
+    enum CodingKeys: String, CodingKey {
+        case text, name, response
+        case sessionId = "session_id"
+        case error
+    }
+}
+
+/// The `POST /jesse/device` body — register this phone's APNs token.
+nonisolated struct JesseDeviceRegistration: Encodable {
+    let token: String
+}
+
 /// The two bridge calls the coordinator drives a turn with. Pulled behind a
 /// protocol purely so a fake can exercise the poll loop in tests without a
 /// server; `JesseClient` is the only production conformer.
@@ -444,11 +550,11 @@ struct JesseClient: JesseClientProtocol {
         req.httpMethod = "POST"
         req.setValue("application/json", forHTTPHeaderField: "Content-Type")
         req.setValue("Bearer \(config.token)", forHTTPHeaderField: "Authorization")
-        let body = Self.requestBody(mode: mode, text: text, sessionId: sessionId,
-                                    voice: voice, instructions: instructions,
-                                    floorOverride: floorOverride,
-                                    attachments: attachments)
-        req.httpBody = try JSONSerialization.data(withJSONObject: body)
+        let request = Self.makeRequest(mode: mode, text: text, sessionId: sessionId,
+                                       voice: voice, instructions: instructions,
+                                       floorOverride: floorOverride,
+                                       attachments: attachments)
+        req.httpBody = try Self.encodeBody(request)
 
         let data: Data, resp: URLResponse
         do {
@@ -520,7 +626,7 @@ struct JesseClient: JesseClientProtocol {
         req.httpMethod = "POST"
         req.setValue("application/json", forHTTPHeaderField: "Content-Type")
         req.setValue("Bearer \(config.token)", forHTTPHeaderField: "Authorization")
-        req.httpBody = try JSONSerialization.data(withJSONObject: ["token": token])
+        req.httpBody = try Self.encodeBody(JesseDeviceRegistration(token: token))
 
         let data: Data, resp: URLResponse
         do {
@@ -620,17 +726,18 @@ struct JesseClient: JesseClientProtocol {
         return rest.hasPrefix(" ") ? String(rest.dropFirst()) : String(rest)
     }
 
-    /// Decode one SSE frame (`event` name + JSON `data`) into a stream event.
+    /// Decode one SSE frame (`event` name + JSON `data`) into a stream event. A
+    /// malformed/empty `data` decodes to nil and falls back to the same defaults the
+    /// old `obj?["…"] ?? …` casts used.
     nonisolated static func decodeStreamFrame(event: String, data: String) -> JesseStreamEvent? {
-        let obj = (try? JSONSerialization.jsonObject(with: Data(data.utf8))) as? [String: Any]
+        let obj = try? JSONDecoder().decode(JesseStreamFrameData.self, from: Data(data.utf8))
         switch event {
-        case "reset": return .reset(obj?["text"] as? String ?? "")
-        case "delta": return .delta(obj?["text"] as? String ?? "")
-        case "activity": return .activity(obj?["name"] as? String ?? "")
+        case "reset": return .reset(obj?.text ?? "")
+        case "delta": return .delta(obj?.text ?? "")
+        case "activity": return .activity(obj?.name ?? "")
         case "done":
-            return .done(JesseReply(text: obj?["response"] as? String ?? "",
-                                    sessionId: obj?["session_id"] as? String))
-        case "error": return .failed(obj?["error"] as? String ?? "Jesse couldn't complete that.")
+            return .done(JesseReply(text: obj?.response ?? "", sessionId: obj?.sessionId))
+        case "error": return .failed(obj?.error ?? "Jesse couldn't complete that.")
         case "cancelled": return .cancelled
         default: return nil
         }
@@ -640,8 +747,9 @@ struct JesseClient: JesseClientProtocol {
     /// as `URLSession.AsyncBytes.lines` yields them and forwards each completed
     /// frame; tests feed hand-built line arrays via `framesFromLines`. Factored out
     /// so the framing — the spot the CHANGELOG's blank-line-swallowing bug lived —
-    /// can be unit-tested directly.
-    struct SSEParser {
+    /// can be unit-tested directly. `nonisolated` so the SSE-reading Task (which runs
+    /// off the main actor) can drive it without an actor hop per line.
+    nonisolated struct SSEParser {
         private var eventName = ""
         private var dataBuf = ""
 
@@ -712,38 +820,42 @@ struct JesseClient: JesseClientProtocol {
     // Body encode/decode split out as pure, static functions so the wire contract
     // can be unit-tested without standing up a server.
 
-    /// Build the `POST /jesse` JSON body. Optional fields are included only when
-    /// they carry content: `instructions` and `floor_override` are omitted when nil
-    /// or blank (so an empty override means "use the bridge default" — for the floor,
-    /// the bridge's built-in floor, which it never drops), matching the bridge's
-    /// `#[serde(default)]` shape so omitting a field reproduces today's behavior.
-    static func requestBody(mode: JesseMode, text: String, sessionId: String?,
+    /// Build the `POST /jesse` request. "Use the bridge default" collapses to a nil
+    /// field that drops out of the encoded body: `voice == false`, a blank
+    /// `instructions`/`floorOverride`, and an empty `attachments` all become nil. The
+    /// floor's nil means the bridge keeps its built-in floor, which it never drops.
+    static func makeRequest(mode: JesseMode, text: String, sessionId: String?,
                             voice: Bool, instructions: String?,
                             floorOverride: String?,
-                            attachments: [JesseAttachment]) -> [String: Any] {
-        var body: [String: Any] = ["mode": mode.rawValue, "text": text]
-        if let sessionId { body["session_id"] = sessionId }
-        if voice { body["voice"] = true }
-        if let instructions,
-           !instructions.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-            body["instructions"] = instructions
+                            attachments: [JesseAttachment]) -> JesseRequest {
+        func nonBlank(_ s: String?) -> String? {
+            guard let s, !s.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return nil }
+            return s
         }
-        if let floorOverride,
-           !floorOverride.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-            body["floor_override"] = floorOverride
-        }
-        if !attachments.isEmpty {
-            // Base64-in-JSON: matches the existing JSONSerialization path. The
-            // bridge re-validates type and size; these are sent as-is.
-            body["attachments"] = attachments.map { a in
-                [
-                    "filename": a.filename,
-                    "mime": a.mime,
-                    "data_base64": a.data.base64EncodedString(),
-                ]
-            }
-        }
-        return body
+        return JesseRequest(
+            mode: mode.rawValue,
+            text: text,
+            sessionId: sessionId,
+            voice: voice ? true : nil,
+            instructions: nonBlank(instructions),
+            floorOverride: nonBlank(floorOverride),
+            // Base64-in-JSON, re-validated by the bridge for type and size.
+            attachments: attachments.isEmpty ? nil : attachments.map {
+                JesseRequest.Attachment(filename: $0.filename, mime: $0.mime,
+                                        dataBase64: $0.data.base64EncodedString())
+            })
+    }
+
+    /// Encode a wire body. Optional fields omit when nil (synthesized
+    /// `encodeIfPresent`), so the keys present match the old hand-built dictionary
+    /// that conditionally inserted them. `sortedKeys` makes the byte order
+    /// deterministic (so the wire shape can be pinned in a test) and
+    /// `withoutEscapingSlashes` keeps `image/png` and base64 readable; the bridge's
+    /// serde accepts any key order, so the contract is unchanged either way.
+    static func encodeBody<T: Encodable>(_ value: T) throws -> Data {
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
+        return try encoder.encode(value)
     }
 
     static func decodeSend(data: Data, resp: URLResponse) throws -> JesseSendResult {
@@ -751,18 +863,17 @@ struct JesseClient: JesseClientProtocol {
         // 202 = still running; hand back the job id to poll. Checked before the
         // 2xx success branch since 202 is itself a success code.
         if http.statusCode == 202 {
-            guard let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-                  let jobId = obj["job_id"] as? String else { throw JesseError.decoding }
+            guard let obj = try? JSONDecoder().decode(JesseSendResponse.self, from: data),
+                  let jobId = obj.jobId else { throw JesseError.decoding }
             return .running(jobId: jobId)
         }
         guard (200..<300).contains(http.statusCode) else {
             throw JesseError.badResponse(http.statusCode,
                                          String(data: data, encoding: .utf8) ?? "")
         }
-        guard let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let reply = obj["response"] as? String else { throw JesseError.decoding }
-        return .reply(JesseReply(text: reply, sessionId: obj["session_id"] as? String),
-                      jobId: obj["job_id"] as? String)
+        guard let obj = try? JSONDecoder().decode(JesseSendResponse.self, from: data),
+              let reply = obj.response else { throw JesseError.decoding }
+        return .reply(JesseReply(text: reply, sessionId: obj.sessionId), jobId: obj.jobId)
     }
 
     static func decodeResult(data: Data, resp: URLResponse) throws -> JesseResultState {
@@ -777,16 +888,17 @@ struct JesseClient: JesseClientProtocol {
             throw JesseError.badResponse(http.statusCode,
                                          String(data: data, encoding: .utf8) ?? "")
         }
-        guard let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let status = obj["status"] as? String else { throw JesseError.decoding }
-        switch status {
+        guard let obj = try? JSONDecoder().decode(JesseResultResponse.self, from: data) else {
+            throw JesseError.decoding
+        }
+        switch obj.status {
         case "running":
             return .running
         case "done":
-            guard let text = obj["response"] as? String else { throw JesseError.decoding }
-            return .done(JesseReply(text: text, sessionId: obj["session_id"] as? String))
+            guard let text = obj.response else { throw JesseError.decoding }
+            return .done(JesseReply(text: text, sessionId: obj.sessionId))
         case "failed":
-            return .failed(obj["error"] as? String ?? "Jesse couldn't complete that.")
+            return .failed(obj.error ?? "Jesse couldn't complete that.")
         case "cancelled":
             // The bridge's terminal state for a cancelled turn. A clean status, not
             // a failure — mirrors the stream's `cancelled` frame (decodeStreamFrame).
@@ -806,14 +918,11 @@ struct JesseClient: JesseClientProtocol {
         }
         // All four keys are required: a bridge too old to expose the fixed floors
         // can't enforce them, so fail rather than silently show none.
-        guard let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let ask = obj["ask"] as? String, let tell = obj["tell"] as? String,
-              let askFloor = obj["ask_floor"] as? String,
-              let tellFloor = obj["tell_floor"] as? String else {
+        guard let obj = try? JSONDecoder().decode(JessePromptsResponse.self, from: data) else {
             throw JesseError.decoding
         }
-        return PromptDefaults(ask: ask, tell: tell,
-                              askFloor: askFloor, tellFloor: tellFloor)
+        return PromptDefaults(ask: obj.ask, tell: obj.tell,
+                              askFloor: obj.askFloor, tellFloor: obj.tellFloor)
     }
 }
 
@@ -822,10 +931,14 @@ struct JesseClient: JesseClientProtocol {
 enum ConfigStore {
     private static let service = "com.tag1.jesse"
 
-    /// Seam for the Keychain add so a test can force an `OSStatus` failure without a
-    /// real Keychain (the test bundle often lacks Keychain entitlements). Production
-    /// uses `SecItemAdd` directly.
+    /// Seams for the three Keychain primitives so a test can force an `OSStatus` or
+    /// supply an in-memory backend without a real Keychain (the test bundle often
+    /// lacks Keychain entitlements). Production uses the `SecItem*` functions
+    /// directly. `addItem` and `copyItem` take the same (query, result) shape as
+    /// `SecItemAdd`/`SecItemCopyMatching`; `deleteItem` mirrors `SecItemDelete`.
     nonisolated(unsafe) static var addItem: (CFDictionary, UnsafeMutablePointer<CFTypeRef?>?) -> OSStatus = SecItemAdd
+    nonisolated(unsafe) static var copyItem: (CFDictionary, UnsafeMutablePointer<CFTypeRef?>?) -> OSStatus = SecItemCopyMatching
+    nonisolated(unsafe) static var deleteItem: (CFDictionary) -> OSStatus = SecItemDelete
 
     static func load() -> JesseConfig {
         JesseConfig(
@@ -855,7 +968,7 @@ enum ConfigStore {
             kSecMatchLimit as String: kSecMatchLimitOne,
         ]
         var item: CFTypeRef?
-        guard SecItemCopyMatching(q as CFDictionary, &item) == errSecSuccess,
+        guard copyItem(q as CFDictionary, &item) == errSecSuccess,
               let data = item as? Data else { return nil }
         return String(data: data, encoding: .utf8)
     }
@@ -867,7 +980,7 @@ enum ConfigStore {
             kSecAttrService as String: service,
             kSecAttrAccount as String: key,
         ]
-        SecItemDelete(base as CFDictionary)
+        _ = deleteItem(base as CFDictionary)
         var add = base
         add[kSecValueData as String] = value.data(using: .utf8)
         let status = addItem(add as CFDictionary, nil)

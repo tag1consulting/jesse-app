@@ -141,12 +141,13 @@ final class ThreadHistoryTests: XCTestCase {
             a: InFlightJob(jobId: "job-a", voice: true),
             b: InFlightJob(jobId: "job-b", voice: false),
         ]
-        InFlightStore.save(map)
-        let loaded = InFlightStore.load()
+        let store = InFlightStore()
+        store.save(map)
+        let loaded = store.load()
         XCTAssertEqual(loaded[a], InFlightJob(jobId: "job-a", voice: true))
         XCTAssertEqual(loaded[b], InFlightJob(jobId: "job-b", voice: false))
-        InFlightStore.save([:]) // clean up shared defaults
-        XCTAssertTrue(InFlightStore.load().isEmpty)
+        store.save([:]) // clean up shared defaults
+        XCTAssertTrue(store.load().isEmpty)
     }
 
     // MARK: - Coordinator behavior

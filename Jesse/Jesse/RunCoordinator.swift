@@ -16,13 +16,26 @@ struct InFlightJob: Codable, Equatable {
     let voice: Bool
 }
 
+/// Reads and writes the persisted `inFlight` map. Pulled behind a protocol so the
+/// coordinator's persistence is a single injectable seam (a test can supply its own
+/// `UserDefaults` suite or an in-memory backend instead of touching the shared
+/// store), matching how the client/config/save seams are already injected.
+protocol InFlightStoring {
+    func load() -> [UUID: InFlightJob]
+    func save(_ map: [UUID: InFlightJob])
+}
+
 /// Persists `inFlight` across suspension. Small and keyed by thread id, in
 /// UserDefaults — the bits needed to present a reply that landed while we were away.
-enum InFlightStore {
+/// The backing `UserDefaults` is injectable; production uses `.standard`.
+struct InFlightStore: InFlightStoring {
     private static let key = "jesse.inflight.v1"
+    private let defaults: UserDefaults
 
-    static func load() -> [UUID: InFlightJob] {
-        guard let data = UserDefaults.standard.data(forKey: key),
+    init(defaults: UserDefaults = .standard) { self.defaults = defaults }
+
+    func load() -> [UUID: InFlightJob] {
+        guard let data = defaults.data(forKey: Self.key),
               let raw = try? JSONDecoder().decode([String: InFlightJob].self, from: data)
         else { return [:] }
         var out: [UUID: InFlightJob] = [:]
@@ -32,10 +45,10 @@ enum InFlightStore {
         return out
     }
 
-    static func save(_ map: [UUID: InFlightJob]) {
+    func save(_ map: [UUID: InFlightJob]) {
         let raw = Dictionary(uniqueKeysWithValues: map.map { ($0.key.uuidString, $0.value) })
         if let data = try? JSONEncoder().encode(raw) {
-            UserDefaults.standard.set(data, forKey: key)
+            defaults.set(data, forKey: Self.key)
         }
     }
 }
@@ -59,10 +72,10 @@ final class RunCoordinator {
 
     // Not observed by views — just lifecycle bookkeeping.
     @ObservationIgnored private var tasks: [UUID: Task<Void, Never>] = [:]
-    // threadID → the granted background-task handle. A box (not a raw id) so the
-    // expiration handler can end the exact id it was granted even if it fires
-    // before the store below — see `BackgroundTasking`.
-    @ObservationIgnored private var backgroundIDs: [UUID: BackgroundTaskHandle] = [:]
+    // Owns the per-thread background-task assertions (begin/end bookkeeping and the
+    // expiration-before-store race fixed in M7). Holds the handle dict that used to
+    // live here directly.
+    @ObservationIgnored private let backgroundGuard: BackgroundTaskGuard
 
     private let configProvider: @MainActor () -> JesseConfig
     private let makeClient: @MainActor (JesseConfig) -> any JesseClientProtocol
@@ -81,13 +94,17 @@ final class RunCoordinator {
     // injected so a test can force a save failure deterministically. Used by the
     // optimistic user-turn save and by `finish`.
     private let save: @MainActor (ModelContext) throws -> Void
-    // Background-task seam. Defaults to the real `UIApplication`-backed tasker;
-    // injected so a test can drive the expiration-before-store race.
-    private let backgroundTasker: BackgroundTasking
     // How the poll loop waits between polls. Defaults to a real `Task.sleep`;
     // injected so a test can drive the backoff sequence deterministically without
     // real waiting.
     private let pollSleep: @MainActor (TimeInterval) async -> Void
+    // Persists the in-flight job map across suspension. Injectable so a test can
+    // avoid the shared UserDefaults store.
+    private let inFlightStore: InFlightStoring
+    // Owns `finish`'s SwiftData append + save + idempotency-on-jobId. Shares the
+    // injected `save` seam so a test's save spy counts both the optimistic
+    // user-turn save and the completion save.
+    private let turnWriter: TurnWriter
 
     // threadID → a counter bumped on each stream reset/delta. The poll loop watches
     // it to snap its backoff back to the fast cadence while the stream is actively
@@ -107,17 +124,24 @@ final class RunCoordinator {
          save: @escaping @MainActor (ModelContext) throws -> Void = { try $0.save() },
          backgroundTasker: BackgroundTasking = UIKitBackgroundTasking(),
          pollSleep: @escaping @MainActor (TimeInterval) async -> Void = { try? await Task.sleep(for: .seconds($0)) },
+         inFlightStore: InFlightStoring? = nil,
          onFirstSuccess: @escaping @MainActor () -> Void = {}) {
+        // Resolve the default on the main actor (in the init body), not in the
+        // default argument — a default arg is evaluated off the actor and the
+        // store's init is main-actor-isolated under MainActor-default isolation.
+        let resolvedInFlightStore = inFlightStore ?? InFlightStore()
         self.configProvider = config
         self.makeClient = makeClient
         self.instructionsProvider = instructions
         self.floorProvider = floor
         self.speak = speak
         self.save = save
-        self.backgroundTasker = backgroundTasker
+        self.turnWriter = TurnWriter(save: save)
+        self.backgroundGuard = BackgroundTaskGuard(tasker: backgroundTasker)
         self.pollSleep = pollSleep
+        self.inFlightStore = resolvedInFlightStore
         self.onFirstSuccess = onFirstSuccess
-        self.inFlight = InFlightStore.load()
+        self.inFlight = resolvedInFlightStore.load()
     }
 
     // MARK: - Poll cadence (H6)
@@ -188,7 +212,7 @@ final class RunCoordinator {
         // leave a stale job that Re-check or resume could re-attach to.
         if inFlight[threadID] != nil {
             inFlight[threadID] = nil
-            InFlightStore.save(inFlight)
+            inFlightStore.save(inFlight)
         }
 
         // A new thread isn't in the store until its first send — insert it now so
@@ -234,14 +258,9 @@ final class RunCoordinator {
         startDates[threadID] = Date()
 
         // A background grant lets a short turn finish after the app is backgrounded;
-        // longer turns are re-attached on foreground via `resume`. The expiration
-        // handler ends the id via the captured `handle`, so even if it fires before
-        // the dict store below, the granted assertion is always released (M7).
-        let handle = BackgroundTaskHandle()
-        backgroundTasker.beginTask(name: "jesse.turn", handle: handle) { [weak self] in
-            self?.endBackground(threadID, handle: handle)
-        }
-        backgroundIDs[threadID] = handle
+        // longer turns are re-attached on foreground via `resume`. The guard owns
+        // the begin/end bookkeeping and the expiration-before-store race (M7).
+        backgroundGuard.begin(threadID, name: "jesse.turn")
 
         tasks[threadID] = Task { [weak self] in
             guard let self else { return }
@@ -295,7 +314,7 @@ final class RunCoordinator {
                 self.fail(threadID: threadID, message: error.localizedDescription, voice: voice)
             }
             self.tasks[threadID] = nil
-            self.endBackground(threadID)
+            self.backgroundGuard.end(threadID)
         }
     }
 
@@ -369,7 +388,7 @@ final class RunCoordinator {
             await self.consume(threadID: threadID, thread: nil, jobId: job.jobId,
                                voice: job.voice, client: client, context: context)
             self.tasks[threadID] = nil
-            self.endBackground(threadID)
+            self.backgroundGuard.end(threadID)
         }
     }
 
@@ -574,116 +593,69 @@ final class RunCoordinator {
     /// `jesse` Turn, persisted — its content is the screen text, or, for a
     /// spoken-only reply, the spoken line) or surfaces a recoverable error +
     /// Re-check — it is never allowed to `clearRun` into nothing, and it never both
-    /// "shows empty" and "stays silent." The ways the old `finish` could silently
-    /// lose a reply are each now a visible, recoverable state:
-    ///   1. the thread can't be resolved (the by-id re-fetch returns nil),
-    ///   2. the reply is *genuinely* empty (both screen and spoken text empty),
-    ///   3. `context.save()` throws.
-    /// A reply whose content lives only in the `SPOKEN:` line (empty `displayText`,
-    /// non-empty `spokenText`) is a real reply — recorded as a turn and spoken —
-    /// not a silent drop.
+    /// "shows empty" and "stays silent."
     ///
-    /// Delivery is idempotent on `jobId`: a re-entry of `finish` for a job whose
-    /// reply this thread already received (Re-check / resume re-polling a completed
-    /// job after a save failure retained `inFlight`) does NOT append a second turn —
-    /// it only retries the persist and clears the run. See `lastDeliveredJobId`.
+    /// The SwiftData append + save + idempotency-on-`jobId` are owned by
+    /// `TurnWriter`; this method maps the writer's `Outcome` to the run-state it
+    /// owns (the spinner, the error banner, the spoken reply, the push prompt). The
+    /// three ways the old `finish` could silently lose a reply are each a distinct
+    /// `Outcome` that surfaces a visible, recoverable state here.
     ///
     /// `thread` is the live reference the send path holds — preferred so the common
     /// case never re-fetches. It's `nil` only on the resume/recheck path (after a
-    /// relaunch), where we fall back to a by-id fetch. `jobId` is the bridge job
-    /// whose reply this is (`nil` only on the dead inline `.reply` path, which has
-    /// no id to key on).
+    /// relaunch), where the writer falls back to a by-id fetch. `jobId` is the bridge
+    /// job whose reply this is (`nil` only on the dead inline `.reply` path).
     // Private so callers can't bypass `send()` (which owns the optimistic turn,
     // persistence, and the stream/poll race). `consume` and the dead inline
     // `.reply` path are the only callers, both inside this type.
     private func finish(threadID: UUID, thread: JesseThread?, reply: JesseReply,
                         voice: Bool, jobId: String?, context: ModelContext) {
-        // (1) Resolve the destination. Prefer the held reference; fall back to a
-        // by-id fetch only when there isn't one (resume/recheck). If neither
-        // resolves, keep the job retained and surface Re-check — do NOT drop it.
-        guard let target = thread ?? fetchThread(threadID, context: context) else {
-            Log.run.error("finish: reply for thread \(threadID) has no resolvable thread " +
-                  "(re-fetch returned nil) — retaining job_id for Re-check, not dropping the reply")
+        switch turnWriter.write(threadID: threadID, thread: thread, reply: reply,
+                                jobId: jobId, context: context) {
+        case .unresolvableThread:
+            // The reply has nowhere visible to land — keep the job for Re-check.
             failRecoverable(threadID: threadID,
                             message: "Got the reply but couldn't attach it to this thread — tap Re-check.",
                             voice: voice)
-            return
-        }
-
-        // (2) Idempotency: this exact job's reply was already delivered into this
-        // thread (a Re-check / resume re-ran `finish` for a completed job whose
-        // save had failed). Do NOT append again — just finish the bookkeeping:
-        // retry the persist (so a previously-failed save can now succeed), clear
-        // the error, and clear the run. A still-failing retry leaves the recoverable
-        // error + retained job intact, still without a duplicate.
-        if let jobId, target.lastDeliveredJobId == jobId {
-            Log.run.notice("finish: job \(jobId) already delivered to thread \(threadID) — " +
-                  "retrying the save only, not re-appending")
-            do {
-                try save(context)
-            } catch {
-                Log.run.error("finish: retry save() failed for thread \(threadID): \(error.localizedDescription) — " +
-                      "still retaining job_id for Re-check")
-                errors[threadID] = "Showed the reply, but couldn't save it — tap Re-check."
-                startDates[threadID] = nil
-                partialText[threadID] = nil
-                activity[threadID] = nil
-                return
-            }
-            errors[threadID] = nil
-            clearRun(threadID)
-            return
-        }
-
-        // (3) Decide what to record. Prefer the screen text; when it's empty, fall
-        // back to the spoken line — a spoken-only reply's content lives there and
-        // must not be lost. Only when BOTH are empty is the reply genuinely empty,
-        // and we surface Re-check instead of appending a blank turn.
-        let displayText = reply.displayText
-        let recordedText: String
-        if !displayText.isEmpty {
-            recordedText = displayText
-        } else if !reply.spokenText.isEmpty {
-            recordedText = reply.spokenText
-        } else {
-            Log.run.error("finish: genuinely empty reply for thread \(threadID) " +
-                  "(no screen text, no spoken text) — surfacing Re-check rather than a blank turn")
+        case .empty:
+            // Genuinely empty — surface Re-check rather than a blank turn.
             failRecoverable(threadID: threadID,
                             message: "Jesse's reply came back empty — tap Re-check to fetch it again.",
                             voice: voice)
-            return
+        case .alreadyDelivered(let saved):
+            // Idempotent re-entry: never speak again. Clear on a successful retry;
+            // otherwise keep the recoverable save error + retained job.
+            if saved {
+                errors[threadID] = nil
+                clearRun(threadID)
+            } else {
+                surfaceSaveFailure(threadID)
+            }
+        case .delivered(let saved):
+            if saved {
+                if voice { speak(reply.spokenText) }
+                // A turn just landed successfully — the moment to ask for push
+                // permission (idempotent; PushManager prompts once, when configured).
+                onFirstSuccess()
+                clearRun(threadID)
+            } else {
+                // The in-memory turn already shows; surface the save failure (keeping
+                // the job for Re-check) and still speak the reply that was shown.
+                surfaceSaveFailure(threadID)
+                if voice { speak(reply.spokenText) }
+            }
         }
+    }
 
-        let turn = Turn(role: .jesse, text: recordedText)
-        target.turns.append(turn)
-        target.sessionId = reply.sessionId ?? target.sessionId
-        target.updatedAt = Date()
-        if let jobId { target.lastDeliveredJobId = jobId }
-
-        // (4) Real error handling, not `try?`. The in-memory append above already
-        // shows the reply; on a save failure, log it and surface a recoverable
-        // error (keeping the job for Re-check) so the failure isn't swallowed. The
-        // in-memory turn + idempotency key persist on the live object, so a
-        // same-session Re-check sees the key match (step 2) and retries the save
-        // without re-appending.
-        do {
-            try save(context)
-        } catch {
-            Log.run.error("finish: context.save() failed for thread \(threadID): \(error.localizedDescription) — " +
-                  "reply is shown but unsaved; retaining job_id for Re-check")
-            errors[threadID] = "Showed the reply, but couldn't save it — tap Re-check."
-            startDates[threadID] = nil
-            partialText[threadID] = nil
-            activity[threadID] = nil
-            if voice { speak(reply.spokenText) }
-            return
-        }
-
-        if voice { speak(reply.spokenText) }
-        // A turn just landed successfully — the moment to ask for push permission
-        // (idempotent; PushManager only prompts once and only when configured).
-        onFirstSuccess()
-        clearRun(threadID)
+    /// A save failure after the in-memory reply is already shown: surface the
+    /// recoverable error and stop the active run, but KEEP the retained job for
+    /// Re-check (the in-memory append + idempotency key persist on the live object,
+    /// so a same-session Re-check retries the save without re-appending).
+    private func surfaceSaveFailure(_ threadID: UUID) {
+        errors[threadID] = "Showed the reply, but couldn't save it — tap Re-check."
+        startDates[threadID] = nil
+        partialText[threadID] = nil
+        activity[threadID] = nil
     }
 
     // MARK: - Push hooks
@@ -744,7 +716,7 @@ final class RunCoordinator {
 
     private func persist(threadID: UUID, job: InFlightJob) {
         inFlight[threadID] = job
-        InFlightStore.save(inFlight)
+        inFlightStore.save(inFlight)
     }
 
     /// Clear all transient + persisted run state for a thread, including any live
@@ -755,27 +727,8 @@ final class RunCoordinator {
         activity[threadID] = nil
         if inFlight[threadID] != nil {
             inFlight[threadID] = nil
-            InFlightStore.save(inFlight)
+            inFlightStore.save(inFlight)
         }
     }
 
-    /// End a thread's background grant. The expiration handler passes the captured
-    /// `handle` directly, so the granted id is ended even if expiration fires before
-    /// `send` stored the handle in `backgroundIDs` (M7). Other callers (the task
-    /// tails) pass no handle and fall back to the stored one. Ending sets the id to
-    /// `.invalid`, so a later call for the same thread is a harmless no-op — the
-    /// grant is released exactly once.
-    private func endBackground(_ threadID: UUID, handle: BackgroundTaskHandle? = nil) {
-        if let h = handle ?? backgroundIDs[threadID], h.id != .invalid {
-            backgroundTasker.endTask(h.id)
-            h.id = .invalid
-        }
-        backgroundIDs[threadID] = nil
-    }
-
-    private func fetchThread(_ id: UUID, context: ModelContext) -> JesseThread? {
-        var descriptor = FetchDescriptor<JesseThread>(predicate: #Predicate { $0.id == id })
-        descriptor.fetchLimit = 1
-        return (try? context.fetch(descriptor))?.first
-    }
 }

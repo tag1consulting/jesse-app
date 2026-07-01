@@ -8,65 +8,65 @@ import SwiftData
 /// resolved override into `send` (including on a voice turn).
 final class PromptOverrideTests: XCTestCase {
 
-    // MARK: - requestBody (POST /jesse shape)
+    // MARK: - makeRequest (POST /jesse shape — Codable)
 
-    func testRequestBodyIncludesInstructionsWhenCustomized() {
-        let b = JesseClient.requestBody(mode: .ask, text: "hi", sessionId: nil,
+    func testRequestIncludesInstructionsWhenCustomized() {
+        let r = JesseClient.makeRequest(mode: .ask, text: "hi", sessionId: nil,
                                         voice: false, instructions: "CUSTOM WRAP",
                                         floorOverride: nil, attachments: [])
-        XCTAssertEqual(b["instructions"] as? String, "CUSTOM WRAP")
+        XCTAssertEqual(r.instructions, "CUSTOM WRAP")
     }
 
-    func testRequestBodyOmitsInstructionsWhenNil() {
-        let b = JesseClient.requestBody(mode: .ask, text: "hi", sessionId: nil,
+    func testRequestOmitsInstructionsWhenNil() {
+        let r = JesseClient.makeRequest(mode: .ask, text: "hi", sessionId: nil,
                                         voice: false, instructions: nil,
                                         floorOverride: nil, attachments: [])
-        XCTAssertNil(b["instructions"], "an absent override must omit the field")
+        XCTAssertNil(r.instructions, "an absent override must omit the field")
         // Byte-compat: an ordinary turn carries only mode + text.
-        XCTAssertEqual(b["mode"] as? String, "ask")
-        XCTAssertEqual(b["text"] as? String, "hi")
-        XCTAssertNil(b["voice"])
+        XCTAssertEqual(r.mode, "ask")
+        XCTAssertEqual(r.text, "hi")
+        XCTAssertNil(r.voice)
     }
 
-    func testRequestBodyOmitsBlankInstructions() {
-        let b = JesseClient.requestBody(mode: .tell, text: "hi", sessionId: nil,
+    func testRequestOmitsBlankInstructions() {
+        let r = JesseClient.makeRequest(mode: .tell, text: "hi", sessionId: nil,
                                         voice: false, instructions: "   \n\t",
                                         floorOverride: nil, attachments: [])
-        XCTAssertNil(b["instructions"], "a blank override means use the default → omit")
+        XCTAssertNil(r.instructions, "a blank override means use the default → omit")
     }
 
-    func testRequestBodyVoiceAndOverrideCoexist() {
-        let b = JesseClient.requestBody(mode: .ask, text: "hi", sessionId: nil,
+    func testRequestVoiceAndOverrideCoexist() {
+        let r = JesseClient.makeRequest(mode: .ask, text: "hi", sessionId: nil,
                                         voice: true, instructions: "VOICE WRAP",
                                         floorOverride: nil, attachments: [])
-        XCTAssertEqual(b["voice"] as? Bool, true)
-        XCTAssertEqual(b["instructions"] as? String, "VOICE WRAP")
+        XCTAssertEqual(r.voice, true)
+        XCTAssertEqual(r.instructions, "VOICE WRAP")
     }
 
-    func testRequestBodyIncludesFloorOverrideWhenSet() {
-        let b = JesseClient.requestBody(mode: .ask, text: "hi", sessionId: nil,
+    func testRequestIncludesFloorOverrideWhenSet() {
+        let r = JesseClient.makeRequest(mode: .ask, text: "hi", sessionId: nil,
                                         voice: false, instructions: nil,
                                         floorOverride: "CUSTOM FLOOR", attachments: [])
-        XCTAssertEqual(b["floor_override"] as? String, "CUSTOM FLOOR")
+        XCTAssertEqual(r.floorOverride, "CUSTOM FLOOR")
     }
 
-    func testRequestBodyOmitsFloorOverrideWhenNilOrBlank() {
-        let nilCase = JesseClient.requestBody(mode: .ask, text: "hi", sessionId: nil,
+    func testRequestOmitsFloorOverrideWhenNilOrBlank() {
+        let nilCase = JesseClient.makeRequest(mode: .ask, text: "hi", sessionId: nil,
                                               voice: false, instructions: nil,
                                               floorOverride: nil, attachments: [])
-        XCTAssertNil(nilCase["floor_override"], "an absent floor override must omit the field")
-        let blankCase = JesseClient.requestBody(mode: .ask, text: "hi", sessionId: nil,
+        XCTAssertNil(nilCase.floorOverride, "an absent floor override must omit the field")
+        let blankCase = JesseClient.makeRequest(mode: .ask, text: "hi", sessionId: nil,
                                                 voice: false, instructions: nil,
                                                 floorOverride: "  \n\t", attachments: [])
-        XCTAssertNil(blankCase["floor_override"], "a blank floor override means use the default → omit")
+        XCTAssertNil(blankCase.floorOverride, "a blank floor override means use the default → omit")
     }
 
-    func testRequestBodyFloorOverrideDoesNotDropInstructions() {
-        let b = JesseClient.requestBody(mode: .tell, text: "hi", sessionId: nil,
+    func testRequestFloorOverrideDoesNotDropInstructions() {
+        let r = JesseClient.makeRequest(mode: .tell, text: "hi", sessionId: nil,
                                         voice: false, instructions: "WRAP",
                                         floorOverride: "FLOOR", attachments: [])
-        XCTAssertEqual(b["instructions"] as? String, "WRAP")
-        XCTAssertEqual(b["floor_override"] as? String, "FLOOR")
+        XCTAssertEqual(r.instructions, "WRAP")
+        XCTAssertEqual(r.floorOverride, "FLOOR")
     }
 
     // MARK: - decodePrompts (GET /jesse/prompts)

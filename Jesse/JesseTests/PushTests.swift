@@ -71,7 +71,7 @@ final class PushTests: XCTestCase {
         // Clear any in-flight jobs other tests persisted to the shared
         // UserDefaults store, so a coordinator built here starts clean (the
         // background-notify test iterates every in-flight job).
-        InFlightStore.save([:])
+        InFlightStore().save([:])
     }
 
     // MARK: - isConfigured

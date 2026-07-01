@@ -30,6 +30,51 @@ protocol BackgroundTasking: AnyObject {
     func endTask(_ id: UIBackgroundTaskIdentifier)
 }
 
+/// Owns the per-thread background-task assertions for `RunCoordinator`: begins a
+/// grant for a thread's turn and ends it exactly once — even when the expiration
+/// handler fires before the grant is recorded (M7). Extracted from the coordinator
+/// so the bookkeeping (the handle box, the per-thread dict, and the "release
+/// exactly once" rule) lives in one testable place instead of being smeared across
+/// the coordinator's `send`/task-tail/`endBackground` paths.
+@MainActor
+final class BackgroundTaskGuard {
+    private let tasker: BackgroundTasking
+    // threadID → the granted handle box. A box (not a raw id) so the expiration
+    // handler can end the exact id it was granted even if it fires before `begin`
+    // records it here — see `BackgroundTaskHandle`.
+    private var handles: [UUID: BackgroundTaskHandle] = [:]
+
+    init(tasker: BackgroundTasking = UIKitBackgroundTasking()) {
+        self.tasker = tasker
+    }
+
+    /// Begin a background grant for `threadID`'s turn. A grant lets a short turn
+    /// finish after the app is backgrounded; longer turns re-attach on foreground.
+    /// The expiration handler ends the id via the captured `handle`, so even if it
+    /// fires before this stores the handle below, the granted assertion is always
+    /// released (M7).
+    func begin(_ threadID: UUID, name: String) {
+        let handle = BackgroundTaskHandle()
+        tasker.beginTask(name: name, handle: handle) { [weak self] in
+            self?.end(threadID, handle: handle)
+        }
+        handles[threadID] = handle
+    }
+
+    /// End a thread's background grant. The expiration handler passes the captured
+    /// `handle` directly, so the granted id is ended even if expiration fired before
+    /// `begin` stored it. Other callers (the task tails) pass no handle and fall
+    /// back to the stored one. Ending sets the id to `.invalid`, so a later call for
+    /// the same thread is a harmless no-op — the grant is released exactly once.
+    func end(_ threadID: UUID, handle: BackgroundTaskHandle? = nil) {
+        if let h = handle ?? handles[threadID], h.id != .invalid {
+            tasker.endTask(h.id)
+            h.id = .invalid
+        }
+        handles[threadID] = nil
+    }
+}
+
 /// Production conformer backed by the shared `UIApplication`.
 final class UIKitBackgroundTasking: BackgroundTasking {
     // Nonisolated so it can be used as a default argument of `RunCoordinator.init`

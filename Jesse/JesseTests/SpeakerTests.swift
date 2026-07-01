@@ -20,16 +20,61 @@ final class SpeakerTests: XCTestCase {
         func deactivate() throws {}
     }
 
+    /// Records what was handed to the synthesizer, so delivery can be asserted
+    /// without a real `AVSpeechSynthesizer`.
+    private final class SpySynth: SpeechSynthesizing {
+        var onFinish: (() -> Void)?
+        var spoken: [String] = []
+        var stopCount = 0
+        func speak(_ text: String) { spoken.append(text) }
+        func stop() { stopCount += 1 }
+    }
+
+    // MARK: - The failure path (Prompt 1)
+
     func testSessionActivationFailureIsSurfacedNotSwallowed() {
-        let speaker = Speaker(session: FailingSession())
+        let speaker = Speaker(session: FailingSession(), synth: SpySynth())
         speaker.speak("hello")
         XCTAssertNotNil(speaker.lastSessionError,
                         "an audio-session configuration failure must be surfaced, not swallowed")
     }
 
     func testSessionActivationSuccessRecordsNoError() {
-        let speaker = Speaker(session: OKSession())
+        let speaker = Speaker(session: OKSession(), synth: SpySynth())
         speaker.speak("hello")
         XCTAssertNil(speaker.lastSessionError, "a successful session config records no error")
+    }
+
+    // MARK: - Delivery
+
+    func testSpeakDeliversTrimmedTextToSynth() {
+        let spy = SpySynth()
+        Speaker(session: OKSession(), synth: spy).speak("  hello there  ")
+        XCTAssertEqual(spy.spoken, ["hello there"], "the trimmed text is handed to the synthesizer")
+    }
+
+    func testEmptyOrWhitespaceTextSpeaksNothing() {
+        let spy = SpySynth()
+        let speaker = Speaker(session: OKSession(), synth: spy)
+        speaker.speak("")
+        speaker.speak("   \n\t ")
+        XCTAssertEqual(spy.spoken, [], "an empty/whitespace reply is never spoken")
+    }
+
+    /// Delivery is still attempted even when the audio session fails to activate —
+    /// the Prompt-1 fix surfaces the routing error but does NOT drop the voice reply
+    /// (playback can still route to the default output).
+    func testSpeakStillDeliversWhenSessionActivationFails() {
+        let spy = SpySynth()
+        let speaker = Speaker(session: FailingSession(), synth: spy)
+        speaker.speak("important note")
+        XCTAssertNotNil(speaker.lastSessionError, "the routing failure is surfaced")
+        XCTAssertEqual(spy.spoken, ["important note"], "the reply is still spoken despite the session failure")
+    }
+
+    func testStopForwardsToSynth() {
+        let spy = SpySynth()
+        Speaker(session: OKSession(), synth: spy).stop()
+        XCTAssertEqual(spy.stopCount, 1)
     }
 }

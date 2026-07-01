@@ -226,12 +226,64 @@ private func splitTableRow(_ line: String) -> [String] {
         .map { $0.trimmingCharacters(in: .whitespaces) }
 }
 
+/// Coalesces the markdown parse of a *growing* string (a live stream's partial
+/// reply) to ~10 Hz. The naive `MarkdownText(partial)` re-parses the whole string
+/// on every delta, so an N-delta stream parses O(N²) characters. This caps the
+/// parse to at most once per `interval`: between parses it returns the last result,
+/// so frequent deltas are cheap and the expensive `parseMarkdownBlocks` runs ≤10×/s
+/// regardless of delta rate. The newest text always wins — the next tick past the
+/// interval parses whatever the current text is — and the finished turn's persisted
+/// Turn renders the complete text, so nothing is ever shown stale for long.
+@MainActor
+final class MarkdownStreamRenderer {
+    /// ~10 Hz: at most one parse per 100 ms while deltas stream in. Also the
+    /// TimelineView tick interval the streaming view drives this with. `nonisolated`
+    /// so it can seed the init default argument (evaluated off the main actor).
+    nonisolated static let interval: TimeInterval = 0.1
+
+    private let interval: TimeInterval
+    private let parse: @MainActor (String) -> [MarkdownBlock]
+    private var cached: [MarkdownBlock] = []
+    private var cachedSource: String?
+    private var lastParseAt: Date?
+
+    /// `parse` is injectable so a test can count calls; it defaults to the real
+    /// `parseMarkdownBlocks`, resolved in the init body (a non-nil default argument
+    /// would be formed off the main actor under MainActor-default isolation).
+    init(interval: TimeInterval = MarkdownStreamRenderer.interval,
+         parse: (@MainActor (String) -> [MarkdownBlock])? = nil) {
+        self.interval = interval
+        self.parse = parse ?? parseMarkdownBlocks
+    }
+
+    /// The blocks to render for `text` at `now`. Re-parses only when the text
+    /// changed AND at least `interval` has elapsed since the last parse; otherwise
+    /// returns the cached blocks unchanged (so the view diff is a no-op and no parse
+    /// runs). Unchanged text never re-parses.
+    func blocks(for text: String, now: Date) -> [MarkdownBlock] {
+        if text == cachedSource { return cached }
+        if let last = lastParseAt, now.timeIntervalSince(last) < interval {
+            return cached
+        }
+        cached = parse(text)
+        cachedSource = text
+        lastParseAt = now
+        return cached
+    }
+}
+
 /// Renders parsed markdown blocks as native SwiftUI views.
 struct MarkdownText: View {
     let blocks: [MarkdownBlock]
 
     init(_ raw: String) {
         self.blocks = parseMarkdownBlocks(raw)
+    }
+
+    /// Render pre-parsed blocks directly — used by the throttled streaming path
+    /// (`MarkdownStreamRenderer`) so the parse isn't re-run inside the view body.
+    init(blocks: [MarkdownBlock]) {
+        self.blocks = blocks
     }
 
     var body: some View {
