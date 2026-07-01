@@ -1,0 +1,865 @@
+//! Integration tests: exercise the real Axum router via
+//! `tower::ServiceExt::oneshot`, no socket bound. These drive the same
+//! `app()` the running server uses.
+#![allow(clippy::collapsible_if)]
+mod common;
+use common::*;
+use jesse_bridge::*;
+use axum::body::Body;
+use axum::http::{Request, StatusCode};
+use serde_json::Value;
+use std::sync::atomic::Ordering;
+use std::sync::Arc;
+use std::time::Duration;
+use tower::ServiceExt;
+
+    #[tokio::test]
+    async fn health_unauthenticated_is_ok_and_leaks_no_paths() {
+        // Liveness only: 200 { "ok": true }, and crucially NONE of the operator
+        // paths (vault / claude binary) to an unauthenticated caller.
+        let st = test_state();
+        let resp = app(st.clone())
+            .oneshot(
+                Request::builder()
+                    .uri("/health")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body: Value = serde_json::from_str(&body_string(resp).await).unwrap();
+        assert_eq!(body["ok"], true);
+        assert!(body.get("vault").is_none(), "vault path must not leak unauthenticated");
+        assert!(body.get("claude").is_none(), "claude path must not leak unauthenticated");
+    }
+
+    #[tokio::test]
+    async fn health_authenticated_returns_paths() {
+        // With the bearer token, the operator detail is surfaced (same info the
+        // old unconditional /health exposed, now gated).
+        let st = test_state();
+        let resp = app(st.clone())
+            .oneshot(
+                Request::builder()
+                    .uri("/health")
+                    .header("authorization", "Bearer test-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body: Value = serde_json::from_str(&body_string(resp).await).unwrap();
+        assert_eq!(body["ok"], true);
+        assert_eq!(body["vault"], st.cfg.vault);
+        assert_eq!(body["claude"], st.cfg.claude_bin);
+    }
+    #[tokio::test]
+    async fn jesse_no_auth_is_401() {
+        let resp = app(test_state())
+            .oneshot(jesse_request(None, r#"{"mode":"ask","text":"hi"}"#))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+    #[tokio::test]
+    async fn jesse_wrong_token_is_401() {
+        let resp = app(test_state())
+            .oneshot(jesse_request(
+                Some("Bearer wrong"),
+                r#"{"mode":"ask","text":"hi"}"#,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+    #[tokio::test]
+    async fn jesse_bad_mode_is_400() {
+        // Correct token, but build_prompt rejects the mode before run_claude.
+        let resp = app(test_state())
+            .oneshot(jesse_request(
+                Some("Bearer test-token"),
+                r#"{"mode":"shout","text":"hi"}"#,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+    #[tokio::test]
+    async fn prompts_requires_auth() {
+        let resp = app(test_state())
+            .oneshot(
+                Request::builder()
+                    .uri("/jesse/prompts")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+    #[tokio::test]
+    async fn prompts_returns_both_built_in_defaults() {
+        let resp = app(test_state())
+            .oneshot(
+                Request::builder()
+                    .uri("/jesse/prompts")
+                    .header("authorization", "Bearer test-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body: Value = serde_json::from_str(&body_string(resp).await).unwrap();
+        // The exact const strings build_prompt applies, so the app's "default"
+        // matches what the bridge would use for a fresh turn.
+        assert_eq!(body["ask"], ASK_PREAMBLE);
+        assert_eq!(body["tell"], TELL_PREAMBLE);
+        // The fixed safety floors are exposed too, so the app can show them read-only.
+        assert_eq!(body["ask_floor"], ASK_FLOOR);
+        assert_eq!(body["tell_floor"], TELL_FLOOR);
+    }
+    #[tokio::test]
+    async fn result_endpoint_returns_persisted_job_after_restart() {
+        // End to end: complete a job under one AppState, then build a fresh
+        // AppState over the same state dir (the restart) and GET its result.
+        let state_parent = std::env::temp_dir().join(format!("jesse-state-{}", random_hex()));
+        let cfg1 = Config {
+            state_dir: Some(state_parent.to_string_lossy().into_owned()),
+            ..test_config()
+        };
+        let st1 = AppState::new(cfg1);
+        let id = st1.jobs.create();
+        st1.jobs
+            .complete(&id, Ok(("survives reboot".to_string(), Some("sess-r".to_string()))));
+        st1.jobs.flush_persistence(); // wait for the off-lock worker to write
+
+        // New AppState over the same dir = the bridge restarting.
+        let cfg2 = Config {
+            state_dir: Some(state_parent.to_string_lossy().into_owned()),
+            ..test_config()
+        };
+        let st2 = AppState::new(cfg2);
+        let resp = app(st2)
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/jesse/result/{id}"))
+                    .header("authorization", "Bearer test-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body: Value = serde_json::from_str(&body_string(resp).await).unwrap();
+        assert_eq!(body["status"], "done");
+        assert_eq!(body["response"], "survives reboot");
+        assert_eq!(body["session_id"], "sess-r");
+
+        let _ = std::fs::remove_dir_all(&state_parent);
+    }
+    #[tokio::test]
+    async fn result_no_auth_is_401() {
+        let resp = app(test_state())
+            .oneshot(
+                Request::builder()
+                    .uri("/jesse/result/whatever")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+    #[tokio::test]
+    async fn result_unknown_id_is_404() {
+        let resp = app(test_state())
+            .oneshot(
+                Request::builder()
+                    .uri("/jesse/result/does-not-exist")
+                    .header("authorization", "Bearer test-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+    #[tokio::test]
+    async fn cancel_no_auth_is_401() {
+        let resp = app(test_state())
+            .oneshot(cancel_request(None, "whatever"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+    #[tokio::test]
+    async fn cancel_wrong_token_is_401() {
+        let resp = app(test_state())
+            .oneshot(cancel_request(Some("Bearer wrong"), "whatever"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+    #[tokio::test]
+    async fn cancel_unknown_id_is_idempotent_204() {
+        // An id the bridge never minted (or already evicted) is a clean no-op —
+        // the phone may cancel after the job is long gone.
+        let resp = app(test_state())
+            .oneshot(cancel_request(Some("Bearer test-token"), "does-not-exist"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    }
+    #[tokio::test]
+    async fn cancel_done_job_succeeds_without_clobbering_result() {
+        // Cancelling an already-finished job must return success but leave the
+        // stored reply intact (the phone can still retrieve it).
+        let st = test_state();
+        let id = st.jobs.create();
+        st.jobs
+            .complete(&id, Ok(("keep me".to_string(), Some("sess-k".to_string()))));
+
+        let resp = app(st.clone())
+            .oneshot(cancel_request(Some("Bearer test-token"), &id))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+
+        let v = result_status(&st, &id).await;
+        assert_eq!(v["status"], "done");
+        assert_eq!(v["response"], "keep me");
+        assert_eq!(v["session_id"], "sess-k");
+    }
+    #[tokio::test]
+    async fn cancel_running_turn_kills_child_and_frees_slot() {
+        // End to end: a fake claude that sleeps far past the grace window and only
+        // touches its marker at the very end. Start the turn (202), cancel it, and
+        // assert it transitions to `cancelled`, the concurrency slot is freed (the
+        // aborted task drops its permit), and the child never reached its marker.
+        let marker = std::env::temp_dir().join(format!(
+            "jesse-cancel-marker-{}-{}.txt",
+            std::process::id(),
+            JOB_COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_file(&marker);
+        let script = format!(
+            "#!/bin/sh\n\
+             sleep 60\n\
+             touch '{}'\n\
+             printf '%s' '{{\"type\":\"result\",\"is_error\":false,\"result\":\"too late\"}}'\n",
+            marker.display()
+        );
+        let fake = write_fake_claude(&script);
+
+        let cfg = Config {
+            claude_bin: fake.to_string_lossy().into_owned(),
+            max_concurrency: 1,   // a freed slot is observable via available_permits
+            ..test_config()
+        };
+        let st = AppState::new(cfg);
+
+        // Start the long turn — it outruns the 1s grace and hands back a job id.
+        let resp = app(st.clone())
+            .oneshot(jesse_request(
+                Some("Bearer test-token"),
+                r#"{"mode":"ask","text":"cancel me"}"#,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::ACCEPTED);
+        let body: Value = serde_json::from_str(&body_string(resp).await).unwrap();
+        let job_id = body["job_id"].as_str().unwrap().to_string();
+        // The turn holds the only permit while it runs.
+        assert_eq!(st.sem.available_permits(), 0, "running turn holds the permit");
+
+        // Cancel it.
+        let resp = app(st.clone())
+            .oneshot(cancel_request(Some("Bearer test-token"), &job_id))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+
+        // The abort drops the task asynchronously; wait for the permit to come back.
+        let mut freed = false;
+        for _ in 0..50 {
+            if st.sem.available_permits() == 1 {
+                freed = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert!(freed, "aborting the turn must free its concurrency slot");
+
+        // The job reads as cleanly cancelled, and the child never hit its marker.
+        let v = result_status(&st, &job_id).await;
+        assert_eq!(v["status"], "cancelled");
+        assert!(
+            !marker.exists(),
+            "the claude child must be killed before it finished its work"
+        );
+
+        let _ = std::fs::remove_file(&marker);
+        let _ = std::fs::remove_file(&fake);
+    }
+    #[tokio::test]
+    async fn turn_survives_client_disconnect() {
+        let marker = std::env::temp_dir().join(format!(
+            "jesse-marker-{}-{}.txt",
+            std::process::id(),
+            JOB_COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_file(&marker);
+        // Sleeps 2s (past the 1s grace), prints the result envelope, then marks
+        // completion. If the child were killed on disconnect the marker never
+        // appears and the job never reaches Done.
+        let script = format!(
+            "#!/bin/sh\n\
+             sleep 2\n\
+             printf '%s' '{{\"type\":\"result\",\"is_error\":false,\"result\":\"slow ok\",\"session_id\":\"sess-slow\"}}'\n\
+             touch '{}'\n",
+            marker.display()
+        );
+        let fake = write_fake_claude(&script);
+
+        let cfg = Config {
+            claude_bin: fake.to_string_lossy().into_owned(),
+            ..test_config()
+        };
+        let st = AppState::new(cfg);
+
+        // POST — should hit grace expiry and return 202 with a job_id.
+        let resp = app(st.clone())
+            .oneshot(jesse_request(
+                Some("Bearer test-token"),
+                r#"{"mode":"ask","text":"slow one"}"#,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::ACCEPTED);
+        let body: Value = serde_json::from_str(&body_string(resp).await).unwrap();
+        assert_eq!(body["status"], "running");
+        let job_id = body["job_id"].as_str().unwrap().to_string();
+
+        // The POST future is now dropped (client "disconnected"). Poll until the
+        // detached turn completes — it must, despite the dropped connection.
+        let mut done = None;
+        for _ in 0..50 {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            let v = result_status(&st, &job_id).await;
+            if v["status"] == "done" {
+                done = Some(v);
+                break;
+            }
+        }
+        let done = done.expect("turn must complete despite client disconnect");
+        assert_eq!(done["response"], "slow ok");
+        assert_eq!(done["session_id"], "sess-slow");
+        assert!(
+            marker.exists(),
+            "fake claude ran to completion (not killed on disconnect)"
+        );
+
+        let _ = std::fs::remove_file(&marker);
+        let _ = std::fs::remove_file(&fake);
+    }
+    #[tokio::test]
+    async fn streaming_completes_on_result_line_not_child_exit() {
+        // A fake claude that emits a valid stream-json sequence ending in a
+        // `result` line and THEN sleeps without exiting, keeping stdout open. The
+        // turn must reach Done driven by the result line — well under the (short)
+        // run timeout — instead of blocking on the pipe until the timeout fires.
+        //
+        // FAILING-FIRST: against the pre-fix read-to-EOF loop the `sleep` holds
+        // stdout open, so `next_line()` blocks until the 2s timeout converts the
+        // turn into a GATEWAY_TIMEOUT failure — the job is never `done`, so the
+        // assertion below (done within ~1.5s) fails.
+        let script = "#!/bin/sh\n\
+             printf '%s\\n' '{\"type\":\"stream_event\",\"event\":{\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\"answer\"}}}'\n\
+             printf '%s\\n' '{\"type\":\"result\",\"is_error\":false,\"result\":\"the answer\",\"session_id\":\"sess-rl\"}'\n\
+             sleep 600\n";
+        let fake = write_fake_claude(script);
+        let cfg = Config {
+            claude_bin: fake.to_string_lossy().into_owned(),
+            timeout_secs: 2, // short run limit — Done must beat it, not race it
+            ..test_config()
+        };
+        let st = AppState::new(cfg);
+
+        let resp = app(st.clone())
+            .oneshot(jesse_request(
+                Some("Bearer test-token"),
+                r#"{"mode":"ask","text":"answer me"}"#,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::ACCEPTED);
+        let body: Value = serde_json::from_str(&body_string(resp).await).unwrap();
+        let job_id = body["job_id"].as_str().unwrap().to_string();
+
+        // Poll only up to 1.5s — comfortably under the 2s timeout. The turn must
+        // be `done` from the result line by then; if completion still waited on
+        // child exit it would still be `running` here (and fail at 2s).
+        let mut done = None;
+        for _ in 0..30 {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            let v = result_status(&st, &job_id).await;
+            if v["status"] == "done" {
+                done = Some(v);
+                break;
+            }
+        }
+        let done =
+            done.expect("turn must reach done on the result line, not block on child stdout EOF");
+        assert_eq!(done["response"], "the answer");
+        assert_eq!(done["session_id"], "sess-rl");
+
+        let _ = std::fs::remove_file(&fake);
+    }
+    #[tokio::test]
+    async fn streaming_reaps_child_after_result_line() {
+        // The flip side of the fix: after completing on the result line, the
+        // bounded reap must actually kill a child that won't exit on its own, so
+        // the fix doesn't leak a runaway `claude`. The fake records its own pid,
+        // prints the result line, then sleeps far longer than the reap bound.
+        let pidfile = std::env::temp_dir().join(format!(
+            "jesse-reap-pid-{}-{}.txt",
+            std::process::id(),
+            JOB_COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_file(&pidfile);
+        let script = format!(
+            "#!/bin/sh\n\
+             echo $$ > '{}'\n\
+             printf '%s' '{{\"type\":\"result\",\"is_error\":false,\"result\":\"reaped\",\"session_id\":\"sess-reap\"}}'\n\
+             printf '\\n'\n\
+             sleep 600\n",
+            pidfile.display()
+        );
+        let fake = write_fake_claude(&script);
+        let cfg = Config {
+            claude_bin: fake.to_string_lossy().into_owned(),
+            // Generous: this test is about the bounded reap, not about racing the
+            // run limit (that is `streaming_completes_on_result_line`'s job). A
+            // short limit only made it flaky under the concentrated process-
+            // spawning load of the integration binary.
+            timeout_secs: 30,
+            ..test_config()
+        };
+        let st = AppState::new(cfg);
+
+        let resp = app(st.clone())
+            .oneshot(jesse_request(
+                Some("Bearer test-token"),
+                r#"{"mode":"ask","text":"reap me"}"#,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::ACCEPTED);
+        let body: Value = serde_json::from_str(&body_string(resp).await).unwrap();
+        let job_id = body["job_id"].as_str().unwrap().to_string();
+
+        // The turn lands Done on the result line (same as above).
+        let mut done = false;
+        for _ in 0..60 {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            if result_status(&st, &job_id).await["status"] == "done" {
+                done = true;
+                break;
+            }
+        }
+        assert!(done, "turn must reach done on the result line");
+
+        // Read the child's pid (written before it printed the result line).
+        let pid: i32 = {
+            let mut p = None;
+            for _ in 0..20 {
+                if let Ok(s) = std::fs::read_to_string(&pidfile) {
+                    if let Ok(n) = s.trim().parse() {
+                        p = Some(n);
+                        break;
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            p.expect("fake claude must record its pid")
+        };
+
+        // The background reap kills the lingering child within its bound (5s).
+        // Give it that bound plus a margin; the child must be gone, even though
+        // its own `sleep 600` is nowhere near done.
+        let mut reaped = false;
+        for _ in 0..80 {
+            if !pid_alive(pid) {
+                reaped = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert!(
+            reaped,
+            "the lingering claude child must be killed by the bounded reap, not left running"
+        );
+
+        let _ = std::fs::remove_file(&pidfile);
+        let _ = std::fs::remove_file(&fake);
+    }
+    #[tokio::test]
+    async fn stream_no_auth_is_401() {
+        let resp = app(test_state())
+            .oneshot(stream_request(None, "whatever"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+    #[tokio::test]
+    async fn stream_unknown_id_is_404() {
+        let resp = app(test_state())
+            .oneshot(stream_request(Some("Bearer test-token"), "does-not-exist"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+    #[tokio::test]
+    async fn stream_running_turn_emits_deltas_then_done() {
+        // A fake claude that emits two text deltas (with a pause between, so the
+        // turn is still running when the phone subscribes) then a terminal result.
+        let script = "#!/bin/sh\n\
+             printf '%s\\n' '{\"type\":\"stream_event\",\"event\":{\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\"Hello \"}}}'\n\
+             sleep 1\n\
+             printf '%s\\n' '{\"type\":\"stream_event\",\"event\":{\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\"world\"}}}'\n\
+             printf '%s\\n' '{\"type\":\"result\",\"is_error\":false,\"result\":\"Hello world\",\"session_id\":\"sess-1\"}'\n";
+        let fake = write_fake_claude(script);
+        let cfg = Config {
+            claude_bin: fake.to_string_lossy().into_owned(),
+            ..test_config()
+        };
+        let st = AppState::new(cfg);
+
+        let resp = app(st.clone())
+            .oneshot(jesse_request(
+                Some("Bearer test-token"),
+                r#"{"mode":"ask","text":"greet me"}"#,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::ACCEPTED);
+        let body: Value = serde_json::from_str(&body_string(resp).await).unwrap();
+        let job_id = body["job_id"].as_str().unwrap().to_string();
+
+        // Open the stream while the turn runs; collect the whole SSE body (it ends
+        // when the terminal `done` frame closes the stream).
+        let resp = app(st.clone())
+            .oneshot(stream_request(Some("Bearer test-token"), &job_id))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let sse = body_string(resp).await;
+
+        // Live "world" delta arrives over the broadcast (the turn was still
+        // running at subscribe), then the authoritative done frame.
+        assert!(sse.contains("event: delta"), "expected a live delta frame: {sse}");
+        assert!(sse.contains("world"), "delta text missing: {sse}");
+        assert!(sse.contains("event: done"), "expected a terminal done frame: {sse}");
+        assert!(sse.contains("Hello world"), "final response missing: {sse}");
+        assert!(sse.contains("sess-1"), "session id missing: {sse}");
+
+        let _ = std::fs::remove_file(&fake);
+    }
+    #[tokio::test]
+    async fn stream_already_done_replays_full_text_then_done() {
+        // A job that finished before the stream is opened must replay the full
+        // text (a reset frame) and a done frame immediately, then close — no
+        // fake claude needed.
+        let st = test_state();
+        let id = st.jobs.create();
+        st.jobs.complete(
+            &id,
+            Ok(("the whole answer".to_string(), Some("sess-done".to_string()))),
+        );
+
+        let resp = app(st.clone())
+            .oneshot(stream_request(Some("Bearer test-token"), &id))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let sse = body_string(resp).await;
+        assert!(sse.contains("event: reset"), "expected a full-text reset: {sse}");
+        assert!(sse.contains("event: done"), "expected a done frame: {sse}");
+        assert!(sse.contains("the whole answer"), "full text missing: {sse}");
+        assert!(sse.contains("sess-done"), "session id missing: {sse}");
+    }
+    #[tokio::test]
+    async fn stream_cancelled_job_emits_cancelled_frame() {
+        // A cancelled job surfaces a clean `cancelled` terminal frame, not an error.
+        let st = test_state();
+        let id = st.jobs.create();
+        st.jobs.stream_register(&id);
+        assert!(matches!(st.jobs.cancel(&id), CancelOutcome::Cancelled));
+
+        let resp = app(st.clone())
+            .oneshot(stream_request(Some("Bearer test-token"), &id))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let sse = body_string(resp).await;
+        assert!(sse.contains("event: cancelled"), "expected a cancelled frame: {sse}");
+        assert!(!sse.contains("event: error"), "cancel must not look like an error: {sse}");
+    }
+    #[tokio::test]
+    async fn post_returns_202_immediately_even_for_a_fast_turn() {
+        // The grace-hold is gone: POST always returns 202 with the job_id up front,
+        // even when `claude` would finish near-instantly. The reply is fetched via
+        // GET /jesse/result/{job_id}. This is the fix for the orphan bug — the
+        // phone always has the id before any connection drop can matter.
+        let script = "#!/bin/sh\nprintf '%s' '{\"type\":\"result\",\"is_error\":false,\"result\":\"quick\",\"session_id\":\"sess-fast\"}'\n";
+        let fake = write_fake_claude(script);
+        let cfg = Config {
+            claude_bin: fake.to_string_lossy().into_owned(),
+            ..test_config()
+        };
+        let st = AppState::new(cfg);
+
+        let resp = app(st.clone())
+            .oneshot(jesse_request(
+                Some("Bearer test-token"),
+                r#"{"mode":"ask","text":"quick one"}"#,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::ACCEPTED, "POST never holds — always 202");
+        let body: Value = serde_json::from_str(&body_string(resp).await).unwrap();
+        assert_eq!(body["status"], "running");
+        let job_id = body["job_id"].as_str().expect("202 carries a job_id").to_string();
+
+        // The detached turn finishes; the reply is retrievable by id.
+        let mut done = None;
+        for _ in 0..50 {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            let v = result_status(&st, &job_id).await;
+            if v["status"] == "done" {
+                done = Some(v);
+                break;
+            }
+        }
+        let done = done.expect("a fast turn still lands in the job store, fetchable by id");
+        assert_eq!(done["response"], "quick");
+        assert_eq!(done["session_id"], "sess-fast");
+
+        let _ = std::fs::remove_file(&fake);
+    }
+    #[tokio::test]
+    async fn second_concurrent_turn_is_429() {
+        // A fake claude that sleeps long enough that the first turn is still
+        // in-flight (holding the only permit) when the second POST arrives.
+        let script = "#!/bin/sh\nsleep 2\nprintf '%s' '{\"type\":\"result\",\"is_error\":false,\"result\":\"ok\",\"session_id\":\"s\"}'\n";
+        let fake = write_fake_claude(script);
+        let cfg = Config {
+            claude_bin: fake.to_string_lossy().into_owned(),
+            max_concurrency: 1,   // exactly one permit
+            ..test_config()
+        };
+        let st = AppState::new(cfg);
+
+        // First POST: occupies the only permit, returns 202 at grace expiry; the
+        // detached turn keeps the permit while the fake claude sleeps.
+        let first = app(st.clone())
+            .oneshot(jesse_request(
+                Some("Bearer test-token"),
+                r#"{"mode":"ask","text":"one"}"#,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(first.status(), StatusCode::ACCEPTED);
+
+        // Second POST while the first turn still holds the permit → 429.
+        let second = app(st.clone())
+            .oneshot(jesse_request(
+                Some("Bearer test-token"),
+                r#"{"mode":"ask","text":"two"}"#,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(second.status(), StatusCode::TOO_MANY_REQUESTS);
+
+        let _ = std::fs::remove_file(&fake);
+    }
+    #[tokio::test]
+    async fn jesse_rejects_mismatched_attachment_with_400() {
+        let att = attachment_json("image/png", PDF_BYTES); // PDF bytes claimed as PNG
+        let json = format!(r#"{{"mode":"ask","text":"hi","attachments":[{att}]}}"#);
+        let resp = app(test_state())
+            .oneshot(jesse_request(Some("Bearer test-token"), &json))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+    #[tokio::test]
+    async fn jesse_rejects_too_many_attachments_with_400() {
+        let att = attachment_json("image/png", PNG_BYTES);
+        let many = std::iter::repeat_n(att.as_str(), DEFAULT_MAX_ATTACHMENTS + 1)
+            .collect::<Vec<_>>()
+            .join(",");
+        let json = format!(r#"{{"mode":"ask","text":"hi","attachments":[{many}]}}"#);
+        let resp = app(test_state())
+            .oneshot(jesse_request(Some("Bearer test-token"), &json))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+    #[tokio::test]
+    async fn jesse_accepts_instructions_field() {
+        // The override field is #[serde(default)] and optional. A request that
+        // carries it must still deserialize; a bad mode then returns 400, proving
+        // the body (with `instructions`) parsed before build_prompt ran.
+        let resp = app(test_state())
+            .oneshot(jesse_request(
+                Some("Bearer test-token"),
+                r#"{"mode":"nope","text":"hi","instructions":"my custom wrapper"}"#,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+    #[tokio::test]
+    async fn jesse_without_attachments_field_still_works() {
+        // The field is #[serde(default)] — existing clients omit it entirely.
+        // A bad mode still reaches build_prompt and returns 400, proving the
+        // request deserialized fine without `attachments`.
+        let resp = app(test_state())
+            .oneshot(jesse_request(
+                Some("Bearer test-token"),
+                r#"{"mode":"nope","text":"hi"}"#,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+    #[tokio::test]
+    async fn device_register_requires_auth() {
+        let resp = app(test_state())
+            .oneshot(device_request(None, r#"{"token":"deadbeef"}"#))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+    #[tokio::test]
+    async fn device_register_round_trip_stores_token() {
+        let st = test_state();
+        let resp = app(st.clone())
+            .oneshot(device_request(Some("Bearer test-token"), r#"{"token":"deadbeefcafe"}"#))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(st.devices.get().as_deref(), Some("deadbeefcafe"), "token stored");
+
+        // Idempotent upsert: a second register overwrites.
+        let resp = app(st.clone())
+            .oneshot(device_request(Some("Bearer test-token"), r#"{"token":"newtoken99"}"#))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(st.devices.get().as_deref(), Some("newtoken99"));
+    }
+    #[tokio::test]
+    async fn device_register_rejects_empty_token() {
+        let resp = app(test_state())
+            .oneshot(device_request(Some("Bearer test-token"), r#"{"token":"   "}"#))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+    #[tokio::test]
+    async fn notify_requires_auth() {
+        let resp = app(test_state())
+            .oneshot(notify_request(None, "some-job"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+    #[tokio::test]
+    async fn notify_flags_and_returns_204() {
+        let st = test_state();
+        let id = st.jobs.create();
+        let resp = app(st.clone())
+            .oneshot(notify_request(Some("Bearer test-token"), &id))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+        // The flag was recorded (running job → not consumed by the race check).
+        assert!(st.notify.take(&id), "running job keeps its notify flag");
+    }
+    #[tokio::test]
+    async fn notify_endpoint_pushes_when_job_already_done() {
+        // The race: the turn finished before the phone backgrounded and flagged.
+        // The notify endpoint must push immediately rather than lose the signal.
+        let mock = MockApns::default();
+        let mut st = test_state();
+        st.apns = Some(test_apns(Arc::new(mock.clone())));
+        st.devices.set("tok".to_string());
+
+        let id = st.jobs.create();
+        st.jobs.complete(&id, Ok(("already done".to_string(), None)));
+
+        let resp = app(st.clone())
+            .oneshot(notify_request(Some("Bearer test-token"), &id))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+        assert_eq!(
+            mock.calls.lock_ok().len(),
+            1,
+            "flagging an already-finished job pushes immediately"
+        );
+    }
+    #[tokio::test]
+    async fn turn_completes_when_claude_eofs_but_does_not_exit() {
+        // A fake claude that prints a full result line, then sleeps without
+        // exiting (the grandchild-holding-the-pipe shape). The post-read
+        // child.wait()/stderr drain are bounded (H4), so the turn completes and
+        // frees its permit on the already-authoritative result — long before the
+        // child's 60s sleep ends.
+        let script = "#!/bin/sh\n\
+             printf '%s\\n' '{\"type\":\"result\",\"is_error\":false,\"result\":\"done fast\",\"session_id\":\"sess-h4\"}'\n\
+             sleep 60\n";
+        let fake = write_fake_claude(script);
+        let cfg = Config {
+            claude_bin: fake.to_string_lossy().into_owned(),
+            max_concurrency: 1,
+            ..test_config()
+        };
+        let st = AppState::new(cfg);
+
+        let resp = app(st.clone())
+            .oneshot(jesse_request(
+                Some("Bearer test-token"),
+                r#"{"mode":"ask","text":"hi"}"#,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::ACCEPTED);
+        let body: Value = serde_json::from_str(&body_string(resp).await).unwrap();
+        let job_id = body["job_id"].as_str().unwrap().to_string();
+
+        // Within a few seconds (≪ the 60s sleep) the turn is Done and the permit
+        // is back — proof the reap is bounded, not pinned by the lingering child.
+        let mut done = false;
+        for _ in 0..50 {
+            if st.sem.available_permits() == 1 {
+                if result_status(&st, &job_id).await["status"] == "done" {
+                    done = true;
+                    break;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert!(
+            done,
+            "turn must complete and free its permit without waiting for the child to exit"
+        );
+        let v = result_status(&st, &job_id).await;
+        assert_eq!(v["response"], "done fast");
+        let _ = std::fs::remove_file(&fake);
+    }

@@ -53,13 +53,25 @@ fi
 #     Guard #2 catching the unsafe form is necessary but not sufficient — a
 #     vacuous pass (no compare at all, or a refactor that drops the check)
 #     would slip through. Require ct_eq / constant_time_eq to be present in the
-#     same file as check_auth.
-AUTH_FILE="$(grep -lE 'fn check_auth' "${RS[@]}" || true)"
-if [ -z "$AUTH_FILE" ]; then
-  flag "check_auth function not found in bridge sources" "expected an fn check_auth"
-elif ! grep -qE 'ct_eq|constant_time_eq' "$AUTH_FILE"; then
-  flag "check_auth's file does not use a constant-time compare (ct_eq/constant_time_eq)" \
-    "$AUTH_FILE"
+#     same file that DEFINES check_auth.
+#
+#     Match the definition (`fn check_auth(` — open paren right after the name),
+#     not the substring `fn check_auth`: after the module split the auth unit
+#     tests live in the same tree and their names (`fn check_auth_wrong_token…`)
+#     would otherwise make this resolve to several files. Each defining file
+#     (there should be exactly one) is checked independently, so the guard is
+#     robust to any file layout without being weakened.
+AUTH_FILES="$(grep -lE 'fn check_auth\(' "${RS[@]}" || true)"
+if [ -z "$AUTH_FILES" ]; then
+  flag "check_auth function not found in bridge sources" "expected an fn check_auth("
+else
+  while IFS= read -r auth_file; do
+    [ -n "$auth_file" ] || continue
+    if ! grep -qE 'ct_eq|constant_time_eq' "$auth_file"; then
+      flag "check_auth's file does not use a constant-time compare (ct_eq/constant_time_eq)" \
+        "$auth_file"
+    fi
+  done <<< "$AUTH_FILES"
 fi
 
 # 3) No literal 0.0.0.0 wildcard as a default bind (would expose the bridge on

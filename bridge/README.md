@@ -45,10 +45,38 @@ export JESSE_ADVERTISE_HOST="your-host.tailnet.ts.net"
 
 A clean `cargo build --release` is the gate — if it doesn't compile, it isn't done.
 
+## Source layout
+
+The crate is a small library (`src/lib.rs`) plus a wiring-only binary
+(`src/main.rs`). The library is split along the sections the code grew into, so a
+change lives in one focused module:
+
+| Module | What it owns |
+| --- | --- |
+| `config` | `Config`, `from_env`, `clamp_timeout_secs`, the `env_string`/`env_parse` helpers, and the default consts |
+| `prompt` | the Ask/Tell wrapper + floor consts and `build_prompt` |
+| `auth` | `check_auth` (constant-time bearer compare) and the `ApiError` alias |
+| `bind` | `is_bind_allowed` / `env_truthy` (bind safety) |
+| `ratelimit` | the token-bucket `RateLimiter` |
+| `jobstore` | the turn-survives-disconnect job store, persistence worker, eviction, `TurnGuard`; **live-stream state is isolated in `jobstore::streams`** as `StreamRegistry` — its broadcast map is a private field, so the "never hold the `streams`, `jobs`, and `aborts` locks at once" invariant is a module boundary, not a comment |
+| `claude` | `build_claude_args` + `run_claude_streaming` and the `stream-json` parsing/classification (`parse_stream_line`, `classify_result_value`, `resolve_stream_outcome`) |
+| `attachments` | base64 decode + length helpers, magic-byte sniff, per-request `ScratchDir`, validation |
+| `apns` | the optional push path (device store, JWT minting, transport, completion→push decision) |
+| `state` / `handlers` / `sse` | shared `AppState`, the Axum handlers + router, and the SSE body/forwarder |
+| `startup` | pairing-QR payload + the `binary_exists`/bind startup checks |
+
+Unit tests live in each module's `#[cfg(test)]`; the `app()`-router tests are a
+`tests/` integration target. `scripts/ci-guards.sh` scans **all** `bridge/src`
+sources, so the security guards apply across every module.
+
 ## Test from the laptop
 
 ```bash
+# Liveness: 200 {"ok":true}, unauthenticated. The vault + claude binary paths are
+# operator detail and are returned ONLY to an authenticated caller (bearer token),
+# so an unauthenticated probe learns nothing but "the bridge is up".
 curl -s http://127.0.0.1:8765/health
+curl -s http://127.0.0.1:8765/health -H "Authorization: Bearer $JESSE_TOKEN"
 
 # Fresh ask — response includes a session_id.
 curl -s http://127.0.0.1:8765/jesse \
