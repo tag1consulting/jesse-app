@@ -109,21 +109,35 @@ struct ThreadListView: View {
         }
     }
 
-    /// A month bucket as a collapsible folder: collapsed by default, its header
-    /// showing the month name and a deterministic count + date-range summary.
-    /// Tapping the header toggles it; collapsed hides the member rows entirely.
+    /// A month bucket as a collapsible folder. Rendered as a `DisclosureGroup`
+    /// (not a bare `Section(isExpanded:)`, whose header isn't tappable in this
+    /// grouped list style — that was the dead-tap bug) so it has a built-in,
+    /// reliably-tappable disclosure chevron that reflects the open/closed state.
+    /// Collapsed by default; collapsed hides the member rows entirely. The header
+    /// reads as a light grouped container (a folder glyph + month name + the
+    /// deterministic count/date-range summary), not a flat dark section bar.
     @ViewBuilder
     private func folderSection(_ rendered: RenderedThreadSection) -> some View {
-        Section(isExpanded: folderBinding(for: rendered)) {
-            rows(rendered.threads)
-        } header: {
-            VStack(alignment: .leading, spacing: 2) {
-                Text(rendered.section.title())
-                Text(folderSummary(for: rendered.threads,
-                                   calendar: .current, locale: .current))
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .textCase(nil)
+        let header = folderHeader(for: rendered, calendar: .current, locale: .current)
+        Section {
+            DisclosureGroup(isExpanded: folderBinding(for: rendered)) {
+                rows(rendered.threads)
+            } label: {
+                HStack(spacing: 8) {
+                    Image(systemName: "folder")
+                        .foregroundStyle(.tint)
+                        .imageScale(.medium)
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(header.title)
+                            .font(.headline)
+                        Text(header.summary)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+                .padding(.vertical, 4)
+                .accessibilityElement(children: .combine)
+                .accessibilityLabel("\(header.title), \(header.summary)")
             }
         }
     }
@@ -136,6 +150,11 @@ struct ThreadListView: View {
             NavigationLink(value: thread) {
                 ThreadRow(thread: thread, running: coordinator.isRunning(thread.id))
             }
+            // Lazily mint/refresh this visible row's AI title. Idempotent and
+            // non-blocking: it no-ops when the cached title is current or a
+            // generation is already running, and degrades to the derived title
+            // when the bridge has no /jesse/title.
+            .onAppear { coordinator.ensureTitle(for: thread, context: context) }
             .swipeActions(edge: .leading) {
                 Button { toggleFavorite(thread) } label: {
                     Label(thread.isFavorite ? "Unfavorite" : "Favorite",
@@ -153,9 +172,14 @@ struct ThreadListView: View {
     private func folderBinding(for rendered: RenderedThreadSection) -> Binding<Bool> {
         Binding(
             get: { rendered.isExpanded },
+            // Route the toggle through the pure `foldersAfterToggling` so the tap
+            // behavior is exactly what the unit tests pin. `open` is what the
+            // disclosure control wants; flip membership only when it actually
+            // differs from the current state.
             set: { open in
-                if open { expandedFolders.insert(rendered.section) }
-                else { expandedFolders.remove(rendered.section) }
+                if open != rendered.isExpanded {
+                    expandedFolders = foldersAfterToggling(rendered.section, in: expandedFolders)
+                }
             })
     }
 
@@ -224,7 +248,10 @@ struct ThreadListView: View {
     }
 }
 
-/// A list row: title, relative last-activity time, and a live dot while running.
+/// A list row: one primary line (the resolved title) and the relative
+/// last-activity time — nothing else. The title is `displayTitle`: the cached AI
+/// title when present (even mid-refresh — the last good title, never blank), else
+/// the derived first-words title. A live spinner shows while the turn runs.
 struct ThreadRow: View {
     let thread: JesseThread
     let running: Bool
@@ -239,19 +266,8 @@ struct ThreadRow: View {
                             .foregroundStyle(.yellow)
                             .accessibilityLabel("Favorite")
                     }
-                    Text(thread.title.isEmpty ? "New conversation" : thread.title)
+                    Text(displayTitle(for: thread))
                         .lineLimit(1)
-                }
-                // Second line: where the conversation actually went — a snippet
-                // of the latest turn. The derived title (line 1) is never touched;
-                // this only augments it. Hidden when empty (no turns) or when it
-                // would just repeat the title (a single, untruncated user turn).
-                let preview = rowPreview(for: thread)
-                if !preview.isEmpty && preview != thread.title {
-                    Text(preview)
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                        .lineLimit(2)
                 }
                 Text(thread.updatedAt, format: .relative(presentation: .named))
                     .font(.caption)

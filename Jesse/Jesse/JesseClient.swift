@@ -433,6 +433,25 @@ nonisolated struct JesseDeviceRegistration: Encodable {
     let token: String
 }
 
+/// The `POST /jesse/title` request body: a bounded, whitespace-collapsed digest
+/// of the conversation (see `titleDigest`) the bridge summarizes into a short
+/// title. The bridge's field is `text` (it caps input at 16 KiB and sanitizes the
+/// result); our `digest` property maps to that wire key. Our digest is capped well
+/// under the bridge's input limit.
+nonisolated struct JesseTitleRequest: Encodable, Equatable {
+    let digest: String
+    enum CodingKeys: String, CodingKey {
+        case digest = "text"
+    }
+}
+
+/// Decoded `POST /jesse/title` body — a single short title string. Any other
+/// shape (or a missing endpoint) decodes to nil upstream, so the row keeps its
+/// derived title.
+nonisolated struct JesseTitleResponse: Decodable {
+    let title: String
+}
+
 /// The two bridge calls the coordinator drives a turn with. Pulled behind a
 /// protocol purely so a fake can exercise the poll loop in tests without a
 /// server; `JesseClient` is the only production conformer.
@@ -457,6 +476,12 @@ protocol JesseClientProtocol {
     /// Fired when the app backgrounds with that turn still in flight — "I'm
     /// leaving, ping me." Best-effort and idempotent.
     func notifyOnComplete(jobId: String) async throws
+    /// Ask the bridge to mint a short conversation title from `digest`
+    /// (`POST /jesse/title`). Returns the title, or nil for ANY failure — offline,
+    /// a bridge with no such endpoint (404), a timeout, a non-2xx, or an empty
+    /// title. It NEVER throws to the UI: a missing title just leaves the row's
+    /// derived title in place. See `title(forDigest:)` on `JesseClient`.
+    func title(forDigest digest: String) async -> String?
 }
 
 extension JesseClientProtocol {
@@ -464,6 +489,9 @@ extension JesseClientProtocol {
     // the push methods; only the production `JesseClient` does the real calls.
     func registerDevice(token: String) async throws {}
     func notifyOnComplete(jobId: String) async throws {}
+    // Default "no title": a fake that doesn't opt into titling degrades exactly
+    // like a bridge without the endpoint (the row keeps its derived title).
+    func title(forDigest digest: String) async -> String? { nil }
 }
 
 struct JesseClient: JesseClientProtocol {
@@ -665,6 +693,37 @@ struct JesseClient: JesseClientProtocol {
         if (200..<300).contains(http.statusCode) || http.statusCode == 404 { return }
         throw JesseError.badResponse(http.statusCode,
                                      String(data: data, encoding: .utf8) ?? "")
+    }
+
+    /// Mint a short conversation title from `digest` (`POST /jesse/title`). Mirrors
+    /// the other calls' URL build + bearer auth + bounded session, but is
+    /// deliberately *total*: EVERY failure mode — not configured, an encode
+    /// failure, a transport error (offline/timeout/dropped), a non-2xx (a bridge
+    /// that predates the endpoint answers 404), an undecodable body, or a
+    /// blank/whitespace title — collapses to `nil`. It never throws, so a caller on
+    /// the list path can fire it without a `try` and the row simply keeps its
+    /// derived title when no AI title comes back. AI titles therefore only populate
+    /// against a bridge that actually has /jesse/title deployed.
+    func title(forDigest digest: String) async -> String? {
+        guard !config.normalizedHost.isEmpty, !config.token.isEmpty,
+              let url = config.endpoint("/jesse/title"),
+              let body = try? Self.encodeBody(JesseTitleRequest(digest: digest)) else {
+            return nil
+        }
+        var req = URLRequest(url: url)
+        req.httpMethod = "POST"
+        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        req.setValue("Bearer \(config.token)", forHTTPHeaderField: "Authorization")
+        req.httpBody = body
+
+        guard let (data, resp) = try? await session.data(for: req),
+              let http = resp as? HTTPURLResponse,
+              (200..<300).contains(http.statusCode),
+              let obj = try? JSONDecoder().decode(JesseTitleResponse.self, from: data) else {
+            return nil
+        }
+        let trimmed = obj.title.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? nil : trimmed
     }
 
     /// Open the live SSE stream for a running turn and decode each frame. Reads

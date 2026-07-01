@@ -89,6 +89,43 @@ func threadListLayout(_ threads: [JesseThread],
     return .sectioned(sections)
 }
 
+/// Apply a user's tap on a month folder header: flip its membership in the
+/// `expanded` set (present → collapse, absent → expand) and return the new set.
+/// Pure, so the tap behavior the fixed folder header binds to is unit-testable
+/// without a view — feed the result back into `threadListLayout` and the folder's
+/// `isExpanded` (and thus its visible rows) flips. The view wires the folder's
+/// disclosure control's binding-setter to this, so a tap reliably toggles.
+func foldersAfterToggling(_ section: ThreadSection,
+                          in expanded: Set<ThreadSection>) -> Set<ThreadSection> {
+    var next = expanded
+    if next.contains(section) { next.remove(section) } else { next.insert(section) }
+    return next
+}
+
+/// The content a month-folder header displays, as a pure value so the header can
+/// be asserted without a view host: the month name, the deterministic count +
+/// date-range `folderSummary`, and whether it's expanded — the last driving the
+/// disclosure chevron's direction (right = collapsed, down = expanded). Building
+/// this here keeps the folder header a testable seam, not just SwiftUI.
+struct FolderHeaderModel: Equatable {
+    let title: String
+    let summary: String
+    /// True when the folder is open; the header's disclosure chevron reflects it.
+    let isExpanded: Bool
+    /// SF Symbol for the disclosure chevron, so "the header exposes a chevron that
+    /// reflects state" is a concrete, assertable fact rather than view chrome.
+    var chevronSystemImage: String { isExpanded ? "chevron.down" : "chevron.right" }
+}
+
+/// Build the header model for a rendered month folder.
+func folderHeader(for rendered: RenderedThreadSection,
+                  calendar: Calendar, locale: Locale) -> FolderHeaderModel {
+    FolderHeaderModel(
+        title: rendered.section.title(calendar: calendar),
+        summary: folderSummary(for: rendered.threads, calendar: calendar, locale: locale),
+        isExpanded: rendered.isExpanded)
+}
+
 /// A short, deterministic folder-summary label for a collapsed month folder:
 /// `"<N> conversations · <date range>"`, where N is the thread count (singular
 /// "1 conversation") and the range spans the min–max last-activity date in the

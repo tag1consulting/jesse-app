@@ -110,6 +110,15 @@ final class RunCoordinator {
     // it to snap its backoff back to the fast cadence while the stream is actively
     // delivering tokens. Not observed by views.
     @ObservationIgnored private var streamTicks: [UUID: Int] = [:]
+
+    // AI-title generation bookkeeping (see `ensureTitle`). Not observed by views —
+    // the title lands on the persisted JesseThread, which the list already queries.
+    // `titlesInFlight` guards against a second concurrent generation for a thread;
+    // `titleAttemptedKeys` records the content key we last *attempted* (success OR
+    // failure) so a failing bridge isn't re-hit on every row appearance — a fresh
+    // launch clears it, and a new turn (new key) makes one fresh attempt.
+    @ObservationIgnored private var titlesInFlight: Set<UUID> = []
+    @ObservationIgnored private var titleAttemptedKeys: [UUID: String] = [:]
     // Called after a turn is delivered successfully — the "sensible moment" to ask
     // for push-notification authorization (not on cold launch). `JesseApp` wires
     // this to `PushManager`; the default is a no-op so tests never touch
@@ -680,6 +689,51 @@ final class RunCoordinator {
     /// tap to the right conversation. nil if no in-flight job matches.
     func threadID(forJobId jobId: String) -> UUID? {
         inFlight.first(where: { $0.value.jobId == jobId })?.key
+    }
+
+    // MARK: - AI titles
+
+    /// Ensure a visible thread has an up-to-date AI title, generating at most ONE
+    /// title per stale content state and never blocking the list. Called on row
+    /// appearance (the "visible row" trigger). No-ops — no network — when:
+    ///  - the thread has no turns yet (nothing to title),
+    ///  - the cached title is already current (`titleSourceKey` == the live key),
+    ///  - a generation is already in flight for this thread, or
+    ///  - this exact content key was already attempted this launch (so a bridge
+    ///    without /jesse/title, which returns nil, isn't re-hit on every appearance).
+    ///
+    /// Invalidation is "a new entry busts the cache": when a turn is appended or
+    /// edited the content key changes, so the guards fall through and exactly one
+    /// regeneration fires. On a non-nil result the title + the key it was minted
+    /// from are written and saved; a nil result (any failure) leaves the derived
+    /// title in place — no error, no spinner. The cached (possibly stale) title
+    /// keeps displaying while a refresh runs, so the row never flickers to blank.
+    func ensureTitle(for thread: JesseThread, context: ModelContext) {
+        let key = threadContentKey(for: thread)
+        guard !key.isEmpty,
+              thread.titleSourceKey != key,
+              !titlesInFlight.contains(thread.id),
+              titleAttemptedKeys[thread.id] != key else { return }
+
+        let threadID = thread.id
+        titlesInFlight.insert(threadID)
+        titleAttemptedKeys[threadID] = key
+        let digest = titleDigest(for: thread)
+        let cfg = configProvider()
+
+        Task { [weak self] in
+            guard let self else { return }
+            let client = self.makeClient(cfg)
+            let title = await client.title(forDigest: digest)
+            self.titlesInFlight.remove(threadID)
+            // nil = the bridge had no title (offline / no endpoint / empty) — keep
+            // the derived title; `titleAttemptedKeys` prevents a re-fire for this
+            // same content until a new turn changes the key.
+            guard let title else { return }
+            thread.aiTitle = title
+            thread.titleSourceKey = key
+            try? self.save(context)
+        }
     }
 
     /// A terminal failure: surface the message and drop everything, including the

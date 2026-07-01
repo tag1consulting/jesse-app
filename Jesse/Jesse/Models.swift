@@ -33,6 +33,17 @@ final class JesseThread {
     // default, so SwiftData lightweight-migrates existing stores with no migration
     // code (matching `isFavorite`/`favoritedAt`).
     var lastDeliveredJobId: String?
+    // A short conversation title minted by the bridge's /jesse/title endpoint,
+    // cached so the list row reads better than the derived first-words title. nil
+    // until one is generated (and stays nil forever against a bridge that lacks
+    // the endpoint — the row falls back to the derived `title`). New property with
+    // a default → SwiftData lightweight-migrates existing stores, no migration code.
+    var aiTitle: String?
+    // The content key (see `threadContentKey`) the current `aiTitle` was minted
+    // from. When it no longer equals the thread's live content key, `aiTitle` is
+    // stale (a turn was appended or edited) and a regeneration is due. Default nil
+    // → lightweight migration, and nil reads as "no cached title yet".
+    var titleSourceKey: String?
 
     @Relationship(deleteRule: .cascade, inverse: \Turn.thread)
     var turns: [Turn] = []

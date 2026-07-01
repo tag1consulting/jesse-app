@@ -153,4 +153,78 @@ final class ThreadFoldersTests: XCTestCase {
         XCTAssertFalse(cleared.isExpanded, "clearing search restores collapsed folders")
         XCTAssertTrue(cleared.visibleThreads.isEmpty)
     }
+
+    // MARK: - Folder tap toggles expand/collapse (the dead-tap fix)
+
+    // The month folder header was a bare `Section(isExpanded:)` whose header isn't
+    // tappable in this grouped list style, so tapping it did nothing. The fix
+    // routes the tap through the pure `foldersAfterToggling`, wired to a
+    // DisclosureGroup's tappable chevron. These drive that expansion-state model
+    // through `threadListLayout` (no UI snapshotting), proving a tap now flips the
+    // folder's expanded state AND the rows on screen.
+
+    func testTogglingFolderFlipsExpandedStateAndVisibleRows() {
+        let old = thread(at: date(2026, 6, 3))
+        let june = ThreadSection.month(monthStart(2026, 6))
+
+        // Collapsed by default: rows hidden.
+        var expanded: Set<ThreadSection> = []
+        let collapsed = section(layout([old], expanded: expanded), june)!
+        XCTAssertFalse(collapsed.isExpanded)
+        XCTAssertTrue(collapsed.visibleThreads.isEmpty)
+
+        // Tap → expanded, the row is now on screen.
+        expanded = foldersAfterToggling(june, in: expanded)
+        let opened = section(layout([old], expanded: expanded), june)!
+        XCTAssertTrue(opened.isExpanded, "a tap opens the folder")
+        XCTAssertEqual(opened.visibleThreads.map(\.id), [old.id],
+                       "opening reveals the member rows")
+
+        // Tap again → collapsed, rows hidden once more.
+        expanded = foldersAfterToggling(june, in: expanded)
+        let reclosed = section(layout([old], expanded: expanded), june)!
+        XCTAssertFalse(reclosed.isExpanded, "a second tap collapses the folder")
+        XCTAssertTrue(reclosed.visibleThreads.isEmpty)
+    }
+
+    func testToggleOnlyAffectsTheTappedFolder() {
+        let june = thread(at: date(2026, 6, 3))
+        let march = thread(at: date(2026, 3, 12))
+        let juneSec = ThreadSection.month(monthStart(2026, 6))
+        let marchSec = ThreadSection.month(monthStart(2026, 3))
+
+        let expanded = foldersAfterToggling(juneSec, in: [])
+        let l = layout([june, march], expanded: expanded)
+        XCTAssertTrue(section(l, juneSec)!.isExpanded, "the tapped folder opens")
+        XCTAssertFalse(section(l, marchSec)!.isExpanded, "other folders stay collapsed")
+    }
+
+    // MARK: - Folder header exposes the chevron + count/date label
+
+    func testFolderHeaderExposesChevronAndSummary() {
+        let a = thread(at: date(2026, 6, 3))
+        let b = thread(at: date(2026, 6, 10))
+        let june = ThreadSection.month(monthStart(2026, 6))
+
+        // Collapsed: right-pointing chevron, month name, deterministic summary.
+        let collapsed = section(layout([a, b]), june)!
+        let header = folderHeader(for: collapsed, calendar: calendar, locale: calendar.locale ?? .current)
+        XCTAssertEqual(header.title, "June 2026", "the month name")
+        XCTAssertEqual(header.summary,
+                       folderSummary(for: collapsed.threads, calendar: calendar,
+                                     locale: calendar.locale ?? .current),
+                       "the deterministic count · date-range label (PR #20)")
+        XCTAssertTrue(header.summary.contains("2 conversations"))
+        XCTAssertFalse(header.isExpanded)
+        XCTAssertEqual(header.chevronSystemImage, "chevron.right",
+                       "collapsed folders read as closed containers")
+
+        // Expanded: the chevron flips to reflect the open state.
+        let opened = section(layout([a, b], expanded: [june]), june)!
+        let openHeader = folderHeader(for: opened, calendar: calendar,
+                                      locale: calendar.locale ?? .current)
+        XCTAssertTrue(openHeader.isExpanded)
+        XCTAssertEqual(openHeader.chevronSystemImage, "chevron.down",
+                       "the chevron reflects the expanded state")
+    }
 }
