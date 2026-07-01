@@ -419,6 +419,97 @@ use tower::ServiceExt;
         let _ = std::fs::remove_file(&fake);
     }
     #[tokio::test]
+    async fn wrapped_prompt_carries_a_live_clock_header_end_to_end() {
+        // Drive the bridge exactly as the App does (POST /jesse) and capture the
+        // prompt that actually reaches `claude` — its `-p` argument, i.e. $2. Then
+        // prove the wrapped prompt leads with a well-formed, live clock header:
+        // day-of-week, ISO date, HH:MM, a zone abbreviation, and a colonized UTC
+        // offset — the deterministic per-turn clock the phone path depends on.
+        //
+        // FAILING-FIRST: with the clock-prepend line in `build_prompt_at` removed,
+        // the captured prompt starts with the safety floor and contains no
+        // "Current date/time:" header, so the assertions below fail.
+        let promptfile = std::env::temp_dir().join(format!(
+            "jesse-prompt-{}-{}.txt",
+            std::process::id(),
+            JOB_COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_file(&promptfile);
+        // $2 is the prompt (argv: -p <prompt> --output-format …). Record it, then
+        // emit a valid terminal result line so the turn completes.
+        let script = format!(
+            "#!/bin/sh\n\
+             printf '%s' \"$2\" > '{}'\n\
+             printf '%s' '{{\"type\":\"result\",\"is_error\":false,\"result\":\"ok\",\"session_id\":\"sess-clock\"}}'\n",
+            promptfile.display()
+        );
+        let fake = write_fake_claude(&script);
+        let cfg = Config {
+            claude_bin: fake.to_string_lossy().into_owned(),
+            timeout_secs: 30,
+            ..test_config()
+        };
+        let st = AppState::new(cfg);
+
+        let resp = app(st.clone())
+            .oneshot(jesse_request(
+                Some("Bearer test-token"),
+                r#"{"mode":"ask","text":"what day is it"}"#,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::ACCEPTED);
+        let body: Value = serde_json::from_str(&body_string(resp).await).unwrap();
+        let job_id = body["job_id"].as_str().unwrap().to_string();
+
+        // Wait for completion so the prompt has certainly been written.
+        let mut done = false;
+        for _ in 0..60 {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            if result_status(&st, &job_id).await["status"] == "done" {
+                done = true;
+                break;
+            }
+        }
+        assert!(done, "turn must complete");
+
+        let prompt =
+            std::fs::read_to_string(&promptfile).expect("fake claude must record the prompt");
+        // The clock leads the whole wrapped prompt.
+        let header = prompt.lines().next().expect("prompt must have a first line");
+        assert!(
+            header.starts_with("Current date/time: "),
+            "wrapped prompt must lead with the clock header, got: {header:?}"
+        );
+        // Well-formed and LIVE: "<Weekday>, <YYYY-MM-DD> <HH:MM> <ABBR> (UTC±HH:MM)."
+        let rest = header
+            .strip_prefix("Current date/time: ")
+            .unwrap()
+            .strip_suffix(").")
+            .expect("header must end with ').'");
+        let (head, offset) = rest.split_once(" (UTC").expect("header must carry a (UTC offset)");
+        assert_eq!(offset.len(), 6, "offset must be ±HH:MM: {offset:?}");
+        assert_eq!(offset.as_bytes()[3], b':', "offset must be colonized: {offset:?}");
+        let parts: Vec<&str> = head.split(' ').collect();
+        assert!(
+            [
+                "Monday,", "Tuesday,", "Wednesday,", "Thursday,", "Friday,", "Saturday,", "Sunday,"
+            ]
+            .contains(&parts[0]),
+            "header must open with a weekday: {head:?}"
+        );
+        let year: i64 = parts[1].split('-').next().unwrap().parse().expect("year");
+        assert!(year >= 2026, "clock must reflect the real current year: {year}");
+        // The floor still follows the clock (it wasn't displaced).
+        assert!(
+            prompt.contains(ASK_FLOOR),
+            "the Ask safety floor must still follow the clock header"
+        );
+
+        let _ = std::fs::remove_file(&fake);
+        let _ = std::fs::remove_file(&promptfile);
+    }
+    #[tokio::test]
     async fn streaming_reaps_child_after_result_line() {
         // The flip side of the fix: after completing on the result line, the
         // bounded reap must actually kill a child that won't exit on its own, so

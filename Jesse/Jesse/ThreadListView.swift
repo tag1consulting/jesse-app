@@ -16,10 +16,22 @@ struct ThreadListView: View {
     // Remembered across launches: false = All, true = Favorites only.
     @AppStorage("threadListFavoritesOnly") private var favoritesOnly = false
 
-    /// Threads the active filter shows. The All view keeps date order untouched;
-    /// Favorites simply narrows to starred threads (no reordering or pinning).
+    // Live search text. Not persisted — a fresh launch starts with the full list.
+    @State private var searchText = ""
+
+    /// Threads the active tab shows, before search. The All view keeps date order
+    /// untouched; Favorites simply narrows to starred threads (no reordering or
+    /// pinning).
     private var visible: [JesseThread] {
         favoritesOnly ? threads.filter(\.isFavorite) : threads
+    }
+
+    /// `visible` narrowed by the search query (title + turn bodies). A blank
+    /// query matches everything, so this is just `visible` when search is idle.
+    /// Applied before grouping, so results stay date-sectioned and compose with
+    /// the All/Favorites tab.
+    private var searched: [JesseThread] {
+        visible.filter { threadMatches($0, query: searchText) }
     }
 
     var body: some View {
@@ -36,6 +48,7 @@ struct ThreadListView: View {
             }
             content
         }
+        .searchable(text: $searchText, prompt: "Search conversations")
         .navigationTitle("Jesse")
         .toolbar {
             ToolbarItem(placement: .topBarTrailing) {
@@ -65,6 +78,10 @@ struct ThreadListView: View {
             } description: {
                 Text("Swipe a conversation and tap Favorite to star it.")
             }
+        } else if searched.isEmpty {
+            // Search is active (a blank query would keep `visible`) but nothing
+            // in this tab matches. Clearing the query restores the full list.
+            ContentUnavailableView.search(text: searchText)
         } else {
             List {
                 ForEach(groupedSections) { group in
@@ -113,7 +130,7 @@ struct ThreadListView: View {
     /// once here so every thread is classified against the same instant.
     private var groupedSections: [ThreadGroup] {
         let now = Date.now
-        let grouped = Dictionary(grouping: visible) {
+        let grouped = Dictionary(grouping: searched) {
             threadSection(for: $0.updatedAt, now: now, calendar: .current)
         }
         return grouped
@@ -177,6 +194,17 @@ struct ThreadRow: View {
                     }
                     Text(thread.title.isEmpty ? "New conversation" : thread.title)
                         .lineLimit(1)
+                }
+                // Second line: where the conversation actually went — a snippet
+                // of the latest turn. The derived title (line 1) is never touched;
+                // this only augments it. Hidden when empty (no turns) or when it
+                // would just repeat the title (a single, untruncated user turn).
+                let preview = rowPreview(for: thread)
+                if !preview.isEmpty && preview != thread.title {
+                    Text(preview)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(2)
                 }
                 Text(thread.updatedAt, format: .relative(presentation: .named))
                     .font(.caption)

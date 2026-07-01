@@ -41,21 +41,33 @@ final class ThreadSectioningTests: XCTestCase {
         XCTAssertEqual(section(date(2026, 6, 24, 23)), .yesterday)
     }
 
-    func testTwoToSixDaysAgoAreWeekdaySections() {
-        for daysAgo in 2...6 {
-            let d = date(2026, 6, 25 - daysAgo)
-            XCTAssertEqual(section(d), .weekday(calendar.startOfDay(for: d)),
-                           "\(daysAgo) days ago should be a weekday section")
-        }
+    func testTwoDaysAgoIsWeekdaySection() {
+        // The only day-granular weekday section in the 3-day window: 2 days ago.
+        let d = date(2026, 6, 23)
+        XCTAssertEqual(section(d), .weekday(calendar.startOfDay(for: d)))
     }
 
-    func testSevenDayBoundaryLandsInMonth() {
-        // Exactly 7 days ago → month section, not a weekday section.
+    func testThreeDayBoundaryLandsInMonth() {
+        // Exactly 3 days ago → month section, not a weekday section. This is the
+        // 3-day-window boundary: days 0/1/2 get individual headers, 3+ roll up.
+        XCTAssertEqual(section(date(2026, 6, 22)), .month(monthStart(2026, 6)))
+    }
+
+    func testTwoVsThreeDayBoundary() {
+        // Assert both sides of the 2/3-day boundary against the fixed `now`.
+        XCTAssertEqual(section(date(2026, 6, 23)),
+                       .weekday(calendar.startOfDay(for: date(2026, 6, 23))),
+                       "2 days ago is the last individual weekday section")
+        XCTAssertEqual(section(date(2026, 6, 22)), .month(monthStart(2026, 6)),
+                       "3 days ago rolls up into its month")
+    }
+
+    func testFourDaysAgoSameMonthRollsIntoMonth() {
+        XCTAssertEqual(section(date(2026, 6, 21)), .month(monthStart(2026, 6)))
+    }
+
+    func testSevenDaysAgoStillLandsInMonth() {
         XCTAssertEqual(section(date(2026, 6, 18)), .month(monthStart(2026, 6)))
-    }
-
-    func testEightDaysAgoSameMonthRollsIntoMonth() {
-        XCTAssertEqual(section(date(2026, 6, 17)), .month(monthStart(2026, 6)))
     }
 
     func testPriorMonth() {
@@ -73,7 +85,7 @@ final class ThreadSectioningTests: XCTestCase {
             date(2026, 5, 10),    // May (month)
             date(2025, 12, 10),   // Dec 2025 (month)
             date(2026, 6, 25, 3), // today
-            date(2026, 6, 19),    // 6 days ago (weekday)
+            date(2026, 6, 22),    // 3 days ago → June (month)
             date(2026, 6, 17),    // June (month)
             date(2026, 6, 24),    // yesterday
             date(2026, 6, 23),    // 2 days ago (weekday)
@@ -83,8 +95,8 @@ final class ThreadSectioningTests: XCTestCase {
             .today,
             .yesterday,
             .weekday(calendar.startOfDay(for: date(2026, 6, 23))),
-            .weekday(calendar.startOfDay(for: date(2026, 6, 19))),
             .month(monthStart(2026, 6)),
+            .month(monthStart(2026, 6)),   // 6/22 and 6/17 share the June bucket
             .month(monthStart(2026, 5)),
             .month(monthStart(2025, 12)),
         ])

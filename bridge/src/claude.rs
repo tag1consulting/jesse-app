@@ -785,12 +785,27 @@ mod tests {
             "a bare Skill scope (any-skill from a phone request) must never be allowed: {tools:?}"
         );
 
-        // Defense-in-depth denylist is passed and contains bare Bash.
+        // The scoped read-only helpers backing the clock header + file inspection
+        // are present, and each is the `Bash(<verb>:*)` scoped form — never a bare
+        // verb or unscoped Bash. These are read-only / pure-compute (no write, no
+        // network), so they widen the read surface only.
+        for verb in ["date", "cal", "head", "tail", "wc"] {
+            assert!(
+                tools.contains(&format!("Bash({verb}:*)").as_str()),
+                "expected scoped Bash({verb}:*) in: {tools:?}"
+            );
+        }
+
+        // Defense-in-depth denylist is passed and still denies bare Bash AND
+        // WebFetch — the scoped read-only verbs above coexist with the bare-Bash
+        // denial exactly as git/mv/cat already do; the deny list is unchanged.
         let didx = args
             .iter()
             .position(|a| a == "--disallowedTools")
             .expect("--disallowedTools present");
-        assert!(args[didx + 1].split(',').any(|t| t.trim() == "Bash"));
+        let deny: Vec<&str> = args[didx + 1].split(',').map(|t| t.trim()).collect();
+        assert!(deny.contains(&"Bash"), "bare Bash must be denied: {deny:?}");
+        assert!(deny.contains(&"WebFetch"), "WebFetch must be denied: {deny:?}");
     }
     #[test]
     fn build_claude_args_resume_when_session() {

@@ -3,20 +3,20 @@ import Foundation
 // Pure, SwiftUI-free date bucketing for the thread list. Kept in its own file
 // (Foundation only) so the classifier is unit-testable without a view host.
 //
-// The window is the last 7 calendar days at day granularity, with everything
+// The window is the last 3 calendar days at day granularity, with everything
 // older rolled up by month and no gap between the two:
 //   • Today / Yesterday          — 0 / 1 days ago
-//   • a weekday section each      — 2…6 days ago (titled "Monday", etc.)
-//   • a month section each        — 7+ days ago (titled "June 2026")
-// A thread exactly 7 days old, or 7+ days old in the current month, lands in
+//   • a weekday section          — 2 days ago (titled "Monday", etc.)
+//   • a month section each        — 3+ days ago (titled "June 2026")
+// A thread exactly 3 days old, or 3+ days old in the current month, lands in
 // its month section even while more-recent threads of that month sit under day
 // headers — that's intended.
 
 enum ThreadSection: Hashable {
     case today
     case yesterday
-    case weekday(Date)   // start-of-day for days 2–6 ago
-    case month(Date)     // start-of-month for anything 7+ days ago
+    case weekday(Date)   // start-of-day for 2 days ago
+    case month(Date)     // start-of-month for anything 3+ days ago
 
     /// Representative instant for ordering sections newest-first (sort
     /// descending). Today and Yesterday carry no date of their own, so they get
@@ -70,9 +70,9 @@ func threadSection(for date: Date, now: Date, calendar: Calendar) -> ThreadSecti
         return .today
     case 1:
         return .yesterday
-    case 2...6:
+    case 2:
         return .weekday(startOfDate)
-    default:          // 7+ days ago
+    default:          // 3+ days ago
         let comps = calendar.dateComponents([.year, .month], from: date)
         return .month(calendar.date(from: comps) ?? startOfDate)
     }

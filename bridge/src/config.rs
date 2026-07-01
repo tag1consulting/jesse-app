@@ -47,6 +47,16 @@ pub const DEFAULT_MAX_ATTACHMENTS_TOTAL_BYTES: usize = 20 * 1024 * 1024;
 // absent — only the `Bash(<verb>:*)` scopes below are allowed. Override with
 // JESSE_ALLOWED_TOOLS. Keep in sync with the table in SECURITY.md.
 //
+// The `Bash(date:*)` / `Bash(cal:*)` scopes back up the per-turn clock header
+// (see `prompt::clock_line`) for on-demand relative date math and alternate
+// formats — both are pure computation with no side effect reachable as a
+// non-privileged user (`date -s` needs root and simply fails; `cal` only prints).
+// The `Bash(head:*)` / `Bash(tail:*)` / `Bash(wc:*)` scopes are strictly
+// read-only, no writes and no network — they round out the existing read set
+// (`cat`, `ls`, `find`, plus `Grep`/`Glob`) so the agent can inspect the large
+// diet CSVs and logs without slurping a whole file. None of the five can write,
+// send, or reach the network, so the action surface is unchanged.
+//
 // The three `Bash(node todo-list/<script>.js:*)` scopes let a food/exercise/
 // weigh-in log REGENERATE the dashboard cache (`diet-today.js`) from the CSV
 // source of truth and re-run its two guards — the per-item-log step the vault's
@@ -71,6 +81,7 @@ pub const DEFAULT_ALLOWED_TOOLS: &str = "Read,Write,Edit,Grep,Glob,\
 mcp__qmd__query,mcp__qmd__get,mcp__qmd__multi_get,mcp__qmd__status,\
 Skill(diet-logging),\
 Bash(git:*),Bash(mv:*),Bash(ls:*),Bash(cat:*),Bash(find:*),\
+Bash(date:*),Bash(cal:*),Bash(head:*),Bash(tail:*),Bash(wc:*),\
 Bash(node todo-list/generate-diet-today.js:*),\
 Bash(node todo-list/validate-diet-today.js:*),\
 Bash(node todo-list/verify-diet-consistency.js:*)";

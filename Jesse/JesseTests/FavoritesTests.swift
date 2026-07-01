@@ -39,6 +39,48 @@ final class FavoritesTests: XCTestCase {
         XCTAssertNil(thread.favoritedAt)
     }
 
+    // MARK: - Old favorites stay first-class after grouping/search changes
+
+    /// A favorite from months ago must still be surfaced by both the Favorites
+    /// filter and a content search that matches one of its turns — the 3-day
+    /// grouping and the new search must not hide aged, starred threads.
+    func testOldFavoriteSurvivesFilterSearchAndSectioning() {
+        let now = date(2026, 6, 25)
+
+        // Starred three months back, with the match word only in a turn body.
+        let fav = JesseThread(mode: .ask, createdAt: date(2026, 3, 12))
+        fav.title = "Garden plans"
+        fav.updatedAt = date(2026, 3, 12)
+        fav.turns = [
+            Turn(role: .user, text: "what should I plant?", createdAt: date(2026, 3, 12)),
+            Turn(role: .jesse, text: "Tomatoes do well on the south wall.",
+                 createdAt: date(2026, 3, 12)),
+        ]
+        fav.setFavorite(true, now: date(2026, 3, 12))
+
+        // A recent, unstarred thread that should NOT leak into the favorites view.
+        let recent = JesseThread(mode: .ask, createdAt: now)
+        recent.title = "Grocery list"
+
+        let all = [recent, fav]
+
+        // Favorites filter still keeps the old starred thread.
+        let favorites = all.filter(\.isFavorite)
+        XCTAssertEqual(favorites.map(\.id), [fav.id])
+
+        // Content search inside Favorites finds it by a turn-body word.
+        XCTAssertTrue(favorites.contains { threadMatches($0, query: "tomatoes") })
+
+        // Content search across All finds it too.
+        XCTAssertTrue(all.contains { threadMatches($0, query: "tomatoes") })
+
+        // And it still lands under its month section, not lost off the day window.
+        var cal = Calendar(identifier: .gregorian)
+        cal.timeZone = TimeZone(identifier: "UTC")!
+        let section = threadSection(for: fav.updatedAt, now: now, calendar: cal)
+        XCTAssertEqual(section, .month(cal.date(from: DateComponents(year: 2026, month: 3))!))
+    }
+
     // MARK: - Persistence round-trip through SwiftData
 
     @MainActor

@@ -23,6 +23,13 @@ The bridge launches `claude` with `--permission-mode default` plus an explicit
 `build_claude_args` and is unit-tested to always be present and to never contain
 unscoped `Bash`.
 
+The prompt-wrapper (`build_prompt`) also prepends one deterministic **clock
+header** to every turn — day-of-week, date, local time, timezone abbreviation,
+and UTC offset — computed fresh from the host system clock (`prompt::clock_line`,
+via `date`; a std-only UTC fallback keeps it present if `date` is unavailable).
+This is read-only context, not a tool grant; it removes the dependence on the
+model deciding to call a clock tool.
+
 Default allowlist (`JESSE_ALLOWED_TOOLS` to override):
 
 | Tool | Why |
@@ -33,6 +40,8 @@ Default allowlist (`JESSE_ALLOWED_TOOLS` to override):
 | `Skill(diet-logging)` | Auto-invoke the vault's `diet-logging` skill on a food/exercise/weigh-in log. The Skill tool only **loads instruction text** — it executes nothing itself; every action the skill prescribes still flows through the scoped `Read`/`Write`/`Edit` and the three `Bash(node todo-list/*.js:*)` scripts, so the action surface is unchanged. Pinned to the single named skill, never a bare `Skill` (which would let any future vault skill run from a phone request) |
 | `Bash(git:*)` | Vault history / status |
 | `Bash(mv:*)`, `Bash(ls:*)`, `Bash(cat:*)`, `Bash(find:*)` | Scoped file wrangling |
+| `Bash(date:*)`, `Bash(cal:*)` | Clock / date math backing the per-turn clock header (relative-date math, alternate formats). Pure computation — `date -s` needs root and fails as a non-privileged user, `cal` only prints, so no side effect is reachable |
+| `Bash(head:*)`, `Bash(tail:*)`, `Bash(wc:*)` | Strictly read-only inspection of large files/logs (the diet CSVs and logs) without slurping the whole file — rounds out the existing `cat`/`ls`/`find` read set. No writes, no network |
 | `Bash(node todo-list/generate-diet-today.js:*)` | Regenerate the `diet-today.js` dashboard cache from the authoritative CSVs after a food/exercise/weigh-in log (without it, a phone log appends the CSV but leaves the cache stale) |
 | `Bash(node todo-list/validate-diet-today.js:*)`, `Bash(node todo-list/verify-diet-consistency.js:*)` | The generator's two guards — field-contract validation and CSV-vs-cache consistency — run after each regeneration |
 

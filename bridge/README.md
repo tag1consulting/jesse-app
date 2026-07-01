@@ -54,7 +54,7 @@ change lives in one focused module:
 | Module | What it owns |
 | --- | --- |
 | `config` | `Config`, `from_env`, `clamp_timeout_secs`, the `env_string`/`env_parse` helpers, and the default consts |
-| `prompt` | the Ask/Tell wrapper + floor consts and `build_prompt` |
+| `prompt` | the Ask/Tell wrapper + floor consts, `build_prompt`, and the per-turn `clock_line` header prepended to every turn |
 | `auth` | `check_auth` (constant-time bearer compare) and the `ApiError` alias |
 | `bind` | `is_bind_allowed` / `env_truthy` (bind safety) |
 | `ratelimit` | the token-bucket `RateLimiter` |
