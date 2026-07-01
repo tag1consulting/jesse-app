@@ -1,0 +1,156 @@
+import XCTest
+@testable import Jesse
+
+final class ThreadFoldersTests: XCTestCase {
+
+    // Fixed calendar + `now` (2026-06-25 12:00 UTC), matching ThreadSectioningTests,
+    // so day/month bucketing and folding never read the wall clock.
+    private let calendar: Calendar = {
+        var c = Calendar(identifier: .gregorian)
+        c.timeZone = TimeZone(identifier: "UTC")!
+        c.locale = Locale(identifier: "en_US_POSIX")
+        return c
+    }()
+    private var now: Date { date(2026, 6, 25, 12) }
+
+    private func date(_ y: Int, _ m: Int, _ d: Int, _ h: Int = 12) -> Date {
+        var comps = DateComponents()
+        comps.year = y; comps.month = m; comps.day = d; comps.hour = h
+        return calendar.date(from: comps)!
+    }
+
+    private func thread(at updatedAt: Date, favorite: Bool = false,
+                        title: String = "", turns: [(TurnRole, String)] = []) -> JesseThread {
+        let t = JesseThread(mode: .ask)
+        t.title = title
+        t.updatedAt = updatedAt
+        t.turns = turns.enumerated().map { i, pair in
+            Turn(role: pair.0, text: pair.1,
+                 createdAt: updatedAt.addingTimeInterval(TimeInterval(i)))
+        }
+        if favorite { t.setFavorite(true, now: updatedAt) }
+        return t
+    }
+
+    private func monthStart(_ y: Int, _ m: Int) -> Date {
+        calendar.date(from: DateComponents(year: y, month: m))!
+    }
+
+    private func layout(_ threads: [JesseThread], favoritesOnly: Bool = false,
+                        search: String = "",
+                        expanded: Set<ThreadSection> = []) -> ThreadListLayout {
+        threadListLayout(threads, favoritesOnly: favoritesOnly, searchQuery: search,
+                         expanded: expanded, now: now, calendar: calendar)
+    }
+
+    private func sections(_ l: ThreadListLayout) -> [RenderedThreadSection] {
+        guard case .sectioned(let s) = l else {
+            XCTFail("expected a sectioned layout, got flat"); return []
+        }
+        return s
+    }
+
+    private func section(_ l: ThreadListLayout, _ s: ThreadSection) -> RenderedThreadSection? {
+        sections(l).first { $0.section == s }
+    }
+
+    // MARK: - Month folders collapse by default; day sections never fold
+
+    func testMonthFoldersStartCollapsedAndHideRows() {
+        let today = thread(at: date(2026, 6, 25))
+        let oldA = thread(at: date(2026, 6, 3))     // June bucket (3+ days ago)
+        let oldB = thread(at: date(2026, 6, 10))    // June bucket
+
+        let l = layout([today, oldA, oldB])
+        let june = section(l, .month(monthStart(2026, 6)))
+        XCTAssertNotNil(june)
+        XCTAssertTrue(june!.isFolder, "month buckets are folders")
+        XCTAssertFalse(june!.isExpanded, "folders start collapsed")
+        // The point of collapsing: the member rows are NOT on screen.
+        XCTAssertTrue(june!.visibleThreads.isEmpty,
+                      "a collapsed folder shows none of its rows")
+        // Membership is still tracked (for the summary + toggling), just hidden.
+        XCTAssertEqual(Set(june!.threads.map(\.id)), Set([oldA.id, oldB.id]))
+    }
+
+    func testDaySectionsAreNeverFolded() {
+        let today = thread(at: date(2026, 6, 25))
+        let yest = thread(at: date(2026, 6, 24))
+        let weekday = thread(at: date(2026, 6, 23))   // 2 days ago
+
+        let l = layout([today, yest, weekday])
+        for sec: ThreadSection in [.today, .yesterday, .weekday(calendar.startOfDay(for: date(2026, 6, 23)))] {
+            let rendered = section(l, sec)
+            XCTAssertNotNil(rendered, "expected day section \(sec)")
+            XCTAssertFalse(rendered!.isFolder, "day sections do not fold")
+            XCTAssertTrue(rendered!.isExpanded, "day sections are always expanded")
+            XCTAssertEqual(rendered!.visibleThreads.count, 1,
+                           "loose day rows are always on screen")
+        }
+    }
+
+    // MARK: - Toggling a folder reveals/hides its rows
+
+    func testTogglingFolderRevealsRows() {
+        let old = thread(at: date(2026, 6, 3))
+        let june = ThreadSection.month(monthStart(2026, 6))
+
+        let collapsed = section(layout([old]), june)!
+        XCTAssertTrue(collapsed.visibleThreads.isEmpty)
+
+        // Expanding = adding the section id to the expansion set.
+        let expanded = section(layout([old], expanded: [june]), june)!
+        XCTAssertTrue(expanded.isExpanded)
+        XCTAssertEqual(expanded.visibleThreads.map(\.id), [old.id],
+                       "an expanded folder reveals its rows")
+    }
+
+    // MARK: - Favorites tab is flat — no folders
+
+    func testFavoritesTabIsFlatWithNoFolders() {
+        // Two starred threads of very different ages + an unstarred recent one.
+        let oldFav = thread(at: date(2026, 3, 12), favorite: true)
+        let recentFav = thread(at: date(2026, 6, 25), favorite: true)
+        let unstarred = thread(at: date(2026, 6, 24))
+
+        let l = layout([unstarred, oldFav, recentFav], favoritesOnly: true)
+        guard case .flat(let list) = l else {
+            return XCTFail("favorites tab must be a flat list, not sectioned")
+        }
+        // All starred threads regardless of age, newest-first, no month chrome.
+        XCTAssertEqual(list.map(\.id), [recentFav.id, oldFav.id])
+        XCTAssertFalse(list.contains { $0.id == unstarred.id })
+    }
+
+    func testAllTabHasMonthFolders() {
+        let l = layout([thread(at: date(2026, 6, 25)), thread(at: date(2026, 3, 12))])
+        let folders = sections(l).filter(\.isFolder)
+        XCTAssertFalse(folders.isEmpty, "the All tab groups old history into month folders")
+    }
+
+    // MARK: - Active search flattens (force-expands) collapsed folders
+
+    func testSearchForceExpandsCollapsedFolderSoMatchIsVisible() {
+        // A match that lives in a month bucket collapsed-by-default.
+        let buried = thread(at: date(2026, 3, 12), title: "Garden plans",
+                            turns: [(.user, "what to plant?"),
+                                    (.jesse, "Tomatoes do well here.")])
+        let march = ThreadSection.month(monthStart(2026, 3))
+
+        // Idle search: folder collapsed, match hidden.
+        let idle = section(layout([buried]), march)!
+        XCTAssertFalse(idle.isExpanded)
+        XCTAssertTrue(idle.visibleThreads.isEmpty)
+
+        // Active search matching a turn body: folder force-expanded, match visible.
+        let searching = section(layout([buried], search: "tomatoes"), march)!
+        XCTAssertTrue(searching.isExpanded, "search must force folders open")
+        XCTAssertEqual(searching.visibleThreads.map(\.id), [buried.id],
+                       "a match in a collapsed-by-default folder is visible while searching")
+
+        // Clearing the query returns the folder to collapsed.
+        let cleared = section(layout([buried], search: ""), march)!
+        XCTAssertFalse(cleared.isExpanded, "clearing search restores collapsed folders")
+        XCTAssertTrue(cleared.visibleThreads.isEmpty)
+    }
+}

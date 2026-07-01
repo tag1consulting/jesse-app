@@ -19,6 +19,11 @@ struct ThreadListView: View {
     // Live search text. Not persisted — a fresh launch starts with the full list.
     @State private var searchText = ""
 
+    // Which month folders the user has opened, keyed by section identity. Month
+    // folders default collapsed (absent here); day sections never fold. Reset on
+    // launch, so old history opens closed every time.
+    @State private var expandedFolders: Set<ThreadSection> = []
+
     /// Threads the active tab shows, before search. The All view keeps date order
     /// untouched; Favorites simply narrows to starred threads (no reordering or
     /// pinning).
@@ -84,25 +89,74 @@ struct ThreadListView: View {
             ContentUnavailableView.search(text: searchText)
         } else {
             List {
-                ForEach(groupedSections) { group in
-                    Section(group.section.title()) {
-                        ForEach(group.threads) { thread in
-                            NavigationLink(value: thread) {
-                                ThreadRow(thread: thread, running: coordinator.isRunning(thread.id))
-                            }
-                            .swipeActions(edge: .leading) {
-                                Button { toggleFavorite(thread) } label: {
-                                    Label(thread.isFavorite ? "Unfavorite" : "Favorite",
-                                          systemImage: thread.isFavorite ? "star.slash" : "star")
-                                }
-                                .tint(.yellow)
+                switch layout {
+                case .flat(let threads):
+                    // Favorites tab: one flat, newest-first list, no folder chrome.
+                    rows(threads)
+                case .sectioned(let sections):
+                    ForEach(sections) { rendered in
+                        if rendered.isFolder {
+                            folderSection(rendered)
+                        } else {
+                            // Loose day rows: today / yesterday / the one weekday.
+                            Section(rendered.section.title()) {
+                                rows(rendered.threads)
                             }
                         }
-                        .onDelete { delete($0, in: group.threads) }
                     }
                 }
             }
         }
+    }
+
+    /// A month bucket as a collapsible folder: collapsed by default, its header
+    /// showing the month name and a deterministic count + date-range summary.
+    /// Tapping the header toggles it; collapsed hides the member rows entirely.
+    @ViewBuilder
+    private func folderSection(_ rendered: RenderedThreadSection) -> some View {
+        Section(isExpanded: folderBinding(for: rendered)) {
+            rows(rendered.threads)
+        } header: {
+            VStack(alignment: .leading, spacing: 2) {
+                Text(rendered.section.title())
+                Text(folderSummary(for: rendered.threads,
+                                   calendar: .current, locale: .current))
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .textCase(nil)
+            }
+        }
+    }
+
+    /// The shared row list for a set of threads — used by both the flat Favorites
+    /// list and each date section, so swipe-to-favorite and delete behave the same.
+    @ViewBuilder
+    private func rows(_ threads: [JesseThread]) -> some View {
+        ForEach(threads) { thread in
+            NavigationLink(value: thread) {
+                ThreadRow(thread: thread, running: coordinator.isRunning(thread.id))
+            }
+            .swipeActions(edge: .leading) {
+                Button { toggleFavorite(thread) } label: {
+                    Label(thread.isFavorite ? "Unfavorite" : "Favorite",
+                          systemImage: thread.isFavorite ? "star.slash" : "star")
+                }
+                .tint(.yellow)
+            }
+        }
+        .onDelete { delete($0, in: threads) }
+    }
+
+    /// Binding a collapsible `Section` reads for its expanded state. The getter
+    /// reflects the resolved layout (so an active search shows folders open); the
+    /// setter records the user's manual toggle in `expandedFolders`.
+    private func folderBinding(for rendered: RenderedThreadSection) -> Binding<Bool> {
+        Binding(
+            get: { rendered.isExpanded },
+            set: { open in
+                if open { expandedFolders.insert(rendered.section) }
+                else { expandedFolders.remove(rendered.section) }
+            })
     }
 
     private func toggleFavorite(_ thread: JesseThread) {
@@ -124,18 +178,19 @@ struct ThreadListView: View {
         path.append(thread)
     }
 
-    /// Threads bucketed into date sections, sections newest-first. Threads keep
-    /// the `@Query`'s `updatedAt`-descending order within each section because
-    /// `Dictionary(grouping:)` preserves source order per group. `now` is read
-    /// once here so every thread is classified against the same instant.
-    private var groupedSections: [ThreadGroup] {
-        let now = Date.now
-        let grouped = Dictionary(grouping: searched) {
-            threadSection(for: $0.updatedAt, now: now, calendar: .current)
-        }
-        return grouped
-            .map { ThreadGroup(section: $0.key, threads: $0.value) }
-            .sorted { $0.section.sortKey > $1.section.sortKey }
+    /// The list's presentation: flat for the Favorites tab, date-sectioned with
+    /// collapsible month folders for All. Pure `threadListLayout` does the
+    /// grouping/folding; `now` is read once here so every thread is classified
+    /// against the same instant. Favorite-filtering and search happen inside the
+    /// pure function, so `visible`/`searched` above just feed the empty-state
+    /// checks.
+    private var layout: ThreadListLayout {
+        threadListLayout(threads,
+                         favoritesOnly: favoritesOnly,
+                         searchQuery: searchText,
+                         expanded: expandedFolders,
+                         now: Date.now,
+                         calendar: .current)
     }
 
     private func delete(_ offsets: IndexSet, in sectionThreads: [JesseThread]) {
@@ -167,14 +222,6 @@ struct ThreadListView: View {
             }
         }
     }
-}
-
-/// One date-bucketed section of the list. `ThreadSection` is its stable
-/// identity, so SwiftUI re-renders correctly as threads move between buckets.
-private struct ThreadGroup: Identifiable {
-    let section: ThreadSection
-    let threads: [JesseThread]
-    var id: ThreadSection { section }
 }
 
 /// A list row: title, relative last-activity time, and a live dot while running.

@@ -81,6 +81,69 @@ final class FavoritesTests: XCTestCase {
         XCTAssertEqual(section, .month(cal.date(from: DateComponents(year: 2026, month: 3))!))
     }
 
+    /// A months-old favorite whose month folder is collapsed in the All tab must
+    /// still be reachable: it appears in the flat Favorites tab, and a content
+    /// search matching one of its turns surfaces it in BOTH tabs — the new
+    /// collapsible folders must not strand aged, starred threads.
+    func testOldFavoriteReachableDespiteCollapsedFolder() {
+        var cal = Calendar(identifier: .gregorian)
+        cal.timeZone = TimeZone(identifier: "UTC")!
+        cal.locale = Locale(identifier: "en_US_POSIX")
+        let now = date(2026, 6, 25)
+
+        let fav = JesseThread(mode: .ask, createdAt: date(2026, 3, 12))
+        fav.title = "Garden plans"
+        fav.updatedAt = date(2026, 3, 12)
+        fav.turns = [
+            Turn(role: .user, text: "what should I plant?", createdAt: date(2026, 3, 12)),
+            Turn(role: .jesse, text: "Tomatoes do well on the south wall.",
+                 createdAt: date(2026, 3, 12)),
+        ]
+        fav.setFavorite(true, now: date(2026, 3, 12))
+
+        let recent = JesseThread(mode: .ask, createdAt: now)
+        recent.title = "Grocery list"
+        recent.updatedAt = now
+
+        let all = [recent, fav]
+        let march = ThreadSection.month(cal.date(from: DateComponents(year: 2026, month: 3))!)
+
+        func build(favoritesOnly: Bool, search: String = "") -> ThreadListLayout {
+            threadListLayout(all, favoritesOnly: favoritesOnly, searchQuery: search,
+                             expanded: [], now: now, calendar: cal)
+        }
+
+        // All tab, idle: the favorite's March folder is collapsed, its row hidden.
+        guard case .sectioned(let allSections) = build(favoritesOnly: false) else {
+            return XCTFail("All tab should be sectioned")
+        }
+        let marchFolder = allSections.first { $0.section == march }
+        XCTAssertNotNil(marchFolder)
+        XCTAssertTrue(marchFolder!.isFolder)
+        XCTAssertFalse(marchFolder!.isExpanded, "the old favorite's folder is collapsed")
+        XCTAssertTrue(marchFolder!.visibleThreads.isEmpty)
+
+        // Favorites tab: flat list, the aged favorite present regardless of age.
+        guard case .flat(let favList) = build(favoritesOnly: true) else {
+            return XCTFail("Favorites tab should be flat")
+        }
+        XCTAssertEqual(favList.map(\.id), [fav.id])
+
+        // Content search in the All tab surfaces it (folder force-expanded).
+        guard case .sectioned(let searchedAll) = build(favoritesOnly: false, search: "tomatoes") else {
+            return XCTFail("searched All tab should be sectioned")
+        }
+        let matched = searchedAll.first { $0.section == march }
+        XCTAssertEqual(matched?.visibleThreads.map(\.id), [fav.id],
+                       "a content search surfaces the aged favorite in the All tab")
+
+        // Content search in the Favorites tab surfaces it too.
+        guard case .flat(let searchedFavs) = build(favoritesOnly: true, search: "tomatoes") else {
+            return XCTFail("searched Favorites tab should be flat")
+        }
+        XCTAssertEqual(searchedFavs.map(\.id), [fav.id])
+    }
+
     // MARK: - Persistence round-trip through SwiftData
 
     @MainActor
