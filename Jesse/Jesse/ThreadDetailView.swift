@@ -25,6 +25,12 @@ struct ThreadDetailView: View {
     private var running: Bool { coordinator.isRunning(thread.id) }
     private var turns: [Turn] { thread.orderedTurns }
 
+    // Auto-scroll follows the newest text only while the user is parked at the
+    // bottom. Scrolling up (even mid-stream) suppresses follow and reveals the
+    // "jump to latest" button; the follow decision itself lives in the pure,
+    // unit-tested `TranscriptScroll` helper.
+    @State private var isAtBottom = true
+
     var body: some View {
         VStack(spacing: 12) {
             transcript
@@ -123,15 +129,64 @@ struct ThreadDetailView: View {
                 }
                 .frame(maxWidth: .infinity, alignment: .leading)
             }
-            .onChange(of: turns.count) { _, _ in scrollToBottom(proxy) }
-            .onChange(of: running) { _, _ in scrollToBottom(proxy) }
-            // Keep the newest streamed text in view as it grows.
-            .onChange(of: coordinator.partialText(for: thread.id)) { _, _ in scrollToBottom(proxy) }
-            .onAppear { scrollToBottom(proxy, animated: false) }
+            // Track whether the user is parked at the bottom straight from the
+            // scroll geometry, tolerating rubber-banding and the growing partial.
+            .onScrollGeometryChange(for: Bool.self) { geo in
+                TranscriptScroll.isAtBottom(
+                    contentOffsetY: geo.contentOffset.y,
+                    contentHeight: geo.contentSize.height,
+                    containerHeight: geo.containerSize.height)
+            } action: { _, atBottom in
+                isAtBottom = atBottom
+            }
+            // A finished reply (turns.count) or the running flag flipping follows
+            // only when at the bottom; a settled change animates gently.
+            .onChange(of: turns.count) { _, _ in autoScroll(proxy, trigger: .jesseTurnAppended) }
+            .onChange(of: running) { _, _ in autoScroll(proxy, trigger: .runningChanged) }
+            // Keep the newest streamed text in view as it grows — but never
+            // animate a delta (a 0.2s tween against a moving target is the
+            // over-scroll churn) and never yank a user who has scrolled up.
+            .onChange(of: coordinator.partialText(for: thread.id)) { _, _ in
+                autoScroll(proxy, trigger: .streamDelta)
+            }
+            .onAppear { autoScroll(proxy, trigger: .appeared) }
+            // One-tap return to live when the user has scrolled up during (or
+            // after) a reply. Hidden while following, so it's out of the way.
+            .overlay(alignment: .bottomTrailing) { jumpToLatestButton(proxy) }
+        }
+    }
+
+    @ViewBuilder
+    private func jumpToLatestButton(_ proxy: ScrollViewProxy) -> some View {
+        if !isAtBottom && (running || !turns.isEmpty) {
+            Button {
+                isAtBottom = true
+                scrollToBottom(proxy, animated: true)
+            } label: {
+                Image(systemName: "chevron.down.circle.fill")
+                    .font(.title)
+                    .symbolRenderingMode(.hierarchical)
+                    .foregroundStyle(.tint)
+                    .background(Circle().fill(.background))
+            }
+            .accessibilityLabel("Jump to latest")
+            .padding(.trailing, 4)
+            .padding(.bottom, 8)
+            .transition(.opacity)
         }
     }
 
     private static let bottomAnchor = "jesse.transcript.bottom"
+
+    /// Auto-scroll for a change of kind `trigger`, gated on follow state. Stream
+    /// deltas and the initial appear scroll without animation (no chasing a
+    /// moving target; land instantly on open); settled turn/running changes get
+    /// a short ease. `.userSentTurn`/`.appeared` scroll regardless of position.
+    private func autoScroll(_ proxy: ScrollViewProxy, trigger: ScrollTrigger) {
+        guard TranscriptScroll.shouldAutoScroll(isAtBottom: isAtBottom, trigger: trigger) else { return }
+        let animated = trigger != .streamDelta && trigger != .appeared
+        scrollToBottom(proxy, animated: animated)
+    }
 
     private func scrollToBottom(_ proxy: ScrollViewProxy, animated: Bool = true) {
         guard !turns.isEmpty || running else { return }
@@ -321,6 +376,12 @@ struct ThreadDetailView: View {
         input = ""
         attachments = []
         attachError = nil
+        // The user just spoke — re-enable follow so the appended turn (and the
+        // reply that streams after it) jumps to the bottom, even if they'd
+        // scrolled up to read history. This is the `.userSentTurn` semantics:
+        // the turns.count bump that `coordinator.send` triggers now scrolls
+        // because `isAtBottom` is true again.
+        isAtBottom = true
         // `coordinator.send` clears the thread's error itself. Don't clear it here
         // first: while a recoverable error is showing, the retained job_id would
         // otherwise make `isRunning` read true and silently drop this new send.
