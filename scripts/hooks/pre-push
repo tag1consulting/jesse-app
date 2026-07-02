@@ -1,0 +1,40 @@
+#!/usr/bin/env bash
+#
+# pre-push — block a push that changes a component's sources without bumping that
+# component's version and updating CHANGELOG.md. It runs the SAME rule as CI
+# (scripts/version-guard.sh) against the commits being pushed, so an un-bumped
+# change never reaches the remote. Depends only on git and the in-repo script.
+#
+# Install with: scripts/install-hooks.sh  (sets core.hooksPath to scripts/hooks).
+set -euo pipefail
+
+ROOT="$(git rev-parse --show-toplevel)"
+GUARD="$ROOT/scripts/version-guard.sh"
+if [ ! -f "$GUARD" ]; then
+  echo "pre-push: $GUARD not found — skipping version check." >&2
+  exit 0
+fi
+
+ZERO="0000000000000000000000000000000000000000"
+
+# Pick the diff base for what's being pushed. Prefer the remote sha git feeds us
+# on stdin (exactly what the remote already has); else the branch's upstream;
+# else HEAD~1. If none resolves (initial push with no parent), the guard skips.
+base=""
+while read -r local_ref local_sha remote_ref remote_sha; do
+  [ "${local_sha:-$ZERO}" = "$ZERO" ] && continue   # branch deletion — nothing to check
+  if [ -n "${remote_sha:-}" ] && [ "$remote_sha" != "$ZERO" ] \
+     && git rev-parse --verify --quiet "${remote_sha}^{commit}" >/dev/null 2>&1; then
+    base="$remote_sha"
+  fi
+done
+
+if [ -z "$base" ]; then
+  base="$(git rev-parse --verify --quiet '@{u}' || true)"
+fi
+if [ -z "$base" ]; then
+  base="HEAD~1"
+fi
+
+echo "pre-push: enforcing version bumps (base=$base)…"
+VERSION_GUARD_BASE="$base" bash "$GUARD"

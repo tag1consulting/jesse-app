@@ -46,7 +46,10 @@ pub struct TitleRequest {
 /// filesystem layout), so they are surfaced **only to an authenticated caller**;
 /// an unauthenticated probe never sees them.
 pub async fn health(State(st): State<AppState>, headers: HeaderMap) -> Json<Value> {
-    let mut body = json!({ "ok": true });
+    // The crate version is returned UNCONDITIONALLY, before the auth-gated
+    // operator detail — a version string isn't sensitive, and the app shows it
+    // as the running bridge version alongside its own.
+    let mut body = json!({ "ok": true, "version": env!("CARGO_PKG_VERSION") });
     if check_auth(&headers, &st.cfg.token).is_ok() {
         body["vault"] = json!(st.cfg.vault);
         body["claude"] = json!(st.cfg.claude_bin);

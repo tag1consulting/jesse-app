@@ -30,6 +30,9 @@ use tower::ServiceExt;
         assert_eq!(resp.status(), StatusCode::OK);
         let body: Value = serde_json::from_str(&body_string(resp).await).unwrap();
         assert_eq!(body["ok"], true);
+        // The version is surfaced unconditionally (it isn't sensitive) and must
+        // match the crate version — that's the whole point of the mandatory bump.
+        assert_eq!(body["version"], env!("CARGO_PKG_VERSION"));
         assert!(body.get("vault").is_none(), "vault path must not leak unauthenticated");
         assert!(body.get("claude").is_none(), "claude path must not leak unauthenticated");
     }
@@ -52,6 +55,7 @@ use tower::ServiceExt;
         assert_eq!(resp.status(), StatusCode::OK);
         let body: Value = serde_json::from_str(&body_string(resp).await).unwrap();
         assert_eq!(body["ok"], true);
+        assert_eq!(body["version"], env!("CARGO_PKG_VERSION"));
         assert_eq!(body["vault"], st.cfg.vault);
         assert_eq!(body["claude"], st.cfg.claude_bin);
     }

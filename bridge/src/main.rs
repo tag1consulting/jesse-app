@@ -76,7 +76,11 @@ async fn main() {
         state.cfg.port, state.cfg.token
     );
 
-    println!("Jesse Bridge → http://{addr}  (vault: {})", state.cfg.vault);
+    println!(
+        "Jesse Bridge v{} → http://{addr}  (vault: {})",
+        env!("CARGO_PKG_VERSION"),
+        state.cfg.vault
+    );
     let listener = tokio::net::TcpListener::bind(&addr)
         .await
         .expect("bind failed");

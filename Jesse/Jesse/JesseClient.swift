@@ -277,6 +277,13 @@ struct JesseReply: Equatable {
     }
 }
 
+/// Parsed `GET /health` result. Only the bridge `version` is modeled — the
+/// liveness `ok` flag and the auth-gated operator paths (vault / claude) aren't
+/// needed by the app. `version` is nil for a bridge too old to report one.
+struct BridgeHealth: Equatable {
+    let version: String?
+}
+
 /// What `GET /jesse/prompts` returns: the two editable wrapper defaults plus the
 /// two fixed safety floors. The floors are display-only — the bridge always
 /// prepends them and a custom wrapper can't drop them — so the app shows them
@@ -400,6 +407,14 @@ nonisolated struct JesseResultResponse: Decodable {
     }
 }
 
+/// Decoded `GET /health` body. `version` is returned unconditionally by the
+/// bridge (before the auth-gated operator paths); it's optional here so a bridge
+/// too old to report one still decodes cleanly to `version == nil`.
+nonisolated struct JesseHealthResponse: Decodable {
+    let ok: Bool?
+    let version: String?
+}
+
 /// Decoded `GET /jesse/prompts` body — all four fields required.
 nonisolated struct JessePromptsResponse: Decodable {
     let ask: String
@@ -460,6 +475,11 @@ protocol JesseClientProtocol {
               instructions: String?, floorOverride: String?,
               attachments: [JesseAttachment]) async throws -> JesseSendResult
     func result(jobId: String) async throws -> JesseResultState
+    /// Probe `GET /health` and parse the bridge's reported version. Used to show
+    /// the running bridge version in Settings alongside the app's own. Throws on a
+    /// transport/HTTP failure; a bridge too old to report a version returns
+    /// `BridgeHealth(version: nil)`.
+    func health() async throws -> BridgeHealth
     /// Best-effort request to stop an in-flight turn server-side. Idempotent.
     func cancelJob(jobId: String) async throws
     /// Live token stream for a running turn (`GET /jesse/stream/{job_id}`). Yields
@@ -485,6 +505,10 @@ protocol JesseClientProtocol {
 }
 
 extension JesseClientProtocol {
+    // Default "no version" so existing conformers (the test fakes) need not
+    // implement the health probe; only the production `JesseClient` — and the
+    // test that exercises this seam — return a real version.
+    func health() async throws -> BridgeHealth { BridgeHealth(version: nil) }
     // Default no-ops so existing conformers (the test fakes) need not implement
     // the push methods; only the production `JesseClient` does the real calls.
     func registerDevice(token: String) async throws {}
@@ -611,6 +635,28 @@ struct JesseClient: JesseClientProtocol {
             throw JesseError.from(error, host: config.normalizedHost)
         }
         return try Self.decodeResult(data: data, resp: resp)
+    }
+
+    /// Probe `GET /health` and parse the bridge's reported version. The version is
+    /// returned unconditionally by the bridge, but we still send the bearer (when
+    /// set) so this reuses the same auth shape as every other call. Throws on a
+    /// transport/HTTP failure; a healthy-but-old bridge yields `version == nil`.
+    func health() async throws -> BridgeHealth {
+        guard !config.normalizedHost.isEmpty,
+              let url = config.endpoint("/health") else { throw JesseError.notConfigured }
+        var req = URLRequest(url: url)
+        req.httpMethod = "GET"
+        if !config.token.isEmpty {
+            req.setValue("Bearer \(config.token)", forHTTPHeaderField: "Authorization")
+        }
+
+        let data: Data, resp: URLResponse
+        do {
+            (data, resp) = try await session.data(for: req)
+        } catch {
+            throw JesseError.from(error, host: config.normalizedHost)
+        }
+        return try Self.decodeHealth(data: data, resp: resp)
     }
 
     /// Best-effort cancel of an in-flight turn (`POST /jesse/cancel/{job_id}`).
@@ -969,6 +1015,20 @@ struct JesseClient: JesseClientProtocol {
         }
     }
 
+    static func decodeHealth(data: Data, resp: URLResponse) throws -> BridgeHealth {
+        guard let http = resp as? HTTPURLResponse else { throw JesseError.decoding }
+        guard (200..<300).contains(http.statusCode) else {
+            throw JesseError.badResponse(http.statusCode,
+                                         String(data: data, encoding: .utf8) ?? "")
+        }
+        guard let obj = try? JSONDecoder().decode(JesseHealthResponse.self, from: data) else {
+            throw JesseError.decoding
+        }
+        // Normalize a blank version to nil so "unknown" is shown, not an empty row.
+        let v = obj.version?.trimmingCharacters(in: .whitespacesAndNewlines)
+        return BridgeHealth(version: (v?.isEmpty ?? true) ? nil : v)
+    }
+
     static func decodePrompts(data: Data, resp: URLResponse) throws -> PromptDefaults {
         guard let http = resp as? HTTPURLResponse else { throw JesseError.decoding }
         guard (200..<300).contains(http.statusCode) else {
@@ -1051,5 +1111,54 @@ enum ConfigStore {
             return false
         }
         return true
+    }
+}
+
+// MARK: - Version surfacing
+
+/// The app's own version, read from the bundle — never hardcoded, so it always
+/// matches `CFBundleShortVersionString`/`CFBundleVersion` (the pbxproj
+/// `MARKETING_VERSION`/`CURRENT_PROJECT_VERSION` the version guard enforces).
+enum AppVersion {
+    static var short: String {
+        Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "—"
+    }
+    static var build: String {
+        Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "—"
+    }
+    /// e.g. "1.0 (2)".
+    static var display: String { "\(short) (\(build))" }
+}
+
+/// Persists the last-seen bridge version (from `GET /health`) so Settings can show
+/// it even before a fresh probe returns. Backed by `UserDefaults`; the store is
+/// injectable purely so a test can point it at a scratch suite (mirroring
+/// `ConfigStore`'s seams).
+enum BridgeVersionStore {
+    nonisolated(unsafe) static var defaults: UserDefaults = .standard
+    private static let key = "bridgeVersion"
+
+    /// The last version the bridge reported, or nil if never fetched.
+    static var current: String? { defaults.string(forKey: key) }
+
+    static func set(_ version: String?) {
+        if let version, !version.isEmpty {
+            defaults.set(version, forKey: key)
+        } else {
+            defaults.removeObject(forKey: key)
+        }
+    }
+
+    /// Probe health via `client` and store the reported version. Returns the value
+    /// now stored (the fresh version on success, else the previously-stored one —
+    /// a failed probe never clobbers a known-good version). This is the seam the
+    /// version test drives with a mock client.
+    @discardableResult
+    static func refresh(using client: JesseClientProtocol) async -> String? {
+        if let health = try? await client.health(), let v = health.version, !v.isEmpty {
+            set(v)
+            return v
+        }
+        return current
     }
 }

@@ -118,6 +118,14 @@ else
   echo "ci-guards: gitleaks not installed — skipping secret scan locally (enforced in CI)." >&2
 fi
 
+# 7) (Versioning) Mandatory version bumps. A change to a component's sources must
+#    bump that component's version and update CHANGELOG.md. Delegated to the
+#    dedicated version-guard.sh (shared with the pre-push hook); it skips cleanly
+#    when there's no parent commit (initial commit / shallow checkout).
+if ! bash "$ROOT/scripts/version-guard.sh"; then
+  fail=1
+fi
+
 if [ "$fail" -ne 0 ]; then
   echo "ci-guards: one or more guards failed." >&2
   exit 1

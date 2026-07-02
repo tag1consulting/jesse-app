@@ -134,6 +134,11 @@ struct SettingsView: View {
     @State private var promptsError: String?
     @State private var loadingPrompts = false
 
+    // Last-seen bridge version (from GET /health), shown next to the app's own.
+    // Seeded from the persisted value so it's populated before a fresh probe, then
+    // refreshed on appear and whenever we contact the bridge for defaults.
+    @State private var bridgeVersion: String? = BridgeVersionStore.current
+
     var body: some View {
         NavigationStack {
             Form {
@@ -207,6 +212,15 @@ struct SettingsView: View {
                 }
 
                 floorSection(for: .tell)
+
+                Section {
+                    LabeledContent("App", value: AppVersion.display)
+                    LabeledContent("Bridge", value: bridgeVersion ?? "unknown")
+                } header: {
+                    Text("Version")
+                } footer: {
+                    Text("The bridge version updates when you load defaults or reopen Settings while connected.")
+                }
             }
             .navigationTitle("Settings")
             .alert("Couldn’t save your settings", isPresented: $showSaveError) {
@@ -263,10 +277,25 @@ struct SettingsView: View {
                 askFloorUnlocked = false
                 tellFloorUnlocked = false
             }
+            .task { await refreshBridgeVersion() }
             .sheet(isPresented: $showScanner) {
                 scannerSheet
             }
         }
+    }
+
+    // MARK: - Version
+
+    /// Probe `GET /health` with the currently-entered host/token and update the
+    /// shown bridge version (and the persisted value). No-op when unconfigured; a
+    /// failed probe leaves the last-known version in place rather than blanking it.
+    private func refreshBridgeVersion() async {
+        let cfg = JesseConfig(host: host.isEmpty ? config.host : host,
+                              port: Int(port) ?? config.port,
+                              token: token.isEmpty ? config.token : token)
+        guard cfg.isConfigured else { return }
+        let v = await BridgeVersionStore.refresh(using: JesseClient(config: cfg))
+        bridgeVersion = v
     }
 
     // MARK: - Prompt defaults
@@ -292,6 +321,9 @@ struct SettingsView: View {
             PromptStore.cacheDefault(.tell, .floor, d.tellFloor)
             if PromptStore.override(for: .ask, .floor) == nil { askFloorText = d.askFloor }
             if PromptStore.override(for: .tell, .floor) == nil { tellFloorText = d.tellFloor }
+            // We just reached the bridge — refresh the shown version off the same
+            // connection attempt.
+            bridgeVersion = await BridgeVersionStore.refresh(using: JesseClient(config: cfg))
             return d
         } catch {
             let detail = (error as? JesseError)?.errorDescription ?? error.localizedDescription

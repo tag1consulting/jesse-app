@@ -699,6 +699,42 @@ The server refuses to start if `JESSE_TOKEN` is unset, the vault isn't a
 directory, the `claude` binary can't be found, or `JESSE_BIND` is an unsafe
 address without the override.
 
+## Versioning
+
+The **bridge** and the **app** are versioned **independently**:
+
+- Bridge: `version` in `bridge/Cargo.toml` (SemVer). Surfaced at runtime — the
+  startup banner (`Jesse Bridge v0.1.1 → …`) and `GET /health` (`"version"`,
+  returned unconditionally, before the auth-gated fields).
+- App: `MARKETING_VERSION (CURRENT_PROJECT_VERSION)` in the Xcode
+  `project.pbxproj` (e.g. `1.0 (2)`). Shown in **Settings → Version**, next to the
+  bridge version the app reads from `/health`.
+
+**Every commit that touches a component bumps that component's version and adds a
+`CHANGELOG.md` entry.** Pick the bump by change type: **patch** for a fix,
+**minor** for a backward-compatible feature, **major** for a breaking change
+(bridge); for the app, bump `CURRENT_PROJECT_VERSION` (build) every release and
+`MARKETING_VERSION` for a user-facing version change.
+
+This is **enforced**, not a convention:
+
+- **Pre-push hook (the real gate).** `scripts/hooks/pre-push` runs
+  `scripts/version-guard.sh` against the commits being pushed and **blocks the
+  push** if a component changed without a version bump + CHANGELOG entry, printing
+  exactly what to bump. Install it once per clone:
+
+  ```bash
+  scripts/install-hooks.sh   # sets core.hooksPath to scripts/hooks
+  ```
+
+  It depends only on git and the in-repo script — nothing outside the repo.
+
+- **CI re-checks.** `scripts/ci-guards.sh` (run by the bridge CI job) calls the
+  same `version-guard.sh`, so an un-bumped change can't merge even if the hook was
+  never installed. The guard skips cleanly when there's no parent commit (initial
+  commit / shallow checkout). The diff base is overridable via
+  `VERSION_GUARD_BASE` (default `HEAD~1`).
+
 ## Hardening past the PoC
 
 - Put it behind `tailscale serve` for real TLS + a stable hostname.
