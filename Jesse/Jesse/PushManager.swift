@@ -90,6 +90,9 @@ final class AppDelegate: NSObject, UIApplicationDelegate, UNUserNotificationCent
         // taps reach us. Authorization is requested later (after a turn succeeds),
         // not here on cold launch.
         UNUserNotificationCenter.current().delegate = self
+        // Start listening for spoken turns relayed from the Apple Watch. No-ops on a
+        // device without WatchConnectivity support (e.g. iPad).
+        PhoneWatchConnectivity.shared.activate()
         return true
     }
 

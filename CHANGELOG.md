@@ -15,6 +15,35 @@ CI both run it). See the "Versioning" section of `bridge/README.md`.
 
 ## [Unreleased]
 
+## [App 1.0 (4)] — 2026-07-02
+
+### Added
+- **Apple Watch app — talk to Jesse from your wrist.** A watchOS companion app
+  (`Jesse Watch App`) plus the phone-side speech-to-text that backs it. One tap
+  starts listening (no press-and-hold); the watch auto-stops on ~1.5 s of silence
+  (with a hard max-record cap and a manual tap-to-stop), sends the audio to the
+  phone, and shows Listening → "Jesse is thinking…" → the reply, speaking the
+  spoken line aloud with a haptic on arrival. Ask/Tell toggle (default Ask).
+  - **The watch never talks to the bridge and holds no bridge token.** It speaks
+    only to the phone over WatchConnectivity. The phone transcribes the audio
+    on-device (`SFSpeechRecognizer`, offline where supported) and feeds the text
+    into the existing `WatchRelay` entry point (`voice: true`), so the exchange
+    lands in the phone's history tagged `watch` — reusing the one turn/persistence
+    path, no fork.
+  - **Two-path reply delivery.** The phone answers on `transferUserInfo` (reliable,
+    background-delivered source of truth) AND `sendMessage` when reachable
+    (immediacy); the watch de-dupes by `requestId` so a reply renders and speaks
+    once. A turn sent while the phone is unreachable is queued ("will send when
+    your phone is reachable"), never silently dropped.
+  - **Shared, tested seams.** A pure WatchConnectivity wire codec (value ↔
+    `[String: Any]`, rejects malformed/oversized payloads), a pure end-of-speech
+    silence detector over metering samples, and pure reply-dedup-by-requestId are
+    compiled into both the phone and the watch and unit-tested from the iOS test
+    target. The phone STT path is tested behind an injectable transcriber seam
+    (fake transcript → relayed text, `voice: true`, thread tagged `watch`).
+- The phone gained a Speech-recognition usage string; the watch a microphone
+  usage string.
+
 ## [App 1.0 (3)] — 2026-07-02
 
 ### Added

@@ -10,24 +10,27 @@ import os
 // module). Every message is logged `.public`: these are our own diagnostic strings
 // — the bearer token and other secrets are never passed here — so redacting them to
 // `<private>` would defeat the point of having them at all.
-struct AppLog {
+// `nonisolated` throughout so diagnostics can be logged from any context — the
+// watch relay logs from nonisolated WCSession delegate callbacks. `Logger` is
+// Sendable, so `AppLog` is too.
+struct AppLog: Sendable {
     let logger: Logger
 
-    func error(_ message: String) { logger.error("\(message, privacy: .public)") }
-    func notice(_ message: String) { logger.notice("\(message, privacy: .public)") }
-    func debug(_ message: String) { logger.debug("\(message, privacy: .public)") }
+    nonisolated func error(_ message: String) { logger.error("\(message, privacy: .public)") }
+    nonisolated func notice(_ message: String) { logger.notice("\(message, privacy: .public)") }
+    nonisolated func debug(_ message: String) { logger.debug("\(message, privacy: .public)") }
 }
 
 enum Log {
-    private static let subsystem = "com.tag1.jesse"
+    private nonisolated static let subsystem = "com.tag1.jesse"
 
     /// Turn lifecycle: send → consume → finish, and the recoverable/terminal
     /// failure paths. The silent-loss diagnostics live here.
-    static let run = AppLog(logger: Logger(subsystem: subsystem, category: "run"))
+    nonisolated static let run = AppLog(logger: Logger(subsystem: subsystem, category: "run"))
     /// Spoken-reply audio-session configuration and routing failures.
-    static let speaker = AppLog(logger: Logger(subsystem: subsystem, category: "speaker"))
+    nonisolated static let speaker = AppLog(logger: Logger(subsystem: subsystem, category: "speaker"))
     /// Push registration / remote-notification callbacks.
-    static let push = AppLog(logger: Logger(subsystem: subsystem, category: "push"))
+    nonisolated static let push = AppLog(logger: Logger(subsystem: subsystem, category: "push"))
     /// Keychain reads/writes for the bridge config (host/port/token).
-    static let keychain = AppLog(logger: Logger(subsystem: subsystem, category: "keychain"))
+    nonisolated static let keychain = AppLog(logger: Logger(subsystem: subsystem, category: "keychain"))
 }

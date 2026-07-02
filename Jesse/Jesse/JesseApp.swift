@@ -20,6 +20,6 @@ struct JesseApp: App {
             ContentView()
                 .environment(coordinator)
         }
-        .modelContainer(for: [JesseThread.self, Turn.self])
+        .modelContainer(AppModelContainer.shared)
     }
 }
