@@ -10,6 +10,17 @@ enum TurnRole: String {
     case jesse
 }
 
+/// Where a thread's first turn came from. `phone` is everything the app itself
+/// starts (typed composer, Siri); `watch` is a turn relayed through the phone
+/// from an Apple Watch. Modeled as a small String-backed enum so `JesseThread`
+/// can store a stable raw value that lightweight-migrates, mirroring how `mode`
+/// maps to `JesseMode`. An unknown/absent raw value reads as `.phone`, so an
+/// existing store with no `origin` column migrates without loss.
+enum ThreadOrigin: String {
+    case phone
+    case watch
+}
+
 @Model
 final class JesseThread {
     var id: UUID = UUID()
@@ -44,6 +55,13 @@ final class JesseThread {
     // stale (a turn was appended or edited) and a regeneration is due. Default nil
     // → lightweight migration, and nil reads as "no cached title yet".
     var titleSourceKey: String?
+    // Where this thread originated: "phone" (the default — typed composer, Siri)
+    // or "watch" (relayed through the phone from an Apple Watch). Stored as the
+    // raw value of `ThreadOrigin`, read back via `originValue`. New property with a
+    // default → SwiftData lightweight-migrates existing stores with no migration
+    // code (matching `isFavorite`/`aiTitle`), and an old row with no value reads as
+    // `.phone`.
+    var origin: String = ThreadOrigin.phone.rawValue
 
     @Relationship(deleteRule: .cascade, inverse: \Turn.thread)
     var turns: [Turn] = []
@@ -57,6 +75,11 @@ final class JesseThread {
     }
 
     var modeValue: JesseMode { JesseMode(rawValue: mode) ?? .ask }
+
+    /// The thread's origin, decoded from the stored raw value. An unknown or absent
+    /// value (a store migrated from before `origin` existed) reads as `.phone`,
+    /// mirroring how `modeValue` defaults an unknown mode to `.ask`.
+    var originValue: ThreadOrigin { ThreadOrigin(rawValue: origin) ?? .phone }
 
     /// Flip the favorite flag, stamping `favoritedAt` when starring and clearing
     /// it when unstarring. `now` is injectable so tests don't read the clock.

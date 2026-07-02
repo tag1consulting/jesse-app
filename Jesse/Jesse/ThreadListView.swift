@@ -13,8 +13,28 @@ struct ThreadListView: View {
     @Binding var config: JesseConfig
     @Binding var showSettings: Bool
 
-    // Remembered across launches: false = All, true = Favorites only.
-    @AppStorage("threadListFavoritesOnly") private var favoritesOnly = false
+    // Which scope the list is showing, remembered across launches. All is the
+    // default; Favorites narrows to starred threads; Watch narrows to threads
+    // relayed from an Apple Watch. Stored as the raw string so it lightweight-adds
+    // over the old boolean-favorites default (an unknown value reads as `.all`).
+    enum ListScope: String, CaseIterable {
+        case all, favorites, watch
+        var label: String {
+            switch self {
+            case .all: return "All"
+            case .favorites: return "Favorites"
+            case .watch: return "Watch"
+            }
+        }
+    }
+    @AppStorage("threadListScope") private var scopeRaw = ListScope.all.rawValue
+    private var scope: ListScope { ListScope(rawValue: scopeRaw) ?? .all }
+
+    /// The two orthogonal filters the current scope maps to, so the pure
+    /// `threadListLayout` and the empty-state checks stay expressed in the same
+    /// favorites/origin terms they always were.
+    private var favoritesOnly: Bool { scope == .favorites }
+    private var originScope: ThreadOriginScope { scope == .watch ? .watch : .all }
 
     // Live search text. Not persisted — a fresh launch starts with the full list.
     @State private var searchText = ""
@@ -24,11 +44,13 @@ struct ThreadListView: View {
     // launch, so old history opens closed every time.
     @State private var expandedFolders: Set<ThreadSection> = []
 
-    /// Threads the active tab shows, before search. The All view keeps date order
-    /// untouched; Favorites simply narrows to starred threads (no reordering or
-    /// pinning).
+    /// Threads the active scope shows, before search. The All view keeps date order
+    /// untouched; Favorites narrows to starred threads; Watch narrows to
+    /// watch-relayed threads (no reordering or pinning in any). The two filters
+    /// stack so the empty-state checks below see exactly what the layout will.
     private var visible: [JesseThread] {
-        favoritesOnly ? threads.filter(\.isFavorite) : threads
+        (favoritesOnly ? threads.filter(\.isFavorite) : threads)
+            .filter { threadMatchesOrigin($0, scope: originScope) }
     }
 
     /// `visible` narrowed by the search query (title + turn bodies). A blank
@@ -43,9 +65,10 @@ struct ThreadListView: View {
         VStack(spacing: 0) {
             // Only meaningful once there's at least one conversation to filter.
             if !threads.isEmpty {
-                Picker("Filter", selection: $favoritesOnly) {
-                    Text("All").tag(false)
-                    Text("Favorites").tag(true)
+                Picker("Filter", selection: $scopeRaw) {
+                    ForEach(ListScope.allCases, id: \.rawValue) { scope in
+                        Text(scope.label).tag(scope.rawValue)
+                    }
                 }
                 .pickerStyle(.segmented)
                 .padding(.horizontal)
@@ -76,12 +99,21 @@ struct ThreadListView: View {
                 Text("Tap + to start one.")
             }
         } else if visible.isEmpty {
-            // Favorites filter on, nothing starred yet. The picker above stays
-            // visible so you can switch back to All.
-            ContentUnavailableView {
-                Label("No favorites yet", systemImage: "star")
-            } description: {
-                Text("Swipe a conversation and tap Favorite to star it.")
+            // A scope filter is on but nothing matches it yet. The picker above
+            // stays visible so you can switch back to All.
+            switch scope {
+            case .watch:
+                ContentUnavailableView {
+                    Label("No watch conversations yet", systemImage: "applewatch")
+                } description: {
+                    Text("Turns relayed from your Apple Watch will appear here.")
+                }
+            default:
+                ContentUnavailableView {
+                    Label("No favorites yet", systemImage: "star")
+                } description: {
+                    Text("Swipe a conversation and tap Favorite to star it.")
+                }
             }
         } else if searched.isEmpty {
             // Search is active (a blank query would keep `visible`) but nothing
@@ -211,6 +243,7 @@ struct ThreadListView: View {
     private var layout: ThreadListLayout {
         threadListLayout(threads,
                          favoritesOnly: favoritesOnly,
+                         originScope: originScope,
                          searchQuery: searchText,
                          expanded: expandedFolders,
                          now: Date.now,

@@ -49,6 +49,10 @@ enum ThreadListLayout {
 ///
 /// - `favoritesOnly` collapses to a single flat, newest-first list of starred
 ///   threads with no folder chrome (the "jump straight back" tab).
+/// - `originScope` narrows to threads of one origin (`.watch` = watch-relayed);
+///   `.all` (the default) is inactive. Applied as an additive filter alongside
+///   favorites and search, BEFORE grouping, so a Watch scope stays date-sectioned
+///   and its search only ever searches watch threads.
 /// - A non-empty `searchQuery` filters (title + turn bodies, via `threadMatches`)
 ///   BEFORE grouping and force-expands every month folder, so a match never hides
 ///   behind a collapsed header; clearing the query restores collapsed folders.
@@ -56,11 +60,13 @@ enum ThreadListLayout {
 ///   default collapsed (absent from the set); day sections are always expanded.
 func threadListLayout(_ threads: [JesseThread],
                       favoritesOnly: Bool,
+                      originScope: ThreadOriginScope = .all,
                       searchQuery: String,
                       expanded: Set<ThreadSection>,
                       now: Date,
                       calendar: Calendar) -> ThreadListLayout {
-    let scoped = favoritesOnly ? threads.filter(\.isFavorite) : threads
+    let scoped = (favoritesOnly ? threads.filter(\.isFavorite) : threads)
+        .filter { threadMatchesOrigin($0, scope: originScope) }
     let matched = scoped.filter { threadMatches($0, query: searchQuery) }
     let searchActive = !searchQuery.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
 

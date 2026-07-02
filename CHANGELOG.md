@@ -15,6 +15,32 @@ CI both run it). See the "Versioning" section of `bridge/README.md`.
 
 ## [Unreleased]
 
+## [App 1.0 (3)] — 2026-07-02
+
+### Added
+- **Watch-relay foundation (phone side).** Groundwork for relaying a spoken turn
+  from an Apple Watch through the phone, without the watch app yet (that's the
+  next PR):
+  - `JesseThread` gained an `origin` tag (`ThreadOrigin` — `phone`/`watch`, with a
+    lightweight-migrating default of `phone`), so a relayed conversation can be
+    told apart from an app-started one. An old store with no `origin` reads as
+    `phone`, no migration code.
+  - `WatchRelay` — the entry point the watch will call in PR2 — takes a relayed
+    turn as a value (`RelayedTurn { requestId, text, mode, voice }`), runs it
+    through the **existing** `RunCoordinator`/`JesseClient` turn path (new
+    `RunCoordinator.runRelayTurn`, reusing the same send → poll → `TurnWriter`
+    flow — no forked networking or persistence), tags the created thread `watch`,
+    appends the user and Jesse turns to normal history, and returns a small
+    `RelayResult { displayText, spokenText, sessionId, threadId }`. It
+    deduplicates by `requestId` (a retried id never starts a second turn) and, on
+    failure, returns a clean error value rather than throwing.
+  - A **Watch** scope in the thread list (`ThreadOriginScope`/`threadMatchesOrigin`,
+    a pure Foundation-only predicate) shows only watch-originated threads. It
+    composes with the existing search and Favorites filters and keeps
+    date-sectioning (filter before grouping).
+- No bridge, WatchConnectivity, audio, or speech-to-text yet — all phone-side
+  plumbing, fully unit-tested.
+
 ## [Bridge 0.1.1] — 2026-07-02
 
 ### Added

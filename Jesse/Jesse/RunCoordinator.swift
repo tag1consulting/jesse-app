@@ -786,3 +786,87 @@ final class RunCoordinator {
     }
 
 }
+
+// MARK: - Watch relay (headless turn execution)
+
+extension RunCoordinator {
+    /// The result of a headless relayed turn: the reply, or a clean error message.
+    /// Deliberately a value, not a thrown error — the relay entry point never
+    /// throws into its caller (the watch bridge in PR2). Internal so `WatchRelay`
+    /// can map it into a `RelayOutcome`.
+    enum RelayTurnResult {
+        case reply(JesseReply)
+        case failure(String)
+    }
+
+    /// Run ONE turn to completion headlessly and RETURN its reply, reusing the
+    /// exact path a typed turn takes — `makeClient(config)` → `client.send` →
+    /// `pollForOutcome` → `TurnWriter.write` — so there is no second, weaker
+    /// networking or persistence path. The differences from `send` are only what a
+    /// relayed turn needs: it drives NO live run-state (no spinner, no background
+    /// grant, no spoken reply — a relayed turn has no on-screen thread view), and
+    /// it hands the reply back to the caller instead of finishing into the UI.
+    ///
+    /// The caller (`WatchRelay`) owns creating and persisting the destination
+    /// `thread` (tagged `.watch`) and its optimistic user `Turn`, mirroring how
+    /// `send` appends the user turn before `consume` appends Jesse's. This method
+    /// appends the `jesse` `Turn` via the shared `TurnWriter` on success. It never
+    /// throws: every failure — a transport error, a bridge `.failed`, an expired or
+    /// empty reply — becomes a `.failure(message)`.
+    func runRelayTurn(thread: JesseThread, text: String, voice: Bool,
+                      context: ModelContext) async -> RelayTurnResult {
+        let mode = thread.modeValue
+        let sessionId = thread.sessionId
+        let threadID = thread.id
+        let client = makeClient(configProvider())
+        let instructions = instructionsProvider(mode)
+        let floorOverride = floorProvider(mode)
+
+        let outcome: TurnOutcome
+        do {
+            let result = try await client.send(mode: mode, text: text, sessionId: sessionId,
+                                               voice: voice, instructions: instructions,
+                                               floorOverride: floorOverride, attachments: [])
+            switch result {
+            case .reply(let reply, _):
+                // An older bridge that answered inline. Deliver it directly.
+                outcome = .done(reply)
+            case .running(let jobId):
+                // The normal path: poll the same authoritative completion loop a
+                // typed turn uses. No display stream is opened — the relay has no
+                // live view — so the poll alone owns completion here.
+                guard let polled = await pollForOutcome(threadID: threadID, jobId: jobId,
+                                                        client: client) else {
+                    return .failure("Lost contact with the turn.")
+                }
+                outcome = polled
+            }
+        } catch let error as JesseError {
+            return .failure(error.localizedDescription)
+        } catch {
+            return .failure(error.localizedDescription)
+        }
+
+        switch outcome {
+        case .done(let reply):
+            // Persist Jesse's turn through the SAME writer `finish` uses, so a
+            // relayed turn lands in the normal history identically. `jobId: nil`
+            // (the relay dedups at the requestId layer, not via the delivery key).
+            switch turnWriter.write(threadID: threadID, thread: thread, reply: reply,
+                                    jobId: nil, context: context) {
+            case .delivered, .alreadyDelivered:
+                return .reply(reply)
+            case .empty:
+                return .failure("Jesse's reply came back empty.")
+            case .unresolvableThread:
+                return .failure("Couldn't attach the reply to the conversation.")
+            }
+        case .failed(let message):
+            return .failure(message)
+        case .expired:
+            return .failure("This reply has expired.")
+        case .cancelled:
+            return .failure("The turn was cancelled.")
+        }
+    }
+}
