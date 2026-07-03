@@ -15,6 +15,24 @@ CI both run it). See the "Versioning" section of `bridge/README.md`.
 
 ## [Unreleased]
 
+## [App 1.0 (7)] — 2026-07-03
+
+### Added
+- **Attachment previews in history.** After you attach image(s) or PDF(s) and
+  send, the conversation now shows a small thumbnail of each attachment on the
+  message, instead of only a "📎 Attached: …" filename line. Optimized for
+  storage: only a downscaled JPEG preview (longest side 320 px, a few KB) is
+  persisted per attachment — never the original bytes. PDFs render their first
+  page with a document badge. Thumbnails are generated off the main thread at send
+  time; a preview failure never affects the message itself. The old "📎 Attached"
+  text line is removed (the thumbnails, labeled by filename for accessibility,
+  make it redundant).
+
+### Changed
+- Deleting a conversation or a message now also removes its stored attachment
+  previews (cascade delete). Existing conversations upgrade in place with no data
+  loss (additive lightweight SwiftData migration).
+
 ## [App 1.0 (6)] — 2026-07-03
 
 ### Changed

@@ -230,15 +230,11 @@ final class RunCoordinator {
             context.insert(thread)
         }
 
-        // Optimistic user turn — appears in the transcript immediately. The
-        // persisted/displayed text notes any attachments (the bridge keeps the
-        // files only for the turn), while the *sent* text stays just `trimmed`.
-        var displayText = trimmed
-        if !attachments.isEmpty {
-            let names = attachments.map(\.filename).joined(separator: ", ")
-            displayText += "\n\n📎 Attached: \(names)"
-        }
-        let userTurn = Turn(role: .user, text: displayText)
+        // Optimistic user turn — appears in the transcript immediately. The *sent*
+        // text is just `trimmed`; any attachments are shown as persisted thumbnail
+        // previews (see `attachPreviews`) rather than an appended "📎 Attached:"
+        // text line, which the previews make redundant.
+        let userTurn = Turn(role: .user, text: trimmed)
         thread.turns.append(userTurn)
         if thread.title.isEmpty {
             thread.title = JesseThread.deriveTitle(from: trimmed)
@@ -255,6 +251,13 @@ final class RunCoordinator {
             errors[threadID] = "Couldn't save your message — try sending it again."
             return
         }
+        // Persist storage-optimized previews of any attachments onto the user turn.
+        // The full-resolution bytes exist only in the composer's staged
+        // `attachments` (the bridge keeps the files only for this turn), so we
+        // generate small thumbnails now, off the main actor, and attach them — the
+        // originals are never persisted. Best-effort and non-blocking; a failed
+        // preview never affects the turn.
+        attachPreviews(to: userTurn, from: attachments, context: context)
 
         let mode = thread.modeValue
         let sessionId = thread.sessionId
@@ -766,6 +769,40 @@ final class RunCoordinator {
     private func handle(error: JesseError, threadID: UUID, voice: Bool) {
         if case .connectionLost = error, inFlight[threadID] != nil { return }
         fail(threadID: threadID, message: error.localizedDescription, voice: voice)
+    }
+
+    /// Generate downscaled JPEG previews of `attachments` and attach them to
+    /// `userTurn` as `TurnAttachment`s. The expensive downscale/encode runs off the
+    /// main actor (a detached task over the Sendable staged bytes); the attach +
+    /// save then hop back to the main actor. Best-effort and non-blocking — the
+    /// turn is already saved, so previews simply appear a moment later. The original
+    /// full-resolution bytes are never persisted (only the thumbnail is stored) and
+    /// are released once this returns. A generation/save failure is logged, not
+    /// surfaced: a preview is not critical to the turn.
+    private func attachPreviews(to userTurn: Turn, from attachments: [JesseAttachment],
+                                context: ModelContext) {
+        guard !attachments.isEmpty else { return }
+        Task { [weak self] in
+            guard let self else { return }
+            // Off the main actor: the CPU/ImageIO/PDFKit work only, over the
+            // Sendable staged bytes. Returns Sendable (filename, mime, thumbnail).
+            let previews: [(String, String, Data)] = await Task.detached(priority: .utility) {
+                attachments.compactMap { att in
+                    AttachmentThumbnail.make(data: att.data, mime: att.mime)
+                        .map { (att.filename, att.mime, $0) }
+                }
+            }.value
+            guard !previews.isEmpty else { return }
+            for (filename, mime, thumbnail) in previews {
+                userTurn.attachments.append(
+                    TurnAttachment(filename: filename, mime: mime, thumbnail: thumbnail))
+            }
+            do {
+                try self.save(context)
+            } catch {
+                Log.run.error("attachment previews save failed: \(error.localizedDescription) — shown in memory but unsaved")
+            }
+        }
     }
 
     private func persist(threadID: UUID, job: InFlightJob) {

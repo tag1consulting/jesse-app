@@ -428,6 +428,9 @@ private struct TurnRow: View {
         // the bubble's own edge (trailing for the user, leading for Jesse) so it
         // stays out of the reading column and never fights the bubble for width.
         VStack(alignment: turn.isUser ? .trailing : .leading, spacing: 2) {
+            if !turn.attachments.isEmpty {
+                TurnAttachmentsView(attachments: turn.orderedAttachments)
+            }
             bubble
             actionsMenu
         }
@@ -469,6 +472,60 @@ private struct TurnRow: View {
             // MarkdownText already enables `.textSelection` at its container.
             MarkdownText(turn.text)
         }
+    }
+}
+
+/// A compact row of a turn's persisted attachment previews (1..N). Each is a small
+/// downscaled JPEG thumbnail (`TurnAttachment.thumbnail`); a PDF gets a corner
+/// badge so it reads as a document, not a photo. Accessible via the filename. The
+/// empty case is handled by the caller (this view isn't shown for turns with none).
+private struct TurnAttachmentsView: View {
+    let attachments: [TurnAttachment]
+
+    private static let side: CGFloat = 78
+
+    var body: some View {
+        HStack(spacing: 8) {
+            ForEach(attachments) { att in
+                thumbnail(att)
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func thumbnail(_ att: TurnAttachment) -> some View {
+        ZStack(alignment: .bottomTrailing) {
+            if let image = UIImage(data: att.thumbnail) {
+                Image(uiImage: image)
+                    .resizable()
+                    .aspectRatio(contentMode: .fill)
+                    .frame(width: Self.side, height: Self.side)
+                    .clipShape(RoundedRectangle(cornerRadius: 10))
+            } else {
+                // No decodable thumbnail (a generation failure that still recorded
+                // the row) — show a typed placeholder rather than a blank.
+                RoundedRectangle(cornerRadius: 10)
+                    .fill(Color.secondary.opacity(0.15))
+                    .frame(width: Self.side, height: Self.side)
+                    .overlay(
+                        Image(systemName: att.isPDF ? "doc.text" : "photo")
+                            .foregroundStyle(.secondary))
+            }
+            if att.isPDF {
+                Image(systemName: "doc.text.fill")
+                    .font(.caption2)
+                    .foregroundStyle(.white)
+                    .padding(4)
+                    .background(.black.opacity(0.55), in: RoundedRectangle(cornerRadius: 5))
+                    .padding(4)
+            }
+        }
+        .overlay(
+            RoundedRectangle(cornerRadius: 10)
+                .strokeBorder(Color.secondary.opacity(0.25), lineWidth: 0.5))
+        .accessibilityElement()
+        .accessibilityLabel(att.isPDF ? "PDF attachment: \(att.filename)"
+                                      : "Image attachment: \(att.filename)")
     }
 }
 

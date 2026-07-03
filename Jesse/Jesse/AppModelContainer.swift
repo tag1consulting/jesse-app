@@ -12,12 +12,12 @@ enum AppModelContainer {
     /// if the on-disk store can't be opened, so a provisioning hiccup degrades to a
     /// non-persisting session rather than a crash.
     static let shared: ModelContainer = {
-        if let container = try? ModelContainer(for: JesseThread.self, Turn.self) {
+        if let container = try? ModelContainer(for: JesseThread.self, Turn.self, TurnAttachment.self) {
             return container
         }
         Log.run.error("persistent SwiftData store unavailable — falling back to in-memory (history won't persist this session)")
         if let memory = try? ModelContainer(
-            for: JesseThread.self, Turn.self,
+            for: JesseThread.self, Turn.self, TurnAttachment.self,
             configurations: ModelConfiguration(isStoredInMemoryOnly: true)) {
             return memory
         }

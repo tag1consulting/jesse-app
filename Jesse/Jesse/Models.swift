@@ -133,6 +133,14 @@ final class Turn {
     var createdAt: Date = Date()
     var thread: JesseThread?
 
+    // Downscaled previews of the files the user attached to this turn (nil bytes
+    // are never stored — see `TurnAttachment`). Cascade so deleting a Turn (or, via
+    // JesseThread's own cascade, a whole thread) removes its previews. Empty by
+    // default, so this additive to-many relationship lightweight-migrates existing
+    // stores with no migration code (matching how `origin`/`aiTitle` were added).
+    @Relationship(deleteRule: .cascade, inverse: \TurnAttachment.turn)
+    var attachments: [TurnAttachment] = []
+
     init(role: TurnRole, text: String, createdAt: Date = Date()) {
         self.id = UUID()
         self.role = role.rawValue
@@ -142,4 +150,42 @@ final class Turn {
 
     var roleValue: TurnRole { TurnRole(rawValue: role) ?? .user }
     var isUser: Bool { roleValue == .user }
+
+    /// Attachment previews in a stable order (the relationship itself is unordered).
+    var orderedAttachments: [TurnAttachment] {
+        attachments.sorted { $0.createdAt < $1.createdAt }
+    }
+}
+
+/// A storage-optimized preview of one file the user attached to a `Turn`. The
+/// full-resolution bytes live only in the composer at send time and are gone from
+/// the bridge the instant the turn ends; we persist ONLY a small downscaled JPEG
+/// `thumbnail` (a few KB — see `AttachmentThumbnail`), never the original, so
+/// history can show what was sent without unbounded growth. Belongs to exactly
+/// one `Turn` (cascade-deleted with it).
+@Model
+final class TurnAttachment {
+    var id: UUID = UUID()
+    // The original file's display name (e.g. "Photo 1.jpg", "report.pdf").
+    var filename: String = ""
+    // The original file's MIME (e.g. "image/jpeg", "application/pdf"), kept so the
+    // renderer can badge a PDF distinctly from an image.
+    var mime: String = ""
+    // A downscaled JPEG preview of the original — the ONLY image bytes we retain.
+    var thumbnail: Data = Data()
+    var createdAt: Date = Date()
+    // The owning turn; nil only transiently before insert. `Turn.attachments` is
+    // the cascade side.
+    var turn: Turn?
+
+    init(filename: String, mime: String, thumbnail: Data, createdAt: Date = Date()) {
+        self.id = UUID()
+        self.filename = filename
+        self.mime = mime
+        self.thumbnail = thumbnail
+        self.createdAt = createdAt
+    }
+
+    var isImage: Bool { mime.hasPrefix("image/") }
+    var isPDF: Bool { mime == "application/pdf" }
 }
