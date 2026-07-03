@@ -39,7 +39,7 @@ final class ThreadFoldersTests: XCTestCase {
     private func layout(_ threads: [JesseThread], favoritesOnly: Bool = false,
                         search: String = "",
                         expanded: Set<ThreadSection> = []) -> ThreadListLayout {
-        threadListLayout(threads, favoritesOnly: favoritesOnly, searchQuery: search,
+        threadListLayout(threads, favoritesOnly: favoritesOnly, searchQueries: [search],
                          expanded: expanded, now: now, calendar: calendar)
     }
 
@@ -152,6 +152,72 @@ final class ThreadFoldersTests: XCTestCase {
         let cleared = section(layout([buried], search: ""), march)!
         XCTAssertFalse(cleared.isExpanded, "clearing search restores collapsed folders")
         XCTAssertTrue(cleared.visibleThreads.isEmpty)
+    }
+
+    // MARK: - Union of query + expansion terms (Tier 2 widen at the layout level)
+
+    /// Drive the layout with an explicit query LIST (typed query + alternate terms).
+    private func layout(_ threads: [JesseThread], queries: [String],
+                        expanded: Set<ThreadSection> = []) -> ThreadListLayout {
+        threadListLayout(threads, favoritesOnly: false, searchQueries: queries,
+                         expanded: expanded, now: now, calendar: calendar)
+    }
+
+    /// A thread that matches ONLY an alternate expansion term (not the typed query)
+    /// is visible while searching, and its month folder is force-expanded — exactly
+    /// as a direct match would be. Clearing the query restores the collapsed folder.
+    func testExpansionTermSurfacesBuriedThreadAndForceExpands() {
+        let buried = thread(at: date(2026, 3, 12), title: "Trip",
+                            turns: [(.user, "planning a holiday in Sicily")])
+        let march = ThreadSection.month(monthStart(2026, 3))
+
+        // Typed query "vacation" matches nothing; folder stays collapsed, row hidden.
+        let typedOnly = section(layout([buried], queries: ["vacation"]), march)
+        XCTAssertNil(typedOnly, "no section when nothing matches the typed query")
+
+        // Add the expansion term "holiday": the buried thread surfaces and its
+        // month folder force-expands so the match is visible.
+        let widened = section(layout([buried], queries: ["vacation", "holiday"]), march)!
+        XCTAssertTrue(widened.isExpanded, "an expansion match force-expands its folder")
+        XCTAssertEqual(widened.visibleThreads.map(\.id), [buried.id],
+                       "a thread matched only via an expansion term is visible")
+
+        // Clearing the query restores the collapsed folder.
+        let cleared = section(layout([buried], queries: []), march)!
+        XCTAssertFalse(cleared.isExpanded)
+        XCTAssertTrue(cleared.visibleThreads.isEmpty)
+    }
+
+    /// Set semantics: a thread matching BOTH the typed query and an alternate term
+    /// appears exactly once — expansion never double-counts a row.
+    func testUnionDoesNotDoubleCountAThread() {
+        let t = thread(at: date(2026, 3, 12), title: "Deploy notes",
+                       turns: [(.user, "run over the bridge")])
+        let march = ThreadSection.month(monthStart(2026, 3))
+        // "bridge" (typed) and "run bridge" (alternate) BOTH match this thread; it
+        // must still be listed once.
+        let sec = section(layout([t], queries: ["bridge", "run bridge"]), march)!
+        XCTAssertEqual(sec.threads.filter { $0.id == t.id }.count, 1,
+                       "a thread matching multiple entries is listed once")
+    }
+
+    /// Graceful degradation (item 8): with no expansion terms (a single-entry list —
+    /// what a dry/disabled expander produces), the visible layout is byte-identical
+    /// to Tier-1-only, and adding an alternate term that matches NOTHING changes
+    /// nothing (expansion only ever ADDS).
+    func testLayoutDegradesToTier1WhenExpansionInactive() {
+        let a = thread(at: date(2026, 6, 25), title: "Roof", turns: [(.user, "roofer Thursday")])
+        let b = thread(at: date(2026, 3, 12), title: "Deploy", turns: [(.user, "run over the bridge")])
+        let march = ThreadSection.month(monthStart(2026, 3))
+
+        func visibleIDs(_ l: ThreadListLayout) -> [[UUID]] {
+            sections(l).sorted { $0.section.sortKey > $1.section.sortKey }
+                .map { $0.threads.map(\.id) }
+        }
+        let base = layout([a, b], queries: ["roof"], expanded: [march])
+        let widenedWithDeadTerm = layout([a, b], queries: ["roof", "zzzznomatch"], expanded: [march])
+        XCTAssertEqual(visibleIDs(base), visibleIDs(widenedWithDeadTerm),
+                       "an expansion term that matches nothing leaves the layout unchanged")
     }
 
     // MARK: - Folder tap toggles expand/collapse (the dead-tap fix)

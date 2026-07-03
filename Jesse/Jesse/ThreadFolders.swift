@@ -53,22 +53,30 @@ enum ThreadListLayout {
 ///   `.all` (the default) is inactive. Applied as an additive filter alongside
 ///   favorites and search, BEFORE grouping, so a Watch scope stays date-sectioned
 ///   and its search only ever searches watch threads.
-/// - A non-empty `searchQuery` filters (title + turn bodies, via `threadMatches`)
-///   BEFORE grouping and force-expands every month folder, so a match never hides
-///   behind a collapsed header; clearing the query restores collapsed folders.
+/// - `searchQueries` is the UNION match set: the typed query plus any active
+///   on-device expansion terms. A thread is kept when it matches ANY entry (via the
+///   multi-token `threadMatchesAny`), filtered BEFORE grouping; search is "active"
+///   when any entry is non-blank, which force-expands every month folder so a match
+///   never hides behind a collapsed header. Clearing the query (empty/all-blank
+///   list) restores collapsed folders. With a single entry this reduces exactly to
+///   the Tier-1 base match, so expansion is strictly additive.
 /// - `expanded` is the set of month sections the user has opened. Month folders
 ///   default collapsed (absent from the set); day sections are always expanded.
 func threadListLayout(_ threads: [JesseThread],
                       favoritesOnly: Bool,
                       originScope: ThreadOriginScope = .all,
-                      searchQuery: String,
+                      searchQueries: [String],
                       expanded: Set<ThreadSection>,
                       now: Date,
                       calendar: Calendar) -> ThreadListLayout {
     let scoped = (favoritesOnly ? threads.filter(\.isFavorite) : threads)
         .filter { threadMatchesOrigin($0, scope: originScope) }
-    let matched = scoped.filter { threadMatches($0, query: searchQuery) }
-    let searchActive = !searchQuery.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    // `threadMatchesAny` returns each thread at most once, so a thread matching
+    // several entries (query + terms) still appears a single time (set semantics).
+    let matched = scoped.filter { threadMatchesAny($0, queries: searchQueries) }
+    let searchActive = searchQueries.contains {
+        !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
 
     // Favorites tab: always one flat, newest-first list. Favorites are few and
     // this is the direct path back to them — folders would only add friction.

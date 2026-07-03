@@ -109,7 +109,7 @@ final class FavoritesTests: XCTestCase {
         let march = ThreadSection.month(cal.date(from: DateComponents(year: 2026, month: 3))!)
 
         func build(favoritesOnly: Bool, search: String = "") -> ThreadListLayout {
-            threadListLayout(all, favoritesOnly: favoritesOnly, searchQuery: search,
+            threadListLayout(all, favoritesOnly: favoritesOnly, searchQueries: [search],
                              expanded: [], now: now, calendar: cal)
         }
 

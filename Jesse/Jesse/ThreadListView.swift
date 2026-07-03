@@ -36,8 +36,21 @@ struct ThreadListView: View {
     private var favoritesOnly: Bool { scope == .favorites }
     private var originScope: ThreadOriginScope { scope == .watch ? .watch : .all }
 
+    // Whether the on-device query-expansion tier is enabled (Settings toggle,
+    // default ON). Off → no `expand` calls, pure Tier-1 multi-token search.
+    @AppStorage("searchExpansionEnabled") private var searchExpansionEnabled = true
+
     // Live search text. Not persisted — a fresh launch starts with the full list.
     @State private var searchText = ""
+
+    // Orchestrates the on-device expansion tier (debounce / gate / cache / cancel).
+    // Injects the FoundationModels-backed expander in production; degrades silently
+    // to Tier-1 when the model is unavailable or disabled.
+    @State private var searchModel = ThreadSearchModel(expander: FoundationModelExpander())
+    // Prewarm the model once per search session (on the first keystroke), reset
+    // when the query clears — SwiftUI's `.searchable` focus isn't directly
+    // observable here, and prewarm is idempotent.
+    @State private var didPrewarm = false
 
     // Which month folders the user has opened, keyed by section identity. Month
     // folders default collapsed (absent here); day sections never fold. Reset on
@@ -53,12 +66,31 @@ struct ThreadListView: View {
             .filter { threadMatchesOrigin($0, scope: originScope) }
     }
 
-    /// `visible` narrowed by the search query (title + turn bodies). A blank
-    /// query matches everything, so this is just `visible` when search is idle.
-    /// Applied before grouping, so results stay date-sectioned and compose with
-    /// the All/Favorites tab.
+    /// Base (Tier-1) matches for the TYPED query alone — used only to gate and feed
+    /// the expansion tier's base count. A blank query matches everything.
     private var searched: [JesseThread] {
         visible.filter { threadMatches($0, query: searchText) }
+    }
+
+    /// The active alternate terms, or none when the tier is disabled.
+    private var activeTerms: [String] {
+        searchExpansionEnabled ? searchModel.activeTerms : []
+    }
+
+    /// The UNION query list the layout and row snippets filter on: the typed query
+    /// plus any active expansion terms. With no terms this is just `[searchText]`,
+    /// which reduces to Tier-1-only.
+    private var activeQueries: [String] { [searchText] + activeTerms }
+
+    /// Whether search is active (the typed query is non-blank).
+    private var searchActive: Bool {
+        !searchText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+
+    /// The union match set (query + terms) — what actually shows; drives the
+    /// no-results empty state so an expansion-only match still counts as a result.
+    private var unionMatched: [JesseThread] {
+        visible.filter { threadMatchesAny($0, queries: activeQueries) }
     }
 
     var body: some View {
@@ -74,9 +106,27 @@ struct ThreadListView: View {
                 .padding(.horizontal)
                 .padding(.bottom, 8)
             }
+            // When the on-device tier widens the search, explain the extra rows:
+            // a related conversation containing none of the typed words is here
+            // because of these alternate terms. Clears with the query / no terms.
+            if searchActive && !activeTerms.isEmpty {
+                Text("Also searching: \(activeTerms.joined(separator: ", "))")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.horizontal)
+                    .padding(.bottom, 6)
+            }
             content
         }
         .searchable(text: $searchText, prompt: "Search conversations")
+        .onChange(of: searchText) { _, newValue in
+            driveSearchExpansion(for: newValue)
+        }
+        .onChange(of: searchExpansionEnabled) { _, _ in
+            // Toggling the tier re-drives the model (which clears itself when off).
+            driveSearchExpansion(for: searchText)
+        }
         .navigationTitle("Jesse")
         .toolbar {
             ToolbarItem(placement: .topBarTrailing) {
@@ -115,9 +165,10 @@ struct ThreadListView: View {
                     Text("Swipe a conversation and tap Favorite to star it.")
                 }
             }
-        } else if searched.isEmpty {
+        } else if unionMatched.isEmpty {
             // Search is active (a blank query would keep `visible`) but nothing
-            // in this tab matches. Clearing the query restores the full list.
+            // in this tab matches — not the typed query nor any expansion term.
+            // Clearing the query restores the full list.
             ContentUnavailableView.search(text: searchText)
         } else {
             List {
@@ -180,7 +231,12 @@ struct ThreadListView: View {
     private func rows(_ threads: [JesseThread]) -> some View {
         ForEach(threads) { thread in
             NavigationLink(value: thread) {
-                ThreadRow(thread: thread, running: coordinator.isRunning(thread.id))
+                // Pass the active query list ONLY while searching, so the row shows
+                // its matched-snippet second line during search and reverts to
+                // title+time when idle (the search-only exception to #22).
+                ThreadRow(thread: thread,
+                          running: coordinator.isRunning(thread.id),
+                          searchQueries: searchActive ? activeQueries : [])
             }
             // Lazily mint/refresh this visible row's AI title. Idempotent and
             // non-blocking: it no-ops when the cached title is current or a
@@ -244,10 +300,29 @@ struct ThreadListView: View {
         threadListLayout(threads,
                          favoritesOnly: favoritesOnly,
                          originScope: originScope,
-                         searchQuery: searchText,
+                         searchQueries: activeQueries,
                          expanded: expandedFolders,
                          now: Date.now,
                          calendar: .current)
+    }
+
+    /// Feed the live query into the expansion model: prewarm once per session on
+    /// the first keystroke, then debounce/gate/cache/cancel inside the model. The
+    /// base-match count is the Tier-1 hit count for the typed query, so the model
+    /// only spends the on-device model when direct results are thin. When the tier
+    /// is disabled this is a no-op (pure Tier-1 search, zero `expand` calls).
+    private func driveSearchExpansion(for query: String) {
+        // Keep the model's master switch in sync with Settings; when off it clears
+        // itself and `update` becomes a no-op (zero expander calls).
+        searchModel.isEnabled = searchExpansionEnabled
+        guard searchExpansionEnabled else { didPrewarm = false; return }
+        if query.isEmpty {
+            didPrewarm = false
+        } else if !didPrewarm {
+            searchModel.prewarm()
+            didPrewarm = true
+        }
+        searchModel.update(query: query, baseMatchCount: searched.count)
     }
 
     private func delete(_ offsets: IndexSet, in sectionThreads: [JesseThread]) {
@@ -281,13 +356,24 @@ struct ThreadListView: View {
     }
 }
 
-/// A list row: one primary line (the resolved title) and the relative
-/// last-activity time — nothing else. The title is `displayTitle`: the cached AI
-/// title when present (even mid-refresh — the last good title, never blank), else
-/// the derived first-words title. A live spinner shows while the turn runs.
+/// A list row. Idle, it's one primary line (the resolved title) and the relative
+/// last-activity time — nothing else (PR #22). While a search is active
+/// (`searchQueries` non-empty) the second line becomes a matched-text SNIPPET with
+/// the matched range(s) highlighted, so a hit — including one surfaced only by an
+/// expansion term — explains itself; this is a deliberate search-only exception,
+/// not a permanent preview line. The title is `displayTitle`: the cached AI title
+/// when present (even mid-refresh — the last good title, never blank), else the
+/// derived first-words title. A live spinner shows while the turn runs.
 struct ThreadRow: View {
     let thread: JesseThread
     let running: Bool
+    /// The active query list (typed query + expansion terms) while searching; empty
+    /// when search is idle. Non-empty switches the second line to the snippet.
+    var searchQueries: [String] = []
+
+    private var snippet: SearchSnippet? {
+        searchSnippet(for: thread, queries: searchQueries)
+    }
 
     var body: some View {
         HStack(spacing: 10) {
@@ -302,9 +388,17 @@ struct ThreadRow: View {
                     Text(displayTitle(for: thread))
                         .lineLimit(1)
                 }
-                Text(thread.updatedAt, format: .relative(presentation: .named))
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
+                if let snippet {
+                    // Search-only: the matched excerpt, matched terms emphasized.
+                    Text(highlighted(snippet))
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(2)
+                } else {
+                    Text(thread.updatedAt, format: .relative(presentation: .named))
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
             }
             Spacer()
             if running {
@@ -313,5 +407,20 @@ struct ThreadRow: View {
             }
         }
         .padding(.vertical, 2)
+    }
+
+    /// Build an `AttributedString` from a snippet, emphasizing the matched range(s)
+    /// (bold + accent tint) so the term that caused the match stands out.
+    private func highlighted(_ snippet: SearchSnippet) -> AttributedString {
+        var attributed = AttributedString(snippet.text)
+        for range in snippet.ranges {
+            guard let lo = AttributedString.Index(range.lowerBound, within: attributed),
+                  let hi = AttributedString.Index(range.upperBound, within: attributed) else {
+                continue
+            }
+            attributed[lo..<hi].font = .caption.bold()
+            attributed[lo..<hi].foregroundColor = .accentColor
+        }
+        return attributed
     }
 }

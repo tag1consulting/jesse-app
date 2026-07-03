@@ -139,6 +139,10 @@ struct SettingsView: View {
     // refreshed on appear and whenever we contact the bridge for defaults.
     @State private var bridgeVersion: String? = BridgeVersionStore.current
 
+    // On-device search expansion (Tier 2), default ON. Off → pure multi-token
+    // Tier-1 search with no model calls. Same key the thread list reads.
+    @AppStorage("searchExpansionEnabled") private var searchExpansionEnabled = true
+
     var body: some View {
         NavigationStack {
             Form {
@@ -212,6 +216,14 @@ struct SettingsView: View {
                 }
 
                 floorSection(for: .tell)
+
+                Section {
+                    Toggle("Smart search expansion", isOn: $searchExpansionEnabled)
+                } header: {
+                    Text("Search")
+                } footer: {
+                    Text("When on, search also finds conversations that match synonyms or rephrasings of your words, using Apple Intelligence entirely on-device. Off uses exact word matching only. Requires a device with Apple Intelligence; otherwise search works the same as off.")
+                }
 
                 Section {
                     LabeledContent("App", value: AppVersion.display)

@@ -45,7 +45,7 @@ final class ThreadOriginFilterTests: XCTestCase {
     private func layout(_ threads: [JesseThread], favoritesOnly: Bool = false,
                         origin: ThreadOriginScope = .all, search: String = "") -> ThreadListLayout {
         threadListLayout(threads, favoritesOnly: favoritesOnly, originScope: origin,
-                         searchQuery: search, expanded: [], now: now, calendar: calendar)
+                         searchQueries: [search], expanded: [], now: now, calendar: calendar)
     }
 
     // MARK: - The pure predicate

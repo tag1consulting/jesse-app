@@ -15,6 +15,30 @@ CI both run it). See the "Versioning" section of `bridge/README.md`.
 
 ## [Unreleased]
 
+## [App 1.0 (5)] — 2026-07-03
+
+### Added
+- **Multi-token conversation search (Tier 1).** Search now matches when every word
+  of the query appears anywhere in a thread's title or turn bodies, order- and
+  gap-independently (e.g. "run bridge" finds "run over the bridge"). Tokens shorter
+  than two characters are ignored unless the whole query is short (so "hi" still
+  works). Case- and diacritic-insensitive, as before. This replaces the previous
+  whole-query contiguous-substring match.
+- **On-device query expansion (Tier 2), additive and optional.** When direct
+  matches are thin, the app asks Apple's on-device Foundation Models (iOS 26) for a
+  few alternate search terms (synonyms/rephrasings) and widens the result set to
+  include them — never reordering or dropping base matches. Everything runs on the
+  device; nothing is sent off it. A subtle "Also searching: …" caption explains the
+  widened rows. Debounced, gated (only for real words with few direct hits),
+  cached, and cancelled on query change; it degrades silently to Tier-1 whenever
+  the model is unavailable, disabled, or fails.
+- **Matched-text snippet on search rows.** While searching, each row shows a
+  windowed excerpt centered on the first matched term with the match highlighted —
+  including when the row matched only via an expansion term. Idle rows are
+  unchanged (title + time).
+- **Settings → Search:** a "Smart search expansion" toggle (default on) turns the
+  Tier-2 model off entirely; Tier-1 multi-token search and snippets still work.
+
 ## [App 1.0 (4)] — 2026-07-02
 
 ### Added

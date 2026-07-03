@@ -33,4 +33,7 @@ enum Log {
     nonisolated static let push = AppLog(logger: Logger(subsystem: subsystem, category: "push"))
     /// Keychain reads/writes for the bridge config (host/port/token).
     nonisolated static let keychain = AppLog(logger: Logger(subsystem: subsystem, category: "keychain"))
+    /// On-device query-expansion (Foundation Models) diagnostics — availability and
+    /// per-call failures, which are swallowed to `[]` and never surfaced to the UI.
+    nonisolated static let search = AppLog(logger: Logger(subsystem: subsystem, category: "search"))
 }
