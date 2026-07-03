@@ -3,6 +3,7 @@ import SwiftData
 import UIKit
 import PhotosUI
 import UniformTypeIdentifiers
+import AVFoundation
 
 // One conversation: the full turn transcript with the composer pinned at the
 // bottom. Being inside a thread *is* continuing it — every send auto-resumes the
@@ -20,6 +21,7 @@ struct ThreadDetailView: View {
     @State private var photoItems: [PhotosPickerItem] = []
     @State private var showPhotoPicker = false
     @State private var showFileImporter = false
+    @State private var showCamera = false
     @State private var attachError: String?
 
     private var running: Bool { coordinator.isRunning(thread.id) }
@@ -256,6 +258,14 @@ struct ThreadDetailView: View {
             guard !items.isEmpty else { return }
             Task { await handlePhotoItems(items) }
         }
+        // Full-screen camera capture. Only reachable when a camera is available
+        // (the menu item is hidden otherwise), so `.camera` never initializes on a
+        // device without one (e.g. Simulator).
+        .fullScreenCover(isPresented: $showCamera) {
+            CameraPicker(onCapture: handleCameraCapture,
+                         onCancel: { showCamera = false })
+                .ignoresSafeArea()
+        }
     }
 
     // MARK: - Attachments UI
@@ -273,6 +283,14 @@ struct ThreadDetailView: View {
                 showFileImporter = true
             } label: {
                 Label("PDF Document", systemImage: "doc")
+            }
+            // Shown only when a camera exists (never on Simulator).
+            if UIImagePickerController.isSourceTypeAvailable(.camera) {
+                Button {
+                    takePhoto()
+                } label: {
+                    Label("Take Photo", systemImage: "camera")
+                }
             }
         } label: {
             Image(systemName: "paperclip")
@@ -327,6 +345,40 @@ struct ThreadDetailView: View {
             addAttachment(data: data, fallbackName: "Photo")
         }
         photoItems = []
+    }
+
+    /// "Take Photo" tapped. Branch on the camera authorization status (via the pure
+    /// `CameraCapture.action`): present immediately when authorized, request access
+    /// when undetermined (presenting only if granted), or surface a settings hint
+    /// when denied/restricted — never presenting a `.camera` picker without
+    /// permission (which would just show black).
+    private func takePhoto() {
+        attachError = nil
+        switch CameraCapture.action(for: AVCaptureDevice.authorizationStatus(for: .video)) {
+        case .present:
+            showCamera = true
+        case .request:
+            AVCaptureDevice.requestAccess(for: .video) { granted in
+                Task { @MainActor in
+                    if granted {
+                        showCamera = true
+                    } else {
+                        attachError = CameraCapture.deniedMessage
+                    }
+                }
+            }
+        case .denied:
+            attachError = CameraCapture.deniedMessage
+        }
+    }
+
+    /// A freshly captured photo (already JPEG-encoded by `CameraPicker`) — stage it
+    /// through the SAME `addAttachment` path the other pickers use, so it inherits
+    /// the client-side MIME/size/count caps and the whole preview + send flow.
+    private func handleCameraCapture(_ data: Data) {
+        showCamera = false
+        addAttachment(data: data, fallbackName: "Photo",
+                      suggestedName: CameraCapture.photoFilename())
     }
 
     private func handleFileImport(_ result: Result<[URL], Error>) {

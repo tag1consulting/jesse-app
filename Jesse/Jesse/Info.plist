@@ -3,7 +3,7 @@
 <plist version="1.0">
 <dict>
 	<key>NSCameraUsageDescription</key>
-	<string>Scan the pairing QR shown by the Jesse bridge.</string>
+	<string>Scan the pairing QR shown by the Jesse bridge, and take photos to attach to a conversation.</string>
 	<key>NSSpeechRecognitionUsageDescription</key>
 	<string>Transcribe the audio you speak on your Apple Watch so Jesse can answer it.</string>
 	<key>NSAppTransportSecurity</key>

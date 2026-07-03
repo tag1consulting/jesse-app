@@ -15,6 +15,18 @@ CI both run it). See the "Versioning" section of `bridge/README.md`.
 
 ## [Unreleased]
 
+## [App 1.0 (8)] — 2026-07-03
+
+### Added
+- **In-app camera capture.** The attachment (paperclip) menu now offers "Take
+  Photo" — shown only on devices with a camera — to snap a photo and attach it
+  right away, alongside picking an existing image or a PDF. The photo is
+  JPEG-encoded and flows through the same staging path as the other pickers, so it
+  inherits the same MIME/size/count limits (and the same thumbnail preview).
+  Camera permission is requested when needed and handled gracefully if denied (a
+  clear hint, no hang). The camera permission prompt now explains both uses (QR
+  pairing and attaching photos).
+
 ## [App 1.0 (7)] — 2026-07-03
 
 ### Added
