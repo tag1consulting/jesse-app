@@ -15,6 +15,17 @@ CI both run it). See the "Versioning" section of `bridge/README.md`.
 
 ## [Unreleased]
 
+## [App 1.0 (6)] — 2026-07-03
+
+### Changed
+- **Word-level text selection in the transcript.** You can now long-press-drag to
+  select individual words or ranges in any message — both your messages and
+  Jesse's replies — instead of only copying a whole message. Whole-message Copy
+  (raw Markdown) and Share moved from the bubble's long-press menu to a small
+  actions button beside each message, so the long-press is free for text
+  selection. User-message bubbles are now selectable too (previously only Jesse's
+  replies had selection enabled, and even that was blocked by the long-press menu).
+
 ## [App 1.0 (5)] — 2026-07-03
 
 ### Added

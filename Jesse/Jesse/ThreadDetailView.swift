@@ -411,40 +411,63 @@ private struct StreamingPartialText: View {
 
 /// One message bubble. User turns sit right with a tinted fill; Jesse's replies
 /// render as Markdown on the left.
+///
+/// Both bubbles enable `.textSelection` so a long-press-drag selects individual
+/// words / ranges (the native selection callout then offers Copy of the picked
+/// range). Whole-message actions live on a small ellipsis `Menu` *beside* the
+/// bubble rather than on a bubble `.contextMenu`: a context menu owns the
+/// long-press, which is exactly the gesture text selection needs, so the two
+/// can't coexist on the same view. Moving Copy/Share to a separate affordance
+/// that doesn't own the long-press lets drag-select win while keeping
+/// whole-message raw-Markdown Copy and Share available.
 private struct TurnRow: View {
     let turn: Turn
 
     var body: some View {
-        bubble
-            // Long-press any message to copy or share it. Copies the *raw*
-            // Markdown (`turn.text`), not the rendered text, so links and
-            // formatting are preserved.
-            .contextMenu {
-                Button {
-                    UIPasteboard.general.string = turn.text
-                } label: {
-                    Label("Copy", systemImage: "doc.on.doc")
-                }
-                ShareLink(item: turn.text) {
-                    Label("Share", systemImage: "square.and.arrow.up")
-                }
+        // The message, with a small actions affordance tucked just beneath it on
+        // the bubble's own edge (trailing for the user, leading for Jesse) so it
+        // stays out of the reading column and never fights the bubble for width.
+        VStack(alignment: turn.isUser ? .trailing : .leading, spacing: 2) {
+            bubble
+            actionsMenu
+        }
+        .frame(maxWidth: .infinity, alignment: turn.isUser ? .trailing : .leading)
+    }
+
+    /// Whole-message Copy (the *raw* Markdown `turn.text`, so links/formatting
+    /// survive) + Share. On a plain `Menu` label, not a `.contextMenu`, so it
+    /// never claims the long-press that starts text selection on the bubble.
+    private var actionsMenu: some View {
+        Menu {
+            Button {
+                UIPasteboard.general.string = turn.text
+            } label: {
+                Label("Copy message", systemImage: "doc.on.doc")
             }
+            ShareLink(item: turn.text) {
+                Label("Share message", systemImage: "square.and.arrow.up")
+            }
+        } label: {
+            Image(systemName: "ellipsis")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .frame(width: 28, height: 28)
+                .contentShape(Rectangle())
+        }
+        .accessibilityLabel(turn.isUser ? "Your message actions" : "Jesse's message actions")
     }
 
     @ViewBuilder private var bubble: some View {
         if turn.isUser {
-            HStack {
-                Spacer(minLength: 40)
-                Text(turn.text)
-                    .padding(.horizontal, 12)
-                    .padding(.vertical, 8)
-                    .background(Color.accentColor.opacity(0.15))
-                    .clipShape(RoundedRectangle(cornerRadius: 14))
-                    .frame(alignment: .trailing)
-            }
+            Text(turn.text)
+                .textSelection(.enabled)
+                .padding(.horizontal, 12)
+                .padding(.vertical, 8)
+                .background(Color.accentColor.opacity(0.15))
+                .clipShape(RoundedRectangle(cornerRadius: 14))
         } else {
+            // MarkdownText already enables `.textSelection` at its container.
             MarkdownText(turn.text)
-                .frame(maxWidth: .infinity, alignment: .leading)
         }
     }
 }
