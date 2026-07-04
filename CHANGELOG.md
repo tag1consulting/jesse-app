@@ -15,6 +15,18 @@ CI both run it). See the "Versioning" section of `bridge/README.md`.
 
 ## [Unreleased]
 
+## [App 1.0 (10)] — 2026-07-04
+
+### Added
+- **Paste images/PDFs into the composer.** A paste button beside the paperclip
+  stages a copied screenshot, image, or PDF straight from the clipboard —
+  including several items at once, up to the four-file cap — through the same path
+  as the pickers, so pasted items inherit the same MIME/size/count limits, chips,
+  previews, and send flow. A copied bitmap with no lossless original is re-encoded
+  to PNG; anything unsupported or oversized is rejected with the existing inline
+  message. `PasteButton` was chosen over a custom ⌘V/edit-menu override because it
+  needs no clipboard-access prompt and shows no "pasted from…" privacy banner.
+
 ## [App 1.0 (9)] — 2026-07-03
 
 ### Fixed

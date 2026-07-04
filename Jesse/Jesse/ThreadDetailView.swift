@@ -243,6 +243,7 @@ struct ThreadDetailView: View {
 
             HStack {
                 attachButton
+                pasteButton
                 SendButton(
                     running: running,
                     startDate: coordinator.startDate(for: thread.id),
@@ -307,6 +308,23 @@ struct ThreadDetailView: View {
         }
         .accessibilityLabel("Add attachment")
         .disabled(running || attachments.count >= AttachmentLimits.maxCount)
+    }
+
+    /// A fast, discoverable paste path beside the paperclip: stage a copied image
+    /// or PDF straight from the clipboard. `PasteButton` is the permission-clean
+    /// choice — no "pasted from…" privacy banner and no clipboard prompt, unlike a
+    /// custom `⌘V`/edit-menu override, and it auto-disables when the pasteboard
+    /// holds no matching content. Pasted items flow through the same
+    /// `addAttachment` path as the pickers, so they inherit the MIME/size/count
+    /// caps and the send flow. Disabled consistently with `attachButton`.
+    private var pasteButton: some View {
+        PasteButton(supportedContentTypes: [.image, .pdf]) { providers in
+            Task { await handlePaste(providers) }
+        }
+        .labelStyle(.iconOnly)
+        .buttonBorderShape(.capsule)
+        .disabled(running || attachments.count >= AttachmentLimits.maxCount)
+        .accessibilityLabel("Paste image or PDF")
     }
 
     private var attachmentChips: some View {
@@ -404,6 +422,70 @@ struct ThreadDetailView: View {
             }
         case .failure(let error):
             attachError = error.localizedDescription
+        }
+    }
+
+    /// The type identifiers tried, in order, when reading a pasted item's bytes —
+    /// concrete lossless encodings first (kept verbatim), then the abstract
+    /// `.image` (whatever the pasteboard offers). A representation that isn't a
+    /// whitelisted type but decodes as a bitmap is re-encoded to PNG by
+    /// `PasteAttachment.stageableBytes`; the `UIImage` object is the final fallback.
+    private static let pasteDataTypes: [UTType] =
+        [.pdf, .png, .jpeg, .heic, .heif, .gif, .webP, .tiff, .bmp, .image]
+
+    /// Clipboard paste (from `pasteButton`): stage each copied image/PDF through
+    /// the SAME `addAttachment` path the pickers use, so it inherits the caps, the
+    /// chip UI, and the send flow. Multiple items up to the 4-file cap are staged;
+    /// the cap (and any oversized/unsupported item) surfaces via `attachError`
+    /// exactly like the pickers. Runs on the main actor (mutates staging state).
+    @MainActor
+    private func handlePaste(_ providers: [NSItemProvider]) async {
+        attachError = nil
+        for provider in providers {
+            guard let data = await loadPastedData(from: provider) else {
+                attachError = "Couldn’t paste that item (images or PDF only)."
+                continue
+            }
+            // loadPastedData guarantees `data` sniffs as a whitelisted type; name
+            // it pasted-<timestamp>.<ext> and let addAttachment run the caps.
+            let ext = JesseAttachment.sniffMime(data)
+                .map(JesseAttachment.fileExtension(forMime:)) ?? "png"
+            addAttachment(data: data, fallbackName: "Pasted",
+                          suggestedName: PasteAttachment.filename(ext: ext))
+        }
+    }
+
+    /// Read a pasted provider's bytes as a stageable, whitelisted payload (or nil).
+    private func loadPastedData(from provider: NSItemProvider) async -> Data? {
+        for type in Self.pasteDataTypes {
+            guard provider.hasItemConformingToTypeIdentifier(type.identifier) else { continue }
+            if let data = await loadData(provider, type: type),
+               let staged = PasteAttachment.stageableBytes(from: data) {
+                return staged
+            }
+        }
+        // A copied bitmap (e.g. a screenshot) with no loadable data representation:
+        // decode the image object and re-encode to PNG.
+        if provider.canLoadObject(ofClass: UIImage.self),
+           let image = await loadImageObject(provider) {
+            return PasteAttachment.pngData(from: image)
+        }
+        return nil
+    }
+
+    private func loadData(_ provider: NSItemProvider, type: UTType) async -> Data? {
+        await withCheckedContinuation { continuation in
+            provider.loadDataRepresentation(forTypeIdentifier: type.identifier) { data, _ in
+                continuation.resume(returning: data)
+            }
+        }
+    }
+
+    private func loadImageObject(_ provider: NSItemProvider) async -> UIImage? {
+        await withCheckedContinuation { continuation in
+            provider.loadObject(ofClass: UIImage.self) { object, _ in
+                continuation.resume(returning: object as? UIImage)
+            }
         }
     }
 
