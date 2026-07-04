@@ -50,6 +50,28 @@ final class JesseWireContractTests: XCTestCase {
         XCTAssertEqual(try body(r), #"{"mode":"ask","text":"hi"}"#)
     }
 
+    /// A present `health_context` block encodes to the `health_context` wire key,
+    /// in sorted position, with the newline escaped — byte-for-byte.
+    func testHealthContextEncodesToExactBytes() throws {
+        let r = JesseClient.makeRequest(mode: .tell, text: "log my swim", sessionId: nil,
+                                        voice: false, instructions: nil, floorOverride: nil,
+                                        attachments: [], healthContext: "Swim 30m\nWalk 45m")
+        XCTAssertEqual(try body(r),
+            #"{"health_context":"Swim 30m\nWalk 45m","mode":"tell","text":"log my swim"}"#)
+    }
+
+    /// A nil or blank `health_context` drops the field — an ordinary turn (feature
+    /// off, no data, or an old build) is byte-for-byte unchanged.
+    func testNilAndBlankHealthContextOmittedFromBytes() throws {
+        let none = JesseClient.makeRequest(mode: .ask, text: "hi", sessionId: nil, voice: false,
+                                           instructions: nil, floorOverride: nil, attachments: [])
+        XCTAssertEqual(try body(none), #"{"mode":"ask","text":"hi"}"#)
+        let blank = JesseClient.makeRequest(mode: .ask, text: "hi", sessionId: nil, voice: false,
+                                            instructions: nil, floorOverride: nil,
+                                            attachments: [], healthContext: "  \n\t")
+        XCTAssertEqual(try body(blank), #"{"mode":"ask","text":"hi"}"#)
+    }
+
     /// The device-registration body — one key, matching the old `["token": …]`.
     func testDeviceRegistrationEncodesToExactBytes() throws {
         let data = try JesseClient.encodeBody(JesseDeviceRegistration(token: "apns-tok"))

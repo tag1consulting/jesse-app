@@ -15,6 +15,28 @@ CI both run it). See the "Versioning" section of `bridge/README.md`.
 
 ## [Unreleased]
 
+## [App 1.0 (11)] — 2026-07-04
+
+### Added
+- **Attach recent workouts from Apple Health.** With the feature connected, every
+  turn — typed, Siri, and the watch relay — carries a compact, device-reported
+  "recent workouts" block (newest first, last 48h, up to 5) so you can say
+  "Log my swim" and Jesse logs it from real numbers (duration, distance, active
+  kcal, avg/max HR) instead of asking. The block is sent as the bridge's optional
+  `health_context` field (bridge 0.2.0+); an older bridge simply ignores it.
+  - **Never blocks or breaks a send.** Unauthorized, no data, a query error, or a
+    1-second timeout all attach nothing and the turn goes out anyway. The
+    watch-relay case (HealthKit unreadable while the phone is locked) hits the same
+    silent degrade.
+  - **HealthKit is read-only and isolated.** One file (`HealthKitWorkoutProvider`)
+    imports HealthKit, behind a `WorkoutContextProviding` seam; the formatter,
+    attach policy, resolver, and timeout are pure and fully unit-tested. New
+    `NSHealthShareUsageDescription` and a read-only HealthKit entitlement; the app
+    writes nothing to Health.
+  - **Settings → Apple Health:** a "Connect Apple Health" row (requests read access
+    to workouts, heart rate, active energy, and swim/walk-run/cycle distance) plus
+    an "Attach recent workouts" toggle (default off until connected once, then on).
+
 ## [Bridge 0.2.0] — 2026-07-04
 
 ### Added

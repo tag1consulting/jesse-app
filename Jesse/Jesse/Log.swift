@@ -36,4 +36,7 @@ enum Log {
     /// On-device query-expansion (Foundation Models) diagnostics — availability and
     /// per-call failures, which are swallowed to `[]` and never surfaced to the UI.
     nonisolated static let search = AppLog(logger: Logger(subsystem: subsystem, category: "search"))
+    /// HealthKit authorization / recent-workout query diagnostics. Query failures are
+    /// swallowed to an empty result (no block attached) and never surfaced to the UI.
+    nonisolated static let health = AppLog(logger: Logger(subsystem: subsystem, category: "health"))
 }

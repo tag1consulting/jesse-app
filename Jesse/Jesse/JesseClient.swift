@@ -358,6 +358,10 @@ nonisolated struct JesseRequest: Encodable, Equatable {
     let instructions: String?
     let floorOverride: String?
     let attachments: [Attachment]?
+    // Compact recent-workouts block from Apple Health (see `WorkoutContext`).
+    // Nil omits the field, matching the bridge's `#[serde(default)]` shape — an
+    // ordinary turn (feature off, no data, or an old build) sends nothing.
+    let healthContext: String?
 
     nonisolated struct Attachment: Encodable, Equatable {
         let filename: String
@@ -375,6 +379,7 @@ nonisolated struct JesseRequest: Encodable, Equatable {
         case voice, instructions
         case floorOverride = "floor_override"
         case attachments
+        case healthContext = "health_context"
     }
 }
 
@@ -536,11 +541,24 @@ struct JesseClient: JesseClientProtocol {
     /// same injected session, so a single stub still serves every endpoint.
     let streamSession: URLSession
 
+    /// Reads recent workouts for the per-turn `health_context` block. The one seam
+    /// HealthKit hides behind (see `WorkoutContextProviding`); defaults to the live
+    /// `HealthKitWorkoutProvider`, injectable so tests drive it with a fake.
+    let workoutProvider: any WorkoutContextProviding
+
+    /// Whether the "attach recent workouts" feature is on. Read at send time from
+    /// the persisted toggle; injectable so tests pin it without touching defaults.
+    let isHealthContextEnabled: @Sendable () -> Bool
+
     init(config: JesseConfig,
          session: URLSession = JesseClient.boundedSession,
-         streamSession: URLSession? = nil) {
+         streamSession: URLSession? = nil,
+         workoutProvider: any WorkoutContextProviding = HealthKitWorkoutProvider(),
+         isHealthContextEnabled: @escaping @Sendable () -> Bool = { WorkoutContextSettings.isEnabled }) {
         self.config = config
         self.session = session
+        self.workoutProvider = workoutProvider
+        self.isHealthContextEnabled = isHealthContextEnabled
         if let streamSession {
             self.streamSession = streamSession
         } else if session === JesseClient.boundedSession {
@@ -602,10 +620,19 @@ struct JesseClient: JesseClientProtocol {
         req.httpMethod = "POST"
         req.setValue("application/json", forHTTPHeaderField: "Content-Type")
         req.setValue("Bearer \(config.token)", forHTTPHeaderField: "Authorization")
+        // Resolve the recent-workouts block here in the request-building path so
+        // EVERY turn — typed, Siri, and the watch relay — inherits it. Best-effort:
+        // the resolver returns nil (attach nothing) when the feature is off, there's
+        // no data, or the query errors/times out, so a turn never blocks or breaks.
+        let healthContext = await WorkoutContextResolver.resolve(
+            enabled: isHealthContextEnabled(),
+            provider: workoutProvider,
+            now: Date())
         let request = Self.makeRequest(mode: mode, text: text, sessionId: sessionId,
                                        voice: voice, instructions: instructions,
                                        floorOverride: floorOverride,
-                                       attachments: attachments)
+                                       attachments: attachments,
+                                       healthContext: healthContext)
         req.httpBody = try Self.encodeBody(request)
 
         let data: Data, resp: URLResponse
@@ -932,7 +959,8 @@ struct JesseClient: JesseClientProtocol {
     static func makeRequest(mode: JesseMode, text: String, sessionId: String?,
                             voice: Bool, instructions: String?,
                             floorOverride: String?,
-                            attachments: [JesseAttachment]) -> JesseRequest {
+                            attachments: [JesseAttachment],
+                            healthContext: String? = nil) -> JesseRequest {
         func nonBlank(_ s: String?) -> String? {
             guard let s, !s.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return nil }
             return s
@@ -948,7 +976,10 @@ struct JesseClient: JesseClientProtocol {
             attachments: attachments.isEmpty ? nil : attachments.map {
                 JesseRequest.Attachment(filename: $0.filename, mime: $0.mime,
                                         dataBase64: $0.data.base64EncodedString())
-            })
+            },
+            // Blank collapses to nil so the field drops out (the bridge treats
+            // absent/blank identically — today's behavior).
+            healthContext: nonBlank(healthContext))
     }
 
     /// Encode a wire body. Optional fields omit when nil (synthesized

@@ -143,6 +143,12 @@ struct SettingsView: View {
     // Tier-1 search with no model calls. Same key the thread list reads.
     @AppStorage("searchExpansionEnabled") private var searchExpansionEnabled = true
 
+    // "Attach recent workouts" — default OFF until Apple Health is connected once,
+    // then flipped on. Same UserDefaults key `JesseClient` reads at send time
+    // (`WorkoutContextSettings`). `connectingHealth` gates the connect row.
+    @AppStorage(WorkoutContextSettings.enabledKey) private var attachHealthContext = false
+    @State private var connectingHealth = false
+
     var body: some View {
         NavigationStack {
             Form {
@@ -223,6 +229,23 @@ struct SettingsView: View {
                     Text("Search")
                 } footer: {
                     Text("When on, search also finds conversations that match synonyms or rephrasings of your words, using Apple Intelligence entirely on-device. Off uses exact word matching only. Requires a device with Apple Intelligence; otherwise search works the same as off.")
+                }
+
+                Section {
+                    Toggle("Attach recent workouts", isOn: $attachHealthContext)
+                    Button {
+                        Task { await connectAppleHealth() }
+                    } label: {
+                        Label("Connect Apple Health", systemImage: "heart.text.square")
+                    }
+                    .disabled(connectingHealth)
+                    if connectingHealth {
+                        HStack { ProgressView(); Text("Requesting access…").foregroundStyle(.secondary) }
+                    }
+                } header: {
+                    Text("Apple Health")
+                } footer: {
+                    Text("Jesse attaches your recent workouts (from Apple Health) so you can ask it to log one — “Log my swim.” Nothing is read until you connect, and you can turn it off anytime.")
                 }
 
                 Section {
@@ -450,6 +473,19 @@ struct SettingsView: View {
             tellDefault = d.tell
             if !fillEmptyOnly || askPrompt.isEmpty { askPrompt = d.ask }
             if !fillEmptyOnly || tellPrompt.isEmpty { tellPrompt = d.tell }
+        }
+    }
+
+    /// "Connect Apple Health": request read authorization for the workout types.
+    /// Apple hides whether READ was granted (denial just yields empty queries, so
+    /// nothing is attached), so "granted once, then on" means: once the prompt has
+    /// been answered without error, flip the toggle on. The user can turn it back
+    /// off anytime.
+    private func connectAppleHealth() async {
+        connectingHealth = true
+        defer { connectingHealth = false }
+        if await HealthKitWorkoutProvider.requestReadAuthorization() {
+            attachHealthContext = true
         }
     }
 
