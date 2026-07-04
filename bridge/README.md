@@ -679,7 +679,7 @@ cargo run --release
 | `JESSE_BIND` | `127.0.0.1` | Interface to bind — set to tailnet IP. Loopback/tailnet (`100.64.0.0/10`) only unless `JESSE_ALLOW_PUBLIC_BIND=1` |
 | `JESSE_ALLOW_PUBLIC_BIND` | (off) | Set `1`/`true` to allow a non-loopback/non-tailnet bind; otherwise such a bind is a startup error |
 | `JESSE_ALLOWED_TOOLS` | (scoped default) | Comma-separated `--allowedTools` list for the agent (see [`../SECURITY.md`](../SECURITY.md)) |
-| `JESSE_DISALLOWED_TOOLS` | `Bash,WebFetch` | Comma-separated `--disallowedTools` denylist (defense-in-depth) |
+| `JESSE_DISALLOWED_TOOLS` | `WebFetch` | Comma-separated `--disallowedTools` denylist. **Only `WebFetch`** — bare `Bash` is deliberately not here: denying it removes the whole Bash tool class and kills every scoped `Bash(...)` grant; unscoped Bash is still blocked by default-deny. See [`../SECURITY.md`](../SECURITY.md#agent-tool-allowlist-in-process-boundary) |
 | `JESSE_MAX_CONCURRENCY` | `2` | Max concurrent turns; excess returns `429` |
 | `JESSE_RATE_PER_MIN` | `30` | Accepted requests per rolling minute; bursts beyond it return `429` |
 | `JESSE_ADVERTISE_HOST` | value of `JESSE_BIND` | Host written into the pairing QR — set to the MagicDNS `ts.net` name to advertise that instead of the bound IP |
@@ -748,6 +748,35 @@ Headless Claude Code does **not** inherit Cowork's OAuth connectors (Gmail,
 Calendar, Slack, Notion, Drive). Local MCP servers (QMD, Home Assistant, etc.)
 and the filesystem **do** work. PoC scope = vault Q&A + capture, which is fine.
 To use the cloud connectors here, register them in this project's `.mcp.json`.
+
+## Code review (git checkouts under `Code/`)
+
+The agent can review source from a phone request like *"review
+https://github.com/owner/repo, focus on the auth path."* It clones/fetches the
+repo, then reads/searches/diffs it.
+
+- **Where checkouts land:** `Code/<host>/<owner>/<repo>`, derived purely from the
+  clone URL — lowercase the host, strip a trailing `.git`, treat
+  `git@host:owner/repo` like `https://host/owner/repo`, drop any port. e.g.
+  `https://github.com/tag1consulting/jesse-app` →
+  `Code/github.com/tag1consulting/jesse-app`;
+  `git@gitlab.com:group/sub/repo.git` → `Code/gitlab.com/group/sub/repo`. A
+  `Code/README.md` index tracks repo → local path → remote URL.
+- **`Code/` is gitignored** in the vault, so checkouts never enter the vault repo
+  or its 15-minute autocommit.
+- **No new tool grant was needed.** `Bash(git:*)` already covers
+  clone/fetch/log/diff/show; `Read`/`Grep`/`Glob` reach the checkout because it is
+  under the vault cwd (no `--add-dir`). The only bridge change that *enabled* this
+  was dropping bare `Bash` from the denylist (it had been disabling the whole Bash
+  tool class — see the knob above and `SECURITY.md`).
+- **Review-only.** The agent may clone/fetch and read; it must **never `git push`
+  and never edit checked-out code**. This is a standing instruction the bridge
+  prepends to every turn (`prompt::REVIEW_CAPABILITY`), not a sandbox — see
+  [`../SECURITY.md`](../SECURITY.md#code-review-checkouts-review-only).
+- **Access & TOFU.** Uses the host's existing credentials, so private
+  access-configured repos work. A first headless clone from a brand-new SSH host
+  can fail the unknown-host prompt — pre-seed `known_hosts` or use the HTTPS URL
+  (GitHub and epyc are already trusted).
 
 ## CHANGELOG
 

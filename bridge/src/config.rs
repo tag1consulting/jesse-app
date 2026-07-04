@@ -94,10 +94,21 @@ Bash(node todo-list/validate-diet-today.js:*),\
 Bash(node todo-list/verify-diet-consistency.js:*)";
 
 // Defense-in-depth: tools that must never run from the bridge even if they slip
-// into the allowlist. Unscoped Bash (arbitrary shell) and WebFetch (SSRF / data
-// exfiltration surface the Ask/Tell workflows don't need). Override with
-// JESSE_DISALLOWED_TOOLS.
-pub const DEFAULT_DISALLOWED_TOOLS: &str = "Bash,WebFetch";
+// into the allowlist. WebFetch is the SSRF / data-exfiltration surface the
+// Ask/Tell workflows don't need. Override with JESSE_DISALLOWED_TOOLS.
+//
+// Bare `Bash` is deliberately NOT here. Listing it removes the entire Bash tool
+// class — which shadows EVERY scoped `Bash(<verb>:*)` grant in the allowlist
+// above (git for code review, the three node diet-cache scripts, date/cal for the
+// clock header, the read-only inspection verbs). Verified on the Studio
+// (claude 2.1.199, 2026-07-04): with `Bash` denied, even `Bash(date:*)` reports
+// "no Bash tool" — the scoped grants become dead. Unscoped Bash is still blocked
+// WITHOUT this entry: under `--permission-mode default` a Bash command matching
+// no scoped allow entry raises a permission prompt, which a headless (`-p`) phone
+// turn cannot answer, so it is denied. Default-deny + the scoped allowlist is the
+// real least-privilege boundary; denying the tool class only breaks the scoped
+// grants (and silently broke diet-logging + the clock verbs until this fix).
+pub const DEFAULT_DISALLOWED_TOOLS: &str = "WebFetch";
 
 #[derive(Clone)]
 pub struct Config {

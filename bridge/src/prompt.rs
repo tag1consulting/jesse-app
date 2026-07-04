@@ -71,6 +71,29 @@ pub const PHONE_FORMAT: &str = "\n\n(Formatting: this reply is shown on a narrow
 screen. Prefer short paragraphs and bullet lists. Use Markdown. If a table is the \
 clearest form, keep it to 2–3 narrow columns; otherwise avoid tables.)";
 
+// Standing capability note appended to every turn, ahead of the voice/phone
+// suffix so the voice `SPOKEN:` line still comes last. Two jobs:
+//  1. Correct the agent's self-model. In THIS (bridge) session it genuinely has
+//     scoped shell — `Bash(git:*)` and the read verbs — even though a Cowork/phone
+//     chat does not. Without this the agent has refused benign `git`/`ls` work,
+//     wrongly believing "phone sessions have no Bash" (a machine-local memory note
+//     that is true for Cowork but not for the bridge).
+//  2. State the review-only policy. Cloning is not path-sandboxed and `Bash(git:*)`
+//     would permit a push, so review-only rests on instruction, not containment:
+//     the agent may clone/fetch and read, never push or edit checked-out code.
+// The `Code/<host>/<owner>/<repo>` path is a pure function of the clone URL (host
+// lowercased, `.git` stripped, scp-form treated like https, port dropped), so an
+// existing checkout is found with one existence check rather than a directory scan.
+pub const REVIEW_CAPABILITY: &str = "\n\n(Capability: you are running on the Mac Studio \
+via the Jesse bridge, which DOES grant scoped shell here — `Bash(git:*)` plus read-only \
+verbs. Any note that \"phone sessions have no Bash\" applies to Cowork, not this session; \
+do not refuse benign git/read work on that basis. To review source, clone or fetch a \
+repo (public or already-access-configured) into `Code/<host>/<owner>/<repo>` — derived \
+from the clone URL: lowercase the host, strip a trailing `.git`, treat `git@host:owner/repo` \
+like `https://host/owner/repo`, drop any port — then Read/Grep/Glob it and update the \
+`Code/README.md` index. REVIEW-ONLY: never `git push` and never edit checked-out code. \
+`Code/` is gitignored, so checkouts never touch the vault repo.)";
+
 // ---- Stateless title endpoint (POST /jesse/title) -------------------------
 //
 // The title path is NOT a turn: no clock header, no safety floor, no
@@ -360,6 +383,10 @@ pub fn build_prompt_at(
     } else {
         format!("{clock}\n\n{floor}\n\n{preamble}{text}")
     };
+    // Standing capability + review-only note, ahead of the format suffix so the
+    // voice `SPOKEN:` line stays the final instruction. Always present (like the
+    // floor), so it is not something a wrapper override can drop.
+    p.push_str(REVIEW_CAPABILITY);
     if voice {
         p.push_str(VOICE_SUFFIX);
     } else {
@@ -549,6 +576,32 @@ mod tests {
             );
             assert!(p.contains(custom));
         }
+    }
+    #[test]
+    fn build_prompt_always_includes_review_capability_before_suffix() {
+        // The review-capability note is present on every turn (fresh/followup,
+        // ask/tell, voice/non-voice) and sits BEFORE the format suffix so the
+        // voice `SPOKEN:` line remains last.
+        for (mode, followup, voice, suffix) in [
+            ("ask", false, false, PHONE_FORMAT),
+            ("tell", true, false, PHONE_FORMAT),
+            ("ask", false, true, VOICE_SUFFIX),
+            ("tell", true, true, VOICE_SUFFIX),
+        ] {
+            let p = bp(mode, "body", followup, voice, None, None);
+            assert!(p.contains(REVIEW_CAPABILITY), "review note must be present");
+            assert!(p.ends_with(suffix), "format suffix must remain last");
+            let cap = p.find(REVIEW_CAPABILITY).unwrap();
+            let suf = p.rfind(suffix).unwrap();
+            assert!(cap < suf, "review note must precede the format suffix");
+        }
+    }
+    #[test]
+    fn build_prompt_review_capability_survives_overrides() {
+        // A wrapper/floor override customizes framing but cannot drop the standing
+        // review-capability note (same guarantee as the floor).
+        let p = bp("ask", "q", false, false, Some("WRAP. "), Some("FLOOR. "));
+        assert!(p.contains(REVIEW_CAPABILITY));
     }
     #[test]
     fn build_prompt_floor_is_mode_specific() {

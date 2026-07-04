@@ -918,16 +918,28 @@ mod tests {
             );
         }
 
-        // Defense-in-depth denylist is passed and still denies bare Bash AND
-        // WebFetch — the scoped read-only verbs above coexist with the bare-Bash
-        // denial exactly as git/mv/cat already do; the deny list is unchanged.
+        // Denylist posture: WebFetch is denied; bare `Bash` MUST NOT be.
+        // Empirically (claude 2.1.199, verified on the Studio 2026-07-04) listing
+        // bare `Bash` in --disallowedTools removes the entire Bash tool class,
+        // shadowing EVERY scoped `Bash(<verb>:*)` allow entry above (git, node
+        // diet scripts, date/cal, …) — they become unavailable, not merely the
+        // unscoped form. Unscoped/unmatched Bash is already blocked without the
+        // deny entry: under --permission-mode default a Bash command that matches
+        // no scoped allow entry is denied (a phone request cannot answer the
+        // permission prompt), so default-deny + the scoped allowlist is the real
+        // boundary. Denying the class only breaks the scoped grants. So the
+        // denylist keeps WebFetch and drops bare Bash.
         let didx = args
             .iter()
             .position(|a| a == "--disallowedTools")
             .expect("--disallowedTools present");
         let deny: Vec<&str> = args[didx + 1].split(',').map(|t| t.trim()).collect();
-        assert!(deny.contains(&"Bash"), "bare Bash must be denied: {deny:?}");
         assert!(deny.contains(&"WebFetch"), "WebFetch must be denied: {deny:?}");
+        assert!(
+            !deny.contains(&"Bash"),
+            "bare Bash must NOT be in the denylist — it disables the whole Bash \
+             tool class and kills every scoped Bash(...) grant: {deny:?}"
+        );
     }
     #[test]
     fn build_claude_args_resume_when_session() {
