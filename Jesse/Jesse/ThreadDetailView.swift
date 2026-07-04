@@ -36,7 +36,12 @@ struct ThreadDetailView: View {
     var body: some View {
         VStack(spacing: 12) {
             transcript
+            // The composer outranks the transcript for vertical space: when the
+            // keyboard, the chips row, and an error line make the screen tight,
+            // the transcript scrolls/yields while the input keeps its multi-line
+            // floor (see ComposerLayout) instead of collapsing to one line.
             composer
+                .layoutPriority(1)
         }
         .padding()
         .navigationTitle(thread.title.isEmpty ? "New conversation" : thread.title)
@@ -230,7 +235,10 @@ struct ThreadDetailView: View {
                                                 : "Tell Jesse something…",
                       text: $input, axis: .vertical)
                 .textFieldStyle(.roundedBorder)
-                .lineLimit(1...5)
+                // Reserve a multi-line floor (grows to the cap, then scrolls) so
+                // the field stays usable with chips staged and the keyboard up;
+                // the lower bound holds the height even when empty.
+                .lineLimit(ComposerLayout.inputLineLimit)
                 .focused($inputFocused)
 
             HStack {

@@ -15,6 +15,15 @@ CI both run it). See the "Versioning" section of `bridge/README.md`.
 
 ## [Unreleased]
 
+## [App 1.0 (9)] — 2026-07-03
+
+### Fixed
+- **Composer no longer collapses to one line.** The message input now holds a
+  multi-line floor (at least three lines, growing to eight before it scrolls
+  internally) even with attachment chips staged, an error visible, and the
+  keyboard up. The composer also outranks the transcript for vertical space, so a
+  tight screen makes the transcript scroll instead of squeezing the input.
+
 ## [App 1.0 (8)] — 2026-07-03
 
 ### Added
