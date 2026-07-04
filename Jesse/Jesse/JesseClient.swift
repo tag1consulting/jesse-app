@@ -541,23 +541,24 @@ struct JesseClient: JesseClientProtocol {
     /// same injected session, so a single stub still serves every endpoint.
     let streamSession: URLSession
 
-    /// Reads recent workouts for the per-turn `health_context` block. The one seam
-    /// HealthKit hides behind (see `WorkoutContextProviding`); defaults to the live
-    /// `HealthKitWorkoutProvider`, injectable so tests drive it with a fake.
-    let workoutProvider: any WorkoutContextProviding
+    /// Reads recent workouts + daily-summary metrics for the per-turn
+    /// `health_context` block. The one seam HealthKit hides behind (see
+    /// `HealthContextProviding`); defaults to the live `HealthKitWorkoutProvider`,
+    /// injectable so tests drive it with a fake.
+    let healthProvider: any HealthContextProviding
 
-    /// Whether the "attach recent workouts" feature is on. Read at send time from
+    /// Whether the "attach health context" feature is on. Read at send time from
     /// the persisted toggle; injectable so tests pin it without touching defaults.
     let isHealthContextEnabled: @Sendable () -> Bool
 
     init(config: JesseConfig,
          session: URLSession = JesseClient.boundedSession,
          streamSession: URLSession? = nil,
-         workoutProvider: any WorkoutContextProviding = HealthKitWorkoutProvider(),
-         isHealthContextEnabled: @escaping @Sendable () -> Bool = { WorkoutContextSettings.isEnabled }) {
+         healthProvider: any HealthContextProviding = HealthKitWorkoutProvider(),
+         isHealthContextEnabled: @escaping @Sendable () -> Bool = { HealthContextSettings.isEnabled }) {
         self.config = config
         self.session = session
-        self.workoutProvider = workoutProvider
+        self.healthProvider = healthProvider
         self.isHealthContextEnabled = isHealthContextEnabled
         if let streamSession {
             self.streamSession = streamSession
@@ -620,13 +621,13 @@ struct JesseClient: JesseClientProtocol {
         req.httpMethod = "POST"
         req.setValue("application/json", forHTTPHeaderField: "Content-Type")
         req.setValue("Bearer \(config.token)", forHTTPHeaderField: "Authorization")
-        // Resolve the recent-workouts block here in the request-building path so
+        // Resolve the health-context block here in the request-building path so
         // EVERY turn — typed, Siri, and the watch relay — inherits it. Best-effort:
         // the resolver returns nil (attach nothing) when the feature is off, there's
         // no data, or the query errors/times out, so a turn never blocks or breaks.
-        let healthContext = await WorkoutContextResolver.resolve(
+        let healthContext = await HealthContextResolver.resolve(
             enabled: isHealthContextEnabled(),
-            provider: workoutProvider,
+            provider: healthProvider,
             now: Date())
         let request = Self.makeRequest(mode: mode, text: text, sessionId: sessionId,
                                        voice: voice, instructions: instructions,

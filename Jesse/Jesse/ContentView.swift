@@ -143,10 +143,10 @@ struct SettingsView: View {
     // Tier-1 search with no model calls. Same key the thread list reads.
     @AppStorage("searchExpansionEnabled") private var searchExpansionEnabled = true
 
-    // "Attach recent workouts" — default OFF until Apple Health is connected once,
+    // "Attach health context" — default OFF until Apple Health is connected once,
     // then flipped on. Same UserDefaults key `JesseClient` reads at send time
-    // (`WorkoutContextSettings`). `connectingHealth` gates the connect row.
-    @AppStorage(WorkoutContextSettings.enabledKey) private var attachHealthContext = false
+    // (`HealthContextSettings`). `connectingHealth` gates the connect row.
+    @AppStorage(HealthContextSettings.enabledKey) private var attachHealthContext = false
     @State private var connectingHealth = false
 
     var body: some View {
@@ -232,7 +232,7 @@ struct SettingsView: View {
                 }
 
                 Section {
-                    Toggle("Attach recent workouts", isOn: $attachHealthContext)
+                    Toggle("Attach health context", isOn: $attachHealthContext)
                     Button {
                         Task { await connectAppleHealth() }
                     } label: {
@@ -245,7 +245,7 @@ struct SettingsView: View {
                 } header: {
                     Text("Apple Health")
                 } footer: {
-                    Text("Jesse attaches your recent workouts (from Apple Health) so you can ask it to log one — “Log my swim.” Nothing is read until you connect, and you can turn it off anytime.")
+                    Text("Jesse attaches a compact summary of your recent Apple Health — last night’s sleep, resting heart rate and other daily vitals, plus your recent workouts — so you can ask it to log one (“Log my swim”) or reflect on how you’re doing. Nothing is read until you connect, and you can turn it off anytime.")
                 }
 
                 Section {

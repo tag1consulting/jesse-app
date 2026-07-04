@@ -1,52 +1,61 @@
 import XCTest
 @testable import Jesse
 
-/// Exercises the real `HealthKitWorkoutProvider` through its injected `fetch`
-/// seam, so the degrade paths are proven WITHOUT depending on simulator Health
-/// data. The provider must turn every failure into an empty result: a thrown
-/// error (the watch-relay "HealthKit database inaccessible while the phone is
-/// locked" case), an overrun of the 1-second bound, and a normal empty query all
-/// yield `[]`, so a turn is never blocked or broken by health data.
+/// Exercises the real `HealthKitWorkoutProvider` through its injected
+/// `HealthMetricFetches` seam, so the degrade paths are proven WITHOUT depending on
+/// simulator Health data. The provider must turn every failure into an empty result
+/// and isolate a single failing metric: a thrown read (the watch-relay "HealthKit
+/// database inaccessible while the phone is locked" case), an overrun of the ~1.5s
+/// bound, and a normal empty gather all keep a turn sending; one failed metric never
+/// drops another.
 final class HealthKitWorkoutProviderTests: XCTestCase {
 
-    private func sample() -> WorkoutSummary {
+    private func swim() -> WorkoutSummary {
         WorkoutSummary(activityName: "Swim", start: Date(timeIntervalSince1970: 1_783_146_600),
                        duration: 1800, distanceMeters: 1500, activeEnergyKcal: 420,
                        averageHeartRateBPM: 132, maxHeartRateBPM: 158, source: "Apple Watch")
     }
 
-    func testThrownErrorYieldsEmpty() async {
+    func testThrownReadsIsolateAndYieldEmpty() async {
         // The watch-relay degrade: a locked phone's HealthKit read throws
-        // "database inaccessible" — it must hit the silent empty path, not crash
-        // or break the send.
+        // "database inaccessible" — it must hit the silent empty path per metric,
+        // not crash or break the send.
         struct DatabaseInaccessible: Error {}
-        let provider = HealthKitWorkoutProvider(fetch: { throw DatabaseInaccessible() })
-        let out = await provider.recentWorkouts()
-        XCTAssertTrue(out.isEmpty)
+        var f = HealthMetricFetches.empty
+        f.workouts = { throw DatabaseInaccessible() }
+        f.sleep = { throw DatabaseInaccessible() }
+        f.restingHR = { 50 }                          // one metric still succeeds
+        let provider = HealthKitWorkoutProvider(fetches: f)
+        let snap = await provider.snapshot()
+        XCTAssertTrue(snap.workouts.isEmpty)
+        XCTAssertNil(snap.daily.sleep)
+        XCTAssertEqual(snap.daily.restingHeartRateBPM, 50, "a sibling read is unaffected")
     }
 
-    func testTimeoutYieldsEmpty() async {
-        // Hoist the value out so the @Sendable fetch closure captures a Sendable
-        // WorkoutSummary, not the (non-Sendable) test case via `self`.
-        let late = [sample()]
-        let provider = HealthKitWorkoutProvider(timeout: .milliseconds(100), fetch: {
+    func testTimeoutYieldsEmptySnapshot() async {
+        // Hoist the value out so the @Sendable closure captures a Sendable value.
+        let late = swim()
+        var f = HealthMetricFetches.empty
+        f.workouts = {
             try await Task.sleep(for: .seconds(5))
-            return late
-        })
-        let out = await provider.recentWorkouts()
-        XCTAssertTrue(out.isEmpty, "a query slower than the bound degrades to empty")
+            return [late]
+        }
+        let provider = HealthKitWorkoutProvider(timeout: .milliseconds(100), fetches: f)
+        let snap = await provider.snapshot()
+        XCTAssertEqual(snap, .empty, "a gather slower than the bound degrades to empty")
     }
 
-    func testEmptyQueryYieldsEmpty() async {
-        let provider = HealthKitWorkoutProvider(fetch: { [] })
-        let out = await provider.recentWorkouts()
-        XCTAssertTrue(out.isEmpty)
+    func testEmptyFetchesYieldEmptySnapshot() async {
+        let snap = await HealthKitWorkoutProvider(fetches: .empty).snapshot()
+        XCTAssertEqual(snap, .empty)
     }
 
-    func testSuccessfulFetchPassesThrough() async {
-        let ws = [sample()]
-        let provider = HealthKitWorkoutProvider(fetch: { ws })
-        let out = await provider.recentWorkouts()
-        XCTAssertEqual(out, ws)
+    func testSuccessfulFetchesPassThrough() async {
+        var f = HealthMetricFetches.empty
+        f.workouts = { [self.swim()] }
+        f.restingHR = { 52 }
+        let snap = await HealthKitWorkoutProvider(fetches: f).snapshot()
+        XCTAssertEqual(snap.workouts, [swim()])
+        XCTAssertEqual(snap.daily.restingHeartRateBPM, 52)
     }
 }

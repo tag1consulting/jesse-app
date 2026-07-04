@@ -7,7 +7,7 @@
 	<key>NSSpeechRecognitionUsageDescription</key>
 	<string>Transcribe the audio you speak on your Apple Watch so Jesse can answer it.</string>
 	<key>NSHealthShareUsageDescription</key>
-	<string>Jesse attaches your recent workouts so you can ask it to log them.</string>
+	<string>Jesse attaches a compact summary of your recent Apple Health — sleep, resting heart rate and other daily vitals, plus recent workouts — so you can ask it to log a workout or reflect on how you’re doing.</string>
 	<key>NSAppTransportSecurity</key>
 	<dict>
 		<key>NSExceptionDomains</key>

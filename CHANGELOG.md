@@ -15,6 +15,35 @@ CI both run it). See the "Versioning" section of `bridge/README.md`.
 
 ## [Unreleased]
 
+## [App 1.0 (12)] — 2026-07-04
+
+### Added
+- **Attach a daily health summary alongside recent workouts.** The Apple Health
+  block a turn carries — typed, Siri, and the watch relay — grows from just recent
+  workouts into a two-section **health context**: a new **daily summary** (last
+  night's sleep with deep/REM/core/awake minutes, resting heart rate, HRV, any
+  low/high/irregular heart-rate events, VO2 max, 1-minute HR recovery, overnight
+  respiratory rate / SpO2 / wrist-temperature deviation, walking steadiness and
+  asymmetry, today's steps and active kcal, and latest weight) followed by the
+  existing recent-workouts section. **Run** workouts now also show average running
+  **power, ground contact time, vertical oscillation, and stride length**. Latest
+  values only — the vault owns history — with each metric omitted when unavailable.
+  - **Same guarantees as before.** Never blocks or delays a send (one combined
+    ~1.5s timeout), silent per-metric degrade (a denied or missing metric is simply
+    omitted, never an error), and one failing read never drops another. The whole
+    block is self-capped at **3 KiB** (was 2 KiB), well under the bridge's 4 KiB
+    ceiling; under pressure it drops the oldest workout lines first, then a
+    boundary run's dynamics suffix, never truncating mid-line.
+  - **HealthKit stays read-only and isolated.** One file
+    (`HealthKitWorkoutProvider`) imports HealthKit, behind a `HealthContextProviding`
+    seam; the daily-summary formatter, composer, classifiers, policy, resolver,
+    gather, and timeout are pure and fully unit-tested. New read types are requested
+    as a union so existing users get a single re-prompt for the delta; the app still
+    writes nothing to Health.
+  - **Settings → Apple Health:** the toggle becomes **"Attach health context"** (one
+    switch for the whole block; the stored key is unchanged, so an existing user's
+    choice carries over).
+
 ## [App 1.0 (11)] — 2026-07-04
 
 ### Added

@@ -1,11 +1,11 @@
 import XCTest
 @testable import Jesse
 
-/// Pure-logic tests for the recent-workouts context: the formatter (ordering,
-/// caps, window, byte-truncation, singular/plural, determinism), the attach
-/// policy, the async timeout helper, and the resolver that wires them for the send
-/// path. Everything here is deterministic — a fixed UTC calendar and a fixed
-/// `now`, never the wall clock or host locale — so the rendered bytes are pinned.
+/// Pure-logic tests for the recent-workouts subsection renderer: the per-workout
+/// line (base fields), the droppable running-dynamics suffix, and the subsection
+/// header. The window/cap/ordering/composition live in `HealthContextFormatter` and
+/// are covered by `HealthContextTests`. Everything here is deterministic — a fixed
+/// UTC calendar — so the rendered bytes are pinned.
 final class WorkoutContextTests: XCTestCase {
 
     // Fixed UTC calendar so date rendering is deterministic regardless of host TZ.
@@ -15,7 +15,6 @@ final class WorkoutContextTests: XCTestCase {
         cal.timeZone = utc
         return cal.date(from: DateComponents(year: y, month: mo, day: d, hour: h, minute: mi))!
     }
-    private lazy var now = date(2026, 7, 4, 12, 0)
 
     private func swim(start: Date, source: String = "Apple Watch") -> WorkoutSummary {
         WorkoutSummary(activityName: "Swim", start: start, duration: 1800,
@@ -23,147 +22,65 @@ final class WorkoutContextTests: XCTestCase {
                        averageHeartRateBPM: 132, maxHeartRateBPM: 158, source: source)
     }
 
-    // MARK: - Formatter
+    // MARK: - Base line (unchanged from the shipped feature — verbatim format)
 
-    func testEmptyInputReturnsNil() {
-        XCTAssertNil(WorkoutContextFormatter.block(from: [], now: now, timeZone: utc))
+    func testBaseLineRendersExactFormat() {
+        let line = WorkoutContextFormatter.baseLine(for: swim(start: date(2026, 7, 4, 6, 30)),
+                                                    timeZone: utc)
+        XCTAssertEqual(line,
+            "Swim — 2026-07-04 06:30, 30m, 1.5 km, 420 kcal, avg HR 132, max HR 158 (Apple Watch)")
     }
 
-    func testSingleWorkoutRendersSingularHeaderAndExactLine() {
-        let block = WorkoutContextFormatter.block(
-            from: [swim(start: date(2026, 7, 4, 6, 30))], now: now, timeZone: utc)
-        XCTAssertEqual(block, """
-        1 recent workout from Apple Health (last 48h, newest first):
-        Swim — 2026-07-04 06:30, 30m, 1.5 km, 420 kcal, avg HR 132, max HR 158 (Apple Watch)
-        """)
-    }
-
-    func testPluralHeaderAndNewestFirstOrdering() {
-        let older = swim(start: date(2026, 7, 3, 18, 0), source: "Watch A")
-        let newer = swim(start: date(2026, 7, 4, 7, 0), source: "Watch B")
-        // Deliberately pass oldest-first; the formatter must sort newest-first.
-        let block = WorkoutContextFormatter.block(from: [older, newer], now: now, timeZone: utc)!
-        let lines = block.split(separator: "\n").map(String.init)
-        XCTAssertTrue(lines[0].hasPrefix("2 recent workouts from Apple Health"))
-        XCTAssertTrue(lines[1].contains("Watch B"), "newest first")
-        XCTAssertTrue(lines[2].contains("Watch A"))
-    }
-
-    func testWindowExcludesWorkoutsOlderThan48h() {
-        // Ended ~49h before `now` → outside the window → dropped → nil.
-        let old = swim(start: date(2026, 7, 2, 10, 0))
-        XCTAssertNil(WorkoutContextFormatter.block(from: [old], now: now, timeZone: utc))
-        // One inside + one outside → only the inside one renders.
-        let fresh = swim(start: date(2026, 7, 4, 6, 0))
-        let block = WorkoutContextFormatter.block(from: [old, fresh], now: now, timeZone: utc)!
-        XCTAssertTrue(block.hasPrefix("1 recent workout "))
-    }
-
-    func testCapsAtFiveWorkouts() {
-        // Seven distinct, all within the window; only the five newest render.
-        let all = (0..<7).map { swim(start: date(2026, 7, 4, 4 + $0 / 60, $0 % 60), source: "W\($0)") }
-        let block = WorkoutContextFormatter.block(from: all, now: now, timeZone: utc)!
-        let lines = block.split(separator: "\n")
-        XCTAssertTrue(lines[0].hasPrefix("5 recent workouts from Apple Health"))
-        XCTAssertEqual(lines.count, 1 + 5, "header + 5 workout lines")
-    }
-
-    func testByteCapTruncatesWholeLinesNeverMidLine() {
-        // Long sources make each line big; not all five fit under the 2 KiB cap.
-        let long = String(repeating: "x", count: 500)
-        let all = (0..<5).map { swim(start: date(2026, 7, 4, 5 + $0, 0), source: long) }
-        let block = WorkoutContextFormatter.block(from: all, now: now, timeZone: utc)!
-        XCTAssertLessThanOrEqual(block.utf8.count, 2 * 1024, "hard 2 KiB ceiling")
-        let lines = block.split(separator: "\n").map(String.init)
-        XCTAssertLessThan(lines.count - 1, 5, "some workouts dropped by the byte cap")
-        // Every included workout line is complete (ends with its full source paren).
-        for line in lines.dropFirst() {
-            XCTAssertTrue(line.hasSuffix("(\(long))"), "never truncated mid-line: \(line.prefix(40))…")
-        }
-        // Header count matches the number of lines actually kept.
-        XCTAssertTrue(lines[0].hasPrefix("\(lines.count - 1) recent workout"))
-    }
-
-    func testOmitsNilFields() {
+    func testBaseLineOmitsNilFieldsAndSource() {
         let bare = WorkoutSummary(activityName: "Walk", start: date(2026, 7, 4, 8, 0),
                                   duration: 3660, distanceMeters: nil, activeEnergyKcal: nil,
                                   averageHeartRateBPM: nil, maxHeartRateBPM: nil, source: nil)
-        let block = WorkoutContextFormatter.block(from: [bare], now: now, timeZone: utc)!
-        // Assert on the workout LINE (the header legitimately carries "(last 48h…)").
-        let workoutLine = block.split(separator: "\n").map(String.init)[1]
-        // Duration formats as 1h01m; no distance/kcal/HR/source segments present.
-        XCTAssertEqual(workoutLine, "Walk — 2026-07-04 08:00, 1h01m")
-        XCTAssertFalse(workoutLine.contains("kcal"))
-        XCTAssertFalse(workoutLine.contains("HR"))
-        XCTAssertFalse(workoutLine.contains("("), "no source paren when source is nil")
+        let line = WorkoutContextFormatter.baseLine(for: bare, timeZone: utc)
+        XCTAssertEqual(line, "Walk — 2026-07-04 08:00, 1h01m")
+        XCTAssertFalse(line.contains("("), "no source paren when source is nil")
     }
 
-    func testDeterministicAcrossCalls() {
-        let ws = [swim(start: date(2026, 7, 4, 6, 30)), swim(start: date(2026, 7, 4, 9, 0))]
-        let a = WorkoutContextFormatter.block(from: ws, now: now, timeZone: utc)
-        let b = WorkoutContextFormatter.block(from: ws, now: now, timeZone: utc)
-        XCTAssertEqual(a, b)
+    func testHeaderSingularAndPlural() {
+        XCTAssertEqual(WorkoutContextFormatter.header(count: 1),
+                       "1 recent workout from Apple Health (last 48h, newest first):")
+        XCTAssertEqual(WorkoutContextFormatter.header(count: 3),
+                       "3 recent workouts from Apple Health (last 48h, newest first):")
     }
 
-    // MARK: - Policy
+    // MARK: - Running-dynamics suffix
 
-    func testPolicyDisabledNeverAttaches() {
-        XCTAssertFalse(WorkoutContextPolicy.shouldAttach(enabled: false, block: "has data"))
-    }
-    func testPolicyEnabledButNoBlock() {
-        XCTAssertFalse(WorkoutContextPolicy.shouldAttach(enabled: true, block: nil))
-        XCTAssertFalse(WorkoutContextPolicy.shouldAttach(enabled: true, block: ""))
-    }
-    func testPolicyEnabledWithBlockAttaches() {
-        XCTAssertTrue(WorkoutContextPolicy.shouldAttach(enabled: true, block: "1 recent workout…"))
-    }
-
-    // MARK: - Timeout helper
-
-    func testTimeoutFastOperationReturnsItsValue() async {
-        let ws = [swim(start: date(2026, 7, 4, 6, 30))]
-        let out = await WorkoutContextTimeout.orEmpty(within: .seconds(1)) { ws }
-        XCTAssertEqual(out, ws)
-    }
-    func testTimeoutThrowingOperationYieldsEmpty() async {
-        struct Boom: Error {}
-        let out = await WorkoutContextTimeout.orEmpty(within: .seconds(1)) { throw Boom() }
-        XCTAssertTrue(out.isEmpty)
-    }
-    func testTimeoutSlowOperationYieldsEmpty() async {
-        let ws = [swim(start: date(2026, 7, 4, 6, 30))]
-        let out = await WorkoutContextTimeout.orEmpty(within: .milliseconds(100)) {
-            try await Task.sleep(for: .seconds(5))
-            return ws
-        }
-        XCTAssertTrue(out.isEmpty, "overrun degrades to empty, not the late value")
+    private func run(dynamics: Bool) -> WorkoutSummary {
+        WorkoutSummary(activityName: "Run", start: date(2026, 7, 4, 7, 0), duration: 2700,
+                       distanceMeters: 8000, activeEnergyKcal: 500,
+                       averageHeartRateBPM: 150, maxHeartRateBPM: 172, source: "Apple Watch",
+                       averageRunningPowerW: dynamics ? 245 : nil,
+                       groundContactTimeMs: dynamics ? 240 : nil,
+                       verticalOscillationCm: dynamics ? 8.1 : nil,
+                       strideLengthM: dynamics ? 1.15 : nil)
     }
 
-    // MARK: - Resolver (send-path wiring, via a fake provider)
-
-    private struct FakeProvider: WorkoutContextProviding {
-        let summaries: [WorkoutSummary]
-        func recentWorkouts() async -> [WorkoutSummary] { summaries }
+    func testDynamicsSuffixRendersAllFields() {
+        XCTAssertEqual(WorkoutContextFormatter.dynamicsSuffix(for: run(dynamics: true)),
+                       ", power 245 W, GCT 240 ms, vert osc 8.1 cm, stride 1.15 m")
     }
 
-    func testResolveDisabledReturnsNilWithoutQuerying() async {
-        let out = await WorkoutContextResolver.resolve(
-            enabled: false,
-            provider: FakeProvider(summaries: [swim(start: date(2026, 7, 4, 6, 30))]),
-            now: now, timeZone: utc)
-        XCTAssertNil(out)
+    func testDynamicsSuffixEmptyWhenNoDynamics() {
+        XCTAssertEqual(WorkoutContextFormatter.dynamicsSuffix(for: run(dynamics: false)), "")
+        XCTAssertFalse(run(dynamics: false).hasRunningDynamics)
+        XCTAssertTrue(run(dynamics: true).hasRunningDynamics)
     }
-    func testResolveEnabledButNoDataReturnsNil() async {
-        let out = await WorkoutContextResolver.resolve(
-            enabled: true, provider: FakeProvider(summaries: []), now: now, timeZone: utc)
-        XCTAssertNil(out)
+
+    func testDynamicsSuffixOmitsIndividualNilFields() {
+        var r = run(dynamics: true)
+        r.groundContactTimeMs = nil
+        r.strideLengthM = nil
+        XCTAssertEqual(WorkoutContextFormatter.dynamicsSuffix(for: r),
+                       ", power 245 W, vert osc 8.1 cm")
     }
-    func testResolveEnabledWithDataReturnsBlock() async {
-        let out = await WorkoutContextResolver.resolve(
-            enabled: true,
-            provider: FakeProvider(summaries: [swim(start: date(2026, 7, 4, 6, 30))]),
-            now: now, timeZone: utc)
-        XCTAssertNotNil(out)
-        XCTAssertTrue(out!.contains("Swim — 2026-07-04 06:30"))
+
+    func testFullLineAppendsDynamicsAfterBase() {
+        XCTAssertEqual(WorkoutContextFormatter.line(for: run(dynamics: true), timeZone: utc),
+            "Run — 2026-07-04 07:00, 45m, 8.0 km, 500 kcal, avg HR 150, max HR 172 (Apple Watch)"
+            + ", power 245 W, GCT 240 ms, vert osc 8.1 cm, stride 1.15 m")
     }
 }
