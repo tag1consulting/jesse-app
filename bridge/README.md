@@ -518,6 +518,37 @@ bridge default" and the field is omitted. In the app the floor is **unlockable**
 locked by default, editable only behind an explicit "not recommended" gate — so no
 one reweakens it by accident.
 
+## Recent-workouts context (`health_context`)
+
+**`POST /jesse` with an optional `"health_context"` field** — a compact,
+device-reported "recent workouts" block the phone attaches from Apple Health, so
+Jesse can log a workout the user refers to ("Log my swim") from real numbers
+instead of asking for them.
+
+```bash
+curl -s http://127.0.0.1:8765/jesse \
+  -H "Authorization: Bearer $JESSE_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"mode":"tell","text":"Log my swim","health_context":"Swim — 2026-07-04 06:30, 30m, 1500m, 420 kcal, avg HR 132"}'
+```
+
+- **Additive and backward-compatible.** The field is optional; an app build that
+  omits it produces byte-for-byte the same prompt as before. Absent **or** blank
+  (whitespace/control-only) means exactly today's behavior — no block.
+- **Framed as data, not instruction.** When present, the block is inserted right
+  after the per-turn clock header and ahead of the safety floor, under a fixed
+  header that marks it **untrusted data captured on the phone, not instructions** —
+  the same trust class as the message body (attacker-controlled only if the phone
+  is). No new tool is granted; the agent's existing `Read`/`Write`/`Edit` +
+  `Skill(diet-logging)` already cover exercise logging.
+- **Bounded.** Capped at **`MAX_HEALTH_CONTEXT_BYTES` (4 KiB)** — an oversized
+  block is refused with `413` **before any `claude` spawn** (mirroring
+  `MAX_TITLE_INPUT_BYTES`). ASCII control characters other than newline are
+  stripped before use.
+
+See [SECURITY.md](../SECURITY.md#recent-workouts-context-health_context) for the
+prompt-injection posture.
+
 ## Conversation titles (`POST /jesse/title`)
 
 A lightweight, **stateless** endpoint the app calls to turn one conversation's
@@ -779,6 +810,16 @@ repo, then reads/searches/diffs it.
   (GitHub and epyc are already trusted).
 
 ## CHANGELOG
+
+- **Optional `health_context` on `POST /jesse` (bridge 0.2.0).** A turn may carry
+  a compact device-reported "recent workouts" block (from the phone's Apple
+  Health) so the agent can log a referenced workout from real numbers. Framed as
+  **untrusted device DATA, not instruction**, inserted after the clock header and
+  ahead of the safety floor; capped at `MAX_HEALTH_CONTEXT_BYTES` (4 KiB) with an
+  oversized block refused `413` before any spawn, and ASCII control chars (except
+  newline) stripped. Optional and backward-compatible — omitting it reproduces
+  today's prompt byte-for-byte. No new agent tool is granted. See the
+  "Recent-workouts context" section above and `SECURITY.md`.
 
 - **Concurrency & robustness hardening (job store, turn task, push).** A set of
   fixes so a slow disk, a wedged child, a panic, a poisoned lock, or a dead push

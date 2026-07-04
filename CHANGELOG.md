@@ -15,6 +15,25 @@ CI both run it). See the "Versioning" section of `bridge/README.md`.
 
 ## [Unreleased]
 
+## [Bridge 0.2.0] — 2026-07-04
+
+### Added
+- **Optional `health_context` on `POST /jesse`.** A turn may carry a compact
+  "recent workouts" block (device-reported, from the phone's Apple Health) so the
+  agent can log a workout the user refers to ("Log my swim") from real numbers
+  instead of asking for them. When present and non-empty, the block is framed as
+  **untrusted device DATA, not instruction**, and inserted right after the per-turn
+  clock header, ahead of the safety floor. **Backward compatible:** the field is
+  optional (`#[serde(default)]`) — an old app build that omits it produces
+  byte-for-byte the same prompt as before. No new agent tool is granted; the
+  existing `Read`/`Write`/`Edit` + `Skill(diet-logging)` already cover exercise
+  logging.
+- Bounded like the title endpoint: the block is capped at
+  **`MAX_HEALTH_CONTEXT_BYTES` (4 KiB)** — an oversized block is rejected with
+  `413` **before any `claude` spawn** (and before a concurrency permit is taken).
+  ASCII control characters other than newline are stripped before the block is
+  used, so a crafted block can't smuggle terminal escapes or NULs into the prompt.
+
 ## [App 1.0 (10)] — 2026-07-04
 
 ### Added

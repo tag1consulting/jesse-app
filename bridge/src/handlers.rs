@@ -24,6 +24,15 @@ pub struct JesseRequest {
     // scratch dir the headless agent reads; empty for an ordinary turn.
     #[serde(default)]
     attachments: Vec<Attachment>,
+    // Optional compact "recent workouts" block the phone attaches from Apple
+    // Health, so the agent can log a workout the user refers to ("Log my swim")
+    // from device-reported numbers. Absent or empty reproduces today's behavior
+    // exactly (backward compatible — old app builds simply omit it). When present
+    // it is capped (`MAX_HEALTH_CONTEXT_BYTES` → 413), control-stripped, and framed
+    // as untrusted DEVICE DATA after the clock line by `build_prompt`. Same trust
+    // class as `text`: attacker-controlled only if the phone is.
+    #[serde(default)]
+    health_context: Option<String>,
 }
 
 /// Body of `POST /jesse/device`: the phone's APNs device token (hex string).
@@ -100,6 +109,7 @@ pub async fn jesse(
         req.voice,
         req.instructions.as_deref(),
         req.floor_override.as_deref(),
+        req.health_context.as_deref(),
     )?;
 
     // Concurrency cap (C3): take a permit before spawning the turn. If none is

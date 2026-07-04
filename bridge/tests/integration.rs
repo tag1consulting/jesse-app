@@ -819,6 +819,132 @@ use tower::ServiceExt;
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     }
     #[tokio::test]
+    async fn jesse_accepts_health_context_field() {
+        // The new field is #[serde(default)] and optional. A request that carries
+        // it must still deserialize; a bad mode then returns 400, proving the body
+        // (with `health_context`) parsed before build_prompt ran. This is the
+        // byte-for-byte request decode, extended for the new optional field.
+        let resp = app(test_state())
+            .oneshot(jesse_request(
+                Some("Bearer test-token"),
+                r#"{"mode":"nope","text":"hi","health_context":"Swim 30m 1500m"}"#,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+    #[tokio::test]
+    async fn jesse_oversized_health_context_is_413_before_any_spawn() {
+        // A block one byte over MAX_HEALTH_CONTEXT_BYTES must be rejected 413 by
+        // build_prompt BEFORE the turn is spawned. A fake claude that touches a
+        // marker the instant it runs proves no spawn happened.
+        let marker = std::env::temp_dir().join(format!(
+            "jesse-hc-marker-{}-{}.txt",
+            std::process::id(),
+            JOB_COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_file(&marker);
+        let script = format!(
+            "#!/bin/sh\n\
+             touch '{}'\n\
+             printf '%s' '{{\"type\":\"result\",\"is_error\":false,\"result\":\"too late\"}}'\n",
+            marker.display()
+        );
+        let fake = write_fake_claude(&script);
+        let cfg = Config {
+            claude_bin: fake.to_string_lossy().into_owned(),
+            ..test_config()
+        };
+        let st = AppState::new(cfg);
+
+        let oversized = "x".repeat(MAX_HEALTH_CONTEXT_BYTES + 1);
+        let json = format!(r#"{{"mode":"ask","text":"hi","health_context":"{oversized}"}}"#);
+        let resp = app(st)
+            .oneshot(jesse_request(Some("Bearer test-token"), &json))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(
+            !marker.exists(),
+            "oversized health_context must be rejected before claude is ever spawned"
+        );
+
+        let _ = std::fs::remove_file(&marker);
+        let _ = std::fs::remove_file(&fake);
+    }
+    #[tokio::test]
+    async fn health_context_block_reaches_claude_verbatim_after_the_clock() {
+        // End-to-end: drive POST /jesse with a health_context block and capture the
+        // prompt that actually reaches `claude` ($2). The framed block must appear
+        // verbatim right after the clock header and ahead of the safety floor; a
+        // request WITHOUT the field must carry no such block.
+        //
+        // FAILING-FIRST: without the block-assembly line in build_prompt_at, the
+        // captured prompt jumps straight from the clock to the floor and contains
+        // neither the framing header nor the block, so the present-case asserts fail.
+        async fn captured_prompt(json: &str) -> String {
+            let promptfile = std::env::temp_dir().join(format!(
+                "jesse-hc-prompt-{}-{}.txt",
+                std::process::id(),
+                JOB_COUNTER.fetch_add(1, Ordering::Relaxed)
+            ));
+            let _ = std::fs::remove_file(&promptfile);
+            let script = format!(
+                "#!/bin/sh\n\
+                 printf '%s' \"$2\" > '{}'\n\
+                 printf '%s' '{{\"type\":\"result\",\"is_error\":false,\"result\":\"ok\",\"session_id\":\"sess-hc\"}}'\n",
+                promptfile.display()
+            );
+            let fake = write_fake_claude(&script);
+            let cfg = Config {
+                claude_bin: fake.to_string_lossy().into_owned(),
+                timeout_secs: 30,
+                ..test_config()
+            };
+            let st = AppState::new(cfg);
+            let resp = app(st.clone())
+                .oneshot(jesse_request(Some("Bearer test-token"), json))
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::ACCEPTED);
+            let body: Value = serde_json::from_str(&body_string(resp).await).unwrap();
+            let job_id = body["job_id"].as_str().unwrap().to_string();
+            let mut done = false;
+            for _ in 0..60 {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                if result_status(&st, &job_id).await["status"] == "done" {
+                    done = true;
+                    break;
+                }
+            }
+            assert!(done, "turn must complete");
+            let prompt =
+                std::fs::read_to_string(&promptfile).expect("fake claude must record the prompt");
+            let _ = std::fs::remove_file(&fake);
+            let _ = std::fs::remove_file(&promptfile);
+            prompt
+        }
+
+        let block = "Swim — 2026-07-04 06:30, 30m, 1500m, 420 kcal, avg HR 132";
+        // Present: the framed block appears verbatim after the clock, before the floor.
+        let with = captured_prompt(
+            &format!(r#"{{"mode":"ask","text":"log my swim","health_context":"{block}"}}"#),
+        )
+        .await;
+        assert!(with.contains(HEALTH_CONTEXT_HEADER), "framing header present");
+        assert!(with.contains(block), "block appears verbatim");
+        let clock_end = with.find("\n\n").expect("clock line then blank line");
+        let block_at = with.find(block).unwrap();
+        let floor_at = with.find(ASK_FLOOR).unwrap();
+        assert!(clock_end < block_at && block_at < floor_at, "clock < block < floor");
+
+        // Absent: no framing header, no block — today's behavior.
+        let without = captured_prompt(r#"{"mode":"ask","text":"log my swim"}"#).await;
+        assert!(!without.contains(HEALTH_CONTEXT_HEADER), "no health block when field absent");
+    }
+    #[tokio::test]
     async fn jesse_without_attachments_field_still_works() {
         // The field is #[serde(default)] — existing clients omit it entirely.
         // A bad mode still reaches build_prompt and returns 400, proving the
