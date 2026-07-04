@@ -11,6 +11,7 @@ struct ContentView: View {
 
     @StateObject private var inbox = JesseInbox.shared
     @StateObject private var pushRouter = PushRouter.shared
+    @StateObject private var voice = VoiceCaptureModel()
     @State private var path: [JesseThread] = []
     @State private var config = ConfigStore.load()
     @State private var showSettings = false
@@ -51,10 +52,54 @@ struct ContentView: View {
             inbox.pending = nil
             startVoiceThread(req)
         }
+        .onChange(of: inbox.pendingWake) { _, wake in
+            guard let wake else { return }
+            inbox.pendingWake = nil
+            Task { await startWakeCapture(mode: wake.mode) }
+        }
         .onChange(of: pushRouter.pendingJobId) { _, jobId in
             guard let jobId else { return }
             pushRouter.pendingJobId = nil
             openThread(forJobId: jobId)
+        }
+        .overlay {
+            if voice.phase != .idle {
+                listeningOverlay
+            }
+        }
+    }
+
+    /// The hands-free listening UI, shown while the wake capture records then
+    /// transcribes. Stop keeps the take (transcribe what was said); Cancel discards
+    /// it. It's an overlay, not a sheet, so it never fights the navigation stack.
+    private var listeningOverlay: some View {
+        ZStack {
+            Color.black.opacity(0.35).ignoresSafeArea()
+            VStack(spacing: 20) {
+                Image(systemName: voice.phase == .listening ? "waveform" : "text.bubble")
+                    .font(.system(size: 44))
+                    .symbolEffect(.variableColor.iterative, isActive: voice.phase == .listening)
+                    .foregroundStyle(.tint)
+                Text(voice.phase == .listening ? "Listening…" : "Transcribing…")
+                    .font(.headline)
+                if voice.phase == .listening {
+                    Text("Speak your request — I'll stop when you pause.")
+                        .font(.subheadline)
+                        .foregroundStyle(.secondary)
+                        .multilineTextAlignment(.center)
+                    HStack(spacing: 16) {
+                        Button("Cancel", role: .cancel) { voice.cancel() }
+                            .buttonStyle(.bordered)
+                        Button("Stop") { voice.stop() }
+                            .buttonStyle(.borderedProminent)
+                    }
+                } else {
+                    ProgressView()
+                }
+            }
+            .padding(28)
+            .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 20))
+            .padding(40)
         }
     }
 
@@ -70,6 +115,14 @@ struct ContentView: View {
         if let thread = try? context.fetch(d).first {
             path = [thread]
         }
+    }
+
+    // The hands-free doorbell fired: capture the spoken request in-app (Siri only
+    // opened us), then run it exactly like any other voice turn. A cancel / denial /
+    // empty transcript simply does nothing — the app is already foregrounded.
+    private func startWakeCapture(mode: JesseMode) async {
+        guard let text = await voice.capture() else { return }
+        startVoiceThread(PendingVoiceRequest(mode: mode, text: text))
     }
 
     // Each voice invocation is its own new thread; the coordinator runs it and

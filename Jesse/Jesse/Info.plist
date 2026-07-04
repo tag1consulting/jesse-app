@@ -5,7 +5,16 @@
 	<key>NSCameraUsageDescription</key>
 	<string>Scan the pairing QR shown by the Jesse bridge, and take photos to attach to a conversation.</string>
 	<key>NSSpeechRecognitionUsageDescription</key>
-	<string>Transcribe the audio you speak on your Apple Watch so Jesse can answer it.</string>
+	<string>Transcribe the audio you speak on your Apple Watch, and the request you speak after a hands-free “Vault Search Jesse”, so Jesse can answer it.</string>
+	<key>NSMicrophoneUsageDescription</key>
+	<string>Record the request you speak after a hands-free “Vault Search Jesse” so Jesse can transcribe and answer it on this iPhone.</string>
+	<key>INAlternativeAppNames</key>
+	<array>
+		<dict>
+			<key>INAlternativeAppName</key>
+			<string>Vault Search Jesse</string>
+		</dict>
+	</array>
 	<key>NSHealthShareUsageDescription</key>
 	<string>Jesse attaches a compact summary of your recent Apple Health — sleep, resting heart rate and other daily vitals, plus recent workouts — so you can ask it to log a workout or reflect on how you’re doing.</string>
 	<key>NSAppTransportSecurity</key>

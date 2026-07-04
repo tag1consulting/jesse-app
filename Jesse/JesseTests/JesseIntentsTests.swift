@@ -12,6 +12,7 @@ final class JesseIntentsTests: XCTestCase {
     // give each test a clean slate on the shared UserDefaults store).
     private let dMode = "jesse.pending.mode"
     private let dText = "jesse.pending.text"
+    private let dWakeMode = "jesse.pending.wakeMode"
 
     override func setUp() {
         super.setUp()
@@ -26,7 +27,9 @@ final class JesseIntentsTests: XCTestCase {
     private func clear() {
         UserDefaults.standard.removeObject(forKey: dMode)
         UserDefaults.standard.removeObject(forKey: dText)
+        UserDefaults.standard.removeObject(forKey: dWakeMode)
         JesseInbox.shared.pending = nil
+        JesseInbox.shared.pendingWake = nil
     }
 
     /// `enqueue` schedules its warm-path drain on a `Task { @MainActor … }`. The
@@ -37,6 +40,12 @@ final class JesseIntentsTests: XCTestCase {
     /// it hasn't, so the round-trip is verified either way.
     private func drainIfNeeded() {
         if JesseInbox.shared.pending == nil { JesseInbox.shared.drain() }
+    }
+
+    /// Wake twin of `drainIfNeeded`: the enqueue's warm drain isn't pumped inside a
+    /// test, so drive `drain()` if the wake hasn't landed yet.
+    private func drainWakeIfNeeded() {
+        if JesseInbox.shared.pendingWake == nil { JesseInbox.shared.drain() }
     }
 
     // MARK: - drain
@@ -108,5 +117,43 @@ final class JesseIntentsTests: XCTestCase {
         drainIfNeeded()
         XCTAssertEqual(JesseInbox.shared.pending?.mode, .tell)
         XCTAssertEqual(JesseInbox.shared.pending?.text, "note the roof guy comes Thursday")
+    }
+
+    // MARK: - the wake doorbell
+
+    /// The doorbell persists a "start listening" SIGNAL — a mode only — never a
+    /// spoken text value. This is the core of the doorbell architecture: Siri
+    /// contributes no free text; the request is captured in-app afterward.
+    func testEnqueueWakePersistsSignalNotText() {
+        JesseInbox.shared.enqueueWake(mode: .ask)
+        XCTAssertEqual(UserDefaults.standard.string(forKey: dWakeMode), "ask")
+        // No text request is created by a wake.
+        XCTAssertNil(UserDefaults.standard.string(forKey: dText))
+        XCTAssertNil(UserDefaults.standard.string(forKey: dMode))
+    }
+
+    /// The cold-launch path for a wake: the mode survives a launch, a fresh drain
+    /// surfaces it as `pendingWake`, and clears it so a second drain doesn't re-fire.
+    func testDrainPicksUpWakeSignalAndClearsIt() {
+        UserDefaults.standard.set("ask", forKey: dWakeMode)
+
+        JesseInbox.shared.drain()
+        XCTAssertEqual(JesseInbox.shared.pendingWake?.mode, .ask)
+        XCTAssertNil(JesseInbox.shared.pending, "a wake is not a text request")
+        XCTAssertNil(UserDefaults.standard.string(forKey: dWakeMode))
+
+        JesseInbox.shared.pendingWake = nil
+        JesseInbox.shared.drain()
+        XCTAssertNil(JesseInbox.shared.pendingWake, "a consumed wake does not re-fire")
+    }
+
+    /// `WakeJesseIntent` (the parameter-less doorbell) enqueues a wake signal, not a
+    /// text request — so the app opens into listening mode rather than replaying a
+    /// Siri-parsed value.
+    func testWakeJesseIntentEnqueuesWakeSignalNotText() async throws {
+        _ = try await WakeJesseIntent().perform()
+        drainWakeIfNeeded()
+        XCTAssertEqual(JesseInbox.shared.pendingWake?.mode, .ask)
+        XCTAssertNil(JesseInbox.shared.pending, "the doorbell must not enqueue text")
     }
 }

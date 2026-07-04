@@ -15,6 +15,34 @@ CI both run it). See the "Versioning" section of `bridge/README.md`.
 
 ## [Unreleased]
 
+## [App 1.0 (13)] — 2026-07-04
+
+### Changed
+- **Hands-free Siri now uses a "doorbell", not free-text capture.** Speaking to
+  Jesse through Siri failed for three stacked reasons: the name "Jesse" collides
+  with Siri's Contacts name resolution; the leading verbs "Ask"/"Tell" are
+  Siri-reserved (they route to ChatGPT / Messages); and the old intents captured
+  the open-ended request via `requestValueDialog`, which Apple documents as
+  unreliable for spoken input. The fix separates the two jobs:
+  - **A parameter-less wake intent (`WakeJesseIntent`) is the trigger.** Its only
+    job is to foreground the app into listening mode — Siri never parses the
+    request. Phrases are short, distinctive, and app-name-led ("Vault Search
+    Jesse", "Hey Vault Search Jesse", "Vault Search Jesse listen", …); the
+    reserved-verb phrases ("Ask Jesse", "Tell Jesse") are removed.
+  - **`INAlternativeAppNames` gives Siri a distinct spoken name** ("Vault Search
+    Jesse") without changing the display name, so the app-name token in each phrase
+    no longer collides with the Contacts name "Jesse". *(SiriKit-lineage key —
+    pending on-device confirmation that iOS 26 App Intents honor it.)*
+  - **The request is captured in-app**, not via Siri: on wake the app records the
+    spoken phrase (auto-stopping on trailing silence via the shared
+    `SilenceDetector`, with a hard cap and a Stop/Cancel overlay) and transcribes
+    it on-device with the existing `SpeechFrameworkTranscriber`, then runs it
+    through the unchanged voice turn path. The typed and on-screen-dictation paths
+    are untouched.
+  - Adds `NSMicrophoneUsageDescription` (live capture needs the mic, not just
+    speech recognition). The `AskJesseIntent`/`TellJesseIntent` intents remain for
+    the Shortcuts-app / typed path.
+
 ## [App 1.0 (12)] — 2026-07-04
 
 ### Added
