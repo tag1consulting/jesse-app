@@ -15,6 +15,22 @@ CI both run it). See the "Versioning" section of `bridge/README.md`.
 
 ## [Unreleased]
 
+## [App 1.0 (14)] — 2026-07-04
+
+### Added
+- **A real accent color, and phone haptics.** Two polish gaps closed:
+  - `AccentColor` shipped empty (only `{"idiom":"universal"}`), so every
+    custom-tinted surface — the user-bubble tint (`accentColor.opacity(0.15)`),
+    the send affordance, the search-match highlight — silently resolved to the
+    system blue. It now carries the brand indigo-blue from the app icon: `#5B7CF0`
+    in light, lifted to `#7B96F5` in dark for contrast on a dark background.
+  - The phone had no haptics (the watch already taps on reply). `ThreadDetailView`
+    now uses the idiomatic iOS 17 `.sensoryFeedback` (not `UIFeedbackGenerator`):
+    a light impact on send, a success tap when a reply lands, and an error tap
+    when a failure surfaces. The completion tap keys off the turn count rising
+    while the run is no longer in flight, so the optimistic user-turn append and a
+    user Cancel stay silent.
+
 ## [App 1.0 (13)] — 2026-07-04
 
 ### Changed

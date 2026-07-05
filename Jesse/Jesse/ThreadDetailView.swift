@@ -16,6 +16,11 @@ struct ThreadDetailView: View {
     @State private var input = ""
     @FocusState private var inputFocused: Bool
 
+    // Bumped once per send() so `.sensoryFeedback` fires a light tap the instant
+    // the user dispatches a turn — the phone had no haptics; the watch already
+    // taps on reply. See the `.sensoryFeedback` trio on `body`.
+    @State private var sendHaptic = 0
+
     // Attachments staged for the next send, plus the pickers' presentation state.
     @State private var attachments: [JesseAttachment] = []
     @State private var photoItems: [PhotosPickerItem] = []
@@ -26,6 +31,19 @@ struct ThreadDetailView: View {
 
     private var running: Bool { coordinator.isRunning(thread.id) }
     private var turns: [Turn] { thread.orderedTurns }
+
+    // Haptic decisions, pulled out of `body` as typed methods so the SwiftUI
+    // type-checker doesn't have to infer the trailing closures inline (the
+    // already-large `body` tips over its complexity budget otherwise).
+    // A reply just landed iff the turn count rose while the run is no longer in
+    // flight — `finish` appends the Jesse turn and clears the run together, while
+    // the optimistic user-turn append happens with `running` still true.
+    private func completionFeedback(old: Int, new: Int) -> SensoryFeedback? {
+        new > old && !running ? .success : nil
+    }
+    private func errorFeedback(old: String?, new: String?) -> SensoryFeedback? {
+        new != nil && new != old ? .error : nil
+    }
 
     // Auto-scroll follows the newest text only while the user is parked at the
     // bottom. Scrolling up (even mid-stream) suppresses follow and reveals the
@@ -44,6 +62,16 @@ struct ThreadDetailView: View {
                 .layoutPriority(1)
         }
         .padding()
+        // Haptics (iOS 17 `.sensoryFeedback`, not UIFeedbackGenerator): a light
+        // tap on send, a success tap when a reply lands, and an error tap when a
+        // failure surfaces. The completion tap keys off `turns.count` rising while
+        // NOT running — that is the moment `finish` appends the Jesse turn and
+        // clears the run in one mutation. The optimistic user-turn append happens
+        // while `running` is still true (so it's excluded), and a user Cancel
+        // neither appends a turn nor sets an error (so it stays silent).
+        .sensoryFeedback(.impact(weight: .light), trigger: sendHaptic)
+        .sensoryFeedback(trigger: turns.count, completionFeedback)
+        .sensoryFeedback(trigger: coordinator.error(for: thread.id), errorFeedback)
         .navigationTitle(thread.title.isEmpty ? "New conversation" : thread.title)
         .navigationBarTitleDisplayMode(.inline)
         .toolbar {
@@ -513,6 +541,7 @@ struct ThreadDetailView: View {
 
     private func send() {
         inputFocused = false
+        sendHaptic &+= 1
         let text = input
         let outgoing = attachments
         input = ""
