@@ -1,6 +1,13 @@
 import Foundation
 import HealthKit
 
+/// Errors from the windowed metric-series reads. Caught and degraded to `[]` by
+/// `series(for:windowDays:)`, so they never surface — a failed read just means
+/// "no data" for that metric.
+private enum HealthSeriesError: Error {
+    case noResults
+}
+
 // The ONE file that imports HealthKit. It conforms to `HealthContextProviding`
 // (declared in the Foundation-only `HealthContext.swift`) and does nothing but
 // read: gather recent workouts plus the daily-summary metrics, reduce each to a
@@ -15,7 +22,7 @@ import HealthKit
 /// values, so a turn is never blocked or broken by health data — HealthKit read
 /// denial is invisible by design. The whole gather runs concurrently under one
 /// bound; a single failing metric never drops another.
-nonisolated struct HealthKitWorkoutProvider: HealthContextProviding {
+nonisolated struct HealthContextProvider: HealthContextProviding {
     /// The read types the app requests and queries — workouts plus the quantity and
     /// category types the block reports. No share (write) types: this never writes.
     /// Requested as a union so HealthKit prompts only for the delta on re-request.
@@ -65,13 +72,138 @@ nonisolated struct HealthKitWorkoutProvider: HealthContextProviding {
         // The default fetches capture only Sendable values (window, limit) and make
         // their own HKHealthStore inside each live query — HKHealthStore is not
         // Sendable, so it must never be captured by these @Sendable closures.
-        self.fetches = fetches ?? HealthKitWorkoutProvider.liveFetches(window: window, limit: limit)
+        self.fetches = fetches ?? HealthContextProvider.liveFetches(window: window, limit: limit)
     }
 
     func snapshot() async -> HealthSnapshot {
         await HealthContextTimeout.orEmpty(within: timeout) {
             await HealthContextGather.snapshot(fetches)
         }
+    }
+
+    /// A windowed daily series for one whitelisted metric (to fulfill a
+    /// `JESSE_NEEDS_HEALTH` metrics request). Best-effort: any failure yields `[]`.
+    /// `windowDays` is pre-validated to 1...31. Quantity metrics use a daily
+    /// `HKStatisticsCollectionQuery` (sum for step/energy, average otherwise);
+    /// sleep buckets samples per night; workouts return one point each.
+    func series(for metric: RequestableMetric, windowDays: Int) async -> [MetricSeriesPoint] {
+        guard HKHealthStore.isHealthDataAvailable() else { return [] }
+        let bpm = HKUnit.count().unitDivided(by: .minute())
+        do {
+            switch metric {
+            case .restingHeartRate:
+                return try await Self.dailyQuantity(.restingHeartRate, unit: bpm,
+                                                    options: .discreteAverage, days: windowDays)
+            case .heartRate:
+                return try await Self.dailyQuantity(.heartRate, unit: bpm,
+                                                    options: .discreteAverage, days: windowDays)
+            case .heartRateVariabilitySDNN:
+                return try await Self.dailyQuantity(.heartRateVariabilitySDNN,
+                                                    unit: .secondUnit(with: .milli),
+                                                    options: .discreteAverage, days: windowDays)
+            case .stepCount:
+                return try await Self.dailyQuantity(.stepCount, unit: .count(),
+                                                    options: .cumulativeSum, days: windowDays)
+            case .activeEnergyBurned:
+                return try await Self.dailyQuantity(.activeEnergyBurned, unit: .kilocalorie(),
+                                                    options: .cumulativeSum, days: windowDays)
+            case .bodyMass:
+                return try await Self.dailyQuantity(.bodyMass, unit: .gramUnit(with: .kilo),
+                                                    options: .discreteAverage, days: windowDays)
+            case .vo2Max:
+                return try await Self.dailyQuantity(.vo2Max, unit: HKUnit(from: "ml/kg*min"),
+                                                    options: .discreteAverage, days: windowDays)
+            case .sleepAnalysis:
+                return try await Self.dailySleepMinutes(days: windowDays)
+            case .workouts:
+                return try await Self.workoutPoints(days: windowDays)
+            }
+        } catch {
+            Log.health.error("metric series read failed for \(metric.rawValue): \(error.localizedDescription)")
+            return []
+        }
+    }
+
+    /// Daily-bucketed statistics for a quantity type over the last `days` days.
+    private static func dailyQuantity(_ id: HKQuantityTypeIdentifier, unit: HKUnit,
+                                      options: HKStatisticsOptions, days: Int)
+        async throws -> [MetricSeriesPoint] {
+        let cal = Calendar.current
+        let now = Date()
+        let startOfToday = cal.startOfDay(for: now)
+        guard let start = cal.date(byAdding: .day, value: -(days - 1), to: startOfToday) else { return [] }
+        var interval = DateComponents(); interval.day = 1
+        let predicate = HKQuery.predicateForSamples(withStart: start, end: now, options: [])
+        let store = HKHealthStore()
+        let collection: HKStatisticsCollection = try await withCheckedThrowingContinuation { cont in
+            let q = HKStatisticsCollectionQuery(quantityType: HKQuantityType(id),
+                                                quantitySamplePredicate: predicate,
+                                                options: options, anchorDate: start,
+                                                intervalComponents: interval)
+            q.initialResultsHandler = { _, results, error in
+                if let error { cont.resume(throwing: error); return }
+                guard let results else {
+                    cont.resume(throwing: HealthSeriesError.noResults); return
+                }
+                cont.resume(returning: results)
+            }
+            store.execute(q)
+        }
+        var points: [MetricSeriesPoint] = []
+        collection.enumerateStatistics(from: start, to: now) { stat, _ in
+            let quantity = options.contains(.cumulativeSum) ? stat.sumQuantity() : stat.averageQuantity()
+            if let value = quantity?.doubleValue(for: unit) {
+                points.append(MetricSeriesPoint(date: stat.startDate, value: value))
+            }
+        }
+        return points
+    }
+
+    /// Total asleep minutes per night over the last `days` days (one point/day).
+    private static func dailySleepMinutes(days: Int) async throws -> [MetricSeriesPoint] {
+        let cal = Calendar.current
+        let now = Date()
+        let startOfToday = cal.startOfDay(for: now)
+        guard let start = cal.date(byAdding: .day, value: -(days - 1), to: startOfToday) else { return [] }
+        let predicate = HKQuery.predicateForSamples(withStart: start, end: now, options: [])
+        let store = HKHealthStore()
+        let samples: [HKCategorySample] = try await withCheckedThrowingContinuation { cont in
+            let q = HKSampleQuery(sampleType: HKCategoryType(.sleepAnalysis), predicate: predicate,
+                                  limit: HKObjectQueryNoLimit, sortDescriptors: nil) { _, s, error in
+                if let error { cont.resume(throwing: error); return }
+                cont.resume(returning: (s as? [HKCategorySample]) ?? [])
+            }
+            store.execute(q)
+        }
+        let asleep: Set<Int> = [
+            HKCategoryValueSleepAnalysis.asleepDeep.rawValue,
+            HKCategoryValueSleepAnalysis.asleepREM.rawValue,
+            HKCategoryValueSleepAnalysis.asleepCore.rawValue,
+            HKCategoryValueSleepAnalysis.asleepUnspecified.rawValue,
+        ]
+        var byDay: [Date: Double] = [:]
+        for s in samples where asleep.contains(s.value) {
+            let day = cal.startOfDay(for: s.endDate)
+            byDay[day, default: 0] += s.endDate.timeIntervalSince(s.startDate) / 60
+        }
+        return byDay.map { MetricSeriesPoint(date: $0.key, value: $0.value) }
+    }
+
+    /// One point per workout over the last `days` days (value = duration minutes).
+    private static func workoutPoints(days: Int) async throws -> [MetricSeriesPoint] {
+        let start = Calendar.current.date(byAdding: .day, value: -days, to: Date()) ?? Date()
+        let predicate = HKQuery.predicateForSamples(withStart: start, end: nil, options: [.strictEndDate])
+        let sort = [NSSortDescriptor(key: HKSampleSortIdentifierEndDate, ascending: false)]
+        let store = HKHealthStore()
+        let workouts: [HKWorkout] = try await withCheckedThrowingContinuation { cont in
+            let q = HKSampleQuery(sampleType: .workoutType(), predicate: predicate,
+                                  limit: HKObjectQueryNoLimit, sortDescriptors: sort) { _, s, error in
+                if let error { cont.resume(throwing: error); return }
+                cont.resume(returning: (s as? [HKWorkout]) ?? [])
+            }
+            store.execute(q)
+        }
+        return workouts.map { MetricSeriesPoint(date: $0.startDate, value: $0.duration / 60) }
     }
 
     /// Request read authorization for the workout + quantity + category types.

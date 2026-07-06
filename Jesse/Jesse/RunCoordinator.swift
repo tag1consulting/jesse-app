@@ -111,6 +111,23 @@ final class RunCoordinator {
     // delivering tokens. Not observed by views.
     @ObservationIgnored private var streamTicks: [UUID: Int] = [:]
 
+    // threadIDs that have already spent their ONE health-fulfillment retry for the
+    // current user message (a reply carried JESSE_NEEDS_HEALTH → we fulfilled + re-
+    // sent). Cleared at the start of each new `send`, so the retry is at most once
+    // per user message; a second directive on the retry's reply is then ignored.
+    @ObservationIgnored private var healthRetried: Set<UUID> = []
+
+    // What a live turn needs to fulfill a JESSE_NEEDS_HEALTH directive and re-send:
+    // the same mode/text plus the resolved wrapper/floor overrides. nil on the
+    // resume/recheck path (no original text after a relaunch), which disables the
+    // retry there — a stranded sentinel just surfaces the empty-reply Re-check.
+    struct HealthRetry {
+        let mode: JesseMode
+        let text: String
+        let instructions: String?
+        let floorOverride: String?
+    }
+
     // AI-title generation bookkeeping (see `ensureTitle`). Not observed by views —
     // the title lands on the persisted JesseThread, which the list already queries.
     // `titlesInFlight` guards against a second concurrent generation for a thread;
@@ -227,6 +244,8 @@ final class RunCoordinator {
         guard !trimmed.isEmpty, !isRunning(thread.id) else { return }
         let threadID = thread.id
         errors[threadID] = nil
+        // A new user message gets a fresh health-retry budget (one per message).
+        healthRetried.remove(threadID)
         // A new turn supersedes any retained-but-unretrieved job from a prior
         // recoverable failure on this thread — the user has moved on, so don't
         // leave a stale job that Re-check or resume could re-attach to.
@@ -322,7 +341,10 @@ final class RunCoordinator {
                     // directly — no fetch-by-id that could resolve to nil and drop
                     // the reply (the silent-stop bug this guards against).
                     await self.consume(threadID: threadID, thread: thread, jobId: jobId,
-                                       voice: voice, client: client, context: context)
+                                       voice: voice, client: client, context: context,
+                                       retry: HealthRetry(mode: mode, text: trimmed,
+                                                          instructions: instructions,
+                                                          floorOverride: floorOverride))
                 }
                 // Belt-and-suspenders: if `client.send` itself throws (a flaky
                 // connection drops the POST before its response lands), the bridge
@@ -460,7 +482,8 @@ final class RunCoordinator {
     /// `thread` is the live reference the send path holds; `nil` on the
     /// resume/recheck path (after a relaunch), where `finish` re-fetches by id.
     private func consume(threadID: UUID, thread: JesseThread?, jobId: String, voice: Bool,
-                         client: any JesseClientProtocol, context: ModelContext) async {
+                         client: any JesseClientProtocol, context: ModelContext,
+                         retry: HealthRetry? = nil) async {
         let outcome: TurnOutcome? = await withTaskGroup(of: TurnOutcome?.self) { group in
             group.addTask { await self.streamForDisplay(threadID: threadID, jobId: jobId, client: client) }
             group.addTask { await self.pollForOutcome(threadID: threadID, jobId: jobId, client: client) }
@@ -493,7 +516,20 @@ final class RunCoordinator {
         }
         switch outcome {
         case .done(let reply):
-            finish(threadID: threadID, thread: thread, reply: reply, voice: voice,
+            // Agent-driven health channel: if this reply is a JESSE_NEEDS_HEALTH
+            // directive and we still have our one retry for this message, fulfill it
+            // and re-send the SAME turn with the data attached — DON'T persist the
+            // sentinel turn (its stripped text is empty by construction). `retry` is
+            // nil on the resume path and on the retry's own consume, so a second
+            // directive is ignored and the stripped text is persisted as the answer.
+            if let needs = reply.needsHealthRequest, let retry, !healthRetried.contains(threadID) {
+                healthRetried.insert(threadID)
+                await fulfillAndRetry(threadID: threadID, thread: thread, needs: needs,
+                                      retry: retry, voice: voice, sessionId: reply.sessionId,
+                                      client: client, context: context)
+                return
+            }
+            finish(threadID: threadID, thread: thread, reply: Self.appCapped(reply), voice: voice,
                    jobId: jobId, context: context)
         case .failed(let message):
             // The turn failed recoverably (a bridge `error`/`.failed`, or a
@@ -510,6 +546,59 @@ final class RunCoordinator {
             // tore the run down; just make sure nothing lingers.
             clearRun(threadID)
         }
+    }
+
+    /// Fulfill a JESSE_NEEDS_HEALTH directive and re-send the SAME turn on the SAME
+    /// thread with the data attached, then consume the answer job. The sentinel turn
+    /// is never persisted (we returned before `finish`); this delivers the real
+    /// answer. If fulfillment fails (toggle off / no data) the client re-sends marked
+    /// `unavailable` so the agent answers from vault data — either way exactly one
+    /// answer turn lands. The answer job's consume runs with `retry: nil`, so a
+    /// second directive is ignored and its stripped text is persisted (capped).
+    private func fulfillAndRetry(threadID: UUID, thread: JesseThread?, needs: NeedsHealthRequest,
+                                 retry: HealthRetry, voice: Bool, sessionId: String?,
+                                 client: any JesseClientProtocol, context: ModelContext) async {
+        do {
+            let result = try await client.sendFulfilling(
+                needs, mode: retry.mode, text: retry.text, sessionId: sessionId, voice: voice,
+                instructions: retry.instructions, floorOverride: retry.floorOverride)
+            switch result {
+            case .reply(let reply, _):
+                finish(threadID: threadID, thread: thread, reply: Self.appCapped(reply),
+                       voice: voice, jobId: nil, context: context)
+            case .running(let jobId):
+                // The new job replaces the sentinel's, so Re-check/resume target the
+                // answer turn. Consume with retry:nil — one retry per user message.
+                persist(threadID: threadID, job: InFlightJob(jobId: jobId, voice: voice))
+                await consume(threadID: threadID, thread: thread, jobId: jobId,
+                              voice: voice, client: client, context: context, retry: nil)
+            }
+        } catch is CancellationError {
+            clearRun(threadID)
+        } catch let error as JesseError {
+            handle(error: error, threadID: threadID, voice: voice)
+        } catch {
+            fail(threadID: threadID, message: error.localizedDescription, voice: voice)
+        }
+    }
+
+    /// App-side cap on a persisted answer — a safety bound so a runaway reply (e.g.
+    /// a retry whose own reply also carried a directive plus a huge body) can never
+    /// store an unbounded string. The bridge already caps its output; this is
+    /// defense in depth, applied where a reply is finished. Char-boundary safe.
+    static let maxPersistedAnswerBytes = 32 * 1024
+    static func appCapped(_ reply: JesseReply) -> JesseReply {
+        guard reply.text.utf8.count > maxPersistedAnswerBytes else { return reply }
+        var end = reply.text.startIndex
+        var used = 0
+        for ch in reply.text {
+            let n = String(ch).utf8.count
+            if used + n > maxPersistedAnswerBytes { break }
+            used += n
+            end = reply.text.index(after: end)
+        }
+        return JesseReply(text: String(reply.text[..<end]), sessionId: reply.sessionId,
+                          directives: reply.directives)
     }
 
     /// Display-only consumer of the live SSE stream: updates `partialText` and

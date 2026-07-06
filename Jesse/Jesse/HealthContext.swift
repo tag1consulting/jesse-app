@@ -8,7 +8,7 @@ import Foundation
 //
 // Everything here is `nonisolated` and deterministic so it is fully unit-tested;
 // the ONLY code that touches HealthKit lives behind `HealthContextProviding` in
-// `HealthKitWorkoutProvider.swift`. Shape:
+// `HealthContextProvider.swift`. Shape:
 //   - `DailySummary` (+ its member value types) — the daily metrics, each optional.
 //   - `HealthSnapshot` — daily summary + workouts, what the provider returns.
 //   - `DailySummaryFormatter` — one line per present metric, fixed order.
@@ -387,17 +387,29 @@ nonisolated enum HealthContextResolver {
 /// path — unauthorized, no data, a per-metric error, or a timeout — yields empty
 /// values, so a turn always goes out (just without the block). HealthKit read
 /// denial is invisible by design (empty results), so silence is the only correct
-/// degrade. `HealthKitWorkoutProvider` is the sole production conformer; tests
+/// degrade. `HealthContextProvider` is the sole production conformer; tests
 /// inject a fake.
 protocol HealthContextProviding: Sendable {
     func snapshot() async -> HealthSnapshot
+    /// A windowed daily series for one whitelisted metric, used to fulfill a
+    /// `JESSE_NEEDS_HEALTH` metrics request. Best-effort: returns `[]` on any
+    /// failure (unauthorized, no data, error), so a request degrades to "no data"
+    /// rather than blocking. `windowDays` is pre-validated to 1...31.
+    func series(for metric: RequestableMetric, windowDays: Int) async -> [MetricSeriesPoint]
+}
+
+extension HealthContextProviding {
+    // Default so existing conformers (the test fakes for the workouts/daily block)
+    // need not implement the series read; only the live provider — and the fakes
+    // that exercise the metrics channel — override it.
+    func series(for metric: RequestableMetric, windowDays: Int) async -> [MetricSeriesPoint] { [] }
 }
 
 // MARK: - Combined bounded gather
 
 /// A bundle of best-effort HealthKit reads, each independently failable, injected
 /// so the gather's per-metric isolation and the timeout are exercised WITHOUT
-/// simulator Health data. The live `HealthKitWorkoutProvider` fills these with real
+/// simulator Health data. The live `HealthContextProvider` fills these with real
 /// queries; tests pass fakes (some throwing) to prove one failing read never drops
 /// another metric's line.
 nonisolated struct HealthMetricFetches: Sendable {

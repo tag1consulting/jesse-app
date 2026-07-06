@@ -610,7 +610,7 @@ struct SettingsView: View {
     private func connectAppleHealth() async {
         connectingHealth = true
         defer { connectingHealth = false }
-        if await HealthKitWorkoutProvider.requestReadAuthorization() {
+        if await HealthContextProvider.requestReadAuthorization() {
             attachHealthContext = true
         }
     }

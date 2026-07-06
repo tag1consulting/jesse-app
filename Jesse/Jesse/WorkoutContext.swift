@@ -6,7 +6,7 @@ import Foundation
 //
 // Everything here is `nonisolated` and deterministic so it is fully unit-tested;
 // the ONLY code that touches HealthKit lives behind `HealthContextProviding` in
-// `HealthKitWorkoutProvider.swift`. `WorkoutSummary` is the value type the
+// `HealthContextProvider.swift`. `WorkoutSummary` is the value type the
 // provider fills; `WorkoutContextFormatter` renders one line per workout (a base
 // line plus, for runs, a droppable running-dynamics segment) and the subsection
 // header. The window/cap/composition live in `HealthContextFormatter`.

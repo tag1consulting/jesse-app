@@ -72,6 +72,66 @@ final class JesseWireContractTests: XCTestCase {
         XCTAssertEqual(try body(blank), #"{"mode":"ask","text":"hi"}"#)
     }
 
+    /// A fulfillment retry carries `health_context` + `health_context_requested`;
+    /// an unfulfillable retry carries only `health_context_unavailable`. Both flags
+    /// are true-or-omitted (a false flag would be meaningless to the bridge).
+    func testHealthRequestFlagsEncodeToExactBytes() throws {
+        let fulfilled = JesseClient.makeRequest(
+            mode: .ask, text: "how am I doing?", sessionId: "s1", voice: false,
+            instructions: nil, floorOverride: nil, attachments: [],
+            healthContext: "RHR 58", healthContextRequested: true)
+        XCTAssertEqual(try body(fulfilled),
+            #"{"health_context":"RHR 58","health_context_requested":true,"mode":"ask","session_id":"s1","text":"how am I doing?"}"#)
+
+        let unavailable = JesseClient.makeRequest(
+            mode: .ask, text: "how am I doing?", sessionId: "s1", voice: false,
+            instructions: nil, floorOverride: nil, attachments: [],
+            healthContextUnavailable: true)
+        XCTAssertEqual(try body(unavailable),
+            #"{"health_context_unavailable":true,"mode":"ask","session_id":"s1","text":"how am I doing?"}"#)
+    }
+
+    /// A false/nil flag drops out — an ordinary turn never carries the retry flags.
+    func testFalseHealthFlagsOmittedFromBytes() throws {
+        let r = JesseClient.makeRequest(mode: .ask, text: "hi", sessionId: nil, voice: false,
+                                        instructions: nil, floorOverride: nil, attachments: [],
+                                        healthContextRequested: false, healthContextUnavailable: false)
+        XCTAssertEqual(try body(r), #"{"mode":"ask","text":"hi"}"#)
+    }
+
+    // MARK: - directives decode (poll result)
+
+    /// A `done` result carrying `directives.needs_health` decodes to a validated
+    /// `NeedsHealthRequest` on the reply.
+    func testDecodeResultDoneWithDirectives() throws {
+        let json = #"{"status":"done","response":"","session_id":"s1","directives":{"needs_health":{"sections":["daily"],"metrics":[{"metric":"restingHeartRate","window_days":14}]}}}"#
+        let s = try JesseClient.decodeResult(data: Data(json.utf8), resp: http(200))
+        guard case .done(let reply) = s else { return XCTFail("expected .done") }
+        let needs = reply.needsHealthRequest
+        XCTAssertEqual(needs?.sections, [.daily])
+        XCTAssertEqual(needs?.metrics, [ValidatedMetricRequest(metric: .restingHeartRate, windowDays: 14)])
+    }
+
+    /// A `done` result with no `directives` (an ordinary reply) decodes to nil —
+    /// backward compatible with a bridge/turn that emits none.
+    func testDecodeResultDoneWithoutDirectives() throws {
+        let json = #"{"status":"done","response":"the answer","session_id":"s1"}"#
+        let s = try JesseClient.decodeResult(data: Data(json.utf8), resp: http(200))
+        guard case .done(let reply) = s else { return XCTFail("expected .done") }
+        XCTAssertNil(reply.directives)
+        XCTAssertNil(reply.needsHealthRequest)
+    }
+
+    /// An invalid directive (window out of range) decodes but the validated request
+    /// is nil — the app never partially fulfills an invalid request.
+    func testDecodeResultInvalidDirectiveValidatesToNil() throws {
+        let json = #"{"status":"done","response":"","session_id":"s1","directives":{"needs_health":{"metrics":[{"metric":"stepCount","window_days":99}]}}}"#
+        let s = try JesseClient.decodeResult(data: Data(json.utf8), resp: http(200))
+        guard case .done(let reply) = s else { return XCTFail("expected .done") }
+        XCTAssertNotNil(reply.directives?.needsHealth, "decoded, but…")
+        XCTAssertNil(reply.needsHealthRequest, "…validation rejects the out-of-range window")
+    }
+
     /// The device-registration body — one key, matching the old `["token": …]`.
     func testDeviceRegistrationEncodesToExactBytes() throws {
         let data = try JesseClient.encodeBody(JesseDeviceRegistration(token: "apns-tok"))

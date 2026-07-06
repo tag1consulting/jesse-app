@@ -15,6 +15,44 @@ CI both run it). See the "Versioning" section of `bridge/README.md`.
 
 ## [Unreleased]
 
+## [App 1.0 (19)] — 2026-07-06
+
+### Added
+- **Classify-then-attach health context + the agent-driven retry.** The app no
+  longer attaches the Apple Health block to every turn — it classifies each message
+  and attaches only when relevant, and fulfills the agent's `JESSE_NEEDS_HEALTH`
+  requests on a retry (PR 2 of the two-PR set; the bridge shipped the directive
+  channel in Bridge 0.3.0).
+  - **Two-tier classifier** behind the `HealthRelevanceClassifying` seam: a pure,
+    word-boundary-aware **keyword floor** (`HealthKeywordClassifier`, always
+    available, tested) UNION an on-device **Foundation Models** yes/no
+    (`FoundationHealthClassifier`, prewarmed, 300 ms bound, degrading to the
+    keyword answer on unavailable/timeout/error). Attaches when either says yes —
+    biased toward attaching. The pure `HealthContextGate` gates on the master
+    toggle: off ⇒ never attach and never fulfill.
+  - **Retry machinery (`RunCoordinator`).** A reply that is a `JESSE_NEEDS_HEALTH`
+    directive triggers **one** fulfillment retry per user message: the app reads the
+    requested sections (`HealthContextFormatter`) and windowed metrics
+    (`RequestableMetric` queries), re-sends the SAME text on the SAME thread with
+    `health_context` + `health_context_requested`, and persists **only** the final
+    answer (the empty sentinel turn is never recorded). If it can't fulfill (toggle
+    off / no data) it retries once marked `health_context_unavailable` so the agent
+    answers from vault data — no loop. A second directive on the retry is ignored;
+    the answer is capped app-side.
+  - **Windowed metric queries.** A fixed `RequestableMetric` whitelist (kept in sync
+    with the bridge), daily-aggregate `HKStatisticsCollectionQuery` reads (1–31
+    days), a pure `MetricSeriesFormatter`, and the `HealthRequestFulfiller` assembler
+    with a 6 KiB app-side cap (under the bridge's 8 KiB). An unknown metric, an
+    out-of-range window, or more than four metrics rejects the WHOLE request
+    (never partially fulfilled).
+  - **Wire.** `health_context_requested` / `health_context_unavailable` added to the
+    request; `directives` decoded on the poll result and SSE `done` frame.
+
+### Changed
+- **`HealthKitWorkoutProvider` renamed to `HealthContextProvider`** (file + type,
+  mechanical) — it reads more than workouts now. It remains the only HealthKit
+  importer and gains the windowed-series reads behind the provider seam.
+
 ## [Bridge 0.3.0] — 2026-07-06
 
 ### Added

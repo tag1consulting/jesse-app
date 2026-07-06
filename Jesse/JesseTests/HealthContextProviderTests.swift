@@ -1,14 +1,14 @@
 import XCTest
 @testable import Jesse
 
-/// Exercises the real `HealthKitWorkoutProvider` through its injected
+/// Exercises the real `HealthContextProvider` through its injected
 /// `HealthMetricFetches` seam, so the degrade paths are proven WITHOUT depending on
 /// simulator Health data. The provider must turn every failure into an empty result
 /// and isolate a single failing metric: a thrown read (the watch-relay "HealthKit
 /// database inaccessible while the phone is locked" case), an overrun of the ~1.5s
 /// bound, and a normal empty gather all keep a turn sending; one failed metric never
 /// drops another.
-final class HealthKitWorkoutProviderTests: XCTestCase {
+final class HealthContextProviderTests: XCTestCase {
 
     private func swim() -> WorkoutSummary {
         WorkoutSummary(activityName: "Swim", start: Date(timeIntervalSince1970: 1_783_146_600),
@@ -25,7 +25,7 @@ final class HealthKitWorkoutProviderTests: XCTestCase {
         f.workouts = { throw DatabaseInaccessible() }
         f.sleep = { throw DatabaseInaccessible() }
         f.restingHR = { 50 }                          // one metric still succeeds
-        let provider = HealthKitWorkoutProvider(fetches: f)
+        let provider = HealthContextProvider(fetches: f)
         let snap = await provider.snapshot()
         XCTAssertTrue(snap.workouts.isEmpty)
         XCTAssertNil(snap.daily.sleep)
@@ -40,13 +40,13 @@ final class HealthKitWorkoutProviderTests: XCTestCase {
             try await Task.sleep(for: .seconds(5))
             return [late]
         }
-        let provider = HealthKitWorkoutProvider(timeout: .milliseconds(100), fetches: f)
+        let provider = HealthContextProvider(timeout: .milliseconds(100), fetches: f)
         let snap = await provider.snapshot()
         XCTAssertEqual(snap, .empty, "a gather slower than the bound degrades to empty")
     }
 
     func testEmptyFetchesYieldEmptySnapshot() async {
-        let snap = await HealthKitWorkoutProvider(fetches: .empty).snapshot()
+        let snap = await HealthContextProvider(fetches: .empty).snapshot()
         XCTAssertEqual(snap, .empty)
     }
 
@@ -54,7 +54,7 @@ final class HealthKitWorkoutProviderTests: XCTestCase {
         var f = HealthMetricFetches.empty
         f.workouts = { [self.swim()] }
         f.restingHR = { 52 }
-        let snap = await HealthKitWorkoutProvider(fetches: f).snapshot()
+        let snap = await HealthContextProvider(fetches: f).snapshot()
         XCTAssertEqual(snap.workouts, [swim()])
         XCTAssertEqual(snap.daily.restingHeartRateBPM, 52)
     }

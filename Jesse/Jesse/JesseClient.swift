@@ -255,6 +255,20 @@ enum JesseError: LocalizedError {
 struct JesseReply: Equatable {
     let text: String         // raw response from the bridge
     let sessionId: String?   // carry into the next call to continue the thread
+    // Structured directives the agent emitted (bridge-extracted, stripped from
+    // `text`). Nil for the overwhelming majority of turns. `needs_health` drives
+    // the classify-then-attach retry in `RunCoordinator`.
+    var directives: JesseDirectives? = nil
+
+    /// The validated needs-health request this reply asks for, or nil if there is
+    /// no `needs_health` directive or it fails the contract (unknown metric, window
+    /// out of range, >4 metrics) — an invalid request is never partially fulfilled.
+    var needsHealthRequest: NeedsHealthRequest? {
+        guard let nh = directives?.needsHealth else { return nil }
+        return NeedsHealthRequest.validated(
+            sections: nh.sections ?? [],
+            metrics: (nh.metrics ?? []).map { (metric: $0.metric, windowDays: $0.windowDays) })
+    }
 
     private static let marker = "SPOKEN:"
 
@@ -275,6 +289,16 @@ struct JesseReply: Equatable {
         }
         return String(text.trimmingCharacters(in: .whitespacesAndNewlines).prefix(240))
     }
+}
+
+/// The health context an outgoing retry turn should carry — the result of
+/// fulfilling a `JESSE_NEEDS_HEALTH` directive. Either a `block` with
+/// `requested == true` (fulfilled), or `block == nil` with `unavailable == true`
+/// (toggle off / no data). Never both flags.
+struct OutgoingHealthContext: Sendable, Equatable {
+    var block: String?
+    var requested: Bool
+    var unavailable: Bool
 }
 
 /// Parsed `GET /health` result. Only the bridge `version` is modeled — the
@@ -358,10 +382,17 @@ nonisolated struct JesseRequest: Encodable, Equatable {
     let instructions: String?
     let floorOverride: String?
     let attachments: [Attachment]?
-    // Compact recent-workouts block from Apple Health (see `WorkoutContext`).
+    // Compact device health-context block from Apple Health (see `HealthContext`).
     // Nil omits the field, matching the bridge's `#[serde(default)]` shape — an
-    // ordinary turn (feature off, no data, or an old build) sends nothing.
+    // ordinary turn (feature off, not health-relevant, or an old build) sends nothing.
     let healthContext: String?
+    // This turn is a retry answering a prior `JESSE_NEEDS_HEALTH` directive — the
+    // requested data is attached in `healthContext`. Nil on an ordinary turn.
+    let healthContextRequested: Bool?
+    // The app could NOT fulfill a health request this turn (toggle off, denied,
+    // locked, or timeout) — the agent should answer from vault data and not
+    // re-request. Nil on an ordinary turn.
+    let healthContextUnavailable: Bool?
 
     nonisolated struct Attachment: Encodable, Equatable {
         let filename: String
@@ -380,6 +411,8 @@ nonisolated struct JesseRequest: Encodable, Equatable {
         case floorOverride = "floor_override"
         case attachments
         case healthContext = "health_context"
+        case healthContextRequested = "health_context_requested"
+        case healthContextUnavailable = "health_context_unavailable"
     }
 }
 
@@ -399,16 +432,43 @@ nonisolated struct JesseSendResponse: Decodable {
 }
 
 /// Decoded `GET /jesse/result/{id}` body: `status` plus the fields that status
-/// implies (`response`/`session_id` for done, `error` for failed).
+/// implies (`response`/`session_id`/`directives` for done, `error` for failed).
 nonisolated struct JesseResultResponse: Decodable {
     let status: String
     let response: String?
     let sessionId: String?
+    let directives: JesseDirectives?
     let error: String?
     enum CodingKeys: String, CodingKey {
         case status, response
         case sessionId = "session_id"
-        case error
+        case directives, error
+    }
+}
+
+/// The `directives` object a terminal result (poll + SSE `done`) may carry. Only
+/// known directive types are modeled; an unknown/malformed one the bridge already
+/// left as visible reply text, so nothing lands here for it. Absent/`null` decodes
+/// to nil (the common case).
+nonisolated struct JesseDirectives: Decodable, Equatable {
+    let needsHealth: JesseNeedsHealth?
+    enum CodingKeys: String, CodingKey {
+        case needsHealth = "needs_health"
+    }
+}
+
+/// The decoded (not yet validated) `needs_health` request. `JesseReply`'s
+/// `needsHealthRequest` validates it against the whitelist/caps before use.
+nonisolated struct JesseNeedsHealth: Decodable, Equatable {
+    let sections: [String]?
+    let metrics: [Metric]?
+    nonisolated struct Metric: Decodable, Equatable {
+        let metric: String
+        let windowDays: Int
+        enum CodingKeys: String, CodingKey {
+            case metric
+            case windowDays = "window_days"
+        }
     }
 }
 
@@ -440,11 +500,12 @@ nonisolated struct JesseStreamFrameData: Decodable {
     let name: String?
     let response: String?
     let sessionId: String?
+    let directives: JesseDirectives?
     let error: String?
     enum CodingKeys: String, CodingKey {
         case text, name, response
         case sessionId = "session_id"
-        case error
+        case directives, error
     }
 }
 
@@ -479,6 +540,15 @@ protocol JesseClientProtocol {
     func send(mode: JesseMode, text: String, sessionId: String?, voice: Bool,
               instructions: String?, floorOverride: String?,
               attachments: [JesseAttachment]) async throws -> JesseSendResult
+    /// Fulfill a `JESSE_NEEDS_HEALTH` directive and re-send the SAME turn on the
+    /// SAME thread with the requested data attached (bypassing the classifier). When
+    /// it can't be fulfilled (toggle off / no data) it re-sends marked unavailable,
+    /// so the agent answers from vault data without re-requesting. See the
+    /// coordinator's retry machinery. Default forwards to `send` (fakes that don't
+    /// exercise the metrics channel need not implement it).
+    func sendFulfilling(_ request: NeedsHealthRequest, mode: JesseMode, text: String,
+                        sessionId: String?, voice: Bool, instructions: String?,
+                        floorOverride: String?) async throws -> JesseSendResult
     func result(jobId: String) async throws -> JesseResultState
     /// Probe `GET /health` and parse the bridge's reported version. Used to show
     /// the running bridge version in Settings alongside the app's own. Throws on a
@@ -510,6 +580,15 @@ protocol JesseClientProtocol {
 }
 
 extension JesseClientProtocol {
+    // Default for fakes that don't exercise the metrics/retry channel: re-send the
+    // SAME turn via `send` (dropping the directive). The production `JesseClient`
+    // and the retry-state-machine test's fake override this.
+    func sendFulfilling(_ request: NeedsHealthRequest, mode: JesseMode, text: String,
+                        sessionId: String?, voice: Bool, instructions: String?,
+                        floorOverride: String?) async throws -> JesseSendResult {
+        try await send(mode: mode, text: text, sessionId: sessionId, voice: voice,
+                       instructions: instructions, floorOverride: floorOverride, attachments: [])
+    }
     // Default "no version" so existing conformers (the test fakes) need not
     // implement the health probe; only the production `JesseClient` — and the
     // test that exercises this seam — return a real version.
@@ -543,7 +622,7 @@ struct JesseClient: JesseClientProtocol {
 
     /// Reads recent workouts + daily-summary metrics for the per-turn
     /// `health_context` block. The one seam HealthKit hides behind (see
-    /// `HealthContextProviding`); defaults to the live `HealthKitWorkoutProvider`,
+    /// `HealthContextProviding`); defaults to the live `HealthContextProvider`,
     /// injectable so tests drive it with a fake.
     let healthProvider: any HealthContextProviding
 
@@ -551,15 +630,22 @@ struct JesseClient: JesseClientProtocol {
     /// the persisted toggle; injectable so tests pin it without touching defaults.
     let isHealthContextEnabled: @Sendable () -> Bool
 
+    /// Decides whether a turn's message is health-related, so the block is attached
+    /// only when relevant (classify-then-attach). Defaults to the production union
+    /// of the keyword floor and the on-device model; tests inject a fake.
+    let healthClassifier: any HealthRelevanceClassifying
+
     init(config: JesseConfig,
          session: URLSession = JesseClient.boundedSession,
          streamSession: URLSession? = nil,
-         healthProvider: any HealthContextProviding = HealthKitWorkoutProvider(),
-         isHealthContextEnabled: @escaping @Sendable () -> Bool = { HealthContextSettings.isEnabled }) {
+         healthProvider: any HealthContextProviding = HealthContextProvider(),
+         isHealthContextEnabled: @escaping @Sendable () -> Bool = { HealthContextSettings.isEnabled },
+         healthClassifier: any HealthRelevanceClassifying = UnionHealthClassifier()) {
         self.config = config
         self.session = session
         self.healthProvider = healthProvider
         self.isHealthContextEnabled = isHealthContextEnabled
+        self.healthClassifier = healthClassifier
         if let streamSession {
             self.streamSession = streamSession
         } else if session === JesseClient.boundedSession {
@@ -614,19 +700,19 @@ struct JesseClient: JesseClientProtocol {
               instructions: String? = nil,
               floorOverride: String? = nil,
               attachments: [JesseAttachment] = []) async throws -> JesseSendResult {
-        guard !config.normalizedHost.isEmpty, !config.token.isEmpty,
-              let url = config.endpoint("/jesse") else { throw JesseError.notConfigured }
-
-        var req = URLRequest(url: url)
-        req.httpMethod = "POST"
-        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        req.setValue("Bearer \(config.token)", forHTTPHeaderField: "Authorization")
-        // Resolve the health-context block here in the request-building path so
-        // EVERY turn — typed, Siri, and the watch relay — inherits it. Best-effort:
-        // the resolver returns nil (attach nothing) when the feature is off, there's
-        // no data, or the query errors/times out, so a turn never blocks or breaks.
+        // Classify-then-attach, in the request-building path so EVERY turn — typed,
+        // Siri, and the watch relay — inherits it. The block is attached ONLY when
+        // the master toggle is on AND the message classifies as health-related
+        // (keyword floor ∪ on-device model, biased toward attaching). When it isn't,
+        // no block goes out; if the agent then needs device data it asks via
+        // JESSE_NEEDS_HEALTH and the coordinator fulfills it on a retry. Best-effort
+        // throughout: resolution returns nil on no-data/error/timeout, so a turn is
+        // never blocked or broken.
+        let enabled = isHealthContextEnabled()
+        let relevant = enabled ? await healthClassifier.isRelevant(text) : false
+        let attach = HealthContextGate.shouldAttach(enabled: enabled, relevant: relevant)
         let healthContext = await HealthContextResolver.resolve(
-            enabled: isHealthContextEnabled(),
+            enabled: attach,
             provider: healthProvider,
             now: Date())
         let request = Self.makeRequest(mode: mode, text: text, sessionId: sessionId,
@@ -634,6 +720,57 @@ struct JesseClient: JesseClientProtocol {
                                        floorOverride: floorOverride,
                                        attachments: attachments,
                                        healthContext: healthContext)
+        return try await postTurn(request)
+    }
+
+    func sendFulfilling(_ requested: NeedsHealthRequest, mode: JesseMode, text: String,
+                        sessionId: String?, voice: Bool,
+                        instructions: String?, floorOverride: String?) async throws -> JesseSendResult {
+        // A retry answering a JESSE_NEEDS_HEALTH directive: bypass the classifier,
+        // fulfill the request from the provider (honoring the master toggle), and
+        // re-send the SAME text on the SAME thread with the data + the flags. When
+        // it can't be fulfilled (toggle off, or nothing gathered) we still re-send —
+        // marked unavailable, no block — so the agent answers from vault data and
+        // never re-requests (no loop).
+        let outgoing = await fulfill(requested)
+        let request = Self.makeRequest(mode: mode, text: text, sessionId: sessionId,
+                                       voice: voice, instructions: instructions,
+                                       floorOverride: floorOverride,
+                                       attachments: [],
+                                       healthContext: outgoing.block,
+                                       healthContextRequested: outgoing.requested ? true : nil,
+                                       healthContextUnavailable: outgoing.unavailable ? true : nil)
+        return try await postTurn(request)
+    }
+
+    /// Fulfill a validated needs-health request from the health provider, honoring
+    /// the master toggle. Off, or nothing gathered → `unavailable` (no block).
+    private func fulfill(_ request: NeedsHealthRequest) async -> OutgoingHealthContext {
+        guard isHealthContextEnabled() else {
+            return OutgoingHealthContext(block: nil, requested: false, unavailable: true)
+        }
+        let snapshot = request.sections.isEmpty ? HealthSnapshot.empty : await healthProvider.snapshot()
+        var series: [RequestableMetric: [MetricSeriesPoint]] = [:]
+        for m in request.metrics {
+            series[m.metric] = await healthProvider.series(for: m.metric, windowDays: m.windowDays)
+        }
+        let block = HealthRequestFulfiller.block(request: request, snapshot: snapshot,
+                                                 series: series, now: Date())
+        if let block {
+            return OutgoingHealthContext(block: block, requested: true, unavailable: false)
+        }
+        return OutgoingHealthContext(block: nil, requested: false, unavailable: true)
+    }
+
+    /// Encode + POST a `/jesse` request body and decode the send result. Shared by
+    /// the classify-then-attach `send` and the fulfillment `sendFulfilling`.
+    private func postTurn(_ request: JesseRequest) async throws -> JesseSendResult {
+        guard !config.normalizedHost.isEmpty, !config.token.isEmpty,
+              let url = config.endpoint("/jesse") else { throw JesseError.notConfigured }
+        var req = URLRequest(url: url)
+        req.httpMethod = "POST"
+        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        req.setValue("Bearer \(config.token)", forHTTPHeaderField: "Authorization")
         req.httpBody = try Self.encodeBody(request)
 
         let data: Data, resp: URLResponse
@@ -869,7 +1006,8 @@ struct JesseClient: JesseClientProtocol {
         case "delta": return .delta(obj?.text ?? "")
         case "activity": return .activity(obj?.name ?? "")
         case "done":
-            return .done(JesseReply(text: obj?.response ?? "", sessionId: obj?.sessionId))
+            return .done(JesseReply(text: obj?.response ?? "", sessionId: obj?.sessionId,
+                                    directives: obj?.directives))
         case "error": return .failed(obj?.error ?? "Jesse couldn't complete that.")
         case "cancelled": return .cancelled
         default: return nil
@@ -961,7 +1099,9 @@ struct JesseClient: JesseClientProtocol {
                             voice: Bool, instructions: String?,
                             floorOverride: String?,
                             attachments: [JesseAttachment],
-                            healthContext: String? = nil) -> JesseRequest {
+                            healthContext: String? = nil,
+                            healthContextRequested: Bool? = nil,
+                            healthContextUnavailable: Bool? = nil) -> JesseRequest {
         func nonBlank(_ s: String?) -> String? {
             guard let s, !s.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return nil }
             return s
@@ -980,7 +1120,11 @@ struct JesseClient: JesseClientProtocol {
             },
             // Blank collapses to nil so the field drops out (the bridge treats
             // absent/blank identically — today's behavior).
-            healthContext: nonBlank(healthContext))
+            healthContext: nonBlank(healthContext),
+            // Only ever `true` or omitted — a `false` flag is meaningless to the
+            // bridge (`#[serde(default)]` = false), so collapse it to nil.
+            healthContextRequested: healthContextRequested == true ? true : nil,
+            healthContextUnavailable: healthContextUnavailable == true ? true : nil)
     }
 
     /// Encode a wire body. Optional fields omit when nil (synthesized
@@ -1033,7 +1177,8 @@ struct JesseClient: JesseClientProtocol {
             return .running
         case "done":
             guard let text = obj.response else { throw JesseError.decoding }
-            return .done(JesseReply(text: text, sessionId: obj.sessionId))
+            return .done(JesseReply(text: text, sessionId: obj.sessionId,
+                                    directives: obj.directives))
         case "failed":
             return .failed(obj.error ?? "Jesse couldn't complete that.")
         case "cancelled":
