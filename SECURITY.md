@@ -250,6 +250,36 @@ back to the app**, so its trust properties are called out explicitly:
   per user message and ignores a second directive. There is no unbounded
   ask/answer cycle.
 
+## Dietary write-back channel (`JESSE_MEAL_LOG`)
+
+The write-direction sibling of `JESSE_NEEDS_HEALTH`, on the **same extractor and
+registry**: a diet-logging reply may end with a `JESSE_MEAL_LOG v1 {json}` line
+the bridge strips into `directives.meal_log`, which the app writes into Apple
+Health as a food entry. Its trust properties mirror the health-request channel,
+with the seam that matters here spelled out:
+
+- **Same trust class as the reply text.** The meal block originates from the
+  sandboxed agent's OUTPUT — the same origin as `health_context` and the reply
+  itself — not from the network. A prompt injection could in principle make the
+  agent emit a meal line, so the payload is **validated against a fixed contract**
+  before anything acts on it: the bridge validates here (required non-empty
+  `id`/`consumedAt`/`name`; each macro a finite, non-negative number or absent; ≤
+  10 meals; ≤ 8 KiB line) and the app validates again and gates the write behind
+  an explicit **HealthKit *write* authorization** the user grants once.
+- **The worst this channel can do** is write **nutrition entries** (energy +
+  macros) attributed to Jesse into Apple Health — a data class the user opted into
+  by granting write access, dedupe-keyed by `id` so a replay can't pile up
+  duplicates. It grants **no new capability** and, like the other directives, adds
+  **no tool** to the agent's allowlist. Weight and workouts stay **read-only** —
+  the write path only ever creates the food correlation, nothing else.
+- **A malformed, over-cap, unknown-version, or over-10-meal block is a loud,
+  visible failure**, not a silent one: the line is left in the reply text and
+  logged, and no field is attached — a bad block is **never partially logged**, and
+  a future `v2` contract bump fails loudly rather than half-parsing.
+- **`consumedAt` is checked only for presence on the bridge** (it has no date
+  library); the app parses the ISO-8601 offset strictly before writing, so a
+  garbled timestamp fails app-side rather than landing a mis-dated entry.
+
 ## Push notifications (APNs key + device token)
 
 Push is **optional and off by default** (see

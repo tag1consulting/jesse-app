@@ -1320,12 +1320,101 @@ async fn directive_is_extracted_on_the_sse_done_frame_consistently() {
 #[tokio::test]
 async fn unknown_directive_passes_through_visible_with_no_field() {
     // An unknown directive name is a loud contract failure: the line stays VISIBLE
-    // in the reply and no `directives` field is attached.
-    let line = r#"{"type":"result","is_error":false,"result":"JESSE_MEAL_LOG v1 {\"foo\":1}","session_id":"sess-unk"}"#;
+    // in the reply and no `directives` field is attached. (Uses a name that is NOT
+    // in the registry — both JESSE_NEEDS_HEALTH and JESSE_MEAL_LOG are known.)
+    let line = r#"{"type":"result","is_error":false,"result":"JESSE_FROBNICATE v1 {\"foo\":1}","session_id":"sess-unk"}"#;
     let (st, job_id) = run_turn_emitting(r#"{"mode":"tell","text":"log lunch"}"#, line).await;
     let v = result_status(&st, &job_id).await;
-    assert_eq!(v["response"], "JESSE_MEAL_LOG v1 {\"foo\":1}", "unknown directive stays visible");
+    assert_eq!(v["response"], "JESSE_FROBNICATE v1 {\"foo\":1}", "unknown directive stays visible");
     assert!(v["directives"].is_null(), "no directives for an unknown name");
+}
+
+// ---- Agent-emitted meal-log directive (JESSE_MEAL_LOG v1) end-to-end --------
+//
+// The write-direction sibling of JESSE_NEEDS_HEALTH: a diet-logging reply ends
+// with a machine-readable meal line the bridge extracts + strips into
+// `directives.meal_log`, which the app writes to Apple Health. Same registry,
+// same seam — these mirror the needs_health end-to-end tests above.
+
+#[tokio::test]
+async fn meal_log_directive_is_extracted_and_stripped_on_the_poll_result() {
+    // A reply whose final line is a valid JESSE_MEAL_LOG directive comes back with
+    // the line STRIPPED and the parsed value under `directives.meal_log`.
+    // FAILING-FIRST: until JESSE_MEAL_LOG is a registered directive, the sentinel
+    // line stays in the reply and `directives` is null.
+    let line = r#"{"type":"result","is_error":false,"result":"Logged your lunch.\nJESSE_MEAL_LOG v1 {\"meals\":[{\"id\":\"2026-07-04-lunch\",\"consumedAt\":\"2026-07-04T12:30:00+02:00\",\"name\":\"Lunch: spaghetti, red sauce\",\"kcal\":385,\"protein_g\":13,\"carbs_g\":77,\"fat_g\":4.5}]}","session_id":"sess-meal"}"#;
+    let (st, job_id) = run_turn_emitting(r#"{"mode":"tell","text":"log lunch: spaghetti"}"#, line).await;
+    let v = result_status(&st, &job_id).await;
+    assert_eq!(v["response"], "Logged your lunch.", "meal-log line stripped from the reply");
+    assert!(!v["response"].as_str().unwrap().contains("JESSE_MEAL_LOG"));
+    let meal = &v["directives"]["meal_log"]["meals"][0];
+    assert_eq!(meal["id"], "2026-07-04-lunch");
+    assert_eq!(meal["consumedAt"], "2026-07-04T12:30:00+02:00");
+    assert_eq!(meal["name"], "Lunch: spaghetti, red sauce");
+    assert_eq!(meal["kcal"], 385.0);
+    assert_eq!(meal["protein_g"], 13.0);
+    assert_eq!(meal["carbs_g"], 77.0);
+    assert_eq!(meal["fat_g"], 4.5);
+    assert_eq!(v["session_id"], "sess-meal");
+}
+
+#[tokio::test]
+async fn meal_log_directive_is_extracted_on_the_sse_done_frame_consistently() {
+    // The SSE `done` frame carries the SAME stripped text + meal_log as the poll —
+    // the two terminal paths are kept byte-consistent (via directives_to_value).
+    let line = r#"{"type":"result","is_error":false,"result":"JESSE_MEAL_LOG v1 {\"meals\":[{\"id\":\"2026-07-04-snack\",\"consumedAt\":\"2026-07-04T15:00:00+02:00\",\"name\":\"Apple\"}]}","session_id":"sess-meal-sse"}"#;
+    let (st, job_id) = run_turn_emitting(r#"{"mode":"tell","text":"log a snack"}"#, line).await;
+    // Poll: sentinel-only reply strips to empty, meal_log attached.
+    let v = result_status(&st, &job_id).await;
+    assert_eq!(v["response"], "", "a sentinel-only reply strips to empty text");
+    assert_eq!(v["directives"]["meal_log"]["meals"][0]["id"], "2026-07-04-snack");
+    // A macro that was omitted must be ABSENT on the wire (never null-padded).
+    assert!(v["directives"]["meal_log"]["meals"][0].get("kcal").is_none());
+    // SSE (already-terminal path): the done frame's JSON data carries meal_log.
+    let resp = app(st.clone())
+        .oneshot(stream_request(Some("Bearer test-token"), &job_id))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let sse = body_string(resp).await;
+    assert!(sse.contains("event: done"), "expected a done frame: {sse}");
+    assert!(sse.contains("meal_log"), "done frame must carry meal_log: {sse}");
+    assert!(sse.contains("2026-07-04-snack"), "meal id in done frame: {sse}");
+}
+
+#[tokio::test]
+async fn meal_log_directive_carries_a_multi_meal_array() {
+    // A single reply may log several meals — the array round-trips in order.
+    let line = r#"{"type":"result","is_error":false,"result":"Logged both.\nJESSE_MEAL_LOG v1 {\"meals\":[{\"id\":\"2026-07-04-breakfast\",\"consumedAt\":\"2026-07-04T08:00:00+02:00\",\"name\":\"Oatmeal\",\"kcal\":300},{\"id\":\"2026-07-04-lunch\",\"consumedAt\":\"2026-07-04T12:30:00+02:00\",\"name\":\"Salad\",\"kcal\":250}]}","session_id":"sess-multi"}"#;
+    let (st, job_id) = run_turn_emitting(r#"{"mode":"tell","text":"log breakfast and lunch"}"#, line).await;
+    let v = result_status(&st, &job_id).await;
+    assert_eq!(v["response"], "Logged both.");
+    let meals = v["directives"]["meal_log"]["meals"].as_array().unwrap();
+    assert_eq!(meals.len(), 2);
+    assert_eq!(meals[0]["id"], "2026-07-04-breakfast");
+    assert_eq!(meals[1]["id"], "2026-07-04-lunch");
+}
+
+#[tokio::test]
+async fn malformed_meal_log_passes_through_visible_with_no_field() {
+    // A JESSE_MEAL_LOG line that fails the contract (here: an empty meals array)
+    // is a loud, visible failure — the line stays in the reply, no field attached.
+    let line = r#"{"type":"result","is_error":false,"result":"JESSE_MEAL_LOG v1 {\"meals\":[]}","session_id":"sess-bad"}"#;
+    let (st, job_id) = run_turn_emitting(r#"{"mode":"tell","text":"log nothing"}"#, line).await;
+    let v = result_status(&st, &job_id).await;
+    assert_eq!(v["response"], "JESSE_MEAL_LOG v1 {\"meals\":[]}", "malformed meal-log stays visible");
+    assert!(v["directives"].is_null(), "no directives for a malformed meal-log");
+}
+
+#[tokio::test]
+async fn meal_log_v2_passes_through_visible() {
+    // An unknown VERSION of a known directive must pass through untouched and
+    // visible, so a future contract bump fails loudly instead of half-parsing.
+    let line = r#"{"type":"result","is_error":false,"result":"JESSE_MEAL_LOG v2 {\"meals\":[{\"id\":\"x\",\"consumedAt\":\"t\",\"name\":\"n\"}]}","session_id":"sess-v2"}"#;
+    let (st, job_id) = run_turn_emitting(r#"{"mode":"tell","text":"log lunch"}"#, line).await;
+    let v = result_status(&st, &job_id).await;
+    assert!(v["response"].as_str().unwrap().contains("JESSE_MEAL_LOG v2"), "v2 stays visible");
+    assert!(v["directives"].is_null(), "no field for an unknown version");
 }
 
 #[tokio::test]

@@ -617,6 +617,57 @@ curl -s http://127.0.0.1:8765/jesse/result/<job_id> \
 See [SECURITY.md](../SECURITY.md#agent-directive-channel-jesse_needs_health) for
 the trust analysis.
 
+## Dietary write-back channel (`JESSE_MEAL_LOG`)
+
+The **write-direction sibling** of `JESSE_NEEDS_HEALTH`, on the **same extractor
+and registry**. When the agent logs a meal into the vault, it ends the reply with
+one machine-readable line the app turns into an Apple Health food entry:
+
+```
+JESSE_MEAL_LOG v1 {"meals":[{"id":"2026-07-04-lunch","consumedAt":"2026-07-04T12:30:00+02:00","name":"Lunch: spaghetti, red sauce","kcal":385,"protein_g":13,"carbs_g":77,"fat_g":4.5}]}
+```
+
+**Payload contract (version 1).**
+
+- `meals` is a **non-empty** array, capped at **10** meals (a reply may log
+  several); over the cap the whole block is malformed.
+- each meal requires a non-empty `id`, `consumedAt`, and `name`:
+  - `id` is the stable per-meal idempotency key (date + meal slot) — the app
+    dedupes on it, so a re-poll or re-opened thread never double-writes.
+  - `consumedAt` is ISO 8601 **with offset**, the *meal* time (not the log time).
+    The bridge checks only presence; the app parses the offset strictly before
+    writing (the bridge has no date library — defense in depth, not the authority).
+- `kcal`, `protein_g`, `carbs_g`, `fat_g` are numbers, each **optional**:
+  **omitted when unknown, never null-padded** — an absent macro is an absent key
+  (an explicit `null`, a non-number, a negative, or a non-finite value is a
+  rejection).
+- the meal-log line is capped at **8 KiB** (its own per-directive cap; the generic
+  ceiling is the same 8 KiB, sized to this, the largest directive — `JESSE_NEEDS_HEALTH`
+  keeps its tighter 2 KiB cap).
+
+**Extraction (bridge side).** Identical seam to `JESSE_NEEDS_HEALTH`: on the
+terminal-result path (poll result and SSE `done` frame, kept consistent), a
+**known**, validating meal line is **stripped** from the reply text and its parsed
+value attached under `directives.meal_log`. A line that is malformed, over the 8
+KiB or 10-meal cap, or names an **unknown version** (`v2…`) passes through
+**untouched and visible** (logged) with no field — a future contract bump fails
+loudly, never half-parsed. Streaming caveat by design: a partial SSE delta may
+briefly show the line before the `done` frame strips it (the app hides it
+defensively); no mid-stream suppression is attempted.
+
+```bash
+curl -s http://127.0.0.1:8765/jesse/result/<job_id> \
+  -H "Authorization: Bearer $JESSE_TOKEN"
+# → { "status":"done", "response":"…(meal line stripped)…", "session_id":"…",
+#     "directives": { "meal_log": { "meals":[{ "id":"2026-07-04-lunch",
+#                     "consumedAt":"2026-07-04T12:30:00+02:00",
+#                     "name":"Lunch: spaghetti, red sauce",
+#                     "kcal":385,"protein_g":13,"carbs_g":77,"fat_g":4.5 }] } } }
+```
+
+See [SECURITY.md](../SECURITY.md#dietary-write-back-channel-jesse_meal_log) for
+the trust analysis.
+
 ## Conversation titles (`POST /jesse/title`)
 
 A lightweight, **stateless** endpoint the app calls to turn one conversation's

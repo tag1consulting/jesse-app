@@ -15,6 +15,37 @@ CI both run it). See the "Versioning" section of `bridge/README.md`.
 
 ## [Unreleased]
 
+## [Bridge 0.4.0] — 2026-07-06
+
+### Added
+- **Dietary write-back directive (`JESSE_MEAL_LOG v1`).** A second entry in the
+  same directive registry shipped in 0.3.0 — the **write-direction sibling** of
+  `JESSE_NEEDS_HEALTH`. When a diet-logging reply's final non-empty line is
+  `JESSE_MEAL_LOG v1 {json}`, the bridge parses + validates it, **strips the line**
+  from the reply text, and attaches the parsed value under `directives.meal_log`
+  on the terminal result (surfaced identically on the poll result and the SSE
+  `done` frame, and persisted with the job — all via the existing
+  `directives_to_value` seam). The app writes each meal into Apple Health as a food
+  correlation (App PR, lands after this).
+  - **Contract (version 1).** `{"meals":[{ "id", "consumedAt", "name", "kcal"?,
+    "protein_g"?, "carbs_g"?, "fat_g"? }]}`. `id` is the stable per-meal
+    idempotency key; `consumedAt` is ISO 8601 with offset; the four macros are
+    numbers, each **optional — omitted when unknown, never null-padded** (so an
+    absent macro is an absent key on the wire, and an explicit `null` is a
+    rejection). A reply may log several meals; the array is non-empty and capped at
+    **10**.
+  - **Loud over silent.** A meal line that is malformed, over its **8 KiB** cap,
+    over the 10-meal cap, or names an **unknown version** (`v2…`) passes through
+    **untouched and visible** (logged), no field attached — a future contract bump
+    fails loudly instead of half-parsing, and a bad block is never partially
+    logged.
+- **Per-directive line caps.** The directive extractor's byte cap is now
+  **per-directive**: a generic outer ceiling (8 KiB, sized to the largest
+  directive) is checked before dispatch, then each registry arm enforces its own
+  cap — `JESSE_NEEDS_HEALTH` keeps its tight **2 KiB** bound, `JESSE_MEAL_LOG` gets
+  **8 KiB**. A directive's contract now owns its own bound; `JESSE_NEEDS_HEALTH`'s
+  observable behavior is unchanged.
+
 ## [App 1.0 (19)] — 2026-07-06
 
 ### Added
