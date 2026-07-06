@@ -15,6 +15,34 @@ CI both run it). See the "Versioning" section of `bridge/README.md`.
 
 ## [Unreleased]
 
+## [App 1.0 (21)] — 2026-07-06
+
+### Fixed
+- **"Connect Apple Health" crash on device.** Tapping Connect Apple Health on
+  build 20 crashed with `NSInvalidArgumentException` — *"Authorization to share the
+  following types is disallowed: HKCorrelationTypeIdentifierFood"*. The build-20
+  share (write) set added `HKCorrelationType(.food)` on top of the four dietary
+  quantity types (`HealthKitMealWriter.swift:28`), on the theory that authorization
+  had to cover the correlation container as well as its samples. It does not:
+  HealthKit **forbids** requesting authorization for an `HKCorrelationType` at all
+  (read or share) and raises `NSInvalidArgumentException` the moment one appears in
+  a `requestAuthorization` set. Apple's model is that you authorize only the sample
+  types a correlation contains; saving the `.food` `HKCorrelation` itself is
+  permitted with no container-level grant once every contained sample is authorized.
+  - **Fix.** The share set is now **exactly** the four dietary quantity types
+    (`dietaryEnergyConsumed`, `dietaryProtein`, `dietaryCarbohydrates`,
+    `dietaryFatTotal`); the read set is unchanged. `HealthKitMealWriter.write` is
+    untouched — `HKHealthStore.save` on the correlation was always legal with
+    contained-type authorization only. An audit of both HealthKit-importing files
+    confirmed this was the sole correlation type in any authorization set.
+  - **Regression guard.** New `HealthKitAuthorizationTypesTests` asserts, against the
+    pure exposed type sets, that (a) the share set is exactly those four dietary
+    quantity identifiers and (b) no identifier in any authorization set (read or
+    share) has the `HKCorrelationTypeIdentifier` prefix — making the whole class of
+    bug unrepresentable, not just the one instance. Both assertions fail against the
+    build-20 sets and pass after the fix. The live authorization sheet stays
+    unexercisable in the sandbox, so this catches the defect at its own layer.
+
 ## [App 1.0 (20)] — 2026-07-06
 
 ### Added

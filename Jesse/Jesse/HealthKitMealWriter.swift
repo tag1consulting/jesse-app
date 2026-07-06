@@ -18,14 +18,17 @@ import HealthKit
 nonisolated struct HealthKitMealWriter: MealWriting {
     /// The dietary quantity types this writes — also the app's HealthKit **share**
     /// (write) set, requested at connect time and queried for the write posture.
-    /// The `.food` correlation type is included so authorization covers the
-    /// container as well as its samples.
+    /// This is EXACTLY the four dietary quantity types and nothing else: HealthKit
+    /// forbids requesting authorization for an `HKCorrelationType` (the `.food`
+    /// container) at all, and raises `NSInvalidArgumentException` at the
+    /// `requestAuthorization` call if one appears here. Saving the `.food`
+    /// `HKCorrelation` needs no container grant — share authorization for every
+    /// sample it contains is sufficient. Guarded by `HealthKitAuthorizationTypesTests`.
     static let shareTypes: Set<HKSampleType> = [
         HKQuantityType(.dietaryEnergyConsumed),
         HKQuantityType(.dietaryProtein),
         HKQuantityType(.dietaryCarbohydrates),
         HKQuantityType(.dietaryFatTotal),
-        HKCorrelationType(.food),
     ]
 
     /// The representative type whose share status stands for "meal writing" (they
