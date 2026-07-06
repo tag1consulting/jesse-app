@@ -15,6 +15,28 @@ CI both run it). See the "Versioning" section of `bridge/README.md`.
 
 ## [Unreleased]
 
+## [App 1.0 (16)] — 2026-07-06
+
+### Added
+- **Live Activity for in-flight turns.** A turn can run for minutes; until now the
+  only ambient signal was the terminal push. The elapsed timer and the human
+  activity line ("Reading the vault…") — both already computed — are now surfaced
+  via ActivityKit on the **Lock Screen and Dynamic Island**: the activity starts
+  when a turn goes in flight, updates its line as Jesse works, and ends on
+  completion, failure, or cancel. Elapsed renders as a self-ticking
+  `Text(…, style: .timer)` anchored to the turn's start, so no per-second update
+  crosses the process boundary.
+  - **A new widget extension target** (`JesseWidgetsExtension`) hosts the
+    `ActivityConfiguration`; `NSSupportsLiveActivities` is set on the app. The
+    `ActivityAttributes` source is shared between app and extension.
+  - **Purely additive** — the existing push-on-background-complete is untouched.
+    ActivityKit is isolated behind a `TurnLiveActivityManaging` seam so
+    `RunCoordinator` never imports it and the test suite injects a no-op; the
+    turn-state → activity-content mapping (`TurnLiveActivity.step`) is a pure
+    function, unit-tested failing-first. Activities are stamped with their thread
+    id so a relaunch re-adopts them, and a foreground reconcile ends any stranded
+    by a mid-turn kill.
+
 ## [App 1.0 (15)] — 2026-07-05
 
 ### Added

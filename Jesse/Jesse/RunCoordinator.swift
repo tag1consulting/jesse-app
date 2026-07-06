@@ -125,6 +125,13 @@ final class RunCoordinator {
     // UNUserNotificationCenter.
     private let onFirstSuccess: @MainActor () -> Void
 
+    // Drives the in-flight-turn Live Activity (Lock Screen / Dynamic Island). A
+    // thin ActivityKit seam so this file never imports ActivityKit and the test
+    // suite injects a no-op — the device-only Live Activity runtime is never
+    // touched under test. The begin/update/end decision is the pure
+    // `TurnLiveActivity.step`; the calls here just feed it current run state.
+    private let liveActivity: any TurnLiveActivityManaging
+
     init(config: @escaping @MainActor () -> JesseConfig = { ConfigStore.load() },
          makeClient: @escaping @MainActor (JesseConfig) -> any JesseClientProtocol = { JesseClient(config: $0) },
          instructions: @escaping @MainActor (JesseMode) -> String? = { PromptStore.wrapperOverride(for: $0) },
@@ -134,11 +141,15 @@ final class RunCoordinator {
          backgroundTasker: BackgroundTasking = UIKitBackgroundTasking(),
          pollSleep: @escaping @MainActor (TimeInterval) async -> Void = { try? await Task.sleep(for: .seconds($0)) },
          inFlightStore: InFlightStoring? = nil,
+         liveActivity: (any TurnLiveActivityManaging)? = nil,
          onFirstSuccess: @escaping @MainActor () -> Void = {}) {
         // Resolve the default on the main actor (in the init body), not in the
         // default argument — a default arg is evaluated off the actor and the
         // store's init is main-actor-isolated under MainActor-default isolation.
         let resolvedInFlightStore = inFlightStore ?? InFlightStore()
+        // Same rationale for the Live Activity controller (its init adopts existing
+        // activities via ActivityKit on the main actor).
+        self.liveActivity = liveActivity ?? TurnLiveActivityController()
         self.configProvider = config
         self.makeClient = makeClient
         self.instructionsProvider = instructions
@@ -268,6 +279,9 @@ final class RunCoordinator {
         let instructions = instructionsProvider(mode)
         let floorOverride = floorProvider(mode)
         startDates[threadID] = Date()
+        // The turn is now in flight — start the Live Activity (Lock Screen / Dynamic
+        // Island). Additive: the existing push-on-background-complete is untouched.
+        syncLiveActivity(threadID, attributes: liveActivityAttributes(for: thread))
 
         // A background grant lets a short turn finish after the app is backgrounded;
         // longer turns are re-attached on foreground via `resume`. The guard owns
@@ -365,6 +379,10 @@ final class RunCoordinator {
     /// as the poll restarts — so foregrounding auto-recovers what Re-check does
     /// by hand.
     func resume(context: ModelContext) {
+        // End any Live Activity stranded by a kill mid-turn whose thread is neither
+        // actively running nor a retained in-flight job (its turn resolved while we
+        // were gone). Running/retained threads are kept and re-driven below.
+        liveActivity.endStale(keeping: Set(startDates.keys).union(inFlight.keys))
         for (threadID, job) in inFlight where tasks[threadID] == nil {
             reattach(threadID: threadID, job: job, context: context)
         }
@@ -514,6 +532,8 @@ final class RunCoordinator {
                     noteStreamActivity(threadID)
                 case .activity(let tool):
                     activity[threadID] = Self.activityLabel(for: tool)
+                    // Push the new human activity line to the Live Activity.
+                    syncLiveActivity(threadID)
                 case .done(let reply):
                     return .done(reply)
                 case .failed(let message):
@@ -760,6 +780,8 @@ final class RunCoordinator {
         // it isn't left dangling. A Re-check/resume reconnects and replays it.
         partialText[threadID] = nil
         activity[threadID] = nil
+        // The run stopped (idle-with-Re-check) — end the Live Activity.
+        syncLiveActivity(threadID)
         if voice { Speaker.shared.speak("Sorry, that didn't work yet. " + message) }
     }
 
@@ -820,6 +842,31 @@ final class RunCoordinator {
             inFlight[threadID] = nil
             inFlightStore.save(inFlight)
         }
+        // The run is now definitively idle — end the Live Activity (a no-op if none).
+        syncLiveActivity(threadID)
+    }
+
+    // MARK: - Live Activity
+
+    /// Reconcile the thread's Live Activity against its current run state. `attributes`
+    /// is supplied only when a turn first goes in flight (the send / re-attach path);
+    /// on update/end it's nil. The begin/update/end/idle decision is the pure
+    /// `TurnLiveActivity.step`, fed the coordinator's own observable run state.
+    private func syncLiveActivity(_ threadID: UUID,
+                                  attributes: JesseTurnActivityAttributes? = nil) {
+        liveActivity.sync(threadID: threadID,
+                          isRunning: isRunning(threadID),
+                          startedAt: startDate(for: threadID),
+                          activityLine: activity(for: threadID),
+                          attributes: attributes)
+    }
+
+    /// Attributes for a thread's Live Activity — its id, title, and short mode label.
+    private func liveActivityAttributes(for thread: JesseThread) -> JesseTurnActivityAttributes {
+        JesseTurnActivityAttributes(
+            threadID: thread.id,
+            threadTitle: thread.title.isEmpty ? "New conversation" : thread.title,
+            modeLabel: thread.modeValue == .ask ? "Ask" : "Tell")
     }
 
 }
