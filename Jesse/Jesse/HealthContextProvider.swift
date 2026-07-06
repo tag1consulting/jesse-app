@@ -206,14 +206,17 @@ nonisolated struct HealthContextProvider: HealthContextProviding {
         return workouts.map { MetricSeriesPoint(date: $0.startDate, value: $0.duration / 60) }
     }
 
-    /// Request read authorization for the workout + quantity + category types.
-    /// Returns false if Health is unavailable or the request errors; true once the
-    /// prompt has been answered (Apple deliberately hides whether READ was granted —
-    /// denial just yields empty queries later, so "granted once" means "asked once").
-    static func requestReadAuthorization() async -> Bool {
+    /// Request authorization for the workout + quantity + category READ types and
+    /// the dietary WRITE (share) types (`HealthKitMealWriter.shareTypes`), in one
+    /// prompt. Returns false if Health is unavailable or the request errors; true
+    /// once the prompt has been answered. Apple hides whether READ was granted
+    /// (denial just yields empty queries), but WRITE status IS queryable — the
+    /// caller checks `HealthKitMealWriter.isWriteDenied()` to decide the meal toggle.
+    static func requestAuthorization() async -> Bool {
         guard HKHealthStore.isHealthDataAvailable() else { return false }
         do {
-            try await HKHealthStore().requestAuthorization(toShare: [], read: readTypes)
+            try await HKHealthStore().requestAuthorization(
+                toShare: HealthKitMealWriter.shareTypes, read: readTypes)
             return true
         } catch {
             Log.health.error("HealthKit authorization request failed: \(error.localizedDescription)")

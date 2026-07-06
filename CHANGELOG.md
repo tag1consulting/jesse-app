@@ -15,6 +15,42 @@ CI both run it). See the "Versioning" section of `bridge/README.md`.
 
 ## [Unreleased]
 
+## [App 1.0 (20)] — 2026-07-06
+
+### Added
+- **Write logged meals to Apple Health** (PR 2 of the two-PR set; the bridge added
+  the `JESSE_MEAL_LOG v1` directive in Bridge 0.4.0). When a diet-logging reply
+  carries a `directives.meal_log`, the app writes each meal into Apple Health as a
+  food correlation — the write-direction sibling of the read-only health context.
+  - **Capability.** `NSHealthUpdateUsageDescription` added; the Settings "Connect
+    Apple Health" request now also asks for dietary **write** access
+    (`dietaryEnergyConsumed`, `dietaryProtein`, `dietaryCarbohydrates`,
+    `dietaryFatTotal`). Write status is queryable (unlike read): if denied, the
+    feature disables quietly and the Settings row says so.
+  - **Seam + write shape.** A `MealWriting` protocol with `HealthKitMealWriter` —
+    the second (and only other) HealthKit-importing file, keeping HealthKit confined
+    to the provider files. Each meal is one `.food` `HKCorrelation` (start/end = the
+    meal time; metadata carries the food name and the meal `id` as external
+    identifier) containing one `HKQuantitySample` per present macro (kcal in
+    kilocalories, macros in grams). Weight and workouts stay **read-only** — nothing
+    else is written.
+  - **Idempotency.** Written meal ids persist in SwiftData (`WrittenMeal`, additive
+    lightweight migration); a `meal_log` whose id was already written is skipped, so
+    a re-poll, Re-check, re-opened thread, or watch relay never double-writes.
+  - **Reliability.** HealthKit writes succeed while the device is locked (so the
+    watch-relay path works); a failed write enqueues into a persisted pending-writes
+    store (`PendingMealStore`) drained on next foreground and next turn.
+  - **Pure, tested pieces.** `MealLogParser` (v1 validation — field optionality,
+    the 10-meal cap, strict ISO-8601 date parsing the bridge deferred, whole-block
+    rejection so a bad block is never partially written) and a **display scrubber**
+    that strips a trailing `JESSE_MEAL_LOG v1` line from streamed partial text before
+    render (an unknown version is left visible — loud by contract). The final
+    persisted text already comes stripped from the bridge.
+  - **Settings.** A "Write meals to Apple Health" toggle
+    (`WriteMealsToHealthSettings`), default on once write access is granted.
+  - **Wire.** `meal_log` decoded on the poll result and SSE `done` frame
+    (`JesseMealLog`/`JesseMeal`); `JesseReply.mealsToLog` validates it.
+
 ## [Bridge 0.4.0] — 2026-07-06
 
 ### Added

@@ -19,6 +19,8 @@
 	</array>
 	<key>NSHealthShareUsageDescription</key>
 	<string>Jesse attaches a compact summary of your recent Apple Health — sleep, resting heart rate and other daily vitals, plus recent workouts — so you can ask it to log a workout or reflect on how you’re doing.</string>
+	<key>NSHealthUpdateUsageDescription</key>
+	<string>Jesse records meals you log into Apple Health.</string>
 	<key>NSAppTransportSecurity</key>
 	<dict>
 		<key>NSExceptionDomains</key>

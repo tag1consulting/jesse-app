@@ -270,6 +270,15 @@ struct JesseReply: Equatable {
             metrics: (nh.metrics ?? []).map { (metric: $0.metric, windowDays: $0.windowDays) })
     }
 
+    /// The validated meals this reply logged, or nil if there is no `meal_log`
+    /// directive or it fails the contract (empty, over the cap, a blank required
+    /// field, an unparseable date, or a bad macro) — an invalid block is never
+    /// partially written to Health. Mirrors `needsHealthRequest`.
+    var mealsToLog: [Meal]? {
+        guard let ml = directives?.mealLog else { return nil }
+        return MealLogParser.meals(from: ml)
+    }
+
     private static let marker = "SPOKEN:"
 
     /// Full answer for the screen, with the SPOKEN: line removed.
@@ -452,8 +461,39 @@ nonisolated struct JesseResultResponse: Decodable {
 /// to nil (the common case).
 nonisolated struct JesseDirectives: Decodable, Equatable {
     let needsHealth: JesseNeedsHealth?
+    // Defaulted so an existing `JesseDirectives(needsHealth:)` construction keeps
+    // compiling; Decodable still uses `decodeIfPresent`, so absent decodes to nil.
+    var mealLog: JesseMealLog? = nil
     enum CodingKeys: String, CodingKey {
         case needsHealth = "needs_health"
+        case mealLog = "meal_log"
+    }
+}
+
+/// The decoded (not yet validated) `meal_log` directive — one or more meals the
+/// agent logged, to write into Apple Health. `JesseReply.mealsToLog` validates it
+/// through `MealLogParser` (caps, field optionality, strict ISO-8601 date) before
+/// anything is written; an invalid block is never partially written.
+nonisolated struct JesseMealLog: Decodable, Equatable {
+    let meals: [JesseMeal]
+}
+
+/// One decoded meal. Wire field names match the bridge contract exactly:
+/// `consumedAt` is camelCase; the macros keep their `_g` suffixes; each macro is
+/// optional (absent when the agent didn't know it — never null-padded).
+nonisolated struct JesseMeal: Decodable, Equatable {
+    let id: String
+    let consumedAt: String
+    let name: String
+    let kcal: Double?
+    let proteinGrams: Double?
+    let carbGrams: Double?
+    let fatGrams: Double?
+    enum CodingKeys: String, CodingKey {
+        case id, consumedAt, name, kcal
+        case proteinGrams = "protein_g"
+        case carbGrams = "carbs_g"
+        case fatGrams = "fat_g"
     }
 }
 

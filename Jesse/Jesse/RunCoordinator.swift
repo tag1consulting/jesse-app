@@ -105,6 +105,10 @@ final class RunCoordinator {
     // injected `save` seam so a test's save spy counts both the optimistic
     // user-turn save and the completion save.
     private let turnWriter: TurnWriter
+    // Writes any meals a reply logged into Apple Health, idempotently and gated by
+    // the toggle + write authorization. Injectable so a test drives it with fakes;
+    // production uses the real HealthKit writer + UserDefaults pending queue.
+    private let mealWriter: MealHealthWriter
 
     // threadID → a counter bumped on each stream reset/delta. The poll loop watches
     // it to snap its backoff back to the fast cadence while the stream is actively
@@ -159,6 +163,7 @@ final class RunCoordinator {
          pollSleep: @escaping @MainActor (TimeInterval) async -> Void = { try? await Task.sleep(for: .seconds($0)) },
          inFlightStore: InFlightStoring? = nil,
          liveActivity: (any TurnLiveActivityManaging)? = nil,
+         mealWriter: MealHealthWriter? = nil,
          onFirstSuccess: @escaping @MainActor () -> Void = {}) {
         // Resolve the default on the main actor (in the init body), not in the
         // default argument — a default arg is evaluated off the actor and the
@@ -174,6 +179,13 @@ final class RunCoordinator {
         self.speak = speak
         self.save = save
         self.turnWriter = TurnWriter(save: save)
+        // Default meal writer: the real HealthKit writer + UserDefaults pending
+        // queue, gated by the persisted toggle. Built on the main actor here (its
+        // pieces are main-actor) rather than in a default argument.
+        self.mealWriter = mealWriter ?? MealHealthWriter(
+            writer: HealthKitMealWriter(),
+            pending: PendingMealStore(),
+            isEnabled: { WriteMealsToHealthSettings.isEnabled })
         self.backgroundGuard = BackgroundTaskGuard(tasker: backgroundTasker)
         self.pollSleep = pollSleep
         self.inFlightStore = resolvedInFlightStore
@@ -244,6 +256,9 @@ final class RunCoordinator {
         guard !trimmed.isEmpty, !isRunning(thread.id) else { return }
         let threadID = thread.id
         errors[threadID] = nil
+        // A new turn is a "next turn" drain point for any meal writes that failed
+        // earlier (device locked, transient HealthKit error) — retry them now.
+        drainPendingMeals(context: context)
         // A new user message gets a fresh health-retry budget (one per message).
         healthRetried.remove(threadID)
         // A new turn supersedes any retained-but-unretrieved job from a prior
@@ -405,6 +420,9 @@ final class RunCoordinator {
         // actively running nor a retained in-flight job (its turn resolved while we
         // were gone). Running/retained threads are kept and re-driven below.
         liveActivity.endStale(keeping: Set(startDates.keys).union(inFlight.keys))
+        // Foreground is a drain point for meal writes that failed while backgrounded
+        // or with the device locked — retry them now (best-effort, gated).
+        drainPendingMeals(context: context)
         for (threadID, job) in inFlight where tasks[threadID] == nil {
             reattach(threadID: threadID, job: job, context: context)
         }
@@ -731,6 +749,11 @@ final class RunCoordinator {
     // `.reply` path are the only callers, both inside this type.
     private func finish(threadID: UUID, thread: JesseThread?, reply: JesseReply,
                         voice: Bool, jobId: String?, context: ModelContext) {
+        // Write any logged meals into Apple Health before mapping the delivery
+        // outcome — idempotent by meal id, so it's safe on a re-delivery (the same
+        // reply re-checked/resumed writes nothing new). Best-effort and detached;
+        // never affects whether the reply is shown.
+        writeMeals(from: reply, context: context)
         switch turnWriter.write(threadID: threadID, thread: thread, reply: reply,
                                 jobId: jobId, context: context) {
         case .unresolvableThread:
@@ -921,6 +944,30 @@ final class RunCoordinator {
         inFlightStore.save(inFlight)
     }
 
+    // MARK: - Meal write-back (Apple Health)
+
+    /// Write any meals this reply logged into Apple Health, idempotently. A pure
+    /// side effect: fire-and-forget on its own task so it never blocks or fails the
+    /// turn (the reply is already delivered). Gated by the toggle + write auth
+    /// inside `MealHealthWriter`; deduped by meal id against the SwiftData written
+    /// store, so re-delivery (Re-check, resume, a re-opened thread) never
+    /// double-writes; a failed write enqueues to the pending store for a later
+    /// drain. No-op for the overwhelming majority of turns (no `meal_log`).
+    private func writeMeals(from reply: JesseReply, context: ModelContext) {
+        guard let meals = reply.mealsToLog, !meals.isEmpty else { return }
+        let written = SwiftDataWrittenMealStore(context: context)
+        let mealWriter = self.mealWriter
+        Task { await mealWriter.process(meals, written: written) }
+    }
+
+    /// Retry any meals whose Health write previously failed (drained on foreground
+    /// and at the start of each new turn). Fire-and-forget; gated identically.
+    private func drainPendingMeals(context: ModelContext) {
+        let written = SwiftDataWrittenMealStore(context: context)
+        let mealWriter = self.mealWriter
+        Task { await mealWriter.drainPending(written: written) }
+    }
+
     /// Clear all transient + persisted run state for a thread, including any live
     /// stream buffer (so a finished/cancelled turn leaves no half-streamed text).
     private func clearRun(_ threadID: UUID) {
@@ -1025,6 +1072,10 @@ extension RunCoordinator {
             // Persist Jesse's turn through the SAME writer `finish` uses, so a
             // relayed turn lands in the normal history identically. `jobId: nil`
             // (the relay dedups at the requestId layer, not via the delivery key).
+            // Write any logged meals into Apple Health. HealthKit saves succeed even
+            // while the device is locked, so a watch-relayed meal logged with the
+            // phone in a pocket still lands (idempotent, gated, detached).
+            writeMeals(from: reply, context: context)
             switch turnWriter.write(threadID: threadID, thread: thread, reply: reply,
                                     jobId: nil, context: context) {
             case .delivered, .alreadyDelivered:

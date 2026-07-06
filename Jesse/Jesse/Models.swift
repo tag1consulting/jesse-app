@@ -189,3 +189,21 @@ final class TurnAttachment {
     var isImage: Bool { mime.hasPrefix("image/") }
     var isPDF: Bool { mime == "application/pdf" }
 }
+
+/// A meal already written to Apple Health, keyed by the bridge-provided stable
+/// meal `id` (date + slot). Its sole purpose is idempotency: before writing a meal
+/// we check this store, so a re-poll, Re-check, re-opened thread, or watch relay of
+/// the same reply never double-writes to Health. A new standalone entity with a
+/// defaulted `.unique` id → SwiftData lightweight-migrates existing stores with no
+/// migration code (matching how `TurnAttachment` was added). `.unique` collapses a
+/// duplicate insert to an upsert, a second guarantee against a double row.
+@Model
+final class WrittenMeal {
+    @Attribute(.unique) var id: String = ""
+    var writtenAt: Date = Date()
+
+    init(id: String, writtenAt: Date = Date()) {
+        self.id = id
+        self.writtenAt = writtenAt
+    }
+}

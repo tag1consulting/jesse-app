@@ -124,7 +124,12 @@ struct ThreadDetailView: View {
                     // a coarse activity line under the spinner. Cleared and
                     // replaced by the persisted Turn the instant the turn finishes.
                     if running {
-                        let partial = coordinator.partialText(for: thread.id) ?? ""
+                        // Scrub a trailing JESSE_MEAL_LOG v1 line from the live
+                        // partial: a delta can briefly show the sentinel before the
+                        // bridge's `done` frame strips it (the streaming caveat).
+                        // Unknown versions are left visible (loud by contract).
+                        let partial = MealLogParser.scrubbedStreamingText(
+                            coordinator.partialText(for: thread.id) ?? "")
                         if !partial.isEmpty {
                             // Coalesced to ~10Hz so a long stream doesn't re-parse
                             // the whole growing string on every delta (M8).

@@ -268,6 +268,13 @@ struct SettingsView: View {
     @AppStorage(HealthContextSettings.enabledKey) private var attachHealthContext = false
     @State private var connectingHealth = false
 
+    // "Write meals to Apple Health" — default OFF until write access is granted, then
+    // flipped on. Same key `RunCoordinator`'s meal writer reads (`WriteMealsToHealthSettings`).
+    // `mealWriteDenied` reflects the queryable WRITE status (unlike read): when the
+    // user has denied write access the row says so and the toggle is disabled.
+    @AppStorage(WriteMealsToHealthSettings.enabledKey) private var writeMealsToHealth = false
+    @State private var mealWriteDenied = false
+
     var body: some View {
         NavigationStack {
             Form {
@@ -357,6 +364,8 @@ struct SettingsView: View {
 
                 Section {
                     Toggle("Attach health context", isOn: $attachHealthContext)
+                    Toggle("Write meals to Apple Health", isOn: $writeMealsToHealth)
+                        .disabled(mealWriteDenied)
                     Button {
                         Task { await connectAppleHealth() }
                     } label: {
@@ -366,11 +375,17 @@ struct SettingsView: View {
                     if connectingHealth {
                         HStack { ProgressView(); Text("Requesting access…").foregroundStyle(.secondary) }
                     }
+                    if mealWriteDenied {
+                        Text("Health write access is off. Turn on Nutrition for Jesse in the Health app › Sharing to log meals here.")
+                            .font(.callout)
+                            .foregroundStyle(.secondary)
+                    }
                 } header: {
                     Text("Apple Health")
                 } footer: {
-                    Text("Jesse attaches a compact summary of your recent Apple Health — last night’s sleep, resting heart rate and other daily vitals, plus your recent workouts — so you can ask it to log one (“Log my swim”) or reflect on how you’re doing. Nothing is read until you connect, and you can turn it off anytime.")
+                    Text("Jesse attaches a compact summary of your recent Apple Health — last night’s sleep, resting heart rate and other daily vitals, plus your recent workouts — so you can ask it to log one (“Log my swim”) or reflect on how you’re doing. With “Write meals” on, meals you log (“log lunch: …”) are also saved to Health as nutrition entries. Nothing is read or written until you connect, and you can turn either off anytime.")
                 }
+                .onAppear { mealWriteDenied = HealthKitMealWriter.isWriteDenied() }
 
                 Section {
                     LabeledContent("App", value: AppVersion.display)
@@ -602,16 +617,20 @@ struct SettingsView: View {
         }
     }
 
-    /// "Connect Apple Health": request read authorization for the workout types.
-    /// Apple hides whether READ was granted (denial just yields empty queries, so
-    /// nothing is attached), so "granted once, then on" means: once the prompt has
-    /// been answered without error, flip the toggle on. The user can turn it back
-    /// off anytime.
+    /// "Connect Apple Health": request read authorization for the health-context
+    /// types AND write authorization for the dietary types, in one prompt. Apple
+    /// hides whether READ was granted (denial just yields empty queries), so
+    /// answering the prompt without error flips the read toggle on. WRITE status IS
+    /// queryable, so meal-writing is flipped on only when write access wasn't denied,
+    /// and the denied state is captured for the row. The user can turn either off.
     private func connectAppleHealth() async {
         connectingHealth = true
         defer { connectingHealth = false }
-        if await HealthContextProvider.requestReadAuthorization() {
+        if await HealthContextProvider.requestAuthorization() {
             attachHealthContext = true
+            let denied = HealthKitMealWriter.isWriteDenied()
+            mealWriteDenied = denied
+            if !denied { writeMealsToHealth = true }
         }
     }
 
