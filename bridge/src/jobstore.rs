@@ -30,6 +30,11 @@ pub enum JobState {
     Done {
         response: String,
         session_id: Option<String>,
+        // Structured directives the agent emitted on its final line (e.g.
+        // `needs_health`), stripped from `response` by the extractor. Carried on
+        // the terminal state so BOTH the poll result and the SSE `done` frame
+        // surface the same value. `None` for the overwhelming majority of turns.
+        directives: Option<Directives>,
     },
     Failed {
         error: String,
@@ -134,13 +139,20 @@ pub fn ms_to_system_time(ms: u64) -> SystemTime {
 /// and timing metadata; never any secret.
 pub fn job_to_value(id: &str, job: &Job) -> Option<Value> {
     let completed_at = job.completed_at?;
-    let (status, response, session_id, error) = match &job.state {
+    let (status, response, session_id, directives, error) = match &job.state {
         JobState::Done {
             response,
             session_id,
-        } => ("done", Some(response.clone()), session_id.clone(), None),
-        JobState::Failed { error } => ("failed", None, None, Some(error.clone())),
-        JobState::Cancelled => ("cancelled", None, None, None),
+            directives,
+        } => (
+            "done",
+            Some(response.clone()),
+            session_id.clone(),
+            directives_to_value(directives),
+            None,
+        ),
+        JobState::Failed { error } => ("failed", None, None, Value::Null, Some(error.clone())),
+        JobState::Cancelled => ("cancelled", None, None, Value::Null, None),
         JobState::Running => return None,
     };
     Some(json!({
@@ -149,6 +161,7 @@ pub fn job_to_value(id: &str, job: &Job) -> Option<Value> {
         "status": status,
         "response": response,
         "session_id": session_id,
+        "directives": directives,
         "error": error,
         "completed_at_ms": system_time_to_ms(completed_at),
         "first_retrieved_at_ms": job.first_retrieved_at.map(system_time_to_ms),
@@ -170,6 +183,12 @@ pub fn value_to_job(v: &Value) -> Option<(String, Job)> {
                 .get("session_id")
                 .and_then(|s| s.as_str())
                 .map(|s| s.to_string()),
+            // Absent/null/malformed persisted directives → None (a persisted
+            // reply from before this field, or a plain turn, has no directive).
+            directives: v
+                .get("directives")
+                .filter(|d| !d.is_null())
+                .and_then(|d| serde_json::from_value(d.clone()).ok()),
         },
         "failed" => JobState::Failed {
             error: v
@@ -437,14 +456,19 @@ impl JobStore {
     /// too (an O(1) hand-off). The blocking disk write runs on the worker, off the
     /// lock (H2), so a slow disk can't stall every other request — while enqueuing
     /// under the lock keeps disk ops ordered against eviction's `remove`.
-    pub fn complete(&self, id: &str, outcome: Result<(String, Option<String>), ApiError>) {
+    pub fn complete(
+        &self,
+        id: &str,
+        outcome: Result<(String, Option<String>, Option<Directives>), ApiError>,
+    ) {
         // The turn is over — drop its abort handle so the map can't leak. Done in
         // its own statement so the `aborts` lock is released before taking `jobs`.
         self.aborts.lock_ok().remove(id);
         let state = match outcome {
-            Ok((response, session_id)) => JobState::Done {
+            Ok((response, session_id, directives)) => JobState::Done {
                 response,
                 session_id,
+                directives,
             },
             Err((_code, error)) => JobState::Failed { error },
         };
@@ -541,11 +565,13 @@ impl JobStore {
             Some(JobState::Done {
                 response,
                 session_id,
+                directives,
             }) => self.stream_finish(
                 id,
                 StreamFrame::Done {
                     response,
                     session_id,
+                    directives,
                 },
             ),
             Some(JobState::Failed { error }) => self.stream_finish(id, StreamFrame::Error(error)),
@@ -746,11 +772,12 @@ mod tests {
     fn job_complete_records_done_and_failed() {
         let store = JobStore::new(Duration::from_secs(600), Duration::from_secs(600), None);
         let ok = store.create();
-        store.complete(&ok, Ok(("hi".to_string(), Some("sess-1".to_string()))));
+        store.complete(&ok, Ok(("hi".to_string(), Some("sess-1".to_string()), None)));
         match store.get(&ok) {
             Some(JobState::Done {
                 response,
                 session_id,
+                ..
             }) => {
                 assert_eq!(response, "hi");
                 assert_eq!(session_id.as_deref(), Some("sess-1"));
@@ -774,12 +801,12 @@ mod tests {
         // the ttl; a running job never evicts; a freshly completed one survives.
         let store = JobStore::new(Duration::from_millis(50), Duration::from_secs(600), None);
         let old = store.create();
-        store.complete(&old, Ok(("done".to_string(), None)));
+        store.complete(&old, Ok(("done".to_string(), None, None)));
         let running = store.create(); // never completes — must survive eviction
         // Wait past the TTL, then complete a fresh one that must NOT be evicted.
         tokio::time::sleep(Duration::from_millis(80)).await;
         let fresh = store.create();
-        store.complete(&fresh, Ok(("fresh".to_string(), None)));
+        store.complete(&fresh, Ok(("fresh".to_string(), None, None)));
 
         store.evict_expired();
         assert!(
@@ -839,9 +866,9 @@ mod tests {
         // sibling survives because its (24h-ish) ttl clock hasn't elapsed.
         let store = JobStore::new(Duration::from_secs(86_400), Duration::from_millis(40), None);
         let fetched = store.create();
-        store.complete(&fetched, Ok(("fetched".to_string(), None)));
+        store.complete(&fetched, Ok(("fetched".to_string(), None, None)));
         let unfetched = store.create();
-        store.complete(&unfetched, Ok(("unfetched".to_string(), None)));
+        store.complete(&unfetched, Ok(("unfetched".to_string(), None, None)));
 
         // First retrieval starts the grace clock for `fetched` only.
         assert!(matches!(
@@ -873,7 +900,7 @@ mod tests {
         {
             let store = JobStore::new(ttl, grace, Some(dir.clone()));
             let id = store.create();
-            store.complete(&id, Ok(("persisted reply".to_string(), Some("sess-9".to_string()))));
+            store.complete(&id, Ok(("persisted reply".to_string(), Some("sess-9".to_string()), None)));
             store.flush_persistence(); // wait for the off-lock worker to write
 
             // A new store over the SAME dir is the restart: it must reload the job.
@@ -882,6 +909,7 @@ mod tests {
                 Some(JobState::Done {
                     response,
                     session_id,
+                    ..
                 }) => {
                     assert_eq!(response, "persisted reply");
                     assert_eq!(session_id.as_deref(), Some("sess-9"));
@@ -921,7 +949,7 @@ mod tests {
         let id = {
             let store = JobStore::new(ttl, grace, Some(dir.clone()));
             let id = store.create();
-            store.complete(&id, Ok(("stale".to_string(), None)));
+            store.complete(&id, Ok(("stale".to_string(), None, None)));
             store.flush_persistence(); // wait for the off-lock worker to write
             id
         };
@@ -964,12 +992,12 @@ mod tests {
         // this is the late-completion race the write-once guard exists for.
         let raced = store.create();
         assert!(matches!(store.cancel(&raced), CancelOutcome::Cancelled));
-        store.complete(&raced, Ok(("late reply".to_string(), None)));
+        store.complete(&raced, Ok(("late reply".to_string(), None, None)));
         assert!(matches!(store.get(&raced), Some(JobState::Cancelled)));
 
         // Cancelling a job that already completed leaves the Done result intact.
         let done = store.create();
-        store.complete(&done, Ok(("kept".to_string(), None)));
+        store.complete(&done, Ok(("kept".to_string(), None, None)));
         assert!(matches!(store.cancel(&done), CancelOutcome::AlreadyTerminal));
         assert!(matches!(store.get(&done), Some(JobState::Done { .. })));
     }
@@ -996,7 +1024,7 @@ mod tests {
         assert!(matches!(store.get(&id), Some(JobState::Running)));
         let id2 = store.create();
         assert!(matches!(store.get(&id2), Some(JobState::Running)));
-        store.complete(&id, Ok(("after poison".into(), None)));
+        store.complete(&id, Ok(("after poison".into(), None, None)));
         assert!(matches!(store.get(&id), Some(JobState::Done { .. })));
     }
     #[test]
@@ -1021,6 +1049,7 @@ mod tests {
                 state: JobState::Done {
                     response: "off-lock".into(),
                     session_id: Some("s".into()),
+                    directives: None,
                 },
                 completed_at: Some(SystemTime::now()),
                 first_retrieved_at: None,
@@ -1046,7 +1075,7 @@ mod tests {
             Some(dir.clone()),
         );
         let id = store.create();
-        store.complete(&id, Ok(("worker write".into(), None)));
+        store.complete(&id, Ok(("worker write".into(), None, None)));
         store.flush_persistence();
         assert!(
             dir.join(format!("{id}.json")).exists(),
@@ -1068,7 +1097,7 @@ mod tests {
         // and a completed-but-never-fetched one (held the full 24h ttl).
         let keep_running = store.create();
         let keep_unfetched = store.create();
-        store.complete(&keep_unfetched, Ok(("keep".into(), None)));
+        store.complete(&keep_unfetched, Ok(("keep".into(), None, None)));
 
         // Hammer create/complete/get/get_retrieving from many tasks WHILE eviction
         // sweeps concurrently — the concurrency test the suite was missing.
@@ -1079,7 +1108,7 @@ mod tests {
                 let mut ids = Vec::new();
                 for i in 0..40 {
                     let id = s.create();
-                    s.complete(&id, Ok((format!("r{t}-{i}"), None)));
+                    s.complete(&id, Ok((format!("r{t}-{i}"), None, None)));
                     let _ = s.get_retrieving(&id); // starts the 20ms grace clock
                     ids.push(id);
                     if i % 7 == 0 {

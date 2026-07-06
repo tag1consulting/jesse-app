@@ -201,13 +201,54 @@ input and handled defensively:
   told to distrust — and, crucially, the tool allowlist (not the prompt) is the
   boundary that bounds what any turn can do.
 - **Bounded and sanitized.** The block is capped at `MAX_HEALTH_CONTEXT_BYTES`
-  (4 KiB, mirroring `MAX_TITLE_INPUT_BYTES`); an oversized block is refused with
-  `413` **before any `claude` spawn** and before a concurrency permit is taken, so
-  it can never trigger a giant model call. ASCII control characters other than
-  newline are stripped before the block is used, so it cannot smuggle terminal
-  escapes, NULs, or stray control bytes into the prompt.
+  (**8 KiB**); an oversized block is refused with `413` **before any `claude`
+  spawn** and before a concurrency permit is taken, so it can never trigger a giant
+  model call. ASCII control characters other than newline are stripped before the
+  block is used, so it cannot smuggle terminal escapes, NULs, or stray control
+  bytes into the prompt. (The cap rose from 4 KiB with the directive channel below:
+  a *granted* metrics request can carry up to 4 metrics × ~31 daily lines; the app
+  self-caps its fulfilled response at 6 KiB, under this ceiling.)
 - **Optional and backward-compatible.** Absent or blank reproduces the pre-field
   prompt byte-for-byte, so an old app build (which never sends it) is unaffected.
+
+## Agent directive channel (`JESSE_NEEDS_HEALTH`)
+
+Health context is no longer attached to every turn — the app classifies each
+message and attaches the block only when relevant. So the agent needs a way to
+**ask** for device health data it wasn't given: the final non-empty line of a
+reply may be a directive `JESSE_<NAME> v<N> {json}` (this release:
+`JESSE_NEEDS_HEALTH v1`). The bridge extracts a known, validating directive,
+strips it from the reply, and hands the parsed request to the app under a
+structured `directives` object. This is a **new data path from the agent's output
+back to the app**, so its trust properties are called out explicitly:
+
+- **A directive originates from the sandboxed agent's OUTPUT**, which is
+  attacker-*influenceable*: a prompt injection in the vault, or a crafted request,
+  could in principle make the agent emit a `JESSE_NEEDS_HEALTH` line. So the
+  request it produces is **not trusted** — it is validated against a **fixed
+  whitelist and caps** before anything acts on it. The bridge validates here
+  (`sections` ⊆ {daily, workouts}; each `metric` on the fixed
+  [whitelist](../bridge/README.md#agent-driven-health-request-channel-jesse_needs_health);
+  `window_days` an integer 1–31; ≤ 4 metrics; ≤ 2 KiB line) and the app validates
+  again against the same enum before reading any HealthKit data. A directive that
+  fails either check is **not fulfilled**.
+- **The worst a prompt-injected agent can do through this channel** is ask for
+  **whitelisted health aggregates the user already agreed to share** (the same
+  HealthKit types the "Attach health context" toggle already reads) over a bounded
+  window. It grants **no new capability**, reads nothing the app couldn't already
+  attach, and — like `health_context` — adds **no tool** to the agent's allowlist.
+  The directive is a *request for data the app gates*, not a command the bridge
+  obeys.
+- **A malformed, over-cap, or unknown directive is a loud, visible failure**, not a
+  silent one: the line is left in the reply text and logged, and no field is
+  attached. Combined with the app's one-retry cap, a wrong or hostile classification
+  can only ever cost a slower answer (one retry) or a vault-data answer — never a
+  wrong or degraded one.
+- **The request→retry loop is bounded.** A turn that carries
+  `health_context_unavailable` tells the agent it cannot get the data and must
+  answer from vault data without re-requesting; the app fulfils at most one retry
+  per user message and ignores a second directive. There is no unbounded
+  ask/answer cycle.
 
 ## Push notifications (APNs key + device token)
 

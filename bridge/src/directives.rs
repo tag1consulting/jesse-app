@@ -1,0 +1,540 @@
+//! Agent-emitted **directives** — a structured back-channel from the sandboxed
+//! agent's reply to the app, carried on the terminal result.
+//!
+//! A directive is the **final non-empty line** of a reply, exactly one line, in a
+//! fixed generic form:
+//!
+//! ```text
+//! JESSE_<NAME> v<N> {json}
+//! ```
+//!
+//! The agent uses it to *ask the app for something it can only get on-device* —
+//! for now, Apple Health context it wasn't given this turn
+//! (`JESSE_NEEDS_HEALTH v1`). The planned dietary write-back adds
+//! `JESSE_MEAL_LOG v1` on this same extractor, so the recognizer is a small
+//! **registry** (a `match` on `(name, version)`), not one-off plumbing.
+//!
+//! **Trust.** A directive originates from the agent's OUTPUT, which is
+//! attacker-influenceable (prompt injection into the vault, a crafted request).
+//! So the app validates every request it produces against a fixed whitelist and
+//! caps before acting on it — a prompt-injected agent can at worst ask for
+//! whitelisted health aggregates the user already agreed to share. This module is
+//! the bridge half of that discipline: it validates the payload here too (defense
+//! in depth) and only attaches a directive that parses AND passes the contract.
+//!
+//! **Correctness invariant.** Extraction only ever affects token cost / prompt
+//! hygiene — never the answer. A line that does not cleanly match a KNOWN
+//! directive is left **in the reply text, visible** (a loud contract failure),
+//! and no field is attached; the reply the user sees is never silently mangled.
+
+use crate::*;
+use serde::{Deserialize, Serialize};
+
+/// Hard cap on the directive line length. A final line longer than this is not
+/// treated as a directive — it passes through untouched and visible (logged), so
+/// a runaway/garbled line can never be parsed as a command or balloon the wire.
+pub const MAX_DIRECTIVE_LINE_BYTES: usize = 2 * 1024;
+
+/// Sections a `JESSE_NEEDS_HEALTH` directive may request (the phone-assembled
+/// two-section health block). Kept in sync with the app's formatter.
+pub const NEEDS_HEALTH_SECTIONS: &[&str] = &["daily", "workouts"];
+
+/// Whitelisted metric identifiers a `JESSE_NEEDS_HEALTH` directive may request a
+/// windowed series for. **Kept in exact sync with the app's `RequestableMetric`
+/// enum** (PR 2): the app rejects anything off this list, and the bridge rejects
+/// it here too, so a prompt-injected agent can only ever ask for these
+/// device-health aggregates the user already opted into sharing.
+pub const NEEDS_HEALTH_METRICS: &[&str] = &[
+    "restingHeartRate",
+    "heartRate",
+    "heartRateVariabilitySDNN",
+    "stepCount",
+    "activeEnergyBurned",
+    "bodyMass",
+    "sleepAnalysis",
+    "vo2Max",
+    "workouts",
+];
+
+/// Max number of metric requests one directive may carry.
+pub const MAX_NEEDS_HEALTH_METRICS: usize = 4;
+
+/// Allowed `window_days` range (inclusive) for a metric request.
+pub const NEEDS_HEALTH_WINDOW_DAYS: std::ops::RangeInclusive<u64> = 1..=31;
+
+/// One windowed-metric request inside a `JESSE_NEEDS_HEALTH` directive.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MetricRequest {
+    pub metric: String,
+    pub window_days: u32,
+}
+
+/// The parsed payload of a `JESSE_NEEDS_HEALTH v1` directive: which sections
+/// and/or whitelisted windowed metrics the agent needs to answer this turn. At
+/// least one of `sections`/`metrics` is non-empty (enforced at parse time).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct NeedsHealth {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sections: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub metrics: Vec<MetricRequest>,
+}
+
+/// The structured `directives` object attached to a terminal result. One
+/// optional field per known directive type; more are added as the registry
+/// grows (e.g. `meal_log`). All-`None` never occurs — a `Directives` is attached
+/// only when at least one directive was recognized.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Directives {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub needs_health: Option<NeedsHealth>,
+}
+
+/// Serialize an optional `Directives` to the wire value used by BOTH the poll
+/// result JSON and the SSE `done` frame, so the two paths are byte-consistent.
+/// `None` → JSON `null` (the app treats null/absent identically).
+pub fn directives_to_value(directives: &Option<Directives>) -> Value {
+    match directives {
+        Some(d) => serde_json::to_value(d).unwrap_or(Value::Null),
+        None => Value::Null,
+    }
+}
+
+/// Map a finished turn's outcome through directive extraction. On success, the
+/// reply's final directive line (if any known one) is stripped from the text and
+/// the parsed value is returned alongside it; on failure the outcome is passed
+/// through unchanged. This is the single seam the handler calls between
+/// `run_claude_streaming` and `jobs.complete`, so the extracted directives land
+/// in `JobState::Done` and flow identically to the poll result and the SSE
+/// `done` frame.
+pub fn apply_directives(
+    outcome: Result<(String, Option<String>), ApiError>,
+) -> Result<(String, Option<String>, Option<Directives>), ApiError> {
+    outcome.map(|(response, session_id)| {
+        let (stripped, directives) = extract_directives(&response);
+        (stripped, session_id, directives)
+    })
+}
+
+/// Extract a recognized directive from a reply's final non-empty line.
+///
+/// Returns `(text, directives)`:
+/// - a KNOWN directive that parses and validates → the line is stripped from the
+///   text (trailing whitespace trimmed) and its parsed value is returned;
+/// - anything else → the text is returned **unchanged** and `directives` is
+///   `None`. That covers a normal reply (no directive line), a directive-shaped
+///   line with an unknown name/version (passed through visible — a loud contract
+///   failure), a malformed line, an over-cap line, and a known directive whose
+///   payload fails the contract. Every non-strip path that looked like a
+///   directive is logged, so a contract break is visible rather than silent.
+///
+/// Exactly one directive line is recognized per reply — the final non-empty one.
+/// Pure (aside from `eprintln!` diagnostics), so it is unit-tested directly.
+pub fn extract_directives(reply: &str) -> (String, Option<Directives>) {
+    // The candidate is the last non-empty line. `trim_end` drops any trailing
+    // blank lines so the directive can sit under trailing newlines.
+    let trimmed_reply = reply.trim_end();
+    let last_line = match trimmed_reply.rsplit('\n').next() {
+        Some(l) => l.trim(),
+        None => return (reply.to_string(), None),
+    };
+
+    // Fast path: only a `JESSE_`-prefixed final line is ever a directive
+    // candidate. A normal reply is returned untouched with no logging.
+    if !last_line.starts_with("JESSE_") {
+        return (reply.to_string(), None);
+    }
+
+    // Over-cap: a directive-shaped final line that is too long is not parsed —
+    // pass it through visible and log (loud failure over silent loss).
+    if last_line.len() > MAX_DIRECTIVE_LINE_BYTES {
+        eprintln!(
+            "directive: final line looks like a directive but exceeds the \
+             {MAX_DIRECTIVE_LINE_BYTES}-byte cap — passing through untouched"
+        );
+        return (reply.to_string(), None);
+    }
+
+    // Shape: `JESSE_<NAME> v<N> {json}`.
+    let Some((name, version, json)) = parse_directive_shape(last_line) else {
+        eprintln!(
+            "directive: final line starts with JESSE_ but is not a valid \
+             `JESSE_<NAME> v<N> {{json}}` directive — passing through untouched"
+        );
+        return (reply.to_string(), None);
+    };
+
+    // Registry: exactly the known (name, version) pairs are recognized. Unknown
+    // names or versions pass through untouched and VISIBLE — a loud contract
+    // failure the operator/agent can see, never a silent strip.
+    match (name, version) {
+        ("JESSE_NEEDS_HEALTH", 1) => match parse_needs_health(json) {
+            Ok(needs_health) => {
+                let directives = Directives {
+                    needs_health: Some(needs_health),
+                };
+                (strip_final_line(reply), Some(directives))
+            }
+            Err(reason) => {
+                eprintln!(
+                    "directive: JESSE_NEEDS_HEALTH v1 payload rejected ({reason}) — \
+                     passing through untouched"
+                );
+                (reply.to_string(), None)
+            }
+        },
+        _ => {
+            eprintln!(
+                "directive: unknown directive `{name} v{version}` — passing through \
+                 untouched (visible contract failure)"
+            );
+            (reply.to_string(), None)
+        }
+    }
+}
+
+/// Split a candidate line into `(name, version, json)` if it matches
+/// `JESSE_<NAME> v<N> {json…}`. The version token is `v` followed by digits; the
+/// remainder must begin with `{`. Returns `None` for anything off-shape.
+fn parse_directive_shape(line: &str) -> Option<(&str, u32, &str)> {
+    let mut parts = line.splitn(3, ' ');
+    let name = parts.next()?;
+    let version_token = parts.next()?;
+    let json = parts.next()?.trim();
+    if !name.starts_with("JESSE_") {
+        return None;
+    }
+    let version: u32 = version_token.strip_prefix('v')?.parse().ok()?;
+    if !json.starts_with('{') {
+        return None;
+    }
+    Some((name, version, json))
+}
+
+/// Remove the final non-empty line (the directive) from a reply, trimming any
+/// trailing whitespace left behind. For a `JESSE_NEEDS_HEALTH` turn the reply is
+/// the directive line alone, so this yields `""` — an empty answer the app does
+/// not persist (it retries with the data attached instead).
+fn strip_final_line(reply: &str) -> String {
+    let trimmed_reply = reply.trim_end();
+    match trimmed_reply.rfind('\n') {
+        Some(nl) => trimmed_reply[..nl].trim_end().to_string(),
+        None => String::new(),
+    }
+}
+
+/// Parse + validate the JSON payload of a `JESSE_NEEDS_HEALTH v1` directive
+/// against the contract: `sections` ⊆ {daily, workouts}; `metrics` a list (cap
+/// [`MAX_NEEDS_HEALTH_METRICS`]) of `{metric, window_days}` with `metric` on the
+/// [`NEEDS_HEALTH_METRICS`] whitelist and `window_days` an integer in
+/// [`NEEDS_HEALTH_WINDOW_DAYS`]; at least one of sections/metrics present. Any
+/// violation is an `Err(reason)` the caller logs and passes through — a bad
+/// directive never becomes a partial or wrong request.
+fn parse_needs_health(json: &str) -> Result<NeedsHealth, String> {
+    let value: Value = serde_json::from_str(json).map_err(|e| format!("invalid JSON: {e}"))?;
+    let obj = value.as_object().ok_or("payload is not a JSON object")?;
+
+    // Reject unknown keys so a typo'd field (e.g. "section") is a loud failure
+    // rather than silently dropping the request.
+    for key in obj.keys() {
+        if key != "sections" && key != "metrics" {
+            return Err(format!("unknown field {key:?}"));
+        }
+    }
+
+    let sections = match obj.get("sections") {
+        None | Some(Value::Null) => Vec::new(),
+        Some(Value::Array(items)) => {
+            let mut out = Vec::with_capacity(items.len());
+            for item in items {
+                let s = item.as_str().ok_or("section entry is not a string")?;
+                if !NEEDS_HEALTH_SECTIONS.contains(&s) {
+                    return Err(format!("unknown section {s:?}"));
+                }
+                out.push(s.to_string());
+            }
+            out
+        }
+        Some(_) => return Err("`sections` is not an array".into()),
+    };
+
+    let metrics = match obj.get("metrics") {
+        None | Some(Value::Null) => Vec::new(),
+        Some(Value::Array(items)) => {
+            if items.len() > MAX_NEEDS_HEALTH_METRICS {
+                return Err(format!(
+                    "`metrics` has {} entries, cap is {MAX_NEEDS_HEALTH_METRICS}",
+                    items.len()
+                ));
+            }
+            let mut out = Vec::with_capacity(items.len());
+            for item in items {
+                let m = item.as_object().ok_or("metric entry is not an object")?;
+                for key in m.keys() {
+                    if key != "metric" && key != "window_days" {
+                        return Err(format!("unknown metric field {key:?}"));
+                    }
+                }
+                let metric = m
+                    .get("metric")
+                    .and_then(|x| x.as_str())
+                    .ok_or("metric entry missing string `metric`")?;
+                if !NEEDS_HEALTH_METRICS.contains(&metric) {
+                    return Err(format!("unknown metric {metric:?}"));
+                }
+                // as_u64 rejects negatives and non-integer floats (e.g. 14.5),
+                // so a window is always a whole positive count.
+                let window = m
+                    .get("window_days")
+                    .and_then(|x| x.as_u64())
+                    .ok_or("metric entry missing integer `window_days`")?;
+                if !NEEDS_HEALTH_WINDOW_DAYS.contains(&window) {
+                    return Err(format!(
+                        "window_days {window} out of range {}..={}",
+                        NEEDS_HEALTH_WINDOW_DAYS.start(),
+                        NEEDS_HEALTH_WINDOW_DAYS.end()
+                    ));
+                }
+                out.push(MetricRequest {
+                    metric: metric.to_string(),
+                    window_days: window as u32,
+                });
+            }
+            out
+        }
+        Some(_) => return Err("`metrics` is not an array".into()),
+    };
+
+    if sections.is_empty() && metrics.is_empty() {
+        return Err("at least one of `sections`/`metrics` must be present".into());
+    }
+    Ok(NeedsHealth { sections, metrics })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn needs_health(reply: &str) -> Option<NeedsHealth> {
+        extract_directives(reply).1.and_then(|d| d.needs_health)
+    }
+
+    #[test]
+    fn absent_directive_leaves_text_untouched() {
+        let reply = "Here is your answer.\n\nSecond paragraph.";
+        let (text, directives) = extract_directives(reply);
+        assert_eq!(text, reply);
+        assert!(directives.is_none());
+    }
+
+    #[test]
+    fn empty_reply_is_untouched() {
+        let (text, directives) = extract_directives("");
+        assert_eq!(text, "");
+        assert!(directives.is_none());
+    }
+
+    #[test]
+    fn known_directive_is_parsed_and_stripped_sections() {
+        let reply = "JESSE_NEEDS_HEALTH v1 {\"sections\":[\"daily\",\"workouts\"]}";
+        let (text, directives) = extract_directives(reply);
+        // The sentinel-only reply strips to empty.
+        assert_eq!(text, "");
+        let nh = directives.unwrap().needs_health.unwrap();
+        assert_eq!(nh.sections, vec!["daily", "workouts"]);
+        assert!(nh.metrics.is_empty());
+    }
+
+    #[test]
+    fn known_directive_metrics_are_parsed() {
+        let reply =
+            "JESSE_NEEDS_HEALTH v1 {\"metrics\":[{\"metric\":\"restingHeartRate\",\"window_days\":14}]}";
+        let nh = needs_health(reply).unwrap();
+        assert!(nh.sections.is_empty());
+        assert_eq!(
+            nh.metrics,
+            vec![MetricRequest {
+                metric: "restingHeartRate".into(),
+                window_days: 14
+            }]
+        );
+    }
+
+    #[test]
+    fn directive_strips_only_the_final_line_keeping_prose() {
+        // A future directive type may follow real prose; only the final line goes.
+        let reply = "Sure, here is what I found so far.\n\nJESSE_NEEDS_HEALTH v1 {\"sections\":[\"daily\"]}";
+        let (text, directives) = extract_directives(reply);
+        assert_eq!(text, "Sure, here is what I found so far.");
+        assert!(directives.unwrap().needs_health.is_some());
+    }
+
+    #[test]
+    fn directive_under_trailing_newlines_still_recognized() {
+        let reply = "JESSE_NEEDS_HEALTH v1 {\"sections\":[\"daily\"]}\n\n";
+        let (text, directives) = extract_directives(reply);
+        assert_eq!(text, "");
+        assert!(directives.is_some());
+    }
+
+    #[test]
+    fn non_final_directive_line_is_not_recognized() {
+        // Only the FINAL non-empty line is a directive; one mid-reply is prose.
+        let reply = "JESSE_NEEDS_HEALTH v1 {\"sections\":[\"daily\"]}\nBut actually here is your answer.";
+        let (text, directives) = extract_directives(reply);
+        assert_eq!(text, reply);
+        assert!(directives.is_none());
+    }
+
+    #[test]
+    fn unknown_name_passes_through_visible() {
+        let reply = "JESSE_MEAL_LOG v1 {\"foo\":1}";
+        let (text, directives) = extract_directives(reply);
+        assert_eq!(text, reply, "unknown directive stays visible in the text");
+        assert!(directives.is_none());
+    }
+
+    #[test]
+    fn unknown_version_passes_through_visible() {
+        let reply = "JESSE_NEEDS_HEALTH v2 {\"sections\":[\"daily\"]}";
+        let (text, directives) = extract_directives(reply);
+        assert_eq!(text, reply);
+        assert!(directives.is_none());
+    }
+
+    #[test]
+    fn malformed_shape_passes_through_visible() {
+        for reply in [
+            "JESSE_NEEDS_HEALTH {\"sections\":[\"daily\"]}", // no version token
+            "JESSE_NEEDS_HEALTH v1 not-json",               // remainder not an object
+            "JESSE_NEEDS_HEALTH vX {\"sections\":[\"daily\"]}", // non-numeric version
+        ] {
+            let (text, directives) = extract_directives(reply);
+            assert_eq!(text, reply, "malformed directive stays visible: {reply:?}");
+            assert!(directives.is_none(), "no field for malformed: {reply:?}");
+        }
+    }
+
+    #[test]
+    fn invalid_payload_passes_through_visible() {
+        for reply in [
+            // empty (neither sections nor metrics)
+            "JESSE_NEEDS_HEALTH v1 {}",
+            // unknown section
+            "JESSE_NEEDS_HEALTH v1 {\"sections\":[\"weather\"]}",
+            // unknown metric
+            "JESSE_NEEDS_HEALTH v1 {\"metrics\":[{\"metric\":\"bloodPressure\",\"window_days\":7}]}",
+            // window out of range (low)
+            "JESSE_NEEDS_HEALTH v1 {\"metrics\":[{\"metric\":\"stepCount\",\"window_days\":0}]}",
+            // window out of range (high)
+            "JESSE_NEEDS_HEALTH v1 {\"metrics\":[{\"metric\":\"stepCount\",\"window_days\":32}]}",
+            // non-integer window
+            "JESSE_NEEDS_HEALTH v1 {\"metrics\":[{\"metric\":\"stepCount\",\"window_days\":7.5}]}",
+            // too many metrics (5 > cap 4)
+            "JESSE_NEEDS_HEALTH v1 {\"metrics\":[\
+             {\"metric\":\"stepCount\",\"window_days\":1},\
+             {\"metric\":\"heartRate\",\"window_days\":1},\
+             {\"metric\":\"bodyMass\",\"window_days\":1},\
+             {\"metric\":\"vo2Max\",\"window_days\":1},\
+             {\"metric\":\"restingHeartRate\",\"window_days\":1}]}",
+            // unknown field
+            "JESSE_NEEDS_HEALTH v1 {\"section\":[\"daily\"]}",
+        ] {
+            let (text, directives) = extract_directives(reply);
+            assert_eq!(text, reply, "invalid payload stays visible: {reply:?}");
+            assert!(directives.is_none(), "no field for invalid: {reply:?}");
+        }
+    }
+
+    #[test]
+    fn window_boundaries_are_accepted() {
+        for window in [1u32, 31] {
+            let reply = format!(
+                "JESSE_NEEDS_HEALTH v1 {{\"metrics\":[{{\"metric\":\"stepCount\",\"window_days\":{window}}}]}}"
+            );
+            let nh = needs_health(&reply).expect("boundary window accepted");
+            assert_eq!(nh.metrics[0].window_days, window);
+        }
+    }
+
+    #[test]
+    fn max_metrics_are_accepted_at_the_cap() {
+        let reply = "JESSE_NEEDS_HEALTH v1 {\"metrics\":[\
+             {\"metric\":\"stepCount\",\"window_days\":1},\
+             {\"metric\":\"heartRate\",\"window_days\":1},\
+             {\"metric\":\"bodyMass\",\"window_days\":1},\
+             {\"metric\":\"vo2Max\",\"window_days\":1}]}";
+        let nh = needs_health(reply).expect("exactly the cap is accepted");
+        assert_eq!(nh.metrics.len(), MAX_NEEDS_HEALTH_METRICS);
+    }
+
+    #[test]
+    fn over_cap_line_passes_through_visible() {
+        // A directive-shaped final line over the byte cap is not parsed.
+        let filler = "x".repeat(MAX_DIRECTIVE_LINE_BYTES);
+        let reply = format!("JESSE_NEEDS_HEALTH v1 {{\"note\":\"{filler}\"}}");
+        assert!(reply.len() > MAX_DIRECTIVE_LINE_BYTES);
+        let (text, directives) = extract_directives(&reply);
+        assert_eq!(text, reply);
+        assert!(directives.is_none());
+    }
+
+    #[test]
+    fn all_whitelisted_metrics_are_accepted() {
+        for metric in NEEDS_HEALTH_METRICS {
+            let reply = format!(
+                "JESSE_NEEDS_HEALTH v1 {{\"metrics\":[{{\"metric\":\"{metric}\",\"window_days\":7}}]}}"
+            );
+            let nh = needs_health(&reply).unwrap_or_else(|| panic!("metric {metric} must parse"));
+            assert_eq!(nh.metrics[0].metric, *metric);
+        }
+    }
+
+    #[test]
+    fn directives_to_value_round_trips_and_nulls() {
+        assert_eq!(directives_to_value(&None), Value::Null);
+        let d = Directives {
+            needs_health: Some(NeedsHealth {
+                sections: vec!["daily".into()],
+                metrics: vec![MetricRequest {
+                    metric: "restingHeartRate".into(),
+                    window_days: 14,
+                }],
+            }),
+        };
+        let v = directives_to_value(&Some(d));
+        assert_eq!(v["needs_health"]["sections"][0], "daily");
+        assert_eq!(v["needs_health"]["metrics"][0]["metric"], "restingHeartRate");
+        assert_eq!(v["needs_health"]["metrics"][0]["window_days"], 14);
+    }
+
+    #[test]
+    fn empty_vecs_are_omitted_on_the_wire() {
+        // sections present, metrics empty → the `metrics` key is omitted.
+        let d = Directives {
+            needs_health: Some(NeedsHealth {
+                sections: vec!["daily".into()],
+                metrics: vec![],
+            }),
+        };
+        let v = directives_to_value(&Some(d));
+        assert!(v["needs_health"].get("metrics").is_none());
+        assert_eq!(v["needs_health"]["sections"][0], "daily");
+    }
+
+    #[test]
+    fn apply_directives_threads_through_ok_and_err() {
+        // Ok: strips + attaches.
+        let ok = apply_directives(Ok((
+            "answer\nJESSE_NEEDS_HEALTH v1 {\"sections\":[\"daily\"]}".into(),
+            Some("sess-1".into()),
+        )))
+        .unwrap();
+        assert_eq!(ok.0, "answer");
+        assert_eq!(ok.1.as_deref(), Some("sess-1"));
+        assert!(ok.2.unwrap().needs_health.is_some());
+        // Err: passed through unchanged.
+        let err = apply_directives(Err((StatusCode::BAD_GATEWAY, "boom".into())));
+        assert!(err.is_err());
+    }
+}

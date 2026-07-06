@@ -137,7 +137,7 @@ use tower::ServiceExt;
         let st1 = AppState::new(cfg1);
         let id = st1.jobs.create();
         st1.jobs
-            .complete(&id, Ok(("survives reboot".to_string(), Some("sess-r".to_string()))));
+            .complete(&id, Ok(("survives reboot".to_string(), Some("sess-r".to_string()), None)));
         st1.jobs.flush_persistence(); // wait for the off-lock worker to write
 
         // New AppState over the same dir = the bridge restarting.
@@ -224,7 +224,7 @@ use tower::ServiceExt;
         let st = test_state();
         let id = st.jobs.create();
         st.jobs
-            .complete(&id, Ok(("keep me".to_string(), Some("sess-k".to_string()))));
+            .complete(&id, Ok(("keep me".to_string(), Some("sess-k".to_string()), None)));
 
         let resp = app(st.clone())
             .oneshot(cancel_request(Some("Bearer test-token"), &id))
@@ -377,9 +377,9 @@ use tower::ServiceExt;
         // run timeout — instead of blocking on the pipe until the timeout fires.
         //
         // FAILING-FIRST: against the pre-fix read-to-EOF loop the `sleep` holds
-        // stdout open, so `next_line()` blocks until the 2s timeout converts the
-        // turn into a GATEWAY_TIMEOUT failure — the job is never `done`, so the
-        // assertion below (done within ~1.5s) fails.
+        // stdout open, so `next_line()` blocks until the run timeout converts the
+        // turn into a GATEWAY_TIMEOUT failure — the job is never `done` inside the
+        // (short, sub-timeout) poll window below, so the assertion fails.
         let script = "#!/bin/sh\n\
              printf '%s\\n' '{\"type\":\"stream_event\",\"event\":{\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\"answer\"}}}'\n\
              printf '%s\\n' '{\"type\":\"result\",\"is_error\":false,\"result\":\"the answer\",\"session_id\":\"sess-rl\"}'\n\
@@ -387,7 +387,10 @@ use tower::ServiceExt;
         let fake = write_fake_claude(script);
         let cfg = Config {
             claude_bin: fake.to_string_lossy().into_owned(),
-            timeout_secs: 2, // short run limit — Done must beat it, not race it
+            // Generous run limit so CPU starvation under a fully-parallel test run
+            // can't race the wall clock; the poll window below is what proves Done
+            // comes from the result line (near-instant) and not the child exiting.
+            timeout_secs: 20,
             ..test_config()
         };
         let st = AppState::new(cfg);
@@ -403,11 +406,12 @@ use tower::ServiceExt;
         let body: Value = serde_json::from_str(&body_string(resp).await).unwrap();
         let job_id = body["job_id"].as_str().unwrap().to_string();
 
-        // Poll only up to 1.5s — comfortably under the 2s timeout. The turn must
-        // be `done` from the result line by then; if completion still waited on
-        // child exit it would still be `running` here (and fail at 2s).
+        // Poll up to ~3s — far under the 20s run limit. Completion is driven by
+        // the result line (near-instant), so `done` lands well inside this window;
+        // if completion still waited on child stdout EOF the turn would sit
+        // `running` for the full 20s and this window would expire with no `done`.
         let mut done = None;
-        for _ in 0..30 {
+        for _ in 0..60 {
             tokio::time::sleep(Duration::from_millis(50)).await;
             let v = result_status(&st, &job_id).await;
             if v["status"] == "done" {
@@ -672,7 +676,7 @@ use tower::ServiceExt;
         let id = st.jobs.create();
         st.jobs.complete(
             &id,
-            Ok(("the whole answer".to_string(), Some("sess-done".to_string()))),
+            Ok(("the whole answer".to_string(), Some("sess-done".to_string()), None)),
         );
 
         let resp = app(st.clone())
@@ -1022,7 +1026,7 @@ use tower::ServiceExt;
         st.devices.set("tok".to_string());
 
         let id = st.jobs.create();
-        st.jobs.complete(&id, Ok(("already done".to_string(), None)));
+        st.jobs.complete(&id, Ok(("already done".to_string(), None, None)));
 
         let resp = app(st.clone())
             .oneshot(notify_request(Some("Bearer test-token"), &id))
@@ -1235,3 +1239,184 @@ use tower::ServiceExt;
         assert_eq!(v["response"], "done fast");
         let _ = std::fs::remove_file(&fake);
     }
+
+// ---- Agent-emitted directives (JESSE_NEEDS_HEALTH) end-to-end ---------------
+//
+// These drive a real turn through POST /jesse with a fake `claude` that emits a
+// terminal `result` line whose text ends in a directive, then assert the reply
+// is stripped and the parsed directive surfaces IDENTICALLY on the poll result
+// and the SSE `done` frame.
+
+// Spawn a turn whose fake `claude` emits exactly `stdout_line` (one NDJSON line),
+// poll until Done, and return `(state, job_id)`. `stdout_line` is wrapped in
+// single quotes for `printf`, so it must contain no single quote (JSON uses
+// double quotes) — and is concatenated, not `format!`'d, so its `{}` are literal.
+async fn run_turn_emitting(req_json: &str, stdout_line: &str) -> (AppState, String) {
+    let script = String::from("#!/bin/sh\nprintf '%s' '") + stdout_line + "'\n";
+    let fake = write_fake_claude(&script);
+    let cfg = Config {
+        claude_bin: fake.to_string_lossy().into_owned(),
+        timeout_secs: 30,
+        ..test_config()
+    };
+    let st = AppState::new(cfg);
+    let resp = app(st.clone())
+        .oneshot(jesse_request(Some("Bearer test-token"), req_json))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::ACCEPTED);
+    let body: Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    let job_id = body["job_id"].as_str().unwrap().to_string();
+    for _ in 0..80 {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        if result_status(&st, &job_id).await["status"] == "done" {
+            let _ = std::fs::remove_file(&fake);
+            return (st, job_id);
+        }
+    }
+    let _ = std::fs::remove_file(&fake);
+    panic!("turn did not complete");
+}
+
+#[tokio::test]
+async fn directive_is_extracted_and_stripped_on_the_poll_result() {
+    // A reply whose final line is a valid JESSE_NEEDS_HEALTH directive comes back
+    // with the line STRIPPED and the parsed value under `directives.needs_health`.
+    // FAILING-FIRST: without `apply_directives` between run_claude and complete,
+    // the response still contains the sentinel line and `directives` is null.
+    let line = r#"{"type":"result","is_error":false,"result":"Here you go.\nJESSE_NEEDS_HEALTH v1 {\"sections\":[\"daily\"],\"metrics\":[{\"metric\":\"restingHeartRate\",\"window_days\":14}]}","session_id":"sess-dir"}"#;
+    let (st, job_id) = run_turn_emitting(r#"{"mode":"ask","text":"how am I doing?"}"#, line).await;
+    let v = result_status(&st, &job_id).await;
+    assert_eq!(v["response"], "Here you go.", "directive line stripped from the reply");
+    assert!(!v["response"].as_str().unwrap().contains("JESSE_NEEDS_HEALTH"));
+    assert_eq!(v["directives"]["needs_health"]["sections"][0], "daily");
+    assert_eq!(v["directives"]["needs_health"]["metrics"][0]["metric"], "restingHeartRate");
+    assert_eq!(v["directives"]["needs_health"]["metrics"][0]["window_days"], 14);
+    assert_eq!(v["session_id"], "sess-dir");
+}
+
+#[tokio::test]
+async fn directive_is_extracted_on_the_sse_done_frame_consistently() {
+    // The SSE `done` frame carries the SAME stripped text + directives as the
+    // poll — the two terminal paths are kept consistent.
+    let line = r#"{"type":"result","is_error":false,"result":"JESSE_NEEDS_HEALTH v1 {\"metrics\":[{\"metric\":\"heartRateVariabilitySDNN\",\"window_days\":7}]}","session_id":"sess-sse"}"#;
+    let (st, job_id) = run_turn_emitting(r#"{"mode":"ask","text":"recovery?"}"#, line).await;
+    // Poll: sentinel-only reply strips to empty, directive attached.
+    let v = result_status(&st, &job_id).await;
+    assert_eq!(v["response"], "", "a sentinel-only reply strips to empty text");
+    assert_eq!(v["directives"]["needs_health"]["metrics"][0]["metric"], "heartRateVariabilitySDNN");
+    // SSE (already-terminal path): the done frame's JSON data carries directives.
+    let resp = app(st.clone())
+        .oneshot(stream_request(Some("Bearer test-token"), &job_id))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let sse = body_string(resp).await;
+    assert!(sse.contains("event: done"), "expected a done frame: {sse}");
+    assert!(sse.contains("needs_health"), "done frame must carry directives: {sse}");
+    assert!(sse.contains("heartRateVariabilitySDNN"), "metric name in done frame: {sse}");
+}
+
+#[tokio::test]
+async fn unknown_directive_passes_through_visible_with_no_field() {
+    // An unknown directive name is a loud contract failure: the line stays VISIBLE
+    // in the reply and no `directives` field is attached.
+    let line = r#"{"type":"result","is_error":false,"result":"JESSE_MEAL_LOG v1 {\"foo\":1}","session_id":"sess-unk"}"#;
+    let (st, job_id) = run_turn_emitting(r#"{"mode":"tell","text":"log lunch"}"#, line).await;
+    let v = result_status(&st, &job_id).await;
+    assert_eq!(v["response"], "JESSE_MEAL_LOG v1 {\"foo\":1}", "unknown directive stays visible");
+    assert!(v["directives"].is_null(), "no directives for an unknown name");
+}
+
+#[tokio::test]
+async fn plain_reply_has_null_directives() {
+    // The overwhelmingly common case: an ordinary answer, unchanged, directives null.
+    let line = r#"{"type":"result","is_error":false,"result":"Your inbox has three threads.","session_id":"sess-plain"}"#;
+    let (st, job_id) = run_turn_emitting(r#"{"mode":"ask","text":"summarize my inbox"}"#, line).await;
+    let v = result_status(&st, &job_id).await;
+    assert_eq!(v["response"], "Your inbox has three threads.");
+    assert!(v.get("directives").is_some(), "the directives key is always present");
+    assert!(v["directives"].is_null(), "plain reply has null directives");
+}
+
+#[tokio::test]
+async fn jesse_accepts_health_request_and_unavailable_fields() {
+    // The two new optional flags are #[serde(default)] — a body carrying them must
+    // still decode (a bad mode then 400s, proving the body parsed first).
+    let resp = app(test_state())
+        .oneshot(jesse_request(
+            Some("Bearer test-token"),
+            r#"{"mode":"nope","text":"hi","health_context_requested":true,"health_context_unavailable":false}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
+
+// Capture the exact prompt that reaches `claude` for a given request body.
+async fn captured_turn_prompt(req_json: &str) -> String {
+    let promptfile = std::env::temp_dir().join(format!(
+        "jesse-dir-prompt-{}-{}.txt",
+        std::process::id(),
+        JOB_COUNTER.fetch_add(1, Ordering::Relaxed)
+    ));
+    let _ = std::fs::remove_file(&promptfile);
+    let script = format!(
+        "#!/bin/sh\n\
+         printf '%s' \"$2\" > '{}'\n\
+         printf '%s' '{{\"type\":\"result\",\"is_error\":false,\"result\":\"ok\",\"session_id\":\"sess-p\"}}'\n",
+        promptfile.display()
+    );
+    let fake = write_fake_claude(&script);
+    let cfg = Config {
+        claude_bin: fake.to_string_lossy().into_owned(),
+        timeout_secs: 30,
+        ..test_config()
+    };
+    let st = AppState::new(cfg);
+    let resp = app(st.clone())
+        .oneshot(jesse_request(Some("Bearer test-token"), req_json))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::ACCEPTED);
+    let body: Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    let job_id = body["job_id"].as_str().unwrap().to_string();
+    for _ in 0..80 {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        if result_status(&st, &job_id).await["status"] == "done" {
+            break;
+        }
+    }
+    let prompt = std::fs::read_to_string(&promptfile).expect("fake claude records the prompt");
+    let _ = std::fs::remove_file(&fake);
+    let _ = std::fs::remove_file(&promptfile);
+    prompt
+}
+
+#[tokio::test]
+async fn wrapper_carries_request_instruction_without_context_and_present_note_with() {
+    // No health_context → the agent is told how to ask (JESSE_NEEDS_HEALTH).
+    let without = captured_turn_prompt(r#"{"mode":"ask","text":"how am I doing?"}"#).await;
+    assert!(without.contains("JESSE_NEEDS_HEALTH v1"), "request instruction present: {without}");
+    assert!(!without.contains("do not emit JESSE_NEEDS_HEALTH"), "not the present note");
+    // With health_context → the present note; do not ask.
+    let with = captured_turn_prompt(
+        r#"{"mode":"ask","text":"log my swim","health_context":"Swim 30m 1500m"}"#,
+    )
+    .await;
+    assert!(with.contains("do not emit JESSE_NEEDS_HEALTH"), "present note: {with}");
+}
+
+#[tokio::test]
+async fn health_context_cap_is_8_kib() {
+    // The cap rose 4→8 KiB. Exactly at 8 KiB is accepted; one byte over is 413
+    // before any spawn (the const is the single source of truth).
+    assert_eq!(MAX_HEALTH_CONTEXT_BYTES, 8 * 1024, "cap is 8 KiB");
+    let at_cap = "y".repeat(MAX_HEALTH_CONTEXT_BYTES);
+    let json = format!(r#"{{"mode":"ask","text":"hi","health_context":"{at_cap}"}}"#);
+    let resp = app(test_state())
+        .oneshot(jesse_request(Some("Bearer test-token"), &json))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::ACCEPTED, "a block at exactly 8 KiB is accepted");
+}

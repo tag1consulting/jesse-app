@@ -33,6 +33,18 @@ pub struct JesseRequest {
     // class as `text`: attacker-controlled only if the phone is.
     #[serde(default)]
     health_context: Option<String>,
+    // This turn is a retry answering a prior `JESSE_NEEDS_HEALTH` directive: the
+    // app fetched the requested data and re-sent the SAME question with it in
+    // `health_context`. Informational — the wrapper frames the attached data as
+    // "requested or attached, don't ask again." Absent/false on an ordinary turn.
+    #[serde(default)]
+    health_context_requested: Option<bool>,
+    // The app could NOT fulfill a health request this turn (Health access denied,
+    // device locked, read timed out, or the feature toggle is off). The wrapper
+    // then tells the agent to answer from vault data without re-requesting, so the
+    // request→retry channel can never loop. Absent/false on an ordinary turn.
+    #[serde(default)]
+    health_context_unavailable: Option<bool>,
 }
 
 /// Body of `POST /jesse/device`: the phone's APNs device token (hex string).
@@ -110,6 +122,8 @@ pub async fn jesse(
         req.instructions.as_deref(),
         req.floor_override.as_deref(),
         req.health_context.as_deref(),
+        req.health_context_requested.unwrap_or(false),
+        req.health_context_unavailable.unwrap_or(false),
     )?;
 
     // Concurrency cap (C3): take a permit before spawning the turn. If none is
@@ -185,6 +199,11 @@ pub async fn jesse(
         let mut guard = TurnGuard::new(jobs.clone(), jid.clone());
 
         let outcome = run_claude_streaming(&cfg, &prompt, sid.as_deref(), &jobs, &jid).await;
+        // Extract any agent-emitted directive from the reply's final line before
+        // the result lands: a recognized directive is stripped from the text and
+        // attached under `directives`, so the poll result and the SSE `done`
+        // frame both carry the same value. A non-directive reply is unchanged.
+        let outcome = apply_directives(outcome);
         jobs.complete(&jid, outcome);
         // Close the live stream with the frame matching the state that actually
         // landed. `complete` is write-once, so a cancel that won the race already
@@ -251,10 +270,12 @@ pub async fn jesse_result(
         Some(JobState::Done {
             response,
             session_id,
+            directives,
         }) => Ok(Json(json!({
             "status": "done",
             "response": response,
             "session_id": session_id,
+            "directives": directives_to_value(&directives),
         }))),
         Some(JobState::Failed { error }) => {
             Ok(Json(json!({ "status": "failed", "error": error })))

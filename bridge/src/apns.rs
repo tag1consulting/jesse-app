@@ -591,7 +591,8 @@ mod tests {
     fn pushable_only_for_done_or_failed() {
         assert!(job_state_is_pushable(&JobState::Done {
             response: "x".into(),
-            session_id: None
+            session_id: None,
+            directives: None
         }));
         assert!(job_state_is_pushable(&JobState::Failed { error: "x".into() }));
         assert!(!job_state_is_pushable(&JobState::Cancelled));
@@ -606,7 +607,7 @@ mod tests {
 
         let id = st.jobs.create();
         st.jobs
-            .complete(&id, Ok(("the answer".to_string(), Some("sess-1".to_string()))));
+            .complete(&id, Ok(("the answer".to_string(), Some("sess-1".to_string()), None)));
         st.notify.insert(&id);
 
         notify_if_complete(st.apns.as_deref(), &st.devices, &st.notify, &st.jobs, &id).await;
@@ -627,7 +628,7 @@ mod tests {
         st.devices.set("abc123devicetoken".to_string());
 
         let id = st.jobs.create();
-        st.jobs.complete(&id, Ok(("the answer".to_string(), None)));
+        st.jobs.complete(&id, Ok(("the answer".to_string(), None, None)));
         // No notify.insert — the turn finished in the foreground.
 
         notify_if_complete(st.apns.as_deref(), &st.devices, &st.notify, &st.jobs, &id).await;
@@ -640,7 +641,7 @@ mod tests {
         st.apns = Some(test_apns(Arc::new(mock.clone())));
         // No device registered.
         let id = st.jobs.create();
-        st.jobs.complete(&id, Ok(("a".to_string(), None)));
+        st.jobs.complete(&id, Ok(("a".to_string(), None, None)));
         st.notify.insert(&id);
         notify_if_complete(st.apns.as_deref(), &st.devices, &st.notify, &st.jobs, &id).await;
         assert_eq!(mock.calls.lock_ok().len(), 0, "no token → no push");
@@ -672,14 +673,14 @@ mod tests {
 
         let id = st.jobs.create();
         st.jobs
-            .complete(&id, Ok(("durable answer".to_string(), Some("sess-9".to_string()))));
+            .complete(&id, Ok(("durable answer".to_string(), Some("sess-9".to_string()), None)));
         st.notify.insert(&id);
 
         notify_if_complete(st.apns.as_deref(), &st.devices, &st.notify, &st.jobs, &id).await;
 
         assert_eq!(mock.calls.lock_ok().len(), 1, "the send was attempted");
         match st.jobs.get(&id) {
-            Some(JobState::Done { response, session_id }) => {
+            Some(JobState::Done { response, session_id, .. }) => {
                 assert_eq!(response, "durable answer", "result intact after a push failure");
                 assert_eq!(session_id.as_deref(), Some("sess-9"));
             }
@@ -694,7 +695,7 @@ mod tests {
         assert!(st.apns.is_none());
         st.devices.set("tok".to_string());
         let id = st.jobs.create();
-        st.jobs.complete(&id, Ok(("a".to_string(), None)));
+        st.jobs.complete(&id, Ok(("a".to_string(), None, None)));
         st.notify.insert(&id);
         // Just must not panic; there's no transport to record against.
         notify_if_complete(st.apns.as_deref(), &st.devices, &st.notify, &st.jobs, &id).await;
@@ -715,7 +716,7 @@ mod tests {
         notify_if_complete(st.apns.as_deref(), &st.devices, &st.notify, &st.jobs, &id).await;
         assert_eq!(mock.calls.lock_ok().len(), 0, "a running job isn't pushed yet");
 
-        st.jobs.complete(&id, Ok(("done now".to_string(), None)));
+        st.jobs.complete(&id, Ok(("done now".to_string(), None, None)));
         notify_if_complete(st.apns.as_deref(), &st.devices, &st.notify, &st.jobs, &id).await;
         assert_eq!(mock.calls.lock_ok().len(), 1, "completion pushes exactly once");
     }
@@ -743,7 +744,7 @@ mod tests {
         st.devices.set("deadtoken".to_string());
 
         let id = st.jobs.create();
-        st.jobs.complete(&id, Ok(("x".into(), None)));
+        st.jobs.complete(&id, Ok(("x".into(), None, None)));
         st.notify.insert(&id);
         notify_if_complete(st.apns.as_deref(), &st.devices, &st.notify, &st.jobs, &id).await;
 
@@ -764,7 +765,7 @@ mod tests {
         st.devices.set("livetoken".to_string());
 
         let id = st.jobs.create();
-        st.jobs.complete(&id, Ok(("x".into(), None)));
+        st.jobs.complete(&id, Ok(("x".into(), None, None)));
         st.notify.insert(&id);
         notify_if_complete(st.apns.as_deref(), &st.devices, &st.notify, &st.jobs, &id).await;
 

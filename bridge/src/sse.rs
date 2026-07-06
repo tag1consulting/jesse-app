@@ -46,9 +46,14 @@ pub fn frame_to_event(frame: &StreamFrame) -> Event {
         StreamFrame::Done {
             response,
             session_id,
+            directives,
         } => sse_event(
             "done",
-            json!({ "response": response, "session_id": session_id }),
+            json!({
+                "response": response,
+                "session_id": session_id,
+                "directives": directives_to_value(directives),
+            }),
         ),
         StreamFrame::Error(error) => sse_event("error", json!({ "error": error })),
         StreamFrame::Cancelled => sse_event("cancelled", json!({})),
@@ -135,11 +140,16 @@ pub async fn jesse_stream(
             Some(JobState::Done {
                 response,
                 session_id,
+                directives,
             }) => {
                 let _ = tx.try_send(Ok(sse_reset(&response)));
                 let _ = tx.try_send(Ok(sse_event(
                     "done",
-                    json!({ "response": response, "session_id": session_id }),
+                    json!({
+                        "response": response,
+                        "session_id": session_id,
+                        "directives": directives_to_value(&directives),
+                    }),
                 )));
             }
             Some(JobState::Failed { error }) => {
@@ -203,6 +213,7 @@ mod tests {
             StreamFrame::Done {
                 response: full.clone(),
                 session_id: None,
+                directives: None,
             },
         );
 

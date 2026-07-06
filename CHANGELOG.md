@@ -15,6 +15,44 @@ CI both run it). See the "Versioning" section of `bridge/README.md`.
 
 ## [Unreleased]
 
+## [Bridge 0.3.0] — 2026-07-06
+
+### Added
+- **Agent-driven directive channel (`JESSE_NEEDS_HEALTH v1`).** A generic
+  back-channel from the sandboxed agent's reply to the app: the final non-empty
+  line of a reply may be a directive `JESSE_<NAME> v<N> {json}`. The bridge
+  recognizes known directives via a small **registry** (this release ships
+  `JESSE_NEEDS_HEALTH v1`; the planned dietary write-back adds `JESSE_MEAL_LOG v1`
+  on the same extractor), parses + validates the payload against a fixed contract,
+  **strips the line** from the reply text, and attaches the parsed value under a
+  structured `directives` object on the terminal result. The `directives` field
+  is surfaced **identically on the poll result (`GET /jesse/result`) and the SSE
+  `done` frame**, and is persisted with the completed job. A directive-shaped line
+  that is malformed, over the 2 KiB line cap, or names an **unknown directive /
+  version** passes through **untouched and visible** (a loud contract failure,
+  logged) with no field attached — a wrong classification only ever costs a slower
+  answer, never a wrong one.
+- **Health-request wrapper instruction.** When a turn carries **no**
+  `health_context`, the prompt wrapper now tells the agent no Apple Health data is
+  attached and how to ask for it (emit a single `JESSE_NEEDS_HEALTH v1` line,
+  listing `sections` (`daily`/`workouts`) and/or whitelisted `metrics` with a
+  `window_days` of 1–31, at most 4, at most once per turn). When the turn **does**
+  carry `health_context`, the wrapper adds "requested or attached health data is
+  included above; do not emit JESSE_NEEDS_HEALTH."
+- **New optional request fields** `health_context_requested` and
+  `health_context_unavailable` (both `Option<bool>`, `#[serde(default)]`). The
+  first marks a retry answering a prior directive; the second tells the agent the
+  app could not fulfill a request this turn (denied/locked/timeout/toggle off) so
+  it answers from vault data and does **not** re-request — the request→retry
+  channel can never loop.
+
+### Changed
+- **`MAX_HEALTH_CONTEXT_BYTES` raised 4 KiB → 8 KiB.** A *granted* metrics request
+  (up to 4 metrics × ~31 daily lines, plus the two-section daily/workouts block)
+  needs more headroom than the original recent-workouts-only block; the app
+  hard-caps its own fulfilled response at 6 KiB, under this ceiling. An oversized
+  block is still a `413` before any spawn.
+
 ## [App 1.0 (18)] — 2026-07-06
 
 ### Changed

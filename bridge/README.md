@@ -541,13 +541,81 @@ curl -s http://127.0.0.1:8765/jesse \
   the same trust class as the message body (attacker-controlled only if the phone
   is). No new tool is granted; the agent's existing `Read`/`Write`/`Edit` +
   `Skill(diet-logging)` already cover exercise logging.
-- **Bounded.** Capped at **`MAX_HEALTH_CONTEXT_BYTES` (4 KiB)** — an oversized
-  block is refused with `413` **before any `claude` spawn** (mirroring
-  `MAX_TITLE_INPUT_BYTES`). ASCII control characters other than newline are
-  stripped before use.
+- **Bounded.** Capped at **`MAX_HEALTH_CONTEXT_BYTES` (8 KiB)** — an oversized
+  block is refused with `413` **before any `claude` spawn**. ASCII control
+  characters other than newline are stripped before use. (Raised from 4 KiB with
+  the request channel below: a *granted* metrics request can carry up to 4 metrics
+  × ~31 daily lines; the app self-caps its fulfilled response at 6 KiB, under this.)
 
 See [SECURITY.md](../SECURITY.md#recent-workouts-context-health_context) for the
 prompt-injection posture.
+
+## Agent-driven health-request channel (`JESSE_NEEDS_HEALTH`)
+
+The app no longer attaches `health_context` to every turn — it classifies each
+message and attaches the block only when it looks health-related. So the agent
+needs a way to **say when it needs device health data the app didn't send**, and
+the app needs a way for the agent to **hand back a structured request**. That is
+the directive channel.
+
+**Request instruction (agent side).** When a turn carries **no**
+`health_context`, `build_prompt` appends a note: no Apple Health data is attached
+this turn, and *if* device data is needed to answer, reply with ONLY a single
+`JESSE_NEEDS_HEALTH v1` line (documented format below), at most once per turn.
+When the turn **does** carry `health_context`, the note instead says "requested or
+attached health data is included above; do not emit JESSE_NEEDS_HEALTH."
+
+**Two new optional request fields** frame the two follow-up cases:
+
+| Field | Type | Meaning |
+|---|---|---|
+| `health_context_requested` | `Option<bool>` | This turn is a **retry** answering a prior directive — the requested data is attached in `health_context`. |
+| `health_context_unavailable` | `Option<bool>` | The app **could not** fulfill the request (Health denied, device locked, read timed out, or the feature toggle is off). The wrapper tells the agent to answer from vault data and **not** re-request, so the channel can't loop. |
+
+**Directive contract (generic, version 1).** A directive is the **final non-empty
+line** of a reply, exactly one line:
+
+```
+JESSE_<NAME> v<N> {json}
+```
+
+This release defines `JESSE_NEEDS_HEALTH v1`; a planned dietary write-back adds
+`JESSE_MEAL_LOG v1` on the same extractor. The needs-health payload:
+
+```
+JESSE_NEEDS_HEALTH v1 {"sections":["daily","workouts"],"metrics":[{"metric":"restingHeartRate","window_days":14}]}
+```
+
+- `sections` (subset of `daily`, `workouts`) and `metrics` are each optional, but
+  **at least one** must be present.
+- each `metric` is on a fixed whitelist (`restingHeartRate`, `heartRate`,
+  `heartRateVariabilitySDNN`, `stepCount`, `activeEnergyBurned`, `bodyMass`,
+  `sleepAnalysis`, `vo2Max`, `workouts`), with an integer `window_days` of 1–31;
+  the metrics array is capped at 4.
+- the directive line is capped at 2 KiB.
+
+**Extraction (bridge side).** On the terminal-result path (poll result and SSE
+`done` frame, kept consistent), when the final non-empty line matches a **known**
+directive and its payload validates, the bridge **strips the line** from the reply
+text and attaches the parsed value under a structured `directives` object on the
+result: `{ "needs_health": { ... } }`. The `directives` field is surfaced on both
+`GET /jesse/result` and the SSE `done` frame, and persisted with the job. A line
+that is malformed, over the line cap, or names an **unknown directive name /
+version** passes through **untouched and visible** (a loud contract failure,
+logged) with no field — a wrong classification only ever costs a slower answer,
+never a wrong one. The recognizer is a small **registry**, so new directive types
+are a table entry, not new plumbing.
+
+```bash
+curl -s http://127.0.0.1:8765/jesse/result/<job_id> \
+  -H "Authorization: Bearer $JESSE_TOKEN"
+# → { "status":"done", "response":"…(sentinel line stripped)…", "session_id":"…",
+#     "directives": { "needs_health": { "sections":["daily"],
+#                     "metrics":[{"metric":"restingHeartRate","window_days":14}] } } }
+```
+
+See [SECURITY.md](../SECURITY.md#agent-directive-channel-jesse_needs_health) for
+the trust analysis.
 
 ## Conversation titles (`POST /jesse/title`)
 
@@ -810,6 +878,27 @@ repo, then reads/searches/diffs it.
   (GitHub and epyc are already trusted).
 
 ## CHANGELOG
+
+- **Agent-driven directive channel + classify-then-attach health context (bridge
+  0.3.0).** Health context is no longer attached to every turn — the app
+  classifies each message and attaches the block only when relevant, and the agent
+  can now **ask** for device health data it wasn't given. Two halves:
+  - **Generic directive extraction.** The final non-empty line of a reply may be a
+    directive `JESSE_<NAME> v<N> {json}`. A small registry recognizes known
+    directives (this release: `JESSE_NEEDS_HEALTH v1`); a recognized, validating
+    directive is **stripped** from the reply and its parsed value attached under a
+    structured `directives` object, surfaced identically on the poll result and the
+    SSE `done` frame and persisted with the job. Malformed / over-cap (2 KiB line)
+    / unknown-name / unknown-version lines pass through **visible** with no field
+    (loud contract failure). See "Agent-driven health-request channel" above and
+    `SECURITY.md`.
+  - **Request instruction + new fields.** When a turn carries no `health_context`,
+    the wrapper tells the agent how to emit a `JESSE_NEEDS_HEALTH` request; when it
+    does, it says not to. New optional request fields `health_context_requested`
+    (a retry answering a prior directive) and `health_context_unavailable` (the app
+    couldn't fulfill it — answer from vault, don't re-request) frame the follow-up
+    turns. `MAX_HEALTH_CONTEXT_BYTES` rose **4 KiB → 8 KiB** to fit a granted
+    metrics request. All additive and backward-compatible.
 
 - **Optional `health_context` on `POST /jesse` (bridge 0.2.0).** A turn may carry
   a compact device-reported "recent workouts" block (from the phone's Apple
