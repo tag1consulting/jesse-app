@@ -12,6 +12,9 @@ struct ThreadListView: View {
     @Binding var path: [JesseThread]
     @Binding var config: JesseConfig
     @Binding var showSettings: Bool
+    // Set alongside `showSettings` by the first-run pairing CTA so Settings opens
+    // straight to the Scan-to-pair sheet; the gear button leaves it false.
+    @Binding var pairViaScanner: Bool
 
     // Which scope the list is showing, remembered across launches. All is the
     // default; Favorites narrows to starred threads; Watch narrows to threads
@@ -143,10 +146,30 @@ struct ThreadListView: View {
     @ViewBuilder
     private var content: some View {
         if threads.isEmpty {
-            ContentUnavailableView {
-                Label("No conversations yet", systemImage: "bubble.left.and.bubble.right")
-            } description: {
-                Text("Tap + to start one.")
+            // First-run gate: an unpaired user's first send would just error, so
+            // steer them to pairing instead of "Tap + to start". The decision is
+            // the pure, unit-tested `threadListEmptyState(for:)`.
+            switch threadListEmptyState(for: config) {
+            case .pairBridge:
+                ContentUnavailableView {
+                    Label("Pair with your Jesse bridge", systemImage: "qrcode.viewfinder")
+                } description: {
+                    Text("Jesse runs on your Mac. Scan the pairing code it prints on startup to connect — your first message needs a paired bridge.")
+                } actions: {
+                    Button {
+                        pairViaScanner = true
+                        showSettings = true
+                    } label: {
+                        Label("Scan to pair", systemImage: "qrcode.viewfinder")
+                    }
+                    .buttonStyle(.borderedProminent)
+                }
+            case .noConversations:
+                ContentUnavailableView {
+                    Label("No conversations yet", systemImage: "bubble.left.and.bubble.right")
+                } description: {
+                    Text("Tap + to start one.")
+                }
             }
         } else if visible.isEmpty {
             // A scope filter is on but nothing matches it yet. The picker above

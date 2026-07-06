@@ -15,15 +15,20 @@ struct ContentView: View {
     @State private var path: [JesseThread] = []
     @State private var config = ConfigStore.load()
     @State private var showSettings = false
+    // Raised with `showSettings` by the first-run pairing CTA so Settings opens
+    // straight to Scan-to-pair; cleared when the sheet dismisses so the gear
+    // button's ordinary Settings open never auto-presents the scanner.
+    @State private var pairViaScanner = false
 
     var body: some View {
         NavigationStack(path: $path) {
-            ThreadListView(path: $path, config: $config, showSettings: $showSettings)
+            ThreadListView(path: $path, config: $config, showSettings: $showSettings,
+                           pairViaScanner: $pairViaScanner)
                 .navigationDestination(for: JesseThread.self) { thread in
                     ThreadDetailView(thread: thread)
                 }
-                .sheet(isPresented: $showSettings) {
-                    SettingsView(config: $config)
+                .sheet(isPresented: $showSettings, onDismiss: { pairViaScanner = false }) {
+                    SettingsView(config: $config, autoPresentScanner: pairViaScanner)
                 }
         }
         .onAppear {
@@ -155,6 +160,10 @@ func settingsSaveOutcome(config: JesseConfig, persistPrompts: () -> Void) -> Sav
 
 struct SettingsView: View {
     @Binding var config: JesseConfig
+    // When true, open straight to the Scan-to-pair sheet — the first-run pairing
+    // CTA sets this so a fresh user lands on the scanner, not the full form. The
+    // gear-button open leaves it false.
+    var autoPresentScanner = false
     @Environment(\.dismiss) private var dismiss
 
     @State private var host = ""
@@ -364,6 +373,11 @@ struct SettingsView: View {
                 tellFloorText = PromptStore.override(for: .tell, .floor) ?? tellFloorDefault
                 askFloorUnlocked = false
                 tellFloorUnlocked = false
+                // First-run pairing CTA: jump straight to the scanner.
+                if autoPresentScanner {
+                    scanError = nil
+                    showScanner = true
+                }
             }
             .task { await refreshBridgeVersion() }
             .sheet(isPresented: $showScanner) {

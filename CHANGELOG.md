@@ -15,6 +15,19 @@ CI both run it). See the "Versioning" section of `bridge/README.md`.
 
 ## [Unreleased]
 
+## [App 1.0 (15)] — 2026-07-05
+
+### Added
+- **First-run pairing flow.** An unpaired user's first send just errored, with no
+  guidance. The thread list's empty state is now gated on whether the app is
+  configured (`ConfigStore.isConfigured` — host *and* bearer token both set): a
+  paired-but-empty install shows the ordinary "No conversations yet / Tap +"
+  prompt, while an unpaired one shows a **"Pair with your Jesse bridge"** call to
+  action. Tapping it opens the existing Settings sheet straight to **Scan-to-pair**
+  (both already worked; the CTA just routes to them). A half-paired config — host
+  entered but no token — still reads as unpaired, since it can't send. The gate
+  (`threadListEmptyState(for:)`) is a pure function, unit-tested failing-first.
+
 ## [App 1.0 (14)] — 2026-07-04
 
 ### Added
