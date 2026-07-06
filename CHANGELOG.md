@@ -15,6 +15,23 @@ CI both run it). See the "Versioning" section of `bridge/README.md`.
 
 ## [Unreleased]
 
+## [App 1.0 (18)] — 2026-07-06
+
+### Changed
+- **Consistent error surfacing + an offline banner.** Error presentation was
+  inconsistent: the transcript used inline color-coded text, attachments an inline
+  caption, but the **Settings Keychain-save failure was an alert** — the lone
+  outlier. That alert is now **inline red text** in the Auth section (the app's one
+  error style), keeping the sheet open on a failed token write exactly as before.
+- **Offline banner.** Mirroring the watch's `.queued` state, the conversation list
+  now shows a "can't reach your Jesse bridge" banner when a `GET /health` probe
+  comes back unreachable — so the phone signals offline **before** you compose and
+  send, not only after a send errors. The probe uses a short-timeout session (so
+  the banner appears promptly) and re-runs on launch, on foreground, and after
+  Settings closes. The show/hide decision (`shouldShowOfflineBanner`) is a pure
+  function, unit-tested failing-first; it never shows on an unpaired install (the
+  pairing CTA covers that) nor before the first probe resolves.
+
 ## [App 1.0 (17)] — 2026-07-06
 
 ### Changed

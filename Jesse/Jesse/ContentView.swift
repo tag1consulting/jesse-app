@@ -22,6 +22,14 @@ struct ContentView: View {
     // iPad/landscape gets a real two-column split; iPhone/compact keeps the stack.
     @Environment(\.horizontalSizeClass) private var sizeClass
     @State private var columnVisibility: NavigationSplitViewVisibility = .automatic
+    // Probes the bridge so the list can warn "offline" before the user composes.
+    @State private var reachability = BridgeReachabilityModel()
+
+    /// The list-level offline banner shows only when paired AND a probe came back
+    /// unreachable (pure `shouldShowOfflineBanner`).
+    private var offlineBannerVisible: Bool {
+        shouldShowOfflineBanner(isConfigured: config.isConfigured, reachability: reachability.state)
+    }
 
     /// The selected conversation, expressed over the existing `path` model so the
     /// split view's detail column and the stack's push share one source of truth:
@@ -38,7 +46,8 @@ struct ContentView: View {
                 // iPhone / compact: the original stack — unchanged behavior.
                 NavigationStack(path: $path) {
                     ThreadListView(path: $path, config: $config, showSettings: $showSettings,
-                                   pairViaScanner: $pairViaScanner, selection: selectedThread)
+                                   pairViaScanner: $pairViaScanner, selection: selectedThread,
+                                   showOfflineBanner: offlineBannerVisible)
                         .navigationDestination(for: JesseThread.self) { thread in
                             ThreadDetailView(thread: thread)
                         }
@@ -47,7 +56,8 @@ struct ContentView: View {
                 // iPad / regular: list as sidebar, conversation as detail.
                 NavigationSplitView(columnVisibility: $columnVisibility) {
                     ThreadListView(path: $path, config: $config, showSettings: $showSettings,
-                                   pairViaScanner: $pairViaScanner, selection: selectedThread)
+                                   pairViaScanner: $pairViaScanner, selection: selectedThread,
+                                   showOfflineBanner: offlineBannerVisible)
                         .navigationSplitViewColumnWidth(min: 320, ideal: 360)
                 } detail: {
                     if let thread = path.last {
@@ -65,13 +75,19 @@ struct ContentView: View {
                 .navigationSplitViewStyle(.balanced)
             }
         }
-        .sheet(isPresented: $showSettings, onDismiss: { pairViaScanner = false }) {
+        .sheet(isPresented: $showSettings, onDismiss: {
+            pairViaScanner = false
+            // Pairing may have changed host/token — re-probe so the banner reflects
+            // the new config.
+            reachability.refresh(config: config)
+        }) {
             SettingsView(config: $config, autoPresentScanner: pairViaScanner)
         }
         .onAppear {
             coordinator.resume(context: context)
             inbox.drain()
             PushManager.shared.refreshRegistration()
+            reachability.refresh(config: config)
         }
         .onChange(of: scenePhase) { _, phase in
             switch phase {
@@ -81,6 +97,8 @@ struct ContentView: View {
                 // Re-register the device token (covers a token change / bridge
                 // restart / host change since last launch).
                 PushManager.shared.refreshRegistration()
+                // Re-probe reachability so the offline banner is current on return.
+                reachability.refresh(config: config)
             case .background:
                 // "I'm leaving, ping me": ask the bridge to push when any
                 // still-in-flight turn finishes, so it only pushes when needed.
@@ -209,9 +227,11 @@ struct SettingsView: View {
 
     @State private var showScanner = false
     @State private var scanError: String?
-    // Set when the Keychain write fails; drives the save-error alert so the sheet
-    // stays open instead of silently dismissing on a token that never persisted.
-    @State private var showSaveError = false
+    // Set when the Keychain write fails. Surfaced inline in the Auth section (the
+    // same pattern as `scanError`), keeping the sheet open instead of dismissing on
+    // a token that never persisted — the app's one error style is inline, not an
+    // alert, so this used to be the lone outlier.
+    @State private var saveError: String?
 
     // Per-mode wrapper editors. `*Prompt` is the editable text; `*Default` mirrors
     // the cached bridge default (for the differs-from-default check and Reset).
@@ -270,6 +290,11 @@ struct SettingsView: View {
                     }
                     if let scanError {
                         Text(scanError)
+                            .font(.callout)
+                            .foregroundStyle(.red)
+                    }
+                    if let saveError {
+                        Text(saveError)
                             .font(.callout)
                             .foregroundStyle(.red)
                     }
@@ -357,14 +382,10 @@ struct SettingsView: View {
                 }
             }
             .navigationTitle("Settings")
-            .alert("Couldn’t save your settings", isPresented: $showSaveError) {
-                Button("OK", role: .cancel) { }
-            } message: {
-                Text("Your token couldn’t be saved to this iPhone’s Keychain, so pairing didn’t finish. Nothing was changed — please tap Save again.")
-            }
             .toolbar {
                 ToolbarItem(placement: .confirmationAction) {
                     Button("Save") {
+                        saveError = nil
                         let cfg = JesseConfig(host: host,
                                               port: Int(port) ?? JesseConfig.defaultPort,
                                               token: token)
@@ -386,7 +407,8 @@ struct SettingsView: View {
                         }
                         switch outcome {
                         case .dismiss:   dismiss()
-                        case .showError: showSaveError = true
+                        case .showError:
+                            saveError = "Your token couldn’t be saved to this iPhone’s Keychain, so pairing didn’t finish. Nothing was changed — please tap Save again."
                         }
                     }
                 }

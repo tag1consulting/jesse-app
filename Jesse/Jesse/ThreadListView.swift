@@ -20,6 +20,11 @@ struct ThreadListView: View {
     // iPhone/compact the row's `NavigationLink` still owns the push, so this just
     // tracks the current thread and changes nothing about that behavior.
     @Binding var selection: JesseThread?
+    // When true, a "can't reach the bridge" banner sits atop the list so the phone
+    // signals offline before the user composes — mirroring the watch's `.queued`
+    // state. The reachability probe lives in `ContentView`; the decision is the
+    // pure `shouldShowOfflineBanner`.
+    var showOfflineBanner = false
 
     // Which scope the list is showing, remembered across launches. All is the
     // default; Favorites narrows to starred threads; Watch narrows to threads
@@ -103,6 +108,9 @@ struct ThreadListView: View {
 
     var body: some View {
         VStack(spacing: 0) {
+            if showOfflineBanner {
+                offlineBanner
+            }
             // Only meaningful once there's at least one conversation to filter.
             if !threads.isEmpty {
                 Picker("Filter", selection: $scopeRaw) {
@@ -146,6 +154,24 @@ struct ThreadListView: View {
             }
         }
         .onAppear(perform: pruneEmpty)
+    }
+
+    /// "Can't reach the bridge" bar atop the list — the phone's echo of the watch's
+    /// `.queued` state, warning offline before the user composes. Warning-orange to
+    /// match the recoverable-error styling in the transcript.
+    private var offlineBanner: some View {
+        HStack(spacing: 6) {
+            Image(systemName: "wifi.slash")
+            Text("Can’t reach your Jesse bridge — check that your Mac is on and connected.")
+                .fixedSize(horizontal: false, vertical: true)
+            Spacer(minLength: 0)
+        }
+        .font(.caption)
+        .foregroundStyle(.orange)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(.horizontal)
+        .padding(.vertical, 8)
+        .background(.orange.opacity(0.12))
     }
 
     @ViewBuilder
