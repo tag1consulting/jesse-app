@@ -15,6 +15,11 @@ struct ThreadListView: View {
     // Set alongside `showSettings` by the first-run pairing CTA so Settings opens
     // straight to the Scan-to-pair sheet; the gear button leaves it false.
     @Binding var pairViaScanner: Bool
+    // The selected conversation, bridged to the root navigation. On iPad/regular
+    // width it drives the detail column of the `NavigationSplitView`; on
+    // iPhone/compact the row's `NavigationLink` still owns the push, so this just
+    // tracks the current thread and changes nothing about that behavior.
+    @Binding var selection: JesseThread?
 
     // Which scope the list is showing, remembered across launches. All is the
     // default; Favorites narrows to starred threads; Watch narrows to threads
@@ -194,7 +199,7 @@ struct ThreadListView: View {
             // Clearing the query restores the full list.
             ContentUnavailableView.search(text: searchText)
         } else {
-            List {
+            List(selection: $selection) {
                 switch layout {
                 case .flat(let threads):
                     // Favorites tab: one flat, newest-first list, no folder chrome.

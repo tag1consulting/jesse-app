@@ -15,6 +15,21 @@ CI both run it). See the "Versioning" section of `bridge/README.md`.
 
 ## [Unreleased]
 
+## [App 1.0 (17)] — 2026-07-06
+
+### Changed
+- **Real iPad layout.** The app builds for iPad but the root was a plain
+  `NavigationStack`, so iPad and landscape were just a blown-up phone. The root now
+  branches on horizontal size class: **regular** width (iPad, landscape) gets a
+  `NavigationSplitView` — the conversation list as a sidebar, the thread as the
+  detail column, with a "Select a conversation" placeholder until one is chosen;
+  **compact** width (iPhone, iPad portrait/Slide Over) keeps the original
+  `NavigationStack`, so **iPhone behavior is unchanged**. Both share one source of
+  truth — the existing `path` model, where the visible conversation is `path.last`
+  — so selecting in the sidebar, tapping compose, and voice/push hand-offs all
+  drive the detail the same way. The list rows are unchanged; the sidebar just adds
+  a selection binding that's inert to the compact push.
+
 ## [App 1.0 (16)] — 2026-07-06
 
 ### Added

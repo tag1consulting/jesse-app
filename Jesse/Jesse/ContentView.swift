@@ -19,17 +19,54 @@ struct ContentView: View {
     // straight to Scan-to-pair; cleared when the sheet dismisses so the gear
     // button's ordinary Settings open never auto-presents the scanner.
     @State private var pairViaScanner = false
+    // iPad/landscape gets a real two-column split; iPhone/compact keeps the stack.
+    @Environment(\.horizontalSizeClass) private var sizeClass
+    @State private var columnVisibility: NavigationSplitViewVisibility = .automatic
+
+    /// The selected conversation, expressed over the existing `path` model so the
+    /// split view's detail column and the stack's push share one source of truth:
+    /// the visible conversation is always `path.last`. Selecting one in the sidebar
+    /// replaces the detail; `newThread`/voice/push that set `path` update it too.
+    private var selectedThread: Binding<JesseThread?> {
+        Binding(get: { path.last },
+                set: { path = $0.map { [$0] } ?? [] })
+    }
 
     var body: some View {
-        NavigationStack(path: $path) {
-            ThreadListView(path: $path, config: $config, showSettings: $showSettings,
-                           pairViaScanner: $pairViaScanner)
-                .navigationDestination(for: JesseThread.self) { thread in
-                    ThreadDetailView(thread: thread)
+        Group {
+            if sizeClass == .compact {
+                // iPhone / compact: the original stack — unchanged behavior.
+                NavigationStack(path: $path) {
+                    ThreadListView(path: $path, config: $config, showSettings: $showSettings,
+                                   pairViaScanner: $pairViaScanner, selection: selectedThread)
+                        .navigationDestination(for: JesseThread.self) { thread in
+                            ThreadDetailView(thread: thread)
+                        }
                 }
-                .sheet(isPresented: $showSettings, onDismiss: { pairViaScanner = false }) {
-                    SettingsView(config: $config, autoPresentScanner: pairViaScanner)
+            } else {
+                // iPad / regular: list as sidebar, conversation as detail.
+                NavigationSplitView(columnVisibility: $columnVisibility) {
+                    ThreadListView(path: $path, config: $config, showSettings: $showSettings,
+                                   pairViaScanner: $pairViaScanner, selection: selectedThread)
+                        .navigationSplitViewColumnWidth(min: 320, ideal: 360)
+                } detail: {
+                    if let thread = path.last {
+                        // Its own stack so the detail's toolbar/title behave normally.
+                        NavigationStack { ThreadDetailView(thread: thread) }
+                            .id(thread.id)
+                    } else {
+                        ContentUnavailableView {
+                            Label("Select a conversation", systemImage: "bubble.left.and.bubble.right")
+                        } description: {
+                            Text("Choose a conversation from the list, or tap the compose button to start a new one.")
+                        }
+                    }
                 }
+                .navigationSplitViewStyle(.balanced)
+            }
+        }
+        .sheet(isPresented: $showSettings, onDismiss: { pairViaScanner = false }) {
+            SettingsView(config: $config, autoPresentScanner: pairViaScanner)
         }
         .onAppear {
             coordinator.resume(context: context)
