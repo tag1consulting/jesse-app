@@ -29,6 +29,33 @@ pub fn pairing_payload(host: &str, port: u16, token: &str) -> String {
     )
 }
 
+/// Whether the plaintext bearer token should be printed at startup. Off by default
+/// so the raw token stays out of terminal scrollback and launchd logs; opt in with
+/// the `--show-token` CLI flag or a truthy `JESSE_SHOW_TOKEN` env var. `token_env`
+/// is the already-evaluated env decision (passed in so this stays pure/testable).
+pub fn show_token_opt_in(args: &[String], token_env: bool) -> bool {
+    token_env || args.iter().any(|a| a == "--show-token")
+}
+
+/// The manual-pairing fallback lines printed beneath the QR. The plaintext `token=`
+/// line is included ONLY when `show_token` is set — by default it is omitted so the
+/// raw token never lands in scrollback or launchd logs. The QR itself always encodes
+/// the token, so pairing is unaffected either way.
+pub fn manual_pairing_lines(host: &str, port: u16, token: &str, show_token: bool) -> Vec<String> {
+    let mut lines = vec!["Pair by scanning the QR above, or enter manually:".to_string()];
+    if show_token {
+        lines.push(format!("  host={host}  port={port}  token={token}"));
+    } else {
+        lines.push(format!("  host={host}  port={port}"));
+        lines.push(
+            "  (token hidden — it's encoded in the QR above; pass --show-token or set \
+             JESSE_SHOW_TOKEN=1 to also print it)"
+                .to_string(),
+        );
+    }
+    lines
+}
+
 /// A regular file with at least one execute bit set (`mode & 0o111`). The point
 /// of the startup check is "can we actually run this as `claude`?", so a plain,
 /// non-executable file (a stray `claude.txt`, a checked-out but un-`chmod +x`ed
@@ -95,6 +122,47 @@ mod tests {
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
+    #[test]
+    fn manual_pairing_lines_hide_token_by_default() {
+        let lines = manual_pairing_lines("100.64.0.1", 8765, "deadbeef", false);
+        let joined = lines.join("\n");
+        assert!(
+            !joined.contains("deadbeef"),
+            "the plaintext token must NOT appear by default"
+        );
+        assert!(
+            joined.contains("host=100.64.0.1") && joined.contains("port=8765"),
+            "host/port are still printed for manual entry"
+        );
+        assert!(
+            !joined.contains("token="),
+            "no token= line is printed by default"
+        );
+    }
+
+    #[test]
+    fn manual_pairing_lines_show_token_when_opted_in() {
+        let lines = manual_pairing_lines("100.64.0.1", 8765, "deadbeef", true);
+        let joined = lines.join("\n");
+        assert!(
+            joined.contains("token=deadbeef"),
+            "the token IS printed once opted in"
+        );
+    }
+
+    #[test]
+    fn show_token_opt_in_honors_flag_and_env() {
+        let none: Vec<String> = vec![];
+        // Neither flag nor env → off.
+        assert!(!show_token_opt_in(&none, false));
+        // CLI flag → on.
+        assert!(show_token_opt_in(&["--show-token".to_string()], false));
+        // Env decision → on, even with no flag.
+        assert!(show_token_opt_in(&none, true));
+        // An unrelated arg alone doesn't enable it.
+        assert!(!show_token_opt_in(&["--verbose".to_string()], false));
+    }
+
     #[test]
     fn pairing_payload_matches_app_format() {
         let p = pairing_payload("100.64.0.1", 8765, "deadbeef");

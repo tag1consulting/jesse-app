@@ -21,19 +21,23 @@ export JESSE_BIND="$(tailscale ip -4 | head -1)"   # or 127.0.0.1 for local test
 cargo run --release
 ```
 
-On startup the bridge prints a **pairing QR** plus a plaintext fallback line:
+On startup the bridge prints a **pairing QR** plus a manual-entry fallback. The
+plaintext token line is **hidden by default** so the raw token stays out of
+scrollback and launchd logs:
 
 ```
 █▀▀▀▀▀█  …  █▀▀▀▀▀█
 …  (terminal QR)  …
 Pair by scanning the QR above, or enter manually:
-  host=100.64.0.1  port=8765  token=<token>
+  host=100.64.0.1  port=8765
+  (token hidden — it's encoded in the QR above; pass --show-token or set JESSE_SHOW_TOKEN=1 to also print it)
 ```
 
 Open the app's **Settings → Scan to pair**, scan that QR, and host/port/token
 fill in automatically — no more typing the token by hand on every restart. The
-QR encodes `jesse://pair?host=…&port=…&token=…`. Manual entry of the printed
-values still works as a fallback.
+QR encodes `jesse://pair?host=…&port=…&token=…`, so scanning pairs without the
+plaintext line. To also print `token=<token>` for manual entry, start the bridge
+with `--show-token` or `JESSE_SHOW_TOKEN=1` (that output then contains the token).
 
 The advertised host defaults to `JESSE_BIND` (the tailnet IP, which is reliably
 reachable; the `ts.net` name can have DNS quirks). To put the MagicDNS hostname

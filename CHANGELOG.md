@@ -15,6 +15,33 @@ CI both run it). See the "Versioning" section of `bridge/README.md`.
 
 ## [Unreleased]
 
+## [App 1.0 (25)] — 2026-07-07
+
+### Security
+- **Keychain token is now unlocked-this-device-only.** `ConfigStore.write` added
+  the bearer token to the Keychain with no `kSecAttrAccessible`, so it took the
+  default accessibility and was backup-eligible and device-migratable. Every add
+  now sets `kSecAttrAccessibleWhenUnlockedThisDeviceOnly`, so the token can't leave
+  the device via an iCloud/iTunes backup or a device transfer. A new
+  `ConfigStoreKeychainTests` case asserts the attribute is present on every add via
+  the injectable seam.
+
+## [Bridge 0.4.1] — 2026-07-07
+
+### Security
+- **The plaintext token is no longer printed at startup by default.** The bridge
+  printed `token=<token>` beside the pairing QR on every launch, leaving the raw
+  token in terminal scrollback and launchd logs. It's now hidden by default —
+  host/port still print for manual entry, and the QR still encodes the token so
+  pairing is unaffected. Opt back in to the plaintext line with the `--show-token`
+  flag or `JESSE_SHOW_TOKEN=1`. New `startup` unit tests cover both the hidden and
+  shown branches and the flag/env opt-in. README updated to match.
+
+### Fixed
+- **Doc drift:** `SECURITY.md` (and the README security-model note) said the
+  `HARD_TIMEOUT_CEILING` was 3600s; the code (`config.rs`) is 7200s. Corrected the
+  docs to match the runtime value.
+
 ## [App 1.0 (24)] — 2026-07-07
 
 ### Changed

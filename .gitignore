@@ -12,6 +12,9 @@ target/
 # internal worklog — never shipped (R5: no personal infra in tracked files)
 STATUS.md
 
+# APNs auth keys — never commit (belt-and-suspenders; keys live outside the tree)
+*.p8
+
 # cruft
 _removed-python/
 *.fuse_hidden*

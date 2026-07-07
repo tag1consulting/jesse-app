@@ -87,7 +87,7 @@ Read this before pairing a second device or running the bridge anywhere shared.
   home Wi-Fi or any other interface by default.
 - **Concurrency, request rate, and per-turn time are bounded** so one client
   can't exhaust the host: `JESSE_MAX_CONCURRENCY` (default 2),
-  `JESSE_RATE_PER_MIN` (default 30), and a hard 3600s timeout ceiling. Excess
+  `JESSE_RATE_PER_MIN` (default 30), and a hard 7200s timeout ceiling. Excess
   load is shed with `429`.
 - **The token is never logged by the bridge** and is stored on the phone in the
   **iOS Keychain** (not plaintext `UserDefaults`).
@@ -97,9 +97,11 @@ Read this before pairing a second device or running the bridge anywhere shared.
 - **Never put a real `JESSE_TOKEN` in a file you commit** — not in this README,
   scripts, CI, or `STATUS.md`. Pass it through the environment at runtime
   (examples below generate a fresh one and never echo a literal).
-- **The startup pairing QR — and the plaintext `token=…` line printed beside it —
-  contains the token.** Do not screenshot, paste, or screen-share that terminal
-  output. Anyone who can read it can drive your vault.
+- **The startup pairing QR contains the token.** Do not screenshot, paste, or
+  screen-share that terminal output. Anyone who can read it can drive your vault.
+  The plaintext `token=…` line is **hidden by default** so the raw token stays out
+  of scrollback and launchd logs; pass `--show-token` or set `JESSE_SHOW_TOKEN=1`
+  to also print it.
 - **To rotate the token**, restart the bridge with a new `JESSE_TOKEN` and
   re-pair the phone (Settings → Scan to pair). The old token stops working
   immediately.
@@ -130,17 +132,21 @@ export JESSE_ADVERTISE_HOST="<your-laptop>.<your-tailnet>.ts.net"
 cargo run --release
 ```
 
-On startup the bridge prints a **pairing QR** and a plaintext fallback:
+On startup the bridge prints a **pairing QR** and a manual-entry fallback. The
+plaintext token line is hidden by default:
 
 ```
 █▀▀▀▀▀█  …  █▀▀▀▀▀█
 …  (terminal QR)  …
 Pair by scanning the QR above, or enter manually:
-  host=<your-laptop>.<your-tailnet>.ts.net  port=8765  token=<token>
+  host=<your-laptop>.<your-tailnet>.ts.net  port=8765
+  (token hidden — it's encoded in the QR above; pass --show-token or set JESSE_SHOW_TOKEN=1 to also print it)
 ```
 
-The QR encodes `jesse://pair?host=…&port=…&token=…`. (Reminder: this output
-contains your token — keep it on-screen only.)
+The QR encodes `jesse://pair?host=…&port=…&token=…`, so scanning still pairs
+without the plaintext line. Run with `--show-token` (or `JESSE_SHOW_TOKEN=1`) to
+print `token=<token>` for manual entry — but that output then contains your token,
+so keep it on-screen only.
 
 Sanity-check it from the laptop before touching the phone:
 

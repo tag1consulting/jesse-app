@@ -145,7 +145,7 @@ To keep a single client (or a runaway turn) from exhausting the host:
   queue.
 - **Rate** — `JESSE_RATE_PER_MIN` (default 30) caps accepted requests per
   rolling minute; bursts beyond it get `429`.
-- **Timeout ceiling** — every turn is bounded by `HARD_TIMEOUT_CEILING` (3600s).
+- **Timeout ceiling** — every turn is bounded by `HARD_TIMEOUT_CEILING` (7200s).
   `JESSE_TIMEOUT=0` is treated as the ceiling, not "unlimited," in release
   builds. An unbounded-wait affordance exists only in debug builds.
 - **Output cap** — captured agent stdout is truncated (a few MB) before parsing

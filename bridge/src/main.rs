@@ -5,8 +5,8 @@
 use std::path::Path;
 
 use jesse_bridge::{
-    app, binary_exists, build_apns, env_truthy, is_bind_allowed, pairing_payload,
-    spawn_eviction_task, AppState, Config,
+    app, binary_exists, build_apns, env_truthy, is_bind_allowed, manual_pairing_lines,
+    pairing_payload, show_token_opt_in, spawn_eviction_task, AppState, Config,
 };
 
 #[tokio::main]
@@ -70,11 +70,14 @@ async fn main() {
         .quiet_zone(true)
         .build();
     println!("{art}");
-    println!("Pair by scanning the QR above, or enter manually:");
-    println!(
-        "  host={advertise_host}  port={}  token={}",
-        state.cfg.port, state.cfg.token
-    );
+    // Print the manual-pairing fallback under the QR. The plaintext token line is
+    // omitted by default so the raw token stays out of scrollback / launchd logs;
+    // the QR still encodes it. Opt in with `--show-token` or JESSE_SHOW_TOKEN=1.
+    let args: Vec<String> = std::env::args().collect();
+    let show_token = show_token_opt_in(&args, env_truthy("JESSE_SHOW_TOKEN"));
+    for line in manual_pairing_lines(&advertise_host, state.cfg.port, &state.cfg.token, show_token) {
+        println!("{line}");
+    }
 
     println!(
         "Jesse Bridge v{} → http://{addr}  (vault: {})",

@@ -24,4 +24,26 @@ final class ConfigStoreKeychainTests: XCTestCase {
         let ok = ConfigStore.save(JesseConfig(host: "laptop", port: 8765, token: "tok"))
         XCTAssertTrue(ok, "all writes succeeded → save reports success")
     }
+
+    /// Every Keychain add must pin accessibility to
+    /// `kSecAttrAccessibleWhenUnlockedThisDeviceOnly`, so the bearer token is neither
+    /// backup-eligible nor device-migratable. Asserted against the exact add dict the
+    /// store passes to `SecItemAdd`, via the injectable seam.
+    func testEveryAddPinsThisDeviceOnlyAccessibility() {
+        var addedAttributes: [[String: Any]] = []
+        ConfigStore.addItem = { query, _ in
+            addedAttributes.append(query as! [String: Any])
+            return errSecSuccess
+        }
+        _ = ConfigStore.save(JesseConfig(host: "laptop", port: 8765, token: "tok"))
+
+        XCTAssertFalse(addedAttributes.isEmpty, "the save must perform at least one add")
+        for attrs in addedAttributes {
+            let accessible = attrs[kSecAttrAccessible as String]
+            XCTAssertNotNil(accessible, "every add must set kSecAttrAccessible")
+            XCTAssertEqual(accessible as! CFString,
+                           kSecAttrAccessibleWhenUnlockedThisDeviceOnly,
+                           "the token must be unlocked-this-device-only: not backup-eligible, not migratable")
+        }
+    }
 }

@@ -1319,6 +1319,11 @@ enum ConfigStore {
         _ = deleteItem(base as CFDictionary)
         var add = base
         add[kSecValueData as String] = value.data(using: .utf8)
+        // Bind the item to THIS device, and only while unlocked: it's then neither
+        // backup-eligible (an iCloud/iTunes backup can't carry the bearer token off
+        // the device) nor migratable to another device on transfer. Without an
+        // explicit accessibility, the Keychain default is backup-eligible.
+        add[kSecAttrAccessible as String] = kSecAttrAccessibleWhenUnlockedThisDeviceOnly
         let status = addItem(add as CFDictionary, nil)
         if status != errSecSuccess {
             // Surface, don't swallow: a locked Keychain (or missing entitlement)
