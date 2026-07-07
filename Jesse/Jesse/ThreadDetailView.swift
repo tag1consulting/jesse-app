@@ -447,34 +447,77 @@ struct ThreadDetailView: View {
 
     /// Native paste of clipboard media (called by `ComposerInput`'s text view when
     /// the user long-presses → Paste and the clipboard holds an image or PDF).
-    /// Stages each copied image/PDF through the SAME `addAttachment` path the
-    /// pickers use, so it inherits the MIME/size/count caps, the chip UI, and the
-    /// send flow. Returns true iff it staged something (so the text view does not
-    /// also paste text). The cap and any oversized/unsupported item surface via
-    /// `attachError`, exactly like the pickers. Main-actor (mutates staging state).
+    /// Reads the pasteboard's item PROVIDERS (not the flattened `.items` dict) so a
+    /// photo loads its own compact JPEG/HEIC bytes verbatim rather than being
+    /// re-encoded to a large PNG. Returns true iff it owns the paste (there is
+    /// media to stage), and stages asynchronously — provider loading is async — so
+    /// the text view does not also paste text. Each item flows through the SAME
+    /// `addAttachment` path the pickers use, inheriting the MIME/size/count caps,
+    /// the chip UI, and the send flow; the cap and any oversized/unsupported item
+    /// surface via `attachError`.
     @MainActor
     private func stagePastedMedia() -> Bool {
+        let providers = UIPasteboard.general.itemProviders.filter {
+            $0.hasItemConformingToTypeIdentifier(UTType.image.identifier)
+                || $0.hasItemConformingToTypeIdentifier(UTType.pdf.identifier)
+        }
+        guard !providers.isEmpty else { return false }
         attachError = nil
-        var stagedAny = false
-        for item in UIPasteboard.general.items {
-            guard let data = ComposerPaste.stageableData(from: item) else { continue }
+        Task { await stagePastedProviders(providers) }
+        return true
+    }
+
+    @MainActor
+    private func stagePastedProviders(_ providers: [NSItemProvider]) async {
+        for provider in providers {
+            guard let data = await loadPastedData(from: provider) else {
+                attachError = "Couldn’t paste that item (images or PDF only)."
+                continue
+            }
+            // loadPastedData guarantees `data` sniffs as a whitelisted type; name it
+            // pasted-<timestamp>.<ext> and let addAttachment run the caps.
             let ext = JesseAttachment.sniffMime(data)
                 .map(JesseAttachment.fileExtension(forMime:)) ?? "png"
             addAttachment(data: data, fallbackName: "Pasted",
                           suggestedName: PasteAttachment.filename(ext: ext))
-            stagedAny = true
         }
-        // A copied bitmap the pasteboard only exposes as `UIImage` objects (e.g.
-        // some screenshots): re-encode each to PNG and stage it.
-        if !stagedAny {
-            for image in UIPasteboard.general.images ?? [] {
-                guard let data = PasteAttachment.pngData(from: image) else { continue }
-                addAttachment(data: data, fallbackName: "Pasted",
-                              suggestedName: PasteAttachment.filename(ext: "png"))
-                stagedAny = true
+    }
+
+    /// Read a pasted provider's bytes as a stageable, whitelisted payload (or nil).
+    /// Concrete encodings are tried in order and kept VERBATIM (a photo stays its
+    /// compact JPEG/HEIC); the `hasItemConformingToTypeIdentifier` guard means a
+    /// type the provider doesn't actually carry is skipped, so a JPEG photo never
+    /// matches `public.png` and never gets re-encoded. A bitmap the provider only
+    /// vends as a `UIImage` (no concrete data representation) is re-encoded to PNG.
+    private func loadPastedData(from provider: NSItemProvider) async -> Data? {
+        for type in ComposerPaste.mediaTypes {
+            guard provider.hasItemConformingToTypeIdentifier(type.identifier) else { continue }
+            if let data = await loadData(provider, type: type),
+               let staged = PasteAttachment.stageableBytes(from: data) {
+                return staged
             }
         }
-        return stagedAny
+        if provider.canLoadObject(ofClass: UIImage.self),
+           let image = await loadImageObject(provider) {
+            return PasteAttachment.pngData(from: image)
+        }
+        return nil
+    }
+
+    private func loadData(_ provider: NSItemProvider, type: UTType) async -> Data? {
+        await withCheckedContinuation { continuation in
+            provider.loadDataRepresentation(forTypeIdentifier: type.identifier) { data, _ in
+                continuation.resume(returning: data)
+            }
+        }
+    }
+
+    private func loadImageObject(_ provider: NSItemProvider) async -> UIImage? {
+        await withCheckedContinuation { continuation in
+            provider.loadObject(ofClass: UIImage.self) { object, _ in
+                continuation.resume(returning: object as? UIImage)
+            }
+        }
     }
 
     /// Sniff the type, name it, run the client-side caps, and stage it — or set

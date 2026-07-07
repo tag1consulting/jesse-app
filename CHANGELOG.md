@@ -15,6 +15,20 @@ CI both run it). See the "Versioning" section of `bridge/README.md`.
 
 ## [Unreleased]
 
+## [App 1.0 (23)] — 2026-07-07
+
+### Fixed
+- **Pasting a photo into the composer no longer trips the 10 MB size cap.** The
+  native paste added in build 22 read the pasteboard's flattened `.items`
+  dictionary and hit the `UIImage → PNG` re-encode path, inflating a compact
+  JPEG/HEIC photo into a much larger PNG that exceeded `AttachmentLimits`
+  (`"pasted-….png" is too large`). The cap did not change; the encoding did.
+  Paste now reads the pasteboard's item *providers* and loads the original bytes
+  via `loadDataRepresentation`, keyed on `hasItemConformingToTypeIdentifier` — so
+  a photo keeps its own compact JPEG/HEIC bytes verbatim and is re-encoded to PNG
+  only as a last resort (a bitmap with no concrete data representation). This
+  restores build 21's paperclip-import behavior for pasted media.
+
 ## [App 1.0 (22)] — 2026-07-07
 
 ### Changed
