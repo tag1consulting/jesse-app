@@ -14,7 +14,9 @@ struct ThreadDetailView: View {
     @Bindable var thread: JesseThread
 
     @State private var input = ""
-    @FocusState private var inputFocused: Bool
+    // Plain @State (not @FocusState): the composer is a UITextView-backed
+    // representable that drives first-responder from this binding.
+    @State private var inputFocused = false
 
     // Bumped once per send() so `.sensoryFeedback` fires a light tap the instant
     // the user dispatches a turn — the phone had no haptics; the watch already
@@ -264,19 +266,21 @@ struct ThreadDetailView: View {
                 attachmentChips
             }
 
-            TextField(thread.modeValue == .ask ? "Ask Jesse anything…"
-                                                : "Tell Jesse something…",
-                      text: $input, axis: .vertical)
-                .textFieldStyle(.roundedBorder)
-                // Reserve a multi-line floor (grows to the cap, then scrolls) so
-                // the field stays usable with chips staged and the keyboard up;
-                // the lower bound holds the height even when empty.
-                .lineLimit(ComposerLayout.inputLineLimit)
-                .focused($inputFocused)
+            // A UITextView-backed field: native long-press → Paste (text, and a
+            // copied photo/PDF, which stages as an attachment via onPasteMedia),
+            // native word/sentence selection, and a multi-line floor that never
+            // collapses to one line (grows to the cap, then scrolls internally).
+            ComposerInput(
+                text: $input,
+                isFocused: $inputFocused,
+                placeholder: thread.modeValue == .ask ? "Ask Jesse anything…"
+                                                      : "Tell Jesse something…",
+                minLines: ComposerLayout.inputMinLines,
+                maxLines: ComposerLayout.inputMaxLines,
+                onPasteMedia: stagePastedMedia)
 
             HStack {
                 attachButton
-                pasteButton
                 SendButton(
                     running: running,
                     startDate: coordinator.startDate(for: thread.id),
@@ -341,23 +345,6 @@ struct ThreadDetailView: View {
         }
         .accessibilityLabel("Add attachment")
         .disabled(running || attachments.count >= AttachmentLimits.maxCount)
-    }
-
-    /// A fast, discoverable paste path beside the paperclip: stage a copied image
-    /// or PDF straight from the clipboard. `PasteButton` is the permission-clean
-    /// choice — no "pasted from…" privacy banner and no clipboard prompt, unlike a
-    /// custom `⌘V`/edit-menu override, and it auto-disables when the pasteboard
-    /// holds no matching content. Pasted items flow through the same
-    /// `addAttachment` path as the pickers, so they inherit the MIME/size/count
-    /// caps and the send flow. Disabled consistently with `attachButton`.
-    private var pasteButton: some View {
-        PasteButton(supportedContentTypes: [.image, .pdf]) { providers in
-            Task { await handlePaste(providers) }
-        }
-        .labelStyle(.iconOnly)
-        .buttonBorderShape(.capsule)
-        .disabled(running || attachments.count >= AttachmentLimits.maxCount)
-        .accessibilityLabel("Paste image or PDF")
     }
 
     private var attachmentChips: some View {
@@ -458,68 +445,36 @@ struct ThreadDetailView: View {
         }
     }
 
-    /// The type identifiers tried, in order, when reading a pasted item's bytes —
-    /// concrete lossless encodings first (kept verbatim), then the abstract
-    /// `.image` (whatever the pasteboard offers). A representation that isn't a
-    /// whitelisted type but decodes as a bitmap is re-encoded to PNG by
-    /// `PasteAttachment.stageableBytes`; the `UIImage` object is the final fallback.
-    private static let pasteDataTypes: [UTType] =
-        [.pdf, .png, .jpeg, .heic, .heif, .gif, .webP, .tiff, .bmp, .image]
-
-    /// Clipboard paste (from `pasteButton`): stage each copied image/PDF through
-    /// the SAME `addAttachment` path the pickers use, so it inherits the caps, the
-    /// chip UI, and the send flow. Multiple items up to the 4-file cap are staged;
-    /// the cap (and any oversized/unsupported item) surfaces via `attachError`
-    /// exactly like the pickers. Runs on the main actor (mutates staging state).
+    /// Native paste of clipboard media (called by `ComposerInput`'s text view when
+    /// the user long-presses → Paste and the clipboard holds an image or PDF).
+    /// Stages each copied image/PDF through the SAME `addAttachment` path the
+    /// pickers use, so it inherits the MIME/size/count caps, the chip UI, and the
+    /// send flow. Returns true iff it staged something (so the text view does not
+    /// also paste text). The cap and any oversized/unsupported item surface via
+    /// `attachError`, exactly like the pickers. Main-actor (mutates staging state).
     @MainActor
-    private func handlePaste(_ providers: [NSItemProvider]) async {
+    private func stagePastedMedia() -> Bool {
         attachError = nil
-        for provider in providers {
-            guard let data = await loadPastedData(from: provider) else {
-                attachError = "Couldn’t paste that item (images or PDF only)."
-                continue
-            }
-            // loadPastedData guarantees `data` sniffs as a whitelisted type; name
-            // it pasted-<timestamp>.<ext> and let addAttachment run the caps.
+        var stagedAny = false
+        for item in UIPasteboard.general.items {
+            guard let data = ComposerPaste.stageableData(from: item) else { continue }
             let ext = JesseAttachment.sniffMime(data)
                 .map(JesseAttachment.fileExtension(forMime:)) ?? "png"
             addAttachment(data: data, fallbackName: "Pasted",
                           suggestedName: PasteAttachment.filename(ext: ext))
+            stagedAny = true
         }
-    }
-
-    /// Read a pasted provider's bytes as a stageable, whitelisted payload (or nil).
-    private func loadPastedData(from provider: NSItemProvider) async -> Data? {
-        for type in Self.pasteDataTypes {
-            guard provider.hasItemConformingToTypeIdentifier(type.identifier) else { continue }
-            if let data = await loadData(provider, type: type),
-               let staged = PasteAttachment.stageableBytes(from: data) {
-                return staged
+        // A copied bitmap the pasteboard only exposes as `UIImage` objects (e.g.
+        // some screenshots): re-encode each to PNG and stage it.
+        if !stagedAny {
+            for image in UIPasteboard.general.images ?? [] {
+                guard let data = PasteAttachment.pngData(from: image) else { continue }
+                addAttachment(data: data, fallbackName: "Pasted",
+                              suggestedName: PasteAttachment.filename(ext: "png"))
+                stagedAny = true
             }
         }
-        // A copied bitmap (e.g. a screenshot) with no loadable data representation:
-        // decode the image object and re-encode to PNG.
-        if provider.canLoadObject(ofClass: UIImage.self),
-           let image = await loadImageObject(provider) {
-            return PasteAttachment.pngData(from: image)
-        }
-        return nil
-    }
-
-    private func loadData(_ provider: NSItemProvider, type: UTType) async -> Data? {
-        await withCheckedContinuation { continuation in
-            provider.loadDataRepresentation(forTypeIdentifier: type.identifier) { data, _ in
-                continuation.resume(returning: data)
-            }
-        }
-    }
-
-    private func loadImageObject(_ provider: NSItemProvider) async -> UIImage? {
-        await withCheckedContinuation { continuation in
-            provider.loadObject(ofClass: UIImage.self) { object, _ in
-                continuation.resume(returning: object as? UIImage)
-            }
-        }
+        return stagedAny
     }
 
     /// Sniff the type, name it, run the client-side caps, and stage it — or set
@@ -588,64 +543,39 @@ private struct StreamingPartialText: View {
 /// One message bubble. User turns sit right with a tinted fill; Jesse's replies
 /// render as Markdown on the left.
 ///
-/// Both bubbles enable `.textSelection` so a long-press-drag selects individual
-/// words / ranges (the native selection callout then offers Copy of the picked
-/// range). Whole-message actions live on a small ellipsis `Menu` *beside* the
-/// bubble rather than on a bubble `.contextMenu`: a context menu owns the
-/// long-press, which is exactly the gesture text selection needs, so the two
-/// can't coexist on the same view. Moving Copy/Share to a separate affordance
-/// that doesn't own the long-press lets drag-select win while keeping
-/// whole-message raw-Markdown Copy and Share available.
+/// Both bubbles are backed by a `UITextView` (`SelectableText` / `MarkdownText`'s
+/// selectable path), so long-pressing the text is the normal iOS gesture: it
+/// starts a native selection the user drags by word / sentence, with the system
+/// Copy / Select All menu. There is no per-message "…" affordance and no custom
+/// long-press-to-copy gesture — the whole point is to stop fighting the native
+/// selection gesture. Whole-conversation Share still lives in the toolbar.
 private struct TurnRow: View {
     let turn: Turn
 
     var body: some View {
-        // The message, with a small actions affordance tucked just beneath it on
-        // the bubble's own edge (trailing for the user, leading for Jesse) so it
-        // stays out of the reading column and never fights the bubble for width.
         VStack(alignment: turn.isUser ? .trailing : .leading, spacing: 2) {
             if !turn.attachments.isEmpty {
                 TurnAttachmentsView(attachments: turn.orderedAttachments)
             }
             bubble
-            actionsMenu
         }
         .frame(maxWidth: .infinity, alignment: turn.isUser ? .trailing : .leading)
     }
 
-    /// Whole-message Copy (the *raw* Markdown `turn.text`, so links/formatting
-    /// survive) + Share. On a plain `Menu` label, not a `.contextMenu`, so it
-    /// never claims the long-press that starts text selection on the bubble.
-    private var actionsMenu: some View {
-        Menu {
-            Button {
-                UIPasteboard.general.string = turn.text
-            } label: {
-                Label("Copy message", systemImage: "doc.on.doc")
-            }
-            ShareLink(item: turn.text) {
-                Label("Share message", systemImage: "square.and.arrow.up")
-            }
-        } label: {
-            Image(systemName: "ellipsis")
-                .font(.caption)
-                .foregroundStyle(.secondary)
-                .frame(width: 28, height: 28)
-                .contentShape(Rectangle())
-        }
-        .accessibilityLabel(turn.isUser ? "Your message actions" : "Jesse's message actions")
-    }
-
     @ViewBuilder private var bubble: some View {
         if turn.isUser {
-            Text(turn.text)
-                .textSelection(.enabled)
+            // User text is shown verbatim (as typed); the UITextView gives native
+            // word/sentence selection within the bubble.
+            SelectableText(attributed: NSAttributedString(
+                string: turn.text,
+                attributes: [.font: UIFont.preferredFont(forTextStyle: .body),
+                             .foregroundColor: UIColor.label]))
                 .padding(.horizontal, 12)
                 .padding(.vertical, 8)
                 .background(Color.accentColor.opacity(0.15))
                 .clipShape(RoundedRectangle(cornerRadius: 14))
         } else {
-            // MarkdownText already enables `.textSelection` at its container.
+            // Selectable path (native per-block word/sentence selection).
             MarkdownText(turn.text)
         }
     }

@@ -1,4 +1,5 @@
 import SwiftUI
+import UIKit
 
 // A small, dependency-free block renderer for Jesse's markdown replies.
 //
@@ -273,66 +274,143 @@ final class MarkdownStreamRenderer {
 }
 
 /// Renders parsed markdown blocks as native SwiftUI views.
+///
+/// Two rendering modes, chosen by `selectable`:
+/// - **Selectable** (persisted turns): each text block is a `SelectableText`
+///   (`UITextView`), so a long-press starts a real native selection the user can
+///   drag by word / sentence, plus Select All and the system Copy menu — what a
+///   SwiftUI `Text` with `.textSelection` did not reliably give inside the
+///   scrolling transcript.
+/// - **Non-selectable** (the live streaming partial): the lightweight SwiftUI
+///   `Text` path, unchanged — the growing partial re-renders ~10×/s and needs no
+///   selection, so it avoids a fleet of `UITextView`s churning mid-stream.
 struct MarkdownText: View {
     let blocks: [MarkdownBlock]
+    let selectable: Bool
 
-    init(_ raw: String) {
+    init(_ raw: String, selectable: Bool = true) {
         self.blocks = parseMarkdownBlocks(raw)
+        self.selectable = selectable
     }
 
     /// Render pre-parsed blocks directly — used by the throttled streaming path
     /// (`MarkdownStreamRenderer`) so the parse isn't re-run inside the view body.
-    init(blocks: [MarkdownBlock]) {
+    /// Defaults to non-selectable (the streaming partial).
+    init(blocks: [MarkdownBlock], selectable: Bool = false) {
         self.blocks = blocks
+        self.selectable = selectable
     }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 8) {
+        let stack = VStack(alignment: .leading, spacing: 8) {
             ForEach(Array(blocks.enumerated()), id: \.offset) { _, block in
                 view(for: block)
                     .frame(maxWidth: .infinity, alignment: .leading)
             }
         }
-        // Selection is enabled at the container; descendant Text inherits it.
-        .textSelection(.enabled)
+        // The selectable path gets native selection from its `SelectableText`
+        // leaves; the streaming path keeps the SwiftUI container selection.
+        if selectable {
+            stack
+        } else {
+            stack.textSelection(.enabled)
+        }
     }
 
     @ViewBuilder
     private func view(for block: MarkdownBlock) -> some View {
         switch block {
         case let .heading(level, text):
-            inline(text)
-                .font(headingFont(level))
+            if selectable {
+                SelectableText(attributed: MarkdownInline.attributed(
+                    text, font: headingUIFont(level), color: .label))
+            } else {
+                inline(text).font(headingFont(level))
+            }
 
         case let .bullet(text):
-            HStack(alignment: .firstTextBaseline, spacing: 6) {
-                Text("•")
-                inline(text)
+            if selectable {
+                SelectableText(attributed: MarkdownInline.listItem(
+                    marker: "•", text: text, font: bodyUIFont, color: .label))
+            } else {
+                HStack(alignment: .firstTextBaseline, spacing: 6) {
+                    Text("•")
+                    inline(text)
+                }
             }
 
         case let .numbered(number, text):
-            HStack(alignment: .firstTextBaseline, spacing: 6) {
-                Text("\(number).")
-                inline(text)
+            if selectable {
+                SelectableText(attributed: MarkdownInline.listItem(
+                    marker: "\(number).", text: text, font: bodyUIFont, color: .label))
+            } else {
+                HStack(alignment: .firstTextBaseline, spacing: 6) {
+                    Text("\(number).")
+                    inline(text)
+                }
             }
 
         case let .code(code):
-            Text(code)
-                .font(.system(.body, design: .monospaced))
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .padding(8)
-                .background(
-                    RoundedRectangle(cornerRadius: 6)
-                        .fill(Color.secondary.opacity(0.12))
-                )
-                .textSelection(.enabled)
+            codeBlock {
+                if selectable {
+                    SelectableText(attributed: NSAttributedString(
+                        string: code,
+                        attributes: [.font: monospacedBodyUIFont, .foregroundColor: UIColor.label]))
+                } else {
+                    Text(code)
+                        .font(.system(.body, design: .monospaced))
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .textSelection(.enabled)
+                }
+            }
 
         case let .table(headers, rows, alignments):
             tableView(headers: headers, rows: rows, alignments: alignments)
 
         case let .paragraph(text):
-            inline(text)
+            if selectable {
+                SelectableText(attributed: MarkdownInline.attributed(
+                    text, font: bodyUIFont, color: .label))
+            } else {
+                inline(text)
+            }
         }
+    }
+
+    /// The shared code-block chrome (monospaced content on a shaded card).
+    @ViewBuilder
+    private func codeBlock<Content: View>(@ViewBuilder _ content: () -> Content) -> some View {
+        content()
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(8)
+            .background(
+                RoundedRectangle(cornerRadius: 6)
+                    .fill(Color.secondary.opacity(0.12))
+            )
+    }
+
+    // Concrete UIKit fonts for the selectable (`SelectableText`) path, mirroring
+    // the SwiftUI text styles the non-selectable path uses.
+    private var bodyUIFont: UIFont { UIFont.preferredFont(forTextStyle: .body) }
+
+    private var monospacedBodyUIFont: UIFont {
+        UIFont.monospacedSystemFont(
+            ofSize: UIFont.preferredFont(forTextStyle: .body).pointSize, weight: .regular)
+    }
+
+    private func headingUIFont(_ level: Int) -> UIFont {
+        let style: UIFont.TextStyle
+        switch level {
+        case 1:  style = .title3
+        case 2:  style = .headline   // already semibold
+        default: style = .subheadline
+        }
+        let base = UIFont.preferredFont(forTextStyle: style)
+        if level == 2 { return base }
+        if let descriptor = base.fontDescriptor.withSymbolicTraits(.traitBold) {
+            return UIFont(descriptor: descriptor, size: base.pointSize)
+        }
+        return base
     }
 
     /// Render a GFM pipe table as a SwiftUI `Grid` inside a horizontal

@@ -5,10 +5,10 @@ import UniformTypeIdentifiers
 @testable import Jesse
 
 /// Covers `PasteAttachment` — the pure paste→bytes core behind the composer's
-/// `PasteButton`. The `NSItemProvider` loading itself needs the pasteboard/UI and
-/// isn't unit-testable; these pin the byte handling that decides what gets staged,
-/// and that a pasted item runs the SAME `sniffMime`/`AttachmentLimits` caps as the
-/// pickers.
+/// native paste (long-press → Paste of a copied image/PDF). The `UIPasteboard`
+/// reading itself needs the pasteboard/UI and isn't unit-testable; these pin the
+/// byte handling that decides what gets staged, and that a pasted item runs the
+/// SAME `sniffMime`/`AttachmentLimits` caps as the pickers.
 final class PasteAttachmentTests: XCTestCase {
 
     // MARK: - Generated filename

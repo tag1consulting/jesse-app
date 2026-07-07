@@ -15,6 +15,30 @@ CI both run it). See the "Versioning" section of `bridge/README.md`.
 
 ## [Unreleased]
 
+## [App 1.0 (22)] — 2026-07-07
+
+### Changed
+- **Native text interaction in the composer and message bubbles.** The app no
+  longer fights iOS's built-in text-interaction gestures:
+  - **Composer paste is native.** The dedicated paste button is gone (it took up
+    space and was non-standard). The composer is now a `UITextView`-backed field
+    (`ComposerInput`): long-press → **Paste** appears — offered by iOS itself
+    only when the clipboard has content the field accepts — and pastes text. A
+    copied **photo or PDF** pastes too, staging as an attachment through the same
+    caps/chip/send path the paperclip uses (`ComposerPaste` + the existing
+    `PasteAttachment` rules). The multi-line floor (never collapses to one line,
+    grows then scrolls) is preserved via `ComposerLayout`.
+  - **Message text is genuinely selectable.** Assistant replies and user bubbles
+    are backed by a non-editable `UITextView` (`SelectableText`, and
+    `MarkdownText`'s new selectable path), so long-pressing starts a real native
+    selection you can drag by **word / sentence**, with double-tap-word, Select
+    All, and the system Copy menu. Markdown (headings, lists, `code`, tables,
+    bold/italic/links) still renders — inline styling is resolved to concrete
+    fonts by `MarkdownInline`. The per-message "…" (overflow) affordance and its
+    whole-message copy-all are removed; whole-conversation Share stays in the
+    toolbar. The live streaming partial keeps the lightweight SwiftUI text path
+    (no selection needed mid-stream).
+
 ## [App 1.0 (21)] — 2026-07-06
 
 ### Fixed
