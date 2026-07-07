@@ -112,6 +112,82 @@ final class HealthContextTests: XCTestCase {
         ])
     }
 
+    // MARK: - Daily-summary formatter: weight line body metrics (body fat, lean mass)
+
+    /// A daily summary carrying only body-composition data (weight + body fat +
+    /// lean mass), each within the 7-day weight window. Any argument passed nil is
+    /// omitted; body fat is a 0…1 FRACTION (rendered as a percent).
+    private func bodyDaily(weightKg: Double? = 78.4,
+                           bodyFatFraction: Double? = 0.251,
+                           leanMassKg: Double? = 63.08,
+                           when: Date? = nil) -> DailySummary {
+        let d = when ?? date(2026, 7, 3, 6, 0)
+        return DailySummary(
+            weight: weightKg.map { DatedValue(value: $0, date: d) },
+            bodyFat: bodyFatFraction.map { DatedValue(value: $0, date: d) },
+            leanBodyMass: leanMassKg.map { DatedValue(value: $0, date: d) })
+    }
+
+    func testWeightLineWithBodyFatAndLeanMass() {
+        let lines = DailySummaryFormatter.lines(from: bodyDaily(), now: now, timeZone: utc)
+        XCTAssertEqual(lines, [
+            "Weight: 78.4 kg (2026-07-03), body fat 25.1% (2026-07-03), lean mass 63.08 kg (2026-07-03)",
+        ])
+    }
+
+    func testWeightLineBodyFatWithoutLeanMass() {
+        let lines = DailySummaryFormatter.lines(from: bodyDaily(leanMassKg: nil), now: now, timeZone: utc)
+        XCTAssertEqual(lines, [
+            "Weight: 78.4 kg (2026-07-03), body fat 25.1% (2026-07-03)",
+        ])
+    }
+
+    func testWeightLineLeanMassWithoutBodyFat() {
+        let lines = DailySummaryFormatter.lines(from: bodyDaily(bodyFatFraction: nil), now: now, timeZone: utc)
+        XCTAssertEqual(lines, [
+            "Weight: 78.4 kg (2026-07-03), lean mass 63.08 kg (2026-07-03)",
+        ])
+    }
+
+    /// Stale body fat / lean mass (outside the 7-day window) drop their clauses; a
+    /// fresh weight then renders exactly as it does today (byte-identical).
+    func testBodyMetricsStaleClausesOmitted() {
+        let stale = date(2026, 6, 1, 0, 0) // > 7 days before now
+        let d = DailySummary(
+            weight: DatedValue(value: 78.4, date: date(2026, 7, 3, 6, 0)),
+            bodyFat: DatedValue(value: 0.251, date: stale),
+            leanBodyMass: DatedValue(value: 63.08, date: stale))
+        let lines = DailySummaryFormatter.lines(from: d, now: now, timeZone: utc)
+        XCTAssertEqual(lines, ["Weight: 78.4 kg (2026-07-03)"])
+    }
+
+    /// The invariant: with both new fields nil the weight line is byte-identical to
+    /// the pre-change output.
+    func testBodyMetricsNilIsByteIdentical() {
+        let lines = DailySummaryFormatter.lines(
+            from: bodyDaily(bodyFatFraction: nil, leanMassKg: nil), now: now, timeZone: utc)
+        XCTAssertEqual(lines, ["Weight: 78.4 kg (2026-07-03)"])
+    }
+
+    /// Body fat is a 0…1 fraction that renders as a 1-decimal percent; lean mass
+    /// keeps 2 decimals.
+    func testBodyMetricsUnitConversionAndPrecision() {
+        let lines = DailySummaryFormatter.lines(
+            from: bodyDaily(weightKg: nil, bodyFatFraction: 0.251, leanMassKg: 63.081),
+            now: now, timeZone: utc)
+        XCTAssertEqual(lines.count, 1)
+        XCTAssertTrue(lines[0].contains("body fat 25.1%"), "0.251 fraction renders as 25.1%")
+        XCTAssertTrue(lines[0].contains("lean mass 63.08 kg"), "kg keeps 2 decimals")
+    }
+
+    /// A context whose only data is body fat (or lean mass) still counts as
+    /// non-empty, so the daily subsection is not skipped.
+    func testEmptyGuardBodyFatOrLeanMassAloneNonEmpty() {
+        XCTAssertFalse(DailySummary(bodyFat: DatedValue(value: 0.25, date: now)).isEmpty)
+        XCTAssertFalse(DailySummary(leanBodyMass: DatedValue(value: 63.0, date: now)).isEmpty)
+        XCTAssertTrue(DailySummary().isEmpty)
+    }
+
     // MARK: - Classifiers
 
     func testSleepClassifierNapVsNight() {

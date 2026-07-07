@@ -44,9 +44,9 @@ nonisolated struct HealthContextProvider: HealthContextProviding {
     private static let quantityReadIdentifiers: [HKQuantityTypeIdentifier] = [
         .restingHeartRate, .heartRateVariabilitySDNN, .vo2Max, .respiratoryRate,
         .oxygenSaturation, .appleSleepingWristTemperature, .heartRateRecoveryOneMinute,
-        .stepCount, .bodyMass, .runningPower, .runningGroundContactTime,
-        .runningVerticalOscillation, .runningStrideLength, .walkingAsymmetryPercentage,
-        .appleWalkingSteadiness,
+        .stepCount, .bodyMass, .bodyFatPercentage, .leanBodyMass, .runningPower,
+        .runningGroundContactTime, .runningVerticalOscillation, .runningStrideLength,
+        .walkingAsymmetryPercentage, .appleWalkingSteadiness,
     ]
     private static let categoryReadIdentifiers: [HKCategoryTypeIdentifier] = [
         .sleepAnalysis, .lowHeartRateEvent, .highHeartRateEvent, .irregularHeartRhythmEvent,
@@ -243,7 +243,12 @@ nonisolated struct HealthContextProvider: HealthContextProviding {
             mobility: { try await liveMobility() },
             todaySteps: { try await sumToday(.stepCount, unit: .count()) },
             todayActiveKcal: { try await sumToday(.activeEnergyBurned, unit: .kilocalorie()) },
-            weight: { try await latest(.bodyMass, unit: .gramUnit(with: .kilo)) })
+            weight: { try await latest(.bodyMass, unit: .gramUnit(with: .kilo)) },
+            // Body fat comes off HealthKit as a 0…1 fraction (HKUnit.percent()); the
+            // formatter scales it to a percent. Same 7-day recency window as weight,
+            // re-checked at format time.
+            bodyFat: { try await latest(.bodyFatPercentage, unit: .percent()) },
+            leanBodyMass: { try await latest(.leanBodyMass, unit: .gramUnit(with: .kilo)) })
     }
 
     // MARK: Workouts (+ running dynamics)

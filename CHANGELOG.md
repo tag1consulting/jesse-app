@@ -15,6 +15,23 @@ CI both run it). See the "Versioning" section of `bridge/README.md`.
 
 ## [Unreleased]
 
+## [App 1.0 (26)] — 2026-07-07
+
+### Added
+- **Health context now reports body fat and lean body mass.** The daily-summary
+  weight line gains two optional clauses beside weight: `body fat 25.1% (2026-07-03)`
+  and `lean mass 63.08 kg (2026-07-03)`, each read latest-within-7-days (the same
+  recency window as weight) and omitted when absent or stale. `.bodyFatPercentage`
+  and `.leanBodyMass` were added to `HealthContextProvider`'s quantity read
+  identifiers, so they enter `readTypes` and the re-authorization sheet (read-only;
+  the share/write set is untouched). Body fat comes off HealthKit as a 0…1 fraction
+  and the formatter scales it to a 1-decimal percent; lean mass renders in kg to 2
+  decimals. With both fields nil the rendered block is byte-identical to before, so
+  a day with no body-composition data looks exactly as it did. New
+  `HealthContextTests` cases cover the weight+BF+LBM line, each new clause alone,
+  stale-clause omission, the byte-identity invariant, the fraction→percent
+  conversion, and the empty-context guard.
+
 ## [App 1.0 (25)] — 2026-07-07
 
 ### Security

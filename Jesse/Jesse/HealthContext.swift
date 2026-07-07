@@ -105,13 +105,18 @@ nonisolated struct DailySummary: Equatable, Sendable {
     var todayActiveKcal: Double?
     /// Latest body mass, kg, with its date.
     var weight: DatedValue?
+    /// Latest body fat, as a FRACTION 0…1 (rendered as a percent), with its date.
+    var bodyFat: DatedValue?
+    /// Latest lean body mass, kg, with its date.
+    var leanBodyMass: DatedValue?
 
     init(sleep: SleepSummary? = nil, restingHeartRateBPM: Double? = nil,
          hrvSDNNms: Double? = nil, hrEvents: [HREventSummary] = [],
          vo2Max: DatedValue? = nil, hrRecovery: DatedValue? = nil,
          vitals: OvernightVitals? = nil, mobility: MobilitySummary? = nil,
          todaySteps: Double? = nil, todayActiveKcal: Double? = nil,
-         weight: DatedValue? = nil) {
+         weight: DatedValue? = nil, bodyFat: DatedValue? = nil,
+         leanBodyMass: DatedValue? = nil) {
         self.sleep = sleep
         self.restingHeartRateBPM = restingHeartRateBPM
         self.hrvSDNNms = hrvSDNNms
@@ -123,6 +128,8 @@ nonisolated struct DailySummary: Equatable, Sendable {
         self.todaySteps = todaySteps
         self.todayActiveKcal = todayActiveKcal
         self.weight = weight
+        self.bodyFat = bodyFat
+        self.leanBodyMass = leanBodyMass
     }
 
     static let empty = DailySummary()
@@ -133,6 +140,7 @@ nonisolated struct DailySummary: Equatable, Sendable {
             && hrEvents.isEmpty && vo2Max == nil && hrRecovery == nil
             && (vitals?.isEmpty ?? true) && (mobility?.isEmpty ?? true)
             && todaySteps == nil && todayActiveKcal == nil && weight == nil
+            && bodyFat == nil && leanBodyMass == nil
     }
 }
 
@@ -213,10 +221,28 @@ nonisolated enum DailySummaryFormatter {
         } else if let kcal = d.todayActiveKcal {
             out.append("Today so far: \(int(kcal)) kcal active")
         }
-        if let w = d.weight, within(w.date, now, weightWindow) {
-            out.append("Weight: \(oneDecimal(w.value)) kg (\(day(w.date, timeZone)))")
-        }
+        if let line = weightLine(d, now: now, timeZone: timeZone) { out.append(line) }
         return out
+    }
+
+    /// The weight line plus its optional body-composition clauses (body fat, lean
+    /// mass), each independently recency-checked against the same 7-day window and
+    /// omitted when absent or stale. With only weight present this is byte-identical
+    /// to the pre-body-metrics output ("Weight: 78.4 kg (2026-07-03)"); nil when no
+    /// body-composition metric is fresh.
+    private static func weightLine(_ d: DailySummary, now: Date, timeZone: TimeZone) -> String? {
+        var parts: [String] = []
+        if let w = d.weight, within(w.date, now, weightWindow) {
+            parts.append("\(oneDecimal(w.value)) kg (\(day(w.date, timeZone)))")
+        }
+        if let bf = d.bodyFat, within(bf.date, now, weightWindow) {
+            parts.append("body fat \(oneDecimal(bf.value * 100))% (\(day(bf.date, timeZone)))")
+        }
+        if let lm = d.leanBodyMass, within(lm.date, now, weightWindow) {
+            parts.append("lean mass \(twoDecimal(lm.value)) kg (\(day(lm.date, timeZone)))")
+        }
+        guard !parts.isEmpty else { return nil }
+        return "Weight: " + parts.joined(separator: ", ")
     }
 
     // MARK: line builders
@@ -266,6 +292,7 @@ nonisolated enum DailySummaryFormatter {
     }
     private static func int(_ v: Double) -> String { String(format: "%.0f", v) }
     private static func oneDecimal(_ v: Double) -> String { String(format: "%.1f", v) }
+    private static func twoDecimal(_ v: Double) -> String { String(format: "%.2f", v) }
 
     private static func day(_ date: Date, _ timeZone: TimeZone) -> String {
         fmt("yyyy-MM-dd", timeZone).string(from: date)
@@ -425,12 +452,15 @@ nonisolated struct HealthMetricFetches: Sendable {
     var todaySteps: @Sendable () async throws -> Double?
     var todayActiveKcal: @Sendable () async throws -> Double?
     var weight: @Sendable () async throws -> DatedValue?
+    var bodyFat: @Sendable () async throws -> DatedValue?
+    var leanBodyMass: @Sendable () async throws -> DatedValue?
 
     /// All-empty fetches — the default the live provider overrides per metric.
     static let empty = HealthMetricFetches(
         workouts: { [] }, sleep: { nil }, restingHR: { nil }, hrv: { nil },
         hrEvents: { [] }, vo2Max: { nil }, hrRecovery: { nil }, vitals: { nil },
-        mobility: { nil }, todaySteps: { nil }, todayActiveKcal: { nil }, weight: { nil })
+        mobility: { nil }, todaySteps: { nil }, todayActiveKcal: { nil }, weight: { nil },
+        bodyFat: { nil }, leanBodyMass: { nil })
 }
 
 /// Runs every metric fetch concurrently and assembles a `HealthSnapshot`, isolating
@@ -451,6 +481,8 @@ nonisolated enum HealthContextGather {
         async let todaySteps = (try? f.todaySteps()) ?? nil
         async let todayActiveKcal = (try? f.todayActiveKcal()) ?? nil
         async let weight = (try? f.weight()) ?? nil
+        async let bodyFat = (try? f.bodyFat()) ?? nil
+        async let leanBodyMass = (try? f.leanBodyMass()) ?? nil
 
         let daily = DailySummary(
             sleep: await sleep,
@@ -463,7 +495,9 @@ nonisolated enum HealthContextGather {
             mobility: await mobility,
             todaySteps: await todaySteps,
             todayActiveKcal: await todayActiveKcal,
-            weight: await weight)
+            weight: await weight,
+            bodyFat: await bodyFat,
+            leanBodyMass: await leanBodyMass)
         return HealthSnapshot(daily: daily, workouts: await workouts)
     }
 }
