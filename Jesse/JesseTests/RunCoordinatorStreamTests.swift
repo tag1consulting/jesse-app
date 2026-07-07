@@ -96,8 +96,16 @@ final class RunCoordinatorStreamTests: XCTestCase {
         try await settle()
         XCTAssertEqual(coordinator.activity(for: thread.id), "Reading the vault…")
 
+        // The observable `partialText` is coalesced to ~10Hz: this second delta
+        // lands inside the first publish's cooldown, so it's surfaced by the
+        // deferred flush at the interval boundary rather than immediately. Poll past
+        // that boundary (the exact concatenation is preserved — nothing is dropped).
         fake.emit(.delta("world"))
-        try await settle()
+        let deadline = Date().addingTimeInterval(3)
+        while coordinator.partialText(for: thread.id) != "Hello world",
+              Date() < deadline {
+            try await Task.sleep(for: .milliseconds(10))
+        }
         XCTAssertEqual(coordinator.partialText(for: thread.id), "Hello world")
 
         // The authoritative done frame finalizes the turn.

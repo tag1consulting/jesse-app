@@ -21,6 +21,18 @@ enum ThreadOrigin: String {
     case watch
 }
 
+/// Non-observed memo backing `JesseThread.orderedTurns`. A plain reference type so
+/// the (read-only-looking) getter can cache the sorted array without writing any
+/// *observed* property of the model: the model holds this box in a `@Transient`
+/// slot it never reassigns, so reading it registers no SwiftUI re-render dependency
+/// and mutating the box's fields can't trigger an observation loop during a body
+/// evaluation. Reset to empty whenever a fetched model is materialized.
+private final class OrderedTurnsMemo {
+    var cache: [Turn]?
+    var count = -1
+    var sortCount = 0
+}
+
 @Model
 final class JesseThread {
     var id: UUID = UUID()
@@ -93,10 +105,37 @@ final class JesseThread {
         favoritedAt = value ? now : nil
     }
 
+    // Non-observed memo for `orderedTurns` (see `OrderedTurnsMemo`). Never reassigned
+    // after init, so it registers no observation dependency; its fields are mutated
+    // in place by the getter. @Transient: never persisted, and reset to a fresh empty
+    // box each time SwiftData materializes the model.
+    @Transient private var orderedMemo = OrderedTurnsMemo()
+
     /// Turns in chronological order — `turns` itself is an unordered relationship.
+    ///
+    /// Memoized: this is read in the transcript's hot path, which re-evaluates ~10Hz
+    /// during a streaming reply, and re-sorting the whole thread on every read is
+    /// wasted work when no turn was appended. The cache is keyed on `turns.count` —
+    /// turns are only ever *appended* (never reordered or individually removed;
+    /// deleting a thread cascades all its turns), so a change in count is the only
+    /// way the ordering can change. Reading `turns` still registers the observation
+    /// dependency, so the view re-evaluates (and the cache invalidates) on append.
     var orderedTurns: [Turn] {
-        turns.sorted { $0.createdAt < $1.createdAt }
+        let memo = orderedMemo
+        if let cache = memo.cache, memo.count == turns.count {
+            return cache
+        }
+        let sorted = turns.sorted { $0.createdAt < $1.createdAt }
+        memo.cache = sorted
+        memo.count = turns.count
+        memo.sortCount += 1
+        return sorted
     }
+
+    /// Instrumentation: the number of real sorts `orderedTurns` has performed. A test
+    /// asserts it stays at 1 across repeated reads (the memoization win) and steps to
+    /// 2 after a turn is appended (invalidation). Not persisted.
+    var orderedSortCount: Int { orderedMemo.sortCount }
 
     /// The whole conversation as a role-labeled Markdown transcript, for copy /
     /// share. Uses each turn's *raw* text so any links or formatting survive,

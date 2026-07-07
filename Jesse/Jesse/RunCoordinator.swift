@@ -98,6 +98,12 @@ final class RunCoordinator {
     // injected so a test can drive the backoff sequence deterministically without
     // real waiting.
     private let pollSleep: @MainActor (TimeInterval) async -> Void
+    // Clock read when deciding whether a `partialText` publish is due. Injectable so
+    // a test drives the coalescing cadence deterministically without real waiting.
+    private let now: @MainActor () -> Date
+    // How the deferred partial-flush waits out the cooldown. Injectable for the same
+    // reason; defaults to a real `Task.sleep`.
+    private let flushSleep: @MainActor (TimeInterval) async -> Void
     // Persists the in-flight job map across suspension. Injectable so a test can
     // avoid the shared UserDefaults store.
     private let inFlightStore: InFlightStoring
@@ -114,6 +120,25 @@ final class RunCoordinator {
     // it to snap its backoff back to the fast cadence while the stream is actively
     // delivering tokens. Not observed by views.
     @ObservationIgnored private var streamTicks: [UUID: Int] = [:]
+
+    // Coalescing state for the observable `partialText` (streaming re-eval perf).
+    // The stream delivers deltas far faster than the UI needs to redraw, yet every
+    // mutation of `partialText` re-evaluates `ThreadDetailView.body` and fires its
+    // auto-scroll. So the *exact* accumulated text is buffered here (source of truth
+    // for the flush tail) and PUBLISHED to `partialText` at most once per
+    // `partialFlushInterval` — the same ~10Hz the markdown parse already runs at.
+    // Never throttled by dropping content: the buffer is exact and the tail always
+    // flushes (terminal frame / stream end), so the final published value equals the
+    // concatenation of every chunk. @ObservationIgnored: only `partialText` is observed.
+    @ObservationIgnored private var partialBuffer: [UUID: String] = [:]
+    // threadID → when `partialText` was last published (for the cooldown check).
+    @ObservationIgnored private var partialLastPublish: [UUID: Date] = [:]
+    // threadID → a single pending deferred-flush task (surfaces a tail chunk that
+    // arrived inside the cooldown, at the interval boundary). At most one per thread.
+    @ObservationIgnored private var partialFlushTasks: [UUID: Task<Void, Never>] = [:]
+    // Instrumentation: how many times `partialText` was actually published. A test
+    // asserts this stays ≪ the delta count (the coalescing win); production ignores it.
+    @ObservationIgnored private(set) var partialPublishCount = 0
 
     // threadIDs that have already spent their ONE health-fulfillment retry for the
     // current user message (a reply carried JESSE_NEEDS_HEALTH → we fulfilled + re-
@@ -161,6 +186,8 @@ final class RunCoordinator {
          save: @escaping @MainActor (ModelContext) throws -> Void = { try $0.save() },
          backgroundTasker: BackgroundTasking = UIKitBackgroundTasking(),
          pollSleep: @escaping @MainActor (TimeInterval) async -> Void = { try? await Task.sleep(for: .seconds($0)) },
+         now: @escaping @MainActor () -> Date = { Date() },
+         flushSleep: @escaping @MainActor (TimeInterval) async -> Void = { try? await Task.sleep(for: .seconds($0)) },
          inFlightStore: InFlightStoring? = nil,
          liveActivity: (any TurnLiveActivityManaging)? = nil,
          mealWriter: MealHealthWriter? = nil,
@@ -188,6 +215,8 @@ final class RunCoordinator {
             isEnabled: { WriteMealsToHealthSettings.isEnabled })
         self.backgroundGuard = BackgroundTaskGuard(tasker: backgroundTasker)
         self.pollSleep = pollSleep
+        self.now = now
+        self.flushSleep = flushSleep
         self.inFlightStore = resolvedInFlightStore
         self.onFirstSuccess = onFirstSuccess
         self.inFlight = resolvedInFlightStore.load()
@@ -203,6 +232,12 @@ final class RunCoordinator {
     nonisolated static let pollIntervalCeiling: TimeInterval = 30
     nonisolated static let pollBackoffFactor: Double = 5
 
+    /// Publish cadence for the observable `partialText`. Matched to the streaming
+    /// markdown renderer's parse interval so the transcript body re-evaluates (and
+    /// its auto-scroll fires) at the same ~10Hz the parse already runs at, instead
+    /// of once per delta chunk.
+    nonisolated static let partialFlushInterval: TimeInterval = MarkdownStreamRenderer.interval
+
     /// The next poll interval after `current`: grow by the backoff factor, capped at
     /// the ceiling. Pure, for direct testing. From `pollInterval`: 2 → 10 → 30 → 30…
     nonisolated static func nextPollInterval(after current: TimeInterval) -> TimeInterval {
@@ -214,6 +249,87 @@ final class RunCoordinator {
     /// test can simulate stream activity deterministically.
     func noteStreamActivity(_ threadID: UUID) {
         streamTicks[threadID, default: 0] += 1
+    }
+
+    // MARK: - Partial-text coalescing (streaming re-eval perf)
+
+    /// Append a live stream chunk to the exact buffer and publish the observable
+    /// `partialText` at most once per `partialFlushInterval`. A chunk that arrives
+    /// inside the cooldown is retained in the buffer and surfaced by a single
+    /// scheduled flush at the interval boundary — so the publish rate is bounded but
+    /// no content is ever dropped.
+    private func appendPartial(_ threadID: UUID, _ chunk: String) {
+        partialBuffer[threadID, default: ""] += chunk
+        publishPartialIfDue(threadID)
+    }
+
+    /// Replace the buffer wholesale (an SSE `reset`/replay) and publish immediately —
+    /// a reset is a coarse, rare event, not the per-token hot path.
+    private func resetPartial(_ threadID: UUID, to text: String) {
+        partialBuffer[threadID] = text
+        publishPartial(threadID)
+    }
+
+    /// Publish now if the cooldown has elapsed; otherwise arrange a single deferred
+    /// flush at the boundary so the buffered tail still lands within one interval.
+    private func publishPartialIfDue(_ threadID: UUID) {
+        if let last = partialLastPublish[threadID] {
+            let elapsed = now().timeIntervalSince(last)
+            if elapsed < Self.partialFlushInterval {
+                schedulePartialFlush(threadID, after: Self.partialFlushInterval - elapsed)
+                return
+            }
+        }
+        publishPartial(threadID)
+    }
+
+    /// Copy the current buffer into the observable `partialText`, stamp the publish
+    /// time, and cancel any pending scheduled flush (this publish subsumes it).
+    private func publishPartial(_ threadID: UUID) {
+        partialFlushTasks[threadID]?.cancel()
+        partialFlushTasks[threadID] = nil
+        partialText[threadID] = partialBuffer[threadID]
+        partialLastPublish[threadID] = now()
+        partialPublishCount += 1
+    }
+
+    /// Schedule one deferred publish at the cooldown boundary. Idempotent: a flush
+    /// already pending covers any further chunks that arrive before it fires.
+    private func schedulePartialFlush(_ threadID: UUID, after delay: TimeInterval) {
+        guard partialFlushTasks[threadID] == nil else { return }
+        partialFlushTasks[threadID] = Task { @MainActor [weak self] in
+            await self?.flushSleep(delay)
+            guard let self, !Task.isCancelled else { return }
+            self.partialFlushTasks[threadID] = nil
+            // Republish only if the buffer actually advanced past what's shown.
+            if self.partialText[threadID] != self.partialBuffer[threadID] {
+                self.publishPartial(threadID)
+            }
+        }
+    }
+
+    /// Surface the exact buffered tail immediately — called on a terminal frame or a
+    /// bare stream end so the final published `partialText` equals the concatenation
+    /// of every chunk, with no last delta stranded in the buffer.
+    private func flushPartial(_ threadID: UUID) {
+        guard partialBuffer[threadID] != nil else { return }
+        if partialText[threadID] != partialBuffer[threadID] {
+            publishPartial(threadID)
+        } else {
+            partialFlushTasks[threadID]?.cancel()
+            partialFlushTasks[threadID] = nil
+        }
+    }
+
+    /// Drop all coalescing state for a thread (buffer, publish stamp, pending flush)
+    /// and clear the observable partial. Routed through every run-clear path so a
+    /// scheduled flush can never repopulate `partialText` after the turn has ended.
+    private func clearPartial(_ threadID: UUID) {
+        partialFlushTasks[threadID]?.cancel()
+        partialFlushTasks[threadID] = nil
+        partialBuffer[threadID] = nil
+        partialLastPublish[threadID] = nil
+        partialText[threadID] = nil
     }
 
     // MARK: - Query (read by views)
@@ -632,10 +748,10 @@ final class RunCoordinator {
                 if Task.isCancelled { return nil }
                 switch event {
                 case .reset(let text):
-                    partialText[threadID] = text
+                    resetPartial(threadID, to: text)
                     noteStreamActivity(threadID)
                 case .delta(let chunk):
-                    partialText[threadID, default: ""] += chunk
+                    appendPartial(threadID, chunk)
                     noteStreamActivity(threadID)
                 case .activity(let tool):
                     activity[threadID] = Self.activityLabel(for: tool)
@@ -653,6 +769,10 @@ final class RunCoordinator {
             // Stream dropped/failed — display only, so swallow it; the concurrent
             // poll completes the turn.
         }
+        // Stream ended (bare or errored) without a terminal frame: surface any tail
+        // still buffered by the coalescer so the last delta isn't stranded, then let
+        // the poll own completion.
+        flushPartial(threadID)
         return nil
     }
 
@@ -798,7 +918,7 @@ final class RunCoordinator {
     private func surfaceSaveFailure(_ threadID: UUID) {
         errors[threadID] = "Showed the reply, but couldn't save it — tap Re-check."
         startDates[threadID] = nil
-        partialText[threadID] = nil
+        clearPartial(threadID)
         activity[threadID] = nil
     }
 
@@ -890,7 +1010,7 @@ final class RunCoordinator {
         startDates[threadID] = nil
         // The live view stops (no longer running); drop any half-streamed text so
         // it isn't left dangling. A Re-check/resume reconnects and replays it.
-        partialText[threadID] = nil
+        clearPartial(threadID)
         activity[threadID] = nil
         // The run stopped (idle-with-Re-check) — end the Live Activity.
         syncLiveActivity(threadID)
@@ -972,7 +1092,7 @@ final class RunCoordinator {
     /// stream buffer (so a finished/cancelled turn leaves no half-streamed text).
     private func clearRun(_ threadID: UUID) {
         startDates[threadID] = nil
-        partialText[threadID] = nil
+        clearPartial(threadID)
         activity[threadID] = nil
         if inFlight[threadID] != nil {
             inFlight[threadID] = nil

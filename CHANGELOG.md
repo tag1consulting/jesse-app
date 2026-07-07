@@ -15,6 +15,26 @@ CI both run it). See the "Versioning" section of `bridge/README.md`.
 
 ## [Unreleased]
 
+## [App 1.0 (24)] — 2026-07-07
+
+### Changed
+- **Streaming replies no longer re-evaluate the transcript on every delta.**
+  During a live turn the observable `partialText` was mutated once per SSE delta
+  chunk, and because it's read in `ThreadDetailView.body` (and watched by
+  `.onChange`), the whole transcript body re-evaluated and an auto-scroll fired on
+  *every* chunk — only the markdown *parse* was throttled to 10 Hz, not the body
+  re-eval or the scroll. `RunCoordinator` now coalesces `partialText` publishes to
+  the same ~10 Hz cadence: incoming chunks accumulate in an exact buffer and the
+  observable is published at most once per interval (with a deferred flush so a
+  tail chunk still surfaces within one interval, and an unconditional flush on the
+  terminal frame / stream end). Throttled by *rate only* — never by dropping
+  content: the final published text is the exact concatenation of every chunk.
+- **`JesseThread.orderedTurns` is memoized.** It was re-sorting the entire thread
+  on every read, and it's read in that same ~10 Hz streaming hot path. It now
+  caches the sorted array keyed on the turn count (turns are only ever appended,
+  so a count change is the only way the ordering can change), invalidating on
+  append. Repeated reads with no mutation perform no additional sort.
+
 ## [App 1.0 (23)] — 2026-07-07
 
 ### Fixed
