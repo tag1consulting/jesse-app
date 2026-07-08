@@ -18,7 +18,7 @@ import HealthKit
 nonisolated struct HealthKitMealWriter: MealWriting {
     /// The dietary quantity types this writes — also the app's HealthKit **share**
     /// (write) set, requested at connect time and queried for the write posture.
-    /// This is EXACTLY the four dietary quantity types and nothing else: HealthKit
+    /// This is EXACTLY the five dietary quantity types and nothing else: HealthKit
     /// forbids requesting authorization for an `HKCorrelationType` (the `.food`
     /// container) at all, and raises `NSInvalidArgumentException` at the
     /// `requestAuthorization` call if one appears here. Saving the `.food`
@@ -29,6 +29,7 @@ nonisolated struct HealthKitMealWriter: MealWriting {
         HKQuantityType(.dietaryProtein),
         HKQuantityType(.dietaryCarbohydrates),
         HKQuantityType(.dietaryFatTotal),
+        HKQuantityType(.dietaryFiber),
     ]
 
     /// The representative type whose share status stands for "meal writing" (they
@@ -49,6 +50,7 @@ nonisolated struct HealthKitMealWriter: MealWriting {
         add(.dietaryProtein, .gram(), meal.proteinGrams)
         add(.dietaryCarbohydrates, .gram(), meal.carbGrams)
         add(.dietaryFatTotal, .gram(), meal.fatGrams)
+        add(.dietaryFiber, .gram(), meal.fiberGrams)
 
         // A meal with no macros has nothing quantitative to store — a correlation
         // needs at least one sample. Treat it as done (so it's recorded and never

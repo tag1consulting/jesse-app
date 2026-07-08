@@ -37,9 +37,10 @@ final class MealHealthWriterTests: XCTestCase {
         func peek() -> [Meal] { meals }
     }
 
-    private func meal(_ id: String) -> Meal {
+    private func meal(_ id: String, fiber: Double? = nil) -> Meal {
         Meal(id: id, consumedAt: Date(timeIntervalSince1970: 1_780_000_000),
-             name: "Meal \(id)", kcal: 100, proteinGrams: nil, carbGrams: nil, fatGrams: nil)
+             name: "Meal \(id)", kcal: 100, proteinGrams: nil, carbGrams: nil,
+             fatGrams: nil, fiberGrams: fiber)
     }
 
     private func writer(_ w: FakeMealWriter, _ p: InMemoryPending,
@@ -54,6 +55,15 @@ final class MealHealthWriterTests: XCTestCase {
         XCTAssertEqual(wrote.sorted(), ["a", "b"])
         XCTAssertEqual(store.ids, ["a", "b"])
         XCTAssertTrue(p.peek().isEmpty, "successful writes leave the pending queue empty")
+    }
+
+    func testWritesAMealCarryingFiber() async {
+        let w = FakeMealWriter(); let p = InMemoryPending(); let store = InMemoryWrittenStore()
+        await writer(w, p).process([meal("f", fiber: 6)], written: store)
+        let wrote = await w.writtenIds()
+        XCTAssertEqual(wrote, ["f"], "a meal carrying fiber writes and is recorded")
+        XCTAssertEqual(store.ids, ["f"])
+        XCTAssertTrue(p.peek().isEmpty)
     }
 
     func testAlreadyWrittenMealIsSkipped() async {

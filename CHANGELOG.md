@@ -15,6 +15,34 @@ CI both run it). See the "Versioning" section of `bridge/README.md`.
 
 ## [Unreleased]
 
+## [App 1.0 (27)] — 2026-07-08
+
+### Added
+- **Dietary fiber now flows from a logged meal into Apple Health.** Fiber is
+  carried end to end exactly like the existing four macros (kcal, protein, carbs,
+  fat): optional per meal, present as a finite non-negative number or omitted —
+  never null-padded. `JesseMeal` decodes `fiber_g` into `fiberGrams`, the domain
+  `Meal` gains `fiberGrams`, and `MealLogParser.meal(from:)` validates it in the
+  macro loop (finite, non-negative). `HealthKitMealWriter` adds
+  `.dietaryFiber` to its share set — now exactly the five dietary quantity types,
+  still no correlation container — and writes a grams sample into the `.food`
+  correlation after fat. The persisted pending-write queue carries the new
+  optional Codable field, so old queued meals decode with `fiberGrams == nil` (no
+  migration). New/extended cases across wire decode, the parser matrix, the
+  authorization type set, the writer, and the pending store cover fiber present,
+  absent, zero, and negative-rejected.
+
+## [Bridge 0.4.2] — 2026-07-08
+
+### Added
+- **`JESSE_MEAL_LOG v1` meals may now carry `fiber_g`.** `fiber_g` joins the meal
+  field allowlist and the `Meal` struct (with the same
+  `skip_serializing_if = "Option::is_none"` treatment as the other macros, so an
+  absent value is omitted from the wire, never serialized as `null`), extracted
+  via `optional_macro`. The parser matrix gains fiber coverage: round-trip decode,
+  absent-omitted, zero-valid, and rejects-negative / rejects-non-numeric — the
+  same coverage the other macros already had.
+
 ## [App 1.0 (26)] — 2026-07-07
 
 ### Added

@@ -21,6 +21,7 @@ nonisolated struct Meal: Codable, Equatable, Sendable {
     let proteinGrams: Double?
     let carbGrams: Double?
     let fatGrams: Double?
+    let fiberGrams: Double?
 }
 
 /// The pure validator + display scrubber for the `JESSE_MEAL_LOG v1` contract.
@@ -61,12 +62,13 @@ nonisolated enum MealLogParser {
         let id = m.id.trimmingCharacters(in: .whitespacesAndNewlines)
         let name = m.name.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !id.isEmpty, !name.isEmpty, let date = parseDate(m.consumedAt) else { return nil }
-        for macro in [m.kcal, m.proteinGrams, m.carbGrams, m.fatGrams] {
+        for macro in [m.kcal, m.proteinGrams, m.carbGrams, m.fatGrams, m.fiberGrams] {
             if let v = macro, !(v.isFinite && v >= 0) { return nil }
         }
         return Meal(id: id, consumedAt: date, name: name,
                     kcal: m.kcal, proteinGrams: m.proteinGrams,
-                    carbGrams: m.carbGrams, fatGrams: m.fatGrams)
+                    carbGrams: m.carbGrams, fatGrams: m.fatGrams,
+                    fiberGrams: m.fiberGrams)
     }
 
     /// Parse an ISO-8601 date-time WITH offset, tolerating optional fractional

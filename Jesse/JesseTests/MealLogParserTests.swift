@@ -12,9 +12,11 @@ final class MealLogParserTests: XCTestCase {
                       consumedAt: String = "2026-07-04T12:30:00+02:00",
                       name: String = "Lunch: spaghetti, red sauce",
                       kcal: Double? = 385, protein: Double? = 13,
-                      carbs: Double? = 77, fat: Double? = 4.5) -> JesseMeal {
+                      carbs: Double? = 77, fat: Double? = 4.5,
+                      fiber: Double? = 6) -> JesseMeal {
         JesseMeal(id: id, consumedAt: consumedAt, name: name,
-                  kcal: kcal, proteinGrams: protein, carbGrams: carbs, fatGrams: fat)
+                  kcal: kcal, proteinGrams: protein, carbGrams: carbs, fatGrams: fat,
+                  fiberGrams: fiber)
     }
 
     // MARK: - Validation / mapping
@@ -29,18 +31,20 @@ final class MealLogParserTests: XCTestCase {
         XCTAssertEqual(m.proteinGrams, 13)
         XCTAssertEqual(m.carbGrams, 77)
         XCTAssertEqual(m.fatGrams, 4.5)
+        XCTAssertEqual(m.fiberGrams, 6)
         // The ISO-8601 offset is parsed to the correct instant.
         XCTAssertEqual(m.consumedAt, MealLogParser.parseDate("2026-07-04T12:30:00+02:00"))
     }
 
     func testMissingOptionalMacrosAreNil() {
-        let m = meal(kcal: nil, protein: nil, carbs: nil, fat: nil)
+        let m = meal(kcal: nil, protein: nil, carbs: nil, fat: nil, fiber: nil)
         let meals = MealLogParser.meals(from: JesseMealLog(meals: [m]))
         XCTAssertEqual(meals?.count, 1)
         XCTAssertNil(meals?[0].kcal)
         XCTAssertNil(meals?[0].proteinGrams)
         XCTAssertNil(meals?[0].carbGrams)
         XCTAssertNil(meals?[0].fatGrams)
+        XCTAssertNil(meals?[0].fiberGrams)
     }
 
     func testMultiMealArrayPreservesOrder() {
@@ -53,6 +57,11 @@ final class MealLogParserTests: XCTestCase {
     func testZeroIsAValidMacro() {
         let meals = MealLogParser.meals(from: JesseMealLog(meals: [meal(kcal: 0)]))
         XCTAssertEqual(meals?[0].kcal, 0)
+    }
+
+    func testZeroFiberIsAValidMacro() {
+        let meals = MealLogParser.meals(from: JesseMealLog(meals: [meal(fiber: 0)]))
+        XCTAssertEqual(meals?[0].fiberGrams, 0)
     }
 
     func testEmptyArrayIsRejected() {
@@ -97,9 +106,14 @@ final class MealLogParserTests: XCTestCase {
         XCTAssertNil(MealLogParser.meal(from: meal(kcal: -5)))
     }
 
+    func testNegativeFiberRejected() {
+        XCTAssertNil(MealLogParser.meal(from: meal(fiber: -1)))
+    }
+
     func testNonFiniteMacroRejected() {
         XCTAssertNil(MealLogParser.meal(from: meal(protein: .infinity)))
         XCTAssertNil(MealLogParser.meal(from: meal(carbs: .nan)))
+        XCTAssertNil(MealLogParser.meal(from: meal(fiber: .infinity)))
     }
 
     // MARK: - Streaming display scrubber

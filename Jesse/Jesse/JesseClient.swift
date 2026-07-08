@@ -489,11 +489,13 @@ nonisolated struct JesseMeal: Decodable, Equatable {
     let proteinGrams: Double?
     let carbGrams: Double?
     let fatGrams: Double?
+    let fiberGrams: Double?
     enum CodingKeys: String, CodingKey {
         case id, consumedAt, name, kcal
         case proteinGrams = "protein_g"
         case carbGrams = "carbs_g"
         case fatGrams = "fat_g"
+        case fiberGrams = "fiber_g"
     }
 }
 

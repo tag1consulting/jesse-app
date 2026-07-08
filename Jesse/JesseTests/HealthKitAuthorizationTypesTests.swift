@@ -15,18 +15,19 @@ import HealthKit
 /// unexercisable in the sandbox and only ever failed on device.
 final class HealthKitAuthorizationTypesTests: XCTestCase {
 
-    /// The share (write) set is EXACTLY the four dietary quantity types from the
-    /// phase-3 spec — no more, no fewer, and specifically no correlation container.
-    func testShareSetIsExactlyTheFourDietaryQuantityTypes() {
+    /// The share (write) set is EXACTLY the five dietary quantity types — no more,
+    /// no fewer, and specifically no correlation container.
+    func testShareSetIsExactlyTheFiveDietaryQuantityTypes() {
         let expected: Set<String> = Set([
             HKQuantityTypeIdentifier.dietaryEnergyConsumed,
             .dietaryProtein,
             .dietaryCarbohydrates,
             .dietaryFatTotal,
+            .dietaryFiber,
         ].map(\.rawValue))
         let actual = Set(HealthKitMealWriter.shareTypes.map(\.identifier))
         XCTAssertEqual(actual, expected,
-                       "share set must be exactly the four dietary quantity types")
+                       "share set must be exactly the five dietary quantity types")
     }
 
     /// No identifier in ANY authorization set (read or share) may be a correlation

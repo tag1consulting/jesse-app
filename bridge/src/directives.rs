@@ -55,7 +55,8 @@ pub const MAX_MEALS: usize = 10;
 /// The optional macro fields a meal may carry, and the only keys (besides the
 /// required `id`/`consumedAt`/`name`) allowed on a meal object. A typo'd or extra
 /// key is a loud failure, mirroring the needs-health payload's unknown-key check.
-const MEAL_FIELDS: &[&str] = &["id", "consumedAt", "name", "kcal", "protein_g", "carbs_g", "fat_g"];
+const MEAL_FIELDS: &[&str] =
+    &["id", "consumedAt", "name", "kcal", "protein_g", "carbs_g", "fat_g", "fiber_g"];
 
 /// Sections a `JESSE_NEEDS_HEALTH` directive may request (the phone-assembled
 /// two-section health block). Kept in sync with the app's formatter.
@@ -123,6 +124,8 @@ pub struct Meal {
     pub carbs_g: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fat_g: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fiber_g: Option<f64>,
 }
 
 /// The parsed payload of a `JESSE_MEAL_LOG v1` directive: one or more meals the
@@ -461,6 +464,7 @@ fn parse_meal(item: &Value) -> Result<Meal, String> {
         protein_g: optional_macro(m, "protein_g")?,
         carbs_g: optional_macro(m, "carbs_g")?,
         fat_g: optional_macro(m, "fat_g")?,
+        fiber_g: optional_macro(m, "fiber_g")?,
     })
 }
 
@@ -715,6 +719,7 @@ mod tests {
                     protein_g: None,
                     carbs_g: None,
                     fat_g: Some(4.5),
+                    fiber_g: Some(6.0),
                 }],
             }),
         };
@@ -725,6 +730,7 @@ mod tests {
         assert_eq!(meal["consumedAt"], "2026-07-04T12:30:00+02:00");
         assert_eq!(meal["kcal"], 385.0);
         assert_eq!(meal["fat_g"], 4.5);
+        assert_eq!(meal["fiber_g"], 6.0);
         assert!(meal.get("protein_g").is_none(), "absent macro omitted, not null");
         assert!(meal.get("carbs_g").is_none());
     }
@@ -788,7 +794,7 @@ mod tests {
     fn meal_log_full_meal_is_parsed_and_stripped() {
         let reply = "Logged.\nJESSE_MEAL_LOG v1 {\"meals\":[{\"id\":\"2026-07-04-lunch\",\
             \"consumedAt\":\"2026-07-04T12:30:00+02:00\",\"name\":\"Lunch: spaghetti, red sauce\",\
-            \"kcal\":385,\"protein_g\":13,\"carbs_g\":77,\"fat_g\":4.5}]}";
+            \"kcal\":385,\"protein_g\":13,\"carbs_g\":77,\"fat_g\":4.5,\"fiber_g\":6}]}";
         let (text, directives) = extract_directives(reply);
         assert_eq!(text, "Logged.", "the meal line is stripped, prose kept");
         let ml = directives.unwrap().meal_log.unwrap();
@@ -801,6 +807,7 @@ mod tests {
         assert_eq!(m.protein_g, Some(13.0));
         assert_eq!(m.carbs_g, Some(77.0));
         assert_eq!(m.fat_g, Some(4.5));
+        assert_eq!(m.fiber_g, Some(6.0));
     }
 
     #[test]
@@ -809,7 +816,13 @@ mod tests {
         let reply = "JESSE_MEAL_LOG v1 {\"meals\":[{\"id\":\"a\",\"consumedAt\":\"t\",\"name\":\"Apple\"}]}";
         let m = meal_log(reply).unwrap().meals.remove(0);
         assert_eq!(m.name, "Apple");
-        assert!(m.kcal.is_none() && m.protein_g.is_none() && m.carbs_g.is_none() && m.fat_g.is_none());
+        assert!(
+            m.kcal.is_none()
+                && m.protein_g.is_none()
+                && m.carbs_g.is_none()
+                && m.fat_g.is_none()
+                && m.fiber_g.is_none()
+        );
     }
 
     #[test]
@@ -826,10 +839,11 @@ mod tests {
     #[test]
     fn meal_log_integer_and_float_macros_both_parse() {
         // JSON ints (385) and floats (4.5) both decode to f64.
-        let reply = "JESSE_MEAL_LOG v1 {\"meals\":[{\"id\":\"a\",\"consumedAt\":\"t\",\"name\":\"n\",\"kcal\":0,\"fat_g\":0.5}]}";
+        let reply = "JESSE_MEAL_LOG v1 {\"meals\":[{\"id\":\"a\",\"consumedAt\":\"t\",\"name\":\"n\",\"kcal\":0,\"fat_g\":0.5,\"fiber_g\":0}]}";
         let m = meal_log(reply).unwrap().meals.remove(0);
         assert_eq!(m.kcal, Some(0.0), "zero is a valid non-negative macro");
         assert_eq!(m.fat_g, Some(0.5));
+        assert_eq!(m.fiber_g, Some(0.0), "zero fiber is a valid non-negative macro");
     }
 
     #[test]
@@ -872,6 +886,10 @@ mod tests {
             "JESSE_MEAL_LOG v1 {\"meals\":[{\"id\":\"a\",\"consumedAt\":\"t\",\"name\":\"n\",\"kcal\":null}]}",
             // negative macro
             "JESSE_MEAL_LOG v1 {\"meals\":[{\"id\":\"a\",\"consumedAt\":\"t\",\"name\":\"n\",\"kcal\":-5}]}",
+            // fiber not a number
+            "JESSE_MEAL_LOG v1 {\"meals\":[{\"id\":\"a\",\"consumedAt\":\"t\",\"name\":\"n\",\"fiber_g\":\"lots\"}]}",
+            // negative fiber
+            "JESSE_MEAL_LOG v1 {\"meals\":[{\"id\":\"a\",\"consumedAt\":\"t\",\"name\":\"n\",\"fiber_g\":-1}]}",
         ] {
             let (text, directives) = extract_directives(reply);
             assert_eq!(text, reply, "malformed meal_log stays visible: {reply:?}");

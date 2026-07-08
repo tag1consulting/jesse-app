@@ -22,9 +22,10 @@ final class PendingMealStoreTests: XCTestCase {
         super.tearDown()
     }
 
-    private func meal(_ id: String, kcal: Double? = 100) -> Meal {
+    private func meal(_ id: String, kcal: Double? = 100, fiber: Double? = nil) -> Meal {
         Meal(id: id, consumedAt: Date(timeIntervalSince1970: 1_780_000_000),
-             name: "Meal \(id)", kcal: kcal, proteinGrams: nil, carbGrams: nil, fatGrams: nil)
+             name: "Meal \(id)", kcal: kcal, proteinGrams: nil, carbGrams: nil,
+             fatGrams: nil, fiberGrams: fiber)
     }
 
     func testEnqueueThenDequeueRoundTrips() {
@@ -35,6 +36,16 @@ final class PendingMealStoreTests: XCTestCase {
         let out = reloaded.dequeueAll()
         XCTAssertEqual(out.map(\.id), ["a", "b"])
         XCTAssertEqual(out.first?.kcal, 100)
+    }
+
+    func testFiberRoundTripsAcrossRelaunch() {
+        let store = PendingMealStore(defaults: defaults)
+        store.enqueue([meal("a", fiber: 6)])
+        // A fresh store over the SAME defaults is the "relaunch": fiber survives.
+        let reloaded = PendingMealStore(defaults: defaults)
+        let out = reloaded.dequeueAll()
+        XCTAssertEqual(out.map(\.id), ["a"])
+        XCTAssertEqual(out.first?.fiberGrams, 6)
     }
 
     func testDequeueClearsTheStore() {

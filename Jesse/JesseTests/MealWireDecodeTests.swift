@@ -17,7 +17,7 @@ final class MealWireDecodeTests: XCTestCase {
          "directives":{"meal_log":{"meals":[
            {"id":"2026-07-04-lunch","consumedAt":"2026-07-04T12:30:00+02:00",
             "name":"Lunch: spaghetti, red sauce","kcal":385,"protein_g":13,
-            "carbs_g":77,"fat_g":4.5}]}}}
+            "carbs_g":77,"fat_g":4.5,"fiber_g":6}]}}}
         """
         let r = try decodeResult(json)
         let meals = try XCTUnwrap(r.directives?.mealLog?.meals)
@@ -29,6 +29,7 @@ final class MealWireDecodeTests: XCTestCase {
         XCTAssertEqual(meals[0].proteinGrams, 13)   // protein_g
         XCTAssertEqual(meals[0].carbGrams, 77)      // carbs_g
         XCTAssertEqual(meals[0].fatGrams, 4.5)      // fat_g
+        XCTAssertEqual(meals[0].fiberGrams, 6)      // fiber_g
     }
 
     func testOmittedMacrosDecodeToNil() throws {
@@ -42,6 +43,7 @@ final class MealWireDecodeTests: XCTestCase {
         XCTAssertNil(meal.proteinGrams)
         XCTAssertNil(meal.carbGrams)
         XCTAssertNil(meal.fatGrams)
+        XCTAssertNil(meal.fiberGrams)
     }
 
     func testAbsentDirectivesDecodeToNil() throws {
@@ -93,7 +95,8 @@ final class MealWireDecodeTests: XCTestCase {
         // never a partial write.
         let bad = JesseMealLog(meals: [JesseMeal(id: "a", consumedAt: "nope", name: "X",
                                                  kcal: nil, proteinGrams: nil,
-                                                 carbGrams: nil, fatGrams: nil)])
+                                                 carbGrams: nil, fatGrams: nil,
+                                                 fiberGrams: nil)])
         let reply = JesseReply(text: "ok", sessionId: nil,
                                directives: JesseDirectives(needsHealth: nil, mealLog: bad))
         XCTAssertNil(reply.mealsToLog)
