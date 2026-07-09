@@ -194,6 +194,52 @@ mod tests {
     }
 
     #[test]
+    fn tool_discipline_accepts_both_397_8_spellings() {
+        // Regression: the `tool-discipline` task asks for 17% of 2,340 = 397.8.
+        // Its answer_matches pattern must accept the mathematically-correct answer
+        // written EITHER as `397.8` or `397.80` — a real eval run was misgraded
+        // when the model answered `397.80` and the pattern's `\b` rejected it.
+        // Exercise the SHIPPED suite so the pattern in jesse-v1.json is what's
+        // under test, not a copy of it.
+        let bytes = include_bytes!("../suites/jesse-v1.json");
+        let suite = crate::suite::Suite::from_json(bytes).expect("jesse-v1 suite parses");
+        let task = suite
+            .tasks
+            .iter()
+            .find(|t| t.id == "tool-discipline")
+            .expect("tool-discipline task present in suite");
+        let pattern = task
+            .assertions
+            .iter()
+            .find_map(|a| match a {
+                Assertion::AnswerMatches { pattern } => Some(pattern.clone()),
+                _ => None,
+            })
+            .expect("tool-discipline has an answer_matches assertion");
+
+        let dir = std::env::temp_dir();
+        for ans in [
+            "397.8",
+            "397.80",
+            "17% of 2,340 = 397.8",
+            "So 0.17 * 2340 = 397.80",
+        ] {
+            let r = eval_assertion(
+                &Assertion::AnswerMatches {
+                    pattern: pattern.clone(),
+                },
+                &tr(ans, 0, true),
+                &dir,
+            );
+            assert!(
+                r.passed,
+                "pattern /{pattern}/ should accept answer {ans:?}: {}",
+                r.detail
+            );
+        }
+    }
+
+    #[test]
     fn max_tool_calls_ceiling() {
         let t = tr("done", 3, true);
         let dir = std::env::temp_dir();
