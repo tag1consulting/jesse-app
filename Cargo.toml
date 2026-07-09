@@ -1,0 +1,11 @@
+# Root workspace. It exists only to host the `eval/` crate (the eval harness).
+#
+# `bridge/` is deliberately EXCLUDED: it is a self-contained crate with its own
+# Cargo.lock and its CI job builds it from `working-directory: bridge`. Excluding
+# it here means `cargo` invoked inside `bridge/` still resolves bridge as its own
+# single-package workspace — same Cargo.lock, same target dir, byte-for-byte the
+# same build as before this workspace existed. Nothing about the bridge changes.
+[workspace]
+resolver = "2"
+members = ["eval"]
+exclude = ["bridge"]
