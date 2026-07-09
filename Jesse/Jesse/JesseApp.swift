@@ -17,7 +17,7 @@ struct JesseApp: App {
 
     var body: some Scene {
         WindowGroup {
-            ContentView()
+            RootTabView()
                 .environment(coordinator)
         }
         .modelContainer(AppModelContainer.shared)

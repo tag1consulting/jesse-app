@@ -252,6 +252,19 @@ enum JesseError: LocalizedError {
     }
 }
 
+/// Why a `GET /jesse/diet` fetch failed, distinguished so the Health tab can show
+/// the right full-screen empty state instead of one generic error. Each case maps
+/// to a distinct recovery hint (pair, check the bridge, update the bridge, retry).
+enum DietFetchError: Error, Equatable {
+    case notConfigured          // no host/token — never paired
+    case unreachable(String)    // offline / DNS / connection dropped (message names the host)
+    case authFailed             // 401 — token wrong
+    case endpointMissing        // 404 — a bridge too old to have /jesse/diet
+    case unavailable            // 503 — bridge up but diet-today.js is broken
+    case decodeFailed           // 2xx but the body didn't decode
+    case server(Int)            // any other non-2xx
+}
+
 struct JesseReply: Equatable {
     let text: String         // raw response from the bridge
     let sessionId: String?   // carry into the next call to continue the thread
@@ -592,6 +605,13 @@ protocol JesseClientProtocol {
                         sessionId: String?, voice: Bool, instructions: String?,
                         floorOverride: String?) async throws -> JesseSendResult
     func result(jobId: String) async throws -> JesseResultState
+    /// Fetch the diet snapshot (`GET /jesse/diet`, bridge ≥ 0.5.0) for the Health
+    /// tab. Throws a `DietFetchError` that distinguishes offline / auth / an older
+    /// bridge without the endpoint (404) / a broken diet-today (503) / a decode
+    /// failure, so the tab can show the matching empty state. Default throws
+    /// `.endpointMissing` so existing fakes that don't model diet behave like an
+    /// old bridge.
+    func fetchDietSnapshot() async throws -> DietSnapshot
     /// Probe `GET /health` and parse the bridge's reported version. Used to show
     /// the running bridge version in Settings alongside the app's own. Throws on a
     /// transport/HTTP failure; a bridge too old to report a version returns
@@ -635,6 +655,11 @@ extension JesseClientProtocol {
     // implement the health probe; only the production `JesseClient` — and the
     // test that exercises this seam — return a real version.
     func health() async throws -> BridgeHealth { BridgeHealth(version: nil) }
+    // Default "old bridge": a fake that doesn't model the diet endpoint behaves
+    // exactly like a bridge that predates it (404 → the "bridge update needed"
+    // empty state). Only the production `JesseClient` and the dashboard's own fake
+    // implement it.
+    func fetchDietSnapshot() async throws -> DietSnapshot { throw DietFetchError.endpointMissing }
     // Default no-ops so existing conformers (the test fakes) need not implement
     // the push methods; only the production `JesseClient` does the real calls.
     func registerDevice(token: String) async throws {}
@@ -1128,6 +1153,47 @@ struct JesseClient: JesseClientProtocol {
             throw JesseError.from(error, host: config.normalizedHost)
         }
         return try Self.decodePrompts(data: data, resp: resp)
+    }
+
+    /// Fetch the diet snapshot (`GET /jesse/diet`). Mirrors the other GETs' URL
+    /// build + bearer auth, but maps failures onto the richer `DietFetchError` the
+    /// Health tab needs: a transport failure → `.unreachable`, `401` → `.authFailed`,
+    /// `404` → `.endpointMissing` (older bridge), `503` → `.unavailable`, a 2xx that
+    /// won't decode → `.decodeFailed`.
+    func fetchDietSnapshot() async throws -> DietSnapshot {
+        guard !config.normalizedHost.isEmpty, !config.token.isEmpty,
+              let url = config.endpoint("/jesse/diet") else { throw DietFetchError.notConfigured }
+        var req = URLRequest(url: url)
+        req.httpMethod = "GET"
+        req.setValue("Bearer \(config.token)", forHTTPHeaderField: "Authorization")
+
+        let data: Data, resp: URLResponse
+        do {
+            (data, resp) = try await session.data(for: req)
+        } catch {
+            let je = JesseError.from(error, host: config.normalizedHost)
+            throw DietFetchError.unreachable(je.errorDescription ?? "Couldn't reach the bridge.")
+        }
+        return try Self.decodeDiet(data: data, resp: resp)
+    }
+
+    /// Map a `GET /jesse/diet` response to a snapshot or the matching
+    /// `DietFetchError`. Pure/static so it's unit-testable without a server.
+    static func decodeDiet(data: Data, resp: URLResponse) throws -> DietSnapshot {
+        guard let http = resp as? HTTPURLResponse else { throw DietFetchError.decodeFailed }
+        switch http.statusCode {
+        case 401:
+            throw DietFetchError.authFailed
+        case 404:
+            throw DietFetchError.endpointMissing
+        case 503:
+            throw DietFetchError.unavailable
+        case 200..<300:
+            do { return try DietSnapshot.decode(from: data) }
+            catch { throw DietFetchError.decodeFailed }
+        default:
+            throw DietFetchError.server(http.statusCode)
+        }
     }
 
     // Body encode/decode split out as pure, static functions so the wire contract

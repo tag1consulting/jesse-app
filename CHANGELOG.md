@@ -15,6 +15,36 @@ CI both run it). See the "Versioning" section of `bridge/README.md`.
 
 ## [Unreleased]
 
+## [App 1.0 (28)] — 2026-07-09
+
+### Added
+- **New "Health" tab — a native diet dashboard with progressive disclosure.** The
+  app root becomes a two-tab `TabView`: the existing conversation UI is unchanged
+  inside a "Chats" tab, and a new "Health" tab renders the `GET /jesse/diet`
+  snapshot (bridge ≥ 0.5.0) natively. The Level-1 "Today" screen is scannable in
+  five seconds — date + day-style chip + "updated HH:MM", a weight card (delta vs
+  the previous weigh-in; BF%/lean only from a real same-day weigh-in, never carried
+  forward), a large calories-remaining card with a status-colored bar and a net
+  line, a four-gauge macro strip, a one-line coach headline, and nav rows with
+  summaries. Six Level-2 detail screens drill in: macros & calories (tappable bar
+  rows open an explainer sheet), food journal (with meal ideas from `proposed`),
+  exercise, weight & trend (a Swift Charts line with a 7-day moving average, target
+  rule marks, a 30d/90d/all range picker, drag-to-scrub, and a BF% toggle),
+  progress & pace, and coach's notes. A pure, fully-unit-tested semantics engine
+  (`DietSemantics`) ports the browser dashboard's rules exactly — day-style
+  ceiling/window/floor profiles, the carb-load flips (calories→window, fat→ceiling,
+  fiber suspended), status color bands, remaining annotations, the exercise
+  carb-bonus, net calories, and the after-4pm gated "low" flags (the hour is
+  injected, never `Date()`). Coach-note HTML (`<strong>` + a few entities) renders
+  as an `AttributedString`. `JesseClient.fetchDietSnapshot()` maps failures onto a
+  `DietFetchError` that drives distinct full-screen empty states (not paired,
+  unreachable, auth failed, bridge-update-needed for a 404, and 503), and a failed
+  refresh never blanks a previously-rendered screen. Refresh happens on tab appear,
+  on pull, and after any turn completes while the tab is active. A "+" quick-log
+  button prefills a Tell turn (Meal / Snack / Weigh-in / Workout) through the
+  existing thread machinery, so a logged meal comes back reflected on the next
+  refresh.
+
 ## [Bridge 0.5.0] — 2026-07-09
 
 ### Added
