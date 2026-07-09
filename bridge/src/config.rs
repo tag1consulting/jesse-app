@@ -149,6 +149,15 @@ pub struct Config {
     // temp dir. Set JESSE_SCRATCH_DIR to point this at a sandbox-mounted path if
     // the bridge is ever confined so it can't read the system temp dir.
     pub scratch_dir: Option<String>,
+    // Optional title-endpoint backend override: `Some((base_url, auth_token,
+    // model))` only when ALL THREE of JESSE_TITLE_BASE_URL / JESSE_TITLE_AUTH_TOKEN
+    // / JESSE_TITLE_MODEL are set (see `resolve_title_backend` for the all-or-
+    // nothing rule). When `Some`, the `POST /jesse/title` one-shot child — and
+    // ONLY that child — gets ANTHROPIC_BASE_URL / ANTHROPIC_AUTH_TOKEN /
+    // ANTHROPIC_MODEL set to these values, so a title can be served by a cheap,
+    // fast local backend while main turns keep using the ambient credentials.
+    // `None` → titles use the ambient backend, byte-for-byte today's behavior.
+    pub title_backend: Option<(String, String, String)>,
 }
 
 impl Config {
@@ -217,6 +226,35 @@ pub fn env_parse<T: std::str::FromStr>(name: &str, default: T) -> T {
         .unwrap_or(default)
 }
 
+/// Resolve the optional title-endpoint backend override from its three
+/// env-derived parts. Returns `Some((base_url, auth_token, model))` ONLY when all
+/// three are present; any partial combination (one or two set) resolves to `None`
+/// so titles fall back to the ambient backend — the "partial config is treated as
+/// unset" rule. On a partial config it logs one warning at startup so a
+/// half-configured deploy is visible rather than silently half-redirecting. Pure
+/// except for that warning; the `Some`/`None` result is what encodes the rule.
+pub fn resolve_title_backend(
+    base_url: Option<String>,
+    auth_token: Option<String>,
+    model: Option<String>,
+) -> Option<(String, String, String)> {
+    match (base_url, auth_token, model) {
+        (Some(b), Some(t), Some(m)) => Some((b, t, m)),
+        (b, t, m) => {
+            let set = b.is_some() as u8 + t.is_some() as u8 + m.is_some() as u8;
+            if set > 0 {
+                eprintln!(
+                    "jesse-bridge: WARNING partial JESSE_TITLE_* config ({set}/3 set) — the \
+                     title-backend override needs ALL of JESSE_TITLE_BASE_URL, \
+                     JESSE_TITLE_AUTH_TOKEN, JESSE_TITLE_MODEL; treating as unset \
+                     (titles use the ambient backend)."
+                );
+            }
+            None
+        }
+    }
+}
+
 impl Config {
     pub fn from_env() -> Self {
         let home = std::env::var("HOME").unwrap_or_default();
@@ -265,6 +303,15 @@ impl Config {
                 DEFAULT_MAX_ATTACHMENTS_TOTAL_BYTES,
             ),
             scratch_dir: env_string("JESSE_SCRATCH_DIR"),
+            // All-or-nothing title-backend override. Uses the same `env_string`
+            // (trimmed, empty-filtered) semantics as every other string field, so
+            // a blank value counts as unset. Partial config logs a warning and
+            // resolves to None (see `resolve_title_backend`).
+            title_backend: resolve_title_backend(
+                env_string("JESSE_TITLE_BASE_URL"),
+                env_string("JESSE_TITLE_AUTH_TOKEN"),
+                env_string("JESSE_TITLE_MODEL"),
+            ),
         }
     }
 }
@@ -383,6 +430,92 @@ mod tests {
             None => std::env::remove_var("JESSE_TIMEOUT"),
         }
     }
+    #[test]
+    fn title_backend_resolves_only_when_all_three_present() {
+        // All-or-nothing: the override resolves ONLY when base_url, auth_token,
+        // AND model are all set. This is the load-bearing "partial config is
+        // treated as unset" rule — any missing part falls back to the ambient
+        // backend so a half-configured deploy never silently half-redirects.
+        let full = resolve_title_backend(
+            Some("http://127.0.0.1:9100".into()),
+            Some("dummy-tok".into()),
+            Some("local-title".into()),
+        );
+        assert_eq!(
+            full,
+            Some((
+                "http://127.0.0.1:9100".to_string(),
+                "dummy-tok".to_string(),
+                "local-title".to_string(),
+            ))
+        );
+        // Every partial combination (1 or 2 of 3 set) resolves to None.
+        let s = || Some("x".to_string());
+        let partials = [
+            (s(), s(), None),
+            (s(), None, s()),
+            (None, s(), s()),
+            (s(), None, None),
+            (None, s(), None),
+            (None, None, s()),
+            (None, None, None),
+        ];
+        for (b, t, m) in partials {
+            assert_eq!(
+                resolve_title_backend(b, t, m),
+                None,
+                "partial title config must resolve to None (treated as unset)"
+            );
+        }
+    }
+
+    #[test]
+    fn config_from_env_title_backend_all_or_nothing() {
+        let _g = ENV_LOCK.lock_ok();
+        let keys = [
+            "JESSE_TITLE_BASE_URL",
+            "JESSE_TITLE_AUTH_TOKEN",
+            "JESSE_TITLE_MODEL",
+        ];
+        let saved: Vec<(&str, Option<String>)> =
+            keys.iter().map(|k| (*k, std::env::var(k).ok())).collect();
+        for k in &keys {
+            std::env::remove_var(k);
+        }
+
+        // Unset by default → no override.
+        assert_eq!(Config::from_env().title_backend, None);
+
+        // All three set → the config carries the resolved triple.
+        std::env::set_var("JESSE_TITLE_BASE_URL", "http://127.0.0.1:9100");
+        std::env::set_var("JESSE_TITLE_AUTH_TOKEN", "dsv4-local-dummy");
+        std::env::set_var("JESSE_TITLE_MODEL", "local-title");
+        assert_eq!(
+            Config::from_env().title_backend,
+            Some((
+                "http://127.0.0.1:9100".to_string(),
+                "dsv4-local-dummy".to_string(),
+                "local-title".to_string(),
+            ))
+        );
+
+        // Drop one → partial → None (treated as unset).
+        std::env::remove_var("JESSE_TITLE_AUTH_TOKEN");
+        assert_eq!(Config::from_env().title_backend, None);
+
+        // A blank/whitespace value counts as unset (env_string semantics), so a
+        // set-but-empty var is still a partial config → None.
+        std::env::set_var("JESSE_TITLE_AUTH_TOKEN", "   ");
+        assert_eq!(Config::from_env().title_backend, None);
+
+        for (k, v) in saved {
+            match v {
+                Some(val) => std::env::set_var(k, val),
+                None => std::env::remove_var(k),
+            }
+        }
+    }
+
     #[test]
     fn scratch_base_defaults_to_temp_and_honors_override() {
         let mut cfg = test_config();

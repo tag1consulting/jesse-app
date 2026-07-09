@@ -32,6 +32,8 @@ use tower::ServiceExt; // ServiceExt::oneshot
             max_attachment_bytes: DEFAULT_MAX_ATTACHMENT_BYTES,
             max_attachments_total_bytes: DEFAULT_MAX_ATTACHMENTS_TOTAL_BYTES,
             scratch_dir: None,
+            // No title-backend override in tests — ambient-backend behavior.
+            title_backend: None,
         }
     }
     pub fn test_state() -> AppState {

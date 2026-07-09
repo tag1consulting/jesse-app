@@ -26,6 +26,9 @@ use crate::*;
             max_attachment_bytes: DEFAULT_MAX_ATTACHMENT_BYTES,
             max_attachments_total_bytes: DEFAULT_MAX_ATTACHMENTS_TOTAL_BYTES,
             scratch_dir: None,
+            // No title-backend override by default — tests that need one set it
+            // explicitly, mirroring an unconfigured (ambient-backend) deploy.
+            title_backend: None,
         }
     }
     pub(crate) fn test_state() -> AppState {

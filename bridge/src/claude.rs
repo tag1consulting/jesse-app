@@ -283,6 +283,40 @@ pub fn build_claude_args(cfg: &Config, prompt: &str, session_id: Option<&str>) -
     args
 }
 
+/// Build the base `claude` child `Command` shared by BOTH a main turn and a
+/// title one-shot: the least-privilege args (`build_claude_args`), the vault cwd
+/// (so CLAUDE.md auto-loads), piped stdio, and `kill_on_drop`. It sets NO
+/// environment overrides — the child inherits the bridge's process env unchanged,
+/// exactly as before. The title path layers its backend override on top via
+/// `apply_title_env`; the main-turn path never does, which is the isolation
+/// guarantee (proven by a dedicated test). Factored out so both paths stay
+/// byte-identical except for that one deliberate difference.
+pub fn build_claude_command(cfg: &Config, prompt: &str, session_id: Option<&str>) -> Command {
+    let mut cmd = Command::new(&cfg.claude_bin);
+    cmd.args(build_claude_args(cfg, prompt, session_id))
+        .current_dir(&cfg.vault) // cwd = vault → CLAUDE.md auto-loads
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true); // killed if the timeout fires or the task is dropped
+    cmd
+}
+
+/// Layer the title-backend override onto a TITLE child's `Command`. When the
+/// override is configured (all three `JESSE_TITLE_*` vars set → `cfg.title_backend`
+/// is `Some`), set `ANTHROPIC_BASE_URL` / `ANTHROPIC_AUTH_TOKEN` / `ANTHROPIC_MODEL`
+/// on THIS child only, so the title one-shot talks to the override backend while
+/// every main-turn child keeps inheriting the ambient process env. A no-op when
+/// unset — the title child then inherits the process env byte-for-byte, exactly as
+/// before this feature. Call this ONLY on the title path; a main turn must never
+/// invoke it (that is the main-turn isolation property).
+pub fn apply_title_env(cmd: &mut Command, cfg: &Config) {
+    if let Some((base_url, auth_token, model)) = &cfg.title_backend {
+        cmd.env("ANTHROPIC_BASE_URL", base_url)
+            .env("ANTHROPIC_AUTH_TOKEN", auth_token)
+            .env("ANTHROPIC_MODEL", model);
+    }
+}
+
 /// Invoke headless Claude Code in the vault, streaming its output. Returns
 /// (reply_text, session_id). Pass session_id to continue a thread; the returned
 /// id is always captured so the client can follow up later. Resuming keeps
@@ -323,12 +357,9 @@ pub async fn run_claude_streaming(
         // Fresh Command per attempt — same args, including --resume if present.
         // Tool access is constrained by the explicit allow/deny lists in
         // build_claude_args (C1); the agent runs under --permission-mode default.
-        let mut cmd = Command::new(&cfg.claude_bin);
-        cmd.args(build_claude_args(cfg, prompt, session_id))
-            .current_dir(&cfg.vault) // cwd = vault → CLAUDE.md auto-loads
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true); // killed if the timeout below fires or the task is dropped
+        // A main turn deliberately does NOT call apply_title_env: the title-backend
+        // override touches the title child only, never a real agent turn.
+        let mut cmd = build_claude_command(cfg, prompt, session_id);
 
         let mut child = cmd.spawn().map_err(|e| {
             (
@@ -516,12 +547,20 @@ pub async fn run_claude_oneshot(
 ) -> Result<String, ApiError> {
     // Same args as a turn (stream-json + the least-privilege allow/deny lists),
     // no --resume: a title call is never part of a thread.
-    let mut cmd = Command::new(&cfg.claude_bin);
-    cmd.args(build_claude_args(cfg, prompt, None))
-        .current_dir(&cfg.vault)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true);
+    let mut cmd = build_claude_command(cfg, prompt, None);
+    // Title-only backend override: point THIS child at the configured
+    // base_url/token/model when all three JESSE_TITLE_* vars are set. A no-op
+    // otherwise (ambient backend). Main turns never call this.
+    apply_title_env(&mut cmd, cfg);
+    // Provenance trail: one line per title call naming which backend served it
+    // (base URL + model, never the token; no prompt content) so a production
+    // audit can tell whether a title went to the override or the ambient backend.
+    match &cfg.title_backend {
+        Some((base_url, _token, model)) => {
+            eprintln!("jesse-bridge: title call → override backend base_url={base_url} model={model}")
+        }
+        None => eprintln!("jesse-bridge: title call → ambient backend (no JESSE_TITLE_* override)"),
+    }
 
     let mut child = cmd.spawn().map_err(|e| {
         (
@@ -941,6 +980,79 @@ mod tests {
              tool class and kills every scoped Bash(...) grant: {deny:?}"
         );
     }
+    /// The three env vars the title-backend override sets on the title child.
+    const TITLE_ENV_KEYS: [&str; 3] =
+        ["ANTHROPIC_BASE_URL", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_MODEL"];
+
+    /// Read the env OVERRIDES a `Command` carries (what `.env()` added), as a
+    /// map. `get_envs()` yields only the explicit per-command overrides, not the
+    /// inherited process env, so this sees exactly what the builder set.
+    fn cmd_env_overrides(cmd: &Command) -> std::collections::HashMap<String, String> {
+        cmd.as_std()
+            .get_envs()
+            .filter_map(|(k, v)| Some((k.to_str()?.to_string(), v?.to_str()?.to_string())))
+            .collect()
+    }
+
+    fn cfg_with_title_backend() -> Config {
+        let mut cfg = test_config();
+        cfg.title_backend = Some((
+            "http://127.0.0.1:9100".to_string(),
+            "dsv4-local-dummy".to_string(),
+            "local-title".to_string(),
+        ));
+        cfg
+    }
+
+    #[test]
+    fn title_command_applies_env_triple_when_configured() {
+        // With the override configured, the TITLE child's Command carries exactly
+        // ANTHROPIC_BASE_URL / _AUTH_TOKEN / _MODEL set to the configured values.
+        let cfg = cfg_with_title_backend();
+        let mut cmd = build_claude_command(&cfg, "hi", None);
+        apply_title_env(&mut cmd, &cfg);
+        let env = cmd_env_overrides(&cmd);
+        assert_eq!(env.get("ANTHROPIC_BASE_URL").map(String::as_str), Some("http://127.0.0.1:9100"));
+        assert_eq!(env.get("ANTHROPIC_AUTH_TOKEN").map(String::as_str), Some("dsv4-local-dummy"));
+        assert_eq!(env.get("ANTHROPIC_MODEL").map(String::as_str), Some("local-title"));
+    }
+
+    #[test]
+    fn title_command_applies_nothing_when_unconfigured() {
+        // With no override (the default), the title child sets NONE of the three
+        // vars — it inherits the ambient process env byte-for-byte, exactly as
+        // before this feature existed.
+        let cfg = test_config();
+        assert!(cfg.title_backend.is_none(), "test_config must default to no override");
+        let mut cmd = build_claude_command(&cfg, "hi", None);
+        apply_title_env(&mut cmd, &cfg);
+        let env = cmd_env_overrides(&cmd);
+        for k in TITLE_ENV_KEYS {
+            assert!(!env.contains_key(k), "unconfigured title child must not set {k}");
+        }
+    }
+
+    #[test]
+    fn main_turn_command_is_unaffected_by_title_backend() {
+        // THE SAFETY PROPERTY, tested directly: even when the title-backend
+        // override IS configured, a MAIN-TURN command carries none of the three
+        // ANTHROPIC_* overrides. The main-turn builder never calls apply_title_env,
+        // so a title-only redirect can never leak onto a real agent turn.
+        let cfg = cfg_with_title_backend();
+        assert!(cfg.title_backend.is_some(), "precondition: override is set");
+        // A resumed turn and a fresh turn are both built the main-turn way.
+        for sid in [None, Some("sess-1")] {
+            let cmd = build_claude_command(&cfg, "do the thing", sid);
+            let env = cmd_env_overrides(&cmd);
+            for k in TITLE_ENV_KEYS {
+                assert!(
+                    !env.contains_key(k),
+                    "main-turn command must NOT carry {k} even when title backend is set"
+                );
+            }
+        }
+    }
+
     #[test]
     fn build_claude_args_resume_when_session() {
         let cfg = test_config();
