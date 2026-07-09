@@ -1509,3 +1509,220 @@ async fn health_context_cap_is_8_kib() {
         .unwrap();
     assert_eq!(resp.status(), StatusCode::ACCEPTED, "a block at exactly 8 KiB is accepted");
 }
+
+// ---- GET /jesse/diet ------------------------------------------------------
+//
+// Synthetic, invented fixtures (never a copy of the real personal vault) that
+// exercise the file-format quirks the parser must survive: unquoted keys, single
+// quotes, trailing commas, missing optional fields, embedded HTML/entities in
+// coach notes, a CSV with quoted commas + blank cells, a malformed section, and
+// an absent optional file.
+
+const FIX_TODAY: &str = "// generated 2026-07-08 06:12 by generate-diet-today.js\n\
+// DO NOT EDIT — regenerated on every log\n\
+window.DIET_TODAY = {\n\
+  date: '2026-07-08',\n\
+  dayStyle: 'normal',\n\
+  dayType: 'Normal training day',\n\
+  weight: { lbs: 197.4, kg: 89.5, bf: 18.1, mm: 150.2, notes: 'steady' },\n\
+  exercise: [\n\
+    { type: 'run', time: '06:30', desc: 'easy 5', distance: 5, unit: 'mi', duration: '43:20', pace: '8:40', avgHR: 138, calories: 520 },\n\
+  ],\n\
+  meals: [\n\
+    { name: 'Breakfast', time: '07:15', items: [\n\
+      { item: 'Oatmeal', amount: '1 cup', cal: 300, p: 10, f: 5, c: 54, fiber: 8 },\n\
+      { item: 'Eggs', amount: '3', cal: 210, p: 18, f: 15, c: 1, fiber: 0 },\n\
+    ] },\n\
+  ],\n\
+  targets: { calories: 2100, protein: 190, fat: 65, carbs: 210, carbsBase: 180, fiber: 38 },\n\
+};\n";
+
+// An old-style DIET_TODAY missing the newer optional fields: no dayStyle, no
+// weight (non-weigh-in day), items with no fiber, targets with no carbsBase/fiber.
+const FIX_TODAY_MINIMAL: &str = "window.DIET_TODAY = {\n\
+  date: '2026-07-08',\n\
+  dayType: 'Rest day',\n\
+  weight: null,\n\
+  exercise: [],\n\
+  meals: [ { name: 'Lunch', time: '12:30', items: [ { item: 'Salad', amount: '1 bowl', cal: 250, p: 8, f: 12, c: 20 } ] } ],\n\
+  targets: { calories: 1900, protein: 180, fat: 60, carbs: 190 },\n\
+};\n";
+
+const FIX_PROGRESS: &str = "window.DIET_PROGRESS = {\n\
+  startWeight: 204, raceTarget: 165, maintTarget: 180, raceDate: '2026-10-11',\n\
+  troughPace: 1.4, rawPace: 1.1, fatPace: 0.9, leanPace: 0.2, paceScale: 2.0, leanScale: 1.0,\n\
+  paceZone: 'good', fatZone: 'good', leanZone: 'good', barColor: '#4caf50',\n\
+  raceBarFilled: 0.62, maintBarFilled: 0.88,\n\
+  raceBarLabel: '24 of 39 lb', maintBarLabel: '21 of 24 lb',\n\
+  paceBarLabel: '1.4 lb/wk', fatBarLabel: '0.9 lb/wk', leanBarLabel: '0.2 lb/wk',\n\
+  paceSubMain: 'on pace', paceSubZone: 'target 1.0–1.5', paceSubLow: '1.0', paceSubHigh: '1.5',\n\
+  fatSubMain: 'losing fat', leanSubMain: 'holding muscle',\n\
+  trajectory: 'On track for the race target.',\n\
+};\n";
+
+const FIX_COACH: &str = "// coach notes\n\
+window.DIET_COACH = {\n\
+  date: '2026-07-08', title: 'Steady progress',\n\
+  notes: [ '<strong>Great week</strong> &mdash; you hit protein every day', 'Hydration looks good' ],\n\
+  ahead: [ 'Long run Saturday &ndash; carb-load Friday' ],\n\
+  quote: { text: 'Discipline is choosing between what you want now and what you want most.', author: 'Abraham Lincoln' },\n\
+};\n";
+
+const FIX_PROPOSED: &str = "window.PROPOSED_DIET = {\n\
+  date: '2026-07-08', source: 'coach',\n\
+  ideas: [ { name: 'Afternoon snack', time: '~15:00', items: [ { item: 'Greek yogurt', amount: '1 cup', cal: 150, p: 20, f: 4, c: 9, fiber: 0 } ], notes: 'protein top-up' } ],\n\
+  gapNote: 'You are ~30g short on protein.',\n\
+};\n";
+
+const FIX_WEIGHT_CSV: &str = "Date,Weight_lbs,Weight_kg,Phase,BodyFat_pct,MuscleMass_lbs,Notes\n\
+2026-07-06,198.6,90.1,Phase 2,18.4,150.0,\"weighed after run, felt light\"\n\
+2026-07-07,198.0,89.8,Phase 2,,,\n\
+2026-07-08,197.4,89.5,Phase 2,18.1,150.2,steady\n";
+
+/// Build a fully-populated synthetic vault and an AppState pointed at it.
+fn diet_state_full() -> (AppState, std::path::PathBuf) {
+    let vault = make_diet_vault();
+    write_vault_file(&vault, "todo-list/diet-today.js", FIX_TODAY);
+    write_vault_file(&vault, "todo-list/diet-progress.js", FIX_PROGRESS);
+    write_vault_file(&vault, "todo-list/diet-coach-notes.js", FIX_COACH);
+    write_vault_file(&vault, "todo-list/proposed-diet-today.js", FIX_PROPOSED);
+    write_vault_file(&vault, "diet-logs/weight-log.csv", FIX_WEIGHT_CSV);
+    let cfg = Config {
+        vault: vault.to_string_lossy().into_owned(),
+        ..test_config()
+    };
+    (AppState::new(cfg), vault)
+}
+
+#[tokio::test]
+async fn diet_no_auth_is_401() {
+    let resp = app(test_state()).oneshot(diet_request(None)).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn diet_wrong_token_is_401() {
+    let resp = app(test_state())
+        .oneshot(diet_request(Some("Bearer wrong")))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn diet_happy_path_returns_full_normalized_snapshot() {
+    let (st, vault) = diet_state_full();
+    let resp = app(st).oneshot(diet_request(Some("Bearer test-token"))).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body: Value = serde_json::from_str(&body_string(resp).await).unwrap();
+
+    // Envelope: RFC3339 asOf + todayMtime, empty errors.
+    assert!(body["asOf"].as_str().unwrap().ends_with('Z'), "asOf is RFC3339 UTC");
+    assert!(body["todayMtime"].as_str().unwrap().ends_with('Z'), "todayMtime present");
+    assert_eq!(body["errors"].as_array().unwrap().len(), 0, "no errors on clean data");
+
+    // today: camelCase field names passed through verbatim.
+    assert_eq!(body["today"]["date"], "2026-07-08");
+    assert_eq!(body["today"]["dayStyle"], "normal");
+    assert_eq!(body["today"]["weight"]["bf"], 18.1);
+    assert_eq!(body["today"]["exercise"][0]["avgHR"], 138);
+    assert_eq!(body["today"]["meals"][0]["items"][0]["fiber"], 8);
+    assert_eq!(body["today"]["targets"]["carbsBase"], 180);
+
+    // progress: verbatim pass-through of the prerendered fields.
+    assert_eq!(body["progress"]["startWeight"], 204);
+    assert_eq!(body["progress"]["raceBarLabel"], "24 of 39 lb");
+    assert_eq!(body["progress"]["paceZone"], "good");
+
+    // coach: HTML/entities survive verbatim (no decode/strip at the bridge).
+    assert_eq!(body["coach"]["notes"][0], "<strong>Great week</strong> &mdash; you hit protein every day");
+    assert_eq!(body["coach"]["quote"]["author"], "Abraham Lincoln");
+
+    // proposed: present with non-empty ideas.
+    assert_eq!(body["proposed"]["ideas"][0]["name"], "Afternoon snack");
+    assert_eq!(body["proposed"]["gapNote"], "You are ~30g short on protein.");
+
+    // weightSeries: chronological, quoted comma preserved, blank cells → null,
+    // MuscleMass_lbs → leanLbs.
+    let ws = body["weightSeries"].as_array().unwrap();
+    assert_eq!(ws.len(), 3);
+    assert_eq!(ws[0]["date"], "2026-07-06");
+    assert_eq!(ws[0]["notes"], "weighed after run, felt light");
+    assert_eq!(ws[0]["leanLbs"], 150.0);
+    assert!(ws[1]["bf"].is_null(), "blank bf cell → null");
+    assert!(ws[1]["leanLbs"].is_null(), "blank MuscleMass cell → null");
+    assert_eq!(ws[2]["lbs"], 197.4);
+
+    let _ = std::fs::remove_dir_all(&vault);
+}
+
+#[tokio::test]
+async fn diet_minimal_today_omits_optional_fields_cleanly() {
+    // An old-style file with no dayStyle, no weigh-in, no fiber/carbsBase must
+    // still parse and 200 — the absent fields simply don't appear.
+    let vault = make_diet_vault();
+    write_vault_file(&vault, "todo-list/diet-today.js", FIX_TODAY_MINIMAL);
+    write_vault_file(&vault, "diet-logs/weight-log.csv", FIX_WEIGHT_CSV);
+    let cfg = Config { vault: vault.to_string_lossy().into_owned(), ..test_config() };
+    let resp = app(AppState::new(cfg)).oneshot(diet_request(Some("Bearer test-token"))).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body: Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    assert!(body["today"]["dayStyle"].is_null(), "absent dayStyle → null");
+    assert!(body["today"]["weight"].is_null(), "non-weigh-in day → weight null");
+    assert!(body["today"]["targets"]["carbsBase"].is_null(), "absent carbsBase → null");
+    // progress/coach files absent → null + an errors entry each (expected files).
+    assert!(body["progress"].is_null());
+    assert!(body["coach"].is_null());
+    // proposed absent → null but NOT an error.
+    assert!(body["proposed"].is_null());
+    let errs = body["errors"].as_array().unwrap();
+    assert!(errs.iter().any(|e| e.as_str().unwrap().starts_with("progress:")));
+    assert!(errs.iter().any(|e| e.as_str().unwrap().starts_with("coach:")));
+    assert!(!errs.iter().any(|e| e.as_str().unwrap().starts_with("proposed:")), "absent proposed is not an error");
+    let _ = std::fs::remove_dir_all(&vault);
+}
+
+#[tokio::test]
+async fn diet_missing_today_is_503() {
+    // No diet-today.js at all → the screen is pointless → 503 with a JSON body.
+    let vault = make_diet_vault();
+    write_vault_file(&vault, "diet-logs/weight-log.csv", FIX_WEIGHT_CSV);
+    let cfg = Config { vault: vault.to_string_lossy().into_owned(), ..test_config() };
+    let resp = app(AppState::new(cfg)).oneshot(diet_request(Some("Bearer test-token"))).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let body: Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    assert!(body["error"].as_str().unwrap().contains("diet-today.js"), "JSON error body names the file");
+    let _ = std::fs::remove_dir_all(&vault);
+}
+
+#[tokio::test]
+async fn diet_broken_today_is_503() {
+    // diet-today.js present but unparseable → still 503.
+    let vault = make_diet_vault();
+    write_vault_file(&vault, "todo-list/diet-today.js", "window.DIET_TODAY = { date: , oops };");
+    let cfg = Config { vault: vault.to_string_lossy().into_owned(), ..test_config() };
+    let resp = app(AppState::new(cfg)).oneshot(diet_request(Some("Bearer test-token"))).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let _ = std::fs::remove_dir_all(&vault);
+}
+
+#[tokio::test]
+async fn diet_section_isolation_bad_progress_still_200() {
+    // A broken progress file must NOT fail the endpoint: today parsed, so 200,
+    // progress null, and a human-readable errors entry naming the section.
+    let vault = make_diet_vault();
+    write_vault_file(&vault, "todo-list/diet-today.js", FIX_TODAY);
+    write_vault_file(&vault, "todo-list/diet-progress.js", "window.DIET_PROGRESS = { not valid ]");
+    write_vault_file(&vault, "todo-list/diet-coach-notes.js", FIX_COACH);
+    write_vault_file(&vault, "diet-logs/weight-log.csv", FIX_WEIGHT_CSV);
+    let cfg = Config { vault: vault.to_string_lossy().into_owned(), ..test_config() };
+    let resp = app(AppState::new(cfg)).oneshot(diet_request(Some("Bearer test-token"))).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "one bad section must not fail the endpoint");
+    let body: Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    assert!(body["progress"].is_null(), "bad section → null");
+    assert!(!body["today"].is_null(), "today still rendered");
+    assert!(!body["coach"].is_null(), "sibling sections unaffected");
+    let errs = body["errors"].as_array().unwrap();
+    assert!(errs.iter().any(|e| e.as_str().unwrap().starts_with("progress:")), "errors names the failed section: {errs:?}");
+    let _ = std::fs::remove_dir_all(&vault);
+}

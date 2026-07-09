@@ -15,6 +15,31 @@ CI both run it). See the "Versioning" section of `bridge/README.md`.
 
 ## [Unreleased]
 
+## [Bridge 0.5.0] — 2026-07-09
+
+### Added
+- **New authenticated endpoint `GET /jesse/diet`** — reads the vault's generated
+  diet data files and returns one normalized JSON snapshot for the app's Health
+  tab. Same bearer auth as every other endpoint. It reads
+  `todo-list/diet-today.js` (required), `todo-list/diet-progress.js`,
+  `todo-list/diet-coach-notes.js`, `todo-list/proposed-diet-today.js` (optional,
+  frequently absent), and `diet-logs/weight-log.csv`. The three `.js` files are
+  data-only JS literals (`window.X = <literal>;` with unquoted keys, single
+  quotes, trailing commas, `//` comments, and embedded HTML/entities in strings),
+  parsed by stripping the comment lines and the `window.X =`/`;` wrapper and
+  handing the literal to the `json5` crate — no hand-rolled JS parser, no
+  quote-rewriting. `weight-log.csv` (RFC 4180, quoted commas in Notes) is parsed
+  with the `csv` crate into a chronological `weightSeries`
+  (`MuscleMass_lbs`→`leanLbs`, blank cells → null). **Per-section isolation**
+  mirrors the browser dashboard: a missing or unparseable file becomes `null` and
+  appends a human-readable line to an `errors` array rather than failing the
+  endpoint. The endpoint returns `200` whenever `diet-today.js` parsed and `503`
+  (JSON error body) only when `diet-today.js` itself is missing/unparseable — the
+  screen is pointless without it. An absent `proposed-diet-today.js`, or one with
+  empty `ideas`, normalizes to `proposed: null` and is **not** an error. The
+  response carries `asOf` (server time) and `todayMtime` (the mtime of
+  `diet-today.js`) as RFC 3339 UTC. New deps: `json5`, `csv`.
+
 ## [App 1.0 (27)] — 2026-07-08
 
 ### Added

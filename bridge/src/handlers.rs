@@ -429,6 +429,7 @@ pub fn app(state: AppState) -> Router {
         .route("/health", get(health))
         .route("/jesse", post(jesse))
         .route("/jesse/prompts", get(jesse_prompts))
+        .route("/jesse/diet", get(jesse_diet))
         .route("/jesse/title", post(jesse_title))
         .route("/jesse/result/:job_id", get(jesse_result))
         .route("/jesse/stream/:job_id", get(jesse_stream))

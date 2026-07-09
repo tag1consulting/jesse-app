@@ -522,6 +522,70 @@ bridge default" and the field is omitted. In the app the floor is **unlockable**
 locked by default, editable only behind an explicit "not recommended" gate — so no
 one reweakens it by accident.
 
+## Diet snapshot (`GET /jesse/diet`)
+
+**`GET /jesse/diet`** — reads the vault's generated diet data files and returns one
+normalized JSON snapshot for the app's **Health** tab. Same bearer auth as
+`/jesse`. The vault agent regenerates these files (`diet-today.js` on every
+food/exercise/weigh-in log; the rest each morning and on weigh-ins) — the bridge
+only reads them; it never writes here.
+
+```bash
+curl -s http://127.0.0.1:8765/jesse/diet \
+  -H "Authorization: Bearer $JESSE_TOKEN"
+```
+
+Files read, all under `$JESSE_VAULT`:
+
+| Path | Section | Required? |
+|---|---|---|
+| `todo-list/diet-today.js` | `today` | **required** (its absence is the only 503) |
+| `todo-list/diet-progress.js` | `progress` | expected |
+| `todo-list/diet-coach-notes.js` | `coach` | expected |
+| `todo-list/proposed-diet-today.js` | `proposed` | optional (frequently absent) |
+| `diet-logs/weight-log.csv` | `weightSeries` | expected |
+
+The three `.js` files (and the optional one) are **data-only JS literals** — zero
+or more leading `//` comment lines, then one `window.<NAME> = <object-or-array>;`
+statement. They are JS, not strict JSON: unquoted keys, single/double quotes,
+trailing commas, and embedded HTML/entities inside strings (coach notes carry
+`<strong>` and `&mdash;`). The bridge strips the comment lines and the
+`window.X =` / `;` wrapper and parses the literal with the `json5` crate — no
+hand-rolled JS parser and no quote-rewriting. `weight-log.csv` is RFC 4180 (header
+`Date,Weight_lbs,Weight_kg,Phase,BodyFat_pct,MuscleMass_lbs,Notes`, with quoted
+commas in the Notes field) and is parsed with the `csv` crate, never `split(',')`.
+
+**Per-section isolation** (a mirror of the browser dashboard's per-section
+try/catch): a file that is missing or fails to parse becomes `null` and appends a
+short human-readable string to the `errors` array — it does **not** fail the
+endpoint. The endpoint returns:
+
+- **`200`** whenever `diet-today.js` parsed (other sections independently `null`).
+- **`503`** (with a JSON error body) only when `diet-today.js` itself is
+  missing/unparseable — the screen is pointless without it.
+
+An absent `proposed-diet-today.js`, or one whose `ideas` list is empty, normalizes
+to `proposed: null` and is **not** recorded as an error.
+
+Response shape (all keys camelCase; unknown generator fields pass through):
+
+```jsonc
+{
+  "asOf": "2026-07-09T13:20:00Z",       // RFC3339 server time
+  "todayMtime": "2026-07-09T06:12:41Z", // RFC3339 mtime of diet-today.js
+  "today": { /* normalized DIET_TODAY */ },
+  "proposed": { /* PROPOSED_DIET */ } | null,
+  "progress": { /* DIET_PROGRESS, passed through */ } | null,
+  "coach": { /* DIET_COACH, passed through */ } | null,
+  "weightSeries": [
+    { "date": "2026-07-08", "lbs": 197.4, "kg": 89.5, "phase": "Phase 2",
+      "bf": 18.1, "leanLbs": 150.2, "notes": "steady" }
+    // chronological (file order); MuscleMass_lbs → leanLbs; blank cells → null
+  ] | null,
+  "errors": ["progress: json5 parse error at …"]
+}
+```
+
 ## Recent-workouts context (`health_context`)
 
 **`POST /jesse` with an optional `"health_context"` field** — a compact,

@@ -90,6 +90,26 @@ use tower::ServiceExt; // ServiceExt::oneshot
         }
         b.body(Body::from(json.to_string())).unwrap()
     }
+    pub fn diet_request(auth: Option<&str>) -> Request<Body> {
+        let mut b = Request::builder().method("GET").uri("/jesse/diet");
+        if let Some(a) = auth {
+            b = b.header("authorization", a);
+        }
+        b.body(Body::empty()).unwrap()
+    }
+    /// Create a throwaway vault dir with `todo-list/` and `diet-logs/`
+    /// subdirectories and return its path. Caller writes fixture files into it and
+    /// removes it when done. Realistic-but-invented data only — never a copy of
+    /// the real personal vault.
+    pub fn make_diet_vault() -> std::path::PathBuf {
+        let root = std::env::temp_dir().join(format!("jesse-vault-{}", random_hex()));
+        std::fs::create_dir_all(root.join("todo-list")).unwrap();
+        std::fs::create_dir_all(root.join("diet-logs")).unwrap();
+        root
+    }
+    pub fn write_vault_file(root: &std::path::Path, rel: &str, contents: &str) {
+        std::fs::write(root.join(rel), contents).unwrap();
+    }
     pub fn notify_request(auth: Option<&str>, job_id: &str) -> Request<Body> {
         let mut b = Request::builder()
             .method("POST")
