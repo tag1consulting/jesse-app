@@ -15,6 +15,28 @@ CI both run it). See the "Versioning" section of `bridge/README.md`.
 
 ## [Unreleased]
 
+## [Bridge 0.6.0] — 2026-07-10
+
+### Added
+- **Optional title-only backend override for `POST /jesse/title`.** Three new
+  optional env vars — `JESSE_TITLE_BASE_URL`, `JESSE_TITLE_AUTH_TOKEN`,
+  `JESSE_TITLE_MODEL` — let the stateless title one-shot be served by a different
+  (typically cheap, fast, local) backend than main turns. When **all three** are
+  set (trimmed, non-empty, same `env_string` semantics as every other string
+  field), the title child — and **only** the title child — is spawned with
+  `ANTHROPIC_BASE_URL` / `ANTHROPIC_AUTH_TOKEN` / `ANTHROPIC_MODEL` set to those
+  values via the child's env, so a title can be generated on a local model while
+  every main "Ask/Tell" turn keeps using the ambient credentials untouched.
+  **Soft-failure semantics:** if any of the three is unset (or blank), behavior is
+  byte-for-byte the previous release — the title child inherits the bridge's
+  process env unchanged. A **partial** configuration (one or two of the three set)
+  logs one warning at startup and is treated as fully unset. Main-turn children
+  are never affected under any configuration (proven by a dedicated test). Each
+  title call logs one provenance line naming the backend that served it (base URL
+  + model, never the token; no prompt content). The title endpoint's soft 20s
+  timeout and one-line clamp are unchanged; a title failure remains soft (the app
+  keeps its own derived title).
+
 ## [App 1.0 (28)] — 2026-07-09
 
 ### Added

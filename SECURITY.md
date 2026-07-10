@@ -163,6 +163,36 @@ To keep a single client (or a runaway turn) from exhausting the host:
   20 MB). The request body limit is sized from these (base64-inflated) so an
   oversized upload is refused before it's buffered.
 
+## Title-endpoint backend override (`JESSE_TITLE_*`)
+
+`POST /jesse/title` can be pointed at a different model backend than main turns
+via three optional env vars — `JESSE_TITLE_BASE_URL`, `JESSE_TITLE_AUTH_TOKEN`,
+`JESSE_TITLE_MODEL`. **Rationale:** a title is a throwaway UI nicety, so it can be
+served by a cheap, fast, local backend without spending the main model's budget or
+latency on it.
+
+Security-relevant properties:
+
+- **Scoped to the title child only.** When all three are set, they are applied as
+  `ANTHROPIC_BASE_URL` / `ANTHROPIC_AUTH_TOKEN` / `ANTHROPIC_MODEL` on the title
+  one-shot's child process *only* (via that `Command`'s env). **Main "Ask/Tell"
+  turns are never affected** under any configuration — the main-turn spawn path
+  never applies the override. This isolation is asserted by a dedicated test, so a
+  refactor can't silently leak a title-only credential/endpoint onto a real turn.
+- **All-or-nothing, soft-failure.** The override resolves only when all three are
+  set (trimmed, non-empty). Any unset value → titles use the ambient backend,
+  byte-for-byte the prior behavior. A **partial** configuration (one or two set)
+  logs one startup warning and is treated as fully unset, so a half-configured
+  deploy fails safe rather than half-redirecting.
+- **Provenance, without secrets.** Each title call logs exactly one line naming
+  the backend that served it — **base URL and model only, never the auth token,
+  and never any prompt content** — so a production audit has a trail of where
+  titles went.
+- **Same request posture otherwise.** The title child still uses `build_claude_args`
+  (identical `--permission-mode`/allow/deny lists), the same `MAX_TITLE_INPUT_BYTES`
+  input cap and short `TITLE_TIMEOUT_SECS`, and remains a soft best-effort call —
+  a title failure is degraded from, never surfaced as an error.
+
 ## Attachments
 
 Files attached to a turn are untrusted input and handled defensively:

@@ -907,6 +907,9 @@ cargo run --release
 | `JESSE_RETRIEVAL_GRACE_SECS` | `600` | How much longer a reply is kept **after** its first retrieval (a short re-poll window) instead of the full TTL |
 | `JESSE_STATE_DIR` | `~/.jesse-bridge` | Where completed results are persisted (`<dir>/jobs`) and the device token (`<dir>/device.json`, 0600), so a restart doesn't lose a reply or the token. Empty disables persistence |
 | `JESSE_CLAUDE_BIN` | `claude` | Path to the `claude` binary |
+| `JESSE_TITLE_BASE_URL` | _(off)_ | Title-only backend override (with the two below). When **all three** are set, the `POST /jesse/title` one-shot child — and ONLY that child — is spawned with `ANTHROPIC_BASE_URL` set to this, so titles can be served by a cheap/fast/local backend while main turns keep the ambient credentials. All-or-nothing and soft: unset (default) → titles use the ambient backend, byte-for-byte prior behavior |
+| `JESSE_TITLE_AUTH_TOKEN` | _(off)_ | Title child's `ANTHROPIC_AUTH_TOKEN`. Required together with the other two `JESSE_TITLE_*` |
+| `JESSE_TITLE_MODEL` | _(off)_ | Title child's `ANTHROPIC_MODEL`. Required together with the other two `JESSE_TITLE_*`. A **partial** config (1–2 of the 3 set) logs a startup warning and is treated as unset; **main-turn children are never affected** under any configuration. Each title call logs one provenance line (base URL + model, never the token) |
 | `JESSE_APNS_KEY_PATH` | _(off)_ | Path to the APNs auth key `.p8`. Set (with the three below) to enable push; unset → push disabled, behavior unchanged. See [Push notifications](#push-notifications-apns--optional-off-by-default) |
 | `JESSE_APNS_KEY_ID` | _(off)_ | APNs Key ID (10 chars) |
 | `JESSE_APNS_TEAM_ID` | _(off)_ | Apple Developer Team ID (10 chars; the JWT `iss`) |

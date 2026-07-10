@@ -177,6 +177,15 @@ Full table in [`bridge/README.md`](bridge/README.md#knobs-env-vars). Most-used:
 | `JESSE_ADVERTISE_HOST` | value of `JESSE_BIND` | Host written into the pairing QR. **Set to your `ts.net` MagicDNS name** (see ATS note). |
 | `JESSE_PORT` | `8765` | Port. |
 | `JESSE_CLAUDE_BIN` | `claude` | Path to the `claude` binary. Use an absolute path if it isn't on the bridge's `PATH`. |
+| `JESSE_TITLE_BASE_URL` | _(off)_ | With the two below, points **only** the `POST /jesse/title` one-shot at a different backend (e.g. a cheap local model) via that child's `ANTHROPIC_BASE_URL`. All three required together. |
+| `JESSE_TITLE_AUTH_TOKEN` | _(off)_ | Auth token for the title backend (the title child's `ANTHROPIC_AUTH_TOKEN`). |
+| `JESSE_TITLE_MODEL` | _(off)_ | Model id for the title backend (the title child's `ANTHROPIC_MODEL`). |
+
+The three `JESSE_TITLE_*` vars are **all-or-nothing** and **soft**: set all three
+to redirect titles only; leave any unset (the default) and titles use the ambient
+backend, exactly as before. A partial set (one or two) logs a startup warning and
+is ignored. **Main "Ask/Tell" turns are never affected** — the override touches
+the title child alone.
 
 The bridge **refuses to start** if `JESSE_TOKEN` is unset, `JESSE_VAULT` isn't a
 directory, the `claude` binary can't be found, or `JESSE_BIND` is an unsafe

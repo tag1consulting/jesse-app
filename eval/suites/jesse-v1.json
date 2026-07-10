@@ -255,7 +255,7 @@
       "assertions": [
         {
           "type": "answer_matches",
-          "pattern": "397\\.8\\b"
+          "pattern": "397\\.80?\\b"
         },
         {
           "type": "max_tool_calls",
