@@ -50,7 +50,7 @@ pub(crate) use std::task::{Context as TaskContext, Poll};
 pub(crate) use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 pub(crate) use axum::{
-    extract::{DefaultBodyLimit, Path as UrlPath, State},
+    extract::{DefaultBodyLimit, Path as UrlPath, Query, State},
     http::{HeaderMap, StatusCode},
     response::{
         sse::{Event, KeepAlive, Sse},

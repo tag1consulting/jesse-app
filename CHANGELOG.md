@@ -15,6 +15,67 @@ CI both run it). See the "Versioning" section of `bridge/README.md`.
 
 ## [Unreleased]
 
+## [App 1.0 (31)] — 2026-07-12
+
+### Added
+- **Health tab: page back through earlier days.** The Health root gains back/forward
+  chevrons (flanking a "Today" jump button) that walk `availableDays` — nearest
+  earlier/later day, ends disabled, forward from the last past day lands on today.
+  The viewed date is pinned: a background refresh or day rollover never yanks you off
+  the day you're reading, and a day already fetched this session renders instantly
+  from an in-memory cache (pull-to-refresh forces a refetch). Chevrons shipped, not a
+  swipe — to avoid fighting the vertical scroll and tab-bar gestures.
+  - **Archived days** (bridge `fidelity: "archived"`, targets present) render exactly
+    like today through the untouched `DietSemantics` engine, with the engine's hour
+    fixed at end-of-day (24) so time-gated flags are fully resolved for a completed
+    day rather than suppressed by the render clock.
+  - **Reconstructed days** (`fidelity: "reconstructed"`, targets null) render with NO
+    judgment: a neutral calories hero (eaten total + burned/net caption), neutral
+    macro rings (gram totals), one "No targets recorded for this day" caption, and a
+    Macros screen of plain per-macro totals. The Food journal and Exercise screens
+    work fully (they're data, not judgment). Coach, Progress & pace rows and the
+    quick-log "+" are hidden on a past day; Weight & trend stays reachable. The footer
+    shows "Archived day" / "Rebuilt from logs" instead of the mtime stamp, and the
+    stale banner is suppressed.
+  - **Old-bridge handling.** `fetchDietSnapshot(date:)` sends `?date=`; a bridge that
+    ignores it (returns today for a dated request) is detected by the date mismatch
+    and flagged, leaving today's view fully functional. A pre-0.7.0 bridge omits
+    `availableDays` so the chevrons stay disabled.
+  - All paging, hour-injection, neutral-mode and visibility selection is pure,
+    Foundation-only, unit-tested code (`DietPaging`, `HistoryRender`, `NeutralMode`,
+    `HistoryUI`); `DietSnapshot` gains optional `availableDays`/`historical`/
+    `fidelity` so old payloads still decode. The plain today response is unchanged
+    beyond those three additive fields.
+
+## [Bridge 0.7.0] — 2026-07-12
+
+### Added
+- **`GET /jesse/diet?date=YYYY-MM-DD` — paged day history.** The endpoint gains an
+  optional strict `date` query parameter (a malformed value is `400` with a JSON
+  error body) and three additive response fields on every response: `availableDays`
+  (the sorted, deduped union of dates across `food-log.csv`, `exercise-log.csv`,
+  `weight-log.csv`, the `diet-logs/days/` archive directory, and today's own date),
+  `historical`, and `fidelity` (`"live" | "archived" | "reconstructed"`).
+  - **Archived days.** When `diet-logs/days/<date>.js` exists it's parsed with the
+    same extractor as `diet-today.js` and served as the day's `today` at full
+    fidelity (`"archived"`). A missing `days/` directory is treated as "no archive",
+    never an error.
+  - **Reconstructed days.** For a past date with no archive, the day is rebuilt from
+    the append-only CSVs (RFC 4180 via the `csv` crate, columns addressed by header
+    NAME and read with `flexible(true)` so legitimately-ragged legacy rows parse):
+    meals grouped by `(Meal, Time)` and sorted chronologically, exercise mapped and
+    sorted, and the weigh-in for that date — with `dayStyle`/`dayType`/`targets` null
+    so the app renders without judgment. A row with no usable identity is skipped and
+    counted into `errors`; an item with no derivable calories gets `cal = 0` and one
+    `errors` note (calories derive from `Cal_per_100g × Grams` when `Calories` is
+    blank).
+  - Historical requests always return `proposed`/`progress`/`coach` null (those files
+    describe the CURRENT state). An unknown or future date is `404` with a JSON error
+    body. The endpoint stays strictly read-only.
+  - The plain today response (no `date`, or `date` == today's date) is byte-compatible
+    with 0.6.0 beyond the three additive fields; `diet-today.js` missing/unparseable
+    is still the only `503`.
+
 ## [App 1.0 (30)] — 2026-07-12
 
 ### Fixed

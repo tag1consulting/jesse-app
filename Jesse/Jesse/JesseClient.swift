@@ -606,12 +606,13 @@ protocol JesseClientProtocol {
                         floorOverride: String?) async throws -> JesseSendResult
     func result(jobId: String) async throws -> JesseResultState
     /// Fetch the diet snapshot (`GET /jesse/diet`, bridge ≥ 0.5.0) for the Health
-    /// tab. Throws a `DietFetchError` that distinguishes offline / auth / an older
-    /// bridge without the endpoint (404) / a broken diet-today (503) / a decode
-    /// failure, so the tab can show the matching empty state. Default throws
-    /// `.endpointMissing` so existing fakes that don't model diet behave like an
-    /// old bridge.
-    func fetchDietSnapshot() async throws -> DietSnapshot
+    /// tab. With `date` (bridge ≥ 0.7.0) it fetches that past day (`?date=`); nil is
+    /// today. Throws a `DietFetchError` that distinguishes offline / auth / an older
+    /// bridge without the endpoint (404) / an unknown-or-future date (also 404) / a
+    /// broken diet-today (503) / a decode failure, so the tab can show the matching
+    /// empty state. Default throws `.endpointMissing` so existing fakes that don't
+    /// model diet behave like an old bridge.
+    func fetchDietSnapshot(date: String?) async throws -> DietSnapshot
     /// Probe `GET /health` and parse the bridge's reported version. Used to show
     /// the running bridge version in Settings alongside the app's own. Throws on a
     /// transport/HTTP failure; a bridge too old to report a version returns
@@ -659,7 +660,9 @@ extension JesseClientProtocol {
     // exactly like a bridge that predates it (404 → the "bridge update needed"
     // empty state). Only the production `JesseClient` and the dashboard's own fake
     // implement it.
-    func fetchDietSnapshot() async throws -> DietSnapshot { throw DietFetchError.endpointMissing }
+    func fetchDietSnapshot(date: String?) async throws -> DietSnapshot { throw DietFetchError.endpointMissing }
+    // Convenience: today's snapshot (the un-dated request).
+    func fetchDietSnapshot() async throws -> DietSnapshot { try await fetchDietSnapshot(date: nil) }
     // Default no-ops so existing conformers (the test fakes) need not implement
     // the push methods; only the production `JesseClient` does the real calls.
     func registerDevice(token: String) async throws {}
@@ -1160,9 +1163,21 @@ struct JesseClient: JesseClientProtocol {
     /// Health tab needs: a transport failure → `.unreachable`, `401` → `.authFailed`,
     /// `404` → `.endpointMissing` (older bridge), `503` → `.unavailable`, a 2xx that
     /// won't decode → `.decodeFailed`.
-    func fetchDietSnapshot() async throws -> DietSnapshot {
+    func fetchDietSnapshot(date: String? = nil) async throws -> DietSnapshot {
         guard !config.normalizedHost.isEmpty, !config.token.isEmpty,
-              let url = config.endpoint("/jesse/diet") else { throw DietFetchError.notConfigured }
+              let base = config.endpoint("/jesse/diet") else { throw DietFetchError.notConfigured }
+        // Append `?date=` for a history request; nil is today (un-dated).
+        let url: URL
+        if let date {
+            guard var comps = URLComponents(url: base, resolvingAgainstBaseURL: false) else {
+                throw DietFetchError.notConfigured
+            }
+            comps.queryItems = [URLQueryItem(name: "date", value: date)]
+            guard let dated = comps.url else { throw DietFetchError.notConfigured }
+            url = dated
+        } else {
+            url = base
+        }
         var req = URLRequest(url: url)
         req.httpMethod = "GET"
         req.setValue("Bearer \(config.token)", forHTTPHeaderField: "Authorization")

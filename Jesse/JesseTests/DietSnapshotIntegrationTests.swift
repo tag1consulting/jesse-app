@@ -12,6 +12,7 @@ final class DietStubURLProtocol: URLProtocol {
     struct Response { var status: Int; var body: Data }
     nonisolated(unsafe) static var response: Response?
     nonisolated(unsafe) static var lastAuthHeader: String?
+    nonisolated(unsafe) static var lastURL: URL?
 
     override class func canInit(with request: URLRequest) -> Bool { response != nil }
     override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
@@ -19,6 +20,7 @@ final class DietStubURLProtocol: URLProtocol {
 
     override func startLoading() {
         DietStubURLProtocol.lastAuthHeader = request.value(forHTTPHeaderField: "Authorization")
+        DietStubURLProtocol.lastURL = request.url
         guard let r = DietStubURLProtocol.response, let url = request.url else {
             client?.urlProtocol(self, didFailWithError: URLError(.unknown)); return
         }
@@ -37,6 +39,7 @@ final class DietSnapshotIntegrationTests: XCTestCase {
     override func tearDown() {
         DietStubURLProtocol.response = nil
         DietStubURLProtocol.lastAuthHeader = nil
+        DietStubURLProtocol.lastURL = nil
         super.tearDown()
     }
 
@@ -61,6 +64,35 @@ final class DietSnapshotIntegrationTests: XCTestCase {
         XCTAssertEqual(snap.today.date, "2026-07-09")
         XCTAssertEqual(snap.today.meals.first?.items.first?.item, "Salad")
         XCTAssertEqual(DietStubURLProtocol.lastAuthHeader, "Bearer tok", "the bearer token must be sent")
+    }
+
+    func testDatedRequestSendsDateQueryAndDecodesHistory() async throws {
+        let body = """
+        { "asOf": "t", "today": { "date": "2026-04-15", "dayStyle": null, "exercise": [],
+          "meals": [], "targets": null }, "proposed": null, "progress": null, "coach": null,
+          "weightSeries": [], "errors": [], "availableDays": ["2026-04-15", "2026-07-12"],
+          "historical": true, "fidelity": "reconstructed" }
+        """
+        DietStubURLProtocol.response = .init(status: 200, body: Data(body.utf8))
+        let snap = try await client().fetchDietSnapshot(date: "2026-04-15")
+        XCTAssertEqual(snap.today.date, "2026-04-15")
+        XCTAssertTrue(snap.isHistorical)
+        XCTAssertEqual(snap.fidelityKind, .reconstructed)
+        // The `?date=` query parameter is actually on the wire.
+        let comps = URLComponents(url: DietStubURLProtocol.lastURL!, resolvingAgainstBaseURL: false)
+        XCTAssertEqual(comps?.queryItems?.first(where: { $0.name == "date" })?.value, "2026-04-15")
+    }
+
+    func testUnknownDate404IsEndpointMissing() async {
+        // A 404 (unknown/future date) maps to the same case an old bridge produces;
+        // the model distinguishes them by whether availableDays enabled the chevron.
+        DietStubURLProtocol.response = .init(status: 404, body: Data(#"{"error":"no diet data"}"#.utf8))
+        do {
+            _ = try await client().fetchDietSnapshot(date: "2026-01-01")
+            XCTFail("expected endpointMissing")
+        } catch let e as DietFetchError {
+            XCTAssertEqual(e, .endpointMissing)
+        } catch { XCTFail("wrong error: \(error)") }
     }
 
     func testOldBridge404IsEndpointMissing() async {

@@ -159,6 +159,78 @@ struct MacroRing: View {
     }
 }
 
+// MARK: - Neutral (no-judgment) rings for a reconstructed day
+
+/// A full neutral ring track — no colored progress arc, because a reconstructed day
+/// has no target to judge against. Frames a plain total.
+struct NeutralRing<Center: View>: View {
+    var lineWidth: CGFloat = 14
+    @ViewBuilder var center: Center
+    var body: some View {
+        ZStack {
+            Circle().stroke(Color.secondary.opacity(0.22), style: StrokeStyle(lineWidth: lineWidth))
+            center
+        }
+    }
+}
+
+/// The neutral calories hero: a full neutral ring with the eaten total centered and
+/// the burned/net caption below when exercise exists. No color, no judgment — the
+/// day was rebuilt from logs and had no recorded targets.
+struct NeutralCaloriesHero: View {
+    let totals: MacroTotals
+    let net: NetCalories
+
+    var body: some View {
+        VStack(spacing: 12) {
+            NeutralRing(lineWidth: 20) {
+                VStack(spacing: 2) {
+                    Text(NeutralMode.caloriesCenter(totals))
+                        .font(.system(size: 34, weight: .bold, design: .rounded).monospacedDigit())
+                        .foregroundStyle(.primary)
+                        .lineLimit(1).minimumScaleFactor(0.6)
+                    if let cap = NeutralMode.caloriesCaption(net: net) {
+                        Text(cap)
+                            .font(.caption.monospacedDigit())
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1).minimumScaleFactor(0.7)
+                    }
+                }
+                .padding(12)
+            }
+            .frame(width: 210, height: 210)
+        }
+        .frame(maxWidth: .infinity)
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel("Calories: \(NeutralMode.caloriesCenter(totals))")
+    }
+}
+
+/// A small neutral macro ring: a full neutral ring with the gram total centered and
+/// the macro name beneath. No goal glyph, no color.
+struct NeutralMacroRing: View {
+    let label: String
+    let grams: Double
+    var body: some View {
+        VStack(spacing: 7) {
+            NeutralRing(lineWidth: 7) {
+                Text(NeutralMode.macroCenter(grams))
+                    .font(.footnote.weight(.semibold).monospacedDigit())
+                    .foregroundStyle(.primary)
+                    .lineLimit(1).minimumScaleFactor(0.6)
+                    .padding(4)
+            }
+            .frame(width: 64, height: 64)
+            Text(label)
+                .font(.caption2.weight(.semibold))
+                .lineLimit(1).minimumScaleFactor(0.7)
+        }
+        .frame(maxWidth: .infinity)
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel("\(label): \(NeutralMode.macroCenter(grams))")
+    }
+}
+
 // MARK: - Stat & metric tiles
 
 /// A stat tile: a caption title, a large rounded value, an optional colored zone

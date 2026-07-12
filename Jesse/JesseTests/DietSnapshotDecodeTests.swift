@@ -122,6 +122,92 @@ final class DietSnapshotDecodeTests: XCTestCase {
         XCTAssertTrue(s.errors[0].hasPrefix("progress:"))
     }
 
+    // MARK: - Day-history additive fields (bridge ≥ 0.7.0)
+
+    func testTodayResponseCarriesLiveHistoryFields() throws {
+        // The plain today `full` body now also carries availableDays/historical/
+        // fidelity — decoded here as live + not historical (they're absent above, so
+        // this asserts the defaults an OLD bridge produces are correct too).
+        let s = try decode(full)
+        XCTAssertFalse(s.isHistorical, "absent historical → today")
+        XCTAssertEqual(s.fidelityKind, .live, "absent fidelity → live")
+        XCTAssertFalse(s.isNeutral)
+        XCTAssertNil(s.availableDays, "old payload without availableDays decodes to nil")
+    }
+
+    // A full archived past day: targets present, judged like today, plus the three
+    // history fields.
+    private let archived = """
+    {
+      "asOf": "2026-07-12T09:00:00Z", "todayMtime": "2026-04-16T06:10:00Z",
+      "today": {
+        "date": "2026-04-15", "dayStyle": "carb-load-training", "dayType": "Carb-load",
+        "weight": null, "exercise": [],
+        "meals": [ { "name": "Dinner", "time": "19:00", "items": [
+          { "item": "Pasta", "amount": "2 cups", "cal": 600, "p": 20, "f": 8, "c": 110, "fiber": 6 } ] } ],
+        "targets": { "calories": 2800, "protein": 150, "fat": 55, "carbs": 400 }
+      },
+      "proposed": null, "progress": null, "coach": null,
+      "weightSeries": [ { "date": "2026-04-15", "lbs": 200.8 } ],
+      "errors": [],
+      "availableDays": ["2026-03-30", "2026-04-15", "2026-07-12"],
+      "historical": true, "fidelity": "archived"
+    }
+    """
+
+    func testDecodesArchivedPastDay() throws {
+        let s = try decode(archived)
+        XCTAssertTrue(s.isHistorical)
+        XCTAssertEqual(s.fidelityKind, .archived)
+        XCTAssertFalse(s.isNeutral, "an archived day is judged, not neutral")
+        XCTAssertEqual(s.today.targets.calories, 2800, "archived targets present")
+        XCTAssertEqual(s.today.dayStyle, "carb-load-training")
+        XCTAssertEqual(s.availableDays, ["2026-03-30", "2026-04-15", "2026-07-12"])
+        // History requests carry null proposed/progress/coach.
+        XCTAssertNil(s.proposed); XCTAssertNil(s.progress); XCTAssertNil(s.coach)
+    }
+
+    // A reconstructed past day: targets null → neutral rendering.
+    private let reconstructed = """
+    {
+      "asOf": "2026-07-12T09:00:00Z", "todayMtime": null,
+      "today": {
+        "date": "2026-04-15", "dayStyle": null, "dayType": null,
+        "weight": { "lbs": 200.8, "kg": 91.1, "bf": 28.5, "mm": 136.2, "notes": "backfilled" },
+        "exercise": [ { "type": "run", "time": "06:30", "distance": 8.0, "unit": "km", "duration": "56:58" } ],
+        "meals": [ { "name": "Lunch", "time": null, "items": [
+          { "item": "Sandwich", "amount": "1 ea", "cal": 450, "p": 25, "f": 18, "c": 48, "fiber": 4 } ] } ],
+        "targets": null
+      },
+      "proposed": null, "progress": null, "coach": null,
+      "weightSeries": [], "errors": [],
+      "availableDays": ["2026-04-15", "2026-07-12"],
+      "historical": true, "fidelity": "reconstructed"
+    }
+    """
+
+    func testDecodesReconstructedPastDayWithNullTargets() throws {
+        let s = try decode(reconstructed)
+        XCTAssertTrue(s.isHistorical)
+        XCTAssertEqual(s.fidelityKind, .reconstructed)
+        XCTAssertTrue(s.isNeutral, "reconstructed → neutral (no judgment)")
+        // targets: null decodes to the empty DietTargets (all nil), never crashes.
+        XCTAssertNil(s.today.targets.calories, "reconstructed day has no recorded targets")
+        XCTAssertNil(s.today.dayStyle)
+        XCTAssertEqual(s.today.meals.first?.items.first?.item, "Sandwich")
+        XCTAssertNil(s.today.meals.first?.time, "null meal time decodes to nil")
+        XCTAssertEqual(s.today.exercise.first?.unit, "km")
+        XCTAssertEqual(s.today.weight?.mm, 136.2)
+    }
+
+    func testLegacyPayloadWithoutNewFieldsStillDecodes() throws {
+        // A pre-0.7.0 bridge omits all three fields entirely → today, live, no paging.
+        let s = try decode(degraded)
+        XCTAssertFalse(s.isHistorical)
+        XCTAssertEqual(s.fidelityKind, .live)
+        XCTAssertNil(s.availableDays)
+    }
+
     func testUnknownKeysAreIgnored() throws {
         // A future generator field we don't model must not break decode.
         let json = """

@@ -99,6 +99,16 @@ use tower::ServiceExt; // ServiceExt::oneshot
         }
         b.body(Body::empty()).unwrap()
     }
+    /// `GET /jesse/diet?date=<date>` — the paged-history request.
+    pub fn diet_request_date(auth: Option<&str>, date: &str) -> Request<Body> {
+        let mut b = Request::builder()
+            .method("GET")
+            .uri(format!("/jesse/diet?date={date}"));
+        if let Some(a) = auth {
+            b = b.header("authorization", a);
+        }
+        b.body(Body::empty()).unwrap()
+    }
     /// Create a throwaway vault dir with `todo-list/` and `diet-logs/`
     /// subdirectories and return its path. Caller writes fixture files into it and
     /// removes it when done. Realistic-but-invented data only — never a copy of

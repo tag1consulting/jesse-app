@@ -20,9 +20,13 @@ struct HealthTabView: View {
         NavigationStack {
             content
                 .toolbar {
-                    ToolbarItem(placement: .primaryAction) {
-                        Button { showQuickLog = true } label: { Image(systemName: "plus") }
-                            .accessibilityLabel("Quick log")
+                    // Quick log is today-only — the logging path only logs today, so
+                    // it's hidden while paging back through a past day.
+                    if HistoryUI.showsQuickLog(isHistorical: model.snapshot?.isHistorical ?? false) {
+                        ToolbarItem(placement: .primaryAction) {
+                            Button { showQuickLog = true } label: { Image(systemName: "plus") }
+                                .accessibilityLabel("Quick log")
+                        }
                     }
                 }
                 .sheet(isPresented: $showQuickLog) {
@@ -54,10 +58,10 @@ struct HealthTabView: View {
             HealthEmptyState(error: error) { Task { await model.load() } }
                 .navigationTitle("Health")
         case .content(let snapshot):
-            // TodayScreen sets its own navigation title (the date).
-            TodayScreen(snapshot: snapshot, now: model.now(), refreshError: model.refreshError) {
-                await model.load()
-            }
+            // TodayScreen sets its own navigation title (the date) and drives paging
+            // through the model.
+            TodayScreen(model: model, snapshot: snapshot, now: model.now(),
+                        refreshError: model.refreshError)
         }
     }
 }
@@ -65,20 +69,33 @@ struct HealthTabView: View {
 // MARK: - Level 1: Today
 
 struct TodayScreen: View {
+    let model: HealthDashboardModel
     let snapshot: DietSnapshot
     let now: Date
     let refreshError: DietFetchError?
-    let refresh: () async -> Void
 
     @State private var explainer: Explainer?
 
     private var today: DietToday { snapshot.today }
-    private var hour: Int { Calendar.current.component(.hour, from: now) }
+    private var clockHour: Int { Calendar.current.component(.hour, from: now) }
+    // The engine's current-hour: real clock for today, end-of-day (24) for a past
+    // day so time-gated flags are fully resolved rather than clock-suppressed.
+    private var hour: Int { HistoryRender.engineHour(isHistorical: snapshot.isHistorical, clockHour: clockHour) }
     private var gauges: DietGauges { DietSemantics.gauges(for: today, hour: hour) }
-    private var isStale: Bool { HealthDisplay.isStale(todayDate: today.date, now: now) }
+    private var totals: MacroTotals { DietSemantics.dayTotals(today.meals) }
+    private var net: NetCalories { NetCalories(intake: totals.cal, burned: DietSemantics.burnedCalories(today.exercise)) }
+    // A reconstructed day renders with NO judgment; live/archived render full.
+    private var mode: HistoryUI.Mode { HistoryUI.mode(fidelity: snapshot.fidelityKind) }
+    private var isNeutral: Bool { mode == .neutral }
+    // The stale banner is suppressed on any past day (a completed day isn't "stale").
+    private var isStale: Bool {
+        !HistoryUI.suppressesStaleBanner(isHistorical: snapshot.isHistorical)
+            && HealthDisplay.isStale(todayDate: today.date, now: now)
+    }
 
     var body: some View {
         List {
+            pagingSection
             headerSection
             caloriesSection
             macroRingsSection
@@ -89,30 +106,74 @@ struct TodayScreen: View {
         }
         .navigationTitle(HealthDisplay.headerDate(today.date))
         .navigationBarTitleDisplayMode(.large)
-        .refreshable { await refresh() }
+        .refreshable { await model.refresh() }
         .sheet(item: $explainer) { ExplainerSheet(explainer: $0) }
     }
 
-    // Header: the day-style chip (tappable → its explainer) with a subtle info
-    // affordance, plus the stale / refresh-failed banners. The date is the nav
-    // title; the updated stamp lives at the very bottom of the scroll view.
+    // Paging control: back / forward chevrons flanking a "Today" jump button, each
+    // enabled per availableDays. Chevrons (not a swipe) to avoid fighting the
+    // vertical scroll and the tab-bar gestures.
+    private var pagingSection: some View {
+        Section {
+            HStack {
+                Button { Task { await model.goBack() } } label: {
+                    Image(systemName: "chevron.left").font(.body.weight(.semibold))
+                }
+                .buttonStyle(.plain)
+                .disabled(!model.canGoBack)
+                .foregroundStyle(model.canGoBack ? AnyShapeStyle(.tint) : AnyShapeStyle(.tertiary))
+                .accessibilityLabel("Previous day")
+
+                Spacer()
+
+                if !model.isViewingToday {
+                    Button { Task { await model.goToToday() } } label: {
+                        Text("Today").font(.subheadline.weight(.semibold))
+                    }
+                    .buttonStyle(.borderless)
+                    .accessibilityLabel("Jump to today")
+                }
+
+                Spacer()
+
+                Button { Task { await model.goForward() } } label: {
+                    Image(systemName: "chevron.right").font(.body.weight(.semibold))
+                }
+                .buttonStyle(.plain)
+                .disabled(!model.canGoForward)
+                .foregroundStyle(model.canGoForward ? AnyShapeStyle(.tint) : AnyShapeStyle(.tertiary))
+                .accessibilityLabel("Next day")
+            }
+            .listRowBackground(Color.clear)
+        }
+    }
+
+    // Header: the day-style chip (full days only — a reconstructed day has no judged
+    // style) plus the stale / refresh-failed / history-unsupported banners.
     private var headerSection: some View {
         Section {
             VStack(alignment: .leading, spacing: 8) {
-                Button {
-                    explainer = Explainers.dayStyle(today.dayStyle, isCarbLoad: gauges.isCarbLoad)
-                } label: {
-                    HStack(spacing: 5) {
-                        DayStyleChip(dayStyle: today.dayStyle, isCarbLoad: gauges.isCarbLoad)
-                        Image(systemName: "info.circle")
-                            .font(.caption2)
-                            .foregroundStyle(.tertiary)
+                if !isNeutral {
+                    Button {
+                        explainer = Explainers.dayStyle(today.dayStyle, isCarbLoad: gauges.isCarbLoad)
+                    } label: {
+                        HStack(spacing: 5) {
+                            DayStyleChip(dayStyle: today.dayStyle, isCarbLoad: gauges.isCarbLoad)
+                            Image(systemName: "info.circle")
+                                .font(.caption2)
+                                .foregroundStyle(.tertiary)
+                        }
+                        .contentShape(Rectangle())
                     }
-                    .contentShape(Rectangle())
+                    .buttonStyle(.plain)
+                    .accessibilityLabel("Day type: \(DayStyleExplain.headline(dayStyle: today.dayStyle, isCarbLoad: gauges.isCarbLoad)). What this changes.")
                 }
-                .buttonStyle(.plain)
-                .accessibilityLabel("Day type: \(DayStyleExplain.headline(dayStyle: today.dayStyle, isCarbLoad: gauges.isCarbLoad)). What this changes.")
 
+                if model.historyUnsupported {
+                    Label("Update the bridge to page back through earlier days.",
+                          systemImage: "arrow.up.circle")
+                        .font(.caption).foregroundStyle(.secondary)
+                }
                 if isStale {
                     Label("showing \(today.date); nothing logged today yet",
                           systemImage: "clock.arrow.circlepath")
@@ -128,28 +189,51 @@ struct TodayScreen: View {
     }
 
     // Calories is the number that matters most, so it's the first content: one large
-    // activity ring. Tapping opens the calories explainer.
+    // ring. On a full day it's the judged activity ring; on a reconstructed day it's
+    // the neutral hero (eaten total, no judgment).
+    @ViewBuilder
     private var caloriesSection: some View {
         Section {
-            CaloriesHeroRing(gauge: gauges.calories, net: gauges.net) {
-                explainer = Explainers.calories(gauges.calories, isCarbLoad: gauges.isCarbLoad)
+            if isNeutral {
+                VStack(spacing: 8) {
+                    NeutralCaloriesHero(totals: totals, net: net)
+                    Text(NeutralMode.noTargetsCaption)
+                        .font(.caption).foregroundStyle(.secondary)
+                }
+                .padding(.vertical, 8)
+                .listRowBackground(Color.clear)
+            } else {
+                CaloriesHeroRing(gauge: gauges.calories, net: gauges.net) {
+                    explainer = Explainers.calories(gauges.calories, isCarbLoad: gauges.isCarbLoad)
+                }
+                .padding(.vertical, 8)
+                .listRowBackground(Color.clear)
             }
-            .padding(.vertical, 8)
-            .listRowBackground(Color.clear)
         }
     }
 
-    // Four smaller rings — protein, carbs, fat, fiber — in one row. Each opens its
-    // macro explainer.
+    // Four smaller rings — protein, carbs, fat, fiber. Judged on a full day; neutral
+    // gram totals on a reconstructed day.
+    @ViewBuilder
     private var macroRingsSection: some View {
         Section {
-            HStack(alignment: .top, spacing: 8) {
-                MacroRing(gauge: gauges.protein) { explainer = Explainers.protein(gauges.protein) }
-                MacroRing(gauge: gauges.carbs) { explainer = Explainers.carbs(gauges.carbs, hasBonus: gauges.carbsBonus != nil) }
-                MacroRing(gauge: gauges.fat) { explainer = Explainers.fat(gauges.fat, isCarbLoad: gauges.isCarbLoad) }
-                MacroRing(gauge: gauges.fiber) { explainer = Explainers.fiber(gauges.fiber, isCarbLoad: gauges.isCarbLoad) }
+            if isNeutral {
+                HStack(alignment: .top, spacing: 8) {
+                    NeutralMacroRing(label: "Protein", grams: totals.p)
+                    NeutralMacroRing(label: "Carbs", grams: totals.c)
+                    NeutralMacroRing(label: "Fat", grams: totals.f)
+                    NeutralMacroRing(label: "Fiber", grams: totals.fiber)
+                }
+                .listRowBackground(Color.clear)
+            } else {
+                HStack(alignment: .top, spacing: 8) {
+                    MacroRing(gauge: gauges.protein) { explainer = Explainers.protein(gauges.protein) }
+                    MacroRing(gauge: gauges.carbs) { explainer = Explainers.carbs(gauges.carbs, hasBonus: gauges.carbsBonus != nil) }
+                    MacroRing(gauge: gauges.fat) { explainer = Explainers.fat(gauges.fat, isCarbLoad: gauges.isCarbLoad) }
+                    MacroRing(gauge: gauges.fiber) { explainer = Explainers.fiber(gauges.fiber, isCarbLoad: gauges.isCarbLoad) }
+                }
+                .listRowBackground(Color.clear)
             }
-            .listRowBackground(Color.clear)
         }
     }
 
@@ -181,9 +265,13 @@ struct TodayScreen: View {
 
     @ViewBuilder
     private var updatedStampSection: some View {
-        if let updated = HealthDisplay.updatedTime(fromMtime: snapshot.todayMtime) {
+        // Today: the mtime "Updated HH:MM" stamp. A past day: a fidelity label
+        // ("Archived day" / "Rebuilt from logs") instead of a stale mtime.
+        if let footer = HistoryUI.footer(isHistorical: snapshot.isHistorical,
+                                         fidelity: snapshot.fidelityKind,
+                                         updated: HealthDisplay.updatedTime(fromMtime: snapshot.todayMtime)) {
             Section {
-                Text("Updated \(updated)")
+                Text(footer)
                     .font(.caption)
                     .foregroundStyle(.secondary)
                     .frame(maxWidth: .infinity, alignment: .center)
@@ -192,13 +280,22 @@ struct TodayScreen: View {
         }
     }
 
+    // Macros subtitle: the judged protein annotation on a full day, plain totals on
+    // a reconstructed day (no judgment to summarize).
+    private var macrosSubtitle: String {
+        if isNeutral {
+            return "\(DietSemantics.fmt(totals.cal)) cal · \(DietSemantics.fmt(totals.p))g protein"
+        }
+        return "\(DietSemantics.fmt(gauges.calories.value)) cal · \(gauges.protein.remaining)"
+    }
+
     private var navRowsSection: some View {
         Section {
             NavigationLink {
-                MacrosCaloriesDetail(today: today, hour: hour)
+                MacrosCaloriesDetail(today: today, hour: hour, neutral: isNeutral)
             } label: {
                 NavRow(title: "Macros & calories", icon: "chart.bar.fill",
-                       subtitle: "\(DietSemantics.fmt(gauges.calories.value)) cal · \(gauges.protein.remaining)")
+                       subtitle: macrosSubtitle)
             }
 
             NavigationLink {
@@ -215,6 +312,8 @@ struct TodayScreen: View {
                        subtitle: "\(today.exercise.count) \(today.exercise.count == 1 ? "session" : "sessions") · \(DietSemantics.fmt(DietSemantics.burnedCalories(today.exercise))) cal")
             }
 
+            // Weight & trend stays reachable on a past day — the chart is inherently
+            // historical.
             unavailableOr(section: snapshot.weightSeries?.isEmpty == false ? snapshot.weightSeries : nil,
                           label: "Weight", errors: snapshot.errors,
                           icon: "scalemass", title: "Weight & trend",
@@ -222,16 +321,20 @@ struct TodayScreen: View {
                 WeightTrendDetail(series: series, progress: snapshot.progress)
             }
 
-            unavailableOr(section: snapshot.progress, label: "Progress", errors: snapshot.errors,
-                          icon: "target", title: "Progress & pace",
-                          subtitle: snapshot.progress?.trajectory) { progress in
-                ProgressPaceDetail(progress: progress, today: today, series: snapshot.weightSeries)
-            }
+            // Progress & pace and Coach's notes are CURRENT-STATE only (the bridge
+            // returns them null on history), so they're hidden on a past day.
+            if HistoryUI.showsCurrentStateRows(isHistorical: snapshot.isHistorical) {
+                unavailableOr(section: snapshot.progress, label: "Progress", errors: snapshot.errors,
+                              icon: "target", title: "Progress & pace",
+                              subtitle: snapshot.progress?.trajectory) { progress in
+                    ProgressPaceDetail(progress: progress, today: today, series: snapshot.weightSeries)
+                }
 
-            unavailableOr(section: snapshot.coach, label: "Coach", errors: snapshot.errors,
-                          icon: "quote.bubble", title: "Coach's notes",
-                          subtitle: snapshot.coach?.title) { coach in
-                CoachDetail(coach: coach)
+                unavailableOr(section: snapshot.coach, label: "Coach", errors: snapshot.errors,
+                              icon: "quote.bubble", title: "Coach's notes",
+                              subtitle: snapshot.coach?.title) { coach in
+                    CoachDetail(coach: coach)
+                }
             }
         }
     }

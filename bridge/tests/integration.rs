@@ -1726,3 +1726,185 @@ async fn diet_section_isolation_bad_progress_still_200() {
     assert!(errs.iter().any(|e| e.as_str().unwrap().starts_with("progress:")), "errors names the failed section: {errs:?}");
     let _ = std::fs::remove_dir_all(&vault);
 }
+
+// ---- GET /jesse/diet?date= (day history) ----------------------------------
+//
+// Synthetic append-only CSV fixtures for the reconstruction path, plus a synthetic
+// archive `days/<date>.js`. Dates are all in the past relative to FIX_TODAY's
+// 2026-07-08, so they're valid history requests.
+
+const FIX_FOOD_CSV: &str = "Date,Meal,Item,Amount,Unit,Cal_per_100g,Grams,Calories,Protein_g,Fat_g,Carbs_g,Notes,Time,Meal_Type,Fiber_g\n\
+2026-04-15,Breakfast,Oatmeal,1,cup,,,300,10,5,54,\"cooked in water, no sugar\",07:15,Breakfast,8\n\
+2026-04-15,Breakfast,Banana,1 medium (~118g),,89,118,,1,0,27,\"ripe, with spots\",07:15,Breakfast,3\n\
+2026-04-15,Lunch,Sandwich,1,ea,,,450,25,18,48,\"turkey, cheese, lettuce\",12:30,Lunch,4\n\
+2026-04-15,Lunch,Cookie,2,ea,,,180,2,9,24,dessert,15:00,Lunch,1\n";
+
+const FIX_EXERCISE_CSV: &str = "Date,Type,Description,Distance_km,Duration,Pace_min_per_km,Elevation_m,Avg_HR,Cadence,Calories,Plan_Source,Notes,Start_Time\n\
+2026-04-15,run,Easy morning run,8.0,56:58,7:07,45,142,168,520,plan,\"felt good, cool air\",06:30\n\
+2026-04-15,strength,Upper body,,0:45:00,,,110,,220,plan,gym,17:00\n";
+
+/// A vault whose `today` is FIX_TODAY (2026-07-08) plus the reconstruction CSVs
+/// and the weight log (which carries 2026-07-06..08).
+fn diet_state_history() -> (AppState, std::path::PathBuf) {
+    let vault = make_diet_vault();
+    write_vault_file(&vault, "todo-list/diet-today.js", FIX_TODAY);
+    write_vault_file(&vault, "diet-logs/weight-log.csv", FIX_WEIGHT_CSV);
+    write_vault_file(&vault, "diet-logs/food-log.csv", FIX_FOOD_CSV);
+    write_vault_file(&vault, "diet-logs/exercise-log.csv", FIX_EXERCISE_CSV);
+    let cfg = Config { vault: vault.to_string_lossy().into_owned(), ..test_config() };
+    (AppState::new(cfg), vault)
+}
+
+#[tokio::test]
+async fn diet_today_response_carries_new_history_fields() {
+    // The plain today response gains availableDays / historical / fidelity, and is
+    // otherwise byte-compatible (existing fields unchanged).
+    let (st, vault) = diet_state_history();
+    let resp = app(st).oneshot(diet_request(Some("Bearer test-token"))).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body: Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    assert_eq!(body["historical"], false, "today is not historical");
+    assert_eq!(body["fidelity"], "live", "today fidelity is live");
+    let days = body["availableDays"].as_array().unwrap();
+    assert!(days.iter().any(|d| d == "2026-07-08"), "today's own date is included");
+    assert!(days.iter().any(|d| d == "2026-04-15"), "a CSV date is included");
+    // Ascending + deduped.
+    let flat: Vec<&str> = days.iter().map(|d| d.as_str().unwrap()).collect();
+    let mut sorted = flat.clone(); sorted.sort(); sorted.dedup();
+    assert_eq!(flat, sorted, "availableDays sorted ascending and deduped");
+    // Existing today fields unchanged.
+    assert_eq!(body["today"]["dayStyle"], "normal");
+    assert_eq!(body["today"]["targets"]["calories"], 2100);
+    let _ = std::fs::remove_dir_all(&vault);
+}
+
+#[tokio::test]
+async fn diet_bad_date_format_is_400() {
+    let (st, vault) = diet_state_history();
+    let resp = app(st).oneshot(diet_request_date(Some("Bearer test-token"), "2026-4-5")).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let body: Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    assert!(body["error"].is_string(), "400 has a JSON error body");
+    let _ = std::fs::remove_dir_all(&vault);
+}
+
+#[tokio::test]
+async fn diet_unknown_date_is_404() {
+    let (st, vault) = diet_state_history();
+    // A valid past date with no CSV/archive data.
+    let resp = app(st).oneshot(diet_request_date(Some("Bearer test-token"), "2026-01-02")).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    let body: Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    assert!(body["error"].is_string(), "404 has a JSON error body");
+    let _ = std::fs::remove_dir_all(&vault);
+}
+
+#[tokio::test]
+async fn diet_future_date_is_404() {
+    let (st, vault) = diet_state_history();
+    let resp = app(st).oneshot(diet_request_date(Some("Bearer test-token"), "2027-01-01")).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    let _ = std::fs::remove_dir_all(&vault);
+}
+
+#[tokio::test]
+async fn diet_reconstructed_day_has_null_targets_and_real_logs() {
+    let (st, vault) = diet_state_history();
+    let resp = app(st).oneshot(diet_request_date(Some("Bearer test-token"), "2026-04-15")).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body: Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    assert_eq!(body["historical"], true);
+    assert_eq!(body["fidelity"], "reconstructed");
+    assert!(body["today"]["targets"].is_null(), "reconstructed day has null targets");
+    assert!(body["today"]["dayStyle"].is_null());
+    assert_eq!(body["today"]["date"], "2026-04-15");
+    // proposed/progress/coach are null on history.
+    assert!(body["proposed"].is_null());
+    assert!(body["progress"].is_null());
+    assert!(body["coach"].is_null());
+    // Meals grouped by (Meal, Time): Breakfast@07:15, Lunch@12:30, Lunch@15:00.
+    let meals = body["today"]["meals"].as_array().unwrap();
+    assert_eq!(meals.len(), 3, "three meal groups: {meals:?}");
+    assert_eq!(meals[0]["name"], "Breakfast");
+    assert_eq!(meals[0]["time"], "07:15");
+    assert_eq!(meals[0]["items"].as_array().unwrap().len(), 2);
+    // Banana: blank Calories → derived from Cal_per_100g×Grams = 89*118/100 = 105.
+    let banana = &meals[0]["items"][1];
+    assert_eq!(banana["item"], "Banana");
+    assert_eq!(banana["cal"], 105.0);
+    assert_eq!(banana["amount"], "1 medium (~118g)", "amount with unit text verbatim");
+    // Oatmeal amount joins bare number + unit.
+    assert_eq!(meals[0]["items"][0]["amount"], "1 cup");
+    // Two same-named Lunch meals at different times stay separate.
+    assert_eq!(meals[1]["name"], "Lunch");
+    assert_eq!(meals[1]["time"], "12:30");
+    assert_eq!(meals[2]["name"], "Lunch");
+    assert_eq!(meals[2]["time"], "15:00");
+    // Exercise reconstructed + sorted by time.
+    let ex = body["today"]["exercise"].as_array().unwrap();
+    assert_eq!(ex.len(), 2);
+    assert_eq!(ex[0]["type"], "run");
+    assert_eq!(ex[0]["time"], "06:30");
+    assert_eq!(ex[0]["distance"], 8.0);
+    assert_eq!(ex[0]["unit"], "km");
+    assert_eq!(ex[0]["duration"], "56:58");
+    assert_eq!(ex[1]["type"], "strength");
+    assert!(ex[1]["distance"].is_null(), "blank distance → null");
+    // No weigh-in for 2026-04-15 → weight null.
+    assert!(body["today"]["weight"].is_null(), "no weigh-in that day → weight null");
+    // weightSeries (the historical chart) is still returned in full.
+    assert_eq!(body["weightSeries"].as_array().unwrap().len(), 3);
+    let _ = std::fs::remove_dir_all(&vault);
+}
+
+#[tokio::test]
+async fn diet_reconstructed_day_maps_weigh_in_when_present() {
+    // 2026-07-06 has a weight-log row but no food/exercise rows → reconstructed with
+    // a weight object in today-weight shape (mm from MuscleMass_lbs).
+    let (st, vault) = diet_state_history();
+    let resp = app(st).oneshot(diet_request_date(Some("Bearer test-token"), "2026-07-06")).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body: Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    assert_eq!(body["fidelity"], "reconstructed");
+    assert_eq!(body["today"]["weight"]["lbs"], 198.6);
+    assert_eq!(body["today"]["weight"]["bf"], 18.4);
+    assert_eq!(body["today"]["weight"]["mm"], 150.0, "mm mapped from MuscleMass_lbs");
+    let _ = std::fs::remove_dir_all(&vault);
+}
+
+#[tokio::test]
+async fn diet_archive_present_wins_over_reconstruction() {
+    // An archive file for a date that ALSO has CSV rows: the archive is served
+    // verbatim (fidelity archived, full targets), not reconstructed.
+    let (st, vault) = diet_state_history();
+    let archive = "// archived 2026-04-16\n\
+window.DIET_TODAY = {\n\
+  date: '2026-04-15', dayStyle: 'carb-load-training', dayType: 'Carb-load',\n\
+  weight: null, exercise: [], meals: [ { name: 'Archived Meal', time: '09:00', items: [] } ],\n\
+  targets: { calories: 2800, protein: 150, fat: 55, carbs: 400 },\n\
+};\n";
+    std::fs::create_dir_all(vault.join("diet-logs/days")).unwrap();
+    write_vault_file(&vault, "diet-logs/days/2026-04-15.js", archive);
+    let resp = app(st).oneshot(diet_request_date(Some("Bearer test-token"), "2026-04-15")).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body: Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    assert_eq!(body["historical"], true);
+    assert_eq!(body["fidelity"], "archived", "archive wins over CSV reconstruction");
+    assert_eq!(body["today"]["dayStyle"], "carb-load-training");
+    assert_eq!(body["today"]["targets"]["calories"], 2800, "archived targets present");
+    assert_eq!(body["today"]["meals"][0]["name"], "Archived Meal", "served verbatim, not reconstructed");
+    let _ = std::fs::remove_dir_all(&vault);
+}
+
+#[tokio::test]
+async fn diet_history_when_days_dir_absent_reconstructs_cleanly() {
+    // The days/ archive directory does not exist at all → treated as no-archive, not
+    // an error; the day reconstructs.
+    let (st, vault) = diet_state_history();
+    assert!(!vault.join("diet-logs/days").exists(), "no archive dir in this fixture");
+    let resp = app(st).oneshot(diet_request_date(Some("Bearer test-token"), "2026-04-15")).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body: Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    assert_eq!(body["fidelity"], "reconstructed");
+    let _ = std::fs::remove_dir_all(&vault);
+}

@@ -210,9 +210,21 @@ struct WeightPoint: Decodable, Equatable, Sendable {
     var notes: String?
 }
 
+/// The tier a day's data came from (bridge ≥ 0.7.0). `live` is today; `archived`
+/// is a past day served from its saved `diet-today.js` copy (full targets, judged
+/// like today); `reconstructed` is a past day rebuilt from the append-only CSVs
+/// (no targets recorded, so rendered WITHOUT judgment colors). An absent/unknown
+/// value from an older bridge reads as `live`.
+enum DietFidelity: String, Equatable, Sendable {
+    case live, archived, reconstructed
+}
+
 /// The whole `GET /jesse/diet` response. `today` is always present (the bridge
 /// returns 503 otherwise); every other section is null when its file was
 /// missing/unparseable, with a human-readable line in `errors`.
+///
+/// `availableDays`/`historical`/`fidelity` are additive (bridge ≥ 0.7.0) and all
+/// optional so an older bridge's payload (which omits them) still decodes cleanly.
 struct DietSnapshot: Decodable, Equatable, Sendable {
     var asOf: String
     var todayMtime: String?
@@ -222,9 +234,17 @@ struct DietSnapshot: Decodable, Equatable, Sendable {
     var coach: DietCoach?
     var weightSeries: [WeightPoint]?
     var errors: [String]
+    /// Every date the app can page to (union of the logs + archives + today),
+    /// sorted ascending. Absent on an old bridge → paging stays disabled.
+    var availableDays: [String]?
+    /// True for a past day, false/absent for today.
+    var historical: Bool?
+    /// `"live" | "archived" | "reconstructed"`; absent on an old bridge.
+    var fidelity: String?
 
     enum CodingKeys: String, CodingKey {
         case asOf, todayMtime, today, proposed, progress, coach, weightSeries, errors
+        case availableDays, historical, fidelity
     }
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
@@ -236,7 +256,30 @@ struct DietSnapshot: Decodable, Equatable, Sendable {
         coach = try c.decodeIfPresent(DietCoach.self, forKey: .coach)
         weightSeries = try c.decodeIfPresent([WeightPoint].self, forKey: .weightSeries)
         errors = try c.decodeIfPresent([String].self, forKey: .errors) ?? []
+        availableDays = try c.decodeIfPresent([String].self, forKey: .availableDays)
+        historical = try c.decodeIfPresent(Bool.self, forKey: .historical)
+        fidelity = try c.decodeIfPresent(String.self, forKey: .fidelity)
     }
+    // A memberwise init for tests/previews (the custom decoder suppresses the
+    // synthesized one).
+    init(asOf: String = "", todayMtime: String? = nil, today: DietToday,
+         proposed: DietProposed? = nil, progress: DietProgress? = nil,
+         coach: DietCoach? = nil, weightSeries: [WeightPoint]? = nil,
+         errors: [String] = [], availableDays: [String]? = nil,
+         historical: Bool? = nil, fidelity: String? = nil) {
+        self.asOf = asOf; self.todayMtime = todayMtime; self.today = today
+        self.proposed = proposed; self.progress = progress; self.coach = coach
+        self.weightSeries = weightSeries; self.errors = errors
+        self.availableDays = availableDays; self.historical = historical
+        self.fidelity = fidelity
+    }
+
+    /// Whether this snapshot is a past day (not today). Absent → today.
+    var isHistorical: Bool { historical ?? false }
+    /// The data tier, defaulting an absent/unknown value to `.live`.
+    var fidelityKind: DietFidelity { DietFidelity(rawValue: fidelity ?? "live") ?? .live }
+    /// A reconstructed day carries no targets, so it renders WITHOUT any judgment.
+    var isNeutral: Bool { fidelityKind == .reconstructed }
 
     /// Decode a snapshot from raw bytes with the app's shared decoder settings.
     static func decode(from data: Data) throws -> DietSnapshot {

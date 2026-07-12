@@ -32,11 +32,24 @@ struct ZoneChip: View {
 struct MacrosCaloriesDetail: View {
     let today: DietToday
     let hour: Int
+    /// A reconstructed day has no recorded targets → plain totals, no bars/colors.
+    var neutral: Bool = false
     @State private var explainer: Explainer?
 
     private var g: DietGauges { DietSemantics.gauges(for: today, hour: hour) }
+    private var totals: MacroTotals { DietSemantics.dayTotals(today.meals) }
+    private var net: NetCalories { NetCalories(intake: totals.cal, burned: DietSemantics.burnedCalories(today.exercise)) }
 
     var body: some View {
+        Group {
+            if neutral { neutralBody } else { judgedBody }
+        }
+        .navigationTitle("Macros & calories")
+        .navigationBarTitleDisplayMode(.inline)
+        .sheet(item: $explainer) { ExplainerSheet(explainer: $0) }
+    }
+
+    private var judgedBody: some View {
         List {
             Section {
                 bar(g.calories, Explainers.calories(g.calories, isCarbLoad: g.isCarbLoad))
@@ -54,9 +67,37 @@ struct MacrosCaloriesDetail: View {
                 legend
             }
         }
-        .navigationTitle("Macros & calories")
-        .navigationBarTitleDisplayMode(.inline)
-        .sheet(item: $explainer) { ExplainerSheet(explainer: $0) }
+    }
+
+    // Neutral: plain per-macro totals, no bars, no colors, no goal glyphs — a
+    // reconstructed day had no targets to judge against.
+    private var neutralBody: some View {
+        List {
+            Section {
+                totalRow("Calories", "\(DietSemantics.fmt(totals.cal))")
+                totalRow("Protein", "\(DietSemantics.fmt(totals.p))g")
+                totalRow("Carbs", "\(DietSemantics.fmt(totals.c))g")
+                totalRow("Fat", "\(DietSemantics.fmt(totals.f))g")
+                totalRow("Fiber", "\(DietSemantics.fmt(totals.fiber))g")
+            } footer: {
+                Text(NeutralMode.noTargetsCaption)
+            }
+            if net.burned > 0 {
+                Section("Net calories") {
+                    totalRow("Eaten", "\(DietSemantics.fmt(net.intake))")
+                    totalRow("Burned", "\(DietSemantics.fmt(net.burned))")
+                    totalRow("Net", "\(DietSemantics.fmt(net.net))")
+                }
+            }
+        }
+    }
+
+    private func totalRow(_ title: String, _ value: String) -> some View {
+        HStack {
+            Text(title).foregroundStyle(.secondary)
+            Spacer()
+            Text(value).font(.body.monospacedDigit())
+        }
     }
 
     private func bar(_ gauge: MetricGauge, _ ex: Explainer) -> some View {
