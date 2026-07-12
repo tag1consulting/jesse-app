@@ -15,6 +15,17 @@ CI both run it). See the "Versioning" section of `bridge/README.md`.
 
 ## [Unreleased]
 
+## [App 1.0 (30)] — 2026-07-12
+
+### Fixed
+- **Health dashboard actor-isolation warnings.** `HealthDashboardModel`'s injected
+  client factory was typed as a plain (nonisolated) `() -> any JesseClientProtocol`,
+  so its default value — `{ JesseClient(config: ConfigStore.load()) }` — called the
+  main-actor-isolated `JesseClient.init` and `ConfigStore.load()` from a synchronous
+  nonisolated context (two warnings under `SWIFT_DEFAULT_ACTOR_ISOLATION = MainActor`).
+  The factory is only ever invoked from `load()` on the already-`@MainActor` model, so
+  the type is now `@MainActor () -> any JesseClientProtocol` to match. No behavior change.
+
 ## [App 1.0 (29)] — 2026-07-12
 
 ### Changed

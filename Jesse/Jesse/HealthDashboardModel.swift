@@ -26,10 +26,10 @@ final class HealthDashboardModel {
     /// states (no snapshot yet) and the subtle "couldn't refresh" stamp (has one).
     private(set) var lastError: DietFetchError?
 
-    private let makeClient: () -> any JesseClientProtocol
+    private let makeClient: @MainActor () -> any JesseClientProtocol
     let now: () -> Date
 
-    init(makeClient: @escaping () -> any JesseClientProtocol = { JesseClient(config: ConfigStore.load()) },
+    init(makeClient: @escaping @MainActor () -> any JesseClientProtocol = { JesseClient(config: ConfigStore.load()) },
          now: @escaping () -> Date = { Date() }) {
         self.makeClient = makeClient
         self.now = now
