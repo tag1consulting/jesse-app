@@ -15,6 +15,57 @@ CI both run it). See the "Versioning" section of `bridge/README.md`.
 
 ## [Unreleased]
 
+## [App 1.0 (29)] — 2026-07-12
+
+### Changed
+- **Health tab redesign — a presentation pass over the v1 dashboard.** The data
+  contract, networking, caching, refresh, error/empty states, and every rule in the
+  `DietSemantics` engine are unchanged; only how the snapshot is presented changed.
+  - **Tab bar scope.** The root TabView's bar is now hidden inside an open
+    conversation (applied on the pushed `ThreadDetailView`, so every entry point —
+    deep link, Siri, notification tap — inherits it) and remains visible on the
+    conversation list and throughout Health.
+  - **Today header.** The date is now the navigation title, formatted Apple-Fitness
+    style ("Saturday, July 12", locale-aware and unit-tested). The day-style chip
+    sits under the title and is tappable, opening an explainer describing what the
+    day type changes (which metrics are floors, ceilings, windows). The "updated
+    HH:MM" stamp moved out of the header to a single centered caption at the very
+    bottom of the scroll view. Stale-banner logic is unchanged.
+  - **Calories hero ring.** The first content section is one large Apple-Watch-style
+    activity ring — thick rounded stroke on a dim track, animating on appear — whose
+    fill is intake/target clamped to 1.0, whose color is the engine's calorie status
+    color exactly (ceiling on normal days, window on carb-load days), and whose
+    center shows the remaining number large with the engine's remaining annotation
+    beneath. A net line ("1,840 eaten · 420 burned · 1,420 net") appears when a burn
+    exists. Tapping opens the calories explainer.
+  - **Macro rings.** Four smaller rings (Protein, Carbs, Fat, Fiber) replace the old
+    compressed gauge strip, each colored by the engine's status (fiber renders
+    neutral gray on a carb-load day, where the engine suspends it), grams in the
+    center, the macro name on one line with its goal glyph beneath. Each opens its
+    explainer.
+  - **Weight card** moves below the rings and is now a NavigationLink into Weight &
+    trend (with a chevron); its content rules are unchanged.
+  - **Food journal.** A day-summary card (total calories large + a stacked
+    calorie-source bar at 4/4/9 kcal per gram, with a legend) replaces the old
+    grand-total footer, followed by chronological meal cards (name, time capsule,
+    calories, per-item macros) with subtotals, then a visually distinct "Planned"
+    section for proposed meal ideas.
+  - **Exercise.** Fitness-app-style workout cards, one per session, with an SF Symbol
+    per activity type (pure, case-insensitive, substring-matched mapping) and a
+    metrics grid of whichever fields exist.
+  - **Weight & trend.** The BF% toggle is removed — the body-fat series renders
+    whenever any weigh-in carries a BF reading (a pure, tested availability rule) and
+    otherwise no BF UI exists. The pace wall-of-text is replaced by two stat tiles
+    (Trough, Raw) with zone chips and captions drawn from the prerendered strings,
+    plus a single range line.
+  - **Progress & pace.** Compact phase milestones, titled progress bars with
+    percents, two fat/lean stat tiles, and a single trajectory callout replace the
+    paragraphs of caption text; the body-composition bar is unchanged.
+  - New pure, failing-first-tested logic: ring fill/clamp + neutral mapping, the
+    calories center-label selection across left/at-limit/over/window, the net line,
+    the exercise-symbol mapping, the BF availability rule, the header-date formatter,
+    the calorie-source split, and the day-style headline.
+
 ## [Bridge 0.6.0] — 2026-07-10
 
 ### Added

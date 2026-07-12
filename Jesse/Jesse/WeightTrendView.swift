@@ -17,8 +17,8 @@ struct WeightTrendDetail: View {
     }
 
     @State private var range: Range = .d90
-    @State private var showBF = false
     @State private var scrubDate: Date?
+    @State private var explainer: Explainer?
 
     /// One chart point with a parsed date; rows whose date doesn't parse are dropped.
     private struct Point: Identifiable {
@@ -77,19 +77,21 @@ struct WeightTrendDetail: View {
                 weightChart
                     .frame(height: 240)
                     .listRowSeparator(.hidden)
-
-                if hasBF {
-                    Toggle("Body fat %", isOn: $showBF)
-                    if showBF { bfChart.frame(height: 140).listRowSeparator(.hidden) }
+            }
+            // Body fat renders whenever any weigh-in in the series carries a BF
+            // reading — no toggle. When none do, no BF UI exists at all. The
+            // availability rule is the pure, tested `HealthDisplay.hasBodyFat`.
+            if HealthDisplay.hasBodyFat(series) {
+                Section("Body fat %") {
+                    bfChart.frame(height: 140).listRowSeparator(.hidden)
                 }
             }
             if let progress { paceSection(progress) }
         }
         .navigationTitle("Weight & trend")
         .navigationBarTitleDisplayMode(.inline)
+        .sheet(item: $explainer) { ExplainerSheet(explainer: $0) }
     }
-
-    private var hasBF: Bool { points.contains { $0.bf != nil } }
 
     // MARK: charts
 
@@ -174,20 +176,32 @@ struct WeightTrendDetail: View {
 
     private func paceSection(_ p: DietProgress) -> some View {
         Section("Pace") {
-            paceRow("Trough", p.paceBarLabel ?? p.troughPace.map { "\(DietSemantics.fmt($0)) lb/wk" },
-                    zone: p.paceZone)
-            paceRow("Raw", p.rawPace.map { "\(DietSemantics.fmt($0)) lb/wk" }, zone: nil)
-            if let sub = p.paceSubMain { Text(sub).font(.caption).foregroundStyle(.secondary) }
-            if let sub = p.paceSubZone { Text(sub).font(.caption).foregroundStyle(.secondary) }
+            HStack(alignment: .top, spacing: 12) {
+                StatTile(title: "Trough", value: paceValue(p.troughPace),
+                         zone: p.paceZone, caption: p.paceSubMain) {
+                    explainer = Explainers.pace(p)
+                }
+                StatTile(title: "Raw", value: paceValue(p.rawPace),
+                         zone: p.paceZone, caption: p.paceSubZone) {
+                    explainer = Explainers.pace(p)
+                }
+            }
+            .listRowInsets(EdgeInsets(top: 8, leading: 16, bottom: 8, trailing: 16))
+
+            if let range = rangeLine(p) {
+                Text(range).font(.caption).foregroundStyle(.secondary)
+            }
         }
     }
 
-    private func paceRow(_ title: String, _ value: String?, zone: String?) -> some View {
-        HStack {
-            Text(title).font(.subheadline)
-            Spacer()
-            if let value { Text(value).font(.subheadline.monospacedDigit()) }
-            if let zone { ZoneChip(text: zone, zone: zone) }
-        }
+    private func paceValue(_ pace: Double?) -> String {
+        pace.map { "\(DietSemantics.fmt($0)) lb/wk" } ?? "—"
+    }
+
+    /// The low/high edges joined into one small range line under the tiles. Both,
+    /// one, or neither may be present.
+    private func rangeLine(_ p: DietProgress) -> String? {
+        let parts = [p.paceSubLow, p.paceSubHigh].compactMap { $0 }
+        return parts.isEmpty ? nil : parts.joined(separator: "  ·  ")
     }
 }

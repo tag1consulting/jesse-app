@@ -132,45 +132,72 @@ struct FoodJournalDetail: View {
 
     var body: some View {
         List {
+            summarySection
             ForEach(Array(meals.enumerated()), id: \.offset) { _, meal in
-                Section {
-                    ForEach(Array(meal.items.enumerated()), id: \.offset) { _, it in
-                        itemRow(it)
-                    }
-                    subtotalRow(DietSemantics.subtotal(of: meal))
-                } header: {
-                    HStack {
-                        Text(meal.name)
-                        if let t = meal.time { Spacer(); Text(t).foregroundStyle(.secondary) }
-                    }
-                }
-            }
-            Section {
-                HStack {
-                    Text("Day total").font(.subheadline.weight(.semibold))
-                    Spacer()
-                    Text("\(DietSemantics.fmt(grand.cal)) cal").font(.subheadline.weight(.semibold).monospacedDigit())
-                }
-                Text(macroLine(grand)).font(.caption.monospacedDigit()).foregroundStyle(.secondary)
+                mealCard(meal)
             }
             if let proposed, !proposed.ideas.isEmpty {
-                mealIdeas(proposed)
+                plannedSection(proposed)
             }
         }
+        .listStyle(.plain)
         .navigationTitle("Food journal")
         .navigationBarTitleDisplayMode(.inline)
     }
 
+    // A day-summary card: total calories large, one stacked bar of where they came
+    // from, and the grand macro line. This replaces the old grand-total footer.
+    private var summarySection: some View {
+        Section {
+            HealthCard {
+                VStack(alignment: .leading, spacing: 12) {
+                    HStack(alignment: .firstTextBaseline) {
+                        Text("\(DietSemantics.fmt(grand.cal))")
+                            .font(.system(size: 40, weight: .bold, design: .rounded).monospacedDigit())
+                        Text("cal today").font(.subheadline).foregroundStyle(.secondary)
+                    }
+                    CalorieSourceBar(split: HealthDisplay.calorieSplit(grand))
+                    Text(itemMacroLine(grand)).font(.caption.monospacedDigit()).foregroundStyle(.secondary)
+                }
+            }
+            .cardRow()
+        }
+    }
+
+    private func mealCard(_ meal: DietMeal) -> some View {
+        Section {
+            HealthCard {
+                VStack(alignment: .leading, spacing: 10) {
+                    HStack(spacing: 8) {
+                        Text(meal.name).font(.headline)
+                        if let t = meal.time { TimeCapsule(time: t) }
+                        Spacer()
+                        Text("\(DietSemantics.fmt(DietSemantics.subtotal(of: meal).cal)) cal")
+                            .font(.subheadline.weight(.semibold).monospacedDigit())
+                    }
+                    ForEach(Array(meal.items.enumerated()), id: \.offset) { _, it in
+                        itemRow(it)
+                    }
+                    Divider()
+                    subtotalRow(DietSemantics.subtotal(of: meal))
+                }
+            }
+            .cardRow()
+        }
+    }
+
     private func itemRow(_ it: DietItem) -> some View {
         VStack(alignment: .leading, spacing: 2) {
-            HStack {
+            HStack(alignment: .firstTextBaseline) {
                 Text(it.item).font(.subheadline)
                 if let a = it.amount { Text(a).font(.caption).foregroundStyle(.secondary) }
                 Spacer()
-                if let cal = it.cal { Text("\(DietSemantics.fmt(cal)) cal").font(.caption.monospacedDigit()) }
+                if let cal = it.cal {
+                    Text("\(DietSemantics.fmt(cal)) cal").font(.caption.monospacedDigit()).foregroundStyle(.secondary)
+                }
             }
-            Text(macroLine(MacroTotals(cal: 0, p: it.p ?? 0, f: it.f ?? 0, c: it.c ?? 0, fiber: it.fiber ?? 0)))
-                .font(.caption2.monospacedDigit()).foregroundStyle(.secondary)
+            Text(itemMacroLine(MacroTotals(cal: 0, p: it.p ?? 0, f: it.f ?? 0, c: it.c ?? 0, fiber: it.fiber ?? 0)))
+                .font(.caption2.monospacedDigit()).foregroundStyle(.tertiary)
         }
     }
 
@@ -178,34 +205,59 @@ struct FoodJournalDetail: View {
         HStack {
             Text("Subtotal").font(.caption.weight(.semibold)).foregroundStyle(.secondary)
             Spacer()
-            Text("\(DietSemantics.fmt(t.cal)) cal · \(macroLine(t))")
+            Text("\(DietSemantics.fmt(t.cal)) cal · \(itemMacroLine(t))")
                 .font(.caption.monospacedDigit()).foregroundStyle(.secondary)
         }
     }
 
-    private func mealIdeas(_ proposed: DietProposed) -> some View {
+    // Proposed meal ideas, styled distinctly from logged meals (secondary tint,
+    // "Planned" header) so logged vs proposed is unmistakable.
+    private func plannedSection(_ proposed: DietProposed) -> some View {
         Section {
             ForEach(Array(proposed.ideas.enumerated()), id: \.offset) { _, idea in
-                VStack(alignment: .leading, spacing: 4) {
-                    HStack {
-                        Text(idea.name).font(.subheadline.weight(.semibold))
-                        if let t = idea.time { Spacer(); Text(t).font(.caption).foregroundStyle(.secondary) }
+                HealthCard {
+                    VStack(alignment: .leading, spacing: 6) {
+                        HStack(spacing: 8) {
+                            Image(systemName: "sparkles").font(.caption).foregroundStyle(.secondary)
+                            Text(idea.name).font(.subheadline.weight(.semibold)).foregroundStyle(.secondary)
+                            if let t = idea.time { TimeCapsule(time: t) }
+                            Spacer()
+                            let tot = DietSemantics.total(of: idea.items)
+                            Text("~\(DietSemantics.fmt(tot.cal)) cal")
+                                .font(.caption.monospacedDigit()).foregroundStyle(.secondary)
+                        }
+                        Text(itemMacroLine(DietSemantics.total(of: idea.items)))
+                            .font(.caption2.monospacedDigit()).foregroundStyle(.tertiary)
+                        if let notes = idea.notes {
+                            Text(notes).font(.caption).foregroundStyle(.secondary)
+                        }
                     }
-                    let t = DietSemantics.total(of: idea.items)
-                    Text("~\(DietSemantics.fmt(t.cal)) cal · \(macroLine(t))")
-                        .font(.caption.monospacedDigit()).foregroundStyle(.secondary)
-                    if let notes = idea.notes { Text(notes).font(.caption).foregroundStyle(.secondary) }
                 }
+                .cardRow()
             }
             if let source = proposed.source {
                 Text("Source: \(source)").font(.caption2).foregroundStyle(.tertiary)
+                    .cardRow()
             }
             if let gap = proposed.gapNote {
                 Text(gap).font(.caption).foregroundStyle(.secondary)
+                    .cardRow()
             }
         } header: {
-            Text("Meal ideas")
+            Label("Planned", systemImage: "calendar.badge.clock")
+                .font(.footnote.weight(.semibold))
+                .foregroundStyle(.secondary)
         }
+    }
+}
+
+private extension View {
+    /// The card list-row treatment shared by the food-journal and exercise cards:
+    /// no separators, a clear background, and a snug inset so the cards float.
+    func cardRow() -> some View {
+        self.listRowInsets(EdgeInsets(top: 6, leading: 16, bottom: 6, trailing: 16))
+            .listRowSeparator(.hidden)
+            .listRowBackground(Color.clear)
     }
 }
 
@@ -215,46 +267,65 @@ struct ExerciseDetail: View {
     let exercise: [DietExercise]
     private var sessions: [DietExercise] { DietSemantics.sortedExercise(exercise) }
 
+    private let columns = [GridItem(.flexible(), alignment: .topLeading),
+                           GridItem(.flexible(), alignment: .topLeading),
+                           GridItem(.flexible(), alignment: .topLeading)]
+
     var body: some View {
         List {
             if sessions.isEmpty {
                 ContentUnavailableView("No exercise logged", systemImage: "figure.run")
+                    .listRowSeparator(.hidden)
+                    .listRowBackground(Color.clear)
             }
             ForEach(Array(sessions.enumerated()), id: \.offset) { _, ex in
-                HealthCard {
-                    VStack(alignment: .leading, spacing: 6) {
-                        HStack {
-                            Text(ex.type.capitalized).font(.headline)
-                            Spacer()
-                            if let t = ex.time { Text(t).font(.subheadline).foregroundStyle(.secondary) }
-                        }
-                        if let d = ex.desc { Text(d).font(.subheadline) }
-                        let line = detailLine(ex)
-                        if !line.isEmpty {
-                            Text(line).font(.caption.monospacedDigit()).foregroundStyle(.secondary)
-                        }
-                    }
-                }
-                .listRowInsets(EdgeInsets(top: 6, leading: 16, bottom: 6, trailing: 16))
-                .listRowSeparator(.hidden)
+                card(ex).cardRow()
             }
         }
+        .listStyle(.plain)
         .navigationTitle("Exercise")
         .navigationBarTitleDisplayMode(.inline)
     }
 
-    /// Join whichever of duration / distance+unit / pace / avgHR / calories exist,
-    /// separated by " · ".
-    private func detailLine(_ ex: DietExercise) -> String {
-        var parts: [String] = []
-        if let d = ex.duration { parts.append(d) }
-        if let dist = ex.distance {
-            parts.append("\(DietSemantics.fmt(dist))\(ex.unit.map { " \($0)" } ?? "")")
+    private func card(_ ex: DietExercise) -> some View {
+        HealthCard {
+            VStack(alignment: .leading, spacing: 12) {
+                HStack(spacing: 10) {
+                    Image(systemName: ExerciseSymbol.name(for: ex.type))
+                        .font(.title2)
+                        .foregroundStyle(.tint)
+                        .frame(width: 30)
+                    Text(ex.type.capitalized).font(.headline)
+                    Spacer()
+                    if let t = ex.time { TimeCapsule(time: t) }
+                }
+                let tiles = metrics(ex)
+                if !tiles.isEmpty {
+                    LazyVGrid(columns: columns, alignment: .leading, spacing: 12) {
+                        ForEach(tiles, id: \.0) { tile in
+                            MetricTile(label: tile.0, value: tile.1)
+                        }
+                    }
+                }
+                if let d = ex.desc {
+                    Text(d).font(.footnote).foregroundStyle(.secondary)
+                }
+            }
         }
-        if let p = ex.pace { parts.append("\(p) pace") }
-        if let hr = ex.avgHR { parts.append("HR \(DietSemantics.fmt(hr))") }
-        if let cal = ex.calories { parts.append("\(DietSemantics.fmt(cal)) cal") }
-        return parts.joined(separator: " · ")
+    }
+
+    /// The (label, value) metric tiles present for a session, in a fixed order:
+    /// Duration, Distance, Pace, Avg HR, Calories. Absent fields are omitted.
+    private func metrics(_ ex: DietExercise) -> [(String, String)] {
+        var out: [(String, String)] = []
+        if let d = ex.duration { out.append(("Duration", d)) }
+        if let dist = ex.distance {
+            out.append(("Distance", "\(DietSemantics.fmt(dist))\(ex.unit.map { " \($0)" } ?? "")"))
+        }
+        if let p = ex.pace { out.append(("Pace", p)) }
+        if let hr = ex.avgHR { out.append(("Avg HR", DietSemantics.fmt(hr))) }
+        if let cal = ex.calories { out.append(("Calories", DietSemantics.fmt(cal))) }
+        return out
     }
 }
 
@@ -265,44 +336,75 @@ struct ProgressPaceDetail: View {
     let today: DietToday
     let series: [WeightPoint]?
 
+    @State private var explainer: Explainer?
+
     private var currentWeight: Double? {
         HealthDisplay.weightCard(today: today, series: series)?.lbs
     }
 
     var body: some View {
         List {
-            Section("Phase") {
-                if let s = progress.startWeight { row("Start", "\(DietSemantics.fmt(s)) lb") }
-                if let r = progress.raceTarget {
-                    row("Race target", "\(DietSemantics.fmt(r)) lb\(progress.raceDate.map { " by \($0)" } ?? "")")
-                }
-                if let m = progress.maintTarget { row("Maintenance", "\(DietSemantics.fmt(m)) lb") }
-            }
+            phaseSection
             Section("Toward targets") {
                 progressBar(to: progress.raceTarget, label: progress.raceBarLabel, title: "Race")
                 progressBar(to: progress.maintTarget, label: progress.maintBarLabel, title: "Maintenance")
             }
-            Section("Composition pace") {
-                paceRow("Fat", progress.fatBarLabel ?? progress.fatPace.map { "\(DietSemantics.fmt($0)) lb/wk" },
-                        zone: progress.fatZone, sub: progress.fatSubMain)
-                paceRow("Lean", progress.leanBarLabel ?? progress.leanPace.map { "\(DietSemantics.fmt($0)) lb/wk" },
-                        zone: progress.leanZone, sub: progress.leanSubMain)
+            Section("Fat vs lean") {
+                HStack(alignment: .top, spacing: 12) {
+                    StatTile(title: "Fat", value: paceValue(progress.fatPace),
+                             zone: progress.fatZone, caption: progress.fatSubMain) {
+                        explainer = Explainers.fatLeanPace(progress)
+                    }
+                    StatTile(title: "Lean", value: paceValue(progress.leanPace),
+                             zone: progress.leanZone, caption: progress.leanSubMain) {
+                        explainer = Explainers.fatLeanPace(progress)
+                    }
+                }
+                .listRowInsets(EdgeInsets(top: 8, leading: 16, bottom: 8, trailing: 16))
+            }
+            if let traj = progress.trajectory {
+                Section {
+                    Label(traj, systemImage: "point.topleft.down.to.point.bottomright.curvepath")
+                        .font(.subheadline)
+                        .padding(.vertical, 4)
+                }
             }
             if let bf = today.weight?.bf, let lbs = today.weight?.lbs {
                 Section("Body composition (today)") {
                     BodyCompBar(totalLbs: lbs, bfPct: bf)
                 }
             }
-            if let traj = progress.trajectory {
-                Section { Text(traj).font(.subheadline) }
-            }
         }
         .navigationTitle("Progress & pace")
         .navigationBarTitleDisplayMode(.inline)
+        .sheet(item: $explainer) { ExplainerSheet(explainer: $0) }
     }
 
-    private func row(_ a: String, _ b: String) -> some View {
-        HStack { Text(a); Spacer(); Text(b).font(.body.monospacedDigit()).foregroundStyle(.secondary) }
+    // Start / race / maintenance as compact milestones in one row.
+    @ViewBuilder
+    private var phaseSection: some View {
+        Section("Phase") {
+            HStack(alignment: .top, spacing: 12) {
+                milestone("Start", progress.startWeight.map { "\(DietSemantics.fmt($0)) lb" }, sub: nil)
+                milestone("Race", progress.raceTarget.map { "\(DietSemantics.fmt($0)) lb" }, sub: progress.raceDate)
+                milestone("Maintain", progress.maintTarget.map { "\(DietSemantics.fmt($0)) lb" }, sub: nil)
+            }
+            .listRowInsets(EdgeInsets(top: 8, leading: 16, bottom: 8, trailing: 16))
+        }
+    }
+
+    @ViewBuilder
+    private func milestone(_ title: String, _ value: String?, sub: String?) -> some View {
+        VStack(alignment: .leading, spacing: 3) {
+            Text(title).font(.caption2.weight(.semibold)).foregroundStyle(.secondary).textCase(.uppercase)
+            Text(value ?? "—").font(.headline.monospacedDigit())
+            if let sub { Text(sub).font(.caption2).foregroundStyle(.tertiary) }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    private func paceValue(_ pace: Double?) -> String {
+        pace.map { "\(DietSemantics.fmt($0)) lb/wk" } ?? "—"
     }
 
     /// A progress bar computed natively from current weight over start→target. The
@@ -321,19 +423,10 @@ struct ProgressPaceDetail: View {
                 if let label { Text(label).font(.caption).foregroundStyle(.secondary) }
             }
         } else if let label {
-            Text(label).font(.caption).foregroundStyle(.secondary)
-        }
-    }
-
-    private func paceRow(_ title: String, _ value: String?, zone: String?, sub: String?) -> some View {
-        VStack(alignment: .leading, spacing: 4) {
-            HStack {
+            VStack(alignment: .leading, spacing: 4) {
                 Text(title).font(.subheadline.weight(.semibold))
-                Spacer()
-                if let value { Text(value).font(.subheadline.monospacedDigit()) }
-                if let zone { ZoneChip(text: zone, zone: zone) }
+                Text(label).font(.caption).foregroundStyle(.secondary)
             }
-            if let sub { Text(sub).font(.caption).foregroundStyle(.secondary) }
         }
     }
 }

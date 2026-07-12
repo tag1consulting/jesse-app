@@ -8,6 +8,29 @@ import Foundation
 
 enum HealthDisplay {
 
+    // MARK: - Header date
+
+    /// The navigation-title date, formatted Apple-Fitness style ("Saturday, July
+    /// 12") from an ISO "yyyy-MM-dd" string. Locale-aware: the ordering and month
+    /// name come from the locale via a localized template, so a non-US locale reads
+    /// naturally. Returns the raw string unchanged if it doesn't parse.
+    static func headerDate(_ iso: String, locale: Locale = .current) -> String {
+        var cal = Calendar(identifier: .gregorian)
+        cal.timeZone = TimeZone(identifier: "UTC")!
+        let inF = DateFormatter()
+        inF.calendar = cal
+        inF.timeZone = cal.timeZone
+        inF.locale = Locale(identifier: "en_US_POSIX")
+        inF.dateFormat = "yyyy-MM-dd"
+        guard let d = inF.date(from: iso) else { return iso }
+        let out = DateFormatter()
+        out.calendar = cal
+        out.timeZone = cal.timeZone
+        out.locale = locale
+        out.setLocalizedDateFormatFromTemplate("EEEEMMMMd")
+        return out.string(from: d)
+    }
+
     // MARK: - Staleness & the "updated" stamp
 
     /// Whether `todayDate` ("YYYY-MM-DD") is NOT the device's current local day —
@@ -84,6 +107,36 @@ enum HealthDisplay {
             lbs: last.lbs, kg: last.kg, bf: nil, leanLbs: nil,
             deltaLbs: prior.map { last.lbs - $0.lbs },
             isTodayWeighIn: false, lastWeighInDate: last.date)
+    }
+
+    // MARK: - Body-fat series availability (chart)
+
+    /// Whether the weight series carries any body-fat reading at all. The BF chart
+    /// exists iff this is true — there is no toggle; when no row has `bf`, no BF UI
+    /// is rendered. Pure so the availability rule is unit-tested, not a view detail.
+    static func hasBodyFat(_ series: [WeightPoint]) -> Bool {
+        series.contains { $0.bf != nil }
+    }
+
+    // MARK: - Calorie-source split (food-journal summary bar)
+
+    /// The kcal contribution of each macro to the day's intake, at the standard
+    /// Atwater factors (protein 4, carbs 4, fat 9 kcal/g). `total` is the sum of the
+    /// three macro-derived calories (NOT the logged `cal`, which can differ) so the
+    /// stacked bar's segments always sum to its whole. Fractions are 0 when empty.
+    struct CalorieSplit: Equatable, Sendable {
+        var proteinKcal: Double
+        var carbsKcal: Double
+        var fatKcal: Double
+        var total: Double { proteinKcal + carbsKcal + fatKcal }
+        var proteinFraction: Double { total > 0 ? proteinKcal / total : 0 }
+        var carbsFraction: Double { total > 0 ? carbsKcal / total : 0 }
+        var fatFraction: Double { total > 0 ? fatKcal / total : 0 }
+    }
+
+    /// Atwater kcal split of a day's macro totals.
+    static func calorieSplit(_ totals: MacroTotals) -> CalorieSplit {
+        CalorieSplit(proteinKcal: totals.p * 4, carbsKcal: totals.c * 4, fatKcal: totals.f * 9)
     }
 
     // MARK: - Moving average (chart)

@@ -76,6 +76,12 @@ struct ThreadDetailView: View {
         .sensoryFeedback(trigger: coordinator.error(for: thread.id), errorFeedback)
         .navigationTitle(thread.title.isEmpty ? "New conversation" : thread.title)
         .navigationBarTitleDisplayMode(.inline)
+        // Hide the root TabView's bar while a conversation is open, so the tabs are
+        // present on the conversation list and within Health but gone inside a
+        // thread. Applying it here (on the pushed detail) means every entry point
+        // that lands on a thread — deep link, Siri, notification tap — inherits it,
+        // since they all converge on this view.
+        .toolbar(.hidden, for: .tabBar)
         .toolbar {
             ToolbarItem(placement: .topBarTrailing) {
                 Button {

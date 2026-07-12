@@ -17,6 +17,57 @@ final class HealthDisplayTests: XCTestCase {
         HealthDisplay.rfc3339(iso)!
     }
 
+    // MARK: - Header date
+
+    func testHeaderDateFormatsAppleFitnessStyle() {
+        // "yyyy-MM-dd" → "EEEE, MMMM d" in en_US, no time-zone shift on the
+        // date-only value (2026-07-12 is a Sunday; 2026-01-01 a Thursday).
+        XCTAssertEqual(HealthDisplay.headerDate("2026-07-12", locale: Locale(identifier: "en_US")),
+                       "Sunday, July 12")
+        XCTAssertEqual(HealthDisplay.headerDate("2026-01-01", locale: Locale(identifier: "en_US")),
+                       "Thursday, January 1")
+    }
+
+    func testHeaderDateReturnsRawStringWhenUnparseable() {
+        XCTAssertEqual(HealthDisplay.headerDate("not-a-date", locale: Locale(identifier: "en_US")),
+                       "not-a-date")
+    }
+
+    // MARK: - Body-fat availability
+
+    func testHasBodyFatTrueWhenAnyRowHasBf() {
+        let series = [wp("2026-07-07", 199.0), wp("2026-07-08", 198.0, bf: 18.4)]
+        XCTAssertTrue(HealthDisplay.hasBodyFat(series))
+    }
+
+    func testHasBodyFatFalseWhenNoRowHasBf() {
+        let series = [wp("2026-07-07", 199.0), wp("2026-07-08", 198.0)]
+        XCTAssertFalse(HealthDisplay.hasBodyFat(series))
+        XCTAssertFalse(HealthDisplay.hasBodyFat([]))
+    }
+
+    // MARK: - Calorie-source split
+
+    func testCalorieSplitUsesAtwaterFactors() {
+        // 100g protein, 200g carbs, 50g fat → 400 / 800 / 450 kcal, total 1650.
+        let split = HealthDisplay.calorieSplit(MacroTotals(cal: 0, p: 100, f: 50, c: 200, fiber: 0))
+        XCTAssertEqual(split.proteinKcal, 400, accuracy: 0.001)
+        XCTAssertEqual(split.carbsKcal, 800, accuracy: 0.001)
+        XCTAssertEqual(split.fatKcal, 450, accuracy: 0.001)
+        XCTAssertEqual(split.total, 1650, accuracy: 0.001)
+        XCTAssertEqual(split.proteinFraction, 400.0 / 1650.0, accuracy: 0.0001)
+        XCTAssertEqual(split.carbsFraction, 800.0 / 1650.0, accuracy: 0.0001)
+        XCTAssertEqual(split.fatFraction, 450.0 / 1650.0, accuracy: 0.0001)
+    }
+
+    func testCalorieSplitEmptyHasZeroFractions() {
+        let split = HealthDisplay.calorieSplit(.zero)
+        XCTAssertEqual(split.total, 0)
+        XCTAssertEqual(split.proteinFraction, 0)
+        XCTAssertEqual(split.carbsFraction, 0)
+        XCTAssertEqual(split.fatFraction, 0)
+    }
+
     // MARK: - Staleness
 
     func testNotStaleWhenTodayMatchesDeviceDay() {

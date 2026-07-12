@@ -19,7 +19,6 @@ struct HealthTabView: View {
     var body: some View {
         NavigationStack {
             content
-                .navigationTitle("Health")
                 .toolbar {
                     ToolbarItem(placement: .primaryAction) {
                         Button { showQuickLog = true } label: { Image(systemName: "plus") }
@@ -50,9 +49,12 @@ struct HealthTabView: View {
         switch model.displayState {
         case .loading:
             ProgressView("Loading today…").frame(maxWidth: .infinity, maxHeight: .infinity)
+                .navigationTitle("Health")
         case .empty(let error):
             HealthEmptyState(error: error) { Task { await model.load() } }
+                .navigationTitle("Health")
         case .content(let snapshot):
+            // TodayScreen sets its own navigation title (the date).
             TodayScreen(snapshot: snapshot, now: model.now(), refreshError: model.refreshError) {
                 await model.load()
             }
@@ -68,6 +70,8 @@ struct TodayScreen: View {
     let refreshError: DietFetchError?
     let refresh: () async -> Void
 
+    @State private var explainer: Explainer?
+
     private var today: DietToday { snapshot.today }
     private var hour: Int { Calendar.current.component(.hour, from: now) }
     private var gauges: DietGauges { DietSemantics.gauges(for: today, hour: hour) }
@@ -76,27 +80,39 @@ struct TodayScreen: View {
     var body: some View {
         List {
             headerSection
-            weightSection
             caloriesSection
-            macroStripSection
+            macroRingsSection
+            weightSection
             coachHeadlineSection
             navRowsSection
+            updatedStampSection
         }
+        .navigationTitle(HealthDisplay.headerDate(today.date))
+        .navigationBarTitleDisplayMode(.large)
         .refreshable { await refresh() }
+        .sheet(item: $explainer) { ExplainerSheet(explainer: $0) }
     }
 
-    // Header: date, day-style chip, updated stamp, stale banner, refresh-failed note.
+    // Header: the day-style chip (tappable → its explainer) with a subtle info
+    // affordance, plus the stale / refresh-failed banners. The date is the nav
+    // title; the updated stamp lives at the very bottom of the scroll view.
     private var headerSection: some View {
         Section {
-            VStack(alignment: .leading, spacing: 6) {
-                HStack {
-                    Text(prettyDate(today.date)).font(.headline)
-                    DayStyleChip(dayStyle: today.dayStyle, isCarbLoad: gauges.isCarbLoad)
-                    Spacer()
-                    if let updated = HealthDisplay.updatedTime(fromMtime: snapshot.todayMtime) {
-                        Text("updated \(updated)").font(.caption).foregroundStyle(.secondary)
+            VStack(alignment: .leading, spacing: 8) {
+                Button {
+                    explainer = Explainers.dayStyle(today.dayStyle, isCarbLoad: gauges.isCarbLoad)
+                } label: {
+                    HStack(spacing: 5) {
+                        DayStyleChip(dayStyle: today.dayStyle, isCarbLoad: gauges.isCarbLoad)
+                        Image(systemName: "info.circle")
+                            .font(.caption2)
+                            .foregroundStyle(.tertiary)
                     }
+                    .contentShape(Rectangle())
                 }
+                .buttonStyle(.plain)
+                .accessibilityLabel("Day type: \(DayStyleExplain.headline(dayStyle: today.dayStyle, isCarbLoad: gauges.isCarbLoad)). What this changes.")
+
                 if isStale {
                     Label("showing \(today.date); nothing logged today yet",
                           systemImage: "clock.arrow.circlepath")
@@ -107,46 +123,47 @@ struct TodayScreen: View {
                         .font(.caption).foregroundStyle(.secondary)
                 }
             }
+            .listRowBackground(Color.clear)
         }
     }
 
+    // Calories is the number that matters most, so it's the first content: one large
+    // activity ring. Tapping opens the calories explainer.
+    private var caloriesSection: some View {
+        Section {
+            CaloriesHeroRing(gauge: gauges.calories, net: gauges.net) {
+                explainer = Explainers.calories(gauges.calories, isCarbLoad: gauges.isCarbLoad)
+            }
+            .padding(.vertical, 8)
+            .listRowBackground(Color.clear)
+        }
+    }
+
+    // Four smaller rings — protein, carbs, fat, fiber — in one row. Each opens its
+    // macro explainer.
+    private var macroRingsSection: some View {
+        Section {
+            HStack(alignment: .top, spacing: 8) {
+                MacroRing(gauge: gauges.protein) { explainer = Explainers.protein(gauges.protein) }
+                MacroRing(gauge: gauges.carbs) { explainer = Explainers.carbs(gauges.carbs, hasBonus: gauges.carbsBonus != nil) }
+                MacroRing(gauge: gauges.fat) { explainer = Explainers.fat(gauges.fat, isCarbLoad: gauges.isCarbLoad) }
+                MacroRing(gauge: gauges.fiber) { explainer = Explainers.fiber(gauges.fiber, isCarbLoad: gauges.isCarbLoad) }
+            }
+            .listRowBackground(Color.clear)
+        }
+    }
+
+    // The weight card moves below the rings and becomes a NavigationLink into the
+    // Weight & trend screen (chevron makes the affordance obvious).
     @ViewBuilder
     private var weightSection: some View {
         if let card = HealthDisplay.weightCard(today: today, series: snapshot.weightSeries) {
-            Section { WeightCardView(card: card) }
-        }
-    }
-
-    private var caloriesSection: some View {
-        Section {
-            let cal = gauges.calories
-            VStack(alignment: .leading, spacing: 8) {
-                HStack(alignment: .firstTextBaseline) {
-                    Text(DietSemantics.fmt(remainingMagnitude(cal)))
-                        .font(.system(size: 40, weight: .bold, design: .rounded).monospacedDigit())
-                        .foregroundStyle(statusColor(cal.status))
-                    Text(cal.remaining).font(.subheadline).foregroundStyle(.secondary)
-                    Spacer()
-                    GoalChip(goal: cal.goal)
+            Section {
+                NavigationLink {
+                    WeightTrendDetail(series: snapshot.weightSeries ?? [], progress: snapshot.progress)
+                } label: {
+                    WeightCardView(card: card)
                 }
-                StatusMeter(fraction: cal.fraction, status: cal.status, height: 10)
-                if gauges.net.burned > 0 {
-                    Text("\(DietSemantics.fmt(gauges.net.net)) net · \(DietSemantics.fmt(gauges.net.burned)) burned")
-                        .font(.caption.monospacedDigit()).foregroundStyle(.secondary)
-                }
-            }
-        } header: {
-            Text("Calories")
-        }
-    }
-
-    private var macroStripSection: some View {
-        Section {
-            HStack(alignment: .top, spacing: 12) {
-                CompactMacroGauge(gauge: gauges.protein)
-                CompactMacroGauge(gauge: gauges.carbs)
-                CompactMacroGauge(gauge: gauges.fat)
-                CompactMacroGauge(gauge: gauges.fiber)
             }
         }
     }
@@ -156,8 +173,21 @@ struct TodayScreen: View {
         if let note = snapshot.coach?.notes.first {
             Section {
                 Text(CoachHTML.plainText(note))
-                    .font(.subheadline).lineLimit(1).truncationMode(.tail)
+                    .font(.subheadline).lineLimit(2).truncationMode(.tail)
                     .foregroundStyle(.secondary)
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var updatedStampSection: some View {
+        if let updated = HealthDisplay.updatedTime(fromMtime: snapshot.todayMtime) {
+            Section {
+                Text("Updated \(updated)")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .frame(maxWidth: .infinity, alignment: .center)
+                    .listRowBackground(Color.clear)
             }
         }
     }
@@ -235,19 +265,6 @@ struct TodayScreen: View {
         case .present: return ""
         }
     }
-
-    private func remainingMagnitude(_ g: MetricGauge) -> Double {
-        guard let t = g.target else { return g.value }
-        return abs(t - g.value)
-    }
-
-    private func prettyDate(_ iso: String) -> String {
-        let inF = DateFormatter(); inF.dateFormat = "yyyy-MM-dd"
-        inF.timeZone = TimeZone(identifier: "UTC")
-        guard let d = inF.date(from: iso) else { return iso }
-        let out = DateFormatter(); out.dateFormat = "EEEE, MMM d"
-        return out.string(from: d)
-    }
 }
 
 // MARK: - Small Level-1 pieces
@@ -263,17 +280,7 @@ struct DayStyleChip: View {
             .foregroundStyle(color)
     }
     private var color: Color { isCarbLoad ? .purple : .secondary }
-    private var label: String {
-        switch dayStyle {
-        case "carb-load-training", "carb-load-race": return "Carb-load"
-        case "long-run": return "Long run"
-        case "refeed": return "Refeed"
-        case "sick": return "Sick"
-        case "fasting": return "Fasting"
-        case "normal", nil, "": return isCarbLoad ? "Carb-load" : "Normal"
-        default: return dayStyle?.capitalized ?? "Normal"
-        }
-    }
+    private var label: String { DayStyleExplain.headline(dayStyle: dayStyle, isCarbLoad: isCarbLoad) }
 }
 
 struct WeightCardView: View {

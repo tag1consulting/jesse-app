@@ -50,32 +50,212 @@ struct StatusMeter: View {
     }
 }
 
-/// A compact macro gauge for the Level-1 strip: label + goal glyph, value/target,
-/// a short meter, and the status as its tint.
-struct CompactMacroGauge: View {
-    let gauge: MetricGauge
+// MARK: - Activity rings
+
+/// A reusable Apple-Watch-style activity ring: a thick rounded stroke on a dim
+/// track, animating from empty to `fraction` on appear. `fraction` is expected
+/// already clamped to [0, 1] (see `HealthRing.fill`); the color is the semantics
+/// engine's status color, passed in so a ring can never pick its own judgment.
+struct ActivityRing<Center: View>: View {
+    let fraction: Double
+    let color: Color
+    var lineWidth: CGFloat = 14
+    @ViewBuilder var center: Center
+
+    @State private var animated = false
+
     var body: some View {
-        VStack(alignment: .leading, spacing: 4) {
-            HStack(spacing: 4) {
-                Text(gauge.label).font(.caption.weight(.semibold))
-                GoalChip(goal: gauge.goal)
+        ZStack {
+            Circle()
+                .stroke(color.opacity(0.16), style: StrokeStyle(lineWidth: lineWidth))
+            Circle()
+                .trim(from: 0, to: animated ? fraction : 0)
+                .stroke(color, style: StrokeStyle(lineWidth: lineWidth, lineCap: .round))
+                .rotationEffect(.degrees(-90))
+            center
+        }
+        .onAppear {
+            withAnimation(.easeOut(duration: 0.8)) { animated = true }
+        }
+    }
+}
+
+/// The calories hero ring: one large ring whose fill is intake/target clamped, its
+/// color the engine's calorie status, the remaining number large in the center with
+/// the engine's remaining annotation beneath it, and the net line below when a burn
+/// exists. Tapping opens the calories explainer.
+struct CaloriesHeroRing: View {
+    let gauge: MetricGauge
+    let net: NetCalories
+    var onTap: () -> Void = {}
+
+    var body: some View {
+        VStack(spacing: 12) {
+            Button(action: onTap) {
+                ActivityRing(fraction: HealthRing.fill(gauge), color: statusColor(gauge.status), lineWidth: 20) {
+                    VStack(spacing: 2) {
+                        Text(CaloriesHero.centerNumber(gauge))
+                            .font(.system(size: 46, weight: .bold, design: .rounded).monospacedDigit())
+                            .foregroundStyle(statusColor(gauge.status))
+                        Text(CaloriesHero.centerCaption(gauge))
+                            .font(.subheadline)
+                            .foregroundStyle(.secondary)
+                    }
+                    .padding(8)
+                }
+                .frame(width: 210, height: 210)
+                .contentShape(Circle())
             }
-            Text(valueTarget)
-                .font(.caption2.monospacedDigit())
-                .foregroundStyle(statusColor(gauge.status))
-                .lineLimit(1)
-                .minimumScaleFactor(0.7)
-            StatusMeter(fraction: gauge.fraction, status: gauge.status, height: 5)
+            .buttonStyle(.plain)
+            .accessibilityElement(children: .combine)
+            .accessibilityLabel("Calories: \(CaloriesHero.centerCaption(gauge))")
+
+            if let line = CaloriesHero.netLine(net) {
+                Text(line)
+                    .font(.caption.monospacedDigit())
+                    .foregroundStyle(.secondary)
+            }
+        }
+        .frame(maxWidth: .infinity)
+    }
+}
+
+/// A small macro ring for the Today row: the engine's status color, the current
+/// grams compact in the center, the macro name on ONE line beneath with its goal
+/// glyph. A suspended metric (fiber on a carb-load day) renders neutral gray via the
+/// status color. Tapping opens that macro's explainer.
+struct MacroRing: View {
+    let gauge: MetricGauge
+    var onTap: () -> Void = {}
+
+    var body: some View {
+        Button(action: onTap) {
+            VStack(spacing: 7) {
+                ActivityRing(fraction: HealthRing.fill(gauge), color: statusColor(gauge.status), lineWidth: 7) {
+                    Text(HealthRing.centerLabel(gauge))
+                        .font(.footnote.weight(.semibold).monospacedDigit())
+                        .foregroundStyle(statusColor(gauge.status))
+                        .lineLimit(1)
+                        .minimumScaleFactor(0.6)
+                        .padding(4)
+                }
+                .frame(width: 64, height: 64)
+                HStack(spacing: 3) {
+                    Text(gauge.label)
+                        .font(.caption2.weight(.semibold))
+                        .lineLimit(1)
+                        .minimumScaleFactor(0.7)
+                    Text(gauge.goal.glyph)
+                        .font(.caption2.weight(.bold))
+                        .foregroundStyle(.secondary)
+                }
+            }
+            .frame(maxWidth: .infinity)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel("\(gauge.label): \(HealthRing.centerLabel(gauge)), \(gauge.remaining)")
+    }
+}
+
+// MARK: - Stat & metric tiles
+
+/// A stat tile: a caption title, a large rounded value, an optional colored zone
+/// chip, and an optional short caption. Used side-by-side for pace and composition
+/// (Weight & trend, Progress & pace). Tapping opens an explainer when wired.
+struct StatTile: View {
+    let title: String
+    let value: String
+    var zone: String? = nil
+    var caption: String? = nil
+    var onTap: (() -> Void)? = nil
+
+    var body: some View {
+        let inner = VStack(alignment: .leading, spacing: 6) {
+            Text(title).font(.caption).foregroundStyle(.secondary)
+            Text(value).font(.title2.weight(.bold).monospacedDigit())
+            if let zone { ZoneChip(text: zone, zone: zone) }
+            if let caption {
+                Text(caption).font(.caption2).foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+        .frame(maxWidth: .infinity, minHeight: 96, alignment: .topLeading)
+        .padding()
+        .background(RoundedRectangle(cornerRadius: 12).fill(Color(.secondarySystemGroupedBackground)))
+
+        if let onTap {
+            Button(action: onTap) { inner.contentShape(Rectangle()) }.buttonStyle(.plain)
+        } else {
+            inner
+        }
+    }
+}
+
+/// A metric cell in the exercise card's grid: a small uppercase caption over a
+/// prominent rounded value.
+struct MetricTile: View {
+    let label: String
+    let value: String
+    var body: some View {
+        VStack(alignment: .leading, spacing: 2) {
+            Text(label.uppercased())
+                .font(.caption2.weight(.semibold))
+                .foregroundStyle(.secondary)
+            Text(value)
+                .font(.title3.weight(.semibold).monospacedDigit())
         }
         .frame(maxWidth: .infinity, alignment: .leading)
-        .accessibilityElement(children: .combine)
-        .accessibilityLabel("\(gauge.label): \(valueTarget), \(gauge.remaining)")
     }
-    private var valueTarget: String {
-        let v = DietSemantics.fmt(gauge.value)
-        if let t = gauge.target { return "\(v)/\(DietSemantics.fmt(t))\(gauge.unit)" }
-        return "\(v)\(gauge.unit)"
+}
+
+// MARK: - Calorie-source stacked bar (food journal summary)
+
+/// Fixed macro-identity colors for the calorie-source bar and its legend —
+/// independent of the status bands so the breakdown never reads as a judgment.
+enum MacroColor {
+    static let protein = Color.indigo
+    static let carbs = Color.teal
+    static let fat = Color.orange
+}
+
+/// A single horizontal stacked bar of where the day's calories came from (protein /
+/// carbs / fat at 4/4/9 kcal per gram), with a compact legend. The split math is
+/// pure and tested (`HealthDisplay.calorieSplit`); this only draws it.
+struct CalorieSourceBar: View {
+    let split: HealthDisplay.CalorieSplit
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            GeometryReader { geo in
+                HStack(spacing: 0) {
+                    Rectangle().fill(MacroColor.protein)
+                        .frame(width: geo.size.width * split.proteinFraction)
+                    Rectangle().fill(MacroColor.carbs)
+                        .frame(width: geo.size.width * split.carbsFraction)
+                    Rectangle().fill(MacroColor.fat)
+                }
+                .clipShape(Capsule())
+            }
+            .frame(height: 12)
+            HStack(spacing: 14) {
+                legendItem("Protein", MacroColor.protein)
+                legendItem("Carbs", MacroColor.carbs)
+                legendItem("Fat", MacroColor.fat)
+            }
+            .font(.caption2)
+            .foregroundStyle(.secondary)
+        }
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel("Calorie sources: protein \(pct(split.proteinFraction)), carbs \(pct(split.carbsFraction)), fat \(pct(split.fatFraction))")
     }
+    private func legendItem(_ label: String, _ color: Color) -> some View {
+        HStack(spacing: 4) {
+            Circle().fill(color).frame(width: 8, height: 8)
+            Text(label)
+        }
+    }
+    private func pct(_ f: Double) -> String { "\(Int((f * 100).rounded()))%" }
 }
 
 /// A full-width bar row for the macros-and-calories detail screen: goal chip,
@@ -182,4 +362,22 @@ func macroLine(_ t: MacroTotals, includeFiber: Bool = true) -> String {
     var parts = ["P \(DietSemantics.fmt(t.p))", "F \(DietSemantics.fmt(t.f))", "C \(DietSemantics.fmt(t.c))"]
     if includeFiber { parts.append("fib \(DietSemantics.fmt(t.fiber))") }
     return parts.joined(separator: " · ")
+}
+
+/// The food-journal per-item macro caption in protein·carbs·fat·fiber order
+/// ("P 32 · C 40 · F 12 · Fib 6").
+func itemMacroLine(_ t: MacroTotals) -> String {
+    "P \(DietSemantics.fmt(t.p)) · C \(DietSemantics.fmt(t.c)) · F \(DietSemantics.fmt(t.f)) · Fib \(DietSemantics.fmt(t.fiber))"
+}
+
+/// A small time capsule ("07:41") for meal / workout headers.
+struct TimeCapsule: View {
+    let time: String
+    var body: some View {
+        Text(time)
+            .font(.caption2.weight(.semibold).monospacedDigit())
+            .padding(.horizontal, 7).padding(.vertical, 3)
+            .background(Capsule().fill(Color(.tertiarySystemFill)))
+            .foregroundStyle(.secondary)
+    }
 }

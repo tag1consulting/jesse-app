@@ -12,6 +12,29 @@ enum Explainers {
         return "\(v)\(g.unit) — \(g.remaining)"
     }
 
+    /// What today's day-style changes — which metrics are floors, ceilings, or
+    /// windows. Opened by tapping the day chip under the header. Carb-load days flip
+    /// the calorie and fat rules and suspend fiber; a normal day is the baseline.
+    static func dayStyle(_ dayStyle: String?, isCarbLoad: Bool) -> Explainer {
+        let paras: [String]
+        if isCarbLoad {
+            paras = [
+                "Today is a carb-load day. The point is to top off glycogen before a long run or race, so the rules flip from an ordinary day.",
+                "Calories become a window, not a ceiling: 92–100% of target is the goal, and under-eating fails the load. Fat becomes a minimize-it ceiling — keep it low to leave calorie room for carbs. Protein and carbs stay floors (hit them or beat them).",
+                "Fiber is suspended: low-residue eating before a long effort is deliberate, so it shows a plain gray ring with no color judgment today. It returns to a 38g floor on your next normal day.",
+            ]
+        } else {
+            paras = [
+                "Today is an ordinary day, so the usual rules apply.",
+                "Calories are a ceiling — stay at or under target. Protein, carbs, and fiber are floors — hit them or beat them. Fat is a window: a 50g hormonal floor, a 65g working cap, a 70g hard cap.",
+                "On a carb-load day these flip — calories become a window, fat a minimize-it ceiling, and fiber is suspended — but not today.",
+            ]
+        }
+        let title = isCarbLoad ? "Carb-load day" : "Today's day type"
+        let valueLine = DayStyleExplain.headline(dayStyle: dayStyle, isCarbLoad: isCarbLoad)
+        return Explainer(id: "daystyle", title: title, valueLine: valueLine, paragraphs: paras)
+    }
+
     static func calories(_ g: MetricGauge, isCarbLoad: Bool) -> Explainer {
         let paras = isCarbLoad
             ? ["On a carb-load day calories flip to a window: 92–100% of target is the goal. Under-eating a carb-load fails it — the point is to top off glycogen before a long run or race.",
