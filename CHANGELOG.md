@@ -15,6 +15,47 @@ CI both run it). See the "Versioning" section of `bridge/README.md`.
 
 ## [Unreleased]
 
+## [App 1.0 (36)] — 2026-07-13
+
+### Changed
+- **Weight targets generalized from two fixed program phases into a labeled list of
+  user goals.** The diet progress contract gains `progress.targets`, a zero-to-N
+  ordered list where each goal carries a `weight`, an optional `date`/`daysLeft`/
+  `requiredPace`, an `achieved` flag, prerendered `barFilled`/`barLabel` strings, and
+  `short`/`title`/`id` labels. This replaces the hardcoded race/maintenance display
+  words in the weight chart, the progress bars, and the milestone chips:
+  - **Model.** New `DietTarget` (tolerant decode — required `id`/`title`/`weight`,
+    the rest optional, unknown keys ignored) plus `targets` on `DietProgress`.
+  - **Legacy fallback.** When `targets` is absent (an older generator), the app
+    synthesizes the race + maintenance goals from the legacy
+    `raceTarget`/`raceDate`/`maintTarget`/`*Bar*` fields, so rendering has one code
+    path and the app deploy is independent of the vault-side rollout. An explicit
+    empty `targets: []` (no goals) is authoritative and hides the goal sections.
+  - **Weight chart.** One dashed horizontal rule per goal (the first keeps the
+    signature green, later goals read muted), labeled with the goal's short name and
+    weight; zero goals draw no rules.
+  - **Progress & pace.** The progress bars and milestone chips loop over the goals;
+    an achieved goal shows a checkmark. A new countdown surfaces the nearest dated
+    goal ("N days to <title>", plus "needs X.X lb/wk" when a required pace is
+    present); a past date reads "N days past", never a negative count; no dated goal
+    hides the section.
+- **Coach quote of the day now decodes HTML entities** (e.g. `&mdash;`, `&lsquo;`)
+  the same way the coach notes do, via `CoachHTML`.
+
+## [Bridge 0.8.2] — 2026-07-13
+
+### Changed
+- **Diet integration coverage for the new `progress.targets` array.** The
+  `DIET_PROGRESS` pass-through is generic (json5 → JSON), so the new targets array
+  flows through with no parser change — now verified. Synthetic fixtures gain a
+  `targets` array (a dated goal, an undated goal in both `date: null` and
+  key-omitted forms, and an achieved past-dated goal), plus a legacy-only fixture
+  (no `targets` key) and an empty-`[]` fixture. New assertions confirm the array
+  round-trips field-for-field with order preserved, the legacy
+  `raceTarget`/`raceDate`/`maintTarget` fields still pass through alongside it, a
+  payload without `targets` still serves 200, and an empty `targets: []` stays an
+  empty array (not null or absent). No behavior change to the endpoint.
+
 ## [Bridge 0.8.1] — 2026-07-13
 
 ### Security

@@ -137,14 +137,62 @@ struct DietProposed: Decodable, Equatable, Sendable {
     }
 }
 
+/// One user weight goal (bridge/generator ≥ the labeled-targets rollout): a weight
+/// plus an optional planned date and prerendered progress strings. Targets are user
+/// goals, not fixed program phases — there may be zero to N of them, in display
+/// order. Every field but `id`/`title`/`weight` may be absent; `short` falls back
+/// to `title` (see `shortLabel`). The bar fields are prerendered exactly like the
+/// legacy `raceBar*`/`maintBar*` fields — render them as-is, never parse numbers
+/// out of the label. Unknown extra fields decode-and-ignore like the rest.
+struct DietTarget: Decodable, Equatable, Sendable, Identifiable {
+    var id: String
+    var title: String
+    /// A tight-space label (chips, chart rules); nil in old data → use `title`.
+    var short: String?
+    var weight: Double
+    /// `yyyy-MM-dd`, or nil for an undated goal.
+    var date: String?
+    /// Days until `date` (negative when past); nil when undated.
+    var daysLeft: Int?
+    /// lb/wk needed to hit the date from the latest weigh-in; nil when undated,
+    /// past, or already achieved.
+    var requiredPace: Double?
+    /// Latest weigh-in at or under `weight`.
+    var achieved: Bool?
+    /// Prerendered 0…20 bar fill, like the legacy `*BarFilled` fields.
+    var barFilled: Double?
+    /// Prerendered progress label, like the legacy `*BarLabel` fields.
+    var barLabel: String?
+
+    /// The label for tight spaces, falling back to `title` when `short` is absent.
+    var shortLabel: String { short ?? title }
+
+    // A memberwise init (with defaults) for the legacy-fallback synthesis, tests,
+    // and previews. Synthesized Decodable keeps this available and ignores unknown
+    // keys; `id`/`title`/`weight` are required in emitted data.
+    init(id: String, title: String, short: String? = nil, weight: Double,
+         date: String? = nil, daysLeft: Int? = nil, requiredPace: Double? = nil,
+         achieved: Bool? = nil, barFilled: Double? = nil, barLabel: String? = nil) {
+        self.id = id; self.title = title; self.short = short; self.weight = weight
+        self.date = date; self.daysLeft = daysLeft; self.requiredPace = requiredPace
+        self.achieved = achieved; self.barFilled = barFilled; self.barLabel = barLabel
+    }
+}
+
 /// `DIET_PROGRESS` — numbers plus prerendered label strings, passed through
 /// verbatim by the bridge. Every field is optional; the app renders the labels
 /// as-is and never parses numbers out of the label strings.
+///
+/// `targets` is the new, general shape (zero to N labeled weight goals); the
+/// legacy `raceTarget`/`raceDate`/`maintTarget`/`*Bar*` fields remain during the
+/// transition and are synthesized into `targets` when it's absent (see
+/// `DietSemantics.displayTargets`), so rendering has one code path.
 struct DietProgress: Decodable, Equatable, Sendable {
     var startWeight: Double?
     var raceTarget: Double?
     var maintTarget: Double?
     var raceDate: String?
+    var targets: [DietTarget]?
     var troughPace: Double?
     var rawPace: Double?
     var fatPace: Double?

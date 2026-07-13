@@ -402,12 +402,23 @@ struct ProgressPaceDetail: View {
         HealthDisplay.weightCard(today: today, series: series)?.lbs
     }
 
+    /// The user's weight goals — the emitted `targets`, or the legacy synthesis.
+    private var targets: [DietTarget] {
+        DietSemantics.displayTargets(progress, currentWeight: currentWeight, today: today.date)
+    }
+
     var body: some View {
         List {
-            phaseSection
-            Section("Toward targets") {
-                progressBar(to: progress.raceTarget, label: progress.raceBarLabel, title: "Race")
-                progressBar(to: progress.maintTarget, label: progress.maintBarLabel, title: "Maintenance")
+            goalsSection
+            if let t = DietSemantics.countdownTarget(targets), let text = DietSemantics.countdownText(t) {
+                Section { countdownRow(t, text: text) }
+            }
+            if !targets.isEmpty {
+                Section("Toward targets") {
+                    ForEach(targets) { t in
+                        progressBar(to: t.weight, label: t.barLabel, title: t.title)
+                    }
+                }
             }
             Section("Fat vs lean") {
                 HStack(alignment: .top, spacing: 12) {
@@ -440,24 +451,54 @@ struct ProgressPaceDetail: View {
         .sheet(item: $explainer) { ExplainerSheet(explainer: $0) }
     }
 
-    // Start / race / maintenance as compact milestones in one row.
+    // The start weight plus one compact milestone per weight goal, in one row.
+    // Goals are user targets (not fixed program phases), so there may be zero to
+    // N; an achieved goal shows a checkmark.
     @ViewBuilder
-    private var phaseSection: some View {
-        Section("Phase") {
-            HStack(alignment: .top, spacing: 12) {
-                milestone("Start", progress.startWeight.map { "\(DietSemantics.fmt($0)) lb" }, sub: nil)
-                milestone("Race", progress.raceTarget.map { "\(DietSemantics.fmt($0)) lb" }, sub: progress.raceDate)
-                milestone("Maintain", progress.maintTarget.map { "\(DietSemantics.fmt($0)) lb" }, sub: nil)
+    private var goalsSection: some View {
+        if progress.startWeight != nil || !targets.isEmpty {
+            Section("Goals") {
+                HStack(alignment: .top, spacing: 12) {
+                    milestone("Start", progress.startWeight.map { "\(DietSemantics.fmt($0)) lb" }, sub: nil)
+                    ForEach(targets) { t in
+                        milestone(t.shortLabel, "\(DietSemantics.fmt(t.weight)) lb",
+                                  sub: DietSemantics.displayDate(t.date), achieved: t.achieved ?? false)
+                    }
+                }
+                .listRowInsets(EdgeInsets(top: 8, leading: 16, bottom: 8, trailing: 16))
             }
-            .listRowInsets(EdgeInsets(top: 8, leading: 16, bottom: 8, trailing: 16))
         }
     }
 
+    // The countdown to a dated goal (phrasing from `DietSemantics.countdownText`),
+    // plus the required pace when the payload carries one. `requiredPace` is null
+    // for a past or achieved goal, so the pace line only ever rides a future date.
     @ViewBuilder
-    private func milestone(_ title: String, _ value: String?, sub: String?) -> some View {
+    private func countdownRow(_ t: DietTarget, text: String) -> some View {
+        VStack(alignment: .leading, spacing: 3) {
+            Label {
+                Text(text).font(.subheadline.weight(.semibold))
+            } icon: {
+                Image(systemName: "flag.checkered")
+            }
+            if let pace = t.requiredPace {
+                Text("needs \(DietSemantics.fmt1(pace)) lb/wk")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
+        }
+        .padding(.vertical, 2)
+    }
+
+    @ViewBuilder
+    private func milestone(_ title: String, _ value: String?, sub: String?, achieved: Bool = false) -> some View {
         VStack(alignment: .leading, spacing: 3) {
             Text(title).font(.caption2.weight(.semibold)).foregroundStyle(.secondary).textCase(.uppercase)
-            Text(value ?? "—").font(.headline.monospacedDigit())
+            HStack(spacing: 3) {
+                Text(value ?? "—").font(.headline.monospacedDigit())
+                if achieved {
+                    Image(systemName: "checkmark.circle.fill").font(.caption).foregroundStyle(.green)
+                }
+            }
             if let sub { Text(sub).font(.caption2).foregroundStyle(.tertiary) }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
@@ -550,9 +591,12 @@ struct CoachDetail: View {
             if let quote = coach.quote {
                 Section {
                     VStack(spacing: 6) {
-                        Text("“\(quote.text)”").font(.body.italic())
+                        // Quote strings carry the same limited HTML/entity subset as
+                        // the notes (e.g. `&mdash;`, `&lsquo;`), so decode them the
+                        // same way — centered and italic, author on a second line.
+                        Text("“\(CoachHTML.plainText(quote.text))”").font(.body.italic())
                         if let author = quote.author {
-                            Text("— \(author)").font(.caption).foregroundStyle(.secondary)
+                            Text("— \(CoachHTML.plainText(author))").font(.caption).foregroundStyle(.secondary)
                         }
                     }
                     .frame(maxWidth: .infinity)

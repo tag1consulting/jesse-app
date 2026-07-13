@@ -1548,6 +1548,9 @@ const FIX_TODAY_MINIMAL: &str = "window.DIET_TODAY = {\n\
   targets: { calories: 1900, protein: 180, fat: 60, carbs: 190 },\n\
 };\n";
 
+// Full progress fixture: the new `targets` array (dated, undated with date:null,
+// undated with the key omitted, and an achieved past-dated goal) ALONGSIDE the
+// legacy race/maint fields, which stay during the transition. All values invented.
 const FIX_PROGRESS: &str = "window.DIET_PROGRESS = {\n\
   startWeight: 204, raceTarget: 165, maintTarget: 180, raceDate: '2026-10-11',\n\
   troughPace: 1.4, rawPace: 1.1, fatPace: 0.9, leanPace: 0.2, paceScale: 2.0, leanScale: 1.0,\n\
@@ -1558,6 +1561,28 @@ const FIX_PROGRESS: &str = "window.DIET_PROGRESS = {\n\
   paceSubMain: 'on pace', paceSubZone: 'target 1.0–1.5', paceSubLow: '1.0', paceSubHigh: '1.5',\n\
   fatSubMain: 'losing fat', leanSubMain: 'holding muscle',\n\
   trajectory: 'On track for the race target.',\n\
+  targets: [\n\
+    { id: 'bday', title: 'Birthday', short: 'Bday', weight: 180, date: '2026-08-15', daysLeft: 38, requiredPace: 2.2, achieved: false, barFilled: 11, barLabel: '13.5 / 24 lbs to 180 (56%)' },\n\
+    { id: 'maint', title: 'Maintenance', short: 'Maint', weight: 165, date: null, daysLeft: null, requiredPace: null, achieved: false, barFilled: 7, barLabel: '13.5 / 39 lbs to 165 (35%)' },\n\
+    { id: 'stretch', title: 'Stretch goal', short: 'Stretch', weight: 160, achieved: false, barFilled: 4, barLabel: '13.5 / 44 lbs to 160 (31%)' },\n\
+    { id: 'firstcut', title: 'First cut', short: 'Cut', weight: 200, date: '2026-05-01', daysLeft: -68, requiredPace: null, achieved: true, barFilled: 20, barLabel: 'reached 200' },\n\
+  ],\n\
+};\n";
+
+// A legacy-only progress fixture (no `targets` key at all): a pre-rollout generator.
+// Must still parse and serve, with the legacy fields intact and `targets` absent.
+const FIX_PROGRESS_LEGACY: &str = "window.DIET_PROGRESS = {\n\
+  startWeight: 204, raceTarget: 165, maintTarget: 180, raceDate: '2026-10-11',\n\
+  raceBarFilled: 0.62, maintBarFilled: 0.88,\n\
+  raceBarLabel: '24 of 39 lb', maintBarLabel: '21 of 24 lb',\n\
+  trajectory: 'On track for the race target.',\n\
+};\n";
+
+// A progress fixture with an explicitly empty `targets: []` — the user has no
+// weight goals right now. Must round-trip as an empty array (not null, not absent).
+const FIX_PROGRESS_EMPTY_TARGETS: &str = "window.DIET_PROGRESS = {\n\
+  startWeight: 204, troughPace: 1.4, paceZone: 'good',\n\
+  targets: [],\n\
 };\n";
 
 const FIX_COACH: &str = "// coach notes\n\
@@ -1633,6 +1658,40 @@ async fn diet_happy_path_returns_full_normalized_snapshot() {
     assert_eq!(body["progress"]["startWeight"], 204);
     assert_eq!(body["progress"]["raceBarLabel"], "24 of 39 lb");
     assert_eq!(body["progress"]["paceZone"], "good");
+
+    // Legacy race/maint fields still pass through while present (real data keeps
+    // them during the transition).
+    assert_eq!(body["progress"]["raceTarget"], 165);
+    assert_eq!(body["progress"]["raceDate"], "2026-10-11");
+    assert_eq!(body["progress"]["maintTarget"], 180);
+
+    // targets: the new array flows through the generic pass-through field-for-field,
+    // order preserved, nulls and omitted keys intact.
+    let targets = body["progress"]["targets"].as_array().unwrap();
+    assert_eq!(targets.len(), 4, "four goals in declared order");
+    // [0] dated goal, all fields present.
+    assert_eq!(targets[0]["id"], "bday");
+    assert_eq!(targets[0]["title"], "Birthday");
+    assert_eq!(targets[0]["short"], "Bday");
+    assert_eq!(targets[0]["weight"], 180);
+    assert_eq!(targets[0]["date"], "2026-08-15");
+    assert_eq!(targets[0]["daysLeft"], 38);
+    assert_eq!(targets[0]["requiredPace"], 2.2);
+    assert_eq!(targets[0]["achieved"], false);
+    assert_eq!(targets[0]["barFilled"], 11);
+    assert_eq!(targets[0]["barLabel"], "13.5 / 24 lbs to 180 (56%)");
+    // [1] undated goal, `date: null` (and daysLeft/requiredPace null) preserved.
+    assert_eq!(targets[1]["id"], "maint");
+    assert!(targets[1]["date"].is_null(), "explicit date: null survives as null");
+    assert!(targets[1]["daysLeft"].is_null());
+    assert!(targets[1]["requiredPace"].is_null());
+    // [2] undated goal with the date key OMITTED → absent, not null.
+    assert_eq!(targets[2]["id"], "stretch");
+    assert!(targets[2].get("date").is_none(), "omitted date key stays omitted");
+    // [3] achieved goal.
+    assert_eq!(targets[3]["id"], "firstcut");
+    assert_eq!(targets[3]["achieved"], true);
+    assert_eq!(targets[3]["daysLeft"], -68, "past date → negative daysLeft");
 
     // coach: HTML/entities survive verbatim (no decode/strip at the bridge).
     assert_eq!(body["coach"]["notes"][0], "<strong>Great week</strong> &mdash; you hit protein every day");
@@ -1724,6 +1783,42 @@ async fn diet_section_isolation_bad_progress_still_200() {
     assert!(!body["coach"].is_null(), "sibling sections unaffected");
     let errs = body["errors"].as_array().unwrap();
     assert!(errs.iter().any(|e| e.as_str().unwrap().starts_with("progress:")), "errors names the failed section: {errs:?}");
+    let _ = std::fs::remove_dir_all(&vault);
+}
+
+#[tokio::test]
+async fn diet_legacy_progress_without_targets_still_serves() {
+    // A pre-rollout generator emits no `targets` key. The endpoint must 200, the
+    // legacy race/maint fields pass through, and `targets` is simply absent — the
+    // app synthesizes it locally, so deploy order is independent of the rollout.
+    let vault = make_diet_vault();
+    write_vault_file(&vault, "todo-list/diet-today.js", FIX_TODAY);
+    write_vault_file(&vault, "todo-list/diet-progress.js", FIX_PROGRESS_LEGACY);
+    write_vault_file(&vault, "diet-logs/weight-log.csv", FIX_WEIGHT_CSV);
+    let cfg = Config { vault: vault.to_string_lossy().into_owned(), ..test_config() };
+    let resp = app(AppState::new(cfg)).oneshot(diet_request(Some("Bearer test-token"))).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body: Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    assert_eq!(body["progress"]["raceTarget"], 165, "legacy fields intact");
+    assert_eq!(body["progress"]["maintTarget"], 180);
+    assert!(body["progress"].get("targets").is_none(), "no targets key on legacy data");
+    let _ = std::fs::remove_dir_all(&vault);
+}
+
+#[tokio::test]
+async fn diet_empty_targets_round_trips_as_empty_array() {
+    // `targets: []` means the user has no weight goals right now — it must survive
+    // as an empty array, distinct from an absent or null field.
+    let vault = make_diet_vault();
+    write_vault_file(&vault, "todo-list/diet-today.js", FIX_TODAY);
+    write_vault_file(&vault, "todo-list/diet-progress.js", FIX_PROGRESS_EMPTY_TARGETS);
+    write_vault_file(&vault, "diet-logs/weight-log.csv", FIX_WEIGHT_CSV);
+    let cfg = Config { vault: vault.to_string_lossy().into_owned(), ..test_config() };
+    let resp = app(AppState::new(cfg)).oneshot(diet_request(Some("Bearer test-token"))).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body: Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    let targets = body["progress"]["targets"].as_array().expect("targets is an array");
+    assert!(targets.is_empty(), "empty targets stays an empty array");
     let _ = std::fs::remove_dir_all(&vault);
 }
 

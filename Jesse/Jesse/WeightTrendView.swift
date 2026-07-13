@@ -61,6 +61,14 @@ struct WeightTrendDetail: View {
         return series.filter { (Self.dayParser.date(from: $0.date) ?? .distantPast) >= cutoff }
     }
 
+    /// The weight goals to draw as rules — the emitted `targets`, or the legacy
+    /// two-target synthesis. The rules only read `weight`/`shortLabel`, so the
+    /// latest weigh-in is a good-enough reference for the fallback's derived fields.
+    private var targetRules: [DietTarget] {
+        guard let progress else { return [] }
+        return DietSemantics.displayTargets(progress, currentWeight: series.last?.lbs, today: series.last?.date)
+    }
+
     private var scrubbed: Point? {
         guard let scrubDate else { return nil }
         return points.min { abs($0.date.timeIntervalSince(scrubDate)) < abs($1.date.timeIntervalSince(scrubDate)) }
@@ -111,20 +119,17 @@ struct WeightTrendDetail: View {
                     .foregroundStyle(Color.accentColor)
                     .lineStyle(StrokeStyle(lineWidth: 2))
             }
-            if let race = progress?.raceTarget {
-                RuleMark(y: .value("Race", race))
-                    .foregroundStyle(.green.opacity(0.6))
+            // One dashed rule per weight goal (zero to N). The first keeps the
+            // signature green; later goals read as muted/secondary so the primary
+            // goal stays dominant. Labels use the tight `short` form.
+            ForEach(Array(targetRules.enumerated()), id: \.element.id) { idx, t in
+                RuleMark(y: .value(t.shortLabel, t.weight))
+                    .foregroundStyle(idx == 0 ? Color.green.opacity(0.6) : Color.secondary.opacity(0.5))
                     .lineStyle(StrokeStyle(lineWidth: 1, dash: [4, 3]))
-                    .annotation(position: .top, alignment: .leading) {
-                        Text("race \(DietSemantics.fmt(race))").font(.caption2).foregroundStyle(.green)
-                    }
-            }
-            if let maint = progress?.maintTarget {
-                RuleMark(y: .value("Maint", maint))
-                    .foregroundStyle(.blue.opacity(0.5))
-                    .lineStyle(StrokeStyle(lineWidth: 1, dash: [4, 3]))
-                    .annotation(position: .bottom, alignment: .leading) {
-                        Text("maint \(DietSemantics.fmt(maint))").font(.caption2).foregroundStyle(.blue)
+                    .annotation(position: idx == 0 ? .top : .bottom, alignment: .leading) {
+                        Text("\(t.shortLabel) \(DietSemantics.fmt(t.weight))")
+                            .font(.caption2)
+                            .foregroundStyle(idx == 0 ? Color.green : Color.secondary)
                     }
             }
             if let s = scrubbed {

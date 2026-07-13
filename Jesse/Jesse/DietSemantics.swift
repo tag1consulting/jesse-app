@@ -303,6 +303,101 @@ enum DietSemantics {
 
     /// Round to a whole number and drop the decimal point ("need 12g more").
     static func fmt(_ x: Double) -> String { String(Int(x.rounded())) }
+
+    /// One-decimal format for a pace ("needs 2.2 lb/wk") — rounding a required
+    /// pace to a whole number would lie, so this keeps the tenths.
+    static func fmt1(_ x: Double) -> String { String(format: "%.1f", x) }
+
+    // MARK: - Weight targets
+
+    /// The effective display targets for a progress payload. When the generator
+    /// emits `targets`, use it verbatim (its `achieved`/`daysLeft`/`requiredPace`
+    /// are authoritative). Otherwise synthesize the legacy two-target shape so the
+    /// UI renders through one code path during the transition — this keeps the app
+    /// deploy independent of the vault-side rollout.
+    ///
+    /// Synthesis: `raceTarget`/`raceDate` → a dated goal, `maintTarget` → an
+    /// undated "Maintenance" goal. Bar fields come straight from the legacy
+    /// `*BarFilled`/`*BarLabel`; `daysLeft` is computed from the date relative to
+    /// `today`; `achieved` from `currentWeight`. Legacy data has no required pace.
+    static func displayTargets(_ progress: DietProgress, currentWeight: Double?, today: String?) -> [DietTarget] {
+        if let targets = progress.targets { return targets }
+        var out: [DietTarget] = []
+        if let w = progress.raceTarget {
+            let days = progress.raceDate.flatMap { d in today.flatMap { daysBetween(from: $0, to: d) } }
+            out.append(DietTarget(
+                id: "race", title: "Target \(fmt(w))", short: fmt(w), weight: w,
+                date: progress.raceDate, daysLeft: days, requiredPace: nil,
+                achieved: currentWeight.map { $0 <= w },
+                barFilled: progress.raceBarFilled, barLabel: progress.raceBarLabel))
+        }
+        if let w = progress.maintTarget {
+            out.append(DietTarget(
+                id: "maint", title: "Maintenance", short: "Maint", weight: w,
+                date: nil, daysLeft: nil, requiredPace: nil,
+                achieved: currentWeight.map { $0 <= w },
+                barFilled: progress.maintBarFilled, barLabel: progress.maintBarLabel))
+        }
+        return out
+    }
+
+    /// The dated goal a countdown should speak to: the nearest upcoming one
+    /// (smallest non-negative `daysLeft`), or — when every dated goal is already
+    /// past — the least-past one (largest, i.e. closest-to-zero, negative). Nil when
+    /// no goal carries a usable date/`daysLeft`, so the countdown section hides.
+    static func countdownTarget(_ targets: [DietTarget]) -> DietTarget? {
+        let dated = targets.filter { $0.date != nil && $0.daysLeft != nil }
+        if let upcoming = dated.filter({ ($0.daysLeft ?? -1) >= 0 })
+            .min(by: { ($0.daysLeft ?? 0) < ($1.daysLeft ?? 0) }) {
+            return upcoming
+        }
+        return dated.max(by: { ($0.daysLeft ?? 0) < ($1.daysLeft ?? 0) })
+    }
+
+    /// The countdown phrasing for a dated goal: "N days to <title>" when the date is
+    /// in the future/today, "N days past <title>" when it has slipped by — never a
+    /// negative count. Nil when the goal has no `daysLeft`.
+    static func countdownText(_ t: DietTarget) -> String? {
+        guard let days = t.daysLeft else { return nil }
+        let n = abs(days)
+        let unit = n == 1 ? "day" : "days"
+        return days < 0 ? "\(n) \(unit) past \(t.title)" : "\(n) \(unit) to \(t.title)"
+    }
+
+    /// Whole days from one `yyyy-MM-dd` day to another (UTC, calendar days), or nil
+    /// if either doesn't parse. Positive = `to` is in the future of `from`.
+    static func daysBetween(from: String, to: String) -> Int? {
+        guard let a = isoDayParser.date(from: from), let b = isoDayParser.date(from: to) else { return nil }
+        let cal = Calendar(identifier: .gregorian)
+        return cal.dateComponents([.day], from: cal.startOfDay(for: a), to: cal.startOfDay(for: b)).day
+    }
+
+    /// A short human date ("Aug 15") from a `yyyy-MM-dd` string, falling back to the
+    /// raw string if it doesn't parse and to nil when absent.
+    static func displayDate(_ iso: String?) -> String? {
+        guard let iso else { return nil }
+        guard let d = isoDayParser.date(from: iso) else { return iso }
+        return monthDayFormatter.string(from: d)
+    }
+
+    /// Parses/renders the `yyyy-MM-dd` day strings deterministically (UTC, gregorian),
+    /// so target dates format identically regardless of device locale/zone.
+    private static let isoDayParser: DateFormatter = {
+        let f = DateFormatter()
+        f.calendar = Calendar(identifier: .gregorian)
+        f.locale = Locale(identifier: "en_US_POSIX")
+        f.timeZone = TimeZone(identifier: "UTC")
+        f.dateFormat = "yyyy-MM-dd"
+        return f
+    }()
+    private static let monthDayFormatter: DateFormatter = {
+        let f = DateFormatter()
+        f.calendar = Calendar(identifier: .gregorian)
+        f.locale = Locale(identifier: "en_US_POSIX")
+        f.timeZone = TimeZone(identifier: "UTC")
+        f.dateFormat = "MMM d"
+        return f
+    }()
 }
 
 /// Summed macros (cal + protein/fat/carbs/fiber grams). `+` and `.zero` make
