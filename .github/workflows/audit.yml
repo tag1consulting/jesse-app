@@ -1,0 +1,34 @@
+name: Scheduled audit
+
+# ci.yml runs `cargo audit` on every push, but RUSTSEC advisories land between
+# commits — a quiet repo would only hear about a new advisory on its next PR.
+# This weekly run audits the existing lockfile on a schedule instead. A failure
+# emails the workflow author via GitHub's normal scheduled-run notifications.
+#
+# gitleaks is deliberately NOT duplicated here: it scans committed sources,
+# which only change on pushes ci.yml already covers.
+#
+# Note: GitHub auto-disables scheduled workflows after ~60 days without repo
+# activity; re-enable from the Actions tab if the repo goes dormant.
+
+on:
+  schedule:
+    - cron: '0 5 * * 1' # Mondays 05:00 UTC
+  workflow_dispatch:
+
+jobs:
+  cargo-audit:
+    name: cargo audit (bridge)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      # Prebuilt binary, same as ci.yml — no from-source compile.
+      - name: Install cargo-audit
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit
+
+      - name: Dependency CVE audit
+        working-directory: bridge
+        run: cargo audit
