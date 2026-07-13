@@ -56,10 +56,11 @@ const DIET_KEYWORDS: &[&str] = &[
     "uova", "uovo", "pane", "insalata", "banane",
 ];
 
-/// Whether the message shows diet-logging intent. STUB (failing-first): claims no
-/// message ever shows intent until the real keyword match lands.
-pub fn diet_intent(_text: &str) -> bool {
-    false
+/// Whether the message shows diet-logging intent: any whole token matches the
+/// [`DIET_KEYWORDS`] set. Whole-token (not substring) so `escalate` never matches
+/// `ate`. Loose by design — a false positive is a safe, cheap fall-through.
+pub fn diet_intent(text: &str) -> bool {
+    tokens(text).iter().any(|t| DIET_KEYWORDS.contains(&t.as_str()))
 }
 
 /// Tokenize into lowercased alphanumeric words (unicode-aware), so keyword matching
