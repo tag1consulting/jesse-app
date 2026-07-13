@@ -89,3 +89,62 @@ final class BridgeVersionTests: XCTestCase {
         XCTAssertEqual(health.version, "9.9.9")
     }
 }
+
+// Pure version-handshake logic (no I/O): SemVer ordering and the
+// `BridgeCompatibility.isOutdated` decision that drives the Settings advisory.
+final class BridgeCompatibilityTests: XCTestCase {
+
+    // MARK: SemVer parsing / ordering
+
+    func testSemVerOrdersByMajorMinorPatch() {
+        XCTAssertLessThan(SemVer("0.6.9")!, SemVer("0.7.0")!)
+        XCTAssertLessThan(SemVer("0.7.0")!, SemVer("0.7.1")!)
+        XCTAssertLessThan(SemVer("0.9.9")!, SemVer("1.0.0")!)
+        XCTAssertFalse(SemVer("0.7.0")! < SemVer("0.7.0")!, "equal versions are not <")
+    }
+
+    func testSemVerTreatsMissingComponentsAsZero() {
+        XCTAssertEqual(SemVer("1"), SemVer("1.0.0"))
+        XCTAssertEqual(SemVer("1.2"), SemVer("1.2.0"))
+    }
+
+    func testSemVerIgnoresPreReleaseAndBuildMetadata() {
+        XCTAssertEqual(SemVer("0.7.0-rc.1"), SemVer("0.7.0"))
+        XCTAssertEqual(SemVer("0.7.0+build.5"), SemVer("0.7.0"))
+    }
+
+    func testSemVerRejectsNonNumericOrOverlongVersions() {
+        XCTAssertNil(SemVer("abc"))
+        XCTAssertNil(SemVer(""))
+        XCTAssertNil(SemVer("1.2.3.4"))
+        XCTAssertNil(SemVer("1.x.0"))
+    }
+
+    // MARK: isOutdated
+
+    func testOutdatedWhenBridgeStrictlyBelowMinimum() {
+        XCTAssertTrue(BridgeCompatibility.isOutdated(bridgeVersion: "0.6.0", minimum: "0.7.0"))
+        XCTAssertTrue(BridgeCompatibility.isOutdated(bridgeVersion: "0.6.9", minimum: "0.7.0"))
+    }
+
+    func testNotOutdatedWhenBridgeAtOrAboveMinimum() {
+        XCTAssertFalse(BridgeCompatibility.isOutdated(bridgeVersion: "0.7.0", minimum: "0.7.0"))
+        XCTAssertFalse(BridgeCompatibility.isOutdated(bridgeVersion: "0.7.1", minimum: "0.7.0"))
+        XCTAssertFalse(BridgeCompatibility.isOutdated(bridgeVersion: "1.0.0", minimum: "0.7.0"))
+    }
+
+    func testUnknownOrUnparseableVersionNeverWarns() {
+        // No version yet, or a bridge too old to report one, or garbage: we can't
+        // prove it's outdated, so we must not cry wolf.
+        XCTAssertFalse(BridgeCompatibility.isOutdated(bridgeVersion: nil, minimum: "0.7.0"))
+        XCTAssertFalse(BridgeCompatibility.isOutdated(bridgeVersion: "", minimum: "0.7.0"))
+        XCTAssertFalse(BridgeCompatibility.isOutdated(bridgeVersion: "not-a-version", minimum: "0.7.0"))
+    }
+
+    func testDefaultMinimumIsAParseableTripleTheCurrentBridgeSatisfies() {
+        // The shipped floor must itself be a clean triple, and the current bridge
+        // (0.7.0) must not trip its own app's warning.
+        XCTAssertNotNil(SemVer(BridgeCompatibility.minimumBridgeVersion))
+        XCTAssertFalse(BridgeCompatibility.isOutdated(bridgeVersion: "0.7.0"))
+    }
+}

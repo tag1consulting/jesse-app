@@ -15,6 +15,38 @@ CI both run it). See the "Versioning" section of `bridge/README.md`.
 
 ## [Unreleased]
 
+## [App 1.0 (33)] — 2026-07-13
+
+### Added
+- **Bridge version handshake (non-blocking).** Settings already showed the running
+  bridge version next to the app's own; it now also *compares* them. The app carries
+  a minimum-bridge-version floor (`BridgeCompatibility.minimumBridgeVersion`, 0.7.0)
+  and, when the connected bridge is strictly older, shows a non-blocking amber
+  "your bridge is out of date — this app expects bridge X or newer, but it's Y"
+  advisory in the Version section. It's a warning, not a hard block: per-endpoint
+  graceful degradation (an old bridge 404ing a newer route) is unchanged and stays
+  the real safety net. This closes the silent-degradation gap behind the past
+  `/jesse/title` 404 incident, where a stale bridge failed quietly. An unknown or
+  unparseable bridge version never triggers the warning (no crying wolf). The
+  comparison is a pure, unit-tested `SemVer` triple compare (pre-release/build
+  metadata ignored, missing components read as zero), covered failing-first.
+
+### CI / tooling (no app-behavior change)
+- **Watch tests now run in CI.** The `Jesse Watch App` scheme is now shared and its
+  test action wired to `Jesse Watch AppTests`; CI resolves a watchOS simulator
+  dynamically (mirroring the iPhone resolution) and runs the watch suite, which
+  previously only ran locally.
+- **Swift warnings are now errors for production code in CI**
+  (`SWIFT_TREAT_WARNINGS_AS_ERRORS=YES` on the app and watch `xcodebuild build`
+  steps). This mirrors the bridge's `cargo clippy -- -D warnings`, which — without
+  `--all-targets` — gates the shipping crate, not the test code; the Swift gate is
+  scoped the same way (the XCTest bundle, which carries pre-existing Swift-6-mode
+  warnings, is out of scope). The app already builds warning-free.
+- **Code coverage is measured and printed** (report-only, non-gating): iOS via
+  `-enableCodeCoverage YES` + an `xccov` summary; the bridge via `cargo llvm-cov`.
+- **Dependency-CVE gate:** CI now runs `cargo audit` over the bridge's `Cargo.lock`
+  (currently clean — no advisories, no ignores).
+
 ## [App 1.0 (32)] — 2026-07-13
 
 ### Changed

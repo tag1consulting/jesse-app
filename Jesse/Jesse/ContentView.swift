@@ -390,6 +390,18 @@ struct SettingsView: View {
                 Section {
                     LabeledContent("App", value: AppVersion.display)
                     LabeledContent("Bridge", value: bridgeVersion ?? "unknown")
+                    if BridgeCompatibility.isOutdated(bridgeVersion: bridgeVersion) {
+                        // Non-blocking heads-up: the app keeps working (each endpoint
+                        // degrades gracefully on its own), but a stale bridge should
+                        // no longer fail silently the way the /jesse/title 404 did.
+                        Label {
+                            Text("Your bridge is out of date — this app expects bridge \(BridgeCompatibility.minimumBridgeVersion) or newer, but it’s \(bridgeVersion ?? "unknown"). Some newer features may not work until you update the bridge.")
+                        } icon: {
+                            Image(systemName: "exclamationmark.triangle.fill")
+                        }
+                        .font(.callout)
+                        .foregroundStyle(.orange)
+                    }
                 } header: {
                     Text("Version")
                 } footer: {

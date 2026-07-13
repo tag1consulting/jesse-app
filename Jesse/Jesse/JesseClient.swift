@@ -1435,6 +1435,63 @@ enum AppVersion {
     static var display: String { "\(short) (\(build))" }
 }
 
+/// A minimal SemVer triple (`major.minor.patch`) for comparison only. Pre-release
+/// and build metadata are ignored (everything from the first `-` or `+` is
+/// dropped), matching how the bridge reports a plain `"0.7.0"` from its
+/// `Cargo.toml`. A missing minor/patch reads as `0` (so `"1"` == `1.0.0`,
+/// `"1.2"` == `1.2.0`), mirroring the tolerance in `scripts/version-guard.sh`.
+/// Anything that isn't a clean numeric triple parses to `nil` rather than
+/// guessing — an unparseable version must never masquerade as a real one.
+struct SemVer: Comparable {
+    let major: Int
+    let minor: Int
+    let patch: Int
+
+    init?(_ raw: String) {
+        // Strip pre-release / build metadata, then require 1–3 dot-separated
+        // non-negative integers.
+        let core = raw.trimmingCharacters(in: .whitespaces)
+            .prefix { $0 != "-" && $0 != "+" }
+        let parts = core.split(separator: ".", omittingEmptySubsequences: false)
+        guard (1...3).contains(parts.count) else { return nil }
+        var nums = [0, 0, 0]
+        for (i, p) in parts.enumerated() {
+            guard let n = Int(p), n >= 0 else { return nil }
+            nums[i] = n
+        }
+        (major, minor, patch) = (nums[0], nums[1], nums[2])
+    }
+
+    static func < (a: SemVer, b: SemVer) -> Bool {
+        (a.major, a.minor, a.patch) < (b.major, b.minor, b.patch)
+    }
+}
+
+/// Compares the running bridge version against the minimum this app build is
+/// designed for. Pure and testable — no I/O. This drives a **non-blocking**
+/// advisory in Settings only; per-endpoint graceful degradation (an old bridge
+/// 404ing a newer route) is unchanged and remains the real safety net. It exists
+/// because the app previously surfaced the bridge version but never compared it,
+/// so a stale bridge degraded silently (the `/jesse/title` 404 incident).
+enum BridgeCompatibility {
+    /// The oldest bridge this app build expects. A bridge at or above this is
+    /// fully supported; an older one still works for every route it implements —
+    /// the app just shows a heads-up that newer features may be missing. Bump this
+    /// when the app starts relying on a bridge behavior newer than the value here.
+    static let minimumBridgeVersion = "0.7.0"
+
+    /// True iff `bridgeVersion` is present, parseable, AND strictly older than
+    /// `minimum`. An unknown or unparseable version returns `false` — we never cry
+    /// wolf on a version we can't actually read.
+    static func isOutdated(bridgeVersion: String?,
+                           minimum: String = minimumBridgeVersion) -> Bool {
+        guard let bridgeVersion,
+              let running = SemVer(bridgeVersion),
+              let floor = SemVer(minimum) else { return false }
+        return running < floor
+    }
+}
+
 /// Persists the last-seen bridge version (from `GET /health`) so Settings can show
 /// it even before a fresh probe returns. Backed by `UserDefaults`; the store is
 /// injectable purely so a test can point it at a scratch suite (mirroring
