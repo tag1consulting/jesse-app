@@ -1280,6 +1280,13 @@ mod tests {
         args.iter().position(|a| a == flag).map(|i| args[i + 1].clone())
     }
 
+    /// True if a bare (valueless) flag appears anywhere in a Command's argv.
+    fn cmd_has_flag(cmd: &Command, flag: &str) -> bool {
+        cmd.as_std()
+            .get_args()
+            .any(|a| a.to_string_lossy() == flag)
+    }
+
     #[test]
     fn diet_extract_command_applies_env_triple_when_configured() {
         // With the override configured, the EXTRACT child's Command carries exactly
@@ -1338,6 +1345,78 @@ mod tests {
                 deny.split(',').any(|t| t.trim() == class),
                 "denylist must remove the {class} class: {deny:?}"
             );
+        }
+    }
+
+    /// The diet children in `[None, Some(diet_backend)]` config — i.e. both the
+    /// ambient VERIFY child and the env-layered EXTRACT child — are built by the
+    /// one shared `build_diet_child_command`, so asserting the posture on the
+    /// builder proves it for `run_diet_extract` AND `run_diet_verify` at once. This
+    /// helper yields both command forms so every containment test below covers both.
+    fn both_diet_child_commands() -> Vec<Command> {
+        let ambient = build_diet_child_command(&test_config(), "hi"); // verify posture
+        let mut extract = build_diet_child_command(&cfg_with_diet_backend(), "hi");
+        apply_diet_env(&mut extract, &cfg_with_diet_backend()); // extract posture
+        vec![ambient, extract]
+    }
+
+    #[test]
+    fn diet_child_disables_all_builtin_tools_at_root() {
+        // Deny-by-default at the tool-SET level: `--tools ""` removes every built-in
+        // tool from the child's toolset at the root, so read/search built-ins (Glob,
+        // Grep, Read, …), ToolSearch, Workflow and Agent do not exist to be invoked —
+        // not merely permission-gated. This is the load-bearing containment flag
+        // (live-proven: without it a "run ls" probe executes Glob).
+        for cmd in both_diet_child_commands() {
+            let tools = cmd_arg_value(&cmd, "--tools")
+                .expect("--tools must be present (deny-by-default toolset)");
+            assert_eq!(tools, "", "--tools must be EMPTY to disable all built-in tools");
+        }
+    }
+
+    #[test]
+    fn diet_child_loads_no_mcp_servers() {
+        // No MCP servers at the root: `--strict-mcp-config` tells the CLI to use ONLY
+        // servers from `--mcp-config`, and that config declares an EMPTY server set —
+        // so every `mcp__*` tool (and anything ToolSearch could load from a server) is
+        // gone at the root, not denied by name.
+        for cmd in both_diet_child_commands() {
+            assert!(
+                cmd_has_flag(&cmd, "--strict-mcp-config"),
+                "--strict-mcp-config must be present so only --mcp-config servers load"
+            );
+            let mcp = cmd_arg_value(&cmd, "--mcp-config")
+                .expect("--mcp-config must be present (empty server set)");
+            let parsed: serde_json::Value =
+                serde_json::from_str(&mcp).expect("--mcp-config value must be valid JSON");
+            let servers = parsed.get("mcpServers").and_then(|v| v.as_object());
+            assert!(
+                servers.map(|m| m.is_empty()).unwrap_or(true),
+                "the MCP config must declare NO servers: {mcp:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn diet_child_denylist_covers_read_search_and_orchestration_classes() {
+        // Belt-and-suspenders behind `--tools ""`: the enumerated denylist is expanded
+        // past the original seven mutation/exec/network classes to also name the
+        // read/search built-ins and the orchestration tools that the old empty-allowlist
+        // posture left reachable (Glob, Grep, Read, ToolSearch, Workflow, Agent,
+        // TodoWrite, Skill). Enumerated denial is fragile — it breaks silently when the
+        // CLI renames or adds tools — which is exactly why `--tools ""` above is the
+        // real guarantee and the live probe battery is the acceptance gate.
+        for cmd in both_diet_child_commands() {
+            let deny = cmd_arg_value(&cmd, "--disallowedTools").expect("--disallowedTools present");
+            let names: Vec<&str> = deny.split(',').map(|t| t.trim()).collect();
+            for class in [
+                "Glob", "Grep", "Read", "ToolSearch", "Workflow", "Agent", "TodoWrite", "Skill",
+            ] {
+                assert!(
+                    names.contains(&class),
+                    "expanded denylist must name the {class} class: {names:?}"
+                );
+            }
         }
     }
 
