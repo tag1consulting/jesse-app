@@ -285,12 +285,25 @@ pub fn resolve_title_backend(
 /// startup warning so a half-configured deploy is visible rather than silently
 /// half-active. Pure except for that warning.
 pub fn resolve_diet_backend(
-    _base_url: Option<String>,
-    _auth_token: Option<String>,
-    _model: Option<String>,
+    base_url: Option<String>,
+    auth_token: Option<String>,
+    model: Option<String>,
 ) -> Option<(String, String, String)> {
-    // STUB (failing-first): always None until the real all-or-nothing rule lands.
-    None
+    match (base_url, auth_token, model) {
+        (Some(b), Some(t), Some(m)) => Some((b, t, m)),
+        (b, t, m) => {
+            let set = b.is_some() as u8 + t.is_some() as u8 + m.is_some() as u8;
+            if set > 0 {
+                eprintln!(
+                    "jesse-bridge: WARNING partial JESSE_DIET_* config ({set}/3 set) — the \
+                     local diet-extract backend needs ALL of JESSE_DIET_BASE_URL, \
+                     JESSE_DIET_AUTH_TOKEN, JESSE_DIET_MODEL; treating as unset (diet \
+                     turns use the hosted path)."
+                );
+            }
+            None
+        }
+    }
 }
 
 impl Config {
