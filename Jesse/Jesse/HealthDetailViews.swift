@@ -75,10 +75,10 @@ struct MacrosCaloriesDetail: View {
         List {
             Section {
                 totalRow("Calories", "\(DietSemantics.fmt(totals.cal))")
-                totalRow("Protein", "\(DietSemantics.fmt(totals.p))g")
-                totalRow("Carbs", "\(DietSemantics.fmt(totals.c))g")
-                totalRow("Fat", "\(DietSemantics.fmt(totals.f))g")
-                totalRow("Fiber", "\(DietSemantics.fmt(totals.fiber))g")
+                totalRow(Macro.protein.displayName, "\(DietSemantics.fmt(totals.p))g")
+                totalRow(Macro.carbs.displayName, "\(DietSemantics.fmt(totals.c))g")
+                totalRow(Macro.fat.displayName, "\(DietSemantics.fmt(totals.f))g")
+                totalRow(Macro.fiber.displayName, "\(DietSemantics.fmt(totals.fiber))g")
             } footer: {
                 Text(NeutralMode.noTargetsCaption)
             }
@@ -198,7 +198,7 @@ struct FoodJournalDetail: View {
                         Text("cal today").font(.subheadline).foregroundStyle(.secondary)
                     }
                     CalorieSourceBar(split: HealthDisplay.calorieSplit(grand))
-                    Text(itemMacroLine(grand)).font(.caption.monospacedDigit()).foregroundStyle(.secondary)
+                    Text(MacroLine.format(grand)).font(.caption.monospacedDigit()).foregroundStyle(.secondary)
                 }
             }
             .cardRow()
@@ -237,17 +237,26 @@ struct FoodJournalDetail: View {
                     Text("\(DietSemantics.fmt(cal)) cal").font(.caption.monospacedDigit()).foregroundStyle(.secondary)
                 }
             }
-            Text(itemMacroLine(MacroTotals(cal: 0, p: it.p ?? 0, f: it.f ?? 0, c: it.c ?? 0, fiber: it.fiber ?? 0)))
+            Text(MacroLine.format(MacroTotals(cal: 0, p: it.p ?? 0, f: it.f ?? 0, c: it.c ?? 0, fiber: it.fiber ?? 0)))
                 .font(.caption2.monospacedDigit()).foregroundStyle(.tertiary)
         }
     }
 
+    // The full macro names don't fit beside "Subtotal" and the calories on one line
+    // at default Dynamic Type, so the macro line drops to its own full-width line
+    // below (matching the item-row layout directly above). Units are kept there for
+    // parity with the item rows.
     private func subtotalRow(_ t: MacroTotals) -> some View {
-        HStack {
-            Text("Subtotal").font(.caption.weight(.semibold)).foregroundStyle(.secondary)
-            Spacer()
-            Text("\(DietSemantics.fmt(t.cal)) cal · \(itemMacroLine(t))")
+        VStack(alignment: .leading, spacing: 2) {
+            HStack {
+                Text("Subtotal").font(.caption.weight(.semibold)).foregroundStyle(.secondary)
+                Spacer()
+                Text("\(DietSemantics.fmt(t.cal)) cal")
+                    .font(.caption.monospacedDigit()).foregroundStyle(.secondary)
+            }
+            Text(MacroLine.format(t))
                 .font(.caption.monospacedDigit()).foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
         }
     }
 
@@ -267,7 +276,7 @@ struct FoodJournalDetail: View {
                             Text("~\(DietSemantics.fmt(tot.cal)) cal")
                                 .font(.caption.monospacedDigit()).foregroundStyle(.secondary)
                         }
-                        Text(itemMacroLine(DietSemantics.total(of: idea.items)))
+                        Text(MacroLine.format(DietSemantics.total(of: idea.items)))
                             .font(.caption2.monospacedDigit()).foregroundStyle(.tertiary)
                         if let notes = idea.notes {
                             Text(notes).font(.caption).foregroundStyle(.secondary)

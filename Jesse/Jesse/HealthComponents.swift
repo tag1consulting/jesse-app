@@ -311,9 +311,9 @@ struct CalorieSourceBar: View {
             }
             .frame(height: 12)
             HStack(spacing: 14) {
-                legendItem("Protein", MacroColor.protein)
-                legendItem("Carbs", MacroColor.carbs)
-                legendItem("Fat", MacroColor.fat)
+                legendItem(Macro.protein.displayName, MacroColor.protein)
+                legendItem(Macro.carbs.displayName, MacroColor.carbs)
+                legendItem(Macro.fat.displayName, MacroColor.fat)
             }
             .font(.caption2)
             .foregroundStyle(.secondary)
@@ -427,19 +427,6 @@ struct HealthCard<Content: View>: View {
             .padding()
             .background(RoundedRectangle(cornerRadius: 14).fill(Color(.secondarySystemGroupedBackground)))
     }
-}
-
-/// A labeled macro triple ("P 18 · F 15 · C 1 · fib 8") for item/meal rows.
-func macroLine(_ t: MacroTotals, includeFiber: Bool = true) -> String {
-    var parts = ["P \(DietSemantics.fmt(t.p))", "F \(DietSemantics.fmt(t.f))", "C \(DietSemantics.fmt(t.c))"]
-    if includeFiber { parts.append("fib \(DietSemantics.fmt(t.fiber))") }
-    return parts.joined(separator: " · ")
-}
-
-/// The food-journal per-item macro caption in protein·carbs·fat·fiber order
-/// ("P 32 · C 40 · F 12 · Fib 6").
-func itemMacroLine(_ t: MacroTotals) -> String {
-    "P \(DietSemantics.fmt(t.p)) · C \(DietSemantics.fmt(t.c)) · F \(DietSemantics.fmt(t.f)) · Fib \(DietSemantics.fmt(t.fiber))"
 }
 
 /// A small time capsule ("07:41") for meal / workout headers.

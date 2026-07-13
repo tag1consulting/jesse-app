@@ -15,6 +15,26 @@ CI both run it). See the "Versioning" section of `bridge/README.md`.
 
 ## [Unreleased]
 
+## [App 1.0 (32)] — 2026-07-13
+
+### Changed
+- **Health tab: macros are spelled out, not abbreviated.** Every user-facing macro
+  label in Health now reads as a full word — Protein, Carbs, Fat, Fiber — from one
+  canonical source (`Macro.displayName`), replacing the cryptic "P" / "C" / "F" and
+  the ambiguous "Fib". The food-journal item rows, per-meal subtotals, the
+  day-summary card, planned meals, and the reconstructed-day (neutral) Macros screen
+  all render from a single pure formatter (`MacroLine.format`), which builds
+  "Protein 32g · Carbs 40g · Fat 12g · Fiber 6g" (full form with units), a compact
+  units-dropped fallback, and an optional fiber-omitted form. The macro rings,
+  calorie-source legend, macros detail rows, and explainer titles route their names
+  through the same canonical source, so no view keeps a private label string.
+  - The per-meal **subtotal** row moves its macro line to its own full-width line
+    below the calories (the full words don't fit beside "Subtotal" and the calories
+    on one line at default Dynamic Type), matching the item-row layout above it.
+  - No displayed numbers change: rounding stays on the shared `DietSemantics.fmt`.
+    The data contract (`p`/`f`/`c`/`fiberGrams`, CSV headers, HealthKit types) is
+    untouched — this is a display-label change only.
+
 ## [App 1.0 (31)] — 2026-07-12
 
 ### Added

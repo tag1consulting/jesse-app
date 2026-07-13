@@ -229,7 +229,7 @@ enum DietSemantics {
         // Protein: always a floor.
         let pTarget = t.protein ?? 0
         let protein = MetricGauge(
-            label: "Protein", goal: .floor, value: sum.p, target: t.protein,
+            label: Macro.protein.displayName, goal: .floor, value: sum.p, target: t.protein,
             status: floorStatus(value: sum.p, target: pTarget),
             remaining: floorRemaining(value: sum.p, target: pTarget),
             flag: proteinLowFlag(protein: sum.p, target: t.protein, hour: hour),
@@ -238,7 +238,7 @@ enum DietSemantics {
         // Carbs: floor vs carbsBase (falling back to carbs).
         let cTarget = t.carbsBase ?? t.carbs ?? 0
         let carbs = MetricGauge(
-            label: "Carbs", goal: .floor, value: sum.c, target: (t.carbsBase ?? t.carbs),
+            label: Macro.carbs.displayName, goal: .floor, value: sum.c, target: (t.carbsBase ?? t.carbs),
             status: floorStatus(value: sum.c, target: cTarget),
             remaining: floorRemaining(value: sum.c, target: cTarget),
             flag: nil, unit: "g", fraction: fraction(sum.c, cTarget))
@@ -248,13 +248,13 @@ enum DietSemantics {
         if carbLoad {
             let fTarget = t.fat ?? 0
             fat = MetricGauge(
-                label: "Fat", goal: .ceiling, value: sum.f, target: t.fat,
+                label: Macro.fat.displayName, goal: .ceiling, value: sum.f, target: t.fat,
                 status: ceilingStatus(value: sum.f, target: fTarget),
                 remaining: ceilingRemaining(value: sum.f, target: fTarget, unit: "g"),
                 flag: nil, unit: "g", fraction: fraction(sum.f, fTarget))
         } else {
             fat = MetricGauge(
-                label: "Fat", goal: .window, value: sum.f, target: fatCap,
+                label: Macro.fat.displayName, goal: .window, value: sum.f, target: fatCap,
                 status: fatWindowStatus(grams: sum.f),
                 remaining: fatWindowRemaining(grams: sum.f),
                 flag: fatLowFlag(fat: sum.f, hour: hour),
@@ -266,12 +266,12 @@ enum DietSemantics {
         let fiber: MetricGauge
         if carbLoad {
             fiber = MetricGauge(
-                label: "Fiber", goal: .floor, value: sum.fiber, target: fiberTarget,
+                label: Macro.fiber.displayName, goal: .floor, value: sum.fiber, target: fiberTarget,
                 status: .suspended, remaining: "suspended (carb-load)",
                 flag: nil, unit: "g", fraction: fraction(sum.fiber, fiberTarget))
         } else {
             fiber = MetricGauge(
-                label: "Fiber", goal: .floor, value: sum.fiber, target: fiberTarget,
+                label: Macro.fiber.displayName, goal: .floor, value: sum.fiber, target: fiberTarget,
                 status: floorStatus(value: sum.fiber, target: fiberTarget),
                 remaining: floorRemaining(value: sum.fiber, target: fiberTarget),
                 flag: nil, unit: "g", fraction: fraction(sum.fiber, fiberTarget))
@@ -318,6 +318,49 @@ struct MacroTotals: Equatable, Sendable {
     static func + (a: MacroTotals, b: MacroTotals) -> MacroTotals {
         MacroTotals(cal: a.cal + b.cal, p: a.p + b.p, f: a.f + b.f,
                     c: a.c + b.c, fiber: a.fiber + b.fiber)
+    }
+}
+
+/// The four macronutrients the Health tab tracks. The single source of truth for
+/// their user-facing display names — no view spells a macro out or abbreviates it
+/// on its own. There is no approved short form: never a single letter, never
+/// "Fib". A future edit that reintroduces one fails `MacroLabelTests`, not Jeremy's
+/// eyes.
+enum Macro: CaseIterable {
+    case protein, carbs, fat, fiber
+
+    var displayName: String {
+        switch self {
+        case .protein: return "Protein"
+        case .carbs: return "Carbs"
+        case .fat: return "Fat"
+        case .fiber: return "Fiber"
+        }
+    }
+}
+
+/// Builds the labeled macro line shown under food-journal items, meal subtotals,
+/// the day-summary card, and planned meals — always from the canonical `Macro`
+/// names, in protein · carbs · fat · fiber order. Pure and unit-tested; the view
+/// bodies only render its output.
+///
+/// `units: true` is the full form ("Protein 32g · Carbs 40g · Fat 12g · Fiber 6g");
+/// `units: false` is the compact fallback that drops the gram unit for tight rows
+/// ("Protein 32 · Carbs 40 · Fat 12 · Fiber 6"). `includeFiber: false` omits the
+/// fiber term entirely. Rounding matches the rest of the Health tab via
+/// `DietSemantics.fmt`, so the displayed numbers never change.
+enum MacroLine {
+    static func format(_ t: MacroTotals, includeFiber: Bool = true, units: Bool = true) -> String {
+        let u = units ? "g" : ""
+        var parts = [
+            "\(Macro.protein.displayName) \(DietSemantics.fmt(t.p))\(u)",
+            "\(Macro.carbs.displayName) \(DietSemantics.fmt(t.c))\(u)",
+            "\(Macro.fat.displayName) \(DietSemantics.fmt(t.f))\(u)",
+        ]
+        if includeFiber {
+            parts.append("\(Macro.fiber.displayName) \(DietSemantics.fmt(t.fiber))\(u)")
+        }
+        return parts.joined(separator: " · ")
     }
 }
 

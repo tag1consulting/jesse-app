@@ -46,7 +46,7 @@ enum Explainers {
     }
 
     static func protein(_ g: MetricGauge) -> Explainer {
-        Explainer(id: "protein", title: "Protein", valueLine: line(g), paragraphs: [
+        Explainer(id: "protein", title: Macro.protein.displayName, valueLine: line(g), paragraphs: [
             "Protein is a floor — hit it or beat it. It preserves muscle while you cut at marathon-training volume.",
             "Under half your target reads red, most of the way there yellow, at or past target green. There's no penalty for going over.",
         ])
@@ -59,7 +59,7 @@ enum Explainers {
         if hasBonus {
             paras.append("The bonus row is extra carb budget you earned by exercising — optional fuel, not an obligation. Eat into it on a big day; skip it on an easy one.")
         }
-        return Explainer(id: "carbs", title: "Carbs", valueLine: line(g), paragraphs: paras)
+        return Explainer(id: "carbs", title: Macro.carbs.displayName, valueLine: line(g), paragraphs: paras)
     }
 
     static func fat(_ g: MetricGauge, isCarbLoad: Bool) -> Explainer {
@@ -68,7 +68,7 @@ enum Explainers {
                "Green well under the cap, yellow approaching it, red over."]
             : ["Fat is a window, not just a cap. 50g is a hormonal floor — below it you risk low energy availability and fat-soluble vitamin uptake. 65g is the working ceiling; 70g the hard ceiling.",
                "So this bar reads red BELOW 50g (deliberately — that's too low), green 50–65g, yellow 65–70g, and red again over 70g."]
-        return Explainer(id: "fat", title: "Fat", valueLine: line(g), paragraphs: paras)
+        return Explainer(id: "fat", title: Macro.fat.displayName, valueLine: line(g), paragraphs: paras)
     }
 
     static func fiber(_ g: MetricGauge, isCarbLoad: Bool) -> Explainer {
@@ -77,7 +77,7 @@ enum Explainers {
                "It'll return to a 38g floor on your next normal day."]
             : ["Fiber is a 38g floor for gut health and satiety. Hit it or beat it on a normal day.",
                "It's suspended on carb-load days, when low-residue eating before a long effort is deliberate."]
-        return Explainer(id: "fiber", title: "Fiber", valueLine: line(g), paragraphs: paras)
+        return Explainer(id: "fiber", title: Macro.fiber.displayName, valueLine: line(g), paragraphs: paras)
     }
 
     static func netCalories(_ net: NetCalories) -> Explainer {

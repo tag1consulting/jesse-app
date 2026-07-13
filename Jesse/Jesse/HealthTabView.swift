@@ -219,10 +219,10 @@ struct TodayScreen: View {
         Section {
             if isNeutral {
                 HStack(alignment: .top, spacing: 8) {
-                    NeutralMacroRing(label: "Protein", grams: totals.p)
-                    NeutralMacroRing(label: "Carbs", grams: totals.c)
-                    NeutralMacroRing(label: "Fat", grams: totals.f)
-                    NeutralMacroRing(label: "Fiber", grams: totals.fiber)
+                    NeutralMacroRing(label: Macro.protein.displayName, grams: totals.p)
+                    NeutralMacroRing(label: Macro.carbs.displayName, grams: totals.c)
+                    NeutralMacroRing(label: Macro.fat.displayName, grams: totals.f)
+                    NeutralMacroRing(label: Macro.fiber.displayName, grams: totals.fiber)
                 }
                 .listRowBackground(Color.clear)
             } else {
