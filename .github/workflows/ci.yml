@@ -2,7 +2,17 @@ name: CI
 
 on:
   push:
+    branches: [main]
   pull_request:
+
+# One CI run per ref. On PR branches a new push cancels the superseded run
+# (macOS minutes are 10x Linux minutes, so stale runs are the expensive kind
+# of waste); runs on main are never cancelled, so every merge commit keeps a
+# complete CI record. Restricting `push` to main stops the duplicate
+# push+pull_request runs PR branches used to get.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 jobs:
   bridge:
@@ -48,6 +58,8 @@ jobs:
       # list (`cargo audit --ignore RUSTSEC-YYYY-NNNN`, or a `deny.toml`
       # `[advisories] ignore` block) with a note on why it isn't reachable here —
       # never silently pin to a vulnerable version.
+      # A weekly scheduled run (audit.yml) covers advisories that land between
+      # pushes.
       - name: Dependency CVE audit
         run: cargo audit
 
@@ -274,3 +286,18 @@ jobs:
             echo "Expected the watch test suite to run at least one test, got ${total}" >&2
             exit 1
           fi
+
+      # A failed run otherwise leaves only log text. The result bundles make
+      # test failures and simulator flakes diagnosable in Xcode without
+      # re-running the job. `if-no-files-found: ignore` because a failure
+      # before the Test step produces no bundle at all.
+      - name: Upload result bundles on failure
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: xcresult-bundles
+          path: |
+            Jesse/build/Result.xcresult
+            Jesse/build/ResultWatch.xcresult
+          if-no-files-found: ignore
+          retention-days: 14
