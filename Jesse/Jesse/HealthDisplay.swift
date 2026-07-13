@@ -121,22 +121,39 @@ enum HealthDisplay {
     // MARK: - Calorie-source split (food-journal summary bar)
 
     /// The kcal contribution of each macro to the day's intake, at the standard
-    /// Atwater factors (protein 4, carbs 4, fat 9 kcal/g). `total` is the sum of the
-    /// three macro-derived calories (NOT the logged `cal`, which can differ) so the
-    /// stacked bar's segments always sum to its whole. Fractions are 0 when empty.
+    /// Atwater factors (protein 4, net-carbs 4, fiber 4, fat 9 kcal/g), with fiber
+    /// carved out of carbs as its own contribution. Fiber grams are a SUBSET of carb
+    /// grams (US-label total-carbohydrate convention — verified in the audit, see
+    /// STATUS §Y), so the fiber slice (4 kcal/g) comes out of the carb slice:
+    /// `netCarbsKcal + fiberKcal` always equals the old single carb term
+    /// (`carbs * 4`), the combined carbs+fiber width equals the old carb width, and
+    /// the four segments still sum to the same whole the old three did. `total` is the
+    /// sum of the macro-derived calories (NOT the logged `cal`, which can differ) so
+    /// the stacked bar's segments always sum to its whole. Fractions are 0 when empty.
     struct CalorieSplit: Equatable, Sendable {
         var proteinKcal: Double
-        var carbsKcal: Double
+        var netCarbsKcal: Double
+        var fiberKcal: Double
         var fatKcal: Double
-        var total: Double { proteinKcal + carbsKcal + fatKcal }
+        var total: Double { proteinKcal + netCarbsKcal + fiberKcal + fatKcal }
         var proteinFraction: Double { total > 0 ? proteinKcal / total : 0 }
-        var carbsFraction: Double { total > 0 ? carbsKcal / total : 0 }
+        var netCarbsFraction: Double { total > 0 ? netCarbsKcal / total : 0 }
+        var fiberFraction: Double { total > 0 ? fiberKcal / total : 0 }
         var fatFraction: Double { total > 0 ? fatKcal / total : 0 }
     }
 
-    /// Atwater kcal split of a day's macro totals.
+    /// Atwater kcal split of a day's macro totals, with fiber carved out of carbs.
+    /// Robustness lives here, not in the view: fiber is clamped to `[0, carbs]`, so a
+    /// missing or negative fiber yields no fiber segment (all carbs stay in net-carbs)
+    /// and a fiber value exceeding carbs never drives the net-carb term negative.
     static func calorieSplit(_ totals: MacroTotals) -> CalorieSplit {
-        CalorieSplit(proteinKcal: totals.p * 4, carbsKcal: totals.c * 4, fatKcal: totals.f * 9)
+        let carbs = max(totals.c, 0)
+        let fiber = min(max(totals.fiber, 0), carbs)   // 0 ≤ fiber ≤ carbs
+        return CalorieSplit(
+            proteinKcal: totals.p * 4,
+            netCarbsKcal: (carbs - fiber) * 4,
+            fiberKcal: fiber * 4,
+            fatKcal: totals.f * 9)
     }
 
     // MARK: - Moving average (chart)

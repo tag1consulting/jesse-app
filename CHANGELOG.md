@@ -15,6 +15,25 @@ CI both run it). See the "Versioning" section of `bridge/README.md`.
 
 ## [Unreleased]
 
+## [App 1.0 (34)] — 2026-07-13
+
+### Added
+- **Food journal: fiber in the calorie-source bar.** The day-summary card's
+  stacked calorie-source bar gains a fourth segment — fiber — carved out of the
+  carb segment (order: Protein, Carbs, Fiber, Fat). Fiber grams are a subset of
+  carb grams (US-label total-carbohydrate convention), so the fiber slice at 4 kcal/g
+  comes out of the carb slice: net-carbs + fiber always occupy exactly the width the
+  carb segment alone used to, and the bar still sums to the day's calories. A day
+  with zero fiber renders no fiber segment and looks exactly as before. The compact
+  legend gains a **Fiber** entry (full words for all four: Protein, Carbs, Fiber,
+  Fat); the grand macro line still shows total carbs and fiber grams unchanged — no
+  displayed number changes. The split math is pure and unit-tested
+  (`HealthDisplay.calorieSplit`): missing/negative fiber is treated as zero, and
+  fiber exceeding carbs is clamped to carbs so the net-carb term never goes negative.
+  Fiber's bar color is `MacroColor.fiber`, added to the app's canonical macro-color
+  source. App-side math and rendering only — no data contract, networking, or
+  semantics-engine change.
+
 ## [Bridge 0.8.0] — 2026-07-13
 
 ### Added

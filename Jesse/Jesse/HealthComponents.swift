@@ -289,12 +289,16 @@ struct MetricTile: View {
 enum MacroColor {
     static let protein = Color.indigo
     static let carbs = Color.teal
+    static let fiber = Color.brown
     static let fat = Color.orange
 }
 
 /// A single horizontal stacked bar of where the day's calories came from (protein /
-/// carbs / fat at 4/4/9 kcal per gram), with a compact legend. The split math is
-/// pure and tested (`HealthDisplay.calorieSplit`); this only draws it.
+/// carbs / fiber / fat at 4/4/4/9 kcal per gram), with a compact legend. Fiber is
+/// carved out of carbs (its grams are a subset of carb grams), so carbs+fiber fill
+/// the width the carb segment alone used to; a zero-fiber day renders no fiber
+/// segment and looks exactly as it did before. The split math is pure and tested
+/// (`HealthDisplay.calorieSplit`); this only draws it.
 struct CalorieSourceBar: View {
     let split: HealthDisplay.CalorieSplit
     var body: some View {
@@ -304,7 +308,9 @@ struct CalorieSourceBar: View {
                     Rectangle().fill(MacroColor.protein)
                         .frame(width: geo.size.width * split.proteinFraction)
                     Rectangle().fill(MacroColor.carbs)
-                        .frame(width: geo.size.width * split.carbsFraction)
+                        .frame(width: geo.size.width * split.netCarbsFraction)
+                    Rectangle().fill(MacroColor.fiber)
+                        .frame(width: geo.size.width * split.fiberFraction)
                     Rectangle().fill(MacroColor.fat)
                 }
                 .clipShape(Capsule())
@@ -313,13 +319,14 @@ struct CalorieSourceBar: View {
             HStack(spacing: 14) {
                 legendItem(Macro.protein.displayName, MacroColor.protein)
                 legendItem(Macro.carbs.displayName, MacroColor.carbs)
+                legendItem(Macro.fiber.displayName, MacroColor.fiber)
                 legendItem(Macro.fat.displayName, MacroColor.fat)
             }
             .font(.caption2)
             .foregroundStyle(.secondary)
         }
         .accessibilityElement(children: .ignore)
-        .accessibilityLabel("Calorie sources: protein \(pct(split.proteinFraction)), carbs \(pct(split.carbsFraction)), fat \(pct(split.fatFraction))")
+        .accessibilityLabel("Calorie sources: protein \(pct(split.proteinFraction)), carbs \(pct(split.netCarbsFraction)), fiber \(pct(split.fiberFraction)), fat \(pct(split.fatFraction))")
     }
     private func legendItem(_ label: String, _ color: Color) -> some View {
         HStack(spacing: 4) {

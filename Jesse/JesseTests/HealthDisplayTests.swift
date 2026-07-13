@@ -46,26 +46,121 @@ final class HealthDisplayTests: XCTestCase {
         XCTAssertFalse(HealthDisplay.hasBodyFat([]))
     }
 
-    // MARK: - Calorie-source split
+    // MARK: - Calorie-source split (four segments: protein / net-carbs / fiber / fat)
 
-    func testCalorieSplitUsesAtwaterFactors() {
-        // 100g protein, 200g carbs, 50g fat → 400 / 800 / 450 kcal, total 1650.
-        let split = HealthDisplay.calorieSplit(MacroTotals(cal: 0, p: 100, f: 50, c: 200, fiber: 0))
+    /// The old single carb term (`carbs * 4`) for a set of totals — the invariant the
+    /// four-segment carve-out must preserve: net-carbs + fiber kcal == this.
+    private func oldCarbsKcal(_ t: MacroTotals) -> Double { t.c * 4 }
+    private func oldTotal(_ t: MacroTotals) -> Double { t.p * 4 + t.c * 4 + t.f * 9 }
+
+    func testCalorieSplitUsesAtwaterFactorsWithFiber() {
+        // 100g protein, 200g carbs (of which 30g fiber), 50g fat.
+        // protein 400, net-carbs (200-30)*4 = 680, fiber 30*4 = 120, fat 450 → 1650.
+        let t = MacroTotals(cal: 0, p: 100, f: 50, c: 200, fiber: 30)
+        let split = HealthDisplay.calorieSplit(t)
         XCTAssertEqual(split.proteinKcal, 400, accuracy: 0.001)
-        XCTAssertEqual(split.carbsKcal, 800, accuracy: 0.001)
+        XCTAssertEqual(split.netCarbsKcal, 680, accuracy: 0.001)
+        XCTAssertEqual(split.fiberKcal, 120, accuracy: 0.001)
         XCTAssertEqual(split.fatKcal, 450, accuracy: 0.001)
         XCTAssertEqual(split.total, 1650, accuracy: 0.001)
         XCTAssertEqual(split.proteinFraction, 400.0 / 1650.0, accuracy: 0.0001)
-        XCTAssertEqual(split.carbsFraction, 800.0 / 1650.0, accuracy: 0.0001)
+        XCTAssertEqual(split.netCarbsFraction, 680.0 / 1650.0, accuracy: 0.0001)
+        XCTAssertEqual(split.fiberFraction, 120.0 / 1650.0, accuracy: 0.0001)
         XCTAssertEqual(split.fatFraction, 450.0 / 1650.0, accuracy: 0.0001)
+        // Carbs+fiber occupy exactly the old single carb slice.
+        XCTAssertEqual(split.netCarbsKcal + split.fiberKcal, oldCarbsKcal(t), accuracy: 0.001)
     }
 
     func testCalorieSplitEmptyHasZeroFractions() {
         let split = HealthDisplay.calorieSplit(.zero)
         XCTAssertEqual(split.total, 0)
         XCTAssertEqual(split.proteinFraction, 0)
-        XCTAssertEqual(split.carbsFraction, 0)
+        XCTAssertEqual(split.netCarbsFraction, 0)
+        XCTAssertEqual(split.fiberFraction, 0)
         XCTAssertEqual(split.fatFraction, 0)
+    }
+
+    func testCalorieSplitZeroFiberRendersNoFiberSegment() {
+        // Zero fiber: no fiber slice, all carbs stay in net-carbs — byte-identical to
+        // the old three-segment behavior.
+        let t = MacroTotals(cal: 0, p: 100, f: 50, c: 200, fiber: 0)
+        let split = HealthDisplay.calorieSplit(t)
+        XCTAssertEqual(split.fiberKcal, 0)
+        XCTAssertEqual(split.fiberFraction, 0)
+        XCTAssertEqual(split.netCarbsKcal, 800, accuracy: 0.001)
+        XCTAssertEqual(split.netCarbsKcal + split.fiberKcal, oldCarbsKcal(t), accuracy: 0.001)
+    }
+
+    func testCalorieSplitMissingNegativeFiberTreatedAsZero() {
+        // A negative fiber value (a corrupt/"missing" sentinel) is treated as zero:
+        // no fiber segment, net-carbs never inflated past the carb total.
+        let t = MacroTotals(cal: 0, p: 40, f: 20, c: 120, fiber: -5)
+        let split = HealthDisplay.calorieSplit(t)
+        XCTAssertEqual(split.fiberKcal, 0)
+        XCTAssertEqual(split.netCarbsKcal, 480, accuracy: 0.001)
+        XCTAssertEqual(split.netCarbsKcal + split.fiberKcal, oldCarbsKcal(t), accuracy: 0.001)
+    }
+
+    func testCalorieSplitFiberEqualToCarbsEmptiesNetCarbs() {
+        // All carbohydrate is fiber: net-carbs is zero, fiber takes the whole carb
+        // slice, nothing goes negative.
+        let t = MacroTotals(cal: 0, p: 0, f: 0, c: 30, fiber: 30)
+        let split = HealthDisplay.calorieSplit(t)
+        XCTAssertEqual(split.netCarbsKcal, 0, accuracy: 0.001)
+        XCTAssertEqual(split.fiberKcal, 120, accuracy: 0.001)
+        XCTAssertEqual(split.netCarbsKcal + split.fiberKcal, oldCarbsKcal(t), accuracy: 0.001)
+    }
+
+    func testCalorieSplitFiberExceedingCarbsIsClamped() {
+        // Fiber greater than carbs (bad data) clamps to carbs: net-carbs stays at
+        // zero (never negative), fiber caps at the carb slice, total is unchanged.
+        let t = MacroTotals(cal: 0, p: 10, f: 5, c: 20, fiber: 50)
+        let split = HealthDisplay.calorieSplit(t)
+        XCTAssertGreaterThanOrEqual(split.netCarbsKcal, 0)
+        XCTAssertEqual(split.netCarbsKcal, 0, accuracy: 0.001)
+        XCTAssertEqual(split.fiberKcal, 80, accuracy: 0.001)   // clamped to carbs 20 * 4
+        XCTAssertEqual(split.netCarbsKcal + split.fiberKcal, oldCarbsKcal(t), accuracy: 0.001)
+        XCTAssertEqual(split.total, oldTotal(t), accuracy: 0.001)
+    }
+
+    func testCalorieSplitFourSegmentsSumToOldThreeSegmentTotal() {
+        // Property-style: across a spread of realistic days (including zero, missing,
+        // equal, and excess fiber), the four segments always sum to the old
+        // three-segment total, and net-carbs+fiber always equals the old carb term.
+        let days: [MacroTotals] = [
+            MacroTotals(cal: 0, p: 140, f: 65, c: 300, fiber: 38),
+            MacroTotals(cal: 0, p: 90, f: 40, c: 210, fiber: 0),
+            MacroTotals(cal: 0, p: 0, f: 0, c: 25, fiber: 4),
+            MacroTotals(cal: 0, p: 6, f: 14, c: 6, fiber: 3),
+            MacroTotals(cal: 0, p: 30, f: 12, c: 45, fiber: 45),
+            MacroTotals(cal: 0, p: 10, f: 5, c: 20, fiber: 50),   // fiber > carbs
+        ]
+        for t in days {
+            let split = HealthDisplay.calorieSplit(t)
+            XCTAssertEqual(split.total, oldTotal(t), accuracy: 0.001,
+                           "four segments must sum to the old three-segment total for \(t)")
+            XCTAssertEqual(split.netCarbsKcal + split.fiberKcal, oldCarbsKcal(t), accuracy: 0.001,
+                           "carbs+fiber must equal the old carb slice for \(t)")
+            XCTAssertGreaterThanOrEqual(split.netCarbsKcal, 0, "net-carbs never negative for \(t)")
+        }
+    }
+
+    func testCalorieSplitFractionsSumToOneWhenNonEmpty() {
+        // Rounding/parity with the display: the four fractions fill the whole bar, so
+        // it still visually sums to the day's calories.
+        let t = MacroTotals(cal: 0, p: 140, f: 65, c: 300, fiber: 38)
+        let split = HealthDisplay.calorieSplit(t)
+        let sum = split.proteinFraction + split.netCarbsFraction + split.fiberFraction + split.fatFraction
+        XCTAssertEqual(sum, 1.0, accuracy: 0.0001)
+    }
+
+    func testCalorieSplitDisplayGramsUnchangedByCarveOut() {
+        // Rounding parity with the current display: carving fiber out of carbs must
+        // not change any displayed gram figure. Carbs still shows the TOTAL carb
+        // grams (not net) and fiber shows fiber grams, both via the shared formatter.
+        let t = MacroTotals(cal: 1650, p: 140, f: 65, c: 301, fiber: 38)
+        XCTAssertEqual(MacroLine.format(t),
+                       "Protein 140g · Carbs 301g · Fat 65g · Fiber 38g")
     }
 
     // MARK: - Staleness
