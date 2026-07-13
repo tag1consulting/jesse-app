@@ -631,6 +631,55 @@ pub struct DietTargets {
     pub fiber: Option<f64>,
 }
 
+/// Sum `food-log.csv` into the day's macro totals for `date` — the source of truth
+/// the dashboard renders from (the whole day, not just this turn's rows). Columns
+/// are addressed by header NAME; a blank `Calories` is derived from
+/// `Cal_per_100g × Grams / 100` (the generator's own rule); blank macros count as 0.
+/// A row that fails to parse is skipped, never fatal.
+pub fn sum_food_csv_for_date(food_csv: &str, date: &str) -> MacroTotals {
+    let mut rdr = csv::ReaderBuilder::new()
+        .has_headers(true)
+        .flexible(true)
+        .from_reader(food_csv.as_bytes());
+    let idx: HashMap<String, usize> = match rdr.headers() {
+        Ok(h) => h
+            .iter()
+            .enumerate()
+            .map(|(i, s)| (s.trim().to_string(), i))
+            .collect(),
+        Err(_) => return MacroTotals::default(),
+    };
+    let cell = |rec: &csv::StringRecord, name: &str| -> String {
+        idx.get(name).and_then(|&j| rec.get(j)).unwrap_or("").trim().to_string()
+    };
+    let num = |s: &str| s.parse::<f64>().unwrap_or(0.0);
+    let mut t = MacroTotals::default();
+    for rec in rdr.records().flatten() {
+        if cell(&rec, "Date") != date {
+            continue;
+        }
+        // Calories: explicit, else Cal_per_100g × Grams / 100.
+        let kcal = match cell(&rec, "Calories").parse::<f64>() {
+            Ok(c) => c,
+            Err(_) => {
+                match (
+                    cell(&rec, "Cal_per_100g").parse::<f64>(),
+                    cell(&rec, "Grams").parse::<f64>(),
+                ) {
+                    (Ok(cp), Ok(g)) => (cp * g / 100.0).round(),
+                    _ => 0.0,
+                }
+            }
+        };
+        t.kcal += kcal;
+        t.protein_g += num(&cell(&rec, "Protein_g"));
+        t.carbs_g += num(&cell(&rec, "Carbs_g"));
+        t.fat_g += num(&cell(&rec, "Fat_g"));
+        t.fiber_g += num(&cell(&rec, "Fiber_g"));
+    }
+    t
+}
+
 /// Sum the per-item food entries into the day's macro totals (missing macros → 0).
 pub fn sum_food_macros(rows: &[FoodEntry]) -> MacroTotals {
     let mut t = MacroTotals::default();
@@ -1320,8 +1369,13 @@ pub async fn run_diet_pipeline(cfg: &Config, utterance: &str) -> DietPipelineOut
         return DietPipelineOutcome::FallThrough { rung: DietRung::Append };
     }
 
-    // Stage 4 — dashboard + mirror. Both are DERIVED from the committed rows.
-    let totals = sum_food_macros(&food);
+    // Stage 4 — dashboard + mirror. Both are DERIVED from the committed CSVs: the
+    // dashboard reflects the whole DAY's totals (re-read from food-log.csv), while
+    // the mirror is per just-appended item.
+    let totals = std::fs::read_to_string(logs_dir.join("food-log.csv"))
+        .ok()
+        .map(|c| sum_food_csv_for_date(&c, &date))
+        .unwrap_or_else(|| sum_food_macros(&food));
     let targets = std::fs::read_to_string(logs_dir.join("daily-targets.csv"))
         .ok()
         .map(|c| targets_for_date(&c, &date))
@@ -1763,11 +1817,33 @@ mod tests {
     }
 
     #[test]
+    fn sums_the_days_food_macros_from_csv_deriving_blank_calories() {
+        // A day with an explicit-Calories row and a legacy per-100g row (blank
+        // Calories → derived), plus a row for a DIFFERENT day that must be excluded.
+        let csv = format!(
+            "{FOOD_LOG_HEADER}\n\
+             2026-07-13,Breakfast,Eggs,3,ea,,,210,18,15,1,,08:00,Breakfast,0\n\
+             2026-07-13,Dinner,Rice,150,g,130,150,,3,0,28,,19:00,Dinner,\n\
+             2026-07-12,Snack,Banana,1,ea,,,105,1,0,27,,10:00,Snack,3\n"
+        );
+        let t = sum_food_csv_for_date(&csv, "2026-07-13");
+        assert_eq!(t.kcal, 210.0 + 195.0, "explicit 210 + derived 130*150/100=195");
+        assert_eq!(t.protein_g, 21.0); // 18 + 3
+        assert_eq!(t.carbs_g, 29.0); // 1 + 28
+        assert_eq!(t.fiber_g, 0.0, "blank fiber counts as 0");
+    }
+
+    #[test]
     fn dashboard_renders_totals_and_bars_from_fixture_csv() {
-        let rows = vec![f("Eggs", "Breakfast", "08:00", 210.0), f("Banana", "Snack", "10:00", 105.0)];
-        let totals = sum_food_macros(&rows);
+        // Render straight from a food-log.csv fixture — the source of truth.
+        let csv = format!(
+            "{FOOD_LOG_HEADER}\n\
+             2026-07-13,Breakfast,Eggs,3,ea,,,210,10,15,1,,08:00,Breakfast,0\n\
+             2026-07-13,Snack,Banana,1,ea,,,105,10,0,27,,10:00,Snack,3\n"
+        );
+        let totals = sum_food_csv_for_date(&csv, "2026-07-13");
         assert_eq!(totals.kcal, 315.0);
-        assert_eq!(totals.protein_g, 20.0); // 2 × 10
+        assert_eq!(totals.protein_g, 20.0); // 10 + 10
         let t = targets_for_date(TARGETS_CSV, "2026-07-13");
         let dash = render_diet_dashboard("2026-07-13", &totals, &t);
         assert!(dash.contains("2026-07-13"), "header carries the date");
