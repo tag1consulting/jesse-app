@@ -160,7 +160,7 @@ final class HealthDisplayTests: XCTestCase {
         // grams (not net) and fiber shows fiber grams, both via the shared formatter.
         let t = MacroTotals(cal: 1650, p: 140, f: 65, c: 301, fiber: 38)
         XCTAssertEqual(MacroLine.format(t),
-                       "Protein 140g · Carbs 301g · Fat 65g · Fiber 38g")
+                       "Protein 140g · Carbs 301g · Fiber 38g · Fat 65g")
     }
 
     // MARK: - Staleness

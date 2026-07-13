@@ -212,25 +212,28 @@ struct TodayScreen: View {
         }
     }
 
-    // Four smaller rings — protein, carbs, fat, fiber. Judged on a full day; neutral
-    // gram totals on a reconstructed day.
+    // Four smaller rings in canonical order — protein, carbs, fiber, fat. Judged on a
+    // full day; neutral gram totals on a reconstructed day. Both derive their order
+    // from `Macro.allCases`; the rings stay four equal peers (ring size encodes
+    // nothing, so fiber's ring is not shrunk — only its position and its label type
+    // change, and the label change lives in the listings, not here).
     @ViewBuilder
     private var macroRingsSection: some View {
         Section {
             if isNeutral {
                 HStack(alignment: .top, spacing: 8) {
-                    NeutralMacroRing(label: Macro.protein.displayName, grams: totals.p)
-                    NeutralMacroRing(label: Macro.carbs.displayName, grams: totals.c)
-                    NeutralMacroRing(label: Macro.fat.displayName, grams: totals.f)
-                    NeutralMacroRing(label: Macro.fiber.displayName, grams: totals.fiber)
+                    ForEach(Macro.allCases, id: \.self) { macro in
+                        NeutralMacroRing(label: macro.displayName, grams: totals.grams(for: macro))
+                    }
                 }
                 .listRowBackground(Color.clear)
             } else {
                 HStack(alignment: .top, spacing: 8) {
-                    MacroRing(gauge: gauges.protein) { explainer = Explainers.protein(gauges.protein) }
-                    MacroRing(gauge: gauges.carbs) { explainer = Explainers.carbs(gauges.carbs, hasBonus: gauges.carbsBonus != nil) }
-                    MacroRing(gauge: gauges.fat) { explainer = Explainers.fat(gauges.fat, isCarbLoad: gauges.isCarbLoad) }
-                    MacroRing(gauge: gauges.fiber) { explainer = Explainers.fiber(gauges.fiber, isCarbLoad: gauges.isCarbLoad) }
+                    ForEach(gauges.orderedMacros, id: \.macro) { entry in
+                        MacroRing(gauge: entry.gauge) {
+                            explainer = Explainers.macro(entry.macro, gauges: gauges)
+                        }
+                    }
                 }
                 .listRowBackground(Color.clear)
             }

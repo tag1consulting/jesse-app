@@ -50,6 +50,37 @@ CI both run it). See the "Versioning" section of `bridge/README.md`.
   every turn takes the hosted path byte-for-byte; the main-turn and title command
   construction are untouched (proven by the existing byte-identical tests).
 
+## [App 1.0 (35)] — 2026-07-13
+
+### Changed
+- **Fiber presented as a subset of carbs everywhere (color, order, type).** Fiber's
+  grams are counted inside carbohydrate grams (US-label convention — the calorie-source
+  bar already carves the fiber segment out of the carb segment), and the presentation
+  now says the same thing on every surface that lists more than one macro. Three rules,
+  all presentation-only — the data contract, wire/CSV identifiers, HealthKit types, the
+  DietSemantics engine, and the calorie-split math (including the fiber clamp) are
+  untouched, and no displayed number changes:
+  - **Color.** Fiber's identity color is no longer an independent hue (`.brown`, added
+    in the fiber-bar change, is gone). It is now the carbs color (system teal) lightened
+    toward white — the same teal family, clearly paler — derived by a function inside a
+    dynamic color provider so it resolves per color scheme and stays fully opaque, so the
+    calorie-source bar reads as carbs and its paler kin side by side and the two stay
+    tellable apart in light and dark mode. Only the macro-**identity** surfaces (the bar
+    and its legend) use this; the rings and Macros-screen bars still color by
+    red/yellow/green status judgment, unchanged.
+  - **Order.** Every user-facing macro listing now shows Protein, Carbs, Fiber, Fat —
+    fiber immediately after carbs — derived from one canonical source (the `Macro`
+    enum's case order). The Health-tab macro rings row (which shipped as Protein, Carbs,
+    Fat, Fiber), the Macros screen, the neutral totals, and every food-journal macro
+    caption were reordered to derive from it instead of hardcoding.
+  - **Type.** Where macros are listed with labels, the fiber entry renders as a
+    sub-entry of carbs — smaller and/or in a dimmer secondary color, the way a nutrition
+    label indents Dietary Fiber under Total Carbohydrate — while its gram number stays
+    visible. Applied to the calorie-source bar legend, the Macros screen bar rows and
+    neutral totals, and the day-summary grand macro line and per-meal subtotal line. The
+    macro rings stay four equal rings (ring size encodes nothing, so fiber's ring is not
+    shrunk — only its position changes).
+
 ## [App 1.0 (34)] — 2026-07-13
 
 ### Added

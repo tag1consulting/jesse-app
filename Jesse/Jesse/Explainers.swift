@@ -45,6 +45,19 @@ enum Explainers {
         return Explainer(id: "calories", title: "Calories", valueLine: line(g), paragraphs: paras)
     }
 
+    /// The explainer for a macro, wired with the live context each one needs (carbs'
+    /// bonus, fat/fiber's carb-load flip). Lets the rings row and the Macros screen
+    /// build explainers while iterating `Macro.allCases` in canonical order, instead
+    /// of naming each builder in a hand-written sequence.
+    static func macro(_ macro: Macro, gauges g: DietGauges) -> Explainer {
+        switch macro {
+        case .protein: return protein(g.protein)
+        case .carbs: return carbs(g.carbs, hasBonus: g.carbsBonus != nil)
+        case .fiber: return fiber(g.fiber, isCarbLoad: g.isCarbLoad)
+        case .fat: return fat(g.fat, isCarbLoad: g.isCarbLoad)
+        }
+    }
+
     static func protein(_ g: MetricGauge) -> Explainer {
         Explainer(id: "protein", title: Macro.protein.displayName, valueLine: line(g), paragraphs: [
             "Protein is a floor — hit it or beat it. It preserves muscle while you cut at marathon-training volume.",

@@ -140,6 +140,20 @@ enum HealthDisplay {
         var netCarbsFraction: Double { total > 0 ? netCarbsKcal / total : 0 }
         var fiberFraction: Double { total > 0 ? fiberKcal / total : 0 }
         var fatFraction: Double { total > 0 ? fatKcal / total : 0 }
+
+        /// The width fraction for a macro's bar segment. The carbs segment carries the
+        /// NET-carb width (fiber is carved out into its own adjacent segment), so the
+        /// carbs + fiber segments together fill exactly the width the carb segment
+        /// alone used to. Lets the bar iterate `Macro.allCases` instead of naming each
+        /// segment in a fixed order.
+        func fraction(for macro: Macro) -> Double {
+            switch macro {
+            case .protein: return proteinFraction
+            case .carbs: return netCarbsFraction
+            case .fiber: return fiberFraction
+            case .fat: return fatFraction
+            }
+        }
     }
 
     /// Atwater kcal split of a day's macro totals, with fiber carved out of carbs.

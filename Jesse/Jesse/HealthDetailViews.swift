@@ -53,11 +53,13 @@ struct MacrosCaloriesDetail: View {
         List {
             Section {
                 bar(g.calories, Explainers.calories(g.calories, isCarbLoad: g.isCarbLoad))
-                bar(g.protein, Explainers.protein(g.protein))
-                bar(g.carbs, Explainers.carbs(g.carbs, hasBonus: g.carbsBonus != nil))
-                if let bonus = g.carbsBonus { bonusRow(bonus) }
-                bar(g.fat, Explainers.fat(g.fat, isCarbLoad: g.isCarbLoad))
-                bar(g.fiber, Explainers.fiber(g.fiber, isCarbLoad: g.isCarbLoad))
+                // Macro bars in canonical order (Protein, Carbs, Fiber, Fat); the
+                // carbs bonus row follows carbs, so fiber sits right after them.
+                ForEach(g.orderedMacros, id: \.macro) { entry in
+                    bar(entry.gauge, Explainers.macro(entry.macro, gauges: g),
+                        isSubEntry: entry.macro.isSubEntry)
+                    if entry.macro == .carbs, let bonus = g.carbsBonus { bonusRow(bonus) }
+                }
             }
             Section("Net calories") {
                 NetCalorieBar(net: g.net)
@@ -75,10 +77,12 @@ struct MacrosCaloriesDetail: View {
         List {
             Section {
                 totalRow("Calories", "\(DietSemantics.fmt(totals.cal))")
-                totalRow(Macro.protein.displayName, "\(DietSemantics.fmt(totals.p))g")
-                totalRow(Macro.carbs.displayName, "\(DietSemantics.fmt(totals.c))g")
-                totalRow(Macro.fat.displayName, "\(DietSemantics.fmt(totals.f))g")
-                totalRow(Macro.fiber.displayName, "\(DietSemantics.fmt(totals.fiber))g")
+                // Canonical order (Protein, Carbs, Fiber, Fat); fiber renders as a
+                // sub-entry of carbs (smaller + secondary label).
+                ForEach(Macro.allCases, id: \.self) { macro in
+                    totalRow(macro.displayName, "\(DietSemantics.fmt(totals.grams(for: macro)))g",
+                             isSubEntry: macro.isSubEntry)
+                }
             } footer: {
                 Text(NeutralMode.noTargetsCaption)
             }
@@ -92,16 +96,18 @@ struct MacrosCaloriesDetail: View {
         }
     }
 
-    private func totalRow(_ title: String, _ value: String) -> some View {
+    private func totalRow(_ title: String, _ value: String, isSubEntry: Bool = false) -> some View {
         HStack {
-            Text(title).foregroundStyle(.secondary)
+            Text(title)
+                .font(isSubEntry ? .footnote : .body)
+                .foregroundStyle(isSubEntry ? AnyShapeStyle(.tertiary) : AnyShapeStyle(.secondary))
             Spacer()
             Text(value).font(.body.monospacedDigit())
         }
     }
 
-    private func bar(_ gauge: MetricGauge, _ ex: Explainer) -> some View {
-        MetricBarRow(gauge: gauge) { explainer = ex }
+    private func bar(_ gauge: MetricGauge, _ ex: Explainer, isSubEntry: Bool = false) -> some View {
+        MetricBarRow(gauge: gauge, isSubEntry: isSubEntry) { explainer = ex }
     }
 
     private func bonusRow(_ bonus: CarbsBonus) -> some View {
@@ -198,7 +204,10 @@ struct FoodJournalDetail: View {
                         Text("cal today").font(.subheadline).foregroundStyle(.secondary)
                     }
                     CalorieSourceBar(split: HealthDisplay.calorieSplit(grand))
-                    Text(MacroLine.format(grand)).font(.caption.monospacedDigit()).foregroundStyle(.secondary)
+                    // Grand macro line: fiber reads as a sub-entry of carbs — one
+                    // ramp step smaller (caption → caption2) and dimmer (tertiary).
+                    macroCaptionText(grand, fiberFont: .caption2, fiberColor: Color(uiColor: .tertiaryLabel))
+                        .font(.caption.monospacedDigit()).foregroundStyle(.secondary)
                 }
             }
             .cardRow()
@@ -254,7 +263,8 @@ struct FoodJournalDetail: View {
                 Text("\(DietSemantics.fmt(t.cal)) cal")
                     .font(.caption.monospacedDigit()).foregroundStyle(.secondary)
             }
-            Text(MacroLine.format(t))
+            // Subtotal macro line: fiber as a sub-entry of carbs (smaller + dimmer).
+            macroCaptionText(t, fiberFont: .caption2, fiberColor: Color(uiColor: .tertiaryLabel))
                 .font(.caption.monospacedDigit()).foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
         }

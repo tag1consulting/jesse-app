@@ -319,6 +319,17 @@ struct MacroTotals: Equatable, Sendable {
         MacroTotals(cal: a.cal + b.cal, p: a.p + b.p, f: a.f + b.f,
                     c: a.c + b.c, fiber: a.fiber + b.fiber)
     }
+
+    /// Grams of a given macro — the seam that lets listings iterate `Macro.allCases`
+    /// instead of hand-reading each field in a fixed order.
+    func grams(for macro: Macro) -> Double {
+        switch macro {
+        case .protein: return p
+        case .carbs: return c
+        case .fiber: return fiber
+        case .fat: return f
+        }
+    }
 }
 
 /// The four macronutrients the Health tab tracks. The single source of truth for
@@ -327,16 +338,37 @@ struct MacroTotals: Equatable, Sendable {
 /// "Fib". A future edit that reintroduces one fails `MacroLabelTests`, not Jeremy's
 /// eyes.
 enum Macro: CaseIterable {
-    case protein, carbs, fat, fiber
+    // Case order IS the canonical user-facing display order: Protein, Carbs, Fiber,
+    // Fat. Fiber is a subset of carbs (its grams are counted inside the carb grams,
+    // US-label convention), so it sits immediately after carbs — never as a fourth
+    // peer after fat. Every listing derives its order from `allCases`; no view spells
+    // an order of its own. A regression that reorders these fails `MacroLabelTests`.
+    case protein, carbs, fiber, fat
 
     var displayName: String {
         switch self {
         case .protein: return "Protein"
         case .carbs: return "Carbs"
-        case .fat: return "Fat"
         case .fiber: return "Fiber"
+        case .fat: return "Fat"
         }
     }
+
+    /// The macro this one is nutritionally a subset of, or nil for a top-level macro.
+    /// Fiber's grams are a subset of carbohydrate grams, so it renders as a sub-entry
+    /// of carbs — smaller and secondary — the way a nutrition label indents Dietary
+    /// Fiber under Total Carbohydrate. Drives both the identity color (a shade of the
+    /// parent's) and the label type treatment.
+    var parent: Macro? {
+        switch self {
+        case .fiber: return .carbs
+        default: return nil
+        }
+    }
+
+    /// True when this macro renders as a sub-entry of another (currently fiber under
+    /// carbs), rather than as one of the top-level peers.
+    var isSubEntry: Bool { parent != nil }
 }
 
 /// Builds the labeled macro line shown under food-journal items, meal subtotals,
@@ -350,17 +382,27 @@ enum Macro: CaseIterable {
 /// fiber term entirely. Rounding matches the rest of the Health tab via
 /// `DietSemantics.fmt`, so the displayed numbers never change.
 enum MacroLine {
-    static func format(_ t: MacroTotals, includeFiber: Bool = true, units: Bool = true) -> String {
+    /// One rendered term of the macro line, tagged with its macro so a view can style
+    /// the sub-entry (fiber) run differently from the top-level runs.
+    struct Segment: Equatable {
+        let macro: Macro
+        let text: String
+    }
+
+    /// The ordered terms of a totals line, in the canonical `Macro.allCases` order
+    /// (Protein, Carbs, Fiber, Fat). `includeFiber: false` drops the fiber term. This
+    /// is the single ordering source both `format` (plain string) and the styled
+    /// caption view derive from.
+    static func segments(_ t: MacroTotals, includeFiber: Bool = true, units: Bool = true) -> [Segment] {
         let u = units ? "g" : ""
-        var parts = [
-            "\(Macro.protein.displayName) \(DietSemantics.fmt(t.p))\(u)",
-            "\(Macro.carbs.displayName) \(DietSemantics.fmt(t.c))\(u)",
-            "\(Macro.fat.displayName) \(DietSemantics.fmt(t.f))\(u)",
-        ]
-        if includeFiber {
-            parts.append("\(Macro.fiber.displayName) \(DietSemantics.fmt(t.fiber))\(u)")
+        return Macro.allCases.compactMap { macro in
+            if macro == .fiber && !includeFiber { return nil }
+            return Segment(macro: macro, text: "\(macro.displayName) \(DietSemantics.fmt(t.grams(for: macro)))\(u)")
         }
-        return parts.joined(separator: " · ")
+    }
+
+    static func format(_ t: MacroTotals, includeFiber: Bool = true, units: Bool = true) -> String {
+        segments(t, includeFiber: includeFiber, units: units).map(\.text).joined(separator: " · ")
     }
 }
 
@@ -408,4 +450,21 @@ struct DietGauges: Equatable, Sendable {
     var carbsBonus: CarbsBonus?
     var net: NetCalories
     var isCarbLoad: Bool
+
+    /// The gauge for a given macro — the seam that lets the rings row and the Macros
+    /// screen iterate `Macro.allCases` in canonical order instead of listing the four
+    /// gauges by hand (which is how the Fat-before-Fiber order slipped in).
+    func gauge(for macro: Macro) -> MetricGauge {
+        switch macro {
+        case .protein: return protein
+        case .carbs: return carbs
+        case .fiber: return fiber
+        case .fat: return fat
+        }
+    }
+
+    /// The four macro gauges in canonical display order (Protein, Carbs, Fiber, Fat).
+    var orderedMacros: [(macro: Macro, gauge: MetricGauge)] {
+        Macro.allCases.map { ($0, gauge(for: $0)) }
+    }
 }

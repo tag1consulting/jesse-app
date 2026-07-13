@@ -1,4 +1,5 @@
 import SwiftUI
+import UIKit
 
 // Shared building blocks for the Health tab. Every view here is a pure function of
 // its inputs — the numbers and statuses are computed upstream by `DietSemantics` /
@@ -286,11 +287,59 @@ struct MetricTile: View {
 
 /// Fixed macro-identity colors for the calorie-source bar and its legend —
 /// independent of the status bands so the breakdown never reads as a judgment.
+///
+/// Fiber is a subset of carbs, so its identity color is not an independent hue: it is
+/// the carbs color lightened toward white — the same teal family, clearly paler, so
+/// the bar reads as carbs and its paler kin sitting side by side. The shade is derived
+/// (not hand-picked) and resolved per color scheme: the carbs color is a system
+/// dynamic color, so the derivation runs inside a `UIColor` dynamic provider that
+/// resolves carbs in the active trait collection first, then lightens it. The result
+/// is fully opaque — the bar's fiber segment sits over other content, so it must never
+/// rely on alpha to look pale.
 enum MacroColor {
     static let protein = Color.indigo
     static let carbs = Color.teal
-    static let fiber = Color.brown
     static let fat = Color.orange
+    static let fiber = shade(ofSubEntry: carbs)
+
+    /// How far a sub-entry macro's color is lightened toward white (0 = unchanged,
+    /// 1 = white). High enough that carbs and fiber stay tellable apart at the bar's
+    /// rendered height in both light and dark mode.
+    static let subEntryLightenFraction: CGFloat = 0.5
+
+    /// Derive a sub-entry macro's identity color from its parent's: the parent color,
+    /// resolved per color scheme, lightened toward white and kept opaque.
+    static func shade(ofSubEntry parent: Color) -> Color {
+        Color(UIColor { traits in
+            UIColor(parent).resolvedColor(with: traits)
+                .lightenedTowardWhite(by: subEntryLightenFraction)
+        })
+    }
+
+    /// Identity color for a macro, so no view hardcodes one. Fiber returns its
+    /// carbs-derived shade.
+    static func color(for macro: Macro) -> Color {
+        switch macro {
+        case .protein: return protein
+        case .carbs: return carbs
+        case .fiber: return fiber
+        case .fat: return fat
+        }
+    }
+}
+
+private extension UIColor {
+    /// This color blended toward white by `fraction` (0 = unchanged, 1 = white),
+    /// staying fully opaque. Component blend in the resolved RGB space.
+    func lightenedTowardWhite(by fraction: CGFloat) -> UIColor {
+        var r: CGFloat = 0, g: CGFloat = 0, b: CGFloat = 0, a: CGFloat = 0
+        getRed(&r, green: &g, blue: &b, alpha: &a)
+        let f = min(max(fraction, 0), 1)
+        return UIColor(red: r + (1 - r) * f,
+                       green: g + (1 - g) * f,
+                       blue: b + (1 - b) * f,
+                       alpha: 1)
+    }
 }
 
 /// A single horizontal stacked bar of where the day's calories came from (protein /
@@ -301,26 +350,26 @@ enum MacroColor {
 /// (`HealthDisplay.calorieSplit`); this only draws it.
 struct CalorieSourceBar: View {
     let split: HealthDisplay.CalorieSplit
+    // Canonical order (Protein, Carbs, Fiber, Fat); the last segment fills the
+    // remaining width so rounding never leaves a hairline gap at the cap edge.
+    private var macros: [Macro] { Macro.allCases }
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
             GeometryReader { geo in
                 HStack(spacing: 0) {
-                    Rectangle().fill(MacroColor.protein)
-                        .frame(width: geo.size.width * split.proteinFraction)
-                    Rectangle().fill(MacroColor.carbs)
-                        .frame(width: geo.size.width * split.netCarbsFraction)
-                    Rectangle().fill(MacroColor.fiber)
-                        .frame(width: geo.size.width * split.fiberFraction)
-                    Rectangle().fill(MacroColor.fat)
+                    ForEach(Array(macros.enumerated()), id: \.element) { index, macro in
+                        Rectangle().fill(MacroColor.color(for: macro))
+                            .frame(width: index == macros.count - 1
+                                   ? nil : geo.size.width * split.fraction(for: macro))
+                    }
                 }
                 .clipShape(Capsule())
             }
             .frame(height: 12)
             HStack(spacing: 14) {
-                legendItem(Macro.protein.displayName, MacroColor.protein)
-                legendItem(Macro.carbs.displayName, MacroColor.carbs)
-                legendItem(Macro.fiber.displayName, MacroColor.fiber)
-                legendItem(Macro.fat.displayName, MacroColor.fat)
+                ForEach(macros, id: \.self) { macro in
+                    legendItem(macro)
+                }
             }
             .font(.caption2)
             .foregroundStyle(.secondary)
@@ -328,13 +377,42 @@ struct CalorieSourceBar: View {
         .accessibilityElement(children: .ignore)
         .accessibilityLabel("Calorie sources: protein \(pct(split.proteinFraction)), carbs \(pct(split.netCarbsFraction)), fiber \(pct(split.fiberFraction)), fat \(pct(split.fatFraction))")
     }
-    private func legendItem(_ label: String, _ color: Color) -> some View {
+    // The fiber entry reads as a sub-entry of carbs: it drops one hierarchy step
+    // dimmer than the three real macros (the legend already sits at the type ramp's
+    // floor — caption2 — so there's no smaller step to take here; the dimmer color
+    // carries the sub-entry cue).
+    private func legendItem(_ macro: Macro) -> some View {
         HStack(spacing: 4) {
-            Circle().fill(color).frame(width: 8, height: 8)
-            Text(label)
+            Circle().fill(MacroColor.color(for: macro)).frame(width: 8, height: 8)
+            Text(macro.displayName)
+                .foregroundStyle(macro.isSubEntry ? AnyShapeStyle(.tertiary) : AnyShapeStyle(.secondary))
         }
     }
     private func pct(_ f: Double) -> String { "\(Int((f * 100).rounded()))%" }
+}
+
+/// Renders a macro totals line as a single interpunct `Text` in the canonical order
+/// (Protein · Carbs · Fiber · Fat), styling the fiber term as a sub-entry of carbs:
+/// the three real-macro runs and the separators inherit the surrounding view's base
+/// font and color, while the fiber run takes `fiberFont` (one type-ramp step smaller,
+/// where the base has the headroom) and `fiberColor` (one hierarchy step dimmer).
+/// Fiber's gram number stays present — only its type changes. Ordering comes from
+/// `MacroLine.segments`, the same source the plain string uses, so a reorder can't
+/// diverge between the styled and unstyled forms.
+func macroCaptionText(_ totals: MacroTotals, includeFiber: Bool = true, units: Bool = true,
+                      fiberFont: Font, fiberColor: Color) -> Text {
+    let segments = MacroLine.segments(totals, includeFiber: includeFiber, units: units)
+    var line = AttributedString()
+    for (index, segment) in segments.enumerated() {
+        if index > 0 { line += AttributedString(" · ") }
+        var run = AttributedString(segment.text)
+        if segment.macro.isSubEntry {
+            run.font = fiberFont.monospacedDigit()
+            run.foregroundColor = fiberColor
+        }
+        line += run
+    }
+    return Text(line)
 }
 
 /// A full-width bar row for the macros-and-calories detail screen: goal chip,
@@ -342,13 +420,19 @@ struct CalorieSourceBar: View {
 /// flag. Tapping opens the row's explainer.
 struct MetricBarRow: View {
     let gauge: MetricGauge
+    /// When true (fiber), the row label reads as a sub-entry of carbs: one type-ramp
+    /// step smaller (subheadline → footnote) and in the secondary color. The bar, the
+    /// value, and its status color are untouched — only the label's type changes.
+    var isSubEntry: Bool = false
     var onTap: () -> Void = {}
     var body: some View {
         Button(action: onTap) {
             VStack(alignment: .leading, spacing: 6) {
                 HStack(spacing: 6) {
                     GoalChip(goal: gauge.goal)
-                    Text(gauge.label).font(.subheadline.weight(.semibold))
+                    Text(gauge.label)
+                        .font((isSubEntry ? Font.footnote : .subheadline).weight(.semibold))
+                        .foregroundStyle(isSubEntry ? AnyShapeStyle(.secondary) : AnyShapeStyle(.primary))
                     Spacer()
                     Text(valueTarget).font(.subheadline.monospacedDigit())
                         .foregroundStyle(statusColor(gauge.status))

@@ -26,19 +26,65 @@ final class MacroLabelTests: XCTestCase {
         }
     }
 
+    // MARK: - Canonical display order (fiber is a subset of carbs → sits after it)
+
+    func testCanonicalDisplayOrderIsProteinCarbsFiberFat() {
+        // The one source of truth for macro order. Fiber is a subset of carbs, so it
+        // sits immediately after carbs — never as a fourth peer after fat. Every
+        // user-facing listing derives its order from this.
+        XCTAssertEqual(Macro.allCases.map(\.displayName),
+                       ["Protein", "Carbs", "Fiber", "Fat"])
+    }
+
+    func testFiberIsTheSubEntryOfCarbs() {
+        // Fiber is a subset of carbs → a sub-entry of it; the other three are peers.
+        XCTAssertEqual(Macro.fiber.parent, .carbs)
+        XCTAssertTrue(Macro.fiber.isSubEntry)
+        for macro in [Macro.protein, .carbs, .fat] {
+            XCTAssertNil(macro.parent)
+            XCTAssertFalse(macro.isSubEntry)
+        }
+    }
+
+    // MARK: - Segments (the ordering source the styled caption view derives from)
+
+    func testSegmentsAreInCanonicalOrderWithFiberFlagged() {
+        let t = MacroTotals(cal: 0, p: 32, f: 12, c: 40, fiber: 6)
+        let segs = MacroLine.segments(t)
+        XCTAssertEqual(segs.map(\.macro), Macro.allCases)   // Protein, Carbs, Fiber, Fat
+        XCTAssertEqual(segs.map(\.text),
+                       ["Protein 32g", "Carbs 40g", "Fiber 6g", "Fat 12g"])
+        // Exactly the fiber segment is the sub-entry.
+        XCTAssertEqual(segs.filter { $0.macro.isSubEntry }.map(\.macro), [.fiber])
+    }
+
+    func testSegmentsOmitFiberWhenExcluded() {
+        let segs = MacroLine.segments(MacroTotals(cal: 0, p: 1, f: 3, c: 2, fiber: 4),
+                                      includeFiber: false)
+        XCTAssertEqual(segs.map(\.macro), [.protein, .carbs, .fat])
+    }
+
+    func testGramsForMacroMapsEachField() {
+        let t = MacroTotals(cal: 999, p: 1, f: 2, c: 3, fiber: 4)
+        XCTAssertEqual(t.grams(for: .protein), 1)
+        XCTAssertEqual(t.grams(for: .fat), 2)
+        XCTAssertEqual(t.grams(for: .carbs), 3)
+        XCTAssertEqual(t.grams(for: .fiber), 4)
+    }
+
     // MARK: - Full form (with gram units)
 
     func testFullFormWithUnits() {
         let t = MacroTotals(cal: 0, p: 32, f: 12, c: 40, fiber: 6)
         XCTAssertEqual(MacroLine.format(t),
-                       "Protein 32g · Carbs 40g · Fat 12g · Fiber 6g")
+                       "Protein 32g · Carbs 40g · Fiber 6g · Fat 12g")
     }
 
-    func testProteinCarbsFatFiberOrder() {
-        // Order is protein · carbs · fat · fiber (fat and carbs are NOT swapped).
+    func testProteinCarbsFiberFatOrder() {
+        // Order is protein · carbs · fiber · fat (fiber sits right after carbs).
         let t = MacroTotals(cal: 0, p: 1, f: 3, c: 2, fiber: 4)
         XCTAssertEqual(MacroLine.format(t),
-                       "Protein 1g · Carbs 2g · Fat 3g · Fiber 4g")
+                       "Protein 1g · Carbs 2g · Fiber 4g · Fat 3g")
     }
 
     // MARK: - Compact form (units dropped) and fiber omitted
@@ -46,7 +92,7 @@ final class MacroLabelTests: XCTestCase {
     func testCompactFormDropsUnits() {
         let t = MacroTotals(cal: 0, p: 32, f: 12, c: 40, fiber: 6)
         XCTAssertEqual(MacroLine.format(t, units: false),
-                       "Protein 32 · Carbs 40 · Fat 12 · Fiber 6")
+                       "Protein 32 · Carbs 40 · Fiber 6 · Fat 12")
     }
 
     func testFiberAbsentOmitsTheFiberTerm() {
@@ -59,7 +105,7 @@ final class MacroLabelTests: XCTestCase {
 
     func testZeroValuesRenderAsZero() {
         XCTAssertEqual(MacroLine.format(MacroTotals.zero),
-                       "Protein 0g · Carbs 0g · Fat 0g · Fiber 0g")
+                       "Protein 0g · Carbs 0g · Fiber 0g · Fat 0g")
     }
 
     // MARK: - Rounding parity with the rest of the Health tab
@@ -69,7 +115,7 @@ final class MacroLabelTests: XCTestCase {
         // fmt() used everywhere else, so the caption never disagrees with the rings.
         let t = MacroTotals(cal: 0, p: 32.4, f: 11.6, c: 39.5, fiber: 6.5)
         XCTAssertEqual(MacroLine.format(t),
-                       "Protein 32g · Carbs 40g · Fat 12g · Fiber 7g")
+                       "Protein 32g · Carbs 40g · Fiber 7g · Fat 12g")
         XCTAssertEqual(DietSemantics.fmt(t.p), "32")
         XCTAssertEqual(DietSemantics.fmt(t.c), "40")
         XCTAssertEqual(DietSemantics.fmt(t.f), "12")
