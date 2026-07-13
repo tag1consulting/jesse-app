@@ -407,39 +407,32 @@ pub fn parse_verify_verdicts(json: &str, n_entries: usize) -> Result<Vec<EntryVe
     Ok(out)
 }
 
-/// The result of applying one verdict to one candidate entry.
-#[derive(Debug, Clone, PartialEq)]
-pub enum EntryResolution {
-    /// Keep or use these (possibly corrected) macros — same item, safe to write.
-    Accept(DietEntry),
-    /// Structural problem (reject, or a non-trivially-safe correction) → rung 3.
-    FallThrough,
-}
-
-/// Apply a verdict to a candidate entry (probation semantics — every entry gated):
-///   * `Reject` → [`EntryResolution::FallThrough`] (rung 3).
-///   * `Approve` → keep the candidate, UNLESS the verifier's own kcal estimate is
-///     out of band ([`kcal_out_of_band`]); a contradictory approve is treated as a
+/// Apply a verdict to a candidate entry (probation semantics — every entry gated).
+/// `Some(entry)` = keep/use these (possibly corrected) macros (safe to write);
+/// `None` = a structural problem (a reject, or a non-trivially-safe correction) → the
+/// turn falls through to the hosted path (rung 3). Cases:
+///   * `Reject` → `None`.
+///   * `Approve` → keep the candidate, UNLESS the verifier's own kcal estimate is out
+///     of band ([`kcal_out_of_band`]); a contradictory approve is treated as a
 ///     correction so we never write numbers the verifier itself disputes.
 ///   * `Correct` → apply the corrected macros IF trivially safe (same item, only
-///     numbers change, and every corrected value is finite/non-negative); anything
-///     else is structural → [`EntryResolution::FallThrough`] (rung 3).
+///     numbers change, every corrected value finite/non-negative); else `None`.
 ///
-/// Only FOOD carries macros to correct; an exercise/weight entry is `Accept`ed on
-/// approve and `FallThrough`s on correct/reject (we don't auto-correct those in v1).
-pub fn resolve_verdict(entry: &DietEntry, v: &EntryVerdict) -> EntryResolution {
+/// Only FOOD carries macros to correct; an exercise/weight entry is kept on approve
+/// and falls through on correct/reject (we don't auto-correct those in v1).
+pub fn resolve_verdict(entry: &DietEntry, v: &EntryVerdict) -> Option<DietEntry> {
     if v.verdict == Verdict::Reject {
-        return EntryResolution::FallThrough;
+        return None;
     }
     match entry {
         DietEntry::Food(f) => resolve_food_verdict(f, v),
         // Non-food: approve keeps it; a correction we can't trivially apply → hosted.
-        _ if v.verdict == Verdict::Approve => EntryResolution::Accept(entry.clone()),
-        _ => EntryResolution::FallThrough,
+        _ if v.verdict == Verdict::Approve => Some(entry.clone()),
+        _ => None,
     }
 }
 
-fn resolve_food_verdict(f: &FoodEntry, v: &EntryVerdict) -> EntryResolution {
+fn resolve_food_verdict(f: &FoodEntry, v: &EntryVerdict) -> Option<DietEntry> {
     let needs_correction = match v.verdict {
         Verdict::Correct => true,
         // An "approve" whose kcal estimate disagrees with the candidate is really a
@@ -451,7 +444,7 @@ fn resolve_food_verdict(f: &FoodEntry, v: &EntryVerdict) -> EntryResolution {
         Verdict::Reject => unreachable!("reject handled in resolve_verdict"),
     };
     if !needs_correction {
-        return EntryResolution::Accept(DietEntry::Food(f.clone()));
+        return Some(DietEntry::Food(f.clone()));
     }
     // Trivially safe correction: same item, macros replaced with the verifier's
     // (finite, non-negative) numbers. `apply` re-validates each corrected value.
@@ -463,29 +456,14 @@ fn resolve_food_verdict(f: &FoodEntry, v: &EntryVerdict) -> EntryResolution {
         }
     };
     let corrected = FoodEntry {
-        kcal: match apply(f.kcal, v.kcal) {
-            Ok(x) => x,
-            Err(()) => return EntryResolution::FallThrough,
-        },
-        protein_g: match apply(f.protein_g, v.protein_g) {
-            Ok(x) => x,
-            Err(()) => return EntryResolution::FallThrough,
-        },
-        carbs_g: match apply(f.carbs_g, v.carbs_g) {
-            Ok(x) => x,
-            Err(()) => return EntryResolution::FallThrough,
-        },
-        fat_g: match apply(f.fat_g, v.fat_g) {
-            Ok(x) => x,
-            Err(()) => return EntryResolution::FallThrough,
-        },
-        fiber_g: match apply(f.fiber_g, v.fiber_g) {
-            Ok(x) => x,
-            Err(()) => return EntryResolution::FallThrough,
-        },
+        kcal: apply(f.kcal, v.kcal).ok()?,
+        protein_g: apply(f.protein_g, v.protein_g).ok()?,
+        carbs_g: apply(f.carbs_g, v.carbs_g).ok()?,
+        fat_g: apply(f.fat_g, v.fat_g).ok()?,
+        fiber_g: apply(f.fiber_g, v.fiber_g).ok()?,
         ..f.clone()
     };
-    EntryResolution::Accept(DietEntry::Food(corrected))
+    Some(DietEntry::Food(corrected))
 }
 
 // ---- CSV row builders ------------------------------------------------------
@@ -747,7 +725,7 @@ fn ceiling_color(pct: f64) -> &'static str {
 /// Color for the FAT window (50g floor, 65g soft cap, 70g hard): red too-low/too-high,
 /// yellow 65–70g, green 50–65g.
 fn fat_color(grams: f64) -> &'static str {
-    if grams < 50.0 || grams > 70.0 {
+    if !(50.0..=70.0).contains(&grams) {
         "🟥"
     } else if grams > 65.0 {
         "🟨"
@@ -1296,15 +1274,16 @@ pub async fn run_diet_pipeline(cfg: &Config, utterance: &str) -> DietPipelineOut
     let mut any_corrected = false;
     for (entry, v) in extract.entries.iter().zip(verdicts.iter()) {
         match resolve_verdict(entry, v) {
-            EntryResolution::Accept(e) => {
+            Some(e) => {
                 if e != *entry {
                     any_corrected = true;
                 }
                 verified.push(e);
             }
-            EntryResolution::FallThrough => {
-                let verdict = if v.verdict == Verdict::Reject { "rejected" } else { "rejected" };
-                prov(false, Some(3), verdict, extract.entries.len(), false);
+            None => {
+                // Any verify-stage fall-through (a reject, or a correction that wasn't
+                // trivially safe) is "rejected" for provenance — the turn is not logged.
+                prov(false, Some(3), "rejected", extract.entries.len(), false);
                 return DietPipelineOutcome::FallThrough { rung: DietRung::Verify };
             }
         }
@@ -1544,10 +1523,11 @@ mod tests {
     #[test]
     fn approve_in_band_keeps_the_candidate() {
         let e = food(105.0);
-        match resolve_verdict(&e, &verdict(Verdict::Approve, Some(110.0))) {
-            EntryResolution::Accept(a) => assert_eq!(a, e),
-            EntryResolution::FallThrough => panic!("in-band approve must keep candidate"),
-        }
+        assert_eq!(
+            resolve_verdict(&e, &verdict(Verdict::Approve, Some(110.0))),
+            Some(e),
+            "in-band approve must keep candidate"
+        );
     }
 
     #[test]
@@ -1556,7 +1536,7 @@ mod tests {
         // do not blindly write the candidate; the verifier's number is used instead.
         let e = food(105.0);
         match resolve_verdict(&e, &verdict(Verdict::Approve, Some(400.0))) {
-            EntryResolution::Accept(DietEntry::Food(f)) => assert_eq!(f.kcal, Some(400.0)),
+            Some(DietEntry::Food(f)) => assert_eq!(f.kcal, Some(400.0)),
             other => panic!("expected corrected kcal, got {other:?}"),
         }
     }
@@ -1565,7 +1545,7 @@ mod tests {
     fn correct_applies_verifier_numbers_same_item() {
         let e = food(105.0);
         match resolve_verdict(&e, &verdict(Verdict::Correct, Some(120.0))) {
-            EntryResolution::Accept(DietEntry::Food(f)) => {
+            Some(DietEntry::Food(f)) => {
                 assert_eq!(f.kcal, Some(120.0));
                 assert_eq!(f.name, "Banana", "item identity unchanged (trivially safe)");
                 assert_eq!(f.carbs_g, Some(27.0), "untouched macro keeps candidate value");
@@ -1576,17 +1556,14 @@ mod tests {
 
     #[test]
     fn reject_falls_through_to_hosted() {
-        assert_eq!(
-            resolve_verdict(&food(105.0), &verdict(Verdict::Reject, None)),
-            EntryResolution::FallThrough
-        );
+        assert_eq!(resolve_verdict(&food(105.0), &verdict(Verdict::Reject, None)), None);
     }
 
     #[test]
     fn correction_with_a_bad_number_is_not_trivially_safe() {
         let mut v = verdict(Verdict::Correct, Some(f64::NAN));
         v.kcal = Some(f64::NAN);
-        assert_eq!(resolve_verdict(&food(105.0), &v), EntryResolution::FallThrough);
+        assert_eq!(resolve_verdict(&food(105.0), &v), None);
     }
 
     #[test]
@@ -1882,15 +1859,32 @@ mod tests {
     #[test]
     fn rung3_a_single_reject_gates_the_whole_turn() {
         // Even one rejected entry means the turn falls through (rung 3): the pipeline
-        // never partially logs. Proven via resolve_verdict returning FallThrough.
+        // never partially logs. Proven via resolve_verdict returning None.
         let e = food(105.0);
-        assert_eq!(
-            resolve_verdict(&e, &verdict(Verdict::Reject, None)),
-            EntryResolution::FallThrough
-        );
+        assert_eq!(resolve_verdict(&e, &verdict(Verdict::Reject, None)), None);
     }
 
     // ---- Split -------------------------------------------------------------
+
+    // ---- Orchestrator (async glue) -----------------------------------------
+
+    #[tokio::test]
+    async fn pipeline_falls_through_at_rung2_when_extract_child_cannot_spawn() {
+        // End-to-end through the async orchestrator without any network: point the
+        // extract child at a non-existent binary so the spawn fails → the pipeline
+        // degrades to a rung-2 fall-through (today's hosted path), never a partial log.
+        let mut cfg = crate::testutil::test_config();
+        cfg.claude_bin = "/no/such/diet-extract-binary".to_string();
+        cfg.diet_backend = Some((
+            "http://127.0.0.1:9100".into(),
+            "dsv4-diet-dummy".into(),
+            "local-diet".into(),
+        ));
+        match run_diet_pipeline(&cfg, "logged a banana").await {
+            DietPipelineOutcome::FallThrough { rung } => assert_eq!(rung, DietRung::Child),
+            _ => panic!("a failed extract spawn must fall through at rung 2"),
+        }
+    }
 
     #[test]
     fn split_entries_groups_by_kind() {
