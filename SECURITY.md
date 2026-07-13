@@ -77,6 +77,59 @@ permitted tool can still do damage within its scope (e.g. `Bash(git:*)` can run
 arbitrary `git` subcommands, `Write` can overwrite vault files). Treat it as
 least-privilege within the vault, not as containment of a hostile agent.
 
+## Diet child tool isolation (in-process boundary)
+
+The diet-logging pipeline (see the bridge README) spawns two **stateless,
+single-shot** children — **extract** (parse a food/exercise/weigh-in utterance
+into per-item JSON) and **verify** (a hosted judgment on those items). Both are
+pure text-in / JSON-text-out and need **no tools at all**. This is a *stricter*
+posture than the main agent above, and it is built by the shared
+`build_diet_child_command`, so the guarantee holds for both children identically.
+
+**Deny-by-default at the CLI root, not by enumeration.** The child is launched
+with:
+
+| Flag | Effect |
+| --- | --- |
+| `--tools ""` | Disables the **entire** built-in toolset. No `Glob`/`Grep`/`Read`, no `Bash`/`Write`/`Edit`, no `ToolSearch`/`Workflow`/`Agent` exist to be invoked — removed at the root, not permission-gated. This is the load-bearing control. |
+| `--strict-mcp-config` + `--mcp-config '{"mcpServers":{}}'` | Loads **no** MCP servers, so every `mcp__*` tool — and anything `ToolSearch` could pull from a server — is absent at the root. |
+| empty `--allowedTools` + expanded `--disallowedTools` | Retained as documented, **fragile** belt-and-suspenders behind the two root flags. The denylist names tools, so it breaks silently on any CLI tool rename/addition; it is not the guarantee. |
+
+**Why the empty allowlist alone was not enough (and how we know).** The children
+were originally built with only an empty `--allowedTools` plus a seven-name
+denylist, on the assumption that an empty allowlist means "no tools". Live
+validation against the pinned CLI (`claude 2.1.207`, 2026-07-13) disproved it: an
+empty allowlist adds **nothing to the default set** rather than emptying it, and
+the read/search built-ins, `ToolSearch`, `Workflow`, and MCP loading do **not**
+raise the permission prompt a headless `-p` child cannot answer. A *run ls* probe
+executed `Glob`; a *fetch* probe reached `mcp__playwright__browser_navigate` and
+made a **live network fetch** with no approval; a *spawn a subagent* probe reached
+`Workflow`. Only `Write` was contained. `--tools ""` + strict-empty MCP closes all
+of these at the source.
+
+**The acceptance gate is a live probe battery, not the unit tests.** Because
+enumerated denial cannot be trusted to stay complete across CLI versions, any
+change to this posture must be re-validated by re-running six probes (`run ls`,
+`write … /tmp/…`, `fetch …`, `spawn a subagent`, `read /etc/hosts`, `ToolSearch
+… list files`) against the exact builder argv on the pinned CLI. PASS = **zero**
+executed `tool_use` across all six, the write-probe file absent, and no network
+egress. The current posture passes all six. (Note: the child may still *narrate*
+fake tool calls in its text and answer from training knowledge — e.g. quote
+`example.com`'s "Example Domain" without fetching — but no tool executes; the
+security property is that it cannot **act**, and its structured output is
+re-validated by the ambient verify gate and by trusted Rust before anything is
+written.) `claude 2.1.207` has no `--max-turns` flag, so the single-shot bound is
+by construction only, not CLI-enforced.
+
+**The title child is a different posture, deliberately.** The title one-shot
+(`run_claude_oneshot`) reuses `build_claude_args` — the **main-turn** scoped
+allowlist and the vault cwd — because it summarizes an already-produced reply and
+was never intended to be toolless. It therefore shares the main agent's tool
+surface (and, with it, the same CLI behavior around read/search/MCP tools), not
+the diet children's hard containment. Whether to tighten it is a separate
+decision; it does not carry the specific "empty allowlist assumed toolless" defect
+that the diet children did, because it never claimed to be toolless.
+
 ## Code review checkouts (review-only)
 
 The agent can review external source: clone/fetch a repo, then read/search/diff

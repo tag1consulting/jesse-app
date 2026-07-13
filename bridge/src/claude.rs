@@ -332,30 +332,92 @@ pub fn apply_diet_env(cmd: &mut Command, cfg: &Config) {
     }
 }
 
-/// Tools DENIED to the stateless diet children (extract + verify). The empty
-/// allowlist below already denies everything under `--permission-mode default`
-/// (an unlisted tool raises a permission prompt a headless `-p` child cannot
-/// answer, so it is denied — the same reasoning as the main allowlist in
-/// `config.rs`). This explicit class-level denylist is belt-and-suspenders: it
-/// removes the mutation / execution / network tool CLASSES outright regardless of
-/// how a given `claude` build interprets an empty `--allowedTools`, so a diet child
-/// can never write, run a shell, or reach the network. It receives its whole
-/// contract inline in the prompt and returns JSON text only.
+/// Tools DENIED to the stateless diet children (extract + verify), as
+/// belt-and-suspenders BEHIND the real boundary (`--tools ""`, see
+/// [`build_diet_child_command`]). Expanded past the original seven mutation /
+/// execution / network classes to also name the read/search built-ins and the
+/// orchestration tools that the old empty-`--allowedTools` posture left reachable:
+/// `Glob`, `Grep`, `Read`, `ToolSearch`, `Workflow`, `Agent`, `TodoWrite`, plus
+/// `Skill` (loads skill instruction text). `WebSearch` is already in the original
+/// seven.
+///
+/// KNOWN WEAKNESS — enumerated denial is fragile: it names tools, so it breaks
+/// SILENTLY whenever the CLI renames a tool, splits one, or adds a new one. The
+/// live proof of that fragility is right here — the vulnerability report's list
+/// also named `LS` and `NotebookRead`, but claude 2.1.207 has no such tools
+/// (verified: it warns `Permission deny rule "LS" matches no known tool`; directory
+/// listing and notebook reads fold into `Glob`/`Read`, which ARE denied). Naming a
+/// phantom tool is a no-op that also spams stderr on every child, so they are
+/// omitted here. Because this list cannot be trusted to stay complete across CLI
+/// versions, the actual guarantee is `--tools ""` (removes the whole built-in
+/// toolset at the root) + strict empty MCP, and the acceptance gate is the live
+/// six-probe battery re-run against the pinned CLI on every change to this posture.
 pub const DIET_CHILD_DISALLOWED_TOOLS: &str =
-    "Bash,Write,Edit,NotebookEdit,WebFetch,WebSearch,Task";
+    "Bash,Write,Edit,NotebookEdit,WebFetch,WebSearch,Task,Glob,Grep,Read,ToolSearch,Workflow,Agent,TodoWrite,Skill";
+
+/// An EMPTY MCP server set, passed as `--mcp-config` alongside `--strict-mcp-config`
+/// so the diet child loads NO MCP servers at all. `--strict-mcp-config` tells the CLI
+/// to use only servers declared here; this declares none — so every `mcp__*` tool,
+/// and anything `ToolSearch` could load from a server, is absent at the root rather
+/// than denied by name. (The vulnerability report saw a "fetch" probe reach
+/// `mcp__playwright__browser_navigate` and make a live network fetch under the old
+/// posture; strict empty MCP closes that at the source.)
+pub const DIET_CHILD_EMPTY_MCP_CONFIG: &str = r#"{"mcpServers":{}}"#;
 
 /// Build the base `Command` for a stateless diet CHILD (extract or verify): the
 /// same `stream-json` + `--permission-mode default` posture as every other child,
-/// but with an EMPTY `--allowedTools` (the child holds no tools at all) plus the
-/// class-level [`DIET_CHILD_DISALLOWED_TOOLS`] denylist. Unlike a turn or a title
-/// call it does NOT set the vault as cwd — the extract/verify contract is inlined
-/// in the prompt, so the child needs no vault context and must not auto-load the
-/// large vault `CLAUDE.md`; cwd is the neutral scratch base. Sets NO env overrides
-/// (callers layer `apply_diet_env` for extract, nothing for the ambient verify).
+/// but hard-contained so the child cannot act. Unlike a turn or a title call it does
+/// NOT set the vault as cwd — the extract/verify contract is inlined in the prompt,
+/// so the child needs no vault context and must not auto-load the large vault
+/// `CLAUDE.md`; cwd is the neutral scratch base. Sets NO env overrides (callers layer
+/// `apply_diet_env` for extract, nothing for the ambient verify).
+///
+/// # Containment posture — why these exact flags
+///
+/// The extract and verify children are single-shot, text-in / JSON-text-out. They
+/// need NO tools. The original posture tried to express that with an EMPTY
+/// `--allowedTools` plus a seven-name denylist, on the assumption that an empty
+/// allowlist under `--permission-mode default` means "allow nothing". Live
+/// validation against the pinned CLI (claude 2.1.207) on 2026-07-13 DISPROVED that
+/// assumption: an empty `--allowedTools` means "add nothing to the default set", not
+/// "allow nothing". A headless `-p` child still reached read/search built-ins (a
+/// "run ls" probe executed `Glob`), loaded MCP servers on demand via `ToolSearch` (a
+/// "fetch" probe drove `mcp__playwright__browser_navigate` to a live network fetch),
+/// and reached `Workflow` — none of which raise the permission prompt that a
+/// headless child cannot answer. Only `Write` was actually contained.
+///
+/// So the boundary is rebuilt at the ROOT, deny-by-default, not by enumeration:
+///   * `--tools ""` — disable the ENTIRE built-in toolset. This is the load-bearing
+///     flag (control-tested: dropping it alone lets the "run ls" probe execute
+///     `Glob` again). No built-in tool exists to be invoked, so read/search,
+///     `ToolSearch`, `Workflow`, and `Agent` are gone at the source rather than
+///     permission-gated.
+///   * `--strict-mcp-config` + an empty `--mcp-config` ([`DIET_CHILD_EMPTY_MCP_CONFIG`])
+///     — load NO MCP servers, so every `mcp__*` tool (and anything `ToolSearch`
+///     could pull from a server) is absent at the root.
+///   * `--disallowedTools` ([`DIET_CHILD_DISALLOWED_TOOLS`]) and an empty
+///     `--allowedTools` — retained as belt-and-suspenders behind the two above. The
+///     denylist is fragile by nature (see its docs); the root flags are the real
+///     guarantee, and the live six-probe battery is the acceptance gate.
+///
+/// Rejected alternatives:
+///   * Enumerated denylist only (the task's fallback (c)) — rejected: it breaks
+///     silently on any CLI tool rename/addition, and this very CLI already omits
+///     `LS`/`NotebookRead` from its tool namespace, so a name-based list cannot be
+///     trusted to stay complete. `--tools ""` sidesteps the namespace entirely.
+///   * `--bare` / `--safe-mode` — rejected: both alter auth resolution (`--bare`
+///     forces `ANTHROPIC_API_KEY`/`apiKeyHelper` and never reads OAuth/keychain),
+///     which would break the ambient-credential verify child. Containment must not
+///     change which backend a child talks to.
+///   * A single-turn cap for defense-in-depth — UNAVAILABLE: claude 2.1.207 exposes
+///     no `--max-turns` flag (verified via `--help`). The children are single-shot
+///     by construction, but the CLI offers no turn bound to enforce it, so the tool
+///     posture stands alone on that axis. (`--max-budget-usd` exists but bounds cost,
+///     not agentic turns, and is not a containment control.)
 pub fn build_diet_child_command(cfg: &Config, prompt: &str) -> Command {
     let mut cmd = Command::new(&cfg.claude_bin);
-    // Empty allowlist — the diet children hold NO tools (see the module const and
-    // the reasoning above). Ignore cfg.allowed_tools entirely.
+    // Empty allowlist — retained belt-and-suspenders; the real boundary is
+    // `--tools ""` below. Ignore cfg.allowed_tools entirely.
     let allowed = String::new();
     cmd.args([
         "-p".to_string(),
@@ -366,6 +428,14 @@ pub fn build_diet_child_command(cfg: &Config, prompt: &str) -> Command {
         "--include-partial-messages".to_string(),
         "--permission-mode".to_string(),
         "default".to_string(),
+        // ROOT boundary #1: disable the entire built-in toolset (deny-by-default).
+        "--tools".to_string(),
+        String::new(),
+        // ROOT boundary #2: load NO MCP servers (strict + empty config).
+        "--strict-mcp-config".to_string(),
+        "--mcp-config".to_string(),
+        DIET_CHILD_EMPTY_MCP_CONFIG.to_string(),
+        // Belt-and-suspenders behind the two root flags above.
         "--allowedTools".to_string(),
         allowed,
         "--disallowedTools".to_string(),
@@ -1280,6 +1350,13 @@ mod tests {
         args.iter().position(|a| a == flag).map(|i| args[i + 1].clone())
     }
 
+    /// True if a bare (valueless) flag appears anywhere in a Command's argv.
+    fn cmd_has_flag(cmd: &Command, flag: &str) -> bool {
+        cmd.as_std()
+            .get_args()
+            .any(|a| a.to_string_lossy() == flag)
+    }
+
     #[test]
     fn diet_extract_command_applies_env_triple_when_configured() {
         // With the override configured, the EXTRACT child's Command carries exactly
@@ -1338,6 +1415,78 @@ mod tests {
                 deny.split(',').any(|t| t.trim() == class),
                 "denylist must remove the {class} class: {deny:?}"
             );
+        }
+    }
+
+    /// The diet children in `[None, Some(diet_backend)]` config — i.e. both the
+    /// ambient VERIFY child and the env-layered EXTRACT child — are built by the
+    /// one shared `build_diet_child_command`, so asserting the posture on the
+    /// builder proves it for `run_diet_extract` AND `run_diet_verify` at once. This
+    /// helper yields both command forms so every containment test below covers both.
+    fn both_diet_child_commands() -> Vec<Command> {
+        let ambient = build_diet_child_command(&test_config(), "hi"); // verify posture
+        let mut extract = build_diet_child_command(&cfg_with_diet_backend(), "hi");
+        apply_diet_env(&mut extract, &cfg_with_diet_backend()); // extract posture
+        vec![ambient, extract]
+    }
+
+    #[test]
+    fn diet_child_disables_all_builtin_tools_at_root() {
+        // Deny-by-default at the tool-SET level: `--tools ""` removes every built-in
+        // tool from the child's toolset at the root, so read/search built-ins (Glob,
+        // Grep, Read, …), ToolSearch, Workflow and Agent do not exist to be invoked —
+        // not merely permission-gated. This is the load-bearing containment flag
+        // (live-proven: without it a "run ls" probe executes Glob).
+        for cmd in both_diet_child_commands() {
+            let tools = cmd_arg_value(&cmd, "--tools")
+                .expect("--tools must be present (deny-by-default toolset)");
+            assert_eq!(tools, "", "--tools must be EMPTY to disable all built-in tools");
+        }
+    }
+
+    #[test]
+    fn diet_child_loads_no_mcp_servers() {
+        // No MCP servers at the root: `--strict-mcp-config` tells the CLI to use ONLY
+        // servers from `--mcp-config`, and that config declares an EMPTY server set —
+        // so every `mcp__*` tool (and anything ToolSearch could load from a server) is
+        // gone at the root, not denied by name.
+        for cmd in both_diet_child_commands() {
+            assert!(
+                cmd_has_flag(&cmd, "--strict-mcp-config"),
+                "--strict-mcp-config must be present so only --mcp-config servers load"
+            );
+            let mcp = cmd_arg_value(&cmd, "--mcp-config")
+                .expect("--mcp-config must be present (empty server set)");
+            let parsed: serde_json::Value =
+                serde_json::from_str(&mcp).expect("--mcp-config value must be valid JSON");
+            let servers = parsed.get("mcpServers").and_then(|v| v.as_object());
+            assert!(
+                servers.map(|m| m.is_empty()).unwrap_or(true),
+                "the MCP config must declare NO servers: {mcp:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn diet_child_denylist_covers_read_search_and_orchestration_classes() {
+        // Belt-and-suspenders behind `--tools ""`: the enumerated denylist is expanded
+        // past the original seven mutation/exec/network classes to also name the
+        // read/search built-ins and the orchestration tools that the old empty-allowlist
+        // posture left reachable (Glob, Grep, Read, ToolSearch, Workflow, Agent,
+        // TodoWrite, Skill). Enumerated denial is fragile — it breaks silently when the
+        // CLI renames or adds tools — which is exactly why `--tools ""` above is the
+        // real guarantee and the live probe battery is the acceptance gate.
+        for cmd in both_diet_child_commands() {
+            let deny = cmd_arg_value(&cmd, "--disallowedTools").expect("--disallowedTools present");
+            let names: Vec<&str> = deny.split(',').map(|t| t.trim()).collect();
+            for class in [
+                "Glob", "Grep", "Read", "ToolSearch", "Workflow", "Agent", "TodoWrite", "Skill",
+            ] {
+                assert!(
+                    names.contains(&class),
+                    "expanded denylist must name the {class} class: {names:?}"
+                );
+            }
         }
     }
 
