@@ -29,6 +29,11 @@ use crate::*;
             // No title-backend override by default — tests that need one set it
             // explicitly, mirroring an unconfigured (ambient-backend) deploy.
             title_backend: None,
+            // No diet-extract backend override by default — the pipeline is dormant
+            // (kill switch), so tests exercise today's hosted path unless they set it.
+            diet_backend: None,
+            // Probation on by default, matching from_env's default.
+            diet_probation: true,
         }
     }
     pub(crate) fn test_state() -> AppState {
