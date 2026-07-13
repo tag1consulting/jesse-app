@@ -324,9 +324,12 @@ pub fn apply_title_env(cmd: &mut Command, cfg: &Config) {
 /// and the hosted verify child keep inheriting the ambient process env. A no-op
 /// when unset. Call this ONLY on the extract path; a main turn or the verify child
 /// must never invoke it (the main-turn isolation property, mirrored from title).
-pub fn apply_diet_env(_cmd: &mut Command, _cfg: &Config) {
-    // STUB (failing-first): does nothing until the real env layering lands, so the
-    // "extract child carries the diet ANTHROPIC_* triple" test fails red first.
+pub fn apply_diet_env(cmd: &mut Command, cfg: &Config) {
+    if let Some((base_url, auth_token, model)) = &cfg.diet_backend {
+        cmd.env("ANTHROPIC_BASE_URL", base_url)
+            .env("ANTHROPIC_AUTH_TOKEN", auth_token)
+            .env("ANTHROPIC_MODEL", model);
+    }
 }
 
 /// Tools DENIED to the stateless diet children (extract + verify). The empty
@@ -351,9 +354,9 @@ pub const DIET_CHILD_DISALLOWED_TOOLS: &str =
 /// (callers layer `apply_diet_env` for extract, nothing for the ambient verify).
 pub fn build_diet_child_command(cfg: &Config, prompt: &str) -> Command {
     let mut cmd = Command::new(&cfg.claude_bin);
-    // Empty allowlist — the diet children hold NO tools. STUB (failing-first): this
-    // currently passes the full main allowlist so the empty-allowlist test reds first.
-    let allowed = cfg.allowed_tools.clone();
+    // Empty allowlist — the diet children hold NO tools (see the module const and
+    // the reasoning above). Ignore cfg.allowed_tools entirely.
+    let allowed = String::new();
     cmd.args([
         "-p".to_string(),
         prompt.to_string(),
