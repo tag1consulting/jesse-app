@@ -127,9 +127,13 @@ pub struct DietExtract {
 /// qualifiers — `Salmon sockeye (Fiorfiore, canned)` is one item whose comma lives
 /// inside the brand note — then flag a comma or a conjunction token (` and `,
 /// ` + `, ` & `, ` with `) in what remains (`Eggs and toast`, `Rice, chicken`).
-pub fn name_is_aggregated(_name: &str) -> bool {
-    // STUB (failing-first): claims nothing is aggregated until the real rule lands.
-    false
+pub fn name_is_aggregated(name: &str) -> bool {
+    let bare = strip_parens(name).to_lowercase();
+    bare.contains(',')
+        || bare.contains(" and ")
+        || bare.contains(" + ")
+        || bare.contains('&')
+        || bare.contains(" with ")
 }
 
 /// Remove balanced `(...)` groups from a string (one level; these names never nest).
@@ -339,9 +343,9 @@ fn parse_weight(m: &serde_json::Map<String, Value>) -> Result<WeightEntry, Strin
 /// an absolute 75 kcal — so a small absolute gap on a small item passes even if it
 /// exceeds 20%, and a large item is held to the tighter 20%. A difference exactly
 /// equal to the threshold is in band (the spec says "more than").
-pub fn kcal_out_of_band(_candidate: f64, _reference: f64) -> bool {
-    // STUB (failing-first): claims everything is in band until the real math lands.
-    false
+pub fn kcal_out_of_band(candidate: f64, reference: f64) -> bool {
+    let tolerance = (0.20 * reference.abs()).max(75.0);
+    (candidate - reference).abs() > tolerance
 }
 
 /// One verifier verdict for one candidate entry.
@@ -590,12 +594,40 @@ fn meal_slug(meal: &str) -> String {
 /// `<date>-<mealslug>-<HHMM>-<seq>`, unique per row so two rows always yield two
 /// distinct mirror meals.
 pub fn build_meal_log_from_food_rows(
-    _rows: &[FoodEntry],
-    _date: &str,
-    _offset: &str,
+    rows: &[FoodEntry],
+    date: &str,
+    offset: &str,
 ) -> Result<Option<MealLog>, String> {
-    // STUB (failing-first): never derives a mirror until the real builder lands.
-    Ok(None)
+    if rows.is_empty() {
+        return Ok(None);
+    }
+    if rows.len() > MAX_MEALS {
+        return Err(format!(
+            "{} food rows exceeds the {MAX_MEALS}-meal mirror cap",
+            rows.len()
+        ));
+    }
+    let meals = rows
+        .iter()
+        .enumerate()
+        .map(|(i, r)| {
+            let hhmm: String = r.time.chars().filter(|c| c.is_ascii_digit()).collect();
+            Meal {
+                // Unique per row (`<date>-<slug>-<HHMM>-<seq>`) so two rows in the same
+                // slot never collide → two rows always yield two distinct meals.
+                id: format!("{date}-{}-{hhmm}-{}", meal_slug(&r.meal), i + 1),
+                consumed_at: format!("{date}T{}:00{offset}", r.time),
+                name: format!("{}: {}", r.meal, r.name),
+                // Macros EQUAL to the row (omit unknown — never null-pad).
+                kcal: r.kcal,
+                protein_g: r.protein_g,
+                carbs_g: r.carbs_g,
+                fat_g: r.fat_g,
+                fiber_g: r.fiber_g,
+            }
+        })
+        .collect();
+    Ok(Some(MealLog { meals }))
 }
 
 // ---- Deterministic ASCII dashboard (rendered from the CSVs) -----------------
@@ -737,9 +769,69 @@ fn pct_of(intake: f64, target: f64) -> f64 {
 /// its goal marker; when absent it renders the plain total. Calories round to whole
 /// numbers; macro grams render as their raw value. The child never writes this — it
 /// is derived here from the CSVs.
-pub fn render_diet_dashboard(_date: &str, _totals: &MacroTotals, _targets: &DietTargets) -> String {
-    // STUB (failing-first): empty until the real renderer lands.
-    String::new()
+pub fn render_diet_dashboard(date: &str, totals: &MacroTotals, targets: &DietTargets) -> String {
+    let mut out = format!("=== Diet — {date} ===\n\n");
+
+    // Calories — a ceiling metric (round to whole numbers, like the generator).
+    match targets.cal {
+        Some(t) => {
+            let pct = pct_of(totals.kcal, t);
+            out.push_str(&format!(
+                "Cal      ≤ {}   {} {} / {}  ({:.0}%)\n",
+                t.round() as i64,
+                bar(pct, ceiling_color(pct)),
+                totals.kcal.round() as i64,
+                t.round() as i64,
+                pct
+            ));
+        }
+        None => out.push_str(&format!("Cal          {} kcal\n", totals.kcal.round() as i64)),
+    }
+
+    // Floor metrics: protein, carbs, fiber.
+    for (label, intake, target) in [
+        ("Protein", totals.protein_g, targets.protein),
+        ("Carbs", totals.carbs_g, targets.carbs),
+        ("Fiber", totals.fiber_g, targets.fiber),
+    ] {
+        match target {
+            Some(t) => {
+                let pct = pct_of(intake, t);
+                out.push_str(&format!(
+                    "{label:<8} ≥ {}    {} {} / {}g  ({:.0}%)\n",
+                    fmt_g(t),
+                    bar(pct, floor_color(pct)),
+                    fmt_g(intake),
+                    fmt_g(t),
+                    pct
+                ));
+            }
+            None => out.push_str(&format!("{label:<8}     {}g\n", fmt_g(intake))),
+        }
+    }
+
+    // Fat — a window metric (colors red when too LOW as well as too high).
+    match targets.fat {
+        Some(t) => {
+            let pct = pct_of(totals.fat_g, t);
+            out.push_str(&format!(
+                "Fat      ↕ 50–65 {} {} / {}g  ({:.0}%)\n",
+                bar(pct, fat_color(totals.fat_g)),
+                fmt_g(totals.fat_g),
+                fmt_g(t),
+                pct
+            ));
+        }
+        None => out.push_str(&format!("Fat          {}g\n", fmt_g(totals.fat_g))),
+    }
+
+    out
+}
+
+/// Render a gram value like the vault does: whole numbers without a trailing `.0`,
+/// one decimal otherwise.
+fn fmt_g(n: f64) -> String {
+    format!("{n}")
 }
 
 // ---- Atomic append + rollback ----------------------------------------------
