@@ -15,6 +15,41 @@ CI both run it). See the "Versioning" section of `bridge/README.md`.
 
 ## [Unreleased]
 
+## [Bridge 0.8.1] — 2026-07-13
+
+### Security
+- **Hard-contain the stateless diet children at the CLI root (sandbox-escape
+  class: incomplete tool denial).** The diet **extract** and **verify** children
+  were built with an empty `--allowedTools` plus a seven-name `--disallowedTools`
+  list, on the assumption that an empty allowlist under `--permission-mode default`
+  yields a child that holds no tools. Live validation against the pinned CLI
+  (`claude 2.1.207`) on 2026-07-13 disproved that: an empty allowlist means "add
+  nothing to the **default** tool set", not "allow nothing". A headless `-p` child
+  still reached the read/search built-ins (a *run ls* probe executed `Glob`),
+  loaded MCP servers on demand via `ToolSearch` (a *fetch* probe drove
+  `mcp__playwright__browser_navigate` to a **live network fetch**, no approval),
+  and reached `Workflow` — none of which raise the permission prompt a headless
+  child cannot answer. Only `Write` was actually contained. **Fix:** rebuild the
+  boundary deny-by-default at the root, applied to **both** children via the shared
+  `build_diet_child_command`:
+  - `--tools ""` disables the **entire** built-in toolset (the load-bearing flag —
+    control-tested: dropping it alone lets the `Glob` escape recur);
+  - `--strict-mcp-config` + an empty `--mcp-config` (`{"mcpServers":{}}`) load **no**
+    MCP servers, so every `mcp__*` tool — and anything `ToolSearch` could pull from a
+    server — is absent at the root;
+  - the `--disallowedTools` denylist is expanded (adds `Glob`, `Grep`, `Read`,
+    `ToolSearch`, `Workflow`, `Agent`, `TodoWrite`, `Skill`) and kept, with the empty
+    `--allowedTools`, as documented fragile belt-and-suspenders behind the two root
+    flags.
+  Re-validated live with a six-probe battery run against the exact builder argv:
+  zero executed `tool_use` across all six probes, the write-probe file absent, and
+  no network egress. `claude 2.1.207` exposes no `--max-turns` flag, so the
+  single-shot bound cannot be CLI-enforced; the children are single-shot by
+  construction and each probe completed in `num_turns=1`. **The kill switch is
+  unchanged** — with `JESSE_DIET_*` unset (the default) the pipeline is dormant and
+  every turn takes the hosted path byte-for-byte; the main-turn and title command
+  construction are untouched (proven by the existing byte-identical tests).
+
 ## [App 1.0 (34)] — 2026-07-13
 
 ### Added
