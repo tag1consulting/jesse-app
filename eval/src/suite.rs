@@ -42,6 +42,31 @@ pub enum Assertion {
     FileMatches { path: String, pattern: String },
     /// Total tool-call count must be <= this ceiling.
     MaxToolCalls { max: u32 },
+    /// A numeric value — capture group 1 of `pattern`, parsed as an f64 — must
+    /// fall within the inclusive band `[min, max]`. When `path` is set the value
+    /// is captured from that workspace file; otherwise from the final answer.
+    /// This is the mechanical macro-band check (e.g. logged Calories in range),
+    /// replacing brittle regex-alternation of every acceptable number.
+    NumberInRange {
+        #[serde(default)]
+        path: Option<String>,
+        pattern: String,
+        min: f64,
+        max: f64,
+    },
+    /// Two numbers must agree within `tolerance`: capture group 1 of
+    /// `file_pattern` from the workspace file at `path`, and capture group 1 of
+    /// `answer_pattern` from the final answer. Passes iff both parse and their
+    /// absolute difference is `<= tolerance` (default `0.0` = exact). This is the
+    /// mirror-vs-CSV consistency check — the emitted `JESSE_MEAL_LOG` macro must
+    /// equal the appended row's macro.
+    NumbersConsistent {
+        path: String,
+        file_pattern: String,
+        answer_pattern: String,
+        #[serde(default)]
+        tolerance: f64,
+    },
     /// A terminal `result` line must have arrived at all.
     Completed,
 }
@@ -169,7 +194,10 @@ mod tests {
     fn vault_refuses_write() {
         let t = task_with(Workspace::VaultReadonly, &["Read", "Write"]);
         let err = t.validate().unwrap_err();
-        assert!(err.contains("Write"), "error should name the offending tool: {err}");
+        assert!(
+            err.contains("Write"),
+            "error should name the offending tool: {err}"
+        );
     }
 
     #[test]

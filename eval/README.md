@@ -51,6 +51,8 @@ Outputs: `<out>/results.json` (one record per task) and `<out>/scorecard.md`
 | `file_equals` | `path`, `content` | workspace file has exactly this content |
 | `file_matches` | `path`, `pattern` | regex matches the workspace file's content |
 | `max_tool_calls` | `max` | tool-call count ≤ `max` |
+| `number_in_range` | `path?`, `pattern`, `min`, `max` | capture group 1 of `pattern`, parsed as a number, is within `[min, max]` (inclusive); read from workspace file `path` if set, else from the final answer |
+| `numbers_consistent` | `path`, `file_pattern`, `answer_pattern`, `tolerance?` | capture group 1 of `file_pattern` (from file `path`) and of `answer_pattern` (from the final answer) both parse and differ by ≤ `tolerance` (default `0`) |
 | `completed` | — | a terminal `result` line arrived |
 
 Regexes use the Rust `regex` crate (no lookaround). Flags like `(?i)` / `(?m)`
