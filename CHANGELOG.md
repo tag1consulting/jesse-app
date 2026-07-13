@@ -15,6 +15,47 @@ CI both run it). See the "Versioning" section of `bridge/README.md`.
 
 ## [Unreleased]
 
+## [Bridge 0.8.0] — 2026-07-13
+
+### Added
+- **Local diet-logging pipeline (behind an env seam, dormant by default).** When
+  `JESSE_DIET_BASE_URL` / `JESSE_DIET_AUTH_TOKEN` / `JESSE_DIET_MODEL` are all set,
+  a diet-shaped "Tell" (food / exercise / weigh-in) is handled by a local pipeline
+  instead of a hosted agent turn:
+  1. **Extract** — a stateless, **toolless** child (empty `--allowedTools`, pointed
+     only at the diet backend via `apply_diet_env`) parses the utterance into
+     structured **per-item** JSON entries (`build_diet_extract_prompt`); the schema
+     rejects aggregation (one entry per food, never a meal total).
+  2. **Verify** — a **hosted, ambient** one-shot (never the diet backend) checks
+     every entry (probation mode: blocking, 100%) with an approve/correct/reject
+     verdict; a correction is applied only when trivially safe (same item, adjusted
+     numbers within a 20%-or-75-kcal tolerance), else it falls through.
+  3. **Append** — trusted Rust appends the verified rows RFC-4180-style to
+     `diet-logs/*.csv` (atomic per turn, with rollback), runs the three pinned node
+     scripts (`generate` → `validate` → `verify`), and commits one-per-log-event.
+  4. **Mirror** — the `JESSE_MEAL_LOG v1` directive is **derived by the bridge** from
+     the appended food rows (one mirror meal per row, macros equal to the row,
+     reusing the existing `MealLog` struct), so per-item mirroring is guaranteed by
+     construction, not trust.
+- **The env seam is the kill switch.** With the triple unset (the default) the diet
+  gate never fires and every turn — diet-shaped or not — takes today's hosted path
+  byte-for-byte on the spawned command (proven by
+  `main_turn_command_is_unaffected_by_diet_backend` and a byte-identical-command
+  test). No redeploy needed to disable the feature.
+- **Fallback ladder.** Every failure lands on a defined rung: gate-unsure/`mode != tell`
+  (1), extract error / malformed / `no_loggable_content` (2), verify reject or unsafe
+  correction (3), append/hook failure — rolled back, no commit (4), or mirror-build
+  failure after a good append — CSV kept, mirror omitted (5). Rungs 1–4 fall through
+  to the hosted turn; a log is never lost and never double-appended.
+- **Provenance.** One stderr line per diet turn (mirroring the title line; token
+  never printed, no meal content): `jesse-bridge: diet turn -> <local|hosted-fallback
+  rung=N> extract base_url=<u> model=<m>; verify verdict=<...>; rows=<n>
+  mirror=<derived|omitted>`.
+- `JESSE_DIET_PROBATION` (default `true`) — mandatory blocking verify; the false
+  (graduation) state is reserved and not used yet.
+
+Nothing here changes runtime behavior until the `JESSE_DIET_*` triple is set.
+
 ## [App 1.0 (33)] — 2026-07-13
 
 ### Added

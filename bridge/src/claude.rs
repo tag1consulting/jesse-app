@@ -317,6 +317,211 @@ pub fn apply_title_env(cmd: &mut Command, cfg: &Config) {
     }
 }
 
+/// Layer the DIET-extract backend override onto the stateless extract child's
+/// `Command`. Exact analogue of [`apply_title_env`], keyed off `cfg.diet_backend`
+/// (all three `JESSE_DIET_*` vars set → `Some`). When configured, the extract
+/// child — and ONLY that child — talks to the override backend; every main turn
+/// and the hosted verify child keep inheriting the ambient process env. A no-op
+/// when unset. Call this ONLY on the extract path; a main turn or the verify child
+/// must never invoke it (the main-turn isolation property, mirrored from title).
+pub fn apply_diet_env(cmd: &mut Command, cfg: &Config) {
+    if let Some((base_url, auth_token, model)) = &cfg.diet_backend {
+        cmd.env("ANTHROPIC_BASE_URL", base_url)
+            .env("ANTHROPIC_AUTH_TOKEN", auth_token)
+            .env("ANTHROPIC_MODEL", model);
+    }
+}
+
+/// Tools DENIED to the stateless diet children (extract + verify). The empty
+/// allowlist below already denies everything under `--permission-mode default`
+/// (an unlisted tool raises a permission prompt a headless `-p` child cannot
+/// answer, so it is denied — the same reasoning as the main allowlist in
+/// `config.rs`). This explicit class-level denylist is belt-and-suspenders: it
+/// removes the mutation / execution / network tool CLASSES outright regardless of
+/// how a given `claude` build interprets an empty `--allowedTools`, so a diet child
+/// can never write, run a shell, or reach the network. It receives its whole
+/// contract inline in the prompt and returns JSON text only.
+pub const DIET_CHILD_DISALLOWED_TOOLS: &str =
+    "Bash,Write,Edit,NotebookEdit,WebFetch,WebSearch,Task";
+
+/// Build the base `Command` for a stateless diet CHILD (extract or verify): the
+/// same `stream-json` + `--permission-mode default` posture as every other child,
+/// but with an EMPTY `--allowedTools` (the child holds no tools at all) plus the
+/// class-level [`DIET_CHILD_DISALLOWED_TOOLS`] denylist. Unlike a turn or a title
+/// call it does NOT set the vault as cwd — the extract/verify contract is inlined
+/// in the prompt, so the child needs no vault context and must not auto-load the
+/// large vault `CLAUDE.md`; cwd is the neutral scratch base. Sets NO env overrides
+/// (callers layer `apply_diet_env` for extract, nothing for the ambient verify).
+pub fn build_diet_child_command(cfg: &Config, prompt: &str) -> Command {
+    let mut cmd = Command::new(&cfg.claude_bin);
+    // Empty allowlist — the diet children hold NO tools (see the module const and
+    // the reasoning above). Ignore cfg.allowed_tools entirely.
+    let allowed = String::new();
+    cmd.args([
+        "-p".to_string(),
+        prompt.to_string(),
+        "--output-format".to_string(),
+        "stream-json".to_string(),
+        "--verbose".to_string(),
+        "--include-partial-messages".to_string(),
+        "--permission-mode".to_string(),
+        "default".to_string(),
+        "--allowedTools".to_string(),
+        allowed,
+        "--disallowedTools".to_string(),
+        DIET_CHILD_DISALLOWED_TOOLS.to_string(),
+    ])
+    .current_dir(cfg.scratch_base()) // neutral cwd → no vault CLAUDE.md auto-load
+    .stdout(Stdio::piped())
+    .stderr(Stdio::piped())
+    .kill_on_drop(true);
+    cmd
+}
+
+/// Spawn a pre-built stateless one-shot `Command` and return its answer text.
+/// Shared by [`run_diet_extract`] and [`run_diet_verify`]: it reuses the exact same
+/// `stream-json` line reading, terminal-`result` classification
+/// (`parse_stream_line` + `resolve_stream_outcome`), and bounded-reap discipline as
+/// a turn, but creates no job, pushes no stream, resumes no session, persists
+/// nothing. The caller has already layered any env override (or none) and set the
+/// tool posture on `cmd`. No retry loop — a diet one-shot is best-effort and the
+/// pipeline degrades to the hosted path on any non-2xx. `label` names the child in
+/// the timeout message.
+async fn run_stateless_oneshot(
+    cfg: &Config,
+    mut cmd: Command,
+    timeout_secs: u64,
+    label: &str,
+) -> Result<String, ApiError> {
+    let mut child = cmd.spawn().map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("failed to spawn {}: {e}", cfg.claude_bin),
+        )
+    })?;
+    let (Some(stdout), Some(stderr)) = (child.stdout.take(), child.stderr.take()) else {
+        return Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "claude child stdout/stderr pipe was not captured".to_string(),
+        ));
+    };
+
+    // Drain stderr concurrently (capped) so a chatty stderr can't deadlock stdout
+    // and the no-`result` fallback has the failure cause.
+    let stderr_task = tokio::spawn(async move {
+        let mut reader = BufReader::new(stderr);
+        let mut buf = Vec::new();
+        let _ = reader.read_to_end(&mut buf).await;
+        let cap = buf.len().min(MAX_OUTPUT_BYTES);
+        String::from_utf8_lossy(&buf[..cap]).into_owned()
+    });
+
+    // Read stdout line by line into a LOCAL buffer, stopping at the terminal
+    // `result` line — the same completion rule as a turn.
+    let read_lines = async {
+        let mut lines = BufReader::new(stdout).lines();
+        let mut terminal: Option<ClaudeOutcome> = None;
+        let mut streamed = String::new();
+        loop {
+            let next = lines
+                .next_line()
+                .await
+                .map_err(|e| (StatusCode::BAD_GATEWAY, format!("claude io error: {e}")))?;
+            let Some(line) = next else { break };
+            match parse_stream_line(&line) {
+                StreamEvent::TextDelta(t) => {
+                    if streamed.len() < MAX_OUTPUT_BYTES {
+                        streamed.push_str(&t);
+                    }
+                }
+                StreamEvent::Done(outcome) => {
+                    terminal = Some(outcome);
+                    break;
+                }
+                StreamEvent::ToolActivity { .. } | StreamEvent::Ignore => {}
+            }
+        }
+        Ok::<(Option<ClaudeOutcome>, String), ApiError>((terminal, streamed))
+    };
+
+    let (terminal, streamed) = match timeout(Duration::from_secs(timeout_secs), read_lines).await {
+        Ok(r) => r?,
+        Err(_) => {
+            return Err((
+                StatusCode::GATEWAY_TIMEOUT,
+                format!("{label} exceeded the {timeout_secs}s limit"),
+            ));
+        }
+    };
+
+    // Bounded reap — once the authoritative result is in, a lingering child must
+    // never delay delivery. Mirrors the turn / title paths.
+    const REAP_TIMEOUT: Duration = Duration::from_secs(5);
+    let stderr = if terminal.is_some() {
+        tokio::spawn(async move {
+            if timeout(REAP_TIMEOUT, child.wait()).await.is_err() {
+                let _ = child.start_kill();
+            }
+            stderr_task.abort();
+        });
+        String::new()
+    } else {
+        if timeout(REAP_TIMEOUT, child.wait()).await.is_err() {
+            let _ = child.start_kill();
+        }
+        match timeout(REAP_TIMEOUT, stderr_task).await {
+            Ok(joined) => joined.unwrap_or_default(),
+            Err(_) => String::new(),
+        }
+    };
+
+    match resolve_stream_outcome(terminal, &streamed, &stderr) {
+        ClaudeOutcome::Ok { result, .. } => Ok(result),
+        ClaudeOutcome::Fatal { message } | ClaudeOutcome::Retryable { message, .. } => {
+            Err((StatusCode::BAD_GATEWAY, message))
+        }
+    }
+}
+
+/// The stateless diet EXTRACT one-shot: parse a raw food/exercise/weigh-in
+/// utterance into structured JSON entries. Runs a toolless child
+/// ([`build_diet_child_command`]) pointed at the diet-extract backend
+/// ([`apply_diet_env`]) when configured; returns the child's raw JSON text for the
+/// pipeline to validate. Emits ONE provenance line (base URL + model, never the
+/// token, no utterance content) so an audit can tell which backend served the
+/// extraction. Any spawn/timeout/upstream failure is a non-2xx the pipeline treats
+/// as ladder rung 2 (fall through to the hosted turn).
+pub async fn run_diet_extract(
+    cfg: &Config,
+    prompt: &str,
+    timeout_secs: u64,
+) -> Result<String, ApiError> {
+    let mut cmd = build_diet_child_command(cfg, prompt);
+    apply_diet_env(&mut cmd, cfg);
+    match &cfg.diet_backend {
+        Some((base_url, _token, model)) => eprintln!(
+            "jesse-bridge: diet extract → override backend base_url={base_url} model={model}"
+        ),
+        None => eprintln!("jesse-bridge: diet extract → ambient backend (no JESSE_DIET_* override)"),
+    }
+    run_stateless_oneshot(cfg, cmd, timeout_secs, "diet extraction").await
+}
+
+/// The stateless diet VERIFY one-shot: a hosted judgment call that never touches
+/// the diet (or title) backend. Runs a toolless child with NO env override, so it
+/// uses the AMBIENT credentials — that is the whole point of the verify gate: the
+/// candidate entries came from a cheap local model, and a trusted hosted model
+/// checks them before anything is written. Returns the child's raw JSON verdicts.
+pub async fn run_diet_verify(
+    cfg: &Config,
+    prompt: &str,
+    timeout_secs: u64,
+) -> Result<String, ApiError> {
+    // Deliberately NO apply_diet_env / apply_title_env — the verify child is ambient.
+    let cmd = build_diet_child_command(cfg, prompt);
+    run_stateless_oneshot(cfg, cmd, timeout_secs, "diet verification").await
+}
+
 /// Invoke headless Claude Code in the vault, streaming its output. Returns
 /// (reply_text, session_id). Pass session_id to continue a thread; the returned
 /// id is always captured so the client can follow up later. Resuming keeps
@@ -1050,6 +1255,139 @@ mod tests {
                     "main-turn command must NOT carry {k} even when title backend is set"
                 );
             }
+        }
+    }
+
+    // ---- Diet extract/verify children --------------------------------------
+
+    fn cfg_with_diet_backend() -> Config {
+        let mut cfg = test_config();
+        cfg.diet_backend = Some((
+            "http://127.0.0.1:9100".to_string(),
+            "dsv4-diet-dummy".to_string(),
+            "local-diet".to_string(),
+        ));
+        cfg
+    }
+
+    /// Extract the value following a flag in a Command's argv, or `None`.
+    fn cmd_arg_value(cmd: &Command, flag: &str) -> Option<String> {
+        let args: Vec<String> = cmd
+            .as_std()
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        args.iter().position(|a| a == flag).map(|i| args[i + 1].clone())
+    }
+
+    #[test]
+    fn diet_extract_command_applies_env_triple_when_configured() {
+        // With the override configured, the EXTRACT child's Command carries exactly
+        // the three ANTHROPIC_* vars set to the diet-backend values.
+        let cfg = cfg_with_diet_backend();
+        let mut cmd = build_diet_child_command(&cfg, "hi");
+        apply_diet_env(&mut cmd, &cfg);
+        let env = cmd_env_overrides(&cmd);
+        assert_eq!(env.get("ANTHROPIC_BASE_URL").map(String::as_str), Some("http://127.0.0.1:9100"));
+        assert_eq!(env.get("ANTHROPIC_AUTH_TOKEN").map(String::as_str), Some("dsv4-diet-dummy"));
+        assert_eq!(env.get("ANTHROPIC_MODEL").map(String::as_str), Some("local-diet"));
+    }
+
+    #[test]
+    fn diet_extract_command_applies_nothing_when_unconfigured() {
+        // No override → the extract child sets none of the three; it inherits the
+        // ambient process env, exactly as if the feature were absent.
+        let cfg = test_config();
+        assert!(cfg.diet_backend.is_none());
+        let mut cmd = build_diet_child_command(&cfg, "hi");
+        apply_diet_env(&mut cmd, &cfg);
+        let env = cmd_env_overrides(&cmd);
+        for k in TITLE_ENV_KEYS {
+            assert!(!env.contains_key(k), "unconfigured extract child must not set {k}");
+        }
+    }
+
+    #[test]
+    fn diet_verify_command_is_ambient_even_when_diet_backend_set() {
+        // THE POINT of the verify gate: it NEVER uses the diet backend. Even with the
+        // override configured, a verify child (built the ambient way — no
+        // apply_diet_env) carries none of the three ANTHROPIC_* overrides.
+        let cfg = cfg_with_diet_backend();
+        assert!(cfg.diet_backend.is_some());
+        let cmd = build_diet_child_command(&cfg, "verify this"); // no env layering
+        let env = cmd_env_overrides(&cmd);
+        for k in TITLE_ENV_KEYS {
+            assert!(
+                !env.contains_key(k),
+                "the verify child must be ambient — must NOT carry {k}"
+            );
+        }
+    }
+
+    #[test]
+    fn diet_child_holds_no_tools() {
+        // The diet children hold NO tools: an EMPTY --allowedTools, plus the
+        // class-level denylist removing the mutation/exec/network tool classes.
+        let cfg = cfg_with_diet_backend();
+        let cmd = build_diet_child_command(&cfg, "hi");
+        let allow = cmd_arg_value(&cmd, "--allowedTools").expect("--allowedTools present");
+        assert_eq!(allow, "", "the diet child's allowlist must be EMPTY (no tools)");
+        let deny = cmd_arg_value(&cmd, "--disallowedTools").expect("--disallowedTools present");
+        for class in ["Bash", "Write", "Edit", "WebFetch", "WebSearch", "Task"] {
+            assert!(
+                deny.split(',').any(|t| t.trim() == class),
+                "denylist must remove the {class} class: {deny:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn main_turn_command_is_unaffected_by_diet_backend() {
+        // THE SAFETY / KILL-SWITCH PROPERTY, tested directly (clone of the title
+        // isolation test): even when the diet-backend override IS configured, a
+        // MAIN-TURN command carries none of the three ANTHROPIC_* overrides, because
+        // the main-turn builder never calls apply_diet_env. A diet-only redirect can
+        // never leak onto a real agent turn.
+        let cfg = cfg_with_diet_backend();
+        assert!(cfg.diet_backend.is_some(), "precondition: override is set");
+        for sid in [None, Some("sess-1")] {
+            let cmd = build_claude_command(&cfg, "do the thing", sid);
+            let env = cmd_env_overrides(&cmd);
+            for k in TITLE_ENV_KEYS {
+                assert!(
+                    !env.contains_key(k),
+                    "main-turn command must NOT carry {k} even when diet backend is set"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn main_turn_command_is_byte_identical_whether_diet_backend_set_or_not() {
+        // The kill switch, proven byte-for-byte on the SPAWNED command: unsetting the
+        // triple must reproduce today's exact main-turn invocation. The argv, the
+        // cwd, and the env overrides must all match between a config with the diet
+        // backend set and one without.
+        let with = cfg_with_diet_backend();
+        let mut without = with.clone();
+        without.diet_backend = None;
+        for sid in [None, Some("sess-42")] {
+            let a = build_claude_command(&with, "log a banana", sid);
+            let b = build_claude_command(&without, "log a banana", sid);
+            let argv = |c: &Command| -> Vec<String> {
+                c.as_std().get_args().map(|s| s.to_string_lossy().into_owned()).collect()
+            };
+            assert_eq!(argv(&a), argv(&b), "argv must be identical (kill switch)");
+            assert_eq!(
+                a.as_std().get_current_dir(),
+                b.as_std().get_current_dir(),
+                "cwd must be identical"
+            );
+            assert_eq!(
+                cmd_env_overrides(&a),
+                cmd_env_overrides(&b),
+                "env overrides must be identical (none, either way)"
+            );
         }
     }
 

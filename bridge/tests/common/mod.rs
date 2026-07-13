@@ -34,6 +34,10 @@ use tower::ServiceExt; // ServiceExt::oneshot
             scratch_dir: None,
             // No title-backend override in tests — ambient-backend behavior.
             title_backend: None,
+            // No diet-extract backend override in tests — the pipeline is dormant
+            // (kill switch), so the integration router exercises today's hosted path.
+            diet_backend: None,
+            diet_probation: true,
         }
     }
     pub fn test_state() -> AppState {

@@ -180,12 +180,28 @@ Full table in [`bridge/README.md`](bridge/README.md#knobs-env-vars). Most-used:
 | `JESSE_TITLE_BASE_URL` | _(off)_ | With the two below, points **only** the `POST /jesse/title` one-shot at a different backend (e.g. a cheap local model) via that child's `ANTHROPIC_BASE_URL`. All three required together. |
 | `JESSE_TITLE_AUTH_TOKEN` | _(off)_ | Auth token for the title backend (the title child's `ANTHROPIC_AUTH_TOKEN`). |
 | `JESSE_TITLE_MODEL` | _(off)_ | Model id for the title backend (the title child's `ANTHROPIC_MODEL`). |
+| `JESSE_DIET_BASE_URL` | _(off)_ | With the two below, enables the **local diet-logging pipeline**: a diet-shaped "Tell" (food/exercise/weigh-in) is parsed by a cheap local model (this backend) instead of a hosted agent turn, then verified, appended, and mirrored. All three required together. Unset → the pipeline is dormant and diet turns take the hosted path. |
+| `JESSE_DIET_AUTH_TOKEN` | _(off)_ | Auth token for the diet-extract backend (the extract child's `ANTHROPIC_AUTH_TOKEN`). |
+| `JESSE_DIET_MODEL` | _(off)_ | Model id for the diet-extract backend (the extract child's `ANTHROPIC_MODEL`). |
+| `JESSE_DIET_PROBATION` | `true` | Probation mode: the hosted verify gate is mandatory and blocking on every extracted entry. Only an explicit falsey value disables it (a future graduation state, not used yet). |
 
 The three `JESSE_TITLE_*` vars are **all-or-nothing** and **soft**: set all three
 to redirect titles only; leave any unset (the default) and titles use the ambient
 backend, exactly as before. A partial set (one or two) logs a startup warning and
 is ignored. **Main "Ask/Tell" turns are never affected** — the override touches
 the title child alone.
+
+The three `JESSE_DIET_*` vars are **all-or-nothing** the same way, and the **seam
+is the kill switch**: with the triple unset (the default) the diet gate never fires,
+so every "Tell" — diet-shaped or not — runs today's hosted agent turn *byte-for-byte*,
+with no redeploy needed to disable the feature. When the triple is set, a diet-shaped
+Tell runs the local pipeline: a **toolless** extract child (pointed only at this
+backend) parses the utterance into per-item entries; a **hosted, ambient** verify
+child (never this backend) checks every entry; trusted Rust appends the verified rows
+to the vault's `diet-logs/*.csv`, runs the pinned regenerate/validate/verify scripts,
+commits, and derives the `JESSE_MEAL_LOG v1` Apple-Health mirror from the appended
+rows. Any failure at any stage falls back to the hosted turn (a log is never lost or
+double-appended). **Main non-diet turns and the title child are never affected.**
 
 The bridge **refuses to start** if `JESSE_TOKEN` is unset, `JESSE_VAULT` isn't a
 directory, the `claude` binary can't be found, or `JESSE_BIND` is an unsafe

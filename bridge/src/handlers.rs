@@ -113,6 +113,12 @@ pub async fn jesse(
     }
 
     let mode = req.mode.trim().to_lowercase();
+    // Kill switch + gate: attempt the local diet-logging pipeline only when a diet
+    // backend is configured AND this is a diet-shaped Tell. With no backend this is
+    // always false, so the turn takes today's hosted path byte-for-byte. Decided here
+    // (before any work) but ACTED ON inside the spawned task below, so a fall-through
+    // reuses the same permit/scratch/job machinery as a normal turn.
+    let try_diet = should_try_local_diet(&st.cfg, &mode, &req.text);
     let is_followup = req.session_id.is_some();
     let prompt = build_prompt(
         &mode,
@@ -181,6 +187,9 @@ pub async fn jesse(
     let jobs = st.jobs.clone();
     let jid = job_id.clone();
     let sid = req.session_id.clone();
+    // The raw utterance the local diet pipeline parses (distinct from the wrapped
+    // `prompt`, which the hosted path — including any diet fall-through — still uses).
+    let raw_text = req.text.clone();
     // Push machinery for the completion notification (no-ops when push is off).
     let apns = st.apns.clone();
     let devices = st.devices.clone();
@@ -198,12 +207,29 @@ pub async fn jesse(
         // never strand the job in Running forever.
         let mut guard = TurnGuard::new(jobs.clone(), jid.clone());
 
-        let outcome = run_claude_streaming(&cfg, &prompt, sid.as_deref(), &jobs, &jid).await;
-        // Extract any agent-emitted directive from the reply's final line before
-        // the result lands: a recognized directive is stripped from the text and
-        // attached under `directives`, so the poll result and the SSE `done`
-        // frame both carry the same value. A non-directive reply is unchanged.
-        let outcome = apply_directives(outcome);
+        // A hosted turn: run the streamed agent turn and extract any agent-emitted
+        // directive from the reply's final line. A recognized directive is stripped
+        // from the text and attached under `directives`, so the poll result and the
+        // SSE `done` frame both carry the same value. A non-directive reply is
+        // unchanged. This is today's path — and the diet fall-through target.
+        let run_hosted = || async {
+            apply_directives(run_claude_streaming(&cfg, &prompt, sid.as_deref(), &jobs, &jid).await)
+        };
+        let outcome = if try_diet {
+            // Local diet pipeline: extract → verify → append → derive mirror. On a
+            // local log the directives (mirror) are BUILT by the bridge, not parsed
+            // from agent text. On any fallback rung the turn drops to the hosted path
+            // unchanged (a log is never lost and never double-appended).
+            match run_diet_pipeline(&cfg, &raw_text).await {
+                DietPipelineOutcome::Logged { dashboard, directives } => {
+                    Ok((dashboard, None, Some(directives)))
+                }
+                DietPipelineOutcome::LoggedNoMirror { dashboard } => Ok((dashboard, None, None)),
+                DietPipelineOutcome::FallThrough { .. } => run_hosted().await,
+            }
+        } else {
+            run_hosted().await
+        };
         jobs.complete(&jid, outcome);
         // Close the live stream with the frame matching the state that actually
         // landed. `complete` is write-once, so a cancel that won the race already

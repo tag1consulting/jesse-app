@@ -158,6 +158,28 @@ pub struct Config {
     // fast local backend while main turns keep using the ambient credentials.
     // `None` → titles use the ambient backend, byte-for-byte today's behavior.
     pub title_backend: Option<(String, String, String)>,
+    // Optional local diet-extract backend override: `Some((base_url, auth_token,
+    // model))` only when ALL THREE of JESSE_DIET_BASE_URL / JESSE_DIET_AUTH_TOKEN /
+    // JESSE_DIET_MODEL are set (see `resolve_diet_backend` — same all-or-nothing
+    // rule as the title backend). When `Some`, the diet-logging pipeline's stateless
+    // EXTRACT child — and only that child — gets ANTHROPIC_BASE_URL /
+    // ANTHROPIC_AUTH_TOKEN / ANTHROPIC_MODEL set to these values, so a food/exercise/
+    // weigh-in utterance can be parsed by a cheap local model while every main turn
+    // and the hosted verify child keep using the ambient credentials.
+    //
+    // THE KILL SWITCH IS THIS SEAM ITSELF: leave the triple unset (the default) and
+    // `diet_backend` is `None`, so the gate in `handlers::jesse` never fires and every
+    // diet turn reverts BYTE-FOR-BYTE to today's hosted `run_claude_streaming` path —
+    // no redeploy, no code change. `None` is the safe, shipped-today behavior.
+    pub diet_backend: Option<(String, String, String)>,
+    // Whether the local diet pipeline runs in PROBATION mode (env
+    // `JESSE_DIET_PROBATION`, default TRUE). In probation the hosted verify gate is
+    // mandatory and blocking on every extracted entry. `false` is a future
+    // graduation state (flip blocking-verify to sampled-audit) and is NOT used yet —
+    // it exists so graduation later needs no change to the extract child or the
+    // append path. Independent of `diet_backend`: it tunes the pipeline's verify
+    // posture, not whether the pipeline is active.
+    pub diet_probation: bool,
 }
 
 impl Config {
@@ -255,6 +277,35 @@ pub fn resolve_title_backend(
     }
 }
 
+/// Resolve the optional local diet-extract backend override from its three
+/// env-derived parts. Identical all-or-nothing rule as [`resolve_title_backend`]:
+/// returns `Some((base_url, auth_token, model))` ONLY when all three are present;
+/// any partial combination resolves to `None` (the diet pipeline stays dormant and
+/// diet turns keep using the ambient/hosted path). A partial config logs one
+/// startup warning so a half-configured deploy is visible rather than silently
+/// half-active. Pure except for that warning.
+pub fn resolve_diet_backend(
+    base_url: Option<String>,
+    auth_token: Option<String>,
+    model: Option<String>,
+) -> Option<(String, String, String)> {
+    match (base_url, auth_token, model) {
+        (Some(b), Some(t), Some(m)) => Some((b, t, m)),
+        (b, t, m) => {
+            let set = b.is_some() as u8 + t.is_some() as u8 + m.is_some() as u8;
+            if set > 0 {
+                eprintln!(
+                    "jesse-bridge: WARNING partial JESSE_DIET_* config ({set}/3 set) — the \
+                     local diet-extract backend needs ALL of JESSE_DIET_BASE_URL, \
+                     JESSE_DIET_AUTH_TOKEN, JESSE_DIET_MODEL; treating as unset (diet \
+                     turns use the hosted path)."
+                );
+            }
+            None
+        }
+    }
+}
+
 impl Config {
     pub fn from_env() -> Self {
         let home = std::env::var("HOME").unwrap_or_default();
@@ -312,6 +363,26 @@ impl Config {
                 env_string("JESSE_TITLE_AUTH_TOKEN"),
                 env_string("JESSE_TITLE_MODEL"),
             ),
+            // All-or-nothing local diet-extract backend override, same `env_string`
+            // (trimmed, empty-filtered) semantics as every other string field. Partial
+            // config logs one warning and resolves to None (see `resolve_diet_backend`).
+            // Unset (the default) → None → the diet pipeline is dormant and every diet
+            // turn takes today's hosted path (the kill switch).
+            diet_backend: resolve_diet_backend(
+                env_string("JESSE_DIET_BASE_URL"),
+                env_string("JESSE_DIET_AUTH_TOKEN"),
+                env_string("JESSE_DIET_MODEL"),
+            ),
+            // Probation defaults to TRUE: the verify gate is mandatory unless an
+            // operator explicitly opts out with a falsey JESSE_DIET_PROBATION. Only an
+            // explicit false/0/no/off flips it; anything else (including unset) is true.
+            diet_probation: std::env::var("JESSE_DIET_PROBATION")
+                .ok()
+                .map(|v| {
+                    let v = v.trim().to_ascii_lowercase();
+                    !(v == "0" || v == "false" || v == "no" || v == "off")
+                })
+                .unwrap_or(true),
         }
     }
 }
@@ -507,6 +578,109 @@ mod tests {
         // set-but-empty var is still a partial config → None.
         std::env::set_var("JESSE_TITLE_AUTH_TOKEN", "   ");
         assert_eq!(Config::from_env().title_backend, None);
+
+        for (k, v) in saved {
+            match v {
+                Some(val) => std::env::set_var(k, val),
+                None => std::env::remove_var(k),
+            }
+        }
+    }
+
+    #[test]
+    fn diet_backend_resolves_only_when_all_three_present() {
+        // All-or-nothing, mirroring the title backend: the diet-extract override
+        // resolves ONLY when base_url, auth_token, AND model are all set. Any missing
+        // part falls back to None so the pipeline stays dormant (the kill switch).
+        let full = resolve_diet_backend(
+            Some("http://127.0.0.1:9100".into()),
+            Some("dummy-tok".into()),
+            Some("local-diet".into()),
+        );
+        assert_eq!(
+            full,
+            Some((
+                "http://127.0.0.1:9100".to_string(),
+                "dummy-tok".to_string(),
+                "local-diet".to_string(),
+            ))
+        );
+        // Every partial combination (1 or 2 of 3 set) resolves to None.
+        let s = || Some("x".to_string());
+        let partials = [
+            (s(), s(), None),
+            (s(), None, s()),
+            (None, s(), s()),
+            (s(), None, None),
+            (None, s(), None),
+            (None, None, s()),
+            (None, None, None),
+        ];
+        for (b, t, m) in partials {
+            assert_eq!(
+                resolve_diet_backend(b, t, m),
+                None,
+                "partial diet config must resolve to None (treated as unset)"
+            );
+        }
+    }
+
+    #[test]
+    fn config_from_env_diet_backend_all_or_nothing_and_probation_default_true() {
+        let _g = ENV_LOCK.lock_ok();
+        let keys = [
+            "JESSE_DIET_BASE_URL",
+            "JESSE_DIET_AUTH_TOKEN",
+            "JESSE_DIET_MODEL",
+            "JESSE_DIET_PROBATION",
+        ];
+        let saved: Vec<(&str, Option<String>)> =
+            keys.iter().map(|k| (*k, std::env::var(k).ok())).collect();
+        for k in &keys {
+            std::env::remove_var(k);
+        }
+
+        // Unset by default → no override, and probation defaults to TRUE.
+        let cfg = Config::from_env();
+        assert_eq!(cfg.diet_backend, None);
+        assert!(cfg.diet_probation, "probation must default to true");
+
+        // All three set → the config carries the resolved triple.
+        std::env::set_var("JESSE_DIET_BASE_URL", "http://127.0.0.1:9100");
+        std::env::set_var("JESSE_DIET_AUTH_TOKEN", "dsv4-diet-dummy");
+        std::env::set_var("JESSE_DIET_MODEL", "local-diet");
+        assert_eq!(
+            Config::from_env().diet_backend,
+            Some((
+                "http://127.0.0.1:9100".to_string(),
+                "dsv4-diet-dummy".to_string(),
+                "local-diet".to_string(),
+            ))
+        );
+
+        // Drop one → partial → None (treated as unset).
+        std::env::remove_var("JESSE_DIET_AUTH_TOKEN");
+        assert_eq!(Config::from_env().diet_backend, None);
+
+        // A blank/whitespace value counts as unset (env_string semantics).
+        std::env::set_var("JESSE_DIET_AUTH_TOKEN", "   ");
+        assert_eq!(Config::from_env().diet_backend, None);
+
+        // Probation: only an explicit falsey value flips it to false.
+        for falsey in ["0", "false", "no", "off", "FALSE", " Off "] {
+            std::env::set_var("JESSE_DIET_PROBATION", falsey);
+            assert!(
+                !Config::from_env().diet_probation,
+                "explicit {falsey:?} must disable probation"
+            );
+        }
+        for truthy in ["1", "true", "yes", "on", "anything-else"] {
+            std::env::set_var("JESSE_DIET_PROBATION", truthy);
+            assert!(
+                Config::from_env().diet_probation,
+                "{truthy:?} must keep probation on"
+            );
+        }
 
         for (k, v) in saved {
             match v {
