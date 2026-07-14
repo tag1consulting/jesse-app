@@ -15,6 +15,46 @@ CI both run it). See the "Versioning" section of `bridge/README.md`.
 
 ## [Unreleased]
 
+## [App 1.0 (37)] — 2026-07-14
+
+### Added
+- **Tap a macro or the calorie total to see the foods that fed it.** The macros &
+  calories detail's explainer sheet — the same sheet a bar tap already opens — now
+  lists, under the explanation, the foods that contributed to *that* metric:
+  - **Ranked by impact.** Each food's contribution to the tapped metric (grams for a
+    macro, kcal for calories) sorted most-to-least, ties keeping the meal/item order
+    the food journal uses. Shown with its name, its amount, its contribution, and a
+    small proportional bar (in the macro's identity color from the calorie-source bar)
+    with its share of the day's total for that metric.
+  - **Zero and absent contributors are excluded, never shown as a 0 row.** A food with
+    40 g carbs and no fat appears under carbs, not fat; a nil/absent field means "not a
+    contributor" (not zero) and the food is omitted. The empty state distinguishes
+    "nothing logged yet" from "logged, but none carry this metric".
+  - **Reconciled against the headline.** The listed foods derive from the same per-item
+    fields as the number on the bar, so they add up by construction; a defensive guard
+    surfaces a note rather than silently showing a list that contradicts the headline.
+  - The ranking is a pure function over `DietToday.meals` (`FoodContributions`),
+    unit-tested for ordering, the zero/nil exclusion, shares, the empty/partial states,
+    and the reconciliation guard.
+- **On-device AI insight, streamed in below the facts.** After the contributing-foods
+  list is on screen, a short natural-language insight about that metric streams in
+  beneath it, styled clearly secondary. It uses the phone's built-in **Apple
+  Foundation Models** on-device model (the app's first user-facing streamed-prose
+  surface from the local model; the search expander and health classifier use it only
+  for structured output), behind a new `HealthInsightGenerating` protocol seam so it is
+  testable and swappable — the FoundationModels dependency stays contained to one file,
+  as with the query expander and health classifier.
+  - **The facts never wait on the model.** The list renders immediately; the insight
+    fills in afterward from a cumulative stream.
+  - **Grounded in the on-screen numbers.** The prompt names only the day's total, the
+    goal, the live status, and the top contributing foods, and forbids invention, so
+    the insight can't reference foods or figures not in the data.
+  - **Degrades to nothing.** If the model is unavailable, disabled, not yet downloaded,
+    or errors, the seam yields an empty stream and the facts stand alone — no error, no
+    placeholder. The seam's unavailable/error path is unit-tested.
+  - Routing insights through the bridge/Claude path is a deliberate follow-up, not part
+    of this change.
+
 ## [Bridge 0.9.0] — 2026-07-14
 
 ### Changed

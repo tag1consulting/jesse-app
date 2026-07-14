@@ -52,12 +52,13 @@ struct MacrosCaloriesDetail: View {
     private var judgedBody: some View {
         List {
             Section {
-                bar(g.calories, Explainers.calories(g.calories, isCarbLoad: g.isCarbLoad))
+                bar(g.calories, Explainers.calories(g.calories, isCarbLoad: g.isCarbLoad),
+                    metric: .calories)
                 // Macro bars in canonical order (Protein, Carbs, Fiber, Fat); the
                 // carbs bonus row follows carbs, so fiber sits right after them.
                 ForEach(g.orderedMacros, id: \.macro) { entry in
                     bar(entry.gauge, Explainers.macro(entry.macro, gauges: g),
-                        isSubEntry: entry.macro.isSubEntry)
+                        metric: .macro(entry.macro), isSubEntry: entry.macro.isSubEntry)
                     if entry.macro == .carbs, let bonus = g.carbsBonus { bonusRow(bonus) }
                 }
             }
@@ -106,8 +107,37 @@ struct MacrosCaloriesDetail: View {
         }
     }
 
-    private func bar(_ gauge: MetricGauge, _ ex: Explainer, isSubEntry: Bool = false) -> some View {
-        MetricBarRow(gauge: gauge, isSubEntry: isSubEntry) { explainer = ex }
+    private func bar(_ gauge: MetricGauge, _ ex: Explainer, metric: ContributionMetric,
+                     isSubEntry: Bool = false) -> some View {
+        // Attach the "what fed this" drill-down to the row's explainer, so the same
+        // tap that opens the explanation also carries the contributing foods and the
+        // grounding for the on-device insight.
+        var withFoods = ex
+        withFoods.drilldown = drilldown(for: metric, gauge: gauge)
+        return MetricBarRow(gauge: gauge, isSubEntry: isSubEntry) { explainer = withFoods }
+    }
+
+    /// Build the drill-down for a tapped metric: the ranked contributing foods (from
+    /// the same meals the totals came from) plus the grounded insight input. The
+    /// headline is the gauge's own value, so the foods reconcile against the number the
+    /// row is showing.
+    private func drilldown(for metric: ContributionMetric, gauge: MetricGauge) -> FoodDrilldown {
+        let breakdown = FoodContributions.breakdown(today.meals, metric: metric, total: gauge.value)
+        let input = HealthInsight.input(
+            metric: metric, total: gauge.value,
+            goalPhrase: goalPhrase(gauge.goal), statusLine: gauge.remaining,
+            dayStyle: g.isCarbLoad ? "carb-load day" : "ordinary day",
+            contributions: breakdown.contributions)
+        return FoodDrilldown(breakdown: breakdown, insightInput: input)
+    }
+
+    /// How a metric is judged, in plain words for the insight grounding.
+    private func goalPhrase(_ goal: DietSemantics.Goal) -> String {
+        switch goal {
+        case .floor: return "a floor to hit or beat"
+        case .ceiling: return "a ceiling to stay under"
+        case .window: return "a target window"
+        }
     }
 
     private func bonusRow(_ bonus: CarbsBonus) -> some View {

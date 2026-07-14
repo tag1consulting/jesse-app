@@ -471,16 +471,37 @@ struct MetricBarRow: View {
 /// The "understand the number" content: a title, the live value/target line, and a
 /// few short second-person paragraphs. Content is baked in (`Explainers`),
 /// parameterized with live numbers where noted.
+///
+/// `drilldown` is the optional "what fed this number" extension: when a metric that
+/// has a food breakdown is tapped (a macro or the calorie total), the ranked
+/// contributing foods and the grounding for the on-device insight ride along here, so
+/// the same sheet hosts both the explanation and the facts. Nil for metrics with no
+/// foods behind them (pace, weight, net) — those render as prose only, unchanged.
 struct Explainer: Identifiable, Equatable {
     let id: String
     var title: String
     var valueLine: String
     var paragraphs: [String]
+    var drilldown: FoodDrilldown?
 }
 
-/// A reusable explainer sheet.
+/// What a metric tap adds to its explainer: the ranked contributing foods (the facts,
+/// rendered immediately) and the grounding for the optional on-device insight (which
+/// streams in below the facts and never blocks them).
+struct FoodDrilldown: Equatable, Sendable {
+    let breakdown: FoodBreakdown
+    let insightInput: HealthInsightInput
+}
+
+/// A reusable explainer sheet. When the explainer carries a `drilldown` (a macro or
+/// the calorie total), the contributing-foods facts render immediately below the
+/// prose, and the on-device insight streams in beneath them — subordinate to the
+/// facts and absent entirely when the model is unavailable.
 struct ExplainerSheet: View {
     let explainer: Explainer
+    /// The on-device insight generator, injectable for previews/tests; the live
+    /// FoundationModels-backed seam by default.
+    var insight: HealthInsightGenerating = HealthInsight.live()
     @Environment(\.dismiss) private var dismiss
     var body: some View {
         NavigationStack {
@@ -490,6 +511,14 @@ struct ExplainerSheet: View {
                         .font(.title3.weight(.semibold).monospacedDigit())
                     ForEach(Array(explainer.paragraphs.enumerated()), id: \.offset) { _, p in
                         Text(p).font(.body).foregroundStyle(.secondary)
+                    }
+                    if let drilldown = explainer.drilldown {
+                        Divider()
+                        ContributingFoodsView(breakdown: drilldown.breakdown)
+                        // The insight is secondary to the facts: it appears below and
+                        // fills in after them, and renders nothing when the model is
+                        // unavailable.
+                        HealthInsightView(input: drilldown.insightInput, provider: insight)
                     }
                 }
                 .frame(maxWidth: .infinity, alignment: .leading)
@@ -504,6 +533,144 @@ struct ExplainerSheet: View {
             }
         }
         .presentationDetents([.medium, .large])
+    }
+}
+
+// MARK: - Contributing foods (the drill-down facts)
+
+/// The "what fed this number" facts: the foods that contributed to the tapped metric,
+/// most impact first, zero/absent contributors already excluded upstream. Renders an
+/// honest empty state (nothing logged vs logged-but-no-detail) and any reconciliation
+/// note; never invents a 0-impact row.
+struct ContributingFoodsView: View {
+    let breakdown: FoodBreakdown
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text("What fed this")
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(.secondary)
+                .textCase(.uppercase)
+
+            if breakdown.isEmpty {
+                Text(emptyMessage)
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
+            } else {
+                ForEach(breakdown.contributions) { c in
+                    ContributionRow(contribution: c, metric: breakdown.metric)
+                }
+                if let note = breakdown.reconciliationNote {
+                    Text(note)
+                        .font(.caption2)
+                        .foregroundStyle(.tertiary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    private var emptyMessage: String {
+        breakdown.hasFoodButNoContributors
+            ? "No logged food lists its \(breakdown.metric.label.lowercased()) yet."
+            : "No foods logged yet."
+    }
+}
+
+/// One contributing food: its name and amount, its contribution to the tapped metric,
+/// and a thin proportional bar (in the metric's identity color) with its share of the
+/// day's total.
+struct ContributionRow: View {
+    let contribution: FoodContribution
+    let metric: ContributionMetric
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 5) {
+            HStack(alignment: .firstTextBaseline, spacing: 6) {
+                Text(contribution.name).font(.subheadline)
+                if let amount = contribution.amount {
+                    Text(amount).font(.caption).foregroundStyle(.secondary)
+                }
+                Spacer()
+                Text("\(DietSemantics.fmt(contribution.value)) \(metric.unit)")
+                    .font(.subheadline.monospacedDigit())
+            }
+            HStack(spacing: 8) {
+                ProportionBar(fraction: contribution.share, color: barColor)
+                Text("\(Int((contribution.share * 100).rounded()))%")
+                    .font(.caption2.monospacedDigit())
+                    .foregroundStyle(.tertiary)
+                    .frame(width: 34, alignment: .trailing)
+            }
+        }
+    }
+
+    /// The metric's identity color — the macro palette from the calorie-source bar so
+    /// the drill-down speaks the same color language, and the accent for calories.
+    private var barColor: Color {
+        switch metric {
+        case .calories: return .accentColor
+        case .macro(let m): return MacroColor.color(for: m)
+        }
+    }
+}
+
+/// A thin proportional bar (share of the day's total for a metric) in a passed color,
+/// on the same dim track the status meters use.
+struct ProportionBar: View {
+    let fraction: Double
+    let color: Color
+    var height: CGFloat = 6
+    var body: some View {
+        GeometryReader { geo in
+            ZStack(alignment: .leading) {
+                Capsule().fill(Color(.tertiarySystemFill))
+                Capsule().fill(color)
+                    .frame(width: geo.size.width * min(max(fraction, 0), 1))
+            }
+        }
+        .frame(height: height)
+    }
+}
+
+// MARK: - On-device insight (streamed, subordinate to the facts)
+
+/// The optional on-device AI insight, shown below the facts. It streams the insight
+/// in progressively via the `HealthInsightGenerating` seam and renders NOTHING until
+/// text arrives — so the facts never wait on it, and an unavailable/failed model
+/// leaves no error and no empty placeholder. Styled clearly secondary to the facts.
+struct HealthInsightView: View {
+    let input: HealthInsightInput
+    let provider: HealthInsightGenerating
+
+    @State private var text = ""
+
+    var body: some View {
+        // An always-present container carries the `.task`, so the stream starts even
+        // while `text` is empty (an empty conditional view can drop its `.task`). The
+        // content shows only once text arrives — nothing renders otherwise.
+        VStack(alignment: .leading, spacing: 6) {
+            if !text.isEmpty {
+                Label("On-device insight", systemImage: "sparkles")
+                    .font(.caption2.weight(.semibold))
+                    .foregroundStyle(.tertiary)
+                    .textCase(.uppercase)
+                Text(text)
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .task(id: input) {
+            // Each cumulative snapshot replaces the text so it grows in place. A model
+            // that's unavailable or errors yields no snapshots, so `text` stays empty
+            // and nothing renders.
+            for await snapshot in provider.insight(for: input) {
+                text = snapshot
+            }
+        }
     }
 }
 
