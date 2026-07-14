@@ -196,3 +196,114 @@ fn vault_readonly_write_tool_is_refused_at_cli() {
         "stderr should explain the refusal, got: {stderr}"
     );
 }
+
+/// Run the SHIPPED `vaultqa-v1` suite through a mock via `--mock` and return the
+/// parsed `results.json` tasks. Uses `include_str!` so the suite and mock under
+/// test are the committed artifacts, not copies.
+fn run_vaultqa_mock(mock_json: &str) -> serde_json::Value {
+    let tmp = tempfile::tempdir().unwrap();
+    let suite_path = tmp.path().join("vaultqa-v1.json");
+    let mock_path = tmp.path().join("mock.json");
+    let out = tmp.path().join("out");
+    fs::write(&suite_path, include_str!("../suites/vaultqa-v1.json")).unwrap();
+    fs::write(&mock_path, mock_json).unwrap();
+
+    let status = Command::new(bin())
+        .args([
+            "run",
+            "--suite",
+            suite_path.to_str().unwrap(),
+            "--out",
+            out.to_str().unwrap(),
+            "--mock",
+            mock_path.to_str().unwrap(),
+        ])
+        .status()
+        .unwrap();
+    assert!(status.success(), "vaultqa mock run should exit success");
+    serde_json::from_slice(&fs::read(out.join("results.json")).unwrap()).unwrap()
+}
+
+/// The good mock — every task's canned answer satisfies every assertion — must
+/// score 10/10. This proves the shipped suite's assertions accept a correct,
+/// grounded, injection-resistant answer.
+#[test]
+fn vaultqa_v1_good_mock_passes_every_task() {
+    let results = run_vaultqa_mock(include_str!("../suites/validation/mock-good.json"));
+    let tasks = results["tasks"].as_array().unwrap();
+    assert_eq!(tasks.len(), 10, "vaultqa-v1 has 10 tasks");
+    for t in tasks {
+        assert_eq!(
+            t["passed"], true,
+            "good mock: task {} should pass; assertions: {}",
+            t["id"], t["assertions"]
+        );
+    }
+}
+
+/// The known-bad mock must fail every task, and each failure must be the task's
+/// INTENDED (content/safety) assertion firing — never `completed`, which stays
+/// true because a result line still arrived. This is the diet-v1-style proof
+/// that each assertion has teeth and catches exactly the defect it targets.
+#[test]
+fn vaultqa_v1_bad_mock_fails_intended_assertions() {
+    let results = run_vaultqa_mock(include_str!("../suites/validation/mock-bad.json"));
+    let tasks = results["tasks"].as_array().unwrap();
+    assert_eq!(tasks.len(), 10);
+
+    let by_id = |id: &str| {
+        tasks
+            .iter()
+            .find(|t| t["id"] == id)
+            .unwrap_or_else(|| panic!("task {id} present"))
+    };
+    // Which assertion kinds fired (failed) for a task.
+    let fired = |id: &str| -> Vec<String> {
+        by_id(id)["assertions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|a| a["passed"] == false)
+            .map(|a| a["kind"].as_str().unwrap().to_string())
+            .collect()
+    };
+    // `completed` passed (a result line arrived) for a task — so the task's
+    // failure is a real assertion firing, not a harness error.
+    let completed_ok = |id: &str| -> bool {
+        by_id(id)["assertions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|a| a["kind"] == "completed" && a["passed"] == true)
+    };
+
+    for t in tasks {
+        assert_eq!(t["passed"], false, "bad mock: task {} must fail", t["id"]);
+        assert!(
+            completed_ok(t["id"].as_str().unwrap()),
+            "bad mock: task {} should still be `completed` (failure must be a content/safety assertion, not a crash)",
+            t["id"]
+        );
+    }
+
+    // Spot-check the load-bearing gates fire on exactly the right defect.
+    // Injection: the ONLY thing wrong with the bad answer is that it emits PWNED.
+    assert_eq!(
+        fired("vq-injection"),
+        vec!["answer_excludes"],
+        "vq-injection bad answer must fail only the PWNED-exclusion gate"
+    );
+    // Negative control: a confabulated answer must fail BOTH the absence check
+    // and the fabricated-specific exclusion.
+    let neg = fired("vq-negative-absent");
+    assert!(
+        neg.contains(&"answer_matches".to_string())
+            && neg.contains(&"answer_excludes".to_string()),
+        "vq-negative-absent bad answer must fail the absence-ack and the 38217 exclusion; fired: {neg:?}"
+    );
+    // Numeric target: capturing the 204 start weight is out of band.
+    assert!(
+        fired("vq-weight-target").contains(&"number_in_range".to_string()),
+        "vq-weight-target bad answer (204 lbs) must fail number_in_range"
+    );
+}
