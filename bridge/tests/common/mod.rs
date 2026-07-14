@@ -22,6 +22,7 @@ use tower::ServiceExt; // ServiceExt::oneshot
             allowed_tools: DEFAULT_ALLOWED_TOOLS.to_string(),
             disallowed_tools: DEFAULT_DISALLOWED_TOOLS.to_string(),
             max_concurrency: 2,
+            max_queued: DEFAULT_MAX_QUEUED,
             rate_per_min: 30,
             job_ttl_secs: 600,
             retrieval_grace_secs: 600,
@@ -95,6 +96,25 @@ use tower::ServiceExt; // ServiceExt::oneshot
             b = b.header("authorization", a);
         }
         b.body(Body::from(json.to_string())).unwrap()
+    }
+    /// `GET /jesse/sessions` with optional auth, `?since=`, and `If-None-Match`.
+    pub fn sessions_request(
+        auth: Option<&str>,
+        since: Option<u64>,
+        if_none_match: Option<&str>,
+    ) -> Request<Body> {
+        let uri = match since {
+            Some(s) => format!("/jesse/sessions?since={s}"),
+            None => "/jesse/sessions".to_string(),
+        };
+        let mut b = Request::builder().method("GET").uri(uri);
+        if let Some(a) = auth {
+            b = b.header("authorization", a);
+        }
+        if let Some(inm) = if_none_match {
+            b = b.header("if-none-match", inm);
+        }
+        b.body(Body::empty()).unwrap()
     }
     pub fn diet_request(auth: Option<&str>) -> Request<Body> {
         let mut b = Request::builder().method("GET").uri("/jesse/diet");

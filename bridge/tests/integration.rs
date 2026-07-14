@@ -750,20 +750,22 @@ use tower::ServiceExt;
         let _ = std::fs::remove_file(&fake);
     }
     #[tokio::test]
-    async fn second_concurrent_turn_is_429() {
-        // A fake claude that sleeps long enough that the first turn is still
-        // in-flight (holding the only permit) when the second POST arrives.
+    async fn queue_full_sheds_with_429() {
+        // Single writer, queue depth 1: the running turn holds the only permit, a
+        // second turn WAITS in the queue (202), and a third — beyond the queue —
+        // is shed with 429, exactly as an over-capacity request was before.
         let script = "#!/bin/sh\nsleep 2\nprintf '%s' '{\"type\":\"result\",\"is_error\":false,\"result\":\"ok\",\"session_id\":\"s\"}'\n";
         let fake = write_fake_claude(script);
         let cfg = Config {
             claude_bin: fake.to_string_lossy().into_owned(),
-            max_concurrency: 1,   // exactly one permit
+            max_concurrency: 1, // exactly one permit
+            max_queued: 1,      // room for exactly one waiter
             ..test_config()
         };
         let st = AppState::new(cfg);
 
-        // First POST: occupies the only permit, returns 202 at grace expiry; the
-        // detached turn keeps the permit while the fake claude sleeps.
+        // First POST: acquires the only permit synchronously and holds it while the
+        // fake claude sleeps.
         let first = app(st.clone())
             .oneshot(jesse_request(
                 Some("Bearer test-token"),
@@ -773,7 +775,7 @@ use tower::ServiceExt;
             .unwrap();
         assert_eq!(first.status(), StatusCode::ACCEPTED);
 
-        // Second POST while the first turn still holds the permit → 429.
+        // Second POST: no permit free, but the queue has room → QUEUED, still 202.
         let second = app(st.clone())
             .oneshot(jesse_request(
                 Some("Bearer test-token"),
@@ -781,7 +783,21 @@ use tower::ServiceExt;
             ))
             .await
             .unwrap();
-        assert_eq!(second.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(
+            second.status(),
+            StatusCode::ACCEPTED,
+            "a second turn queues (202), it is not rejected"
+        );
+
+        // Third POST: queue is full (one running + one waiting) → shed with 429.
+        let third = app(st.clone())
+            .oneshot(jesse_request(
+                Some("Bearer test-token"),
+                r#"{"mode":"ask","text":"three"}"#,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(third.status(), StatusCode::TOO_MANY_REQUESTS);
 
         let _ = std::fs::remove_file(&fake);
     }
@@ -2002,4 +2018,377 @@ async fn diet_history_when_days_dir_absent_reconstructs_cleanly() {
     let body: Value = serde_json::from_str(&body_string(resp).await).unwrap();
     assert_eq!(body["fidelity"], "reconstructed");
     let _ = std::fs::remove_dir_all(&vault);
+}
+
+// ---- Single-writer default + bounded queue ---------------------------------
+
+#[tokio::test]
+async fn two_overlapping_turns_serialize_and_both_complete() {
+    // Concurrency 1: two turns submitted back-to-back must run one-at-a-time. A
+    // fake claude records START on spawn and END on exit (bracketing a short
+    // sleep) into a shared log. Serialized execution yields START,END,START,END —
+    // never overlapping STARTs — and both turns complete.
+    let log = std::env::temp_dir().join(format!(
+        "jesse-serialize-{}-{}.log",
+        std::process::id(),
+        JOB_COUNTER.fetch_add(1, Ordering::Relaxed)
+    ));
+    let _ = std::fs::remove_file(&log);
+    let script = format!(
+        "#!/bin/sh\n\
+         printf 'START\\n' >> '{log}'\n\
+         sleep 1\n\
+         printf 'END\\n' >> '{log}'\n\
+         printf '%s' '{{\"type\":\"result\",\"is_error\":false,\"result\":\"ok\",\"session_id\":\"s\"}}'\n",
+        log = log.display()
+    );
+    let fake = write_fake_claude(&script);
+    let cfg = Config {
+        claude_bin: fake.to_string_lossy().into_owned(),
+        max_concurrency: 1,
+        max_queued: 4,
+        ..test_config()
+    };
+    let st = AppState::new(cfg);
+
+    // Fire both turns; both are accepted immediately (one Ready, one Queued).
+    let mut ids = Vec::new();
+    for text in ["first", "second"] {
+        let resp = app(st.clone())
+            .oneshot(jesse_request(
+                Some("Bearer test-token"),
+                &format!(r#"{{"mode":"ask","text":"{text}"}}"#),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::ACCEPTED);
+        let body: Value = serde_json::from_str(&body_string(resp).await).unwrap();
+        ids.push(body["job_id"].as_str().unwrap().to_string());
+    }
+
+    // Wait for both to finish.
+    for id in &ids {
+        let mut done = false;
+        for _ in 0..80 {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            if result_status(&st, id).await["status"] == "done" {
+                done = true;
+                break;
+            }
+        }
+        assert!(done, "both queued turns must complete");
+    }
+
+    // The spawns did not overlap: the log is exactly START,END,START,END.
+    let contents = std::fs::read_to_string(&log).unwrap();
+    let lines: Vec<&str> = contents.lines().collect();
+    assert_eq!(
+        lines,
+        ["START", "END", "START", "END"],
+        "turns must serialize (no overlapping claude spawns): {contents:?}"
+    );
+
+    let _ = std::fs::remove_file(&log);
+    let _ = std::fs::remove_file(&fake);
+}
+
+#[tokio::test]
+async fn queued_turn_returns_202_immediately_and_stream_reflects_the_wait() {
+    // A second turn is accepted (202) the instant it's submitted even though the
+    // only permit is held by a still-running first turn — it is NOT held until a
+    // permit frees. Its live stream reflects the wait via the activity hint.
+    let script = "#!/bin/sh\nsleep 3\nprintf '%s' '{\"type\":\"result\",\"is_error\":false,\"result\":\"ok\",\"session_id\":\"s\"}'\n";
+    let fake = write_fake_claude(script);
+    let cfg = Config {
+        claude_bin: fake.to_string_lossy().into_owned(),
+        max_concurrency: 1,
+        max_queued: 4,
+        ..test_config()
+    };
+    let st = AppState::new(cfg);
+
+    // First turn takes the permit.
+    let first = app(st.clone())
+        .oneshot(jesse_request(Some("Bearer test-token"), r#"{"mode":"ask","text":"one"}"#))
+        .await
+        .unwrap();
+    assert_eq!(first.status(), StatusCode::ACCEPTED);
+
+    // Second turn: returned promptly (well under the first turn's 3s run) with
+    // status running — proof the POST never blocks on a permit.
+    let start = std::time::Instant::now();
+    let second = app(st.clone())
+        .oneshot(jesse_request(Some("Bearer test-token"), r#"{"mode":"ask","text":"two"}"#))
+        .await
+        .unwrap();
+    assert_eq!(second.status(), StatusCode::ACCEPTED);
+    assert!(start.elapsed() < Duration::from_secs(2), "202 must be immediate, not held for a permit");
+    let body: Value = serde_json::from_str(&body_string(second).await).unwrap();
+    assert_eq!(body["status"], "running");
+    let queued_id = body["job_id"].as_str().unwrap().to_string();
+
+    // The queued turn's stream carries the "queued behind another turn" activity.
+    let mut saw_queue_activity = false;
+    for _ in 0..30 {
+        if let Some((_text, activity, _rx)) = st.jobs.stream_subscribe(&queued_id) {
+            if activity.as_deref() == Some(QUEUED_ACTIVITY) {
+                saw_queue_activity = true;
+                break;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(saw_queue_activity, "a queued turn's stream must reflect the wait");
+
+    // Clean up: cancel the queued turn so the fake claude sleep doesn't linger.
+    let _ = app(st.clone())
+        .oneshot(cancel_request(Some("Bearer test-token"), &queued_id))
+        .await;
+    let _ = std::fs::remove_file(&fake);
+}
+
+#[tokio::test]
+async fn cancelling_a_queued_turn_frees_its_slot_and_never_spawns_claude() {
+    // Concurrency 1, queue depth 1. Turn A holds the permit (long sleep). Turn B
+    // queues behind it. Cancelling B: it goes Cancelled, its claude never spawns
+    // (the shared spawn-log gains no second line), and its queue slot frees (a new
+    // turn C can queue again rather than being shed).
+    let log = std::env::temp_dir().join(format!(
+        "jesse-qcancel-{}-{}.log",
+        std::process::id(),
+        JOB_COUNTER.fetch_add(1, Ordering::Relaxed)
+    ));
+    let _ = std::fs::remove_file(&log);
+    let script = format!(
+        "#!/bin/sh\n\
+         printf 'spawn\\n' >> '{log}'\n\
+         sleep 8\n\
+         printf '%s' '{{\"type\":\"result\",\"is_error\":false,\"result\":\"ok\",\"session_id\":\"s\"}}'\n",
+        log = log.display()
+    );
+    let fake = write_fake_claude(&script);
+    let cfg = Config {
+        claude_bin: fake.to_string_lossy().into_owned(),
+        max_concurrency: 1,
+        max_queued: 1,
+        ..test_config()
+    };
+    let st = AppState::new(cfg);
+
+    // A: takes the permit and spawns claude (writes one "spawn" line).
+    let a = app(st.clone())
+        .oneshot(jesse_request(Some("Bearer test-token"), r#"{"mode":"ask","text":"a"}"#))
+        .await
+        .unwrap();
+    assert_eq!(a.status(), StatusCode::ACCEPTED);
+
+    // Wait until A's claude has actually spawned (its one "spawn" line lands), so
+    // the count assertion below is deterministic rather than timing-dependent.
+    let mut a_spawned = false;
+    for _ in 0..50 {
+        if std::fs::read_to_string(&log).unwrap_or_default().lines().count() >= 1 {
+            a_spawned = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(a_spawned, "the running turn A must spawn claude");
+
+    // B: queued (202) behind A; it must NOT spawn claude.
+    let b = app(st.clone())
+        .oneshot(jesse_request(Some("Bearer test-token"), r#"{"mode":"ask","text":"b"}"#))
+        .await
+        .unwrap();
+    assert_eq!(b.status(), StatusCode::ACCEPTED);
+    let b_id: Value = serde_json::from_str(&body_string(b).await).unwrap();
+    let b_id = b_id["job_id"].as_str().unwrap().to_string();
+
+    // Let B settle into the wait.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    // Cancel the queued turn B.
+    let cancel = app(st.clone())
+        .oneshot(cancel_request(Some("Bearer test-token"), &b_id))
+        .await
+        .unwrap();
+    assert_eq!(cancel.status(), StatusCode::NO_CONTENT);
+
+    // Let the abort propagate.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    // B is cleanly cancelled.
+    assert_eq!(result_status(&st, &b_id).await["status"], "cancelled");
+
+    // Only A ever spawned claude — B's claude never ran.
+    let spawns = std::fs::read_to_string(&log).unwrap_or_default();
+    assert_eq!(
+        spawns.lines().count(),
+        1,
+        "the cancelled queued turn must never spawn claude: {spawns:?}"
+    );
+
+    // The freed slot is reusable: a new turn C queues (202) rather than 429.
+    let c = app(st.clone())
+        .oneshot(jesse_request(Some("Bearer test-token"), r#"{"mode":"ask","text":"c"}"#))
+        .await
+        .unwrap();
+    assert_eq!(
+        c.status(),
+        StatusCode::ACCEPTED,
+        "cancelling the queued turn must free its slot"
+    );
+
+    // The running turns' fake-claude sleeps are killed (kill_on_drop) when `st`
+    // and its tasks drop at end of test.
+    let _ = std::fs::remove_file(&log);
+    let _ = std::fs::remove_file(&fake);
+}
+
+// ---- GET /jesse/sessions ----------------------------------------------------
+
+#[tokio::test]
+async fn sessions_requires_auth() {
+    let st = test_state();
+    let resp = app(st).oneshot(sessions_request(None, None, None)).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn sessions_empty_when_projects_dir_absent_with_stable_etag_and_304() {
+    // Point the vault at a path whose escaped projects dir does not exist → an
+    // empty list (never an error), a strong ETag, and a matching If-None-Match 304.
+    let cfg = Config {
+        vault: format!("/no/such/vault/{}", random_hex()),
+        ..test_config()
+    };
+    let st = AppState::new(cfg);
+
+    let resp = app(st.clone()).oneshot(sessions_request(Some("Bearer test-token"), None, None)).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let etag = resp.headers().get("etag").unwrap().to_str().unwrap().to_string();
+    assert!(etag.starts_with('"') && !etag.starts_with("W/"), "strong etag: {etag}");
+    let body: Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    assert_eq!(body["sessions"], serde_json::json!([]), "absent projects dir → empty list");
+
+    // Same request with the ETag → 304 Not Modified, empty body.
+    let resp = app(st).oneshot(sessions_request(Some("Bearer test-token"), None, Some(&etag))).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_MODIFIED);
+    assert!(body_string(resp).await.is_empty(), "304 has an empty body");
+}
+
+// Serialize the HOME-mutating session tests against each other.
+static HOME_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+// The guard is intentionally held across the awaited request: HOME is a process
+// global, so it must stay pinned to this test's throwaway value for the whole
+// request (the sessions handler reads it mid-await). Only this one test mutates
+// HOME, so holding the lock across the await cannot deadlock.
+#[allow(clippy::await_holding_lock)]
+#[tokio::test]
+async fn sessions_lists_a_real_transcript_with_first_message_and_title() {
+    let _g = HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let saved_home = std::env::var("HOME").ok();
+
+    // A throwaway HOME with a vault whose escaped projects dir holds one session.
+    let home = std::env::temp_dir().join(format!("jesse-home-{}", random_hex()));
+    let vault = format!("/vault/{}", random_hex());
+    let proj = home.join(".claude").join("projects").join(escape_project_path(&vault));
+    std::fs::create_dir_all(&proj).unwrap();
+    std::fs::write(
+        proj.join("sess-42.jsonl"),
+        "{\"type\":\"system\"}\n{\"type\":\"user\",\"message\":{\"content\":\"what is on Today.md?\"}}\n",
+    )
+    .unwrap();
+
+    std::env::set_var("HOME", &home);
+    let cfg = Config {
+        vault: vault.clone(),
+        state_dir: None,
+        ..test_config()
+    };
+    let st = AppState::new(cfg);
+    // Store a title for the session (as POST /jesse/title would).
+    st.titles.set("sess-42", "Today Overview");
+
+    let resp = app(st).oneshot(sessions_request(Some("Bearer test-token"), None, None)).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body: Value = serde_json::from_str(&body_string(resp).await).unwrap();
+
+    // Restore HOME before asserting (so a panic can't leak the override).
+    match saved_home {
+        Some(h) => std::env::set_var("HOME", h),
+        None => std::env::remove_var("HOME"),
+    }
+
+    let sessions = body["sessions"].as_array().unwrap();
+    assert_eq!(sessions.len(), 1);
+    assert_eq!(sessions[0]["session_id"], "sess-42");
+    assert_eq!(sessions[0]["first_message"], "what is on Today.md?");
+    assert_eq!(sessions[0]["title"], "Today Overview");
+    assert!(sessions[0]["last_modified"].as_u64().is_some());
+
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+// ---- POST /jesse/title server-side store -----------------------------------
+
+#[tokio::test]
+async fn title_with_session_id_persists_and_survives_restart() {
+    // A title request carrying a session_id persists the minted title under it; a
+    // fresh store over the same state dir reloads it (restart survival). Uses a
+    // fake claude that returns a clean title.
+    let script = "#!/bin/sh\nprintf '%s' '{\"type\":\"result\",\"is_error\":false,\"result\":\"Roof Repair Plan\",\"session_id\":\"x\"}'\n";
+    let fake = write_fake_claude(script);
+    let state_dir = std::env::temp_dir().join(format!("jesse-titlestate-{}", random_hex()));
+    let cfg = Config {
+        claude_bin: fake.to_string_lossy().into_owned(),
+        state_dir: Some(state_dir.to_string_lossy().into_owned()),
+        ..test_config()
+    };
+    let st = AppState::new(cfg.clone());
+
+    let resp = app(st.clone())
+        .oneshot(title_request(
+            Some("Bearer test-token"),
+            r#"{"text":"the roofer is coming Thursday","session_id":"sess-roof"}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body: Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    assert_eq!(body["title"], "Roof Repair Plan");
+
+    // In-memory store now has it.
+    assert_eq!(st.titles.get("sess-roof").as_deref(), Some("Roof Repair Plan"));
+
+    // Restart survival: a fresh store over the same state dir reloads the title.
+    let reloaded = AppState::new(cfg);
+    assert_eq!(reloaded.titles.get("sess-roof").as_deref(), Some("Roof Repair Plan"));
+
+    let _ = std::fs::remove_dir_all(&state_dir);
+    let _ = std::fs::remove_file(&fake);
+}
+
+#[tokio::test]
+async fn title_without_session_id_persists_nothing() {
+    // Omitting session_id reproduces today's stateless behavior — nothing stored.
+    let script = "#!/bin/sh\nprintf '%s' '{\"type\":\"result\",\"is_error\":false,\"result\":\"Some Title\",\"session_id\":\"x\"}'\n";
+    let fake = write_fake_claude(script);
+    let state_dir = std::env::temp_dir().join(format!("jesse-titlestate-{}", random_hex()));
+    let cfg = Config {
+        claude_bin: fake.to_string_lossy().into_owned(),
+        state_dir: Some(state_dir.to_string_lossy().into_owned()),
+        ..test_config()
+    };
+    let st = AppState::new(cfg);
+
+    let resp = app(st.clone())
+        .oneshot(title_request(Some("Bearer test-token"), r#"{"text":"a conversation"}"#))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert!(st.titles.is_empty(), "no session_id → nothing persisted");
+
+    let _ = std::fs::remove_dir_all(&state_dir);
+    let _ = std::fs::remove_file(&fake);
 }

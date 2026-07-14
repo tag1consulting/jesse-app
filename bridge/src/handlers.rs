@@ -57,6 +57,12 @@ pub struct DeviceRequest {
 #[derive(Deserialize)]
 pub struct TitleRequest {
     text: String,
+    // Optional: when present, the minted title is persisted server-side under this
+    // session_id (so `GET /jesse/sessions` can show it). Absent → today's
+    // stateless behavior exactly (nothing persisted). Additive and
+    // backward-compatible: old clients simply omit it.
+    #[serde(default)]
+    session_id: Option<String>,
 }
 
 // ---- Handlers -------------------------------------------------------------
@@ -132,16 +138,21 @@ pub async fn jesse(
         req.health_context_unavailable.unwrap_or(false),
     )?;
 
-    // Concurrency cap (C3): take a permit before spawning the turn. If none is
-    // immediately available, shed load with 429 instead of queuing unboundedly.
-    // The permit is moved into the spawned task and held for the life of the
-    // turn, so the cap reflects in-flight turns, not just connected clients.
-    let permit = match st.sem.clone().try_acquire_owned() {
-        Ok(p) => p,
-        Err(_) => {
+    // Concurrency + bounded queue: decide whether this turn runs now, waits for a
+    // permit, or is shed. A free permit → run immediately (as before). No free
+    // permit but the wait queue has room → QUEUE it: we still create the job and
+    // return 202 below, and the permit is acquired INSIDE the spawned task, so a
+    // second client's turn waits for the first to finish and then runs (the
+    // single-writer default protects vault files from concurrent rewrites). Beyond
+    // the queue (`max_queued`) → shed with 429, exactly as before. The admission is
+    // carried into the task; on any early return below it drops cleanly (a Ready
+    // permit is released, a Queued ticket frees its reserved slot).
+    let admission = match st.queue.admit() {
+        Some(a) => a,
+        None => {
             return Err((
                 StatusCode::TOO_MANY_REQUESTS,
-                "busy: too many concurrent turns".to_string(),
+                "busy: too many turns queued".to_string(),
             ))
         }
     };
@@ -195,17 +206,34 @@ pub async fn jesse(
     let devices = st.devices.clone();
     let notify = st.notify.clone();
     let handle = tokio::spawn(async move {
-        // Hold the permit for the whole turn, releasing it on task exit.
-        let _permit: OwnedSemaphorePermit = permit;
         // Hold the scratch dir for the whole turn; its Drop removes the decoded
         // attachment files when the task ends — success, error, or timeout. The
         // files therefore survive run_claude's internal retries and are cleaned
         // exactly once, here.
         let _scratch = scratch;
-        // If the body below panics, this guard's Drop still drives the job to a
-        // terminal Failed + terminal stream frame (M2) — a panicking turn can
-        // never strand the job in Running forever.
+        // If the body below panics — or the task is aborted (cancel) while still
+        // waiting for a permit — this guard's Drop drives the job to a terminal
+        // state + terminal stream frame (M2). It's write-once, so a cancel that
+        // already wrote `Cancelled` wins; the guard then no-ops.
         let mut guard = TurnGuard::new(jobs.clone(), jid.clone());
+        // Acquire the concurrency permit and hold it for the whole turn. A Ready
+        // admission already holds one (run immediately); a Queued admission WAITS
+        // here until a permit frees — a second client's turn blocks behind the
+        // first. Cancelling a queued turn aborts this task while it waits: the
+        // ticket's Drop frees its queue slot and no `claude` is ever spawned.
+        //
+        // The turn/timeout clock starts only AFTER this — `run_claude_streaming`'s
+        // JESSE_TIMEOUT is measured from its own call below, never while queued.
+        let _permit: OwnedSemaphorePermit = match admission {
+            Admission::Ready(p) => p,
+            Admission::Queued(ticket) => {
+                // Reflect the wait in the live stream, reusing the activity hint
+                // mechanism (no new SSE frame type). A late/reconnecting subscriber
+                // sees it via the accumulated snapshot on subscribe.
+                jobs.stream_push_activity(&jid, QUEUED_ACTIVITY);
+                ticket.wait_for_permit().await
+            }
+        };
 
         // A hosted turn: run the streamed agent turn and extract any agent-emitted
         // directive from the reply's final line. A recognized directive is stripped
@@ -440,6 +468,12 @@ pub async fn jesse_title(
             "claude returned no usable title".to_string(),
         ));
     }
+    // If the client named a session, persist the minted title under it before
+    // returning, so `GET /jesse/sessions` can show it. No session_id → today's
+    // stateless behavior (nothing stored). The store trims + clamps defensively.
+    if let Some(session_id) = req.session_id.as_deref() {
+        st.titles.set(session_id, &title);
+    }
     Ok(Json(json!({ "title": title })))
 }
 
@@ -456,6 +490,7 @@ pub fn app(state: AppState) -> Router {
         .route("/jesse", post(jesse))
         .route("/jesse/prompts", get(jesse_prompts))
         .route("/jesse/diet", get(jesse_diet))
+        .route("/jesse/sessions", get(jesse_sessions))
         .route("/jesse/title", post(jesse_title))
         .route("/jesse/result/:job_id", get(jesse_result))
         .route("/jesse/stream/:job_id", get(jesse_stream))

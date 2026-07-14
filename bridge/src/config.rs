@@ -21,6 +21,12 @@ pub const DEFAULT_JOB_TTL_SECS: u64 = 86_400;
 // pre-24h window, repurposed as the post-fetch grace.
 pub const DEFAULT_RETRIEVAL_GRACE_SECS: u64 = 600;
 
+// Default depth of the turn wait queue in front of the concurrency semaphore
+// (env `JESSE_MAX_QUEUED`). When a permit isn't free, up to this many turns may
+// WAIT for one; beyond it, load is shed with 429. Floor 0 (0 → no queue: an
+// unavailable permit sheds immediately, the pre-queue behavior).
+pub const DEFAULT_MAX_QUEUED: usize = 4;
+
 // Short, fixed timeout for the stateless title endpoint (`POST /jesse/title`).
 // Much tighter than a turn's JESSE_TIMEOUT (default 3600s) because a title is
 // interactive UI latency, not a full agent turn: on overrun the app just
@@ -122,9 +128,15 @@ pub struct Config {
     pub allowed_tools: String,
     // Comma-separated tool denylist passed to `claude --disallowedTools`.
     pub disallowed_tools: String,
-    // Max concurrent turns. A request that can't get a permit immediately is
-    // rejected with 429 rather than queued unboundedly.
+    // Max concurrent turns. Defaults to 1 — a single global write lock, so at
+    // most one turn runs (and can rewrite vault files) at a time regardless of how
+    // many clients are connected. A request that can't get a permit immediately is
+    // QUEUED (up to `max_queued`) rather than rejected; beyond the queue, 429.
     pub max_concurrency: usize,
+    // Depth of the wait queue in front of the concurrency semaphore. When no
+    // permit is free, up to this many turns may wait for one; beyond it, load is
+    // shed with 429 (the pre-queue behavior). Floor 0 → no queue.
+    pub max_queued: usize,
     // Per-service rate ceiling (requests accepted per rolling minute). Bursts
     // beyond this are rejected with 429.
     pub rate_per_min: u32,
@@ -207,6 +219,15 @@ impl Config {
         self.state_dir
             .as_deref()
             .map(|d| PathBuf::from(d).join("device.json"))
+    }
+
+    /// The file the server-side session titles are persisted to (sibling of the
+    /// `jobs/` dir and `device.json`), or `None` when persistence is disabled —
+    /// then titles are in-memory only, the same degradation the job store has.
+    pub fn titles_file(&self) -> Option<PathBuf> {
+        self.state_dir
+            .as_deref()
+            .map(|d| PathBuf::from(d).join("titles.json"))
     }
 }
 
@@ -324,11 +345,16 @@ impl Config {
                 .unwrap_or_else(|| DEFAULT_DISALLOWED_TOOLS.to_string()),
             // `>= 1` floor: a parsed 0 falls back to the default (not to a 1-clamp),
             // the long-standing behavior — so kept explicit, not via `env_parse`.
+            // Default 1 (single-writer): protects vault files from concurrent
+            // rewrites by multiple clients — one turn runs anywhere at a time.
             max_concurrency: std::env::var("JESSE_MAX_CONCURRENCY")
                 .ok()
                 .and_then(|s| s.parse().ok())
                 .filter(|n| *n >= 1)
-                .unwrap_or(2),
+                .unwrap_or(1),
+            // Wait-queue depth; floor 0 (0 → no queue). A parsed value is honored
+            // as-is; unset/unparseable → DEFAULT_MAX_QUEUED.
+            max_queued: env_parse("JESSE_MAX_QUEUED", DEFAULT_MAX_QUEUED),
             rate_per_min: std::env::var("JESSE_RATE_PER_MIN")
                 .ok()
                 .and_then(|s| s.parse().ok())
@@ -427,6 +453,8 @@ mod tests {
             "JESSE_PORT",
             "JESSE_CLAUDE_BIN",
             "JESSE_TIMEOUT",
+            "JESSE_MAX_CONCURRENCY",
+            "JESSE_MAX_QUEUED",
             "JESSE_JOB_TTL_SECS",
             "JESSE_RETRIEVAL_GRACE_SECS",
             "JESSE_STATE_DIR",
@@ -448,6 +476,10 @@ mod tests {
         assert_eq!(cfg.port, 8765);
         assert_eq!(cfg.claude_bin, "claude");
         assert_eq!(cfg.timeout_secs, 3600);
+        // Single-writer default: one turn runs at a time; a burst of up to
+        // DEFAULT_MAX_QUEUED waits behind it rather than being rejected.
+        assert_eq!(cfg.max_concurrency, 1);
+        assert_eq!(cfg.max_queued, DEFAULT_MAX_QUEUED);
         // Eviction defaults: 24h hold for an unfetched reply, short post-fetch grace.
         assert_eq!(cfg.job_ttl_secs, DEFAULT_JOB_TTL_SECS);
         assert_eq!(cfg.retrieval_grace_secs, DEFAULT_RETRIEVAL_GRACE_SECS);
@@ -687,6 +719,24 @@ mod tests {
                 Some(val) => std::env::set_var(k, val),
                 None => std::env::remove_var(k),
             }
+        }
+    }
+
+    #[test]
+    fn max_queued_honors_env_including_explicit_zero() {
+        let _g = ENV_LOCK.lock_ok();
+        let saved = std::env::var("JESSE_MAX_QUEUED").ok();
+        // Explicit 0 is honored (floor 0 → no queue), not folded to the default.
+        std::env::set_var("JESSE_MAX_QUEUED", "0");
+        assert_eq!(Config::from_env().max_queued, 0);
+        std::env::set_var("JESSE_MAX_QUEUED", "9");
+        assert_eq!(Config::from_env().max_queued, 9);
+        // Unparseable falls back to the default.
+        std::env::set_var("JESSE_MAX_QUEUED", "nope");
+        assert_eq!(Config::from_env().max_queued, DEFAULT_MAX_QUEUED);
+        match saved {
+            Some(v) => std::env::set_var("JESSE_MAX_QUEUED", v),
+            None => std::env::remove_var("JESSE_MAX_QUEUED"),
         }
     }
 

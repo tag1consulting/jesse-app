@@ -84,10 +84,13 @@ mod directives;
 mod handlers;
 mod jobstore;
 mod prompt;
+mod queue;
 mod ratelimit;
+mod sessions;
 mod sse;
 mod startup;
 mod state;
+mod titlestore;
 mod util;
 
 // Flat internal namespace: every module's items reachable crate-wide by bare
@@ -105,10 +108,13 @@ pub use directives::*;
 pub use handlers::*;
 pub use jobstore::*;
 pub use prompt::*;
+pub use queue::*;
 pub use ratelimit::*;
+pub use sessions::*;
 pub use sse::*;
 pub use startup::*;
 pub use state::*;
+pub use titlestore::*;
 pub use util::*;
 
 #[cfg(test)]

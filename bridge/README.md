@@ -738,13 +738,13 @@ the trust analysis.
 
 ## Conversation titles (`POST /jesse/title`)
 
-A lightweight, **stateless** endpoint the app calls to turn one conversation's
-text into a **very short title** (roughly 3–6 words, ~40 chars). It is **not a
-turn**: no job is created, nothing is persisted, no session, no live stream, no
-push, and no eviction interaction — it touches none of the jobs/streams/aborts
-state. It reuses the same `claude` invocation discipline as a turn (same
-`build_claude_args` allow/deny tool posture, `kill_on_drop`, and terminal-result
-classification) via a single bounded `run_claude_oneshot` call.
+A lightweight endpoint the app calls to turn one conversation's text into a
+**very short title** (roughly 3–6 words, ~40 chars). It is **not a turn**: no job
+is created, no session, no live stream, no push, and no eviction interaction — it
+touches none of the jobs/streams/aborts state. It reuses the same `claude`
+invocation discipline as a turn (same `build_claude_args` allow/deny tool posture,
+`kill_on_drop`, and terminal-result classification) via a single bounded
+`run_claude_oneshot` call.
 
 ```bash
 curl -s http://127.0.0.1:8765/jesse/title \
@@ -752,6 +752,13 @@ curl -s http://127.0.0.1:8765/jesse/title \
   -H "Content-Type: application/json" \
   -d '{"text":"<a bounded digest of the conversation to title>"}'
 # → { "title": "Weekend Trip Planning" }
+
+# Optionally persist the minted title under a session so GET /jesse/sessions can
+# show it (see the title store below):
+curl -s http://127.0.0.1:8765/jesse/title \
+  -H "Authorization: Bearer $JESSE_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"text":"<digest>","session_id":"<claude session id>"}'
 ```
 
 - **Auth / rate limit.** Same bearer auth as `/jesse` (constant-time compare;
@@ -771,8 +778,65 @@ curl -s http://127.0.0.1:8765/jesse/title \
   non-2xx (`504`/`502`). **The app must treat "no title" as normal** and fall back
   to its existing derived title — it is never surfaced to the user as an error, and
   a title failure is never fatal to the bridge.
+- **Optional server-side title store.** The body accepts an optional
+  `"session_id"`. When present **and** the title call succeeds, the minted title is
+  persisted server-side under that session_id **before** the response, so
+  `GET /jesse/sessions` can show it. **Omitting `session_id` reproduces today's
+  stateless behavior exactly** — nothing is stored (old clients keep working
+  unchanged). The store is a single JSON file `<state_dir>/titles.json` (0600,
+  atomic temp+rename, best-effort — a write failure is logged, never fatal),
+  following the device-token store's discipline; with no state dir configured it is
+  **in-memory only** (titles lost on restart, the same degradation the job store
+  has). The stored title is trimmed and clamped to `MAX_TITLE_CHARS` (60) at the
+  store boundary. It survives a restart (write → reload on startup).
 
-Response: `{ "title": String }`.
+Response: `{ "title": String }` (unchanged whether or not `session_id` is sent).
+
+## Session list (`GET /jesse/sessions`)
+
+Lists the vault's Claude Code **sessions** (threads), newest first, so the app can
+show a history of conversations. Threads are Claude Code sessions: each session's
+transcript is a `<session_id>.jsonl` file under
+`~/.claude/projects/<escaped-vault-path>/`. This endpoint enumerates those files
+for the bridge's vault. **Read-only** — it never writes a session file.
+
+```bash
+curl -s http://127.0.0.1:8765/jesse/sessions \
+  -H "Authorization: Bearer $JESSE_TOKEN"
+# → { "sessions": [
+#      { "session_id": "0a61d246-…", "last_modified": 1752500000,
+#        "first_message": "What is on Today.md?", "title": "Today Overview" },
+#      …newest first…
+#    ] }
+```
+
+- **Auth / rate limit.** Same bearer auth (`401` without/with a wrong bearer) and
+  the same per-service rate limiter (`429` on a burst) as `/jesse`.
+- **Fields.** `session_id` is the jsonl filename stem. `last_modified` is the
+  file's mtime in unix seconds (the sort key, newest first). `first_message` is the
+  text of the session's **first user turn**, truncated to **120 chars** on a char
+  boundary — read from only a bounded 64 KiB prefix of the file; a session whose
+  first user turn isn't found within that prefix gets `first_message: null` (never
+  an error). `title` comes from the [title store](#conversation-titles-post-jessetitle),
+  or `null` if none was ever minted for that session.
+- **Projects-dir derivation (verified).** The `<escaped-vault-path>` is
+  `cfg.vault` with **every non-alphanumeric character replaced by `-`** (so `/`,
+  `.`, and `_` all become `-`; an existing `-` is kept; runs are not collapsed).
+  e.g. `/Users/you/devel/tag1/jesse` → `-Users-you-devel-tag1-jesse`. This was
+  verified against `claude 2.1.208` by creating a session in a controlled cwd and
+  matching the created directory name; it is a **pure, unit-tested** function
+  (`escape_project_path`) pinned against that convention.
+- **`?since=<unix seconds>`.** Returns only sessions with mtime **strictly
+  greater** than the value — a cheap delta poll (usually small and often empty in
+  steady state).
+- **ETag / `304`.** The response carries a **strong ETag** (a quoted SHA-256 over
+  the exact response body). Send it back as `If-None-Match` and an unchanged list
+  returns **`304 Not Modified`** with an empty body. `*` also matches.
+- **Robustness.** A missing projects directory returns an **empty list**, not an
+  error (the bridge may run before any session exists). Unparseable jsonl lines are
+  skipped; non-`.jsonl` files and subdirectories are ignored; a filename that isn't
+  a plain component is skipped defensively (a listing can never reach outside the
+  projects dir).
 
 ## Push notifications (APNs) — optional, off by default
 
@@ -898,7 +962,8 @@ cargo run --release
 | `JESSE_ALLOW_PUBLIC_BIND` | (off) | Set `1`/`true` to allow a non-loopback/non-tailnet bind; otherwise such a bind is a startup error |
 | `JESSE_ALLOWED_TOOLS` | (scoped default) | Comma-separated `--allowedTools` list for the agent (see [`../SECURITY.md`](../SECURITY.md)) |
 | `JESSE_DISALLOWED_TOOLS` | `WebFetch` | Comma-separated `--disallowedTools` denylist. **Only `WebFetch`** — bare `Bash` is deliberately not here: denying it removes the whole Bash tool class and kills every scoped `Bash(...)` grant; unscoped Bash is still blocked by default-deny. See [`../SECURITY.md`](../SECURITY.md#agent-tool-allowlist-in-process-boundary) |
-| `JESSE_MAX_CONCURRENCY` | `2` | Max concurrent turns; excess returns `429` |
+| `JESSE_MAX_CONCURRENCY` | `1` | Max concurrent turns — a **single global write lock** by default, so at most one turn runs (and can rewrite vault files) at a time regardless of how many clients are connected. A turn that can't get a permit immediately is **queued** (see `JESSE_MAX_QUEUED`), not rejected |
+| `JESSE_MAX_QUEUED` | `4` | Depth of the wait queue in front of the concurrency limit. When no permit is free, up to this many turns **wait** for one (returning `202` immediately and streaming a "queued behind another turn" activity line while they wait); beyond the queue, load is shed with `429`. `0` disables the queue (an unavailable permit sheds `429` immediately — the pre-queue behavior) |
 | `JESSE_RATE_PER_MIN` | `30` | Accepted requests per rolling minute; bursts beyond it return `429` |
 | `JESSE_ADVERTISE_HOST` | value of `JESSE_BIND` | Host written into the pairing QR — set to the MagicDNS `ts.net` name to advertise that instead of the bound IP |
 | `JESSE_PORT` | `8765` | Port |

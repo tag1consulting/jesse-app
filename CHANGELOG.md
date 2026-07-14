@@ -15,6 +15,58 @@ CI both run it). See the "Versioning" section of `bridge/README.md`.
 
 ## [Unreleased]
 
+## [Bridge 0.9.0] — 2026-07-14
+
+### Changed
+- **Single-writer default: `JESSE_MAX_CONCURRENCY` now defaults to `1` (was `2`).**
+  The bridge runs one turn at a time by default — a **single global write lock**.
+  With multiple paired clients (or one client's overlapping turns), two turns could
+  previously run at once and both rewrite the same vault files (the diet CSVs,
+  dashboards, daily notes), racing each other's edits. Serializing turns makes the
+  vault the property of exactly one turn at a time. The env override is unchanged;
+  set `JESSE_MAX_CONCURRENCY=2` (or more) to restore concurrent turns.
+- **`POST /jesse` queues instead of shedding when busy (immediate-`429` → bounded
+  queue).** A turn that can't get a concurrency permit immediately is now **queued**
+  rather than rejected: `POST /jesse` still returns `202 {job_id, status:"running"}`
+  at once, and the permit is acquired **inside** the spawned task, so a second
+  client's turn **waits** for the first to finish and then runs. The queue is
+  bounded by a new **`JESSE_MAX_QUEUED`** (env, default `4`, floor `0`); beyond the
+  cap, load is shed with `429` exactly as before (and `JESSE_MAX_QUEUED=0`
+  reproduces the old immediate-`429`, no-queue behavior). While a turn waits, its
+  live stream carries a `"queued behind another turn"` **activity** frame (reusing
+  the existing SSE activity mechanism — no new frame type). Cancelling a queued turn
+  works and frees its queue slot **without ever spawning `claude`**, and the
+  per-turn timeout clock starts only when `claude` spawns, never while queued.
+
+### Added
+- **`GET /jesse/sessions` — the session list.** A new authed, rate-limited endpoint
+  that enumerates the vault's Claude Code session transcripts
+  (`~/.claude/projects/<escaped-vault-path>/*.jsonl`) and returns, **newest first by
+  mtime**, `{ session_id, last_modified, first_message, title }` per session.
+  `first_message` is the first user turn's text truncated to 120 chars (read from a
+  bounded 64 KiB prefix; `null` if not found — never an error, and both plain-string
+  and array-of-blocks message content are handled). `title` comes from the new title
+  store (below). Supports `?since=<unix seconds>` (strictly-greater delta poll) and a
+  **strong ETag** with `If-None-Match` → `304`. A missing projects directory is an
+  empty list, not an error; unparseable lines and non-jsonl files are skipped. The
+  `<escaped-vault-path>` derivation is a pure, unit-tested function — **every
+  non-alphanumeric char → `-`** (verified against `claude 2.1.208`:
+  `/Users/u/devel/tag1/jesse` → `-Users-u-devel-tag1-jesse`).
+- **Server-side title store on `POST /jesse/title`.** The title request gains an
+  optional `"session_id"`; when present and the title call succeeds, the minted
+  title is persisted under it (a single `<state_dir>/titles.json`, 0600, atomic
+  temp+rename, best-effort — mirroring the device-token store), so it survives a
+  restart and `GET /jesse/sessions` can show it. With no state dir the store is
+  in-memory only (the same degradation the job store has). **Omitting `session_id`
+  is byte-for-byte today's stateless behavior** — old clients are unaffected. The
+  stored title is trimmed and clamped to `MAX_TITLE_CHARS` (60) at the store
+  boundary.
+
+All three are additive and backward-compatible (additive endpoint, additive
+optional request field, additive env var, and a default change that only *narrows*
+concurrency); an app build that never calls the new endpoint or sends the new field
+behaves exactly as before.
+
 ## [App 1.0 (36)] — 2026-07-13
 
 ### Changed

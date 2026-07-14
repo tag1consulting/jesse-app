@@ -16,6 +16,7 @@ use crate::*;
             allowed_tools: DEFAULT_ALLOWED_TOOLS.to_string(),
             disallowed_tools: DEFAULT_DISALLOWED_TOOLS.to_string(),
             max_concurrency: 2,
+            max_queued: DEFAULT_MAX_QUEUED,
             rate_per_min: 30,
             job_ttl_secs: 600,
             retrieval_grace_secs: 600,
