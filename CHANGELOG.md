@@ -15,6 +15,20 @@ CI both run it). See the "Versioning" section of `bridge/README.md`.
 
 ## [Unreleased]
 
+## [Bridge 0.9.1] — 2026-07-14
+
+### Docs
+- **Document the diet-pipeline probation graduation criteria.** Added a "Diet
+  pipeline probation" section to `bridge/README.md` (next to the `JESSE_DIET_*`
+  env table) stating when `JESSE_DIET_PROBATION` may be disabled: no earlier than
+  **14 consecutive days** and **30 local-path entries**, with **zero rung-4
+  (append/hook) failures**, **zero structural corrections that had to fall
+  through**, a **rung-2/3 fallback rate under 5%**, and the daily audits reviewed.
+  Flipping the flag is a human decision made against the audit history, never
+  automated; graduation keeps the hosted verify child running on every entry
+  (relaxing verify to spot-check semantics is a separate future decision).
+  Documentation only — no behavior change; probation stays on by default.
+
 ## [App 1.0 (38)] — 2026-07-14
 
 ### Fixed

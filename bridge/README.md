@@ -989,6 +989,39 @@ The server refuses to start if `JESSE_TOKEN` is unset, the vault isn't a
 directory, the `claude` binary can't be found, or `JESSE_BIND` is an unsafe
 address without the override.
 
+### Diet pipeline probation
+
+`JESSE_DIET_PROBATION` defaults to `true` and **stays on** through go-live. In
+probation the hosted verify gate is mandatory and blocking on every extracted
+entry, and the daily diet audit
+(`com.example.jesse-diet-audit` → `~/Library/Logs/jesse-diet-audit/YYYY-MM-DD.txt`)
+records every `diet turn ->` provenance line, the local/hosted-fallback split by
+rung, the verify verdicts, any rollback events, and a re-derivation drift check of
+the day's dashboard totals against `diet-logs/food-log.csv`.
+
+**Probation may be lifted only when ALL of these hold** — this is a **human
+decision made against the accumulated audit history, never automated**:
+
+- **≥ 14 consecutive days** of the pipeline running in production, **and**
+- **≥ 30 local-path entries** actually logged over that window, **and**
+- **zero rung-4 failures** — no append/hook (`generate` / `validate` /
+  `verify-diet-consistency`) failure that forced a rollback, **and**
+- **zero structural corrections that had to fall through** — no turn where a
+  verify `correct`/`reject` verdict could not be applied safely and the entry
+  dropped to the hosted path, **and**
+- a **rung-2/3 fallback rate under 5%** (extract failures / `no_loggable_content`
+  / verify-unavailable / verify-rejected, as a fraction of gated diet turns), **and**
+- the **daily audits have been reviewed** across the whole window, not merely
+  generated.
+
+Flipping `JESSE_DIET_PROBATION` to a falsey value is a deliberate operator action
+taken after reading the audit history; nothing in the pipeline flips it
+automatically. **Graduation does not turn verify off.** Even with probation
+disabled, the hosted verify child keeps running on every extracted entry; whether
+the graduated state relaxes verify to spot-check semantics (rather than
+blocking-on-every-entry) is a **separate future decision**, not implied by lifting
+probation.
+
 ## Versioning
 
 The **bridge** and the **app** are versioned **independently**:
