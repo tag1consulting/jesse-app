@@ -41,6 +41,59 @@ enum DietSemantics {
         }
     }
 
+    /// The deterministic goal outcome for a metric, computed in code so the on-device
+    /// insight never has to guess it (the source of the "you hit your goal" bug when it
+    /// did). Its thresholds mirror the `*Remaining` strings exactly, so the discrete
+    /// status and the human wording can never disagree.
+    ///
+    /// `met` — the goal is satisfied: a floor reached, within a window, or under a
+    /// ceiling. `short(by:)` — below a floor / a window's low edge by that many
+    /// grams/cal (the amount still needed). `over(by:)` — past a ceiling / a window's
+    /// high edge by that amount. `noGoal` — no usable target, so NO goal claim may be
+    /// made at all.
+    enum GoalStatus: Equatable, Sendable {
+        case met
+        case short(Double)
+        case over(Double)
+        case noGoal
+
+        /// Whether the goal is satisfied — the only state under which an insight may
+        /// assert the goal was hit/met.
+        var isMet: Bool { self == .met }
+    }
+
+    // MARK: - Discrete goal status (deterministic, mirrors the remaining strings)
+
+    /// FLOOR: met at or above target, else short by the shortfall.
+    static func floorGoalStatus(value: Double, target: Double) -> GoalStatus {
+        guard target > 0 else { return .noGoal }
+        return value >= target ? .met : .short(target - value)
+    }
+
+    /// CEILING: met at or under target, else over by the excess.
+    static func ceilingGoalStatus(value: Double, target: Double) -> GoalStatus {
+        guard target > 0 else { return .noGoal }
+        return value <= target ? .met : .over(value - target)
+    }
+
+    /// FAT WINDOW (normal day): short of the 50g floor below it, met inside 50–65g,
+    /// over the 65g working cap above it.
+    static func fatWindowGoalStatus(grams: Double) -> GoalStatus {
+        if grams < fatFloor { return .short(fatFloor - grams) }
+        if grams <= fatCap { return .met }
+        return .over(grams - fatCap)
+    }
+
+    /// CALORIE WINDOW (carb-load day): short of the 92% low edge below it, met inside
+    /// 92–100%, over target above it.
+    static func calorieWindowGoalStatus(value: Double, target: Double) -> GoalStatus {
+        guard target > 0 else { return .noGoal }
+        let low = target * carbLoadLowFraction
+        if value < low { return .short(low - value) }
+        if value <= target { return .met }
+        return .over(value - target)
+    }
+
     // MARK: - Day-style profile
 
     /// Whether today is a carb-load day. `dayStyle` wins; if absent, fall back to a
@@ -217,12 +270,14 @@ enum DietSemantics {
                 label: "Calories", goal: .window, value: sum.cal, target: t.calories,
                 status: calorieWindowStatus(value: sum.cal, target: calTarget),
                 remaining: calorieWindowRemaining(value: sum.cal, target: calTarget),
+                goalStatus: calorieWindowGoalStatus(value: sum.cal, target: calTarget),
                 flag: nil, unit: "", fraction: fraction(sum.cal, calTarget))
         } else {
             calories = MetricGauge(
                 label: "Calories", goal: .ceiling, value: sum.cal, target: t.calories,
                 status: ceilingStatus(value: sum.cal, target: calTarget),
                 remaining: ceilingRemaining(value: sum.cal, target: calTarget),
+                goalStatus: ceilingGoalStatus(value: sum.cal, target: calTarget),
                 flag: nil, unit: "", fraction: fraction(sum.cal, calTarget))
         }
 
@@ -232,6 +287,7 @@ enum DietSemantics {
             label: Macro.protein.displayName, goal: .floor, value: sum.p, target: t.protein,
             status: floorStatus(value: sum.p, target: pTarget),
             remaining: floorRemaining(value: sum.p, target: pTarget),
+            goalStatus: floorGoalStatus(value: sum.p, target: pTarget),
             flag: proteinLowFlag(protein: sum.p, target: t.protein, hour: hour),
             unit: "g", fraction: fraction(sum.p, pTarget))
 
@@ -241,6 +297,7 @@ enum DietSemantics {
             label: Macro.carbs.displayName, goal: .floor, value: sum.c, target: (t.carbsBase ?? t.carbs),
             status: floorStatus(value: sum.c, target: cTarget),
             remaining: floorRemaining(value: sum.c, target: cTarget),
+            goalStatus: floorGoalStatus(value: sum.c, target: cTarget),
             flag: nil, unit: "g", fraction: fraction(sum.c, cTarget))
 
         // Fat: window on a normal day, minimize-it ceiling on a carb-load day.
@@ -251,12 +308,14 @@ enum DietSemantics {
                 label: Macro.fat.displayName, goal: .ceiling, value: sum.f, target: t.fat,
                 status: ceilingStatus(value: sum.f, target: fTarget),
                 remaining: ceilingRemaining(value: sum.f, target: fTarget, unit: "g"),
+                goalStatus: ceilingGoalStatus(value: sum.f, target: fTarget),
                 flag: nil, unit: "g", fraction: fraction(sum.f, fTarget))
         } else {
             fat = MetricGauge(
                 label: Macro.fat.displayName, goal: .window, value: sum.f, target: fatCap,
                 status: fatWindowStatus(grams: sum.f),
                 remaining: fatWindowRemaining(grams: sum.f),
+                goalStatus: fatWindowGoalStatus(grams: sum.f),
                 flag: fatLowFlag(fat: sum.f, hour: hour),
                 unit: "g", fraction: fraction(sum.f, fatCap))
         }
@@ -268,12 +327,14 @@ enum DietSemantics {
             fiber = MetricGauge(
                 label: Macro.fiber.displayName, goal: .floor, value: sum.fiber, target: fiberTarget,
                 status: .suspended, remaining: "suspended (carb-load)",
+                goalStatus: .noGoal,
                 flag: nil, unit: "g", fraction: fraction(sum.fiber, fiberTarget))
         } else {
             fiber = MetricGauge(
                 label: Macro.fiber.displayName, goal: .floor, value: sum.fiber, target: fiberTarget,
                 status: floorStatus(value: sum.fiber, target: fiberTarget),
                 remaining: floorRemaining(value: sum.fiber, target: fiberTarget),
+                goalStatus: floorGoalStatus(value: sum.fiber, target: fiberTarget),
                 flag: nil, unit: "g", fraction: fraction(sum.fiber, fiberTarget))
         }
 
@@ -512,6 +573,10 @@ struct MetricGauge: Equatable, Sendable {
     var target: Double?
     var status: DietSemantics.Status
     var remaining: String
+    /// The deterministic goal outcome (met / short / over / no-goal), computed
+    /// alongside `remaining` so the insight is fed a ground-truth status instead of
+    /// guessing one. Defaults to `.noGoal` so a gauge built without it makes no claim.
+    var goalStatus: DietSemantics.GoalStatus = .noGoal
     /// The gated "low" nag (protein/fat), surfaced only at/after 16:00. Nil otherwise.
     var flag: String?
     var unit: String

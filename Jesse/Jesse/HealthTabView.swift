@@ -110,6 +110,17 @@ struct TodayScreen: View {
         .sheet(item: $explainer) { ExplainerSheet(explainer: $0) }
     }
 
+    /// Open a metric's drill-down from a Today-screen ring tap: attach the shared
+    /// enriched drill-down (contributing foods + grounded insight) to the metric's
+    /// explainer, so tapping the calorie or a macro ring here presents the identical
+    /// sheet the Macros & calories detail does — one component, not a copied variant.
+    private func openDrilldown(_ ex: Explainer, metric: ContributionMetric, gauge: MetricGauge) {
+        var enriched = ex
+        enriched.drilldown = FoodDrilldown.build(meals: today.meals, metric: metric,
+                                                 gauge: gauge, isCarbLoad: gauges.isCarbLoad)
+        explainer = enriched
+    }
+
     // Paging control: back / forward chevrons flanking a "Today" jump button, each
     // enabled per availableDays. Chevrons (not a swipe) to avoid fighting the
     // vertical scroll and the tab-bar gestures.
@@ -204,7 +215,8 @@ struct TodayScreen: View {
                 .listRowBackground(Color.clear)
             } else {
                 CaloriesHeroRing(gauge: gauges.calories, net: gauges.net) {
-                    explainer = Explainers.calories(gauges.calories, isCarbLoad: gauges.isCarbLoad)
+                    openDrilldown(Explainers.calories(gauges.calories, isCarbLoad: gauges.isCarbLoad),
+                                  metric: .calories, gauge: gauges.calories)
                 }
                 .padding(.vertical, 8)
                 .listRowBackground(Color.clear)
@@ -231,7 +243,8 @@ struct TodayScreen: View {
                 HStack(alignment: .top, spacing: 8) {
                     ForEach(gauges.orderedMacros, id: \.macro) { entry in
                         MacroRing(gauge: entry.gauge) {
-                            explainer = Explainers.macro(entry.macro, gauges: gauges)
+                            openDrilldown(Explainers.macro(entry.macro, gauges: gauges),
+                                          metric: .macro(entry.macro), gauge: entry.gauge)
                         }
                     }
                 }

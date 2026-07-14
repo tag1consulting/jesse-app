@@ -282,4 +282,51 @@ final class DietSemanticsTests: XCTestCase {
         XCTAssertNotNil(after.fat.flag)
         XCTAssertEqual(after.protein.status, .red, "color unchanged by the gate")
     }
+
+    // MARK: - Deterministic goal status (the insight grounding)
+
+    func testFloorGoalStatus() {
+        XCTAssertEqual(S.floorGoalStatus(value: 93, target: 140), .short(47)) // below → short by the gap
+        XCTAssertEqual(S.floorGoalStatus(value: 140, target: 140), .met)      // exactly at → met
+        XCTAssertEqual(S.floorGoalStatus(value: 160, target: 140), .met)      // above → met
+        XCTAssertEqual(S.floorGoalStatus(value: 50, target: 0), .noGoal)      // no target → no claim
+    }
+
+    func testCeilingGoalStatus() {
+        XCTAssertEqual(S.ceilingGoalStatus(value: 1800, target: 2100), .met)  // under limit → met
+        XCTAssertEqual(S.ceilingGoalStatus(value: 2100, target: 2100), .met)  // at limit → met
+        XCTAssertEqual(S.ceilingGoalStatus(value: 2200, target: 2100), .over(100)) // over → over
+        XCTAssertEqual(S.ceilingGoalStatus(value: 500, target: 0), .noGoal)
+    }
+
+    func testFatWindowGoalStatus() {
+        XCTAssertEqual(S.fatWindowGoalStatus(grams: 40), .short(10)) // below the 50g floor
+        XCTAssertEqual(S.fatWindowGoalStatus(grams: 60), .met)       // inside 50–65
+        XCTAssertEqual(S.fatWindowGoalStatus(grams: 72), .over(7))   // past the 65g cap
+    }
+
+    func testCalorieWindowGoalStatus() {
+        // Window low edge is 92% of target; met inside 92–100%, over above.
+        XCTAssertEqual(S.calorieWindowGoalStatus(value: 2500, target: 3000), .short(260)) // 2760 low edge
+        XCTAssertEqual(S.calorieWindowGoalStatus(value: 2900, target: 3000), .met)
+        XCTAssertEqual(S.calorieWindowGoalStatus(value: 3100, target: 3000), .over(100))
+        XCTAssertEqual(S.calorieWindowGoalStatus(value: 100, target: 0), .noGoal)
+    }
+
+    func testGaugesCarryGoalStatus() {
+        // Protein under target → short; a met floor → met; suspended fiber → no goal.
+        let meals = [DietMeal(name: "all", time: "12:00", items: [item(1200, 93, 40, 300, 20)])]
+        let targets = DietTargets(calories: 2100, protein: 140, fat: 65, carbs: 210, carbsBase: 180, fiber: 38)
+        let g = S.gauges(for: todayNormal(meals: meals, targets: targets), hour: 12)
+        XCTAssertEqual(g.protein.goalStatus, .short(47))   // 93 of 140 → the defect case
+        XCTAssertEqual(g.carbs.goalStatus, .met)           // 300 ≥ 180 base
+        XCTAssertEqual(g.fiber.goalStatus, .short(18))     // 20 of 38 on a normal day
+
+        // Fiber on a carb-load day is suspended → it makes no goal claim.
+        let clTargets = DietTargets(calories: 3000, protein: 140, fat: 50, carbs: 450, carbsBase: 450, fiber: 38)
+        let cl = S.gauges(for: DietToday(date: "2026-07-09", dayStyle: "carb-load-training",
+                                         dayType: nil, weight: nil, exercise: [], meals: meals,
+                                         targets: clTargets), hour: 12)
+        XCTAssertEqual(cl.fiber.goalStatus, .noGoal)
+    }
 }

@@ -15,6 +15,45 @@ CI both run it). See the "Versioning" section of `bridge/README.md`.
 
 ## [Unreleased]
 
+## [App 1.0 (38)] — 2026-07-14
+
+### Fixed
+- **The macro/calorie drill-down now opens the same enriched sheet from the Today
+  screen too.** Tapping a macro ring or the calorie ring on the main Today screen
+  opened the bare explainer — prose only, no contributing foods, no insight — while
+  tapping a bar inside Macros & calories opened the enriched one. Both entry points
+  now route through a single shared builder (`FoodDrilldown.build`), so tapping
+  protein, carbs, fat, fiber, or calories *anywhere* presents the identical facts and
+  grounded insight.
+- **The insight no longer asserts a goal was hit when it wasn't.** The drill-down
+  correctly read "93/140g, need 47g more" while the insight below claimed "you've hit
+  your protein goal" — the model was handed the per-food contributions but no
+  authoritative goal status, so it guessed (and guessed "met" on nearly every macro).
+  Goal status is now computed in code, never by the model:
+  - A deterministic `GoalStatus` (met / short by N / over by N / no-goal) is computed
+    alongside each gauge's remaining string, from the same numbers the title shows, and
+    handed to the model as an explicit **ground-truth** fact it's instructed never to
+    contradict — it may only claim the goal was hit when the status says *met*.
+  - A post-generation **discard guard** is the deterministic backstop: if a generated
+    insight still asserts the goal was reached while the computed status says otherwise
+    (or makes any goal claim when there's no target), the insight is dropped and the
+    facts stand alone. A wrong insight is worse than none.
+  - Unit-tested at the defect's layer: the goal-status computation (below / at / above
+    goal, windows, and nil target), that the gauges carry it, that the grounding prompt
+    states it as authoritative, and that the guard catches the field's exact wrong
+    sentence and its variants while keeping genuinely-met and color-only insights.
+
+### Added
+- **Share the whole drill-down page.** A share button on the drill-down sheet exports a
+  clean plain-text rendition — the metric title with its consumed/goal and remaining,
+  the sorted contributing foods with amounts and contributions, and the insight when
+  one is present — that pastes cleanly into a chat or note with no markdown scaffolding.
+  Pure and unit-tested.
+- **Selectable text on the drill-down.** `.textSelection(.enabled)` is applied to the
+  value/target line, the explanation paragraphs, the contributing-food rows, and the
+  insight. Where SwiftUI's selection falls short, the plain-text share export is the
+  guaranteed path that carries the full page.
+
 ## [App 1.0 (37)] — 2026-07-14
 
 ### Added

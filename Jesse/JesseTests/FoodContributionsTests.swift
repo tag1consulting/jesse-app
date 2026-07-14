@@ -157,4 +157,26 @@ final class FoodContributionsTests: XCTestCase {
         let bd = FoodContributions.breakdown(meals, metric: .macro(.protein), total: 40.3)
         XCTAssertNil(bd.reconciliationNote)
     }
+
+    // MARK: - Shared drill-down builder (the single path both entry points use)
+
+    func testDrilldownBuildAttachesFactsAndGroundedStatus() {
+        // The builder BOTH the Today rings and the Macros detail call: it must attach
+        // the ranked facts AND ground the insight with the gauge's deterministic status
+        // (target + goalStatus), so tapping a metric anywhere gets the identical
+        // enriched sheet — the fix for the Today screen opening the bare explainer.
+        let meals = [meal("Day", [item("Chicken", p: 60), item("Yogurt", p: 33)])]
+        let gauge = MetricGauge(label: "Protein", goal: .floor, value: 93, target: 140,
+                                status: .yellow, remaining: "need 47g more",
+                                goalStatus: .short(47), flag: nil, unit: "g", fraction: 93.0 / 140)
+        let drill = FoodDrilldown.build(meals: meals, metric: .macro(.protein),
+                                        gauge: gauge, isCarbLoad: false)
+        // Facts: the ranked contributing foods, reconciled to the gauge's value.
+        XCTAssertEqual(drill.breakdown.contributions.map(\.name), ["Chicken", "Yogurt"])
+        XCTAssertEqual(drill.breakdown.total, 93)
+        // Grounding: the insight is fed the gauge's target and deterministic status.
+        XCTAssertEqual(drill.insightInput.goal, 140)
+        XCTAssertEqual(drill.insightInput.goalStatus, .short(47))
+        XCTAssertEqual(drill.insightInput.total, 93)
+    }
 }

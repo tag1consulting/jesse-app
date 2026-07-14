@@ -491,6 +491,22 @@ struct Explainer: Identifiable, Equatable {
 struct FoodDrilldown: Equatable, Sendable {
     let breakdown: FoodBreakdown
     let insightInput: HealthInsightInput
+
+    /// Build the drill-down for a tapped metric — the single builder BOTH entry points
+    /// use (the Today rings and the Macros & calories detail), so tapping a metric
+    /// anywhere produces the identical facts and grounded insight. The headline is the
+    /// gauge's own value, so the foods reconcile against the number the tap came from,
+    /// and the insight is fed the gauge's deterministic goal status rather than guessing.
+    static func build(meals: [DietMeal], metric: ContributionMetric,
+                      gauge: MetricGauge, isCarbLoad: Bool) -> FoodDrilldown {
+        let breakdown = FoodContributions.breakdown(meals, metric: metric, total: gauge.value)
+        let input = HealthInsight.input(
+            metric: metric, total: gauge.value, goal: gauge.target,
+            goalStatus: gauge.goalStatus, goalPhrase: HealthInsight.goalPhrase(gauge.goal),
+            dayStyle: isCarbLoad ? "carb-load day" : "ordinary day",
+            contributions: breakdown.contributions)
+        return FoodDrilldown(breakdown: breakdown, insightInput: input)
+    }
 }
 
 /// A reusable explainer sheet. When the explainer carries a `drilldown` (a macro or
@@ -503,14 +519,20 @@ struct ExplainerSheet: View {
     /// FoundationModels-backed seam by default.
     var insight: HealthInsightGenerating = HealthInsight.live()
     @Environment(\.dismiss) private var dismiss
+    /// The live insight text, owned here so the share export carries whatever is on
+    /// screen. Empty when there's no drill-down or the model produced nothing.
+    @State private var insightText = ""
+
     var body: some View {
         NavigationStack {
             ScrollView {
                 VStack(alignment: .leading, spacing: 16) {
                     Text(explainer.valueLine)
                         .font(.title3.weight(.semibold).monospacedDigit())
+                        .textSelection(.enabled)
                     ForEach(Array(explainer.paragraphs.enumerated()), id: \.offset) { _, p in
                         Text(p).font(.body).foregroundStyle(.secondary)
+                            .textSelection(.enabled)
                     }
                     if let drilldown = explainer.drilldown {
                         Divider()
@@ -518,7 +540,8 @@ struct ExplainerSheet: View {
                         // The insight is secondary to the facts: it appears below and
                         // fills in after them, and renders nothing when the model is
                         // unavailable.
-                        HealthInsightView(input: drilldown.insightInput, provider: insight)
+                        HealthInsightView(input: drilldown.insightInput, provider: insight,
+                                          text: $insightText)
                     }
                 }
                 .frame(maxWidth: .infinity, alignment: .leading)
@@ -527,12 +550,63 @@ struct ExplainerSheet: View {
             .navigationTitle(explainer.title)
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
+                // Share the whole page as clean plain text — the guaranteed path that
+                // carries everything regardless of where SwiftUI text selection has
+                // gaps. Shown only when there's a drill-down (a full page to share).
+                if let drilldown = explainer.drilldown {
+                    ToolbarItem(placement: .topBarLeading) {
+                        ShareLink(item: DrilldownShare.plainText(
+                            title: explainer.title, valueLine: explainer.valueLine,
+                            breakdown: drilldown.breakdown,
+                            insight: insightText.isEmpty ? nil : insightText))
+                    }
+                }
                 ToolbarItem(placement: .confirmationAction) {
                     Button("Done") { dismiss() }
                 }
             }
         }
         .presentationDetents([.medium, .large])
+    }
+}
+
+/// Renders a metric drill-down as clean plain text for the share sheet: the metric
+/// title with its consumed/goal line, the sorted contributing foods with amounts and
+/// contributions, and the on-device insight when one is present. Plain text on
+/// purpose — it pastes cleanly into a chat or note with no markdown scaffolding, and
+/// it's the guaranteed carrier of the full page where on-screen selection falls short.
+/// Pure and unit-tested.
+enum DrilldownShare {
+    static func plainText(title: String, valueLine: String, breakdown: FoodBreakdown,
+                          insight: String?) -> String {
+        var lines: [String] = []
+        // Header: the metric and its live value/target/remaining line, joined so it
+        // reads as one sentence ("Protein — 93 / 140g — need 47g more").
+        lines.append("\(title) — \(valueLine)")
+        lines.append("")
+
+        lines.append("What fed this:")
+        if breakdown.isEmpty {
+            lines.append(breakdown.hasFoodButNoContributors
+                ? "No logged food lists its \(breakdown.metric.label.lowercased()) yet."
+                : "No foods logged yet.")
+        } else {
+            for c in breakdown.contributions {
+                let amount = c.amount.map { " (\($0))" } ?? ""
+                let share = Int((c.share * 100).rounded())
+                lines.append("• \(c.name)\(amount): \(DietSemantics.fmt(c.value)) \(breakdown.metric.unit) — \(share)%")
+            }
+            if let note = breakdown.reconciliationNote {
+                lines.append(note)
+            }
+        }
+
+        if let insight, !insight.isEmpty {
+            lines.append("")
+            lines.append("On-device insight:")
+            lines.append(insight)
+        }
+        return lines.joined(separator: "\n")
     }
 }
 
@@ -569,6 +643,10 @@ struct ContributingFoodsView: View {
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
+        // Enable selection for the food rows too; it propagates to the descendant
+        // Text views (name, amount, contribution). The share export is the guaranteed
+        // carrier where a given row's selection doesn't take.
+        .textSelection(.enabled)
     }
 
     private var emptyMessage: String {
@@ -643,8 +721,9 @@ struct ProportionBar: View {
 struct HealthInsightView: View {
     let input: HealthInsightInput
     let provider: HealthInsightGenerating
-
-    @State private var text = ""
+    /// The live insight text, lifted to the parent so the share export can carry it.
+    /// Bound (not local `@State`) because the sheet owns it for the plain-text export.
+    @Binding var text: String
 
     var body: some View {
         // An always-present container carries the `.task`, so the stream starts even
@@ -659,15 +738,23 @@ struct HealthInsightView: View {
                 Text(text)
                     .font(.footnote)
                     .foregroundStyle(.secondary)
+                    .textSelection(.enabled)
                     .fixedSize(horizontal: false, vertical: true)
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
         .task(id: input) {
+            text = ""
             // Each cumulative snapshot replaces the text so it grows in place. A model
             // that's unavailable or errors yields no snapshots, so `text` stays empty
-            // and nothing renders.
+            // and nothing renders. The guard is the deterministic backstop: if a
+            // snapshot asserts a goal was reached that the computed status contradicts,
+            // discard the insight outright and leave the facts standing alone.
             for await snapshot in provider.insight(for: input) {
+                if HealthInsightGuard.contradicts(snapshot, status: input.goalStatus) {
+                    text = ""
+                    break
+                }
                 text = snapshot
             }
         }

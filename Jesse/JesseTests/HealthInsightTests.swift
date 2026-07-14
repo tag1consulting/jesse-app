@@ -14,9 +14,11 @@ final class HealthInsightTests: XCTestCase {
 
     private func input(foods: [FoodFact],
                        metricLabel: String = "Carbs", unit: String = "g",
-                       total: Double = 250, statusLine: String = "need 40g more") -> HealthInsightInput {
+                       total: Double = 250, goal: Double? = 290,
+                       goalStatus: DietSemantics.GoalStatus = .short(40)) -> HealthInsightInput {
         HealthInsightInput(metricLabel: metricLabel, unit: unit, total: total,
-                           goalPhrase: "a floor to hit or beat", statusLine: statusLine,
+                           goal: goal, goalStatus: goalStatus,
+                           goalPhrase: "a floor to hit or beat",
                            dayStyle: "ordinary day", foods: foods)
     }
 
@@ -31,9 +33,38 @@ final class HealthInsightTests: XCTestCase {
         XCTAssertTrue(prompt.contains("Banana"))
         XCTAssertTrue(prompt.contains("80 g"))
         XCTAssertTrue(prompt.contains("32%"))
-        XCTAssertTrue(prompt.contains("250 g"))       // the day total
-        XCTAssertTrue(prompt.contains("need 40g more")) // the live status line
+        XCTAssertTrue(prompt.contains("250 g"))       // consumed so far
+        XCTAssertTrue(prompt.contains("290 g"))       // the target
         XCTAssertTrue(prompt.contains("Carbs"))
+    }
+
+    // MARK: - Authoritative goal-status grounding (the defect)
+
+    func testPromptStatesGoalNotMetWhenShort() {
+        // 93 of 140 g protein — the real defect case: the model was asserting "you've
+        // hit your goal". The prompt must hand it the computed NOT-met status as ground
+        // truth, with the correct shortfall.
+        let prompt = HealthInsightPrompt.make(input(
+            foods: [FoodFact(name: "Star protein", value: 40, sharePct: 26)],
+            metricLabel: "Protein", total: 93, goal: 140, goalStatus: .short(47)))
+        XCTAssertTrue(prompt.contains("GOAL STATUS"))
+        XCTAssertTrue(prompt.uppercased().contains("NOT MET"))
+        XCTAssertTrue(prompt.contains("47g short"))
+        // And it must forbid the very claim that was appearing.
+        XCTAssertTrue(prompt.lowercased().contains("never say"))
+    }
+
+    func testPromptStatesGoalMetWhenMet() {
+        let prompt = HealthInsightPrompt.make(input(
+            foods: [], metricLabel: "Carbs", total: 300, goal: 290, goalStatus: .met))
+        XCTAssertTrue(prompt.uppercased().contains("MET"))
+    }
+
+    func testPromptMakesNoGoalClaimWhenNoTarget() {
+        let prompt = HealthInsightPrompt.make(input(
+            foods: [], metricLabel: "Fiber", total: 12, goal: nil, goalStatus: .noGoal))
+        XCTAssertTrue(prompt.contains("Target: none set."))
+        XCTAssertTrue(prompt.lowercased().contains("do not state any goal status"))
     }
 
     func testPromptForbidsInvention() {
@@ -54,13 +85,64 @@ final class HealthInsightTests: XCTestCase {
             FoodContribution(id: i, name: "F\(i)", amount: nil, value: Double(10 - i), share: Double(10 - i) / 100)
         }
         let built = HealthInsight.input(
-            metric: .macro(.carbs), total: 100, goalPhrase: "a floor to hit or beat",
-            statusLine: "need 40g more", dayStyle: "ordinary day", contributions: contributions)
+            metric: .macro(.carbs), total: 100, goal: 140, goalStatus: .short(40),
+            goalPhrase: "a floor to hit or beat", dayStyle: "ordinary day",
+            contributions: contributions)
         XCTAssertEqual(built.foods.count, HealthInsight.groundingFoodCount)
         XCTAssertEqual(built.foods.first?.name, "F0")
         XCTAssertEqual(built.foods.first?.sharePct, 10)   // 10/100 → 10%
         XCTAssertEqual(built.metricLabel, "Carbs")
         XCTAssertEqual(built.unit, "g")
+        XCTAssertEqual(built.goal, 140)
+        XCTAssertEqual(built.goalStatus, .short(40))
+    }
+
+    // MARK: - The discard guard (deterministic backstop for a wrong generation)
+
+    func testGuardDiscardsGoalClaimWhenShort() {
+        // The exact wrong sentence from the field, against a short status → discard.
+        let bad = "You've hit your protein goal for the day, with 26% from the Star protein."
+        XCTAssertTrue(HealthInsightGuard.contradicts(bad, status: .short(47)))
+    }
+
+    func testGuardKeepsGoalClaimWhenActuallyMet() {
+        let ok = "You've hit your protein goal for the day."
+        XCTAssertFalse(HealthInsightGuard.contradicts(ok, status: .met))
+    }
+
+    func testGuardKeepsColorOnlyInsight() {
+        // No goal claim at all — just contributor color — survives any status.
+        let color = "Most of your carbs came from the pasta (32%) and a banana (11%)."
+        XCTAssertFalse(HealthInsightGuard.contradicts(color, status: .short(40)))
+        XCTAssertFalse(HealthInsightGuard.contradicts(color, status: .over(20)))
+    }
+
+    func testGuardDiscardsGoalClaimWhenNoTarget() {
+        // A metric with no target must draw no goal claim; one gets discarded.
+        let bad = "You reached your fiber target easily today."
+        XCTAssertTrue(HealthInsightGuard.contradicts(bad, status: .noGoal))
+    }
+
+    func testGuardCatchesVariedCompletionPhrasings() {
+        for claim in ["You met your carb goal.",
+                      "Your protein target is met.",
+                      "You're on track to hit your goal.",
+                      "Nice — you reached your goal today."] {
+            XCTAssertTrue(HealthInsightGuard.contradicts(claim, status: .short(10)),
+                          "should catch: \(claim)")
+        }
+    }
+
+    func testGuardKeepsNegatedNotMetPhrasings() {
+        // The real on-device output for the 93/140 case — a CORRECT not-met sentence
+        // that contains "met your protein goal" only under a negation. It must survive.
+        for ok in ["You have not met your protein goal for the day",
+                   "You haven't hit your protein goal yet.",
+                   "You're still short of your protein goal.",
+                   "You're under your protein target — 47 g to go."] {
+            XCTAssertFalse(HealthInsightGuard.contradicts(ok, status: .short(47)),
+                           "should keep: \(ok)")
+        }
     }
 
     // MARK: - Seam contract: empty / error → empty stream
