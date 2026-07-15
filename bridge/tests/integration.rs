@@ -3152,3 +3152,224 @@ async fn badge_never_applies_to_the_title_endpoint() {
     assert!(!title.contains('['), "no badge on a title: {title:?}");
     let _ = std::fs::remove_file(&fake);
 }
+
+// ---- Context carry (JESSE_CONTEXT_CARRY, default on) ------------------------
+//
+// The bridge-side ledger that fixes the live defect: a locally-served turn never
+// entered the thread's hosted session, so a later hosted follow-up lost it. These
+// drive the REAL handler end to end with a prompt-sniffing fake `claude`.
+
+/// POST one `/jesse` turn against `st` and poll to a terminal result.
+async fn carry_post_and_wait(st: &AppState, body: &str) -> Value {
+    let resp = app(st.clone())
+        .oneshot(jesse_request(Some("Bearer test-token"), body))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::ACCEPTED);
+    let b: Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    let job_id = b["job_id"].as_str().unwrap().to_string();
+    for _ in 0..120 {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        if result_status(st, &job_id).await["status"] == "done" {
+            return result_status(st, &job_id).await;
+        }
+    }
+    panic!("context-carry turn did not complete");
+}
+
+#[tokio::test]
+async fn context_carry_off_local_turn_is_stateless_today() {
+    // The kill switch, at the router: with carry OFF (the fixture default), a fresh
+    // local vault-QA answer carries session_id: null (today's stateless behavior) and
+    // the ledger records NOTHING. This is the byte-for-byte control for the ON tests.
+    let vault = make_diet_vault();
+    write_vault_file(&vault, "todo-list/Today.md", "# Today\nVO2 max is 52.\n");
+    let fake = write_sniffing_fake("Your VO2 max is 52 (todo-list/Today.md:2).", "HOSTED");
+    let cfg = Config {
+        claude_bin: fake.to_string_lossy().into_owned(),
+        vault: vault.to_string_lossy().into_owned(),
+        vaultqa_backend: Some((
+            "http://127.0.0.1:9100".into(),
+            "vaultqa-dummy-tok".into(),
+            "local-vaultqa".into(),
+        )),
+        context_carry: false,
+        timeout_secs: 30,
+        ..test_config()
+    };
+    let st = AppState::new(cfg);
+    let v = carry_post_and_wait(&st, r#"{"mode":"ask","text":"what is my VO2 max lately"}"#).await;
+    assert_eq!(v["response"], "Your VO2 max is 52 (todo-list/Today.md:2).");
+    assert!(v["session_id"].is_null(), "carry off → stateless, no synthetic id");
+    assert_eq!(st.context.thread_count(), 0, "carry off → nothing recorded");
+    let _ = std::fs::remove_dir_all(&vault);
+    let _ = std::fs::remove_file(&fake);
+}
+
+#[tokio::test]
+async fn context_carry_on_fresh_local_turn_mints_a_synthetic_id() {
+    // Carry ON: a fresh locally-served turn (no request session) is handed a synthetic
+    // `local-<hex>` session id so the app can send it back on the follow-up, and the
+    // turn is recorded under that id as PENDING (not yet in any hosted session).
+    let vault = make_diet_vault();
+    write_vault_file(&vault, "todo-list/Today.md", "# Today\nVO2 max is 52.\n");
+    let fake = write_sniffing_fake("Your VO2 max is 52 (todo-list/Today.md:2).", "HOSTED");
+    let cfg = Config {
+        claude_bin: fake.to_string_lossy().into_owned(),
+        vault: vault.to_string_lossy().into_owned(),
+        vaultqa_backend: Some((
+            "http://127.0.0.1:9100".into(),
+            "vaultqa-dummy-tok".into(),
+            "local-vaultqa".into(),
+        )),
+        context_carry: true,
+        timeout_secs: 30,
+        ..test_config()
+    };
+    let st = AppState::new(cfg);
+    let v = carry_post_and_wait(&st, r#"{"mode":"ask","text":"what is my VO2 max lately"}"#).await;
+    let sid = v["session_id"].as_str().expect("carry on → a synthetic session id");
+    assert!(sid.starts_with("local-"), "fresh local turn mints a synthetic id: {sid}");
+    assert_eq!(st.context.thread_len(sid), 1, "recorded under the synthetic id");
+    assert_eq!(st.context.pending(sid).len(), 1, "a local turn is pending");
+    let _ = std::fs::remove_dir_all(&vault);
+    let _ = std::fs::remove_file(&fake);
+}
+
+/// A fake `claude` for the end-to-end transcript scenario. The vault-QA/emergency
+/// child (prompt carries `INSTRUCTIONS:`) answers from the fixture with a citation.
+/// The hosted turn FAILS transport-class on its first call (so emergency takes over)
+/// and, on its second call, captures its full argv to `argv_file` and returns a real
+/// session id. `count_file` distinguishes the two hosted calls.
+fn write_transcript_fake(
+    count_file: &std::path::Path,
+    argv_file: &std::path::Path,
+) -> std::path::PathBuf {
+    let script = format!(
+        "#!/bin/sh\n\
+         if printf '%s' \"$2\" | grep -q 'INSTRUCTIONS:'; then\n\
+         printf '%s' '{{\"type\":\"result\",\"is_error\":false,\"result\":\"Her birthday is March 3 (people/jamie.md:1).\",\"session_id\":null}}'\n\
+         exit 0\n\
+         fi\n\
+         n=$(cat '{count}' 2>/dev/null || echo 0)\n\
+         n=$((n+1))\n\
+         printf '%s' \"$n\" > '{count}'\n\
+         if [ \"$n\" = \"1\" ]; then\n\
+         printf 'connect ECONNREFUSED 127.0.0.1:9100\\n' >&2\n\
+         exit 1\n\
+         fi\n\
+         printf '%s\\n' \"$@\" > '{argv}'\n\
+         printf '%s' '{{\"type\":\"result\",\"is_error\":false,\"result\":\"She is 40.\",\"session_id\":\"real-sess-xyz\"}}'\n",
+        count = count_file.display(),
+        argv = argv_file.display(),
+    );
+    write_fake_claude(&script)
+}
+
+#[tokio::test]
+async fn context_carry_end_to_end_pins_todays_transcript() {
+    // The flagship scenario from the defect report, pinned:
+    //   turn 1 "What is Jamie's birthday?" — hosted is DOWN (fake transport failure),
+    //     so the emergency child answers from the fixture vault; the reply carries a
+    //     synthetic local- session id.
+    //   turn 2 "So how old is she?" — arrives with that id, runs HOSTED (fake captures
+    //     argv). The captured hosted prompt contains turn 1's question AND answer, argv
+    //     has no --resume, and the ledger ends re-keyed to the real returned id.
+    let vault = make_diet_vault();
+    std::fs::create_dir_all(vault.join("people")).unwrap();
+    write_vault_file(&vault, "people/jamie.md", "Jamie was born on March 3.\n");
+    let n = JOB_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let count_file =
+        std::env::temp_dir().join(format!("jesse-cc-count-{}-{}.txt", std::process::id(), n));
+    let argv_file =
+        std::env::temp_dir().join(format!("jesse-cc-argv-{}-{}.txt", std::process::id(), n));
+    let _ = std::fs::remove_file(&count_file);
+    let _ = std::fs::remove_file(&argv_file);
+    let fake = write_transcript_fake(&count_file, &argv_file);
+
+    let cfg = Config {
+        claude_bin: fake.to_string_lossy().into_owned(),
+        vault: vault.to_string_lossy().into_owned(),
+        vaultqa_backend: Some((
+            "http://127.0.0.1:9100".into(),
+            "vaultqa-dummy-tok".into(),
+            "local-oss".into(),
+        )),
+        emergency_local: true,
+        context_carry: true,
+        timeout_secs: 30,
+        ..test_config()
+    };
+    let st = AppState::new(cfg);
+
+    // Turn 1: emergency-served, fresh thread → synthetic id.
+    let v1 = carry_post_and_wait(&st, r#"{"mode":"ask","text":"What is Jamie's birthday?"}"#).await;
+    assert!(
+        v1["response"].as_str().unwrap().contains("March 3"),
+        "turn 1 answered from the vault by the emergency child: {}",
+        v1["response"]
+    );
+    let synthetic = v1["session_id"].as_str().expect("turn 1 carries a synthetic id");
+    assert!(synthetic.starts_with("local-"), "synthetic id minted: {synthetic}");
+    assert_eq!(st.context.pending(synthetic).len(), 1, "turn 1 is pending");
+
+    // Turn 2: follow-up carrying the synthetic id → runs hosted.
+    let body2 = format!(
+        r#"{{"mode":"ask","text":"So how old is she?","session_id":{}}}"#,
+        serde_json::to_string(synthetic).unwrap()
+    );
+    let v2 = carry_post_and_wait(&st, &body2).await;
+    assert_eq!(v2["response"], "She is 40.", "turn 2 is hosted");
+    assert_eq!(
+        v2["session_id"], "real-sess-xyz",
+        "turn 2 carries the real hosted session id"
+    );
+
+    // The captured hosted prompt carries turn 1's question AND answer, no --resume.
+    let argv = std::fs::read_to_string(&argv_file).expect("turn 2 captured its argv");
+    assert!(
+        argv.contains("What is Jamie's birthday?"),
+        "hosted catch-up carries turn 1's question: {argv}"
+    );
+    assert!(
+        argv.contains("March 3"),
+        "hosted catch-up carries turn 1's answer: {argv}"
+    );
+    assert!(
+        argv.contains("MISSED CONVERSATION HISTORY"),
+        "the catch-up block is framed as data"
+    );
+    assert!(
+        !argv.lines().any(|l| l == "--resume"),
+        "a synthetic id must never reach --resume: {argv}"
+    );
+
+    // The ledger is re-keyed from the synthetic id to the real returned id, and the
+    // once-pending turn 1 is now marked in_hosted_history (absorbed by the session).
+    assert_eq!(st.context.thread_len(synthetic), 0, "synthetic thread re-keyed away");
+    assert!(
+        st.context.thread_len("real-sess-xyz") >= 2,
+        "turns live under the real id now"
+    );
+    assert!(
+        st.context.pending("real-sess-xyz").is_empty(),
+        "turn 1 was marked in_hosted_history on the hosted follow-up"
+    );
+
+    // Turn 3: another hosted turn on the SAME (now real) thread. Because turn 2 already
+    // marked the pending entry in_hosted_history, there is nothing left to catch up —
+    // so turn 3's captured hosted prompt carries NO catch-up block (no double-inject).
+    let body3 = r#"{"mode":"ask","text":"And where does she live?","session_id":"real-sess-xyz"}"#;
+    let v3 = carry_post_and_wait(&st, body3).await;
+    assert_eq!(v3["response"], "She is 40.");
+    let argv3 = std::fs::read_to_string(&argv_file).expect("turn 3 captured its argv");
+    assert!(
+        !argv3.contains("MISSED CONVERSATION HISTORY"),
+        "an already-absorbed thread must not re-inject the catch-up block: {argv3}"
+    );
+
+    let _ = std::fs::remove_dir_all(&vault);
+    let _ = std::fs::remove_file(&fake);
+    let _ = std::fs::remove_file(&count_file);
+    let _ = std::fs::remove_file(&argv_file);
+}
