@@ -256,6 +256,16 @@ pub struct Config {
     // Tell) instead of surfacing the outage. Inert unless BOTH this flag and the
     // vault-QA backend are set; unset → every path is byte-for-byte today's behavior.
     pub emergency_local: bool,
+    // Whether the bridge-side CONTEXT LEDGER is active (env `JESSE_CONTEXT_CARRY` =
+    // `on|off`, DEFAULT ON). It fixes a live defect: a locally served turn never
+    // entered the thread's hosted session, so the next hosted follow-up lost the
+    // earlier turn. On → the ledger records each delivered ask/tell turn, injects a
+    // catch-up block into the next hosted turn and a recent-conversation block into
+    // the local children, and mints a synthetic thread id for a fresh locally-served
+    // turn. Off is the ROLLBACK: byte-for-byte today's behavior — no ledger reads or
+    // writes, no `context.json`, no synthetic ids, no injected blocks. Default ON
+    // follows the badge's default-on precedent because this repairs a live bug.
+    pub context_carry: bool,
 }
 
 impl Config {
@@ -292,6 +302,17 @@ impl Config {
         self.state_dir
             .as_deref()
             .map(|d| PathBuf::from(d).join("titles.json"))
+    }
+
+    /// The file the context ledger is persisted to (a sibling of `titles.json`),
+    /// or `None` when persistence is disabled — then the ledger is in-memory only,
+    /// the same degradation the job/title/device stores have. Holds conversation
+    /// content (the ledger's whole point), so it stays in the state dir and never
+    /// reaches the metrics log, provenance, or any other log line.
+    pub fn context_file(&self) -> Option<PathBuf> {
+        self.state_dir
+            .as_deref()
+            .map(|d| PathBuf::from(d).join("context.json"))
     }
 }
 
@@ -450,6 +471,21 @@ pub fn resolve_emergency_local() -> bool {
         .unwrap_or(false)
 }
 
+/// Parse `JESSE_CONTEXT_CARRY` into the `context_carry` flag. Default TRUE (mirrors
+/// [`resolve_model_badge`]): only an explicit `off`/`0`/`false`/`no` disables it. This
+/// repairs a live defect, so the off switch is the ROLLBACK, not the default — the same
+/// default-on precedent the badge follows, and the opposite of `resolve_emergency_local`
+/// (which defaults OFF because it changes what a hosted outage does).
+pub fn resolve_context_carry() -> bool {
+    std::env::var("JESSE_CONTEXT_CARRY")
+        .ok()
+        .map(|v| {
+            let v = v.trim().to_ascii_lowercase();
+            !(v == "0" || v == "false" || v == "no" || v == "off")
+        })
+        .unwrap_or(true)
+}
+
 impl Config {
     pub fn from_env() -> Self {
         let home = std::env::var("HOME").unwrap_or_default();
@@ -551,6 +587,8 @@ impl Config {
             metrics_log: env_string("JESSE_METRICS_LOG"),
             // Emergency local fallback arm; default OFF (see `resolve_emergency_local`).
             emergency_local: resolve_emergency_local(),
+            // Context ledger (context carry); default ON (see `resolve_context_carry`).
+            context_carry: resolve_context_carry(),
         }
     }
 }
@@ -1078,6 +1116,44 @@ mod tests {
         match saved {
             Some(v) => std::env::set_var("JESSE_EMERGENCY_LOCAL", v),
             None => std::env::remove_var("JESSE_EMERGENCY_LOCAL"),
+        }
+    }
+
+    #[test]
+    fn context_carry_defaults_on_and_only_explicit_falsey_disables() {
+        // Context carry fixes a live defect, so it defaults ON (the badge/probation
+        // truthiness rule): only an explicit off/0/false/no flips it off — the
+        // rollback switch. Unset or any other value keeps it on.
+        let _g = ENV_LOCK.lock_ok();
+        let saved = std::env::var("JESSE_CONTEXT_CARRY").ok();
+        std::env::remove_var("JESSE_CONTEXT_CARRY");
+        assert!(Config::from_env().context_carry, "default on");
+        for falsey in ["0", "false", "no", "off", "OFF", " Off "] {
+            std::env::set_var("JESSE_CONTEXT_CARRY", falsey);
+            assert!(
+                !Config::from_env().context_carry,
+                "explicit {falsey:?} disables (rollback)"
+            );
+        }
+        for truthy in ["1", "true", "yes", "on", "anything-else"] {
+            std::env::set_var("JESSE_CONTEXT_CARRY", truthy);
+            assert!(
+                Config::from_env().context_carry,
+                "{truthy:?} keeps carry on"
+            );
+        }
+        // The persistence path is a sibling of titles.json, and None with no state dir.
+        let mut cfg = Config::from_env();
+        cfg.state_dir = Some("/var/jesse".to_string());
+        assert_eq!(
+            cfg.context_file(),
+            Some(PathBuf::from("/var/jesse/context.json"))
+        );
+        cfg.state_dir = None;
+        assert_eq!(cfg.context_file(), None);
+        match saved {
+            Some(v) => std::env::set_var("JESSE_CONTEXT_CARRY", v),
+            None => std::env::remove_var("JESSE_CONTEXT_CARRY"),
         }
     }
 }

@@ -174,8 +174,9 @@ JESSE_NEEDS_HEALTH again this turn.)";
 /// multi-line — one workout per line); every other ASCII control char (C0 and
 /// DEL, including tab and carriage return) is dropped so a crafted block cannot
 /// smuggle terminal escapes, NULs, or stray control bytes into the prompt. Pure,
-/// so it is unit-tested.
-fn strip_ascii_controls_keep_newline(s: &str) -> String {
+/// so it is unit-tested. `pub(crate)` so the context ledger frames its injected
+/// blocks with the SAME control hygiene device data gets.
+pub(crate) fn strip_ascii_controls_keep_newline(s: &str) -> String {
     s.chars()
         .filter(|&c| c == '\n' || !c.is_ascii_control())
         .collect()

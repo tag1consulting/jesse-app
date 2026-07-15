@@ -50,6 +50,11 @@ pub(crate) fn test_config() -> Config {
         // exercise metrics/emergency set these explicitly.
         metrics_log: None,
         emergency_local: false,
+        // Context carry OFF in the fixture (like the badge/emergency defaults): the
+        // many exact-`response`/`session_id` assertions predate it and must be
+        // byte-for-byte unaffected. Carry behavior is covered by dedicated tests that
+        // enable it explicitly (the shipped `from_env` default is ON).
+        context_carry: false,
     }
 }
 pub(crate) fn test_state() -> AppState {

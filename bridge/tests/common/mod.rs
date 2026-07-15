@@ -50,6 +50,10 @@ pub fn test_config() -> Config {
         // an unconfigured deploy (the both-unset byte-for-byte property).
         metrics_log: None,
         emergency_local: false,
+        // Context carry OFF in the fixture (like the badge/emergency defaults): the
+        // exact-`response`/`session_id` turn assertions predate it. Carry behavior is
+        // covered by dedicated tests that enable it (the shipped default is ON).
+        context_carry: false,
     }
 }
 pub fn test_state() -> AppState {

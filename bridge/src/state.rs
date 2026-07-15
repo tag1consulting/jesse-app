@@ -33,6 +33,12 @@ pub struct AppState {
     // emergency fallback is armed — `handlers::jesse` only consults it then, so with
     // emergency off it never changes a turn's behavior.
     pub breaker: Arc<CircuitBreaker>,
+    // The context ledger (context carry): records each delivered turn per thread and
+    // feeds a catch-up block into the next hosted turn + a recent-conversation block
+    // into the local children, so a locally-served turn is not lost to a later hosted
+    // follow-up. Persisted to `<state_dir>/context.json`. Inert (a total no-op) unless
+    // `cfg.context_carry` is on — with carry off every path is byte-for-byte today's.
+    pub context: Arc<ContextLedger>,
 }
 
 impl AppState {
@@ -46,6 +52,8 @@ impl AppState {
         let jobs_dir = cfg.jobs_dir();
         let device_file = cfg.device_file();
         let titles_file = cfg.titles_file();
+        let context_file = cfg.context_file();
+        let context_enabled = cfg.context_carry;
         let sem = Arc::new(Semaphore::new(cfg.max_concurrency.max(1)));
         let queue = QueueGate::new(sem.clone(), cfg.max_queued);
         let limiter = Arc::new(RateLimiter::new(cfg.rate_per_min));
@@ -60,6 +68,7 @@ impl AppState {
             notify: Arc::new(NotifyFlags::new()),
             apns: None,
             breaker: Arc::new(CircuitBreaker::new()),
+            context: Arc::new(ContextLedger::new(context_file, context_enabled)),
         }
     }
 
