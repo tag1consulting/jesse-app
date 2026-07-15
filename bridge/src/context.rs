@@ -453,7 +453,12 @@ fn clean(s: &str) -> String {
 /// `None` when there are none (so a thread with nothing pending yields a byte-for-byte
 /// unchanged prompt). Framed as untrusted DATA; total capped at [`CATCHUP_MAX_BYTES`],
 /// dropping the oldest pairs and leading with `(<N> earlier turns omitted)` when over.
-pub fn build_catchup_block(pending: &[ContextTurn]) -> Option<String> {
+///
+/// Returns `(block, included_ids)` — the ids of the entries ACTUALLY included in the
+/// block (oldest-first). Only those may be marked `in_hosted_history` on success: an
+/// over-cap dropped-oldest entry stays pending so it is re-injected next hosted turn
+/// (at-least-once — a rare duplicate is harmless, a silent drop is not).
+pub fn build_catchup_block(pending: &[ContextTurn]) -> Option<(String, Vec<String>)> {
     if pending.is_empty() {
         return None;
     }
@@ -483,7 +488,8 @@ pub fn build_catchup_block(pending: &[ContextTurn]) -> Option<String> {
             // Either it fits, or only the newest single pair remains (deliver it even if
             // a pathological single pair is over-cap — the store already caps each side
             // at 2000 chars, so this is a floor, not an unbounded block).
-            return Some(block);
+            let included_ids = pending[dropped..].iter().map(|t| t.id.clone()).collect();
+            return Some((block, included_ids));
         }
         dropped += 1;
     }
@@ -539,6 +545,42 @@ pub fn mint_synthetic_session_id() -> String {
 /// it, so it must never be resumed).
 pub fn is_synthetic_session_id(id: &str) -> bool {
     id.starts_with("local-")
+}
+
+/// Whether a fresh synthetic thread id should be minted for THIS delivered turn: carry
+/// on, the request carried NO session id, and the route was LOCAL (not a hosted
+/// `run_claude_streaming` turn). Pure — the decision the handler applies.
+pub fn should_mint_synthetic(carry: bool, request_had_session: bool, in_hosted_history: bool) -> bool {
+    carry && !request_had_session && !in_hosted_history
+}
+
+/// Construct one ledger turn from a delivered turn's state (live clock + random id). The
+/// user text is truncated first, then a `[attachment omitted]` marker is appended when the
+/// turn carried attachments (so the marker always survives). The reply is the delivered
+/// text PRE-badge.
+pub fn make_context_turn(
+    mode: &str,
+    source: BadgeSource,
+    user_text: &str,
+    had_attachments: bool,
+    reply_pre_badge: &str,
+) -> ContextTurn {
+    let (route, in_hosted_history) = ContextRoute::from_badge_source(source);
+    let user = truncate_context_field(user_text);
+    let user = if had_attachments {
+        format!("{user}{ATTACHMENT_OMITTED_MARKER}")
+    } else {
+        user
+    };
+    ContextTurn {
+        id: random_hex(),
+        ts: rfc3339_utc(SystemTime::now()),
+        mode: mode.to_string(),
+        route,
+        user_text: user,
+        reply: truncate_context_field(reply_pre_badge),
+        in_hosted_history,
+    }
 }
 
 #[cfg(test)]
@@ -770,6 +812,33 @@ mod tests {
         assert!(!is_synthetic_session_id("real-abc-123"));
     }
 
+    #[test]
+    fn should_mint_synthetic_only_when_carry_on_no_session_local_route() {
+        // Minted ONLY when carry on AND no request session AND route was local.
+        assert!(should_mint_synthetic(true, false, false));
+        // Carry off → never.
+        assert!(!should_mint_synthetic(false, false, false));
+        // Request already had a session → never (re-use it).
+        assert!(!should_mint_synthetic(true, true, false));
+        // Hosted route → never (the hosted turn returns a real session id).
+        assert!(!should_mint_synthetic(true, false, true));
+    }
+
+    #[test]
+    fn make_context_turn_carries_route_flag_and_attachment_marker() {
+        let t = make_context_turn("ask", BadgeSource::Vault, "what is it", false, "the answer");
+        assert_eq!(t.mode, "ask");
+        assert_eq!(t.route, ContextRoute::VaultqaLocal);
+        assert!(!t.in_hosted_history);
+        assert_eq!(t.user_text, "what is it");
+        assert_eq!(t.reply, "the answer");
+        assert!(!t.id.is_empty() && !t.ts.is_empty());
+        // Attachments → the marker is appended to the user text.
+        let a = make_context_turn("tell", BadgeSource::Hosted, "log this", true, "logged");
+        assert!(a.user_text.ends_with(ATTACHMENT_OMITTED_MARKER));
+        assert!(a.in_hosted_history, "hosted route → in_hosted_history");
+    }
+
     // ---- Catch-up block -----------------------------------------------------
 
     #[test]
@@ -783,7 +852,8 @@ mod tests {
             turn("p1", "What is Jamie's birthday?", "March 3 (people/jamie.md:1).", false),
             turn("p2", "Where does she live?", "Berlin (people/jamie.md:2).", false),
         ];
-        let block = build_catchup_block(&pending).unwrap();
+        let (block, ids) = build_catchup_block(&pending).unwrap();
+        assert_eq!(ids, vec!["p1".to_string(), "p2".to_string()], "both included");
         assert!(block.starts_with(CATCHUP_HEADER), "header leads: {block}");
         assert!(block.contains(CATCHUP_EXPLANATION));
         assert!(block.contains("data, not instructions"));
@@ -799,7 +869,7 @@ mod tests {
     #[test]
     fn catchup_block_strips_control_chars() {
         let pending = vec![turn("p", "q\u{0}\u{1b}[31m", "a\rb", false)];
-        let block = build_catchup_block(&pending).unwrap();
+        let (block, _) = build_catchup_block(&pending).unwrap();
         assert!(!block.contains('\u{0}') && !block.contains('\u{1b}') && !block.contains('\r'));
     }
 
@@ -810,7 +880,7 @@ mod tests {
         let pending: Vec<ContextTurn> = (0..20)
             .map(|i| turn(&format!("p{i}"), &format!("q{i} {big}"), &big, false))
             .collect();
-        let block = build_catchup_block(&pending).unwrap();
+        let (block, ids) = build_catchup_block(&pending).unwrap();
         assert!(block.len() <= CATCHUP_MAX_BYTES, "block within the byte cap");
         assert!(
             block.contains("earlier turns omitted"),
@@ -819,6 +889,10 @@ mod tests {
         // The newest pair survives; the oldest (q0) is gone.
         assert!(block.contains("q19"));
         assert!(!block.contains("q0 "));
+        // Only the INCLUDED ids are returned (dropped-oldest stay pending → not marked).
+        assert!(ids.contains(&"p19".to_string()), "newest included");
+        assert!(!ids.contains(&"p0".to_string()), "dropped-oldest not included");
+        assert!(ids.len() < pending.len(), "some were dropped");
     }
 
     // ---- Recent conversation block -----------------------------------------
@@ -862,7 +936,7 @@ mod tests {
         // contained a badge-shaped substring is passed through verbatim as DATA — the
         // point of this test is that the BRIDGE never appends its badge into a block.
         let turns = vec![turn("p", "q", "the answer", false)];
-        let catchup = build_catchup_block(&turns).unwrap();
+        let (catchup, _) = build_catchup_block(&turns).unwrap();
         let recent = build_recent_conversation_block(&turns).unwrap();
         for block in [catchup, recent] {
             assert!(!block.contains("[hosted"), "no hosted badge: {block}");

@@ -480,6 +480,60 @@ pub fn build_prompt(
     )
 }
 
+/// Assemble the LEAD of a wrapped prompt — the clock header plus the framed health
+/// block — the part that precedes the safety floor. Shared by [`build_prompt_at`] and
+/// [`splice_catchup`] so the hosted catch-up block is spliced at EXACTLY the floor
+/// boundary (the two can never drift). Returns `""` when both are absent, reproducing the
+/// pre-clock output byte-for-byte (no leading blank lines).
+fn prompt_lead(clock: &str, health_block: Option<&str>) -> String {
+    let mut lead = String::new();
+    if !clock.trim().is_empty() {
+        lead.push_str(clock);
+    }
+    if let Some(block) = health_block {
+        if !lead.is_empty() {
+            lead.push_str("\n\n");
+        }
+        lead.push_str(block);
+    }
+    lead
+}
+
+/// Splice a framed hosted CATCH-UP block ([`context::build_catchup_block`]) into a
+/// prompt built by [`build_prompt_at`], inserting it immediately BEFORE the mode floor —
+/// adjacent to where the health block is framed, ahead of the floor, exactly as the
+/// design requires. `clock` and `health_context` MUST be the same values used to build
+/// `prompt`, so the lead length (hence the floor's start offset) is recomputed
+/// identically via [`prompt_lead`]. An empty/blank block returns the prompt byte-for-byte
+/// unchanged, so a thread with nothing pending is a no-op. Pure.
+///
+/// This runs INSIDE the spawned turn task, under the concurrency permit (see the handler),
+/// so the pending read and the splice happen together — two queued turns on one thread
+/// can never both carry the same pending block.
+pub fn splice_catchup(
+    prompt: &str,
+    catchup_block: &str,
+    clock: &str,
+    health_context: Option<&str>,
+) -> String {
+    if catchup_block.trim().is_empty() {
+        return prompt.to_string();
+    }
+    let health_block = frame_health_context(health_context).ok().flatten();
+    let lead = prompt_lead(clock, health_block.as_deref());
+    // The prompt begins with exactly `{lead}\n\n{floor}…` (or `{floor}…` when the lead
+    // is empty), so the floor starts at `lead.len() + 2` (or 0). Defensive bound check.
+    let floor_start = if lead.is_empty() { 0 } else { lead.len() + 2 };
+    if floor_start > prompt.len() {
+        return prompt.to_string();
+    }
+    format!(
+        "{}{catchup_block}\n\n{}",
+        &prompt[..floor_start],
+        &prompt[floor_start..]
+    )
+}
+
 /// The pure core of [`build_prompt`]: identical, except the clock header is
 /// passed in rather than read from the system clock, so the output is fully
 /// deterministic under test. `clock` leads the wrapped prompt; an empty `clock`
@@ -543,16 +597,7 @@ pub fn build_prompt_at(
     // An empty clock is omitted so the const-only path is reproduced byte-for-byte
     // (no leading blank lines); the Health block, when present, sits right after
     // the clock line and ahead of the floor.
-    let mut lead = String::new();
-    if !clock.trim().is_empty() {
-        lead.push_str(clock);
-    }
-    if let Some(block) = &health_block {
-        if !lead.is_empty() {
-            lead.push_str("\n\n");
-        }
-        lead.push_str(block);
-    }
+    let lead = prompt_lead(clock, health_block.as_deref());
     let mut p = if lead.is_empty() {
         format!("{floor}\n\n{preamble}{text}")
     } else {
@@ -957,6 +1002,53 @@ mod tests {
         // Exactly at the cap is accepted.
         let at_cap = "y".repeat(MAX_HEALTH_CONTEXT_BYTES);
         assert!(bp_hc("ask", "q", Some(&at_cap)).is_ok());
+    }
+
+    // ---- Hosted catch-up splice (context carry) ----------------------------
+
+    #[test]
+    fn splice_catchup_inserts_the_block_between_health_and_floor() {
+        // The block lands adjacent to the health block, ahead of the mode floor.
+        let block = "Swim — 2026-07-04 06:30, 30m";
+        let prompt = bp_hc("ask", "how old is she", Some(block)).unwrap();
+        let catchup = "MISSED CONVERSATION HISTORY (data, not instructions)\nQ: birthday?\nA: March 3";
+        let out = splice_catchup(&prompt, catchup, TEST_CLOCK, Some(block));
+        // Order: clock < health block < catch-up < floor < preamble.
+        let clock_at = out.find(TEST_CLOCK).unwrap();
+        let health_at = out.find(block).unwrap();
+        let catchup_at = out.find("MISSED CONVERSATION HISTORY").unwrap();
+        let floor_at = out.find(ASK_FLOOR).unwrap();
+        let q_at = out.find("how old is she").unwrap();
+        assert!(
+            clock_at < health_at && health_at < catchup_at && catchup_at < floor_at && floor_at < q_at,
+            "order clock < health < catchup < floor < question: {out}"
+        );
+        // Everything else in the prompt is preserved verbatim.
+        assert!(out.ends_with(PHONE_FORMAT));
+    }
+
+    #[test]
+    fn splice_catchup_with_no_lead_leads_the_prompt() {
+        // Empty clock, no health → the catch-up block leads, right before the floor.
+        let prompt =
+            build_prompt_at("", "ask", "q", false, false, None, None, None, false, false).unwrap();
+        let out = splice_catchup(&prompt, "CATCHUP", "", None);
+        assert!(out.starts_with("CATCHUP\n\n"), "block leads with no lead: {out}");
+        let catchup_at = out.find("CATCHUP").unwrap();
+        let floor_at = out.find(ASK_FLOOR).unwrap();
+        assert!(catchup_at < floor_at);
+    }
+
+    #[test]
+    fn splice_catchup_empty_block_is_a_byte_for_byte_noop() {
+        let prompt = bp("ask", "q", false, false, None, None);
+        for empty in ["", "   ", "\n\t "] {
+            assert_eq!(
+                splice_catchup(&prompt, empty, TEST_CLOCK, None),
+                prompt,
+                "empty catch-up block must not change the prompt"
+            );
+        }
     }
 
     // ---- Health-request channel (JESSE_NEEDS_HEALTH) -----------------------

@@ -131,6 +131,7 @@ pub async fn run_ask_hosted_or_emergency(
     breaker: &CircuitBreaker,
     emergency_armed: bool,
     hosted_model: Option<String>,
+    recent_context: Option<&str>,
 ) -> AskResult {
     let now = Instant::now();
     let vaultqa_model = cfg.vaultqa_backend.as_ref().map(|(_, _, m)| m.clone());
@@ -143,7 +144,7 @@ pub async fn run_ask_hosted_or_emergency(
     // A small closure that runs the emergency child and packages the AskResult, or
     // returns None when the child hard-failed (caller decides the fallback).
     let emergency = |reason: String| async {
-        match run_emergency_ask_pipeline(cfg, question, health_context).await {
+        match run_emergency_ask_pipeline(cfg, question, health_context, recent_context).await {
             EmergencyAskOutcome::Answered {
                 text,
                 citations,
@@ -315,7 +316,13 @@ pub async fn jesse(
     let try_vaultqa = !try_diet
         && should_try_local_vaultqa(&st.cfg, &mode, &req.text, !req.attachments.is_empty());
     let is_followup = req.session_id.is_some();
-    let prompt = build_prompt(
+    // Compute the clock header ONCE here and build the prompt from it, so the SAME
+    // clock can recompute the floor boundary when the hosted catch-up block is spliced
+    // in under the permit (context carry, Piece 3). `build_prompt` reads the clock
+    // itself; `build_prompt_at` takes it explicitly, so we capture it.
+    let clock = clock_line();
+    let prompt = build_prompt_at(
+        &clock,
         &mode,
         &req.text,
         is_followup,
@@ -351,6 +358,9 @@ pub async fn jesse(
     // the paths in the prompt so the agent reads them. The scratch dir's Drop
     // guard (moved into the turn task below) removes it on every exit path.
     let decoded = validate_and_decode_attachments(&st.cfg, &req.attachments)?;
+    // Whether this turn carried attachments — the ledger records the raw text with a
+    // `[attachment omitted]` marker rather than the bytes (context carry).
+    let had_attachments = !decoded.is_empty();
     let (prompt, scratch) = if decoded.is_empty() {
         (prompt, None)
     } else {
@@ -403,6 +413,12 @@ pub async fn jesse(
     // armed — checked inside the task.
     let mode = mode.clone();
     let breaker = st.breaker.clone();
+    // Context carry (Piece 1–3): the ledger, the title store (for a synthetic→real
+    // title move), and the captured clock (so the catch-up splice recomputes the floor
+    // boundary from the same header the prompt was built with). All inert when carry off.
+    let context = st.context.clone();
+    let titles = st.titles.clone();
+    let clock = clock.clone();
     let handle = tokio::spawn(async move {
         // Hold the scratch dir for the whole turn; its Drop removes the decoded
         // attachment files when the task ends — success, error, or timeout. The
@@ -442,12 +458,45 @@ pub async fn jesse(
         let hosted_model = env_string("ANTHROPIC_MODEL");
         let diet_queue = DietQueue::from_cfg(&cfg);
 
+        // ---- Context carry (Piece 3 + 4): read the thread's ledger UNDER THE PERMIT
+        // so two queued turns on one thread can never both carry the same pending block.
+        // `pending` (for the hosted catch-up) and `recent` (for a local child) are read
+        // once here; both are empty when carry is off (the ledger is inert) or the
+        // thread is unknown, so every downstream splice/inject is a byte-for-byte no-op.
+        let thread_key = sid.clone();
+        let pending = thread_key
+            .as_deref()
+            .map(|k| context.pending(k))
+            .unwrap_or_default();
+        // Build the hosted catch-up block + the ids actually included in it (only those
+        // get marked in_hosted_history on success, so an over-cap dropped-oldest entry
+        // stays pending — at-least-once, never a silent drop).
+        let (catchup_block, injected_ids) = match build_catchup_block(&pending) {
+            Some((block, ids)) => (Some(block), ids),
+            None => (None, Vec::new()),
+        };
+        // Splice the catch-up block into the hosted prompt (ahead of the floor, adjacent
+        // to the health block). None → the prompt is byte-for-byte unchanged.
+        let hosted_prompt = match &catchup_block {
+            Some(block) => splice_catchup(&prompt, block, &clock, health_context.as_deref()),
+            None => prompt.clone(),
+        };
+        // The RECENT CONVERSATION block for a local child (vault-QA / emergency), read
+        // from the same thread. `None` when there is no history (fresh-turn prompts stay
+        // byte-for-byte today's).
+        let recent_block = thread_key
+            .as_deref()
+            .map(|k| context.recent(k, RECENT_MAX_TURNS))
+            .and_then(|turns| build_recent_conversation_block(&turns));
+
         // A hosted turn: run the streamed agent turn and extract any agent-emitted
         // directive from the reply's final line. A recognized directive is stripped
         // from the text and attached under `directives`. This is today's path — and the
-        // diet fall-through target.
+        // diet fall-through target. Uses `hosted_prompt` (the catch-up-spliced prompt).
         let run_hosted = || async {
-            apply_directives(run_claude_streaming(&cfg, &prompt, sid.as_deref(), &jobs, &jid).await)
+            apply_directives(
+                run_claude_streaming(&cfg, &hosted_prompt, sid.as_deref(), &jobs, &jid).await,
+            )
         };
 
         // Resolve the turn. Each branch yields the outcome, the BADGE SOURCE, the
@@ -468,7 +517,7 @@ pub async fn jesse(
         let diet_model = || cfg.diet_backend.as_ref().map(|(_, _, m)| m.clone());
         let vaultqa_model = || cfg.vaultqa_backend.as_ref().map(|(_, _, m)| m.clone());
 
-        let (outcome, badge_source) = if try_diet {
+        let (mut outcome, badge_source) = if try_diet {
             // Local diet pipeline: extract → verify → append → derive mirror.
             match run_diet_pipeline(&cfg, &raw_text).await {
                 DietPipelineOutcome::Logged {
@@ -561,7 +610,9 @@ pub async fn jesse(
             // Local vault-QA lookup (routine route). On success the tokens stay local
             // and no hosted turn runs. On any ladder rung it becomes a hosted ASK
             // attempt (which, when emergency is armed, may serve the emergency child).
-            match run_vaultqa_pipeline(&cfg, &raw_text, health_context.as_deref()).await {
+            match run_vaultqa_pipeline(&cfg, &raw_text, health_context.as_deref(), recent_block.as_deref())
+                .await
+            {
                 VaultqaOutcome::Answered { text, citations } => {
                     route = MetricsRoute::VaultqaLocal;
                     m_model = vaultqa_model();
@@ -573,7 +624,7 @@ pub async fn jesse(
                     m_rung = rung.num();
                     let r = run_ask_hosted_or_emergency(
                         &cfg,
-                        &prompt,
+                        &hosted_prompt,
                         sid.as_deref(),
                         &jobs,
                         &jid,
@@ -582,6 +633,7 @@ pub async fn jesse(
                         &breaker,
                         emergency_armed,
                         hosted_model.clone(),
+                        recent_block.as_deref(),
                     )
                     .await;
                     route = r.route;
@@ -600,7 +652,7 @@ pub async fn jesse(
             // failure. With emergency disarmed this is byte-for-byte the old hosted path.
             let r = run_ask_hosted_or_emergency(
                 &cfg,
-                &prompt,
+                &hosted_prompt,
                 sid.as_deref(),
                 &jobs,
                 &jid,
@@ -609,6 +661,7 @@ pub async fn jesse(
                 &breaker,
                 emergency_armed,
                 hosted_model.clone(),
+                recent_block.as_deref(),
             )
             .await;
             route = r.route;
@@ -631,6 +684,76 @@ pub async fn jesse(
             }
             (out, BadgeSource::Hosted)
         };
+
+        // ---- Context carry (Piece 1–3): from the SAME pre-badge outcome the badge and
+        // metrics use, record the delivered turn, resolve the thread key + synthetic
+        // session id, mark the injected pending entries on hosted success, re-key on a
+        // new session id, and move a title from a synthetic id to the real one. A failed
+        // turn (Err) records nothing. Entirely inert when carry is off (the ledger is a
+        // no-op and this block skips), so every path stays byte-for-byte today's.
+        if cfg.context_carry {
+            if let Ok((reply_text, reply_sid, _)) = &outcome {
+                let reply_text = reply_text.clone();
+                let reply_sid = reply_sid.clone();
+                let (_route, in_hist) = ContextRoute::from_badge_source(badge_source);
+                let request_sid = sid.clone();
+                let mut minted: Option<String> = None;
+                let record_key: Option<String> = if in_hist {
+                    // Hosted SUCCESS: the catch-up block reached the resumed session, so
+                    // mark the injected pending entries and re-key to the real returned
+                    // id (unconditional — a no-op when unchanged). The reply already
+                    // carries the real id; the app stores it.
+                    let real_id = reply_sid.clone().or_else(|| request_sid.clone());
+                    if let (Some(real), Some(from)) = (&real_id, &request_sid) {
+                        context.mark_in_hosted_history(from, &injected_ids);
+                        if from != real {
+                            context.rekey(from, real);
+                            // Move any title stashed under a synthetic id to the real id.
+                            if is_synthetic_session_id(from) {
+                                titles.rename(from, real);
+                            }
+                        }
+                    }
+                    real_id
+                } else {
+                    // A LOCAL route. Record under the existing thread, or (a fresh
+                    // locally-served thread with no request session) mint a synthetic id
+                    // and hand it back as the reply's session id so the app stores it.
+                    match &request_sid {
+                        Some(k) => Some(k.clone()),
+                        None => {
+                            let synthetic = mint_synthetic_session_id();
+                            minted = Some(synthetic.clone());
+                            Some(synthetic)
+                        }
+                    }
+                };
+                // Record the delivered turn (non-empty replies only — a directive-only
+                // turn strips to "" and the app retries, so it is not a delivered turn).
+                if let Some(key) = &record_key {
+                    if !reply_text.trim().is_empty() {
+                        context.record(
+                            key,
+                            make_context_turn(
+                                &mode,
+                                badge_source,
+                                &raw_text,
+                                had_attachments,
+                                &reply_text,
+                            ),
+                        );
+                    }
+                }
+                // Hand the minted synthetic id back on the reply (through the app's
+                // existing `?? sessionId` line — no app change) so the follow-up carries it.
+                if let Some(synthetic) = minted {
+                    if let Ok((_, s, _)) = &mut outcome {
+                        *s = Some(synthetic);
+                    }
+                }
+            }
+        }
+
         // Build the structured provenance (v2) from the SAME pre-finalize outcome and
         // turn state that produce the text badge, so the two are always both-present or
         // both-absent. It rides on `JobState::Done` next to `directives`, reaching BOTH

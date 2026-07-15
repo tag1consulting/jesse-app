@@ -272,8 +272,16 @@ pub fn build_claude_args(cfg: &Config, prompt: &str, session_id: Option<&str>) -
         args.push(cfg.disallowed_tools.clone());
     }
     if let Some(sid) = session_id {
-        args.push("--resume".to_string());
-        args.push(sid.to_string());
+        // A synthetic `local-<hex>` id (context carry) names a bridge-minted ledger
+        // thread with NO real claude session, so it must NEVER be resumed — the CLI
+        // would error on an unknown session id. The hosted turn runs FRESH; on success
+        // the caller re-keys the ledger from the synthetic id to the real returned id
+        // and injects the catch-up block so the missed turns are not lost. A no-op for
+        // every real id (and when carry is off, no synthetic id ever exists).
+        if !is_synthetic_session_id(sid) {
+            args.push("--resume".to_string());
+            args.push(sid.to_string());
+        }
     }
     args
 }
@@ -1939,6 +1947,29 @@ mod tests {
         // No --resume without a session id.
         let none = build_claude_args(&cfg, "hi", None);
         assert!(!none.iter().any(|a| a == "--resume"));
+    }
+    #[test]
+    fn build_claude_args_never_resumes_a_synthetic_local_id() {
+        // Context carry: a `local-<hex>` thread id names a bridge-minted ledger thread
+        // with NO real claude session behind it, so it must never reach --resume (the
+        // CLI would error on an unknown session). The hosted turn runs fresh; the
+        // caller re-keys the ledger from the synthetic id to the real returned id on
+        // success. Proven directly on the argv the child is spawned with.
+        let cfg = test_config();
+        let synthetic = format!("local-{}", random_hex());
+        let args = build_claude_args(&cfg, "hi", Some(&synthetic));
+        assert!(
+            !args.iter().any(|a| a == "--resume"),
+            "a synthetic local- id must never produce --resume: {args:?}"
+        );
+        assert!(
+            !args.iter().any(|a| a == &synthetic),
+            "the synthetic id must not appear anywhere in argv: {args:?}"
+        );
+        // A real id still resumes, unchanged.
+        let real = build_claude_args(&cfg, "hi", Some("real-sess-1"));
+        let ridx = real.iter().position(|a| a == "--resume").expect("--resume");
+        assert_eq!(real[ridx + 1], "real-sess-1");
     }
     #[test]
     fn truncate_bytes_caps_multibyte_on_char_boundary() {
