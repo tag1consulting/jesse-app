@@ -2392,3 +2392,223 @@ async fn title_without_session_id_persists_nothing() {
     let _ = std::fs::remove_dir_all(&state_dir);
     let _ = std::fs::remove_file(&fake);
 }
+
+// ---- Local vault-QA route (POST /jesse ask, contained read-only child) ------
+//
+// Drive a self-referential Ask through the real handler with a prompt-sniffing
+// fake `claude`: the vault-QA child prompt carries "INSTRUCTIONS:" and the hosted
+// turn prompt carries the clock header, so one fake binary can emit different
+// output per child and the tests can prove (a) a validated local answer SKIPS the
+// hosted turn and (b) any ladder rung falls through to the hosted path.
+
+/// A fake `claude` that answers the vault-QA child (prompt contains "INSTRUCTIONS:")
+/// with `child_result` and the hosted turn with `hosted_result`, each a bare result
+/// string (no single quotes — it is single-quoted for printf).
+fn write_sniffing_fake(child_result: &str, hosted_result: &str) -> std::path::PathBuf {
+    let script = format!(
+        "#!/bin/sh\n\
+         if printf '%s' \"$2\" | grep -q 'INSTRUCTIONS:'; then\n\
+         printf '%s' '{{\"type\":\"result\",\"is_error\":false,\"result\":\"{child_result}\",\"session_id\":\"sess-vq\"}}'\n\
+         else\n\
+         printf '%s' '{{\"type\":\"result\",\"is_error\":false,\"result\":\"{hosted_result}\",\"session_id\":\"sess-h\"}}'\n\
+         fi\n"
+    );
+    write_fake_claude(&script)
+}
+
+async fn run_vaultqa_turn(cfg: Config, ask_text: &str) -> Value {
+    let st = AppState::new(cfg);
+    let body = format!(r#"{{"mode":"ask","text":{}}}"#, serde_json::to_string(ask_text).unwrap());
+    let resp = app(st.clone())
+        .oneshot(jesse_request(Some("Bearer test-token"), &body))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::ACCEPTED);
+    let b: Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    let job_id = b["job_id"].as_str().unwrap().to_string();
+    // Generous poll window (~12s): under a fully-parallel test run the fake-`claude`
+    // subprocess can be slow to schedule, so a tight window flakes (STATUS §Q/§T1).
+    for _ in 0..120 {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        if result_status(&st, &job_id).await["status"] == "done" {
+            return result_status(&st, &job_id).await;
+        }
+    }
+    panic!("vault-QA turn did not complete");
+}
+
+#[tokio::test]
+async fn vaultqa_local_answer_is_delivered_and_skips_the_hosted_turn() {
+    // A validated, cited local answer is returned verbatim and the hosted turn does
+    // NOT run — proven because the hosted branch of the fake would emit the sentinel
+    // HOSTED_SHOULD_NOT_RUN, which must be absent from the reply.
+    let vault = make_diet_vault();
+    write_vault_file(&vault, "todo-list/Today.md", "# Today\nVO2 max is 52.\n");
+    let fake = write_sniffing_fake(
+        "Your VO2 max is 52 (todo-list/Today.md:2).",
+        "HOSTED_SHOULD_NOT_RUN",
+    );
+    let cfg = Config {
+        claude_bin: fake.to_string_lossy().into_owned(),
+        vault: vault.to_string_lossy().into_owned(),
+        vaultqa_backend: Some((
+            "http://127.0.0.1:9100".into(),
+            "vaultqa-dummy-tok".into(),
+            "local-vaultqa".into(),
+        )),
+        timeout_secs: 30,
+        ..test_config()
+    };
+    let v = run_vaultqa_turn(cfg, "what is my VO2 max lately").await;
+    assert_eq!(v["response"], "Your VO2 max is 52 (todo-list/Today.md:2).");
+    assert!(
+        !v["response"].as_str().unwrap().contains("HOSTED_SHOULD_NOT_RUN"),
+        "the hosted turn must NOT run when the local answer is delivered"
+    );
+    // A stateless local answer carries no session id and no directives.
+    assert!(v["session_id"].is_null(), "local vault-QA answer is stateless");
+    assert!(v["directives"].is_null());
+    let _ = std::fs::remove_dir_all(&vault);
+    let _ = std::fs::remove_file(&fake);
+}
+
+#[tokio::test]
+async fn vaultqa_no_vault_answer_falls_through_to_the_hosted_turn() {
+    // The child emits NO_VAULT_ANSWER (rung 3) → the turn falls through and the reply
+    // is the HOSTED text, proving the ladder handed off rather than delivering the
+    // sentinel to the user.
+    let vault = make_diet_vault();
+    write_vault_file(&vault, "todo-list/Today.md", "# Today\n");
+    let fake = write_sniffing_fake("NO_VAULT_ANSWER", "Hosted answered from the session.");
+    let cfg = Config {
+        claude_bin: fake.to_string_lossy().into_owned(),
+        vault: vault.to_string_lossy().into_owned(),
+        vaultqa_backend: Some((
+            "http://127.0.0.1:9100".into(),
+            "vaultqa-dummy-tok".into(),
+            "local-vaultqa".into(),
+        )),
+        timeout_secs: 30,
+        ..test_config()
+    };
+    let v = run_vaultqa_turn(cfg, "what is my VO2 max lately").await;
+    assert_eq!(
+        v["response"], "Hosted answered from the session.",
+        "a NO_VAULT_ANSWER child must fall through to the hosted turn"
+    );
+    let _ = std::fs::remove_dir_all(&vault);
+    let _ = std::fs::remove_file(&fake);
+}
+
+#[tokio::test]
+async fn vaultqa_uncited_answer_falls_through_to_the_hosted_turn() {
+    // The child answers but with NO citation (rung 5, validator fail) → fall through.
+    let vault = make_diet_vault();
+    let fake = write_sniffing_fake(
+        "Your VO2 max is about 52, from memory.",
+        "Hosted answered instead.",
+    );
+    let cfg = Config {
+        claude_bin: fake.to_string_lossy().into_owned(),
+        vault: vault.to_string_lossy().into_owned(),
+        vaultqa_backend: Some((
+            "http://127.0.0.1:9100".into(),
+            "vaultqa-dummy-tok".into(),
+            "local-vaultqa".into(),
+        )),
+        timeout_secs: 30,
+        ..test_config()
+    };
+    let v = run_vaultqa_turn(cfg, "what is my VO2 max lately").await;
+    assert_eq!(
+        v["response"], "Hosted answered instead.",
+        "an uncited local answer must be rejected by the validator and fall through"
+    );
+    let _ = std::fs::remove_dir_all(&vault);
+    let _ = std::fs::remove_file(&fake);
+}
+
+// ---- Model badge (JESSE_MODEL_BADGE, default on) ----------------------------
+//
+// The display-only provenance line the bridge appends to every delivered
+// /jesse/jesse reply. The test fixture defaults the badge OFF (so the exact
+// response assertions above are unaffected); these tests enable it explicitly.
+
+#[tokio::test]
+async fn badge_on_hosted_turn_appends_a_hosted_badge() {
+    // A plain hosted Ask (no local backends) gets a trailing [hosted…] badge after
+    // its answer. ANTHROPIC_MODEL may or may not be set in the env, so assert the
+    // shape rather than an exact model string.
+    let script = "#!/bin/sh\nprintf '%s' '{\"type\":\"result\",\"is_error\":false,\"result\":\"Your inbox has three threads.\",\"session_id\":\"sess-b\"}'\n";
+    let fake = write_fake_claude(script);
+    let cfg = Config {
+        claude_bin: fake.to_string_lossy().into_owned(),
+        model_badge: true,
+        timeout_secs: 30,
+        ..test_config()
+    };
+    let v = run_vaultqa_turn(cfg, "summarize my inbox").await;
+    let resp = v["response"].as_str().unwrap();
+    assert!(resp.starts_with("Your inbox has three threads."), "answer preserved: {resp:?}");
+    assert!(resp.contains("\n\n[hosted"), "a hosted badge is appended: {resp:?}");
+    assert!(resp.ends_with(']'), "badge is the trailing line: {resp:?}");
+    // Exactly one appended badge.
+    assert_eq!(resp.matches("\n\n[hosted").count(), 1, "exactly one badge");
+    let _ = std::fs::remove_file(&fake);
+}
+
+#[tokio::test]
+async fn badge_on_vaultqa_local_answer_names_the_vault_backend() {
+    // A validated local vault-QA answer gets the [local · vault · <model>] badge.
+    let vault = make_diet_vault();
+    write_vault_file(&vault, "todo-list/Today.md", "# Today\nVO2 max is 52.\n");
+    let fake = write_sniffing_fake(
+        "Your VO2 max is 52 (todo-list/Today.md:2).",
+        "HOSTED_SHOULD_NOT_RUN",
+    );
+    let cfg = Config {
+        claude_bin: fake.to_string_lossy().into_owned(),
+        vault: vault.to_string_lossy().into_owned(),
+        vaultqa_backend: Some((
+            "http://127.0.0.1:9100".into(),
+            "vaultqa-dummy-tok".into(),
+            "local-vaultqa".into(),
+        )),
+        model_badge: true,
+        timeout_secs: 30,
+        ..test_config()
+    };
+    let v = run_vaultqa_turn(cfg, "what is my VO2 max lately").await;
+    let resp = v["response"].as_str().unwrap();
+    assert!(resp.starts_with("Your VO2 max is 52 (todo-list/Today.md:2)."), "answer preserved: {resp:?}");
+    assert!(resp.ends_with("\n\n[local · vault · local-vaultqa]"), "vault badge: {resp:?}");
+    assert!(!resp.contains("HOSTED_SHOULD_NOT_RUN"), "hosted turn must not run");
+    let _ = std::fs::remove_dir_all(&vault);
+    let _ = std::fs::remove_file(&fake);
+}
+
+#[tokio::test]
+async fn badge_never_applies_to_the_title_endpoint() {
+    // The title endpoint is exempt even with the badge on: a title is not a reply.
+    let script = "#!/bin/sh\nprintf '%s' '{\"type\":\"result\",\"is_error\":false,\"result\":\"Weekend Trip\",\"session_id\":\"sess-t\"}'\n";
+    let fake = write_fake_claude(script);
+    let cfg = Config {
+        claude_bin: fake.to_string_lossy().into_owned(),
+        model_badge: true,
+        ..test_config()
+    };
+    let st = AppState::new(cfg);
+    let resp = app(st.clone())
+        .oneshot(title_request(
+            Some("Bearer test-token"),
+            r#"{"text":"planning a weekend trip to the coast"}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let v: Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    let title = v["title"].as_str().unwrap();
+    assert_eq!(title, "Weekend Trip", "title carries no badge");
+    assert!(!title.contains('['), "no badge on a title: {title:?}");
+    let _ = std::fs::remove_file(&fake);
+}

@@ -74,7 +74,9 @@ pub(crate) use tokio::time::timeout;
 mod apns;
 mod attachments;
 mod auth;
+mod badge;
 mod bind;
+mod citations;
 mod claude;
 mod config;
 mod diet;
@@ -92,13 +94,17 @@ mod startup;
 mod state;
 mod titlestore;
 mod util;
+mod vaultqa;
+mod vaultqagate;
 
 // Flat internal namespace: every module's items reachable crate-wide by bare
 // name (so `use crate::*` in each module works exactly like the old single file).
 pub use apns::*;
 pub use attachments::*;
 pub use auth::*;
+pub use badge::*;
 pub use bind::*;
+pub use citations::*;
 pub use claude::*;
 pub use config::*;
 pub use diet::*;
@@ -116,6 +122,8 @@ pub use startup::*;
 pub use state::*;
 pub use titlestore::*;
 pub use util::*;
+pub use vaultqa::*;
+pub use vaultqagate::*;
 
 #[cfg(test)]
 mod testutil;

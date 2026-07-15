@@ -39,6 +39,13 @@ use tower::ServiceExt; // ServiceExt::oneshot
             // (kill switch), so the integration router exercises today's hosted path.
             diet_backend: None,
             diet_probation: true,
+            // No vault-QA backend override in tests — the route is inert (kill switch),
+            // so the integration router exercises today's hosted Ask path.
+            vaultqa_backend: None,
+            vaultqa_mcp_config: None,
+            // Badge off in the fixture: the exact-`response` turn assertions predate it
+            // (the shipped default is on; badge behavior is tested with it enabled).
+            model_badge: false,
         }
     }
     pub fn test_state() -> AppState {

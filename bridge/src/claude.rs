@@ -592,6 +592,122 @@ pub async fn run_diet_verify(
     run_stateless_oneshot(cfg, cmd, timeout_secs, "diet verification").await
 }
 
+// ---- Contained read-only vault-QA child ------------------------------------
+
+/// The root toolset the vault-QA child is launched with (`--tools`). Unlike the
+/// diet child's EMPTY set, the vault-QA child needs to READ the vault to answer, so
+/// it gets a root ALLOWLIST of exactly the three read-only built-ins — file read
+/// and the two search tools, nothing that can write, execute, or reach the network.
+pub const VAULTQA_CHILD_ROOT_TOOLS: &str = "Read,Grep,Glob";
+
+/// The `--allowedTools` grant for the vault-QA child: the same three read-only
+/// built-ins plus the four read-only qmd MCP search tools (present only when an MCP
+/// config supplies the qmd server; absent otherwise, and then simply never invoked).
+pub const VAULTQA_CHILD_ALLOWED_TOOLS: &str =
+    "Read,Grep,Glob,mcp__qmd__query,mcp__qmd__get,mcp__qmd__multi_get,mcp__qmd__status";
+
+/// Tools DENIED to the vault-QA child as documented belt-and-suspenders BEHIND the
+/// real boundary (the `--tools "Read,Grep,Glob"` root allowlist + strict MCP). It
+/// names every mutation / execution / network / orchestration class so a CLI change
+/// that widened the root set would still hit the denylist. Enumerated denial is
+/// fragile by nature (it breaks silently on a tool rename/addition), exactly as the
+/// diet child's denylist documents — the root allowlist is the guarantee.
+pub const VAULTQA_CHILD_DISALLOWED_TOOLS: &str =
+    "Bash,Write,Edit,NotebookEdit,WebFetch,WebSearch,Task,Agent,ToolSearch,Workflow,TodoWrite";
+
+/// Build the base `Command` for the stateless, READ-ONLY vault-QA child. A near-clone
+/// of [`build_diet_child_command`] with deliberate deltas so the child can read the
+/// vault and answer a self-referential question from it:
+///
+///   * `--tools "Read,Grep,Glob"` — a root ALLOWLIST (not the diet child's empty set):
+///     the child needs to read files, so it gets exactly the three read-only built-ins
+///     at the root and nothing else. No `Bash`/`Write`/`Edit`, no `ToolSearch`/
+///     `Workflow`/`Agent` — they are absent at the root, not permission-gated.
+///   * `--strict-mcp-config` + `--mcp-config` from `JESSE_VAULTQA_MCP_CONFIG` when set
+///     (the qmd server), else the shared empty-servers const so NO MCP loads.
+///   * `--allowedTools` naming the three built-ins plus the four read-only qmd tools.
+///   * `--disallowedTools` ([`VAULTQA_CHILD_DISALLOWED_TOOLS`]) as documented
+///     belt-and-suspenders behind the root allowlist.
+///
+/// THE ONE INTENTIONAL DIVERGENCE FROM THE DIET CHILD: cwd is the VAULT, not the
+/// neutral scratch base. The child must read vault files to answer, so it runs in the
+/// vault (CLAUDE.md auto-loads, but the prompt frames all file content as untrusted
+/// data). Containment therefore comes from the TOOLSET — the read-only root allowlist
+/// plus strict MCP mean the child can read but cannot write, execute, or reach the
+/// network — not from an isolated cwd, the same way the diet child's containment comes
+/// from `--tools ""`. Sets NO env override (the caller layers `apply_vaultqa_env`), and
+/// never passes `--resume` (the child is stateless).
+pub fn build_vaultqa_child_command(cfg: &Config, prompt: &str) -> Command {
+    let mut cmd = Command::new(&cfg.claude_bin);
+    // `--mcp-config` accepts a file PATH or inline JSON. When JESSE_VAULTQA_MCP_CONFIG
+    // is set it is a path to a config declaring exactly the qmd server; unset → the
+    // shared inline empty-servers const, so strict-mcp-config loads NO servers.
+    let mcp_config = cfg
+        .vaultqa_mcp_config
+        .as_deref()
+        .unwrap_or(DIET_CHILD_EMPTY_MCP_CONFIG);
+    cmd.args([
+        "-p".to_string(),
+        prompt.to_string(),
+        "--output-format".to_string(),
+        "stream-json".to_string(),
+        "--verbose".to_string(),
+        "--include-partial-messages".to_string(),
+        "--permission-mode".to_string(),
+        "default".to_string(),
+        // ROOT boundary #1: a read-only root allowlist (not an empty set) — the child
+        // may read the vault, nothing more.
+        "--tools".to_string(),
+        VAULTQA_CHILD_ROOT_TOOLS.to_string(),
+        // ROOT boundary #2: only the servers in --mcp-config load (qmd, or none).
+        "--strict-mcp-config".to_string(),
+        "--mcp-config".to_string(),
+        mcp_config.to_string(),
+        // Belt-and-suspenders behind the two root flags above.
+        "--allowedTools".to_string(),
+        VAULTQA_CHILD_ALLOWED_TOOLS.to_string(),
+        "--disallowedTools".to_string(),
+        VAULTQA_CHILD_DISALLOWED_TOOLS.to_string(),
+    ])
+    // The ONE divergence from the diet child: cwd = the vault. The child must READ
+    // vault files; containment is the read-only toolset above, not the cwd.
+    .current_dir(&cfg.vault)
+    .stdout(Stdio::piped())
+    .stderr(Stdio::piped())
+    .kill_on_drop(true);
+    cmd
+}
+
+/// Layer the vault-QA backend override onto the vault-QA child's `Command`. Exact
+/// analogue of [`apply_diet_env`] / [`apply_title_env`], keyed off `cfg.vaultqa_backend`
+/// (all three `JESSE_VAULTQA_*` vars set → `Some`). When configured, the vault-QA child
+/// — and ONLY that child — talks to the override backend; every main turn and the
+/// diet/title children keep their own env. A no-op when unset. Call this ONLY on the
+/// vault-QA path; a main turn must never invoke it (the main-turn isolation property).
+pub fn apply_vaultqa_env(cmd: &mut Command, cfg: &Config) {
+    if let Some((base_url, auth_token, model)) = &cfg.vaultqa_backend {
+        cmd.env("ANTHROPIC_BASE_URL", base_url)
+            .env("ANTHROPIC_AUTH_TOKEN", auth_token)
+            .env("ANTHROPIC_MODEL", model);
+    }
+}
+
+/// Run the contained read-only vault-QA child: a toolless-except-read one-shot
+/// ([`build_vaultqa_child_command`]) pointed at the vault-QA backend
+/// ([`apply_vaultqa_env`]) when configured. Returns the child's raw answer text for
+/// the pipeline to validate. No retry — a vault lookup is best-effort and the ladder
+/// degrades to the hosted turn on any failure. `hard timeout` is [`VAULTQA_TIMEOUT_SECS`]
+/// (passed by the caller).
+pub async fn run_vaultqa_child(
+    cfg: &Config,
+    prompt: &str,
+    timeout_secs: u64,
+) -> Result<String, ApiError> {
+    let mut cmd = build_vaultqa_child_command(cfg, prompt);
+    apply_vaultqa_env(&mut cmd, cfg);
+    run_stateless_oneshot(cfg, cmd, timeout_secs, "vault-QA lookup").await
+}
+
 /// Invoke headless Claude Code in the vault, streaming its output. Returns
 /// (reply_text, session_id). Pass session_id to continue a thread; the returned
 /// id is always captured so the client can follow up later. Resuming keeps
@@ -1537,6 +1653,150 @@ mod tests {
                 cmd_env_overrides(&b),
                 "env overrides must be identical (none, either way)"
             );
+        }
+    }
+
+    // ---- Vault-QA child ----------------------------------------------------
+
+    fn cfg_with_vaultqa_backend() -> Config {
+        let mut cfg = test_config();
+        cfg.vaultqa_backend = Some((
+            "http://127.0.0.1:9100".to_string(),
+            "vaultqa-dummy-tok".to_string(),
+            "local-vaultqa".to_string(),
+        ));
+        cfg
+    }
+
+    #[test]
+    fn vaultqa_child_applies_env_triple_when_configured() {
+        // With the override configured, the vault-QA child's Command carries exactly
+        // the three ANTHROPIC_* vars set to the vault-QA backend values.
+        let cfg = cfg_with_vaultqa_backend();
+        let mut cmd = build_vaultqa_child_command(&cfg, "hi");
+        apply_vaultqa_env(&mut cmd, &cfg);
+        let env = cmd_env_overrides(&cmd);
+        assert_eq!(env.get("ANTHROPIC_BASE_URL").map(String::as_str), Some("http://127.0.0.1:9100"));
+        assert_eq!(env.get("ANTHROPIC_AUTH_TOKEN").map(String::as_str), Some("vaultqa-dummy-tok"));
+        assert_eq!(env.get("ANTHROPIC_MODEL").map(String::as_str), Some("local-vaultqa"));
+    }
+
+    #[test]
+    fn vaultqa_child_applies_nothing_when_unconfigured() {
+        let cfg = test_config();
+        assert!(cfg.vaultqa_backend.is_none());
+        let mut cmd = build_vaultqa_child_command(&cfg, "hi");
+        apply_vaultqa_env(&mut cmd, &cfg);
+        let env = cmd_env_overrides(&cmd);
+        for k in TITLE_ENV_KEYS {
+            assert!(!env.contains_key(k), "unconfigured vault-QA child must not set {k}");
+        }
+    }
+
+    #[test]
+    fn vaultqa_child_is_read_only_at_the_root_with_no_resume_in_the_vault() {
+        // The child's containment posture, asserted on the built argv:
+        //   * `--tools "Read,Grep,Glob"` — a read-only ROOT allowlist (not empty).
+        //   * `--strict-mcp-config` present so only --mcp-config servers load.
+        //   * `--allowedTools` names the three built-ins plus the four qmd tools.
+        //   * `--disallowedTools` names the mutation/exec/network/orchestration classes.
+        //   * NO `--resume` (stateless), and cwd = the vault (the one divergence).
+        let cfg = cfg_with_vaultqa_backend();
+        let cmd = build_vaultqa_child_command(&cfg, "answer me");
+
+        let tools = cmd_arg_value(&cmd, "--tools").expect("--tools present");
+        assert_eq!(tools, "Read,Grep,Glob", "read-only root allowlist");
+
+        assert!(
+            cmd_has_flag(&cmd, "--strict-mcp-config"),
+            "--strict-mcp-config must be present"
+        );
+        // Unset MCP config → the shared empty-servers const (no servers).
+        let mcp = cmd_arg_value(&cmd, "--mcp-config").expect("--mcp-config present");
+        let parsed: serde_json::Value = serde_json::from_str(&mcp).expect("valid JSON");
+        assert!(
+            parsed.get("mcpServers").and_then(|v| v.as_object()).map(|m| m.is_empty()).unwrap_or(true),
+            "unset MCP config → no servers: {mcp:?}"
+        );
+
+        let allow = cmd_arg_value(&cmd, "--allowedTools").expect("--allowedTools present");
+        let allowed: Vec<&str> = allow.split(',').map(|t| t.trim()).collect();
+        for t in ["Read", "Grep", "Glob", "mcp__qmd__query", "mcp__qmd__get", "mcp__qmd__multi_get", "mcp__qmd__status"] {
+            assert!(allowed.contains(&t), "allowlist must name {t}: {allowed:?}");
+        }
+        // No mutation/exec built-in is granted.
+        for t in ["Write", "Edit", "Bash"] {
+            assert!(!allowed.contains(&t), "allowlist must NOT grant {t}: {allowed:?}");
+        }
+
+        let deny = cmd_arg_value(&cmd, "--disallowedTools").expect("--disallowedTools present");
+        let denied: Vec<&str> = deny.split(',').map(|t| t.trim()).collect();
+        for class in ["Bash", "Write", "Edit", "NotebookEdit", "WebFetch", "WebSearch", "Task", "Agent", "ToolSearch", "Workflow", "TodoWrite"] {
+            assert!(denied.contains(&class), "denylist must name {class}: {denied:?}");
+        }
+
+        // Stateless: never --resume.
+        assert!(!cmd_has_flag(&cmd, "--resume"), "vault-QA child must not resume a session");
+
+        // cwd = the vault (the intentional divergence from the diet child's scratch cwd).
+        assert_eq!(
+            cmd.as_std().get_current_dir().map(|p| p.to_path_buf()),
+            Some(std::path::PathBuf::from(&cfg.vault)),
+            "vault-QA child cwd must be the vault"
+        );
+    }
+
+    #[test]
+    fn vaultqa_child_uses_mcp_config_path_when_set() {
+        // When JESSE_VAULTQA_MCP_CONFIG is set, its PATH is passed straight to
+        // --mcp-config (the CLI accepts a path or inline JSON), so the qmd server loads.
+        let mut cfg = cfg_with_vaultqa_backend();
+        cfg.vaultqa_mcp_config = Some("/etc/jesse/qmd.json".to_string());
+        let cmd = build_vaultqa_child_command(&cfg, "hi");
+        assert_eq!(
+            cmd_arg_value(&cmd, "--mcp-config").as_deref(),
+            Some("/etc/jesse/qmd.json"),
+            "the configured MCP config path must be passed verbatim"
+        );
+        assert!(cmd_has_flag(&cmd, "--strict-mcp-config"));
+    }
+
+    #[test]
+    fn main_turn_command_is_unaffected_by_vaultqa_backend() {
+        // THE SAFETY / KILL-SWITCH PROPERTY (clone of the diet/title isolation test):
+        // even when the vault-QA override IS configured, a MAIN-TURN command carries
+        // none of the three ANTHROPIC_* overrides, because the main-turn builder never
+        // calls apply_vaultqa_env. A vault-QA-only redirect can never leak onto a turn.
+        let cfg = cfg_with_vaultqa_backend();
+        assert!(cfg.vaultqa_backend.is_some(), "precondition: override is set");
+        for sid in [None, Some("sess-1")] {
+            let cmd = build_claude_command(&cfg, "do the thing", sid);
+            let env = cmd_env_overrides(&cmd);
+            for k in TITLE_ENV_KEYS {
+                assert!(
+                    !env.contains_key(k),
+                    "main-turn command must NOT carry {k} even when vault-QA backend is set"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn main_turn_command_is_byte_identical_whether_vaultqa_backend_set_or_not() {
+        // The kill switch, proven byte-for-byte on the SPAWNED command: unsetting the
+        // triple reproduces today's exact main-turn invocation (argv, cwd, env).
+        let with = cfg_with_vaultqa_backend();
+        let mut without = with.clone();
+        without.vaultqa_backend = None;
+        for sid in [None, Some("sess-42")] {
+            let a = build_claude_command(&with, "what is my vo2 max", sid);
+            let b = build_claude_command(&without, "what is my vo2 max", sid);
+            let argv = |c: &Command| -> Vec<String> {
+                c.as_std().get_args().map(|s| s.to_string_lossy().into_owned()).collect()
+            };
+            assert_eq!(argv(&a), argv(&b), "argv identical (kill switch)");
+            assert_eq!(a.as_std().get_current_dir(), b.as_std().get_current_dir(), "cwd identical");
+            assert_eq!(cmd_env_overrides(&a), cmd_env_overrides(&b), "env overrides identical (none)");
         }
     }
 

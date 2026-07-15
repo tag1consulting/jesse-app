@@ -125,6 +125,16 @@ pub async fn jesse(
     // (before any work) but ACTED ON inside the spawned task below, so a fall-through
     // reuses the same permit/scratch/job machinery as a normal turn.
     let try_diet = should_try_local_diet(&st.cfg, &mode, &req.text);
+    // Kill switch + STRICT gate: attempt the contained read-only vault-QA child only
+    // when a vault-QA backend is configured AND this is a self-referential Ask that
+    // carries no attachment/image and is not diet-gate-shaped (diet keeps precedence —
+    // `try_diet` is Tell-only, so they never both fire, but the `!try_diet` guard makes
+    // the precedence explicit). With no backend this is always false, so every Ask
+    // takes today's hosted path byte-for-byte. Decided here (before any work) but ACTED
+    // ON inside the spawned task below, so a fall-through reuses the same permit/job
+    // machinery as a normal turn.
+    let try_vaultqa = !try_diet
+        && should_try_local_vaultqa(&st.cfg, &mode, &req.text, !req.attachments.is_empty());
     let is_followup = req.session_id.is_some();
     let prompt = build_prompt(
         &mode,
@@ -200,7 +210,11 @@ pub async fn jesse(
     let sid = req.session_id.clone();
     // The raw utterance the local diet pipeline parses (distinct from the wrapped
     // `prompt`, which the hosted path — including any diet fall-through — still uses).
+    // The vault-QA child answers this same raw question.
     let raw_text = req.text.clone();
+    // The phone-supplied health block, framed into the vault-QA child prompt the same
+    // way the hosted turn frames it (already size-checked by `build_prompt` above).
+    let health_context = req.health_context.clone();
     // Push machinery for the completion notification (no-ops when push is off).
     let apns = st.apns.clone();
     let devices = st.devices.clone();
@@ -243,21 +257,44 @@ pub async fn jesse(
         let run_hosted = || async {
             apply_directives(run_claude_streaming(&cfg, &prompt, sid.as_deref(), &jobs, &jid).await)
         };
-        let outcome = if try_diet {
+        // Each branch yields the outcome AND the BADGE SOURCE — which backend
+        // actually produced the delivered text. A fallback rung runs the hosted turn,
+        // so it badges `Hosted` (the backend that produced the text), never the local
+        // one that tried first.
+        let (outcome, badge_source) = if try_diet {
             // Local diet pipeline: extract → verify → append → derive mirror. On a
             // local log the directives (mirror) are BUILT by the bridge, not parsed
             // from agent text. On any fallback rung the turn drops to the hosted path
             // unchanged (a log is never lost and never double-appended).
             match run_diet_pipeline(&cfg, &raw_text).await {
                 DietPipelineOutcome::Logged { dashboard, directives } => {
-                    Ok((dashboard, None, Some(directives)))
+                    (Ok((dashboard, None, Some(directives))), BadgeSource::DietVerify)
                 }
-                DietPipelineOutcome::LoggedNoMirror { dashboard } => Ok((dashboard, None, None)),
-                DietPipelineOutcome::FallThrough { .. } => run_hosted().await,
+                DietPipelineOutcome::LoggedNoMirror { dashboard } => {
+                    (Ok((dashboard, None, None)), BadgeSource::DietVerify)
+                }
+                DietPipelineOutcome::FallThrough { .. } => (run_hosted().await, BadgeSource::Hosted),
+            }
+        } else if try_vaultqa {
+            // Local vault-QA: run the contained read-only child, validate its citations,
+            // and on success return its text as the reply WITHOUT running the hosted
+            // turn (the tokens stay local). No session_id (stateless) and no directives
+            // (the read-only child never emits one). On any ladder rung the turn drops
+            // to today's hosted path unchanged (a question is never lost).
+            match run_vaultqa_pipeline(&cfg, &raw_text, health_context.as_deref()).await {
+                VaultqaOutcome::Answered { text, .. } => (Ok((text, None, None)), BadgeSource::Vault),
+                VaultqaOutcome::FallThrough { .. } => (run_hosted().await, BadgeSource::Hosted),
             }
         } else {
-            run_hosted().await
+            (run_hosted().await, BadgeSource::Hosted)
         };
+        // Finalize the delivered reply: append the model badge (display only) at this
+        // single point, so BOTH the poll result and the SSE `done` frame (which reads
+        // the stored state) carry it. A no-op when the badge is off, on an error, or on
+        // an empty directive-only reply. The hosted model is the ambient ANTHROPIC_MODEL
+        // in the bridge's env (what the hosted child actually used), read once here.
+        let hosted_model = env_string("ANTHROPIC_MODEL");
+        let outcome = finalize_reply_badge(outcome, &cfg, badge_source, hosted_model.as_deref());
         jobs.complete(&jid, outcome);
         // Close the live stream with the frame matching the state that actually
         // landed. `complete` is write-once, so a cancel that won the race already

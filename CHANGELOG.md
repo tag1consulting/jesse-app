@@ -15,6 +15,37 @@ CI both run it). See the "Versioning" section of `bridge/README.md`.
 
 ## [Unreleased]
 
+## [Bridge 0.10.0] — 2026-07-14
+
+### Added
+- **Local vault-QA route (`JESSE_VAULTQA_*`) — answer a self-referential "Ask"
+  from the vault, on-device.** When the `JESSE_VAULTQA_BASE_URL` /
+  `JESSE_VAULTQA_AUTH_TOKEN` / `JESSE_VAULTQA_MODEL` triple is configured, a
+  question that passes a **strict** gate (an interrogative opener AND a
+  self-reference, no attachment/URL, not diet-shaped — diet keeps precedence) is
+  answered by a **contained, read-only** local child instead of the hosted agent,
+  keeping the tokens on-device. The child clones the diet child's deny-by-default
+  posture with two deltas so it can read: a read-only root allowlist `--tools
+  "Read,Grep,Glob"` (plus the four read-only qmd MCP tools when
+  `JESSE_VAULTQA_MCP_CONFIG` supplies the server) and cwd = the vault (containment
+  is the toolset, not the cwd). Every answer passes a pure in-process **citation
+  validator** (≥1 citation, every cited file resolves, every quoted claim occurs
+  in its file) before delivery; on any failure rung — spawn/API error, timeout,
+  `NO_VAULT_ANSWER`, empty, validator fail — the turn **falls through** to today's
+  hosted path unchanged. All-or-nothing and soft: **the seam is the kill switch**
+  (unset the triple → every Ask takes the hosted path byte-for-byte). One
+  provenance line per gated turn, never the question, never the token. See the
+  bridge README ("Local vault-QA route") and `SECURITY.md` ("Vault-QA child tool
+  isolation").
+- **Model badge on every `/jesse/jesse` reply (`JESSE_MODEL_BADGE`, default on).**
+  The bridge appends a one-line, display-only provenance badge naming which
+  backend produced the delivered text: `[local · vault · <model>]`, `[local · diet
+  · <model> + hosted verify]`, or `[hosted · <model>]` / `[hosted]`. Derived from
+  the bridge's own turn state (never model output), applied at the single
+  reply-finalization point (so both the poll result and the SSE `done` frame carry
+  it), and **never** written into session state, fed back into a child, committed
+  to the vault, or applied to the title endpoint. `JESSE_MODEL_BADGE=off`
+  reproduces the prior exact reply text.
 ## [Bridge 0.9.1] — 2026-07-14
 
 ### Docs

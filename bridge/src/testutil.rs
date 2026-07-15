@@ -35,6 +35,15 @@ use crate::*;
             diet_backend: None,
             // Probation on by default, matching from_env's default.
             diet_probation: true,
+            // No vault-QA backend override by default — the route is inert (kill
+            // switch), so tests exercise today's hosted Ask path unless they set it.
+            vaultqa_backend: None,
+            vaultqa_mcp_config: None,
+            // Badge OFF in the fixture so a turn's stored reply is byte-for-byte the
+            // model text — the many exact-`response` assertions predate the badge and
+            // must not have to account for it. Badge behavior is covered by dedicated
+            // tests that enable it explicitly (the shipped `from_env` default is ON).
+            model_badge: false,
         }
     }
     pub(crate) fn test_state() -> AppState {

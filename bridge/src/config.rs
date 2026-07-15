@@ -27,6 +27,14 @@ pub const DEFAULT_RETRIEVAL_GRACE_SECS: u64 = 600;
 // unavailable permit sheds immediately, the pre-queue behavior).
 pub const DEFAULT_MAX_QUEUED: usize = 4;
 
+// Hard timeout (seconds) for the contained read-only vault-QA child. Tighter
+// than a turn: the child reads a handful of vault files (Read/Grep/Glob, and the
+// qmd MCP search when configured) and answers from them — a bounded lookup, not
+// an agent turn. On overrun the ladder degrades to the hosted turn (rung 2). A
+// const, not env-tunable: it bounds a latency-sensitive local answer, not an
+// operator-managed workload, mirroring `TITLE_TIMEOUT_SECS`.
+pub const VAULTQA_TIMEOUT_SECS: u64 = 25;
+
 // Short, fixed timeout for the stateless title endpoint (`POST /jesse/title`).
 // Much tighter than a turn's JESSE_TIMEOUT (default 3600s) because a title is
 // interactive UI latency, not a full agent turn: on overrun the app just
@@ -192,6 +200,33 @@ pub struct Config {
     // append path. Independent of `diet_backend`: it tunes the pipeline's verify
     // posture, not whether the pipeline is active.
     pub diet_probation: bool,
+    // Optional local vault-QA backend override: `Some((base_url, auth_token,
+    // model))` only when ALL THREE of JESSE_VAULTQA_BASE_URL / JESSE_VAULTQA_AUTH_TOKEN
+    // / JESSE_VAULTQA_MODEL are set (see `resolve_vaultqa_backend` — same all-or-
+    // nothing rule as the diet backend). When `Some`, a self-referential "Ask" that
+    // passes the strict vault-QA gate runs the CONTAINED, READ-ONLY vault-QA child —
+    // and only that child — pointed at these values via `apply_vaultqa_env`, so a
+    // vault lookup can be answered locally while every main turn and the diet/title
+    // children keep their own credentials.
+    //
+    // THE KILL SWITCH IS THIS SEAM ITSELF: leave the triple unset (the default) and
+    // `vaultqa_backend` is `None`, so the gate in `handlers::jesse` never fires and
+    // every Ask reverts BYTE-FOR-BYTE to today's hosted `run_claude_streaming` path —
+    // no redeploy, no code change. `None` is the safe, shipped-today behavior.
+    pub vaultqa_backend: Option<(String, String, String)>,
+    // Optional path to an MCP config JSON declaring exactly the qmd vault-search
+    // server, layered onto the vault-QA child via `--mcp-config` (env
+    // `JESSE_VAULTQA_MCP_CONFIG`). When unset the child loads NO MCP servers (the
+    // empty-servers const) and runs on the three read-only built-ins alone — qmd is
+    // simply absent, never an error. Only the vault-QA child ever reads this.
+    pub vaultqa_mcp_config: Option<String>,
+    // Whether the bridge appends a one-line provenance BADGE to each delivered
+    // `POST /jesse/jesse` reply (env `JESSE_MODEL_BADGE`, default TRUE). Display
+    // only: it names which backend produced the delivered text (`[local · vault · …]`,
+    // `[local · diet · … + hosted verify]`, `[hosted · …]`) and is derived from the
+    // bridge's own turn state, never from model output. `off` reproduces today's
+    // exact reply text. Never applies to the title endpoint.
+    pub model_badge: bool,
 }
 
 impl Config {
@@ -327,6 +362,49 @@ pub fn resolve_diet_backend(
     }
 }
 
+/// Resolve the optional local vault-QA backend override from its three env-derived
+/// parts. Identical all-or-nothing rule as [`resolve_diet_backend`] /
+/// [`resolve_title_backend`]: returns `Some((base_url, auth_token, model))` ONLY
+/// when all three are present; any partial combination resolves to `None` (the
+/// vault-QA route stays inert and Asks keep taking the hosted path). A partial
+/// config logs one startup warning so a half-configured deploy is visible rather
+/// than silently half-active. Pure except for that warning.
+pub fn resolve_vaultqa_backend(
+    base_url: Option<String>,
+    auth_token: Option<String>,
+    model: Option<String>,
+) -> Option<(String, String, String)> {
+    match (base_url, auth_token, model) {
+        (Some(b), Some(t), Some(m)) => Some((b, t, m)),
+        (b, t, m) => {
+            let set = b.is_some() as u8 + t.is_some() as u8 + m.is_some() as u8;
+            if set > 0 {
+                eprintln!(
+                    "jesse-bridge: WARNING partial JESSE_VAULTQA_* config ({set}/3 set) — the \
+                     local vault-QA backend needs ALL of JESSE_VAULTQA_BASE_URL, \
+                     JESSE_VAULTQA_AUTH_TOKEN, JESSE_VAULTQA_MODEL; treating as unset (Asks \
+                     use the hosted path)."
+                );
+            }
+            None
+        }
+    }
+}
+
+/// Parse `JESSE_MODEL_BADGE` into the `model_badge` flag. Default TRUE: only an
+/// explicit `off` / `0` / `false` / `no` disables the badge; anything else
+/// (including unset or a bare `on`) keeps it on. Mirrors the `JESSE_DIET_PROBATION`
+/// truthiness rule so operators reason about one convention.
+pub fn resolve_model_badge() -> bool {
+    std::env::var("JESSE_MODEL_BADGE")
+        .ok()
+        .map(|v| {
+            let v = v.trim().to_ascii_lowercase();
+            !(v == "0" || v == "false" || v == "no" || v == "off")
+        })
+        .unwrap_or(true)
+}
+
 impl Config {
     pub fn from_env() -> Self {
         let home = std::env::var("HOME").unwrap_or_default();
@@ -409,6 +487,21 @@ impl Config {
                     !(v == "0" || v == "false" || v == "no" || v == "off")
                 })
                 .unwrap_or(true),
+            // All-or-nothing local vault-QA backend override, same `env_string`
+            // (trimmed, empty-filtered) semantics as every other string field. Partial
+            // config logs one warning and resolves to None (see `resolve_vaultqa_backend`).
+            // Unset (the default) → None → the vault-QA route is inert and every Ask takes
+            // today's hosted path (the kill switch).
+            vaultqa_backend: resolve_vaultqa_backend(
+                env_string("JESSE_VAULTQA_BASE_URL"),
+                env_string("JESSE_VAULTQA_AUTH_TOKEN"),
+                env_string("JESSE_VAULTQA_MODEL"),
+            ),
+            // Optional MCP config path for the vault-QA child (the qmd server). Unset →
+            // None → the child runs the read-only built-ins only, qmd absent.
+            vaultqa_mcp_config: env_string("JESSE_VAULTQA_MCP_CONFIG"),
+            // Provenance badge on delivered replies; default on (see `resolve_model_badge`).
+            model_badge: resolve_model_badge(),
         }
     }
 }
@@ -712,6 +805,106 @@ mod tests {
                 Config::from_env().diet_probation,
                 "{truthy:?} must keep probation on"
             );
+        }
+
+        for (k, v) in saved {
+            match v {
+                Some(val) => std::env::set_var(k, val),
+                None => std::env::remove_var(k),
+            }
+        }
+    }
+
+    #[test]
+    fn vaultqa_backend_resolves_only_when_all_three_present() {
+        // All-or-nothing, mirroring the diet/title backends: the vault-QA override
+        // resolves ONLY when base_url, auth_token, AND model are all set. Any missing
+        // part falls back to None so the route stays inert (the kill switch).
+        let full = resolve_vaultqa_backend(
+            Some("http://127.0.0.1:9100".into()),
+            Some("dummy-tok".into()),
+            Some("local-vaultqa".into()),
+        );
+        assert_eq!(
+            full,
+            Some((
+                "http://127.0.0.1:9100".to_string(),
+                "dummy-tok".to_string(),
+                "local-vaultqa".to_string(),
+            ))
+        );
+        // Every partial combination (1 or 2 of 3 set) resolves to None.
+        let s = || Some("x".to_string());
+        let partials = [
+            (s(), s(), None),
+            (s(), None, s()),
+            (None, s(), s()),
+            (s(), None, None),
+            (None, s(), None),
+            (None, None, s()),
+            (None, None, None),
+        ];
+        for (b, t, m) in partials {
+            assert_eq!(
+                resolve_vaultqa_backend(b, t, m),
+                None,
+                "partial vault-QA config must resolve to None (treated as unset)"
+            );
+        }
+    }
+
+    #[test]
+    fn config_from_env_vaultqa_backend_all_or_nothing_and_mcp_and_badge() {
+        let _g = ENV_LOCK.lock_ok();
+        let keys = [
+            "JESSE_VAULTQA_BASE_URL",
+            "JESSE_VAULTQA_AUTH_TOKEN",
+            "JESSE_VAULTQA_MODEL",
+            "JESSE_VAULTQA_MCP_CONFIG",
+            "JESSE_MODEL_BADGE",
+        ];
+        let saved: Vec<(&str, Option<String>)> =
+            keys.iter().map(|k| (*k, std::env::var(k).ok())).collect();
+        for k in &keys {
+            std::env::remove_var(k);
+        }
+
+        // Unset by default → no override, MCP config absent, badge ON.
+        let cfg = Config::from_env();
+        assert_eq!(cfg.vaultqa_backend, None);
+        assert_eq!(cfg.vaultqa_mcp_config, None);
+        assert!(cfg.model_badge, "badge must default to on");
+
+        // All three set → the config carries the resolved triple; MCP path honored.
+        std::env::set_var("JESSE_VAULTQA_BASE_URL", "http://127.0.0.1:9100");
+        std::env::set_var("JESSE_VAULTQA_AUTH_TOKEN", "vaultqa-dummy-tok");
+        std::env::set_var("JESSE_VAULTQA_MODEL", "local-vaultqa");
+        std::env::set_var("JESSE_VAULTQA_MCP_CONFIG", "/etc/jesse/qmd.json");
+        let cfg = Config::from_env();
+        assert_eq!(
+            cfg.vaultqa_backend,
+            Some((
+                "http://127.0.0.1:9100".to_string(),
+                "vaultqa-dummy-tok".to_string(),
+                "local-vaultqa".to_string(),
+            ))
+        );
+        assert_eq!(cfg.vaultqa_mcp_config.as_deref(), Some("/etc/jesse/qmd.json"));
+
+        // Drop one → partial → None (treated as unset); a blank value counts as unset.
+        std::env::remove_var("JESSE_VAULTQA_AUTH_TOKEN");
+        assert_eq!(Config::from_env().vaultqa_backend, None);
+        std::env::set_var("JESSE_VAULTQA_AUTH_TOKEN", "   ");
+        assert_eq!(Config::from_env().vaultqa_backend, None);
+
+        // Badge: only an explicit falsey value flips it off.
+        for falsey in ["0", "false", "no", "off", "OFF", " Off "] {
+            std::env::set_var("JESSE_MODEL_BADGE", falsey);
+            assert!(!Config::from_env().model_badge, "explicit {falsey:?} disables the badge");
+        }
+        for truthy in ["1", "true", "yes", "on", "anything-else"] {
+            std::env::set_var("JESSE_MODEL_BADGE", truthy);
+            assert!(Config::from_env().model_badge, "{truthy:?} keeps the badge on");
         }
 
         for (k, v) in saved {

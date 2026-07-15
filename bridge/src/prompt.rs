@@ -191,7 +191,12 @@ fn strip_ascii_controls_keep_newline(s: &str) -> String {
 ///
 /// The cap is checked on the raw received bytes (before stripping) so the wire
 /// bound is unambiguous. Pure, so the cap/strip/framing are unit-testable.
-fn frame_health_context(health_context: Option<&str>) -> Result<Option<String>, ApiError> {
+///
+/// `pub(crate)` so the contained vault-QA child prompt ([`vaultqa`]) can frame the
+/// SAME device block, the same way, as the hosted turn — one framing, one trust
+/// story. (The handler's `build_prompt` already enforces the 413 cap ahead of the
+/// vault-QA branch, so the child path only ever sees an already-bounded block.)
+pub(crate) fn frame_health_context(health_context: Option<&str>) -> Result<Option<String>, ApiError> {
     let Some(raw) = health_context else {
         return Ok(None);
     };

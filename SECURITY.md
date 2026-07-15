@@ -130,6 +130,47 @@ the diet children's hard containment. Whether to tighten it is a separate
 decision; it does not carry the specific "empty allowlist assumed toolless" defect
 that the diet children did, because it never claimed to be toolless.
 
+## Vault-QA child tool isolation (in-process boundary)
+
+The local vault-QA route (see the bridge README) spawns one **stateless,
+single-shot, READ-ONLY** child that answers a self-referential "Ask" from vault
+files. Unlike the diet children, it needs to **read the vault** — so its posture
+is *read-only*, not *toolless*, and it is a near-clone of `build_diet_child_command`
+(`build_vaultqa_child_command`) with two deliberate deltas.
+
+**Read-only at the CLI root, deny-by-default for everything else.** The child is
+launched with:
+
+| Flag | Effect |
+| --- | --- |
+| `--tools "Read,Grep,Glob"` | A read-only **root allowlist** (not the diet child's empty set). Exactly the three read-only built-ins exist at the root; `Bash`/`Write`/`Edit`, `ToolSearch`/`Workflow`/`Agent`, and everything else are absent at the root, not permission-gated. This is the load-bearing control. |
+| `--strict-mcp-config` + `--mcp-config <cfg>` | Loads **only** the servers in the config — the **qmd** vault-search server when `JESSE_VAULTQA_MCP_CONFIG` supplies it (its four tools are read-only search), or **no** servers otherwise. Nothing else can be reached, and `ToolSearch` (denied and absent at the root) cannot pull a server in. |
+| `--allowedTools` + expanded `--disallowedTools` | The allowlist names the three built-ins plus the four qmd tools; the denylist names `Bash,Write,Edit,NotebookEdit,WebFetch,WebSearch,Task,Agent,ToolSearch,Workflow,TodoWrite` as documented, **fragile** belt-and-suspenders behind the root flags (it names tools, so it breaks silently on a CLI tool rename/addition — it is not the guarantee). |
+
+So the child can **read** the vault but cannot write, execute a shell, reach the
+network, spawn a subagent, or load an unlisted MCP tool.
+
+**The cwd divergence, and why it's safe.** This is the one intentional divergence
+from the diet child, which runs in a neutral scratch dir: the vault-QA child's cwd
+**is the vault**, because it must read vault files to answer. Containment therefore
+comes from the **toolset** (the read-only root allowlist + strict MCP), NOT from an
+isolated cwd — exactly the way the diet child's containment comes from `--tools ""`
+rather than its scratch cwd. Running in the vault means CLAUDE.md auto-loads, but
+the child's prompt frames **all** file content (CLAUDE.md included) as untrusted
+**data, never instructions**, and the read-only toolset means even a fully
+prompt-injected child cannot *act* — at worst it emits text, which is then re-checked
+in-process.
+
+**Defense past containment: the citation validator.** Because the child's answer is
+delivered to the user (unlike the diet child's structured output, which trusted Rust
+re-derives), a pure in-process validator runs on every answer before it is returned:
+it requires at least one citation, that every cited file resolves under the vault,
+and that any string quoted against a `path:line` actually occurs in that file. An
+uncited, mis-cited, or fabricated-quote answer fails and the turn falls through to the
+hosted path — a prompt-injected or hallucinating child cannot deliver an invented
+"fact from your vault." Injection text inside a vault file can at most cause a
+`NO_VAULT_ANSWER` / validator-fail fall-through, never an action.
+
 ## Code review checkouts (review-only)
 
 The agent can review external source: clone/fetch a repo, then read/search/diff
