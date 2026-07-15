@@ -19,9 +19,14 @@
 //! point: the tokens stay local). Exactly one provenance line is emitted per gated
 //! turn. The whole module is dormant unless the env triple is set (the kill switch).
 //!
-//! KNOWN TRADEOFF: a locally answered turn never enters the hosted session history
-//! (no `--resume` write), so a later hosted follow-up won't know it happened. The
-//! strict gate keeps conversational follow-ups hosted for exactly this reason.
+//! CONTEXT CARRY: a locally answered turn does not enter the hosted session history
+//! (no `--resume` write). The **context ledger** ([`context`]) closes the gap the old
+//! design left open: it records this turn and injects a catch-up block into the next
+//! hosted turn (so a later hosted follow-up DOES learn what happened) and a
+//! recent-conversation block into a local child (so a follow-up that reaches one can
+//! resolve its references). The strict gate still keeps synthesis-shaped follow-ups
+//! hosted; the ledger repairs the reference-resolution defect. Off with
+//! `JESSE_CONTEXT_CARRY=off`.
 
 use crate::*;
 

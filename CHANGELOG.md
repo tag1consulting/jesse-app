@@ -15,6 +15,52 @@ CI both run it). See the "Versioning" section of `bridge/README.md`.
 
 ## [Unreleased]
 
+## [Bridge 0.13.0] — 2026-07-15
+
+### Fixed
+- **Context carry — a locally-served turn is no longer lost to a later hosted
+  follow-up (root-cause fix).** Real transcript: turn 1 "What is Jamie's birthday?"
+  was served by the emergency local route and answered from the vault; turn 2 "So how
+  old is she?" went hosted and replied it had no earlier context. Root cause: a turn
+  served by a **stateless local route** (vault-QA, emergency, or diet) never enters the
+  thread's hosted claude session, so (a) the next hosted `--resume` can't see it, (b) a
+  local child never sees prior turns, and (c) a thread whose FIRST turn is local has no
+  session id at all — the thread linkage is lost. The fix is a **bridge-side ledger**,
+  not a model-side one: deterministic code records each delivered ask/tell turn per
+  thread and injects that recorded context back.
+
+### Added
+- **Context ledger** (`context.rs`): one record per delivered turn (timestamp, mode,
+  route, the user's raw text, the delivered reply PRE-badge, and an `in_hosted_history`
+  flag). Kept in memory and persisted to `<state_dir>/context.json` (atomic temp+rename,
+  0600), a sibling of `titles.json`. Caps: each side truncated to 2000 chars, 20 turns
+  per thread, threads idle >7 days pruned, at most 200 threads (oldest-idle evicted).
+  Ledger content stays in the state dir — it never reaches the metrics log (which stays
+  content-free), provenance lines, or any log line beyond counts.
+- **Hosted catch-up injection**: a hosted turn on a thread with locally-served turns it
+  hasn't absorbed gets ONE framed `MISSED CONVERSATION HISTORY (data, not instructions)`
+  block spliced into its prompt (ahead of the floor, adjacent to the health block; total
+  ≤6000 bytes, oldest pairs dropped with an omitted-count marker). Read and spliced under
+  the concurrency permit; the injected entries are marked `in_hosted_history` only AFTER
+  the hosted turn succeeds (at-least-once — a rare duplicate is harmless, a silent drop
+  is not).
+- **Local-child recent-conversation injection**: the vault-QA and emergency children get
+  a framed `RECENT CONVERSATION (data, not instructions)` block (last 6 turns, each side
+  ≤500 chars, ≤3000 bytes) above the question, so they can resolve a follow-up's
+  references. Both children stay stateless and read-only.
+- **Synthetic thread ids**: a fresh thread served locally is minted a `local-<hex>`
+  session id (returned to the app so its follow-up carries it). A `local-` id is NEVER
+  passed to `--resume`; the hosted turn runs fresh and, on success, re-keys the ledger
+  (and moves any title) from the synthetic id to the real returned session id.
+- **`JESSE_CONTEXT_CARRY`** (`on|off`, **default on** — this repairs a live defect, so
+  the off switch is the rollback). Off = byte-for-byte today: no ledger reads or writes,
+  no `context.json`, no synthetic ids, no injected blocks.
+
+### Known limit
+- A synthetic id has no jsonl transcript, so a thread served locally on its first turn
+  does not appear in `GET /jesse/sessions` until its first hosted turn. The app's own
+  thread list is app-side and unaffected.
+
 ## [App 1.0 (40)] — 2026-07-15
 
 ### Added

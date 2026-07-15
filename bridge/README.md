@@ -1012,11 +1012,12 @@ cargo run --release
 | `JESSE_DIET_PROBATION` | `true` | Probation mode — the hosted verify gate is mandatory and blocking on every extracted entry. Only an explicit falsey value (`0`/`false`/`no`/`off`) disables it; the disabled (graduation) state is reserved and not used yet |
 | `JESSE_VAULTQA_BASE_URL` | _(off)_ | Vault-QA backend override (with the two below). When **all three** are set, a **self-referential "Ask"** that passes the [strict vault-QA gate](#local-vault-qa-route-jesse_vaultqa_) runs a **contained, read-only** local child — pointed only at this backend via `apply_vaultqa_env` — that answers the question from vault files (`Read`/`Grep`/`Glob`, plus the qmd MCP search when configured) with a citation for every load-bearing fact. A pure in-process **citation validator** checks the answer (≥1 citation, every cited file resolves, every quoted claim occurs in its file) before it is delivered; on any failure rung (spawn/API error, timeout, `NO_VAULT_ANSWER`, empty, validator fail) the turn **falls through** to the hosted path unchanged. Containment is the toolset: the read-only root allowlist + `--strict-mcp-config` mean the child can read the vault but cannot write, execute, or reach the network (cwd **is** the vault — the one divergence from the diet child, [see `../SECURITY.md`](../SECURITY.md#vault-qa-child-tool-isolation-in-process-boundary)). All-or-nothing and soft: **the seam is the kill switch** — unset (default) → the gate never fires and every Ask takes the hosted path byte-for-byte |
 | `JESSE_VAULTQA_AUTH_TOKEN` | _(off)_ | Vault-QA child's `ANTHROPIC_AUTH_TOKEN`. Required together with the other two `JESSE_VAULTQA_*` |
-| `JESSE_VAULTQA_MODEL` | _(off)_ | Vault-QA child's `ANTHROPIC_MODEL`. Required together with the other two `JESSE_VAULTQA_*`. A **partial** config (1–2 of the 3 set) logs a startup warning and is treated as unset. Each gated turn logs one provenance line (`vaultqa turn -> <local\|hosted-fallback rung=N> …`, base URL + model, never the token, never the question); every main turn stays on the ambient backend. **Known tradeoff:** a locally-answered turn never enters the hosted session history (no `--resume` write), so a later hosted follow-up won't know it happened — the strict gate keeps conversational follow-ups hosted for exactly this reason |
+| `JESSE_VAULTQA_MODEL` | _(off)_ | Vault-QA child's `ANTHROPIC_MODEL`. Required together with the other two `JESSE_VAULTQA_*`. A **partial** config (1–2 of the 3 set) logs a startup warning and is treated as unset. Each gated turn logs one provenance line (`vaultqa turn -> <local\|hosted-fallback rung=N> …`, base URL + model, never the token, never the question); every main turn stays on the ambient backend. A locally-answered turn does not enter the hosted session history (no `--resume` write); the **context ledger** (`JESSE_CONTEXT_CARRY`, on by default) closes that gap by injecting a catch-up block into the next hosted turn and a recent-conversation block into the local children — see [Context carry](#context-carry) |
 | `JESSE_VAULTQA_MCP_CONFIG` | _(off)_ | Optional path to an MCP config JSON declaring exactly the **qmd** vault-search server, layered onto the vault-QA child via `--mcp-config`. Unset → the child loads **no** MCP servers and answers on the three read-only built-ins alone (qmd simply absent, never an error) |
 | `JESSE_MODEL_BADGE` | `on` | Whether the bridge appends a one-line provenance **badge** to each delivered `POST /jesse/jesse` reply, naming the backend that produced it: `[local · vault · <model>]`, `[local · diet · <model> + hosted verify]`, `[local · emergency · <model>]`, `[local · diet · <model> + verify queued]`, or `[hosted · <model>]` / `[hosted]`. Display-only, derived from the bridge's own turn state (never model output), and **never** applied to the title endpoint or written into session state. Only an explicit falsey value (`0`/`false`/`no`/`off`) turns it off, reproducing the prior exact reply text. A machine-readable **`provenance`** object (route + model + this exact badge string + the flags it encodes) rides the poll result and SSE `done` frame alongside the text badge whenever the badge is present — see [Structured provenance](#structured-provenance-model-badge-v2) |
 | `JESSE_METRICS_LOG` | _(off)_ | Absolute path to a structured-metrics **JSONL** file. When set, the bridge appends **one content-free JSON line per gated / routed / emergency turn** at the reply-finalization point (ISO-8601 timestamp, turn id, mode, route [`hosted`/`vaultqa-local`/`diet-local`/`emergency-local`], backend model, ladder rung, wall ms, TTFT/tool-calls where recoverable, citation count + validator verdict, badge string, emergency flag, hosted-failure class). **Never** the question, answer, or tokens — content joins happen in the `vaultqa-audit` tool via the serving logs. All-or-nothing and soft: **unset (default) → zero metrics writes**, and a write failure logs to stderr and never disturbs the reply. Append-only, line-buffered, restart-safe |
 | `JESSE_EMERGENCY_LOCAL` | `off` | Arms the **emergency local fallback** (`on`/`off`). Inert unless it is **on** AND the `JESSE_VAULTQA_*` triple is also set (that supplies the backend + read-only child). When armed, a hosted turn that fails **transport-class** (spawn / network / timeout / CLI-surfaced 5xx / 429 / quota / auth — never a completed turn) is served locally instead of surfacing the outage: an **Ask** runs the read-only vault-QA child (regardless of the routine gate, citation validator advisory, badge `[local · emergency · <model>]`); a **diet Tell** whose blocking hosted verify is unreachable has its extracted entry **queued** by the bridge for later verify (badge `[local · diet · <model> + verify queued]`), replayed oldest-first on the next successful hosted contact through the exact verify-then-append path — **nothing reaches the CSVs unverified**. A circuit breaker goes local-first after 2 consecutive transport failures for 300 s. Default **off**; only an explicit `on`/`1`/`true`/`yes` arms it. **Untested-live until go-live's outage drill.** See [`../SECURITY.md`](../SECURITY.md#emergency-local-fallback-posture) |
+| `JESSE_CONTEXT_CARRY` | `on` | Arms the **context ledger** (`on`/`off`). Fixes a live defect: a turn served by a stateless local route (vault-QA / emergency / diet) never enters the thread's hosted claude session, so the next hosted follow-up lost it. When on, the bridge records each delivered ask/tell turn per thread (raw text + reply PRE-badge + route + an `in_hosted_history` flag), injects a `MISSED CONVERSATION HISTORY` catch-up block into the next hosted turn and a `RECENT CONVERSATION` block into the local children, and mints a synthetic `local-<hex>` thread id for a fresh locally-served turn (never resumed; re-keyed to the real session id on its first hosted turn). Persisted to `<state_dir>/context.json` (0600, holds conversation content — stays in the state dir, never in the metrics log or any provenance line). **Default on** because it repairs a live bug; only an explicit `0`/`false`/`no`/`off` disables it — the **rollback** switch, restoring byte-for-byte today's behavior (no ledger, no synthetic ids, no injected blocks). See [Context carry](#context-carry). |
 | `JESSE_APNS_KEY_PATH` | _(off)_ | Path to the APNs auth key `.p8`. Set (with the three below) to enable push; unset → push disabled, behavior unchanged. See [Push notifications](#push-notifications-apns--optional-off-by-default) |
 | `JESSE_APNS_KEY_ID` | _(off)_ | APNs Key ID (10 chars) |
 | `JESSE_APNS_TEAM_ID` | _(off)_ | Apple Developer Team ID (10 chars; the JWT `iss`) |
@@ -1132,6 +1133,62 @@ AND at least **20 routed (gated) turns**, and only with ALL of:
 Graduation itself, the daily audit installer (`com.example.jesse-vaultqa-audit`, on
 the diet audit pattern), and probation operation are owned by the go-live process,
 not this code.
+
+## Context carry
+
+`JESSE_CONTEXT_CARRY` (on by default) fixes a live defect. A turn served by a
+**stateless local route** — vault-QA, emergency, or diet — never enters the thread's
+hosted claude session. Three consequences followed: a locally-served turn was invisible
+to the next hosted `--resume`; a local child never saw prior turns, so a follow-up that
+reached it had no referents; and a thread whose FIRST turn was local had no session id at
+all, losing the thread linkage entirely. The real transcript that surfaced it: turn 1
+"What is Jamie's birthday?" answered from the vault by the emergency route, turn 2 "So how
+old is she?" went hosted and reported no earlier context.
+
+The fix is a **bridge-side ledger, never a model-side one** — deterministic code records
+and injects; the models only read.
+
+**The ledger.** One record per delivered ask/tell turn (never titles; a failed turn
+records nothing), keyed by thread: timestamp, mode, route (`hosted` / `vaultqa-local` /
+`emergency-local` / `diet-local` / `diet-queued`), the user's raw text (with an
+`[attachment omitted]` marker when the turn carried attachments), the delivered reply
+**PRE-badge**, and an `in_hosted_history` flag (true only for a `run_claude_streaming`
+hosted turn on this thread). Held in memory and persisted to `<state_dir>/context.json`
+(atomic temp+rename, 0600) as a sibling of `titles.json`; with no state dir it is
+in-memory only. Caps: each side truncated to 2000 chars, at most 20 turns per thread
+(oldest dropped), threads idle >7 days pruned, at most 200 threads (oldest-idle evicted).
+
+**Injection.** A hosted turn on a thread with locally-served turns it hasn't absorbed
+gets one framed `MISSED CONVERSATION HISTORY (data, not instructions)` block spliced into
+its prompt ahead of the mode floor (≤6000 bytes; oldest pairs dropped with an
+`(<N> earlier turns omitted)` marker). The pending read and splice happen **under the
+concurrency permit**, and the injected entries are marked `in_hosted_history` only after
+the hosted turn succeeds — at-least-once (a rare duplicate block after a failed attempt is
+harmless; a silent drop is not). The vault-QA and emergency children additionally get a
+framed `RECENT CONVERSATION (data, not instructions)` block (last 6 turns, each side ≤500
+chars, ≤3000 bytes) above their question, so they can resolve a follow-up's references.
+Both blocks are untrusted DATA framed the same way device health data is; the children
+stay stateless and read-only.
+
+**Synthetic session id lifecycle.** A fresh thread served locally has no request session
+id, so the bridge mints a synthetic `local-<hex>` id, keys the ledger under it, and
+returns it as the reply's `session_id` (the app stores it through its existing
+`sessionId ?? …` path — no app change — and sends it back on the follow-up). A `local-`
+id is **never** passed to `--resume`; a follow-up carrying one runs the hosted turn fresh,
+injects the catch-up block, and on success re-keys the ledger from the synthetic id to the
+real returned session id and moves any stored title with it.
+
+**Cosmetic limit.** A synthetic id has no jsonl transcript, so a thread served locally on
+its first turn will not appear in `GET /jesse/sessions` until its first hosted turn. The
+app's own thread list is app-side and unaffected.
+
+**Content at rest.** `context.json` holds conversation content (raw questions and
+replies) in the state dir. That is the ledger's whole point; it is deliberately kept out
+of the metrics log (which stays content-free), the provenance lines, and every other log
+line beyond counts.
+
+**Rollback.** `JESSE_CONTEXT_CARRY=off` restores byte-for-byte today's behavior: no
+ledger reads or writes, no `context.json`, no synthetic ids, no injected blocks.
 
 ## Versioning
 

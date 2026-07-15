@@ -3236,6 +3236,48 @@ async fn context_carry_on_fresh_local_turn_mints_a_synthetic_id() {
     let _ = std::fs::remove_file(&fake);
 }
 
+#[tokio::test]
+async fn context_carry_records_pre_badge_reply_so_no_badge_leaks_into_a_block() {
+    // The badge is display-only: the ledger stores the reply PRE-badge, so a badge
+    // string can never appear in a catch-up or recent-conversation block. Proven with
+    // the badge ON: the delivered response carries the trailing badge, but the recorded
+    // ledger reply — and any block built from it — does not.
+    let vault = make_diet_vault();
+    write_vault_file(&vault, "todo-list/Today.md", "# Today\nVO2 max is 52.\n");
+    let fake = write_sniffing_fake("Your VO2 max is 52 (todo-list/Today.md:2).", "HOSTED");
+    let cfg = Config {
+        claude_bin: fake.to_string_lossy().into_owned(),
+        vault: vault.to_string_lossy().into_owned(),
+        vaultqa_backend: Some((
+            "http://127.0.0.1:9100".into(),
+            "vaultqa-dummy-tok".into(),
+            "local-vaultqa".into(),
+        )),
+        context_carry: true,
+        model_badge: true,
+        timeout_secs: 30,
+        ..test_config()
+    };
+    let st = AppState::new(cfg);
+    let v = carry_post_and_wait(&st, r#"{"mode":"ask","text":"what is my VO2 max lately"}"#).await;
+    // The DELIVERED reply carries the display badge.
+    assert!(
+        v["response"].as_str().unwrap().contains("[local · vault · local-vaultqa]"),
+        "delivered reply carries the badge: {}",
+        v["response"]
+    );
+    // The RECORDED reply is pre-badge — no badge string anywhere.
+    let sid = v["session_id"].as_str().unwrap();
+    let recorded = &st.context.recent(sid, 1)[0].reply;
+    assert!(
+        !recorded.contains("[local") && !recorded.contains("[hosted"),
+        "the ledger stores pre-badge text: {recorded}"
+    );
+    assert_eq!(recorded, "Your VO2 max is 52 (todo-list/Today.md:2).");
+    let _ = std::fs::remove_dir_all(&vault);
+    let _ = std::fs::remove_file(&fake);
+}
+
 /// A fake `claude` for the end-to-end transcript scenario. The vault-QA/emergency
 /// child (prompt carries `INSTRUCTIONS:`) answers from the fixture with a citation.
 /// The hosted turn FAILS transport-class on its first call (so emergency takes over)
