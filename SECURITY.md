@@ -276,9 +276,12 @@ override on an untrusted network.
 
 To keep a single client (or a runaway turn) from exhausting the host:
 
-- **Concurrency** — `JESSE_MAX_CONCURRENCY` (default 2) caps in-flight turns; a
-  request that can't get a permit immediately gets `429`, never an unbounded
-  queue.
+- **Concurrency** — `JESSE_MAX_CONCURRENCY` (default 1) caps in-flight turns: a
+  single global write lock, so at most one turn rewrites the vault at a time
+  regardless of how many clients are connected. A request that can't get a permit
+  immediately **waits** in a bounded queue (`JESSE_MAX_QUEUED`, default 4) rather
+  than being rejected; only load beyond the queue is shed with `429`, so the queue
+  is never unbounded. `JESSE_MAX_QUEUED=0` restores immediate-`429` shedding.
 - **Rate** — `JESSE_RATE_PER_MIN` (default 30) caps accepted requests per
   rolling minute; bursts beyond it get `429`.
 - **Timeout ceiling** — every turn is bounded by `HARD_TIMEOUT_CEILING` (7200s).
@@ -298,6 +301,28 @@ To keep a single client (or a runaway turn) from exhausting the host:
   default 10 MB), and combined size (`JESSE_MAX_ATTACHMENTS_TOTAL_BYTES`, default
   20 MB). The request body limit is sized from these (base64-inflated) so an
   oversized upload is refused before it's buffered.
+
+## Session list (`GET /jesse/sessions`)
+
+`GET /jesse/sessions` lets the app show a history of conversations. It is
+**read-only** and never writes a session file.
+
+- **Same auth/rate posture as every endpoint.** It is bearer-auth gated
+  (`401` without/with a wrong bearer — the same posture as `/jesse`) and shares
+  the same rate limiter (`429` on a burst).
+- **What it reads.** It enumerates the vault's Claude Code transcripts —
+  `~/.claude/projects/<escaped-vault>/*.jsonl` — and returns, per session, the
+  session id, the file mtime, a short **first-message snippet** (the first user
+  turn, read from only a bounded **64 KiB** prefix of the file), and the stored
+  title if one was minted. The `<escaped-vault>` path is produced by a **pure,
+  unit-tested** function, and only plain `*.jsonl` components in that one
+  directory are listed, so a listing can **never reach outside the projects
+  dir**.
+- **What an authenticated caller can now read.** This exposes transcript
+  **snippets** an authenticated caller couldn't read before — the opening text
+  of each session. That is vault-conversation content, gated behind the same
+  bearer token as `/jesse` itself; an **unauthenticated** caller gets `401` and
+  learns nothing, exactly the posture of `/jesse`.
 
 ## Title-endpoint backend override (`JESSE_TITLE_*`)
 
@@ -328,6 +353,16 @@ Security-relevant properties:
   (identical `--permission-mode`/allow/deny lists), the same `MAX_TITLE_INPUT_BYTES`
   input cap and short `TITLE_TIMEOUT_SECS`, and remains a soft best-effort call —
   a title failure is degraded from, never surfaced as an error.
+- **Optional server-side title store.** `POST /jesse/title` accepts an optional
+  `session_id`. When present *and* the title call succeeds, the minted title is
+  persisted so `GET /jesse/sessions` can show it — to a single JSON file
+  `<state_dir>/titles.json` written with mode `0600` via an atomic temp+rename and
+  **best-effort** (a write failure is logged, never fatal), mirroring the
+  `device.json` device-token store's discipline. Only the session id and its short
+  title are stored — never the bearer token or prompt content. With no state dir
+  configured the store is **in-memory only** (titles lost on restart, the same
+  degradation the job store has). **Omitting `session_id` is byte-for-byte the old
+  stateless behavior** — nothing is written and old clients are unaffected.
 
 ## Attachments
 
