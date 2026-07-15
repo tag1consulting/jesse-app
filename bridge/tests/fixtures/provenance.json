@@ -1,0 +1,83 @@
+{
+  "_comment": "SHARED bridge<->app contract for the model-badge v2 structured provenance. This file is the SINGLE SOURCE OF TRUTH for the exact badge strings, the citations-unverified warning, and the assembled reply text per route. BOTH the Rust bridge test (bridge/src/badge.rs) AND the iOS app test (Jesse/JesseTests/ProvenanceFixtureTests.swift) load THIS FILE from disk (the Swift test resolves it relative to #filePath) and assert against it, so the two sides can never drift. Edit here and both suites re-verify. `·` is U+00B7; the warning starts with U+26A0 U+FE0F.",
+  "citations_unverified_warning": "⚠️ citations unverified — the hosted assistant was unavailable, so this local answer was delivered without a passing citation check. Double-check anything important.",
+  "cases": [
+    {
+      "name": "hosted",
+      "provenance": {
+        "route": "hosted",
+        "model": "claude-opus-4-8",
+        "badge": "[hosted · claude-opus-4-8]",
+        "flags": { "hosted_verify": false, "verify_queued": false, "citations_unverified": false }
+      },
+      "reply_body": "Here is your answer.",
+      "reply_text": "Here is your answer.\n\n[hosted · claude-opus-4-8]"
+    },
+    {
+      "name": "hosted-bare",
+      "provenance": {
+        "route": "hosted",
+        "model": null,
+        "badge": "[hosted]",
+        "flags": { "hosted_verify": false, "verify_queued": false, "citations_unverified": false }
+      },
+      "reply_body": "No ambient model was set.",
+      "reply_text": "No ambient model was set.\n\n[hosted]"
+    },
+    {
+      "name": "vault-local",
+      "provenance": {
+        "route": "vaultqa-local",
+        "model": "local-oss",
+        "badge": "[local · vault · local-oss]",
+        "flags": { "hosted_verify": false, "verify_queued": false, "citations_unverified": false }
+      },
+      "reply_body": "Your VO2 max is 52 (todo-list/Today.md:2).",
+      "reply_text": "Your VO2 max is 52 (todo-list/Today.md:2).\n\n[local · vault · local-oss]"
+    },
+    {
+      "name": "diet-local-hosted-verify",
+      "provenance": {
+        "route": "diet-local",
+        "model": "local-oss",
+        "badge": "[local · diet · local-oss + hosted verify]",
+        "flags": { "hosted_verify": true, "verify_queued": false, "citations_unverified": false }
+      },
+      "reply_body": "Logged: oatmeal, 320 kcal.",
+      "reply_text": "Logged: oatmeal, 320 kcal.\n\n[local · diet · local-oss + hosted verify]"
+    },
+    {
+      "name": "diet-local-verify-queued",
+      "provenance": {
+        "route": "emergency-local",
+        "model": "local-oss",
+        "badge": "[local · diet · local-oss + verify queued]",
+        "flags": { "hosted_verify": false, "verify_queued": true, "citations_unverified": false }
+      },
+      "reply_body": "Captured locally — I'll verify it when the assistant is back.",
+      "reply_text": "Captured locally — I'll verify it when the assistant is back.\n\n[local · diet · local-oss + verify queued]"
+    },
+    {
+      "name": "emergency-local-verified",
+      "provenance": {
+        "route": "emergency-local",
+        "model": "local-oss",
+        "badge": "[local · emergency · local-oss]",
+        "flags": { "hosted_verify": false, "verify_queued": false, "citations_unverified": false }
+      },
+      "reply_body": "Your VO2 max is 52 (todo-list/Today.md:2).",
+      "reply_text": "Your VO2 max is 52 (todo-list/Today.md:2).\n\n[local · emergency · local-oss]"
+    },
+    {
+      "name": "emergency-local-citations-unverified",
+      "provenance": {
+        "route": "emergency-local",
+        "model": "local-oss",
+        "badge": "[local · emergency · local-oss]",
+        "flags": { "hosted_verify": false, "verify_queued": false, "citations_unverified": true }
+      },
+      "reply_body": "Your VO2 max is about 52, I think.",
+      "reply_text": "⚠️ citations unverified — the hosted assistant was unavailable, so this local answer was delivered without a passing citation check. Double-check anything important.\n\nYour VO2 max is about 52, I think.\n\n[local · emergency · local-oss]"
+    }
+  ]
+}

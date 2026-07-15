@@ -732,7 +732,7 @@ final class RunCoordinator {
             end = reply.text.index(after: end)
         }
         return JesseReply(text: String(reply.text[..<end]), sessionId: reply.sessionId,
-                          directives: reply.directives)
+                          directives: reply.directives, provenance: reply.provenance)
     }
 
     /// Display-only consumer of the live SSE stream: updates `partialText` and

@@ -685,6 +685,37 @@ curl -s http://127.0.0.1:8765/jesse/result/<job_id> \
 See [SECURITY.md](../SECURITY.md#agent-directive-channel-jesse_needs_health) for
 the trust analysis.
 
+### Structured provenance (model-badge v2)
+
+Alongside the text [model badge](#env) (see `JESSE_MODEL_BADGE`), a delivered reply
+carries a machine-readable **`provenance`** object on the **same terminal-result path**
+as `directives` — surfaced identically on `GET /jesse/result` and the SSE `done` frame,
+and persisted with the job — so a client can render native UI instead of string-parsing
+the badge out of the reply text:
+
+```bash
+# → { "status":"done", "response":"…answer, badge stripped by the client…", "session_id":"…",
+#     "provenance": { "route":"emergency-local", "model":"local-oss",
+#                     "badge":"[local · emergency · local-oss]",
+#                     "flags":{ "hosted_verify":false, "verify_queued":false,
+#                               "citations_unverified":true } } }
+```
+
+- `route` — `hosted` | `vaultqa-local` | `diet-local` | `emergency-local` (the same route
+  vocabulary as the metrics line).
+- `model` — the backend model that produced the reply (`null` on a bare `[hosted]`).
+- `badge` — the exact badge string, **byte-identical** to what is appended to `response`,
+  so a client strips it by matching this string.
+- `flags` — `hosted_verify`, `verify_queued`, and `citations_unverified` — exactly what the
+  badge (and, for the last, the prepended `⚠️ citations unverified` warning) encode.
+
+It is built at the **same finalization seam** as the badge and is present **exactly when**
+the badge is appended: `null` when `JESSE_MODEL_BADGE` is off, on an empty directive-only
+reply, and on every error/cancel — so an older client that ignores it still reads the same
+trailing badge in the text (the fallback). The **metrics line and `vaultqa-audit` schema
+are unaffected.** The exact strings are pinned by a shared fixture
+(`bridge/tests/fixtures/provenance.json`) that both the bridge and the iOS app tests read.
+
 ## Dietary write-back channel (`JESSE_MEAL_LOG`)
 
 The **write-direction sibling** of `JESSE_NEEDS_HEALTH`, on the **same extractor
@@ -983,7 +1014,7 @@ cargo run --release
 | `JESSE_VAULTQA_AUTH_TOKEN` | _(off)_ | Vault-QA child's `ANTHROPIC_AUTH_TOKEN`. Required together with the other two `JESSE_VAULTQA_*` |
 | `JESSE_VAULTQA_MODEL` | _(off)_ | Vault-QA child's `ANTHROPIC_MODEL`. Required together with the other two `JESSE_VAULTQA_*`. A **partial** config (1–2 of the 3 set) logs a startup warning and is treated as unset. Each gated turn logs one provenance line (`vaultqa turn -> <local\|hosted-fallback rung=N> …`, base URL + model, never the token, never the question); every main turn stays on the ambient backend. **Known tradeoff:** a locally-answered turn never enters the hosted session history (no `--resume` write), so a later hosted follow-up won't know it happened — the strict gate keeps conversational follow-ups hosted for exactly this reason |
 | `JESSE_VAULTQA_MCP_CONFIG` | _(off)_ | Optional path to an MCP config JSON declaring exactly the **qmd** vault-search server, layered onto the vault-QA child via `--mcp-config`. Unset → the child loads **no** MCP servers and answers on the three read-only built-ins alone (qmd simply absent, never an error) |
-| `JESSE_MODEL_BADGE` | `on` | Whether the bridge appends a one-line provenance **badge** to each delivered `POST /jesse/jesse` reply, naming the backend that produced it: `[local · vault · <model>]`, `[local · diet · <model> + hosted verify]`, `[local · emergency · <model>]`, `[local · diet · <model> + verify queued]`, or `[hosted · <model>]` / `[hosted]`. Display-only, derived from the bridge's own turn state (never model output), and **never** applied to the title endpoint or written into session state. Only an explicit falsey value (`0`/`false`/`no`/`off`) turns it off, reproducing the prior exact reply text |
+| `JESSE_MODEL_BADGE` | `on` | Whether the bridge appends a one-line provenance **badge** to each delivered `POST /jesse/jesse` reply, naming the backend that produced it: `[local · vault · <model>]`, `[local · diet · <model> + hosted verify]`, `[local · emergency · <model>]`, `[local · diet · <model> + verify queued]`, or `[hosted · <model>]` / `[hosted]`. Display-only, derived from the bridge's own turn state (never model output), and **never** applied to the title endpoint or written into session state. Only an explicit falsey value (`0`/`false`/`no`/`off`) turns it off, reproducing the prior exact reply text. A machine-readable **`provenance`** object (route + model + this exact badge string + the flags it encodes) rides the poll result and SSE `done` frame alongside the text badge whenever the badge is present — see [Structured provenance](#structured-provenance-model-badge-v2) |
 | `JESSE_METRICS_LOG` | _(off)_ | Absolute path to a structured-metrics **JSONL** file. When set, the bridge appends **one content-free JSON line per gated / routed / emergency turn** at the reply-finalization point (ISO-8601 timestamp, turn id, mode, route [`hosted`/`vaultqa-local`/`diet-local`/`emergency-local`], backend model, ladder rung, wall ms, TTFT/tool-calls where recoverable, citation count + validator verdict, badge string, emergency flag, hosted-failure class). **Never** the question, answer, or tokens — content joins happen in the `vaultqa-audit` tool via the serving logs. All-or-nothing and soft: **unset (default) → zero metrics writes**, and a write failure logs to stderr and never disturbs the reply. Append-only, line-buffered, restart-safe |
 | `JESSE_EMERGENCY_LOCAL` | `off` | Arms the **emergency local fallback** (`on`/`off`). Inert unless it is **on** AND the `JESSE_VAULTQA_*` triple is also set (that supplies the backend + read-only child). When armed, a hosted turn that fails **transport-class** (spawn / network / timeout / CLI-surfaced 5xx / 429 / quota / auth — never a completed turn) is served locally instead of surfacing the outage: an **Ask** runs the read-only vault-QA child (regardless of the routine gate, citation validator advisory, badge `[local · emergency · <model>]`); a **diet Tell** whose blocking hosted verify is unreachable has its extracted entry **queued** by the bridge for later verify (badge `[local · diet · <model> + verify queued]`), replayed oldest-first on the next successful hosted contact through the exact verify-then-append path — **nothing reaches the CSVs unverified**. A circuit breaker goes local-first after 2 consecutive transport failures for 300 s. Default **off**; only an explicit `on`/`1`/`true`/`yes` arms it. **Untested-live until go-live's outage drill.** See [`../SECURITY.md`](../SECURITY.md#emergency-local-fallback-posture) |
 | `JESSE_APNS_KEY_PATH` | _(off)_ | Path to the APNs auth key `.p8`. Set (with the three below) to enable push; unset → push disabled, behavior unchanged. See [Push notifications](#push-notifications-apns--optional-off-by-default) |

@@ -607,6 +607,13 @@ private struct TurnRow: View {
                 TurnAttachmentsView(attachments: turn.orderedAttachments)
             }
             bubble
+            // Native provenance chip under a Jesse reply that carried structured
+            // provenance (the badge text is already stripped from `turn.text`). Absent
+            // for user turns and older/badges-off replies — nothing renders there.
+            if let provenance = JesseProvenance.from(json: turn.provenanceJSON) {
+                ProvenanceChip(provenance: provenance)
+                    .padding(.top, 1)
+            }
         }
         .frame(maxWidth: .infinity, alignment: turn.isUser ? .trailing : .leading)
     }

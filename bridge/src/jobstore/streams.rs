@@ -23,12 +23,13 @@ pub enum StreamFrame {
     /// A coarse "Jesse is using the <name> tool" activity hint.
     Activity(String),
     /// Terminal: the turn finished. Carries the authoritative final text,
-    /// session id, and any extracted directives (same values `complete`
-    /// persisted), not the accumulated deltas.
+    /// session id, any extracted directives, and the structured provenance (same
+    /// values `complete` persisted), not the accumulated deltas.
     Done {
         response: String,
         session_id: Option<String>,
         directives: Option<Directives>,
+        provenance: Option<Provenance>,
     },
     /// Terminal: the turn failed. Carries the human-readable cause.
     Error(String),

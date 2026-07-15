@@ -35,6 +35,12 @@ pub enum JobState {
         // the terminal state so BOTH the poll result and the SSE `done` frame
         // surface the same value. `None` for the overwhelming majority of turns.
         directives: Option<Directives>,
+        // Structured, display-only provenance (which backend produced the text +
+        // the badge/flags it encodes), carried on the terminal state so BOTH the
+        // poll result and the SSE `done` frame surface the same value. Present
+        // exactly when the text badge is appended; `None` when badges are off, on a
+        // persisted reply from before this field, or on an empty/error turn.
+        provenance: Option<Provenance>,
     },
     Failed {
         error: String,
@@ -139,20 +145,24 @@ pub fn ms_to_system_time(ms: u64) -> SystemTime {
 /// and timing metadata; never any secret.
 pub fn job_to_value(id: &str, job: &Job) -> Option<Value> {
     let completed_at = job.completed_at?;
-    let (status, response, session_id, directives, error) = match &job.state {
+    let (status, response, session_id, directives, provenance, error) = match &job.state {
         JobState::Done {
             response,
             session_id,
             directives,
+            provenance,
         } => (
             "done",
             Some(response.clone()),
             session_id.clone(),
             directives_to_value(directives),
+            provenance_to_value(provenance),
             None,
         ),
-        JobState::Failed { error } => ("failed", None, None, Value::Null, Some(error.clone())),
-        JobState::Cancelled => ("cancelled", None, None, Value::Null, None),
+        JobState::Failed { error } => {
+            ("failed", None, None, Value::Null, Value::Null, Some(error.clone()))
+        }
+        JobState::Cancelled => ("cancelled", None, None, Value::Null, Value::Null, None),
         JobState::Running => return None,
     };
     Some(json!({
@@ -162,6 +172,7 @@ pub fn job_to_value(id: &str, job: &Job) -> Option<Value> {
         "response": response,
         "session_id": session_id,
         "directives": directives,
+        "provenance": provenance,
         "error": error,
         "completed_at_ms": system_time_to_ms(completed_at),
         "first_retrieved_at_ms": job.first_retrieved_at.map(system_time_to_ms),
@@ -189,6 +200,14 @@ pub fn value_to_job(v: &Value) -> Option<(String, Job)> {
                 .get("directives")
                 .filter(|d| !d.is_null())
                 .and_then(|d| serde_json::from_value(d.clone()).ok()),
+            // Absent/null/malformed persisted provenance → None (a persisted reply
+            // from before this field, or a badges-off turn, has none). A restart
+            // then serves the reply with its badge still in the text — the app's
+            // no-provenance fallback shows it verbatim, exactly as an old client.
+            provenance: v
+                .get("provenance")
+                .filter(|p| !p.is_null())
+                .and_then(|p| serde_json::from_value(p.clone()).ok()),
         },
         "failed" => JobState::Failed {
             error: v
@@ -461,6 +480,20 @@ impl JobStore {
         id: &str,
         outcome: Result<(String, Option<String>, Option<Directives>), ApiError>,
     ) {
+        self.complete_with_provenance(id, outcome, None);
+    }
+
+    /// Land a turn's outcome AND its structured provenance onto the job. Identical
+    /// to [`complete`](Self::complete) in every other respect (write-once, persisted,
+    /// off-lock disk write); the provenance rides on `JobState::Done` so BOTH the poll
+    /// result and the SSE `done` frame surface the same value — mirroring `directives`.
+    /// `None` on an error/cancelled outcome or when badges are off.
+    pub fn complete_with_provenance(
+        &self,
+        id: &str,
+        outcome: Result<(String, Option<String>, Option<Directives>), ApiError>,
+        provenance: Option<Provenance>,
+    ) {
         // The turn is over — drop its abort handle so the map can't leak. Done in
         // its own statement so the `aborts` lock is released before taking `jobs`.
         self.aborts.lock_ok().remove(id);
@@ -469,6 +502,7 @@ impl JobStore {
                 response,
                 session_id,
                 directives,
+                provenance,
             },
             Err((_code, error)) => JobState::Failed { error },
         };
@@ -566,12 +600,14 @@ impl JobStore {
                 response,
                 session_id,
                 directives,
+                provenance,
             }) => self.stream_finish(
                 id,
                 StreamFrame::Done {
                     response,
                     session_id,
                     directives,
+                    provenance,
                 },
             ),
             Some(JobState::Failed { error }) => self.stream_finish(id, StreamFrame::Error(error)),
@@ -1050,6 +1086,7 @@ mod tests {
                     response: "off-lock".into(),
                     session_id: Some("s".into()),
                     directives: None,
+                    provenance: None,
                 },
                 completed_at: Some(SystemTime::now()),
                 first_retrieved_at: None,

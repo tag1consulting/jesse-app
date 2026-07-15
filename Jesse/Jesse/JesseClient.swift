@@ -272,6 +272,11 @@ struct JesseReply: Equatable {
     // `text`). Nil for the overwhelming majority of turns. `needs_health` drives
     // the classify-then-attach retry in `RunCoordinator`.
     var directives: JesseDirectives? = nil
+    // Structured, display-only provenance (model-badge v2). When present, `displayText`
+    // strips the trailing badge (and the emergency citations-unverified warning) so the
+    // bubble shows a clean body and a native chip renders it instead. Nil on an older
+    // bridge / badges-off turn → the text is shown verbatim.
+    var provenance: JesseProvenance? = nil
 
     /// The validated needs-health request this reply asks for, or nil if there is
     /// no `needs_health` directive or it fails the contract (unknown metric, window
@@ -294,9 +299,13 @@ struct JesseReply: Equatable {
 
     private static let marker = "SPOKEN:"
 
-    /// Full answer for the screen, with the SPOKEN: line removed.
+    /// Full answer for the screen, with the model-badge (and any emergency
+    /// citations-unverified warning) stripped when structured provenance is present,
+    /// then the SPOKEN: line removed. With no provenance the text is shown verbatim
+    /// (the older-bridge fallback), badge included, exactly as before.
     var displayText: String {
-        text.split(separator: "\n", omittingEmptySubsequences: false)
+        let base = provenance?.strip(from: text) ?? text
+        return base.split(separator: "\n", omittingEmptySubsequences: false)
             .filter { !$0.trimmingCharacters(in: .whitespaces).uppercased().hasPrefix(Self.marker) }
             .joined(separator: "\n")
             .trimmingCharacters(in: .whitespacesAndNewlines)
@@ -460,11 +469,14 @@ nonisolated struct JesseResultResponse: Decodable {
     let response: String?
     let sessionId: String?
     let directives: JesseDirectives?
+    // Structured provenance (model-badge v2). Absent/null on an older bridge or a
+    // badges-off turn → the reply text is shown verbatim (fallback).
+    let provenance: JesseProvenance?
     let error: String?
     enum CodingKeys: String, CodingKey {
         case status, response
         case sessionId = "session_id"
-        case directives, error
+        case directives, provenance, error
     }
 }
 
@@ -556,11 +568,13 @@ nonisolated struct JesseStreamFrameData: Decodable {
     let response: String?
     let sessionId: String?
     let directives: JesseDirectives?
+    // Structured provenance on the SSE `done` frame — the same value the poll carries.
+    let provenance: JesseProvenance?
     let error: String?
     enum CodingKeys: String, CodingKey {
         case text, name, response
         case sessionId = "session_id"
-        case directives, error
+        case directives, provenance, error
     }
 }
 
@@ -1077,7 +1091,7 @@ struct JesseClient: JesseClientProtocol {
         case "activity": return .activity(obj?.name ?? "")
         case "done":
             return .done(JesseReply(text: obj?.response ?? "", sessionId: obj?.sessionId,
-                                    directives: obj?.directives))
+                                    directives: obj?.directives, provenance: obj?.provenance))
         case "error": return .failed(obj?.error ?? "Jesse couldn't complete that.")
         case "cancelled": return .cancelled
         default: return nil
@@ -1301,7 +1315,7 @@ struct JesseClient: JesseClientProtocol {
         case "done":
             guard let text = obj.response else { throw JesseError.decoding }
             return .done(JesseReply(text: text, sessionId: obj.sessionId,
-                                    directives: obj.directives))
+                                    directives: obj.directives, provenance: obj.provenance))
         case "failed":
             return .failed(obj.error ?? "Jesse couldn't complete that.")
         case "cancelled":

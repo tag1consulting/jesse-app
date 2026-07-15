@@ -592,7 +592,8 @@ mod tests {
         assert!(job_state_is_pushable(&JobState::Done {
             response: "x".into(),
             session_id: None,
-            directives: None
+            directives: None,
+            provenance: None
         }));
         assert!(job_state_is_pushable(&JobState::Failed { error: "x".into() }));
         assert!(!job_state_is_pushable(&JobState::Cancelled));

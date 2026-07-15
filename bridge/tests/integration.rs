@@ -1333,6 +1333,96 @@ async fn directive_is_extracted_on_the_sse_done_frame_consistently() {
     assert!(sse.contains("heartRateVariabilitySDNN"), "metric name in done frame: {sse}");
 }
 
+// ---- Structured provenance (v2) end-to-end ----------------------------------
+//
+// A delivered reply carries a machine-readable `provenance` object alongside the
+// text badge, on BOTH the poll result and the SSE `done` frame. These drive a real
+// hosted turn with badges ON and assert the wiring: provenance is present, its
+// `badge` is byte-identical to what was appended to the text, and it is absent when
+// badges are off (the older-client fallback).
+
+// Like `run_turn_emitting`, but with the model badge switched ON so a delivered
+// hosted reply carries both the text badge and structured provenance.
+async fn run_badged_turn_emitting(req_json: &str, stdout_line: &str, model_badge: bool) -> (AppState, String) {
+    let script = String::from("#!/bin/sh\nprintf '%s' '") + stdout_line + "'\n";
+    let fake = write_fake_claude(&script);
+    let cfg = Config {
+        claude_bin: fake.to_string_lossy().into_owned(),
+        timeout_secs: 30,
+        model_badge,
+        ..test_config()
+    };
+    let st = AppState::new(cfg);
+    let resp = app(st.clone())
+        .oneshot(jesse_request(Some("Bearer test-token"), req_json))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::ACCEPTED);
+    let body: Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    let job_id = body["job_id"].as_str().unwrap().to_string();
+    for _ in 0..80 {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        if result_status(&st, &job_id).await["status"] == "done" {
+            let _ = std::fs::remove_file(&fake);
+            return (st, job_id);
+        }
+    }
+    let _ = std::fs::remove_file(&fake);
+    panic!("turn did not complete");
+}
+
+#[tokio::test]
+async fn provenance_rides_the_poll_result_and_matches_the_appended_badge() {
+    // A plain hosted turn with badges on: the poll result carries `provenance` whose
+    // `badge` is exactly the string appended to the end of `response` (byte-identity
+    // between the structured field and the text badge older clients still read).
+    let line = r#"{"type":"result","is_error":false,"result":"Here is your answer.","session_id":"sess-prov"}"#;
+    let (st, job_id) = run_badged_turn_emitting(r#"{"mode":"ask","text":"hello"}"#, line, true).await;
+    let v = result_status(&st, &job_id).await;
+
+    let prov = &v["provenance"];
+    assert!(prov.is_object(), "provenance present on a badged reply: {v}");
+    assert_eq!(prov["route"], "hosted", "a plain hosted turn routes hosted");
+    let badge = prov["badge"].as_str().expect("badge string present");
+    assert!(badge.starts_with("[hosted"), "hosted badge shape: {badge}");
+    // The structured badge is byte-identical to what was appended to the reply text.
+    let response = v["response"].as_str().unwrap();
+    assert!(response.ends_with(&format!("\n\n{badge}")), "response ends with the same badge: {response:?}");
+    assert!(response.starts_with("Here is your answer."), "answer body preserved");
+    // Flags are all false on a hosted turn.
+    assert_eq!(prov["flags"]["hosted_verify"], false);
+    assert_eq!(prov["flags"]["verify_queued"], false);
+    assert_eq!(prov["flags"]["citations_unverified"], false);
+}
+
+#[tokio::test]
+async fn provenance_on_the_sse_done_frame_matches_the_poll() {
+    // The SSE `done` frame carries the SAME provenance as the poll — the two terminal
+    // paths are kept byte-consistent (mirroring the directives contract).
+    let line = r#"{"type":"result","is_error":false,"result":"Streamed answer.","session_id":"sess-prov-sse"}"#;
+    let (st, job_id) = run_badged_turn_emitting(r#"{"mode":"ask","text":"hello"}"#, line, true).await;
+    let resp = app(st.clone())
+        .oneshot(stream_request(Some("Bearer test-token"), &job_id))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let sse = body_string(resp).await;
+    assert!(sse.contains("event: done"), "expected a done frame: {sse}");
+    assert!(sse.contains("\"provenance\""), "done frame carries provenance: {sse}");
+    assert!(sse.contains("\"route\":\"hosted\""), "route on the done frame: {sse}");
+}
+
+#[tokio::test]
+async fn provenance_is_null_when_badges_off_older_client_fallback() {
+    // Badges off → no text badge AND no provenance object (JSON null), so an older
+    // client sees exactly today's behavior: the reply text verbatim, no chip.
+    let line = r#"{"type":"result","is_error":false,"result":"No badge here.","session_id":"sess-nobadge"}"#;
+    let (st, job_id) = run_badged_turn_emitting(r#"{"mode":"ask","text":"hello"}"#, line, false).await;
+    let v = result_status(&st, &job_id).await;
+    assert!(v["provenance"].is_null(), "no provenance when badges are off: {v}");
+    assert_eq!(v["response"], "No badge here.", "reply text is unbadged and unchanged");
+}
+
 #[tokio::test]
 async fn unknown_directive_passes_through_visible_with_no_field() {
     // An unknown directive name is a loud contract failure: the line stays VISIBLE

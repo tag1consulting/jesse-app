@@ -172,6 +172,14 @@ final class Turn {
     var createdAt: Date = Date()
     var thread: JesseThread?
 
+    // Structured provenance (model-badge v2) for a Jesse reply, stored as the compact
+    // JSON the bridge delivered (see `JesseProvenance`). Drives the native provenance
+    // chip under the message, and survives relaunch/scroll. Nil for user turns, older
+    // replies, and badges-off turns. Additive defaulted property → SwiftData
+    // lightweight-migrates existing stores with no migration code (matching how
+    // `origin`/`aiTitle`/`lastDeliveredJobId` were added).
+    var provenanceJSON: String?
+
     // Downscaled previews of the files the user attached to this turn (nil bytes
     // are never stored — see `TurnAttachment`). Cascade so deleting a Turn (or, via
     // JesseThread's own cascade, a whole thread) removes its previews. Empty by

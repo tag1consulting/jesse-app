@@ -79,6 +79,11 @@ pub struct AskResult {
     pub failclass: Option<String>,
     pub citations: Option<usize>,
     pub validator: Option<String>,
+    /// The emergency answer was delivered WITHOUT a passing citation check (the
+    /// advisory validator failed) — the reply carries the prepended warning and the
+    /// provenance chip must show the unverified state. Always `false` off the
+    /// emergency route.
+    pub citations_unverified: bool,
     pub hosted_succeeded: bool,
 }
 
@@ -147,6 +152,10 @@ pub async fn run_ask_hosted_or_emergency(
                     failclass: Some(reason),
                     citations,
                     validator: Some(emergency_validator(validator_ok)),
+                    // The one path that can serve unverified citations: an emergency
+                    // answer whose advisory validator failed (its text already carries
+                    // the prepended warning).
+                    citations_unverified: !validator_ok,
                     hosted_succeeded: false,
                 })
             }
@@ -179,6 +188,7 @@ pub async fn run_ask_hosted_or_emergency(
                 failclass: None,
                 citations: None,
                 validator: None,
+                citations_unverified: false,
                 hosted_succeeded: true,
             }
         }
@@ -200,6 +210,7 @@ pub async fn run_ask_hosted_or_emergency(
                     failclass: Some(cls.label().to_string()),
                     citations: None,
                     validator: None,
+                    citations_unverified: false,
                     hosted_succeeded: false,
                 };
             }
@@ -213,6 +224,7 @@ pub async fn run_ask_hosted_or_emergency(
                 failclass: if emergency_armed { Some(cls.label().to_string()) } else { None },
                 citations: None,
                 validator: None,
+                citations_unverified: false,
                 hosted_succeeded: false,
             }
         }
@@ -435,6 +447,9 @@ pub async fn jesse(
         let mut m_validator: Option<String> = None;
         let mut m_emergency = false;
         let mut m_failclass: Option<String> = None;
+        // Provenance-only: whether an emergency answer skipped the citation check.
+        // Never feeds the metrics line (which records the validator verdict directly).
+        let mut m_citations_unverified = false;
         let mut hosted_succeeded = false;
 
         let diet_model = || cfg.diet_backend.as_ref().map(|(_, _, m)| m.clone());
@@ -528,6 +543,7 @@ pub async fn jesse(
                     ).await;
                     route = r.route; m_model = r.model; m_emergency = r.emergency;
                     m_failclass = r.failclass; m_citations = r.citations; m_validator = r.validator;
+                    m_citations_unverified = r.citations_unverified;
                     hosted_succeeded = r.hosted_succeeded;
                     (r.outcome, r.badge)
                 }
@@ -541,6 +557,7 @@ pub async fn jesse(
             ).await;
             route = r.route; m_model = r.model; m_emergency = r.emergency;
             m_failclass = r.failclass; m_citations = r.citations; m_validator = r.validator;
+            m_citations_unverified = r.citations_unverified;
             hosted_succeeded = r.hosted_succeeded;
             (r.outcome, r.badge)
         } else {
@@ -552,6 +569,17 @@ pub async fn jesse(
             if emergency_armed { update_breaker(&breaker, &out, Instant::now()); }
             (out, BadgeSource::Hosted)
         };
+        // Build the structured provenance (v2) from the SAME pre-finalize outcome and
+        // turn state that produce the text badge, so the two are always both-present or
+        // both-absent. It rides on `JobState::Done` next to `directives`, reaching BOTH
+        // the poll result and the SSE `done` frame; the metrics line and audit are
+        // untouched. `route`/`m_model` are the resolved route + backend model (the same
+        // the metrics line records); `m_citations_unverified` is the emergency advisory
+        // verdict (always false off that route).
+        let provenance = reply_provenance(
+            &outcome, &cfg, route, badge_source, m_model.clone(), hosted_model.as_deref(),
+            m_citations_unverified,
+        );
         // Finalize the delivered reply: append the model badge (display only) at this
         // single point, so BOTH the poll result and the SSE `done` frame carry it.
         let outcome = finalize_reply_badge(outcome, &cfg, badge_source, hosted_model.as_deref());
@@ -587,7 +615,7 @@ pub async fn jesse(
             });
         }
 
-        jobs.complete(&jid, outcome);
+        jobs.complete_with_provenance(&jid, outcome, provenance);
         // Close the live stream with the frame matching the state that actually
         // landed. `complete` is write-once, so a cancel that won the race already
         // set `Cancelled` (and `cancel` already emitted that frame + removed the
@@ -665,11 +693,13 @@ pub async fn jesse_result(
             response,
             session_id,
             directives,
+            provenance,
         }) => Ok(Json(json!({
             "status": "done",
             "response": response,
             "session_id": session_id,
             "directives": directives_to_value(&directives),
+            "provenance": provenance_to_value(&provenance),
         }))),
         Some(JobState::Failed { error }) => {
             Ok(Json(json!({ "status": "failed", "error": error })))

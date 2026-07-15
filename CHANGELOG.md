@@ -15,6 +15,48 @@ CI both run it). See the "Versioning" section of `bridge/README.md`.
 
 ## [Unreleased]
 
+## [Bridge 0.12.0] — 2026-07-15
+
+### Added
+- **Structured provenance on every delivered reply (model-badge v2).** Alongside the
+  existing text badge (kept — older clients depend on it), a terminal turn's payload now
+  carries a machine-readable `provenance` object on **both** the poll result
+  (`GET /jesse/result`) and the SSE `done` frame, next to `directives`:
+  - `route` — `hosted` | `vaultqa-local` | `diet-local` | `emergency-local` (the same
+    route vocabulary the metrics line uses — one source of truth).
+  - `model` — the backend model that produced the reply (`null` on a bare `[hosted]`).
+  - `badge` — the exact text badge string, **byte-identical** to what is appended to the
+    reply text, so a client can strip it from the display by matching it.
+  - `flags` — `hosted_verify` (diet `+ hosted verify`), `verify_queued` (diet
+    `+ verify queued`), and `citations_unverified` (an emergency answer delivered above
+    the `⚠️ citations unverified` warning) — exactly what the badge and warning encode.
+
+  It is built at the **same finalization seam** as the badge and is present on the payload
+  **exactly when** the badge is appended (badges on, a non-empty `Ok` reply); it is
+  `null` when badges are off, on an empty directive-only turn, and on every error/cancel —
+  so an older client sees precisely today's behavior (the trailing badge in the text). It
+  is persisted with the job and reloads across a restart. *Root cause it addresses:* a
+  client that wanted to render provenance as native UI had to string-parse the badge out
+  of the reply text and re-derive the route/flags — brittle and drift-prone. The
+  **metrics line and the `vaultqa-audit` schema are unchanged.** The exact strings are
+  pinned by a shared fixture (`bridge/tests/fixtures/provenance.json`) that both the
+  bridge and the iOS app tests read, so producer and consumer can never drift.
+
+## [App 1.0 (39)] — 2026-07-15
+
+### Added
+- **Native provenance chip under a Jesse reply.** When the bridge delivers structured
+  provenance (model-badge v2), the app strips the trailing text badge — and, on an
+  unverified emergency answer, the prepended `⚠️ citations unverified` warning — from the
+  displayed message and renders a subtle capsule under the bubble instead: a distinct
+  tint for **local** vs **hosted** vs **emergency**, a *"Queued for verify"* state for a
+  diet Tell queued during an outage, and a **warning** state (red, with a triangle) for
+  unverified citations. When provenance is **absent** (an older bridge, or badges off) the
+  reply text is shown verbatim, badge and all — exactly as before. The chip is persisted
+  with the turn, so it survives relaunch and scrolling. The exact badge/warning strings
+  are shared with the bridge via `bridge/tests/fixtures/provenance.json`, which the app's
+  `ProvenanceTests` reads from disk so the two sides can't drift.
+
 ## [Bridge 0.11.0] — 2026-07-15
 
 ### Added
