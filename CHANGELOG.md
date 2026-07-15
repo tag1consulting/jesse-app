@@ -15,6 +15,70 @@ CI both run it). See the "Versioning" section of `bridge/README.md`.
 
 ## [Unreleased]
 
+## [Bridge 0.11.0] — 2026-07-15
+
+### Added
+- **Structured metrics log (`JESSE_METRICS_LOG`).** When set to an absolute path, the
+  bridge appends **one content-free JSON line per gated / routed / emergency turn** at
+  the same reply-finalization seam the badge uses: ISO-8601 timestamp, turn id, mode,
+  route (`hosted` / `vaultqa-local` / `diet-local` / `emergency-local`), backend model,
+  ladder rung, wall ms, TTFT/tool-calls where recoverable, citation count + validator
+  verdict, badge string, emergency flag, and hosted-failure class. **Never** the
+  question, answer, or tokens — content joins happen in the audit via the serving logs.
+  *Root cause it addresses:* the local-routing story had no durable, queryable record of
+  what routed where, at what latency, or why a turn fell through — so an operator could
+  not see routed share, fallback rates, or emergency activations without scraping
+  free-text provenance. All-or-nothing and soft: unset → **zero** writes; a write
+  failure logs to stderr and never disturbs the reply (append-only, line-buffered,
+  restart-safe).
+- **Emergency local fallback (`JESSE_EMERGENCY_LOCAL`, default off).** Armed only when
+  on **and** the `JESSE_VAULTQA_*` triple is set. On a **transport-class** hosted
+  failure (spawn / network / timeout / CLI-surfaced 5xx / 429 / quota / auth — never a
+  completed turn), the bridge serves locally instead of surfacing the outage: an **Ask**
+  runs the read-only vault-QA child (regardless of the routine gate; citation validator
+  **advisory**, badge `[local · emergency · <model>]`, 120 s timeout); a **diet Tell**
+  whose blocking hosted verify is unreachable has its extracted entry **queued** by the
+  bridge (`[local · diet · <model> + verify queued]`) and replayed oldest-first on the
+  next successful hosted contact through the exact verify-then-append path — **nothing
+  reaches the CSVs unverified**, a rejected replay moves to a rejected file (never a
+  silent drop), and the queue survives a restart. A **circuit breaker** goes local-first
+  after 2 consecutive transport failures for 300 s. *Root cause it addresses:* a hosted
+  outage previously meant a dead phone — every Ask errored and every diet Tell's blocking
+  verify failed — even though the vault and a local model were right there.
+  **Untested-live until go-live's outage drill;** ships dormant. See `SECURITY.md`
+  ("Emergency local fallback posture").
+- **`vaultqa-audit` bin — the daily audit of the vault-QA / emergency pipeline.** Reads
+  the day's `JESSE_METRICS_LOG` slice **by timestamp** (not the diet audit's line-count
+  watermark), joins the serving logs for citation re-validation when configured (skipped
+  cleanly offline), reads the diet queue for pending/rejected + backlog age, and writes a
+  dated markdown note + JSON twin to `~/Library/Logs/jesse-vaultqa-audit/`, mirroring the
+  diet audit's destination. **Tripwires first:** any invented citation, any
+  injection-style leak, emergency active >24 h, replay backlog older than 24 h. The
+  launchd installer stays with go-live.
+- **Vault-QA gate v2 — synthesis exclusions.** A self-referential Ask carrying a
+  synthesis token (`advise`/`advice`/`suggest`/`recommend`/`review`/`summarize`/
+  `summary`/`compare`/`analyze`/`plan`/`brainstorm`/`improve`/`rank`, or the `should I` /
+  `what should` bigrams) is now **excluded** from the local lookup route and answered by
+  the hosted agent. *Root cause:* the `vaultqa-v1` bake-off showed hosted winning every
+  judged synthesis pair while both locals scored 100% on lookups — a false negative costs
+  nothing (hosted answers as today), a false positive delivers a worse local answer.
+
+### Changed
+- **Vault-QA child timeout 25 s → 60 s** (`VAULTQA_TIMEOUT_SECS`). The `vaultqa-v1`
+  bake-off measured the winning local backend's lookups at **10–42 s wall**; a 25 s
+  ceiling would have timed out (rung-2) most real lookups the model answered correctly.
+  Const only, no new env. The emergency child gets a looser 120 s (`EMERGENCY_TIMEOUT_SECS`).
+
+### Notes
+- **Backend call (recorded):** applying the routine-lookup qualification rule to the
+  archived `vaultqa-v1` artifacts — (a) 100% on `vq-injection` + `vq-negative-absent`,
+  (b) 100% of mechanical assertions on the 7-task subset, (c) subset mean wall ≤ 45 s —
+  `local-oss` qualifies (mean **27.87 s**), `local-flash` fails (c) (mean **79.73 s**);
+  **winner `local-oss`** (also the emergency backend). Pinned by a fixture test.
+- With `JESSE_METRICS_LOG` and `JESSE_EMERGENCY_LOCAL` both unset, every existing path
+  (main turn, titles, diet, vault-QA) is byte-for-byte unchanged — the full prior test
+  suite passes unmodified.
+
 ## [Bridge 0.10.0] — 2026-07-14
 
 ### Added

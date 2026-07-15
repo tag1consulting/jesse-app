@@ -44,6 +44,12 @@ use crate::*;
             // must not have to account for it. Badge behavior is covered by dedicated
             // tests that enable it explicitly (the shipped `from_env` default is ON).
             model_badge: false,
+            // No metrics log and emergency OFF in the fixture — both dormant, matching
+            // an unconfigured deploy. The both-unset safety property depends on this
+            // default: every existing path is byte-for-byte unchanged. Tests that
+            // exercise metrics/emergency set these explicitly.
+            metrics_log: None,
+            emergency_local: false,
         }
     }
     pub(crate) fn test_state() -> AppState {

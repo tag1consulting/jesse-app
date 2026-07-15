@@ -65,6 +65,160 @@ pub struct TitleRequest {
     session_id: Option<String>,
 }
 
+// ---- Emergency ASK routing (Piece 4) --------------------------------------
+
+/// The result of resolving an ASK turn's hosted attempt, possibly via the emergency
+/// local fallback. Carries the delivered outcome, the badge source, the metrics shape,
+/// and whether a hosted contact SUCCEEDED (which gates the diet-queue replay).
+pub struct AskResult {
+    pub outcome: Result<(String, Option<String>, Option<Directives>), ApiError>,
+    pub badge: BadgeSource,
+    pub route: MetricsRoute,
+    pub model: Option<String>,
+    pub emergency: bool,
+    pub failclass: Option<String>,
+    pub citations: Option<usize>,
+    pub validator: Option<String>,
+    pub hosted_succeeded: bool,
+}
+
+/// Update the circuit breaker from a hosted attempt's outcome: a success resets it, a
+/// transport-class failure counts toward tripping it. Called only when emergency armed.
+fn update_breaker(breaker: &CircuitBreaker, out: &Result<(String, Option<String>, Option<Directives>), ApiError>, now: Instant) {
+    match out {
+        Ok(_) => breaker.record_success(),
+        Err(e) => {
+            if classify_hosted_failure(e).is_transport() {
+                breaker.record_transport_failure(now);
+            }
+        }
+    }
+}
+
+/// The validator string for a metrics line from an emergency outcome.
+fn emergency_validator(validator_ok: bool) -> String {
+    if validator_ok { "ok".to_string() } else { "advisory-fail".to_string() }
+}
+
+/// Resolve an ASK turn: attempt the hosted turn (unless the breaker is open and
+/// emergency is armed, in which case go local-first), and on a TRANSPORT-class hosted
+/// failure with emergency armed, serve the read-only emergency child instead. On any
+/// non-transport failure, an unarmed bridge, or an emergency child failure, this
+/// returns the ORIGINAL hosted outcome exactly as today. `hosted_model` is the ambient
+/// `ANTHROPIC_MODEL` for the metrics/badge model field on the hosted path.
+#[allow(clippy::too_many_arguments)]
+pub async fn run_ask_hosted_or_emergency(
+    cfg: &Config,
+    prompt: &str,
+    sid: Option<&str>,
+    jobs: &JobStore,
+    jid: &str,
+    question: &str,
+    health_context: Option<&str>,
+    breaker: &CircuitBreaker,
+    emergency_armed: bool,
+    hosted_model: Option<String>,
+) -> AskResult {
+    let now = Instant::now();
+    let vaultqa_model = cfg
+        .vaultqa_backend
+        .as_ref()
+        .map(|(_, _, m)| m.clone());
+    let base_url = cfg
+        .vaultqa_backend
+        .as_ref()
+        .map(|(b, _, _)| b.clone())
+        .unwrap_or_default();
+
+    // A small closure that runs the emergency child and packages the AskResult, or
+    // returns None when the child hard-failed (caller decides the fallback).
+    let emergency = |reason: String| async {
+        match run_emergency_ask_pipeline(cfg, question, health_context).await {
+            EmergencyAskOutcome::Answered { text, citations, validator_ok } => {
+                if let Some(model) = &vaultqa_model {
+                    eprintln!("{}", format_emergency_provenance(&base_url, model, &reason));
+                }
+                Some(AskResult {
+                    outcome: Ok((text, None, None)),
+                    badge: BadgeSource::Emergency,
+                    route: MetricsRoute::EmergencyLocal,
+                    model: vaultqa_model.clone(),
+                    emergency: true,
+                    failclass: Some(reason),
+                    citations,
+                    validator: Some(emergency_validator(validator_ok)),
+                    hosted_succeeded: false,
+                })
+            }
+            EmergencyAskOutcome::ChildFailed => None,
+        }
+    };
+
+    // Local-first: the breaker is open (hosted judged down) — skip the hosted attempt
+    // and serve the emergency child. If the child also fails, fall through to actually
+    // attempting hosted (better a slow real answer than none).
+    if emergency_armed && breaker.should_skip_hosted(now) {
+        if let Some(res) = emergency("breaker-open".to_string()).await {
+            return res;
+        }
+    }
+
+    // Attempt hosted.
+    let out = apply_directives(run_claude_streaming(cfg, prompt, sid, jobs, jid).await);
+    match out {
+        Ok(v) => {
+            if emergency_armed {
+                breaker.record_success();
+            }
+            AskResult {
+                outcome: Ok(v),
+                badge: BadgeSource::Hosted,
+                route: MetricsRoute::Hosted,
+                model: hosted_model,
+                emergency: false,
+                failclass: None,
+                citations: None,
+                validator: None,
+                hosted_succeeded: true,
+            }
+        }
+        Err(e) => {
+            let cls = classify_hosted_failure(&e);
+            if emergency_armed && cls.is_transport() {
+                breaker.record_transport_failure(now);
+                if let Some(res) = emergency(cls.label().to_string()).await {
+                    return res;
+                }
+                // The emergency child also failed — return the ORIGINAL hosted error
+                // exactly as today, but record that emergency was attempted.
+                return AskResult {
+                    outcome: Err(e),
+                    badge: BadgeSource::Hosted,
+                    route: MetricsRoute::Hosted,
+                    model: hosted_model,
+                    emergency: true,
+                    failclass: Some(cls.label().to_string()),
+                    citations: None,
+                    validator: None,
+                    hosted_succeeded: false,
+                };
+            }
+            // Not armed, or a non-transport failure → today's behavior: surface the error.
+            AskResult {
+                outcome: Err(e),
+                badge: BadgeSource::Hosted,
+                route: MetricsRoute::Hosted,
+                model: hosted_model,
+                emergency: false,
+                failclass: if emergency_armed { Some(cls.label().to_string()) } else { None },
+                citations: None,
+                validator: None,
+                hosted_succeeded: false,
+            }
+        }
+    }
+}
+
 // ---- Handlers -------------------------------------------------------------
 
 /// Liveness probe. Always returns `200 { "ok": true }` with **no auth and no
@@ -219,6 +373,11 @@ pub async fn jesse(
     let apns = st.apns.clone();
     let devices = st.devices.clone();
     let notify = st.notify.clone();
+    // Emergency-fallback machinery (Piece 4): the mode string (for the emergency-ASK
+    // gate + metrics) and the shared circuit breaker. Both inert unless emergency is
+    // armed — checked inside the task.
+    let mode = mode.clone();
+    let breaker = st.breaker.clone();
     let handle = tokio::spawn(async move {
         // Hold the scratch dir for the whole turn; its Drop removes the decoded
         // attachment files when the task ends — success, error, or timeout. The
@@ -249,52 +408,185 @@ pub async fn jesse(
             }
         };
 
+        // Turn wall clock starts here (after the permit — queued time doesn't count).
+        let turn_start = Instant::now();
+        // Emergency fallback (Piece 4) is armed only when JESSE_EMERGENCY_LOCAL is on
+        // AND the vault-QA triple is set (it supplies the backend + read-only child).
+        // With it disarmed, every branch below is byte-for-byte today's behavior.
+        let emergency_armed = emergency_armed(&cfg);
+        let hosted_model = env_string("ANTHROPIC_MODEL");
+        let diet_queue = DietQueue::from_cfg(&cfg);
+
         // A hosted turn: run the streamed agent turn and extract any agent-emitted
         // directive from the reply's final line. A recognized directive is stripped
-        // from the text and attached under `directives`, so the poll result and the
-        // SSE `done` frame both carry the same value. A non-directive reply is
-        // unchanged. This is today's path — and the diet fall-through target.
+        // from the text and attached under `directives`. This is today's path — and the
+        // diet fall-through target.
         let run_hosted = || async {
             apply_directives(run_claude_streaming(&cfg, &prompt, sid.as_deref(), &jobs, &jid).await)
         };
-        // Each branch yields the outcome AND the BADGE SOURCE — which backend
-        // actually produced the delivered text. A fallback rung runs the hosted turn,
-        // so it badges `Hosted` (the backend that produced the text), never the local
-        // one that tried first.
+
+        // Resolve the turn. Each branch yields the outcome, the BADGE SOURCE, the
+        // metrics shape, and whether a hosted contact succeeded (which gates the
+        // diet-queue replay below).
+        let mut route = MetricsRoute::Hosted;
+        let mut m_model: Option<String> = hosted_model.clone();
+        let mut m_rung: u8 = 0;
+        let mut m_citations: Option<usize> = None;
+        let mut m_validator: Option<String> = None;
+        let mut m_emergency = false;
+        let mut m_failclass: Option<String> = None;
+        let mut hosted_succeeded = false;
+
+        let diet_model = || cfg.diet_backend.as_ref().map(|(_, _, m)| m.clone());
+        let vaultqa_model = || cfg.vaultqa_backend.as_ref().map(|(_, _, m)| m.clone());
+
         let (outcome, badge_source) = if try_diet {
-            // Local diet pipeline: extract → verify → append → derive mirror. On a
-            // local log the directives (mirror) are BUILT by the bridge, not parsed
-            // from agent text. On any fallback rung the turn drops to the hosted path
-            // unchanged (a log is never lost and never double-appended).
+            // Local diet pipeline: extract → verify → append → derive mirror.
             match run_diet_pipeline(&cfg, &raw_text).await {
                 DietPipelineOutcome::Logged { dashboard, directives } => {
+                    // The blocking hosted verify succeeded → hosted is reachable.
+                    hosted_succeeded = true;
+                    route = MetricsRoute::DietLocal;
+                    m_model = diet_model();
                     (Ok((dashboard, None, Some(directives))), BadgeSource::DietVerify)
                 }
                 DietPipelineOutcome::LoggedNoMirror { dashboard } => {
+                    hosted_succeeded = true;
+                    route = MetricsRoute::DietLocal;
+                    m_model = diet_model();
                     (Ok((dashboard, None, None)), BadgeSource::DietVerify)
                 }
-                DietPipelineOutcome::FallThrough { .. } => (run_hosted().await, BadgeSource::Hosted),
+                DietPipelineOutcome::VerifyUnavailable { err, utterance, entries, date, offset } => {
+                    let cls = classify_hosted_failure(&err);
+                    // Emergency: hosted verify unreachable → the BRIDGE queues the
+                    // extracted entry (never a model, never the CSV) for later verify.
+                    if emergency_armed && cls.is_transport() && diet_queue.is_available() {
+                        let id = random_hex();
+                        let item = QueuedEntry {
+                            id: id.clone(),
+                            queued_ts: rfc3339_utc(SystemTime::now()),
+                            date,
+                            offset,
+                            utterance,
+                            entries,
+                        };
+                        match diet_queue.enqueue(&item) {
+                            Ok(()) => {
+                                eprintln!("{}", format_queued_provenance(&id));
+                                breaker.record_transport_failure(Instant::now());
+                                route = MetricsRoute::EmergencyLocal;
+                                m_model = diet_model();
+                                m_emergency = true;
+                                m_failclass = Some(cls.label().to_string());
+                                (Ok((queued_reply_text(), None, None)), BadgeSource::DietQueued)
+                            }
+                            Err(e) => {
+                                // Couldn't queue → today's behavior (run hosted).
+                                eprintln!("jesse-bridge: diet queue enqueue failed: {e} — hosted fallback");
+                                let out = run_hosted().await;
+                                hosted_succeeded = out.is_ok();
+                                if emergency_armed { update_breaker(&breaker, &out, Instant::now()); }
+                                m_rung = DietRung::Verify.num();
+                                (out, BadgeSource::Hosted)
+                            }
+                        }
+                    } else {
+                        // Not armed or a non-transport verify error → today's behavior:
+                        // exactly FallThrough { rung: Verify } (run the hosted turn).
+                        let out = run_hosted().await;
+                        hosted_succeeded = out.is_ok();
+                        if emergency_armed { update_breaker(&breaker, &out, Instant::now()); }
+                        m_rung = DietRung::Verify.num();
+                        (out, BadgeSource::Hosted)
+                    }
+                }
+                DietPipelineOutcome::FallThrough { rung } => {
+                    let out = run_hosted().await;
+                    hosted_succeeded = out.is_ok();
+                    if emergency_armed { update_breaker(&breaker, &out, Instant::now()); }
+                    m_rung = rung.num();
+                    (out, BadgeSource::Hosted)
+                }
             }
         } else if try_vaultqa {
-            // Local vault-QA: run the contained read-only child, validate its citations,
-            // and on success return its text as the reply WITHOUT running the hosted
-            // turn (the tokens stay local). No session_id (stateless) and no directives
-            // (the read-only child never emits one). On any ladder rung the turn drops
-            // to today's hosted path unchanged (a question is never lost).
+            // Local vault-QA lookup (routine route). On success the tokens stay local
+            // and no hosted turn runs. On any ladder rung it becomes a hosted ASK
+            // attempt (which, when emergency is armed, may serve the emergency child).
             match run_vaultqa_pipeline(&cfg, &raw_text, health_context.as_deref()).await {
-                VaultqaOutcome::Answered { text, .. } => (Ok((text, None, None)), BadgeSource::Vault),
-                VaultqaOutcome::FallThrough { .. } => (run_hosted().await, BadgeSource::Hosted),
+                VaultqaOutcome::Answered { text, citations } => {
+                    route = MetricsRoute::VaultqaLocal;
+                    m_model = vaultqa_model();
+                    m_citations = Some(citations);
+                    m_validator = Some("ok".to_string());
+                    (Ok((text, None, None)), BadgeSource::Vault)
+                }
+                VaultqaOutcome::FallThrough { rung } => {
+                    m_rung = rung.num();
+                    let r = run_ask_hosted_or_emergency(
+                        &cfg, &prompt, sid.as_deref(), &jobs, &jid, &raw_text,
+                        health_context.as_deref(), &breaker, emergency_armed, hosted_model.clone(),
+                    ).await;
+                    route = r.route; m_model = r.model; m_emergency = r.emergency;
+                    m_failclass = r.failclass; m_citations = r.citations; m_validator = r.validator;
+                    hosted_succeeded = r.hosted_succeeded;
+                    (r.outcome, r.badge)
+                }
             }
+        } else if mode == "ask" {
+            // A plain (non-gated) ASK: emergency + breaker apply on a hosted transport
+            // failure. With emergency disarmed this is byte-for-byte the old hosted path.
+            let r = run_ask_hosted_or_emergency(
+                &cfg, &prompt, sid.as_deref(), &jobs, &jid, &raw_text,
+                health_context.as_deref(), &breaker, emergency_armed, hosted_model.clone(),
+            ).await;
+            route = r.route; m_model = r.model; m_emergency = r.emergency;
+            m_failclass = r.failclass; m_citations = r.citations; m_validator = r.validator;
+            hosted_succeeded = r.hosted_succeeded;
+            (r.outcome, r.badge)
         } else {
-            (run_hosted().await, BadgeSource::Hosted)
+            // A non-diet TELL: no local fallback exists, so always attempt hosted (the
+            // breaker never skips here). Update the breaker so a Tell's hosted health
+            // still feeds it when emergency is armed.
+            let out = run_hosted().await;
+            hosted_succeeded = out.is_ok();
+            if emergency_armed { update_breaker(&breaker, &out, Instant::now()); }
+            (out, BadgeSource::Hosted)
         };
         // Finalize the delivered reply: append the model badge (display only) at this
-        // single point, so BOTH the poll result and the SSE `done` frame (which reads
-        // the stored state) carry it. A no-op when the badge is off, on an error, or on
-        // an empty directive-only reply. The hosted model is the ambient ANTHROPIC_MODEL
-        // in the bridge's env (what the hosted child actually used), read once here.
-        let hosted_model = env_string("ANTHROPIC_MODEL");
+        // single point, so BOTH the poll result and the SSE `done` frame carry it.
         let outcome = finalize_reply_badge(outcome, &cfg, badge_source, hosted_model.as_deref());
+
+        // Structured metrics (Piece 3): one content-free line per GATED / ROUTED /
+        // EMERGENCY turn, at this same finalization seam. A no-op when JESSE_METRICS_LOG
+        // is unset. Never the question/answer/tokens. Emitted before `complete` so a
+        // slow disk can't delay the terminal frame? — no: keep it after we know the
+        // badge string; it cannot alter `outcome`.
+        let metrics_relevant = try_diet || try_vaultqa || m_emergency;
+        if metrics_relevant {
+            let badge = match &outcome {
+                Ok((text, _, _)) if !text.trim().is_empty() => {
+                    model_badge_line(&cfg, badge_source, hosted_model.as_deref())
+                }
+                _ => None,
+            };
+            append_metrics_line(&cfg, &MetricsRecord {
+                ts: rfc3339_utc(SystemTime::now()),
+                turn_id: jid.clone(),
+                mode: mode.clone(),
+                route,
+                model: m_model,
+                rung: m_rung,
+                wall_ms: turn_start.elapsed().as_millis() as u64,
+                ttft_ms: None,
+                tool_calls: None,
+                citations: m_citations,
+                validator: m_validator,
+                badge,
+                emergency: m_emergency,
+                hosted_failure_class: m_failclass,
+            });
+        }
+
         jobs.complete(&jid, outcome);
         // Close the live stream with the frame matching the state that actually
         // landed. `complete` is write-once, so a cancel that won the race already
@@ -305,6 +597,17 @@ pub async fn jesse(
         // The job reached a terminal state cleanly — disarm the guard so its Drop
         // is a no-op (the right frame is already out).
         guard.disarm();
+
+        // Emergency diet-queue replay (Piece 4): on a SUCCESSFUL hosted contact, drain
+        // any queued diet entries oldest-first through the exact verify-then-append
+        // path. Run here — INSIDE the turn task, with the concurrency permit still held
+        // — so replay's vault writes respect the single-writer invariant and never race
+        // another turn. The reply is already stored above, so replay only delays the
+        // NEXT turn's start, never this reply. A no-op when emergency is disarmed, no
+        // hosted contact succeeded, or the queue is empty.
+        if emergency_armed && hosted_succeeded && diet_queue.is_available() {
+            replay_diet_queue(&cfg, &diet_queue).await;
+        }
 
         // Fire the completion push if this turn was flagged for it (the phone
         // backgrounded mid-turn). A no-op unless push is configured, the job is

@@ -171,6 +171,48 @@ hosted path — a prompt-injected or hallucinating child cannot deliver an inven
 "fact from your vault." Injection text inside a vault file can at most cause a
 `NO_VAULT_ANSWER` / validator-fail fall-through, never an action.
 
+## Emergency local fallback posture (`JESSE_EMERGENCY_LOCAL`)
+
+The emergency fallback (bridge README) keeps the phone useful during a **hosted
+outage** without opening any new write surface. It is armed only when
+`JESSE_EMERGENCY_LOCAL=on` **and** the `JESSE_VAULTQA_*` triple is set, and it fires
+only on a **transport-class** hosted failure (spawn / network / timeout / CLI-surfaced
+5xx / 429 / quota / auth) — a completed hosted turn is never a failure regardless of
+content, so a hostile reply can never trigger it.
+
+**Local models never gain a write path — emergency included.** This is the standing
+safety invariant, documented in `handlers.rs`/`dietqueue.rs` where the child postures
+live:
+
+- The emergency **Ask** answer comes from the **same read-only vault-QA child** above
+  — `--tools "Read,Grep,Glob"` + strict MCP, no `Write`/`Edit`/`Bash`, cwd framed as
+  untrusted data. It never gains a tool the routine child lacks. The only difference is
+  the prompt (it says hosted is unavailable and to answer best-effort or say what it
+  cannot) and a looser 120 s timeout. The citation validator still runs, but
+  **advisory**: because there is no ladder rung below emergency, an uncited answer is
+  delivered anyway with a prepended `citations unverified` warning above the badge —
+  the user is told, and the answer still came from a read-only child that cannot act.
+- The emergency **diet Tell** path performs **no local write to the canonical CSVs**.
+  When the blocking hosted verify is unreachable, the **bridge** (deterministic Rust,
+  never a model) appends the already-extracted entry to a pending-verify file in its
+  own state directory. On the next successful hosted contact the queue is replayed
+  oldest-first through the **exact existing verify-then-append path** — the same hosted
+  verify child admits or rejects each entry, exactly as a live entry. **Nothing ever
+  reaches the CSVs unverified**, the 100%-verify probation invariant holds through the
+  outage, and a rejected replay moves to a rejected file (surfaced in provenance),
+  never a silent drop. The queue is authored entirely by bridge code; the local extract
+  model's output is data awaiting a hosted verdict, not a durable write.
+
+**Every durable write stays deterministic bridge code.** As with the live diet
+pipeline, the only actor that writes the vault is trusted Rust, gated on a hosted
+verify verdict. The local models — routine, emergency, or extract — only ever produce
+**text** that the bridge validates or queues. A circuit breaker (2 consecutive
+transport failures → local-first for 300 s) only ever decides whether to *skip* a
+hosted attempt in favor of the read-only local path; it can never grant a capability.
+
+Emergency mode is **untested-live until go-live's outage drill** (block hosted at the
+network level and verify phone behavior end-to-end); it ships dormant (`off`).
+
 ## Code review checkouts (review-only)
 
 The agent can review external source: clone/fetch a repo, then read/search/diff

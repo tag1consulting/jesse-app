@@ -63,7 +63,13 @@ pub const WEIGHT_LOG_HEADER: &str =
 
 /// One extracted food ITEM (never an aggregated meal). Macros are per-item; unknown
 /// macros are `None` (omitted from the CSV, never zero-padded).
-#[derive(Debug, Clone, PartialEq)]
+///
+/// Serde derives (added for the emergency diet queue, [`dietqueue`]) let a validated
+/// entry round-trip through the pending-verify file with FULL fidelity — the queue
+/// must replay the exact entry, including fields (`unit`, `notes`) that the lossy
+/// `entries_to_json` verify shape drops. The derives are additive; no existing
+/// serialization uses them.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct FoodEntry {
     pub name: String,
     pub meal: String, // Breakfast | Lunch | Dinner | Snack
@@ -79,7 +85,7 @@ pub struct FoodEntry {
 }
 
 /// One extracted exercise session.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct ExerciseEntry {
     pub activity: String,
     pub time: Option<String>, // Start_Time HH:MM
@@ -93,7 +99,7 @@ pub struct ExerciseEntry {
 }
 
 /// One extracted weigh-in reading.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct WeightEntry {
     pub weight_lbs: f64,
     pub weight_kg: Option<f64>,
@@ -103,7 +109,11 @@ pub struct WeightEntry {
 }
 
 /// A single extracted entry — one per ITEM, never an aggregate.
-#[derive(Debug, Clone, PartialEq)]
+///
+/// Internally tagged (`kind`) for the queue's serde round-trip; none of the entry
+/// structs carry a `kind` field of their own, so the tag is unambiguous.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "kind", rename_all = "lowercase")]
 pub enum DietEntry {
     Food(FoodEntry),
     Exercise(ExerciseEntry),
@@ -1043,8 +1053,9 @@ pub fn local_offset() -> String {
         .unwrap_or_else(|| "+00:00".to_string())
 }
 
-/// Local `HH:MM` via `date +%H:%M`, for the commit message timestamp.
-fn local_hhmm() -> String {
+/// Local `HH:MM` via `date +%H:%M`, for the commit message timestamp. `pub(crate)`
+/// so the emergency diet-queue replay ([`dietqueue`]) can stamp its own commit.
+pub(crate) fn local_hhmm() -> String {
     std::process::Command::new("date")
         .env("LC_ALL", "C")
         .arg("+%H:%M")
@@ -1227,6 +1238,14 @@ pub enum DietRung {
     Mirror = 5,
 }
 
+impl DietRung {
+    /// The rung number (for provenance + the metrics line), mirroring
+    /// [`vaultqa::VaultqaRung::num`].
+    pub fn num(self) -> u8 {
+        self as u8
+    }
+}
+
 /// The outcome of the local pipeline for one turn.
 pub enum DietPipelineOutcome {
     /// Logged locally: the ASCII dashboard reply plus the derived directives (mirror).
@@ -1238,6 +1257,19 @@ pub enum DietPipelineOutcome {
     LoggedNoMirror { dashboard: String },
     /// Fall through to the hosted turn at the given rung (2–4).
     FallThrough { rung: DietRung },
+    /// The blocking hosted VERIFY child could not be reached (it errored — the verify
+    /// child is ambient/hosted, so this is a hosted-outage signal). Carries everything
+    /// the emergency path needs to QUEUE the extracted entry for later verify
+    /// ([`dietqueue`]). A non-emergency caller treats this EXACTLY like
+    /// `FallThrough { rung: Verify }` — runs the hosted turn — so with emergency off the
+    /// behavior is byte-for-byte unchanged. Nothing here is appended to the CSVs.
+    VerifyUnavailable {
+        err: ApiError,
+        utterance: String,
+        entries: Vec<DietEntry>,
+        date: String,
+        offset: String,
+    },
 }
 
 /// Split validated entries by kind (used by both the orchestrator and its tests).
@@ -1307,9 +1339,19 @@ pub async fn run_diet_pipeline(cfg: &Config, utterance: &str) -> DietPipelineOut
     .await
     {
         Ok(s) => s,
-        Err(_) => {
+        Err(e) => {
+            // The verify child (ambient/hosted) errored — surface it as VerifyUnavailable
+            // carrying the extract so an emergency caller can queue it. A non-emergency
+            // caller maps this straight back to a hosted fall-through (Verify rung), so
+            // today's behavior is unchanged.
             prov(false, Some(3), "unavailable", extract.entries.len(), false);
-            return DietPipelineOutcome::FallThrough { rung: DietRung::Verify };
+            return DietPipelineOutcome::VerifyUnavailable {
+                err: e,
+                utterance: utterance.to_string(),
+                entries: extract.entries,
+                date: local_today(),
+                offset: local_offset(),
+            };
         }
     };
     let verdicts = match parse_verify_verdicts(&verify_raw, extract.entries.len()) {

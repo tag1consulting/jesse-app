@@ -46,6 +46,10 @@ use tower::ServiceExt; // ServiceExt::oneshot
             // Badge off in the fixture: the exact-`response` turn assertions predate it
             // (the shipped default is on; badge behavior is tested with it enabled).
             model_badge: false,
+            // No metrics log and emergency OFF in the fixture — both dormant, matching
+            // an unconfigured deploy (the both-unset byte-for-byte property).
+            metrics_log: None,
+            emergency_local: false,
         }
     }
     pub fn test_state() -> AppState {

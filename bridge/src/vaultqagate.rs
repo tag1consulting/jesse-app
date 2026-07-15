@@ -54,6 +54,19 @@ const WEB_VERBS: &[&str] = &[
     "search", "research", "browse", "fetch", "news", "weather",
 ];
 
+/// SYNTHESIS-shaped verbs (gate v2, Piece 1) — a question that wants judgment,
+/// advice, comparison, or a plan, not a fact lookup. The vaultqa-v1 bake-off showed
+/// the hosted model winning EVERY judged synthesis pair while both locals scored
+/// 100% on lookups, so a synthesis-shaped Ask belongs on the hosted path. The error
+/// directions stay asymmetric: excluding one of these is FREE (hosted answers it
+/// exactly as today), whereas letting it through would route a synthesis question to
+/// a lookup-only local model and deliver a WORSE user-facing answer. The `should I` /
+/// `what should` bigrams are matched separately (they are phrases, not single tokens).
+const SYNTHESIS_VERBS: &[&str] = &[
+    "advise", "advice", "suggest", "recommend", "review", "summarize", "summary",
+    "compare", "analyze", "plan", "brainstorm", "improve", "rank",
+];
+
 /// URL scheme / host markers. Any of these substrings (case-folded) means the
 /// message references a URL, which a vault lookup cannot answer — excluded.
 const URL_MARKERS: &[&str] = &["http://", "https://", "www.", "://"];
@@ -118,7 +131,9 @@ fn has_interrogative(toks: &[String]) -> bool {
 /// table-tested). Fires only when ALL hold:
 ///   * an interrogative opener is present, AND
 ///   * a self-reference token is present ("about my own data"), AND
-///   * no act verb (log/add/draft/…), no web verb (search/browse/news/…), and
+///   * no act verb (log/add/draft/…), no web verb (search/browse/news/…), no
+///     SYNTHESIS verb (advise/suggest/recommend/review/compare/plan/… or the
+///     `should I` / `what should` bigrams — gate v2, Piece 1), and
 ///   * the message is not diet-gate-shaped (diet keeps precedence —
 ///     [`dietgate::diet_intent`]), and
 ///   * the message holds no URL.
@@ -144,6 +159,17 @@ pub fn vaultqa_question_gate(text: &str) -> bool {
     }
     // "look up" is a two-word web verb the single-token pass above misses.
     if toks.windows(2).any(|w| w[0] == "look" && w[1] == "up") {
+        return false;
+    }
+    // Gate v2 (Piece 1): synthesis-shaped asks belong on the hosted path — a
+    // single synthesis verb, or the `should I` / `what should` bigrams, excludes.
+    if toks.iter().any(|t| SYNTHESIS_VERBS.contains(&t.as_str())) {
+        return false;
+    }
+    if toks
+        .windows(2)
+        .any(|w| (w[0] == "should" && w[1] == "i") || (w[0] == "what" && w[1] == "should"))
+    {
         return false;
     }
     // Allowlist: an interrogative AND a self-reference, both present.
@@ -213,6 +239,57 @@ mod tests {
         "how many calories have I logged today",
         "what did I eat for lunch",
     ];
+
+    // Gate v2 (Piece 1): SYNTHESIS-shaped self-referential questions the gate must
+    // now REFUSE. Each is a textbook interrogative + self-reference (so the v1 gate
+    // fired on it) that also carries a synthesis token (advise/suggest/recommend/
+    // review/compare/analyze/plan/rank/improve/"should I"/"what should"). Routing
+    // these to a lookup-only local model delivers a worse answer than the hosted
+    // agent; a false negative here is free (hosted answers as today), a false
+    // positive is user-facing, so lookups-only stays tight. The last two are the
+    // prompt's examples (also diet-shaped, so doubly excluded).
+    const SYNTH_MISSES: &[&str] = &[
+        "what should I focus on in my project",
+        "which of my tasks should I prioritize",
+        "what do you suggest for my weekend plans",
+        "how many of my notes should I review first",
+        "which of my accounts do you recommend I close",
+        "what should I do about my overdue project",
+        "review my recent diet entries and suggest fiber changes",
+        "what should I eat before tomorrow's run",
+    ];
+
+    #[test]
+    fn gate_v2_excludes_synthesis_shaped_questions() {
+        for u in SYNTH_MISSES {
+            assert!(
+                !vaultqa_question_gate(u),
+                "gate v2 must NOT fire on a synthesis-shaped question: {u:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn gate_v2_still_fires_on_plain_lookups() {
+        // The v1 positives must still fire — the synthesis exclusion narrows the gate,
+        // it does not close it. A shoe-size lookup (the prompt's canonical example, but
+        // with the diet keyword "running" dropped — see the note below) still fires.
+        assert!(vaultqa_question_gate("what size were my last shoes"));
+        for u in HITS {
+            assert!(vaultqa_question_gate(u), "plain lookup must still fire: {u:?}");
+        }
+    }
+
+    #[test]
+    fn diet_precedence_owns_running_shoes_lookup_not_the_synthesis_exclusion() {
+        // NOTE: the prompt's illustrative positive "what size were my last running
+        // shoes" does NOT fire — but for a PRE-EXISTING reason, not gate v2: "running"
+        // is a diet keyword, so diet_intent claims it and diet keeps precedence. This
+        // pins that behavior so a future reader doesn't mistake it for the synthesis
+        // exclusion. The diet-free form ("... my last shoes") fires (asserted above).
+        assert!(diet_intent("what size were my last running shoes"));
+        assert!(!vaultqa_question_gate("what size were my last running shoes"));
+    }
 
     #[test]
     fn gate_fires_on_self_referential_questions() {

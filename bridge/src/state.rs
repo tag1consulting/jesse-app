@@ -28,6 +28,11 @@ pub struct AppState {
     // Set by `main`; `AppState::new` leaves it `None` so tests never touch env
     // or the network (a test that exercises push installs its own mock client).
     pub apns: Option<Arc<ApnsClient>>,
+    // Circuit breaker for the emergency local fallback (Piece 4): shared across turns
+    // so consecutive transport-class hosted failures can trip it. Inert unless the
+    // emergency fallback is armed — `handlers::jesse` only consults it then, so with
+    // emergency off it never changes a turn's behavior.
+    pub breaker: Arc<CircuitBreaker>,
 }
 
 impl AppState {
@@ -54,6 +59,7 @@ impl AppState {
             devices: Arc::new(DeviceStore::new(device_file)),
             notify: Arc::new(NotifyFlags::new()),
             apns: None,
+            breaker: Arc::new(CircuitBreaker::new()),
         }
     }
 

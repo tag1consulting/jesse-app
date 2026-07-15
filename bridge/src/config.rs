@@ -33,7 +33,20 @@ pub const DEFAULT_MAX_QUEUED: usize = 4;
 // an agent turn. On overrun the ladder degrades to the hosted turn (rung 2). A
 // const, not env-tunable: it bounds a latency-sensitive local answer, not an
 // operator-managed workload, mirroring `TITLE_TIMEOUT_SECS`.
-pub const VAULTQA_TIMEOUT_SECS: u64 = 25;
+//
+// Raised 25 → 60 after the vaultqa-v1 bake-off (2026-07-14) measured the winning
+// oss backend's lookups at 10–42 s WALL: a 25 s ceiling would have timed out most
+// real lookups (rung-2 fall-throughs) despite the model answering correctly. 60 s
+// clears the measured 42 s max with headroom while still bounding the child well
+// under a full turn.
+pub const VAULTQA_TIMEOUT_SECS: u64 = 60;
+
+// Hard timeout (seconds) for the EMERGENCY vault-QA child (Piece 4). Looser than
+// the routine `VAULTQA_TIMEOUT_SECS` because there is no ladder rung below it: when
+// hosted is unavailable the emergency answer is the only answer, so it is worth
+// waiting longer for a best-effort local reply than to fail fast. A const, not
+// env-tunable, for the same reason the routine timeout is.
+pub const EMERGENCY_TIMEOUT_SECS: u64 = 120;
 
 // Short, fixed timeout for the stateless title endpoint (`POST /jesse/title`).
 // Much tighter than a turn's JESSE_TIMEOUT (default 3600s) because a title is
@@ -227,6 +240,22 @@ pub struct Config {
     // bridge's own turn state, never from model output. `off` reproduces today's
     // exact reply text. Never applies to the title endpoint.
     pub model_badge: bool,
+    // Optional absolute path to a structured-metrics JSONL file (env
+    // `JESSE_METRICS_LOG`; see [`metrics`]). `None` (unset, the default) → ZERO metrics
+    // writes: the metrics path is dormant, same soft-failure semantics as the other
+    // envs. When `Some`, the bridge appends one JSON line per gated/routed/emergency
+    // turn at the reply-finalization point the badge uses. Content-free (never the
+    // question, answer, or tokens). A write failure logs to stderr and never disturbs
+    // the reply.
+    pub metrics_log: Option<String>,
+    // Whether the EMERGENCY local fallback is armed (env `JESSE_EMERGENCY_LOCAL` =
+    // `on|off`, default OFF). When on AND the vault-QA triple is also set (which
+    // supplies the backend + read-only child), a hosted turn that fails TRANSPORT-class
+    // (spawn/network/timeout/5xx/429/quota/auth — never a completed turn) is answered
+    // best-effort by the local read-only child (Ask) or queued for later verify (diet
+    // Tell) instead of surfacing the outage. Inert unless BOTH this flag and the
+    // vault-QA backend are set; unset → every path is byte-for-byte today's behavior.
+    pub emergency_local: bool,
 }
 
 impl Config {
@@ -405,6 +434,22 @@ pub fn resolve_model_badge() -> bool {
         .unwrap_or(true)
 }
 
+/// Parse `JESSE_EMERGENCY_LOCAL` into the `emergency_local` flag. Default FALSE
+/// (the opposite of `JESSE_MODEL_BADGE`/`JESSE_DIET_PROBATION`): the emergency
+/// fallback is an availability lever that changes what a hosted OUTAGE does, so it
+/// stays OFF unless an operator EXPLICITLY opts in with a truthy value. Only
+/// `on`/`1`/`true`/`yes` enable it; unset, blank, `off`, or an unrecognized value
+/// all leave it off, so a fat-fingered value can never silently arm it.
+pub fn resolve_emergency_local() -> bool {
+    std::env::var("JESSE_EMERGENCY_LOCAL")
+        .ok()
+        .map(|v| {
+            let v = v.trim().to_ascii_lowercase();
+            v == "on" || v == "1" || v == "true" || v == "yes"
+        })
+        .unwrap_or(false)
+}
+
 impl Config {
     pub fn from_env() -> Self {
         let home = std::env::var("HOME").unwrap_or_default();
@@ -502,6 +547,11 @@ impl Config {
             vaultqa_mcp_config: env_string("JESSE_VAULTQA_MCP_CONFIG"),
             // Provenance badge on delivered replies; default on (see `resolve_model_badge`).
             model_badge: resolve_model_badge(),
+            // Structured-metrics log path. Same `env_string` (trimmed, empty-filtered)
+            // semantics — a blank value counts as unset → None → zero metrics writes.
+            metrics_log: env_string("JESSE_METRICS_LOG"),
+            // Emergency local fallback arm; default OFF (see `resolve_emergency_local`).
+            emergency_local: resolve_emergency_local(),
         }
     }
 }
@@ -940,5 +990,67 @@ mod tests {
         assert_eq!(cfg.scratch_base(), std::env::temp_dir());
         cfg.scratch_dir = Some("/var/jesse-scratch".to_string());
         assert_eq!(cfg.scratch_base(), PathBuf::from("/var/jesse-scratch"));
+    }
+
+    #[test]
+    fn vaultqa_timeout_raised_to_cover_the_measured_oss_lookup_range() {
+        // Piece 2: 25 → 60. The vaultqa-v1 bake-off measured oss lookups at 10–42 s
+        // wall; a 25 s ceiling would have starved most real lookups (rung-2 timeouts).
+        // 60 s clears the measured 42 s max with headroom. Emergency's best-effort rung
+        // gets a looser 120 s (no ladder below it).
+        assert_eq!(VAULTQA_TIMEOUT_SECS, 60);
+        // Must clear the measured 42 s oss lookup max (a `let` binding keeps clippy from
+        // folding the const comparison to a trivially-true assert).
+        let measured_oss_max_secs = 42u64;
+        assert!(VAULTQA_TIMEOUT_SECS >= measured_oss_max_secs, "must clear the measured oss max");
+        assert_eq!(EMERGENCY_TIMEOUT_SECS, 120);
+    }
+
+    #[test]
+    fn metrics_log_resolves_from_env_and_is_none_when_unset() {
+        // Piece 3: JESSE_METRICS_LOG = an absolute file path; unset → None (dormant,
+        // zero metrics writes), same soft-failure semantics as the other envs. A blank
+        // value counts as unset via the shared `env_string` rule.
+        let _g = ENV_LOCK.lock_ok();
+        let saved = std::env::var("JESSE_METRICS_LOG").ok();
+        std::env::remove_var("JESSE_METRICS_LOG");
+        assert_eq!(Config::from_env().metrics_log, None);
+        std::env::set_var("JESSE_METRICS_LOG", "/var/log/jesse/metrics.jsonl");
+        assert_eq!(
+            Config::from_env().metrics_log.as_deref(),
+            Some("/var/log/jesse/metrics.jsonl")
+        );
+        std::env::set_var("JESSE_METRICS_LOG", "   ");
+        assert_eq!(Config::from_env().metrics_log, None, "blank counts as unset");
+        match saved {
+            Some(v) => std::env::set_var("JESSE_METRICS_LOG", v),
+            None => std::env::remove_var("JESSE_METRICS_LOG"),
+        }
+    }
+
+    #[test]
+    fn emergency_local_defaults_off_and_only_on_enables() {
+        // Piece 4: JESSE_EMERGENCY_LOCAL = on|off, default OFF. Unlike the badge/
+        // probation truthiness rule (default on), this defaults OFF — only an explicit
+        // truthy value enables it, so a half-configured deploy stays inert.
+        let _g = ENV_LOCK.lock_ok();
+        let saved = std::env::var("JESSE_EMERGENCY_LOCAL").ok();
+        std::env::remove_var("JESSE_EMERGENCY_LOCAL");
+        assert!(!Config::from_env().emergency_local, "default off");
+        for truthy in ["on", "1", "true", "yes", "ON", " On "] {
+            std::env::set_var("JESSE_EMERGENCY_LOCAL", truthy);
+            assert!(Config::from_env().emergency_local, "explicit {truthy:?} enables");
+        }
+        for falsey in ["off", "0", "false", "no", "", "  ", "garbage"] {
+            std::env::set_var("JESSE_EMERGENCY_LOCAL", falsey);
+            assert!(
+                !Config::from_env().emergency_local,
+                "{falsey:?} leaves emergency off"
+            );
+        }
+        match saved {
+            Some(v) => std::env::set_var("JESSE_EMERGENCY_LOCAL", v),
+            None => std::env::remove_var("JESSE_EMERGENCY_LOCAL"),
+        }
     }
 }

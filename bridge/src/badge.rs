@@ -13,6 +13,10 @@
 //!   * `[local · diet · <model> + hosted verify]` — a diet entry that ran the
 //!     blocking verify (drop the `+ hosted verify` suffix on any future non-verify
 //!     diet path);
+//!   * `[local · emergency · <model>]`            — an EMERGENCY vault-QA answer served
+//!     because the hosted backend was unavailable (Piece 4);
+//!   * `[local · diet · <model> + verify queued]` — a diet entry captured locally and
+//!     QUEUED for hosted verify because hosted was unavailable (Piece 4);
 //!   * `[hosted · <model>]`                       — a hosted turn with an explicit
 //!     ambient `ANTHROPIC_MODEL`, else `[hosted]`.
 //!
@@ -31,6 +35,11 @@ pub enum BadgeSource {
     DietVerify,
     /// A local vault-QA answer.
     Vault,
+    /// An EMERGENCY vault-QA answer (hosted was unavailable). Uses the vault-QA model.
+    Emergency,
+    /// A diet entry captured locally and QUEUED for hosted verify (hosted unavailable).
+    /// Uses the diet model.
+    DietQueued,
 }
 
 /// Build the badge line for a delivered reply, or `None` when badges are off. Pure —
@@ -57,6 +66,23 @@ pub fn model_badge_line(cfg: &Config, source: BadgeSource, hosted_model: Option<
                 .map(|(_, _, m)| m.as_str())
                 .unwrap_or("local");
             format!("[local · diet · {model} + hosted verify]")
+        }
+        BadgeSource::Emergency => {
+            // The emergency child IS the vault-QA child, so it badges the vault-QA model.
+            let model = cfg
+                .vaultqa_backend
+                .as_ref()
+                .map(|(_, _, m)| m.as_str())
+                .unwrap_or("local");
+            format!("[local · emergency · {model}]")
+        }
+        BadgeSource::DietQueued => {
+            let model = cfg
+                .diet_backend
+                .as_ref()
+                .map(|(_, _, m)| m.as_str())
+                .unwrap_or("local");
+            format!("[local · diet · {model} + verify queued]")
         }
         BadgeSource::Hosted => match hosted_model {
             Some(m) => format!("[hosted · {m}]"),
@@ -115,6 +141,21 @@ mod tests {
         cfg.model_badge = false;
         assert_eq!(model_badge_line(&cfg, BadgeSource::Hosted, Some("m")), None);
         assert_eq!(model_badge_line(&cfg, BadgeSource::Vault, None), None);
+    }
+
+    #[test]
+    fn emergency_and_queued_badge_strings() {
+        // Piece 4: the emergency ASK answer badges the vault-QA (emergency) model; a
+        // queued diet Tell badges the diet model with the `+ verify queued` suffix.
+        let cfg = cfg_on();
+        assert_eq!(
+            model_badge_line(&cfg, BadgeSource::Emergency, None).unwrap(),
+            "[local · emergency · local-vaultqa]"
+        );
+        assert_eq!(
+            model_badge_line(&cfg, BadgeSource::DietQueued, None).unwrap(),
+            "[local · diet · local-diet + verify queued]"
+        );
     }
 
     #[test]
