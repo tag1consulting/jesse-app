@@ -25,7 +25,8 @@ final class PendingMealStoreTests: XCTestCase {
     private func meal(_ id: String, kcal: Double? = 100, fiber: Double? = nil) -> Meal {
         Meal(id: id, consumedAt: Date(timeIntervalSince1970: 1_780_000_000),
              name: "Meal \(id)", kcal: kcal, proteinGrams: nil, carbGrams: nil,
-             fatGrams: nil, fiberGrams: fiber)
+             fatGrams: nil, fiberGrams: fiber,
+             sodiumMg: nil, satFatGrams: nil, sugarGrams: nil, potassiumMg: nil)
     }
 
     func testEnqueueThenDequeueRoundTrips() {

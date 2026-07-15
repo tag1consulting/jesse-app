@@ -13,10 +13,13 @@ final class MealLogParserTests: XCTestCase {
                       name: String = "Lunch: spaghetti, red sauce",
                       kcal: Double? = 385, protein: Double? = 13,
                       carbs: Double? = 77, fat: Double? = 4.5,
-                      fiber: Double? = 6) -> JesseMeal {
+                      fiber: Double? = 6, sodium: Double? = nil,
+                      satFat: Double? = nil, sugar: Double? = nil,
+                      potassium: Double? = nil) -> JesseMeal {
         JesseMeal(id: id, consumedAt: consumedAt, name: name,
                   kcal: kcal, proteinGrams: protein, carbGrams: carbs, fatGrams: fat,
-                  fiberGrams: fiber)
+                  fiberGrams: fiber, sodiumMg: sodium, satFatGrams: satFat,
+                  sugarGrams: sugar, potassiumMg: potassium)
     }
 
     // MARK: - Validation / mapping
@@ -34,6 +37,22 @@ final class MealLogParserTests: XCTestCase {
         XCTAssertEqual(m.fiberGrams, 6)
         // The ISO-8601 offset is parsed to the correct instant.
         XCTAssertEqual(m.consumedAt, MealLogParser.parseDate("2026-07-04T12:30:00+02:00"))
+    }
+
+    func testMicronutrientsPassThroughToTheDomainMeal() {
+        // The four wire micronutrients validate and thread onto the domain Meal; an
+        // absent one stays nil (never null-padded to 0).
+        let wire = meal(sodium: 900, satFat: 3.5, sugar: 12, potassium: nil)
+        let m = MealLogParser.meal(from: wire)
+        XCTAssertEqual(m?.sodiumMg, 900)
+        XCTAssertEqual(m?.satFatGrams, 3.5)
+        XCTAssertEqual(m?.sugarGrams, 12)
+        XCTAssertNil(m?.potassiumMg, "an absent micronutrient stays nil")
+    }
+
+    func testNegativeMicronutrientRejectsTheWholeMeal() {
+        // A negative micronutrient is as invalid as a negative macro → nil (no partial).
+        XCTAssertNil(MealLogParser.meal(from: meal(sodium: -1)))
     }
 
     func testMissingOptionalMacrosAreNil() {

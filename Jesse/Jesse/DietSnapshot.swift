@@ -12,6 +12,14 @@ import Foundation
 
 /// One food item inside a meal (or a proposed meal idea). `fiber` is written by
 /// the generator (0 when unknown); the rest may be absent on older files.
+///
+/// `na`/`satf`/`sug`/`k` are the four micronutrients (bridge ≥ 0.12.x). UNLIKE
+/// `fiber` — which the generator always fills, so nil-coalescing it to 0 is harmless
+/// — these are absent for MANY items. A missing value is UNKNOWN, never zero: it must
+/// never be summed or shown as 0. They therefore live OUTSIDE the `MacroTotals` /
+/// `total(of:)` path (which coalesces nil→0 for cal/p/f/c/fiber) and are aggregated
+/// separately by `DietSemantics.micronutrientTotal`, which preserves the unknowns.
+/// Synthesized Decodable decodes an absent key to nil, so no decoder change is needed.
 struct DietItem: Decodable, Equatable, Sendable {
     var item: String
     var amount: String?
@@ -20,6 +28,14 @@ struct DietItem: Decodable, Equatable, Sendable {
     var f: Double?
     var c: Double?
     var fiber: Double?
+    /// Sodium, milligrams. Absent (nil) = unknown, not zero.
+    var na: Double?
+    /// Saturated fat, grams. Absent (nil) = unknown, not zero.
+    var satf: Double?
+    /// Total sugars, grams. Absent (nil) = unknown, not zero.
+    var sug: Double?
+    /// Potassium, milligrams. Absent (nil) = unknown, not zero.
+    var k: Double?
 }
 
 /// A logged meal: a name, an optional `HH:MM` time, and its items.
@@ -54,6 +70,10 @@ struct DietWeight: Decodable, Equatable, Sendable {
 
 /// The day's macro/calorie targets. `carbsBase` and `fiber` may be absent in old
 /// files (fiber defaults to 38 downstream — see `DietSemantics`).
+///
+/// `sodium`/`satFat`/`potassium`/`sugar` are the optional micronutrient day targets
+/// (bridge ≥ 0.12.x). Each is a reference the matching gauge judges against; when
+/// absent the gauge shows the value only, with no judgment.
 struct DietTargets: Decodable, Equatable, Sendable {
     var calories: Double?
     var protein: Double?
@@ -61,6 +81,14 @@ struct DietTargets: Decodable, Equatable, Sendable {
     var carbs: Double?
     var carbsBase: Double?
     var fiber: Double?
+    /// Sodium ceiling, milligrams.
+    var sodium: Double?
+    /// Saturated-fat ceiling, grams.
+    var satFat: Double?
+    /// Potassium floor, milligrams.
+    var potassium: Double?
+    /// Total-sugars reference line, grams (informational — never a ceiling judgment).
+    var sugar: Double?
 }
 
 /// `DIET_TODAY` — the normalized snapshot of today.

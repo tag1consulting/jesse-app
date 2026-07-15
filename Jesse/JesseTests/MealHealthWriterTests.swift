@@ -1,4 +1,5 @@
 import XCTest
+import HealthKit
 @testable import Jesse
 
 /// The reliability core of meal write-back, driven entirely with fakes (no
@@ -40,7 +41,8 @@ final class MealHealthWriterTests: XCTestCase {
     private func meal(_ id: String, fiber: Double? = nil) -> Meal {
         Meal(id: id, consumedAt: Date(timeIntervalSince1970: 1_780_000_000),
              name: "Meal \(id)", kcal: 100, proteinGrams: nil, carbGrams: nil,
-             fatGrams: nil, fiberGrams: fiber)
+             fatGrams: nil, fiberGrams: fiber,
+             sodiumMg: nil, satFatGrams: nil, sugarGrams: nil, potassiumMg: nil)
     }
 
     private func writer(_ w: FakeMealWriter, _ p: InMemoryPending,
@@ -125,5 +127,58 @@ final class MealHealthWriterTests: XCTestCase {
         p.enqueue([meal("a")])
         await writer(w, p, enabled: false).drainPending(written: store)
         XCTAssertEqual(p.peek().map(\.id), ["a"], "draining while off must not lose the queued meal")
+    }
+
+    // MARK: - HealthKit sample building (micronutrients, unknown ≠ zero)
+
+    /// A meal carrying an explicit set of macros/micronutrients (any may be nil).
+    private func fullMeal(kcal: Double? = 100, sodiumMg: Double? = nil,
+                          satFatGrams: Double? = nil, sugarGrams: Double? = nil,
+                          potassiumMg: Double? = nil) -> Meal {
+        Meal(id: "m", consumedAt: Date(timeIntervalSince1970: 1_780_000_000),
+             name: "M", kcal: kcal, proteinGrams: 20, carbGrams: 30, fatGrams: 10,
+             fiberGrams: 5, sodiumMg: sodiumMg, satFatGrams: satFatGrams,
+             sugarGrams: sugarGrams, potassiumMg: potassiumMg)
+    }
+
+    private func samples(of meal: Meal, _ id: HKQuantityTypeIdentifier) -> [HKQuantitySample] {
+        HealthKitMealWriter.samples(for: meal)
+            .compactMap { $0 as? HKQuantitySample }
+            .filter { $0.quantityType == HKQuantityType(id) }
+    }
+
+    func testMealWithKnownSodiumWritesOneSodiumSample() {
+        let m = fullMeal(sodiumMg: 800)
+        let sodium = samples(of: m, .dietarySodium)
+        XCTAssertEqual(sodium.count, 1)
+        XCTAssertEqual(sodium[0].quantity.doubleValue(for: .gramUnit(with: .milli)), 800, accuracy: 0.001,
+                       "the summed known sodium is written in milligrams")
+    }
+
+    func testMealWithAllUnknownPotassiumWritesNoPotassiumSample() {
+        // potassiumMg nil ⇒ no item carried a value ⇒ NO sample (never a zero sample).
+        let m = fullMeal(sodiumMg: 800, potassiumMg: nil)
+        XCTAssertTrue(samples(of: m, .dietaryPotassium).isEmpty,
+                      "an all-unknown micronutrient writes no sample")
+    }
+
+    func testExistingMacroSamplesAreUnchangedByMicronutrients() {
+        // The five macro samples are present and correct regardless of micronutrients.
+        let m = fullMeal(sodiumMg: 800, satFatGrams: 3, sugarGrams: 12, potassiumMg: 500)
+        XCTAssertEqual(samples(of: m, .dietaryEnergyConsumed).first?.quantity.doubleValue(for: .kilocalorie()), 100)
+        XCTAssertEqual(samples(of: m, .dietaryProtein).first?.quantity.doubleValue(for: .gram()), 20)
+        XCTAssertEqual(samples(of: m, .dietaryCarbohydrates).first?.quantity.doubleValue(for: .gram()), 30)
+        XCTAssertEqual(samples(of: m, .dietaryFatTotal).first?.quantity.doubleValue(for: .gram()), 10)
+        XCTAssertEqual(samples(of: m, .dietaryFiber).first?.quantity.doubleValue(for: .gram()), 5)
+        // And the micronutrient samples ride alongside them.
+        XCTAssertEqual(samples(of: m, .dietaryFatSaturated).first?.quantity.doubleValue(for: .gram()), 3)
+        XCTAssertEqual(samples(of: m, .dietarySugar).first?.quantity.doubleValue(for: .gram()), 12)
+        XCTAssertEqual(samples(of: m, .dietaryPotassium).first?.quantity.doubleValue(for: .gramUnit(with: .milli)), 500)
+    }
+
+    func testMealWithNoMicronutrientsWritesOnlyTheFiveMacroSamples() {
+        let m = fullMeal()   // all four micronutrients nil
+        let count = HealthKitMealWriter.samples(for: m).count
+        XCTAssertEqual(count, 5, "no micronutrient values ⇒ only the five macro samples")
     }
 }

@@ -424,9 +424,31 @@ struct MetricBarRow: View {
     /// step smaller (subheadline → footnote) and in the secondary color. The bar, the
     /// value, and its status color are untouched — only the label's type changes.
     var isSubEntry: Bool = false
-    var onTap: () -> Void = {}
+    /// The explainer tap. Nil for a micronutrient row (no explainer wired): the row
+    /// then renders identically minus the info-circle affordance and the button wrap.
+    var onTap: (() -> Void)? = nil
+
     var body: some View {
-        Button(action: onTap) {
+        if let onTap {
+            Button(action: onTap) { content }.buttonStyle(.plain)
+        } else {
+            content
+        }
+    }
+
+    @ViewBuilder private var content: some View {
+        if notTracked {
+            // "not tracked yet": no item that day carried the value. A neutral label +
+            // caption, no numeric value, no filled bar — distinct from a real zero.
+            HStack(spacing: 6) {
+                GoalChip(goal: gauge.goal)
+                Text(gauge.label).font(.subheadline.weight(.semibold))
+                Spacer()
+                Text(DietSemantics.notTrackedCaption)
+                    .font(.caption).foregroundStyle(.secondary)
+            }
+            .contentShape(Rectangle())
+        } else {
             VStack(alignment: .leading, spacing: 6) {
                 HStack(spacing: 6) {
                     GoalChip(goal: gauge.goal)
@@ -436,7 +458,9 @@ struct MetricBarRow: View {
                     Spacer()
                     Text(valueTarget).font(.subheadline.monospacedDigit())
                         .foregroundStyle(statusColor(gauge.status))
-                    Image(systemName: "info.circle").font(.caption).foregroundStyle(.tertiary)
+                    if onTap != nil {
+                        Image(systemName: "info.circle").font(.caption).foregroundStyle(.tertiary)
+                    }
                 }
                 StatusMeter(fraction: gauge.fraction, status: gauge.status)
                 HStack {
@@ -446,6 +470,12 @@ struct MetricBarRow: View {
                         Text(pct).font(.caption.monospacedDigit()).foregroundStyle(.tertiary)
                     }
                 }
+                // A partial micronutrient total is a floor — warn how many items were
+                // not estimated so the "≥" is never read as a complete number.
+                if let cap = DietSemantics.partialCaption(unknownItemCount: gauge.unknownItemCount) {
+                    Label(cap, systemImage: "questionmark.circle")
+                        .font(.caption2).foregroundStyle(.secondary)
+                }
                 if let flag = gauge.flag {
                     Label(flag, systemImage: "clock.badge.exclamationmark")
                         .font(.caption).foregroundStyle(.orange)
@@ -453,16 +483,21 @@ struct MetricBarRow: View {
             }
             .contentShape(Rectangle())
         }
-        .buttonStyle(.plain)
     }
+
+    /// The "not tracked yet" state: a micronutrient gauge with no known contributor.
+    private var notTracked: Bool { gauge.knownItemCount == 0 }
+
     private var valueTarget: String {
+        // A partial total is a floor: prefix "≥" so it's never shown as complete.
+        let prefix = gauge.partial ? "≥" : ""
         let v = DietSemantics.fmt(gauge.value)
-        if let t = gauge.target { return "\(v) / \(DietSemantics.fmt(t))\(gauge.unit)" }
-        return "\(v)\(gauge.unit)"
+        if let t = gauge.target { return "\(prefix)\(v) / \(DietSemantics.fmt(t))\(gauge.unit)" }
+        return "\(prefix)\(v)\(gauge.unit)"
     }
     private var percent: String? {
         guard let f = gauge.fraction else { return nil }
-        return "\(Int((f * 100).rounded()))%"
+        return "\(gauge.partial ? "≥" : "")\(Int((f * 100).rounded()))%"
     }
 }
 

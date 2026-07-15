@@ -39,6 +39,11 @@ struct MacrosCaloriesDetail: View {
     private var g: DietGauges { DietSemantics.gauges(for: today, hour: hour) }
     private var totals: MacroTotals { DietSemantics.dayTotals(today.meals) }
     private var net: NetCalories { NetCalories(intake: totals.cal, burned: DietSemantics.burnedCalories(today.exercise)) }
+    private var micronutrients: [MetricGauge] { DietSemantics.micronutrientGauges(for: today) }
+    /// Only surface the micronutrient section when at least one of the four carries a
+    /// known value that day — otherwise there is nothing to show but four "not tracked
+    /// yet" rows.
+    private var hasMicronutrients: Bool { micronutrients.contains { ($0.knownItemCount ?? 0) > 0 } }
 
     var body: some View {
         Group {
@@ -62,6 +67,7 @@ struct MacrosCaloriesDetail: View {
                     if entry.macro == .carbs, let bonus = g.carbsBonus { bonusRow(bonus) }
                 }
             }
+            micronutrientSection
             Section("Net calories") {
                 NetCalorieBar(net: g.net)
                     .onTapGesture { explainer = Explainers.netCalories(g.net) }
@@ -87,6 +93,7 @@ struct MacrosCaloriesDetail: View {
             } footer: {
                 Text(NeutralMode.noTargetsCaption)
             }
+            micronutrientSection
             if net.burned > 0 {
                 Section("Net calories") {
                     totalRow("Eaten", "\(DietSemantics.fmt(net.intake))")
@@ -117,6 +124,20 @@ struct MacrosCaloriesDetail: View {
         withFoods.drilldown = FoodDrilldown.build(meals: today.meals, metric: metric,
                                                   gauge: gauge, isCarbLoad: g.isCarbLoad)
         return MetricBarRow(gauge: gauge, isSubEntry: isSubEntry) { explainer = withFoods }
+    }
+
+    // The four micronutrient rows, rendered in the exact macro-bar-row language
+    // (MetricBarRow) with no explainer tap. A partial total shows "≥" and the "N items
+    // not estimated" caption; an all-unknown nutrient shows "not tracked yet". Hidden
+    // entirely when no nutrient carries a known value that day.
+    @ViewBuilder private var micronutrientSection: some View {
+        if hasMicronutrients {
+            Section("Micronutrients") {
+                ForEach(Array(micronutrients.enumerated()), id: \.offset) { _, gauge in
+                    MetricBarRow(gauge: gauge)
+                }
+            }
+        }
     }
 
     private func bonusRow(_ bonus: CarbsBonus) -> some View {

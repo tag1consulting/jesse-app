@@ -26,6 +26,32 @@ final class MacroLabelTests: XCTestCase {
         }
     }
 
+    // MARK: - Micronutrient names (the second single-source label set)
+
+    func testMicronutrientDisplayNamesAreFullAndUnabbreviated() {
+        XCTAssertEqual(Micronutrient.sodium.displayName, "Sodium")
+        XCTAssertEqual(Micronutrient.saturatedFat.displayName, "Saturated Fat")
+        XCTAssertEqual(Micronutrient.totalSugars.displayName, "Total Sugars")
+        XCTAssertEqual(Micronutrient.potassium.displayName, "Potassium")
+    }
+
+    func testMicronutrientNamesCarryNoAbbreviation() {
+        // No wire key or chemical symbol ever surfaces as a user-facing name.
+        let banned: Set<String> = ["Na", "K", "SatFat", "Sat Fat", "Sugars", "Sugar", "na", "satf", "sug", "k"]
+        for n in Micronutrient.allCases {
+            XCTAssertFalse(banned.contains(n.displayName),
+                           "\(n) still renders the abbreviation \(n.displayName)")
+            XCTAssertGreaterThan(n.displayName.count, 3)
+        }
+    }
+
+    func testMicronutrientCanonicalOrderAndUnits() {
+        XCTAssertEqual(Micronutrient.allCases.map(\.displayName),
+                       ["Sodium", "Saturated Fat", "Total Sugars", "Potassium"])
+        // Sodium/potassium in mg, the fat and sugars in g.
+        XCTAssertEqual(Micronutrient.allCases.map(\.unit), ["mg", "g", "g", "mg"])
+    }
+
     // MARK: - Canonical display order (fiber is a subset of carbs → sits after it)
 
     func testCanonicalDisplayOrderIsProteinCarbsFiberFat() {

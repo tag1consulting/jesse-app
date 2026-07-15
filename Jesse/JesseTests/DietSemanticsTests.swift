@@ -313,6 +313,119 @@ final class DietSemanticsTests: XCTestCase {
         XCTAssertEqual(S.calorieWindowGoalStatus(value: 100, target: 0), .noGoal)
     }
 
+    // MARK: - Micronutrient aggregation (unknown ≠ zero)
+
+    /// An item carrying an explicit set of the four micronutrients (any may be nil).
+    private func micro(na: Double? = nil, satf: Double? = nil,
+                       sug: Double? = nil, k: Double? = nil) -> DietItem {
+        DietItem(item: "x", amount: nil, cal: 0, p: 0, f: 0, c: 0, fiber: 0,
+                 na: na, satf: satf, sug: sug, k: k)
+    }
+
+    func testMicronutrientTotalAllKnownIsNotPartial() {
+        // Every item has sodium → a complete, non-partial total that is the exact sum.
+        let items = [micro(na: 500), micro(na: 300), micro(na: 200)]
+        let agg = S.micronutrientTotal(of: items, \.na)
+        XCTAssertEqual(agg.knownSum, 1000)
+        XCTAssertEqual(agg.unknownItemCount, 0)
+        XCTAssertEqual(agg.knownItemCount, 3)
+        XCTAssertFalse(agg.partial)
+        XCTAssertTrue(agg.tracked)
+    }
+
+    func testMicronutrientTotalOneUnknownIsPartialAndExcludesIt() {
+        // One of three items lacks sodium → partial, unknownItemCount 1, and the sum
+        // EXCLUDES the unknown (it is not treated as 0).
+        let items = [micro(na: 500), micro(na: nil), micro(na: 300)]
+        let agg = S.micronutrientTotal(of: items, \.na)
+        XCTAssertEqual(agg.knownSum, 800, "the unknown item is excluded, not summed as 0")
+        XCTAssertEqual(agg.unknownItemCount, 1)
+        XCTAssertEqual(agg.knownItemCount, 2)
+        XCTAssertTrue(agg.partial)
+        XCTAssertTrue(agg.tracked)
+    }
+
+    func testMicronutrientTotalZeroKnownIsNotTracked() {
+        // No item carries potassium → the "not tracked yet" state, not a zero total.
+        let items = [micro(na: 500), micro(na: 300)]
+        let agg = S.micronutrientTotal(of: items, \.k)
+        XCTAssertEqual(agg.knownSum, 0)
+        XCTAssertEqual(agg.knownItemCount, 0)
+        XCTAssertFalse(agg.tracked, "zero known → not tracked yet, distinct from a real zero")
+    }
+
+    // MARK: - Micronutrient gauges
+
+    private func microDay(_ items: [DietItem], targets: DietTargets = DietTargets()) -> DietToday {
+        DietToday(date: "2026-07-09", dayStyle: "normal", dayType: nil, weight: nil,
+                  exercise: [], meals: [DietMeal(name: "all", time: "12:00", items: items)],
+                  targets: targets)
+    }
+
+    private func gauge(_ today: DietToday, _ n: Micronutrient) -> MetricGauge {
+        S.micronutrientGauges(for: today).first { $0.label == n.displayName }!
+    }
+
+    func testSodiumGaugeCompleteUnderCeilingIsGreen() {
+        let today = microDay([micro(na: 500), micro(na: 300)],
+                             targets: DietTargets(sodium: 2300))
+        let g = gauge(today, .sodium)
+        XCTAssertEqual(g.value, 800)
+        XCTAssertFalse(g.partial)
+        XCTAssertEqual(g.goal, .ceiling)
+        XCTAssertEqual(g.status, .green)      // 800/2300 under 80%
+        XCTAssertEqual(g.unit, "mg")
+    }
+
+    func testSodiumGaugePartialCarriesFlagAndCount() {
+        let today = microDay([micro(na: 500), micro(na: nil), micro(na: 300)],
+                             targets: DietTargets(sodium: 2300))
+        let g = gauge(today, .sodium)
+        XCTAssertEqual(g.value, 800, "partial sum excludes the unknown item")
+        XCTAssertTrue(g.partial)
+        XCTAssertEqual(g.unknownItemCount, 1)
+        XCTAssertEqual(g.knownItemCount, 2)
+        XCTAssertEqual(S.partialCaption(unknownItemCount: g.unknownItemCount), "1 item not estimated")
+    }
+
+    func testMicronutrientGaugeNotTrackedWhenNoneKnown() {
+        let today = microDay([micro(na: 500)], targets: DietTargets(potassium: 3500))
+        let g = gauge(today, .potassium)
+        XCTAssertEqual(g.knownItemCount, 0)
+        XCTAssertEqual(g.remaining, S.notTrackedCaption)
+        XCTAssertEqual(g.status, .suspended, "not-tracked shows no judgment")
+    }
+
+    func testPotassiumGaugeIsAFloor() {
+        let today = microDay([micro(k: 2000), micro(k: 1800)],
+                             targets: DietTargets(potassium: 3500))
+        let g = gauge(today, .potassium)
+        XCTAssertEqual(g.goal, .floor)
+        XCTAssertEqual(g.value, 3800)
+        XCTAssertEqual(g.status, .green)      // 3800 ≥ 3500 floor
+    }
+
+    func testTotalSugarsIsInformationalNeverJudged() {
+        // Even far "over" any reference, sugars never turns red/green — like suspended
+        // fiber. A reference target only feeds the bar, not a status.
+        let today = microDay([micro(sug: 40), micro(sug: 60)],
+                             targets: DietTargets(sugar: 50))
+        let g = gauge(today, .totalSugars)
+        XCTAssertEqual(g.value, 100)
+        XCTAssertEqual(g.status, .suspended, "total sugars is never judged")
+        XCTAssertEqual(g.goalStatus, .noGoal)
+    }
+
+    func testMicronutrientNoTargetShowsValueOnly() {
+        // Sodium present but no target → value only, no judgment, no bar reference.
+        let today = microDay([micro(na: 900)], targets: DietTargets())
+        let g = gauge(today, .sodium)
+        XCTAssertEqual(g.value, 900)
+        XCTAssertEqual(g.status, .suspended)
+        XCTAssertEqual(g.goalStatus, .noGoal)
+        XCTAssertNil(g.fraction)
+    }
+
     func testGaugesCarryGoalStatus() {
         // Protein under target → short; a met floor → met; suspended fiber → no goal.
         let meals = [DietMeal(name: "all", time: "12:00", items: [item(1200, 93, 40, 300, 20)])]

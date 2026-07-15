@@ -121,6 +121,26 @@ enum DietSemantics {
         return t
     }
 
+    // MARK: - Micronutrient aggregation (unknown ≠ zero)
+
+    /// Aggregate ONE optional per-item nutrient across a set of items, PRESERVING the
+    /// unknowns: the sum of only the items that carried a value, how many items were
+    /// unknown (absent value), and how many were known. This is deliberately NOT the
+    /// `total(of:)` path — a nil here is UNKNOWN, never coalesced to 0, so a partial
+    /// total is never passed off as complete.
+    static func micronutrientTotal(of items: [DietItem], _ value: (DietItem) -> Double?) -> MicronutrientTotal {
+        var knownSum = 0.0, known = 0, unknown = 0
+        for it in items {
+            if let v = value(it) { knownSum += v; known += 1 } else { unknown += 1 }
+        }
+        return MicronutrientTotal(knownSum: knownSum, unknownItemCount: unknown, knownItemCount: known)
+    }
+
+    /// The day's aggregate of one nutrient across every item in every meal.
+    static func micronutrientTotal(for meals: [DietMeal], _ value: (DietItem) -> Double?) -> MicronutrientTotal {
+        micronutrientTotal(of: meals.flatMap(\.items), value)
+    }
+
     /// Per-meal subtotal.
     static func subtotal(of meal: DietMeal) -> MacroTotals { total(of: meal.items) }
 
@@ -353,6 +373,79 @@ enum DietSemantics {
                           isCarbLoad: carbLoad)
     }
 
+    // MARK: - Micronutrient gauges (sodium, saturated fat, total sugars, potassium)
+
+    /// The four micronutrient gauges for a day, in canonical order — sodium, saturated
+    /// fat, total sugars, potassium. Each preserves unknowns: any item without the
+    /// value makes the total PARTIAL (`value` is a floor, the view renders "≥"), and a
+    /// day with zero known values is the neutral "not tracked yet" state. Sodium and
+    /// saturated fat are ceilings, potassium a floor, total sugars informational (never
+    /// judged); an absent target shows the value only, with no judgment.
+    static func micronutrientGauges(for today: DietToday) -> [MetricGauge] {
+        Micronutrient.allCases.map { micronutrientGauge($0, meals: today.meals, targets: today.targets) }
+    }
+
+    /// Build one micronutrient gauge from the day's items and targets.
+    static func micronutrientGauge(_ n: Micronutrient, meals: [DietMeal], targets: DietTargets) -> MetricGauge {
+        let agg = micronutrientTotal(for: meals, n.value(in:))
+        let value = agg.knownSum
+        let target = n.target(in: targets)
+        let unit = n.unit
+
+        // Base gauge shared by every branch — value-only, no judgment. The branches
+        // below layer a status/remaining/goalStatus on top when there's a real target.
+        var g = MetricGauge(
+            label: n.displayName, goal: n.goal, value: value, target: target,
+            status: .suspended, remaining: "", goalStatus: .noGoal,
+            flag: nil, unit: unit, fraction: nil,
+            partial: agg.partial, unknownItemCount: agg.unknownItemCount,
+            knownItemCount: agg.knownItemCount)
+
+        // No item that day carried the nutrient → the neutral "not tracked yet" state,
+        // regardless of whether a target exists.
+        guard agg.tracked else {
+            g.remaining = notTrackedCaption
+            return g
+        }
+
+        // Total sugars is informational only: show the value (and a reference bar if a
+        // target is present) but NEVER a red/green judgment — modeled like suspended
+        // fiber.
+        if !n.judged {
+            g.fraction = fraction(value, target ?? 0)
+            g.remaining = target == nil ? "" : "reference \(fmt(target!))\(unit)"
+            return g
+        }
+
+        // Judged nutrients (ceiling / floor) need a usable target; without one they
+        // stay value-only.
+        guard let target, target > 0 else { return g }
+        g.fraction = fraction(value, target)
+        switch n.goal {
+        case .ceiling:
+            g.status = ceilingStatus(value: value, target: target)
+            g.remaining = ceilingRemaining(value: value, target: target, unit: unit)
+            g.goalStatus = ceilingGoalStatus(value: value, target: target)
+        case .floor:
+            g.status = floorStatus(value: value, target: target)
+            g.remaining = floorRemaining(value: value, target: target, unit: unit)
+            g.goalStatus = floorGoalStatus(value: value, target: target)
+        case .window:
+            break // not used by any micronutrient
+        }
+        return g
+    }
+
+    /// The neutral caption for a nutrient no item that day carried a value for.
+    static let notTrackedCaption = "not tracked yet"
+
+    /// The "N items not estimated" caption for a partial micronutrient total, or nil
+    /// when the total is complete (every contributing item carried the value).
+    static func partialCaption(unknownItemCount: Int) -> String? {
+        guard unknownItemCount > 0 else { return nil }
+        return "\(unknownItemCount) item\(unknownItemCount == 1 ? "" : "s") not estimated"
+    }
+
     // MARK: - Helpers
 
     /// A bar fill fraction (value / target), 0 when there's no usable target. Not
@@ -488,6 +581,84 @@ struct MacroTotals: Equatable, Sendable {
     }
 }
 
+/// A day's aggregate of one optional per-item nutrient, preserving unknowns: the sum
+/// of ONLY the items that carried a value, how many were unknown, and how many were
+/// known. Because a missing value is UNKNOWN (never 0), a total with any unknown
+/// contributor is PARTIAL (`knownSum` is a floor, not a complete sum), and a total
+/// with zero known contributors is the neutral "not tracked yet" state.
+struct MicronutrientTotal: Equatable, Sendable {
+    var knownSum: Double
+    var unknownItemCount: Int
+    var knownItemCount: Int
+
+    /// True when at least one contributing item lacked the value — `knownSum` is a
+    /// floor, and the view must render it "≥" with the "N items not estimated" caption.
+    var partial: Bool { unknownItemCount > 0 }
+    /// True when at least one item carried the value; false is the "not tracked yet"
+    /// state (distinct from a real zero).
+    var tracked: Bool { knownItemCount > 0 }
+}
+
+/// The four micronutrients shown alongside the macros. The single source of truth for
+/// their user-facing display names — full, unabbreviated, spelled in one place so no
+/// view invents a short form (guarded by `MacroLabelTests`). Case order is the
+/// canonical display order.
+enum Micronutrient: CaseIterable {
+    case sodium, saturatedFat, totalSugars, potassium
+
+    /// The full, unabbreviated user-facing name — the ONLY place these are spelled.
+    var displayName: String {
+        switch self {
+        case .sodium: return "Sodium"
+        case .saturatedFat: return "Saturated Fat"
+        case .totalSugars: return "Total Sugars"
+        case .potassium: return "Potassium"
+        }
+    }
+
+    /// The display unit: sodium and potassium in milligrams, the fat and sugars in grams.
+    var unit: String {
+        switch self {
+        case .sodium, .potassium: return "mg"
+        case .saturatedFat, .totalSugars: return "g"
+        }
+    }
+
+    /// How the nutrient is judged: sodium and saturated fat are ceilings (don't
+    /// exceed), potassium a floor (reach it), total sugars a ceiling glyph but NEVER a
+    /// color judgment (see `judged`) — fruit and dairy sugars are fine.
+    var goal: DietSemantics.Goal {
+        switch self {
+        case .sodium, .saturatedFat, .totalSugars: return .ceiling
+        case .potassium: return .floor
+        }
+    }
+
+    /// Whether the nutrient carries a red/green judgment. Total sugars is
+    /// informational only — shown plain like suspended fiber, never judged.
+    var judged: Bool { self != .totalSugars }
+
+    /// This nutrient's per-item value (nil = unknown for that item).
+    func value(in item: DietItem) -> Double? {
+        switch self {
+        case .sodium: return item.na
+        case .saturatedFat: return item.satf
+        case .totalSugars: return item.sug
+        case .potassium: return item.k
+        }
+    }
+
+    /// This nutrient's day target, or nil when the day carries no reference for it.
+    func target(in t: DietTargets) -> Double? {
+        switch self {
+        case .sodium: return t.sodium
+        case .saturatedFat: return t.satFat
+        case .totalSugars: return t.sugar
+        case .potassium: return t.potassium
+        }
+    }
+}
+
 /// The four macronutrients the Health tab tracks. The single source of truth for
 /// their user-facing display names — no view spells a macro out or abbreviates it
 /// on its own. There is no approved short form: never a single letter, never
@@ -582,6 +753,16 @@ struct MetricGauge: Equatable, Sendable {
     var unit: String
     /// Bar fill fraction (value/target-ish), nil when there's no usable reference.
     var fraction: Double?
+    /// Micronutrient partiality (the five macro gauges leave these at the defaults,
+    /// their values being complete sums). `partial` is true when at least one
+    /// contributing item lacked a value, so `value` is a FLOOR — the view renders it
+    /// "≥value", never as a complete total. `unknownItemCount` drives the "N items not
+    /// estimated" caption. `knownItemCount` is nil for a non-micronutrient gauge; for a
+    /// micronutrient it's how many items carried the value, and a value of 0 is the
+    /// neutral "not tracked yet" state (distinct from a real zero).
+    var partial: Bool = false
+    var unknownItemCount: Int = 0
+    var knownItemCount: Int? = nil
 }
 
 /// The exercise carb add-back — extra carb budget earned by exercise, optional

@@ -15,6 +15,37 @@ CI both run it). See the "Versioning" section of `bridge/README.md`.
 
 ## [Unreleased]
 
+## [App 1.0 (40)] — 2026-07-15
+
+### Added
+- **Four per-item micronutrients on the Health tab + into Apple Health: sodium,
+  saturated fat, total sugars, potassium.** They arrive as four OPTIONAL numeric fields
+  on each diet item (`na` mg, `satf` g, `sug` g, `k` mg) and four OPTIONAL day targets
+  (`sodium`, `satFat`, `potassium`, `sugar`). The governing rule is **unknown ≠ zero**:
+  unlike `fiber` (always filled, so nil→0 is harmless), these are absent for many items,
+  so a missing value is UNKNOWN and is never summed or shown as 0. Decoding adds the four
+  optional item fields (`DietItem`) and four optional target keys (`DietTargets`) — kept
+  OUT of the `MacroTotals`/`total(of:)` nil→0 path, which is unchanged for cal/p/f/c/fiber.
+  A new `DietSemantics.micronutrientTotal` aggregates each nutrient over a day preserving
+  unknowns as `(knownSum, unknownItemCount, knownItemCount)`, and `micronutrientGauges`
+  builds four `MetricGauge`s in the macro vocabulary: sodium & saturated fat as ceilings,
+  potassium a floor, total sugars informational (never judged — modeled like suspended
+  fiber). A total with any unknown contributor is **partial**, rendered `≥sum` with an
+  *"N items not estimated"* caption; a nutrient no item carried shows *"not tracked yet"*;
+  an absent target shows the value only, no judgment. The four render in a **Micronutrients**
+  section of the Macros & calories detail, reusing the existing macro `MetricBarRow`. Their
+  full display names (`Sodium`, `Saturated Fat`, `Total Sugars`, `Potassium`) live in one
+  place — a new `Micronutrient` enum, mirroring `Macro` and guarded by `MacroLabelTests`.
+- **HealthKit meal write-back for the four micronutrients.** A logged meal now carries the
+  four (each the sum of only its known items, nil when none), threaded from the `meal_log`
+  wire (`sodium_mg`/`satfat_g`/`sugar_g`/`potassium_mg`) through `Meal` and written as
+  additional samples on the meal's existing `.food` correlation — `dietarySodium` /
+  `dietaryFatSaturated` / `dietarySugar` / `dietaryPotassium` (sodium & potassium in mg,
+  fats & sugar in g). A nutrient with no known value writes NO sample (never a 0). The
+  share (write) set grows from the five macros to nine to authorize them; the existing
+  kcal/protein/carbs/fat/fiber samples and the weight/workout read-only posture are
+  untouched.
+
 ## [Bridge 0.12.1] — 2026-07-15
 
 ### Added

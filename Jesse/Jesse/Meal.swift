@@ -22,6 +22,13 @@ nonisolated struct Meal: Codable, Equatable, Sendable {
     let carbGrams: Double?
     let fatGrams: Double?
     let fiberGrams: Double?
+    /// The four micronutrients, each the sum of ONLY the meal's items that carried a
+    /// known value — nil when NO item in the meal did (never a summed 0). Written as
+    /// their own HealthKit samples; sodium/potassium in mg, saturated fat/sugars in g.
+    let sodiumMg: Double?
+    let satFatGrams: Double?
+    let sugarGrams: Double?
+    let potassiumMg: Double?
 }
 
 /// The pure validator + display scrubber for the `JESSE_MEAL_LOG v1` contract.
@@ -62,13 +69,16 @@ nonisolated enum MealLogParser {
         let id = m.id.trimmingCharacters(in: .whitespacesAndNewlines)
         let name = m.name.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !id.isEmpty, !name.isEmpty, let date = parseDate(m.consumedAt) else { return nil }
-        for macro in [m.kcal, m.proteinGrams, m.carbGrams, m.fatGrams, m.fiberGrams] {
-            if let v = macro, !(v.isFinite && v >= 0) { return nil }
+        for value in [m.kcal, m.proteinGrams, m.carbGrams, m.fatGrams, m.fiberGrams,
+                      m.sodiumMg, m.satFatGrams, m.sugarGrams, m.potassiumMg] {
+            if let v = value, !(v.isFinite && v >= 0) { return nil }
         }
         return Meal(id: id, consumedAt: date, name: name,
                     kcal: m.kcal, proteinGrams: m.proteinGrams,
                     carbGrams: m.carbGrams, fatGrams: m.fatGrams,
-                    fiberGrams: m.fiberGrams)
+                    fiberGrams: m.fiberGrams,
+                    sodiumMg: m.sodiumMg, satFatGrams: m.satFatGrams,
+                    sugarGrams: m.sugarGrams, potassiumMg: m.potassiumMg)
     }
 
     /// Parse an ISO-8601 date-time WITH offset, tolerating optional fractional

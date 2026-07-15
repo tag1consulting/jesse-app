@@ -96,7 +96,9 @@ final class MealWireDecodeTests: XCTestCase {
         let bad = JesseMealLog(meals: [JesseMeal(id: "a", consumedAt: "nope", name: "X",
                                                  kcal: nil, proteinGrams: nil,
                                                  carbGrams: nil, fatGrams: nil,
-                                                 fiberGrams: nil)])
+                                                 fiberGrams: nil, sodiumMg: nil,
+                                                 satFatGrams: nil, sugarGrams: nil,
+                                                 potassiumMg: nil)])
         let reply = JesseReply(text: "ok", sessionId: nil,
                                directives: JesseDirectives(needsHealth: nil, mealLog: bad))
         XCTAssertNil(reply.mealsToLog)

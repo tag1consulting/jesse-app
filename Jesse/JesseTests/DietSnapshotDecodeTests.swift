@@ -208,6 +208,63 @@ final class DietSnapshotDecodeTests: XCTestCase {
         XCTAssertNil(s.availableDays)
     }
 
+    // MARK: - Micronutrients (na / satf / sug / k) — unknown ≠ zero
+
+    // A day where one item carries all four micronutrients and a second carries none,
+    // plus the four optional day targets.
+    private let micros = """
+    {
+      "asOf": "2026-07-09T14:50:55Z",
+      "today": {
+        "date": "2026-07-09", "exercise": [],
+        "meals": [ { "name": "Lunch", "time": "12:30", "items": [
+          { "item": "Soup", "cal": 200, "p": 8, "f": 6, "c": 20, "fiber": 3,
+            "na": 900, "satf": 2.5, "sug": 4, "k": 300 },
+          { "item": "Bread", "cal": 150, "p": 5, "f": 2, "c": 28, "fiber": 2 }
+        ] } ],
+        "targets": { "calories": 2100, "protein": 190, "fat": 65, "carbs": 210,
+          "sodium": 2300, "satFat": 20, "potassium": 3500, "sugar": 50 }
+      },
+      "errors": []
+    }
+    """
+
+    func testDecodesMicronutrientsWhenPresent() throws {
+        let s = try decode(micros)
+        let items = try XCTUnwrap(s.today.meals.first?.items)
+        // First item carries all four.
+        XCTAssertEqual(items[0].na, 900)
+        XCTAssertEqual(items[0].satf, 2.5)
+        XCTAssertEqual(items[0].sug, 4)
+        XCTAssertEqual(items[0].k, 300)
+        // Second item lacks all four → nil (UNKNOWN), never zero-padded.
+        XCTAssertNil(items[1].na)
+        XCTAssertNil(items[1].satf)
+        XCTAssertNil(items[1].sug)
+        XCTAssertNil(items[1].k)
+        // The four optional day targets decode.
+        XCTAssertEqual(s.today.targets.sodium, 2300)
+        XCTAssertEqual(s.today.targets.satFat, 20)
+        XCTAssertEqual(s.today.targets.potassium, 3500)
+        XCTAssertEqual(s.today.targets.sugar, 50)
+    }
+
+    func testItemLackingMicronutrientsDecodesToNil() throws {
+        // The `full` body carries none of the four new item keys → all nil, and the
+        // whole payload still decodes cleanly (no key is required).
+        let s = try decode(full)
+        let item = try XCTUnwrap(s.today.meals.first?.items.first)
+        XCTAssertNil(item.na)
+        XCTAssertNil(item.satf)
+        XCTAssertNil(item.sug)
+        XCTAssertNil(item.k)
+        // Absent target keys → nil.
+        XCTAssertNil(s.today.targets.sodium)
+        XCTAssertNil(s.today.targets.satFat)
+        XCTAssertNil(s.today.targets.potassium)
+        XCTAssertNil(s.today.targets.sugar)
+    }
+
     func testUnknownKeysAreIgnored() throws {
         // A future generator field we don't model must not break decode.
         let json = """

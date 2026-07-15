@@ -515,12 +515,23 @@ nonisolated struct JesseMeal: Decodable, Equatable {
     let carbGrams: Double?
     let fatGrams: Double?
     let fiberGrams: Double?
+    /// The four micronutrients, each pre-summed by the bridge over only the meal's
+    /// items that carried a known value (absent when none did — never a summed 0).
+    /// Optional and additive: an older bridge that omits them decodes to nil.
+    let sodiumMg: Double?
+    let satFatGrams: Double?
+    let sugarGrams: Double?
+    let potassiumMg: Double?
     enum CodingKeys: String, CodingKey {
         case id, consumedAt, name, kcal
         case proteinGrams = "protein_g"
         case carbGrams = "carbs_g"
         case fatGrams = "fat_g"
         case fiberGrams = "fiber_g"
+        case sodiumMg = "sodium_mg"
+        case satFatGrams = "satfat_g"
+        case sugarGrams = "sugar_g"
+        case potassiumMg = "potassium_mg"
     }
 }
 
