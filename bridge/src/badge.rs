@@ -47,7 +47,11 @@ pub enum BadgeSource {
 /// the model strings come from `cfg` (the configured local backends) and, for the
 /// hosted case, from `hosted_model` (the ambient `ANTHROPIC_MODEL`, `None` → bare
 /// `[hosted]`). Never reads model output.
-pub fn model_badge_line(cfg: &Config, source: BadgeSource, hosted_model: Option<&str>) -> Option<String> {
+pub fn model_badge_line(
+    cfg: &Config,
+    source: BadgeSource,
+    hosted_model: Option<&str>,
+) -> Option<String> {
     if !cfg.model_badge {
         return None;
     }
@@ -292,7 +296,11 @@ mod tests {
         assert_eq!(out, format!("{text}\n\n[hosted]"));
         // Exactly one bridge badge at the very end.
         assert!(out.ends_with("\n\n[hosted]"));
-        assert_eq!(out.matches("\n\n[hosted]").count(), 1, "one appended badge only");
+        assert_eq!(
+            out.matches("\n\n[hosted]").count(),
+            1,
+            "one appended badge only"
+        );
     }
 
     #[test]
@@ -301,7 +309,10 @@ mod tests {
         for (source, expected) in [
             (BadgeSource::Hosted, "[hosted]"),
             (BadgeSource::Vault, "[local · vault · local-vaultqa]"),
-            (BadgeSource::DietVerify, "[local · diet · local-diet + hosted verify]"),
+            (
+                BadgeSource::DietVerify,
+                "[local · diet · local-diet + hosted verify]",
+            ),
         ] {
             let out = finalize_reply_badge(
                 Ok(("Reply body.".into(), Some("sess".into()), None)),
@@ -332,13 +343,9 @@ mod tests {
         // On, but an EMPTY reply (a directive-only turn) is left empty so the app's
         // retry logic still fires.
         let cfg = cfg_on();
-        let out = finalize_reply_badge(
-            Ok(("".into(), None, None)),
-            &cfg,
-            BadgeSource::Hosted,
-            None,
-        )
-        .unwrap();
+        let out =
+            finalize_reply_badge(Ok(("".into(), None, None)), &cfg, BadgeSource::Hosted, None)
+                .unwrap();
         assert_eq!(out.0, "", "an empty reply must not be badged");
 
         // On, but an error outcome passes through unchanged.
@@ -370,33 +377,81 @@ mod tests {
     fn provenance_present_matches_the_badge_for_each_route() {
         let cfg = cfg_on();
         let cases = [
-            RouteCase { route: MetricsRoute::Hosted, source: BadgeSource::Hosted,
-                model: Some("claude-opus-4-8"), hosted: Some("claude-opus-4-8"),
-                badge: "[hosted · claude-opus-4-8]", flags: (false, false, false) },
-            RouteCase { route: MetricsRoute::VaultqaLocal, source: BadgeSource::Vault,
-                model: Some("local-vaultqa"), hosted: None,
-                badge: "[local · vault · local-vaultqa]", flags: (false, false, false) },
-            RouteCase { route: MetricsRoute::DietLocal, source: BadgeSource::DietVerify,
-                model: Some("local-diet"), hosted: None,
-                badge: "[local · diet · local-diet + hosted verify]", flags: (true, false, false) },
-            RouteCase { route: MetricsRoute::EmergencyLocal, source: BadgeSource::Emergency,
-                model: Some("local-vaultqa"), hosted: None,
-                badge: "[local · emergency · local-vaultqa]", flags: (false, false, false) },
-            RouteCase { route: MetricsRoute::EmergencyLocal, source: BadgeSource::DietQueued,
-                model: Some("local-diet"), hosted: None,
-                badge: "[local · diet · local-diet + verify queued]", flags: (false, true, false) },
+            RouteCase {
+                route: MetricsRoute::Hosted,
+                source: BadgeSource::Hosted,
+                model: Some("claude-opus-4-8"),
+                hosted: Some("claude-opus-4-8"),
+                badge: "[hosted · claude-opus-4-8]",
+                flags: (false, false, false),
+            },
+            RouteCase {
+                route: MetricsRoute::VaultqaLocal,
+                source: BadgeSource::Vault,
+                model: Some("local-vaultqa"),
+                hosted: None,
+                badge: "[local · vault · local-vaultqa]",
+                flags: (false, false, false),
+            },
+            RouteCase {
+                route: MetricsRoute::DietLocal,
+                source: BadgeSource::DietVerify,
+                model: Some("local-diet"),
+                hosted: None,
+                badge: "[local · diet · local-diet + hosted verify]",
+                flags: (true, false, false),
+            },
+            RouteCase {
+                route: MetricsRoute::EmergencyLocal,
+                source: BadgeSource::Emergency,
+                model: Some("local-vaultqa"),
+                hosted: None,
+                badge: "[local · emergency · local-vaultqa]",
+                flags: (false, false, false),
+            },
+            RouteCase {
+                route: MetricsRoute::EmergencyLocal,
+                source: BadgeSource::DietQueued,
+                model: Some("local-diet"),
+                hosted: None,
+                badge: "[local · diet · local-diet + verify queued]",
+                flags: (false, true, false),
+            },
         ];
         for c in cases {
             let (hv, vq, cu) = c.flags;
-            let p = reply_provenance(&ok("Body."), &cfg, c.route, c.source, c.model.map(String::from), c.hosted, cu)
-                .expect("provenance present for a non-empty reply with badges on");
+            let p = reply_provenance(
+                &ok("Body."),
+                &cfg,
+                c.route,
+                c.source,
+                c.model.map(String::from),
+                c.hosted,
+                cu,
+            )
+            .expect("provenance present for a non-empty reply with badges on");
             assert_eq!(p.route, c.route);
-            assert_eq!(p.model.as_deref(), c.model, "backend model carried structurally");
+            assert_eq!(
+                p.model.as_deref(),
+                c.model,
+                "backend model carried structurally"
+            );
             assert_eq!(p.badge, c.badge, "badge byte-identical to the text badge");
             // The badge string embedded in provenance is exactly what finalize appends.
             let finalized = finalize_reply_badge(ok("Body."), &cfg, c.source, c.hosted).unwrap();
-            assert_eq!(finalized.0, format!("Body.\n\n{}", p.badge), "provenance.badge == appended badge");
-            assert_eq!((p.flags.hosted_verify, p.flags.verify_queued, p.flags.citations_unverified), (hv, vq, cu));
+            assert_eq!(
+                finalized.0,
+                format!("Body.\n\n{}", p.badge),
+                "provenance.badge == appended badge"
+            );
+            assert_eq!(
+                (
+                    p.flags.hosted_verify,
+                    p.flags.verify_queued,
+                    p.flags.citations_unverified
+                ),
+                (hv, vq, cu)
+            );
         }
     }
 
@@ -404,12 +459,23 @@ mod tests {
     fn emergency_citations_unverified_flag_flows_when_advisory_validator_failed() {
         let cfg = cfg_on();
         let p = reply_provenance(
-            &ok("Best guess."), &cfg, MetricsRoute::EmergencyLocal, BadgeSource::Emergency,
-            Some("local-vaultqa".into()), None, /* citations_unverified */ true,
+            &ok("Best guess."),
+            &cfg,
+            MetricsRoute::EmergencyLocal,
+            BadgeSource::Emergency,
+            Some("local-vaultqa".into()),
+            None,
+            /* citations_unverified */ true,
         )
         .unwrap();
-        assert!(p.flags.citations_unverified, "the advisory-fail emergency turn marks citations unverified");
-        assert_eq!(p.badge, "[local · emergency · local-vaultqa]", "badge string is unchanged by the flag");
+        assert!(
+            p.flags.citations_unverified,
+            "the advisory-fail emergency turn marks citations unverified"
+        );
+        assert_eq!(
+            p.badge, "[local · emergency · local-vaultqa]",
+            "badge string is unchanged by the flag"
+        );
     }
 
     #[test]
@@ -417,16 +483,52 @@ mod tests {
         // Off → no provenance (mirrors: no badge appended).
         let mut off = cfg_on();
         off.model_badge = false;
-        assert!(reply_provenance(&ok("Body."), &off, MetricsRoute::Hosted, BadgeSource::Hosted, None, Some("m"), false).is_none());
+        assert!(reply_provenance(
+            &ok("Body."),
+            &off,
+            MetricsRoute::Hosted,
+            BadgeSource::Hosted,
+            None,
+            Some("m"),
+            false
+        )
+        .is_none());
 
         let cfg = cfg_on();
         // Empty (directive-only) reply → no badge, so no provenance.
-        assert!(reply_provenance(&ok(""), &cfg, MetricsRoute::Hosted, BadgeSource::Hosted, None, None, false).is_none());
-        assert!(reply_provenance(&ok("   \n  "), &cfg, MetricsRoute::Hosted, BadgeSource::Hosted, None, None, false).is_none());
+        assert!(reply_provenance(
+            &ok(""),
+            &cfg,
+            MetricsRoute::Hosted,
+            BadgeSource::Hosted,
+            None,
+            None,
+            false
+        )
+        .is_none());
+        assert!(reply_provenance(
+            &ok("   \n  "),
+            &cfg,
+            MetricsRoute::Hosted,
+            BadgeSource::Hosted,
+            None,
+            None,
+            false
+        )
+        .is_none());
         // Error outcome → no badge, so no provenance.
         let err: Result<(String, Option<String>, Option<Directives>), ApiError> =
             Err((StatusCode::BAD_GATEWAY, "boom".into()));
-        assert!(reply_provenance(&err, &cfg, MetricsRoute::Hosted, BadgeSource::Hosted, None, None, false).is_none());
+        assert!(reply_provenance(
+            &err,
+            &cfg,
+            MetricsRoute::Hosted,
+            BadgeSource::Hosted,
+            None,
+            None,
+            false
+        )
+        .is_none());
     }
 
     #[test]
@@ -435,7 +537,10 @@ mod tests {
         // the exact badge strings, the citations-unverified warning, and the assembled
         // reply text per route — so the bridge (producer) and the app (stripper) can
         // never drift. If this fails, the bridge changed a string the app relies on.
-        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/provenance.json");
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/provenance.json"
+        );
         let raw = std::fs::read_to_string(path).expect("shared provenance fixture is readable");
         let fx: Value = serde_json::from_str(&raw).expect("fixture is valid JSON");
 
@@ -463,7 +568,11 @@ mod tests {
                 other => panic!("unmapped fixture case: {other}"),
             };
             let model = case["provenance"]["model"].as_str().map(String::from);
-            let hosted = if source == BadgeSource::Hosted { model.clone() } else { None };
+            let hosted = if source == BadgeSource::Hosted {
+                model.clone()
+            } else {
+                None
+            };
             let route: MetricsRoute =
                 serde_json::from_value(case["provenance"]["route"].clone()).unwrap();
             let body = case["reply_body"].as_str().unwrap();
@@ -496,10 +605,21 @@ mod tests {
     #[test]
     fn provenance_serializes_to_the_pinned_wire_shape() {
         let cfg = cfg_on();
-        let p = reply_provenance(&ok("Body."), &cfg, MetricsRoute::EmergencyLocal, BadgeSource::Emergency,
-            Some("local-vaultqa".into()), None, true).unwrap();
+        let p = reply_provenance(
+            &ok("Body."),
+            &cfg,
+            MetricsRoute::EmergencyLocal,
+            BadgeSource::Emergency,
+            Some("local-vaultqa".into()),
+            None,
+            true,
+        )
+        .unwrap();
         let v = provenance_to_value(&Some(p));
-        assert_eq!(v["route"], "emergency-local", "route serializes kebab, same vocab as metrics");
+        assert_eq!(
+            v["route"], "emergency-local",
+            "route serializes kebab, same vocab as metrics"
+        );
         assert_eq!(v["model"], "local-vaultqa");
         assert_eq!(v["badge"], "[local · emergency · local-vaultqa]");
         assert_eq!(v["flags"]["hosted_verify"], false);
@@ -508,7 +628,16 @@ mod tests {
         // None → JSON null (absent-provenance path).
         assert_eq!(provenance_to_value(&None), Value::Null);
         // A bare hosted turn carries model: null but still a badge.
-        let bare = reply_provenance(&ok("Body."), &cfg, MetricsRoute::Hosted, BadgeSource::Hosted, None, None, false).unwrap();
+        let bare = reply_provenance(
+            &ok("Body."),
+            &cfg,
+            MetricsRoute::Hosted,
+            BadgeSource::Hosted,
+            None,
+            None,
+            false,
+        )
+        .unwrap();
         let bv = provenance_to_value(&Some(bare));
         assert_eq!(bv["model"], Value::Null);
         assert_eq!(bv["badge"], "[hosted]");

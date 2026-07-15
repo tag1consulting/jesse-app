@@ -59,7 +59,7 @@ pub fn extract_citations(answer: &str) -> Vec<Citation> {
     while let Some(rel) = answer[search..].find(".md") {
         let dot = search + rel; // index of '.' in ".md"
         let end = dot + 3; // just past "md"
-        // Walk left over path bytes to the token start.
+                           // Walk left over path bytes to the token start.
         let mut start = dot;
         while start > 0 && is_path_byte(bytes[start - 1]) {
             start -= 1;
@@ -132,7 +132,21 @@ fn resolve(raw: &str, vault_root: &Path) -> Option<PathBuf> {
 fn is_bind_sep(c: char) -> bool {
     matches!(
         c,
-        ' ' | '\t' | '\n' | '(' | '[' | ')' | ']' | '`' | '—' | '–' | '-' | ',' | ':' | ';' | '"' | '\''
+        ' ' | '\t'
+            | '\n'
+            | '('
+            | '['
+            | ')'
+            | ']'
+            | '`'
+            | '—'
+            | '–'
+            | '-'
+            | ','
+            | ':'
+            | ';'
+            | '"'
+            | '\''
     )
 }
 
@@ -152,11 +166,12 @@ fn bound_quotes<'a>(answer: &'a str, cites: &[Citation]) -> Vec<(&'a str, usize)
                 let inner_end = inner_start + rel;
                 let quote = &answer[inner_start..inner_end];
                 let close = inner_end + 1; // just past the closing quote
-                // Bind to a citation whose token starts within the gap after the
-                // close, if every char in the gap is a separator.
-                if let Some(idx) = cites.iter().position(|c| {
-                    c.at >= close && answer[close..c.at].chars().all(is_bind_sep)
-                }) {
+                                           // Bind to a citation whose token starts within the gap after the
+                                           // close, if every char in the gap is a separator.
+                if let Some(idx) = cites
+                    .iter()
+                    .position(|c| c.at >= close && answer[close..c.at].chars().all(is_bind_sep))
+                {
                     if !quote.trim().is_empty() {
                         pairs.push((quote, idx));
                     }
@@ -202,9 +217,8 @@ pub fn validate_vaultqa_answer(answer: &str, vault_root: &Path) -> Result<usize,
     }
     // Every quoted claim bound to a citation must occur in that citation's file.
     for (quote, idx) in bound_quotes(answer, &cites) {
-        let content = std::fs::read_to_string(&resolved[idx]).map_err(|_| {
-            CitationFailure::UnresolvedFile(cites[idx].path.clone())
-        })?;
+        let content = std::fs::read_to_string(&resolved[idx])
+            .map_err(|_| CitationFailure::UnresolvedFile(cites[idx].path.clone()))?;
         if !quote_present(&content, quote, cites[idx].line) {
             return Err(CitationFailure::FabricatedQuote {
                 path: cites[idx].path.clone(),
@@ -234,9 +248,8 @@ mod tests {
 
     #[test]
     fn extract_finds_paths_with_and_without_line() {
-        let cites = extract_citations(
-            "See `todo-list/Today.md:2` and also notes/plan.md for context.",
-        );
+        let cites =
+            extract_citations("See `todo-list/Today.md:2` and also notes/plan.md for context.");
         assert_eq!(cites.len(), 2);
         assert_eq!(cites[0].path, "todo-list/Today.md");
         assert_eq!(cites[0].line, Some(2));
@@ -284,7 +297,9 @@ mod tests {
         let answer = "It's in todo-list/Ghost.md.";
         assert_eq!(
             validate_vaultqa_answer(answer, &root),
-            Err(CitationFailure::UnresolvedFile("todo-list/Ghost.md".to_string()))
+            Err(CitationFailure::UnresolvedFile(
+                "todo-list/Ghost.md".to_string()
+            ))
         );
         let _ = std::fs::remove_dir_all(&root);
     }

@@ -55,8 +55,16 @@ pub const MAX_MEALS: usize = 10;
 /// The optional macro fields a meal may carry, and the only keys (besides the
 /// required `id`/`consumedAt`/`name`) allowed on a meal object. A typo'd or extra
 /// key is a loud failure, mirroring the needs-health payload's unknown-key check.
-const MEAL_FIELDS: &[&str] =
-    &["id", "consumedAt", "name", "kcal", "protein_g", "carbs_g", "fat_g", "fiber_g"];
+const MEAL_FIELDS: &[&str] = &[
+    "id",
+    "consumedAt",
+    "name",
+    "kcal",
+    "protein_g",
+    "carbs_g",
+    "fat_g",
+    "fiber_g",
+];
 
 /// Sections a `JESSE_NEEDS_HEALTH` directive may request (the phone-assembled
 /// two-section health block). Kept in sync with the app's formatter.
@@ -434,7 +442,10 @@ fn parse_meal_log(json: &str) -> Result<MealLog, String> {
         return Err("`meals` is empty".into());
     }
     if items.len() > MAX_MEALS {
-        return Err(format!("`meals` has {} entries, cap is {MAX_MEALS}", items.len()));
+        return Err(format!(
+            "`meals` has {} entries, cap is {MAX_MEALS}",
+            items.len()
+        ));
     }
 
     let mut meals = Vec::with_capacity(items.len());
@@ -571,7 +582,8 @@ mod tests {
     #[test]
     fn non_final_directive_line_is_not_recognized() {
         // Only the FINAL non-empty line is a directive; one mid-reply is prose.
-        let reply = "JESSE_NEEDS_HEALTH v1 {\"sections\":[\"daily\"]}\nBut actually here is your answer.";
+        let reply =
+            "JESSE_NEEDS_HEALTH v1 {\"sections\":[\"daily\"]}\nBut actually here is your answer.";
         let (text, directives) = extract_directives(reply);
         assert_eq!(text, reply);
         assert!(directives.is_none());
@@ -599,7 +611,7 @@ mod tests {
     fn malformed_shape_passes_through_visible() {
         for reply in [
             "JESSE_NEEDS_HEALTH {\"sections\":[\"daily\"]}", // no version token
-            "JESSE_NEEDS_HEALTH v1 not-json",               // remainder not an object
+            "JESSE_NEEDS_HEALTH v1 not-json",                // remainder not an object
             "JESSE_NEEDS_HEALTH vX {\"sections\":[\"daily\"]}", // non-numeric version
         ] {
             let (text, directives) = extract_directives(reply);
@@ -698,7 +710,10 @@ mod tests {
         };
         let v = directives_to_value(&Some(d));
         assert_eq!(v["needs_health"]["sections"][0], "daily");
-        assert_eq!(v["needs_health"]["metrics"][0]["metric"], "restingHeartRate");
+        assert_eq!(
+            v["needs_health"]["metrics"][0]["metric"],
+            "restingHeartRate"
+        );
         assert_eq!(v["needs_health"]["metrics"][0]["window_days"], 14);
         // needs_health-only Directives omit the meal_log key entirely.
         assert!(v.get("meal_log").is_none());
@@ -731,7 +746,10 @@ mod tests {
         assert_eq!(meal["kcal"], 385.0);
         assert_eq!(meal["fat_g"], 4.5);
         assert_eq!(meal["fiber_g"], 6.0);
-        assert!(meal.get("protein_g").is_none(), "absent macro omitted, not null");
+        assert!(
+            meal.get("protein_g").is_none(),
+            "absent macro omitted, not null"
+        );
         assert!(meal.get("carbs_g").is_none());
     }
 
@@ -773,7 +791,9 @@ mod tests {
         // must pass through visible — the per-arm cap fires BEFORE the payload
         // parse, so it is never stripped despite parsing cleanly. This proves the
         // cap is enforced per-directive, not by the (now 8 KiB) generic ceiling.
-        let many = std::iter::repeat_n("\"daily\"", 400).collect::<Vec<_>>().join(",");
+        let many = std::iter::repeat_n("\"daily\"", 400)
+            .collect::<Vec<_>>()
+            .join(",");
         let reply = format!("JESSE_NEEDS_HEALTH v1 {{\"sections\":[{many}]}}");
         assert!(
             reply.len() > MAX_NEEDS_HEALTH_LINE_BYTES && reply.len() < MAX_DIRECTIVE_LINE_BYTES,
@@ -843,13 +863,18 @@ mod tests {
         let m = meal_log(reply).unwrap().meals.remove(0);
         assert_eq!(m.kcal, Some(0.0), "zero is a valid non-negative macro");
         assert_eq!(m.fat_g, Some(0.5));
-        assert_eq!(m.fiber_g, Some(0.0), "zero fiber is a valid non-negative macro");
+        assert_eq!(
+            m.fiber_g,
+            Some(0.0),
+            "zero fiber is a valid non-negative macro"
+        );
     }
 
     #[test]
     fn meal_log_v2_passes_through_visible() {
         // Unknown version of a known directive → passthrough (future bump fails loud).
-        let reply = "JESSE_MEAL_LOG v2 {\"meals\":[{\"id\":\"a\",\"consumedAt\":\"t\",\"name\":\"n\"}]}";
+        let reply =
+            "JESSE_MEAL_LOG v2 {\"meals\":[{\"id\":\"a\",\"consumedAt\":\"t\",\"name\":\"n\"}]}";
         let (text, directives) = extract_directives(reply);
         assert_eq!(text, reply);
         assert!(directives.is_none());
@@ -901,7 +926,9 @@ mod tests {
     fn meal_log_over_meals_cap_passes_through_visible() {
         // MAX_MEALS + 1 entries → the whole block is malformed (never partial).
         let one = "{\"id\":\"x\",\"consumedAt\":\"t\",\"name\":\"n\"}";
-        let meals = std::iter::repeat_n(one, MAX_MEALS + 1).collect::<Vec<_>>().join(",");
+        let meals = std::iter::repeat_n(one, MAX_MEALS + 1)
+            .collect::<Vec<_>>()
+            .join(",");
         let reply = format!("JESSE_MEAL_LOG v1 {{\"meals\":[{meals}]}}");
         let (text, directives) = extract_directives(&reply);
         assert_eq!(text, reply);
@@ -911,7 +938,9 @@ mod tests {
     #[test]
     fn meal_log_at_meals_cap_is_accepted() {
         let one = "{\"id\":\"x\",\"consumedAt\":\"t\",\"name\":\"n\"}";
-        let meals = std::iter::repeat_n(one, MAX_MEALS).collect::<Vec<_>>().join(",");
+        let meals = std::iter::repeat_n(one, MAX_MEALS)
+            .collect::<Vec<_>>()
+            .join(",");
         let reply = format!("JESSE_MEAL_LOG v1 {{\"meals\":[{meals}]}}");
         let ml = meal_log(&reply).expect("exactly the cap is accepted");
         assert_eq!(ml.meals.len(), MAX_MEALS);

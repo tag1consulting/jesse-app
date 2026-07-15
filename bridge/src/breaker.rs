@@ -55,10 +55,7 @@ impl CircuitBreaker {
     /// counter is left intact, so if that retry fails transport-class again the breaker
     /// re-opens immediately, and only a success clears it.
     pub fn should_skip_hosted(&self, now: Instant) -> bool {
-        self.inner
-            .lock_ok()
-            .open_until
-            .is_some_and(|t| now < t)
+        self.inner.lock_ok().open_until.is_some_and(|t| now < t)
     }
 
     /// Record a hosted SUCCESS — resets the breaker completely (closed, counter 0).
@@ -99,7 +96,10 @@ mod tests {
         let t0 = Instant::now();
         b.record_transport_failure(t0);
         assert_eq!(b.consecutive(), 1);
-        assert!(!b.should_skip_hosted(t0), "one failure must not open the breaker");
+        assert!(
+            !b.should_skip_hosted(t0),
+            "one failure must not open the breaker"
+        );
     }
 
     #[test]
@@ -108,7 +108,10 @@ mod tests {
         let t0 = Instant::now();
         b.record_transport_failure(t0);
         b.record_transport_failure(t0);
-        assert!(b.should_skip_hosted(t0), "two consecutive transport failures open it");
+        assert!(
+            b.should_skip_hosted(t0),
+            "two consecutive transport failures open it"
+        );
         // Still open partway through the cooldown.
         assert!(b.should_skip_hosted(t0 + cd() - Duration::from_secs(1)));
     }
@@ -133,7 +136,10 @@ mod tests {
         assert!(b.should_skip_hosted(t0));
         b.record_success();
         assert_eq!(b.consecutive(), 0);
-        assert!(!b.should_skip_hosted(t0), "success closes the breaker immediately");
+        assert!(
+            !b.should_skip_hosted(t0),
+            "success closes the breaker immediately"
+        );
     }
 
     #[test]
@@ -144,7 +150,10 @@ mod tests {
         b.record_success(); // breaks the "consecutive" streak
         b.record_transport_failure(t0);
         assert_eq!(b.consecutive(), 1);
-        assert!(!b.should_skip_hosted(t0), "non-consecutive failures must not open it");
+        assert!(
+            !b.should_skip_hosted(t0),
+            "non-consecutive failures must not open it"
+        );
     }
 
     #[test]
@@ -154,9 +163,15 @@ mod tests {
         b.record_transport_failure(t0);
         b.record_transport_failure(t0);
         let later = t0 + cd() + Duration::from_secs(1);
-        assert!(!b.should_skip_hosted(later), "cooldown elapsed → retry hosted");
+        assert!(
+            !b.should_skip_hosted(later),
+            "cooldown elapsed → retry hosted"
+        );
         // The retry also fails transport-class → the breaker re-opens from `later`.
         b.record_transport_failure(later);
-        assert!(b.should_skip_hosted(later), "a failed retry re-opens the breaker");
+        assert!(
+            b.should_skip_hosted(later),
+            "a failed retry re-opens the breaker"
+        );
     }
 }

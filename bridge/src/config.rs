@@ -455,8 +455,7 @@ impl Config {
         let home = std::env::var("HOME").unwrap_or_default();
         Config {
             token: env_string("JESSE_TOKEN").unwrap_or_default(),
-            vault: env_string("JESSE_VAULT")
-                .unwrap_or_else(|| format!("{home}/devel/tag1/jesse")),
+            vault: env_string("JESSE_VAULT").unwrap_or_else(|| format!("{home}/devel/tag1/jesse")),
             bind: env_string("JESSE_BIND").unwrap_or_else(|| "127.0.0.1".to_string()),
             port: env_parse("JESSE_PORT", 8765),
             claude_bin: env_string("JESSE_CLAUDE_BIN").unwrap_or_else(|| "claude".to_string()),
@@ -630,8 +629,14 @@ mod tests {
         // HOME is set), with job files under `<state_dir>/jobs`.
         match std::env::var("HOME").ok().filter(|h| !h.is_empty()) {
             Some(home) => {
-                assert_eq!(cfg.state_dir.as_deref(), Some(format!("{home}/.jesse-bridge").as_str()));
-                assert_eq!(cfg.jobs_dir(), Some(PathBuf::from(format!("{home}/.jesse-bridge/jobs"))));
+                assert_eq!(
+                    cfg.state_dir.as_deref(),
+                    Some(format!("{home}/.jesse-bridge").as_str())
+                );
+                assert_eq!(
+                    cfg.jobs_dir(),
+                    Some(PathBuf::from(format!("{home}/.jesse-bridge/jobs")))
+                );
             }
             None => {
                 assert_eq!(cfg.state_dir, None);
@@ -660,7 +665,10 @@ mod tests {
         // 0 means "ceiling", never unlimited.
         assert_eq!(clamp_timeout_secs(0), HARD_TIMEOUT_CEILING);
         // Over-ceiling is capped; in-range is unchanged; 1 is the floor.
-        assert_eq!(clamp_timeout_secs(HARD_TIMEOUT_CEILING + 10), HARD_TIMEOUT_CEILING);
+        assert_eq!(
+            clamp_timeout_secs(HARD_TIMEOUT_CEILING + 10),
+            HARD_TIMEOUT_CEILING
+        );
         assert_eq!(clamp_timeout_secs(1800), 1800);
         assert_eq!(clamp_timeout_secs(1), 1);
     }
@@ -939,7 +947,10 @@ mod tests {
                 "local-vaultqa".to_string(),
             ))
         );
-        assert_eq!(cfg.vaultqa_mcp_config.as_deref(), Some("/etc/jesse/qmd.json"));
+        assert_eq!(
+            cfg.vaultqa_mcp_config.as_deref(),
+            Some("/etc/jesse/qmd.json")
+        );
 
         // Drop one → partial → None (treated as unset); a blank value counts as unset.
         std::env::remove_var("JESSE_VAULTQA_AUTH_TOKEN");
@@ -950,11 +961,17 @@ mod tests {
         // Badge: only an explicit falsey value flips it off.
         for falsey in ["0", "false", "no", "off", "OFF", " Off "] {
             std::env::set_var("JESSE_MODEL_BADGE", falsey);
-            assert!(!Config::from_env().model_badge, "explicit {falsey:?} disables the badge");
+            assert!(
+                !Config::from_env().model_badge,
+                "explicit {falsey:?} disables the badge"
+            );
         }
         for truthy in ["1", "true", "yes", "on", "anything-else"] {
             std::env::set_var("JESSE_MODEL_BADGE", truthy);
-            assert!(Config::from_env().model_badge, "{truthy:?} keeps the badge on");
+            assert!(
+                Config::from_env().model_badge,
+                "{truthy:?} keeps the badge on"
+            );
         }
 
         for (k, v) in saved {
@@ -1002,7 +1019,10 @@ mod tests {
         // Must clear the measured 42 s oss lookup max (a `let` binding keeps clippy from
         // folding the const comparison to a trivially-true assert).
         let measured_oss_max_secs = 42u64;
-        assert!(VAULTQA_TIMEOUT_SECS >= measured_oss_max_secs, "must clear the measured oss max");
+        assert!(
+            VAULTQA_TIMEOUT_SECS >= measured_oss_max_secs,
+            "must clear the measured oss max"
+        );
         assert_eq!(EMERGENCY_TIMEOUT_SECS, 120);
     }
 
@@ -1021,7 +1041,11 @@ mod tests {
             Some("/var/log/jesse/metrics.jsonl")
         );
         std::env::set_var("JESSE_METRICS_LOG", "   ");
-        assert_eq!(Config::from_env().metrics_log, None, "blank counts as unset");
+        assert_eq!(
+            Config::from_env().metrics_log,
+            None,
+            "blank counts as unset"
+        );
         match saved {
             Some(v) => std::env::set_var("JESSE_METRICS_LOG", v),
             None => std::env::remove_var("JESSE_METRICS_LOG"),
@@ -1039,7 +1063,10 @@ mod tests {
         assert!(!Config::from_env().emergency_local, "default off");
         for truthy in ["on", "1", "true", "yes", "ON", " On "] {
             std::env::set_var("JESSE_EMERGENCY_LOCAL", truthy);
-            assert!(Config::from_env().emergency_local, "explicit {truthy:?} enables");
+            assert!(
+                Config::from_env().emergency_local,
+                "explicit {truthy:?} enables"
+            );
         }
         for falsey in ["off", "0", "false", "no", "", "  ", "garbage"] {
             std::env::set_var("JESSE_EMERGENCY_LOCAL", falsey);

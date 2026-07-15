@@ -51,9 +51,7 @@ nothing else.\n\
 /// handler's `build_prompt`, so an oversized block can't reach here; a defensive
 /// `Err` from framing is treated as "no block").
 pub fn build_vaultqa_prompt(question: &str, health_context: Option<&str>) -> String {
-    let health_block = frame_health_context(health_context)
-        .ok()
-        .flatten();
+    let health_block = frame_health_context(health_context).ok().flatten();
     let mut p = format!("QUESTION:\n{question}\n\n");
     if let Some(block) = health_block {
         p.push_str(&block);
@@ -135,7 +133,9 @@ pub fn decide_vaultqa_outcome(
         Ok(text) => {
             let trimmed = text.trim();
             if trimmed.is_empty() {
-                return VaultqaOutcome::FallThrough { rung: VaultqaRung::Empty };
+                return VaultqaOutcome::FallThrough {
+                    rung: VaultqaRung::Empty,
+                };
             }
             if trimmed == NO_VAULT_ANSWER {
                 return VaultqaOutcome::FallThrough {
@@ -204,7 +204,9 @@ pub async fn run_vaultqa_pipeline(
         // Defensive: never entered without a backend, but degrade rather than panic.
         None => {
             eprintln!("jesse-bridge: vault-QA pipeline invoked with no backend — falling through");
-            return VaultqaOutcome::FallThrough { rung: VaultqaRung::Child };
+            return VaultqaOutcome::FallThrough {
+                rung: VaultqaRung::Child,
+            };
         }
     };
     let prompt = build_vaultqa_prompt(question, health_context);
@@ -212,10 +214,16 @@ pub async fn run_vaultqa_pipeline(
     let outcome = decide_vaultqa_outcome(result, Path::new(&cfg.vault));
     match &outcome {
         VaultqaOutcome::Answered { citations, .. } => {
-            eprintln!("{}", format_vaultqa_provenance(true, None, &base_url, &model, *citations));
+            eprintln!(
+                "{}",
+                format_vaultqa_provenance(true, None, &base_url, &model, *citations)
+            );
         }
         VaultqaOutcome::FallThrough { rung } => {
-            eprintln!("{}", format_vaultqa_provenance(false, Some(*rung), &base_url, &model, 0));
+            eprintln!(
+                "{}",
+                format_vaultqa_provenance(false, Some(*rung), &base_url, &model, 0)
+            );
         }
     }
     outcome
@@ -229,7 +237,10 @@ mod tests {
     fn prompt_carries_question_verbatim_and_the_instruction_contract() {
         let q = "what is my VO2 max lately";
         let p = build_vaultqa_prompt(q, None);
-        assert!(p.starts_with(&format!("QUESTION:\n{q}\n\n")), "question leads verbatim: {p:?}");
+        assert!(
+            p.starts_with(&format!("QUESTION:\n{q}\n\n")),
+            "question leads verbatim: {p:?}"
+        );
         // The load-bearing instruction clauses.
         assert!(p.contains("Answer ONLY from files in this vault"));
         assert!(p.contains("Cite the file path for EVERY load-bearing fact"));
@@ -240,7 +251,10 @@ mod tests {
         assert!(p.contains("EXACTLY `NO_VAULT_ANSWER`"));
         assert!(p.contains("renders on a phone"));
         // No health framing when no block is supplied.
-        assert!(!p.contains(HEALTH_CONTEXT_HEADER), "no health block → no health framing");
+        assert!(
+            !p.contains(HEALTH_CONTEXT_HEADER),
+            "no health block → no health framing"
+        );
     }
 
     #[test]
@@ -253,14 +267,20 @@ mod tests {
         let hdr_at = p.find(HEALTH_CONTEXT_HEADER).expect("health block framed");
         let block_at = p.find(block).expect("block present verbatim");
         let instr_at = p.find("INSTRUCTIONS:").unwrap();
-        assert!(q_at < hdr_at && hdr_at < block_at && block_at < instr_at, "order: q < health < instructions");
+        assert!(
+            q_at < hdr_at && hdr_at < block_at && block_at < instr_at,
+            "order: q < health < instructions"
+        );
     }
 
     #[test]
     fn prompt_omits_blank_or_control_only_health_block() {
         // A blank / control-only block frames to nothing (same as the hosted path).
         let p = build_vaultqa_prompt("q", Some("  \u{0}\u{1b}  "));
-        assert!(!p.contains(HEALTH_CONTEXT_HEADER), "blank health block adds no framing");
+        assert!(
+            !p.contains(HEALTH_CONTEXT_HEADER),
+            "blank health block adds no framing"
+        );
     }
 
     // ---- Ladder rung mapping (one test per rung) ---------------------------
@@ -278,7 +298,12 @@ mod tests {
         let root = temp_vault();
         for status in [StatusCode::INTERNAL_SERVER_ERROR, StatusCode::BAD_GATEWAY] {
             let out = decide_vaultqa_outcome(Err((status, "boom".into())), &root);
-            assert_eq!(out, VaultqaOutcome::FallThrough { rung: VaultqaRung::Child });
+            assert_eq!(
+                out,
+                VaultqaOutcome::FallThrough {
+                    rung: VaultqaRung::Child
+                }
+            );
         }
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -286,11 +311,14 @@ mod tests {
     #[test]
     fn rung2_timeout_falls_through() {
         let root = temp_vault();
-        let out = decide_vaultqa_outcome(
-            Err((StatusCode::GATEWAY_TIMEOUT, "too slow".into())),
-            &root,
+        let out =
+            decide_vaultqa_outcome(Err((StatusCode::GATEWAY_TIMEOUT, "too slow".into())), &root);
+        assert_eq!(
+            out,
+            VaultqaOutcome::FallThrough {
+                rung: VaultqaRung::Timeout
+            }
         );
-        assert_eq!(out, VaultqaOutcome::FallThrough { rung: VaultqaRung::Timeout });
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -300,7 +328,12 @@ mod tests {
         // Exact token, and tolerant of surrounding whitespace.
         for ans in ["NO_VAULT_ANSWER", "  NO_VAULT_ANSWER\n"] {
             let out = decide_vaultqa_outcome(Ok(ans.to_string()), &root);
-            assert_eq!(out, VaultqaOutcome::FallThrough { rung: VaultqaRung::NoVaultAnswer });
+            assert_eq!(
+                out,
+                VaultqaOutcome::FallThrough {
+                    rung: VaultqaRung::NoVaultAnswer
+                }
+            );
         }
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -309,7 +342,12 @@ mod tests {
     fn rung4_empty_answer_falls_through() {
         let root = temp_vault();
         let out = decide_vaultqa_outcome(Ok("   \n  ".to_string()), &root);
-        assert_eq!(out, VaultqaOutcome::FallThrough { rung: VaultqaRung::Empty });
+        assert_eq!(
+            out,
+            VaultqaOutcome::FallThrough {
+                rung: VaultqaRung::Empty
+            }
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -318,7 +356,12 @@ mod tests {
         let root = temp_vault();
         // No citation at all → validator fail → rung 5.
         let out = decide_vaultqa_outcome(Ok("Your VO2 max is about 52.".to_string()), &root);
-        assert_eq!(out, VaultqaOutcome::FallThrough { rung: VaultqaRung::Validator });
+        assert_eq!(
+            out,
+            VaultqaOutcome::FallThrough {
+                rung: VaultqaRung::Validator
+            }
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -329,7 +372,10 @@ mod tests {
         let out = decide_vaultqa_outcome(Ok(answer.to_string()), &root);
         assert_eq!(
             out,
-            VaultqaOutcome::Answered { text: answer.to_string(), citations: 1 }
+            VaultqaOutcome::Answered {
+                text: answer.to_string(),
+                citations: 1
+            }
         );
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -345,7 +391,10 @@ mod tests {
             "jesse-bridge: vaultqa turn -> hosted-fallback rung=5 reason=citation-validation-failed"
         );
         let line = format_vaultqa_provenance(true, None, "http://u", "m", 1);
-        assert!(!line.contains("token"), "provenance must never carry a token");
+        assert!(
+            !line.contains("token"),
+            "provenance must never carry a token"
+        );
     }
 
     #[tokio::test]

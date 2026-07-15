@@ -170,7 +170,8 @@ fn strip_parens(s: &str) -> String {
 /// finite, non-negative number. Returns `Err(reason)` for anything off-contract; the
 /// pipeline maps that to ladder rung 2 (fall through to the hosted turn).
 pub fn parse_diet_entries(json: &str) -> Result<DietExtract, String> {
-    let value: Value = serde_json::from_str(json.trim()).map_err(|e| format!("invalid JSON: {e}"))?;
+    let value: Value =
+        serde_json::from_str(json.trim()).map_err(|e| format!("invalid JSON: {e}"))?;
     let obj = value.as_object().ok_or("payload is not a JSON object")?;
     for key in obj.keys() {
         if key != "entries" && key != "no_loggable_content" {
@@ -245,7 +246,9 @@ fn opt_num_field(m: &serde_json::Map<String, Value>, key: &str) -> Result<Option
     match m.get(key) {
         None => Ok(None),
         Some(v) => {
-            let n = v.as_f64().ok_or_else(|| format!("`{key}` is not a number"))?;
+            let n = v
+                .as_f64()
+                .ok_or_else(|| format!("`{key}` is not a number"))?;
             if !n.is_finite() {
                 return Err(format!("`{key}` is not finite"));
             }
@@ -258,8 +261,18 @@ fn opt_num_field(m: &serde_json::Map<String, Value>, key: &str) -> Result<Option
 }
 
 const FOOD_KEYS: &[&str] = &[
-    "kind", "name", "meal", "time", "amount", "unit", "kcal", "protein_g", "carbs_g", "fat_g",
-    "fiber_g", "notes",
+    "kind",
+    "name",
+    "meal",
+    "time",
+    "amount",
+    "unit",
+    "kcal",
+    "protein_g",
+    "carbs_g",
+    "fat_g",
+    "fiber_g",
+    "notes",
 ];
 
 fn parse_food(m: &serde_json::Map<String, Value>) -> Result<FoodEntry, String> {
@@ -290,8 +303,16 @@ fn parse_food(m: &serde_json::Map<String, Value>) -> Result<FoodEntry, String> {
 }
 
 const EXERCISE_KEYS: &[&str] = &[
-    "kind", "activity", "time", "description", "distance_km", "duration", "pace", "avg_hr",
-    "calories", "notes",
+    "kind",
+    "activity",
+    "time",
+    "description",
+    "distance_km",
+    "duration",
+    "pace",
+    "avg_hr",
+    "calories",
+    "notes",
 ];
 
 fn parse_exercise(m: &serde_json::Map<String, Value>) -> Result<ExerciseEntry, String> {
@@ -383,7 +404,8 @@ pub struct EntryVerdict {
 /// candidates). Requires exactly `n_entries` verdicts. `Err` → the pipeline can't
 /// confirm the write, so it falls through to the hosted turn (rung 3).
 pub fn parse_verify_verdicts(json: &str, n_entries: usize) -> Result<Vec<EntryVerdict>, String> {
-    let value: Value = serde_json::from_str(json.trim()).map_err(|e| format!("invalid JSON: {e}"))?;
+    let value: Value =
+        serde_json::from_str(json.trim()).map_err(|e| format!("invalid JSON: {e}"))?;
     let obj = value.as_object().ok_or("payload is not a JSON object")?;
     let items = obj
         .get("verdicts")
@@ -461,8 +483,8 @@ fn resolve_food_verdict(f: &FoodEntry, v: &EntryVerdict) -> Option<DietEntry> {
     let apply = |orig: Option<f64>, corrected: Option<f64>| -> Result<Option<f64>, ()> {
         match corrected {
             Some(n) if n.is_finite() && n >= 0.0 => Ok(Some(n)),
-            Some(_) => Err(()),   // a bad corrected value is not trivially safe
-            None => Ok(orig),     // verifier didn't touch this macro → keep candidate's
+            Some(_) => Err(()), // a bad corrected value is not trivially safe
+            None => Ok(orig),   // verifier didn't touch this macro → keep candidate's
         }
     };
     let corrected = FoodEntry {
@@ -660,7 +682,11 @@ pub fn sum_food_csv_for_date(food_csv: &str, date: &str) -> MacroTotals {
         Err(_) => return MacroTotals::default(),
     };
     let cell = |rec: &csv::StringRecord, name: &str| -> String {
-        idx.get(name).and_then(|&j| rec.get(j)).unwrap_or("").trim().to_string()
+        idx.get(name)
+            .and_then(|&j| rec.get(j))
+            .unwrap_or("")
+            .trim()
+            .to_string()
     };
     let num = |s: &str| s.parse::<f64>().unwrap_or(0.0);
     let mut t = MacroTotals::default();
@@ -727,7 +753,11 @@ pub fn targets_for_date(targets_csv: &str, date: &str) -> DietTargets {
             .and_then(|s| s.parse::<f64>().ok())
     };
     for rec in rdr.records().flatten() {
-        let d = idx.get("Date").and_then(|&j| rec.get(j)).unwrap_or("").trim();
+        let d = idx
+            .get("Date")
+            .and_then(|&j| rec.get(j))
+            .unwrap_or("")
+            .trim();
         if d == date {
             return DietTargets {
                 cal: get(&rec, "Cal_Target"),
@@ -747,7 +777,9 @@ const BAR_WIDTH: usize = 20;
 /// with a single color emoji per the metric's goal type. `filled` uses `⬜` for the
 /// empty remainder.
 fn bar(pct: f64, color: &str) -> String {
-    let filled = ((pct / 100.0) * BAR_WIDTH as f64).round().clamp(0.0, BAR_WIDTH as f64) as usize;
+    let filled = ((pct / 100.0) * BAR_WIDTH as f64)
+        .round()
+        .clamp(0.0, BAR_WIDTH as f64) as usize;
     let mut s = String::new();
     for _ in 0..filled {
         s.push_str(color);
@@ -822,7 +854,10 @@ pub fn render_diet_dashboard(date: &str, totals: &MacroTotals, targets: &DietTar
                 pct
             ));
         }
-        None => out.push_str(&format!("Cal          {} kcal\n", totals.kcal.round() as i64)),
+        None => out.push_str(&format!(
+            "Cal          {} kcal\n",
+            totals.kcal.round() as i64
+        )),
     }
 
     // Floor metrics: protein, carbs, fiber.
@@ -891,7 +926,10 @@ impl AppendSnapshot {
                 None => std::fs::remove_file(path),
             };
             if let Err(e) = r {
-                eprintln!("jesse-bridge: diet rollback failed for {}: {e}", path.display());
+                eprintln!(
+                    "jesse-bridge: diet rollback failed for {}: {e}",
+                    path.display()
+                );
             }
         }
     }
@@ -926,7 +964,9 @@ pub fn append_rows_atomic(
         ("exercise-log.csv", exercise),
         ("weight-log.csv", weight),
     ];
-    let mut snapshot = AppendSnapshot { restores: Vec::new() };
+    let mut snapshot = AppendSnapshot {
+        restores: Vec::new(),
+    };
     for (name, rows) in targets {
         if rows.is_empty() {
             continue;
@@ -1197,7 +1237,8 @@ CANDIDATES:\n{candidates_json}"
 /// Serialize validated entries back to the compact JSON the verify prompt embeds.
 pub fn entries_to_json(entries: &[DietEntry]) -> String {
     let arr: Vec<Value> = entries.iter().map(entry_to_value).collect();
-    serde_json::to_string(&json!({ "entries": arr })).unwrap_or_else(|_| "{\"entries\":[]}".to_string())
+    serde_json::to_string(&json!({ "entries": arr }))
+        .unwrap_or_else(|_| "{\"entries\":[]}".to_string())
 }
 
 fn entry_to_value(e: &DietEntry) -> Value {
@@ -1315,18 +1356,28 @@ pub async fn run_diet_pipeline(cfg: &Config, utterance: &str) -> DietPipelineOut
     };
 
     // Stage 1 — extract.
-    let extract_raw = match run_diet_extract(cfg, &build_diet_extract_prompt(utterance), DIET_EXTRACT_TIMEOUT_SECS).await {
+    let extract_raw = match run_diet_extract(
+        cfg,
+        &build_diet_extract_prompt(utterance),
+        DIET_EXTRACT_TIMEOUT_SECS,
+    )
+    .await
+    {
         Ok(s) => s,
         Err(_) => {
             prov(false, Some(2), "n/a", 0, false);
-            return DietPipelineOutcome::FallThrough { rung: DietRung::Child };
+            return DietPipelineOutcome::FallThrough {
+                rung: DietRung::Child,
+            };
         }
     };
     let extract = match parse_diet_entries(&extract_raw) {
         Ok(e) if !e.no_loggable_content && !e.entries.is_empty() => e,
         _ => {
             prov(false, Some(2), "n/a", 0, false);
-            return DietPipelineOutcome::FallThrough { rung: DietRung::Child };
+            return DietPipelineOutcome::FallThrough {
+                rung: DietRung::Child,
+            };
         }
     };
 
@@ -1358,7 +1409,9 @@ pub async fn run_diet_pipeline(cfg: &Config, utterance: &str) -> DietPipelineOut
         Ok(v) => v,
         Err(_) => {
             prov(false, Some(3), "unavailable", extract.entries.len(), false);
-            return DietPipelineOutcome::FallThrough { rung: DietRung::Verify };
+            return DietPipelineOutcome::FallThrough {
+                rung: DietRung::Verify,
+            };
         }
     };
     let mut verified = Vec::with_capacity(extract.entries.len());
@@ -1375,11 +1428,17 @@ pub async fn run_diet_pipeline(cfg: &Config, utterance: &str) -> DietPipelineOut
                 // Any verify-stage fall-through (a reject, or a correction that wasn't
                 // trivially safe) is "rejected" for provenance — the turn is not logged.
                 prov(false, Some(3), "rejected", extract.entries.len(), false);
-                return DietPipelineOutcome::FallThrough { rung: DietRung::Verify };
+                return DietPipelineOutcome::FallThrough {
+                    rung: DietRung::Verify,
+                };
             }
         }
     }
-    let verify_word = if any_corrected { "corrected" } else { "approved" };
+    let verify_word = if any_corrected {
+        "corrected"
+    } else {
+        "approved"
+    };
 
     // Stage 3 — append + hooks + commit (atomic per turn).
     let (food, exercise, weight) = split_entries(&verified);
@@ -1395,20 +1454,26 @@ pub async fn run_diet_pipeline(cfg: &Config, utterance: &str) -> DietPipelineOut
         Err(e) => {
             eprintln!("jesse-bridge: diet append failed: {e}");
             prov(false, Some(4), verify_word, verified.len(), false);
-            return DietPipelineOutcome::FallThrough { rung: DietRung::Append };
+            return DietPipelineOutcome::FallThrough {
+                rung: DietRung::Append,
+            };
         }
     };
     if let Err(e) = run_diet_hooks(vault).await {
         eprintln!("jesse-bridge: diet hooks failed: {e}");
         snapshot.rollback();
         prov(false, Some(4), verify_word, verified.len(), false);
-        return DietPipelineOutcome::FallThrough { rung: DietRung::Append };
+        return DietPipelineOutcome::FallThrough {
+            rung: DietRung::Append,
+        };
     }
     if let Err(e) = commit_diet_logs(vault, &date, &local_hhmm()).await {
         eprintln!("jesse-bridge: diet commit failed: {e}");
         snapshot.rollback();
         prov(false, Some(4), verify_word, verified.len(), false);
-        return DietPipelineOutcome::FallThrough { rung: DietRung::Append };
+        return DietPipelineOutcome::FallThrough {
+            rung: DietRung::Append,
+        };
     }
 
     // Stage 4 — dashboard + mirror. Both are DERIVED from the committed CSVs: the
@@ -1494,7 +1559,10 @@ mod tests {
     #[test]
     fn parse_rejects_an_aggregated_food_entry() {
         let json = r#"{"entries":[{"kind":"food","name":"Eggs and toast","meal":"Breakfast","time":"08:00","kcal":300}]}"#;
-        assert!(parse_diet_entries(json).is_err(), "aggregated name must reject");
+        assert!(
+            parse_diet_entries(json).is_err(),
+            "aggregated name must reject"
+        );
     }
 
     // ---- Extract parsing ---------------------------------------------------
@@ -1548,9 +1616,13 @@ mod tests {
     #[test]
     fn parse_enforces_entry_cap() {
         let one = r#"{"kind":"food","name":"x","meal":"Snack","time":"09:00","kcal":1}"#;
-        let over = std::iter::repeat_n(one, MAX_DIET_ENTRIES + 1).collect::<Vec<_>>().join(",");
+        let over = std::iter::repeat_n(one, MAX_DIET_ENTRIES + 1)
+            .collect::<Vec<_>>()
+            .join(",");
         assert!(parse_diet_entries(&format!("{{\"entries\":[{over}]}}")).is_err());
-        let at = std::iter::repeat_n(one, MAX_DIET_ENTRIES).collect::<Vec<_>>().join(",");
+        let at = std::iter::repeat_n(one, MAX_DIET_ENTRIES)
+            .collect::<Vec<_>>()
+            .join(",");
         assert!(parse_diet_entries(&format!("{{\"entries\":[{at}]}}")).is_ok());
     }
 
@@ -1559,7 +1631,11 @@ mod tests {
         let json = r#"{"entries":[{"kind":"weight","weight_kg":90.0}]}"#;
         let ex = parse_diet_entries(json).unwrap();
         match &ex.entries[0] {
-            DietEntry::Weight(w) => assert!((w.weight_lbs - 198.4).abs() < 0.1, "kg→lbs: {}", w.weight_lbs),
+            DietEntry::Weight(w) => assert!(
+                (w.weight_lbs - 198.4).abs() < 0.1,
+                "kg→lbs: {}",
+                w.weight_lbs
+            ),
             other => panic!("expected weight, got {other:?}"),
         }
     }
@@ -1576,15 +1652,27 @@ mod tests {
     #[test]
     fn tolerance_20pct_arm_dominates_for_large_items() {
         // reference 1000 → 20% = 200 > 75, so the relative arm wins.
-        assert!(!kcal_out_of_band(1180.0, 1000.0), "180 diff ≤ 200 → in band");
-        assert!(kcal_out_of_band(1210.0, 1000.0), "210 diff > 200 → out of band");
+        assert!(
+            !kcal_out_of_band(1180.0, 1000.0),
+            "180 diff ≤ 200 → in band"
+        );
+        assert!(
+            kcal_out_of_band(1210.0, 1000.0),
+            "210 diff > 200 → out of band"
+        );
     }
 
     #[test]
     fn tolerance_boundary_is_inclusive_in_band() {
         // Exactly at the threshold (the larger arm) is IN band ("more than").
-        assert!(!kcal_out_of_band(275.0, 200.0), "diff == 75 exactly → in band");
-        assert!(!kcal_out_of_band(1200.0, 1000.0), "diff == 200 (20%) exactly → in band");
+        assert!(
+            !kcal_out_of_band(275.0, 200.0),
+            "diff == 75 exactly → in band"
+        );
+        assert!(
+            !kcal_out_of_band(1200.0, 1000.0),
+            "diff == 200 (20%) exactly → in band"
+        );
     }
 
     // ---- Verify verdict handling -------------------------------------------
@@ -1644,7 +1732,11 @@ mod tests {
             Some(DietEntry::Food(f)) => {
                 assert_eq!(f.kcal, Some(120.0));
                 assert_eq!(f.name, "Banana", "item identity unchanged (trivially safe)");
-                assert_eq!(f.carbs_g, Some(27.0), "untouched macro keeps candidate value");
+                assert_eq!(
+                    f.carbs_g,
+                    Some(27.0),
+                    "untouched macro keeps candidate value"
+                );
             }
             other => panic!("expected correction, got {other:?}"),
         }
@@ -1652,7 +1744,10 @@ mod tests {
 
     #[test]
     fn reject_falls_through_to_hosted() {
-        assert_eq!(resolve_verdict(&food(105.0), &verdict(Verdict::Reject, None)), None);
+        assert_eq!(
+            resolve_verdict(&food(105.0), &verdict(Verdict::Reject, None)),
+            None
+        );
     }
 
     #[test]
@@ -1666,7 +1761,10 @@ mod tests {
     fn parse_verify_verdicts_requires_one_per_entry() {
         let json = r#"{"verdicts":[{"verdict":"approve"},{"verdict":"reject"}]}"#;
         assert_eq!(parse_verify_verdicts(json, 2).unwrap().len(), 2);
-        assert!(parse_verify_verdicts(json, 3).is_err(), "count mismatch rejects");
+        assert!(
+            parse_verify_verdicts(json, 3).is_err(),
+            "count mismatch rejects"
+        );
         assert!(parse_verify_verdicts("nope", 2).is_err());
     }
 
@@ -1689,7 +1787,9 @@ mod tests {
         };
         let row = food_row(&e, "2026-07-13");
         // RFC-4180: the item's comma forces quoting; the row parses back to 15 fields.
-        let mut rdr = csv::ReaderBuilder::new().has_headers(false).from_reader(row.as_bytes());
+        let mut rdr = csv::ReaderBuilder::new()
+            .has_headers(false)
+            .from_reader(row.as_bytes());
         let rec = rdr.records().next().unwrap().unwrap();
         assert_eq!(rec.len(), FOOD_LOG_HEADER.split(',').count(), "15 columns");
         assert_eq!(&rec[0], "2026-07-13");
@@ -1719,7 +1819,9 @@ mod tests {
             notes: None,
         };
         let row = food_row(&e, "2026-07-13");
-        let mut rdr = csv::ReaderBuilder::new().has_headers(false).from_reader(row.as_bytes());
+        let mut rdr = csv::ReaderBuilder::new()
+            .has_headers(false)
+            .from_reader(row.as_bytes());
         let rec = rdr.records().next().unwrap().unwrap();
         assert_eq!(&rec[7], "", "absent kcal → empty cell, not 0");
         assert_eq!(&rec[14], "", "absent fiber → empty cell");
@@ -1734,9 +1836,18 @@ mod tests {
         // what the append path writes. Assert the prompt carries each header verbatim
         // AND that each row builder emits exactly that many columns.
         let p = build_diet_extract_prompt("hi");
-        assert!(p.contains(FOOD_LOG_HEADER), "extract prompt must inline the food header");
-        assert!(p.contains(EXERCISE_LOG_HEADER), "extract prompt must inline the exercise header");
-        assert!(p.contains(WEIGHT_LOG_HEADER), "extract prompt must inline the weight header");
+        assert!(
+            p.contains(FOOD_LOG_HEADER),
+            "extract prompt must inline the food header"
+        );
+        assert!(
+            p.contains(EXERCISE_LOG_HEADER),
+            "extract prompt must inline the exercise header"
+        );
+        assert!(
+            p.contains(WEIGHT_LOG_HEADER),
+            "extract prompt must inline the weight header"
+        );
 
         let count = |row: &str| {
             csv::ReaderBuilder::new()
@@ -1749,22 +1860,48 @@ mod tests {
                 .len()
         };
         let f = FoodEntry {
-            name: "n".into(), meal: "Snack".into(), time: "09:00".into(),
-            amount: None, unit: None, kcal: Some(1.0), protein_g: None, carbs_g: None,
-            fat_g: None, fiber_g: None, notes: None,
+            name: "n".into(),
+            meal: "Snack".into(),
+            time: "09:00".into(),
+            amount: None,
+            unit: None,
+            kcal: Some(1.0),
+            protein_g: None,
+            carbs_g: None,
+            fat_g: None,
+            fiber_g: None,
+            notes: None,
         };
-        assert_eq!(count(&food_row(&f, "2026-07-13")), FOOD_LOG_HEADER.split(',').count());
+        assert_eq!(
+            count(&food_row(&f, "2026-07-13")),
+            FOOD_LOG_HEADER.split(',').count()
+        );
         let x = ExerciseEntry {
-            activity: "Run".into(), time: Some("06:00".into()), description: None,
-            distance_km: Some(5.0), duration: None, pace: None, avg_hr: None,
-            calories: None, notes: None,
+            activity: "Run".into(),
+            time: Some("06:00".into()),
+            description: None,
+            distance_km: Some(5.0),
+            duration: None,
+            pace: None,
+            avg_hr: None,
+            calories: None,
+            notes: None,
         };
-        assert_eq!(count(&exercise_row(&x, "2026-07-13")), EXERCISE_LOG_HEADER.split(',').count());
+        assert_eq!(
+            count(&exercise_row(&x, "2026-07-13")),
+            EXERCISE_LOG_HEADER.split(',').count()
+        );
         let w = WeightEntry {
-            weight_lbs: 198.0, weight_kg: None, body_fat_pct: None,
-            muscle_mass_lbs: None, notes: None,
+            weight_lbs: 198.0,
+            weight_kg: None,
+            body_fat_pct: None,
+            muscle_mass_lbs: None,
+            notes: None,
         };
-        assert_eq!(count(&weight_row(&w, "2026-07-13")), WEIGHT_LOG_HEADER.split(',').count());
+        assert_eq!(
+            count(&weight_row(&w, "2026-07-13")),
+            WEIGHT_LOG_HEADER.split(',').count()
+        );
     }
 
     // ---- Mirror builder ----------------------------------------------------
@@ -1787,7 +1924,10 @@ mod tests {
 
     #[test]
     fn mirror_is_one_meal_per_row_with_row_equal_macros() {
-        let rows = vec![f("Banana", "Snack", "10:40", 105.0), f("Almonds", "Snack", "10:40", 116.0)];
+        let rows = vec![
+            f("Banana", "Snack", "10:40", 105.0),
+            f("Almonds", "Snack", "10:40", 116.0),
+        ];
         let ml = build_meal_log_from_food_rows(&rows, "2026-07-13", "+02:00")
             .unwrap()
             .expect("two rows → a mirror");
@@ -1819,7 +1959,9 @@ mod tests {
             fiber_g: None,
             notes: None,
         };
-        let ml = build_meal_log_from_food_rows(&[e], "2026-07-13", "+02:00").unwrap().unwrap();
+        let ml = build_meal_log_from_food_rows(&[e], "2026-07-13", "+02:00")
+            .unwrap()
+            .unwrap();
         let m = &ml.meals[0];
         assert_eq!(m.kcal, Some(180.0));
         assert_eq!(m.carbs_g, Some(32.0));
@@ -1828,7 +1970,9 @@ mod tests {
 
     #[test]
     fn mirror_none_when_no_food_rows() {
-        assert!(build_meal_log_from_food_rows(&[], "2026-07-13", "+02:00").unwrap().is_none());
+        assert!(build_meal_log_from_food_rows(&[], "2026-07-13", "+02:00")
+            .unwrap()
+            .is_none());
     }
 
     #[test]
@@ -1855,7 +1999,10 @@ mod tests {
         assert_eq!(t.fat, Some(65.0));
         assert_eq!(t.fiber, Some(38.0));
         // A date with no row → all None.
-        assert_eq!(targets_for_date(TARGETS_CSV, "2026-01-01"), DietTargets::default());
+        assert_eq!(
+            targets_for_date(TARGETS_CSV, "2026-01-01"),
+            DietTargets::default()
+        );
     }
 
     #[test]
@@ -1869,7 +2016,11 @@ mod tests {
              2026-07-12,Snack,Banana,1,ea,,,105,1,0,27,,10:00,Snack,3\n"
         );
         let t = sum_food_csv_for_date(&csv, "2026-07-13");
-        assert_eq!(t.kcal, 210.0 + 195.0, "explicit 210 + derived 130*150/100=195");
+        assert_eq!(
+            t.kcal,
+            210.0 + 195.0,
+            "explicit 210 + derived 130*150/100=195"
+        );
         assert_eq!(t.protein_g, 21.0); // 18 + 3
         assert_eq!(t.carbs_g, 29.0); // 1 + 28
         assert_eq!(t.fiber_g, 0.0, "blank fiber counts as 0");
@@ -1889,12 +2040,18 @@ mod tests {
         let t = targets_for_date(TARGETS_CSV, "2026-07-13");
         let dash = render_diet_dashboard("2026-07-13", &totals, &t);
         assert!(dash.contains("2026-07-13"), "header carries the date");
-        assert!(dash.contains("315") && dash.contains("2100"), "cal intake / target: {dash}");
+        assert!(
+            dash.contains("315") && dash.contains("2100"),
+            "cal intake / target: {dash}"
+        );
         assert!(dash.contains("190"), "protein target shown");
         // 315/2100 = 15% → calorie ceiling is comfortably green.
         assert!(dash.contains("🟩"), "a green bar should appear");
         // A floor metric well under 50% shows red.
-        assert!(dash.contains("🟥"), "protein 20/190 (11%) is a red floor bar");
+        assert!(
+            dash.contains("🟥"),
+            "protein 20/190 (11%) is a red floor bar"
+        );
     }
 
     // ---- Atomic append + rollback ------------------------------------------
@@ -1959,7 +2116,10 @@ mod tests {
         );
         // Never prints a token.
         let line = format_diet_provenance(true, None, "http://u", "m", "approved", 1, true);
-        assert!(!line.contains("token"), "provenance must never carry a token");
+        assert!(
+            !line.contains("token"),
+            "provenance must never carry a token"
+        );
     }
 
     // ---- Ladder rung mapping (pure decisions) ------------------------------
@@ -1970,7 +2130,8 @@ mod tests {
         // log" → the orchestrator treats them as rung 2 (fall through). Proven at the
         // parse layer the orchestrator keys off.
         assert!(parse_diet_entries("garbage").is_err());
-        let nologgable = parse_diet_entries(r#"{"no_loggable_content":true,"entries":[]}"#).unwrap();
+        let nologgable =
+            parse_diet_entries(r#"{"no_loggable_content":true,"entries":[]}"#).unwrap();
         assert!(nologgable.no_loggable_content || nologgable.entries.is_empty());
     }
 

@@ -57,8 +57,17 @@ mod tests {
     }
     #[test]
     fn bind_allow_public_permits_everything() {
-        for a in ["0.0.0.0", "192.168.1.10", "8.8.8.8", "example.com", "127.0.0.1"] {
-            assert!(is_bind_allowed(a, true), "{a} should be allowed when public");
+        for a in [
+            "0.0.0.0",
+            "192.168.1.10",
+            "8.8.8.8",
+            "example.com",
+            "127.0.0.1",
+        ] {
+            assert!(
+                is_bind_allowed(a, true),
+                "{a} should be allowed when public"
+            );
         }
     }
 }

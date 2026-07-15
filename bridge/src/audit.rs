@@ -115,7 +115,10 @@ pub fn aggregate(records: &[&MetricsRecord]) -> AuditAgg {
                 *emergency_by_class.entry(cls.clone()).or_default() += 1;
             }
         }
-        if r.badge.as_deref().is_some_and(|b| b.contains("verify queued")) {
+        if r.badge
+            .as_deref()
+            .is_some_and(|b| b.contains("verify queued"))
+        {
             diet_queued += 1;
         }
         walls.push(r.wall_ms);
@@ -179,13 +182,19 @@ pub fn tripwires(agg: &AuditAgg, inp: &TripwireInputs) -> Vec<String> {
             inp.injection_leaks
         ));
     }
-    if inp.emergency_active_age_secs.is_some_and(|a| a > TRIPWIRE_AGE_SECS) {
+    if inp
+        .emergency_active_age_secs
+        .is_some_and(|a| a > TRIPWIRE_AGE_SECS)
+    {
         out.push(format!(
             "TRIPWIRE: emergency mode has been active for more than 24h ({}s)",
             inp.emergency_active_age_secs.unwrap()
         ));
     }
-    if inp.oldest_pending_age_secs.is_some_and(|a| a > TRIPWIRE_AGE_SECS) {
+    if inp
+        .oldest_pending_age_secs
+        .is_some_and(|a| a > TRIPWIRE_AGE_SECS)
+    {
         out.push(format!(
             "TRIPWIRE: diet verify-replay backlog older than 24h ({}s) — hosted may be stuck down",
             inp.oldest_pending_age_secs.unwrap()
@@ -203,13 +212,19 @@ mod tests {
 
     // A fixture day of metrics JSONL — the exact shape the bridge writes.
     const FIXTURE: &str = concat!(
-        r#"{"ts":"2026-07-15T08:00:00Z","turn_id":"a","mode":"ask","route":"vaultqa-local","model":"local-oss","rung":0,"wall_ms":12000,"citations":1,"validator":"ok","badge":"[local · vault · local-oss]","emergency":false}"#, "\n",
-        r#"{"ts":"2026-07-15T08:05:00Z","turn_id":"b","mode":"ask","route":"hosted","model":"claude","rung":3,"wall_ms":20000,"badge":"[hosted · claude]","emergency":false}"#, "\n",
-        r#"{"ts":"2026-07-15T09:00:00Z","turn_id":"c","mode":"ask","route":"emergency-local","model":"local-oss","rung":0,"wall_ms":40000,"validator":"advisory-fail","badge":"[local · emergency · local-oss]","emergency":true,"hosted_failure_class":"network"}"#, "\n",
-        r#"{"ts":"2026-07-15T10:00:00Z","turn_id":"d","mode":"tell","route":"diet-local","model":"local-diet","rung":0,"wall_ms":8000,"badge":"[local · diet · local-diet + hosted verify]","emergency":false}"#, "\n",
-        r#"{"ts":"2026-07-15T11:00:00Z","turn_id":"e","mode":"tell","route":"emergency-local","model":"local-diet","rung":0,"wall_ms":6000,"badge":"[local · diet · local-diet + verify queued]","emergency":true,"hosted_failure_class":"timeout"}"#, "\n",
+        r#"{"ts":"2026-07-15T08:00:00Z","turn_id":"a","mode":"ask","route":"vaultqa-local","model":"local-oss","rung":0,"wall_ms":12000,"citations":1,"validator":"ok","badge":"[local · vault · local-oss]","emergency":false}"#,
+        "\n",
+        r#"{"ts":"2026-07-15T08:05:00Z","turn_id":"b","mode":"ask","route":"hosted","model":"claude","rung":3,"wall_ms":20000,"badge":"[hosted · claude]","emergency":false}"#,
+        "\n",
+        r#"{"ts":"2026-07-15T09:00:00Z","turn_id":"c","mode":"ask","route":"emergency-local","model":"local-oss","rung":0,"wall_ms":40000,"validator":"advisory-fail","badge":"[local · emergency · local-oss]","emergency":true,"hosted_failure_class":"network"}"#,
+        "\n",
+        r#"{"ts":"2026-07-15T10:00:00Z","turn_id":"d","mode":"tell","route":"diet-local","model":"local-diet","rung":0,"wall_ms":8000,"badge":"[local · diet · local-diet + hosted verify]","emergency":false}"#,
+        "\n",
+        r#"{"ts":"2026-07-15T11:00:00Z","turn_id":"e","mode":"tell","route":"emergency-local","model":"local-diet","rung":0,"wall_ms":6000,"badge":"[local · diet · local-diet + verify queued]","emergency":true,"hosted_failure_class":"timeout"}"#,
+        "\n",
         // A record from a DIFFERENT day — must be excluded by the timestamp watermark.
-        r#"{"ts":"2026-07-14T23:59:00Z","turn_id":"old","mode":"ask","route":"hosted","rung":2,"wall_ms":99000,"emergency":false}"#, "\n",
+        r#"{"ts":"2026-07-14T23:59:00Z","turn_id":"old","mode":"ask","route":"hosted","rung":2,"wall_ms":99000,"emergency":false}"#,
+        "\n",
         // A malformed line — must be skipped, never sink the audit.
         "not json at all",
     );
@@ -221,7 +236,11 @@ mod tests {
     #[test]
     fn timestamp_watermark_selects_only_the_target_day() {
         let all = day();
-        assert_eq!(all.len(), 6, "malformed line skipped, 6 valid records parsed");
+        assert_eq!(
+            all.len(),
+            6,
+            "malformed line skipped, 6 valid records parsed"
+        );
         let today = records_for_date(&all, "2026-07-15");
         assert_eq!(today.len(), 5, "the 2026-07-14 record is excluded by ts");
         assert!(today.iter().all(|r| r.ts.starts_with("2026-07-15")));
@@ -287,6 +306,9 @@ mod tests {
             emergency_active_age_secs: Some(TRIPWIRE_AGE_SECS - 1),
             ..Default::default()
         };
-        assert!(tripwires(&agg, &inp2).is_empty(), "under-24h ages are not tripwires");
+        assert!(
+            tripwires(&agg, &inp2).is_empty(),
+            "under-24h ages are not tripwires"
+        );
     }
 }

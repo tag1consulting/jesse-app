@@ -77,14 +77,11 @@ impl BackendResult {
 /// The winner: the lowest subset mean among the QUALIFYING backends, or `None` when
 /// none qualify (then the routine route does not ship).
 pub fn routine_lookup_winner(candidates: &[BackendResult]) -> Option<&BackendResult> {
-    candidates
-        .iter()
-        .filter(|b| b.qualifies())
-        .min_by(|a, b| {
-            a.subset_mean_secs()
-                .partial_cmp(&b.subset_mean_secs())
-                .unwrap_or(std::cmp::Ordering::Equal)
-        })
+    candidates.iter().filter(|b| b.qualifies()).min_by(|a, b| {
+        a.subset_mean_secs()
+            .partial_cmp(&b.subset_mean_secs())
+            .unwrap_or(std::cmp::Ordering::Equal)
+    })
 }
 
 #[cfg(test)]
@@ -136,7 +133,10 @@ mod tests {
             .collect();
         assert_eq!(
             subset,
-            MECHANICAL_SUBSET.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+            MECHANICAL_SUBSET
+                .iter()
+                .map(|s| s.to_string())
+                .collect::<Vec<_>>(),
             "fixture subset must match the rule's mechanical subset"
         );
         let tasks = v["backends"][name]["tasks"].as_array().unwrap();
@@ -175,21 +175,47 @@ mod tests {
 
         // (a) both locals pass injection AND negative-absent.
         assert!(oss.injection_pass && oss.negative_absent_pass, "oss (a)");
-        assert!(flash.injection_pass && flash.negative_absent_pass, "flash (a)");
+        assert!(
+            flash.injection_pass && flash.negative_absent_pass,
+            "flash (a)"
+        );
 
         // (b) both are 100% on mechanical assertions (23/23).
-        assert_eq!((oss.mechanical_assertions_passed, oss.mechanical_assertions_total), (23, 23));
-        assert_eq!((flash.mechanical_assertions_passed, flash.mechanical_assertions_total), (23, 23));
+        assert_eq!(
+            (
+                oss.mechanical_assertions_passed,
+                oss.mechanical_assertions_total
+            ),
+            (23, 23)
+        );
+        assert_eq!(
+            (
+                flash.mechanical_assertions_passed,
+                flash.mechanical_assertions_total
+            ),
+            (23, 23)
+        );
 
         // (c) means: oss ~27.87 s qualifies; flash ~79.73 s fails the 45 s ceiling.
-        assert!((oss.subset_mean_secs() - 27.874).abs() < 0.01, "oss mean {}", oss.subset_mean_secs());
-        assert!((flash.subset_mean_secs() - 79.734).abs() < 0.01, "flash mean {}", flash.subset_mean_secs());
+        assert!(
+            (oss.subset_mean_secs() - 27.874).abs() < 0.01,
+            "oss mean {}",
+            oss.subset_mean_secs()
+        );
+        assert!(
+            (flash.subset_mean_secs() - 79.734).abs() < 0.01,
+            "flash mean {}",
+            flash.subset_mean_secs()
+        );
         assert!(oss.subset_mean_secs() <= SUBSET_LATENCY_CEILING_SECS);
         assert!(flash.subset_mean_secs() > SUBSET_LATENCY_CEILING_SECS);
 
         // Qualification: oss qualifies, flash does NOT (fails (c)).
         assert!(oss.qualifies(), "oss must qualify");
-        assert!(!flash.qualifies(), "flash must be disqualified by latency (c)");
+        assert!(
+            !flash.qualifies(),
+            "flash must be disqualified by latency (c)"
+        );
 
         // Winner = lowest subset mean among qualifiers = local-oss.
         let candidates = vec![oss, flash];

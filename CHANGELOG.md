@@ -15,7 +15,19 @@ CI both run it). See the "Versioning" section of `bridge/README.md`.
 
 ## [Unreleased]
 
-## [Bridge 0.12.0] — 2026-07-15
+## [Bridge 0.12.1] — 2026-07-15
+
+### Added
+- **Four reconstructed micronutrients on past-day meals.** `food-log.csv` gained four
+  trailing columns — `Sodium_mg`, `SatFat_g`, `Sugar_g`, `Potassium_mg`. On a
+  RECONSTRUCTED past day (`GET /jesse/diet?date=…` with no archived copy), each meal
+  item now carries `na`, `satf`, `sug`, and `k` built from those columns in
+  `reconstruct_meals` (`bridge/src/diet.rs`), addressed by header **name** (the log is
+  ragged). Unlike `fiber`/`p`/`f`/`c`, a blank or unparseable cell stays JSON `null`
+  (via `opt_num`), because for these a blank means **unknown**, not zero. The TODAY
+  pass-through path already forwards `diet-today.js` verbatim, so it needed no change;
+  a legacy short row that predates the new columns still parses (the missing cells read
+  `null`, not malformed). Reconstructed days carry no targets, so no target work.
 
 ### Added
 - **Structured provenance on every delivered reply (model-badge v2).** Alongside the

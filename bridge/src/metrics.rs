@@ -152,10 +152,16 @@ mod tests {
         let line = serde_json::to_string(&rec).unwrap();
         assert!(!line.contains('\n'), "one line, no embedded newline");
         // Route serializes to the kebab string the audit aggregates on.
-        assert!(line.contains("\"route\":\"vaultqa-local\""), "route kebab: {line}");
+        assert!(
+            line.contains("\"route\":\"vaultqa-local\""),
+            "route kebab: {line}"
+        );
         // Never carries content/token fields.
         for forbidden in ["question", "answer", "tokens", "text"] {
-            assert!(!line.contains(forbidden), "line must not carry {forbidden:?}: {line}");
+            assert!(
+                !line.contains(forbidden),
+                "line must not carry {forbidden:?}: {line}"
+            );
         }
         let back: MetricsRecord = serde_json::from_str(&line).unwrap();
         assert_eq!(back, rec, "round-trip identity");
@@ -179,7 +185,8 @@ mod tests {
         // choosing a path we never configure and asserting it is never created.
         let mut cfg = crate::testutil::test_config();
         cfg.metrics_log = None;
-        let sentinel = std::env::temp_dir().join(format!("jesse-metrics-unset-{}.jsonl", random_hex()));
+        let sentinel =
+            std::env::temp_dir().join(format!("jesse-metrics-unset-{}.jsonl", random_hex()));
         assert!(!sentinel.exists());
         append_metrics_line(&cfg, &sample());
         assert!(!sentinel.exists(), "unset metrics_log must touch no file");

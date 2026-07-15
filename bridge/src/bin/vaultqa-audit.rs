@@ -20,8 +20,8 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 
 use jesse_bridge::{
-    aggregate, parse_metrics_lines, records_for_date, route_key, tripwires, validate_vaultqa_answer,
-    AuditAgg, Config, DietQueue, TripwireInputs, TRIPWIRE_AGE_SECS,
+    aggregate, parse_metrics_lines, records_for_date, route_key, tripwires,
+    validate_vaultqa_answer, AuditAgg, Config, DietQueue, TripwireInputs, TRIPWIRE_AGE_SECS,
 };
 
 /// One joined (question, answer) pair recovered from the serving logs for a turn, so
@@ -87,7 +87,9 @@ fn rfc3339_to_epoch(s: &str) -> Option<i64> {
 /// citation re-validation, and re-answer are then reported as skipped).
 fn load_serving_join() -> HashMap<String, (String, String)> {
     let mut map = HashMap::new();
-    let Some(path) = std::env::var("JESSE_AUDIT_SERVING_LOG").ok().filter(|s| !s.trim().is_empty())
+    let Some(path) = std::env::var("JESSE_AUDIT_SERVING_LOG")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
     else {
         return map;
     };
@@ -105,14 +107,18 @@ fn load_serving_join() -> HashMap<String, (String, String)> {
 
 /// An injection-style leak marker: a lone `PWNED` line, the suite's canary.
 fn has_injection_leak(answer: &str) -> bool {
-    answer.lines().any(|l| l.trim().eq_ignore_ascii_case("PWNED"))
+    answer
+        .lines()
+        .any(|l| l.trim().eq_ignore_ascii_case("PWNED"))
 }
 
 fn main() {
     let date = std::env::args().nth(1).unwrap_or_else(today);
 
     // The metrics log is the audit's spine. Unset → nothing to audit.
-    let Some(metrics_path) = std::env::var("JESSE_METRICS_LOG").ok().filter(|s| !s.trim().is_empty())
+    let Some(metrics_path) = std::env::var("JESSE_METRICS_LOG")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
     else {
         eprintln!("vaultqa-audit: JESSE_METRICS_LOG is not set — nothing to audit.");
         std::process::exit(0);
@@ -198,11 +204,27 @@ fn main() {
     };
 
     let md = render_markdown(
-        &date, &agg, &fired, &pending, &rejected, oldest_pending_age, revalidated, invented, leaks,
-        &judge_note, join.is_empty(),
+        &date,
+        &agg,
+        &fired,
+        &pending,
+        &rejected,
+        oldest_pending_age,
+        revalidated,
+        invented,
+        leaks,
+        &judge_note,
+        join.is_empty(),
     );
     let json = render_json(
-        &date, &agg, &fired, pending.len(), rejected.len(), oldest_pending_age, revalidated, invented,
+        &date,
+        &agg,
+        &fired,
+        pending.len(),
+        rejected.len(),
+        oldest_pending_age,
+        revalidated,
+        invented,
         leaks,
     );
 
@@ -228,7 +250,10 @@ fn main() {
         std::process::exit(1);
     }
     if let Err(e) = std::fs::write(&json_path, &json) {
-        eprintln!("vaultqa-audit: could not write {}: {e}", json_path.display());
+        eprintln!(
+            "vaultqa-audit: could not write {}: {e}",
+            json_path.display()
+        );
         std::process::exit(1);
     }
     println!(
@@ -275,7 +300,11 @@ fn render_markdown(
     s.push_str(&format!("- hosted fall-through: {}\n", agg.hosted_fallback));
     s.push_str("\n### Per-rung fall-through\n\n");
     for (rung, n) in &agg.rung_counts {
-        let label = if *rung == 0 { "0 (local success)" } else { "fall-through" };
+        let label = if *rung == 0 {
+            "0 (local success)"
+        } else {
+            "fall-through"
+        };
         s.push_str(&format!("- rung {rung} [{label}]: {n}\n"));
     }
     s.push_str("\n### Per-route\n\n");
@@ -288,7 +317,10 @@ fn render_markdown(
     s.push_str(&format!("- p95: {} ms\n", agg.latency_p95_ms));
 
     s.push_str("\n## Validator\n\n");
-    s.push_str(&format!("- validator failures (fail/advisory-fail): {}\n", agg.validator_failures));
+    s.push_str(&format!(
+        "- validator failures (fail/advisory-fail): {}\n",
+        agg.validator_failures
+    ));
 
     s.push_str("\n## Emergency\n\n");
     s.push_str(&format!("- activations: {}\n", agg.emergency_activations));
@@ -297,13 +329,23 @@ fn render_markdown(
     }
 
     s.push_str("\n## Diet verify queue\n\n");
-    s.push_str(&format!("- queued this day (metrics): {}\n", agg.diet_queued));
+    s.push_str(&format!(
+        "- queued this day (metrics): {}\n",
+        agg.diet_queued
+    ));
     s.push_str(&format!("- pending now: {}\n", pending.len()));
-    s.push_str(&format!("- rejected on replay (file): {}\n", rejected.len()));
+    s.push_str(&format!(
+        "- rejected on replay (file): {}\n",
+        rejected.len()
+    ));
     if let Some(age) = oldest_pending_age {
         s.push_str(&format!(
             "- oldest pending age: {age}s{}\n",
-            if age > TRIPWIRE_AGE_SECS { "  ⚠ >24h" } else { "" }
+            if age > TRIPWIRE_AGE_SECS {
+                "  ⚠ >24h"
+            } else {
+                ""
+            }
         ));
     }
 

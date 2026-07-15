@@ -2,10 +2,10 @@ use crate::*;
 
 #[derive(Deserialize)]
 pub struct JesseRequest {
-    mode: String,                 // "ask" | "tell"
+    mode: String, // "ask" | "tell"
     text: String,
     #[serde(default)]
-    session_id: Option<String>,   // set to continue a thread (a followup)
+    session_id: Option<String>, // set to continue a thread (a followup)
     #[serde(default)]
     voice: bool, // voice request → ask for a SPOKEN: summary line, keep it listenable
     // Optional per-request override of the active mode's wrapper instruction.
@@ -89,7 +89,11 @@ pub struct AskResult {
 
 /// Update the circuit breaker from a hosted attempt's outcome: a success resets it, a
 /// transport-class failure counts toward tripping it. Called only when emergency armed.
-fn update_breaker(breaker: &CircuitBreaker, out: &Result<(String, Option<String>, Option<Directives>), ApiError>, now: Instant) {
+fn update_breaker(
+    breaker: &CircuitBreaker,
+    out: &Result<(String, Option<String>, Option<Directives>), ApiError>,
+    now: Instant,
+) {
     match out {
         Ok(_) => breaker.record_success(),
         Err(e) => {
@@ -102,7 +106,11 @@ fn update_breaker(breaker: &CircuitBreaker, out: &Result<(String, Option<String>
 
 /// The validator string for a metrics line from an emergency outcome.
 fn emergency_validator(validator_ok: bool) -> String {
-    if validator_ok { "ok".to_string() } else { "advisory-fail".to_string() }
+    if validator_ok {
+        "ok".to_string()
+    } else {
+        "advisory-fail".to_string()
+    }
 }
 
 /// Resolve an ASK turn: attempt the hosted turn (unless the breaker is open and
@@ -125,10 +133,7 @@ pub async fn run_ask_hosted_or_emergency(
     hosted_model: Option<String>,
 ) -> AskResult {
     let now = Instant::now();
-    let vaultqa_model = cfg
-        .vaultqa_backend
-        .as_ref()
-        .map(|(_, _, m)| m.clone());
+    let vaultqa_model = cfg.vaultqa_backend.as_ref().map(|(_, _, m)| m.clone());
     let base_url = cfg
         .vaultqa_backend
         .as_ref()
@@ -139,7 +144,11 @@ pub async fn run_ask_hosted_or_emergency(
     // returns None when the child hard-failed (caller decides the fallback).
     let emergency = |reason: String| async {
         match run_emergency_ask_pipeline(cfg, question, health_context).await {
-            EmergencyAskOutcome::Answered { text, citations, validator_ok } => {
+            EmergencyAskOutcome::Answered {
+                text,
+                citations,
+                validator_ok,
+            } => {
                 if let Some(model) = &vaultqa_model {
                     eprintln!("{}", format_emergency_provenance(&base_url, model, &reason));
                 }
@@ -221,7 +230,11 @@ pub async fn run_ask_hosted_or_emergency(
                 route: MetricsRoute::Hosted,
                 model: hosted_model,
                 emergency: false,
-                failclass: if emergency_armed { Some(cls.label().to_string()) } else { None },
+                failclass: if emergency_armed {
+                    Some(cls.label().to_string())
+                } else {
+                    None
+                },
                 citations: None,
                 validator: None,
                 citations_unverified: false,
@@ -458,12 +471,18 @@ pub async fn jesse(
         let (outcome, badge_source) = if try_diet {
             // Local diet pipeline: extract → verify → append → derive mirror.
             match run_diet_pipeline(&cfg, &raw_text).await {
-                DietPipelineOutcome::Logged { dashboard, directives } => {
+                DietPipelineOutcome::Logged {
+                    dashboard,
+                    directives,
+                } => {
                     // The blocking hosted verify succeeded → hosted is reachable.
                     hosted_succeeded = true;
                     route = MetricsRoute::DietLocal;
                     m_model = diet_model();
-                    (Ok((dashboard, None, Some(directives))), BadgeSource::DietVerify)
+                    (
+                        Ok((dashboard, None, Some(directives))),
+                        BadgeSource::DietVerify,
+                    )
                 }
                 DietPipelineOutcome::LoggedNoMirror { dashboard } => {
                     hosted_succeeded = true;
@@ -471,7 +490,13 @@ pub async fn jesse(
                     m_model = diet_model();
                     (Ok((dashboard, None, None)), BadgeSource::DietVerify)
                 }
-                DietPipelineOutcome::VerifyUnavailable { err, utterance, entries, date, offset } => {
+                DietPipelineOutcome::VerifyUnavailable {
+                    err,
+                    utterance,
+                    entries,
+                    date,
+                    offset,
+                } => {
                     let cls = classify_hosted_failure(&err);
                     // Emergency: hosted verify unreachable → the BRIDGE queues the
                     // extracted entry (never a model, never the CSV) for later verify.
@@ -493,14 +518,19 @@ pub async fn jesse(
                                 m_model = diet_model();
                                 m_emergency = true;
                                 m_failclass = Some(cls.label().to_string());
-                                (Ok((queued_reply_text(), None, None)), BadgeSource::DietQueued)
+                                (
+                                    Ok((queued_reply_text(), None, None)),
+                                    BadgeSource::DietQueued,
+                                )
                             }
                             Err(e) => {
                                 // Couldn't queue → today's behavior (run hosted).
                                 eprintln!("jesse-bridge: diet queue enqueue failed: {e} — hosted fallback");
                                 let out = run_hosted().await;
                                 hosted_succeeded = out.is_ok();
-                                if emergency_armed { update_breaker(&breaker, &out, Instant::now()); }
+                                if emergency_armed {
+                                    update_breaker(&breaker, &out, Instant::now());
+                                }
                                 m_rung = DietRung::Verify.num();
                                 (out, BadgeSource::Hosted)
                             }
@@ -510,7 +540,9 @@ pub async fn jesse(
                         // exactly FallThrough { rung: Verify } (run the hosted turn).
                         let out = run_hosted().await;
                         hosted_succeeded = out.is_ok();
-                        if emergency_armed { update_breaker(&breaker, &out, Instant::now()); }
+                        if emergency_armed {
+                            update_breaker(&breaker, &out, Instant::now());
+                        }
                         m_rung = DietRung::Verify.num();
                         (out, BadgeSource::Hosted)
                     }
@@ -518,7 +550,9 @@ pub async fn jesse(
                 DietPipelineOutcome::FallThrough { rung } => {
                     let out = run_hosted().await;
                     hosted_succeeded = out.is_ok();
-                    if emergency_armed { update_breaker(&breaker, &out, Instant::now()); }
+                    if emergency_armed {
+                        update_breaker(&breaker, &out, Instant::now());
+                    }
                     m_rung = rung.num();
                     (out, BadgeSource::Hosted)
                 }
@@ -538,11 +572,24 @@ pub async fn jesse(
                 VaultqaOutcome::FallThrough { rung } => {
                     m_rung = rung.num();
                     let r = run_ask_hosted_or_emergency(
-                        &cfg, &prompt, sid.as_deref(), &jobs, &jid, &raw_text,
-                        health_context.as_deref(), &breaker, emergency_armed, hosted_model.clone(),
-                    ).await;
-                    route = r.route; m_model = r.model; m_emergency = r.emergency;
-                    m_failclass = r.failclass; m_citations = r.citations; m_validator = r.validator;
+                        &cfg,
+                        &prompt,
+                        sid.as_deref(),
+                        &jobs,
+                        &jid,
+                        &raw_text,
+                        health_context.as_deref(),
+                        &breaker,
+                        emergency_armed,
+                        hosted_model.clone(),
+                    )
+                    .await;
+                    route = r.route;
+                    m_model = r.model;
+                    m_emergency = r.emergency;
+                    m_failclass = r.failclass;
+                    m_citations = r.citations;
+                    m_validator = r.validator;
                     m_citations_unverified = r.citations_unverified;
                     hosted_succeeded = r.hosted_succeeded;
                     (r.outcome, r.badge)
@@ -552,11 +599,24 @@ pub async fn jesse(
             // A plain (non-gated) ASK: emergency + breaker apply on a hosted transport
             // failure. With emergency disarmed this is byte-for-byte the old hosted path.
             let r = run_ask_hosted_or_emergency(
-                &cfg, &prompt, sid.as_deref(), &jobs, &jid, &raw_text,
-                health_context.as_deref(), &breaker, emergency_armed, hosted_model.clone(),
-            ).await;
-            route = r.route; m_model = r.model; m_emergency = r.emergency;
-            m_failclass = r.failclass; m_citations = r.citations; m_validator = r.validator;
+                &cfg,
+                &prompt,
+                sid.as_deref(),
+                &jobs,
+                &jid,
+                &raw_text,
+                health_context.as_deref(),
+                &breaker,
+                emergency_armed,
+                hosted_model.clone(),
+            )
+            .await;
+            route = r.route;
+            m_model = r.model;
+            m_emergency = r.emergency;
+            m_failclass = r.failclass;
+            m_citations = r.citations;
+            m_validator = r.validator;
             m_citations_unverified = r.citations_unverified;
             hosted_succeeded = r.hosted_succeeded;
             (r.outcome, r.badge)
@@ -566,7 +626,9 @@ pub async fn jesse(
             // still feeds it when emergency is armed.
             let out = run_hosted().await;
             hosted_succeeded = out.is_ok();
-            if emergency_armed { update_breaker(&breaker, &out, Instant::now()); }
+            if emergency_armed {
+                update_breaker(&breaker, &out, Instant::now());
+            }
             (out, BadgeSource::Hosted)
         };
         // Build the structured provenance (v2) from the SAME pre-finalize outcome and
@@ -577,7 +639,12 @@ pub async fn jesse(
         // the metrics line records); `m_citations_unverified` is the emergency advisory
         // verdict (always false off that route).
         let provenance = reply_provenance(
-            &outcome, &cfg, route, badge_source, m_model.clone(), hosted_model.as_deref(),
+            &outcome,
+            &cfg,
+            route,
+            badge_source,
+            m_model.clone(),
+            hosted_model.as_deref(),
             m_citations_unverified,
         );
         // Finalize the delivered reply: append the model badge (display only) at this
@@ -597,22 +664,25 @@ pub async fn jesse(
                 }
                 _ => None,
             };
-            append_metrics_line(&cfg, &MetricsRecord {
-                ts: rfc3339_utc(SystemTime::now()),
-                turn_id: jid.clone(),
-                mode: mode.clone(),
-                route,
-                model: m_model,
-                rung: m_rung,
-                wall_ms: turn_start.elapsed().as_millis() as u64,
-                ttft_ms: None,
-                tool_calls: None,
-                citations: m_citations,
-                validator: m_validator,
-                badge,
-                emergency: m_emergency,
-                hosted_failure_class: m_failclass,
-            });
+            append_metrics_line(
+                &cfg,
+                &MetricsRecord {
+                    ts: rfc3339_utc(SystemTime::now()),
+                    turn_id: jid.clone(),
+                    mode: mode.clone(),
+                    route,
+                    model: m_model,
+                    rung: m_rung,
+                    wall_ms: turn_start.elapsed().as_millis() as u64,
+                    ttft_ms: None,
+                    tool_calls: None,
+                    citations: m_citations,
+                    validator: m_validator,
+                    badge,
+                    emergency: m_emergency,
+                    hosted_failure_class: m_failclass,
+                },
+            );
         }
 
         jobs.complete_with_provenance(&jid, outcome, provenance);
@@ -701,9 +771,7 @@ pub async fn jesse_result(
             "directives": directives_to_value(&directives),
             "provenance": provenance_to_value(&provenance),
         }))),
-        Some(JobState::Failed { error }) => {
-            Ok(Json(json!({ "status": "failed", "error": error })))
-        }
+        Some(JobState::Failed { error }) => Ok(Json(json!({ "status": "failed", "error": error }))),
         Some(JobState::Cancelled) => Ok(Json(json!({ "status": "cancelled" }))),
         None => Err((
             StatusCode::NOT_FOUND,
@@ -729,7 +797,9 @@ pub async fn jesse_cancel(
     st.notify.take(&job_id);
     match st.jobs.cancel(&job_id) {
         CancelOutcome::Cancelled => {
-            eprintln!("cancel: job {job_id} aborted by client — claude killed, concurrency slot freed");
+            eprintln!(
+                "cancel: job {job_id} aborted by client — claude killed, concurrency slot freed"
+            );
         }
         CancelOutcome::AlreadyTerminal => {
             eprintln!("cancel: job {job_id} already finished — no-op");

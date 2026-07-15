@@ -83,8 +83,8 @@ pub fn extract_js_literal(content: &str) -> Result<Value, String> {
 /// Read a file and extract its JS literal. IO and parse failures both surface as
 /// a human-readable string for the `errors` array.
 fn load_js_section(path: &Path) -> Result<Value, String> {
-    let content =
-        std::fs::read_to_string(path).map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+    let content = std::fs::read_to_string(path)
+        .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
     extract_js_literal(&content)
 }
 
@@ -407,7 +407,9 @@ pub fn reconstruct_meals(content: &str, date: &str) -> (Vec<Value>, Vec<String>)
         ) {
             Some(c) => c,
             None => {
-                errors.push(format!("meals: '{item_name}' has no calories (line {line_no})"));
+                errors.push(format!(
+                    "meals: '{item_name}' has no calories (line {line_no})"
+                ));
                 0.0
             }
         };
@@ -419,6 +421,14 @@ pub fn reconstruct_meals(content: &str, date: &str) -> (Vec<Value>, Vec<String>)
             "f": num_or_zero(&col(&rec, "Fat_g")),
             "c": num_or_zero(&col(&rec, "Carbs_g")),
             "fiber": num_or_zero(&col(&rec, "Fiber_g")),
+            // The four trailing micronutrients use opt_num, NOT num_or_zero: a
+            // blank/unparseable cell means UNKNOWN, so it stays JSON null rather
+            // than collapsing to 0 the way fiber (and p/f/c) do. A legacy short
+            // row that ends before these columns reads them blank → null.
+            "na": opt_num(&col(&rec, "Sodium_mg")),
+            "satf": opt_num(&col(&rec, "SatFat_g")),
+            "sug": opt_num(&col(&rec, "Sugar_g")),
+            "k": opt_num(&col(&rec, "Potassium_mg")),
         });
         if let Some(g) = groups.iter_mut().find(|g| g.0 == meal && g.1 == time) {
             g.2.push(item);
@@ -458,7 +468,12 @@ pub fn reconstruct_exercise(content: &str, date: &str) -> (Vec<Value>, Vec<Strin
         .from_reader(content.as_bytes());
     let idx = match rdr.headers() {
         Ok(h) => header_index(h),
-        Err(_) => return (vec![], vec!["exercise: exercise-log.csv header unreadable".into()]),
+        Err(_) => {
+            return (
+                vec![],
+                vec!["exercise: exercise-log.csv header unreadable".into()],
+            )
+        }
     };
     let col = |rec: &csv::StringRecord, name: &str| -> String {
         idx.get(name)
@@ -654,7 +669,10 @@ pub async fn jesse_diet(
         }
         Err(e) => (
             Value::Null,
-            vec![format!("weightSeries: cannot read {}: {e}", weight_path.display())],
+            vec![format!(
+                "weightSeries: cannot read {}: {e}",
+                weight_path.display()
+            )],
         ),
     };
 
@@ -703,7 +721,10 @@ pub async fn jesse_diet(
             },
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
             Err(e) => {
-                errors.push(format!("proposed: cannot read {}: {e}", proposed_path.display()));
+                errors.push(format!(
+                    "proposed: cannot read {}: {e}",
+                    proposed_path.display()
+                ));
                 None
             }
         };
@@ -772,7 +793,10 @@ pub async fn jesse_diet(
             (recon, "reconstructed", None)
         }
         Err(e) => {
-            errors.push(format!("archive: cannot read {}: {e}", archive_path.display()));
+            errors.push(format!(
+                "archive: cannot read {}: {e}",
+                archive_path.display()
+            ));
             let (recon, errs) = reconstruct_day(
                 &date,
                 food_csv.as_deref(),
@@ -914,7 +938,8 @@ mod tests {
 
     #[test]
     fn preserves_chronological_file_order() {
-        let csv = format!("{HEADER}\n2026-07-01,200,,,,,\n2026-07-02,199,,,,,\n2026-07-03,198,,,,,\n");
+        let csv =
+            format!("{HEADER}\n2026-07-01,200,,,,,\n2026-07-02,199,,,,,\n2026-07-03,198,,,,,\n");
         let (rows, _) = parse_weight_csv(&csv);
         let dates: Vec<&str> = rows.iter().map(|r| r["date"].as_str().unwrap()).collect();
         assert_eq!(dates, ["2026-07-01", "2026-07-02", "2026-07-03"]);
@@ -936,7 +961,10 @@ mod tests {
         assert_eq!(rows[0]["date"], "2026-07-01");
         assert_eq!(rows[1]["date"], "2026-07-04");
         assert_eq!(errs.len(), 1, "one summary error line");
-        assert!(errs[0].contains('3') && errs[0].contains('4'), "names the bad lines: {errs:?}");
+        assert!(
+            errs[0].contains('3') && errs[0].contains('4'),
+            "names the bad lines: {errs:?}"
+        );
     }
 
     #[test]
@@ -950,7 +978,8 @@ mod tests {
 
     #[test]
     fn empty_ideas_normalizes_to_none() {
-        let v = extract_js_literal("window.PROPOSED_DIET = { date: '2026-07-08', ideas: [] };").unwrap();
+        let v = extract_js_literal("window.PROPOSED_DIET = { date: '2026-07-08', ideas: [] };")
+            .unwrap();
         assert!(normalize_proposed(v).is_none());
     }
 
@@ -993,15 +1022,15 @@ mod tests {
     #[test]
     fn rejects_malformed_dates() {
         for bad in [
-            "2026-4-5",     // not zero-padded
-            "2026-13-01",   // month out of range
-            "2026-04-32",   // day out of range
-            "2026/04/15",   // wrong separator
-            "2026-04-15T",  // trailing char / wrong length
-            "abcd-ef-gh",   // non-digit
-            "",             // empty
-            "2026-00-10",   // month 0
-            "2026-04-00",   // day 0
+            "2026-4-5",    // not zero-padded
+            "2026-13-01",  // month out of range
+            "2026-04-32",  // day out of range
+            "2026/04/15",  // wrong separator
+            "2026-04-15T", // trailing char / wrong length
+            "abcd-ef-gh",  // non-digit
+            "",            // empty
+            "2026-00-10",  // month 0
+            "2026-04-00",  // day 0
         ] {
             assert!(valid_iso_date(bad).is_none(), "should reject {bad:?}");
         }
@@ -1009,7 +1038,7 @@ mod tests {
 
     // ---- reconstruct_meals -------------------------------------------------
 
-    const FOOD_HEADER: &str = "Date,Meal,Item,Amount,Unit,Cal_per_100g,Grams,Calories,Protein_g,Fat_g,Carbs_g,Notes,Time,Meal_Type,Fiber_g";
+    const FOOD_HEADER: &str = "Date,Meal,Item,Amount,Unit,Cal_per_100g,Grams,Calories,Protein_g,Fat_g,Carbs_g,Notes,Time,Meal_Type,Fiber_g,Sodium_mg,SatFat_g,Sugar_g,Potassium_mg";
 
     #[test]
     fn groups_meals_by_meal_and_time_two_same_named_meals_stay_separate() {
@@ -1025,7 +1054,11 @@ mod tests {
         assert!(errs.is_empty(), "clean rows: {errs:?}");
         assert_eq!(meals.len(), 2, "two (Meal, Time) groups");
         assert_eq!(meals[0]["time"], "10:00");
-        assert_eq!(meals[0]["items"].as_array().unwrap().len(), 2, "Apple + Grapes");
+        assert_eq!(
+            meals[0]["items"].as_array().unwrap().len(),
+            2,
+            "Apple + Grapes"
+        );
         assert_eq!(meals[1]["time"], "15:30");
         assert_eq!(meals[1]["items"][0]["item"], "Almonds");
     }
@@ -1061,7 +1094,10 @@ mod tests {
         assert!(errs.is_empty());
         assert_eq!(meals.len(), 1);
         assert_eq!(meals[0]["items"][0]["item"], "Soup");
-        assert_eq!(meals[0]["items"][0]["c"], 30.0, "Notes quoting didn't shift columns");
+        assert_eq!(
+            meals[0]["items"][0]["c"], 30.0,
+            "Notes quoting didn't shift columns"
+        );
     }
 
     #[test]
@@ -1074,10 +1110,16 @@ mod tests {
              2026-03-30,Breakfast,Eggs,3,ea,,,210,18,15,1,\n" // 12 fields: no Time/Meal_Type/Fiber_g
         );
         let (meals, errs) = reconstruct_meals(&csv, "2026-03-30");
-        assert!(errs.is_empty(), "a short legacy row is not an error: {errs:?}");
+        assert!(
+            errs.is_empty(),
+            "a short legacy row is not an error: {errs:?}"
+        );
         assert_eq!(meals.len(), 1);
         assert!(meals[0]["time"].is_null(), "missing Time cell → null");
-        assert_eq!(meals[0]["items"][0]["fiber"], 0.0, "missing Fiber_g cell → 0");
+        assert_eq!(
+            meals[0]["items"][0]["fiber"], 0.0,
+            "missing Fiber_g cell → 0"
+        );
         assert_eq!(meals[0]["items"][0]["cal"], 210.0);
     }
 
@@ -1093,9 +1135,16 @@ mod tests {
         );
         let (meals, errs) = reconstruct_meals(&csv, "2026-04-15");
         assert_eq!(meals.len(), 1, "one Breakfast group");
-        assert_eq!(meals[0]["items"].as_array().unwrap().len(), 2, "Eggs + Bacon survive");
+        assert_eq!(
+            meals[0]["items"].as_array().unwrap().len(),
+            2,
+            "Eggs + Bacon survive"
+        );
         assert_eq!(errs.len(), 1, "one summary error");
-        assert!(errs[0].contains('3'), "names the torn line number: {errs:?}");
+        assert!(
+            errs[0].contains('3'),
+            "names the torn line number: {errs:?}"
+        );
     }
 
     #[test]
@@ -1107,7 +1156,10 @@ mod tests {
         let (meals, errs) = reconstruct_meals(&csv, "2026-04-15");
         assert_eq!(meals[0]["items"][0]["cal"], 0.0);
         assert_eq!(errs.len(), 1);
-        assert!(errs[0].contains("Mystery"), "error names the item: {errs:?}");
+        assert!(
+            errs[0].contains("Mystery"),
+            "error names the item: {errs:?}"
+        );
     }
 
     #[test]
@@ -1123,6 +1175,71 @@ mod tests {
         assert_eq!(items[0]["amount"], "1 cup", "bare number + unit joined");
         assert_eq!(items[1]["amount"], "1 medium (~118g)", "unit text verbatim");
         assert!(items[2]["amount"].is_null(), "blank Amount → null");
+    }
+
+    #[test]
+    fn micronutrients_populated_yield_their_numbers() {
+        // All four trailing cells present → na/satf/sug/k carry those numbers.
+        let csv = format!(
+            "{FOOD_HEADER}\n\
+             2026-04-15,Lunch,Soup,1,bowl,,,220,8,6,30,,12:00,Lunch,7,480,2.5,9,610\n"
+        );
+        let (meals, errs) = reconstruct_meals(&csv, "2026-04-15");
+        assert!(errs.is_empty(), "clean row: {errs:?}");
+        let item = &meals[0]["items"][0];
+        assert_eq!(item["na"], 480.0);
+        assert_eq!(item["satf"], 2.5);
+        assert_eq!(item["sug"], 9.0);
+        assert_eq!(item["k"], 610.0);
+        // Existing keys untouched.
+        assert_eq!(item["fiber"], 7.0);
+    }
+
+    #[test]
+    fn micronutrients_blank_cells_are_null_not_zero() {
+        // The four cells present-but-blank mean UNKNOWN → null, NOT 0.0. This is
+        // the whole reason they use opt_num rather than num_or_zero (fiber).
+        let csv = format!(
+            "{FOOD_HEADER}\n\
+             2026-04-15,Lunch,Soup,1,bowl,,,220,8,6,30,,12:00,Lunch,7,,,,\n"
+        );
+        let (meals, errs) = reconstruct_meals(&csv, "2026-04-15");
+        assert!(
+            errs.is_empty(),
+            "blank micronutrients are not an error: {errs:?}"
+        );
+        let item = &meals[0]["items"][0];
+        assert!(item["na"].is_null(), "blank Sodium_mg → null, not 0");
+        assert!(item["satf"].is_null(), "blank SatFat_g → null, not 0");
+        assert!(item["sug"].is_null(), "blank Sugar_g → null, not 0");
+        assert!(item["k"].is_null(), "blank Potassium_mg → null, not 0");
+        // Fiber, by contrast, still collapses a blank to 0.
+        assert_eq!(item["fiber"], 7.0);
+    }
+
+    #[test]
+    fn legacy_short_row_micronutrients_are_null_and_row_parses() {
+        // A legacy row that ends BEFORE the four micronutrient columns (here it
+        // stops after Fiber_g, 15 fields) must parse normally — not be counted
+        // malformed — with na/satf/sug/k all null (the missing cells read blank).
+        let csv = format!(
+            "{FOOD_HEADER}\n\
+             2026-03-30,Breakfast,Toast,2,ea,,,180,6,2,32,,08:00,Breakfast,3\n"
+        );
+        let (meals, errs) = reconstruct_meals(&csv, "2026-03-30");
+        assert!(
+            errs.is_empty(),
+            "a short pre-micronutrient row is not malformed: {errs:?}"
+        );
+        assert_eq!(meals.len(), 1);
+        let item = &meals[0]["items"][0];
+        assert!(item["na"].is_null(), "missing Sodium_mg cell → null");
+        assert!(item["satf"].is_null(), "missing SatFat_g cell → null");
+        assert!(item["sug"].is_null(), "missing Sugar_g cell → null");
+        assert!(item["k"].is_null(), "missing Potassium_mg cell → null");
+        // The row still reconstructs its existing fields fine.
+        assert_eq!(item["fiber"], 3.0);
+        assert_eq!(item["cal"], 180.0);
     }
 
     // ---- reconstruct_exercise ----------------------------------------------
@@ -1143,13 +1260,19 @@ mod tests {
         assert_eq!(ex[0]["type"], "run");
         assert_eq!(ex[0]["distance"], 8.0);
         assert_eq!(ex[0]["unit"], "km");
-        assert_eq!(ex[0]["duration"], "56:58", "duration passed through verbatim");
+        assert_eq!(
+            ex[0]["duration"], "56:58",
+            "duration passed through verbatim"
+        );
         assert_eq!(ex[0]["pace"], "7:07");
         assert_eq!(ex[0]["avgHR"], 142.0);
         assert_eq!(ex[1]["type"], "strength");
         assert!(ex[1]["distance"].is_null(), "blank distance → null");
         assert!(ex[1]["pace"].is_null(), "blank pace → null");
-        assert_eq!(ex[1]["duration"], "0:45:00", "a different duration format, verbatim");
+        assert_eq!(
+            ex[1]["duration"], "0:45:00",
+            "a different duration format, verbatim"
+        );
     }
 
     #[test]
@@ -1195,7 +1318,10 @@ mod tests {
     #[test]
     fn weight_for_date_absent_is_none() {
         let csv = format!("{HEADER}\n2026-07-07,198.0,89.8,Phase 2,,,\n");
-        assert!(weight_for_date(&csv, "2026-07-06").is_none(), "no row that date → None");
+        assert!(
+            weight_for_date(&csv, "2026-07-06").is_none(),
+            "no row that date → None"
+        );
     }
 
     // ---- csv_dates / archive_dates -----------------------------------------
@@ -1218,6 +1344,9 @@ mod tests {
     #[test]
     fn archive_dates_missing_directory_is_empty_not_an_error() {
         let missing = std::env::temp_dir().join(format!("jesse-no-such-{}", std::process::id()));
-        assert!(archive_dates(&missing).is_empty(), "absent days/ → no archives, no panic");
+        assert!(
+            archive_dates(&missing).is_empty(),
+            "absent days/ → no archives, no panic"
+        );
     }
 }

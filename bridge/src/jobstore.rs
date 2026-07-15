@@ -159,9 +159,14 @@ pub fn job_to_value(id: &str, job: &Job) -> Option<Value> {
             provenance_to_value(provenance),
             None,
         ),
-        JobState::Failed { error } => {
-            ("failed", None, None, Value::Null, Value::Null, Some(error.clone()))
-        }
+        JobState::Failed { error } => (
+            "failed",
+            None,
+            None,
+            Value::Null,
+            Value::Null,
+            Some(error.clone()),
+        ),
         JobState::Cancelled => ("cancelled", None, None, Value::Null, Value::Null, None),
         JobState::Running => return None,
     };
@@ -366,7 +371,11 @@ impl Persister for DiskPersister {
 
 /// Load persisted jobs from `dir`, dropping (and deleting) any that are already
 /// past eviction or unparseable. Returns the survivors to seed the in-memory map.
-pub fn load_persisted_jobs(dir: &Path, ttl: Duration, retrieval_grace: Duration) -> Vec<(String, Job)> {
+pub fn load_persisted_jobs(
+    dir: &Path,
+    ttl: Duration,
+    retrieval_grace: Duration,
+) -> Vec<(String, Job)> {
     let mut out = Vec::new();
     let Ok(entries) = std::fs::read_dir(dir) else {
         return out;
@@ -641,9 +650,9 @@ impl JobStore {
                 Some(_) => CancelOutcome::AlreadyTerminal,
             }
         }; // jobs lock released here, before aborting / touching `streams`
-        // Now fire the abort handle (drop → `kill_on_drop` kills `claude` and frees
-        // the permit); removing it also prevents a leak. Taken on its own lock,
-        // never overlapping `jobs`.
+           // Now fire the abort handle (drop → `kill_on_drop` kills `claude` and frees
+           // the permit); removing it also prevents a leak. Taken on its own lock,
+           // never overlapping `jobs`.
         if let Some(handle) = self.aborts.lock_ok().remove(id) {
             handle.abort();
         }
@@ -808,7 +817,10 @@ mod tests {
     fn job_complete_records_done_and_failed() {
         let store = JobStore::new(Duration::from_secs(600), Duration::from_secs(600), None);
         let ok = store.create();
-        store.complete(&ok, Ok(("hi".to_string(), Some("sess-1".to_string()), None)));
+        store.complete(
+            &ok,
+            Ok(("hi".to_string(), Some("sess-1".to_string()), None)),
+        );
         match store.get(&ok) {
             Some(JobState::Done {
                 response,
@@ -839,7 +851,7 @@ mod tests {
         let old = store.create();
         store.complete(&old, Ok(("done".to_string(), None, None)));
         let running = store.create(); // never completes — must survive eviction
-        // Wait past the TTL, then complete a fresh one that must NOT be evicted.
+                                      // Wait past the TTL, then complete a fresh one that must NOT be evicted.
         tokio::time::sleep(Duration::from_millis(80)).await;
         let fresh = store.create();
         store.complete(&fresh, Ok(("fresh".to_string(), None, None)));
@@ -864,11 +876,31 @@ mod tests {
         let grace = Duration::from_secs(600);
         // Never fetched: held the FULL ttl. Well past the old 600s window it's
         // still alive — the regression this whole change exists to fix.
-        assert!(!job_is_evictable(Duration::from_secs(700), None, ttl, grace));
-        assert!(!job_is_evictable(Duration::from_secs(86_399), None, ttl, grace));
+        assert!(!job_is_evictable(
+            Duration::from_secs(700),
+            None,
+            ttl,
+            grace
+        ));
+        assert!(!job_is_evictable(
+            Duration::from_secs(86_399),
+            None,
+            ttl,
+            grace
+        ));
         // At/after the ttl it finally evicts.
-        assert!(job_is_evictable(Duration::from_secs(86_400), None, ttl, grace));
-        assert!(job_is_evictable(Duration::from_secs(90_000), None, ttl, grace));
+        assert!(job_is_evictable(
+            Duration::from_secs(86_400),
+            None,
+            ttl,
+            grace
+        ));
+        assert!(job_is_evictable(
+            Duration::from_secs(90_000),
+            None,
+            ttl,
+            grace
+        ));
     }
     #[test]
     fn job_is_evictable_uses_grace_after_first_fetch() {
@@ -936,7 +968,14 @@ mod tests {
         {
             let store = JobStore::new(ttl, grace, Some(dir.clone()));
             let id = store.create();
-            store.complete(&id, Ok(("persisted reply".to_string(), Some("sess-9".to_string()), None)));
+            store.complete(
+                &id,
+                Ok((
+                    "persisted reply".to_string(),
+                    Some("sess-9".to_string()),
+                    None,
+                )),
+            );
             store.flush_persistence(); // wait for the off-lock worker to write
 
             // A new store over the SAME dir is the restart: it must reload the job.
@@ -963,7 +1002,10 @@ mod tests {
         let id = {
             let store = JobStore::new(ttl, grace, Some(dir.clone()));
             let id = store.create();
-            store.complete(&id, Err((StatusCode::GATEWAY_TIMEOUT, "run limit".to_string())));
+            store.complete(
+                &id,
+                Err((StatusCode::GATEWAY_TIMEOUT, "run limit".to_string())),
+            );
             store.flush_persistence(); // wait for the off-lock worker to write
             id
         };
@@ -1034,7 +1076,10 @@ mod tests {
         // Cancelling a job that already completed leaves the Done result intact.
         let done = store.create();
         store.complete(&done, Ok(("kept".to_string(), None, None)));
-        assert!(matches!(store.cancel(&done), CancelOutcome::AlreadyTerminal));
+        assert!(matches!(
+            store.cancel(&done),
+            CancelOutcome::AlreadyTerminal
+        ));
         assert!(matches!(store.get(&done), Some(JobState::Done { .. })));
     }
     #[test]
@@ -1053,7 +1098,10 @@ mod tests {
             panic!("poison the jobs lock");
         })
         .join();
-        assert!(poisoned.is_err(), "helper thread panicked, poisoning the lock");
+        assert!(
+            poisoned.is_err(),
+            "helper thread panicked, poisoning the lock"
+        );
 
         // With `.lock().unwrap()` every subsequent access would panic, cascading
         // one failed turn into a bridge-wide outage. `lock_ok` recovers the guard.

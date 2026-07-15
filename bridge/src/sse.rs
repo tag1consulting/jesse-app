@@ -133,7 +133,12 @@ pub async fn jesse_stream(
         if let Some(name) = activity {
             let _ = tx.try_send(Ok(sse_event("activity", json!({ "name": name }))));
         }
-        tokio::spawn(forward_live_frames(brx, tx, st.jobs.clone(), job_id.clone()));
+        tokio::spawn(forward_live_frames(
+            brx,
+            tx,
+            st.jobs.clone(),
+            job_id.clone(),
+        ));
     } else {
         // No live stream — the job is already terminal (or never existed). Emit
         // the matching frame and close. `get_retrieving` so an already-`done`

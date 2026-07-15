@@ -75,7 +75,12 @@ async fn main() {
     // the QR still encodes it. Opt in with `--show-token` or JESSE_SHOW_TOKEN=1.
     let args: Vec<String> = std::env::args().collect();
     let show_token = show_token_opt_in(&args, env_truthy("JESSE_SHOW_TOKEN"));
-    for line in manual_pairing_lines(&advertise_host, state.cfg.port, &state.cfg.token, show_token) {
+    for line in manual_pairing_lines(
+        &advertise_host,
+        state.cfg.port,
+        &state.cfg.token,
+        show_token,
+    ) {
         println!("{line}");
     }
 
@@ -90,5 +95,7 @@ async fn main() {
     // Evict expired jobs on a periodic background task rather than on the request
     // hot path (H3), so a sweep's file unlinks never delay a turn.
     spawn_eviction_task(state.jobs.clone());
-    axum::serve(listener, app(state)).await.expect("server error");
+    axum::serve(listener, app(state))
+        .await
+        .expect("server error");
 }
