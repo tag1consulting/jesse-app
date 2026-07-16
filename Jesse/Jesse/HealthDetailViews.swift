@@ -39,17 +39,20 @@ struct MacrosCaloriesDetail: View {
     private var g: DietGauges { DietSemantics.gauges(for: today, hour: hour) }
     private var totals: MacroTotals { DietSemantics.dayTotals(today.meals) }
     private var net: NetCalories { NetCalories(intake: totals.cal, burned: DietSemantics.burnedCalories(today.exercise)) }
-    /// The four micronutrient gauges paired with their nutrient, so a row can build the
-    /// tapped nutrient's explainer + drill-down (not just render the gauge).
-    private var micronutrients: [(nutrient: Micronutrient, gauge: MetricGauge)] {
-        Micronutrient.allCases.map {
-            ($0, DietSemantics.micronutrientGauge($0, meals: today.meals, targets: today.targets))
-        }
+    /// One micronutrient's gauge for the current day.
+    private func microGauge(_ n: Micronutrient) -> MetricGauge {
+        DietSemantics.micronutrientGauge(n, meals: today.meals, targets: today.targets)
     }
-    /// Only surface the micronutrient section when at least one of the four carries a
-    /// known value that day — otherwise there is nothing to show but four "not tracked
-    /// yet" rows.
-    private var hasMicronutrients: Bool { micronutrients.contains { ($0.gauge.knownItemCount ?? 0) > 0 } }
+    /// Whether a nutrient carried at least one known value that day — the gate for
+    /// surfacing a row (an all-unknown "not tracked yet" row is noise, not shown).
+    private func isTracked(_ n: Micronutrient) -> Bool { (microGauge(n).knownItemCount ?? 0) > 0 }
+    /// The standalone minerals (sodium, potassium) paired with their gauge.
+    private var minerals: [(nutrient: Micronutrient, gauge: MetricGauge)] {
+        NutrientOrder.minerals.map { ($0, microGauge($0)) }
+    }
+    /// Only surface the Micronutrients section when a mineral carries a known value that
+    /// day — otherwise there is nothing to show but "not tracked yet" rows.
+    private var hasMinerals: Bool { minerals.contains { ($0.gauge.knownItemCount ?? 0) > 0 } }
 
     var body: some View {
         Group {
@@ -65,12 +68,12 @@ struct MacrosCaloriesDetail: View {
             Section {
                 bar(g.calories, Explainers.calories(g.calories, isCarbLoad: g.isCarbLoad),
                     metric: .calories)
-                // Macro bars in canonical order (Protein, Carbs, Fiber, Fat); the
-                // carbs bonus row follows carbs, so fiber sits right after them.
-                ForEach(g.orderedMacros, id: \.macro) { entry in
-                    bar(entry.gauge, Explainers.macro(entry.macro, gauges: g),
-                        metric: .macro(entry.macro), isSubEntry: entry.macro.isSubEntry)
-                    if entry.macro == .carbs, let bonus = g.carbsBonus { bonusRow(bonus) }
+                // The nutrient tree in canonical nutrition-label order: Protein, Carbs,
+                // Fiber, Total Sugars, Fat, Saturated Fat — macro bars and micronutrient
+                // sub-entry bars share the one ordered sequence. The carbs bonus row
+                // still follows carbs; sodium and potassium are minerals, shown below.
+                ForEach(NutrientOrder.macroArea, id: \.self) { entry in
+                    nutrientRow(entry)
                 }
             }
             micronutrientSection
@@ -84,17 +87,39 @@ struct MacrosCaloriesDetail: View {
         }
     }
 
+    // One row of the nutrient tree. A macro renders its full bar (fiber indented as a
+    // sub-entry), with the carbs bonus row right after carbs. A micronutrient sub-entry
+    // (total sugars under carbs, saturated fat under fat) renders the SAME bar — indented,
+    // full unknown-aware "≥"/"not estimated"/"not tracked yet" rendering, tapping opens
+    // the same shared drill-down — but only when it carries a known value that day
+    // (an all-unknown sub-entry is noise, not shown).
+    @ViewBuilder private func nutrientRow(_ entry: NutrientEntry) -> some View {
+        switch entry {
+        case .macro(let m):
+            bar(g.gauge(for: m), Explainers.macro(m, gauges: g),
+                metric: .macro(m), isSubEntry: m.isSubEntry)
+            if m == .carbs, let bonus = g.carbsBonus { bonusRow(bonus) }
+        case .micronutrient(let n):
+            if isTracked(n) {
+                let gauge = microGauge(n)
+                bar(gauge, Explainers.micronutrient(n, gauge: gauge),
+                    metric: .micronutrient(n), isSubEntry: true)
+            }
+        }
+    }
+
     // Neutral: plain per-macro totals, no bars, no colors, no goal glyphs — a
     // reconstructed day had no targets to judge against.
     private var neutralBody: some View {
         List {
             Section {
                 totalRow("Calories", "\(DietSemantics.fmt(totals.cal))")
-                // Canonical order (Protein, Carbs, Fiber, Fat); fiber renders as a
-                // sub-entry of carbs (smaller + secondary label).
-                ForEach(Macro.allCases, id: \.self) { macro in
-                    totalRow(macro.displayName, "\(DietSemantics.fmt(totals.grams(for: macro)))g",
-                             isSubEntry: macro.isSubEntry)
+                // The nutrient tree in canonical order (Protein, Carbs, Fiber, Total
+                // Sugars, Fat, Saturated Fat) as plain indented gram totals — a
+                // reconstructed day has no targets to judge against. A tracked
+                // micronutrient sub-entry keeps its unknown-aware "≥" floor.
+                ForEach(NutrientOrder.macroArea, id: \.self) { entry in
+                    neutralNutrientRow(entry)
                 }
             } footer: {
                 Text(NeutralMode.noTargetsCaption)
@@ -118,6 +143,26 @@ struct MacrosCaloriesDetail: View {
             Spacer()
             Text(value).font(.body.monospacedDigit())
         }
+        .padding(.leading, NutrientRowLayout.indent(isSubEntry: isSubEntry))
+    }
+
+    // One row of the neutral (no-targets) nutrient tree. A macro is a plain gram total;
+    // a tracked micronutrient sub-entry is a plain indented total keeping its unknown-
+    // aware "≥" floor (an all-unknown sub-entry is not shown). Sodium and potassium are
+    // shown below in the Micronutrients section, not here.
+    @ViewBuilder private func neutralNutrientRow(_ entry: NutrientEntry) -> some View {
+        switch entry {
+        case .macro(let m):
+            totalRow(m.displayName, "\(DietSemantics.fmt(totals.grams(for: m)))g",
+                     isSubEntry: m.isSubEntry)
+        case .micronutrient(let n):
+            if isTracked(n) {
+                let gauge = microGauge(n)
+                let prefix = gauge.partial ? "≥" : ""
+                totalRow(n.displayName, "\(prefix)\(DietSemantics.fmt(gauge.value))\(n.unit)",
+                         isSubEntry: true)
+            }
+        }
     }
 
     private func bar(_ gauge: MetricGauge, _ ex: Explainer, metric: ContributionMetric,
@@ -132,30 +177,22 @@ struct MacrosCaloriesDetail: View {
         return MetricBarRow(gauge: gauge, isSubEntry: isSubEntry) { explainer = withFoods }
     }
 
-    // The four micronutrient rows, rendered in the exact macro-bar-row language
-    // (MetricBarRow). A partial total shows "≥" and the "N items not estimated" caption;
-    // an all-unknown nutrient shows "not tracked yet". Tapping any row opens the SAME
-    // shared drill-down sheet the macros use — extended with unknown-aware semantics.
-    // Hidden entirely when no nutrient carries a known value that day.
+    // The Micronutrients section — now the two standalone MINERALS (sodium, potassium)
+    // only; saturated fat and total sugars have moved up to sit under their parent macro
+    // as sub-entries. Each mineral renders in the exact macro-bar-row language: a partial
+    // total shows "≥" and the "N items not estimated" caption; an all-unknown nutrient
+    // shows "not tracked yet". Tapping opens the SAME shared drill-down sheet the macros
+    // use — via `bar`, so the row carries the education note too. Hidden entirely when
+    // neither mineral carries a known value that day.
     @ViewBuilder private var micronutrientSection: some View {
-        if hasMicronutrients {
+        if hasMinerals {
             Section("Micronutrients") {
-                ForEach(Array(micronutrients.enumerated()), id: \.offset) { _, entry in
-                    MetricBarRow(gauge: entry.gauge) { openMicronutrient(entry.nutrient, entry.gauge) }
+                ForEach(minerals, id: \.nutrient) { entry in
+                    bar(entry.gauge, Explainers.micronutrient(entry.nutrient, gauge: entry.gauge),
+                        metric: .micronutrient(entry.nutrient))
                 }
             }
         }
-    }
-
-    // Open a micronutrient's drill-down: the nutrient's explainer carries the shared
-    // enriched drill-down (contributing foods, the "Not estimated" group, and the
-    // grounded on-device insight), so tapping a micro gauge presents the identical sheet
-    // the macros do — one component, not a copied variant.
-    private func openMicronutrient(_ nutrient: Micronutrient, _ gauge: MetricGauge) {
-        var ex = Explainers.micronutrient(nutrient, gauge: gauge)
-        ex.drilldown = FoodDrilldown.build(meals: today.meals, metric: .micronutrient(nutrient),
-                                           gauge: gauge, isCarbLoad: g.isCarbLoad)
-        explainer = ex
     }
 
     private func bonusRow(_ bonus: CarbsBonus) -> some View {

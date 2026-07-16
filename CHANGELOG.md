@@ -15,6 +15,49 @@ CI both run it). See the "Versioning" section of `bridge/README.md`.
 
 ## [Unreleased]
 
+## [App 1.0 (42)] — 2026-07-16
+
+### Changed
+- **The nutrient list now mirrors a food label: saturated fat and total sugars render as
+  indented sub-entries of their parent macro, not as flat micronutrients.** A food label
+  declares "of which sugars" and "of which fibre" under Carbohydrate and "of which
+  saturates" under Fat; the Macros & calories screen now reads the same way — **Protein,
+  Carbs, Fiber, Total Sugars, Fat, Saturated Fat** — with the Micronutrients section
+  reduced to the two standalone minerals, **Sodium and Potassium**. This is a
+  presentation change only: no displayed number, unknown-aware split, gauge direction,
+  drill-down, HealthKit write, wire/CSV id, or `DietSemantics` total changes.
+  - **One sub-entry model across both enums.** `Micronutrient` gains `parent`/`isSubEntry`
+    (total sugars → carbs, saturated fat → fat; sodium and potassium have no parent),
+    mirroring `Macro.parent` (fiber → carbs). A single `NutrientOrder.macroArea` derives
+    the canonical row order from those links — the one source the order tests assert
+    against — and `NutrientOrder.minerals` is the standalone set. The Macros screen (both
+    the judged and the reconstructed-day bodies) iterates that one ordered sequence.
+  - **Gauges are untouched by the move.** Saturated fat stays a CEILING with full
+    unknown-aware rendering (partial `≥`, "N items not estimated", "not tracked yet");
+    total sugars stays INFORMATIONAL with no target and no judgment; fiber stays a FLOOR.
+    Each still opens the same shared `ExplainerSheet`/`FoodDrilldown` from its new position.
+  - **A real leading indent for every sub-entry.** Fiber, total sugars, and saturated fat
+    are now inset on the list/row surfaces (Macros screen bars and the reconstructed-day
+    totals) via one shared `NutrientRowLayout`, driven only by `isSubEntry`, so a sub-entry
+    visually sits inside its parent — nutrition-label style. The indent is a grouping cue
+    only: the equal-peer ring row is NOT indented and no child is drawn as a proportional
+    slice of a parent's bar (an EU label's declared carbohydrate excludes fibre, so each
+    child keeps its own independent gauge).
+  - **Parent-derived sub-entry colors.** Saturated fat and total sugars now take a lightened
+    shade of their parent macro's identity color (fat orange, carbs teal) in the drill-down
+    bars — the same derivation fiber uses — resolved per color scheme and kept opaque.
+    Sodium and potassium keep their own distinct mineral hue.
+
+### Added
+- **A short, fixed, plain-language education explainer for each of the four
+  micronutrients**, surfaced as a subordinate callout in the drill-down sheet — distinct
+  from the streamed on-device insight (which is about today's foods) and never a number.
+  Deterministic editorial copy stored on `Micronutrient.education`, stating each nutrient's
+  direction correctly: sodium and saturated fat as ceilings (with the salt→sodium and
+  "saturated fat is a sub-budget of total fat, the rest of your fat is fine" lessons),
+  potassium as a floor to reach (and why a low reading usually means "unmeasured, not
+  none"), total sugars as informational with no target and no judgment.
+
 ## [App 1.0 (41)] — 2026-07-16
 
 ### Added

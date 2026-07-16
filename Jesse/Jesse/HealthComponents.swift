@@ -415,24 +415,42 @@ func macroCaptionText(_ totals: MacroTotals, includeFiber: Bool = true, units: B
     return Text(line)
 }
 
+/// The one shared layout for a nutrient sub-entry's leading indent. A sub-entry
+/// (fiber and total sugars under carbs, saturated fat under fat) is inset on the
+/// stacked list/row surfaces so it visually sits INSIDE its parent, nutrition-label
+/// style — a grouping cue, driven only by `isSubEntry`, so it reads the same in every
+/// gauge state (target-set or not, partial, all-unknown). Zero for a top-level
+/// nutrient. Deliberately NOT applied to the equal-peer ring row, nor as a
+/// proportional subdivision of a parent's bar: an EU label's declared carbohydrate
+/// excludes fibre, so a child is its own independent line, never a slice of the parent.
+enum NutrientRowLayout {
+    /// The leading indent (points) a sub-entry row is inset by. One value, no
+    /// per-nutrient copies.
+    static let subEntryIndent: CGFloat = 16
+    static func indent(isSubEntry: Bool) -> CGFloat { isSubEntry ? subEntryIndent : 0 }
+}
+
 /// A full-width bar row for the macros-and-calories detail screen: goal chip,
 /// label, value/target/percent, the meter, the remaining annotation, and any gated
 /// flag. Tapping opens the row's explainer.
 struct MetricBarRow: View {
     let gauge: MetricGauge
-    /// When true (fiber), the row label reads as a sub-entry of carbs: one type-ramp
-    /// step smaller (subheadline → footnote) and in the secondary color. The bar, the
-    /// value, and its status color are untouched — only the label's type changes.
+    /// When true (a sub-entry — fiber, total sugars, saturated fat), the row label reads
+    /// as a sub-entry of its parent macro: one type-ramp step smaller (subheadline →
+    /// footnote) and in the secondary color, AND the whole row carries the shared leading
+    /// indent so it sits inside its parent. The bar, the value, and its status color are
+    /// untouched — only the label's type and the row's indent change.
     var isSubEntry: Bool = false
     /// The explainer tap. Nil for a micronutrient row (no explainer wired): the row
     /// then renders identically minus the info-circle affordance and the button wrap.
     var onTap: (() -> Void)? = nil
 
     var body: some View {
+        let indented = content.padding(.leading, NutrientRowLayout.indent(isSubEntry: isSubEntry))
         if let onTap {
-            Button(action: onTap) { content }.buttonStyle(.plain)
+            Button(action: onTap) { indented }.buttonStyle(.plain)
         } else {
-            content
+            indented
         }
     }
 
@@ -522,6 +540,11 @@ struct Explainer: Identifiable, Equatable {
     var title: String
     var valueLine: String
     var paragraphs: [String]
+    /// A short, fixed teaching blurb about the metric itself — what it is and how to read
+    /// its gauge — rendered as a subordinate callout below the prose. Set for the four
+    /// micronutrients (from `Micronutrient.education`); nil for metrics without one, which
+    /// then render exactly as before.
+    var note: String?
     var drilldown: FoodDrilldown?
 }
 
@@ -581,6 +604,22 @@ struct ExplainerSheet: View {
                     ForEach(Array(explainer.paragraphs.enumerated()), id: \.offset) { _, p in
                         Text(p).font(.body).foregroundStyle(.secondary)
                             .textSelection(.enabled)
+                    }
+                    if let note = explainer.note {
+                        // The fixed "what is this nutrient" teaching, subordinate to the
+                        // live prose above: quiet type, muted background, an info glyph.
+                        // Available but never competing with today's numbers.
+                        Label {
+                            Text(note).font(.footnote).foregroundStyle(.secondary)
+                                .textSelection(.enabled)
+                                .fixedSize(horizontal: false, vertical: true)
+                        } icon: {
+                            Image(systemName: "info.circle").foregroundStyle(.tertiary)
+                        }
+                        .font(.footnote)
+                        .padding(12)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .background(RoundedRectangle(cornerRadius: 10).fill(Color(.tertiarySystemFill)))
                     }
                     if let drilldown = explainer.drilldown {
                         Divider()
@@ -805,17 +844,20 @@ struct ContributionRow: View {
     }
 }
 
-/// Identity colors for the four micronutrients, kept distinct from the macro palette
-/// (indigo/teal/orange) so the drill-down bars don't read as a macro. One place, so no
-/// view hardcodes a color.
+/// Identity colors for the four micronutrients. A sub-entry micronutrient takes a
+/// lightened shade of its PARENT macro's identity color — saturated fat from the fat
+/// orange, total sugars from the carbs teal — the same derivation fiber uses, so the
+/// nutrition-label tree reads as parent-and-paler-kin in the drill-down bars too
+/// (resolved per color scheme, opaque, distinguishable in light and dark). The
+/// standalone minerals (sodium, potassium) keep their own distinct hue, apart from the
+/// macro palette. One place, so no view hardcodes a color.
 enum MicronutrientColor {
     static func color(for n: Micronutrient) -> Color {
-        switch n {
-        case .sodium: return .blue
-        case .saturatedFat: return .brown
-        case .totalSugars: return .pink
-        case .potassium: return .mint
+        if let parent = n.parent {
+            return MacroColor.shade(ofSubEntry: MacroColor.color(for: parent))
         }
+        // The two standalone minerals — the only cases with no macro parent.
+        return n == .sodium ? .blue : .mint
     }
 }
 

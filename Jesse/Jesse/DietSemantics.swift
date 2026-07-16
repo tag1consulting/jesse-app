@@ -657,6 +657,44 @@ enum Micronutrient: CaseIterable {
         case .potassium: return t.potassium
         }
     }
+
+    /// The macro this micronutrient hangs off as a nutrition-label sub-entry, or nil for
+    /// a standalone mineral. A food label declares "of which sugars" and "of which fibre"
+    /// under Carbohydrate and "of which saturates" under Fat, so total sugars renders as
+    /// a sub-entry of carbs (beside fiber) and saturated fat as a sub-entry of fat.
+    /// Sodium and potassium are minerals — a component of no macro — so they have no
+    /// parent and stay in the Micronutrients section. Drives the sub-entry identity
+    /// color, the label type treatment, and the leading indent, exactly as `Macro.parent`
+    /// does for fiber.
+    var parent: Macro? {
+        switch self {
+        case .totalSugars: return .carbs
+        case .saturatedFat: return .fat
+        case .sodium, .potassium: return nil
+        }
+    }
+
+    /// True when this micronutrient renders as an indented sub-entry beneath a macro
+    /// (total sugars, saturated fat), rather than standalone in the Micronutrients section.
+    var isSubEntry: Bool { parent != nil }
+
+    /// A short, FIXED, plain-language teaching blurb — what the nutrient is and how to
+    /// read its gauge — surfaced subordinately in the drill-down sheet. Editorial copy,
+    /// deterministic and unit-tested, distinct from the streamed on-device insight (which
+    /// is about today's foods) and never a number. Ceiling vs floor vs informational is
+    /// stated correctly per nutrient; total sugars carries no judgment.
+    var education: String {
+        switch self {
+        case .sodium:
+            return "Sodium is the part of salt that pushes blood pressure up when it stays high over time — about 400 mg of it in every gram of salt. Stay under most days. A long or hot run sweats sodium out, so those days can run higher on purpose."
+        case .saturatedFat:
+            return "Saturated fat is just one slice of your total fat — a sub-budget with its own cap, not a limit on fat overall. The rest of your fat is fine: olive oil, fish, nuts, and egg yolks are unsaturated and can run high. Only this saturated slice has a ceiling to stay under."
+        case .potassium:
+            return "Potassium is the counterweight to sodium and helps pull blood pressure down. It's a floor to reach, not a limit. Labels often leave it out, so a low or \"not tracked yet\" reading usually means it couldn't be measured, not that you ate none — bananas, potatoes, beans, and salmon are loaded with it."
+        case .totalSugars:
+            return "This is every sugar in your food — the natural sugar in fruit, milk, and yogurt plus any added, all summed. Labels can't split the two, so there's no target here and no red or green. It's healthy from fruit and dairy; use the food list below to see whether it's those or added sugar worth trimming."
+        }
+    }
 }
 
 /// The four macronutrients the Health tab tracks. The single source of truth for
@@ -696,6 +734,53 @@ enum Macro: CaseIterable {
     /// True when this macro renders as a sub-entry of another (currently fiber under
     /// carbs), rather than as one of the top-level peers.
     var isSubEntry: Bool { parent != nil }
+}
+
+/// One row in the nutrition-label nutrient tree: either a macro (protein, carbs, fiber,
+/// fat) or a micronutrient that hangs off a macro as a sub-entry (total sugars and
+/// saturated fat). The single type the Macros screen iterates, so a macro row and a
+/// micronutrient sub-entry row share one ordered sequence and one sub-entry treatment
+/// instead of two hand-kept lists.
+enum NutrientEntry: Equatable, Hashable {
+    case macro(Macro)
+    case micronutrient(Micronutrient)
+
+    /// Whether this row renders as an indented sub-entry of a parent macro — driven by
+    /// the same `parent`/`isSubEntry` model on both enums.
+    var isSubEntry: Bool {
+        switch self {
+        case .macro(let m): return m.isSubEntry
+        case .micronutrient(let n): return n.isSubEntry
+        }
+    }
+}
+
+/// The single canonical ordering of the nutrient tree, derived from the `parent` links
+/// on `Macro` and `Micronutrient` — no view hand-orders the rows. This is the one source
+/// the order tests assert against.
+enum NutrientOrder {
+    /// The macro area's rows in canonical nutrition-label order: each top-level macro
+    /// followed immediately by its sub-entries — macro sub-entries first (fiber), then
+    /// micronutrient sub-entries (total sugars, saturated fat). For the current tree that
+    /// is Protein, Carbs, Fiber, Total Sugars, Fat, Saturated Fat. Standalone minerals
+    /// (sodium, potassium) are NOT here — they live in the Micronutrients section.
+    static let macroArea: [NutrientEntry] = {
+        var out: [NutrientEntry] = []
+        for macro in Macro.allCases where macro.parent == nil {
+            out.append(.macro(macro))
+            for sub in Macro.allCases where sub.parent == macro {
+                out.append(.macro(sub))
+            }
+            for n in Micronutrient.allCases where n.parent == macro {
+                out.append(.micronutrient(n))
+            }
+        }
+        return out
+    }()
+
+    /// The standalone minerals shown in the Micronutrients section — the micronutrients
+    /// with no macro parent (sodium, potassium), in canonical order.
+    static let minerals: [Micronutrient] = Micronutrient.allCases.filter { $0.parent == nil }
 }
 
 /// Builds the labeled macro line shown under food-journal items, meal subtotals,

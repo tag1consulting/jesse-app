@@ -100,7 +100,8 @@ enum Explainers {
     /// only; and total sugars stays informational — never a judgment.
     static func micronutrient(_ n: Micronutrient, gauge g: MetricGauge) -> Explainer {
         Explainer(id: "micro-\(n.displayName)", title: n.displayName,
-                  valueLine: microLine(g), paragraphs: microParagraphs(n, g))
+                  valueLine: microLine(g), paragraphs: microParagraphs(n, g),
+                  note: n.education)
     }
 
     /// The micronutrient header line, mirroring the gauge's own value language: "≥" when
