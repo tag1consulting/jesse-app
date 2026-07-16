@@ -509,6 +509,10 @@ pub async fn jesse(
         let mut m_validator: Option<String> = None;
         let mut m_emergency = false;
         let mut m_failclass: Option<String> = None;
+        // The machine-readable rung-2 reason on a diet rung-2 fall-through (content-free
+        // code; None on every other turn). Threaded into the metrics line so the audit
+        // can separate pipeline failures from correct rejections of non-loggable turns.
+        let mut m_diet_reason: Option<String> = None;
         // Provenance-only: whether an emergency answer skipped the citation check.
         // Never feeds the metrics line (which records the validator verdict directly).
         let mut m_citations_unverified = false;
@@ -596,13 +600,14 @@ pub async fn jesse(
                         (out, BadgeSource::Hosted)
                     }
                 }
-                DietPipelineOutcome::FallThrough { rung } => {
+                DietPipelineOutcome::FallThrough { rung, reason } => {
                     let out = run_hosted().await;
                     hosted_succeeded = out.is_ok();
                     if emergency_armed {
                         update_breaker(&breaker, &out, Instant::now());
                     }
                     m_rung = rung.num();
+                    m_diet_reason = reason.map(|r| r.code());
                     (out, BadgeSource::Hosted)
                 }
             }
@@ -804,6 +809,7 @@ pub async fn jesse(
                     badge,
                     emergency: m_emergency,
                     hosted_failure_class: m_failclass,
+                    diet_reason: m_diet_reason,
                 },
             );
         }

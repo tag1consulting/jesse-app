@@ -349,6 +349,33 @@ fn render_markdown(
         ));
     }
 
+    s.push_str("\n## Diet extract (rung-2) by reason\n\n");
+    s.push_str(&format!(
+        "- identifiable diet turns (local + rung-2): {}\n",
+        agg.diet_identifiable
+    ));
+    if agg.rung2_by_reason.is_empty() {
+        s.push_str("- rung-2 fall-throughs: none\n");
+    } else {
+        for (reason, n) in &agg.rung2_by_reason {
+            s.push_str(&format!("  - {reason}: {n}\n"));
+        }
+    }
+    // Two rates: the RAW rung-2 rate, and the FAILURE-only rate that excludes
+    // `no_loggable` (correct rejections of non-loggable turns the keyword gate let in).
+    s.push_str(&format!(
+        "- raw rung-2 rate: {:.1}% ({} / {})\n",
+        agg.diet_rung2_raw_rate() * 100.0,
+        agg.rung2_total(),
+        agg.diet_identifiable
+    ));
+    s.push_str(&format!(
+        "- failure-only rate (excl. no_loggable): {:.1}% ({} / {})\n",
+        agg.diet_rung2_failure_rate() * 100.0,
+        agg.rung2_failures(),
+        agg.diet_identifiable
+    ));
+
     s.push_str("\n## Citation re-validation (read-only, vs vault)\n\n");
     if join_empty {
         s.push_str("- skipped — no serving-log join configured (set JESSE_AUDIT_SERVING_LOG)\n");
@@ -393,6 +420,15 @@ fn render_json(
         "emergency": {
             "activations": agg.emergency_activations,
             "by_class": agg.emergency_by_class,
+        },
+        "diet_extract_rung2": {
+            "identifiable_diet_turns": agg.diet_identifiable,
+            "by_reason": agg.rung2_by_reason,
+            "total": agg.rung2_total(),
+            "no_loggable": agg.rung2_no_loggable(),
+            "failures": agg.rung2_failures(),
+            "raw_rate": agg.diet_rung2_raw_rate(),
+            "failure_rate": agg.diet_rung2_failure_rate(),
         },
         "diet_queue": {
             "queued_today": agg.diet_queued,

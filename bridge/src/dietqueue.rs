@@ -348,7 +348,7 @@ mod tests {
             entries: vec![DietEntry::Food(FoodEntry {
                 name: name.to_string(),
                 meal: "Snack".to_string(),
-                time: "09:00".to_string(),
+                time: Some("09:00".to_string()),
                 amount: Some("1".to_string()),
                 unit: Some("piece".to_string()),
                 kcal: Some(105.0),

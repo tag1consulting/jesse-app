@@ -15,6 +15,50 @@ CI both run it). See the "Versioning" section of `bridge/README.md`.
 
 ## [Unreleased]
 
+## [Bridge 0.15.0] — 2026-07-16
+
+### Fixed
+Four root-cause fixes to the local diet-extract pipeline, downstream of correct
+model comprehension. The 2026-07-15 investigation found the extract child (DeepSeek
+V4 Flash via `local-diet`) identified the food/exercise in ~17 of 20 rung-2 turns;
+the pipeline then rejected its output. Projected effect: ~13 of the 20 observed
+rung-2 turns convert to local logs. **Fixtures reproduce the documented CLI-child
+failure shapes** (missing time, null macros, fenced JSON); the read-only investigation
+archive was not accessible from the dev host, so replays were reconstructed faithfully
+rather than byte-copied.
+
+- **The bridge owns received-at time, not the model.** The extract child runs toolless
+  with a neutral cwd, so it has **no clock** — yet the schema/prompt required a per-entry
+  `time` and the parser rejected an absent one. "ate 1 almond" (no stated time) was a
+  **deterministic rung-2 schema-fail** (3/3 reruns); guessing produced invented times
+  (a ~17:44 snack stamped 15:00 at go-live). `time` is now optional; the model returns
+  one **only** when the message states an explicit clock time (never invents), and at
+  append the bridge stamps any unstated food time with the turn's received-at wall clock
+  (local `HH:MM`). An explicit time always wins; the fill flows through the normal
+  row + mirror path, so dashboard/Apple-Health re-derivation is unchanged.
+- **JSON `null`/empty string now mean absent for optional macros.** The prompt says omit
+  unknown macros; the model nulls them instead. `opt_num_field` rejected a null as "not a
+  number", schema-failing a correct entry to rung 2 (the dominant failure, with missing
+  time). Null and empty/blank strings are now absent (`None`), the same as an omitted key;
+  a literal `0` stays a measured zero; required fields stay strict.
+- **A full markdown code fence is stripped before parsing.** The parser did `json.loads`
+  on the trimmed raw with no fence handling; through the production CLI child the model
+  wraps its JSON in a ` ``` `/` ```json ` fence on some turns, parsing as invalid JSON
+  (3/20 rung-2). `strip_code_fence` unwraps **only** a full outer fence; backticks inside
+  a JSON string value, and any not-fully-wrapped payload, are never touched.
+- **Every rung-2 fall-through now carries a machine-readable reason.** The five causes
+  (`child_error`, `malformed_json`, `schema_fail:<field>`, `empty_entries`, `no_loggable`)
+  collapsed into one indistinguishable line, so the daily audit could not tell a pipeline
+  FAILURE from a **correct rejection** of a non-loggable turn (3/20 rung-2 turns were
+  correct rejections the loose keyword gate let in). The reason threads through the
+  provenance line and the metrics JSONL (content-free — a code plus the schema field,
+  never meal text or the token); the audit counts rung-2 by reason and reports two rates
+  (raw, and failure-only excluding `no_loggable`). The README graduation criteria gain a
+  clearly-marked PROPOSAL (not a change) that the 5% bar count only loggable-content turns.
+
+The kill switch is unchanged: with the `JESSE_DIET_*` triple unset the pipeline is
+dormant and every diet turn takes the hosted path byte-for-byte.
+
 ## [App 1.0 (42)] — 2026-07-16
 
 ### Changed

@@ -73,7 +73,12 @@ pub const WEIGHT_LOG_HEADER: &str =
 pub struct FoodEntry {
     pub name: String,
     pub meal: String, // Breakfast | Lunch | Dinner | Snack
-    pub time: String, // HH:MM
+    // `HH:MM` — the clock time the item was eaten, but ONLY when the utterance
+    // stated one explicitly ("lunch at 12"). The toolless extract child has no
+    // clock, so an unstated time is `None`; the bridge fills it with the turn's
+    // received-at wall clock at append ([`stamp_missing_food_times`]). An explicit
+    // stated time always wins. The model must never invent a time.
+    pub time: Option<String>,
     pub amount: Option<String>,
     pub unit: Option<String>,
     pub kcal: Option<f64>,
@@ -177,9 +182,47 @@ fn strip_parens(s: &str) -> String {
 /// aggregated name ([`name_is_aggregated`]) is rejected. Any macro present must be a
 /// finite, non-negative number. Returns `Err(reason)` for anything off-contract; the
 /// pipeline maps that to ladder rung 2 (fall through to the hosted turn).
+/// If `s` (expected already trimmed) is ENTIRELY wrapped in one markdown code fence,
+/// return the interior; otherwise return `s` unchanged. A wrapper is an opening line of
+/// three-or-more backticks with an optional language tag (` ```json `), the payload on
+/// its own line(s), and a closing line of only backticks (≥ the opening count). Only the
+/// OUTERMOST full wrapper is stripped, so backticks INSIDE a JSON string value are never
+/// touched, and a payload that is not fully fence-wrapped (e.g. prose then a fence, or a
+/// fence with no closing line) is returned verbatim. Through the production CLI child the
+/// model fences its JSON on some turns; the parser strips exactly this before json.loads.
+pub fn strip_code_fence(s: &str) -> &str {
+    // Opening fence: leading run of >=3 backticks, then an optional tag with no backticks.
+    let open_ticks = s.chars().take_while(|&c| c == '`').count();
+    if open_ticks < 3 {
+        return s;
+    }
+    let Some(first_nl) = s.find('\n') else {
+        return s; // single line — no interior to strip
+    };
+    let open_tag = &s[open_ticks..first_nl];
+    if open_tag.contains('`') {
+        return s; // not a clean opening fence line
+    }
+    // The closing fence is the LAST non-empty line: a run of only backticks (>= opening).
+    let after = s[first_nl + 1..].trim_end_matches(['\n', '\r', ' ', '\t']);
+    let (interior, close_line) = match after.rfind('\n') {
+        Some(nl) => (&after[..nl], &after[nl + 1..]),
+        None => ("", after), // opening fence then only a closing line → empty interior
+    };
+    let close_ok = {
+        let n = close_line.chars().take_while(|&c| c == '`').count();
+        n >= open_ticks && close_line.chars().all(|c| c == '`')
+    };
+    if close_ok {
+        interior
+    } else {
+        s // not fully fence-wrapped — leave it exactly as-is
+    }
+}
+
 pub fn parse_diet_entries(json: &str) -> Result<DietExtract, String> {
     let value: Value =
-        serde_json::from_str(json.trim()).map_err(|e| format!("invalid JSON: {e}"))?;
+        serde_json::from_str(strip_code_fence(json.trim())).map_err(|e| format!("invalid JSON: {e}"))?;
     let obj = value.as_object().ok_or("payload is not a JSON object")?;
     for key in obj.keys() {
         if key != "entries" && key != "no_loggable_content" {
@@ -249,7 +292,9 @@ fn opt_str_field(m: &serde_json::Map<String, Value>, key: &str) -> Option<String
 }
 
 /// An optional macro/number: absent → None; present → a finite, non-negative number
-/// (an explicit `null` is a violation — the contract omits unknowns, never nulls).
+/// (an explicit `null` is a violation — this strict form is what the hosted VERIFY
+/// verdict parser uses, so verify-gate behavior is unchanged). The EXTRACT parsers use
+/// the null/empty-tolerant [`opt_extract_num_field`] instead (Fix 2).
 fn opt_num_field(m: &serde_json::Map<String, Value>, key: &str) -> Result<Option<f64>, String> {
     match m.get(key) {
         None => Ok(None),
@@ -265,6 +310,25 @@ fn opt_num_field(m: &serde_json::Map<String, Value>, key: &str) -> Result<Option
             }
             Ok(Some(n))
         }
+    }
+}
+
+/// An optional EXTRACT-child macro/number, tolerant of the child's two ways of saying
+/// "unknown". The prompt tells the model to OMIT an unknown macro, but it commonly nulls
+/// it (or emits an empty string) instead — so JSON `null` and an empty/blank string are
+/// BOTH treated as absent (None), the same as an omitted key. A literal `0` is a
+/// measured zero (`Some(0.0)`), never absent; a negative, non-finite, or
+/// non-numeric-non-empty value is still a schema violation. Scoped to the extract
+/// parsers so the verify verdict path ([`opt_num_field`]) stays strict/unchanged.
+fn opt_extract_num_field(
+    m: &serde_json::Map<String, Value>,
+    key: &str,
+) -> Result<Option<f64>, String> {
+    match m.get(key) {
+        // Omitted, JSON null, or an empty/blank string → absent.
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(s)) if s.trim().is_empty() => Ok(None),
+        _ => opt_num_field(m, key),
     }
 }
 
@@ -302,18 +366,19 @@ fn parse_food(m: &serde_json::Map<String, Value>) -> Result<FoodEntry, String> {
     Ok(FoodEntry {
         name,
         meal: req_str(m, "meal")?,
-        time: req_str(m, "time")?,
+        // Optional: the bridge owns the received-at fallback (see the field docs).
+        time: opt_str_field(m, "time"),
         amount: opt_str_field(m, "amount"),
         unit: opt_str_field(m, "unit"),
-        kcal: opt_num_field(m, "kcal")?,
-        protein_g: opt_num_field(m, "protein_g")?,
-        carbs_g: opt_num_field(m, "carbs_g")?,
-        fat_g: opt_num_field(m, "fat_g")?,
-        fiber_g: opt_num_field(m, "fiber_g")?,
-        sodium_mg: opt_num_field(m, "sodium_mg")?,
-        satfat_g: opt_num_field(m, "satfat_g")?,
-        sugar_g: opt_num_field(m, "sugar_g")?,
-        potassium_mg: opt_num_field(m, "potassium_mg")?,
+        kcal: opt_extract_num_field(m, "kcal")?,
+        protein_g: opt_extract_num_field(m, "protein_g")?,
+        carbs_g: opt_extract_num_field(m, "carbs_g")?,
+        fat_g: opt_extract_num_field(m, "fat_g")?,
+        fiber_g: opt_extract_num_field(m, "fiber_g")?,
+        sodium_mg: opt_extract_num_field(m, "sodium_mg")?,
+        satfat_g: opt_extract_num_field(m, "satfat_g")?,
+        sugar_g: opt_extract_num_field(m, "sugar_g")?,
+        potassium_mg: opt_extract_num_field(m, "potassium_mg")?,
         notes: opt_str_field(m, "notes"),
     })
 }
@@ -341,11 +406,11 @@ fn parse_exercise(m: &serde_json::Map<String, Value>) -> Result<ExerciseEntry, S
         activity: req_str(m, "activity")?,
         time: opt_str_field(m, "time"),
         description: opt_str_field(m, "description"),
-        distance_km: opt_num_field(m, "distance_km")?,
+        distance_km: opt_extract_num_field(m, "distance_km")?,
         duration: opt_str_field(m, "duration"),
         pace: opt_str_field(m, "pace"),
-        avg_hr: opt_num_field(m, "avg_hr")?,
-        calories: opt_num_field(m, "calories")?,
+        avg_hr: opt_extract_num_field(m, "avg_hr")?,
+        calories: opt_extract_num_field(m, "calories")?,
         notes: opt_str_field(m, "notes"),
     })
 }
@@ -365,8 +430,8 @@ fn parse_weight(m: &serde_json::Map<String, Value>) -> Result<WeightEntry, Strin
             return Err(format!("unknown weight field {k:?}"));
         }
     }
-    let lbs = opt_num_field(m, "weight_lbs")?;
-    let kg = opt_num_field(m, "weight_kg")?;
+    let lbs = opt_extract_num_field(m, "weight_lbs")?;
+    let kg = opt_extract_num_field(m, "weight_kg")?;
     // weight-log.csv keys on a parseable Weight_lbs, so a weigh-in MUST resolve one:
     // prefer the reported lbs, else derive from kg (1 kg = 2.20462 lb).
     let weight_lbs = match (lbs, kg) {
@@ -377,8 +442,8 @@ fn parse_weight(m: &serde_json::Map<String, Value>) -> Result<WeightEntry, Strin
     Ok(WeightEntry {
         weight_lbs,
         weight_kg: kg,
-        body_fat_pct: opt_num_field(m, "body_fat_pct")?,
-        muscle_mass_lbs: opt_num_field(m, "muscle_mass_lbs")?,
+        body_fat_pct: opt_extract_num_field(m, "body_fat_pct")?,
+        muscle_mass_lbs: opt_extract_num_field(m, "muscle_mass_lbs")?,
         notes: opt_str_field(m, "notes"),
     })
 }
@@ -553,7 +618,7 @@ pub fn food_row(e: &FoodEntry, date: &str) -> String {
         num_cell(e.fat_g),
         num_cell(e.carbs_g),
         csv_field(e.notes.as_deref().unwrap_or("")),
-        csv_field(&e.time),
+        csv_field(e.time.as_deref().unwrap_or("")),
         csv_field(&e.meal), // Meal_Type mirrors Meal
         num_cell(e.fiber_g),
         num_cell(e.sodium_mg),    // Sodium_mg — blank when unknown, never 0
@@ -641,12 +706,15 @@ pub fn build_meal_log_from_food_rows(
         .iter()
         .enumerate()
         .map(|(i, r)| {
-            let hhmm: String = r.time.chars().filter(|c| c.is_ascii_digit()).collect();
+            // By the time a row reaches the mirror the pipeline has stamped any
+            // missing time (received-at), so `time` is Some; default defensively.
+            let time = r.time.as_deref().unwrap_or("");
+            let hhmm: String = time.chars().filter(|c| c.is_ascii_digit()).collect();
             Meal {
                 // Unique per row (`<date>-<slug>-<HHMM>-<seq>`) so two rows in the same
                 // slot never collide → two rows always yield two distinct meals.
                 id: format!("{date}-{}-{hhmm}-{}", meal_slug(&r.meal), i + 1),
-                consumed_at: format!("{date}T{}:00{offset}", r.time),
+                consumed_at: format!("{date}T{time}:00{offset}"),
                 name: format!("{}: {}", r.meal, r.name),
                 // Macros EQUAL to the row (omit unknown — never null-pad).
                 kcal: r.kcal,
@@ -1153,12 +1221,71 @@ fn normalize_offset_pub(raw: &str) -> String {
     "+00:00".to_string()
 }
 
+// ---- Rung-2 reason codes ---------------------------------------------------
+
+/// The machine-readable reason a diet turn fell to rung 2 (the extract/`Child` rung).
+/// Every rung-2 emission carries one so the daily audit can tell a pipeline FAILURE
+/// from a CORRECT rejection of a non-loggable turn (the loose keyword gate lets some
+/// non-loggable turns in). The code is content-free — a fixed token plus, for a schema
+/// failure, the offending SCHEMA FIELD name — never meal text and never the token.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Rung2Reason {
+    /// The extract child errored, timed out, or could not be spawned.
+    ChildError,
+    /// The child's output was not valid JSON (after fence-stripping).
+    MalformedJson,
+    /// Valid JSON but off-contract; carries the failing schema field where known.
+    SchemaFail(Option<String>),
+    /// Parsed cleanly, `no_loggable_content` false, but the `entries` array was empty.
+    EmptyEntries,
+    /// The child set `no_loggable_content` — a CORRECT rejection, not a failure.
+    NoLoggable,
+}
+
+impl Rung2Reason {
+    /// The content-free reason code for the provenance line and metrics record, e.g.
+    /// `child_error`, `malformed_json`, `schema_fail:time`, `empty_entries`,
+    /// `no_loggable`. A schema failure appends the offending field after a colon.
+    pub fn code(&self) -> String {
+        match self {
+            Rung2Reason::ChildError => "child_error".to_string(),
+            Rung2Reason::MalformedJson => "malformed_json".to_string(),
+            Rung2Reason::SchemaFail(Some(field)) => format!("schema_fail:{field}"),
+            Rung2Reason::SchemaFail(None) => "schema_fail".to_string(),
+            Rung2Reason::EmptyEntries => "empty_entries".to_string(),
+            Rung2Reason::NoLoggable => "no_loggable".to_string(),
+        }
+    }
+
+    /// Classify a [`parse_diet_entries`] error string. A serde failure is prefixed
+    /// `invalid JSON:` (→ `MalformedJson`); anything else is a schema violation, and the
+    /// first back-tick-delimited token in the message is the offending field (schema
+    /// keys are back-ticked in the validator; a quoted value like a meal name is not, so
+    /// no meal text can leak into the code).
+    pub fn from_parse_error(msg: &str) -> Rung2Reason {
+        if msg.starts_with("invalid JSON:") {
+            Rung2Reason::MalformedJson
+        } else {
+            Rung2Reason::SchemaFail(schema_field(msg))
+        }
+    }
+}
+
+/// The first back-tick-delimited token in `msg` (the offending schema field), if any.
+fn schema_field(msg: &str) -> Option<String> {
+    let start = msg.find('`')? + 1;
+    let rest = &msg[start..];
+    let end = rest.find('`')?;
+    Some(rest[..end].to_string())
+}
+
 // ---- Provenance ------------------------------------------------------------
 
 /// One diet-turn provenance line (mirrors the title provenance line): local vs
 /// hosted-fallback with the rung, the extract backend (base URL + model, NEVER the
-/// token, no meal content), the verify verdict, the row count, and whether a mirror
-/// was derived.
+/// token, no meal content), the verify verdict, the row count, whether a mirror was
+/// derived, and — on a rung-2 fall-through — the machine-readable [`Rung2Reason`] code.
+#[allow(clippy::too_many_arguments)] // a flat provenance line; a params struct would only obscure it
 pub fn format_diet_provenance(
     local: bool,
     rung: Option<u8>,
@@ -1167,6 +1294,7 @@ pub fn format_diet_provenance(
     verify: &str,
     rows: usize,
     mirror_derived: bool,
+    reason: Option<&str>,
 ) -> String {
     let disposition = if local {
         "local".to_string()
@@ -1174,8 +1302,12 @@ pub fn format_diet_provenance(
         format!("hosted-fallback rung={}", rung.unwrap_or(0))
     };
     let mirror = if mirror_derived { "derived" } else { "omitted" };
+    // The machine-readable rung-2 reason rides after the disposition (content-free).
+    let reason = reason
+        .map(|r| format!(" reason={r}"))
+        .unwrap_or_default();
     format!(
-        "jesse-bridge: diet turn -> {disposition} extract base_url={base_url} model={model}; \
+        "jesse-bridge: diet turn -> {disposition}{reason} extract base_url={base_url} model={model}; \
          verify verdict={verify}; rows={rows} mirror={mirror}"
     )
 }
@@ -1188,8 +1320,8 @@ pub fn format_diet_provenance(
 pub const DIET_EXTRACT_SCHEMA: &str = r#"{
   "no_loggable_content": <boolean: true ONLY if the message logs nothing to eat/drink, no workout, no weight>,
   "entries": [
-    { "kind": "food", "name": "<ONE food item, never a combined meal>", "meal": "Breakfast|Lunch|Dinner|Snack", "time": "HH:MM", "amount": "<e.g. 1 medium (~118g)>", "unit": "serving", "kcal": <number>, "protein_g": <number>, "carbs_g": <number>, "fat_g": <number>, "fiber_g": <number>, "sodium_mg": <number>, "satfat_g": <number>, "sugar_g": <number>, "potassium_mg": <number>, "notes": "<optional>" },
-    { "kind": "exercise", "activity": "Run|Walk|Swim|Strength/Weights|...", "time": "HH:MM", "description": "<optional>", "distance_km": <number>, "duration": "<e.g. 56:58>", "pace": "<e.g. 7:07>", "avg_hr": <number>, "calories": <number>, "notes": "<optional>" },
+    { "kind": "food", "name": "<ONE food item, never a combined meal>", "meal": "Breakfast|Lunch|Dinner|Snack", "time": "<HH:MM ONLY if the message states a clock time, else null/omit — never invent one>", "amount": "<e.g. 1 medium (~118g)>", "unit": "serving", "kcal": <number>, "protein_g": <number>, "carbs_g": <number>, "fat_g": <number>, "fiber_g": <number>, "sodium_mg": <number>, "satfat_g": <number>, "sugar_g": <number>, "potassium_mg": <number>, "notes": "<optional>" },
+    { "kind": "exercise", "activity": "Run|Walk|Swim|Strength/Weights|...", "time": "<HH:MM ONLY if stated, else null/omit>", "description": "<optional>", "distance_km": <number>, "duration": "<e.g. 56:58>", "pace": "<e.g. 7:07>", "avg_hr": <number>, "calories": <number>, "notes": "<optional>" },
     { "kind": "weight", "weight_lbs": <number>, "weight_kg": <number>, "body_fat_pct": <number>, "muscle_mass_lbs": <number>, "notes": "<optional>" }
   ]
 }"#;
@@ -1218,8 +1350,12 @@ is saturated fat in grams (the label's \"di cui acidi grassi saturi\"). `sugar_g
 TOTAL sugars in grams (\"di cui zuccheri\"), NEVER added sugars. `potassium_mg` is \
 potassium in milligrams — optional on EU labels and usually absent, so usually omitted. \
 Scale label values to the amount actually logged when the serving differs.\n\
-- `time` is the clock time the thing happened (HH:MM). `meal` is the meal slot that \
-fits that hour.\n\
+- `time` is the clock time the thing happened (HH:MM), but ONLY when the message \
+states one (\"at 12:30\", \"this morning\" is NOT a clock time). You have NO clock and \
+MUST NOT invent, guess, or infer a time — if the message gives no explicit clock time, \
+set `time` to null or omit it, and the bridge stamps the real received-at time. `meal` \
+is the meal slot that fits the stated hour, or your best slot from the wording when no \
+time is given.\n\
 \n\
 PER-ITEM RULE (the 2026-07-13 schema decision — enforce it):\n\
 - Emit ONE food entry PER DISTINCT FOOD, each with its OWN per-item macros. NEVER a \
@@ -1333,8 +1469,13 @@ pub enum DietPipelineOutcome {
     },
     /// Logged locally but the mirror was omitted (rung 5): CSV committed, no directive.
     LoggedNoMirror { dashboard: String },
-    /// Fall through to the hosted turn at the given rung (2–4).
-    FallThrough { rung: DietRung },
+    /// Fall through to the hosted turn at the given rung (2–4). `reason` carries the
+    /// machine-readable [`Rung2Reason`] on a rung-2 fall-through (the only rung with a
+    /// reason taxonomy); `None` for rungs 3–4.
+    FallThrough {
+        rung: DietRung,
+        reason: Option<Rung2Reason>,
+    },
     /// The blocking hosted VERIFY child could not be reached (it errored — the verify
     /// child is ambient/hosted, so this is a hosted-outage signal). Carries everything
     /// the emergency path needs to QUEUE the extracted entry for later verify
@@ -1348,6 +1489,28 @@ pub enum DietPipelineOutcome {
         date: String,
         offset: String,
     },
+}
+
+/// Stamp every food entry that carries no explicitly-stated `time` with the turn's
+/// received-at wall clock (`HH:MM`). The bridge — never the model — owns the fallback
+/// time: the toolless extract child has no clock and returns a time ONLY when the
+/// utterance states one, so an absent/blank time here means "not stated" and is filled
+/// with `received_hhmm`. An explicitly-stated time is left untouched (it always wins).
+/// Runs at APPEND, so the filled time flows through the normal row + mirror path and
+/// leaves the derived dashboard/Apple-Health re-derivation unchanged.
+pub fn stamp_missing_food_times(entries: &mut [DietEntry], received_hhmm: &str) {
+    for e in entries.iter_mut() {
+        if let DietEntry::Food(f) = e {
+            let stated = f
+                .time
+                .as_deref()
+                .map(str::trim)
+                .is_some_and(|t| !t.is_empty());
+            if !stated {
+                f.time = Some(received_hhmm.to_string());
+            }
+        }
+    }
 }
 
 /// Split validated entries by kind (used by both the orchestrator and its tests).
@@ -1382,14 +1545,41 @@ pub async fn run_diet_pipeline(cfg: &Config, utterance: &str) -> DietPipelineOut
             eprintln!("jesse-bridge: diet pipeline invoked with no backend — falling through");
             return DietPipelineOutcome::FallThrough {
                 rung: DietRung::Child,
+                reason: Some(Rung2Reason::ChildError),
             };
         }
     };
+    // The turn's received-at wall clock (`HH:MM`), captured as the pipeline receives
+    // the turn. The bridge stamps this onto any food entry whose time the utterance
+    // never stated (see [`stamp_missing_food_times`]); the model never invents a time.
+    let received_hhmm = local_hhmm();
     let prov = |local: bool, rung: Option<u8>, verify: &str, rows: usize, mirror: bool| {
         eprintln!(
             "{}",
-            format_diet_provenance(local, rung, &base_url, &model, verify, rows, mirror)
+            format_diet_provenance(local, rung, &base_url, &model, verify, rows, mirror, None)
         );
+    };
+    // Rung-2 (Child) fall-through: emit provenance WITH the machine-readable reason and
+    // return it so the handler threads it into the metrics line. Every rung-2 cause is
+    // distinguished here (the audit separates failures from correct rejections).
+    let fall_child = |reason: Rung2Reason| {
+        eprintln!(
+            "{}",
+            format_diet_provenance(
+                false,
+                Some(2),
+                &base_url,
+                &model,
+                "n/a",
+                0,
+                false,
+                Some(&reason.code()),
+            )
+        );
+        DietPipelineOutcome::FallThrough {
+            rung: DietRung::Child,
+            reason: Some(reason),
+        }
     };
 
     // Stage 1 — extract.
@@ -1401,21 +1591,13 @@ pub async fn run_diet_pipeline(cfg: &Config, utterance: &str) -> DietPipelineOut
     .await
     {
         Ok(s) => s,
-        Err(_) => {
-            prov(false, Some(2), "n/a", 0, false);
-            return DietPipelineOutcome::FallThrough {
-                rung: DietRung::Child,
-            };
-        }
+        Err(_) => return fall_child(Rung2Reason::ChildError),
     };
     let extract = match parse_diet_entries(&extract_raw) {
-        Ok(e) if !e.no_loggable_content && !e.entries.is_empty() => e,
-        _ => {
-            prov(false, Some(2), "n/a", 0, false);
-            return DietPipelineOutcome::FallThrough {
-                rung: DietRung::Child,
-            };
-        }
+        Ok(e) if e.no_loggable_content => return fall_child(Rung2Reason::NoLoggable),
+        Ok(e) if e.entries.is_empty() => return fall_child(Rung2Reason::EmptyEntries),
+        Ok(e) => e,
+        Err(msg) => return fall_child(Rung2Reason::from_parse_error(&msg)),
     };
 
     // Stage 2 — verify (probation: mandatory, blocking, 100%).
@@ -1448,6 +1630,7 @@ pub async fn run_diet_pipeline(cfg: &Config, utterance: &str) -> DietPipelineOut
             prov(false, Some(3), "unavailable", extract.entries.len(), false);
             return DietPipelineOutcome::FallThrough {
                 rung: DietRung::Verify,
+                reason: None,
             };
         }
     };
@@ -1467,6 +1650,7 @@ pub async fn run_diet_pipeline(cfg: &Config, utterance: &str) -> DietPipelineOut
                 prov(false, Some(3), "rejected", extract.entries.len(), false);
                 return DietPipelineOutcome::FallThrough {
                     rung: DietRung::Verify,
+                    reason: None,
                 };
             }
         }
@@ -1477,7 +1661,10 @@ pub async fn run_diet_pipeline(cfg: &Config, utterance: &str) -> DietPipelineOut
         "approved"
     };
 
-    // Stage 3 — append + hooks + commit (atomic per turn).
+    // Stage 3 — append + hooks + commit (atomic per turn). Fill any unstated food
+    // time with the turn's received-at wall clock BEFORE building rows, so the time
+    // flows through the normal row + mirror path (bridge owns received-at).
+    stamp_missing_food_times(&mut verified, &received_hhmm);
     let (food, exercise, weight) = split_entries(&verified);
     let date = local_today();
     let food_rows: Vec<String> = food.iter().map(|f| food_row(f, &date)).collect();
@@ -1493,6 +1680,7 @@ pub async fn run_diet_pipeline(cfg: &Config, utterance: &str) -> DietPipelineOut
             prov(false, Some(4), verify_word, verified.len(), false);
             return DietPipelineOutcome::FallThrough {
                 rung: DietRung::Append,
+                reason: None,
             };
         }
     };
@@ -1502,6 +1690,7 @@ pub async fn run_diet_pipeline(cfg: &Config, utterance: &str) -> DietPipelineOut
         prov(false, Some(4), verify_word, verified.len(), false);
         return DietPipelineOutcome::FallThrough {
             rung: DietRung::Append,
+            reason: None,
         };
     }
     if let Err(e) = commit_diet_logs(vault, &date, &local_hhmm()).await {
@@ -1510,6 +1699,7 @@ pub async fn run_diet_pipeline(cfg: &Config, utterance: &str) -> DietPipelineOut
         prov(false, Some(4), verify_word, verified.len(), false);
         return DietPipelineOutcome::FallThrough {
             rung: DietRung::Append,
+            reason: None,
         };
     }
 
@@ -1681,7 +1871,7 @@ mod tests {
         let e = FoodEntry {
             name: "Banana".into(),
             meal: "Snack".into(),
-            time: "10:00".into(),
+            time: Some("10:00".into()),
             amount: None,
             unit: None,
             kcal: Some(105.0),
@@ -1714,7 +1904,7 @@ mod tests {
         let e = FoodEntry {
             name: "Prosciutto".into(),
             meal: "Lunch".into(),
-            time: "12:00".into(),
+            time: Some("12:00".into()),
             amount: None,
             unit: None,
             kcal: Some(120.0),
@@ -1745,18 +1935,227 @@ mod tests {
     }
 
     #[test]
+    fn missing_or_null_time_is_accepted_not_schema_failed() {
+        // "ate 1 almond" — the utterance states no clock time. The toolless extract
+        // child has no clock, so it omits (or nulls) `time`; the bridge owns the
+        // received-at fallback at append. Requiring `time` here made this a
+        // DETERMINISTIC rung-2 schema-fail (3/3 reruns in the 2026-07-15
+        // investigation). The parser must ACCEPT an absent/null time.
+        let omitted = r#"{"entries":[{"kind":"food","name":"almond","meal":"Snack"}]}"#;
+        assert!(
+            parse_diet_entries(omitted).is_ok(),
+            "an omitted time must parse (bridge fills received-at), not schema-fail"
+        );
+        let null = r#"{"entries":[{"kind":"food","name":"almond","meal":"Snack","time":null}]}"#;
+        assert!(
+            parse_diet_entries(null).is_ok(),
+            "a null time must parse (bridge fills received-at), not schema-fail"
+        );
+        // An omitted time parses to `None` (not stated) — never a fabricated value.
+        match &parse_diet_entries(omitted).unwrap().entries[0] {
+            DietEntry::Food(f) => assert_eq!(f.time, None, "unstated time stays None until append"),
+            other => panic!("expected food, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn stamp_fills_only_unstated_food_times_with_received_at() {
+        // The bridge owns received-at: a food entry with no stated time is stamped at
+        // append; an explicitly-stated time always wins and is left untouched.
+        let mut entries = vec![
+            DietEntry::Food(FoodEntry {
+                name: "almond".into(),
+                meal: "Snack".into(),
+                time: None, // unstated → should be filled
+                amount: None,
+                unit: None,
+                kcal: Some(7.0),
+                protein_g: None,
+                carbs_g: None,
+                fat_g: None,
+                fiber_g: None,
+                sodium_mg: None,
+                satfat_g: None,
+                sugar_g: None,
+                potassium_mg: None,
+                notes: None,
+            }),
+            DietEntry::Food(FoodEntry {
+                name: "toast".into(),
+                meal: "Breakfast".into(),
+                time: Some("07:15".into()), // explicit → must be preserved
+                amount: None,
+                unit: None,
+                kcal: Some(120.0),
+                protein_g: None,
+                carbs_g: None,
+                fat_g: None,
+                fiber_g: None,
+                sodium_mg: None,
+                satfat_g: None,
+                sugar_g: None,
+                potassium_mg: None,
+                notes: None,
+            }),
+        ];
+        stamp_missing_food_times(&mut entries, "17:44");
+        match (&entries[0], &entries[1]) {
+            (DietEntry::Food(a), DietEntry::Food(b)) => {
+                assert_eq!(a.time.as_deref(), Some("17:44"), "unstated time gets received-at");
+                assert_eq!(b.time.as_deref(), Some("07:15"), "stated time is preserved");
+            }
+            _ => panic!("expected two food entries"),
+        }
+    }
+
+    #[test]
+    fn unstated_time_flows_through_row_and_mirror_as_received_at() {
+        // End to end at the append layer: an unstated-time item, once stamped, carries
+        // received-at into BOTH the CSV Time column and the derived mirror `consumedAt`
+        // — the normal row path, so dashboard re-derivation is unchanged by the fill.
+        let mut entries =
+            parse_diet_entries(r#"{"entries":[{"kind":"food","name":"almond","meal":"Snack","kcal":7}]}"#)
+                .unwrap()
+                .entries;
+        stamp_missing_food_times(&mut entries, "17:44");
+        let (food, _, _) = split_entries(&entries);
+        // CSV Time column (13th field) is the received-at time.
+        let row = food_row(&food[0], "2026-07-16");
+        assert_eq!(row.split(',').nth(12), Some("17:44"), "Time cell = received-at: {row}");
+        // Mirror consumedAt derives from the same filled time.
+        let mirror = build_meal_log_from_food_rows(&food, "2026-07-16", "+00:00")
+            .unwrap()
+            .expect("a food row yields a mirror");
+        assert_eq!(mirror.meals[0].consumed_at, "2026-07-16T17:44:00+00:00");
+    }
+
+    #[test]
+    fn stated_time_is_preserved_end_to_end() {
+        // "lunch at 12:30" — an explicit time survives parse → row → mirror untouched.
+        let entries = parse_diet_entries(
+            r#"{"entries":[{"kind":"food","name":"salad","meal":"Lunch","time":"12:30","kcal":250}]}"#,
+        )
+        .unwrap()
+        .entries;
+        // No stamping needed, but even if append runs it, the stated time wins.
+        let mut e2 = entries.clone();
+        stamp_missing_food_times(&mut e2, "17:44");
+        let (food, _, _) = split_entries(&e2);
+        let row = food_row(&food[0], "2026-07-16");
+        assert_eq!(row.split(',').nth(12), Some("12:30"), "stated Time cell preserved: {row}");
+        let mirror = build_meal_log_from_food_rows(&food, "2026-07-16", "+00:00")
+            .unwrap()
+            .unwrap();
+        assert_eq!(mirror.meals[0].consumed_at, "2026-07-16T12:30:00+00:00");
+    }
+
+    #[test]
     fn parse_rejects_malformed_and_off_contract() {
         for bad in [
             "not json",
             r#"{"entries":"nope"}"#,
-            r#"{"entries":[{"kind":"food"}]}"#, // missing name/meal/time
+            r#"{"entries":[{"kind":"food"}]}"#, // missing name/meal (time is now optional)
             r#"{"entries":[{"kind":"food","name":"n","meal":"Snack","time":"t","kcal":-5}]}"#, // negative
-            r#"{"entries":[{"kind":"food","name":"n","meal":"Snack","time":"t","kcal":null}]}"#, // explicit null
             r#"{"entries":[{"kind":"bogus"}]}"#,
             r#"{"entries":[{"kind":"food","name":"n","meal":"Snack","time":"t","added_sugar_g":5}]}"#, // unknown key (a schema field like sodium_mg would now parse)
             r#"{"extra":1,"entries":[]}"#, // unknown top-level
         ] {
             assert!(parse_diet_entries(bad).is_err(), "should reject: {bad}");
+        }
+    }
+
+    #[test]
+    fn null_and_empty_optional_macros_are_absent_zero_is_measured() {
+        // The prompt says "omit unknowns"; the model nulls them instead (or emits an
+        // empty string). Both must mean ABSENT for an optional macro — the
+        // null-is-a-violation rule was a top rung-2 cause (10/20 turns, with missing
+        // time, in the 2026-07-15 investigation).
+        let base = |body: &str| {
+            format!(r#"{{"entries":[{{"kind":"food","name":"n","meal":"Snack","time":"09:00",{body}}}]}}"#)
+        };
+        for body in [r#""kcal":null"#, r#""kcal":"""#, r#""protein_g":null"#] {
+            let ex = parse_diet_entries(&base(body)).unwrap_or_else(|e| panic!("{body} must parse: {e:?}"));
+            match &ex.entries[0] {
+                DietEntry::Food(f) => {
+                    if body.contains("protein_g") {
+                        assert_eq!(f.protein_g, None, "null protein_g is absent: {body}");
+                    } else {
+                        assert_eq!(f.kcal, None, "null/empty kcal is absent: {body}");
+                    }
+                }
+                other => panic!("expected food, got {other:?}"),
+            }
+        }
+        // A literal 0 remains a MEASURED zero, never absent.
+        let z = parse_diet_entries(&base(r#""kcal":0"#)).unwrap();
+        match &z.entries[0] {
+            DietEntry::Food(f) => assert_eq!(f.kcal, Some(0.0), "0 is a measured zero, not absent"),
+            other => panic!("expected food, got {other:?}"),
+        }
+        // Still strict: a negative or non-numeric value is a schema violation.
+        assert!(parse_diet_entries(&base(r#""kcal":-5"#)).is_err(), "negative still rejected");
+        assert!(parse_diet_entries(&base(r#""kcal":"abc""#)).is_err(), "non-numeric string still rejected");
+    }
+
+    #[test]
+    fn verify_verdict_macro_parsing_stays_strict_on_null() {
+        // The null/empty tolerance is EXTRACT-only. The hosted verify verdict parser
+        // stays strict (a null macro is a violation → rung 3), so verify-gate behavior
+        // is unchanged by Fix 2.
+        assert!(
+            parse_verify_verdicts(r#"{"verdicts":[{"verdict":"approve","kcal":null}]}"#, 1).is_err(),
+            "verify parsing must stay strict on a null macro"
+        );
+        // A well-formed verdict still parses.
+        assert!(
+            parse_verify_verdicts(r#"{"verdicts":[{"verdict":"approve","kcal":100}]}"#, 1).is_ok()
+        );
+    }
+
+    #[test]
+    fn fenced_json_payload_parses_after_fence_strip() {
+        // Through the production CLI child shape the model fences its JSON in a markdown
+        // code block on some turns (turns 4, 11, 13 of the 2026-07-15 investigation —
+        // 3/20 rung-2 turns were "fenced malformed", off correct comprehension). A full
+        // outer fence must be stripped before parsing.
+        let tagged = "```json\n{\"entries\":[{\"kind\":\"food\",\"name\":\"almond\",\"meal\":\"Snack\",\"kcal\":7}]}\n```";
+        let ex = parse_diet_entries(tagged)
+            .unwrap_or_else(|e| panic!("fenced (```json) payload must parse: {e:?}"));
+        assert_eq!(ex.entries.len(), 1, "fenced entry parses");
+        // A bare ``` fence (no language tag), with surrounding whitespace, too.
+        let bare = "\n```\n{\"no_loggable_content\":true,\"entries\":[]}\n```\n";
+        assert!(
+            parse_diet_entries(bare).unwrap().no_loggable_content,
+            "bare-fenced payload must parse"
+        );
+    }
+
+    #[test]
+    fn strip_code_fence_only_unwraps_a_full_outer_fence() {
+        // A full wrapper (tagged or bare) → interior returned.
+        assert_eq!(strip_code_fence("```json\n{\"a\":1}\n```"), "{\"a\":1}");
+        assert_eq!(strip_code_fence("```\n{\"a\":1}\n```"), "{\"a\":1}");
+        // Unfenced payload → returned verbatim (the common case, no regression).
+        assert_eq!(strip_code_fence("{\"a\":1}"), "{\"a\":1}");
+        // A fence INSIDE a JSON string value must never be modified — the payload is
+        // not itself fence-wrapped, so it passes through untouched.
+        let inner = "{\"notes\":\"see ```code``` block\"}";
+        assert_eq!(strip_code_fence(inner), inner);
+        // Not fully wrapped: no closing fence line → left exactly as-is.
+        assert_eq!(strip_code_fence("```json\n{\"a\":1}"), "```json\n{\"a\":1}");
+        // Prose before the fence (payload does not START with the fence) → untouched.
+        let trailing = "here you go:\n```json\n{\"a\":1}\n```";
+        assert_eq!(strip_code_fence(trailing), trailing);
+    }
+
+    #[test]
+    fn fence_inside_a_string_value_survives_parse() {
+        // An unfenced payload whose Notes field legitimately contains backticks parses
+        // with the backticks intact (the strip never runs on a non-wrapped payload).
+        let json = r#"{"entries":[{"kind":"food","name":"n","meal":"Snack","time":"09:00","notes":"label reads ```200 kcal```"}]}"#;
+        match &parse_diet_entries(json).unwrap().entries[0] {
+            DietEntry::Food(f) => assert_eq!(f.notes.as_deref(), Some("label reads ```200 kcal```")),
+            other => panic!("expected food, got {other:?}"),
         }
     }
 
@@ -1828,7 +2227,7 @@ mod tests {
         DietEntry::Food(FoodEntry {
             name: "Banana".into(),
             meal: "Snack".into(),
-            time: "10:00".into(),
+            time: Some("10:00".into()),
             amount: None,
             unit: None,
             kcal: Some(kcal),
@@ -1901,7 +2300,7 @@ mod tests {
         let e = DietEntry::Food(FoodEntry {
             name: "Crackers".into(),
             meal: "Snack".into(),
-            time: "15:00".into(),
+            time: Some("15:00".into()),
             amount: None,
             unit: None,
             kcal: Some(100.0),
@@ -1960,7 +2359,7 @@ mod tests {
         let e = FoodEntry {
             name: "Salmon sockeye (Fiorfiore, canned)".into(),
             meal: "Breakfast".into(),
-            time: "09:40".into(),
+            time: Some("09:40".into()),
             amount: Some("1 can".into()),
             unit: None,
             kcal: Some(129.0),
@@ -2001,7 +2400,7 @@ mod tests {
         let e = FoodEntry {
             name: "Water".into(),
             meal: "Snack".into(),
-            time: "12:00".into(),
+            time: Some("12:00".into()),
             amount: None,
             unit: None,
             kcal: None,
@@ -2063,7 +2462,7 @@ mod tests {
         let f = FoodEntry {
             name: "n".into(),
             meal: "Snack".into(),
-            time: "09:00".into(),
+            time: Some("09:00".into()),
             amount: None,
             unit: None,
             kcal: Some(1.0),
@@ -2115,7 +2514,7 @@ mod tests {
         FoodEntry {
             name: name.into(),
             meal: meal.into(),
-            time: time.into(),
+            time: Some(time.into()),
             amount: None,
             unit: None,
             kcal: Some(kcal),
@@ -2158,7 +2557,7 @@ mod tests {
         let e = FoodEntry {
             name: "Toast".into(),
             meal: "Breakfast".into(),
-            time: "08:00".into(),
+            time: Some("08:00".into()),
             amount: None,
             unit: None,
             kcal: Some(180.0),
@@ -2189,7 +2588,7 @@ mod tests {
         let e = FoodEntry {
             name: "Prosciutto".into(),
             meal: "Lunch".into(),
-            time: "12:30".into(),
+            time: Some("12:30".into()),
             amount: None,
             unit: None,
             kcal: Some(120.0),
@@ -2369,23 +2768,83 @@ mod tests {
     #[test]
     fn provenance_local_and_fallback_and_no_mirror() {
         assert_eq!(
-            format_diet_provenance(true, None, "http://u", "m", "approved", 2, true),
+            format_diet_provenance(true, None, "http://u", "m", "approved", 2, true, None),
             "jesse-bridge: diet turn -> local extract base_url=http://u model=m; verify verdict=approved; rows=2 mirror=derived"
         );
         assert_eq!(
-            format_diet_provenance(false, Some(3), "http://u", "m", "rejected", 1, false),
+            format_diet_provenance(false, Some(3), "http://u", "m", "rejected", 1, false, None),
             "jesse-bridge: diet turn -> hosted-fallback rung=3 extract base_url=http://u model=m; verify verdict=rejected; rows=1 mirror=omitted"
         );
         // Rung 5: logged locally, mirror omitted.
         assert_eq!(
-            format_diet_provenance(true, Some(5), "http://u", "m", "corrected", 11, false),
+            format_diet_provenance(true, Some(5), "http://u", "m", "corrected", 11, false, None),
             "jesse-bridge: diet turn -> local extract base_url=http://u model=m; verify verdict=corrected; rows=11 mirror=omitted"
         );
         // Never prints a token.
-        let line = format_diet_provenance(true, None, "http://u", "m", "approved", 1, true);
+        let line = format_diet_provenance(true, None, "http://u", "m", "approved", 1, true, None);
         assert!(
             !line.contains("token"),
             "provenance must never carry a token"
+        );
+    }
+
+    #[test]
+    fn provenance_rung2_carries_a_machine_readable_reason() {
+        // Every rung-2 emission must carry a machine-readable reason so the daily audit
+        // can tell a FAILURE from a correct rejection. It rides after the rung, is
+        // content-free, and never appears on a non-rung-2 line.
+        let line = format_diet_provenance(
+            false,
+            Some(2),
+            "http://u",
+            "m",
+            "n/a",
+            0,
+            false,
+            Some("schema_fail:time"),
+        );
+        assert!(
+            line.contains("reason=schema_fail:time"),
+            "rung-2 provenance must carry the reason code: {line}"
+        );
+        assert!(!line.contains("token"), "still never carries a token");
+        // A local success (no reason) is unchanged — no `reason=` fragment.
+        let ok = format_diet_provenance(true, None, "http://u", "m", "approved", 1, true, None);
+        assert!(!ok.contains("reason="), "a non-rung-2 line has no reason: {ok}");
+    }
+
+    #[test]
+    fn rung2_reason_codes_are_content_free_and_name_the_field() {
+        assert_eq!(Rung2Reason::ChildError.code(), "child_error");
+        assert_eq!(Rung2Reason::MalformedJson.code(), "malformed_json");
+        assert_eq!(Rung2Reason::EmptyEntries.code(), "empty_entries");
+        assert_eq!(Rung2Reason::NoLoggable.code(), "no_loggable");
+        assert_eq!(
+            Rung2Reason::SchemaFail(Some("time".into())).code(),
+            "schema_fail:time"
+        );
+        assert_eq!(Rung2Reason::SchemaFail(None).code(), "schema_fail");
+        // Classification from a parse-error string: serde failures are malformed_json;
+        // a validator message names its back-ticked field; a quoted meal name never
+        // leaks into the code (it is not back-ticked).
+        assert_eq!(
+            Rung2Reason::from_parse_error("invalid JSON: expected value at line 1 column 1"),
+            Rung2Reason::MalformedJson
+        );
+        assert_eq!(
+            Rung2Reason::from_parse_error("entry missing string `time`"),
+            Rung2Reason::SchemaFail(Some("time".into()))
+        );
+        assert_eq!(
+            Rung2Reason::from_parse_error("`kcal` is negative"),
+            Rung2Reason::SchemaFail(Some("kcal".into()))
+        );
+        // A quoted (not back-ticked) name yields no field — no meal text in the code.
+        assert_eq!(
+            Rung2Reason::from_parse_error(
+                "food entry name \"Eggs and toast\" spans multiple items"
+            ),
+            Rung2Reason::SchemaFail(None)
         );
     }
 
@@ -2427,7 +2886,14 @@ mod tests {
             "local-diet".into(),
         ));
         match run_diet_pipeline(&cfg, "logged a banana").await {
-            DietPipelineOutcome::FallThrough { rung } => assert_eq!(rung, DietRung::Child),
+            DietPipelineOutcome::FallThrough { rung, reason } => {
+                assert_eq!(rung, DietRung::Child);
+                assert_eq!(
+                    reason,
+                    Some(Rung2Reason::ChildError),
+                    "a failed extract spawn is a child_error"
+                );
+            }
             _ => panic!("a failed extract spawn must fall through at rung 2"),
         }
     }
