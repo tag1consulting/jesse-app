@@ -53,7 +53,7 @@ pub const DIET_VERIFY_TIMEOUT_SECS: u64 = 30;
 // append_schema` is the drift guard that enforces this (the parity mitigation).
 
 pub const FOOD_LOG_HEADER: &str =
-    "Date,Meal,Item,Amount,Unit,Cal_per_100g,Grams,Calories,Protein_g,Fat_g,Carbs_g,Notes,Time,Meal_Type,Fiber_g";
+    "Date,Meal,Item,Amount,Unit,Cal_per_100g,Grams,Calories,Protein_g,Fat_g,Carbs_g,Notes,Time,Meal_Type,Fiber_g,Sodium_mg,SatFat_g,Sugar_g,Potassium_mg";
 pub const EXERCISE_LOG_HEADER: &str =
     "Date,Type,Description,Distance_km,Duration,Pace_min_per_km,Elevation_m,Avg_HR,Cadence,Calories,Plan_Source,Notes,Start_Time";
 pub const WEIGHT_LOG_HEADER: &str =
@@ -81,6 +81,14 @@ pub struct FoodEntry {
     pub carbs_g: Option<f64>,
     pub fat_g: Option<f64>,
     pub fiber_g: Option<f64>,
+    // The four micronutrients — same unknown-is-not-zero discipline as the macros:
+    // `None` means the message/label never established a value (blank CSV cell, omitted
+    // on the wire), never `Some(0.0)`. `sodium_mg`/`potassium_mg` are milligrams;
+    // `satfat_g`/`sugar_g` are grams.
+    pub sodium_mg: Option<f64>,
+    pub satfat_g: Option<f64>,
+    pub sugar_g: Option<f64>,
+    pub potassium_mg: Option<f64>,
     pub notes: Option<String>,
 }
 
@@ -272,6 +280,10 @@ const FOOD_KEYS: &[&str] = &[
     "carbs_g",
     "fat_g",
     "fiber_g",
+    "sodium_mg",
+    "satfat_g",
+    "sugar_g",
+    "potassium_mg",
     "notes",
 ];
 
@@ -298,6 +310,10 @@ fn parse_food(m: &serde_json::Map<String, Value>) -> Result<FoodEntry, String> {
         carbs_g: opt_num_field(m, "carbs_g")?,
         fat_g: opt_num_field(m, "fat_g")?,
         fiber_g: opt_num_field(m, "fiber_g")?,
+        sodium_mg: opt_num_field(m, "sodium_mg")?,
+        satfat_g: opt_num_field(m, "satfat_g")?,
+        sugar_g: opt_num_field(m, "sugar_g")?,
+        potassium_mg: opt_num_field(m, "potassium_mg")?,
         notes: opt_str_field(m, "notes"),
     })
 }
@@ -540,6 +556,10 @@ pub fn food_row(e: &FoodEntry, date: &str) -> String {
         csv_field(&e.time),
         csv_field(&e.meal), // Meal_Type mirrors Meal
         num_cell(e.fiber_g),
+        num_cell(e.sodium_mg),    // Sodium_mg — blank when unknown, never 0
+        num_cell(e.satfat_g),     // SatFat_g
+        num_cell(e.sugar_g),      // Sugar_g
+        num_cell(e.potassium_mg), // Potassium_mg
     ];
     cols.join(",")
 }
@@ -634,6 +654,14 @@ pub fn build_meal_log_from_food_rows(
                 carbs_g: r.carbs_g,
                 fat_g: r.fat_g,
                 fiber_g: r.fiber_g,
+                // Micronutrients carry through per row too. Each mirror meal is exactly
+                // ONE food row, so the "sum over the meal's items that carry a known
+                // value" is just this row's value when known, and `None` (no wire field)
+                // when the row never established it — never a summed `Some(0)`.
+                sodium_mg: r.sodium_mg,
+                satfat_g: r.satfat_g,
+                sugar_g: r.sugar_g,
+                potassium_mg: r.potassium_mg,
             }
         })
         .collect();
@@ -1160,7 +1188,7 @@ pub fn format_diet_provenance(
 pub const DIET_EXTRACT_SCHEMA: &str = r#"{
   "no_loggable_content": <boolean: true ONLY if the message logs nothing to eat/drink, no workout, no weight>,
   "entries": [
-    { "kind": "food", "name": "<ONE food item, never a combined meal>", "meal": "Breakfast|Lunch|Dinner|Snack", "time": "HH:MM", "amount": "<e.g. 1 medium (~118g)>", "unit": "serving", "kcal": <number>, "protein_g": <number>, "carbs_g": <number>, "fat_g": <number>, "fiber_g": <number>, "notes": "<optional>" },
+    { "kind": "food", "name": "<ONE food item, never a combined meal>", "meal": "Breakfast|Lunch|Dinner|Snack", "time": "HH:MM", "amount": "<e.g. 1 medium (~118g)>", "unit": "serving", "kcal": <number>, "protein_g": <number>, "carbs_g": <number>, "fat_g": <number>, "fiber_g": <number>, "sodium_mg": <number>, "satfat_g": <number>, "sugar_g": <number>, "potassium_mg": <number>, "notes": "<optional>" },
     { "kind": "exercise", "activity": "Run|Walk|Swim|Strength/Weights|...", "time": "HH:MM", "description": "<optional>", "distance_km": <number>, "duration": "<e.g. 56:58>", "pace": "<e.g. 7:07>", "avg_hr": <number>, "calories": <number>, "notes": "<optional>" },
     { "kind": "weight", "weight_lbs": <number>, "weight_kg": <number>, "body_fat_pct": <number>, "muscle_mass_lbs": <number>, "notes": "<optional>" }
   ]
@@ -1181,6 +1209,15 @@ CONTRACT (the vault's diet logs; you are parsing INTO these columns):\n\
 - weight-log.csv columns: {WEIGHT_LOG_HEADER}\n\
 - Macros are per-ITEM absolute grams/kcal. Omit any macro you don't know — NEVER \
 guess and NEVER write 0 as a placeholder (0 means a real measured zero).\n\
+- MICRONUTRIENTS (`sodium_mg`, `satfat_g`, `sugar_g`, `potassium_mg`) follow the SAME \
+rule: fill a value only from a nutrition label in the message or a confident estimate, \
+otherwise OMIT the key entirely (never guess, never 0-as-placeholder). Units and \
+conversions: `sodium_mg` is sodium in MILLIGRAMS — when an EU label prints salt \
+(\"sale\") in grams instead of sodium, convert sodium_mg = salt_grams × 400. `satfat_g` \
+is saturated fat in grams (the label's \"di cui acidi grassi saturi\"). `sugar_g` is \
+TOTAL sugars in grams (\"di cui zuccheri\"), NEVER added sugars. `potassium_mg` is \
+potassium in milligrams — optional on EU labels and usually absent, so usually omitted. \
+Scale label values to the amount actually logged when the serving differs.\n\
 - `time` is the clock time the thing happened (HH:MM). `meal` is the meal slot that \
 fits that hour.\n\
 \n\
@@ -1591,6 +1628,116 @@ mod tests {
     }
 
     #[test]
+    fn parses_food_micronutrients_all_some_or_none() {
+        // All four present, a subset present, and none present must ALL parse — each
+        // micronutrient is optional and unknown-is-not-zero (absent → None).
+        let json = r#"{"entries":[
+            {"kind":"food","name":"Prosciutto","meal":"Lunch","time":"12:00","kcal":120,"sodium_mg":900,"satfat_g":2.5,"sugar_g":0,"potassium_mg":180},
+            {"kind":"food","name":"Cracker","meal":"Snack","time":"15:00","kcal":80,"sodium_mg":150,"sugar_g":1.2},
+            {"kind":"food","name":"Banana","meal":"Snack","time":"10:00","kcal":105}
+        ]}"#;
+        let ex = parse_diet_entries(json).expect("all three parse");
+        let foods: Vec<&FoodEntry> = ex
+            .entries
+            .iter()
+            .filter_map(|e| match e {
+                DietEntry::Food(f) => Some(f),
+                _ => None,
+            })
+            .collect();
+        // All four present.
+        assert_eq!(foods[0].sodium_mg, Some(900.0));
+        assert_eq!(foods[0].satfat_g, Some(2.5));
+        assert_eq!(foods[0].sugar_g, Some(0.0), "explicit measured zero");
+        assert_eq!(foods[0].potassium_mg, Some(180.0));
+        // Subset present — the omitted two stay None, not 0.
+        assert_eq!(foods[1].sodium_mg, Some(150.0));
+        assert_eq!(foods[1].sugar_g, Some(1.2));
+        assert_eq!(foods[1].satfat_g, None);
+        assert_eq!(foods[1].potassium_mg, None);
+        // None present — all four absent.
+        assert!(
+            foods[2].sodium_mg.is_none()
+                && foods[2].satfat_g.is_none()
+                && foods[2].sugar_g.is_none()
+                && foods[2].potassium_mg.is_none()
+        );
+    }
+
+    #[test]
+    fn parse_rejects_negative_micronutrient() {
+        // A micronutrient shares the finite/non-negative discipline of the macros.
+        assert!(parse_diet_entries(
+            r#"{"entries":[{"kind":"food","name":"n","meal":"Snack","time":"09:00","sodium_mg":-5}]}"#
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn blank_micronutrient_round_trips_to_unknown_not_zero() {
+        // End-to-end: a food entry with NO sodium builds a row whose Sodium_mg cell is
+        // empty, and reading that row back through the shipped CSV reader yields JSON
+        // null (unknown) for `na` — never 0.
+        let e = FoodEntry {
+            name: "Banana".into(),
+            meal: "Snack".into(),
+            time: "10:00".into(),
+            amount: None,
+            unit: None,
+            kcal: Some(105.0),
+            protein_g: Some(1.3),
+            carbs_g: Some(27.0),
+            fat_g: Some(0.4),
+            fiber_g: Some(3.0),
+            sodium_mg: None,
+            satfat_g: None,
+            sugar_g: None,
+            potassium_mg: None,
+            notes: None,
+        };
+        let csv = format!("{FOOD_LOG_HEADER}\n{}\n", food_row(&e, "2026-07-13"));
+        let (meals, _errors) = crate::diet::reconstruct_meals(&csv, "2026-07-13");
+        let item = &meals[0]["items"][0];
+        assert!(
+            item["na"].is_null(),
+            "blank Sodium_mg reads back as null, not 0"
+        );
+        assert!(item["satf"].is_null(), "blank SatFat_g reads back as null");
+        assert!(item["sug"].is_null(), "blank Sugar_g reads back as null");
+        assert!(item["k"].is_null(), "blank Potassium_mg reads back as null");
+    }
+
+    #[test]
+    fn known_micronutrient_round_trips_through_the_reader() {
+        // The mirror image: a KNOWN sodium survives the row build and reads back as its
+        // number (proving the write column lands where the reader expects it).
+        let e = FoodEntry {
+            name: "Prosciutto".into(),
+            meal: "Lunch".into(),
+            time: "12:00".into(),
+            amount: None,
+            unit: None,
+            kcal: Some(120.0),
+            protein_g: None,
+            carbs_g: None,
+            fat_g: None,
+            fiber_g: None,
+            sodium_mg: Some(900.0),
+            satfat_g: Some(2.5),
+            sugar_g: Some(0.0),
+            potassium_mg: Some(180.0),
+            notes: None,
+        };
+        let csv = format!("{FOOD_LOG_HEADER}\n{}\n", food_row(&e, "2026-07-13"));
+        let (meals, _errors) = crate::diet::reconstruct_meals(&csv, "2026-07-13");
+        let item = &meals[0]["items"][0];
+        assert_eq!(item["na"], 900.0);
+        assert_eq!(item["satf"], 2.5);
+        assert_eq!(item["sug"], 0.0, "measured-zero sugar reads back as 0");
+        assert_eq!(item["k"], 180.0);
+    }
+
+    #[test]
     fn no_loggable_content_flag_parses() {
         let ex = parse_diet_entries(r#"{"no_loggable_content":true,"entries":[]}"#).unwrap();
         assert!(ex.no_loggable_content);
@@ -1606,7 +1753,7 @@ mod tests {
             r#"{"entries":[{"kind":"food","name":"n","meal":"Snack","time":"t","kcal":-5}]}"#, // negative
             r#"{"entries":[{"kind":"food","name":"n","meal":"Snack","time":"t","kcal":null}]}"#, // explicit null
             r#"{"entries":[{"kind":"bogus"}]}"#,
-            r#"{"entries":[{"kind":"food","name":"n","meal":"Snack","time":"t","sodium_mg":5}]}"#, // unknown key
+            r#"{"entries":[{"kind":"food","name":"n","meal":"Snack","time":"t","added_sugar_g":5}]}"#, // unknown key (a schema field like sodium_mg would now parse)
             r#"{"extra":1,"entries":[]}"#, // unknown top-level
         ] {
             assert!(parse_diet_entries(bad).is_err(), "should reject: {bad}");
@@ -1689,6 +1836,10 @@ mod tests {
             carbs_g: Some(27.0),
             fat_g: Some(0.4),
             fiber_g: Some(3.0),
+            sodium_mg: None,
+            satfat_g: None,
+            sugar_g: None,
+            potassium_mg: None,
             notes: None,
         })
     }
@@ -1743,6 +1894,40 @@ mod tests {
     }
 
     #[test]
+    fn correction_carries_micronutrients_through_untouched() {
+        // The verifier only corrects the five macros; the four micronutrients ride
+        // the `..f.clone()` spread untouched. A kcal correction must not disturb a
+        // known sodium value (nor invent one on the absent potassium).
+        let e = DietEntry::Food(FoodEntry {
+            name: "Crackers".into(),
+            meal: "Snack".into(),
+            time: "15:00".into(),
+            amount: None,
+            unit: None,
+            kcal: Some(100.0),
+            protein_g: Some(2.0),
+            carbs_g: Some(18.0),
+            fat_g: Some(3.0),
+            fiber_g: Some(1.0),
+            sodium_mg: Some(230.0),
+            satfat_g: Some(0.5),
+            sugar_g: Some(0.0),
+            potassium_mg: None,
+            notes: None,
+        });
+        match resolve_verdict(&e, &verdict(Verdict::Correct, Some(140.0))) {
+            Some(DietEntry::Food(f)) => {
+                assert_eq!(f.kcal, Some(140.0), "kcal corrected");
+                assert_eq!(f.sodium_mg, Some(230.0), "sodium carried through untouched");
+                assert_eq!(f.satfat_g, Some(0.5), "satfat untouched");
+                assert_eq!(f.sugar_g, Some(0.0), "measured-zero sugar preserved");
+                assert_eq!(f.potassium_mg, None, "absent potassium stays absent");
+            }
+            other => panic!("expected correction, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn reject_falls_through_to_hosted() {
         assert_eq!(
             resolve_verdict(&food(105.0), &verdict(Verdict::Reject, None)),
@@ -1783,15 +1968,19 @@ mod tests {
             carbs_g: Some(0.0),
             fat_g: Some(2.3),
             fiber_g: Some(0.0),
+            sodium_mg: Some(340.0),
+            satfat_g: Some(0.5),
+            sugar_g: Some(0.0), // a real measured zero, not "unknown"
+            potassium_mg: None, // absent on the label → blank cell, never 0
             notes: Some("drained, with salt".into()),
         };
         let row = food_row(&e, "2026-07-13");
-        // RFC-4180: the item's comma forces quoting; the row parses back to 15 fields.
+        // RFC-4180: the item's comma forces quoting; the row parses back to 19 fields.
         let mut rdr = csv::ReaderBuilder::new()
             .has_headers(false)
             .from_reader(row.as_bytes());
         let rec = rdr.records().next().unwrap().unwrap();
-        assert_eq!(rec.len(), FOOD_LOG_HEADER.split(',').count(), "15 columns");
+        assert_eq!(rec.len(), FOOD_LOG_HEADER.split(',').count(), "19 columns");
         assert_eq!(&rec[0], "2026-07-13");
         assert_eq!(&rec[1], "Breakfast");
         assert_eq!(&rec[2], "Salmon sockeye (Fiorfiore, canned)");
@@ -1801,6 +1990,10 @@ mod tests {
         assert_eq!(&rec[7], "129", "kcal into Calories");
         assert_eq!(&rec[13], "Breakfast", "Meal_Type mirrors Meal");
         assert_eq!(&rec[14], "0", "fiber");
+        assert_eq!(&rec[15], "340", "sodium_mg");
+        assert_eq!(&rec[16], "0.5", "satfat_g");
+        assert_eq!(&rec[17], "0", "sugar_g measured zero renders 0, not blank");
+        assert_eq!(&rec[18], "", "potassium_mg absent → blank cell, not 0");
     }
 
     #[test]
@@ -1816,6 +2009,10 @@ mod tests {
             carbs_g: None,
             fat_g: None,
             fiber_g: None,
+            sodium_mg: None,
+            satfat_g: None,
+            sugar_g: None,
+            potassium_mg: None,
             notes: None,
         };
         let row = food_row(&e, "2026-07-13");
@@ -1825,6 +2022,10 @@ mod tests {
         let rec = rdr.records().next().unwrap().unwrap();
         assert_eq!(&rec[7], "", "absent kcal → empty cell, not 0");
         assert_eq!(&rec[14], "", "absent fiber → empty cell");
+        assert_eq!(&rec[15], "", "absent sodium → empty cell, not 0");
+        assert_eq!(&rec[16], "", "absent satfat → empty cell");
+        assert_eq!(&rec[17], "", "absent sugar → empty cell");
+        assert_eq!(&rec[18], "", "absent potassium → empty cell");
     }
 
     // ---- Parity: prompt ↔ append schema ------------------------------------
@@ -1870,6 +2071,10 @@ mod tests {
             carbs_g: None,
             fat_g: None,
             fiber_g: None,
+            sodium_mg: None,
+            satfat_g: None,
+            sugar_g: None,
+            potassium_mg: None,
             notes: None,
         };
         assert_eq!(
@@ -1918,6 +2123,10 @@ mod tests {
             carbs_g: Some(20.0),
             fat_g: Some(5.0),
             fiber_g: Some(3.0),
+            sodium_mg: None,
+            satfat_g: None,
+            sugar_g: None,
+            potassium_mg: None,
             notes: None,
         }
     }
@@ -1957,6 +2166,10 @@ mod tests {
             carbs_g: Some(32.0),
             fat_g: None,
             fiber_g: None,
+            sodium_mg: None,
+            satfat_g: None,
+            sugar_g: None,
+            potassium_mg: None,
             notes: None,
         };
         let ml = build_meal_log_from_food_rows(&[e], "2026-07-13", "+02:00")
@@ -1966,6 +2179,60 @@ mod tests {
         assert_eq!(m.kcal, Some(180.0));
         assert_eq!(m.carbs_g, Some(32.0));
         assert!(m.protein_g.is_none() && m.fat_g.is_none() && m.fiber_g.is_none());
+    }
+
+    #[test]
+    fn mirror_carries_known_micronutrients_and_serializes_under_wire_keys() {
+        // A row with known sodium/sugar mirrors those onto the meal and serializes them
+        // under the EXACT wire keys the app decodes (`sodium_mg`, `sugar_g`); the two
+        // the row didn't carry (satfat, potassium) produce NO wire field — never a 0.
+        let e = FoodEntry {
+            name: "Prosciutto".into(),
+            meal: "Lunch".into(),
+            time: "12:30".into(),
+            amount: None,
+            unit: None,
+            kcal: Some(120.0),
+            protein_g: None,
+            carbs_g: None,
+            fat_g: None,
+            fiber_g: None,
+            sodium_mg: Some(900.0),
+            satfat_g: None,
+            sugar_g: Some(0.0),
+            potassium_mg: None,
+            notes: None,
+        };
+        let ml = build_meal_log_from_food_rows(&[e], "2026-07-13", "+02:00")
+            .unwrap()
+            .unwrap();
+        let m = &ml.meals[0];
+        assert_eq!(m.sodium_mg, Some(900.0));
+        assert_eq!(
+            m.sugar_g,
+            Some(0.0),
+            "measured-zero sugar carried, not dropped"
+        );
+        assert!(m.satfat_g.is_none() && m.potassium_mg.is_none());
+        // Serialize the whole directive and check the wire keys the app expects.
+        let v = directives_to_value(&Some(Directives {
+            needs_health: None,
+            meal_log: Some(ml),
+        }));
+        let meal = &v["meal_log"]["meals"][0];
+        assert_eq!(meal["sodium_mg"], 900.0, "known sodium under `sodium_mg`");
+        assert_eq!(
+            meal["sugar_g"], 0.0,
+            "known measured-zero sugar under `sugar_g`"
+        );
+        assert!(
+            meal.get("satfat_g").is_none(),
+            "no known satfat → no `satfat_g` field (never 0)"
+        );
+        assert!(
+            meal.get("potassium_mg").is_none(),
+            "no known potassium → no `potassium_mg` field"
+        );
     }
 
     #[test]

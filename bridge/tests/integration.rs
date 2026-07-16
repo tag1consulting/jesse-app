@@ -1614,6 +1614,28 @@ async fn meal_log_directive_is_extracted_and_stripped_on_the_poll_result() {
 }
 
 #[tokio::test]
+async fn meal_log_directive_carries_micronutrients_under_their_wire_keys() {
+    // A meal that carries known sodium/sugar round-trips those under the EXACT wire
+    // keys the app decodes (`sodium_mg`, `sugar_g`), while a micronutrient the meal
+    // did not carry (potassium) stays ABSENT on the wire — never a null-padded 0.
+    let line = r#"{"type":"result","is_error":false,"result":"Logged.\nJESSE_MEAL_LOG v1 {\"meals\":[{\"id\":\"2026-07-04-lunch\",\"consumedAt\":\"2026-07-04T12:30:00+02:00\",\"name\":\"Lunch: prosciutto\",\"kcal\":120,\"sodium_mg\":900,\"satfat_g\":2.5,\"sugar_g\":0}]}","session_id":"sess-micro"}"#;
+    let (st, job_id) =
+        run_turn_emitting(r#"{"mode":"tell","text":"log lunch: prosciutto"}"#, line).await;
+    let v = result_status(&st, &job_id).await;
+    let meal = &v["directives"]["meal_log"]["meals"][0];
+    assert_eq!(meal["sodium_mg"], 900.0, "known sodium under `sodium_mg`");
+    assert_eq!(meal["satfat_g"], 2.5, "known satfat under `satfat_g`");
+    assert_eq!(
+        meal["sugar_g"], 0.0,
+        "measured-zero sugar carried, not dropped"
+    );
+    assert!(
+        meal.get("potassium_mg").is_none(),
+        "unknown potassium is absent on the wire, never 0"
+    );
+}
+
+#[tokio::test]
 async fn meal_log_directive_is_extracted_on_the_sse_done_frame_consistently() {
     // The SSE `done` frame carries the SAME stripped text + meal_log as the poll —
     // the two terminal paths are kept byte-consistent (via directives_to_value).
@@ -3200,7 +3222,10 @@ async fn context_carry_off_local_turn_is_stateless_today() {
     let st = AppState::new(cfg);
     let v = carry_post_and_wait(&st, r#"{"mode":"ask","text":"what is my VO2 max lately"}"#).await;
     assert_eq!(v["response"], "Your VO2 max is 52 (todo-list/Today.md:2).");
-    assert!(v["session_id"].is_null(), "carry off → stateless, no synthetic id");
+    assert!(
+        v["session_id"].is_null(),
+        "carry off → stateless, no synthetic id"
+    );
     assert_eq!(st.context.thread_count(), 0, "carry off → nothing recorded");
     let _ = std::fs::remove_dir_all(&vault);
     let _ = std::fs::remove_file(&fake);
@@ -3228,9 +3253,18 @@ async fn context_carry_on_fresh_local_turn_mints_a_synthetic_id() {
     };
     let st = AppState::new(cfg);
     let v = carry_post_and_wait(&st, r#"{"mode":"ask","text":"what is my VO2 max lately"}"#).await;
-    let sid = v["session_id"].as_str().expect("carry on → a synthetic session id");
-    assert!(sid.starts_with("local-"), "fresh local turn mints a synthetic id: {sid}");
-    assert_eq!(st.context.thread_len(sid), 1, "recorded under the synthetic id");
+    let sid = v["session_id"]
+        .as_str()
+        .expect("carry on → a synthetic session id");
+    assert!(
+        sid.starts_with("local-"),
+        "fresh local turn mints a synthetic id: {sid}"
+    );
+    assert_eq!(
+        st.context.thread_len(sid),
+        1,
+        "recorded under the synthetic id"
+    );
     assert_eq!(st.context.pending(sid).len(), 1, "a local turn is pending");
     let _ = std::fs::remove_dir_all(&vault);
     let _ = std::fs::remove_file(&fake);
@@ -3262,7 +3296,10 @@ async fn context_carry_records_pre_badge_reply_so_no_badge_leaks_into_a_block() 
     let v = carry_post_and_wait(&st, r#"{"mode":"ask","text":"what is my VO2 max lately"}"#).await;
     // The DELIVERED reply carries the display badge.
     assert!(
-        v["response"].as_str().unwrap().contains("[local · vault · local-vaultqa]"),
+        v["response"]
+            .as_str()
+            .unwrap()
+            .contains("[local · vault · local-vaultqa]"),
         "delivered reply carries the badge: {}",
         v["response"]
     );
@@ -3351,8 +3388,13 @@ async fn context_carry_end_to_end_pins_todays_transcript() {
         "turn 1 answered from the vault by the emergency child: {}",
         v1["response"]
     );
-    let synthetic = v1["session_id"].as_str().expect("turn 1 carries a synthetic id");
-    assert!(synthetic.starts_with("local-"), "synthetic id minted: {synthetic}");
+    let synthetic = v1["session_id"]
+        .as_str()
+        .expect("turn 1 carries a synthetic id");
+    assert!(
+        synthetic.starts_with("local-"),
+        "synthetic id minted: {synthetic}"
+    );
     assert_eq!(st.context.pending(synthetic).len(), 1, "turn 1 is pending");
 
     // Turn 2: follow-up carrying the synthetic id → runs hosted.
@@ -3388,7 +3430,11 @@ async fn context_carry_end_to_end_pins_todays_transcript() {
 
     // The ledger is re-keyed from the synthetic id to the real returned id, and the
     // once-pending turn 1 is now marked in_hosted_history (absorbed by the session).
-    assert_eq!(st.context.thread_len(synthetic), 0, "synthetic thread re-keyed away");
+    assert_eq!(
+        st.context.thread_len(synthetic),
+        0,
+        "synthetic thread re-keyed away"
+    );
     assert!(
         st.context.thread_len("real-sess-xyz") >= 2,
         "turns live under the real id now"

@@ -356,6 +356,10 @@ mod tests {
                 carbs_g: Some(27.0),
                 fat_g: Some(0.3),
                 fiber_g: Some(3.1),
+                sodium_mg: None,
+                satfat_g: None,
+                sugar_g: None,
+                potassium_mg: None,
                 notes: Some("queued during outage".to_string()),
             })],
         }

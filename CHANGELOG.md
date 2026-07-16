@@ -15,6 +15,29 @@ CI both run it). See the "Versioning" section of `bridge/README.md`.
 
 ## [Unreleased]
 
+## [Bridge 0.14.0] — 2026-07-15
+
+### Added
+- **Diet micronutrient write path — the four micronutrients now get written, not
+  just read.** The read side already understood `Sodium_mg`, `SatFat_g`, `Sugar_g`,
+  and `Potassium_mg` (0.12.1) and the app renders them into HealthKit (build 40), but
+  nothing the bridge logged ever filled the cells. Now the whole local diet pipeline
+  carries them end to end:
+  - `FOOD_LOG_HEADER` extends to the 19-column contract; `food_row` writes the four
+    trailing cells (blank when unknown).
+  - `FoodEntry` gains `sodium_mg`/`satfat_g`/`sugar_g`/`potassium_mg` (`Option<f64>`),
+    and the extract schema + prompt gain the four keys with unit/conversion guidance
+    (sodium in mg — EU "sale" salt-grams × 400; `satfat_g` = "di cui acidi grassi
+    saturi" in g; `sugar_g` = TOTAL "di cui zuccheri" in g, never added sugars;
+    potassium in mg, usually absent on EU labels).
+  - The `JESSE_MEAL_LOG v1` directive `Meal` gains the four optional fields, serialized
+    under the exact wire keys the app decodes (`sodium_mg`, `satfat_g`, `sugar_g`,
+    `potassium_mg`); the payload validator rejects a negative or non-finite value.
+  - **Unknown is not zero** at every stage: a nutrient the message/label doesn't
+    establish is an omitted extract key → `None` → a blank CSV cell → no wire field.
+    `0` is reserved for a real measured zero. The verifier still corrects only the five
+    macros; the micronutrients carry through a correction untouched.
+
 ## [Bridge 0.13.0] — 2026-07-15
 
 ### Fixed

@@ -64,6 +64,10 @@ const MEAL_FIELDS: &[&str] = &[
     "carbs_g",
     "fat_g",
     "fiber_g",
+    "sodium_mg",
+    "satfat_g",
+    "sugar_g",
+    "potassium_mg",
 ];
 
 /// Sections a `JESSE_NEEDS_HEALTH` directive may request (the phone-assembled
@@ -134,6 +138,18 @@ pub struct Meal {
     pub fat_g: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fiber_g: Option<f64>,
+    /// The four micronutrients, each pre-summed by the bridge over ONLY the meal's
+    /// items that carried a known value — absent when none did (`None` serializes as
+    /// an omitted key, never `Some(0)`). Wire names match the app's `JesseMeal`
+    /// decoder exactly: `sodium_mg`/`potassium_mg` in mg, `satfat_g`/`sugar_g` in g.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sodium_mg: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub satfat_g: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sugar_g: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub potassium_mg: Option<f64>,
 }
 
 /// The parsed payload of a `JESSE_MEAL_LOG v1` directive: one or more meals the
@@ -476,6 +492,10 @@ fn parse_meal(item: &Value) -> Result<Meal, String> {
         carbs_g: optional_macro(m, "carbs_g")?,
         fat_g: optional_macro(m, "fat_g")?,
         fiber_g: optional_macro(m, "fiber_g")?,
+        sodium_mg: optional_macro(m, "sodium_mg")?,
+        satfat_g: optional_macro(m, "satfat_g")?,
+        sugar_g: optional_macro(m, "sugar_g")?,
+        potassium_mg: optional_macro(m, "potassium_mg")?,
     })
 }
 
@@ -735,6 +755,10 @@ mod tests {
                     carbs_g: None,
                     fat_g: Some(4.5),
                     fiber_g: Some(6.0),
+                    sodium_mg: Some(410.0),
+                    satfat_g: None,
+                    sugar_g: None,
+                    potassium_mg: None,
                 }],
             }),
         };
@@ -746,11 +770,44 @@ mod tests {
         assert_eq!(meal["kcal"], 385.0);
         assert_eq!(meal["fat_g"], 4.5);
         assert_eq!(meal["fiber_g"], 6.0);
+        assert_eq!(
+            meal["sodium_mg"], 410.0,
+            "known micronutrient under its wire key"
+        );
         assert!(
             meal.get("protein_g").is_none(),
             "absent macro omitted, not null"
         );
         assert!(meal.get("carbs_g").is_none());
+        assert!(
+            meal.get("satfat_g").is_none()
+                && meal.get("sugar_g").is_none()
+                && meal.get("potassium_mg").is_none(),
+            "absent micronutrients omitted, not null"
+        );
+    }
+
+    #[test]
+    fn meal_log_parses_all_four_micronutrients() {
+        // A meal carrying all four micronutrients under their wire keys decodes each
+        // (a measured-zero sugar included), and an absent one is None — never 0.
+        let reply = "JESSE_MEAL_LOG v1 {\"meals\":[{\"id\":\"a\",\"consumedAt\":\"t\",\"name\":\"Prosciutto\",\
+            \"sodium_mg\":900,\"satfat_g\":2.5,\"sugar_g\":0,\"potassium_mg\":180}]}";
+        let m = meal_log(reply).unwrap().meals.remove(0);
+        assert_eq!(m.sodium_mg, Some(900.0));
+        assert_eq!(m.satfat_g, Some(2.5));
+        assert_eq!(
+            m.sugar_g,
+            Some(0.0),
+            "zero is a valid measured micronutrient"
+        );
+        assert_eq!(m.potassium_mg, Some(180.0));
+
+        // Subset present: the omitted ones stay None.
+        let reply2 = "JESSE_MEAL_LOG v1 {\"meals\":[{\"id\":\"a\",\"consumedAt\":\"t\",\"name\":\"n\",\"sodium_mg\":150}]}";
+        let m2 = meal_log(reply2).unwrap().meals.remove(0);
+        assert_eq!(m2.sodium_mg, Some(150.0));
+        assert!(m2.satfat_g.is_none() && m2.sugar_g.is_none() && m2.potassium_mg.is_none());
     }
 
     #[test]
@@ -903,8 +960,16 @@ mod tests {
             "JESSE_MEAL_LOG v1 {\"meals\":[{\"id\":\"a\",\"consumedAt\":\"t\"}]}",
             // empty (blank) required field
             "JESSE_MEAL_LOG v1 {\"meals\":[{\"id\":\"  \",\"consumedAt\":\"t\",\"name\":\"n\"}]}",
-            // unknown meal field
-            "JESSE_MEAL_LOG v1 {\"meals\":[{\"id\":\"a\",\"consumedAt\":\"t\",\"name\":\"n\",\"sodium_mg\":5}]}",
+            // unknown meal field (a schema key like sodium_mg would now parse)
+            "JESSE_MEAL_LOG v1 {\"meals\":[{\"id\":\"a\",\"consumedAt\":\"t\",\"name\":\"n\",\"added_sugar_g\":5}]}",
+            // negative micronutrient
+            "JESSE_MEAL_LOG v1 {\"meals\":[{\"id\":\"a\",\"consumedAt\":\"t\",\"name\":\"n\",\"sodium_mg\":-5}]}",
+            // non-finite micronutrient (JSON has no NaN, but an out-of-f64-range literal is not finite)
+            "JESSE_MEAL_LOG v1 {\"meals\":[{\"id\":\"a\",\"consumedAt\":\"t\",\"name\":\"n\",\"potassium_mg\":1e400}]}",
+            // micronutrient not a number
+            "JESSE_MEAL_LOG v1 {\"meals\":[{\"id\":\"a\",\"consumedAt\":\"t\",\"name\":\"n\",\"satfat_g\":\"salty\"}]}",
+            // micronutrient explicitly null (contract says omit, never null-pad)
+            "JESSE_MEAL_LOG v1 {\"meals\":[{\"id\":\"a\",\"consumedAt\":\"t\",\"name\":\"n\",\"sugar_g\":null}]}",
             // macro not a number
             "JESSE_MEAL_LOG v1 {\"meals\":[{\"id\":\"a\",\"consumedAt\":\"t\",\"name\":\"n\",\"kcal\":\"lots\"}]}",
             // macro explicitly null (contract says omit, never null-pad)
