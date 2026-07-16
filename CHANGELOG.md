@@ -15,6 +15,41 @@ CI both run it). See the "Versioning" section of `bridge/README.md`.
 
 ## [Unreleased]
 
+## [App 1.0 (41)] — 2026-07-16
+
+### Added
+- **Tapping any of the four micronutrient gauges opens the SAME shared drill-down sheet
+  the five macros use — one component, extended with unknown-aware semantics.** Before,
+  the four micro rows (sodium, saturated fat, total sugars, potassium) rendered but did
+  nothing on tap. Now each opens the existing `ExplainerSheet`/`FoodDrilldown` — the same
+  contributing-foods facts, streamed on-device insight, ShareLink export, and text
+  selection the macro/calorie drill-down (PR #74) ships — with the micronutrient rule
+  **unknown ≠ zero** carried all the way through:
+  - `ContributionMetric` gains a `.micronutrient` case; a micronutrient breakdown ranks
+    the day's items with a known value > 0 by contribution (a measured true 0 is a
+    non-contributor, excluded), and every item **lacking** a value is surfaced in a
+    distinct **"Not estimated"** group — name and amount, never a number, never a 0.
+    These rows are why a partial total reads `≥`, so they are never silently omitted.
+  - The sheet header mirrors the gauge exactly: a partial day shows `≥<knownSum><unit>`
+    with the *"N items not estimated"* caption; an all-unknown nutrient shows *"not
+    tracked yet"* and still opens (every item under "Not estimated", no invented total);
+    a target frames consumed-vs-target by the nutrient's semantics (ceiling for sodium /
+    saturated fat, floor for potassium); no target shows the value only. Total sugars
+    stays informational — the number, never a judgment. Each contributor's share is
+    computed against the KNOWN sum, so a partial day never presents a share as if the
+    denominator were complete.
+  - The on-device insight grounding (`HealthInsightInput`) is extended with the
+    deterministic partiality facts — `partial`, `knownItemCount`, `unknownItemCount`,
+    and, only when a target exists, the target plus its computed status — plus an
+    `informational` flag for total sugars (grounded WITHOUT a target). The prompt states
+    a partial total is a floor ("at least"), forbids any completeness claim, and for
+    total sugars forbids all judgment. The post-generation discard guard grows to match:
+    a generation that claims a partial total is complete, or renders a judgment for total
+    sugars, is discarded and the facts stand alone (a wrong insight is worse than none).
+  - The plain-text ShareLink export carries the `≥` notation, the *"N items not
+    estimated"* caption, and the full "Not estimated" item list, so a partial sodium day
+    never pastes into a chat as a bare complete-looking number.
+
 ## [Bridge 0.14.0] — 2026-07-15
 
 ### Added

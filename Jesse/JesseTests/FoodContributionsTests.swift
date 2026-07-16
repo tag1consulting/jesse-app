@@ -13,8 +13,10 @@ final class FoodContributionsTests: XCTestCase {
 
     private func item(_ name: String, cal: Double? = nil, p: Double? = nil,
                       f: Double? = nil, c: Double? = nil, fiber: Double? = nil,
-                      amount: String? = nil) -> DietItem {
-        DietItem(item: name, amount: amount, cal: cal, p: p, f: f, c: c, fiber: fiber)
+                      amount: String? = nil, na: Double? = nil, satf: Double? = nil,
+                      sug: Double? = nil, k: Double? = nil) -> DietItem {
+        DietItem(item: name, amount: amount, cal: cal, p: p, f: f, c: c, fiber: fiber,
+                 na: na, satf: satf, sug: sug, k: k)
     }
     private func meal(_ name: String, _ items: [DietItem]) -> DietMeal {
         DietMeal(name: name, time: nil, items: items)
@@ -158,6 +160,81 @@ final class FoodContributionsTests: XCTestCase {
         XCTAssertNil(bd.reconciliationNote)
     }
 
+    // MARK: - Micronutrient metric label / unit / flags
+
+    func testMicronutrientMetricLabelUnitAndFlags() {
+        XCTAssertEqual(ContributionMetric.micronutrient(.sodium).label, "Sodium")
+        XCTAssertEqual(ContributionMetric.micronutrient(.sodium).unit, "mg")
+        XCTAssertEqual(ContributionMetric.micronutrient(.saturatedFat).unit, "g")
+        XCTAssertTrue(ContributionMetric.micronutrient(.sodium).isMicronutrient)
+        XCTAssertFalse(ContributionMetric.macro(.carbs).isMicronutrient)
+        // Only total sugars is informational.
+        XCTAssertTrue(ContributionMetric.micronutrient(.totalSugars).isInformational)
+        XCTAssertFalse(ContributionMetric.micronutrient(.sodium).isInformational)
+        XCTAssertFalse(ContributionMetric.macro(.carbs).isInformational)
+    }
+
+    // MARK: - Micronutrient ranking (unknown ≠ zero, surfaced in its own group)
+
+    func testMicronutrientRanksKnownAndCollectsUnknowns() {
+        // Sodium: two known contributors (sorted desc), one measured true 0 (excluded),
+        // one absent (UNKNOWN → the not-estimated group, never a 0-value contributor).
+        let meals = [meal("Day", [
+            item("Cheese", amount: "40g", na: 300),
+            item("Bread", na: 450),
+            item("Water", na: 0),        // measured 0 → non-contributor, excluded
+            item("Apple", amount: "1", na: nil),  // unknown → not-estimated group
+        ])]
+        let bd = FoodContributions.breakdown(meals, metric: .micronutrient(.sodium), total: 750)
+        // Known contributors, most impact first; the measured-0 and unknown excluded.
+        XCTAssertEqual(bd.contributions.map(\.name), ["Bread", "Cheese"])
+        XCTAssertEqual(bd.contributions.map(\.value), [450, 300])
+        // The unknown item is in its own group — name + amount, never a value.
+        XCTAssertEqual(bd.unknownFoods.map(\.name), ["Apple"])
+        XCTAssertEqual(bd.unknownFoods.first?.amount, "1")
+        XCTAssertTrue(bd.isPartial)
+        // The measured-0 "Water" is NOT unknown — it never appears anywhere.
+        XCTAssertFalse(bd.unknownFoods.contains { $0.name == "Water" })
+        XCTAssertFalse(bd.contributions.contains { $0.name == "Water" })
+    }
+
+    func testMicronutrientAllKnownIsNotPartial() {
+        let meals = [meal("Day", [item("A", na: 200), item("B", na: 300)])]
+        let bd = FoodContributions.breakdown(meals, metric: .micronutrient(.sodium), total: 500)
+        XCTAssertTrue(bd.unknownFoods.isEmpty)
+        XCTAssertFalse(bd.isPartial)
+        XCTAssertNil(bd.reconciliationNote, "a micronutrient never trips the reconciliation note")
+    }
+
+    func testMicronutrientAllUnknownStillListsEveryItem() {
+        // No item carries potassium → no contributors, but every item is surfaced in the
+        // not-estimated group so the sheet opens honestly (no invented total).
+        let meals = [meal("Day", [item("Rice", amount: "1 cup", k: nil), item("Egg", k: nil)])]
+        let bd = FoodContributions.breakdown(meals, metric: .micronutrient(.potassium), total: 0)
+        XCTAssertTrue(bd.contributions.isEmpty)
+        XCTAssertEqual(bd.unknownFoods.map(\.name), ["Rice", "Egg"])
+        XCTAssertTrue(bd.isPartial)
+    }
+
+    func testMicronutrientShareIsAgainstKnownSum() {
+        // Share denominator is the KNOWN sum (the total passed = knownSum), so a partial
+        // day's contributors read as a share of the estimated total, not an invented one.
+        let meals = [meal("Day", [
+            item("Big", na: 600), item("Small", na: 200), item("Unknown", na: nil),
+        ])]
+        let bd = FoodContributions.breakdown(meals, metric: .micronutrient(.sodium), total: 800)
+        XCTAssertEqual(bd.contributions[0].share, 0.75, accuracy: 0.0001)
+        XCTAssertEqual(bd.contributions[1].share, 0.25, accuracy: 0.0001)
+    }
+
+    func testMacroBreakdownNeverCollectsUnknowns() {
+        // A macro's absent field stays a plain non-contributor — no not-estimated group.
+        let meals = [meal("Day", [item("Rice", c: 40), item("Water", c: nil)])]
+        let bd = FoodContributions.breakdown(meals, metric: .macro(.carbs), total: 40)
+        XCTAssertTrue(bd.unknownFoods.isEmpty)
+        XCTAssertFalse(bd.isPartial)
+    }
+
     // MARK: - Shared drill-down builder (the single path both entry points use)
 
     func testDrilldownBuildAttachesFactsAndGroundedStatus() {
@@ -178,5 +255,39 @@ final class FoodContributionsTests: XCTestCase {
         XCTAssertEqual(drill.insightInput.goal, 140)
         XCTAssertEqual(drill.insightInput.goalStatus, .short(47))
         XCTAssertEqual(drill.insightInput.total, 93)
+    }
+
+    func testDrilldownBuildMicronutrientCarriesPartialFactsAndUnknownGroup() {
+        // A partial sodium day: the builder attaches the ranked known contributors, the
+        // not-estimated group, and grounds the insight with the partiality facts.
+        let meals = [meal("Day", [
+            item("Bread", na: 450), item("Cheese", na: 300), item("Apple", na: nil),
+        ])]
+        let gauge = DietSemantics.micronutrientGauge(
+            .sodium, meals: meals, targets: DietTargets(sodium: 2300))
+        let drill = FoodDrilldown.build(meals: meals, metric: .micronutrient(.sodium),
+                                        gauge: gauge, isCarbLoad: false)
+        XCTAssertEqual(drill.breakdown.contributions.map(\.name), ["Bread", "Cheese"])
+        XCTAssertEqual(drill.breakdown.unknownFoods.map(\.name), ["Apple"])
+        XCTAssertEqual(drill.breakdown.total, 750, "the known sum is a floor")
+        // Grounding carries the partiality facts.
+        XCTAssertTrue(drill.insightInput.partial)
+        XCTAssertEqual(drill.insightInput.knownItemCount, 2)
+        XCTAssertEqual(drill.insightInput.unknownItemCount, 1)
+        XCTAssertEqual(drill.insightInput.goal, 2300)
+        XCTAssertFalse(drill.insightInput.informational)
+    }
+
+    func testDrilldownBuildTotalSugarsIsInformationalWithNoTargetGrounding() {
+        // Total sugars is informational: even with a reference target on the gauge, the
+        // insight is grounded WITHOUT a goal so it frames no judgment.
+        let meals = [meal("Day", [item("Yogurt", sug: 20), item("Berries", sug: 10)])]
+        let gauge = DietSemantics.micronutrientGauge(
+            .totalSugars, meals: meals, targets: DietTargets(sugar: 50))
+        let drill = FoodDrilldown.build(meals: meals, metric: .micronutrient(.totalSugars),
+                                        gauge: gauge, isCarbLoad: false)
+        XCTAssertTrue(drill.insightInput.informational)
+        XCTAssertNil(drill.insightInput.goal, "informational grounding carries no target")
+        XCTAssertEqual(drill.insightInput.goalStatus, .noGoal)
     }
 }

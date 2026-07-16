@@ -93,6 +93,55 @@ enum Explainers {
         return Explainer(id: "fiber", title: Macro.fiber.displayName, valueLine: line(g), paragraphs: paras)
     }
 
+    /// The explainer for a micronutrient, wired with its live gauge so the sheet header
+    /// mirrors the gauge exactly: a partial total reads "≥"; an all-unknown nutrient
+    /// reads "not tracked yet"; a target frames the number by the nutrient's semantics
+    /// (ceiling for sodium/saturated fat, floor for potassium); no target shows the value
+    /// only; and total sugars stays informational — never a judgment.
+    static func micronutrient(_ n: Micronutrient, gauge g: MetricGauge) -> Explainer {
+        Explainer(id: "micro-\(n.displayName)", title: n.displayName,
+                  valueLine: microLine(g), paragraphs: microParagraphs(n, g))
+    }
+
+    /// The micronutrient header line, mirroring the gauge's own value language: "≥" when
+    /// the total is a floor, the value/target and its remaining wording when a target is
+    /// present, and the neutral "not tracked yet" when no item carried the value.
+    private static func microLine(_ g: MetricGauge) -> String {
+        guard (g.knownItemCount ?? 0) > 0 else { return DietSemantics.notTrackedCaption }
+        let prefix = g.partial ? "≥" : ""
+        let v = DietSemantics.fmt(g.value)
+        if let t = g.target {
+            let rem = g.remaining.isEmpty ? "" : " — \(g.remaining)"
+            return "\(prefix)\(v) / \(DietSemantics.fmt(t))\(g.unit)\(rem)"
+        }
+        return "\(prefix)\(v)\(g.unit)"
+    }
+
+    private static func microParagraphs(_ n: Micronutrient, _ g: MetricGauge) -> [String] {
+        var paras: [String] = []
+        switch n {
+        case .sodium:
+            paras.append("Sodium is a ceiling — stay at or under target. Most of a day's sodium hides in bread, cheese, cured meat, and restaurant food, not the salt shaker.")
+        case .saturatedFat:
+            paras.append("Saturated fat is a ceiling — stay at or under target. It's the butter, cheese, and fatty-meat share of your fat, kept in check for heart health while your total fat stays in its window.")
+        case .totalSugars:
+            paras.append("Total sugars is shown for composition only — there's no red or green here. It counts natural sugars in fruit and dairy alongside any added, so a high number isn't automatically a problem.")
+        case .potassium:
+            paras.append("Potassium is a floor — hit it or beat it. Fruit, potatoes, dairy, and beans carry most of it, and it's the mineral that balances sodium's effect on blood pressure.")
+        }
+        // The unknown-aware caveat: what "≥" and "not tracked yet" mean, so the number is
+        // never misread as complete.
+        if (g.knownItemCount ?? 0) == 0 {
+            paras.append("No food logged today lists a \(n.displayName.lowercased()) value yet, so there's nothing to total — every item is under \"Not estimated\" below.")
+        } else if g.partial {
+            paras.append("Some logged foods don't list their \(n.displayName.lowercased()), so this total is a floor — the real number is at least this much. Those items are listed under \"Not estimated\" below, never counted as zero.")
+        }
+        if g.target == nil {
+            paras.append("No target is set for it, so it's shown as a plain value with no goal to judge against.")
+        }
+        return paras
+    }
+
     static func netCalories(_ net: NetCalories) -> Explainer {
         Explainer(id: "net", title: "Net calories",
                   valueLine: "\(DietSemantics.fmt(net.net)) net · \(DietSemantics.fmt(net.burned)) burned",

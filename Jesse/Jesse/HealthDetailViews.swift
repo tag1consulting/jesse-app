@@ -39,11 +39,17 @@ struct MacrosCaloriesDetail: View {
     private var g: DietGauges { DietSemantics.gauges(for: today, hour: hour) }
     private var totals: MacroTotals { DietSemantics.dayTotals(today.meals) }
     private var net: NetCalories { NetCalories(intake: totals.cal, burned: DietSemantics.burnedCalories(today.exercise)) }
-    private var micronutrients: [MetricGauge] { DietSemantics.micronutrientGauges(for: today) }
+    /// The four micronutrient gauges paired with their nutrient, so a row can build the
+    /// tapped nutrient's explainer + drill-down (not just render the gauge).
+    private var micronutrients: [(nutrient: Micronutrient, gauge: MetricGauge)] {
+        Micronutrient.allCases.map {
+            ($0, DietSemantics.micronutrientGauge($0, meals: today.meals, targets: today.targets))
+        }
+    }
     /// Only surface the micronutrient section when at least one of the four carries a
     /// known value that day — otherwise there is nothing to show but four "not tracked
     /// yet" rows.
-    private var hasMicronutrients: Bool { micronutrients.contains { ($0.knownItemCount ?? 0) > 0 } }
+    private var hasMicronutrients: Bool { micronutrients.contains { ($0.gauge.knownItemCount ?? 0) > 0 } }
 
     var body: some View {
         Group {
@@ -127,17 +133,29 @@ struct MacrosCaloriesDetail: View {
     }
 
     // The four micronutrient rows, rendered in the exact macro-bar-row language
-    // (MetricBarRow) with no explainer tap. A partial total shows "≥" and the "N items
-    // not estimated" caption; an all-unknown nutrient shows "not tracked yet". Hidden
-    // entirely when no nutrient carries a known value that day.
+    // (MetricBarRow). A partial total shows "≥" and the "N items not estimated" caption;
+    // an all-unknown nutrient shows "not tracked yet". Tapping any row opens the SAME
+    // shared drill-down sheet the macros use — extended with unknown-aware semantics.
+    // Hidden entirely when no nutrient carries a known value that day.
     @ViewBuilder private var micronutrientSection: some View {
         if hasMicronutrients {
             Section("Micronutrients") {
-                ForEach(Array(micronutrients.enumerated()), id: \.offset) { _, gauge in
-                    MetricBarRow(gauge: gauge)
+                ForEach(Array(micronutrients.enumerated()), id: \.offset) { _, entry in
+                    MetricBarRow(gauge: entry.gauge) { openMicronutrient(entry.nutrient, entry.gauge) }
                 }
             }
         }
+    }
+
+    // Open a micronutrient's drill-down: the nutrient's explainer carries the shared
+    // enriched drill-down (contributing foods, the "Not estimated" group, and the
+    // grounded on-device insight), so tapping a micro gauge presents the identical sheet
+    // the macros do — one component, not a copied variant.
+    private func openMicronutrient(_ nutrient: Micronutrient, _ gauge: MetricGauge) {
+        var ex = Explainers.micronutrient(nutrient, gauge: gauge)
+        ex.drilldown = FoodDrilldown.build(meals: today.meals, metric: .micronutrient(nutrient),
+                                           gauge: gauge, isCarbLoad: g.isCarbLoad)
+        explainer = ex
     }
 
     private func bonusRow(_ bonus: CarbsBonus) -> some View {

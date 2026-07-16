@@ -37,6 +37,32 @@ struct HealthInsightInput: Equatable, Sendable {
     /// The top contributing foods, most impact first — the only foods/numbers the
     /// model is allowed to mention.
     let foods: [FoodFact]
+    /// Micronutrient partiality: true when at least one logged item carries NO value
+    /// for this nutrient, so `total` is a FLOOR (a known sum), not a complete total.
+    /// The prompt hands this over as an explicit fact and the guard discards any
+    /// generation that claims the total is complete. Always false for a macro/calorie.
+    let partial: Bool
+    /// How many items carried a value (fed `total`) and how many did not — the counts
+    /// behind the "N items not estimated" caption. Both 0 for a macro/calorie.
+    let knownItemCount: Int
+    let unknownItemCount: Int
+    /// Informational-only metric (total sugars): grounded with composition and top
+    /// contributors, NEVER a judgment. The prompt forbids over/too-much language and the
+    /// guard discards a generation that renders one. Always false for a macro/calorie.
+    let informational: Bool
+
+    // Defaulted memberwise init so a macro/calorie caller (and existing tests) build an
+    // input without naming the micronutrient-only fields; a micronutrient caller sets them.
+    init(metricLabel: String, unit: String, total: Double, goal: Double?,
+         goalStatus: DietSemantics.GoalStatus, goalPhrase: String, dayStyle: String,
+         foods: [FoodFact], partial: Bool = false, knownItemCount: Int = 0,
+         unknownItemCount: Int = 0, informational: Bool = false) {
+        self.metricLabel = metricLabel; self.unit = unit; self.total = total
+        self.goal = goal; self.goalStatus = goalStatus; self.goalPhrase = goalPhrase
+        self.dayStyle = dayStyle; self.foods = foods; self.partial = partial
+        self.knownItemCount = knownItemCount; self.unknownItemCount = unknownItemCount
+        self.informational = informational
+    }
 
     /// The authoritative goal-status fact fed to the model — a single ground-truth line
     /// derived from the deterministic `goalStatus`, so the model states the goal exactly
@@ -52,6 +78,16 @@ struct HealthInsightInput: Equatable, Sendable {
         case .noGoal:
             return "no target is set for this metric — do not state any goal status."
         }
+    }
+
+    /// The authoritative partiality fact fed to the model: whether the total is complete
+    /// or a floor with items not estimated. Nil for a complete total (a macro/calorie,
+    /// or a micronutrient where every item carried the value), so the prompt adds no
+    /// partiality line at all.
+    var partialFact: String? {
+        guard partial else { return nil }
+        let items = "\(unknownItemCount) of \(knownItemCount + unknownItemCount) logged item\(unknownItemCount + knownItemCount == 1 ? "" : "s")"
+        return "This total is PARTIAL — \(items) carry no measured \(metricLabel.lowercased()) value, so \(DietSemantics.fmt(total)) \(unit) is a floor (AT LEAST this much), never the complete total. Never state or imply it is the full/complete/entire total; if you name the number, say \"at least\"."
     }
 }
 
@@ -91,14 +127,18 @@ enum HealthInsight {
     static func input(metric: ContributionMetric, total: Double, goal: Double?,
                       goalStatus: DietSemantics.GoalStatus, goalPhrase: String,
                       dayStyle: String,
-                      contributions: [FoodContribution]) -> HealthInsightInput {
+                      contributions: [FoodContribution],
+                      partial: Bool = false, knownItemCount: Int = 0,
+                      unknownItemCount: Int = 0, informational: Bool = false) -> HealthInsightInput {
         let foods = contributions.prefix(groundingFoodCount).map {
             FoodFact(name: $0.name, value: $0.value, sharePct: Int(($0.share * 100).rounded()))
         }
         return HealthInsightInput(
             metricLabel: metric.label, unit: metric.unit, total: total,
             goal: goal, goalStatus: goalStatus, goalPhrase: goalPhrase,
-            dayStyle: dayStyle, foods: Array(foods))
+            dayStyle: dayStyle, foods: Array(foods),
+            partial: partial, knownItemCount: knownItemCount,
+            unknownItemCount: unknownItemCount, informational: informational)
     }
 
     /// How a metric is judged, in plain words for the insight grounding — the shared
@@ -129,21 +169,30 @@ enum HealthInsightPrompt {
         }
         let goalLine = input.goal.map { "Target: \(DietSemantics.fmt($0)) \(input.unit)." }
             ?? "Target: none set."
+        // An authoritative partiality line, present only when the total is a floor, so
+        // the model states "at least" and never claims completeness.
+        let partialLine = input.partialFact.map { "\nPARTIALITY (authoritative): \($0)" } ?? ""
+        // For an informational metric (total sugars) the closing instruction forbids
+        // any judgment — composition and top contributors only.
+        let judgmentRule = input.informational
+            ? "This metric is INFORMATIONAL ONLY: describe composition and the top contributors, and NEVER judge the amount — no \"over\", \"too much\", \"too high\", \"excessive\", \"cut back\", \"reduce\", or any good/bad language about the quantity."
+            : "State the goal status EXACTLY as given above: never say they hit, met, reached, or are on track to hit their goal or target unless the GOAL STATUS line says MET."
+        let completenessRule = input.partial
+            ? " Never call this the full, complete, or total amount — it is a floor; say \"at least\" if you cite the number."
+            : ""
         return """
         Day type: \(input.dayStyle).
         Metric: \(input.metricLabel) — \(input.goalPhrase).
         Consumed so far: \(DietSemantics.fmt(input.total)) \(input.unit). \(goalLine)
         GOAL STATUS (authoritative — treat this as ground truth and never contradict \
-        it): \(input.goalStatusFact)
+        it): \(input.goalStatusFact)\(partialLine)
         Top contributing foods:
         \(foodLines)
 
         In one or two short sentences, tell the user something useful about their \
-        \(metric) for the day. State the goal status EXACTLY as given above: never say \
-        they hit, met, reached, or are on track to hit their goal or target unless the \
-        GOAL STATUS line says MET. Use ONLY the foods and numbers listed above — do not \
-        invent foods, amounts, or targets. Second person, plain text, no lists, no \
-        markdown.
+        \(metric) for the day. \(judgmentRule)\(completenessRule) Use ONLY the foods and \
+        numbers listed above — do not invent foods, amounts, or targets. Second person, \
+        plain text, no lists, no markdown.
         """
     }
 }
@@ -191,6 +240,48 @@ enum HealthInsightGuard {
     static func contradicts(_ text: String, status: DietSemantics.GoalStatus) -> Bool {
         guard !status.isMet else { return false }
         return claimsGoalReached(text)
+    }
+
+    /// Phrases that assert a total is COMPLETE — flagged on a partial day, where the
+    /// total is only a floor. Tuned for precision (a false positive drops one insight):
+    /// each names the whole, not a running tally.
+    private static let completenessClaims = [
+        " in total", " altogether", " a total of", " total of ", " in all",
+        " all told", " adds up to", " sums to", " your total ", " the total ",
+        " complete total", " full total", " entire ", " all of your ",
+    ]
+
+    /// Judgment words an informational metric (total sugars) must never render.
+    private static let judgmentWords = [
+        " over ", " too much", " too high", " excessive", " cut back", " cut down",
+        " reduce ", " lower your", " limit ", " way too", " overdid",
+    ]
+
+    /// Whether `text` asserts the total is a complete amount — the signal to discard on
+    /// a partial day, where the number is only a floor. Negation-unaware on purpose: a
+    /// partial total is never complete, so any completeness phrasing is wrong here.
+    static func claimsCompleteTotal(_ text: String) -> Bool {
+        let t = " " + text.lowercased().replacingOccurrences(of: "’", with: "'") + " "
+        return completenessClaims.contains(where: t.contains)
+    }
+
+    /// Whether `text` renders a good/bad judgment about the amount — the signal to
+    /// discard for an informational metric (total sugars), which is composition-only.
+    static func rendersJudgment(_ text: String) -> Bool {
+        let t = " " + text.lowercased() + " "
+        return judgmentWords.contains(where: t.contains)
+    }
+
+    /// The full discard decision for a generation, given the grounded `input`: a
+    /// generation is discarded when it (a) claims the goal was reached against a
+    /// non-met status, (b) claims the total is complete on a partial day, or (c)
+    /// renders a judgment for an informational metric. Any one is enough — a wrong
+    /// insight is worse than none.
+    static func contradicts(_ text: String, input: HealthInsightInput) -> Bool {
+        if contradicts(text, status: input.goalStatus) { return true }
+        if input.partial, claimsCompleteTotal(text) { return true }
+        if input.informational, rendersJudgment(text) { return true }
+        return false
     }
 }
 

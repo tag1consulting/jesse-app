@@ -446,6 +446,11 @@ struct MetricBarRow: View {
                 Spacer()
                 Text(DietSemantics.notTrackedCaption)
                     .font(.caption).foregroundStyle(.secondary)
+                // A tappable not-tracked row (a micronutrient drill-down) still opens the
+                // sheet — with every item under "Not estimated" — so show the affordance.
+                if onTap != nil {
+                    Image(systemName: "info.circle").font(.caption).foregroundStyle(.tertiary)
+                }
             }
             .contentShape(Rectangle())
         } else {
@@ -535,11 +540,19 @@ struct FoodDrilldown: Equatable, Sendable {
     static func build(meals: [DietMeal], metric: ContributionMetric,
                       gauge: MetricGauge, isCarbLoad: Bool) -> FoodDrilldown {
         let breakdown = FoodContributions.breakdown(meals, metric: metric, total: gauge.value)
+        // An informational metric (total sugars) is grounded WITHOUT a target, so the
+        // insight frames no goal and the judgment forbid stands alone; every other
+        // metric hands over its target and deterministic status. The micronutrient
+        // partiality facts (floor, N not estimated) ride along on every metric and are
+        // inert for a complete macro/calorie total.
+        let informational = metric.isInformational
         let input = HealthInsight.input(
-            metric: metric, total: gauge.value, goal: gauge.target,
+            metric: metric, total: gauge.value, goal: informational ? nil : gauge.target,
             goalStatus: gauge.goalStatus, goalPhrase: HealthInsight.goalPhrase(gauge.goal),
             dayStyle: isCarbLoad ? "carb-load day" : "ordinary day",
-            contributions: breakdown.contributions)
+            contributions: breakdown.contributions,
+            partial: gauge.partial, knownItemCount: gauge.knownItemCount ?? 0,
+            unknownItemCount: gauge.unknownItemCount, informational: informational)
         return FoodDrilldown(breakdown: breakdown, insightInput: input)
     }
 }
@@ -622,9 +635,16 @@ enum DrilldownShare {
 
         lines.append("What fed this:")
         if breakdown.isEmpty {
-            lines.append(breakdown.hasFoodButNoContributors
-                ? "No logged food lists its \(breakdown.metric.label.lowercased()) yet."
-                : "No foods logged yet.")
+            // An all-unknown micronutrient day has no contributors but IS honest to
+            // open: say nothing carries a measured value, then list every item below
+            // under "Not estimated" — never a "nothing logged" message that hides them.
+            if breakdown.isPartial {
+                lines.append("No logged food lists a measured \(breakdown.metric.label.lowercased()) value yet.")
+            } else {
+                lines.append(breakdown.hasFoodButNoContributors
+                    ? "No logged food lists its \(breakdown.metric.label.lowercased()) yet."
+                    : "No foods logged yet.")
+            }
         } else {
             for c in breakdown.contributions {
                 let amount = c.amount.map { " (\($0))" } ?? ""
@@ -633,6 +653,20 @@ enum DrilldownShare {
             }
             if let note = breakdown.reconciliationNote {
                 lines.append(note)
+            }
+        }
+
+        // The "Not estimated" group: the items carrying no value for this micronutrient,
+        // name and amount only, never a number — the reason the total reads "≥". Carried
+        // in the export verbatim so a partial day never pastes as a complete number.
+        if !breakdown.unknownFoods.isEmpty {
+            lines.append("")
+            let caption = DietSemantics.partialCaption(unknownItemCount: breakdown.unknownFoods.count)
+                ?? "not estimated"
+            lines.append("Not estimated (\(caption)):")
+            for u in breakdown.unknownFoods {
+                let amount = u.amount.map { " (\($0))" } ?? ""
+                lines.append("• \(u.name)\(amount)")
             }
         }
 
@@ -676,6 +710,13 @@ struct ContributingFoodsView: View {
                         .fixedSize(horizontal: false, vertical: true)
                 }
             }
+
+            // The "Not estimated" group: the items with no value for this
+            // micronutrient, name and amount only — never a number, never a 0. These
+            // are why the header reads "≥"; surfacing them is the whole point.
+            if !breakdown.unknownFoods.isEmpty {
+                notEstimatedGroup
+            }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
         // Enable selection for the food rows too; it propagates to the descendant
@@ -684,8 +725,41 @@ struct ContributingFoodsView: View {
         .textSelection(.enabled)
     }
 
+    private var notEstimatedGroup: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 6) {
+                Text("Not estimated")
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(.secondary)
+                    .textCase(.uppercase)
+                if let caption = DietSemantics.partialCaption(unknownItemCount: breakdown.unknownFoods.count) {
+                    Text(caption)
+                        .font(.caption2)
+                        .foregroundStyle(.tertiary)
+                }
+            }
+            ForEach(breakdown.unknownFoods) { u in
+                HStack(alignment: .firstTextBaseline, spacing: 6) {
+                    Text(u.name).font(.subheadline).foregroundStyle(.secondary)
+                    if let amount = u.amount {
+                        Text(amount).font(.caption).foregroundStyle(.tertiary)
+                    }
+                    Spacer()
+                    // No number, ever — a dash marks "unknown", distinct from a 0.
+                    Text("—").font(.subheadline).foregroundStyle(.tertiary)
+                }
+            }
+        }
+        .padding(.top, 2)
+    }
+
     private var emptyMessage: String {
-        breakdown.hasFoodButNoContributors
+        // An all-unknown micronutrient day still opens: nothing carries a measured
+        // value, and every item shows below under "Not estimated".
+        if breakdown.isPartial {
+            return "No logged food lists a measured \(breakdown.metric.label.lowercased()) value yet."
+        }
+        return breakdown.hasFoodButNoContributors
             ? "No logged food lists its \(breakdown.metric.label.lowercased()) yet."
             : "No foods logged yet."
     }
@@ -720,11 +794,27 @@ struct ContributionRow: View {
     }
 
     /// The metric's identity color — the macro palette from the calorie-source bar so
-    /// the drill-down speaks the same color language, and the accent for calories.
+    /// the drill-down speaks the same color language, the accent for calories, and a
+    /// per-nutrient identity color for a micronutrient.
     private var barColor: Color {
         switch metric {
         case .calories: return .accentColor
         case .macro(let m): return MacroColor.color(for: m)
+        case .micronutrient(let n): return MicronutrientColor.color(for: n)
+        }
+    }
+}
+
+/// Identity colors for the four micronutrients, kept distinct from the macro palette
+/// (indigo/teal/orange) so the drill-down bars don't read as a macro. One place, so no
+/// view hardcodes a color.
+enum MicronutrientColor {
+    static func color(for n: Micronutrient) -> Color {
+        switch n {
+        case .sodium: return .blue
+        case .saturatedFat: return .brown
+        case .totalSugars: return .pink
+        case .potassium: return .mint
         }
     }
 }
@@ -786,7 +876,10 @@ struct HealthInsightView: View {
             // snapshot asserts a goal was reached that the computed status contradicts,
             // discard the insight outright and leave the facts standing alone.
             for await snapshot in provider.insight(for: input) {
-                if HealthInsightGuard.contradicts(snapshot, status: input.goalStatus) {
+                // The input-aware guard discards a generation that claims goal status
+                // contrary to the facts, claims a partial total is complete, or renders
+                // a judgment for an informational metric (total sugars).
+                if HealthInsightGuard.contradicts(snapshot, input: input) {
                     text = ""
                     break
                 }
