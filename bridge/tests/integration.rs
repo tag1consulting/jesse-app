@@ -1797,12 +1797,7 @@ async fn post_corrections(st: &AppState, auth: Option<&str>, body: &str) -> (Sta
 #[tokio::test]
 async fn meal_corrections_endpoint_requires_auth() {
     let (st, fake) = state_with_queue("unused");
-    let (status, _) = post_corrections(
-        &st,
-        None,
-        r#"{"retract":["2026-07-04-snack-1500"]}"#,
-    )
-    .await;
+    let (status, _) = post_corrections(&st, None, r#"{"retract":["2026-07-04-snack-1500"]}"#).await;
     assert_eq!(status, StatusCode::UNAUTHORIZED, "no bearer → 401");
     let _ = std::fs::remove_file(&fake);
 }
@@ -1827,10 +1822,10 @@ async fn meal_corrections_endpoint_queues_and_returns_seq() {
 async fn meal_corrections_endpoint_rejects_malformed_batch() {
     let (st, fake) = state_with_queue("unused");
     for bad in [
-        r#"{}"#,                                                        // empty batch
+        r#"{}"#,                                                                 // empty batch
         r#"{"meals":[{"id":"a","consumedAt":"t","name":"n"}],"retract":["a"]}"#, // id in both
         r#"{"meals":[{"id":"a","consumedAt":"t","name":"n","sodium_mg":-5}]}"#,  // negative
-        r#"{"retract":[5]}"#,                                           // non-string retract
+        r#"{"retract":[5]}"#, // non-string retract
         r#"{"meals":[{"id":"a","consumedAt":"t","name":"n"}],"note":1}"#, // unknown key
     ] {
         let (status, _) = post_corrections(&st, Some("Bearer test-token"), bad).await;
@@ -1859,9 +1854,15 @@ async fn queued_correction_merges_into_the_next_terminal_result_with_seq() {
     assert_eq!(v["response"], "Here is your day.", "reply text untouched");
     let ml = &v["directives"]["meal_log"];
     assert_eq!(ml["meals"][0]["id"], "2026-07-04-soup");
-    assert_eq!(ml["meals"][0]["sodium_mg"], 900.0, "micronutrient on the wire");
+    assert_eq!(
+        ml["meals"][0]["sodium_mg"], 900.0,
+        "micronutrient on the wire"
+    );
     assert_eq!(ml["retract"][0], "2026-07-04-gone");
-    assert_eq!(ml["corrections_seq"], 1, "highest queued seq stamped for ack");
+    assert_eq!(
+        ml["corrections_seq"], 1,
+        "highest queued seq stamped for ack"
+    );
     let _ = std::fs::remove_file(&fake);
 }
 
@@ -1892,9 +1893,8 @@ async fn queued_corrections_merge_ahead_of_a_turn_extracted_block() {
 
 #[tokio::test]
 async fn unacked_corrections_redeliver_but_an_ack_prunes_them() {
-    let (st, fake) = state_with_queue(
-        r#"{"type":"result","is_error":false,"result":"ok","session_id":"s"}"#,
-    );
+    let (st, fake) =
+        state_with_queue(r#"{"type":"result","is_error":false,"result":"ok","session_id":"s"}"#);
     post_corrections(
         &st,
         Some("Bearer test-token"),
@@ -3729,4 +3729,300 @@ async fn context_carry_end_to_end_pins_todays_transcript() {
     let _ = std::fs::remove_file(&fake);
     let _ = std::fs::remove_file(&count_file);
     let _ = std::fs::remove_file(&argv_file);
+}
+
+// ---- POST /jesse idempotency (request_id dedup) ---------------------------
+//
+// A client that never saw the 202 for a POST can re-send the SAME request with the
+// SAME `request_id`; the bridge returns the ORIGINAL job instead of spawning a
+// second turn. These drive the real router end-to-end with a fake `claude` that
+// records every spawn to a counter file, so "spawned exactly once" is observable.
+
+/// A fake `claude` that appends one line to `counter` on every spawn (so a test can
+/// count how many turns actually ran) and then emits a terminal result line. The
+/// `sleep` keeps the turn briefly live so a duplicate POST lands while it runs.
+fn spawn_counting_claude(counter: &std::path::Path, sleep_secs: u32) -> std::path::PathBuf {
+    let script = format!(
+        "#!/bin/sh\n\
+         echo x >> '{}'\n\
+         sleep {sleep_secs}\n\
+         printf '%s' '{{\"type\":\"result\",\"is_error\":false,\"result\":\"deduped ok\",\"session_id\":\"sess-dedup\"}}'\n",
+        counter.display()
+    );
+    write_fake_claude(&script)
+}
+
+fn spawn_count(counter: &std::path::Path) -> usize {
+    std::fs::read_to_string(counter)
+        .map(|s| s.lines().filter(|l| !l.is_empty()).count())
+        .unwrap_or(0)
+}
+
+fn counter_path() -> std::path::PathBuf {
+    std::env::temp_dir().join(format!(
+        "jesse-spawns-{}-{}.txt",
+        std::process::id(),
+        JOB_COUNTER.fetch_add(1, Ordering::Relaxed)
+    ))
+}
+
+async fn wait_for_done(st: &AppState, job_id: &str) -> Value {
+    for _ in 0..100 {
+        let v = result_status(st, job_id).await;
+        if v["status"] == "done" {
+            return v;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!("turn {job_id} never reached done");
+}
+
+#[tokio::test]
+async fn dedup_same_request_id_twice_returns_same_job_and_spawns_once() {
+    let counter = counter_path();
+    let _ = std::fs::remove_file(&counter);
+    let fake = spawn_counting_claude(&counter, 1);
+    let cfg = Config {
+        claude_bin: fake.to_string_lossy().into_owned(),
+        timeout_secs: 30,
+        ..test_config()
+    };
+    let st = AppState::new(cfg);
+
+    let body = r#"{"mode":"ask","text":"hi","request_id":"dup-abc"}"#;
+    // First POST creates the job.
+    let r1 = app(st.clone())
+        .oneshot(jesse_request(Some("Bearer test-token"), body))
+        .await
+        .unwrap();
+    assert_eq!(r1.status(), StatusCode::ACCEPTED);
+    let b1: Value = serde_json::from_str(&body_string(r1).await).unwrap();
+    assert_eq!(b1["status"], "running");
+    let id1 = b1["job_id"].as_str().unwrap().to_string();
+
+    // Second POST with the SAME request_id — same job id back, same fresh-accept shape.
+    let r2 = app(st.clone())
+        .oneshot(jesse_request(Some("Bearer test-token"), body))
+        .await
+        .unwrap();
+    assert_eq!(r2.status(), StatusCode::ACCEPTED);
+    let b2: Value = serde_json::from_str(&body_string(r2).await).unwrap();
+    assert_eq!(b2["status"], "running");
+    assert_eq!(
+        b2["job_id"].as_str().unwrap(),
+        id1,
+        "a duplicate request_id must return the ORIGINAL job id"
+    );
+
+    let done = wait_for_done(&st, &id1).await;
+    assert_eq!(done["response"], "deduped ok");
+    assert_eq!(
+        spawn_count(&counter),
+        1,
+        "the duplicate POST must not spawn a second claude"
+    );
+
+    let _ = std::fs::remove_file(&fake);
+    let _ = std::fs::remove_file(&counter);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn dedup_two_concurrent_duplicate_posts_yield_one_job() {
+    let counter = counter_path();
+    let _ = std::fs::remove_file(&counter);
+    let fake = spawn_counting_claude(&counter, 1);
+    let cfg = Config {
+        claude_bin: fake.to_string_lossy().into_owned(),
+        timeout_secs: 30,
+        // Two permits so BOTH would run concurrently if the dedup didn't collapse them.
+        max_concurrency: 2,
+        ..test_config()
+    };
+    let st = AppState::new(cfg);
+
+    let body = r#"{"mode":"ask","text":"race","request_id":"race-key"}"#;
+    // Fire both POSTs in parallel on separate tasks — the check-and-insert under the
+    // job store's one lock must let exactly one win.
+    let a = st.clone();
+    let h1 = tokio::spawn(async move {
+        app(a)
+            .oneshot(jesse_request(Some("Bearer test-token"), body))
+            .await
+            .unwrap()
+    });
+    let b = st.clone();
+    let h2 = tokio::spawn(async move {
+        app(b)
+            .oneshot(jesse_request(Some("Bearer test-token"), body))
+            .await
+            .unwrap()
+    });
+    let (r1, r2) = (h1.await.unwrap(), h2.await.unwrap());
+    assert_eq!(r1.status(), StatusCode::ACCEPTED);
+    assert_eq!(r2.status(), StatusCode::ACCEPTED);
+    let b1: Value = serde_json::from_str(&body_string(r1).await).unwrap();
+    let b2: Value = serde_json::from_str(&body_string(r2).await).unwrap();
+    let id1 = b1["job_id"].as_str().unwrap();
+    let id2 = b2["job_id"].as_str().unwrap();
+    assert_eq!(
+        id1, id2,
+        "two concurrent duplicate POSTs must resolve to the SAME job id"
+    );
+
+    let done = wait_for_done(&st, id1).await;
+    assert_eq!(done["response"], "deduped ok");
+    assert_eq!(
+        spawn_count(&counter),
+        1,
+        "two concurrent duplicate POSTs must spawn exactly one claude"
+    );
+
+    let _ = std::fs::remove_file(&fake);
+    let _ = std::fs::remove_file(&counter);
+}
+
+#[tokio::test]
+async fn dedup_against_a_completed_job_fetches_the_finished_result() {
+    let counter = counter_path();
+    let _ = std::fs::remove_file(&counter);
+    // No sleep — the first turn finishes fast, so the duplicate lands on a DONE job.
+    let fake = spawn_counting_claude(&counter, 0);
+    let cfg = Config {
+        claude_bin: fake.to_string_lossy().into_owned(),
+        timeout_secs: 30,
+        ..test_config()
+    };
+    let st = AppState::new(cfg);
+
+    let body = r#"{"mode":"ask","text":"hi","request_id":"finished-key"}"#;
+    let r1 = app(st.clone())
+        .oneshot(jesse_request(Some("Bearer test-token"), body))
+        .await
+        .unwrap();
+    let b1: Value = serde_json::from_str(&body_string(r1).await).unwrap();
+    let id1 = b1["job_id"].as_str().unwrap().to_string();
+    let done = wait_for_done(&st, &id1).await;
+    assert_eq!(done["response"], "deduped ok");
+
+    // Now re-POST the SAME request_id against the finished job.
+    let r2 = app(st.clone())
+        .oneshot(jesse_request(Some("Bearer test-token"), body))
+        .await
+        .unwrap();
+    assert_eq!(r2.status(), StatusCode::ACCEPTED);
+    let b2: Value = serde_json::from_str(&body_string(r2).await).unwrap();
+    let id2 = b2["job_id"].as_str().unwrap().to_string();
+    assert_eq!(
+        id2, id1,
+        "a completed job's request_id must still dedup to it"
+    );
+    // The returned id fetches the finished result immediately (first poll is satisfied).
+    let refetch = result_status(&st, &id2).await;
+    assert_eq!(refetch["status"], "done");
+    assert_eq!(refetch["response"], "deduped ok");
+    assert_eq!(
+        spawn_count(&counter),
+        1,
+        "a dedup against a completed job must not spawn a second claude"
+    );
+
+    let _ = std::fs::remove_file(&fake);
+    let _ = std::fs::remove_file(&counter);
+}
+
+#[tokio::test]
+async fn absent_request_id_creates_a_distinct_job_each_time() {
+    // Regression: with NO request_id, every POST is a fresh turn — two POSTs get two
+    // different job ids and two spawns, byte-for-byte today's behavior.
+    let counter = counter_path();
+    let _ = std::fs::remove_file(&counter);
+    let fake = spawn_counting_claude(&counter, 0);
+    let cfg = Config {
+        claude_bin: fake.to_string_lossy().into_owned(),
+        timeout_secs: 30,
+        ..test_config()
+    };
+    let st = AppState::new(cfg);
+
+    let body = r#"{"mode":"ask","text":"hi"}"#;
+    let r1 = app(st.clone())
+        .oneshot(jesse_request(Some("Bearer test-token"), body))
+        .await
+        .unwrap();
+    let id1 = serde_json::from_str::<Value>(&body_string(r1).await).unwrap()["job_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let _ = wait_for_done(&st, &id1).await;
+    let r2 = app(st.clone())
+        .oneshot(jesse_request(Some("Bearer test-token"), body))
+        .await
+        .unwrap();
+    let id2 = serde_json::from_str::<Value>(&body_string(r2).await).unwrap()["job_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let _ = wait_for_done(&st, &id2).await;
+
+    assert_ne!(id1, id2, "no request_id → each POST is a distinct turn");
+    assert_eq!(
+        spawn_count(&counter),
+        2,
+        "two POSTs with no request_id must spawn two turns"
+    );
+
+    let _ = std::fs::remove_file(&fake);
+    let _ = std::fs::remove_file(&counter);
+}
+
+#[tokio::test]
+async fn invalid_request_id_is_400_json_and_spawns_nothing() {
+    // A bridge whose fake claude would touch a marker if it EVER ran — an invalid
+    // request_id must be rejected before any turn machinery.
+    let counter = counter_path();
+    let _ = std::fs::remove_file(&counter);
+    let fake = spawn_counting_claude(&counter, 0);
+    let cfg = Config {
+        claude_bin: fake.to_string_lossy().into_owned(),
+        ..test_config()
+    };
+    let st = AppState::new(cfg);
+
+    // Over-length (65 chars).
+    let too_long = "a".repeat(65);
+    let body_long = format!(r#"{{"mode":"ask","text":"hi","request_id":"{too_long}"}}"#);
+    let r1 = app(st.clone())
+        .oneshot(jesse_request(Some("Bearer test-token"), &body_long))
+        .await
+        .unwrap();
+    assert_eq!(r1.status(), StatusCode::BAD_REQUEST);
+    let e1: Value = serde_json::from_str(&body_string(r1).await).unwrap();
+    assert!(
+        e1["error"].as_str().unwrap().contains("64"),
+        "the 400 body must be a one-line JSON error naming the length cap"
+    );
+
+    // Bad characters.
+    let body_bad = r#"{"mode":"ask","text":"hi","request_id":"bad id!"}"#;
+    let r2 = app(st.clone())
+        .oneshot(jesse_request(Some("Bearer test-token"), body_bad))
+        .await
+        .unwrap();
+    assert_eq!(r2.status(), StatusCode::BAD_REQUEST);
+    let e2: Value = serde_json::from_str(&body_string(r2).await).unwrap();
+    assert!(
+        e2["error"].is_string(),
+        "the bad-chars 400 must also carry a JSON error"
+    );
+
+    // Neither rejected POST spawned anything.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(
+        spawn_count(&counter),
+        0,
+        "a rejected request_id must spawn no turn"
+    );
+
+    let _ = std::fs::remove_file(&fake);
+    let _ = std::fs::remove_file(&counter);
 }

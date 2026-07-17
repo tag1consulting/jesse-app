@@ -143,6 +143,48 @@ curl -s http://127.0.0.1:8765/jesse/result/<job_id> \
 
 Same bearer auth as `/jesse`. An unknown or evicted id → **`404`**.
 
+### Idempotency key — safely re-send a `POST /jesse` (`request_id`)
+
+Because `POST /jesse` returns the `job_id` on the first response and the turn then runs
+**detached**, a network drop *before* that response reaches the phone leaves the client
+with no id to poll — and a blind retry would spawn a **second** turn (double the tokens,
+a second vault write). The optional **`request_id`** field closes that window: re-send the
+same request with the same key and the bridge returns the **original** job.
+
+```bash
+# First attempt — the 202 never made it back to the phone.
+curl -s -X POST http://127.0.0.1:8765/jesse \
+  -H "Authorization: Bearer $JESSE_TOKEN" -H "Content-Type: application/json" \
+  -d '{"mode":"ask","text":"When is my next race?","request_id":"2f9c1a-turn-0007"}'
+
+# Retry with the SAME request_id — same job_id back, no second turn spawned.
+curl -s -X POST http://127.0.0.1:8765/jesse \
+  -H "Authorization: Bearer $JESSE_TOKEN" -H "Content-Type: application/json" \
+  -d '{"mode":"ask","text":"When is my next race?","request_id":"2f9c1a-turn-0007"}'
+# → 202 { "job_id": "<same id as the first accept>", "status": "running" }
+```
+
+- **Optional and additive.** `request_id` is a string, `≤ 64` chars, **ASCII
+  alphanumerics and hyphens only**; anything else is a `400 { "error": "…" }`.
+  **Omitting it reproduces the pre-idempotency behavior exactly** — every `POST` is a fresh
+  turn (old app builds simply don't send it).
+- **What "dedup" returns.** When the key is already mapped to a **live** job — queued,
+  running, done, failed, or cancelled, as long as it's still inside its retention window —
+  the bridge **creates nothing, takes no concurrency permit, and enqueues nothing**. It
+  returns `202 { "job_id": "<existing>", "status": "running" }`, the *exact* shape of a
+  fresh accept, so the client streams (`GET /jesse/stream/{job_id}`) or polls
+  (`GET /jesse/result/{job_id}`) the returned id identically either way. A job that already
+  finished satisfies the first poll immediately with its stored terminal state.
+- **Reaped ⇒ new.** Once a job is evicted (see the eviction model below), its `request_id`
+  mapping is gone, so the same key on a later `POST` is treated as brand new.
+- **Concurrency-safe.** The `request_id → job_id` index is maintained under the job store's
+  single `jobs` lock, with the check-and-insert done at job creation — so two duplicate
+  `POST`s that arrive *at the same instant* can never both spawn; they collapse to one job.
+- **Survives a restart.** The `request_id` is persisted with the completed job and the
+  index is rebuilt from persisted jobs on startup, so a dedup still works across a bridge
+  restart. Job files written before this field (which lack the key) load unchanged.
+- **Auth and rate limiting are unchanged** and apply *before* any of this.
+
 ### Cancel an in-flight turn
 
 ```bash

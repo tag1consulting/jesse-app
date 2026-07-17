@@ -71,10 +71,36 @@ pub struct Job {
     // Set (wall-clock) at the FIRST successful retrieval of a terminal result.
     // Once set, eviction switches from the full TTL to the short post-fetch grace.
     pub first_retrieved_at: Option<SystemTime>,
+    // The idempotency key this turn was created with, or `None` for a turn with no
+    // `request_id`. Persisted with the job and used to prune the reverse dedup index
+    // (`JobsInner::request_index`) when the job is reaped, so the index can never
+    // outlive its job.
+    pub request_id: Option<String>,
+}
+
+/// The jobs map plus the `request_id → job_id` dedup index, behind ONE lock so a
+/// check-and-insert at job creation is atomic against a concurrent duplicate POST
+/// and the index can never point at a job the same critical section didn't create.
+#[derive(Default)]
+pub struct JobsInner {
+    pub jobs: HashMap<String, Job>,
+    // Reverse index for POST /jesse idempotency: an incoming `request_id` maps to the
+    // job_id already serving it. Only jobs created WITH a `request_id` appear here.
+    // Rebuilt from persisted jobs at startup; every job removal (eviction) also
+    // removes its entry, so a mapping can never outlive its job.
+    pub request_index: HashMap<String, String>,
+}
+
+/// The outcome of creating a job under an optional idempotency key: either a fresh
+/// job was created, or an identical live `request_id` was already mapped — in which
+/// case the caller must spawn nothing and hand back the existing id.
+pub enum CreateOutcome {
+    Created(String),
+    Duplicate(String),
 }
 
 pub struct JobStore {
-    pub jobs: Mutex<HashMap<String, Job>>,
+    pub jobs: Mutex<JobsInner>,
     // Abort handle for each RUNNING job's spawned turn task, keyed by job id.
     // `POST /jesse/cancel/{id}` looks the handle up and aborts it — dropping the
     // task's `Child` (kill_on_drop) kills `claude` and frees the concurrency
@@ -181,6 +207,10 @@ pub fn job_to_value(id: &str, job: &Job) -> Option<Value> {
         "error": error,
         "completed_at_ms": system_time_to_ms(completed_at),
         "first_retrieved_at_ms": job.first_retrieved_at.map(system_time_to_ms),
+        // The idempotency key, so a POST /jesse dedup mapping survives a restart
+        // (the index is rebuilt from these on load). Absent/null on a turn with no
+        // request_id and on any persisted file written before this field existed.
+        "request_id": job.request_id,
     }))
 }
 
@@ -234,12 +264,19 @@ pub fn value_to_job(v: &Value) -> Option<(String, Job)> {
         .get("first_retrieved_at_ms")
         .and_then(|m| m.as_u64())
         .map(ms_to_system_time);
+    // Absent/null/non-string request_id → None. Every job file written before this
+    // field existed simply lacks the key and loads with no idempotency mapping.
+    let request_id = v
+        .get("request_id")
+        .and_then(|r| r.as_str())
+        .map(|s| s.to_string());
     Some((
         id,
         Job {
             state,
             completed_at,
             first_retrieved_at,
+            request_id,
         },
     ))
 }
@@ -439,15 +476,26 @@ impl JobStore {
 
     /// Build a store over an explicit persister and pre-seeded job map. Lets a
     /// test inject a probe sink (e.g. to prove `complete` persists off the lock)
-    /// while sharing the rest of the wiring with `new`.
+    /// while sharing the rest of the wiring with `new`. The `request_id → job_id`
+    /// dedup index is rebuilt here from the seeded jobs, so a persisted mapping is
+    /// live again the instant the store loads (startup index rebuild).
     pub fn with_persister(
         ttl: Duration,
         retrieval_grace: Duration,
         persister: Arc<dyn Persister>,
         jobs: HashMap<String, Job>,
     ) -> Self {
+        let mut request_index = HashMap::new();
+        for (id, job) in &jobs {
+            if let Some(rid) = &job.request_id {
+                request_index.insert(rid.clone(), id.clone());
+            }
+        }
         JobStore {
-            jobs: Mutex::new(jobs),
+            jobs: Mutex::new(JobsInner {
+                jobs,
+                request_index,
+            }),
             aborts: Mutex::new(HashMap::new()),
             streams: StreamRegistry::new(),
             ttl,
@@ -457,18 +505,62 @@ impl JobStore {
     }
 
     /// Register a new running job and return its opaque id. Running jobs are not
-    /// persisted (no result yet).
+    /// persisted (no result yet). For a turn with no idempotency key.
     pub fn create(&self) -> String {
+        match self.create_with_request_id(None) {
+            CreateOutcome::Created(id) => id,
+            // Unreachable with `None` (no request_id can ever be already-mapped),
+            // but returning the id keeps the signature total.
+            CreateOutcome::Duplicate(id) => id,
+        }
+    }
+
+    /// Register a new running job under an optional idempotency key, atomically.
+    /// When `request_id` is `Some` and already maps to a job still present in the
+    /// store, NO job is created and [`CreateOutcome::Duplicate`] carries the existing
+    /// id — so two concurrent POSTs with the same `request_id` can never both spawn
+    /// (the check-and-insert happens under the one `jobs` lock). Otherwise a fresh
+    /// running job is inserted (and its `request_id` indexed) and its id returned.
+    pub fn create_with_request_id(&self, request_id: Option<String>) -> CreateOutcome {
+        let mut guard = self.jobs.lock_ok();
+        if let Some(rid) = &request_id {
+            // Only dedup to a mapping whose job still exists — a reaped job's entry
+            // is pruned on eviction, but guard against a stale mapping defensively.
+            if let Some(existing) = guard.request_index.get(rid).cloned() {
+                if guard.jobs.contains_key(&existing) {
+                    return CreateOutcome::Duplicate(existing);
+                }
+            }
+        }
         let id = new_job_id();
-        self.jobs.lock_ok().insert(
+        guard.jobs.insert(
             id.clone(),
             Job {
                 state: JobState::Running,
                 completed_at: None,
                 first_retrieved_at: None,
+                request_id: request_id.clone(),
             },
         );
-        id
+        if let Some(rid) = request_id {
+            guard.request_index.insert(rid, id.clone());
+        }
+        CreateOutcome::Created(id)
+    }
+
+    /// The job_id currently serving `request_id`, if one is mapped and its job is
+    /// still present (queued, running, or a terminal result within its retention
+    /// window). `None` when the key is unknown or its job has been reaped — in which
+    /// case the caller treats the POST as brand new. Cheap read on the request hot
+    /// path so an ordinary duplicate is short-circuited before any permit/work.
+    pub fn dedup_lookup(&self, request_id: &str) -> Option<String> {
+        let guard = self.jobs.lock_ok();
+        let id = guard.request_index.get(request_id)?;
+        if guard.jobs.contains_key(id) {
+            Some(id.clone())
+        } else {
+            None
+        }
     }
 
     /// Land a turn's outcome onto its job and persist the result. A Fatal/io
@@ -516,7 +608,7 @@ impl JobStore {
             Err((_code, error)) => JobState::Failed { error },
         };
         let mut guard = self.jobs.lock_ok();
-        let Some(job) = guard.get_mut(id) else {
+        let Some(job) = guard.jobs.get_mut(id) else {
             return;
         };
         if !matches!(job.state, JobState::Running) {
@@ -639,7 +731,7 @@ impl JobStore {
         // write-once, so the guard then no-ops and `Cancelled` always wins (M2).
         let outcome = {
             let mut guard = self.jobs.lock_ok();
-            match guard.get_mut(id) {
+            match guard.jobs.get_mut(id) {
                 None => CancelOutcome::Unknown,
                 Some(job) if matches!(job.state, JobState::Running) => {
                     job.state = JobState::Cancelled;
@@ -666,7 +758,7 @@ impl JobStore {
     }
 
     pub fn get(&self, id: &str) -> Option<JobState> {
-        self.jobs.lock_ok().get(id).map(|j| j.state.clone())
+        self.jobs.lock_ok().jobs.get(id).map(|j| j.state.clone())
     }
 
     /// Fetch a job's state and, if this is the first retrieval of a terminal
@@ -675,7 +767,7 @@ impl JobStore {
     /// start the clock. This is what `GET /jesse/result` uses.
     pub fn get_retrieving(&self, id: &str) -> Option<JobState> {
         let mut guard = self.jobs.lock_ok();
-        let job = guard.get_mut(id)?;
+        let job = guard.jobs.get_mut(id)?;
         let state = job.state.clone();
         let is_terminal = !matches!(job.state, JobState::Running);
         if is_terminal && job.first_retrieved_at.is_none() {
@@ -703,7 +795,8 @@ impl JobStore {
         let ttl = self.ttl;
         let retrieval_grace = self.retrieval_grace;
         let mut guard = self.jobs.lock_ok();
-        guard.retain(|id, j| {
+        let inner = &mut *guard;
+        inner.jobs.retain(|id, j| {
             let Some(completed) = j.completed_at else {
                 return true; // running — never evict
             };
@@ -714,6 +807,12 @@ impl JobStore {
             let evict = job_is_evictable(age_complete, age_retrieved, ttl, retrieval_grace);
             if evict {
                 self.persister.remove(id); // enqueue unlink under lock (worker unlinks)
+                                           // Prune the dedup mapping in the SAME critical section, so a
+                                           // reaped job's `request_id` can never resolve to a gone job —
+                                           // a later POST with that key is then correctly treated as new.
+                if let Some(rid) = &j.request_id {
+                    inner.request_index.remove(rid);
+                }
             }
             !evict
         });
@@ -1138,6 +1237,7 @@ mod tests {
                 },
                 completed_at: Some(SystemTime::now()),
                 first_retrieved_at: None,
+                request_id: None,
             };
             let value = job_to_value(&id, &job).expect("a terminal job serializes");
             // Completes here even though we hold the jobs lock.
@@ -1290,5 +1390,179 @@ mod tests {
             got_terminal_error,
             "the stream must receive a terminal error frame, not stay silent"
         );
+    }
+
+    // ---- POST /jesse idempotency (request_id dedup) -----------------------
+
+    #[test]
+    fn create_with_request_id_dedups_a_live_mapping() {
+        let store = JobStore::new(Duration::from_secs(600), Duration::from_secs(600), None);
+        // First create under a key → a fresh job, indexed.
+        let id = match store.create_with_request_id(Some("req-1".to_string())) {
+            CreateOutcome::Created(id) => id,
+            CreateOutcome::Duplicate(_) => panic!("first create must be Created"),
+        };
+        // A second create under the SAME key → Duplicate carrying the SAME id;
+        // no new job was inserted (spawn nothing).
+        match store.create_with_request_id(Some("req-1".to_string())) {
+            CreateOutcome::Duplicate(existing) => assert_eq!(existing, id),
+            CreateOutcome::Created(_) => {
+                panic!("a live mapping must dedup, not create a second job")
+            }
+        }
+        // The phase-1 hot-path lookup resolves the key to the same job.
+        assert_eq!(store.dedup_lookup("req-1").as_deref(), Some(id.as_str()));
+        // A DIFFERENT key is unrelated → a distinct job.
+        let other = match store.create_with_request_id(Some("req-2".to_string())) {
+            CreateOutcome::Created(id) => id,
+            CreateOutcome::Duplicate(_) => panic!("a new key must create"),
+        };
+        assert_ne!(other, id);
+        // An unknown key resolves to nothing.
+        assert!(store.dedup_lookup("never-seen").is_none());
+    }
+
+    #[test]
+    fn dedup_survives_completion_and_still_returns_the_finished_job() {
+        // A key stays mapped after its job completes — a duplicate POST against a
+        // finished job returns that job so the first poll gets the reply.
+        let store = JobStore::new(Duration::from_secs(600), Duration::from_secs(600), None);
+        let id = match store.create_with_request_id(Some("done-key".to_string())) {
+            CreateOutcome::Created(id) => id,
+            CreateOutcome::Duplicate(_) => unreachable!(),
+        };
+        store.complete(&id, Ok(("finished".to_string(), None, None)));
+        assert_eq!(store.dedup_lookup("done-key").as_deref(), Some(id.as_str()));
+        match store.create_with_request_id(Some("done-key".to_string())) {
+            CreateOutcome::Duplicate(existing) => assert_eq!(existing, id),
+            CreateOutcome::Created(_) => panic!("a completed job's key must still dedup"),
+        }
+    }
+
+    #[test]
+    fn reaped_mapping_is_treated_as_new_and_index_is_pruned() {
+        // Tiny ttl, no grace: a completed job ages out, and eviction must also drop
+        // its dedup mapping so the SAME key later creates a brand-new job.
+        let store = JobStore::new(Duration::from_millis(1), Duration::from_millis(1), None);
+        let id1 = match store.create_with_request_id(Some("reap-key".to_string())) {
+            CreateOutcome::Created(id) => id,
+            CreateOutcome::Duplicate(_) => unreachable!(),
+        };
+        store.complete(&id1, Ok(("gone soon".to_string(), None, None)));
+        std::thread::sleep(Duration::from_millis(10));
+        store.evict_expired();
+        // The job is reaped AND its mapping pruned (index can't outlive the job).
+        assert!(store.get(&id1).is_none(), "the job should have evicted");
+        assert!(
+            store.dedup_lookup("reap-key").is_none(),
+            "a reaped job's mapping must be pruned, not dangle"
+        );
+        // The same key now creates a fresh job — treated as brand new.
+        let id2 = match store.create_with_request_id(Some("reap-key".to_string())) {
+            CreateOutcome::Created(id) => id,
+            CreateOutcome::Duplicate(_) => panic!("a reaped mapping must be treated as new"),
+        };
+        assert_ne!(id2, id1);
+    }
+
+    #[test]
+    fn job_value_roundtrips_request_id_and_tolerates_absence() {
+        // A completed job with a request_id serializes it, and parses back with it.
+        let job = Job {
+            state: JobState::Done {
+                response: "r".into(),
+                session_id: None,
+                directives: None,
+                provenance: None,
+            },
+            completed_at: Some(SystemTime::now()),
+            first_retrieved_at: None,
+            request_id: Some("rid-abc".into()),
+        };
+        let v = job_to_value("id1", &job).expect("a terminal job serializes");
+        assert_eq!(v["request_id"], "rid-abc");
+        let (_, back) = value_to_job(&v).expect("round-trips");
+        assert_eq!(back.request_id.as_deref(), Some("rid-abc"));
+
+        // An OLD persisted file lacks the key entirely — it must still load, with
+        // no idempotency mapping.
+        let mut old = v.clone();
+        old.as_object_mut().unwrap().remove("request_id");
+        let (_, back_old) = value_to_job(&old).expect("a pre-field file still loads");
+        assert!(
+            back_old.request_id.is_none(),
+            "a file without request_id loads with None, not an error"
+        );
+    }
+
+    #[test]
+    fn persisted_request_id_rebuilds_the_index_on_restart() {
+        // A completed job's request_id survives a restart AND repopulates the dedup
+        // index, so a duplicate POST after a bridge restart still returns it.
+        let dir = temp_jobs_dir();
+        let ttl = Duration::from_secs(86_400);
+        let grace = Duration::from_secs(600);
+        let id = {
+            let store = JobStore::new(ttl, grace, Some(dir.clone()));
+            let id = match store.create_with_request_id(Some("persist-key".to_string())) {
+                CreateOutcome::Created(id) => id,
+                CreateOutcome::Duplicate(_) => unreachable!(),
+            };
+            store.complete(&id, Ok(("persisted".to_string(), None, None)));
+            store.flush_persistence();
+            id
+        };
+        // Restart over the same dir: the index is rebuilt from the persisted job.
+        let restarted = JobStore::new(ttl, grace, Some(dir.clone()));
+        assert!(matches!(restarted.get(&id), Some(JobState::Done { .. })));
+        assert_eq!(
+            restarted.dedup_lookup("persist-key").as_deref(),
+            Some(id.as_str()),
+            "the dedup index must be rebuilt from persisted jobs at startup"
+        );
+        match restarted.create_with_request_id(Some("persist-key".to_string())) {
+            CreateOutcome::Duplicate(existing) => assert_eq!(existing, id),
+            CreateOutcome::Created(_) => {
+                panic!("a persisted mapping must dedup after restart")
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn old_persisted_file_without_request_id_still_loads() {
+        // A hand-authored pre-field file (no request_id key) must load cleanly on
+        // startup and carry no mapping — the on-disk backward-compat guarantee.
+        let dir = temp_jobs_dir();
+        std::fs::create_dir_all(&dir).unwrap();
+        let id = "0000000000000000deadbeefdeadbeef";
+        let old = json!({
+            "v": 1,
+            "job_id": id,
+            "status": "done",
+            "response": "legacy reply",
+            "session_id": "sess-old",
+            "directives": Value::Null,
+            "provenance": Value::Null,
+            "error": Value::Null,
+            "completed_at_ms": system_time_to_ms(SystemTime::now()),
+            "first_retrieved_at_ms": Value::Null,
+            // NOTE: no "request_id" key — the pre-idempotency on-disk shape.
+        });
+        std::fs::write(dir.join(format!("{id}.json")), old.to_string()).unwrap();
+        let store = JobStore::new(
+            Duration::from_secs(86_400),
+            Duration::from_secs(600),
+            Some(dir.clone()),
+        );
+        match store.get(id) {
+            Some(JobState::Done { response, .. }) => assert_eq!(response, "legacy reply"),
+            other => panic!("old file must load as Done, got {:?}", other.map(|_| ())),
+        }
+        assert!(
+            store.dedup_lookup("anything").is_none(),
+            "an old file carries no dedup mapping"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

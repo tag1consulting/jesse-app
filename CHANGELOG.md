@@ -15,6 +15,39 @@ CI both run it). See the "Versioning" section of `bridge/README.md`.
 
 ## [Unreleased]
 
+## [Bridge 0.17.0] — 2026-07-17
+
+### Added
+- **Idempotency key for `POST /jesse` — a client that never saw the `202` can safely
+  re-send.** `POST /jesse` returns the `job_id` on the first response and the turn runs
+  detached; if the network drops before that response reaches the phone, the old contract
+  had no way to recover — a retry would spawn a *second* turn (double the tokens, a second
+  vault write). A new optional `request_id` field closes that: re-sending the same request
+  with the same key returns the ORIGINAL job instead of starting a new one.
+  - **Wire contract.** `POST /jesse` gains an optional `"request_id"` (string). Validated
+    when present: at most 64 chars, ASCII alphanumerics and hyphens only — anything else is
+    a `400 {"error":"…"}`. **Absent `request_id` reproduces today's behavior exactly**
+    (old app builds simply omit it) — every POST is a fresh turn.
+  - **Dedup semantics.** A `request_id` already mapped to a **live** job (queued, running,
+    or a terminal result still inside its retention window) short-circuits: the bridge
+    creates nothing, takes no concurrency permit, enqueues nothing, and returns
+    `202 {"job_id":"<existing>","status":"running"}` — the exact shape of a fresh accept.
+    The client then streams/polls that id as normal (a job that already finished satisfies
+    the first poll immediately). A `request_id` whose job has been **reaped** is treated as
+    brand new. Auth and rate limiting apply first, unchanged.
+  - **Concurrency-safe.** The `request_id → job_id` index lives under the job store's one
+    `jobs` lock; the check-and-insert happens at job creation, so two concurrent duplicate
+    POSTs can never both spawn — they collapse to a single job. The index is rebuilt from
+    persisted jobs at startup and pruned wherever a job is evicted, so a mapping can never
+    outlive its job.
+  - **Persistence.** The `request_id` is persisted with the completed job and reloaded on
+    restart (the dedup index is rebuilt from it). Job files written before this field —
+    which lack the key entirely — still load unchanged, with no mapping.
+  - Tests: same key twice (one spawn, same id), two concurrent duplicates (one job),
+    dedup against a completed job (returned id fetches the finished result), reaped mapping
+    treated as new (and the index pruned), absent-key regression (distinct jobs), invalid
+    key `400`, and a persisted round-trip that rebuilds the index (old files still load).
+
 ## [App 1.0 (44)] — 2026-07-17
 
 ### Changed

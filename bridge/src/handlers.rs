@@ -52,6 +52,43 @@ pub struct JesseRequest {
     // missing or stale ack only ever costs a redelivery, never correctness.
     #[serde(default)]
     meal_corrections_ack: Option<u64>,
+    // Optional idempotency key for POST /jesse. A client that never saw the response
+    // to a POST (socket dropped before the 202) can re-send the SAME request with the
+    // SAME `request_id`; the bridge then returns the ORIGINAL job instead of spawning a
+    // second turn. Validated when present (`validate_request_id`): ≤64 chars, ASCII
+    // alphanumerics and hyphens only. Absent reproduces today's behavior exactly (old
+    // app builds simply omit it) — every POST is a fresh turn.
+    #[serde(default)]
+    request_id: Option<String>,
+}
+
+/// Validate a POST /jesse idempotency `request_id`: at most 64 characters, ASCII
+/// alphanumerics and hyphens only, non-empty. Returns a one-line error message on
+/// rejection (the handler surfaces it as a `400`). Pure so it is unit-tested in
+/// isolation from the router.
+pub fn validate_request_id(id: &str) -> Result<(), String> {
+    if id.is_empty() {
+        return Err("request_id must not be empty".to_string());
+    }
+    if id.len() > 64 {
+        return Err("request_id must be at most 64 characters".to_string());
+    }
+    if !id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-') {
+        return Err("request_id may contain only ASCII letters, digits, and hyphens".to_string());
+    }
+    Ok(())
+}
+
+/// The `202 { "job_id", "status": "running" }` accept response. The SAME shape is
+/// returned for a fresh turn and for an idempotent-dedup hit, so the client streams
+/// or polls the returned id identically either way (a job that already finished
+/// satisfies the first poll immediately).
+fn accepted_running(job_id: &str) -> Response {
+    (
+        StatusCode::ACCEPTED,
+        Json(json!({ "job_id": job_id, "status": "running" })),
+    )
+        .into_response()
 }
 
 /// Body of `POST /jesse/device`: the phone's APNs device token (hex string).
@@ -314,6 +351,24 @@ pub async fn jesse(
         ));
     }
 
+    // Idempotency (POST /jesse dedup). Auth + rate limiting above are unchanged and
+    // apply first. When a valid `request_id` is present AND already maps to a live
+    // job (queued, running, or a terminal result still in its retention window),
+    // short-circuit here: create nothing, take no concurrency permit, enqueue
+    // nothing, and hand back the EXISTING job id in the same fresh-accept shape. A
+    // request_id whose job has been reaped is unmapped, so it falls through as brand
+    // new. Absent request_id skips this entirely — byte-for-byte today's behavior.
+    if let Some(rid) = req.request_id.as_deref() {
+        if let Err(msg) = validate_request_id(rid) {
+            // A one-line JSON error, distinct from a plain-text ApiError so the shape
+            // matches the JSON the client already parses on every other response.
+            return Ok((StatusCode::BAD_REQUEST, Json(json!({ "error": msg }))).into_response());
+        }
+        if let Some(existing) = st.jobs.dedup_lookup(rid) {
+            return Ok(accepted_running(&existing));
+        }
+    }
+
     let mode = req.mode.trim().to_lowercase();
     // Kill switch + gate: attempt the local diet-logging pipeline only when a diet
     // backend is configured AND this is a diet-shaped Tell. With no backend this is
@@ -401,7 +456,17 @@ pub async fn jesse(
     // Eviction runs on a periodic background task (`spawn_eviction_task`), NOT
     // here on the request hot path — a sweep that unlinks files must never block
     // a turn from starting (H3).
-    let job_id = st.jobs.create();
+    // Create the job under the optional idempotency key. The check-and-insert is
+    // atomic under the job store's one lock, so if a concurrent duplicate POST won
+    // the race between our phase-1 lookup above and here, we get `Duplicate` and
+    // spawn nothing — dropping the admission (releasing the permit / freeing the
+    // queue slot) and the scratch dir on this early return, and handing back the
+    // winner's id in the same fresh-accept shape. This is what makes two concurrent
+    // duplicate POSTs collapse to exactly one job.
+    let job_id = match st.jobs.create_with_request_id(req.request_id.clone()) {
+        CreateOutcome::Created(id) => id,
+        CreateOutcome::Duplicate(existing) => return Ok(accepted_running(&existing)),
+    };
     // Open the live stream before spawning so a phone that opens
     // `GET /jesse/stream/{job_id}` immediately finds the broadcast channel.
     st.jobs.stream_register(&job_id);
@@ -634,8 +699,13 @@ pub async fn jesse(
             // Local vault-QA lookup (routine route). On success the tokens stay local
             // and no hosted turn runs. On any ladder rung it becomes a hosted ASK
             // attempt (which, when emergency is armed, may serve the emergency child).
-            match run_vaultqa_pipeline(&cfg, &raw_text, health_context.as_deref(), recent_block.as_deref())
-                .await
+            match run_vaultqa_pipeline(
+                &cfg,
+                &raw_text,
+                health_context.as_deref(),
+                recent_block.as_deref(),
+            )
+            .await
             {
                 VaultqaOutcome::Answered { text, citations } => {
                     route = MetricsRoute::VaultqaLocal;
@@ -905,11 +975,7 @@ pub async fn jesse(
     // phone never saw — unavoidably unrecoverable without an id. That window is
     // now one round-trip instead of a multi-second hold, which is the whole point
     // of delivering the id eagerly.
-    Ok((
-        StatusCode::ACCEPTED,
-        Json(json!({ "job_id": job_id, "status": "running" })),
-    )
-        .into_response())
+    Ok(accepted_running(&job_id))
 }
 
 /// Fetch a turn's state by job id. This is what the app polls after a dropped
@@ -1100,12 +1166,16 @@ pub async fn jesse_meal_corrections(
     Json(body): Json<Value>,
 ) -> Result<Json<Value>, ApiError> {
     check_auth(&headers, &st.cfg.token)?;
-    let obj = body
-        .as_object()
-        .ok_or((StatusCode::BAD_REQUEST, "body is not a JSON object".to_string()))?;
+    let obj = body.as_object().ok_or((
+        StatusCode::BAD_REQUEST,
+        "body is not a JSON object".to_string(),
+    ))?;
     let (meals, retract) = parse_meal_batch_v2(obj).map_err(|reason| {
         eprintln!("meal-corrections: rejected malformed batch ({reason})");
-        (StatusCode::BAD_REQUEST, format!("malformed meal batch: {reason}"))
+        (
+            StatusCode::BAD_REQUEST,
+            format!("malformed meal batch: {reason}"),
+        )
     })?;
     match st.meal_corrections.enqueue(meals, retract) {
         Ok(seq) => Ok(Json(json!({ "status": "queued", "corrections_seq": seq }))),
@@ -1147,4 +1217,31 @@ pub fn app(state: AppState) -> Router {
         .route("/jesse/notify/:job_id", post(jesse_notify))
         .layer(DefaultBodyLimit::max(body_limit))
         .with_state(state)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn validate_request_id_accepts_alnum_and_hyphens_within_length() {
+        assert!(validate_request_id("abc123").is_ok());
+        assert!(validate_request_id("A1B2-c3d4-EF56").is_ok());
+        assert!(validate_request_id("--------").is_ok());
+        // Exactly 64 chars is the boundary and allowed.
+        assert!(validate_request_id(&"a".repeat(64)).is_ok());
+    }
+
+    #[test]
+    fn validate_request_id_rejects_empty_over_length_and_bad_chars() {
+        assert!(validate_request_id("").is_err());
+        // 65 chars is one past the cap.
+        assert!(validate_request_id(&"a".repeat(65)).is_err());
+        // Disallowed characters: underscore, dot, slash, space, unicode.
+        assert!(validate_request_id("has_underscore").is_err());
+        assert!(validate_request_id("has.dot").is_err());
+        assert!(validate_request_id("has/slash").is_err());
+        assert!(validate_request_id("has space").is_err());
+        assert!(validate_request_id("café").is_err());
+    }
 }
