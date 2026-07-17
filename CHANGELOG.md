@@ -15,6 +15,20 @@ CI both run it). See the "Versioning" section of `bridge/README.md`.
 
 ## [Unreleased]
 
+## [Bridge 0.16.1] — 2026-07-17
+
+### Changed
+- **Dropped the dead legacy weight-target contract from the `/jesse/diet` progress
+  fixtures.** As of 2026-07-17 the (out-of-repo) progress generator stopped emitting
+  `raceTarget`/`raceDate`/`maintTarget`; `progress.targets` is the sole weight-goal wire
+  contract. The bridge is a pure pass-through for this block, so nothing changes at
+  runtime — this is a **test/docs-only** cleanup. Removed the legacy fields from the
+  integration fixtures (`FIX_PROGRESS`, `FIX_PROGRESS_LEGACY`) and deleted the round-trip
+  assertions that pinned them. The `targets` array coverage is unchanged and complete:
+  dated, undated (`date:null` and key-omitted), achieved past-dated, empty `targets: []`,
+  and tolerance of an absent `targets` key. The app's legacy-fallback synthesis
+  (`DietSemantics.displayTargets`) is untouched and stays by design.
+
 ## [App 1.0 (43)] — 2026-07-17
 
 ### Added
