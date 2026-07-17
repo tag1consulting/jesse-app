@@ -15,6 +15,42 @@ CI both run it). See the "Versioning" section of `bridge/README.md`.
 
 ## [Unreleased]
 
+## [App 1.0 (46)] — 2026-07-17
+
+### Changed
+- **An oversized photo now downscales to fit instead of erroring.** Attaching an
+  image whose original file already exceeded the 10 MB per-file cap failed with
+  "… is too large (max 10 MB per file)" on every entry path (composer paste,
+  paperclip file import, camera capture) — they all stage through one shared
+  `addAttachment` funnel. Now, when a staged **image** is over the cap, it's
+  re-encoded to a smaller JPEG that fits, silently — no error, no prompt, no
+  Settings toggle.
+  - **New `AttachmentDownscaler`** — a pure, `nonisolated`, testable decision +
+    transform unit. `fitToCap(_:cap:)` re-encodes an over-cap decodable image as a
+    JPEG (quality 0.85), stepping the longest pixel edge down (×0.8 per iteration,
+    floored) until it lands under 90 % of the cap so a boundary result doesn't
+    flap. EXIF orientation is applied (ImageIO transform → upright pixels), so the
+    result arrives right-side-up. Output is always JPEG regardless of input, and
+    the display name gets a `.jpg` extension.
+  - **Byte-verbatim invariant preserved (PR #51).** The very first check is
+    "already under the cap?" — if so it returns `nil` and the original bytes stage
+    untouched, never decoded or re-encoded. Downscaling triggers *only* when the
+    original bytes exceed the cap.
+  - **One shared spot.** The re-encode lives in `addAttachment`, so paste, photo
+    picker, file import, and camera all behave identically — no new paste/picker
+    divergence (PR #51's root cause).
+  - **Images only.** An over-cap PDF (or any non-image) is left untouched and the
+    existing size cap rejects it exactly as before; rasterizing PDFs is out of
+    scope. The total (20 MB) and file-count (4) caps are unchanged — downscaling
+    satisfies the per-file cap only.
+  - Tests (failing-first): an oversized synthetic image stages under the cap,
+    decodes valid, and shows its dimensions stepped down; orientation is applied
+    (a rotated fixture decodes upright); under-cap inputs (image and PDF) return
+    `nil` so staging stays byte-verbatim; an over-cap PDF and an undecodable image
+    are not downscaled; cap edges on both sides; the filename swaps to `.jpg`. The
+    existing `PasteAttachmentTests` are untouched.
+  - Build **44 → 46**.
+
 ## [Bridge 0.17.0] — 2026-07-17
 
 ### Added
