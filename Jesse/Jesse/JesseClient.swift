@@ -291,10 +291,23 @@ struct JesseReply: Equatable {
     /// The validated meals this reply logged, or nil if there is no `meal_log`
     /// directive or it fails the contract (empty, over the cap, a blank required
     /// field, an unparseable date, or a bad macro) — an invalid block is never
-    /// partially written to Health. Mirrors `needsHealthRequest`.
+    /// partially written to Health. Mirrors `needsHealthRequest`. (v1 view; the v2
+    /// correction flow uses `mealBatch`.)
     var mealsToLog: [Meal]? {
         guard let ml = directives?.mealLog else { return nil }
         return MealLogParser.meals(from: ml)
+    }
+
+    /// The validated v2 meal-events batch this reply/turn delivered — upserts +
+    /// retracts + the `corrections_seq` to ack — or nil if there is no `meal_log`
+    /// directive or it fails the contract (over a cap, a blank/invalid field, an
+    /// unparseable date, or the same id in both `meals` and `retract`). An invalid
+    /// block is never partially applied. This is the seam the correction flow uses;
+    /// a v1 delivery decodes with empty `retract` and nil seq, so it flows through
+    /// unchanged as an all-upsert batch.
+    var mealBatch: MealBatch? {
+        guard let ml = directives?.mealLog else { return nil }
+        return MealLogParser.batch(from: ml)
     }
 
     private static let marker = "SPOKEN:"
@@ -424,6 +437,11 @@ nonisolated struct JesseRequest: Encodable, Equatable {
     // locked, or timeout) — the agent should answer from vault data and not
     // re-request. Nil on an ordinary turn.
     let healthContextUnavailable: Bool?
+    // Meal-corrections ack (JESSE_MEAL_LOG v2): the highest `corrections_seq` the app
+    // has taken responsibility for (applied, or skipped because the mirror is off). The
+    // bridge prunes every queued batch at or below it. Nil until the app has applied a
+    // delivered correction; re-sending the same value is harmless (prune is idempotent).
+    let mealCorrectionsAck: Int?
 
     nonisolated struct Attachment: Encodable, Equatable {
         let filename: String
@@ -444,6 +462,7 @@ nonisolated struct JesseRequest: Encodable, Equatable {
         case healthContext = "health_context"
         case healthContextRequested = "health_context_requested"
         case healthContextUnavailable = "health_context_unavailable"
+        case mealCorrectionsAck = "meal_corrections_ack"
     }
 }
 
@@ -495,12 +514,25 @@ nonisolated struct JesseDirectives: Decodable, Equatable {
     }
 }
 
-/// The decoded (not yet validated) `meal_log` directive — one or more meals the
-/// agent logged, to write into Apple Health. `JesseReply.mealsToLog` validates it
-/// through `MealLogParser` (caps, field optionality, strict ISO-8601 date) before
-/// anything is written; an invalid block is never partially written.
+/// The decoded (not yet validated) `meal_log` directive. Under **v1** it is just
+/// `meals` (inserts). Under **v2** it also carries `retract` (ids the source deleted →
+/// the app removes their Health entry + tombstones them) and, when the bridge merged
+/// off-app corrections from its persisted queue, `correctionsSeq` (the highest queued
+/// batch seq the app must ack so the bridge prunes). `JesseReply.mealBatch` validates
+/// the whole thing through `MealLogParser` (caps, field optionality, strict ISO-8601
+/// date, no id in both arrays) before anything is written. Both v2 fields are absent on
+/// a v1 delivery (`decodeIfPresent` → nil), so an older bridge decodes unchanged.
 nonisolated struct JesseMealLog: Decodable, Equatable {
     let meals: [JesseMeal]
+    // Defaulted (like `JesseDirectives.mealLog`) so an existing `JesseMealLog(meals:)`
+    // construction keeps compiling; Decodable still uses `decodeIfPresent`, so an absent
+    // key (a v1 delivery, or an older bridge) decodes to nil.
+    var retract: [String]? = nil
+    var correctionsSeq: Int? = nil
+    enum CodingKeys: String, CodingKey {
+        case meals, retract
+        case correctionsSeq = "corrections_seq"
+    }
 }
 
 /// One decoded meal. Wire field names match the bridge contract exactly:
@@ -730,17 +762,24 @@ struct JesseClient: JesseClientProtocol {
     /// of the keyword floor and the on-device model; tests inject a fake.
     let healthClassifier: any HealthRelevanceClassifying
 
+    /// The highest meal-corrections `corrections_seq` the app has taken responsibility
+    /// for, read at send time and attached to every turn so the bridge can prune its
+    /// queue. Defaults to the persisted ack store; injectable so tests pin it.
+    let mealCorrectionsAck: @Sendable () -> Int?
+
     init(config: JesseConfig,
          session: URLSession = JesseClient.boundedSession,
          streamSession: URLSession? = nil,
          healthProvider: any HealthContextProviding = HealthContextProvider(),
          isHealthContextEnabled: @escaping @Sendable () -> Bool = { HealthContextSettings.isEnabled },
-         healthClassifier: any HealthRelevanceClassifying = UnionHealthClassifier()) {
+         healthClassifier: any HealthRelevanceClassifying = UnionHealthClassifier(),
+         mealCorrectionsAck: @escaping @Sendable () -> Int? = { MealCorrectionsAckStore.pendingSeq }) {
         self.config = config
         self.session = session
         self.healthProvider = healthProvider
         self.isHealthContextEnabled = isHealthContextEnabled
         self.healthClassifier = healthClassifier
+        self.mealCorrectionsAck = mealCorrectionsAck
         if let streamSession {
             self.streamSession = streamSession
         } else if session === JesseClient.boundedSession {
@@ -814,7 +853,8 @@ struct JesseClient: JesseClientProtocol {
                                        voice: voice, instructions: instructions,
                                        floorOverride: floorOverride,
                                        attachments: attachments,
-                                       healthContext: healthContext)
+                                       healthContext: healthContext,
+                                       mealCorrectionsAck: mealCorrectionsAck())
         return try await postTurn(request)
     }
 
@@ -834,7 +874,8 @@ struct JesseClient: JesseClientProtocol {
                                        attachments: [],
                                        healthContext: outgoing.block,
                                        healthContextRequested: outgoing.requested ? true : nil,
-                                       healthContextUnavailable: outgoing.unavailable ? true : nil)
+                                       healthContextUnavailable: outgoing.unavailable ? true : nil,
+                                       mealCorrectionsAck: mealCorrectionsAck())
         return try await postTurn(request)
     }
 
@@ -1249,7 +1290,8 @@ struct JesseClient: JesseClientProtocol {
                             attachments: [JesseAttachment],
                             healthContext: String? = nil,
                             healthContextRequested: Bool? = nil,
-                            healthContextUnavailable: Bool? = nil) -> JesseRequest {
+                            healthContextUnavailable: Bool? = nil,
+                            mealCorrectionsAck: Int? = nil) -> JesseRequest {
         func nonBlank(_ s: String?) -> String? {
             guard let s, !s.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return nil }
             return s
@@ -1272,7 +1314,9 @@ struct JesseClient: JesseClientProtocol {
             // Only ever `true` or omitted — a `false` flag is meaningless to the
             // bridge (`#[serde(default)]` = false), so collapse it to nil.
             healthContextRequested: healthContextRequested == true ? true : nil,
-            healthContextUnavailable: healthContextUnavailable == true ? true : nil)
+            healthContextUnavailable: healthContextUnavailable == true ? true : nil,
+            // Only a positive seq is meaningful (0/absent → nothing acked yet).
+            mealCorrectionsAck: (mealCorrectionsAck ?? 0) > 0 ? mealCorrectionsAck : nil)
     }
 
     /// Encode a wire body. Optional fields omit when nil (synthesized

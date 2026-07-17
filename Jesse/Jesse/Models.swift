@@ -238,19 +238,33 @@ final class TurnAttachment {
 }
 
 /// A meal already written to Apple Health, keyed by the bridge-provided stable
-/// meal `id` (date + slot). Its sole purpose is idempotency: before writing a meal
-/// we check this store, so a re-poll, Re-check, re-opened thread, or watch relay of
-/// the same reply never double-writes to Health. A new standalone entity with a
-/// defaulted `.unique` id → SwiftData lightweight-migrates existing stores with no
-/// migration code (matching how `TurnAttachment` was added). `.unique` collapses a
-/// duplicate insert to an upsert, a second guarantee against a double row.
+/// meal `id` (date + slot). Its purpose is idempotency AND correction tracking: before
+/// applying a delivered meal we consult this store, so a re-poll, Re-check, re-opened
+/// thread, or watch relay never double-writes, and a *changed* meal (v2 upsert) is
+/// detected and rewritten exactly once.
+///
+/// - `contentHash` is `Meal.contentHash` at last write — an empty string means
+///   "hash-unknown" (a row migrated from the pre-v2 store, or not yet recorded). On the
+///   next sight of that id the hashes differ, triggering exactly one idempotent rewrite.
+/// - `tombstoned` marks an id the source retracted: a later *plain* insert of the same
+///   content is ignored (stale replay), but an upsert with a DIFFERENT hash clears the
+///   tombstone (a re-logged meal wins over a stale deletion).
+///
+/// Both new fields are **defaulted**, so SwiftData lightweight-migrates existing stores
+/// with no migration code (matching how `TurnAttachment` and this entity itself were
+/// added). `.unique` collapses a duplicate insert to an upsert, a second guarantee
+/// against a double row.
 @Model
 final class WrittenMeal {
     @Attribute(.unique) var id: String = ""
     var writtenAt: Date = Date()
+    var contentHash: String = ""
+    var tombstoned: Bool = false
 
-    init(id: String, writtenAt: Date = Date()) {
+    init(id: String, writtenAt: Date = Date(), contentHash: String = "", tombstoned: Bool = false) {
         self.id = id
         self.writtenAt = writtenAt
+        self.contentHash = contentHash
+        self.tombstoned = tombstoned
     }
 }

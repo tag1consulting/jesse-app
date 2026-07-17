@@ -2,131 +2,272 @@ import XCTest
 import HealthKit
 @testable import Jesse
 
-/// The reliability core of meal write-back, driven entirely with fakes (no
-/// HealthKit, no SwiftData): the gate (toggle + write auth), idempotency by meal
-/// id, the pending-queue enqueue on failure, and the drain that retries it. Proves
+/// The reliability + correction core of meal write-back (`JESSE_MEAL_LOG v2`), driven
+/// entirely with fakes (no HealthKit, no SwiftData): the gate (toggle + write auth), the
+/// upsert matrix (insert / skip / rewrite / retract / tombstone / revival / stale replay /
+/// meal move), the transactional ack (advanced on full apply, withheld on failure, and
+/// advanced-but-not-applied when the mirror is off), and the pending-queue drain. Proves
 /// the guarantees the on-device path relies on without a device.
 @MainActor
 final class MealHealthWriterTests: XCTestCase {
 
-    /// Records writes; each meal id can be forced to fail; auth is togglable.
+    /// Records an ordered op log; each id can be forced to fail write and/or delete; auth
+    /// is togglable. `delete` returns true (idempotent) unless the id is in `failDeletes`.
     private actor FakeMealWriter: MealWriting {
-        private(set) var wrote: [String] = []
-        private var failIds: Set<String> = []
+        enum Op: Equatable { case write(String), delete(String) }
+        private(set) var ops: [Op] = []
+        private var failWrites: Set<String> = []
+        private var failDeletes: Set<String> = []
         private var authorized = true
-        func setFailing(_ ids: Set<String>) { failIds = ids }
+        func setFailingWrites(_ ids: Set<String>) { failWrites = ids }
+        func setFailingDeletes(_ ids: Set<String>) { failDeletes = ids }
         func setAuthorized(_ on: Bool) { authorized = on }
-        func writtenIds() -> [String] { wrote }
+        func log() -> [Op] { ops }
+        func writes() -> [String] { ops.compactMap { if case let .write(id) = $0 { return id } else { return nil } } }
+        func deletes() -> [String] { ops.compactMap { if case let .delete(id) = $0 { return id } else { return nil } } }
         func write(_ meal: Meal) async -> Bool {
-            if failIds.contains(meal.id) { return false }
-            wrote.append(meal.id)
-            return true
+            if failWrites.contains(meal.id) { return false }
+            ops.append(.write(meal.id)); return true
+        }
+        func delete(id: String) async -> Bool {
+            if failDeletes.contains(id) { return false }
+            ops.append(.delete(id)); return true
         }
         func isAuthorizedToWrite() async -> Bool { authorized }
     }
 
     private final class InMemoryWrittenStore: WrittenMealStoring {
-        var ids: Set<String> = []
-        func isWritten(_ id: String) -> Bool { ids.contains(id) }
-        func markWritten(_ id: String) { ids.insert(id) }
+        var records: [String: WrittenMealRecord] = [:]
+        func record(for id: String) -> WrittenMealRecord? { records[id] }
+        func recordWritten(id: String, contentHash: String) {
+            records[id] = WrittenMealRecord(contentHash: contentHash, tombstoned: false)
+        }
+        func recordTombstoned(id: String) {
+            let hash = records[id]?.contentHash ?? ""
+            records[id] = WrittenMealRecord(contentHash: hash, tombstoned: true)
+        }
     }
 
     private final class InMemoryPending: PendingMealStoring {
-        private var meals: [Meal] = []
-        func enqueue(_ m: [Meal]) { for x in m where !meals.contains(where: { $0.id == x.id }) { meals.append(x) } }
-        func dequeueAll() -> [Meal] { let out = meals; meals = []; return out }
-        func peek() -> [Meal] { meals }
+        private var batch = PendingMealBatch.empty
+        func enqueue(_ b: PendingMealBatch) {
+            for m in b.upserts where !batch.upserts.contains(where: { $0.id == m.id }) { batch.upserts.append(m) }
+            for r in b.retracts where !batch.retracts.contains(r) { batch.retracts.append(r) }
+        }
+        func dequeueAll() -> PendingMealBatch { let out = batch; batch = .empty; return out }
+        func peek() -> PendingMealBatch { batch }
     }
 
-    private func meal(_ id: String, fiber: Double? = nil) -> Meal {
-        Meal(id: id, consumedAt: Date(timeIntervalSince1970: 1_780_000_000),
-             name: "Meal \(id)", kcal: 100, proteinGrams: nil, carbGrams: nil,
-             fatGrams: nil, fiberGrams: fiber,
-             sodiumMg: nil, satFatGrams: nil, sugarGrams: nil, potassiumMg: nil)
+    /// Captures the acked seqs (in order) so tests can assert what was acked.
+    private final class AckCapture { var seqs: [Int] = [] }
+
+    private func meal(_ id: String, kcal: Double? = 100, sodiumMg: Double? = nil,
+                      at: TimeInterval = 1_780_000_000) -> Meal {
+        Meal(id: id, consumedAt: Date(timeIntervalSince1970: at),
+             name: "Meal \(id)", kcal: kcal, proteinGrams: nil, carbGrams: nil,
+             fatGrams: nil, fiberGrams: nil, sodiumMg: sodiumMg,
+             satFatGrams: nil, sugarGrams: nil, potassiumMg: nil)
     }
 
-    private func writer(_ w: FakeMealWriter, _ p: InMemoryPending,
-                        enabled: Bool = true) -> MealHealthWriter {
-        MealHealthWriter(writer: w, pending: p, isEnabled: { enabled })
+    private func batch(_ upserts: [Meal] = [], retract: [String] = [], seq: Int? = nil) -> MealBatch {
+        MealBatch(upserts: upserts, retracts: retract, correctionsSeq: seq)
     }
 
-    func testWritesNewMealsAndRecordsThem() async {
-        let w = FakeMealWriter(); let p = InMemoryPending(); let store = InMemoryWrittenStore()
-        await writer(w, p).process([meal("a"), meal("b")], written: store)
-        let wrote = await w.writtenIds()
-        XCTAssertEqual(wrote.sorted(), ["a", "b"])
-        XCTAssertEqual(store.ids, ["a", "b"])
-        XCTAssertTrue(p.peek().isEmpty, "successful writes leave the pending queue empty")
+    private func makeWriter(_ w: FakeMealWriter, _ p: InMemoryPending, _ ack: AckCapture,
+                            enabled: Bool = true) -> MealHealthWriter {
+        MealHealthWriter(writer: w, pending: p, isEnabled: { enabled },
+                         recordAck: { ack.seqs.append($0) })
     }
 
-    func testWritesAMealCarryingFiber() async {
-        let w = FakeMealWriter(); let p = InMemoryPending(); let store = InMemoryWrittenStore()
-        await writer(w, p).process([meal("f", fiber: 6)], written: store)
-        let wrote = await w.writtenIds()
-        XCTAssertEqual(wrote, ["f"], "a meal carrying fiber writes and is recorded")
-        XCTAssertEqual(store.ids, ["f"])
+    // MARK: - Upsert matrix
+
+    func testUnseenIdIsInsertedAndRecordedWithItsHash() async {
+        let w = FakeMealWriter(); let p = InMemoryPending(); let ack = AckCapture()
+        let store = InMemoryWrittenStore()
+        let m = meal("a")
+        await makeWriter(w, p, ack).apply(batch([m], seq: 5), written: store)
+        let writes = await w.writes()
+        XCTAssertEqual(writes, ["a"])
+        XCTAssertEqual(store.record(for: "a")?.contentHash, m.contentHash)
+        XCTAssertEqual(store.record(for: "a")?.tombstoned, false)
         XCTAssertTrue(p.peek().isEmpty)
+        XCTAssertEqual(ack.seqs, [5], "a fully-applied batch advances the ack to its seq")
     }
 
-    func testAlreadyWrittenMealIsSkipped() async {
-        let w = FakeMealWriter(); let p = InMemoryPending(); let store = InMemoryWrittenStore()
-        store.ids = ["a"] // already written on a prior delivery
-        await writer(w, p).process([meal("a"), meal("b")], written: store)
-        let wrote = await w.writtenIds()
-        XCTAssertEqual(wrote, ["b"], "the deduped meal is not written again")
+    func testSameContentIsSkippedNoSecondWrite() async {
+        let w = FakeMealWriter(); let p = InMemoryPending(); let ack = AckCapture()
+        let store = InMemoryWrittenStore()
+        let m = meal("a")
+        store.records["a"] = WrittenMealRecord(contentHash: m.contentHash, tombstoned: false)
+        await makeWriter(w, p, ack).apply(batch([m], seq: 2), written: store)
+        let log = await w.log()
+        XCTAssertTrue(log.isEmpty, "identical content is neither written nor deleted")
+        XCTAssertEqual(ack.seqs, [2], "an all-skip batch is still acked")
     }
 
-    func testFailedWriteIsEnqueuedNotRecorded() async {
-        let w = FakeMealWriter(); await w.setFailing(["b"])
-        let p = InMemoryPending(); let store = InMemoryWrittenStore()
-        await writer(w, p).process([meal("a"), meal("b")], written: store)
-        XCTAssertEqual(store.ids, ["a"], "only the successful write is recorded")
-        XCTAssertEqual(p.peek().map(\.id), ["b"], "the failed write is queued for retry")
+    func testChangedContentRewritesExactlyOnce() async {
+        let w = FakeMealWriter(); let p = InMemoryPending(); let ack = AckCapture()
+        let store = InMemoryWrittenStore()
+        store.records["a"] = WrittenMealRecord(contentHash: "stale", tombstoned: false)
+        let corrected = meal("a", kcal: 250)
+        await makeWriter(w, p, ack).apply(batch([corrected], seq: 3), written: store)
+        let log = await w.log()
+        XCTAssertEqual(log, [.delete("a"), .write("a")],
+                       "a changed meal is delete-then-rewritten, exactly one entry")
+        XCTAssertEqual(store.record(for: "a")?.contentHash, corrected.contentHash)
+        XCTAssertEqual(ack.seqs, [3])
     }
 
-    func testDrainRetriesPendingAndClearsOnSuccess() async {
-        let w = FakeMealWriter(); await w.setFailing(["b"])
-        let p = InMemoryPending(); let store = InMemoryWrittenStore()
-        await writer(w, p).process([meal("a"), meal("b")], written: store)
-        XCTAssertEqual(p.peek().map(\.id), ["b"])
+    func testMicronutrientOnlyCorrectionRewritesOnce() async {
+        let w = FakeMealWriter(); let p = InMemoryPending(); let ack = AckCapture()
+        let store = InMemoryWrittenStore()
+        let before = meal("soup", kcal: 120, sodiumMg: nil)  // no sodium estimate yet
+        store.records["soup"] = WrittenMealRecord(contentHash: before.contentHash, tombstoned: false)
+        let after = meal("soup", kcal: 120, sodiumMg: 900)   // ONLY sodium added
+        XCTAssertNotEqual(before.contentHash, after.contentHash,
+                          "adding a first sodium estimate must change the hash (absent ≠ 0)")
+        await makeWriter(w, p, ack).apply(batch([after], seq: 7), written: store)
+        let log = await w.log()
+        XCTAssertEqual(log, [.delete("soup"), .write("soup")],
+                       "a micronutrient-only change rewrites exactly once")
+        XCTAssertEqual(ack.seqs, [7])
+    }
+
+    func testRetractDeletesAndTombstones() async {
+        let w = FakeMealWriter(); let p = InMemoryPending(); let ack = AckCapture()
+        let store = InMemoryWrittenStore()
+        store.records["a"] = WrittenMealRecord(contentHash: meal("a").contentHash, tombstoned: false)
+        await makeWriter(w, p, ack).apply(batch(retract: ["a"], seq: 4), written: store)
+        let deletes = await w.deletes()
+        XCTAssertEqual(deletes, ["a"])
+        XCTAssertEqual(store.record(for: "a")?.tombstoned, true)
+        XCTAssertEqual(ack.seqs, [4])
+    }
+
+    func testRetractOfUnknownIdIsANoopButTombstones() async {
+        let w = FakeMealWriter(); let p = InMemoryPending(); let ack = AckCapture()
+        let store = InMemoryWrittenStore()
+        await makeWriter(w, p, ack).apply(batch(retract: ["ghost"], seq: 1), written: store)
+        XCTAssertEqual(store.record(for: "ghost")?.tombstoned, true,
+                       "an unknown retract tombstones so a later stale insert is ignored")
+        XCTAssertEqual(ack.seqs, [1], "an unknown retract is not an error — still acked")
+    }
+
+    func testStaleReplayAfterTombstoneIsIgnored() async {
+        let w = FakeMealWriter(); let p = InMemoryPending(); let ack = AckCapture()
+        let store = InMemoryWrittenStore()
+        let m = meal("a")
+        store.records["a"] = WrittenMealRecord(contentHash: m.contentHash, tombstoned: true)
+        await makeWriter(w, p, ack).apply(batch([m], seq: 9), written: store)
+        let writes = await w.writes()
+        XCTAssertTrue(writes.isEmpty, "a stale replay of a retracted meal is not re-written")
+        XCTAssertEqual(store.record(for: "a")?.tombstoned, true, "it stays tombstoned")
+        XCTAssertEqual(ack.seqs, [9])
+    }
+
+    func testTombstoneRevivalOnDifferentContent() async {
+        let w = FakeMealWriter(); let p = InMemoryPending(); let ack = AckCapture()
+        let store = InMemoryWrittenStore()
+        store.records["a"] = WrittenMealRecord(contentHash: "old", tombstoned: true)
+        let reLogged = meal("a", kcal: 333)  // different content
+        await makeWriter(w, p, ack).apply(batch([reLogged], seq: 6), written: store)
+        let writes = await w.writes()
+        XCTAssertEqual(writes, ["a"], "a re-logged meal wins over a stale deletion")
+        XCTAssertEqual(store.record(for: "a")?.tombstoned, false, "the tombstone is cleared")
+        XCTAssertEqual(store.record(for: "a")?.contentHash, reLogged.contentHash)
+    }
+
+    func testMealMoveRetractOldPlusUpsertNewYieldsOneEntryAtTheNewTime() async {
+        let w = FakeMealWriter(); let p = InMemoryPending(); let ack = AckCapture()
+        let store = InMemoryWrittenStore()
+        store.records["snack-1500"] = WrittenMealRecord(
+            contentHash: meal("snack-1500").contentHash, tombstoned: false)
+        let moved = meal("snack-1630", at: 1_780_005_000)  // new id (embeds new time)
+        await makeWriter(w, p, ack).apply(
+            batch([moved], retract: ["snack-1500"], seq: 8), written: store)
+        // Upserts apply BEFORE retracts: write the new, then delete the old — one entry left.
+        let log = await w.log()
+        XCTAssertEqual(log, [.write("snack-1630"), .delete("snack-1500")])
+        XCTAssertEqual(store.record(for: "snack-1500")?.tombstoned, true)
+        XCTAssertEqual(store.record(for: "snack-1630")?.tombstoned, false)
+        XCTAssertEqual(ack.seqs, [8])
+    }
+
+    // MARK: - Transactional ack + pending drain
+
+    func testPartialFailureWithholdsAckAndEnqueuesRemainder() async {
+        let w = FakeMealWriter(); await w.setFailingWrites(["b"])
+        let p = InMemoryPending(); let ack = AckCapture(); let store = InMemoryWrittenStore()
+        await makeWriter(w, p, ack).apply(batch([meal("a"), meal("b")], seq: 10), written: store)
+        let writes = await w.writes()
+        XCTAssertEqual(writes, ["a"], "the good meal still applies")
+        XCTAssertEqual(p.peek().upserts.map(\.id), ["b"], "the failed meal is enqueued")
+        XCTAssertTrue(ack.seqs.isEmpty, "the ack is WITHHELD on a partial failure → bridge redelivers")
+    }
+
+    func testFailedRetractWithholdsAckAndEnqueues() async {
+        let w = FakeMealWriter(); await w.setFailingDeletes(["x"])
+        let p = InMemoryPending(); let ack = AckCapture(); let store = InMemoryWrittenStore()
+        store.records["x"] = WrittenMealRecord(contentHash: meal("x").contentHash, tombstoned: false)
+        await makeWriter(w, p, ack).apply(batch(retract: ["x"], seq: 11), written: store)
+        XCTAssertEqual(p.peek().retracts, ["x"], "a failed delete is queued for retry")
+        XCTAssertTrue(ack.seqs.isEmpty)
+        XCTAssertNotEqual(store.record(for: "x")?.tombstoned, true, "not tombstoned until the delete succeeds")
+    }
+
+    func testDrainRetriesPendingUpsertsAndRetracts() async {
+        let w = FakeMealWriter(); await w.setFailingWrites(["b"])
+        let p = InMemoryPending(); let ack = AckCapture(); let store = InMemoryWrittenStore()
+        await makeWriter(w, p, ack).apply(batch([meal("a"), meal("b")], seq: 10), written: store)
+        XCTAssertEqual(p.peek().upserts.map(\.id), ["b"])
         // The transient failure clears; a drain now succeeds and empties the queue.
-        await w.setFailing([])
-        await writer(w, p).drainPending(written: store)
-        XCTAssertEqual(store.ids, ["a", "b"])
+        await w.setFailingWrites([])
+        await makeWriter(w, p, ack).drainPending(written: store)
+        let writes = await w.writes()
+        XCTAssertEqual(writes, ["a", "b"])
         XCTAssertTrue(p.peek().isEmpty, "a successful drain clears the pending queue")
+        XCTAssertEqual(ack.seqs, [], "the drain path advances no ack (redelivery owns seq)")
     }
 
-    func testDrainReEnqueuesWhenStillFailing() async {
-        let w = FakeMealWriter(); await w.setFailing(["b"])
-        let p = InMemoryPending(); let store = InMemoryWrittenStore()
-        p.enqueue([meal("b")])
-        await writer(w, p).drainPending(written: store)
-        XCTAssertEqual(p.peek().map(\.id), ["b"], "a still-failing meal stays queued")
+    // MARK: - Gate (toggle + auth)
+
+    func testMirrorOffAcksButDoesNotApply() async {
+        let w = FakeMealWriter(); let p = InMemoryPending(); let ack = AckCapture()
+        let store = InMemoryWrittenStore()
+        await makeWriter(w, p, ack, enabled: false).apply(batch([meal("a")], seq: 12), written: store)
+        let log = await w.log()
+        XCTAssertTrue(log.isEmpty, "toggle off ⇒ nothing written or deleted")
+        XCTAssertTrue(store.records.isEmpty)
+        XCTAssertTrue(p.peek().isEmpty, "toggle off ⇒ nothing queued")
+        XCTAssertEqual(ack.seqs, [12], "toggle off still ACKS (Health is a mirror only while on)")
     }
 
-    func testFeatureOffWritesNothing() async {
-        let w = FakeMealWriter(); let p = InMemoryPending(); let store = InMemoryWrittenStore()
-        await writer(w, p, enabled: false).process([meal("a")], written: store)
-        let wrote = await w.writtenIds()
-        XCTAssertTrue(wrote.isEmpty, "toggle off ⇒ nothing written")
-        XCTAssertTrue(store.ids.isEmpty)
-        XCTAssertTrue(p.peek().isEmpty, "toggle off ⇒ nothing queued either")
-    }
-
-    func testUnauthorizedWritesNothing() async {
+    func testWriteDeniedAcksButDoesNotApply() async {
         let w = FakeMealWriter(); await w.setAuthorized(false)
-        let p = InMemoryPending(); let store = InMemoryWrittenStore()
-        await writer(w, p).process([meal("a")], written: store)
-        let wrote = await w.writtenIds()
-        XCTAssertTrue(wrote.isEmpty, "write denied ⇒ nothing written")
-        XCTAssertTrue(p.peek().isEmpty)
+        let p = InMemoryPending(); let ack = AckCapture(); let store = InMemoryWrittenStore()
+        await makeWriter(w, p, ack).apply(batch([meal("a")], seq: 13), written: store)
+        let log = await w.log()
+        XCTAssertTrue(log.isEmpty, "write denied ⇒ nothing applied")
+        XCTAssertEqual(ack.seqs, [13], "denied still acks so the bridge stops redelivering")
     }
 
     func testDrainWhileOffPutsPendingBack() async {
-        let w = FakeMealWriter(); let p = InMemoryPending(); let store = InMemoryWrittenStore()
-        p.enqueue([meal("a")])
-        await writer(w, p, enabled: false).drainPending(written: store)
-        XCTAssertEqual(p.peek().map(\.id), ["a"], "draining while off must not lose the queued meal")
+        let w = FakeMealWriter(); let p = InMemoryPending(); let ack = AckCapture()
+        let store = InMemoryWrittenStore()
+        p.enqueue(PendingMealBatch(upserts: [meal("a")], retracts: ["b"]))
+        await makeWriter(w, p, ack, enabled: false).drainPending(written: store)
+        XCTAssertEqual(p.peek().upserts.map(\.id), ["a"], "draining while off must not lose queued work")
+        XCTAssertEqual(p.peek().retracts, ["b"])
+    }
+
+    func testBatchWithNoSeqAppliesButAcksNothing() async {
+        // A turn's own reply block carries no corrections_seq — apply it, ack nothing.
+        let w = FakeMealWriter(); let p = InMemoryPending(); let ack = AckCapture()
+        let store = InMemoryWrittenStore()
+        await makeWriter(w, p, ack).apply(batch([meal("a")], seq: nil), written: store)
+        let writes = await w.writes()
+        XCTAssertEqual(writes, ["a"])
+        XCTAssertTrue(ack.seqs.isEmpty, "a seq-less (turn-extracted) block acks nothing")
     }
 
     // MARK: - HealthKit sample building (micronutrients, unknown ≠ zero)

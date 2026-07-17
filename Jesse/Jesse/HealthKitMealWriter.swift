@@ -94,6 +94,44 @@ nonisolated struct HealthKitMealWriter: MealWriting {
         }
     }
 
+    /// Delete the app's `.food` correlation for `id` and its contained quantity samples.
+    /// The meal id was stored as `HKMetadataKeyExternalUUID` on the correlation, so we
+    /// query for `.food` correlations with that value, then delete each correlation
+    /// **together with its `.objects`** (the contained samples) — correlation deletion
+    /// does not cascade, and there are now up to nine quantity types per meal, so we
+    /// enumerate rather than assume. HealthKit only lets the app delete objects IT wrote,
+    /// so another source's data is never touched even if it shared the external id.
+    func delete(id: String) async -> Bool {
+        guard HKHealthStore.isHealthDataAvailable() else { return false }
+        let store = HKHealthStore()
+        let predicate = HKQuery.predicateForObjects(
+            withMetadataKey: HKMetadataKeyExternalUUID, allowedValues: [id])
+        do {
+            let correlations = try await withCheckedThrowingContinuation {
+                (cont: CheckedContinuation<[HKCorrelation], Error>) in
+                let query = HKCorrelationQuery(
+                    type: HKCorrelationType(.food), predicate: predicate, samplePredicates: nil
+                ) { _, results, error in
+                    if let error { cont.resume(throwing: error) } else { cont.resume(returning: results ?? []) }
+                }
+                store.execute(query)
+            }
+            // Nothing matched → the id is already absent (idempotent retract/rewrite).
+            guard !correlations.isEmpty else { return true }
+            // Delete each correlation AND the quantity samples it contains (no cascade).
+            var toDelete: [HKObject] = []
+            for correlation in correlations {
+                toDelete.append(correlation)
+                toDelete.append(contentsOf: correlation.objects)
+            }
+            try await store.delete(toDelete)
+            return true
+        } catch {
+            Log.health.error("meal delete failed for \(id): \(error.localizedDescription)")
+            return false
+        }
+    }
+
     func isAuthorizedToWrite() async -> Bool {
         guard HKHealthStore.isHealthDataAvailable() else { return false }
         // Denied ⇒ the user turned meal writing off ⇒ disable quietly. `.notDetermined`

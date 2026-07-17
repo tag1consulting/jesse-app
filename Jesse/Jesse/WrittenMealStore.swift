@@ -10,18 +10,40 @@ import SwiftData
 struct SwiftDataWrittenMealStore: WrittenMealStoring {
     let context: ModelContext
 
-    func isWritten(_ id: String) -> Bool {
+    private func fetch(_ id: String) -> WrittenMeal? {
         var descriptor = FetchDescriptor<WrittenMeal>(predicate: #Predicate { $0.id == id })
         descriptor.fetchLimit = 1
-        return ((try? context.fetchCount(descriptor)) ?? 0) > 0
+        return (try? context.fetch(descriptor))?.first
     }
 
-    func markWritten(_ id: String) {
-        guard !isWritten(id) else { return }
-        context.insert(WrittenMeal(id: id))
-        // Best-effort persist — a failed save just means the id isn't durable this
-        // session; the meal was already written to Health, and `.unique` prevents a
-        // duplicate WrittenMeal row if the same id is inserted again.
+    func record(for id: String) -> WrittenMealRecord? {
+        guard let row = fetch(id) else { return nil }
+        return WrittenMealRecord(contentHash: row.contentHash, tombstoned: row.tombstoned)
+    }
+
+    func recordWritten(id: String, contentHash: String) {
+        if let row = fetch(id) {
+            row.contentHash = contentHash
+            row.tombstoned = false
+            row.writtenAt = Date()
+        } else {
+            context.insert(WrittenMeal(id: id, contentHash: contentHash))
+        }
+        // Best-effort persist — a failed save just means the record isn't durable this
+        // session; the meal was already written to Health, and the id+hash idempotency
+        // recovers on the next sight.
+        try? context.save()
+    }
+
+    func recordTombstoned(id: String) {
+        if let row = fetch(id) {
+            row.tombstoned = true
+            row.writtenAt = Date()
+        } else {
+            // A retract of an id we never wrote still records a tombstone, so a later
+            // stale insert of the same content is ignored.
+            context.insert(WrittenMeal(id: id, tombstoned: true))
+        }
         try? context.save()
     }
 }

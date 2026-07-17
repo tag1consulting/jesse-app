@@ -1074,10 +1074,10 @@ final class RunCoordinator {
     /// double-writes; a failed write enqueues to the pending store for a later
     /// drain. No-op for the overwhelming majority of turns (no `meal_log`).
     private func writeMeals(from reply: JesseReply, context: ModelContext) {
-        guard let meals = reply.mealsToLog, !meals.isEmpty else { return }
+        guard let batch = reply.mealBatch, !batch.isEmpty else { return }
         let written = SwiftDataWrittenMealStore(context: context)
         let mealWriter = self.mealWriter
-        Task { await mealWriter.process(meals, written: written) }
+        Task { await mealWriter.apply(batch, written: written) }
     }
 
     /// Retry any meals whose Health write previously failed (drained on foreground

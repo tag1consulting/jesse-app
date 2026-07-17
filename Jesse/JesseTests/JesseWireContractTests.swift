@@ -99,6 +99,24 @@ final class JesseWireContractTests: XCTestCase {
         XCTAssertEqual(try body(r), #"{"mode":"ask","text":"hi"}"#)
     }
 
+    /// A positive `meal_corrections_ack` (JESSE_MEAL_LOG v2) encodes to the wire key in
+    /// sorted position; a nil/zero ack drops the field (an ordinary turn is unchanged).
+    func testMealCorrectionsAckEncodesToExactBytes() throws {
+        let acked = JesseClient.makeRequest(mode: .ask, text: "hi", sessionId: nil, voice: false,
+                                            instructions: nil, floorOverride: nil, attachments: [],
+                                            mealCorrectionsAck: 42)
+        XCTAssertEqual(try body(acked),
+            #"{"meal_corrections_ack":42,"mode":"ask","text":"hi"}"#)
+
+        for absent in [nil, 0] as [Int?] {
+            let r = JesseClient.makeRequest(mode: .ask, text: "hi", sessionId: nil, voice: false,
+                                            instructions: nil, floorOverride: nil, attachments: [],
+                                            mealCorrectionsAck: absent)
+            XCTAssertEqual(try body(r), #"{"mode":"ask","text":"hi"}"#,
+                           "a nil/zero ack drops the field")
+        }
+    }
+
     // MARK: - directives decode (poll result)
 
     /// A `done` result carrying `directives.needs_health` decodes to a validated

@@ -107,4 +107,58 @@ final class MealWireDecodeTests: XCTestCase {
     func testReplyMealsToLogIsNilWithoutDirective() {
         XCTAssertNil(JesseReply(text: "plain", sessionId: nil).mealsToLog)
     }
+
+    // MARK: - v2 wire (retract + corrections_seq)
+
+    func testPollResultDecodesRetractAndCorrectionsSeq() throws {
+        let json = """
+        {"status":"done","response":"Moved it.","session_id":"s",
+         "directives":{"meal_log":{
+           "meals":[{"id":"2026-07-04-snack-1630","consumedAt":"2026-07-04T16:30:00+02:00",
+                     "name":"Snack","sodium_mg":900}],
+           "retract":["2026-07-04-snack-1500"],
+           "corrections_seq":42}}}
+        """
+        let ml = try XCTUnwrap(try decodeResult(json).directives?.mealLog)
+        XCTAssertEqual(ml.meals.first?.sodiumMg, 900)
+        XCTAssertEqual(ml.retract, ["2026-07-04-snack-1500"])
+        XCTAssertEqual(ml.correctionsSeq, 42)
+    }
+
+    func testV1DeliveryDecodesNilRetractAndSeq() throws {
+        // An older/v1 delivery omits both v2 keys → they decode to nil (backward compatible).
+        let json = """
+        {"status":"done","response":"ok","session_id":"s",
+         "directives":{"meal_log":{"meals":[
+           {"id":"a","consumedAt":"2026-07-04T12:30:00+02:00","name":"Lunch","kcal":400}]}}}
+        """
+        let ml = try XCTUnwrap(try decodeResult(json).directives?.mealLog)
+        XCTAssertNil(ml.retract)
+        XCTAssertNil(ml.correctionsSeq)
+    }
+
+    func testReplyMealBatchValidatesV2Delivery() throws {
+        let json = """
+        {"status":"done","response":"ok","session_id":"s",
+         "directives":{"meal_log":{
+           "meals":[{"id":"new","consumedAt":"2026-07-04T12:30:00+02:00","name":"Lunch"}],
+           "retract":["old"],"corrections_seq":9}}}
+        """
+        let r = try decodeResult(json)
+        let reply = JesseReply(text: r.response ?? "", sessionId: r.sessionId, directives: r.directives)
+        let b = try XCTUnwrap(reply.mealBatch)
+        XCTAssertEqual(b.upserts.map(\.id), ["new"])
+        XCTAssertEqual(b.retracts, ["old"])
+        XCTAssertEqual(b.correctionsSeq, 9)
+    }
+
+    func testSSEDoneFrameDecodesRetractAndSeq() throws {
+        let json = """
+        {"response":"Moved.","session_id":"s",
+         "directives":{"meal_log":{"meals":[],"retract":["gone"],"corrections_seq":3}}}
+        """
+        let frame = try JSONDecoder().decode(JesseStreamFrameData.self, from: Data(json.utf8))
+        XCTAssertEqual(frame.directives?.mealLog?.retract, ["gone"])
+        XCTAssertEqual(frame.directives?.mealLog?.correctionsSeq, 3)
+    }
 }

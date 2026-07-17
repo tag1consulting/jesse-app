@@ -152,11 +152,8 @@ final class MealLogParserTests: XCTestCase {
         XCTAssertEqual(MealLogParser.scrubbedStreamingText(text), text)
     }
 
-    func testScrubberDoesNotStripUnknownVersion() {
-        // v2 is loud by contract — never scrubbed.
-        let text = "Answer.\nJESSE_MEAL_LOG v2 {\"meals\":[]}"
-        XCTAssertEqual(MealLogParser.scrubbedStreamingText(text), text)
-    }
+    // (v2 is now a KNOWN version and IS scrubbed — see testScrubberStripsV2LineToo /
+    // testScrubberDoesNotStripV3 below for the current unknown-version boundary.)
 
     func testScrubberDoesNotStripV10OrV11() {
         let text = "Answer.\nJESSE_MEAL_LOG v10 {}"
@@ -167,5 +164,121 @@ final class MealLogParserTests: XCTestCase {
         // A sentinel-looking line that is NOT last is prose (matches the bridge).
         let text = "JESSE_MEAL_LOG v1 {\"meals\":[]}\nBut actually here is your answer."
         XCTAssertEqual(MealLogParser.scrubbedStreamingText(text), text)
+    }
+
+    func testScrubberStripsV2LineToo() {
+        // v2 is now a known version — its trailing line IS scrubbed from partial text.
+        let text = "Moved it.\nJESSE_MEAL_LOG v2 {\"meals\":[],\"retract\":[\"a\"]}"
+        XCTAssertEqual(MealLogParser.scrubbedStreamingText(text), "Moved it.")
+    }
+
+    func testScrubberDoesNotStripV3() {
+        // v3 and up stay visible (loud by contract).
+        let text = "Answer.\nJESSE_MEAL_LOG v3 {\"meals\":[]}"
+        XCTAssertEqual(MealLogParser.scrubbedStreamingText(text), text)
+    }
+
+    // MARK: - v2 batch (upserts + retracts + seq)
+
+    private func log(_ meals: [JesseMeal] = [], retract: [String]? = nil,
+                     seq: Int? = nil) -> JesseMealLog {
+        JesseMealLog(meals: meals, retract: retract, correctionsSeq: seq)
+    }
+
+    func testV1DeliveryIsAnAllUpsertBatch() {
+        // A v1 block (no retract, no seq) validates to an all-upsert batch — one seam,
+        // both versions.
+        let b = MealLogParser.batch(from: log([meal()]))
+        XCTAssertEqual(b?.upserts.count, 1)
+        XCTAssertTrue(b?.retracts.isEmpty ?? false)
+        XCTAssertNil(b?.correctionsSeq)
+    }
+
+    func testV2BatchCarriesUpsertsRetractsAndSeq() {
+        let b = MealLogParser.batch(from: log([meal(id: "new")], retract: ["old"], seq: 7))
+        XCTAssertEqual(b?.upserts.map(\.id), ["new"])
+        XCTAssertEqual(b?.retracts, ["old"])
+        XCTAssertEqual(b?.correctionsSeq, 7)
+    }
+
+    func testRetractOnlyBatchIsValid() {
+        let b = MealLogParser.batch(from: log(retract: ["a", "b"], seq: 3))
+        XCTAssertTrue(b?.upserts.isEmpty ?? false)
+        XCTAssertEqual(b?.retracts, ["a", "b"])
+    }
+
+    func testEmptyBatchNeitherMealsNorRetractIsRejected() {
+        XCTAssertNil(MealLogParser.batch(from: log()), "nothing to do → malformed")
+    }
+
+    func testSameIdInBothMealsAndRetractIsRejected() {
+        // A move uses DIFFERENT ids; the same id in both arrays is malformed → whole batch nil.
+        XCTAssertNil(MealLogParser.batch(from: log([meal(id: "x")], retract: ["x"])))
+    }
+
+    func testBlankRetractIdRejectsTheWholeBatch() {
+        XCTAssertNil(MealLogParser.batch(from: log([meal()], retract: ["  "])))
+    }
+
+    func testOverRetractCapIsRejectedWholesale() {
+        let many = (0...MealLogParser.maxRetract).map { "r\($0)" } // maxRetract + 1
+        XCTAssertNil(MealLogParser.batch(from: log(retract: many)))
+    }
+
+    func testAtRetractCapIsAccepted() {
+        let atCap = (0..<MealLogParser.maxRetract).map { "r\($0)" }
+        XCTAssertEqual(MealLogParser.batch(from: log(retract: atCap))?.retracts.count, MealLogParser.maxRetract)
+    }
+
+    func testBatchReusesPerMealValidation() {
+        // A bad meal inside a v2 batch fails the whole batch (reuses meal(from:)).
+        XCTAssertNil(MealLogParser.batch(from: log([meal(sodium: -1)], retract: ["a"])))
+    }
+
+    // MARK: - Content hash (absent ≠ 0, field-agnostic, order-stable)
+
+    private func domain(kcal: Double? = 100, sodium: Double? = nil) -> Meal {
+        Meal(id: "id", consumedAt: Date(timeIntervalSince1970: 1_780_000_000), name: "N",
+             kcal: kcal, proteinGrams: nil, carbGrams: nil, fatGrams: nil, fiberGrams: nil,
+             sodiumMg: sodium, satFatGrams: nil, sugarGrams: nil, potassiumMg: nil)
+    }
+
+    func testIdenticalContentHashesEqual() {
+        XCTAssertEqual(domain().contentHash, domain().contentHash)
+    }
+
+    func testAbsentAndZeroHashDifferently() {
+        // The unknown ≠ zero law: a nil sodium and a 0 sodium must NOT hash the same.
+        XCTAssertNotEqual(domain(sodium: nil).contentHash, domain(sodium: 0).contentHash)
+    }
+
+    func testAFirstSodiumEstimateChangesTheHash() {
+        // A meal gaining its first sodium value hashes differently → triggers one rewrite.
+        XCTAssertNotEqual(domain(sodium: nil).contentHash, domain(sodium: 900).contentHash)
+    }
+
+    func testADifferentSodiumValueChangesTheHash() {
+        XCTAssertNotEqual(domain(sodium: 600).contentHash, domain(sodium: 900).contentHash)
+    }
+
+    func testNameChangeChangesTheHash() {
+        let a = Meal(id: "id", consumedAt: Date(timeIntervalSince1970: 1_780_000_000), name: "A",
+                     kcal: 100, proteinGrams: nil, carbGrams: nil, fatGrams: nil, fiberGrams: nil,
+                     sodiumMg: nil, satFatGrams: nil, sugarGrams: nil, potassiumMg: nil)
+        let b = Meal(id: "id", consumedAt: Date(timeIntervalSince1970: 1_780_000_000), name: "B",
+                     kcal: 100, proteinGrams: nil, carbGrams: nil, fatGrams: nil, fiberGrams: nil,
+                     sodiumMg: nil, satFatGrams: nil, sugarGrams: nil, potassiumMg: nil)
+        XCTAssertNotEqual(a.contentHash, b.contentHash)
+    }
+
+    func testIdIsNotPartOfTheHash() {
+        // The hash answers "did the CONTENT change?" — id is the store key, not content.
+        let a = Meal(id: "id-1", consumedAt: Date(timeIntervalSince1970: 1_780_000_000), name: "N",
+                     kcal: 100, proteinGrams: nil, carbGrams: nil, fatGrams: nil, fiberGrams: nil,
+                     sodiumMg: nil, satFatGrams: nil, sugarGrams: nil, potassiumMg: nil)
+        let b = Meal(id: "id-2", consumedAt: Date(timeIntervalSince1970: 1_780_000_000), name: "N",
+                     kcal: 100, proteinGrams: nil, carbGrams: nil, fatGrams: nil, fiberGrams: nil,
+                     sodiumMg: nil, satFatGrams: nil, sugarGrams: nil, potassiumMg: nil)
+        XCTAssertEqual(a.contentHash, b.contentHash)
     }
 }

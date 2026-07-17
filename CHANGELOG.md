@@ -15,6 +15,47 @@ CI both run it). See the "Versioning" section of `bridge/README.md`.
 
 ## [Unreleased]
 
+## [App 1.0 (43)] — 2026-07-17
+
+### Added
+- **Meal-correction propagation in Apple Health — the app half of `JESSE_MEAL_LOG v2`
+  (upsert + retract).** Phase 3 wrote meals insert-only: once an id was written it was
+  skipped forever, so a correction made outside an app turn never reached Health. The app
+  now applies the bridge's v2 corrections (Bridge 0.16.0): it detects a *changed* meal and
+  rewrites its Health entry, deletes a *retracted* one, and acks what it has applied so the
+  bridge prunes its queue.
+  - **Parser** (`MealLogParser.batch`): validates a delivered `meal_log` into a domain
+    `MealBatch` (upserts + retracts + `corrections_seq`), reusing the existing per-meal
+    validation. Caps (≤10 meals, ≤10 retracts), atomic rejection (a blank field, an
+    unparseable date, a bad nutrient, or the same id in both arrays rejects the WHOLE
+    batch), v1 compat (an all-upsert batch), and the streaming scrubber now hides a v2
+    sentinel too while leaving v3+ visible.
+  - **Idempotency store upgrade** (`WrittenMeal`): gains a per-id **content hash** (a
+    SHA-256 over `consumedAt`, `name`, and every PRESENT nutrient — absent canonically
+    excluded, so absent ≠ 0 and a meal gaining its first sodium estimate rewrites exactly
+    once) and a **tombstone** flag. Additive, lightweight SwiftData migration; existing
+    rows read as hash-unknown and rewrite once on next sight. The hash iterates a fixed
+    canonical field order, so a future nutrient never needs a store migration.
+  - **HealthKit upsert/retract** (`HealthKitMealWriter`): unseen → insert; same hash →
+    skip; changed hash → delete the app's correlation (found by its meal-id external
+    identifier) **and its contained quantity samples** (up to nine — correlation deletion
+    does not cascade) then rewrite; retract → delete + tombstone. A tombstoned id ignores a
+    stale re-insert but a differing hash revives it (a re-logged meal wins). Only ever
+    deletes samples the app itself wrote — never another source's data.
+  - **Ack + durability**: after fully applying a delivered batch the app advances a
+    monotonic `meal_corrections_ack` sent on the next `POST /jesse`; on a HealthKit failure
+    the unapplied remainder is enqueued (upserts AND retracts) and the ack is **withheld**,
+    so the bridge redelivers (app-side id+hash idempotency makes that harmless). The
+    "Write meals to Apple Health" toggle governs corrections too — off means deliveries are
+    acked (so the bridge stops redelivering) but not applied (Health is a mirror only while
+    on). No new toggle.
+- Build **42 → 43**. Tests (failing-first): the parser matrix (v2/retract/caps/v3/hash),
+  the store migration (new fields default; hash-unknown triggers one rewrite), the upsert
+  matrix (insert/skip/rewrite/retract/tombstone/revival/stale-replay/meal-move/micronutrient-
+  only), the transactional ack (advanced on success, withheld on failure, acked-not-applied
+  when off), the pending-batch drain + legacy `[Meal]` migration, and the wire decode +
+  byte-pinned `meal_corrections_ack` request.
+
 ## [Bridge 0.16.0] — 2026-07-16
 
 > Version note: `0.15.0` is the concurrent local diet-extract pipeline work (#84,
