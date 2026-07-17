@@ -78,7 +78,7 @@ final class PhoneWatchConnectivity: NSObject {
     override convenience init() {
         let relay = WatchRelay(coordinator: RunCoordinator())
         self.init(handler: WatchTurnHandler(transcriber: SpeechFrameworkTranscriber(), relay: relay),
-                  context: AppModelContainer.shared.mainContext)
+                  context: AppModelContainer.shared.container.mainContext)
     }
 
     init(handler: WatchTurnHandler, context: ModelContext) {

@@ -15,6 +15,33 @@ CI both run it). See the "Versioning" section of `bridge/README.md`.
 
 ## [Unreleased]
 
+## [App 1.0 (44)] — 2026-07-17
+
+### Changed
+- **Versioned the SwiftData schema and stopped silently losing history on a store
+  failure.** `AppModelContainer` opened the store with `try?` and, on any failure,
+  substituted an *empty in-memory store* with only a log line — so a migration that
+  ever failed on a populated device would swap the user's whole conversation history
+  for a blank slate with no signal. Two root-cause fixes:
+  - **No more silent fallback.** A failed on-disk open now surfaces as
+    `AppModelStore.openFailure`; the app runs on a clearly *flagged* in-memory
+    fallback for the session (a non-dismissible banner: "Couldn't open your saved
+    conversations… this session won't be saved") and the on-disk file is left
+    **untouched** — never overwritten or deleted — so the data stays recoverable.
+  - **A versioned schema + migration plan.** The model list is now a
+    `VersionedSchema` (`JesseSchemaV1`) opened through a `SchemaMigrationPlan`
+    (`JesseMigrationPlan`) — the structural, testable home for future migrations.
+    The historical additive changes (`isFavorite`, `favoritedAt`,
+    `lastDeliveredJobId`, `aiTitle`, `titleSourceKey`, `origin`, `provenanceJSON`,
+    the `attachments` relationship, `TurnAttachment`, `WrittenMeal`) are all
+    lightweight-compatible, so the plan is a documented single-version scaffold.
+  - **Coverage for the path that had none.** New `AppModelContainerMigrationTests`
+    populate an on-disk store the pre-versioned way (threads, turns, attachments,
+    favorites, a WrittenMeal), reopen it through the real loader, and assert every
+    field survives (favorites still favorited, `aiTitle`/`origin`/`lastDeliveredJobId`
+    intact, a Turn's `provenanceJSON`, an attachment's thumbnail bytes) — plus a test
+    that a corrupt store is *flagged* (not swallowed) and its bytes left intact.
+
 ## [App 1.0 (43)] — 2026-07-17
 
 ### Added
