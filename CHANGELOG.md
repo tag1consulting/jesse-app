@@ -15,6 +15,52 @@ CI both run it). See the "Versioning" section of `bridge/README.md`.
 
 ## [Unreleased]
 
+## [Bridge 0.16.0] — 2026-07-16
+
+> Version note: `0.15.0` is the concurrent local diet-extract pipeline work (#84,
+> now on `main`); this change is independent and takes the next minor, `0.16.0`.
+
+### Added
+- **Meal-correction propagation — `JESSE_MEAL_LOG v2` with upsert + retract, and a
+  persisted corrections queue so corrections made OUTSIDE an app turn still reach Apple
+  Health.** Phase 3 shipped meals insert-only: once an id was written it was skipped
+  forever, so a correction made in a desktop/Cowork logging session (no app turn, no
+  reply to carry a block) never propagated. This closes that gap on the bridge side; the
+  app-side delete-and-rewrite lands in a following app release.
+  - **v2 contract (trailing-sentinel, same rules as v1, version bumped).**
+    `JESSE_MEAL_LOG v2 {"meals":[…],"retract":[…]}`. `meals` are **upserts** keyed on
+    `id` (unseen → insert; same content → skip; changed → the app deletes the prior
+    Health entry and rewrites it). `retract` (optional, cap 10) lists ids the source
+    deleted — the app removes their Health entry and tombstones the id. A **meal move** is
+    a retract of the old id plus an upsert of the new id (ids embed the meal time), so the
+    same id in both arrays is malformed (passthrough + log). v1 stays accepted unchanged;
+    **v3 and up pass through visible** (a future bump fails loud). The nine tracked
+    nutrient fields are unchanged and v2 is **field-agnostic** over them — a future
+    nutrient is an additive optional field, never a v3.
+  - **Persisted corrections queue + endpoint.** A new LAN-only, bearer-authed
+    `POST /jesse/meal-corrections` accepts a v2 batch (validated against the exact same
+    contract as an in-reply directive) and persists it to
+    `<state_dir>/meal-corrections-queue.jsonl` with a monotonic batch `seq` (survives
+    restart and a fully-drained queue). It carries meal events **generally** — off-phone
+    inserts as much as corrections and retracts.
+  - **At-least-once delivery, ack, prune.** On every terminal result (poll and SSE `done`
+    alike) queued batches are merged into the outgoing `meal_log` **ahead of** any block
+    the turn's own reply produced, collapsed net per-id (last-op-wins, so the delivered
+    payload never lists an id in both arrays and a retract-then-relog nets to the relog),
+    with the highest queued `seq` stamped as `corrections_seq`. The app echoes
+    `meal_corrections_ack` on a subsequent `POST /jesse`; the bridge prunes batches at or
+    below it. Unacked batches redeliver every turn (app-side idempotency makes that
+    harmless). Queue cap **100** — a post at the cap is rejected `429` (a visible failure
+    at the source beats a silent drop); every enqueue, delivery, ack, and prune is logged.
+  - **Local diet mirror unchanged in shape.** `build_meal_log_from_food_rows` constructs
+    the same insert-only v1-shaped block (empty `retract`, no `corrections_seq`); the four
+    micronutrient columns remain omitted pending the vault-side CSV rollout.
+  - Docs: `SECURITY.md` gains the endpoint + queue (external logging-agent input, same
+    trust class as reply text). Failing-first tests cover v2 extraction (with/without
+    retract, retract-only, caps, same-id-in-both), v1 compat, v3 passthrough, queue
+    persistence across restart, merge ordering + net-per-id collapse, ack pruning,
+    redelivery, and cap rejection.
+
 ## [Bridge 0.15.0] — 2026-07-16
 
 ### Fixed

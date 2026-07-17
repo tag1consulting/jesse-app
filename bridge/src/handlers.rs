@@ -45,6 +45,13 @@ pub struct JesseRequest {
     // request→retry channel can never loop. Absent/false on an ordinary turn.
     #[serde(default)]
     health_context_unavailable: Option<bool>,
+    // Meal-corrections ack (JESSE_MEAL_LOG v2): the highest `corrections_seq` the app has
+    // APPLIED from a delivered `meal_log`. On receipt the bridge prunes every queued batch
+    // at or below this seq. Absent on an ordinary turn (old app builds simply omit it);
+    // redelivery of an unacked batch is harmless (app-side id+hash idempotency), so a
+    // missing or stale ack only ever costs a redelivery, never correctness.
+    #[serde(default)]
+    meal_corrections_ack: Option<u64>,
 }
 
 /// Body of `POST /jesse/device`: the phone's APNs device token (hex string).
@@ -289,6 +296,15 @@ pub async fn jesse(
 ) -> Result<Response, ApiError> {
     check_auth(&headers, &st.cfg.token)?;
 
+    // Meal-corrections ack (JESSE_MEAL_LOG v2): if this turn carries the highest
+    // `corrections_seq` the app has APPLIED, prune every queued batch at/below it before
+    // any work — the app has taken responsibility for those, so they must not redeliver.
+    // Done here (not in the spawned task) so the prune is committed even if the turn is
+    // shed/queued below. Unacked batches simply redeliver; app idempotency makes that safe.
+    if let Some(acked) = req.meal_corrections_ack {
+        st.meal_corrections.prune_through(acked);
+    }
+
     // Rate limit before doing any work (C3). A per-service token bucket; bursts
     // beyond JESSE_RATE_PER_MIN are shed with 429 rather than queued.
     if !st.limiter.allow() {
@@ -418,6 +434,9 @@ pub async fn jesse(
     // boundary from the same header the prompt was built with). All inert when carry off.
     let context = st.context.clone();
     let titles = st.titles.clone();
+    // Meal-corrections queue (JESSE_MEAL_LOG v2): merged into the delivered `meal_log` at
+    // completion, so off-app corrections ride this turn's terminal result.
+    let meal_corrections = st.meal_corrections.clone();
     let clock = clock.clone();
     let handle = tokio::spawn(async move {
         // Hold the scratch dir for the whole turn; its Drop removes the decoded
@@ -814,6 +833,23 @@ pub async fn jesse(
             );
         }
 
+        // Merge persisted off-app meal corrections (JESSE_MEAL_LOG v2) into the delivered
+        // `meal_log` at this single finalization seam, BEFORE the job is stored — so BOTH
+        // the poll result and the SSE `done` frame (each reads the stored `Done` state)
+        // carry the identical merged value. Queued batches lead, the turn's own extracted
+        // block follows, and the highest queued seq is stamped as `corrections_seq` for the
+        // app to ack. A no-op when the queue is empty/unavailable, and only the Ok
+        // (delivered) path carries directives — a failed turn delivers no meal_log, so its
+        // corrections simply redeliver on the next successful turn (at-least-once).
+        let outcome = match outcome {
+            Ok((text, sid_out, directives)) => Ok((
+                text,
+                sid_out,
+                merge_meal_corrections(directives, &meal_corrections),
+            )),
+            err => err,
+        };
+
         jobs.complete_with_provenance(&jid, outcome, provenance);
         // Close the live stream with the frame matching the state that actually
         // landed. `complete` is write-once, so a cancel that won the race already
@@ -1046,6 +1082,48 @@ pub async fn jesse_title(
     Ok(Json(json!({ "title": title })))
 }
 
+/// `POST /jesse/meal-corrections` — accept a `JESSE_MEAL_LOG v2` meal-events batch from an
+/// external logging agent (a Cowork/desktop session that logged, corrected, or deleted a
+/// meal with no app turn to carry the block) and persist it to the corrections queue.
+///
+/// Same bearer auth as every other endpoint (LAN-only, single-user trust). The body is the
+/// v2 payload object `{"meals":[…],"retract":[…]}`; it is validated against the EXACT same
+/// contract as an in-reply `JESSE_MEAL_LOG v2` directive ([`parse_meal_batch_v2`] — required
+/// meal fields, finite non-negative nutrients, caps, no id in both arrays, at least one of
+/// meals/retract), so a malformed or attacker-shaped body is a loud `400`, never a partial
+/// enqueue. On success the assigned monotonic `seq` is returned; the app acks it once
+/// applied. At the queue cap the post is rejected `429` (a visible failure at the source
+/// beats a silent drop); with persistence off it is `503`.
+pub async fn jesse_meal_corrections(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> Result<Json<Value>, ApiError> {
+    check_auth(&headers, &st.cfg.token)?;
+    let obj = body
+        .as_object()
+        .ok_or((StatusCode::BAD_REQUEST, "body is not a JSON object".to_string()))?;
+    let (meals, retract) = parse_meal_batch_v2(obj).map_err(|reason| {
+        eprintln!("meal-corrections: rejected malformed batch ({reason})");
+        (StatusCode::BAD_REQUEST, format!("malformed meal batch: {reason}"))
+    })?;
+    match st.meal_corrections.enqueue(meals, retract) {
+        Ok(seq) => Ok(Json(json!({ "status": "queued", "corrections_seq": seq }))),
+        Err(EnqueueError::Full) => Err((
+            StatusCode::TOO_MANY_REQUESTS,
+            format!("meal-corrections queue is full (cap {MAX_MEAL_CORRECTION_BATCHES}) — ack and drain first"),
+        )),
+        Err(EnqueueError::Unavailable) => Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "meal-corrections queue unavailable (no state dir configured)".to_string(),
+        )),
+        Err(EnqueueError::Io(e)) => Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("could not persist meal batch: {e}"),
+        )),
+    }
+}
+
 /// Build the axum router with its shared state. Kept separate from `main` so
 /// tests can drive the same routes via `tower::ServiceExt::oneshot` without
 /// binding a socket. The running server uses exactly this router.
@@ -1061,6 +1139,7 @@ pub fn app(state: AppState) -> Router {
         .route("/jesse/diet", get(jesse_diet))
         .route("/jesse/sessions", get(jesse_sessions))
         .route("/jesse/title", post(jesse_title))
+        .route("/jesse/meal-corrections", post(jesse_meal_corrections))
         .route("/jesse/result/:job_id", get(jesse_result))
         .route("/jesse/stream/:job_id", get(jesse_stream))
         .route("/jesse/cancel/:job_id", post(jesse_cancel))

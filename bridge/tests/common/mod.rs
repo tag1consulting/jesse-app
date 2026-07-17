@@ -112,6 +112,17 @@ pub fn title_request(auth: Option<&str>, json: &str) -> Request<Body> {
     }
     b.body(Body::from(json.to_string())).unwrap()
 }
+/// `POST /jesse/meal-corrections` with the given (optional) auth header and v2 body.
+pub fn meal_corrections_request(auth: Option<&str>, json: &str) -> Request<Body> {
+    let mut b = Request::builder()
+        .method("POST")
+        .uri("/jesse/meal-corrections")
+        .header("content-type", "application/json");
+    if let Some(a) = auth {
+        b = b.header("authorization", a);
+    }
+    b.body(Body::from(json.to_string())).unwrap()
+}
 /// `GET /jesse/sessions` with optional auth, `?since=`, and `If-None-Match`.
 pub fn sessions_request(
     auth: Option<&str>,

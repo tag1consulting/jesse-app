@@ -733,7 +733,14 @@ pub fn build_meal_log_from_food_rows(
             }
         })
         .collect();
-    Ok(Some(MealLog { meals }))
+    // The derived mirror is an insert-only v1-shaped block: it never retracts (the local
+    // route re-derives the whole day) and carries no corrections_seq (it is not assembled
+    // from the persisted corrections queue). Both v2 fields stay empty/None here.
+    Ok(Some(MealLog {
+        meals,
+        retract: Vec::new(),
+        corrections_seq: None,
+    }))
 }
 
 // ---- Deterministic ASCII dashboard (rendered from the CSVs) -----------------

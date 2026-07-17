@@ -736,23 +736,42 @@ JESSE_MEAL_LOG v1 {"meals":[{"id":"2026-07-04-lunch","consumedAt":"2026-07-04T12
   - `consumedAt` is ISO 8601 **with offset**, the *meal* time (not the log time).
     The bridge checks only presence; the app parses the offset strictly before
     writing (the bridge has no date library — defense in depth, not the authority).
-- `kcal`, `protein_g`, `carbs_g`, `fat_g` are numbers, each **optional**:
-  **omitted when unknown, never null-padded** — an absent macro is an absent key
-  (an explicit `null`, a non-number, a negative, or a non-finite value is a
-  rejection).
+- the nine tracked nutrient fields — `kcal`, `protein_g`, `carbs_g`, `fat_g`,
+  `fiber_g`, `sodium_mg`, `satfat_g`, `sugar_g`, `potassium_mg` — are numbers, each
+  **optional**: **omitted when unknown, never null-padded** — an absent nutrient is
+  an absent key (an explicit `null`, a non-number, a negative, or a non-finite value
+  is a rejection). The set is **field-agnostic**: a future nutrient is an additive
+  optional field, never a version bump.
 - the meal-log line is capped at **8 KiB** (its own per-directive cap; the generic
   ceiling is the same 8 KiB, sized to this, the largest directive — `JESSE_NEEDS_HEALTH`
   keeps its tighter 2 KiB cap).
 
+**Payload contract (version 2 — upsert + retract).** v2 keeps every v1 rule and adds
+correction semantics so a change made *after* a meal was first logged propagates:
+
+- `meals` entries are **upserts** keyed on `id`: unseen → insert (v1 behavior); same
+  content → skip (idempotent replay); changed content → the app deletes the previously
+  written Health entry and rewrites it.
+- `retract` (optional, cap **10**) is an array of ids the source deleted — the app
+  removes their Health entry and tombstones the id; retracting an unknown id is a no-op.
+- a **meal move** is a retract of the old id plus an upsert of the **new** id (ids embed
+  the meal time), so the **same id in both** `meals` and `retract` is malformed.
+- at least one of `meals`/`retract` must be present; both v2 fields are omitted on the
+  wire when empty, so a v1-shaped delivery is byte-for-byte unchanged.
+
+```
+JESSE_MEAL_LOG v2 {"meals":[{"id":"2026-07-04-snack-1630","consumedAt":"2026-07-04T16:30:00+02:00","name":"Snack"}],"retract":["2026-07-04-snack-1500"]}
+```
+
 **Extraction (bridge side).** Identical seam to `JESSE_NEEDS_HEALTH`: on the
 terminal-result path (poll result and SSE `done` frame, kept consistent), a
-**known**, validating meal line is **stripped** from the reply text and its parsed
-value attached under `directives.meal_log`. A line that is malformed, over the 8
-KiB or 10-meal cap, or names an **unknown version** (`v2…`) passes through
-**untouched and visible** (logged) with no field — a future contract bump fails
-loudly, never half-parsed. Streaming caveat by design: a partial SSE delta may
-briefly show the line before the `done` frame strips it (the app hides it
-defensively); no mid-stream suppression is attempted.
+**known** (v1 **or** v2), validating meal line is **stripped** from the reply text
+and its parsed value attached under `directives.meal_log`. A line that is malformed,
+over the 8 KiB / 10-meal / 10-retract cap, or names an **unknown version** (`v3` and
+up) passes through **untouched and visible** (logged) with no field — a future
+contract bump fails loudly, never half-parsed. Streaming caveat by design: a partial
+SSE delta may briefly show the line before the `done` frame strips it (the app hides
+it defensively); no mid-stream suppression is attempted.
 
 ```bash
 curl -s http://127.0.0.1:8765/jesse/result/<job_id> \
@@ -764,8 +783,39 @@ curl -s http://127.0.0.1:8765/jesse/result/<job_id> \
 #                     "kcal":385,"protein_g":13,"carbs_g":77,"fat_g":4.5 }] } } }
 ```
 
-See [SECURITY.md](../SECURITY.md#dietary-write-back-channel-jesse_meal_log) for
-the trust analysis.
+See [SECURITY.md](../SECURITY.md#dietary-write-back-channel-jesse_meal_log-v1-and-v2)
+for the trust analysis.
+
+### Off-app corrections queue (`POST /jesse/meal-corrections`)
+
+Most logging — and **all** corrections — happen in non-app sessions (desktop/Cowork
+logging on the Studio) with no app turn, so there is no reply to carry a
+`JESSE_MEAL_LOG` block. This endpoint lets an external logging agent hand the bridge a
+v2 batch to relay on the next app turn. It carries meal events **generally** — off-phone
+inserts as much as corrections and retracts. The bridge only **persists and relays**; the
+app is the sole writer.
+
+```bash
+# Enqueue an off-app correction (a sodium change on an already-logged soup).
+curl -s -X POST http://127.0.0.1:8765/jesse/meal-corrections \
+  -H "Authorization: Bearer $JESSE_TOKEN" -H 'content-type: application/json' \
+  -d '{"meals":[{"id":"2026-07-04-soup","consumedAt":"2026-07-04T12:00:00+02:00","name":"Soup","sodium_mg":900}]}'
+# → { "status":"queued", "corrections_seq": 1 }
+```
+
+- **Body = the v2 payload object** (`{"meals":[…],"retract":[…]}`), validated against the
+  **exact same contract** as an in-reply `JESSE_MEAL_LOG v2` directive; a malformed body
+  is a loud `400`, never a partial enqueue. Same bearer auth as every endpoint.
+- **Persisted + bounded.** Batches land in `<state_dir>/meal-corrections-queue.jsonl` with
+  a monotonic `seq` (survives restart and a fully-drained queue). Cap **100** — a post at
+  the cap is rejected `429`; with no state dir configured it is `503` (persistence off).
+- **At-least-once delivery, ack, prune.** On every terminal result the queued batches are
+  merged into the delivered `meal_log` **ahead of** any block the turn's own reply
+  produced (collapsed net per-id, last-op-wins, so the delivered payload never lists an id
+  in both arrays), with the highest queued `seq` stamped as `corrections_seq`. The app
+  echoes it back as `meal_corrections_ack` on a later `POST /jesse`; the bridge prunes
+  batches at or below the ack. Unacked batches redeliver every turn — harmless because the
+  app dedupes on `id` + content hash. Every enqueue, delivery, ack, and prune is logged.
 
 ## Conversation titles (`POST /jesse/title`)
 

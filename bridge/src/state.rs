@@ -33,6 +33,12 @@ pub struct AppState {
     // emergency fallback is armed — `handlers::jesse` only consults it then, so with
     // emergency off it never changes a turn's behavior.
     pub breaker: Arc<CircuitBreaker>,
+    // Persisted meal-corrections queue (JESSE_MEAL_LOG v2): off-app meal events posted
+    // to `POST /jesse/meal-corrections` land here and are merged into the `meal_log`
+    // delivered on every terminal result, so corrections made in non-app sessions still
+    // reach Apple Health. Persisted to `<state_dir>/meal-corrections-queue.jsonl`;
+    // unavailable (delivery a no-op, enqueue errors loudly) when no state dir is set.
+    pub meal_corrections: Arc<MealCorrectionsQueue>,
     // The context ledger (context carry): records each delivered turn per thread and
     // feeds a catch-up block into the next hosted turn + a recent-conversation block
     // into the local children, so a locally-served turn is not lost to a later hosted
@@ -54,6 +60,7 @@ impl AppState {
         let titles_file = cfg.titles_file();
         let context_file = cfg.context_file();
         let context_enabled = cfg.context_carry;
+        let meal_corrections = Arc::new(MealCorrectionsQueue::from_cfg(&cfg));
         let sem = Arc::new(Semaphore::new(cfg.max_concurrency.max(1)));
         let queue = QueueGate::new(sem.clone(), cfg.max_queued);
         let limiter = Arc::new(RateLimiter::new(cfg.rate_per_min));
@@ -68,6 +75,7 @@ impl AppState {
             notify: Arc::new(NotifyFlags::new()),
             apns: None,
             breaker: Arc::new(CircuitBreaker::new()),
+            meal_corrections,
             context: Arc::new(ContextLedger::new(context_file, context_enabled)),
         }
     }

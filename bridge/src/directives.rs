@@ -48,9 +48,14 @@ pub const MAX_NEEDS_HEALTH_LINE_BYTES: usize = 2 * 1024;
 /// so it gets the full 8 KiB contract bound (equal to the generic ceiling).
 pub const MAX_MEAL_LOG_LINE_BYTES: usize = 8 * 1024;
 
-/// Max meals one `JESSE_MEAL_LOG v1` directive may carry. Over this the whole
+/// Max meals one `JESSE_MEAL_LOG` directive may carry. Over this the whole
 /// block is treated as malformed (passthrough + log), never partially logged.
 pub const MAX_MEALS: usize = 10;
+
+/// Max ids one `JESSE_MEAL_LOG v2` directive (or one `POST /jesse/meal-corrections`
+/// batch) may `retract`. Over this the whole block is malformed (passthrough + log),
+/// mirroring the `meals` cap — a retract batch is never partially applied.
+pub const MAX_RETRACT: usize = 10;
 
 /// The optional macro fields a meal may carry, and the only keys (besides the
 /// required `id`/`consumedAt`/`name`) allowed on a meal object. A typo'd or extra
@@ -152,12 +157,30 @@ pub struct Meal {
     pub potassium_mg: Option<f64>,
 }
 
-/// The parsed payload of a `JESSE_MEAL_LOG v1` directive: one or more meals the
-/// app writes to Apple Health (the bridge only extracts; the app is the writer).
-/// `meals` is non-empty and capped at [`MAX_MEALS`], both enforced at parse time.
+/// The parsed payload of a `JESSE_MEAL_LOG` directive, plus the corrections-queue
+/// delivery envelope. Under **v1** it is exactly `meals` (a non-empty, capped array
+/// the app inserts). Under **v2** it gains `retract` (ids whose Health entries the app
+/// deletes and tombstones) and, when this block was assembled at delivery from the
+/// persisted corrections queue, `corrections_seq` (the highest queued batch seq the
+/// app must ack so the bridge can prune). The two v2 fields are additive and
+/// `skip_serializing_if`-omitted, so a v1 delivery is byte-for-byte today's wire and an
+/// old app build simply ignores keys it does not know.
+///
+/// **v2 semantics are field-agnostic over the nutrient set** ([`Meal`]): upsert and
+/// rewrite are defined over every nutrient field present on the meal, never a frozen
+/// list, so a future nutrient is an additive optional field, not a v3.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MealLog {
     pub meals: Vec<Meal>,
+    /// v2: ids the source deleted — the app removes their Health entry and tombstones
+    /// the id. Empty (and omitted on the wire) for a v1 block. Capped at [`MAX_RETRACT`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub retract: Vec<String>,
+    /// Delivery-only: the highest corrections-queue batch seq merged into this payload.
+    /// `None` (omitted) for a block extracted purely from a turn's reply; `Some(seq)`
+    /// once queued batches were merged in, so the app knows which seq to ack.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub corrections_seq: Option<u64>,
 }
 
 /// The structured `directives` object attached to a terminal result. One
@@ -278,15 +301,23 @@ pub fn extract_directives(reply: &str) -> (String, Option<Directives>) {
                 }
             }
         }
-        ("JESSE_MEAL_LOG", 1) => {
+        ("JESSE_MEAL_LOG", ver @ (1 | 2)) => {
             if last_line.len() > MAX_MEAL_LOG_LINE_BYTES {
                 eprintln!(
-                    "directive: JESSE_MEAL_LOG v1 exceeds its \
+                    "directive: JESSE_MEAL_LOG v{ver} exceeds its \
                      {MAX_MEAL_LOG_LINE_BYTES}-byte cap — passing through untouched"
                 );
                 return (reply.to_string(), None);
             }
-            match parse_meal_log(json) {
+            // v1: `meals` only (retract is an unknown key → malformed). v2: `meals`
+            // upserts plus optional `retract`. Both share one 8 KiB cap and the same
+            // per-meal validation; the version only selects which top-level shape is legal.
+            let parsed = if ver == 1 {
+                parse_meal_log_v1(json)
+            } else {
+                parse_meal_log_v2(json)
+            };
+            match parsed {
                 Ok(meal_log) => {
                     let directives = Directives {
                         needs_health: None,
@@ -296,7 +327,7 @@ pub fn extract_directives(reply: &str) -> (String, Option<Directives>) {
                 }
                 Err(reason) => {
                     eprintln!(
-                        "directive: JESSE_MEAL_LOG v1 payload rejected ({reason}) — \
+                        "directive: JESSE_MEAL_LOG v{ver} payload rejected ({reason}) — \
                          passing through untouched"
                     );
                     (reply.to_string(), None)
@@ -434,15 +465,16 @@ fn parse_needs_health(json: &str) -> Result<NeedsHealth, String> {
 /// Parse + validate the JSON payload of a `JESSE_MEAL_LOG v1` directive against
 /// the contract: a single `meals` key holding a **non-empty** array (cap
 /// [`MAX_MEALS`]) of meal objects, each with a non-empty `id`, `consumedAt`, and
-/// `name`, plus any of the optional numeric macros. Any violation is an
+/// `name`, plus any of the optional numeric nutrients. Any violation is an
 /// `Err(reason)` the caller logs and passes through — a bad block never becomes a
-/// partial or wrong meal write (visible failure over silent data loss).
-fn parse_meal_log(json: &str) -> Result<MealLog, String> {
+/// partial or wrong meal write (visible failure over silent data loss). A `retract`
+/// key is not part of v1, so it lands in the unknown-key check → malformed passthrough.
+fn parse_meal_log_v1(json: &str) -> Result<MealLog, String> {
     let value: Value = serde_json::from_str(json).map_err(|e| format!("invalid JSON: {e}"))?;
     let obj = value.as_object().ok_or("payload is not a JSON object")?;
 
-    // Reject unknown top-level keys so a typo (e.g. "meal") is a loud failure
-    // rather than silently logging nothing.
+    // Reject unknown top-level keys so a typo (e.g. "meal") — or a v2-only `retract`
+    // key on a v1 line — is a loud failure rather than silently logging nothing.
     for key in obj.keys() {
         if key != "meals" {
             return Err(format!("unknown field {key:?}"));
@@ -468,7 +500,109 @@ fn parse_meal_log(json: &str) -> Result<MealLog, String> {
     for item in items {
         meals.push(parse_meal(item)?);
     }
-    Ok(MealLog { meals })
+    Ok(MealLog {
+        meals,
+        retract: Vec::new(),
+        corrections_seq: None,
+    })
+}
+
+/// Parse + validate the JSON payload of a `JESSE_MEAL_LOG v2` directive:
+/// `{"meals":[…],"retract":[…]}`. Delegates the shape to [`parse_meal_batch_v2`]
+/// (shared byte-for-byte with the `POST /jesse/meal-corrections` endpoint) and wraps
+/// the result in a [`MealLog`] with no `corrections_seq` (that is stamped only at
+/// delivery, when queued batches are merged in).
+fn parse_meal_log_v2(json: &str) -> Result<MealLog, String> {
+    let value: Value = serde_json::from_str(json).map_err(|e| format!("invalid JSON: {e}"))?;
+    let obj = value.as_object().ok_or("payload is not a JSON object")?;
+    let (meals, retract) = parse_meal_batch_v2(obj)?;
+    Ok(MealLog {
+        meals,
+        retract,
+        corrections_seq: None,
+    })
+}
+
+/// Parse + validate the **v2 meal-batch shape** shared by the `JESSE_MEAL_LOG v2`
+/// directive and the `POST /jesse/meal-corrections` endpoint body:
+///
+/// - `meals` (optional; default empty) — upserts, cap [`MAX_MEALS`], each validated
+///   exactly as v1 ([`parse_meal`]: required strings + finite non-negative nutrients).
+/// - `retract` (optional; default empty) — ids the source deleted, cap [`MAX_RETRACT`],
+///   each a non-empty string.
+/// - **At least one** of `meals`/`retract` must be non-empty (an empty batch is nothing
+///   to do → malformed).
+/// - **No id may appear in both** arrays in one batch — a meal move arrives as a retract
+///   of the old id plus an upsert of the NEW id, so a collision is malformed
+///   (passthrough + log), never applied.
+///
+/// Unknown top-level keys are rejected (loud failure over a silent drop). Returned as a
+/// tuple so the endpoint can enqueue it and the directive path can wrap it in a
+/// [`MealLog`]; the validation is defined once here.
+pub fn parse_meal_batch_v2(
+    obj: &serde_json::Map<String, Value>,
+) -> Result<(Vec<Meal>, Vec<String>), String> {
+    for key in obj.keys() {
+        if key != "meals" && key != "retract" {
+            return Err(format!("unknown field {key:?}"));
+        }
+    }
+
+    let meals = match obj.get("meals") {
+        None | Some(Value::Null) => Vec::new(),
+        Some(Value::Array(items)) => {
+            if items.len() > MAX_MEALS {
+                return Err(format!(
+                    "`meals` has {} entries, cap is {MAX_MEALS}",
+                    items.len()
+                ));
+            }
+            let mut out = Vec::with_capacity(items.len());
+            for item in items {
+                out.push(parse_meal(item)?);
+            }
+            out
+        }
+        Some(_) => return Err("`meals` is not an array".into()),
+    };
+
+    let retract = match obj.get("retract") {
+        None | Some(Value::Null) => Vec::new(),
+        Some(Value::Array(items)) => {
+            if items.len() > MAX_RETRACT {
+                return Err(format!(
+                    "`retract` has {} entries, cap is {MAX_RETRACT}",
+                    items.len()
+                ));
+            }
+            let mut out = Vec::with_capacity(items.len());
+            for item in items {
+                let s = item
+                    .as_str()
+                    .ok_or("retract entry is not a string")?
+                    .to_string();
+                if s.trim().is_empty() {
+                    return Err("retract entry is empty".into());
+                }
+                out.push(s);
+            }
+            out
+        }
+        Some(_) => return Err("`retract` is not an array".into()),
+    };
+
+    if meals.is_empty() && retract.is_empty() {
+        return Err("at least one of `meals`/`retract` must be present".into());
+    }
+
+    // A meal move is retract-old + upsert-new; the SAME id in both arrays is malformed.
+    for m in &meals {
+        if retract.iter().any(|r| r == &m.id) {
+            return Err(format!("id {:?} appears in both `meals` and `retract`", m.id));
+        }
+    }
+
+    Ok((meals, retract))
 }
 
 /// Parse + validate one meal object. Enforces the required string fields, rejects
@@ -760,6 +894,8 @@ mod tests {
                     sugar_g: None,
                     potassium_mg: None,
                 }],
+                retract: Vec::new(),
+                corrections_seq: None,
             }),
         };
         let v = directives_to_value(&Some(d));
@@ -928,13 +1064,139 @@ mod tests {
     }
 
     #[test]
-    fn meal_log_v2_passes_through_visible() {
-        // Unknown version of a known directive → passthrough (future bump fails loud).
-        let reply =
-            "JESSE_MEAL_LOG v2 {\"meals\":[{\"id\":\"a\",\"consumedAt\":\"t\",\"name\":\"n\"}]}";
+    fn meal_log_v2_meals_only_is_parsed_and_stripped() {
+        // v2 with only `meals` (no retract) parses like v1 — retract stays empty and
+        // is omitted on the wire; corrections_seq is None (not a delivery-merged block).
+        let reply = "Logged.\nJESSE_MEAL_LOG v2 {\"meals\":[{\"id\":\"a\",\"consumedAt\":\"t\",\
+            \"name\":\"n\",\"kcal\":410,\"sodium_mg\":620}]}";
+        let (text, directives) = extract_directives(reply);
+        assert_eq!(text, "Logged.");
+        let ml = directives.unwrap().meal_log.unwrap();
+        assert_eq!(ml.meals.len(), 1);
+        assert_eq!(ml.meals[0].sodium_mg, Some(620.0));
+        assert!(ml.retract.is_empty());
+        assert_eq!(ml.corrections_seq, None);
+    }
+
+    #[test]
+    fn meal_log_v2_with_retract_is_parsed() {
+        // A meal move: retract the old id, upsert the new id, in one block.
+        let reply = "JESSE_MEAL_LOG v2 {\"meals\":[{\"id\":\"2026-07-04-snack-1630\",\
+            \"consumedAt\":\"2026-07-04T16:30:00+02:00\",\"name\":\"Snack\"}],\
+            \"retract\":[\"2026-07-04-snack-1500\"]}";
+        let ml = meal_log(reply).unwrap();
+        assert_eq!(ml.meals.len(), 1);
+        assert_eq!(ml.meals[0].id, "2026-07-04-snack-1630");
+        assert_eq!(ml.retract, vec!["2026-07-04-snack-1500"]);
+    }
+
+    #[test]
+    fn meal_log_v2_retract_only_is_parsed() {
+        // A pure source-side deletion: no upsert, just a retract. Valid under v2.
+        let reply = "JESSE_MEAL_LOG v2 {\"retract\":[\"2026-07-04-snack-1630\"]}";
+        let ml = meal_log(reply).unwrap();
+        assert!(ml.meals.is_empty());
+        assert_eq!(ml.retract, vec!["2026-07-04-snack-1630"]);
+    }
+
+    #[test]
+    fn meal_log_v2_retract_serializes_and_absent_is_omitted() {
+        // A v2 block with a retract round-trips the key; a v1/no-retract block omits it.
+        let with = meal_log("JESSE_MEAL_LOG v2 {\"retract\":[\"x\"]}").unwrap();
+        let v = serde_json::to_value(&with).unwrap();
+        assert_eq!(v["retract"][0], "x");
+        assert!(v.get("meals").is_some());
+        // corrections_seq is delivery-only → omitted when None.
+        assert!(v.get("corrections_seq").is_none());
+
+        let without =
+            meal_log("JESSE_MEAL_LOG v2 {\"meals\":[{\"id\":\"a\",\"consumedAt\":\"t\",\"name\":\"n\"}]}")
+                .unwrap();
+        let v2 = serde_json::to_value(&without).unwrap();
+        assert!(v2.get("retract").is_none(), "empty retract omitted, not []");
+    }
+
+    #[test]
+    fn meal_log_v3_and_up_passes_through_visible() {
+        // An UNKNOWN version (v3 and up) of a known directive → passthrough (a future
+        // bump fails loud and stays visible, never silently stripped).
+        for reply in [
+            "JESSE_MEAL_LOG v3 {\"meals\":[{\"id\":\"a\",\"consumedAt\":\"t\",\"name\":\"n\"}]}",
+            "JESSE_MEAL_LOG v10 {\"meals\":[{\"id\":\"a\",\"consumedAt\":\"t\",\"name\":\"n\"}]}",
+        ] {
+            let (text, directives) = extract_directives(reply);
+            assert_eq!(text, reply, "unknown meal_log version stays visible: {reply:?}");
+            assert!(directives.is_none());
+        }
+    }
+
+    #[test]
+    fn meal_log_v1_rejects_a_retract_key() {
+        // `retract` is v2-only; on a v1 line it is an unknown top-level field → malformed.
+        let reply = "JESSE_MEAL_LOG v1 {\"meals\":[{\"id\":\"a\",\"consumedAt\":\"t\",\"name\":\"n\"}],\
+            \"retract\":[\"b\"]}";
         let (text, directives) = extract_directives(reply);
         assert_eq!(text, reply);
         assert!(directives.is_none());
+    }
+
+    #[test]
+    fn meal_log_v2_malformed_payloads_pass_through_visible() {
+        for reply in [
+            // empty batch: neither meals nor retract
+            "JESSE_MEAL_LOG v2 {}",
+            "JESSE_MEAL_LOG v2 {\"meals\":[],\"retract\":[]}",
+            // retract not an array
+            "JESSE_MEAL_LOG v2 {\"retract\":\"x\"}",
+            // retract entry not a string
+            "JESSE_MEAL_LOG v2 {\"retract\":[5]}",
+            // retract entry blank
+            "JESSE_MEAL_LOG v2 {\"retract\":[\"  \"]}",
+            // same id in both meals and retract (a move must use DIFFERENT ids)
+            "JESSE_MEAL_LOG v2 {\"meals\":[{\"id\":\"a\",\"consumedAt\":\"t\",\"name\":\"n\"}],\"retract\":[\"a\"]}",
+            // unknown top-level field
+            "JESSE_MEAL_LOG v2 {\"meals\":[{\"id\":\"a\",\"consumedAt\":\"t\",\"name\":\"n\"}],\"note\":1}",
+            // a bad meal inside a v2 block still fails the whole block
+            "JESSE_MEAL_LOG v2 {\"meals\":[{\"id\":\"a\",\"consumedAt\":\"t\",\"name\":\"n\",\"kcal\":-1}]}",
+        ] {
+            let (text, directives) = extract_directives(reply);
+            assert_eq!(text, reply, "malformed v2 meal_log stays visible: {reply:?}");
+            assert!(directives.is_none(), "no field for malformed v2: {reply:?}");
+        }
+    }
+
+    #[test]
+    fn meal_log_v2_over_retract_cap_passes_through_visible() {
+        let ids = std::iter::repeat_n("\"x\"", MAX_RETRACT + 1)
+            .collect::<Vec<_>>()
+            .join(",");
+        let reply = format!("JESSE_MEAL_LOG v2 {{\"retract\":[{ids}]}}");
+        let (text, directives) = extract_directives(&reply);
+        assert_eq!(text, reply);
+        assert!(directives.is_none());
+    }
+
+    #[test]
+    fn parse_meal_batch_v2_is_shared_with_the_endpoint_shape() {
+        // The endpoint calls parse_meal_batch_v2 directly on a decoded object; prove the
+        // same validation the directive uses holds there (meals+retract, caps, collision).
+        let obj = serde_json::json!({
+            "meals": [{"id":"new","consumedAt":"t","name":"n","sodium_mg":900}],
+            "retract": ["old"],
+        });
+        let (meals, retract) = parse_meal_batch_v2(obj.as_object().unwrap()).unwrap();
+        assert_eq!(meals.len(), 1);
+        assert_eq!(meals[0].sodium_mg, Some(900.0));
+        assert_eq!(retract, vec!["old"]);
+        // collision rejected
+        let bad = serde_json::json!({
+            "meals": [{"id":"a","consumedAt":"t","name":"n"}],
+            "retract": ["a"],
+        });
+        assert!(parse_meal_batch_v2(bad.as_object().unwrap()).is_err());
+        // empty rejected
+        let empty = serde_json::json!({});
+        assert!(parse_meal_batch_v2(empty.as_object().unwrap()).is_err());
     }
 
     #[test]

@@ -1705,20 +1705,289 @@ async fn malformed_meal_log_passes_through_visible_with_no_field() {
 }
 
 #[tokio::test]
-async fn meal_log_v2_passes_through_visible() {
-    // An unknown VERSION of a known directive must pass through untouched and
+async fn meal_log_v2_directive_is_extracted_with_retract() {
+    // v2 is now a REGISTERED version: a reply's final v2 line (upsert + retract, a meal
+    // move) is stripped and attached under `directives.meal_log` with the retract array.
+    let line = r#"{"type":"result","is_error":false,"result":"Moved it.\nJESSE_MEAL_LOG v2 {\"meals\":[{\"id\":\"2026-07-04-snack-1630\",\"consumedAt\":\"2026-07-04T16:30:00+02:00\",\"name\":\"Snack\"}],\"retract\":[\"2026-07-04-snack-1500\"]}","session_id":"sess-v2"}"#;
+    let (st, job_id) = run_turn_emitting(r#"{"mode":"tell","text":"move my snack"}"#, line).await;
+    let v = result_status(&st, &job_id).await;
+    assert_eq!(v["response"], "Moved it.", "v2 line stripped");
+    assert_eq!(
+        v["directives"]["meal_log"]["meals"][0]["id"],
+        "2026-07-04-snack-1630"
+    );
+    assert_eq!(
+        v["directives"]["meal_log"]["retract"][0],
+        "2026-07-04-snack-1500"
+    );
+}
+
+#[tokio::test]
+async fn meal_log_v3_and_up_passes_through_visible() {
+    // An unknown VERSION (v3 and up) of a known directive must pass through untouched and
     // visible, so a future contract bump fails loudly instead of half-parsing.
-    let line = r#"{"type":"result","is_error":false,"result":"JESSE_MEAL_LOG v2 {\"meals\":[{\"id\":\"x\",\"consumedAt\":\"t\",\"name\":\"n\"}]}","session_id":"sess-v2"}"#;
+    let line = r#"{"type":"result","is_error":false,"result":"JESSE_MEAL_LOG v3 {\"meals\":[{\"id\":\"x\",\"consumedAt\":\"t\",\"name\":\"n\"}]}","session_id":"sess-v3"}"#;
     let (st, job_id) = run_turn_emitting(r#"{"mode":"tell","text":"log lunch"}"#, line).await;
     let v = result_status(&st, &job_id).await;
     assert!(
         v["response"]
             .as_str()
             .unwrap()
-            .contains("JESSE_MEAL_LOG v2"),
-        "v2 stays visible"
+            .contains("JESSE_MEAL_LOG v3"),
+        "v3 stays visible"
     );
     assert!(v["directives"].is_null(), "no field for an unknown version");
+}
+
+// ---- Meal-corrections queue (POST /jesse/meal-corrections + v2 delivery) --------
+//
+// Off-app meal events (logged/corrected/deleted in a desktop session with no app turn)
+// are POSTed to the persisted corrections queue and MERGED into the `meal_log` delivered
+// on the next terminal result. Delivery is at-least-once: unacked batches redeliver; the
+// app's `corrections_seq` ack prunes what it has applied. These exercise the whole seam.
+
+/// Build a state whose corrections queue is AVAILABLE (a temp state dir) plus a fake
+/// `claude` emitting `stdout_line`. Returns (state, fake_path); remove the fake when done.
+fn state_with_queue(stdout_line: &str) -> (AppState, std::path::PathBuf) {
+    let dir = std::env::temp_dir().join(format!("jesse-mcq-it-{}", random_hex()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let script = String::from("#!/bin/sh\nprintf '%s' '") + stdout_line + "'\n";
+    let fake = write_fake_claude(&script);
+    let cfg = Config {
+        claude_bin: fake.to_string_lossy().into_owned(),
+        timeout_secs: 30,
+        state_dir: Some(dir.to_string_lossy().into_owned()),
+        ..test_config()
+    };
+    (AppState::new(cfg), fake)
+}
+
+/// Fire a `POST /jesse` turn against an existing state and wait for it to reach `done`,
+/// returning its job id. `req_json` is the full request body (so a caller can include a
+/// `meal_corrections_ack`).
+async fn run_turn_on(st: &AppState, req_json: &str) -> String {
+    let resp = app(st.clone())
+        .oneshot(jesse_request(Some("Bearer test-token"), req_json))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::ACCEPTED);
+    let body: Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    let job_id = body["job_id"].as_str().unwrap().to_string();
+    for _ in 0..80 {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        if result_status(st, &job_id).await["status"] == "done" {
+            return job_id;
+        }
+    }
+    panic!("turn did not complete");
+}
+
+/// POST a v2 batch to the corrections endpoint and return (status, body).
+async fn post_corrections(st: &AppState, auth: Option<&str>, body: &str) -> (StatusCode, Value) {
+    let resp = app(st.clone())
+        .oneshot(meal_corrections_request(auth, body))
+        .await
+        .unwrap();
+    let status = resp.status();
+    let text = body_string(resp).await;
+    let v: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
+    (status, v)
+}
+
+#[tokio::test]
+async fn meal_corrections_endpoint_requires_auth() {
+    let (st, fake) = state_with_queue("unused");
+    let (status, _) = post_corrections(
+        &st,
+        None,
+        r#"{"retract":["2026-07-04-snack-1500"]}"#,
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "no bearer → 401");
+    let _ = std::fs::remove_file(&fake);
+}
+
+#[tokio::test]
+async fn meal_corrections_endpoint_queues_and_returns_seq() {
+    let (st, fake) = state_with_queue("unused");
+    // A sodium correction — proving the micronutrient wire keys ride the endpoint too.
+    let (status, v) = post_corrections(
+        &st,
+        Some("Bearer test-token"),
+        r#"{"meals":[{"id":"2026-07-04-soup","consumedAt":"2026-07-04T12:00:00+02:00","name":"Soup","sodium_mg":900}]}"#,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(v["corrections_seq"], 1, "first batch gets seq 1");
+    assert_eq!(v["status"], "queued");
+    let _ = std::fs::remove_file(&fake);
+}
+
+#[tokio::test]
+async fn meal_corrections_endpoint_rejects_malformed_batch() {
+    let (st, fake) = state_with_queue("unused");
+    for bad in [
+        r#"{}"#,                                                        // empty batch
+        r#"{"meals":[{"id":"a","consumedAt":"t","name":"n"}],"retract":["a"]}"#, // id in both
+        r#"{"meals":[{"id":"a","consumedAt":"t","name":"n","sodium_mg":-5}]}"#,  // negative
+        r#"{"retract":[5]}"#,                                           // non-string retract
+        r#"{"meals":[{"id":"a","consumedAt":"t","name":"n"}],"note":1}"#, // unknown key
+    ] {
+        let (status, _) = post_corrections(&st, Some("Bearer test-token"), bad).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "malformed rejected: {bad}");
+    }
+    let _ = std::fs::remove_file(&fake);
+}
+
+#[tokio::test]
+async fn queued_correction_merges_into_the_next_terminal_result_with_seq() {
+    // A correction posted with NO app turn is delivered on the next terminal result even
+    // though that turn's own reply carries no meal_log block.
+    // NB: keep the fake reply apostrophe-free — the fake `claude` wraps stdout in a
+    // single-quoted shell string, so a `'` would truncate it and the turn would hang.
+    let (st, fake) = state_with_queue(
+        r#"{"type":"result","is_error":false,"result":"Here is your day.","session_id":"s"}"#,
+    );
+    post_corrections(
+        &st,
+        Some("Bearer test-token"),
+        r#"{"meals":[{"id":"2026-07-04-soup","consumedAt":"2026-07-04T12:00:00+02:00","name":"Soup","sodium_mg":900}],"retract":["2026-07-04-gone"]}"#,
+    )
+    .await;
+    let job_id = run_turn_on(&st, r#"{"mode":"ask","text":"how is my day?"}"#).await;
+    let v = result_status(&st, &job_id).await;
+    assert_eq!(v["response"], "Here is your day.", "reply text untouched");
+    let ml = &v["directives"]["meal_log"];
+    assert_eq!(ml["meals"][0]["id"], "2026-07-04-soup");
+    assert_eq!(ml["meals"][0]["sodium_mg"], 900.0, "micronutrient on the wire");
+    assert_eq!(ml["retract"][0], "2026-07-04-gone");
+    assert_eq!(ml["corrections_seq"], 1, "highest queued seq stamped for ack");
+    let _ = std::fs::remove_file(&fake);
+}
+
+#[tokio::test]
+async fn queued_corrections_merge_ahead_of_a_turn_extracted_block() {
+    // The turn's OWN reply logs a fresh meal; a queued correction must precede it.
+    let (st, fake) = state_with_queue(
+        r#"{"type":"result","is_error":false,"result":"Logged.\nJESSE_MEAL_LOG v1 {\"meals\":[{\"id\":\"2026-07-04-fresh\",\"consumedAt\":\"2026-07-04T19:00:00+02:00\",\"name\":\"Dinner\"}]}","session_id":"s"}"#,
+    );
+    post_corrections(
+        &st,
+        Some("Bearer test-token"),
+        r#"{"meals":[{"id":"2026-07-04-queued","consumedAt":"2026-07-04T12:00:00+02:00","name":"Lunch"}]}"#,
+    )
+    .await;
+    let job_id = run_turn_on(&st, r#"{"mode":"tell","text":"log dinner"}"#).await;
+    let v = result_status(&st, &job_id).await;
+    let meals = v["directives"]["meal_log"]["meals"].as_array().unwrap();
+    let ids: Vec<&str> = meals.iter().map(|m| m["id"].as_str().unwrap()).collect();
+    assert_eq!(
+        ids,
+        vec!["2026-07-04-queued", "2026-07-04-fresh"],
+        "queued correction leads, this turn's own block follows"
+    );
+    assert_eq!(v["directives"]["meal_log"]["corrections_seq"], 1);
+    let _ = std::fs::remove_file(&fake);
+}
+
+#[tokio::test]
+async fn unacked_corrections_redeliver_but_an_ack_prunes_them() {
+    let (st, fake) = state_with_queue(
+        r#"{"type":"result","is_error":false,"result":"ok","session_id":"s"}"#,
+    );
+    post_corrections(
+        &st,
+        Some("Bearer test-token"),
+        r#"{"meals":[{"id":"2026-07-04-soup","consumedAt":"2026-07-04T12:00:00+02:00","name":"Soup"}]}"#,
+    )
+    .await;
+    // Turn 1: delivered (seq 1). No ack yet.
+    let j1 = run_turn_on(&st, r#"{"mode":"ask","text":"a"}"#).await;
+    let v1 = result_status(&st, &j1).await;
+    assert_eq!(v1["directives"]["meal_log"]["corrections_seq"], 1);
+    // Turn 2 WITHOUT ack: the unacked batch redelivers.
+    let j2 = run_turn_on(&st, r#"{"mode":"ask","text":"b"}"#).await;
+    let v2 = result_status(&st, &j2).await;
+    assert_eq!(
+        v2["directives"]["meal_log"]["meals"][0]["id"], "2026-07-04-soup",
+        "unacked batch redelivers on every turn"
+    );
+    // Turn 3 WITH the ack: the bridge prunes seq ≤ 1, so it stops delivering.
+    let j3 = run_turn_on(&st, r#"{"mode":"ask","text":"c","meal_corrections_ack":1}"#).await;
+    let v3 = result_status(&st, &j3).await;
+    assert!(
+        v3["directives"].is_null(),
+        "after ack the queue is empty → no meal_log delivered: {}",
+        v3["directives"]
+    );
+    let _ = std::fs::remove_file(&fake);
+}
+
+#[tokio::test]
+async fn queued_corrections_survive_a_bridge_restart() {
+    // POST to a state over a temp dir, then build a FRESH state over the SAME dir (a
+    // restart) and confirm the queued correction still delivers.
+    let dir = std::env::temp_dir().join(format!("jesse-mcq-restart-{}", random_hex()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let cfg1 = Config {
+        state_dir: Some(dir.to_string_lossy().into_owned()),
+        ..test_config()
+    };
+    let st1 = AppState::new(cfg1);
+    let (status, _) = post_corrections(
+        &st1,
+        Some("Bearer test-token"),
+        r#"{"meals":[{"id":"2026-07-04-soup","consumedAt":"2026-07-04T12:00:00+02:00","name":"Soup","sodium_mg":900}]}"#,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    drop(st1); // simulate a restart
+
+    // Fresh state + fake claude over the same state dir.
+    let script = String::from(
+        "#!/bin/sh\nprintf '%s' '{\"type\":\"result\",\"is_error\":false,\"result\":\"ok\",\"session_id\":\"s\"}'\n",
+    );
+    let fake = write_fake_claude(&script);
+    let cfg2 = Config {
+        claude_bin: fake.to_string_lossy().into_owned(),
+        timeout_secs: 30,
+        state_dir: Some(dir.to_string_lossy().into_owned()),
+        ..test_config()
+    };
+    let st2 = AppState::new(cfg2);
+    let job_id = run_turn_on(&st2, r#"{"mode":"ask","text":"after restart"}"#).await;
+    let v = result_status(&st2, &job_id).await;
+    assert_eq!(
+        v["directives"]["meal_log"]["meals"][0]["sodium_mg"], 900.0,
+        "correction persisted across the restart and delivered"
+    );
+    let _ = std::fs::remove_file(&fake);
+}
+
+#[tokio::test]
+async fn meal_corrections_endpoint_rejects_at_cap() {
+    let (st, fake) = state_with_queue("unused");
+    // Fill to the cap.
+    for i in 0..100 {
+        let (status, _) = post_corrections(
+            &st,
+            Some("Bearer test-token"),
+            &format!(
+                r#"{{"meals":[{{"id":"m{i}","consumedAt":"2026-07-04T12:00:00+02:00","name":"n"}}]}}"#
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "batch {i} within cap");
+    }
+    // One past the cap is rejected loudly (429), never silently dropped.
+    let (status, _) = post_corrections(
+        &st,
+        Some("Bearer test-token"),
+        r#"{"meals":[{"id":"over","consumedAt":"2026-07-04T12:00:00+02:00","name":"n"}]}"#,
+    )
+    .await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS, "at cap → 429");
+    let _ = std::fs::remove_file(&fake);
 }
 
 #[tokio::test]

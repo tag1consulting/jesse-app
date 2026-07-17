@@ -481,35 +481,71 @@ back to the app**, so its trust properties are called out explicitly:
   per user message and ignores a second directive. There is no unbounded
   ask/answer cycle.
 
-## Dietary write-back channel (`JESSE_MEAL_LOG`)
+## Dietary write-back channel (`JESSE_MEAL_LOG` v1 and v2)
 
 The write-direction sibling of `JESSE_NEEDS_HEALTH`, on the **same extractor and
-registry**: a diet-logging reply may end with a `JESSE_MEAL_LOG v1 {json}` line
+registry**: a diet-logging reply may end with a `JESSE_MEAL_LOG v<N> {json}` line
 the bridge strips into `directives.meal_log`, which the app writes into Apple
-Health as a food entry. Its trust properties mirror the health-request channel,
-with the seam that matters here spelled out:
+Health as a food entry. **v1** carries `meals` (inserts); **v2** adds `retract`
+(ids the source deleted) and upsert semantics so a *correction* propagates, not
+just a first insert. Its trust properties mirror the health-request channel, with
+the seams that matter here spelled out:
 
 - **Same trust class as the reply text.** The meal block originates from the
   sandboxed agent's OUTPUT — the same origin as `health_context` and the reply
   itself — not from the network. A prompt injection could in principle make the
   agent emit a meal line, so the payload is **validated against a fixed contract**
   before anything acts on it: the bridge validates here (required non-empty
-  `id`/`consumedAt`/`name`; each macro a finite, non-negative number or absent; ≤
-  10 meals; ≤ 8 KiB line) and the app validates again and gates the write behind
-  an explicit **HealthKit *write* authorization** the user grants once.
-- **The worst this channel can do** is write **nutrition entries** (energy +
-  macros) attributed to Jesse into Apple Health — a data class the user opted into
-  by granting write access, dedupe-keyed by `id` so a replay can't pile up
-  duplicates. It grants **no new capability** and, like the other directives, adds
-  **no tool** to the agent's allowlist. Weight and workouts stay **read-only** —
-  the write path only ever creates the food correlation, nothing else.
-- **A malformed, over-cap, unknown-version, or over-10-meal block is a loud,
+  `id`/`consumedAt`/`name`; each nutrient a finite, non-negative number or absent;
+  ≤ 10 meals; **v2**: `retract` an array of ≤ 10 non-empty strings, no id in both
+  `meals` and `retract`; ≤ 8 KiB line) and the app validates again and gates the
+  write behind an explicit **HealthKit *write* authorization** the user grants once.
+- **The worst this channel can do** is create, replace, or delete **nutrition
+  entries** (energy + macros + the four micronutrients) attributed to Jesse in
+  Apple Health — a data class the user opted into by granting write access,
+  dedupe-keyed by `id` (v2 adds a per-id content hash) so a replay can't pile up
+  duplicates. **The app only ever deletes/rewrites entries Jesse itself wrote**
+  (matched by its own external-id metadata) — never another source's data. It
+  grants **no new capability** and adds **no tool** to the agent's allowlist. Weight
+  and workouts stay **read-only**.
+- **A malformed, over-cap, unknown-version, or contract-violating block is a loud,
   visible failure**, not a silent one: the line is left in the reply text and
   logged, and no field is attached — a bad block is **never partially logged**, and
-  a future `v2` contract bump fails loudly rather than half-parsing.
+  **`v3` and up pass through visible** (a future contract bump fails loudly rather
+  than half-parsing).
 - **`consumedAt` is checked only for presence on the bridge** (it has no date
   library); the app parses the ISO-8601 offset strictly before writing, so a
   garbled timestamp fails app-side rather than landing a mis-dated entry.
+
+### Off-app corrections queue (`POST /jesse/meal-corrections`)
+
+Most logging and **all** corrections happen in non-app sessions (desktop/Cowork
+logging on the Studio) with no app turn — so there is no reply to carry a
+`JESSE_MEAL_LOG` block. A new endpoint lets an external logging agent hand the
+bridge a v2 batch to relay on the next app turn. The bridge only **persists and
+relays**; it never writes Apple Health or the vault (the app remains the sole
+writer).
+
+- **Bearer-auth gated, LAN-only, same trust class as reply text.** `POST
+  /jesse/meal-corrections` uses the same `JESSE_TOKEN` bearer check as every other
+  endpoint, and its body is input from an **external logging agent** — attacker-
+  influenceable exactly like the reply text. It is therefore validated against the
+  **identical `JESSE_MEAL_LOG v2` contract** as an in-reply directive before it is
+  queued (same required fields, finite non-negative nutrients, caps, and the
+  no-id-in-both rule), so a malformed or crafted body is a loud `400`, never a
+  partial enqueue — and the app re-validates every field before writing.
+- **Bounded, persisted, never a silent drop.** Batches land in
+  `<state_dir>/meal-corrections-queue.jsonl` with a monotonic `seq` (survives
+  restart). The queue is **capped at 100 batches**; a post at the cap is rejected
+  `429` (a visible failure at the source beats a silent loss), and with no state dir
+  configured it is `503` (persistence off). Every enqueue, delivery, ack, and prune
+  is logged (content-free counts only).
+- **At-least-once, idempotent, self-pruning.** On every terminal result the queued
+  batches are merged into the delivered `meal_log` and the highest `seq` is stamped
+  as `corrections_seq`; the app echoes `meal_corrections_ack` on a later `POST
+  /jesse` and the bridge prunes batches at or below it. An unacked batch redelivers
+  every turn — harmless because the app dedupes on `id` + content hash — so a
+  dropped socket or a lost ack costs a redelivery, never a wrong or duplicated write.
 
 ## Push notifications (APNs key + device token)
 
