@@ -15,11 +15,13 @@ final class MealLogParserTests: XCTestCase {
                       carbs: Double? = 77, fat: Double? = 4.5,
                       fiber: Double? = 6, sodium: Double? = nil,
                       satFat: Double? = nil, sugar: Double? = nil,
-                      potassium: Double? = nil) -> JesseMeal {
+                      potassium: Double? = nil, calcium: Double? = nil,
+                      magnesium: Double? = nil) -> JesseMeal {
         JesseMeal(id: id, consumedAt: consumedAt, name: name,
                   kcal: kcal, proteinGrams: protein, carbGrams: carbs, fatGrams: fat,
                   fiberGrams: fiber, sodiumMg: sodium, satFatGrams: satFat,
-                  sugarGrams: sugar, potassiumMg: potassium)
+                  sugarGrams: sugar, potassiumMg: potassium,
+                  calciumMg: calcium, magnesiumMg: magnesium)
     }
 
     // MARK: - Validation / mapping
@@ -240,7 +242,7 @@ final class MealLogParserTests: XCTestCase {
     private func domain(kcal: Double? = 100, sodium: Double? = nil) -> Meal {
         Meal(id: "id", consumedAt: Date(timeIntervalSince1970: 1_780_000_000), name: "N",
              kcal: kcal, proteinGrams: nil, carbGrams: nil, fatGrams: nil, fiberGrams: nil,
-             sodiumMg: sodium, satFatGrams: nil, sugarGrams: nil, potassiumMg: nil)
+             sodiumMg: sodium, satFatGrams: nil, sugarGrams: nil, potassiumMg: nil, calciumMg: nil, magnesiumMg: nil)
     }
 
     func testIdenticalContentHashesEqual() {
@@ -264,10 +266,10 @@ final class MealLogParserTests: XCTestCase {
     func testNameChangeChangesTheHash() {
         let a = Meal(id: "id", consumedAt: Date(timeIntervalSince1970: 1_780_000_000), name: "A",
                      kcal: 100, proteinGrams: nil, carbGrams: nil, fatGrams: nil, fiberGrams: nil,
-                     sodiumMg: nil, satFatGrams: nil, sugarGrams: nil, potassiumMg: nil)
+                     sodiumMg: nil, satFatGrams: nil, sugarGrams: nil, potassiumMg: nil, calciumMg: nil, magnesiumMg: nil)
         let b = Meal(id: "id", consumedAt: Date(timeIntervalSince1970: 1_780_000_000), name: "B",
                      kcal: 100, proteinGrams: nil, carbGrams: nil, fatGrams: nil, fiberGrams: nil,
-                     sodiumMg: nil, satFatGrams: nil, sugarGrams: nil, potassiumMg: nil)
+                     sodiumMg: nil, satFatGrams: nil, sugarGrams: nil, potassiumMg: nil, calciumMg: nil, magnesiumMg: nil)
         XCTAssertNotEqual(a.contentHash, b.contentHash)
     }
 
@@ -275,10 +277,10 @@ final class MealLogParserTests: XCTestCase {
         // The hash answers "did the CONTENT change?" — id is the store key, not content.
         let a = Meal(id: "id-1", consumedAt: Date(timeIntervalSince1970: 1_780_000_000), name: "N",
                      kcal: 100, proteinGrams: nil, carbGrams: nil, fatGrams: nil, fiberGrams: nil,
-                     sodiumMg: nil, satFatGrams: nil, sugarGrams: nil, potassiumMg: nil)
+                     sodiumMg: nil, satFatGrams: nil, sugarGrams: nil, potassiumMg: nil, calciumMg: nil, magnesiumMg: nil)
         let b = Meal(id: "id-2", consumedAt: Date(timeIntervalSince1970: 1_780_000_000), name: "N",
                      kcal: 100, proteinGrams: nil, carbGrams: nil, fatGrams: nil, fiberGrams: nil,
-                     sodiumMg: nil, satFatGrams: nil, sugarGrams: nil, potassiumMg: nil)
+                     sodiumMg: nil, satFatGrams: nil, sugarGrams: nil, potassiumMg: nil, calciumMg: nil, magnesiumMg: nil)
         XCTAssertEqual(a.contentHash, b.contentHash)
     }
 }

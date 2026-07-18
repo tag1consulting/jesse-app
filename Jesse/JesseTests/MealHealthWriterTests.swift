@@ -62,11 +62,12 @@ final class MealHealthWriterTests: XCTestCase {
     private final class AckCapture { var seqs: [Int] = [] }
 
     private func meal(_ id: String, kcal: Double? = 100, sodiumMg: Double? = nil,
-                      at: TimeInterval = 1_780_000_000) -> Meal {
+                      calciumMg: Double? = nil, at: TimeInterval = 1_780_000_000) -> Meal {
         Meal(id: id, consumedAt: Date(timeIntervalSince1970: at),
              name: "Meal \(id)", kcal: kcal, proteinGrams: nil, carbGrams: nil,
              fatGrams: nil, fiberGrams: nil, sodiumMg: sodiumMg,
-             satFatGrams: nil, sugarGrams: nil, potassiumMg: nil)
+             satFatGrams: nil, sugarGrams: nil, potassiumMg: nil,
+             calciumMg: calciumMg, magnesiumMg: nil)
     }
 
     private func batch(_ upserts: [Meal] = [], retract: [String] = [], seq: Int? = nil) -> MealBatch {
@@ -131,6 +132,24 @@ final class MealHealthWriterTests: XCTestCase {
         XCTAssertEqual(log, [.delete("soup"), .write("soup")],
                        "a micronutrient-only change rewrites exactly once")
         XCTAssertEqual(ack.seqs, [7])
+    }
+
+    func testCalciumOnlyCorrectionRewritesOnce() async {
+        // Adding a first calcium estimate changes the content hash (absent ≠ 0), so the
+        // meal is delete-then-rewritten exactly once — the same correction path the other
+        // micronutrients flow through, now carrying calcium/magnesium in the hash.
+        let w = FakeMealWriter(); let p = InMemoryPending(); let ack = AckCapture()
+        let store = InMemoryWrittenStore()
+        let before = meal("soup", kcal: 120, calciumMg: nil)  // no calcium estimate yet
+        store.records["soup"] = WrittenMealRecord(contentHash: before.contentHash, tombstoned: false)
+        let after = meal("soup", kcal: 120, calciumMg: 250)   // ONLY calcium added
+        XCTAssertNotEqual(before.contentHash, after.contentHash,
+                          "adding a first calcium estimate must change the hash (absent ≠ 0)")
+        await makeWriter(w, p, ack).apply(batch([after], seq: 14), written: store)
+        let log = await w.log()
+        XCTAssertEqual(log, [.delete("soup"), .write("soup")],
+                       "a calcium-only change rewrites exactly once")
+        XCTAssertEqual(ack.seqs, [14])
     }
 
     func testRetractDeletesAndTombstones() async {
@@ -275,11 +294,13 @@ final class MealHealthWriterTests: XCTestCase {
     /// A meal carrying an explicit set of macros/micronutrients (any may be nil).
     private func fullMeal(kcal: Double? = 100, sodiumMg: Double? = nil,
                           satFatGrams: Double? = nil, sugarGrams: Double? = nil,
-                          potassiumMg: Double? = nil) -> Meal {
+                          potassiumMg: Double? = nil, calciumMg: Double? = nil,
+                          magnesiumMg: Double? = nil) -> Meal {
         Meal(id: "m", consumedAt: Date(timeIntervalSince1970: 1_780_000_000),
              name: "M", kcal: kcal, proteinGrams: 20, carbGrams: 30, fatGrams: 10,
              fiberGrams: 5, sodiumMg: sodiumMg, satFatGrams: satFatGrams,
-             sugarGrams: sugarGrams, potassiumMg: potassiumMg)
+             sugarGrams: sugarGrams, potassiumMg: potassiumMg,
+             calciumMg: calciumMg, magnesiumMg: magnesiumMg)
     }
 
     private func samples(of meal: Meal, _ id: HKQuantityTypeIdentifier) -> [HKQuantitySample] {
@@ -298,7 +319,7 @@ final class MealHealthWriterTests: XCTestCase {
 
     func testMealWithAllUnknownPotassiumWritesNoPotassiumSample() {
         // potassiumMg nil ⇒ no item carried a value ⇒ NO sample (never a zero sample).
-        let m = fullMeal(sodiumMg: 800, potassiumMg: nil)
+        let m = fullMeal(sodiumMg: 800, potassiumMg: nil, calciumMg: nil, magnesiumMg: nil)
         XCTAssertTrue(samples(of: m, .dietaryPotassium).isEmpty,
                       "an all-unknown micronutrient writes no sample")
     }
@@ -318,8 +339,38 @@ final class MealHealthWriterTests: XCTestCase {
     }
 
     func testMealWithNoMicronutrientsWritesOnlyTheFiveMacroSamples() {
-        let m = fullMeal()   // all four micronutrients nil
+        let m = fullMeal()   // all six micronutrients nil
         let count = HealthKitMealWriter.samples(for: m).count
         XCTAssertEqual(count, 5, "no micronutrient values ⇒ only the five macro samples")
+    }
+
+    func testMealWithKnownCalciumAndMagnesiumWritesThoseSamples() {
+        let m = fullMeal(calciumMg: 250, magnesiumMg: 90)
+        let calcium = samples(of: m, .dietaryCalcium)
+        let magnesium = samples(of: m, .dietaryMagnesium)
+        XCTAssertEqual(calcium.count, 1)
+        XCTAssertEqual(calcium[0].quantity.doubleValue(for: .gramUnit(with: .milli)), 250, accuracy: 0.001,
+                       "the summed known calcium is written in milligrams")
+        XCTAssertEqual(magnesium.count, 1)
+        XCTAssertEqual(magnesium[0].quantity.doubleValue(for: .gramUnit(with: .milli)), 90, accuracy: 0.001,
+                       "the summed known magnesium is written in milligrams")
+    }
+
+    func testMealWithAllUnknownCalciumMagnesiumWritesNoSample() {
+        // Both nil ⇒ no item carried a value ⇒ NO sample (never a zero sample).
+        let m = fullMeal(sodiumMg: 800, calciumMg: nil, magnesiumMg: nil)
+        XCTAssertTrue(samples(of: m, .dietaryCalcium).isEmpty,
+                      "an all-unknown calcium writes no sample")
+        XCTAssertTrue(samples(of: m, .dietaryMagnesium).isEmpty,
+                      "an all-unknown magnesium writes no sample")
+    }
+
+    func testMealWithEveryMicronutrientWritesElevenSamplesAndNoOmega3() {
+        // Five macros + six HealthKit micros = eleven; omega-3 and unsaturated fat are
+        // NOT written (no HealthKit type / gauge-only), so there is no twelfth sample.
+        let m = fullMeal(sodiumMg: 800, satFatGrams: 3, sugarGrams: 12, potassiumMg: 500,
+                         calciumMg: 250, magnesiumMg: 90)
+        XCTAssertEqual(HealthKitMealWriter.samples(for: m).count, 11,
+                       "five macros plus the six HealthKit-bound micronutrients")
     }
 }

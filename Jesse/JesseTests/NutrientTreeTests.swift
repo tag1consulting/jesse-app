@@ -14,7 +14,8 @@ final class NutrientTreeTests: XCTestCase {
 
     // MARK: - Canonical order (the single source every listing derives from)
 
-    func testMacroAreaOrderIsProteinCarbsFiberSugarsFatSatFat() {
+    func testMacroAreaOrderIsProteinCarbsFiberSugarsFatSatFatUnsatFat() {
+        // Under Fat: saturated fat then the derived unsaturated fat, both sub-entries.
         XCTAssertEqual(NutrientOrder.macroArea, [
             .macro(.protein),
             .macro(.carbs),
@@ -22,21 +23,23 @@ final class NutrientTreeTests: XCTestCase {
             .micronutrient(.totalSugars),
             .macro(.fat),
             .micronutrient(.saturatedFat),
+            .micronutrient(.unsaturatedFat),
         ])
     }
 
-    func testMineralsAreSodiumAndPotassiumOnly() {
-        // The Micronutrients section is the two standalone minerals only — saturated fat
-        // and total sugars have moved up under their parent macro.
-        XCTAssertEqual(NutrientOrder.minerals, [.sodium, .potassium])
+    func testMineralsAreTheStandaloneEntriesInOrder() {
+        // The Micronutrients section is the standalone entries only (no macro parent) —
+        // saturated/unsaturated fat and total sugars sit under their parent macro.
+        XCTAssertEqual(NutrientOrder.minerals,
+                       [.sodium, .potassium, .calcium, .omega3, .magnesium])
     }
 
     func testMacroAreaNeverContainsAMineral() {
-        // Sodium and potassium are minerals, not a component of any macro; they never
-        // appear among the macro-area rows.
+        // Standalone entries are not a component of any macro; they never appear among
+        // the macro-area rows.
         for mineral in NutrientOrder.minerals {
             XCTAssertFalse(NutrientOrder.macroArea.contains(.micronutrient(mineral)),
-                           "\(mineral) is a mineral and must not sit in the macro area")
+                           "\(mineral) is standalone and must not sit in the macro area")
         }
     }
 
@@ -54,11 +57,13 @@ final class NutrientTreeTests: XCTestCase {
     func testMicronutrientParents() {
         XCTAssertEqual(Micronutrient.totalSugars.parent, .carbs)
         XCTAssertEqual(Micronutrient.saturatedFat.parent, .fat)
+        XCTAssertEqual(Micronutrient.unsaturatedFat.parent, .fat)
         XCTAssertTrue(Micronutrient.totalSugars.isSubEntry)
         XCTAssertTrue(Micronutrient.saturatedFat.isSubEntry)
-        for mineral in [Micronutrient.sodium, .potassium] {
-            XCTAssertNil(mineral.parent)
-            XCTAssertFalse(mineral.isSubEntry)
+        XCTAssertTrue(Micronutrient.unsaturatedFat.isSubEntry)
+        for standalone in [Micronutrient.sodium, .potassium, .calcium, .omega3, .magnesium] {
+            XCTAssertNil(standalone.parent)
+            XCTAssertFalse(standalone.isSubEntry)
         }
     }
 
@@ -66,10 +71,14 @@ final class NutrientTreeTests: XCTestCase {
         XCTAssertTrue(NutrientEntry.macro(.fiber).isSubEntry)
         XCTAssertTrue(NutrientEntry.micronutrient(.totalSugars).isSubEntry)
         XCTAssertTrue(NutrientEntry.micronutrient(.saturatedFat).isSubEntry)
+        XCTAssertTrue(NutrientEntry.micronutrient(.unsaturatedFat).isSubEntry)
         XCTAssertFalse(NutrientEntry.macro(.carbs).isSubEntry)
         XCTAssertFalse(NutrientEntry.macro(.fat).isSubEntry)
         XCTAssertFalse(NutrientEntry.micronutrient(.sodium).isSubEntry)
         XCTAssertFalse(NutrientEntry.micronutrient(.potassium).isSubEntry)
+        XCTAssertFalse(NutrientEntry.micronutrient(.calcium).isSubEntry)
+        XCTAssertFalse(NutrientEntry.micronutrient(.omega3).isSubEntry)
+        XCTAssertFalse(NutrientEntry.micronutrient(.magnesium).isSubEntry)
     }
 
     // MARK: - Preserved gauge semantics after the move
@@ -123,6 +132,26 @@ final class NutrientTreeTests: XCTestCase {
     func testMineralsKeepTheirDirections() {
         XCTAssertEqual(Micronutrient.sodium.goal, .ceiling)
         XCTAssertEqual(Micronutrient.potassium.goal, .floor)
+    }
+
+    func testNewFloorNutrientsAreJudgedFloors() {
+        for n in [Micronutrient.calcium, .omega3, .magnesium] {
+            XCTAssertEqual(n.goal, .floor, "\(n) is a floor to reach")
+            XCTAssertTrue(n.judged, "\(n) carries a red/green judgment")
+        }
+    }
+
+    func testUnsaturatedFatIsInformationalAndDerivedUnderFat() {
+        // Informational (never judged), no target, and a sub-entry of fat.
+        XCTAssertFalse(Micronutrient.unsaturatedFat.judged)
+        XCTAssertNil(Micronutrient.unsaturatedFat.target(in: DietTargets(satFat: 20)))
+        XCTAssertEqual(Micronutrient.unsaturatedFat.parent, .fat)
+        // Per-item value is fat − saturated fat, but only when saturated fat is known.
+        let known = DietItem(item: "x", amount: nil, cal: 0, p: 0, f: 18, c: 0, fiber: 0, satf: 5)
+        XCTAssertEqual(Micronutrient.unsaturatedFat.value(in: known), 13)
+        let unknown = DietItem(item: "y", amount: nil, cal: 0, p: 0, f: 18, c: 0, fiber: 0, satf: nil)
+        XCTAssertNil(Micronutrient.unsaturatedFat.value(in: unknown),
+                     "an item with unknown saturated fat is UNKNOWN (partial), never derived from 0")
     }
 
     // MARK: - Shared indent (list/row surfaces only)

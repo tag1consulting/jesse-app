@@ -31,8 +31,12 @@ final class MacroLabelTests: XCTestCase {
     func testMicronutrientDisplayNamesAreFullAndUnabbreviated() {
         XCTAssertEqual(Micronutrient.sodium.displayName, "Sodium")
         XCTAssertEqual(Micronutrient.saturatedFat.displayName, "Saturated Fat")
+        XCTAssertEqual(Micronutrient.unsaturatedFat.displayName, "Unsaturated Fat")
         XCTAssertEqual(Micronutrient.totalSugars.displayName, "Total Sugars")
         XCTAssertEqual(Micronutrient.potassium.displayName, "Potassium")
+        XCTAssertEqual(Micronutrient.calcium.displayName, "Calcium")
+        XCTAssertEqual(Micronutrient.omega3.displayName, "Omega-3 (EPA+DHA)")
+        XCTAssertEqual(Micronutrient.magnesium.displayName, "Magnesium")
     }
 
     func testMicronutrientNamesCarryNoAbbreviation() {
@@ -47,9 +51,11 @@ final class MacroLabelTests: XCTestCase {
 
     func testMicronutrientCanonicalOrderAndUnits() {
         XCTAssertEqual(Micronutrient.allCases.map(\.displayName),
-                       ["Sodium", "Saturated Fat", "Total Sugars", "Potassium"])
-        // Sodium/potassium in mg, the fat and sugars in g.
-        XCTAssertEqual(Micronutrient.allCases.map(\.unit), ["mg", "g", "g", "mg"])
+                       ["Sodium", "Saturated Fat", "Unsaturated Fat", "Total Sugars",
+                        "Potassium", "Calcium", "Omega-3 (EPA+DHA)", "Magnesium"])
+        // Minerals and omega-3 in mg, the fats and sugars in g.
+        XCTAssertEqual(Micronutrient.allCases.map(\.unit),
+                       ["mg", "g", "g", "g", "mg", "mg", "mg", "mg"])
     }
 
     // MARK: - Canonical display order (fiber is a subset of carbs → sits after it)

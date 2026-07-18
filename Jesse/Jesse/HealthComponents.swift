@@ -844,20 +844,26 @@ struct ContributionRow: View {
     }
 }
 
-/// Identity colors for the four micronutrients. A sub-entry micronutrient takes a
-/// lightened shade of its PARENT macro's identity color — saturated fat from the fat
-/// orange, total sugars from the carbs teal — the same derivation fiber uses, so the
-/// nutrition-label tree reads as parent-and-paler-kin in the drill-down bars too
-/// (resolved per color scheme, opaque, distinguishable in light and dark). The
-/// standalone minerals (sodium, potassium) keep their own distinct hue, apart from the
-/// macro palette. One place, so no view hardcodes a color.
+/// Identity colors for the micronutrients. A sub-entry micronutrient takes a lightened
+/// shade of its PARENT macro's identity color — saturated fat and unsaturated fat from the
+/// fat orange, total sugars from the carbs teal — the same derivation fiber uses, so the
+/// nutrition-label tree reads as parent-and-paler-kin in the drill-down bars too (resolved
+/// per color scheme, opaque, distinguishable in light and dark). The standalone entries
+/// (sodium, potassium, calcium, magnesium, omega-3) each keep their own distinct hue,
+/// apart from the macro palette. One place, so no view hardcodes a color.
 enum MicronutrientColor {
     static func color(for n: Micronutrient) -> Color {
         if let parent = n.parent {
             return MacroColor.shade(ofSubEntry: MacroColor.color(for: parent))
         }
-        // The two standalone minerals — the only cases with no macro parent.
-        return n == .sodium ? .blue : .mint
+        // The standalone entries — the cases with no macro parent — each a distinct hue.
+        switch n {
+        case .potassium: return .mint
+        case .calcium: return .cyan
+        case .omega3: return .pink
+        case .magnesium: return .purple
+        default: return .blue // sodium (and any future standalone default)
+        }
     }
 }
 

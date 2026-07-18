@@ -23,8 +23,9 @@ nonisolated struct HealthKitMealWriter: MealWriting {
     /// `NSInvalidArgumentException` at the `requestAuthorization` call if one appears
     /// here. Saving the `.food` `HKCorrelation` needs no container grant — share
     /// authorization for every sample it contains is sufficient, so each quantity type
-    /// a meal may carry (the five macros plus the four micronutrients) must be in this
-    /// set. Guarded by `HealthKitAuthorizationTypesTests`.
+    /// a meal may carry (the five macros plus the six HealthKit-bound micronutrients)
+    /// must be in this set. Omega-3 is gauge-only (no HealthKit EPA+DHA type) and so is
+    /// absent here. Guarded by `HealthKitAuthorizationTypesTests`.
     static let shareTypes: Set<HKSampleType> = [
         HKQuantityType(.dietaryEnergyConsumed),
         HKQuantityType(.dietaryProtein),
@@ -35,6 +36,8 @@ nonisolated struct HealthKitMealWriter: MealWriting {
         HKQuantityType(.dietaryFatSaturated),
         HKQuantityType(.dietarySugar),
         HKQuantityType(.dietaryPotassium),
+        HKQuantityType(.dietaryCalcium),
+        HKQuantityType(.dietaryMagnesium),
     ]
 
     /// The representative type whose share status stands for "meal writing" (they
@@ -46,8 +49,8 @@ nonisolated struct HealthKitMealWriter: MealWriting {
     /// without a save (`MealHealthWriterTests`). A nil / negative / non-finite value
     /// writes NO sample (never a zero), so a micronutrient with no known value across
     /// the meal (nil on the `Meal`) is simply omitted. The existing five macro samples
-    /// are unchanged; the four micronutrients are additive — sodium/potassium in
-    /// milligrams (`HKUnit` gram-milli), saturated fat and sugars in grams.
+    /// are unchanged; the six micronutrients are additive — sodium/potassium/calcium/
+    /// magnesium in milligrams (`HKUnit` gram-milli), saturated fat and sugars in grams.
     static func samples(for meal: Meal) -> Set<HKSample> {
         var samples: Set<HKSample> = []
         func add(_ id: HKQuantityTypeIdentifier, _ unit: HKUnit, _ value: Double?) {
@@ -65,6 +68,8 @@ nonisolated struct HealthKitMealWriter: MealWriting {
         add(.dietaryFatSaturated, .gram(), meal.satFatGrams)
         add(.dietarySugar, .gram(), meal.sugarGrams)
         add(.dietaryPotassium, .gramUnit(with: .milli), meal.potassiumMg)
+        add(.dietaryCalcium, .gramUnit(with: .milli), meal.calciumMg)
+        add(.dietaryMagnesium, .gramUnit(with: .milli), meal.magnesiumMg)
         return samples
     }
 
@@ -98,8 +103,9 @@ nonisolated struct HealthKitMealWriter: MealWriting {
     /// The meal id was stored as `HKMetadataKeyExternalUUID` on the correlation, so we
     /// query for `.food` correlations with that value, then delete each correlation
     /// **together with its `.objects`** (the contained samples) — correlation deletion
-    /// does not cascade, and there are now up to nine quantity types per meal, so we
-    /// enumerate rather than assume. HealthKit only lets the app delete objects IT wrote,
+    /// does not cascade, and there are now up to eleven quantity types per meal, so we
+    /// enumerate the present samples rather than assume a count. HealthKit only lets the
+    /// app delete objects IT wrote,
     /// so another source's data is never touched even if it shared the external id.
     func delete(id: String) async -> Bool {
         guard HKHealthStore.isHealthDataAvailable() else { return false }

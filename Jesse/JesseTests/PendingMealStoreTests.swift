@@ -26,7 +26,7 @@ final class PendingMealStoreTests: XCTestCase {
         Meal(id: id, consumedAt: Date(timeIntervalSince1970: 1_780_000_000),
              name: "Meal \(id)", kcal: kcal, proteinGrams: nil, carbGrams: nil,
              fatGrams: nil, fiberGrams: nil,
-             sodiumMg: sodium, satFatGrams: nil, sugarGrams: nil, potassiumMg: nil)
+             sodiumMg: sodium, satFatGrams: nil, sugarGrams: nil, potassiumMg: nil, calciumMg: nil, magnesiumMg: nil)
     }
 
     private func batch(_ upserts: [Meal] = [], retract: [String] = []) -> PendingMealBatch {

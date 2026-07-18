@@ -15,6 +15,39 @@ CI both run it). See the "Versioning" section of `bridge/README.md`.
 
 ## [Unreleased]
 
+## [App 1.0 (49)] — 2026-07-18
+
+### Added
+- **Three more tracked micronutrients on the Health tab plus one derived — calcium,
+  omega-3 (EPA+DHA), magnesium, and unsaturated fat — end to end, mirroring the four-micro
+  pattern (build 40) exactly with the same unknown ≠ zero discipline.** The `GET /jesse/diet`
+  per-item snapshot gains three OPTIONAL gauge fields (`ca` mg, `o3` mg, `mg` mg) and three
+  OPTIONAL day targets (`calcium` 1200, `omega3` 500, `magnesium` 400); a missing value is
+  UNKNOWN, never summed or shown as 0, and stays OUT of the `MacroTotals`/`total(of:)`
+  nil→0 path. `DietSemantics.micronutrientGauge` builds calcium, omega-3, and magnesium as
+  **floors** (like potassium — met / short by N) and **unsaturated fat** as an
+  informational, DERIVED gauge (`fat − saturated fat` over items whose saturated fat is
+  KNOWN — an unknown-satf item makes the day partial, never zero), value-only and never
+  judged like total sugars. Each preserves unknowns: a partial total renders `≥sum` with an
+  *"N items not estimated"* caption; a nutrient no item carried shows *"not tracked yet"*;
+  an absent target shows the value only. Calcium, magnesium, and omega-3 join the standalone
+  **Micronutrients** section; unsaturated fat nests under Fat beside saturated fat. Tapping
+  any of the four opens the SAME shared drill-down sheet (sorted contributors, "Not estimated"
+  group, `≥` partial header, share-of-known-total, grounded on-device insight with the
+  informational judgment-forbid for unsaturated fat). Their full display names (`Calcium`,
+  `Omega-3 (EPA+DHA)`, `Magnesium`, `Unsaturated Fat`) live in the one `Micronutrient` enum,
+  guarded by `MacroLabelTests`.
+- **HealthKit meal write-back for calcium and magnesium only.** A logged meal now carries
+  `calcium_mg` and `magnesium_mg` (each the sum of only its known items, nil when none),
+  threaded from the `meal_log` wire through `Meal` and written as additional samples on the
+  meal's existing `.food` correlation — `dietaryCalcium` and `dietaryMagnesium` (both in mg).
+  A nutrient with no known value writes NO sample (never a 0), and the delete-then-rewrite
+  correction path enumerates the present sample types (now up to eleven), so the two new
+  types flow through a rewrite. The share (write) set grows from nine to eleven to authorize
+  them. **Omega-3 is gauge-only** — there is no HealthKit EPA+DHA type (`dietaryFatPolyunsaturated`
+  includes plant ALA), so it is never a meal field and writes no sample; unsaturated fat is
+  derived and likewise never written.
+
 ## [Bridge 0.18.0] — 2026-07-18
 
 ### Added

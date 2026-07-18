@@ -98,7 +98,7 @@ final class MealWireDecodeTests: XCTestCase {
                                                  carbGrams: nil, fatGrams: nil,
                                                  fiberGrams: nil, sodiumMg: nil,
                                                  satFatGrams: nil, sugarGrams: nil,
-                                                 potassiumMg: nil)])
+                                                 potassiumMg: nil, calciumMg: nil, magnesiumMg: nil)])
         let reply = JesseReply(text: "ok", sessionId: nil,
                                directives: JesseDirectives(needsHealth: nil, mealLog: bad))
         XCTAssertNil(reply.mealsToLog)
@@ -150,6 +150,36 @@ final class MealWireDecodeTests: XCTestCase {
         XCTAssertEqual(b.upserts.map(\.id), ["new"])
         XCTAssertEqual(b.retracts, ["old"])
         XCTAssertEqual(b.correctionsSeq, 9)
+    }
+
+    func testMealBlockDecodesCalciumAndMagnesium() throws {
+        // calcium_mg / magnesium_mg parse like the other HealthKit-bound micros; the meal
+        // wire has NO omega-3 field (gauge-only), so `JesseMeal` never carries one.
+        let json = """
+        {"status":"done","response":"ok","session_id":"s",
+         "directives":{"meal_log":{"meals":[
+           {"id":"a","consumedAt":"2026-07-04T12:30:00+02:00","name":"Salmon plate",
+            "sodium_mg":600,"potassium_mg":800,"calcium_mg":250,"magnesium_mg":90}]}}}
+        """
+        let meal = try XCTUnwrap(try decodeResult(json).directives?.mealLog?.meals.first)
+        XCTAssertEqual(meal.calciumMg, 250)
+        XCTAssertEqual(meal.magnesiumMg, 90)
+        // The other HealthKit micros still parse alongside them.
+        XCTAssertEqual(meal.sodiumMg, 600)
+        XCTAssertEqual(meal.potassiumMg, 800)
+    }
+
+    func testMealBlockOmittingCalciumMagnesiumDecodesToNil() throws {
+        // An older bridge (or a meal with no known calcium/magnesium) omits both → nil,
+        // never a summed 0.
+        let json = """
+        {"status":"done","response":"ok","session_id":"s",
+         "directives":{"meal_log":{"meals":[
+           {"id":"a","consumedAt":"2026-07-04T12:30:00+02:00","name":"Apple","kcal":95}]}}}
+        """
+        let meal = try XCTUnwrap(try decodeResult(json).directives?.mealLog?.meals.first)
+        XCTAssertNil(meal.calciumMg)
+        XCTAssertNil(meal.magnesiumMg)
     }
 
     func testSSEDoneFrameDecodesRetractAndSeq() throws {

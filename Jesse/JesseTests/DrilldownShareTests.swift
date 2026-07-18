@@ -9,9 +9,10 @@ import XCTest
 final class DrilldownShareTests: XCTestCase {
 
     private func item(_ name: String, c: Double? = nil, amount: String? = nil,
-                      na: Double? = nil, sug: Double? = nil, k: Double? = nil) -> DietItem {
+                      na: Double? = nil, sug: Double? = nil, k: Double? = nil,
+                      ca: Double? = nil) -> DietItem {
         DietItem(item: name, amount: amount, cal: nil, p: nil, f: nil, c: c, fiber: nil,
-                 na: na, satf: nil, sug: sug, k: k)
+                 na: na, satf: nil, sug: sug, k: k, ca: ca)
     }
 
     func testExportsHeaderFoodsAndInsight() {
@@ -94,6 +95,22 @@ final class DrilldownShareTests: XCTestCase {
         XCTAssertFalse(text.contains("≥"), "a complete total shows no floor notation")
         XCTAssertTrue(text.contains("750 / 2300mg"))
         XCTAssertFalse(text.contains("Not estimated"))
+    }
+
+    func testPartialCalciumFloorExportsFloorNotationAndNotEstimated() {
+        // A new floor nutrient exports the same unknown-aware shape: a ≥ floor header, the
+        // sorted known contributors, and the not-estimated group with no numbers.
+        let meals = [DietMeal(name: "Day", time: nil, items: [
+            item("Yogurt", amount: "1 cup", ca: 300),
+            item("Kale", ca: 150),
+            item("Chips", amount: "1 bag", ca: nil),   // unknown
+        ])]
+        let text = microExport(meals, .calcium, targets: DietTargets(calcium: 1200))
+        XCTAssertTrue(text.contains("≥450"), "partial header must show the ≥ floor: \(text)")
+        XCTAssertTrue(text.contains("Yogurt (1 cup): 300 mg"))
+        XCTAssertTrue(text.contains("1 item not estimated"))
+        XCTAssertTrue(text.contains("• Chips (1 bag)"))
+        XCTAssertFalse(text.contains("Chips (1 bag): 0"), "an unknown is never exported as a 0")
     }
 
     func testAllUnknownExportsNotTrackedAndListsEveryItem() {

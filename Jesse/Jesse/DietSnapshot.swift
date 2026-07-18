@@ -13,13 +13,15 @@ import Foundation
 /// One food item inside a meal (or a proposed meal idea). `fiber` is written by
 /// the generator (0 when unknown); the rest may be absent on older files.
 ///
-/// `na`/`satf`/`sug`/`k` are the four micronutrients (bridge ≥ 0.12.x). UNLIKE
-/// `fiber` — which the generator always fills, so nil-coalescing it to 0 is harmless
-/// — these are absent for MANY items. A missing value is UNKNOWN, never zero: it must
-/// never be summed or shown as 0. They therefore live OUTSIDE the `MacroTotals` /
-/// `total(of:)` path (which coalesces nil→0 for cal/p/f/c/fiber) and are aggregated
-/// separately by `DietSemantics.micronutrientTotal`, which preserves the unknowns.
-/// Synthesized Decodable decodes an absent key to nil, so no decoder change is needed.
+/// `na`/`satf`/`sug`/`k` (bridge ≥ 0.12.x) and `ca`/`o3`/`mg` (bridge ≥ 0.18.0) are the
+/// tracked micronutrients. UNLIKE `fiber` — which the generator always fills, so
+/// nil-coalescing it to 0 is harmless — these are absent for MANY items. A missing value
+/// is UNKNOWN, never zero: it must never be summed or shown as 0. They therefore live
+/// OUTSIDE the `MacroTotals` / `total(of:)` path (which coalesces nil→0 for cal/p/f/c/fiber)
+/// and are aggregated separately by `DietSemantics.micronutrientTotal`, which preserves the
+/// unknowns. Synthesized Decodable decodes an absent key to nil, so no decoder change is
+/// needed; the new fields carry a `= nil` default only so additive construction (tests,
+/// previews) needn't name them.
 struct DietItem: Decodable, Equatable, Sendable {
     var item: String
     var amount: String?
@@ -36,6 +38,12 @@ struct DietItem: Decodable, Equatable, Sendable {
     var sug: Double?
     /// Potassium, milligrams. Absent (nil) = unknown, not zero.
     var k: Double?
+    /// Calcium, milligrams. Absent (nil) = unknown, not zero.
+    var ca: Double? = nil
+    /// Omega-3 (marine EPA+DHA), milligrams. Absent (nil) = unknown, not zero.
+    var o3: Double? = nil
+    /// Magnesium, milligrams. Absent (nil) = unknown, not zero.
+    var mg: Double? = nil
 }
 
 /// A logged meal: a name, an optional `HH:MM` time, and its items.
@@ -71,9 +79,10 @@ struct DietWeight: Decodable, Equatable, Sendable {
 /// The day's macro/calorie targets. `carbsBase` and `fiber` may be absent in old
 /// files (fiber defaults to 38 downstream — see `DietSemantics`).
 ///
-/// `sodium`/`satFat`/`potassium`/`sugar` are the optional micronutrient day targets
-/// (bridge ≥ 0.12.x). Each is a reference the matching gauge judges against; when
-/// absent the gauge shows the value only, with no judgment.
+/// `sodium`/`satFat`/`potassium`/`sugar` (bridge ≥ 0.12.x) and `calcium`/`omega3`/
+/// `magnesium` (bridge ≥ 0.18.0) are the optional micronutrient day targets. Each is a
+/// reference the matching gauge judges against; when absent the gauge shows the value
+/// only, with no judgment. (Unsaturated fat is derived, not tracked, and has no target.)
 struct DietTargets: Decodable, Equatable, Sendable {
     var calories: Double?
     var protein: Double?
@@ -89,6 +98,12 @@ struct DietTargets: Decodable, Equatable, Sendable {
     var potassium: Double?
     /// Total-sugars reference line, grams (informational — never a ceiling judgment).
     var sugar: Double?
+    /// Calcium floor, milligrams.
+    var calcium: Double?
+    /// Omega-3 (EPA+DHA) floor, milligrams.
+    var omega3: Double?
+    /// Magnesium floor, milligrams.
+    var magnesium: Double?
 }
 
 /// `DIET_TODAY` — the normalized snapshot of today.
