@@ -114,6 +114,11 @@ final class RunCoordinator {
     // Persists the in-flight job map across suspension. Injectable so a test can
     // avoid the shared UserDefaults store.
     private let inFlightStore: InFlightStoring
+    // Durable queue of remote Claude Code sessions to delete (thread-delete →
+    // `DELETE /jesse/session/{id}`). Persisted so a delete made while the laptop is
+    // asleep survives to the next drain. Injectable so a test points it at a scratch
+    // UserDefaults suite.
+    private let sessionDeletionStore: PendingSessionDeletionStore
     // Owns `finish`'s SwiftData append + save + idempotency-on-jobId. Shares the
     // injected `save` seam so a test's save spy counts both the optimistic
     // user-turn save and the completion save.
@@ -198,6 +203,7 @@ final class RunCoordinator {
          inFlightStore: InFlightStoring? = nil,
          liveActivity: (any TurnLiveActivityManaging)? = nil,
          mealWriter: MealHealthWriter? = nil,
+         sessionDeletionStore: PendingSessionDeletionStore? = nil,
          onFirstSuccess: @escaping @MainActor () -> Void = {}) {
         // Resolve the default on the main actor (in the init body), not in the
         // default argument — a default arg is evaluated off the actor and the
@@ -225,6 +231,9 @@ final class RunCoordinator {
         self.now = now
         self.flushSleep = flushSleep
         self.inFlightStore = resolvedInFlightStore
+        // Resolved in the body (not a default arg) — its init is main-actor-isolated
+        // under this module's MainActor default isolation, mirroring the stores above.
+        self.sessionDeletionStore = sessionDeletionStore ?? PendingSessionDeletionStore()
         self.onFirstSuccess = onFirstSuccess
         self.inFlight = resolvedInFlightStore.load()
     }
@@ -682,6 +691,29 @@ final class RunCoordinator {
         }
     }
 
+    // MARK: - Remote session deletion (durable)
+
+    /// Enqueue a thread's bridge `sessionId` for durable remote deletion and kick a
+    /// drain. Called from the thread swipe-delete AFTER the instant local SwiftData
+    /// delete: the local delete is unchanged, and the remote transcript is reclaimed
+    /// best-effort (retried on the next foreground if the laptop is asleep now). A
+    /// blank id is a no-op (a thread with no reply has no remote session).
+    func enqueueSessionDeletion(_ sessionId: String) {
+        sessionDeletionStore.enqueue(sessionId)
+        drainSessionDeletions()
+    }
+
+    /// Fire-and-forget drain of the durable pending-deletions queue: for each
+    /// tombstone, `DELETE /jesse/session/{id}`; success (incl. the bridge's
+    /// idempotent 404) clears it, a network failure leaves it for next time. Driven
+    /// on enqueue and on `scenePhase → .active` (via `resume`).
+    private func drainSessionDeletions() {
+        let drainer = SessionDeletionDrainer(
+            store: sessionDeletionStore,
+            makeClient: { [makeClient, configProvider] in makeClient(configProvider()) })
+        Task { await drainer.drain() }
+    }
+
     // MARK: - Resume (foreground re-attach)
 
     /// Called when the app returns to the foreground. For every persisted job
@@ -702,6 +734,9 @@ final class RunCoordinator {
         // Foreground is a drain point for meal writes that failed while backgrounded
         // or with the device locked — retry them now (best-effort, gated).
         drainPendingMeals(context: context)
+        // Foreground is also the drain point for remote session deletions queued
+        // while the laptop was asleep/offline (thread-delete → DELETE /jesse/session).
+        drainSessionDeletions()
         for (threadID, job) in inFlight where tasks[threadID] == nil {
             reattach(threadID: threadID, job: job, context: context)
         }

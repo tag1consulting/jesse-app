@@ -81,10 +81,10 @@ impl AppState {
     }
 
     /// The `~/.claude/projects/<escaped-vault>` directory this bridge's vault
-    /// sessions live in. Reads HOME at call time; an unknown HOME yields a path
-    /// that simply won't exist (→ empty session list), never an error.
+    /// sessions live in. Uses the HOME captured once in `Config` (see `cfg.home`);
+    /// an unknown HOME yields a path that simply won't exist (→ empty session
+    /// list), never an error.
     pub fn sessions_dir(&self) -> PathBuf {
-        let home = std::env::var("HOME").unwrap_or_default();
-        vault_sessions_dir(&home, &self.cfg.vault)
+        vault_sessions_dir(&self.cfg.home, &self.cfg.vault)
     }
 }

@@ -15,6 +15,55 @@ CI both run it). See the "Versioning" section of `bridge/README.md`.
 
 ## [Unreleased]
 
+## [App 1.0 (52)] — 2026-07-18
+
+### Added
+- **Durably delete a thread's remote Claude Code session on thread-delete.** Swipe-
+  deleting a thread still does the local SwiftData delete instantly (unchanged); if
+  the thread had a bridge `sessionId`, that id is now enqueued into a persisted
+  pending-deletions queue (`PendingSessionDeletionStore`, UserDefaults-backed — no
+  schema migration) and a drainer calls `DELETE /jesse/session/{id}`. On success
+  (including the bridge's idempotent 404) the tombstone is cleared; on a network
+  failure it is retained for next time. The queue drains on enqueue and on
+  `scenePhase → .active` (alongside `coordinator.resume` / `inbox.drain`), so a
+  delete made while the laptop is asleep completes on the next foreground.
+- **`JesseClient.deleteSession(_:)`** mirroring `send`'s URL/auth; a missing-session
+  `404` maps to success (idempotent), exactly like `cancelJob`.
+
+## [Bridge 0.20.0] — 2026-07-18
+
+### Added
+- **`DELETE /jesse/session/{session_id}` — delete one Claude Code session for the
+  vault, scoped to the vault project only.** Same bearer auth as `/jesse`.
+  **Idempotent** (mirroring `POST /jesse/cancel`): an unknown or already-gone id
+  returns `204`, never an error, so the app's durable delete-drainer and the GC
+  sweep can retry a missing id safely; a real failure to delete a file that exists
+  is `500`; a structurally-invalid id (not a plain filename component) is `400`
+  before it can reach the filesystem (path-traversal guard). Removes exactly
+  `<home>/.claude/projects/<escaped-vault>/<session_id>.jsonl` and drops any stashed
+  title for that session.
+- **Age-based session GC sweep (`JESSE_SESSION_TTL_DAYS`, default 90).** A
+  background task (one run at startup, then every 6h) reclaims vault-project
+  sessions whose transcript mtime is older than the TTL. Resuming a session touches
+  its mtime, so the sweep never reclaims an actively-used thread — only orphans
+  (a failed remote delete, or anything deleted locally before the delete-on-thread-
+  delete flow existed). Every reclaim is logged (id + age); it never deletes anything
+  younger than the TTL and never steps outside the vault project. The age predicate
+  (`is_session_expired`) is pure and tested against a fixed clock.
+- **Resume-after-sweep safety.** A hosted turn whose requested session was swept
+  (or deleted) now starts a **fresh session** cleanly instead of surfacing a raw
+  `claude --resume <gone>` error: `resolve_resume_session` drops the `--resume` when
+  the transcript no longer exists on disk, logs a named line, and the turn returns a
+  new session id (the app keeps its local transcript). A synthetic `local-` id and a
+  live real id pass through unchanged.
+
+### Changed
+- **`Config` now captures `HOME` once at startup (`cfg.home`).** Every session-path
+  lookup (`sessions_dir`, `session_transcript_exists`, the GC sweep) reads `cfg.home`
+  rather than the process env at call time. Behavior-identical in production (HOME is
+  stable), and it makes the session paths deterministic and testable without mutating
+  a process-global.
+
 ## [Bridge 0.19.0] — 2026-07-18
 
 ### Fixed

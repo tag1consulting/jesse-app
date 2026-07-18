@@ -393,6 +393,13 @@ struct ThreadListView: View {
         for index in offsets {
             let thread = sectionThreads[index]
             coordinator.cancel(thread.id)
+            // If the thread had a bridge session, durably enqueue its remote deletion
+            // (DELETE /jesse/session/{id}) BEFORE the local delete reads it — the
+            // local SwiftData delete stays instant; the remote reclaim is best-effort
+            // and retried on the next foreground if the laptop is asleep now.
+            if let sessionId = thread.sessionId, !sessionId.isEmpty {
+                coordinator.enqueueSessionDeletion(sessionId)
+            }
             context.delete(thread)
         }
         do {

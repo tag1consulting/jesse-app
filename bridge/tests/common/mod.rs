@@ -13,6 +13,9 @@ use tower::ServiceExt; // ServiceExt::oneshot
 pub fn test_config() -> Config {
     Config {
         token: "test-token".to_string(),
+        // Captured HOME for session-path lookups; tests that exercise session
+        // paths override `home`/`vault` explicitly (no global-env mutation).
+        home: std::env::var("HOME").unwrap_or_default(),
         // Any existing directory works — most tests never reach run_claude.
         vault: std::env::temp_dir().to_string_lossy().into_owned(),
         bind: "127.0.0.1".to_string(),
@@ -26,6 +29,7 @@ pub fn test_config() -> Config {
         rate_per_min: 30,
         job_ttl_secs: 600,
         retrieval_grace_secs: 600,
+        session_ttl_days: DEFAULT_SESSION_TTL_DAYS,
         // No on-disk persistence in tests by default — keeps cargo test off
         // the real $HOME. The persistence tests build a store with a temp dir.
         state_dir: None,
@@ -78,6 +82,15 @@ pub fn cancel_request(auth: Option<&str>, job_id: &str) -> Request<Body> {
     let mut b = Request::builder()
         .method("POST")
         .uri(format!("/jesse/cancel/{job_id}"));
+    if let Some(a) = auth {
+        b = b.header("authorization", a);
+    }
+    b.body(Body::empty()).unwrap()
+}
+pub fn session_delete_request(auth: Option<&str>, session_id: &str) -> Request<Body> {
+    let mut b = Request::builder()
+        .method("DELETE")
+        .uri(format!("/jesse/session/{session_id}"));
     if let Some(a) = auth {
         b = b.header("authorization", a);
     }

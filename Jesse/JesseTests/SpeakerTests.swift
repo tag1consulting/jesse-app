@@ -33,16 +33,24 @@ final class SpeakerTests: XCTestCase {
     }
 
     // MARK: - The failure path (Prompt 1)
+    //
+    // These assert the UN-MUTED delivery/session behavior, so they pin `muted: false`
+    // rather than inherit the default (`JESSE_MUTE != nil`). The shared `Jesse` scheme
+    // sets `JESSE_MUTE=1` and its TestAction inherits the Run env
+    // (`shouldUseLaunchSchemeArgsEnv=YES`), so a default-constructed `Speaker` under
+    // `xcodebuild test` would be muted and deliver nothing — pinning keeps these tests
+    // hermetic against the dev-mute env. The dedicated mute tests below pin `muted:`
+    // explicitly too.
 
     func testSessionActivationFailureIsSurfacedNotSwallowed() {
-        let speaker = Speaker(session: FailingSession(), synth: SpySynth())
+        let speaker = Speaker(session: FailingSession(), synth: SpySynth(), muted: false)
         speaker.speak("hello")
         XCTAssertNotNil(speaker.lastSessionError,
                         "an audio-session configuration failure must be surfaced, not swallowed")
     }
 
     func testSessionActivationSuccessRecordsNoError() {
-        let speaker = Speaker(session: OKSession(), synth: SpySynth())
+        let speaker = Speaker(session: OKSession(), synth: SpySynth(), muted: false)
         speaker.speak("hello")
         XCTAssertNil(speaker.lastSessionError, "a successful session config records no error")
     }
@@ -51,13 +59,13 @@ final class SpeakerTests: XCTestCase {
 
     func testSpeakDeliversTrimmedTextToSynth() {
         let spy = SpySynth()
-        Speaker(session: OKSession(), synth: spy).speak("  hello there  ")
+        Speaker(session: OKSession(), synth: spy, muted: false).speak("  hello there  ")
         XCTAssertEqual(spy.spoken, ["hello there"], "the trimmed text is handed to the synthesizer")
     }
 
     func testEmptyOrWhitespaceTextSpeaksNothing() {
         let spy = SpySynth()
-        let speaker = Speaker(session: OKSession(), synth: spy)
+        let speaker = Speaker(session: OKSession(), synth: spy, muted: false)
         speaker.speak("")
         speaker.speak("   \n\t ")
         XCTAssertEqual(spy.spoken, [], "an empty/whitespace reply is never spoken")
@@ -68,7 +76,7 @@ final class SpeakerTests: XCTestCase {
     /// (playback can still route to the default output).
     func testSpeakStillDeliversWhenSessionActivationFails() {
         let spy = SpySynth()
-        let speaker = Speaker(session: FailingSession(), synth: spy)
+        let speaker = Speaker(session: FailingSession(), synth: spy, muted: false)
         speaker.speak("important note")
         XCTAssertNotNil(speaker.lastSessionError, "the routing failure is surfaced")
         XCTAssertEqual(spy.spoken, ["important note"], "the reply is still spoken despite the session failure")

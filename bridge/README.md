@@ -961,6 +961,58 @@ curl -s http://127.0.0.1:8765/jesse/sessions \
   a plain component is skipped defensively (a listing can never reach outside the
   projects dir).
 
+## Delete a session (`DELETE /jesse/session/{session_id}`)
+
+Deletes one Claude Code session for the bridge's vault — its transcript file
+`<home>/.claude/projects/<escaped-vault>/<session_id>.jsonl` — **scoped to the
+vault project only**. The app calls this when the user swipe-deletes a thread, so
+the remote transcript is reclaimed too (not just the phone's local copy).
+
+```bash
+curl -s -X DELETE http://127.0.0.1:8765/jesse/session/<session_id> \
+  -H "Authorization: Bearer $JESSE_TOKEN"
+# → 204 No Content
+```
+
+- **Same bearer auth** as `/jesse` (`401` without/with a wrong bearer).
+- **Idempotent**, exactly like `POST /jesse/cancel`: an **unknown or already-gone**
+  id returns **`204`** (success), never an error — the app's durable delete-drainer
+  retries a queued delete, and the GC sweep below must never choke on a missing id.
+  A real failure to delete a file that *exists* is a `500`.
+- **Path-traversal safe.** The `session_id` must be a plain filename component
+  (non-empty, not `.`/`..`, no path separator); anything else is a `400` **before**
+  it can reach the filesystem, so a crafted id can never delete outside the vault
+  projects dir. The one file removed is exactly `<session_id>.jsonl` in that dir.
+- **Title cleanup.** Any title stashed for the session (see the title store) is
+  dropped, so a reclaimed id can't linger in `titles.json`.
+- **A deleted session is no longer resumable** — see the resume-after-sweep note
+  under the GC sweep below.
+
+## Session GC sweep (`JESSE_SESSION_TTL_DAYS`)
+
+A background task reclaims **orphaned** vault-project sessions — one whose remote
+delete never reached the bridge (a failed-network swipe-delete), and everything
+deleted locally on the phone *before* the delete-on-thread-delete flow existed. It
+runs **once at startup**, then every 6 hours, and deletes every vault-project
+session jsonl whose **last-modified time is older than `JESSE_SESSION_TTL_DAYS`**
+(default **90**).
+
+- **Never reclaims an active thread.** Resuming a session touches its jsonl mtime,
+  so a thread you're still using is always younger than the TTL and is never swept.
+  The sweep reclaims exactly the orphans.
+- **Never deletes anything younger than the TTL, and never steps outside the vault
+  project.** It enumerates only plain `*.jsonl` files directly under
+  `<home>/.claude/projects/<escaped-vault>/` (the same scoping as
+  `GET /jesse/sessions`); subdirs, other files, and a non-plain stem are skipped.
+- **Every reclaim is logged** with the session id and its age.
+- **Resume-after-sweep safety.** Because a swept (or deleted) session can no longer
+  be resumed while its phone thread still exists, a hosted turn whose requested
+  session's transcript is gone starts a **fresh session** cleanly rather than
+  surfacing a raw `claude --resume <gone>` error: the bridge drops the `--resume`,
+  logs a named line, and the turn returns a **new** session id (the app keeps its
+  local transcript and stores the new id). A synthetic `local-` id and a live real
+  id are unaffected.
+
 ## Push notifications (APNs) — optional, off by default
 
 The bridge can send the phone an **APNs alert when a backgrounded turn finishes**,
@@ -1093,6 +1145,7 @@ cargo run --release
 | `JESSE_TIMEOUT` | `3600` | Per-request run limit (seconds), clamped to `1..=7200`. `0` is treated as the 7200s ceiling, not unlimited. On overrun the turn returns `504` with an actionable message naming this var |
 | `JESSE_JOB_TTL_SECS` | `86400` | How long a finished-but-**unfetched** reply stays retrievable (24h). The clock starts at first retrieval, not at completion |
 | `JESSE_RETRIEVAL_GRACE_SECS` | `600` | How much longer a reply is kept **after** its first retrieval (a short re-poll window) instead of the full TTL |
+| `JESSE_SESSION_TTL_DAYS` | `90` | Age (days) past which the background session GC sweep reclaims a vault-project Claude Code session jsonl. The sweep keys on file mtime, and resuming a session touches it, so an actively-used thread is never reclaimed — only orphans older than this. Runs once at startup, then every 6h; scoped to the vault project only. See [Session GC sweep](#session-gc-sweep-jesse_session_ttl_days) |
 | `JESSE_STATE_DIR` | `~/.jesse-bridge` | Where completed results are persisted (`<dir>/jobs`) and the device token (`<dir>/device.json`, 0600), so a restart doesn't lose a reply or the token. Empty disables persistence |
 | `JESSE_CLAUDE_BIN` | `claude` | Path to the `claude` binary |
 | `JESSE_TITLE_BASE_URL` | _(off)_ | Title-only backend override (with the two below). When **all three** are set, the `POST /jesse/title` one-shot child — and ONLY that child — is spawned with `ANTHROPIC_BASE_URL` set to this, so titles can be served by a cheap/fast/local backend while main turns keep the ambient credentials. All-or-nothing and soft: unset (default) → titles use the ambient backend, byte-for-byte prior behavior |

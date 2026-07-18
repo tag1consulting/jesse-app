@@ -3074,20 +3074,10 @@ async fn sessions_empty_when_projects_dir_absent_with_stable_etag_and_304() {
     assert!(body_string(resp).await.is_empty(), "304 has an empty body");
 }
 
-// Serialize the HOME-mutating session tests against each other.
-static HOME_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-// The guard is intentionally held across the awaited request: HOME is a process
-// global, so it must stay pinned to this test's throwaway value for the whole
-// request (the sessions handler reads it mid-await). Only this one test mutates
-// HOME, so holding the lock across the await cannot deadlock.
-#[allow(clippy::await_holding_lock)]
 #[tokio::test]
 async fn sessions_lists_a_real_transcript_with_first_message_and_title() {
-    let _g = HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    let saved_home = std::env::var("HOME").ok();
-
-    // A throwaway HOME with a vault whose escaped projects dir holds one session.
+    // A throwaway HOME (via `cfg.home`, no global-env mutation) with a vault whose
+    // escaped projects dir holds one session.
     let home = std::env::temp_dir().join(format!("jesse-home-{}", random_hex()));
     let vault = format!("/vault/{}", random_hex());
     let proj = home
@@ -3101,8 +3091,8 @@ async fn sessions_lists_a_real_transcript_with_first_message_and_title() {
     )
     .unwrap();
 
-    std::env::set_var("HOME", &home);
     let cfg = Config {
+        home: home.to_string_lossy().into_owned(),
         vault: vault.clone(),
         state_dir: None,
         ..test_config()
@@ -3118,18 +3108,108 @@ async fn sessions_lists_a_real_transcript_with_first_message_and_title() {
     assert_eq!(resp.status(), StatusCode::OK);
     let body: Value = serde_json::from_str(&body_string(resp).await).unwrap();
 
-    // Restore HOME before asserting (so a panic can't leak the override).
-    match saved_home {
-        Some(h) => std::env::set_var("HOME", h),
-        None => std::env::remove_var("HOME"),
-    }
-
     let sessions = body["sessions"].as_array().unwrap();
     assert_eq!(sessions.len(), 1);
     assert_eq!(sessions[0]["session_id"], "sess-42");
     assert_eq!(sessions[0]["first_message"], "what is on Today.md?");
     assert_eq!(sessions[0]["title"], "Today Overview");
     assert!(sessions[0]["last_modified"].as_u64().is_some());
+
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+// ---- DELETE /jesse/session/{id} --------------------------------------------
+
+#[tokio::test]
+async fn session_delete_requires_auth() {
+    let st = test_state();
+    let resp = app(st)
+        .oneshot(session_delete_request(None, "some-session"))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn session_delete_unknown_id_is_idempotent_204() {
+    // An unknown / already-gone id is idempotent success (204), never an error —
+    // the app's durable delete-drainer and the GC sweep both retry safely.
+    let cfg = Config {
+        vault: format!("/no/such/vault/{}", random_hex()),
+        ..test_config()
+    };
+    let st = AppState::new(cfg);
+    let resp = app(st)
+        .oneshot(session_delete_request(
+            Some("Bearer test-token"),
+            "never-existed",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+}
+
+// Deleting an EXISTING session removes its transcript, and the deleted session is
+// then no longer resumable. Uses a per-test `cfg.home` (no global-env mutation), so
+// it never races the claude-spawning turn tests.
+#[tokio::test]
+async fn session_delete_removes_transcript_and_makes_it_unresumable() {
+    let home = std::env::temp_dir().join(format!("jesse-home-{}", random_hex()));
+    let vault = format!("/vault/{}", random_hex());
+    let proj = home
+        .join(".claude")
+        .join("projects")
+        .join(escape_project_path(&vault));
+    std::fs::create_dir_all(&proj).unwrap();
+    let transcript = proj.join("sess-del.jsonl");
+    std::fs::write(&transcript, "{\"type\":\"user\",\"message\":{\"content\":\"hi\"}}\n").unwrap();
+
+    let cfg = Config {
+        home: home.to_string_lossy().into_owned(),
+        vault: vault.clone(),
+        state_dir: None,
+        ..test_config()
+    };
+    let st = AppState::new(cfg.clone());
+    st.titles.set("sess-del", "A Title");
+
+    // Before delete: the transcript exists and the session is resumable.
+    assert!(transcript.exists());
+    assert_eq!(
+        resolve_resume_session(&cfg, Some("sess-del")),
+        Some("sess-del")
+    );
+
+    let resp = app(st.clone())
+        .oneshot(session_delete_request(
+            Some("Bearer test-token"),
+            "sess-del",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+
+    // The transcript is gone, the stashed title is dropped, and the session is no
+    // longer resumable (a resume now falls to a fresh session).
+    assert!(!transcript.exists(), "transcript file must be deleted");
+    assert!(
+        st.titles.get("sess-del").is_none(),
+        "stashed title must be dropped on delete"
+    );
+    assert!(
+        resolve_resume_session(&cfg, Some("sess-del")).is_none(),
+        "a deleted session must no longer be resumable"
+    );
+
+    // A repeat delete of the now-gone id is still idempotent success.
+    let resp2 = app(st)
+        .oneshot(session_delete_request(
+            Some("Bearer test-token"),
+            "sess-del",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp2.status(), StatusCode::NO_CONTENT, "repeat delete idempotent");
 
     let _ = std::fs::remove_dir_all(&home);
 }

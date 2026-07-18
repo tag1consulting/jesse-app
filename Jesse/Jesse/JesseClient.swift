@@ -707,6 +707,14 @@ protocol JesseClientProtocol {
     func health() async throws -> BridgeHealth
     /// Best-effort request to stop an in-flight turn server-side. Idempotent.
     func cancelJob(jobId: String) async throws
+    /// Delete a thread's remote Claude Code session server-side
+    /// (`DELETE /jesse/session/{id}`). Fired when the user deletes a thread, so the
+    /// bridge reclaims the transcript too. Idempotent server-side: a missing session
+    /// (`404`) maps to success, exactly like `cancelJob`. Throws only on a genuine
+    /// transport/auth/5xx failure, so the durable drainer can leave it queued and
+    /// retry on the next foreground. Default no-op so fakes that don't exercise it
+    /// need not implement it. See `deleteSession` on `JesseClient`.
+    func deleteSession(_ sessionId: String) async throws
     /// Live token stream for a running turn (`GET /jesse/stream/{job_id}`). Yields
     /// `reset`/`delta`/`activity` frames as the reply builds, then exactly one
     /// terminal frame (`done`/`failed`/`cancelled`). Throws on a transport/auth
@@ -764,6 +772,10 @@ extension JesseClientProtocol {
     // the push methods; only the production `JesseClient` does the real calls.
     func registerDevice(token: String) async throws {}
     func notifyOnComplete(jobId: String) async throws {}
+    // Default no-op so fakes that don't exercise remote session deletion behave
+    // like a bridge that always succeeds; the production `JesseClient` and the
+    // deletion-drainer test's fake implement the real call.
+    func deleteSession(_ sessionId: String) async throws {}
     // Default "no title": a fake that doesn't opt into titling degrades exactly
     // like a bridge without the endpoint (the row keeps its derived title).
     func title(forDigest digest: String) async -> String? { nil }
@@ -1036,6 +1048,34 @@ struct JesseClient: JesseClientProtocol {
         }
         guard let http = resp as? HTTPURLResponse else { throw JesseError.decoding }
         // 2xx (the bridge replies 204) or 404 (nothing left to cancel) → success.
+        if (200..<300).contains(http.statusCode) || http.statusCode == 404 { return }
+        throw JesseError.badResponse(http.statusCode,
+                                     String(data: data, encoding: .utf8) ?? "")
+    }
+
+    /// Delete a thread's remote Claude Code session (`DELETE /jesse/session/{id}`).
+    /// Mirrors `cancelJob`'s URL build + bearer auth + idempotent-404 handling: the
+    /// bridge returns `204` for a real delete AND for an unknown/already-gone id, and
+    /// a `404` (a bridge that no longer knows the id) is treated as success too —
+    /// there's nothing left to delete. Throws only on a genuine transport/auth/5xx
+    /// failure, so the durable drainer can leave the tombstone queued and retry later.
+    func deleteSession(_ sessionId: String) async throws {
+        guard !config.normalizedHost.isEmpty, !config.token.isEmpty,
+              let url = config.endpoint("/jesse/session/\(sessionId)") else {
+            throw JesseError.notConfigured
+        }
+        var req = URLRequest(url: url)
+        req.httpMethod = "DELETE"
+        req.setValue("Bearer \(config.token)", forHTTPHeaderField: "Authorization")
+
+        let data: Data, resp: URLResponse
+        do {
+            (data, resp) = try await session.data(for: req)
+        } catch {
+            throw JesseError.from(error, host: config.normalizedHost)
+        }
+        guard let http = resp as? HTTPURLResponse else { throw JesseError.decoding }
+        // 2xx (the bridge replies 204) or 404 (nothing left to delete) → success.
         if (200..<300).contains(http.statusCode) || http.statusCode == 404 { return }
         throw JesseError.badResponse(http.statusCode,
                                      String(data: data, encoding: .utf8) ?? "")

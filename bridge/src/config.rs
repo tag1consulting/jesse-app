@@ -27,6 +27,14 @@ pub const DEFAULT_RETRIEVAL_GRACE_SECS: u64 = 600;
 // unavailable permit sheds immediately, the pre-queue behavior).
 pub const DEFAULT_MAX_QUEUED: usize = 4;
 
+// Age, in days, past which the session GC sweep reclaims a vault-project Claude
+// Code session (env `JESSE_SESSION_TTL_DAYS`). Resuming a session touches its
+// jsonl mtime, so the sweep never reclaims an actively-used thread — only the
+// orphans (a swipe-delete whose remote delete never reached the bridge, and
+// everything deleted locally before the delete-on-thread-delete flow existed).
+// 90 days is a generous floor well past any realistic active-thread gap.
+pub const DEFAULT_SESSION_TTL_DAYS: u64 = 90;
+
 // Hard timeout (seconds) for the contained read-only vault-QA child. Tighter
 // than a turn: the child reads a handful of vault files (Read/Grep/Glob, and the
 // qmd MCP search when configured) and answers from them — a bounded lookup, not
@@ -141,6 +149,13 @@ pub const DEFAULT_DISALLOWED_TOOLS: &str = "WebFetch";
 pub struct Config {
     pub token: String,
     pub vault: String,
+    // The bridge user's HOME, resolved ONCE at startup. Claude Code's session
+    // transcripts live under `<home>/.claude/projects/…`, so every session-path
+    // lookup (`sessions_dir`, `session_transcript_exists`, the GC sweep) reads THIS
+    // rather than the process env at call time. HOME never changes during a run, so
+    // this is behavior-identical in production; capturing it makes the session paths
+    // deterministic and testable without mutating a process-global.
+    pub home: String,
     pub bind: String,
     pub port: u16,
     pub claude_bin: String,
@@ -168,6 +183,12 @@ pub struct Config {
     // Once a completed job has been fetched once, how much longer it's kept (a
     // short grace so a re-poll still works) instead of the full TTL.
     pub retrieval_grace_secs: u64,
+    // Age, in DAYS, past which the background session GC sweep reclaims a
+    // vault-project Claude Code session jsonl (env `JESSE_SESSION_TTL_DAYS`,
+    // default `DEFAULT_SESSION_TTL_DAYS` = 90). The sweep keys on file mtime, and
+    // resuming a session touches its mtime, so a session younger than this is
+    // NEVER deleted — only orphaned transcripts older than the TTL are reclaimed.
+    pub session_ttl_days: u64,
     // Directory under which completed job results are persisted (one JSON file
     // per job, under `<state_dir>/jobs`) so a bridge restart / laptop reboot
     // doesn't lose a finished-but-unretrieved reply. None disables persistence
@@ -491,6 +512,8 @@ impl Config {
         let home = std::env::var("HOME").unwrap_or_default();
         Config {
             token: env_string("JESSE_TOKEN").unwrap_or_default(),
+            // Capture HOME once — session-path lookups read `cfg.home`, not the env.
+            home: home.clone(),
             vault: env_string("JESSE_VAULT").unwrap_or_else(|| format!("{home}/devel/tag1/jesse")),
             bind: env_string("JESSE_BIND").unwrap_or_else(|| "127.0.0.1".to_string()),
             port: env_parse("JESSE_PORT", 8765),
@@ -523,6 +546,7 @@ impl Config {
                 "JESSE_RETRIEVAL_GRACE_SECS",
                 DEFAULT_RETRIEVAL_GRACE_SECS,
             ),
+            session_ttl_days: env_parse("JESSE_SESSION_TTL_DAYS", DEFAULT_SESSION_TTL_DAYS),
             state_dir: env_string("JESSE_STATE_DIR").or_else(|| {
                 // Default: a dotdir under HOME. Empty HOME → no default
                 // (persistence off) rather than writing to a bare "/.jesse-bridge".
@@ -1017,6 +1041,24 @@ mod tests {
                 Some(val) => std::env::set_var(k, val),
                 None => std::env::remove_var(k),
             }
+        }
+    }
+
+    #[test]
+    fn session_ttl_days_defaults_to_90_and_honors_env() {
+        let _g = ENV_LOCK.lock_ok();
+        let saved = std::env::var("JESSE_SESSION_TTL_DAYS").ok();
+        std::env::remove_var("JESSE_SESSION_TTL_DAYS");
+        assert_eq!(Config::from_env().session_ttl_days, DEFAULT_SESSION_TTL_DAYS);
+        assert_eq!(DEFAULT_SESSION_TTL_DAYS, 90);
+        std::env::set_var("JESSE_SESSION_TTL_DAYS", "30");
+        assert_eq!(Config::from_env().session_ttl_days, 30);
+        // Unparseable falls back to the default.
+        std::env::set_var("JESSE_SESSION_TTL_DAYS", "nope");
+        assert_eq!(Config::from_env().session_ttl_days, DEFAULT_SESSION_TTL_DAYS);
+        match saved {
+            Some(v) => std::env::set_var("JESSE_SESSION_TTL_DAYS", v),
+            None => std::env::remove_var("JESSE_SESSION_TTL_DAYS"),
         }
     }
 
