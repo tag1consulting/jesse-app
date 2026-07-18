@@ -15,6 +15,15 @@ CI both run it). See the "Versioning" section of `bridge/README.md`.
 
 ## [Unreleased]
 
+## [App 1.0 (51)] — 2026-07-18
+
+### Changed
+- **Enable `JESSE_MUTE=1` by default in the shared `Jesse` scheme's Run environment**,
+  so local Xcode/`xcodebuild` debug launches (Run, Test, Profile — all inherit via
+  `shouldUseLaunchSchemeArgsEnv`) no longer speak aloud or duck other audio. Scheme
+  environment variables apply only to debug launches, never to installed/TestFlight
+  builds, so shipped builds speak exactly as before.
+
 ## [App 1.0 (50)] — 2026-07-18
 
 ### Added
