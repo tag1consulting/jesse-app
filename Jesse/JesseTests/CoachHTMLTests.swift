@@ -6,6 +6,7 @@ import XCTest
 // crashing. Asserted on the tokenizer's `segments` seam (the AttributedString
 // assembly is a thin wrapper over it).
 
+@MainActor
 final class CoachHTMLTests: XCTestCase {
 
     func testStrongBecomesBoldRun() {

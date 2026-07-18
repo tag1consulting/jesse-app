@@ -7,6 +7,7 @@ import Security
 /// injected SecItem seams against an in-memory backend (the test bundle lacks
 /// Keychain entitlements), proving what's written reads back, and that an empty
 /// Keychain loads the defaults.
+@MainActor
 final class ConfigStoreRoundTripTests: XCTestCase {
 
     override func tearDown() {

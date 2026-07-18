@@ -2,6 +2,7 @@ import XCTest
 import SwiftData
 @testable import Jesse
 
+@MainActor
 final class RunCoordinatorCancelTests: XCTestCase {
 
     /// Drives the coordinator's poll loop without a server: `send` reports the

@@ -7,6 +7,7 @@ import XCTest
 // stable tie-breaking, the share math, the empty/partial states, and the
 // reconciliation guard that refuses to show a list contradicting the headline.
 
+@MainActor
 final class FoodContributionsTests: XCTestCase {
 
     // MARK: - Fixtures

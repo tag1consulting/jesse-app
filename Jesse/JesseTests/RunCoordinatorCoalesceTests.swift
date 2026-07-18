@@ -15,6 +15,7 @@ import SwiftData
 /// ends and cancels it). The observed publish count is then exactly two — the first
 /// delta's immediate publish plus the terminal tail flush — for any number of
 /// chunks.
+@MainActor
 final class RunCoordinatorCoalesceTests: XCTestCase {
 
     /// A hand-driven streaming client (mirrors `RunCoordinatorStreamTests`), kept

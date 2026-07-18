@@ -1,9 +1,18 @@
 import XCTest
 @testable import Jesse
 
+/// A one-shot flag a `@Sendable` closure can set without capturing a mutable `var`
+/// (forbidden in a Sendable closure). `@unchecked Sendable` is safe here because the
+/// only writer is the injected model closure, which the union invokes sequentially.
+private final class CallFlag: @unchecked Sendable {
+    private(set) var fired = false
+    func fire() { fired = true }
+}
+
 /// The classify-then-attach floor: the keyword tier (pure, word-boundary aware),
 /// the union of the two tiers, and the pure gate. The on-device model tier is
 /// unavailable in the Simulator, so the union is tested through injected closures.
+@MainActor
 final class HealthRelevanceClassifierTests: XCTestCase {
 
     // MARK: - Tier 0 keyword floor
@@ -57,13 +66,16 @@ final class HealthRelevanceClassifierTests: XCTestCase {
     // MARK: - Union of the two tiers
 
     func testUnionKeywordHitShortCircuitsModel() async {
-        var modelCalled = false
+        // A reference box, not a captured `var`: the `@Sendable` model closure can't
+        // mutate a local `var`. The union calls keyword then model sequentially, so
+        // the box is only ever touched from one task — `@unchecked Sendable` is safe.
+        let modelCalled = CallFlag()
         let union = UnionHealthClassifier(
             keyword: { _ in true },
-            model: { _ in modelCalled = true; return false })
+            model: { _ in modelCalled.fire(); return false })
         let relevant = await union.isRelevant("log my swim")
         XCTAssertTrue(relevant)
-        XCTAssertFalse(modelCalled, "a Tier 0 hit must not consult the model")
+        XCTAssertFalse(modelCalled.fired, "a Tier 0 hit must not consult the model")
     }
 
     func testUnionModelSaysYesWhenKeywordMisses() async {

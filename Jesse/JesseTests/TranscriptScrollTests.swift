@@ -1,6 +1,7 @@
 import XCTest
 @testable import Jesse
 
+@MainActor
 final class TranscriptScrollTests: XCTestCase {
 
     // MARK: - shouldAutoScroll: trigger × position

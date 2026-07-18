@@ -6,6 +6,7 @@ import XCTest
 // itself isn't exercised here; `filterExpansionTerms` is the deterministic core
 // that shapes whatever the model returns. This file does NOT import FoundationModels
 // — proving the filter is usable without the model framework.
+@MainActor
 final class FoundationModelExpanderTests: XCTestCase {
 
     func testTrimsAndDropsBlanks() {

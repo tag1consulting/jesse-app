@@ -2,6 +2,7 @@ import XCTest
 import SwiftData
 @testable import Jesse
 
+@MainActor
 final class FavoritesTests: XCTestCase {
 
     private func date(_ y: Int, _ m: Int, _ d: Int) -> Date {

@@ -4,6 +4,7 @@ import XCTest
 /// Reply-dedup-by-requestId. The phone answers on two paths (reliable
 /// `transferUserInfo` + immediate `sendMessage`), so the watch can see one reply
 /// twice; the deduper keeps the first and drops the rest.
+@MainActor
 final class ReplyDeduperTests: XCTestCase {
 
     func testFirstDeliveryPasses() {

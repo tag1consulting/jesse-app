@@ -7,6 +7,7 @@ import XCTest
 // bar iterates (`CalorieSplit.fraction(for:)`), so the shipped Fat-before-Fiber
 // order can't come back through a view body.
 
+@MainActor
 final class MacroOrderTests: XCTestCase {
     typealias S = DietSemantics
 

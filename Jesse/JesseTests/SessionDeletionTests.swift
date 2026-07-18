@@ -6,6 +6,7 @@ import XCTest
 /// `DELETE /jesse/session/{id}` best-effort — clearing the tombstone on success
 /// (incl. the bridge's idempotent 404) and leaving it for the next foreground on a
 /// network failure. Driven through the existing `JesseClientProtocol` seam.
+@MainActor
 final class SessionDeletionTests: XCTestCase {
 
     /// A fake conforming to the existing client seam. Records `deleteSession` calls

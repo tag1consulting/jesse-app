@@ -11,6 +11,7 @@ import Security
 ///
 /// Driven through the same injectable `addItem` seam `ConfigStoreKeychainTests`
 /// uses, so no real Keychain is touched.
+@MainActor
 final class SettingsSaveTests: XCTestCase {
 
     override func tearDown() {

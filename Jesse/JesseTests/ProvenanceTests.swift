@@ -7,6 +7,7 @@ import XCTest
 /// instead. When provenance is ABSENT (older bridge / badges off) the text is shown
 /// verbatim. The exact strings are pinned by the shared bridge fixture, read here from
 /// disk so the app and the bridge can never drift.
+@MainActor
 final class ProvenanceTests: XCTestCase {
 
     private func http(_ status: Int) -> HTTPURLResponse {

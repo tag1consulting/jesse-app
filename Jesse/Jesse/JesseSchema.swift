@@ -39,7 +39,7 @@ import SwiftData
 /// The original version of the app's persistent schema (through the whole additive
 /// lineage above — all lightweight-compatible).
 enum JesseSchemaV1: VersionedSchema {
-    static var versionIdentifier = Schema.Version(1, 0, 0)
+    static let versionIdentifier = Schema.Version(1, 0, 0)
 
     static var models: [any PersistentModel.Type] {
         [JesseThread.self, Turn.self, TurnAttachment.self, WrittenMeal.self]
@@ -49,7 +49,7 @@ enum JesseSchemaV1: VersionedSchema {
 /// V2 — adds the send outbox (`OutboxItem` + `OutboxAttachment`). Additive-only, so
 /// V1 → V2 is a lightweight stage.
 enum JesseSchemaV2: VersionedSchema {
-    static var versionIdentifier = Schema.Version(2, 0, 0)
+    static let versionIdentifier = Schema.Version(2, 0, 0)
 
     static var models: [any PersistentModel.Type] {
         [JesseThread.self, Turn.self, TurnAttachment.self, WrittenMeal.self,

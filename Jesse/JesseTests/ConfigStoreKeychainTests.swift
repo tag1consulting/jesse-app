@@ -6,6 +6,7 @@ import Security
 /// Keychain (or a missing entitlement) silently lost the token. `save` now reports
 /// whether every field persisted. Driven through the injectable `addItem` seam so
 /// no real Keychain is touched.
+@MainActor
 final class ConfigStoreKeychainTests: XCTestCase {
 
     override func tearDown() {

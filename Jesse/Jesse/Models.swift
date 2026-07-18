@@ -27,7 +27,11 @@ enum ThreadOrigin: String {
 /// slot it never reassigns, so reading it registers no SwiftUI re-render dependency
 /// and mutating the box's fields can't trigger an observation loop during a body
 /// evaluation. Reset to empty whenever a fetched model is materialized.
-private final class OrderedTurnsMemo {
+// `nonisolated` so it matches the isolation of `JesseThread`'s `@Model`-generated
+// accessors (which run outside the module's default main-actor isolation). The box
+// is reachable only through a single non-Sendable `JesseThread`, never shared
+// across isolation domains, so its in-place mutation can't race.
+private nonisolated final class OrderedTurnsMemo {
     var cache: [Turn]?
     var count = -1
     var sortCount = 0

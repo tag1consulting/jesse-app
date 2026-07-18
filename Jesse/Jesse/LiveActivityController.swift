@@ -84,11 +84,23 @@ final class TurnLiveActivityController: TurnLiveActivityManaging {
 
     private func update(threadID: UUID, content: JesseTurnActivityAttributes.ContentState) {
         guard let activity = activities[threadID] else { return }
-        Task { await activity.update(ActivityContent(state: content, staleDate: nil)) }
+        // `Activity.update` is a `@concurrent` method and ActivityKit doesn't mark
+        // `Activity` as `Sendable`, so the fire-and-forget task's use of the handle
+        // trips the sending check. The handle is a thread-safe reference to a
+        // system-managed Live Activity, and updating it off the main actor is exactly
+        // ActivityKit's intended use — so the capture is `nonisolated(unsafe)`: safe
+        // by the framework's own contract, not a silenced race.
+        nonisolated(unsafe) let handle = activity
+        Task { await handle.update(ActivityContent(state: content, staleDate: nil)) }
     }
 
     private func end(threadID: UUID) {
         guard let activity = activities.removeValue(forKey: threadID) else { return }
-        Task { await activity.end(nil, dismissalPolicy: .immediate) }
+        // Same as `update`: `Activity.end` is `@concurrent` on a non-Sendable handle.
+        // The activity is removed from the dict first, so nothing else references it;
+        // handing it to the ending task is safe by ActivityKit's contract, hence the
+        // `nonisolated(unsafe)` capture.
+        nonisolated(unsafe) let handle = activity
+        Task { await handle.end(nil, dismissalPolicy: .immediate) }
     }
 }

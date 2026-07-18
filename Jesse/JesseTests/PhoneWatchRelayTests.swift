@@ -9,6 +9,7 @@ import SwiftData
 /// thread is tagged `.watch`, the reply carries displayText/spokenText, the
 /// dictation fallback bypasses transcription, and a transcription failure yields a
 /// clean `ok: false` reply that never even starts a turn.
+@MainActor
 final class PhoneWatchRelayTests: XCTestCase {
 
     /// Records the audio it was handed and returns a scripted transcript (or nil).

@@ -9,6 +9,7 @@ import SwiftUI
 // and the fixed per-nutrient education copy — so a regression can't quietly re-flatten
 // the tree, flip a gauge, or drop the teaching.
 
+@MainActor
 final class NutrientTreeTests: XCTestCase {
     typealias S = DietSemantics
 

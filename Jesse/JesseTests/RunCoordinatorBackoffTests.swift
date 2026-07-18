@@ -2,10 +2,19 @@ import XCTest
 import SwiftData
 @testable import Jesse
 
+/// A main-actor holder that breaks the coordinator↔pollSleep construction cycle: a
+/// `let` box the injected closure captures, whose `coordinator` is filled in once the
+/// coordinator exists. Main-actor-isolated (hence `Sendable`) and only ever touched
+/// on the main actor.
+@MainActor private final class CoordinatorBox {
+    weak var coordinator: RunCoordinator?
+}
+
 /// (H6) The poll loop must back off geometrically toward a ceiling instead of
 /// hammering `GET /jesse/result` every 2s forever, and snap back to the fast
 /// cadence when the live stream shows the turn is still producing tokens. Driven
 /// through an injected sleep seam so the delays are observed without real waiting.
+@MainActor
 final class RunCoordinatorBackoffTests: XCTestCase {
 
     /// A client whose `result` returns `.running` for the first `runningCount`
@@ -76,17 +85,22 @@ final class RunCoordinatorBackoffTests: XCTestCase {
     @MainActor
     func testPollDelayResetsOnStreamActivity() async throws {
         var recorded: [TimeInterval] = []
-        var coordinator: RunCoordinator!
         let threadID = UUID()
-        coordinator = RunCoordinator(
+        // The pollSleep closure needs the coordinator that owns it — a construction
+        // cycle. Hold it in a main-actor box assigned once after init, so the closure
+        // captures a stable `let` reference rather than a `var` reassigned after
+        // capture (which the Swift 6 sending check flags).
+        let box = CoordinatorBox()
+        let coordinator = RunCoordinator(
             config: { JesseConfig(host: "laptop", port: 8765, token: "tok") },
             makeClient: { _ in CountingClient(runningCount: 0) },
             pollSleep: { interval in
                 recorded.append(interval)
                 // After the 2nd (already backed-off) sleep, simulate the live stream
                 // delivering a delta — the next poll must snap back to the fast cadence.
-                if recorded.count == 2 { coordinator.noteStreamActivity(threadID) }
+                if recorded.count == 2 { box.coordinator?.noteStreamActivity(threadID) }
             })
+        box.coordinator = coordinator
 
         let client = CountingClient(runningCount: 4)
         let outcome = await coordinator.pollForOutcome(threadID: threadID, jobId: "job-backoff",

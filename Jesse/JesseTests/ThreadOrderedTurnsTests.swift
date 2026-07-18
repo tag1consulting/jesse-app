@@ -8,6 +8,7 @@ import SwiftData
 /// stream doesn't re-sort the whole thread hundreds of times. This pins the
 /// memoization: repeated reads with no mutation perform exactly one sort, and an
 /// append invalidates the cache so ordering stays correct.
+@MainActor
 final class ThreadOrderedTurnsTests: XCTestCase {
 
     @MainActor

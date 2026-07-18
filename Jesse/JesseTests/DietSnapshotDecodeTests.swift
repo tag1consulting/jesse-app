@@ -5,6 +5,7 @@ import XCTest
 // (null sections + a non-empty errors array), unknown-key tolerance, and the
 // status→error mapping in `JesseClient.decodeDiet`.
 
+@MainActor
 final class DietSnapshotDecodeTests: XCTestCase {
 
     private func decode(_ json: String) throws -> DietSnapshot {

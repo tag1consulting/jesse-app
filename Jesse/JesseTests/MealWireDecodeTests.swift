@@ -5,6 +5,7 @@ import XCTest
 /// SSE `done` frame) and the `JesseReply.mealsToLog` validation seam. Pins the
 /// snake_case macro keys and the camelCase `consumedAt`, and that an absent block
 /// decodes to nil (the common case).
+@MainActor
 final class MealWireDecodeTests: XCTestCase {
 
     private func decodeResult(_ json: String) throws -> JesseResultResponse {

@@ -5,6 +5,7 @@ import AVFoundation
 /// Covers `CameraCapture` — the pure decision helpers behind in-app camera capture
 /// (the UI/`UIImagePickerController` bridge itself isn't unit-testable and needs a
 /// device camera).
+@MainActor
 final class CameraCaptureTests: XCTestCase {
 
     func testAuthorizedPresents() {

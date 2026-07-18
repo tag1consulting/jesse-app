@@ -6,6 +6,7 @@ import XCTest
 /// (a) the exact request bytes on the wire — so the bridge contract is unchanged —
 /// and (b) the decode of every response shape, including the omit-when-default
 /// behavior the old conditionally-built dictionary had.
+@MainActor
 final class JesseWireContractTests: XCTestCase {
 
     private func http(_ status: Int, path: String = "/jesse") -> HTTPURLResponse {

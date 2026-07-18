@@ -6,6 +6,7 @@ import XCTest
 /// (empty, over-cap, blank field, bad date, bad macro) collapsing the WHOLE block
 /// to nil (never a partial write); plus the display scrubber (strip a trailing v1
 /// line, keep prose, leave an unknown version visible).
+@MainActor
 final class MealLogParserTests: XCTestCase {
 
     private func meal(id: String = "2026-07-04-lunch",

@@ -101,7 +101,7 @@ enum AttachmentLimits {
     }
 }
 
-struct JesseConfig {
+struct JesseConfig: Sendable {
     /// The bridge's default port (`JESSE_PORT`), used when a pairing payload or a
     /// stored config omits/can't parse one.
     static let defaultPort = 8765
@@ -669,7 +669,13 @@ nonisolated struct JesseTitleResponse: Decodable {
 /// The two bridge calls the coordinator drives a turn with. Pulled behind a
 /// protocol purely so a fake can exercise the poll loop in tests without a
 /// server; `JesseClient` is the only production conformer.
-protocol JesseClientProtocol {
+///
+/// `Sendable` because the coordinator races a turn's stream and poll in two
+/// concurrent child tasks (`consume`), so the client value crosses into them. The
+/// production `JesseClient` is an immutable value of `Sendable` parts (config,
+/// `URLSession`s, `Sendable` provider/classifier existentials, `@Sendable`
+/// closures); test doubles are main-actor-isolated (hence `Sendable`) or declare it.
+protocol JesseClientProtocol: Sendable {
     func send(mode: JesseMode, text: String, sessionId: String?, voice: Bool,
               instructions: String?, floorOverride: String?,
               attachments: [JesseAttachment]) async throws -> JesseSendResult

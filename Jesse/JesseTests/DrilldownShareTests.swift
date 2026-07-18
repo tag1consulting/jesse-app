@@ -6,6 +6,7 @@ import XCTest
 // and the insight when present) regardless of where on-screen text selection has
 // gaps. Plain text on purpose: it pastes cleanly with no markdown scaffolding.
 
+@MainActor
 final class DrilldownShareTests: XCTestCase {
 
     private func item(_ name: String, c: Double? = nil, amount: String? = nil,

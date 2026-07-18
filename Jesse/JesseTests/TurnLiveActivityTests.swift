@@ -5,6 +5,7 @@ import XCTest
 /// (`request`/`update`/`end`) need a real device, but the *decision* of when to
 /// begin, update, end, or do nothing — and the content it carries — is pure and
 /// pinned here.
+@MainActor
 final class TurnLiveActivityTests: XCTestCase {
 
     private let started = Date(timeIntervalSince1970: 1_000_000)

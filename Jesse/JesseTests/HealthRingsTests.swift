@@ -8,6 +8,7 @@ import XCTest
 // the real `DietSemantics.gauges` so a flip that the engine makes is the flip the
 // ring draws — the two can never disagree.
 
+@MainActor
 final class HealthRingsTests: XCTestCase {
     typealias S = DietSemantics
 

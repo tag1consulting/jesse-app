@@ -8,6 +8,7 @@ import SwiftData
 /// updates incrementally, that exactly one persisted `Turn` is created on `done`,
 /// that a dropped stream falls back to polling, and that a `cancelled` frame is
 /// treated as the user's own cancel (no Turn, no error).
+@MainActor
 final class RunCoordinatorStreamTests: XCTestCase {
 
     /// A client whose `stream` is driven by hand: the test yields events and then
