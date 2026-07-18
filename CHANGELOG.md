@@ -15,6 +15,28 @@ CI both run it). See the "Versioning" section of `bridge/README.md`.
 
 ## [Unreleased]
 
+## [Bridge 0.21.0] — 2026-07-18
+
+### Added
+- **`nutrientSeries` on `GET /jesse/diet`** — one additive top-level field, a
+  per-day, per-nutrient aggregate over `food-log.csv` history, for the app's
+  per-nutrient trend charts and multi-window coaching. Built from the SAME
+  single `food-log.csv` read as `weightSeries`/`availableDays` and attached to
+  BOTH the today and history responses. A JSON array, one object per date
+  ascending, capped to the most recent **90** dates (older dates dropped; the app
+  labels the range). Each day is `{ date, nutrients: { <key>: { sum, known,
+  unknown }, … } }` over keys `cal/p/f/c/fiber/na/satf/sug/k/ca/o3/mg/unsat`
+  (`unsat` = `Fat_g − SatFat_g`, known only when both are known, clamped ≥ 0).
+  **Unknown is not zero**, matching the rest of the micronutrient stack: a blank
+  cell is an unknown contribution (excluded from `sum`, counted in `unknown`),
+  never a 0; a nutrient with no known contributor on a day is OMITTED for that day
+  (the app renders a gap), and a day with no known nutrient at all is omitted
+  entirely. Targets/medians/trends stay the app's math, not the bridge's. A
+  missing/unreadable `food-log.csv` yields `[]` (never null) plus one diagnostic in
+  `errors`, the way `weightSeries` reports. Changes nothing else — today
+  pass-through, per-item day reconstruction, targets, `weightSeries`, and the CSV
+  are all untouched.
+
 ## [App 1.0 (52)] — 2026-07-18
 
 ### Added

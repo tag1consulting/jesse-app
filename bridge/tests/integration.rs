@@ -2208,6 +2208,7 @@ fn diet_state_full() -> (AppState, std::path::PathBuf) {
     write_vault_file(&vault, "todo-list/diet-coach-notes.js", FIX_COACH);
     write_vault_file(&vault, "todo-list/proposed-diet-today.js", FIX_PROPOSED);
     write_vault_file(&vault, "diet-logs/weight-log.csv", FIX_WEIGHT_CSV);
+    write_vault_file(&vault, "diet-logs/food-log.csv", FIX_FOOD_CSV);
     let cfg = Config {
         vault: vault.to_string_lossy().into_owned(),
         ..test_config()
@@ -2332,6 +2333,32 @@ async fn diet_happy_path_returns_full_normalized_snapshot() {
     assert!(ws[1]["bf"].is_null(), "blank bf cell → null");
     assert!(ws[1]["leanLbs"].is_null(), "blank MuscleMass cell → null");
     assert_eq!(ws[2]["lbs"], 197.4);
+
+    // nutrientSeries: per-day, per-nutrient aggregate from the SAME food-log.csv,
+    // unknown-aware. FIX_FOOD_CSV has one day (2026-04-15, four items); its header
+    // stops at Fiber_g so every micro is unknown → those keys are omitted.
+    let ns = body["nutrientSeries"].as_array().unwrap();
+    assert_eq!(ns.len(), 1, "one day in the food log");
+    assert_eq!(ns[0]["date"], "2026-04-15");
+    let n = &ns[0]["nutrients"];
+    // cal: Banana's Calories cell is blank → UNKNOWN (excluded from the sum, NOT 0);
+    // the other three are known. This is the whole unknown-is-not-zero contract.
+    assert_eq!(
+        n["cal"]["sum"], 930.0,
+        "300 + 450 + 180; Banana blank excluded"
+    );
+    assert_eq!(n["cal"]["known"], 3);
+    assert_eq!(n["cal"]["unknown"], 1);
+    // Macros present on every row → all-known.
+    assert_eq!(n["p"]["sum"], 38.0);
+    assert_eq!(n["p"]["known"], 4);
+    assert_eq!(n["fiber"]["sum"], 16.0);
+    assert_eq!(n["fiber"]["known"], 4);
+    // No micro columns in this fixture → their keys (and derived unsat, which needs
+    // SatFat_g) are omitted for the day.
+    assert!(n.get("na").is_none(), "no Sodium_mg column → key omitted");
+    assert!(n.get("k").is_none(), "no Potassium_mg column → key omitted");
+    assert!(n.get("unsat").is_none(), "no SatFat_g → unsat omitted");
 
     let _ = std::fs::remove_dir_all(&vault);
 }
@@ -3162,7 +3189,11 @@ async fn session_delete_removes_transcript_and_makes_it_unresumable() {
         .join(escape_project_path(&vault));
     std::fs::create_dir_all(&proj).unwrap();
     let transcript = proj.join("sess-del.jsonl");
-    std::fs::write(&transcript, "{\"type\":\"user\",\"message\":{\"content\":\"hi\"}}\n").unwrap();
+    std::fs::write(
+        &transcript,
+        "{\"type\":\"user\",\"message\":{\"content\":\"hi\"}}\n",
+    )
+    .unwrap();
 
     let cfg = Config {
         home: home.to_string_lossy().into_owned(),
@@ -3209,7 +3240,11 @@ async fn session_delete_removes_transcript_and_makes_it_unresumable() {
         ))
         .await
         .unwrap();
-    assert_eq!(resp2.status(), StatusCode::NO_CONTENT, "repeat delete idempotent");
+    assert_eq!(
+        resp2.status(),
+        StatusCode::NO_CONTENT,
+        "repeat delete idempotent"
+    );
 
     let _ = std::fs::remove_dir_all(&home);
 }
