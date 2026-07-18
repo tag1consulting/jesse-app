@@ -4147,3 +4147,220 @@ async fn invalid_request_id_is_400_json_and_spawns_nothing() {
     let _ = std::fs::remove_file(&fake);
     let _ = std::fs::remove_file(&counter);
 }
+
+// ===========================================================================
+// Opt-in shadow comparison (JESSE_SHADOW_*)
+// ===========================================================================
+
+/// A shadow-armed config over a fake `claude` whose behavior BRANCHES on
+/// `ANTHROPIC_BASE_URL` — set only on the contained shadow child (via
+/// `apply_shadow_env`), never on the hosted turn — so one script drives both sides.
+fn shadow_config(fake: &std::path::Path, log: &std::path::Path) -> Config {
+    Config {
+        claude_bin: fake.to_string_lossy().into_owned(),
+        timeout_secs: 20,
+        shadow_backend: Some((
+            "https://gw.example".to_string(),
+            "gw-secret-token".to_string(),
+            "fw-glm".to_string(),
+        )),
+        shadow_sample_pct: 100,
+        shadow_log: log.to_string_lossy().into_owned(),
+        ..test_config()
+    }
+}
+
+async fn post_ask_and_wait_done(st: &AppState, text: &str) -> Value {
+    let resp = app(st.clone())
+        .oneshot(jesse_request(
+            Some("Bearer test-token"),
+            &format!(r#"{{"mode":"ask","text":"{text}"}}"#),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::ACCEPTED);
+    let body: Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    let job_id = body["job_id"].as_str().unwrap().to_string();
+    for _ in 0..80 {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let v = result_status(st, &job_id).await;
+        if v["status"] == "done" {
+            let mut v = v;
+            v["job_id"] = Value::String(job_id);
+            return v;
+        }
+    }
+    panic!("turn never reached done");
+}
+
+/// Poll the shadow log for the pair belonging to `turn_id`, up to ~4s.
+fn read_pair(log: &std::path::Path, turn_id: &str) -> Option<ShadowPair> {
+    let body = std::fs::read_to_string(log).ok()?;
+    parse_shadow_pairs(&body)
+        .into_iter()
+        .find(|p| p.turn_id == turn_id)
+}
+
+#[tokio::test]
+async fn shadow_disarmed_vs_armed_delivers_byte_for_byte_identical() {
+    // GOLDEN: the delivered reply (text + session id) is identical whether shadow is
+    // armed or not — arming shadow changes nothing on the production path.
+    let script = "#!/bin/sh\n\
+        if [ -n \"$ANTHROPIC_BASE_URL\" ]; then\n\
+          printf '%s' '{\"type\":\"result\",\"is_error\":false,\"result\":\"shadow answer\",\"session_id\":\"s\",\"usage\":{\"input_tokens\":100,\"output_tokens\":20}}'\n\
+        else\n\
+          printf '%s' '{\"type\":\"result\",\"is_error\":false,\"result\":\"the hosted answer\",\"session_id\":\"sess-1\"}'\n\
+        fi\n";
+    let fake = write_fake_claude(script);
+
+    // Unarmed.
+    let st_off = AppState::new(Config {
+        claude_bin: fake.to_string_lossy().into_owned(),
+        timeout_secs: 20,
+        ..test_config()
+    });
+    let off = post_ask_and_wait_done(&st_off, "same question").await;
+
+    // Armed (distinct log).
+    let log =
+        std::env::temp_dir().join(format!("jesse-shadow-golden-{}.jsonl", std::process::id()));
+    let _ = std::fs::remove_file(&log);
+    let st_on = AppState::new(shadow_config(&fake, &log));
+    let on = post_ask_and_wait_done(&st_on, "same question").await;
+
+    assert_eq!(
+        off["response"], on["response"],
+        "delivered text must be identical"
+    );
+    assert_eq!(off["response"], "the hosted answer");
+    assert_eq!(
+        off["session_id"], on["session_id"],
+        "delivered session id must be identical"
+    );
+
+    let _ = std::fs::remove_file(&fake);
+    let _ = std::fs::remove_file(&log);
+}
+
+#[tokio::test]
+async fn shadow_armed_mirrors_an_eligible_ask_and_logs_a_complete_pair() {
+    let script = "#!/bin/sh\n\
+        if [ -n \"$ANTHROPIC_BASE_URL\" ]; then\n\
+          printf '%s\\n' '{\"type\":\"stream_event\",\"event\":{\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\"shadow says hi\"}}}'\n\
+          printf '%s' '{\"type\":\"result\",\"is_error\":false,\"result\":\"shadow says hi\",\"session_id\":\"s\",\"usage\":{\"input_tokens\":1200,\"output_tokens\":80,\"cache_read_input_tokens\":40}}'\n\
+        else\n\
+          printf '%s' '{\"type\":\"result\",\"is_error\":false,\"result\":\"hosted answer text\",\"session_id\":\"sess-x\"}'\n\
+        fi\n";
+    let fake = write_fake_claude(script);
+    let log = std::env::temp_dir().join(format!("jesse-shadow-pair-{}.jsonl", std::process::id()));
+    let _ = std::fs::remove_file(&log);
+    let st = AppState::new(shadow_config(&fake, &log));
+
+    let done = post_ask_and_wait_done(&st, "mirror me").await;
+    assert_eq!(done["response"], "hosted answer text");
+    let job_id = done["job_id"].as_str().unwrap().to_string();
+
+    let mut pair = None;
+    for _ in 0..80 {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        if let Some(p) = read_pair(&log, &job_id) {
+            pair = Some(p);
+            break;
+        }
+    }
+    let pair = pair.expect("an eligible ask must produce a shadow pair line");
+    assert_eq!(pair.outcome, "complete");
+    // Hosted text is the delivered (pre-badge) answer, captured from the jobstore seam.
+    assert_eq!(pair.hosted_text, "hosted answer text");
+    assert_eq!(pair.shadow_text.as_deref(), Some("shadow says hi"));
+    assert_eq!(pair.shadow_model, "fw-glm");
+    let usage = pair
+        .shadow_usage
+        .expect("shadow usage captured from the result line");
+    assert_eq!(usage.input_tokens, Some(1200));
+    assert_eq!(usage.output_tokens, Some(80));
+    assert!(
+        !pair.write_attempt,
+        "a read-only shadow child makes no write attempt"
+    );
+    // The delivered turn is untouched: the stored reply is still the hosted answer.
+    let after = result_status(&st, &job_id).await;
+    assert_eq!(after["response"], "hosted answer text");
+
+    let _ = std::fs::remove_file(&fake);
+    let _ = std::fs::remove_file(&log);
+}
+
+#[tokio::test]
+async fn shadow_child_error_records_an_incomplete_pair_and_leaves_the_turn_intact() {
+    // The shadow side returns a transport-class error envelope; the hosted turn
+    // succeeds. The pair is recorded INCOMPLETE (no shadow text) and swallowed.
+    let script = "#!/bin/sh\n\
+        if [ -n \"$ANTHROPIC_BASE_URL\" ]; then\n\
+          printf '%s' '{\"type\":\"result\",\"is_error\":true,\"result\":\"upstream 500\",\"api_error_status\":500}'\n\
+        else\n\
+          printf '%s' '{\"type\":\"result\",\"is_error\":false,\"result\":\"good hosted reply\",\"session_id\":\"sess-e\"}'\n\
+        fi\n";
+    let fake = write_fake_claude(script);
+    let log = std::env::temp_dir().join(format!("jesse-shadow-err-{}.jsonl", std::process::id()));
+    let _ = std::fs::remove_file(&log);
+    let st = AppState::new(shadow_config(&fake, &log));
+
+    let done = post_ask_and_wait_done(&st, "mirror me too").await;
+    assert_eq!(
+        done["response"], "good hosted reply",
+        "hosted turn unaffected by shadow failure"
+    );
+    let job_id = done["job_id"].as_str().unwrap().to_string();
+
+    let mut pair = None;
+    for _ in 0..80 {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        if let Some(p) = read_pair(&log, &job_id) {
+            pair = Some(p);
+            break;
+        }
+    }
+    let pair = pair.expect("a shadow error still records an (incomplete) pair");
+    assert_eq!(pair.outcome, "error");
+    assert!(
+        pair.shadow_text.is_none(),
+        "an errored shadow logs no answer"
+    );
+    assert!(pair.error.is_some());
+
+    let _ = std::fs::remove_file(&fake);
+    let _ = std::fs::remove_file(&log);
+}
+
+#[tokio::test]
+async fn shadow_never_mirrors_a_tell() {
+    // A Tell is never eligible: no pair is ever written even with shadow armed.
+    let script = "#!/bin/sh\nprintf '%s' '{\"type\":\"result\",\"is_error\":false,\"result\":\"noted\",\"session_id\":\"sess-t\"}'\n";
+    let fake = write_fake_claude(script);
+    let log = std::env::temp_dir().join(format!("jesse-shadow-tell-{}.jsonl", std::process::id()));
+    let _ = std::fs::remove_file(&log);
+    let st = AppState::new(shadow_config(&fake, &log));
+
+    let resp = app(st.clone())
+        .oneshot(jesse_request(
+            Some("Bearer test-token"),
+            r#"{"mode":"tell","text":"remember milk"}"#,
+        ))
+        .await
+        .unwrap();
+    let body: Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    let job_id = body["job_id"].as_str().unwrap().to_string();
+    for _ in 0..40 {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        if result_status(&st, &job_id).await["status"] == "done" {
+            break;
+        }
+    }
+    // Give any (erroneous) shadow task time to run, then assert the log is absent.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(!log.exists(), "a Tell must never be mirrored");
+
+    let _ = std::fs::remove_file(&fake);
+    let _ = std::fs::remove_file(&log);
+}

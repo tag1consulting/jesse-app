@@ -1,6 +1,6 @@
 [package]
 name = "jesse-bridge"
-version = "0.21.0"
+version = "0.22.0"
 edition = "2021"
 
 [dependencies]
@@ -36,6 +36,11 @@ reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-
 # emits the raw R||S signature JWS requires. ring is already in the graph (rustls'
 # crypto backend), so this adds no new TLS/crypto stack. Used only to sign the JWT.
 ring = "0.17"
+# libc: ONE syscall — setpriority(2) — to drop the opt-in shadow-comparison child
+# to a background nice value so a mirrored ask never contends for CPU with a live
+# phone turn (JESSE_SHADOW_*). Unix-only, best-effort (errors ignored). libc is
+# already deep in the graph (tokio/reqwest/ring), so naming it adds no new build.
+libc = "0.2"
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }   # ServiceExt::oneshot

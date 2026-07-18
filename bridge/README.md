@@ -1163,6 +1163,12 @@ cargo run --release
 | `JESSE_METRICS_LOG` | _(off)_ | Absolute path to a structured-metrics **JSONL** file. When set, the bridge appends **one content-free JSON line per gated / routed / emergency turn** at the reply-finalization point (ISO-8601 timestamp, turn id, mode, route [`hosted`/`vaultqa-local`/`diet-local`/`emergency-local`], backend model, ladder rung, wall ms, TTFT/tool-calls where recoverable, citation count + validator verdict, badge string, emergency flag, hosted-failure class). **Never** the question, answer, or tokens — content joins happen in the `vaultqa-audit` tool via the serving logs. All-or-nothing and soft: **unset (default) → zero metrics writes**, and a write failure logs to stderr and never disturbs the reply. Append-only, line-buffered, restart-safe |
 | `JESSE_EMERGENCY_LOCAL` | `off` | Arms the **emergency local fallback** (`on`/`off`). Inert unless it is **on** AND the `JESSE_VAULTQA_*` triple is also set (that supplies the backend + read-only child). When armed, a hosted turn that fails **transport-class** (spawn / network / timeout / CLI-surfaced 5xx / 429 / quota / auth — never a completed turn) is served locally instead of surfacing the outage: an **Ask** runs the read-only vault-QA child (regardless of the routine gate, citation validator advisory, badge `[local · emergency · <model>]`); a **diet Tell** whose blocking hosted verify is unreachable has its extracted entry **queued** by the bridge for later verify (badge `[local · diet · <model> + verify queued]`), replayed oldest-first on the next successful hosted contact through the exact verify-then-append path — **nothing reaches the CSVs unverified**. A circuit breaker goes local-first after 2 consecutive transport failures for 300 s. Default **off**; only an explicit `on`/`1`/`true`/`yes` arms it. **Untested-live until go-live's outage drill.** See [`../SECURITY.md`](../SECURITY.md#emergency-local-fallback-posture) |
 | `JESSE_CONTEXT_CARRY` | `on` | Arms the **context ledger** (`on`/`off`). Fixes a live defect: a turn served by a stateless local route (vault-QA / emergency / diet) never enters the thread's hosted claude session, so the next hosted follow-up lost it. When on, the bridge records each delivered ask/tell turn per thread (raw text + reply PRE-badge + route + an `in_hosted_history` flag), injects a `MISSED CONVERSATION HISTORY` catch-up block into the next hosted turn and a `RECENT CONVERSATION` block into the local children, and mints a synthetic `local-<hex>` thread id for a fresh locally-served turn (never resumed; re-keyed to the real session id on its first hosted turn). Persisted to `<state_dir>/context.json` (0600, holds conversation content — stays in the state dir, never in the metrics log or any provenance line). **Default on** because it repairs a live bug; only an explicit `0`/`false`/`no`/`off` disables it — the **rollback** switch, restoring byte-for-byte today's behavior (no ledger, no synthetic ids, no injected blocks). See [Context carry](#context-carry). |
+| `JESSE_SHADOW_BASE_URL` | _(off)_ | **Shadow-comparison** backend override (with the two below). When **all three** `JESSE_SHADOW_*` are set, shadow mode is **armed**: a **sampled** subset of eligible **ask** turns is mirrored — strictly **after** the hosted answer is delivered — to this backend through a **contained read-only** child (the vault-QA child's construction, pointed here via `apply_shadow_env`), and both answers plus per-side timing and token usage are appended to the local shadow log for the `shadow-audit` bin to judge. **Nothing about the delivered answer, its latency, its badge, or any production route changes** — the mirror runs on a detached, permit-free task, holds a separate at-most-one slot (never the production permit), yields (`skipped_busy`) to a running/queued phone turn, and any shadow failure is recorded and swallowed. **The triple is the kill switch:** unset any one var and shadow is off, byte-for-byte today's behavior — this is the disarm (unset + **bootout + bootstrap**; `kickstart -k` does **not** reload plist env). Production intent: the **gateway URL**, the **gateway token**, and `fw-glm`. **Privacy:** armed shadow sends the sampled ask's prompt and the read-only child's vault reads to the remote backend; the shadow log holds vault-derived answer text and **stays local** (mode `0600`, never sent anywhere). The bridge carries only the gateway URL + token — **never a Fireworks credential**, and never logs a token value |
+| `JESSE_SHADOW_AUTH_TOKEN` | _(off)_ | Shadow child's `ANTHROPIC_AUTH_TOKEN` (the gateway token). Required together with the other two `JESSE_SHADOW_*` |
+| `JESSE_SHADOW_MODEL` | _(off)_ | Shadow child's `ANTHROPIC_MODEL` (production: `fw-glm`). Required together with the other two `JESSE_SHADOW_*`. A **partial** config (1–2 of the 3 set) logs a startup warning and is treated as unset; **no turn is ever mirrored** under any partial or unset configuration |
+| `JESSE_SHADOW_SAMPLE_PCT` | `100` | Percentage of **eligible** ask turns mirrored, clamped to `[0, 100]`. Decided **per turn by a deterministic hash of the turn id** (reproducible, never RNG): `0` → mirror nothing even when armed; `100` → every eligible turn. Inert unless the triple is set |
+| `JESSE_SHADOW_LOG` | `~/Library/Logs/jesse-shadow/shadow.jsonl` | Absolute path to the shadow **pair log** (`~` expanded, parent created on first write). One JSON line per mirrored pair (turn id, timestamp, both answers, per-side wall-clock + TTFT where available, per-side token usage, shadow model alias); created mode `0600` (vault-derived content). A timeout/error records an **incomplete** pair and never retries. Only ever written when shadow is armed |
+| `JESSE_SHADOW_TIMEOUT_SECS` | `120` | Wall-clock budget for one shadow child; a timeout records an incomplete pair (never a retry). Inert unless the triple is set |
 | `JESSE_APNS_KEY_PATH` | _(off)_ | Path to the APNs auth key `.p8`. Set (with the three below) to enable push; unset → push disabled, behavior unchanged. See [Push notifications](#push-notifications-apns--optional-off-by-default) |
 | `JESSE_APNS_KEY_ID` | _(off)_ | APNs Key ID (10 chars) |
 | `JESSE_APNS_TEAM_ID` | _(off)_ | Apple Developer Team ID (10 chars; the JWT `iss`) |
@@ -1278,6 +1284,64 @@ AND at least **20 routed (gated) turns**, and only with ALL of:
 Graduation itself, the daily audit installer (`com.example.jesse-vaultqa-audit`, on
 the diet audit pattern), and probation operation are owned by the go-live process,
 not this code.
+
+## Shadow comparison (`JESSE_SHADOW_*`)
+
+An **opt-in, side-effect-free** way to gather evidence for whether a second backend
+(production intent: `fw-glm` via the gateway) could serve ask turns as well as the
+hosted model — **without touching a single production route**. When the
+`JESSE_SHADOW_*` triple is armed, a **sampled** subset of eligible ask turns is
+**mirrored, strictly after the hosted answer has been delivered**, to the shadow
+backend through the **same contained read-only child** the vault-QA route uses
+(pointed at the shadow backend via `apply_shadow_env`; read-only root allowlist,
+strict MCP, provably unable to write — see [`../SECURITY.md`](../SECURITY.md#shadow-comparison-child-isolation-in-process-boundary)).
+Both answers plus per-side timing and token usage are appended to the local shadow
+log (`JESSE_SHADOW_LOG`, mode `0600`).
+
+**Eligibility** (all required): shadow armed; **ask** mode; the turn actually took the
+**hosted** route (a vault-QA rung-0 local answer, an emergency-local answer, and any
+diet turn are excluded; a vault-QA turn that **fell through to hosted is** eligible);
+no attachments; the hosted turn completed successfully with a non-empty answer; and
+the turn is in the deterministic `JESSE_SHADOW_SAMPLE_PCT` sample. **A Tell is never
+mirrored, and a turn is never mirrored twice.**
+
+**Isolation is the whole point.** The delivered answer, its latency, its badge, and
+every production route are **byte-for-byte unchanged** whether shadow is armed or not
+(a golden test asserts the unarmed case; the delivery path has no `await` on anything
+shadow-related). The mirror runs on a **detached, permit-free** task, holds a separate
+**at-most-one** slot — never the production permit — and **yields** (`skipped_busy`)
+to a running or queued phone turn, so it can never delay the phone. The shadow child
+runs at background priority. Any shadow failure (timeout, transport, gateway error) is
+recorded as an incomplete pair and **swallowed** — it can never surface to the phone
+or alter the real turn's jobstore state.
+
+**The audit (`shadow-audit`).** A daily bin — same conventions as `vaultqa-audit`
+(dated markdown note + JSON twin under `~/Library/Logs/jesse-shadow-audit/`, tripwires
+first) — reads the shadow log and judges up to `JESSE_SHADOW_JUDGE_CAP` (default 20)
+unjudged pairs on **ambient hosted auth** (never in the request path) with **two
+position-swapped `claude -p` calls** per pair: the shadow side wins a pair only if it
+wins **both** orderings; disagreement is a tie. A line-count **watermark** plus a
+judged sidecar keep judging incremental and the log append-only. The note reports
+W/L/T today and cumulative, per-side latency percentiles, measured Fireworks cost vs
+the same turns on Opus, a judge-spend estimate, and **tripwires** (any injection-style
+leak in a shadow answer, any shadow-child write attempt, or Fireworks spend above
+$5/day) — each instructing the operator to **disarm the triple**. The audit only
+**reports**; it never routes.
+
+### Shadow graduation criteria
+
+Printed in **every** audit note so the target is fixed. Meeting them is **evidence for
+a routing prompt** — a human decision, never automated:
+
+- **≥ 14 days armed** AND **≥ 150 judged pairs**;
+- **cumulative net (wins − losses) no worse than −5%** of judged pairs;
+- **zero injection leaks**;
+- **shadow p50 wall-clock no worse than hosted p50 + 50%**.
+
+**Kill switch:** unset any one of the `JESSE_SHADOW_*` triple and shadow is off,
+byte-for-byte today's behavior. Because launchd caches the plist environment, the
+disarm is **unset the var, then `bootout` + `bootstrap`** — `kickstart -k` does not
+reload plist env.
 
 ## Context carry
 

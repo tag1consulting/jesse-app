@@ -15,6 +15,62 @@ CI both run it). See the "Versioning" section of `bridge/README.md`.
 
 ## [Unreleased]
 
+## [Bridge 0.22.0] — 2026-07-18
+
+### Added
+- **Opt-in shadow comparison (`JESSE_SHADOW_*`)** — a side-effect-free way to
+  gather evidence for whether a second backend (production intent: `fw-glm` via
+  the gateway) could serve ask turns as well as the hosted model, **without
+  changing a single production route**. When the `JESSE_SHADOW_BASE_URL` /
+  `JESSE_SHADOW_AUTH_TOKEN` / `JESSE_SHADOW_MODEL` triple is armed, a **sampled**
+  subset of eligible ask turns is **mirrored — strictly after the hosted answer
+  is delivered** — to the shadow backend through the **same contained read-only
+  child** the vault-QA route uses (`build_shadow_child_command` +
+  `apply_shadow_env`; read-only root allowlist, strict MCP, provably unable to
+  write). Both answers plus per-side timing and token usage are appended to a
+  local **shadow pair log** (`JESSE_SHADOW_LOG`, default
+  `~/Library/Logs/jesse-shadow/shadow.jsonl`, created mode `0600`).
+  - **Eligibility** (all required): shadow armed; ask mode; the turn took the
+    **hosted** route (vault-QA rung-0 local, emergency-local, and diet turns are
+    excluded; a vault-QA fall-through to hosted **is** eligible); no attachments;
+    the hosted turn completed successfully with a non-empty answer; and the turn
+    is in the deterministic `JESSE_SHADOW_SAMPLE_PCT` sample (default 100, clamped
+    `[0, 100]`, decided by a stable hash of the turn id — reproducible, never RNG).
+    A **Tell is never mirrored, and a turn is never mirrored twice.**
+  - **Isolation is guaranteed:** the delivered answer, its latency, its badge, and
+    every production route are **byte-for-byte unchanged** whether shadow is armed
+    or not (a golden test asserts the unarmed case; the delivery path has no
+    `await` on anything shadow-related). The mirror runs on a **detached,
+    permit-free** task, holds a **separate at-most-one slot** (`AppState.shadow_slot`)
+    — never the production permit — **yields** (`skipped_busy`) to a running or
+    queued phone turn, and runs the child at background priority. Any shadow
+    failure (timeout, transport, gateway error, `JESSE_SHADOW_TIMEOUT_SECS`
+    default 120) is recorded as an **incomplete** pair and swallowed.
+  - **Secrets:** the bridge carries only the **gateway URL and gateway token** —
+    never a Fireworks credential — and never logs a token value.
+- **`shadow-audit` bin** — a daily judge (same conventions as `vaultqa-audit`:
+  dated markdown note + JSON twin under `~/Library/Logs/jesse-shadow-audit/`,
+  tripwires first). Reads the shadow log and judges up to `JESSE_SHADOW_JUDGE_CAP`
+  (default 20) unjudged pairs on **ambient** hosted auth with **two
+  position-swapped `claude -p` calls** per pair (shadow wins only if it wins both
+  orderings; disagreement = tie); a line-count **watermark** + judged sidecar keep
+  judging incremental and the log append-only. Reports W/L/T today and cumulative,
+  per-side latency percentiles, measured Fireworks cost vs the same turns on Opus,
+  a judge-spend estimate, **disarm tripwires** (injection-style leak, shadow-child
+  write attempt, Fireworks spend > $5/day), and progress against the fixed
+  **graduation criteria** (≥ 14 days armed AND ≥ 150 judged pairs; net ≥ −5% of
+  judged; zero leaks; shadow p50 ≤ hosted p50 + 50%). The audit only reports — it
+  never routes.
+
+### Notes
+- New env vars: `JESSE_SHADOW_BASE_URL`, `JESSE_SHADOW_AUTH_TOKEN`,
+  `JESSE_SHADOW_MODEL`, `JESSE_SHADOW_SAMPLE_PCT`, `JESSE_SHADOW_LOG`,
+  `JESSE_SHADOW_TIMEOUT_SECS`, plus `JESSE_SHADOW_JUDGE_CAP` for the audit. **The
+  triple is the kill switch:** unset any one and shadow is off, byte-for-byte
+  today's behavior (disarm = unset + `bootout` + `bootstrap`; `kickstart -k` does
+  not reload plist env). New dependency: `libc` (one `setpriority` syscall for the
+  background-priority shadow child). See `bridge/README.md` and `SECURITY.md`.
+
 ## [App 1.0 (54)] — 2026-07-18
 
 ### Changed

@@ -59,6 +59,16 @@ pub(crate) fn test_config() -> Config {
         // byte-for-byte unaffected. Carry behavior is covered by dedicated tests that
         // enable it explicitly (the shipped `from_env` default is ON).
         context_carry: false,
+        // Shadow comparison DISARMED in the fixture (kill switch): no backend triple,
+        // so no ask turn is ever mirrored and every path is byte-for-byte today's.
+        // Tests that exercise shadow set `shadow_backend`/`shadow_log` explicitly.
+        shadow_backend: None,
+        shadow_sample_pct: 100,
+        shadow_log: std::env::temp_dir()
+            .join("jesse-shadow-test.jsonl")
+            .to_string_lossy()
+            .into_owned(),
+        shadow_timeout_secs: 120,
     }
 }
 pub(crate) fn test_state() -> AppState {
