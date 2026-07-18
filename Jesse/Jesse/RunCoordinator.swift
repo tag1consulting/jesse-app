@@ -14,6 +14,13 @@ import UIKit
 struct InFlightJob: Codable, Equatable {
     let jobId: String
     let voice: Bool
+    // The outbox `request_id` (`OutboxItem.id`) this job ACKed, retained so
+    // `reconcile` can tell "the ACK won the race with a kill" (a still-`.sending`
+    // outbox item whose id matches a persisted job → the item is stale, delete it)
+    // from "Jesse never received this" (no matching job → mark the item failed).
+    // Optional and defaulted so old persisted files that predate the field decode
+    // to nil (synthesized Decodable uses `decodeIfPresent` for an optional).
+    var requestId: UUID? = nil
 }
 
 /// Reads and writes the persisted `inFlight` map. Pulled behind a protocol so the
@@ -391,110 +398,261 @@ final class RunCoordinator {
             context.insert(thread)
         }
 
-        // Optimistic user turn — appears in the transcript immediately. The *sent*
-        // text is just `trimmed`; any attachments are shown as persisted thumbnail
-        // previews (see `attachPreviews`) rather than an appended "📎 Attached:"
-        // text line, which the previews make redundant.
+        // ── Stage: the optimistic user Turn AND its OutboxItem in ONE save. The user
+        // message appears in the transcript immediately; the OutboxItem (state
+        // `.sending`, carrying the ORIGINAL full-resolution — i.e. staged,
+        // post-downscale — attachment bytes) OWNS the message until the bridge ACKs.
+        // Attachments are shown as persisted thumbnail previews (see `attachPreviews`)
+        // rather than an appended "📎 Attached:" text line.
         let userTurn = Turn(role: .user, text: trimmed)
         thread.turns.append(userTurn)
         if thread.title.isEmpty {
             thread.title = JesseThread.deriveTitle(from: trimmed)
         }
         thread.updatedAt = Date()
+        let mode = thread.modeValue
+        let item = OutboxItem(threadID: threadID, turnID: userTurn.id, text: trimmed,
+                              mode: mode, voice: voice)
+        for att in attachments {
+            item.attachments.append(
+                OutboxAttachment(filename: att.filename, mime: att.mime, data: att.data))
+        }
+        context.insert(item)
         // Real error handling, not `try?`. If this throws the user message is shown
-        // but not persisted, and proceeding would attach the reply to a thread that
-        // may never persist. Surface a recoverable failure (the same shape `finish`
-        // uses) and abort the turn before any bridge call, rather than swallowing it.
+        // but neither it nor the outbox record is persisted, and proceeding would
+        // attach the reply to a thread that may never persist. Surface a recoverable
+        // failure and abort the turn before any bridge call, rather than swallow it.
         do {
             try save(context)
         } catch {
-            Log.run.error("optimistic user-turn save failed for thread \(threadID): \(error.localizedDescription) — aborting the turn")
+            Log.run.error("optimistic user-turn + outbox save failed for thread \(threadID): \(error.localizedDescription) — aborting the turn")
             errors[threadID] = "Couldn't save your message — try sending it again."
             return
         }
-        // Persist storage-optimized previews of any attachments onto the user turn.
-        // The full-resolution bytes exist only in the composer's staged
-        // `attachments` (the bridge keeps the files only for this turn), so we
-        // generate small thumbnails now, off the main actor, and attach them — the
-        // originals are never persisted. Best-effort and non-blocking; a failed
-        // preview never affects the turn.
+        // Persist storage-optimized thumbnail previews of any attachments onto the
+        // user turn (for history). The full-resolution bytes live in the OutboxItem
+        // now; these small JPEGs are generated off the main actor and attached
+        // best-effort — a failed preview never affects the turn.
         attachPreviews(to: userTurn, from: attachments, context: context)
 
-        let mode = thread.modeValue
+        // ── Transmit: POST with `requestId = item.id`. Any success (a `.running`
+        // 202 or the legacy inline `.reply` 200) deletes the item — after that the
+        // existing InFlight/consume/Re-check machinery owns the turn unchanged; a
+        // throw before that ACK flips the item to `.failed` for the per-message Retry.
+        transmit(item: item, thread: thread, context: context)
+    }
+
+    /// The bridge round-trip for one staged (or retried) `OutboxItem`, keyed by its
+    /// `id` as the `request_id`. Marks the thread running and, on ACK, hands off to
+    /// the same stream+poll/consume path a turn always took — the outbox change is
+    /// entirely in the pre-ACK window. Session/instructions/floor/config are resolved
+    /// FRESH here (not captured at stage time) so a Retry picks up current state and
+    /// the same request_id lets the bridge dedup a POST that actually landed.
+    private func transmit(item: OutboxItem, thread: JesseThread, context: ModelContext) {
+        let threadID = thread.id
+        let requestId = item.id
+        let text = item.text
+        let voice = item.voice
+        let mode = item.modeValue
         let sessionId = thread.sessionId
         let cfg = configProvider()
-        // Resolve the wrapper and floor overrides on the main actor before
-        // detaching the turn; nil when this mode isn't customized (the bridge uses
-        // its default wrapper / its built-in floor).
+        // Resolve the wrapper and floor overrides on the main actor before detaching
+        // the turn; nil when this mode isn't customized.
         let instructions = instructionsProvider(mode)
         let floorOverride = floorProvider(mode)
+        // Reconstitute the outgoing attachments from the persisted ORIGINAL bytes.
+        let attachments = item.orderedAttachments.map {
+            JesseAttachment(filename: $0.filename, mime: $0.mime, data: $0.data)
+        }
         startDates[threadID] = Date()
         // The turn is now in flight — start the Live Activity (Lock Screen / Dynamic
-        // Island). Additive: the existing push-on-background-complete is untouched.
+        // Island).
         syncLiveActivity(threadID, attributes: liveActivityAttributes(for: thread))
-
         // A background grant lets a short turn finish after the app is backgrounded;
-        // longer turns are re-attached on foreground via `resume`. The guard owns
-        // the begin/end bookkeeping and the expiration-before-store race (M7).
+        // longer turns are re-attached on foreground via `resume`.
         backgroundGuard.begin(threadID, name: "jesse.turn")
 
         tasks[threadID] = Task { [weak self] in
             guard let self else { return }
             let client = self.makeClient(cfg)
             do {
-                let result = try await client.send(mode: mode, text: trimmed,
+                let result = try await client.send(mode: mode, text: text,
                                                    sessionId: sessionId, voice: voice,
                                                    instructions: instructions,
                                                    floorOverride: floorOverride,
-                                                   attachments: attachments)
+                                                   attachments: attachments,
+                                                   requestId: requestId)
                 switch result {
                 case .reply(let reply, _):
-                    // Inline reply. The fixed bridge always returns `.running`
-                    // (it hands back the job_id immediately and never holds the
-                    // connection), so this path is effectively dead — kept only so
-                    // an older bridge that still answers inline doesn't break.
-                    // Deliver against the live `thread` reference (the send path
-                    // holds it), so there's no fetch-by-id that could miss.
+                    // ACK (legacy inline 200 — effectively dead against the fixed
+                    // bridge, kept for an older one). Delivered → drop the outbox
+                    // item, then finish against the live `thread` reference.
+                    self.ackDelete(item, context: context)
                     self.finish(threadID: threadID, thread: thread, reply: reply,
                                 voice: voice, jobId: nil, context: context)
                 case .running(let jobId):
-                    // The normal path. `persist` runs FIRST, synchronously, so
-                    // `inFlight` is on disk the instant the job_id arrives — before
-                    // `consume` opens a single socket. Any later drop (stream or
-                    // poll, app suspended) is therefore recoverable via Re-check /
-                    // `resume`, because the id was captured up front. This is the
-                    // app half of the orphan fix: the bridge delivers the id early,
-                    // and we persist it before doing anything that can fail.
-                    self.persist(threadID: threadID, job: InFlightJob(jobId: jobId, voice: voice))
-                    // Stream (display) and poll (completion) run concurrently; see
-                    // `consume`. Polling is not a fallback — it owns the reply.
-                    // Pass the live `thread` reference so completion appends to it
-                    // directly — no fetch-by-id that could resolve to nil and drop
-                    // the reply (the silent-stop bug this guards against).
+                    // ACK (202 — the normal path). Delivered → drop the outbox item,
+                    // then persist the in-flight job (carrying the request_id so
+                    // `reconcile` can resolve a kill/ACK race) and consume as before:
+                    // stream (display) and poll (completion) race, and any later drop
+                    // is recoverable via Re-check / `resume`.
+                    self.ackDelete(item, context: context)
+                    self.persist(threadID: threadID,
+                                 job: InFlightJob(jobId: jobId, voice: voice, requestId: requestId))
                     await self.consume(threadID: threadID, thread: thread, jobId: jobId,
                                        voice: voice, client: client, context: context,
-                                       retry: HealthRetry(mode: mode, text: trimmed,
+                                       retry: HealthRetry(mode: mode, text: text,
                                                           instructions: instructions,
                                                           floorOverride: floorOverride))
                 }
-                // Belt-and-suspenders: if `client.send` itself throws (a flaky
-                // connection drops the POST before its response lands), the bridge
-                // may have created the turn with a job_id the phone never saw —
-                // that one turn is unrecoverable without an id. With the immediate
-                // job_id this window is just the single request/response round-trip
-                // (it used to be the whole multi-second grace hold), which is the
-                // point of the fix. See `handle(error:)` for the connection-lost
-                // case where a job_id *was* already retained.
             } catch is CancellationError {
-                self.clearRun(threadID)
+                // Pre-ACK cancel: today this silently cleared, losing the message.
+                // Preserve it as `.failed` so the user can Retry/Discard; speak
+                // nothing (matching the old silent cancel).
+                self.failOutbox(item, threadID: threadID,
+                                message: "Cancelled before it was delivered.",
+                                voice: voice, speakFailure: false, context: context)
             } catch let error as JesseError {
-                self.handle(error: error, threadID: threadID, voice: voice)
+                // Pre-ACK failure (timeout, dead network, 429/5xx, notConfigured):
+                // the message never reached the bridge. Preserve it as `.failed` with
+                // the mapped, human-readable message for the per-message Retry — and
+                // deliberately DON'T set the thread-level `errors[]` banner (the
+                // per-message UI owns this failure class). Still speak on a voice turn.
+                self.failOutbox(item, threadID: threadID,
+                                message: error.errorDescription ?? "Couldn't send your message.",
+                                voice: voice, speakFailure: true, context: context)
             } catch {
-                self.fail(threadID: threadID, message: error.localizedDescription, voice: voice)
+                self.failOutbox(item, threadID: threadID, message: error.localizedDescription,
+                                voice: voice, speakFailure: true, context: context)
             }
             self.tasks[threadID] = nil
             self.backgroundGuard.end(threadID)
         }
+    }
+
+    /// A delivered message: drop its `OutboxItem` (cascade-deleting its stored
+    /// attachment bytes) and persist. Deliberately NOT routed through the injected
+    /// `save` seam — it's best-effort cleanup that self-heals (a failed delete leaves
+    /// a still-`.sending` item that `reconcile` collapses via the persisted job's
+    /// request_id), and keeping it off the seam preserves the seam's meaning as "the
+    /// optimistic-turn stage save + the finish save" that the finish tests count on.
+    private func ackDelete(_ item: OutboxItem, context: ModelContext) {
+        context.delete(item)
+        do {
+            try context.save()
+        } catch {
+            Log.run.error("outbox ACK delete save failed: \(error.localizedDescription) — reconcile will collapse it via the persisted job")
+        }
+    }
+
+    /// A pre-ACK failure: preserve the message as `.failed` (mapped error + bumped
+    /// attempt count) for the per-message Retry, and clear the active run WITHOUT
+    /// setting the thread-level error banner — the per-message UI owns this class.
+    /// The background grant is released by the transmit task's tail.
+    private func failOutbox(_ item: OutboxItem, threadID: UUID, message: String,
+                            voice: Bool, speakFailure: Bool, context: ModelContext) {
+        item.stateRaw = OutboxState.failed.rawValue
+        item.lastError = message
+        item.attempts += 1
+        do {
+            try context.save()
+        } catch {
+            Log.run.error("outbox failure save failed: \(error.localizedDescription)")
+        }
+        startDates[threadID] = nil
+        clearPartial(threadID)
+        activity[threadID] = nil
+        syncLiveActivity(threadID)
+        if speakFailure, voice { Speaker.shared.speak("Sorry, that didn't work. " + message) }
+    }
+
+    // MARK: - Send outbox (recover / retry / discard)
+
+    /// Recover the send outbox after a relaunch/foreground: for every `OutboxItem`
+    /// still `.sending` with no live transmit task, decide whether the bridge ACKed
+    /// before the app died. If the persisted in-flight job for its thread carries a
+    /// matching `request_id`, the ACK won the race with the kill (the item's own
+    /// delete never persisted) — the item is stale, so delete it. Otherwise the POST
+    /// never landed: mark it `.failed` so the per-message Retry appears. This recovers
+    /// the app-killed-mid-POST case, which today fails with no error at all. Called
+    /// from `resume` before its re-attach loop.
+    func reconcile(context: ModelContext) {
+        let sending = OutboxState.sending.rawValue
+        let descriptor = FetchDescriptor<OutboxItem>(
+            predicate: #Predicate { $0.stateRaw == sending })
+        guard let items = try? context.fetch(descriptor), !items.isEmpty else { return }
+        var changed = false
+        for item in items where tasks[item.threadID] == nil {
+            if inFlight[item.threadID]?.requestId == item.id {
+                context.delete(item)
+            } else {
+                item.stateRaw = OutboxState.failed.rawValue
+                item.lastError = "Jesse never received this."
+            }
+            changed = true
+        }
+        guard changed else { return }
+        do {
+            try context.save()
+        } catch {
+            Log.run.error("outbox reconcile save failed: \(error.localizedDescription)")
+        }
+    }
+
+    /// Manually retry a `.failed` outbox message — NEVER automatic. Re-runs the
+    /// transmit with the SAME `OutboxItem` (same `request_id`, so the bridge dedups
+    /// if the original POST actually landed), reusing the existing user `Turn` — never
+    /// a second bubble. Guarded: the item must be `.failed` and its thread not
+    /// running; session/instructions/floor/config are re-resolved fresh in `transmit`.
+    func retry(itemID: UUID, context: ModelContext) {
+        guard let item = fetchOutboxItem(itemID, context: context),
+              item.state == .failed,
+              !isRunning(item.threadID),
+              let thread = fetchThread(item.threadID, context: context) else { return }
+        item.stateRaw = OutboxState.sending.rawValue
+        item.lastError = nil
+        do {
+            try context.save()
+        } catch {
+            Log.run.error("outbox retry flip save failed: \(error.localizedDescription)")
+        }
+        transmit(item: item, thread: thread, context: context)
+    }
+
+    /// Discard a failed outbox message: delete the item and its optimistic user
+    /// `Turn`, and — if that leaves the thread with no turns and no bridge session —
+    /// delete the now-empty thread too. Save.
+    func discard(itemID: UUID, context: ModelContext) {
+        guard let item = fetchOutboxItem(itemID, context: context) else { return }
+        let threadID = item.threadID
+        let turnID = item.turnID
+        context.delete(item)
+        if let thread = fetchThread(threadID, context: context) {
+            let remaining = thread.turns.filter { $0.id != turnID }
+            if let turn = thread.turns.first(where: { $0.id == turnID }) {
+                context.delete(turn)
+            }
+            if remaining.isEmpty && thread.sessionId == nil {
+                context.delete(thread)
+            }
+        }
+        do {
+            try context.save()
+        } catch {
+            Log.run.error("outbox discard save failed: \(error.localizedDescription)")
+        }
+    }
+
+    private func fetchOutboxItem(_ id: UUID, context: ModelContext) -> OutboxItem? {
+        var d = FetchDescriptor<OutboxItem>(predicate: #Predicate { $0.id == id })
+        d.fetchLimit = 1
+        return (try? context.fetch(d))?.first
+    }
+
+    private func fetchThread(_ id: UUID, context: ModelContext) -> JesseThread? {
+        var d = FetchDescriptor<JesseThread>(predicate: #Predicate { $0.id == id })
+        d.fetchLimit = 1
+        return (try? context.fetch(d))?.first
     }
 
     /// Cancellation is authoritative over the run's state, not just the task.
@@ -532,6 +690,11 @@ final class RunCoordinator {
     /// as the poll restarts — so foregrounding auto-recovers what Re-check does
     /// by hand.
     func resume(context: ModelContext) {
+        // Recover the send outbox first: a message killed mid-POST (still `.sending`
+        // with no live task) is resolved to delivered-and-stale (delete) or
+        // never-received (`.failed`) BEFORE any re-attach, so its per-message state
+        // is correct the moment the UI reads it.
+        reconcile(context: context)
         // End any Live Activity stranded by a kill mid-turn whose thread is neither
         // actively running nor a retained in-flight job (its turn resolved while we
         // were gone). Running/retained threads are kept and re-driven below.

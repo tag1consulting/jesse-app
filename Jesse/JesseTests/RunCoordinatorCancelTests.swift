@@ -67,7 +67,7 @@ final class RunCoordinatorCancelTests: XCTestCase {
     @MainActor
     func testCancelDuringPollClearsRunAndIgnoresLateDone() async throws {
         let container = try ModelContainer(
-            for: JesseThread.self, Turn.self,
+            for: JesseThread.self, Turn.self, OutboxItem.self, OutboxAttachment.self,
             configurations: ModelConfiguration(isStoredInMemoryOnly: true))
         let context = ModelContext(container)
 
@@ -115,7 +115,7 @@ final class RunCoordinatorCancelTests: XCTestCase {
     @MainActor
     func testCancelInvokesBridgeCancelWithInFlightJobId() async throws {
         let container = try ModelContainer(
-            for: JesseThread.self, Turn.self,
+            for: JesseThread.self, Turn.self, OutboxItem.self, OutboxAttachment.self,
             configurations: ModelConfiguration(isStoredInMemoryOnly: true))
         let context = ModelContext(container)
 

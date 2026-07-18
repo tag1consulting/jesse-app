@@ -26,7 +26,13 @@ struct JesseAttachment: Identifiable, Equatable {
     /// the bridge runs — so the declared type always matches the actual bytes
     /// (a PhotosPicker item may be HEIC even when it looks like a JPEG). Returns
     /// nil for anything not on the whitelist.
-    static func sniffMime(_ data: Data) -> String? {
+    ///
+    /// Explicitly `nonisolated`: a pure function over its `Data` argument, called
+    /// from the `nonisolated` `AttachmentDownscaler.fitToCap`. Under this module's
+    /// MainActor default isolation the compiler's `nonisolated` inference for it is
+    /// fragile (it can flip to main-actor-isolated as unrelated code in this file
+    /// changes), so pin it here rather than rely on inference.
+    nonisolated static func sniffMime(_ data: Data) -> String? {
         let b = [UInt8](data.prefix(16))
         func match(_ ascii: String, at off: Int = 0) -> Bool {
             let sig = Array(ascii.utf8)
@@ -442,6 +448,13 @@ nonisolated struct JesseRequest: Encodable, Equatable {
     // bridge prunes every queued batch at or below it. Nil until the app has applied a
     // delivered correction; re-sending the same value is harmless (prune is idempotent).
     let mealCorrectionsAck: Int?
+    // Idempotency key (the send outbox's `OutboxItem.id`, as a string): the bridge
+    // dedups a `POST /jesse` carrying a `request_id` it has already seen, returning
+    // the SAME job instead of spawning a second turn — so a manual Retry after a
+    // pre-ACK drop can't double-send. Nil on every call that isn't outbox-driven (the
+    // watch relay, the health-context retry); a bridge without the field ignores it
+    // (no `deny_unknown_fields`), so the bytes are unchanged when it's absent.
+    let requestId: String?
 
     nonisolated struct Attachment: Encodable, Equatable {
         let filename: String
@@ -463,6 +476,7 @@ nonisolated struct JesseRequest: Encodable, Equatable {
         case healthContextRequested = "health_context_requested"
         case healthContextUnavailable = "health_context_unavailable"
         case mealCorrectionsAck = "meal_corrections_ack"
+        case requestId = "request_id"
     }
 }
 
@@ -652,6 +666,15 @@ protocol JesseClientProtocol {
     func send(mode: JesseMode, text: String, sessionId: String?, voice: Bool,
               instructions: String?, floorOverride: String?,
               attachments: [JesseAttachment]) async throws -> JesseSendResult
+    /// Send carrying the outbox idempotency key (`request_id`). The send outbox is
+    /// the only caller that passes a non-nil `requestId`; every other call site (the
+    /// watch relay, the health-context retry) uses the plain `send` above. Defaulted
+    /// in the extension to forward to that plain `send` (dropping the id), so the
+    /// test fakes need not implement it; the production `JesseClient` overrides it to
+    /// actually encode `request_id`.
+    func send(mode: JesseMode, text: String, sessionId: String?, voice: Bool,
+              instructions: String?, floorOverride: String?,
+              attachments: [JesseAttachment], requestId: UUID?) async throws -> JesseSendResult
     /// Fulfill a `JESSE_NEEDS_HEALTH` directive and re-send the SAME turn on the
     /// SAME thread with the requested data attached (bypassing the classifier). When
     /// it can't be fulfilled (toggle off / no data) it re-sends marked unavailable,
@@ -700,6 +723,16 @@ protocol JesseClientProtocol {
 }
 
 extension JesseClientProtocol {
+    // Default for fakes/callers that don't carry an idempotency key: forward to the
+    // plain `send`, dropping `requestId`. The production `JesseClient` overrides this
+    // to encode `request_id`; a fake that wants to assert the key implements it.
+    func send(mode: JesseMode, text: String, sessionId: String?, voice: Bool,
+              instructions: String?, floorOverride: String?,
+              attachments: [JesseAttachment], requestId: UUID?) async throws -> JesseSendResult {
+        try await send(mode: mode, text: text, sessionId: sessionId, voice: voice,
+                       instructions: instructions, floorOverride: floorOverride,
+                       attachments: attachments)
+    }
     // Default for fakes that don't exercise the metrics/retry channel: re-send the
     // SAME turn via `send` (dropping the directive). The production `JesseClient`
     // and the retry-state-machine test's fake override this.
@@ -834,6 +867,17 @@ struct JesseClient: JesseClientProtocol {
               instructions: String? = nil,
               floorOverride: String? = nil,
               attachments: [JesseAttachment] = []) async throws -> JesseSendResult {
+        try await send(mode: mode, text: text, sessionId: sessionId, voice: voice,
+                       instructions: instructions, floorOverride: floorOverride,
+                       attachments: attachments, requestId: nil)
+    }
+
+    func send(mode: JesseMode, text: String,
+              sessionId: String?, voice: Bool,
+              instructions: String?,
+              floorOverride: String?,
+              attachments: [JesseAttachment],
+              requestId: UUID?) async throws -> JesseSendResult {
         // Classify-then-attach, in the request-building path so EVERY turn — typed,
         // Siri, and the watch relay — inherits it. The block is attached ONLY when
         // the master toggle is on AND the message classifies as health-related
@@ -854,7 +898,8 @@ struct JesseClient: JesseClientProtocol {
                                        floorOverride: floorOverride,
                                        attachments: attachments,
                                        healthContext: healthContext,
-                                       mealCorrectionsAck: mealCorrectionsAck())
+                                       mealCorrectionsAck: mealCorrectionsAck(),
+                                       requestId: requestId)
         return try await postTurn(request)
     }
 
@@ -1291,7 +1336,8 @@ struct JesseClient: JesseClientProtocol {
                             healthContext: String? = nil,
                             healthContextRequested: Bool? = nil,
                             healthContextUnavailable: Bool? = nil,
-                            mealCorrectionsAck: Int? = nil) -> JesseRequest {
+                            mealCorrectionsAck: Int? = nil,
+                            requestId: UUID? = nil) -> JesseRequest {
         func nonBlank(_ s: String?) -> String? {
             guard let s, !s.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return nil }
             return s
@@ -1316,7 +1362,10 @@ struct JesseClient: JesseClientProtocol {
             healthContextRequested: healthContextRequested == true ? true : nil,
             healthContextUnavailable: healthContextUnavailable == true ? true : nil,
             // Only a positive seq is meaningful (0/absent → nothing acked yet).
-            mealCorrectionsAck: (mealCorrectionsAck ?? 0) > 0 ? mealCorrectionsAck : nil)
+            mealCorrectionsAck: (mealCorrectionsAck ?? 0) > 0 ? mealCorrectionsAck : nil,
+            // The outbox idempotency key, encoded as its string form; nil drops the
+            // field so a non-outbox call is byte-for-byte unchanged.
+            requestId: requestId?.uuidString)
     }
 
     /// Encode a wire body. Optional fields omit when nil (synthesized

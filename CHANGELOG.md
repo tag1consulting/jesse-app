@@ -15,6 +15,44 @@ CI both run it). See the "Versioning" section of `bridge/README.md`.
 
 ## [Unreleased]
 
+## [App 1.0 (48)] — 2026-07-17
+
+### Added
+- **A send outbox so a message can't be silently lost before the bridge ACKs.**
+  The bridge acknowledges `POST /jesse` immediately with `202 {job_id}`, and
+  everything after that ACK was already recoverable (persisted `InFlightJob`,
+  Re-check, foreground resume). But *before* the ACK — a timeout, a dead network,
+  a 429/5xx, or the app being suspended/killed mid-POST — the message was lost, and
+  the full-resolution attachment bytes with it (only thumbnails persist; the
+  composer clears its staged bytes at send). Now every send persists an outbox
+  record first and deletes it at the ACK.
+  - **Two new SwiftData models** (`OutboxItem` + `OutboxAttachment`), added as
+    schema **V2** with a lightweight `V1 → V2` migration stage (they're additive,
+    fully-defaulted entities). `OutboxItem.id` IS the wire `request_id`;
+    `OutboxAttachment` holds the ORIGINAL (staged, post-downscale, always-sendable)
+    bytes in external storage.
+  - **`request_id` on `POST /jesse`** (`JesseClient.send(…, requestId:)`), so a
+    Retry re-sends with the SAME key and the bridge dedups a POST that actually
+    landed (one turn, not two). Other call sites (watch relay, health-context
+    retry) pass nil; a bridge without the field ignores it, so the bytes are
+    unchanged when it's absent.
+  - **Stage → transmit** in `RunCoordinator.send`: the optimistic user turn and its
+    `OutboxItem` are created in one save; the transmit deletes the item on any
+    success (a `.running` 202 or the legacy inline `.reply` 200) and hands off to
+    the unchanged InFlight/consume/Re-check machinery. A pre-ACK throw preserves the
+    message as `.failed` (a pre-ACK cancel too, which used to vanish silently) —
+    WITHOUT the thread-level error banner, which the per-message UI now owns.
+  - **`reconcile`** (run on resume, before re-attach) recovers the app-killed-
+    mid-POST case: a still-`.sending` item is deleted if the persisted job carries
+    its `request_id` (the ACK won the race) or flipped to `.failed` ("Jesse never
+    received this.") otherwise.
+  - **Manual, per-message Retry / Discard — never automatic.** A failed user bubble
+    shows a compact "Not delivered" line (orange, matching the Re-check affordance)
+    with Retry (re-runs the transmit reusing the same turn and request_id) and
+    Discard (removes the message, and an empty sessionless thread with it). The
+    composer stays enabled with failed messages present; the conversation list
+    badges rows that have any undelivered message.
+
 ## [App 1.0 (46)] — 2026-07-17
 
 ### Changed

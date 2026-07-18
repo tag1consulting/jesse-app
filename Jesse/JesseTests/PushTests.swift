@@ -180,7 +180,7 @@ final class PushTests: XCTestCase {
     @MainActor
     func testBackgroundNotifyFlagsInFlightJobAndRoutingFindsThread() async throws {
         let container = try ModelContainer(
-            for: JesseThread.self, Turn.self,
+            for: JesseThread.self, Turn.self, OutboxItem.self, OutboxAttachment.self,
             configurations: ModelConfiguration(isStoredInMemoryOnly: true))
         let context = ModelContext(container)
 
@@ -219,7 +219,7 @@ final class PushTests: XCTestCase {
     @MainActor
     func testFirstSuccessHookFiresOnDeliveredReply() async throws {
         let container = try ModelContainer(
-            for: JesseThread.self, Turn.self,
+            for: JesseThread.self, Turn.self, OutboxItem.self, OutboxAttachment.self,
             configurations: ModelConfiguration(isStoredInMemoryOnly: true))
         let context = ModelContext(container)
 

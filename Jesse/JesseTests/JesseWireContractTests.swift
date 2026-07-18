@@ -117,6 +117,37 @@ final class JesseWireContractTests: XCTestCase {
         }
     }
 
+    /// The outbox idempotency key encodes to the `request_id` wire key (as the
+    /// UUID's string form), in sorted position — byte-for-byte.
+    func testRequestIdEncodesToExactBytes() throws {
+        let id = UUID(uuidString: "E621E1F8-C36C-495A-93FC-0C247A3E6E5F")!
+        let r = JesseClient.makeRequest(mode: .ask, text: "hi", sessionId: nil, voice: false,
+                                        instructions: nil, floorOverride: nil, attachments: [],
+                                        requestId: id)
+        XCTAssertEqual(try body(r),
+            #"{"mode":"ask","request_id":"E621E1F8-C36C-495A-93FC-0C247A3E6E5F","text":"hi"}"#)
+    }
+
+    /// A nil `requestId` drops the field — every non-outbox call (watch relay,
+    /// health-context retry) is byte-for-byte unchanged.
+    func testNilRequestIdOmittedFromBytes() throws {
+        let r = JesseClient.makeRequest(mode: .ask, text: "hi", sessionId: nil, voice: false,
+                                        instructions: nil, floorOverride: nil, attachments: [],
+                                        requestId: nil)
+        XCTAssertEqual(try body(r), #"{"mode":"ask","text":"hi"}"#)
+    }
+
+    /// Response decoding is unchanged by the request_id addition: a 202 still yields
+    /// a running job id (the bridge ignores an unknown `request_id`; nothing about
+    /// the response shape changed).
+    func testResponseDecodingUnchangedWithRequestId() throws {
+        let json = Data(#"{"job_id":"job-idem","status":"running"}"#.utf8)
+        guard case .running(let id) = try JesseClient.decodeSend(data: json, resp: http(202)) else {
+            return XCTFail("expected .running")
+        }
+        XCTAssertEqual(id, "job-idem")
+    }
+
     // MARK: - directives decode (poll result)
 
     /// A `done` result carrying `directives.needs_health` decodes to a validated

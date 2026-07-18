@@ -31,8 +31,19 @@ struct ThreadDetailView: View {
     @State private var showCamera = false
     @State private var attachError: String?
 
+    // Every persisted outbox record; filtered per-turn below. Small (only messages
+    // in flight or failed live here), and observed so a message flipping to `.failed`
+    // (or being retried/discarded) re-renders the affected turn's controls live.
+    @Query private var outbox: [OutboxItem]
+
     private var running: Bool { coordinator.isRunning(thread.id) }
     private var turns: [Turn] { thread.orderedTurns }
+
+    /// The `.failed` outbox item for a given user turn, if any — drives the compact
+    /// per-message "Not delivered" line with Retry/Discard under that bubble.
+    private func failedItem(for turnID: UUID) -> OutboxItem? {
+        outbox.first { $0.turnID == turnID && $0.threadID == thread.id && $0.state == .failed }
+    }
 
     // Haptic decisions, pulled out of `body` as typed methods so the SwiftUI
     // type-checker doesn't have to infer the trailing closures inline (the
@@ -125,8 +136,21 @@ struct ThreadDetailView: View {
                             .padding(.top, 40)
                     }
                     ForEach(turns) { turn in
-                        TurnRow(turn: turn)
-                            .id(turn.id)
+                        VStack(alignment: turn.isUser ? .trailing : .leading, spacing: 4) {
+                            TurnRow(turn: turn)
+                            // A user turn whose message never reached the bridge shows
+                            // a compact per-message failure line with its own Retry /
+                            // Discard — the composer stays enabled, and each failed
+                            // message retries independently.
+                            if let item = failedItem(for: turn.id) {
+                                OutboxFailedControls(
+                                    lastError: item.lastError,
+                                    onRetry: { coordinator.retry(itemID: item.id, context: context) },
+                                    onDiscard: { coordinator.discard(itemID: item.id, context: context) })
+                            }
+                        }
+                        .frame(maxWidth: .infinity, alignment: turn.isUser ? .trailing : .leading)
+                        .id(turn.id)
                     }
                     // Live, streaming reply: the partial text as it arrives, plus
                     // a coarse activity line under the spinner. Cleared and
@@ -598,6 +622,40 @@ private struct StreamingPartialText: View {
     var body: some View {
         TimelineView(.animation(minimumInterval: MarkdownStreamRenderer.interval, paused: !running)) { context in
             MarkdownText(blocks: renderer.blocks(for: text, now: context.date))
+        }
+    }
+}
+
+/// The compact "Not delivered" line shown under a user bubble whose `OutboxItem`
+/// is `.failed`: an orange exclamation, the short reason, and small Retry / Discard
+/// buttons. Matches the transcript's recoverable-error / Re-check visual language
+/// (warning-orange, bordered buttons) rather than inventing new styling.
+private struct OutboxFailedControls: View {
+    let lastError: String?
+    let onRetry: () -> Void
+    let onDiscard: () -> Void
+
+    var body: some View {
+        VStack(alignment: .trailing, spacing: 6) {
+            HStack(spacing: 5) {
+                Image(systemName: "exclamationmark.triangle.fill")
+                Text(lastError.map { "Not delivered — \($0)" } ?? "Not delivered")
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            .font(.caption)
+            .foregroundStyle(.orange)
+            HStack(spacing: 8) {
+                Button(action: onRetry) {
+                    Label("Retry", systemImage: "arrow.clockwise")
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+                Button(role: .destructive, action: onDiscard) {
+                    Label("Discard", systemImage: "trash")
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+            }
         }
     }
 }

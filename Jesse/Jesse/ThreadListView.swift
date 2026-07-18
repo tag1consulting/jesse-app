@@ -8,6 +8,9 @@ struct ThreadListView: View {
     @Environment(\.modelContext) private var context
     @Environment(RunCoordinator.self) private var coordinator
     @Query(sort: \JesseThread.updatedAt, order: .reverse) private var threads: [JesseThread]
+    // Every persisted outbox record; used only to badge rows with an undelivered
+    // (`.failed`) message. Small and observed, so a badge appears/clears live.
+    @Query private var outbox: [OutboxItem]
 
     @Binding var path: [JesseThread]
     @Binding var config: JesseConfig
@@ -48,6 +51,12 @@ struct ThreadListView: View {
     /// favorites/origin terms they always were.
     private var favoritesOnly: Bool { scope == .favorites }
     private var originScope: ThreadOriginScope { scope == .watch ? .watch : .all }
+
+    /// Thread ids with at least one undelivered (`.failed`) outbox message — drives
+    /// the small orange badge on those rows.
+    private var threadsWithFailedOutbox: Set<UUID> {
+        Set(outbox.filter { $0.state == .failed }.map(\.threadID))
+    }
 
     // Whether the on-device query-expansion tier is enabled (Settings toggle,
     // default ON). Off → no `expand` calls, pure Tier-1 multi-token search.
@@ -290,6 +299,7 @@ struct ThreadListView: View {
                 // title+time when idle (the search-only exception to #22).
                 ThreadRow(thread: thread,
                           running: coordinator.isRunning(thread.id),
+                          hasFailedOutbox: threadsWithFailedOutbox.contains(thread.id),
                           searchQueries: searchActive ? activeQueries : [])
             }
             // Lazily mint/refresh this visible row's AI title. Idempotent and
@@ -421,6 +431,9 @@ struct ThreadListView: View {
 struct ThreadRow: View {
     let thread: JesseThread
     let running: Bool
+    /// Whether this thread has any undelivered (`.failed`) outbox message — shows a
+    /// small orange badge so the list surfaces "something didn't send" at a glance.
+    var hasFailedOutbox: Bool = false
     /// The active query list (typed query + expansion terms) while searching; empty
     /// when search is idle. Non-empty switches the second line to the snippet.
     var searchQueries: [String] = []
@@ -455,6 +468,12 @@ struct ThreadRow: View {
                 }
             }
             Spacer()
+            if hasFailedOutbox {
+                Image(systemName: "exclamationmark.circle.fill")
+                    .font(.caption)
+                    .foregroundStyle(.orange)
+                    .accessibilityLabel("Undelivered message")
+            }
             if running {
                 ProgressView()
                     .controlSize(.small)

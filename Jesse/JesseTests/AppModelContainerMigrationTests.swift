@@ -120,6 +120,29 @@ final class AppModelContainerMigrationTests: XCTestCase {
         XCTAssertEqual(attachment.filename, "Photo 1.jpg")
         XCTAssertEqual(attachment.mime, "image/jpeg")
         XCTAssertEqual(attachment.thumbnail, thumbBytes, "the thumbnail bytes survive the open")
+
+        // The V2 outbox entities exist under the migrated schema and are usable: a
+        // V1-populated store (which had no OutboxItem/OutboxAttachment table) opens
+        // under V2 with the two new entities added and empty, and a fresh insert +
+        // round-trip of the ORIGINAL attachment bytes works.
+        XCTAssertEqual(try ctx.fetchCount(FetchDescriptor<OutboxItem>()), 0,
+                       "a V1 store migrates to V2 with an empty outbox")
+        let originalBytes = Data([0x89, 0x50, 0x4E, 0x47, 0x00, 0x11, 0x22, 0x33]) // PNG-ish
+        let outbox = OutboxItem(threadID: favThreadId, turnID: userTurn.id,
+                                text: "with a photo", mode: .tell, voice: false)
+        outbox.attachments.append(
+            OutboxAttachment(filename: "Photo 1.jpg", mime: "image/jpeg", data: originalBytes))
+        ctx.insert(outbox)
+        try ctx.save()
+        let reopened = AppModelContainer.load(url: url)
+        let ctx2 = ModelContext(reopened.container)
+        let items = try ctx2.fetch(FetchDescriptor<OutboxItem>())
+        XCTAssertEqual(items.count, 1)
+        let item = try XCTUnwrap(items.first)
+        XCTAssertEqual(item.state, .sending)
+        XCTAssertEqual(item.threadID, favThreadId)
+        XCTAssertEqual(item.orderedAttachments.first?.data, originalBytes,
+                       "the ORIGINAL full-resolution bytes round-trip through OutboxAttachment")
     }
 
     func testFailedOpenIsFlaggedAndLeavesTheOnDiskFileIntact() throws {

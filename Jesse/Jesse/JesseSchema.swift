@@ -24,18 +24,20 @@ import SwiftData
 // opens under the current schema with all prior rows intact and the new fields
 // reading their defaults. That is exactly a **lightweight** migration.
 //
-// Because the whole lineage collapses to a single lightweight-compatible shape,
-// there is only ONE version so far (`JesseSchemaV1`) and the plan has NO explicit
-// stages — SwiftData performs the lightweight open automatically. This is a
-// deliberate single-version scaffold, not missing work: the value it buys is the
-// populated-store migration test (`AppModelContainerMigrationTests`) and the place
-// to add a `MigrationStage` the day an additive-only change is no longer possible
-// (a rename, a retype, a required de-defaulted field). When that day comes: add
-// `JesseSchemaV2`, append it to `schemas`, and add a `.lightweight`/`.custom`
-// stage from V1 to V2 — the test harness already opens a V1-populated store, so
-// the new stage gets coverage the moment it exists.
+// ── V2: the send outbox ────────────────────────────────────────────────────
+// `JesseSchemaV2` adds two entities — `OutboxItem` and `OutboxAttachment` — so a
+// message survives the pre-ACK window (a timeout / dead network / 429/5xx / a kill
+// mid-POST) that used to lose it, along with its full-resolution attachment bytes.
+// Both are new entities with fully-defaulted properties, so V1 → V2 is still a
+// LIGHTWEIGHT migration (nothing renamed, retyped, or dropped): a V1-populated
+// store opens under V2 with all prior rows intact and the two new (empty) entities
+// added. We nonetheless make it an EXPLICIT version + stage rather than lean on the
+// implicit lightweight open, per the migration-safety plan — so the populated-store
+// migration test (`AppModelContainerMigrationTests`) exercises the V1 → V2 stage,
+// and the next non-additive change has a stage to slot in beside this one.
 
-/// The current (and, so far, only) version of the app's persistent schema.
+/// The original version of the app's persistent schema (through the whole additive
+/// lineage above — all lightweight-compatible).
 enum JesseSchemaV1: VersionedSchema {
     static var versionIdentifier = Schema.Version(1, 0, 0)
 
@@ -44,20 +46,31 @@ enum JesseSchemaV1: VersionedSchema {
     }
 }
 
+/// V2 — adds the send outbox (`OutboxItem` + `OutboxAttachment`). Additive-only, so
+/// V1 → V2 is a lightweight stage.
+enum JesseSchemaV2: VersionedSchema {
+    static var versionIdentifier = Schema.Version(2, 0, 0)
+
+    static var models: [any PersistentModel.Type] {
+        [JesseThread.self, Turn.self, TurnAttachment.self, WrittenMeal.self,
+         OutboxItem.self, OutboxAttachment.self]
+    }
+}
+
 /// The app's live schema, derived from the current `VersionedSchema`. The container
 /// and every migration-test open the store through THIS value so they can never
 /// drift from the versioned model list.
-var jesseCurrentSchema: Schema { Schema(versionedSchema: JesseSchemaV1.self) }
+var jesseCurrentSchema: Schema { Schema(versionedSchema: JesseSchemaV2.self) }
 
-/// The migration plan the container opens the store with. Single-version today (see
-/// the lineage note above): one schema, no explicit stages, so SwiftData does the
-/// lightweight open. Future schema versions append here.
+/// The migration plan the container opens the store with: V1 → V2, a single
+/// lightweight stage (the outbox entities are additive). Future schema versions
+/// append a new version and a new stage here.
 enum JesseMigrationPlan: SchemaMigrationPlan {
     static var schemas: [any VersionedSchema.Type] {
-        [JesseSchemaV1.self]
+        [JesseSchemaV1.self, JesseSchemaV2.self]
     }
 
     static var stages: [MigrationStage] {
-        []
+        [.lightweight(fromVersion: JesseSchemaV1.self, toVersion: JesseSchemaV2.self)]
     }
 }

@@ -155,7 +155,7 @@ final class ThreadHistoryTests: XCTestCase {
     @MainActor
     func testSendAppendsOptimisticTurnAndSurfacesNotConfigured() async throws {
         let container = try ModelContainer(
-            for: JesseThread.self, Turn.self,
+            for: JesseThread.self, Turn.self, OutboxItem.self, OutboxAttachment.self,
             configurations: ModelConfiguration(isStoredInMemoryOnly: true))
         let context = ModelContext(container)
         // Empty host/token → JesseClient.send throws .notConfigured before any network.
@@ -164,22 +164,38 @@ final class ThreadHistoryTests: XCTestCase {
         let thread = JesseThread(mode: .ask)
         coordinator.send(thread: thread, text: "what's on Today?", voice: false, context: context)
 
-        // The user turn shows immediately and the thread is marked running.
+        // The user turn shows immediately and the thread is marked running while the
+        // outbox item is `.sending`.
         XCTAssertEqual(thread.turns.count, 1)
         XCTAssertEqual(thread.turns.first?.isUser, true)
         XCTAssertEqual(thread.title, "what's on Today?")
         XCTAssertTrue(coordinator.isRunning(thread.id))
 
-        // The doomed call resolves quickly: error set, run cleared.
-        try await waitUntil { coordinator.error(for: thread.id) != nil }
+        // The doomed (pre-ACK) call resolves quickly. This failure class is owned by
+        // the per-message outbox UI, NOT the thread-level banner: the OutboxItem flips
+        // to `.failed` with a mapped message, the run clears, and `errors[]` stays nil.
+        try await waitUntil { self.failedOutboxItems(for: thread.id, context).count == 1 }
         XCTAssertFalse(coordinator.isRunning(thread.id))
-        XCTAssertNotNil(coordinator.error(for: thread.id))
+        XCTAssertNil(coordinator.error(for: thread.id),
+                     "a pre-ACK failure does not set the thread-level banner")
+        let failed = try XCTUnwrap(failedOutboxItems(for: thread.id, context).first)
+        XCTAssertEqual(failed.turnID, thread.turns.first?.id, "keyed to the optimistic user turn")
+        XCTAssertEqual(failed.attempts, 1)
+        XCTAssertEqual(failed.lastError, JesseError.notConfigured.errorDescription)
+    }
+
+    @MainActor
+    private func failedOutboxItems(for threadID: UUID, _ context: ModelContext) -> [OutboxItem] {
+        let failed = OutboxState.failed.rawValue
+        let d = FetchDescriptor<OutboxItem>(
+            predicate: #Predicate { $0.threadID == threadID && $0.stateRaw == failed })
+        return (try? context.fetch(d)) ?? []
     }
 
     @MainActor
     func testSecondSendIgnoredWhileRunning() async throws {
         let container = try ModelContainer(
-            for: JesseThread.self, Turn.self,
+            for: JesseThread.self, Turn.self, OutboxItem.self, OutboxAttachment.self,
             configurations: ModelConfiguration(isStoredInMemoryOnly: true))
         let context = ModelContext(container)
         let coordinator = RunCoordinator(config: { JesseConfig(host: "", port: 8765, token: "") })

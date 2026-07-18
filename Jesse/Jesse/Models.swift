@@ -237,6 +237,103 @@ final class TurnAttachment {
     var isPDF: Bool { mime == "application/pdf" }
 }
 
+/// The delivery state of an `OutboxItem`. `sending` while its transmit is in
+/// flight (the thread reads as running); `failed` once a send threw before the
+/// bridge ACKed it — the state the per-message Retry/Discard UI keys off. Stored
+/// as a String raw value so the model lightweight-migrates and an unknown/absent
+/// value reads as `.sending`, mirroring how `TurnRole`/`ThreadOrigin` map.
+enum OutboxState: String {
+    case sending
+    case failed
+}
+
+/// A message that has been staged for send but not yet ACKed by the bridge. It is
+/// created (state `.sending`) in the SAME save as its optimistic user `Turn`, and
+/// DELETED the instant `client.send` returns any success (a 202 `.running` job id
+/// or the legacy inline 200 `.reply`). Before that ACK the outbox owns the message:
+/// a timeout, a dead network, a 429/5xx, or the app being suspended/killed mid-POST
+/// would otherwise lose it — and the full-resolution attachment bytes with it, since
+/// only thumbnails persist on the `Turn` and the composer clears its staged bytes at
+/// send. A pre-ACK failure flips this to `.failed` (never auto-retried — a manual
+/// per-message Retry re-runs the transmit with the SAME `id`, so the bridge dedups
+/// if the original POST actually landed).
+///
+/// `id` IS the wire `request_id` (the bridge's idempotency key). All properties are
+/// defaulted so existing stores lightweight-migrate, matching how `TurnAttachment`
+/// was added. Registered in `AppModelContainer` via `JesseSchemaV2`.
+@Model
+final class OutboxItem {
+    // This IS the wire `request_id` sent as `request_id` on `POST /jesse`.
+    var id: UUID = UUID()
+    // The thread this message belongs to (id, not a relationship — the thread is
+    // fetched by id on the recovery paths where no live reference survives a kill).
+    var threadID: UUID = UUID()
+    // The optimistic user `Turn` this message created (reused verbatim on Retry —
+    // never a second user bubble; deleted on Discard).
+    var turnID: UUID = UUID()
+    var text: String = ""
+    // The mode the turn was staged with (`JesseMode` raw value).
+    var mode: String = JesseMode.ask.rawValue
+    var voice: Bool = false
+    // `OutboxState` raw value — "sending" | "failed".
+    var stateRaw: String = OutboxState.sending.rawValue
+    // The human-readable failure line (a mapped `JesseError` message) once `.failed`.
+    var lastError: String?
+    // How many times a transmit of this message has failed pre-ACK.
+    var attempts: Int = 0
+    var createdAt: Date = Date()
+
+    @Relationship(deleteRule: .cascade, inverse: \OutboxAttachment.item)
+    var attachments: [OutboxAttachment] = []
+
+    init(id: UUID = UUID(), threadID: UUID, turnID: UUID, text: String,
+         mode: JesseMode, voice: Bool, state: OutboxState = .sending,
+         createdAt: Date = Date()) {
+        self.id = id
+        self.threadID = threadID
+        self.turnID = turnID
+        self.text = text
+        self.mode = mode.rawValue
+        self.voice = voice
+        self.stateRaw = state.rawValue
+        self.createdAt = createdAt
+    }
+
+    /// The delivery state, decoded from the raw value (unknown/absent → `.sending`).
+    var state: OutboxState { OutboxState(rawValue: stateRaw) ?? .sending }
+    /// The staged mode, decoded from the raw value (unknown/absent → `.ask`).
+    var modeValue: JesseMode { JesseMode(rawValue: mode) ?? .ask }
+    /// Attachments in a stable order (the relationship itself is unordered).
+    var orderedAttachments: [OutboxAttachment] {
+        attachments.sorted { $0.createdAt < $1.createdAt }
+    }
+}
+
+/// The ORIGINAL full-resolution bytes of one file staged with an `OutboxItem` —
+/// the always-sendable staged (post-downscale) bytes the composer would otherwise
+/// drop at send. Held in `.externalStorage` so a large image doesn't bloat the
+/// sqlite row, and cascade-deleted with its item (at ACK, or on Discard). Distinct
+/// from `TurnAttachment`, which keeps only a small thumbnail for history.
+@Model
+final class OutboxAttachment {
+    var id: UUID = UUID()
+    var filename: String = ""
+    var mime: String = ""
+    @Attribute(.externalStorage) var data: Data = Data()
+    var createdAt: Date = Date()
+    // The owning item; nil only transiently before insert. `OutboxItem.attachments`
+    // is the cascade side.
+    var item: OutboxItem?
+
+    init(filename: String, mime: String, data: Data, createdAt: Date = Date()) {
+        self.id = UUID()
+        self.filename = filename
+        self.mime = mime
+        self.data = data
+        self.createdAt = createdAt
+    }
+}
+
 /// A meal already written to Apple Health, keyed by the bridge-provided stable
 /// meal `id` (date + slot). Its purpose is idempotency AND correction tracking: before
 /// applying a delivered meal we consult this store, so a re-poll, Re-check, re-opened
