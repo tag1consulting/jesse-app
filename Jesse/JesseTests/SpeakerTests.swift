@@ -15,8 +15,10 @@ final class SpeakerTests: XCTestCase {
     }
 
     /// A session that succeeds, to confirm the success path records no error.
+    /// Counts activations so a test can assert muting never touches the session.
     private final class OKSession: AudioSessioning {
-        func activate() throws {}
+        var activateCount = 0
+        func activate() throws { activateCount += 1 }
         func deactivate() throws {}
     }
 
@@ -70,6 +72,30 @@ final class SpeakerTests: XCTestCase {
         speaker.speak("important note")
         XCTAssertNotNil(speaker.lastSessionError, "the routing failure is surfaced")
         XCTAssertEqual(spy.spoken, ["important note"], "the reply is still spoken despite the session failure")
+    }
+
+    // MARK: - Dev mute (JESSE_MUTE)
+
+    /// When muted, `speak` delivers nothing to the synth AND never activates the
+    /// audio session — so it neither speaks nor ducks other audio.
+    func testMutedSpeaksNothingAndNeverActivatesSession() {
+        let spy = SpySynth()
+        let session = OKSession()
+        let speaker = Speaker(session: session, synth: spy, muted: true)
+        speaker.speak("hello")
+        XCTAssertEqual(spy.spoken, [], "a muted speaker hands nothing to the synthesizer")
+        XCTAssertEqual(session.activateCount, 0, "muting must not activate the audio session (no ducking)")
+    }
+
+    /// The un-muted path is unchanged: text still reaches the synth and the session
+    /// is activated.
+    func testNotMutedStillSpeaksAndActivatesSession() {
+        let spy = SpySynth()
+        let session = OKSession()
+        let speaker = Speaker(session: session, synth: spy, muted: false)
+        speaker.speak("hello")
+        XCTAssertEqual(spy.spoken, ["hello"], "an un-muted speaker still delivers to the synthesizer")
+        XCTAssertEqual(session.activateCount, 1, "the un-muted path still activates the audio session")
     }
 
     func testStopForwardsToSynth() {

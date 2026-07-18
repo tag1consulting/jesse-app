@@ -15,6 +15,16 @@ CI both run it). See the "Versioning" section of `bridge/README.md`.
 
 ## [Unreleased]
 
+## [App 1.0 (50)] — 2026-07-18
+
+### Added
+- **`JESSE_MUTE` dev flag to silence spoken (TTS) replies without muting the Mac.**
+  Setting `JESSE_MUTE=1` in the run scheme's environment makes `Speaker.speak` a
+  no-op that returns before activating the audio session — so it never ducks other
+  audio and never reaches the synthesizer. The flag defaults off (env unset), so
+  production behavior is unchanged; it is injectable through the initializer for
+  deterministic tests. A dev/debug convenience, not a user-facing setting.
+
 ## [App 1.0 (49)] — 2026-07-18
 
 ### Added
