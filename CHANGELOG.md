@@ -15,6 +15,50 @@ CI both run it). See the "Versioning" section of `bridge/README.md`.
 
 ## [Unreleased]
 
+## [Bridge 0.19.0] — 2026-07-18
+
+### Fixed
+- **Local diet mirror now emits the SAME deterministic per-meal ids as the hosted
+  logging skill.** The on-Studio mirror previously emitted one `JESSE_MEAL_LOG` meal
+  PER food row with a positional id `<date>-<slot>-<HHMM>-<seq>`. That `seq` is not
+  recomputable from the CSV, so a correction arriving via the hosted path computed a
+  DIFFERENT id and duplicated the Apple Health entry; worse, now that app-side upserts
+  are version-agnostic, a recurring `seq` across turns with different content could
+  hash-rewrite the WRONG Health entry. `build_meal_log_from_food_rows` now GROUPS the
+  turn's verified food rows by `(date, meal slot, HHMM)` into one mirror meal per group
+  with id `<date>-<slot lowercased>-<HHMM>` (no seq) — byte-identical to the id the
+  hosted contract computes for the same rows, and recomputable from the CSV alone, so a
+  later correction or retraction targets the exact same Health entry. Each nutrient is
+  summed in trusted Rust over the group's rows that carry a KNOWN value (kcal, protein,
+  carbs, fat as plain sums; fiber and the six meal-wire micros summed over known rows
+  only, the field OMITTED entirely when no row in the group carries it — unknown stays
+  unknown, never a summed `0`). Model-side aggregation remains impossible by
+  construction (the bridge sums, never the model). There is no `omega3` meal-wire field
+  (no HealthKit EPA+DHA type), so nothing is summed for it. The 10-meals-per-block cap
+  is now enforced on the group count (grouping only shrinks the block).
+  - **Migration note (accepted, not fixed).** Meals already written to Health under the
+    old `-<seq>`-suffixed ids stay stranded under those ids; a later correction to such
+    a meal inserts under the new-format id and duplicates the Health entry. The window
+    is small, so this is accepted rather than migrated.
+- **The local extract pipeline is no longer correction-blind.** `no_loggable_content`
+  was true only when a message logged nothing at all, so a keyword-bearing correction
+  ("actually lunch was two bowls, about 700 kcal") could be extracted as a fresh log —
+  appending a DUPLICATE row to `food-log.csv` (corrupting the source of truth) plus
+  mirroring a new-id meal. The extract prompt and the `DIET_EXTRACT_SCHEMA`
+  `no_loggable_content` description now instruct the child to set `no_loggable_content`
+  true and return an empty `entries` array for any message that AMENDS, corrects, moves,
+  or deletes something already logged, routing the turn to rung 2 (the hosted path,
+  which owns the correction contract). The local path is insert-only by design; every
+  correction takes the hosted path. No gate- or verify-level machinery was added — the
+  existing rung-2 reason codes / metrics already measure how the extract children
+  classify these turns.
+  - Tests (red→green): same slot+time rows group into one summed meal with a seq-free
+    id; micro sum discipline (known + unknown = the known value; an all-None group
+    serializes no key) for fiber and every micro; different slots/times stay separate
+    meals; exact id equality with the hosted `<date>-<slot>-<HHMM>` format; the
+    10-meal cap enforced on group count after grouping; the extract prompt/schema carry
+    the amendment rule. Existing per-row / seq-id assertions were flipped to match.
+
 ## [App 1.0 (51)] — 2026-07-18
 
 ### Changed
