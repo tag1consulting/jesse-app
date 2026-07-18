@@ -73,6 +73,11 @@ const MEAL_FIELDS: &[&str] = &[
     "satfat_g",
     "sugar_g",
     "potassium_mg",
+    // HealthKit-bound micros only: calcium and magnesium have HealthKit types. Omega-3
+    // does NOT (there is no EPA/DHA HealthKit quantity), so `omega3_mg` is deliberately
+    // NOT a meal wire field and stays an unknown key here.
+    "calcium_mg",
+    "magnesium_mg",
 ];
 
 /// Sections a `JESSE_NEEDS_HEALTH` directive may request (the phone-assembled
@@ -155,6 +160,13 @@ pub struct Meal {
     pub sugar_g: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub potassium_mg: Option<f64>,
+    /// The two newest HealthKit-bound micros, same pre-summed / omit-when-unknown
+    /// discipline. `calcium_mg`/`magnesium_mg` are milligrams. Omega-3 has no HealthKit
+    /// type, so there is deliberately no `omega3_mg` field here.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub calcium_mg: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub magnesium_mg: Option<f64>,
 }
 
 /// The parsed payload of a `JESSE_MEAL_LOG` directive, plus the corrections-queue
@@ -598,7 +610,10 @@ pub fn parse_meal_batch_v2(
     // A meal move is retract-old + upsert-new; the SAME id in both arrays is malformed.
     for m in &meals {
         if retract.iter().any(|r| r == &m.id) {
-            return Err(format!("id {:?} appears in both `meals` and `retract`", m.id));
+            return Err(format!(
+                "id {:?} appears in both `meals` and `retract`",
+                m.id
+            ));
         }
     }
 
@@ -630,6 +645,8 @@ fn parse_meal(item: &Value) -> Result<Meal, String> {
         satfat_g: optional_macro(m, "satfat_g")?,
         sugar_g: optional_macro(m, "sugar_g")?,
         potassium_mg: optional_macro(m, "potassium_mg")?,
+        calcium_mg: optional_macro(m, "calcium_mg")?,
+        magnesium_mg: optional_macro(m, "magnesium_mg")?,
     })
 }
 
@@ -893,6 +910,8 @@ mod tests {
                     satfat_g: None,
                     sugar_g: None,
                     potassium_mg: None,
+                    calcium_mg: Some(60.0),
+                    magnesium_mg: None,
                 }],
                 retract: Vec::new(),
                 corrections_seq: None,
@@ -910,6 +929,7 @@ mod tests {
             meal["sodium_mg"], 410.0,
             "known micronutrient under its wire key"
         );
+        assert_eq!(meal["calcium_mg"], 60.0, "known calcium under its wire key");
         assert!(
             meal.get("protein_g").is_none(),
             "absent macro omitted, not null"
@@ -918,17 +938,19 @@ mod tests {
         assert!(
             meal.get("satfat_g").is_none()
                 && meal.get("sugar_g").is_none()
-                && meal.get("potassium_mg").is_none(),
+                && meal.get("potassium_mg").is_none()
+                && meal.get("magnesium_mg").is_none(),
             "absent micronutrients omitted, not null"
         );
     }
 
     #[test]
     fn meal_log_parses_all_four_micronutrients() {
-        // A meal carrying all four micronutrients under their wire keys decodes each
-        // (a measured-zero sugar included), and an absent one is None — never 0.
+        // A meal carrying the wire micronutrients (the four originals plus the two
+        // HealthKit-bound newcomers calcium_mg/magnesium_mg) decodes each (a measured-
+        // zero sugar included), and an absent one is None — never 0.
         let reply = "JESSE_MEAL_LOG v1 {\"meals\":[{\"id\":\"a\",\"consumedAt\":\"t\",\"name\":\"Prosciutto\",\
-            \"sodium_mg\":900,\"satfat_g\":2.5,\"sugar_g\":0,\"potassium_mg\":180}]}";
+            \"sodium_mg\":900,\"satfat_g\":2.5,\"sugar_g\":0,\"potassium_mg\":180,\"calcium_mg\":8,\"magnesium_mg\":20}]}";
         let m = meal_log(reply).unwrap().meals.remove(0);
         assert_eq!(m.sodium_mg, Some(900.0));
         assert_eq!(m.satfat_g, Some(2.5));
@@ -938,12 +960,34 @@ mod tests {
             "zero is a valid measured micronutrient"
         );
         assert_eq!(m.potassium_mg, Some(180.0));
+        assert_eq!(m.calcium_mg, Some(8.0));
+        assert_eq!(m.magnesium_mg, Some(20.0));
 
         // Subset present: the omitted ones stay None.
-        let reply2 = "JESSE_MEAL_LOG v1 {\"meals\":[{\"id\":\"a\",\"consumedAt\":\"t\",\"name\":\"n\",\"sodium_mg\":150}]}";
+        let reply2 = "JESSE_MEAL_LOG v1 {\"meals\":[{\"id\":\"a\",\"consumedAt\":\"t\",\"name\":\"n\",\"calcium_mg\":150}]}";
         let m2 = meal_log(reply2).unwrap().meals.remove(0);
-        assert_eq!(m2.sodium_mg, Some(150.0));
-        assert!(m2.satfat_g.is_none() && m2.sugar_g.is_none() && m2.potassium_mg.is_none());
+        assert_eq!(m2.calcium_mg, Some(150.0));
+        assert!(
+            m2.sodium_mg.is_none()
+                && m2.satfat_g.is_none()
+                && m2.sugar_g.is_none()
+                && m2.potassium_mg.is_none()
+                && m2.magnesium_mg.is_none()
+        );
+
+        // v2 accepts them identically (same parse_meal path).
+        let v2 = "JESSE_MEAL_LOG v2 {\"meals\":[{\"id\":\"a\",\"consumedAt\":\"t\",\"name\":\"n\",\"calcium_mg\":40,\"magnesium_mg\":12}],\"retract\":[\"old\"]}";
+        let mv2 = meal_log(v2).unwrap().meals.remove(0);
+        assert_eq!(mv2.calcium_mg, Some(40.0));
+        assert_eq!(mv2.magnesium_mg, Some(12.0));
+
+        // Omega-3 has NO HealthKit type, so `omega3_mg` is NOT a meal wire field: it is
+        // an unknown key → the whole block is malformed and passes through visible.
+        let o3 = "JESSE_MEAL_LOG v1 {\"meals\":[{\"id\":\"a\",\"consumedAt\":\"t\",\"name\":\"n\",\"omega3_mg\":50}]}";
+        assert!(
+            meal_log(o3).is_none(),
+            "omega3_mg is not a meal field — rejected as an unknown key"
+        );
     }
 
     #[test]
@@ -1109,9 +1153,10 @@ mod tests {
         // corrections_seq is delivery-only → omitted when None.
         assert!(v.get("corrections_seq").is_none());
 
-        let without =
-            meal_log("JESSE_MEAL_LOG v2 {\"meals\":[{\"id\":\"a\",\"consumedAt\":\"t\",\"name\":\"n\"}]}")
-                .unwrap();
+        let without = meal_log(
+            "JESSE_MEAL_LOG v2 {\"meals\":[{\"id\":\"a\",\"consumedAt\":\"t\",\"name\":\"n\"}]}",
+        )
+        .unwrap();
         let v2 = serde_json::to_value(&without).unwrap();
         assert!(v2.get("retract").is_none(), "empty retract omitted, not []");
     }
@@ -1125,7 +1170,10 @@ mod tests {
             "JESSE_MEAL_LOG v10 {\"meals\":[{\"id\":\"a\",\"consumedAt\":\"t\",\"name\":\"n\"}]}",
         ] {
             let (text, directives) = extract_directives(reply);
-            assert_eq!(text, reply, "unknown meal_log version stays visible: {reply:?}");
+            assert_eq!(
+                text, reply,
+                "unknown meal_log version stays visible: {reply:?}"
+            );
             assert!(directives.is_none());
         }
     }
@@ -1133,7 +1181,8 @@ mod tests {
     #[test]
     fn meal_log_v1_rejects_a_retract_key() {
         // `retract` is v2-only; on a v1 line it is an unknown top-level field → malformed.
-        let reply = "JESSE_MEAL_LOG v1 {\"meals\":[{\"id\":\"a\",\"consumedAt\":\"t\",\"name\":\"n\"}],\
+        let reply =
+            "JESSE_MEAL_LOG v1 {\"meals\":[{\"id\":\"a\",\"consumedAt\":\"t\",\"name\":\"n\"}],\
             \"retract\":[\"b\"]}";
         let (text, directives) = extract_directives(reply);
         assert_eq!(text, reply);
@@ -1222,10 +1271,16 @@ mod tests {
             "JESSE_MEAL_LOG v1 {\"meals\":[{\"id\":\"a\",\"consumedAt\":\"t\"}]}",
             // empty (blank) required field
             "JESSE_MEAL_LOG v1 {\"meals\":[{\"id\":\"  \",\"consumedAt\":\"t\",\"name\":\"n\"}]}",
-            // unknown meal field (a schema key like sodium_mg would now parse)
+            // unknown meal field (a schema key like sodium_mg/calcium_mg would now parse,
+            // but omega3_mg has no HealthKit type so it stays unknown → malformed)
             "JESSE_MEAL_LOG v1 {\"meals\":[{\"id\":\"a\",\"consumedAt\":\"t\",\"name\":\"n\",\"added_sugar_g\":5}]}",
+            "JESSE_MEAL_LOG v1 {\"meals\":[{\"id\":\"a\",\"consumedAt\":\"t\",\"name\":\"n\",\"omega3_mg\":50}]}",
             // negative micronutrient
             "JESSE_MEAL_LOG v1 {\"meals\":[{\"id\":\"a\",\"consumedAt\":\"t\",\"name\":\"n\",\"sodium_mg\":-5}]}",
+            "JESSE_MEAL_LOG v1 {\"meals\":[{\"id\":\"a\",\"consumedAt\":\"t\",\"name\":\"n\",\"calcium_mg\":-5}]}",
+            "JESSE_MEAL_LOG v1 {\"meals\":[{\"id\":\"a\",\"consumedAt\":\"t\",\"name\":\"n\",\"magnesium_mg\":-1}]}",
+            // micronutrient explicitly null (contract says omit, never null-pad)
+            "JESSE_MEAL_LOG v1 {\"meals\":[{\"id\":\"a\",\"consumedAt\":\"t\",\"name\":\"n\",\"calcium_mg\":null}]}",
             // non-finite micronutrient (JSON has no NaN, but an out-of-f64-range literal is not finite)
             "JESSE_MEAL_LOG v1 {\"meals\":[{\"id\":\"a\",\"consumedAt\":\"t\",\"name\":\"n\",\"potassium_mg\":1e400}]}",
             // micronutrient not a number

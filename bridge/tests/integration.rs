@@ -1615,10 +1615,11 @@ async fn meal_log_directive_is_extracted_and_stripped_on_the_poll_result() {
 
 #[tokio::test]
 async fn meal_log_directive_carries_micronutrients_under_their_wire_keys() {
-    // A meal that carries known sodium/sugar round-trips those under the EXACT wire
-    // keys the app decodes (`sodium_mg`, `sugar_g`), while a micronutrient the meal
-    // did not carry (potassium) stays ABSENT on the wire — never a null-padded 0.
-    let line = r#"{"type":"result","is_error":false,"result":"Logged.\nJESSE_MEAL_LOG v1 {\"meals\":[{\"id\":\"2026-07-04-lunch\",\"consumedAt\":\"2026-07-04T12:30:00+02:00\",\"name\":\"Lunch: prosciutto\",\"kcal\":120,\"sodium_mg\":900,\"satfat_g\":2.5,\"sugar_g\":0}]}","session_id":"sess-micro"}"#;
+    // A meal that carries known sodium/sugar/calcium round-trips those under the EXACT
+    // wire keys the app decodes (`sodium_mg`, `sugar_g`, `calcium_mg`), while a
+    // micronutrient the meal did not carry (potassium, magnesium) stays ABSENT on the
+    // wire — never a null-padded 0.
+    let line = r#"{"type":"result","is_error":false,"result":"Logged.\nJESSE_MEAL_LOG v1 {\"meals\":[{\"id\":\"2026-07-04-lunch\",\"consumedAt\":\"2026-07-04T12:30:00+02:00\",\"name\":\"Lunch: prosciutto\",\"kcal\":120,\"sodium_mg\":900,\"satfat_g\":2.5,\"sugar_g\":0,\"calcium_mg\":15}]}","session_id":"sess-micro"}"#;
     let (st, job_id) =
         run_turn_emitting(r#"{"mode":"tell","text":"log lunch: prosciutto"}"#, line).await;
     let v = result_status(&st, &job_id).await;
@@ -1629,9 +1630,14 @@ async fn meal_log_directive_carries_micronutrients_under_their_wire_keys() {
         meal["sugar_g"], 0.0,
         "measured-zero sugar carried, not dropped"
     );
+    assert_eq!(meal["calcium_mg"], 15.0, "known calcium under `calcium_mg`");
     assert!(
         meal.get("potassium_mg").is_none(),
         "unknown potassium is absent on the wire, never 0"
+    );
+    assert!(
+        meal.get("magnesium_mg").is_none(),
+        "unknown magnesium is absent on the wire, never 0"
     );
 }
 

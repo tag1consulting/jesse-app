@@ -304,7 +304,10 @@ mod tests {
         }])
         .unwrap();
         let p = build_vaultqa_prompt("So how old is she?", None, Some(&recent));
-        assert!(p.starts_with(RECENT_CONVERSATION_HEADER), "recent block leads: {p}");
+        assert!(
+            p.starts_with(RECENT_CONVERSATION_HEADER),
+            "recent block leads: {p}"
+        );
         let recent_at = p.find(RECENT_CONVERSATION_HEADER).unwrap();
         let q_at = p.find("QUESTION:").unwrap();
         assert!(recent_at < q_at, "recent block sits above QUESTION");

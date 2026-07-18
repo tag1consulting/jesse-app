@@ -429,6 +429,13 @@ pub fn reconstruct_meals(content: &str, date: &str) -> (Vec<Value>, Vec<String>)
             "satf": opt_num(&col(&rec, "SatFat_g")),
             "sug": opt_num(&col(&rec, "Sugar_g")),
             "k": opt_num(&col(&rec, "Potassium_mg")),
+            // The three newest trailing micronutrients — same opt_num discipline: a
+            // blank/unparseable/absent cell is UNKNOWN (JSON null), never 0. Per-item
+            // GAUGE fields on GET /jesse/diet; short names ca/o3/mg match the app
+            // snapshot decoder.
+            "ca": opt_num(&col(&rec, "Calcium_mg")),
+            "o3": opt_num(&col(&rec, "Omega3_mg")),
+            "mg": opt_num(&col(&rec, "Magnesium_mg")),
         });
         if let Some(g) = groups.iter_mut().find(|g| g.0 == meal && g.1 == time) {
             g.2.push(item);
@@ -1038,7 +1045,7 @@ mod tests {
 
     // ---- reconstruct_meals -------------------------------------------------
 
-    const FOOD_HEADER: &str = "Date,Meal,Item,Amount,Unit,Cal_per_100g,Grams,Calories,Protein_g,Fat_g,Carbs_g,Notes,Time,Meal_Type,Fiber_g,Sodium_mg,SatFat_g,Sugar_g,Potassium_mg";
+    const FOOD_HEADER: &str = "Date,Meal,Item,Amount,Unit,Cal_per_100g,Grams,Calories,Protein_g,Fat_g,Carbs_g,Notes,Time,Meal_Type,Fiber_g,Sodium_mg,SatFat_g,Sugar_g,Potassium_mg,Calcium_mg,Omega3_mg,Magnesium_mg";
 
     #[test]
     fn groups_meals_by_meal_and_time_two_same_named_meals_stay_separate() {
@@ -1179,10 +1186,10 @@ mod tests {
 
     #[test]
     fn micronutrients_populated_yield_their_numbers() {
-        // All four trailing cells present → na/satf/sug/k carry those numbers.
+        // All seven trailing cells present → na/satf/sug/k/ca/o3/mg carry those numbers.
         let csv = format!(
             "{FOOD_HEADER}\n\
-             2026-04-15,Lunch,Soup,1,bowl,,,220,8,6,30,,12:00,Lunch,7,480,2.5,9,610\n"
+             2026-04-15,Lunch,Soup,1,bowl,,,220,8,6,30,,12:00,Lunch,7,480,2.5,9,610,120,300,45\n"
         );
         let (meals, errs) = reconstruct_meals(&csv, "2026-04-15");
         assert!(errs.is_empty(), "clean row: {errs:?}");
@@ -1191,17 +1198,20 @@ mod tests {
         assert_eq!(item["satf"], 2.5);
         assert_eq!(item["sug"], 9.0);
         assert_eq!(item["k"], 610.0);
+        assert_eq!(item["ca"], 120.0);
+        assert_eq!(item["o3"], 300.0);
+        assert_eq!(item["mg"], 45.0);
         // Existing keys untouched.
         assert_eq!(item["fiber"], 7.0);
     }
 
     #[test]
     fn micronutrients_blank_cells_are_null_not_zero() {
-        // The four cells present-but-blank mean UNKNOWN → null, NOT 0.0. This is
+        // The trailing cells present-but-blank mean UNKNOWN → null, NOT 0.0. This is
         // the whole reason they use opt_num rather than num_or_zero (fiber).
         let csv = format!(
             "{FOOD_HEADER}\n\
-             2026-04-15,Lunch,Soup,1,bowl,,,220,8,6,30,,12:00,Lunch,7,,,,\n"
+             2026-04-15,Lunch,Soup,1,bowl,,,220,8,6,30,,12:00,Lunch,7,,,,,,,\n"
         );
         let (meals, errs) = reconstruct_meals(&csv, "2026-04-15");
         assert!(
@@ -1213,15 +1223,18 @@ mod tests {
         assert!(item["satf"].is_null(), "blank SatFat_g → null, not 0");
         assert!(item["sug"].is_null(), "blank Sugar_g → null, not 0");
         assert!(item["k"].is_null(), "blank Potassium_mg → null, not 0");
+        assert!(item["ca"].is_null(), "blank Calcium_mg → null, not 0");
+        assert!(item["o3"].is_null(), "blank Omega3_mg → null, not 0");
+        assert!(item["mg"].is_null(), "blank Magnesium_mg → null, not 0");
         // Fiber, by contrast, still collapses a blank to 0.
         assert_eq!(item["fiber"], 7.0);
     }
 
     #[test]
     fn legacy_short_row_micronutrients_are_null_and_row_parses() {
-        // A legacy row that ends BEFORE the four micronutrient columns (here it
-        // stops after Fiber_g, 15 fields) must parse normally — not be counted
-        // malformed — with na/satf/sug/k all null (the missing cells read blank).
+        // A legacy row that ends BEFORE the micronutrient columns (here it stops
+        // after Fiber_g, 15 fields) must parse normally — not be counted malformed —
+        // with na/satf/sug/k/ca/o3/mg all null (the missing cells read blank).
         let csv = format!(
             "{FOOD_HEADER}\n\
              2026-03-30,Breakfast,Toast,2,ea,,,180,6,2,32,,08:00,Breakfast,3\n"
@@ -1237,6 +1250,9 @@ mod tests {
         assert!(item["satf"].is_null(), "missing SatFat_g cell → null");
         assert!(item["sug"].is_null(), "missing Sugar_g cell → null");
         assert!(item["k"].is_null(), "missing Potassium_mg cell → null");
+        assert!(item["ca"].is_null(), "missing Calcium_mg cell → null");
+        assert!(item["o3"].is_null(), "missing Omega3_mg cell → null");
+        assert!(item["mg"].is_null(), "missing Magnesium_mg cell → null");
         // The row still reconstructs its existing fields fine.
         assert_eq!(item["fiber"], 3.0);
         assert_eq!(item["cal"], 180.0);

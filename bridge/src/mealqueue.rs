@@ -179,18 +179,17 @@ impl MealCorrectionsQueue {
             return 0;
         };
         let all: Vec<QueuedMealBatch> = read_json_lines(path);
-        let keep: Vec<QueuedMealBatch> = all
-            .iter()
-            .filter(|b| b.seq > acked_seq)
-            .cloned()
-            .collect();
+        let keep: Vec<QueuedMealBatch> =
+            all.iter().filter(|b| b.seq > acked_seq).cloned().collect();
         let pruned = all.len() - keep.len();
         if pruned == 0 {
             return 0;
         }
         // On rewrite failure, leave the file as-is (redeliver rather than risk a torn file).
         if rewrite_json_lines(path, &keep).is_err() {
-            eprintln!("meal-corrections: prune rewrite failed for ack seq={acked_seq} — left intact");
+            eprintln!(
+                "meal-corrections: prune rewrite failed for ack seq={acked_seq} — left intact"
+            );
             return 0;
         }
         eprintln!("meal-corrections: pruned {pruned} batch(es) at/below acked seq={acked_seq}");
@@ -237,7 +236,12 @@ pub fn merge_meal_corrections(
 
     for b in &batches {
         for m in &b.meals {
-            record(&mut order, &mut ops, m.id.clone(), Op::Upsert(Box::new(m.clone())));
+            record(
+                &mut order,
+                &mut ops,
+                m.id.clone(),
+                Op::Upsert(Box::new(m.clone())),
+            );
         }
         for r in &b.retract {
             record(&mut order, &mut ops, r.clone(), Op::Retract);
@@ -372,6 +376,8 @@ mod tests {
             satfat_g: None,
             sugar_g: None,
             potassium_mg: None,
+            calcium_mg: None,
+            magnesium_mg: None,
         }
     }
 
@@ -443,7 +449,8 @@ mod tests {
         let dir = tmp_dir();
         let q = MealCorrectionsQueue::from_dir(&dir);
         for i in 0..MAX_MEAL_CORRECTION_BATCHES {
-            q.enqueue(vec![meal(&format!("m{i}"), None)], vec![]).unwrap();
+            q.enqueue(vec![meal(&format!("m{i}"), None)], vec![])
+                .unwrap();
         }
         assert_eq!(q.len(), MAX_MEAL_CORRECTION_BATCHES);
         match q.enqueue(vec![meal("over", None)], vec![]) {
@@ -506,7 +513,11 @@ mod tests {
         assert_eq!(ml.meals.len(), 1);
         assert_eq!(ml.meals[0].id, "q1");
         assert_eq!(ml.retract, vec!["gone"]);
-        assert_eq!(ml.corrections_seq, Some(1), "highest queued seq stamped for ack");
+        assert_eq!(
+            ml.corrections_seq,
+            Some(1),
+            "highest queued seq stamped for ack"
+        );
     }
 
     #[test]
@@ -547,7 +558,10 @@ mod tests {
         q.enqueue(vec![meal("x", Some(120.0))], vec![]).unwrap(); // seq 2: re-logged
         let ml = merge_meal_corrections(None, &q).unwrap().meal_log.unwrap();
         // The delivered payload must NOT list x in both arrays (the app would reject that).
-        assert!(ml.retract.is_empty(), "relog supersedes the earlier retract");
+        assert!(
+            ml.retract.is_empty(),
+            "relog supersedes the earlier retract"
+        );
         assert_eq!(ml.meals.len(), 1);
         assert_eq!(ml.meals[0].id, "x");
         assert_eq!(ml.meals[0].sodium_mg, Some(120.0));

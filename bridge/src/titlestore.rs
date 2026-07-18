@@ -198,10 +198,16 @@ mod tests {
         store.set("local-abc", "Jamie's Birthday");
         store.rename("local-abc", "real-sess-1");
         assert_eq!(store.get("local-abc"), None, "old key cleared");
-        assert_eq!(store.get("real-sess-1").as_deref(), Some("Jamie's Birthday"));
+        assert_eq!(
+            store.get("real-sess-1").as_deref(),
+            Some("Jamie's Birthday")
+        );
         // No-ops: same id, missing source, empty ids.
         store.rename("real-sess-1", "real-sess-1");
-        assert_eq!(store.get("real-sess-1").as_deref(), Some("Jamie's Birthday"));
+        assert_eq!(
+            store.get("real-sess-1").as_deref(),
+            Some("Jamie's Birthday")
+        );
         store.rename("ghost", "real-sess-1");
         assert_eq!(store.len(), 1);
     }

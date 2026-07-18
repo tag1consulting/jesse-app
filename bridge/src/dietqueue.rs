@@ -360,6 +360,9 @@ mod tests {
                 satfat_g: None,
                 sugar_g: None,
                 potassium_mg: None,
+                calcium_mg: None,
+                omega3_mg: None,
+                magnesium_mg: None,
                 notes: Some("queued during outage".to_string()),
             })],
         }

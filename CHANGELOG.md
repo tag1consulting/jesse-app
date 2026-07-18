@@ -15,6 +15,43 @@ CI both run it). See the "Versioning" section of `bridge/README.md`.
 
 ## [Unreleased]
 
+## [Bridge 0.18.0] — 2026-07-18
+
+### Added
+- **Three more diet micronutrients end to end — calcium, omega-3 (marine EPA+DHA),
+  and magnesium — same unknown-is-not-zero discipline as the existing four.** The
+  food-log CSV grows three trailing columns (`Calcium_mg`, `Omega3_mg`,
+  `Magnesium_mg`), so the header is now 22 columns. As with sodium/satfat/sugar/
+  potassium, a value the message or label never established stays *absent* at every
+  stage — omitted extract key, `None` in the struct, blank CSV cell, omitted wire
+  field — and is **never** `0` standing in for "did not know".
+  - **Read path (`GET /jesse/diet`).** `reconstruct_meals` emits three new per-item
+    GAUGE fields — `ca`/`o3`/`mg` — via `opt_num` (blank/unparseable/absent → JSON
+    `null`, never `0`). A legacy short row that ends before the new columns reads them
+    as null and still parses.
+  - **Write path (extract → verify → append).** `FoodEntry` gains `calcium_mg`,
+    `omega3_mg`, `magnesium_mg`; the extract schema/prompt add the three keys with the
+    fill-only-from-a-label-or-confident-estimate rule. Omega-3 is defined as marine
+    long-chain **EPA+DHA only** (fish, shellfish, roe, small amounts in eggs/dairy) —
+    never the plant ALA in walnuts, flax, chia, or vegetable oils, and omitted for a
+    plant-ALA-only food. Calcium and magnesium, like potassium, are usually absent on
+    EU labels and so usually omitted. The verifier corrects only the five macros; the
+    new micros carry through a correction untouched.
+  - **Apple Health mirror (`JESSE_MEAL_LOG`).** Only the HealthKit-bound micros ride
+    the meal wire: `calcium_mg` and `magnesium_mg` are added to the meal allowlist and
+    the `Meal` struct (finite, non-negative, explicit `null` rejected, omitted when
+    unknown). **Omega-3 has no HealthKit type** (`dietaryFatPolyunsaturated` includes
+    ALA, wrong for EPA/DHA), so it is deliberately NOT a meal field — the derived
+    off-phone mirror populates calcium and magnesium only.
+  - Unchanged by design: `MacroTotals`/`sum_food_csv_for_date` (blank-means-0, correct
+    only for the five macros), the ASCII dashboard, and the today pass-through path.
+  - Tests: read-path null-vs-number round trips and legacy-short-row; header/row parity
+    at 22 columns; parse accepts all three / a subset / none and still rejects an
+    out-of-schema key loudly; blank-stays-unknown round trip; the full 22-cell row;
+    verify carry-through keeps `calcium_mg`; the meal wire accepts calcium/magnesium on
+    v1 and v2, rejects null/negative, and rejects `omega3_mg` as an unknown key; the
+    derived mirror serializes calcium/magnesium when known and omits them when not.
+
 ## [App 1.0 (48)] — 2026-07-17
 
 ### Added
