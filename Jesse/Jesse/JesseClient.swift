@@ -908,10 +908,14 @@ struct JesseClient: JesseClientProtocol {
         let enabled = isHealthContextEnabled()
         let relevant = enabled ? await healthClassifier.isRelevant(text) : false
         let attach = HealthContextGate.shouldAttach(enabled: enabled, relevant: relevant)
-        let healthContext = await HealthContextResolver.resolve(
-            enabled: attach,
-            provider: healthProvider,
-            now: Date())
+        // Resolve the HealthKit block and the diet nutrient rollup concurrently so the
+        // extra diet GET doesn't add serial latency, then compose them into the one
+        // health_context. Both are best-effort and gated on the same relevance decision.
+        async let healthBlock = HealthContextResolver.resolve(
+            enabled: attach, provider: healthProvider, now: Date())
+        async let dietRollup = dietRollupBlock(enabled: attach)
+        let healthContext = DietContextComposer.combine(
+            healthBlock: await healthBlock, dietRollup: await dietRollup)
         let request = Self.makeRequest(mode: mode, text: text, sessionId: sessionId,
                                        voice: voice, instructions: instructions,
                                        floorOverride: floorOverride,
@@ -920,6 +924,22 @@ struct JesseClient: JesseClientProtocol {
                                        mealCorrectionsAck: mealCorrectionsAck(),
                                        requestId: requestId)
         return try await postTurn(request)
+    }
+
+    /// The compact multi-window nutrient rollup for the coach's `health_context`, or nil.
+    /// Best-effort and gated on the same health-relevance decision as the HealthKit block:
+    /// off → nil (no diet GET at all); otherwise fetch the diet snapshot and, when it
+    /// carries a `nutrientSeries` (bridge ≥ 0.21.0), render the 7/30/all rollup over KNOWN
+    /// days only. Any failure (transport, decode, older bridge without the field) → nil, so
+    /// a turn is never blocked or broken. The top-sources lines use the loaded day's food
+    /// detail — the per-item log the app has.
+    private func dietRollupBlock(enabled: Bool) async -> String? {
+        guard enabled else { return nil }
+        guard let snapshot = try? await fetchDietSnapshot() else { return nil }
+        guard let series = snapshot.nutrientSeries, NutrientTrends.isAvailable(series) else { return nil }
+        let text = NutrientTrends.coachRollup(series: series, targets: snapshot.today.targets,
+                                              meals: snapshot.today.meals)
+        return text.isEmpty ? nil : text
     }
 
     func sendFulfilling(_ requested: NeedsHealthRequest, mode: JesseMode, text: String,

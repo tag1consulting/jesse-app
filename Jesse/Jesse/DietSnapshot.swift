@@ -301,6 +301,44 @@ struct WeightPoint: Decodable, Equatable, Sendable {
     var notes: String?
 }
 
+/// One nutrient's aggregate for a single day in `nutrientSeries` (bridge ≥ 0.21.0):
+/// the sum of KNOWN item values only, and the item counts behind it. `sum` NEVER
+/// includes an unknown item (unknown ≠ 0); `unknown > 0` means the day is PARTIAL — a
+/// lower bound, which matters for a floor nutrient. This mirrors the per-day
+/// `MicronutrientTotal` shape but is history-wide, one entry per logged day.
+struct NutrientDayValue: Decodable, Equatable, Sendable {
+    var sum: Double
+    var known: Int
+    var unknown: Int
+
+    init(sum: Double, known: Int, unknown: Int) {
+        self.sum = sum; self.known = known; self.unknown = unknown
+    }
+}
+
+/// One day in `nutrientSeries`: an ISO `yyyy-MM-dd` date and the per-nutrient
+/// aggregates PRESENT that day, keyed by the bridge's short nutrient key
+/// (`cal`/`p`/`f`/`c`/`fiber`/`na`/`satf`/`sug`/`k`/`ca`/`o3`/`mg`/`unsat`). A nutrient
+/// key is present only when at least one item that day carried a known value; a key
+/// ABSENT from `nutrients` is a GAP (all-unknown that day), never a zero. Pure data —
+/// every gap-aware computation lives in `NutrientTrends`, never here.
+struct NutrientDay: Decodable, Equatable, Sendable {
+    var date: String
+    var nutrients: [String: NutrientDayValue]
+
+    enum CodingKeys: String, CodingKey { case date, nutrients }
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        date = try c.decode(String.self, forKey: .date)
+        nutrients = try c.decodeIfPresent([String: NutrientDayValue].self, forKey: .nutrients) ?? [:]
+    }
+    // A memberwise init for tests/previews (the custom decoder suppresses the
+    // synthesized one).
+    init(date: String, nutrients: [String: NutrientDayValue] = [:]) {
+        self.date = date; self.nutrients = nutrients
+    }
+}
+
 /// The tier a day's data came from (bridge ≥ 0.7.0). `live` is today; `archived`
 /// is a past day served from its saved `diet-today.js` copy (full targets, judged
 /// like today); `reconstructed` is a past day rebuilt from the append-only CSVs
@@ -325,6 +363,12 @@ struct DietSnapshot: Decodable, Equatable, Sendable {
     var coach: DietCoach?
     var weightSeries: [WeightPoint]?
     var errors: [String]
+    /// Per-day, per-nutrient history aggregate (bridge ≥ 0.21.0), ascending by date,
+    /// most recent 90 logged days. The source for the per-nutrient trend charts and the
+    /// coach's multi-window rollup. Absent/empty on an older bridge → the trend
+    /// affordance hides, no crash. UNKNOWN ≠ ZERO: every computation over this runs only
+    /// on days where the nutrient key is present (see `NutrientTrends`).
+    var nutrientSeries: [NutrientDay]?
     /// Every date the app can page to (union of the logs + archives + today),
     /// sorted ascending. Absent on an old bridge → paging stays disabled.
     var availableDays: [String]?
@@ -335,7 +379,7 @@ struct DietSnapshot: Decodable, Equatable, Sendable {
 
     enum CodingKeys: String, CodingKey {
         case asOf, todayMtime, today, proposed, progress, coach, weightSeries, errors
-        case availableDays, historical, fidelity
+        case nutrientSeries, availableDays, historical, fidelity
     }
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
@@ -347,6 +391,7 @@ struct DietSnapshot: Decodable, Equatable, Sendable {
         coach = try c.decodeIfPresent(DietCoach.self, forKey: .coach)
         weightSeries = try c.decodeIfPresent([WeightPoint].self, forKey: .weightSeries)
         errors = try c.decodeIfPresent([String].self, forKey: .errors) ?? []
+        nutrientSeries = try c.decodeIfPresent([NutrientDay].self, forKey: .nutrientSeries)
         availableDays = try c.decodeIfPresent([String].self, forKey: .availableDays)
         historical = try c.decodeIfPresent(Bool.self, forKey: .historical)
         fidelity = try c.decodeIfPresent(String.self, forKey: .fidelity)
@@ -356,11 +401,13 @@ struct DietSnapshot: Decodable, Equatable, Sendable {
     init(asOf: String = "", todayMtime: String? = nil, today: DietToday,
          proposed: DietProposed? = nil, progress: DietProgress? = nil,
          coach: DietCoach? = nil, weightSeries: [WeightPoint]? = nil,
-         errors: [String] = [], availableDays: [String]? = nil,
+         errors: [String] = [], nutrientSeries: [NutrientDay]? = nil,
+         availableDays: [String]? = nil,
          historical: Bool? = nil, fidelity: String? = nil) {
         self.asOf = asOf; self.todayMtime = todayMtime; self.today = today
         self.proposed = proposed; self.progress = progress; self.coach = coach
         self.weightSeries = weightSeries; self.errors = errors
+        self.nutrientSeries = nutrientSeries
         self.availableDays = availableDays; self.historical = historical
         self.fidelity = fidelity
     }

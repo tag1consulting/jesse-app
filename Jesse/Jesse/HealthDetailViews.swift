@@ -34,6 +34,10 @@ struct MacrosCaloriesDetail: View {
     let hour: Int
     /// A reconstructed day has no recorded targets → plain totals, no bars/colors.
     var neutral: Bool = false
+    /// The per-nutrient history (bridge ≥ 0.21.0), passed straight into the drill-down so
+    /// each nutrient row can push its trend. Nil/empty on an older bridge → no trend
+    /// affordance. Defaulted so previews/older call sites compile unchanged.
+    var nutrientSeries: [NutrientDay]? = nil
     @State private var explainer: Explainer?
 
     private var g: DietGauges { DietSemantics.gauges(for: today, hour: hour) }
@@ -173,7 +177,8 @@ struct MacrosCaloriesDetail: View {
         // use, so both entry points open the identical enriched sheet.
         var withFoods = ex
         withFoods.drilldown = FoodDrilldown.build(meals: today.meals, metric: metric,
-                                                  gauge: gauge, isCarbLoad: g.isCarbLoad)
+                                                  gauge: gauge, isCarbLoad: g.isCarbLoad,
+                                                  series: nutrientSeries, targets: today.targets)
         return MetricBarRow(gauge: gauge, isSubEntry: isSubEntry) { explainer = withFoods }
     }
 

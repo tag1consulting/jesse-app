@@ -15,6 +15,48 @@ CI both run it). See the "Versioning" section of `bridge/README.md`.
 
 ## [Unreleased]
 
+## [App 1.0 (53)] — 2026-07-18
+
+### Added
+- **Per-nutrient trend charts + multi-window coaching, from the bridge's
+  `nutrientSeries`.** Consumes the additive `nutrientSeries` field (Bridge 0.21.0),
+  degrading gracefully when it's absent/empty (the trend affordance simply hides).
+  Carries the core rule end to end: **unknown is not zero** — every computation runs
+  only over the days a nutrient key is present; a gap day is never a 0, never a day
+  under a floor or over a ceiling, and coverage (days known / logged days in window) is
+  surfaced next to every verdict.
+  - **`NutrientTrends` — a pure, Foundation-only trend engine** (no SwiftUI, fully
+    unit-tested), sitting beside `DietSemantics`/`FoodContributions`. Per nutrient +
+    window it exposes the plottable known-day points (gap days absent, partial days
+    flagged), coverage, the **median** (resists a single binge/fast day),
+    floor `countUnderTarget`/`pctUnderTarget`, ceiling `countOverTarget`/`pctOverTarget`,
+    target-kind median-distance, an informational distribution (median/min/max, never a
+    pass/fail), and a **direction classified relative to the nutrient's kind**
+    (floor rising = improving, ceiling rising = worsening; informational is neutral
+    rising/falling; under 6 known days → "not enough data"). Plus a plain-language
+    verdict, a top-sources ranker (reusing the drill-down contributor math, KNOWN
+    contributions only), and the compact 7/30/all coach rollup.
+  - **`TrendNutrient` — the single-source model for all thirteen nutrients**
+    (`cal/p/f/c/fiber/na/satf/sug/k/ca/o3/mg/unsat`): full name, unit, kind
+    (floor/ceiling/target/informational), target lookup, and the curated grounding copy
+    (`whyItMatters` + `goodSources`) so no health claim is model-invented. Mirrors the
+    `Macro`/`Micronutrient` display-name enums, guarded by tests.
+  - **`NutrientTrendDetail` — the trend view** (Swift Charts, drawn in the
+    `WeightTrendDetail` language): a 30d/90d/All range picker, drag-to-scrub, a
+    kind-colored target rule, **visible gaps** (the line breaks across any missing day —
+    a gap reads as "no data", never a dip to zero), partial days as hollow "at least
+    this" points, and a summary band with the engine's verdict, the consequence copy,
+    the top sources in range, and a "raise it with" hint for a short floor. Reached one
+    tap deeper — a "View trend" row inside the existing contributors drill-down sheet,
+    not top-level Health chrome (exactly like the weight trend behind the weight card).
+  - **Coach multi-window grounding.** On a health/diet-relevant turn the app now folds a
+    compact, plain-text nutrient rollup into `health_context` (composed alongside the
+    HealthKit block, well under the bridge's 8 KiB cap): a framing sentence, one terse
+    line per nutrient across 7/30/all (coverage-gated — "insufficient data" rather than a
+    misleading number), and, for each standing problem (worst first), its consequence,
+    the real top-contributing foods, and its good-source foods so the coach grounds a fix
+    in real food. Truncates worst-first (informational dropped first) when oversized.
+
 ## [Bridge 0.21.0] — 2026-07-18
 
 ### Added

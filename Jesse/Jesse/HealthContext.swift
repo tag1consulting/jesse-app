@@ -407,6 +407,31 @@ nonisolated enum HealthContextResolver {
     }
 }
 
+// MARK: - Diet rollup composition
+
+/// Joins the HealthKit block and the diet nutrient rollup into the one `health_context`
+/// string a coach turn carries, under a hard ceiling well below the bridge's
+/// `MAX_HEALTH_CONTEXT_BYTES` (8 KiB). Either part may be nil/empty; returns nil when
+/// both are. The diet rollup is already budgeted by `NutrientTrends.coachRollup`; this
+/// only joins the two subsections and, defensively, keeps the higher-value HealthKit
+/// block alone if the combined block would somehow exceed the ceiling.
+nonisolated enum DietContextComposer {
+    /// Hard ceiling on the combined block — the HealthKit block self-limits to 3 KiB and
+    /// the diet rollup to ~2.5 KiB, so 6 KiB leaves clear headroom under the 8 KiB cap.
+    static let maxBytes = 6 * 1024
+
+    static func combine(healthBlock: String?, dietRollup: String?) -> String? {
+        let health = healthBlock.flatMap { $0.isEmpty ? nil : $0 }
+        let diet = dietRollup.flatMap { $0.isEmpty ? nil : $0 }
+        guard let diet else { return health }
+        guard let health else {
+            return diet.utf8.count <= maxBytes ? diet : nil
+        }
+        let combined = health + "\n\n" + diet
+        return combined.utf8.count <= maxBytes ? combined : health
+    }
+}
+
 // MARK: - Provider seam
 
 /// The one seam HealthKit hides behind. A conformer returns a best-effort

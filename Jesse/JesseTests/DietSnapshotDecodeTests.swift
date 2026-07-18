@@ -291,6 +291,58 @@ final class DietSnapshotDecodeTests: XCTestCase {
         XCTAssertEqual(s.today.date, "2026-07-09")
     }
 
+    // MARK: - nutrientSeries (bridge ≥ 0.21.0) — additive, unknown ≠ zero
+
+    // A snapshot carrying a two-day nutrientSeries: one full day and one where a nutrient
+    // key is a GAP (absent) and another is partial (unknown > 0).
+    private let withSeries = """
+    {
+      "asOf": "2026-07-09T14:50:55Z",
+      "today": {
+        "date": "2026-07-09", "exercise": [], "meals": [],
+        "targets": { "calories": 2100, "protein": 190, "magnesium": 400 }
+      },
+      "errors": [],
+      "nutrientSeries": [
+        { "date": "2026-07-07",
+          "nutrients": {
+            "cal": { "sum": 2000, "known": 5, "unknown": 0 },
+            "mg":  { "sum": 250,  "known": 3, "unknown": 2 }
+          } },
+        { "date": "2026-07-08",
+          "nutrients": {
+            "cal": { "sum": 1900, "known": 4, "unknown": 0 }
+          } }
+      ]
+    }
+    """
+
+    func testDecodesNutrientSeries() throws {
+        let s = try decode(withSeries)
+        let series = try XCTUnwrap(s.nutrientSeries)
+        XCTAssertEqual(series.count, 2)
+        XCTAssertEqual(series[0].date, "2026-07-07")
+        // sum/known/unknown parse.
+        let cal0 = try XCTUnwrap(series[0].nutrients["cal"])
+        XCTAssertEqual(cal0.sum, 2000)
+        XCTAssertEqual(cal0.known, 5)
+        XCTAssertEqual(cal0.unknown, 0)
+        // A partial nutrient day: unknown > 0, sum is the KNOWN-only floor.
+        let mg0 = try XCTUnwrap(series[0].nutrients["mg"])
+        XCTAssertEqual(mg0.sum, 250)
+        XCTAssertEqual(mg0.unknown, 2)
+        // Day two: magnesium is a GAP (absent from the map), never a zero entry.
+        XCTAssertNil(series[1].nutrients["mg"], "an all-unknown nutrient day is absent, not 0")
+        XCTAssertEqual(series[1].nutrients["cal"]?.sum, 1900)
+    }
+
+    func testSnapshotWithoutNutrientSeriesStillDecodes() throws {
+        // The `full` and `degraded` fixtures carry no nutrientSeries → nil (graceful,
+        // older bridge), and the whole payload decodes cleanly.
+        XCTAssertNil(try decode(full).nutrientSeries)
+        XCTAssertNil(try decode(degraded).nutrientSeries)
+    }
+
     // MARK: - decodeDiet status mapping
 
     private func resp(_ code: Int) -> HTTPURLResponse {
