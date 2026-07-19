@@ -9,10 +9,10 @@ Axum + Tokio. Compiles to a single static binary — drop it on the laptop and r
 ## Run
 
 ```bash
-cd Code/jesse-mobile/bridge
+cd bridge
 
 export JESSE_TOKEN="$(openssl rand -hex 24)"   # save this for the phone
-export JESSE_VAULT="$HOME/devel/tag1/jesse"
+export JESSE_VAULT="$HOME/vault"
 
 # Bind to the tailnet IP so the phone can reach it. Find it with:
 #   tailscale ip -4
@@ -945,7 +945,7 @@ curl -s http://127.0.0.1:8765/jesse/sessions \
 - **Projects-dir derivation (verified).** The `<escaped-vault-path>` is
   `cfg.vault` with **every non-alphanumeric character replaced by `-`** (so `/`,
   `.`, and `_` all become `-`; an existing `-` is kept; runs are not collapsed).
-  e.g. `/Users/you/devel/tag1/jesse` → `-Users-you-devel-tag1-jesse`. This was
+  e.g. `/Users/you/vault` → `-Users-you-vault`. This was
   verified against `claude 2.1.208` by creating a session in a controlled cwd and
   matching the created directory name; it is a **pure, unit-tested** function
   (`escape_project_path`) pinned against that convention.
@@ -1132,7 +1132,7 @@ cargo run --release
 | Var | Default | Purpose |
 |---|---|---|
 | `JESSE_TOKEN` | (required) | Bearer token the phone must send |
-| `JESSE_VAULT` | `~/devel/tag1/jesse` | cwd for `claude -p` (loads CLAUDE.md) |
+| `JESSE_VAULT` | `~/vault` | cwd for `claude -p` (loads CLAUDE.md) |
 | `JESSE_BIND` | `127.0.0.1` | Interface to bind — set to tailnet IP. Loopback/tailnet (`100.64.0.0/10`) only unless `JESSE_ALLOW_PUBLIC_BIND=1` |
 | `JESSE_ALLOW_PUBLIC_BIND` | (off) | Set `1`/`true` to allow a non-loopback/non-tailnet bind; otherwise such a bind is a startup error |
 | `JESSE_ALLOWED_TOOLS` | (scoped default) | Comma-separated `--allowedTools` list for the agent (see [`../SECURITY.md`](../SECURITY.md)) |
@@ -1575,9 +1575,3 @@ repo, then reads/searches/diffs it.
   dispatches a frame at each new `event:` line. This only affected the live,
   display-only token stream; the poll path (which owns completion) always
   delivered the reply, so no answer was ever lost to it.
-
-## Note
-
-`_removed-python/` holds the original Python prototype, kept only because this
-sandbox can't delete files on the mounted volume. Delete it when you relocate the
-project — it is not part of the build.

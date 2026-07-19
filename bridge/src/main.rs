@@ -60,7 +60,7 @@ async fn main() {
 
     // Pairing QR — scan it from the app's Settings to fill in host/port/token.
     // The advertised host defaults to the bound IP (reliably reachable on the
-    // tailnet; the ts.net name has DNS quirks per STATUS.md). Override with
+    // tailnet; the ts.net name can have DNS quirks). Override with
     // JESSE_ADVERTISE_HOST to force the MagicDNS name into the QR instead.
     let advertise_host =
         std::env::var("JESSE_ADVERTISE_HOST").unwrap_or_else(|_| state.cfg.bind.clone());

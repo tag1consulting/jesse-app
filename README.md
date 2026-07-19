@@ -32,7 +32,6 @@ iPhone (Jesse app)  ──HTTP over Tailscale──▶  Laptop (jesse-bridge)  �
 |---|---|
 | `bridge/` | Rust bridge service. See [`bridge/README.md`](bridge/README.md) for the full HTTP contract, endpoints, and env knobs. |
 | `Jesse/` | Xcode project for the iOS app (`Jesse` app target + `JesseTests`). |
-| `STATUS.md` | Running build/test log and design notes. |
 
 ---
 
@@ -98,7 +97,7 @@ Read this before pairing a second device or running the bridge anywhere shared.
 ### Do not commit or share secrets
 
 - **Never put a real `JESSE_TOKEN` in a file you commit** — not in this README,
-  scripts, CI, or `STATUS.md`. Pass it through the environment at runtime
+  scripts, CI, or any tracked file. Pass it through the environment at runtime
   (examples below generate a fresh one and never echo a literal).
 - **The startup pairing QR contains the token.** Do not screenshot, paste, or
   screen-share that terminal output. Anyone who can read it can drive your vault.
@@ -170,7 +169,7 @@ Full table in [`bridge/README.md`](bridge/README.md#knobs-env-vars). Most-used:
 | Var | Default | Purpose |
 |---|---|---|
 | `JESSE_TOKEN` | **required** | Bearer token the phone must send. The server refuses to start without it. |
-| `JESSE_VAULT` | `~/devel/tag1/jesse` | Working directory for `claude -p`. Must be an existing directory. |
+| `JESSE_VAULT` | `~/vault` | Working directory for `claude -p`. Must be an existing directory. |
 | `JESSE_BIND` | `127.0.0.1` | Interface to bind. Set to the tailnet IP for phone access. Loopback/tailnet only unless `JESSE_ALLOW_PUBLIC_BIND=1`. |
 | `JESSE_ALLOW_PUBLIC_BIND` | _(off)_ | Set to `1` to allow binding a non-loopback/non-tailnet address. Off by default; an unsafe bind is otherwise a startup error. |
 | `JESSE_ALLOWED_TOOLS` | _(scoped default)_ | Comma-separated `--allowedTools` list for the agent. See [SECURITY.md](SECURITY.md). |
@@ -345,4 +344,4 @@ These are the things most likely to bite during setup, roughly in order:
   -- -D warnings`). A clean release build is the gate.
 - **App:** `xcodebuild build` / `xcodebuild test` with the `Jesse` scheme. Keep the
   test suite green and the build warning-free.
-- See `STATUS.md` for the running log of what was built, tested, and decided.
+- See `CHANGELOG.md` for the per-version record of what changed in each component.

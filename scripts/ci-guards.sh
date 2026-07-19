@@ -91,17 +91,73 @@ if hits="$(grep -nE '/tmp/[^"'"'"']*token|jesse_token' "${RS[@]}" || true)"; the
 fi
 
 # 5) (R5/T9) No personal infrastructure in tracked files — a real tailnet IP,
-#    MagicDNS/tailnet id, a developer's machine name, or a personal absolute
-#    home path must never ship. Scans the whole tracked tree (STATUS.md and
-#    other internal worklogs are .gitignored, so they are out of scope here).
-PERSONAL='100\.70\.149\.25|tailnet|build-host|/Users/user'
+#    MagicDNS/tailnet id, a developer's machine name, a personal launchd label,
+#    or a personal absolute home path must never ship. Scans the whole tracked
+#    tree (STATUS.md and other internal worklogs are .gitignored, so they are out
+#    of scope here).
+#
+#    These patterns are DENYLIST minus a small ALLOWLIST of documented placeholders,
+#    and they are deliberately GENERIC — this file names NO real developer, host,
+#    launchd label, or home path (there is nothing here for a `grep` or a history
+#    scrub to find). It describes the *shape* of a leak:
+#      * a non-boundary IP inside the CGNAT/tailnet range 100.64.0.0/10;
+#      * an auto-generated MagicDNS id, `tail<digits>[.ts.net]`;
+#      * an Apple auto-hostname, `<name>s-MacBook` / `<name>s-Mac-Studio` / …;
+#      * a personal reverse-DNS launchd label, `com.<who>.jesse-*`;
+#      * an absolute `/Users/<name>` home path.
+#    An earlier version hard-listed specific IPs and missed one in the same range
+#    that then shipped green — hence the generic range rather than an enumeration.
+#    The allowlist covers what the repo legitimately documents: the CGNAT CIDR and
+#    its boundary/example addresses, the `example`/`tag1` label namespaces, and the
+#    generic `/Users/{u,you,user,someuser}` doc placeholders.
+PERSONAL_DENY='100\.(6[4-9]|[7-9][0-9]|1[01][0-9]|12[0-7])\.[0-9]{1,3}\.[0-9]{1,3}|tail[0-9]{4,}|[A-Za-z]+s-[Mm]ac([Bb]ook|-[Ss]tudio|-[Mm]ini|-[Aa]ir)|[A-Za-z]+s-i[Mm]ac|com\.[a-z0-9]+\.jesse-|/Users/[a-z][a-z0-9_.-]+'
+# ALLOW: documented placeholders. IP branches are anchored so `.1` does not also
+#        swallow `.10`/`.199`; any OTHER in-range address stays flagged.
+PERSONAL_ALLOW='100\.64\.0\.0/10|100\.64\.0\.0([^0-9]|$)|100\.64\.0\.1([^0-9]|$)|100\.127\.255\.255|com\.(example|tag1)\.|/Users/(u|you|user|someuser)([^A-Za-z0-9]|$)'
+
+# 5a) Self-check the matcher itself before trusting it against the tree. A future
+#     edit that neuters the regex (so a real leak sails through green) is caught
+#     here: known-bad samples MUST match, known-good placeholders MUST NOT. Every
+#     sample is SYNTHETIC (not anyone's real identifier) — the same generic rules
+#     that flag these flag the real leaked values too, without this file carrying
+#     any real value for a grep or history scrub to surface.
+_flagged() {  # 0 (true) iff $1 matches DENY and is not wholly an ALLOW placeholder
+  printf '%s\n' "$1" | grep -qE "$PERSONAL_DENY" \
+    && ! printf '%s\n' "$1" | grep -qE "$PERSONAL_ALLOW"
+}
+selfcheck_fail=0
+for bad in \
+  'JESSE_BIND=100.99.42.7' \
+  'host=100.120.5.200:8765' \
+  'foo.tail000042.ts.net' \
+  'someones-MacBook-Pro' \
+  'devs-Mac-Studio-3' \
+  'label com.acme.jesse-bridge' \
+  '/Users/somebody/devel/vault'
+do
+  _flagged "$bad" || { echo "ci-guards SELFCHECK: expected to FLAG but did not: $bad" >&2; selfcheck_fail=1; }
+done
+for ok in \
+  '100.64.0.0/10' 'host=100.64.0.1 port=8765' 'is_bind_allowed("100.64.0.0")' \
+  '"100.127.255.255"' 'not 100.128.0.1' 'your-host.tailnet.ts.net' \
+  'my-laptop.tailnet-1234.ts.net' 'com.example.jesse-vaultqa-audit' \
+  'com.tag1.Jesse' '/Users/user/vault' '/Users/you/devel' '/Users/u/x'
+do
+  _flagged "$ok" && { echo "ci-guards SELFCHECK: false-positive on placeholder: $ok" >&2; selfcheck_fail=1; }
+done
+if [ "$selfcheck_fail" -ne 0 ]; then
+  flag "personal-infra matcher self-check failed (see SELFCHECK lines above)" \
+    "the R5 denylist/allowlist regex is broken — fix it before trusting a green run"
+fi
+
 if git -C "$ROOT" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
-  # Exclude this script: it is the one reviewed place those patterns must appear
-  # (as the matcher itself), so it would otherwise flag its own definition.
+  # Exclude this script: it is the one reviewed place these patterns must appear
+  # (as the matcher and its self-check samples), so it would otherwise flag itself.
   if hits="$(git -C "$ROOT" ls-files -z -- . ':!:scripts/ci-guards.sh' \
-      | xargs -0 grep -nE "$PERSONAL" 2>/dev/null || true)"; then
+      | xargs -0 grep -nE "$PERSONAL_DENY" 2>/dev/null \
+      | grep -vE "$PERSONAL_ALLOW" || true)"; then
     if [ -n "$hits" ]; then
-      flag "personal infra (tailnet IP / MagicDNS / machine name / home path) in a tracked file" "$hits"
+      flag "personal infra (tailnet IP / MagicDNS / machine name / launchd label / home path) in a tracked file" "$hits"
     fi
   fi
 fi

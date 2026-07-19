@@ -5,7 +5,7 @@
 //!
 //! Run:
 //!     export JESSE_TOKEN="$(openssl rand -hex 24)"
-//!     export JESSE_VAULT="$HOME/devel/tag1/jesse"
+//!     export JESSE_VAULT="$HOME/vault"
 //!     export JESSE_BIND="$(tailscale ip -4 | head -1)"   # or 127.0.0.1 to test
 //!     cargo run --release
 //!

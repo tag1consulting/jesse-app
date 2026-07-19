@@ -597,7 +597,7 @@ impl Config {
             token: env_string("JESSE_TOKEN").unwrap_or_default(),
             // Capture HOME once — session-path lookups read `cfg.home`, not the env.
             home: home.clone(),
-            vault: env_string("JESSE_VAULT").unwrap_or_else(|| format!("{home}/devel/tag1/jesse")),
+            vault: env_string("JESSE_VAULT").unwrap_or_else(|| format!("{home}/vault")),
             bind: env_string("JESSE_BIND").unwrap_or_else(|| "127.0.0.1".to_string()),
             port: env_parse("JESSE_PORT", 8765),
             claude_bin: env_string("JESSE_CLAUDE_BIN").unwrap_or_else(|| "claude".to_string()),

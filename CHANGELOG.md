@@ -15,6 +15,32 @@ CI both run it). See the "Versioning" section of `bridge/README.md`.
 
 ## [Unreleased]
 
+## [Bridge 0.22.3] — 2026-07-19
+
+### Changed
+- **Publishing prep: no personal infrastructure in the tracked tree.** Ahead of
+  open-sourcing, scrubbed developer-specific values from tracked/shipped files and
+  hardened the guard that enforces it:
+  - The default `JESSE_VAULT` is now `~/vault` (was a developer's personal vault
+    path) in `bridge/src/config.rs`; the doc/run examples and both READMEs match.
+    The live bridge sets `JESSE_VAULT` explicitly, so this changes only the
+    unset-env fallback. The `eval` harness's `vault_dir()` now resolves
+    `$JESSE_VAULT` first (else `~/vault`), mirroring the bridge.
+  - Genericized the personal launchd label prefix (`com.<developer>.jesse-*`) to
+    `com.example.jesse-*` in `bridge/README.md` and `CHANGELOG.md`, and removed a
+    stale `_removed-python/` note and `STATUS.md` references from the docs.
+- **`scripts/ci-guards.sh` R5 guard now catches the whole tailnet address space,
+  not a hand-listed set of IPs.** The previous denylist enumerated specific IPs and
+  missed others in the same CGNAT range. It now flags any non-boundary
+  `100.64.0.0/10` address and any `tail<digits>.ts.net` MagicDNS id (plus machine
+  names, personal launchd labels, and home paths), while allowlisting the CIDR and
+  boundary/example addresses the repo legitimately documents. Added an inline
+  matcher self-check that fails loudly if a future edit neuters the regex.
+
+### Added
+- **Apache-2.0 `LICENSE` and `NOTICE`** at the repo root, and a `license =
+  "Apache-2.0"` field in `bridge/Cargo.toml`.
+
 ## [Bridge 0.22.2] — 2026-07-19
 
 ### Changed

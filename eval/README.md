@@ -36,7 +36,7 @@ Outputs: `<out>/results.json` (one record per task) and `<out>/scorecard.md`
 
 - `fixture` — the harness creates a fresh temp dir and populates it from the
   task's inline `fixture_files` before the run. Hermetic and repeatable.
-- `vault-readonly` — the task runs with cwd `~/devel/tag1/jesse` (the real vault).
+- `vault-readonly` — the task runs with cwd `$JESSE_VAULT` (else `~/vault`, the real vault).
   Its allowlist may contain **only** read tools: `Read`, `Grep`, `Glob`, and the
   four `mcp__qmd__*` tools. Any other tool (`Write`, `Edit`, any `Bash`, …) is
   **refused before the suite runs** so an eval can never modify the vault. This

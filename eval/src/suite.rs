@@ -3,8 +3,8 @@
 //! A suite is a JSON file (see `eval/README.md` for the documented schema and a
 //! full example task). Tasks are hermetic: a `fixture` task runs in a fresh temp
 //! dir populated from its inline `fixture_files`; a `vault-readonly` task runs
-//! against the real vault (`~/devel/tag1/jesse`) and MUST be restricted to read
-//! tools only — enforced by [`Task::validate`].
+//! against the real vault (`$JESSE_VAULT`, else `~/vault`) and MUST be restricted
+//! to read tools only — enforced by [`Task::validate`].
 
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -23,7 +23,7 @@ pub struct Suite {
 pub enum Workspace {
     /// A fresh temp dir populated from `fixture_files` before the run. Hermetic.
     Fixture,
-    /// The real vault at `~/devel/tag1/jesse`, read-only. Allowlist is hard-capped
+    /// The real vault (`$JESSE_VAULT`, else `~/vault`), read-only. Allowlist is hard-capped
     /// to read tools by [`Task::validate`] so an eval run can never mutate it.
     VaultReadonly,
 }
@@ -112,9 +112,14 @@ pub fn home_dir() -> PathBuf {
     PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| "/".to_string()))
 }
 
-/// The vault working directory (`~/devel/tag1/jesse`).
+/// The vault working directory: `$JESSE_VAULT` when set, else `~/vault`. Mirrors
+/// the bridge's `JESSE_VAULT` resolution so an eval points at the same vault the
+/// bridge serves, with no personal absolute path committed (repo guard R5).
 pub fn vault_dir() -> PathBuf {
-    home_dir().join("devel").join("tag1").join("jesse")
+    match std::env::var("JESSE_VAULT") {
+        Ok(v) if !v.is_empty() => PathBuf::from(v),
+        _ => home_dir().join("vault"),
+    }
 }
 
 impl Task {
