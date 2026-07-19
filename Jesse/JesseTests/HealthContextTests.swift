@@ -8,6 +8,7 @@ import XCTest
 /// line, max-size fit), the attach policy, the resolver, the bounded timeout, and
 /// the per-metric-isolating gather. Everything is deterministic — a fixed UTC
 /// calendar and a fixed `now` — so the rendered bytes are pinned.
+@MainActor
 final class HealthContextTests: XCTestCase {
 
     private let utc = TimeZone(identifier: "UTC")!

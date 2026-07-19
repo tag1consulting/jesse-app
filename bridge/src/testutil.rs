@@ -7,6 +7,9 @@ pub(crate) static ENV_LOCK: Mutex<()> = Mutex::new(());
 pub(crate) fn test_config() -> Config {
     Config {
         token: "test-token".to_string(),
+        // Captured HOME for session-path lookups; tests that exercise session
+        // paths override `home`/`vault` explicitly (no global-env mutation).
+        home: std::env::var("HOME").unwrap_or_default(),
         // Any existing directory works — most tests never reach run_claude.
         vault: std::env::temp_dir().to_string_lossy().into_owned(),
         bind: "127.0.0.1".to_string(),
@@ -20,6 +23,7 @@ pub(crate) fn test_config() -> Config {
         rate_per_min: 30,
         job_ttl_secs: 600,
         retrieval_grace_secs: 600,
+        session_ttl_days: DEFAULT_SESSION_TTL_DAYS,
         // No on-disk persistence in tests by default — keeps cargo test off
         // the real $HOME. The persistence tests build a store with a temp dir.
         state_dir: None,
@@ -55,6 +59,16 @@ pub(crate) fn test_config() -> Config {
         // byte-for-byte unaffected. Carry behavior is covered by dedicated tests that
         // enable it explicitly (the shipped `from_env` default is ON).
         context_carry: false,
+        // Shadow comparison DISARMED in the fixture (kill switch): no backend triple,
+        // so no ask turn is ever mirrored and every path is byte-for-byte today's.
+        // Tests that exercise shadow set `shadow_backend`/`shadow_log` explicitly.
+        shadow_backend: None,
+        shadow_sample_pct: 100,
+        shadow_log: std::env::temp_dir()
+            .join("jesse-shadow-test.jsonl")
+            .to_string_lossy()
+            .into_owned(),
+        shadow_timeout_secs: 120,
     }
 }
 pub(crate) fn test_state() -> AppState {

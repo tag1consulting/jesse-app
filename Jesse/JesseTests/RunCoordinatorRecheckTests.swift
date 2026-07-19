@@ -6,6 +6,7 @@ import SwiftData
 /// a manual "Re-check" that re-attaches to the same job — delivering the reply if
 /// it's now ready, or resuming the poll if it's still running. Driven entirely
 /// through `JesseClientProtocol` so no server is needed.
+@MainActor
 final class RunCoordinatorRecheckTests: XCTestCase {
 
     /// A fake whose `result` outcome is switchable between phases, so a test can
@@ -51,7 +52,7 @@ final class RunCoordinatorRecheckTests: XCTestCase {
     @MainActor
     private func makeContext() throws -> ModelContext {
         let container = try ModelContainer(
-            for: JesseThread.self, Turn.self,
+            for: JesseThread.self, Turn.self, OutboxItem.self, OutboxAttachment.self,
             configurations: ModelConfiguration(isStoredInMemoryOnly: true))
         return ModelContext(container)
     }

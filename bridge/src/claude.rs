@@ -747,6 +747,15 @@ pub async fn run_claude_streaming(
     // outcome is the loop's `break` value and the function is statically total:
     // every path breaks or `continue`s, so there is no post-loop `unreachable!()`
     // the compiler couldn't prove was dead.
+    // Resume-after-sweep safety: if the requested session's transcript no longer
+    // exists on disk (reclaimed by the GC sweep, or deleted while the phone thread
+    // lived on), drop the `--resume` so `claude --resume <gone>` can never surface a
+    // raw CLI error — the turn runs FRESH and returns a new session id (the app keeps
+    // its local transcript and stores the new id). A live real id and a synthetic
+    // `local-` id pass through unchanged. Resolved ONCE here (not per attempt) since
+    // a mid-turn sweep can't remove a session claude is actively holding open.
+    let session_id = resolve_resume_session(cfg, session_id);
+
     let mut attempt = 0u32;
     loop {
         attempt += 1;

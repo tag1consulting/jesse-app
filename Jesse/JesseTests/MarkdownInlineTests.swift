@@ -6,6 +6,7 @@ import UIKit
 /// italic / `code` / links) to the CONCRETE `UIFont` traits and attributes a
 /// `UITextView` needs to render selectable message text the same way a SwiftUI
 /// `Text` would.
+@MainActor
 final class MarkdownInlineTests: XCTestCase {
 
     private let base = UIFont.preferredFont(forTextStyle: .body)

@@ -6,6 +6,7 @@ import XCTest
 // carb-load flips, fiber suspension, the dayStyle→dayType fallback, the 4pm gate,
 // totals, and chronological sorting.
 
+@MainActor
 final class DietSemanticsTests: XCTestCase {
     typealias S = DietSemantics
 
@@ -315,11 +316,13 @@ final class DietSemanticsTests: XCTestCase {
 
     // MARK: - Micronutrient aggregation (unknown ≠ zero)
 
-    /// An item carrying an explicit set of the four micronutrients (any may be nil).
+    /// An item carrying an explicit set of the micronutrients (any may be nil). `f` is
+    /// set so the derived unsaturated-fat gauge (fat − saturated fat) has a fat total.
     private func micro(na: Double? = nil, satf: Double? = nil,
-                       sug: Double? = nil, k: Double? = nil) -> DietItem {
-        DietItem(item: "x", amount: nil, cal: 0, p: 0, f: 0, c: 0, fiber: 0,
-                 na: na, satf: satf, sug: sug, k: k)
+                       sug: Double? = nil, k: Double? = nil, ca: Double? = nil,
+                       o3: Double? = nil, mg: Double? = nil, f: Double = 0) -> DietItem {
+        DietItem(item: "x", amount: nil, cal: 0, p: 0, f: f, c: 0, fiber: 0,
+                 na: na, satf: satf, sug: sug, k: k, ca: ca, o3: o3, mg: mg)
     }
 
     func testMicronutrientTotalAllKnownIsNotPartial() {
@@ -441,5 +444,101 @@ final class DietSemanticsTests: XCTestCase {
                                          dayType: nil, weight: nil, exercise: [], meals: meals,
                                          targets: clTargets), hour: 12)
         XCTAssertEqual(cl.fiber.goalStatus, .noGoal)
+    }
+
+    // MARK: - New floor micronutrients (calcium / omega-3 / magnesium)
+
+    func testCalciumGaugeIsAFloorMetWhenAtOrOverTarget() {
+        let today = microDay([micro(ca: 700), micro(ca: 600)],
+                             targets: DietTargets(calcium: 1200))
+        let g = gauge(today, .calcium)
+        XCTAssertEqual(g.goal, .floor)
+        XCTAssertEqual(g.value, 1300)
+        XCTAssertEqual(g.unit, "mg")
+        XCTAssertEqual(g.status, .green)               // 1300 ≥ 1200 floor
+        XCTAssertEqual(g.goalStatus, .met)
+    }
+
+    func testMagnesiumGaugeShortByTheShortfall() {
+        let today = microDay([micro(mg: 100), micro(mg: 120)],
+                             targets: DietTargets(magnesium: 400))
+        let g = gauge(today, .magnesium)
+        XCTAssertEqual(g.goal, .floor)
+        XCTAssertEqual(g.value, 220)
+        XCTAssertEqual(g.goalStatus, .short(180))      // 400 − 220
+    }
+
+    func testOmega3GaugeIsAFloorInMilligrams() {
+        let today = microDay([micro(o3: 300), micro(o3: 250)],
+                             targets: DietTargets(omega3: 500))
+        let g = gauge(today, .omega3)
+        XCTAssertEqual(g.goal, .floor)
+        XCTAssertEqual(g.value, 550)
+        XCTAssertEqual(g.unit, "mg")
+        XCTAssertEqual(g.status, .green)               // 550 ≥ 500 floor
+    }
+
+    func testCalciumPartialIsAFloorExcludingTheUnknown() {
+        // One of three items lacks calcium → partial, the unknown excluded (not 0).
+        let today = microDay([micro(ca: 400), micro(ca: nil), micro(ca: 300)],
+                             targets: DietTargets(calcium: 1200))
+        let g = gauge(today, .calcium)
+        XCTAssertEqual(g.value, 700, "the unknown calcium item is excluded, not summed as 0")
+        XCTAssertTrue(g.partial)
+        XCTAssertEqual(g.unknownItemCount, 1)
+        XCTAssertEqual(S.partialCaption(unknownItemCount: g.unknownItemCount), "1 item not estimated")
+    }
+
+    func testCalciumAllUnknownIsNotTracked() {
+        let today = microDay([micro(na: 500)], targets: DietTargets(calcium: 1200))
+        let g = gauge(today, .calcium)
+        XCTAssertEqual(g.knownItemCount, 0)
+        XCTAssertEqual(g.remaining, S.notTrackedCaption)
+        XCTAssertEqual(g.status, .suspended)
+    }
+
+    func testNewFloorNutrientNoTargetShowsValueOnly() {
+        let today = microDay([micro(ca: 600)], targets: DietTargets())
+        let g = gauge(today, .calcium)
+        XCTAssertEqual(g.value, 600)
+        XCTAssertEqual(g.status, .suspended)
+        XCTAssertEqual(g.goalStatus, .noGoal)
+        XCTAssertNil(g.fraction)
+    }
+
+    // MARK: - Derived unsaturated fat (informational, unknown-aware)
+
+    func testUnsaturatedFatDerivedFromFatMinusSaturated() {
+        // Every item has known saturated fat → a complete total = Σ(f − satf).
+        let today = microDay([micro(satf: 5, f: 20), micro(satf: 3, f: 10)])
+        let g = gauge(today, .unsaturatedFat)
+        XCTAssertEqual(g.value, 22)                     // (20−5) + (10−3)
+        XCTAssertFalse(g.partial)
+        XCTAssertEqual(g.unit, "g")
+        XCTAssertEqual(g.status, .suspended, "unsaturated fat is informational — never judged")
+        XCTAssertEqual(g.goalStatus, .noGoal)
+        XCTAssertNil(g.target, "unsaturated fat has no target")
+    }
+
+    func testUnsaturatedFatPartialWhenASaturatedFatIsUnknown() {
+        // The middle item has unknown saturated fat → it's UNKNOWN (partial), excluded
+        // from the sum, never derived from a 0.
+        let today = microDay([micro(satf: 5, f: 20), micro(satf: nil, f: 12),
+                              micro(satf: 4, f: 14)])
+        let g = gauge(today, .unsaturatedFat)
+        XCTAssertEqual(g.value, 25, "(20−5) + (14−4); the unknown-satf item is excluded")
+        XCTAssertTrue(g.partial)
+        XCTAssertEqual(g.unknownItemCount, 1)
+        XCTAssertEqual(g.knownItemCount, 2)
+    }
+
+    func testUnsaturatedFatShareVsKnownTotal() {
+        // The drill-down share is each contributor's fraction of the KNOWN unsaturated sum.
+        let meals = [DietMeal(name: "all", time: "12:00",
+                              items: [micro(satf: 5, f: 20), micro(satf: 3, f: 10)])]
+        let bd = FoodContributions.breakdown(meals, metric: .micronutrient(.unsaturatedFat), total: 22)
+        XCTAssertEqual(bd.contributions.map(\.value), [15, 7])     // sorted most-impact-first
+        XCTAssertEqual(bd.contributions.first?.share ?? 0, 15.0 / 22.0, accuracy: 0.0001)
+        XCTAssertTrue(bd.unknownFoods.isEmpty)
     }
 }

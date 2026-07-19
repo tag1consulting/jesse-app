@@ -13,13 +13,16 @@ import HealthKit
 /// (`HealthKitMealWriter.shareTypes`, `HealthContextProvider.readTypes`) so the
 /// mistake is caught at its own layer — the real `requestAuthorization` is
 /// unexercisable in the sandbox and only ever failed on device.
+@MainActor
 final class HealthKitAuthorizationTypesTests: XCTestCase {
 
-    /// The share (write) set is EXACTLY the nine dietary quantity types a meal may
-    /// carry — the five macros plus the four micronutrients — no more, no fewer, and
-    /// specifically no correlation container. Every quantity type a `.food` sample uses
-    /// must be authorized to share, or the save fails.
-    func testShareSetIsExactlyTheNineDietaryQuantityTypes() {
+    /// The share (write) set is EXACTLY the eleven dietary quantity types a meal may
+    /// carry — the five macros plus the six HealthKit-bound micronutrients (sodium,
+    /// saturated fat, sugar, potassium, calcium, magnesium) — no more, no fewer, and
+    /// specifically no correlation container, and specifically NOT omega-3 (gauge-only,
+    /// no HealthKit EPA+DHA type). Every quantity type a `.food` sample uses must be
+    /// authorized to share, or the save fails.
+    func testShareSetIsExactlyTheElevenDietaryQuantityTypes() {
         let expected: Set<String> = Set([
             HKQuantityTypeIdentifier.dietaryEnergyConsumed,
             .dietaryProtein,
@@ -30,10 +33,12 @@ final class HealthKitAuthorizationTypesTests: XCTestCase {
             .dietaryFatSaturated,
             .dietarySugar,
             .dietaryPotassium,
+            .dietaryCalcium,
+            .dietaryMagnesium,
         ].map(\.rawValue))
         let actual = Set(HealthKitMealWriter.shareTypes.map(\.identifier))
         XCTAssertEqual(actual, expected,
-                       "share set must be exactly the nine dietary quantity types")
+                       "share set must be exactly the eleven dietary quantity types")
     }
 
     /// No identifier in ANY authorization set (read or share) may be a correlation

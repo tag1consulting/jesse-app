@@ -45,6 +45,13 @@ pub struct AppState {
     // follow-up. Persisted to `<state_dir>/context.json`. Inert (a total no-op) unless
     // `cfg.context_carry` is on — with carry off every path is byte-for-byte today's.
     pub context: Arc<ContextLedger>,
+    // AT-MOST-ONE guard for the opt-in shadow-comparison child (JESSE_SHADOW_*). A
+    // permit of ONE, entirely separate from `sem` (the production permit), so a
+    // background shadow mirror can never occupy or delay a phone turn's slot. A
+    // shadow run `try_acquire`s this (never `.await`); if it's taken, that turn is
+    // simply not mirrored (no backlog — the sample is large enough). Always present;
+    // inert unless `cfg.shadow_backend` is set. See [`shadow`].
+    pub shadow_slot: Arc<Semaphore>,
 }
 
 impl AppState {
@@ -77,14 +84,16 @@ impl AppState {
             breaker: Arc::new(CircuitBreaker::new()),
             meal_corrections,
             context: Arc::new(ContextLedger::new(context_file, context_enabled)),
+            // One shadow child at a time; separate from the production permit.
+            shadow_slot: Arc::new(Semaphore::new(1)),
         }
     }
 
     /// The `~/.claude/projects/<escaped-vault>` directory this bridge's vault
-    /// sessions live in. Reads HOME at call time; an unknown HOME yields a path
-    /// that simply won't exist (→ empty session list), never an error.
+    /// sessions live in. Uses the HOME captured once in `Config` (see `cfg.home`);
+    /// an unknown HOME yields a path that simply won't exist (→ empty session
+    /// list), never an error.
     pub fn sessions_dir(&self) -> PathBuf {
-        let home = std::env::var("HOME").unwrap_or_default();
-        vault_sessions_dir(&home, &self.cfg.vault)
+        vault_sessions_dir(&self.cfg.home, &self.cfg.vault)
     }
 }

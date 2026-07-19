@@ -11,7 +11,10 @@ import SwiftData
 
 /// Records the request the client built and replies with a scripted status. Body
 /// is captured from `httpBodyStream` (URLSession moves `httpBody` there).
-final class CapturingProtocol: URLProtocol, @unchecked Sendable {
+// No `@unchecked Sendable`: `URLProtocol`'s `Sendable` conformance is unavailable,
+// so declaring one is redundant (and warns). The shared scripting state is
+// `nonisolated(unsafe)` static, written on the test thread before a request runs.
+final class CapturingProtocol: URLProtocol {
     struct Captured {
         var method: String
         var path: String
@@ -54,6 +57,7 @@ final class CapturingProtocol: URLProtocol, @unchecked Sendable {
     override func stopLoading() {}
 
     /// A `JesseClient` whose session routes through this protocol.
+    @MainActor
     static func makeClient(host: String = "laptop", token: String = "tok") -> JesseClient {
         let cfg = URLSessionConfiguration.ephemeral
         cfg.protocolClasses = [CapturingProtocol.self]
@@ -62,10 +66,11 @@ final class CapturingProtocol: URLProtocol, @unchecked Sendable {
     }
 }
 
+@MainActor
 final class PushTests: XCTestCase {
 
-    override func setUp() {
-        super.setUp()
+    override func setUp() async throws {
+        try await super.setUp()
         CapturingProtocol.captured = nil
         CapturingProtocol.status = 200
         // Clear any in-flight jobs other tests persisted to the shared
@@ -180,7 +185,7 @@ final class PushTests: XCTestCase {
     @MainActor
     func testBackgroundNotifyFlagsInFlightJobAndRoutingFindsThread() async throws {
         let container = try ModelContainer(
-            for: JesseThread.self, Turn.self,
+            for: JesseThread.self, Turn.self, OutboxItem.self, OutboxAttachment.self,
             configurations: ModelConfiguration(isStoredInMemoryOnly: true))
         let context = ModelContext(container)
 
@@ -219,7 +224,7 @@ final class PushTests: XCTestCase {
     @MainActor
     func testFirstSuccessHookFiresOnDeliveredReply() async throws {
         let container = try ModelContainer(
-            for: JesseThread.self, Turn.self,
+            for: JesseThread.self, Turn.self, OutboxItem.self, OutboxAttachment.self,
             configurations: ModelConfiguration(isStoredInMemoryOnly: true))
         let context = ModelContext(container)
 

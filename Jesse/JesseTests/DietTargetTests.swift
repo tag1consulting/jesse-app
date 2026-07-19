@@ -6,6 +6,7 @@ import XCTest
 // formatting, and the coach-quote entity decode. The synthesis and countdown are
 // pure `DietSemantics`, so every rule is tested directly without a view.
 
+@MainActor
 final class DietTargetTests: XCTestCase {
     typealias S = DietSemantics
 

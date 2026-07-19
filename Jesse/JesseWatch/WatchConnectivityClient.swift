@@ -78,9 +78,12 @@ final class WatchConnectivityClient: NSObject, WatchRequestSending {
         }
     }
 
-    private func handleIncoming(_ dict: [String: Any]) {
-        guard case .reply(let reply)? = WatchMessage.decode(dict) else { return }
-        onReply?(reply)
+    /// Hop an already-decoded (Sendable) reply to the main actor. Decoding happens
+    /// on the delegate thread so the non-Sendable `[String: Any]` never crosses the
+    /// isolation boundary — only the `Sendable` `WatchReply` does.
+    private nonisolated func deliver(_ message: WatchMessage?) {
+        guard case .reply(let reply)? = message else { return }
+        Task { @MainActor in self.onReply?(reply) }
     }
 }
 
@@ -89,13 +92,14 @@ extension WatchConnectivityClient: WCSessionDelegate {
                              activationDidCompleteWith activationState: WCSessionActivationState,
                              error: Error?) {}
 
-    // Immediate reply path.
+    // Immediate reply path. `WatchMessage.decode` is `nonisolated` and returns a
+    // `Sendable` value, so decode here (off the main actor) and send only that.
     nonisolated func session(_ session: WCSession, didReceiveMessage message: [String: Any]) {
-        Task { @MainActor in self.handleIncoming(message) }
+        deliver(WatchMessage.decode(message))
     }
 
     // Reliable/background reply path (source of truth).
     nonisolated func session(_ session: WCSession, didReceiveUserInfo userInfo: [String: Any]) {
-        Task { @MainActor in self.handleIncoming(userInfo) }
+        deliver(WatchMessage.decode(userInfo))
     }
 }

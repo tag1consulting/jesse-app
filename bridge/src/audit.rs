@@ -71,7 +71,10 @@ impl AuditAgg {
     /// Rung-2 turns that were a CORRECT rejection of a non-loggable turn (`no_loggable`)
     /// — the loose keyword gate let them into the pipeline; they are not failures.
     pub fn rung2_no_loggable(&self) -> usize {
-        self.rung2_by_reason.get("no_loggable").copied().unwrap_or(0)
+        self.rung2_by_reason
+            .get("no_loggable")
+            .copied()
+            .unwrap_or(0)
     }
 
     /// Rung-2 turns that were genuine pipeline FAILURES (everything but `no_loggable`).

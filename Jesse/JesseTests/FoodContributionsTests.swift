@@ -7,6 +7,7 @@ import XCTest
 // stable tie-breaking, the share math, the empty/partial states, and the
 // reconciliation guard that refuses to show a list contradicting the headline.
 
+@MainActor
 final class FoodContributionsTests: XCTestCase {
 
     // MARK: - Fixtures
@@ -14,9 +15,10 @@ final class FoodContributionsTests: XCTestCase {
     private func item(_ name: String, cal: Double? = nil, p: Double? = nil,
                       f: Double? = nil, c: Double? = nil, fiber: Double? = nil,
                       amount: String? = nil, na: Double? = nil, satf: Double? = nil,
-                      sug: Double? = nil, k: Double? = nil) -> DietItem {
+                      sug: Double? = nil, k: Double? = nil, ca: Double? = nil,
+                      o3: Double? = nil, mg: Double? = nil) -> DietItem {
         DietItem(item: name, amount: amount, cal: cal, p: p, f: f, c: c, fiber: fiber,
-                 na: na, satf: satf, sug: sug, k: k)
+                 na: na, satf: satf, sug: sug, k: k, ca: ca, o3: o3, mg: mg)
     }
     private func meal(_ name: String, _ items: [DietItem]) -> DietMeal {
         DietMeal(name: name, time: nil, items: items)
@@ -227,6 +229,49 @@ final class FoodContributionsTests: XCTestCase {
         XCTAssertEqual(bd.contributions[1].share, 0.25, accuracy: 0.0001)
     }
 
+    func testNewMicronutrientMetricLabelsUnitsAndFlags() {
+        XCTAssertEqual(ContributionMetric.micronutrient(.calcium).unit, "mg")
+        XCTAssertEqual(ContributionMetric.micronutrient(.omega3).unit, "mg")
+        XCTAssertEqual(ContributionMetric.micronutrient(.magnesium).unit, "mg")
+        XCTAssertEqual(ContributionMetric.micronutrient(.unsaturatedFat).unit, "g")
+        XCTAssertEqual(ContributionMetric.micronutrient(.omega3).label, "Omega-3 (EPA+DHA)")
+        // Unsaturated fat is informational (like total sugars); the floors are not.
+        XCTAssertTrue(ContributionMetric.micronutrient(.unsaturatedFat).isInformational)
+        XCTAssertFalse(ContributionMetric.micronutrient(.calcium).isInformational)
+        // All are unknown-preserving micronutrients.
+        for n in [Micronutrient.calcium, .omega3, .magnesium, .unsaturatedFat] {
+            XCTAssertTrue(ContributionMetric.micronutrient(n).isMicronutrient)
+        }
+    }
+
+    func testCalciumRanksKnownAndCollectsUnknowns() {
+        let meals = [meal("Day", [
+            item("Yogurt", amount: "1 cup", ca: 300),
+            item("Kale", ca: 150),
+            item("Water", ca: 0),                    // measured 0 → excluded
+            item("Chip", amount: "1 bag", ca: nil),  // unknown → not-estimated
+        ])]
+        let bd = FoodContributions.breakdown(meals, metric: .micronutrient(.calcium), total: 450)
+        XCTAssertEqual(bd.contributions.map(\.name), ["Yogurt", "Kale"])
+        XCTAssertEqual(bd.unknownFoods.map(\.name), ["Chip"])
+        XCTAssertTrue(bd.isPartial)
+    }
+
+    func testUnsaturatedFatRanksByDerivedValueAndCollectsUnknownSatf() {
+        // Derived contribution is fat − saturated fat; an item with unknown saturated fat
+        // is UNKNOWN (not-estimated group), never derived from 0.
+        let meals = [meal("Day", [
+            item("Olive oil", f: 14, amount: "1 tbsp", satf: 2),   // 12
+            item("Salmon", f: 12, satf: 3),                        // 9
+            item("Butter", f: 8, satf: nil),                       // unknown satf
+        ])]
+        let bd = FoodContributions.breakdown(meals, metric: .micronutrient(.unsaturatedFat), total: 21)
+        XCTAssertEqual(bd.contributions.map(\.name), ["Olive oil", "Salmon"])
+        XCTAssertEqual(bd.contributions.map(\.value), [12, 9])
+        XCTAssertEqual(bd.unknownFoods.map(\.name), ["Butter"])
+        XCTAssertTrue(bd.isPartial)
+    }
+
     func testMacroBreakdownNeverCollectsUnknowns() {
         // A macro's absent field stays a plain non-contributor — no not-estimated group.
         let meals = [meal("Day", [item("Rice", c: 40), item("Water", c: nil)])]
@@ -289,5 +334,27 @@ final class FoodContributionsTests: XCTestCase {
         XCTAssertTrue(drill.insightInput.informational)
         XCTAssertNil(drill.insightInput.goal, "informational grounding carries no target")
         XCTAssertEqual(drill.insightInput.goalStatus, .noGoal)
+    }
+
+    func testDrilldownBuildUnsaturatedFatIsInformationalDerivedAndUnknownAware() {
+        // Unsaturated fat is derived (fat − saturated fat) AND informational: the ranked
+        // contributors come from the derived value, the unknown-satf item lands in the
+        // not-estimated group, and the insight is grounded with no goal (no judgment).
+        let meals = [meal("Day", [
+            item("Olive oil", f: 14, satf: 2),   // 12
+            item("Salmon", f: 12, satf: 3),      // 9
+            item("Butter", f: 8, satf: nil),     // unknown satf → not estimated
+        ])]
+        let gauge = DietSemantics.micronutrientGauge(
+            .unsaturatedFat, meals: meals, targets: DietTargets())
+        let drill = FoodDrilldown.build(meals: meals, metric: .micronutrient(.unsaturatedFat),
+                                        gauge: gauge, isCarbLoad: false)
+        XCTAssertEqual(drill.breakdown.contributions.map(\.name), ["Olive oil", "Salmon"])
+        XCTAssertEqual(drill.breakdown.unknownFoods.map(\.name), ["Butter"])
+        XCTAssertEqual(drill.breakdown.total, 21, "the known derived sum is a floor")
+        XCTAssertTrue(drill.insightInput.informational)
+        XCTAssertNil(drill.insightInput.goal, "informational grounding carries no target")
+        XCTAssertEqual(drill.insightInput.goalStatus, .noGoal)
+        XCTAssertTrue(drill.insightInput.partial)
     }
 }

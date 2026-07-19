@@ -82,8 +82,8 @@ final class JesseInbox: ObservableObject {
 }
 
 struct AskJesseIntent: AppIntent {
-    static var title: LocalizedStringResource = "Ask Jesse"
-    static var openAppWhenRun = true
+    static let title: LocalizedStringResource = "Ask Jesse"
+    static let openAppWhenRun = true
 
     @Parameter(title: "Question", requestValueDialog: "What's your question?")
     var text: String
@@ -96,8 +96,8 @@ struct AskJesseIntent: AppIntent {
 }
 
 struct TellJesseIntent: AppIntent {
-    static var title: LocalizedStringResource = "Tell Jesse"
-    static var openAppWhenRun = true
+    static let title: LocalizedStringResource = "Tell Jesse"
+    static let openAppWhenRun = true
 
     @Parameter(title: "Message", requestValueDialog: "What should I note?")
     var text: String
@@ -113,8 +113,8 @@ struct TellJesseIntent: AppIntent {
 /// mode — no `@Parameter`, no `requestValueDialog`, so Siri never tries to parse
 /// the open-ended request. The app captures the request itself once it's open.
 struct WakeJesseIntent: AppIntent {
-    static var title: LocalizedStringResource = "Talk to Jesse"
-    static var openAppWhenRun = true
+    static let title: LocalizedStringResource = "Talk to Jesse"
+    static let openAppWhenRun = true
 
     @MainActor
     func perform() async throws -> some IntentResult {

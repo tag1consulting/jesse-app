@@ -246,6 +246,10 @@ xcodebuild test -scheme Jesse \
 
 (Adjust the simulator name to one your Xcode has installed.)
 
+Set `JESSE_MUTE=1` under the scheme's **Run > Environment Variables** to silence
+spoken (text-to-speech) replies during development — no audio and no ducking of
+other audio, without muting the Mac.
+
 ---
 
 ## 3. Pair the phone with the bridge

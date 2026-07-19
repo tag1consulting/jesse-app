@@ -4,6 +4,7 @@ import XCTest
 // Pure-function tests for the AI-title seams: the content key (invalidation), the
 // digest (what the app sends), and the display precedence. No view host, no
 // network — mirroring ThreadSectioningTests / ThreadFoldersTests.
+@MainActor
 final class ThreadTitleTests: XCTestCase {
 
     private func thread(turns: [(TurnRole, String)], title: String = "",

@@ -42,6 +42,225 @@ pub fn vault_sessions_dir(home: &str, vault: &str) -> PathBuf {
         .join(escape_project_path(vault))
 }
 
+/// The transcript path for one session under the vault's projects dir:
+/// `<home>/.claude/projects/<escaped-vault>/<session_id>.jsonl`. Pure path
+/// arithmetic — it does not check existence. Callers pass a session id that has
+/// already been validated as a plain component (see [`is_plain_session_component`]).
+pub fn session_transcript_path(home: &str, vault: &str, session_id: &str) -> PathBuf {
+    vault_sessions_dir(home, vault).join(format!("{session_id}.jsonl"))
+}
+
+/// Whether a session id is a plain filename component that can only ever name a
+/// file *inside* the vault projects dir — non-empty, not `.`/`..`, and free of
+/// any path separator. This is the SAME defensive check `list_sessions` applies
+/// to a listed stem; here it guards a caller-supplied id (delete / resume) so a
+/// crafted `session_id` like `../../foo` can never escape the vault projects dir.
+pub fn is_plain_session_component(session_id: &str) -> bool {
+    !session_id.is_empty()
+        && session_id != "."
+        && session_id != ".."
+        && !session_id.contains('/')
+        && !session_id.contains('\\')
+}
+
+/// Whether a real (non-synthetic) session's transcript still exists on disk under
+/// the bridge's vault projects dir. Uses the HOME captured in `cfg.home` (like
+/// `AppState::sessions_dir`); an unknown HOME or a non-plain id yields `false`.
+/// A synthetic `local-` id (context carry) has no transcript by construction, so
+/// this reports `false` for it — callers that care special-case it first.
+pub fn session_transcript_exists(cfg: &Config, session_id: &str) -> bool {
+    if !is_plain_session_component(session_id) {
+        return false;
+    }
+    session_transcript_path(&cfg.home, &cfg.vault, session_id).is_file()
+}
+
+/// The outcome of deleting one session's transcript. `Deleted` removed an existing
+/// file; `AlreadyGone` found none (idempotent success — an unknown or already-gone
+/// id is NOT an error, so retries and GC never choke); `Failed` is a real I/O
+/// failure deleting a file that exists.
+#[derive(Debug, PartialEq)]
+pub enum SessionDeleteOutcome {
+    Deleted,
+    AlreadyGone,
+    Failed(String),
+}
+
+/// Delete one session's transcript file from a projects `dir`, idempotently and
+/// scoped to that dir. The `session_id` must be a plain component (the handler
+/// rejects a non-plain id before calling this); the file removed is exactly
+/// `<dir>/<session_id>.jsonl`. A `NotFound` error maps to `AlreadyGone` (success),
+/// any other I/O error to `Failed`. Never touches anything but that one file.
+pub fn delete_session_file(dir: &Path, session_id: &str) -> SessionDeleteOutcome {
+    let path = dir.join(format!("{session_id}.jsonl"));
+    match std::fs::remove_file(&path) {
+        Ok(()) => SessionDeleteOutcome::Deleted,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => SessionDeleteOutcome::AlreadyGone,
+        Err(e) => SessionDeleteOutcome::Failed(e.to_string()),
+    }
+}
+
+// ---- Age-based GC sweep ----------------------------------------------------
+
+/// How often the background session GC sweep runs (plus one run at startup). The
+/// TTL is measured in days, so a several-hour cadence reclaims orphaned sessions
+/// promptly without churning the disk.
+pub const SESSION_GC_INTERVAL: Duration = Duration::from_secs(6 * 3600);
+
+/// Whether a session whose transcript was last modified at `mtime_secs` is past
+/// the `ttl_days` reclaim age at wall clock `now_secs` (both unix seconds). Pure,
+/// so the age predicate is unit-tested against a FIXED clock (no wall-clock sleep).
+/// STRICTLY older: a session exactly at the TTL boundary — or anything younger —
+/// is kept. `saturating_*` keeps a clock skew (mtime in the future) from
+/// underflowing to a huge age.
+pub fn is_session_expired(mtime_secs: u64, now_secs: u64, ttl_days: u64) -> bool {
+    let ttl_secs = ttl_days.saturating_mul(86_400);
+    now_secs.saturating_sub(mtime_secs) > ttl_secs
+}
+
+/// Sweep a vault projects `dir`, deleting every `*.jsonl` session whose mtime is
+/// older than `ttl_days` at wall clock `now_secs`. Returns the `(session_id,
+/// age_secs)` of each reclaimed session (for logging/tests). `now_secs` is passed
+/// in so the sweep is testable against a fixed clock. Robust and scoped exactly
+/// like `list_sessions`:
+/// - a missing/unreadable `dir` reclaims nothing (never an error);
+/// - only plain `*.jsonl` regular files directly in `dir` are considered — subdirs,
+///   other files, and a non-plain stem are skipped, so it can never delete outside
+///   the vault projects dir;
+/// - a session younger than the TTL (or exactly at it) is NEVER deleted;
+/// - a per-file delete failure is logged and skipped, never aborting the sweep.
+pub fn sweep_expired_sessions(dir: &Path, now_secs: u64, ttl_days: u64) -> Vec<(String, u64)> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut reclaimed = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
+            continue;
+        }
+        let Ok(meta) = entry.metadata() else { continue };
+        if !meta.is_file() {
+            continue;
+        }
+        let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+            continue;
+        };
+        if !is_plain_session_component(stem) {
+            continue;
+        }
+        let mtime = meta
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        if !is_session_expired(mtime, now_secs, ttl_days) {
+            continue;
+        }
+        let age = now_secs.saturating_sub(mtime);
+        match std::fs::remove_file(&path) {
+            Ok(()) => {
+                let age_days = age / 86_400;
+                eprintln!(
+                    "jesse-bridge: session GC reclaimed {stem} (age {age_days}d, ttl {ttl_days}d)"
+                );
+                reclaimed.push((stem.to_string(), age));
+            }
+            Err(e) => {
+                eprintln!("jesse-bridge: session GC could not delete {stem}: {e} — skipped");
+            }
+        }
+    }
+    reclaimed
+}
+
+/// Run one GC sweep over the bridge vault's projects dir at the current wall
+/// clock. Uses the HOME captured in `cfg.home` (mirroring `AppState::sessions_dir`)
+/// so the sweep stays scoped to exactly the vault project. Titles for reclaimed
+/// sessions are dropped from the store so a reclaimed id can't linger in `titles.json`.
+pub fn run_session_gc(cfg: &Config, titles: &TitleStore) {
+    let dir = vault_sessions_dir(&cfg.home, &cfg.vault);
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let reclaimed = sweep_expired_sessions(&dir, now, cfg.session_ttl_days);
+    for (id, _age) in &reclaimed {
+        titles.remove(id);
+    }
+    if !reclaimed.is_empty() {
+        eprintln!(
+            "jesse-bridge: session GC swept {} orphaned session(s) older than {} days",
+            reclaimed.len(),
+            cfg.session_ttl_days
+        );
+    }
+}
+
+/// Spawn the background session GC sweep: one run immediately at startup, then
+/// every `SESSION_GC_INTERVAL`, for the life of the process. A missing session
+/// TTL / projects dir is handled gracefully by `run_session_gc` (it reclaims
+/// nothing). Mirrors `spawn_eviction_task`'s shape.
+pub fn spawn_session_gc_task(cfg: Arc<Config>, titles: Arc<TitleStore>) {
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(SESSION_GC_INTERVAL);
+        // `interval` fires the first tick IMMEDIATELY, so this is the "one run at
+        // startup" the spec asks for; subsequent ticks are the periodic sweep.
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            tick.tick().await;
+            run_session_gc(&cfg, &titles);
+        }
+    });
+}
+
+// ---- Resume-after-sweep safety ---------------------------------------------
+
+/// Decide the session id to actually pass to `claude --resume`, given whether the
+/// requested session's transcript still exists. Pure, so the decision is
+/// unit-tested against a fixed bool.
+///   * `None` → `None` (a fresh turn — unchanged).
+///   * a synthetic `local-` id → passed through unchanged (`build_claude_args`
+///     already never resumes it; the existence bool is irrelevant here).
+///   * a real id whose transcript is PRESENT → resume it (today's behavior).
+///   * a real id whose transcript is MISSING (swept by GC, or deleted) → `None`:
+///     run FRESH rather than let `claude --resume <gone>` surface a raw CLI error.
+///     The turn returns a new session id and the app keeps its local transcript.
+pub fn effective_resume_id(session_id: Option<&str>, transcript_exists: bool) -> Option<&str> {
+    match session_id {
+        None => None,
+        Some(sid) if is_synthetic_session_id(sid) => Some(sid),
+        Some(sid) if transcript_exists => Some(sid),
+        Some(_) => None,
+    }
+}
+
+/// Resolve the effective `--resume` session for a hosted turn: drop the resume
+/// when the requested real session's transcript no longer exists on disk (swept
+/// by GC or deleted while the phone thread lived on), so a stale resume becomes a
+/// clean FRESH session instead of a crash or a raw system error string. Reads HOME
+/// via `session_transcript_exists`; logs a named line when it drops a resume so the
+/// fall-to-fresh is visible, never silent. A synthetic id and a live real id pass
+/// through unchanged.
+pub fn resolve_resume_session<'a>(cfg: &Config, session_id: Option<&'a str>) -> Option<&'a str> {
+    let sid = session_id?;
+    // Synthetic ids never have a transcript and must not trigger a (false) fs miss
+    // log — they are handled (never resumed) downstream in `build_claude_args`.
+    if is_synthetic_session_id(sid) {
+        return Some(sid);
+    }
+    let exists = session_transcript_exists(cfg, sid);
+    let effective = effective_resume_id(Some(sid), exists);
+    if effective.is_none() {
+        eprintln!(
+            "jesse-bridge: session {sid} has no transcript (swept by GC or deleted) — \
+             starting a fresh session for this thread"
+        );
+    }
+    effective
+}
+
 /// One session summary in the response, newest-first ordered by the caller.
 #[derive(serde::Serialize, PartialEq, Debug)]
 pub struct SessionSummary {
@@ -253,6 +472,54 @@ pub async fn jesse_sessions(
         .into_response())
 }
 
+/// `DELETE /jesse/session/{session_id}` — delete one Claude Code session for the
+/// bridge's vault, scoped to the vault project only. Same bearer auth as `/jesse`.
+///
+/// **Idempotent**, mirroring `POST /jesse/cancel`: an unknown or already-gone id
+/// returns `204` (success), never an error — the app's durable delete-drainer
+/// retries and the GC sweep must never choke on a missing id. A real failure to
+/// delete a file that *exists* is a `500`. A structurally-invalid id (one that
+/// isn't a plain filename component — empty, `.`/`..`, or containing a path
+/// separator) is a `400`: it can only be a traversal attempt, never a real session
+/// id, so it must never reach the filesystem.
+pub async fn jesse_session_delete(
+    State(st): State<AppState>,
+    UrlPath(session_id): UrlPath<String>,
+    headers: HeaderMap,
+) -> Result<StatusCode, ApiError> {
+    check_auth(&headers, &st.cfg.token)?;
+    // Defensive: a non-plain component can never name a session inside the projects
+    // dir; reject it up front so it can't reach `remove_file` (path traversal).
+    if !is_plain_session_component(&session_id) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "invalid session id".to_string(),
+        ));
+    }
+    let dir = st.sessions_dir();
+    match delete_session_file(&dir, &session_id) {
+        SessionDeleteOutcome::Deleted => {
+            // Drop any stashed title so the reclaimed id can't linger in titles.json.
+            st.titles.remove(&session_id);
+            eprintln!("jesse-bridge: deleted session {session_id}");
+            Ok(StatusCode::NO_CONTENT)
+        }
+        SessionDeleteOutcome::AlreadyGone => {
+            // Idempotent: unknown / already-gone is success, not an error.
+            st.titles.remove(&session_id);
+            eprintln!("jesse-bridge: session {session_id} already gone — no-op (idempotent)");
+            Ok(StatusCode::NO_CONTENT)
+        }
+        SessionDeleteOutcome::Failed(msg) => {
+            eprintln!("jesse-bridge: failed to delete session {session_id}: {msg}");
+            Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("could not delete session: {msg}"),
+            ))
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -451,6 +718,192 @@ mod tests {
         assert!(if_none_match_matches("*", &tag));
         assert!(if_none_match_matches(&format!("\"other\", {tag}"), &tag));
         assert!(!if_none_match_matches("\"nope\"", &tag));
+    }
+
+    #[test]
+    fn is_plain_session_component_rejects_traversal() {
+        assert!(is_plain_session_component("0a61d246-abc"));
+        assert!(is_plain_session_component("local-deadbeef"));
+        // Rejected: empty, dot-dirs, and anything with a separator.
+        assert!(!is_plain_session_component(""));
+        assert!(!is_plain_session_component("."));
+        assert!(!is_plain_session_component(".."));
+        assert!(!is_plain_session_component("../secrets"));
+        assert!(!is_plain_session_component("a/b"));
+        assert!(!is_plain_session_component("a\\b"));
+    }
+
+    #[test]
+    fn delete_session_file_is_idempotent_and_scoped() {
+        let dir = temp_dir();
+        write(&dir, "sess-1.jsonl", "{\"type\":\"user\"}\n");
+        // First delete removes the existing file.
+        assert_eq!(
+            delete_session_file(&dir, "sess-1"),
+            SessionDeleteOutcome::Deleted
+        );
+        assert!(!dir.join("sess-1.jsonl").exists(), "file is gone");
+        // Second delete of the same (now-missing) id is idempotent success.
+        assert_eq!(
+            delete_session_file(&dir, "sess-1"),
+            SessionDeleteOutcome::AlreadyGone
+        );
+        // An unknown id is idempotent success too.
+        assert_eq!(
+            delete_session_file(&dir, "never-existed"),
+            SessionDeleteOutcome::AlreadyGone
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn is_session_expired_uses_a_strict_ttl_boundary() {
+        let day = 86_400u64;
+        let ttl_days = 90u64;
+        let ttl = ttl_days * day;
+        let now = 1_000 * day; // an arbitrary fixed clock, well past the epoch
+                               // Younger than the TTL: kept.
+        assert!(!is_session_expired(now - ttl + day, now, ttl_days));
+        // EXACTLY at the TTL: kept (strictly-older only).
+        assert!(!is_session_expired(now - ttl, now, ttl_days));
+        // One second past the TTL: reclaimed.
+        assert!(is_session_expired(now - ttl - 1, now, ttl_days));
+        // A future mtime (clock skew) saturates to age 0 → never expired.
+        assert!(!is_session_expired(now + day, now, ttl_days));
+    }
+
+    #[test]
+    fn sweep_reclaims_only_sessions_older_than_the_ttl() {
+        let dir = temp_dir();
+        let day = 86_400u64;
+        let now = 1_000 * day;
+        let ttl_days = 90u64;
+        // Three sessions at known ages; a non-jsonl file and a subdir to ignore.
+        write(&dir, "fresh.jsonl", "{}\n"); // touched today
+        write(&dir, "old.jsonl", "{}\n"); // 200 days old
+        write(&dir, "borderline.jsonl", "{}\n"); // exactly at the TTL — kept
+        write(&dir, "notes.txt", "ignore");
+        std::fs::create_dir_all(dir.join("subdir.jsonl")).unwrap();
+        set_mtime(&dir.join("fresh.jsonl"), now);
+        set_mtime(&dir.join("old.jsonl"), now - 200 * day);
+        set_mtime(&dir.join("borderline.jsonl"), now - ttl_days * day);
+
+        let reclaimed = sweep_expired_sessions(&dir, now, ttl_days);
+        let ids: Vec<&str> = reclaimed.iter().map(|(id, _)| id.as_str()).collect();
+        assert_eq!(ids, ["old"], "only the >90d session is reclaimed");
+        // The reclaimed session's age is reported (200 days).
+        assert_eq!(reclaimed[0].1, 200 * day);
+        // The kept ones survive; the sweep never touches the non-jsonl file or subdir.
+        assert!(dir.join("fresh.jsonl").exists());
+        assert!(dir.join("borderline.jsonl").exists());
+        assert!(!dir.join("old.jsonl").exists());
+        assert!(dir.join("notes.txt").exists());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn sweep_missing_dir_reclaims_nothing() {
+        let missing = std::env::temp_dir().join(format!("jesse-nogc-{}", random_hex()));
+        assert!(sweep_expired_sessions(&missing, 1_000_000, 90).is_empty());
+    }
+
+    #[test]
+    fn run_session_gc_reclaims_old_sessions_and_drops_their_titles() {
+        // Wiring test over the cfg.home path (no global-env mutation): an ancient
+        // session (mtime at the epoch, far past any TTL) is reclaimed and its stashed
+        // title dropped; a fresh one survives.
+        let home = std::env::temp_dir().join(format!("jesse-home-{}", random_hex()));
+        let vault = "/vault/gc";
+        let dir = home
+            .join(".claude")
+            .join("projects")
+            .join(escape_project_path(vault));
+        std::fs::create_dir_all(&dir).unwrap();
+        write(&dir, "ancient.jsonl", "{}\n");
+        write(&dir, "fresh.jsonl", "{}\n");
+        set_mtime(&dir.join("ancient.jsonl"), 0); // epoch → older than any TTL
+        // `fresh.jsonl` keeps its just-written (now) mtime.
+
+        let mut cfg = crate::testutil::test_config();
+        cfg.home = home.to_string_lossy().into_owned();
+        cfg.vault = vault.to_string();
+        cfg.session_ttl_days = 90;
+
+        let titles = TitleStore::new(None);
+        titles.set("ancient", "Old Title");
+        titles.set("fresh", "New Title");
+
+        run_session_gc(&cfg, &titles);
+
+        assert!(!dir.join("ancient.jsonl").exists(), "ancient session reclaimed");
+        assert!(dir.join("fresh.jsonl").exists(), "fresh session kept");
+        assert_eq!(titles.get("ancient"), None, "reclaimed title dropped");
+        assert_eq!(titles.get("fresh").as_deref(), Some("New Title"), "kept title stays");
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn effective_resume_id_drops_a_missing_real_session() {
+        // Fresh turn: unchanged.
+        assert_eq!(effective_resume_id(None, false), None);
+        assert_eq!(effective_resume_id(None, true), None);
+        // Synthetic id: passed through regardless of the existence bool.
+        assert_eq!(
+            effective_resume_id(Some("local-abc"), false),
+            Some("local-abc")
+        );
+        // Real id, transcript present → resume it.
+        assert_eq!(effective_resume_id(Some("real-1"), true), Some("real-1"));
+        // Real id, transcript MISSING (swept/deleted) → fresh (None).
+        assert_eq!(effective_resume_id(Some("real-1"), false), None);
+    }
+
+    #[test]
+    fn resolve_resume_drops_a_deleted_session_end_to_end() {
+        // Drive the whole cfg.home-based path (no global-env mutation): a present
+        // transcript resumes; after it is deleted the same id is no longer resumable
+        // (falls to a fresh session).
+        let home = std::env::temp_dir().join(format!("jesse-home-{}", random_hex()));
+        let vault = "/vault/notes";
+        let dir = home
+            .join(".claude")
+            .join("projects")
+            .join(escape_project_path(vault));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let mut cfg = crate::testutil::test_config();
+        cfg.home = home.to_string_lossy().into_owned();
+        cfg.vault = vault.to_string();
+
+        // No transcript yet → a real id is NOT resumable (fresh).
+        assert_eq!(resolve_resume_session(&cfg, Some("sess-1")), None);
+        // Create the transcript → the id resumes.
+        write(&dir, "sess-1.jsonl", "{\"type\":\"user\"}\n");
+        assert!(session_transcript_exists(&cfg, "sess-1"));
+        assert_eq!(resolve_resume_session(&cfg, Some("sess-1")), Some("sess-1"));
+        // Delete it (the DELETE endpoint's core op) → no longer resumable.
+        assert_eq!(
+            delete_session_file(&dir, "sess-1"),
+            SessionDeleteOutcome::Deleted
+        );
+        assert!(!session_transcript_exists(&cfg, "sess-1"));
+        assert_eq!(resolve_resume_session(&cfg, Some("sess-1")), None);
+        // A synthetic id passes through untouched (never resumed downstream).
+        assert_eq!(
+            resolve_resume_session(&cfg, Some("local-abc")),
+            Some("local-abc")
+        );
+
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn session_transcript_path_lands_under_the_projects_dir() {
+        let p = session_transcript_path("/home/bob", "/vault/notes", "sess-9");
+        assert_eq!(
+            p,
+            PathBuf::from("/home/bob/.claude/projects/-vault-notes/sess-9.jsonl")
+        );
     }
 
     /// Set a file's mtime to exactly `secs` since the unix epoch, dependency-free,

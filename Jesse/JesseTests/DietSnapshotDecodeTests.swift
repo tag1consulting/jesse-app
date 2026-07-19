@@ -5,6 +5,7 @@ import XCTest
 // (null sections + a non-empty errors array), unknown-key tolerance, and the
 // status→error mapping in `JesseClient.decodeDiet`.
 
+@MainActor
 final class DietSnapshotDecodeTests: XCTestCase {
 
     private func decode(_ json: String) throws -> DietSnapshot {
@@ -208,10 +209,10 @@ final class DietSnapshotDecodeTests: XCTestCase {
         XCTAssertNil(s.availableDays)
     }
 
-    // MARK: - Micronutrients (na / satf / sug / k) — unknown ≠ zero
+    // MARK: - Micronutrients (na / satf / sug / k / ca / o3 / mg) — unknown ≠ zero
 
-    // A day where one item carries all four micronutrients and a second carries none,
-    // plus the four optional day targets.
+    // A day where one item carries every tracked micronutrient and a second carries
+    // none, plus every optional day target.
     private let micros = """
     {
       "asOf": "2026-07-09T14:50:55Z",
@@ -219,11 +220,12 @@ final class DietSnapshotDecodeTests: XCTestCase {
         "date": "2026-07-09", "exercise": [],
         "meals": [ { "name": "Lunch", "time": "12:30", "items": [
           { "item": "Soup", "cal": 200, "p": 8, "f": 6, "c": 20, "fiber": 3,
-            "na": 900, "satf": 2.5, "sug": 4, "k": 300 },
+            "na": 900, "satf": 2.5, "sug": 4, "k": 300, "ca": 120, "o3": 250, "mg": 60 },
           { "item": "Bread", "cal": 150, "p": 5, "f": 2, "c": 28, "fiber": 2 }
         ] } ],
         "targets": { "calories": 2100, "protein": 190, "fat": 65, "carbs": 210,
-          "sodium": 2300, "satFat": 20, "potassium": 3500, "sugar": 50 }
+          "sodium": 2300, "satFat": 20, "potassium": 3500, "sugar": 50,
+          "calcium": 1200, "omega3": 500, "magnesium": 400 }
       },
       "errors": []
     }
@@ -232,25 +234,34 @@ final class DietSnapshotDecodeTests: XCTestCase {
     func testDecodesMicronutrientsWhenPresent() throws {
         let s = try decode(micros)
         let items = try XCTUnwrap(s.today.meals.first?.items)
-        // First item carries all four.
+        // First item carries every tracked micronutrient.
         XCTAssertEqual(items[0].na, 900)
         XCTAssertEqual(items[0].satf, 2.5)
         XCTAssertEqual(items[0].sug, 4)
         XCTAssertEqual(items[0].k, 300)
-        // Second item lacks all four → nil (UNKNOWN), never zero-padded.
+        XCTAssertEqual(items[0].ca, 120)
+        XCTAssertEqual(items[0].o3, 250)
+        XCTAssertEqual(items[0].mg, 60)
+        // Second item lacks all → nil (UNKNOWN), never zero-padded.
         XCTAssertNil(items[1].na)
         XCTAssertNil(items[1].satf)
         XCTAssertNil(items[1].sug)
         XCTAssertNil(items[1].k)
-        // The four optional day targets decode.
+        XCTAssertNil(items[1].ca)
+        XCTAssertNil(items[1].o3)
+        XCTAssertNil(items[1].mg)
+        // Every optional day target decodes.
         XCTAssertEqual(s.today.targets.sodium, 2300)
         XCTAssertEqual(s.today.targets.satFat, 20)
         XCTAssertEqual(s.today.targets.potassium, 3500)
         XCTAssertEqual(s.today.targets.sugar, 50)
+        XCTAssertEqual(s.today.targets.calcium, 1200)
+        XCTAssertEqual(s.today.targets.omega3, 500)
+        XCTAssertEqual(s.today.targets.magnesium, 400)
     }
 
     func testItemLackingMicronutrientsDecodesToNil() throws {
-        // The `full` body carries none of the four new item keys → all nil, and the
+        // The `full` body carries none of the item micronutrient keys → all nil, and the
         // whole payload still decodes cleanly (no key is required).
         let s = try decode(full)
         let item = try XCTUnwrap(s.today.meals.first?.items.first)
@@ -258,11 +269,17 @@ final class DietSnapshotDecodeTests: XCTestCase {
         XCTAssertNil(item.satf)
         XCTAssertNil(item.sug)
         XCTAssertNil(item.k)
+        XCTAssertNil(item.ca)
+        XCTAssertNil(item.o3)
+        XCTAssertNil(item.mg)
         // Absent target keys → nil.
         XCTAssertNil(s.today.targets.sodium)
         XCTAssertNil(s.today.targets.satFat)
         XCTAssertNil(s.today.targets.potassium)
         XCTAssertNil(s.today.targets.sugar)
+        XCTAssertNil(s.today.targets.calcium)
+        XCTAssertNil(s.today.targets.omega3)
+        XCTAssertNil(s.today.targets.magnesium)
     }
 
     func testUnknownKeysAreIgnored() throws {
@@ -273,6 +290,58 @@ final class DietSnapshotDecodeTests: XCTestCase {
         """
         let s = try decode(json)
         XCTAssertEqual(s.today.date, "2026-07-09")
+    }
+
+    // MARK: - nutrientSeries (bridge ≥ 0.21.0) — additive, unknown ≠ zero
+
+    // A snapshot carrying a two-day nutrientSeries: one full day and one where a nutrient
+    // key is a GAP (absent) and another is partial (unknown > 0).
+    private let withSeries = """
+    {
+      "asOf": "2026-07-09T14:50:55Z",
+      "today": {
+        "date": "2026-07-09", "exercise": [], "meals": [],
+        "targets": { "calories": 2100, "protein": 190, "magnesium": 400 }
+      },
+      "errors": [],
+      "nutrientSeries": [
+        { "date": "2026-07-07",
+          "nutrients": {
+            "cal": { "sum": 2000, "known": 5, "unknown": 0 },
+            "mg":  { "sum": 250,  "known": 3, "unknown": 2 }
+          } },
+        { "date": "2026-07-08",
+          "nutrients": {
+            "cal": { "sum": 1900, "known": 4, "unknown": 0 }
+          } }
+      ]
+    }
+    """
+
+    func testDecodesNutrientSeries() throws {
+        let s = try decode(withSeries)
+        let series = try XCTUnwrap(s.nutrientSeries)
+        XCTAssertEqual(series.count, 2)
+        XCTAssertEqual(series[0].date, "2026-07-07")
+        // sum/known/unknown parse.
+        let cal0 = try XCTUnwrap(series[0].nutrients["cal"])
+        XCTAssertEqual(cal0.sum, 2000)
+        XCTAssertEqual(cal0.known, 5)
+        XCTAssertEqual(cal0.unknown, 0)
+        // A partial nutrient day: unknown > 0, sum is the KNOWN-only floor.
+        let mg0 = try XCTUnwrap(series[0].nutrients["mg"])
+        XCTAssertEqual(mg0.sum, 250)
+        XCTAssertEqual(mg0.unknown, 2)
+        // Day two: magnesium is a GAP (absent from the map), never a zero entry.
+        XCTAssertNil(series[1].nutrients["mg"], "an all-unknown nutrient day is absent, not 0")
+        XCTAssertEqual(series[1].nutrients["cal"]?.sum, 1900)
+    }
+
+    func testSnapshotWithoutNutrientSeriesStillDecodes() throws {
+        // The `full` and `degraded` fixtures carry no nutrientSeries → nil (graceful,
+        // older bridge), and the whole payload decodes cleanly.
+        XCTAssertNil(try decode(full).nutrientSeries)
+        XCTAssertNil(try decode(degraded).nutrientSeries)
     }
 
     // MARK: - decodeDiet status mapping

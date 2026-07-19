@@ -554,14 +554,25 @@ struct Explainer: Identifiable, Equatable {
 struct FoodDrilldown: Equatable, Sendable {
     let breakdown: FoodBreakdown
     let insightInput: HealthInsightInput
+    /// The per-nutrient trend, one tap deeper — present only when the snapshot carries a
+    /// `nutrientSeries` (bridge ≥ 0.21.0). Nil on an older bridge, so the "View trend"
+    /// affordance simply doesn't appear (graceful degrade, no crash).
+    var trend: NutrientTrendContext?
 
     /// Build the drill-down for a tapped metric — the single builder BOTH entry points
     /// use (the Today rings and the Macros & calories detail), so tapping a metric
     /// anywhere produces the identical facts and grounded insight. The headline is the
     /// gauge's own value, so the foods reconcile against the number the tap came from,
     /// and the insight is fed the gauge's deterministic goal status rather than guessing.
+    ///
+    /// `series`/`targets` are additive: when the snapshot carries a `nutrientSeries`, the
+    /// tapped metric's per-nutrient trend rides along so the sheet can push
+    /// `NutrientTrendDetail`. Defaulted so callers without history (previews, older
+    /// paths) build exactly as before.
     static func build(meals: [DietMeal], metric: ContributionMetric,
-                      gauge: MetricGauge, isCarbLoad: Bool) -> FoodDrilldown {
+                      gauge: MetricGauge, isCarbLoad: Bool,
+                      series: [NutrientDay]? = nil,
+                      targets: DietTargets = DietTargets()) -> FoodDrilldown {
         let breakdown = FoodContributions.breakdown(meals, metric: metric, total: gauge.value)
         // An informational metric (total sugars) is grounded WITHOUT a target, so the
         // insight frames no goal and the judgment forbid stands alone; every other
@@ -576,7 +587,14 @@ struct FoodDrilldown: Equatable, Sendable {
             contributions: breakdown.contributions,
             partial: gauge.partial, knownItemCount: gauge.knownItemCount ?? 0,
             unknownItemCount: gauge.unknownItemCount, informational: informational)
-        return FoodDrilldown(breakdown: breakdown, insightInput: input)
+        // Attach the per-nutrient trend only when the bridge sent history — otherwise the
+        // sheet shows the facts alone, exactly as before.
+        let trend: NutrientTrendContext? = {
+            guard let series, NutrientTrends.isAvailable(series) else { return nil }
+            return NutrientTrendContext(nutrient: TrendNutrient(metric: metric),
+                                        series: series, targets: targets, meals: meals)
+        }()
+        return FoodDrilldown(breakdown: breakdown, insightInput: input, trend: trend)
     }
 }
 
@@ -629,6 +647,18 @@ struct ExplainerSheet: View {
                         // unavailable.
                         HealthInsightView(input: drilldown.insightInput, provider: insight,
                                           text: $insightText)
+                        // The per-nutrient trend lives one tap deeper (only when the bridge
+                        // sent history) — like the weight trend behind the weight card. A
+                        // plain navigation row, not top-level Health chrome.
+                        if let trend = drilldown.trend {
+                            Divider()
+                            NavigationLink {
+                                NutrientTrendDetail(context: trend)
+                            } label: {
+                                Label("View \(trend.nutrient.fullName) trend", systemImage: "chart.xyaxis.line")
+                                    .font(.body)
+                            }
+                        }
                     }
                 }
                 .frame(maxWidth: .infinity, alignment: .leading)
@@ -844,20 +874,26 @@ struct ContributionRow: View {
     }
 }
 
-/// Identity colors for the four micronutrients. A sub-entry micronutrient takes a
-/// lightened shade of its PARENT macro's identity color — saturated fat from the fat
-/// orange, total sugars from the carbs teal — the same derivation fiber uses, so the
-/// nutrition-label tree reads as parent-and-paler-kin in the drill-down bars too
-/// (resolved per color scheme, opaque, distinguishable in light and dark). The
-/// standalone minerals (sodium, potassium) keep their own distinct hue, apart from the
-/// macro palette. One place, so no view hardcodes a color.
+/// Identity colors for the micronutrients. A sub-entry micronutrient takes a lightened
+/// shade of its PARENT macro's identity color — saturated fat and unsaturated fat from the
+/// fat orange, total sugars from the carbs teal — the same derivation fiber uses, so the
+/// nutrition-label tree reads as parent-and-paler-kin in the drill-down bars too (resolved
+/// per color scheme, opaque, distinguishable in light and dark). The standalone entries
+/// (sodium, potassium, calcium, magnesium, omega-3) each keep their own distinct hue,
+/// apart from the macro palette. One place, so no view hardcodes a color.
 enum MicronutrientColor {
     static func color(for n: Micronutrient) -> Color {
         if let parent = n.parent {
             return MacroColor.shade(ofSubEntry: MacroColor.color(for: parent))
         }
-        // The two standalone minerals — the only cases with no macro parent.
-        return n == .sodium ? .blue : .mint
+        // The standalone entries — the cases with no macro parent — each a distinct hue.
+        switch n {
+        case .potassium: return .mint
+        case .calcium: return .cyan
+        case .omega3: return .pink
+        case .magnesium: return .purple
+        default: return .blue // sodium (and any future standalone default)
+        }
     }
 }
 

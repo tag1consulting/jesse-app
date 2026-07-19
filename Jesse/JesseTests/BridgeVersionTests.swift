@@ -32,21 +32,24 @@ private final class HealthFakeClient: JesseClientProtocol, @unchecked Sendable {
     }
 }
 
+@MainActor
 final class BridgeVersionTests: XCTestCase {
     private var scratch: UserDefaults!
 
-    override func setUp() {
-        super.setUp()
+    // Async variants so the `@MainActor` case's main-actor state (`scratch`) is
+    // touched on the main actor; the sync hooks run nonisolated and would warn.
+    override func setUp() async throws {
+        try await super.setUp()
         // Point the store at a throwaway suite so tests never touch real defaults.
         scratch = UserDefaults(suiteName: "BridgeVersionTests")!
         scratch.removePersistentDomain(forName: "BridgeVersionTests")
         BridgeVersionStore.defaults = scratch
     }
 
-    override func tearDown() {
+    override func tearDown() async throws {
         scratch.removePersistentDomain(forName: "BridgeVersionTests")
         BridgeVersionStore.defaults = .standard
-        super.tearDown()
+        try await super.tearDown()
     }
 
     func testHealthVersionSurfacesAsStoredBridgeVersion() async {
@@ -92,6 +95,7 @@ final class BridgeVersionTests: XCTestCase {
 
 // Pure version-handshake logic (no I/O): SemVer ordering and the
 // `BridgeCompatibility.isOutdated` decision that drives the Settings advisory.
+@MainActor
 final class BridgeCompatibilityTests: XCTestCase {
 
     // MARK: SemVer parsing / ordering

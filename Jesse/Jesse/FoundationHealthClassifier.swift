@@ -55,15 +55,23 @@ final class FoundationHealthClassifier {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return nil }
 
+        // Prepare the reused session and prompt HERE, on the main actor. The session
+        // is `@unchecked Sendable` and `respond` is `nonisolated(nonsending)`, so the
+        // model child task can capture and drive the session directly. Building both
+        // race children with the SAME (nonisolated) isolation — rather than mixing a
+        // `@MainActor` child with a nonisolated one — is what keeps the region-based
+        // isolation checker able to reason about the group.
+        let session = ensureSession()
+        let prompt = """
+        Does this message relate to the user's health, fitness, sleep, \
+        diet, or exercise? Message: "\(trimmed)"
+        """
+
         // Race the model against the latency bound; whichever finishes first wins.
         return await withTaskGroup(of: Bool?.self) { group in
-            group.addTask { @MainActor in
+            group.addTask {
                 do {
-                    let prompt = """
-                    Does this message relate to the user's health, fitness, sleep, \
-                    diet, or exercise? Message: "\(trimmed)"
-                    """
-                    let response = try await self.ensureSession().respond(
+                    let response = try await session.respond(
                         to: prompt, generating: HealthRelevanceAnswer.self)
                     return response.content.relevant
                 } catch {

@@ -5,28 +5,29 @@ import XCTest
 /// `PendingMealBatch` (upserts + retracts): enqueue/dequeue round-trips across a relaunch;
 /// dequeue clears; enqueue dedupes (upserts by id, retracts by value); and the pre-v2
 /// `[Meal]` queue migrates once into upserts.
+@MainActor
 final class PendingMealStoreTests: XCTestCase {
 
     private var suiteName = ""
     private var defaults: UserDefaults!
 
-    override func setUp() {
-        super.setUp()
+    override func setUp() async throws {
+        try await super.setUp()
         suiteName = "test.pendingmeals.\(UUID().uuidString)"
         defaults = UserDefaults(suiteName: suiteName)
     }
 
-    override func tearDown() {
+    override func tearDown() async throws {
         defaults.removePersistentDomain(forName: suiteName)
         defaults = nil
-        super.tearDown()
+        try await super.tearDown()
     }
 
     private func meal(_ id: String, kcal: Double? = 100, sodium: Double? = nil) -> Meal {
         Meal(id: id, consumedAt: Date(timeIntervalSince1970: 1_780_000_000),
              name: "Meal \(id)", kcal: kcal, proteinGrams: nil, carbGrams: nil,
              fatGrams: nil, fiberGrams: nil,
-             sodiumMg: sodium, satFatGrams: nil, sugarGrams: nil, potassiumMg: nil)
+             sodiumMg: sodium, satFatGrams: nil, sugarGrams: nil, potassiumMg: nil, calciumMg: nil, magnesiumMg: nil)
     }
 
     private func batch(_ upserts: [Meal] = [], retract: [String] = []) -> PendingMealBatch {

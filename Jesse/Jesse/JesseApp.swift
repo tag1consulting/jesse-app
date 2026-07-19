@@ -15,11 +15,16 @@ struct JesseApp: App {
         onFirstSuccess: { PushManager.shared.noteSuccessfulTurn() }
     )
 
+    // Opened once at launch. `openFailure` is non-nil only when the on-disk store
+    // couldn't be opened and we're on the flagged in-memory fallback — surfaced to
+    // the user rather than silently swallowed (see `AppModelStore`).
+    private let store = AppModelContainer.shared
+
     var body: some Scene {
         WindowGroup {
-            RootTabView()
+            RootTabView(storeError: store.openFailure)
                 .environment(coordinator)
         }
-        .modelContainer(AppModelContainer.shared)
+        .modelContainer(store.container)
     }
 }

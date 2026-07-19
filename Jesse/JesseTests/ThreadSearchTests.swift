@@ -1,6 +1,7 @@
 import XCTest
 @testable import Jesse
 
+@MainActor
 final class ThreadSearchTests: XCTestCase {
 
     /// Build an in-memory thread (no SwiftData container needed) with a title

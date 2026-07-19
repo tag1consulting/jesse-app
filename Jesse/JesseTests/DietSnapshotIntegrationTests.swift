@@ -32,6 +32,7 @@ final class DietStubURLProtocol: URLProtocol {
     }
 }
 
+@MainActor
 final class DietSnapshotIntegrationTests: XCTestCase {
 
     private let cfg = JesseConfig(host: "laptop", port: 8765, token: "tok")

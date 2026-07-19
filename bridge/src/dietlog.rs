@@ -11,9 +11,21 @@
 //!   3. **Append** — trusted Rust writes the verified rows RFC-4180-style to the
 //!      correct `diet-logs/*.csv`, runs the three pinned node scripts, and commits.
 //!   4. **Mirror** — the `JESSE_MEAL_LOG v1` directive is DERIVED by the bridge from
-//!      the appended food rows (one mirror meal per row, macros equal to the row),
-//!      reusing the existing [`Meal`]/[`MealLog`] structs so the app decodes it
-//!      unchanged. The aggregation failure mode is impossible by construction.
+//!      the appended food rows: the turn's rows are GROUPED by (date, meal slot, time)
+//!      into one mirror meal per group, each carrying the SAME deterministic id the
+//!      hosted logging skill computes for those rows (`<date>-<slot lowercased>-<HHMM>`,
+//!      recomputable from the CSV alone), with every nutrient summed in trusted Rust
+//!      over the group's rows that carry a KNOWN value. Reusing the existing
+//!      [`Meal`]/[`MealLog`] structs, the app decodes it unchanged. Model-side
+//!      aggregation stays impossible by construction (the bridge sums, never the model),
+//!      and because each id matches the hosted contract, a later correction or
+//!      retraction routed through the hosted path targets the exact same Health entry.
+//!
+//! **Insert-only by design.** The local path logs NEW consumption only; it never
+//! amends, moves, or retracts an already-logged entry. A correction turn is classified
+//! `no_loggable_content` at extract and routed to the hosted turn (rung 2), whose
+//! logging skill owns the correction contract — the deterministic per-meal ids above
+//! are exactly what let that hosted correction find the mirror's Health entry.
 //!
 //! Every failure lands on a well-defined [`DietRung`]: rungs 1–4 fall through to the
 //! hosted turn (a log is never lost and never double-appended — the append is atomic
@@ -53,7 +65,7 @@ pub const DIET_VERIFY_TIMEOUT_SECS: u64 = 30;
 // append_schema` is the drift guard that enforces this (the parity mitigation).
 
 pub const FOOD_LOG_HEADER: &str =
-    "Date,Meal,Item,Amount,Unit,Cal_per_100g,Grams,Calories,Protein_g,Fat_g,Carbs_g,Notes,Time,Meal_Type,Fiber_g,Sodium_mg,SatFat_g,Sugar_g,Potassium_mg";
+    "Date,Meal,Item,Amount,Unit,Cal_per_100g,Grams,Calories,Protein_g,Fat_g,Carbs_g,Notes,Time,Meal_Type,Fiber_g,Sodium_mg,SatFat_g,Sugar_g,Potassium_mg,Calcium_mg,Omega3_mg,Magnesium_mg";
 pub const EXERCISE_LOG_HEADER: &str =
     "Date,Type,Description,Distance_km,Duration,Pace_min_per_km,Elevation_m,Avg_HR,Cadence,Calories,Plan_Source,Notes,Start_Time";
 pub const WEIGHT_LOG_HEADER: &str =
@@ -94,6 +106,13 @@ pub struct FoodEntry {
     pub satfat_g: Option<f64>,
     pub sugar_g: Option<f64>,
     pub potassium_mg: Option<f64>,
+    // The three newest micronutrients — same unknown-is-not-zero discipline. `calcium_mg`
+    // and `magnesium_mg` are milligrams; `omega3_mg` is marine long-chain EPA+DHA in
+    // milligrams (never plant ALA). `None` is a blank CSV cell / omitted wire field,
+    // never `Some(0.0)`.
+    pub calcium_mg: Option<f64>,
+    pub omega3_mg: Option<f64>,
+    pub magnesium_mg: Option<f64>,
     pub notes: Option<String>,
 }
 
@@ -221,8 +240,8 @@ pub fn strip_code_fence(s: &str) -> &str {
 }
 
 pub fn parse_diet_entries(json: &str) -> Result<DietExtract, String> {
-    let value: Value =
-        serde_json::from_str(strip_code_fence(json.trim())).map_err(|e| format!("invalid JSON: {e}"))?;
+    let value: Value = serde_json::from_str(strip_code_fence(json.trim()))
+        .map_err(|e| format!("invalid JSON: {e}"))?;
     let obj = value.as_object().ok_or("payload is not a JSON object")?;
     for key in obj.keys() {
         if key != "entries" && key != "no_loggable_content" {
@@ -348,6 +367,9 @@ const FOOD_KEYS: &[&str] = &[
     "satfat_g",
     "sugar_g",
     "potassium_mg",
+    "calcium_mg",
+    "omega3_mg",
+    "magnesium_mg",
     "notes",
 ];
 
@@ -379,6 +401,9 @@ fn parse_food(m: &serde_json::Map<String, Value>) -> Result<FoodEntry, String> {
         satfat_g: opt_extract_num_field(m, "satfat_g")?,
         sugar_g: opt_extract_num_field(m, "sugar_g")?,
         potassium_mg: opt_extract_num_field(m, "potassium_mg")?,
+        calcium_mg: opt_extract_num_field(m, "calcium_mg")?,
+        omega3_mg: opt_extract_num_field(m, "omega3_mg")?,
+        magnesium_mg: opt_extract_num_field(m, "magnesium_mg")?,
         notes: opt_str_field(m, "notes"),
     })
 }
@@ -625,6 +650,9 @@ pub fn food_row(e: &FoodEntry, date: &str) -> String {
         num_cell(e.satfat_g),     // SatFat_g
         num_cell(e.sugar_g),      // Sugar_g
         num_cell(e.potassium_mg), // Potassium_mg
+        num_cell(e.calcium_mg),   // Calcium_mg — blank when unknown, never 0
+        num_cell(e.omega3_mg),    // Omega3_mg  (marine EPA+DHA only)
+        num_cell(e.magnesium_mg), // Magnesium_mg
     ];
     cols.join(",")
 }
@@ -680,14 +708,36 @@ fn meal_slug(meal: &str) -> String {
     out.trim_matches('-').to_string()
 }
 
-/// Build the DERIVED [`MealLog`] mirror from the verified food entries: exactly ONE
-/// mirror meal per food row, with macros EQUAL to the row's — the aggregation
-/// failure mode is impossible by construction, not by trust. Returns `Ok(None)` when
-/// there are no food rows (a valid exercise/weigh-in-only turn — no mirror to emit),
-/// and `Err` when the row count exceeds [`MAX_MEALS`] (the caller maps that to rung
-/// 5: keep the committed CSV, omit the mirror). Each meal id is
-/// `<date>-<mealslug>-<HHMM>-<seq>`, unique per row so two rows always yield two
-/// distinct mirror meals.
+/// Sum a group's values for one nutrient, honoring the unknown-is-not-zero contract:
+/// a `None` row contributes NOTHING, and a group in which no row carries the value
+/// sums to `None` (the field is omitted on the wire, never a summed `Some(0)`). A
+/// group with at least one known value sums those, so a partially-known nutrient
+/// mirrors the sum of the rows that stated it.
+fn sum_known(vals: impl Iterator<Item = Option<f64>>) -> Option<f64> {
+    let mut acc: Option<f64> = None;
+    for v in vals.flatten() {
+        acc = Some(acc.unwrap_or(0.0) + v);
+    }
+    acc
+}
+
+/// Build the DERIVED [`MealLog`] mirror from the verified food entries. The turn's
+/// rows are GROUPED by (date, meal slot, `HHMM`) — one mirror meal per group — so each
+/// meal carries the SAME deterministic id the hosted logging skill computes for the
+/// same rows: `<date>-<slot lowercased>-<HHMM>` (e.g. `2026-07-04-lunch-1230`), with
+/// no positional seq. That id is recomputable from the CSV row data alone, which is the
+/// property that lets a later hosted correction or retraction target the exact Health
+/// entry this mirror created (app-side upserts are version-agnostic).
+///
+/// Every nutrient is summed in trusted Rust over the group's rows via [`sum_known`]
+/// (unknown-is-not-zero: a `None` row contributes nothing; an all-`None` group omits
+/// the field). Aggregation is done by the bridge, never the model, so the aggregation
+/// failure mode stays impossible by construction. There is no `omega3` field on the
+/// meal wire (no HealthKit EPA+DHA type), so nothing is summed for it.
+///
+/// Returns `Ok(None)` when there are no food rows (a valid exercise/weigh-in-only turn
+/// — no mirror to emit), and `Err` when the GROUP count exceeds [`MAX_MEALS`] (the
+/// caller maps that to rung 5: keep the committed CSV, omit the mirror).
 pub fn build_meal_log_from_food_rows(
     rows: &[FoodEntry],
     date: &str,
@@ -696,40 +746,72 @@ pub fn build_meal_log_from_food_rows(
     if rows.is_empty() {
         return Ok(None);
     }
-    if rows.len() > MAX_MEALS {
+
+    // Group the turn's rows by (meal slot, HHMM), preserving first-appearance order so
+    // the mirror is deterministic. The grouping KEY is the same (slug, HHMM) the id is
+    // built from, so two rows that would compute the same id always land in one group —
+    // ids are unique across meals by construction.
+    struct Group<'a> {
+        slug: String,
+        hhmm: String,
+        // The first row's raw `time`/`meal` drive the group's consumed-at + display
+        // label; every row in the group shares the same (slug, HHMM).
+        time: String,
+        meal_label: String,
+        rows: Vec<&'a FoodEntry>,
+    }
+    let mut groups: Vec<Group> = Vec::new();
+    for r in rows {
+        // By the time a row reaches the mirror the pipeline has stamped any missing
+        // time (received-at), so `time` is Some; default defensively. `hhmm` is the
+        // digits of the clock time — the SAME fallback the id has always used.
+        let time = r.time.as_deref().unwrap_or("");
+        let hhmm: String = time.chars().filter(|c| c.is_ascii_digit()).collect();
+        let slug = meal_slug(&r.meal);
+        match groups.iter_mut().find(|g| g.slug == slug && g.hhmm == hhmm) {
+            Some(g) => g.rows.push(r),
+            None => groups.push(Group {
+                slug,
+                hhmm,
+                time: time.to_string(),
+                meal_label: r.meal.clone(),
+                rows: vec![r],
+            }),
+        }
+    }
+    if groups.len() > MAX_MEALS {
         return Err(format!(
-            "{} food rows exceeds the {MAX_MEALS}-meal mirror cap",
-            rows.len()
+            "{} meals exceeds the {MAX_MEALS}-meal mirror cap",
+            groups.len()
         ));
     }
-    let meals = rows
+    let meals = groups
         .iter()
-        .enumerate()
-        .map(|(i, r)| {
-            // By the time a row reaches the mirror the pipeline has stamped any
-            // missing time (received-at), so `time` is Some; default defensively.
-            let time = r.time.as_deref().unwrap_or("");
-            let hhmm: String = time.chars().filter(|c| c.is_ascii_digit()).collect();
+        .map(|g| {
+            let names: Vec<&str> = g.rows.iter().map(|r| r.name.as_str()).collect();
             Meal {
-                // Unique per row (`<date>-<slug>-<HHMM>-<seq>`) so two rows in the same
-                // slot never collide → two rows always yield two distinct meals.
-                id: format!("{date}-{}-{hhmm}-{}", meal_slug(&r.meal), i + 1),
-                consumed_at: format!("{date}T{time}:00{offset}"),
-                name: format!("{}: {}", r.meal, r.name),
-                // Macros EQUAL to the row (omit unknown — never null-pad).
-                kcal: r.kcal,
-                protein_g: r.protein_g,
-                carbs_g: r.carbs_g,
-                fat_g: r.fat_g,
-                fiber_g: r.fiber_g,
-                // Micronutrients carry through per row too. Each mirror meal is exactly
-                // ONE food row, so the "sum over the meal's items that carry a known
-                // value" is just this row's value when known, and `None` (no wire field)
-                // when the row never established it — never a summed `Some(0)`.
-                sodium_mg: r.sodium_mg,
-                satfat_g: r.satfat_g,
-                sugar_g: r.sugar_g,
-                potassium_mg: r.potassium_mg,
+                // The deterministic hosted-contract id: `<date>-<slug>-<HHMM>`, no seq.
+                id: format!("{date}-{}-{}", g.slug, g.hhmm),
+                consumed_at: format!("{date}T{}:00{offset}", g.time),
+                name: format!("{}: {}", g.meal_label, names.join(", ")),
+                // Macros summed over the group in trusted Rust (unknown-is-not-zero).
+                kcal: sum_known(g.rows.iter().map(|r| r.kcal)),
+                protein_g: sum_known(g.rows.iter().map(|r| r.protein_g)),
+                carbs_g: sum_known(g.rows.iter().map(|r| r.carbs_g)),
+                fat_g: sum_known(g.rows.iter().map(|r| r.fat_g)),
+                fiber_g: sum_known(g.rows.iter().map(|r| r.fiber_g)),
+                // Micronutrients summed the same way: only the rows that stated a value
+                // contribute, and a group where none did omits the field (never Some(0)).
+                sodium_mg: sum_known(g.rows.iter().map(|r| r.sodium_mg)),
+                satfat_g: sum_known(g.rows.iter().map(|r| r.satfat_g)),
+                sugar_g: sum_known(g.rows.iter().map(|r| r.sugar_g)),
+                potassium_mg: sum_known(g.rows.iter().map(|r| r.potassium_mg)),
+                // Only the HealthKit-bound micros carry onto the Meal wire. Calcium and
+                // magnesium have HealthKit types; omega-3 does NOT (there is no EPA/DHA
+                // HealthKit quantity — `dietaryFatPolyunsaturated` includes ALA, so it is
+                // wrong), so there is no `omega3` Meal field and nothing to mirror for it.
+                calcium_mg: sum_known(g.rows.iter().map(|r| r.calcium_mg)),
+                magnesium_mg: sum_known(g.rows.iter().map(|r| r.magnesium_mg)),
             }
         })
         .collect();
@@ -1310,9 +1392,7 @@ pub fn format_diet_provenance(
     };
     let mirror = if mirror_derived { "derived" } else { "omitted" };
     // The machine-readable rung-2 reason rides after the disposition (content-free).
-    let reason = reason
-        .map(|r| format!(" reason={r}"))
-        .unwrap_or_default();
+    let reason = reason.map(|r| format!(" reason={r}")).unwrap_or_default();
     format!(
         "jesse-bridge: diet turn -> {disposition}{reason} extract base_url={base_url} model={model}; \
          verify verdict={verify}; rows={rows} mirror={mirror}"
@@ -1325,9 +1405,9 @@ pub fn format_diet_provenance(
 /// array plus `no_loggable_content`. Kept as a const so the prompt and the report
 /// share one source. See [`parse_diet_entries`] for the enforcing validator.
 pub const DIET_EXTRACT_SCHEMA: &str = r#"{
-  "no_loggable_content": <boolean: true ONLY if the message logs nothing to eat/drink, no workout, no weight>,
+  "no_loggable_content": <boolean: true if the message logs nothing NEW to eat/drink, no workout, no weight — OR if it AMENDS/corrects/moves/deletes something already logged instead of reporting new consumption; in either case return an empty entries array>,
   "entries": [
-    { "kind": "food", "name": "<ONE food item, never a combined meal>", "meal": "Breakfast|Lunch|Dinner|Snack", "time": "<HH:MM ONLY if the message states a clock time, else null/omit — never invent one>", "amount": "<e.g. 1 medium (~118g)>", "unit": "serving", "kcal": <number>, "protein_g": <number>, "carbs_g": <number>, "fat_g": <number>, "fiber_g": <number>, "sodium_mg": <number>, "satfat_g": <number>, "sugar_g": <number>, "potassium_mg": <number>, "notes": "<optional>" },
+    { "kind": "food", "name": "<ONE food item, never a combined meal>", "meal": "Breakfast|Lunch|Dinner|Snack", "time": "<HH:MM ONLY if the message states a clock time, else null/omit — never invent one>", "amount": "<e.g. 1 medium (~118g)>", "unit": "serving", "kcal": <number>, "protein_g": <number>, "carbs_g": <number>, "fat_g": <number>, "fiber_g": <number>, "sodium_mg": <number>, "satfat_g": <number>, "sugar_g": <number>, "potassium_mg": <number>, "calcium_mg": <number>, "omega3_mg": <number>, "magnesium_mg": <number>, "notes": "<optional>" },
     { "kind": "exercise", "activity": "Run|Walk|Swim|Strength/Weights|...", "time": "<HH:MM ONLY if stated, else null/omit>", "description": "<optional>", "distance_km": <number>, "duration": "<e.g. 56:58>", "pace": "<e.g. 7:07>", "avg_hr": <number>, "calories": <number>, "notes": "<optional>" },
     { "kind": "weight", "weight_lbs": <number>, "weight_kg": <number>, "body_fat_pct": <number>, "muscle_mass_lbs": <number>, "notes": "<optional>" }
   ]
@@ -1348,15 +1428,21 @@ CONTRACT (the vault's diet logs; you are parsing INTO these columns):\n\
 - weight-log.csv columns: {WEIGHT_LOG_HEADER}\n\
 - Macros are per-ITEM absolute grams/kcal. Omit any macro you don't know — NEVER \
 guess and NEVER write 0 as a placeholder (0 means a real measured zero).\n\
-- MICRONUTRIENTS (`sodium_mg`, `satfat_g`, `sugar_g`, `potassium_mg`) follow the SAME \
-rule: fill a value only from a nutrition label in the message or a confident estimate, \
-otherwise OMIT the key entirely (never guess, never 0-as-placeholder). Units and \
-conversions: `sodium_mg` is sodium in MILLIGRAMS — when an EU label prints salt \
-(\"sale\") in grams instead of sodium, convert sodium_mg = salt_grams × 400. `satfat_g` \
-is saturated fat in grams (the label's \"di cui acidi grassi saturi\"). `sugar_g` is \
-TOTAL sugars in grams (\"di cui zuccheri\"), NEVER added sugars. `potassium_mg` is \
-potassium in milligrams — optional on EU labels and usually absent, so usually omitted. \
-Scale label values to the amount actually logged when the serving differs.\n\
+- MICRONUTRIENTS (`sodium_mg`, `satfat_g`, `sugar_g`, `potassium_mg`, `calcium_mg`, \
+`omega3_mg`, `magnesium_mg`) follow the SAME rule: fill a value only from a nutrition \
+label in the message or a confident estimate, otherwise OMIT the key entirely (never \
+guess, never 0-as-placeholder). Units and conversions: `sodium_mg` is sodium in \
+MILLIGRAMS — when an EU label prints salt (\"sale\") in grams instead of sodium, convert \
+sodium_mg = salt_grams × 400. `satfat_g` is saturated fat in grams (the label's \"di cui \
+acidi grassi saturi\"). `sugar_g` is TOTAL sugars in grams (\"di cui zuccheri\"), NEVER \
+added sugars. `potassium_mg` is potassium in milligrams — optional on EU labels and \
+usually absent, so usually omitted. `calcium_mg` is calcium in MILLIGRAMS and \
+`magnesium_mg` is magnesium in milligrams — like potassium, both are usually absent on \
+EU labels and so usually omitted, but a confident whole-food estimate is fine. \
+`omega3_mg` is marine long-chain omega-3 (EPA+DHA) in MILLIGRAMS — count it ONLY for \
+fish, shellfish, roe, and the small amounts in eggs/dairy; NEVER the plant ALA in \
+walnuts, flax, chia, or vegetable oils, and OMIT it entirely for a plant-ALA-only food. \
+Scale every label value to the amount actually logged when the serving differs.\n\
 - `time` is the clock time the thing happened (HH:MM), but ONLY when the message \
 states one (\"at 12:30\", \"this morning\" is NOT a clock time). You have NO clock and \
 MUST NOT invent, guess, or infer a time — if the message gives no explicit clock time, \
@@ -1372,6 +1458,13 @@ brand/qualifier in parentheses is part of one item's name (\"Salmon (canned)\").
 - One exercise entry per activity; one weight entry per reading.\n\
 - If the message logs nothing loggable (no food/drink, no workout, no weight), set \
 `no_loggable_content` to true and return an empty `entries` array.\n\
+- CORRECTIONS ARE NOT NEW LOGS. If the message AMENDS, corrects, moves, or deletes \
+something already logged — \"actually lunch was two bowls, ~700 kcal\", \"make that \
+700 not 500\", \"delete the snack\", \"move breakfast to 9am\" — rather than reporting \
+NEW consumption, set `no_loggable_content` to true and return an empty `entries` \
+array. This local path logs NEW consumption ONLY; a correction is routed to the hosted \
+path, which owns the correction contract. When you cannot tell a new item from an edit \
+to an existing one, treat it as an amendment (omit it).\n\
 \n\
 SCHEMA (return exactly this shape):\n\
 {DIET_EXTRACT_SCHEMA}\n\
@@ -1826,11 +1919,11 @@ mod tests {
 
     #[test]
     fn parses_food_micronutrients_all_some_or_none() {
-        // All four present, a subset present, and none present must ALL parse — each
+        // All seven present, a subset present, and none present must ALL parse — each
         // micronutrient is optional and unknown-is-not-zero (absent → None).
         let json = r#"{"entries":[
-            {"kind":"food","name":"Prosciutto","meal":"Lunch","time":"12:00","kcal":120,"sodium_mg":900,"satfat_g":2.5,"sugar_g":0,"potassium_mg":180},
-            {"kind":"food","name":"Cracker","meal":"Snack","time":"15:00","kcal":80,"sodium_mg":150,"sugar_g":1.2},
+            {"kind":"food","name":"Prosciutto","meal":"Lunch","time":"12:00","kcal":120,"sodium_mg":900,"satfat_g":2.5,"sugar_g":0,"potassium_mg":180,"calcium_mg":8,"omega3_mg":40,"magnesium_mg":20},
+            {"kind":"food","name":"Cracker","meal":"Snack","time":"15:00","kcal":80,"sodium_mg":150,"sugar_g":1.2,"calcium_mg":12},
             {"kind":"food","name":"Banana","meal":"Snack","time":"10:00","kcal":105}
         ]}"#;
         let ex = parse_diet_entries(json).expect("all three parse");
@@ -1842,30 +1935,52 @@ mod tests {
                 _ => None,
             })
             .collect();
-        // All four present.
+        // All seven present.
         assert_eq!(foods[0].sodium_mg, Some(900.0));
         assert_eq!(foods[0].satfat_g, Some(2.5));
         assert_eq!(foods[0].sugar_g, Some(0.0), "explicit measured zero");
         assert_eq!(foods[0].potassium_mg, Some(180.0));
-        // Subset present — the omitted two stay None, not 0.
+        assert_eq!(foods[0].calcium_mg, Some(8.0));
+        assert_eq!(foods[0].omega3_mg, Some(40.0));
+        assert_eq!(foods[0].magnesium_mg, Some(20.0));
+        // Subset present — the omitted ones stay None, not 0.
         assert_eq!(foods[1].sodium_mg, Some(150.0));
         assert_eq!(foods[1].sugar_g, Some(1.2));
+        assert_eq!(foods[1].calcium_mg, Some(12.0));
         assert_eq!(foods[1].satfat_g, None);
         assert_eq!(foods[1].potassium_mg, None);
-        // None present — all four absent.
+        assert_eq!(foods[1].omega3_mg, None);
+        assert_eq!(foods[1].magnesium_mg, None);
+        // None present — all seven absent.
         assert!(
             foods[2].sodium_mg.is_none()
                 && foods[2].satfat_g.is_none()
                 && foods[2].sugar_g.is_none()
                 && foods[2].potassium_mg.is_none()
+                && foods[2].calcium_mg.is_none()
+                && foods[2].omega3_mg.is_none()
+                && foods[2].magnesium_mg.is_none()
         );
     }
 
     #[test]
     fn parse_rejects_negative_micronutrient() {
-        // A micronutrient shares the finite/non-negative discipline of the macros.
+        // A micronutrient shares the finite/non-negative discipline of the macros —
+        // including the three newest ones.
         assert!(parse_diet_entries(
             r#"{"entries":[{"kind":"food","name":"n","meal":"Snack","time":"09:00","sodium_mg":-5}]}"#
+        )
+        .is_err());
+        assert!(parse_diet_entries(
+            r#"{"entries":[{"kind":"food","name":"n","meal":"Snack","time":"09:00","calcium_mg":-1}]}"#
+        )
+        .is_err());
+        assert!(parse_diet_entries(
+            r#"{"entries":[{"kind":"food","name":"n","meal":"Snack","time":"09:00","omega3_mg":-1}]}"#
+        )
+        .is_err());
+        assert!(parse_diet_entries(
+            r#"{"entries":[{"kind":"food","name":"n","meal":"Snack","time":"09:00","magnesium_mg":-1}]}"#
         )
         .is_err());
     }
@@ -1890,6 +2005,9 @@ mod tests {
             satfat_g: None,
             sugar_g: None,
             potassium_mg: None,
+            calcium_mg: None,
+            omega3_mg: None,
+            magnesium_mg: None,
             notes: None,
         };
         let csv = format!("{FOOD_LOG_HEADER}\n{}\n", food_row(&e, "2026-07-13"));
@@ -1902,6 +2020,12 @@ mod tests {
         assert!(item["satf"].is_null(), "blank SatFat_g reads back as null");
         assert!(item["sug"].is_null(), "blank Sugar_g reads back as null");
         assert!(item["k"].is_null(), "blank Potassium_mg reads back as null");
+        assert!(item["ca"].is_null(), "blank Calcium_mg reads back as null");
+        assert!(item["o3"].is_null(), "blank Omega3_mg reads back as null");
+        assert!(
+            item["mg"].is_null(),
+            "blank Magnesium_mg reads back as null"
+        );
     }
 
     #[test]
@@ -1923,6 +2047,9 @@ mod tests {
             satfat_g: Some(2.5),
             sugar_g: Some(0.0),
             potassium_mg: Some(180.0),
+            calcium_mg: Some(8.0),
+            omega3_mg: Some(40.0),
+            magnesium_mg: Some(20.0),
             notes: None,
         };
         let csv = format!("{FOOD_LOG_HEADER}\n{}\n", food_row(&e, "2026-07-13"));
@@ -1932,6 +2059,9 @@ mod tests {
         assert_eq!(item["satf"], 2.5);
         assert_eq!(item["sug"], 0.0, "measured-zero sugar reads back as 0");
         assert_eq!(item["k"], 180.0);
+        assert_eq!(item["ca"], 8.0, "known calcium survives write→read");
+        assert_eq!(item["o3"], 40.0, "known omega-3 survives write→read");
+        assert_eq!(item["mg"], 20.0, "known magnesium survives write→read");
     }
 
     #[test]
@@ -1985,6 +2115,9 @@ mod tests {
                 satfat_g: None,
                 sugar_g: None,
                 potassium_mg: None,
+                calcium_mg: None,
+                omega3_mg: None,
+                magnesium_mg: None,
                 notes: None,
             }),
             DietEntry::Food(FoodEntry {
@@ -2002,13 +2135,20 @@ mod tests {
                 satfat_g: None,
                 sugar_g: None,
                 potassium_mg: None,
+                calcium_mg: None,
+                omega3_mg: None,
+                magnesium_mg: None,
                 notes: None,
             }),
         ];
         stamp_missing_food_times(&mut entries, "17:44");
         match (&entries[0], &entries[1]) {
             (DietEntry::Food(a), DietEntry::Food(b)) => {
-                assert_eq!(a.time.as_deref(), Some("17:44"), "unstated time gets received-at");
+                assert_eq!(
+                    a.time.as_deref(),
+                    Some("17:44"),
+                    "unstated time gets received-at"
+                );
                 assert_eq!(b.time.as_deref(), Some("07:15"), "stated time is preserved");
             }
             _ => panic!("expected two food entries"),
@@ -2020,15 +2160,20 @@ mod tests {
         // End to end at the append layer: an unstated-time item, once stamped, carries
         // received-at into BOTH the CSV Time column and the derived mirror `consumedAt`
         // — the normal row path, so dashboard re-derivation is unchanged by the fill.
-        let mut entries =
-            parse_diet_entries(r#"{"entries":[{"kind":"food","name":"almond","meal":"Snack","kcal":7}]}"#)
-                .unwrap()
-                .entries;
+        let mut entries = parse_diet_entries(
+            r#"{"entries":[{"kind":"food","name":"almond","meal":"Snack","kcal":7}]}"#,
+        )
+        .unwrap()
+        .entries;
         stamp_missing_food_times(&mut entries, "17:44");
         let (food, _, _) = split_entries(&entries);
         // CSV Time column (13th field) is the received-at time.
         let row = food_row(&food[0], "2026-07-16");
-        assert_eq!(row.split(',').nth(12), Some("17:44"), "Time cell = received-at: {row}");
+        assert_eq!(
+            row.split(',').nth(12),
+            Some("17:44"),
+            "Time cell = received-at: {row}"
+        );
         // Mirror consumedAt derives from the same filled time.
         let mirror = build_meal_log_from_food_rows(&food, "2026-07-16", "+00:00")
             .unwrap()
@@ -2049,7 +2194,11 @@ mod tests {
         stamp_missing_food_times(&mut e2, "17:44");
         let (food, _, _) = split_entries(&e2);
         let row = food_row(&food[0], "2026-07-16");
-        assert_eq!(row.split(',').nth(12), Some("12:30"), "stated Time cell preserved: {row}");
+        assert_eq!(
+            row.split(',').nth(12),
+            Some("12:30"),
+            "stated Time cell preserved: {row}"
+        );
         let mirror = build_meal_log_from_food_rows(&food, "2026-07-16", "+00:00")
             .unwrap()
             .unwrap();
@@ -2064,7 +2213,7 @@ mod tests {
             r#"{"entries":[{"kind":"food"}]}"#, // missing name/meal (time is now optional)
             r#"{"entries":[{"kind":"food","name":"n","meal":"Snack","time":"t","kcal":-5}]}"#, // negative
             r#"{"entries":[{"kind":"bogus"}]}"#,
-            r#"{"entries":[{"kind":"food","name":"n","meal":"Snack","time":"t","added_sugar_g":5}]}"#, // unknown key (a schema field like sodium_mg would now parse)
+            r#"{"entries":[{"kind":"food","name":"n","meal":"Snack","time":"t","added_sugar_g":5}]}"#, // still-unknown key (a schema field like sodium_mg/calcium_mg/omega3_mg now parses)
             r#"{"extra":1,"entries":[]}"#, // unknown top-level
         ] {
             assert!(parse_diet_entries(bad).is_err(), "should reject: {bad}");
@@ -2078,10 +2227,13 @@ mod tests {
         // null-is-a-violation rule was a top rung-2 cause (10/20 turns, with missing
         // time, in the 2026-07-15 investigation).
         let base = |body: &str| {
-            format!(r#"{{"entries":[{{"kind":"food","name":"n","meal":"Snack","time":"09:00",{body}}}]}}"#)
+            format!(
+                r#"{{"entries":[{{"kind":"food","name":"n","meal":"Snack","time":"09:00",{body}}}]}}"#
+            )
         };
         for body in [r#""kcal":null"#, r#""kcal":"""#, r#""protein_g":null"#] {
-            let ex = parse_diet_entries(&base(body)).unwrap_or_else(|e| panic!("{body} must parse: {e:?}"));
+            let ex = parse_diet_entries(&base(body))
+                .unwrap_or_else(|e| panic!("{body} must parse: {e:?}"));
             match &ex.entries[0] {
                 DietEntry::Food(f) => {
                     if body.contains("protein_g") {
@@ -2100,8 +2252,14 @@ mod tests {
             other => panic!("expected food, got {other:?}"),
         }
         // Still strict: a negative or non-numeric value is a schema violation.
-        assert!(parse_diet_entries(&base(r#""kcal":-5"#)).is_err(), "negative still rejected");
-        assert!(parse_diet_entries(&base(r#""kcal":"abc""#)).is_err(), "non-numeric string still rejected");
+        assert!(
+            parse_diet_entries(&base(r#""kcal":-5"#)).is_err(),
+            "negative still rejected"
+        );
+        assert!(
+            parse_diet_entries(&base(r#""kcal":"abc""#)).is_err(),
+            "non-numeric string still rejected"
+        );
     }
 
     #[test]
@@ -2110,7 +2268,8 @@ mod tests {
         // stays strict (a null macro is a violation → rung 3), so verify-gate behavior
         // is unchanged by Fix 2.
         assert!(
-            parse_verify_verdicts(r#"{"verdicts":[{"verdict":"approve","kcal":null}]}"#, 1).is_err(),
+            parse_verify_verdicts(r#"{"verdicts":[{"verdict":"approve","kcal":null}]}"#, 1)
+                .is_err(),
             "verify parsing must stay strict on a null macro"
         );
         // A well-formed verdict still parses.
@@ -2161,7 +2320,9 @@ mod tests {
         // with the backticks intact (the strip never runs on a non-wrapped payload).
         let json = r#"{"entries":[{"kind":"food","name":"n","meal":"Snack","time":"09:00","notes":"label reads ```200 kcal```"}]}"#;
         match &parse_diet_entries(json).unwrap().entries[0] {
-            DietEntry::Food(f) => assert_eq!(f.notes.as_deref(), Some("label reads ```200 kcal```")),
+            DietEntry::Food(f) => {
+                assert_eq!(f.notes.as_deref(), Some("label reads ```200 kcal```"))
+            }
             other => panic!("expected food, got {other:?}"),
         }
     }
@@ -2246,6 +2407,9 @@ mod tests {
             satfat_g: None,
             sugar_g: None,
             potassium_mg: None,
+            calcium_mg: None,
+            omega3_mg: None,
+            magnesium_mg: None,
             notes: None,
         })
     }
@@ -2301,9 +2465,9 @@ mod tests {
 
     #[test]
     fn correction_carries_micronutrients_through_untouched() {
-        // The verifier only corrects the five macros; the four micronutrients ride
-        // the `..f.clone()` spread untouched. A kcal correction must not disturb a
-        // known sodium value (nor invent one on the absent potassium).
+        // The verifier only corrects the five macros; every micronutrient rides the
+        // `..f.clone()` spread untouched. A kcal correction must not disturb a known
+        // sodium/calcium value (nor invent one on an absent potassium/magnesium).
         let e = DietEntry::Food(FoodEntry {
             name: "Crackers".into(),
             meal: "Snack".into(),
@@ -2319,6 +2483,9 @@ mod tests {
             satfat_g: Some(0.5),
             sugar_g: Some(0.0),
             potassium_mg: None,
+            calcium_mg: Some(45.0),
+            omega3_mg: Some(30.0),
+            magnesium_mg: None,
             notes: None,
         });
         match resolve_verdict(&e, &verdict(Verdict::Correct, Some(140.0))) {
@@ -2328,6 +2495,17 @@ mod tests {
                 assert_eq!(f.satfat_g, Some(0.5), "satfat untouched");
                 assert_eq!(f.sugar_g, Some(0.0), "measured-zero sugar preserved");
                 assert_eq!(f.potassium_mg, None, "absent potassium stays absent");
+                assert_eq!(
+                    f.calcium_mg,
+                    Some(45.0),
+                    "known calcium carried through untouched"
+                );
+                assert_eq!(
+                    f.omega3_mg,
+                    Some(30.0),
+                    "known omega-3 carried through untouched"
+                );
+                assert_eq!(f.magnesium_mg, None, "absent magnesium stays absent");
             }
             other => panic!("expected correction, got {other:?}"),
         }
@@ -2376,17 +2554,20 @@ mod tests {
             fiber_g: Some(0.0),
             sodium_mg: Some(340.0),
             satfat_g: Some(0.5),
-            sugar_g: Some(0.0), // a real measured zero, not "unknown"
-            potassium_mg: None, // absent on the label → blank cell, never 0
+            sugar_g: Some(0.0),      // a real measured zero, not "unknown"
+            potassium_mg: None,      // absent on the label → blank cell, never 0
+            calcium_mg: Some(15.0),  // canned salmon (with bones) carries some calcium
+            omega3_mg: Some(1400.0), // marine EPA+DHA — a real fish source
+            magnesium_mg: None,      // absent on the label → blank cell, never 0
             notes: Some("drained, with salt".into()),
         };
         let row = food_row(&e, "2026-07-13");
-        // RFC-4180: the item's comma forces quoting; the row parses back to 19 fields.
+        // RFC-4180: the item's comma forces quoting; the row parses back to 22 fields.
         let mut rdr = csv::ReaderBuilder::new()
             .has_headers(false)
             .from_reader(row.as_bytes());
         let rec = rdr.records().next().unwrap().unwrap();
-        assert_eq!(rec.len(), FOOD_LOG_HEADER.split(',').count(), "19 columns");
+        assert_eq!(rec.len(), FOOD_LOG_HEADER.split(',').count(), "22 columns");
         assert_eq!(&rec[0], "2026-07-13");
         assert_eq!(&rec[1], "Breakfast");
         assert_eq!(&rec[2], "Salmon sockeye (Fiorfiore, canned)");
@@ -2400,6 +2581,9 @@ mod tests {
         assert_eq!(&rec[16], "0.5", "satfat_g");
         assert_eq!(&rec[17], "0", "sugar_g measured zero renders 0, not blank");
         assert_eq!(&rec[18], "", "potassium_mg absent → blank cell, not 0");
+        assert_eq!(&rec[19], "15", "calcium_mg into Calcium_mg");
+        assert_eq!(&rec[20], "1400", "omega3_mg into Omega3_mg");
+        assert_eq!(&rec[21], "", "magnesium_mg absent → blank cell, not 0");
     }
 
     #[test]
@@ -2419,6 +2603,9 @@ mod tests {
             satfat_g: None,
             sugar_g: None,
             potassium_mg: None,
+            calcium_mg: None,
+            omega3_mg: None,
+            magnesium_mg: None,
             notes: None,
         };
         let row = food_row(&e, "2026-07-13");
@@ -2426,12 +2613,16 @@ mod tests {
             .has_headers(false)
             .from_reader(row.as_bytes());
         let rec = rdr.records().next().unwrap().unwrap();
+        assert_eq!(rec.len(), FOOD_LOG_HEADER.split(',').count(), "22 columns");
         assert_eq!(&rec[7], "", "absent kcal → empty cell, not 0");
         assert_eq!(&rec[14], "", "absent fiber → empty cell");
         assert_eq!(&rec[15], "", "absent sodium → empty cell, not 0");
         assert_eq!(&rec[16], "", "absent satfat → empty cell");
         assert_eq!(&rec[17], "", "absent sugar → empty cell");
         assert_eq!(&rec[18], "", "absent potassium → empty cell");
+        assert_eq!(&rec[19], "", "absent calcium → empty cell, not 0");
+        assert_eq!(&rec[20], "", "absent omega-3 → empty cell, not 0");
+        assert_eq!(&rec[21], "", "absent magnesium → empty cell, not 0");
     }
 
     // ---- Parity: prompt ↔ append schema ------------------------------------
@@ -2481,6 +2672,9 @@ mod tests {
             satfat_g: None,
             sugar_g: None,
             potassium_mg: None,
+            calcium_mg: None,
+            omega3_mg: None,
+            magnesium_mg: None,
             notes: None,
         };
         assert_eq!(
@@ -2515,6 +2709,37 @@ mod tests {
         );
     }
 
+    #[test]
+    fn extract_prompt_and_schema_state_the_amendment_rule() {
+        // Defect 2: the local path is insert-only. The extract prompt must instruct the
+        // child to classify a correction/amendment as `no_loggable_content` (routing it
+        // to the hosted path), and the schema's `no_loggable_content` description must
+        // say so too — so the child never re-logs a correction as a fresh entry.
+        let p = build_diet_extract_prompt("actually lunch was two bowls, about 700 kcal");
+        assert!(
+            p.contains("CORRECTIONS ARE NOT NEW LOGS"),
+            "extract prompt must carry the amendment rule"
+        );
+        assert!(
+            p.contains("AMENDS, corrects, moves, or deletes"),
+            "amendment rule must name the amend/correct/move/delete cases"
+        );
+        assert!(
+            p.contains("logs NEW consumption ONLY"),
+            "prompt must state the insert-only invariant"
+        );
+        // The schema's own `no_loggable_content` description is updated too (it is inlined
+        // into the prompt via DIET_EXTRACT_SCHEMA).
+        assert!(
+            DIET_EXTRACT_SCHEMA.contains("AMENDS/corrects/moves/deletes"),
+            "schema no_loggable_content description must cover amendments"
+        );
+        assert!(
+            p.contains(DIET_EXTRACT_SCHEMA),
+            "the updated schema is inlined into the prompt"
+        );
+    }
+
     // ---- Mirror builder ----------------------------------------------------
 
     fn f(name: &str, meal: &str, time: &str, kcal: f64) -> FoodEntry {
@@ -2533,12 +2758,18 @@ mod tests {
             satfat_g: None,
             sugar_g: None,
             potassium_mg: None,
+            calcium_mg: None,
+            omega3_mg: None,
+            magnesium_mg: None,
             notes: None,
         }
     }
 
     #[test]
-    fn mirror_is_one_meal_per_row_with_row_equal_macros() {
+    fn mirror_groups_same_slot_time_rows_into_one_summed_meal() {
+        // Two rows in the SAME (slot, time) group collapse to ONE mirror meal whose
+        // macros are the trusted-Rust sum of the rows — and whose id is the
+        // deterministic hosted-contract id with NO positional seq.
         let rows = vec![
             f("Banana", "Snack", "10:40", 105.0),
             f("Almonds", "Snack", "10:40", 116.0),
@@ -2546,17 +2777,116 @@ mod tests {
         let ml = build_meal_log_from_food_rows(&rows, "2026-07-13", "+02:00")
             .unwrap()
             .expect("two rows → a mirror");
-        assert_eq!(ml.meals.len(), 2, "two rows always yield two mirror meals");
-        // Row-equal macros, by construction.
-        assert_eq!(ml.meals[0].kcal, Some(105.0));
-        assert_eq!(ml.meals[1].kcal, Some(116.0));
-        assert_eq!(ml.meals[0].protein_g, Some(10.0));
-        assert_eq!(ml.meals[0].fiber_g, Some(3.0));
-        // Distinct ids so the two meals never collide.
-        assert_ne!(ml.meals[0].id, ml.meals[1].id, "ids must be unique per row");
-        assert!(ml.meals[0].id.starts_with("2026-07-13-snack-1040"));
-        assert_eq!(ml.meals[0].consumed_at, "2026-07-13T10:40:00+02:00");
-        assert_eq!(ml.meals[0].name, "Snack: Banana");
+        assert_eq!(
+            ml.meals.len(),
+            1,
+            "same slot+time rows group into one mirror meal"
+        );
+        let m = &ml.meals[0];
+        // Summed macros over the group (f() sets protein 10, carbs 20, fat 5, fiber 3).
+        assert_eq!(m.kcal, Some(221.0), "105 + 116");
+        assert_eq!(m.protein_g, Some(20.0));
+        assert_eq!(m.carbs_g, Some(40.0));
+        assert_eq!(m.fat_g, Some(10.0));
+        assert_eq!(m.fiber_g, Some(6.0));
+        // Deterministic hosted-contract id — no `-<seq>` suffix.
+        assert_eq!(m.id, "2026-07-13-snack-1040", "id has no positional seq");
+        assert_eq!(m.consumed_at, "2026-07-13T10:40:00+02:00");
+        assert_eq!(m.name, "Snack: Banana, Almonds");
+    }
+
+    #[test]
+    fn mirror_keeps_different_slots_or_times_as_separate_meals() {
+        // Different slot, OR same slot at a different time, stay distinct mirror meals,
+        // each with its own deterministic id.
+        let rows = vec![
+            f("Banana", "Snack", "10:40", 105.0),
+            f("Rice", "Lunch", "12:30", 200.0),
+            f("Apple", "Snack", "15:00", 95.0), // same slot as row 0, different time
+        ];
+        let ml = build_meal_log_from_food_rows(&rows, "2026-07-13", "+02:00")
+            .unwrap()
+            .expect("three distinct groups → a mirror");
+        assert_eq!(ml.meals.len(), 3, "three distinct (slot,time) groups");
+        let ids: Vec<&str> = ml.meals.iter().map(|m| m.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec![
+                "2026-07-13-snack-1040",
+                "2026-07-13-lunch-1230",
+                "2026-07-13-snack-1500",
+            ],
+            "one deterministic id per group, first-appearance order preserved"
+        );
+    }
+
+    #[test]
+    fn mirror_id_matches_the_hosted_contract_format_exactly() {
+        // The exact id string a grouped meal gets MUST equal the hosted format
+        // `<date>-<slot lowercased>-<HHMM>` (the example the contract documents).
+        let rows = vec![f("Sandwich", "Lunch", "12:30", 450.0)];
+        let ml = build_meal_log_from_food_rows(&rows, "2026-07-04", "+02:00")
+            .unwrap()
+            .unwrap();
+        assert_eq!(ml.meals[0].id, "2026-07-04-lunch-1230");
+    }
+
+    #[test]
+    fn mirror_sums_micros_over_known_rows_and_omits_all_none_group() {
+        // Micro sum discipline: within a group, a known value plus an unknown yields the
+        // known value alone (unknown contributes nothing); a group where NO row carries
+        // the micro serializes no key at all — same shape for fiber and every micro.
+        let with = |ca: Option<f64>, fib: Option<f64>, na: Option<f64>| FoodEntry {
+            name: "x".into(),
+            meal: "Lunch".into(),
+            time: Some("12:30".into()),
+            amount: None,
+            unit: None,
+            kcal: Some(100.0),
+            protein_g: None,
+            carbs_g: None,
+            fat_g: None,
+            fiber_g: fib,
+            sodium_mg: na,
+            satfat_g: None,
+            sugar_g: None,
+            potassium_mg: None,
+            calcium_mg: ca,
+            omega3_mg: None,
+            magnesium_mg: None,
+            notes: None,
+        };
+        // One row carries calcium 100 / fiber 4 / sodium 300, the other carries none.
+        let rows = vec![
+            with(Some(100.0), Some(4.0), Some(300.0)),
+            with(None, None, None),
+        ];
+        let ml = build_meal_log_from_food_rows(&rows, "2026-07-13", "+02:00")
+            .unwrap()
+            .unwrap();
+        assert_eq!(ml.meals.len(), 1, "same slot+time → one meal");
+        let m = &ml.meals[0];
+        assert_eq!(
+            m.calcium_mg,
+            Some(100.0),
+            "known + unknown = the known value"
+        );
+        assert_eq!(m.fiber_g, Some(4.0), "same discipline for fiber");
+        assert_eq!(m.sodium_mg, Some(300.0), "same discipline for sodium");
+        // Micros no row carried are omitted entirely (never a summed Some(0)).
+        assert!(m.satfat_g.is_none() && m.sugar_g.is_none() && m.potassium_mg.is_none());
+        assert!(m.magnesium_mg.is_none(), "all-None magnesium omitted");
+        // And on the wire the all-None micros produce NO key.
+        let v = directives_to_value(&Some(Directives {
+            needs_health: None,
+            meal_log: Some(ml),
+        }));
+        let meal = &v["meal_log"]["meals"][0];
+        assert_eq!(meal["calcium_mg"], 100.0);
+        assert!(
+            meal.get("magnesium_mg").is_none(),
+            "an all-None micro serializes no key"
+        );
     }
 
     #[test]
@@ -2576,6 +2906,9 @@ mod tests {
             satfat_g: None,
             sugar_g: None,
             potassium_mg: None,
+            calcium_mg: None,
+            omega3_mg: None,
+            magnesium_mg: None,
             notes: None,
         };
         let ml = build_meal_log_from_food_rows(&[e], "2026-07-13", "+02:00")
@@ -2589,9 +2922,11 @@ mod tests {
 
     #[test]
     fn mirror_carries_known_micronutrients_and_serializes_under_wire_keys() {
-        // A row with known sodium/sugar mirrors those onto the meal and serializes them
-        // under the EXACT wire keys the app decodes (`sodium_mg`, `sugar_g`); the two
-        // the row didn't carry (satfat, potassium) produce NO wire field — never a 0.
+        // A row with known sodium/sugar/calcium mirrors those onto the meal and
+        // serializes them under the EXACT wire keys the app decodes (`sodium_mg`,
+        // `sugar_g`, `calcium_mg`); the ones the row didn't carry (satfat, potassium,
+        // magnesium) produce NO wire field — never a 0. Omega-3 is NOT a Meal field at
+        // all (no HealthKit type), so it never reaches the wire even when the row has it.
         let e = FoodEntry {
             name: "Prosciutto".into(),
             meal: "Lunch".into(),
@@ -2607,6 +2942,9 @@ mod tests {
             satfat_g: None,
             sugar_g: Some(0.0),
             potassium_mg: None,
+            calcium_mg: Some(11.0),
+            omega3_mg: Some(50.0), // known on the row, but has no Meal field to carry it
+            magnesium_mg: None,
             notes: None,
         };
         let ml = build_meal_log_from_food_rows(&[e], "2026-07-13", "+02:00")
@@ -2619,7 +2957,12 @@ mod tests {
             Some(0.0),
             "measured-zero sugar carried, not dropped"
         );
-        assert!(m.satfat_g.is_none() && m.potassium_mg.is_none());
+        assert_eq!(
+            m.calcium_mg,
+            Some(11.0),
+            "known calcium mirrored onto the meal"
+        );
+        assert!(m.satfat_g.is_none() && m.potassium_mg.is_none() && m.magnesium_mg.is_none());
         // Serialize the whole directive and check the wire keys the app expects.
         let v = directives_to_value(&Some(Directives {
             needs_health: None,
@@ -2631,6 +2974,7 @@ mod tests {
             meal["sugar_g"], 0.0,
             "known measured-zero sugar under `sugar_g`"
         );
+        assert_eq!(meal["calcium_mg"], 11.0, "known calcium under `calcium_mg`");
         assert!(
             meal.get("satfat_g").is_none(),
             "no known satfat → no `satfat_g` field (never 0)"
@@ -2638,6 +2982,14 @@ mod tests {
         assert!(
             meal.get("potassium_mg").is_none(),
             "no known potassium → no `potassium_mg` field"
+        );
+        assert!(
+            meal.get("magnesium_mg").is_none(),
+            "no known magnesium → no `magnesium_mg` field"
+        );
+        assert!(
+            meal.get("omega3_mg").is_none(),
+            "omega-3 is never a meal wire field (no HealthKit type)"
         );
     }
 
@@ -2650,13 +3002,43 @@ mod tests {
 
     #[test]
     fn mirror_errors_over_the_meal_cap_rung5() {
+        // The cap is on the number of MEALS (groups), enforced AFTER grouping. Give each
+        // row a distinct time so it forms its own group → MAX_MEALS + 1 groups → Err.
         let rows: Vec<FoodEntry> = (0..MAX_MEALS + 1)
-            .map(|i| f(&format!("Item{i}"), "Snack", "10:00", 100.0))
+            .map(|i| f(&format!("Item{i}"), "Snack", &format!("10:{i:02}"), 100.0))
             .collect();
         assert!(
             build_meal_log_from_food_rows(&rows, "2026-07-13", "+02:00").is_err(),
-            "over the cap → Err (rung 5)"
+            "more groups than the cap → Err (rung 5)"
         );
+        // At the cap exactly (MAX_MEALS distinct groups) it still builds.
+        let ok: Vec<FoodEntry> = (0..MAX_MEALS)
+            .map(|i| f(&format!("Item{i}"), "Snack", &format!("10:{i:02}"), 100.0))
+            .collect();
+        assert_eq!(
+            build_meal_log_from_food_rows(&ok, "2026-07-13", "+02:00")
+                .unwrap()
+                .unwrap()
+                .meals
+                .len(),
+            MAX_MEALS,
+            "exactly at the cap builds all meals"
+        );
+    }
+
+    #[test]
+    fn mirror_many_rows_one_group_stays_one_meal_under_the_cap() {
+        // The grouping is what keeps the block under the caps: many items in one
+        // (slot, time) collapse to a single meal, so a busy meal never trips the
+        // 10-meal cap by item count.
+        let rows: Vec<FoodEntry> = (0..MAX_MEALS + 5)
+            .map(|i| f(&format!("Item{i}"), "Dinner", "19:00", 50.0))
+            .collect();
+        let ml = build_meal_log_from_food_rows(&rows, "2026-07-13", "+02:00")
+            .unwrap()
+            .expect("one group → one meal, well under the cap");
+        assert_eq!(ml.meals.len(), 1);
+        assert_eq!(ml.meals[0].id, "2026-07-13-dinner-1900");
     }
 
     // ---- Dashboard ---------------------------------------------------------
@@ -2817,7 +3199,10 @@ mod tests {
         assert!(!line.contains("token"), "still never carries a token");
         // A local success (no reason) is unchanged — no `reason=` fragment.
         let ok = format_diet_provenance(true, None, "http://u", "m", "approved", 1, true, None);
-        assert!(!ok.contains("reason="), "a non-rung-2 line has no reason: {ok}");
+        assert!(
+            !ok.contains("reason="),
+            "a non-rung-2 line has no reason: {ok}"
+        );
     }
 
     #[test]

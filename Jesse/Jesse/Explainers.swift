@@ -127,8 +127,16 @@ enum Explainers {
             paras.append("Saturated fat is a ceiling — stay at or under target. It's the butter, cheese, and fatty-meat share of your fat, kept in check for heart health while your total fat stays in its window.")
         case .totalSugars:
             paras.append("Total sugars is shown for composition only — there's no red or green here. It counts natural sugars in fruit and dairy alongside any added, so a high number isn't automatically a problem.")
+        case .unsaturatedFat:
+            paras.append("Unsaturated fat is your total fat minus the saturated slice — the heart-healthy fats from olive oil, nuts, avocado, and fish. It's shown for composition only, with no target and no red or green.")
         case .potassium:
             paras.append("Potassium is a floor — hit it or beat it. Fruit, potatoes, dairy, and beans carry most of it, and it's the mineral that balances sodium's effect on blood pressure.")
+        case .calcium:
+            paras.append("Calcium is a floor — hit it or beat it. Dairy, fortified plant milks, tofu, and leafy greens carry most of it, and it builds bone and keeps muscles and nerves working.")
+        case .omega3:
+            paras.append("Omega-3 is a floor — hit it or beat it. This counts the marine EPA and DHA in oily fish, shellfish, and roe, not the plant ALA in flax or walnuts.")
+        case .magnesium:
+            paras.append("Magnesium is a floor — hit it or beat it. Nuts, seeds, beans, whole grains, and leafy greens carry most of it, and it supports muscle, nerve, and sleep function.")
         }
         // The unknown-aware caveat: what "≥" and "not tracked yet" mean, so the number is
         // never misread as complete.

@@ -5,6 +5,7 @@ import Foundation
 /// Covers the share transcript and the client-side attachment logic — the parts
 /// that are pure and testable without a server or the UI. The bridge re-runs the
 /// same validation as the authority; these guard the client's mirror of it.
+@MainActor
 final class AttachmentTests: XCTestCase {
 
     // MARK: - Share transcript

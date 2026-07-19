@@ -15,11 +15,11 @@ CI both run it). See the "Versioning" section of `bridge/README.md`.
 
 ## [Unreleased]
 
-## [Bridge 0.16.1] — 2026-07-17
+## [Bridge 0.22.1] — 2026-07-19
 
 ### Changed
 - **Dropped the dead legacy weight-target contract from the `/jesse/diet` progress
-  fixtures.** As of 2026-07-17 the (out-of-repo) progress generator stopped emitting
+  fixtures.** The (out-of-repo) progress generator stopped emitting
   `raceTarget`/`raceDate`/`maintTarget`; `progress.targets` is the sole weight-goal wire
   contract. The bridge is a pure pass-through for this block, so nothing changes at
   runtime — this is a **test/docs-only** cleanup. Removed the legacy fields from the
@@ -28,6 +28,471 @@ CI both run it). See the "Versioning" section of `bridge/README.md`.
   dated, undated (`date:null` and key-omitted), achieved past-dated, empty `targets: []`,
   and tolerance of an absent `targets` key. The app's legacy-fallback synthesis
   (`DietSemantics.displayTargets`) is untouched and stays by design.
+
+## [Bridge 0.22.0] — 2026-07-18
+
+### Added
+- **Opt-in shadow comparison (`JESSE_SHADOW_*`)** — a side-effect-free way to
+  gather evidence for whether a second backend (production intent: `fw-glm` via
+  the gateway) could serve ask turns as well as the hosted model, **without
+  changing a single production route**. When the `JESSE_SHADOW_BASE_URL` /
+  `JESSE_SHADOW_AUTH_TOKEN` / `JESSE_SHADOW_MODEL` triple is armed, a **sampled**
+  subset of eligible ask turns is **mirrored — strictly after the hosted answer
+  is delivered** — to the shadow backend through the **same contained read-only
+  child** the vault-QA route uses (`build_shadow_child_command` +
+  `apply_shadow_env`; read-only root allowlist, strict MCP, provably unable to
+  write). Both answers plus per-side timing and token usage are appended to a
+  local **shadow pair log** (`JESSE_SHADOW_LOG`, default
+  `~/Library/Logs/jesse-shadow/shadow.jsonl`, created mode `0600`).
+  - **Eligibility** (all required): shadow armed; ask mode; the turn took the
+    **hosted** route (vault-QA rung-0 local, emergency-local, and diet turns are
+    excluded; a vault-QA fall-through to hosted **is** eligible); no attachments;
+    the hosted turn completed successfully with a non-empty answer; and the turn
+    is in the deterministic `JESSE_SHADOW_SAMPLE_PCT` sample (default 100, clamped
+    `[0, 100]`, decided by a stable hash of the turn id — reproducible, never RNG).
+    A **Tell is never mirrored, and a turn is never mirrored twice.**
+  - **Isolation is guaranteed:** the delivered answer, its latency, its badge, and
+    every production route are **byte-for-byte unchanged** whether shadow is armed
+    or not (a golden test asserts the unarmed case; the delivery path has no
+    `await` on anything shadow-related). The mirror runs on a **detached,
+    permit-free** task, holds a **separate at-most-one slot** (`AppState.shadow_slot`)
+    — never the production permit — **yields** (`skipped_busy`) to a running or
+    queued phone turn, and runs the child at background priority. Any shadow
+    failure (timeout, transport, gateway error, `JESSE_SHADOW_TIMEOUT_SECS`
+    default 120) is recorded as an **incomplete** pair and swallowed.
+  - **Secrets:** the bridge carries only the **gateway URL and gateway token** —
+    never a Fireworks credential — and never logs a token value.
+- **`shadow-audit` bin** — a daily judge (same conventions as `vaultqa-audit`:
+  dated markdown note + JSON twin under `~/Library/Logs/jesse-shadow-audit/`,
+  tripwires first). Reads the shadow log and judges up to `JESSE_SHADOW_JUDGE_CAP`
+  (default 20) unjudged pairs on **ambient** hosted auth with **two
+  position-swapped `claude -p` calls** per pair (shadow wins only if it wins both
+  orderings; disagreement = tie); a line-count **watermark** + judged sidecar keep
+  judging incremental and the log append-only. Reports W/L/T today and cumulative,
+  per-side latency percentiles, measured Fireworks cost vs the same turns on Opus,
+  a judge-spend estimate, **disarm tripwires** (injection-style leak, shadow-child
+  write attempt, Fireworks spend > $5/day), and progress against the fixed
+  **graduation criteria** (≥ 14 days armed AND ≥ 150 judged pairs; net ≥ −5% of
+  judged; zero leaks; shadow p50 ≤ hosted p50 + 50%). The audit only reports — it
+  never routes.
+
+### Notes
+- New env vars: `JESSE_SHADOW_BASE_URL`, `JESSE_SHADOW_AUTH_TOKEN`,
+  `JESSE_SHADOW_MODEL`, `JESSE_SHADOW_SAMPLE_PCT`, `JESSE_SHADOW_LOG`,
+  `JESSE_SHADOW_TIMEOUT_SECS`, plus `JESSE_SHADOW_JUDGE_CAP` for the audit. **The
+  triple is the kill switch:** unset any one and shadow is off, byte-for-byte
+  today's behavior (disarm = unset + `bootout` + `bootstrap`; `kickstart -k` does
+  not reload plist env). New dependency: `libc` (one `setpriority` syscall for the
+  background-priority shadow child). See `bridge/README.md` and `SECURITY.md`.
+
+## [App 1.0 (54)] — 2026-07-18
+
+### Changed
+- **Migrated the app to the Swift 6 language mode.** Every target
+  (`Jesse`, `JesseTests`, `Jesse Watch App`, `Jesse Watch AppTests`,
+  `JesseWidgetsExtension`) now builds under `SWIFT_VERSION = 6.0`, with every
+  resulting concurrency diagnostic fixed at the root cause rather than
+  suppressed. The module was already main-actor-isolated by default, so the
+  work concentrated at the async boundaries:
+  - `JesseClientProtocol` is now `Sendable` (the coordinator races a turn's
+    stream and poll in two concurrent child tasks, so the client existential
+    crosses into them); `JesseConfig` gains `Sendable` to match.
+  - `Ask/Tell/WakeJesseIntent` metadata and `VersionedSchema.versionIdentifier`
+    become `static let` (immutable, satisfy the get-only requirements) instead
+    of nonisolated mutable global state.
+  - `OrderedTurnsMemo` is `nonisolated` to match the `@Model`-generated
+    accessors that touch it; `WatchConnectivityClient` decodes on the delegate
+    thread and hops only the `Sendable` `WatchReply` to the main actor; the
+    background-task expiration handler is `@MainActor @Sendable`.
+  - A few genuinely-safe SDK interop points (ActivityKit's non-`Sendable`
+    `Activity` handed to its own `@concurrent` update/end, `AVCaptureSession`
+    started off-main) use `nonisolated(unsafe)` with a comment explaining why
+    each is safe by the framework's own contract.
+  - The test targets stay nonisolated-by-default (a default-main-actor test
+    module collides with XCTest's nonisolated base class); test classes that
+    drive main-actor app code are marked `@MainActor`, which is accurate since
+    XCTest runs them on the main thread.
+  No behavior change — a build-system and concurrency-correctness migration only.
+
+## [App 1.0 (53)] — 2026-07-18
+
+### Added
+- **Per-nutrient trend charts + multi-window coaching, from the bridge's
+  `nutrientSeries`.** Consumes the additive `nutrientSeries` field (Bridge 0.21.0),
+  degrading gracefully when it's absent/empty (the trend affordance simply hides).
+  Carries the core rule end to end: **unknown is not zero** — every computation runs
+  only over the days a nutrient key is present; a gap day is never a 0, never a day
+  under a floor or over a ceiling, and coverage (days known / logged days in window) is
+  surfaced next to every verdict.
+  - **`NutrientTrends` — a pure, Foundation-only trend engine** (no SwiftUI, fully
+    unit-tested), sitting beside `DietSemantics`/`FoodContributions`. Per nutrient +
+    window it exposes the plottable known-day points (gap days absent, partial days
+    flagged), coverage, the **median** (resists a single binge/fast day),
+    floor `countUnderTarget`/`pctUnderTarget`, ceiling `countOverTarget`/`pctOverTarget`,
+    target-kind median-distance, an informational distribution (median/min/max, never a
+    pass/fail), and a **direction classified relative to the nutrient's kind**
+    (floor rising = improving, ceiling rising = worsening; informational is neutral
+    rising/falling; under 6 known days → "not enough data"). Plus a plain-language
+    verdict, a top-sources ranker (reusing the drill-down contributor math, KNOWN
+    contributions only), and the compact 7/30/all coach rollup.
+  - **`TrendNutrient` — the single-source model for all thirteen nutrients**
+    (`cal/p/f/c/fiber/na/satf/sug/k/ca/o3/mg/unsat`): full name, unit, kind
+    (floor/ceiling/target/informational), target lookup, and the curated grounding copy
+    (`whyItMatters` + `goodSources`) so no health claim is model-invented. Mirrors the
+    `Macro`/`Micronutrient` display-name enums, guarded by tests.
+  - **`NutrientTrendDetail` — the trend view** (Swift Charts, drawn in the
+    `WeightTrendDetail` language): a 30d/90d/All range picker, drag-to-scrub, a
+    kind-colored target rule, **visible gaps** (the line breaks across any missing day —
+    a gap reads as "no data", never a dip to zero), partial days as hollow "at least
+    this" points, and a summary band with the engine's verdict, the consequence copy,
+    the top sources in range, and a "raise it with" hint for a short floor. Reached one
+    tap deeper — a "View trend" row inside the existing contributors drill-down sheet,
+    not top-level Health chrome (exactly like the weight trend behind the weight card).
+  - **Coach multi-window grounding.** On a health/diet-relevant turn the app now folds a
+    compact, plain-text nutrient rollup into `health_context` (composed alongside the
+    HealthKit block, well under the bridge's 8 KiB cap): a framing sentence, one terse
+    line per nutrient across 7/30/all (coverage-gated — "insufficient data" rather than a
+    misleading number), and, for each standing problem (worst first), its consequence,
+    the real top-contributing foods, and its good-source foods so the coach grounds a fix
+    in real food. Truncates worst-first (informational dropped first) when oversized.
+
+## [Bridge 0.21.0] — 2026-07-18
+
+### Added
+- **`nutrientSeries` on `GET /jesse/diet`** — one additive top-level field, a
+  per-day, per-nutrient aggregate over `food-log.csv` history, for the app's
+  per-nutrient trend charts and multi-window coaching. Built from the SAME
+  single `food-log.csv` read as `weightSeries`/`availableDays` and attached to
+  BOTH the today and history responses. A JSON array, one object per date
+  ascending, capped to the most recent **90** dates (older dates dropped; the app
+  labels the range). Each day is `{ date, nutrients: { <key>: { sum, known,
+  unknown }, … } }` over keys `cal/p/f/c/fiber/na/satf/sug/k/ca/o3/mg/unsat`
+  (`unsat` = `Fat_g − SatFat_g`, known only when both are known, clamped ≥ 0).
+  **Unknown is not zero**, matching the rest of the micronutrient stack: a blank
+  cell is an unknown contribution (excluded from `sum`, counted in `unknown`),
+  never a 0; a nutrient with no known contributor on a day is OMITTED for that day
+  (the app renders a gap), and a day with no known nutrient at all is omitted
+  entirely. Targets/medians/trends stay the app's math, not the bridge's. A
+  missing/unreadable `food-log.csv` yields `[]` (never null) plus one diagnostic in
+  `errors`, the way `weightSeries` reports. Changes nothing else — today
+  pass-through, per-item day reconstruction, targets, `weightSeries`, and the CSV
+  are all untouched.
+
+## [App 1.0 (52)] — 2026-07-18
+
+### Added
+- **Durably delete a thread's remote Claude Code session on thread-delete.** Swipe-
+  deleting a thread still does the local SwiftData delete instantly (unchanged); if
+  the thread had a bridge `sessionId`, that id is now enqueued into a persisted
+  pending-deletions queue (`PendingSessionDeletionStore`, UserDefaults-backed — no
+  schema migration) and a drainer calls `DELETE /jesse/session/{id}`. On success
+  (including the bridge's idempotent 404) the tombstone is cleared; on a network
+  failure it is retained for next time. The queue drains on enqueue and on
+  `scenePhase → .active` (alongside `coordinator.resume` / `inbox.drain`), so a
+  delete made while the laptop is asleep completes on the next foreground.
+- **`JesseClient.deleteSession(_:)`** mirroring `send`'s URL/auth; a missing-session
+  `404` maps to success (idempotent), exactly like `cancelJob`.
+
+## [Bridge 0.20.0] — 2026-07-18
+
+### Added
+- **`DELETE /jesse/session/{session_id}` — delete one Claude Code session for the
+  vault, scoped to the vault project only.** Same bearer auth as `/jesse`.
+  **Idempotent** (mirroring `POST /jesse/cancel`): an unknown or already-gone id
+  returns `204`, never an error, so the app's durable delete-drainer and the GC
+  sweep can retry a missing id safely; a real failure to delete a file that exists
+  is `500`; a structurally-invalid id (not a plain filename component) is `400`
+  before it can reach the filesystem (path-traversal guard). Removes exactly
+  `<home>/.claude/projects/<escaped-vault>/<session_id>.jsonl` and drops any stashed
+  title for that session.
+- **Age-based session GC sweep (`JESSE_SESSION_TTL_DAYS`, default 90).** A
+  background task (one run at startup, then every 6h) reclaims vault-project
+  sessions whose transcript mtime is older than the TTL. Resuming a session touches
+  its mtime, so the sweep never reclaims an actively-used thread — only orphans
+  (a failed remote delete, or anything deleted locally before the delete-on-thread-
+  delete flow existed). Every reclaim is logged (id + age); it never deletes anything
+  younger than the TTL and never steps outside the vault project. The age predicate
+  (`is_session_expired`) is pure and tested against a fixed clock.
+- **Resume-after-sweep safety.** A hosted turn whose requested session was swept
+  (or deleted) now starts a **fresh session** cleanly instead of surfacing a raw
+  `claude --resume <gone>` error: `resolve_resume_session` drops the `--resume` when
+  the transcript no longer exists on disk, logs a named line, and the turn returns a
+  new session id (the app keeps its local transcript). A synthetic `local-` id and a
+  live real id pass through unchanged.
+
+### Changed
+- **`Config` now captures `HOME` once at startup (`cfg.home`).** Every session-path
+  lookup (`sessions_dir`, `session_transcript_exists`, the GC sweep) reads `cfg.home`
+  rather than the process env at call time. Behavior-identical in production (HOME is
+  stable), and it makes the session paths deterministic and testable without mutating
+  a process-global.
+
+## [Bridge 0.19.0] — 2026-07-18
+
+### Fixed
+- **Local diet mirror now emits the SAME deterministic per-meal ids as the hosted
+  logging skill.** The on-Studio mirror previously emitted one `JESSE_MEAL_LOG` meal
+  PER food row with a positional id `<date>-<slot>-<HHMM>-<seq>`. That `seq` is not
+  recomputable from the CSV, so a correction arriving via the hosted path computed a
+  DIFFERENT id and duplicated the Apple Health entry; worse, now that app-side upserts
+  are version-agnostic, a recurring `seq` across turns with different content could
+  hash-rewrite the WRONG Health entry. `build_meal_log_from_food_rows` now GROUPS the
+  turn's verified food rows by `(date, meal slot, HHMM)` into one mirror meal per group
+  with id `<date>-<slot lowercased>-<HHMM>` (no seq) — byte-identical to the id the
+  hosted contract computes for the same rows, and recomputable from the CSV alone, so a
+  later correction or retraction targets the exact same Health entry. Each nutrient is
+  summed in trusted Rust over the group's rows that carry a KNOWN value (kcal, protein,
+  carbs, fat as plain sums; fiber and the six meal-wire micros summed over known rows
+  only, the field OMITTED entirely when no row in the group carries it — unknown stays
+  unknown, never a summed `0`). Model-side aggregation remains impossible by
+  construction (the bridge sums, never the model). There is no `omega3` meal-wire field
+  (no HealthKit EPA+DHA type), so nothing is summed for it. The 10-meals-per-block cap
+  is now enforced on the group count (grouping only shrinks the block).
+  - **Migration note (accepted, not fixed).** Meals already written to Health under the
+    old `-<seq>`-suffixed ids stay stranded under those ids; a later correction to such
+    a meal inserts under the new-format id and duplicates the Health entry. The window
+    is small, so this is accepted rather than migrated.
+- **The local extract pipeline is no longer correction-blind.** `no_loggable_content`
+  was true only when a message logged nothing at all, so a keyword-bearing correction
+  ("actually lunch was two bowls, about 700 kcal") could be extracted as a fresh log —
+  appending a DUPLICATE row to `food-log.csv` (corrupting the source of truth) plus
+  mirroring a new-id meal. The extract prompt and the `DIET_EXTRACT_SCHEMA`
+  `no_loggable_content` description now instruct the child to set `no_loggable_content`
+  true and return an empty `entries` array for any message that AMENDS, corrects, moves,
+  or deletes something already logged, routing the turn to rung 2 (the hosted path,
+  which owns the correction contract). The local path is insert-only by design; every
+  correction takes the hosted path. No gate- or verify-level machinery was added — the
+  existing rung-2 reason codes / metrics already measure how the extract children
+  classify these turns.
+  - Tests (red→green): same slot+time rows group into one summed meal with a seq-free
+    id; micro sum discipline (known + unknown = the known value; an all-None group
+    serializes no key) for fiber and every micro; different slots/times stay separate
+    meals; exact id equality with the hosted `<date>-<slot>-<HHMM>` format; the
+    10-meal cap enforced on group count after grouping; the extract prompt/schema carry
+    the amendment rule. Existing per-row / seq-id assertions were flipped to match.
+
+## [App 1.0 (51)] — 2026-07-18
+
+### Changed
+- **Enable `JESSE_MUTE=1` by default in the shared `Jesse` scheme's Run environment**,
+  so local Xcode/`xcodebuild` debug launches (Run, Test, Profile — all inherit via
+  `shouldUseLaunchSchemeArgsEnv`) no longer speak aloud or duck other audio. Scheme
+  environment variables apply only to debug launches, never to installed/TestFlight
+  builds, so shipped builds speak exactly as before.
+
+## [App 1.0 (50)] — 2026-07-18
+
+### Added
+- **`JESSE_MUTE` dev flag to silence spoken (TTS) replies without muting the Mac.**
+  Setting `JESSE_MUTE=1` in the run scheme's environment makes `Speaker.speak` a
+  no-op that returns before activating the audio session — so it never ducks other
+  audio and never reaches the synthesizer. The flag defaults off (env unset), so
+  production behavior is unchanged; it is injectable through the initializer for
+  deterministic tests. A dev/debug convenience, not a user-facing setting.
+
+## [App 1.0 (49)] — 2026-07-18
+
+### Added
+- **Three more tracked micronutrients on the Health tab plus one derived — calcium,
+  omega-3 (EPA+DHA), magnesium, and unsaturated fat — end to end, mirroring the four-micro
+  pattern (build 40) exactly with the same unknown ≠ zero discipline.** The `GET /jesse/diet`
+  per-item snapshot gains three OPTIONAL gauge fields (`ca` mg, `o3` mg, `mg` mg) and three
+  OPTIONAL day targets (`calcium` 1200, `omega3` 500, `magnesium` 400); a missing value is
+  UNKNOWN, never summed or shown as 0, and stays OUT of the `MacroTotals`/`total(of:)`
+  nil→0 path. `DietSemantics.micronutrientGauge` builds calcium, omega-3, and magnesium as
+  **floors** (like potassium — met / short by N) and **unsaturated fat** as an
+  informational, DERIVED gauge (`fat − saturated fat` over items whose saturated fat is
+  KNOWN — an unknown-satf item makes the day partial, never zero), value-only and never
+  judged like total sugars. Each preserves unknowns: a partial total renders `≥sum` with an
+  *"N items not estimated"* caption; a nutrient no item carried shows *"not tracked yet"*;
+  an absent target shows the value only. Calcium, magnesium, and omega-3 join the standalone
+  **Micronutrients** section; unsaturated fat nests under Fat beside saturated fat. Tapping
+  any of the four opens the SAME shared drill-down sheet (sorted contributors, "Not estimated"
+  group, `≥` partial header, share-of-known-total, grounded on-device insight with the
+  informational judgment-forbid for unsaturated fat). Their full display names (`Calcium`,
+  `Omega-3 (EPA+DHA)`, `Magnesium`, `Unsaturated Fat`) live in the one `Micronutrient` enum,
+  guarded by `MacroLabelTests`.
+- **HealthKit meal write-back for calcium and magnesium only.** A logged meal now carries
+  `calcium_mg` and `magnesium_mg` (each the sum of only its known items, nil when none),
+  threaded from the `meal_log` wire through `Meal` and written as additional samples on the
+  meal's existing `.food` correlation — `dietaryCalcium` and `dietaryMagnesium` (both in mg).
+  A nutrient with no known value writes NO sample (never a 0), and the delete-then-rewrite
+  correction path enumerates the present sample types (now up to eleven), so the two new
+  types flow through a rewrite. The share (write) set grows from nine to eleven to authorize
+  them. **Omega-3 is gauge-only** — there is no HealthKit EPA+DHA type (`dietaryFatPolyunsaturated`
+  includes plant ALA), so it is never a meal field and writes no sample; unsaturated fat is
+  derived and likewise never written.
+
+## [Bridge 0.18.0] — 2026-07-18
+
+### Added
+- **Three more diet micronutrients end to end — calcium, omega-3 (marine EPA+DHA),
+  and magnesium — same unknown-is-not-zero discipline as the existing four.** The
+  food-log CSV grows three trailing columns (`Calcium_mg`, `Omega3_mg`,
+  `Magnesium_mg`), so the header is now 22 columns. As with sodium/satfat/sugar/
+  potassium, a value the message or label never established stays *absent* at every
+  stage — omitted extract key, `None` in the struct, blank CSV cell, omitted wire
+  field — and is **never** `0` standing in for "did not know".
+  - **Read path (`GET /jesse/diet`).** `reconstruct_meals` emits three new per-item
+    GAUGE fields — `ca`/`o3`/`mg` — via `opt_num` (blank/unparseable/absent → JSON
+    `null`, never `0`). A legacy short row that ends before the new columns reads them
+    as null and still parses.
+  - **Write path (extract → verify → append).** `FoodEntry` gains `calcium_mg`,
+    `omega3_mg`, `magnesium_mg`; the extract schema/prompt add the three keys with the
+    fill-only-from-a-label-or-confident-estimate rule. Omega-3 is defined as marine
+    long-chain **EPA+DHA only** (fish, shellfish, roe, small amounts in eggs/dairy) —
+    never the plant ALA in walnuts, flax, chia, or vegetable oils, and omitted for a
+    plant-ALA-only food. Calcium and magnesium, like potassium, are usually absent on
+    EU labels and so usually omitted. The verifier corrects only the five macros; the
+    new micros carry through a correction untouched.
+  - **Apple Health mirror (`JESSE_MEAL_LOG`).** Only the HealthKit-bound micros ride
+    the meal wire: `calcium_mg` and `magnesium_mg` are added to the meal allowlist and
+    the `Meal` struct (finite, non-negative, explicit `null` rejected, omitted when
+    unknown). **Omega-3 has no HealthKit type** (`dietaryFatPolyunsaturated` includes
+    ALA, wrong for EPA/DHA), so it is deliberately NOT a meal field — the derived
+    off-phone mirror populates calcium and magnesium only.
+  - Unchanged by design: `MacroTotals`/`sum_food_csv_for_date` (blank-means-0, correct
+    only for the five macros), the ASCII dashboard, and the today pass-through path.
+  - Tests: read-path null-vs-number round trips and legacy-short-row; header/row parity
+    at 22 columns; parse accepts all three / a subset / none and still rejects an
+    out-of-schema key loudly; blank-stays-unknown round trip; the full 22-cell row;
+    verify carry-through keeps `calcium_mg`; the meal wire accepts calcium/magnesium on
+    v1 and v2, rejects null/negative, and rejects `omega3_mg` as an unknown key; the
+    derived mirror serializes calcium/magnesium when known and omits them when not.
+
+## [App 1.0 (48)] — 2026-07-17
+
+### Added
+- **A send outbox so a message can't be silently lost before the bridge ACKs.**
+  The bridge acknowledges `POST /jesse` immediately with `202 {job_id}`, and
+  everything after that ACK was already recoverable (persisted `InFlightJob`,
+  Re-check, foreground resume). But *before* the ACK — a timeout, a dead network,
+  a 429/5xx, or the app being suspended/killed mid-POST — the message was lost, and
+  the full-resolution attachment bytes with it (only thumbnails persist; the
+  composer clears its staged bytes at send). Now every send persists an outbox
+  record first and deletes it at the ACK.
+  - **Two new SwiftData models** (`OutboxItem` + `OutboxAttachment`), added as
+    schema **V2** with a lightweight `V1 → V2` migration stage (they're additive,
+    fully-defaulted entities). `OutboxItem.id` IS the wire `request_id`;
+    `OutboxAttachment` holds the ORIGINAL (staged, post-downscale, always-sendable)
+    bytes in external storage.
+  - **`request_id` on `POST /jesse`** (`JesseClient.send(…, requestId:)`), so a
+    Retry re-sends with the SAME key and the bridge dedups a POST that actually
+    landed (one turn, not two). Other call sites (watch relay, health-context
+    retry) pass nil; a bridge without the field ignores it, so the bytes are
+    unchanged when it's absent.
+  - **Stage → transmit** in `RunCoordinator.send`: the optimistic user turn and its
+    `OutboxItem` are created in one save; the transmit deletes the item on any
+    success (a `.running` 202 or the legacy inline `.reply` 200) and hands off to
+    the unchanged InFlight/consume/Re-check machinery. A pre-ACK throw preserves the
+    message as `.failed` (a pre-ACK cancel too, which used to vanish silently) —
+    WITHOUT the thread-level error banner, which the per-message UI now owns.
+  - **`reconcile`** (run on resume, before re-attach) recovers the app-killed-
+    mid-POST case: a still-`.sending` item is deleted if the persisted job carries
+    its `request_id` (the ACK won the race) or flipped to `.failed` ("Jesse never
+    received this.") otherwise.
+  - **Manual, per-message Retry / Discard — never automatic.** A failed user bubble
+    shows a compact "Not delivered" line (orange, matching the Re-check affordance)
+    with Retry (re-runs the transmit reusing the same turn and request_id) and
+    Discard (removes the message, and an empty sessionless thread with it). The
+    composer stays enabled with failed messages present; the conversation list
+    badges rows that have any undelivered message.
+
+## [App 1.0 (46)] — 2026-07-17
+
+### Changed
+- **An oversized photo now downscales to fit instead of erroring.** Attaching an
+  image whose original file already exceeded the 10 MB per-file cap failed with
+  "… is too large (max 10 MB per file)" on every entry path (composer paste,
+  paperclip file import, camera capture) — they all stage through one shared
+  `addAttachment` funnel. Now, when a staged **image** is over the cap, it's
+  re-encoded to a smaller JPEG that fits, silently — no error, no prompt, no
+  Settings toggle.
+  - **New `AttachmentDownscaler`** — a pure, `nonisolated`, testable decision +
+    transform unit. `fitToCap(_:cap:)` re-encodes an over-cap decodable image as a
+    JPEG (quality 0.85), stepping the longest pixel edge down (×0.8 per iteration,
+    floored) until it lands under 90 % of the cap so a boundary result doesn't
+    flap. EXIF orientation is applied (ImageIO transform → upright pixels), so the
+    result arrives right-side-up. Output is always JPEG regardless of input, and
+    the display name gets a `.jpg` extension.
+  - **Byte-verbatim invariant preserved (PR #51).** The very first check is
+    "already under the cap?" — if so it returns `nil` and the original bytes stage
+    untouched, never decoded or re-encoded. Downscaling triggers *only* when the
+    original bytes exceed the cap.
+  - **One shared spot.** The re-encode lives in `addAttachment`, so paste, photo
+    picker, file import, and camera all behave identically — no new paste/picker
+    divergence (PR #51's root cause).
+  - **Images only.** An over-cap PDF (or any non-image) is left untouched and the
+    existing size cap rejects it exactly as before; rasterizing PDFs is out of
+    scope. The total (20 MB) and file-count (4) caps are unchanged — downscaling
+    satisfies the per-file cap only.
+  - Tests (failing-first): an oversized synthetic image stages under the cap,
+    decodes valid, and shows its dimensions stepped down; orientation is applied
+    (a rotated fixture decodes upright); under-cap inputs (image and PDF) return
+    `nil` so staging stays byte-verbatim; an over-cap PDF and an undecodable image
+    are not downscaled; cap edges on both sides; the filename swaps to `.jpg`. The
+    existing `PasteAttachmentTests` are untouched.
+  - Build **44 → 46**.
+
+## [Bridge 0.17.0] — 2026-07-17
+
+### Added
+- **Idempotency key for `POST /jesse` — a client that never saw the `202` can safely
+  re-send.** `POST /jesse` returns the `job_id` on the first response and the turn runs
+  detached; if the network drops before that response reaches the phone, the old contract
+  had no way to recover — a retry would spawn a *second* turn (double the tokens, a second
+  vault write). A new optional `request_id` field closes that: re-sending the same request
+  with the same key returns the ORIGINAL job instead of starting a new one.
+  - **Wire contract.** `POST /jesse` gains an optional `"request_id"` (string). Validated
+    when present: at most 64 chars, ASCII alphanumerics and hyphens only — anything else is
+    a `400 {"error":"…"}`. **Absent `request_id` reproduces today's behavior exactly**
+    (old app builds simply omit it) — every POST is a fresh turn.
+  - **Dedup semantics.** A `request_id` already mapped to a **live** job (queued, running,
+    or a terminal result still inside its retention window) short-circuits: the bridge
+    creates nothing, takes no concurrency permit, enqueues nothing, and returns
+    `202 {"job_id":"<existing>","status":"running"}` — the exact shape of a fresh accept.
+    The client then streams/polls that id as normal (a job that already finished satisfies
+    the first poll immediately). A `request_id` whose job has been **reaped** is treated as
+    brand new. Auth and rate limiting apply first, unchanged.
+  - **Concurrency-safe.** The `request_id → job_id` index lives under the job store's one
+    `jobs` lock; the check-and-insert happens at job creation, so two concurrent duplicate
+    POSTs can never both spawn — they collapse to a single job. The index is rebuilt from
+    persisted jobs at startup and pruned wherever a job is evicted, so a mapping can never
+    outlive its job.
+  - **Persistence.** The `request_id` is persisted with the completed job and reloaded on
+    restart (the dedup index is rebuilt from it). Job files written before this field —
+    which lack the key entirely — still load unchanged, with no mapping.
+  - Tests: same key twice (one spawn, same id), two concurrent duplicates (one job),
+    dedup against a completed job (returned id fetches the finished result), reaped mapping
+    treated as new (and the index pruned), absent-key regression (distinct jobs), invalid
+    key `400`, and a persisted round-trip that rebuilds the index (old files still load).
+
+## [App 1.0 (44)] — 2026-07-17
+
+### Changed
+- **Versioned the SwiftData schema and stopped silently losing history on a store
+  failure.** `AppModelContainer` opened the store with `try?` and, on any failure,
+  substituted an *empty in-memory store* with only a log line — so a migration that
+  ever failed on a populated device would swap the user's whole conversation history
+  for a blank slate with no signal. Two root-cause fixes:
+  - **No more silent fallback.** A failed on-disk open now surfaces as
+    `AppModelStore.openFailure`; the app runs on a clearly *flagged* in-memory
+    fallback for the session (a non-dismissible banner: "Couldn't open your saved
+    conversations… this session won't be saved") and the on-disk file is left
+    **untouched** — never overwritten or deleted — so the data stays recoverable.
+  - **A versioned schema + migration plan.** The model list is now a
+    `VersionedSchema` (`JesseSchemaV1`) opened through a `SchemaMigrationPlan`
+    (`JesseMigrationPlan`) — the structural, testable home for future migrations.
+    The historical additive changes (`isFavorite`, `favoritedAt`,
+    `lastDeliveredJobId`, `aiTitle`, `titleSourceKey`, `origin`, `provenanceJSON`,
+    the `attachments` relationship, `TurnAttachment`, `WrittenMeal`) are all
+    lightweight-compatible, so the plan is a documented single-version scaffold.
+  - **Coverage for the path that had none.** New `AppModelContainerMigrationTests`
+    populate an on-disk store the pre-versioned way (threads, turns, attachments,
+    favorites, a WrittenMeal), reopen it through the real loader, and assert every
+    field survives (favorites still favorited, `aiTitle`/`origin`/`lastDeliveredJobId`
+    intact, a Turn's `provenanceJSON`, an attachment's thumbnail bytes) — plus a test
+    that a corrupt store is *flagged* (not swallowed) and its bytes left intact.
 
 ## [App 1.0 (43)] — 2026-07-17
 

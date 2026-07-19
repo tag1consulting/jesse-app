@@ -24,13 +24,17 @@ nonisolated struct Meal: Codable, Equatable, Sendable {
     let carbGrams: Double?
     let fatGrams: Double?
     let fiberGrams: Double?
-    /// The four micronutrients, each the sum of ONLY the meal's items that carried a
-    /// known value — nil when NO item in the meal did (never a summed 0). Written as
-    /// their own HealthKit samples; sodium/potassium in mg, saturated fat/sugars in g.
+    /// The HealthKit-bound micronutrients, each the sum of ONLY the meal's items that
+    /// carried a known value — nil when NO item in the meal did (never a summed 0).
+    /// Written as their own HealthKit samples; sodium/potassium/calcium/magnesium in mg,
+    /// saturated fat/sugars in g. Omega-3 is gauge-only (no HealthKit EPA+DHA type) and
+    /// so is never a meal field.
     let sodiumMg: Double?
     let satFatGrams: Double?
     let sugarGrams: Double?
     let potassiumMg: Double?
+    let calciumMg: Double?
+    let magnesiumMg: Double?
 
     /// A stable content hash over `consumedAt`, `name`, and every **present** nutrient,
     /// with absent nutrients canonically EXCLUDED (so absent and `0` hash differently — a
@@ -49,6 +53,7 @@ nonisolated struct Meal: Codable, Equatable, Sendable {
             ("kcal", kcal), ("protein_g", proteinGrams), ("carbs_g", carbGrams),
             ("fat_g", fatGrams), ("fiber_g", fiberGrams), ("sodium_mg", sodiumMg),
             ("satfat_g", satFatGrams), ("sugar_g", sugarGrams), ("potassium_mg", potassiumMg),
+            ("calcium_mg", calciumMg), ("magnesium_mg", magnesiumMg),
         ]
         for (key, value) in nutrients {
             if let value { parts.append("\(key)=\(value)") }
@@ -158,7 +163,8 @@ nonisolated enum MealLogParser {
         let name = m.name.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !id.isEmpty, !name.isEmpty, let date = parseDate(m.consumedAt) else { return nil }
         for value in [m.kcal, m.proteinGrams, m.carbGrams, m.fatGrams, m.fiberGrams,
-                      m.sodiumMg, m.satFatGrams, m.sugarGrams, m.potassiumMg] {
+                      m.sodiumMg, m.satFatGrams, m.sugarGrams, m.potassiumMg,
+                      m.calciumMg, m.magnesiumMg] {
             if let v = value, !(v.isFinite && v >= 0) { return nil }
         }
         return Meal(id: id, consumedAt: date, name: name,
@@ -166,7 +172,8 @@ nonisolated enum MealLogParser {
                     carbGrams: m.carbGrams, fatGrams: m.fatGrams,
                     fiberGrams: m.fiberGrams,
                     sodiumMg: m.sodiumMg, satFatGrams: m.satFatGrams,
-                    sugarGrams: m.sugarGrams, potassiumMg: m.potassiumMg)
+                    sugarGrams: m.sugarGrams, potassiumMg: m.potassiumMg,
+                    calciumMg: m.calciumMg, magnesiumMg: m.magnesiumMg)
     }
 
     /// Parse an ISO-8601 date-time WITH offset, tolerating optional fractional

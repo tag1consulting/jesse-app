@@ -117,7 +117,8 @@ struct TodayScreen: View {
     private func openDrilldown(_ ex: Explainer, metric: ContributionMetric, gauge: MetricGauge) {
         var enriched = ex
         enriched.drilldown = FoodDrilldown.build(meals: today.meals, metric: metric,
-                                                 gauge: gauge, isCarbLoad: gauges.isCarbLoad)
+                                                 gauge: gauge, isCarbLoad: gauges.isCarbLoad,
+                                                 series: snapshot.nutrientSeries, targets: today.targets)
         explainer = enriched
     }
 
@@ -308,7 +309,8 @@ struct TodayScreen: View {
     private var navRowsSection: some View {
         Section {
             NavigationLink {
-                MacrosCaloriesDetail(today: today, hour: hour, neutral: isNeutral)
+                MacrosCaloriesDetail(today: today, hour: hour, neutral: isNeutral,
+                                     nutrientSeries: snapshot.nutrientSeries)
             } label: {
                 NavRow(title: "Macros & calories", icon: "chart.bar.fill",
                        subtitle: macrosSubtitle)

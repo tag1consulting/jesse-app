@@ -1,6 +1,7 @@
 import XCTest
 @testable import Jesse
 
+@MainActor
 final class ThreadFoldersTests: XCTestCase {
 
     // Fixed calendar + `now` (2026-06-25 12:00 UTC), matching ThreadSectioningTests,

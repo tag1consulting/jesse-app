@@ -171,6 +171,44 @@ hosted path — a prompt-injected or hallucinating child cannot deliver an inven
 "fact from your vault." Injection text inside a vault file can at most cause a
 `NO_VAULT_ANSWER` / validator-fail fall-through, never an action.
 
+## Shadow-comparison child isolation (in-process boundary)
+
+The opt-in shadow-comparison route (`JESSE_SHADOW_*`, see the bridge README) mirrors a
+**sampled** ask turn — strictly **after** the hosted answer has been delivered — to a
+second backend to gather offline evidence. Its child is the **same stateless,
+single-shot, READ-ONLY** child the vault-QA route uses: `build_shadow_child_command`
+delegates to `build_vaultqa_child_command`, so the shadow child is launched with the
+identical `--tools "Read,Grep,Glob"` root allowlist, `--strict-mcp-config` +
+empty/qmd `--mcp-config`, and the documented denylist. The **only** difference is the
+backend it is pointed at: `apply_shadow_env` sets `ANTHROPIC_BASE_URL` /
+`ANTHROPIC_AUTH_TOKEN` / `ANTHROPIC_MODEL` **on the child only**, keyed off
+`cfg.shadow_backend` (the gateway URL + gateway token + `fw-glm`). So the shadow child
+can **read** the vault to answer but cannot write, execute a shell, reach the network
+directly, spawn a subagent, or load an unlisted MCP tool — the same guarantee the
+vault-QA child gets, proven by the same write-refusal assertions
+(`shadow_child_is_read_only_and_cannot_write`).
+
+**A write capability reaching it is a test failure, not a runtime surprise.** Beyond
+the containment, the shadow runner watches the child's stream for any non-read tool
+use and records a `write_attempt` canary on the pair; the daily `shadow-audit` fires a
+**disarm tripwire** on any such attempt (and on any injection-style leak in a shadow
+answer). Because the child is read-only, at worst it emits text — which is never
+delivered to the phone, only logged locally for offline judging.
+
+**Secrets.** The bridge carries only the **gateway URL and gateway token** — never a
+Fireworks credential — and it **never logs a token value**. The shadow log holds
+vault-derived answer text, so it is created **mode 0600** and the bridge never sends it
+anywhere; only the `shadow-audit` bin reads it, and its judge calls run on **ambient**
+hosted auth, never with the shadow env, and never in the request path.
+
+**Isolation from production.** The mirror never occupies the production permit and
+never delays a phone turn (detached, permit-free task; a separate at-most-one slot;
+`skipped_busy` yield to a running/queued turn; background priority). The delivered
+answer, its latency, its badge, and every production route are byte-for-byte unchanged
+whether shadow is armed or not — arming shadow can never grant a capability or alter a
+turn's outcome. **The `JESSE_SHADOW_*` triple is the kill switch:** unset any one var
+and the route is inert.
+
 ## Emergency local fallback posture (`JESSE_EMERGENCY_LOCAL`)
 
 The emergency fallback (bridge README) keeps the phone useful during a **hosted

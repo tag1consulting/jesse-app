@@ -2,6 +2,7 @@ import XCTest
 @testable import Jesse
 
 /// (Lows) Named-constant extraction and the `JesseInbox` main-actor drain path.
+@MainActor
 final class LowsTests: XCTestCase {
 
     // MARK: - Named constants (no more scattered magic numbers)

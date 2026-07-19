@@ -25,7 +25,7 @@ protocol BackgroundTasking: AnyObject {
     /// BEFORE the expiration handler can run. The real implementation gets this
     /// for free: `beginBackgroundTask` returns the id before the system can fire
     /// expiration, so `handle.id` is set first.
-    func beginTask(name: String, handle: BackgroundTaskHandle, expiration: @escaping () -> Void)
+    func beginTask(name: String, handle: BackgroundTaskHandle, expiration: @escaping @MainActor @Sendable () -> Void)
     /// End the task. A no-op for `.invalid`, matching `UIApplication`.
     func endTask(_ id: UIBackgroundTaskIdentifier)
 }
@@ -81,7 +81,7 @@ final class UIKitBackgroundTasking: BackgroundTasking {
     // (evaluated in the caller's context); it holds no isolated state.
     nonisolated init() {}
 
-    func beginTask(name: String, handle: BackgroundTaskHandle, expiration: @escaping () -> Void) {
+    func beginTask(name: String, handle: BackgroundTaskHandle, expiration: @escaping @MainActor @Sendable () -> Void) {
         handle.id = UIApplication.shared.beginBackgroundTask(withName: name, expirationHandler: expiration)
     }
 

@@ -182,16 +182,25 @@ mod tests {
         rec.rung = 2;
         rec.diet_reason = Some("schema_fail:time".to_string());
         let line = serde_json::to_string(&rec).unwrap();
-        assert!(line.contains("\"diet_reason\":\"schema_fail:time\""), "reason present: {line}");
+        assert!(
+            line.contains("\"diet_reason\":\"schema_fail:time\""),
+            "reason present: {line}"
+        );
         // A code + schema field only — never the meal text or the token.
         for forbidden in ["question", "answer", "tokens", "token", "text"] {
-            assert!(!line.contains(forbidden), "reason line must not carry {forbidden:?}: {line}");
+            assert!(
+                !line.contains(forbidden),
+                "reason line must not carry {forbidden:?}: {line}"
+            );
         }
         let back: MetricsRecord = serde_json::from_str(&line).unwrap();
         assert_eq!(back, rec, "round-trip identity");
         // Absent on a normal turn → not serialized (compact).
         let none = serde_json::to_string(&sample()).unwrap();
-        assert!(!none.contains("diet_reason"), "absent reason is omitted: {none}");
+        assert!(
+            !none.contains("diet_reason"),
+            "absent reason is omitted: {none}"
+        );
     }
 
     #[test]

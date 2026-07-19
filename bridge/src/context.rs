@@ -222,7 +222,10 @@ impl ContextLedger {
             });
             entry.turns.push(turn);
             // Per-thread cap: drop oldest beyond the cap.
-            let excess = entry.turns.len().saturating_sub(CONTEXT_MAX_TURNS_PER_THREAD);
+            let excess = entry
+                .turns
+                .len()
+                .saturating_sub(CONTEXT_MAX_TURNS_PER_THREAD);
             if excess > 0 {
                 entry.turns.drain(0..excess);
             }
@@ -320,7 +323,10 @@ impl ContextLedger {
             match map.get_mut(to) {
                 Some(dest) => {
                     dest.turns.extend(moved.turns);
-                    let excess = dest.turns.len().saturating_sub(CONTEXT_MAX_TURNS_PER_THREAD);
+                    let excess = dest
+                        .turns
+                        .len()
+                        .saturating_sub(CONTEXT_MAX_TURNS_PER_THREAD);
                     if excess > 0 {
                         dest.turns.drain(0..excess);
                     }
@@ -360,7 +366,9 @@ impl ContextLedger {
 
 /// Current unix seconds for a `SystemTime` (0 before the epoch — impossible in practice).
 fn unix_secs(t: SystemTime) -> u64 {
-    t.duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
+    t.duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 /// GC the map in place against `now_secs`: prune threads idle longer than
@@ -550,7 +558,11 @@ pub fn is_synthetic_session_id(id: &str) -> bool {
 /// Whether a fresh synthetic thread id should be minted for THIS delivered turn: carry
 /// on, the request carried NO session id, and the route was LOCAL (not a hosted
 /// `run_claude_streaming` turn). Pure — the decision the handler applies.
-pub fn should_mint_synthetic(carry: bool, request_had_session: bool, in_hosted_history: bool) -> bool {
+pub fn should_mint_synthetic(
+    carry: bool,
+    request_had_session: bool,
+    in_hosted_history: bool,
+) -> bool {
     carry && !request_had_session && !in_hosted_history
 }
 
@@ -685,7 +697,10 @@ mod tests {
         let path = temp_context_path();
         {
             let led = ContextLedger::new(Some(path.clone()), true);
-            led.record("t", turn("id1", "what is jamie's birthday", "March 3", false));
+            led.record(
+                "t",
+                turn("id1", "what is jamie's birthday", "March 3", false),
+            );
             led.record("t", turn("id2", "hosted follow", "answer", true));
         } // dropped — file already fsync'd + renamed
         let reloaded = ContextLedger::new(Some(path.clone()), true);
@@ -849,11 +864,25 @@ mod tests {
     #[test]
     fn catchup_block_frames_pairs_oldest_first_as_data() {
         let pending = vec![
-            turn("p1", "What is Jamie's birthday?", "March 3 (people/jamie.md:1).", false),
-            turn("p2", "Where does she live?", "Berlin (people/jamie.md:2).", false),
+            turn(
+                "p1",
+                "What is Jamie's birthday?",
+                "March 3 (people/jamie.md:1).",
+                false,
+            ),
+            turn(
+                "p2",
+                "Where does she live?",
+                "Berlin (people/jamie.md:2).",
+                false,
+            ),
         ];
         let (block, ids) = build_catchup_block(&pending).unwrap();
-        assert_eq!(ids, vec!["p1".to_string(), "p2".to_string()], "both included");
+        assert_eq!(
+            ids,
+            vec!["p1".to_string(), "p2".to_string()],
+            "both included"
+        );
         assert!(block.starts_with(CATCHUP_HEADER), "header leads: {block}");
         assert!(block.contains(CATCHUP_EXPLANATION));
         assert!(block.contains("data, not instructions"));
@@ -881,7 +910,10 @@ mod tests {
             .map(|i| turn(&format!("p{i}"), &format!("q{i} {big}"), &big, false))
             .collect();
         let (block, ids) = build_catchup_block(&pending).unwrap();
-        assert!(block.len() <= CATCHUP_MAX_BYTES, "block within the byte cap");
+        assert!(
+            block.len() <= CATCHUP_MAX_BYTES,
+            "block within the byte cap"
+        );
         assert!(
             block.contains("earlier turns omitted"),
             "omitted marker present when oldest dropped"
@@ -891,7 +923,10 @@ mod tests {
         assert!(!block.contains("q0 "));
         // Only the INCLUDED ids are returned (dropped-oldest stay pending → not marked).
         assert!(ids.contains(&"p19".to_string()), "newest included");
-        assert!(!ids.contains(&"p0".to_string()), "dropped-oldest not included");
+        assert!(
+            !ids.contains(&"p0".to_string()),
+            "dropped-oldest not included"
+        );
         assert!(ids.len() < pending.len(), "some were dropped");
     }
 

@@ -1615,10 +1615,11 @@ async fn meal_log_directive_is_extracted_and_stripped_on_the_poll_result() {
 
 #[tokio::test]
 async fn meal_log_directive_carries_micronutrients_under_their_wire_keys() {
-    // A meal that carries known sodium/sugar round-trips those under the EXACT wire
-    // keys the app decodes (`sodium_mg`, `sugar_g`), while a micronutrient the meal
-    // did not carry (potassium) stays ABSENT on the wire — never a null-padded 0.
-    let line = r#"{"type":"result","is_error":false,"result":"Logged.\nJESSE_MEAL_LOG v1 {\"meals\":[{\"id\":\"2026-07-04-lunch\",\"consumedAt\":\"2026-07-04T12:30:00+02:00\",\"name\":\"Lunch: prosciutto\",\"kcal\":120,\"sodium_mg\":900,\"satfat_g\":2.5,\"sugar_g\":0}]}","session_id":"sess-micro"}"#;
+    // A meal that carries known sodium/sugar/calcium round-trips those under the EXACT
+    // wire keys the app decodes (`sodium_mg`, `sugar_g`, `calcium_mg`), while a
+    // micronutrient the meal did not carry (potassium, magnesium) stays ABSENT on the
+    // wire — never a null-padded 0.
+    let line = r#"{"type":"result","is_error":false,"result":"Logged.\nJESSE_MEAL_LOG v1 {\"meals\":[{\"id\":\"2026-07-04-lunch\",\"consumedAt\":\"2026-07-04T12:30:00+02:00\",\"name\":\"Lunch: prosciutto\",\"kcal\":120,\"sodium_mg\":900,\"satfat_g\":2.5,\"sugar_g\":0,\"calcium_mg\":15}]}","session_id":"sess-micro"}"#;
     let (st, job_id) =
         run_turn_emitting(r#"{"mode":"tell","text":"log lunch: prosciutto"}"#, line).await;
     let v = result_status(&st, &job_id).await;
@@ -1629,9 +1630,14 @@ async fn meal_log_directive_carries_micronutrients_under_their_wire_keys() {
         meal["sugar_g"], 0.0,
         "measured-zero sugar carried, not dropped"
     );
+    assert_eq!(meal["calcium_mg"], 15.0, "known calcium under `calcium_mg`");
     assert!(
         meal.get("potassium_mg").is_none(),
         "unknown potassium is absent on the wire, never 0"
+    );
+    assert!(
+        meal.get("magnesium_mg").is_none(),
+        "unknown magnesium is absent on the wire, never 0"
     );
 }
 
@@ -1797,12 +1803,7 @@ async fn post_corrections(st: &AppState, auth: Option<&str>, body: &str) -> (Sta
 #[tokio::test]
 async fn meal_corrections_endpoint_requires_auth() {
     let (st, fake) = state_with_queue("unused");
-    let (status, _) = post_corrections(
-        &st,
-        None,
-        r#"{"retract":["2026-07-04-snack-1500"]}"#,
-    )
-    .await;
+    let (status, _) = post_corrections(&st, None, r#"{"retract":["2026-07-04-snack-1500"]}"#).await;
     assert_eq!(status, StatusCode::UNAUTHORIZED, "no bearer → 401");
     let _ = std::fs::remove_file(&fake);
 }
@@ -1827,10 +1828,10 @@ async fn meal_corrections_endpoint_queues_and_returns_seq() {
 async fn meal_corrections_endpoint_rejects_malformed_batch() {
     let (st, fake) = state_with_queue("unused");
     for bad in [
-        r#"{}"#,                                                        // empty batch
+        r#"{}"#,                                                                 // empty batch
         r#"{"meals":[{"id":"a","consumedAt":"t","name":"n"}],"retract":["a"]}"#, // id in both
         r#"{"meals":[{"id":"a","consumedAt":"t","name":"n","sodium_mg":-5}]}"#,  // negative
-        r#"{"retract":[5]}"#,                                           // non-string retract
+        r#"{"retract":[5]}"#, // non-string retract
         r#"{"meals":[{"id":"a","consumedAt":"t","name":"n"}],"note":1}"#, // unknown key
     ] {
         let (status, _) = post_corrections(&st, Some("Bearer test-token"), bad).await;
@@ -1859,9 +1860,15 @@ async fn queued_correction_merges_into_the_next_terminal_result_with_seq() {
     assert_eq!(v["response"], "Here is your day.", "reply text untouched");
     let ml = &v["directives"]["meal_log"];
     assert_eq!(ml["meals"][0]["id"], "2026-07-04-soup");
-    assert_eq!(ml["meals"][0]["sodium_mg"], 900.0, "micronutrient on the wire");
+    assert_eq!(
+        ml["meals"][0]["sodium_mg"], 900.0,
+        "micronutrient on the wire"
+    );
     assert_eq!(ml["retract"][0], "2026-07-04-gone");
-    assert_eq!(ml["corrections_seq"], 1, "highest queued seq stamped for ack");
+    assert_eq!(
+        ml["corrections_seq"], 1,
+        "highest queued seq stamped for ack"
+    );
     let _ = std::fs::remove_file(&fake);
 }
 
@@ -1892,9 +1899,8 @@ async fn queued_corrections_merge_ahead_of_a_turn_extracted_block() {
 
 #[tokio::test]
 async fn unacked_corrections_redeliver_but_an_ack_prunes_them() {
-    let (st, fake) = state_with_queue(
-        r#"{"type":"result","is_error":false,"result":"ok","session_id":"s"}"#,
-    );
+    let (st, fake) =
+        state_with_queue(r#"{"type":"result","is_error":false,"result":"ok","session_id":"s"}"#);
     post_corrections(
         &st,
         Some("Bearer test-token"),
@@ -2205,6 +2211,7 @@ fn diet_state_full() -> (AppState, std::path::PathBuf) {
     write_vault_file(&vault, "todo-list/diet-coach-notes.js", FIX_COACH);
     write_vault_file(&vault, "todo-list/proposed-diet-today.js", FIX_PROPOSED);
     write_vault_file(&vault, "diet-logs/weight-log.csv", FIX_WEIGHT_CSV);
+    write_vault_file(&vault, "diet-logs/food-log.csv", FIX_FOOD_CSV);
     let cfg = Config {
         vault: vault.to_string_lossy().into_owned(),
         ..test_config()
@@ -2323,6 +2330,32 @@ async fn diet_happy_path_returns_full_normalized_snapshot() {
     assert!(ws[1]["bf"].is_null(), "blank bf cell → null");
     assert!(ws[1]["leanLbs"].is_null(), "blank MuscleMass cell → null");
     assert_eq!(ws[2]["lbs"], 197.4);
+
+    // nutrientSeries: per-day, per-nutrient aggregate from the SAME food-log.csv,
+    // unknown-aware. FIX_FOOD_CSV has one day (2026-04-15, four items); its header
+    // stops at Fiber_g so every micro is unknown → those keys are omitted.
+    let ns = body["nutrientSeries"].as_array().unwrap();
+    assert_eq!(ns.len(), 1, "one day in the food log");
+    assert_eq!(ns[0]["date"], "2026-04-15");
+    let n = &ns[0]["nutrients"];
+    // cal: Banana's Calories cell is blank → UNKNOWN (excluded from the sum, NOT 0);
+    // the other three are known. This is the whole unknown-is-not-zero contract.
+    assert_eq!(
+        n["cal"]["sum"], 930.0,
+        "300 + 450 + 180; Banana blank excluded"
+    );
+    assert_eq!(n["cal"]["known"], 3);
+    assert_eq!(n["cal"]["unknown"], 1);
+    // Macros present on every row → all-known.
+    assert_eq!(n["p"]["sum"], 38.0);
+    assert_eq!(n["p"]["known"], 4);
+    assert_eq!(n["fiber"]["sum"], 16.0);
+    assert_eq!(n["fiber"]["known"], 4);
+    // No micro columns in this fixture → their keys (and derived unsat, which needs
+    // SatFat_g) are omitted for the day.
+    assert!(n.get("na").is_none(), "no Sodium_mg column → key omitted");
+    assert!(n.get("k").is_none(), "no Potassium_mg column → key omitted");
+    assert!(n.get("unsat").is_none(), "no SatFat_g → unsat omitted");
 
     let _ = std::fs::remove_dir_all(&vault);
 }
@@ -3064,20 +3097,10 @@ async fn sessions_empty_when_projects_dir_absent_with_stable_etag_and_304() {
     assert!(body_string(resp).await.is_empty(), "304 has an empty body");
 }
 
-// Serialize the HOME-mutating session tests against each other.
-static HOME_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-// The guard is intentionally held across the awaited request: HOME is a process
-// global, so it must stay pinned to this test's throwaway value for the whole
-// request (the sessions handler reads it mid-await). Only this one test mutates
-// HOME, so holding the lock across the await cannot deadlock.
-#[allow(clippy::await_holding_lock)]
 #[tokio::test]
 async fn sessions_lists_a_real_transcript_with_first_message_and_title() {
-    let _g = HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    let saved_home = std::env::var("HOME").ok();
-
-    // A throwaway HOME with a vault whose escaped projects dir holds one session.
+    // A throwaway HOME (via `cfg.home`, no global-env mutation) with a vault whose
+    // escaped projects dir holds one session.
     let home = std::env::temp_dir().join(format!("jesse-home-{}", random_hex()));
     let vault = format!("/vault/{}", random_hex());
     let proj = home
@@ -3091,8 +3114,8 @@ async fn sessions_lists_a_real_transcript_with_first_message_and_title() {
     )
     .unwrap();
 
-    std::env::set_var("HOME", &home);
     let cfg = Config {
+        home: home.to_string_lossy().into_owned(),
         vault: vault.clone(),
         state_dir: None,
         ..test_config()
@@ -3108,18 +3131,116 @@ async fn sessions_lists_a_real_transcript_with_first_message_and_title() {
     assert_eq!(resp.status(), StatusCode::OK);
     let body: Value = serde_json::from_str(&body_string(resp).await).unwrap();
 
-    // Restore HOME before asserting (so a panic can't leak the override).
-    match saved_home {
-        Some(h) => std::env::set_var("HOME", h),
-        None => std::env::remove_var("HOME"),
-    }
-
     let sessions = body["sessions"].as_array().unwrap();
     assert_eq!(sessions.len(), 1);
     assert_eq!(sessions[0]["session_id"], "sess-42");
     assert_eq!(sessions[0]["first_message"], "what is on Today.md?");
     assert_eq!(sessions[0]["title"], "Today Overview");
     assert!(sessions[0]["last_modified"].as_u64().is_some());
+
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+// ---- DELETE /jesse/session/{id} --------------------------------------------
+
+#[tokio::test]
+async fn session_delete_requires_auth() {
+    let st = test_state();
+    let resp = app(st)
+        .oneshot(session_delete_request(None, "some-session"))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn session_delete_unknown_id_is_idempotent_204() {
+    // An unknown / already-gone id is idempotent success (204), never an error —
+    // the app's durable delete-drainer and the GC sweep both retry safely.
+    let cfg = Config {
+        vault: format!("/no/such/vault/{}", random_hex()),
+        ..test_config()
+    };
+    let st = AppState::new(cfg);
+    let resp = app(st)
+        .oneshot(session_delete_request(
+            Some("Bearer test-token"),
+            "never-existed",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+}
+
+// Deleting an EXISTING session removes its transcript, and the deleted session is
+// then no longer resumable. Uses a per-test `cfg.home` (no global-env mutation), so
+// it never races the claude-spawning turn tests.
+#[tokio::test]
+async fn session_delete_removes_transcript_and_makes_it_unresumable() {
+    let home = std::env::temp_dir().join(format!("jesse-home-{}", random_hex()));
+    let vault = format!("/vault/{}", random_hex());
+    let proj = home
+        .join(".claude")
+        .join("projects")
+        .join(escape_project_path(&vault));
+    std::fs::create_dir_all(&proj).unwrap();
+    let transcript = proj.join("sess-del.jsonl");
+    std::fs::write(
+        &transcript,
+        "{\"type\":\"user\",\"message\":{\"content\":\"hi\"}}\n",
+    )
+    .unwrap();
+
+    let cfg = Config {
+        home: home.to_string_lossy().into_owned(),
+        vault: vault.clone(),
+        state_dir: None,
+        ..test_config()
+    };
+    let st = AppState::new(cfg.clone());
+    st.titles.set("sess-del", "A Title");
+
+    // Before delete: the transcript exists and the session is resumable.
+    assert!(transcript.exists());
+    assert_eq!(
+        resolve_resume_session(&cfg, Some("sess-del")),
+        Some("sess-del")
+    );
+
+    let resp = app(st.clone())
+        .oneshot(session_delete_request(
+            Some("Bearer test-token"),
+            "sess-del",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+
+    // The transcript is gone, the stashed title is dropped, and the session is no
+    // longer resumable (a resume now falls to a fresh session).
+    assert!(!transcript.exists(), "transcript file must be deleted");
+    assert!(
+        st.titles.get("sess-del").is_none(),
+        "stashed title must be dropped on delete"
+    );
+    assert!(
+        resolve_resume_session(&cfg, Some("sess-del")).is_none(),
+        "a deleted session must no longer be resumable"
+    );
+
+    // A repeat delete of the now-gone id is still idempotent success.
+    let resp2 = app(st)
+        .oneshot(session_delete_request(
+            Some("Bearer test-token"),
+            "sess-del",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        resp2.status(),
+        StatusCode::NO_CONTENT,
+        "repeat delete idempotent"
+    );
 
     let _ = std::fs::remove_dir_all(&home);
 }
@@ -3725,4 +3846,517 @@ async fn context_carry_end_to_end_pins_todays_transcript() {
     let _ = std::fs::remove_file(&fake);
     let _ = std::fs::remove_file(&count_file);
     let _ = std::fs::remove_file(&argv_file);
+}
+
+// ---- POST /jesse idempotency (request_id dedup) ---------------------------
+//
+// A client that never saw the 202 for a POST can re-send the SAME request with the
+// SAME `request_id`; the bridge returns the ORIGINAL job instead of spawning a
+// second turn. These drive the real router end-to-end with a fake `claude` that
+// records every spawn to a counter file, so "spawned exactly once" is observable.
+
+/// A fake `claude` that appends one line to `counter` on every spawn (so a test can
+/// count how many turns actually ran) and then emits a terminal result line. The
+/// `sleep` keeps the turn briefly live so a duplicate POST lands while it runs.
+fn spawn_counting_claude(counter: &std::path::Path, sleep_secs: u32) -> std::path::PathBuf {
+    let script = format!(
+        "#!/bin/sh\n\
+         echo x >> '{}'\n\
+         sleep {sleep_secs}\n\
+         printf '%s' '{{\"type\":\"result\",\"is_error\":false,\"result\":\"deduped ok\",\"session_id\":\"sess-dedup\"}}'\n",
+        counter.display()
+    );
+    write_fake_claude(&script)
+}
+
+fn spawn_count(counter: &std::path::Path) -> usize {
+    std::fs::read_to_string(counter)
+        .map(|s| s.lines().filter(|l| !l.is_empty()).count())
+        .unwrap_or(0)
+}
+
+fn counter_path() -> std::path::PathBuf {
+    std::env::temp_dir().join(format!(
+        "jesse-spawns-{}-{}.txt",
+        std::process::id(),
+        JOB_COUNTER.fetch_add(1, Ordering::Relaxed)
+    ))
+}
+
+async fn wait_for_done(st: &AppState, job_id: &str) -> Value {
+    for _ in 0..100 {
+        let v = result_status(st, job_id).await;
+        if v["status"] == "done" {
+            return v;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!("turn {job_id} never reached done");
+}
+
+#[tokio::test]
+async fn dedup_same_request_id_twice_returns_same_job_and_spawns_once() {
+    let counter = counter_path();
+    let _ = std::fs::remove_file(&counter);
+    let fake = spawn_counting_claude(&counter, 1);
+    let cfg = Config {
+        claude_bin: fake.to_string_lossy().into_owned(),
+        timeout_secs: 30,
+        ..test_config()
+    };
+    let st = AppState::new(cfg);
+
+    let body = r#"{"mode":"ask","text":"hi","request_id":"dup-abc"}"#;
+    // First POST creates the job.
+    let r1 = app(st.clone())
+        .oneshot(jesse_request(Some("Bearer test-token"), body))
+        .await
+        .unwrap();
+    assert_eq!(r1.status(), StatusCode::ACCEPTED);
+    let b1: Value = serde_json::from_str(&body_string(r1).await).unwrap();
+    assert_eq!(b1["status"], "running");
+    let id1 = b1["job_id"].as_str().unwrap().to_string();
+
+    // Second POST with the SAME request_id — same job id back, same fresh-accept shape.
+    let r2 = app(st.clone())
+        .oneshot(jesse_request(Some("Bearer test-token"), body))
+        .await
+        .unwrap();
+    assert_eq!(r2.status(), StatusCode::ACCEPTED);
+    let b2: Value = serde_json::from_str(&body_string(r2).await).unwrap();
+    assert_eq!(b2["status"], "running");
+    assert_eq!(
+        b2["job_id"].as_str().unwrap(),
+        id1,
+        "a duplicate request_id must return the ORIGINAL job id"
+    );
+
+    let done = wait_for_done(&st, &id1).await;
+    assert_eq!(done["response"], "deduped ok");
+    assert_eq!(
+        spawn_count(&counter),
+        1,
+        "the duplicate POST must not spawn a second claude"
+    );
+
+    let _ = std::fs::remove_file(&fake);
+    let _ = std::fs::remove_file(&counter);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn dedup_two_concurrent_duplicate_posts_yield_one_job() {
+    let counter = counter_path();
+    let _ = std::fs::remove_file(&counter);
+    let fake = spawn_counting_claude(&counter, 1);
+    let cfg = Config {
+        claude_bin: fake.to_string_lossy().into_owned(),
+        timeout_secs: 30,
+        // Two permits so BOTH would run concurrently if the dedup didn't collapse them.
+        max_concurrency: 2,
+        ..test_config()
+    };
+    let st = AppState::new(cfg);
+
+    let body = r#"{"mode":"ask","text":"race","request_id":"race-key"}"#;
+    // Fire both POSTs in parallel on separate tasks — the check-and-insert under the
+    // job store's one lock must let exactly one win.
+    let a = st.clone();
+    let h1 = tokio::spawn(async move {
+        app(a)
+            .oneshot(jesse_request(Some("Bearer test-token"), body))
+            .await
+            .unwrap()
+    });
+    let b = st.clone();
+    let h2 = tokio::spawn(async move {
+        app(b)
+            .oneshot(jesse_request(Some("Bearer test-token"), body))
+            .await
+            .unwrap()
+    });
+    let (r1, r2) = (h1.await.unwrap(), h2.await.unwrap());
+    assert_eq!(r1.status(), StatusCode::ACCEPTED);
+    assert_eq!(r2.status(), StatusCode::ACCEPTED);
+    let b1: Value = serde_json::from_str(&body_string(r1).await).unwrap();
+    let b2: Value = serde_json::from_str(&body_string(r2).await).unwrap();
+    let id1 = b1["job_id"].as_str().unwrap();
+    let id2 = b2["job_id"].as_str().unwrap();
+    assert_eq!(
+        id1, id2,
+        "two concurrent duplicate POSTs must resolve to the SAME job id"
+    );
+
+    let done = wait_for_done(&st, id1).await;
+    assert_eq!(done["response"], "deduped ok");
+    assert_eq!(
+        spawn_count(&counter),
+        1,
+        "two concurrent duplicate POSTs must spawn exactly one claude"
+    );
+
+    let _ = std::fs::remove_file(&fake);
+    let _ = std::fs::remove_file(&counter);
+}
+
+#[tokio::test]
+async fn dedup_against_a_completed_job_fetches_the_finished_result() {
+    let counter = counter_path();
+    let _ = std::fs::remove_file(&counter);
+    // No sleep — the first turn finishes fast, so the duplicate lands on a DONE job.
+    let fake = spawn_counting_claude(&counter, 0);
+    let cfg = Config {
+        claude_bin: fake.to_string_lossy().into_owned(),
+        timeout_secs: 30,
+        ..test_config()
+    };
+    let st = AppState::new(cfg);
+
+    let body = r#"{"mode":"ask","text":"hi","request_id":"finished-key"}"#;
+    let r1 = app(st.clone())
+        .oneshot(jesse_request(Some("Bearer test-token"), body))
+        .await
+        .unwrap();
+    let b1: Value = serde_json::from_str(&body_string(r1).await).unwrap();
+    let id1 = b1["job_id"].as_str().unwrap().to_string();
+    let done = wait_for_done(&st, &id1).await;
+    assert_eq!(done["response"], "deduped ok");
+
+    // Now re-POST the SAME request_id against the finished job.
+    let r2 = app(st.clone())
+        .oneshot(jesse_request(Some("Bearer test-token"), body))
+        .await
+        .unwrap();
+    assert_eq!(r2.status(), StatusCode::ACCEPTED);
+    let b2: Value = serde_json::from_str(&body_string(r2).await).unwrap();
+    let id2 = b2["job_id"].as_str().unwrap().to_string();
+    assert_eq!(
+        id2, id1,
+        "a completed job's request_id must still dedup to it"
+    );
+    // The returned id fetches the finished result immediately (first poll is satisfied).
+    let refetch = result_status(&st, &id2).await;
+    assert_eq!(refetch["status"], "done");
+    assert_eq!(refetch["response"], "deduped ok");
+    assert_eq!(
+        spawn_count(&counter),
+        1,
+        "a dedup against a completed job must not spawn a second claude"
+    );
+
+    let _ = std::fs::remove_file(&fake);
+    let _ = std::fs::remove_file(&counter);
+}
+
+#[tokio::test]
+async fn absent_request_id_creates_a_distinct_job_each_time() {
+    // Regression: with NO request_id, every POST is a fresh turn — two POSTs get two
+    // different job ids and two spawns, byte-for-byte today's behavior.
+    let counter = counter_path();
+    let _ = std::fs::remove_file(&counter);
+    let fake = spawn_counting_claude(&counter, 0);
+    let cfg = Config {
+        claude_bin: fake.to_string_lossy().into_owned(),
+        timeout_secs: 30,
+        ..test_config()
+    };
+    let st = AppState::new(cfg);
+
+    let body = r#"{"mode":"ask","text":"hi"}"#;
+    let r1 = app(st.clone())
+        .oneshot(jesse_request(Some("Bearer test-token"), body))
+        .await
+        .unwrap();
+    let id1 = serde_json::from_str::<Value>(&body_string(r1).await).unwrap()["job_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let _ = wait_for_done(&st, &id1).await;
+    let r2 = app(st.clone())
+        .oneshot(jesse_request(Some("Bearer test-token"), body))
+        .await
+        .unwrap();
+    let id2 = serde_json::from_str::<Value>(&body_string(r2).await).unwrap()["job_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let _ = wait_for_done(&st, &id2).await;
+
+    assert_ne!(id1, id2, "no request_id → each POST is a distinct turn");
+    assert_eq!(
+        spawn_count(&counter),
+        2,
+        "two POSTs with no request_id must spawn two turns"
+    );
+
+    let _ = std::fs::remove_file(&fake);
+    let _ = std::fs::remove_file(&counter);
+}
+
+#[tokio::test]
+async fn invalid_request_id_is_400_json_and_spawns_nothing() {
+    // A bridge whose fake claude would touch a marker if it EVER ran — an invalid
+    // request_id must be rejected before any turn machinery.
+    let counter = counter_path();
+    let _ = std::fs::remove_file(&counter);
+    let fake = spawn_counting_claude(&counter, 0);
+    let cfg = Config {
+        claude_bin: fake.to_string_lossy().into_owned(),
+        ..test_config()
+    };
+    let st = AppState::new(cfg);
+
+    // Over-length (65 chars).
+    let too_long = "a".repeat(65);
+    let body_long = format!(r#"{{"mode":"ask","text":"hi","request_id":"{too_long}"}}"#);
+    let r1 = app(st.clone())
+        .oneshot(jesse_request(Some("Bearer test-token"), &body_long))
+        .await
+        .unwrap();
+    assert_eq!(r1.status(), StatusCode::BAD_REQUEST);
+    let e1: Value = serde_json::from_str(&body_string(r1).await).unwrap();
+    assert!(
+        e1["error"].as_str().unwrap().contains("64"),
+        "the 400 body must be a one-line JSON error naming the length cap"
+    );
+
+    // Bad characters.
+    let body_bad = r#"{"mode":"ask","text":"hi","request_id":"bad id!"}"#;
+    let r2 = app(st.clone())
+        .oneshot(jesse_request(Some("Bearer test-token"), body_bad))
+        .await
+        .unwrap();
+    assert_eq!(r2.status(), StatusCode::BAD_REQUEST);
+    let e2: Value = serde_json::from_str(&body_string(r2).await).unwrap();
+    assert!(
+        e2["error"].is_string(),
+        "the bad-chars 400 must also carry a JSON error"
+    );
+
+    // Neither rejected POST spawned anything.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(
+        spawn_count(&counter),
+        0,
+        "a rejected request_id must spawn no turn"
+    );
+
+    let _ = std::fs::remove_file(&fake);
+    let _ = std::fs::remove_file(&counter);
+}
+
+// ===========================================================================
+// Opt-in shadow comparison (JESSE_SHADOW_*)
+// ===========================================================================
+
+/// A shadow-armed config over a fake `claude` whose behavior BRANCHES on
+/// `ANTHROPIC_BASE_URL` — set only on the contained shadow child (via
+/// `apply_shadow_env`), never on the hosted turn — so one script drives both sides.
+fn shadow_config(fake: &std::path::Path, log: &std::path::Path) -> Config {
+    Config {
+        claude_bin: fake.to_string_lossy().into_owned(),
+        timeout_secs: 20,
+        shadow_backend: Some((
+            "https://gw.example".to_string(),
+            "gw-secret-token".to_string(),
+            "fw-glm".to_string(),
+        )),
+        shadow_sample_pct: 100,
+        shadow_log: log.to_string_lossy().into_owned(),
+        ..test_config()
+    }
+}
+
+async fn post_ask_and_wait_done(st: &AppState, text: &str) -> Value {
+    let resp = app(st.clone())
+        .oneshot(jesse_request(
+            Some("Bearer test-token"),
+            &format!(r#"{{"mode":"ask","text":"{text}"}}"#),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::ACCEPTED);
+    let body: Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    let job_id = body["job_id"].as_str().unwrap().to_string();
+    for _ in 0..80 {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let v = result_status(st, &job_id).await;
+        if v["status"] == "done" {
+            let mut v = v;
+            v["job_id"] = Value::String(job_id);
+            return v;
+        }
+    }
+    panic!("turn never reached done");
+}
+
+/// Poll the shadow log for the pair belonging to `turn_id`, up to ~4s.
+fn read_pair(log: &std::path::Path, turn_id: &str) -> Option<ShadowPair> {
+    let body = std::fs::read_to_string(log).ok()?;
+    parse_shadow_pairs(&body)
+        .into_iter()
+        .find(|p| p.turn_id == turn_id)
+}
+
+#[tokio::test]
+async fn shadow_disarmed_vs_armed_delivers_byte_for_byte_identical() {
+    // GOLDEN: the delivered reply (text + session id) is identical whether shadow is
+    // armed or not — arming shadow changes nothing on the production path.
+    let script = "#!/bin/sh\n\
+        if [ -n \"$ANTHROPIC_BASE_URL\" ]; then\n\
+          printf '%s' '{\"type\":\"result\",\"is_error\":false,\"result\":\"shadow answer\",\"session_id\":\"s\",\"usage\":{\"input_tokens\":100,\"output_tokens\":20}}'\n\
+        else\n\
+          printf '%s' '{\"type\":\"result\",\"is_error\":false,\"result\":\"the hosted answer\",\"session_id\":\"sess-1\"}'\n\
+        fi\n";
+    let fake = write_fake_claude(script);
+
+    // Unarmed.
+    let st_off = AppState::new(Config {
+        claude_bin: fake.to_string_lossy().into_owned(),
+        timeout_secs: 20,
+        ..test_config()
+    });
+    let off = post_ask_and_wait_done(&st_off, "same question").await;
+
+    // Armed (distinct log).
+    let log =
+        std::env::temp_dir().join(format!("jesse-shadow-golden-{}.jsonl", std::process::id()));
+    let _ = std::fs::remove_file(&log);
+    let st_on = AppState::new(shadow_config(&fake, &log));
+    let on = post_ask_and_wait_done(&st_on, "same question").await;
+
+    assert_eq!(
+        off["response"], on["response"],
+        "delivered text must be identical"
+    );
+    assert_eq!(off["response"], "the hosted answer");
+    assert_eq!(
+        off["session_id"], on["session_id"],
+        "delivered session id must be identical"
+    );
+
+    let _ = std::fs::remove_file(&fake);
+    let _ = std::fs::remove_file(&log);
+}
+
+#[tokio::test]
+async fn shadow_armed_mirrors_an_eligible_ask_and_logs_a_complete_pair() {
+    let script = "#!/bin/sh\n\
+        if [ -n \"$ANTHROPIC_BASE_URL\" ]; then\n\
+          printf '%s\\n' '{\"type\":\"stream_event\",\"event\":{\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\"shadow says hi\"}}}'\n\
+          printf '%s' '{\"type\":\"result\",\"is_error\":false,\"result\":\"shadow says hi\",\"session_id\":\"s\",\"usage\":{\"input_tokens\":1200,\"output_tokens\":80,\"cache_read_input_tokens\":40}}'\n\
+        else\n\
+          printf '%s' '{\"type\":\"result\",\"is_error\":false,\"result\":\"hosted answer text\",\"session_id\":\"sess-x\"}'\n\
+        fi\n";
+    let fake = write_fake_claude(script);
+    let log = std::env::temp_dir().join(format!("jesse-shadow-pair-{}.jsonl", std::process::id()));
+    let _ = std::fs::remove_file(&log);
+    let st = AppState::new(shadow_config(&fake, &log));
+
+    let done = post_ask_and_wait_done(&st, "mirror me").await;
+    assert_eq!(done["response"], "hosted answer text");
+    let job_id = done["job_id"].as_str().unwrap().to_string();
+
+    let mut pair = None;
+    for _ in 0..80 {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        if let Some(p) = read_pair(&log, &job_id) {
+            pair = Some(p);
+            break;
+        }
+    }
+    let pair = pair.expect("an eligible ask must produce a shadow pair line");
+    assert_eq!(pair.outcome, "complete");
+    // Hosted text is the delivered (pre-badge) answer, captured from the jobstore seam.
+    assert_eq!(pair.hosted_text, "hosted answer text");
+    assert_eq!(pair.shadow_text.as_deref(), Some("shadow says hi"));
+    assert_eq!(pair.shadow_model, "fw-glm");
+    let usage = pair
+        .shadow_usage
+        .expect("shadow usage captured from the result line");
+    assert_eq!(usage.input_tokens, Some(1200));
+    assert_eq!(usage.output_tokens, Some(80));
+    assert!(
+        !pair.write_attempt,
+        "a read-only shadow child makes no write attempt"
+    );
+    // The delivered turn is untouched: the stored reply is still the hosted answer.
+    let after = result_status(&st, &job_id).await;
+    assert_eq!(after["response"], "hosted answer text");
+
+    let _ = std::fs::remove_file(&fake);
+    let _ = std::fs::remove_file(&log);
+}
+
+#[tokio::test]
+async fn shadow_child_error_records_an_incomplete_pair_and_leaves_the_turn_intact() {
+    // The shadow side returns a transport-class error envelope; the hosted turn
+    // succeeds. The pair is recorded INCOMPLETE (no shadow text) and swallowed.
+    let script = "#!/bin/sh\n\
+        if [ -n \"$ANTHROPIC_BASE_URL\" ]; then\n\
+          printf '%s' '{\"type\":\"result\",\"is_error\":true,\"result\":\"upstream 500\",\"api_error_status\":500}'\n\
+        else\n\
+          printf '%s' '{\"type\":\"result\",\"is_error\":false,\"result\":\"good hosted reply\",\"session_id\":\"sess-e\"}'\n\
+        fi\n";
+    let fake = write_fake_claude(script);
+    let log = std::env::temp_dir().join(format!("jesse-shadow-err-{}.jsonl", std::process::id()));
+    let _ = std::fs::remove_file(&log);
+    let st = AppState::new(shadow_config(&fake, &log));
+
+    let done = post_ask_and_wait_done(&st, "mirror me too").await;
+    assert_eq!(
+        done["response"], "good hosted reply",
+        "hosted turn unaffected by shadow failure"
+    );
+    let job_id = done["job_id"].as_str().unwrap().to_string();
+
+    let mut pair = None;
+    for _ in 0..80 {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        if let Some(p) = read_pair(&log, &job_id) {
+            pair = Some(p);
+            break;
+        }
+    }
+    let pair = pair.expect("a shadow error still records an (incomplete) pair");
+    assert_eq!(pair.outcome, "error");
+    assert!(
+        pair.shadow_text.is_none(),
+        "an errored shadow logs no answer"
+    );
+    assert!(pair.error.is_some());
+
+    let _ = std::fs::remove_file(&fake);
+    let _ = std::fs::remove_file(&log);
+}
+
+#[tokio::test]
+async fn shadow_never_mirrors_a_tell() {
+    // A Tell is never eligible: no pair is ever written even with shadow armed.
+    let script = "#!/bin/sh\nprintf '%s' '{\"type\":\"result\",\"is_error\":false,\"result\":\"noted\",\"session_id\":\"sess-t\"}'\n";
+    let fake = write_fake_claude(script);
+    let log = std::env::temp_dir().join(format!("jesse-shadow-tell-{}.jsonl", std::process::id()));
+    let _ = std::fs::remove_file(&log);
+    let st = AppState::new(shadow_config(&fake, &log));
+
+    let resp = app(st.clone())
+        .oneshot(jesse_request(
+            Some("Bearer test-token"),
+            r#"{"mode":"tell","text":"remember milk"}"#,
+        ))
+        .await
+        .unwrap();
+    let body: Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    let job_id = body["job_id"].as_str().unwrap().to_string();
+    for _ in 0..40 {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        if result_status(&st, &job_id).await["status"] == "done" {
+            break;
+        }
+    }
+    // Give any (erroneous) shadow task time to run, then assert the log is absent.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(!log.exists(), "a Tell must never be mirrored");
+
+    let _ = std::fs::remove_file(&fake);
+    let _ = std::fs::remove_file(&log);
 }

@@ -13,13 +13,15 @@ import Foundation
 /// One food item inside a meal (or a proposed meal idea). `fiber` is written by
 /// the generator (0 when unknown); the rest may be absent on older files.
 ///
-/// `na`/`satf`/`sug`/`k` are the four micronutrients (bridge ≥ 0.12.x). UNLIKE
-/// `fiber` — which the generator always fills, so nil-coalescing it to 0 is harmless
-/// — these are absent for MANY items. A missing value is UNKNOWN, never zero: it must
-/// never be summed or shown as 0. They therefore live OUTSIDE the `MacroTotals` /
-/// `total(of:)` path (which coalesces nil→0 for cal/p/f/c/fiber) and are aggregated
-/// separately by `DietSemantics.micronutrientTotal`, which preserves the unknowns.
-/// Synthesized Decodable decodes an absent key to nil, so no decoder change is needed.
+/// `na`/`satf`/`sug`/`k` (bridge ≥ 0.12.x) and `ca`/`o3`/`mg` (bridge ≥ 0.18.0) are the
+/// tracked micronutrients. UNLIKE `fiber` — which the generator always fills, so
+/// nil-coalescing it to 0 is harmless — these are absent for MANY items. A missing value
+/// is UNKNOWN, never zero: it must never be summed or shown as 0. They therefore live
+/// OUTSIDE the `MacroTotals` / `total(of:)` path (which coalesces nil→0 for cal/p/f/c/fiber)
+/// and are aggregated separately by `DietSemantics.micronutrientTotal`, which preserves the
+/// unknowns. Synthesized Decodable decodes an absent key to nil, so no decoder change is
+/// needed; the new fields carry a `= nil` default only so additive construction (tests,
+/// previews) needn't name them.
 struct DietItem: Decodable, Equatable, Sendable {
     var item: String
     var amount: String?
@@ -36,6 +38,12 @@ struct DietItem: Decodable, Equatable, Sendable {
     var sug: Double?
     /// Potassium, milligrams. Absent (nil) = unknown, not zero.
     var k: Double?
+    /// Calcium, milligrams. Absent (nil) = unknown, not zero.
+    var ca: Double? = nil
+    /// Omega-3 (marine EPA+DHA), milligrams. Absent (nil) = unknown, not zero.
+    var o3: Double? = nil
+    /// Magnesium, milligrams. Absent (nil) = unknown, not zero.
+    var mg: Double? = nil
 }
 
 /// A logged meal: a name, an optional `HH:MM` time, and its items.
@@ -71,9 +79,10 @@ struct DietWeight: Decodable, Equatable, Sendable {
 /// The day's macro/calorie targets. `carbsBase` and `fiber` may be absent in old
 /// files (fiber defaults to 38 downstream — see `DietSemantics`).
 ///
-/// `sodium`/`satFat`/`potassium`/`sugar` are the optional micronutrient day targets
-/// (bridge ≥ 0.12.x). Each is a reference the matching gauge judges against; when
-/// absent the gauge shows the value only, with no judgment.
+/// `sodium`/`satFat`/`potassium`/`sugar` (bridge ≥ 0.12.x) and `calcium`/`omega3`/
+/// `magnesium` (bridge ≥ 0.18.0) are the optional micronutrient day targets. Each is a
+/// reference the matching gauge judges against; when absent the gauge shows the value
+/// only, with no judgment. (Unsaturated fat is derived, not tracked, and has no target.)
 struct DietTargets: Decodable, Equatable, Sendable {
     var calories: Double?
     var protein: Double?
@@ -89,6 +98,12 @@ struct DietTargets: Decodable, Equatable, Sendable {
     var potassium: Double?
     /// Total-sugars reference line, grams (informational — never a ceiling judgment).
     var sugar: Double?
+    /// Calcium floor, milligrams.
+    var calcium: Double?
+    /// Omega-3 (EPA+DHA) floor, milligrams.
+    var omega3: Double?
+    /// Magnesium floor, milligrams.
+    var magnesium: Double?
 }
 
 /// `DIET_TODAY` — the normalized snapshot of today.
@@ -286,6 +301,44 @@ struct WeightPoint: Decodable, Equatable, Sendable {
     var notes: String?
 }
 
+/// One nutrient's aggregate for a single day in `nutrientSeries` (bridge ≥ 0.21.0):
+/// the sum of KNOWN item values only, and the item counts behind it. `sum` NEVER
+/// includes an unknown item (unknown ≠ 0); `unknown > 0` means the day is PARTIAL — a
+/// lower bound, which matters for a floor nutrient. This mirrors the per-day
+/// `MicronutrientTotal` shape but is history-wide, one entry per logged day.
+struct NutrientDayValue: Decodable, Equatable, Sendable {
+    var sum: Double
+    var known: Int
+    var unknown: Int
+
+    init(sum: Double, known: Int, unknown: Int) {
+        self.sum = sum; self.known = known; self.unknown = unknown
+    }
+}
+
+/// One day in `nutrientSeries`: an ISO `yyyy-MM-dd` date and the per-nutrient
+/// aggregates PRESENT that day, keyed by the bridge's short nutrient key
+/// (`cal`/`p`/`f`/`c`/`fiber`/`na`/`satf`/`sug`/`k`/`ca`/`o3`/`mg`/`unsat`). A nutrient
+/// key is present only when at least one item that day carried a known value; a key
+/// ABSENT from `nutrients` is a GAP (all-unknown that day), never a zero. Pure data —
+/// every gap-aware computation lives in `NutrientTrends`, never here.
+struct NutrientDay: Decodable, Equatable, Sendable {
+    var date: String
+    var nutrients: [String: NutrientDayValue]
+
+    enum CodingKeys: String, CodingKey { case date, nutrients }
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        date = try c.decode(String.self, forKey: .date)
+        nutrients = try c.decodeIfPresent([String: NutrientDayValue].self, forKey: .nutrients) ?? [:]
+    }
+    // A memberwise init for tests/previews (the custom decoder suppresses the
+    // synthesized one).
+    init(date: String, nutrients: [String: NutrientDayValue] = [:]) {
+        self.date = date; self.nutrients = nutrients
+    }
+}
+
 /// The tier a day's data came from (bridge ≥ 0.7.0). `live` is today; `archived`
 /// is a past day served from its saved `diet-today.js` copy (full targets, judged
 /// like today); `reconstructed` is a past day rebuilt from the append-only CSVs
@@ -310,6 +363,12 @@ struct DietSnapshot: Decodable, Equatable, Sendable {
     var coach: DietCoach?
     var weightSeries: [WeightPoint]?
     var errors: [String]
+    /// Per-day, per-nutrient history aggregate (bridge ≥ 0.21.0), ascending by date,
+    /// most recent 90 logged days. The source for the per-nutrient trend charts and the
+    /// coach's multi-window rollup. Absent/empty on an older bridge → the trend
+    /// affordance hides, no crash. UNKNOWN ≠ ZERO: every computation over this runs only
+    /// on days where the nutrient key is present (see `NutrientTrends`).
+    var nutrientSeries: [NutrientDay]?
     /// Every date the app can page to (union of the logs + archives + today),
     /// sorted ascending. Absent on an old bridge → paging stays disabled.
     var availableDays: [String]?
@@ -320,7 +379,7 @@ struct DietSnapshot: Decodable, Equatable, Sendable {
 
     enum CodingKeys: String, CodingKey {
         case asOf, todayMtime, today, proposed, progress, coach, weightSeries, errors
-        case availableDays, historical, fidelity
+        case nutrientSeries, availableDays, historical, fidelity
     }
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
@@ -332,6 +391,7 @@ struct DietSnapshot: Decodable, Equatable, Sendable {
         coach = try c.decodeIfPresent(DietCoach.self, forKey: .coach)
         weightSeries = try c.decodeIfPresent([WeightPoint].self, forKey: .weightSeries)
         errors = try c.decodeIfPresent([String].self, forKey: .errors) ?? []
+        nutrientSeries = try c.decodeIfPresent([NutrientDay].self, forKey: .nutrientSeries)
         availableDays = try c.decodeIfPresent([String].self, forKey: .availableDays)
         historical = try c.decodeIfPresent(Bool.self, forKey: .historical)
         fidelity = try c.decodeIfPresent(String.self, forKey: .fidelity)
@@ -341,11 +401,13 @@ struct DietSnapshot: Decodable, Equatable, Sendable {
     init(asOf: String = "", todayMtime: String? = nil, today: DietToday,
          proposed: DietProposed? = nil, progress: DietProgress? = nil,
          coach: DietCoach? = nil, weightSeries: [WeightPoint]? = nil,
-         errors: [String] = [], availableDays: [String]? = nil,
+         errors: [String] = [], nutrientSeries: [NutrientDay]? = nil,
+         availableDays: [String]? = nil,
          historical: Bool? = nil, fidelity: String? = nil) {
         self.asOf = asOf; self.todayMtime = todayMtime; self.today = today
         self.proposed = proposed; self.progress = progress; self.coach = coach
         self.weightSeries = weightSeries; self.errors = errors
+        self.nutrientSeries = nutrientSeries
         self.availableDays = availableDays; self.historical = historical
         self.fidelity = fidelity
     }
