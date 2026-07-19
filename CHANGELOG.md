@@ -15,6 +15,22 @@ CI both run it). See the "Versioning" section of `bridge/README.md`.
 
 ## [Unreleased]
 
+## [Bridge 0.22.2] — 2026-07-19
+
+### Changed
+- **Record the vault-QA route probation start.** Added a "Probation status"
+  paragraph to the "Vault-QA route graduation criteria" section of
+  `bridge/README.md`: probation **started 2026-07-15** with the `0.11.0` deploy
+  (the `JESSE_VAULTQA_*` triple, `JESSE_METRICS_LOG`, and `JESSE_EMERGENCY_LOCAL=on`
+  added to the launchd env; the daily `com.example.jesse-vaultqa-audit` job installed
+  the same day), so the earliest graduation review is **2026-07-29** (14 days) and
+  only once **≥ 20 routed turns** have also accrued — whichever is later. Records the
+  day-0 smoke baseline and two go-live caveats **independent of the vault-QA route**:
+  the diet **extract** flakes to rung-2 under load (so the emergency diet
+  verify-queue/replay path stayed **unit-test-only**, never exercised by the live
+  outage drill), and the title one-shot exceeds its 20 s cap from qmd-MCP cold-start.
+  Documentation only — no behavior change.
+
 ## [Bridge 0.22.1] — 2026-07-19
 
 ### Changed

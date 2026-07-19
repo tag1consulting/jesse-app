@@ -1285,6 +1285,22 @@ Graduation itself, the daily audit installer (`com.example.jesse-vaultqa-audit`,
 the diet audit pattern), and probation operation are owned by the go-live process,
 not this code.
 
+**Probation status.** Vault-QA probation **started 2026-07-15** with the bridge
+`0.11.0` deploy (the `JESSE_VAULTQA_*` triple + `JESSE_METRICS_LOG` +
+`JESSE_EMERGENCY_LOCAL=on` were added to the launchd env and the daily
+`com.example.jesse-vaultqa-audit` job installed the same day). Earliest possible
+graduation review is therefore **2026-07-29** (14 days), and only once **≥ 20
+routed (gated) turns** have also accrued in the audit history — whichever is later.
+Day-0 baseline (deploy-day smoke turns, from `~/Library/Logs/jesse-metrics/`):
+routed-local vault-QA lookups verified with resolving citations, hosted synthesis
+correctly staying hosted, and the emergency ASK + circuit-breaker `local-first`
+paths exercised under a live network outage drill. Two go-live caveats logged the
+same day, **independent of the vault-QA route** (which met its criteria): (1) the
+diet **extract** child flakes to rung-2 under load, so the emergency **diet
+verify-queue/replay** path (which is only reached from a *successful* extract) was
+**not exercised live and remains unit-test-only**; (2) the title one-shot exceeds
+its 20 s cap from qmd-MCP cold-start. Neither is a vault-QA regression.
+
 ## Shadow comparison (`JESSE_SHADOW_*`)
 
 An **opt-in, side-effect-free** way to gather evidence for whether a second backend
