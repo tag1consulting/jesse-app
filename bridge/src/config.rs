@@ -287,6 +287,34 @@ pub struct Config {
     // writes, no `context.json`, no synthetic ids, no injected blocks. Default ON
     // follows the badge's default-on precedent because this repairs a live bug.
     pub context_carry: bool,
+    // Opt-in SHADOW-comparison backend override (env `JESSE_SHADOW_*`, same
+    // all-or-nothing `Option<(base_url, auth_token, model)>` triple as the vault-QA
+    // backend). When `Some`, a SAMPLED subset of eligible ask turns is mirrored —
+    // AFTER the hosted answer is delivered — to this backend through a contained
+    // read-only child, and both answers plus timing/usage are appended to the local
+    // shadow log for offline judging. Nothing about the delivered answer, its
+    // latency, its badge, or any production route changes. THE TRIPLE IS THE KILL
+    // SWITCH: unset any one var → `None` → not a single turn is mirrored,
+    // byte-for-byte today's behavior. The production intent is the gateway URL, the
+    // gateway token, and the `fw-glm` model alias (the bridge never carries a
+    // Fireworks credential — only the gateway URL + token). See [`shadow`].
+    pub shadow_backend: Option<(String, String, String)>,
+    // Percentage of ELIGIBLE ask turns mirrored to the shadow backend (env
+    // `JESSE_SHADOW_SAMPLE_PCT`, default 100, clamped to `[0, 100]`). The decision is
+    // per turn via a DETERMINISTIC hash of the turn id (`shadow_sampled`), so it is
+    // reproducible and never an RNG. 0 → nothing is mirrored even when armed; 100 →
+    // every eligible turn. Inert unless `shadow_backend` is set.
+    pub shadow_sample_pct: u8,
+    // Absolute path to the shadow pair log (env `JESSE_SHADOW_LOG`, default
+    // `~/Library/Logs/jesse-shadow/shadow.jsonl`, `~` expanded, parent created on
+    // first write). One JSON line per mirrored pair; created mode 0600 (it holds
+    // vault-derived answer text — it stays local and the bridge never sends it
+    // anywhere). Inert unless `shadow_backend` is set.
+    pub shadow_log: String,
+    // Wall-clock budget for one shadow child (env `JESSE_SHADOW_TIMEOUT_SECS`,
+    // default 120). A timeout records an INCOMPLETE pair and never retries. Inert
+    // unless `shadow_backend` is set.
+    pub shadow_timeout_secs: u64,
 }
 
 impl Config {
@@ -462,6 +490,61 @@ pub fn resolve_vaultqa_backend(
     }
 }
 
+/// Resolve the optional SHADOW-comparison backend override from its three
+/// env-derived parts. Identical all-or-nothing rule as [`resolve_vaultqa_backend`]:
+/// returns `Some((base_url, auth_token, model))` ONLY when all three are present;
+/// any partial combination resolves to `None` (shadow mode stays disarmed and no
+/// ask turn is ever mirrored). A partial config logs one startup warning so a
+/// half-configured deploy is visible rather than silently half-active. Pure except
+/// for that warning. THE TRIPLE IS THE KILL SWITCH: unset any one var and shadow is
+/// off, byte-for-byte today's behavior (unset all three → silent). The production
+/// intent is the gateway URL, the gateway token, and the `fw-glm` model alias.
+pub fn resolve_shadow_backend(
+    base_url: Option<String>,
+    auth_token: Option<String>,
+    model: Option<String>,
+) -> Option<(String, String, String)> {
+    match (base_url, auth_token, model) {
+        (Some(b), Some(t), Some(m)) => Some((b, t, m)),
+        (b, t, m) => {
+            let set = b.is_some() as u8 + t.is_some() as u8 + m.is_some() as u8;
+            if set > 0 {
+                eprintln!(
+                    "jesse-bridge: WARNING partial JESSE_SHADOW_* config ({set}/3 set) — shadow \
+                     comparison needs ALL of JESSE_SHADOW_BASE_URL, JESSE_SHADOW_AUTH_TOKEN, \
+                     JESSE_SHADOW_MODEL; treating as unset (no turn is mirrored)."
+                );
+            }
+            None
+        }
+    }
+}
+
+/// Clamp a shadow sample percentage into `[0, 100]`. Unset/unparseable falls back
+/// to the caller's default (100 = mirror every eligible turn); an out-of-range value
+/// saturates to the nearest bound rather than disabling sampling.
+pub fn clamp_sample_pct(raw: u64) -> u8 {
+    raw.min(100) as u8
+}
+
+/// Expand a leading `~` / `~/` in a path to `home` (the crate keeps `HOME` in
+/// `Config.home`, captured once at startup — there is no other tilde expansion in
+/// the crate, so this is the single definition). A bare `~` becomes `home`; `~/x`
+/// becomes `home/x`. Any other shape (absolute path, `~user`, empty home) is
+/// returned unchanged, so an already-absolute `JESSE_SHADOW_LOG` is untouched.
+pub fn expand_tilde(raw: &str, home: &str) -> String {
+    if home.is_empty() {
+        return raw.to_string();
+    }
+    if raw == "~" {
+        return home.to_string();
+    }
+    match raw.strip_prefix("~/") {
+        Some(rest) => format!("{home}/{rest}"),
+        None => raw.to_string(),
+    }
+}
+
 /// Parse `JESSE_MODEL_BADGE` into the `model_badge` flag. Default TRUE: only an
 /// explicit `off` / `0` / `false` / `no` disables the badge; anything else
 /// (including unset or a bare `on`) keeps it on. Mirrors the `JESSE_DIET_PROBATION`
@@ -613,6 +696,29 @@ impl Config {
             emergency_local: resolve_emergency_local(),
             // Context ledger (context carry); default ON (see `resolve_context_carry`).
             context_carry: resolve_context_carry(),
+            // All-or-nothing SHADOW-comparison backend override, same `env_string`
+            // (trimmed, empty-filtered) semantics as every other string field. Partial
+            // config logs one warning and resolves to None (see `resolve_shadow_backend`).
+            // Unset (the default) → None → shadow mode is disarmed and not a single ask
+            // turn is mirrored (the kill switch).
+            shadow_backend: resolve_shadow_backend(
+                env_string("JESSE_SHADOW_BASE_URL"),
+                env_string("JESSE_SHADOW_AUTH_TOKEN"),
+                env_string("JESSE_SHADOW_MODEL"),
+            ),
+            // Sample percentage of eligible ask turns to mirror; default 100, clamped
+            // to [0, 100]. An unset/unparseable value keeps the 100 default.
+            shadow_sample_pct: clamp_sample_pct(env_parse("JESSE_SHADOW_SAMPLE_PCT", 100)),
+            // Shadow pair log; `~` expanded against the captured HOME, default under
+            // `~/Library/Logs/jesse-shadow/`. Only ever written when shadow is armed.
+            shadow_log: expand_tilde(
+                &env_string("JESSE_SHADOW_LOG")
+                    .unwrap_or_else(|| "~/Library/Logs/jesse-shadow/shadow.jsonl".to_string()),
+                &home,
+            ),
+            // Shadow child wall-clock budget; default 120s. A timeout logs an
+            // incomplete pair and never retries.
+            shadow_timeout_secs: env_parse("JESSE_SHADOW_TIMEOUT_SECS", 120),
         }
     }
 }
@@ -1045,17 +1151,147 @@ mod tests {
     }
 
     #[test]
+    fn shadow_backend_resolves_only_when_all_three_present() {
+        let full = resolve_shadow_backend(
+            Some("https://gw.example".into()),
+            Some("gw-tok".into()),
+            Some("fw-glm".into()),
+        );
+        assert_eq!(
+            full,
+            Some((
+                "https://gw.example".to_string(),
+                "gw-tok".to_string(),
+                "fw-glm".to_string(),
+            ))
+        );
+        // Every partial combination (1 or 2 of 3 set) resolves to None — the kill
+        // switch: unset any one var and not a single turn is mirrored.
+        let s = || Some("x".to_string());
+        let partials = [
+            (s(), s(), None),
+            (s(), None, s()),
+            (None, s(), s()),
+            (s(), None, None),
+            (None, s(), None),
+            (None, None, s()),
+            (None, None, None),
+        ];
+        for (b, t, m) in partials {
+            assert_eq!(
+                resolve_shadow_backend(b, t, m),
+                None,
+                "partial shadow config must resolve to None (treated as unset)"
+            );
+        }
+    }
+
+    #[test]
+    fn shadow_sample_pct_clamps_to_0_100() {
+        assert_eq!(clamp_sample_pct(0), 0);
+        assert_eq!(clamp_sample_pct(50), 50);
+        assert_eq!(clamp_sample_pct(100), 100);
+        // Over-range saturates to 100 rather than disabling sampling.
+        assert_eq!(clamp_sample_pct(101), 100);
+        assert_eq!(clamp_sample_pct(1_000_000), 100);
+    }
+
+    #[test]
+    fn expand_tilde_expands_leading_home_only() {
+        assert_eq!(expand_tilde("~", "/Users/j"), "/Users/j");
+        assert_eq!(
+            expand_tilde("~/Library/Logs/x.jsonl", "/Users/j"),
+            "/Users/j/Library/Logs/x.jsonl"
+        );
+        // An already-absolute path is untouched, as is a `~user` form.
+        assert_eq!(expand_tilde("/var/log/x", "/Users/j"), "/var/log/x");
+        assert_eq!(expand_tilde("~bob/x", "/Users/j"), "~bob/x");
+        // Empty HOME leaves the value verbatim (no bare-"/…" default).
+        assert_eq!(expand_tilde("~/x", ""), "~/x");
+    }
+
+    #[test]
+    fn config_from_env_shadow_all_or_nothing_and_knobs() {
+        let _g = ENV_LOCK.lock_ok();
+        let keys = [
+            "JESSE_SHADOW_BASE_URL",
+            "JESSE_SHADOW_AUTH_TOKEN",
+            "JESSE_SHADOW_MODEL",
+            "JESSE_SHADOW_SAMPLE_PCT",
+            "JESSE_SHADOW_LOG",
+            "JESSE_SHADOW_TIMEOUT_SECS",
+        ];
+        let saved: Vec<(&str, Option<String>)> =
+            keys.iter().map(|k| (*k, std::env::var(k).ok())).collect();
+        for k in &keys {
+            std::env::remove_var(k);
+        }
+
+        // Unset by default → disarmed; knobs take their defaults.
+        let cfg = Config::from_env();
+        assert_eq!(cfg.shadow_backend, None);
+        assert_eq!(cfg.shadow_sample_pct, 100);
+        assert_eq!(cfg.shadow_timeout_secs, 120);
+        assert!(
+            cfg.shadow_log
+                .ends_with("/Library/Logs/jesse-shadow/shadow.jsonl"),
+            "default shadow log path expanded under HOME: {}",
+            cfg.shadow_log
+        );
+        assert!(!cfg.shadow_log.starts_with('~'), "the ~ must be expanded");
+
+        // All three set → armed triple; knobs honored + clamped.
+        std::env::set_var("JESSE_SHADOW_BASE_URL", "https://gw.example");
+        std::env::set_var("JESSE_SHADOW_AUTH_TOKEN", "gw-tok");
+        std::env::set_var("JESSE_SHADOW_MODEL", "fw-glm");
+        std::env::set_var("JESSE_SHADOW_SAMPLE_PCT", "250"); // clamps to 100
+        std::env::set_var("JESSE_SHADOW_TIMEOUT_SECS", "45");
+        std::env::set_var("JESSE_SHADOW_LOG", "/tmp/jesse-shadow-test/shadow.jsonl");
+        let cfg = Config::from_env();
+        assert_eq!(
+            cfg.shadow_backend,
+            Some((
+                "https://gw.example".to_string(),
+                "gw-tok".to_string(),
+                "fw-glm".to_string(),
+            ))
+        );
+        assert_eq!(cfg.shadow_sample_pct, 100);
+        assert_eq!(cfg.shadow_timeout_secs, 45);
+        assert_eq!(cfg.shadow_log, "/tmp/jesse-shadow-test/shadow.jsonl");
+
+        // Drop one → partial → None (treated as unset); a blank counts as unset.
+        std::env::remove_var("JESSE_SHADOW_MODEL");
+        assert_eq!(Config::from_env().shadow_backend, None);
+        std::env::set_var("JESSE_SHADOW_MODEL", "   ");
+        assert_eq!(Config::from_env().shadow_backend, None);
+
+        for (k, v) in saved {
+            match v {
+                Some(val) => std::env::set_var(k, val),
+                None => std::env::remove_var(k),
+            }
+        }
+    }
+
+    #[test]
     fn session_ttl_days_defaults_to_90_and_honors_env() {
         let _g = ENV_LOCK.lock_ok();
         let saved = std::env::var("JESSE_SESSION_TTL_DAYS").ok();
         std::env::remove_var("JESSE_SESSION_TTL_DAYS");
-        assert_eq!(Config::from_env().session_ttl_days, DEFAULT_SESSION_TTL_DAYS);
+        assert_eq!(
+            Config::from_env().session_ttl_days,
+            DEFAULT_SESSION_TTL_DAYS
+        );
         assert_eq!(DEFAULT_SESSION_TTL_DAYS, 90);
         std::env::set_var("JESSE_SESSION_TTL_DAYS", "30");
         assert_eq!(Config::from_env().session_ttl_days, 30);
         // Unparseable falls back to the default.
         std::env::set_var("JESSE_SESSION_TTL_DAYS", "nope");
-        assert_eq!(Config::from_env().session_ttl_days, DEFAULT_SESSION_TTL_DAYS);
+        assert_eq!(
+            Config::from_env().session_ttl_days,
+            DEFAULT_SESSION_TTL_DAYS
+        );
         match saved {
             Some(v) => std::env::set_var("JESSE_SESSION_TTL_DAYS", v),
             None => std::env::remove_var("JESSE_SESSION_TTL_DAYS"),

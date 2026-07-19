@@ -58,6 +58,16 @@ pub fn test_config() -> Config {
         // exact-`response`/`session_id` turn assertions predate it. Carry behavior is
         // covered by dedicated tests that enable it (the shipped default is ON).
         context_carry: false,
+        // Shadow comparison disarmed in the fixture (kill switch): no backend triple,
+        // so the integration router mirrors nothing and every path is byte-for-byte
+        // today's. Tests that exercise shadow set `shadow_backend`/`shadow_log`.
+        shadow_backend: None,
+        shadow_sample_pct: 100,
+        shadow_log: std::env::temp_dir()
+            .join("jesse-shadow-itest.jsonl")
+            .to_string_lossy()
+            .into_owned(),
+        shadow_timeout_secs: 120,
     }
 }
 pub fn test_state() -> AppState {

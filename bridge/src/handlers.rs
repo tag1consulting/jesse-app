@@ -503,6 +503,13 @@ pub async fn jesse(
     // completion, so off-app corrections ride this turn's terminal result.
     let meal_corrections = st.meal_corrections.clone();
     let clock = clock.clone();
+    // Shadow comparison (JESSE_SHADOW_*): the concurrency semaphore + queue (to yield to
+    // a live/queued phone turn) and the at-most-one shadow slot. All three are Arcs;
+    // entirely inert unless `cfg.shadow_backend` is set — with shadow disarmed nothing
+    // below reads them and every path is byte-for-byte today's behavior.
+    let shadow_sem = st.sem.clone();
+    let shadow_queue = st.queue.clone();
+    let shadow_slot = st.shadow_slot.clone();
     let handle = tokio::spawn(async move {
         // Hold the scratch dir for the whole turn; its Drop removes the decoded
         // attachment files when the task ends — success, error, or timeout. The
@@ -864,6 +871,27 @@ pub async fn jesse(
             hosted_model.as_deref(),
             m_citations_unverified,
         );
+        // Shadow comparison (JESSE_SHADOW_*): capture the eligible turn's inputs from
+        // the PRE-BADGE outcome so a later mirror is judged on the same answer text the
+        // model produced (the badge is bridge-added provenance the shadow answer never
+        // carries). This only READS the outcome; it never blocks or alters the delivered
+        // reply. `None` whenever shadow is disarmed or the turn is ineligible/unsampled
+        // (the common case) — so the delivery path below stays byte-for-byte unchanged.
+        let shadow_job = match &outcome {
+            Ok((text, _, _))
+                if shadow_eligible(&cfg, &mode, route, had_attachments, true, text, &jid) =>
+            {
+                Some(ShadowJob {
+                    turn_id: jid.clone(),
+                    question: raw_text.clone(),
+                    prompt: hosted_prompt.clone(),
+                    hosted_text: text.clone(),
+                    hosted_wall_ms: turn_start.elapsed().as_millis() as u64,
+                })
+            }
+            _ => None,
+        };
+
         // Finalize the delivered reply: append the model badge (display only) at this
         // single point, so BOTH the poll result and the SSE `done` frame carry it.
         let outcome = finalize_reply_badge(outcome, &cfg, badge_source, hosted_model.as_deref());
@@ -950,6 +978,25 @@ pub async fn jesse(
         // can't outlive the runtime on shutdown; it adds only ~one HTTP round-trip
         // to a turn that already finished.
         notify_if_complete(apns.as_deref(), &devices, &notify, &jobs, &jid).await;
+
+        // Shadow comparison (JESSE_SHADOW_*): mirror this delivered ask on a DETACHED,
+        // permit-free task — the LAST thing the turn does. Drop the production permit
+        // FIRST (only when actually mirroring) so the shadow can never occupy it or
+        // delay a queued phone turn, and so `production_busy` reads the true state
+        // rather than this turn's own permit. Never awaited: the reply is already
+        // stored and pushed, so the shadow can't affect the real turn's state or the
+        // phone. `None` (disarmed/ineligible/unsampled — the common case) leaves this a
+        // no-op and the permit drops at task end exactly as before.
+        if let Some(job) = shadow_job {
+            drop(_permit);
+            spawn_shadow(
+                cfg.clone(),
+                shadow_sem.clone(),
+                shadow_queue.clone(),
+                shadow_slot.clone(),
+                job,
+            );
+        }
     });
 
     // Store the task's abort handle so `POST /jesse/cancel/{id}` can stop it.
@@ -1208,7 +1255,10 @@ pub fn app(state: AppState) -> Router {
         .route("/jesse/prompts", get(jesse_prompts))
         .route("/jesse/diet", get(jesse_diet))
         .route("/jesse/sessions", get(jesse_sessions))
-        .route("/jesse/session/:session_id", axum::routing::delete(jesse_session_delete))
+        .route(
+            "/jesse/session/:session_id",
+            axum::routing::delete(jesse_session_delete),
+        )
         .route("/jesse/title", post(jesse_title))
         .route("/jesse/meal-corrections", post(jesse_meal_corrections))
         .route("/jesse/result/:job_id", get(jesse_result))
