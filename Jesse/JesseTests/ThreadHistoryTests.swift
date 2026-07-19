@@ -2,6 +2,7 @@ import XCTest
 import SwiftData
 @testable import Jesse
 
+@MainActor
 final class ThreadHistoryTests: XCTestCase {
 
     // MARK: - Wire contract: POST /jesse body decoding

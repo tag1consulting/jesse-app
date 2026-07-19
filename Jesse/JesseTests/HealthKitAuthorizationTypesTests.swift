@@ -13,6 +13,7 @@ import HealthKit
 /// (`HealthKitMealWriter.shareTypes`, `HealthContextProvider.readTypes`) so the
 /// mistake is caught at its own layer — the real `requestAuthorization` is
 /// unexercisable in the sandbox and only ever failed on device.
+@MainActor
 final class HealthKitAuthorizationTypesTests: XCTestCase {
 
     /// The share (write) set is EXACTLY the eleven dietary quantity types a meal may

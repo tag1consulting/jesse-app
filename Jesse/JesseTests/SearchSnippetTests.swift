@@ -4,6 +4,7 @@ import XCTest
 // Pure tests for `searchSnippet(for:queries:)` — the windowed, highlighted excerpt
 // shown on a row while a search is active. No UI: the snippet is a plain value
 // (text + highlight ranges), asserted directly.
+@MainActor
 final class SearchSnippetTests: XCTestCase {
 
     private func thread(title: String, turns: [(TurnRole, String)]) -> JesseThread {

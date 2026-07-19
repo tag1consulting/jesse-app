@@ -15,6 +15,35 @@ CI both run it). See the "Versioning" section of `bridge/README.md`.
 
 ## [Unreleased]
 
+## [App 1.0 (54)] — 2026-07-18
+
+### Changed
+- **Migrated the app to the Swift 6 language mode.** Every target
+  (`Jesse`, `JesseTests`, `Jesse Watch App`, `Jesse Watch AppTests`,
+  `JesseWidgetsExtension`) now builds under `SWIFT_VERSION = 6.0`, with every
+  resulting concurrency diagnostic fixed at the root cause rather than
+  suppressed. The module was already main-actor-isolated by default, so the
+  work concentrated at the async boundaries:
+  - `JesseClientProtocol` is now `Sendable` (the coordinator races a turn's
+    stream and poll in two concurrent child tasks, so the client existential
+    crosses into them); `JesseConfig` gains `Sendable` to match.
+  - `Ask/Tell/WakeJesseIntent` metadata and `VersionedSchema.versionIdentifier`
+    become `static let` (immutable, satisfy the get-only requirements) instead
+    of nonisolated mutable global state.
+  - `OrderedTurnsMemo` is `nonisolated` to match the `@Model`-generated
+    accessors that touch it; `WatchConnectivityClient` decodes on the delegate
+    thread and hops only the `Sendable` `WatchReply` to the main actor; the
+    background-task expiration handler is `@MainActor @Sendable`.
+  - A few genuinely-safe SDK interop points (ActivityKit's non-`Sendable`
+    `Activity` handed to its own `@concurrent` update/end, `AVCaptureSession`
+    started off-main) use `nonisolated(unsafe)` with a comment explaining why
+    each is safe by the framework's own contract.
+  - The test targets stay nonisolated-by-default (a default-main-actor test
+    module collides with XCTest's nonisolated base class); test classes that
+    drive main-actor app code are marked `@MainActor`, which is accurate since
+    XCTest runs them on the main thread.
+  No behavior change — a build-system and concurrency-correctness migration only.
+
 ## [App 1.0 (53)] — 2026-07-18
 
 ### Added

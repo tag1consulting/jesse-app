@@ -6,6 +6,7 @@ import XCTest
 // carb-load flips, fiber suspension, the dayStyle→dayType fallback, the 4pm gate,
 // totals, and chronological sorting.
 
+@MainActor
 final class DietSemanticsTests: XCTestCase {
     typealias S = DietSemantics
 

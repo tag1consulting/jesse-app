@@ -6,6 +6,7 @@ import XCTest
 // failed refresh AFTER a good load never blanks the screen (stays `.content`, with
 // `refreshError` set for the subtle stamp).
 
+@MainActor
 final class HealthDashboardModelTests: XCTestCase {
 
     /// A fake whose `fetchDietSnapshot` returns scripted results in order (the last

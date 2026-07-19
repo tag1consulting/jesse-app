@@ -6,6 +6,7 @@ import XCTest
 // and never plotted. Coverage (known / logged days in window) rides alongside every
 // verdict. Deterministic — dates are fixtures, never `Date()`.
 
+@MainActor
 final class NutrientTrendsTests: XCTestCase {
     typealias N = NutrientTrends
 

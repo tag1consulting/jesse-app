@@ -6,6 +6,7 @@ import PDFKit
 /// Covers `AttachmentThumbnail` — the storage-optimized preview generator. Asserts
 /// the output is a downscaled JPEG (not the original bytes), capped at the max
 /// dimension, for both images and PDFs, and nil for junk.
+@MainActor
 final class AttachmentThumbnailTests: XCTestCase {
 
     // MARK: - Helpers

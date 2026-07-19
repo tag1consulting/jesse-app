@@ -6,6 +6,7 @@ import SwiftData
 /// included only when it carries content), the `GET /jesse/prompts` decode, the
 /// `PromptStore` override decision, and that `RunCoordinator` forwards the
 /// resolved override into `send` (including on a voice turn).
+@MainActor
 final class PromptOverrideTests: XCTestCase {
 
     // MARK: - makeRequest (POST /jesse shape — Codable)
@@ -115,8 +116,10 @@ final class PromptOverrideTests: XCTestCase {
         }
     }
 
-    override func setUp() { super.setUp(); clearPromptDefaults() }
-    override func tearDown() { clearPromptDefaults(); super.tearDown() }
+    // Async variants so the `@MainActor` case isn't synchronously sent into XCTest's
+    // nonisolated sync setUp/tearDown (Swift 6 sending check).
+    override func setUp() async throws { try await super.setUp(); clearPromptDefaults() }
+    override func tearDown() async throws { clearPromptDefaults(); try await super.tearDown() }
 
     func testOverrideNilWhenUntouched() {
         XCTAssertNil(PromptStore.wrapperOverride(for: .ask))
@@ -233,8 +236,8 @@ final class PromptOverrideTests: XCTestCase {
     }
 
     @MainActor
-    private func runSend(instructions: @escaping (JesseMode) -> String? = { _ in nil },
-                         floor: @escaping (JesseMode) -> String? = { _ in nil },
+    private func runSend(instructions: @escaping @MainActor (JesseMode) -> String? = { _ in nil },
+                         floor: @escaping @MainActor (JesseMode) -> String? = { _ in nil },
                          mode: JesseMode, voice: Bool) async throws -> CapturingClient {
         let context = try makeContext()
         let fake = CapturingClient()

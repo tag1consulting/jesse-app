@@ -5,6 +5,7 @@ import XCTest
 // Health-tab row renders. These lock the words in from one source: a future
 // regression back to "P"/"C"/"F"/"Fib" fails here, not on the device.
 
+@MainActor
 final class MacroLabelTests: XCTestCase {
 
     // MARK: - Canonical names

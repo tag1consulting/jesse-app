@@ -4,6 +4,7 @@ import XCTest
 /// The pure end-of-speech detector. Pins the start/stop/timeout boundaries with
 /// crafted metering samples — no audio hardware. `power` is dBFS: values at/above
 /// the threshold are "speech", below are "silence".
+@MainActor
 final class SilenceDetectorTests: XCTestCase {
 
     private let det = SilenceDetector(speechThreshold: -30, trailingSilence: 1.5, maxDuration: 12)

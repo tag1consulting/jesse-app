@@ -8,6 +8,7 @@ import SwiftData
 /// a real `RunCoordinator` + a real in-memory SwiftData store through the
 /// `JesseClientProtocol` seam (`.running` → poll `.done`), which the suite never
 /// had an end-to-end render guard for.
+@MainActor
 final class RunCoordinatorFinishTests: XCTestCase {
 
     /// A fake that outruns the grace window (so the coordinator persists a job and

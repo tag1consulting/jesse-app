@@ -6,6 +6,7 @@ import XCTest
 /// `threadListLayout` the view drives, mirroring `ThreadFoldersTests`. At least one
 /// case here fails if the filter ignores origin (see `testWatchScopeExcludesPhoneThread`
 /// / `testWatchScopeComposesWithSearch`).
+@MainActor
 final class ThreadOriginFilterTests: XCTestCase {
 
     private let calendar: Calendar = {

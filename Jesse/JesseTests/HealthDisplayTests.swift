@@ -5,6 +5,7 @@ import XCTest
 // same-day-vs-fallback resolution (BF/lean never carried forward), the
 // moving-average builder, and per-section availability.
 
+@MainActor
 final class HealthDisplayTests: XCTestCase {
 
     private var utc: Calendar {

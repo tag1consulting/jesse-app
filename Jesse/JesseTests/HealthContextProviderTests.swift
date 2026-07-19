@@ -8,6 +8,7 @@ import XCTest
 /// database inaccessible while the phone is locked" case), an overrun of the ~1.5s
 /// bound, and a normal empty gather all keep a turn sending; one failed metric never
 /// drops another.
+@MainActor
 final class HealthContextProviderTests: XCTestCase {
 
     private func swim() -> WorkoutSummary {
@@ -52,7 +53,10 @@ final class HealthContextProviderTests: XCTestCase {
 
     func testSuccessfulFetchesPassThrough() async {
         var f = HealthMetricFetches.empty
-        f.workouts = { [self.swim()] }
+        // Build the (Sendable) workout on the main actor, then capture the value — the
+        // `@Sendable` fetch closure must not capture `self` (the non-Sendable test case).
+        let workout = swim()
+        f.workouts = { [workout] }
         f.restingHR = { 52 }
         let snap = await HealthContextProvider(fetches: f).snapshot()
         XCTAssertEqual(snap.workouts, [swim()])

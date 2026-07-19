@@ -7,6 +7,7 @@ import XCTest
 /// message kind round-trips cleanly through the `[String: Any]` WatchConnectivity
 /// carries, and that a malformed or oversized dictionary is REJECTED (nil), not
 /// crashed on.
+@MainActor
 final class WatchMessageCodecTests: XCTestCase {
 
     // MARK: - Round-trips

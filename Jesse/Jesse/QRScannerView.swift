@@ -101,9 +101,15 @@ final class ScannerViewController: UIViewController, AVCaptureMetadataOutputObje
         view.layer.addSublayer(layer)
         preview = layer
 
-        // Starting the session blocks; keep it off the main thread.
-        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-            self?.session.startRunning()
+        // Starting the session blocks, so Apple requires `startRunning()` off the main
+        // queue. `AVCaptureSession` is documented thread-safe and this instance is
+        // confined to this view controller — started exactly once here, stopped on the
+        // main actor (viewWillDisappear / first decode), which can't overlap this
+        // one-shot start. The SDK doesn't mark the class `Sendable`, so the capture is
+        // `nonisolated(unsafe)`: safe by AVFoundation's own threading contract.
+        nonisolated(unsafe) let session = self.session
+        DispatchQueue.global(qos: .userInitiated).async {
+            session.startRunning()
         }
     }
 

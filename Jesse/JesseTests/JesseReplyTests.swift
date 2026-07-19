@@ -1,6 +1,7 @@
 import XCTest
 @testable import Jesse
 
+@MainActor
 final class JesseReplyTests: XCTestCase {
 
     private func reply(_ text: String) -> JesseReply {

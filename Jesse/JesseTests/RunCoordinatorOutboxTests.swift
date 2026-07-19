@@ -10,6 +10,7 @@ import SwiftData
 /// POST that actually landed. These tests drive a real `RunCoordinator` + in-memory
 /// store through the client seam, asserting the whole stage → ACK/fail → retry →
 /// discard lifecycle and the app-killed-mid-POST reconcile.
+@MainActor
 final class RunCoordinatorOutboxTests: XCTestCase {
 
     /// A client scripted per `send` call, capturing the `request_id` and attachments

@@ -8,6 +8,7 @@ import UniformTypeIdentifiers
 /// oversized IMAGE attach by re-encoding it under the per-file cap, while leaving
 /// every under-cap input byte-verbatim (the PR #51 invariant) and every non-image
 /// to the existing caps. Driven by synthetic in-memory images; no asset or UI.
+@MainActor
 final class AttachmentDownscalerTests: XCTestCase {
 
     // MARK: - Under-cap inputs are never touched (byte-verbatim invariant)

@@ -40,19 +40,20 @@ final class TitleStubURLProtocol: URLProtocol {
 
 /// Counts `title` calls and returns a scripted result. All other protocol methods
 /// are inert stubs (the title path never drives a turn).
-final class TitleCountingClient: JesseClientProtocol, @unchecked Sendable {
-    private let lock = NSLock()
-    private var _titleCalls = 0
-    private var _lastDigest: String?
+// `@MainActor` (not a lock) so the call counters are isolated without `NSLock`,
+// whose `lock()`/`unlock()` are unavailable from async contexts under Swift 6. The
+// title path (`RunCoordinator` → `client.title(forDigest:)`) is driven on the main
+// actor, so a main-actor fake counts deterministically and is `Sendable` for free.
+@MainActor
+final class TitleCountingClient: JesseClientProtocol {
+    private(set) var titleCalls = 0
+    private(set) var lastDigest: String?
     private let scripted: String?
 
     init(returns scripted: String?) { self.scripted = scripted }
 
-    var titleCalls: Int { lock.lock(); defer { lock.unlock() }; return _titleCalls }
-    var lastDigest: String? { lock.lock(); defer { lock.unlock() }; return _lastDigest }
-
     func title(forDigest digest: String) async -> String? {
-        lock.lock(); _titleCalls += 1; _lastDigest = digest; lock.unlock()
+        titleCalls += 1; lastDigest = digest
         return scripted
     }
 
@@ -68,6 +69,7 @@ final class TitleCountingClient: JesseClientProtocol, @unchecked Sendable {
     }
 }
 
+@MainActor
 final class AITitleTests: XCTestCase {
 
     private let cfg = JesseConfig(host: "laptop", port: 8765, token: "tok")
