@@ -2144,11 +2144,12 @@ const FIX_TODAY_MINIMAL: &str = "window.DIET_TODAY = {\n\
   targets: { calories: 1900, protein: 180, fat: 60, carbs: 190 },\n\
 };\n";
 
-// Full progress fixture: the new `targets` array (dated, undated with date:null,
-// undated with the key omitted, and an achieved past-dated goal) ALONGSIDE the
-// legacy race/maint fields, which stay during the transition. All values invented.
+// Full progress fixture: the `targets` array (dated, undated with date:null,
+// undated with the key omitted, and an achieved past-dated goal) is the sole
+// weight-goal wire contract now that the generator no longer emits the legacy
+// raceTarget/raceDate/maintTarget fields. All values invented.
 const FIX_PROGRESS: &str = "window.DIET_PROGRESS = {\n\
-  startWeight: 204, raceTarget: 165, maintTarget: 180, raceDate: '2026-10-11',\n\
+  startWeight: 204,\n\
   troughPace: 1.4, rawPace: 1.1, fatPace: 0.9, leanPace: 0.2, paceScale: 2.0, leanScale: 1.0,\n\
   paceZone: 'good', fatZone: 'good', leanZone: 'good', barColor: '#4caf50',\n\
   raceBarFilled: 0.62, maintBarFilled: 0.88,\n\
@@ -2165,10 +2166,12 @@ const FIX_PROGRESS: &str = "window.DIET_PROGRESS = {\n\
   ],\n\
 };\n";
 
-// A legacy-only progress fixture (no `targets` key at all): a pre-rollout generator.
-// Must still parse and serve, with the legacy fields intact and `targets` absent.
+// A pre-array progress fixture with no `targets` key at all: a pre-rollout
+// generator (or a stale cached file). Must still parse and serve 200 with
+// `targets` simply absent — the app synthesizes goals locally, so bridge/app
+// deploy order stays independent of the generator rollout.
 const FIX_PROGRESS_LEGACY: &str = "window.DIET_PROGRESS = {\n\
-  startWeight: 204, raceTarget: 165, maintTarget: 180, raceDate: '2026-10-11',\n\
+  startWeight: 204,\n\
   raceBarFilled: 0.62, maintBarFilled: 0.88,\n\
   raceBarLabel: '24 of 39 lb', maintBarLabel: '21 of 24 lb',\n\
   trajectory: 'On track for the race target.',\n\
@@ -2269,13 +2272,7 @@ async fn diet_happy_path_returns_full_normalized_snapshot() {
     assert_eq!(body["progress"]["raceBarLabel"], "24 of 39 lb");
     assert_eq!(body["progress"]["paceZone"], "good");
 
-    // Legacy race/maint fields still pass through while present (real data keeps
-    // them during the transition).
-    assert_eq!(body["progress"]["raceTarget"], 165);
-    assert_eq!(body["progress"]["raceDate"], "2026-10-11");
-    assert_eq!(body["progress"]["maintTarget"], 180);
-
-    // targets: the new array flows through the generic pass-through field-for-field,
+    // targets: the array flows through the generic pass-through field-for-field,
     // order preserved, nulls and omitted keys intact.
     let targets = body["progress"]["targets"].as_array().unwrap();
     assert_eq!(targets.len(), 4, "four goals in declared order");
@@ -2498,8 +2495,8 @@ async fn diet_section_isolation_bad_progress_still_200() {
 #[tokio::test]
 async fn diet_legacy_progress_without_targets_still_serves() {
     // A pre-rollout generator emits no `targets` key. The endpoint must 200, the
-    // legacy race/maint fields pass through, and `targets` is simply absent — the
-    // app synthesizes it locally, so deploy order is independent of the rollout.
+    // progress block passes through, and `targets` is simply absent — the app
+    // synthesizes goals locally, so deploy order is independent of the rollout.
     let vault = make_diet_vault();
     write_vault_file(&vault, "todo-list/diet-today.js", FIX_TODAY);
     write_vault_file(&vault, "todo-list/diet-progress.js", FIX_PROGRESS_LEGACY);
@@ -2514,8 +2511,7 @@ async fn diet_legacy_progress_without_targets_still_serves() {
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
     let body: Value = serde_json::from_str(&body_string(resp).await).unwrap();
-    assert_eq!(body["progress"]["raceTarget"], 165, "legacy fields intact");
-    assert_eq!(body["progress"]["maintTarget"], 180);
+    assert_eq!(body["progress"]["startWeight"], 204, "progress passes through");
     assert!(
         body["progress"].get("targets").is_none(),
         "no targets key on legacy data"
