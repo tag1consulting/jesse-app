@@ -143,6 +143,48 @@ curl -s http://127.0.0.1:8765/jesse/result/<job_id> \
 
 Same bearer auth as `/jesse`. An unknown or evicted id → **`404`**.
 
+### Idempotency key — safely re-send a `POST /jesse` (`request_id`)
+
+Because `POST /jesse` returns the `job_id` on the first response and the turn then runs
+**detached**, a network drop *before* that response reaches the phone leaves the client
+with no id to poll — and a blind retry would spawn a **second** turn (double the tokens,
+a second vault write). The optional **`request_id`** field closes that window: re-send the
+same request with the same key and the bridge returns the **original** job.
+
+```bash
+# First attempt — the 202 never made it back to the phone.
+curl -s -X POST http://127.0.0.1:8765/jesse \
+  -H "Authorization: Bearer $JESSE_TOKEN" -H "Content-Type: application/json" \
+  -d '{"mode":"ask","text":"When is my next race?","request_id":"2f9c1a-turn-0007"}'
+
+# Retry with the SAME request_id — same job_id back, no second turn spawned.
+curl -s -X POST http://127.0.0.1:8765/jesse \
+  -H "Authorization: Bearer $JESSE_TOKEN" -H "Content-Type: application/json" \
+  -d '{"mode":"ask","text":"When is my next race?","request_id":"2f9c1a-turn-0007"}'
+# → 202 { "job_id": "<same id as the first accept>", "status": "running" }
+```
+
+- **Optional and additive.** `request_id` is a string, `≤ 64` chars, **ASCII
+  alphanumerics and hyphens only**; anything else is a `400 { "error": "…" }`.
+  **Omitting it reproduces the pre-idempotency behavior exactly** — every `POST` is a fresh
+  turn (old app builds simply don't send it).
+- **What "dedup" returns.** When the key is already mapped to a **live** job — queued,
+  running, done, failed, or cancelled, as long as it's still inside its retention window —
+  the bridge **creates nothing, takes no concurrency permit, and enqueues nothing**. It
+  returns `202 { "job_id": "<existing>", "status": "running" }`, the *exact* shape of a
+  fresh accept, so the client streams (`GET /jesse/stream/{job_id}`) or polls
+  (`GET /jesse/result/{job_id}`) the returned id identically either way. A job that already
+  finished satisfies the first poll immediately with its stored terminal state.
+- **Reaped ⇒ new.** Once a job is evicted (see the eviction model below), its `request_id`
+  mapping is gone, so the same key on a later `POST` is treated as brand new.
+- **Concurrency-safe.** The `request_id → job_id` index is maintained under the job store's
+  single `jobs` lock, with the check-and-insert done at job creation — so two duplicate
+  `POST`s that arrive *at the same instant* can never both spawn; they collapse to one job.
+- **Survives a restart.** The `request_id` is persisted with the completed job and the
+  index is rebuilt from persisted jobs on startup, so a dedup still works across a bridge
+  restart. Job files written before this field (which lack the key) load unchanged.
+- **Auth and rate limiting are unchanged** and apply *before* any of this.
+
 ### Cancel an in-flight turn
 
 ```bash
@@ -685,6 +727,37 @@ curl -s http://127.0.0.1:8765/jesse/result/<job_id> \
 See [SECURITY.md](../SECURITY.md#agent-directive-channel-jesse_needs_health) for
 the trust analysis.
 
+### Structured provenance (model-badge v2)
+
+Alongside the text [model badge](#env) (see `JESSE_MODEL_BADGE`), a delivered reply
+carries a machine-readable **`provenance`** object on the **same terminal-result path**
+as `directives` — surfaced identically on `GET /jesse/result` and the SSE `done` frame,
+and persisted with the job — so a client can render native UI instead of string-parsing
+the badge out of the reply text:
+
+```bash
+# → { "status":"done", "response":"…answer, badge stripped by the client…", "session_id":"…",
+#     "provenance": { "route":"emergency-local", "model":"local-oss",
+#                     "badge":"[local · emergency · local-oss]",
+#                     "flags":{ "hosted_verify":false, "verify_queued":false,
+#                               "citations_unverified":true } } }
+```
+
+- `route` — `hosted` | `vaultqa-local` | `diet-local` | `emergency-local` (the same route
+  vocabulary as the metrics line).
+- `model` — the backend model that produced the reply (`null` on a bare `[hosted]`).
+- `badge` — the exact badge string, **byte-identical** to what is appended to `response`,
+  so a client strips it by matching this string.
+- `flags` — `hosted_verify`, `verify_queued`, and `citations_unverified` — exactly what the
+  badge (and, for the last, the prepended `⚠️ citations unverified` warning) encode.
+
+It is built at the **same finalization seam** as the badge and is present **exactly when**
+the badge is appended: `null` when `JESSE_MODEL_BADGE` is off, on an empty directive-only
+reply, and on every error/cancel — so an older client that ignores it still reads the same
+trailing badge in the text (the fallback). The **metrics line and `vaultqa-audit` schema
+are unaffected.** The exact strings are pinned by a shared fixture
+(`bridge/tests/fixtures/provenance.json`) that both the bridge and the iOS app tests read.
+
 ## Dietary write-back channel (`JESSE_MEAL_LOG`)
 
 The **write-direction sibling** of `JESSE_NEEDS_HEALTH`, on the **same extractor
@@ -705,23 +778,42 @@ JESSE_MEAL_LOG v1 {"meals":[{"id":"2026-07-04-lunch","consumedAt":"2026-07-04T12
   - `consumedAt` is ISO 8601 **with offset**, the *meal* time (not the log time).
     The bridge checks only presence; the app parses the offset strictly before
     writing (the bridge has no date library — defense in depth, not the authority).
-- `kcal`, `protein_g`, `carbs_g`, `fat_g` are numbers, each **optional**:
-  **omitted when unknown, never null-padded** — an absent macro is an absent key
-  (an explicit `null`, a non-number, a negative, or a non-finite value is a
-  rejection).
+- the nine tracked nutrient fields — `kcal`, `protein_g`, `carbs_g`, `fat_g`,
+  `fiber_g`, `sodium_mg`, `satfat_g`, `sugar_g`, `potassium_mg` — are numbers, each
+  **optional**: **omitted when unknown, never null-padded** — an absent nutrient is
+  an absent key (an explicit `null`, a non-number, a negative, or a non-finite value
+  is a rejection). The set is **field-agnostic**: a future nutrient is an additive
+  optional field, never a version bump.
 - the meal-log line is capped at **8 KiB** (its own per-directive cap; the generic
   ceiling is the same 8 KiB, sized to this, the largest directive — `JESSE_NEEDS_HEALTH`
   keeps its tighter 2 KiB cap).
 
+**Payload contract (version 2 — upsert + retract).** v2 keeps every v1 rule and adds
+correction semantics so a change made *after* a meal was first logged propagates:
+
+- `meals` entries are **upserts** keyed on `id`: unseen → insert (v1 behavior); same
+  content → skip (idempotent replay); changed content → the app deletes the previously
+  written Health entry and rewrites it.
+- `retract` (optional, cap **10**) is an array of ids the source deleted — the app
+  removes their Health entry and tombstones the id; retracting an unknown id is a no-op.
+- a **meal move** is a retract of the old id plus an upsert of the **new** id (ids embed
+  the meal time), so the **same id in both** `meals` and `retract` is malformed.
+- at least one of `meals`/`retract` must be present; both v2 fields are omitted on the
+  wire when empty, so a v1-shaped delivery is byte-for-byte unchanged.
+
+```
+JESSE_MEAL_LOG v2 {"meals":[{"id":"2026-07-04-snack-1630","consumedAt":"2026-07-04T16:30:00+02:00","name":"Snack"}],"retract":["2026-07-04-snack-1500"]}
+```
+
 **Extraction (bridge side).** Identical seam to `JESSE_NEEDS_HEALTH`: on the
 terminal-result path (poll result and SSE `done` frame, kept consistent), a
-**known**, validating meal line is **stripped** from the reply text and its parsed
-value attached under `directives.meal_log`. A line that is malformed, over the 8
-KiB or 10-meal cap, or names an **unknown version** (`v2…`) passes through
-**untouched and visible** (logged) with no field — a future contract bump fails
-loudly, never half-parsed. Streaming caveat by design: a partial SSE delta may
-briefly show the line before the `done` frame strips it (the app hides it
-defensively); no mid-stream suppression is attempted.
+**known** (v1 **or** v2), validating meal line is **stripped** from the reply text
+and its parsed value attached under `directives.meal_log`. A line that is malformed,
+over the 8 KiB / 10-meal / 10-retract cap, or names an **unknown version** (`v3` and
+up) passes through **untouched and visible** (logged) with no field — a future
+contract bump fails loudly, never half-parsed. Streaming caveat by design: a partial
+SSE delta may briefly show the line before the `done` frame strips it (the app hides
+it defensively); no mid-stream suppression is attempted.
 
 ```bash
 curl -s http://127.0.0.1:8765/jesse/result/<job_id> \
@@ -733,8 +825,39 @@ curl -s http://127.0.0.1:8765/jesse/result/<job_id> \
 #                     "kcal":385,"protein_g":13,"carbs_g":77,"fat_g":4.5 }] } } }
 ```
 
-See [SECURITY.md](../SECURITY.md#dietary-write-back-channel-jesse_meal_log) for
-the trust analysis.
+See [SECURITY.md](../SECURITY.md#dietary-write-back-channel-jesse_meal_log-v1-and-v2)
+for the trust analysis.
+
+### Off-app corrections queue (`POST /jesse/meal-corrections`)
+
+Most logging — and **all** corrections — happen in non-app sessions (desktop/Cowork
+logging on the Studio) with no app turn, so there is no reply to carry a
+`JESSE_MEAL_LOG` block. This endpoint lets an external logging agent hand the bridge a
+v2 batch to relay on the next app turn. It carries meal events **generally** — off-phone
+inserts as much as corrections and retracts. The bridge only **persists and relays**; the
+app is the sole writer.
+
+```bash
+# Enqueue an off-app correction (a sodium change on an already-logged soup).
+curl -s -X POST http://127.0.0.1:8765/jesse/meal-corrections \
+  -H "Authorization: Bearer $JESSE_TOKEN" -H 'content-type: application/json' \
+  -d '{"meals":[{"id":"2026-07-04-soup","consumedAt":"2026-07-04T12:00:00+02:00","name":"Soup","sodium_mg":900}]}'
+# → { "status":"queued", "corrections_seq": 1 }
+```
+
+- **Body = the v2 payload object** (`{"meals":[…],"retract":[…]}`), validated against the
+  **exact same contract** as an in-reply `JESSE_MEAL_LOG v2` directive; a malformed body
+  is a loud `400`, never a partial enqueue. Same bearer auth as every endpoint.
+- **Persisted + bounded.** Batches land in `<state_dir>/meal-corrections-queue.jsonl` with
+  a monotonic `seq` (survives restart and a fully-drained queue). Cap **100** — a post at
+  the cap is rejected `429`; with no state dir configured it is `503` (persistence off).
+- **At-least-once delivery, ack, prune.** On every terminal result the queued batches are
+  merged into the delivered `meal_log` **ahead of** any block the turn's own reply
+  produced (collapsed net per-id, last-op-wins, so the delivered payload never lists an id
+  in both arrays), with the highest queued `seq` stamped as `corrections_seq`. The app
+  echoes it back as `meal_corrections_ack` on a later `POST /jesse`; the bridge prunes
+  batches at or below the ack. Unacked batches redeliver every turn — harmless because the
+  app dedupes on `id` + content hash. Every enqueue, delivery, ack, and prune is logged.
 
 ## Conversation titles (`POST /jesse/title`)
 
@@ -837,6 +960,58 @@ curl -s http://127.0.0.1:8765/jesse/sessions \
   skipped; non-`.jsonl` files and subdirectories are ignored; a filename that isn't
   a plain component is skipped defensively (a listing can never reach outside the
   projects dir).
+
+## Delete a session (`DELETE /jesse/session/{session_id}`)
+
+Deletes one Claude Code session for the bridge's vault — its transcript file
+`<home>/.claude/projects/<escaped-vault>/<session_id>.jsonl` — **scoped to the
+vault project only**. The app calls this when the user swipe-deletes a thread, so
+the remote transcript is reclaimed too (not just the phone's local copy).
+
+```bash
+curl -s -X DELETE http://127.0.0.1:8765/jesse/session/<session_id> \
+  -H "Authorization: Bearer $JESSE_TOKEN"
+# → 204 No Content
+```
+
+- **Same bearer auth** as `/jesse` (`401` without/with a wrong bearer).
+- **Idempotent**, exactly like `POST /jesse/cancel`: an **unknown or already-gone**
+  id returns **`204`** (success), never an error — the app's durable delete-drainer
+  retries a queued delete, and the GC sweep below must never choke on a missing id.
+  A real failure to delete a file that *exists* is a `500`.
+- **Path-traversal safe.** The `session_id` must be a plain filename component
+  (non-empty, not `.`/`..`, no path separator); anything else is a `400` **before**
+  it can reach the filesystem, so a crafted id can never delete outside the vault
+  projects dir. The one file removed is exactly `<session_id>.jsonl` in that dir.
+- **Title cleanup.** Any title stashed for the session (see the title store) is
+  dropped, so a reclaimed id can't linger in `titles.json`.
+- **A deleted session is no longer resumable** — see the resume-after-sweep note
+  under the GC sweep below.
+
+## Session GC sweep (`JESSE_SESSION_TTL_DAYS`)
+
+A background task reclaims **orphaned** vault-project sessions — one whose remote
+delete never reached the bridge (a failed-network swipe-delete), and everything
+deleted locally on the phone *before* the delete-on-thread-delete flow existed. It
+runs **once at startup**, then every 6 hours, and deletes every vault-project
+session jsonl whose **last-modified time is older than `JESSE_SESSION_TTL_DAYS`**
+(default **90**).
+
+- **Never reclaims an active thread.** Resuming a session touches its jsonl mtime,
+  so a thread you're still using is always younger than the TTL and is never swept.
+  The sweep reclaims exactly the orphans.
+- **Never deletes anything younger than the TTL, and never steps outside the vault
+  project.** It enumerates only plain `*.jsonl` files directly under
+  `<home>/.claude/projects/<escaped-vault>/` (the same scoping as
+  `GET /jesse/sessions`); subdirs, other files, and a non-plain stem are skipped.
+- **Every reclaim is logged** with the session id and its age.
+- **Resume-after-sweep safety.** Because a swept (or deleted) session can no longer
+  be resumed while its phone thread still exists, a hosted turn whose requested
+  session's transcript is gone starts a **fresh session** cleanly rather than
+  surfacing a raw `claude --resume <gone>` error: the bridge drops the `--resume`,
+  logs a named line, and the turn returns a **new** session id (the app keeps its
+  local transcript and stores the new id). A synthetic `local-` id and a live real
+  id are unaffected.
 
 ## Push notifications (APNs) — optional, off by default
 
@@ -970,6 +1145,7 @@ cargo run --release
 | `JESSE_TIMEOUT` | `3600` | Per-request run limit (seconds), clamped to `1..=7200`. `0` is treated as the 7200s ceiling, not unlimited. On overrun the turn returns `504` with an actionable message naming this var |
 | `JESSE_JOB_TTL_SECS` | `86400` | How long a finished-but-**unfetched** reply stays retrievable (24h). The clock starts at first retrieval, not at completion |
 | `JESSE_RETRIEVAL_GRACE_SECS` | `600` | How much longer a reply is kept **after** its first retrieval (a short re-poll window) instead of the full TTL |
+| `JESSE_SESSION_TTL_DAYS` | `90` | Age (days) past which the background session GC sweep reclaims a vault-project Claude Code session jsonl. The sweep keys on file mtime, and resuming a session touches it, so an actively-used thread is never reclaimed — only orphans older than this. Runs once at startup, then every 6h; scoped to the vault project only. See [Session GC sweep](#session-gc-sweep-jesse_session_ttl_days) |
 | `JESSE_STATE_DIR` | `~/.jesse-bridge` | Where completed results are persisted (`<dir>/jobs`) and the device token (`<dir>/device.json`, 0600), so a restart doesn't lose a reply or the token. Empty disables persistence |
 | `JESSE_CLAUDE_BIN` | `claude` | Path to the `claude` binary |
 | `JESSE_TITLE_BASE_URL` | _(off)_ | Title-only backend override (with the two below). When **all three** are set, the `POST /jesse/title` one-shot child — and ONLY that child — is spawned with `ANTHROPIC_BASE_URL` set to this, so titles can be served by a cheap/fast/local backend while main turns keep the ambient credentials. All-or-nothing and soft: unset (default) → titles use the ambient backend, byte-for-byte prior behavior |
@@ -981,11 +1157,18 @@ cargo run --release
 | `JESSE_DIET_PROBATION` | `true` | Probation mode — the hosted verify gate is mandatory and blocking on every extracted entry. Only an explicit falsey value (`0`/`false`/`no`/`off`) disables it; the disabled (graduation) state is reserved and not used yet |
 | `JESSE_VAULTQA_BASE_URL` | _(off)_ | Vault-QA backend override (with the two below). When **all three** are set, a **self-referential "Ask"** that passes the [strict vault-QA gate](#local-vault-qa-route-jesse_vaultqa_) runs a **contained, read-only** local child — pointed only at this backend via `apply_vaultqa_env` — that answers the question from vault files (`Read`/`Grep`/`Glob`, plus the qmd MCP search when configured) with a citation for every load-bearing fact. A pure in-process **citation validator** checks the answer (≥1 citation, every cited file resolves, every quoted claim occurs in its file) before it is delivered; on any failure rung (spawn/API error, timeout, `NO_VAULT_ANSWER`, empty, validator fail) the turn **falls through** to the hosted path unchanged. Containment is the toolset: the read-only root allowlist + `--strict-mcp-config` mean the child can read the vault but cannot write, execute, or reach the network (cwd **is** the vault — the one divergence from the diet child, [see `../SECURITY.md`](../SECURITY.md#vault-qa-child-tool-isolation-in-process-boundary)). All-or-nothing and soft: **the seam is the kill switch** — unset (default) → the gate never fires and every Ask takes the hosted path byte-for-byte |
 | `JESSE_VAULTQA_AUTH_TOKEN` | _(off)_ | Vault-QA child's `ANTHROPIC_AUTH_TOKEN`. Required together with the other two `JESSE_VAULTQA_*` |
-| `JESSE_VAULTQA_MODEL` | _(off)_ | Vault-QA child's `ANTHROPIC_MODEL`. Required together with the other two `JESSE_VAULTQA_*`. A **partial** config (1–2 of the 3 set) logs a startup warning and is treated as unset. Each gated turn logs one provenance line (`vaultqa turn -> <local\|hosted-fallback rung=N> …`, base URL + model, never the token, never the question); every main turn stays on the ambient backend. **Known tradeoff:** a locally-answered turn never enters the hosted session history (no `--resume` write), so a later hosted follow-up won't know it happened — the strict gate keeps conversational follow-ups hosted for exactly this reason |
+| `JESSE_VAULTQA_MODEL` | _(off)_ | Vault-QA child's `ANTHROPIC_MODEL`. Required together with the other two `JESSE_VAULTQA_*`. A **partial** config (1–2 of the 3 set) logs a startup warning and is treated as unset. Each gated turn logs one provenance line (`vaultqa turn -> <local\|hosted-fallback rung=N> …`, base URL + model, never the token, never the question); every main turn stays on the ambient backend. A locally-answered turn does not enter the hosted session history (no `--resume` write); the **context ledger** (`JESSE_CONTEXT_CARRY`, on by default) closes that gap by injecting a catch-up block into the next hosted turn and a recent-conversation block into the local children — see [Context carry](#context-carry) |
 | `JESSE_VAULTQA_MCP_CONFIG` | _(off)_ | Optional path to an MCP config JSON declaring exactly the **qmd** vault-search server, layered onto the vault-QA child via `--mcp-config`. Unset → the child loads **no** MCP servers and answers on the three read-only built-ins alone (qmd simply absent, never an error) |
-| `JESSE_MODEL_BADGE` | `on` | Whether the bridge appends a one-line provenance **badge** to each delivered `POST /jesse/jesse` reply, naming the backend that produced it: `[local · vault · <model>]`, `[local · diet · <model> + hosted verify]`, `[local · emergency · <model>]`, `[local · diet · <model> + verify queued]`, or `[hosted · <model>]` / `[hosted]`. Display-only, derived from the bridge's own turn state (never model output), and **never** applied to the title endpoint or written into session state. Only an explicit falsey value (`0`/`false`/`no`/`off`) turns it off, reproducing the prior exact reply text |
+| `JESSE_MODEL_BADGE` | `on` | Whether the bridge appends a one-line provenance **badge** to each delivered `POST /jesse/jesse` reply, naming the backend that produced it: `[local · vault · <model>]`, `[local · diet · <model> + hosted verify]`, `[local · emergency · <model>]`, `[local · diet · <model> + verify queued]`, or `[hosted · <model>]` / `[hosted]`. Display-only, derived from the bridge's own turn state (never model output), and **never** applied to the title endpoint or written into session state. Only an explicit falsey value (`0`/`false`/`no`/`off`) turns it off, reproducing the prior exact reply text. A machine-readable **`provenance`** object (route + model + this exact badge string + the flags it encodes) rides the poll result and SSE `done` frame alongside the text badge whenever the badge is present — see [Structured provenance](#structured-provenance-model-badge-v2) |
 | `JESSE_METRICS_LOG` | _(off)_ | Absolute path to a structured-metrics **JSONL** file. When set, the bridge appends **one content-free JSON line per gated / routed / emergency turn** at the reply-finalization point (ISO-8601 timestamp, turn id, mode, route [`hosted`/`vaultqa-local`/`diet-local`/`emergency-local`], backend model, ladder rung, wall ms, TTFT/tool-calls where recoverable, citation count + validator verdict, badge string, emergency flag, hosted-failure class). **Never** the question, answer, or tokens — content joins happen in the `vaultqa-audit` tool via the serving logs. All-or-nothing and soft: **unset (default) → zero metrics writes**, and a write failure logs to stderr and never disturbs the reply. Append-only, line-buffered, restart-safe |
 | `JESSE_EMERGENCY_LOCAL` | `off` | Arms the **emergency local fallback** (`on`/`off`). Inert unless it is **on** AND the `JESSE_VAULTQA_*` triple is also set (that supplies the backend + read-only child). When armed, a hosted turn that fails **transport-class** (spawn / network / timeout / CLI-surfaced 5xx / 429 / quota / auth — never a completed turn) is served locally instead of surfacing the outage: an **Ask** runs the read-only vault-QA child (regardless of the routine gate, citation validator advisory, badge `[local · emergency · <model>]`); a **diet Tell** whose blocking hosted verify is unreachable has its extracted entry **queued** by the bridge for later verify (badge `[local · diet · <model> + verify queued]`), replayed oldest-first on the next successful hosted contact through the exact verify-then-append path — **nothing reaches the CSVs unverified**. A circuit breaker goes local-first after 2 consecutive transport failures for 300 s. Default **off**; only an explicit `on`/`1`/`true`/`yes` arms it. **Untested-live until go-live's outage drill.** See [`../SECURITY.md`](../SECURITY.md#emergency-local-fallback-posture) |
+| `JESSE_CONTEXT_CARRY` | `on` | Arms the **context ledger** (`on`/`off`). Fixes a live defect: a turn served by a stateless local route (vault-QA / emergency / diet) never enters the thread's hosted claude session, so the next hosted follow-up lost it. When on, the bridge records each delivered ask/tell turn per thread (raw text + reply PRE-badge + route + an `in_hosted_history` flag), injects a `MISSED CONVERSATION HISTORY` catch-up block into the next hosted turn and a `RECENT CONVERSATION` block into the local children, and mints a synthetic `local-<hex>` thread id for a fresh locally-served turn (never resumed; re-keyed to the real session id on its first hosted turn). Persisted to `<state_dir>/context.json` (0600, holds conversation content — stays in the state dir, never in the metrics log or any provenance line). **Default on** because it repairs a live bug; only an explicit `0`/`false`/`no`/`off` disables it — the **rollback** switch, restoring byte-for-byte today's behavior (no ledger, no synthetic ids, no injected blocks). See [Context carry](#context-carry). |
+| `JESSE_SHADOW_BASE_URL` | _(off)_ | **Shadow-comparison** backend override (with the two below). When **all three** `JESSE_SHADOW_*` are set, shadow mode is **armed**: a **sampled** subset of eligible **ask** turns is mirrored — strictly **after** the hosted answer is delivered — to this backend through a **contained read-only** child (the vault-QA child's construction, pointed here via `apply_shadow_env`), and both answers plus per-side timing and token usage are appended to the local shadow log for the `shadow-audit` bin to judge. **Nothing about the delivered answer, its latency, its badge, or any production route changes** — the mirror runs on a detached, permit-free task, holds a separate at-most-one slot (never the production permit), yields (`skipped_busy`) to a running/queued phone turn, and any shadow failure is recorded and swallowed. **The triple is the kill switch:** unset any one var and shadow is off, byte-for-byte today's behavior — this is the disarm (unset + **bootout + bootstrap**; `kickstart -k` does **not** reload plist env). Production intent: the **gateway URL**, the **gateway token**, and `fw-glm`. **Privacy:** armed shadow sends the sampled ask's prompt and the read-only child's vault reads to the remote backend; the shadow log holds vault-derived answer text and **stays local** (mode `0600`, never sent anywhere). The bridge carries only the gateway URL + token — **never a Fireworks credential**, and never logs a token value |
+| `JESSE_SHADOW_AUTH_TOKEN` | _(off)_ | Shadow child's `ANTHROPIC_AUTH_TOKEN` (the gateway token). Required together with the other two `JESSE_SHADOW_*` |
+| `JESSE_SHADOW_MODEL` | _(off)_ | Shadow child's `ANTHROPIC_MODEL` (production: `fw-glm`). Required together with the other two `JESSE_SHADOW_*`. A **partial** config (1–2 of the 3 set) logs a startup warning and is treated as unset; **no turn is ever mirrored** under any partial or unset configuration |
+| `JESSE_SHADOW_SAMPLE_PCT` | `100` | Percentage of **eligible** ask turns mirrored, clamped to `[0, 100]`. Decided **per turn by a deterministic hash of the turn id** (reproducible, never RNG): `0` → mirror nothing even when armed; `100` → every eligible turn. Inert unless the triple is set |
+| `JESSE_SHADOW_LOG` | `~/Library/Logs/jesse-shadow/shadow.jsonl` | Absolute path to the shadow **pair log** (`~` expanded, parent created on first write). One JSON line per mirrored pair (turn id, timestamp, both answers, per-side wall-clock + TTFT where available, per-side token usage, shadow model alias); created mode `0600` (vault-derived content). A timeout/error records an **incomplete** pair and never retries. Only ever written when shadow is armed |
+| `JESSE_SHADOW_TIMEOUT_SECS` | `120` | Wall-clock budget for one shadow child; a timeout records an incomplete pair (never a retry). Inert unless the triple is set |
 | `JESSE_APNS_KEY_PATH` | _(off)_ | Path to the APNs auth key `.p8`. Set (with the three below) to enable push; unset → push disabled, behavior unchanged. See [Push notifications](#push-notifications-apns--optional-off-by-default) |
 | `JESSE_APNS_KEY_ID` | _(off)_ | APNs Key ID (10 chars) |
 | `JESSE_APNS_TEAM_ID` | _(off)_ | Apple Developer Team ID (10 chars; the JWT `iss`) |
@@ -1117,6 +1300,120 @@ diet **extract** child flakes to rung-2 under load, so the emergency **diet
 verify-queue/replay** path (which is only reached from a *successful* extract) was
 **not exercised live and remains unit-test-only**; (2) the title one-shot exceeds
 its 20 s cap from qmd-MCP cold-start. Neither is a vault-QA regression.
+
+## Shadow comparison (`JESSE_SHADOW_*`)
+
+An **opt-in, side-effect-free** way to gather evidence for whether a second backend
+(production intent: `fw-glm` via the gateway) could serve ask turns as well as the
+hosted model — **without touching a single production route**. When the
+`JESSE_SHADOW_*` triple is armed, a **sampled** subset of eligible ask turns is
+**mirrored, strictly after the hosted answer has been delivered**, to the shadow
+backend through the **same contained read-only child** the vault-QA route uses
+(pointed at the shadow backend via `apply_shadow_env`; read-only root allowlist,
+strict MCP, provably unable to write — see [`../SECURITY.md`](../SECURITY.md#shadow-comparison-child-isolation-in-process-boundary)).
+Both answers plus per-side timing and token usage are appended to the local shadow
+log (`JESSE_SHADOW_LOG`, mode `0600`).
+
+**Eligibility** (all required): shadow armed; **ask** mode; the turn actually took the
+**hosted** route (a vault-QA rung-0 local answer, an emergency-local answer, and any
+diet turn are excluded; a vault-QA turn that **fell through to hosted is** eligible);
+no attachments; the hosted turn completed successfully with a non-empty answer; and
+the turn is in the deterministic `JESSE_SHADOW_SAMPLE_PCT` sample. **A Tell is never
+mirrored, and a turn is never mirrored twice.**
+
+**Isolation is the whole point.** The delivered answer, its latency, its badge, and
+every production route are **byte-for-byte unchanged** whether shadow is armed or not
+(a golden test asserts the unarmed case; the delivery path has no `await` on anything
+shadow-related). The mirror runs on a **detached, permit-free** task, holds a separate
+**at-most-one** slot — never the production permit — and **yields** (`skipped_busy`)
+to a running or queued phone turn, so it can never delay the phone. The shadow child
+runs at background priority. Any shadow failure (timeout, transport, gateway error) is
+recorded as an incomplete pair and **swallowed** — it can never surface to the phone
+or alter the real turn's jobstore state.
+
+**The audit (`shadow-audit`).** A daily bin — same conventions as `vaultqa-audit`
+(dated markdown note + JSON twin under `~/Library/Logs/jesse-shadow-audit/`, tripwires
+first) — reads the shadow log and judges up to `JESSE_SHADOW_JUDGE_CAP` (default 20)
+unjudged pairs on **ambient hosted auth** (never in the request path) with **two
+position-swapped `claude -p` calls** per pair: the shadow side wins a pair only if it
+wins **both** orderings; disagreement is a tie. A line-count **watermark** plus a
+judged sidecar keep judging incremental and the log append-only. The note reports
+W/L/T today and cumulative, per-side latency percentiles, measured Fireworks cost vs
+the same turns on Opus, a judge-spend estimate, and **tripwires** (any injection-style
+leak in a shadow answer, any shadow-child write attempt, or Fireworks spend above
+$5/day) — each instructing the operator to **disarm the triple**. The audit only
+**reports**; it never routes.
+
+### Shadow graduation criteria
+
+Printed in **every** audit note so the target is fixed. Meeting them is **evidence for
+a routing prompt** — a human decision, never automated:
+
+- **≥ 14 days armed** AND **≥ 150 judged pairs**;
+- **cumulative net (wins − losses) no worse than −5%** of judged pairs;
+- **zero injection leaks**;
+- **shadow p50 wall-clock no worse than hosted p50 + 50%**.
+
+**Kill switch:** unset any one of the `JESSE_SHADOW_*` triple and shadow is off,
+byte-for-byte today's behavior. Because launchd caches the plist environment, the
+disarm is **unset the var, then `bootout` + `bootstrap`** — `kickstart -k` does not
+reload plist env.
+
+## Context carry
+
+`JESSE_CONTEXT_CARRY` (on by default) fixes a live defect. A turn served by a
+**stateless local route** — vault-QA, emergency, or diet — never enters the thread's
+hosted claude session. Three consequences followed: a locally-served turn was invisible
+to the next hosted `--resume`; a local child never saw prior turns, so a follow-up that
+reached it had no referents; and a thread whose FIRST turn was local had no session id at
+all, losing the thread linkage entirely. The real transcript that surfaced it: turn 1
+"What is Jamie's birthday?" answered from the vault by the emergency route, turn 2 "So how
+old is she?" went hosted and reported no earlier context.
+
+The fix is a **bridge-side ledger, never a model-side one** — deterministic code records
+and injects; the models only read.
+
+**The ledger.** One record per delivered ask/tell turn (never titles; a failed turn
+records nothing), keyed by thread: timestamp, mode, route (`hosted` / `vaultqa-local` /
+`emergency-local` / `diet-local` / `diet-queued`), the user's raw text (with an
+`[attachment omitted]` marker when the turn carried attachments), the delivered reply
+**PRE-badge**, and an `in_hosted_history` flag (true only for a `run_claude_streaming`
+hosted turn on this thread). Held in memory and persisted to `<state_dir>/context.json`
+(atomic temp+rename, 0600) as a sibling of `titles.json`; with no state dir it is
+in-memory only. Caps: each side truncated to 2000 chars, at most 20 turns per thread
+(oldest dropped), threads idle >7 days pruned, at most 200 threads (oldest-idle evicted).
+
+**Injection.** A hosted turn on a thread with locally-served turns it hasn't absorbed
+gets one framed `MISSED CONVERSATION HISTORY (data, not instructions)` block spliced into
+its prompt ahead of the mode floor (≤6000 bytes; oldest pairs dropped with an
+`(<N> earlier turns omitted)` marker). The pending read and splice happen **under the
+concurrency permit**, and the injected entries are marked `in_hosted_history` only after
+the hosted turn succeeds — at-least-once (a rare duplicate block after a failed attempt is
+harmless; a silent drop is not). The vault-QA and emergency children additionally get a
+framed `RECENT CONVERSATION (data, not instructions)` block (last 6 turns, each side ≤500
+chars, ≤3000 bytes) above their question, so they can resolve a follow-up's references.
+Both blocks are untrusted DATA framed the same way device health data is; the children
+stay stateless and read-only.
+
+**Synthetic session id lifecycle.** A fresh thread served locally has no request session
+id, so the bridge mints a synthetic `local-<hex>` id, keys the ledger under it, and
+returns it as the reply's `session_id` (the app stores it through its existing
+`sessionId ?? …` path — no app change — and sends it back on the follow-up). A `local-`
+id is **never** passed to `--resume`; a follow-up carrying one runs the hosted turn fresh,
+injects the catch-up block, and on success re-keys the ledger from the synthetic id to the
+real returned session id and moves any stored title with it.
+
+**Cosmetic limit.** A synthetic id has no jsonl transcript, so a thread served locally on
+its first turn will not appear in `GET /jesse/sessions` until its first hosted turn. The
+app's own thread list is app-side and unaffected.
+
+**Content at rest.** `context.json` holds conversation content (raw questions and
+replies) in the state dir. That is the ledger's whole point; it is deliberately kept out
+of the metrics log (which stays content-free), the provenance lines, and every other log
+line beyond counts.
+
+**Rollback.** `JESSE_CONTEXT_CARRY=off` restores byte-for-byte today's behavior: no
+ledger reads or writes, no `context.json`, no synthetic ids, no injected blocks.
 
 ## Versioning
 

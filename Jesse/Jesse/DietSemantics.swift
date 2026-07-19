@@ -121,6 +121,26 @@ enum DietSemantics {
         return t
     }
 
+    // MARK: - Micronutrient aggregation (unknown ≠ zero)
+
+    /// Aggregate ONE optional per-item nutrient across a set of items, PRESERVING the
+    /// unknowns: the sum of only the items that carried a value, how many items were
+    /// unknown (absent value), and how many were known. This is deliberately NOT the
+    /// `total(of:)` path — a nil here is UNKNOWN, never coalesced to 0, so a partial
+    /// total is never passed off as complete.
+    static func micronutrientTotal(of items: [DietItem], _ value: (DietItem) -> Double?) -> MicronutrientTotal {
+        var knownSum = 0.0, known = 0, unknown = 0
+        for it in items {
+            if let v = value(it) { knownSum += v; known += 1 } else { unknown += 1 }
+        }
+        return MicronutrientTotal(knownSum: knownSum, unknownItemCount: unknown, knownItemCount: known)
+    }
+
+    /// The day's aggregate of one nutrient across every item in every meal.
+    static func micronutrientTotal(for meals: [DietMeal], _ value: (DietItem) -> Double?) -> MicronutrientTotal {
+        micronutrientTotal(of: meals.flatMap(\.items), value)
+    }
+
     /// Per-meal subtotal.
     static func subtotal(of meal: DietMeal) -> MacroTotals { total(of: meal.items) }
 
@@ -353,6 +373,80 @@ enum DietSemantics {
                           isCarbLoad: carbLoad)
     }
 
+    // MARK: - Micronutrient gauges
+
+    /// The micronutrient gauges for a day, in `Micronutrient.allCases` order. Each
+    /// preserves unknowns: any item without the value makes the total PARTIAL (`value` is
+    /// a floor, the view renders "≥"), and a day with zero known values is the neutral
+    /// "not tracked yet" state. Sodium and saturated fat are ceilings; potassium, calcium,
+    /// magnesium, and omega-3 are floors; total sugars and unsaturated fat are
+    /// informational (never judged); an absent target shows the value only, with no
+    /// judgment.
+    static func micronutrientGauges(for today: DietToday) -> [MetricGauge] {
+        Micronutrient.allCases.map { micronutrientGauge($0, meals: today.meals, targets: today.targets) }
+    }
+
+    /// Build one micronutrient gauge from the day's items and targets.
+    static func micronutrientGauge(_ n: Micronutrient, meals: [DietMeal], targets: DietTargets) -> MetricGauge {
+        let agg = micronutrientTotal(for: meals, n.value(in:))
+        let value = agg.knownSum
+        let target = n.target(in: targets)
+        let unit = n.unit
+
+        // Base gauge shared by every branch — value-only, no judgment. The branches
+        // below layer a status/remaining/goalStatus on top when there's a real target.
+        var g = MetricGauge(
+            label: n.displayName, goal: n.goal, value: value, target: target,
+            status: .suspended, remaining: "", goalStatus: .noGoal,
+            flag: nil, unit: unit, fraction: nil,
+            partial: agg.partial, unknownItemCount: agg.unknownItemCount,
+            knownItemCount: agg.knownItemCount)
+
+        // No item that day carried the nutrient → the neutral "not tracked yet" state,
+        // regardless of whether a target exists.
+        guard agg.tracked else {
+            g.remaining = notTrackedCaption
+            return g
+        }
+
+        // Total sugars is informational only: show the value (and a reference bar if a
+        // target is present) but NEVER a red/green judgment — modeled like suspended
+        // fiber.
+        if !n.judged {
+            g.fraction = fraction(value, target ?? 0)
+            g.remaining = target == nil ? "" : "reference \(fmt(target!))\(unit)"
+            return g
+        }
+
+        // Judged nutrients (ceiling / floor) need a usable target; without one they
+        // stay value-only.
+        guard let target, target > 0 else { return g }
+        g.fraction = fraction(value, target)
+        switch n.goal {
+        case .ceiling:
+            g.status = ceilingStatus(value: value, target: target)
+            g.remaining = ceilingRemaining(value: value, target: target, unit: unit)
+            g.goalStatus = ceilingGoalStatus(value: value, target: target)
+        case .floor:
+            g.status = floorStatus(value: value, target: target)
+            g.remaining = floorRemaining(value: value, target: target, unit: unit)
+            g.goalStatus = floorGoalStatus(value: value, target: target)
+        case .window:
+            break // not used by any micronutrient
+        }
+        return g
+    }
+
+    /// The neutral caption for a nutrient no item that day carried a value for.
+    static let notTrackedCaption = "not tracked yet"
+
+    /// The "N items not estimated" caption for a partial micronutrient total, or nil
+    /// when the total is complete (every contributing item carried the value).
+    static func partialCaption(unknownItemCount: Int) -> String? {
+        guard unknownItemCount > 0 else { return nil }
+        return "\(unknownItemCount) item\(unknownItemCount == 1 ? "" : "s") not estimated"
+    }
+
     // MARK: - Helpers
 
     /// A bar fill fraction (value / target), 0 when there's no usable target. Not
@@ -488,6 +582,155 @@ struct MacroTotals: Equatable, Sendable {
     }
 }
 
+/// A day's aggregate of one optional per-item nutrient, preserving unknowns: the sum
+/// of ONLY the items that carried a value, how many were unknown, and how many were
+/// known. Because a missing value is UNKNOWN (never 0), a total with any unknown
+/// contributor is PARTIAL (`knownSum` is a floor, not a complete sum), and a total
+/// with zero known contributors is the neutral "not tracked yet" state.
+struct MicronutrientTotal: Equatable, Sendable {
+    var knownSum: Double
+    var unknownItemCount: Int
+    var knownItemCount: Int
+
+    /// True when at least one contributing item lacked the value — `knownSum` is a
+    /// floor, and the view must render it "≥" with the "N items not estimated" caption.
+    var partial: Bool { unknownItemCount > 0 }
+    /// True when at least one item carried the value; false is the "not tracked yet"
+    /// state (distinct from a real zero).
+    var tracked: Bool { knownItemCount > 0 }
+}
+
+/// The micronutrients shown alongside the macros. The single source of truth for their
+/// user-facing display names — full, unabbreviated, spelled in one place so no view
+/// invents a short form (guarded by `MacroLabelTests`). Case order is the canonical
+/// display order (and drives the sub-entry order under a parent macro and the mineral
+/// order in the Micronutrients section — see `NutrientOrder`).
+///
+/// `unsaturatedFat` is DERIVED, not a stored field: its per-item value is `fat − saturated
+/// fat` for items whose saturated fat is KNOWN (an unknown-satf item makes the day
+/// partial, never zero). Like total sugars it is informational — a value only, never a
+/// red/green judgment (see `judged`).
+enum Micronutrient: CaseIterable {
+    case sodium, saturatedFat, unsaturatedFat, totalSugars, potassium, calcium, omega3, magnesium
+
+    /// The full, unabbreviated user-facing name — the ONLY place these are spelled.
+    var displayName: String {
+        switch self {
+        case .sodium: return "Sodium"
+        case .saturatedFat: return "Saturated Fat"
+        case .unsaturatedFat: return "Unsaturated Fat"
+        case .totalSugars: return "Total Sugars"
+        case .potassium: return "Potassium"
+        case .calcium: return "Calcium"
+        case .omega3: return "Omega-3 (EPA+DHA)"
+        case .magnesium: return "Magnesium"
+        }
+    }
+
+    /// The display unit: the minerals and omega-3 in milligrams, the fats and sugars in grams.
+    var unit: String {
+        switch self {
+        case .sodium, .potassium, .calcium, .omega3, .magnesium: return "mg"
+        case .saturatedFat, .unsaturatedFat, .totalSugars: return "g"
+        }
+    }
+
+    /// How the nutrient is judged: sodium and saturated fat are ceilings (don't exceed);
+    /// potassium, calcium, magnesium, and omega-3 are floors (reach them); total sugars
+    /// and unsaturated fat are informational (a directional glyph but NEVER a color
+    /// judgment — see `judged`). Unsaturated fat is the healthy fat, so it reads as a
+    /// floor glyph (≥) even though it carries no judgment.
+    var goal: DietSemantics.Goal {
+        switch self {
+        case .sodium, .saturatedFat: return .ceiling
+        case .totalSugars: return .ceiling
+        case .potassium, .calcium, .omega3, .magnesium, .unsaturatedFat: return .floor
+        }
+    }
+
+    /// Whether the nutrient carries a red/green judgment. Total sugars and unsaturated
+    /// fat are informational only — shown plain like suspended fiber, never judged.
+    var judged: Bool { self != .totalSugars && self != .unsaturatedFat }
+
+    /// This nutrient's per-item value (nil = unknown for that item). Unsaturated fat is
+    /// DERIVED — `fat − saturated fat`, but only for an item whose saturated fat is known;
+    /// an item with unknown saturated fat returns nil (unknown → partial, never zero).
+    func value(in item: DietItem) -> Double? {
+        switch self {
+        case .sodium: return item.na
+        case .saturatedFat: return item.satf
+        case .unsaturatedFat: return item.satf.map { (item.f ?? 0) - $0 }
+        case .totalSugars: return item.sug
+        case .potassium: return item.k
+        case .calcium: return item.ca
+        case .omega3: return item.o3
+        case .magnesium: return item.mg
+        }
+    }
+
+    /// This nutrient's day target, or nil when the day carries no reference for it.
+    /// Unsaturated fat is informational and derived — it never carries a target.
+    func target(in t: DietTargets) -> Double? {
+        switch self {
+        case .sodium: return t.sodium
+        case .saturatedFat: return t.satFat
+        case .unsaturatedFat: return nil
+        case .totalSugars: return t.sugar
+        case .potassium: return t.potassium
+        case .calcium: return t.calcium
+        case .omega3: return t.omega3
+        case .magnesium: return t.magnesium
+        }
+    }
+
+    /// The macro this micronutrient hangs off as a nutrition-label sub-entry, or nil for
+    /// a standalone entry. A food label declares "of which sugars" and "of which fibre"
+    /// under Carbohydrate and "of which saturates" under Fat, so total sugars renders as
+    /// a sub-entry of carbs (beside fiber), and saturated fat AND the derived unsaturated
+    /// fat as sub-entries of fat. Sodium, potassium, calcium, magnesium, and omega-3 have
+    /// no parent and stay in the Micronutrients section (omega-3 is a fat but, like the
+    /// minerals, is tracked as a standalone floor). Drives the sub-entry identity color,
+    /// the label type treatment, and the leading indent, exactly as `Macro.parent` does
+    /// for fiber.
+    var parent: Macro? {
+        switch self {
+        case .totalSugars: return .carbs
+        case .saturatedFat, .unsaturatedFat: return .fat
+        case .sodium, .potassium, .calcium, .omega3, .magnesium: return nil
+        }
+    }
+
+    /// True when this micronutrient renders as an indented sub-entry beneath a macro
+    /// (total sugars, saturated fat), rather than standalone in the Micronutrients section.
+    var isSubEntry: Bool { parent != nil }
+
+    /// A short, FIXED, plain-language teaching blurb — what the nutrient is and how to
+    /// read its gauge — surfaced subordinately in the drill-down sheet. Editorial copy,
+    /// deterministic and unit-tested, distinct from the streamed on-device insight (which
+    /// is about today's foods) and never a number. Ceiling vs floor vs informational is
+    /// stated correctly per nutrient; total sugars carries no judgment.
+    var education: String {
+        switch self {
+        case .sodium:
+            return "Sodium is the part of salt that pushes blood pressure up when it stays high over time — about 400 mg of it in every gram of salt. Stay under most days. A long or hot run sweats sodium out, so those days can run higher on purpose."
+        case .saturatedFat:
+            return "Saturated fat is just one slice of your total fat — a sub-budget with its own cap, not a limit on fat overall. The rest of your fat is fine: olive oil, fish, nuts, and egg yolks are unsaturated and can run high. Only this saturated slice has a ceiling to stay under."
+        case .potassium:
+            return "Potassium is the counterweight to sodium and helps pull blood pressure down. It's a floor to reach, not a limit. Labels often leave it out, so a low or \"not tracked yet\" reading usually means it couldn't be measured, not that you ate none — bananas, potatoes, beans, and salmon are loaded with it."
+        case .totalSugars:
+            return "This is every sugar in your food — the natural sugar in fruit, milk, and yogurt plus any added, all summed. Labels can't split the two, so there's no target here and no red or green. It's healthy from fruit and dairy; use the food list below to see whether it's those or added sugar worth trimming."
+        case .unsaturatedFat:
+            return "This is the rest of your fat once the saturated slice is set aside — the olive oil, nuts, avocado, and fish fats that are good for your heart. It's shown for composition only: no target, no red or green. A high number here just means most of your fat is the healthy kind."
+        case .calcium:
+            return "Calcium is a floor to reach, not a limit — it builds bone and keeps muscles and nerves firing. Dairy, fortified plant milks, tofu, and leafy greens carry most of it. Labels often leave it out, so a low or \"not tracked yet\" reading usually means it couldn't be measured, not that you ate none."
+        case .omega3:
+            return "Omega-3 here is the marine EPA and DHA in oily fish, shellfish, and roe — the heart- and brain-supporting fats, counted as a floor to reach. It does NOT include the plant ALA in flax, walnuts, or chia. Most foods leave it off the label, so a low or \"not tracked yet\" reading usually means it couldn't be measured."
+        case .magnesium:
+            return "Magnesium is a floor to reach, not a limit — it supports muscle and nerve function, blood sugar, and sleep. Nuts, seeds, beans, whole grains, and leafy greens are loaded with it. Labels often leave it out, so a low or \"not tracked yet\" reading usually means it couldn't be measured, not that you ate none."
+        }
+    }
+}
+
 /// The four macronutrients the Health tab tracks. The single source of truth for
 /// their user-facing display names — no view spells a macro out or abbreviates it
 /// on its own. There is no approved short form: never a single letter, never
@@ -525,6 +768,53 @@ enum Macro: CaseIterable {
     /// True when this macro renders as a sub-entry of another (currently fiber under
     /// carbs), rather than as one of the top-level peers.
     var isSubEntry: Bool { parent != nil }
+}
+
+/// One row in the nutrition-label nutrient tree: either a macro (protein, carbs, fiber,
+/// fat) or a micronutrient that hangs off a macro as a sub-entry (total sugars and
+/// saturated fat). The single type the Macros screen iterates, so a macro row and a
+/// micronutrient sub-entry row share one ordered sequence and one sub-entry treatment
+/// instead of two hand-kept lists.
+enum NutrientEntry: Equatable, Hashable {
+    case macro(Macro)
+    case micronutrient(Micronutrient)
+
+    /// Whether this row renders as an indented sub-entry of a parent macro — driven by
+    /// the same `parent`/`isSubEntry` model on both enums.
+    var isSubEntry: Bool {
+        switch self {
+        case .macro(let m): return m.isSubEntry
+        case .micronutrient(let n): return n.isSubEntry
+        }
+    }
+}
+
+/// The single canonical ordering of the nutrient tree, derived from the `parent` links
+/// on `Macro` and `Micronutrient` — no view hand-orders the rows. This is the one source
+/// the order tests assert against.
+enum NutrientOrder {
+    /// The macro area's rows in canonical nutrition-label order: each top-level macro
+    /// followed immediately by its sub-entries — macro sub-entries first (fiber), then
+    /// micronutrient sub-entries (total sugars, saturated fat). For the current tree that
+    /// is Protein, Carbs, Fiber, Total Sugars, Fat, Saturated Fat. Standalone minerals
+    /// (sodium, potassium) are NOT here — they live in the Micronutrients section.
+    static let macroArea: [NutrientEntry] = {
+        var out: [NutrientEntry] = []
+        for macro in Macro.allCases where macro.parent == nil {
+            out.append(.macro(macro))
+            for sub in Macro.allCases where sub.parent == macro {
+                out.append(.macro(sub))
+            }
+            for n in Micronutrient.allCases where n.parent == macro {
+                out.append(.micronutrient(n))
+            }
+        }
+        return out
+    }()
+
+    /// The standalone minerals shown in the Micronutrients section — the micronutrients
+    /// with no macro parent (sodium, potassium), in canonical order.
+    static let minerals: [Micronutrient] = Micronutrient.allCases.filter { $0.parent == nil }
 }
 
 /// Builds the labeled macro line shown under food-journal items, meal subtotals,
@@ -582,6 +872,16 @@ struct MetricGauge: Equatable, Sendable {
     var unit: String
     /// Bar fill fraction (value/target-ish), nil when there's no usable reference.
     var fraction: Double?
+    /// Micronutrient partiality (the five macro gauges leave these at the defaults,
+    /// their values being complete sums). `partial` is true when at least one
+    /// contributing item lacked a value, so `value` is a FLOOR — the view renders it
+    /// "≥value", never as a complete total. `unknownItemCount` drives the "N items not
+    /// estimated" caption. `knownItemCount` is nil for a non-micronutrient gauge; for a
+    /// micronutrient it's how many items carried the value, and a value of 0 is the
+    /// neutral "not tracked yet" state (distinct from a real zero).
+    var partial: Bool = false
+    var unknownItemCount: Int = 0
+    var knownItemCount: Int? = nil
 }
 
 /// The exercise carb add-back — extra carb budget earned by exercise, optional

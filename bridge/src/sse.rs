@@ -47,12 +47,14 @@ pub fn frame_to_event(frame: &StreamFrame) -> Event {
             response,
             session_id,
             directives,
+            provenance,
         } => sse_event(
             "done",
             json!({
                 "response": response,
                 "session_id": session_id,
                 "directives": directives_to_value(directives),
+                "provenance": provenance_to_value(provenance),
             }),
         ),
         StreamFrame::Error(error) => sse_event("error", json!({ "error": error })),
@@ -131,7 +133,12 @@ pub async fn jesse_stream(
         if let Some(name) = activity {
             let _ = tx.try_send(Ok(sse_event("activity", json!({ "name": name }))));
         }
-        tokio::spawn(forward_live_frames(brx, tx, st.jobs.clone(), job_id.clone()));
+        tokio::spawn(forward_live_frames(
+            brx,
+            tx,
+            st.jobs.clone(),
+            job_id.clone(),
+        ));
     } else {
         // No live stream — the job is already terminal (or never existed). Emit
         // the matching frame and close. `get_retrieving` so an already-`done`
@@ -141,6 +148,7 @@ pub async fn jesse_stream(
                 response,
                 session_id,
                 directives,
+                provenance,
             }) => {
                 let _ = tx.try_send(Ok(sse_reset(&response)));
                 let _ = tx.try_send(Ok(sse_event(
@@ -149,6 +157,7 @@ pub async fn jesse_stream(
                         "response": response,
                         "session_id": session_id,
                         "directives": directives_to_value(&directives),
+                        "provenance": provenance_to_value(&provenance),
                     }),
                 )));
             }
@@ -214,6 +223,7 @@ mod tests {
                 response: full.clone(),
                 session_id: None,
                 directives: None,
+                provenance: None,
             },
         );
 

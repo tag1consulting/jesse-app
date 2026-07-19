@@ -6,6 +6,7 @@ import SwiftData
 /// JESSE_NEEDS_HEALTH directive triggers ONE fulfillment retry (same text, same
 /// thread), the sentinel turn is never persisted, and a second directive on the
 /// retry's reply is ignored. Driven through `JesseClientProtocol` — no server.
+@MainActor
 final class HealthRetryTests: XCTestCase {
 
     /// A fake that answers the sentinel job with a needs-health directive and the
@@ -56,7 +57,7 @@ final class HealthRetryTests: XCTestCase {
     @MainActor
     private func makeContext() throws -> ModelContext {
         let container = try ModelContainer(
-            for: JesseThread.self, Turn.self,
+            for: JesseThread.self, Turn.self, OutboxItem.self, OutboxAttachment.self,
             configurations: ModelConfiguration(isStoredInMemoryOnly: true))
         return ModelContext(container)
     }

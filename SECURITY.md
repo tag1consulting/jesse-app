@@ -171,6 +171,44 @@ hosted path — a prompt-injected or hallucinating child cannot deliver an inven
 "fact from your vault." Injection text inside a vault file can at most cause a
 `NO_VAULT_ANSWER` / validator-fail fall-through, never an action.
 
+## Shadow-comparison child isolation (in-process boundary)
+
+The opt-in shadow-comparison route (`JESSE_SHADOW_*`, see the bridge README) mirrors a
+**sampled** ask turn — strictly **after** the hosted answer has been delivered — to a
+second backend to gather offline evidence. Its child is the **same stateless,
+single-shot, READ-ONLY** child the vault-QA route uses: `build_shadow_child_command`
+delegates to `build_vaultqa_child_command`, so the shadow child is launched with the
+identical `--tools "Read,Grep,Glob"` root allowlist, `--strict-mcp-config` +
+empty/qmd `--mcp-config`, and the documented denylist. The **only** difference is the
+backend it is pointed at: `apply_shadow_env` sets `ANTHROPIC_BASE_URL` /
+`ANTHROPIC_AUTH_TOKEN` / `ANTHROPIC_MODEL` **on the child only**, keyed off
+`cfg.shadow_backend` (the gateway URL + gateway token + `fw-glm`). So the shadow child
+can **read** the vault to answer but cannot write, execute a shell, reach the network
+directly, spawn a subagent, or load an unlisted MCP tool — the same guarantee the
+vault-QA child gets, proven by the same write-refusal assertions
+(`shadow_child_is_read_only_and_cannot_write`).
+
+**A write capability reaching it is a test failure, not a runtime surprise.** Beyond
+the containment, the shadow runner watches the child's stream for any non-read tool
+use and records a `write_attempt` canary on the pair; the daily `shadow-audit` fires a
+**disarm tripwire** on any such attempt (and on any injection-style leak in a shadow
+answer). Because the child is read-only, at worst it emits text — which is never
+delivered to the phone, only logged locally for offline judging.
+
+**Secrets.** The bridge carries only the **gateway URL and gateway token** — never a
+Fireworks credential — and it **never logs a token value**. The shadow log holds
+vault-derived answer text, so it is created **mode 0600** and the bridge never sends it
+anywhere; only the `shadow-audit` bin reads it, and its judge calls run on **ambient**
+hosted auth, never with the shadow env, and never in the request path.
+
+**Isolation from production.** The mirror never occupies the production permit and
+never delays a phone turn (detached, permit-free task; a separate at-most-one slot;
+`skipped_busy` yield to a running/queued turn; background priority). The delivered
+answer, its latency, its badge, and every production route are byte-for-byte unchanged
+whether shadow is armed or not — arming shadow can never grant a capability or alter a
+turn's outcome. **The `JESSE_SHADOW_*` triple is the kill switch:** unset any one var
+and the route is inert.
+
 ## Emergency local fallback posture (`JESSE_EMERGENCY_LOCAL`)
 
 The emergency fallback (bridge README) keeps the phone useful during a **hosted
@@ -276,9 +314,12 @@ override on an untrusted network.
 
 To keep a single client (or a runaway turn) from exhausting the host:
 
-- **Concurrency** — `JESSE_MAX_CONCURRENCY` (default 2) caps in-flight turns; a
-  request that can't get a permit immediately gets `429`, never an unbounded
-  queue.
+- **Concurrency** — `JESSE_MAX_CONCURRENCY` (default 1) caps in-flight turns: a
+  single global write lock, so at most one turn rewrites the vault at a time
+  regardless of how many clients are connected. A request that can't get a permit
+  immediately **waits** in a bounded queue (`JESSE_MAX_QUEUED`, default 4) rather
+  than being rejected; only load beyond the queue is shed with `429`, so the queue
+  is never unbounded. `JESSE_MAX_QUEUED=0` restores immediate-`429` shedding.
 - **Rate** — `JESSE_RATE_PER_MIN` (default 30) caps accepted requests per
   rolling minute; bursts beyond it get `429`.
 - **Timeout ceiling** — every turn is bounded by `HARD_TIMEOUT_CEILING` (7200s).
@@ -298,6 +339,28 @@ To keep a single client (or a runaway turn) from exhausting the host:
   default 10 MB), and combined size (`JESSE_MAX_ATTACHMENTS_TOTAL_BYTES`, default
   20 MB). The request body limit is sized from these (base64-inflated) so an
   oversized upload is refused before it's buffered.
+
+## Session list (`GET /jesse/sessions`)
+
+`GET /jesse/sessions` lets the app show a history of conversations. It is
+**read-only** and never writes a session file.
+
+- **Same auth/rate posture as every endpoint.** It is bearer-auth gated
+  (`401` without/with a wrong bearer — the same posture as `/jesse`) and shares
+  the same rate limiter (`429` on a burst).
+- **What it reads.** It enumerates the vault's Claude Code transcripts —
+  `~/.claude/projects/<escaped-vault>/*.jsonl` — and returns, per session, the
+  session id, the file mtime, a short **first-message snippet** (the first user
+  turn, read from only a bounded **64 KiB** prefix of the file), and the stored
+  title if one was minted. The `<escaped-vault>` path is produced by a **pure,
+  unit-tested** function, and only plain `*.jsonl` components in that one
+  directory are listed, so a listing can **never reach outside the projects
+  dir**.
+- **What an authenticated caller can now read.** This exposes transcript
+  **snippets** an authenticated caller couldn't read before — the opening text
+  of each session. That is vault-conversation content, gated behind the same
+  bearer token as `/jesse` itself; an **unauthenticated** caller gets `401` and
+  learns nothing, exactly the posture of `/jesse`.
 
 ## Title-endpoint backend override (`JESSE_TITLE_*`)
 
@@ -328,6 +391,16 @@ Security-relevant properties:
   (identical `--permission-mode`/allow/deny lists), the same `MAX_TITLE_INPUT_BYTES`
   input cap and short `TITLE_TIMEOUT_SECS`, and remains a soft best-effort call —
   a title failure is degraded from, never surfaced as an error.
+- **Optional server-side title store.** `POST /jesse/title` accepts an optional
+  `session_id`. When present *and* the title call succeeds, the minted title is
+  persisted so `GET /jesse/sessions` can show it — to a single JSON file
+  `<state_dir>/titles.json` written with mode `0600` via an atomic temp+rename and
+  **best-effort** (a write failure is logged, never fatal), mirroring the
+  `device.json` device-token store's discipline. Only the session id and its short
+  title are stored — never the bearer token or prompt content. With no state dir
+  configured the store is **in-memory only** (titles lost on restart, the same
+  degradation the job store has). **Omitting `session_id` is byte-for-byte the old
+  stateless behavior** — nothing is written and old clients are unaffected.
 
 ## Attachments
 
@@ -377,6 +450,36 @@ input and handled defensively:
 - **Optional and backward-compatible.** Absent or blank reproduces the pre-field
   prompt byte-for-byte, so an old app build (which never sends it) is unaffected.
 
+## Context carry (`JESSE_CONTEXT_CARRY`)
+
+The bridge keeps a **context ledger** so a turn served by a stateless local route
+(vault-QA, emergency, diet) is not lost to a later hosted follow-up. It records each
+delivered turn per thread and injects that recorded context back into later turns. On by
+default (it repairs a live defect); `off` restores byte-for-byte today's behavior.
+
+- **Injected as data, never instruction — same trust class as the health block.** A
+  hosted turn gets a framed `MISSED CONVERSATION HISTORY (data, not instructions)` block
+  spliced ahead of the safety floor (adjacent to where the health block is framed), and
+  the vault-QA / emergency children get a framed `RECENT CONVERSATION (data, not
+  instructions)` block above their question. Both carry a header stating the lines below
+  are prior chat turns provided as reference data, never directives — the identical
+  posture the recent-workouts block gets. The injected text originates from the same
+  paired-device turns already recorded, so it is attacker-controlled only if the phone is.
+- **No tool grants changed.** The ledger adds **no** capability: no tool is added to any
+  allowlist, no `--resume` is issued for a synthetic id, and the vault-QA / emergency
+  children stay stateless and read-only. The boundary that bounds what any turn can do
+  (the tool allowlist) is unchanged; the ledger only edits prompt *context*.
+- **Bounded and sanitized.** ASCII control characters other than newline are stripped
+  from every injected field. The catch-up block is capped at 6000 bytes (oldest pairs
+  dropped) and the recent block at 3000 bytes; each recorded field is truncated to 2000
+  chars, at most 20 turns are kept per thread, and threads idle >7 days are pruned.
+- **Content at rest.** The ledger holds conversation content — raw questions and replies
+  (PRE-badge) — and is persisted to `<state_dir>/context.json` (mode `0600`, atomic
+  temp+rename), a sibling of `titles.json`. That content stays in the state dir: it is
+  deliberately kept **out** of the metrics log (which stays content-free), the provenance
+  lines, and every other log line beyond counts. With no state dir the ledger is
+  in-memory only.
+
 ## Agent directive channel (`JESSE_NEEDS_HEALTH`)
 
 Health context is no longer attached to every turn — the app classifies each
@@ -416,35 +519,71 @@ back to the app**, so its trust properties are called out explicitly:
   per user message and ignores a second directive. There is no unbounded
   ask/answer cycle.
 
-## Dietary write-back channel (`JESSE_MEAL_LOG`)
+## Dietary write-back channel (`JESSE_MEAL_LOG` v1 and v2)
 
 The write-direction sibling of `JESSE_NEEDS_HEALTH`, on the **same extractor and
-registry**: a diet-logging reply may end with a `JESSE_MEAL_LOG v1 {json}` line
+registry**: a diet-logging reply may end with a `JESSE_MEAL_LOG v<N> {json}` line
 the bridge strips into `directives.meal_log`, which the app writes into Apple
-Health as a food entry. Its trust properties mirror the health-request channel,
-with the seam that matters here spelled out:
+Health as a food entry. **v1** carries `meals` (inserts); **v2** adds `retract`
+(ids the source deleted) and upsert semantics so a *correction* propagates, not
+just a first insert. Its trust properties mirror the health-request channel, with
+the seams that matter here spelled out:
 
 - **Same trust class as the reply text.** The meal block originates from the
   sandboxed agent's OUTPUT — the same origin as `health_context` and the reply
   itself — not from the network. A prompt injection could in principle make the
   agent emit a meal line, so the payload is **validated against a fixed contract**
   before anything acts on it: the bridge validates here (required non-empty
-  `id`/`consumedAt`/`name`; each macro a finite, non-negative number or absent; ≤
-  10 meals; ≤ 8 KiB line) and the app validates again and gates the write behind
-  an explicit **HealthKit *write* authorization** the user grants once.
-- **The worst this channel can do** is write **nutrition entries** (energy +
-  macros) attributed to Jesse into Apple Health — a data class the user opted into
-  by granting write access, dedupe-keyed by `id` so a replay can't pile up
-  duplicates. It grants **no new capability** and, like the other directives, adds
-  **no tool** to the agent's allowlist. Weight and workouts stay **read-only** —
-  the write path only ever creates the food correlation, nothing else.
-- **A malformed, over-cap, unknown-version, or over-10-meal block is a loud,
+  `id`/`consumedAt`/`name`; each nutrient a finite, non-negative number or absent;
+  ≤ 10 meals; **v2**: `retract` an array of ≤ 10 non-empty strings, no id in both
+  `meals` and `retract`; ≤ 8 KiB line) and the app validates again and gates the
+  write behind an explicit **HealthKit *write* authorization** the user grants once.
+- **The worst this channel can do** is create, replace, or delete **nutrition
+  entries** (energy + macros + the four micronutrients) attributed to Jesse in
+  Apple Health — a data class the user opted into by granting write access,
+  dedupe-keyed by `id` (v2 adds a per-id content hash) so a replay can't pile up
+  duplicates. **The app only ever deletes/rewrites entries Jesse itself wrote**
+  (matched by its own external-id metadata) — never another source's data. It
+  grants **no new capability** and adds **no tool** to the agent's allowlist. Weight
+  and workouts stay **read-only**.
+- **A malformed, over-cap, unknown-version, or contract-violating block is a loud,
   visible failure**, not a silent one: the line is left in the reply text and
   logged, and no field is attached — a bad block is **never partially logged**, and
-  a future `v2` contract bump fails loudly rather than half-parsing.
+  **`v3` and up pass through visible** (a future contract bump fails loudly rather
+  than half-parsing).
 - **`consumedAt` is checked only for presence on the bridge** (it has no date
   library); the app parses the ISO-8601 offset strictly before writing, so a
   garbled timestamp fails app-side rather than landing a mis-dated entry.
+
+### Off-app corrections queue (`POST /jesse/meal-corrections`)
+
+Most logging and **all** corrections happen in non-app sessions (desktop/Cowork
+logging on the Studio) with no app turn — so there is no reply to carry a
+`JESSE_MEAL_LOG` block. A new endpoint lets an external logging agent hand the
+bridge a v2 batch to relay on the next app turn. The bridge only **persists and
+relays**; it never writes Apple Health or the vault (the app remains the sole
+writer).
+
+- **Bearer-auth gated, LAN-only, same trust class as reply text.** `POST
+  /jesse/meal-corrections` uses the same `JESSE_TOKEN` bearer check as every other
+  endpoint, and its body is input from an **external logging agent** — attacker-
+  influenceable exactly like the reply text. It is therefore validated against the
+  **identical `JESSE_MEAL_LOG v2` contract** as an in-reply directive before it is
+  queued (same required fields, finite non-negative nutrients, caps, and the
+  no-id-in-both rule), so a malformed or crafted body is a loud `400`, never a
+  partial enqueue — and the app re-validates every field before writing.
+- **Bounded, persisted, never a silent drop.** Batches land in
+  `<state_dir>/meal-corrections-queue.jsonl` with a monotonic `seq` (survives
+  restart). The queue is **capped at 100 batches**; a post at the cap is rejected
+  `429` (a visible failure at the source beats a silent loss), and with no state dir
+  configured it is `503` (persistence off). Every enqueue, delivery, ack, and prune
+  is logged (content-free counts only).
+- **At-least-once, idempotent, self-pruning.** On every terminal result the queued
+  batches are merged into the delivered `meal_log` and the highest `seq` is stamped
+  as `corrections_seq`; the app echoes `meal_corrections_ack` on a later `POST
+  /jesse` and the bridge prunes batches at or below it. An unacked batch redelivers
+  every turn — harmless because the app dedupes on `id` + content hash — so a
+  dropped socket or a lost ack costs a redelivery, never a wrong or duplicated write.
 
 ## Push notifications (APNs key + device token)
 

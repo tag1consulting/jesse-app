@@ -9,6 +9,7 @@ import UniformTypeIdentifiers
 /// reading itself needs the pasteboard/UI and isn't unit-testable; these pin the
 /// byte handling that decides what gets staged, and that a pasted item runs the
 /// SAME `sniffMime`/`AttachmentLimits` caps as the pickers.
+@MainActor
 final class PasteAttachmentTests: XCTestCase {
 
     // MARK: - Generated filename

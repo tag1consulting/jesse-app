@@ -1,72 +1,82 @@
 import XCTest
 @testable import Jesse
 
-/// The persisted pending-write queue (UserDefaults-backed, injectable suite,
-/// mirroring `InFlightStore`). Enqueue/dequeue round-trips a `Meal` across what
-/// would be a relaunch; dequeue clears; enqueue dedupes by id so a repeatedly-
-/// failing meal never grows the store.
+/// The persisted pending-apply queue (UserDefaults-backed, injectable suite). Now a v2
+/// `PendingMealBatch` (upserts + retracts): enqueue/dequeue round-trips across a relaunch;
+/// dequeue clears; enqueue dedupes (upserts by id, retracts by value); and the pre-v2
+/// `[Meal]` queue migrates once into upserts.
+@MainActor
 final class PendingMealStoreTests: XCTestCase {
 
     private var suiteName = ""
     private var defaults: UserDefaults!
 
-    override func setUp() {
-        super.setUp()
+    override func setUp() async throws {
+        try await super.setUp()
         suiteName = "test.pendingmeals.\(UUID().uuidString)"
         defaults = UserDefaults(suiteName: suiteName)
     }
 
-    override func tearDown() {
+    override func tearDown() async throws {
         defaults.removePersistentDomain(forName: suiteName)
         defaults = nil
-        super.tearDown()
+        try await super.tearDown()
     }
 
-    private func meal(_ id: String, kcal: Double? = 100, fiber: Double? = nil) -> Meal {
+    private func meal(_ id: String, kcal: Double? = 100, sodium: Double? = nil) -> Meal {
         Meal(id: id, consumedAt: Date(timeIntervalSince1970: 1_780_000_000),
              name: "Meal \(id)", kcal: kcal, proteinGrams: nil, carbGrams: nil,
-             fatGrams: nil, fiberGrams: fiber)
+             fatGrams: nil, fiberGrams: nil,
+             sodiumMg: sodium, satFatGrams: nil, sugarGrams: nil, potassiumMg: nil, calciumMg: nil, magnesiumMg: nil)
     }
 
-    func testEnqueueThenDequeueRoundTrips() {
-        let store = PendingMealStore(defaults: defaults)
-        store.enqueue([meal("a"), meal("b")])
-        // A fresh store over the SAME defaults is the "relaunch": the queue survives.
-        let reloaded = PendingMealStore(defaults: defaults)
-        let out = reloaded.dequeueAll()
-        XCTAssertEqual(out.map(\.id), ["a", "b"])
-        XCTAssertEqual(out.first?.kcal, 100)
+    private func batch(_ upserts: [Meal] = [], retract: [String] = []) -> PendingMealBatch {
+        PendingMealBatch(upserts: upserts, retracts: retract)
     }
 
-    func testFiberRoundTripsAcrossRelaunch() {
+    func testEnqueueThenDequeueRoundTripsBothArms() {
         let store = PendingMealStore(defaults: defaults)
-        store.enqueue([meal("a", fiber: 6)])
-        // A fresh store over the SAME defaults is the "relaunch": fiber survives.
-        let reloaded = PendingMealStore(defaults: defaults)
-        let out = reloaded.dequeueAll()
-        XCTAssertEqual(out.map(\.id), ["a"])
-        XCTAssertEqual(out.first?.fiberGrams, 6)
+        store.enqueue(batch([meal("a", sodium: 900), meal("b")], retract: ["gone"]))
+        // A fresh store over the SAME defaults is the "relaunch": the batch survives.
+        let out = PendingMealStore(defaults: defaults).dequeueAll()
+        XCTAssertEqual(out.upserts.map(\.id), ["a", "b"])
+        XCTAssertEqual(out.upserts.first?.sodiumMg, 900, "the micronutrient survives the relaunch")
+        XCTAssertEqual(out.retracts, ["gone"])
     }
 
     func testDequeueClearsTheStore() {
         let store = PendingMealStore(defaults: defaults)
-        store.enqueue([meal("a")])
-        XCTAssertEqual(store.dequeueAll().count, 1)
+        store.enqueue(batch([meal("a")], retract: ["r"]))
+        XCTAssertFalse(store.dequeueAll().isEmpty)
         XCTAssertTrue(store.dequeueAll().isEmpty, "a second dequeue is empty — the queue was cleared")
     }
 
-    func testEnqueueDedupesById() {
+    func testEnqueueDedupesUpsertsByIdAndRetractsByValue() {
         let store = PendingMealStore(defaults: defaults)
-        store.enqueue([meal("a")])
-        store.enqueue([meal("a", kcal: 999)]) // same id — must not duplicate
+        store.enqueue(batch([meal("a")], retract: ["r"]))
+        store.enqueue(batch([meal("a", kcal: 999)], retract: ["r"])) // both dups
         let out = store.dequeueAll()
-        XCTAssertEqual(out.count, 1)
-        XCTAssertEqual(out.first?.kcal, 100, "the first-enqueued meal is kept; the duplicate is dropped")
+        XCTAssertEqual(out.upserts.count, 1)
+        XCTAssertEqual(out.upserts.first?.kcal, 100, "the first-enqueued upsert is kept")
+        XCTAssertEqual(out.retracts, ["r"], "the duplicate retract is dropped")
     }
 
     func testEnqueueEmptyIsNoOp() {
         let store = PendingMealStore(defaults: defaults)
-        store.enqueue([])
+        store.enqueue(.empty)
         XCTAssertTrue(store.dequeueAll().isEmpty)
+    }
+
+    func testLegacyV1QueueMigratesIntoUpsertsOnce() {
+        // A pre-v2 store wrote a bare `[Meal]` under the `…v1` key. The v2 store reads it
+        // as upserts (once), then clears it on dequeue so it never re-migrates.
+        let legacy = [meal("old-a"), meal("old-b")]
+        if let data = try? JSONEncoder().encode(legacy) {
+            defaults.set(data, forKey: "jesse.pendingMealWrites.v1")
+        }
+        let out = PendingMealStore(defaults: defaults).dequeueAll()
+        XCTAssertEqual(out.upserts.map(\.id), ["old-a", "old-b"], "the legacy queue migrates into upserts")
+        // Drained: a second read finds nothing (both keys cleared).
+        XCTAssertTrue(PendingMealStore(defaults: defaults).dequeueAll().isEmpty)
     }
 }

@@ -86,9 +86,12 @@ Read this before pairing a second device or running the bridge anywhere shared.
   error unless you set `JESSE_ALLOW_PUBLIC_BIND=1`. It will not answer on your
   home Wi-Fi or any other interface by default.
 - **Concurrency, request rate, and per-turn time are bounded** so one client
-  can't exhaust the host: `JESSE_MAX_CONCURRENCY` (default 2),
-  `JESSE_RATE_PER_MIN` (default 30), and a hard 7200s timeout ceiling. Excess
-  load is shed with `429`.
+  can't exhaust the host: `JESSE_MAX_CONCURRENCY` (default 1 — a single global
+  write lock, so one turn rewrites the vault at a time), `JESSE_RATE_PER_MIN`
+  (default 30), and a hard 7200s timeout ceiling. A turn that can't get a permit
+  is **queued** (up to `JESSE_MAX_QUEUED`, default 4); only load beyond the queue
+  is shed with `429`. Set `JESSE_MAX_QUEUED=0` to restore immediate-`429`
+  shedding.
 - **The token is never logged by the bridge** and is stored on the phone in the
   **iOS Keychain** (not plaintext `UserDefaults`).
 
@@ -172,7 +175,8 @@ Full table in [`bridge/README.md`](bridge/README.md#knobs-env-vars). Most-used:
 | `JESSE_ALLOW_PUBLIC_BIND` | _(off)_ | Set to `1` to allow binding a non-loopback/non-tailnet address. Off by default; an unsafe bind is otherwise a startup error. |
 | `JESSE_ALLOWED_TOOLS` | _(scoped default)_ | Comma-separated `--allowedTools` list for the agent. See [SECURITY.md](SECURITY.md). |
 | `JESSE_DISALLOWED_TOOLS` | `Bash,WebFetch` | Comma-separated `--disallowedTools` denylist (defense-in-depth). |
-| `JESSE_MAX_CONCURRENCY` | `2` | Max concurrent turns; excess returns `429`. |
+| `JESSE_MAX_CONCURRENCY` | `1` | Max concurrent turns — a single global write lock by default, so one turn rewrites the vault at a time. A turn that can't get a permit is queued, not rejected. |
+| `JESSE_MAX_QUEUED` | `4` | Depth of the wait queue in front of the concurrency limit; when no permit is free, up to this many turns wait for one, and only load beyond the queue returns `429`. `0` disables the queue (immediate `429`). |
 | `JESSE_RATE_PER_MIN` | `30` | Accepted requests per rolling minute; bursts beyond it return `429`. |
 | `JESSE_ADVERTISE_HOST` | value of `JESSE_BIND` | Host written into the pairing QR. **Set to your `ts.net` MagicDNS name** (see ATS note). |
 | `JESSE_PORT` | `8765` | Port. |
@@ -241,6 +245,10 @@ xcodebuild test -scheme Jesse \
 ```
 
 (Adjust the simulator name to one your Xcode has installed.)
+
+Set `JESSE_MUTE=1` under the scheme's **Run > Environment Variables** to silence
+spoken (text-to-speech) replies during development — no audio and no ducking of
+other audio, without muting the Mac.
 
 ---
 

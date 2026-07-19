@@ -5,6 +5,7 @@ import XCTest
 /// runtime logic to drive from a test), but the floor is exactly the regression
 /// being fixed — the input must never collapse to one line — so these assert the
 /// invariant a careless edit would reopen.
+@MainActor
 final class ComposerLayoutTests: XCTestCase {
 
     func testInputReservesAtLeastThreeLines() {

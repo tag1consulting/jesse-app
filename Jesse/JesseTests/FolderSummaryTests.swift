@@ -1,6 +1,7 @@
 import XCTest
 @testable import Jesse
 
+@MainActor
 final class FolderSummaryTests: XCTestCase {
 
     // Fixed UTC/Gregorian/POSIX calendar+locale so month abbreviations and the

@@ -6,6 +6,7 @@ import XCTest
 /// header. The window/cap/ordering/composition live in `HealthContextFormatter` and
 /// are covered by `HealthContextTests`. Everything here is deterministic — a fixed
 /// UTC calendar — so the rendered bytes are pinned.
+@MainActor
 final class WorkoutContextTests: XCTestCase {
 
     // Fixed UTC calendar so date rendering is deterministic regardless of host TZ.

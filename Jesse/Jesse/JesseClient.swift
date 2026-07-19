@@ -26,7 +26,13 @@ struct JesseAttachment: Identifiable, Equatable {
     /// the bridge runs — so the declared type always matches the actual bytes
     /// (a PhotosPicker item may be HEIC even when it looks like a JPEG). Returns
     /// nil for anything not on the whitelist.
-    static func sniffMime(_ data: Data) -> String? {
+    ///
+    /// Explicitly `nonisolated`: a pure function over its `Data` argument, called
+    /// from the `nonisolated` `AttachmentDownscaler.fitToCap`. Under this module's
+    /// MainActor default isolation the compiler's `nonisolated` inference for it is
+    /// fragile (it can flip to main-actor-isolated as unrelated code in this file
+    /// changes), so pin it here rather than rely on inference.
+    nonisolated static func sniffMime(_ data: Data) -> String? {
         let b = [UInt8](data.prefix(16))
         func match(_ ascii: String, at off: Int = 0) -> Bool {
             let sig = Array(ascii.utf8)
@@ -95,7 +101,7 @@ enum AttachmentLimits {
     }
 }
 
-struct JesseConfig {
+struct JesseConfig: Sendable {
     /// The bridge's default port (`JESSE_PORT`), used when a pairing payload or a
     /// stored config omits/can't parse one.
     static let defaultPort = 8765
@@ -272,6 +278,11 @@ struct JesseReply: Equatable {
     // `text`). Nil for the overwhelming majority of turns. `needs_health` drives
     // the classify-then-attach retry in `RunCoordinator`.
     var directives: JesseDirectives? = nil
+    // Structured, display-only provenance (model-badge v2). When present, `displayText`
+    // strips the trailing badge (and the emergency citations-unverified warning) so the
+    // bubble shows a clean body and a native chip renders it instead. Nil on an older
+    // bridge / badges-off turn → the text is shown verbatim.
+    var provenance: JesseProvenance? = nil
 
     /// The validated needs-health request this reply asks for, or nil if there is
     /// no `needs_health` directive or it fails the contract (unknown metric, window
@@ -286,17 +297,34 @@ struct JesseReply: Equatable {
     /// The validated meals this reply logged, or nil if there is no `meal_log`
     /// directive or it fails the contract (empty, over the cap, a blank required
     /// field, an unparseable date, or a bad macro) — an invalid block is never
-    /// partially written to Health. Mirrors `needsHealthRequest`.
+    /// partially written to Health. Mirrors `needsHealthRequest`. (v1 view; the v2
+    /// correction flow uses `mealBatch`.)
     var mealsToLog: [Meal]? {
         guard let ml = directives?.mealLog else { return nil }
         return MealLogParser.meals(from: ml)
     }
 
+    /// The validated v2 meal-events batch this reply/turn delivered — upserts +
+    /// retracts + the `corrections_seq` to ack — or nil if there is no `meal_log`
+    /// directive or it fails the contract (over a cap, a blank/invalid field, an
+    /// unparseable date, or the same id in both `meals` and `retract`). An invalid
+    /// block is never partially applied. This is the seam the correction flow uses;
+    /// a v1 delivery decodes with empty `retract` and nil seq, so it flows through
+    /// unchanged as an all-upsert batch.
+    var mealBatch: MealBatch? {
+        guard let ml = directives?.mealLog else { return nil }
+        return MealLogParser.batch(from: ml)
+    }
+
     private static let marker = "SPOKEN:"
 
-    /// Full answer for the screen, with the SPOKEN: line removed.
+    /// Full answer for the screen, with the model-badge (and any emergency
+    /// citations-unverified warning) stripped when structured provenance is present,
+    /// then the SPOKEN: line removed. With no provenance the text is shown verbatim
+    /// (the older-bridge fallback), badge included, exactly as before.
     var displayText: String {
-        text.split(separator: "\n", omittingEmptySubsequences: false)
+        let base = provenance?.strip(from: text) ?? text
+        return base.split(separator: "\n", omittingEmptySubsequences: false)
             .filter { !$0.trimmingCharacters(in: .whitespaces).uppercased().hasPrefix(Self.marker) }
             .joined(separator: "\n")
             .trimmingCharacters(in: .whitespacesAndNewlines)
@@ -415,6 +443,18 @@ nonisolated struct JesseRequest: Encodable, Equatable {
     // locked, or timeout) — the agent should answer from vault data and not
     // re-request. Nil on an ordinary turn.
     let healthContextUnavailable: Bool?
+    // Meal-corrections ack (JESSE_MEAL_LOG v2): the highest `corrections_seq` the app
+    // has taken responsibility for (applied, or skipped because the mirror is off). The
+    // bridge prunes every queued batch at or below it. Nil until the app has applied a
+    // delivered correction; re-sending the same value is harmless (prune is idempotent).
+    let mealCorrectionsAck: Int?
+    // Idempotency key (the send outbox's `OutboxItem.id`, as a string): the bridge
+    // dedups a `POST /jesse` carrying a `request_id` it has already seen, returning
+    // the SAME job instead of spawning a second turn — so a manual Retry after a
+    // pre-ACK drop can't double-send. Nil on every call that isn't outbox-driven (the
+    // watch relay, the health-context retry); a bridge without the field ignores it
+    // (no `deny_unknown_fields`), so the bytes are unchanged when it's absent.
+    let requestId: String?
 
     nonisolated struct Attachment: Encodable, Equatable {
         let filename: String
@@ -435,6 +475,8 @@ nonisolated struct JesseRequest: Encodable, Equatable {
         case healthContext = "health_context"
         case healthContextRequested = "health_context_requested"
         case healthContextUnavailable = "health_context_unavailable"
+        case mealCorrectionsAck = "meal_corrections_ack"
+        case requestId = "request_id"
     }
 }
 
@@ -460,11 +502,14 @@ nonisolated struct JesseResultResponse: Decodable {
     let response: String?
     let sessionId: String?
     let directives: JesseDirectives?
+    // Structured provenance (model-badge v2). Absent/null on an older bridge or a
+    // badges-off turn → the reply text is shown verbatim (fallback).
+    let provenance: JesseProvenance?
     let error: String?
     enum CodingKeys: String, CodingKey {
         case status, response
         case sessionId = "session_id"
-        case directives, error
+        case directives, provenance, error
     }
 }
 
@@ -483,12 +528,25 @@ nonisolated struct JesseDirectives: Decodable, Equatable {
     }
 }
 
-/// The decoded (not yet validated) `meal_log` directive — one or more meals the
-/// agent logged, to write into Apple Health. `JesseReply.mealsToLog` validates it
-/// through `MealLogParser` (caps, field optionality, strict ISO-8601 date) before
-/// anything is written; an invalid block is never partially written.
+/// The decoded (not yet validated) `meal_log` directive. Under **v1** it is just
+/// `meals` (inserts). Under **v2** it also carries `retract` (ids the source deleted →
+/// the app removes their Health entry + tombstones them) and, when the bridge merged
+/// off-app corrections from its persisted queue, `correctionsSeq` (the highest queued
+/// batch seq the app must ack so the bridge prunes). `JesseReply.mealBatch` validates
+/// the whole thing through `MealLogParser` (caps, field optionality, strict ISO-8601
+/// date, no id in both arrays) before anything is written. Both v2 fields are absent on
+/// a v1 delivery (`decodeIfPresent` → nil), so an older bridge decodes unchanged.
 nonisolated struct JesseMealLog: Decodable, Equatable {
     let meals: [JesseMeal]
+    // Defaulted (like `JesseDirectives.mealLog`) so an existing `JesseMealLog(meals:)`
+    // construction keeps compiling; Decodable still uses `decodeIfPresent`, so an absent
+    // key (a v1 delivery, or an older bridge) decodes to nil.
+    var retract: [String]? = nil
+    var correctionsSeq: Int? = nil
+    enum CodingKeys: String, CodingKey {
+        case meals, retract
+        case correctionsSeq = "corrections_seq"
+    }
 }
 
 /// One decoded meal. Wire field names match the bridge contract exactly:
@@ -503,12 +561,30 @@ nonisolated struct JesseMeal: Decodable, Equatable {
     let carbGrams: Double?
     let fatGrams: Double?
     let fiberGrams: Double?
+    /// The HealthKit-bound micronutrients, each pre-summed by the bridge over only the
+    /// meal's items that carried a known value (absent when none did — never a summed 0).
+    /// Optional and additive: an older bridge that omits them decodes to nil. Only the
+    /// nutrients written to Apple Health ride this wire — sodium/saturated fat/sugar/
+    /// potassium (bridge ≥ 0.12.x) plus calcium/magnesium (bridge ≥ 0.18.0). Omega-3 is
+    /// gauge-only (no HealthKit EPA+DHA type) and is NOT a meal field.
+    let sodiumMg: Double?
+    let satFatGrams: Double?
+    let sugarGrams: Double?
+    let potassiumMg: Double?
+    let calciumMg: Double?
+    let magnesiumMg: Double?
     enum CodingKeys: String, CodingKey {
         case id, consumedAt, name, kcal
         case proteinGrams = "protein_g"
         case carbGrams = "carbs_g"
         case fatGrams = "fat_g"
         case fiberGrams = "fiber_g"
+        case sodiumMg = "sodium_mg"
+        case satFatGrams = "satfat_g"
+        case sugarGrams = "sugar_g"
+        case potassiumMg = "potassium_mg"
+        case calciumMg = "calcium_mg"
+        case magnesiumMg = "magnesium_mg"
     }
 }
 
@@ -556,11 +632,13 @@ nonisolated struct JesseStreamFrameData: Decodable {
     let response: String?
     let sessionId: String?
     let directives: JesseDirectives?
+    // Structured provenance on the SSE `done` frame — the same value the poll carries.
+    let provenance: JesseProvenance?
     let error: String?
     enum CodingKeys: String, CodingKey {
         case text, name, response
         case sessionId = "session_id"
-        case directives, error
+        case directives, provenance, error
     }
 }
 
@@ -591,10 +669,25 @@ nonisolated struct JesseTitleResponse: Decodable {
 /// The two bridge calls the coordinator drives a turn with. Pulled behind a
 /// protocol purely so a fake can exercise the poll loop in tests without a
 /// server; `JesseClient` is the only production conformer.
-protocol JesseClientProtocol {
+///
+/// `Sendable` because the coordinator races a turn's stream and poll in two
+/// concurrent child tasks (`consume`), so the client value crosses into them. The
+/// production `JesseClient` is an immutable value of `Sendable` parts (config,
+/// `URLSession`s, `Sendable` provider/classifier existentials, `@Sendable`
+/// closures); test doubles are main-actor-isolated (hence `Sendable`) or declare it.
+protocol JesseClientProtocol: Sendable {
     func send(mode: JesseMode, text: String, sessionId: String?, voice: Bool,
               instructions: String?, floorOverride: String?,
               attachments: [JesseAttachment]) async throws -> JesseSendResult
+    /// Send carrying the outbox idempotency key (`request_id`). The send outbox is
+    /// the only caller that passes a non-nil `requestId`; every other call site (the
+    /// watch relay, the health-context retry) uses the plain `send` above. Defaulted
+    /// in the extension to forward to that plain `send` (dropping the id), so the
+    /// test fakes need not implement it; the production `JesseClient` overrides it to
+    /// actually encode `request_id`.
+    func send(mode: JesseMode, text: String, sessionId: String?, voice: Bool,
+              instructions: String?, floorOverride: String?,
+              attachments: [JesseAttachment], requestId: UUID?) async throws -> JesseSendResult
     /// Fulfill a `JESSE_NEEDS_HEALTH` directive and re-send the SAME turn on the
     /// SAME thread with the requested data attached (bypassing the classifier). When
     /// it can't be fulfilled (toggle off / no data) it re-sends marked unavailable,
@@ -620,6 +713,14 @@ protocol JesseClientProtocol {
     func health() async throws -> BridgeHealth
     /// Best-effort request to stop an in-flight turn server-side. Idempotent.
     func cancelJob(jobId: String) async throws
+    /// Delete a thread's remote Claude Code session server-side
+    /// (`DELETE /jesse/session/{id}`). Fired when the user deletes a thread, so the
+    /// bridge reclaims the transcript too. Idempotent server-side: a missing session
+    /// (`404`) maps to success, exactly like `cancelJob`. Throws only on a genuine
+    /// transport/auth/5xx failure, so the durable drainer can leave it queued and
+    /// retry on the next foreground. Default no-op so fakes that don't exercise it
+    /// need not implement it. See `deleteSession` on `JesseClient`.
+    func deleteSession(_ sessionId: String) async throws
     /// Live token stream for a running turn (`GET /jesse/stream/{job_id}`). Yields
     /// `reset`/`delta`/`activity` frames as the reply builds, then exactly one
     /// terminal frame (`done`/`failed`/`cancelled`). Throws on a transport/auth
@@ -643,6 +744,16 @@ protocol JesseClientProtocol {
 }
 
 extension JesseClientProtocol {
+    // Default for fakes/callers that don't carry an idempotency key: forward to the
+    // plain `send`, dropping `requestId`. The production `JesseClient` overrides this
+    // to encode `request_id`; a fake that wants to assert the key implements it.
+    func send(mode: JesseMode, text: String, sessionId: String?, voice: Bool,
+              instructions: String?, floorOverride: String?,
+              attachments: [JesseAttachment], requestId: UUID?) async throws -> JesseSendResult {
+        try await send(mode: mode, text: text, sessionId: sessionId, voice: voice,
+                       instructions: instructions, floorOverride: floorOverride,
+                       attachments: attachments)
+    }
     // Default for fakes that don't exercise the metrics/retry channel: re-send the
     // SAME turn via `send` (dropping the directive). The production `JesseClient`
     // and the retry-state-machine test's fake override this.
@@ -667,6 +778,10 @@ extension JesseClientProtocol {
     // the push methods; only the production `JesseClient` does the real calls.
     func registerDevice(token: String) async throws {}
     func notifyOnComplete(jobId: String) async throws {}
+    // Default no-op so fakes that don't exercise remote session deletion behave
+    // like a bridge that always succeeds; the production `JesseClient` and the
+    // deletion-drainer test's fake implement the real call.
+    func deleteSession(_ sessionId: String) async throws {}
     // Default "no title": a fake that doesn't opt into titling degrades exactly
     // like a bridge without the endpoint (the row keeps its derived title).
     func title(forDigest digest: String) async -> String? { nil }
@@ -705,17 +820,24 @@ struct JesseClient: JesseClientProtocol {
     /// of the keyword floor and the on-device model; tests inject a fake.
     let healthClassifier: any HealthRelevanceClassifying
 
+    /// The highest meal-corrections `corrections_seq` the app has taken responsibility
+    /// for, read at send time and attached to every turn so the bridge can prune its
+    /// queue. Defaults to the persisted ack store; injectable so tests pin it.
+    let mealCorrectionsAck: @Sendable () -> Int?
+
     init(config: JesseConfig,
          session: URLSession = JesseClient.boundedSession,
          streamSession: URLSession? = nil,
          healthProvider: any HealthContextProviding = HealthContextProvider(),
          isHealthContextEnabled: @escaping @Sendable () -> Bool = { HealthContextSettings.isEnabled },
-         healthClassifier: any HealthRelevanceClassifying = UnionHealthClassifier()) {
+         healthClassifier: any HealthRelevanceClassifying = UnionHealthClassifier(),
+         mealCorrectionsAck: @escaping @Sendable () -> Int? = { MealCorrectionsAckStore.pendingSeq }) {
         self.config = config
         self.session = session
         self.healthProvider = healthProvider
         self.isHealthContextEnabled = isHealthContextEnabled
         self.healthClassifier = healthClassifier
+        self.mealCorrectionsAck = mealCorrectionsAck
         if let streamSession {
             self.streamSession = streamSession
         } else if session === JesseClient.boundedSession {
@@ -770,6 +892,17 @@ struct JesseClient: JesseClientProtocol {
               instructions: String? = nil,
               floorOverride: String? = nil,
               attachments: [JesseAttachment] = []) async throws -> JesseSendResult {
+        try await send(mode: mode, text: text, sessionId: sessionId, voice: voice,
+                       instructions: instructions, floorOverride: floorOverride,
+                       attachments: attachments, requestId: nil)
+    }
+
+    func send(mode: JesseMode, text: String,
+              sessionId: String?, voice: Bool,
+              instructions: String?,
+              floorOverride: String?,
+              attachments: [JesseAttachment],
+              requestId: UUID?) async throws -> JesseSendResult {
         // Classify-then-attach, in the request-building path so EVERY turn — typed,
         // Siri, and the watch relay — inherits it. The block is attached ONLY when
         // the master toggle is on AND the message classifies as health-related
@@ -781,16 +914,38 @@ struct JesseClient: JesseClientProtocol {
         let enabled = isHealthContextEnabled()
         let relevant = enabled ? await healthClassifier.isRelevant(text) : false
         let attach = HealthContextGate.shouldAttach(enabled: enabled, relevant: relevant)
-        let healthContext = await HealthContextResolver.resolve(
-            enabled: attach,
-            provider: healthProvider,
-            now: Date())
+        // Resolve the HealthKit block and the diet nutrient rollup concurrently so the
+        // extra diet GET doesn't add serial latency, then compose them into the one
+        // health_context. Both are best-effort and gated on the same relevance decision.
+        async let healthBlock = HealthContextResolver.resolve(
+            enabled: attach, provider: healthProvider, now: Date())
+        async let dietRollup = dietRollupBlock(enabled: attach)
+        let healthContext = DietContextComposer.combine(
+            healthBlock: await healthBlock, dietRollup: await dietRollup)
         let request = Self.makeRequest(mode: mode, text: text, sessionId: sessionId,
                                        voice: voice, instructions: instructions,
                                        floorOverride: floorOverride,
                                        attachments: attachments,
-                                       healthContext: healthContext)
+                                       healthContext: healthContext,
+                                       mealCorrectionsAck: mealCorrectionsAck(),
+                                       requestId: requestId)
         return try await postTurn(request)
+    }
+
+    /// The compact multi-window nutrient rollup for the coach's `health_context`, or nil.
+    /// Best-effort and gated on the same health-relevance decision as the HealthKit block:
+    /// off → nil (no diet GET at all); otherwise fetch the diet snapshot and, when it
+    /// carries a `nutrientSeries` (bridge ≥ 0.21.0), render the 7/30/all rollup over KNOWN
+    /// days only. Any failure (transport, decode, older bridge without the field) → nil, so
+    /// a turn is never blocked or broken. The top-sources lines use the loaded day's food
+    /// detail — the per-item log the app has.
+    private func dietRollupBlock(enabled: Bool) async -> String? {
+        guard enabled else { return nil }
+        guard let snapshot = try? await fetchDietSnapshot() else { return nil }
+        guard let series = snapshot.nutrientSeries, NutrientTrends.isAvailable(series) else { return nil }
+        let text = NutrientTrends.coachRollup(series: series, targets: snapshot.today.targets,
+                                              meals: snapshot.today.meals)
+        return text.isEmpty ? nil : text
     }
 
     func sendFulfilling(_ requested: NeedsHealthRequest, mode: JesseMode, text: String,
@@ -809,7 +964,8 @@ struct JesseClient: JesseClientProtocol {
                                        attachments: [],
                                        healthContext: outgoing.block,
                                        healthContextRequested: outgoing.requested ? true : nil,
-                                       healthContextUnavailable: outgoing.unavailable ? true : nil)
+                                       healthContextUnavailable: outgoing.unavailable ? true : nil,
+                                       mealCorrectionsAck: mealCorrectionsAck())
         return try await postTurn(request)
     }
 
@@ -918,6 +1074,34 @@ struct JesseClient: JesseClientProtocol {
         }
         guard let http = resp as? HTTPURLResponse else { throw JesseError.decoding }
         // 2xx (the bridge replies 204) or 404 (nothing left to cancel) → success.
+        if (200..<300).contains(http.statusCode) || http.statusCode == 404 { return }
+        throw JesseError.badResponse(http.statusCode,
+                                     String(data: data, encoding: .utf8) ?? "")
+    }
+
+    /// Delete a thread's remote Claude Code session (`DELETE /jesse/session/{id}`).
+    /// Mirrors `cancelJob`'s URL build + bearer auth + idempotent-404 handling: the
+    /// bridge returns `204` for a real delete AND for an unknown/already-gone id, and
+    /// a `404` (a bridge that no longer knows the id) is treated as success too —
+    /// there's nothing left to delete. Throws only on a genuine transport/auth/5xx
+    /// failure, so the durable drainer can leave the tombstone queued and retry later.
+    func deleteSession(_ sessionId: String) async throws {
+        guard !config.normalizedHost.isEmpty, !config.token.isEmpty,
+              let url = config.endpoint("/jesse/session/\(sessionId)") else {
+            throw JesseError.notConfigured
+        }
+        var req = URLRequest(url: url)
+        req.httpMethod = "DELETE"
+        req.setValue("Bearer \(config.token)", forHTTPHeaderField: "Authorization")
+
+        let data: Data, resp: URLResponse
+        do {
+            (data, resp) = try await session.data(for: req)
+        } catch {
+            throw JesseError.from(error, host: config.normalizedHost)
+        }
+        guard let http = resp as? HTTPURLResponse else { throw JesseError.decoding }
+        // 2xx (the bridge replies 204) or 404 (nothing left to delete) → success.
         if (200..<300).contains(http.statusCode) || http.statusCode == 404 { return }
         throw JesseError.badResponse(http.statusCode,
                                      String(data: data, encoding: .utf8) ?? "")
@@ -1077,7 +1261,7 @@ struct JesseClient: JesseClientProtocol {
         case "activity": return .activity(obj?.name ?? "")
         case "done":
             return .done(JesseReply(text: obj?.response ?? "", sessionId: obj?.sessionId,
-                                    directives: obj?.directives))
+                                    directives: obj?.directives, provenance: obj?.provenance))
         case "error": return .failed(obj?.error ?? "Jesse couldn't complete that.")
         case "cancelled": return .cancelled
         default: return nil
@@ -1224,7 +1408,9 @@ struct JesseClient: JesseClientProtocol {
                             attachments: [JesseAttachment],
                             healthContext: String? = nil,
                             healthContextRequested: Bool? = nil,
-                            healthContextUnavailable: Bool? = nil) -> JesseRequest {
+                            healthContextUnavailable: Bool? = nil,
+                            mealCorrectionsAck: Int? = nil,
+                            requestId: UUID? = nil) -> JesseRequest {
         func nonBlank(_ s: String?) -> String? {
             guard let s, !s.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return nil }
             return s
@@ -1247,7 +1433,12 @@ struct JesseClient: JesseClientProtocol {
             // Only ever `true` or omitted — a `false` flag is meaningless to the
             // bridge (`#[serde(default)]` = false), so collapse it to nil.
             healthContextRequested: healthContextRequested == true ? true : nil,
-            healthContextUnavailable: healthContextUnavailable == true ? true : nil)
+            healthContextUnavailable: healthContextUnavailable == true ? true : nil,
+            // Only a positive seq is meaningful (0/absent → nothing acked yet).
+            mealCorrectionsAck: (mealCorrectionsAck ?? 0) > 0 ? mealCorrectionsAck : nil,
+            // The outbox idempotency key, encoded as its string form; nil drops the
+            // field so a non-outbox call is byte-for-byte unchanged.
+            requestId: requestId?.uuidString)
     }
 
     /// Encode a wire body. Optional fields omit when nil (synthesized
@@ -1301,7 +1492,7 @@ struct JesseClient: JesseClientProtocol {
         case "done":
             guard let text = obj.response else { throw JesseError.decoding }
             return .done(JesseReply(text: text, sessionId: obj.sessionId,
-                                    directives: obj.directives))
+                                    directives: obj.directives, provenance: obj.provenance))
         case "failed":
             return .failed(obj.error ?? "Jesse couldn't complete that.")
         case "cancelled":

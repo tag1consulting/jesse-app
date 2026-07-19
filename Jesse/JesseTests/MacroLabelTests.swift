@@ -5,6 +5,7 @@ import XCTest
 // Health-tab row renders. These lock the words in from one source: a future
 // regression back to "P"/"C"/"F"/"Fib" fails here, not on the device.
 
+@MainActor
 final class MacroLabelTests: XCTestCase {
 
     // MARK: - Canonical names
@@ -24,6 +25,38 @@ final class MacroLabelTests: XCTestCase {
                            "\(macro) still renders the abbreviation \(macro.displayName)")
             XCTAssertGreaterThan(macro.displayName.count, 1)
         }
+    }
+
+    // MARK: - Micronutrient names (the second single-source label set)
+
+    func testMicronutrientDisplayNamesAreFullAndUnabbreviated() {
+        XCTAssertEqual(Micronutrient.sodium.displayName, "Sodium")
+        XCTAssertEqual(Micronutrient.saturatedFat.displayName, "Saturated Fat")
+        XCTAssertEqual(Micronutrient.unsaturatedFat.displayName, "Unsaturated Fat")
+        XCTAssertEqual(Micronutrient.totalSugars.displayName, "Total Sugars")
+        XCTAssertEqual(Micronutrient.potassium.displayName, "Potassium")
+        XCTAssertEqual(Micronutrient.calcium.displayName, "Calcium")
+        XCTAssertEqual(Micronutrient.omega3.displayName, "Omega-3 (EPA+DHA)")
+        XCTAssertEqual(Micronutrient.magnesium.displayName, "Magnesium")
+    }
+
+    func testMicronutrientNamesCarryNoAbbreviation() {
+        // No wire key or chemical symbol ever surfaces as a user-facing name.
+        let banned: Set<String> = ["Na", "K", "SatFat", "Sat Fat", "Sugars", "Sugar", "na", "satf", "sug", "k"]
+        for n in Micronutrient.allCases {
+            XCTAssertFalse(banned.contains(n.displayName),
+                           "\(n) still renders the abbreviation \(n.displayName)")
+            XCTAssertGreaterThan(n.displayName.count, 3)
+        }
+    }
+
+    func testMicronutrientCanonicalOrderAndUnits() {
+        XCTAssertEqual(Micronutrient.allCases.map(\.displayName),
+                       ["Sodium", "Saturated Fat", "Unsaturated Fat", "Total Sugars",
+                        "Potassium", "Calcium", "Omega-3 (EPA+DHA)", "Magnesium"])
+        // Minerals and omega-3 in mg, the fats and sugars in g.
+        XCTAssertEqual(Micronutrient.allCases.map(\.unit),
+                       ["mg", "g", "g", "g", "mg", "mg", "mg", "mg"])
     }
 
     // MARK: - Canonical display order (fiber is a subset of carbs → sits after it)

@@ -5,6 +5,7 @@ import XCTest
 /// CHANGELOG says had a blank-line-swallowing bug, previously covered only by a
 /// single end-to-end test that delivered the whole body as one chunk. These feed
 /// hand-built line arrays so the framing is exercised in isolation.
+@MainActor
 final class SSEParserTests: XCTestCase {
 
     private func delta(_ t: String) -> String { #"data: {"text":"\#(t)"}"# }

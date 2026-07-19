@@ -15,6 +15,7 @@ import SwiftData
 /// ends and cancels it). The observed publish count is then exactly two — the first
 /// delta's immediate publish plus the terminal tail flush — for any number of
 /// chunks.
+@MainActor
 final class RunCoordinatorCoalesceTests: XCTestCase {
 
     /// A hand-driven streaming client (mirrors `RunCoordinatorStreamTests`), kept
@@ -50,7 +51,7 @@ final class RunCoordinatorCoalesceTests: XCTestCase {
     @MainActor
     private func makeContext() throws -> ModelContext {
         let container = try ModelContainer(
-            for: JesseThread.self, Turn.self,
+            for: JesseThread.self, Turn.self, OutboxItem.self, OutboxAttachment.self,
             configurations: ModelConfiguration(isStoredInMemoryOnly: true))
         return ModelContext(container)
     }

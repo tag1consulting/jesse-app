@@ -1,6 +1,7 @@
 import XCTest
 @testable import Jesse
 
+@MainActor
 final class ThreadSectioningTests: XCTestCase {
 
     // A fixed UTC/Gregorian/POSIX calendar and a fixed `now` so classification

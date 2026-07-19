@@ -55,6 +55,50 @@ impl TitleStore {
         self.map.lock_ok().get(session_id).cloned()
     }
 
+    /// Move a title from `from` to `to`, then persist (context carry): when a fresh
+    /// locally-served thread's synthetic id becomes a real claude session id on its first
+    /// hosted turn, its title must follow. Overwrites any title already under `to`. A
+    /// no-op when `from == to`, `from` has no title, or `from`/`to` is empty.
+    pub fn rename(&self, from: &str, to: &str) {
+        let from = from.trim();
+        let to = to.trim();
+        if from.is_empty() || to.is_empty() || from == to {
+            return;
+        }
+        let snapshot = {
+            let mut map = self.map.lock_ok();
+            let Some(title) = map.remove(from) else {
+                return;
+            };
+            map.insert(to.to_string(), title);
+            map.clone()
+        };
+        if let Some(path) = &self.path {
+            persist_titles(path, &snapshot);
+        }
+    }
+
+    /// Drop the title for a session and persist, if one was stored (session
+    /// delete / GC reclaim: a reclaimed session's transcript is gone, so its
+    /// stashed title must not linger in `titles.json` and re-surface). A no-op
+    /// (no write) when the session has no title or the id is blank.
+    pub fn remove(&self, session_id: &str) {
+        let session_id = session_id.trim();
+        if session_id.is_empty() {
+            return;
+        }
+        let snapshot = {
+            let mut map = self.map.lock_ok();
+            if map.remove(session_id).is_none() {
+                return;
+            }
+            map.clone()
+        };
+        if let Some(path) = &self.path {
+            persist_titles(path, &snapshot);
+        }
+    }
+
     /// Number of stored titles. For tests/introspection only.
     pub fn len(&self) -> usize {
         self.map.lock_ok().len()
@@ -165,6 +209,45 @@ mod tests {
             MAX_TITLE_CHARS,
             "the store clamps an oversized title defensively"
         );
+    }
+
+    #[test]
+    fn rename_moves_a_title_from_synthetic_to_real_id() {
+        // Context carry: a fresh local thread's synthetic id becomes a real session id on
+        // its first hosted turn; its title must follow.
+        let store = TitleStore::new(None);
+        store.set("local-abc", "Jamie's Birthday");
+        store.rename("local-abc", "real-sess-1");
+        assert_eq!(store.get("local-abc"), None, "old key cleared");
+        assert_eq!(
+            store.get("real-sess-1").as_deref(),
+            Some("Jamie's Birthday")
+        );
+        // No-ops: same id, missing source, empty ids.
+        store.rename("real-sess-1", "real-sess-1");
+        assert_eq!(
+            store.get("real-sess-1").as_deref(),
+            Some("Jamie's Birthday")
+        );
+        store.rename("ghost", "real-sess-1");
+        assert_eq!(store.len(), 1);
+    }
+
+    #[test]
+    fn remove_drops_a_title_and_is_a_noop_when_absent() {
+        // Session delete / GC reclaim: a reclaimed session's stashed title must not
+        // linger. Removing a stored title clears it; removing an unknown/blank id
+        // is a harmless no-op.
+        let store = TitleStore::new(None);
+        store.set("sess-a", "Weekend Trip");
+        store.set("sess-b", "Roof Notes");
+        store.remove("sess-a");
+        assert_eq!(store.get("sess-a"), None, "removed title is gone");
+        assert_eq!(store.get("sess-b").as_deref(), Some("Roof Notes"), "others untouched");
+        // No-ops.
+        store.remove("ghost");
+        store.remove("");
+        assert_eq!(store.len(), 1);
     }
 
     #[test]

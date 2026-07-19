@@ -174,8 +174,9 @@ JESSE_NEEDS_HEALTH again this turn.)";
 /// multi-line — one workout per line); every other ASCII control char (C0 and
 /// DEL, including tab and carriage return) is dropped so a crafted block cannot
 /// smuggle terminal escapes, NULs, or stray control bytes into the prompt. Pure,
-/// so it is unit-tested.
-fn strip_ascii_controls_keep_newline(s: &str) -> String {
+/// so it is unit-tested. `pub(crate)` so the context ledger frames its injected
+/// blocks with the SAME control hygiene device data gets.
+pub(crate) fn strip_ascii_controls_keep_newline(s: &str) -> String {
     s.chars()
         .filter(|&c| c == '\n' || !c.is_ascii_control())
         .collect()
@@ -196,7 +197,9 @@ fn strip_ascii_controls_keep_newline(s: &str) -> String {
 /// SAME device block, the same way, as the hosted turn — one framing, one trust
 /// story. (The handler's `build_prompt` already enforces the 413 cap ahead of the
 /// vault-QA branch, so the child path only ever sees an already-bounded block.)
-pub(crate) fn frame_health_context(health_context: Option<&str>) -> Result<Option<String>, ApiError> {
+pub(crate) fn frame_health_context(
+    health_context: Option<&str>,
+) -> Result<Option<String>, ApiError> {
     let Some(raw) = health_context else {
         return Ok(None);
     };
@@ -278,9 +281,7 @@ pub fn sanitize_title(raw: &str) -> String {
     // Strip a single pair of matching surrounding quotes (straight or smart).
     let line = strip_wrapping_quotes(line);
     // Drop trailing sentence punctuation the instruction asked to omit.
-    let line = line
-        .trim_end_matches(['.', '!', '?', ',', ';', ':'])
-        .trim();
+    let line = line.trim_end_matches(['.', '!', '?', ',', ';', ':']).trim();
     // Clamp to MAX_TITLE_CHARS characters (char boundary safe) and re-trim in case
     // the cut left trailing whitespace.
     line.chars()
@@ -293,7 +294,12 @@ pub fn sanitize_title(raw: &str) -> String {
 /// Strip one pair of matching surrounding quotes (straight `"`/`'` or smart
 /// `“ ”`/`‘ ’`) if present and non-empty; otherwise return the input unchanged.
 fn strip_wrapping_quotes(s: &str) -> &str {
-    for (open, close) in [('"', '"'), ('\'', '\''), ('\u{201C}', '\u{201D}'), ('\u{2018}', '\u{2019}')] {
+    for (open, close) in [
+        ('"', '"'),
+        ('\'', '\''),
+        ('\u{201C}', '\u{201D}'),
+        ('\u{2018}', '\u{2019}'),
+    ] {
         if let Some(inner) = s.strip_prefix(open).and_then(|r| r.strip_suffix(close)) {
             let inner = inner.trim();
             if !inner.is_empty() {
@@ -399,7 +405,13 @@ fn utc_now_fields() -> (String, String, String, String, String) {
     let (y, m, d) = civil_from_days(days);
     // 1970-01-01 was a Thursday; index 0 = Sunday.
     const WD: [&str; 7] = [
-        "Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday",
+        "Sunday",
+        "Monday",
+        "Tuesday",
+        "Wednesday",
+        "Thursday",
+        "Friday",
+        "Saturday",
     ];
     let weekday = WD[(days + 4).rem_euclid(7) as usize];
     (
@@ -468,6 +480,60 @@ pub fn build_prompt(
     )
 }
 
+/// Assemble the LEAD of a wrapped prompt — the clock header plus the framed health
+/// block — the part that precedes the safety floor. Shared by [`build_prompt_at`] and
+/// [`splice_catchup`] so the hosted catch-up block is spliced at EXACTLY the floor
+/// boundary (the two can never drift). Returns `""` when both are absent, reproducing the
+/// pre-clock output byte-for-byte (no leading blank lines).
+fn prompt_lead(clock: &str, health_block: Option<&str>) -> String {
+    let mut lead = String::new();
+    if !clock.trim().is_empty() {
+        lead.push_str(clock);
+    }
+    if let Some(block) = health_block {
+        if !lead.is_empty() {
+            lead.push_str("\n\n");
+        }
+        lead.push_str(block);
+    }
+    lead
+}
+
+/// Splice a framed hosted CATCH-UP block ([`context::build_catchup_block`]) into a
+/// prompt built by [`build_prompt_at`], inserting it immediately BEFORE the mode floor —
+/// adjacent to where the health block is framed, ahead of the floor, exactly as the
+/// design requires. `clock` and `health_context` MUST be the same values used to build
+/// `prompt`, so the lead length (hence the floor's start offset) is recomputed
+/// identically via [`prompt_lead`]. An empty/blank block returns the prompt byte-for-byte
+/// unchanged, so a thread with nothing pending is a no-op. Pure.
+///
+/// This runs INSIDE the spawned turn task, under the concurrency permit (see the handler),
+/// so the pending read and the splice happen together — two queued turns on one thread
+/// can never both carry the same pending block.
+pub fn splice_catchup(
+    prompt: &str,
+    catchup_block: &str,
+    clock: &str,
+    health_context: Option<&str>,
+) -> String {
+    if catchup_block.trim().is_empty() {
+        return prompt.to_string();
+    }
+    let health_block = frame_health_context(health_context).ok().flatten();
+    let lead = prompt_lead(clock, health_block.as_deref());
+    // The prompt begins with exactly `{lead}\n\n{floor}…` (or `{floor}…` when the lead
+    // is empty), so the floor starts at `lead.len() + 2` (or 0). Defensive bound check.
+    let floor_start = if lead.is_empty() { 0 } else { lead.len() + 2 };
+    if floor_start > prompt.len() {
+        return prompt.to_string();
+    }
+    format!(
+        "{}{catchup_block}\n\n{}",
+        &prompt[..floor_start],
+        &prompt[floor_start..]
+    )
+}
+
 /// The pure core of [`build_prompt`]: identical, except the clock header is
 /// passed in rather than read from the system clock, so the output is fully
 /// deterministic under test. `clock` leads the wrapped prompt; an empty `clock`
@@ -531,16 +597,7 @@ pub fn build_prompt_at(
     // An empty clock is omitted so the const-only path is reproduced byte-for-byte
     // (no leading blank lines); the Health block, when present, sits right after
     // the clock line and ahead of the floor.
-    let mut lead = String::new();
-    if !clock.trim().is_empty() {
-        lead.push_str(clock);
-    }
-    if let Some(block) = &health_block {
-        if !lead.is_empty() {
-            lead.push_str("\n\n");
-        }
-        lead.push_str(block);
-    }
+    let lead = prompt_lead(clock, health_block.as_deref());
     let mut p = if lead.is_empty() {
         format!("{floor}\n\n{preamble}{text}")
     } else {
@@ -592,20 +649,34 @@ mod tests {
         floor: Option<&str>,
     ) -> String {
         build_prompt_at(
-            TEST_CLOCK, mode, text, followup, voice, instructions, floor, None, false, false,
+            TEST_CLOCK,
+            mode,
+            text,
+            followup,
+            voice,
+            instructions,
+            floor,
+            None,
+            false,
+            false,
         )
         .unwrap()
     }
 
     // Like `bp`, but carrying a `health_context` block (the recent-workouts data).
     // Returns the Result so cap/oversized cases can be asserted.
-    fn bp_hc(
-        mode: &str,
-        text: &str,
-        health_context: Option<&str>,
-    ) -> Result<String, ApiError> {
+    fn bp_hc(mode: &str, text: &str, health_context: Option<&str>) -> Result<String, ApiError> {
         build_prompt_at(
-            TEST_CLOCK, mode, text, false, false, None, None, health_context, false, false,
+            TEST_CLOCK,
+            mode,
+            text,
+            false,
+            false,
+            None,
+            None,
+            health_context,
+            false,
+            false,
         )
     }
 
@@ -642,13 +713,25 @@ mod tests {
     }
     #[test]
     fn build_prompt_unknown_mode_is_400() {
-        let err =
-            build_prompt_at(TEST_CLOCK, "shout", "hey", false, false, None, None, None, false, false).unwrap_err();
+        let err = build_prompt_at(
+            TEST_CLOCK, "shout", "hey", false, false, None, None, None, false, false,
+        )
+        .unwrap_err();
         assert_eq!(err.0, StatusCode::BAD_REQUEST);
         // An unknown mode is still a 400 even when an override is supplied.
-        let err =
-            build_prompt_at(TEST_CLOCK, "shout", "hey", false, false, Some("custom"), None, None, false, false)
-                .unwrap_err();
+        let err = build_prompt_at(
+            TEST_CLOCK,
+            "shout",
+            "hey",
+            false,
+            false,
+            Some("custom"),
+            None,
+            None,
+            false,
+            false,
+        )
+        .unwrap_err();
         assert_eq!(err.0, StatusCode::BAD_REQUEST);
     }
     #[test]
@@ -707,11 +790,20 @@ mod tests {
             let base = bp(mode, "body", followup, voice, None, None);
             for blank in [Some(""), Some("   "), Some("\n\t "), None] {
                 let wrap = bp(mode, "body", followup, voice, blank, None);
-                assert_eq!(wrap, base, "blank wrapper override {blank:?} must equal default");
+                assert_eq!(
+                    wrap, base,
+                    "blank wrapper override {blank:?} must equal default"
+                );
                 let floor = bp(mode, "body", followup, voice, None, blank);
-                assert_eq!(floor, base, "blank floor override {blank:?} must equal default");
+                assert_eq!(
+                    floor, base,
+                    "blank floor override {blank:?} must equal default"
+                );
                 let both = bp(mode, "body", followup, voice, blank, blank);
-                assert_eq!(both, base, "blank/blank override {blank:?} must equal default");
+                assert_eq!(
+                    both, base,
+                    "blank/blank override {blank:?} must equal default"
+                );
             }
         }
     }
@@ -744,9 +836,19 @@ mod tests {
     }
     #[test]
     fn build_prompt_floor_override_still_mode_validated() {
-        let err =
-            build_prompt_at(TEST_CLOCK, "shout", "hey", false, false, None, Some("x"), None, false, false)
-                .unwrap_err();
+        let err = build_prompt_at(
+            TEST_CLOCK,
+            "shout",
+            "hey",
+            false,
+            false,
+            None,
+            Some("x"),
+            None,
+            false,
+            false,
+        )
+        .unwrap_err();
         assert_eq!(err.0, StatusCode::BAD_REQUEST);
     }
     #[test]
@@ -826,7 +928,10 @@ mod tests {
                 TEST_CLOCK, mode, "body", followup, voice, None, None, None, false, false,
             )
             .unwrap();
-            assert_eq!(with, base, "absent health_context must equal default ({mode})");
+            assert_eq!(
+                with, base,
+                "absent health_context must equal default ({mode})"
+            );
         }
     }
 
@@ -837,7 +942,10 @@ mod tests {
         let base = bp("ask", "q", false, false, None, None);
         for blank in [Some(""), Some("   "), Some("\n\t "), Some("\u{0}\u{1b}\r")] {
             let p = bp_hc("ask", "q", blank).unwrap();
-            assert_eq!(p, base, "blank/control-only health_context {blank:?} must equal default");
+            assert_eq!(
+                p, base,
+                "blank/control-only health_context {blank:?} must equal default"
+            );
         }
     }
 
@@ -849,14 +957,19 @@ mod tests {
         let p = bp_hc("ask", "log my swim", Some(block)).unwrap();
         // Clock leads, then the framing header on its own line, then the block.
         assert!(
-            p.starts_with(&format!("{TEST_CLOCK}\n\n{HEALTH_CONTEXT_HEADER}\n{block}\n\n")),
+            p.starts_with(&format!(
+                "{TEST_CLOCK}\n\n{HEALTH_CONTEXT_HEADER}\n{block}\n\n"
+            )),
             "clock → framed health block → (floor) must lead: {p:?}"
         );
         // The block sits AFTER the clock and BEFORE the floor.
         let clock_at = p.find(TEST_CLOCK).unwrap();
         let block_at = p.find(block).unwrap();
         let floor_at = p.find(ASK_FLOOR).unwrap();
-        assert!(clock_at < block_at && block_at < floor_at, "order: clock < block < floor");
+        assert!(
+            clock_at < block_at && block_at < floor_at,
+            "order: clock < block < floor"
+        );
         // The turn scaffolding is otherwise intact.
         assert!(p.contains(ASK_PREAMBLE) && p.contains("log my swim"));
         assert!(p.ends_with(PHONE_FORMAT));
@@ -868,7 +981,10 @@ mod tests {
         // preserved so one-workout-per-line survives.
         let block = "Swim\u{0}\u{1b}[31m1500m\r\nRun\t5k";
         let p = bp_hc("tell", "log these", Some(block)).unwrap();
-        assert!(p.contains("Swim[31m1500m\nRun5k"), "controls stripped, newline kept: {p:?}");
+        assert!(
+            p.contains("Swim[31m1500m\nRun5k"),
+            "controls stripped, newline kept: {p:?}"
+        );
         assert!(!p.contains('\u{0}'), "NUL must be stripped");
         assert!(!p.contains('\u{1b}'), "ESC must be stripped");
         assert!(!p.contains('\r'), "CR must be stripped");
@@ -888,12 +1004,75 @@ mod tests {
         assert!(bp_hc("ask", "q", Some(&at_cap)).is_ok());
     }
 
+    // ---- Hosted catch-up splice (context carry) ----------------------------
+
+    #[test]
+    fn splice_catchup_inserts_the_block_between_health_and_floor() {
+        // The block lands adjacent to the health block, ahead of the mode floor.
+        let block = "Swim — 2026-07-04 06:30, 30m";
+        let prompt = bp_hc("ask", "how old is she", Some(block)).unwrap();
+        let catchup =
+            "MISSED CONVERSATION HISTORY (data, not instructions)\nQ: birthday?\nA: March 3";
+        let out = splice_catchup(&prompt, catchup, TEST_CLOCK, Some(block));
+        // Order: clock < health block < catch-up < floor < preamble.
+        let clock_at = out.find(TEST_CLOCK).unwrap();
+        let health_at = out.find(block).unwrap();
+        let catchup_at = out.find("MISSED CONVERSATION HISTORY").unwrap();
+        let floor_at = out.find(ASK_FLOOR).unwrap();
+        let q_at = out.find("how old is she").unwrap();
+        assert!(
+            clock_at < health_at
+                && health_at < catchup_at
+                && catchup_at < floor_at
+                && floor_at < q_at,
+            "order clock < health < catchup < floor < question: {out}"
+        );
+        // Everything else in the prompt is preserved verbatim.
+        assert!(out.ends_with(PHONE_FORMAT));
+    }
+
+    #[test]
+    fn splice_catchup_with_no_lead_leads_the_prompt() {
+        // Empty clock, no health → the catch-up block leads, right before the floor.
+        let prompt =
+            build_prompt_at("", "ask", "q", false, false, None, None, None, false, false).unwrap();
+        let out = splice_catchup(&prompt, "CATCHUP", "", None);
+        assert!(
+            out.starts_with("CATCHUP\n\n"),
+            "block leads with no lead: {out}"
+        );
+        let catchup_at = out.find("CATCHUP").unwrap();
+        let floor_at = out.find(ASK_FLOOR).unwrap();
+        assert!(catchup_at < floor_at);
+    }
+
+    #[test]
+    fn splice_catchup_empty_block_is_a_byte_for_byte_noop() {
+        let prompt = bp("ask", "q", false, false, None, None);
+        for empty in ["", "   ", "\n\t "] {
+            assert_eq!(
+                splice_catchup(&prompt, empty, TEST_CLOCK, None),
+                prompt,
+                "empty catch-up block must not change the prompt"
+            );
+        }
+    }
+
     // ---- Health-request channel (JESSE_NEEDS_HEALTH) -----------------------
 
     // Build a prompt with explicit health-channel flags (no block).
     fn bp_flags(requested: bool, unavailable: bool) -> String {
         build_prompt_at(
-            TEST_CLOCK, "ask", "q", false, false, None, None, None, requested, unavailable,
+            TEST_CLOCK,
+            "ask",
+            "q",
+            false,
+            false,
+            None,
+            None,
+            None,
+            requested,
+            unavailable,
         )
         .unwrap()
     }
@@ -909,7 +1088,10 @@ mod tests {
             ("ask", false, true, VOICE_SUFFIX),
         ] {
             let p = bp(mode, "body", followup, voice, None, None);
-            assert!(p.contains(NEEDS_HEALTH_REQUEST), "request note present ({mode})");
+            assert!(
+                p.contains(NEEDS_HEALTH_REQUEST),
+                "request note present ({mode})"
+            );
             assert!(!p.contains(NEEDS_HEALTH_PRESENT));
             assert!(!p.contains(NEEDS_HEALTH_UNAVAILABLE));
             // It sits AFTER the review note and BEFORE the format suffix, so the
@@ -969,7 +1151,16 @@ mod tests {
         // If a turn somehow carries both a block and the unavailable flag, the
         // unavailable note wins (answer from vault, don't loop) — never contradict.
         let p = build_prompt_at(
-            TEST_CLOCK, "ask", "q", false, false, None, None, Some("Swim 30m"), false, true,
+            TEST_CLOCK,
+            "ask",
+            "q",
+            false,
+            false,
+            None,
+            None,
+            Some("Swim 30m"),
+            false,
+            true,
         )
         .unwrap();
         assert!(p.contains(NEEDS_HEALTH_UNAVAILABLE));
@@ -981,7 +1172,10 @@ mod tests {
     #[test]
     fn build_title_prompt_wraps_text_with_fixed_instruction() {
         let p = build_title_prompt("hello there");
-        assert!(p.starts_with(TITLE_INSTRUCTION), "instruction must lead: {p:?}");
+        assert!(
+            p.starts_with(TITLE_INSTRUCTION),
+            "instruction must lead: {p:?}"
+        );
         assert!(p.contains("hello there"));
         // Not a turn: none of the turn scaffolding leaks in.
         assert!(!p.contains(ASK_FLOOR) && !p.contains(TELL_FLOOR));
@@ -990,14 +1184,20 @@ mod tests {
     }
     #[test]
     fn sanitize_title_passes_a_clean_title_through() {
-        assert_eq!(sanitize_title("Weekend Trip Planning"), "Weekend Trip Planning");
+        assert_eq!(
+            sanitize_title("Weekend Trip Planning"),
+            "Weekend Trip Planning"
+        );
     }
     #[test]
     fn sanitize_title_strips_surrounding_quotes() {
         assert_eq!(sanitize_title("\"Weekend Trip\""), "Weekend Trip");
         assert_eq!(sanitize_title("'Weekend Trip'"), "Weekend Trip");
         // Smart quotes too.
-        assert_eq!(sanitize_title("\u{201C}Weekend Trip\u{201D}"), "Weekend Trip");
+        assert_eq!(
+            sanitize_title("\u{201C}Weekend Trip\u{201D}"),
+            "Weekend Trip"
+        );
     }
     #[test]
     fn sanitize_title_strips_title_prefix_and_trailing_punctuation() {
@@ -1020,7 +1220,10 @@ mod tests {
         let long = "This is an absurdly long run on title that keeps going well past any \
                     reasonable short title length";
         let out = sanitize_title(long);
-        assert!(out.chars().count() <= MAX_TITLE_CHARS, "clamped to cap: {out:?}");
+        assert!(
+            out.chars().count() <= MAX_TITLE_CHARS,
+            "clamped to cap: {out:?}"
+        );
         assert!(!out.contains('\n'), "single line only");
         assert!(!out.is_empty());
     }
@@ -1063,7 +1266,8 @@ mod tests {
     fn build_prompt_empty_clock_is_omitted() {
         // An empty clock reproduces the pre-clock output: the floor leads, with no
         // stray leading blank lines.
-        let p = build_prompt_at("", "ask", "q", false, false, None, None, None, false, false).unwrap();
+        let p =
+            build_prompt_at("", "ask", "q", false, false, None, None, None, false, false).unwrap();
         assert!(p.starts_with(ASK_FLOOR));
         assert!(!p.starts_with('\n'));
     }
@@ -1095,7 +1299,9 @@ mod tests {
         let rest = line
             .strip_prefix("Current date/time: ")
             .expect("clock line must start with the fixed label");
-        let rest = rest.strip_suffix(").").expect("clock line must end with ').'");
+        let rest = rest
+            .strip_suffix(").")
+            .expect("clock line must end with ').'");
         // "<Weekday>, <YYYY-MM-DD> <HH:MM> <ABBR> (UTC<offset>"
         let (head, offset) = rest.split_once(" (UTC").expect("must carry a (UTC offset)");
         // Offset is colonized ±HH:MM.
@@ -1103,11 +1309,20 @@ mod tests {
         assert!(offset.starts_with('+') || offset.starts_with('-'));
         assert_eq!(offset.as_bytes()[3], b':');
         let parts: Vec<&str> = head.split(' ').collect();
-        assert!(parts.len() >= 4, "expected weekday/date/time/abbr: {head:?}");
+        assert!(
+            parts.len() >= 4,
+            "expected weekday/date/time/abbr: {head:?}"
+        );
         let weekday = parts[0].trim_end_matches(',');
         assert!(
             [
-                "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"
+                "Monday",
+                "Tuesday",
+                "Wednesday",
+                "Thursday",
+                "Friday",
+                "Saturday",
+                "Sunday"
             ]
             .contains(&weekday),
             "unexpected weekday {weekday:?}"
@@ -1118,7 +1333,10 @@ mod tests {
         let year: i64 = date[0].parse().expect("year");
         let month: u32 = date[1].parse().expect("month");
         let day: u32 = date[2].parse().expect("day");
-        assert!(year >= 2026, "clock must reflect the real (current) year: {year}");
+        assert!(
+            year >= 2026,
+            "clock must reflect the real (current) year: {year}"
+        );
         assert!((1..=12).contains(&month) && (1..=31).contains(&day));
         // Time field: HH:MM.
         let time: Vec<&str> = parts[2].split(':').collect();
@@ -1141,14 +1359,20 @@ mod tests {
         // The std-only fallback yields the same field shape the formatter expects.
         let (weekday, ymd, hm, abbrev, offset) = utc_now_fields();
         assert!([
-            "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"
+            "Monday",
+            "Tuesday",
+            "Wednesday",
+            "Thursday",
+            "Friday",
+            "Saturday",
+            "Sunday"
         ]
         .contains(&weekday.as_str()));
         assert_eq!(abbrev, "UTC");
         assert_eq!(offset, "+0000");
         assert_eq!(ymd.len(), 10); // YYYY-MM-DD
         assert_eq!(hm.len(), 5); // HH:MM
-        // Feeds the formatter cleanly.
+                                 // Feeds the formatter cleanly.
         let line = format_clock_line(&weekday, &ymd, &hm, &abbrev, &offset);
         assert!(line.starts_with("Current date/time: "));
         assert!(line.ends_with("(UTC+00:00)."));

@@ -6,6 +6,7 @@ import XCTest
 /// composes — so it must appear only when the app is actually paired AND a health
 /// probe has come back unreachable, never on an unpaired install or before the
 /// first probe resolves.
+@MainActor
 final class BridgeReachabilityTests: XCTestCase {
 
     func testUnreachableWhilePairedShowsBanner() {

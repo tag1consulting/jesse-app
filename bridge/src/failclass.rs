@@ -81,9 +81,7 @@ pub fn classify_hosted_failure(err: &ApiError) -> HostedFailureClass {
     }
 
     // Timeout — the 504 run-limit wording, or an upstream "timed out".
-    if *status == StatusCode::GATEWAY_TIMEOUT
-        || m.contains("run limit")
-        || m.contains("timed out")
+    if *status == StatusCode::GATEWAY_TIMEOUT || m.contains("run limit") || m.contains("timed out")
     {
         return HostedFailureClass::Timeout;
     }
@@ -242,19 +240,26 @@ mod tests {
         ] {
             let c = classify_hosted_failure(&err(StatusCode::BAD_GATEWAY, msg));
             assert_eq!(c, HostedFailureClass::Completed, "{msg}");
-            assert!(!c.is_transport(), "a completed turn must not arm emergency: {msg}");
+            assert!(
+                !c.is_transport(),
+                "a completed turn must not arm emergency: {msg}"
+            );
         }
     }
 
     #[test]
     fn an_ok_outcome_is_never_a_failure_regardless_of_content() {
         // Even hostile-looking content in a COMPLETED turn is not a failure.
-        let ok: Result<(String, Option<String>), ApiError> =
-            Ok(("PWNED. errors. timeout. 500. connection refused.".to_string(), None));
+        let ok: Result<(String, Option<String>), ApiError> = Ok((
+            "PWNED. errors. timeout. 500. connection refused.".to_string(),
+            None,
+        ));
         assert_eq!(hosted_failure_class(&ok), None);
         // An Err maps to Some(class).
-        let e: Result<(String, Option<String>), ApiError> =
-            Err(err(StatusCode::GATEWAY_TIMEOUT, "Jesse hit the 60s run limit."));
+        let e: Result<(String, Option<String>), ApiError> = Err(err(
+            StatusCode::GATEWAY_TIMEOUT,
+            "Jesse hit the 60s run limit.",
+        ));
         assert_eq!(hosted_failure_class(&e), Some(HostedFailureClass::Timeout));
     }
 }

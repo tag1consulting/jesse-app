@@ -1,6 +1,7 @@
 import XCTest
 @testable import Jesse
 
+@MainActor
 final class JesseConfigTests: XCTestCase {
 
     private func config(host: String, port: Int = 8765, token: String = "t") -> JesseConfig {

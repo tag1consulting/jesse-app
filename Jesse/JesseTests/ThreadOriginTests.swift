@@ -6,6 +6,7 @@ import SwiftData
 /// raw value round-trips through `ThreadOrigin`; and a store migrated from before
 /// `origin` existed (an unknown/absent raw value) reads back as `.phone` with no
 /// loss, mirroring how `modeValue` defaults an unknown mode to `.ask`.
+@MainActor
 final class ThreadOriginTests: XCTestCase {
 
     func testDefaultThreadIsPhone() {

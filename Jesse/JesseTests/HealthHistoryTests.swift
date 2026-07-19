@@ -5,6 +5,7 @@ import XCTest
 // injection for a past day, the neutral-mode labels, and the past-day chrome
 // visibility rules. No SwiftUI, no networking — the seams the view relies on.
 
+@MainActor
 final class HealthHistoryTests: XCTestCase {
 
     // MARK: - DietPaging

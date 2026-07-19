@@ -87,6 +87,13 @@ pub struct MetricsRecord {
     /// The hosted-failure class ([`failclass`]) when a hosted attempt failed.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub hosted_failure_class: Option<String>,
+    /// The machine-readable rung-2 reason ([`dietlog::Rung2Reason::code`]) on a diet
+    /// rung-2 fall-through — `child_error` / `malformed_json` / `schema_fail:<field>` /
+    /// `empty_entries` / `no_loggable`. Content-free (a code + schema field, never meal
+    /// text or the token); `None` on every non-diet-rung-2 turn. Lets the audit tell a
+    /// pipeline FAILURE from a correct rejection of a non-loggable turn.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub diet_reason: Option<String>,
 }
 
 /// Append one metrics line to `cfg.metrics_log`, or do nothing when it is unset.
@@ -143,6 +150,7 @@ mod tests {
             badge: Some("[local · vault · local-oss]".to_string()),
             emergency: false,
             hosted_failure_class: None,
+            diet_reason: None,
         }
     }
 
@@ -152,13 +160,47 @@ mod tests {
         let line = serde_json::to_string(&rec).unwrap();
         assert!(!line.contains('\n'), "one line, no embedded newline");
         // Route serializes to the kebab string the audit aggregates on.
-        assert!(line.contains("\"route\":\"vaultqa-local\""), "route kebab: {line}");
+        assert!(
+            line.contains("\"route\":\"vaultqa-local\""),
+            "route kebab: {line}"
+        );
         // Never carries content/token fields.
         for forbidden in ["question", "answer", "tokens", "text"] {
-            assert!(!line.contains(forbidden), "line must not carry {forbidden:?}: {line}");
+            assert!(
+                !line.contains(forbidden),
+                "line must not carry {forbidden:?}: {line}"
+            );
         }
         let back: MetricsRecord = serde_json::from_str(&line).unwrap();
         assert_eq!(back, rec, "round-trip identity");
+    }
+
+    #[test]
+    fn diet_reason_round_trips_and_stays_content_free() {
+        let mut rec = sample();
+        rec.route = MetricsRoute::Hosted;
+        rec.rung = 2;
+        rec.diet_reason = Some("schema_fail:time".to_string());
+        let line = serde_json::to_string(&rec).unwrap();
+        assert!(
+            line.contains("\"diet_reason\":\"schema_fail:time\""),
+            "reason present: {line}"
+        );
+        // A code + schema field only — never the meal text or the token.
+        for forbidden in ["question", "answer", "tokens", "token", "text"] {
+            assert!(
+                !line.contains(forbidden),
+                "reason line must not carry {forbidden:?}: {line}"
+            );
+        }
+        let back: MetricsRecord = serde_json::from_str(&line).unwrap();
+        assert_eq!(back, rec, "round-trip identity");
+        // Absent on a normal turn → not serialized (compact).
+        let none = serde_json::to_string(&sample()).unwrap();
+        assert!(
+            !none.contains("diet_reason"),
+            "absent reason is omitted: {none}"
+        );
     }
 
     #[test]
@@ -179,7 +221,8 @@ mod tests {
         // choosing a path we never configure and asserting it is never created.
         let mut cfg = crate::testutil::test_config();
         cfg.metrics_log = None;
-        let sentinel = std::env::temp_dir().join(format!("jesse-metrics-unset-{}.jsonl", random_hex()));
+        let sentinel =
+            std::env::temp_dir().join(format!("jesse-metrics-unset-{}.jsonl", random_hex()));
         assert!(!sentinel.exists());
         append_metrics_line(&cfg, &sample());
         assert!(!sentinel.exists(), "unset metrics_log must touch no file");

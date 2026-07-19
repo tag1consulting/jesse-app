@@ -14,14 +14,17 @@ final class JesseIntentsTests: XCTestCase {
     private let dText = "jesse.pending.text"
     private let dWakeMode = "jesse.pending.wakeMode"
 
-    override func setUp() {
-        super.setUp()
+    // The async `setUp`/`tearDown` variants: XCTest awaits them, so the main-actor
+    // test case isn't synchronously sent into XCTest's nonisolated sync hooks (which
+    // is what trips Swift 6's sending check when the class is `@MainActor`).
+    override func setUp() async throws {
+        try await super.setUp()
         clear()
     }
 
-    override func tearDown() {
+    override func tearDown() async throws {
         clear()
-        super.tearDown()
+        try await super.tearDown()
     }
 
     private func clear() {
@@ -102,7 +105,7 @@ final class JesseIntentsTests: XCTestCase {
     // MARK: - the intents
 
     func testAskJesseIntentEnqueuesAskMode() async throws {
-        var intent = AskJesseIntent()
+        let intent = AskJesseIntent()
         intent.text = "a question"
         _ = try await intent.perform()
         drainIfNeeded()
@@ -111,7 +114,7 @@ final class JesseIntentsTests: XCTestCase {
     }
 
     func testTellJesseIntentEnqueuesTellMode() async throws {
-        var intent = TellJesseIntent()
+        let intent = TellJesseIntent()
         intent.text = "note the roof guy comes Thursday"
         _ = try await intent.perform()
         drainIfNeeded()

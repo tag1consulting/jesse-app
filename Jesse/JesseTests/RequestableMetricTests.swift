@@ -4,6 +4,7 @@ import XCTest
 /// The app half of the JESSE_NEEDS_HEALTH channel: request validation (whitelist,
 /// window range, metric cap — reject the WHOLE request, never partially fulfill),
 /// the pure series formatter, and the fulfillment assembler's 6 KiB cap.
+@MainActor
 final class RequestableMetricTests: XCTestCase {
 
     // MARK: - Validation

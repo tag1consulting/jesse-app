@@ -124,9 +124,7 @@ pub fn parse_stream_line(line: &str) -> StreamEvent {
             match event.and_then(|e| e.get("type")).and_then(|t| t.as_str()) {
                 Some("content_block_delta") => {
                     let delta = event.and_then(|e| e.get("delta"));
-                    let is_text = delta
-                        .and_then(|d| d.get("type"))
-                        .and_then(|t| t.as_str())
+                    let is_text = delta.and_then(|d| d.get("type")).and_then(|t| t.as_str())
                         == Some("text_delta");
                     match delta.and_then(|d| d.get("text")).and_then(|t| t.as_str()) {
                         Some(text) if is_text => StreamEvent::TextDelta(text.to_string()),
@@ -135,9 +133,7 @@ pub fn parse_stream_line(line: &str) -> StreamEvent {
                 }
                 Some("content_block_start") => {
                     let block = event.and_then(|e| e.get("content_block"));
-                    let is_tool = block
-                        .and_then(|b| b.get("type"))
-                        .and_then(|t| t.as_str())
+                    let is_tool = block.and_then(|b| b.get("type")).and_then(|t| t.as_str())
                         == Some("tool_use");
                     match block.and_then(|b| b.get("name")).and_then(|n| n.as_str()) {
                         Some(name) if is_tool => StreamEvent::ToolActivity {
@@ -222,8 +218,7 @@ pub fn resolve_stream_outcome(
             } else {
                 // Success but no answer anywhere — never deliver an empty bubble.
                 ClaudeOutcome::Fatal {
-                    message: "claude returned an empty result and streamed no text"
-                        .to_string(),
+                    message: "claude returned an empty result and streamed no text".to_string(),
                 }
             }
         }
@@ -277,8 +272,16 @@ pub fn build_claude_args(cfg: &Config, prompt: &str, session_id: Option<&str>) -
         args.push(cfg.disallowed_tools.clone());
     }
     if let Some(sid) = session_id {
-        args.push("--resume".to_string());
-        args.push(sid.to_string());
+        // A synthetic `local-<hex>` id (context carry) names a bridge-minted ledger
+        // thread with NO real claude session, so it must NEVER be resumed — the CLI
+        // would error on an unknown session id. The hosted turn runs FRESH; on success
+        // the caller re-keys the ledger from the synthetic id to the real returned id
+        // and injects the catch-up block so the missed turns are not lost. A no-op for
+        // every real id (and when carry is off, no synthetic id ever exists).
+        if !is_synthetic_session_id(sid) {
+            args.push("--resume".to_string());
+            args.push(sid.to_string());
+        }
     }
     args
 }
@@ -572,7 +575,9 @@ pub async fn run_diet_extract(
         Some((base_url, _token, model)) => eprintln!(
             "jesse-bridge: diet extract → override backend base_url={base_url} model={model}"
         ),
-        None => eprintln!("jesse-bridge: diet extract → ambient backend (no JESSE_DIET_* override)"),
+        None => {
+            eprintln!("jesse-bridge: diet extract → ambient backend (no JESSE_DIET_* override)")
+        }
     }
     run_stateless_oneshot(cfg, cmd, timeout_secs, "diet extraction").await
 }
@@ -742,6 +747,15 @@ pub async fn run_claude_streaming(
     // outcome is the loop's `break` value and the function is statically total:
     // every path breaks or `continue`s, so there is no post-loop `unreachable!()`
     // the compiler couldn't prove was dead.
+    // Resume-after-sweep safety: if the requested session's transcript no longer
+    // exists on disk (reclaimed by the GC sweep, or deleted while the phone thread
+    // lived on), drop the `--resume` so `claude --resume <gone>` can never surface a
+    // raw CLI error — the turn runs FRESH and returns a new session id (the app keeps
+    // its local transcript and stores the new id). A live real id and a synthetic
+    // `local-` id pass through unchanged. Resolved ONCE here (not per attempt) since
+    // a mid-turn sweep can't remove a session claude is actively holding open.
+    let session_id = resolve_resume_session(cfg, session_id);
+
     let mut attempt = 0u32;
     loop {
         attempt += 1;
@@ -797,9 +811,10 @@ pub async fn run_claude_streaming(
             let mut lines = BufReader::new(stdout).lines();
             let mut terminal: Option<ClaudeOutcome> = None;
             loop {
-                let next = lines.next_line().await.map_err(|e| {
-                    (StatusCode::BAD_GATEWAY, format!("claude io error: {e}"))
-                })?;
+                let next = lines
+                    .next_line()
+                    .await
+                    .map_err(|e| (StatusCode::BAD_GATEWAY, format!("claude io error: {e}")))?;
                 let Some(line) = next else { break };
                 match parse_stream_line(&line) {
                     StreamEvent::TextDelta(t) => jobs.stream_push_delta(job_id, &t),
@@ -832,9 +847,9 @@ pub async fn run_claude_streaming(
                     return Err((
                         StatusCode::GATEWAY_TIMEOUT,
                         format!(
-                            "Jesse hit the {}s run limit. Raise JESSE_TIMEOUT to allow longer turns.",
-                            cfg.timeout_secs
-                        ),
+                        "Jesse hit the {}s run limit. Raise JESSE_TIMEOUT to allow longer turns.",
+                        cfg.timeout_secs
+                    ),
                     ))
                 }
             }
@@ -948,7 +963,9 @@ pub async fn run_claude_oneshot(
     // audit can tell whether a title went to the override or the ambient backend.
     match &cfg.title_backend {
         Some((base_url, _token, model)) => {
-            eprintln!("jesse-bridge: title call → override backend base_url={base_url} model={model}")
+            eprintln!(
+                "jesse-bridge: title call → override backend base_url={base_url} model={model}"
+            )
         }
         None => eprintln!("jesse-bridge: title call → ambient backend (no JESSE_TITLE_* override)"),
     }
@@ -1054,8 +1071,7 @@ mod tests {
     const FX_SUCCESS: &str = include_str!("../tests/fixtures/stream/success.ndjson");
     const FX_EMPTY_RESULT: &str =
         include_str!("../tests/fixtures/stream/empty_result_success.ndjson");
-    const FX_MISSING_RESULT: &str =
-        include_str!("../tests/fixtures/stream/missing_result.ndjson");
+    const FX_MISSING_RESULT: &str = include_str!("../tests/fixtures/stream/missing_result.ndjson");
     const FX_MAX_TURNS: &str = include_str!("../tests/fixtures/stream/error_max_turns.ndjson");
     /// Replay a captured `stream-json` turn exactly as `run_claude_streaming`
     /// does: accumulate `text_delta`s, keep the last terminal `result`, then let
@@ -1172,15 +1188,21 @@ mod tests {
     }
     #[test]
     fn parse_terminal_result_4xx_is_fatal() {
-        let line = r#"{"type":"result","is_error":true,"api_error_status":400,"result":"bad request"}"#;
+        let line =
+            r#"{"type":"result","is_error":true,"api_error_status":400,"result":"bad request"}"#;
         match parse_stream_line(line) {
-            StreamEvent::Done(ClaudeOutcome::Fatal { message }) => assert!(message.contains("bad request")),
+            StreamEvent::Done(ClaudeOutcome::Fatal { message }) => {
+                assert!(message.contains("bad request"))
+            }
             other => panic!("expected Done(Fatal), got {other:?}"),
         }
     }
     #[test]
     fn parse_non_json_and_noise_lines_are_ignored() {
-        assert!(matches!(parse_stream_line("not json at all"), StreamEvent::Ignore));
+        assert!(matches!(
+            parse_stream_line("not json at all"),
+            StreamEvent::Ignore
+        ));
         assert!(matches!(parse_stream_line("   "), StreamEvent::Ignore));
         let init = r#"{"type":"system","subtype":"init","session_id":"s","tools":[]}"#;
         assert!(matches!(parse_stream_line(init), StreamEvent::Ignore));
@@ -1195,7 +1217,10 @@ mod tests {
         let pos = |needle: &str| args.iter().position(|a| a == needle);
         let of = pos("--output-format").expect("--output-format present");
         assert_eq!(args[of + 1], "stream-json");
-        assert!(pos("--verbose").is_some(), "stream-json + -p requires --verbose");
+        assert!(
+            pos("--verbose").is_some(),
+            "stream-json + -p requires --verbose"
+        );
         assert!(
             pos("--include-partial-messages").is_some(),
             "token-level deltas require --include-partial-messages"
@@ -1211,7 +1236,10 @@ mod tests {
                     "expected the full ~693-char answer, got {} chars",
                     result.len()
                 );
-                assert_eq!(session_id.as_deref(), Some("0a61d246-062e-4910-b825-44ebd04f0bbd"));
+                assert_eq!(
+                    session_id.as_deref(),
+                    Some("0a61d246-062e-4910-b825-44ebd04f0bbd")
+                );
             }
             other => panic!("expected Ok with full text, got {other:?}"),
         }
@@ -1226,7 +1254,10 @@ mod tests {
                     result.contains("This vault is") && !result.trim().is_empty(),
                     "empty `result` should fall back to streamed text, got {result:?}"
                 );
-                assert_eq!(session_id.as_deref(), Some("0a61d246-062e-4910-b825-44ebd04f0bbd"));
+                assert_eq!(
+                    session_id.as_deref(),
+                    Some("0a61d246-062e-4910-b825-44ebd04f0bbd")
+                );
             }
             other => panic!("expected Ok with streamed text, got {other:?}"),
         }
@@ -1261,7 +1292,10 @@ mod tests {
         // must still surface as a failure even though narration text streamed —
         // mid-turn narration is not the answer and must not masquerade as one.
         assert!(
-            matches!(replay_outcome(FX_MAX_TURNS, ""), ClaudeOutcome::Fatal { .. }),
+            matches!(
+                replay_outcome(FX_MAX_TURNS, ""),
+                ClaudeOutcome::Fatal { .. }
+            ),
             "error envelope must stay Fatal, not be replaced by streamed narration"
         );
     }
@@ -1287,7 +1321,10 @@ mod tests {
 
         // acceptEdits / bypassPermissions never appear anywhere in the args.
         for a in &args {
-            assert!(!a.contains("acceptEdits"), "acceptEdits must not appear: {a}");
+            assert!(
+                !a.contains("acceptEdits"),
+                "acceptEdits must not appear: {a}"
+            );
             assert!(
                 !a.contains("bypassPermissions"),
                 "bypassPermissions must not appear: {a}"
@@ -1320,7 +1357,9 @@ mod tests {
             );
         }
         assert!(
-            !tools.iter().any(|t| *t == "Bash(node:*)" || *t == "Bash(node)"),
+            !tools
+                .iter()
+                .any(|t| *t == "Bash(node:*)" || *t == "Bash(node)"),
             "a bare node scope (arbitrary-JS RCE) must never be allowed: {tools:?}"
         );
 
@@ -1364,7 +1403,10 @@ mod tests {
             .position(|a| a == "--disallowedTools")
             .expect("--disallowedTools present");
         let deny: Vec<&str> = args[didx + 1].split(',').map(|t| t.trim()).collect();
-        assert!(deny.contains(&"WebFetch"), "WebFetch must be denied: {deny:?}");
+        assert!(
+            deny.contains(&"WebFetch"),
+            "WebFetch must be denied: {deny:?}"
+        );
         assert!(
             !deny.contains(&"Bash"),
             "bare Bash must NOT be in the denylist — it disables the whole Bash \
@@ -1372,8 +1414,11 @@ mod tests {
         );
     }
     /// The three env vars the title-backend override sets on the title child.
-    const TITLE_ENV_KEYS: [&str; 3] =
-        ["ANTHROPIC_BASE_URL", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_MODEL"];
+    const TITLE_ENV_KEYS: [&str; 3] = [
+        "ANTHROPIC_BASE_URL",
+        "ANTHROPIC_AUTH_TOKEN",
+        "ANTHROPIC_MODEL",
+    ];
 
     /// Read the env OVERRIDES a `Command` carries (what `.env()` added), as a
     /// map. `get_envs()` yields only the explicit per-command overrides, not the
@@ -1403,9 +1448,18 @@ mod tests {
         let mut cmd = build_claude_command(&cfg, "hi", None);
         apply_title_env(&mut cmd, &cfg);
         let env = cmd_env_overrides(&cmd);
-        assert_eq!(env.get("ANTHROPIC_BASE_URL").map(String::as_str), Some("http://127.0.0.1:9100"));
-        assert_eq!(env.get("ANTHROPIC_AUTH_TOKEN").map(String::as_str), Some("dsv4-local-dummy"));
-        assert_eq!(env.get("ANTHROPIC_MODEL").map(String::as_str), Some("local-title"));
+        assert_eq!(
+            env.get("ANTHROPIC_BASE_URL").map(String::as_str),
+            Some("http://127.0.0.1:9100")
+        );
+        assert_eq!(
+            env.get("ANTHROPIC_AUTH_TOKEN").map(String::as_str),
+            Some("dsv4-local-dummy")
+        );
+        assert_eq!(
+            env.get("ANTHROPIC_MODEL").map(String::as_str),
+            Some("local-title")
+        );
     }
 
     #[test]
@@ -1414,12 +1468,18 @@ mod tests {
         // vars — it inherits the ambient process env byte-for-byte, exactly as
         // before this feature existed.
         let cfg = test_config();
-        assert!(cfg.title_backend.is_none(), "test_config must default to no override");
+        assert!(
+            cfg.title_backend.is_none(),
+            "test_config must default to no override"
+        );
         let mut cmd = build_claude_command(&cfg, "hi", None);
         apply_title_env(&mut cmd, &cfg);
         let env = cmd_env_overrides(&cmd);
         for k in TITLE_ENV_KEYS {
-            assert!(!env.contains_key(k), "unconfigured title child must not set {k}");
+            assert!(
+                !env.contains_key(k),
+                "unconfigured title child must not set {k}"
+            );
         }
     }
 
@@ -1463,14 +1523,14 @@ mod tests {
             .get_args()
             .map(|a| a.to_string_lossy().into_owned())
             .collect();
-        args.iter().position(|a| a == flag).map(|i| args[i + 1].clone())
+        args.iter()
+            .position(|a| a == flag)
+            .map(|i| args[i + 1].clone())
     }
 
     /// True if a bare (valueless) flag appears anywhere in a Command's argv.
     fn cmd_has_flag(cmd: &Command, flag: &str) -> bool {
-        cmd.as_std()
-            .get_args()
-            .any(|a| a.to_string_lossy() == flag)
+        cmd.as_std().get_args().any(|a| a.to_string_lossy() == flag)
     }
 
     #[test]
@@ -1481,9 +1541,18 @@ mod tests {
         let mut cmd = build_diet_child_command(&cfg, "hi");
         apply_diet_env(&mut cmd, &cfg);
         let env = cmd_env_overrides(&cmd);
-        assert_eq!(env.get("ANTHROPIC_BASE_URL").map(String::as_str), Some("http://127.0.0.1:9100"));
-        assert_eq!(env.get("ANTHROPIC_AUTH_TOKEN").map(String::as_str), Some("dsv4-diet-dummy"));
-        assert_eq!(env.get("ANTHROPIC_MODEL").map(String::as_str), Some("local-diet"));
+        assert_eq!(
+            env.get("ANTHROPIC_BASE_URL").map(String::as_str),
+            Some("http://127.0.0.1:9100")
+        );
+        assert_eq!(
+            env.get("ANTHROPIC_AUTH_TOKEN").map(String::as_str),
+            Some("dsv4-diet-dummy")
+        );
+        assert_eq!(
+            env.get("ANTHROPIC_MODEL").map(String::as_str),
+            Some("local-diet")
+        );
     }
 
     #[test]
@@ -1496,7 +1565,10 @@ mod tests {
         apply_diet_env(&mut cmd, &cfg);
         let env = cmd_env_overrides(&cmd);
         for k in TITLE_ENV_KEYS {
-            assert!(!env.contains_key(k), "unconfigured extract child must not set {k}");
+            assert!(
+                !env.contains_key(k),
+                "unconfigured extract child must not set {k}"
+            );
         }
     }
 
@@ -1524,7 +1596,10 @@ mod tests {
         let cfg = cfg_with_diet_backend();
         let cmd = build_diet_child_command(&cfg, "hi");
         let allow = cmd_arg_value(&cmd, "--allowedTools").expect("--allowedTools present");
-        assert_eq!(allow, "", "the diet child's allowlist must be EMPTY (no tools)");
+        assert_eq!(
+            allow, "",
+            "the diet child's allowlist must be EMPTY (no tools)"
+        );
         let deny = cmd_arg_value(&cmd, "--disallowedTools").expect("--disallowedTools present");
         for class in ["Bash", "Write", "Edit", "WebFetch", "WebSearch", "Task"] {
             assert!(
@@ -1556,7 +1631,10 @@ mod tests {
         for cmd in both_diet_child_commands() {
             let tools = cmd_arg_value(&cmd, "--tools")
                 .expect("--tools must be present (deny-by-default toolset)");
-            assert_eq!(tools, "", "--tools must be EMPTY to disable all built-in tools");
+            assert_eq!(
+                tools, "",
+                "--tools must be EMPTY to disable all built-in tools"
+            );
         }
     }
 
@@ -1596,7 +1674,14 @@ mod tests {
             let deny = cmd_arg_value(&cmd, "--disallowedTools").expect("--disallowedTools present");
             let names: Vec<&str> = deny.split(',').map(|t| t.trim()).collect();
             for class in [
-                "Glob", "Grep", "Read", "ToolSearch", "Workflow", "Agent", "TodoWrite", "Skill",
+                "Glob",
+                "Grep",
+                "Read",
+                "ToolSearch",
+                "Workflow",
+                "Agent",
+                "TodoWrite",
+                "Skill",
             ] {
                 assert!(
                     names.contains(&class),
@@ -1640,7 +1725,10 @@ mod tests {
             let a = build_claude_command(&with, "log a banana", sid);
             let b = build_claude_command(&without, "log a banana", sid);
             let argv = |c: &Command| -> Vec<String> {
-                c.as_std().get_args().map(|s| s.to_string_lossy().into_owned()).collect()
+                c.as_std()
+                    .get_args()
+                    .map(|s| s.to_string_lossy().into_owned())
+                    .collect()
             };
             assert_eq!(argv(&a), argv(&b), "argv must be identical (kill switch)");
             assert_eq!(
@@ -1676,9 +1764,18 @@ mod tests {
         let mut cmd = build_vaultqa_child_command(&cfg, "hi");
         apply_vaultqa_env(&mut cmd, &cfg);
         let env = cmd_env_overrides(&cmd);
-        assert_eq!(env.get("ANTHROPIC_BASE_URL").map(String::as_str), Some("http://127.0.0.1:9100"));
-        assert_eq!(env.get("ANTHROPIC_AUTH_TOKEN").map(String::as_str), Some("vaultqa-dummy-tok"));
-        assert_eq!(env.get("ANTHROPIC_MODEL").map(String::as_str), Some("local-vaultqa"));
+        assert_eq!(
+            env.get("ANTHROPIC_BASE_URL").map(String::as_str),
+            Some("http://127.0.0.1:9100")
+        );
+        assert_eq!(
+            env.get("ANTHROPIC_AUTH_TOKEN").map(String::as_str),
+            Some("vaultqa-dummy-tok")
+        );
+        assert_eq!(
+            env.get("ANTHROPIC_MODEL").map(String::as_str),
+            Some("local-vaultqa")
+        );
     }
 
     #[test]
@@ -1689,7 +1786,10 @@ mod tests {
         apply_vaultqa_env(&mut cmd, &cfg);
         let env = cmd_env_overrides(&cmd);
         for k in TITLE_ENV_KEYS {
-            assert!(!env.contains_key(k), "unconfigured vault-QA child must not set {k}");
+            assert!(
+                !env.contains_key(k),
+                "unconfigured vault-QA child must not set {k}"
+            );
         }
     }
 
@@ -1715,28 +1815,61 @@ mod tests {
         let mcp = cmd_arg_value(&cmd, "--mcp-config").expect("--mcp-config present");
         let parsed: serde_json::Value = serde_json::from_str(&mcp).expect("valid JSON");
         assert!(
-            parsed.get("mcpServers").and_then(|v| v.as_object()).map(|m| m.is_empty()).unwrap_or(true),
+            parsed
+                .get("mcpServers")
+                .and_then(|v| v.as_object())
+                .map(|m| m.is_empty())
+                .unwrap_or(true),
             "unset MCP config → no servers: {mcp:?}"
         );
 
         let allow = cmd_arg_value(&cmd, "--allowedTools").expect("--allowedTools present");
         let allowed: Vec<&str> = allow.split(',').map(|t| t.trim()).collect();
-        for t in ["Read", "Grep", "Glob", "mcp__qmd__query", "mcp__qmd__get", "mcp__qmd__multi_get", "mcp__qmd__status"] {
+        for t in [
+            "Read",
+            "Grep",
+            "Glob",
+            "mcp__qmd__query",
+            "mcp__qmd__get",
+            "mcp__qmd__multi_get",
+            "mcp__qmd__status",
+        ] {
             assert!(allowed.contains(&t), "allowlist must name {t}: {allowed:?}");
         }
         // No mutation/exec built-in is granted.
         for t in ["Write", "Edit", "Bash"] {
-            assert!(!allowed.contains(&t), "allowlist must NOT grant {t}: {allowed:?}");
+            assert!(
+                !allowed.contains(&t),
+                "allowlist must NOT grant {t}: {allowed:?}"
+            );
         }
 
         let deny = cmd_arg_value(&cmd, "--disallowedTools").expect("--disallowedTools present");
         let denied: Vec<&str> = deny.split(',').map(|t| t.trim()).collect();
-        for class in ["Bash", "Write", "Edit", "NotebookEdit", "WebFetch", "WebSearch", "Task", "Agent", "ToolSearch", "Workflow", "TodoWrite"] {
-            assert!(denied.contains(&class), "denylist must name {class}: {denied:?}");
+        for class in [
+            "Bash",
+            "Write",
+            "Edit",
+            "NotebookEdit",
+            "WebFetch",
+            "WebSearch",
+            "Task",
+            "Agent",
+            "ToolSearch",
+            "Workflow",
+            "TodoWrite",
+        ] {
+            assert!(
+                denied.contains(&class),
+                "denylist must name {class}: {denied:?}"
+            );
         }
 
         // Stateless: never --resume.
-        assert!(!cmd_has_flag(&cmd, "--resume"), "vault-QA child must not resume a session");
+        assert!(
+            !cmd_has_flag(&cmd, "--resume"),
+            "vault-QA child must not resume a session"
+        );
 
         // cwd = the vault (the intentional divergence from the diet child's scratch cwd).
         assert_eq!(
@@ -1768,7 +1901,10 @@ mod tests {
         // none of the three ANTHROPIC_* overrides, because the main-turn builder never
         // calls apply_vaultqa_env. A vault-QA-only redirect can never leak onto a turn.
         let cfg = cfg_with_vaultqa_backend();
-        assert!(cfg.vaultqa_backend.is_some(), "precondition: override is set");
+        assert!(
+            cfg.vaultqa_backend.is_some(),
+            "precondition: override is set"
+        );
         for sid in [None, Some("sess-1")] {
             let cmd = build_claude_command(&cfg, "do the thing", sid);
             let env = cmd_env_overrides(&cmd);
@@ -1792,11 +1928,22 @@ mod tests {
             let a = build_claude_command(&with, "what is my vo2 max", sid);
             let b = build_claude_command(&without, "what is my vo2 max", sid);
             let argv = |c: &Command| -> Vec<String> {
-                c.as_std().get_args().map(|s| s.to_string_lossy().into_owned()).collect()
+                c.as_std()
+                    .get_args()
+                    .map(|s| s.to_string_lossy().into_owned())
+                    .collect()
             };
             assert_eq!(argv(&a), argv(&b), "argv identical (kill switch)");
-            assert_eq!(a.as_std().get_current_dir(), b.as_std().get_current_dir(), "cwd identical");
-            assert_eq!(cmd_env_overrides(&a), cmd_env_overrides(&b), "env overrides identical (none)");
+            assert_eq!(
+                a.as_std().get_current_dir(),
+                b.as_std().get_current_dir(),
+                "cwd identical"
+            );
+            assert_eq!(
+                cmd_env_overrides(&a),
+                cmd_env_overrides(&b),
+                "env overrides identical (none)"
+            );
         }
     }
 
@@ -1809,6 +1956,29 @@ mod tests {
         // No --resume without a session id.
         let none = build_claude_args(&cfg, "hi", None);
         assert!(!none.iter().any(|a| a == "--resume"));
+    }
+    #[test]
+    fn build_claude_args_never_resumes_a_synthetic_local_id() {
+        // Context carry: a `local-<hex>` thread id names a bridge-minted ledger thread
+        // with NO real claude session behind it, so it must never reach --resume (the
+        // CLI would error on an unknown session). The hosted turn runs fresh; the
+        // caller re-keys the ledger from the synthetic id to the real returned id on
+        // success. Proven directly on the argv the child is spawned with.
+        let cfg = test_config();
+        let synthetic = format!("local-{}", random_hex());
+        let args = build_claude_args(&cfg, "hi", Some(&synthetic));
+        assert!(
+            !args.iter().any(|a| a == "--resume"),
+            "a synthetic local- id must never produce --resume: {args:?}"
+        );
+        assert!(
+            !args.iter().any(|a| a == &synthetic),
+            "the synthetic id must not appear anywhere in argv: {args:?}"
+        );
+        // A real id still resumes, unchanged.
+        let real = build_claude_args(&cfg, "hi", Some("real-sess-1"));
+        let ridx = real.iter().position(|a| a == "--resume").expect("--resume");
+        assert_eq!(real[ridx + 1], "real-sess-1");
     }
     #[test]
     fn truncate_bytes_caps_multibyte_on_char_boundary() {

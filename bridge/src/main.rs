@@ -6,7 +6,8 @@ use std::path::Path;
 
 use jesse_bridge::{
     app, binary_exists, build_apns, env_truthy, is_bind_allowed, manual_pairing_lines,
-    pairing_payload, show_token_opt_in, spawn_eviction_task, AppState, Config,
+    pairing_payload, show_token_opt_in, spawn_eviction_task, spawn_session_gc_task, AppState,
+    Config,
 };
 
 #[tokio::main]
@@ -75,7 +76,12 @@ async fn main() {
     // the QR still encodes it. Opt in with `--show-token` or JESSE_SHOW_TOKEN=1.
     let args: Vec<String> = std::env::args().collect();
     let show_token = show_token_opt_in(&args, env_truthy("JESSE_SHOW_TOKEN"));
-    for line in manual_pairing_lines(&advertise_host, state.cfg.port, &state.cfg.token, show_token) {
+    for line in manual_pairing_lines(
+        &advertise_host,
+        state.cfg.port,
+        &state.cfg.token,
+        show_token,
+    ) {
         println!("{line}");
     }
 
@@ -90,5 +96,12 @@ async fn main() {
     // Evict expired jobs on a periodic background task rather than on the request
     // hot path (H3), so a sweep's file unlinks never delay a turn.
     spawn_eviction_task(state.jobs.clone());
-    axum::serve(listener, app(state)).await.expect("server error");
+    // Reclaim orphaned vault-project Claude Code sessions older than
+    // JESSE_SESSION_TTL_DAYS on a background sweep (one run at startup, then
+    // periodic). Scoped to the vault project only; an actively-resumed session
+    // touches its mtime and is never reclaimed.
+    spawn_session_gc_task(state.cfg.clone(), state.titles.clone());
+    axum::serve(listener, app(state))
+        .await
+        .expect("server error");
 }

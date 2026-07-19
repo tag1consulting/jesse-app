@@ -22,7 +22,7 @@
 //! pointless without it, so its absence/parse-failure is the only `503`.
 
 use crate::*;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 /// Format a `SystemTime` as an RFC 3339 UTC timestamp (`YYYY-MM-DDTHH:MM:SSZ`).
 /// std only — reuses `prompt::civil_from_days` for the calendar math, the same
@@ -83,8 +83,8 @@ pub fn extract_js_literal(content: &str) -> Result<Value, String> {
 /// Read a file and extract its JS literal. IO and parse failures both surface as
 /// a human-readable string for the `errors` array.
 fn load_js_section(path: &Path) -> Result<Value, String> {
-    let content =
-        std::fs::read_to_string(path).map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+    let content = std::fs::read_to_string(path)
+        .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
     extract_js_literal(&content)
 }
 
@@ -407,7 +407,9 @@ pub fn reconstruct_meals(content: &str, date: &str) -> (Vec<Value>, Vec<String>)
         ) {
             Some(c) => c,
             None => {
-                errors.push(format!("meals: '{item_name}' has no calories (line {line_no})"));
+                errors.push(format!(
+                    "meals: '{item_name}' has no calories (line {line_no})"
+                ));
                 0.0
             }
         };
@@ -419,6 +421,21 @@ pub fn reconstruct_meals(content: &str, date: &str) -> (Vec<Value>, Vec<String>)
             "f": num_or_zero(&col(&rec, "Fat_g")),
             "c": num_or_zero(&col(&rec, "Carbs_g")),
             "fiber": num_or_zero(&col(&rec, "Fiber_g")),
+            // The four trailing micronutrients use opt_num, NOT num_or_zero: a
+            // blank/unparseable cell means UNKNOWN, so it stays JSON null rather
+            // than collapsing to 0 the way fiber (and p/f/c) do. A legacy short
+            // row that ends before these columns reads them blank → null.
+            "na": opt_num(&col(&rec, "Sodium_mg")),
+            "satf": opt_num(&col(&rec, "SatFat_g")),
+            "sug": opt_num(&col(&rec, "Sugar_g")),
+            "k": opt_num(&col(&rec, "Potassium_mg")),
+            // The three newest trailing micronutrients — same opt_num discipline: a
+            // blank/unparseable/absent cell is UNKNOWN (JSON null), never 0. Per-item
+            // GAUGE fields on GET /jesse/diet; short names ca/o3/mg match the app
+            // snapshot decoder.
+            "ca": opt_num(&col(&rec, "Calcium_mg")),
+            "o3": opt_num(&col(&rec, "Omega3_mg")),
+            "mg": opt_num(&col(&rec, "Magnesium_mg")),
         });
         if let Some(g) = groups.iter_mut().find(|g| g.0 == meal && g.1 == time) {
             g.2.push(item);
@@ -445,6 +462,139 @@ pub fn reconstruct_meals(content: &str, date: &str) -> (Vec<Value>, Vec<String>)
     (meals, errors)
 }
 
+/// The per-day, per-nutrient aggregate columns for [`nutrient_series`]: the output
+/// key paired with the `food-log.csv` header it reads. Addressed by NAME (the log is
+/// ragged and column order has drifted). `unsat` is NOT here — it is derived from
+/// `Fat_g` − `SatFat_g` and handled separately. Keys mirror the app's decoder:
+/// cal/p/f/c/fiber/na/satf/sug/k/ca/o3/mg (+ derived unsat).
+const NUTRIENT_COLS: &[(&str, &str)] = &[
+    ("cal", "Calories"),
+    ("p", "Protein_g"),
+    ("f", "Fat_g"),
+    ("c", "Carbs_g"),
+    ("fiber", "Fiber_g"),
+    ("na", "Sodium_mg"),
+    ("satf", "SatFat_g"),
+    ("sug", "Sugar_g"),
+    ("k", "Potassium_mg"),
+    ("ca", "Calcium_mg"),
+    ("o3", "Omega3_mg"),
+    ("mg", "Magnesium_mg"),
+];
+
+/// The 90-most-recent-dates cap on [`nutrient_series`]. Older dates are dropped
+/// entirely; the app labels the visible range.
+const NUTRIENT_SERIES_MAX_DAYS: usize = 90;
+
+/// A running per-nutrient tally within one day: the sum of KNOWN values and the
+/// counts of items that were known vs unknown for that nutrient. `unknown` is NOT
+/// summed as 0 — a blank/absent cell is an unknown contribution, never a zero.
+#[derive(Default)]
+struct NutrientAgg {
+    sum: f64,
+    known: u64,
+    unknown: u64,
+}
+
+impl NutrientAgg {
+    /// Fold one item's value in: `Some(v)` is a known contribution added to the sum;
+    /// `None` is an unknown contribution that only bumps the unknown count.
+    fn add(&mut self, v: Option<f64>) {
+        match v {
+            Some(x) => {
+                self.sum += x;
+                self.known += 1;
+            }
+            None => self.unknown += 1,
+        }
+    }
+}
+
+/// Build `nutrientSeries`: a per-day, per-nutrient aggregate over `food-log.csv`,
+/// one object per DATE ascending, capped to the most recent
+/// [`NUTRIENT_SERIES_MAX_DAYS`] dates. UNKNOWN IS NOT ZERO — a blank/unparseable/
+/// absent cell is an unknown contribution (never summed as 0), and a nutrient with
+/// no known contributor on a day is OMITTED for that day (the app renders a gap). A
+/// day with no known nutrient at all is omitted entirely. Pure and unit-testable;
+/// std/serde_json only. Mirrors [`reconstruct_meals`]: flexible reader, columns by
+/// header NAME, and the same opt-numeric discipline (`None` for blank/unparseable)
+/// that keeps unknown distinct from 0 — never the blank-to-0 helper the item totals
+/// use. Targets/medians/trends are the app's math, not the bridge's.
+pub fn nutrient_series(food_csv: &str) -> Vec<Value> {
+    let mut rdr = csv::ReaderBuilder::new()
+        .has_headers(true)
+        .flexible(true)
+        .from_reader(food_csv.as_bytes());
+    let idx = match rdr.headers() {
+        Ok(h) => header_index(h),
+        Err(_) => return vec![],
+    };
+    // An optional numeric cell by header name → Some(f64) only when present AND
+    // parseable; blank / unparseable / absent (short legacy row) → None (UNKNOWN).
+    // Same semantics as `opt_num`, but yielding Option<f64> so the aggregate can
+    // count known vs unknown rather than collapsing a blank to 0.
+    let opt = |rec: &csv::StringRecord, name: &str| -> Option<f64> {
+        idx.get(name)
+            .and_then(|&j| rec.get(j))
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .and_then(|s| s.parse::<f64>().ok())
+    };
+
+    // Date (ascending, deduped) → nutrient key → tally. BTreeMap keeps dates sorted
+    // so the 90-cap can keep the most recent tail and emit ascending.
+    let mut by_day: BTreeMap<String, HashMap<&'static str, NutrientAgg>> = BTreeMap::new();
+    for rec in rdr.records().flatten() {
+        let date = idx
+            .get("Date")
+            .and_then(|&j| rec.get(j))
+            .unwrap_or("")
+            .trim();
+        // Only real ISO dates form a series bucket (mirrors availableDays); a blank
+        // or malformed Date can't be a chart point.
+        if valid_iso_date(date).is_none() {
+            continue;
+        }
+        let day = by_day.entry(date.to_string()).or_default();
+        for &(key, col) in NUTRIENT_COLS {
+            day.entry(key).or_default().add(opt(&rec, col));
+        }
+        // Derived unsaturated fat: KNOWN only when BOTH Fat_g and SatFat_g are known;
+        // otherwise the item is unknown for unsat. A rounding-negative is clamped to
+        // 0 at the item level before summing (a real present value is fine).
+        let unsat = match (opt(&rec, "Fat_g"), opt(&rec, "SatFat_g")) {
+            (Some(f), Some(sf)) => Some((f - sf).max(0.0)),
+            _ => None,
+        };
+        day.entry("unsat").or_default().add(unsat);
+    }
+
+    // Emit ascending, keeping only the most recent cap dates. For each day, a
+    // nutrient key appears ONLY when known >= 1; a day with no known nutrient at all
+    // is dropped so it reads as a gap downstream, not a false zero.
+    let skip = by_day.len().saturating_sub(NUTRIENT_SERIES_MAX_DAYS);
+    let mut out = Vec::new();
+    for (date, aggs) in by_day.into_iter().skip(skip) {
+        let mut nutrients = serde_json::Map::new();
+        // Emit in NUTRIENT_COLS order, then unsat, for a stable, readable shape.
+        for &(key, _) in NUTRIENT_COLS.iter().chain([("unsat", "")].iter()) {
+            if let Some(a) = aggs.get(key) {
+                if a.known >= 1 {
+                    nutrients.insert(
+                        key.to_string(),
+                        json!({ "sum": a.sum, "known": a.known, "unknown": a.unknown }),
+                    );
+                }
+            }
+        }
+        if nutrients.is_empty() {
+            continue;
+        }
+        out.push(json!({ "date": date, "nutrients": Value::Object(nutrients) }));
+    }
+    out
+}
+
 /// Reconstruct a day's exercise from `exercise-log.csv` for `date`, mapped to the
 /// exercise shape and sorted by `Start_Time` (null first). A structurally broken
 /// row is skipped and counted once into `errors`. Pure and unit-testable.
@@ -458,7 +608,12 @@ pub fn reconstruct_exercise(content: &str, date: &str) -> (Vec<Value>, Vec<Strin
         .from_reader(content.as_bytes());
     let idx = match rdr.headers() {
         Ok(h) => header_index(h),
-        Err(_) => return (vec![], vec!["exercise: exercise-log.csv header unreadable".into()]),
+        Err(_) => {
+            return (
+                vec![],
+                vec!["exercise: exercise-log.csv header unreadable".into()],
+            )
+        }
     };
     let col = |rec: &csv::StringRecord, name: &str| -> String {
         idx.get(name)
@@ -635,7 +790,9 @@ pub async fn jesse_diet(
 
     // Read the append-only logs once — reused for weightSeries, availableDays, and
     // (on a history request) reconstruction. Missing files are simply absent.
-    let food_csv = std::fs::read_to_string(logs.join("food-log.csv")).ok();
+    let food_path = logs.join("food-log.csv");
+    let food_read = std::fs::read_to_string(&food_path);
+    let food_csv = food_read.as_deref().ok();
     let exercise_csv = std::fs::read_to_string(logs.join("exercise-log.csv")).ok();
     let weight_path = logs.join("weight-log.csv");
     let weight_read = std::fs::read_to_string(&weight_path);
@@ -654,7 +811,26 @@ pub async fn jesse_diet(
         }
         Err(e) => (
             Value::Null,
-            vec![format!("weightSeries: cannot read {}: {e}", weight_path.display())],
+            vec![format!(
+                "weightSeries: cannot read {}: {e}",
+                weight_path.display()
+            )],
+        ),
+    };
+
+    // nutrientSeries: shared by today and history (per-nutrient trend charts are
+    // inherently historical), built from the SAME food-log.csv read as weightSeries
+    // and availableDays. Present → the array (possibly empty); a missing/unreadable
+    // file → `[]` + one error (an absent chart is fine; a null crash is not — so it
+    // is `[]`, not null, unlike weightSeries).
+    let (nutrient_series_val, nutrient_errors): (Value, Vec<String>) = match &food_read {
+        Ok(content) => (Value::Array(nutrient_series(content)), Vec::new()),
+        Err(e) => (
+            Value::Array(vec![]),
+            vec![format!(
+                "nutrientSeries: cannot read {}: {e}",
+                food_path.display()
+            )],
         ),
     };
 
@@ -663,7 +839,7 @@ pub async fn jesse_diet(
     if !today_date.is_empty() {
         days.insert(today_date.clone());
     }
-    if let Some(c) = &food_csv {
+    if let Some(c) = food_csv {
         days.extend(csv_dates(c));
     }
     if let Some(c) = &exercise_csv {
@@ -703,11 +879,15 @@ pub async fn jesse_diet(
             },
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
             Err(e) => {
-                errors.push(format!("proposed: cannot read {}: {e}", proposed_path.display()));
+                errors.push(format!(
+                    "proposed: cannot read {}: {e}",
+                    proposed_path.display()
+                ));
                 None
             }
         };
         errors.extend(weight_errors);
+        errors.extend(nutrient_errors);
 
         return Ok(Json(json!({
             "asOf": rfc3339_utc(SystemTime::now()),
@@ -717,6 +897,7 @@ pub async fn jesse_diet(
             "progress": progress,
             "coach": coach,
             "weightSeries": weight_series,
+            "nutrientSeries": nutrient_series_val,
             "errors": errors,
             "availableDays": available,
             "historical": false,
@@ -753,7 +934,7 @@ pub async fn jesse_diet(
                 errors.push(format!("archive: {e}"));
                 let (recon, errs) = reconstruct_day(
                     &date,
-                    food_csv.as_deref(),
+                    food_csv,
                     exercise_csv.as_deref(),
                     weight_read.as_deref().ok(),
                 );
@@ -764,7 +945,7 @@ pub async fn jesse_diet(
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             let (recon, errs) = reconstruct_day(
                 &date,
-                food_csv.as_deref(),
+                food_csv,
                 exercise_csv.as_deref(),
                 weight_read.as_deref().ok(),
             );
@@ -772,10 +953,13 @@ pub async fn jesse_diet(
             (recon, "reconstructed", None)
         }
         Err(e) => {
-            errors.push(format!("archive: cannot read {}: {e}", archive_path.display()));
+            errors.push(format!(
+                "archive: cannot read {}: {e}",
+                archive_path.display()
+            ));
             let (recon, errs) = reconstruct_day(
                 &date,
-                food_csv.as_deref(),
+                food_csv,
                 exercise_csv.as_deref(),
                 weight_read.as_deref().ok(),
             );
@@ -784,6 +968,7 @@ pub async fn jesse_diet(
         }
     };
     errors.extend(weight_errors);
+    errors.extend(nutrient_errors);
 
     // Historical requests never carry proposed/progress/coach — those files
     // describe the CURRENT state, so attaching them to a past date would be wrong.
@@ -795,6 +980,7 @@ pub async fn jesse_diet(
         "progress": Value::Null,
         "coach": Value::Null,
         "weightSeries": weight_series,
+        "nutrientSeries": nutrient_series_val,
         "errors": errors,
         "availableDays": available,
         "historical": true,
@@ -914,7 +1100,8 @@ mod tests {
 
     #[test]
     fn preserves_chronological_file_order() {
-        let csv = format!("{HEADER}\n2026-07-01,200,,,,,\n2026-07-02,199,,,,,\n2026-07-03,198,,,,,\n");
+        let csv =
+            format!("{HEADER}\n2026-07-01,200,,,,,\n2026-07-02,199,,,,,\n2026-07-03,198,,,,,\n");
         let (rows, _) = parse_weight_csv(&csv);
         let dates: Vec<&str> = rows.iter().map(|r| r["date"].as_str().unwrap()).collect();
         assert_eq!(dates, ["2026-07-01", "2026-07-02", "2026-07-03"]);
@@ -936,7 +1123,10 @@ mod tests {
         assert_eq!(rows[0]["date"], "2026-07-01");
         assert_eq!(rows[1]["date"], "2026-07-04");
         assert_eq!(errs.len(), 1, "one summary error line");
-        assert!(errs[0].contains('3') && errs[0].contains('4'), "names the bad lines: {errs:?}");
+        assert!(
+            errs[0].contains('3') && errs[0].contains('4'),
+            "names the bad lines: {errs:?}"
+        );
     }
 
     #[test]
@@ -950,7 +1140,8 @@ mod tests {
 
     #[test]
     fn empty_ideas_normalizes_to_none() {
-        let v = extract_js_literal("window.PROPOSED_DIET = { date: '2026-07-08', ideas: [] };").unwrap();
+        let v = extract_js_literal("window.PROPOSED_DIET = { date: '2026-07-08', ideas: [] };")
+            .unwrap();
         assert!(normalize_proposed(v).is_none());
     }
 
@@ -993,15 +1184,15 @@ mod tests {
     #[test]
     fn rejects_malformed_dates() {
         for bad in [
-            "2026-4-5",     // not zero-padded
-            "2026-13-01",   // month out of range
-            "2026-04-32",   // day out of range
-            "2026/04/15",   // wrong separator
-            "2026-04-15T",  // trailing char / wrong length
-            "abcd-ef-gh",   // non-digit
-            "",             // empty
-            "2026-00-10",   // month 0
-            "2026-04-00",   // day 0
+            "2026-4-5",    // not zero-padded
+            "2026-13-01",  // month out of range
+            "2026-04-32",  // day out of range
+            "2026/04/15",  // wrong separator
+            "2026-04-15T", // trailing char / wrong length
+            "abcd-ef-gh",  // non-digit
+            "",            // empty
+            "2026-00-10",  // month 0
+            "2026-04-00",  // day 0
         ] {
             assert!(valid_iso_date(bad).is_none(), "should reject {bad:?}");
         }
@@ -1009,7 +1200,7 @@ mod tests {
 
     // ---- reconstruct_meals -------------------------------------------------
 
-    const FOOD_HEADER: &str = "Date,Meal,Item,Amount,Unit,Cal_per_100g,Grams,Calories,Protein_g,Fat_g,Carbs_g,Notes,Time,Meal_Type,Fiber_g";
+    const FOOD_HEADER: &str = "Date,Meal,Item,Amount,Unit,Cal_per_100g,Grams,Calories,Protein_g,Fat_g,Carbs_g,Notes,Time,Meal_Type,Fiber_g,Sodium_mg,SatFat_g,Sugar_g,Potassium_mg,Calcium_mg,Omega3_mg,Magnesium_mg";
 
     #[test]
     fn groups_meals_by_meal_and_time_two_same_named_meals_stay_separate() {
@@ -1025,7 +1216,11 @@ mod tests {
         assert!(errs.is_empty(), "clean rows: {errs:?}");
         assert_eq!(meals.len(), 2, "two (Meal, Time) groups");
         assert_eq!(meals[0]["time"], "10:00");
-        assert_eq!(meals[0]["items"].as_array().unwrap().len(), 2, "Apple + Grapes");
+        assert_eq!(
+            meals[0]["items"].as_array().unwrap().len(),
+            2,
+            "Apple + Grapes"
+        );
         assert_eq!(meals[1]["time"], "15:30");
         assert_eq!(meals[1]["items"][0]["item"], "Almonds");
     }
@@ -1061,7 +1256,10 @@ mod tests {
         assert!(errs.is_empty());
         assert_eq!(meals.len(), 1);
         assert_eq!(meals[0]["items"][0]["item"], "Soup");
-        assert_eq!(meals[0]["items"][0]["c"], 30.0, "Notes quoting didn't shift columns");
+        assert_eq!(
+            meals[0]["items"][0]["c"], 30.0,
+            "Notes quoting didn't shift columns"
+        );
     }
 
     #[test]
@@ -1074,10 +1272,16 @@ mod tests {
              2026-03-30,Breakfast,Eggs,3,ea,,,210,18,15,1,\n" // 12 fields: no Time/Meal_Type/Fiber_g
         );
         let (meals, errs) = reconstruct_meals(&csv, "2026-03-30");
-        assert!(errs.is_empty(), "a short legacy row is not an error: {errs:?}");
+        assert!(
+            errs.is_empty(),
+            "a short legacy row is not an error: {errs:?}"
+        );
         assert_eq!(meals.len(), 1);
         assert!(meals[0]["time"].is_null(), "missing Time cell → null");
-        assert_eq!(meals[0]["items"][0]["fiber"], 0.0, "missing Fiber_g cell → 0");
+        assert_eq!(
+            meals[0]["items"][0]["fiber"], 0.0,
+            "missing Fiber_g cell → 0"
+        );
         assert_eq!(meals[0]["items"][0]["cal"], 210.0);
     }
 
@@ -1093,9 +1297,16 @@ mod tests {
         );
         let (meals, errs) = reconstruct_meals(&csv, "2026-04-15");
         assert_eq!(meals.len(), 1, "one Breakfast group");
-        assert_eq!(meals[0]["items"].as_array().unwrap().len(), 2, "Eggs + Bacon survive");
+        assert_eq!(
+            meals[0]["items"].as_array().unwrap().len(),
+            2,
+            "Eggs + Bacon survive"
+        );
         assert_eq!(errs.len(), 1, "one summary error");
-        assert!(errs[0].contains('3'), "names the torn line number: {errs:?}");
+        assert!(
+            errs[0].contains('3'),
+            "names the torn line number: {errs:?}"
+        );
     }
 
     #[test]
@@ -1107,7 +1318,10 @@ mod tests {
         let (meals, errs) = reconstruct_meals(&csv, "2026-04-15");
         assert_eq!(meals[0]["items"][0]["cal"], 0.0);
         assert_eq!(errs.len(), 1);
-        assert!(errs[0].contains("Mystery"), "error names the item: {errs:?}");
+        assert!(
+            errs[0].contains("Mystery"),
+            "error names the item: {errs:?}"
+        );
     }
 
     #[test]
@@ -1123,6 +1337,273 @@ mod tests {
         assert_eq!(items[0]["amount"], "1 cup", "bare number + unit joined");
         assert_eq!(items[1]["amount"], "1 medium (~118g)", "unit text verbatim");
         assert!(items[2]["amount"].is_null(), "blank Amount → null");
+    }
+
+    #[test]
+    fn micronutrients_populated_yield_their_numbers() {
+        // All seven trailing cells present → na/satf/sug/k/ca/o3/mg carry those numbers.
+        let csv = format!(
+            "{FOOD_HEADER}\n\
+             2026-04-15,Lunch,Soup,1,bowl,,,220,8,6,30,,12:00,Lunch,7,480,2.5,9,610,120,300,45\n"
+        );
+        let (meals, errs) = reconstruct_meals(&csv, "2026-04-15");
+        assert!(errs.is_empty(), "clean row: {errs:?}");
+        let item = &meals[0]["items"][0];
+        assert_eq!(item["na"], 480.0);
+        assert_eq!(item["satf"], 2.5);
+        assert_eq!(item["sug"], 9.0);
+        assert_eq!(item["k"], 610.0);
+        assert_eq!(item["ca"], 120.0);
+        assert_eq!(item["o3"], 300.0);
+        assert_eq!(item["mg"], 45.0);
+        // Existing keys untouched.
+        assert_eq!(item["fiber"], 7.0);
+    }
+
+    #[test]
+    fn micronutrients_blank_cells_are_null_not_zero() {
+        // The trailing cells present-but-blank mean UNKNOWN → null, NOT 0.0. This is
+        // the whole reason they use opt_num rather than num_or_zero (fiber).
+        let csv = format!(
+            "{FOOD_HEADER}\n\
+             2026-04-15,Lunch,Soup,1,bowl,,,220,8,6,30,,12:00,Lunch,7,,,,,,,\n"
+        );
+        let (meals, errs) = reconstruct_meals(&csv, "2026-04-15");
+        assert!(
+            errs.is_empty(),
+            "blank micronutrients are not an error: {errs:?}"
+        );
+        let item = &meals[0]["items"][0];
+        assert!(item["na"].is_null(), "blank Sodium_mg → null, not 0");
+        assert!(item["satf"].is_null(), "blank SatFat_g → null, not 0");
+        assert!(item["sug"].is_null(), "blank Sugar_g → null, not 0");
+        assert!(item["k"].is_null(), "blank Potassium_mg → null, not 0");
+        assert!(item["ca"].is_null(), "blank Calcium_mg → null, not 0");
+        assert!(item["o3"].is_null(), "blank Omega3_mg → null, not 0");
+        assert!(item["mg"].is_null(), "blank Magnesium_mg → null, not 0");
+        // Fiber, by contrast, still collapses a blank to 0.
+        assert_eq!(item["fiber"], 7.0);
+    }
+
+    #[test]
+    fn legacy_short_row_micronutrients_are_null_and_row_parses() {
+        // A legacy row that ends BEFORE the micronutrient columns (here it stops
+        // after Fiber_g, 15 fields) must parse normally — not be counted malformed —
+        // with na/satf/sug/k/ca/o3/mg all null (the missing cells read blank).
+        let csv = format!(
+            "{FOOD_HEADER}\n\
+             2026-03-30,Breakfast,Toast,2,ea,,,180,6,2,32,,08:00,Breakfast,3\n"
+        );
+        let (meals, errs) = reconstruct_meals(&csv, "2026-03-30");
+        assert!(
+            errs.is_empty(),
+            "a short pre-micronutrient row is not malformed: {errs:?}"
+        );
+        assert_eq!(meals.len(), 1);
+        let item = &meals[0]["items"][0];
+        assert!(item["na"].is_null(), "missing Sodium_mg cell → null");
+        assert!(item["satf"].is_null(), "missing SatFat_g cell → null");
+        assert!(item["sug"].is_null(), "missing Sugar_g cell → null");
+        assert!(item["k"].is_null(), "missing Potassium_mg cell → null");
+        assert!(item["ca"].is_null(), "missing Calcium_mg cell → null");
+        assert!(item["o3"].is_null(), "missing Omega3_mg cell → null");
+        assert!(item["mg"].is_null(), "missing Magnesium_mg cell → null");
+        // The row still reconstructs its existing fields fine.
+        assert_eq!(item["fiber"], 3.0);
+        assert_eq!(item["cal"], 180.0);
+    }
+
+    // ---- nutrient_series ---------------------------------------------------
+
+    /// The nutrients map for `date` in a series, or None if that date is absent.
+    fn day_nutrients<'a>(series: &'a [Value], date: &str) -> Option<&'a Value> {
+        series
+            .iter()
+            .find(|d| d["date"] == json!(date))
+            .map(|d| &d["nutrients"])
+    }
+
+    #[test]
+    fn nutrient_series_sums_known_values_and_counts_them() {
+        // Day 1: two items both with known potassium → k.sum = total, known = 2.
+        let csv = format!(
+            "{FOOD_HEADER}\n\
+             2026-04-15,Lunch,Soup,1,bowl,,,220,8,6,30,,12:00,Lunch,7,480,2.5,9,610,120,300,45\n\
+             2026-04-15,Dinner,Beans,1,cup,,,240,15,1,40,,18:00,Dinner,12,5,0.2,2,500,80,50,60\n"
+        );
+        let series = nutrient_series(&csv);
+        assert_eq!(series.len(), 1, "one day");
+        assert_eq!(series[0]["date"], "2026-04-15");
+        let k = &series[0]["nutrients"]["k"];
+        assert_eq!(k["sum"], 1110.0, "610 + 500");
+        assert_eq!(k["known"], 2);
+        assert_eq!(k["unknown"], 0);
+    }
+
+    #[test]
+    fn nutrient_series_blank_cell_excluded_from_sum_not_treated_as_zero() {
+        // One item knows sodium, one is blank for it → na.sum is the single known
+        // value (NOT the sum with blank counted as 0), known = 1, unknown = 1.
+        let csv = format!(
+            "{FOOD_HEADER}\n\
+             2026-04-15,Lunch,Soup,1,bowl,,,220,8,6,30,,12:00,Lunch,7,480,2.5,9,610,120,300,45\n\
+             2026-04-15,Snack,Chips,1,bag,,,150,2,10,15,,15:00,Snack,1,,1.0,0,50,10,0,20\n"
+        );
+        let series = nutrient_series(&csv);
+        let na = &series[0]["nutrients"]["na"];
+        assert_eq!(na["sum"], 480.0, "only the one known sodium, blank not 0");
+        assert_eq!(na["known"], 1);
+        assert_eq!(na["unknown"], 1);
+    }
+
+    #[test]
+    fn nutrient_series_all_unknown_nutrient_key_is_omitted_others_remain() {
+        // Every item blank for omega-3 → o3 key OMITTED for the day, while nutrients
+        // that WERE known that day still emit their keys.
+        let csv = format!(
+            "{FOOD_HEADER}\n\
+             2026-04-15,Lunch,Soup,1,bowl,,,220,8,6,30,,12:00,Lunch,7,480,2.5,9,610,120,,45\n\
+             2026-04-15,Snack,Chips,1,bag,,,150,2,10,15,,15:00,Snack,1,200,1.0,0,50,10,,20\n"
+        );
+        let series = nutrient_series(&csv);
+        let n = day_nutrients(&series, "2026-04-15").expect("day present");
+        assert!(
+            n.get("o3").is_none(),
+            "every item blank for o3 → key omitted"
+        );
+        assert!(n.get("na").is_some(), "sodium was known → present");
+        assert!(n.get("cal").is_some(), "calories known → present");
+    }
+
+    #[test]
+    fn nutrient_series_day_with_no_known_nutrient_is_omitted_entirely() {
+        // A row whose every nutrient cell (including the macros) is blank contributes
+        // no known nutrient, so the day does not appear at all.
+        let csv = format!(
+            "{FOOD_HEADER}\n\
+             2026-04-15,Snack,Water,1,glass,,,,,,,,15:00,Snack,\n"
+        );
+        let series = nutrient_series(&csv);
+        assert!(
+            series.is_empty(),
+            "no known nutrient anywhere → no day: {series:?}"
+        );
+    }
+
+    #[test]
+    fn nutrient_series_unsat_needs_both_fat_and_satfat_known() {
+        // Item A: known fat (14) and known satfat (2) → unsat contributes 12, known.
+        // Item B: known fat but BLANK satfat → unknown for unsat, excluded from sum.
+        let csv = format!(
+            "{FOOD_HEADER}\n\
+             2026-04-15,Lunch,Nuts,28,g,,,164,6,14,6,,12:00,Lunch,3,5,2,1,200,80,100,60\n\
+             2026-04-15,Snack,Oil,1,tbsp,,,120,0,14,0,,15:00,Snack,0,0,,0,0,0,0,0\n"
+        );
+        let series = nutrient_series(&csv);
+        let n = day_nutrients(&series, "2026-04-15").expect("day present");
+        let unsat = &n["unsat"];
+        assert_eq!(unsat["sum"], 12.0, "14 - 2 from item A only");
+        assert_eq!(
+            unsat["known"], 1,
+            "item B blank satfat → not known for unsat"
+        );
+        assert_eq!(unsat["unknown"], 1);
+    }
+
+    #[test]
+    fn nutrient_series_legacy_short_row_micros_unknown_macros_known() {
+        // A legacy row that ends before the micro columns is NOT malformed: its
+        // present macros count as known, its missing micros count as unknown.
+        let csv = format!(
+            "{FOOD_HEADER}\n\
+             2026-03-30,Breakfast,Toast,2,ea,,,180,6,2,32,,08:00,Breakfast,3\n"
+        );
+        let series = nutrient_series(&csv);
+        let n = day_nutrients(&series, "2026-03-30").expect("day present");
+        // Macros present → known with their values.
+        assert_eq!(n["cal"]["sum"], 180.0);
+        assert_eq!(n["cal"]["known"], 1);
+        assert_eq!(n["p"]["sum"], 6.0);
+        assert_eq!(n["f"]["known"], 1);
+        // Micros beyond the row's end → unknown, so their keys are omitted (known 0).
+        assert!(n.get("k").is_none(), "missing Potassium_mg → key omitted");
+        assert!(n.get("ca").is_none(), "missing Calcium_mg → key omitted");
+        assert!(n.get("o3").is_none(), "missing Omega3_mg → key omitted");
+        // Fiber IS present in this row (last field) → known.
+        assert_eq!(n["fiber"]["sum"], 3.0);
+    }
+
+    #[test]
+    fn nutrient_series_caps_at_ninety_most_recent_dates_ascending() {
+        // 100 distinct dates → exactly the most recent 90, ascending. Dates
+        // 2026-01-01 .. 2026-04-10 (100 consecutive days); the cap drops the oldest 10.
+        let mut csv = String::from(FOOD_HEADER);
+        csv.push('\n');
+        // Build 100 consecutive dates from a fixed start using day arithmetic in the
+        // test (no clock). 2026-01-01 is day-of-month walked across Jan..Apr.
+        let dates = ninety_plus_dates();
+        for d in &dates {
+            csv.push_str(&format!(
+                "{d},Snack,Bite,1,ea,,,100,5,2,10,,12:00,Snack,1,50,0.5,1,100,20,10,15\n"
+            ));
+        }
+        let series = nutrient_series(&csv);
+        assert_eq!(series.len(), 90, "capped to 90");
+        // Ascending, and the retained window is the most recent 90 (oldest 10 dropped).
+        assert_eq!(series[0]["date"], dates[10], "oldest kept is #11 overall");
+        assert_eq!(series[89]["date"], dates[99], "newest kept is the last");
+        let dates_out: Vec<&str> = series.iter().map(|d| d["date"].as_str().unwrap()).collect();
+        let mut sorted = dates_out.clone();
+        sorted.sort_unstable();
+        assert_eq!(dates_out, sorted, "emitted ascending");
+    }
+
+    /// 100 consecutive valid ISO dates, ascending, starting 2026-01-01 — for the cap
+    /// test. Pure integer date walking; no clock (`Date::now` is unavailable here).
+    fn ninety_plus_dates() -> Vec<String> {
+        let days_in = |m: i64| match m {
+            1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+            4 | 6 | 9 | 11 => 30,
+            2 => 28, // 2026 is not a leap year
+            _ => 30,
+        };
+        let (mut y, mut m, mut d) = (2026, 1, 1);
+        let mut out = Vec::new();
+        for _ in 0..100 {
+            out.push(format!("{y:04}-{m:02}-{d:02}"));
+            d += 1;
+            if d > days_in(m) {
+                d = 1;
+                m += 1;
+                if m > 12 {
+                    m = 1;
+                    y += 1;
+                }
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn nutrient_series_missing_header_and_empty_body_yield_empty_no_panic() {
+        // Header only, no data rows → empty series (no panic).
+        assert!(nutrient_series(&format!("{FOOD_HEADER}\n")).is_empty());
+        // Completely empty content → empty series (no panic).
+        assert!(nutrient_series("").is_empty());
+    }
+
+    #[test]
+    fn nutrient_series_unsat_clamps_rounding_negative_to_zero() {
+        // A row where SatFat_g slightly exceeds Fat_g (rounding) → unsat clamps to 0,
+        // never a negative contribution.
+        let csv = format!(
+            "{FOOD_HEADER}\n\
+             2026-04-15,Snack,Cheese,1,oz,,,110,7,9,1,,12:00,Snack,0,180,9.1,0,30,200,0,8\n"
+        );
+        let series = nutrient_series(&csv);
+        let n = day_nutrients(&series, "2026-04-15").expect("day present");
+        assert_eq!(n["unsat"]["sum"], 0.0, "9 - 9.1 clamps to 0, not negative");
+        assert_eq!(n["unsat"]["known"], 1);
     }
 
     // ---- reconstruct_exercise ----------------------------------------------
@@ -1143,13 +1624,19 @@ mod tests {
         assert_eq!(ex[0]["type"], "run");
         assert_eq!(ex[0]["distance"], 8.0);
         assert_eq!(ex[0]["unit"], "km");
-        assert_eq!(ex[0]["duration"], "56:58", "duration passed through verbatim");
+        assert_eq!(
+            ex[0]["duration"], "56:58",
+            "duration passed through verbatim"
+        );
         assert_eq!(ex[0]["pace"], "7:07");
         assert_eq!(ex[0]["avgHR"], 142.0);
         assert_eq!(ex[1]["type"], "strength");
         assert!(ex[1]["distance"].is_null(), "blank distance → null");
         assert!(ex[1]["pace"].is_null(), "blank pace → null");
-        assert_eq!(ex[1]["duration"], "0:45:00", "a different duration format, verbatim");
+        assert_eq!(
+            ex[1]["duration"], "0:45:00",
+            "a different duration format, verbatim"
+        );
     }
 
     #[test]
@@ -1195,7 +1682,10 @@ mod tests {
     #[test]
     fn weight_for_date_absent_is_none() {
         let csv = format!("{HEADER}\n2026-07-07,198.0,89.8,Phase 2,,,\n");
-        assert!(weight_for_date(&csv, "2026-07-06").is_none(), "no row that date → None");
+        assert!(
+            weight_for_date(&csv, "2026-07-06").is_none(),
+            "no row that date → None"
+        );
     }
 
     // ---- csv_dates / archive_dates -----------------------------------------
@@ -1218,6 +1708,9 @@ mod tests {
     #[test]
     fn archive_dates_missing_directory_is_empty_not_an_error() {
         let missing = std::env::temp_dir().join(format!("jesse-no-such-{}", std::process::id()));
-        assert!(archive_dates(&missing).is_empty(), "absent days/ → no archives, no panic");
+        assert!(
+            archive_dates(&missing).is_empty(),
+            "absent days/ → no archives, no panic"
+        );
     }
 }

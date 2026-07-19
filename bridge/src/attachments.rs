@@ -125,7 +125,12 @@ pub fn sniff_attachment(b: &[u8]) -> Option<(&'static str, &'static str)> {
 /// (`; charset=…`) stripped, and the common `image/jpg` spelling folded to the
 /// canonical `image/jpeg`.
 pub fn normalize_mime(m: &str) -> String {
-    let base = m.split(';').next().unwrap_or("").trim().to_ascii_lowercase();
+    let base = m
+        .split(';')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
     if base == "image/jpg" {
         "image/jpeg".to_string()
     } else {
@@ -360,15 +365,24 @@ mod tests {
     fn base64_rejects_malformed_input() {
         assert!(base64_decode("TWF").is_err(), "truncated group");
         assert!(base64_decode("****").is_err(), "invalid character");
-        assert!(base64_decode("TQ==X").is_err(), "trailing data after padding");
-        assert!(base64_decode("T=Fu").is_err(), "data after padding mid-group");
+        assert!(
+            base64_decode("TQ==X").is_err(),
+            "trailing data after padding"
+        );
+        assert!(
+            base64_decode("T=Fu").is_err(),
+            "data after padding mid-group"
+        );
         assert!(base64_decode("====").is_err(), "over-long padding");
     }
     #[test]
     fn sniff_identifies_whitelisted_types() {
         assert_eq!(sniff_attachment(PNG_BYTES), Some(("image/png", "png")));
         assert_eq!(sniff_attachment(JPEG_BYTES), Some(("image/jpeg", "jpg")));
-        assert_eq!(sniff_attachment(PDF_BYTES), Some(("application/pdf", "pdf")));
+        assert_eq!(
+            sniff_attachment(PDF_BYTES),
+            Some(("application/pdf", "pdf"))
+        );
         assert_eq!(sniff_attachment(GIF_BYTES), Some(("image/gif", "gif")));
         assert_eq!(sniff_attachment(WEBP_BYTES), Some(("image/webp", "webp")));
         assert_eq!(sniff_attachment(HEIC_BYTES), Some(("image/heic", "heic")));
@@ -378,14 +392,17 @@ mod tests {
         assert_eq!(sniff_attachment(b"not a real file"), None);
         assert_eq!(sniff_attachment(b""), None);
         assert_eq!(sniff_attachment(&[0xFF, 0xD8]), None); // too short for JPEG
-        // A ZIP/Office doc is deliberately NOT on the whitelist.
+                                                           // A ZIP/Office doc is deliberately NOT on the whitelist.
         assert_eq!(sniff_attachment(b"PK\x03\x04"), None);
     }
     #[test]
     fn normalize_mime_folds_jpg_and_strips_params() {
         assert_eq!(normalize_mime("image/jpg"), "image/jpeg");
         assert_eq!(normalize_mime("IMAGE/PNG"), "image/png");
-        assert_eq!(normalize_mime("application/pdf; charset=binary"), "application/pdf");
+        assert_eq!(
+            normalize_mime("application/pdf; charset=binary"),
+            "application/pdf"
+        );
     }
     #[test]
     fn validate_accepts_well_formed_attachments() {
@@ -639,10 +656,25 @@ mod tests {
     fn base64_error_branches_are_each_reported() {
         // One case per error branch of the hand-rolled decoder, pinned to its
         // message so a refactor can't silently collapse a branch.
-        assert_eq!(base64_decode("TWF").unwrap_err(), "base64: truncated group (length not a multiple of 4)");
-        assert_eq!(base64_decode("****").unwrap_err(), "base64: invalid character");
-        assert_eq!(base64_decode("T=Fu").unwrap_err(), "base64: data after padding");
-        assert_eq!(base64_decode("====").unwrap_err(), "base64: over-long padding");
-        assert_eq!(base64_decode("TQ==X").unwrap_err(), "base64: trailing data after padding");
+        assert_eq!(
+            base64_decode("TWF").unwrap_err(),
+            "base64: truncated group (length not a multiple of 4)"
+        );
+        assert_eq!(
+            base64_decode("****").unwrap_err(),
+            "base64: invalid character"
+        );
+        assert_eq!(
+            base64_decode("T=Fu").unwrap_err(),
+            "base64: data after padding"
+        );
+        assert_eq!(
+            base64_decode("====").unwrap_err(),
+            "base64: over-long padding"
+        );
+        assert_eq!(
+            base64_decode("TQ==X").unwrap_err(),
+            "base64: trailing data after padding"
+        );
     }
 }

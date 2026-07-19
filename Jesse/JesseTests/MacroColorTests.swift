@@ -9,6 +9,7 @@ import UIKit
 // both light and dark mode and lock that relationship in. A regression back to the
 // old independent `.brown` fails here (its hue is nowhere near the carbs teal).
 
+@MainActor
 final class MacroColorTests: XCTestCase {
 
     private let light = UITraitCollection(userInterfaceStyle: .light)

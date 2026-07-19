@@ -415,18 +415,63 @@ func macroCaptionText(_ totals: MacroTotals, includeFiber: Bool = true, units: B
     return Text(line)
 }
 
+/// The one shared layout for a nutrient sub-entry's leading indent. A sub-entry
+/// (fiber and total sugars under carbs, saturated fat under fat) is inset on the
+/// stacked list/row surfaces so it visually sits INSIDE its parent, nutrition-label
+/// style — a grouping cue, driven only by `isSubEntry`, so it reads the same in every
+/// gauge state (target-set or not, partial, all-unknown). Zero for a top-level
+/// nutrient. Deliberately NOT applied to the equal-peer ring row, nor as a
+/// proportional subdivision of a parent's bar: an EU label's declared carbohydrate
+/// excludes fibre, so a child is its own independent line, never a slice of the parent.
+enum NutrientRowLayout {
+    /// The leading indent (points) a sub-entry row is inset by. One value, no
+    /// per-nutrient copies.
+    static let subEntryIndent: CGFloat = 16
+    static func indent(isSubEntry: Bool) -> CGFloat { isSubEntry ? subEntryIndent : 0 }
+}
+
 /// A full-width bar row for the macros-and-calories detail screen: goal chip,
 /// label, value/target/percent, the meter, the remaining annotation, and any gated
 /// flag. Tapping opens the row's explainer.
 struct MetricBarRow: View {
     let gauge: MetricGauge
-    /// When true (fiber), the row label reads as a sub-entry of carbs: one type-ramp
-    /// step smaller (subheadline → footnote) and in the secondary color. The bar, the
-    /// value, and its status color are untouched — only the label's type changes.
+    /// When true (a sub-entry — fiber, total sugars, saturated fat), the row label reads
+    /// as a sub-entry of its parent macro: one type-ramp step smaller (subheadline →
+    /// footnote) and in the secondary color, AND the whole row carries the shared leading
+    /// indent so it sits inside its parent. The bar, the value, and its status color are
+    /// untouched — only the label's type and the row's indent change.
     var isSubEntry: Bool = false
-    var onTap: () -> Void = {}
+    /// The explainer tap. Nil for a micronutrient row (no explainer wired): the row
+    /// then renders identically minus the info-circle affordance and the button wrap.
+    var onTap: (() -> Void)? = nil
+
     var body: some View {
-        Button(action: onTap) {
+        let indented = content.padding(.leading, NutrientRowLayout.indent(isSubEntry: isSubEntry))
+        if let onTap {
+            Button(action: onTap) { indented }.buttonStyle(.plain)
+        } else {
+            indented
+        }
+    }
+
+    @ViewBuilder private var content: some View {
+        if notTracked {
+            // "not tracked yet": no item that day carried the value. A neutral label +
+            // caption, no numeric value, no filled bar — distinct from a real zero.
+            HStack(spacing: 6) {
+                GoalChip(goal: gauge.goal)
+                Text(gauge.label).font(.subheadline.weight(.semibold))
+                Spacer()
+                Text(DietSemantics.notTrackedCaption)
+                    .font(.caption).foregroundStyle(.secondary)
+                // A tappable not-tracked row (a micronutrient drill-down) still opens the
+                // sheet — with every item under "Not estimated" — so show the affordance.
+                if onTap != nil {
+                    Image(systemName: "info.circle").font(.caption).foregroundStyle(.tertiary)
+                }
+            }
+            .contentShape(Rectangle())
+        } else {
             VStack(alignment: .leading, spacing: 6) {
                 HStack(spacing: 6) {
                     GoalChip(goal: gauge.goal)
@@ -436,7 +481,9 @@ struct MetricBarRow: View {
                     Spacer()
                     Text(valueTarget).font(.subheadline.monospacedDigit())
                         .foregroundStyle(statusColor(gauge.status))
-                    Image(systemName: "info.circle").font(.caption).foregroundStyle(.tertiary)
+                    if onTap != nil {
+                        Image(systemName: "info.circle").font(.caption).foregroundStyle(.tertiary)
+                    }
                 }
                 StatusMeter(fraction: gauge.fraction, status: gauge.status)
                 HStack {
@@ -446,6 +493,12 @@ struct MetricBarRow: View {
                         Text(pct).font(.caption.monospacedDigit()).foregroundStyle(.tertiary)
                     }
                 }
+                // A partial micronutrient total is a floor — warn how many items were
+                // not estimated so the "≥" is never read as a complete number.
+                if let cap = DietSemantics.partialCaption(unknownItemCount: gauge.unknownItemCount) {
+                    Label(cap, systemImage: "questionmark.circle")
+                        .font(.caption2).foregroundStyle(.secondary)
+                }
                 if let flag = gauge.flag {
                     Label(flag, systemImage: "clock.badge.exclamationmark")
                         .font(.caption).foregroundStyle(.orange)
@@ -453,16 +506,21 @@ struct MetricBarRow: View {
             }
             .contentShape(Rectangle())
         }
-        .buttonStyle(.plain)
     }
+
+    /// The "not tracked yet" state: a micronutrient gauge with no known contributor.
+    private var notTracked: Bool { gauge.knownItemCount == 0 }
+
     private var valueTarget: String {
+        // A partial total is a floor: prefix "≥" so it's never shown as complete.
+        let prefix = gauge.partial ? "≥" : ""
         let v = DietSemantics.fmt(gauge.value)
-        if let t = gauge.target { return "\(v) / \(DietSemantics.fmt(t))\(gauge.unit)" }
-        return "\(v)\(gauge.unit)"
+        if let t = gauge.target { return "\(prefix)\(v) / \(DietSemantics.fmt(t))\(gauge.unit)" }
+        return "\(prefix)\(v)\(gauge.unit)"
     }
     private var percent: String? {
         guard let f = gauge.fraction else { return nil }
-        return "\(Int((f * 100).rounded()))%"
+        return "\(gauge.partial ? "≥" : "")\(Int((f * 100).rounded()))%"
     }
 }
 
@@ -482,6 +540,11 @@ struct Explainer: Identifiable, Equatable {
     var title: String
     var valueLine: String
     var paragraphs: [String]
+    /// A short, fixed teaching blurb about the metric itself — what it is and how to read
+    /// its gauge — rendered as a subordinate callout below the prose. Set for the four
+    /// micronutrients (from `Micronutrient.education`); nil for metrics without one, which
+    /// then render exactly as before.
+    var note: String?
     var drilldown: FoodDrilldown?
 }
 
@@ -491,21 +554,47 @@ struct Explainer: Identifiable, Equatable {
 struct FoodDrilldown: Equatable, Sendable {
     let breakdown: FoodBreakdown
     let insightInput: HealthInsightInput
+    /// The per-nutrient trend, one tap deeper — present only when the snapshot carries a
+    /// `nutrientSeries` (bridge ≥ 0.21.0). Nil on an older bridge, so the "View trend"
+    /// affordance simply doesn't appear (graceful degrade, no crash).
+    var trend: NutrientTrendContext?
 
     /// Build the drill-down for a tapped metric — the single builder BOTH entry points
     /// use (the Today rings and the Macros & calories detail), so tapping a metric
     /// anywhere produces the identical facts and grounded insight. The headline is the
     /// gauge's own value, so the foods reconcile against the number the tap came from,
     /// and the insight is fed the gauge's deterministic goal status rather than guessing.
+    ///
+    /// `series`/`targets` are additive: when the snapshot carries a `nutrientSeries`, the
+    /// tapped metric's per-nutrient trend rides along so the sheet can push
+    /// `NutrientTrendDetail`. Defaulted so callers without history (previews, older
+    /// paths) build exactly as before.
     static func build(meals: [DietMeal], metric: ContributionMetric,
-                      gauge: MetricGauge, isCarbLoad: Bool) -> FoodDrilldown {
+                      gauge: MetricGauge, isCarbLoad: Bool,
+                      series: [NutrientDay]? = nil,
+                      targets: DietTargets = DietTargets()) -> FoodDrilldown {
         let breakdown = FoodContributions.breakdown(meals, metric: metric, total: gauge.value)
+        // An informational metric (total sugars) is grounded WITHOUT a target, so the
+        // insight frames no goal and the judgment forbid stands alone; every other
+        // metric hands over its target and deterministic status. The micronutrient
+        // partiality facts (floor, N not estimated) ride along on every metric and are
+        // inert for a complete macro/calorie total.
+        let informational = metric.isInformational
         let input = HealthInsight.input(
-            metric: metric, total: gauge.value, goal: gauge.target,
+            metric: metric, total: gauge.value, goal: informational ? nil : gauge.target,
             goalStatus: gauge.goalStatus, goalPhrase: HealthInsight.goalPhrase(gauge.goal),
             dayStyle: isCarbLoad ? "carb-load day" : "ordinary day",
-            contributions: breakdown.contributions)
-        return FoodDrilldown(breakdown: breakdown, insightInput: input)
+            contributions: breakdown.contributions,
+            partial: gauge.partial, knownItemCount: gauge.knownItemCount ?? 0,
+            unknownItemCount: gauge.unknownItemCount, informational: informational)
+        // Attach the per-nutrient trend only when the bridge sent history — otherwise the
+        // sheet shows the facts alone, exactly as before.
+        let trend: NutrientTrendContext? = {
+            guard let series, NutrientTrends.isAvailable(series) else { return nil }
+            return NutrientTrendContext(nutrient: TrendNutrient(metric: metric),
+                                        series: series, targets: targets, meals: meals)
+        }()
+        return FoodDrilldown(breakdown: breakdown, insightInput: input, trend: trend)
     }
 }
 
@@ -534,6 +623,22 @@ struct ExplainerSheet: View {
                         Text(p).font(.body).foregroundStyle(.secondary)
                             .textSelection(.enabled)
                     }
+                    if let note = explainer.note {
+                        // The fixed "what is this nutrient" teaching, subordinate to the
+                        // live prose above: quiet type, muted background, an info glyph.
+                        // Available but never competing with today's numbers.
+                        Label {
+                            Text(note).font(.footnote).foregroundStyle(.secondary)
+                                .textSelection(.enabled)
+                                .fixedSize(horizontal: false, vertical: true)
+                        } icon: {
+                            Image(systemName: "info.circle").foregroundStyle(.tertiary)
+                        }
+                        .font(.footnote)
+                        .padding(12)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .background(RoundedRectangle(cornerRadius: 10).fill(Color(.tertiarySystemFill)))
+                    }
                     if let drilldown = explainer.drilldown {
                         Divider()
                         ContributingFoodsView(breakdown: drilldown.breakdown)
@@ -542,6 +647,18 @@ struct ExplainerSheet: View {
                         // unavailable.
                         HealthInsightView(input: drilldown.insightInput, provider: insight,
                                           text: $insightText)
+                        // The per-nutrient trend lives one tap deeper (only when the bridge
+                        // sent history) — like the weight trend behind the weight card. A
+                        // plain navigation row, not top-level Health chrome.
+                        if let trend = drilldown.trend {
+                            Divider()
+                            NavigationLink {
+                                NutrientTrendDetail(context: trend)
+                            } label: {
+                                Label("View \(trend.nutrient.fullName) trend", systemImage: "chart.xyaxis.line")
+                                    .font(.body)
+                            }
+                        }
                     }
                 }
                 .frame(maxWidth: .infinity, alignment: .leading)
@@ -587,9 +704,16 @@ enum DrilldownShare {
 
         lines.append("What fed this:")
         if breakdown.isEmpty {
-            lines.append(breakdown.hasFoodButNoContributors
-                ? "No logged food lists its \(breakdown.metric.label.lowercased()) yet."
-                : "No foods logged yet.")
+            // An all-unknown micronutrient day has no contributors but IS honest to
+            // open: say nothing carries a measured value, then list every item below
+            // under "Not estimated" — never a "nothing logged" message that hides them.
+            if breakdown.isPartial {
+                lines.append("No logged food lists a measured \(breakdown.metric.label.lowercased()) value yet.")
+            } else {
+                lines.append(breakdown.hasFoodButNoContributors
+                    ? "No logged food lists its \(breakdown.metric.label.lowercased()) yet."
+                    : "No foods logged yet.")
+            }
         } else {
             for c in breakdown.contributions {
                 let amount = c.amount.map { " (\($0))" } ?? ""
@@ -598,6 +722,20 @@ enum DrilldownShare {
             }
             if let note = breakdown.reconciliationNote {
                 lines.append(note)
+            }
+        }
+
+        // The "Not estimated" group: the items carrying no value for this micronutrient,
+        // name and amount only, never a number — the reason the total reads "≥". Carried
+        // in the export verbatim so a partial day never pastes as a complete number.
+        if !breakdown.unknownFoods.isEmpty {
+            lines.append("")
+            let caption = DietSemantics.partialCaption(unknownItemCount: breakdown.unknownFoods.count)
+                ?? "not estimated"
+            lines.append("Not estimated (\(caption)):")
+            for u in breakdown.unknownFoods {
+                let amount = u.amount.map { " (\($0))" } ?? ""
+                lines.append("• \(u.name)\(amount)")
             }
         }
 
@@ -641,6 +779,13 @@ struct ContributingFoodsView: View {
                         .fixedSize(horizontal: false, vertical: true)
                 }
             }
+
+            // The "Not estimated" group: the items with no value for this
+            // micronutrient, name and amount only — never a number, never a 0. These
+            // are why the header reads "≥"; surfacing them is the whole point.
+            if !breakdown.unknownFoods.isEmpty {
+                notEstimatedGroup
+            }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
         // Enable selection for the food rows too; it propagates to the descendant
@@ -649,8 +794,41 @@ struct ContributingFoodsView: View {
         .textSelection(.enabled)
     }
 
+    private var notEstimatedGroup: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 6) {
+                Text("Not estimated")
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(.secondary)
+                    .textCase(.uppercase)
+                if let caption = DietSemantics.partialCaption(unknownItemCount: breakdown.unknownFoods.count) {
+                    Text(caption)
+                        .font(.caption2)
+                        .foregroundStyle(.tertiary)
+                }
+            }
+            ForEach(breakdown.unknownFoods) { u in
+                HStack(alignment: .firstTextBaseline, spacing: 6) {
+                    Text(u.name).font(.subheadline).foregroundStyle(.secondary)
+                    if let amount = u.amount {
+                        Text(amount).font(.caption).foregroundStyle(.tertiary)
+                    }
+                    Spacer()
+                    // No number, ever — a dash marks "unknown", distinct from a 0.
+                    Text("—").font(.subheadline).foregroundStyle(.tertiary)
+                }
+            }
+        }
+        .padding(.top, 2)
+    }
+
     private var emptyMessage: String {
-        breakdown.hasFoodButNoContributors
+        // An all-unknown micronutrient day still opens: nothing carries a measured
+        // value, and every item shows below under "Not estimated".
+        if breakdown.isPartial {
+            return "No logged food lists a measured \(breakdown.metric.label.lowercased()) value yet."
+        }
+        return breakdown.hasFoodButNoContributors
             ? "No logged food lists its \(breakdown.metric.label.lowercased()) yet."
             : "No foods logged yet."
     }
@@ -685,11 +863,36 @@ struct ContributionRow: View {
     }
 
     /// The metric's identity color — the macro palette from the calorie-source bar so
-    /// the drill-down speaks the same color language, and the accent for calories.
+    /// the drill-down speaks the same color language, the accent for calories, and a
+    /// per-nutrient identity color for a micronutrient.
     private var barColor: Color {
         switch metric {
         case .calories: return .accentColor
         case .macro(let m): return MacroColor.color(for: m)
+        case .micronutrient(let n): return MicronutrientColor.color(for: n)
+        }
+    }
+}
+
+/// Identity colors for the micronutrients. A sub-entry micronutrient takes a lightened
+/// shade of its PARENT macro's identity color — saturated fat and unsaturated fat from the
+/// fat orange, total sugars from the carbs teal — the same derivation fiber uses, so the
+/// nutrition-label tree reads as parent-and-paler-kin in the drill-down bars too (resolved
+/// per color scheme, opaque, distinguishable in light and dark). The standalone entries
+/// (sodium, potassium, calcium, magnesium, omega-3) each keep their own distinct hue,
+/// apart from the macro palette. One place, so no view hardcodes a color.
+enum MicronutrientColor {
+    static func color(for n: Micronutrient) -> Color {
+        if let parent = n.parent {
+            return MacroColor.shade(ofSubEntry: MacroColor.color(for: parent))
+        }
+        // The standalone entries — the cases with no macro parent — each a distinct hue.
+        switch n {
+        case .potassium: return .mint
+        case .calcium: return .cyan
+        case .omega3: return .pink
+        case .magnesium: return .purple
+        default: return .blue // sodium (and any future standalone default)
         }
     }
 }
@@ -751,7 +954,10 @@ struct HealthInsightView: View {
             // snapshot asserts a goal was reached that the computed status contradicts,
             // discard the insight outright and leave the facts standing alone.
             for await snapshot in provider.insight(for: input) {
-                if HealthInsightGuard.contradicts(snapshot, status: input.goalStatus) {
+                // The input-aware guard discards a generation that claims goal status
+                // contrary to the facts, claims a partial total is complete, or renders
+                // a judgment for an informational metric (total sugars).
+                if HealthInsightGuard.contradicts(snapshot, input: input) {
                     text = ""
                     break
                 }

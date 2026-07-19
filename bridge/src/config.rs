@@ -27,6 +27,14 @@ pub const DEFAULT_RETRIEVAL_GRACE_SECS: u64 = 600;
 // unavailable permit sheds immediately, the pre-queue behavior).
 pub const DEFAULT_MAX_QUEUED: usize = 4;
 
+// Age, in days, past which the session GC sweep reclaims a vault-project Claude
+// Code session (env `JESSE_SESSION_TTL_DAYS`). Resuming a session touches its
+// jsonl mtime, so the sweep never reclaims an actively-used thread — only the
+// orphans (a swipe-delete whose remote delete never reached the bridge, and
+// everything deleted locally before the delete-on-thread-delete flow existed).
+// 90 days is a generous floor well past any realistic active-thread gap.
+pub const DEFAULT_SESSION_TTL_DAYS: u64 = 90;
+
 // Hard timeout (seconds) for the contained read-only vault-QA child. Tighter
 // than a turn: the child reads a handful of vault files (Read/Grep/Glob, and the
 // qmd MCP search when configured) and answers from them — a bounded lookup, not
@@ -141,6 +149,13 @@ pub const DEFAULT_DISALLOWED_TOOLS: &str = "WebFetch";
 pub struct Config {
     pub token: String,
     pub vault: String,
+    // The bridge user's HOME, resolved ONCE at startup. Claude Code's session
+    // transcripts live under `<home>/.claude/projects/…`, so every session-path
+    // lookup (`sessions_dir`, `session_transcript_exists`, the GC sweep) reads THIS
+    // rather than the process env at call time. HOME never changes during a run, so
+    // this is behavior-identical in production; capturing it makes the session paths
+    // deterministic and testable without mutating a process-global.
+    pub home: String,
     pub bind: String,
     pub port: u16,
     pub claude_bin: String,
@@ -168,6 +183,12 @@ pub struct Config {
     // Once a completed job has been fetched once, how much longer it's kept (a
     // short grace so a re-poll still works) instead of the full TTL.
     pub retrieval_grace_secs: u64,
+    // Age, in DAYS, past which the background session GC sweep reclaims a
+    // vault-project Claude Code session jsonl (env `JESSE_SESSION_TTL_DAYS`,
+    // default `DEFAULT_SESSION_TTL_DAYS` = 90). The sweep keys on file mtime, and
+    // resuming a session touches its mtime, so a session younger than this is
+    // NEVER deleted — only orphaned transcripts older than the TTL are reclaimed.
+    pub session_ttl_days: u64,
     // Directory under which completed job results are persisted (one JSON file
     // per job, under `<state_dir>/jobs`) so a bridge restart / laptop reboot
     // doesn't lose a finished-but-unretrieved reply. None disables persistence
@@ -256,6 +277,44 @@ pub struct Config {
     // Tell) instead of surfacing the outage. Inert unless BOTH this flag and the
     // vault-QA backend are set; unset → every path is byte-for-byte today's behavior.
     pub emergency_local: bool,
+    // Whether the bridge-side CONTEXT LEDGER is active (env `JESSE_CONTEXT_CARRY` =
+    // `on|off`, DEFAULT ON). It fixes a live defect: a locally served turn never
+    // entered the thread's hosted session, so the next hosted follow-up lost the
+    // earlier turn. On → the ledger records each delivered ask/tell turn, injects a
+    // catch-up block into the next hosted turn and a recent-conversation block into
+    // the local children, and mints a synthetic thread id for a fresh locally-served
+    // turn. Off is the ROLLBACK: byte-for-byte today's behavior — no ledger reads or
+    // writes, no `context.json`, no synthetic ids, no injected blocks. Default ON
+    // follows the badge's default-on precedent because this repairs a live bug.
+    pub context_carry: bool,
+    // Opt-in SHADOW-comparison backend override (env `JESSE_SHADOW_*`, same
+    // all-or-nothing `Option<(base_url, auth_token, model)>` triple as the vault-QA
+    // backend). When `Some`, a SAMPLED subset of eligible ask turns is mirrored —
+    // AFTER the hosted answer is delivered — to this backend through a contained
+    // read-only child, and both answers plus timing/usage are appended to the local
+    // shadow log for offline judging. Nothing about the delivered answer, its
+    // latency, its badge, or any production route changes. THE TRIPLE IS THE KILL
+    // SWITCH: unset any one var → `None` → not a single turn is mirrored,
+    // byte-for-byte today's behavior. The production intent is the gateway URL, the
+    // gateway token, and the `fw-glm` model alias (the bridge never carries a
+    // Fireworks credential — only the gateway URL + token). See [`shadow`].
+    pub shadow_backend: Option<(String, String, String)>,
+    // Percentage of ELIGIBLE ask turns mirrored to the shadow backend (env
+    // `JESSE_SHADOW_SAMPLE_PCT`, default 100, clamped to `[0, 100]`). The decision is
+    // per turn via a DETERMINISTIC hash of the turn id (`shadow_sampled`), so it is
+    // reproducible and never an RNG. 0 → nothing is mirrored even when armed; 100 →
+    // every eligible turn. Inert unless `shadow_backend` is set.
+    pub shadow_sample_pct: u8,
+    // Absolute path to the shadow pair log (env `JESSE_SHADOW_LOG`, default
+    // `~/Library/Logs/jesse-shadow/shadow.jsonl`, `~` expanded, parent created on
+    // first write). One JSON line per mirrored pair; created mode 0600 (it holds
+    // vault-derived answer text — it stays local and the bridge never sends it
+    // anywhere). Inert unless `shadow_backend` is set.
+    pub shadow_log: String,
+    // Wall-clock budget for one shadow child (env `JESSE_SHADOW_TIMEOUT_SECS`,
+    // default 120). A timeout records an INCOMPLETE pair and never retries. Inert
+    // unless `shadow_backend` is set.
+    pub shadow_timeout_secs: u64,
 }
 
 impl Config {
@@ -292,6 +351,17 @@ impl Config {
         self.state_dir
             .as_deref()
             .map(|d| PathBuf::from(d).join("titles.json"))
+    }
+
+    /// The file the context ledger is persisted to (a sibling of `titles.json`),
+    /// or `None` when persistence is disabled — then the ledger is in-memory only,
+    /// the same degradation the job/title/device stores have. Holds conversation
+    /// content (the ledger's whole point), so it stays in the state dir and never
+    /// reaches the metrics log, provenance, or any other log line.
+    pub fn context_file(&self) -> Option<PathBuf> {
+        self.state_dir
+            .as_deref()
+            .map(|d| PathBuf::from(d).join("context.json"))
     }
 }
 
@@ -420,6 +490,61 @@ pub fn resolve_vaultqa_backend(
     }
 }
 
+/// Resolve the optional SHADOW-comparison backend override from its three
+/// env-derived parts. Identical all-or-nothing rule as [`resolve_vaultqa_backend`]:
+/// returns `Some((base_url, auth_token, model))` ONLY when all three are present;
+/// any partial combination resolves to `None` (shadow mode stays disarmed and no
+/// ask turn is ever mirrored). A partial config logs one startup warning so a
+/// half-configured deploy is visible rather than silently half-active. Pure except
+/// for that warning. THE TRIPLE IS THE KILL SWITCH: unset any one var and shadow is
+/// off, byte-for-byte today's behavior (unset all three → silent). The production
+/// intent is the gateway URL, the gateway token, and the `fw-glm` model alias.
+pub fn resolve_shadow_backend(
+    base_url: Option<String>,
+    auth_token: Option<String>,
+    model: Option<String>,
+) -> Option<(String, String, String)> {
+    match (base_url, auth_token, model) {
+        (Some(b), Some(t), Some(m)) => Some((b, t, m)),
+        (b, t, m) => {
+            let set = b.is_some() as u8 + t.is_some() as u8 + m.is_some() as u8;
+            if set > 0 {
+                eprintln!(
+                    "jesse-bridge: WARNING partial JESSE_SHADOW_* config ({set}/3 set) — shadow \
+                     comparison needs ALL of JESSE_SHADOW_BASE_URL, JESSE_SHADOW_AUTH_TOKEN, \
+                     JESSE_SHADOW_MODEL; treating as unset (no turn is mirrored)."
+                );
+            }
+            None
+        }
+    }
+}
+
+/// Clamp a shadow sample percentage into `[0, 100]`. Unset/unparseable falls back
+/// to the caller's default (100 = mirror every eligible turn); an out-of-range value
+/// saturates to the nearest bound rather than disabling sampling.
+pub fn clamp_sample_pct(raw: u64) -> u8 {
+    raw.min(100) as u8
+}
+
+/// Expand a leading `~` / `~/` in a path to `home` (the crate keeps `HOME` in
+/// `Config.home`, captured once at startup — there is no other tilde expansion in
+/// the crate, so this is the single definition). A bare `~` becomes `home`; `~/x`
+/// becomes `home/x`. Any other shape (absolute path, `~user`, empty home) is
+/// returned unchanged, so an already-absolute `JESSE_SHADOW_LOG` is untouched.
+pub fn expand_tilde(raw: &str, home: &str) -> String {
+    if home.is_empty() {
+        return raw.to_string();
+    }
+    if raw == "~" {
+        return home.to_string();
+    }
+    match raw.strip_prefix("~/") {
+        Some(rest) => format!("{home}/{rest}"),
+        None => raw.to_string(),
+    }
+}
+
 /// Parse `JESSE_MODEL_BADGE` into the `model_badge` flag. Default TRUE: only an
 /// explicit `off` / `0` / `false` / `no` disables the badge; anything else
 /// (including unset or a bare `on`) keeps it on. Mirrors the `JESSE_DIET_PROBATION`
@@ -450,13 +575,29 @@ pub fn resolve_emergency_local() -> bool {
         .unwrap_or(false)
 }
 
+/// Parse `JESSE_CONTEXT_CARRY` into the `context_carry` flag. Default TRUE (mirrors
+/// [`resolve_model_badge`]): only an explicit `off`/`0`/`false`/`no` disables it. This
+/// repairs a live defect, so the off switch is the ROLLBACK, not the default — the same
+/// default-on precedent the badge follows, and the opposite of `resolve_emergency_local`
+/// (which defaults OFF because it changes what a hosted outage does).
+pub fn resolve_context_carry() -> bool {
+    std::env::var("JESSE_CONTEXT_CARRY")
+        .ok()
+        .map(|v| {
+            let v = v.trim().to_ascii_lowercase();
+            !(v == "0" || v == "false" || v == "no" || v == "off")
+        })
+        .unwrap_or(true)
+}
+
 impl Config {
     pub fn from_env() -> Self {
         let home = std::env::var("HOME").unwrap_or_default();
         Config {
             token: env_string("JESSE_TOKEN").unwrap_or_default(),
-            vault: env_string("JESSE_VAULT")
-                .unwrap_or_else(|| format!("{home}/devel/tag1/jesse")),
+            // Capture HOME once — session-path lookups read `cfg.home`, not the env.
+            home: home.clone(),
+            vault: env_string("JESSE_VAULT").unwrap_or_else(|| format!("{home}/devel/tag1/jesse")),
             bind: env_string("JESSE_BIND").unwrap_or_else(|| "127.0.0.1".to_string()),
             port: env_parse("JESSE_PORT", 8765),
             claude_bin: env_string("JESSE_CLAUDE_BIN").unwrap_or_else(|| "claude".to_string()),
@@ -488,6 +629,7 @@ impl Config {
                 "JESSE_RETRIEVAL_GRACE_SECS",
                 DEFAULT_RETRIEVAL_GRACE_SECS,
             ),
+            session_ttl_days: env_parse("JESSE_SESSION_TTL_DAYS", DEFAULT_SESSION_TTL_DAYS),
             state_dir: env_string("JESSE_STATE_DIR").or_else(|| {
                 // Default: a dotdir under HOME. Empty HOME → no default
                 // (persistence off) rather than writing to a bare "/.jesse-bridge".
@@ -552,6 +694,31 @@ impl Config {
             metrics_log: env_string("JESSE_METRICS_LOG"),
             // Emergency local fallback arm; default OFF (see `resolve_emergency_local`).
             emergency_local: resolve_emergency_local(),
+            // Context ledger (context carry); default ON (see `resolve_context_carry`).
+            context_carry: resolve_context_carry(),
+            // All-or-nothing SHADOW-comparison backend override, same `env_string`
+            // (trimmed, empty-filtered) semantics as every other string field. Partial
+            // config logs one warning and resolves to None (see `resolve_shadow_backend`).
+            // Unset (the default) → None → shadow mode is disarmed and not a single ask
+            // turn is mirrored (the kill switch).
+            shadow_backend: resolve_shadow_backend(
+                env_string("JESSE_SHADOW_BASE_URL"),
+                env_string("JESSE_SHADOW_AUTH_TOKEN"),
+                env_string("JESSE_SHADOW_MODEL"),
+            ),
+            // Sample percentage of eligible ask turns to mirror; default 100, clamped
+            // to [0, 100]. An unset/unparseable value keeps the 100 default.
+            shadow_sample_pct: clamp_sample_pct(env_parse("JESSE_SHADOW_SAMPLE_PCT", 100)),
+            // Shadow pair log; `~` expanded against the captured HOME, default under
+            // `~/Library/Logs/jesse-shadow/`. Only ever written when shadow is armed.
+            shadow_log: expand_tilde(
+                &env_string("JESSE_SHADOW_LOG")
+                    .unwrap_or_else(|| "~/Library/Logs/jesse-shadow/shadow.jsonl".to_string()),
+                &home,
+            ),
+            // Shadow child wall-clock budget; default 120s. A timeout logs an
+            // incomplete pair and never retries.
+            shadow_timeout_secs: env_parse("JESSE_SHADOW_TIMEOUT_SECS", 120),
         }
     }
 }
@@ -630,8 +797,14 @@ mod tests {
         // HOME is set), with job files under `<state_dir>/jobs`.
         match std::env::var("HOME").ok().filter(|h| !h.is_empty()) {
             Some(home) => {
-                assert_eq!(cfg.state_dir.as_deref(), Some(format!("{home}/.jesse-bridge").as_str()));
-                assert_eq!(cfg.jobs_dir(), Some(PathBuf::from(format!("{home}/.jesse-bridge/jobs"))));
+                assert_eq!(
+                    cfg.state_dir.as_deref(),
+                    Some(format!("{home}/.jesse-bridge").as_str())
+                );
+                assert_eq!(
+                    cfg.jobs_dir(),
+                    Some(PathBuf::from(format!("{home}/.jesse-bridge/jobs")))
+                );
             }
             None => {
                 assert_eq!(cfg.state_dir, None);
@@ -660,7 +833,10 @@ mod tests {
         // 0 means "ceiling", never unlimited.
         assert_eq!(clamp_timeout_secs(0), HARD_TIMEOUT_CEILING);
         // Over-ceiling is capped; in-range is unchanged; 1 is the floor.
-        assert_eq!(clamp_timeout_secs(HARD_TIMEOUT_CEILING + 10), HARD_TIMEOUT_CEILING);
+        assert_eq!(
+            clamp_timeout_secs(HARD_TIMEOUT_CEILING + 10),
+            HARD_TIMEOUT_CEILING
+        );
         assert_eq!(clamp_timeout_secs(1800), 1800);
         assert_eq!(clamp_timeout_secs(1), 1);
     }
@@ -939,7 +1115,10 @@ mod tests {
                 "local-vaultqa".to_string(),
             ))
         );
-        assert_eq!(cfg.vaultqa_mcp_config.as_deref(), Some("/etc/jesse/qmd.json"));
+        assert_eq!(
+            cfg.vaultqa_mcp_config.as_deref(),
+            Some("/etc/jesse/qmd.json")
+        );
 
         // Drop one → partial → None (treated as unset); a blank value counts as unset.
         std::env::remove_var("JESSE_VAULTQA_AUTH_TOKEN");
@@ -950,11 +1129,17 @@ mod tests {
         // Badge: only an explicit falsey value flips it off.
         for falsey in ["0", "false", "no", "off", "OFF", " Off "] {
             std::env::set_var("JESSE_MODEL_BADGE", falsey);
-            assert!(!Config::from_env().model_badge, "explicit {falsey:?} disables the badge");
+            assert!(
+                !Config::from_env().model_badge,
+                "explicit {falsey:?} disables the badge"
+            );
         }
         for truthy in ["1", "true", "yes", "on", "anything-else"] {
             std::env::set_var("JESSE_MODEL_BADGE", truthy);
-            assert!(Config::from_env().model_badge, "{truthy:?} keeps the badge on");
+            assert!(
+                Config::from_env().model_badge,
+                "{truthy:?} keeps the badge on"
+            );
         }
 
         for (k, v) in saved {
@@ -962,6 +1147,154 @@ mod tests {
                 Some(val) => std::env::set_var(k, val),
                 None => std::env::remove_var(k),
             }
+        }
+    }
+
+    #[test]
+    fn shadow_backend_resolves_only_when_all_three_present() {
+        let full = resolve_shadow_backend(
+            Some("https://gw.example".into()),
+            Some("gw-tok".into()),
+            Some("fw-glm".into()),
+        );
+        assert_eq!(
+            full,
+            Some((
+                "https://gw.example".to_string(),
+                "gw-tok".to_string(),
+                "fw-glm".to_string(),
+            ))
+        );
+        // Every partial combination (1 or 2 of 3 set) resolves to None — the kill
+        // switch: unset any one var and not a single turn is mirrored.
+        let s = || Some("x".to_string());
+        let partials = [
+            (s(), s(), None),
+            (s(), None, s()),
+            (None, s(), s()),
+            (s(), None, None),
+            (None, s(), None),
+            (None, None, s()),
+            (None, None, None),
+        ];
+        for (b, t, m) in partials {
+            assert_eq!(
+                resolve_shadow_backend(b, t, m),
+                None,
+                "partial shadow config must resolve to None (treated as unset)"
+            );
+        }
+    }
+
+    #[test]
+    fn shadow_sample_pct_clamps_to_0_100() {
+        assert_eq!(clamp_sample_pct(0), 0);
+        assert_eq!(clamp_sample_pct(50), 50);
+        assert_eq!(clamp_sample_pct(100), 100);
+        // Over-range saturates to 100 rather than disabling sampling.
+        assert_eq!(clamp_sample_pct(101), 100);
+        assert_eq!(clamp_sample_pct(1_000_000), 100);
+    }
+
+    #[test]
+    fn expand_tilde_expands_leading_home_only() {
+        assert_eq!(expand_tilde("~", "/Users/j"), "/Users/j");
+        assert_eq!(
+            expand_tilde("~/Library/Logs/x.jsonl", "/Users/j"),
+            "/Users/j/Library/Logs/x.jsonl"
+        );
+        // An already-absolute path is untouched, as is a `~user` form.
+        assert_eq!(expand_tilde("/var/log/x", "/Users/j"), "/var/log/x");
+        assert_eq!(expand_tilde("~bob/x", "/Users/j"), "~bob/x");
+        // Empty HOME leaves the value verbatim (no bare-"/…" default).
+        assert_eq!(expand_tilde("~/x", ""), "~/x");
+    }
+
+    #[test]
+    fn config_from_env_shadow_all_or_nothing_and_knobs() {
+        let _g = ENV_LOCK.lock_ok();
+        let keys = [
+            "JESSE_SHADOW_BASE_URL",
+            "JESSE_SHADOW_AUTH_TOKEN",
+            "JESSE_SHADOW_MODEL",
+            "JESSE_SHADOW_SAMPLE_PCT",
+            "JESSE_SHADOW_LOG",
+            "JESSE_SHADOW_TIMEOUT_SECS",
+        ];
+        let saved: Vec<(&str, Option<String>)> =
+            keys.iter().map(|k| (*k, std::env::var(k).ok())).collect();
+        for k in &keys {
+            std::env::remove_var(k);
+        }
+
+        // Unset by default → disarmed; knobs take their defaults.
+        let cfg = Config::from_env();
+        assert_eq!(cfg.shadow_backend, None);
+        assert_eq!(cfg.shadow_sample_pct, 100);
+        assert_eq!(cfg.shadow_timeout_secs, 120);
+        assert!(
+            cfg.shadow_log
+                .ends_with("/Library/Logs/jesse-shadow/shadow.jsonl"),
+            "default shadow log path expanded under HOME: {}",
+            cfg.shadow_log
+        );
+        assert!(!cfg.shadow_log.starts_with('~'), "the ~ must be expanded");
+
+        // All three set → armed triple; knobs honored + clamped.
+        std::env::set_var("JESSE_SHADOW_BASE_URL", "https://gw.example");
+        std::env::set_var("JESSE_SHADOW_AUTH_TOKEN", "gw-tok");
+        std::env::set_var("JESSE_SHADOW_MODEL", "fw-glm");
+        std::env::set_var("JESSE_SHADOW_SAMPLE_PCT", "250"); // clamps to 100
+        std::env::set_var("JESSE_SHADOW_TIMEOUT_SECS", "45");
+        std::env::set_var("JESSE_SHADOW_LOG", "/tmp/jesse-shadow-test/shadow.jsonl");
+        let cfg = Config::from_env();
+        assert_eq!(
+            cfg.shadow_backend,
+            Some((
+                "https://gw.example".to_string(),
+                "gw-tok".to_string(),
+                "fw-glm".to_string(),
+            ))
+        );
+        assert_eq!(cfg.shadow_sample_pct, 100);
+        assert_eq!(cfg.shadow_timeout_secs, 45);
+        assert_eq!(cfg.shadow_log, "/tmp/jesse-shadow-test/shadow.jsonl");
+
+        // Drop one → partial → None (treated as unset); a blank counts as unset.
+        std::env::remove_var("JESSE_SHADOW_MODEL");
+        assert_eq!(Config::from_env().shadow_backend, None);
+        std::env::set_var("JESSE_SHADOW_MODEL", "   ");
+        assert_eq!(Config::from_env().shadow_backend, None);
+
+        for (k, v) in saved {
+            match v {
+                Some(val) => std::env::set_var(k, val),
+                None => std::env::remove_var(k),
+            }
+        }
+    }
+
+    #[test]
+    fn session_ttl_days_defaults_to_90_and_honors_env() {
+        let _g = ENV_LOCK.lock_ok();
+        let saved = std::env::var("JESSE_SESSION_TTL_DAYS").ok();
+        std::env::remove_var("JESSE_SESSION_TTL_DAYS");
+        assert_eq!(
+            Config::from_env().session_ttl_days,
+            DEFAULT_SESSION_TTL_DAYS
+        );
+        assert_eq!(DEFAULT_SESSION_TTL_DAYS, 90);
+        std::env::set_var("JESSE_SESSION_TTL_DAYS", "30");
+        assert_eq!(Config::from_env().session_ttl_days, 30);
+        // Unparseable falls back to the default.
+        std::env::set_var("JESSE_SESSION_TTL_DAYS", "nope");
+        assert_eq!(
+            Config::from_env().session_ttl_days,
+            DEFAULT_SESSION_TTL_DAYS
+        );
+        match saved {
+            Some(v) => std::env::set_var("JESSE_SESSION_TTL_DAYS", v),
+            None => std::env::remove_var("JESSE_SESSION_TTL_DAYS"),
         }
     }
 
@@ -1002,7 +1335,10 @@ mod tests {
         // Must clear the measured 42 s oss lookup max (a `let` binding keeps clippy from
         // folding the const comparison to a trivially-true assert).
         let measured_oss_max_secs = 42u64;
-        assert!(VAULTQA_TIMEOUT_SECS >= measured_oss_max_secs, "must clear the measured oss max");
+        assert!(
+            VAULTQA_TIMEOUT_SECS >= measured_oss_max_secs,
+            "must clear the measured oss max"
+        );
         assert_eq!(EMERGENCY_TIMEOUT_SECS, 120);
     }
 
@@ -1021,7 +1357,11 @@ mod tests {
             Some("/var/log/jesse/metrics.jsonl")
         );
         std::env::set_var("JESSE_METRICS_LOG", "   ");
-        assert_eq!(Config::from_env().metrics_log, None, "blank counts as unset");
+        assert_eq!(
+            Config::from_env().metrics_log,
+            None,
+            "blank counts as unset"
+        );
         match saved {
             Some(v) => std::env::set_var("JESSE_METRICS_LOG", v),
             None => std::env::remove_var("JESSE_METRICS_LOG"),
@@ -1039,7 +1379,10 @@ mod tests {
         assert!(!Config::from_env().emergency_local, "default off");
         for truthy in ["on", "1", "true", "yes", "ON", " On "] {
             std::env::set_var("JESSE_EMERGENCY_LOCAL", truthy);
-            assert!(Config::from_env().emergency_local, "explicit {truthy:?} enables");
+            assert!(
+                Config::from_env().emergency_local,
+                "explicit {truthy:?} enables"
+            );
         }
         for falsey in ["off", "0", "false", "no", "", "  ", "garbage"] {
             std::env::set_var("JESSE_EMERGENCY_LOCAL", falsey);
@@ -1051,6 +1394,44 @@ mod tests {
         match saved {
             Some(v) => std::env::set_var("JESSE_EMERGENCY_LOCAL", v),
             None => std::env::remove_var("JESSE_EMERGENCY_LOCAL"),
+        }
+    }
+
+    #[test]
+    fn context_carry_defaults_on_and_only_explicit_falsey_disables() {
+        // Context carry fixes a live defect, so it defaults ON (the badge/probation
+        // truthiness rule): only an explicit off/0/false/no flips it off — the
+        // rollback switch. Unset or any other value keeps it on.
+        let _g = ENV_LOCK.lock_ok();
+        let saved = std::env::var("JESSE_CONTEXT_CARRY").ok();
+        std::env::remove_var("JESSE_CONTEXT_CARRY");
+        assert!(Config::from_env().context_carry, "default on");
+        for falsey in ["0", "false", "no", "off", "OFF", " Off "] {
+            std::env::set_var("JESSE_CONTEXT_CARRY", falsey);
+            assert!(
+                !Config::from_env().context_carry,
+                "explicit {falsey:?} disables (rollback)"
+            );
+        }
+        for truthy in ["1", "true", "yes", "on", "anything-else"] {
+            std::env::set_var("JESSE_CONTEXT_CARRY", truthy);
+            assert!(
+                Config::from_env().context_carry,
+                "{truthy:?} keeps carry on"
+            );
+        }
+        // The persistence path is a sibling of titles.json, and None with no state dir.
+        let mut cfg = Config::from_env();
+        cfg.state_dir = Some("/var/jesse".to_string());
+        assert_eq!(
+            cfg.context_file(),
+            Some(PathBuf::from("/var/jesse/context.json"))
+        );
+        cfg.state_dir = None;
+        assert_eq!(cfg.context_file(), None);
+        match saved {
+            Some(v) => std::env::set_var("JESSE_CONTEXT_CARRY", v),
+            None => std::env::remove_var("JESSE_CONTEXT_CARRY"),
         }
     }
 }

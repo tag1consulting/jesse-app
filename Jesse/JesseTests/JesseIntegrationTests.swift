@@ -134,8 +134,13 @@ final class StubURLProtocol: URLProtocol {
     override func startLoading() {
         let req = request
         let bridge = StubURLProtocol.bridge
-        DispatchQueue.global().async { [weak self] in
-            self?.serve(req, bridge)
+        // URLSession owns this protocol instance for the load's duration and cancels
+        // via `stopLoading` (which sets the lock-guarded `cancelled` that `serve`
+        // checks). `URLProtocol` can't be `Sendable`, so hand the background queue a
+        // `nonisolated(unsafe)` reference — safe by that ownership/locking contract.
+        nonisolated(unsafe) let this = self
+        DispatchQueue.global().async {
+            this.serve(req, bridge)
         }
     }
 
@@ -303,6 +308,7 @@ final class StubURLProtocol: URLProtocol {
 
 // MARK: - Tests
 
+@MainActor
 final class JesseIntegrationTests: XCTestCase {
 
     private let cfg = JesseConfig(host: "laptop", port: 8765, token: "tok")
@@ -328,7 +334,7 @@ final class JesseIntegrationTests: XCTestCase {
     @MainActor
     private func makeContext() throws -> ModelContext {
         let container = try ModelContainer(
-            for: JesseThread.self, Turn.self,
+            for: JesseThread.self, Turn.self, OutboxItem.self, OutboxAttachment.self,
             configurations: ModelConfiguration(isStoredInMemoryOnly: true))
         return ModelContext(container)
     }

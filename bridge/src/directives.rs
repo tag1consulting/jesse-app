@@ -48,15 +48,37 @@ pub const MAX_NEEDS_HEALTH_LINE_BYTES: usize = 2 * 1024;
 /// so it gets the full 8 KiB contract bound (equal to the generic ceiling).
 pub const MAX_MEAL_LOG_LINE_BYTES: usize = 8 * 1024;
 
-/// Max meals one `JESSE_MEAL_LOG v1` directive may carry. Over this the whole
+/// Max meals one `JESSE_MEAL_LOG` directive may carry. Over this the whole
 /// block is treated as malformed (passthrough + log), never partially logged.
 pub const MAX_MEALS: usize = 10;
+
+/// Max ids one `JESSE_MEAL_LOG v2` directive (or one `POST /jesse/meal-corrections`
+/// batch) may `retract`. Over this the whole block is malformed (passthrough + log),
+/// mirroring the `meals` cap — a retract batch is never partially applied.
+pub const MAX_RETRACT: usize = 10;
 
 /// The optional macro fields a meal may carry, and the only keys (besides the
 /// required `id`/`consumedAt`/`name`) allowed on a meal object. A typo'd or extra
 /// key is a loud failure, mirroring the needs-health payload's unknown-key check.
-const MEAL_FIELDS: &[&str] =
-    &["id", "consumedAt", "name", "kcal", "protein_g", "carbs_g", "fat_g", "fiber_g"];
+const MEAL_FIELDS: &[&str] = &[
+    "id",
+    "consumedAt",
+    "name",
+    "kcal",
+    "protein_g",
+    "carbs_g",
+    "fat_g",
+    "fiber_g",
+    "sodium_mg",
+    "satfat_g",
+    "sugar_g",
+    "potassium_mg",
+    // HealthKit-bound micros only: calcium and magnesium have HealthKit types. Omega-3
+    // does NOT (there is no EPA/DHA HealthKit quantity), so `omega3_mg` is deliberately
+    // NOT a meal wire field and stays an unknown key here.
+    "calcium_mg",
+    "magnesium_mg",
+];
 
 /// Sections a `JESSE_NEEDS_HEALTH` directive may request (the phone-assembled
 /// two-section health block). Kept in sync with the app's formatter.
@@ -126,14 +148,51 @@ pub struct Meal {
     pub fat_g: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fiber_g: Option<f64>,
+    /// The four micronutrients, each pre-summed by the bridge over ONLY the meal's
+    /// items that carried a known value — absent when none did (`None` serializes as
+    /// an omitted key, never `Some(0)`). Wire names match the app's `JesseMeal`
+    /// decoder exactly: `sodium_mg`/`potassium_mg` in mg, `satfat_g`/`sugar_g` in g.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sodium_mg: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub satfat_g: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sugar_g: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub potassium_mg: Option<f64>,
+    /// The two newest HealthKit-bound micros, same pre-summed / omit-when-unknown
+    /// discipline. `calcium_mg`/`magnesium_mg` are milligrams. Omega-3 has no HealthKit
+    /// type, so there is deliberately no `omega3_mg` field here.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub calcium_mg: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub magnesium_mg: Option<f64>,
 }
 
-/// The parsed payload of a `JESSE_MEAL_LOG v1` directive: one or more meals the
-/// app writes to Apple Health (the bridge only extracts; the app is the writer).
-/// `meals` is non-empty and capped at [`MAX_MEALS`], both enforced at parse time.
+/// The parsed payload of a `JESSE_MEAL_LOG` directive, plus the corrections-queue
+/// delivery envelope. Under **v1** it is exactly `meals` (a non-empty, capped array
+/// the app inserts). Under **v2** it gains `retract` (ids whose Health entries the app
+/// deletes and tombstones) and, when this block was assembled at delivery from the
+/// persisted corrections queue, `corrections_seq` (the highest queued batch seq the
+/// app must ack so the bridge can prune). The two v2 fields are additive and
+/// `skip_serializing_if`-omitted, so a v1 delivery is byte-for-byte today's wire and an
+/// old app build simply ignores keys it does not know.
+///
+/// **v2 semantics are field-agnostic over the nutrient set** ([`Meal`]): upsert and
+/// rewrite are defined over every nutrient field present on the meal, never a frozen
+/// list, so a future nutrient is an additive optional field, not a v3.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MealLog {
     pub meals: Vec<Meal>,
+    /// v2: ids the source deleted — the app removes their Health entry and tombstones
+    /// the id. Empty (and omitted on the wire) for a v1 block. Capped at [`MAX_RETRACT`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub retract: Vec<String>,
+    /// Delivery-only: the highest corrections-queue batch seq merged into this payload.
+    /// `None` (omitted) for a block extracted purely from a turn's reply; `Some(seq)`
+    /// once queued batches were merged in, so the app knows which seq to ack.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub corrections_seq: Option<u64>,
 }
 
 /// The structured `directives` object attached to a terminal result. One
@@ -254,15 +313,23 @@ pub fn extract_directives(reply: &str) -> (String, Option<Directives>) {
                 }
             }
         }
-        ("JESSE_MEAL_LOG", 1) => {
+        ("JESSE_MEAL_LOG", ver @ (1 | 2)) => {
             if last_line.len() > MAX_MEAL_LOG_LINE_BYTES {
                 eprintln!(
-                    "directive: JESSE_MEAL_LOG v1 exceeds its \
+                    "directive: JESSE_MEAL_LOG v{ver} exceeds its \
                      {MAX_MEAL_LOG_LINE_BYTES}-byte cap — passing through untouched"
                 );
                 return (reply.to_string(), None);
             }
-            match parse_meal_log(json) {
+            // v1: `meals` only (retract is an unknown key → malformed). v2: `meals`
+            // upserts plus optional `retract`. Both share one 8 KiB cap and the same
+            // per-meal validation; the version only selects which top-level shape is legal.
+            let parsed = if ver == 1 {
+                parse_meal_log_v1(json)
+            } else {
+                parse_meal_log_v2(json)
+            };
+            match parsed {
                 Ok(meal_log) => {
                     let directives = Directives {
                         needs_health: None,
@@ -272,7 +339,7 @@ pub fn extract_directives(reply: &str) -> (String, Option<Directives>) {
                 }
                 Err(reason) => {
                     eprintln!(
-                        "directive: JESSE_MEAL_LOG v1 payload rejected ({reason}) — \
+                        "directive: JESSE_MEAL_LOG v{ver} payload rejected ({reason}) — \
                          passing through untouched"
                     );
                     (reply.to_string(), None)
@@ -410,15 +477,16 @@ fn parse_needs_health(json: &str) -> Result<NeedsHealth, String> {
 /// Parse + validate the JSON payload of a `JESSE_MEAL_LOG v1` directive against
 /// the contract: a single `meals` key holding a **non-empty** array (cap
 /// [`MAX_MEALS`]) of meal objects, each with a non-empty `id`, `consumedAt`, and
-/// `name`, plus any of the optional numeric macros. Any violation is an
+/// `name`, plus any of the optional numeric nutrients. Any violation is an
 /// `Err(reason)` the caller logs and passes through — a bad block never becomes a
-/// partial or wrong meal write (visible failure over silent data loss).
-fn parse_meal_log(json: &str) -> Result<MealLog, String> {
+/// partial or wrong meal write (visible failure over silent data loss). A `retract`
+/// key is not part of v1, so it lands in the unknown-key check → malformed passthrough.
+fn parse_meal_log_v1(json: &str) -> Result<MealLog, String> {
     let value: Value = serde_json::from_str(json).map_err(|e| format!("invalid JSON: {e}"))?;
     let obj = value.as_object().ok_or("payload is not a JSON object")?;
 
-    // Reject unknown top-level keys so a typo (e.g. "meal") is a loud failure
-    // rather than silently logging nothing.
+    // Reject unknown top-level keys so a typo (e.g. "meal") — or a v2-only `retract`
+    // key on a v1 line — is a loud failure rather than silently logging nothing.
     for key in obj.keys() {
         if key != "meals" {
             return Err(format!("unknown field {key:?}"));
@@ -434,14 +502,122 @@ fn parse_meal_log(json: &str) -> Result<MealLog, String> {
         return Err("`meals` is empty".into());
     }
     if items.len() > MAX_MEALS {
-        return Err(format!("`meals` has {} entries, cap is {MAX_MEALS}", items.len()));
+        return Err(format!(
+            "`meals` has {} entries, cap is {MAX_MEALS}",
+            items.len()
+        ));
     }
 
     let mut meals = Vec::with_capacity(items.len());
     for item in items {
         meals.push(parse_meal(item)?);
     }
-    Ok(MealLog { meals })
+    Ok(MealLog {
+        meals,
+        retract: Vec::new(),
+        corrections_seq: None,
+    })
+}
+
+/// Parse + validate the JSON payload of a `JESSE_MEAL_LOG v2` directive:
+/// `{"meals":[…],"retract":[…]}`. Delegates the shape to [`parse_meal_batch_v2`]
+/// (shared byte-for-byte with the `POST /jesse/meal-corrections` endpoint) and wraps
+/// the result in a [`MealLog`] with no `corrections_seq` (that is stamped only at
+/// delivery, when queued batches are merged in).
+fn parse_meal_log_v2(json: &str) -> Result<MealLog, String> {
+    let value: Value = serde_json::from_str(json).map_err(|e| format!("invalid JSON: {e}"))?;
+    let obj = value.as_object().ok_or("payload is not a JSON object")?;
+    let (meals, retract) = parse_meal_batch_v2(obj)?;
+    Ok(MealLog {
+        meals,
+        retract,
+        corrections_seq: None,
+    })
+}
+
+/// Parse + validate the **v2 meal-batch shape** shared by the `JESSE_MEAL_LOG v2`
+/// directive and the `POST /jesse/meal-corrections` endpoint body:
+///
+/// - `meals` (optional; default empty) — upserts, cap [`MAX_MEALS`], each validated
+///   exactly as v1 ([`parse_meal`]: required strings + finite non-negative nutrients).
+/// - `retract` (optional; default empty) — ids the source deleted, cap [`MAX_RETRACT`],
+///   each a non-empty string.
+/// - **At least one** of `meals`/`retract` must be non-empty (an empty batch is nothing
+///   to do → malformed).
+/// - **No id may appear in both** arrays in one batch — a meal move arrives as a retract
+///   of the old id plus an upsert of the NEW id, so a collision is malformed
+///   (passthrough + log), never applied.
+///
+/// Unknown top-level keys are rejected (loud failure over a silent drop). Returned as a
+/// tuple so the endpoint can enqueue it and the directive path can wrap it in a
+/// [`MealLog`]; the validation is defined once here.
+pub fn parse_meal_batch_v2(
+    obj: &serde_json::Map<String, Value>,
+) -> Result<(Vec<Meal>, Vec<String>), String> {
+    for key in obj.keys() {
+        if key != "meals" && key != "retract" {
+            return Err(format!("unknown field {key:?}"));
+        }
+    }
+
+    let meals = match obj.get("meals") {
+        None | Some(Value::Null) => Vec::new(),
+        Some(Value::Array(items)) => {
+            if items.len() > MAX_MEALS {
+                return Err(format!(
+                    "`meals` has {} entries, cap is {MAX_MEALS}",
+                    items.len()
+                ));
+            }
+            let mut out = Vec::with_capacity(items.len());
+            for item in items {
+                out.push(parse_meal(item)?);
+            }
+            out
+        }
+        Some(_) => return Err("`meals` is not an array".into()),
+    };
+
+    let retract = match obj.get("retract") {
+        None | Some(Value::Null) => Vec::new(),
+        Some(Value::Array(items)) => {
+            if items.len() > MAX_RETRACT {
+                return Err(format!(
+                    "`retract` has {} entries, cap is {MAX_RETRACT}",
+                    items.len()
+                ));
+            }
+            let mut out = Vec::with_capacity(items.len());
+            for item in items {
+                let s = item
+                    .as_str()
+                    .ok_or("retract entry is not a string")?
+                    .to_string();
+                if s.trim().is_empty() {
+                    return Err("retract entry is empty".into());
+                }
+                out.push(s);
+            }
+            out
+        }
+        Some(_) => return Err("`retract` is not an array".into()),
+    };
+
+    if meals.is_empty() && retract.is_empty() {
+        return Err("at least one of `meals`/`retract` must be present".into());
+    }
+
+    // A meal move is retract-old + upsert-new; the SAME id in both arrays is malformed.
+    for m in &meals {
+        if retract.iter().any(|r| r == &m.id) {
+            return Err(format!(
+                "id {:?} appears in both `meals` and `retract`",
+                m.id
+            ));
+        }
+    }
+
+    Ok((meals, retract))
 }
 
 /// Parse + validate one meal object. Enforces the required string fields, rejects
@@ -465,6 +641,12 @@ fn parse_meal(item: &Value) -> Result<Meal, String> {
         carbs_g: optional_macro(m, "carbs_g")?,
         fat_g: optional_macro(m, "fat_g")?,
         fiber_g: optional_macro(m, "fiber_g")?,
+        sodium_mg: optional_macro(m, "sodium_mg")?,
+        satfat_g: optional_macro(m, "satfat_g")?,
+        sugar_g: optional_macro(m, "sugar_g")?,
+        potassium_mg: optional_macro(m, "potassium_mg")?,
+        calcium_mg: optional_macro(m, "calcium_mg")?,
+        magnesium_mg: optional_macro(m, "magnesium_mg")?,
     })
 }
 
@@ -571,7 +753,8 @@ mod tests {
     #[test]
     fn non_final_directive_line_is_not_recognized() {
         // Only the FINAL non-empty line is a directive; one mid-reply is prose.
-        let reply = "JESSE_NEEDS_HEALTH v1 {\"sections\":[\"daily\"]}\nBut actually here is your answer.";
+        let reply =
+            "JESSE_NEEDS_HEALTH v1 {\"sections\":[\"daily\"]}\nBut actually here is your answer.";
         let (text, directives) = extract_directives(reply);
         assert_eq!(text, reply);
         assert!(directives.is_none());
@@ -599,7 +782,7 @@ mod tests {
     fn malformed_shape_passes_through_visible() {
         for reply in [
             "JESSE_NEEDS_HEALTH {\"sections\":[\"daily\"]}", // no version token
-            "JESSE_NEEDS_HEALTH v1 not-json",               // remainder not an object
+            "JESSE_NEEDS_HEALTH v1 not-json",                // remainder not an object
             "JESSE_NEEDS_HEALTH vX {\"sections\":[\"daily\"]}", // non-numeric version
         ] {
             let (text, directives) = extract_directives(reply);
@@ -698,7 +881,10 @@ mod tests {
         };
         let v = directives_to_value(&Some(d));
         assert_eq!(v["needs_health"]["sections"][0], "daily");
-        assert_eq!(v["needs_health"]["metrics"][0]["metric"], "restingHeartRate");
+        assert_eq!(
+            v["needs_health"]["metrics"][0]["metric"],
+            "restingHeartRate"
+        );
         assert_eq!(v["needs_health"]["metrics"][0]["window_days"], 14);
         // needs_health-only Directives omit the meal_log key entirely.
         assert!(v.get("meal_log").is_none());
@@ -720,7 +906,15 @@ mod tests {
                     carbs_g: None,
                     fat_g: Some(4.5),
                     fiber_g: Some(6.0),
+                    sodium_mg: Some(410.0),
+                    satfat_g: None,
+                    sugar_g: None,
+                    potassium_mg: None,
+                    calcium_mg: Some(60.0),
+                    magnesium_mg: None,
                 }],
+                retract: Vec::new(),
+                corrections_seq: None,
             }),
         };
         let v = directives_to_value(&Some(d));
@@ -731,8 +925,69 @@ mod tests {
         assert_eq!(meal["kcal"], 385.0);
         assert_eq!(meal["fat_g"], 4.5);
         assert_eq!(meal["fiber_g"], 6.0);
-        assert!(meal.get("protein_g").is_none(), "absent macro omitted, not null");
+        assert_eq!(
+            meal["sodium_mg"], 410.0,
+            "known micronutrient under its wire key"
+        );
+        assert_eq!(meal["calcium_mg"], 60.0, "known calcium under its wire key");
+        assert!(
+            meal.get("protein_g").is_none(),
+            "absent macro omitted, not null"
+        );
         assert!(meal.get("carbs_g").is_none());
+        assert!(
+            meal.get("satfat_g").is_none()
+                && meal.get("sugar_g").is_none()
+                && meal.get("potassium_mg").is_none()
+                && meal.get("magnesium_mg").is_none(),
+            "absent micronutrients omitted, not null"
+        );
+    }
+
+    #[test]
+    fn meal_log_parses_all_four_micronutrients() {
+        // A meal carrying the wire micronutrients (the four originals plus the two
+        // HealthKit-bound newcomers calcium_mg/magnesium_mg) decodes each (a measured-
+        // zero sugar included), and an absent one is None — never 0.
+        let reply = "JESSE_MEAL_LOG v1 {\"meals\":[{\"id\":\"a\",\"consumedAt\":\"t\",\"name\":\"Prosciutto\",\
+            \"sodium_mg\":900,\"satfat_g\":2.5,\"sugar_g\":0,\"potassium_mg\":180,\"calcium_mg\":8,\"magnesium_mg\":20}]}";
+        let m = meal_log(reply).unwrap().meals.remove(0);
+        assert_eq!(m.sodium_mg, Some(900.0));
+        assert_eq!(m.satfat_g, Some(2.5));
+        assert_eq!(
+            m.sugar_g,
+            Some(0.0),
+            "zero is a valid measured micronutrient"
+        );
+        assert_eq!(m.potassium_mg, Some(180.0));
+        assert_eq!(m.calcium_mg, Some(8.0));
+        assert_eq!(m.magnesium_mg, Some(20.0));
+
+        // Subset present: the omitted ones stay None.
+        let reply2 = "JESSE_MEAL_LOG v1 {\"meals\":[{\"id\":\"a\",\"consumedAt\":\"t\",\"name\":\"n\",\"calcium_mg\":150}]}";
+        let m2 = meal_log(reply2).unwrap().meals.remove(0);
+        assert_eq!(m2.calcium_mg, Some(150.0));
+        assert!(
+            m2.sodium_mg.is_none()
+                && m2.satfat_g.is_none()
+                && m2.sugar_g.is_none()
+                && m2.potassium_mg.is_none()
+                && m2.magnesium_mg.is_none()
+        );
+
+        // v2 accepts them identically (same parse_meal path).
+        let v2 = "JESSE_MEAL_LOG v2 {\"meals\":[{\"id\":\"a\",\"consumedAt\":\"t\",\"name\":\"n\",\"calcium_mg\":40,\"magnesium_mg\":12}],\"retract\":[\"old\"]}";
+        let mv2 = meal_log(v2).unwrap().meals.remove(0);
+        assert_eq!(mv2.calcium_mg, Some(40.0));
+        assert_eq!(mv2.magnesium_mg, Some(12.0));
+
+        // Omega-3 has NO HealthKit type, so `omega3_mg` is NOT a meal wire field: it is
+        // an unknown key → the whole block is malformed and passes through visible.
+        let o3 = "JESSE_MEAL_LOG v1 {\"meals\":[{\"id\":\"a\",\"consumedAt\":\"t\",\"name\":\"n\",\"omega3_mg\":50}]}";
+        assert!(
+            meal_log(o3).is_none(),
+            "omega3_mg is not a meal field — rejected as an unknown key"
+        );
     }
 
     #[test]
@@ -773,7 +1028,9 @@ mod tests {
         // must pass through visible — the per-arm cap fires BEFORE the payload
         // parse, so it is never stripped despite parsing cleanly. This proves the
         // cap is enforced per-directive, not by the (now 8 KiB) generic ceiling.
-        let many = std::iter::repeat_n("\"daily\"", 400).collect::<Vec<_>>().join(",");
+        let many = std::iter::repeat_n("\"daily\"", 400)
+            .collect::<Vec<_>>()
+            .join(",");
         let reply = format!("JESSE_NEEDS_HEALTH v1 {{\"sections\":[{many}]}}");
         assert!(
             reply.len() > MAX_NEEDS_HEALTH_LINE_BYTES && reply.len() < MAX_DIRECTIVE_LINE_BYTES,
@@ -843,16 +1100,152 @@ mod tests {
         let m = meal_log(reply).unwrap().meals.remove(0);
         assert_eq!(m.kcal, Some(0.0), "zero is a valid non-negative macro");
         assert_eq!(m.fat_g, Some(0.5));
-        assert_eq!(m.fiber_g, Some(0.0), "zero fiber is a valid non-negative macro");
+        assert_eq!(
+            m.fiber_g,
+            Some(0.0),
+            "zero fiber is a valid non-negative macro"
+        );
     }
 
     #[test]
-    fn meal_log_v2_passes_through_visible() {
-        // Unknown version of a known directive → passthrough (future bump fails loud).
-        let reply = "JESSE_MEAL_LOG v2 {\"meals\":[{\"id\":\"a\",\"consumedAt\":\"t\",\"name\":\"n\"}]}";
+    fn meal_log_v2_meals_only_is_parsed_and_stripped() {
+        // v2 with only `meals` (no retract) parses like v1 — retract stays empty and
+        // is omitted on the wire; corrections_seq is None (not a delivery-merged block).
+        let reply = "Logged.\nJESSE_MEAL_LOG v2 {\"meals\":[{\"id\":\"a\",\"consumedAt\":\"t\",\
+            \"name\":\"n\",\"kcal\":410,\"sodium_mg\":620}]}";
+        let (text, directives) = extract_directives(reply);
+        assert_eq!(text, "Logged.");
+        let ml = directives.unwrap().meal_log.unwrap();
+        assert_eq!(ml.meals.len(), 1);
+        assert_eq!(ml.meals[0].sodium_mg, Some(620.0));
+        assert!(ml.retract.is_empty());
+        assert_eq!(ml.corrections_seq, None);
+    }
+
+    #[test]
+    fn meal_log_v2_with_retract_is_parsed() {
+        // A meal move: retract the old id, upsert the new id, in one block.
+        let reply = "JESSE_MEAL_LOG v2 {\"meals\":[{\"id\":\"2026-07-04-snack-1630\",\
+            \"consumedAt\":\"2026-07-04T16:30:00+02:00\",\"name\":\"Snack\"}],\
+            \"retract\":[\"2026-07-04-snack-1500\"]}";
+        let ml = meal_log(reply).unwrap();
+        assert_eq!(ml.meals.len(), 1);
+        assert_eq!(ml.meals[0].id, "2026-07-04-snack-1630");
+        assert_eq!(ml.retract, vec!["2026-07-04-snack-1500"]);
+    }
+
+    #[test]
+    fn meal_log_v2_retract_only_is_parsed() {
+        // A pure source-side deletion: no upsert, just a retract. Valid under v2.
+        let reply = "JESSE_MEAL_LOG v2 {\"retract\":[\"2026-07-04-snack-1630\"]}";
+        let ml = meal_log(reply).unwrap();
+        assert!(ml.meals.is_empty());
+        assert_eq!(ml.retract, vec!["2026-07-04-snack-1630"]);
+    }
+
+    #[test]
+    fn meal_log_v2_retract_serializes_and_absent_is_omitted() {
+        // A v2 block with a retract round-trips the key; a v1/no-retract block omits it.
+        let with = meal_log("JESSE_MEAL_LOG v2 {\"retract\":[\"x\"]}").unwrap();
+        let v = serde_json::to_value(&with).unwrap();
+        assert_eq!(v["retract"][0], "x");
+        assert!(v.get("meals").is_some());
+        // corrections_seq is delivery-only → omitted when None.
+        assert!(v.get("corrections_seq").is_none());
+
+        let without = meal_log(
+            "JESSE_MEAL_LOG v2 {\"meals\":[{\"id\":\"a\",\"consumedAt\":\"t\",\"name\":\"n\"}]}",
+        )
+        .unwrap();
+        let v2 = serde_json::to_value(&without).unwrap();
+        assert!(v2.get("retract").is_none(), "empty retract omitted, not []");
+    }
+
+    #[test]
+    fn meal_log_v3_and_up_passes_through_visible() {
+        // An UNKNOWN version (v3 and up) of a known directive → passthrough (a future
+        // bump fails loud and stays visible, never silently stripped).
+        for reply in [
+            "JESSE_MEAL_LOG v3 {\"meals\":[{\"id\":\"a\",\"consumedAt\":\"t\",\"name\":\"n\"}]}",
+            "JESSE_MEAL_LOG v10 {\"meals\":[{\"id\":\"a\",\"consumedAt\":\"t\",\"name\":\"n\"}]}",
+        ] {
+            let (text, directives) = extract_directives(reply);
+            assert_eq!(
+                text, reply,
+                "unknown meal_log version stays visible: {reply:?}"
+            );
+            assert!(directives.is_none());
+        }
+    }
+
+    #[test]
+    fn meal_log_v1_rejects_a_retract_key() {
+        // `retract` is v2-only; on a v1 line it is an unknown top-level field → malformed.
+        let reply =
+            "JESSE_MEAL_LOG v1 {\"meals\":[{\"id\":\"a\",\"consumedAt\":\"t\",\"name\":\"n\"}],\
+            \"retract\":[\"b\"]}";
         let (text, directives) = extract_directives(reply);
         assert_eq!(text, reply);
         assert!(directives.is_none());
+    }
+
+    #[test]
+    fn meal_log_v2_malformed_payloads_pass_through_visible() {
+        for reply in [
+            // empty batch: neither meals nor retract
+            "JESSE_MEAL_LOG v2 {}",
+            "JESSE_MEAL_LOG v2 {\"meals\":[],\"retract\":[]}",
+            // retract not an array
+            "JESSE_MEAL_LOG v2 {\"retract\":\"x\"}",
+            // retract entry not a string
+            "JESSE_MEAL_LOG v2 {\"retract\":[5]}",
+            // retract entry blank
+            "JESSE_MEAL_LOG v2 {\"retract\":[\"  \"]}",
+            // same id in both meals and retract (a move must use DIFFERENT ids)
+            "JESSE_MEAL_LOG v2 {\"meals\":[{\"id\":\"a\",\"consumedAt\":\"t\",\"name\":\"n\"}],\"retract\":[\"a\"]}",
+            // unknown top-level field
+            "JESSE_MEAL_LOG v2 {\"meals\":[{\"id\":\"a\",\"consumedAt\":\"t\",\"name\":\"n\"}],\"note\":1}",
+            // a bad meal inside a v2 block still fails the whole block
+            "JESSE_MEAL_LOG v2 {\"meals\":[{\"id\":\"a\",\"consumedAt\":\"t\",\"name\":\"n\",\"kcal\":-1}]}",
+        ] {
+            let (text, directives) = extract_directives(reply);
+            assert_eq!(text, reply, "malformed v2 meal_log stays visible: {reply:?}");
+            assert!(directives.is_none(), "no field for malformed v2: {reply:?}");
+        }
+    }
+
+    #[test]
+    fn meal_log_v2_over_retract_cap_passes_through_visible() {
+        let ids = std::iter::repeat_n("\"x\"", MAX_RETRACT + 1)
+            .collect::<Vec<_>>()
+            .join(",");
+        let reply = format!("JESSE_MEAL_LOG v2 {{\"retract\":[{ids}]}}");
+        let (text, directives) = extract_directives(&reply);
+        assert_eq!(text, reply);
+        assert!(directives.is_none());
+    }
+
+    #[test]
+    fn parse_meal_batch_v2_is_shared_with_the_endpoint_shape() {
+        // The endpoint calls parse_meal_batch_v2 directly on a decoded object; prove the
+        // same validation the directive uses holds there (meals+retract, caps, collision).
+        let obj = serde_json::json!({
+            "meals": [{"id":"new","consumedAt":"t","name":"n","sodium_mg":900}],
+            "retract": ["old"],
+        });
+        let (meals, retract) = parse_meal_batch_v2(obj.as_object().unwrap()).unwrap();
+        assert_eq!(meals.len(), 1);
+        assert_eq!(meals[0].sodium_mg, Some(900.0));
+        assert_eq!(retract, vec!["old"]);
+        // collision rejected
+        let bad = serde_json::json!({
+            "meals": [{"id":"a","consumedAt":"t","name":"n"}],
+            "retract": ["a"],
+        });
+        assert!(parse_meal_batch_v2(bad.as_object().unwrap()).is_err());
+        // empty rejected
+        let empty = serde_json::json!({});
+        assert!(parse_meal_batch_v2(empty.as_object().unwrap()).is_err());
     }
 
     #[test]
@@ -878,8 +1271,22 @@ mod tests {
             "JESSE_MEAL_LOG v1 {\"meals\":[{\"id\":\"a\",\"consumedAt\":\"t\"}]}",
             // empty (blank) required field
             "JESSE_MEAL_LOG v1 {\"meals\":[{\"id\":\"  \",\"consumedAt\":\"t\",\"name\":\"n\"}]}",
-            // unknown meal field
-            "JESSE_MEAL_LOG v1 {\"meals\":[{\"id\":\"a\",\"consumedAt\":\"t\",\"name\":\"n\",\"sodium_mg\":5}]}",
+            // unknown meal field (a schema key like sodium_mg/calcium_mg would now parse,
+            // but omega3_mg has no HealthKit type so it stays unknown → malformed)
+            "JESSE_MEAL_LOG v1 {\"meals\":[{\"id\":\"a\",\"consumedAt\":\"t\",\"name\":\"n\",\"added_sugar_g\":5}]}",
+            "JESSE_MEAL_LOG v1 {\"meals\":[{\"id\":\"a\",\"consumedAt\":\"t\",\"name\":\"n\",\"omega3_mg\":50}]}",
+            // negative micronutrient
+            "JESSE_MEAL_LOG v1 {\"meals\":[{\"id\":\"a\",\"consumedAt\":\"t\",\"name\":\"n\",\"sodium_mg\":-5}]}",
+            "JESSE_MEAL_LOG v1 {\"meals\":[{\"id\":\"a\",\"consumedAt\":\"t\",\"name\":\"n\",\"calcium_mg\":-5}]}",
+            "JESSE_MEAL_LOG v1 {\"meals\":[{\"id\":\"a\",\"consumedAt\":\"t\",\"name\":\"n\",\"magnesium_mg\":-1}]}",
+            // micronutrient explicitly null (contract says omit, never null-pad)
+            "JESSE_MEAL_LOG v1 {\"meals\":[{\"id\":\"a\",\"consumedAt\":\"t\",\"name\":\"n\",\"calcium_mg\":null}]}",
+            // non-finite micronutrient (JSON has no NaN, but an out-of-f64-range literal is not finite)
+            "JESSE_MEAL_LOG v1 {\"meals\":[{\"id\":\"a\",\"consumedAt\":\"t\",\"name\":\"n\",\"potassium_mg\":1e400}]}",
+            // micronutrient not a number
+            "JESSE_MEAL_LOG v1 {\"meals\":[{\"id\":\"a\",\"consumedAt\":\"t\",\"name\":\"n\",\"satfat_g\":\"salty\"}]}",
+            // micronutrient explicitly null (contract says omit, never null-pad)
+            "JESSE_MEAL_LOG v1 {\"meals\":[{\"id\":\"a\",\"consumedAt\":\"t\",\"name\":\"n\",\"sugar_g\":null}]}",
             // macro not a number
             "JESSE_MEAL_LOG v1 {\"meals\":[{\"id\":\"a\",\"consumedAt\":\"t\",\"name\":\"n\",\"kcal\":\"lots\"}]}",
             // macro explicitly null (contract says omit, never null-pad)
@@ -901,7 +1308,9 @@ mod tests {
     fn meal_log_over_meals_cap_passes_through_visible() {
         // MAX_MEALS + 1 entries → the whole block is malformed (never partial).
         let one = "{\"id\":\"x\",\"consumedAt\":\"t\",\"name\":\"n\"}";
-        let meals = std::iter::repeat_n(one, MAX_MEALS + 1).collect::<Vec<_>>().join(",");
+        let meals = std::iter::repeat_n(one, MAX_MEALS + 1)
+            .collect::<Vec<_>>()
+            .join(",");
         let reply = format!("JESSE_MEAL_LOG v1 {{\"meals\":[{meals}]}}");
         let (text, directives) = extract_directives(&reply);
         assert_eq!(text, reply);
@@ -911,7 +1320,9 @@ mod tests {
     #[test]
     fn meal_log_at_meals_cap_is_accepted() {
         let one = "{\"id\":\"x\",\"consumedAt\":\"t\",\"name\":\"n\"}";
-        let meals = std::iter::repeat_n(one, MAX_MEALS).collect::<Vec<_>>().join(",");
+        let meals = std::iter::repeat_n(one, MAX_MEALS)
+            .collect::<Vec<_>>()
+            .join(",");
         let reply = format!("JESSE_MEAL_LOG v1 {{\"meals\":[{meals}]}}");
         let ml = meal_log(&reply).expect("exactly the cap is accepted");
         assert_eq!(ml.meals.len(), MAX_MEALS);

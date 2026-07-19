@@ -8,6 +8,7 @@ import SwiftData
 /// (deduplication), the created thread is tagged `.watch`, BOTH turns persist to
 /// the real store, the result carries displayText/spokenText from a stubbed reply,
 /// and a stubbed failure yields a clean error value rather than a throw.
+@MainActor
 final class WatchRelayTests: XCTestCase {
 
     /// A fake client that counts sends and returns a fixed reply (or fails at the
@@ -134,9 +135,14 @@ final class WatchRelayTests: XCTestCase {
         let context = try makeContext()
 
         let turn = RelayedTurn(requestId: UUID(), text: "Same question", mode: .ask)
-        async let a = relay.relay(turn, context: context)
-        async let b = relay.relay(turn, context: context)
-        let (first, second) = await (a, b)
+        // `relay` is `@MainActor`, so both calls run on the main actor and interleave
+        // at their `await`s — which is exactly the coalescing path under test. Drive
+        // them through two main-actor tasks (rather than `async let`, whose nonisolated
+        // child tasks would require sending the non-Sendable `ModelContext` across an
+        // isolation boundary); the context stays on the main actor throughout.
+        let a = Task { @MainActor in await relay.relay(turn, context: context) }
+        let b = Task { @MainActor in await relay.relay(turn, context: context) }
+        let (first, second) = (await a.value, await b.value)
 
         XCTAssertEqual(fake.sendCount, 1)
         XCTAssertEqual(try allThreads(context).count, 1)

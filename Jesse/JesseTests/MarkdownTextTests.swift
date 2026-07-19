@@ -1,6 +1,7 @@
 import XCTest
 @testable import Jesse
 
+@MainActor
 final class MarkdownTextTests: XCTestCase {
 
     func testHeadingLevels() {

@@ -6,6 +6,7 @@ import XCTest
 /// bridge" CTA (their first send would otherwise just error), a paired one the
 /// ordinary "start a conversation" prompt. The decision is pure so it's pinned
 /// here without standing up the view.
+@MainActor
 final class ThreadListEmptyStateTests: XCTestCase {
 
     func testPairedConfigShowsOrdinaryEmptyState() {

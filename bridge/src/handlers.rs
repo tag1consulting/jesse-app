@@ -2,10 +2,10 @@ use crate::*;
 
 #[derive(Deserialize)]
 pub struct JesseRequest {
-    mode: String,                 // "ask" | "tell"
+    mode: String, // "ask" | "tell"
     text: String,
     #[serde(default)]
-    session_id: Option<String>,   // set to continue a thread (a followup)
+    session_id: Option<String>, // set to continue a thread (a followup)
     #[serde(default)]
     voice: bool, // voice request → ask for a SPOKEN: summary line, keep it listenable
     // Optional per-request override of the active mode's wrapper instruction.
@@ -45,6 +45,50 @@ pub struct JesseRequest {
     // request→retry channel can never loop. Absent/false on an ordinary turn.
     #[serde(default)]
     health_context_unavailable: Option<bool>,
+    // Meal-corrections ack (JESSE_MEAL_LOG v2): the highest `corrections_seq` the app has
+    // APPLIED from a delivered `meal_log`. On receipt the bridge prunes every queued batch
+    // at or below this seq. Absent on an ordinary turn (old app builds simply omit it);
+    // redelivery of an unacked batch is harmless (app-side id+hash idempotency), so a
+    // missing or stale ack only ever costs a redelivery, never correctness.
+    #[serde(default)]
+    meal_corrections_ack: Option<u64>,
+    // Optional idempotency key for POST /jesse. A client that never saw the response
+    // to a POST (socket dropped before the 202) can re-send the SAME request with the
+    // SAME `request_id`; the bridge then returns the ORIGINAL job instead of spawning a
+    // second turn. Validated when present (`validate_request_id`): ≤64 chars, ASCII
+    // alphanumerics and hyphens only. Absent reproduces today's behavior exactly (old
+    // app builds simply omit it) — every POST is a fresh turn.
+    #[serde(default)]
+    request_id: Option<String>,
+}
+
+/// Validate a POST /jesse idempotency `request_id`: at most 64 characters, ASCII
+/// alphanumerics and hyphens only, non-empty. Returns a one-line error message on
+/// rejection (the handler surfaces it as a `400`). Pure so it is unit-tested in
+/// isolation from the router.
+pub fn validate_request_id(id: &str) -> Result<(), String> {
+    if id.is_empty() {
+        return Err("request_id must not be empty".to_string());
+    }
+    if id.len() > 64 {
+        return Err("request_id must be at most 64 characters".to_string());
+    }
+    if !id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-') {
+        return Err("request_id may contain only ASCII letters, digits, and hyphens".to_string());
+    }
+    Ok(())
+}
+
+/// The `202 { "job_id", "status": "running" }` accept response. The SAME shape is
+/// returned for a fresh turn and for an idempotent-dedup hit, so the client streams
+/// or polls the returned id identically either way (a job that already finished
+/// satisfies the first poll immediately).
+fn accepted_running(job_id: &str) -> Response {
+    (
+        StatusCode::ACCEPTED,
+        Json(json!({ "job_id": job_id, "status": "running" })),
+    )
+        .into_response()
 }
 
 /// Body of `POST /jesse/device`: the phone's APNs device token (hex string).
@@ -79,12 +123,21 @@ pub struct AskResult {
     pub failclass: Option<String>,
     pub citations: Option<usize>,
     pub validator: Option<String>,
+    /// The emergency answer was delivered WITHOUT a passing citation check (the
+    /// advisory validator failed) — the reply carries the prepended warning and the
+    /// provenance chip must show the unverified state. Always `false` off the
+    /// emergency route.
+    pub citations_unverified: bool,
     pub hosted_succeeded: bool,
 }
 
 /// Update the circuit breaker from a hosted attempt's outcome: a success resets it, a
 /// transport-class failure counts toward tripping it. Called only when emergency armed.
-fn update_breaker(breaker: &CircuitBreaker, out: &Result<(String, Option<String>, Option<Directives>), ApiError>, now: Instant) {
+fn update_breaker(
+    breaker: &CircuitBreaker,
+    out: &Result<(String, Option<String>, Option<Directives>), ApiError>,
+    now: Instant,
+) {
     match out {
         Ok(_) => breaker.record_success(),
         Err(e) => {
@@ -97,7 +150,11 @@ fn update_breaker(breaker: &CircuitBreaker, out: &Result<(String, Option<String>
 
 /// The validator string for a metrics line from an emergency outcome.
 fn emergency_validator(validator_ok: bool) -> String {
-    if validator_ok { "ok".to_string() } else { "advisory-fail".to_string() }
+    if validator_ok {
+        "ok".to_string()
+    } else {
+        "advisory-fail".to_string()
+    }
 }
 
 /// Resolve an ASK turn: attempt the hosted turn (unless the breaker is open and
@@ -118,12 +175,10 @@ pub async fn run_ask_hosted_or_emergency(
     breaker: &CircuitBreaker,
     emergency_armed: bool,
     hosted_model: Option<String>,
+    recent_context: Option<&str>,
 ) -> AskResult {
     let now = Instant::now();
-    let vaultqa_model = cfg
-        .vaultqa_backend
-        .as_ref()
-        .map(|(_, _, m)| m.clone());
+    let vaultqa_model = cfg.vaultqa_backend.as_ref().map(|(_, _, m)| m.clone());
     let base_url = cfg
         .vaultqa_backend
         .as_ref()
@@ -133,8 +188,12 @@ pub async fn run_ask_hosted_or_emergency(
     // A small closure that runs the emergency child and packages the AskResult, or
     // returns None when the child hard-failed (caller decides the fallback).
     let emergency = |reason: String| async {
-        match run_emergency_ask_pipeline(cfg, question, health_context).await {
-            EmergencyAskOutcome::Answered { text, citations, validator_ok } => {
+        match run_emergency_ask_pipeline(cfg, question, health_context, recent_context).await {
+            EmergencyAskOutcome::Answered {
+                text,
+                citations,
+                validator_ok,
+            } => {
                 if let Some(model) = &vaultqa_model {
                     eprintln!("{}", format_emergency_provenance(&base_url, model, &reason));
                 }
@@ -147,6 +206,10 @@ pub async fn run_ask_hosted_or_emergency(
                     failclass: Some(reason),
                     citations,
                     validator: Some(emergency_validator(validator_ok)),
+                    // The one path that can serve unverified citations: an emergency
+                    // answer whose advisory validator failed (its text already carries
+                    // the prepended warning).
+                    citations_unverified: !validator_ok,
                     hosted_succeeded: false,
                 })
             }
@@ -179,6 +242,7 @@ pub async fn run_ask_hosted_or_emergency(
                 failclass: None,
                 citations: None,
                 validator: None,
+                citations_unverified: false,
                 hosted_succeeded: true,
             }
         }
@@ -200,6 +264,7 @@ pub async fn run_ask_hosted_or_emergency(
                     failclass: Some(cls.label().to_string()),
                     citations: None,
                     validator: None,
+                    citations_unverified: false,
                     hosted_succeeded: false,
                 };
             }
@@ -210,9 +275,14 @@ pub async fn run_ask_hosted_or_emergency(
                 route: MetricsRoute::Hosted,
                 model: hosted_model,
                 emergency: false,
-                failclass: if emergency_armed { Some(cls.label().to_string()) } else { None },
+                failclass: if emergency_armed {
+                    Some(cls.label().to_string())
+                } else {
+                    None
+                },
                 citations: None,
                 validator: None,
+                citations_unverified: false,
                 hosted_succeeded: false,
             }
         }
@@ -263,6 +333,15 @@ pub async fn jesse(
 ) -> Result<Response, ApiError> {
     check_auth(&headers, &st.cfg.token)?;
 
+    // Meal-corrections ack (JESSE_MEAL_LOG v2): if this turn carries the highest
+    // `corrections_seq` the app has APPLIED, prune every queued batch at/below it before
+    // any work — the app has taken responsibility for those, so they must not redeliver.
+    // Done here (not in the spawned task) so the prune is committed even if the turn is
+    // shed/queued below. Unacked batches simply redeliver; app idempotency makes that safe.
+    if let Some(acked) = req.meal_corrections_ack {
+        st.meal_corrections.prune_through(acked);
+    }
+
     // Rate limit before doing any work (C3). A per-service token bucket; bursts
     // beyond JESSE_RATE_PER_MIN are shed with 429 rather than queued.
     if !st.limiter.allow() {
@@ -270,6 +349,24 @@ pub async fn jesse(
             StatusCode::TOO_MANY_REQUESTS,
             "rate limit exceeded".to_string(),
         ));
+    }
+
+    // Idempotency (POST /jesse dedup). Auth + rate limiting above are unchanged and
+    // apply first. When a valid `request_id` is present AND already maps to a live
+    // job (queued, running, or a terminal result still in its retention window),
+    // short-circuit here: create nothing, take no concurrency permit, enqueue
+    // nothing, and hand back the EXISTING job id in the same fresh-accept shape. A
+    // request_id whose job has been reaped is unmapped, so it falls through as brand
+    // new. Absent request_id skips this entirely — byte-for-byte today's behavior.
+    if let Some(rid) = req.request_id.as_deref() {
+        if let Err(msg) = validate_request_id(rid) {
+            // A one-line JSON error, distinct from a plain-text ApiError so the shape
+            // matches the JSON the client already parses on every other response.
+            return Ok((StatusCode::BAD_REQUEST, Json(json!({ "error": msg }))).into_response());
+        }
+        if let Some(existing) = st.jobs.dedup_lookup(rid) {
+            return Ok(accepted_running(&existing));
+        }
     }
 
     let mode = req.mode.trim().to_lowercase();
@@ -290,7 +387,13 @@ pub async fn jesse(
     let try_vaultqa = !try_diet
         && should_try_local_vaultqa(&st.cfg, &mode, &req.text, !req.attachments.is_empty());
     let is_followup = req.session_id.is_some();
-    let prompt = build_prompt(
+    // Compute the clock header ONCE here and build the prompt from it, so the SAME
+    // clock can recompute the floor boundary when the hosted catch-up block is spliced
+    // in under the permit (context carry, Piece 3). `build_prompt` reads the clock
+    // itself; `build_prompt_at` takes it explicitly, so we capture it.
+    let clock = clock_line();
+    let prompt = build_prompt_at(
+        &clock,
         &mode,
         &req.text,
         is_followup,
@@ -326,6 +429,9 @@ pub async fn jesse(
     // the paths in the prompt so the agent reads them. The scratch dir's Drop
     // guard (moved into the turn task below) removes it on every exit path.
     let decoded = validate_and_decode_attachments(&st.cfg, &req.attachments)?;
+    // Whether this turn carried attachments — the ledger records the raw text with a
+    // `[attachment omitted]` marker rather than the bytes (context carry).
+    let had_attachments = !decoded.is_empty();
     let (prompt, scratch) = if decoded.is_empty() {
         (prompt, None)
     } else {
@@ -350,7 +456,17 @@ pub async fn jesse(
     // Eviction runs on a periodic background task (`spawn_eviction_task`), NOT
     // here on the request hot path — a sweep that unlinks files must never block
     // a turn from starting (H3).
-    let job_id = st.jobs.create();
+    // Create the job under the optional idempotency key. The check-and-insert is
+    // atomic under the job store's one lock, so if a concurrent duplicate POST won
+    // the race between our phase-1 lookup above and here, we get `Duplicate` and
+    // spawn nothing — dropping the admission (releasing the permit / freeing the
+    // queue slot) and the scratch dir on this early return, and handing back the
+    // winner's id in the same fresh-accept shape. This is what makes two concurrent
+    // duplicate POSTs collapse to exactly one job.
+    let job_id = match st.jobs.create_with_request_id(req.request_id.clone()) {
+        CreateOutcome::Created(id) => id,
+        CreateOutcome::Duplicate(existing) => return Ok(accepted_running(&existing)),
+    };
     // Open the live stream before spawning so a phone that opens
     // `GET /jesse/stream/{job_id}` immediately finds the broadcast channel.
     st.jobs.stream_register(&job_id);
@@ -378,6 +494,22 @@ pub async fn jesse(
     // armed — checked inside the task.
     let mode = mode.clone();
     let breaker = st.breaker.clone();
+    // Context carry (Piece 1–3): the ledger, the title store (for a synthetic→real
+    // title move), and the captured clock (so the catch-up splice recomputes the floor
+    // boundary from the same header the prompt was built with). All inert when carry off.
+    let context = st.context.clone();
+    let titles = st.titles.clone();
+    // Meal-corrections queue (JESSE_MEAL_LOG v2): merged into the delivered `meal_log` at
+    // completion, so off-app corrections ride this turn's terminal result.
+    let meal_corrections = st.meal_corrections.clone();
+    let clock = clock.clone();
+    // Shadow comparison (JESSE_SHADOW_*): the concurrency semaphore + queue (to yield to
+    // a live/queued phone turn) and the at-most-one shadow slot. All three are Arcs;
+    // entirely inert unless `cfg.shadow_backend` is set — with shadow disarmed nothing
+    // below reads them and every path is byte-for-byte today's behavior.
+    let shadow_sem = st.sem.clone();
+    let shadow_queue = st.queue.clone();
+    let shadow_slot = st.shadow_slot.clone();
     let handle = tokio::spawn(async move {
         // Hold the scratch dir for the whole turn; its Drop removes the decoded
         // attachment files when the task ends — success, error, or timeout. The
@@ -417,12 +549,45 @@ pub async fn jesse(
         let hosted_model = env_string("ANTHROPIC_MODEL");
         let diet_queue = DietQueue::from_cfg(&cfg);
 
+        // ---- Context carry (Piece 3 + 4): read the thread's ledger UNDER THE PERMIT
+        // so two queued turns on one thread can never both carry the same pending block.
+        // `pending` (for the hosted catch-up) and `recent` (for a local child) are read
+        // once here; both are empty when carry is off (the ledger is inert) or the
+        // thread is unknown, so every downstream splice/inject is a byte-for-byte no-op.
+        let thread_key = sid.clone();
+        let pending = thread_key
+            .as_deref()
+            .map(|k| context.pending(k))
+            .unwrap_or_default();
+        // Build the hosted catch-up block + the ids actually included in it (only those
+        // get marked in_hosted_history on success, so an over-cap dropped-oldest entry
+        // stays pending — at-least-once, never a silent drop).
+        let (catchup_block, injected_ids) = match build_catchup_block(&pending) {
+            Some((block, ids)) => (Some(block), ids),
+            None => (None, Vec::new()),
+        };
+        // Splice the catch-up block into the hosted prompt (ahead of the floor, adjacent
+        // to the health block). None → the prompt is byte-for-byte unchanged.
+        let hosted_prompt = match &catchup_block {
+            Some(block) => splice_catchup(&prompt, block, &clock, health_context.as_deref()),
+            None => prompt.clone(),
+        };
+        // The RECENT CONVERSATION block for a local child (vault-QA / emergency), read
+        // from the same thread. `None` when there is no history (fresh-turn prompts stay
+        // byte-for-byte today's).
+        let recent_block = thread_key
+            .as_deref()
+            .map(|k| context.recent(k, RECENT_MAX_TURNS))
+            .and_then(|turns| build_recent_conversation_block(&turns));
+
         // A hosted turn: run the streamed agent turn and extract any agent-emitted
         // directive from the reply's final line. A recognized directive is stripped
         // from the text and attached under `directives`. This is today's path — and the
-        // diet fall-through target.
+        // diet fall-through target. Uses `hosted_prompt` (the catch-up-spliced prompt).
         let run_hosted = || async {
-            apply_directives(run_claude_streaming(&cfg, &prompt, sid.as_deref(), &jobs, &jid).await)
+            apply_directives(
+                run_claude_streaming(&cfg, &hosted_prompt, sid.as_deref(), &jobs, &jid).await,
+            )
         };
 
         // Resolve the turn. Each branch yields the outcome, the BADGE SOURCE, the
@@ -435,20 +600,33 @@ pub async fn jesse(
         let mut m_validator: Option<String> = None;
         let mut m_emergency = false;
         let mut m_failclass: Option<String> = None;
+        // The machine-readable rung-2 reason on a diet rung-2 fall-through (content-free
+        // code; None on every other turn). Threaded into the metrics line so the audit
+        // can separate pipeline failures from correct rejections of non-loggable turns.
+        let mut m_diet_reason: Option<String> = None;
+        // Provenance-only: whether an emergency answer skipped the citation check.
+        // Never feeds the metrics line (which records the validator verdict directly).
+        let mut m_citations_unverified = false;
         let mut hosted_succeeded = false;
 
         let diet_model = || cfg.diet_backend.as_ref().map(|(_, _, m)| m.clone());
         let vaultqa_model = || cfg.vaultqa_backend.as_ref().map(|(_, _, m)| m.clone());
 
-        let (outcome, badge_source) = if try_diet {
+        let (mut outcome, badge_source) = if try_diet {
             // Local diet pipeline: extract → verify → append → derive mirror.
             match run_diet_pipeline(&cfg, &raw_text).await {
-                DietPipelineOutcome::Logged { dashboard, directives } => {
+                DietPipelineOutcome::Logged {
+                    dashboard,
+                    directives,
+                } => {
                     // The blocking hosted verify succeeded → hosted is reachable.
                     hosted_succeeded = true;
                     route = MetricsRoute::DietLocal;
                     m_model = diet_model();
-                    (Ok((dashboard, None, Some(directives))), BadgeSource::DietVerify)
+                    (
+                        Ok((dashboard, None, Some(directives))),
+                        BadgeSource::DietVerify,
+                    )
                 }
                 DietPipelineOutcome::LoggedNoMirror { dashboard } => {
                     hosted_succeeded = true;
@@ -456,7 +634,13 @@ pub async fn jesse(
                     m_model = diet_model();
                     (Ok((dashboard, None, None)), BadgeSource::DietVerify)
                 }
-                DietPipelineOutcome::VerifyUnavailable { err, utterance, entries, date, offset } => {
+                DietPipelineOutcome::VerifyUnavailable {
+                    err,
+                    utterance,
+                    entries,
+                    date,
+                    offset,
+                } => {
                     let cls = classify_hosted_failure(&err);
                     // Emergency: hosted verify unreachable → the BRIDGE queues the
                     // extracted entry (never a model, never the CSV) for later verify.
@@ -478,14 +662,19 @@ pub async fn jesse(
                                 m_model = diet_model();
                                 m_emergency = true;
                                 m_failclass = Some(cls.label().to_string());
-                                (Ok((queued_reply_text(), None, None)), BadgeSource::DietQueued)
+                                (
+                                    Ok((queued_reply_text(), None, None)),
+                                    BadgeSource::DietQueued,
+                                )
                             }
                             Err(e) => {
                                 // Couldn't queue → today's behavior (run hosted).
                                 eprintln!("jesse-bridge: diet queue enqueue failed: {e} — hosted fallback");
                                 let out = run_hosted().await;
                                 hosted_succeeded = out.is_ok();
-                                if emergency_armed { update_breaker(&breaker, &out, Instant::now()); }
+                                if emergency_armed {
+                                    update_breaker(&breaker, &out, Instant::now());
+                                }
                                 m_rung = DietRung::Verify.num();
                                 (out, BadgeSource::Hosted)
                             }
@@ -495,16 +684,21 @@ pub async fn jesse(
                         // exactly FallThrough { rung: Verify } (run the hosted turn).
                         let out = run_hosted().await;
                         hosted_succeeded = out.is_ok();
-                        if emergency_armed { update_breaker(&breaker, &out, Instant::now()); }
+                        if emergency_armed {
+                            update_breaker(&breaker, &out, Instant::now());
+                        }
                         m_rung = DietRung::Verify.num();
                         (out, BadgeSource::Hosted)
                     }
                 }
-                DietPipelineOutcome::FallThrough { rung } => {
+                DietPipelineOutcome::FallThrough { rung, reason } => {
                     let out = run_hosted().await;
                     hosted_succeeded = out.is_ok();
-                    if emergency_armed { update_breaker(&breaker, &out, Instant::now()); }
+                    if emergency_armed {
+                        update_breaker(&breaker, &out, Instant::now());
+                    }
                     m_rung = rung.num();
+                    m_diet_reason = reason.map(|r| r.code());
                     (out, BadgeSource::Hosted)
                 }
             }
@@ -512,7 +706,14 @@ pub async fn jesse(
             // Local vault-QA lookup (routine route). On success the tokens stay local
             // and no hosted turn runs. On any ladder rung it becomes a hosted ASK
             // attempt (which, when emergency is armed, may serve the emergency child).
-            match run_vaultqa_pipeline(&cfg, &raw_text, health_context.as_deref()).await {
+            match run_vaultqa_pipeline(
+                &cfg,
+                &raw_text,
+                health_context.as_deref(),
+                recent_block.as_deref(),
+            )
+            .await
+            {
                 VaultqaOutcome::Answered { text, citations } => {
                     route = MetricsRoute::VaultqaLocal;
                     m_model = vaultqa_model();
@@ -523,11 +724,26 @@ pub async fn jesse(
                 VaultqaOutcome::FallThrough { rung } => {
                     m_rung = rung.num();
                     let r = run_ask_hosted_or_emergency(
-                        &cfg, &prompt, sid.as_deref(), &jobs, &jid, &raw_text,
-                        health_context.as_deref(), &breaker, emergency_armed, hosted_model.clone(),
-                    ).await;
-                    route = r.route; m_model = r.model; m_emergency = r.emergency;
-                    m_failclass = r.failclass; m_citations = r.citations; m_validator = r.validator;
+                        &cfg,
+                        &hosted_prompt,
+                        sid.as_deref(),
+                        &jobs,
+                        &jid,
+                        &raw_text,
+                        health_context.as_deref(),
+                        &breaker,
+                        emergency_armed,
+                        hosted_model.clone(),
+                        recent_block.as_deref(),
+                    )
+                    .await;
+                    route = r.route;
+                    m_model = r.model;
+                    m_emergency = r.emergency;
+                    m_failclass = r.failclass;
+                    m_citations = r.citations;
+                    m_validator = r.validator;
+                    m_citations_unverified = r.citations_unverified;
                     hosted_succeeded = r.hosted_succeeded;
                     (r.outcome, r.badge)
                 }
@@ -536,11 +752,26 @@ pub async fn jesse(
             // A plain (non-gated) ASK: emergency + breaker apply on a hosted transport
             // failure. With emergency disarmed this is byte-for-byte the old hosted path.
             let r = run_ask_hosted_or_emergency(
-                &cfg, &prompt, sid.as_deref(), &jobs, &jid, &raw_text,
-                health_context.as_deref(), &breaker, emergency_armed, hosted_model.clone(),
-            ).await;
-            route = r.route; m_model = r.model; m_emergency = r.emergency;
-            m_failclass = r.failclass; m_citations = r.citations; m_validator = r.validator;
+                &cfg,
+                &hosted_prompt,
+                sid.as_deref(),
+                &jobs,
+                &jid,
+                &raw_text,
+                health_context.as_deref(),
+                &breaker,
+                emergency_armed,
+                hosted_model.clone(),
+                recent_block.as_deref(),
+            )
+            .await;
+            route = r.route;
+            m_model = r.model;
+            m_emergency = r.emergency;
+            m_failclass = r.failclass;
+            m_citations = r.citations;
+            m_validator = r.validator;
+            m_citations_unverified = r.citations_unverified;
             hosted_succeeded = r.hosted_succeeded;
             (r.outcome, r.badge)
         } else {
@@ -549,9 +780,118 @@ pub async fn jesse(
             // still feeds it when emergency is armed.
             let out = run_hosted().await;
             hosted_succeeded = out.is_ok();
-            if emergency_armed { update_breaker(&breaker, &out, Instant::now()); }
+            if emergency_armed {
+                update_breaker(&breaker, &out, Instant::now());
+            }
             (out, BadgeSource::Hosted)
         };
+
+        // ---- Context carry (Piece 1–3): from the SAME pre-badge outcome the badge and
+        // metrics use, record the delivered turn, resolve the thread key + synthetic
+        // session id, mark the injected pending entries on hosted success, re-key on a
+        // new session id, and move a title from a synthetic id to the real one. A failed
+        // turn (Err) records nothing. Entirely inert when carry is off (the ledger is a
+        // no-op and this block skips), so every path stays byte-for-byte today's.
+        if cfg.context_carry {
+            if let Ok((reply_text, reply_sid, _)) = &outcome {
+                let reply_text = reply_text.clone();
+                let reply_sid = reply_sid.clone();
+                let (_route, in_hist) = ContextRoute::from_badge_source(badge_source);
+                let request_sid = sid.clone();
+                let mut minted: Option<String> = None;
+                let record_key: Option<String> = if in_hist {
+                    // Hosted SUCCESS: the catch-up block reached the resumed session, so
+                    // mark the injected pending entries and re-key to the real returned
+                    // id (unconditional — a no-op when unchanged). The reply already
+                    // carries the real id; the app stores it.
+                    let real_id = reply_sid.clone().or_else(|| request_sid.clone());
+                    if let (Some(real), Some(from)) = (&real_id, &request_sid) {
+                        context.mark_in_hosted_history(from, &injected_ids);
+                        if from != real {
+                            context.rekey(from, real);
+                            // Move any title stashed under a synthetic id to the real id.
+                            if is_synthetic_session_id(from) {
+                                titles.rename(from, real);
+                            }
+                        }
+                    }
+                    real_id
+                } else {
+                    // A LOCAL route. Record under the existing thread, or (a fresh
+                    // locally-served thread with no request session) mint a synthetic id
+                    // and hand it back as the reply's session id so the app stores it.
+                    match &request_sid {
+                        Some(k) => Some(k.clone()),
+                        None => {
+                            let synthetic = mint_synthetic_session_id();
+                            minted = Some(synthetic.clone());
+                            Some(synthetic)
+                        }
+                    }
+                };
+                // Record the delivered turn (non-empty replies only — a directive-only
+                // turn strips to "" and the app retries, so it is not a delivered turn).
+                if let Some(key) = &record_key {
+                    if !reply_text.trim().is_empty() {
+                        context.record(
+                            key,
+                            make_context_turn(
+                                &mode,
+                                badge_source,
+                                &raw_text,
+                                had_attachments,
+                                &reply_text,
+                            ),
+                        );
+                    }
+                }
+                // Hand the minted synthetic id back on the reply (through the app's
+                // existing `?? sessionId` line — no app change) so the follow-up carries it.
+                if let Some(synthetic) = minted {
+                    if let Ok((_, s, _)) = &mut outcome {
+                        *s = Some(synthetic);
+                    }
+                }
+            }
+        }
+
+        // Build the structured provenance (v2) from the SAME pre-finalize outcome and
+        // turn state that produce the text badge, so the two are always both-present or
+        // both-absent. It rides on `JobState::Done` next to `directives`, reaching BOTH
+        // the poll result and the SSE `done` frame; the metrics line and audit are
+        // untouched. `route`/`m_model` are the resolved route + backend model (the same
+        // the metrics line records); `m_citations_unverified` is the emergency advisory
+        // verdict (always false off that route).
+        let provenance = reply_provenance(
+            &outcome,
+            &cfg,
+            route,
+            badge_source,
+            m_model.clone(),
+            hosted_model.as_deref(),
+            m_citations_unverified,
+        );
+        // Shadow comparison (JESSE_SHADOW_*): capture the eligible turn's inputs from
+        // the PRE-BADGE outcome so a later mirror is judged on the same answer text the
+        // model produced (the badge is bridge-added provenance the shadow answer never
+        // carries). This only READS the outcome; it never blocks or alters the delivered
+        // reply. `None` whenever shadow is disarmed or the turn is ineligible/unsampled
+        // (the common case) — so the delivery path below stays byte-for-byte unchanged.
+        let shadow_job = match &outcome {
+            Ok((text, _, _))
+                if shadow_eligible(&cfg, &mode, route, had_attachments, true, text, &jid) =>
+            {
+                Some(ShadowJob {
+                    turn_id: jid.clone(),
+                    question: raw_text.clone(),
+                    prompt: hosted_prompt.clone(),
+                    hosted_text: text.clone(),
+                    hosted_wall_ms: turn_start.elapsed().as_millis() as u64,
+                })
+            }
+            _ => None,
+        };
+
         // Finalize the delivered reply: append the model badge (display only) at this
         // single point, so BOTH the poll result and the SSE `done` frame carry it.
         let outcome = finalize_reply_badge(outcome, &cfg, badge_source, hosted_model.as_deref());
@@ -569,25 +909,46 @@ pub async fn jesse(
                 }
                 _ => None,
             };
-            append_metrics_line(&cfg, &MetricsRecord {
-                ts: rfc3339_utc(SystemTime::now()),
-                turn_id: jid.clone(),
-                mode: mode.clone(),
-                route,
-                model: m_model,
-                rung: m_rung,
-                wall_ms: turn_start.elapsed().as_millis() as u64,
-                ttft_ms: None,
-                tool_calls: None,
-                citations: m_citations,
-                validator: m_validator,
-                badge,
-                emergency: m_emergency,
-                hosted_failure_class: m_failclass,
-            });
+            append_metrics_line(
+                &cfg,
+                &MetricsRecord {
+                    ts: rfc3339_utc(SystemTime::now()),
+                    turn_id: jid.clone(),
+                    mode: mode.clone(),
+                    route,
+                    model: m_model,
+                    rung: m_rung,
+                    wall_ms: turn_start.elapsed().as_millis() as u64,
+                    ttft_ms: None,
+                    tool_calls: None,
+                    citations: m_citations,
+                    validator: m_validator,
+                    badge,
+                    emergency: m_emergency,
+                    hosted_failure_class: m_failclass,
+                    diet_reason: m_diet_reason,
+                },
+            );
         }
 
-        jobs.complete(&jid, outcome);
+        // Merge persisted off-app meal corrections (JESSE_MEAL_LOG v2) into the delivered
+        // `meal_log` at this single finalization seam, BEFORE the job is stored — so BOTH
+        // the poll result and the SSE `done` frame (each reads the stored `Done` state)
+        // carry the identical merged value. Queued batches lead, the turn's own extracted
+        // block follows, and the highest queued seq is stamped as `corrections_seq` for the
+        // app to ack. A no-op when the queue is empty/unavailable, and only the Ok
+        // (delivered) path carries directives — a failed turn delivers no meal_log, so its
+        // corrections simply redeliver on the next successful turn (at-least-once).
+        let outcome = match outcome {
+            Ok((text, sid_out, directives)) => Ok((
+                text,
+                sid_out,
+                merge_meal_corrections(directives, &meal_corrections),
+            )),
+            err => err,
+        };
+
+        jobs.complete_with_provenance(&jid, outcome, provenance);
         // Close the live stream with the frame matching the state that actually
         // landed. `complete` is write-once, so a cancel that won the race already
         // set `Cancelled` (and `cancel` already emitted that frame + removed the
@@ -617,6 +978,25 @@ pub async fn jesse(
         // can't outlive the runtime on shutdown; it adds only ~one HTTP round-trip
         // to a turn that already finished.
         notify_if_complete(apns.as_deref(), &devices, &notify, &jobs, &jid).await;
+
+        // Shadow comparison (JESSE_SHADOW_*): mirror this delivered ask on a DETACHED,
+        // permit-free task — the LAST thing the turn does. Drop the production permit
+        // FIRST (only when actually mirroring) so the shadow can never occupy it or
+        // delay a queued phone turn, and so `production_busy` reads the true state
+        // rather than this turn's own permit. Never awaited: the reply is already
+        // stored and pushed, so the shadow can't affect the real turn's state or the
+        // phone. `None` (disarmed/ineligible/unsampled — the common case) leaves this a
+        // no-op and the permit drops at task end exactly as before.
+        if let Some(job) = shadow_job {
+            drop(_permit);
+            spawn_shadow(
+                cfg.clone(),
+                shadow_sem.clone(),
+                shadow_queue.clone(),
+                shadow_slot.clone(),
+                job,
+            );
+        }
     });
 
     // Store the task's abort handle so `POST /jesse/cancel/{id}` can stop it.
@@ -642,11 +1022,7 @@ pub async fn jesse(
     // phone never saw — unavoidably unrecoverable without an id. That window is
     // now one round-trip instead of a multi-second hold, which is the whole point
     // of delivering the id eagerly.
-    Ok((
-        StatusCode::ACCEPTED,
-        Json(json!({ "job_id": job_id, "status": "running" })),
-    )
-        .into_response())
+    Ok(accepted_running(&job_id))
 }
 
 /// Fetch a turn's state by job id. This is what the app polls after a dropped
@@ -665,15 +1041,15 @@ pub async fn jesse_result(
             response,
             session_id,
             directives,
+            provenance,
         }) => Ok(Json(json!({
             "status": "done",
             "response": response,
             "session_id": session_id,
             "directives": directives_to_value(&directives),
+            "provenance": provenance_to_value(&provenance),
         }))),
-        Some(JobState::Failed { error }) => {
-            Ok(Json(json!({ "status": "failed", "error": error })))
-        }
+        Some(JobState::Failed { error }) => Ok(Json(json!({ "status": "failed", "error": error }))),
         Some(JobState::Cancelled) => Ok(Json(json!({ "status": "cancelled" }))),
         None => Err((
             StatusCode::NOT_FOUND,
@@ -699,7 +1075,9 @@ pub async fn jesse_cancel(
     st.notify.take(&job_id);
     match st.jobs.cancel(&job_id) {
         CancelOutcome::Cancelled => {
-            eprintln!("cancel: job {job_id} aborted by client — claude killed, concurrency slot freed");
+            eprintln!(
+                "cancel: job {job_id} aborted by client — claude killed, concurrency slot freed"
+            );
         }
         CancelOutcome::AlreadyTerminal => {
             eprintln!("cancel: job {job_id} already finished — no-op");
@@ -817,6 +1195,52 @@ pub async fn jesse_title(
     Ok(Json(json!({ "title": title })))
 }
 
+/// `POST /jesse/meal-corrections` — accept a `JESSE_MEAL_LOG v2` meal-events batch from an
+/// external logging agent (a Cowork/desktop session that logged, corrected, or deleted a
+/// meal with no app turn to carry the block) and persist it to the corrections queue.
+///
+/// Same bearer auth as every other endpoint (LAN-only, single-user trust). The body is the
+/// v2 payload object `{"meals":[…],"retract":[…]}`; it is validated against the EXACT same
+/// contract as an in-reply `JESSE_MEAL_LOG v2` directive ([`parse_meal_batch_v2`] — required
+/// meal fields, finite non-negative nutrients, caps, no id in both arrays, at least one of
+/// meals/retract), so a malformed or attacker-shaped body is a loud `400`, never a partial
+/// enqueue. On success the assigned monotonic `seq` is returned; the app acks it once
+/// applied. At the queue cap the post is rejected `429` (a visible failure at the source
+/// beats a silent drop); with persistence off it is `503`.
+pub async fn jesse_meal_corrections(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> Result<Json<Value>, ApiError> {
+    check_auth(&headers, &st.cfg.token)?;
+    let obj = body.as_object().ok_or((
+        StatusCode::BAD_REQUEST,
+        "body is not a JSON object".to_string(),
+    ))?;
+    let (meals, retract) = parse_meal_batch_v2(obj).map_err(|reason| {
+        eprintln!("meal-corrections: rejected malformed batch ({reason})");
+        (
+            StatusCode::BAD_REQUEST,
+            format!("malformed meal batch: {reason}"),
+        )
+    })?;
+    match st.meal_corrections.enqueue(meals, retract) {
+        Ok(seq) => Ok(Json(json!({ "status": "queued", "corrections_seq": seq }))),
+        Err(EnqueueError::Full) => Err((
+            StatusCode::TOO_MANY_REQUESTS,
+            format!("meal-corrections queue is full (cap {MAX_MEAL_CORRECTION_BATCHES}) — ack and drain first"),
+        )),
+        Err(EnqueueError::Unavailable) => Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "meal-corrections queue unavailable (no state dir configured)".to_string(),
+        )),
+        Err(EnqueueError::Io(e)) => Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("could not persist meal batch: {e}"),
+        )),
+    }
+}
+
 /// Build the axum router with its shared state. Kept separate from `main` so
 /// tests can drive the same routes via `tower::ServiceExt::oneshot` without
 /// binding a socket. The running server uses exactly this router.
@@ -831,7 +1255,12 @@ pub fn app(state: AppState) -> Router {
         .route("/jesse/prompts", get(jesse_prompts))
         .route("/jesse/diet", get(jesse_diet))
         .route("/jesse/sessions", get(jesse_sessions))
+        .route(
+            "/jesse/session/:session_id",
+            axum::routing::delete(jesse_session_delete),
+        )
         .route("/jesse/title", post(jesse_title))
+        .route("/jesse/meal-corrections", post(jesse_meal_corrections))
         .route("/jesse/result/:job_id", get(jesse_result))
         .route("/jesse/stream/:job_id", get(jesse_stream))
         .route("/jesse/cancel/:job_id", post(jesse_cancel))
@@ -839,4 +1268,31 @@ pub fn app(state: AppState) -> Router {
         .route("/jesse/notify/:job_id", post(jesse_notify))
         .layer(DefaultBodyLimit::max(body_limit))
         .with_state(state)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn validate_request_id_accepts_alnum_and_hyphens_within_length() {
+        assert!(validate_request_id("abc123").is_ok());
+        assert!(validate_request_id("A1B2-c3d4-EF56").is_ok());
+        assert!(validate_request_id("--------").is_ok());
+        // Exactly 64 chars is the boundary and allowed.
+        assert!(validate_request_id(&"a".repeat(64)).is_ok());
+    }
+
+    #[test]
+    fn validate_request_id_rejects_empty_over_length_and_bad_chars() {
+        assert!(validate_request_id("").is_err());
+        // 65 chars is one past the cap.
+        assert!(validate_request_id(&"a".repeat(65)).is_err());
+        // Disallowed characters: underscore, dot, slash, space, unicode.
+        assert!(validate_request_id("has_underscore").is_err());
+        assert!(validate_request_id("has.dot").is_err());
+        assert!(validate_request_id("has/slash").is_err());
+        assert!(validate_request_id("has space").is_err());
+        assert!(validate_request_id("café").is_err());
+    }
 }

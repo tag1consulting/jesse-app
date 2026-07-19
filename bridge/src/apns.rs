@@ -299,8 +299,7 @@ impl ApnsClient {
 
 /// URL-safe base64 without padding — the JWS encoding for the JWT's three parts.
 pub fn base64url_nopad(bytes: &[u8]) -> String {
-    const ALPHABET: &[u8; 64] =
-        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
     let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
     for chunk in bytes.chunks(3) {
         let b0 = chunk[0] as u32;
@@ -443,7 +442,9 @@ pub fn build_apns() -> Option<Arc<ApnsClient>> {
     let der = match pkcs8_der_from_pem(&pem) {
         Ok(d) => d,
         Err(e) => {
-            eprintln!("warning: JESSE_APNS_KEY_PATH is not a valid PKCS#8 .p8 ({e}) — push disabled");
+            eprintln!(
+                "warning: JESSE_APNS_KEY_PATH is not a valid PKCS#8 .p8 ({e}) — push disabled"
+            );
             return None;
         }
     };
@@ -592,9 +593,12 @@ mod tests {
         assert!(job_state_is_pushable(&JobState::Done {
             response: "x".into(),
             session_id: None,
-            directives: None
+            directives: None,
+            provenance: None
         }));
-        assert!(job_state_is_pushable(&JobState::Failed { error: "x".into() }));
+        assert!(job_state_is_pushable(&JobState::Failed {
+            error: "x".into()
+        }));
         assert!(!job_state_is_pushable(&JobState::Cancelled));
         assert!(!job_state_is_pushable(&JobState::Running));
     }
@@ -606,8 +610,10 @@ mod tests {
         st.devices.set("abc123devicetoken".to_string());
 
         let id = st.jobs.create();
-        st.jobs
-            .complete(&id, Ok(("the answer".to_string(), Some("sess-1".to_string()), None)));
+        st.jobs.complete(
+            &id,
+            Ok(("the answer".to_string(), Some("sess-1".to_string()), None)),
+        );
         st.notify.insert(&id);
 
         notify_if_complete(st.apns.as_deref(), &st.devices, &st.notify, &st.jobs, &id).await;
@@ -615,10 +621,16 @@ mod tests {
         let calls = mock.calls.lock_ok();
         assert_eq!(calls.len(), 1, "a flagged, completed turn pushes once");
         let req = &calls[0];
-        assert!(req.path.contains("abc123devicetoken"), "path targets the token");
+        assert!(
+            req.path.contains("abc123devicetoken"),
+            "path targets the token"
+        );
         assert_eq!(req.topic, "com.tag1.Jesse");
         assert_eq!(req.jwt.split('.').count(), 3, "carries a JWT");
-        assert!(String::from_utf8_lossy(&req.payload).contains(&id), "payload carries job_id");
+        assert!(
+            String::from_utf8_lossy(&req.payload).contains(&id),
+            "payload carries job_id"
+        );
     }
     #[tokio::test]
     async fn completed_but_not_flagged_does_not_push() {
@@ -628,7 +640,8 @@ mod tests {
         st.devices.set("abc123devicetoken".to_string());
 
         let id = st.jobs.create();
-        st.jobs.complete(&id, Ok(("the answer".to_string(), None, None)));
+        st.jobs
+            .complete(&id, Ok(("the answer".to_string(), None, None)));
         // No notify.insert — the turn finished in the foreground.
 
         notify_if_complete(st.apns.as_deref(), &st.devices, &st.notify, &st.jobs, &id).await;
@@ -657,7 +670,11 @@ mod tests {
         assert!(matches!(st.jobs.cancel(&id), CancelOutcome::Cancelled));
         st.notify.insert(&id);
         notify_if_complete(st.apns.as_deref(), &st.devices, &st.notify, &st.jobs, &id).await;
-        assert_eq!(mock.calls.lock_ok().len(), 0, "a cancelled turn isn't pushed");
+        assert_eq!(
+            mock.calls.lock_ok().len(),
+            0,
+            "a cancelled turn isn't pushed"
+        );
     }
     #[tokio::test]
     async fn push_failure_does_not_disturb_stored_result() {
@@ -672,16 +689,29 @@ mod tests {
         st.devices.set("tok".to_string());
 
         let id = st.jobs.create();
-        st.jobs
-            .complete(&id, Ok(("durable answer".to_string(), Some("sess-9".to_string()), None)));
+        st.jobs.complete(
+            &id,
+            Ok((
+                "durable answer".to_string(),
+                Some("sess-9".to_string()),
+                None,
+            )),
+        );
         st.notify.insert(&id);
 
         notify_if_complete(st.apns.as_deref(), &st.devices, &st.notify, &st.jobs, &id).await;
 
         assert_eq!(mock.calls.lock_ok().len(), 1, "the send was attempted");
         match st.jobs.get(&id) {
-            Some(JobState::Done { response, session_id, .. }) => {
-                assert_eq!(response, "durable answer", "result intact after a push failure");
+            Some(JobState::Done {
+                response,
+                session_id,
+                ..
+            }) => {
+                assert_eq!(
+                    response, "durable answer",
+                    "result intact after a push failure"
+                );
                 assert_eq!(session_id.as_deref(), Some("sess-9"));
             }
             other => panic!("job must stay Done, got {:?}", other.map(|_| ())),
@@ -714,11 +744,20 @@ mod tests {
         let id = st.jobs.create(); // Running
         st.notify.insert(&id);
         notify_if_complete(st.apns.as_deref(), &st.devices, &st.notify, &st.jobs, &id).await;
-        assert_eq!(mock.calls.lock_ok().len(), 0, "a running job isn't pushed yet");
+        assert_eq!(
+            mock.calls.lock_ok().len(),
+            0,
+            "a running job isn't pushed yet"
+        );
 
-        st.jobs.complete(&id, Ok(("done now".to_string(), None, None)));
+        st.jobs
+            .complete(&id, Ok(("done now".to_string(), None, None)));
         notify_if_complete(st.apns.as_deref(), &st.devices, &st.notify, &st.jobs, &id).await;
-        assert_eq!(mock.calls.lock_ok().len(), 1, "completion pushes exactly once");
+        assert_eq!(
+            mock.calls.lock_ok().len(),
+            1,
+            "completion pushes exactly once"
+        );
     }
     #[test]
     fn device_token_survives_restart() {

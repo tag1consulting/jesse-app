@@ -9,6 +9,7 @@ import UniformTypeIdentifiers
 /// are pinned by `PasteAttachmentTests`. These pin which pastes count as media and
 /// the type-load order (concrete encodings, kept verbatim so a photo is not
 /// re-encoded to a larger PNG).
+@MainActor
 final class ComposerPasteTests: XCTestCase {
 
     // MARK: - isMediaPaste

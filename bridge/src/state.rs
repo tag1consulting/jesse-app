@@ -33,6 +33,25 @@ pub struct AppState {
     // emergency fallback is armed — `handlers::jesse` only consults it then, so with
     // emergency off it never changes a turn's behavior.
     pub breaker: Arc<CircuitBreaker>,
+    // Persisted meal-corrections queue (JESSE_MEAL_LOG v2): off-app meal events posted
+    // to `POST /jesse/meal-corrections` land here and are merged into the `meal_log`
+    // delivered on every terminal result, so corrections made in non-app sessions still
+    // reach Apple Health. Persisted to `<state_dir>/meal-corrections-queue.jsonl`;
+    // unavailable (delivery a no-op, enqueue errors loudly) when no state dir is set.
+    pub meal_corrections: Arc<MealCorrectionsQueue>,
+    // The context ledger (context carry): records each delivered turn per thread and
+    // feeds a catch-up block into the next hosted turn + a recent-conversation block
+    // into the local children, so a locally-served turn is not lost to a later hosted
+    // follow-up. Persisted to `<state_dir>/context.json`. Inert (a total no-op) unless
+    // `cfg.context_carry` is on — with carry off every path is byte-for-byte today's.
+    pub context: Arc<ContextLedger>,
+    // AT-MOST-ONE guard for the opt-in shadow-comparison child (JESSE_SHADOW_*). A
+    // permit of ONE, entirely separate from `sem` (the production permit), so a
+    // background shadow mirror can never occupy or delay a phone turn's slot. A
+    // shadow run `try_acquire`s this (never `.await`); if it's taken, that turn is
+    // simply not mirrored (no backlog — the sample is large enough). Always present;
+    // inert unless `cfg.shadow_backend` is set. See [`shadow`].
+    pub shadow_slot: Arc<Semaphore>,
 }
 
 impl AppState {
@@ -46,6 +65,9 @@ impl AppState {
         let jobs_dir = cfg.jobs_dir();
         let device_file = cfg.device_file();
         let titles_file = cfg.titles_file();
+        let context_file = cfg.context_file();
+        let context_enabled = cfg.context_carry;
+        let meal_corrections = Arc::new(MealCorrectionsQueue::from_cfg(&cfg));
         let sem = Arc::new(Semaphore::new(cfg.max_concurrency.max(1)));
         let queue = QueueGate::new(sem.clone(), cfg.max_queued);
         let limiter = Arc::new(RateLimiter::new(cfg.rate_per_min));
@@ -60,14 +82,18 @@ impl AppState {
             notify: Arc::new(NotifyFlags::new()),
             apns: None,
             breaker: Arc::new(CircuitBreaker::new()),
+            meal_corrections,
+            context: Arc::new(ContextLedger::new(context_file, context_enabled)),
+            // One shadow child at a time; separate from the production permit.
+            shadow_slot: Arc::new(Semaphore::new(1)),
         }
     }
 
     /// The `~/.claude/projects/<escaped-vault>` directory this bridge's vault
-    /// sessions live in. Reads HOME at call time; an unknown HOME yields a path
-    /// that simply won't exist (→ empty session list), never an error.
+    /// sessions live in. Uses the HOME captured once in `Config` (see `cfg.home`);
+    /// an unknown HOME yields a path that simply won't exist (→ empty session
+    /// list), never an error.
     pub fn sessions_dir(&self) -> PathBuf {
-        let home = std::env::var("HOME").unwrap_or_default();
-        vault_sessions_dir(&home, &self.cfg.vault)
+        vault_sessions_dir(&self.cfg.home, &self.cfg.vault)
     }
 }

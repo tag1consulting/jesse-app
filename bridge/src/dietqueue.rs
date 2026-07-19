@@ -96,12 +96,18 @@ impl DietQueue {
 
     /// All pending entries, oldest-first (file order).
     pub fn pending(&self) -> Vec<QueuedEntry> {
-        self.pending.as_deref().map(read_json_lines).unwrap_or_default()
+        self.pending
+            .as_deref()
+            .map(read_json_lines)
+            .unwrap_or_default()
     }
 
     /// All rejected entries (audit/test helper).
     pub fn rejected(&self) -> Vec<QueuedEntry> {
-        self.rejected.as_deref().map(read_json_lines).unwrap_or_default()
+        self.rejected
+            .as_deref()
+            .map(read_json_lines)
+            .unwrap_or_default()
     }
 
     /// Atomically remove and return the OLDEST pending entry, or `None` if empty.
@@ -139,7 +145,10 @@ impl DietQueue {
 pub enum ReplayDisposition {
     /// Every entry passed verify (approved, or a trivially-safe correction) — append
     /// the (possibly corrected) entries.
-    Approved { entries: Vec<DietEntry>, corrected: bool },
+    Approved {
+        entries: Vec<DietEntry>,
+        corrected: bool,
+    },
     /// A verify verdict rejected an entry (or a correction wasn't trivially safe) —
     /// move the whole queued item to the rejected file. Never appended.
     Rejected,
@@ -339,7 +348,7 @@ mod tests {
             entries: vec![DietEntry::Food(FoodEntry {
                 name: name.to_string(),
                 meal: "Snack".to_string(),
-                time: "09:00".to_string(),
+                time: Some("09:00".to_string()),
                 amount: Some("1".to_string()),
                 unit: Some("piece".to_string()),
                 kcal: Some(105.0),
@@ -347,6 +356,13 @@ mod tests {
                 carbs_g: Some(27.0),
                 fat_g: Some(0.3),
                 fiber_g: Some(3.1),
+                sodium_mg: None,
+                satfat_g: None,
+                sugar_g: None,
+                potassium_mg: None,
+                calcium_mg: None,
+                omega3_mg: None,
+                magnesium_mg: None,
                 notes: Some("queued during outage".to_string()),
             })],
         }
@@ -432,8 +448,10 @@ mod tests {
     fn classify_replay_requeues_on_transport_failure_or_unparseable() {
         let item = food_item("banana");
         // Transport-class verify failure → re-queue.
-        let err: Result<String, ApiError> =
-            Err((StatusCode::GATEWAY_TIMEOUT, "verify hit the run limit".into()));
+        let err: Result<String, ApiError> = Err((
+            StatusCode::GATEWAY_TIMEOUT,
+            "verify hit the run limit".into(),
+        ));
         assert_eq!(classify_replay(&item, &err), ReplayDisposition::Requeue);
         // Unparseable verdicts → re-queue (don't guess).
         assert_eq!(
@@ -450,7 +468,10 @@ mod tests {
         q.enqueue(&item).unwrap();
         // Simulate a replay pass that dequeues then rejects.
         let taken = q.dequeue_oldest().unwrap();
-        assert_eq!(classify_replay(&taken, &Ok(reject_verdicts(1))), ReplayDisposition::Rejected);
+        assert_eq!(
+            classify_replay(&taken, &Ok(reject_verdicts(1))),
+            ReplayDisposition::Rejected
+        );
         q.record_rejected(&taken).unwrap();
         assert!(q.pending().is_empty(), "not left pending");
         let rejected = q.rejected();

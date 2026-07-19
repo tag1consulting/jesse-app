@@ -15,11 +15,15 @@ final class HealthInsightTests: XCTestCase {
     private func input(foods: [FoodFact],
                        metricLabel: String = "Carbs", unit: String = "g",
                        total: Double = 250, goal: Double? = 290,
-                       goalStatus: DietSemantics.GoalStatus = .short(40)) -> HealthInsightInput {
+                       goalStatus: DietSemantics.GoalStatus = .short(40),
+                       partial: Bool = false, knownItemCount: Int = 0,
+                       unknownItemCount: Int = 0, informational: Bool = false) -> HealthInsightInput {
         HealthInsightInput(metricLabel: metricLabel, unit: unit, total: total,
                            goal: goal, goalStatus: goalStatus,
                            goalPhrase: "a floor to hit or beat",
-                           dayStyle: "ordinary day", foods: foods)
+                           dayStyle: "ordinary day", foods: foods,
+                           partial: partial, knownItemCount: knownItemCount,
+                           unknownItemCount: unknownItemCount, informational: informational)
     }
 
     // MARK: - Prompt grounding
@@ -97,6 +101,50 @@ final class HealthInsightTests: XCTestCase {
         XCTAssertEqual(built.goalStatus, .short(40))
     }
 
+    // MARK: - Micronutrient grounding (partial floor + informational)
+
+    func testPromptStatesPartialTotalIsAFloor() {
+        let prompt = HealthInsightPrompt.make(input(
+            foods: [FoodFact(name: "Bread", value: 450, sharePct: 60)],
+            metricLabel: "Sodium", unit: "mg", total: 750, goal: 2300,
+            goalStatus: .met, partial: true, knownItemCount: 2, unknownItemCount: 1))
+        XCTAssertTrue(prompt.contains("PARTIALITY"))
+        XCTAssertTrue(prompt.uppercased().contains("PARTIAL"))
+        XCTAssertTrue(prompt.lowercased().contains("floor"))
+        XCTAssertTrue(prompt.contains("1 of 3"), "names how many of how many items are unknown")
+        // It must forbid claiming completeness.
+        XCTAssertTrue(prompt.lowercased().contains("at least"))
+    }
+
+    func testPromptOmitsPartialityLineWhenComplete() {
+        let prompt = HealthInsightPrompt.make(input(foods: [], metricLabel: "Sodium",
+                                                    unit: "mg", total: 800, partial: false))
+        XCTAssertFalse(prompt.contains("PARTIALITY"))
+    }
+
+    func testPromptForbidsJudgmentForInformationalMetric() {
+        let prompt = HealthInsightPrompt.make(input(
+            foods: [FoodFact(name: "Yogurt", value: 20, sharePct: 50)],
+            metricLabel: "Total Sugars", unit: "g", total: 40, goal: nil,
+            goalStatus: .noGoal, informational: true))
+        XCTAssertTrue(prompt.uppercased().contains("INFORMATIONAL ONLY"))
+        XCTAssertTrue(prompt.lowercased().contains("never judge"))
+        XCTAssertTrue(prompt.contains("Target: none set."))
+    }
+
+    func testInputBuilderCarriesMicronutrientFacts() {
+        let contributions = [FoodContribution(id: 0, name: "Bread", amount: nil, value: 450, share: 0.6)]
+        let built = HealthInsight.input(
+            metric: .micronutrient(.sodium), total: 750, goal: 2300, goalStatus: .met,
+            goalPhrase: "a ceiling to stay under", dayStyle: "ordinary day",
+            contributions: contributions, partial: true, knownItemCount: 2,
+            unknownItemCount: 1, informational: false)
+        XCTAssertEqual(built.unit, "mg")
+        XCTAssertTrue(built.partial)
+        XCTAssertEqual(built.knownItemCount, 2)
+        XCTAssertEqual(built.unknownItemCount, 1)
+    }
+
     // MARK: - The discard guard (deterministic backstop for a wrong generation)
 
     func testGuardDiscardsGoalClaimWhenShort() {
@@ -143,6 +191,59 @@ final class HealthInsightTests: XCTestCase {
             XCTAssertFalse(HealthInsightGuard.contradicts(ok, status: .short(47)),
                            "should keep: \(ok)")
         }
+    }
+
+    // MARK: - The discard guard, micronutrient facts (completeness + judgment)
+
+    func testGuardDiscardsCompletenessClaimOnPartialDay() {
+        // A partial sodium day: a generation that presents the floor as a complete total
+        // is discarded (the number is only "at least").
+        let partial = input(foods: [], metricLabel: "Sodium", unit: "mg", total: 750,
+                            goal: 2300, goalStatus: .met, partial: true,
+                            knownItemCount: 2, unknownItemCount: 1)
+        for bad in ["You had 750 mg of sodium in total today.",
+                    "Altogether that's a modest sodium day.",
+                    "Your total sodium came mostly from the bread."] {
+            XCTAssertTrue(HealthInsightGuard.contradicts(bad, input: partial),
+                          "should discard completeness claim: \(bad)")
+        }
+    }
+
+    func testGuardKeepsFloorPhrasingOnPartialDay() {
+        let partial = input(foods: [], metricLabel: "Sodium", unit: "mg", total: 750,
+                            goal: 2300, goalStatus: .met, partial: true,
+                            knownItemCount: 2, unknownItemCount: 1)
+        for ok in ["At least 750 mg of sodium so far, mostly from the bread.",
+                   "The bread and cheese are your biggest sodium sources logged."] {
+            XCTAssertFalse(HealthInsightGuard.contradicts(ok, input: partial),
+                           "should keep floor-honest insight: \(ok)")
+        }
+    }
+
+    func testGuardKeepsCompletenessClaimWhenComplete() {
+        // The same "in total" phrasing is fine when the total is NOT partial.
+        let complete = input(foods: [], metricLabel: "Sodium", unit: "mg", total: 800,
+                             goal: 2300, goalStatus: .met, partial: false)
+        XCTAssertFalse(HealthInsightGuard.contradicts("You had 800 mg of sodium in total.",
+                                                      input: complete))
+    }
+
+    func testGuardDiscardsJudgmentForInformationalSugars() {
+        let sugars = input(foods: [], metricLabel: "Total Sugars", unit: "g", total: 90,
+                           goal: nil, goalStatus: .noGoal, informational: true)
+        for bad in ["That's a lot of sugar — try to cut back tomorrow.",
+                    "Your sugars are too high today.",
+                    "You went over on sugar."] {
+            XCTAssertTrue(HealthInsightGuard.contradicts(bad, input: sugars),
+                          "should discard judgment: \(bad)")
+        }
+    }
+
+    func testGuardKeepsCompositionForInformationalSugars() {
+        let sugars = input(foods: [], metricLabel: "Total Sugars", unit: "g", total: 90,
+                           goal: nil, goalStatus: .noGoal, informational: true)
+        let ok = "Most of your sugars came from the yogurt and berries — natural dairy and fruit sugars."
+        XCTAssertFalse(HealthInsightGuard.contradicts(ok, input: sugars))
     }
 
     // MARK: - Seam contract: empty / error → empty stream

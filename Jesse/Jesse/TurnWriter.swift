@@ -87,6 +87,10 @@ struct TurnWriter {
         }
 
         let turn = Turn(role: .jesse, text: recordedText)
+        // Persist the structured provenance (if any) so the message renders its native
+        // chip on relaunch/scroll. `recordedText` above is already badge-stripped via
+        // `reply.displayText`, so the bubble text and the chip never double-show it.
+        turn.provenanceJSON = reply.provenance?.jsonString
         target.turns.append(turn)
         target.sessionId = reply.sessionId ?? target.sessionId
         target.updatedAt = Date()

@@ -87,6 +87,12 @@ final class Speaker {
     private let synth: SpeechSynthesizing
     private let session: AudioSessioning
 
+    /// When true, `speak` is a no-op: it never activates the audio session (so it
+    /// never ducks other audio) and never hands text to the synth. A dev/debug
+    /// convenience — default is driven by the `JESSE_MUTE` environment variable set
+    /// on the run scheme, so production (env unset) speaks exactly as before.
+    private let muted: Bool
+
     /// The last audio-session error, surfaced (not swallowed) for diagnostics and
     /// so a test can assert a routing failure was observed rather than dropped.
     private(set) var lastSessionError: Error?
@@ -95,8 +101,10 @@ final class Speaker {
     /// the main actor inside the initializer (a non-nil default argument would be
     /// evaluated off the actor). Tests inject a spy.
     init(session: AudioSessioning = SystemAudioSession(),
-         synth: SpeechSynthesizing? = nil) {
+         synth: SpeechSynthesizing? = nil,
+         muted: Bool = ProcessInfo.processInfo.environment["JESSE_MUTE"] != nil) {
         self.session = session
+        self.muted = muted
         self.synth = synth ?? SystemSpeechSynthesizer()
         // Tear the audio session down once speech ends (un-ducking other audio).
         self.synth.onFinish = { [weak self] in self?.deactivateSession() }
@@ -105,6 +113,9 @@ final class Speaker {
     func speak(_ text: String) {
         let t = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !t.isEmpty else { return }
+        // Dev/debug mute (JESSE_MUTE): return before activating the audio session so
+        // muting never ducks other audio and never reaches the synth.
+        guard !muted else { return }
         // Real error handling, not `try?`. A routing/category failure used to be
         // swallowed silently, dropping the voice reply with no trace. Log and record
         // it; still attempt to speak (playback may route to the default output).

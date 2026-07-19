@@ -44,15 +44,13 @@ const SELF_REFS: &[&str] = &["my", "i", "me", "mine", "we", "our"];
 /// Action verbs — a "Tell"-shaped ask that wants work done, not a lookup. Their
 /// presence excludes the turn (it belongs on the hosted path that can act).
 const ACT_VERBS: &[&str] = &[
-    "log", "add", "draft", "write", "send", "reply", "update", "schedule", "remind",
-    "create", "fix", "buy",
+    "log", "add", "draft", "write", "send", "reply", "update", "schedule", "remind", "create",
+    "fix", "buy",
 ];
 
 /// Web-shaped verbs — the answer lives on the internet, not the vault, so the local
 /// read-only child cannot serve it. Excluded.
-const WEB_VERBS: &[&str] = &[
-    "search", "research", "browse", "fetch", "news", "weather",
-];
+const WEB_VERBS: &[&str] = &["search", "research", "browse", "fetch", "news", "weather"];
 
 /// SYNTHESIS-shaped verbs (gate v2, Piece 1) — a question that wants judgment,
 /// advice, comparison, or a plan, not a fact lookup. The vaultqa-v1 bake-off showed
@@ -63,8 +61,19 @@ const WEB_VERBS: &[&str] = &[
 /// a lookup-only local model and deliver a WORSE user-facing answer. The `should I` /
 /// `what should` bigrams are matched separately (they are phrases, not single tokens).
 const SYNTHESIS_VERBS: &[&str] = &[
-    "advise", "advice", "suggest", "recommend", "review", "summarize", "summary",
-    "compare", "analyze", "plan", "brainstorm", "improve", "rank",
+    "advise",
+    "advice",
+    "suggest",
+    "recommend",
+    "review",
+    "summarize",
+    "summary",
+    "compare",
+    "analyze",
+    "plan",
+    "brainstorm",
+    "improve",
+    "rank",
 ];
 
 /// URL scheme / host markers. Any of these substrings (case-folded) means the
@@ -111,7 +120,10 @@ fn contains_url(text: &str) -> bool {
 /// a `how much/many/long` bigram, or a weak auxiliary in inversion (immediately
 /// followed by a self-reference).
 fn has_interrogative(toks: &[String]) -> bool {
-    if toks.iter().any(|t| STRONG_INTERROGATIVES.contains(&t.as_str())) {
+    if toks
+        .iter()
+        .any(|t| STRONG_INTERROGATIVES.contains(&t.as_str()))
+    {
         return true;
     }
     if toks
@@ -122,9 +134,8 @@ fn has_interrogative(toks: &[String]) -> bool {
     }
     // Weak auxiliary + self-reference (subject-auxiliary inversion), e.g. "did I",
     // "is my", "have we" — the only form in which these read as a question.
-    toks.windows(2).any(|w| {
-        WEAK_INTERROGATIVES.contains(&w[0].as_str()) && SELF_REFS.contains(&w[1].as_str())
-    })
+    toks.windows(2)
+        .any(|w| WEAK_INTERROGATIVES.contains(&w[0].as_str()) && SELF_REFS.contains(&w[1].as_str()))
 }
 
 /// The strict question allowlist + exclusions, over the RAW message (pure, so it is
@@ -276,7 +287,10 @@ mod tests {
         // with the diet keyword "running" dropped — see the note below) still fires.
         assert!(vaultqa_question_gate("what size were my last shoes"));
         for u in HITS {
-            assert!(vaultqa_question_gate(u), "plain lookup must still fire: {u:?}");
+            assert!(
+                vaultqa_question_gate(u),
+                "plain lookup must still fire: {u:?}"
+            );
         }
     }
 
@@ -288,20 +302,28 @@ mod tests {
         // pins that behavior so a future reader doesn't mistake it for the synthesis
         // exclusion. The diet-free form ("... my last shoes") fires (asserted above).
         assert!(diet_intent("what size were my last running shoes"));
-        assert!(!vaultqa_question_gate("what size were my last running shoes"));
+        assert!(!vaultqa_question_gate(
+            "what size were my last running shoes"
+        ));
     }
 
     #[test]
     fn gate_fires_on_self_referential_questions() {
         for u in HITS {
-            assert!(vaultqa_question_gate(u), "should fire the vault-QA gate: {u:?}");
+            assert!(
+                vaultqa_question_gate(u),
+                "should fire the vault-QA gate: {u:?}"
+            );
         }
     }
 
     #[test]
     fn gate_rejects_non_questions_actions_web_url_and_diet() {
         for u in MISSES {
-            assert!(!vaultqa_question_gate(u), "should NOT fire the vault-QA gate: {u:?}");
+            assert!(
+                !vaultqa_question_gate(u),
+                "should NOT fire the vault-QA gate: {u:?}"
+            );
         }
     }
 
@@ -319,7 +341,10 @@ mod tests {
     fn how_bigrams_qualify_but_bare_how_does_not() {
         assert!(vaultqa_question_gate("how much did I spend on my card"));
         assert!(vaultqa_question_gate("how long is my commute"));
-        assert!(!vaultqa_question_gate("how do you feel"), "bare 'how' + no self-ref");
+        assert!(
+            !vaultqa_question_gate("how do you feel"),
+            "bare 'how' + no self-ref"
+        );
     }
 
     #[test]
@@ -344,12 +369,32 @@ mod tests {
         );
         // With a backend AND a qualifying Ask → attempt it.
         cfg.vaultqa_backend = Some(("http://u".into(), "tok".into(), "m".into()));
-        assert!(should_try_local_vaultqa(&cfg, "ask", "what is my VO2 max", false));
+        assert!(should_try_local_vaultqa(
+            &cfg,
+            "ask",
+            "what is my VO2 max",
+            false
+        ));
         // Tell mode never fires the vault-QA gate (diet owns Tell).
-        assert!(!should_try_local_vaultqa(&cfg, "tell", "what is my VO2 max", false));
+        assert!(!should_try_local_vaultqa(
+            &cfg,
+            "tell",
+            "what is my VO2 max",
+            false
+        ));
         // An attachment/image turn is excluded (wants the multimodal hosted agent).
-        assert!(!should_try_local_vaultqa(&cfg, "ask", "what is my VO2 max", true));
+        assert!(!should_try_local_vaultqa(
+            &cfg,
+            "ask",
+            "what is my VO2 max",
+            true
+        ));
         // A non-question Ask doesn't fire.
-        assert!(!should_try_local_vaultqa(&cfg, "ask", "summarize the notes", false));
+        assert!(!should_try_local_vaultqa(
+            &cfg,
+            "ask",
+            "summarize the notes",
+            false
+        ));
     }
 }

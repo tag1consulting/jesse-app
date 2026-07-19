@@ -6,6 +6,7 @@ import XCTest
 /// (a) the exact request bytes on the wire — so the bridge contract is unchanged —
 /// and (b) the decode of every response shape, including the omit-when-default
 /// behavior the old conditionally-built dictionary had.
+@MainActor
 final class JesseWireContractTests: XCTestCase {
 
     private func http(_ status: Int, path: String = "/jesse") -> HTTPURLResponse {
@@ -97,6 +98,55 @@ final class JesseWireContractTests: XCTestCase {
                                         instructions: nil, floorOverride: nil, attachments: [],
                                         healthContextRequested: false, healthContextUnavailable: false)
         XCTAssertEqual(try body(r), #"{"mode":"ask","text":"hi"}"#)
+    }
+
+    /// A positive `meal_corrections_ack` (JESSE_MEAL_LOG v2) encodes to the wire key in
+    /// sorted position; a nil/zero ack drops the field (an ordinary turn is unchanged).
+    func testMealCorrectionsAckEncodesToExactBytes() throws {
+        let acked = JesseClient.makeRequest(mode: .ask, text: "hi", sessionId: nil, voice: false,
+                                            instructions: nil, floorOverride: nil, attachments: [],
+                                            mealCorrectionsAck: 42)
+        XCTAssertEqual(try body(acked),
+            #"{"meal_corrections_ack":42,"mode":"ask","text":"hi"}"#)
+
+        for absent in [nil, 0] as [Int?] {
+            let r = JesseClient.makeRequest(mode: .ask, text: "hi", sessionId: nil, voice: false,
+                                            instructions: nil, floorOverride: nil, attachments: [],
+                                            mealCorrectionsAck: absent)
+            XCTAssertEqual(try body(r), #"{"mode":"ask","text":"hi"}"#,
+                           "a nil/zero ack drops the field")
+        }
+    }
+
+    /// The outbox idempotency key encodes to the `request_id` wire key (as the
+    /// UUID's string form), in sorted position — byte-for-byte.
+    func testRequestIdEncodesToExactBytes() throws {
+        let id = UUID(uuidString: "E621E1F8-C36C-495A-93FC-0C247A3E6E5F")!
+        let r = JesseClient.makeRequest(mode: .ask, text: "hi", sessionId: nil, voice: false,
+                                        instructions: nil, floorOverride: nil, attachments: [],
+                                        requestId: id)
+        XCTAssertEqual(try body(r),
+            #"{"mode":"ask","request_id":"E621E1F8-C36C-495A-93FC-0C247A3E6E5F","text":"hi"}"#)
+    }
+
+    /// A nil `requestId` drops the field — every non-outbox call (watch relay,
+    /// health-context retry) is byte-for-byte unchanged.
+    func testNilRequestIdOmittedFromBytes() throws {
+        let r = JesseClient.makeRequest(mode: .ask, text: "hi", sessionId: nil, voice: false,
+                                        instructions: nil, floorOverride: nil, attachments: [],
+                                        requestId: nil)
+        XCTAssertEqual(try body(r), #"{"mode":"ask","text":"hi"}"#)
+    }
+
+    /// Response decoding is unchanged by the request_id addition: a 202 still yields
+    /// a running job id (the bridge ignores an unknown `request_id`; nothing about
+    /// the response shape changed).
+    func testResponseDecodingUnchangedWithRequestId() throws {
+        let json = Data(#"{"job_id":"job-idem","status":"running"}"#.utf8)
+        guard case .running(let id) = try JesseClient.decodeSend(data: json, resp: http(202)) else {
+            return XCTFail("expected .running")
+        }
+        XCTAssertEqual(id, "job-idem")
     }
 
     // MARK: - directives decode (poll result)

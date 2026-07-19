@@ -7,6 +7,7 @@ import UIKit
 /// identifier, even when it fires before `send` records the handle. Pre-fix the
 /// handler ended whatever the `backgroundIDs` dict held; if expiration raced
 /// ahead of the store, the dict was empty and the assertion leaked.
+@MainActor
 final class RunCoordinatorBackgroundTaskTests: XCTestCase {
 
     /// A background tasker that, on `beginTask`, sets the granted id into the handle
@@ -18,7 +19,7 @@ final class RunCoordinatorBackgroundTaskTests: XCTestCase {
         let granted = UIBackgroundTaskIdentifier(rawValue: 42)
         var ended: [UIBackgroundTaskIdentifier] = []
 
-        func beginTask(name: String, handle: BackgroundTaskHandle, expiration: @escaping () -> Void) {
+        func beginTask(name: String, handle: BackgroundTaskHandle, expiration: @escaping @MainActor @Sendable () -> Void) {
             handle.id = granted
             // Fire expiration synchronously, before this returns to `send` and
             // therefore before `send` stores the handle in `backgroundIDs`.
@@ -50,7 +51,7 @@ final class RunCoordinatorBackgroundTaskTests: XCTestCase {
     @MainActor
     func testExpirationBeforeStoreEndsGrantedID() async throws {
         let container = try ModelContainer(
-            for: JesseThread.self, Turn.self,
+            for: JesseThread.self, Turn.self, OutboxItem.self, OutboxAttachment.self,
             configurations: ModelConfiguration(isStoredInMemoryOnly: true))
         let context = ModelContext(container)
 
