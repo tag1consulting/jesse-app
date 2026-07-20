@@ -2514,7 +2514,10 @@ async fn diet_legacy_progress_without_targets_still_serves() {
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
     let body: Value = serde_json::from_str(&body_string(resp).await).unwrap();
-    assert_eq!(body["progress"]["startWeight"], 204, "progress passes through");
+    assert_eq!(
+        body["progress"]["startWeight"], 204,
+        "progress passes through"
+    );
     assert!(
         body["progress"].get("targets").is_none(),
         "no targets key on legacy data"
@@ -3245,6 +3248,283 @@ async fn session_delete_removes_transcript_and_makes_it_unresumable() {
         "repeat delete idempotent"
     );
 
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+// ---- GET /jesse/sessions/{id} — transcript hydration -----------------------
+
+/// A throwaway HOME whose escaped vault projects dir holds `session_id.jsonl` with
+/// the given contents; returns `(home, cfg, AppState)`. Mirrors the pattern the
+/// session-list tests use (per-test `cfg.home`, no global-env mutation).
+fn hydrate_fixture(session_id: &str, jsonl: &str) -> (std::path::PathBuf, AppState) {
+    let home = std::env::temp_dir().join(format!("jesse-home-{}", random_hex()));
+    let vault = format!("/vault/{}", random_hex());
+    let proj = home
+        .join(".claude")
+        .join("projects")
+        .join(escape_project_path(&vault));
+    std::fs::create_dir_all(&proj).unwrap();
+    std::fs::write(proj.join(format!("{session_id}.jsonl")), jsonl).unwrap();
+    let cfg = Config {
+        home: home.to_string_lossy().into_owned(),
+        vault,
+        state_dir: None,
+        ..test_config()
+    };
+    (home, AppState::new(cfg))
+}
+
+#[tokio::test]
+async fn hydrate_requires_auth() {
+    let st = test_state();
+    let resp = app(st)
+        .oneshot(hydrate_request(None, "some-session", None))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn hydrate_returns_ordered_turns_from_a_transcript() {
+    // A realistic transcript: a system init line, a bridge-WRAPPED first user turn,
+    // an assistant turn with thinking + tool_use + text (only the text renders), and
+    // a follow-up user turn. Hydration returns clean, ordered, stripped turns.
+    let wrapped = build_prompt_at(
+        "Current date/time: Sunday, 2026-07-20 08:00 CEST (UTC+02:00).",
+        "ask",
+        "what is on Today.md?",
+        false,
+        false,
+        None,
+        None,
+        None,
+        false,
+        false,
+        &Persona::default(),
+    )
+    .unwrap();
+    let jsonl = format!(
+        concat!(
+            "{{\"type\":\"system\",\"subtype\":\"init\"}}\n",
+            "{{\"type\":\"user\",\"message\":{{\"content\":{}}}}}\n",
+            "{{\"type\":\"assistant\",\"message\":{{\"content\":[",
+            "{{\"type\":\"thinking\",\"thinking\":\"hmm\"}},",
+            "{{\"type\":\"tool_use\",\"name\":\"Read\",\"input\":{{}}}},",
+            "{{\"type\":\"text\",\"text\":\"Two things: a call and a run.\"}}]}}}}\n",
+            "{{\"type\":\"user\",\"message\":{{\"content\":[{{\"type\":\"tool_result\",\"content\":\"noise\"}}]}}}}\n"
+        ),
+        serde_json::to_string(&wrapped).unwrap(),
+    );
+    let (home, st) = hydrate_fixture("sess-hy", &jsonl);
+
+    let resp = app(st)
+        .oneshot(hydrate_request(Some("Bearer test-token"), "sess-hy", None))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body: Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    assert_eq!(body["session_id"], "sess-hy");
+    let turns = body["turns"].as_array().unwrap();
+    assert_eq!(turns.len(), 2, "system + tool_result carrier skipped");
+    assert_eq!(turns[0]["role"], "user");
+    assert_eq!(
+        turns[0]["text"], "what is on Today.md?",
+        "the wrapper is stripped from the hydrated user turn"
+    );
+    assert_eq!(turns[1]["role"], "assistant");
+    assert_eq!(
+        turns[1]["text"], "Two things: a call and a run.",
+        "only the assistant's visible text, no thinking/tool_use"
+    );
+    assert_eq!(
+        body["next_offset"].as_u64().unwrap(),
+        jsonl.len() as u64,
+        "next_offset is the full byte length"
+    );
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+#[tokio::test]
+async fn hydrate_after_returns_only_the_delta_with_the_next_offset() {
+    let head = concat!(
+        "{\"type\":\"user\",\"message\":{\"content\":\"q1\"}}\n",
+        "{\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"a1\"}]}}\n",
+    );
+    let (home, st) = hydrate_fixture("sess-delta", head);
+
+    // First call (no `after`) returns everything and the head length as next_offset.
+    let resp = app(st.clone())
+        .oneshot(hydrate_request(
+            Some("Bearer test-token"),
+            "sess-delta",
+            None,
+        ))
+        .await
+        .unwrap();
+    let body: Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    assert_eq!(body["turns"].as_array().unwrap().len(), 2);
+    let offset = body["next_offset"].as_u64().unwrap();
+    assert_eq!(offset, head.len() as u64);
+
+    // Append a new turn to the same transcript, then hydrate FROM the prior offset.
+    let dir = st.sessions_dir();
+    let path = dir.join("sess-delta.jsonl");
+    let more = "{\"type\":\"user\",\"message\":{\"content\":\"q2\"}}\n";
+    std::fs::write(&path, format!("{head}{more}")).unwrap();
+
+    let resp = app(st)
+        .oneshot(hydrate_request(
+            Some("Bearer test-token"),
+            "sess-delta",
+            Some(offset),
+        ))
+        .await
+        .unwrap();
+    let body: Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    let turns = body["turns"].as_array().unwrap();
+    assert_eq!(turns.len(), 1, "only the appended turn");
+    assert_eq!(turns[0]["text"], "q2");
+    assert_eq!(
+        body["next_offset"].as_u64().unwrap(),
+        (head.len() + more.len()) as u64
+    );
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+#[tokio::test]
+async fn hydrate_skips_a_partial_trailing_line_then_returns_it_next_call() {
+    // A complete turn followed by a partial line (no terminating newline yet).
+    let complete = "{\"type\":\"user\",\"message\":{\"content\":\"q1\"}}\n";
+    let partial = "{\"type\":\"user\",\"message\":{\"content\":\"q2 par";
+    let (home, st) = hydrate_fixture("sess-partial", &format!("{complete}{partial}"));
+
+    let resp = app(st.clone())
+        .oneshot(hydrate_request(
+            Some("Bearer test-token"),
+            "sess-partial",
+            None,
+        ))
+        .await
+        .unwrap();
+    let body: Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    assert_eq!(
+        body["turns"].as_array().unwrap().len(),
+        1,
+        "the partial line is not returned yet (no 500)"
+    );
+    let offset = body["next_offset"].as_u64().unwrap();
+    assert_eq!(
+        offset,
+        complete.len() as u64,
+        "offset stops before the partial"
+    );
+
+    // The writer finishes the line; the next `?after=` call returns it.
+    let dir = st.sessions_dir();
+    let path = dir.join("sess-partial.jsonl");
+    std::fs::write(&path, format!("{complete}{partial}tial\"}}}}\n")).unwrap();
+
+    let resp = app(st)
+        .oneshot(hydrate_request(
+            Some("Bearer test-token"),
+            "sess-partial",
+            Some(offset),
+        ))
+        .await
+        .unwrap();
+    let body: Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    let turns = body["turns"].as_array().unwrap();
+    assert_eq!(turns.len(), 1);
+    assert_eq!(turns[0]["text"], "q2 partial");
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+#[tokio::test]
+async fn hydrate_unknown_id_is_404() {
+    let (home, st) = hydrate_fixture(
+        "exists",
+        "{\"type\":\"user\",\"message\":{\"content\":\"hi\"}}\n",
+    );
+    let resp = app(st)
+        .oneshot(hydrate_request(
+            Some("Bearer test-token"),
+            "does-not-exist",
+            None,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+#[tokio::test]
+async fn hydrate_rejects_a_path_traversal_id() {
+    // A crafted id that is not a plain filename component must be a 400 BEFORE the
+    // filesystem is touched — it can never resolve outside the projects dir.
+    let (home, st) = hydrate_fixture(
+        "real",
+        "{\"type\":\"user\",\"message\":{\"content\":\"hi\"}}\n",
+    );
+    for bad in ["..%2f..%2fsecrets", "..", "."] {
+        let resp = app(st.clone())
+            .oneshot(hydrate_request(Some("Bearer test-token"), bad, None))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::BAD_REQUEST,
+            "traversal id {bad:?} must be rejected"
+        );
+    }
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+#[tokio::test]
+async fn title_mint_transcript_is_excluded_from_list_and_hydration() {
+    // Wart 1 end-to-end: a title-mint transcript (first user turn is the fixed title
+    // instruction) never appears in the list AND 404s from hydration; a real session
+    // in the same dir is listed and hydratable.
+    let mint_line = format!(
+        "{{\"type\":\"user\",\"message\":{{\"content\":{}}}}}\n",
+        serde_json::to_string(&build_title_prompt("a digest of some real chat")).unwrap()
+    );
+    let (home, st) = hydrate_fixture("mint", &mint_line);
+    // Add a real session alongside the mint.
+    let proj = st.sessions_dir();
+    std::fs::write(
+        proj.join("real.jsonl"),
+        "{\"type\":\"user\",\"message\":{\"content\":\"what is on Today.md?\"}}\n",
+    )
+    .unwrap();
+
+    // The list shows only the real session.
+    let resp = app(st.clone())
+        .oneshot(sessions_request(Some("Bearer test-token"), None, None))
+        .await
+        .unwrap();
+    let body: Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    let ids: Vec<&str> = body["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|s| s["session_id"].as_str().unwrap())
+        .collect();
+    assert_eq!(ids, ["real"], "title-mint excluded from the list");
+
+    // Hydrating the mint id is a 404; the real id hydrates.
+    let resp = app(st.clone())
+        .oneshot(hydrate_request(Some("Bearer test-token"), "mint", None))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND, "title-mint id 404s");
+
+    let resp = app(st)
+        .oneshot(hydrate_request(Some("Bearer test-token"), "real", None))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body: Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    assert_eq!(body["turns"][0]["text"], "what is on Today.md?");
     let _ = std::fs::remove_dir_all(&home);
 }
 

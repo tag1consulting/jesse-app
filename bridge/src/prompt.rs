@@ -272,6 +272,121 @@ pub fn build_title_prompt(text: &str) -> String {
     format!("{TITLE_INSTRUCTION}\n\nConversation:\n{text}")
 }
 
+/// The distinctive leading phrase of [`TITLE_INSTRUCTION`]. A `POST /jesse/title`
+/// one-shot runs `claude -p "<TITLE_INSTRUCTION>…"` with no `--resume`, so it mints
+/// its OWN session transcript whose first user turn begins with exactly this text.
+/// Both a title mint and a real turn are `claude -p` runs — there is no line-type
+/// difference in the jsonl to tell them apart — so the fixed instruction prefix is
+/// the sturdiest available signal. It is a leading slice of the const (coupled by a
+/// test, so the two cannot drift), matched on the RAW first user turn BEFORE any
+/// wrapper stripping (a mint prompt is never wrapper-stripped, so the raw prefix is
+/// exact).
+pub const TITLE_MINT_MARKER: &str = "Produce ONE very short title for the conversation";
+
+/// Whether `first_user_raw` (the RAW, un-stripped text of a transcript's first user
+/// turn) is a `POST /jesse/title` one-shot mint rather than a real conversation.
+/// Used to keep title-mint transcripts out of `GET /jesse/sessions` and to `404`
+/// them from hydration. Leading whitespace is tolerated before the marker.
+pub fn is_title_mint_prompt(first_user_raw: &str) -> bool {
+    first_user_raw.trim_start().starts_with(TITLE_MINT_MARKER)
+}
+
+// ---- Un-wrapping a bridge prompt back to the user's words ------------------
+//
+// `GET /jesse/sessions` and the hydration endpoint show the USER's actual
+// utterance, not the wrapper the bridge added around it. A wrapped prompt is
+// `{clock}\n\n[{health}\n\n][{catchup}\n\n]{floor}\n\n{preamble}{TEXT}{REVIEW_CAPABILITY}…`
+// (see [`build_prompt_at`]): the user's words sit BETWEEN the preamble's fixed
+// delimiter and the always-appended [`REVIEW_CAPABILITY`] note. The bridge knows
+// its own format, so it strips exactly what it added. Interactive (non-bridge)
+// sessions instead lead with `<local-command-caveat>` / `<command-…>` plumbing from
+// the CLI; that framing is stripped too. Anything else is returned unchanged.
+
+/// A stable leading slice of [`REVIEW_CAPABILITY`] — the note `build_prompt_at`
+/// ALWAYS appends right after the user's text. Its presence is the structural
+/// signature of a bridge-wrapped prompt (a title mint and an interactive turn never
+/// contain it), and it is the right boundary of the user's utterance. Coupled to
+/// the const by a test so they cannot drift.
+pub const REVIEW_CAPABILITY_MARKER: &str = "\n\n(Capability: you are running on the Mac Studio";
+
+/// The placeholder-free tails of the four built-in preambles (see [`ASK_PREAMBLE`],
+/// [`TELL_PREAMBLE`], [`ASK_FOLLOWUP`], [`TELL_FOLLOWUP`]). The user's text begins
+/// immediately after whichever one leads it. The `{Owner}` placeholder only appears
+/// BEFORE these tails, so the tails are persona-independent and match any owner.
+const PREAMBLE_DELIMITERS: [&str; 4] = [
+    "\n\nQuestion: ",                             // ASK_PREAMBLE tail (fresh)
+    "\n\nMessage: ",                              // TELL_PREAMBLE tail (fresh)
+    "follows up (still asking, keep it short): ", // ASK_FOLLOWUP tail
+    "follows up (capture/act per CLAUDE.md): ",   // TELL_FOLLOWUP tail
+];
+
+/// Recover the user's utterance from a bridge-wrapped prompt, or `None` if `raw`
+/// isn't one. Requires BOTH the [`REVIEW_CAPABILITY_MARKER`] (the strong bridge
+/// signature) and a preamble delimiter occurring before it, so an interactive turn
+/// or a message that merely happens to contain `"Question: "` is never mistaken for
+/// a wrapper. Returns the text between the earliest preamble delimiter and the
+/// capability marker, trimmed.
+fn strip_bridge_wrapper(raw: &str) -> Option<String> {
+    let cap_pos = raw.find(REVIEW_CAPABILITY_MARKER)?;
+    let mut start: Option<usize> = None;
+    for delim in PREAMBLE_DELIMITERS {
+        if let Some(p) = raw.find(delim) {
+            let end = p + delim.len();
+            if end <= cap_pos {
+                start = Some(start.map_or(end, |s| s.min(end)));
+            }
+        }
+    }
+    let start = start?;
+    Some(raw[start..cap_pos].trim().to_string())
+}
+
+/// Strip the interactive-CLI framing that some sessions lead with: the
+/// `<local-command-caveat>…</local-command-caveat>` block and the standalone
+/// `<command-name>` / `<command-message>` / `<command-args>` / `<local-command-stdout>`
+/// plumbing lines. Returns the trimmed remainder (which may be empty — e.g. a bare
+/// `/clear`, which then surfaces as "no first message" rather than as XML noise).
+fn strip_local_command_framing(raw: &str) -> String {
+    let mut s = raw.to_string();
+    // Remove any caveat block(s), however many lines each spans.
+    const OPEN: &str = "<local-command-caveat>";
+    const CLOSE: &str = "</local-command-caveat>";
+    while let Some(a) = s.find(OPEN) {
+        match s[a..].find(CLOSE) {
+            Some(rel) => {
+                let end = a + rel + CLOSE.len();
+                s.replace_range(a..end, "");
+            }
+            None => break, // unterminated — leave the rest as-is
+        }
+    }
+    // Drop the command-plumbing tag lines entirely.
+    let cleaned: Vec<&str> = s
+        .lines()
+        .filter(|l| {
+            let t = l.trim_start();
+            !(t.starts_with("<command-name>")
+                || t.starts_with("<command-message>")
+                || t.starts_with("<command-args>")
+                || t.starts_with("<local-command-stdout>"))
+        })
+        .collect();
+    cleaned.join("\n").trim().to_string()
+}
+
+/// Strip whatever the bridge (or the interactive CLI) wrapped around a user turn,
+/// returning the user's actual utterance. A bridge-wrapped prompt is un-wrapped to
+/// the text between the preamble and the capability note; otherwise interactive
+/// caveat/command framing is removed; a plain message is returned trimmed and
+/// unchanged. Pure, so both the session-list snippet and every hydrated user turn
+/// strip identically.
+pub fn strip_prompt_wrapper(raw: &str) -> String {
+    if let Some(inner) = strip_bridge_wrapper(raw) {
+        return inner;
+    }
+    strip_local_command_framing(raw)
+}
+
 /// Clamp a raw model reply down to a single-line title: take the first non-empty
 /// line, strip a leading `Title:` label and a single pair of surrounding quotes,
 /// drop trailing punctuation, and truncate to `MAX_TITLE_CHARS` characters on a
@@ -753,7 +868,16 @@ mod tests {
             diet_keywords_extra: vec![],
         };
         let p = build_prompt_at(
-            TEST_CLOCK, "ask", "what is on Today.md", false, false, None, None, None, false, false,
+            TEST_CLOCK,
+            "ask",
+            "what is on Today.md",
+            false,
+            false,
+            None,
+            None,
+            None,
+            false,
+            false,
             &persona,
         )
         .unwrap();
@@ -769,7 +893,16 @@ mod tests {
     #[test]
     fn build_prompt_unknown_mode_is_400() {
         let err = build_prompt_at(
-            TEST_CLOCK, "shout", "hey", false, false, None, None, None, false, false,
+            TEST_CLOCK,
+            "shout",
+            "hey",
+            false,
+            false,
+            None,
+            None,
+            None,
+            false,
+            false,
             &Persona::default(),
         )
         .unwrap_err();
@@ -983,7 +1116,16 @@ mod tests {
         ] {
             let base = bp(mode, "body", followup, voice, None, None);
             let with = build_prompt_at(
-                TEST_CLOCK, mode, "body", followup, voice, None, None, None, false, false,
+                TEST_CLOCK,
+                mode,
+                "body",
+                followup,
+                voice,
+                None,
+                None,
+                None,
+                false,
+                false,
                 &Persona::default(),
             )
             .unwrap();
@@ -1093,8 +1235,20 @@ mod tests {
     #[test]
     fn splice_catchup_with_no_lead_leads_the_prompt() {
         // Empty clock, no health → the catch-up block leads, right before the floor.
-        let prompt =
-            build_prompt_at("", "ask", "q", false, false, None, None, None, false, false, &Persona::default()).unwrap();
+        let prompt = build_prompt_at(
+            "",
+            "ask",
+            "q",
+            false,
+            false,
+            None,
+            None,
+            None,
+            false,
+            false,
+            &Persona::default(),
+        )
+        .unwrap();
         let out = splice_catchup(&prompt, "CATCHUP", "", None);
         assert!(
             out.starts_with("CATCHUP\n\n"),
@@ -1244,6 +1398,100 @@ mod tests {
         assert!(!p.contains(PHONE_FORMAT) && !p.contains(VOICE_SUFFIX));
     }
     #[test]
+    fn title_mint_marker_is_coupled_to_the_instruction() {
+        // The marker must be a genuine leading slice of the instruction, and a real
+        // mint prompt must be recognized — so the two can never silently drift.
+        assert!(
+            TITLE_INSTRUCTION.starts_with(TITLE_MINT_MARKER),
+            "marker must lead the instruction"
+        );
+        assert!(is_title_mint_prompt(&build_title_prompt("anything at all")));
+        // Leading whitespace before the marker is tolerated.
+        assert!(is_title_mint_prompt(&format!("  {TITLE_INSTRUCTION}")));
+        // A real wrapped turn is NOT a mint.
+        let turn = bp("ask", "what is on Today.md", false, false, None, None);
+        assert!(!is_title_mint_prompt(&turn));
+        // A bare user message is not a mint.
+        assert!(!is_title_mint_prompt("Produce a report on Q3 sales"));
+    }
+
+    #[test]
+    fn review_capability_marker_is_coupled_to_the_const() {
+        assert!(
+            REVIEW_CAPABILITY.starts_with(REVIEW_CAPABILITY_MARKER),
+            "the marker must be a leading slice of REVIEW_CAPABILITY"
+        );
+    }
+
+    #[test]
+    fn strip_wrapper_recovers_user_text_from_a_fresh_ask() {
+        let raw = bp("ask", "what is on Today.md?", false, false, None, None);
+        assert_eq!(strip_prompt_wrapper(&raw), "what is on Today.md?");
+    }
+
+    #[test]
+    fn strip_wrapper_recovers_user_text_from_a_fresh_tell() {
+        let raw = bp(
+            "tell",
+            "I ran 8 miles this morning",
+            false,
+            false,
+            None,
+            None,
+        );
+        assert_eq!(strip_prompt_wrapper(&raw), "I ran 8 miles this morning");
+    }
+
+    #[test]
+    fn strip_wrapper_recovers_user_text_from_followups() {
+        let ask = bp("ask", "and what about tomorrow?", true, false, None, None);
+        assert_eq!(strip_prompt_wrapper(&ask), "and what about tomorrow?");
+        let tell = bp("tell", "also log a 2 mile walk", true, false, None, None);
+        assert_eq!(strip_prompt_wrapper(&tell), "also log a 2 mile walk");
+    }
+
+    #[test]
+    fn strip_wrapper_handles_voice_and_short_text() {
+        // A short utterance followed by REVIEW_CAPABILITY + the voice suffix must
+        // still strip to exactly the utterance (the trailing appended blocks go).
+        let raw = bp("tell", "Log my swim", false, true, None, None);
+        assert_eq!(strip_prompt_wrapper(&raw), "Log my swim");
+    }
+
+    #[test]
+    fn strip_wrapper_survives_a_health_block() {
+        let raw = bp_hc("ask", "how were my workouts?", Some("Swim 30m 400kcal")).unwrap();
+        assert_eq!(strip_prompt_wrapper(&raw), "how were my workouts?");
+    }
+
+    #[test]
+    fn strip_wrapper_leaves_a_plain_message_unchanged() {
+        // No bridge signature and no caveat framing → returned trimmed, unchanged
+        // (even if it happens to contain a delimiter-like phrase).
+        assert_eq!(
+            strip_prompt_wrapper("  just a plain message\n"),
+            "just a plain message"
+        );
+        assert_eq!(
+            strip_prompt_wrapper("Question: is this stripped? no, no capability note follows"),
+            "Question: is this stripped? no, no capability note follows"
+        );
+    }
+
+    #[test]
+    fn strip_wrapper_removes_interactive_caveat_and_command_framing() {
+        let raw = "<local-command-caveat>Caveat: The messages below were generated by the \
+user while running local commands. DO NOT respond.</local-command-caveat>\n\
+<command-name>/clear</command-name>\n<command-message>clear</command-message>\n\
+<command-args></command-args>";
+        // Only plumbing → nothing left to show.
+        assert_eq!(strip_prompt_wrapper(raw), "");
+        // Caveat framing ahead of a real typed prompt → the prompt survives.
+        let raw2 = "<local-command-caveat>Caveat: …</local-command-caveat>\nWhat is on Today.md?";
+        assert_eq!(strip_prompt_wrapper(raw2), "What is on Today.md?");
+    }
+
+    #[test]
     fn sanitize_title_passes_a_clean_title_through() {
         assert_eq!(
             sanitize_title("Weekend Trip Planning"),
@@ -1328,8 +1576,20 @@ mod tests {
     fn build_prompt_empty_clock_is_omitted() {
         // An empty clock reproduces the pre-clock output: the floor leads, with no
         // stray leading blank lines.
-        let p =
-            build_prompt_at("", "ask", "q", false, false, None, None, None, false, false, &Persona::default()).unwrap();
+        let p = build_prompt_at(
+            "",
+            "ask",
+            "q",
+            false,
+            false,
+            None,
+            None,
+            None,
+            false,
+            false,
+            &Persona::default(),
+        )
+        .unwrap();
         assert!(p.starts_with(&rp(ASK_FLOOR)));
         assert!(!p.starts_with('\n'));
     }

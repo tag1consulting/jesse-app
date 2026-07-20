@@ -942,6 +942,19 @@ curl -s http://127.0.0.1:8765/jesse/sessions \
   first user turn isn't found within that prefix gets `first_message: null` (never
   an error). `title` comes from the [title store](#conversation-titles-post-jessetitle),
   or `null` if none was ever minted for that session.
+- **`first_message` is the user's words, not the wrapper.** A bridge turn's first
+  user line is the *wrapped* prompt (the per-turn clock line, any attached health
+  context, and the Ask/Tell preamble around the message); an interactive session can
+  lead with `<local-command-caveat>` / `<command-…>` CLI plumbing. The bridge strips
+  what it added (the preamble and the always-appended capability note) and the caveat
+  framing, so the snippet is the actual utterance. The same stripping is applied to
+  every hydrated user turn (see below), so history and the list agree.
+- **Title-mint transcripts are excluded.** Every `POST /jesse/title` runs a
+  `claude -p` one-shot that mints its OWN transcript whose first user turn is the
+  fixed title instruction. Those are not real conversations, so `list_sessions`
+  recognizes and drops them (a prefix match on the instruction, coupled to the
+  constant by a test). The hydration endpoint `404`s a title-mint id for the same
+  reason.
 - **Projects-dir derivation (verified).** The `<escaped-vault-path>` is
   `cfg.vault` with **every non-alphanumeric character replaced by `-`** (so `/`,
   `.`, and `_` all become `-`; an existing `-` is kept; runs are not collapsed).
@@ -960,6 +973,49 @@ curl -s http://127.0.0.1:8765/jesse/sessions \
   skipped; non-`.jsonl` files and subdirectories are ignored; a filename that isn't
   a plain component is skipped defensively (a listing can never reach outside the
   projects dir).
+
+## Hydrate a transcript (`GET /jesse/sessions/{session_id}`)
+
+Returns one session's transcript as **ordered, client-renderable turns**, so a
+client that never saw a thread's earlier turns can render its history. The turns are
+shaped exactly like a **live SSE turn**: user utterances (wrapper-stripped, as in the
+list snippet) and the assistant's **visible text** only — thinking, `tool_use`, and
+`tool_result` noise the phone would not render are dropped, along with subagent
+(`isSidechain`) and CLI `isMeta` lines.
+
+```bash
+curl -s http://127.0.0.1:8765/jesse/sessions/<session_id> \
+  -H "Authorization: Bearer $JESSE_TOKEN"
+# → { "session_id": "0a61d246-…",
+#     "turns": [
+#       { "role": "user",      "text": "What is on Today.md?", "timestamp": "2026-07-20T08:00:00.000Z" },
+#       { "role": "assistant", "text": "Two things: a call and a run.", "timestamp": "…" }
+#     ],
+#     "next_offset": 4821 }
+```
+
+- **Auth / rate limit.** Same bearer auth (`401`) and the same per-service rate
+  limiter (`429`) as `/jesse/sessions`.
+- **`?after=<byte offset>` — the delta sync.** The transcript jsonl is
+  **append-only**, so the endpoint returns only the content appended after `after`
+  plus a fresh **`next_offset`** to send next time. Omit `after` (or send `0`) for the
+  full history. A reconnecting client re-syncs in one small round trip: send back the
+  `next_offset` it last saw. The offset is an exact byte position at a **line
+  boundary** — a **partial trailing line** (the file caught mid-write) is left
+  unconsumed, so `next_offset` points at its start and it is returned on the next
+  `?after=` call once the writer completes it. `after` at/after EOF returns no turns
+  and the current length.
+- **`404`** for an unknown id — and for a **title-mint** id (a `POST /jesse/title`
+  one-shot transcript), identically to the session list's exclusion.
+- **`400` — path-traversal safe.** The `session_id` must be a plain filename
+  component (non-empty, not `.`/`..`, no path separator); anything else is a `400`
+  **before** the filesystem is touched, so a crafted id can never resolve outside the
+  vault projects dir. The one file read is exactly `<session_id>.jsonl` in that dir,
+  via the same pure `session_transcript_path` / `escape_project_path` derivation
+  `/jesse/sessions` uses.
+- **Never `500`s on a bad transcript.** Unparseable, non-UTF-8, or partial lines are
+  skipped (a partial trailing line is returned once complete); a session with only
+  tool traffic simply yields an empty `turns` array.
 
 ## Delete a session (`DELETE /jesse/session/{session_id}`)
 
