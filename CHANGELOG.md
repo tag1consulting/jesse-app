@@ -15,6 +15,37 @@ CI both run it). See the "Versioning" section of `bridge/README.md`.
 
 ## [Unreleased]
 
+## [App 1.0 (56)] — 2026-07-20
+
+### Added
+- **Per-nutrient trend charts now color each day by its goal status, and every
+  trend chart offers a 1-week range.** The per-nutrient trend (behind a drill-down
+  tap) plots each known day in the SAME green/amber/red the daily macro bars and
+  status meter use (`statusColor`), so under/on/over reads at a glance:
+  - Coloring reuses the existing per-day bands — `DietSemantics.floorStatus` for a
+    floor (protein, fiber, carbs, and the minerals), `ceilingStatus` for a ceiling
+    (sodium, saturated fat, calories), and the fixed-grams `fatWindowStatus` for the
+    fat window — via a new pure `NutrientTrends.dayStatus`. Calories read as a
+    ceiling and carbs as a floor (the normal-day treatment, the only one the history
+    can assume), matching the Today bars; the informational nutrients (total sugars,
+    unsaturated fat) stay neutral, never judged.
+  - Color is a SECOND signal, never the only one: each dot's position relative to the
+    target rule and a new under/on/over word in the scrub readout
+    (`NutrientTrends.dayStatusPhrase`) carry the same information, and the palette is
+    legible in light and dark mode.
+  - A PARTIAL day (unknown-mixed, so its value is a lower bound) only takes a red/green
+    once the lower bound already PROVES the breach — a floor already cleared, a ceiling
+    already exceeded — and otherwise stays neutral rather than overclaim a band its
+    unknowns could overturn. Gap days remain breaks in the line, never zeros.
+  - A **1-week (7d)** option joins 30d/90d/All on every per-nutrient trend chart AND on
+    the weight trend chart, so the recent tail reads at a glance (useful while
+    traveling). The target line, coloring, gaps, and partial readout stay correct at
+    every range.
+
+### Notes
+- No bridge change: `nutrientSeries` (bridge ≥ 0.21.0) was already decoded and wired;
+  this is app-side charting only.
+
 ## [Bridge 0.22.4] — 2026-07-19
 
 ### Changed
