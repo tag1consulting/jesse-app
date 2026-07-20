@@ -315,6 +315,12 @@ pub struct Config {
     // default 120). A timeout records an INCOMPLETE pair and never retries. Inert
     // unless `shadow_backend` is set.
     pub shadow_timeout_secs: u64,
+    // The resolved personalization: owner name/pronoun, languages, and extra diet
+    // vocabulary. Loaded from generic built-in defaults → `jesse.local.toml`
+    // `[persona]` → environment (see [`Persona::load`]). A fresh clone with no
+    // local file resolves to the generic default ("the user"), so no personal fact
+    // is ever compiled in — personalization is pure runtime DATA.
+    pub persona: Persona,
 }
 
 impl Config {
@@ -719,6 +725,10 @@ impl Config {
             // Shadow child wall-clock budget; default 120s. A timeout logs an
             // incomplete pair and never retries.
             shadow_timeout_secs: env_parse("JESSE_SHADOW_TIMEOUT_SECS", 120),
+            // Personalization overlay: generic defaults → jesse.local.toml → env.
+            // Resolved once at startup against the captured HOME (used to find the
+            // state-dir config location for a launchd service outside the repo).
+            persona: Persona::load(&home),
         }
     }
 }

@@ -197,15 +197,15 @@ fn vault_readonly_write_tool_is_refused_at_cli() {
     );
 }
 
-/// Run the SHIPPED `vaultqa-v1` suite through a mock via `--mock` and return the
-/// parsed `results.json` tasks. Uses `include_str!` so the suite and mock under
+/// Run the SHIPPED `vaultqa-example` suite through a mock via `--mock` and return
+/// the parsed `results.json` tasks. Uses `include_str!` so the suite and mock under
 /// test are the committed artifacts, not copies.
 fn run_vaultqa_mock(mock_json: &str) -> serde_json::Value {
     let tmp = tempfile::tempdir().unwrap();
-    let suite_path = tmp.path().join("vaultqa-v1.json");
+    let suite_path = tmp.path().join("vaultqa-example.json");
     let mock_path = tmp.path().join("mock.json");
     let out = tmp.path().join("out");
-    fs::write(&suite_path, include_str!("../suites/vaultqa-v1.json")).unwrap();
+    fs::write(&suite_path, include_str!("../suites/vaultqa-example.json")).unwrap();
     fs::write(&mock_path, mock_json).unwrap();
 
     let status = Command::new(bin())
@@ -228,10 +228,10 @@ fn run_vaultqa_mock(mock_json: &str) -> serde_json::Value {
 /// score 10/10. This proves the shipped suite's assertions accept a correct,
 /// grounded, injection-resistant answer.
 #[test]
-fn vaultqa_v1_good_mock_passes_every_task() {
+fn vaultqa_example_good_mock_passes_every_task() {
     let results = run_vaultqa_mock(include_str!("../suites/validation/mock-good.json"));
     let tasks = results["tasks"].as_array().unwrap();
-    assert_eq!(tasks.len(), 10, "vaultqa-v1 has 10 tasks");
+    assert_eq!(tasks.len(), 10, "vaultqa-example has 10 tasks");
     for t in tasks {
         assert_eq!(
             t["passed"], true,
@@ -246,7 +246,7 @@ fn vaultqa_v1_good_mock_passes_every_task() {
 /// true because a result line still arrived. This is the diet-v1-style proof
 /// that each assertion has teeth and catches exactly the defect it targets.
 #[test]
-fn vaultqa_v1_bad_mock_fails_intended_assertions() {
+fn vaultqa_example_bad_mock_fails_intended_assertions() {
     let results = run_vaultqa_mock(include_str!("../suites/validation/mock-bad.json"));
     let tasks = results["tasks"].as_array().unwrap();
     assert_eq!(tasks.len(), 10);
@@ -299,11 +299,11 @@ fn vaultqa_v1_bad_mock_fails_intended_assertions() {
     assert!(
         neg.contains(&"answer_matches".to_string())
             && neg.contains(&"answer_excludes".to_string()),
-        "vq-negative-absent bad answer must fail the absence-ack and the 38217 exclusion; fired: {neg:?}"
+        "vq-negative-absent bad answer must fail the absence-ack and the 77420 exclusion; fired: {neg:?}"
     );
     // Numeric target: capturing the 204 start weight is out of band.
     assert!(
         fired("vq-weight-target").contains(&"number_in_range".to_string()),
-        "vq-weight-target bad answer (204 lbs) must fail number_in_range"
+        "vq-weight-target bad answer (210 lbs) must fail number_in_range"
     );
 }

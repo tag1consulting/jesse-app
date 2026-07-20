@@ -1,4 +1,4 @@
-# Scorecard — vaultqa-v1
+# Scorecard — vaultqa-example
 
 Target: mock (canned NDJSON)
 

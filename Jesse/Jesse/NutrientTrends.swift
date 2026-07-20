@@ -667,7 +667,8 @@ enum NutrientTrends {
     /// detail the app has (typically the loaded day) used for the top-sources lines;
     /// unknown items never appear as a source. Returns "" when the series is empty.
     static func coachRollup(series: [NutrientDay], targets: DietTargets,
-                            meals: [DietMeal], budgetBytes: Int = coachRollupBudget) -> String {
+                            meals: [DietMeal], ownerName: String = "the user",
+                            budgetBytes: Int = coachRollupBudget) -> String {
         guard isAvailable(series) else { return "" }
 
         // Primary-window analysis per nutrient, for standing-problem detection + ranking.
@@ -693,10 +694,10 @@ enum NutrientTrends {
         let framing = "NUTRIENT WINDOWS (known days only — a gap is never a low day). "
             + "Use these to tell a persistent pattern from a single day: call out what is "
             + "consistently on-track and what is a standing problem across 7/30/all. For each "
-            + "standing problem below, EVERY day: say what the level is doing to Jeremy "
-            + "(the consequence), where he is getting or missing it (the real top sources), "
-            + "and one or two concrete fixes from his good-source foods — favoring what is in "
-            + "season and already in his kitchen, and fitting the calorie deficit. Never "
+            + "standing problem below, EVERY day: say what the level is doing to \(ownerName) "
+            + "(the consequence), where they are getting or missing it (the real top sources), "
+            + "and one or two concrete fixes from their good-source foods — favoring what is in "
+            + "season and already in their kitchen, and fitting the calorie deficit. Never "
             + "present a coverage gap as a low day."
 
         // Build every candidate block, in priority order, then greedily fit the budget.

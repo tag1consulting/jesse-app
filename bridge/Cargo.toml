@@ -1,6 +1,6 @@
 [package]
 name = "jesse-bridge"
-version = "0.22.3"
+version = "0.22.4"
 edition = "2021"
 license = "Apache-2.0"
 
@@ -15,6 +15,11 @@ serde_json = "1"
 # json5 handles exactly that superset; we strip the assignment wrapper and parse
 # the literal. No hand-rolled JS parsing, no regex quote-rewriting.
 json5 = "0.4"
+# TOML parser for the optional gitignored `jesse.local.toml` persona overlay
+# (owner name/pronoun/languages + extra diet vocabulary). Read once at startup,
+# layered under the environment; a missing/malformed file soft-fails to the
+# generic built-in defaults so a fresh clone needs no config at all.
+toml = { version = "0.8", default-features = false, features = ["parse"] }
 # RFC 4180 CSV reader for the vault's `weight-log.csv` (GET /jesse/diet). Its Notes
 # column contains quoted commas, so a naive split(',') corrupts rows — the csv
 # crate handles quoting/escaping correctly.

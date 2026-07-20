@@ -26,6 +26,55 @@ iPhone (Jesse app)  ──HTTP over Tailscale──▶  Laptop (jesse-bridge)  �
 
 ---
 
+## Make Jesse yours
+
+A fresh clone is fully generic: with no configuration the assistant addresses
+"the user", the vault defaults to `~/vault`, and the diet-intent gate uses an
+English-only vocabulary. **All personalization is runtime data in gitignored
+files — never an edit to tracked source — so `git push` can never leak it.**
+
+Every local file has a committed `*.example` twin; copy it and edit the copy:
+
+1. **Name, pronoun, languages, vocabulary** — copy the persona template and edit
+   your copy:
+   ```bash
+   cp jesse.example.toml jesse.local.toml
+   # set owner_name, owner_pronoun, languages, and any diet_keywords_extra
+   ```
+   The bridge reads `jesse.local.toml` last, over the built-in defaults;
+   environment variables (`JESSE_OWNER_NAME`, `JESSE_OWNER_PRONOUN`,
+   `JESSE_LANGUAGES`, `JESSE_DIET_KEYWORDS_EXTRA`) override the file. It is found
+   (first that exists wins) at `$JESSE_CONFIG`, then `./jesse.local.toml`, then
+   `<state-dir>/jesse.local.toml` (`$JESSE_STATE_DIR`, else `$HOME/.jesse-bridge`) —
+   the last is the reliable spot for a launchd-managed service whose working
+   directory isn't the repo.
+
+2. **Point at your vault** — `export JESSE_VAULT=/path/to/your/vault` (defaults to
+   `~/vault`).
+
+3. **Local CI-guard denylist (optional)** — to have the pre-push checks catch your
+   real name/hostnames/IPs if they ever slip into a tracked file:
+   ```bash
+   cp scripts/ci-guards.local.sh.example scripts/ci-guards.local.sh
+   # add your real identifiers to EXTRA_DENY
+   ```
+   `scripts/ci-guards.sh` sources it when present. Org CI won't have the file —
+   that's expected; the generic guard still runs everywhere.
+
+4. **Your own eval suite (optional)** — copy the generic template into `local/` and
+   pin it to your real vault:
+   ```bash
+   cp eval/suites/vaultqa-example.json eval/suites/local/vaultqa-mine.json
+   ```
+   See [`eval/suites/README.md`](eval/suites/README.md).
+
+Every instance path above — `jesse.local.toml`, `scripts/ci-guards.local.sh`, and
+everything under `eval/suites/local/` — is **gitignored by design**, so personal
+data can't be committed or pushed. The bridge's own persona config is documented
+in [`bridge/README.md`](bridge/README.md).
+
+---
+
 ## Repository layout
 
 | Path | What |

@@ -123,13 +123,15 @@ async fn prompts_returns_both_built_in_defaults() {
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
     let body: Value = serde_json::from_str(&body_string(resp).await).unwrap();
-    // The exact const strings build_prompt applies, so the app's "default"
-    // matches what the bridge would use for a fresh turn.
-    assert_eq!(body["ask"], ASK_PREAMBLE);
-    assert_eq!(body["tell"], TELL_PREAMBLE);
+    // The endpoint renders the built-in defaults through the configured persona, so
+    // the app's "default" matches exactly what the bridge would build for a fresh
+    // turn. test_state uses the generic default persona (owner "the user").
+    let p = Persona::default();
+    assert_eq!(body["ask"], p.render(ASK_PREAMBLE));
+    assert_eq!(body["tell"], p.render(TELL_PREAMBLE));
     // The fixed safety floors are exposed too, so the app can show them read-only.
-    assert_eq!(body["ask_floor"], ASK_FLOOR);
-    assert_eq!(body["tell_floor"], TELL_FLOOR);
+    assert_eq!(body["ask_floor"], p.render(ASK_FLOOR));
+    assert_eq!(body["tell_floor"], p.render(TELL_FLOOR));
 }
 #[tokio::test]
 async fn result_endpoint_returns_persisted_job_after_restart() {
@@ -543,9 +545,10 @@ async fn wrapped_prompt_carries_a_live_clock_header_end_to_end() {
         year >= 2026,
         "clock must reflect the real current year: {year}"
     );
-    // The floor still follows the clock (it wasn't displaced).
+    // The floor still follows the clock (it wasn't displaced). The endpoint renders
+    // the default persona ("the user") into the floor template.
     assert!(
-        prompt.contains(ASK_FLOOR),
+        prompt.contains(&Persona::default().render(ASK_FLOOR)),
         "the Ask safety floor must still follow the clock header"
     );
 
@@ -1021,7 +1024,7 @@ async fn health_context_block_reaches_claude_verbatim_after_the_clock() {
     assert!(with.contains(block), "block appears verbatim");
     let clock_end = with.find("\n\n").expect("clock line then blank line");
     let block_at = with.find(block).unwrap();
-    let floor_at = with.find(ASK_FLOOR).unwrap();
+    let floor_at = with.find(&Persona::default().render(ASK_FLOOR)).unwrap();
     assert!(
         clock_end < block_at && block_at < floor_at,
         "clock < block < floor"

@@ -18,3 +18,17 @@ STATUS.md
 # cruft
 _removed-python/
 *.fuse_hidden*
+
+# Local personalization overlay — never commit (holds the owner's real name,
+# languages, vocabulary). Ship jesse.example.toml; copy it to jesse.local.toml
+# and edit that. See README → "Make Jesse yours".
+jesse.local.toml
+
+# Local CI-guard denylist — the owner's real name/hostnames/IPs the R5 guard
+# should catch locally. Ship scripts/ci-guards.local.sh.example; copy it. Org CI
+# won't have this file, which is expected.
+scripts/ci-guards.local.sh
+
+# Local eval suites pinned to a real vault (real facts, filenames). The shipped
+# vaultqa-example.json is the generic template; real suites live here, gitignored.
+eval/suites/local/

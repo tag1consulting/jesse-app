@@ -1417,10 +1417,10 @@ pub const DIET_EXTRACT_SCHEMA: &str = r#"{
 /// header consts the append path targets — the parity source of truth), the per-item
 /// anti-aggregation rule, the schema, and the JSON-only instruction. The raw
 /// utterance is appended. The child holds no tools, so everything it needs is here.
-pub fn build_diet_extract_prompt(utterance: &str) -> String {
+pub fn build_diet_extract_prompt(utterance: &str, owner: &str) -> String {
     format!(
-        "You extract structured diet-log entries from a short message Jeremy sent from \
-his phone. Return ONLY a single JSON object — no prose, no markdown, no code fence.\n\
+        "You extract structured diet-log entries from a short message {owner} sent from \
+their phone. Return ONLY a single JSON object — no prose, no markdown, no code fence.\n\
 \n\
 CONTRACT (the vault's diet logs; you are parsing INTO these columns):\n\
 - food-log.csv columns: {FOOD_LOG_HEADER}\n\
@@ -1477,11 +1477,11 @@ MESSAGE:\n{utterance}"
 /// a per-entry approve/correct/reject instruction with the tolerance band spelled
 /// out (differs by more than 20% OR 75 kcal per item). Returns a `verdicts` array,
 /// one verdict per candidate, in order.
-pub fn build_diet_verify_prompt(utterance: &str, candidates_json: &str) -> String {
+pub fn build_diet_verify_prompt(utterance: &str, candidates_json: &str, owner: &str) -> String {
     format!(
         "You are the VERIFY gate for a diet-logging pipeline. A cheap local model \
-parsed Jeremy's message into candidate per-item entries. Check each one against the \
-message before it is written to his logs. Return ONLY a JSON object — no prose.\n\
+parsed {owner}'s message into candidate per-item entries. Check each one against the \
+message before it is written to their logs. Return ONLY a JSON object — no prose.\n\
 \n\
 For EACH candidate, in order, emit one verdict:\n\
 - \"approve\": the item and its macros are right (within tolerance).\n\
@@ -1685,7 +1685,7 @@ pub async fn run_diet_pipeline(cfg: &Config, utterance: &str) -> DietPipelineOut
     // Stage 1 — extract.
     let extract_raw = match run_diet_extract(
         cfg,
-        &build_diet_extract_prompt(utterance),
+        &build_diet_extract_prompt(utterance, &cfg.persona.owner_name),
         DIET_EXTRACT_TIMEOUT_SECS,
     )
     .await
@@ -1703,7 +1703,7 @@ pub async fn run_diet_pipeline(cfg: &Config, utterance: &str) -> DietPipelineOut
     // Stage 2 — verify (probation: mandatory, blocking, 100%).
     let verify_raw = match run_diet_verify(
         cfg,
-        &build_diet_verify_prompt(utterance, &entries_to_json(&extract.entries)),
+        &build_diet_verify_prompt(utterance, &entries_to_json(&extract.entries), &cfg.persona.owner_name),
         DIET_VERIFY_TIMEOUT_SECS,
     )
     .await
@@ -2633,7 +2633,7 @@ mod tests {
         // the row builders target, so the described contract can never drift from
         // what the append path writes. Assert the prompt carries each header verbatim
         // AND that each row builder emits exactly that many columns.
-        let p = build_diet_extract_prompt("hi");
+        let p = build_diet_extract_prompt("hi", "the user");
         assert!(
             p.contains(FOOD_LOG_HEADER),
             "extract prompt must inline the food header"
@@ -2715,7 +2715,7 @@ mod tests {
         // child to classify a correction/amendment as `no_loggable_content` (routing it
         // to the hosted path), and the schema's `no_loggable_content` description must
         // say so too — so the child never re-logs a correction as a fresh entry.
-        let p = build_diet_extract_prompt("actually lunch was two bowls, about 700 kcal");
+        let p = build_diet_extract_prompt("actually lunch was two bowls, about 700 kcal", "the user");
         assert!(
             p.contains("CORRECTIONS ARE NOT NEW LOGS"),
             "extract prompt must carry the amendment rule"

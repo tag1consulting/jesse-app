@@ -1,11 +1,11 @@
 {
-  "name": "vaultqa-v1",
+  "name": "vaultqa-example",
   "tasks": [
     {
       "id": "vq-shoe-size",
       "class": "vault-qa",
       "workspace": "vault-readonly",
-      "prompt": "What shoe size does Jeremy wear for his running shoes? Search the vault, give both the EU and US size, and name the vault note (filename) that records it.",
+      "prompt": "What shoe size does the vault owner wear for their running shoes? Search the vault, give both the EU and US size, and name the vault note (filename) that records it.",
       "allowed_tools": [
         "Read",
         "Grep",
@@ -19,15 +19,15 @@
       "assertions": [
         {
           "type": "answer_matches",
-          "pattern": "44\\.5"
+          "pattern": "43\\.5"
         },
         {
           "type": "answer_matches",
-          "pattern": "10\\.5"
+          "pattern": "9\\.5"
         },
         {
           "type": "answer_matches",
-          "pattern": "(?i)Running-Shoe-Orders"
+          "pattern": "(?i)Footwear-Log"
         },
         {
           "type": "max_tool_calls",
@@ -42,7 +42,7 @@
       "id": "vq-usenet-status",
       "class": "vault-qa",
       "workspace": "vault-readonly",
-      "prompt": "What is the plan for Jeremy's self-hosted Usenet node? Name the server software and the kind of host/container it runs in, and cite the vault note that describes it.",
+      "prompt": "What is the plan for the owner's self-hosted feed reader? Name the server software and the kind of host/container it runs in, and cite the vault note that describes it.",
       "allowed_tools": [
         "Read",
         "Grep",
@@ -56,11 +56,11 @@
       "assertions": [
         {
           "type": "answer_matches",
-          "pattern": "(?i)leafnode"
+          "pattern": "(?i)freshrss"
         },
         {
           "type": "answer_matches",
-          "pattern": "(?i)LXC|Proxmox"
+          "pattern": "(?i)docker|container"
         },
         {
           "type": "answer_matches",
@@ -75,7 +75,7 @@
       "id": "vq-protein-goal",
       "class": "vault-qa",
       "workspace": "vault-readonly",
-      "prompt": "What is Jeremy's daily protein target in his diet program? Quote the line from the vault that states it and cite the note (filename) it comes from.",
+      "prompt": "What is the owner's daily protein target in their diet program? Quote the line from the vault that states it and cite the note (filename) it comes from.",
       "allowed_tools": [
         "Read",
         "Grep",
@@ -89,7 +89,7 @@
       "assertions": [
         {
           "type": "answer_matches",
-          "pattern": "150\\s?g"
+          "pattern": "120\\s?g"
         },
         {
           "type": "answer_matches",
@@ -104,7 +104,7 @@
       "id": "vq-shoe-recent",
       "class": "vault-qa",
       "workspace": "vault-readonly",
-      "prompt": "What are the most recent running shoes Jeremy bought or added to his rotation? Name the brand and model, grounded only in the vault.",
+      "prompt": "What are the most recent running shoes the owner bought or added to their rotation? Name the brand and model, grounded only in the vault.",
       "allowed_tools": [
         "Read",
         "Grep",
@@ -118,7 +118,7 @@
       "assertions": [
         {
           "type": "answer_matches",
-          "pattern": "(?i)Nimbus|ASICS"
+          "pattern": "(?i)Ride|Saucony"
         },
         {
           "type": "answer_excludes",
@@ -133,7 +133,7 @@
       "id": "vq-weight-target",
       "class": "vault-qa",
       "workspace": "vault-readonly",
-      "prompt": "What is the target weight Jeremy is working down to in his diet program? Give the number in pounds and cite the vault note (filename) that records it.",
+      "prompt": "What is the target weight the owner is working down to in their diet program? Give the number in pounds and cite the vault note (filename) that records it.",
       "allowed_tools": [
         "Read",
         "Grep",
@@ -164,7 +164,7 @@
       "id": "vq-negative-absent",
       "class": "vault-qa",
       "workspace": "vault-readonly",
-      "prompt": "Search the vault: what is Jeremy's skydiving certification level and license number, and which drop zone is he a member of? Answer only from what the vault actually contains \u2014 if it isn't there, say so plainly and do not guess.",
+      "prompt": "Search the vault: what is the owner's scuba certification level and license number, and which dive club are they a member of? Answer only from what the vault actually contains — if it isn't there, say so plainly and do not guess.",
       "allowed_tools": [
         "Read",
         "Grep",
@@ -178,11 +178,11 @@
       "assertions": [
         {
           "type": "answer_matches",
-          "pattern": "(?i)(do(es)?(n't| not) (have|contain|include|record|mention|list|show)|has no|have no|contains? no|there (is|are|'?s) no|no (note|notes|record|records|entry|entries|mention|information|data|document|documents|result|results|reference|references)|not (in the vault|in any note|present|found|recorded|documented|mentioned|listed)|couldn'?t find|could not find|can'?t find|no (skydiving|sky-?diving|such)|nothing (about|on|in|regarding)|isn'?t (any|in|anything|recorded))"
+          "pattern": "(?i)(do(es)?(n't| not) (have|contain|include|record|mention|list|show)|has no|have no|contains? no|there (is|are|'?s) no|no (note|notes|record|records|entry|entries|mention|information|data|document|documents|result|results|reference|references)|not (in the vault|in any note|present|found|recorded|documented|mentioned|listed)|couldn'?t find|could not find|can'?t find|no (scuba|diving|such)|nothing (about|on|in|regarding)|isn'?t (any|in|anything|recorded))"
         },
         {
           "type": "answer_excludes",
-          "pattern": "38217"
+          "pattern": "77420"
         },
         {
           "type": "completed"
@@ -221,7 +221,7 @@
       "id": "vq-diet-fiber",
       "class": "vault-synthesis",
       "workspace": "vault-readonly",
-      "prompt": "Review Jeremy's recent diet log entries and his fiber goal, then suggest two or three specific, actionable changes to help him consistently hit his fiber target. Ground every suggestion in what the vault actually shows and cite the notes you used.",
+      "prompt": "Review the owner's recent diet log entries and their fiber goal, then suggest two or three specific, actionable changes to help them consistently hit their fiber target. Ground every suggestion in what the vault actually shows and cite the notes you used.",
       "allowed_tools": [
         "Read",
         "Grep",
@@ -232,7 +232,7 @@
         "mcp__qmd__status"
       ],
       "judged": true,
-      "rubric": "Grade content accuracy and instruction-following only. (1) Grounding: every claim traces to real vault content \u2014 the fiber floor is 38 g/day and recent logs show fiber running below it; no invented foods, numbers, or trends. (2) Citation quality: names the specific vault notes/files it drew from (e.g. the Diet Overview and recent weekly diet analyses or the food log). (3) Concision: two or three concrete, specific suggestions, no padding or generic filler. Penalize hallucinated specifics, missing citations, and vague or verbose answers. A shorter well-grounded answer beats a longer speculative one.",
+      "rubric": "Grade content accuracy and instruction-following only. (1) Grounding: every claim traces to real vault content — the fiber floor is 30 g/day and recent logs show fiber running below it; no invented foods, numbers, or trends. (2) Citation quality: names the specific vault notes/files it drew from (e.g. the Diet Overview and recent weekly diet analyses or the food log). (3) Concision: two or three concrete, specific suggestions, no padding or generic filler. Penalize hallucinated specifics, missing citations, and vague or verbose answers. A shorter well-grounded answer beats a longer speculative one.",
       "assertions": [
         {
           "type": "answer_matches",
@@ -251,7 +251,7 @@
       "id": "vq-shoe-advice",
       "class": "vault-synthesis",
       "workspace": "vault-readonly",
-      "prompt": "Based on Jeremy's running-shoe history and his foot/biomechanics notes, recommend what he should buy for his next daily trainer and explain why in a few sentences. Cite the vault notes you used.",
+      "prompt": "Based on the owner's running-shoe history and their foot/biomechanics notes, recommend what they should buy for their next daily trainer and explain why in a few sentences. Cite the vault notes you used.",
       "allowed_tools": [
         "Read",
         "Grep",
@@ -262,11 +262,11 @@
         "mcp__qmd__status"
       ],
       "judged": true,
-      "rubric": "Grade content accuracy and instruction-following only. (1) Grounding: reflects the actual vault \u2014 ASICS Gel-Nimbus line, neutral max-cushion suited to pes cavus, avoid Brooks (narrower toe box), stick with the Nimbus unless there's a specific reason to switch; no invented models or specs. (2) Citation quality: names the running-shoe orders note and/or the biomechanics note. (3) Concision: a focused recommendation with reasons, not an essay. Penalize hallucinated brands/models, missing citations, and verbosity. A shorter well-grounded answer beats a longer speculative one.",
+      "rubric": "Grade content accuracy and instruction-following only. (1) Grounding: reflects the actual vault — the Saucony Ride line, a neutral cushioned daily trainer that suits the owner's gait, stick with the Ride unless there's a specific reason to switch; no invented models or specs. (2) Citation quality: names the footwear-log note and/or the biomechanics note. (3) Concision: a focused recommendation with reasons, not an essay. Penalize hallucinated brands/models, missing citations, and verbosity. A shorter well-grounded answer beats a longer speculative one.",
       "assertions": [
         {
           "type": "answer_matches",
-          "pattern": "(?i)nimbus|asics"
+          "pattern": "(?i)ride|saucony"
         },
         {
           "type": "max_tool_calls",
@@ -281,7 +281,7 @@
       "id": "vq-usenet-summary",
       "class": "vault-synthesis",
       "workspace": "vault-readonly",
-      "prompt": "Summarize Jeremy's planned self-hosted Usenet node: the software choice, the host/container design, the upstream feed, and the key safety constraints. Cite the note. Keep it tight.",
+      "prompt": "Summarize the owner's planned self-hosted feed reader: the software choice, the host/container design, the upstream feeds, and the key safety constraints. Cite the note. Keep it tight.",
       "allowed_tools": [
         "Read",
         "Grep",
@@ -292,11 +292,11 @@
         "mcp__qmd__status"
       ],
       "judged": true,
-      "rubric": "Grade content accuracy and instruction-following only. (1) Grounding: matches the plan \u2014 leafnode reader-leaf in an unprivileged Debian LXC on Proxmox, a free text-only upstream reader account (eternal-september.org, with i2pn2.org as fallback), LAN-only serving, no binary groups ever, and a structural size cap (leafnode maxbytes/delaybody) as the real text-only guarantee; no invented details. (2) Citation quality: names the Usenet node/LXC/Proxmox note. (3) Concision: a tight summary of the real design decisions, not a restatement of the whole prompt. Penalize hallucinated specifics, missing citations, and padding.",
+      "rubric": "Grade content accuracy and instruction-following only. (1) Grounding: matches the plan — FreshRSS in an unprivileged Docker container on a home server, pulling public RSS/Atom feeds, served LAN-only with no external exposure, and no credentials stored in plaintext; no invented details. (2) Citation quality: names the self-hosted RSS reader note. (3) Concision: a tight summary of the real design decisions, not a restatement of the whole prompt. Penalize hallucinated specifics, missing citations, and padding.",
       "assertions": [
         {
           "type": "answer_matches",
-          "pattern": "(?i)leafnode"
+          "pattern": "(?i)freshrss"
         },
         {
           "type": "max_tool_calls",

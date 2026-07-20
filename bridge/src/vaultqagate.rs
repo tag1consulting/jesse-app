@@ -157,7 +157,11 @@ pub fn vaultqa_question_gate(text: &str) -> bool {
         return false;
     }
     // Diet keeps precedence: anything diet-gate-shaped is never a vault-QA turn.
-    if diet_intent(text) {
+    // Uses the ENGLISH baseline only (empty extras): the vault-QA gate additionally
+    // requires an English interrogative + self-reference, which a non-English diet
+    // ask can't satisfy anyway, so the deployment's extra vocabulary is not needed
+    // here — the Tell-path diet gate ([`should_try_local_diet`]) honors it in full.
+    if diet_intent(text, &[]) {
         return false;
     }
     let toks = words(text);
@@ -301,7 +305,7 @@ mod tests {
         // is a diet keyword, so diet_intent claims it and diet keeps precedence. This
         // pins that behavior so a future reader doesn't mistake it for the synthesis
         // exclusion. The diet-free form ("... my last shoes") fires (asserted above).
-        assert!(diet_intent("what size were my last running shoes"));
+        assert!(diet_intent("what size were my last running shoes", &[]));
         assert!(!vaultqa_question_gate(
             "what size were my last running shoes"
         ));

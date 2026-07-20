@@ -160,6 +160,29 @@ if git -C "$ROOT" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
       flag "personal infra (tailnet IP / MagicDNS / machine name / launchd label / home path) in a tracked file" "$hits"
     fi
   fi
+
+  # 5-local) Optional LOCAL denylist extension. The generic R5 patterns above name
+  #   nobody; a deployment's REAL identifiers (owner name, hostnames, IPs) live in
+  #   scripts/ci-guards.local.sh — gitignored, so it never ships. If present, source
+  #   it to set/append `EXTRA_DENY` (a grep -E alternation), then scan the tracked
+  #   tree for those literal values too. This runs in local / pre-push checks; org CI
+  #   won't have the file (expected) — the generic guard above still runs everywhere.
+  #   Ship scripts/ci-guards.local.sh.example (synthetic samples) as the template.
+  EXTRA_DENY=""
+  if [ -f "$ROOT/scripts/ci-guards.local.sh" ]; then
+    # shellcheck source=/dev/null
+    . "$ROOT/scripts/ci-guards.local.sh"
+  fi
+  if [ -n "$EXTRA_DENY" ]; then
+    # The local file is gitignored (never listed), so no exclusion is needed; the
+    # tracked .example holds only synthetic samples, which real patterns won't match.
+    if hits="$(git -C "$ROOT" ls-files -z -- . \
+        | xargs -0 grep -nE "$EXTRA_DENY" 2>/dev/null || true)"; then
+      if [ -n "$hits" ]; then
+        flag "local personal identifier (from scripts/ci-guards.local.sh) in a tracked file" "$hits"
+      fi
+    fi
+  fi
 fi
 
 # 6) (R5/T9) Run a secret scanner over the tree when one is available. gitleaks

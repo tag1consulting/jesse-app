@@ -1127,6 +1127,29 @@ cargo run --release
 - Laptop awake. Sleep kills the server — the main "outside the house" reliability
   gap to solve later (a `launchd` keep-alive + `caffeinate`, or an always-on box).
 
+## Persona / personalization
+
+The bridge ships **generic**: with no configuration it addresses "the user", and
+the diet-intent gate uses an English-only baseline. Personalization is runtime
+DATA, never a source edit — the owner's name, pronoun, languages, and any extra
+diet vocabulary live in a gitignored `jesse.local.toml`, so `git push` can never
+leak them. See the top-level [README → **Make Jesse yours**](../README.md#make-jesse-yours)
+for the copy-and-edit walkthrough.
+
+Precedence, lowest to highest: built-in generic defaults → `jesse.local.toml`
+`[persona]` → the `JESSE_OWNER_NAME` / `JESSE_OWNER_PRONOUN` / `JESSE_LANGUAGES` /
+`JESSE_DIET_KEYWORDS_EXTRA` env vars. The file is located (first that exists wins)
+at `$JESSE_CONFIG`, then `./jesse.local.toml`, then `<state-dir>/jesse.local.toml`
+(`$JESSE_STATE_DIR`, else `$HOME/.jesse-bridge`) — the last is the reliable spot for
+a launchd-managed service whose working directory isn't the repo. A missing or
+malformed file soft-fails to the generic defaults. Copy `jesse.example.toml` (all
+keys, synthetic values) to `jesse.local.toml` to start.
+
+The Ask/Tell wrappers and safety floors are `{Owner}`/`{owner}`/`{owner_pronoun}`
+templates rendered from the persona at prompt-build time; the fixed, non-overridable
+safety floor still always leads a turn. `GET /jesse/prompts` returns the
+persona-rendered defaults so the app's cached "default" matches what a turn builds.
+
 ## Knobs (env vars)
 
 | Var | Default | Purpose |
@@ -1148,6 +1171,11 @@ cargo run --release
 | `JESSE_SESSION_TTL_DAYS` | `90` | Age (days) past which the background session GC sweep reclaims a vault-project Claude Code session jsonl. The sweep keys on file mtime, and resuming a session touches it, so an actively-used thread is never reclaimed — only orphans older than this. Runs once at startup, then every 6h; scoped to the vault project only. See [Session GC sweep](#session-gc-sweep-jesse_session_ttl_days) |
 | `JESSE_STATE_DIR` | `~/.jesse-bridge` | Where completed results are persisted (`<dir>/jobs`) and the device token (`<dir>/device.json`, 0600), so a restart doesn't lose a reply or the token. Empty disables persistence |
 | `JESSE_CLAUDE_BIN` | `claude` | Path to the `claude` binary |
+| `JESSE_CONFIG` | _(search path)_ | Explicit path to the `jesse.local.toml` persona overlay. When unset the bridge looks for `./jesse.local.toml`, then `<state-dir>/jesse.local.toml`. See [Persona / personalization](#persona--personalization) |
+| `JESSE_OWNER_NAME` | `the user` | Owner label rendered into the Ask/Tell wrappers. Overrides the `[persona] owner_name` from `jesse.local.toml` |
+| `JESSE_OWNER_PRONOUN` | `their` | Owner's possessive pronoun in the wrappers. Overrides `[persona] owner_pronoun` |
+| `JESSE_LANGUAGES` | `en` | Comma-separated languages the owner writes in (informational). Overrides `[persona] languages` |
+| `JESSE_DIET_KEYWORDS_EXTRA` | _(none)_ | Comma-separated extra diet-intent keywords merged into the English baseline gate. Overrides `[persona] diet_keywords_extra` |
 | `JESSE_TITLE_BASE_URL` | _(off)_ | Title-only backend override (with the two below). When **all three** are set, the `POST /jesse/title` one-shot child — and ONLY that child — is spawned with `ANTHROPIC_BASE_URL` set to this, so titles can be served by a cheap/fast/local backend while main turns keep the ambient credentials. All-or-nothing and soft: unset (default) → titles use the ambient backend, byte-for-byte prior behavior |
 | `JESSE_TITLE_AUTH_TOKEN` | _(off)_ | Title child's `ANTHROPIC_AUTH_TOKEN`. Required together with the other two `JESSE_TITLE_*` |
 | `JESSE_TITLE_MODEL` | _(off)_ | Title child's `ANTHROPIC_MODEL`. Required together with the other two `JESSE_TITLE_*`. A **partial** config (1–2 of the 3 set) logs a startup warning and is treated as unset; **main-turn children are never affected** under any configuration. Each title call logs one provenance line (base URL + model, never the token) |

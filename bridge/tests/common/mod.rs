@@ -68,6 +68,8 @@ pub fn test_config() -> Config {
             .to_string_lossy()
             .into_owned(),
         shadow_timeout_secs: 120,
+        // Generic default persona (owner "the user") — the fresh-clone identity.
+        persona: Persona::default(),
     }
 }
 pub fn test_state() -> AppState {

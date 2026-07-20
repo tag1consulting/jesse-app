@@ -734,8 +734,8 @@ enum Micronutrient: CaseIterable {
 /// The four macronutrients the Health tab tracks. The single source of truth for
 /// their user-facing display names — no view spells a macro out or abbreviates it
 /// on its own. There is no approved short form: never a single letter, never
-/// "Fib". A future edit that reintroduces one fails `MacroLabelTests`, not Jeremy's
-/// eyes.
+/// "Fib". A future edit that reintroduces one fails `MacroLabelTests`, not a human
+/// reviewer's eyes.
 enum Macro: CaseIterable {
     // Case order IS the canonical user-facing display order: Protein, Carbs, Fiber,
     // Fat. Fiber is a subset of carbs (its grams are counted inside the carb grams,

@@ -47,6 +47,31 @@ enum PromptStore {
         "jesse.prompt.\(mode.rawValue).\(slot.keySegment)\(suffix)"
     }
 
+    // MARK: - Owner name
+
+    /// UserDefaults key for the owner's display name — the personalization the app
+    /// threads into locally-built prompt context (e.g. the diet-coach rollup).
+    private static let ownerNameKey = "jesse.owner.name"
+
+    /// How the app refers to the owner in prompt context it builds itself. Default
+    /// "the user" (the generic identity a fresh install reads with). Set it in
+    /// Settings to a real name; the bridge's own wrappers are personalized
+    /// separately via its `jesse.local.toml` persona. A blank value reads as the
+    /// default so an empty field never sends "".
+    static var ownerName: String {
+        get {
+            let v = (defaults.string(forKey: ownerNameKey) ?? "")
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            return v.isEmpty ? "the user" : v
+        }
+        set {
+            defaults.set(
+                newValue.trimmingCharacters(in: .whitespacesAndNewlines),
+                forKey: ownerNameKey
+            )
+        }
+    }
+
     // MARK: - Reads
 
     static func text(_ mode: JesseMode, _ slot: PromptSlot) -> String {

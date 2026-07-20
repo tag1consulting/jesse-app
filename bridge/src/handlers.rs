@@ -318,11 +318,16 @@ pub async fn jesse_prompts(
     headers: HeaderMap,
 ) -> Result<Json<Value>, ApiError> {
     check_auth(&headers, &st.cfg.token)?;
+    // Render the persona into the defaults so the app's cached "default" matches
+    // exactly what a fresh turn would build (a fresh clone sees "The user is
+    // ASKING…"; a personalized deploy sees the owner's name). The floors are shown
+    // read-only; the wrappers are the editable defaults.
+    let p = &st.cfg.persona;
     Ok(Json(json!({
-        "ask": ASK_PREAMBLE,
-        "tell": TELL_PREAMBLE,
-        "ask_floor": ASK_FLOOR,
-        "tell_floor": TELL_FLOOR,
+        "ask": p.render(ASK_PREAMBLE),
+        "tell": p.render(TELL_PREAMBLE),
+        "ask_floor": p.render(ASK_FLOOR),
+        "tell_floor": p.render(TELL_FLOOR),
     })))
 }
 
@@ -403,6 +408,7 @@ pub async fn jesse(
         req.health_context.as_deref(),
         req.health_context_requested.unwrap_or(false),
         req.health_context_unavailable.unwrap_or(false),
+        &st.cfg.persona,
     )?;
 
     // Concurrency + bounded queue: decide whether this turn runs now, waits for a

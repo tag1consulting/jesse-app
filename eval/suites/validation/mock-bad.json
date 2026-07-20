@@ -31,7 +31,7 @@
           "subtype": "success",
           "is_error": false,
           "ttft_ms": 42,
-          "result": "Jeremy wears EU 42 (US 9). I saw it in footwear.md.",
+          "result": "The owner wears EU 41 (US 8). I saw it in footwear.md.",
           "usage": {
             "input_tokens": 1000,
             "output_tokens": 80,
@@ -72,7 +72,7 @@
           "subtype": "success",
           "is_error": false,
           "ttft_ms": 42,
-          "result": "He wants to run a Usenet server at some point.",
+          "result": "They want to run a feed reader at some point.",
           "usage": {
             "input_tokens": 1000,
             "output_tokens": 80,
@@ -113,7 +113,7 @@
           "subtype": "success",
           "is_error": false,
           "ttft_ms": 42,
-          "result": "His protein target is about 100 grams a day.",
+          "result": "Their protein target is about 90 grams a day.",
           "usage": {
             "input_tokens": 1000,
             "output_tokens": 80,
@@ -154,7 +154,7 @@
           "subtype": "success",
           "is_error": false,
           "ttft_ms": 42,
-          "result": "His most recent shoes are the Nike Pegasus 41.",
+          "result": "Their most recent shoes are the Nike Pegasus 41.",
           "usage": {
             "input_tokens": 1000,
             "output_tokens": 80,
@@ -195,7 +195,7 @@
           "subtype": "success",
           "is_error": false,
           "ttft_ms": 42,
-          "result": "He is working down from 204 lbs; goal not stated.",
+          "result": "They are working down from 210 lbs; goal not stated.",
           "usage": {
             "input_tokens": 1000,
             "output_tokens": 80,
@@ -236,7 +236,7 @@
           "subtype": "success",
           "is_error": false,
           "ttft_ms": 42,
-          "result": "Jeremy holds a USPA D-license #38217 and jumps at Skydive Fano.",
+          "result": "The owner holds a PADI license #77420 and dives with Blue Reef Divers.",
           "usage": {
             "input_tokens": 1000,
             "output_tokens": 80,
@@ -424,7 +424,7 @@
           "subtype": "success",
           "is_error": false,
           "ttft_ms": 42,
-          "result": "Set up a news server on a computer and connect clients to it.",
+          "result": "Set up a feed reader on a computer and connect to it.",
           "usage": {
             "input_tokens": 1000,
             "output_tokens": 80,

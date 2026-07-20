@@ -1,0 +1,28 @@
+#!/usr/bin/env bash
+# ci-guards.local.sh.example — template for a LOCAL R5 denylist extension.
+#
+# Copy this to `scripts/ci-guards.local.sh` (gitignored) and put YOUR real
+# personal identifiers here — the name, hostnames, tailnet IPs, and launchd label
+# the R5 guard should catch if they ever slip into a tracked file. `ci-guards.sh`
+# sources this file (when present) and scans the tracked tree for these values in
+# addition to its generic patterns.
+#
+#   cp scripts/ci-guards.local.sh.example scripts/ci-guards.local.sh
+#   # edit in your real values, then run: bash scripts/ci-guards.sh
+#
+# This runs in LOCAL / pre-push checks only. Org CI won't have the real file
+# (it's gitignored) — that's expected; the generic R5 guard still runs there.
+#
+# Set/extend EXTRA_DENY: an extended-regex (grep -E) alternation of the literal
+# strings to catch. The `${EXTRA_DENY:+$EXTRA_DENY|}` prefix appends safely if the
+# variable is already set. Escape regex metacharacters (`.`) in IPs/hostnames.
+#
+# IMPORTANT: keep the samples in THIS committed .example SYNTHETIC — it is a
+# tracked file, so it must carry no real identifiers (the same R5 rule). Your real
+# `ci-guards.local.sh` copy holds your actual name/hosts/IPs.
+
+EXTRA_DENY="${EXTRA_DENY:+$EXTRA_DENY|}Robin Doe|Robin Q\. Public"
+EXTRA_DENY="${EXTRA_DENY}|robins-laptop\.example|robin-vault"
+# 198.51.100.0/24 and 203.0.113.0/24 are RFC 5737 documentation ranges (synthetic).
+EXTRA_DENY="${EXTRA_DENY}|198\.51\.100\.[0-9]{1,3}|203\.0\.113\.[0-9]{1,3}"
+EXTRA_DENY="${EXTRA_DENY}|com\.robindoe\.jesse-bridge"

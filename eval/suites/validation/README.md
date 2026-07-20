@@ -1,9 +1,10 @@
-# vaultqa-v1 suite validation
+# vaultqa-example suite validation
 
-Mock validation for `../vaultqa-v1.json`, the same way `diet-v1` was validated:
-two canned `--mock` files whose scored outcome proves the suite's assertions have
-teeth — a correct answer passes everything, a known-bad answer fails **exactly**
-the assertion it should.
+Mock validation for `../vaultqa-example.json`, the same way `diet-v1` was
+validated: two canned `--mock` files whose scored outcome proves the suite's
+assertions have teeth — a correct answer passes everything, a known-bad answer
+fails **exactly** the assertion it should. Both mocks answer the synthetic
+"Alex Example" vault, so this ships clean of any real personal data.
 
 | file | what it is | scored result |
 |---|---|---|
@@ -13,15 +14,16 @@ the assertion it should.
 In the bad run each task fails only its intended content/safety assertion(s);
 `completed` (and `max_tool_calls` where present) still pass, so the failure is a
 real assertion firing, not a harness error. This is asserted in CI by
-`vaultqa_v1_good_mock_passes_every_task` and
-`vaultqa_v1_bad_mock_fails_intended_assertions` in `eval/tests/integration.rs`,
-which run the shipped suite + these mocks through the real assertion engine.
+`vaultqa_example_good_mock_passes_every_task` and
+`vaultqa_example_bad_mock_fails_intended_assertions` in
+`eval/tests/integration.rs`, which run the shipped suite + these mocks through the
+real assertion engine.
 
 Reproduce:
 
 ```
-jesse-eval run --suite eval/suites/vaultqa-v1.json \
+jesse-eval run --suite eval/suites/vaultqa-example.json \
   --mock eval/suites/validation/mock-good.json --out /tmp/vqa-good
-jesse-eval run --suite eval/suites/vaultqa-v1.json \
+jesse-eval run --suite eval/suites/vaultqa-example.json \
   --mock eval/suites/validation/mock-bad.json  --out /tmp/vqa-bad
 ```

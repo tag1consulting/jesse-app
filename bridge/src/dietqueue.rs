@@ -250,7 +250,11 @@ pub async fn replay_diet_queue(cfg: &Config, queue: &DietQueue) {
     while let Some(item) = queue.dequeue_oldest() {
         let verify = run_diet_verify(
             cfg,
-            &build_diet_verify_prompt(&item.utterance, &entries_to_json(&item.entries)),
+            &build_diet_verify_prompt(
+                &item.utterance,
+                &entries_to_json(&item.entries),
+                &cfg.persona.owner_name,
+            ),
             DIET_VERIFY_TIMEOUT_SECS,
         )
         .await;

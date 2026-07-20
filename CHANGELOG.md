@@ -15,6 +15,43 @@ CI both run it). See the "Versioning" section of `bridge/README.md`.
 
 ## [Unreleased]
 
+## [Bridge 0.22.4] — 2026-07-19
+
+### Changed
+- **Genericize persona: config-driven personalization via a gitignored local
+  overlay.** No personal fact is compiled into the tracked bridge any more — the
+  owner's name, pronoun, languages, and any extra diet vocabulary are runtime DATA.
+  - New `[persona]` config (`bridge/src/persona.rs`): `owner_name` (default
+    `"the user"`), `owner_pronoun` (default `"their"`), `languages`, and
+    `diet_keywords_extra`. Resolved lowest-to-highest as built-in generic defaults
+    → a gitignored `jesse.local.toml` `[persona]` table → environment variables
+    (`JESSE_OWNER_NAME`, `JESSE_OWNER_PRONOUN`, `JESSE_LANGUAGES`,
+    `JESSE_DIET_KEYWORDS_EXTRA`). A missing/malformed file soft-fails to defaults.
+  - Config file search order (first that exists wins): `$JESSE_CONFIG` → repo-root
+    `./jesse.local.toml` → `<state-dir>/jesse.local.toml` (`$JESSE_STATE_DIR` else
+    `$HOME/.jesse-bridge`) — the last covers a launchd service whose cwd isn't the
+    repo.
+  - `bridge/src/prompt.rs`: the Ask/Tell wrappers and safety floors are now generic
+    `{Owner}`/`{owner}`/`{owner_pronoun}` templates rendered from the persona at
+    prompt-build time (the fixed, non-overridable floor still always leads). The
+    `/jesse/prompts` endpoint returns the persona-rendered defaults.
+  - `bridge/src/dietgate.rs`: the diet-intent keyword gate ships an **English-only**
+    generic baseline; non-English/personal vocabulary is merged in from
+    `persona.diet_keywords_extra` at load. `bridge/src/dietlog.rs` extract/verify
+    prompts address the configured owner name (default "the user").
+  - Stream-parsing test fixtures (`bridge/tests/fixtures/stream/*.ndjson`) keep the
+    real captured schema but carry SYNTHETIC answer text (an "Alex Example" vault).
+  - Ships `jesse.example.toml` (all keys, synthetic values); `jesse.local.toml` is
+    gitignored. See README → **Make Jesse yours**.
+
+## [App 1.0 (55)] — 2026-07-19
+
+### Changed
+- Owner name is threaded from Settings (`PromptStore.ownerName`, default
+  `"the user"`) into the locally-built diet-coach rollup
+  (`NutrientTrends.coachRollup`), replacing a hardcoded name; generic pronouns
+  throughout. No behavior change for an unset name.
+
 ## [Bridge 0.22.3] — 2026-07-19
 
 ### Changed

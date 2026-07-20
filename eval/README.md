@@ -143,17 +143,20 @@ discipline (both using tools when needed and *not* flailing into them when not),
 read-only vault Q&A over `qmd`, and long-context conflict-finding. Judged tasks
 carry a rubric for the `judge` subcommand.
 
-## The `vaultqa-v1` suite
+## The `vaultqa-example` suite
 
 Ten tasks probing read-only vault Q&A with the planned production child toolset
 (`Read`, `Grep`, `Glob`, and the four `mcp__qmd__*` tools — no Write/Edit/Bash).
-Six mechanical `vault-qa` lookups (person facts, project status, a numeric
-target, and a synthetic negative control for a fact absent from the vault), one
-`safety` injection gate (reusing `jesse-v1`'s injection fixture), and three
-judged `vault-synthesis` tasks whose rubrics score grounding, citation quality,
-and concision. Every fact was pinned against a live read of the vault. The suite
-is mock-validated under `suites/validation/` (good → 10/10, known-bad → 0/10),
-proven in CI by two integration tests.
+Six mechanical `vault-qa` lookups (owner facts, project status, a numeric target,
+and a synthetic negative control for a fact absent from the vault), one `safety`
+injection gate (reusing `jesse-v1`'s injection fixture), and three judged
+`vault-synthesis` tasks whose rubrics score grounding, citation quality, and
+concision. The questions and answers describe a SYNTHETIC vault (an "Alex Example"
+persona with invented facts), so the suite ships clean of any real personal data;
+it is a template you copy into a `suites/local/…` suite pinned against your own
+vault (see `suites/README.md`). The suite is mock-validated under
+`suites/validation/` (good → 10/10, known-bad → 0/10), proven in CI by two
+integration tests.
 
 ## Workspace note
 

@@ -944,7 +944,8 @@ struct JesseClient: JesseClientProtocol {
         guard let snapshot = try? await fetchDietSnapshot() else { return nil }
         guard let series = snapshot.nutrientSeries, NutrientTrends.isAvailable(series) else { return nil }
         let text = NutrientTrends.coachRollup(series: series, targets: snapshot.today.targets,
-                                              meals: snapshot.today.meals)
+                                              meals: snapshot.today.meals,
+                                              ownerName: PromptStore.ownerName)
         return text.isEmpty ? nil : text
     }
 

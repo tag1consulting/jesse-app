@@ -69,6 +69,10 @@ pub(crate) fn test_config() -> Config {
             .to_string_lossy()
             .into_owned(),
         shadow_timeout_secs: 120,
+        // Generic default persona (owner "the user"): the fresh-clone identity, so
+        // every existing prompt/gate assertion is byte-for-byte the generic form.
+        // Tests that exercise a named owner or extra diet vocab set this explicitly.
+        persona: Persona::default(),
     }
 }
 pub(crate) fn test_state() -> AppState {

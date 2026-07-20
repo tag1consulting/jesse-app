@@ -13,10 +13,16 @@ use crate::*;
 // a question, so don't take unrequested action; but a surfaced durable fact is
 // always recorded. The app shows this read-only so users don't re-type a weaker
 // variant inside their own wrapper.
-pub const ASK_FLOOR: &str = "Don't do task-work he didn't ask for — no new drafts, \
+//
+// `{owner}` / `{owner_pronoun}` are persona placeholders rendered at prompt-build
+// time (see [`Persona::render`]); with the generic default persona this reads
+// "…the user didn't ask for…never needs their permission." The floor is
+// non-overridable in the sense that it is ALWAYS prepended and cannot be dropped —
+// its wording is personalized (owner label/pronoun) but not the app's to remove.
+pub const ASK_FLOOR: &str = "Don't do task-work {owner} didn't ask for — no new drafts, \
 TODOs, or edits to act on something. BUT if this exchange surfaces a durable \
 fact, correction, or status change, record it to the right vault file \
-immediately per CLAUDE.md — that is never optional and never needs his \
+immediately per CLAUDE.md — that is never optional and never needs {owner_pronoun} \
 permission.";
 
 // The non-negotiable floor for TELL turns: durable-fact capture is always on,
@@ -32,7 +38,7 @@ permission.";
 // this only reinforces it so it happens on the phone path every time.
 pub const TELL_FLOOR: &str = "Record any durable fact, correction, or status change \
 to the right vault file immediately per CLAUDE.md — that is never optional and \
-never needs his permission. When the fact is a food, exercise, or weigh-in log, \
+never needs {owner_pronoun} permission. When the fact is a food, exercise, or weigh-in log, \
 `todo-list/diet-today.js` is a DERIVED cache: after appending the CSV row(s), \
 regenerate it by running `node todo-list/generate-diet-today.js`, then verify \
 with `node todo-list/validate-diet-today.js` and \
@@ -42,11 +48,17 @@ or exercise data into it.";
 // Editable wrappers (the framing the app's Settings can override). The fixed
 // floor above is prepended separately and is NOT part of this text, so a custom
 // override cannot drop it.
-pub const ASK_PREAMBLE: &str = "Jeremy is ASKING you a question from his phone. \
+//
+// `{Owner}` (capitalized, sentence-initial), `{owner}`, and `{owner_pronoun}` are
+// persona placeholders rendered at prompt-build time; the generic default persona
+// renders "The user is ASKING you a question from their phone…". A local
+// `jesse.local.toml` (e.g. owner_name = "Alex Example", owner_pronoun = "her")
+// reproduces a named owner's wording as pure configuration.
+pub const ASK_PREAMBLE: &str = "{Owner} is ASKING you a question from {owner_pronoun} phone. \
 Answer concisely and directly; read the vault as needed. Keep the answer short \
 enough to read on a phone screen.\n\nQuestion: ";
 
-pub const TELL_PREAMBLE: &str = "Jeremy is TELLING you something from his phone — a \
+pub const TELL_PREAMBLE: &str = "{Owner} is TELLING you something from {owner_pronoun} phone — a \
 fact, an instruction, or something to capture. Act on it per CLAUDE.md: log it, \
 file it, or update the vault as appropriate. Reply with a one or two sentence \
 confirmation of what you did.\n\nMessage: ";
@@ -54,9 +66,9 @@ confirmation of what you did.\n\nMessage: ";
 // On a resumed thread the framing is already established — keep it light. The
 // record-facts invariant now lives in the always-applied floor, so the followup
 // wrappers no longer restate it.
-pub const ASK_FOLLOWUP: &str = "Jeremy follows up (still asking, keep it short): ";
+pub const ASK_FOLLOWUP: &str = "{Owner} follows up (still asking, keep it short): ";
 
-pub const TELL_FOLLOWUP: &str = "Jeremy follows up (capture/act per CLAUDE.md): ";
+pub const TELL_FOLLOWUP: &str = "{Owner} follows up (capture/act per CLAUDE.md): ";
 
 // Appended when the request arrived by voice — the reply will be read aloud, so
 // we ask Jesse to end with a plain-prose SPOKEN: line the app can hand to TTS.
@@ -320,7 +332,7 @@ fn strip_wrapping_quotes(s: &str) -> &str {
 // computed fresh per turn from the host's system clock — the source of truth,
 // present whether or not `claude` also injects a date. It carries day-of-week,
 // full date, local time, timezone abbreviation, and UTC offset so the model can
-// convert when a request names another zone (Jeremy travels across timezones).
+// convert when a request names another zone (the user may travel across timezones).
 // The zone is never hardcoded: it comes from the host wall-clock via `date`.
 
 /// The per-turn clock header, computed fresh from the system clock. Prefers the
@@ -465,6 +477,7 @@ pub fn build_prompt(
     health_context: Option<&str>,
     health_context_requested: bool,
     health_context_unavailable: bool,
+    persona: &Persona,
 ) -> Result<String, ApiError> {
     build_prompt_at(
         &clock_line(),
@@ -477,6 +490,7 @@ pub fn build_prompt(
         health_context,
         health_context_requested,
         health_context_unavailable,
+        persona,
     )
 }
 
@@ -562,6 +576,9 @@ pub fn build_prompt_at(
     // The app could not fulfill a health request (denied/locked/timeout/toggle
     // off): tell the agent to answer from vault data and not re-request.
     health_context_unavailable: bool,
+    // The resolved personalization. Its `owner_name`/`owner_pronoun` are rendered
+    // into the built-in default wrapper/floor (never into an app override).
+    persona: &Persona,
 ) -> Result<String, ApiError> {
     // Validate the mode and pick both the built-in wrapper and the default floor —
     // an unknown mode is still a 400, override or not.
@@ -577,16 +594,20 @@ pub fn build_prompt_at(
             ))
         }
     };
+    // An app-supplied override is used VERBATIM (it is the app's own text, already
+    // personalized there); only the built-in default has its `{owner}` placeholders
+    // rendered from the persona. So a fresh clone reads "The user is ASKING…" and a
+    // local `jesse.local.toml` restores the owner's name, all without editing source.
     let preamble = match instructions {
-        Some(s) if !s.trim().is_empty() => s,
-        _ => default_preamble,
+        Some(s) if !s.trim().is_empty() => s.to_string(),
+        _ => persona.render(default_preamble),
     };
     // The floor still LEADS every turn. An override changes only its wording;
-    // blank/absent falls back to the built-in const, so there is never a turn
-    // with no floor at all.
+    // blank/absent falls back to the built-in const (persona-rendered), so there is
+    // never a turn with no floor at all.
     let floor = match floor_override {
-        Some(s) if !s.trim().is_empty() => s,
-        _ => default_floor,
+        Some(s) if !s.trim().is_empty() => s.to_string(),
+        _ => persona.render(default_floor),
     };
     // Validate + frame the optional recent-workouts block. Oversized is a hard
     // 413 here (ahead of the concurrency permit in the handler); absent/blank
@@ -639,7 +660,15 @@ mod tests {
     // separately below.
     const TEST_CLOCK: &str = "Current date/time: Wednesday, 2026-07-01 07:16 CEST (UTC+02:00).";
 
-    // The wrapped prompt for the given mode/overrides, with the fixed test clock.
+    // Render a wrapper/floor template through the GENERIC default persona — the
+    // text a fresh clone (owner "the user") emits. Assertions compare against this
+    // rendered form, since the raw consts now carry `{owner}` placeholders.
+    fn rp(template: &str) -> String {
+        Persona::default().render(template)
+    }
+
+    // The wrapped prompt for the given mode/overrides, with the fixed test clock
+    // and the generic default persona.
     fn bp(
         mode: &str,
         text: &str,
@@ -659,6 +688,7 @@ mod tests {
             None,
             false,
             false,
+            &Persona::default(),
         )
         .unwrap()
     }
@@ -677,6 +707,7 @@ mod tests {
             health_context,
             false,
             false,
+            &Persona::default(),
         )
     }
 
@@ -684,8 +715,8 @@ mod tests {
     fn build_prompt_ask_fresh_wraps_with_ask_preamble() {
         let p = bp("ask", "what is on Today.md", false, false, None, None);
         // The clock leads, then the fixed floor, then the editable wrapper.
-        assert!(p.starts_with(&format!("{TEST_CLOCK}\n\n{ASK_FLOOR}")));
-        assert!(p.contains(ASK_PREAMBLE));
+        assert!(p.starts_with(&format!("{TEST_CLOCK}\n\n{}", rp(ASK_FLOOR))));
+        assert!(p.contains(&rp(ASK_PREAMBLE)));
         assert!(p.contains("what is on Today.md"));
         // Non-voice replies get the phone-formatting hint, not the voice suffix.
         assert!(p.ends_with(PHONE_FORMAT));
@@ -694,27 +725,52 @@ mod tests {
     #[test]
     fn build_prompt_ask_followup_uses_followup_preamble() {
         let p = bp("ask", "and the second?", true, false, None, None);
-        assert!(p.starts_with(&format!("{TEST_CLOCK}\n\n{ASK_FLOOR}")));
-        assert!(p.contains(ASK_FOLLOWUP));
+        assert!(p.starts_with(&format!("{TEST_CLOCK}\n\n{}", rp(ASK_FLOOR))));
+        assert!(p.contains(&rp(ASK_FOLLOWUP)));
         assert!(p.contains("and the second?"));
         assert!(p.ends_with(PHONE_FORMAT));
     }
     #[test]
     fn build_prompt_tell_fresh_and_followup() {
         let fresh = bp("tell", "remember this", false, false, None, None);
-        assert!(fresh.starts_with(&format!("{TEST_CLOCK}\n\n{TELL_FLOOR}")));
-        assert!(fresh.contains(TELL_PREAMBLE));
+        assert!(fresh.starts_with(&format!("{TEST_CLOCK}\n\n{}", rp(TELL_FLOOR))));
+        assert!(fresh.contains(&rp(TELL_PREAMBLE)));
         assert!(fresh.contains("remember this"));
         assert!(fresh.ends_with(PHONE_FORMAT));
         let followup = bp("tell", "also this", true, false, None, None);
-        assert!(followup.starts_with(&format!("{TEST_CLOCK}\n\n{TELL_FLOOR}")));
-        assert!(followup.contains(TELL_FOLLOWUP));
+        assert!(followup.starts_with(&format!("{TEST_CLOCK}\n\n{}", rp(TELL_FLOOR))));
+        assert!(followup.contains(&rp(TELL_FOLLOWUP)));
         assert!(followup.ends_with(PHONE_FORMAT));
     }
+    #[test]
+    fn persona_renders_owner_name_and_pronoun_into_defaults() {
+        // A local jesse.local.toml supplying a named owner must reproduce a named
+        // wrapper/floor as pure configuration (no source edit).
+        let persona = Persona {
+            owner_name: "Alex Example".into(),
+            owner_pronoun: "her".into(),
+            languages: vec!["en".into(), "es".into()],
+            diet_keywords_extra: vec![],
+        };
+        let p = build_prompt_at(
+            TEST_CLOCK, "ask", "what is on Today.md", false, false, None, None, None, false, false,
+            &persona,
+        )
+        .unwrap();
+        // The rendered floor + wrapper name the owner and use the possessive pronoun.
+        assert!(p.contains("Don't do task-work Alex Example didn't ask for"));
+        assert!(p.contains("never needs her permission"));
+        assert!(p.contains("Alex Example is ASKING you a question from her phone"));
+        // The generic labels are gone once a name is configured.
+        assert!(!p.contains("the user"));
+        assert!(!p.contains("{owner"));
+    }
+
     #[test]
     fn build_prompt_unknown_mode_is_400() {
         let err = build_prompt_at(
             TEST_CLOCK, "shout", "hey", false, false, None, None, None, false, false,
+            &Persona::default(),
         )
         .unwrap_err();
         assert_eq!(err.0, StatusCode::BAD_REQUEST);
@@ -730,6 +786,7 @@ mod tests {
             None,
             false,
             false,
+            &Persona::default(),
         )
         .unwrap_err();
         assert_eq!(err.0, StatusCode::BAD_REQUEST);
@@ -749,9 +806,9 @@ mod tests {
         let p = bp("ask", "the question", false, false, Some(custom), None);
         // The override replaces the built-in Ask wrapper entirely...
         assert!(p.contains(custom));
-        assert!(!p.contains(ASK_PREAMBLE));
+        assert!(!p.contains(&rp(ASK_PREAMBLE)));
         // ...but the clock + fixed floor still lead, unremovable...
-        assert!(p.starts_with(&format!("{TEST_CLOCK}\n\n{ASK_FLOOR}")));
+        assert!(p.starts_with(&format!("{TEST_CLOCK}\n\n{}", rp(ASK_FLOOR))));
         assert!(p.contains("the question"));
         // ...and the bridge still appends the phone-format suffix.
         assert!(p.ends_with(PHONE_FORMAT));
@@ -761,7 +818,7 @@ mod tests {
         let custom = "Spoken-friendly wrapper: ";
         let p = bp("tell", "do the thing", false, true, Some(custom), None);
         assert!(p.contains(custom));
-        assert!(!p.contains(TELL_PREAMBLE));
+        assert!(!p.contains(&rp(TELL_PREAMBLE)));
         // Voice suffix wins over phone-format even under an override.
         assert!(p.ends_with(VOICE_SUFFIX));
         assert!(!p.contains(PHONE_FORMAT));
@@ -773,8 +830,8 @@ mod tests {
         let custom = "My wrapper: ";
         let p = bp("ask", "more", true, false, Some(custom), None);
         assert!(p.contains(custom));
-        assert!(p.starts_with(&format!("{TEST_CLOCK}\n\n{ASK_FLOOR}")));
-        assert!(!p.contains(ASK_FOLLOWUP));
+        assert!(p.starts_with(&format!("{TEST_CLOCK}\n\n{}", rp(ASK_FLOOR))));
+        assert!(!p.contains(&rp(ASK_FOLLOWUP)));
     }
     #[test]
     fn build_prompt_blank_override_is_byte_identical_to_default() {
@@ -817,14 +874,14 @@ mod tests {
                 p.starts_with(&format!("{TEST_CLOCK}\n\n{custom_floor}")),
                 "override floor must follow the clock (fu={followup}, v={voice})"
             );
-            assert!(!p.contains(ASK_FLOOR));
+            assert!(!p.contains(&rp(ASK_FLOOR)));
         }
     }
     #[test]
     fn build_prompt_blank_floor_override_falls_back_to_const() {
         for fo in [None, Some(""), Some("   ")] {
             let p = bp("ask", "q", false, false, None, fo);
-            assert!(p.starts_with(&format!("{TEST_CLOCK}\n\n{ASK_FLOOR}")));
+            assert!(p.starts_with(&format!("{TEST_CLOCK}\n\n{}", rp(ASK_FLOOR))));
         }
     }
     #[test]
@@ -832,7 +889,7 @@ mod tests {
         let p = bp("ask", "q", false, false, Some("WRAP. "), Some("FLOOR. "));
         assert!(p.starts_with(&format!("{TEST_CLOCK}\n\nFLOOR. \n\nWRAP. q")));
         assert!(p.ends_with(PHONE_FORMAT));
-        assert!(!p.contains(ASK_FLOOR) && !p.contains(ASK_PREAMBLE));
+        assert!(!p.contains(&rp(ASK_FLOOR)) && !p.contains(&rp(ASK_PREAMBLE)));
     }
     #[test]
     fn build_prompt_floor_override_still_mode_validated() {
@@ -847,6 +904,7 @@ mod tests {
             None,
             false,
             false,
+            &Persona::default(),
         )
         .unwrap_err();
         assert_eq!(err.0, StatusCode::BAD_REQUEST);
@@ -857,7 +915,7 @@ mod tests {
         for (followup, voice) in [(false, false), (true, false), (false, true)] {
             let p = bp("ask", "do X", followup, voice, Some(custom), None);
             assert!(
-                p.starts_with(&format!("{TEST_CLOCK}\n\n{ASK_FLOOR}")),
+                p.starts_with(&format!("{TEST_CLOCK}\n\n{}", rp(ASK_FLOOR))),
                 "clock + floor must lead (fu={followup}, v={voice})"
             );
             assert!(p.contains(custom));
@@ -869,7 +927,7 @@ mod tests {
         for (followup, voice) in [(false, false), (true, false), (false, true)] {
             let p = bp("tell", "log Y", followup, voice, Some(custom), None);
             assert!(
-                p.starts_with(&format!("{TEST_CLOCK}\n\n{TELL_FLOOR}")),
+                p.starts_with(&format!("{TEST_CLOCK}\n\n{}", rp(TELL_FLOOR))),
                 "clock + floor must lead (fu={followup}, v={voice})"
             );
             assert!(p.contains(custom));
@@ -904,11 +962,11 @@ mod tests {
     #[test]
     fn build_prompt_floor_is_mode_specific() {
         let ask = bp("ask", "q", false, false, None, None);
-        assert!(ask.contains(ASK_FLOOR));
-        assert!(!ask.contains(TELL_FLOOR));
+        assert!(ask.contains(&rp(ASK_FLOOR)));
+        assert!(!ask.contains(&rp(TELL_FLOOR)));
         let tell = bp("tell", "m", false, false, None, None);
-        assert!(tell.contains(TELL_FLOOR));
-        assert!(!tell.contains(ASK_FLOOR));
+        assert!(tell.contains(&rp(TELL_FLOOR)));
+        assert!(!tell.contains(&rp(ASK_FLOOR)));
     }
 
     // ---- Recent-workouts context (health_context) --------------------------
@@ -926,6 +984,7 @@ mod tests {
             let base = bp(mode, "body", followup, voice, None, None);
             let with = build_prompt_at(
                 TEST_CLOCK, mode, "body", followup, voice, None, None, None, false, false,
+                &Persona::default(),
             )
             .unwrap();
             assert_eq!(
@@ -965,13 +1024,13 @@ mod tests {
         // The block sits AFTER the clock and BEFORE the floor.
         let clock_at = p.find(TEST_CLOCK).unwrap();
         let block_at = p.find(block).unwrap();
-        let floor_at = p.find(ASK_FLOOR).unwrap();
+        let floor_at = p.find(&rp(ASK_FLOOR)).unwrap();
         assert!(
             clock_at < block_at && block_at < floor_at,
             "order: clock < block < floor"
         );
         // The turn scaffolding is otherwise intact.
-        assert!(p.contains(ASK_PREAMBLE) && p.contains("log my swim"));
+        assert!(p.contains(&rp(ASK_PREAMBLE)) && p.contains("log my swim"));
         assert!(p.ends_with(PHONE_FORMAT));
     }
 
@@ -1018,7 +1077,7 @@ mod tests {
         let clock_at = out.find(TEST_CLOCK).unwrap();
         let health_at = out.find(block).unwrap();
         let catchup_at = out.find("MISSED CONVERSATION HISTORY").unwrap();
-        let floor_at = out.find(ASK_FLOOR).unwrap();
+        let floor_at = out.find(&rp(ASK_FLOOR)).unwrap();
         let q_at = out.find("how old is she").unwrap();
         assert!(
             clock_at < health_at
@@ -1035,14 +1094,14 @@ mod tests {
     fn splice_catchup_with_no_lead_leads_the_prompt() {
         // Empty clock, no health → the catch-up block leads, right before the floor.
         let prompt =
-            build_prompt_at("", "ask", "q", false, false, None, None, None, false, false).unwrap();
+            build_prompt_at("", "ask", "q", false, false, None, None, None, false, false, &Persona::default()).unwrap();
         let out = splice_catchup(&prompt, "CATCHUP", "", None);
         assert!(
             out.starts_with("CATCHUP\n\n"),
             "block leads with no lead: {out}"
         );
         let catchup_at = out.find("CATCHUP").unwrap();
-        let floor_at = out.find(ASK_FLOOR).unwrap();
+        let floor_at = out.find(&rp(ASK_FLOOR)).unwrap();
         assert!(catchup_at < floor_at);
     }
 
@@ -1073,6 +1132,7 @@ mod tests {
             None,
             requested,
             unavailable,
+            &Persona::default(),
         )
         .unwrap()
     }
@@ -1161,6 +1221,7 @@ mod tests {
             Some("Swim 30m"),
             false,
             true,
+            &Persona::default(),
         )
         .unwrap();
         assert!(p.contains(NEEDS_HEALTH_UNAVAILABLE));
@@ -1178,7 +1239,7 @@ mod tests {
         );
         assert!(p.contains("hello there"));
         // Not a turn: none of the turn scaffolding leaks in.
-        assert!(!p.contains(ASK_FLOOR) && !p.contains(TELL_FLOOR));
+        assert!(!p.contains(&rp(ASK_FLOOR)) && !p.contains(&rp(TELL_FLOOR)));
         assert!(!p.contains("Current date/time:"));
         assert!(!p.contains(PHONE_FORMAT) && !p.contains(VOICE_SUFFIX));
     }
@@ -1257,18 +1318,19 @@ mod tests {
             None,
             false,
             false,
+            &Persona::default(),
         )
         .unwrap();
         assert!(p.starts_with("Current date/time: Monday, 2026-01-05 09:00 EST (UTC-05:00).\n\n"));
-        assert!(p.contains(ASK_FLOOR));
+        assert!(p.contains(&rp(ASK_FLOOR)));
     }
     #[test]
     fn build_prompt_empty_clock_is_omitted() {
         // An empty clock reproduces the pre-clock output: the floor leads, with no
         // stray leading blank lines.
         let p =
-            build_prompt_at("", "ask", "q", false, false, None, None, None, false, false).unwrap();
-        assert!(p.starts_with(ASK_FLOOR));
+            build_prompt_at("", "ask", "q", false, false, None, None, None, false, false, &Persona::default()).unwrap();
+        assert!(p.starts_with(&rp(ASK_FLOOR)));
         assert!(!p.starts_with('\n'));
     }
     #[test]

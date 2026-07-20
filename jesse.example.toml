@@ -1,0 +1,48 @@
+# jesse.example.toml — the personalization template.
+#
+# Copy this to `jesse.local.toml` and edit it to make Jesse yours. The bridge
+# reads it LAST, layering it over the built-in generic defaults; environment
+# variables (JESSE_OWNER_NAME, …) override the file. A fresh clone with no
+# jesse.local.toml works fine — the assistant just addresses "the user".
+#
+# `jesse.local.toml` is gitignored BY DESIGN so your personal data can never be
+# pushed. Do NOT edit this example with real values — edit your copy.
+#
+# Where the bridge looks for the file (first one that exists wins):
+#   1. $JESSE_CONFIG            — an explicit path to a TOML file
+#   2. ./jesse.local.toml       — repo root / current working directory
+#   3. <state-dir>/jesse.local.toml
+#        where <state-dir> is $JESSE_STATE_DIR, else $HOME/.jesse-bridge
+#      (the reliable spot for a launchd-managed service whose cwd isn't the repo).
+
+[persona]
+
+# How the assistant refers to you in the prompt wrappers. Rendered into the
+# built-in Ask/Tell framing wherever it says "{owner}"/"{Owner}". Default:
+# "the user" (so a fresh clone reads "The user is ASKING you a question…").
+owner_name = "Alex Example"
+
+# Your POSSESSIVE pronoun ("their"/"his"/"her"/…), rendered wherever the wrappers
+# say "{owner_pronoun} phone" / "{owner_pronoun} permission". Optional; default
+# "their" (which reads correctly for any name).
+owner_pronoun = "their"
+
+# The languages you write in (informational; e.g. English + Spanish). Not injected
+# into any prompt — it documents the deployment and pairs with the extra diet
+# vocabulary below. Optional; default ["en"].
+languages = ["en", "es"]
+
+# Extra diet-intent keywords merged into the ENGLISH-only baseline diet gate
+# (whole lowercased tokens). This is where a non-English or personal food/exercise
+# vocabulary lives, so no personal or non-English term is baked into the shipped
+# source. Optional; default [] (English baseline only). Examples below are
+# Spanish diet terms — replace with your own language/vocabulary.
+diet_keywords_extra = [
+  "desayuno",   # breakfast
+  "almuerzo",   # lunch
+  "cena",       # dinner
+  "comida",     # meal / food
+  "caminata",   # walk
+  "corri",      # ran
+  "peso",       # weight
+]
