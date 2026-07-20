@@ -1261,6 +1261,7 @@ pub fn app(state: AppState) -> Router {
         .route("/jesse/prompts", get(jesse_prompts))
         .route("/jesse/diet", get(jesse_diet))
         .route("/jesse/sessions", get(jesse_sessions))
+        .route("/jesse/sessions/:session_id", get(jesse_session_hydrate))
         .route(
             "/jesse/session/:session_id",
             axum::routing::delete(jesse_session_delete),

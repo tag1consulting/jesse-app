@@ -167,6 +167,18 @@ pub fn sessions_request(
     }
     b.body(Body::empty()).unwrap()
 }
+/// `GET /jesse/sessions/{id}` (transcript hydration) with optional auth and `?after=`.
+pub fn hydrate_request(auth: Option<&str>, session_id: &str, after: Option<u64>) -> Request<Body> {
+    let uri = match after {
+        Some(a) => format!("/jesse/sessions/{session_id}?after={a}"),
+        None => format!("/jesse/sessions/{session_id}"),
+    };
+    let mut b = Request::builder().method("GET").uri(uri);
+    if let Some(a) = auth {
+        b = b.header("authorization", a);
+    }
+    b.body(Body::empty()).unwrap()
+}
 pub fn diet_request(auth: Option<&str>) -> Request<Body> {
     let mut b = Request::builder().method("GET").uri("/jesse/diet");
     if let Some(a) = auth {

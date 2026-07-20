@@ -15,6 +15,40 @@ CI both run it). See the "Versioning" section of `bridge/README.md`.
 
 ## [Unreleased]
 
+## [Bridge 0.23.0] — 2026-07-20
+
+### Added
+- **Transcript hydration endpoint — `GET /jesse/sessions/{session_id}`.** A client
+  that never saw a session's earlier turns can now render its history. Returns the
+  session transcript as ordered, client-renderable turns
+  (`{ "session_id", "turns": [ { "role", "text", "timestamp? } ], "next_offset" }`),
+  shaped like a live SSE turn: user utterances (wrapper-stripped) and visible
+  assistant TEXT only — thinking, `tool_use`, and `tool_result` noise are dropped,
+  as are subagent (`isSidechain`) and CLI `isMeta` lines.
+  - **`?after=<byte offset>` delta sync.** The jsonl is append-only, so the endpoint
+    returns only the content after the offset plus the new `next_offset`; a
+    reconnecting client re-syncs in one small round trip. A **partial trailing line**
+    (the file caught mid-write) is left unconsumed and returned on the next `?after=`
+    call once complete — malformed/partial lines are skipped, never a `500`.
+  - **Same auth/rate-limit posture as `/jesse/sessions`** (bearer `401`, `429` on a
+    burst). **`404`** for an unknown id; **`400`** for a non-plain id (path-traversal
+    defense — the id must resolve to a file inside the vault projects dir, rejected
+    before the filesystem is touched). Reuses the same pure projects-dir derivation
+    (`session_transcript_path` / `escape_project_path`) `/jesse/sessions` uses.
+
+### Fixed
+- **Title-mint transcripts no longer pollute the session list (Wart 1).** Each
+  `POST /jesse/title` one-shot runs `claude -p` and mints its own transcript whose
+  first user turn is the fixed title instruction. `list_sessions` now recognizes and
+  excludes those (prefix match on the instruction, coupled to the const by a test),
+  and hydration `404`s a title-mint id — they were never real conversations.
+- **`first_message` shows the user's words, not the wrapper (Wart 2).** The first
+  user turn in a bridge transcript is the wrapped prompt (clock line, health context,
+  Ask/Tell preamble); interactive sessions can lead with `<local-command-caveat>`
+  plumbing. The bridge now strips what it added (the preamble/capability framing) and
+  the caveat/command framing, so both the list snippet AND every hydrated user turn
+  surface the actual utterance. Truncation bound unchanged (120 chars).
+
 ## [App 1.0 (57)] — 2026-07-20
 
 ### Fixed

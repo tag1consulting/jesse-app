@@ -296,12 +296,41 @@ pub fn extract_user_text(v: &Value) -> Option<String> {
     }
 }
 
-/// Read a bounded prefix of a session jsonl and return the text of its first user
-/// turn, truncated to `FIRST_MESSAGE_CHARS` chars on a char boundary. `None` when
-/// no user turn with text is found within the prefix, or the file can't be read —
-/// never an error (such a session just shows `first_message: null`). Unparseable
-/// lines are skipped.
-pub fn first_user_message(path: &Path) -> Option<String> {
+/// Pull the assistant text out of a `{"type":"assistant","message":{...}}`
+/// transcript line — the visible answer only. Content is an array of blocks in a
+/// real transcript (occasionally a plain string); the `text` of each `{"type":"text"}`
+/// block is joined, and every non-text block (`thinking`, `tool_use`) is dropped, so
+/// hydrated assistant turns carry exactly what a live SSE turn streams. Returns
+/// `None` for a non-assistant line or one with no visible text (a tool-use-only turn).
+pub fn extract_assistant_text(v: &Value) -> Option<String> {
+    if v.get("type").and_then(|t| t.as_str()) != Some("assistant") {
+        return None;
+    }
+    let content = v.get("message")?.get("content")?;
+    match content {
+        Value::String(s) => Some(s.clone()),
+        Value::Array(blocks) => {
+            let mut parts = Vec::new();
+            for b in blocks {
+                if b.get("type").and_then(|t| t.as_str()) == Some("text") {
+                    if let Some(t) = b.get("text").and_then(|t| t.as_str()) {
+                        parts.push(t);
+                    }
+                }
+            }
+            (!parts.is_empty()).then(|| parts.join("\n"))
+        }
+        _ => None,
+    }
+}
+
+/// Read a bounded prefix of a session jsonl and return the RAW (un-stripped) text of
+/// its first user turn. `None` when no user turn with text is found within the
+/// prefix, or the file can't be read — never an error. Unparseable lines are
+/// skipped. Shared by the list snippet AND the title-mint check, so both see exactly
+/// the same first-user text (the mint check must run on the raw text, before any
+/// wrapper stripping).
+pub fn first_user_raw(path: &Path) -> Option<String> {
     use std::io::Read;
     let file = std::fs::File::open(path).ok()?;
     let mut buf = Vec::new();
@@ -318,11 +347,29 @@ pub fn first_user_message(path: &Path) -> Option<String> {
         if let Some(t) = extract_user_text(&v) {
             let t = t.trim();
             if !t.is_empty() {
-                return Some(truncate_chars(t, FIRST_MESSAGE_CHARS));
+                return Some(t.to_string());
             }
         }
     }
     None
+}
+
+/// Turn a RAW first-user turn into the list snippet: strip the bridge wrapper (or
+/// interactive caveat framing) so the user's actual words show, then truncate to
+/// `FIRST_MESSAGE_CHARS` chars on a char boundary. `None` when nothing renderable
+/// remains after stripping (e.g. a bare `/clear`).
+fn snippet_from_raw(raw: &str) -> Option<String> {
+    let stripped = strip_prompt_wrapper(raw);
+    let t = stripped.trim();
+    (!t.is_empty()).then(|| truncate_chars(t, FIRST_MESSAGE_CHARS))
+}
+
+/// Read a bounded prefix of a session jsonl and return its first user turn as the
+/// list snippet — wrapper-stripped and truncated to `FIRST_MESSAGE_CHARS`. `None`
+/// when no renderable user turn is found within the prefix or the file can't be
+/// read (the session then shows `first_message: null`, never an error).
+pub fn first_user_message(path: &Path) -> Option<String> {
+    first_user_raw(path).as_deref().and_then(snippet_from_raw)
 }
 
 /// Enumerate the session jsonl files in `dir`, newest first by mtime, filling each
@@ -375,10 +422,18 @@ pub fn list_sessions(dir: &Path, since: Option<u64>, titles: &TitleStore) -> Vec
                 continue;
             }
         }
+        // Wart 1: a `POST /jesse/title` one-shot mints its own transcript whose
+        // first user turn is the fixed title instruction. Those are not real
+        // conversations — exclude them from the list entirely.
+        let raw = first_user_raw(&path);
+        if raw.as_deref().map(is_title_mint_prompt).unwrap_or(false) {
+            continue;
+        }
         out.push(SessionSummary {
             session_id: stem.to_string(),
             last_modified: mtime,
-            first_message: first_user_message(&path),
+            // Wart 2: strip the bridge wrapper so the snippet is the user's words.
+            first_message: raw.as_deref().and_then(snippet_from_raw),
             title: titles.get(stem),
         });
     }
@@ -472,6 +527,190 @@ pub async fn jesse_sessions(
         .into_response())
 }
 
+// ---- GET /jesse/sessions/{id} — transcript hydration -----------------------
+//
+// A client that never saw a session's earlier turns hydrates its history here. The
+// full transcript is the session's `<session_id>.jsonl`; this endpoint returns the
+// ordered, client-renderable turns (user utterances + visible assistant text),
+// wrapper-stripped exactly like the list snippet and shaped like a live SSE turn.
+// `?after=<byte offset>` returns only the bytes appended since — the jsonl is
+// append-only, so a reconnecting client re-syncs in one small round trip.
+
+/// One hydrated turn: a role, the visible text, and the transcript timestamp when
+/// present. `timestamp` is omitted from the JSON when a line carries none.
+#[derive(serde::Serialize, PartialEq, Debug)]
+pub struct HydratedTurn {
+    pub role: String,
+    pub text: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub timestamp: Option<String>,
+}
+
+/// Shape one transcript jsonl line into a renderable turn, or `None` to skip it.
+/// Mirrors the live SSE convention — user utterances (wrapper-stripped) and visible
+/// assistant TEXT only — so hydrated history and live turns look the same. Skipped:
+/// tool-use / thinking-only turns and `tool_result` carriers (no visible text),
+/// subagent (`isSidechain`) traffic and CLI `isMeta` plumbing (e.g. the caveat line),
+/// non-turn line types (`system`, `summary`, …), and blank / malformed lines.
+fn shape_turn_line(line: &str) -> Option<HydratedTurn> {
+    let line = line.trim();
+    if line.is_empty() {
+        return None;
+    }
+    let v: Value = serde_json::from_str(line).ok()?; // skip a malformed/partial line
+    if v.get("isSidechain").and_then(|b| b.as_bool()) == Some(true) {
+        return None;
+    }
+    if v.get("isMeta").and_then(|b| b.as_bool()) == Some(true) {
+        return None;
+    }
+    let ts = v
+        .get("timestamp")
+        .and_then(|t| t.as_str())
+        .map(str::to_string);
+    match v.get("type").and_then(|t| t.as_str()) {
+        Some("user") => {
+            let stripped = strip_prompt_wrapper(extract_user_text(&v)?.trim());
+            let text = stripped.trim();
+            (!text.is_empty()).then(|| HydratedTurn {
+                role: "user".to_string(),
+                text: text.to_string(),
+                timestamp: ts,
+            })
+        }
+        Some("assistant") => {
+            let text = extract_assistant_text(&v)?;
+            let text = text.trim();
+            (!text.is_empty()).then(|| HydratedTurn {
+                role: "assistant".to_string(),
+                text: text.to_string(),
+                timestamp: ts,
+            })
+        }
+        _ => None,
+    }
+}
+
+/// Parse jsonl `bytes` — which begin at absolute file offset `base` — into ordered
+/// turns, plus the absolute byte offset immediately after the last NEWLINE-terminated
+/// line consumed. A trailing line with no `\n` (an append-only file caught
+/// mid-write) is left UNCONSUMED: `next_offset` points at its start, so the next
+/// `?after=` call returns it once the writer finishes it. A complete-but-malformed
+/// line is skipped and still advances the offset (it is gone, not replayed forever).
+/// Pure, so the offset math is unit-tested directly.
+pub fn parse_turns(bytes: &[u8], base: u64) -> (Vec<HydratedTurn>, u64) {
+    let mut turns = Vec::new();
+    let mut pos = 0usize;
+    let mut consumed = 0usize;
+    while let Some(rel) = bytes[pos..].iter().position(|&b| b == b'\n') {
+        let end = pos + rel; // index of the '\n'
+        if let Ok(s) = std::str::from_utf8(&bytes[pos..end]) {
+            if let Some(t) = shape_turn_line(s) {
+                turns.push(t);
+            }
+        }
+        pos = end + 1; // step past the newline
+        consumed = pos;
+    }
+    (turns, base + consumed as u64)
+}
+
+/// Read a transcript from byte offset `after` to EOF and shape the new turns,
+/// returning them with the next offset. `after` at or past EOF (a caught-up client,
+/// or a stale over-large offset) yields no turns and the current length. Append-only,
+/// so the offset math is exact.
+pub fn hydrate_from_file(path: &Path, after: u64) -> std::io::Result<(Vec<HydratedTurn>, u64)> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut file = std::fs::File::open(path)?;
+    let len = file.metadata()?.len();
+    if after >= len {
+        return Ok((Vec::new(), len));
+    }
+    file.seek(SeekFrom::Start(after))?;
+    let mut buf = Vec::new();
+    file.read_to_end(&mut buf)?;
+    Ok(parse_turns(&buf, after))
+}
+
+/// Query params for `GET /jesse/sessions/{id}`.
+#[derive(Deserialize)]
+pub struct HydrateQuery {
+    /// Return only content appended after this byte offset (the append-only delta
+    /// sync). Absent → the full transcript from offset 0.
+    #[serde(default)]
+    pub after: Option<u64>,
+}
+
+/// `GET /jesse/sessions/{session_id}` — hydrate one session's transcript into
+/// ordered, client-renderable turns. Same bearer auth and rate limiter as
+/// `/jesse/sessions`. `?after=<byte offset>` returns only the turns appended since,
+/// with `next_offset` for the next round trip (the jsonl is append-only, so the
+/// offset math is exact and a reconnecting client syncs in one small call).
+///
+/// - **`404`** for an unknown id, and for a title-mint transcript (Wart 1 — a
+///   `POST /jesse/title` one-shot is not a real conversation; it is excluded from
+///   the list AND rejected here, identically to an unknown id).
+/// - **`400`** for a structurally-invalid id (not a plain filename component):
+///   path-traversal defense, rejected before the filesystem is touched, so a
+///   crafted id can never resolve outside the vault projects dir.
+/// - **Malformed / partial lines never 500** — they are skipped (a partial trailing
+///   line is returned on the next `?after=` call once complete).
+pub async fn jesse_session_hydrate(
+    State(st): State<AppState>,
+    UrlPath(session_id): UrlPath<String>,
+    headers: HeaderMap,
+    Query(params): Query<HydrateQuery>,
+) -> Result<Response, ApiError> {
+    check_auth(&headers, &st.cfg.token)?;
+    if !st.limiter.allow() {
+        return Err((
+            StatusCode::TOO_MANY_REQUESTS,
+            "rate limit exceeded".to_string(),
+        ));
+    }
+    // Path-traversal defense: a non-plain component can never name a file INSIDE the
+    // projects dir; reject it before the filesystem is touched (same posture as the
+    // DELETE endpoint), so a crafted id like `../../foo` can't escape the vault.
+    if !is_plain_session_component(&session_id) {
+        return Err((StatusCode::BAD_REQUEST, "invalid session id".to_string()));
+    }
+    let path = session_transcript_path(&st.cfg.home, &st.cfg.vault, &session_id);
+    if !path.is_file() {
+        return Err((StatusCode::NOT_FOUND, "unknown session".to_string()));
+    }
+    // Wart 1: a title-mint transcript is not a real conversation — 404 it, exactly as
+    // it is excluded from GET /jesse/sessions. Checked on the RAW first user turn.
+    if first_user_raw(&path)
+        .as_deref()
+        .map(is_title_mint_prompt)
+        .unwrap_or(false)
+    {
+        return Err((StatusCode::NOT_FOUND, "unknown session".to_string()));
+    }
+    let after = params.after.unwrap_or(0);
+    let (turns, next_offset) = hydrate_from_file(&path, after).map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("could not read session transcript: {e}"),
+        )
+    })?;
+    let body = serde_json::to_string(&json!({
+        "session_id": session_id,
+        "turns": turns,
+        "next_offset": next_offset,
+    }))
+    .unwrap_or_else(|_| r#"{"turns":[]}"#.to_string());
+    Ok((
+        StatusCode::OK,
+        [(
+            axum::http::header::CONTENT_TYPE,
+            "application/json".to_string(),
+        )],
+        body,
+    )
+        .into_response())
+}
+
 /// `DELETE /jesse/session/{session_id}` — delete one Claude Code session for the
 /// bridge's vault, scoped to the vault project only. Same bearer auth as `/jesse`.
 ///
@@ -491,10 +730,7 @@ pub async fn jesse_session_delete(
     // Defensive: a non-plain component can never name a session inside the projects
     // dir; reject it up front so it can't reach `remove_file` (path traversal).
     if !is_plain_session_component(&session_id) {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            "invalid session id".to_string(),
-        ));
+        return Err((StatusCode::BAD_REQUEST, "invalid session id".to_string()));
     }
     let dir = st.sessions_dir();
     match delete_session_file(&dir, &session_id) {
@@ -822,7 +1058,7 @@ mod tests {
         write(&dir, "ancient.jsonl", "{}\n");
         write(&dir, "fresh.jsonl", "{}\n");
         set_mtime(&dir.join("ancient.jsonl"), 0); // epoch → older than any TTL
-        // `fresh.jsonl` keeps its just-written (now) mtime.
+                                                  // `fresh.jsonl` keeps its just-written (now) mtime.
 
         let mut cfg = crate::testutil::test_config();
         cfg.home = home.to_string_lossy().into_owned();
@@ -835,10 +1071,17 @@ mod tests {
 
         run_session_gc(&cfg, &titles);
 
-        assert!(!dir.join("ancient.jsonl").exists(), "ancient session reclaimed");
+        assert!(
+            !dir.join("ancient.jsonl").exists(),
+            "ancient session reclaimed"
+        );
         assert!(dir.join("fresh.jsonl").exists(), "fresh session kept");
         assert_eq!(titles.get("ancient"), None, "reclaimed title dropped");
-        assert_eq!(titles.get("fresh").as_deref(), Some("New Title"), "kept title stays");
+        assert_eq!(
+            titles.get("fresh").as_deref(),
+            Some("New Title"),
+            "kept title stays"
+        );
         std::fs::remove_dir_all(&home).ok();
     }
 
@@ -904,6 +1147,192 @@ mod tests {
             p,
             PathBuf::from("/home/bob/.claude/projects/-vault-notes/sess-9.jsonl")
         );
+    }
+
+    #[test]
+    fn extract_assistant_text_joins_text_and_skips_tool_and_thinking() {
+        // The real transcript shape: a content array of thinking/text/tool_use.
+        let v: Value = serde_json::from_str(
+            r#"{"type":"assistant","message":{"content":[
+                 {"type":"thinking","thinking":"pondering"},
+                 {"type":"text","text":"first"},
+                 {"type":"tool_use","name":"Read","input":{}},
+                 {"type":"text","text":"second"}]}}"#,
+        )
+        .unwrap();
+        assert_eq!(extract_assistant_text(&v).as_deref(), Some("first\nsecond"));
+        // A tool-use-only assistant turn has no visible text.
+        let v: Value = serde_json::from_str(
+            r#"{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Read","input":{}}]}}"#,
+        )
+        .unwrap();
+        assert_eq!(extract_assistant_text(&v), None);
+        // A user line yields None.
+        let v: Value =
+            serde_json::from_str(r#"{"type":"user","message":{"content":"hi"}}"#).unwrap();
+        assert_eq!(extract_assistant_text(&v), None);
+    }
+
+    #[test]
+    fn parse_turns_orders_turns_and_reports_the_full_offset() {
+        let jsonl = concat!(
+            r#"{"type":"system","subtype":"init"}"#,
+            "\n",
+            r#"{"type":"user","message":{"content":"first question"}}"#,
+            "\n",
+            r#"{"type":"assistant","message":{"content":[{"type":"text","text":"an answer"}]}}"#,
+            "\n",
+        );
+        let (turns, offset) = parse_turns(jsonl.as_bytes(), 0);
+        assert_eq!(offset, jsonl.len() as u64, "all complete lines consumed");
+        assert_eq!(turns.len(), 2, "system line skipped");
+        assert_eq!(turns[0].role, "user");
+        assert_eq!(turns[0].text, "first question");
+        assert_eq!(turns[1].role, "assistant");
+        assert_eq!(turns[1].text, "an answer");
+    }
+
+    #[test]
+    fn parse_turns_skips_noise_malformed_and_tool_results() {
+        let jsonl = concat!(
+            r#"{"type":"user","isMeta":true,"message":{"content":"<local-command-caveat>x</local-command-caveat>"}}"#,
+            "\n",
+            r#"not valid json at all"#,
+            "\n",
+            r#"{"type":"user","isSidechain":true,"message":{"content":"subagent chatter"}}"#,
+            "\n",
+            r#"{"type":"user","message":{"content":[{"type":"tool_result","content":"noise"}]}}"#,
+            "\n",
+            r#"{"type":"user","message":{"content":"a real question"}}"#,
+            "\n",
+        );
+        let (turns, offset) = parse_turns(jsonl.as_bytes(), 0);
+        assert_eq!(offset, jsonl.len() as u64);
+        assert_eq!(turns.len(), 1, "only the real user turn survives");
+        assert_eq!(turns[0].text, "a real question");
+    }
+
+    #[test]
+    fn parse_turns_leaves_a_partial_trailing_line_unconsumed() {
+        let complete = concat!(
+            r#"{"type":"user","message":{"content":"q1"}}"#,
+            "\n",
+            r#"{"type":"assistant","message":{"content":[{"type":"text","text":"a1"}]}}"#,
+            "\n",
+        );
+        // A partial line: no terminating newline yet (append-only file mid-write).
+        let partial = r#"{"type":"user","message":{"content":"q2 in"#;
+        let full = format!("{complete}{partial}");
+
+        let (turns, offset) = parse_turns(full.as_bytes(), 0);
+        assert_eq!(turns.len(), 2, "the partial line is NOT returned yet");
+        assert_eq!(
+            offset,
+            complete.len() as u64,
+            "offset points at the START of the partial line"
+        );
+
+        // The writer finishes the line; the next `?after=` call returns it.
+        let rest = "complete\"}}\n";
+        let appended = format!("{partial}{rest}");
+        let (turns2, offset2) = parse_turns(appended.as_bytes(), offset);
+        assert_eq!(turns2.len(), 1);
+        assert_eq!(turns2[0].text, "q2 incomplete");
+        // The whole appended line is now consumed, from where the partial started.
+        assert_eq!(offset2, offset + appended.len() as u64);
+    }
+
+    #[test]
+    fn hydrate_from_file_reads_the_delta_from_an_offset() {
+        let dir = temp_dir();
+        let path = dir.join("h.jsonl");
+        let first = concat!(
+            r#"{"type":"user","message":{"content":"q1"}}"#,
+            "\n",
+            r#"{"type":"assistant","message":{"content":[{"type":"text","text":"a1"}]}}"#,
+            "\n",
+        );
+        std::fs::write(&path, first).unwrap();
+
+        let (turns, offset) = hydrate_from_file(&path, 0).unwrap();
+        assert_eq!(turns.len(), 2);
+        assert_eq!(offset, first.len() as u64);
+
+        // A caught-up client (after == len) gets nothing new, offset unchanged.
+        let (none_yet, off2) = hydrate_from_file(&path, offset).unwrap();
+        assert!(none_yet.is_empty());
+        assert_eq!(off2, offset);
+
+        // Append a turn; hydrating from the prior offset returns only the new one.
+        let more = "{\"type\":\"user\",\"message\":{\"content\":\"q2\"}}\n";
+        std::fs::write(&path, format!("{first}{more}")).unwrap();
+        let (delta, off3) = hydrate_from_file(&path, offset).unwrap();
+        assert_eq!(delta.len(), 1);
+        assert_eq!(delta[0].text, "q2");
+        assert_eq!(off3, (first.len() + more.len()) as u64);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn list_excludes_title_mint_transcripts() {
+        let dir = temp_dir();
+        // A title-mint transcript: its first user turn is the fixed instruction.
+        let mint = format!(
+            "{{\"type\":\"user\",\"message\":{{\"content\":{}}}}}\n",
+            serde_json::to_string(&build_title_prompt("some conversation digest")).unwrap()
+        );
+        write(&dir, "mint.jsonl", &mint);
+        // A real session.
+        write(
+            &dir,
+            "real.jsonl",
+            "{\"type\":\"user\",\"message\":{\"content\":\"what is on Today.md?\"}}\n",
+        );
+        let titles = TitleStore::new(None);
+        let listed = list_sessions(&dir, None, &titles);
+        let ids: Vec<&str> = listed.iter().map(|s| s.session_id.as_str()).collect();
+        assert_eq!(
+            ids,
+            ["real"],
+            "title-mint transcript excluded from the list"
+        );
+        assert_eq!(
+            listed[0].first_message.as_deref(),
+            Some("what is on Today.md?")
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn first_message_strips_the_bridge_wrapper() {
+        let dir = temp_dir();
+        // A realistic wrapped first user turn (built by the real prompt builder).
+        let wrapped = build_prompt_at(
+            "Current date/time: Sunday, 2026-07-20 08:00 CEST (UTC+02:00).",
+            "ask",
+            "what is on Today.md?",
+            false,
+            false,
+            None,
+            None,
+            None,
+            false,
+            false,
+            &Persona::default(),
+        )
+        .unwrap();
+        let line = format!(
+            "{{\"type\":\"user\",\"message\":{{\"content\":{}}}}}\n",
+            serde_json::to_string(&wrapped).unwrap()
+        );
+        write(&dir, "s.jsonl", &line);
+        assert_eq!(
+            first_user_message(&dir.join("s.jsonl")).as_deref(),
+            Some("what is on Today.md?"),
+            "the snippet is the user's words, not the wrapper"
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// Set a file's mtime to exactly `secs` since the unix epoch, dependency-free,
