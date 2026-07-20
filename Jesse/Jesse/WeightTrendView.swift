@@ -11,11 +11,15 @@ struct WeightTrendDetail: View {
     let progress: DietProgress?
 
     enum Range: String, CaseIterable, Identifiable {
-        case d30 = "30d", d90 = "90d", all = "All"
+        case d7 = "7d", d30 = "30d", d90 = "90d", all = "All"
         var id: String { rawValue }
-        var days: Int? { self == .d30 ? 30 : self == .d90 ? 90 : nil }
+        var days: Int? {
+            switch self { case .d7: return 7; case .d30: return 30; case .d90: return 90; case .all: return nil }
+        }
     }
 
+    // 90 days is the default for this slower signal; the shared 7-day option reads the
+    // recent tail at a glance, matching the nutrient trend charts' range set.
     @State private var range: Range = .d90
     @State private var scrubDate: Date?
     @State private var explainer: Explainer?

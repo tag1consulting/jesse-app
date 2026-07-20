@@ -88,6 +88,24 @@ enum TrendNutrient: String, CaseIterable, Identifiable, Sendable {
         }
     }
 
+    /// The nutrient's NORMAL-day judged goal, used to color one plotted day with the SAME
+    /// status band the daily gauge uses — so a day's dot on the trend and its bar on the
+    /// Today screen never disagree (`NutrientTrends.dayStatus`). Nil for the informational
+    /// nutrients (total sugars, unsaturated fat), which the daily gauge also never judges;
+    /// they plot in a neutral tone. Calories read as a ceiling and carbs as a floor — the
+    /// normal-day treatment, the only one history can assume (the per-day style isn't in
+    /// `nutrientSeries`); fat is the 50–65 g window. This is deliberately DISTINCT from
+    /// `kind`, which drives the trend DIRECTION (where calories "sit near" a target):
+    /// `dayGoal` answers "was this day good?", `kind` answers "which way is it drifting?".
+    var dayGoal: DietSemantics.Goal? {
+        switch self {
+        case .p, .fiber, .c, .k, .ca, .o3, .mg: return .floor
+        case .cal, .na, .satf: return .ceiling
+        case .f: return .window
+        case .sug, .unsat: return nil
+        }
+    }
+
     /// This nutrient's reference target from the day's targets object, or nil when the
     /// snapshot carries none (then the trend renders value-only, with NO judgment). Total
     /// sugars' target is an optional reference line only (informational — never a
@@ -483,6 +501,63 @@ enum NutrientTrends {
             partialCount: points.filter(\.isPartial).count,
             countUnderTarget: countUnder, countOverTarget: countOver,
             direction: direction(for: nutrient, values: values, target: target))
+    }
+
+    // MARK: - Per-day goal status (chart coloring)
+
+    /// The color-status band for ONE plotted day, delegating to the daily gauge's own band
+    /// functions (`DietSemantics.floorStatus`/`ceilingStatus`/`fatWindowStatus`) so a trend
+    /// dot matches the color the Today bar would give that value. The nutrient's `dayGoal`
+    /// picks the band; an informational nutrient (no `dayGoal`) or a missing/zero target is
+    /// neutral (`.suspended`), never a red/green claim.
+    ///
+    /// A PARTIAL day's `value` is a lower bound (unknown contributors weren't counted), so a
+    /// judgment is asserted ONLY in the direction the lower bound already PROVES — a floor
+    /// already cleared reads good, a ceiling already breached reads bad — and every other
+    /// partial day stays neutral rather than claim a band its unknowns could overturn.
+    static func dayStatus(_ nutrient: TrendNutrient, value: Double, isPartial: Bool,
+                          target: Double?) -> DietSemantics.Status {
+        guard let goal = nutrient.dayGoal else { return .suspended }
+        switch goal {
+        case .floor:
+            guard let target, target > 0 else { return .suspended }
+            let s = DietSemantics.floorStatus(value: value, target: target)
+            // A partial floor is only PROVEN once the known-only floor already clears target.
+            return isPartial ? (s == .green ? .green : .suspended) : s
+        case .ceiling:
+            guard let target, target > 0 else { return .suspended }
+            let s = DietSemantics.ceilingStatus(value: value, target: target)
+            // A partial ceiling is only PROVEN once the known-only floor already exceeds it.
+            return isPartial ? (s == .red ? .red : .suspended) : s
+        case .window:
+            // The fat window is fixed grams (50–65 green, to 70 yellow), independent of the
+            // day's target — matching the normal-day fat gauge. A partial day can only be
+            // proven bad when even the known-only floor already clears the hard cap.
+            let s = DietSemantics.fatWindowStatus(grams: value)
+            return isPartial ? (value > DietSemantics.fatHardCap ? .red : .suspended) : s
+        }
+    }
+
+    /// A short under/on/over phrase for a plotted day's scrub readout — the SAME judgment the
+    /// color encodes, in words, so color is never the only signal (accessibility). Nil when
+    /// the day carries no judgment: an informational nutrient, no usable target, or a partial
+    /// day whose unknowns leave the band undecided.
+    static func dayStatusPhrase(_ nutrient: TrendNutrient, value: Double, isPartial: Bool,
+                                target: Double?) -> String? {
+        guard let goal = nutrient.dayGoal else { return nil }
+        switch dayStatus(nutrient, value: value, isPartial: isPartial, target: target) {
+        case .suspended:
+            return nil
+        case .green:
+            switch goal { case .floor: return "at or above floor"
+                          case .ceiling: return "under ceiling"; case .window: return "in range" }
+        case .yellow:
+            switch goal { case .floor: return "near floor"
+                          case .ceiling: return "near ceiling"; case .window: return "near cap" }
+        case .red:
+            switch goal { case .floor: return "under floor"
+                          case .ceiling: return "over ceiling"; case .window: return "out of range" }
+        }
     }
 
     // MARK: - Top sources

@@ -163,6 +163,87 @@ final class NutrientTrendsTests: XCTestCase {
         XCTAssertEqual(all.daysInWindow, 30)
     }
 
+    // MARK: - Per-day goal status → color (chart coloring)
+
+    // Each plotted day colors by the SAME status band the daily gauge uses, so the trend dot
+    // and the Today bar never disagree. Floor, ceiling, and window each map through their own
+    // band; informational and no-target days stay neutral; a partial day only asserts the
+    // breach its lower bound already proves.
+
+    func testFloorDayStatusMatchesDailyFloorBands() {
+        // Protein floor 190: <50% red, 50–80% yellow, ≥80% green (DietSemantics.floorStatus).
+        let target = 190.0
+        func s(_ v: Double) -> DietSemantics.Status {
+            N.dayStatus(.p, value: v, isPartial: false, target: target)
+        }
+        XCTAssertEqual(s(90), .red, "under half the floor is a miss")
+        XCTAssertEqual(s(150), .yellow, "approaching the floor is the amber band")
+        XCTAssertEqual(s(190), .green, "at the floor is met")
+        XCTAssertEqual(s(210), .green, "over the floor is met")
+        // The color leg: the band maps through the app's shared palette.
+        XCTAssertEqual(statusColor(s(90)), .red)
+        XCTAssertEqual(statusColor(s(150)), .orange)
+        XCTAssertEqual(statusColor(s(210)), .green)
+    }
+
+    func testCeilingDayStatusMatchesDailyCeilingBands() {
+        // Sodium ceiling 2300: <80% green, 80–100% yellow, >100% red (DietSemantics.ceilingStatus).
+        let target = 2300.0
+        func s(_ v: Double) -> DietSemantics.Status {
+            N.dayStatus(.na, value: v, isPartial: false, target: target)
+        }
+        XCTAssertEqual(s(1500), .green, "well under the ceiling is good")
+        XCTAssertEqual(s(2000), .yellow, "nearing the ceiling is the amber band")
+        XCTAssertEqual(s(2500), .red, "over the ceiling is a miss")
+        XCTAssertEqual(statusColor(s(2500)), .red)
+    }
+
+    func testWindowDayStatusUsesFixedFatWindowIndependentOfTarget() {
+        // Fat is the window: <50 red, 50–65 green, 65–70 yellow, >70 red — fixed grams, so a
+        // nil target must NOT neutralize it (unlike floor/ceiling).
+        func s(_ v: Double) -> DietSemantics.Status {
+            N.dayStatus(.f, value: v, isPartial: false, target: nil)
+        }
+        XCTAssertEqual(s(40), .red, "under the 50 g hormonal floor")
+        XCTAssertEqual(s(60), .green, "inside the 50–65 g window")
+        XCTAssertEqual(s(68), .yellow, "between the working and hard cap")
+        XCTAssertEqual(s(75), .red, "over the 70 g hard cap")
+    }
+
+    func testInformationalAndNoTargetDaysAreNeutral() {
+        // Informational nutrients are never judged → neutral regardless of target/value.
+        XCTAssertEqual(N.dayStatus(.sug, value: 80, isPartial: false, target: 50), .suspended)
+        XCTAssertEqual(N.dayStatus(.unsat, value: 40, isPartial: false, target: nil), .suspended)
+        // A floor/ceiling with no usable target makes no claim.
+        XCTAssertEqual(N.dayStatus(.p, value: 90, isPartial: false, target: nil), .suspended)
+        XCTAssertEqual(N.dayStatus(.na, value: 3000, isPartial: false, target: 0), .suspended)
+    }
+
+    func testPartialDayAssertsOnlyTheBreachItsLowerBoundProves() {
+        // Floor: a partial value is a lower bound. Already-cleared reads green; still-short is
+        // undecided (unknowns could lift it), so neutral — never a false "under floor".
+        XCTAssertEqual(N.dayStatus(.p, value: 200, isPartial: true, target: 190), .green)
+        XCTAssertEqual(N.dayStatus(.p, value: 90, isPartial: true, target: 190), .suspended)
+        // Ceiling: already-breached reads red; still-under is undecided (unknowns could push
+        // it over), so neutral — never a false "under ceiling".
+        XCTAssertEqual(N.dayStatus(.na, value: 2500, isPartial: true, target: 2300), .red)
+        XCTAssertEqual(N.dayStatus(.na, value: 1500, isPartial: true, target: 2300), .suspended)
+        // Window: only a lower bound already past the hard cap is proven bad.
+        XCTAssertEqual(N.dayStatus(.f, value: 75, isPartial: true, target: nil), .red)
+        XCTAssertEqual(N.dayStatus(.f, value: 60, isPartial: true, target: nil), .suspended)
+    }
+
+    func testDayStatusPhraseMirrorsTheColorAndHedgesTheUndecided() {
+        // The phrase carries the same under/on/over signal as the color (accessibility).
+        XCTAssertEqual(N.dayStatusPhrase(.p, value: 210, isPartial: false, target: 190), "at or above floor")
+        XCTAssertEqual(N.dayStatusPhrase(.p, value: 90, isPartial: false, target: 190), "under floor")
+        XCTAssertEqual(N.dayStatusPhrase(.na, value: 2500, isPartial: false, target: 2300), "over ceiling")
+        XCTAssertEqual(N.dayStatusPhrase(.f, value: 60, isPartial: false, target: nil), "in range")
+        // No claim where the day carries none: informational, no target, undecided partial.
+        XCTAssertNil(N.dayStatusPhrase(.sug, value: 80, isPartial: false, target: 50))
+        XCTAssertNil(N.dayStatusPhrase(.p, value: 90, isPartial: true, target: 190))
+    }
+
     // MARK: - Labels (all thirteen, unabbreviated)
 
     func testAllThirteenFullNamesPresentAndUnabbreviated() {

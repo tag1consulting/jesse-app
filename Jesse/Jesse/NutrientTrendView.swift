@@ -17,13 +17,16 @@ struct NutrientTrendDetail: View {
     let context: NutrientTrendContext
 
     enum Range: String, CaseIterable, Identifiable {
-        case d30 = "30d", d90 = "90d", all = "All"
+        case d7 = "7d", d30 = "30d", d90 = "90d", all = "All"
         var id: String { rawValue }
-        var days: Int? { self == .d30 ? 30 : self == .d90 ? 90 : nil }
+        var days: Int? {
+            switch self { case .d7: return 7; case .d30: return 30; case .d90: return 90; case .all: return nil }
+        }
     }
 
     // 30 days is the meaningful default here (the coverage examples speak to "the last
-    // 30 logged days"); the weight trend's 90-day default is for a slower signal.
+    // 30 logged days"); the weight trend's 90-day default is for a slower signal. The 7-day
+    // option reads the recent tail at a glance — handy while traveling.
     @State private var range: Range = .d30
     @State private var scrubDate: Date?
 
@@ -81,14 +84,22 @@ struct NutrientTrendDetail: View {
         return segs
     }
 
-    /// The target rule's color reads the nutrient's kind: green for a floor to reach,
-    /// orange for a ceiling to stay under, and a neutral secondary for a target line.
+    /// The target rule's color reads the nutrient's day-goal, matching the dot coloring:
+    /// green for a floor to reach, orange for a ceiling/window cap to stay under, and a
+    /// neutral secondary for an informational reference line.
     private var ruleColor: Color {
-        switch nutrient.kind {
+        switch nutrient.dayGoal {
         case .floor: return .green
-        case .ceiling: return .orange
-        case .target, .informational: return .secondary
+        case .ceiling, .window: return .orange
+        case nil: return .secondary
         }
+    }
+
+    /// The `DietSemantics` status color for one plotted day, reusing the daily gauge's
+    /// palette so the trend dot matches the color the Today bar gives that value.
+    private func markColor(_ p: Pt) -> Color {
+        statusColor(NutrientTrends.dayStatus(nutrient, value: p.value,
+                                             isPartial: p.isPartial, target: trend.target))
     }
 
     /// A 0-based y-domain that always includes the target, so a value near the floor
@@ -209,25 +220,31 @@ struct NutrientTrendDetail: View {
     private var chart: some View {
         Chart {
             // Broken line: one connected run per segment, never bridging a gap. Linear
-            // interpolation (no catmullRom) so it can't dip toward zero between points.
+            // interpolation (no catmullRom) so it can't dip toward zero between points. The
+            // line is a neutral connector — the per-day GOAL color lives on the dots, which
+            // would read as noise smeared along a multi-colored line.
             ForEach(segments) { seg in
                 ForEach(seg.points) { p in
                     LineMark(x: .value("Date", p.date), y: .value(nutrient.fullName, p.value),
                              series: .value("Segment", seg.id))
-                        .foregroundStyle(Color.accentColor.opacity(0.55))
+                        .foregroundStyle(.secondary.opacity(0.4))
                 }
             }
-            // Complete known days: filled points.
+            // Complete known days: filled points, colored by that day's goal status (the
+            // same greens/ambers/reds the daily bars use) so under/on/over reads at a glance.
+            // Position relative to the target rule carries the same signal for accessibility.
             ForEach(points.filter { !$0.isPartial }) { p in
                 PointMark(x: .value("Date", p.date), y: .value(nutrient.fullName, p.value))
-                    .foregroundStyle(Color.accentColor)
+                    .foregroundStyle(markColor(p))
                     .symbolSize(36)
             }
-            // Partial days: a hollow ring (outer accent disc + inner background hole) to
-            // read as "at least this", distinct from a complete day.
+            // Partial days: a hollow ring (outer status disc + inner background hole) to
+            // read as "at least this", distinct from a complete day. A partial ring only
+            // takes a red/green once its lower bound already proves the breach; otherwise it
+            // stays neutral rather than overclaim (see `NutrientTrends.dayStatus`).
             ForEach(points.filter { $0.isPartial }) { p in
                 PointMark(x: .value("Date", p.date), y: .value(nutrient.fullName, p.value))
-                    .foregroundStyle(Color.accentColor).symbolSize(70)
+                    .foregroundStyle(markColor(p)).symbolSize(70)
                 PointMark(x: .value("Date", p.date), y: .value(nutrient.fullName, p.value))
                     .foregroundStyle(Color(.systemBackground)).symbolSize(26)
             }
@@ -263,19 +280,31 @@ struct NutrientTrendDetail: View {
     }
 
     private var kindWord: String {
-        switch nutrient.kind {
+        switch nutrient.dayGoal {
         case .floor: return "floor"
         case .ceiling: return "ceiling"
-        case .target: return "target"
-        case .informational: return "ref"
+        case .window: return "cap"
+        case nil: return "ref"
         }
     }
 
     private func scrubLabel(_ p: Pt) -> some View {
-        VStack(alignment: .leading, spacing: 2) {
+        // The under/on/over word behind the color, so the readout carries the same signal
+        // (accessibility). Nil for an informational day or a partial day the unknowns leave
+        // undecided — never an overclaim. A judged day tints its value to match its dot; a
+        // neutral (`.suspended`) day stays primary so the number never reads as muted.
+        let status = NutrientTrends.dayStatus(nutrient, value: p.value,
+                                              isPartial: p.isPartial, target: trend.target)
+        let phrase = NutrientTrends.dayStatusPhrase(nutrient, value: p.value,
+                                                    isPartial: p.isPartial, target: trend.target)
+        return VStack(alignment: .leading, spacing: 2) {
             Text(p.id).font(.caption2).foregroundStyle(.secondary)
             Text("\(p.isPartial ? "≥" : "")\(NutrientTrends.fmt(p.value)) \(nutrient.unit)")
                 .font(.caption.weight(.semibold).monospacedDigit())
+                .foregroundStyle(status == .suspended ? Color.primary : statusColor(status))
+            if let phrase {
+                Text(phrase).font(.caption2).foregroundStyle(.secondary)
+            }
             if p.isPartial {
                 Text("partial day").font(.caption2).foregroundStyle(.secondary)
             }
