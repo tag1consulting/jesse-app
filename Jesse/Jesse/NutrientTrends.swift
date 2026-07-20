@@ -407,14 +407,21 @@ enum NutrientTrends {
             .sorted { ($0.date) < ($1.date) }
     }
 
-    /// The `nutrientSeries` entries inside the most-recent `windowDays` CALENDAR days,
-    /// anchored on the last logged day (nil window = all). `series` must be ascending.
-    static func windowed(_ series: [NutrientDay], windowDays: Int?) -> [NutrientDay] {
+    /// The `nutrientSeries` entries inside the most-recent `windowDays` CALENDAR days, anchored
+    /// on `anchor` (a nil `anchor` falls back to the last logged day; a nil `windowDays` = all).
+    /// The window is `[anchor − (windowDays − 1), anchor]`, INCLUSIVE on both ends — the upper
+    /// bound matters when the anchor is a nutrient's OWN last reading, which can sit before the
+    /// last logged day, so the window must not spill into later nutrient-less days. `series`
+    /// must be ascending.
+    static func windowed(_ series: [NutrientDay], windowDays: Int?, anchor: Date? = nil) -> [NutrientDay] {
         guard let windowDays,
-              let anchor = series.last.flatMap({ dayParser.date(from: $0.date) }),
-              let cutoff = utcCalendar.date(byAdding: .day, value: -(windowDays - 1), to: anchor)
+              let anchorDate = anchor ?? series.last.flatMap({ dayParser.date(from: $0.date) }),
+              let cutoff = utcCalendar.date(byAdding: .day, value: -(windowDays - 1), to: anchorDate)
         else { return series }
-        return series.filter { (dayParser.date(from: $0.date) ?? .distantPast) >= cutoff }
+        return series.filter {
+            guard let d = dayParser.date(from: $0.date) else { return false }
+            return d >= cutoff && d <= anchorDate
+        }
     }
 
     /// The median of a set of values, or nil when empty. The even-count median averages
@@ -471,7 +478,17 @@ enum NutrientTrends {
     static func analyze(_ series: [NutrientDay], nutrient: TrendNutrient,
                         targets: DietTargets, windowDays: Int?) -> NutrientTrend {
         let ordered = sorted(series)
-        let window = windowed(ordered, windowDays: windowDays)
+        // Anchor the window on THIS nutrient's most recent known day — not the last day ANY
+        // nutrient was logged. A rarely-labeled nutrient (omega-3, magnesium, calcium…) is
+        // known only occasionally, so anchoring on the global last log would read empty at a
+        // short range whenever it wasn't logged in the last calendar week; anchoring on its
+        // own last reading always shows its recent tail. This mirrors the weight chart, whose
+        // series is weigh-ins only and so already anchors on its own data. Falls back to the
+        // last logged day when the nutrient is never known (then the window has no points
+        // regardless).
+        let anchor = ordered.last { ($0.nutrients[nutrient.key]?.known ?? 0) >= 1 }
+            .flatMap { dayParser.date(from: $0.date) }
+        let window = windowed(ordered, windowDays: windowDays, anchor: anchor)
         let target = nutrient.target(in: targets)
 
         var points: [NutrientTrendPoint] = []
