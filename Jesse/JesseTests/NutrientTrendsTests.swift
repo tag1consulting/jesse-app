@@ -244,6 +244,44 @@ final class NutrientTrendsTests: XCTestCase {
         XCTAssertNil(N.dayStatusPhrase(.p, value: 90, isPartial: true, target: 190))
     }
 
+    // MARK: - Window anchors on the nutrient's own recent tail (sparse nutrients)
+
+    // A rarely-labeled nutrient still charts its recent tail at a short range, instead of
+    // reading empty because it happened not to be logged in the last calendar week. The
+    // window anchors on the nutrient's OWN most recent reading, not the last day any nutrient
+    // was logged.
+
+    func testShortRangeAnchorsOnNutrientsOwnLastReadingNotGlobalLastLoggedDay() {
+        // 40 logged days (calories known daily → the series' last day is the newest LOG).
+        // Omega-3 is known only on days 10–17 (≈3 weeks before the last log) and never since.
+        let d = dates(from: "2026-06-10", count: 40)
+        var series: [NutrientDay] = []
+        for (i, date) in d.enumerated() {
+            var n: [String: NutrientDayValue] = ["cal": val(2000, known: 6)]
+            if (10...17).contains(i) { n["o3"] = val(500, known: 2) }
+            series.append(NutrientDay(date: date, nutrients: n))
+        }
+        let t = targets { $0.omega3 = 500 }
+        // 7-day range anchors on omega-3's own last reading (day 17), so it shows its recent
+        // tail (days 11–17) rather than an empty last-calendar-week window.
+        let w7 = N.analyze(series, nutrient: .o3, targets: t, windowDays: 7)
+        XCTAssertFalse(w7.points.isEmpty, "a sparse nutrient still charts its recent tail at 7d")
+        XCTAssertEqual(w7.points.count, 7, "the 7 days ending at the last omega-3 reading")
+        XCTAssertEqual(w7.points.last?.date, d[17], "the window ends at the nutrient's last reading")
+        XCTAssertEqual(w7.daysInWindow, 7, "the window never spills into later nutrient-less days")
+    }
+
+    func testDenseNutrientStillAnchorsOnTheLastLoggedDay() {
+        // A daily-logged nutrient's own last reading IS the last logged day, so the macros are
+        // unchanged: their short ranges still end on the most recent day.
+        let d = dates(from: "2026-06-10", count: 20)
+        let series = d.map { NutrientDay(date: $0, nutrients: ["cal": val(2000, known: 6), "p": val(180)]) }
+        let t = targets { $0.protein = 190 }
+        let w7 = N.analyze(series, nutrient: .p, targets: t, windowDays: 7)
+        XCTAssertEqual(w7.points.count, 7)
+        XCTAssertEqual(w7.points.last?.date, d[19], "anchored on the most recent day")
+    }
+
     // MARK: - Labels (all thirteen, unabbreviated)
 
     func testAllThirteenFullNamesPresentAndUnabbreviated() {

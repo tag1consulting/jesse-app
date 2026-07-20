@@ -49,6 +49,22 @@ CI both run it). See the "Versioning" section of `bridge/README.md`.
   the caveat/command framing, so both the list snippet AND every hydrated user turn
   surface the actual utterance. Truncation bound unchanged (120 chars).
 
+## [App 1.0 (57)] — 2026-07-20
+
+### Fixed
+- **A per-nutrient trend's short range (7d/30d) no longer reads empty for a
+  rarely-logged nutrient.** The window was anchored on the last day *any*
+  nutrient was logged (≈ today), so a nutrient that isn't on most food labels
+  (omega-3, magnesium, calcium, potassium) charted blank at 7d whenever it
+  wasn't logged in the last calendar week — you had to widen to 30d/All to see
+  anything. `NutrientTrends.analyze` now anchors each nutrient's window on that
+  nutrient's OWN most recent reading, so a short range always shows its recent
+  tail (even one or two points). This mirrors the weight chart, whose series is
+  weigh-ins only and so already anchored on its own data. Densely-logged macros
+  are unchanged (their last reading is the last logged day). `windowed` gained an
+  optional anchor with an inclusive upper bound so the window can't spill into
+  later nutrient-less days.
+
 ## [App 1.0 (56)] — 2026-07-20
 
 ### Added
