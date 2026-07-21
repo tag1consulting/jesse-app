@@ -34,6 +34,19 @@ const DIET_KEYWORDS: &[&str] = &[
     "log",
     "logged",
     "logging",
+    // "track" is as common an English logging verb as "log" and was missing:
+    // across 203 real turns it accounted for 8 of the 16 logging turns the gate
+    // failed to catch — the bare imperative with a weight-and-food object, e.g.
+    // "track 30g of walnuts" — each of which silently took the hosted path
+    // instead of the local ladder.
+    //
+    // The BARE imperative only — deliberately not "tracked"/"tracking". Every one
+    // of those 36 real diet uses is "track"; the inflected forms overwhelmingly
+    // appear in non-diet senses (asking how long something has been tracked, or
+    // saying a past turn tracked something wrong), and since the vault-QA gate
+    // yields to diet intent
+    // (vaultqagate.rs:164), matching them would hijack ordinary vault questions.
+    "track",
     "ate",
     "eat",
     "eating",
@@ -170,6 +183,20 @@ mod tests {
         "coffee and oatmeal",
         "biked 20 miles and logged the calories",
         "salad and a yogurt for lunch",
+        // "track" phrasings — the most common real logging verb in production and
+        // the single biggest gate gap before it was added. Bare-noun objects here
+        // on purpose: the verb alone must carry the match.
+        "Track 30g of walnuts.",
+        "Now track 85g of raw celery",
+        "Track my recent exercise. I was clearing brush in the yard.",
+    ];
+
+    // Non-diet uses of the "track" family that must NOT be hijacked. The bare verb
+    // is a diet keyword; its inflected forms are not, precisely so these keep
+    // reaching the vault-QA path (which yields to diet intent).
+    const TRACK_NON_DIET: &[&str] = &[
+        "how long have I been tracking this project",
+        "you tracked that number wrong earlier",
     ];
 
     // Non-diet Tells that must NOT fire the gate.
@@ -197,6 +224,17 @@ mod tests {
     fn gate_ignores_non_diet_tells() {
         for u in MISSES {
             assert!(!diet_intent(u, NO_EXTRA), "should NOT detect diet intent: {u:?}");
+        }
+    }
+
+    #[test]
+    fn inflected_track_forms_stay_out_of_the_gate() {
+        for u in TRACK_NON_DIET {
+            assert!(
+                !diet_intent(u, NO_EXTRA),
+                "inflected 'track' must not claim a non-diet Tell (the vault-QA gate \
+                 yields to diet intent, so this would hijack it): {u:?}"
+            );
         }
     }
 
