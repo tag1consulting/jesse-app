@@ -26,8 +26,11 @@ struct MacRootView: View {
     @State private var selection: UUID?
     @State private var showingSettings = false
     /// Scope (all / favorites / archived) + folder-expansion state + the two-tier
-    /// search, wrapping the shared layout. Constructed with the production on-device
-    /// expander; the Settings toggle drives its enabled flag each keystroke.
+    /// search, wrapping the shared layout. The production on-device expander is
+    /// injected HERE, in the view, on purpose: the view model defaults to the inert
+    /// `NoExpansion` so unit tests never spin up the real on-device model. Do not
+    /// push `FoundationModelExpander()` down into a test-reachable default. The
+    /// Settings toggle drives the tier's enabled flag each keystroke.
     @State private var listModel = MacThreadListModel(searchExpander: FoundationModelExpander())
 
     // Whether the on-device query-expansion tier is enabled (Settings toggle, default

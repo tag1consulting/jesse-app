@@ -97,6 +97,13 @@ let package = Package(
         // one file that imports it compiles and runs on both platforms. Depends on
         // JesseCore and JesseConversations to sit alongside the list-presentation
         // layer it widens.
+        //
+        // GOTCHA (applies to any class here): under .defaultIsolation(MainActor.self)
+        // a class's synthesized deinit is MainActor-isolated, so releasing an instance
+        // off the main actor (a unit-test host tears objects down off-actor) routes
+        // through the isolated-deinit executor hop and aborts. Give any class that can
+        // be released off the main actor an explicit `nonisolated deinit {}` (see
+        // ThreadSearchModel and FoundationModelExpander).
         .target(
             name: "JesseSearch",
             dependencies: ["JesseCore", "JesseConversations"],

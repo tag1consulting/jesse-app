@@ -44,6 +44,15 @@ public final class FoundationModelExpander: QueryExpanding {
 
     public init() {}
 
+    /// `nonisolated` for the same reason as `ThreadSearchModel`'s: under this
+    /// module's `.defaultIsolation(MainActor.self)` the synthesized deinit would be
+    /// MainActor-isolated, and releasing the expander off the main actor (a unit-test
+    /// host tears objects down off-actor) routes through the isolated-deinit executor
+    /// hop, which aborts. An empty nonisolated deinit avoids the hop; the `session`
+    /// still releases normally afterward. Any class in this target that could be
+    /// released off the main actor needs this.
+    nonisolated deinit {}
+
     /// Warm the on-device session when the search field gains focus, so the first
     /// real query doesn't pay cold-start latency. Silent no-op when unavailable.
     public func prewarm() {

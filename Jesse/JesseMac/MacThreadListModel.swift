@@ -49,9 +49,12 @@ struct MacThreadListModel {
     /// Inject the expander (production: the FoundationModels-backed on-device model,
     /// passed by the view; tests: a fake) plus the Settings-driven enabled flag and,
     /// for tests, a shorter debounce. The default is the INERT `NoExpansion` so the
-    /// scope/folder tests that call `MacThreadListModel()` never instantiate the real
-    /// on-device expander (unavailable off-device, and its teardown aborts a plain
-    /// test host); the Mac view constructs with `FoundationModelExpander()` explicitly.
+    /// scope/folder tests that call `MacThreadListModel()` never spin up the real
+    /// on-device model, which is unavailable in CI (the search brief requires tests
+    /// not to depend on it). This is best-practice, not a crash workaround: the abort
+    /// a real expander once caused in a bare test host was the MainActor-isolated
+    /// deinit, now fixed at the source (see `FoundationModelExpander` /
+    /// `ThreadSearchModel`). The Mac view constructs with `FoundationModelExpander()`.
     init(searchExpander: QueryExpanding = NoExpansion(),
          searchEnabled: Bool = true,
          searchDebounce: Duration = .milliseconds(300)) {
