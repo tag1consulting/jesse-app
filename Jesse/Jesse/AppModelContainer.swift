@@ -34,7 +34,8 @@ enum AppModelContainer {
     static let shared: AppModelStore = load()
 
     /// Open the store at `url` (nil → the default Application-Support location),
-    /// under the versioned schema + migration plan. Factored out of `shared` and
+    /// under the current schema with automatic lightweight migration. Factored out of
+    /// `shared` and
     /// `url`-injectable so the populated-store migration test and the
     /// fallback-flag test drive the exact same code path the app does.
     ///
@@ -49,8 +50,30 @@ enum AppModelContainer {
         let onDisk = url.map { ModelConfiguration(schema: schema, url: $0) }
             ?? ModelConfiguration(schema: schema)
         do {
+            // Open with SwiftData's AUTOMATIC lightweight migration (no
+            // `migrationPlan:`), NOT a staged plan. This is deliberate and load-bearing.
+            //
+            // A staged `SchemaMigrationPlan` keys migration on each version's exact
+            // model checksum and can only migrate a store whose recorded checksum
+            // matches a version IN the plan. But every VersionedSchema here references
+            // the same live `@Model` classes, so adding a property to an existing
+            // entity (e.g. `JesseThread.isArchived`) changes that version's checksum in
+            // place: a store already stamped with the OLD checksum becomes an "unknown
+            // model version" and the open THROWS ("Cannot use staged migration with an
+            // unknown model version"), stranding the user behind the store-error banner.
+            // That is a per-additive-property break, and it shipped once already.
+            //
+            // Automatic migration instead infers a lightweight mapping by comparing the
+            // store's entity hashes to the current schema, so an additive, defaulted
+            // property (or a new entity) migrates with no plan and no per-version
+            // checksum pinning. This is exactly what carried every earlier additive
+            // property (`isFavorite`, `origin`, `aiTitle`, the outbox entities) before a
+            // plan was ever introduced. A NON-lightweight change (renaming/retyping a
+            // column, splitting an entity) is the only thing that needs a real
+            // migration; reintroduce a plan with a custom stage THEN, keyed to the shape
+            // at that point, not before.
             let container = try ModelContainer(
-                for: schema, migrationPlan: JesseMigrationPlan.self, configurations: onDisk)
+                for: schema, configurations: onDisk)
             return AppModelStore(container: container, openFailure: nil)
         } catch {
             Log.run.error(

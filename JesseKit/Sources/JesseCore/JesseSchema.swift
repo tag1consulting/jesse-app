@@ -1,62 +1,66 @@
 import Foundation
 import SwiftData
 
-// The app's SwiftData schema, versioned. Until now the store was opened over a
-// bare `[JesseThread.self, Turn.self, …]` model list with no `VersionedSchema`
-// and no `SchemaMigrationPlan`, so there was no structural home for migrations
-// and — the real gap — no way to *test* opening a populated on-disk store across
-// a schema change. This file is that home.
+// The app's SwiftData schema and its migration strategy.
 //
-// ── Migration lineage (all lightweight so far) ─────────────────────────────
-// The schema has grown only by **additive, defaulted** changes, each of which
-// SwiftData lightweight-migrates with zero migration code:
+// ── Migration strategy: AUTOMATIC lightweight, NOT a staged plan ─────────────
+// The store is opened with SwiftData's automatic lightweight migration (see
+// `AppModelContainer.load`, i.e. `ModelContainer(for:configurations:)` with NO
+// `migrationPlan:`). Do NOT reintroduce a `SchemaMigrationPlan` for an additive
+// change. Here is the hard-won reason, learned from a shipped break:
+//
+// A staged `SchemaMigrationPlan` keys each migration on a version's exact model
+// CHECKSUM and can only migrate a store whose recorded checksum matches a version
+// listed in the plan. But every `VersionedSchema` in this app references the SAME
+// live `@Model` classes, so adding a property to an existing entity changes that
+// version's checksum IN PLACE. A store already stamped with the old checksum then
+// becomes an "unknown model version" and the open THROWS ("Cannot use staged
+// migration with an unknown model version"), leaving the user stranded behind the
+// store-error banner with an app that can't read its own history. That is a break on
+// the FIRST additive property after a plan ships, and it did ship and break once.
+//
+// (The sibling failure mode, had we instead tried to give the property change its own
+// `VersionedSchema`: because both versions reference the same live class they compute
+// the SAME checksum, and SwiftData rejects the plan at open with "Duplicate version
+// checksums detected." So neither staged option can even express a property-only
+// change in this shared-`@Model` design.)
+//
+// Automatic migration sidesteps both: it infers a lightweight mapping by comparing the
+// store's entity hashes to the current schema, with no version-checksum pinning. Every
+// change the schema has ever taken is lightweight-compatible, so this Just Works:
 //
 //   • `JesseThread.isFavorite` (Bool = false), `favoritedAt` (Date?)
 //   • `JesseThread.lastDeliveredJobId` (String?)
 //   • `JesseThread.aiTitle` (String?), `titleSourceKey` (String?)
 //   • `JesseThread.origin` (String = "phone")
+//   • `JesseThread.isArchived` (Bool = false), `archivedAt` (Date?)  ← the archive fields
 //   • `Turn.provenanceJSON` (String?)
 //   • `Turn.attachments` → `TurnAttachment` (to-many, cascade, empty default)
 //   • the `WrittenMeal` entity, then its `contentHash` / `tombstoned` fields
+//   • the `OutboxItem` / `OutboxAttachment` entities (the send outbox)
 //
-// Every one of those is a new property with a default or a new optional/relationship,
-// so no column is renamed, retyped, or dropped: a store written before any of them
-// opens under the current schema with all prior rows intact and the new fields
-// reading their defaults. That is exactly a **lightweight** migration.
+// Each is a new property with a default, a new optional/relationship, or a new entity:
+// nothing renamed, retyped, or dropped. A store written before any of them opens under
+// the current schema with all prior rows intact and the new fields reading their
+// defaults / new entities empty. `AppModelContainerMigrationTests` proves this by
+// opening a populated on-disk store written the OLD way and asserting every field
+// (including the archive fields defaulting correctly) survives.
 //
-// ── V2: the send outbox ────────────────────────────────────────────────────
-// `JesseSchemaV2` adds two entities — `OutboxItem` and `OutboxAttachment` — so a
-// message survives the pre-ACK window (a timeout / dead network / 429/5xx / a kill
-// mid-POST) that used to lose it, along with its full-resolution attachment bytes.
-// Both are new entities with fully-defaulted properties, so V1 → V2 is still a
-// LIGHTWEIGHT migration (nothing renamed, retyped, or dropped): a V1-populated
-// store opens under V2 with all prior rows intact and the two new (empty) entities
-// added. We nonetheless make it an EXPLICIT version + stage rather than lean on the
-// implicit lightweight open, per the migration-safety plan — so the populated-store
-// migration test (`AppModelContainerMigrationTests`) exercises the V1 → V2 stage,
-// and the next non-additive change has a stage to slot in beside this one.
+// The ONLY change that needs a real migration is a NON-lightweight one: renaming or
+// retyping a column, splitting/merging an entity, backfilling a derived value. THEN,
+// and only then, reintroduce a `SchemaMigrationPlan` with a custom stage keyed to the
+// model shape AT THAT POINT (which likely means freezing a copy of the old model
+// types), never a lightweight stage for an additive change.
 //
-// ── Local archive state (additive properties, absorbed into V2) ─────────────
-// `JesseThread` gains two properties, `isArchived` (Bool = false) and `archivedAt`
-// (Date?), which back the per-device "hide this conversation from my list" feature
-// (the Archived view). Like the V1-era additive properties above, these are ABSORBED
-// into the current version (V2) rather than given their own VersionedSchema, and for
-// a hard platform reason: a `VersionedSchema`'s checksum is computed from the live
-// `@Model` types, and a new version whose model list differs from V2 ONLY by two
-// added properties on the shared `JesseThread` class produces a checksum IDENTICAL to
-// V2's (both reference the same live type), which SwiftData rejects at store-open
-// with "Duplicate version checksums detected." A new VersionedSchema is therefore only
-// viable when the ENTITY SET changes (as V2 did by adding the outbox entities), not
-// for a property-only addition. So the archive fields ride in V2 exactly as
-// `isFavorite`/`origin`/`aiTitle` rode in V1: a store written before they existed
-// opens under the current schema with every prior row intact and `isArchived` reading
-// its `false` default, a LIGHTWEIGHT migration with zero migration code, proven by
-// the populated-store test. Archive state is deliberately NOT synced through the
-// bridge (which syncs only sessions/transcripts/titles); it is local to each device,
-// exactly like favorite state.
+// The `VersionedSchema` enums below remain purely as the canonical, single-source
+// model list (and as lineage documentation); they are not wired into a staged plan.
+//
+// Note: archive state is LOCAL to each device's store and deliberately NOT synced
+// through the bridge (which syncs only sessions/transcripts/titles), exactly like
+// favorite state.
 
-/// The original version of the app's persistent schema (through the whole additive
-/// lineage above — all lightweight-compatible).
+/// The original entity set (through the whole additive property lineage above, all
+/// lightweight-compatible). Kept for lineage documentation.
 public enum JesseSchemaV1: VersionedSchema {
     public static let versionIdentifier = Schema.Version(1, 0, 0)
 
@@ -65,8 +69,11 @@ public enum JesseSchemaV1: VersionedSchema {
     }
 }
 
-/// V2 — adds the send outbox (`OutboxItem` + `OutboxAttachment`). Additive-only, so
-/// V1 → V2 is a lightweight stage.
+/// The current entity set, adding the send outbox (`OutboxItem` + `OutboxAttachment`)
+/// to V1. `jesseCurrentSchema` is derived from this so the container and the migration
+/// test can never drift from the model list. Additive property changes (favorites,
+/// origin, and the archive fields) live on these same entities and migrate
+/// automatically; they do not get their own version (see the header note).
 public enum JesseSchemaV2: VersionedSchema {
     public static let versionIdentifier = Schema.Version(2, 0, 0)
 
@@ -76,24 +83,8 @@ public enum JesseSchemaV2: VersionedSchema {
     }
 }
 
-/// The app's live schema, derived from the current `VersionedSchema` (V2, which now
-/// carries `JesseThread`'s archive fields as absorbed additive properties; see the
-/// header note on why a property-only change does not get its own version). The
-/// container and every migration-test open the store through THIS value so they can
-/// never drift from the versioned model list.
+/// The app's live schema, derived from the current `VersionedSchema`. The container
+/// and every migration-test open the store through THIS value so they can never drift
+/// from the model list. Opened with automatic lightweight migration (no staged plan);
+/// see the header note and `AppModelContainer.load`.
 public var jesseCurrentSchema: Schema { Schema(versionedSchema: JesseSchemaV2.self) }
-
-/// The migration plan the container opens the store with: V1 → V2, a single
-/// lightweight stage (the outbox entities are additive). Additive PROPERTY changes
-/// (favorites, origin, and now the archive fields) ride within the current version
-/// via SwiftData's implicit lightweight open and need no stage; the next change to
-/// the ENTITY SET appends a new version and a new stage here.
-public enum JesseMigrationPlan: SchemaMigrationPlan {
-    public static var schemas: [any VersionedSchema.Type] {
-        [JesseSchemaV1.self, JesseSchemaV2.self]
-    }
-
-    public static var stages: [MigrationStage] {
-        [.lightweight(fromVersion: JesseSchemaV1.self, toVersion: JesseSchemaV2.self)]
-    }
-}

@@ -27,17 +27,24 @@ CI both run it). See the "Versioning" section of `bridge/README.md`.
   - **Schema (`JesseCore`).** `JesseThread` gains two additive, defaulted properties,
     `isArchived` (Bool = false) and `archivedAt` (Date?), plus `setArchived` /
     `toggleArchived` helpers mirroring the favorites ones (the timestamp is stamped on
-    archive and cleared on restore). Like the earlier additive properties (favorites,
-    origin, aiTitle), these are absorbed into the current schema version rather than
-    given a new one: a `VersionedSchema`'s checksum is derived from the live `@Model`
-    types, so a version that differs only by two added properties on the shared
-    `JesseThread` class collides with the existing version ("Duplicate version
-    checksums") and SwiftData rejects it at store-open. A new version is only viable
-    when the entity set changes, as the V2 outbox entities did. Because the change is
-    additive and defaulted, nothing is renamed, retyped, or dropped: a store written
-    before these columns existed opens under the current schema with every prior row
-    intact and `isArchived` reading false. The populated-store migration test now
-    covers this, including an archive-flip round-trip through a reopen.
+    archive and cleared on restore).
+  - **Store migration hardening (`JesseCore` / `AppModelContainer`).** The store now
+    opens with SwiftData's automatic lightweight migration instead of a staged
+    `SchemaMigrationPlan`. The staged plan keyed migration on each version's exact
+    model checksum, but every `VersionedSchema` here references the same live `@Model`
+    classes, so adding a property to an existing entity (like the archive fields)
+    changed a version's checksum in place and turned every already-stamped store into
+    an "unknown model version", throwing at open ("Cannot use staged migration with an
+    unknown model version") and stranding the user behind the "Couldn't open your saved
+    conversations" banner. That was a latent break on the first additive property after
+    the plan shipped. Automatic migration infers a lightweight mapping from the store's
+    entity hashes with no checksum pinning, which is exactly what carried every earlier
+    additive property (favorites, origin, aiTitle) and the outbox entities. A new
+    regression test writes a store stamped with a prior `JesseThread` shape and proves
+    it opens after the attribute is added; the populated-store test also covers the
+    archive-flip round-trip. A staged plan is only needed for a genuinely
+    non-lightweight change (a rename/retype/entity split) and should be reintroduced
+    only then.
   - **Shared filtering (`JesseConversations`).** `threadListLayout` takes a new
     `archivedOnly` scope. The normal list (All, Favorites, Watch) now excludes
     archived threads; a dedicated Archived view shows only archived threads as a flat,
