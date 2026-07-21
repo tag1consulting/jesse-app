@@ -958,55 +958,62 @@ pub fn targets_for_date(targets_csv: &str, date: &str) -> DietTargets {
 
 const BAR_WIDTH: usize = 20;
 
-/// A 20-char bar filled proportionally to `pct` (0–100+, clamped to 100 for fill),
-/// with a single color emoji per the metric's goal type. `filled` uses `⬜` for the
-/// empty remainder.
-fn bar(pct: f64, color: &str) -> String {
+/// Fat window edges (grams), mirroring the app's `DietSemantics`: hormonal floor,
+/// working cap. The 70g hard cap is a firmer line the wording notes but the bar
+/// doesn't need its own edge for.
+const FAT_FLOOR_G: f64 = 50.0;
+const FAT_CAP_G: f64 = 65.0;
+
+/// A 20-char progress bar filled proportionally to `pct` (0–100+, clamped to 100).
+/// Deliberately MONOCHROME — a single meaning, "how far along", carried by one fill
+/// glyph. The old pass/fail color emoji made one color mean three different things
+/// across rows (too-low on a floor, too-high on a ceiling, both on the fat window);
+/// the status now lives in the trailing words, so the bar can stay neutral.
+fn progress_bar(pct: f64) -> String {
     let filled = ((pct / 100.0) * BAR_WIDTH as f64)
         .round()
         .clamp(0.0, BAR_WIDTH as f64) as usize;
     let mut s = String::new();
     for _ in 0..filled {
-        s.push_str(color);
+        s.push('█');
     }
     for _ in 0..(BAR_WIDTH - filled) {
-        s.push('⬜');
+        s.push('░');
     }
     s
 }
 
-/// Color for a FLOOR metric (protein, carbs, fiber): red <50%, yellow 50–79%,
-/// green ≥80%.
-fn floor_color(pct: f64) -> &'static str {
-    if pct < 50.0 {
-        "🟥"
-    } else if pct < 80.0 {
-        "🟨"
+/// The kind status word for a FLOOR metric — action-first and never punitive, mirroring
+/// the app's `floorRemaining`. Reached: "there — nice"; short: "Xg to go".
+fn floor_word(intake: f64, target: f64) -> String {
+    if intake >= target {
+        "there — nice".to_string()
     } else {
-        "🟩"
+        format!("{}g to go", fmt_g((target - intake).round()))
     }
 }
 
-/// Color for the CALORIE ceiling: green 0–79%, yellow 80–100%, red >100%.
-fn ceiling_color(pct: f64) -> &'static str {
-    if pct <= 79.0 {
-        "🟩"
-    } else if pct <= 100.0 {
-        "🟨"
+/// The kind status word for the CALORIE ceiling, mirroring `ceilingRemaining`: headroom
+/// framed as room, not a limit — "room for X" / "right on target" / "X over".
+fn ceiling_word(intake: f64, target: f64) -> String {
+    if intake < target {
+        format!("room for {}", fmt_g((target - intake).round()))
+    } else if intake > target {
+        format!("{} over", fmt_g((intake - target).round()))
     } else {
-        "🟥"
+        "right on target".to_string()
     }
 }
 
-/// Color for the FAT window (50g floor, 65g soft cap, 70g hard): red too-low/too-high,
-/// yellow 65–70g, green 50–65g.
-fn fat_color(grams: f64) -> &'static str {
-    if !(50.0..=70.0).contains(&grams) {
-        "🟥"
-    } else if grams > 65.0 {
-        "🟨"
+/// The kind status word for the FAT window, mirroring `fatWindowRemaining`: direction in
+/// words, no "cap" language — "Xg to the 50g floor" / "in range" / "Xg above the range".
+fn fat_word(grams: f64) -> String {
+    if grams < FAT_FLOOR_G {
+        format!("{}g to the 50g floor", fmt_g((FAT_FLOOR_G - grams).round()))
+    } else if grams <= FAT_CAP_G {
+        "in range".to_string()
     } else {
-        "🟩"
+        format!("{}g above the range", fmt_g((grams - FAT_CAP_G).round()))
     }
 }
 
@@ -1018,25 +1025,77 @@ fn pct_of(intake: f64, target: f64) -> f64 {
     }
 }
 
-/// Render the deterministic ASCII dashboard for `date` from the day's totals and
-/// targets. When a target is present the metric renders a colored 20-char bar with
-/// its goal marker; when absent it renders the plain total. Calories round to whole
-/// numbers; macro grams render as their raw value. The child never writes this — it
-/// is derived here from the CSVs.
+/// The plain summary line that LEADS the dashboard — "how am I doing / what would help
+/// next" — the same supportive-coach opening the app's Health tab uses. Deterministic and
+/// gentle: it names the one or two floors most worth topping up, flags calories only when
+/// genuinely over, and otherwise says the day's on track. Empty string when there are no
+/// targets to judge against (the bars render as plain totals then).
+fn summary_line(totals: &MacroTotals, targets: &DietTargets) -> String {
+    // Genuinely-short floors (below 80% of target — the app's "basically there" cutoff),
+    // worst-first, named for the "what would help next" line.
+    let mut shorts: Vec<(&str, f64)> = Vec::new();
+    for (label, intake, target) in [
+        ("protein", totals.protein_g, targets.protein),
+        ("carbs", totals.carbs_g, targets.carbs),
+        ("fiber", totals.fiber_g, targets.fiber),
+    ] {
+        if let Some(t) = target {
+            if t > 0.0 && intake < 0.8 * t {
+                shorts.push((label, (t - intake) / t));
+            }
+        }
+    }
+    // Fat below its 50g floor is a floor-like concern too.
+    if targets.fat.is_some() && totals.fat_g < FAT_FLOOR_G {
+        shorts.push(("fat", (FAT_FLOOR_G - totals.fat_g) / FAT_FLOOR_G));
+    }
+    shorts.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+
+    let calories_over = matches!(targets.cal, Some(t) if t > 0.0 && totals.kcal > t);
+
+    if calories_over {
+        return "A little over on calories today — easy to ease back tomorrow.".to_string();
+    }
+    match shorts.len() {
+        0 if targets.cal.is_some() || targets.protein.is_some() => {
+            "You're on track — nicely balanced.".to_string()
+        }
+        0 => String::new(),
+        1 => format!("Coming together. A bit more {} rounds out the day.", shorts[0].0),
+        _ => format!(
+            "Coming together. Some {} and some {} rounds out the day.",
+            shorts[0].0, shorts[1].0
+        ),
+    }
+}
+
+/// Render the deterministic ASCII dashboard for `date` from the day's totals and targets.
+/// A plain-language summary leads; then one row per metric — its goal glyph for direction
+/// (≤ ceiling, ≥ floor, ↕ window), a neutral progress bar, the numbers, and a kind status
+/// word. Color no longer carries meaning (the words do), so the same green that meant
+/// "too low" on a floor and "too high" on a ceiling is gone. When a target is absent the
+/// metric renders its plain total. The child never writes this — it is derived from the
+/// CSVs, and it tells the same story as the app's Health tab.
 pub fn render_diet_dashboard(date: &str, totals: &MacroTotals, targets: &DietTargets) -> String {
     let mut out = format!("=== Diet — {date} ===\n\n");
+
+    let summary = summary_line(totals, targets);
+    if !summary.is_empty() {
+        out.push_str(&summary);
+        out.push_str("\n\n");
+    }
 
     // Calories — a ceiling metric (round to whole numbers, like the generator).
     match targets.cal {
         Some(t) => {
             let pct = pct_of(totals.kcal, t);
             out.push_str(&format!(
-                "Cal      ≤ {}   {} {} / {}  ({:.0}%)\n",
+                "Cal      ≤ {}   {}  {} / {}   {}\n",
                 t.round() as i64,
-                bar(pct, ceiling_color(pct)),
+                progress_bar(pct),
                 totals.kcal.round() as i64,
                 t.round() as i64,
-                pct
+                ceiling_word(totals.kcal, t),
             ));
         }
         None => out.push_str(&format!(
@@ -1055,28 +1114,28 @@ pub fn render_diet_dashboard(date: &str, totals: &MacroTotals, targets: &DietTar
             Some(t) => {
                 let pct = pct_of(intake, t);
                 out.push_str(&format!(
-                    "{label:<8} ≥ {}    {} {} / {}g  ({:.0}%)\n",
+                    "{label:<8} ≥ {}   {}  {} / {}g   {}\n",
                     fmt_g(t),
-                    bar(pct, floor_color(pct)),
+                    progress_bar(pct),
                     fmt_g(intake),
                     fmt_g(t),
-                    pct
+                    floor_word(intake, t),
                 ));
             }
             None => out.push_str(&format!("{label:<8}     {}g\n", fmt_g(intake))),
         }
     }
 
-    // Fat — a window metric (colors red when too LOW as well as too high).
+    // Fat — a window metric. Direction (too low vs too high) is in the words, never color.
     match targets.fat {
         Some(t) => {
             let pct = pct_of(totals.fat_g, t);
             out.push_str(&format!(
-                "Fat      ↕ 50–65 {} {} / {}g  ({:.0}%)\n",
-                bar(pct, fat_color(totals.fat_g)),
+                "Fat      ↕ 50–65 {}  {} / {}g   {}\n",
+                progress_bar(pct),
                 fmt_g(totals.fat_g),
                 fmt_g(t),
-                pct
+                fat_word(totals.fat_g),
             ));
         }
         None => out.push_str(&format!("Fat          {}g\n", fmt_g(totals.fat_g))),
@@ -3100,12 +3159,22 @@ mod tests {
             "cal intake / target: {dash}"
         );
         assert!(dash.contains("190"), "protein target shown");
-        // 315/2100 = 15% → calorie ceiling is comfortably green.
-        assert!(dash.contains("🟩"), "a green bar should appear");
-        // A floor metric well under 50% shows red.
+        // Words-first, single-meaning: a neutral progress bar, never pass/fail color emoji.
         assert!(
-            dash.contains("🟥"),
-            "protein 20/190 (11%) is a red floor bar"
+            dash.contains('█') && !dash.contains("🟩") && !dash.contains("🟥"),
+            "bars are monochrome, no color emoji: {dash}"
+        );
+        // Calories comfortably under the ceiling reads as room, not a grade.
+        assert!(dash.contains("room for"), "calorie headroom framed kindly: {dash}");
+        // Floors far short read as "to go" — kind and action-first, never "need X".
+        assert!(
+            dash.contains("to go") && !dash.contains("need "),
+            "floor shortfall is action-first: {dash}"
+        );
+        // A leading plain summary answers "how am I doing / what would help next".
+        assert!(
+            dash.contains("Coming together") || dash.contains("on track"),
+            "a plain summary leads the dashboard: {dash}"
         );
     }
 

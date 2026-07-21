@@ -45,7 +45,7 @@ struct MacrosCaloriesDetail: View {
     private var net: NetCalories { NetCalories(intake: totals.cal, burned: DietSemantics.burnedCalories(today.exercise)) }
     /// One micronutrient's gauge for the current day.
     private func microGauge(_ n: Micronutrient) -> MetricGauge {
-        DietSemantics.micronutrientGauge(n, meals: today.meals, targets: today.targets)
+        DietSemantics.micronutrientGauge(n, meals: today.meals, targets: today.targets, hour: hour)
     }
     /// Whether a nutrient carried at least one known value that day — the gate for
     /// surfacing a row (an all-unknown "not tracked yet" row is noise, not shown).
@@ -208,7 +208,7 @@ struct MacrosCaloriesDetail: View {
                 Text("\(DietSemantics.fmt(bonus.consumed)) / \(DietSemantics.fmt(bonus.pool))g")
                     .font(.caption.monospacedDigit()).foregroundStyle(.secondary)
             }
-            StatusMeter(fraction: bonus.fraction, status: .green, height: 5)
+            StatusMeter(fraction: bonus.fraction, tone: .onTrack, height: 5)
         }
         .padding(.leading, 24)
     }
@@ -610,7 +610,7 @@ struct ProgressPaceDetail: View {
                     Spacer()
                     Text("\(Int((frac * 100).rounded()))%").font(.caption.monospacedDigit()).foregroundStyle(.secondary)
                 }
-                StatusMeter(fraction: frac, status: .green, height: 8)
+                StatusMeter(fraction: frac, tone: .onTrack, height: 8)
                 if let label { Text(label).font(.caption).foregroundStyle(.secondary) }
             }
         } else if let label {

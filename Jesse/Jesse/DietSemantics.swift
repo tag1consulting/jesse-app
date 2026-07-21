@@ -21,12 +21,71 @@ enum DietSemantics {
     static let fatHardCap = 70.0
     /// Carb-load calorie window: the low edge as a fraction of target.
     static let carbLoadLowFraction = 0.92
-    /// The after-hour at/after which the nagging "low" flags surface.
+    /// The after-hour at/after which a still-unfinished floor turns from the neutral
+    /// "coming along" tone into a gentle "worth a nudge" — and the gated "low" flags
+    /// surface. Before this hour an unfilled floor is simply in progress, never a problem.
     static let nagHour = 16
+
+    /// How far over a ceiling (as a fraction of its target), late in the day, escalates
+    /// a nudge into the firmer "take note" tone — e.g. well over the calorie ceiling in
+    /// the evening. Deliberately gentle: this is a heads-up, never an alarm.
+    static let takeNoteOverFraction = 0.10
 
     /// A metric's status band. `suspended` = shown plain, no judgment (fiber on a
     /// carb-load day), and also the "no usable target" fallback.
+    ///
+    /// This is the raw band math (kept for the trend chart, which colors a single
+    /// nutrient over time where a band is unambiguous). The Health tab itself colors
+    /// from `Tone`, which means ONE thing on every row; see `tone(for:hour:)`.
     enum Status: Equatable, Sendable { case red, yellow, green, suspended }
+
+    /// The single display signal the Health tab colors from. Unlike `Status` — where red
+    /// means "too low" on a floor but "too high" on a ceiling — a `Tone` means the SAME
+    /// thing on every row, so a color can be read at a glance without decoding the row.
+    /// Direction (too low vs too high) is carried by the words and the goal glyph, never
+    /// the color.
+    ///
+    /// `onTrack` — you're in a good place (a floor reached, inside a window, comfortably
+    /// under a ceiling). `inProgress` — simply not finished yet, which is normal
+    /// (an unfilled floor early in the day), and also the no-judgment look (suspended
+    /// fiber, no usable target). `nudge` — one gentle, specific action would help
+    /// (a floor still low late in the day, over a ceiling, outside a window). `takeNote` —
+    /// genuinely worth attention (well over a ceiling late in the day, or a hard-cap
+    /// breach), delivered as a heads-up, not an alarm.
+    enum Tone: Equatable, Sendable { case onTrack, inProgress, nudge, takeNote }
+
+    /// Derive the one-meaning display `Tone` from a metric's deterministic goal outcome,
+    /// the hour, and (for a window's hard edge) whether a hard cap was breached. Pure and
+    /// unit-tested, so the color a row shows can never disagree with its words.
+    ///
+    /// - `.met` → `onTrack` (good, on every row).
+    /// - `.short` (below a floor / a window's low edge): `onTrack` when it's already
+    ///   basically there (`nearGoal` — the band reads good, e.g. a floor ≥ 80%); else
+    ///   `inProgress` before `nagHour` (unfinished early is normal), then `nudge` once the
+    ///   day is winding down.
+    /// - `.over` (past a ceiling / a window's high edge) → `nudge`, escalating to
+    ///   `takeNote` when a hard cap is breached, or when it's well over (≥
+    ///   `takeNoteOverFraction` of target) AND late in the day.
+    /// - `.noGoal` → `inProgress` (shown plain, no judgment).
+    static func tone(goalStatus: GoalStatus, hour: Int, target: Double?,
+                     nearGoal: Bool = false, hardOver: Bool = false) -> Tone {
+        switch goalStatus {
+        case .noGoal:
+            return .inProgress
+        case .met:
+            return .onTrack
+        case .short:
+            if nearGoal { return .onTrack }   // basically there — don't nag over the last bit
+            // Unfinished. Neutral while the day is young; a gentle nudge once it's late.
+            return hour >= nagHour ? .nudge : .inProgress
+        case .over(let by):
+            if hardOver { return .takeNote }
+            if hour >= nagHour, let target, target > 0, by >= target * takeNoteOverFraction {
+                return .takeNote
+            }
+            return .nudge
+        }
+    }
 
     /// How a metric is judged, for its glyph and explainer.
     enum Goal: Equatable, Sendable {
@@ -225,51 +284,57 @@ enum DietSemantics {
 
     // MARK: - Remaining annotations
 
-    /// floor: "need Xg more" / "target hit".
+    /// floor: "Xg to go" / "there — nice". Action-first and kind: what's left, not what's
+    /// missing. The tone (color) says whether that's a calm "coming along" or a gentle
+    /// evening nudge; these words just carry the amount and direction.
     static func floorRemaining(value: Double, target: Double, unit: String = "g") -> String {
         guard target > 0 else { return "" }
-        if value >= target { return "target hit" }
-        return "need \(fmt(target - value))\(unit) more"
+        if value >= target { return "there — nice" }
+        return "\(fmt(target - value))\(unit) to go"
     }
 
-    /// ceiling: "X left" / "at limit" / "X over limit".
+    /// ceiling: "room for X" / "right on target" / "X over". Frames headroom as room to
+    /// use, not a limit to fear; "over" without "limit"/"breach" — the tone carries how
+    /// much it matters.
     static func ceilingRemaining(value: Double, target: Double, unit: String = "") -> String {
         guard target > 0 else { return "" }
-        if value < target { return "\(fmt(target - value))\(unit) left" }
-        if value == target { return "at limit" }
-        return "\(fmt(value - target))\(unit) over limit"
+        if value < target { return "room for \(fmt(target - value))\(unit)" }
+        if value == target { return "right on target" }
+        return "\(fmt(value - target))\(unit) over"
     }
 
-    /// fat window: "need Xg to floor" / "Xg to cap" / "Xg over cap" (cap = 65g).
+    /// fat window: "Xg to the 50g floor" / "in range" / "Xg above the range" (working
+    /// range 50–65g). No "cap" language — inside the range simply reads "in range".
     static func fatWindowRemaining(grams: Double) -> String {
-        if grams < fatFloor { return "need \(fmt(fatFloor - grams))g to floor" }
-        if grams <= fatCap { return "\(fmt(fatCap - grams))g to cap" }
-        return "\(fmt(grams - fatCap))g over cap"
+        if grams < fatFloor { return "\(fmt(fatFloor - grams))g to the 50g floor" }
+        if grams <= fatCap { return "in range" }
+        return "\(fmt(grams - fatCap))g above the range"
     }
 
-    /// calorie window: "need X more" / "in window" / "X over". "need X more" is the
-    /// amount to reach the window's low edge (92%); "X over" the amount past target.
+    /// calorie window (carb-load day): "X more to go" / "in window" / "X over". "X more to
+    /// go" is the amount up to the window's low edge (92%) — under-fuelling a carb-load
+    /// wants MORE food, and the word says so; "X over" the amount past target.
     static func calorieWindowRemaining(value: Double, target: Double) -> String {
         guard target > 0 else { return "" }
         let low = target * carbLoadLowFraction
-        if value < low { return "need \(fmt(low - value)) more" }
+        if value < low { return "\(fmt(low - value)) more to go" }
         if value <= target { return "in window" }
         return "\(fmt(value - target)) over"
     }
 
     // MARK: - After-4pm gated flags
 
-    /// The protein "low" nag: only at/after 16:00, only under 25% of target.
-    /// Colors and over-cap flags are never gated — this is the one gated text.
+    /// The protein "low" heads-up: only at/after 16:00, only under 25% of target. A gentle,
+    /// action-first nudge (never gated colors — that's the tone's job).
     static func proteinLowFlag(protein: Double, target: Double?, hour: Int) -> String? {
         guard hour >= nagHour, let target, target > 0 else { return nil }
-        return protein / target * 100 < 25 ? "still under 25% of protein" : nil
+        return protein / target * 100 < 25 ? "some protein would help before the day's out" : nil
     }
 
-    /// The fat "low" nag: only at/after 16:00, only under the 50g hormonal floor.
+    /// The fat "low" heads-up: only at/after 16:00, only under the 50g hormonal floor.
     static func fatLowFlag(fat: Double, hour: Int) -> String? {
         guard hour >= nagHour else { return nil }
-        return fat < fatFloor ? "under the 50g fat floor" : nil
+        return fat < fatFloor ? "a little fat would help — you're under the 50g floor" : nil
     }
 
     // MARK: - Assembled gauges
@@ -286,56 +351,69 @@ enum DietSemantics {
         let calTarget = t.calories ?? 0
         let calories: MetricGauge
         if carbLoad {
+            let gs = calorieWindowGoalStatus(value: sum.cal, target: calTarget)
             calories = MetricGauge(
                 label: "Calories", goal: .window, value: sum.cal, target: t.calories,
                 status: calorieWindowStatus(value: sum.cal, target: calTarget),
                 remaining: calorieWindowRemaining(value: sum.cal, target: calTarget),
-                goalStatus: calorieWindowGoalStatus(value: sum.cal, target: calTarget),
+                goalStatus: gs, tone: tone(goalStatus: gs, hour: hour, target: t.calories),
                 flag: nil, unit: "", fraction: fraction(sum.cal, calTarget))
         } else {
+            let gs = ceilingGoalStatus(value: sum.cal, target: calTarget)
             calories = MetricGauge(
                 label: "Calories", goal: .ceiling, value: sum.cal, target: t.calories,
                 status: ceilingStatus(value: sum.cal, target: calTarget),
                 remaining: ceilingRemaining(value: sum.cal, target: calTarget),
-                goalStatus: ceilingGoalStatus(value: sum.cal, target: calTarget),
+                goalStatus: gs, tone: tone(goalStatus: gs, hour: hour, target: t.calories),
                 flag: nil, unit: "", fraction: fraction(sum.cal, calTarget))
         }
 
         // Protein: always a floor.
         let pTarget = t.protein ?? 0
+        let pGoal = floorGoalStatus(value: sum.p, target: pTarget)
+        let pStatus = floorStatus(value: sum.p, target: pTarget)
         let protein = MetricGauge(
             label: Macro.protein.displayName, goal: .floor, value: sum.p, target: t.protein,
-            status: floorStatus(value: sum.p, target: pTarget),
+            status: pStatus,
             remaining: floorRemaining(value: sum.p, target: pTarget),
-            goalStatus: floorGoalStatus(value: sum.p, target: pTarget),
+            goalStatus: pGoal,
+            tone: tone(goalStatus: pGoal, hour: hour, target: t.protein, nearGoal: pStatus == .green),
             flag: proteinLowFlag(protein: sum.p, target: t.protein, hour: hour),
             unit: "g", fraction: fraction(sum.p, pTarget))
 
         // Carbs: floor vs carbsBase (falling back to carbs).
         let cTarget = t.carbsBase ?? t.carbs ?? 0
+        let cGoal = floorGoalStatus(value: sum.c, target: cTarget)
+        let cStatus = floorStatus(value: sum.c, target: cTarget)
         let carbs = MetricGauge(
             label: Macro.carbs.displayName, goal: .floor, value: sum.c, target: (t.carbsBase ?? t.carbs),
-            status: floorStatus(value: sum.c, target: cTarget),
+            status: cStatus,
             remaining: floorRemaining(value: sum.c, target: cTarget),
-            goalStatus: floorGoalStatus(value: sum.c, target: cTarget),
+            goalStatus: cGoal,
+            tone: tone(goalStatus: cGoal, hour: hour, target: (t.carbsBase ?? t.carbs), nearGoal: cStatus == .green),
             flag: nil, unit: "g", fraction: fraction(sum.c, cTarget))
 
         // Fat: window on a normal day, minimize-it ceiling on a carb-load day.
         let fat: MetricGauge
         if carbLoad {
             let fTarget = t.fat ?? 0
+            let fGoal = ceilingGoalStatus(value: sum.f, target: fTarget)
             fat = MetricGauge(
                 label: Macro.fat.displayName, goal: .ceiling, value: sum.f, target: t.fat,
                 status: ceilingStatus(value: sum.f, target: fTarget),
                 remaining: ceilingRemaining(value: sum.f, target: fTarget, unit: "g"),
-                goalStatus: ceilingGoalStatus(value: sum.f, target: fTarget),
+                goalStatus: fGoal, tone: tone(goalStatus: fGoal, hour: hour, target: t.fat),
                 flag: nil, unit: "g", fraction: fraction(sum.f, fTarget))
         } else {
+            let fGoal = fatWindowGoalStatus(grams: sum.f)
+            // The 70g hard cap is the firmer line: a breach reads "take note", not a nudge.
+            let fatHardOver = sum.f > fatHardCap
             fat = MetricGauge(
                 label: Macro.fat.displayName, goal: .window, value: sum.f, target: fatCap,
                 status: fatWindowStatus(grams: sum.f),
                 remaining: fatWindowRemaining(grams: sum.f),
-                goalStatus: fatWindowGoalStatus(grams: sum.f),
+                goalStatus: fGoal,
+                tone: tone(goalStatus: fGoal, hour: hour, target: fatCap, hardOver: fatHardOver),
                 flag: fatLowFlag(fat: sum.f, hour: hour),
                 unit: "g", fraction: fraction(sum.f, fatCap))
         }
@@ -346,15 +424,18 @@ enum DietSemantics {
         if carbLoad {
             fiber = MetricGauge(
                 label: Macro.fiber.displayName, goal: .floor, value: sum.fiber, target: fiberTarget,
-                status: .suspended, remaining: "suspended (carb-load)",
-                goalStatus: .noGoal,
+                status: .suspended, remaining: "resting today (carb-load)",
+                goalStatus: .noGoal, tone: .inProgress,
                 flag: nil, unit: "g", fraction: fraction(sum.fiber, fiberTarget))
         } else {
+            let fbGoal = floorGoalStatus(value: sum.fiber, target: fiberTarget)
+            let fbStatus = floorStatus(value: sum.fiber, target: fiberTarget)
             fiber = MetricGauge(
                 label: Macro.fiber.displayName, goal: .floor, value: sum.fiber, target: fiberTarget,
-                status: floorStatus(value: sum.fiber, target: fiberTarget),
+                status: fbStatus,
                 remaining: floorRemaining(value: sum.fiber, target: fiberTarget),
-                goalStatus: floorGoalStatus(value: sum.fiber, target: fiberTarget),
+                goalStatus: fbGoal,
+                tone: tone(goalStatus: fbGoal, hour: hour, target: fiberTarget, nearGoal: fbStatus == .green),
                 flag: nil, unit: "g", fraction: fraction(sum.fiber, fiberTarget))
         }
 
@@ -382,12 +463,15 @@ enum DietSemantics {
     /// magnesium, and omega-3 are floors; total sugars and unsaturated fat are
     /// informational (never judged); an absent target shows the value only, with no
     /// judgment.
-    static func micronutrientGauges(for today: DietToday) -> [MetricGauge] {
-        Micronutrient.allCases.map { micronutrientGauge($0, meals: today.meals, targets: today.targets) }
+    static func micronutrientGauges(for today: DietToday, hour: Int = 12) -> [MetricGauge] {
+        Micronutrient.allCases.map { micronutrientGauge($0, meals: today.meals, targets: today.targets, hour: hour) }
     }
 
-    /// Build one micronutrient gauge from the day's items and targets.
-    static func micronutrientGauge(_ n: Micronutrient, meals: [DietMeal], targets: DietTargets) -> MetricGauge {
+    /// Build one micronutrient gauge from the day's items and targets. `hour` feeds the
+    /// display tone the same way the macro gauges use it (a floor short before `nagHour`
+    /// reads neutral, not as a problem).
+    static func micronutrientGauge(_ n: Micronutrient, meals: [DietMeal], targets: DietTargets,
+                                   hour: Int = 12) -> MetricGauge {
         let agg = micronutrientTotal(for: meals, n.value(in:))
         let value = agg.knownSum
         let target = n.target(in: targets)
@@ -434,6 +518,7 @@ enum DietSemantics {
         case .window:
             break // not used by any micronutrient
         }
+        g.tone = tone(goalStatus: g.goalStatus, hour: hour, target: target, nearGoal: g.status == .green)
         return g
     }
 
@@ -867,6 +952,10 @@ struct MetricGauge: Equatable, Sendable {
     /// alongside `remaining` so the insight is fed a ground-truth status instead of
     /// guessing one. Defaults to `.noGoal` so a gauge built without it makes no claim.
     var goalStatus: DietSemantics.GoalStatus = .noGoal
+    /// The one-meaning display tone the Health tab colors from (see `DietSemantics.Tone`).
+    /// Defaults to `.inProgress` (neutral) so a gauge built without it never invents a
+    /// judgment; the engine sets it from `goalStatus` + the hour for every real gauge.
+    var tone: DietSemantics.Tone = .inProgress
     /// The gated "low" nag (protein/fat), surfaced only at/after 16:00. Nil otherwise.
     var flag: String?
     var unit: String
