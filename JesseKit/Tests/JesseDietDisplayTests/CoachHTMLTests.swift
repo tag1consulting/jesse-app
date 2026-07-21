@@ -1,5 +1,6 @@
 import XCTest
-@testable import Jesse
+@testable import JesseDietDisplay
+import JesseNetworking
 
 // The coach-notes HTML formatter: only <strong> becomes bold, the known entities
 // decode, every other tag is stripped, and unknown markup passes through without

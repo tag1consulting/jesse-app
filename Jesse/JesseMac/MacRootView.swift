@@ -15,6 +15,25 @@ import JesseSearch
 // the same code the iPhone uses. A scope control (all vs favorites) flips between the
 // full date-sectioned layout and the flat favorites list, and each row can be starred.
 
+// The window's top-level shell: a two-tab split between the existing Chats experience
+// (the NavigationSplitView, with all its selection / ⌘N / ⌘R / ⌘, / favorites / archive /
+// search behavior unchanged) and the new bridge-fed Health tab. Only this tab chrome is
+// Mac-specific; each tab's content is otherwise exactly what it was.
+struct MacShellView: View {
+    @Environment(MacCoordinator.self) private var coordinator
+    /// Store-open failure banner, threaded down to the Chats tab.
+    var storeError: Error?
+
+    var body: some View {
+        TabView {
+            MacRootView(storeError: storeError)
+                .tabItem { Label("Chats", systemImage: "bubble.left.and.bubble.right") }
+            MacHealthView(configStore: coordinator.configStore)
+                .tabItem { Label("Health", systemImage: "heart.text.square") }
+        }
+    }
+}
+
 struct MacRootView: View {
     @Environment(\.modelContext) private var context
     @Environment(MacCoordinator.self) private var coordinator

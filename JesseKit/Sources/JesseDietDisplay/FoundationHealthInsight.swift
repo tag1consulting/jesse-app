@@ -1,5 +1,6 @@
 import Foundation
 import FoundationModels
+import os
 
 // The on-device health-insight generator — the ONLY file in the app besides the
 // query expander and the health classifier that imports FoundationModels. Every
@@ -14,6 +15,10 @@ import FoundationModels
 // for ANY reason (device ineligible, Apple Intelligence off, model not downloaded) or
 // when a call errors. Nothing leaves the device; `SystemLanguageModel` runs entirely
 // on-device.
+
+/// Package-local logger (the app's shared `Log` type stayed in the iOS target). A
+/// failed insight is swallowed to an empty stream; this only records it for debugging.
+private let insightLog = Logger(subsystem: "com.tag1.JesseDietDisplay", category: "health")
 
 @MainActor
 final class FoundationHealthInsight: HealthInsightGenerating {
@@ -61,7 +66,7 @@ final class FoundationHealthInsight: HealthInsightGenerating {
                 } catch {
                     // Timeouts, guardrail rejections, decode failures — all swallowed;
                     // the facts stand alone with no error surfaced.
-                    Log.health.error("health insight failed: \(error.localizedDescription)")
+                    insightLog.error("health insight failed: \(error.localizedDescription)")
                     continuation.finish()
                 }
             }

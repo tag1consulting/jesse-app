@@ -15,6 +15,36 @@ CI both run it). See the "Versioning" section of `bridge/README.md`.
 
 ## [Unreleased]
 
+## [App 1.0 (66)] - 2026-07-21
+
+### Added
+- **The Mac gains a Health tab, showing the same diet and health dashboard the
+  iPhone shows, fed by the bridge with no HealthKit dependency.** The macOS window
+  is now a two-tab shell (Chats, unchanged, and Health); the Health tab renders
+  today, day-history paging (back / forward / today), macro and micronutrient
+  totals, trends, rings, and the on-device insight, all from `GET /jesse/diet`
+  through the Mac's own `JesseBridgeClient` built from the same host and token the
+  Chats side already uses. HealthKit stays an iPhone-only concern (per-turn context
+  enrichment and writing meals back to Apple Health); the dashboard never needs it,
+  so the Mac links none of it. A failed refresh never blanks a loaded screen, and an
+  un-updated bridge still shows today with a "bridge update needed" note, exactly as
+  on the iPhone.
+
+### Changed
+- **The diet and health dashboard display layer was extracted out of the iOS app
+  into a new shared `JesseDietDisplay` library in JesseKit, so iOS and macOS render
+  the Health tab from one source.** The pure semantics (`DietSemantics`), the paging
+  and history helpers, the `@MainActor` view model (`HealthDashboardModel`, which now
+  fetches through a narrow `DietSnapshotProviding` seam so each platform injects its
+  own client), and the Swift Charts based dashboard views all moved into the package
+  with zero behavior change on iOS. The iOS-only files that touch HealthKit (per-turn
+  context provider, meal writer) and the send-path relevance classifier stayed in the
+  iOS target and are unchanged. The one on-device insight (FoundationModels) moved too
+  behind its total `HealthInsightGenerating` seam and still degrades to nothing when
+  the model is unavailable, on both platforms. The pure decoding, semantics, view-model
+  state-machine, and history tests moved into the fast package test suite; the iOS
+  Health tab behavior, its HealthKit enrichment, and its meal writing are all unchanged.
+
 ## [App 1.0 (65)] - 2026-07-21
 
 ### Changed

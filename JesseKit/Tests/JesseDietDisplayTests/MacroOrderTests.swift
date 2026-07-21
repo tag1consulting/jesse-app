@@ -1,5 +1,6 @@
 import XCTest
-@testable import Jesse
+@testable import JesseDietDisplay
+import JesseNetworking
 
 // The order-consuming surfaces derive their macro order from the canonical
 // `Macro.allCases`, not from hand-written rows. These lock the two seams the rings

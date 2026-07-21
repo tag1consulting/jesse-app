@@ -1,4 +1,5 @@
 import Foundation
+import JesseNetworking
 
 // The per-nutrient trend engine, as pure Foundation-only logic — no SwiftUI, no
 // `Date()` read, every rule deterministically testable. It sits beside `DietSemantics`
@@ -373,7 +374,7 @@ struct NutrientTrend: Equatable, Sendable {
 
 // MARK: - Engine
 
-enum NutrientTrends {
+public enum NutrientTrends {
     /// The minimum known-day count before a direction may be asserted or a standing
     /// problem called — below it, "not enough data".
     static let minKnownForDirection = 6
@@ -396,7 +397,7 @@ enum NutrientTrends {
 
     /// Whether the trend affordance should show at all: the field is present and carries at
     /// least one day. On an older bridge (absent/empty) the affordance hides — no crash.
-    static func isAvailable(_ series: [NutrientDay]?) -> Bool {
+    public static func isAvailable(_ series: [NutrientDay]?) -> Bool {
         (series?.isEmpty == false)
     }
 
@@ -683,7 +684,7 @@ enum NutrientTrends {
     /// HealthKit block inside the bridge's `MAX_HEALTH_CONTEXT_BYTES` (8 KiB) cap; the
     /// HealthKit block self-limits to 3 KiB, so 2.5 KiB here keeps the combined context
     /// well under the hard cap with headroom.
-    static let coachRollupBudget = 2560
+    public static let coachRollupBudget = 2560
 
     private static func windowLabel(_ days: Int?) -> String { days.map { "\($0)d" } ?? "all" }
 
@@ -758,9 +759,9 @@ enum NutrientTrends {
     /// nutrients first, and states that it was truncated. `meals` is the per-day food
     /// detail the app has (typically the loaded day) used for the top-sources lines;
     /// unknown items never appear as a source. Returns "" when the series is empty.
-    static func coachRollup(series: [NutrientDay], targets: DietTargets,
-                            meals: [DietMeal], ownerName: String = "the user",
-                            budgetBytes: Int = coachRollupBudget) -> String {
+    public static func coachRollup(series: [NutrientDay], targets: DietTargets,
+                                   meals: [DietMeal], ownerName: String = "the user",
+                                   budgetBytes: Int = coachRollupBudget) -> String {
         guard isAvailable(series) else { return "" }
 
         // Primary-window analysis per nutrient, for standing-problem detection + ranking.

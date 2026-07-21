@@ -146,7 +146,7 @@ struct NutrientTrendDetail: View {
             summarySection
         }
         .navigationTitle(nutrient.fullName)
-        .navigationBarTitleDisplayMode(.inline)
+        .dietNavTitle(.inline)
     }
 
     // MARK: - Summary band
@@ -246,7 +246,7 @@ struct NutrientTrendDetail: View {
                 PointMark(x: .value("Date", p.date), y: .value(nutrient.fullName, p.value))
                     .foregroundStyle(markColor(p)).symbolSize(70)
                 PointMark(x: .value("Date", p.date), y: .value(nutrient.fullName, p.value))
-                    .foregroundStyle(Color(.systemBackground)).symbolSize(26)
+                    .foregroundStyle(Color.dietBackground).symbolSize(26)
             }
             // The target rule, when the snapshot carries one — labeled by kind.
             if let target = trend.target {

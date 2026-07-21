@@ -102,6 +102,12 @@ struct FoodFact: Equatable, Sendable {
 // Under the project's MainActor-default isolation this protocol (and its conformers)
 // are main-actor-isolated; `insight` returns synchronously and does its work in a
 // detached stream task, so it never blocks the caller and the facts never wait on it.
+// @MainActor because the one live conformer (`FoundationHealthInsight`) owns a
+// @MainActor on-device model session, and every consumer is a SwiftUI view already on
+// the main actor. Isolating the seam itself keeps the conformance from crossing an actor
+// boundary under the package's nonisolated default (the iOS app previously got this for
+// free from its MainActor-default isolation).
+@MainActor
 protocol HealthInsightGenerating {
     /// A short, grounded insight about the metric, streamed as cumulative snapshots
     /// (each element is the full text so far). Yields an empty stream — no elements,

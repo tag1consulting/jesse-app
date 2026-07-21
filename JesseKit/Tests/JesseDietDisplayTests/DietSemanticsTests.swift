@@ -1,5 +1,6 @@
 import XCTest
-@testable import Jesse
+@testable import JesseDietDisplay
+import JesseNetworking
 
 // The diet semantics engine is the heart of the Health tab, so every rule has a
 // direct test — the status bands and their boundaries, the remaining wording, the

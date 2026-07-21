@@ -1,5 +1,6 @@
 import XCTest
-@testable import Jesse
+@testable import JesseDietDisplay
+import JesseNetworking
 
 // Labeled weight goals: the legacy-fallback synthesis, the achieved/past-date
 // states, the countdown selection and phrasing, `short`→`title` fallback, date

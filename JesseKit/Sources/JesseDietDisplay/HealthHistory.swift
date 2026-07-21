@@ -1,4 +1,5 @@
 import Foundation
+import JesseNetworking
 
 // Pure, Foundation-only logic for paging the Health tab back through earlier days
 // (bridge ≥ 0.7.0). NOTHING here touches SwiftUI. Three concerns, each unit-tested:
@@ -80,7 +81,7 @@ enum NeutralMode {
 
 /// Which rendering mode a day uses, and which chrome a past day hides. All pure so
 /// the visibility rules are unit-tested, never a scattered view guess.
-enum HistoryUI {
+public enum HistoryUI {
     enum Mode: Equatable, Sendable { case full, neutral }
 
     /// A reconstructed day renders neutral (no judgment); live/archived render full.
@@ -97,7 +98,7 @@ enum HistoryUI {
     static func showsCurrentStateRows(isHistorical: Bool) -> Bool { !isHistorical }
 
     /// Quick log ("+") is hidden on a past day — the logging path only logs today.
-    static func showsQuickLog(isHistorical: Bool) -> Bool { !isHistorical }
+    public static func showsQuickLog(isHistorical: Bool) -> Bool { !isHistorical }
 
     /// The footer line under the day: the "Updated HH:MM" mtime stamp for today, or
     /// a fidelity label ("Archived day" / "Rebuilt from logs") for a past day.

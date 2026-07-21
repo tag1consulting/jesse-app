@@ -1,5 +1,6 @@
 import XCTest
-@testable import Jesse
+@testable import JesseDietDisplay
+import JesseNetworking
 
 // The drill-down share export is a pure plain-text rendition of the whole page — the
 // guaranteed carrier of everything (header, sorted foods with amounts/contributions,

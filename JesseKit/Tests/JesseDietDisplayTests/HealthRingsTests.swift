@@ -1,5 +1,6 @@
 import XCTest
-@testable import Jesse
+@testable import JesseDietDisplay
+import JesseNetworking
 
 // The redesigned Today screen's pure presentation logic: ring fill + clamping per
 // metric type (including the carb-load flips and fiber suspension → neutral), the

@@ -1,5 +1,6 @@
 import XCTest
-@testable import Jesse
+@testable import JesseDietDisplay
+import JesseNetworking
 
 // The pure trend engine + single-source nutrient model. Every rule is unknown-aware: a
 // GAP day (nutrient key absent) is never a 0, never a day under a floor/over a ceiling,

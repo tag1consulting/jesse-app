@@ -1,6 +1,6 @@
 import XCTest
-@testable import Jesse
-import JesseCore
+@testable import JesseDietDisplay
+import JesseNetworking
 
 // The Health tab view model: a successful load surfaces `.content`; each fetch
 // error before the first success surfaces the matching `.empty` state; and a
@@ -13,7 +13,7 @@ final class HealthDashboardModelTests: XCTestCase {
     /// A fake whose `fetchDietSnapshot` returns scripted results in order (the last
     /// repeats). Only the diet method is exercised; the rest are unreachable.
     @MainActor
-    private final class DietFakeClient: JesseClientProtocol {
+    private final class DietFakeClient: DietSnapshotProviding {
         enum Outcome { case snapshot(DietSnapshot); case error(DietFetchError) }
         private var outcomes: [Outcome]
         private(set) var fetchCount = 0
@@ -26,17 +26,6 @@ final class HealthDashboardModelTests: XCTestCase {
             case .snapshot(let s): return s
             case .error(let e): throw e
             }
-        }
-        // Unused by these tests.
-        func send(mode: JesseMode, text: String, sessionId: String?, voice: Bool,
-                  instructions: String?, floorOverride: String?,
-                  attachments: [JesseAttachment]) async throws -> JesseSendResult {
-            .running(jobId: "x")
-        }
-        func result(jobId: String) async throws -> JesseResultState { .running }
-        func cancelJob(jobId: String) async throws {}
-        func stream(jobId: String) -> AsyncThrowingStream<JesseStreamEvent, Error> {
-            AsyncThrowingStream { $0.finish() }
         }
     }
 
@@ -112,7 +101,7 @@ final class HealthDashboardModelTests: XCTestCase {
     /// A fake that serves a distinct snapshot per requested date and records the
     /// dates it was asked for (nil → the live today snapshot).
     @MainActor
-    private final class PagingFakeClient: JesseClientProtocol {
+    private final class PagingFakeClient: DietSnapshotProviding {
         let today: String
         let available: [String]
         private(set) var requested: [String?] = []
@@ -138,14 +127,6 @@ final class HealthDashboardModelTests: XCTestCase {
         }
         private var availableJSON: String {
             "[" + available.map { "\"\($0)\"" }.joined(separator: ", ") + "]"
-        }
-        func send(mode: JesseMode, text: String, sessionId: String?, voice: Bool,
-                  instructions: String?, floorOverride: String?,
-                  attachments: [JesseAttachment]) async throws -> JesseSendResult { .running(jobId: "x") }
-        func result(jobId: String) async throws -> JesseResultState { .running }
-        func cancelJob(jobId: String) async throws {}
-        func stream(jobId: String) -> AsyncThrowingStream<JesseStreamEvent, Error> {
-            AsyncThrowingStream { $0.finish() }
         }
     }
 
