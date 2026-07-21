@@ -15,6 +15,22 @@ CI both run it). See the "Versioning" section of `bridge/README.md`.
 
 ## [Unreleased]
 
+## [App 1.0 (65)] - 2026-07-21
+
+### Changed
+- **Document the MainActor-isolated-deinit gotcha in code so it can't silently
+  regress.** In `JesseSearch` (built with `.defaultIsolation(MainActor.self)`), a
+  class's synthesized deinit is MainActor-isolated, so releasing an instance off the
+  main actor (a unit-test host tears objects down off-actor) routes through the
+  isolated-deinit executor hop and aborts. `ThreadSearchModel` already carried the
+  `nonisolated deinit` fix; `FoundationModelExpander` now carries it too (verified:
+  with it, a real expander can be constructed and destroyed in the test host without
+  aborting), and the rule is spelled out on the `JesseSearch` target in
+  `Package.swift`. The Mac view model keeps its inert `NoExpansion` default and the
+  Mac view injects `FoundationModelExpander()` explicitly, with comments at both
+  sites explaining that the real on-device model must stay out of test-reachable
+  defaults. Comments only plus the one added deinit; no behavior change.
+
 ## [App 1.0 (64)] - 2026-07-21
 
 ### Added
