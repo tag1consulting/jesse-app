@@ -44,6 +44,13 @@
 			remoteGlobalIDString = B0D06D00000000000000D014;
 			remoteInfo = JesseWidgetsExtension;
 		};
+		B0D070000000000000007041 /* PBXContainerItemProxy */ = {
+			isa = PBXContainerItemProxy;
+			containerPortal = B0D0680D2FE83E3F00C8C4B0 /* Project object */;
+			proxyType = 1;
+			remoteGlobalIDString = B0D06E00000000000000E014;
+			remoteInfo = "Jesse Mac";
+		};
 /* End PBXContainerItemProxy section */
 
 /* Begin PBXCopyFilesBuildPhase section */
@@ -81,6 +88,8 @@
 		B0D06D00000000000000D102 /* JesseTurnLiveActivity.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = JesseTurnLiveActivity.swift; sourceTree = "<group>"; };
 		B0D06D00000000000000D103 /* JesseTurnActivityAttributes.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = JesseTurnActivityAttributes.swift; sourceTree = "<group>"; };
 		B0D06D00000000000000D104 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
+		B0D06E00000000000000E015 /* Jesse Mac.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = "Jesse Mac.app"; sourceTree = BUILT_PRODUCTS_DIR; };
+		B0D070000000000000007015 /* Jesse MacTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = "Jesse MacTests.xctest"; sourceTree = BUILT_PRODUCTS_DIR; };
 /* End PBXFileReference section */
 
 /* Begin PBXFileSystemSynchronizedBuildFileExceptionSet section */
@@ -97,6 +106,13 @@
 				Info.plist,
 			);
 			target = B0D06A00000000000000A014 /* Jesse Watch App */;
+		};
+		B0D06E00000000000000E02A /* Exceptions for "JesseMac" folder in "Jesse Mac" target */ = {
+			isa = PBXFileSystemSynchronizedBuildFileExceptionSet;
+			membershipExceptions = (
+				Info.plist,
+			);
+			target = B0D06E00000000000000E014 /* Jesse Mac */;
 		};
 /* End PBXFileSystemSynchronizedBuildFileExceptionSet section */
 
@@ -130,6 +146,24 @@
 		B0D06C00000000000000C009 /* JesseShared */ = {
 			isa = PBXFileSystemSynchronizedRootGroup;
 			path = JesseShared;
+			sourceTree = "<group>";
+		};
+		B0D06E00000000000000E017 /* JesseMac */ = {
+			isa = PBXFileSystemSynchronizedRootGroup;
+			exceptions = (
+				B0D06E00000000000000E02A /* Exceptions for "JesseMac" folder in "Jesse Mac" target */,
+			);
+			path = JesseMac;
+			sourceTree = "<group>";
+		};
+		B0D06F00000000000000F009 /* JesseCore */ = {
+			isa = PBXFileSystemSynchronizedRootGroup;
+			path = JesseCore;
+			sourceTree = "<group>";
+		};
+		B0D070000000000000007017 /* JesseMacTests */ = {
+			isa = PBXFileSystemSynchronizedRootGroup;
+			path = JesseMacTests;
 			sourceTree = "<group>";
 		};
 /* End PBXFileSystemSynchronizedRootGroup section */
@@ -170,6 +204,20 @@
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
+		B0D06E00000000000000E012 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		B0D070000000000000007012 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
 /* End PBXFrameworksBuildPhase section */
 
 /* Begin PBXGroup section */
@@ -178,6 +226,9 @@
 			children = (
 				B0D068172FE83E3F00C8C4B0 /* Jesse */,
 				B0D06C00000000000000C009 /* JesseShared */,
+				B0D06F00000000000000F009 /* JesseCore */,
+				B0D06E00000000000000E017 /* JesseMac */,
+				B0D070000000000000007017 /* JesseMacTests */,
 				B0D06D00000000000000D009 /* JesseWidgets */,
 				B0D069000000000000000009 /* JesseTests */,
 				B0D06A00000000000000A017 /* JesseWatch */,
@@ -194,6 +245,8 @@
 				B0D06A00000000000000A015 /* Jesse Watch App.app */,
 				B0D06B00000000000000B015 /* Jesse Watch AppTests.xctest */,
 				B0D06D00000000000000D015 /* JesseWidgetsExtension.appex */,
+				B0D06E00000000000000E015 /* Jesse Mac.app */,
+				B0D070000000000000007015 /* Jesse MacTests.xctest */,
 			);
 			name = Products;
 			sourceTree = "<group>";
@@ -231,6 +284,7 @@
 			fileSystemSynchronizedGroups = (
 				B0D068172FE83E3F00C8C4B0 /* Jesse */,
 				B0D06C00000000000000C009 /* JesseShared */,
+				B0D06F00000000000000F009 /* JesseCore */,
 			);
 			name = Jesse;
 			packageProductDependencies = (
@@ -327,6 +381,52 @@
 			productReference = B0D06D00000000000000D015 /* JesseWidgetsExtension.appex */;
 			productType = "com.apple.product-type.app-extension";
 		};
+		B0D06E00000000000000E014 /* Jesse Mac */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = B0D06E00000000000000E020 /* Build configuration list for PBXNativeTarget "Jesse Mac" */;
+			buildPhases = (
+				B0D06E00000000000000E011 /* Sources */,
+				B0D06E00000000000000E012 /* Frameworks */,
+				B0D06E00000000000000E013 /* Resources */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+			);
+			fileSystemSynchronizedGroups = (
+				B0D06E00000000000000E017 /* JesseMac */,
+				B0D06F00000000000000F009 /* JesseCore */,
+			);
+			name = "Jesse Mac";
+			packageProductDependencies = (
+			);
+			productName = "Jesse Mac";
+			productReference = B0D06E00000000000000E015 /* Jesse Mac.app */;
+			productType = "com.apple.product-type.application";
+		};
+		B0D070000000000000007014 /* Jesse MacTests */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = B0D070000000000000007020 /* Build configuration list for PBXNativeTarget "Jesse MacTests" */;
+			buildPhases = (
+				B0D070000000000000007011 /* Sources */,
+				B0D070000000000000007012 /* Frameworks */,
+				B0D070000000000000007013 /* Resources */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+				B0D070000000000000007040 /* PBXTargetDependency */,
+			);
+			fileSystemSynchronizedGroups = (
+				B0D070000000000000007017 /* JesseMacTests */,
+			);
+			name = "Jesse MacTests";
+			packageProductDependencies = (
+			);
+			productName = "Jesse MacTests";
+			productReference = B0D070000000000000007015 /* Jesse MacTests.xctest */;
+			productType = "com.apple.product-type.bundle.unit-test";
+		};
 /* End PBXNativeTarget section */
 
 /* Begin PBXProject section */
@@ -355,6 +455,13 @@
 					B0D06D00000000000000D014 = {
 						CreatedOnToolsVersion = 26.5;
 					};
+					B0D06E00000000000000E014 = {
+						CreatedOnToolsVersion = 26.5;
+					};
+					B0D070000000000000007014 = {
+						CreatedOnToolsVersion = 26.5;
+						TestTargetID = B0D06E00000000000000E014;
+					};
 				};
 			};
 			buildConfigurationList = B0D068102FE83E3F00C8C4B0 /* Build configuration list for PBXProject "Jesse" */;
@@ -376,6 +483,8 @@
 				B0D06A00000000000000A014 /* Jesse Watch App */,
 				B0D06B00000000000000B014 /* Jesse Watch AppTests */,
 				B0D06D00000000000000D014 /* JesseWidgetsExtension */,
+				B0D06E00000000000000E014 /* Jesse Mac */,
+				B0D070000000000000007014 /* Jesse MacTests */,
 			);
 		};
 /* End PBXProject section */
@@ -410,6 +519,20 @@
 			runOnlyForDeploymentPostprocessing = 0;
 		};
 		B0D06D00000000000000D013 /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		B0D06E00000000000000E013 /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		B0D070000000000000007013 /* Resources */ = {
 			isa = PBXResourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
@@ -458,6 +581,20 @@
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
+		B0D06E00000000000000E011 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		B0D070000000000000007011 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
 /* End PBXSourcesBuildPhase section */
 
 /* Begin PBXTargetDependency section */
@@ -480,6 +617,11 @@
 			isa = PBXTargetDependency;
 			target = B0D06D00000000000000D014 /* JesseWidgetsExtension */;
 			targetProxy = B0D06D00000000000000D041 /* PBXContainerItemProxy */;
+		};
+		B0D070000000000000007040 /* PBXTargetDependency */ = {
+			isa = PBXTargetDependency;
+			target = B0D06E00000000000000E014 /* Jesse Mac */;
+			targetProxy = B0D070000000000000007041 /* PBXContainerItemProxy */;
 		};
 /* End PBXTargetDependency section */
 
@@ -615,7 +757,7 @@
 				CLANG_ENABLE_MODULES = YES;
 				CODE_SIGN_ENTITLEMENTS = Jesse/Jesse.entitlements;
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 58;
+				CURRENT_PROJECT_VERSION = 59;
 				DEVELOPMENT_TEAM = C6RPS3BGXX;
 				ENABLE_PREVIEWS = YES;
 				GENERATE_INFOPLIST_FILE = YES;
@@ -651,7 +793,7 @@
 				CLANG_ENABLE_MODULES = YES;
 				CODE_SIGN_ENTITLEMENTS = Jesse/Jesse.entitlements;
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 58;
+				CURRENT_PROJECT_VERSION = 59;
 				DEVELOPMENT_TEAM = C6RPS3BGXX;
 				ENABLE_PREVIEWS = YES;
 				GENERATE_INFOPLIST_FILE = YES;
@@ -683,7 +825,7 @@
 			buildSettings = {
 				BUNDLE_LOADER = "$(TEST_HOST)";
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 58;
+				CURRENT_PROJECT_VERSION = 59;
 				DEVELOPMENT_TEAM = C6RPS3BGXX;
 				GENERATE_INFOPLIST_FILE = YES;
 				IPHONEOS_DEPLOYMENT_TARGET = 26.5;
@@ -702,7 +844,7 @@
 			buildSettings = {
 				BUNDLE_LOADER = "$(TEST_HOST)";
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 58;
+				CURRENT_PROJECT_VERSION = 59;
 				DEVELOPMENT_TEAM = C6RPS3BGXX;
 				GENERATE_INFOPLIST_FILE = YES;
 				IPHONEOS_DEPLOYMENT_TARGET = 26.5;
@@ -723,7 +865,7 @@
 				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
 				CLANG_ENABLE_MODULES = YES;
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 58;
+				CURRENT_PROJECT_VERSION = 59;
 				DEVELOPMENT_TEAM = C6RPS3BGXX;
 				ENABLE_PREVIEWS = YES;
 				GENERATE_INFOPLIST_FILE = YES;
@@ -757,7 +899,7 @@
 				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
 				CLANG_ENABLE_MODULES = YES;
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 58;
+				CURRENT_PROJECT_VERSION = 59;
 				DEVELOPMENT_TEAM = C6RPS3BGXX;
 				ENABLE_PREVIEWS = YES;
 				GENERATE_INFOPLIST_FILE = YES;
@@ -790,7 +932,7 @@
 			buildSettings = {
 				BUNDLE_LOADER = "$(TEST_HOST)";
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 58;
+				CURRENT_PROJECT_VERSION = 59;
 				DEVELOPMENT_TEAM = C6RPS3BGXX;
 				GENERATE_INFOPLIST_FILE = YES;
 				MARKETING_VERSION = 1.0;
@@ -810,7 +952,7 @@
 			buildSettings = {
 				BUNDLE_LOADER = "$(TEST_HOST)";
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 58;
+				CURRENT_PROJECT_VERSION = 59;
 				DEVELOPMENT_TEAM = C6RPS3BGXX;
 				GENERATE_INFOPLIST_FILE = YES;
 				MARKETING_VERSION = 1.0;
@@ -832,7 +974,7 @@
 				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
 				CLANG_ENABLE_MODULES = YES;
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 58;
+				CURRENT_PROJECT_VERSION = 59;
 				DEVELOPMENT_TEAM = C6RPS3BGXX;
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_FILE = JesseWidgets/Info.plist;
@@ -864,7 +1006,7 @@
 				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
 				CLANG_ENABLE_MODULES = YES;
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 58;
+				CURRENT_PROJECT_VERSION = 59;
 				DEVELOPMENT_TEAM = C6RPS3BGXX;
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_FILE = JesseWidgets/Info.plist;
@@ -888,6 +1030,109 @@
 				SWIFT_VERSION = 6.0;
 				TARGETED_DEVICE_FAMILY = "1,2";
 				VALIDATE_PRODUCT = YES;
+			};
+			name = Release;
+		};
+		B0D06E00000000000000E021 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ASSETCATALOG_COMPILER_GENERATE_SWIFT_ASSET_SYMBOL_EXTENSIONS = YES;
+				CLANG_ENABLE_MODULES = YES;
+				CODE_SIGN_STYLE = Automatic;
+				COMBINE_HIDPI_IMAGES = YES;
+				CURRENT_PROJECT_VERSION = 59;
+				DEVELOPMENT_TEAM = C6RPS3BGXX;
+				ENABLE_PREVIEWS = YES;
+				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_FILE = JesseMac/Info.plist;
+				INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.productivity";
+				INFOPLIST_KEY_NSHumanReadableCopyright = "";
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/../Frameworks",
+				);
+				MACOSX_DEPLOYMENT_TARGET = 26.0;
+				MARKETING_VERSION = 1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = com.tag1.JesseMac;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SDKROOT = macosx;
+				STRING_CATALOG_GENERATE_SYMBOLS = YES;
+				SWIFT_APPROACHABLE_CONCURRENCY = YES;
+				SWIFT_DEFAULT_ACTOR_ISOLATION = MainActor;
+				SWIFT_EMIT_LOC_STRINGS = YES;
+				SWIFT_OPTIMIZATION_LEVEL = "-Onone";
+				SWIFT_UPCOMING_FEATURE_MEMBER_IMPORT_VISIBILITY = YES;
+				SWIFT_VERSION = 6.0;
+			};
+			name = Debug;
+		};
+		B0D06E00000000000000E022 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ASSETCATALOG_COMPILER_GENERATE_SWIFT_ASSET_SYMBOL_EXTENSIONS = YES;
+				CLANG_ENABLE_MODULES = YES;
+				CODE_SIGN_STYLE = Automatic;
+				COMBINE_HIDPI_IMAGES = YES;
+				CURRENT_PROJECT_VERSION = 59;
+				DEVELOPMENT_TEAM = C6RPS3BGXX;
+				ENABLE_PREVIEWS = YES;
+				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_FILE = JesseMac/Info.plist;
+				INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.productivity";
+				INFOPLIST_KEY_NSHumanReadableCopyright = "";
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/../Frameworks",
+				);
+				MACOSX_DEPLOYMENT_TARGET = 26.0;
+				MARKETING_VERSION = 1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = com.tag1.JesseMac;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SDKROOT = macosx;
+				STRING_CATALOG_GENERATE_SYMBOLS = YES;
+				SWIFT_APPROACHABLE_CONCURRENCY = YES;
+				SWIFT_DEFAULT_ACTOR_ISOLATION = MainActor;
+				SWIFT_EMIT_LOC_STRINGS = YES;
+				SWIFT_UPCOMING_FEATURE_MEMBER_IMPORT_VISIBILITY = YES;
+				SWIFT_VERSION = 6.0;
+			};
+			name = Release;
+		};
+		B0D070000000000000007021 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				BUNDLE_LOADER = "$(TEST_HOST)";
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 59;
+				DEVELOPMENT_TEAM = C6RPS3BGXX;
+				GENERATE_INFOPLIST_FILE = YES;
+				MACOSX_DEPLOYMENT_TARGET = 26.0;
+				MARKETING_VERSION = 1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = com.tag1.JesseMacTests;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SDKROOT = macosx;
+				SWIFT_EMIT_LOC_STRINGS = NO;
+				SWIFT_VERSION = 6.0;
+				TEST_HOST = "$(BUILT_PRODUCTS_DIR)/Jesse Mac.app/Contents/MacOS/Jesse Mac";
+			};
+			name = Debug;
+		};
+		B0D070000000000000007022 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				BUNDLE_LOADER = "$(TEST_HOST)";
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 59;
+				DEVELOPMENT_TEAM = C6RPS3BGXX;
+				GENERATE_INFOPLIST_FILE = YES;
+				MACOSX_DEPLOYMENT_TARGET = 26.0;
+				MARKETING_VERSION = 1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = com.tag1.JesseMacTests;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SDKROOT = macosx;
+				SWIFT_EMIT_LOC_STRINGS = NO;
+				SWIFT_VERSION = 6.0;
+				TEST_HOST = "$(BUILT_PRODUCTS_DIR)/Jesse Mac.app/Contents/MacOS/Jesse Mac";
 			};
 			name = Release;
 		};
@@ -944,6 +1189,24 @@
 			buildConfigurations = (
 				B0D06D00000000000000D021 /* Debug */,
 				B0D06D00000000000000D022 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+		B0D06E00000000000000E020 /* Build configuration list for PBXNativeTarget "Jesse Mac" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				B0D06E00000000000000E021 /* Debug */,
+				B0D06E00000000000000E022 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+		B0D070000000000000007020 /* Build configuration list for PBXNativeTarget "Jesse MacTests" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				B0D070000000000000007021 /* Debug */,
+				B0D070000000000000007022 /* Release */,
 			);
 			defaultConfigurationIsVisible = 0;
 			defaultConfigurationName = Release;
