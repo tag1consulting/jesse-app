@@ -1,7 +1,11 @@
 import XCTest
 import SwiftUI
 import UIKit
-@testable import Jesse
+@testable import JesseDietDisplay
+
+// Kept in the iOS suite (not the shared package suite) because it resolves the macro
+// colors through UIKit's `UITraitCollection` / `UIColor`, which only exist on iOS. The
+// cross-platform derivation itself lives in JesseDietDisplay; this locks its iOS render.
 
 // Fiber is a subset of carbs, so its identity color must be a lighter *shade of the
 // carbs color* — same hue family, clearly lighter, fully opaque — not an independent

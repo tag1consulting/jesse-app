@@ -1,5 +1,6 @@
 import XCTest
-@testable import Jesse
+@testable import JesseDietDisplay
+import JesseNetworking
 
 // The pure view-logic seam: staleness, the updated-stamp, the weight card's
 // same-day-vs-fallback resolution (BF/lean never carried forward), the

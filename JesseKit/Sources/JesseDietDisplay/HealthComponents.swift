@@ -1,5 +1,5 @@
 import SwiftUI
-import UIKit
+import JesseNetworking
 
 // Shared building blocks for the Health tab. Every view here is a pure function of
 // its inputs — the numbers and statuses are computed upstream by `DietSemantics` /
@@ -34,13 +34,13 @@ func toneColor(_ tone: DietSemantics.Tone) -> Color {
 extension Color {
     /// The "take note" tone: a muted clay/terracotta that reads as "worth attention"
     /// without the alarm of pure red — deliberately calmer than `.red`. Resolved per
-    /// color scheme (a touch brighter in dark mode) via a `UIColor` dynamic provider,
+    /// color scheme (a touch brighter in dark mode) via the platform dynamic provider,
     /// matching how the macro identity colors adapt.
-    static let dietTakeNote = Color(UIColor { traits in
-        traits.userInterfaceStyle == .dark
-            ? UIColor(red: 0.80, green: 0.47, blue: 0.32, alpha: 1)   // #CC7852
-            : UIColor(red: 0.69, green: 0.37, blue: 0.23, alpha: 1)   // #B05E3B
-    })
+    static let dietTakeNote = Color.dietDynamic { isDark in
+        isDark
+            ? PlatformColor(red: 0.80, green: 0.47, blue: 0.32, alpha: 1)   // #CC7852
+            : PlatformColor(red: 0.69, green: 0.37, blue: 0.23, alpha: 1)   // #B05E3B
+    }
 }
 
 /// The goal glyph (≥ floor, ≤ ceiling, ↕ window) in a subtle chip.
@@ -51,7 +51,7 @@ struct GoalChip: View {
             .font(.caption.weight(.bold))
             .foregroundStyle(.secondary)
             .frame(width: 18, height: 18)
-            .background(Circle().fill(Color(.tertiarySystemFill)))
+            .background(Circle().fill(Color.dietSubtleFill))
             .accessibilityLabel(goalName)
     }
     private var goalName: String {
@@ -69,7 +69,7 @@ struct StatusMeter: View {
     var body: some View {
         GeometryReader { geo in
             ZStack(alignment: .leading) {
-                Capsule().fill(Color(.tertiarySystemFill))
+                Capsule().fill(Color.dietSubtleFill)
                 Capsule().fill(toneColor(tone))
                     .frame(width: geo.size.width * min(max(fraction ?? 0, 0), 1))
             }
@@ -283,7 +283,7 @@ struct StatTile: View {
         }
         .frame(maxWidth: .infinity, minHeight: 96, alignment: .topLeading)
         .padding()
-        .background(RoundedRectangle(cornerRadius: 12).fill(Color(.secondarySystemGroupedBackground)))
+        .background(RoundedRectangle(cornerRadius: 12).fill(Color.dietGroupedBackground))
 
         if let onTap {
             Button(action: onTap) { inner.contentShape(Rectangle()) }.buttonStyle(.plain)
@@ -337,10 +337,10 @@ enum MacroColor {
     /// Derive a sub-entry macro's identity color from its parent's: the parent color,
     /// resolved per color scheme, lightened toward white and kept opaque.
     static func shade(ofSubEntry parent: Color) -> Color {
-        Color(UIColor { traits in
-            UIColor(parent).resolvedColor(with: traits)
-                .lightenedTowardWhite(by: subEntryLightenFraction)
-        })
+        Color.dietDynamic { isDark in
+            parent.dietPlatformResolved(isDark: isDark)
+                .dietLightenedTowardWhite(by: subEntryLightenFraction)
+        }
     }
 
     /// Identity color for a macro, so no view hardcodes one. Fiber returns its
@@ -355,19 +355,6 @@ enum MacroColor {
     }
 }
 
-private extension UIColor {
-    /// This color blended toward white by `fraction` (0 = unchanged, 1 = white),
-    /// staying fully opaque. Component blend in the resolved RGB space.
-    func lightenedTowardWhite(by fraction: CGFloat) -> UIColor {
-        var r: CGFloat = 0, g: CGFloat = 0, b: CGFloat = 0, a: CGFloat = 0
-        getRed(&r, green: &g, blue: &b, alpha: &a)
-        let f = min(max(fraction, 0), 1)
-        return UIColor(red: r + (1 - r) * f,
-                       green: g + (1 - g) * f,
-                       blue: b + (1 - b) * f,
-                       alpha: 1)
-    }
-}
 
 /// A single horizontal stacked bar of where the day's calories came from (protein /
 /// carbs / fiber / fat at 4/4/4/9 kcal per gram), with a compact legend. Fiber is
@@ -664,7 +651,7 @@ struct ExplainerSheet: View {
                         .font(.footnote)
                         .padding(12)
                         .frame(maxWidth: .infinity, alignment: .leading)
-                        .background(RoundedRectangle(cornerRadius: 10).fill(Color(.tertiarySystemFill)))
+                        .background(RoundedRectangle(cornerRadius: 10).fill(Color.dietSubtleFill))
                     }
                     if let drilldown = explainer.drilldown {
                         Divider()
@@ -692,13 +679,13 @@ struct ExplainerSheet: View {
                 .padding()
             }
             .navigationTitle(explainer.title)
-            .navigationBarTitleDisplayMode(.inline)
+            .dietNavTitle(.inline)
             .toolbar {
                 // Share the whole page as clean plain text — the guaranteed path that
                 // carries everything regardless of where SwiftUI text selection has
                 // gaps. Shown only when there's a drill-down (a full page to share).
                 if let drilldown = explainer.drilldown {
-                    ToolbarItem(placement: .topBarLeading) {
+                    ToolbarItem(placement: .dietLeading) {
                         ShareLink(item: DrilldownShare.plainText(
                             title: explainer.title, valueLine: explainer.valueLine,
                             breakdown: drilldown.breakdown,
@@ -933,7 +920,7 @@ struct ProportionBar: View {
     var body: some View {
         GeometryReader { geo in
             ZStack(alignment: .leading) {
-                Capsule().fill(Color(.tertiarySystemFill))
+                Capsule().fill(Color.dietSubtleFill)
                 Capsule().fill(color)
                     .frame(width: geo.size.width * min(max(fraction, 0), 1))
             }
@@ -1031,7 +1018,7 @@ struct HealthCard<Content: View>: View {
         content
             .frame(maxWidth: .infinity, alignment: .leading)
             .padding()
-            .background(RoundedRectangle(cornerRadius: 14).fill(Color(.secondarySystemGroupedBackground)))
+            .background(RoundedRectangle(cornerRadius: 14).fill(Color.dietGroupedBackground))
     }
 }
 
@@ -1042,7 +1029,7 @@ struct TimeCapsule: View {
         Text(time)
             .font(.caption2.weight(.semibold).monospacedDigit())
             .padding(.horizontal, 7).padding(.vertical, 3)
-            .background(Capsule().fill(Color(.tertiarySystemFill)))
+            .background(Capsule().fill(Color.dietSubtleFill))
             .foregroundStyle(.secondary)
     }
 }

@@ -1,4 +1,5 @@
 import Foundation
+import JesseNetworking
 
 // Pure, Foundation-only view logic for the Health tab — the seam the view tests
 // drive instead of snapshots: staleness, the "updated HH:MM" stamp, the weight

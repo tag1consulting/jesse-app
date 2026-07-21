@@ -1,4 +1,5 @@
 import SwiftUI
+import JesseNetworking
 
 // The Level-2 detail screens (except the weight chart, which is its own file). Each
 // renders purely from `DietSnapshot` + `DietSemantics`/`Explainers`; no business
@@ -63,7 +64,7 @@ struct MacrosCaloriesDetail: View {
             if neutral { neutralBody } else { judgedBody }
         }
         .navigationTitle("Macros & calories")
-        .navigationBarTitleDisplayMode(.inline)
+        .dietNavTitle(.inline)
         .sheet(item: $explainer) { ExplainerSheet(explainer: $0) }
     }
 
@@ -246,7 +247,7 @@ struct NetCalorieBar: View {
                 ZStack(alignment: .leading) {
                     Capsule().fill(Color.accentColor.opacity(0.85))
                     Capsule()
-                        .fill(Color(.tertiarySystemFill))
+                        .fill(Color.dietSubtleFill)
                         .frame(width: geo.size.width * burnedFrac)
                         .overlay(Capsule().strokeBorder(.secondary, style: StrokeStyle(lineWidth: 1, dash: [3, 2])))
                         .frame(width: geo.size.width * burnedFrac, alignment: .leading)
@@ -279,7 +280,7 @@ struct FoodJournalDetail: View {
         }
         .listStyle(.plain)
         .navigationTitle("Food journal")
-        .navigationBarTitleDisplayMode(.inline)
+        .dietNavTitle(.inline)
     }
 
     // A day-summary card: total calories large, one stacked bar of where they came
@@ -296,7 +297,7 @@ struct FoodJournalDetail: View {
                     CalorieSourceBar(split: HealthDisplay.calorieSplit(grand))
                     // Grand macro line: fiber reads as a sub-entry of carbs — one
                     // ramp step smaller (caption → caption2) and dimmer (tertiary).
-                    macroCaptionText(grand, fiberFont: .caption2, fiberColor: Color(uiColor: .tertiaryLabel))
+                    macroCaptionText(grand, fiberFont: .caption2, fiberColor: Color.dietTertiaryLabel)
                         .font(.caption.monospacedDigit()).foregroundStyle(.secondary)
                 }
             }
@@ -354,7 +355,7 @@ struct FoodJournalDetail: View {
                     .font(.caption.monospacedDigit()).foregroundStyle(.secondary)
             }
             // Subtotal macro line: fiber as a sub-entry of carbs (smaller + dimmer).
-            macroCaptionText(t, fiberFont: .caption2, fiberColor: Color(uiColor: .tertiaryLabel))
+            macroCaptionText(t, fiberFont: .caption2, fiberColor: Color.dietTertiaryLabel)
                 .font(.caption.monospacedDigit()).foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
         }
@@ -434,7 +435,7 @@ struct ExerciseDetail: View {
         }
         .listStyle(.plain)
         .navigationTitle("Exercise")
-        .navigationBarTitleDisplayMode(.inline)
+        .dietNavTitle(.inline)
     }
 
     private func card(_ ex: DietExercise) -> some View {
@@ -537,7 +538,7 @@ struct ProgressPaceDetail: View {
             }
         }
         .navigationTitle("Progress & pace")
-        .navigationBarTitleDisplayMode(.inline)
+        .dietNavTitle(.inline)
         .sheet(item: $explainer) { ExplainerSheet(explainer: $0) }
     }
 
@@ -695,6 +696,6 @@ struct CoachDetail: View {
             }
         }
         .navigationTitle("Coach's notes")
-        .navigationBarTitleDisplayMode(.inline)
+        .dietNavTitle(.inline)
     }
 }

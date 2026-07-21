@@ -1,6 +1,7 @@
 import Foundation
 import Security
 import JesseCore
+import JesseDietDisplay
 // Re-export the shared networking layer so the rest of the iOS target (app + tests) sees
 // JesseConfig, JesseReply, JesseError, the wire/result types, DietSnapshot, the SSE
 // parser, and the concrete JesseBridgeClient by their bare names — exactly as before this
@@ -189,6 +190,11 @@ extension JesseClientProtocol {
 /// The production `JesseClientProtocol`: the shared `JesseBridgeClient` plus the iOS-only
 /// `health_context` assembly. Every network call flows through `bridge`; this type owns
 /// only the classify-then-attach decision and the HealthKit/diet block composition.
+// The iOS client satisfies the shared dashboard's narrow fetch seam (it already has
+// `fetchDietSnapshot`), so the Health tab injects it unchanged as before the display
+// layer moved into JesseDietDisplay.
+extension JesseClient: DietSnapshotProviding {}
+
 struct JesseClient: JesseClientProtocol {
     var config: JesseConfig
 

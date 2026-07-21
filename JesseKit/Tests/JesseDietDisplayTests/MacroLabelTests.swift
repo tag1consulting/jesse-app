@@ -1,5 +1,6 @@
 import XCTest
-@testable import Jesse
+@testable import JesseDietDisplay
+import JesseNetworking
 
 // The canonical macro display names and the pure macro-line formatter that every
 // Health-tab row renders. These lock the words in from one source: a future

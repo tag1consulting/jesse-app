@@ -1,5 +1,6 @@
 import XCTest
-@testable import Jesse
+@testable import JesseDietDisplay
+import JesseNetworking
 
 // The "what fed this number" drill-down is a pure ranking over the day's meals, so
 // every rule has a direct test: most-impact-first ordering, the zero/nil exclusion

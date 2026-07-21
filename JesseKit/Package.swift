@@ -26,6 +26,7 @@ let package = Package(
         .library(name: "JesseNetworking", targets: ["JesseNetworking"]),
         .library(name: "JesseConversations", targets: ["JesseConversations"]),
         .library(name: "JesseSearch", targets: ["JesseSearch"]),
+        .library(name: "JesseDietDisplay", targets: ["JesseDietDisplay"]),
     ],
     targets: [
         .target(
@@ -115,6 +116,40 @@ let package = Package(
         .testTarget(
             name: "JesseSearchTests",
             dependencies: ["JesseSearch"],
+            swiftSettings: [
+                .swiftLanguageMode(.v6),
+            ]
+        ),
+        // The portable diet/health DASHBOARD DISPLAY layer, extracted from the iOS
+        // target so iOS and macOS render the same Health tab from the same source. It
+        // holds the pure semantics (DietSemantics), the paging/history helpers, the
+        // @MainActor view model (HealthDashboardModel, which fetches through the narrow
+        // DietSnapshotProviding seam so each platform injects its own client), and the
+        // SwiftUI dashboard views (Swift Charts based). It is HealthKit-FREE by
+        // construction: HealthKit is an iOS-only enrichment/write concern that never
+        // reaches the display, so no file here imports it and the Mac links this with
+        // no HealthKit dependency. The one on-device insight (FoundationModels) is
+        // cross-platform and degrades to nothing when the model is unavailable, so it
+        // lives here behind its total `HealthInsightGenerating` seam.
+        //
+        // Isolation: default (nonisolated) like JesseNetworking, NOT MainActor-default.
+        // DietSemantics and NutrientTrends are pure nonisolated functions called from
+        // both the MainActor views and the iOS app's off-main per-turn context builder,
+        // so forcing MainActor here would break the latter. The views get MainActor from
+        // their `View` conformance; the model and the insight generator are explicitly
+        // @MainActor. HealthDashboardModel carries a `nonisolated deinit` so an off-main
+        // release (a unit-test host tears objects down off-actor) never routes through
+        // the isolated-deinit executor hop and aborts.
+        .target(
+            name: "JesseDietDisplay",
+            dependencies: ["JesseCore", "JesseNetworking"],
+            swiftSettings: [
+                .swiftLanguageMode(.v6),
+            ]
+        ),
+        .testTarget(
+            name: "JesseDietDisplayTests",
+            dependencies: ["JesseDietDisplay", "JesseNetworking"],
             swiftSettings: [
                 .swiftLanguageMode(.v6),
             ]

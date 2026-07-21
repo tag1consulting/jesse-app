@@ -1,5 +1,6 @@
 import XCTest
-@testable import Jesse
+@testable import JesseDietDisplay
+import JesseNetworking
 
 // The pure day-history logic: paging over availableDays, the end-of-day engine-hour
 // injection for a past day, the neutral-mode labels, and the past-day chrome

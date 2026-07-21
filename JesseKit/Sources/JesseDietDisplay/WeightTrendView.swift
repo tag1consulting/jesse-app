@@ -1,4 +1,5 @@
 import SwiftUI
+import JesseNetworking
 import Charts
 
 // The weight-and-trend detail: a Swift Charts line of daily weigh-ins plus a 7-day
@@ -101,7 +102,7 @@ struct WeightTrendDetail: View {
             if let progress { paceSection(progress) }
         }
         .navigationTitle("Weight & trend")
-        .navigationBarTitleDisplayMode(.inline)
+        .dietNavTitle(.inline)
         .sheet(item: $explainer) { ExplainerSheet(explainer: $0) }
     }
 

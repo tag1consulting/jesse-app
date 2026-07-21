@@ -1,4 +1,5 @@
 import Foundation
+import JesseNetworking
 
 // The "what fed this number" drill-down, as pure Foundation-only logic. Given the
 // day's meals and a tapped metric (the calorie total or one macro), it ranks the

@@ -28,7 +28,7 @@ struct JesseMacApp: App {
 
     var body: some Scene {
         WindowGroup {
-            MacRootView(storeError: store.openFailure)
+            MacShellView(storeError: store.openFailure)
                 .environment(coordinator)
                 .onAppear {
                     notifier.requestAuthorization()

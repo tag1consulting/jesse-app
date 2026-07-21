@@ -1,5 +1,6 @@
 import XCTest
-@testable import Jesse
+@testable import JesseDietDisplay
+import JesseNetworking
 
 // The plain-language day summary that leads the Health tab. It's derived entirely from
 // the same gauges the rings draw, so these assert the three shapes the proposal showed:

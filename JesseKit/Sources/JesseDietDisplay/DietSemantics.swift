@@ -1,4 +1,5 @@
 import Foundation
+import JesseNetworking
 
 // The diet dashboard's rules, as pure Foundation-only functions — a faithful port
 // of the browser dashboard's logic. NOTHING here touches SwiftUI: a `Status` maps

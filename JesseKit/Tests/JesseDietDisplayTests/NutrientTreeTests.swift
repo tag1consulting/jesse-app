@@ -1,6 +1,7 @@
 import XCTest
 import SwiftUI
-@testable import Jesse
+@testable import JesseDietDisplay
+import JesseNetworking
 
 // The nutrition-label nutrient tree: carbohydrate is the parent of fibre AND total
 // sugars; fat is the parent of saturated fat; sodium and potassium are standalone

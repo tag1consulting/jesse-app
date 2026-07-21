@@ -1,5 +1,6 @@
 import XCTest
-@testable import Jesse
+@testable import JesseDietDisplay
+import JesseNetworking
 
 // The on-device insight seam has two testable halves: the pure prompt builder (which
 // grounds the model in the on-screen foods and numbers and forbids invention) and the

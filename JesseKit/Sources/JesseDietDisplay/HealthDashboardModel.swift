@@ -1,5 +1,6 @@
 import Foundation
 import Observation
+import JesseNetworking
 
 // The Health tab's view model. Owns the currently-viewed snapshot, the fetch state,
 // day-history paging, and an in-memory per-date cache. Invariants:
@@ -19,10 +20,16 @@ import Observation
 // fake. `now` is injected for deterministic staleness.
 @MainActor
 @Observable
-final class HealthDashboardModel {
+public final class HealthDashboardModel {
+    // A @MainActor class's synthesized deinit is MainActor-isolated; a unit-test host
+    // releases the model off the main actor, which would route through the isolated-deinit
+    // executor hop and abort. An explicit nonisolated deinit keeps teardown off-actor safe
+    // (there is nothing to clean up). Same pattern as JesseSearch's models.
+    nonisolated deinit {}
+
     /// The snapshot currently on screen (today or a paged-back day), kept across
     /// refreshes.
-    private(set) var snapshot: DietSnapshot?
+    public private(set) var snapshot: DietSnapshot?
     /// A fetch is in flight (drives the "refreshing" affordance; the screen keeps
     /// showing the cached snapshot underneath).
     private(set) var isLoading = false
@@ -45,24 +52,28 @@ final class HealthDashboardModel {
     /// day renders instantly on return.
     private var cache: [String: DietSnapshot] = [:]
 
-    private let makeClient: @MainActor () -> any JesseClientProtocol
-    let now: () -> Date
+    private let makeClient: @MainActor () -> any DietSnapshotProviding
+    public let now: () -> Date
 
-    init(makeClient: @escaping @MainActor () -> any JesseClientProtocol = { JesseClient(config: ConfigStore.load()) },
-         now: @escaping () -> Date = { Date() }) {
+    /// The client is a required injection (no iOS-specific default now that the model
+    /// lives in the shared package): iOS passes its `JesseClient`, the Mac a
+    /// `JesseBridgeClient`, tests/previews a fake. Both concrete clients satisfy the
+    /// narrow `DietSnapshotProviding` seam.
+    public init(makeClient: @escaping @MainActor () -> any DietSnapshotProviding,
+                now: @escaping () -> Date = { Date() }) {
         self.makeClient = makeClient
         self.now = now
     }
 
     /// What the tab root renders. `.content` wins whenever a snapshot exists, so a
     /// failed refresh never blanks the screen.
-    enum DisplayState: Equatable {
+    public enum DisplayState: Equatable {
         case loading                 // first load, nothing cached yet
         case content(DietSnapshot)   // a snapshot to render (possibly mid-refresh)
         case empty(DietFetchError)   // no snapshot AND a fetch error → empty state
     }
 
-    var displayState: DisplayState {
+    public var displayState: DisplayState {
         if let snapshot { return .content(snapshot) }
         if let lastError { return .empty(lastError) }
         return .loading
@@ -70,51 +81,53 @@ final class HealthDashboardModel {
 
     /// A refresh error to surface subtly *while still showing content* — nil unless
     /// a snapshot is already on screen and the latest fetch failed.
-    var refreshError: DietFetchError? {
+    public var refreshError: DietFetchError? {
         snapshot != nil ? lastError : nil
     }
 
     // MARK: - Paging surface (all derived from availableDays + the viewed date)
 
     /// Whether the user is on today (vs a paged-back day).
-    var isViewingToday: Bool { viewedDate == nil }
+    public var isViewingToday: Bool { viewedDate == nil }
 
     /// The date currently being viewed, resolved to a concrete string.
-    var currentDate: String { viewedDate ?? todayDate ?? snapshot?.today.date ?? "" }
+    public var currentDate: String { viewedDate ?? todayDate ?? snapshot?.today.date ?? "" }
 
-    /// Paging over the available days, or nil until we know today's date.
+    /// Paging over the available days, or nil until we know today's date. Internal: the
+    /// paging *decisions* are exposed through `canGoBack` / `goBack` etc., but the
+    /// `DietPaging` value itself stays a package detail.
     var paging: DietPaging? {
         guard let todayDate else { return nil }
         return DietPaging(days: availableDays, today: todayDate)
     }
 
-    var canGoBack: Bool { paging?.canGoBack(from: currentDate) ?? false }
-    var canGoForward: Bool { paging?.canGoForward(from: currentDate) ?? false }
+    public var canGoBack: Bool { paging?.canGoBack(from: currentDate) ?? false }
+    public var canGoForward: Bool { paging?.canGoForward(from: currentDate) ?? false }
 
     // MARK: - Loading
 
     /// Refresh the currently-viewed day (forced refetch). Called on first appear
     /// (viewing today) and on background triggers — the pinned view is preserved.
-    func load() async { await fetch(date: viewedDate, force: true) }
+    public func load() async { await fetch(date: viewedDate, force: true) }
 
     /// Pull-to-refresh: force a refetch of the day currently on screen.
-    func refresh() async { await fetch(date: viewedDate, force: true) }
+    public func refresh() async { await fetch(date: viewedDate, force: true) }
 
     /// Page to the nearest earlier available day (cache hit renders instantly).
-    func goBack() async {
+    public func goBack() async {
         guard let target = paging?.earlier(than: currentDate) else { return }
         await fetch(date: pagingDate(target), force: false)
     }
 
     /// Page to the nearest later available day; forward from the last past day lands
     /// on today.
-    func goForward() async {
+    public func goForward() async {
         guard let target = paging?.later(than: currentDate) else { return }
         await fetch(date: pagingDate(target), force: false)
     }
 
     /// Jump straight back to today.
-    func goToToday() async { await fetch(date: nil, force: false) }
+    public func goToToday() async { await fetch(date: nil, force: false) }
 
     /// A paging target equal to today's date is the live day — request it un-dated
     /// so it renders with full live semantics.
