@@ -1,7 +1,8 @@
 import XCTest
-@testable import Jesse
+@testable import JesseNetworking
 
-@MainActor
+/// The reply's display/spoken text derivation (SPOKEN: line handling). Moved here from the
+/// iOS target with `JesseReply`.
 final class JesseReplyTests: XCTestCase {
 
     private func reply(_ text: String) -> JesseReply {

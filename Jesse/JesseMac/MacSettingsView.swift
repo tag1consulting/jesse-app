@@ -21,7 +21,7 @@ struct MacSettingsView: View {
             Form {
                 Section {
                     TextField("Host", text: $host, prompt: Text("studio.tailnet.ts.net or 100.x.y.z"))
-                    TextField("Port", text: $port, prompt: Text("\(MacBridgeConfig.defaultPort)"))
+                    TextField("Port", text: $port, prompt: Text("\(JesseConfig.defaultPort)"))
                     SecureField("Bearer token", text: $token)
                 } header: {
                     Text("Manual")
@@ -59,7 +59,7 @@ struct MacSettingsView: View {
         .frame(width: 480, height: 440)
         .onAppear {
             host = configStore.config.host
-            port = configStore.config.port == MacBridgeConfig.defaultPort ? "" : String(configStore.config.port)
+            port = configStore.config.port == JesseConfig.defaultPort ? "" : String(configStore.config.port)
             token = configStore.config.token
         }
     }
@@ -72,7 +72,7 @@ struct MacSettingsView: View {
     /// Fill the fields from a `jesse://pair?url=host:port&token=…` link.
     private func applyPairLink() {
         guard let parsed = MacPairLink.parse(pasteLink) else { return }
-        let (h, p) = MacBridgeConfig.sanitize(parsed.host)
+        let (h, p) = JesseConfig.sanitize(parsed.host)
         host = h
         if let port = p ?? parsed.port { self.port = String(port) }
         token = parsed.token
@@ -89,7 +89,7 @@ nonisolated enum MacPairLink {
         func value(_ name: String) -> String? { items.first { $0.name == name }?.value }
         guard let urlValue = value("url") ?? value("host"),
               let token = value("token"), !token.isEmpty else { return nil }
-        let (host, port) = MacBridgeConfig.sanitize(urlValue)
+        let (host, port) = JesseConfig.sanitize(urlValue)
         return (host, port, token)
     }
 }

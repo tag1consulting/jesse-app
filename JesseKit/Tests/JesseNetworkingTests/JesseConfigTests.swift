@@ -1,7 +1,9 @@
 import XCTest
-@testable import Jesse
+@testable import JesseNetworking
 
-@MainActor
+/// Host-sanitizing, endpoint construction, and pairing-payload parsing for the one shared
+/// `JesseConfig`. Consolidated from the former iOS `JesseConfigTests` and the macOS
+/// `MacBridgeConfigTests`, which tested two duplicate config value types.
 final class JesseConfigTests: XCTestCase {
 
     private func config(host: String, port: Int = 8765, token: String = "t") -> JesseConfig {
@@ -36,10 +38,35 @@ final class JesseConfigTests: XCTestCase {
         XCTAssertEqual(config(host: "  host  ").normalizedHost, "host")
     }
 
+    // MARK: - static sanitize(_:) (the macOS settings/pairing entry point)
+
+    func testSanitizeFullURLLiftsPort() {
+        let (host, port) = JesseConfig.sanitize("http://Studio.tailnet.ts.net:9000/health")
+        XCTAssertEqual(host, "studio.tailnet.ts.net")
+        XCTAssertEqual(port, 9000)
+    }
+
+    func testSanitizeHostPort() {
+        let (host, port) = JesseConfig.sanitize("100.64.0.1:8765")
+        XCTAssertEqual(host, "100.64.0.1")
+        XCTAssertEqual(port, 8765)
+    }
+
+    func testSanitizeBareHostNoPort() {
+        let (host, port) = JesseConfig.sanitize("  box.ts.net  ")
+        XCTAssertEqual(host, "box.ts.net")
+        XCTAssertNil(port)
+    }
+
+    func testSanitizeStripsProtocolRelativeAndPath() {
+        let (host, port) = JesseConfig.sanitize("//box.ts.net/jesse/sessions")
+        XCTAssertEqual(host, "box.ts.net")
+        XCTAssertNil(port)
+    }
+
     // MARK: - effectivePort
 
     func testEmbeddedPortOverridesStoredPort() {
-        // "host:1234" with a different stored port → the embedded one wins.
         let c = config(host: "host:1234", port: 9999)
         XCTAssertEqual(c.effectivePort, 1234)
         XCTAssertEqual(c.normalizedHost, "host")
@@ -63,6 +90,14 @@ final class JesseConfigTests: XCTestCase {
 
     func testEndpointEmptyHostIsNil() {
         XCTAssertNil(config(host: "").endpoint("/jesse"))
+    }
+
+    // MARK: - isConfigured
+
+    func testIsConfiguredRequiresHostAndToken() {
+        XCTAssertFalse(JesseConfig(host: "", port: 8765, token: "t").isConfigured)
+        XCTAssertFalse(JesseConfig(host: "h", port: 8765, token: "").isConfigured)
+        XCTAssertTrue(JesseConfig(host: "h", port: 8765, token: "t").isConfigured)
     }
 
     // MARK: - fromPairing

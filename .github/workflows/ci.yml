@@ -109,12 +109,15 @@ jobs:
           xcodebuild -version
           xcode-select -p
 
-      # JesseKit local package (the JesseCore model layer). Fast standalone suite,
-      # built and tested with warnings-as-errors symmetric with the app build below.
-      # JesseCore depends on SwiftData (Apple-only), so this runs on the macOS runner
-      # rather than the Linux bridge job. Runs first for quick feedback on the model
-      # layer before the longer app build/test steps.
-      - name: Build and test JesseKit package
+      # JesseKit local package: the JesseCore model layer AND the JesseNetworking
+      # bridge-client layer (config, wire types, the SSE parser, endpoint construction,
+      # error mapping, the diet snapshot models, and the one concrete client both apps
+      # share). `swift build`/`swift test` cover every target in the package, so this one
+      # step builds and tests both libraries and both their test suites. Built with
+      # warnings-as-errors symmetric with the app build below. These targets depend on
+      # SwiftData/Security (Apple-only), so this runs on the macOS runner rather than the
+      # Linux bridge job. Runs first for quick feedback before the longer app build/test.
+      - name: Build and test JesseKit package (JesseCore + JesseNetworking)
         working-directory: ${{ github.workspace }}/JesseKit
         run: |
           set -euo pipefail

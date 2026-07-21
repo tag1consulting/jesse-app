@@ -88,7 +88,7 @@ final class MacCoordinator {
         self.configStore = configStore
     }
 
-    private var client: MacJesseClient { MacJesseClient(config: configStore.config) }
+    private var client: JesseBridgeClient { JesseBridgeClient(config: configStore.config) }
 
     func isRunning(_ threadID: UUID) -> Bool { isRunning && activeThreadID == threadID }
 
@@ -124,8 +124,9 @@ final class MacCoordinator {
                 mode: mode, text: trimmed, sessionId: thread.sessionId,
                 requestId: UUID().uuidString)
             switch result {
-            case let .reply(replyText, sid):
-                await finalize(thread: thread, reply: replyText, sessionId: sid, context: context, client: cli)
+            case let .reply(reply, _):
+                await finalize(thread: thread, reply: reply.text, sessionId: reply.sessionId,
+                               context: context, client: cli)
             case let .running(jobId):
                 await runStream(jobId: jobId, thread: thread, context: context, client: cli)
             }
@@ -135,7 +136,7 @@ final class MacCoordinator {
     }
 
     private func runStream(jobId: String, thread: JesseThread, context: ModelContext,
-                           client cli: MacJesseClient) async {
+                           client cli: JesseBridgeClient) async {
         var terminalReply: String?
         var terminalSession: String?
         var sawTerminal = false
@@ -147,9 +148,9 @@ final class MacCoordinator {
                 case let .reset(s): streamingText = s
                 case let .delta(s): streamingText += s
                 case let .activity(a): activity = a
-                case let .done(text, sid):
-                    terminalReply = text.isEmpty ? streamingText : text
-                    terminalSession = sid
+                case let .done(reply):
+                    terminalReply = reply.text.isEmpty ? streamingText : reply.text
+                    terminalSession = reply.sessionId
                     sawTerminal = true
                 case let .failed(msg):
                     failure = msg
@@ -178,15 +179,16 @@ final class MacCoordinator {
     }
 
     private func pollToCompletion(jobId: String, thread: JesseThread, context: ModelContext,
-                                  client cli: MacJesseClient) async {
+                                  client cli: JesseBridgeClient) async {
         for _ in 0..<600 {  // ~10 min ceiling at 1s spacing
             if Task.isCancelled { return }
             do {
                 switch try await cli.result(jobId: jobId) {
                 case .running:
                     try? await Task.sleep(for: .seconds(1))
-                case let .done(text, sid):
-                    await finalize(thread: thread, reply: text, sessionId: sid, context: context, client: cli)
+                case let .done(reply):
+                    await finalize(thread: thread, reply: reply.text, sessionId: reply.sessionId,
+                                   context: context, client: cli)
                     return
                 case let .failed(msg):
                     lastError = msg
@@ -208,7 +210,7 @@ final class MacCoordinator {
     /// cursor past this exchange (so a later hydrate won't re-add it), and mint a title
     /// for a still-untitled thread.
     private func finalize(thread: JesseThread, reply: String, sessionId: String?,
-                          context: ModelContext, client cli: MacJesseClient) async {
+                          context: ModelContext, client cli: JesseBridgeClient) async {
         if let sid = sessionId, !sid.isEmpty, thread.sessionId != sid {
             thread.sessionId = sid
         }
@@ -232,7 +234,7 @@ final class MacCoordinator {
         // Mint an AI title once, from the thread's first user turn.
         if (thread.aiTitle ?? "").isEmpty,
            let firstUser = thread.orderedTurns.first(where: { $0.isUser })?.text,
-           let title = await cli.title(for: firstUser, sessionId: sid) {
+           let title = await cli.title(text: firstUser, sessionId: sid) {
             thread.aiTitle = title
             try? context.save()
         }
@@ -258,8 +260,9 @@ final class MacCoordinator {
             thread.updatedAt = Date()
             try? context.save()
             MacCursorStore.setOffset(sid, next)
-        } catch MacJesseError.unknownSession {
-            // The session is gone server-side (GC'd / deleted). Leave the cached copy.
+        } catch JesseError.badResponse(404, _) {
+            // The session is gone server-side (GC'd / deleted): the shared client surfaces
+            // an unknown/expired transcript as a 404. Leave the cached copy.
         } catch {
             lastError = Self.friendly(error)
         }
@@ -285,7 +288,7 @@ final class MacCoordinator {
         }
     }
 
-    private func upsert(_ list: [MacSessionSummary], context: ModelContext) {
+    private func upsert(_ list: [SessionSummary], context: ModelContext) {
         // Index existing threads that carry a session id.
         let existing = (try? context.fetch(FetchDescriptor<JesseThread>())) ?? []
         var bySession: [String: JesseThread] = [:]
@@ -315,16 +318,18 @@ final class MacCoordinator {
 
     static func friendly(_ error: Error) -> String {
         switch error {
-        case MacJesseError.notConfigured:
+        case JesseError.notConfigured:
             return "Set the bridge address and token in Settings first."
-        case let MacJesseError.transport(msg):
-            return "Couldn’t reach the bridge: \(msg)"
-        case let MacJesseError.badStatus(code, _):
-            return "The bridge returned an error (HTTP \(code))."
-        case MacJesseError.unknownSession:
+        case JesseError.badResponse(404, _):
             return "That conversation is no longer on the bridge."
-        case MacJesseError.decoding:
+        case let JesseError.badResponse(code, _):
+            return "The bridge returned an error (HTTP \(code))."
+        case JesseError.decoding:
             return "The bridge sent a response the app couldn’t read."
+        case let je as JesseError:
+            // cannotFindHost / cannotConnect / timedOut / transport / connectionLost —
+            // each already names the host it tried.
+            return je.errorDescription ?? "Couldn’t reach the bridge."
         default:
             return error.localizedDescription
         }
