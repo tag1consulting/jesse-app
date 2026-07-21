@@ -25,6 +25,7 @@ let package = Package(
         .library(name: "JesseCore", targets: ["JesseCore"]),
         .library(name: "JesseNetworking", targets: ["JesseNetworking"]),
         .library(name: "JesseConversations", targets: ["JesseConversations"]),
+        .library(name: "JesseSearch", targets: ["JesseSearch"]),
     ],
     targets: [
         .target(
@@ -80,6 +81,33 @@ let package = Package(
         .testTarget(
             name: "JesseConversationsTests",
             dependencies: ["JesseConversations"],
+            swiftSettings: [
+                .swiftLanguageMode(.v6),
+            ]
+        ),
+        // The two-tier conversation search extracted from the iOS app so iOS and
+        // macOS share one implementation: the framework-agnostic query-expansion
+        // seam (`QueryExpanding`), the debounce/gate/cache/cancel orchestration
+        // model (`ThreadSearchModel`), the pure gating decision (`shouldExpand`),
+        // and the ONE FoundationModels-backed on-device expander. Like JesseCore
+        // and JesseConversations it runs under the app's MainActor default
+        // isolation (the model and expander are @MainActor, authored against that
+        // default). FoundationModels is present on iOS 26 and macOS 26, and the
+        // expander degrades to [] at runtime when the model is unavailable, so the
+        // one file that imports it compiles and runs on both platforms. Depends on
+        // JesseCore and JesseConversations to sit alongside the list-presentation
+        // layer it widens.
+        .target(
+            name: "JesseSearch",
+            dependencies: ["JesseCore", "JesseConversations"],
+            swiftSettings: [
+                .defaultIsolation(MainActor.self),
+                .swiftLanguageMode(.v6),
+            ]
+        ),
+        .testTarget(
+            name: "JesseSearchTests",
+            dependencies: ["JesseSearch"],
             swiftSettings: [
                 .swiftLanguageMode(.v6),
             ]

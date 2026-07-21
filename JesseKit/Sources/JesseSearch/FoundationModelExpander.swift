@@ -1,52 +1,60 @@
 import Foundation
 import FoundationModels
+import os
 
-// Tier 2's on-device query expander — the ONLY file in the app that imports
+// Tier 2's on-device query expander: the ONLY file in JesseSearch that imports
 // FoundationModels. Every other type (and every test) depends on the
 // `QueryExpanding` seam instead, so the model dependency is fully contained here
 // and the rest of the app never links against a specific model API.
 //
 // Everything degrades to `[]` (silently off) when the on-device model is
-// unavailable for ANY reason — device ineligible, Apple Intelligence off, model
-// not yet downloaded — or when a call errors/times out. Nothing is ever sent off
+// unavailable for ANY reason (device ineligible, Apple Intelligence off, model
+// not yet downloaded) or when a call errors/times out. Nothing is ever sent off
 // the device; `SystemLanguageModel` runs entirely on-device.
 //
-// The deployment target is iOS 26.5, so FoundationModels (26.0+) is always present
-// at runtime — availability here is about whether the *model* is usable, not the
-// framework.
+// FoundationModels ships on iOS 26 and macOS 26, so this same expander backs both
+// the iPhone and the Mac search. Availability here is about whether the *model* is
+// usable at runtime, not whether the framework is present.
+
+/// On-device query-expansion diagnostics: availability and per-call failures,
+/// which are swallowed to `[]` and never surfaced to the UI. Package-local so the
+/// expander doesn't depend on the app target's logging.
+private let searchLog = Logger(subsystem: "com.tag1.jesse", category: "search")
 
 /// Guided-generation output: a small, count-bounded list of alternate search
 /// terms. `@Generable` + `@Guide` constrain the model to return exactly this shape.
 @Generable
 private struct ExpansionTerms {
-    @Guide(description: "2 to 4 alternative search terms for the same thing — synonyms, rephrasings, or more/less specific variants",
+    @Guide(description: "2 to 4 alternative search terms for the same thing, synonyms, rephrasings, or more/less specific variants",
            .count(2...4))
     var terms: [String]
 }
 
 @MainActor
-final class FoundationModelExpander: QueryExpanding {
-    /// One reused session (prewarmed on focus) — cheaper than a fresh session per
+public final class FoundationModelExpander: QueryExpanding {
+    /// One reused session (prewarmed on focus), cheaper than a fresh session per
     /// query. Created lazily so an unavailable model never allocates one.
     private var session: LanguageModelSession?
 
     private static let instructions = """
     You expand a search query into a few alternative search terms for the same \
-    thing — synonyms, rephrasings, or more/less specific variants. Reply with the \
+    thing, synonyms, rephrasings, or more/less specific variants. Reply with the \
     terms only, no explanations.
     """
 
+    public init() {}
+
     /// Warm the on-device session when the search field gains focus, so the first
     /// real query doesn't pay cold-start latency. Silent no-op when unavailable.
-    func prewarm() {
+    public func prewarm() {
         guard case .available = SystemLanguageModel.default.availability else { return }
         ensureSession().prewarm()
     }
 
     /// Alternate search terms for `query`, or `[]` when the model is unavailable or
-    /// the call fails. Never throws — the search tier treats `[]` as "no expansion".
-    func expand(_ query: String) async -> [String] {
-        // Availability FIRST: any unavailable reason → feature silently off.
+    /// the call fails. Never throws: the search tier treats `[]` as "no expansion".
+    public func expand(_ query: String) async -> [String] {
+        // Availability FIRST: any unavailable reason -> feature silently off.
         guard case .available = SystemLanguageModel.default.availability else {
             return []
         }
@@ -55,15 +63,15 @@ final class FoundationModelExpander: QueryExpanding {
 
         do {
             let prompt = """
-            Give 2–4 alternative search terms for this query, for finding the same \
-            thing in a list of past conversations. Terms only. Query: "\(trimmed)"
+            Give 2 to 4 alternative search terms for this query, for finding the \
+            same thing in a list of past conversations. Terms only. Query: "\(trimmed)"
             """
             let response = try await ensureSession().respond(
                 to: prompt, generating: ExpansionTerms.self)
             return filterExpansionTerms(response.content.terms, original: trimmed)
         } catch {
-            // Includes timeouts, guardrail rejections, decode failures — all swallowed.
-            Log.search.error("query expansion failed: \(error.localizedDescription)")
+            // Includes timeouts, guardrail rejections, decode failures, all swallowed.
+            searchLog.error("query expansion failed: \(error.localizedDescription, privacy: .public)")
             return []
         }
     }
@@ -76,14 +84,14 @@ final class FoundationModelExpander: QueryExpanding {
     }
 }
 
-/// Pure result-filtering for expansion terms — the unit-testable core of the model
+/// Pure result-filtering for expansion terms: the unit-testable core of the model
 /// path (the real model is unavailable in CI / the Simulator). Trims each term,
 /// drops blanks, drops any term equal (case-insensitively) to the original query,
-/// de-duplicates case-insensitively, and caps at `maxTerms`. Empty in → empty out.
+/// de-duplicates case-insensitively, and caps at `maxTerms`. Empty in -> empty out.
 ///
 /// Foundation-only and free of any FoundationModels type, so it is testable from a
 /// target that never imports the model framework.
-func filterExpansionTerms(_ raw: [String], original: String, maxTerms: Int = 4) -> [String] {
+public func filterExpansionTerms(_ raw: [String], original: String, maxTerms: Int = 4) -> [String] {
     let originalKey = original.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
     var out: [String] = []
     for term in raw {

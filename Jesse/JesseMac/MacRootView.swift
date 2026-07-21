@@ -2,6 +2,7 @@ import SwiftUI
 import SwiftData
 import JesseCore
 import JesseConversations
+import JesseSearch
 
 // The Mac shell: a NavigationSplitView with the thread list on the left and the
 // selected conversation on the right — the big-screen affordance the plan calls for
@@ -24,8 +25,19 @@ struct MacRootView: View {
 
     @State private var selection: UUID?
     @State private var showingSettings = false
-    /// Scope (all / favorites) + folder-expansion state, wrapping the shared layout.
-    @State private var listModel = MacThreadListModel()
+    /// Scope (all / favorites / archived) + folder-expansion state + the two-tier
+    /// search, wrapping the shared layout. Constructed with the production on-device
+    /// expander; the Settings toggle drives its enabled flag each keystroke.
+    @State private var listModel = MacThreadListModel(searchExpander: FoundationModelExpander())
+
+    // Whether the on-device query-expansion tier is enabled (Settings toggle, default
+    // ON). Off -> no `expand` calls, pure Tier-1 multi-token search. Same key and
+    // default as the iPhone's Settings toggle.
+    @AppStorage("searchExpansionEnabled") private var searchExpansionEnabled = true
+    // Prewarm the model once per search session (on the first keystroke), reset when
+    // the query clears. `.searchable` focus isn't directly observable, and prewarm is
+    // an idempotent no-op when the model is unavailable.
+    @State private var didPrewarm = false
 
     /// Store-open failure banner (in-memory fallback — history not being saved).
     var storeError: Error?
@@ -35,8 +47,39 @@ struct MacRootView: View {
     }
 
     /// The sidebar shape, computed by the shared pure function so the Mac matches iOS.
+    /// Reads `listModel.searchQueries`, which reads the shared model's `activeTerms`,
+    /// so the list widens automatically when on-device expansion terms arrive.
     private var layout: ThreadListLayout {
         listModel.layout(threads, now: .now, calendar: .current)
+    }
+
+    /// Whether a search is active (the typed query is non-blank).
+    private var isSearching: Bool {
+        !listModel.searchText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+
+    /// Whether the resolved layout has no rows at all (used only to show the search
+    /// no-results state; grouping never yields empty sections).
+    private var layoutIsEmpty: Bool {
+        switch layout {
+        case .flat(let t): return t.isEmpty
+        case .sectioned(let s): return s.allSatisfy { $0.threads.isEmpty }
+        }
+    }
+
+    /// Feed the live query into the shared expansion model: prewarm once per session
+    /// on the first keystroke, then let the model debounce/gate/cache/cancel. The
+    /// base-match count is the Tier-1 hit count within the current scope, so the model
+    /// only spends the on-device model when direct results are thin. A no-op for the
+    /// tier when Settings has it off (pure Tier-1 search, zero `expand` calls).
+    private func driveSearch() {
+        if !searchExpansionEnabled || listModel.searchText.isEmpty {
+            didPrewarm = false
+        } else if !didPrewarm {
+            listModel.search.prewarm()
+            didPrewarm = true
+        }
+        listModel.updateSearch(threads, enabled: searchExpansionEnabled)
     }
 
     var body: some View {
@@ -87,6 +130,13 @@ struct MacRootView: View {
         }
         .safeAreaInset(edge: .top) { scopePicker }
         .overlay { emptyState }
+        // Live sidebar search, matching the iPhone: instant Tier-1 token matching,
+        // widened by Tier-2 on-device query expansion when available. On the first
+        // keystroke the model is prewarmed; every keystroke re-drives it.
+        .searchable(text: $listModel.searchText, placement: .sidebar,
+                    prompt: "Search conversations")
+        .onChange(of: listModel.searchText) { _, _ in driveSearch() }
+        .onChange(of: searchExpansionEnabled) { _, _ in driveSearch() }
         .navigationTitle("Jesse")
         .toolbar {
             ToolbarItemGroup {
@@ -145,6 +195,10 @@ struct MacRootView: View {
                 description: Text(coordinator.configStore.isConfigured
                     ? "Start one with the compose button, or pull your phone’s threads with Refresh."
                     : "Connect to your bridge in Settings to begin."))
+        } else if isSearching && layoutIsEmpty {
+            // A search is active but nothing in this scope matches, neither the typed
+            // query nor any expansion term. Clearing the field restores the list.
+            ContentUnavailableView.search(text: listModel.searchText)
         } else if listModel.scope == .favorites, case .flat(let list) = layout, list.isEmpty {
             ContentUnavailableView(
                 "No favorites yet",

@@ -1,14 +1,10 @@
 import XCTest
-@testable import Jesse
+@testable import JesseSearch
 
-// The Tier-2 expansion GATING decision (`shouldExpand`) is iOS-only: it decides
-// when the on-device query-expansion tier is worth invoking, orchestration that
-// lives in the app target, not in the shared JesseConversations predicate. The
-// pure multi-token match tests moved to JesseConversationsTests/ThreadMatchingTests
-// when `threadMatches`/`threadMatchesAny` were extracted; this keeps the gating
-// coverage next to the code it guards.
-@MainActor
-final class ThreadSearchGatingTests: XCTestCase {
+// The Tier-2 expansion GATING decision (`shouldExpand`): when the on-device query
+// expansion tier is worth invoking. Pure and deterministic, so it is asserted
+// directly with no model and no view host. Shared by iOS and macOS via JesseSearch.
+final class SearchGatingTests: XCTestCase {
 
     func testShouldExpandGating() {
         // Trivial (short) query: never expand, regardless of base count.

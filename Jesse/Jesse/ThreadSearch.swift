@@ -2,23 +2,14 @@ import Foundation
 import JesseCore
 import JesseConversations
 
-// The iOS-only search extras that layer on top of the shared match predicate:
-// the expansion-tier gating decision (`shouldExpand`) and the highlighted matched
-// snippet a search row shows. The pure multi-token match predicate itself
-// (`threadMatches`, `threadMatchesAny`, `significantTokens`) now lives in the
-// shared JesseConversations library so iOS and macOS filter their lists the same
-// way; this file keeps only the on-device-expansion orchestration aids, which are
-// iOS-specific. Still Foundation-only and view-free so it stays unit-testable.
-
-/// Whether the query expansion tier is worth invoking. True only when the trimmed
-/// query is a real token (length >= 3, so trivial 1–2 char queries never spend the
-/// model) AND the base matcher already found fewer than `threshold` threads (so a
-/// plentiful result set is never widened). Pure and deterministic.
-func shouldExpand(query: String, baseMatchCount: Int, threshold: Int) -> Bool {
-    let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
-    guard trimmed.count >= 3 else { return false }
-    return baseMatchCount < threshold
-}
+// The iOS-only search extra that layers on top of the shared match predicate: the
+// highlighted matched snippet a search row shows. The pure multi-token match
+// predicate itself (`threadMatches`, `threadMatchesAny`, `significantTokens`) lives
+// in the shared JesseConversations library, and the expansion-tier orchestration
+// (the `shouldExpand` gate, the `ThreadSearchModel`, the on-device expander) now
+// lives in the shared JesseSearch library, so iOS and macOS search the same way.
+// This file keeps only the row snippet, which is iOS-specific presentation. Still
+// Foundation-only and view-free so it stays unit-testable.
 
 // MARK: - Matched snippet (search-only row aid)
 

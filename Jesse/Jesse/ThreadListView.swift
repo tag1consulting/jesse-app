@@ -2,6 +2,7 @@ import SwiftUI
 import SwiftData
 import JesseCore
 import JesseConversations
+import JesseSearch
 
 // Root screen: the list of conversations, newest first. Tapping one opens it;
 // `+` starts a fresh one. Starting several and letting them run at once is just
