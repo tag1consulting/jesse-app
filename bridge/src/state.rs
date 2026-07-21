@@ -17,6 +17,12 @@ pub struct AppState {
     // when a state dir is configured; in-memory otherwise). Filled by
     // `POST /jesse/title` and read by `GET /jesse/sessions`.
     pub titles: Arc<TitleStore>,
+    // Server-side session_id -> favorite/archived flags store (persisted to
+    // `<state_dir>/flags.json` when a state dir is configured; in-memory otherwise).
+    // The bridge is the source of truth for these two flags so every device (iPhone,
+    // Mac) converges on one set of favorites and archived conversations. Read into
+    // `GET /jesse/sessions` and written by `POST /jesse/session/{id}/flags`.
+    pub flags: Arc<FlagStore>,
     // The registered APNs device token (single user). Always present so device
     // registration works even when push is off; persisted to the state dir.
     pub devices: Arc<DeviceStore>,
@@ -65,6 +71,7 @@ impl AppState {
         let jobs_dir = cfg.jobs_dir();
         let device_file = cfg.device_file();
         let titles_file = cfg.titles_file();
+        let flags_file = cfg.flags_file();
         let context_file = cfg.context_file();
         let context_enabled = cfg.context_carry;
         let meal_corrections = Arc::new(MealCorrectionsQueue::from_cfg(&cfg));
@@ -78,6 +85,7 @@ impl AppState {
             queue,
             limiter,
             titles: Arc::new(TitleStore::new(titles_file)),
+            flags: Arc::new(FlagStore::new(flags_file)),
             devices: Arc::new(DeviceStore::new(device_file)),
             notify: Arc::new(NotifyFlags::new()),
             apns: None,

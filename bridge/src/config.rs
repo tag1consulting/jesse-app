@@ -359,6 +359,16 @@ impl Config {
             .map(|d| PathBuf::from(d).join("titles.json"))
     }
 
+    /// The file the per-session favorite / archived flags are persisted to (a
+    /// sibling of `titles.json`), or `None` when persistence is disabled (then the
+    /// flags are in-memory only), the same degradation the job/title/device stores
+    /// have. Holds only the two booleans and their change timestamps, never a secret.
+    pub fn flags_file(&self) -> Option<PathBuf> {
+        self.state_dir
+            .as_deref()
+            .map(|d| PathBuf::from(d).join("flags.json"))
+    }
+
     /// The file the context ledger is persisted to (a sibling of `titles.json`),
     /// or `None` when persistence is disabled — then the ledger is in-memory only,
     /// the same degradation the job/title/device stores have. Holds conversation

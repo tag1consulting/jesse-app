@@ -100,7 +100,7 @@ async fn main() {
     // JESSE_SESSION_TTL_DAYS on a background sweep (one run at startup, then
     // periodic). Scoped to the vault project only; an actively-resumed session
     // touches its mtime and is never reclaimed.
-    spawn_session_gc_task(state.cfg.clone(), state.titles.clone());
+    spawn_session_gc_task(state.cfg.clone(), state.titles.clone(), state.flags.clone());
     axum::serve(listener, app(state))
         .await
         .expect("server error");

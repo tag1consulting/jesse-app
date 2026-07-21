@@ -1266,6 +1266,10 @@ pub fn app(state: AppState) -> Router {
             "/jesse/session/:session_id",
             axum::routing::delete(jesse_session_delete),
         )
+        .route(
+            "/jesse/session/:session_id/flags",
+            post(jesse_session_flags),
+        )
         .route("/jesse/title", post(jesse_title))
         .route("/jesse/meal-corrections", post(jesse_meal_corrections))
         .route("/jesse/result/:job_id", get(jesse_result))

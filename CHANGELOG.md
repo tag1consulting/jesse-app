@@ -15,6 +15,42 @@ CI both run it). See the "Versioning" section of `bridge/README.md`.
 
 ## [Unreleased]
 
+## [Bridge 0.25.0] - 2026-07-21
+
+### Added
+- **The bridge is now the source of truth for a conversation's favorite and
+  archived state, so every device (iPhone, Mac) converges on one set of favorites
+  and one set of archived conversations.** Until now those two flags were per-device
+  local flags on the app's SwiftData thread with no cross-device sync. A new durable
+  per-session flags store (`bridge/src/flagstore.rs`, modeled on the title store)
+  keeps an in-memory `session_id -> SessionFlags` map behind a lock, persisted
+  atomically (temp + rename, mode 0600) to `<state_dir>/flags.json`, loaded at
+  startup, written on change, and in-memory only when no state dir is configured
+  (the same degradation the job, device, and title stores have). Load is tolerant of
+  a missing or future field so adding another flag later stays additive.
+  - **Last-writer-wins per flag.** Each of `favorite` and `archived` carries a
+    client-supplied change timestamp in unix milliseconds (`favorite_updated_ms`,
+    `archived_updated_ms`) and is an independent LWW register: a strictly newer
+    timestamp wins, an equal or older write is ignored. So writes arriving from
+    different devices in any order converge deterministically to the same result.
+  - **Read path.** `GET /jesse/sessions` now carries `favorite`,
+    `favorite_updated_ms`, `archived`, and `archived_updated_ms` on each summary,
+    defaulting to false/0 for a session with no flags row. They are part of the
+    serialized body, so they fold into the list's strong ETag automatically:
+    flipping a flag changes the body and invalidates a cached 304.
+  - **Write path.** New `POST /jesse/session/{id}/flags` (bearer-authenticated,
+    rate-limited, and id-validated exactly like the other per-session routes)
+    accepts any subset of `{ favorite, favorite_updated_ms, archived,
+    archived_updated_ms }`, applies LWW per provided flag, and returns the resulting
+    `SessionFlags`. A structurally-invalid id is a 400; an unknown id (no transcript
+    on disk) is a 404, matching the hydrate route.
+  - **Deletion.** `DELETE /jesse/session/{id}` and the age-based GC sweep now drop
+    the flags row alongside the title, so a deleted or reclaimed conversation cannot
+    resurrect a stale favorite.
+  - **Additive and backward compatible.** An app built before this ignores the new
+    response fields and never calls the new endpoint; the flags default to false
+    everywhere. No app version change is required by this release.
+
 ## [App 1.0 (66)] - 2026-07-21
 
 ### Added
