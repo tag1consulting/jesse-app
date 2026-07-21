@@ -1,6 +1,6 @@
 import XCTest
 import SwiftData
-@testable import Jesse
+import JesseConversations
 import JesseCore
 
 @MainActor

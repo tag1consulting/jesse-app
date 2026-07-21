@@ -14,7 +14,7 @@ import JesseCore
 
 /// Which origin the list is scoped to. `.all` matches everything (scope inactive);
 /// `.watch` matches only watch-originated threads.
-enum ThreadOriginScope {
+public enum ThreadOriginScope {
     case all
     case watch
 }
@@ -23,7 +23,7 @@ enum ThreadOriginScope {
 /// inactive — show everything, like a blank search query); `.watch` matches only a
 /// thread whose `originValue` is `.watch`. Pure and Foundation-only so it composes
 /// before grouping and is tested directly, mirroring `threadMatches`.
-func threadMatchesOrigin(_ thread: JesseThread, scope: ThreadOriginScope) -> Bool {
+public func threadMatchesOrigin(_ thread: JesseThread, scope: ThreadOriginScope) -> Bool {
     switch scope {
     case .all:
         return true

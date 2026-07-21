@@ -24,6 +24,7 @@ let package = Package(
     products: [
         .library(name: "JesseCore", targets: ["JesseCore"]),
         .library(name: "JesseNetworking", targets: ["JesseNetworking"]),
+        .library(name: "JesseConversations", targets: ["JesseConversations"]),
     ],
     targets: [
         .target(
@@ -57,6 +58,28 @@ let package = Package(
         .testTarget(
             name: "JesseNetworkingTests",
             dependencies: ["JesseNetworking"],
+            swiftSettings: [
+                .swiftLanguageMode(.v6),
+            ]
+        ),
+        // The pure, view-free list-presentation layer both apps drive their thread
+        // list from: date sectioning, the collapsible-folder / favorites / origin
+        // layout, and the multi-token match predicate. It reads @Model state on
+        // JesseThread, so like JesseCore it runs under the app's MainActor default
+        // isolation (the free functions were authored against that default and are
+        // only ever called from the MainActor list views). Extracted verbatim from
+        // the iOS target with zero behavior change so iOS and macOS share one source.
+        .target(
+            name: "JesseConversations",
+            dependencies: ["JesseCore"],
+            swiftSettings: [
+                .defaultIsolation(MainActor.self),
+                .swiftLanguageMode(.v6),
+            ]
+        ),
+        .testTarget(
+            name: "JesseConversationsTests",
+            dependencies: ["JesseConversations"],
             swiftSettings: [
                 .swiftLanguageMode(.v6),
             ]

@@ -15,7 +15,7 @@ import JesseCore
 
 extension ThreadSection {
     /// Month buckets fold; day buckets (today / yesterday / weekday) stay loose.
-    var isFolder: Bool {
+    public var isFolder: Bool {
         if case .month = self { return true }
         return false
     }
@@ -24,22 +24,22 @@ extension ThreadSection {
 /// One date section as it should render: its members, whether it's a collapsible
 /// folder (month bucket), and whether it's currently expanded. `visibleThreads`
 /// is what's actually on screen — empty for a collapsed folder.
-struct RenderedThreadSection: Identifiable {
-    let section: ThreadSection
-    let threads: [JesseThread]
-    let isFolder: Bool
-    let isExpanded: Bool
+public struct RenderedThreadSection: Identifiable {
+    public let section: ThreadSection
+    public let threads: [JesseThread]
+    public let isFolder: Bool
+    public let isExpanded: Bool
 
-    var id: ThreadSection { section }
+    public var id: ThreadSection { section }
 
     /// Rows on screen now: the members when loose or expanded, none when a folder
     /// is collapsed (the whole point — collapse hides the rows, not just chrome).
-    var visibleThreads: [JesseThread] { isExpanded ? threads : [] }
+    public var visibleThreads: [JesseThread] { isExpanded ? threads : [] }
 }
 
 /// The two shapes the list takes. Favorites is a single flat list (no folders);
 /// the All tab is date sections, month buckets rendered as collapsible folders.
-enum ThreadListLayout {
+public enum ThreadListLayout {
     case flat([JesseThread])
     case sectioned([RenderedThreadSection])
 }
@@ -63,13 +63,13 @@ enum ThreadListLayout {
 ///   the Tier-1 base match, so expansion is strictly additive.
 /// - `expanded` is the set of month sections the user has opened. Month folders
 ///   default collapsed (absent from the set); day sections are always expanded.
-func threadListLayout(_ threads: [JesseThread],
-                      favoritesOnly: Bool,
-                      originScope: ThreadOriginScope = .all,
-                      searchQueries: [String],
-                      expanded: Set<ThreadSection>,
-                      now: Date,
-                      calendar: Calendar) -> ThreadListLayout {
+public func threadListLayout(_ threads: [JesseThread],
+                             favoritesOnly: Bool,
+                             originScope: ThreadOriginScope = .all,
+                             searchQueries: [String],
+                             expanded: Set<ThreadSection>,
+                             now: Date,
+                             calendar: Calendar) -> ThreadListLayout {
     let scoped = (favoritesOnly ? threads.filter(\.isFavorite) : threads)
         .filter { threadMatchesOrigin($0, scope: originScope) }
     // `threadMatchesAny` returns each thread at most once, so a thread matching
@@ -110,8 +110,8 @@ func threadListLayout(_ threads: [JesseThread],
 /// without a view — feed the result back into `threadListLayout` and the folder's
 /// `isExpanded` (and thus its visible rows) flips. The view wires the folder's
 /// disclosure control's binding-setter to this, so a tap reliably toggles.
-func foldersAfterToggling(_ section: ThreadSection,
-                          in expanded: Set<ThreadSection>) -> Set<ThreadSection> {
+public func foldersAfterToggling(_ section: ThreadSection,
+                                 in expanded: Set<ThreadSection>) -> Set<ThreadSection> {
     var next = expanded
     if next.contains(section) { next.remove(section) } else { next.insert(section) }
     return next
@@ -122,19 +122,19 @@ func foldersAfterToggling(_ section: ThreadSection,
 /// date-range `folderSummary`, and whether it's expanded — the last driving the
 /// disclosure chevron's direction (right = collapsed, down = expanded). Building
 /// this here keeps the folder header a testable seam, not just SwiftUI.
-struct FolderHeaderModel: Equatable {
-    let title: String
-    let summary: String
+public struct FolderHeaderModel: Equatable {
+    public let title: String
+    public let summary: String
     /// True when the folder is open; the header's disclosure chevron reflects it.
-    let isExpanded: Bool
+    public let isExpanded: Bool
     /// SF Symbol for the disclosure chevron, so "the header exposes a chevron that
     /// reflects state" is a concrete, assertable fact rather than view chrome.
-    var chevronSystemImage: String { isExpanded ? "chevron.down" : "chevron.right" }
+    public var chevronSystemImage: String { isExpanded ? "chevron.down" : "chevron.right" }
 }
 
 /// Build the header model for a rendered month folder.
-func folderHeader(for rendered: RenderedThreadSection,
-                  calendar: Calendar, locale: Locale) -> FolderHeaderModel {
+public func folderHeader(for rendered: RenderedThreadSection,
+                         calendar: Calendar, locale: Locale) -> FolderHeaderModel {
     FolderHeaderModel(
         title: rendered.section.title(calendar: calendar),
         summary: folderSummary(for: rendered.threads, calendar: calendar, locale: locale),
@@ -149,7 +149,7 @@ func folderHeader(for rendered: RenderedThreadSection,
 /// Foundation-only and deterministic given a fixed `calendar`/`locale`. Empty
 /// input returns "" (the view never renders a folder for an empty bucket, but the
 /// guard keeps the function total).
-func folderSummary(for threads: [JesseThread], calendar: Calendar, locale: Locale) -> String {
+public func folderSummary(for threads: [JesseThread], calendar: Calendar, locale: Locale) -> String {
     guard !threads.isEmpty else { return "" }
     let count = threads.count
     let noun = count == 1 ? "conversation" : "conversations"

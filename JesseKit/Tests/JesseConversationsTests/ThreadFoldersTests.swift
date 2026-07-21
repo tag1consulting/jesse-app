@@ -1,5 +1,5 @@
 import XCTest
-@testable import Jesse
+import JesseConversations
 import JesseCore
 
 @MainActor
