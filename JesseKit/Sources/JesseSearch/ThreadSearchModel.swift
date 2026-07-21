@@ -5,34 +5,34 @@ import Observation
 // live search field and the pure predicates: it decides WHEN to ask the injected
 // `QueryExpanding` for alternate terms, coalesces rapid typing, caches, cancels
 // stale work, and publishes the currently-active alternate terms for the view to
-// union with the typed query.
+// union with the typed query. Shared by iOS and macOS via the JesseSearch library.
 //
 // The contract is efficiency + silent fallback:
-//   * DEBOUNCE  — wait ~300ms of quiet before spending the model, so a burst of
+//   * DEBOUNCE  wait ~300ms of quiet before spending the model, so a burst of
 //     keystrokes is one call, not one per character.
-//   * GATE      — never call the model for a trivial query or when the base match
+//   * GATE      never call the model for a trivial query or when the base match
 //     set is already plentiful (`shouldExpand`).
-//   * CACHE     — a session-scoped LRU keyed by the normalized query, so a repeat
+//   * CACHE     a session-scoped LRU keyed by the normalized query, so a repeat
 //     or a backspaced-then-retyped query is expanded at most once.
-//   * CANCEL    — a query change cancels the in-flight expansion (structured Task
+//   * CANCEL    a query change cancels the in-flight expansion (structured Task
 //     cancellation), so terms for a query the user has moved on from are never
 //     applied.
-//   * PUBLISH   — `activeTerms` is the alternate list for the current query, empty
+//   * PUBLISH   `activeTerms` is the alternate list for the current query, empty
 //     whenever search is idle, gated off, or the expander returned nothing.
 //
 // The model never blocks the list: the view filters on the typed query immediately
 // and simply widens the set if/when `activeTerms` becomes non-empty.
 @MainActor
 @Observable
-final class ThreadSearchModel {
+public final class ThreadSearchModel {
     /// Alternate search terms currently active for the live query. The view unions
     /// these with the typed query (`threadMatchesAny`). Empty when idle/gated/dry.
-    private(set) var activeTerms: [String] = []
+    public private(set) var activeTerms: [String] = []
 
     /// Master on/off for the whole expansion tier (the Settings toggle). When off,
-    /// `update` never calls the expander — pure Tier-1 search — and any published
+    /// `update` never calls the expander (pure Tier-1 search) and any published
     /// terms are cleared immediately.
-    var isEnabled: Bool {
+    public var isEnabled: Bool {
         didSet { if !isEnabled { clear() } }
     }
 
@@ -41,7 +41,7 @@ final class ThreadSearchModel {
     private let threshold: Int
     private let cacheCapacity: Int
 
-    /// LRU cache of normalized query → expansion terms. `lruOrder` is most-recent
+    /// LRU cache of normalized query to expansion terms. `lruOrder` is most-recent
     /// last; on capacity the front (least-recent) entry is evicted.
     private var cache: [String: [String]] = [:]
     private var lruOrder: [String] = []
@@ -56,11 +56,11 @@ final class ThreadSearchModel {
     /// `threshold` is the base-match count at/above which expansion is skipped
     /// (plenty of direct hits already). Debounce/cache size are injectable so tests
     /// stay deterministic and fast.
-    init(expander: QueryExpanding,
-         isEnabled: Bool = true,
-         debounce: Duration = .milliseconds(300),
-         threshold: Int = 5,
-         cacheCapacity: Int = 32) {
+    public init(expander: QueryExpanding,
+                isEnabled: Bool = true,
+                debounce: Duration = .milliseconds(300),
+                threshold: Int = 5,
+                cacheCapacity: Int = 32) {
         self.expander = expander
         self.isEnabled = isEnabled
         self.debounce = debounce
@@ -71,7 +71,7 @@ final class ThreadSearchModel {
     /// Feed the live query text and the CURRENT base-match count (threads matching
     /// the typed query alone). Debounces, gates, caches, and cancels as described.
     /// Safe to call on every keystroke and on every base-count change.
-    func update(query: String, baseMatchCount: Int) {
+    public func update(query: String, baseMatchCount: Int) {
         let normalized = normalize(query)
 
         // A different query invalidates any in-flight expansion for the old one:
@@ -83,19 +83,19 @@ final class ThreadSearchModel {
         }
         currentQuery = normalized
 
-        // Tier disabled (Settings toggle off) → pure Tier-1, never call the model.
+        // Tier disabled (Settings toggle off) -> pure Tier-1, never call the model.
         guard isEnabled else {
             activeTerms = []
             return
         }
 
-        // Search idle → no terms, no work.
+        // Search idle -> no terms, no work.
         if normalized.isEmpty {
             activeTerms = []
             return
         }
 
-        // Gate: trivial query or already-plentiful base results → don't spend the
+        // Gate: trivial query or already-plentiful base results -> don't spend the
         // model, and clear any terms carried over from a previous query.
         guard shouldExpand(query: normalized, baseMatchCount: baseMatchCount,
                            threshold: threshold) else {
@@ -103,16 +103,16 @@ final class ThreadSearchModel {
             return
         }
 
-        // Cache hit → apply immediately, no expander call.
+        // Cache hit -> apply immediately, no expander call.
         if let cached = cachedTerms(for: normalized) {
             activeTerms = cached
             return
         }
 
-        // Already expanding exactly this query → let it finish (no duplicate call).
+        // Already expanding exactly this query -> let it finish (no duplicate call).
         if taskQuery == normalized, task != nil { return }
 
-        // Miss → debounce, then a single expander call; apply only if still current.
+        // Miss -> debounce, then a single expander call; apply only if still current.
         taskQuery = normalized
         task = Task { [weak self] in
             guard let self else { return }
@@ -124,14 +124,23 @@ final class ThreadSearchModel {
         }
     }
 
+    /// `nonisolated` so releasing the model never hops to the main actor: under the
+    /// module's MainActor-default isolation the synthesized deinit would otherwise be
+    /// MainActor-isolated, and destroying an instance off the main actor (as a test
+    /// host or a background release can) would route through the isolated-deinit
+    /// executor hop, which aborts. The stored properties still release normally after
+    /// this body, and the debounced task captures `self` weakly, so a dropped model
+    /// leaves nothing running against it (its `guard let self` bails).
+    nonisolated deinit {}
+
     /// Warm the expander (on search-field focus) so the first query doesn't pay
     /// cold-start latency. Forwards to the injected expander's optional `prewarm`.
-    func prewarm() {
+    public func prewarm() {
         expander.prewarm()
     }
 
     /// Clear all state (search dismissed). Cancels any in-flight expansion.
-    func clear() {
+    public func clear() {
         task?.cancel()
         task = nil
         taskQuery = nil
@@ -141,13 +150,13 @@ final class ThreadSearchModel {
 
     /// Test hook: await the in-flight expansion (if any) so assertions run after
     /// the debounce + expander call have settled. No-op when nothing is in flight.
-    func awaitPendingExpansion() async {
+    public func awaitPendingExpansion() async {
         await task?.value
     }
 
     // MARK: - Internals
 
-    /// Fold the expander's result into the cache and publish it — but only if the
+    /// Fold the expander's result into the cache and publish it, but only if the
     /// user is still on this query (a change since the call started drops it).
     private func applyExpansion(_ terms: [String], for query: String) {
         store(terms, for: query)

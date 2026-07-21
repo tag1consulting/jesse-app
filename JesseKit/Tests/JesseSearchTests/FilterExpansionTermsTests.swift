@@ -1,13 +1,11 @@
 import XCTest
-@testable import Jesse
+@testable import JesseSearch
 
 // Tests the PURE result-filtering helper of the Foundation Models expander. The
 // real on-device model is unavailable in CI / the Simulator, so the model call
 // itself isn't exercised here; `filterExpansionTerms` is the deterministic core
-// that shapes whatever the model returns. This file does NOT import FoundationModels
-// — proving the filter is usable without the model framework.
-@MainActor
-final class FoundationModelExpanderTests: XCTestCase {
+// that shapes whatever the model returns. These assertions never touch a model.
+final class FilterExpansionTermsTests: XCTestCase {
 
     func testTrimsAndDropsBlanks() {
         let out = filterExpansionTerms(["  span  ", "", "   ", "overpass"], original: "bridge")

@@ -24,6 +24,9 @@
 		B0D0F3000000000000F30022 /* JesseConversations in Frameworks */ = {isa = PBXBuildFile; productRef = B0D0F3000000000000F30021 /* JesseConversations */; };
 		B0D0F3000000000000F30032 /* JesseConversations in Frameworks */ = {isa = PBXBuildFile; productRef = B0D0F3000000000000F30031 /* JesseConversations */; };
 		B0D0F3000000000000F30042 /* JesseConversations in Frameworks */ = {isa = PBXBuildFile; productRef = B0D0F3000000000000F30041 /* JesseConversations */; };
+		B0D0F4000000000000F40012 /* JesseSearch in Frameworks */ = {isa = PBXBuildFile; productRef = B0D0F4000000000000F40011 /* JesseSearch */; };
+		B0D0F4000000000000F40022 /* JesseSearch in Frameworks */ = {isa = PBXBuildFile; productRef = B0D0F4000000000000F40021 /* JesseSearch */; };
+		B0D0F4000000000000F40042 /* JesseSearch in Frameworks */ = {isa = PBXBuildFile; productRef = B0D0F4000000000000F40041 /* JesseSearch */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
@@ -182,6 +185,7 @@
 				B0D0F1000000000000F10012 /* JesseCore in Frameworks */,
 				B0D0F2000000000000F20012 /* JesseNetworking in Frameworks */,
 				B0D0F3000000000000F30012 /* JesseConversations in Frameworks */,
+				B0D0F4000000000000F40012 /* JesseSearch in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -223,6 +227,7 @@
 				B0D0F1000000000000F10022 /* JesseCore in Frameworks */,
 				B0D0F2000000000000F20022 /* JesseNetworking in Frameworks */,
 				B0D0F3000000000000F30022 /* JesseConversations in Frameworks */,
+				B0D0F4000000000000F40022 /* JesseSearch in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -232,6 +237,7 @@
 			files = (
 				B0D0F1000000000000F10042 /* JesseCore in Frameworks */,
 				B0D0F3000000000000F30042 /* JesseConversations in Frameworks */,
+				B0D0F4000000000000F40042 /* JesseSearch in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -306,6 +312,7 @@
 				B0D0F1000000000000F10011 /* JesseCore */,
 				B0D0F2000000000000F20011 /* JesseNetworking */,
 				B0D0F3000000000000F30011 /* JesseConversations */,
+				B0D0F4000000000000F40011 /* JesseSearch */,
 			);
 			productName = Jesse;
 			productReference = B0D068152FE83E3F00C8C4B0 /* Jesse.app */;
@@ -422,6 +429,7 @@
 				B0D0F1000000000000F10021 /* JesseCore */,
 				B0D0F2000000000000F20021 /* JesseNetworking */,
 				B0D0F3000000000000F30021 /* JesseConversations */,
+				B0D0F4000000000000F40021 /* JesseSearch */,
 			);
 			productName = "Jesse Mac";
 			productReference = B0D06E00000000000000E015 /* Jesse Mac.app */;
@@ -447,6 +455,7 @@
 			packageProductDependencies = (
 				B0D0F1000000000000F10041 /* JesseCore */,
 				B0D0F3000000000000F30041 /* JesseConversations */,
+				B0D0F4000000000000F40041 /* JesseSearch */,
 			);
 			productName = "Jesse MacTests";
 			productReference = B0D070000000000000007015 /* Jesse MacTests.xctest */;
@@ -785,7 +794,7 @@
 				CLANG_ENABLE_MODULES = YES;
 				CODE_SIGN_ENTITLEMENTS = Jesse/Jesse.entitlements;
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 63;
+				CURRENT_PROJECT_VERSION = 64;
 				DEVELOPMENT_TEAM = C6RPS3BGXX;
 				ENABLE_PREVIEWS = YES;
 				GENERATE_INFOPLIST_FILE = YES;
@@ -821,7 +830,7 @@
 				CLANG_ENABLE_MODULES = YES;
 				CODE_SIGN_ENTITLEMENTS = Jesse/Jesse.entitlements;
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 63;
+				CURRENT_PROJECT_VERSION = 64;
 				DEVELOPMENT_TEAM = C6RPS3BGXX;
 				ENABLE_PREVIEWS = YES;
 				GENERATE_INFOPLIST_FILE = YES;
@@ -853,7 +862,7 @@
 			buildSettings = {
 				BUNDLE_LOADER = "$(TEST_HOST)";
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 63;
+				CURRENT_PROJECT_VERSION = 64;
 				DEVELOPMENT_TEAM = C6RPS3BGXX;
 				GENERATE_INFOPLIST_FILE = YES;
 				IPHONEOS_DEPLOYMENT_TARGET = 26.5;
@@ -872,7 +881,7 @@
 			buildSettings = {
 				BUNDLE_LOADER = "$(TEST_HOST)";
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 63;
+				CURRENT_PROJECT_VERSION = 64;
 				DEVELOPMENT_TEAM = C6RPS3BGXX;
 				GENERATE_INFOPLIST_FILE = YES;
 				IPHONEOS_DEPLOYMENT_TARGET = 26.5;
@@ -893,7 +902,7 @@
 				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
 				CLANG_ENABLE_MODULES = YES;
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 63;
+				CURRENT_PROJECT_VERSION = 64;
 				DEVELOPMENT_TEAM = C6RPS3BGXX;
 				ENABLE_PREVIEWS = YES;
 				GENERATE_INFOPLIST_FILE = YES;
@@ -927,7 +936,7 @@
 				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
 				CLANG_ENABLE_MODULES = YES;
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 63;
+				CURRENT_PROJECT_VERSION = 64;
 				DEVELOPMENT_TEAM = C6RPS3BGXX;
 				ENABLE_PREVIEWS = YES;
 				GENERATE_INFOPLIST_FILE = YES;
@@ -960,7 +969,7 @@
 			buildSettings = {
 				BUNDLE_LOADER = "$(TEST_HOST)";
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 63;
+				CURRENT_PROJECT_VERSION = 64;
 				DEVELOPMENT_TEAM = C6RPS3BGXX;
 				GENERATE_INFOPLIST_FILE = YES;
 				MARKETING_VERSION = 1.0;
@@ -980,7 +989,7 @@
 			buildSettings = {
 				BUNDLE_LOADER = "$(TEST_HOST)";
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 63;
+				CURRENT_PROJECT_VERSION = 64;
 				DEVELOPMENT_TEAM = C6RPS3BGXX;
 				GENERATE_INFOPLIST_FILE = YES;
 				MARKETING_VERSION = 1.0;
@@ -1002,7 +1011,7 @@
 				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
 				CLANG_ENABLE_MODULES = YES;
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 63;
+				CURRENT_PROJECT_VERSION = 64;
 				DEVELOPMENT_TEAM = C6RPS3BGXX;
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_FILE = JesseWidgets/Info.plist;
@@ -1034,7 +1043,7 @@
 				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
 				CLANG_ENABLE_MODULES = YES;
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 63;
+				CURRENT_PROJECT_VERSION = 64;
 				DEVELOPMENT_TEAM = C6RPS3BGXX;
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_FILE = JesseWidgets/Info.plist;
@@ -1068,7 +1077,7 @@
 				CLANG_ENABLE_MODULES = YES;
 				CODE_SIGN_STYLE = Automatic;
 				COMBINE_HIDPI_IMAGES = YES;
-				CURRENT_PROJECT_VERSION = 63;
+				CURRENT_PROJECT_VERSION = 64;
 				DEVELOPMENT_TEAM = C6RPS3BGXX;
 				ENABLE_PREVIEWS = YES;
 				GENERATE_INFOPLIST_FILE = YES;
@@ -1101,7 +1110,7 @@
 				CLANG_ENABLE_MODULES = YES;
 				CODE_SIGN_STYLE = Automatic;
 				COMBINE_HIDPI_IMAGES = YES;
-				CURRENT_PROJECT_VERSION = 63;
+				CURRENT_PROJECT_VERSION = 64;
 				DEVELOPMENT_TEAM = C6RPS3BGXX;
 				ENABLE_PREVIEWS = YES;
 				GENERATE_INFOPLIST_FILE = YES;
@@ -1131,7 +1140,7 @@
 			buildSettings = {
 				BUNDLE_LOADER = "$(TEST_HOST)";
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 63;
+				CURRENT_PROJECT_VERSION = 64;
 				DEVELOPMENT_TEAM = C6RPS3BGXX;
 				GENERATE_INFOPLIST_FILE = YES;
 				MACOSX_DEPLOYMENT_TARGET = 26.0;
@@ -1150,7 +1159,7 @@
 			buildSettings = {
 				BUNDLE_LOADER = "$(TEST_HOST)";
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 63;
+				CURRENT_PROJECT_VERSION = 64;
 				DEVELOPMENT_TEAM = C6RPS3BGXX;
 				GENERATE_INFOPLIST_FILE = YES;
 				MACOSX_DEPLOYMENT_TARGET = 26.0;
@@ -1292,6 +1301,18 @@
 		B0D0F3000000000000F30041 /* JesseConversations */ = {
 			isa = XCSwiftPackageProductDependency;
 			productName = JesseConversations;
+		};
+		B0D0F4000000000000F40011 /* JesseSearch */ = {
+			isa = XCSwiftPackageProductDependency;
+			productName = JesseSearch;
+		};
+		B0D0F4000000000000F40021 /* JesseSearch */ = {
+			isa = XCSwiftPackageProductDependency;
+			productName = JesseSearch;
+		};
+		B0D0F4000000000000F40041 /* JesseSearch */ = {
+			isa = XCSwiftPackageProductDependency;
+			productName = JesseSearch;
 		};
 /* End XCSwiftPackageProductDependency section */
 	};

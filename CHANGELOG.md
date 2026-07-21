@@ -15,6 +15,41 @@ CI both run it). See the "Versioning" section of `bridge/README.md`.
 
 ## [Unreleased]
 
+## [App 1.0 (64)] - 2026-07-21
+
+### Added
+- **The iPhone's two-tier conversation search now works on the Mac too, from one
+  shared implementation.** The Mac sidebar gains a live search that matches the
+  iPhone: instant Tier-1 token matching over conversation titles and transcript
+  text, widened by Tier-2 on-device query expansion when the model is available,
+  with a Settings toggle for the expansion tier and silent fallback to Tier-1
+  everywhere. Nothing is ever sent off the device.
+  - **Shared library (`JesseSearch`).** The search seams that lived only in the iOS
+    target moved into a new `JesseSearch` library in `JesseKit`, so iOS and macOS
+    search from one source: the framework-agnostic query-expansion seam
+    (`QueryExpanding`), the debounce / gate / cache / cancel orchestration model
+    (`ThreadSearchModel`), the pure gating decision (`shouldExpand`), and the single
+    FoundationModels-backed on-device expander. The expander stays the only file
+    that imports FoundationModels and guards model availability at runtime (it
+    degrades to no expansion when the model is unavailable), so the same code
+    compiles and runs on iOS 26 and macOS 26. The iOS app now imports the shared
+    library with no behavior change.
+  - **Mac search UI.** A `.searchable` field in the sidebar filters the list on the
+    typed query immediately and widens if and when on-device expansion terms arrive;
+    the model never blocks the list. An active search force-expands month folders so
+    no match hides behind a collapsed header, and search composes with the existing
+    Favorites and Archived scopes (scope is applied before the search filter, so
+    searching within a scope searches only that subset). A "Smart search
+    (on-device)" toggle in Mac Settings drives the expansion tier, matching the
+    iPhone; when off, only Tier-1 runs.
+  - **Tests.** The pure search tests (`filterExpansionTerms`, gating, and the
+    orchestration model's debounce / gate / cache / cancel via a fake expander) moved
+    into `JesseSearchTests` and run in the fast package suite. A new `JesseMacTests`
+    case drives the Mac view model with a fake expander and asserts that typing a
+    query narrows the layout to the Tier-1 matches and widens to include an
+    expansion-only match, and that a disabled tier and a scoped search behave as
+    expected.
+
 ## [App 1.0 (63)] - 2026-07-21
 
 ### Added

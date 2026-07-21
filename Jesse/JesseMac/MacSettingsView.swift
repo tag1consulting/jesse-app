@@ -14,6 +14,11 @@ struct MacSettingsView: View {
     @State private var token: String = ""
     @State private var pasteLink: String = ""
 
+    // Master switch for the on-device query-expansion tier (Tier 2), matching the
+    // iPhone's Settings toggle. Same key and default (ON). Off -> sidebar search is
+    // pure Tier-1 token matching with no on-device model calls.
+    @AppStorage("searchExpansionEnabled") private var searchExpansionEnabled = true
+
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
             Text("Bridge Connection").font(.title2.weight(.semibold)).padding()
@@ -40,6 +45,15 @@ struct MacSettingsView: View {
                     Text("Pairing link")
                 } footer: {
                     Text("Paste a jesse://pair link to fill the fields above.")
+                        .font(.caption).foregroundStyle(.secondary)
+                }
+
+                Section {
+                    Toggle("Smart search (on-device)", isOn: $searchExpansionEnabled)
+                } header: {
+                    Text("Search")
+                } footer: {
+                    Text("Widens sidebar search with related terms suggested by the on-device model. Everything stays on this Mac; turn it off to match only what you type.")
                         .font(.caption).foregroundStyle(.secondary)
                 }
             }

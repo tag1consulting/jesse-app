@@ -1,11 +1,13 @@
 import XCTest
-@testable import Jesse
+@testable import JesseSearch
 
-/// A scripted, call-counting `QueryExpanding` fake (item 3) so the orchestration
-/// model's gating / cache / cancellation are assertable without any real model.
+/// A scripted, call-counting `QueryExpanding` fake so the orchestration model's
+/// gating / cache / cancellation are assertable without any real model. `@MainActor`
+/// because `QueryExpanding` is main-actor-isolated under JesseSearch's default
+/// isolation.
 @MainActor
 final class FakeQueryExpander: QueryExpanding {
-    /// Total `expand` invocations, and the queries in call order — the gating and
+    /// Total `expand` invocations, and the queries in call order: the gating and
     /// cache assertions read these.
     private(set) var callCount = 0
     private(set) var calledQueries: [String] = []
@@ -41,7 +43,7 @@ final class ThreadSearchModelTests: XCTestCase {
         // Base results already plentiful (>= threshold): no need to widen.
         m.update(query: "bridge", baseMatchCount: 10)
         await m.awaitPendingExpansion()
-        XCTAssertEqual(fake.callCount, 0, "plentiful base → no expander call")
+        XCTAssertEqual(fake.callCount, 0, "plentiful base -> no expander call")
         XCTAssertTrue(m.activeTerms.isEmpty)
     }
 
@@ -54,7 +56,7 @@ final class ThreadSearchModelTests: XCTestCase {
         XCTAssertTrue(m.activeTerms.isEmpty)
     }
 
-    // MARK: - Thin base → one call, terms published
+    // MARK: - Thin base -> one call, terms published
 
     func testThinBaseCallsExpanderOnceAndPublishesTerms() async {
         let fake = FakeQueryExpander()
@@ -74,7 +76,7 @@ final class ThreadSearchModelTests: XCTestCase {
         let m = model(fake)
         m.update(query: "bridge", baseMatchCount: 0)
         await m.awaitPendingExpansion()
-        // Repeat (or backspace-then-retype): normalized key is identical → cache hit.
+        // Repeat (or backspace-then-retype): normalized key is identical -> cache hit.
         m.update(query: "  Bridge ", baseMatchCount: 0)
         await m.awaitPendingExpansion()
         XCTAssertEqual(fake.callCount, 1, "a repeated query is expanded at most once")
@@ -89,7 +91,7 @@ final class ThreadSearchModelTests: XCTestCase {
             await m.awaitPendingExpansion()
         }
         XCTAssertEqual(fake.callCount, 3)
-        // "cats" was the least-recently-used and is evicted → re-querying it calls
+        // "cats" was the least-recently-used and is evicted -> re-querying it calls
         // the expander again; "birds" (most recent) is still cached.
         m.update(query: "cats", baseMatchCount: 0)
         await m.awaitPendingExpansion()
@@ -141,13 +143,13 @@ final class ThreadSearchModelTests: XCTestCase {
         XCTAssertTrue(m.activeTerms.isEmpty, "clearing the query clears the alternate terms")
     }
 
-    // MARK: - Master off switch (item 9)
+    // MARK: - Master off switch
 
     func testDisabledTierMakesNoExpanderCallsRegardlessOfBaseCount() async {
         let fake = FakeQueryExpander()
         let m = model(fake)
         m.isEnabled = false
-        // Thin base (would normally expand) and zero base — neither may call out.
+        // Thin base (would normally expand) and zero base: neither may call out.
         m.update(query: "bridge", baseMatchCount: 0)
         await m.awaitPendingExpansion()
         m.update(query: "tunnel", baseMatchCount: 0)
