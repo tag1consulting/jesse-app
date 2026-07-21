@@ -60,6 +60,29 @@ CI both run it). See the "Versioning" section of `bridge/README.md`.
     stream now shares the iOS session ceilings (a day-long resource timeout), which only
     raises a cap and never changes which frames arrive.
 
+## [Bridge 0.24.2] — 2026-07-21
+
+### Fixed
+- **The diet gate now recognizes "track", the most common real logging verb.**
+  `DIET_KEYWORDS` had `log`/`logged`/`logging` but not `track`, so the bare
+  imperative with a weight-and-food object ("track 30g of walnuts") never matched.
+  A missed gate is silent and looks fine from the outside — the turn just takes the hosted
+  path and logs correctly — which is why this went unnoticed: the local ladder was
+  simply never entered.
+  Measured over the 203 turns in one deployment's context ledger (2026-07-16 → -21):
+  59 turns logged food or exercise and **16 (27%) missed the gate**, of which
+  "track" alone accounts for **8**.
+  **Only the bare imperative is added — not `tracked`/`tracking`.** All 36 real diet
+  uses are the bare verb, while the inflected forms appear overwhelmingly in
+  non-diet senses (asking how long something has been tracked). Since the vault-QA
+  gate yields to diet intent (`vaultqagate.rs:164`), matching them would hijack
+  ordinary vault questions — caught by two existing `vaultqagate` tests when a first
+  cut added all three forms. A regression test now pins the inflected forms OUT.
+  The remaining misses are elliptical continuations inside a logging thread — a bare
+  quantity-and-food follow-up ("another 40g of the same") with no verb at all;
+  per-deployment food nouns in `persona.diet_keywords_extra` cover those today, and
+  a thread-context rule would address them structurally.
+
 ## [App 1.0 (60)] - 2026-07-21
 
 ### Changed
@@ -94,6 +117,7 @@ CI both run it). See the "Versioning" section of `bridge/README.md`.
     build steps pass `SWIFT_SUPPRESS_WARNINGS=NO` so warnings-as-errors no longer
     conflicts with the suppression Xcode applies to package dependencies. No bridge
     changes.
+
 
 ## [Bridge 0.24.1] — 2026-07-21
 
