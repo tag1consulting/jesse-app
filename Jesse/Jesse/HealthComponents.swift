@@ -6,8 +6,9 @@ import UIKit
 // `HealthDisplay`; nothing here decides a color band or a remaining string. Dark
 // mode falls out of the semantic colors and grouped backgrounds; no emoji.
 
-/// Map a semantic status to a display color. Yellow → orange for legibility;
-/// `suspended` → secondary (shown plain, no judgment).
+/// Map a semantic status BAND to a display color. Used only by the per-nutrient trend
+/// chart, where a single nutrient's band is unambiguous over time. The Health tab itself
+/// colors from `toneColor` so a color means one thing on every row.
 func statusColor(_ status: DietSemantics.Status) -> Color {
     switch status {
     case .red: return .red
@@ -15,6 +16,31 @@ func statusColor(_ status: DietSemantics.Status) -> Color {
     case .green: return .green
     case .suspended: return .secondary
     }
+}
+
+/// Map a one-meaning display `Tone` to a color — the single color seam the Health tab's
+/// rings, meters, and bars use. Each color means the SAME thing on every row:
+/// green = good, neutral grey = coming along / no judgment, amber = a gentle nudge, a
+/// muted clay = worth a note (never a bright alarm-red). Direction lives in the words.
+func toneColor(_ tone: DietSemantics.Tone) -> Color {
+    switch tone {
+    case .onTrack: return .green
+    case .inProgress: return .secondary
+    case .nudge: return .orange
+    case .takeNote: return .dietTakeNote
+    }
+}
+
+extension Color {
+    /// The "take note" tone: a muted clay/terracotta that reads as "worth attention"
+    /// without the alarm of pure red — deliberately calmer than `.red`. Resolved per
+    /// color scheme (a touch brighter in dark mode) via a `UIColor` dynamic provider,
+    /// matching how the macro identity colors adapt.
+    static let dietTakeNote = Color(UIColor { traits in
+        traits.userInterfaceStyle == .dark
+            ? UIColor(red: 0.80, green: 0.47, blue: 0.32, alpha: 1)   // #CC7852
+            : UIColor(red: 0.69, green: 0.37, blue: 0.23, alpha: 1)   // #B05E3B
+    })
 }
 
 /// The goal glyph (≥ floor, ≤ ceiling, ↕ window) in a subtle chip.
@@ -33,17 +59,18 @@ struct GoalChip: View {
     }
 }
 
-/// A thin status-tinted progress meter. `fraction` is clamped to [0, 1] for the
-/// fill; values over target simply peg full (the remaining text says "over").
+/// A thin tone-tinted progress meter. `fraction` is clamped to [0, 1] for the fill;
+/// values over target simply peg full (the remaining text says "over"). The fill color
+/// is the one-meaning `Tone`, so the meter never disagrees with the row's words.
 struct StatusMeter: View {
     let fraction: Double?
-    let status: DietSemantics.Status
+    let tone: DietSemantics.Tone
     var height: CGFloat = 8
     var body: some View {
         GeometryReader { geo in
             ZStack(alignment: .leading) {
                 Capsule().fill(Color(.tertiarySystemFill))
-                Capsule().fill(statusColor(status))
+                Capsule().fill(toneColor(tone))
                     .frame(width: geo.size.width * min(max(fraction ?? 0, 0), 1))
             }
         }
@@ -93,11 +120,11 @@ struct CaloriesHeroRing: View {
     var body: some View {
         VStack(spacing: 12) {
             Button(action: onTap) {
-                ActivityRing(fraction: HealthRing.fill(gauge), color: statusColor(gauge.status), lineWidth: 20) {
+                ActivityRing(fraction: HealthRing.fill(gauge), color: toneColor(gauge.tone), lineWidth: 20) {
                     VStack(spacing: 2) {
                         Text(CaloriesHero.centerNumber(gauge))
                             .font(.system(size: 46, weight: .bold, design: .rounded).monospacedDigit())
-                            .foregroundStyle(statusColor(gauge.status))
+                            .foregroundStyle(toneColor(gauge.tone))
                         Text(CaloriesHero.centerCaption(gauge))
                             .font(.subheadline)
                             .foregroundStyle(.secondary)
@@ -132,10 +159,10 @@ struct MacroRing: View {
     var body: some View {
         Button(action: onTap) {
             VStack(spacing: 7) {
-                ActivityRing(fraction: HealthRing.fill(gauge), color: statusColor(gauge.status), lineWidth: 7) {
+                ActivityRing(fraction: HealthRing.fill(gauge), color: toneColor(gauge.tone), lineWidth: 7) {
                     Text(HealthRing.centerLabel(gauge))
                         .font(.footnote.weight(.semibold).monospacedDigit())
-                        .foregroundStyle(statusColor(gauge.status))
+                        .foregroundStyle(toneColor(gauge.tone))
                         .lineLimit(1)
                         .minimumScaleFactor(0.6)
                         .padding(4)
@@ -480,12 +507,12 @@ struct MetricBarRow: View {
                         .foregroundStyle(isSubEntry ? AnyShapeStyle(.secondary) : AnyShapeStyle(.primary))
                     Spacer()
                     Text(valueTarget).font(.subheadline.monospacedDigit())
-                        .foregroundStyle(statusColor(gauge.status))
+                        .foregroundStyle(toneColor(gauge.tone))
                     if onTap != nil {
                         Image(systemName: "info.circle").font(.caption).foregroundStyle(.tertiary)
                     }
                 }
-                StatusMeter(fraction: gauge.fraction, status: gauge.status)
+                StatusMeter(fraction: gauge.fraction, tone: gauge.tone)
                 HStack {
                     Text(gauge.remaining).font(.caption).foregroundStyle(.secondary)
                     Spacer()
@@ -964,6 +991,34 @@ struct HealthInsightView: View {
                 text = snapshot
             }
         }
+    }
+}
+
+// MARK: - Day summary (leads the Today screen)
+
+/// The plain-language summary that LEADS the Today screen — one line for "how am I
+/// doing", one for "what would help next" — so the answer is legible before any gauge.
+/// A single small tone dot is the only color, and it means the same thing the rings do.
+/// The per-nutrient detail below stays available but quieter.
+struct DaySummaryCard: View {
+    let summary: DaySummary
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(alignment: .firstTextBaseline, spacing: 8) {
+                Circle().fill(toneColor(summary.tone)).frame(width: 10, height: 10)
+                    .accessibilityHidden(true)
+                Text(summary.headline)
+                    .font(.headline)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            Text(summary.nextAction)
+                .font(.subheadline)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel("\(summary.headline) \(summary.nextAction)")
     }
 }
 

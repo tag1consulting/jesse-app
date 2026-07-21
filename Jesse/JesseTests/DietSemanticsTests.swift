@@ -39,9 +39,9 @@ final class DietSemanticsTests: XCTestCase {
     }
 
     func testFloorRemaining() {
-        XCTAssertEqual(S.floorRemaining(value: 80, target: 100), "need 20g more")
-        XCTAssertEqual(S.floorRemaining(value: 100, target: 100), "target hit")
-        XCTAssertEqual(S.floorRemaining(value: 130, target: 100), "target hit")
+        XCTAssertEqual(S.floorRemaining(value: 80, target: 100), "20g to go")
+        XCTAssertEqual(S.floorRemaining(value: 100, target: 100), "there — nice")
+        XCTAssertEqual(S.floorRemaining(value: 130, target: 100), "there — nice")
     }
 
     // MARK: - CEILING band (calories on a normal day)
@@ -54,11 +54,11 @@ final class DietSemanticsTests: XCTestCase {
     }
 
     func testCeilingRemaining() {
-        XCTAssertEqual(S.ceilingRemaining(value: 1800, target: 2100), "300 left")
-        XCTAssertEqual(S.ceilingRemaining(value: 2100, target: 2100), "at limit")
-        XCTAssertEqual(S.ceilingRemaining(value: 2300, target: 2100), "200 over limit")
+        XCTAssertEqual(S.ceilingRemaining(value: 1800, target: 2100), "room for 300")
+        XCTAssertEqual(S.ceilingRemaining(value: 2100, target: 2100), "right on target")
+        XCTAssertEqual(S.ceilingRemaining(value: 2300, target: 2100), "200 over")
         // With a unit (fat-as-ceiling on a carb-load day).
-        XCTAssertEqual(S.ceilingRemaining(value: 40, target: 65, unit: "g"), "25g left")
+        XCTAssertEqual(S.ceilingRemaining(value: 40, target: 65, unit: "g"), "room for 25g")
     }
 
     // MARK: - FAT WINDOW (normal day)
@@ -73,9 +73,9 @@ final class DietSemanticsTests: XCTestCase {
     }
 
     func testFatWindowRemaining() {
-        XCTAssertEqual(S.fatWindowRemaining(grams: 40), "need 10g to floor")
-        XCTAssertEqual(S.fatWindowRemaining(grams: 55), "10g to cap")
-        XCTAssertEqual(S.fatWindowRemaining(grams: 72), "7g over cap")
+        XCTAssertEqual(S.fatWindowRemaining(grams: 40), "10g to the 50g floor")
+        XCTAssertEqual(S.fatWindowRemaining(grams: 55), "in range")
+        XCTAssertEqual(S.fatWindowRemaining(grams: 72), "7g above the range")
     }
 
     // MARK: - CALORIE WINDOW (carb-load day)
@@ -88,7 +88,7 @@ final class DietSemanticsTests: XCTestCase {
     }
 
     func testCalorieWindowRemaining() {
-        XCTAssertEqual(S.calorieWindowRemaining(value: 2000, target: 3000), "need 760 more") // to 92%
+        XCTAssertEqual(S.calorieWindowRemaining(value: 2000, target: 3000), "760 more to go") // to 92%
         XCTAssertEqual(S.calorieWindowRemaining(value: 2800, target: 3000), "in window")
         XCTAssertEqual(S.calorieWindowRemaining(value: 3200, target: 3000), "200 over")
     }
@@ -109,6 +109,63 @@ final class DietSemanticsTests: XCTestCase {
         XCTAssertNil(S.fatLowFlag(fat: 30, hour: 15))
         XCTAssertNotNil(S.fatLowFlag(fat: 30, hour: 16))   // under 50g floor, after 4pm
         XCTAssertNil(S.fatLowFlag(fat: 60, hour: 20))      // not low
+    }
+
+    // MARK: - Tone (the one-meaning display signal)
+
+    func testToneMetIsOnTrackAndNoGoalIsNeutral() {
+        XCTAssertEqual(S.tone(goalStatus: .met, hour: 9, target: 100), .onTrack)
+        XCTAssertEqual(S.tone(goalStatus: .met, hour: 20, target: 100), .onTrack)
+        // No usable target → neutral, never a judgment.
+        XCTAssertEqual(S.tone(goalStatus: .noGoal, hour: 20, target: nil), .inProgress)
+    }
+
+    func testToneShortIsNeutralEarlyThenNudgeLate() {
+        // The morning fix: a floor merely unfinished early is neutral, NOT a problem.
+        XCTAssertEqual(S.tone(goalStatus: .short(80), hour: 9, target: 140), .inProgress)
+        XCTAssertEqual(S.tone(goalStatus: .short(80), hour: 15, target: 140), .inProgress)
+        // At/after the wind-down hour a still-short floor earns a gentle nudge.
+        XCTAssertEqual(S.tone(goalStatus: .short(80), hour: 16, target: 140), .nudge)
+        XCTAssertEqual(S.tone(goalStatus: .short(80), hour: 20, target: 140), .nudge)
+    }
+
+    func testToneOverIsNudgeUntilWellOverLate() {
+        // A little over is a nudge at any hour.
+        XCTAssertEqual(S.tone(goalStatus: .over(50), hour: 20, target: 2000), .nudge)
+        // Well over (≥10% of target) AND late escalates to the firmer take-note tone.
+        XCTAssertEqual(S.tone(goalStatus: .over(250), hour: 20, target: 2000), .takeNote)
+        // Same magnitude, but early in the day → still just a nudge (you can course-correct).
+        XCTAssertEqual(S.tone(goalStatus: .over(250), hour: 11, target: 2000), .nudge)
+    }
+
+    func testToneHardOverIsAlwaysTakeNote() {
+        // A hard-cap breach (fat > 70g) is the firmer line regardless of hour.
+        XCTAssertEqual(S.tone(goalStatus: .over(6), hour: 9, target: 65, hardOver: true), .takeNote)
+    }
+
+    func testGaugesMorningFloorsAreNeutralNotAlarming() {
+        // ~9am, only breakfast logged: floors are far short but it's EARLY, so every macro
+        // ring reads as calmly in progress — never the old red "failure" at 9am.
+        let meals = [DietMeal(name: "breakfast", time: "08:00", items: [item(520, 30, 18, 68, 6)])]
+        let targets = DietTargets(calories: 2600, protein: 140, fat: 65, carbs: 300, carbsBase: 300, fiber: 38)
+        let g = S.gauges(for: todayNormal(meals: meals, targets: targets), hour: 9)
+        XCTAssertEqual(g.protein.tone, .inProgress)
+        XCTAssertEqual(g.carbs.tone, .inProgress)
+        XCTAssertEqual(g.fiber.tone, .inProgress)
+        XCTAssertEqual(g.fat.tone, .inProgress)     // 18g on the way to the 50g floor, early
+        XCTAssertEqual(g.calories.tone, .onTrack)   // comfortably under the ceiling
+    }
+
+    func testGaugesEveningShortFloorBecomesGentleNudge() {
+        // Same shortfall, but at 20:00 a still-low floor becomes a gentle nudge (amber),
+        // with the action carried by the words — never red.
+        let meals = [DietMeal(name: "day", time: "12:00", items: [item(2180, 100, 58, 295, 20)])]
+        let targets = DietTargets(calories: 2600, protein: 140, fat: 65, carbs: 300, carbsBase: 300, fiber: 38)
+        let g = S.gauges(for: todayNormal(meals: meals, targets: targets), hour: 20)
+        XCTAssertEqual(g.protein.tone, .nudge)   // 100/140, late
+        XCTAssertEqual(g.fiber.tone, .nudge)     // 20/38, late
+        XCTAssertEqual(g.carbs.tone, .onTrack)   // 295/300 → met
+        XCTAssertEqual(g.fat.tone, .onTrack)     // 58g in the 50–65 range
     }
 
     // MARK: - Totals & sorting

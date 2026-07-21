@@ -15,6 +15,60 @@ CI both run it). See the "Versioning" section of `bridge/README.md`.
 
 ## [Unreleased]
 
+## [App 1.0 (58)] — 2026-07-21
+
+### Changed
+- **Health tab reframed from a strict grader into a supportive coach — presentation
+  and wording only.** The numeric targets and the floor / ceiling / window model are
+  **untouched**; what changed is how the day is shown and described.
+  - **One color now means one thing, on every row.** The old `Status` band
+    (red/yellow/green) mapped straight to color, so red meant "too low" on a floor,
+    "too high" on a ceiling, and *both* on the fat window — and the same red calorie
+    ring meant "ate too much" on a normal day but "ate too little" on a carb-load day.
+    A new one-meaning `DietSemantics.Tone` drives all Health-tab color instead:
+    `onTrack` (green = good), `inProgress` (grey = coming along / no judgment), `nudge`
+    (amber = one gentle action helps), `takeNote` (a muted clay, never alarm-red =
+    genuinely worth attention). Direction (too low vs too high) is carried by the words
+    and the goal glyph (`≥`/`≤`/`↕`), never the color. `Status` is kept only for the
+    per-nutrient trend chart, where a single nutrient's band is unambiguous over time.
+  - **Mornings no longer look like failure.** `Tone` is hour-aware: a floor that's
+    merely unfinished early in the day reads as neutral "coming along", not a problem;
+    only once the day is winding down (after `nagHour`) does a still-low floor become a
+    gentle nudge. A floor already basically there (≥ 80%) reads on-track and is never
+    nagged over the last few grams.
+  - **A plain summary leads the screen.** A new `DaySummary` answers "how am I doing"
+    and "what would help next" in one short, kind pair of lines (e.g. "Solid day." →
+    "To round out the day: some protein and some fiber this evening."), derived from the
+    same gauges the rings draw so the two can't disagree. The rings and per-nutrient
+    detail stay, quieter, below it.
+  - **Kind, action-first wording.** The `*Remaining` strings and the explainer copy drop
+    the punitive vocabulary: "need 20g more" → "20g to go"; "target hit" → "there —
+    nice"; "300 left" → "room for 300"; "at limit" → "right on target"; "200 over limit"
+    → "200 over"; "7g over cap" → "7g above the range"; and the carb-load explainers no
+    longer say a day can "fail". The genuinely-honest signals (well over the calorie
+    ceiling late in the day, a fat hard-cap breach) are kept — delivered as a gentle
+    heads-up, not an alarm.
+  - **Honest data is preserved.** Unknown is still not zero, a partial total still reads
+    "≥ / at least", and a not-yet-tracked nutrient is still a data gap, not a miss.
+  - New/updated unit coverage: `DaySummaryTests`, tone cases in `DietSemanticsTests`,
+    and the reworded assertions in `DietSemanticsTests`/`HealthRingsTests`. All 941 app
+    tests pass; build is warning-free.
+
+## [Bridge 0.24.0] — 2026-07-21
+
+### Changed
+- **The deterministic ASCII diet dashboard (printed into chat after a local meal-log)
+  now tells the same supportive-coach story as the app's Health tab.** Presentation
+  only — the CSV-derived totals, targets, and floor/ceiling/window model are unchanged.
+  - **A plain summary line leads** ("how am I doing / what would help next"), the same
+    opening the Health tab uses.
+  - **Bars are monochrome** (`█`/`░`) instead of pass/fail color emoji (🟥/🟨/🟩), which
+    made one color mean three different things across rows. Status now lives in the
+    trailing words; the goal glyph (`≤`/`≥`/`↕`) carries direction.
+  - **Kind, action-first wording** mirroring the app: "room for X" for calorie headroom,
+    "Xg to go" for a short floor, "in range" / "Xg above the range" for fat — never
+    "over limit"/"over cap".
+
 ## [Bridge 0.23.0] — 2026-07-20
 
 ### Added

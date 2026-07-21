@@ -20,14 +20,14 @@ enum Explainers {
         if isCarbLoad {
             paras = [
                 "Today is a carb-load day. The point is to top off glycogen before a long run or race, so the rules flip from an ordinary day.",
-                "Calories become a window, not a ceiling: 92–100% of target is the goal, and under-eating fails the load. Fat becomes a minimize-it ceiling — keep it low to leave calorie room for carbs. Protein and carbs stay floors (hit them or beat them).",
-                "Fiber is suspended: low-residue eating before a long effort is deliberate, so it shows a plain gray ring with no color judgment today. It returns to a 38g floor on your next normal day.",
+                "Calories become a window, not a ceiling: 92–100% of target is the goal, so under-eating misses the point of a carb-load. Fat becomes a minimize-it ceiling — keep it low to leave calorie room for carbs. Protein and carbs stay floors (reach them or beat them).",
+                "Fiber is resting today: low-residue eating before a long effort is deliberate, so it shows a plain gray ring with no judgment. It returns to a 38g floor on your next normal day.",
             ]
         } else {
             paras = [
                 "Today is an ordinary day, so the usual rules apply.",
-                "Calories are a ceiling — stay at or under target. Protein, carbs, and fiber are floors — hit them or beat them. Fat is a window: a 50g hormonal floor, a 65g working cap, a 70g hard cap.",
-                "On a carb-load day these flip — calories become a window, fat a minimize-it ceiling, and fiber is suspended — but not today.",
+                "Calories are a ceiling — stay at or under target. Protein, carbs, and fiber are floors — reach them or beat them. Fat is a window: a 50g hormonal floor, a 65g working cap, a 70g hard cap.",
+                "On a carb-load day these flip — calories become a window, fat a minimize-it ceiling, and fiber rests — but not today.",
             ]
         }
         let title = isCarbLoad ? "Carb-load day" : "Today's day type"
@@ -37,11 +37,11 @@ enum Explainers {
 
     static func calories(_ g: MetricGauge, isCarbLoad: Bool) -> Explainer {
         let paras = isCarbLoad
-            ? ["On a carb-load day calories flip to a window: 92–100% of target is the goal. Under-eating a carb-load fails it — the point is to top off glycogen before a long run or race.",
-               "That's why this bar reads red below 92% (not just above 100%): too few calories is the failure mode here, not too many."]
+            ? ["On a carb-load day calories flip to a window: 92–100% of target is the goal. Under-eating a carb-load misses its point — it's there to top off glycogen before a long run or race.",
+               "That's why the gauge nudges you below 92%, not just above 100%: here the thing to watch is eating too little, not too much."]
             : ["On a cut day calories are a ceiling — stay at or under target.",
                "Today's target is a phase base plus half of your logged exercise calories added back, so a bigger training day earns a bit more food. Travel and maintenance days use a declared maintenance base instead, which simply arrives here as a larger target.",
-               "Green under 80%, yellow approaching the limit, red once you go over."]
+               "There's room to spare under target, a calm approach as you near it, and a gentle heads-up once you go over — never an alarm."]
         return Explainer(id: "calories", title: "Calories", valueLine: line(g), paragraphs: paras)
     }
 
@@ -60,14 +60,14 @@ enum Explainers {
 
     static func protein(_ g: MetricGauge) -> Explainer {
         Explainer(id: "protein", title: Macro.protein.displayName, valueLine: line(g), paragraphs: [
-            "Protein is a floor — hit it or beat it. It preserves muscle while you cut at marathon-training volume.",
-            "Under half your target reads red, most of the way there yellow, at or past target green. There's no penalty for going over.",
+            "Protein is a floor — reach it or beat it. It preserves muscle while you cut at marathon-training volume.",
+            "Early in the day a low number just reads as coming along; still low late in the day, it earns a gentle nudge; at or past target, you're on track. There's no downside to going over.",
         ])
     }
 
     static func carbs(_ g: MetricGauge, hasBonus: Bool) -> Explainer {
         var paras = [
-            "Carbs are a floor — the remainder of your budget after protein and fat are set. Hit the base to fuel training.",
+            "Carbs are a floor — the remainder of your budget after protein and fat are set. Reach the base to fuel training.",
         ]
         if hasBonus {
             paras.append("The bonus row is extra carb budget you earned by exercising — optional fuel, not an obligation. Eat into it on a big day; skip it on an easy one.")
@@ -78,18 +78,18 @@ enum Explainers {
     static func fat(_ g: MetricGauge, isCarbLoad: Bool) -> Explainer {
         let paras = isCarbLoad
             ? ["On a carb-load day fat becomes a minimize-it ceiling: keep it low to leave calorie room for carbs.",
-               "Green well under the cap, yellow approaching it, red over."]
+               "Plenty of room well under the cap, a calm approach as you near it, and a gentle heads-up over."]
             : ["Fat is a window, not just a cap. 50g is a hormonal floor — below it you risk low energy availability and fat-soluble vitamin uptake. 65g is the working ceiling; 70g the hard ceiling.",
-               "So this bar reads red BELOW 50g (deliberately — that's too low), green 50–65g, yellow 65–70g, and red again over 70g."]
+               "So the gauge gives a nudge BELOW 50g (that's too low — flagged on purpose), reads on track from 50–65g, and offers a heads-up above 65g — more firmly past the 70g hard cap."]
         return Explainer(id: "fat", title: Macro.fat.displayName, valueLine: line(g), paragraphs: paras)
     }
 
     static func fiber(_ g: MetricGauge, isCarbLoad: Bool) -> Explainer {
         let paras = isCarbLoad
-            ? ["Fiber is suspended on carb-load days. Low-residue eating before a long run or race is deliberate — an empty gut is the goal, so there's no color judgment today.",
+            ? ["Fiber rests on carb-load days. Low-residue eating before a long run or race is deliberate — an empty gut is the goal, so there's no judgment today.",
                "It'll return to a 38g floor on your next normal day."]
-            : ["Fiber is a 38g floor for gut health and satiety. Hit it or beat it on a normal day.",
-               "It's suspended on carb-load days, when low-residue eating before a long effort is deliberate."]
+            : ["Fiber is a 38g floor for gut health and satiety. Reach it or beat it on a normal day.",
+               "It rests on carb-load days, when low-residue eating before a long effort is deliberate."]
         return Explainer(id: "fiber", title: Macro.fiber.displayName, valueLine: line(g), paragraphs: paras)
     }
 
