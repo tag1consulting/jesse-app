@@ -1750,7 +1750,16 @@ pub async fn run_diet_pipeline(cfg: &Config, utterance: &str) -> DietPipelineOut
     .await
     {
         Ok(s) => s,
-        Err(_) => return fall_child(Rung2Reason::ChildError),
+        // Log the child's own error before collapsing it into `child_error`. The
+        // reason code alone cannot distinguish a model failure from an unreachable
+        // backend, and this arm swallowing the message once hid a 14-hour local
+        // gateway outage behind what looked like ordinary rung-2 flakiness. The
+        // message is the child's status + text (no utterance content), so it is
+        // safe to log under the same rules as the provenance line.
+        Err((status, msg)) => {
+            eprintln!("jesse-bridge: diet extract child failed: {status} {msg}");
+            return fall_child(Rung2Reason::ChildError);
+        }
     };
     let extract = match parse_diet_entries(&extract_raw) {
         Ok(e) if e.no_loggable_content => return fall_child(Rung2Reason::NoLoggable),

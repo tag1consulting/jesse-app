@@ -64,9 +64,29 @@ pub fn load_device_token(path: &Path) -> Option<String> {
 
 /// Write the device token atomically (temp + rename), 0600 — same discipline as
 /// `persist_job`. Best-effort: a failure is logged, never fatal.
+///
+/// The temp file name is unique per write (pid + a process-wide counter), NOT a
+/// fixed `device.json.tmp`. A shared temp path makes concurrent writers collide:
+/// the phone re-registers on foreground, so two `POST /jesse/device` calls can
+/// overlap, and with one temp path the loser's rename finds nothing (a spurious
+/// ENOENT warning) while its still-open fd writes into the file the winner just
+/// renamed into place — defeating the atomicity this function exists to provide.
+/// Unique temp names give each writer its own file, so both renames are atomic
+/// and the last one simply wins.
 pub fn persist_device_token(path: &Path, token: &str) {
+    if let Err(e) = try_persist_device_token(path, token) {
+        eprintln!("warning: could not persist device token: {e}");
+    }
+}
+
+/// The fallible body of [`persist_device_token`]. Separate so a test can assert the
+/// no-collision contract directly: under concurrency EVERY write must succeed, which
+/// is exactly what the shared temp path broke.
+fn try_persist_device_token(path: &Path, token: &str) -> std::io::Result<()> {
+    static WRITE_SEQ: AtomicU64 = AtomicU64::new(0);
     let value = json!({ "v": 1, "token": token });
-    let tmp = path.with_extension("json.tmp");
+    let seq = WRITE_SEQ.fetch_add(1, Ordering::Relaxed);
+    let tmp = path.with_extension(format!("json.tmp.{}.{seq}", std::process::id()));
     let write = || -> std::io::Result<()> {
         let mut f = std::fs::OpenOptions::new()
             .write(true)
@@ -78,10 +98,9 @@ pub fn persist_device_token(path: &Path, token: &str) {
         f.sync_all()?;
         std::fs::rename(&tmp, path)
     };
-    if let Err(e) = write() {
-        eprintln!("warning: could not persist device token: {e}");
+    write().inspect_err(|_| {
         let _ = std::fs::remove_file(&tmp);
-    }
+    })
 }
 
 /// Job ids the phone asked to be notified about on completion. A flag is consumed
@@ -827,6 +846,69 @@ mod tests {
         assert!(
             restarted.get().is_none(),
             "the cleared token stays cleared across a restart"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn concurrent_persists_never_collide_on_a_temp_file() {
+        // The phone re-registers on foreground, so `set` calls overlap. With a
+        // single shared `device.json.tmp` the losing writer's rename hit ENOENT and
+        // its open fd wrote into the already-renamed file; unique temp names make
+        // every writer atomic and the last one simply win. Assert the observable
+        // contract: whatever the interleaving, the file always parses to one of the
+        // tokens written, and no temp file is left behind.
+        let dir = temp_jobs_dir();
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("device.json");
+
+        // Overlap is forced with a barrier rather than bought with volume: every
+        // write fsyncs, and a big fleet (8 x 50 was the first cut) starves the
+        // deadline-based turn tests sharing a `cargo test --all-targets` run enough
+        // to fail them. Releasing 4 threads simultaneously puts their writes inside
+        // each other's open→rename window with only 4 x 4 writes total, which is
+        // enough to fail against the shared-temp-path bug on every observed run.
+        let gate = Arc::new(std::sync::Barrier::new(4));
+        let threads: Vec<_> = (0..4)
+            .map(|t| {
+                let path = path.clone();
+                let gate = Arc::clone(&gate);
+                std::thread::spawn(move || {
+                    gate.wait();
+                    (0..4)
+                        .filter_map(|i| {
+                            try_persist_device_token(&path, &format!("token-{t}-{i}")).err()
+                        })
+                        .map(|e| e.to_string())
+                        .collect::<Vec<_>>()
+                })
+            })
+            .collect();
+        let errors: Vec<String> = threads
+            .into_iter()
+            .flat_map(|t| t.join().unwrap())
+            .collect();
+        assert!(
+            errors.is_empty(),
+            "every concurrent write must succeed; got {} failure(s): {:?}",
+            errors.len(),
+            &errors[..errors.len().min(3)]
+        );
+
+        let loaded = load_device_token(&path).expect("the file parses after the race");
+        assert!(
+            loaded.starts_with("token-"),
+            "a torn write would leave something other than a whole token: {loaded:?}"
+        );
+        let leftovers: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .filter(|n| n.contains(".tmp"))
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "every temp file must be renamed away, found: {leftovers:?}"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
