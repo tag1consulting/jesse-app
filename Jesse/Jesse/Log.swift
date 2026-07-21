@@ -1,4 +1,5 @@
 import os
+import JesseCore
 
 // Centralized logging for the app's diagnostics. These replace the scattered
 // `print()` calls that vanished on release builds (print writes to stdout, which

@@ -1,4 +1,5 @@
 import Foundation
+import JesseCore
 
 // Pure, SwiftUI-free presentation model for the thread list's collapsible month
 // folders. Kept Foundation-only so folding/expansion is unit-testable without a

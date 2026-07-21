@@ -1,5 +1,6 @@
 import SwiftUI
 import UIKit
+import JesseCore
 
 // A small, dependency-free block renderer for Jesse's markdown replies.
 //

@@ -1,6 +1,7 @@
 import Foundation
 import SwiftData
 import WatchConnectivity
+import JesseCore
 
 // The phone half of the watch relay. Receives a spoken turn from the Jesse Watch
 // App over WatchConnectivity, transcribes the audio on-device (via the

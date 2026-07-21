@@ -38,20 +38,20 @@ import SwiftData
 
 /// The original version of the app's persistent schema (through the whole additive
 /// lineage above — all lightweight-compatible).
-enum JesseSchemaV1: VersionedSchema {
-    static let versionIdentifier = Schema.Version(1, 0, 0)
+public enum JesseSchemaV1: VersionedSchema {
+    public static let versionIdentifier = Schema.Version(1, 0, 0)
 
-    static var models: [any PersistentModel.Type] {
+    public static var models: [any PersistentModel.Type] {
         [JesseThread.self, Turn.self, TurnAttachment.self, WrittenMeal.self]
     }
 }
 
 /// V2 — adds the send outbox (`OutboxItem` + `OutboxAttachment`). Additive-only, so
 /// V1 → V2 is a lightweight stage.
-enum JesseSchemaV2: VersionedSchema {
-    static let versionIdentifier = Schema.Version(2, 0, 0)
+public enum JesseSchemaV2: VersionedSchema {
+    public static let versionIdentifier = Schema.Version(2, 0, 0)
 
-    static var models: [any PersistentModel.Type] {
+    public static var models: [any PersistentModel.Type] {
         [JesseThread.self, Turn.self, TurnAttachment.self, WrittenMeal.self,
          OutboxItem.self, OutboxAttachment.self]
     }
@@ -60,17 +60,17 @@ enum JesseSchemaV2: VersionedSchema {
 /// The app's live schema, derived from the current `VersionedSchema`. The container
 /// and every migration-test open the store through THIS value so they can never
 /// drift from the versioned model list.
-var jesseCurrentSchema: Schema { Schema(versionedSchema: JesseSchemaV2.self) }
+public var jesseCurrentSchema: Schema { Schema(versionedSchema: JesseSchemaV2.self) }
 
 /// The migration plan the container opens the store with: V1 → V2, a single
 /// lightweight stage (the outbox entities are additive). Future schema versions
 /// append a new version and a new stage here.
-enum JesseMigrationPlan: SchemaMigrationPlan {
-    static var schemas: [any VersionedSchema.Type] {
+public enum JesseMigrationPlan: SchemaMigrationPlan {
+    public static var schemas: [any VersionedSchema.Type] {
         [JesseSchemaV1.self, JesseSchemaV2.self]
     }
 
-    static var stages: [MigrationStage] {
+    public static var stages: [MigrationStage] {
         [.lightweight(fromVersion: JesseSchemaV1.self, toVersion: JesseSchemaV2.self)]
     }
 }

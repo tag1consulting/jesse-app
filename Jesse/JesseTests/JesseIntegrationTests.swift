@@ -1,6 +1,7 @@
 import XCTest
 import SwiftData
 @testable import Jesse
+import JesseCore
 
 // Integration tests that drive the REAL `JesseClient` (and `RunCoordinator` with
 // the real client, not the fake) against an in-process `URLProtocol` stub that

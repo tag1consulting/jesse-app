@@ -1,6 +1,7 @@
 import XCTest
 import SwiftData
 @testable import Jesse
+import JesseCore
 
 /// Item 2 — the watch relay entry point. Drives the relay end-to-end as plain
 /// TEXT (no watch hardware) through the same `JesseClientProtocol` seam the

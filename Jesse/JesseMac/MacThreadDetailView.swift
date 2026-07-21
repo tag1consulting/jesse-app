@@ -1,5 +1,6 @@
 import SwiftUI
 import SwiftData
+import JesseCore
 
 // One conversation: the transcript (hydrated from the bridge on open, cache-first) plus
 // the live streaming reply and the composer. Resume is implicit — the thread carries a

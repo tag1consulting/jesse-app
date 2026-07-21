@@ -1,6 +1,7 @@
 import AppIntents
 import Combine
 import Foundation
+import JesseCore
 
 // Bridge between Siri and the app. Siri captures the spoken text into `text`,
 // we stash it, open the app, and ContentView runs it (no timeout) + speaks the

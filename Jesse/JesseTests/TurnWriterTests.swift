@@ -1,6 +1,7 @@
 import XCTest
 import SwiftData
 @testable import Jesse
+import JesseCore
 
 /// Direct unit tests for `TurnWriter` — the SwiftData append + save +
 /// idempotency-on-jobId concern extracted from `RunCoordinator.finish`. The

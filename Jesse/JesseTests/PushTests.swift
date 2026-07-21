@@ -1,6 +1,7 @@
 import XCTest
 import SwiftData
 @testable import Jesse
+import JesseCore
 
 // Tests for the push surface added to the app: the two new `JesseClient` calls
 // (device registration + notify-on-complete) over a URLProtocol stub, the

@@ -1,6 +1,7 @@
 import XCTest
 import SwiftData
 @testable import Jesse
+import JesseCore
 
 /// The store-open path that actually matters and had zero coverage: opening a
 /// **populated on-disk** store under the current versioned schema + migration plan,

@@ -5,6 +5,10 @@ build/
 DerivedData/
 *.xcuserstate
 **/xcuserdata/
+# Swift Package Manager (JesseKit local package build products + user config)
+.build/
+.swiftpm/
+
 # Rust
 target/
 # local agent settings (never commit; may hold machine-local config)

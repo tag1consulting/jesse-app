@@ -1,5 +1,6 @@
 import SwiftUI
 import SwiftData
+import JesseCore
 
 // The macOS Jesse client — a thin native client that talks to the SAME bridge on the
 // Studio the iPhone uses (see the JESSE-WRAP B3 plan). A SEPARATE app target from the

@@ -1,6 +1,7 @@
 import XCTest
 import SwiftData
 @testable import Jesse
+import JesseCore
 
 @MainActor
 final class ThreadHistoryTests: XCTestCase {

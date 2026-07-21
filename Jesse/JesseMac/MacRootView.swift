@@ -1,5 +1,6 @@
 import SwiftUI
 import SwiftData
+import JesseCore
 
 // The Mac shell: a NavigationSplitView with the thread list on the left and the
 // selected conversation on the right — the big-screen affordance the plan calls for

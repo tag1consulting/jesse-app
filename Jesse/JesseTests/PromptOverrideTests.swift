@@ -1,6 +1,7 @@
 import XCTest
 import SwiftData
 @testable import Jesse
+import JesseCore
 
 /// Covers the prompt-customization path: the `POST /jesse` body shape (override
 /// included only when it carries content), the `GET /jesse/prompts` decode, the

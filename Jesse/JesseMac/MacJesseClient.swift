@@ -1,4 +1,5 @@
 import Foundation
+import JesseCore
 
 // The macOS bridge client. Standalone (the iOS `JesseClient` is entangled with the
 // HealthKit context path, which macOS has no equivalent of) and health-free: a Mac

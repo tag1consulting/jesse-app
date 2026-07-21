@@ -1,6 +1,6 @@
 import XCTest
 import SwiftData
-@testable import Jesse
+import JesseCore
 
 /// Item 1 — the `origin` tag on `JesseThread`. A default thread is `.phone`; the
 /// raw value round-trips through `ThreadOrigin`; and a store migrated from before

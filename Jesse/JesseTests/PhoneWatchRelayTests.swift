@@ -1,6 +1,7 @@
 import XCTest
 import SwiftData
 @testable import Jesse
+import JesseCore
 
 /// The phone-side STT → relay seam (`WatchTurnHandler`). Drives it with a FAKE
 /// transcriber and the same `JesseClientProtocol` fake the relay tests use, so it

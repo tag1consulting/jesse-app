@@ -1,5 +1,6 @@
 import XCTest
 @testable import Jesse
+import JesseCore
 
 /// (Lows) Named-constant extraction and the `JesseInbox` main-actor drain path.
 @MainActor

@@ -1,5 +1,6 @@
 import XCTest
 @testable import Jesse
+import JesseCore
 
 // The Health tab view model: a successful load surfaces `.content`; each fetch
 // error before the first success surfaces the matching `.empty` state; and a

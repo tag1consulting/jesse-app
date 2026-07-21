@@ -1,5 +1,6 @@
 import Foundation
 import Security
+import JesseCore
 
 // Networking + config for the Jesse bridge. Config (host + token) lives in
 // Keychain so it survives reinstalls and isn't in plaintext UserDefaults.

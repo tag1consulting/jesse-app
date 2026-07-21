@@ -1,6 +1,7 @@
 import XCTest
 import SwiftData
 @testable import Jesse
+import JesseCore
 
 /// The completion→render path: `finish` must always leave the app in exactly one
 /// of {reply shown, recoverable error + Re-check shown}. "Spinner stops, nothing

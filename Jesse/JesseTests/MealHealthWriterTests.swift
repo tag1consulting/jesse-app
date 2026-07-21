@@ -1,6 +1,7 @@
 import XCTest
 import HealthKit
 @testable import Jesse
+import JesseCore
 
 /// The reliability + correction core of meal write-back (`JESSE_MEAL_LOG v2`), driven
 /// entirely with fakes (no HealthKit, no SwiftData): the gate (toggle + write auth), the

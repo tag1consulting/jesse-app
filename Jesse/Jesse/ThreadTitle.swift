@@ -1,4 +1,5 @@
 import Foundation
+import JesseCore
 
 // Pure, SwiftUI-free helpers for the thread list's AI-generated titles. Kept in
 // their own Foundation-only file so they're unit-testable without a view host or

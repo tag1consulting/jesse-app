@@ -1,6 +1,7 @@
 import XCTest
 import SwiftData
 @testable import Jesse
+import JesseCore
 
 /// Covers the `TurnAttachment` schema change: it round-trips through a real store,
 /// cascade-deletes with its `Turn`/`JesseThread`, and — the migration guard — an

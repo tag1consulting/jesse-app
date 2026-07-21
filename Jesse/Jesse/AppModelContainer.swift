@@ -1,5 +1,6 @@
 import Foundation
 import SwiftData
+import JesseCore
 
 // One shared SwiftData container for the whole app process. Both the SwiftUI view
 // tree (`JesseApp`) and the background watch-relay path

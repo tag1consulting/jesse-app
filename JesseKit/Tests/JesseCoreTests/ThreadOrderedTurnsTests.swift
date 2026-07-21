@@ -1,6 +1,6 @@
 import XCTest
 import SwiftData
-@testable import Jesse
+import JesseCore
 
 /// `JesseThread.orderedTurns` is read in the transcript's hot path, which
 /// re-evaluates ~10Hz during a streaming reply. It must sort the thread's turns

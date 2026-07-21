@@ -1,5 +1,6 @@
 import XCTest
 @testable import Jesse
+import JesseCore
 
 /// Durable remote-session deletion: when the user deletes a thread we enqueue its
 /// bridge `sessionId` into a persisted queue and a drainer calls

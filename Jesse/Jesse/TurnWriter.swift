@@ -1,5 +1,6 @@
 import Foundation
 import SwiftData
+import JesseCore
 
 // The persistence half of completing a turn, extracted from `RunCoordinator.finish`.
 // It owns exactly three concerns: resolving the destination thread, the SwiftData

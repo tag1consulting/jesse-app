@@ -2,6 +2,7 @@ import Foundation
 import SwiftData
 import SwiftUI
 import UIKit
+import JesseCore
 
 // App-scoped run manager. Lives above the views (owned by `JesseApp`) so a run
 // keeps going while you navigate back to the list and start another. Keyed by

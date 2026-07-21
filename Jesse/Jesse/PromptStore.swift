@@ -1,4 +1,5 @@
 import Foundation
+import JesseCore
 
 /// Per-mode custom prompts, persisted in UserDefaults (these aren't secret,
 /// unlike the bearer token, so not Keychain). Each mode has two *slots*:

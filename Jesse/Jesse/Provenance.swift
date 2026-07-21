@@ -1,4 +1,5 @@
 import SwiftUI
+import JesseCore
 
 // MARK: - Wire model
 

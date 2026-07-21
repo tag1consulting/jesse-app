@@ -1,5 +1,6 @@
 import XCTest
 @testable import Jesse
+import JesseCore
 
 // Version surfacing: a `GET /health` version reported by the bridge is stored as
 // the last-seen bridge version, via the `JesseClientProtocol` mock seam. Also

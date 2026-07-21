@@ -1,5 +1,6 @@
 import Foundation
 import SwiftData
+import JesseCore
 
 /// SwiftData-backed idempotency store for written meal ids (the production
 /// `WrittenMealStoring`). Wraps the per-call `ModelContext` the coordinator already
