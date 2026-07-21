@@ -15,6 +15,54 @@ CI both run it). See the "Versioning" section of `bridge/README.md`.
 
 ## [Unreleased]
 
+## [App 1.0 (63)] - 2026-07-21
+
+### Added
+- **Archive a conversation to hide it from your list, with an Archived view to see
+  or restore it, on both iOS and Mac from one shared implementation.** Archiving is
+  the reversible "get this out of my way" action (for example a duplicate) that
+  deletion is not: the conversation and all its turns stay put, it just leaves the
+  main list until you unarchive it. It is distinct from deletion, which removes the
+  thread and reclaims its remote transcript; neither affects the other.
+  - **Schema (`JesseCore`).** `JesseThread` gains two additive, defaulted properties,
+    `isArchived` (Bool = false) and `archivedAt` (Date?), plus `setArchived` /
+    `toggleArchived` helpers mirroring the favorites ones (the timestamp is stamped on
+    archive and cleared on restore).
+  - **Store migration hardening (`JesseCore` / `AppModelContainer`).** The store now
+    opens with SwiftData's automatic lightweight migration instead of a staged
+    `SchemaMigrationPlan`. The staged plan keyed migration on each version's exact
+    model checksum, but every `VersionedSchema` here references the same live `@Model`
+    classes, so adding a property to an existing entity (like the archive fields)
+    changed a version's checksum in place and turned every already-stamped store into
+    an "unknown model version", throwing at open ("Cannot use staged migration with an
+    unknown model version") and stranding the user behind the "Couldn't open your saved
+    conversations" banner. That was a latent break on the first additive property after
+    the plan shipped. Automatic migration infers a lightweight mapping from the store's
+    entity hashes with no checksum pinning, which is exactly what carried every earlier
+    additive property (favorites, origin, aiTitle) and the outbox entities. A new
+    regression test writes a store stamped with a prior `JesseThread` shape and proves
+    it opens after the attribute is added; the populated-store test also covers the
+    archive-flip round-trip. A staged plan is only needed for a genuinely
+    non-lightweight change (a rename/retype/entity split) and should be reintroduced
+    only then.
+  - **Shared filtering (`JesseConversations`).** `threadListLayout` takes a new
+    `archivedOnly` scope. The normal list (All, Favorites, Watch) now excludes
+    archived threads; a dedicated Archived view shows only archived threads as a flat,
+    newest-first list like Favorites; an archived favorite drops out of Favorites until
+    restored. The archive filter is applied before the favorites, origin, and search
+    filters and before grouping, so it composes additively and the function stays pure.
+  - **iOS.** The scope control gains an Archived filter, and each conversation has an
+    Archive / Unarchive affordance (leading swipe action and context menu). Archived
+    conversations no longer appear in All or Favorites. Existing behavior (favorites,
+    folders, deletion, and every entry point) is unchanged apart from the new, opt-in
+    archive affordance.
+  - **Mac.** The sidebar scope control gains an Archived segment, each row has an
+    Archive / Unarchive action (context menu and trailing swipe), and Command Shift A
+    archives or restores the selected conversation.
+  - Archive state is LOCAL to each device's SwiftData store: it is intentionally not
+    synced through the bridge (which syncs only sessions, transcripts, and titles),
+    exactly like favorite state. Archiving is a per-device "hide from my list" action.
+
 ## [App 1.0 (62)] - 2026-07-21
 
 ### Changed

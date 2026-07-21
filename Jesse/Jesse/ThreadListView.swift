@@ -33,26 +33,31 @@ struct ThreadListView: View {
 
     // Which scope the list is showing, remembered across launches. All is the
     // default; Favorites narrows to starred threads; Watch narrows to threads
-    // relayed from an Apple Watch. Stored as the raw string so it lightweight-adds
-    // over the old boolean-favorites default (an unknown value reads as `.all`).
+    // relayed from an Apple Watch; Archived shows only conversations the user has
+    // hidden from the main list (and is the one place to restore them). Stored as the
+    // raw string so it lightweight-adds over the old boolean-favorites default (an
+    // unknown value reads as `.all`).
     enum ListScope: String, CaseIterable {
-        case all, favorites, watch
+        case all, favorites, watch, archived
         var label: String {
             switch self {
             case .all: return "All"
             case .favorites: return "Favorites"
             case .watch: return "Watch"
+            case .archived: return "Archived"
             }
         }
     }
     @AppStorage("threadListScope") private var scopeRaw = ListScope.all.rawValue
     private var scope: ListScope { ListScope(rawValue: scopeRaw) ?? .all }
 
-    /// The two orthogonal filters the current scope maps to, so the pure
+    /// The orthogonal filters the current scope maps to, so the pure
     /// `threadListLayout` and the empty-state checks stay expressed in the same
-    /// favorites/origin terms they always were.
+    /// favorites/origin/archived terms. Archived is its own flat view; every other
+    /// scope excludes archived threads (archiving is local, never bridge-synced).
     private var favoritesOnly: Bool { scope == .favorites }
     private var originScope: ThreadOriginScope { scope == .watch ? .watch : .all }
+    private var archivedOnly: Bool { scope == .archived }
 
     /// Thread ids with at least one undelivered (`.failed`) outbox message — drives
     /// the small orange badge on those rows.
@@ -83,10 +88,13 @@ struct ThreadListView: View {
 
     /// Threads the active scope shows, before search. The All view keeps date order
     /// untouched; Favorites narrows to starred threads; Watch narrows to
-    /// watch-relayed threads (no reordering or pinning in any). The two filters
-    /// stack so the empty-state checks below see exactly what the layout will.
+    /// watch-relayed threads; Archived narrows to hidden threads. Every non-archived
+    /// scope excludes archived threads (the archive filter runs first, mirroring the
+    /// shared `threadListLayout`). The filters stack so the empty-state checks below
+    /// see exactly what the layout will.
     private var visible: [JesseThread] {
-        (favoritesOnly ? threads.filter(\.isFavorite) : threads)
+        let archiveScoped = threads.filter { archivedOnly ? $0.isArchived : !$0.isArchived }
+        return (favoritesOnly ? archiveScoped.filter(\.isFavorite) : archiveScoped)
             .filter { threadMatchesOrigin($0, scope: originScope) }
     }
 
@@ -223,6 +231,12 @@ struct ThreadListView: View {
                 } description: {
                     Text("Turns relayed from your Apple Watch will appear here.")
                 }
+            case .archived:
+                ContentUnavailableView {
+                    Label("No archived conversations", systemImage: "archivebox")
+                } description: {
+                    Text("Swipe a conversation and tap Archive to hide it from your list. Archived conversations stay here until you restore them, and never leave this device.")
+                }
             default:
                 ContentUnavailableView {
                     Label("No favorites yet", systemImage: "star")
@@ -315,6 +329,24 @@ struct ThreadListView: View {
                           systemImage: thread.isFavorite ? "star.slash" : "star")
                 }
                 .tint(.yellow)
+                // Archive / Unarchive. Hides the thread from All / Favorites / Watch
+                // (or restores it from Archived) without touching deletion: the
+                // thread and its turns stay put. Local to this device only.
+                Button { toggleArchived(thread) } label: {
+                    Label(thread.isArchived ? "Unarchive" : "Archive",
+                          systemImage: thread.isArchived ? "tray.and.arrow.up" : "archivebox")
+                }
+                .tint(.indigo)
+            }
+            .contextMenu {
+                Button { toggleFavorite(thread) } label: {
+                    Label(thread.isFavorite ? "Unfavorite" : "Favorite",
+                          systemImage: thread.isFavorite ? "star.slash" : "star")
+                }
+                Button { toggleArchived(thread) } label: {
+                    Label(thread.isArchived ? "Unarchive" : "Archive",
+                          systemImage: thread.isArchived ? "tray.and.arrow.up" : "archivebox")
+                }
             }
         }
         .onDelete { delete($0, in: threads) }
@@ -346,6 +378,19 @@ struct ThreadListView: View {
         }
     }
 
+    /// Archive or restore a conversation. Purely local: it flips `isArchived`
+    /// (stamping/clearing `archivedAt`) so the shared `threadListLayout` hides or
+    /// re-shows the row. Distinct from deletion: no turns are removed and nothing is
+    /// enqueued for remote reclamation; archive state is never synced to the bridge.
+    private func toggleArchived(_ thread: JesseThread) {
+        thread.toggleArchived()
+        do {
+            try context.save()
+        } catch {
+            Log.run.error("archive toggle save failed: \(error.localizedDescription)")
+        }
+    }
+
     private func newThread() {
         // Insert before pushing so the thread's identity is stable across the
         // first send (a not-yet-inserted model's id changes on insert, which
@@ -366,6 +411,7 @@ struct ThreadListView: View {
         threadListLayout(threads,
                          favoritesOnly: favoritesOnly,
                          originScope: originScope,
+                         archivedOnly: archivedOnly,
                          searchQueries: activeQueries,
                          expanded: expandedFolders,
                          now: Date.now,

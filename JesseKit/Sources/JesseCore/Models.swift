@@ -78,6 +78,22 @@ public final class JesseThread {
     // code (matching `isFavorite`/`aiTitle`), and an old row with no value reads as
     // `.phone`.
     public var origin: String = ThreadOrigin.phone.rawValue
+    // Whether this thread is archived: hidden from the main list (All / Favorites /
+    // Watch) and shown only in the dedicated Archived view, from which it can be
+    // restored. Distinct from deletion: archiving keeps the thread and its turns and
+    // is fully reversible; it just hides the row (for example to get a duplicate out
+    // of the way). New property with a default, so SwiftData lightweight-migrates
+    // existing stores with no migration code (matching isFavorite/origin).
+    //
+    // Archive state is LOCAL to this device's SwiftData store. It is NOT synced
+    // through the bridge, which only syncs sessions/transcripts/titles: archiving is
+    // a per-device "hide from my list" action, intentionally not shared across
+    // devices. Favorite state (isFavorite) is local for the same reason.
+    public var isArchived: Bool = false
+    // When it was archived; nil whenever isArchived is false. Stamped on archive and
+    // cleared on unarchive, mirroring favoritedAt, so an Archived view could later
+    // sort by archive time rather than last activity.
+    public var archivedAt: Date?
 
     @Relationship(deleteRule: .cascade, inverse: \Turn.thread)
     public var turns: [Turn] = []
@@ -107,6 +123,20 @@ public final class JesseThread {
     public func setFavorite(_ value: Bool, now: Date = Date()) {
         isFavorite = value
         favoritedAt = value ? now : nil
+    }
+
+    /// Flip the archived flag, stamping `archivedAt` when archiving and clearing it
+    /// when unarchiving. `now` is injectable so tests don't read the clock. Mirrors
+    /// `toggleFavorite`.
+    public func toggleArchived(now: Date = Date()) {
+        setArchived(!isArchived, now: now)
+    }
+
+    /// Set the archived flag explicitly, keeping `archivedAt` consistent (stamped
+    /// when archiving, cleared when unarchiving). Mirrors `setFavorite`.
+    public func setArchived(_ value: Bool, now: Date = Date()) {
+        isArchived = value
+        archivedAt = value ? now : nil
     }
 
     // Non-observed memo for `orderedTurns` (see `OrderedTurnsMemo`). Never reassigned

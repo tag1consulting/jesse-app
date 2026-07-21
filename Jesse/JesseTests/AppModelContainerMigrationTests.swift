@@ -3,22 +3,31 @@ import SwiftData
 @testable import Jesse
 import JesseCore
 
-/// The store-open path that actually matters and had zero coverage: opening a
-/// **populated on-disk** store under the current versioned schema + migration plan,
-/// and what happens when that open **fails**.
+/// The store-open path that actually matters and had a dangerous coverage gap:
+/// opening a **populated on-disk** store under the current schema with automatic
+/// lightweight migration, and what happens when that open **fails**.
 ///
-/// Two guarantees, each failing-first:
+/// Three guarantees, each failing-first:
 ///
 ///  1. `testPopulatedOnDiskStoreSurvivesOpenUnderVersionedSchema` writes a store the
-///     way the app opened it *before* this change — a bare model list, no versioned
-///     schema, no plan — populates it with threads/turns/attachments/favorites in
-///     their full current shape, then reopens it through `AppModelContainer.load`
-///     (the versioned schema + `JesseMigrationPlan`) and asserts **every field
-///     survives**: favorites still favorited, `aiTitle`/`titleSourceKey`/`origin`/
-///     `lastDeliveredJobId` intact, a Turn's `provenanceJSON` intact, and each
-///     attachment's thumbnail bytes present. A naive migration that dropped an
-///     entity (e.g. `TurnAttachment` missing from the versioned model list) or
-///     rebuilt the store (version-identifier drift) fails this test.
+///     way the app opened it *before* the outbox entities existed (a bare model list),
+///     populates it with threads/turns/attachments/favorites in their full current
+///     shape, then reopens it through `AppModelContainer.load` and asserts **every
+///     field survives**: favorites still favorited, `aiTitle`/`titleSourceKey`/
+///     `origin`/`lastDeliveredJobId` intact, a Turn's `provenanceJSON` intact, and
+///     each attachment's thumbnail bytes present. It also covers the archive fields:
+///     `isArchived`/`archivedAt` read their defaults on rows written before those
+///     columns existed, and an archive flip round-trips through a reopen. A naive
+///     migration that dropped an entity (e.g. `TurnAttachment` missing from the model
+///     list) fails this test.
+///
+///  1b. `testStampedStoreSurvivesAddingAnAttributeToAnExistingEntity` is the
+///     regression for the shipped break: it writes a store STAMPED with a prior
+///     `VersionedSchema` whose `JesseThread` lacks an attribute, then opens it under a
+///     schema that adds that attribute, and asserts the open succeeds (rows intact,
+///     new column defaulted). Under a staged `migrationPlan` this throws "Cannot use
+///     staged migration with an unknown model version" (exactly the device failure).
+///     Automatic lightweight migration makes it pass.
 ///
 ///  2. `testFailedOpenIsFlaggedAndLeavesTheOnDiskFileIntact` corrupts the on-disk
 ///     file and asserts the loader does NOT silently swallow the failure into an
@@ -111,6 +120,14 @@ final class AppModelContainerMigrationTests: XCTestCase {
         XCTAssertEqual(fav.originValue, .watch, "origin is preserved")
         XCTAssertEqual(fav.lastDeliveredJobId, "job-777")
 
+        // The archive fields are an additive-property lightweight migration: a store
+        // written before those columns existed opens with `isArchived` reading its
+        // `false` default and `archivedAt` nil, on EVERY row (nothing rebuilt).
+        for thread in try ctx.fetch(FetchDescriptor<JesseThread>()) {
+            XCTAssertFalse(thread.isArchived, "isArchived defaults to false on a pre-archive row")
+            XCTAssertNil(thread.archivedAt, "archivedAt defaults to nil on a pre-archive row")
+        }
+
         // The relationship + a Turn's provenance + the attachment's bytes all survive.
         XCTAssertEqual(fav.orderedTurns.count, 2)
         let jesseTurn = try XCTUnwrap(fav.orderedTurns.first { $0.roleValue == .jesse })
@@ -134,6 +151,11 @@ final class AppModelContainerMigrationTests: XCTestCase {
         outbox.attachments.append(
             OutboxAttachment(filename: "Photo 1.jpg", mime: "image/jpeg", data: originalBytes))
         ctx.insert(outbox)
+        // Archive the favorite in this same save so the archive flip round-trips
+        // through the reopen below (proving the additive field persists, not just
+        // defaults).
+        let archivedAt = Date(timeIntervalSince1970: 1_800_000_000)
+        fav.setArchived(true, now: archivedAt)
         try ctx.save()
         let reopened = AppModelContainer.load(url: url)
         let ctx2 = ModelContext(reopened.container)
@@ -142,8 +164,62 @@ final class AppModelContainerMigrationTests: XCTestCase {
         let item = try XCTUnwrap(items.first)
         XCTAssertEqual(item.state, .sending)
         XCTAssertEqual(item.threadID, favThreadId)
+
+        // The archived flag + timestamp survived the reopen on exactly the one thread.
+        let archived = try ctx2.fetch(
+            FetchDescriptor<JesseThread>(predicate: #Predicate { $0.isArchived }))
+        XCTAssertEqual(archived.map(\.id), [favThreadId], "the archived flag persists")
+        XCTAssertEqual(archived.first?.archivedAt, archivedAt, "archivedAt persists")
         XCTAssertEqual(item.orderedAttachments.first?.data, originalBytes,
                        "the ORIGINAL full-resolution bytes round-trip through OutboxAttachment")
+    }
+
+    /// The regression for the shipped store-open break. A store STAMPED with a prior
+    /// `VersionedSchema` (whose `JesseThread` has no archive fields, the way a shipped
+    /// build stamped it) must still open after `JesseThread` gains `isArchived`/
+    /// `archivedAt`. Under a staged `SchemaMigrationPlan` this throws Code 134504
+    /// "Cannot use staged migration with an unknown model version", the exact device
+    /// symptom (the red "Couldn't open your saved conversations" banner). Automatic
+    /// lightweight migration (what `AppModelContainer.load` now uses) opens it and
+    /// defaults the new column. Reintroducing a staged plan for an additive change
+    /// fails this test.
+    func testStampedStoreSurvivesAddingAnAttributeToAnExistingEntity() throws {
+        let url = tempStoreURL()
+        defer { removeStore(url) }
+        let threadId = UUID()
+
+        // "Before": write a store STAMPED with the legacy versioned schema (its
+        // JesseThread predates the archive fields), exactly as a shipped build did.
+        do {
+            let schema = Schema(versionedSchema: LegacyStampedSchema.self)
+            let container = try ModelContainer(
+                for: schema, configurations: ModelConfiguration(schema: schema, url: url))
+            let ctx = ModelContext(container)
+            let t = LegacyStampedSchema.JesseThread()
+            t.id = threadId
+            t.title = "pre-archive thread"
+            t.isFavorite = true
+            t.origin = ThreadOrigin.watch.rawValue
+            ctx.insert(t)
+            try ctx.save()
+        }
+
+        // "After": open under the CURRENT schema (JesseThread now has the archive
+        // columns) through the real app path. Must open, not fall back.
+        let store = AppModelContainer.load(url: url)
+        XCTAssertNil(store.openFailure,
+                     "a stamped store must open after an attribute is added to an existing entity")
+        XCTAssertFalse(store.isFallback)
+        let ctx = ModelContext(store.container)
+
+        let threads = try ctx.fetch(FetchDescriptor<JesseThread>())
+        XCTAssertEqual(threads.count, 1, "the pre-archive row survives")
+        let t = try XCTUnwrap(threads.first)
+        XCTAssertEqual(t.id, threadId)
+        XCTAssertTrue(t.isFavorite, "favorite survives the open")
+        XCTAssertEqual(t.originValue, .watch, "origin survives the open")
+        XCTAssertFalse(t.isArchived, "the added isArchived column defaults to false")
+        XCTAssertNil(t.archivedAt, "the added archivedAt column defaults to nil")
     }
 
     func testFailedOpenIsFlaggedAndLeavesTheOnDiskFileIntact() throws {
@@ -170,5 +246,37 @@ final class AppModelContainerMigrationTests: XCTestCase {
         // real data stays recoverable on the next launch.
         XCTAssertTrue(FileManager.default.fileExists(atPath: url.path), "the on-disk file is preserved")
         XCTAssertEqual(try Data(contentsOf: url), garbage, "the on-disk file is left exactly as it was")
+    }
+}
+
+/// A frozen copy of a PRIOR `JesseThread` shape (no archive fields), used ONLY to
+/// write a store stamped with an older schema so `testStampedStoreSurvivesAddingAn
+/// AttributeToAnExistingEntity` can prove the app opens it after the attribute is
+/// added. Its nested class is named `JesseThread` so its SwiftData entity name matches
+/// the live model (that is what makes the added-attribute migration line up). It holds
+/// only the scalar fields that existed then (no relationships), so it needs no frozen
+/// copy of `Turn`; the live schema adds the `turns` relationship and the other entities
+/// as an additive (lightweight) change on open. This type is never used by the app.
+private enum LegacyStampedSchema: VersionedSchema {
+    static var versionIdentifier: Schema.Version { Schema.Version(2, 0, 0) }
+
+    static var models: [any PersistentModel.Type] { [JesseThread.self] }
+
+    @Model
+    final class JesseThread {
+        var id: UUID = UUID()
+        var title: String = ""
+        var createdAt: Date = Date()
+        var updatedAt: Date = Date()
+        var mode: String = "ask"
+        var sessionId: String?
+        var isFavorite: Bool = false
+        var favoritedAt: Date?
+        var lastDeliveredJobId: String?
+        var aiTitle: String?
+        var titleSourceKey: String?
+        var origin: String = "phone"
+
+        init() {}
     }
 }
