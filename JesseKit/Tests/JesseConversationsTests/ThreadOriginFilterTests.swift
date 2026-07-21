@@ -1,5 +1,5 @@
 import XCTest
-@testable import Jesse
+import JesseConversations
 import JesseCore
 
 /// Item 3 — the Watch scope filter. Tests the pure `threadMatchesOrigin` predicate

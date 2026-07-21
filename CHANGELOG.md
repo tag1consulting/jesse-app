@@ -15,6 +15,37 @@ CI both run it). See the "Versioning" section of `bridge/README.md`.
 
 ## [Unreleased]
 
+## [App 1.0 (62)] - 2026-07-21
+
+### Changed
+- **Extracted the thread list's presentation logic into a shared
+  `JesseConversations` library and brought Favorites to the Mac, so both apps drive
+  their conversation list from one source instead of the Mac re-implementing it.**
+  The date sectioning, the collapsible-folder / favorites / origin layout, and the
+  multi-token match predicate were iOS-target-local; the Mac sidebar was a bare
+  `@Query` sort with no favorites at all. This unifies the presentation seam and
+  adds the Mac UI on top of it.
+  - **New `JesseConversations` library product in `JesseKit`** (depends on
+    `JesseCore`), holding `ThreadSectioning`, `ThreadFolders`, `ThreadOriginFilter`,
+    and the pure `threadMatches` / `threadMatchesAny` predicate, moved verbatim from
+    the iOS target and made public with zero behavior change. The iOS app now imports
+    the shared module; its list behavior is unchanged. The on-device search-expansion
+    orchestration (gating and the highlighted matched snippet) stays iOS-only.
+  - **Favorites on the Mac.** The Mac sidebar now renders from the shared
+    `threadListLayout` (via a testable `MacThreadListModel` seam), not a bare
+    `@Query` sort: a segmented All / Favorites scope control switches between the full
+    date-sectioned layout with collapsible month folders and the flat, newest-first
+    favorites list, matching the iPhone. Each row has a star affordance, with a
+    per-thread toggle via context menu and a leading swipe action; the favorites
+    filter has a Command Shift F shortcut. The Mac's cache-first paint, selection
+    restoration, and the New / Refresh / Settings shortcuts are preserved.
+  - **Tests moved and added.** The pure sectioning / folder / origin / favorites /
+    match tests moved into `JesseConversationsTests` (kept green); new
+    `JesseMacTests` coverage exercises the Mac list-model wiring (starring updates
+    `isFavorite` / `favoritedAt`, scope switching changes which threads the layout
+    yields, folder toggling reveals month rows). No schema change and no bridge
+    change: the favorites fields already existed.
+
 ## [App 1.0 (61)] - 2026-07-21
 
 ### Changed

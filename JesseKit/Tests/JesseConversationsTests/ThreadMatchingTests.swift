@@ -1,9 +1,9 @@
 import XCTest
-@testable import Jesse
+import JesseConversations
 import JesseCore
 
 @MainActor
-final class ThreadSearchTests: XCTestCase {
+final class ThreadMatchingTests: XCTestCase {
 
     /// Build an in-memory thread (no SwiftData container needed) with a title
     /// and a list of (role, text) turns.
@@ -155,18 +155,6 @@ final class ThreadSearchTests: XCTestCase {
         // Neither entry's tokens all appear... except the second.
         XCTAssertFalse(threadMatchesAny(t, queries: ["quarterly budget", "run tunnel"]))
         XCTAssertTrue(threadMatchesAny(t, queries: ["quarterly budget", "run bridge"]))
-    }
-
-    func testShouldExpandGating() {
-        // Trivial (short) query: never expand, regardless of base count.
-        XCTAssertFalse(shouldExpand(query: "hi", baseMatchCount: 0, threshold: 5))
-        XCTAssertFalse(shouldExpand(query: "  a ", baseMatchCount: 0, threshold: 5))
-        // Real word but plentiful base results: no need to widen.
-        XCTAssertFalse(shouldExpand(query: "bridge", baseMatchCount: 5, threshold: 5))
-        XCTAssertFalse(shouldExpand(query: "bridge", baseMatchCount: 9, threshold: 5))
-        // Real word, thin/zero base: expand.
-        XCTAssertTrue(shouldExpand(query: "bridge", baseMatchCount: 0, threshold: 5))
-        XCTAssertTrue(shouldExpand(query: "bridge", baseMatchCount: 4, threshold: 5))
     }
 
     // MARK: - Graceful-degradation invariant (item 8)
