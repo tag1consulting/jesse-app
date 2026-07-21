@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!--
+	  The bridge is reached over the tailnet by a bare 100.x IP or a MagicDNS
+	  ts.net name, on plain http (JESSE_PORT 8765) — the bridge binds tailnet space
+	  and is not TLS-terminated. An IP literal can't be expressed as an ATS
+	  NSExceptionDomains entry, and 100.64/10 (CGNAT) is not in ATS's "local
+	  networking" set, so a narrow per-domain exception (as the iPhone uses for its
+	  ts.net name) wouldn't cover the tailnet-IP path this client documents. For a
+	  single-user, bearer-token-authenticated, tailnet-only client, allow insecure
+	  loads outright.
+	-->
+	<key>NSAppTransportSecurity</key>
+	<dict>
+		<key>NSAllowsArbitraryLoads</key>
+		<true/>
+	</dict>
+	<key>CFBundleURLTypes</key>
+	<array>
+		<dict>
+			<key>CFBundleURLName</key>
+			<string>com.tag1.JesseMac.pair</string>
+			<key>CFBundleURLSchemes</key>
+			<array>
+				<string>jesse</string>
+			</array>
+		</dict>
+	</array>
+</dict>
+</plist>

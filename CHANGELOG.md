@@ -15,6 +15,42 @@ CI both run it). See the "Versioning" section of `bridge/README.md`.
 
 ## [Unreleased]
 
+## [App 1.0 (58)] — 2026-07-21
+
+### Added
+- **Native macOS Jesse client (`Jesse Mac`) — JESSE-WRAP B3 MVP.** A thin native
+  client that talks to the same bridge on the Studio the iPhone uses, built as a
+  SEPARATE macOS app target rather than the plan's originally-locked single
+  multiplatform target: the iOS app is deeply UIKit/HealthKit-coupled and its
+  `ContentView` isn't wanted on the Mac, so a separate target avoids invasive
+  `#if` surgery on the shipping app.
+  - **Shared core (`JesseCore/`).** A new synchronized folder, added to BOTH the
+    iOS and Mac targets with zero iOS behavior change: `JesseMode` (extracted from
+    `JesseClient.swift`) plus `Models.swift` and `JesseSchema.swift` (moved from
+    `Jesse/`). The Mac target reuses the phone's `JesseThread`/`Turn` schema.
+  - **`NavigationSplitView` shell** — cache-first thread list + conversation
+    detail. The list renders from the local SwiftData store (instant, offline) and
+    reconciles from `GET /jesse/sessions` (ETag-conditioned) in the background, so
+    phone-started threads appear.
+  - **`MacJesseClient`** — a health-free client covering `POST /jesse`,
+    `GET /jesse/stream/{job_id}` (SSE, with a poll fallback), `GET /jesse/sessions`
+    (`?since=`, ETag), `GET /jesse/sessions/{id}` (`?after=` byte-delta hydration),
+    `POST /jesse/title`, and `GET /jesse/result/{job_id}`.
+  - **Resume + hydration.** Opening a thread hydrates its transcript via the
+    append-only `?after=` delta, tracked by a per-session byte-offset cursor, and
+    continues the same Claude Code session by `session_id`.
+  - **Config + notifications.** Manual host/token and `jesse://pair` link config
+    (bearer token in the Keychain); a dependency-free SwiftUI Markdown renderer
+    (the iOS path is UIKit-based); local completion notifications
+    (`UserNotifications`) while the app runs.
+  - **Tests (`Jesse MacTests`, 19 XCTest cases).** Cover the pure logic — SSE
+    framing, host sanitizing, Markdown block parsing, and pairing-link parsing.
+    Hosted in the Mac app but run unsigned.
+  - **CI.** The `ios-app` job now also builds the Mac app (warnings-as-errors) and
+    runs the Mac tests; a shared `Jesse Mac` scheme is checked in. No bridge changes.
+  - Deliberately omitted (iOS-only): HealthKit, Siri, Live Activities, watch relay,
+    camera. Deferred to polish: APNs-for-Mac (quit/asleep notify), camera QR pairing.
+
 ## [Bridge 0.23.0] — 2026-07-20
 
 ### Added

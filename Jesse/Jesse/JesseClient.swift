@@ -4,12 +4,6 @@ import Security
 // Networking + config for the Jesse bridge. Config (host + token) lives in
 // Keychain so it survives reinstalls and isn't in plaintext UserDefaults.
 
-enum JesseMode: String, CaseIterable, Identifiable {
-    case ask, tell
-    var id: String { rawValue }
-    var label: String { self == .ask ? "Ask Jesse" : "Tell Jesse" }
-}
-
 /// A file the user picked to send with a turn. `data` is the raw bytes; the
 /// client base64-encodes it for the wire. Held in the composer as a removable
 /// chip and cleared after a successful send.

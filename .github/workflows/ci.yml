@@ -88,7 +88,7 @@ jobs:
         run: bash scripts/ci-guards.sh
 
   ios-app:
-    name: ios-app (build, test, watch, coverage)
+    name: ios-app (build, test, watch, mac, coverage)
     # The app targets iOS 26, whose simulators only run on a macOS 26 (Tahoe)
     # host — the macos-15 image can build but xcodebuild refuses to offer the
     # iOS 26 simulators as destinations there.
@@ -287,6 +287,51 @@ jobs:
             exit 1
           fi
 
+      # --- Mac app: the JesseMacTests suite (pure client logic — SSE framing,
+      # host sanitizing, Markdown parsing, pair-link parsing). Native macOS, so
+      # there is no simulator to resolve: build for the host, warnings-as-errors
+      # symmetric with iOS/watch. The hosted unit tests run UNSIGNED — they only
+      # load the test host, so no signing identity is needed on the runner.
+      - name: Build (mac)
+        run: |
+          set -euo pipefail
+          xcodebuild build \
+            -scheme "Jesse Mac" \
+            -destination "platform=macOS" \
+            -derivedDataPath build/DerivedDataMac \
+            SWIFT_TREAT_WARNINGS_AS_ERRORS=YES \
+            CODE_SIGNING_ALLOWED=NO
+
+      - name: Test (mac)
+        run: |
+          set -euo pipefail
+          xcodebuild test \
+            -scheme "Jesse Mac" \
+            -destination "platform=macOS" \
+            -derivedDataPath build/DerivedDataMac \
+            -resultBundlePath build/ResultMac.xcresult \
+            CODE_SIGNING_ALLOWED=NO
+
+      - name: Report mac test count
+        if: always()
+        run: |
+          set -euo pipefail
+          if [ ! -d build/ResultMac.xcresult ]; then
+            echo "No mac result bundle produced" >&2
+            exit 1
+          fi
+          summary="$(xcrun xcresulttool get test-results summary --path build/ResultMac.xcresult)"
+          total=$(printf '%s' "$summary" | jq -r '.totalTestCount')
+          passed=$(printf '%s' "$summary" | jq -r '.passedTests')
+          failed=$(printf '%s' "$summary" | jq -r '.failedTests')
+          skipped=$(printf '%s' "$summary" | jq -r '.skippedTests')
+          echo "JesseMacTests: total=${total} passed=${passed} failed=${failed} skipped=${skipped}"
+          echo "### mac: ${total} tests (passed ${passed}, failed ${failed}, skipped ${skipped})" >> "$GITHUB_STEP_SUMMARY"
+          if [ "${total}" -le 0 ]; then
+            echo "Expected the mac test suite to run at least one test, got ${total}" >&2
+            exit 1
+          fi
+
       # A failed run otherwise leaves only log text. The result bundles make
       # test failures and simulator flakes diagnosable in Xcode without
       # re-running the job. `if-no-files-found: ignore` because a failure
@@ -299,5 +344,6 @@ jobs:
           path: |
             Jesse/build/Result.xcresult
             Jesse/build/ResultWatch.xcresult
+            Jesse/build/ResultMac.xcresult
           if-no-files-found: ignore
           retention-days: 14
