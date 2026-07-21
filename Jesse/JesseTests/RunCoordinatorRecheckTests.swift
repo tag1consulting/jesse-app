@@ -1,6 +1,7 @@
 import XCTest
 import SwiftData
 @testable import Jesse
+import JesseCore
 
 /// Part 3: a turn that fails recoverably must RETAIN its bridge job_id and offer
 /// a manual "Re-check" that re-attaches to the same job — delivering the reply if

@@ -15,6 +15,41 @@ CI both run it). See the "Versioning" section of `bridge/README.md`.
 
 ## [Unreleased]
 
+## [App 1.0 (60)] - 2026-07-21
+
+### Changed
+- **Extracted the model layer into a real local Swift package, `JesseKit`, with a
+  first library product `JesseCore`. Pure structural refactor, no behavior change.**
+  Until now the model layer was "shared" between the iOS and macOS targets only by
+  compiling the same files into both (the `JesseCore` synchronized folder), which is
+  not a boundary: the Mac target had already grown a parallel networking client. This
+  establishes the compile-time boundary the rest of that cleanup needs.
+  - **`JesseMode`, `Models.swift`, and `JesseSchema.swift` moved** from the app's
+    synchronized `JesseCore/` folder into `JesseKit/Sources/JesseCore`. The types the
+    apps reference (the `@Model` entities `JesseThread`, `Turn`, `TurnAttachment`,
+    `OutboxItem`, `OutboxAttachment`, `WrittenMeal`; the enums `JesseMode`, `TurnRole`,
+    `ThreadOrigin`, `OutboxState`; and `JesseSchemaV1`/`JesseSchemaV2`,
+    `jesseCurrentSchema`, `JesseMigrationPlan`) are now `public`. Nothing was renamed.
+  - **SwiftData store untouched.** Same entities, same schema versions, same
+    `JesseMigrationPlan` (V1 to V2 lightweight). Entity names are the unqualified class
+    names, so moving them to a new module does not change on-disk identity. The
+    populated-store migration test still opens the store and passes.
+  - **Concurrency preserved.** The `JesseCore` target sets `defaultIsolation(MainActor)`
+    and Swift 6 language mode so the moved code keeps the exact isolation it had under
+    the app's `SWIFT_DEFAULT_ACTOR_ISOLATION = MainActor`.
+  - **Targets wired.** `JesseKit` is a package dependency of the iOS `Jesse` target, the
+    `Jesse Mac` target, and the `JesseTests` target; the files that reference the moved
+    types gained `import JesseCore`. The watch and widgets targets do not use these
+    types and are unchanged.
+  - **Tests.** The two pure model unit suites (`ThreadOrderedTurnsTests`,
+    `ThreadOriginTests`) moved into the fast `swift test` package suite; the
+    app-integration tests (container open, app wiring) stay in `JesseTests`, importing
+    `JesseCore`.
+  - **CI.** A new job builds and tests the package with warnings as errors; the app
+    build steps pass `SWIFT_SUPPRESS_WARNINGS=NO` so warnings-as-errors no longer
+    conflicts with the suppression Xcode applies to package dependencies. No bridge
+    changes.
+
 ## [App 1.0 (59)] — 2026-07-21
 
 ### Added

@@ -1,6 +1,7 @@
 import XCTest
 import SwiftData
 @testable import Jesse
+import JesseCore
 
 /// A main-actor holder that breaks the coordinator↔pollSleep construction cycle: a
 /// `let` box the injected closure captures, whose `coordinator` is filled in once the

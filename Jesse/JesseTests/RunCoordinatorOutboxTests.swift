@@ -1,6 +1,7 @@
 import XCTest
 import SwiftData
 @testable import Jesse
+import JesseCore
 
 /// The send outbox: a message is persisted at stage time (an `OutboxItem` carrying
 /// the ORIGINAL full-resolution attachment bytes) and deleted the instant the bridge

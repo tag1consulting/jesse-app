@@ -1,6 +1,7 @@
 import XCTest
 import SwiftData
 @testable import Jesse
+import JesseCore
 
 /// The live-streaming path of the coordinator, driven through the
 /// `JesseClientProtocol` seam with no server. A turn that outran the grace window

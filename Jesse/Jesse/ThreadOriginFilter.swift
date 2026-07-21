@@ -1,4 +1,5 @@
 import Foundation
+import JesseCore
 
 // Pure, SwiftUI-free origin scoping for the thread list. Kept in its own file
 // (Foundation only) so the predicate is unit-testable without a view host,

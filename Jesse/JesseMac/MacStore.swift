@@ -1,6 +1,7 @@
 import Foundation
 import SwiftData
 import Observation
+import JesseCore
 
 // The Mac client's local store + sync + turn runner. Cache-first (locked 2026-07-13):
 // the UI always renders from this local SwiftData store; the bridge is the sync

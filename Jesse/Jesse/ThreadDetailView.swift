@@ -4,6 +4,7 @@ import UIKit
 import PhotosUI
 import UniformTypeIdentifiers
 import AVFoundation
+import JesseCore
 
 // One conversation: the full turn transcript with the composer pinned at the
 // bottom. Being inside a thread *is* continuing it — every send auto-resumes the

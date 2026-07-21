@@ -1,6 +1,7 @@
 import XCTest
 import SwiftData
 @testable import Jesse
+import JesseCore
 
 /// The classify-then-attach retry machinery in `RunCoordinator`: a reply that is a
 /// JESSE_NEEDS_HEALTH directive triggers ONE fulfillment retry (same text, same

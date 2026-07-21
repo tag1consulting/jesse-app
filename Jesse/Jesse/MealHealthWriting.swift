@@ -1,4 +1,5 @@
 import Foundation
+import JesseCore
 
 // The Foundation-only seams and orchestration for writing logged meals into Apple
 // Health. HealthKit itself is confined to `HealthKitMealWriter` (behind the

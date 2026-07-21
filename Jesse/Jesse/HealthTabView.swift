@@ -1,5 +1,6 @@
 import SwiftUI
 import SwiftData
+import JesseCore
 
 // The Health tab: a compact, scannable "Today" screen that drills into the six
 // detail screens. All rendering is a pure function of the snapshot + semantics; the

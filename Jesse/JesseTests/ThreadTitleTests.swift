@@ -1,5 +1,6 @@
 import XCTest
 @testable import Jesse
+import JesseCore
 
 // Pure-function tests for the AI-title seams: the content key (invalidation), the
 // digest (what the app sends), and the display precedence. No view host, no

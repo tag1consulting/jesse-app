@@ -1,6 +1,7 @@
 import XCTest
 import SwiftData
 @testable import Jesse
+import JesseCore
 
 // Behavioral tests for AI-title generation: the REAL `JesseClient.title` over a
 // URLProtocol stub (404 / timeout / empty → nil, a 200 → the title), and

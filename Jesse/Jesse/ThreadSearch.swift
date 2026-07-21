@@ -1,4 +1,5 @@
 import Foundation
+import JesseCore
 
 // Pure, SwiftUI-free search matching for the thread list. Kept in its own file
 // (Foundation only) so the predicates are unit-testable without a view host,

@@ -1,5 +1,6 @@
 import XCTest
 @testable import Jesse
+import JesseCore
 
 @MainActor
 final class ThreadFoldersTests: XCTestCase {

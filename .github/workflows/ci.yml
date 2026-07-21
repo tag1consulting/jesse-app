@@ -109,6 +109,18 @@ jobs:
           xcodebuild -version
           xcode-select -p
 
+      # JesseKit local package (the JesseCore model layer). Fast standalone suite,
+      # built and tested with warnings-as-errors symmetric with the app build below.
+      # JesseCore depends on SwiftData (Apple-only), so this runs on the macOS runner
+      # rather than the Linux bridge job. Runs first for quick feedback on the model
+      # layer before the longer app build/test steps.
+      - name: Build and test JesseKit package
+        working-directory: ${{ github.workspace }}/JesseKit
+        run: |
+          set -euo pipefail
+          swift build -Xswiftc -warnings-as-errors
+          swift test -Xswiftc -warnings-as-errors
+
       - name: Resolve simulator destination
         id: sim
         run: |
@@ -164,6 +176,7 @@ jobs:
             -derivedDataPath build/DerivedData \
             IPHONEOS_DEPLOYMENT_TARGET=${{ steps.sim.outputs.deployment_target }} \
             SWIFT_TREAT_WARNINGS_AS_ERRORS=YES \
+            SWIFT_SUPPRESS_WARNINGS=NO \
             CODE_SIGNING_ALLOWED=NO
 
       - name: Test
@@ -255,6 +268,7 @@ jobs:
             -destination "${{ steps.watchsim.outputs.destination }}" \
             -derivedDataPath build/DerivedDataWatch \
             SWIFT_TREAT_WARNINGS_AS_ERRORS=YES \
+            SWIFT_SUPPRESS_WARNINGS=NO \
             CODE_SIGNING_ALLOWED=NO
 
       - name: Test (watch)
@@ -300,6 +314,7 @@ jobs:
             -destination "platform=macOS" \
             -derivedDataPath build/DerivedDataMac \
             SWIFT_TREAT_WARNINGS_AS_ERRORS=YES \
+            SWIFT_SUPPRESS_WARNINGS=NO \
             CODE_SIGNING_ALLOWED=NO
 
       - name: Test (mac)

@@ -1,5 +1,6 @@
 import Foundation
 import SwiftData
+import JesseCore
 
 // The phone-side entry point an Apple Watch will call (in PR2) to relay a spoken
 // turn through the phone. Everything here is exercisable as plain TEXT with no

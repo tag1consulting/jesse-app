@@ -1,6 +1,7 @@
 import XCTest
 import Foundation
 @testable import Jesse
+import JesseCore
 
 /// Covers the share transcript and the client-side attachment logic — the parts
 /// that are pure and testable without a server or the UI. The bridge re-runs the

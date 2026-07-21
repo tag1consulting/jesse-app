@@ -1,6 +1,7 @@
 import XCTest
 import SwiftData
 @testable import Jesse
+import JesseCore
 
 /// Covers the `WrittenMeal` idempotency + correction store: it round-trips through a real
 /// store, `SwiftDataWrittenMealStore` records content hashes + tombstones and dedupes ids,

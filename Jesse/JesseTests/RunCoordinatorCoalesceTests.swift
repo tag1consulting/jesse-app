@@ -1,6 +1,7 @@
 import XCTest
 import SwiftData
 @testable import Jesse
+import JesseCore
 
 /// Streaming re-eval perf: the coordinator publishes the observable `partialText`
 /// at most ~10Hz regardless of how fast delta chunks arrive, so a long reply no

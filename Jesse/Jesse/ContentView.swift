@@ -1,5 +1,6 @@
 import SwiftUI
 import SwiftData
+import JesseCore
 
 // Root of the app: a NavigationStack hosting the thread list. Cross-cutting
 // concerns live here — re-attaching to backgrounded runs on foreground, draining

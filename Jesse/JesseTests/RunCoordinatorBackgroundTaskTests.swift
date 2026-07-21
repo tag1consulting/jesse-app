@@ -2,6 +2,7 @@ import XCTest
 import SwiftData
 import UIKit
 @testable import Jesse
+import JesseCore
 
 /// (M7) The background-task expiration handler must always end the *granted*
 /// identifier, even when it fires before `send` records the handle. Pre-fix the
