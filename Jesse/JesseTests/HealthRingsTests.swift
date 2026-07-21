@@ -86,25 +86,25 @@ final class HealthRingsTests: XCTestCase {
     func testCaloriesHeroLeftState() {
         let g = calGauge(intake: 1380, target: 2000)   // 620 under a ceiling
         XCTAssertEqual(CaloriesHero.centerNumber(g), "620")
-        XCTAssertEqual(CaloriesHero.centerCaption(g), "620 left")
+        XCTAssertEqual(CaloriesHero.centerCaption(g), "room for 620")
     }
 
     func testCaloriesHeroAtLimitState() {
         let g = calGauge(intake: 2000, target: 2000)
         XCTAssertEqual(CaloriesHero.centerNumber(g), "0")
-        XCTAssertEqual(CaloriesHero.centerCaption(g), "at limit")
+        XCTAssertEqual(CaloriesHero.centerCaption(g), "right on target")
     }
 
     func testCaloriesHeroOverState() {
         let g = calGauge(intake: 2180, target: 2000)
         XCTAssertEqual(CaloriesHero.centerNumber(g), "180")
-        XCTAssertEqual(CaloriesHero.centerCaption(g), "180 over limit")
+        XCTAssertEqual(CaloriesHero.centerCaption(g), "180 over")
     }
 
     func testCaloriesHeroWindowStateOnCarbLoad() {
-        // Carb-load day: calories are a window. Under the 92% low edge → "need X more".
+        // Carb-load day: calories are a window. Under the 92% low edge → "X more to go".
         let g = calGauge(intake: 1500, target: 2000, carbLoad: true)
-        XCTAssertEqual(CaloriesHero.centerCaption(g), "need 340 more")   // 1840 - 1500
+        XCTAssertEqual(CaloriesHero.centerCaption(g), "340 more to go")   // 1840 - 1500
         // In-window phrasing at, say, 96%.
         let inWin = calGauge(intake: 1920, target: 2000, carbLoad: true)
         XCTAssertEqual(CaloriesHero.centerCaption(inWin), "in window")

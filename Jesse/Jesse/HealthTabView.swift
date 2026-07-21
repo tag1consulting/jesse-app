@@ -97,6 +97,7 @@ struct TodayScreen: View {
         List {
             pagingSection
             headerSection
+            summarySection
             caloriesSection
             macroRingsSection
             weightSection
@@ -197,6 +198,19 @@ struct TodayScreen: View {
                 }
             }
             .listRowBackground(Color.clear)
+        }
+    }
+
+    // The plain-language summary LEADS the judged day: "how am I doing" + "what would
+    // help next", derived from the same gauges the rings draw (so they can't disagree).
+    // A reconstructed day has no targets to summarize, so it's omitted there.
+    @ViewBuilder
+    private var summarySection: some View {
+        if !isNeutral {
+            Section {
+                DaySummaryCard(summary: DaySummary.make(gauges: gauges, hour: hour,
+                                                        hasFood: !today.meals.isEmpty))
+            }
         }
     }
 
