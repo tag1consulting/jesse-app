@@ -23,6 +23,7 @@ let package = Package(
     ],
     products: [
         .library(name: "JesseCore", targets: ["JesseCore"]),
+        .library(name: "JesseNetworking", targets: ["JesseNetworking"]),
     ],
     targets: [
         .target(
@@ -35,6 +36,27 @@ let package = Package(
         .testTarget(
             name: "JesseCoreTests",
             dependencies: ["JesseCore"],
+            swiftSettings: [
+                .swiftLanguageMode(.v6),
+            ]
+        ),
+        // The bridge HTTP contract and the one concrete client both apps share:
+        // config, wire types, the SSE parser, endpoint construction, error mapping,
+        // and the diet snapshot models. View-free and health-free — the iOS app layers
+        // its per-turn health_context body on top. Unlike JesseCore (whose @Model layer
+        // was authored against the app's MainActor default isolation), the networking
+        // surface is nonisolated Sendable value types and a nonisolated client used off
+        // the main actor, so this target keeps Swift's default (nonisolated) isolation.
+        .target(
+            name: "JesseNetworking",
+            dependencies: ["JesseCore"],
+            swiftSettings: [
+                .swiftLanguageMode(.v6),
+            ]
+        ),
+        .testTarget(
+            name: "JesseNetworkingTests",
+            dependencies: ["JesseNetworking"],
             swiftSettings: [
                 .swiftLanguageMode(.v6),
             ]

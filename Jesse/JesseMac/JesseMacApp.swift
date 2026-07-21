@@ -41,7 +41,7 @@ struct JesseMacApp: App {
                 }
                 .onOpenURL { url in
                     guard let p = MacPairLink.parse(url.absoluteString) else { return }
-                    let (host, port) = MacBridgeConfig.sanitize(p.host)
+                    let (host, port) = JesseConfig.sanitize(p.host)
                     configStore.save(host: host, port: port ?? p.port, token: p.token)
                 }
         }

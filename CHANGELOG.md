@@ -15,6 +15,51 @@ CI both run it). See the "Versioning" section of `bridge/README.md`.
 
 ## [Unreleased]
 
+## [App 1.0 (61)] - 2026-07-21
+
+### Changed
+- **Unified the iOS and macOS bridge clients into one shared `JesseNetworking`
+  library, and deleted the macOS networking duplication. Pure structural refactor,
+  no behavior change on either platform.**
+  The single largest source of iOS/macOS drift was the networking layer: the Mac
+  target's `MacJesseClient.swift` re-implemented from scratch what the iOS
+  `JesseClient.swift` already did (send a turn, stream the SSE reply, poll a job,
+  list sessions, hydrate a transcript, mint a title), with the wire structs, the SSE
+  parser, and endpoint construction duplicated under `Mac`-prefixed names. This
+  collapses that duplication into one place.
+  - **New `JesseNetworking` library product in `JesseKit`** (depends on `JesseCore`),
+    owning the whole bridge HTTP contract: the config value type (`JesseConfig`) plus a
+    Keychain-backed config store seam (`BridgeConfigStoring` / `KeychainConfigStore`),
+    the one canonical set of wire types (`JesseReply`, `JesseSendResult`,
+    `JesseResultState`, `JesseStreamEvent`, `SessionSummary`, `HydratedTurn`, the
+    request/response `Codable` DTOs, `JesseProvenance`, `JesseDirectives`, the `Diet*`
+    snapshot models), one pure `SSEParser`, endpoint/URL construction, the bearer-auth
+    request builder, ETag handling, error mapping (`JesseError` / `DietFetchError`), and
+    a single concrete `JesseBridgeClient` implementing send, stream, poll, sessions,
+    hydrate, title, diet, cancel, delete, health, and device registration.
+  - **iOS `JesseClient` is now a thin platform layer over that shared client.** It adds
+    only the iOS-specific concerns: the per-turn `health_context` body assembled from
+    HealthKit, the classify-then-attach decision, and the needs-health fulfillment retry.
+    The public `JesseClientProtocol` surface the app already consumes is unchanged, so
+    `RunCoordinator` and the views compile without edits (`JesseNetworking` is
+    re-exported from the iOS target).
+  - **Deleted `MacJesseClient.swift` and every `Mac`-prefixed wire type and parser.**
+    `MacStore`'s `MacCoordinator` now talks to the shared `JesseBridgeClient`; the Mac
+    keeps its own thin cache-first single-turn coordinator, but the networking underneath
+    is the shared one. `MacBridgeConfig` and `MacKeychain` are gone: `MacConfigStore`
+    now persists host, port, and token through the shared Keychain seam, exactly as iOS
+    does (token in the Keychain, not plaintext UserDefaults).
+  - **Tests.** The SSE-framing and host-sanitizing tests (formerly duplicated in the iOS
+    and macOS test targets) are consolidated as package tests in `JesseNetworkingTests`,
+    alongside the reply display/spoken derivation tests. The macOS test target keeps its
+    app-specific coverage (Markdown, pairing-link, notification snippet). The iOS wire and
+    integration tests are unchanged.
+  - **No bridge change.** The bridge HTTP contract, and every route the apps call, are
+    untouched. Streaming, the 202 poll fallback, hydration deltas, ETag 304s, title
+    minting, cancellation, and remote-session deletion all behave as before. The macOS
+    stream now shares the iOS session ceilings (a day-long resource timeout), which only
+    raises a cap and never changes which frames arrive.
+
 ## [App 1.0 (60)] - 2026-07-21
 
 ### Changed

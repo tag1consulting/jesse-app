@@ -16,6 +16,9 @@
 		B0D0F1000000000000F10012 /* JesseCore in Frameworks */ = {isa = PBXBuildFile; productRef = B0D0F1000000000000F10011 /* JesseCore */; };
 		B0D0F1000000000000F10022 /* JesseCore in Frameworks */ = {isa = PBXBuildFile; productRef = B0D0F1000000000000F10021 /* JesseCore */; };
 		B0D0F1000000000000F10032 /* JesseCore in Frameworks */ = {isa = PBXBuildFile; productRef = B0D0F1000000000000F10031 /* JesseCore */; };
+		B0D0F2000000000000F20012 /* JesseNetworking in Frameworks */ = {isa = PBXBuildFile; productRef = B0D0F2000000000000F20011 /* JesseNetworking */; };
+		B0D0F2000000000000F20022 /* JesseNetworking in Frameworks */ = {isa = PBXBuildFile; productRef = B0D0F2000000000000F20021 /* JesseNetworking */; };
+		B0D0F2000000000000F20032 /* JesseNetworking in Frameworks */ = {isa = PBXBuildFile; productRef = B0D0F2000000000000F20031 /* JesseNetworking */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
@@ -172,6 +175,7 @@
 			buildActionMask = 2147483647;
 			files = (
 				B0D0F1000000000000F10012 /* JesseCore in Frameworks */,
+				B0D0F2000000000000F20012 /* JesseNetworking in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -180,6 +184,7 @@
 			buildActionMask = 2147483647;
 			files = (
 				B0D0F1000000000000F10032 /* JesseCore in Frameworks */,
+				B0D0F2000000000000F20032 /* JesseNetworking in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -209,6 +214,7 @@
 			buildActionMask = 2147483647;
 			files = (
 				B0D0F1000000000000F10022 /* JesseCore in Frameworks */,
+				B0D0F2000000000000F20022 /* JesseNetworking in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -288,6 +294,7 @@
 			name = Jesse;
 			packageProductDependencies = (
 				B0D0F1000000000000F10011 /* JesseCore */,
+				B0D0F2000000000000F20011 /* JesseNetworking */,
 			);
 			productName = Jesse;
 			productReference = B0D068152FE83E3F00C8C4B0 /* Jesse.app */;
@@ -312,6 +319,7 @@
 			name = JesseTests;
 			packageProductDependencies = (
 				B0D0F1000000000000F10031 /* JesseCore */,
+				B0D0F2000000000000F20031 /* JesseNetworking */,
 			);
 			productName = JesseTests;
 			productReference = B0D069000000000000000002 /* JesseTests.xctest */;
@@ -400,6 +408,7 @@
 			name = "Jesse Mac";
 			packageProductDependencies = (
 				B0D0F1000000000000F10021 /* JesseCore */,
+				B0D0F2000000000000F20021 /* JesseNetworking */,
 			);
 			productName = "Jesse Mac";
 			productReference = B0D06E00000000000000E015 /* Jesse Mac.app */;
@@ -475,7 +484,7 @@
 			mainGroup = B0D0680C2FE83E3F00C8C4B0;
 			minimizedProjectReferenceProxies = 1;
 			packageReferences = (
-				B0D0F1000000000000F10001 /* XCLocalSwiftPackageReference "JesseKit" */,
+				B0D0F1000000000000F10001 /* XCLocalSwiftPackageReference "../JesseKit" */,
 			);
 			preferredProjectObjectVersion = 77;
 			productRefGroup = B0D068162FE83E3F00C8C4B0 /* Products */;
@@ -761,7 +770,7 @@
 				CLANG_ENABLE_MODULES = YES;
 				CODE_SIGN_ENTITLEMENTS = Jesse/Jesse.entitlements;
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 60;
+				CURRENT_PROJECT_VERSION = 61;
 				DEVELOPMENT_TEAM = C6RPS3BGXX;
 				ENABLE_PREVIEWS = YES;
 				GENERATE_INFOPLIST_FILE = YES;
@@ -797,7 +806,7 @@
 				CLANG_ENABLE_MODULES = YES;
 				CODE_SIGN_ENTITLEMENTS = Jesse/Jesse.entitlements;
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 60;
+				CURRENT_PROJECT_VERSION = 61;
 				DEVELOPMENT_TEAM = C6RPS3BGXX;
 				ENABLE_PREVIEWS = YES;
 				GENERATE_INFOPLIST_FILE = YES;
@@ -829,7 +838,7 @@
 			buildSettings = {
 				BUNDLE_LOADER = "$(TEST_HOST)";
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 60;
+				CURRENT_PROJECT_VERSION = 61;
 				DEVELOPMENT_TEAM = C6RPS3BGXX;
 				GENERATE_INFOPLIST_FILE = YES;
 				IPHONEOS_DEPLOYMENT_TARGET = 26.5;
@@ -848,7 +857,7 @@
 			buildSettings = {
 				BUNDLE_LOADER = "$(TEST_HOST)";
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 60;
+				CURRENT_PROJECT_VERSION = 61;
 				DEVELOPMENT_TEAM = C6RPS3BGXX;
 				GENERATE_INFOPLIST_FILE = YES;
 				IPHONEOS_DEPLOYMENT_TARGET = 26.5;
@@ -869,7 +878,7 @@
 				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
 				CLANG_ENABLE_MODULES = YES;
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 60;
+				CURRENT_PROJECT_VERSION = 61;
 				DEVELOPMENT_TEAM = C6RPS3BGXX;
 				ENABLE_PREVIEWS = YES;
 				GENERATE_INFOPLIST_FILE = YES;
@@ -903,7 +912,7 @@
 				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
 				CLANG_ENABLE_MODULES = YES;
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 60;
+				CURRENT_PROJECT_VERSION = 61;
 				DEVELOPMENT_TEAM = C6RPS3BGXX;
 				ENABLE_PREVIEWS = YES;
 				GENERATE_INFOPLIST_FILE = YES;
@@ -936,7 +945,7 @@
 			buildSettings = {
 				BUNDLE_LOADER = "$(TEST_HOST)";
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 60;
+				CURRENT_PROJECT_VERSION = 61;
 				DEVELOPMENT_TEAM = C6RPS3BGXX;
 				GENERATE_INFOPLIST_FILE = YES;
 				MARKETING_VERSION = 1.0;
@@ -956,7 +965,7 @@
 			buildSettings = {
 				BUNDLE_LOADER = "$(TEST_HOST)";
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 60;
+				CURRENT_PROJECT_VERSION = 61;
 				DEVELOPMENT_TEAM = C6RPS3BGXX;
 				GENERATE_INFOPLIST_FILE = YES;
 				MARKETING_VERSION = 1.0;
@@ -978,7 +987,7 @@
 				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
 				CLANG_ENABLE_MODULES = YES;
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 60;
+				CURRENT_PROJECT_VERSION = 61;
 				DEVELOPMENT_TEAM = C6RPS3BGXX;
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_FILE = JesseWidgets/Info.plist;
@@ -1010,7 +1019,7 @@
 				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
 				CLANG_ENABLE_MODULES = YES;
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 60;
+				CURRENT_PROJECT_VERSION = 61;
 				DEVELOPMENT_TEAM = C6RPS3BGXX;
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_FILE = JesseWidgets/Info.plist;
@@ -1044,7 +1053,7 @@
 				CLANG_ENABLE_MODULES = YES;
 				CODE_SIGN_STYLE = Automatic;
 				COMBINE_HIDPI_IMAGES = YES;
-				CURRENT_PROJECT_VERSION = 60;
+				CURRENT_PROJECT_VERSION = 61;
 				DEVELOPMENT_TEAM = C6RPS3BGXX;
 				ENABLE_PREVIEWS = YES;
 				GENERATE_INFOPLIST_FILE = YES;
@@ -1077,7 +1086,7 @@
 				CLANG_ENABLE_MODULES = YES;
 				CODE_SIGN_STYLE = Automatic;
 				COMBINE_HIDPI_IMAGES = YES;
-				CURRENT_PROJECT_VERSION = 60;
+				CURRENT_PROJECT_VERSION = 61;
 				DEVELOPMENT_TEAM = C6RPS3BGXX;
 				ENABLE_PREVIEWS = YES;
 				GENERATE_INFOPLIST_FILE = YES;
@@ -1107,7 +1116,7 @@
 			buildSettings = {
 				BUNDLE_LOADER = "$(TEST_HOST)";
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 60;
+				CURRENT_PROJECT_VERSION = 61;
 				DEVELOPMENT_TEAM = C6RPS3BGXX;
 				GENERATE_INFOPLIST_FILE = YES;
 				MACOSX_DEPLOYMENT_TARGET = 26.0;
@@ -1126,7 +1135,7 @@
 			buildSettings = {
 				BUNDLE_LOADER = "$(TEST_HOST)";
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 60;
+				CURRENT_PROJECT_VERSION = 61;
 				DEVELOPMENT_TEAM = C6RPS3BGXX;
 				GENERATE_INFOPLIST_FILE = YES;
 				MACOSX_DEPLOYMENT_TARGET = 26.0;
@@ -1218,7 +1227,7 @@
 /* End XCConfigurationList section */
 
 /* Begin XCLocalSwiftPackageReference section */
-		B0D0F1000000000000F10001 /* XCLocalSwiftPackageReference "JesseKit" */ = {
+		B0D0F1000000000000F10001 /* XCLocalSwiftPackageReference "../JesseKit" */ = {
 			isa = XCLocalSwiftPackageReference;
 			relativePath = ../JesseKit;
 		};
@@ -1236,6 +1245,18 @@
 		B0D0F1000000000000F10031 /* JesseCore */ = {
 			isa = XCSwiftPackageProductDependency;
 			productName = JesseCore;
+		};
+		B0D0F2000000000000F20011 /* JesseNetworking */ = {
+			isa = XCSwiftPackageProductDependency;
+			productName = JesseNetworking;
+		};
+		B0D0F2000000000000F20021 /* JesseNetworking */ = {
+			isa = XCSwiftPackageProductDependency;
+			productName = JesseNetworking;
+		};
+		B0D0F2000000000000F20031 /* JesseNetworking */ = {
+			isa = XCSwiftPackageProductDependency;
+			productName = JesseNetworking;
 		};
 /* End XCSwiftPackageProductDependency section */
 	};
