@@ -108,6 +108,17 @@ pub fn session_delete_request(auth: Option<&str>, session_id: &str) -> Request<B
     }
     b.body(Body::empty()).unwrap()
 }
+/// `POST /jesse/session/{id}/flags` with the given (optional) auth header and body.
+pub fn session_flags_request(auth: Option<&str>, session_id: &str, json: &str) -> Request<Body> {
+    let mut b = Request::builder()
+        .method("POST")
+        .uri(format!("/jesse/session/{session_id}/flags"))
+        .header("content-type", "application/json");
+    if let Some(a) = auth {
+        b = b.header("authorization", a);
+    }
+    b.body(Body::from(json.to_string())).unwrap()
+}
 pub fn stream_request(auth: Option<&str>, job_id: &str) -> Request<Body> {
     let mut b = Request::builder()
         .method("GET")

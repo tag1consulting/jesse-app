@@ -177,9 +177,10 @@ pub fn sweep_expired_sessions(dir: &Path, now_secs: u64, ttl_days: u64) -> Vec<(
 
 /// Run one GC sweep over the bridge vault's projects dir at the current wall
 /// clock. Uses the HOME captured in `cfg.home` (mirroring `AppState::sessions_dir`)
-/// so the sweep stays scoped to exactly the vault project. Titles for reclaimed
-/// sessions are dropped from the store so a reclaimed id can't linger in `titles.json`.
-pub fn run_session_gc(cfg: &Config, titles: &TitleStore) {
+/// so the sweep stays scoped to exactly the vault project. Titles AND flags for
+/// reclaimed sessions are dropped from their stores so a reclaimed id can't linger
+/// in `titles.json` / `flags.json` and resurrect a stale title or favorite.
+pub fn run_session_gc(cfg: &Config, titles: &TitleStore, flags: &FlagStore) {
     let dir = vault_sessions_dir(&cfg.home, &cfg.vault);
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -188,6 +189,7 @@ pub fn run_session_gc(cfg: &Config, titles: &TitleStore) {
     let reclaimed = sweep_expired_sessions(&dir, now, cfg.session_ttl_days);
     for (id, _age) in &reclaimed {
         titles.remove(id);
+        flags.remove(id);
     }
     if !reclaimed.is_empty() {
         eprintln!(
@@ -202,7 +204,7 @@ pub fn run_session_gc(cfg: &Config, titles: &TitleStore) {
 /// every `SESSION_GC_INTERVAL`, for the life of the process. A missing session
 /// TTL / projects dir is handled gracefully by `run_session_gc` (it reclaims
 /// nothing). Mirrors `spawn_eviction_task`'s shape.
-pub fn spawn_session_gc_task(cfg: Arc<Config>, titles: Arc<TitleStore>) {
+pub fn spawn_session_gc_task(cfg: Arc<Config>, titles: Arc<TitleStore>, flags: Arc<FlagStore>) {
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(SESSION_GC_INTERVAL);
         // `interval` fires the first tick IMMEDIATELY, so this is the "one run at
@@ -210,7 +212,7 @@ pub fn spawn_session_gc_task(cfg: Arc<Config>, titles: Arc<TitleStore>) {
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             tick.tick().await;
-            run_session_gc(&cfg, &titles);
+            run_session_gc(&cfg, &titles, &flags);
         }
     });
 }
@@ -261,13 +263,20 @@ pub fn resolve_resume_session<'a>(cfg: &Config, session_id: Option<&'a str>) -> 
     effective
 }
 
-/// One session summary in the response, newest-first ordered by the caller.
+/// One session summary in the response, newest-first ordered by the caller. The
+/// four flag fields (`favorite`, `favorite_updated_ms`, `archived`,
+/// `archived_updated_ms`) are additive: they default to false/0 for a session with
+/// no flags row, and an older app that predates them simply ignores them.
 #[derive(serde::Serialize, PartialEq, Debug)]
 pub struct SessionSummary {
     pub session_id: String,
     pub last_modified: u64,
     pub first_message: Option<String>,
     pub title: Option<String>,
+    pub favorite: bool,
+    pub favorite_updated_ms: u64,
+    pub archived: bool,
+    pub archived_updated_ms: u64,
 }
 
 /// Pull the user text out of a `{"type":"user","message":{...}}` transcript line.
@@ -383,7 +392,17 @@ pub fn first_user_message(path: &Path) -> Option<String> {
 ///   `dir`;
 /// - `since` (unix seconds), when set, keeps only sessions with mtime STRICTLY
 ///   greater — the delta-poll filter.
-pub fn list_sessions(dir: &Path, since: Option<u64>, titles: &TitleStore) -> Vec<SessionSummary> {
+///
+/// Each summary's four flag fields are filled from the `flags` store, defaulting to
+/// false/0 for a session with no row. The flags are part of the serialized body, so
+/// they are folded into the list's ETag automatically (see `jesse_sessions`):
+/// flipping a flag changes the body and therefore invalidates a cached 304.
+pub fn list_sessions(
+    dir: &Path,
+    since: Option<u64>,
+    titles: &TitleStore,
+    flags: &FlagStore,
+) -> Vec<SessionSummary> {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return Vec::new();
     };
@@ -429,12 +448,17 @@ pub fn list_sessions(dir: &Path, since: Option<u64>, titles: &TitleStore) -> Vec
         if raw.as_deref().map(is_title_mint_prompt).unwrap_or(false) {
             continue;
         }
+        let f = flags.get(stem);
         out.push(SessionSummary {
             session_id: stem.to_string(),
             last_modified: mtime,
             // Wart 2: strip the bridge wrapper so the snippet is the user's words.
             first_message: raw.as_deref().and_then(snippet_from_raw),
             title: titles.get(stem),
+            favorite: f.favorite,
+            favorite_updated_ms: f.favorite_updated_ms,
+            archived: f.archived,
+            archived_updated_ms: f.archived_updated_ms,
         });
     }
     // Newest first; break ties on session_id for a stable, deterministic order
@@ -496,7 +520,7 @@ pub async fn jesse_sessions(
     }
 
     let dir = st.sessions_dir();
-    let sessions = list_sessions(&dir, params.since, &st.titles);
+    let sessions = list_sessions(&dir, params.since, &st.titles, &st.flags);
     let body = serde_json::to_string(&json!({ "sessions": sessions }))
         .unwrap_or_else(|_| r#"{"sessions":[]}"#.to_string());
     let etag = strong_etag(&body);
@@ -735,14 +759,17 @@ pub async fn jesse_session_delete(
     let dir = st.sessions_dir();
     match delete_session_file(&dir, &session_id) {
         SessionDeleteOutcome::Deleted => {
-            // Drop any stashed title so the reclaimed id can't linger in titles.json.
+            // Drop any stashed title AND flags so the reclaimed id can't linger in
+            // titles.json / flags.json and resurrect a stale title or favorite.
             st.titles.remove(&session_id);
+            st.flags.remove(&session_id);
             eprintln!("jesse-bridge: deleted session {session_id}");
             Ok(StatusCode::NO_CONTENT)
         }
         SessionDeleteOutcome::AlreadyGone => {
             // Idempotent: unknown / already-gone is success, not an error.
             st.titles.remove(&session_id);
+            st.flags.remove(&session_id);
             eprintln!("jesse-bridge: session {session_id} already gone — no-op (idempotent)");
             Ok(StatusCode::NO_CONTENT)
         }
@@ -754,6 +781,56 @@ pub async fn jesse_session_delete(
             ))
         }
     }
+}
+
+/// `POST /jesse/session/{session_id}/flags` sets this session's favorite / archived
+/// flags, so the bridge (not one device) is the source of truth and every device
+/// converges. Same bearer auth, rate limiter, and id validation as the other
+/// per-session routes.
+///
+/// The body carries any subset of `{ favorite, favorite_updated_ms, archived,
+/// archived_updated_ms }`; each provided flag is applied **last-writer-wins** by its
+/// client-supplied change timestamp (unix millis): a strictly newer timestamp wins,
+/// an equal or older write is ignored, so out-of-order writes from different devices
+/// converge deterministically. A partial body (one flag only) leaves the other flag
+/// untouched. The resulting `SessionFlags` is returned.
+///
+/// - **`400`** for a structurally-invalid id (not a plain filename component):
+///   path-traversal defense, rejected before the filesystem is touched.
+/// - **`404`** for an unknown id (a session with no transcript on disk; a synthetic
+///   `local-` id has none by construction), identical to the hydrate route.
+pub async fn jesse_session_flags(
+    State(st): State<AppState>,
+    UrlPath(session_id): UrlPath<String>,
+    headers: HeaderMap,
+    Json(update): Json<FlagUpdate>,
+) -> Result<Json<Value>, ApiError> {
+    check_auth(&headers, &st.cfg.token)?;
+    if !st.limiter.allow() {
+        return Err((
+            StatusCode::TOO_MANY_REQUESTS,
+            "rate limit exceeded".to_string(),
+        ));
+    }
+    // Path-traversal defense: a non-plain component can never name a file inside the
+    // projects dir; reject it before the filesystem is touched (same as delete/hydrate).
+    if !is_plain_session_component(&session_id) {
+        return Err((StatusCode::BAD_REQUEST, "invalid session id".to_string()));
+    }
+    // Unknown id is a 404, exactly like the hydrate route: the session must have a
+    // transcript on disk. (A synthetic `local-` id has none, so it 404s here; the
+    // app syncs flags only for real sessions.)
+    let path = session_transcript_path(&st.cfg.home, &st.cfg.vault, &session_id);
+    if !path.is_file() {
+        return Err((StatusCode::NOT_FOUND, "unknown session".to_string()));
+    }
+    let result = st.flags.apply(&session_id, &update);
+    Ok(Json(json!({
+        "favorite": result.favorite,
+        "favorite_updated_ms": result.favorite_updated_ms,
+        "archived": result.archived,
+        "archived_updated_ms": result.archived_updated_ms,
+    })))
 }
 
 #[cfg(test)]
@@ -827,7 +904,8 @@ mod tests {
     fn missing_dir_lists_empty_not_error() {
         let missing = std::env::temp_dir().join(format!("jesse-nope-{}", random_hex()));
         let titles = TitleStore::new(None);
-        assert!(list_sessions(&missing, None, &titles).is_empty());
+        let flags = FlagStore::new(None);
+        assert!(list_sessions(&missing, None, &titles, &flags).is_empty());
     }
 
     #[test]
@@ -906,8 +984,19 @@ mod tests {
 
         let titles = TitleStore::new(None);
         titles.set("mid", "Middle Session");
+        // Flags filled from the store; a session with no row lists false/0.
+        let flags = FlagStore::new(None);
+        flags.apply(
+            "mid",
+            &FlagUpdate {
+                favorite: Some(true),
+                favorite_updated_ms: Some(1_700),
+                archived: Some(true),
+                archived_updated_ms: Some(1_800),
+            },
+        );
 
-        let all = list_sessions(&dir, None, &titles);
+        let all = list_sessions(&dir, None, &titles, &flags);
         let ids: Vec<&str> = all.iter().map(|s| s.session_id.as_str()).collect();
         assert_eq!(
             ids,
@@ -918,15 +1007,17 @@ mod tests {
         let mid = all.iter().find(|s| s.session_id == "mid").unwrap();
         assert_eq!(mid.title.as_deref(), Some("Middle Session"));
         assert_eq!(mid.first_message.as_deref(), Some("mid q"));
-        assert!(all
-            .iter()
-            .find(|s| s.session_id == "new")
-            .unwrap()
-            .title
-            .is_none());
+        // Flags filled for the flagged session.
+        assert!(mid.favorite && mid.favorite_updated_ms == 1_700);
+        assert!(mid.archived && mid.archived_updated_ms == 1_800);
+        let new = all.iter().find(|s| s.session_id == "new").unwrap();
+        assert!(new.title.is_none());
+        // An unflagged session defaults to false/0 on all four flag fields.
+        assert!(!new.favorite && new.favorite_updated_ms == 0);
+        assert!(!new.archived && new.archived_updated_ms == 0);
 
         // ?since strictly greater: since=2000 keeps only "new" (mtime 3000).
-        let delta = list_sessions(&dir, Some(2_000), &titles);
+        let delta = list_sessions(&dir, Some(2_000), &titles, &flags);
         let ids: Vec<&str> = delta.iter().map(|s| s.session_id.as_str()).collect();
         assert_eq!(ids, ["new"], "since is strictly greater-than");
 
@@ -1068,8 +1159,26 @@ mod tests {
         let titles = TitleStore::new(None);
         titles.set("ancient", "Old Title");
         titles.set("fresh", "New Title");
+        // Flags for both sessions: the reclaimed one's row must be dropped too.
+        let flags = FlagStore::new(None);
+        flags.apply(
+            "ancient",
+            &FlagUpdate {
+                favorite: Some(true),
+                favorite_updated_ms: Some(1),
+                ..FlagUpdate::default()
+            },
+        );
+        flags.apply(
+            "fresh",
+            &FlagUpdate {
+                favorite: Some(true),
+                favorite_updated_ms: Some(1),
+                ..FlagUpdate::default()
+            },
+        );
 
-        run_session_gc(&cfg, &titles);
+        run_session_gc(&cfg, &titles, &flags);
 
         assert!(
             !dir.join("ancient.jsonl").exists(),
@@ -1082,6 +1191,13 @@ mod tests {
             Some("New Title"),
             "kept title stays"
         );
+        // The reclaimed session's flags row is dropped; the kept one's survives.
+        assert_eq!(
+            flags.get("ancient"),
+            SessionFlags::default(),
+            "reclaimed flags dropped"
+        );
+        assert!(flags.get("fresh").favorite, "kept flags stay");
         std::fs::remove_dir_all(&home).ok();
     }
 
@@ -1290,7 +1406,8 @@ mod tests {
             "{\"type\":\"user\",\"message\":{\"content\":\"what is on Today.md?\"}}\n",
         );
         let titles = TitleStore::new(None);
-        let listed = list_sessions(&dir, None, &titles);
+        let flags = FlagStore::new(None);
+        let listed = list_sessions(&dir, None, &titles, &flags);
         let ids: Vec<&str> = listed.iter().map(|s| s.session_id.as_str()).collect();
         assert_eq!(
             ids,

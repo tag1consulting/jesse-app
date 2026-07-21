@@ -3251,6 +3251,292 @@ async fn session_delete_removes_transcript_and_makes_it_unresumable() {
     let _ = std::fs::remove_dir_all(&home);
 }
 
+// ---- POST /jesse/session/{id}/flags ----------------------------------------
+
+/// A throwaway HOME whose escaped vault projects dir holds one real `session_id`
+/// transcript; returns `(home, AppState)`. `state_dir` is None → flags are in-memory
+/// for the life of this AppState, which is all these endpoint tests need. Mirrors the
+/// session-list/delete test pattern (per-test `cfg.home`, no global-env mutation).
+fn flags_fixture(session_id: &str) -> (std::path::PathBuf, AppState) {
+    let home = std::env::temp_dir().join(format!("jesse-home-{}", random_hex()));
+    let vault = format!("/vault/{}", random_hex());
+    let proj = home
+        .join(".claude")
+        .join("projects")
+        .join(escape_project_path(&vault));
+    std::fs::create_dir_all(&proj).unwrap();
+    std::fs::write(
+        proj.join(format!("{session_id}.jsonl")),
+        "{\"type\":\"user\",\"message\":{\"content\":\"hi\"}}\n",
+    )
+    .unwrap();
+    let cfg = Config {
+        home: home.to_string_lossy().into_owned(),
+        vault,
+        state_dir: None,
+        ..test_config()
+    };
+    (home, AppState::new(cfg))
+}
+
+#[tokio::test]
+async fn session_flags_requires_auth() {
+    let st = test_state();
+    let resp = app(st)
+        .oneshot(session_flags_request(
+            None,
+            "some-session",
+            r#"{"favorite":true,"favorite_updated_ms":1}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn session_flags_unknown_id_is_404() {
+    // A plain but unknown id (no transcript on disk) → 404, exactly like hydrate.
+    let st = test_state();
+    let resp = app(st)
+        .oneshot(session_flags_request(
+            Some("Bearer test-token"),
+            "no-such-session",
+            r#"{"favorite":true,"favorite_updated_ms":1}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn session_flags_rejects_a_path_traversal_id() {
+    // A crafted id that is not a plain filename component is a 400 before the
+    // filesystem is touched. Encoded slashes keep it a single routed path segment.
+    let (home, st) = flags_fixture("real");
+    let resp = app(st)
+        .oneshot(session_flags_request(
+            Some("Bearer test-token"),
+            "..%2f..%2fsecrets",
+            r#"{"favorite":true,"favorite_updated_ms":1}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+#[tokio::test]
+async fn session_flags_happy_path_sets_and_returns_flags() {
+    let (home, st) = flags_fixture("sess-f");
+    let resp = app(st.clone())
+        .oneshot(session_flags_request(
+            Some("Bearer test-token"),
+            "sess-f",
+            r#"{"favorite":true,"favorite_updated_ms":100,"archived":true,"archived_updated_ms":200}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body: Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    assert_eq!(body["favorite"], true);
+    assert_eq!(body["favorite_updated_ms"], 100);
+    assert_eq!(body["archived"], true);
+    assert_eq!(body["archived_updated_ms"], 200);
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+#[tokio::test]
+async fn session_flags_partial_update_leaves_the_other_flag_untouched() {
+    // Set favorite first, then a body carrying ONLY archived; favorite (value + ts)
+    // must be preserved.
+    let (home, st) = flags_fixture("sess-p");
+    let _ = app(st.clone())
+        .oneshot(session_flags_request(
+            Some("Bearer test-token"),
+            "sess-p",
+            r#"{"favorite":true,"favorite_updated_ms":100}"#,
+        ))
+        .await
+        .unwrap();
+    let resp = app(st.clone())
+        .oneshot(session_flags_request(
+            Some("Bearer test-token"),
+            "sess-p",
+            r#"{"archived":true,"archived_updated_ms":50}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body: Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    assert_eq!(body["favorite"], true, "favorite value preserved");
+    assert_eq!(body["favorite_updated_ms"], 100, "favorite ts preserved");
+    assert_eq!(body["archived"], true, "archived set by the partial update");
+    assert_eq!(body["archived_updated_ms"], 50);
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+#[tokio::test]
+async fn session_flags_lww_ignores_a_stale_write_over_the_endpoint() {
+    // End-to-end LWW: a newer write wins, an older one is ignored.
+    let (home, st) = flags_fixture("sess-lww");
+    let _ = app(st.clone())
+        .oneshot(session_flags_request(
+            Some("Bearer test-token"),
+            "sess-lww",
+            r#"{"favorite":true,"favorite_updated_ms":100}"#,
+        ))
+        .await
+        .unwrap();
+    // An OLDER write (ts 50) must not flip the value.
+    let resp = app(st.clone())
+        .oneshot(session_flags_request(
+            Some("Bearer test-token"),
+            "sess-lww",
+            r#"{"favorite":false,"favorite_updated_ms":50}"#,
+        ))
+        .await
+        .unwrap();
+    let body: Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    assert_eq!(body["favorite"], true, "stale write ignored");
+    assert_eq!(body["favorite_updated_ms"], 100);
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+#[tokio::test]
+async fn sessions_list_carries_flags_and_its_etag_changes_when_a_flag_changes() {
+    // The read path surfaces the flags AND folds them into the ETag: a fresh session
+    // lists false/0, and flipping a flag changes the body so a prior ETag no longer
+    // matches (no stale 304).
+    let (home, st) = flags_fixture("sess-e");
+
+    // First list: flags default to false/0; capture the ETag.
+    let resp = app(st.clone())
+        .oneshot(sessions_request(Some("Bearer test-token"), None, None))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let etag1 = resp
+        .headers()
+        .get("etag")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+    let body: Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    let s0 = &body["sessions"][0];
+    assert_eq!(s0["session_id"], "sess-e");
+    assert_eq!(s0["favorite"], false);
+    assert_eq!(s0["favorite_updated_ms"], 0);
+    assert_eq!(s0["archived"], false);
+    assert_eq!(s0["archived_updated_ms"], 0);
+
+    // That ETag matches now (304).
+    let resp = app(st.clone())
+        .oneshot(sessions_request(Some("Bearer test-token"), None, Some(&etag1)))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_MODIFIED);
+
+    // Flip a flag.
+    let _ = app(st.clone())
+        .oneshot(session_flags_request(
+            Some("Bearer test-token"),
+            "sess-e",
+            r#"{"favorite":true,"favorite_updated_ms":100}"#,
+        ))
+        .await
+        .unwrap();
+
+    // The same If-None-Match no longer matches; the flag is in the body/ETag.
+    let resp = app(st.clone())
+        .oneshot(sessions_request(Some("Bearer test-token"), None, Some(&etag1)))
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "changing a flag must invalidate the cached 304"
+    );
+    let body: Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    assert_eq!(body["sessions"][0]["favorite"], true);
+    assert_eq!(body["sessions"][0]["favorite_updated_ms"], 100);
+
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+#[tokio::test]
+async fn session_flags_survive_a_bridge_restart() {
+    // Persistence round-trip through the endpoint: write with a state dir configured,
+    // rebuild the store from that dir, and the flags are still there.
+    let home = std::env::temp_dir().join(format!("jesse-home-{}", random_hex()));
+    let vault = format!("/vault/{}", random_hex());
+    let proj = home
+        .join(".claude")
+        .join("projects")
+        .join(escape_project_path(&vault));
+    std::fs::create_dir_all(&proj).unwrap();
+    std::fs::write(
+        proj.join("sess-r.jsonl"),
+        "{\"type\":\"user\",\"message\":{\"content\":\"hi\"}}\n",
+    )
+    .unwrap();
+    let state_dir = std::env::temp_dir().join(format!("jesse-state-{}", random_hex()));
+    std::fs::create_dir_all(&state_dir).unwrap();
+    let cfg = Config {
+        home: home.to_string_lossy().into_owned(),
+        vault: vault.clone(),
+        state_dir: Some(state_dir.to_string_lossy().into_owned()),
+        ..test_config()
+    };
+    let st = AppState::new(cfg.clone());
+
+    let resp = app(st)
+        .oneshot(session_flags_request(
+            Some("Bearer test-token"),
+            "sess-r",
+            r#"{"favorite":true,"favorite_updated_ms":123}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // A fresh AppState over the same state dir reloads flags.json from disk.
+    let st2 = AppState::new(cfg);
+    let reloaded = st2.flags.get("sess-r");
+    assert!(reloaded.favorite && reloaded.favorite_updated_ms == 123);
+
+    let _ = std::fs::remove_dir_all(&home);
+    let _ = std::fs::remove_dir_all(&state_dir);
+}
+
+#[tokio::test]
+async fn session_delete_drops_the_flags_row() {
+    // A deleted conversation must not resurrect a stale favorite: the flags row is
+    // dropped alongside the transcript and title on DELETE.
+    let (home, st) = flags_fixture("sess-d");
+    let _ = app(st.clone())
+        .oneshot(session_flags_request(
+            Some("Bearer test-token"),
+            "sess-d",
+            r#"{"favorite":true,"favorite_updated_ms":100}"#,
+        ))
+        .await
+        .unwrap();
+    assert!(st.flags.get("sess-d").favorite, "flag set before delete");
+
+    let resp = app(st.clone())
+        .oneshot(session_delete_request(Some("Bearer test-token"), "sess-d"))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    assert_eq!(
+        st.flags.get("sess-d"),
+        SessionFlags::default(),
+        "flags row dropped on delete"
+    );
+    let _ = std::fs::remove_dir_all(&home);
+}
+
 // ---- GET /jesse/sessions/{id} — transcript hydration -----------------------
 
 /// A throwaway HOME whose escaped vault projects dir holds `session_id.jsonl` with
