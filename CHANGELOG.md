@@ -50,6 +50,30 @@ CI both run it). See the "Versioning" section of `bridge/README.md`.
     conflicts with the suppression Xcode applies to package dependencies. No bridge
     changes.
 
+## [Bridge 0.24.1] — 2026-07-21
+
+### Fixed
+- **Concurrent device-token registrations no longer collide on a shared temp file.**
+  `persist_device_token` derived its temp path from the target (`device.json.tmp`), so
+  every writer used the *same* one. The phone re-registers on foreground, so two
+  `POST /jesse/device` calls overlap routinely: the loser's rename found nothing
+  (`ENOENT`, the `warning: could not persist device token` line seen 78 times in the
+  Studio log, characteristically in pairs) while its still-open fd wrote into the file
+  the winner had just renamed into place — defeating the atomicity the temp+rename
+  discipline exists to provide. The temp name is now unique per write (pid + a
+  process-wide counter), so each writer renames its own file and the last simply wins.
+  A regression test drives 8 threads × 50 writes and asserts *every* write succeeds;
+  against the old code it reproduces 233 `ENOENT` failures out of 400.
+
+### Changed
+- **A failed diet-extract child now logs why before falling through to rung 2.** The
+  `Err` arm discarded the child's `ApiError` and reported only `reason=child_error`,
+  which cannot distinguish a model failure from an unreachable backend. That silence
+  hid a ~14-hour local-gateway outage (the Studio rebooted overnight; the bridge came
+  back under launchd, the hand-started gateway and ds4 did not) behind what looked like
+  ordinary rung-2 flakiness. The child's status and message are now logged — no
+  utterance content, same rules as the provenance line.
+
 ## [App 1.0 (59)] — 2026-07-21
 
 ### Added
@@ -85,6 +109,7 @@ CI both run it). See the "Versioning" section of `bridge/README.md`.
     runs the Mac tests; a shared `Jesse Mac` scheme is checked in. No bridge changes.
   - Deliberately omitted (iOS-only): HealthKit, Siri, Live Activities, watch relay,
     camera. Deferred to polish: APNs-for-Mac (quit/asleep notify), camera QR pairing.
+
 
 ## [App 1.0 (58)] — 2026-07-21
 
