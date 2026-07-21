@@ -16,9 +16,12 @@ import JesseCore
 ///     (the versioned schema + `JesseMigrationPlan`) and asserts **every field
 ///     survives**: favorites still favorited, `aiTitle`/`titleSourceKey`/`origin`/
 ///     `lastDeliveredJobId` intact, a Turn's `provenanceJSON` intact, and each
-///     attachment's thumbnail bytes present. A naive migration that dropped an
-///     entity (e.g. `TurnAttachment` missing from the versioned model list) or
-///     rebuilt the store (version-identifier drift) fails this test.
+///     attachment's thumbnail bytes present. It also covers the archive fields as an
+///     additive-property lightweight migration: `isArchived`/`archivedAt` read their
+///     defaults on rows written before those columns existed, and an archive flip
+///     round-trips through a reopen. A naive migration that dropped an entity (e.g.
+///     `TurnAttachment` missing from the versioned model list) or rebuilt the store
+///     (version-identifier drift) fails this test.
 ///
 ///  2. `testFailedOpenIsFlaggedAndLeavesTheOnDiskFileIntact` corrupts the on-disk
 ///     file and asserts the loader does NOT silently swallow the failure into an
@@ -111,6 +114,14 @@ final class AppModelContainerMigrationTests: XCTestCase {
         XCTAssertEqual(fav.originValue, .watch, "origin is preserved")
         XCTAssertEqual(fav.lastDeliveredJobId, "job-777")
 
+        // The archive fields are an additive-property lightweight migration: a store
+        // written before those columns existed opens with `isArchived` reading its
+        // `false` default and `archivedAt` nil, on EVERY row (nothing rebuilt).
+        for thread in try ctx.fetch(FetchDescriptor<JesseThread>()) {
+            XCTAssertFalse(thread.isArchived, "isArchived defaults to false on a pre-archive row")
+            XCTAssertNil(thread.archivedAt, "archivedAt defaults to nil on a pre-archive row")
+        }
+
         // The relationship + a Turn's provenance + the attachment's bytes all survive.
         XCTAssertEqual(fav.orderedTurns.count, 2)
         let jesseTurn = try XCTUnwrap(fav.orderedTurns.first { $0.roleValue == .jesse })
@@ -134,6 +145,11 @@ final class AppModelContainerMigrationTests: XCTestCase {
         outbox.attachments.append(
             OutboxAttachment(filename: "Photo 1.jpg", mime: "image/jpeg", data: originalBytes))
         ctx.insert(outbox)
+        // Archive the favorite in this same save so the archive flip round-trips
+        // through the reopen below (proving the additive field persists, not just
+        // defaults).
+        let archivedAt = Date(timeIntervalSince1970: 1_800_000_000)
+        fav.setArchived(true, now: archivedAt)
         try ctx.save()
         let reopened = AppModelContainer.load(url: url)
         let ctx2 = ModelContext(reopened.container)
@@ -142,6 +158,12 @@ final class AppModelContainerMigrationTests: XCTestCase {
         let item = try XCTUnwrap(items.first)
         XCTAssertEqual(item.state, .sending)
         XCTAssertEqual(item.threadID, favThreadId)
+
+        // The archived flag + timestamp survived the reopen on exactly the one thread.
+        let archived = try ctx2.fetch(
+            FetchDescriptor<JesseThread>(predicate: #Predicate { $0.isArchived }))
+        XCTAssertEqual(archived.map(\.id), [favThreadId], "the archived flag persists")
+        XCTAssertEqual(archived.first?.archivedAt, archivedAt, "archivedAt persists")
         XCTAssertEqual(item.orderedAttachments.first?.data, originalBytes,
                        "the ORIGINAL full-resolution bytes round-trip through OutboxAttachment")
     }

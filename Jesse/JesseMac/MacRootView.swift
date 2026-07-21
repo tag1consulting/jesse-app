@@ -104,17 +104,30 @@ struct MacRootView: View {
                           systemImage: listModel.scope == .favorites ? "star.fill" : "star")
                 }
                 .keyboardShortcut("f", modifiers: [.command, .shift])
+                // Archive / restore the selected conversation. ⌘⇧A works with only a
+                // sidebar selection (no visible control focused); the row's context
+                // menu and trailing swipe mirror the same action. Disabled with no
+                // selection so the shortcut is a no-op then.
+                Button { archiveSelected() } label: {
+                    Label(selectedThread?.isArchived == true ? "Unarchive" : "Archive",
+                          systemImage: selectedThread?.isArchived == true
+                              ? "tray.and.arrow.up" : "archivebox")
+                }
+                .keyboardShortcut("a", modifiers: [.command, .shift])
+                .disabled(selectedThread == nil)
                 Button { showingSettings = true } label: { Label("Settings", systemImage: "gearshape") }
                     .keyboardShortcut(",", modifiers: .command)
             }
         }
     }
 
-    /// The scope control: a two-item segmented picker matching the iPhone's tabs.
+    /// The scope control: a segmented picker matching the iPhone's tabs. All and
+    /// Favorites exclude archived threads; Archived shows only hidden conversations.
     private var scopePicker: some View {
         Picker("Scope", selection: $listModel.scope) {
             Text("All").tag(MacThreadListModel.Scope.all)
             Text("Favorites").tag(MacThreadListModel.Scope.favorites)
+            Text("Archived").tag(MacThreadListModel.Scope.archived)
         }
         .pickerStyle(.segmented)
         .labelsHidden()
@@ -137,6 +150,11 @@ struct MacRootView: View {
                 "No favorites yet",
                 systemImage: "star",
                 description: Text("Star a conversation to keep it here."))
+        } else if listModel.scope == .archived, case .flat(let list) = layout, list.isEmpty {
+            ContentUnavailableView(
+                "No archived conversations",
+                systemImage: "archivebox",
+                description: Text("Archive a conversation to hide it from your list. It stays here until you restore it, and never leaves this Mac."))
         }
     }
 
@@ -153,6 +171,10 @@ struct MacRootView: View {
                     Label(thread.isFavorite ? "Unfavorite" : "Favorite",
                           systemImage: thread.isFavorite ? "star.slash" : "star")
                 }
+                Button { toggleArchived(thread) } label: {
+                    Label(thread.isArchived ? "Unarchive" : "Archive",
+                          systemImage: thread.isArchived ? "tray.and.arrow.up" : "archivebox")
+                }
                 Divider()
                 Button(role: .destructive) { delete(thread) } label: {
                     Label("Delete", systemImage: "trash")
@@ -164,6 +186,16 @@ struct MacRootView: View {
                           systemImage: thread.isFavorite ? "star.slash" : "star")
                 }
                 .tint(.yellow)
+            }
+            // Archive / restore via a trailing swipe (distinct from the leading
+            // favorite swipe and from Delete in the context menu). Hides the thread
+            // from All / Favorites, or restores it from Archived. Local only.
+            .swipeActions(edge: .trailing) {
+                Button { toggleArchived(thread) } label: {
+                    Label(thread.isArchived ? "Unarchive" : "Archive",
+                          systemImage: thread.isArchived ? "tray.and.arrow.up" : "archivebox")
+                }
+                .tint(.indigo)
             }
     }
 
@@ -208,6 +240,21 @@ struct MacRootView: View {
     private func toggleFavorite(_ thread: JesseThread) {
         listModel.toggleFavorite(thread)
         try? context.save()
+    }
+
+    /// Archive / restore one conversation through the shared seam, then persist. Local
+    /// only: it flips `isArchived` so the shared layout hides or re-shows the row;
+    /// nothing is deleted and nothing is synced to the bridge.
+    private func toggleArchived(_ thread: JesseThread) {
+        listModel.toggleArchived(thread)
+        try? context.save()
+    }
+
+    /// The ⌘⇧A action: archive / restore whatever thread is selected in the sidebar.
+    /// No-op with no selection (the toolbar button is disabled then).
+    private func archiveSelected() {
+        guard let thread = selectedThread else { return }
+        toggleArchived(thread)
     }
 
     private func newChat() {

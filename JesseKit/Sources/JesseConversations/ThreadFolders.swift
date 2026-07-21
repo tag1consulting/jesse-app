@@ -37,8 +37,9 @@ public struct RenderedThreadSection: Identifiable {
     public var visibleThreads: [JesseThread] { isExpanded ? threads : [] }
 }
 
-/// The two shapes the list takes. Favorites is a single flat list (no folders);
-/// the All tab is date sections, month buckets rendered as collapsible folders.
+/// The two shapes the list takes. Favorites and the Archived view are each a single
+/// flat list (no folders); the All tab is date sections, month buckets rendered as
+/// collapsible folders.
 public enum ThreadListLayout {
     case flat([JesseThread])
     case sectioned([RenderedThreadSection])
@@ -50,6 +51,15 @@ public enum ThreadListLayout {
 ///
 /// - `favoritesOnly` collapses to a single flat, newest-first list of starred
 ///   threads with no folder chrome (the "jump straight back" tab).
+/// - `archivedOnly` selects the dedicated Archived view: a single flat, newest-first
+///   list of ONLY archived threads (like Favorites, no folder chrome), from which a
+///   thread can be restored. When false (the default), archived threads are EXCLUDED
+///   from every layout (the normal All list, the Favorites list, and any origin
+///   scope), so archiving genuinely hides a conversation from the main list until it
+///   is unarchived. The archive filter is applied FIRST, before favorites / origin /
+///   search and before grouping, so it composes additively with all of them (an
+///   archived favorite drops out of Favorites until unarchived). Archive state is
+///   local to each device's store and never synced through the bridge.
 /// - `originScope` narrows to threads of one origin (`.watch` = watch-relayed);
 ///   `.all` (the default) is inactive. Applied as an additive filter alongside
 ///   favorites and search, BEFORE grouping, so a Watch scope stays date-sectioned
@@ -66,11 +76,16 @@ public enum ThreadListLayout {
 public func threadListLayout(_ threads: [JesseThread],
                              favoritesOnly: Bool,
                              originScope: ThreadOriginScope = .all,
+                             archivedOnly: Bool = false,
                              searchQueries: [String],
                              expanded: Set<ThreadSection>,
                              now: Date,
                              calendar: Calendar) -> ThreadListLayout {
-    let scoped = (favoritesOnly ? threads.filter(\.isFavorite) : threads)
+    // Archive filter first: the Archived view (`archivedOnly`) keeps ONLY archived
+    // threads; every other layout keeps ONLY non-archived ones, so an archived
+    // conversation is hidden from All / Favorites / Watch until it is unarchived.
+    let archiveScoped = threads.filter { archivedOnly ? $0.isArchived : !$0.isArchived }
+    let scoped = (favoritesOnly ? archiveScoped.filter(\.isFavorite) : archiveScoped)
         .filter { threadMatchesOrigin($0, scope: originScope) }
     // `threadMatchesAny` returns each thread at most once, so a thread matching
     // several entries (query + terms) still appears a single time (set semantics).
@@ -79,9 +94,9 @@ public func threadListLayout(_ threads: [JesseThread],
         !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     }
 
-    // Favorites tab: always one flat, newest-first list. Favorites are few and
-    // this is the direct path back to them — folders would only add friction.
-    if favoritesOnly {
+    // Favorites and Archived are each always one flat, newest-first list: both are
+    // narrow, direct-access views where folders would only add friction.
+    if archivedOnly || favoritesOnly {
         return .flat(matched.sorted { $0.updatedAt > $1.updatedAt })
     }
 

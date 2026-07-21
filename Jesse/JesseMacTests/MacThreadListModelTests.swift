@@ -111,6 +111,63 @@ final class MacThreadListModelTests: XCTestCase {
         XCTAssertTrue(empty.isEmpty)
     }
 
+    // MARK: - Archive scope + toggling drives the shared layout
+
+    func testArchivedScopeShowsOnlyArchivedAndAllExcludesThem() {
+        var model = MacThreadListModel()
+        let live = thread(at: date(2026, 6, 25), title: "live")
+        let archivedOld = thread(at: date(2026, 3, 12), title: "archived old")
+        let archivedNew = thread(at: date(2026, 6, 20), title: "archived new")
+        archivedOld.setArchived(true, now: date(2026, 3, 12))
+        archivedNew.setArchived(true, now: date(2026, 6, 20))
+        let all = [live, archivedOld, archivedNew]
+
+        // All scope: sectioned, and the archived threads are hidden from it.
+        model.scope = .all
+        let allLayout = model.layout(all, now: now, calendar: calendar)
+        XCTAssertEqual(Set(memberIDs(allLayout)), [live.id],
+                       "the All scope excludes archived threads")
+
+        // Archived scope: flat, only archived, newest-first, no live leak.
+        model.scope = .archived
+        let archivedLayout = model.layout(all, now: now, calendar: calendar)
+        guard case .flat(let flat) = archivedLayout else {
+            return XCTFail("archived scope must be flat")
+        }
+        XCTAssertEqual(flat.map(\.id), [archivedNew.id, archivedOld.id])
+        XCTAssertFalse(flat.contains { $0.id == live.id })
+    }
+
+    func testToggleArchivedRemovesFromActiveLayoutThenRestores() {
+        let model = MacThreadListModel()
+        let t = thread(at: date(2026, 6, 25), title: "dup")
+        XCTAssertFalse(t.isArchived)
+        XCTAssertNil(t.archivedAt)
+
+        // Archive: flag set, timestamp stamped.
+        let archivedAt = date(2026, 6, 26)
+        model.toggleArchived(t, now: archivedAt)
+        XCTAssertTrue(t.isArchived)
+        XCTAssertEqual(t.archivedAt, archivedAt)
+
+        // It drops out of the All layout and appears in the Archived layout.
+        var allModel = MacThreadListModel(); allModel.scope = .all
+        XCTAssertTrue(memberIDs(allModel.layout([t], now: now, calendar: calendar)).isEmpty,
+                      "an archived thread is gone from the All layout")
+        var archivedModel = MacThreadListModel(); archivedModel.scope = .archived
+        guard case .flat(let flat) = archivedModel.layout([t], now: now, calendar: calendar) else {
+            return XCTFail("archived scope must be flat")
+        }
+        XCTAssertEqual(flat.map(\.id), [t.id])
+
+        // Unarchive: flag + timestamp cleared, and it returns to the All layout.
+        model.toggleArchived(t, now: date(2026, 6, 27))
+        XCTAssertFalse(t.isArchived)
+        XCTAssertNil(t.archivedAt)
+        XCTAssertEqual(memberIDs(allModel.layout([t], now: now, calendar: calendar)), [t.id],
+                       "unarchiving restores it to the All layout")
+    }
+
     // MARK: - Folder expansion routes through the shared pure helper
 
     func testToggleFolderRevealsMonthRows() {

@@ -15,6 +15,47 @@ CI both run it). See the "Versioning" section of `bridge/README.md`.
 
 ## [Unreleased]
 
+## [App 1.0 (63)] - 2026-07-21
+
+### Added
+- **Archive a conversation to hide it from your list, with an Archived view to see
+  or restore it, on both iOS and Mac from one shared implementation.** Archiving is
+  the reversible "get this out of my way" action (for example a duplicate) that
+  deletion is not: the conversation and all its turns stay put, it just leaves the
+  main list until you unarchive it. It is distinct from deletion, which removes the
+  thread and reclaims its remote transcript; neither affects the other.
+  - **Schema (`JesseCore`).** `JesseThread` gains two additive, defaulted properties,
+    `isArchived` (Bool = false) and `archivedAt` (Date?), plus `setArchived` /
+    `toggleArchived` helpers mirroring the favorites ones (the timestamp is stamped on
+    archive and cleared on restore). Like the earlier additive properties (favorites,
+    origin, aiTitle), these are absorbed into the current schema version rather than
+    given a new one: a `VersionedSchema`'s checksum is derived from the live `@Model`
+    types, so a version that differs only by two added properties on the shared
+    `JesseThread` class collides with the existing version ("Duplicate version
+    checksums") and SwiftData rejects it at store-open. A new version is only viable
+    when the entity set changes, as the V2 outbox entities did. Because the change is
+    additive and defaulted, nothing is renamed, retyped, or dropped: a store written
+    before these columns existed opens under the current schema with every prior row
+    intact and `isArchived` reading false. The populated-store migration test now
+    covers this, including an archive-flip round-trip through a reopen.
+  - **Shared filtering (`JesseConversations`).** `threadListLayout` takes a new
+    `archivedOnly` scope. The normal list (All, Favorites, Watch) now excludes
+    archived threads; a dedicated Archived view shows only archived threads as a flat,
+    newest-first list like Favorites; an archived favorite drops out of Favorites until
+    restored. The archive filter is applied before the favorites, origin, and search
+    filters and before grouping, so it composes additively and the function stays pure.
+  - **iOS.** The scope control gains an Archived filter, and each conversation has an
+    Archive / Unarchive affordance (leading swipe action and context menu). Archived
+    conversations no longer appear in All or Favorites. Existing behavior (favorites,
+    folders, deletion, and every entry point) is unchanged apart from the new, opt-in
+    archive affordance.
+  - **Mac.** The sidebar scope control gains an Archived segment, each row has an
+    Archive / Unarchive action (context menu and trailing swipe), and Command Shift A
+    archives or restores the selected conversation.
+  - Archive state is LOCAL to each device's SwiftData store: it is intentionally not
+    synced through the bridge (which syncs only sessions, transcripts, and titles),
+    exactly like favorite state. Archiving is a per-device "hide from my list" action.
+
 ## [App 1.0 (62)] - 2026-07-21
 
 ### Changed
