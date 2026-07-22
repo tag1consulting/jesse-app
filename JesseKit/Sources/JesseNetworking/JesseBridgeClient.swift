@@ -13,7 +13,12 @@ import JesseCore
 
 /// The cross-platform surface a bridge client exposes — every endpoint that needs no
 /// iOS-only data. Pulled behind a protocol so a fake can exercise callers in tests.
-public protocol BridgeClientProtocol: Sendable {
+///
+/// Refines `FlagSyncing` (JesseCore) so the shared `FlagReconciler` can push a
+/// local-newer favorite/archive change through any bridge client. `FlagSyncing` carries a
+/// default no-op `setFlags`, so a test fake conforming to this protocol keeps compiling
+/// without implementing it; the real `JesseBridgeClient` overrides it below.
+public protocol BridgeClientProtocol: FlagSyncing, Sendable {
     var config: JesseConfig { get }
     func sendPrepared(_ request: JesseRequest) async throws -> JesseSendResult
     func send(mode: JesseMode, text: String, sessionId: String?, voice: Bool,
@@ -179,6 +184,37 @@ public struct JesseBridgeClient: BridgeClientProtocol {
     /// Idempotent-404 like `cancelJob`: a missing session is a success.
     public func deleteSession(_ sessionId: String) async throws {
         try await idempotentCall("/jesse/session/\(sessionId)", method: "DELETE")
+    }
+
+    // MARK: - Flags
+
+    /// Push a favorite/archive change up (`POST /jesse/session/{id}/flags`), sending ONLY
+    /// the flag(s) that changed with their unix-millis clocks so the bridge applies each
+    /// last-writer-wins. Best-effort: a 2xx (the bridge echoes the resulting flags) and a
+    /// 404 (an unknown id, or a pre-0.25.0 bridge with no such route) both count as
+    /// success, so degrading against an older bridge is a clean no-op. Only a genuine
+    /// transport/auth/5xx failure throws, and the caller (`FlagReconciler`) swallows even
+    /// that, because the local clock stays newer and the next reconcile re-pushes.
+    public func setFlags(sessionId: String, favorite: FlagWrite?, archived: FlagWrite?) async throws {
+        guard var req = authorized("/jesse/session/\(sessionId)/flags", method: "POST") else {
+            throw JesseError.notConfigured
+        }
+        let body = JesseFlagsRequest(
+            favorite: favorite?.value,
+            favoriteUpdatedMs: favorite.map { UInt64(max(0, $0.updatedMs)) },
+            archived: archived?.value,
+            archivedUpdatedMs: archived.map { UInt64(max(0, $0.updatedMs)) })
+        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        req.httpBody = try Self.encodeBody(body)
+        let data: Data, resp: URLResponse
+        do {
+            (data, resp) = try await session.data(for: req)
+        } catch {
+            throw JesseError.from(error, host: config.normalizedHost)
+        }
+        guard let http = resp as? HTTPURLResponse else { throw JesseError.decoding }
+        if (200..<300).contains(http.statusCode) || http.statusCode == 404 { return }
+        throw JesseError.badResponse(http.statusCode, String(data: data, encoding: .utf8) ?? "")
     }
 
     /// Register (idempotent upsert) a device's APNs token with the bridge

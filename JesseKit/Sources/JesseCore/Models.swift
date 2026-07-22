@@ -50,10 +50,28 @@ public final class JesseThread {
     public var sessionId: String?
     // Whether this thread is starred. New property with a default, so SwiftData
     // lightweight-migrates existing stores with no migration code.
+    //
+    // Local-first, reconciled across devices by the bridge flags (bridge 0.25.0):
+    // the local store is the render source and the bridge is the sync source. The
+    // favorite bit rides `GET /jesse/sessions` and is settable via
+    // `POST /jesse/session/{id}/flags`, converged last-writer-wins by
+    // `favoriteUpdatedMs` (see `FlagReconciler`). A purely-local thread (no
+    // `sessionId` yet) simply stays local until its first reply lands.
     public var isFavorite: Bool = false
     // When it was starred; nil whenever `isFavorite` is false. Kept so favorites
-    // could later sort by pin time rather than last activity.
+    // could later sort by pin time rather than last activity. This is a DISPLAY
+    // timestamp, not the sync clock: it is deliberately cleared on unstar, so it
+    // cannot be the last-writer-wins clock (an unstar would lose its change time).
+    // `favoriteUpdatedMs` below is the never-cleared LWW clock instead.
     public var favoritedAt: Date?
+    // The last-writer-wins clock for `isFavorite` (unix millis of the last change,
+    // set OR cleared), used only by cross-device flag sync. Unlike `favoritedAt` it
+    // is never reset to a sentinel on unstar, so an unstar's timestamp survives and
+    // can beat a stale server `favorite:true`. Additive defaulted property → SwiftData
+    // lightweight-migrates existing stores with no migration code (matching how the
+    // favorite/archive fields were added); a pre-sync row reads 0, equal to an
+    // unflagged server session's 0, so it reconciles as a no-op.
+    public var favoriteUpdatedMs: Int = 0
     // The bridge job_id whose reply was last delivered into this thread, used as
     // an idempotency key so a re-entry of `finish` (Re-check / resume re-polling a
     // completed job) can't append the same reply twice. New property with a
@@ -85,15 +103,22 @@ public final class JesseThread {
     // of the way). New property with a default, so SwiftData lightweight-migrates
     // existing stores with no migration code (matching isFavorite/origin).
     //
-    // Archive state is LOCAL to this device's SwiftData store. It is NOT synced
-    // through the bridge, which only syncs sessions/transcripts/titles: archiving is
-    // a per-device "hide from my list" action, intentionally not shared across
-    // devices. Favorite state (isFavorite) is local for the same reason.
+    // Local-first, reconciled across devices by the bridge flags (bridge 0.25.0):
+    // like favorite, archive state renders from the local store and syncs through the
+    // bridge, converged last-writer-wins by `archivedUpdatedMs`. It rides
+    // `GET /jesse/sessions` and is settable via `POST /jesse/session/{id}/flags`, so
+    // archiving a conversation on one device hides it on the others after a sync.
     public var isArchived: Bool = false
     // When it was archived; nil whenever isArchived is false. Stamped on archive and
     // cleared on unarchive, mirroring favoritedAt, so an Archived view could later
-    // sort by archive time rather than last activity.
+    // sort by archive time rather than last activity. DISPLAY timestamp only; the
+    // never-cleared `archivedUpdatedMs` below is the last-writer-wins sync clock.
     public var archivedAt: Date?
+    // The last-writer-wins clock for `isArchived` (unix millis of the last change, set
+    // OR cleared). Mirrors `favoriteUpdatedMs`: never reset on unarchive, so an
+    // unarchive's timestamp survives to beat a stale server `archived:true`. Additive
+    // defaulted property → lightweight migration; a pre-sync row reads 0.
+    public var archivedUpdatedMs: Int = 0
 
     @Relationship(deleteRule: .cascade, inverse: \Turn.thread)
     public var turns: [Turn] = []
@@ -119,10 +144,15 @@ public final class JesseThread {
         setFavorite(!isFavorite, now: now)
     }
 
-    /// Set the favorite flag explicitly, keeping `favoritedAt` consistent.
+    /// Set the favorite flag explicitly (a LOCAL user action), keeping `favoritedAt`
+    /// consistent and stamping the never-cleared LWW clock `favoriteUpdatedMs` with
+    /// `now` on EVERY change (set or clear), so a later reconcile can push this change
+    /// up and win against a stale server value. Adopting a value FROM the server uses
+    /// `applyFavoriteFromSync` instead (it carries the server's clock, not `now`).
     public func setFavorite(_ value: Bool, now: Date = Date()) {
         isFavorite = value
         favoritedAt = value ? now : nil
+        favoriteUpdatedMs = Self.unixMillis(now)
     }
 
     /// Flip the archived flag, stamping `archivedAt` when archiving and clearing it
@@ -132,11 +162,44 @@ public final class JesseThread {
         setArchived(!isArchived, now: now)
     }
 
-    /// Set the archived flag explicitly, keeping `archivedAt` consistent (stamped
-    /// when archiving, cleared when unarchiving). Mirrors `setFavorite`.
+    /// Set the archived flag explicitly (a LOCAL user action), keeping `archivedAt`
+    /// consistent and stamping the never-cleared LWW clock `archivedUpdatedMs` with
+    /// `now`. Mirrors `setFavorite`; server adoption uses `applyArchivedFromSync`.
     public func setArchived(_ value: Bool, now: Date = Date()) {
         isArchived = value
         archivedAt = value ? now : nil
+        archivedUpdatedMs = Self.unixMillis(now)
+    }
+
+    /// Adopt a favorite value that WON last-writer-wins against the local one, carrying
+    /// the SERVER's change clock (not `now`) so the local `favoriteUpdatedMs` matches the
+    /// server exactly and the next reconcile is a no-op. `favoritedAt` (display only) is
+    /// set to that clock when starring and cleared when unstarring, preserving its
+    /// nil-when-unstarred invariant. Called only by `FlagReconciler`.
+    public func applyFavoriteFromSync(_ value: Bool, updatedMs: Int) {
+        isFavorite = value
+        favoritedAt = value ? Self.date(fromUnixMillis: updatedMs) : nil
+        favoriteUpdatedMs = updatedMs
+    }
+
+    /// Adopt an archived value that won last-writer-wins, carrying the server's clock.
+    /// Mirrors `applyFavoriteFromSync`. Called only by `FlagReconciler`.
+    public func applyArchivedFromSync(_ value: Bool, updatedMs: Int) {
+        isArchived = value
+        archivedAt = value ? Self.date(fromUnixMillis: updatedMs) : nil
+        archivedUpdatedMs = updatedMs
+    }
+
+    /// Unix milliseconds of a date, the unit the bridge's LWW flag clocks use. Rounded
+    /// to the nearest millisecond so a round-trip through the wire is stable.
+    public static func unixMillis(_ date: Date) -> Int {
+        Int((date.timeIntervalSince1970 * 1000).rounded())
+    }
+
+    /// The date for a unix-millis clock, used to set the display `favoritedAt`/
+    /// `archivedAt` when adopting a server flag.
+    public static func date(fromUnixMillis ms: Int) -> Date {
+        Date(timeIntervalSince1970: Double(ms) / 1000)
     }
 
     // Non-observed memo for `orderedTurns` (see `OrderedTurnsMemo`). Never reassigned

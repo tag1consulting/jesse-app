@@ -135,22 +135,57 @@ public enum JesseStreamEvent: Equatable, Sendable {
 // MARK: - Sessions / hydration
 
 /// One session in `GET /jesse/sessions`. Matches the bridge `SessionSummary`.
+///
+/// The four flag fields (`favorite`, `favoriteUpdatedMs`, `archived`,
+/// `archivedUpdatedMs`, bridge 0.25.0) are the server-authoritative favorite/archive
+/// state plus their last-writer-wins millis clocks. They are decoded with
+/// `decodeIfPresent` and default to `false` / `0`, so against a pre-0.25.0 bridge that
+/// omits them the app behaves exactly as before (local-only flags): a missing flag reads
+/// as unset with a zero clock, which reconciles as a no-op against an unflagged local
+/// thread.
 public struct SessionSummary: Decodable, Sendable, Equatable {
     public let sessionId: String
     public let lastModified: UInt64
     public let firstMessage: String?
     public let title: String?
-    public init(sessionId: String, lastModified: UInt64, firstMessage: String?, title: String?) {
+    public let favorite: Bool
+    public let favoriteUpdatedMs: UInt64
+    public let archived: Bool
+    public let archivedUpdatedMs: UInt64
+    public init(sessionId: String, lastModified: UInt64, firstMessage: String?, title: String?,
+                favorite: Bool = false, favoriteUpdatedMs: UInt64 = 0,
+                archived: Bool = false, archivedUpdatedMs: UInt64 = 0) {
         self.sessionId = sessionId
         self.lastModified = lastModified
         self.firstMessage = firstMessage
         self.title = title
+        self.favorite = favorite
+        self.favoriteUpdatedMs = favoriteUpdatedMs
+        self.archived = archived
+        self.archivedUpdatedMs = archivedUpdatedMs
     }
     enum CodingKeys: String, CodingKey {
         case sessionId = "session_id"
         case lastModified = "last_modified"
         case firstMessage = "first_message"
         case title
+        case favorite
+        case favoriteUpdatedMs = "favorite_updated_ms"
+        case archived
+        case archivedUpdatedMs = "archived_updated_ms"
+    }
+    // Custom decode so the flag fields default (a pre-0.25.0 bridge omits them) rather
+    // than fail the whole list decode. The required fields stay required.
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        sessionId = try c.decode(String.self, forKey: .sessionId)
+        lastModified = try c.decode(UInt64.self, forKey: .lastModified)
+        firstMessage = try c.decodeIfPresent(String.self, forKey: .firstMessage)
+        title = try c.decodeIfPresent(String.self, forKey: .title)
+        favorite = try c.decodeIfPresent(Bool.self, forKey: .favorite) ?? false
+        favoriteUpdatedMs = try c.decodeIfPresent(UInt64.self, forKey: .favoriteUpdatedMs) ?? 0
+        archived = try c.decodeIfPresent(Bool.self, forKey: .archived) ?? false
+        archivedUpdatedMs = try c.decodeIfPresent(UInt64.self, forKey: .archivedUpdatedMs) ?? 0
     }
 }
 
@@ -427,6 +462,32 @@ public struct JesseStreamFrameData: Decodable {
 public struct JesseDeviceRegistration: Encodable {
     public let token: String
     public init(token: String) { self.token = token }
+}
+
+/// The `POST /jesse/session/{id}/flags` body: any subset of the four flag fields. Only
+/// the flag(s) that changed are sent, each paired with its unix-millis change clock, so
+/// the bridge applies each last-writer-wins by that timestamp. A nil field omits its key
+/// (synthesized `encodeIfPresent`), so a favorite-only change carries no `archived` keys
+/// and leaves the server's archived register untouched, matching the bridge's partial
+/// `FlagUpdate`.
+public struct JesseFlagsRequest: Encodable, Equatable {
+    public let favorite: Bool?
+    public let favoriteUpdatedMs: UInt64?
+    public let archived: Bool?
+    public let archivedUpdatedMs: UInt64?
+    public init(favorite: Bool? = nil, favoriteUpdatedMs: UInt64? = nil,
+                archived: Bool? = nil, archivedUpdatedMs: UInt64? = nil) {
+        self.favorite = favorite
+        self.favoriteUpdatedMs = favoriteUpdatedMs
+        self.archived = archived
+        self.archivedUpdatedMs = archivedUpdatedMs
+    }
+    enum CodingKeys: String, CodingKey {
+        case favorite
+        case favoriteUpdatedMs = "favorite_updated_ms"
+        case archived
+        case archivedUpdatedMs = "archived_updated_ms"
+    }
 }
 
 /// The `POST /jesse/title` request body: a bounded, whitespace-collapsed digest of the

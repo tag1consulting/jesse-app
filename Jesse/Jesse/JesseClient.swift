@@ -113,10 +113,18 @@ enum AttachmentLimits {
 ///
 /// `Sendable` because the coordinator races a turn's stream and poll in two concurrent
 /// child tasks (`consume`), so the client value crosses into them.
-protocol JesseClientProtocol: Sendable {
+// Refines `FlagSyncing` (JesseCore) so the shared `FlagReconciler` can push a local-newer
+// favorite/archive change through the iOS client, exactly as it does through the Mac's
+// shared client. `FlagSyncing.setFlags` has a default no-op, so the test fakes keep
+// compiling; the production `JesseClient` forwards it to the bridge.
+protocol JesseClientProtocol: FlagSyncing, Sendable {
     func send(mode: JesseMode, text: String, sessionId: String?, voice: Bool,
               instructions: String?, floorOverride: String?,
               attachments: [JesseAttachment]) async throws -> JesseSendResult
+    /// List sessions (`GET /jesse/sessions`, ETag-conditioned) so the app can reconcile
+    /// server-authoritative favorite/archive flags into local threads. Defaulted to
+    /// `.notModified` so a fake need not model the session list.
+    func listSessions(etag: String?) async throws -> SessionsResult
     /// Send carrying the outbox idempotency key (`request_id`). Defaulted in the
     /// extension to forward to the plain `send` (dropping the id).
     func send(mode: JesseMode, text: String, sessionId: String?, voice: Bool,
@@ -182,6 +190,9 @@ extension JesseClientProtocol {
     // Default no-op so fakes that don't exercise remote session deletion behave like a
     // bridge that always succeeds.
     func deleteSession(_ sessionId: String) async throws {}
+    // Default "no sessions to sync": a fake that doesn't model the session list behaves
+    // like an unchanged (304) list, so the flag-reconcile pass is a no-op for it.
+    func listSessions(etag: String?) async throws -> SessionsResult { .notModified }
     // Default "no title": a fake that doesn't opt into titling degrades exactly like a
     // bridge without the endpoint (the row keeps its derived title).
     func title(forDigest digest: String) async -> String? { nil }
@@ -353,6 +364,12 @@ struct JesseClient: JesseClientProtocol {
 
     func deleteSession(_ sessionId: String) async throws {
         try await bridge.deleteSession(sessionId)
+    }
+    func listSessions(etag: String?) async throws -> SessionsResult {
+        try await bridge.listSessions(etag: etag)
+    }
+    func setFlags(sessionId: String, favorite: FlagWrite?, archived: FlagWrite?) async throws {
+        try await bridge.setFlags(sessionId: sessionId, favorite: favorite, archived: archived)
     }
 
     func registerDevice(token: String) async throws {

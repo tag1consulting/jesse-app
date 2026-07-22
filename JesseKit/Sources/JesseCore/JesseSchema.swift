@@ -34,6 +34,8 @@ import SwiftData
 //   • `JesseThread.aiTitle` (String?), `titleSourceKey` (String?)
 //   • `JesseThread.origin` (String = "phone")
 //   • `JesseThread.isArchived` (Bool = false), `archivedAt` (Date?)  ← the archive fields
+//   • `JesseThread.favoriteUpdatedMs` (Int = 0), `archivedUpdatedMs` (Int = 0)  ← the
+//     never-cleared last-writer-wins clocks for cross-device favorite/archive sync
 //   • `Turn.provenanceJSON` (String?)
 //   • `Turn.attachments` → `TurnAttachment` (to-many, cascade, empty default)
 //   • the `WrittenMeal` entity, then its `contentHash` / `tombstoned` fields
@@ -55,9 +57,9 @@ import SwiftData
 // The `VersionedSchema` enums below remain purely as the canonical, single-source
 // model list (and as lineage documentation); they are not wired into a staged plan.
 //
-// Note: archive state is LOCAL to each device's store and deliberately NOT synced
-// through the bridge (which syncs only sessions/transcripts/titles), exactly like
-// favorite state.
+// Note: favorite and archive state are local-first (the store is the render source)
+// and reconciled across devices through the bridge flags, last-writer-wins on the
+// `favoriteUpdatedMs` / `archivedUpdatedMs` clocks (bridge 0.25.0; see `FlagReconciler`).
 
 /// The original entity set (through the whole additive property lineage above, all
 /// lightweight-compatible). Kept for lineage documentation.
@@ -72,8 +74,9 @@ public enum JesseSchemaV1: VersionedSchema {
 /// The current entity set, adding the send outbox (`OutboxItem` + `OutboxAttachment`)
 /// to V1. `jesseCurrentSchema` is derived from this so the container and the migration
 /// test can never drift from the model list. Additive property changes (favorites,
-/// origin, and the archive fields) live on these same entities and migrate
-/// automatically; they do not get their own version (see the header note).
+/// origin, the archive fields, and the favorite/archive LWW-sync clocks) live on these
+/// same entities and migrate automatically; they do not get their own version (see the
+/// header note).
 public enum JesseSchemaV2: VersionedSchema {
     public static let versionIdentifier = Schema.Version(2, 0, 0)
 
