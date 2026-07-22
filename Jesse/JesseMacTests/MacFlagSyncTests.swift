@@ -95,7 +95,7 @@ final class MacFlagSyncTests: XCTestCase {
         context.insert(thread)
         try context.save()
 
-        let fake = FakeBridgeClient(sessions: .sessions([summary("s1", favorite: true, favoriteMs: 200)], etag: "e1"))
+        let fake = FakeBridgeClient(sessions: .sessions([summary("s1", favorite: true, favoriteMs: 200)], deleted: [], etag: "e1"))
         let coordinator = makeCoordinator(fake)
         await coordinator.refreshSessions(context: context)
 
@@ -112,7 +112,7 @@ final class MacFlagSyncTests: XCTestCase {
         context.insert(thread)
         try context.save()
 
-        let fake = FakeBridgeClient(sessions: .sessions([summary("s1", archived: false, archivedMs: 200)], etag: "e1"))
+        let fake = FakeBridgeClient(sessions: .sessions([summary("s1", archived: false, archivedMs: 200)], deleted: [], etag: "e1"))
         let coordinator = makeCoordinator(fake)
         await coordinator.refreshSessions(context: context)
 

@@ -120,6 +120,11 @@ final class RunCoordinator {
     // asleep survives to the next drain. Injectable so a test points it at a scratch
     // UserDefaults suite.
     private let sessionDeletionStore: PendingSessionDeletionStore
+    // Presence-based per-session transcript cursor (absent = never hydrated, distinct
+    // from byte 0). Drives phone-side hydration on open (seed vs import) and is advanced
+    // past the phone's own turns at delivery so a later hydrate never re-imports them.
+    // Injectable so a test points it at a scratch UserDefaults suite.
+    private let hydrationCursorStore: HydrationCursorStore
     // Owns `finish`'s SwiftData append + save + idempotency-on-jobId. Shares the
     // injected `save` seam so a test's save spy counts both the optimistic
     // user-turn save and the completion save.
@@ -205,6 +210,7 @@ final class RunCoordinator {
          liveActivity: (any TurnLiveActivityManaging)? = nil,
          mealWriter: MealHealthWriter? = nil,
          sessionDeletionStore: PendingSessionDeletionStore? = nil,
+         hydrationCursorStore: HydrationCursorStore? = nil,
          onFirstSuccess: @escaping @MainActor () -> Void = {}) {
         // Resolve the default on the main actor (in the init body), not in the
         // default argument — a default arg is evaluated off the actor and the
@@ -235,6 +241,7 @@ final class RunCoordinator {
         // Resolved in the body (not a default arg) — its init is main-actor-isolated
         // under this module's MainActor default isolation, mirroring the stores above.
         self.sessionDeletionStore = sessionDeletionStore ?? PendingSessionDeletionStore()
+        self.hydrationCursorStore = hydrationCursorStore ?? HydrationCursorStore()
         self.onFirstSuccess = onFirstSuccess
         self.inFlight = resolvedInFlightStore.load()
     }
@@ -619,19 +626,22 @@ final class RunCoordinator {
         set { UserDefaults.standard.set(newValue, forKey: "jesse.sessions.etag") }
     }
 
-    /// Pull `GET /jesse/sessions` and reconcile the server-authoritative favorite/archive
-    /// flags into local threads, cache-first and last-writer-wins (see `FlagReconciler`).
-    /// This is the iOS half of cross-device flag convergence, the mirror of the Mac's
-    /// `MacStore` session-list sync: a star or archive made on the Mac lands here, and a
-    /// change made here that is newer than the server is pushed back up.
+    /// Pull `GET /jesse/sessions` and reconcile it into local threads through the ONE
+    /// shared `SessionReconciler` both apps use, cache-first and offline-tolerant. This is
+    /// the iOS half of two-way conversation sync, the mirror of the Mac's `MacStore` sync:
+    ///  - ADOPT a brand-new bridge session (started on the Mac) as a local stub that
+    ///    hydrates its transcript when opened,
+    ///  - UPDATE a matched thread (refresh the server title, reconcile favorite/archive
+    ///    last-writer-wins via `FlagReconciler`), and
+    ///  - DELETE-LOCAL a thread the bridge tombstoned (a delete made on the Mac), clearing
+    ///    its hydration cursor.
     ///
-    /// Scoped to threads this device already has (matched by `session_id`): it refreshes
-    /// their bridge title and reconciles their flags, but does NOT adopt brand-new bridge
-    /// sessions into the phone's list. The phone shows the conversations it started, and
-    /// convergence applies to the ones that exist on both devices. Best-effort throughout:
-    /// an unreachable or pre-0.25.0 bridge, or any failure, is swallowed (logged, never a
-    /// user error); the next pass retries, and a local change simply keeps winning until
-    /// it syncs.
+    /// The pending-local-delete ids feed the reconciler's resurrection guard, so a
+    /// conversation the user just deleted here is never re-adopted before its remote delete
+    /// drains. Best-effort throughout: an unreachable or older bridge, or any failure, is
+    /// swallowed (logged, never a user error); the next pass retries. Against a pre-0.26.0
+    /// bridge the `deleted` array is empty, so delete propagation is inert (exactly today's
+    /// behavior), while adoption and flag convergence still work.
     func refreshSessions(context: ModelContext) async {
         let config = configProvider()
         guard config.isConfigured else { return }
@@ -640,27 +650,52 @@ final class RunCoordinator {
             switch try await client.listSessions(etag: sessionsETag) {
             case .notModified:
                 return
-            case let .sessions(list, etag):
+            case let .sessions(list, deleted, etag):
                 sessionsETag = etag
-                await reconcileSessionFlags(list, client: client, context: context)
+                await applySessionSync(list, deleted: deleted, client: client, context: context)
             }
         } catch {
             Log.run.debug("sessions refresh failed: \(error.localizedDescription)")
         }
     }
 
-    /// Merge a fetched session list into local threads: for each summary that matches a
-    /// local thread by `session_id`, refresh the cached bridge title and reconcile its
-    /// favorite/archive flags. Saves once if anything changed.
-    private func reconcileSessionFlags(_ list: [SessionSummary],
-                                       client: any JesseClientProtocol,
-                                       context: ModelContext) async {
+    /// Apply the shared reconciler's plan to the local store: adopt, update, delete-local.
+    /// Saves once at the end if anything changed.
+    private func applySessionSync(_ list: [SessionSummary], deleted: [SessionTombstone],
+                                  client: any JesseClientProtocol, context: ModelContext) async {
         let existing = (try? context.fetch(FetchDescriptor<JesseThread>())) ?? []
         var bySession: [String: JesseThread] = [:]
         for t in existing { if let sid = t.sessionId, !sid.isEmpty { bySession[sid] = t } }
 
+        let plan = SessionReconciler.plan(
+            localSessionIds: Set(bySession.keys),
+            sessions: list,
+            tombstones: Set(deleted.map(\.sessionId)),
+            pendingDeletion: sessionDeletionStore.pendingIds)
+
         var changed = false
-        for s in list {
+
+        // ADOPT: create a stub mirroring `MacCoordinator.upsert` (derived title, server
+        // aiTitle, session id, last-modified timestamps), then reconcile flags: a
+        // zero-clock stub simply adopts whatever the server holds.
+        for s in plan.adopt {
+            let stamp = Date(timeIntervalSince1970: TimeInterval(s.lastModified))
+            let derived = s.firstMessage.map { JesseThread.deriveTitle(from: $0) } ?? ""
+            let thread = JesseThread(title: derived, mode: .ask, createdAt: stamp)
+            thread.sessionId = s.sessionId
+            thread.aiTitle = s.title
+            thread.updatedAt = stamp
+            context.insert(thread)
+            await FlagReconciler.reconcile(
+                thread: thread,
+                serverFavorite: s.favorite, serverFavoriteUpdatedMs: Int(s.favoriteUpdatedMs),
+                serverArchived: s.archived, serverArchivedUpdatedMs: Int(s.archivedUpdatedMs),
+                client: client)
+            changed = true
+        }
+
+        // UPDATE: refresh the server title and reconcile flags on an existing thread.
+        for s in plan.update {
             guard let thread = bySession[s.sessionId] else { continue }
             if let title = s.title, !title.isEmpty, thread.aiTitle != title {
                 thread.aiTitle = title
@@ -673,11 +708,109 @@ final class RunCoordinator {
                 client: client)
             changed = changed || didChange
         }
+
+        // DELETE-LOCAL: the bridge tombstoned this session (deleted on the Mac). Remove the
+        // local thread (its turns cascade) and clear its hydration cursor.
+        for sid in plan.deleteLocalSessionIds {
+            guard let thread = bySession[sid] else { continue }
+            cancel(thread.id)
+            context.delete(thread)
+            hydrationCursorStore.clear(sid)
+            changed = true
+        }
+
         if changed {
             do { try save(context) } catch {
-                Log.run.error("sessions flag reconcile save failed: \(error.localizedDescription)")
+                Log.run.error("session sync save failed: \(error.localizedDescription)")
             }
         }
+    }
+
+    // MARK: - Hydration (phone-side, on open)
+
+    /// Pull a conversation's transcript from the bridge when it is opened, cache-first and
+    /// offline-tolerant, mirroring `MacCoordinator.hydrate` plus the seeding rule the
+    /// presence-based cursor enables:
+    ///  - cursor PRESENT → import only the byte-delta past it;
+    ///  - cursor ABSENT + the thread already has local turns → it is the phone's own record
+    ///    (a phone-started thread), so SEED the cursor to the transcript end and import
+    ///    NOTHING (never re-import our own turns);
+    ///  - cursor ABSENT + no local turns → it is an adopted stub, so import the FULL
+    ///    transcript.
+    /// A 404 (unknown / gc'd transcript) leaves the cached copy; a thread with no session
+    /// id has nothing to hydrate.
+    func hydrateOnOpen(thread: JesseThread, context: ModelContext) async {
+        let config = configProvider()
+        guard config.isConfigured, let sid = thread.sessionId, !sid.isEmpty else { return }
+        let client = makeClient(config)
+
+        if let cursor = hydrationCursorStore.offset(sid) {
+            await importTranscript(sid, after: cursor, into: thread, client: client, context: context)
+        } else if thread.turns.isEmpty {
+            await importTranscript(sid, after: 0, into: thread, client: client, context: context)
+        } else {
+            await seedCursorToEnd(sid, from: 0, client: client)
+        }
+    }
+
+    /// Import the transcript delta from `after` into `thread` (append turns) and advance
+    /// the cursor to the returned end. A 404 leaves the cache untouched.
+    private func importTranscript(_ sid: String, after: UInt64, into thread: JesseThread,
+                                  client: any JesseClientProtocol, context: ModelContext) async {
+        do {
+            let (turns, next) = try await client.hydrate(sessionId: sid, after: after)
+            for t in turns {
+                let role: TurnRole = (t.role == "assistant") ? .jesse : .user
+                let turn = Turn(role: role, text: t.text, createdAt: Self.parseHydrateTimestamp(t.timestamp))
+                turn.thread = thread
+                context.insert(turn)
+            }
+            if !turns.isEmpty {
+                thread.updatedAt = Date()
+                do { try save(context) } catch {
+                    Log.run.error("hydrate save failed: \(error.localizedDescription)")
+                }
+            }
+            hydrationCursorStore.setOffset(sid, next)
+        } catch JesseError.badResponse(404, _) {
+            // Session gone server-side (gc'd / deleted): leave the cached copy.
+        } catch {
+            Log.run.debug("hydrate failed: \(error.localizedDescription)")
+        }
+    }
+
+    /// Advance a session's cursor to the current transcript end WITHOUT importing, used to
+    /// seed a phone-started thread on first open and to move past the phone's own turns at
+    /// delivery, so a later hydrate returns only genuinely-new content. Best-effort: a 404
+    /// or transport failure leaves the cursor unchanged (the next open re-decides).
+    private func seedCursorToEnd(_ sid: String, from: UInt64, client: any JesseClientProtocol) async {
+        if let (_, next) = try? await client.hydrate(sessionId: sid, after: from) {
+            hydrationCursorStore.setOffset(sid, next)
+        }
+    }
+
+    /// Advance the hydration cursor past a reply that was just delivered locally (the
+    /// phone's own turns are already in the bridge transcript), mirroring
+    /// `MacCoordinator.finalize`. Fire-and-forget and best-effort so it never blocks or
+    /// fails the turn. Called from the ONE delivery point (`TurnWriter.write` → `.delivered`),
+    /// which every local-append path funnels through, so the cursor advances once per reply
+    /// and a later hydrate never re-imports the phone's own record.
+    private func advanceCursorAfterDelivery(sessionId: String?) {
+        guard let sid = sessionId, !sid.isEmpty, configProvider().isConfigured else { return }
+        let client = makeClient(configProvider())
+        let from = hydrationCursorStore.offset(sid) ?? 0
+        Task { await seedCursorToEnd(sid, from: from, client: client) }
+    }
+
+    /// Parse a transcript ISO-8601 timestamp; fall back to now so ordering stays stable
+    /// (mirrors `MacCoordinator.parseTimestamp`).
+    private static func parseHydrateTimestamp(_ s: String?) -> Date {
+        guard let s else { return Date() }
+        let iso = ISO8601DateFormatter()
+        iso.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        if let d = iso.date(from: s) { return d }
+        iso.formatOptions = [.withInternetDateTime]
+        return iso.date(from: s) ?? Date()
     }
 
     /// Optimistic best-effort push of a just-toggled FAVORITE up to the bridge. The local
@@ -1167,8 +1300,15 @@ final class RunCoordinator {
         // reply re-checked/resumed writes nothing new). Best-effort and detached;
         // never affects whether the reply is shown.
         writeMeals(from: reply, context: context)
-        switch turnWriter.write(threadID: threadID, thread: thread, reply: reply,
-                                jobId: jobId, context: context) {
+        let outcome = turnWriter.write(threadID: threadID, thread: thread, reply: reply,
+                                       jobId: jobId, context: context)
+        // The single canonical delivery point: a fresh turn just landed, so advance the
+        // hydration cursor past it (best-effort) so a later open never re-imports the
+        // phone's own reply. `.alreadyDelivered` re-entries already advanced on first sight.
+        if case .delivered = outcome {
+            advanceCursorAfterDelivery(sessionId: reply.sessionId ?? thread?.sessionId)
+        }
+        switch outcome {
         case .unresolvableThread:
             // The reply has nowhere visible to land — keep the job for Re-check.
             failRecoverable(threadID: threadID,
@@ -1489,8 +1629,14 @@ extension RunCoordinator {
             // while the device is locked, so a watch-relayed meal logged with the
             // phone in a pocket still lands (idempotent, gated, detached).
             writeMeals(from: reply, context: context)
-            switch turnWriter.write(threadID: threadID, thread: thread, reply: reply,
-                                    jobId: nil, context: context) {
+            let outcome = turnWriter.write(threadID: threadID, thread: thread, reply: reply,
+                                           jobId: nil, context: context)
+            // Same delivery point as `finish`: advance the hydration cursor past the
+            // relayed reply so a later open never re-imports the phone's own record.
+            if case .delivered = outcome {
+                advanceCursorAfterDelivery(sessionId: reply.sessionId ?? thread.sessionId)
+            }
+            switch outcome {
             case .delivered, .alreadyDelivered:
                 return .reply(reply)
             case .empty:

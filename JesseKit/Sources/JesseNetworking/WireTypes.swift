@@ -202,11 +202,30 @@ public struct HydratedTurn: Decodable, Sendable, Equatable {
     }
 }
 
-/// Result of listing sessions: either fresh data (with the ETag to send back next
-/// time) or a 304 telling the caller its cache is current.
+/// One deletion tombstone on `GET /jesse/sessions` (bridge 0.26.0): the id of a session
+/// an explicit delete removed, and the unix-millis time it was deleted. It rides the
+/// `deleted` array alongside `sessions` so a delete made on one device converges to the
+/// others (they remove the matching local thread). Against a pre-0.26.0 bridge the array
+/// is absent and decodes to empty, so cross-device delete propagation is simply inert.
+public struct SessionTombstone: Decodable, Sendable, Equatable {
+    public let sessionId: String
+    public let deletedMs: UInt64
+    public init(sessionId: String, deletedMs: UInt64) {
+        self.sessionId = sessionId
+        self.deletedMs = deletedMs
+    }
+    enum CodingKeys: String, CodingKey {
+        case sessionId = "session_id"
+        case deletedMs = "deleted_ms"
+    }
+}
+
+/// Result of listing sessions: either fresh data (the sessions, the cross-device deletion
+/// tombstones, and the ETag to send back next time) or a 304 telling the caller its cache
+/// is current. `deleted` is empty against a pre-0.26.0 bridge that omits the field.
 public enum SessionsResult: Sendable, Equatable {
     case notModified
-    case sessions([SessionSummary], etag: String?)
+    case sessions([SessionSummary], deleted: [SessionTombstone], etag: String?)
 }
 
 // MARK: - Wire contract (Codable)
@@ -511,9 +530,20 @@ struct JesseTitleResponse: Decodable {
     let title: String?
 }
 
-/// Decoded `GET /jesse/sessions` body.
+/// Decoded `GET /jesse/sessions` body. `deleted` (bridge 0.26.0) is the cross-device
+/// deletion tombstones; it decodes to empty against a pre-0.26.0 bridge that omits the
+/// field (so a delete never propagates but nothing breaks, exactly today's behavior).
 struct JesseSessionsBody: Decodable {
     let sessions: [SessionSummary]
+    let deleted: [SessionTombstone]
+    enum CodingKeys: String, CodingKey {
+        case sessions, deleted
+    }
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        sessions = try c.decode([SessionSummary].self, forKey: .sessions)
+        deleted = try c.decodeIfPresent([SessionTombstone].self, forKey: .deleted) ?? []
+    }
 }
 
 /// Decoded `GET /jesse/sessions/{id}` body.

@@ -88,7 +88,7 @@ final class SessionFlagSyncTests: XCTestCase {
         context.insert(thread)
         try context.save()
 
-        let fake = FakeFlagClient(sessions: .sessions([summary("s1", favorite: true, favoriteMs: 200)], etag: "e1"))
+        let fake = FakeFlagClient(sessions: .sessions([summary("s1", favorite: true, favoriteMs: 200)], deleted: [], etag: "e1"))
         let coordinator = makeCoordinator(fake)
         await coordinator.refreshSessions(context: context)
 
@@ -105,7 +105,7 @@ final class SessionFlagSyncTests: XCTestCase {
         context.insert(thread)
         try context.save()
 
-        let fake = FakeFlagClient(sessions: .sessions([summary("s1", archived: true, archivedMs: 50)], etag: "e1"))
+        let fake = FakeFlagClient(sessions: .sessions([summary("s1", archived: true, archivedMs: 50)], deleted: [], etag: "e1"))
         let coordinator = makeCoordinator(fake)
         await coordinator.refreshSessions(context: context)
 
@@ -121,7 +121,7 @@ final class SessionFlagSyncTests: XCTestCase {
         context.insert(thread)
         try context.save()
 
-        let fake = FakeFlagClient(sessions: .sessions([summary("s1", favorite: false, favoriteMs: 200)], etag: "e1"))
+        let fake = FakeFlagClient(sessions: .sessions([summary("s1", favorite: false, favoriteMs: 200)], deleted: [], etag: "e1"))
         let coordinator = makeCoordinator(fake)
         await coordinator.refreshSessions(context: context)
 
@@ -138,7 +138,7 @@ final class SessionFlagSyncTests: XCTestCase {
         try context.save()
 
         // Server lists some other session; the local-only thread must be untouched.
-        let fake = FakeFlagClient(sessions: .sessions([summary("other", favorite: false, favoriteMs: 999)], etag: "e1"))
+        let fake = FakeFlagClient(sessions: .sessions([summary("other", favorite: false, favoriteMs: 999)], deleted: [], etag: "e1"))
         let coordinator = makeCoordinator(fake)
         await coordinator.refreshSessions(context: context)
 

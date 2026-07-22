@@ -94,6 +94,14 @@ struct ThreadDetailView: View {
         // that lands on a thread — deep link, Siri, notification tap — inherits it,
         // since they all converge on this view.
         .toolbar(.hidden, for: .tabBar)
+        // Hydrate the transcript from the bridge when this conversation is opened,
+        // cache-first: an adopted stub (started on the Mac) pulls its full transcript
+        // here, a phone-started thread just seeds its cursor, and either way an
+        // unreachable or older bridge leaves the cached copy untouched. Mirrors the
+        // Mac detail view's `.task(id:)` hydrate.
+        .task(id: thread.id) {
+            await coordinator.hydrateOnOpen(thread: thread, context: context)
+        }
         .toolbar {
             ToolbarItem(placement: .topBarTrailing) {
                 Button {
