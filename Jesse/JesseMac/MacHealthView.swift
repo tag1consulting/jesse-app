@@ -14,6 +14,13 @@ import JesseDietDisplay
 // old-bridge `historyUnsupported` banner, and the "couldn't refresh, showing the last
 // update" stamp that never blanks a loaded screen. The Mac adds only a manual refresh.
 struct MacHealthView: View {
+    /// Opens the shared Settings scene (see `JesseMacApp`). The Health tab needs its own
+    /// route because its empty state, when the bridge is unconfigured, tells the user to
+    /// pair "in Settings" but has no button of its own (the shared `notConfigured` state
+    /// deliberately shows no retry), and the Chats sidebar toolbar is a different tab. This
+    /// is the "nowhere to log in" fix: a Settings button that is always present on the tab.
+    @Environment(\.openSettings) private var openSettings
+
     private let configStore: MacConfigStore
     @State private var model: HealthDashboardModel
 
@@ -36,6 +43,12 @@ struct MacHealthView: View {
                         }
                         .keyboardShortcut("r", modifiers: .command)
                         .help("Refresh the day on screen")
+                    }
+                    ToolbarItem {
+                        Button { openSettings() } label: {
+                            Label("Settings", systemImage: "gearshape")
+                        }
+                        .help("Pair with your bridge, or change the connection")
                     }
                 }
         }

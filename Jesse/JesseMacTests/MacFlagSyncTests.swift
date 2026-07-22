@@ -66,7 +66,7 @@ final class MacFlagSyncTests: XCTestCase {
     @MainActor
     private func makeCoordinator(_ fake: FakeBridgeClient) -> MacCoordinator {
         MacCoordinator(configStore: MacConfigStore(config: JesseConfig(host: "studio", port: 8765, token: "tok")),
-                       makeFlagClient: { _ in fake })
+                       makeClient: { _ in fake })
     }
 
     private func summary(_ id: String, favorite: Bool = false, favoriteMs: UInt64 = 0,

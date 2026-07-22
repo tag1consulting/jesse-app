@@ -89,11 +89,14 @@ final class MacCoordinator {
         set { UserDefaults.standard.set(newValue, forKey: "sessions.etag") }
     }
 
-    /// Builds the client the flag-sync path uses (session list + `setFlags`). Injected as
-    /// a seam so a test drives it with a fake `BridgeClientProtocol`; production builds the
-    /// real shared client from the current config. Kept separate from the send-path
-    /// `client` so this injection is additive and touches nothing about turn running.
-    private let makeFlagClient: @MainActor (JesseConfig) -> any BridgeClientProtocol
+    /// Builds the bridge client every network path uses (send, streaming, hydrate, the
+    /// session list, `setFlags`, and remote deletes). Injected as one seam so a test drives
+    /// the WHOLE coordinator (turn running and hydration included, not just flag sync)
+    /// with a fake `BridgeClientProtocol`; production builds the real shared client from the
+    /// current config. Unifying the send/hydrate path onto this factory (it used to build a
+    /// concrete `JesseBridgeClient` inline, untestable) is what lets the hydration-on-open
+    /// tests exist at all.
+    private let makeClient: @MainActor (JesseConfig) -> any BridgeClientProtocol
 
     /// Durable queue of remote sessions to delete (thread-delete → `DELETE /jesse/session/{id}`),
     /// the Mac mirror of the phone's store (shared type in JesseNetworking). Persisted so a
@@ -102,15 +105,15 @@ final class MacCoordinator {
     private let sessionDeletionStore: PendingSessionDeletionStore
 
     init(configStore: MacConfigStore,
-         makeFlagClient: @escaping @MainActor (JesseConfig) -> any BridgeClientProtocol
+         makeClient: @escaping @MainActor (JesseConfig) -> any BridgeClientProtocol
             = { JesseBridgeClient(config: $0) },
          sessionDeletionStore: PendingSessionDeletionStore = PendingSessionDeletionStore()) {
         self.configStore = configStore
-        self.makeFlagClient = makeFlagClient
+        self.makeClient = makeClient
         self.sessionDeletionStore = sessionDeletionStore
     }
 
-    private var client: JesseBridgeClient { JesseBridgeClient(config: configStore.config) }
+    private var client: any BridgeClientProtocol { makeClient(configStore.config) }
 
     func isRunning(_ threadID: UUID) -> Bool { isRunning && activeThreadID == threadID }
 
@@ -144,7 +147,8 @@ final class MacCoordinator {
         do {
             let result = try await cli.send(
                 mode: mode, text: trimmed, sessionId: thread.sessionId,
-                requestId: UUID().uuidString)
+                voice: false, instructions: nil, floorOverride: nil,
+                attachments: [], requestId: UUID().uuidString)
             switch result {
             case let .reply(reply, _):
                 await finalize(thread: thread, reply: reply.text, sessionId: reply.sessionId,
@@ -158,7 +162,7 @@ final class MacCoordinator {
     }
 
     private func runStream(jobId: String, thread: JesseThread, context: ModelContext,
-                           client cli: JesseBridgeClient) async {
+                           client cli: any BridgeClientProtocol) async {
         var terminalReply: String?
         var terminalSession: String?
         var sawTerminal = false
@@ -201,7 +205,7 @@ final class MacCoordinator {
     }
 
     private func pollToCompletion(jobId: String, thread: JesseThread, context: ModelContext,
-                                  client cli: JesseBridgeClient) async {
+                                  client cli: any BridgeClientProtocol) async {
         for _ in 0..<600 {  // ~10 min ceiling at 1s spacing
             if Task.isCancelled { return }
             do {
@@ -232,7 +236,7 @@ final class MacCoordinator {
     /// cursor past this exchange (so a later hydrate won't re-add it), and mint a title
     /// for a still-untitled thread.
     private func finalize(thread: JesseThread, reply: String, sessionId: String?,
-                          context: ModelContext, client cli: JesseBridgeClient) async {
+                          context: ModelContext, client cli: any BridgeClientProtocol) async {
         if let sid = sessionId, !sid.isEmpty, thread.sessionId != sid {
             thread.sessionId = sid
         }
@@ -301,7 +305,7 @@ final class MacCoordinator {
     func refreshSessions(context: ModelContext) async {
         guard configStore.isConfigured else { return }
         drainSessionDeletions()
-        let cli = makeFlagClient(configStore.config)
+        let cli = makeClient(configStore.config)
         do {
             switch try await cli.listSessions(since: nil, etag: sessionsETag) {
             case .notModified:
@@ -388,7 +392,7 @@ final class MacCoordinator {
     private func drainSessionDeletions() {
         guard configStore.isConfigured else { return }
         let store = sessionDeletionStore
-        let cli = makeFlagClient(configStore.config)
+        let cli = makeClient(configStore.config)
         Task {
             for item in store.pending {
                 do {
@@ -411,7 +415,7 @@ final class MacCoordinator {
     func pushFavoriteChange(for thread: JesseThread) {
         guard let sid = thread.sessionId, !sid.isEmpty else { return }
         let write = FlagWrite(value: thread.isFavorite, updatedMs: thread.favoriteUpdatedMs)
-        let cli = makeFlagClient(configStore.config)
+        let cli = makeClient(configStore.config)
         Task { try? await cli.setFlags(sessionId: sid, favorite: write, archived: nil) }
     }
 
@@ -420,7 +424,7 @@ final class MacCoordinator {
     func pushArchivedChange(for thread: JesseThread) {
         guard let sid = thread.sessionId, !sid.isEmpty else { return }
         let write = FlagWrite(value: thread.isArchived, updatedMs: thread.archivedUpdatedMs)
-        let cli = makeFlagClient(configStore.config)
+        let cli = makeClient(configStore.config)
         Task { try? await cli.setFlags(sessionId: sid, favorite: nil, archived: write) }
     }
 
