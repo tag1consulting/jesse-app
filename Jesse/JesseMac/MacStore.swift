@@ -52,6 +52,11 @@ enum MacCursorStore {
     static func setOffset(_ sessionId: String, _ value: UInt64, defaults: UserDefaults = .standard) {
         defaults.set(Int(value), forKey: key(sessionId))
     }
+    /// Forget a session's cursor, called when its local thread is deleted (locally or via
+    /// a cross-device tombstone) so a re-adopted id later hydrates from scratch.
+    static func clear(_ sessionId: String, defaults: UserDefaults = .standard) {
+        defaults.removeObject(forKey: key(sessionId))
+    }
 }
 
 // MARK: - Coordinator
@@ -90,11 +95,19 @@ final class MacCoordinator {
     /// `client` so this injection is additive and touches nothing about turn running.
     private let makeFlagClient: @MainActor (JesseConfig) -> any BridgeClientProtocol
 
+    /// Durable queue of remote sessions to delete (thread-delete → `DELETE /jesse/session/{id}`),
+    /// the Mac mirror of the phone's store (shared type in JesseNetworking). Persisted so a
+    /// delete made while the Studio is asleep survives to the next drain, and its ids feed
+    /// the session reconciler's resurrection guard. Injectable so a test uses a scratch suite.
+    private let sessionDeletionStore: PendingSessionDeletionStore
+
     init(configStore: MacConfigStore,
          makeFlagClient: @escaping @MainActor (JesseConfig) -> any BridgeClientProtocol
-            = { JesseBridgeClient(config: $0) }) {
+            = { JesseBridgeClient(config: $0) },
+         sessionDeletionStore: PendingSessionDeletionStore = PendingSessionDeletionStore()) {
         self.configStore = configStore
         self.makeFlagClient = makeFlagClient
+        self.sessionDeletionStore = sessionDeletionStore
     }
 
     private var client: JesseBridgeClient { JesseBridgeClient(config: configStore.config) }
@@ -279,62 +292,113 @@ final class MacCoordinator {
 
     // MARK: Session-list sync
 
-    /// Reconcile `GET /jesse/sessions` into local threads: adopt phone-started threads,
-    /// refresh server-authoritative titles, and converge the favorite/archive flags across
-    /// devices (last-writer-wins; see `FlagReconciler`). ETag-conditioned, so an unchanged
-    /// list is a cheap 304.
+    /// Reconcile `GET /jesse/sessions` into local threads through the ONE shared
+    /// `SessionReconciler` both apps use: adopt Mac/phone-started threads, refresh
+    /// server-authoritative titles, converge the favorite/archive flags across devices
+    /// (last-writer-wins; see `FlagReconciler`), and honor cross-device deletion tombstones
+    /// (bridge 0.26.0). ETag-conditioned, so an unchanged list is a cheap 304. Also drains
+    /// any queued remote deletions (best-effort) whenever the list is pulled.
     func refreshSessions(context: ModelContext) async {
         guard configStore.isConfigured else { return }
+        drainSessionDeletions()
         let cli = makeFlagClient(configStore.config)
         do {
             switch try await cli.listSessions(since: nil, etag: sessionsETag) {
             case .notModified:
                 return
-            case let .sessions(list, etag):
+            case let .sessions(list, deleted, etag):
                 sessionsETag = etag
-                await upsert(list, client: cli, context: context)
+                await upsert(list, deleted: deleted, client: cli, context: context)
             }
         } catch {
             lastError = Self.friendly(error)
         }
     }
 
-    private func upsert(_ list: [SessionSummary], client cli: any BridgeClientProtocol,
-                        context: ModelContext) async {
+    private func upsert(_ list: [SessionSummary], deleted: [SessionTombstone],
+                        client cli: any BridgeClientProtocol, context: ModelContext) async {
         // Index existing threads that carry a session id.
         let existing = (try? context.fetch(FetchDescriptor<JesseThread>())) ?? []
         var bySession: [String: JesseThread] = [:]
         for t in existing { if let sid = t.sessionId, !sid.isEmpty { bySession[sid] = t } }
 
-        for s in list {
+        let plan = SessionReconciler.plan(
+            localSessionIds: Set(bySession.keys),
+            sessions: list,
+            tombstones: Set(deleted.map(\.sessionId)),
+            pendingDeletion: sessionDeletionStore.pendingIds)
+
+        // ADOPT a new stub, then reconcile flags (a zero-clock stub adopts server flags).
+        for s in plan.adopt {
             let stamp = Date(timeIntervalSince1970: TimeInterval(s.lastModified))
-            let thread: JesseThread
-            if let t = bySession[s.sessionId] {
-                if let title = s.title, !title.isEmpty { t.aiTitle = title }
-                if t.title.isEmpty, let fm = s.firstMessage {
-                    t.title = JesseThread.deriveTitle(from: fm)
-                }
-                if stamp > t.updatedAt { t.updatedAt = stamp }
-                thread = t
-            } else {
-                let derived = s.firstMessage.map { JesseThread.deriveTitle(from: $0) } ?? ""
-                let t = JesseThread(title: derived, mode: .ask, createdAt: stamp)
-                t.sessionId = s.sessionId
-                t.aiTitle = s.title
-                t.updatedAt = stamp
-                context.insert(t)
-                thread = t
-            }
-            // Converge favorite/archive last-writer-wins. A freshly-created thread has
-            // zero-clocks, so this simply adopts whatever the server holds (and never
-            // spuriously pushes, since a zero local clock is never strictly newer).
+            let derived = s.firstMessage.map { JesseThread.deriveTitle(from: $0) } ?? ""
+            let t = JesseThread(title: derived, mode: .ask, createdAt: stamp)
+            t.sessionId = s.sessionId
+            t.aiTitle = s.title
+            t.updatedAt = stamp
+            context.insert(t)
             await FlagReconciler.reconcile(
-                thread: thread,
+                thread: t,
                 serverFavorite: s.favorite, serverFavoriteUpdatedMs: Int(s.favoriteUpdatedMs),
                 serverArchived: s.archived, serverArchivedUpdatedMs: Int(s.archivedUpdatedMs),
                 client: cli)
         }
+
+        // UPDATE an existing thread: refresh title, then reconcile flags.
+        for s in plan.update {
+            guard let t = bySession[s.sessionId] else { continue }
+            let stamp = Date(timeIntervalSince1970: TimeInterval(s.lastModified))
+            if let title = s.title, !title.isEmpty { t.aiTitle = title }
+            if t.title.isEmpty, let fm = s.firstMessage {
+                t.title = JesseThread.deriveTitle(from: fm)
+            }
+            if stamp > t.updatedAt { t.updatedAt = stamp }
+            await FlagReconciler.reconcile(
+                thread: t,
+                serverFavorite: s.favorite, serverFavoriteUpdatedMs: Int(s.favoriteUpdatedMs),
+                serverArchived: s.archived, serverArchivedUpdatedMs: Int(s.archivedUpdatedMs),
+                client: cli)
+        }
+
+        // DELETE-LOCAL a thread the bridge tombstoned (deleted on the phone): remove it
+        // (turns cascade) and clear its hydration cursor.
+        for sid in plan.deleteLocalSessionIds {
+            guard let t = bySession[sid] else { continue }
+            context.delete(t)
+            MacCursorStore.clear(sid)
+        }
+
         try? context.save()
+    }
+
+    // MARK: - Remote session deletion (durable)
+
+    /// Enqueue a thread's bridge `sessionId` for durable remote deletion and kick a drain.
+    /// Called from the sidebar delete AFTER the instant local SwiftData delete: the local
+    /// delete is unchanged, and the remote transcript is reclaimed best-effort (and a
+    /// tombstone recorded so the phone converges). A blank id is a no-op.
+    func enqueueSessionDeletion(_ sessionId: String) {
+        sessionDeletionStore.enqueue(sessionId)
+        drainSessionDeletions()
+    }
+
+    /// Fire-and-forget drain of the durable pending-deletions queue: for each tombstone,
+    /// `DELETE /jesse/session/{id}`; success (incl. the bridge's idempotent 404) clears it,
+    /// a network failure leaves it for the next drain (enqueue or the next sessions pull).
+    private func drainSessionDeletions() {
+        guard configStore.isConfigured else { return }
+        let store = sessionDeletionStore
+        let cli = makeFlagClient(configStore.config)
+        Task {
+            for item in store.pending {
+                do {
+                    try await cli.deleteSession(item.sessionId)
+                    store.remove(item.sessionId)
+                } catch {
+                    // Transport/auth/5xx: leave the tombstone; the next drain retries.
+                }
+            }
+        }
     }
 
     // MARK: Flag push

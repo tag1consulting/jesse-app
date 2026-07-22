@@ -15,6 +15,42 @@ CI both run it). See the "Versioning" section of `bridge/README.md`.
 
 ## [Unreleased]
 
+## [App 1.0 (68)] - 2026-07-22
+
+### Added
+- **Conversations now sync two-way across iPhone and Mac.** A conversation started on
+  either device shows up on the other after a sync, loads its transcript when opened,
+  and is removed everywhere when deleted on any one device. Cache-first and offline
+  tolerant throughout: an unreachable or older bridge never blocks a send, a toggle, or
+  a delete, and never loses a change. Cross-device DELETE propagation requires bridge
+  0.26.0; against an older bridge adoption and transcript hydration still work and delete
+  propagation is simply inert (local delete plus best-effort remote reclaim, exactly the
+  prior behavior).
+  - **One shared session reconciler.** A pure, view-free `SessionReconciler` (in
+    `JesseNetworking`) turns the local session ids, the server session list, the server
+    deletion tombstones, and the ids pending a local delete into a plan: ADOPT an unknown
+    session, UPDATE (title refresh plus per-flag `FlagReconciler`) a matched one, and
+    DELETE-LOCAL a tombstoned one. Tombstoned and pending-delete ids are excluded from
+    adoption, so a just-deleted conversation is never re-created (the resurrection guard).
+    BOTH apps' session-reconcile paths (the phone's `RunCoordinator.refreshSessions` and
+    the Mac's `MacStore` upsert) now call this one function, so they can no longer drift.
+  - **Phone adoption.** The phone adopts every brand-new bridge session the list carries
+    as a stub (derived title, server title, session id, last-modified timestamps), exactly
+    as the Mac already did, and reconciles its favorite/archive flags.
+  - **Phone transcript hydration on open.** A presence-based per-session cursor (absent
+    means never hydrated, distinct from byte 0) drives a hydrate when a conversation is
+    opened: an adopted stub imports its full transcript, a phone-started thread seeds its
+    cursor to the transcript end and imports nothing (so the phone never re-imports its own
+    turns), and a later open imports only the delta. At the single delivery point the phone
+    advances the cursor past its own just-delivered reply, mirroring the Mac.
+  - **Cross-device delete.** Deleting a conversation on one device records a bridge deletion
+    tombstone (bridge 0.26.0); the other device removes the matching local thread (its turns
+    cascade) and clears its hydration cursor on the next sync. The Mac gained a durable
+    pending-delete queue mirroring the phone's, so a delete made while the Studio is asleep
+    survives to the next drain.
+  - No SwiftData schema change: the hydration cursor and the pending-delete queue are
+    `UserDefaults`, not new model columns.
+
 ## [App 1.0 (67)] - 2026-07-22
 
 ### Added

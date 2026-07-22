@@ -299,7 +299,7 @@ public struct JesseBridgeClient: BridgeClientProtocol {
         guard let body = try? JSONDecoder().decode(JesseSessionsBody.self, from: data) else {
             throw JesseError.decoding
         }
-        return .sessions(body.sessions, etag: newETag)
+        return .sessions(body.sessions, deleted: body.deleted, etag: newETag)
     }
 
     // MARK: - Hydrate

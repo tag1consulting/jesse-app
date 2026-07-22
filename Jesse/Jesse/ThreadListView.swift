@@ -466,10 +466,13 @@ struct ThreadListView: View {
     }
 
     /// Drop threads that were opened but never sent to (no turns) so the list
-    /// doesn't accumulate empties from `+`-then-back.
+    /// doesn't accumulate empties from `+`-then-back. Scoped to purely-local threads
+    /// (no `sessionId`): an adopted stub (started on the Mac) carries a `sessionId` but
+    /// has no turns until it hydrates on open, so it must be preserved, not pruned.
     private func pruneEmpty() {
         var changed = false
-        for thread in threads where thread.turns.isEmpty && !coordinator.isRunning(thread.id) {
+        for thread in threads
+        where thread.turns.isEmpty && thread.sessionId == nil && !coordinator.isRunning(thread.id) {
             context.delete(thread)
             changed = true
         }

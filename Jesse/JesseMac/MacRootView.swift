@@ -346,6 +346,14 @@ struct MacRootView: View {
 
     private func delete(_ thread: JesseThread) {
         if selection == thread.id { selection = nil }
+        // If the thread had a bridge session, durably enqueue its remote deletion BEFORE
+        // the local delete reads it: the local delete stays instant; the remote reclaim
+        // (and the cross-device tombstone that converges the delete to the phone) is
+        // best-effort and retried on the next sessions pull if the Studio is asleep now.
+        if let sid = thread.sessionId, !sid.isEmpty {
+            coordinator.enqueueSessionDeletion(sid)
+            MacCursorStore.clear(sid)
+        }
         context.delete(thread)
         try? context.save()
     }

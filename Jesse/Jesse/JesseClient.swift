@@ -125,6 +125,12 @@ protocol JesseClientProtocol: FlagSyncing, Sendable {
     /// server-authoritative favorite/archive flags into local threads. Defaulted to
     /// `.notModified` so a fake need not model the session list.
     func listSessions(etag: String?) async throws -> SessionsResult
+    /// Pull a session's transcript delta (`GET /jesse/sessions/{id}`, `?after=` byte
+    /// cursor) so an adopted or opened conversation can hydrate on demand. Returns the
+    /// ordered turns appended since `after` and the next cursor. Defaulted in the
+    /// extension to a 404 (unknown transcript → leave the cached copy), so a fake that
+    /// does not model hydration degrades like a bridge with nothing to serve.
+    func hydrate(sessionId: String, after: UInt64) async throws -> (turns: [HydratedTurn], nextOffset: UInt64)
     /// Send carrying the outbox idempotency key (`request_id`). Defaulted in the
     /// extension to forward to the plain `send` (dropping the id).
     func send(mode: JesseMode, text: String, sessionId: String?, voice: Bool,
@@ -193,6 +199,11 @@ extension JesseClientProtocol {
     // Default "no sessions to sync": a fake that doesn't model the session list behaves
     // like an unchanged (304) list, so the flag-reconcile pass is a no-op for it.
     func listSessions(etag: String?) async throws -> SessionsResult { .notModified }
+    // Default "unknown transcript": a fake that doesn't model hydration behaves like a
+    // bridge with nothing to serve (404), so an open leaves the cached copy untouched.
+    func hydrate(sessionId: String, after: UInt64) async throws -> (turns: [HydratedTurn], nextOffset: UInt64) {
+        throw JesseError.badResponse(404, "")
+    }
     // Default "no title": a fake that doesn't opt into titling degrades exactly like a
     // bridge without the endpoint (the row keeps its derived title).
     func title(forDigest digest: String) async -> String? { nil }
@@ -367,6 +378,9 @@ struct JesseClient: JesseClientProtocol {
     }
     func listSessions(etag: String?) async throws -> SessionsResult {
         try await bridge.listSessions(etag: etag)
+    }
+    func hydrate(sessionId: String, after: UInt64) async throws -> (turns: [HydratedTurn], nextOffset: UInt64) {
+        try await bridge.hydrate(sessionId: sessionId, after: after)
     }
     func setFlags(sessionId: String, favorite: FlagWrite?, archived: FlagWrite?) async throws {
         try await bridge.setFlags(sessionId: sessionId, favorite: favorite, archived: archived)
