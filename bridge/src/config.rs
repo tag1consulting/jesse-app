@@ -369,6 +369,16 @@ impl Config {
             .map(|d| PathBuf::from(d).join("flags.json"))
     }
 
+    /// The file the per-session deletion tombstones are persisted to (a sibling of
+    /// `flags.json`), or `None` when persistence is disabled (then tombstones are
+    /// in-memory only), the same degradation the job / title / device / flag stores
+    /// have. Holds only a session_id and the unix-millis delete time, never a secret.
+    pub fn deletions_file(&self) -> Option<PathBuf> {
+        self.state_dir
+            .as_deref()
+            .map(|d| PathBuf::from(d).join("deletions.json"))
+    }
+
     /// The file the context ledger is persisted to (a sibling of `titles.json`),
     /// or `None` when persistence is disabled — then the ledger is in-memory only,
     /// the same degradation the job/title/device stores have. Holds conversation

@@ -3251,6 +3251,186 @@ async fn session_delete_removes_transcript_and_makes_it_unresumable() {
     let _ = std::fs::remove_dir_all(&home);
 }
 
+// ---- Deletion tombstones (the `deleted` array on GET /jesse/sessions) -------
+
+#[tokio::test]
+async fn sessions_deleted_array_present_and_empty_by_default() {
+    // A bridge with no tombstones returns an empty `deleted` array (additive, always
+    // present) alongside `sessions`.
+    let cfg = Config {
+        vault: format!("/no/such/vault/{}", random_hex()),
+        ..test_config()
+    };
+    let st = AppState::new(cfg);
+    let resp = app(st)
+        .oneshot(sessions_request(Some("Bearer test-token"), None, None))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body: Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    assert_eq!(
+        body["deleted"],
+        serde_json::json!([]),
+        "no tombstones → empty deleted array"
+    );
+}
+
+#[tokio::test]
+async fn session_delete_records_a_tombstone_and_changes_the_sessions_etag() {
+    // An explicit delete records a durable tombstone that rides on GET /jesse/sessions
+    // as the `deleted` array, and adding it changes the strong ETag (so a cached 304
+    // is invalidated): the signal Prompt 10's app uses to converge removals.
+    let home = std::env::temp_dir().join(format!("jesse-home-{}", random_hex()));
+    let vault = format!("/vault/{}", random_hex());
+    let proj = home
+        .join(".claude")
+        .join("projects")
+        .join(escape_project_path(&vault));
+    std::fs::create_dir_all(&proj).unwrap();
+    std::fs::write(
+        proj.join("sess-keep.jsonl"),
+        "{\"type\":\"user\",\"message\":{\"content\":\"keep me\"}}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        proj.join("sess-del.jsonl"),
+        "{\"type\":\"user\",\"message\":{\"content\":\"delete me\"}}\n",
+    )
+    .unwrap();
+
+    let cfg = Config {
+        home: home.to_string_lossy().into_owned(),
+        vault: vault.clone(),
+        state_dir: None,
+        ..test_config()
+    };
+    let st = AppState::new(cfg);
+
+    // Before delete: two sessions, an empty `deleted` array, capture the ETag.
+    let resp = app(st.clone())
+        .oneshot(sessions_request(Some("Bearer test-token"), None, None))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let etag_before = resp
+        .headers()
+        .get("etag")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+    let body: Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    assert_eq!(body["sessions"].as_array().unwrap().len(), 2);
+    assert_eq!(body["deleted"], serde_json::json!([]));
+
+    // Delete one session.
+    let resp = app(st.clone())
+        .oneshot(session_delete_request(
+            Some("Bearer test-token"),
+            "sess-del",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+
+    // After delete: `deleted` carries the tombstone, `sessions` no longer lists it,
+    // and the ETag changed.
+    let resp = app(st.clone())
+        .oneshot(sessions_request(Some("Bearer test-token"), None, None))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let etag_after = resp
+        .headers()
+        .get("etag")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+    assert_ne!(
+        etag_before, etag_after,
+        "adding a tombstone must change the strong ETag"
+    );
+    let body: Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    let sessions = body["sessions"].as_array().unwrap();
+    assert_eq!(sessions.len(), 1, "the deleted session is no longer listed");
+    assert_eq!(sessions[0]["session_id"], "sess-keep");
+    let deleted = body["deleted"].as_array().unwrap();
+    assert_eq!(deleted.len(), 1, "one tombstone");
+    assert_eq!(deleted[0]["session_id"], "sess-del");
+    assert!(
+        deleted[0]["deleted_ms"].as_u64().unwrap() > 0,
+        "tombstone carries a unix-millis delete time"
+    );
+
+    // The pre-delete ETag no longer matches (the cached 304 was invalidated): the
+    // same conditional request now returns a fresh 200, not 304.
+    let resp = app(st)
+        .oneshot(sessions_request(
+            Some("Bearer test-token"),
+            None,
+            Some(&etag_before),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "stale ETag → 200 (not a 304), because the tombstone changed the body"
+    );
+
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+// Age-based GC reclaims a session past the TTL but records NO deletion tombstone: a
+// device merely offline while a session aged out must keep its local copy. Only an
+// explicit user delete records one.
+#[tokio::test]
+async fn session_gc_records_no_tombstone() {
+    let home = std::env::temp_dir().join(format!("jesse-home-{}", random_hex()));
+    let vault = format!("/vault/{}", random_hex());
+    let proj = home
+        .join(".claude")
+        .join("projects")
+        .join(escape_project_path(&vault));
+    std::fs::create_dir_all(&proj).unwrap();
+    let ancient = proj.join("ancient.jsonl");
+    std::fs::write(&ancient, "{\"type\":\"user\"}\n").unwrap();
+    // Age it far past any TTL (mtime at the epoch).
+    let epoch = std::time::UNIX_EPOCH;
+    std::fs::File::open(&ancient)
+        .unwrap()
+        .set_modified(epoch)
+        .unwrap();
+
+    let cfg = Config {
+        home: home.to_string_lossy().into_owned(),
+        vault: vault.clone(),
+        state_dir: None,
+        session_ttl_days: 90,
+        ..test_config()
+    };
+    let st = AppState::new(cfg);
+
+    run_session_gc(&st.cfg, &st.titles, &st.flags);
+
+    assert!(!ancient.exists(), "GC reclaimed the aged-out session");
+    assert!(
+        st.deletions.is_empty(),
+        "GC must record NO deletion tombstone"
+    );
+
+    // And the sessions list shows an empty `deleted` array after GC.
+    let resp = app(st)
+        .oneshot(sessions_request(Some("Bearer test-token"), None, None))
+        .await
+        .unwrap();
+    let body: Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    assert_eq!(body["deleted"], serde_json::json!([]), "no tombstone from GC");
+
+    let _ = std::fs::remove_dir_all(&home);
+}
+
 // ---- POST /jesse/session/{id}/flags ----------------------------------------
 
 /// A throwaway HOME whose escaped vault projects dir holds one real `session_id`
