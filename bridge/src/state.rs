@@ -23,6 +23,13 @@ pub struct AppState {
     // Mac) converges on one set of favorites and archived conversations. Read into
     // `GET /jesse/sessions` and written by `POST /jesse/session/{id}/flags`.
     pub flags: Arc<FlagStore>,
+    // Server-side session_id -> deletion tombstone store (persisted to
+    // `<state_dir>/deletions.json` when a state dir is configured; in-memory
+    // otherwise). Records a durable tombstone when (and only when) a client
+    // explicitly deletes a session, exposed as the `deleted` array on
+    // `GET /jesse/sessions` so every device converges on removals the same way it
+    // converges on favorite/archived flags. Age-based GC never records here.
+    pub deletions: Arc<DeletionStore>,
     // The registered APNs device token (single user). Always present so device
     // registration works even when push is off; persisted to the state dir.
     pub devices: Arc<DeviceStore>,
@@ -72,6 +79,8 @@ impl AppState {
         let device_file = cfg.device_file();
         let titles_file = cfg.titles_file();
         let flags_file = cfg.flags_file();
+        let deletions_file = cfg.deletions_file();
+        let deletion_retention_ms = deletion_retention_ms(cfg.session_ttl_days);
         let context_file = cfg.context_file();
         let context_enabled = cfg.context_carry;
         let meal_corrections = Arc::new(MealCorrectionsQueue::from_cfg(&cfg));
@@ -86,6 +95,7 @@ impl AppState {
             limiter,
             titles: Arc::new(TitleStore::new(titles_file)),
             flags: Arc::new(FlagStore::new(flags_file)),
+            deletions: Arc::new(DeletionStore::new(deletions_file, deletion_retention_ms)),
             devices: Arc::new(DeviceStore::new(device_file)),
             notify: Arc::new(NotifyFlags::new()),
             apns: None,

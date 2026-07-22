@@ -54,6 +54,33 @@ CI both run it). See the "Versioning" section of `bridge/README.md`.
     threads it already has (matched by `session_id`); it does not adopt brand-new
     bridge sessions into the phone's list.
 
+## [Bridge 0.26.0] - 2026-07-22
+
+### Added
+- **The bridge now records a durable deletion tombstone when a client explicitly
+  deletes a session, and exposes recent tombstones as a `deleted` array on
+  `GET /jesse/sessions`, so every device converges on removals the same way it
+  already converges on favorite and archived flags.** Deleting a session already
+  reclaimed its transcript, but a device that adopted that session earlier got no
+  signal and kept a stale local copy. A new durable per-session tombstone store
+  (`bridge/src/deletionstore.rs`, modeled on the flags store) maps
+  `session_id -> deleted_ms` (unix millis of the delete), persisted atomically to
+  `<state_dir>/deletions.json` (mode 0600, in-memory only when no state dir is
+  configured), tolerant of missing or unknown fields, and pruned to a bounded
+  retention window on load and on every write.
+  - **Recorded on explicit delete only, never on GC.** `DELETE /jesse/session/{id}`
+    records a tombstone on both the deleted and already-gone outcomes (idempotent: a
+    repeat just refreshes the millis). Age-based session GC deliberately records
+    nothing, so a device merely offline while a session aged out keeps its local copy.
+  - **Bounded retention.** Tombstones older than the retention window (the config
+    session TTL, or a 30 day fallback when no TTL is set) are pruned on load and on
+    write, so `deletions.json` stays small.
+  - **Additive and backward compatible.** The `deleted` array rides inside the same
+    `GET /jesse/sessions` body, so the existing strong ETag already covers it (a new
+    tombstone changes the ETag and invalidates a cached 304). An app built before this
+    decodes only `sessions` and is unaffected; a bridge with no tombstones returns an
+    empty `deleted` array. The app consumes this in a later release.
+
 ## [Bridge 0.25.0] - 2026-07-21
 
 ### Added

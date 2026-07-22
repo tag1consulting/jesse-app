@@ -190,6 +190,9 @@ pub fn run_session_gc(cfg: &Config, titles: &TitleStore, flags: &FlagStore) {
     for (id, _age) in &reclaimed {
         titles.remove(id);
         flags.remove(id);
+        // GC intentionally records NO deletion tombstone: a device merely offline while
+        // a session aged out must keep its local copy, so only an explicit user delete
+        // (jesse_session_delete) records one.
     }
     if !reclaimed.is_empty() {
         eprintln!(
@@ -521,8 +524,12 @@ pub async fn jesse_sessions(
 
     let dir = st.sessions_dir();
     let sessions = list_sessions(&dir, params.since, &st.titles, &st.flags);
-    let body = serde_json::to_string(&json!({ "sessions": sessions }))
-        .unwrap_or_else(|_| r#"{"sessions":[]}"#.to_string());
+    // Recent deletion tombstones ride inside the same body, so the existing strong
+    // ETag covers them automatically (a new tombstone changes the body → the ETag →
+    // invalidates a cached 304). Additive: an old app decodes only `sessions`.
+    let deleted = st.deletions.recent(system_time_to_ms(SystemTime::now()));
+    let body = serde_json::to_string(&json!({ "sessions": sessions, "deleted": deleted }))
+        .unwrap_or_else(|_| r#"{"sessions":[],"deleted":[]}"#.to_string());
     let etag = strong_etag(&body);
 
     // If-None-Match → 304 with the ETag and no body.
@@ -763,6 +770,11 @@ pub async fn jesse_session_delete(
             // titles.json / flags.json and resurrect a stale title or favorite.
             st.titles.remove(&session_id);
             st.flags.remove(&session_id);
+            // Record a durable deletion tombstone: this is a user-intent delete, so a
+            // device that adopted this session earlier must learn to drop it. Only the
+            // explicit delete route records here; age-based GC never does.
+            st.deletions
+                .record(&session_id, system_time_to_ms(SystemTime::now()));
             eprintln!("jesse-bridge: deleted session {session_id}");
             Ok(StatusCode::NO_CONTENT)
         }
@@ -770,6 +782,11 @@ pub async fn jesse_session_delete(
             // Idempotent: unknown / already-gone is success, not an error.
             st.titles.remove(&session_id);
             st.flags.remove(&session_id);
+            // Still a user-intent delete (a retry of the drainer, or a delete of an id
+            // whose file is already gone), so record the tombstone here too. Idempotent:
+            // it just refreshes the millis on a repeat.
+            st.deletions
+                .record(&session_id, system_time_to_ms(SystemTime::now()));
             eprintln!("jesse-bridge: session {session_id} already gone — no-op (idempotent)");
             Ok(StatusCode::NO_CONTENT)
         }
