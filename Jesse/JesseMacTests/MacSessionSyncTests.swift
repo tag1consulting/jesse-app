@@ -63,7 +63,7 @@ final class MacSessionSyncTests: XCTestCase {
     private func makeCoordinator(_ fake: FakeBridgeClient,
                                  deletion: PendingSessionDeletionStore) -> MacCoordinator {
         MacCoordinator(configStore: MacConfigStore(config: JesseConfig(host: "studio", port: 8765, token: "tok")),
-                       makeFlagClient: { _ in fake },
+                       makeClient: { _ in fake },
                        sessionDeletionStore: deletion)
     }
 

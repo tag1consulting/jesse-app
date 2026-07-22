@@ -15,6 +15,45 @@ CI both run it). See the "Versioning" section of `bridge/README.md`.
 
 ## [Unreleased]
 
+## [App 1.0 (69)] - 2026-07-22
+
+### Fixed
+- **The macOS client is usable again.** A cluster of Mac-only regressions left the app
+  unable to load old conversations, reach Settings, start a new chat, or open the Health
+  tab. Root-caused and fixed, each pinned by a test that fails before the fix and passes
+  after. The fixes are Mac-only; no shared package source changed, so iOS and watch are
+  untouched. The only shared-package addition is one layout regression test.
+  - **Bridge pairing survives the shared-config migration.** When the Mac adopted the shared
+    `KeychainConfigStore` (App 1.0 (61)), the Keychain account for the token changed
+    (`bridge-token` -> `token`) and the host/port moved out of UserDefaults, with no
+    migration. A previously-paired user then loaded an EMPTY config, so the whole app read
+    as unconfigured: transcripts would not hydrate, New Chat was disabled, and the Health
+    tab dead-ended at "not paired" with no way in. `MacConfigStore` now recovers a
+    pre-1.0(61) pairing once, on first launch, and rewrites it under the shared accounts.
+    The exact Keychain service and account keys are pinned by a test so they cannot silently
+    change again.
+  - **Settings is reachable from anywhere.** The app had no macOS `Settings` scene and no
+    settings command, so there was no "Settings…" menu item and no working system shortcut,
+    and the only in-window entry point lived on the Chats sidebar toolbar (useless from the
+    Health tab or an unconfigured window). Added a first-class `Settings` scene, so the
+    standard menu item and shortcut are always present, plus an in-tab Settings button on
+    Health and routing from the empty states. Every in-window affordance opens the one
+    settings surface.
+  - **The Health tab no longer dead-ends.** When unconfigured it showed "pair in Settings"
+    with no button and no route; it now carries a Settings button of its own.
+  - **New Chat and hydration follow the restored configuration.** With the pairing recovered,
+    New Chat re-enables and opening a conversation hydrates its transcript (full on first
+    open, byte-delta after), as designed.
+  - **Same-titled conversations stay distinct.** Verified (not assumed): adoption and the
+    shared `threadListLayout` key on session id and object identity, never on title, so two
+    conversations that share a name render as two rows. Pinned end to end on the Mac and in
+    the shared layout so a future change cannot collapse them.
+  - **Testability.** `MacConfigStore` and `MacCoordinator`'s send/hydrate client are now
+    injectable, so the coordinator can be driven end to end from a fake. A `nonisolated
+    deinit` on `MacConfigStore` avoids the MainActor isolated-deinit abort under test. The
+    macOS suite grows from pure-helper coverage to config, hydration, adoption, and gating
+    coverage.
+
 ## [App 1.0 (68)] - 2026-07-22
 
 ### Added

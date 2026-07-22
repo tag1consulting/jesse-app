@@ -42,8 +42,12 @@ struct MacRootView: View {
     /// and orders them, and the @Query just keeps the set live as the store changes.
     @Query(sort: \JesseThread.updatedAt, order: .reverse) private var threads: [JesseThread]
 
+    /// Opens the macOS Settings scene (see `JesseMacApp`). Used for every in-window route
+    /// to Settings so there is a single settings surface, reachable even when the sidebar
+    /// toolbar is not (an unconfigured window, or the Health tab).
+    @Environment(\.openSettings) private var openSettings
+
     @State private var selection: UUID?
-    @State private var showingSettings = false
     /// Scope (all / favorites / archived) + folder-expansion state + the two-tier
     /// search, wrapping the shared layout. The production on-device expander is
     /// injected HERE, in the view, on purpose: the view model defaults to the inert
@@ -115,16 +119,13 @@ struct MacRootView: View {
                         .id(thread.id)
                 } else {
                     MacEmptyDetail(configured: coordinator.configStore.isConfigured) {
-                        showingSettings = true
+                        openSettings()
                     }
                 }
             }
         }
         .safeAreaInset(edge: .top) {
             if storeError != nil { MacStoreErrorBanner() }
-        }
-        .sheet(isPresented: $showingSettings) {
-            MacSettingsView(configStore: coordinator.configStore)
         }
         .task {
             await coordinator.refreshSessions(context: context)
@@ -187,8 +188,10 @@ struct MacRootView: View {
                 }
                 .keyboardShortcut("a", modifiers: [.command, .shift])
                 .disabled(selectedThread == nil)
-                Button { showingSettings = true } label: { Label("Settings", systemImage: "gearshape") }
-                    .keyboardShortcut(",", modifiers: .command)
+                // Opens the shared Settings scene. The scene owns the standard ⌘, shortcut
+                // globally, so this button carries none of its own (a second ⌘, binding
+                // would just shadow the system one).
+                Button { openSettings() } label: { Label("Settings", systemImage: "gearshape") }
             }
         }
     }

@@ -47,6 +47,19 @@ struct JesseMacApp: App {
         }
         .defaultSize(width: 1000, height: 700)
         .modelContainer(store.container)
+
+        // A first-class macOS Settings scene. This is what puts the standard "Settings…"
+        // item in the app menu (with the system ⌘, shortcut) and makes bridge pairing
+        // reachable from ANYWHERE: either tab, and crucially while the app is still
+        // unconfigured. Without it there was no menu-bar Settings at all, so an unpaired or
+        // migration-orphaned user had no way in: the Chats sidebar toolbar was the only
+        // entry point, and it is useless from the Health tab or an empty window. The
+        // in-window affordances (the sidebar gear, the empty-state button, the Health
+        // toolbar button) all open THIS scene via `openSettings`, so there is one settings
+        // surface, always available.
+        Settings {
+            MacSettingsView(configStore: configStore)
+        }
     }
 
     private static func notificationTitle(_ thread: JesseThread) -> String {
