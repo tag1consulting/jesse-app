@@ -29,6 +29,12 @@ final class MacConfigStore {
         self.config = KeychainConfigStore(service: Self.keychainService).load()
     }
 
+    /// Test seam: build a store with a fixed config, bypassing the Keychain load so a unit
+    /// test can drive a configured coordinator without touching the login keychain.
+    init(config: JesseConfig) {
+        self.config = config
+    }
+
     var isConfigured: Bool { config.isConfigured }
 
     /// Persist a new config: sanitize the host, lift an embedded port, and store all three

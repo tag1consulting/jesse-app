@@ -103,6 +103,9 @@ struct ThreadDetailView: View {
                     } catch {
                         Log.run.error("favorite toggle save failed: \(error.localizedDescription)")
                     }
+                    // Best-effort mirror to the bridge so the Mac converges; self-healing
+                    // if it fails (see RunCoordinator.pushFavoriteChange).
+                    coordinator.pushFavoriteChange(for: thread)
                 } label: {
                     Label(thread.isFavorite ? "Unfavorite" : "Favorite",
                           systemImage: thread.isFavorite ? "star.fill" : "star")

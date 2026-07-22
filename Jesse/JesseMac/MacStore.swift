@@ -84,8 +84,17 @@ final class MacCoordinator {
         set { UserDefaults.standard.set(newValue, forKey: "sessions.etag") }
     }
 
-    init(configStore: MacConfigStore) {
+    /// Builds the client the flag-sync path uses (session list + `setFlags`). Injected as
+    /// a seam so a test drives it with a fake `BridgeClientProtocol`; production builds the
+    /// real shared client from the current config. Kept separate from the send-path
+    /// `client` so this injection is additive and touches nothing about turn running.
+    private let makeFlagClient: @MainActor (JesseConfig) -> any BridgeClientProtocol
+
+    init(configStore: MacConfigStore,
+         makeFlagClient: @escaping @MainActor (JesseConfig) -> any BridgeClientProtocol
+            = { JesseBridgeClient(config: $0) }) {
         self.configStore = configStore
+        self.makeFlagClient = makeFlagClient
     }
 
     private var client: JesseBridgeClient { JesseBridgeClient(config: configStore.config) }
@@ -271,24 +280,27 @@ final class MacCoordinator {
     // MARK: Session-list sync
 
     /// Reconcile `GET /jesse/sessions` into local threads: adopt phone-started threads,
-    /// refresh server-authoritative titles. ETag-conditioned, so an unchanged list is a
-    /// cheap 304.
+    /// refresh server-authoritative titles, and converge the favorite/archive flags across
+    /// devices (last-writer-wins; see `FlagReconciler`). ETag-conditioned, so an unchanged
+    /// list is a cheap 304.
     func refreshSessions(context: ModelContext) async {
         guard configStore.isConfigured else { return }
+        let cli = makeFlagClient(configStore.config)
         do {
-            switch try await client.listSessions(etag: sessionsETag) {
+            switch try await cli.listSessions(since: nil, etag: sessionsETag) {
             case .notModified:
                 return
             case let .sessions(list, etag):
                 sessionsETag = etag
-                upsert(list, context: context)
+                await upsert(list, client: cli, context: context)
             }
         } catch {
             lastError = Self.friendly(error)
         }
     }
 
-    private func upsert(_ list: [SessionSummary], context: ModelContext) {
+    private func upsert(_ list: [SessionSummary], client cli: any BridgeClientProtocol,
+                        context: ModelContext) async {
         // Index existing threads that carry a session id.
         let existing = (try? context.fetch(FetchDescriptor<JesseThread>())) ?? []
         var bySession: [String: JesseThread] = [:]
@@ -296,12 +308,14 @@ final class MacCoordinator {
 
         for s in list {
             let stamp = Date(timeIntervalSince1970: TimeInterval(s.lastModified))
+            let thread: JesseThread
             if let t = bySession[s.sessionId] {
                 if let title = s.title, !title.isEmpty { t.aiTitle = title }
                 if t.title.isEmpty, let fm = s.firstMessage {
                     t.title = JesseThread.deriveTitle(from: fm)
                 }
                 if stamp > t.updatedAt { t.updatedAt = stamp }
+                thread = t
             } else {
                 let derived = s.firstMessage.map { JesseThread.deriveTitle(from: $0) } ?? ""
                 let t = JesseThread(title: derived, mode: .ask, createdAt: stamp)
@@ -309,9 +323,41 @@ final class MacCoordinator {
                 t.aiTitle = s.title
                 t.updatedAt = stamp
                 context.insert(t)
+                thread = t
             }
+            // Converge favorite/archive last-writer-wins. A freshly-created thread has
+            // zero-clocks, so this simply adopts whatever the server holds (and never
+            // spuriously pushes, since a zero local clock is never strictly newer).
+            await FlagReconciler.reconcile(
+                thread: thread,
+                serverFavorite: s.favorite, serverFavoriteUpdatedMs: Int(s.favoriteUpdatedMs),
+                serverArchived: s.archived, serverArchivedUpdatedMs: Int(s.archivedUpdatedMs),
+                client: cli)
         }
         try? context.save()
+    }
+
+    // MARK: Flag push
+
+    /// Optimistic best-effort push of a just-toggled FAVORITE up to the bridge so the
+    /// phone converges on its next sync. No-op for a thread with no `session_id`. A failed
+    /// push is swallowed: the local `favoriteUpdatedMs` is now newer than the server, so
+    /// the next `refreshSessions` reconcile re-pushes it (the LWW reconcile self-heals, so
+    /// no retry queue is needed and a failure never surfaces to the user).
+    func pushFavoriteChange(for thread: JesseThread) {
+        guard let sid = thread.sessionId, !sid.isEmpty else { return }
+        let write = FlagWrite(value: thread.isFavorite, updatedMs: thread.favoriteUpdatedMs)
+        let cli = makeFlagClient(configStore.config)
+        Task { try? await cli.setFlags(sessionId: sid, favorite: write, archived: nil) }
+    }
+
+    /// Optimistic best-effort push of a just-toggled ARCHIVE up. Mirror of
+    /// `pushFavoriteChange`; same self-healing best-effort semantics.
+    func pushArchivedChange(for thread: JesseThread) {
+        guard let sid = thread.sessionId, !sid.isEmpty else { return }
+        let write = FlagWrite(value: thread.isArchived, updatedMs: thread.archivedUpdatedMs)
+        let cli = makeFlagClient(configStore.config)
+        Task { try? await cli.setFlags(sessionId: sid, favorite: nil, archived: write) }
     }
 
     // MARK: Helpers

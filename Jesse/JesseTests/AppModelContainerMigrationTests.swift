@@ -115,6 +115,8 @@ final class AppModelContainerMigrationTests: XCTestCase {
         let fav = try XCTUnwrap(favorites.first)
         XCTAssertEqual(fav.id, favThreadId)
         XCTAssertEqual(fav.favoritedAt, favoritedAt, "favoritedAt is preserved")
+        XCTAssertEqual(fav.favoriteUpdatedMs, JesseThread.unixMillis(favoritedAt),
+                       "the favorite LWW-sync clock persists")
         XCTAssertEqual(fav.aiTitle, "AI-minted title")
         XCTAssertEqual(fav.titleSourceKey, "content-key-1")
         XCTAssertEqual(fav.originValue, .watch, "origin is preserved")
@@ -170,6 +172,8 @@ final class AppModelContainerMigrationTests: XCTestCase {
             FetchDescriptor<JesseThread>(predicate: #Predicate { $0.isArchived }))
         XCTAssertEqual(archived.map(\.id), [favThreadId], "the archived flag persists")
         XCTAssertEqual(archived.first?.archivedAt, archivedAt, "archivedAt persists")
+        XCTAssertEqual(archived.first?.archivedUpdatedMs, JesseThread.unixMillis(archivedAt),
+                       "the archive LWW-sync clock persists")
         XCTAssertEqual(item.orderedAttachments.first?.data, originalBytes,
                        "the ORIGINAL full-resolution bytes round-trip through OutboxAttachment")
     }
@@ -220,6 +224,11 @@ final class AppModelContainerMigrationTests: XCTestCase {
         XCTAssertEqual(t.originValue, .watch, "origin survives the open")
         XCTAssertFalse(t.isArchived, "the added isArchived column defaults to false")
         XCTAssertNil(t.archivedAt, "the added archivedAt column defaults to nil")
+        // The favorite/archive LWW-sync clocks are additive columns too: a store written
+        // before they existed opens with them reading their 0 default, which the
+        // reconciler treats as "unset" (equal to an unflagged server session's 0).
+        XCTAssertEqual(t.favoriteUpdatedMs, 0, "the added favoriteUpdatedMs column defaults to 0")
+        XCTAssertEqual(t.archivedUpdatedMs, 0, "the added archivedUpdatedMs column defaults to 0")
     }
 
     func testFailedOpenIsFlaggedAndLeavesTheOnDiskFileIntact() throws {

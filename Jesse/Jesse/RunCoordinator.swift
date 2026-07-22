@@ -609,6 +609,100 @@ final class RunCoordinator {
         }
     }
 
+    // MARK: - Session-list flag sync
+
+    /// The last ETag from `GET /jesse/sessions`, so an unchanged list is a cheap 304.
+    /// Kept in UserDefaults (a tiny string), not the model store, since this is transient
+    /// sync state, not conversation data.
+    private var sessionsETag: String? {
+        get { UserDefaults.standard.string(forKey: "jesse.sessions.etag") }
+        set { UserDefaults.standard.set(newValue, forKey: "jesse.sessions.etag") }
+    }
+
+    /// Pull `GET /jesse/sessions` and reconcile the server-authoritative favorite/archive
+    /// flags into local threads, cache-first and last-writer-wins (see `FlagReconciler`).
+    /// This is the iOS half of cross-device flag convergence, the mirror of the Mac's
+    /// `MacStore` session-list sync: a star or archive made on the Mac lands here, and a
+    /// change made here that is newer than the server is pushed back up.
+    ///
+    /// Scoped to threads this device already has (matched by `session_id`): it refreshes
+    /// their bridge title and reconciles their flags, but does NOT adopt brand-new bridge
+    /// sessions into the phone's list. The phone shows the conversations it started, and
+    /// convergence applies to the ones that exist on both devices. Best-effort throughout:
+    /// an unreachable or pre-0.25.0 bridge, or any failure, is swallowed (logged, never a
+    /// user error); the next pass retries, and a local change simply keeps winning until
+    /// it syncs.
+    func refreshSessions(context: ModelContext) async {
+        let config = configProvider()
+        guard config.isConfigured else { return }
+        let client = makeClient(config)
+        do {
+            switch try await client.listSessions(etag: sessionsETag) {
+            case .notModified:
+                return
+            case let .sessions(list, etag):
+                sessionsETag = etag
+                await reconcileSessionFlags(list, client: client, context: context)
+            }
+        } catch {
+            Log.run.debug("sessions refresh failed: \(error.localizedDescription)")
+        }
+    }
+
+    /// Merge a fetched session list into local threads: for each summary that matches a
+    /// local thread by `session_id`, refresh the cached bridge title and reconcile its
+    /// favorite/archive flags. Saves once if anything changed.
+    private func reconcileSessionFlags(_ list: [SessionSummary],
+                                       client: any JesseClientProtocol,
+                                       context: ModelContext) async {
+        let existing = (try? context.fetch(FetchDescriptor<JesseThread>())) ?? []
+        var bySession: [String: JesseThread] = [:]
+        for t in existing { if let sid = t.sessionId, !sid.isEmpty { bySession[sid] = t } }
+
+        var changed = false
+        for s in list {
+            guard let thread = bySession[s.sessionId] else { continue }
+            if let title = s.title, !title.isEmpty, thread.aiTitle != title {
+                thread.aiTitle = title
+                changed = true
+            }
+            let didChange = await FlagReconciler.reconcile(
+                thread: thread,
+                serverFavorite: s.favorite, serverFavoriteUpdatedMs: Int(s.favoriteUpdatedMs),
+                serverArchived: s.archived, serverArchivedUpdatedMs: Int(s.archivedUpdatedMs),
+                client: client)
+            changed = changed || didChange
+        }
+        if changed {
+            do { try save(context) } catch {
+                Log.run.error("sessions flag reconcile save failed: \(error.localizedDescription)")
+            }
+        }
+    }
+
+    /// Optimistic best-effort push of a just-toggled FAVORITE up to the bridge. The local
+    /// write already happened (cache-first, the view saved it); this mirrors it up so the
+    /// other device converges on the next sync. No-op for a thread with no `session_id`
+    /// (purely local until its first reply lands). A failed push is intentionally
+    /// swallowed: the local `favoriteUpdatedMs` is now newer than the server, so the next
+    /// `refreshSessions` reconcile re-pushes it (the LWW reconcile is self-healing), so no
+    /// durable retry queue is needed and a failure never surfaces to the user.
+    func pushFavoriteChange(for thread: JesseThread) {
+        guard let sid = thread.sessionId, !sid.isEmpty else { return }
+        let write = FlagWrite(value: thread.isFavorite, updatedMs: thread.favoriteUpdatedMs)
+        let client = makeClient(configProvider())
+        Task { try? await client.setFlags(sessionId: sid, favorite: write, archived: nil) }
+    }
+
+    /// Optimistic best-effort push of a just-toggled ARCHIVE up to the bridge. Mirror of
+    /// `pushFavoriteChange`; same self-healing best-effort semantics.
+    func pushArchivedChange(for thread: JesseThread) {
+        guard let sid = thread.sessionId, !sid.isEmpty else { return }
+        let write = FlagWrite(value: thread.isArchived, updatedMs: thread.archivedUpdatedMs)
+        let client = makeClient(configProvider())
+        Task { try? await client.setFlags(sessionId: sid, favorite: nil, archived: write) }
+    }
+
     /// Manually retry a `.failed` outbox message — NEVER automatic. Re-runs the
     /// transmit with the SAME `OutboxItem` (same `request_id`, so the bridge dedups
     /// if the original POST actually landed), reusing the existing user `Turn` — never

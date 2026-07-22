@@ -55,7 +55,8 @@ struct ThreadListView: View {
     /// The orthogonal filters the current scope maps to, so the pure
     /// `threadListLayout` and the empty-state checks stay expressed in the same
     /// favorites/origin/archived terms. Archived is its own flat view; every other
-    /// scope excludes archived threads (archiving is local, never bridge-synced).
+    /// scope excludes archived threads (archiving is local-first, converged across
+    /// devices by the bridge flags).
     private var favoritesOnly: Bool { scope == .favorites }
     private var originScope: ThreadOriginScope { scope == .watch ? .watch : .all }
     private var archivedOnly: Bool { scope == .archived }
@@ -332,7 +333,7 @@ struct ThreadListView: View {
                 .tint(.yellow)
                 // Archive / Unarchive. Hides the thread from All / Favorites / Watch
                 // (or restores it from Archived) without touching deletion: the
-                // thread and its turns stay put. Local to this device only.
+                // thread and its turns stay put. Local-first, converged across devices.
                 Button { toggleArchived(thread) } label: {
                     Label(thread.isArchived ? "Unarchive" : "Archive",
                           systemImage: thread.isArchived ? "tray.and.arrow.up" : "archivebox")
@@ -377,12 +378,17 @@ struct ThreadListView: View {
         } catch {
             Log.run.error("favorite toggle save failed: \(error.localizedDescription)")
         }
+        // Best-effort mirror of the local change to the bridge so the Mac converges.
+        // Never blocks the toggle and never surfaces an error; self-healing via the next
+        // sessions-sync reconcile if it fails (see RunCoordinator.pushFavoriteChange).
+        coordinator.pushFavoriteChange(for: thread)
     }
 
-    /// Archive or restore a conversation. Purely local: it flips `isArchived`
+    /// Archive or restore a conversation. Local-first: it flips `isArchived`
     /// (stamping/clearing `archivedAt`) so the shared `threadListLayout` hides or
-    /// re-shows the row. Distinct from deletion: no turns are removed and nothing is
-    /// enqueued for remote reclamation; archive state is never synced to the bridge.
+    /// re-shows the row, then best-effort mirrors the change to the bridge so the other
+    /// device converges. Distinct from deletion: no turns are removed and nothing is
+    /// enqueued for remote reclamation.
     private func toggleArchived(_ thread: JesseThread) {
         thread.toggleArchived()
         do {
@@ -390,6 +396,7 @@ struct ThreadListView: View {
         } catch {
             Log.run.error("archive toggle save failed: \(error.localizedDescription)")
         }
+        coordinator.pushArchivedChange(for: thread)
     }
 
     private func newThread() {

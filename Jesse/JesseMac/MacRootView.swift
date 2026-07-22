@@ -316,14 +316,18 @@ struct MacRootView: View {
     private func toggleFavorite(_ thread: JesseThread) {
         listModel.toggleFavorite(thread)
         try? context.save()
+        // Best-effort mirror to the bridge so the phone converges; self-healing if it
+        // fails (see MacCoordinator.pushFavoriteChange).
+        coordinator.pushFavoriteChange(for: thread)
     }
 
-    /// Archive / restore one conversation through the shared seam, then persist. Local
-    /// only: it flips `isArchived` so the shared layout hides or re-shows the row;
-    /// nothing is deleted and nothing is synced to the bridge.
+    /// Archive / restore one conversation through the shared seam, then persist and
+    /// best-effort mirror the change to the bridge so the phone converges. Nothing is
+    /// deleted; the flip just hides or re-shows the row locally.
     private func toggleArchived(_ thread: JesseThread) {
         listModel.toggleArchived(thread)
         try? context.save()
+        coordinator.pushArchivedChange(for: thread)
     }
 
     /// The ⌘⇧A action: archive / restore whatever thread is selected in the sidebar.

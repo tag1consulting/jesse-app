@@ -86,6 +86,9 @@ struct ContentView: View {
         }
         .onAppear {
             coordinator.resume(context: context)
+            // Pull the session list and reconcile favorite/archive flags across devices
+            // (cache-first; a star/archive made on the Mac lands here). Best-effort.
+            Task { await coordinator.refreshSessions(context: context) }
             inbox.drain()
             PushManager.shared.refreshRegistration()
             reachability.refresh(config: config)
@@ -94,6 +97,7 @@ struct ContentView: View {
             switch phase {
             case .active:
                 coordinator.resume(context: context)
+                Task { await coordinator.refreshSessions(context: context) }
                 inbox.drain()
                 // Re-register the device token (covers a token change / bridge
                 // restart / host change since last launch).

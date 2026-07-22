@@ -15,6 +15,45 @@ CI both run it). See the "Versioning" section of `bridge/README.md`.
 
 ## [Unreleased]
 
+## [App 1.0 (67)] - 2026-07-22
+
+### Added
+- **Favorites and archive state now converge across iPhone and Mac.** Starring or
+  archiving a conversation on one device shows up on the other after a sync,
+  cache-first and offline-tolerant, with no user-visible error if a push fails.
+  Requires bridge 0.25.0 for sync to flow; against an older bridge the apps behave
+  exactly as before (local-only flags).
+  - **Cache-first, reconciled last-writer-wins.** The local SwiftData store stays the
+    render source; the bridge is the sync source. A new pure, view-free reconciler
+    (`FlagReconciler` in `JesseCore`) decides per flag: a strictly-newer server
+    timestamp adopts the server value locally, a strictly-newer local timestamp pushes
+    the local value up, and an equal timestamp does nothing: the same strict-greater
+    rule the bridge applies, so both sides converge on one winner. It is called from
+    BOTH apps' session-reconcile path (the Mac's `MacStore` upsert and iOS's new
+    `RunCoordinator.refreshSessions`), so the two behave identically.
+  - **New per-flag LWW clocks.** `JesseThread` gains two additive, defaulted,
+    never-cleared millis clocks (`favoriteUpdatedMs`, `archivedUpdatedMs`) as the
+    last-writer-wins timestamps. The existing `favoritedAt`/`archivedAt` stay
+    display-only (nil when the flag is off), which is why they cannot double as the
+    sync clock: an un-favorite would lose its change time. The new fields lightweight-
+    migrate (no schema version bump); a store written before them reads 0, which the
+    reconciler treats as "unset". Gated by the populated-store migration test.
+  - **Optimistic local write + best-effort push.** Toggling favorite or archive
+    updates the local thread immediately (unchanged), then, if the thread has a
+    `session_id`, fires `setFlags` to the bridge. A failed push never surfaces as a
+    user error: the local clock is now newer than the server, so the next sessions-sync
+    reconcile pushes it again. No durable retry queue is needed, because the LWW
+    reconcile is self-healing. A purely-local thread (no `session_id` yet) stays local until
+    its first reply lands, then syncs.
+  - **Client.** The shared `JesseNetworking` client gains `setFlags`
+    (`POST /jesse/session/{id}/flags`, sending only the changed flag(s) with their
+    millis clocks) and decodes the four new fields on the sessions-list summary; both
+    are behind a `FlagSyncing` seam with a default no-op so fakes and any pre-0.25.0
+    path compile and degrade cleanly (a 404 is a best-effort no-op).
+  - **Scope.** iOS and Mac only; no watch or widgets. The iOS pull reconciles flags on
+    threads it already has (matched by `session_id`); it does not adopt brand-new
+    bridge sessions into the phone's list.
+
 ## [Bridge 0.25.0] - 2026-07-21
 
 ### Added

@@ -23,8 +23,8 @@ struct MacThreadListModel {
     /// rendered as collapsible folders); `.favorites` is just starred conversations
     /// as one flat, newest-first list; `.archived` is just the conversations the user
     /// has hidden from the main list, also flat, and the one place to restore them.
-    /// `.all` and `.favorites` both EXCLUDE archived threads. Archive state is local
-    /// to this device's store, never synced through the bridge, matching favorites.
+    /// `.all` and `.favorites` both EXCLUDE archived threads. Archive state is
+    /// local-first and converged across devices by the bridge flags, matching favorites.
     enum Scope: Hashable {
         case all
         case favorites
@@ -122,15 +122,17 @@ struct MacThreadListModel {
 
     /// Star / unstar a conversation. A thin seam over `JesseThread.toggleFavorite`
     /// so the view's star action has one testable entry point; the view persists the
-    /// context afterwards (this only mutates the model object).
+    /// context and best-effort pushes the change to the bridge afterwards (this only
+    /// mutates the model object).
     func toggleFavorite(_ thread: JesseThread, now: Date = .now) {
         thread.toggleFavorite(now: now)
     }
 
     /// Archive / restore a conversation. A thin seam over `JesseThread.toggleArchived`
     /// (stamping/clearing `archivedAt`) so the view's archive action and its keyboard
-    /// shortcut share one testable entry point; the view persists the context
-    /// afterwards. Local only: archive state is never synced through the bridge.
+    /// shortcut share one testable entry point; the view persists the context and
+    /// best-effort pushes the change to the bridge afterwards. Local-first, converged
+    /// across devices by the bridge flags (last-writer-wins).
     func toggleArchived(_ thread: JesseThread, now: Date = .now) {
         thread.toggleArchived(now: now)
     }
