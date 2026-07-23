@@ -36,3 +36,4 @@ scripts/ci-guards.local.sh
 # Local eval suites pinned to a real vault (real facts, filenames). The shipped
 # vaultqa-example.json is the generic template; real suites live here, gitignored.
 eval/suites/local/
+todo-list/
