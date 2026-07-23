@@ -82,6 +82,20 @@ CI both run it). See the "Versioning" section of `bridge/README.md`.
   selectable). If the active model goes unhealthy the bridge does NOT auto-switch — it keeps
   it active and lets the next turn surface the failure through the existing retry path.
 
+## [App 1.0 (75)] - 2026-07-23
+
+### Changed
+- **Per-conversation, per-device model selection (retiring the global switch).** The model a
+  conversation runs on is now remembered LOCALLY — per thread and per device — and sent as the
+  bridge's per-turn `model` field on every turn, so changing the model in one conversation or
+  on one device no longer switches it everywhere. The compose-bar picker (iPhone and Mac) now
+  sets THIS conversation's model; a new conversation defaults to the last model used on that
+  device (falling back to `opus`). Settings' model section is relabeled "Default model for new
+  conversations" and sets the LOCAL per-device default instead of the bridge's global one — the
+  apps no longer write `POST /jesse/model` from the switcher. Each reply's provenance chip still
+  names the model that actually served it, so a mixed-model thread reads correctly. Per-model
+  write access is unchanged.
+
 ## [App 1.0 (74)] - 2026-07-23
 
 ### Added

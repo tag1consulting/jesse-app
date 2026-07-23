@@ -145,11 +145,15 @@ final class MacCoordinator {
         }
 
         let cli = client
+        // The PER-TURN model this conversation sends on: its own stored selection, else this
+        // device's default (`LastUsedModelStore`). Local to this Mac and this thread — it never
+        // mutates the bridge's global default, so the phone is unaffected. nil → bridge default.
+        let model = thread.selectedModelID ?? LastUsedModelStore.id
         do {
             let result = try await cli.send(
                 mode: mode, text: trimmed, sessionId: thread.sessionId,
                 voice: false, instructions: nil, floorOverride: nil,
-                attachments: [], requestId: UUID().uuidString)
+                attachments: [], requestId: UUID().uuidString, model: model)
             switch result {
             case let .reply(reply, _):
                 await finalize(thread: thread, reply: reply, streamedText: nil,

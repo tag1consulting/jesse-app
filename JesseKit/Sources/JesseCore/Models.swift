@@ -48,6 +48,16 @@ public final class JesseThread {
     public var mode: String = JesseMode.ask.rawValue
     // Bridge session for resume; nil until the first reply lands.
     public var sessionId: String?
+    // The model this conversation sends its turns on (per-turn model selection — the
+    // bridge's `model` request field). PER THREAD and PER DEVICE: changing it here affects
+    // only this conversation on this device, never another thread or another device. A new
+    // conversation is seeded from this device's last-used default (`LastUsedModelStore`),
+    // falling back to the ambient `opus` if none. nil means "unset" — an old thread migrated
+    // from before this property, or a thread that predates any selection — which the send
+    // path resolves to the device default, then `opus`. New optional property with a nil
+    // default → SwiftData lightweight-migrates existing stores with no migration code
+    // (matching `aiTitle`/`origin`/`lastDeliveredJobId`).
+    public var selectedModelID: String?
     // Whether this thread is starred. New property with a default, so SwiftData
     // lightweight-migrates existing stores with no migration code.
     //

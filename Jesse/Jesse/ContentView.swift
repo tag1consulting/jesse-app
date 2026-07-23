@@ -263,10 +263,13 @@ struct SettingsView: View {
     // refreshed on appear and whenever we contact the bridge for defaults.
     @State private var bridgeVersion: String? = BridgeVersionStore.current
 
-    // The global model switch (bridge 0.27.0): the selectable models + active selection,
-    // fetched from the bridge (the source of truth) on open and after a change. `nil` until
-    // loaded / on an older bridge. `switchingModel` disables the rows during a swap.
+    // Per-turn model selection (retire the global switch): the selectable models fetched from
+    // the bridge, used here ONLY to choose this DEVICE's default model for NEW conversations
+    // (`LastUsedModelStore`) — never the bridge's global default. `nil` until loaded / on an
+    // older bridge. `deviceDefaultID` mirrors the per-device default so the checkmark updates
+    // live; `switchingModel` disables the write-toggle rows during a write change.
     @State private var modelState: ModelSwitchState?
+    @State private var deviceDefaultID: String? = LastUsedModelStore.id
     @State private var loadingModels = false
     @State private var switchingModel = false
     @State private var modelsError: String?
@@ -539,18 +542,20 @@ struct SettingsView: View {
         }
     }
 
-    /// The global model switch section: one row per selectable model, the active one
-    /// checked. An unavailable model is disabled with a short reason — "not configured" (no
-    /// token armed) or "unreachable" (its last health probe failed) — so a health change
-    /// shows live. Selecting a model is one tap; the bridge is the source of truth so this
-    /// refetches after a change. Hidden until models load (an older bridge has no route).
+    /// The per-device DEFAULT-model section: one row per selectable model, the current device
+    /// default checked. Selecting a model here sets THIS device's default for NEW conversations
+    /// only (`LastUsedModelStore`) — it never changes the bridge's global default and never
+    /// touches an existing conversation (each thread keeps its own choice, changed from the
+    /// thread's own picker). An unavailable model is disabled with a short reason — "not
+    /// configured" or "unreachable" — so a health change shows live. Hidden until models load
+    /// (an older bridge has no route).
     @ViewBuilder
     private var modelSwitchSection: some View {
         Section {
             if let modelState {
                 ForEach(modelState.models) { model in
                     Button {
-                        selectModel(model)
+                        selectDefaultModel(model)
                     } label: {
                         HStack {
                             VStack(alignment: .leading, spacing: 2) {
@@ -567,13 +572,13 @@ struct SettingsView: View {
                                 }
                             }
                             Spacer()
-                            if model.id == modelState.active {
+                            if model.id == resolvedDefaultID {
                                 Image(systemName: "checkmark")
                                     .foregroundStyle(.tint)
                             }
                         }
                     }
-                    .disabled(!model.available || switchingModel)
+                    .disabled(!model.available)
                 }
             } else if loadingModels {
                 HStack { ProgressView(); Text("Loading models…").foregroundStyle(.secondary) }
@@ -590,9 +595,9 @@ struct SettingsView: View {
                     .foregroundStyle(.red)
             }
         } header: {
-            Text("Model")
+            Text("Default model for new conversations")
         } footer: {
-            Text("Chooses which model answers your conversations (and the sub-agents it runs). The cheap background helpers — titles, diet logging, vault lookups — are unaffected. A non-default model can read your vault but not write it until you enable writes for it. A model that is unreachable or not yet configured is shown disabled.")
+            Text("Sets which model NEW conversations on this device start on (and the sub-agents it runs). Each conversation keeps its own choice — change it from the picker inside a conversation — and this is per device, so your phone and Mac can differ. The cheap background helpers — titles, diet logging, vault lookups — are unaffected. A non-default model can read your vault but not write it until you enable writes for it. A model that is unreachable or not yet configured is shown disabled.")
         }
         // Poll on appear AND on a light interval WHILE this settings screen is visible, so a
         // model going healthy/unhealthy shows up live. The `.task` is cancelled when the view
@@ -700,23 +705,20 @@ struct SettingsView: View {
         }
     }
 
-    /// Make `model` the active model, then refetch so the UI reflects the bridge's truth.
-    /// A no-op on the already-active model or an unavailable one.
-    private func selectModel(_ model: ModelInfo) {
-        guard model.available, model.id != modelState?.active else { return }
-        Task {
-            switchingModel = true
-            defer { switchingModel = false }
-            let cfg = JesseConfig(host: host, port: Int(port) ?? JesseConfig.defaultPort, token: token)
-            do {
-                try await JesseClient(config: cfg).setActiveModel(model.id)
-                modelsError = nil
-            } catch {
-                let detail = (error as? JesseError)?.errorDescription ?? error.localizedDescription
-                modelsError = "Couldn’t switch model. (\(detail))"
-            }
-            await loadModels()
-        }
+    /// The device default shown checked: this device's stored default when it is still
+    /// selectable, else the ambient `opus` (the effective default a new conversation gets).
+    private var resolvedDefaultID: String? {
+        modelState?.resolvedModel(threadModelID: nil, deviceDefaultID: deviceDefaultID)?.id
+    }
+
+    /// Make `model` this DEVICE's default for NEW conversations (`LastUsedModelStore`). Purely
+    /// local — no bridge write — so another device and every existing conversation are
+    /// unaffected. A no-op on an unavailable model.
+    private func selectDefaultModel(_ model: ModelInfo) {
+        guard model.available else { return }
+        LastUsedModelStore.id = model.id
+        deviceDefaultID = model.id
+        modelsError = nil
     }
 
     /// A large, internally-scrollable prompt editor used by every prompt text

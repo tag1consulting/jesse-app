@@ -138,6 +138,28 @@ final class JesseWireContractTests: XCTestCase {
         XCTAssertEqual(try body(r), #"{"mode":"ask","text":"hi"}"#)
     }
 
+    /// The per-turn `model` selection encodes the bridge's `model` key in sorted position.
+    func testModelEncodesToExactBytes() throws {
+        let r = JesseClient.makeRequest(mode: .ask, text: "hi", sessionId: nil, voice: false,
+                                        instructions: nil, floorOverride: nil, attachments: [],
+                                        requestId: nil, model: "glm-5.2")
+        // `.sortedKeys` orders the keys: "mode" < "model" (a prefix) < "text".
+        XCTAssertEqual(try body(r), #"{"mode":"ask","model":"glm-5.2","text":"hi"}"#)
+    }
+
+    /// A nil or blank `model` drops the field — a thread with no selection (and no device
+    /// default) sends byte-for-byte today's request, so the bridge uses its stored default.
+    func testNilAndBlankModelOmittedFromBytes() throws {
+        let none = JesseClient.makeRequest(mode: .ask, text: "hi", sessionId: nil, voice: false,
+                                           instructions: nil, floorOverride: nil, attachments: [],
+                                           requestId: nil, model: nil)
+        XCTAssertEqual(try body(none), #"{"mode":"ask","text":"hi"}"#)
+        let blank = JesseClient.makeRequest(mode: .ask, text: "hi", sessionId: nil, voice: false,
+                                            instructions: nil, floorOverride: nil, attachments: [],
+                                            requestId: nil, model: "   ")
+        XCTAssertEqual(try body(blank), #"{"mode":"ask","text":"hi"}"#)
+    }
+
     /// Response decoding is unchanged by the request_id addition: a 202 still yields
     /// a running job id (the bridge ignores an unknown `request_id`; nothing about
     /// the response shape changed).
