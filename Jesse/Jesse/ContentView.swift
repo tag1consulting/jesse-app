@@ -540,9 +540,10 @@ struct SettingsView: View {
     }
 
     /// The global model switch section: one row per selectable model, the active one
-    /// checked, an unavailable model (e.g. Kimi K3 until a live slug resolves) disabled with
-    /// a "pending" note. Selecting a model is one tap; the bridge is the source of truth so
-    /// this refetches after a change. Hidden until models load (an older bridge has no route).
+    /// checked. An unavailable model is disabled with a short reason — "not configured" (no
+    /// token armed) or "unreachable" (its last health probe failed) — so a health change
+    /// shows live. Selecting a model is one tap; the bridge is the source of truth so this
+    /// refetches after a change. Hidden until models load (an older bridge has no route).
     @ViewBuilder
     private var modelSwitchSection: some View {
         Section {
@@ -555,8 +556,8 @@ struct SettingsView: View {
                             VStack(alignment: .leading, spacing: 2) {
                                 Text(model.label)
                                     .foregroundStyle(model.available ? .primary : .secondary)
-                                if !model.available {
-                                    Text("pending — not yet available")
+                                if let reason = model.unavailableReason {
+                                    Text(reason)
                                         .font(.caption)
                                         .foregroundStyle(.secondary)
                                 } else if !model.isDefault && !model.writesAllowed {
@@ -591,11 +592,28 @@ struct SettingsView: View {
         } header: {
             Text("Model")
         } footer: {
-            Text("Chooses which model answers your conversations (and the sub-agents it runs). The cheap background helpers — titles, diet logging, vault lookups — are unaffected. A non-default model can read your vault but not write it until you enable writes for it.")
+            Text("Chooses which model answers your conversations (and the sub-agents it runs). The cheap background helpers — titles, diet logging, vault lookups — are unaffected. A non-default model can read your vault but not write it until you enable writes for it. A model that is unreachable or not yet configured is shown disabled.")
         }
-        .task { await loadModels() }
+        // Poll on appear AND on a light interval WHILE this settings screen is visible, so a
+        // model going healthy/unhealthy shows up live. The `.task` is cancelled when the view
+        // goes away (Settings dismissed), so polling backs off then — never a tight loop.
+        .task { await pollModelsWhileVisible() }
 
         writeAccessSection
+    }
+
+    /// The health poll cadence while Settings is open — long enough to never be a tight loop.
+    private static let modelPollInterval: Duration = .seconds(25)
+
+    /// Fetch the models on appear, then re-fetch every `modelPollInterval` for as long as this
+    /// view's `.task` lives (SwiftUI cancels it when the view disappears, so this stops when
+    /// Settings closes). Skips a poll mid-swap so a background refresh can't clobber an
+    /// in-flight selection.
+    private func pollModelsWhileVisible() async {
+        while !Task.isCancelled {
+            if !switchingModel { await loadModels() }
+            try? await Task.sleep(for: Self.modelPollInterval)
+        }
     }
 
     /// Phase 2: per-model write access. One toggle per available non-default model; turning
@@ -675,8 +693,10 @@ struct SettingsView: View {
             modelState = try await JesseClient(config: cfg).fetchModels()
             modelsError = nil
         } catch {
-            // An older bridge 404s here; leave the section hidden rather than shouting.
-            modelState = nil
+            // Leave `modelState` as-is: never loaded (older bridge 404s / first poll failed)
+            // → stays nil, so the section stays hidden rather than shouting; already loaded →
+            // KEEP the last-known list so a transient blip during interval polling doesn't
+            // blank a working switcher (the next poll refreshes it).
         }
     }
 

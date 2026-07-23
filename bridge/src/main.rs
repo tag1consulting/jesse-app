@@ -6,8 +6,8 @@ use std::path::Path;
 
 use jesse_bridge::{
     app, binary_exists, build_apns, env_truthy, is_bind_allowed, manual_pairing_lines,
-    pairing_payload, show_token_opt_in, spawn_eviction_task, spawn_session_gc_task, AppState,
-    Config,
+    pairing_payload, show_token_opt_in, spawn_eviction_task, spawn_session_gc_task,
+    start_health_prober, AppState, Config,
 };
 
 #[tokio::main]
@@ -101,6 +101,11 @@ async fn main() {
     // periodic). Scoped to the vault project only; an actively-resumed session
     // touches its mtime and is never reclaimed.
     spawn_session_gc_task(state.cfg.clone(), state.titles.clone(), state.flags.clone());
+    // Health-probe each CONFIGURED non-ambient model on its interval so the apps only offer
+    // models that are reachable right now. A no-op for an opus-only deploy (no targets), so
+    // the health path is entirely absent there. Never blocks a turn (detached tasks); a
+    // probe failure only demotes that model to unhealthy, never disturbs the bridge.
+    start_health_prober(state.health.clone(), &state.cfg.model_registry);
     axum::serve(listener, app(state))
         .await
         .expect("server error");

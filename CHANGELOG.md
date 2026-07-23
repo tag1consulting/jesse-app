@@ -15,6 +15,55 @@ CI both run it). See the "Versioning" section of `bridge/README.md`.
 
 ## [Unreleased]
 
+## [Bridge 0.28.0] - 2026-07-23
+
+### Added
+- **Declarative, health-checked model registry.** The selectable-model registry is no
+  longer a hardcoded four entries. It is MERGED from three sources (later overriding earlier
+  by id): the built-in ambient `opus` (always present, never configurable), the existing
+  `JESSE_MODEL_GLM_* / _KIMI_* / _LOCAL_*` env triples (unchanged), and a new declarative
+  `[[models]]` array in the bridge config file (the same TOML the persona loads from).
+  Adding a model — a second local endpoint, a hosted provider like fireworks.ai, or an
+  OpenAI-style codex behind an Anthropic-surface gateway — is now a pure config edit plus
+  one env var for its token, with no Rust change. A declarative entry names its token env
+  var by NAME (`auth_token_env`); the token is read from the process env at startup and is
+  never written to the config file, `model.json`, or any endpoint response. `jesse.example.toml`
+  documents the schema with `fireworks` and `codex` examples. With no model config the
+  bridge is opus-only and byte-for-byte today's behavior.
+- **Per-model health probing.** A background prober (optional, non-blocking, never logs a
+  token) probes each configured non-ambient model's reachability on an interval (default
+  60s, per-model overridable) with a short timeout (default 3s), caching `{ healthy,
+  checked_at_ms, latency_ms, last_error_class }` per model. Ambient `opus` is healthy by
+  construction and never probed; an opus-only deploy runs no prober at all. Selectability is
+  `configured` (backend/token resolved) AND `healthy` (last probe passed).
+- **Endpoint gating.** `GET /jesse/models` rows now carry `configured`, `healthy`,
+  `available` (= configured AND healthy), `last_checked_ms`, and `latency_ms` (still ids,
+  booleans, enums, and numbers only — never a base URL or token). `POST /jesse/model` now
+  rejects an unconfigured OR unhealthy model with 409 (unknown id still 400; `opus` always
+  selectable). If the active model goes unhealthy the bridge does NOT auto-switch — it keeps
+  it active and lets the next turn surface the failure through the existing retry path.
+
+## [App 1.0 (74)] - 2026-07-23
+
+### Added
+- **Live model health in the switcher (iPhone + Mac).** The Settings model switcher now
+  polls the bridge on a light interval while it is open, so a model going reachable or
+  unreachable shows up live. A model that is not yet configured is disabled as "not
+  configured"; a configured model whose health probe last failed is disabled as
+  "unreachable"; only configured, healthy models are selectable. The shared `ModelInfo` wire
+  type carries the new `configured` / `healthy` / `last_checked_ms` / `latency_ms` fields and
+  degrades cleanly against an older bridge that omits them.
+
+## [App 1.0 (73)] - 2026-07-23
+
+### Added
+- **macOS per-message provenance chip.** A JesseMac reply now shows the same native
+  provenance chip the iPhone has: which model produced the reply and what the turn cost
+  (and a write marker when a non-default writing model produced it). The Mac message store
+  now threads the reply's structured provenance through, persists it so the chip survives a
+  reload, and shows the badge-stripped body so the raw trailing text badge no longer appears.
+  An older-bridge reply with no provenance is shown verbatim with no chip.
+
 ## [App 1.0 (72)] - 2026-07-23
 
 ### Added

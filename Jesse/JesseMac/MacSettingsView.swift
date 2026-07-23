@@ -91,8 +91,10 @@ struct MacSettingsView: View {
         }
     }
 
-    /// The global model switch section: the selectable models, the active one checked, an
-    /// unavailable model disabled with a "pending" note. Mirrors the iPhone's switcher.
+    /// The global model switch section: the selectable models, the active one checked. An
+    /// unavailable model is disabled with a short reason — "not configured" or "unreachable" —
+    /// and the list polls on a light interval while Settings is open so a health change shows
+    /// live. Mirrors the iPhone's switcher.
     @ViewBuilder
     private var modelSwitchSection: some View {
         Section {
@@ -105,8 +107,8 @@ struct MacSettingsView: View {
                             VStack(alignment: .leading, spacing: 2) {
                                 Text(model.label)
                                     .foregroundStyle(model.available ? .primary : .secondary)
-                                if !model.available {
-                                    Text("pending — not yet available")
+                                if let reason = model.unavailableReason {
+                                    Text(reason)
                                         .font(.caption).foregroundStyle(.secondary)
                                 } else if !model.isDefault && !model.writesAllowed {
                                     Text("read-only")
@@ -131,10 +133,25 @@ struct MacSettingsView: View {
         } header: {
             Text("Model")
         } footer: {
-            Text("Chooses which model answers your conversations. The background helpers (titles, diet, vault lookups) are unaffected. A non-default model reads your vault but can't write it until you enable writes for it.")
+            Text("Chooses which model answers your conversations. The background helpers (titles, diet, vault lookups) are unaffected. A non-default model reads your vault but can't write it until you enable writes for it. A model that is unreachable or not yet configured is shown disabled.")
                 .font(.caption).foregroundStyle(.secondary)
         }
-        .task { await loadModels() }
+        // Poll on appear and every `modelPollInterval` while Settings is open; SwiftUI cancels
+        // this `.task` when the sheet closes, so polling backs off then (never a tight loop).
+        .task { await pollModelsWhileVisible() }
+    }
+
+    /// The health poll cadence while Settings is open — long enough to never be a tight loop.
+    private static let modelPollInterval: Duration = .seconds(25)
+
+    /// Fetch on appear, then re-fetch every `modelPollInterval` for as long as this view's
+    /// `.task` lives. Skips a poll mid-swap so a background refresh can't clobber an in-flight
+    /// selection.
+    private func pollModelsWhileVisible() async {
+        while !Task.isCancelled {
+            if !switchingModel { await loadModels() }
+            try? await Task.sleep(for: Self.modelPollInterval)
+        }
     }
 
     /// Phase 2: per-model write access, gated behind a confirmation. Mirrors the iPhone.
@@ -210,7 +227,9 @@ struct MacSettingsView: View {
             modelState = try await modelClient().fetchModels()
             modelsError = nil
         } catch {
-            modelState = nil // older bridge → hide the section
+            // Leave `modelState` as-is: never loaded (older bridge 404s) → stays nil and the
+            // section stays hidden; already loaded → KEEP the last-known list so a transient
+            // blip during interval polling doesn't blank a working switcher.
         }
     }
 

@@ -492,35 +492,83 @@ public struct JesseDeviceRegistration: Encodable {
 /// the other wire types so its `Decodable` conformance stays nonisolated (JesseCore defaults
 /// to MainActor isolation, which a nonisolated client decode cannot use).
 public struct ModelInfo: Decodable, Equatable, Sendable, Identifiable {
-    /// The stable id the switch keys on (`opus`, `glm-5.2`, `kimi-k3`, `local`).
+    /// The stable id the switch keys on (`opus`, `glm-5.2`, `kimi-k3`, `local`, or a
+    /// declarative id like `fireworks` / `codex`).
     public let id: String
     /// The human label shown in the switcher.
     public let label: String
     /// `ambient` | `hosted` | `local` — kept as the raw string so an unknown future kind
     /// still decodes and renders rather than failing.
     public let kind: String
-    /// Whether this model may be selected. An unavailable model (e.g. `kimi-k3` until a live
-    /// slug resolves) shows disabled with a "pending" note.
+    /// Whether this model may be selected RIGHT NOW: the bridge's `available` = `configured`
+    /// AND `healthy`. The switcher renders an unavailable model disabled with `unavailableReason`.
     public let available: Bool
+    /// Whether the model's backend/token RESOLVED (an unconfigured model is `kimi-k3` until a
+    /// live slug is armed, or a declarative entry whose token env var is unset). Defaults to
+    /// `available` against a pre-health bridge that omits it.
+    public let configured: Bool
+    /// Whether the model's last health probe PASSED. Ambient `opus` is always healthy.
+    /// Defaults to `available` against a pre-health bridge that omits it.
+    public let healthy: Bool
+    /// Unix-millis of the model's last health probe, or `nil` (opus / before the first probe /
+    /// older bridge).
+    public let lastCheckedMs: UInt64?
+    /// The last probe's round-trip latency in millis, or `nil` when not reported.
+    public let latencyMs: UInt64?
     /// The effective write permission: the ambient default (`opus`) is always true; every
-    /// other model is false until writes are enabled per model (Phase 2).
+    /// other model is false until writes are enabled per model.
     public let writesAllowed: Bool
 
-    public init(id: String, label: String, kind: String, available: Bool, writesAllowed: Bool) {
+    public init(id: String, label: String, kind: String, available: Bool, writesAllowed: Bool,
+                configured: Bool? = nil, healthy: Bool? = nil,
+                lastCheckedMs: UInt64? = nil, latencyMs: UInt64? = nil) {
         self.id = id
         self.label = label
         self.kind = kind
         self.available = available
+        // Default the health fields to `available` so a construction (or an older bridge that
+        // omits them) behaves exactly as the pre-health `configured ⇒ available` model.
+        self.configured = configured ?? available
+        self.healthy = healthy ?? available
+        self.lastCheckedMs = lastCheckedMs
+        self.latencyMs = latencyMs
         self.writesAllowed = writesAllowed
     }
 
     enum CodingKeys: String, CodingKey {
-        case id, label, kind, available
+        case id, label, kind, available, configured, healthy
+        case lastCheckedMs = "last_checked_ms"
+        case latencyMs = "latency_ms"
         case writesAllowed = "writes_allowed"
+    }
+
+    // Custom decode so the health fields DEFAULT (a pre-health bridge omits them) rather than
+    // fail the whole list decode — the same additive-forward-compatible pattern SessionSummary
+    // uses. `configured`/`healthy` fall back to `available`; the timestamps are optional.
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        id = try c.decode(String.self, forKey: .id)
+        label = try c.decode(String.self, forKey: .label)
+        kind = try c.decode(String.self, forKey: .kind)
+        available = try c.decode(Bool.self, forKey: .available)
+        writesAllowed = try c.decode(Bool.self, forKey: .writesAllowed)
+        configured = try c.decodeIfPresent(Bool.self, forKey: .configured) ?? available
+        healthy = try c.decodeIfPresent(Bool.self, forKey: .healthy) ?? available
+        lastCheckedMs = try c.decodeIfPresent(UInt64.self, forKey: .lastCheckedMs)
+        latencyMs = try c.decodeIfPresent(UInt64.self, forKey: .latencyMs)
     }
 
     /// The ambient default (`opus`) — never applies overrides and is always writes-on.
     public var isDefault: Bool { kind == "ambient" }
+
+    /// A short reason this model is NOT selectable, or `nil` when it is. Distinguishes the two
+    /// disabled states the switcher explains: `not configured` (no token/triple armed) vs
+    /// `unreachable` (configured, but the last health probe failed).
+    public var unavailableReason: String? {
+        if available { return nil }
+        if !configured { return "not configured" }
+        return "unreachable"
+    }
 }
 
 /// The `GET /jesse/models` payload: the active model id plus the selectable models. The

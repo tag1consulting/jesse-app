@@ -1,6 +1,7 @@
 import SwiftUI
 import SwiftData
 import JesseCore
+import JesseNetworking
 
 // One conversation: the transcript (hydrated from the bridge on open, cache-first) plus
 // the live streaming reply and the composer. Resume is implicit — the thread carries a
@@ -133,8 +134,17 @@ struct MacTurnBubble: View {
         } else {
             HStack(alignment: .top, spacing: 10) {
                 jesseGlyph
-                MacMarkdownView(text: turn.text)
-                    .frame(maxWidth: .infinity, alignment: .leading)
+                VStack(alignment: .leading, spacing: 4) {
+                    MacMarkdownView(text: turn.text)
+                    // Native provenance chip under a Jesse reply that carried structured
+                    // provenance (the badge text is already stripped from `turn.text` when
+                    // the reply was ingested). Absent for older / badges-off replies —
+                    // nothing renders there and the text shows verbatim. Mirrors iOS.
+                    if let provenance = JesseProvenance.from(json: turn.provenanceJSON) {
+                        ProvenanceChip(provenance: provenance)
+                    }
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
                 Spacer(minLength: 40)
             }
         }
@@ -172,6 +182,48 @@ struct MacStreamingBubble: View {
             }
             .frame(maxWidth: .infinity, alignment: .leading)
             Spacer(minLength: 40)
+        }
+    }
+}
+
+/// A subtle capsule rendered under a Jesse message when structured provenance is present.
+/// Distinct tint for local vs hosted vs emergency, and a warning state for unverified
+/// citations. This is the macOS-native sibling of the iOS `ProvenanceChip`: both are pure
+/// renderings of the SAME shared `JesseProvenance` presentation helpers (chipTitle /
+/// costLabel / iconName / routeKind / accessibilityText live in JesseNetworking), so the
+/// two chips carry byte-identical content and can never drift on what they show — only the
+/// ~30 lines of SwiftUI live per platform, because there is no shared SwiftUI module the
+/// two app targets both compile (JesseNetworking is view-free by design).
+struct ProvenanceChip: View {
+    let provenance: JesseProvenance
+
+    var body: some View {
+        HStack(spacing: 4) {
+            Image(systemName: provenance.iconName)
+                .font(.caption2)
+            Text(provenance.chipTitle)
+                .font(.caption2.weight(.medium))
+            if let cost = provenance.costLabel {
+                Text(cost)
+                    .font(.caption2)
+                    .foregroundStyle(tint.opacity(0.75))
+            }
+        }
+        .foregroundStyle(tint)
+        .padding(.horizontal, 8)
+        .padding(.vertical, 3)
+        .background(Capsule().fill(tint.opacity(0.14)))
+        .overlay(Capsule().strokeBorder(tint.opacity(0.22), lineWidth: 0.5))
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(provenance.accessibilityText)
+    }
+
+    private var tint: Color {
+        switch provenance.routeKind {
+        case .hosted: return .secondary
+        case .local: return .teal
+        case .emergency: return .orange
+        case .warning: return .red
         }
     }
 }
