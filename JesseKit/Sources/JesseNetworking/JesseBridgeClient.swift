@@ -24,6 +24,13 @@ public protocol BridgeClientProtocol: FlagSyncing, Sendable {
     func send(mode: JesseMode, text: String, sessionId: String?, voice: Bool,
               instructions: String?, floorOverride: String?,
               attachments: [JesseRequest.Attachment], requestId: String?) async throws -> JesseSendResult
+    /// Send carrying the PER-TURN `model` selection (retire the global switch). Additive: a
+    /// default implementation forwards to the no-model `send`, so existing conformers (the Mac
+    /// test fakes) need not implement it; the production client overrides it to pass `model`.
+    func send(mode: JesseMode, text: String, sessionId: String?, voice: Bool,
+              instructions: String?, floorOverride: String?,
+              attachments: [JesseRequest.Attachment], requestId: String?,
+              model: String?) async throws -> JesseSendResult
     func result(jobId: String) async throws -> JesseResultState
     func stream(jobId: String) -> AsyncThrowingStream<JesseStreamEvent, Error>
     func listSessions(since: UInt64?, etag: String?) async throws -> SessionsResult
@@ -34,6 +41,20 @@ public protocol BridgeClientProtocol: FlagSyncing, Sendable {
     func health() async throws -> BridgeHealth
     func fetchDietSnapshot(date: String?) async throws -> DietSnapshot
     func fetchPrompts() async throws -> PromptDefaults
+}
+
+public extension BridgeClientProtocol {
+    /// Default for conformers that predate the per-turn model field (the Mac test fakes):
+    /// forward to the no-model `send`, dropping `model`. The production `JesseBridgeClient`
+    /// overrides this to actually carry the selection.
+    func send(mode: JesseMode, text: String, sessionId: String?, voice: Bool,
+              instructions: String?, floorOverride: String?,
+              attachments: [JesseRequest.Attachment], requestId: String?,
+              model: String?) async throws -> JesseSendResult {
+        try await send(mode: mode, text: text, sessionId: sessionId, voice: voice,
+                       instructions: instructions, floorOverride: floorOverride,
+                       attachments: attachments, requestId: requestId)
+    }
 }
 
 public struct JesseBridgeClient: BridgeClientProtocol {
@@ -114,10 +135,23 @@ public struct JesseBridgeClient: BridgeClientProtocol {
                      floorOverride: String? = nil,
                      attachments: [JesseRequest.Attachment] = [],
                      requestId: String? = nil) async throws -> JesseSendResult {
+        try await send(mode: mode, text: text, sessionId: sessionId, voice: voice,
+                       instructions: instructions, floorOverride: floorOverride,
+                       attachments: attachments, requestId: requestId, model: nil)
+    }
+
+    /// Send a turn naming the PER-TURN `model` (retire the global switch). `model` is
+    /// non-defaulted so it never collides with the no-model overload above; a nil/blank value
+    /// omits the field, so the bridge uses its stored default. The Mac send path calls this.
+    public func send(mode: JesseMode, text: String, sessionId: String?,
+                     voice: Bool, instructions: String?,
+                     floorOverride: String?,
+                     attachments: [JesseRequest.Attachment],
+                     requestId: String?, model: String?) async throws -> JesseSendResult {
         let request = Self.makeRequest(mode: mode, text: text, sessionId: sessionId,
                                        voice: voice, instructions: instructions,
                                        floorOverride: floorOverride, attachments: attachments,
-                                       requestId: requestId)
+                                       requestId: requestId, model: model)
         return try await sendPrepared(request)
     }
 
@@ -542,7 +576,8 @@ public struct JesseBridgeClient: BridgeClientProtocol {
                                    healthContextRequested: Bool? = nil,
                                    healthContextUnavailable: Bool? = nil,
                                    mealCorrectionsAck: Int? = nil,
-                                   requestId: String? = nil) -> JesseRequest {
+                                   requestId: String? = nil,
+                                   model: String? = nil) -> JesseRequest {
         func nonBlank(_ s: String?) -> String? {
             guard let s, !s.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return nil }
             return s
@@ -564,7 +599,10 @@ public struct JesseBridgeClient: BridgeClientProtocol {
             // Only a positive seq is meaningful (0/absent → nothing acked yet).
             mealCorrectionsAck: (mealCorrectionsAck ?? 0) > 0 ? mealCorrectionsAck : nil,
             // The outbox idempotency key; nil drops the field.
-            requestId: requestId)
+            requestId: requestId,
+            // The per-turn model selection; blank collapses to nil so the field drops out
+            // (the bridge then uses its stored default — today's behavior).
+            model: nonBlank(model))
     }
 
     /// Encode a wire body. Optional fields omit when nil. `sortedKeys` makes the byte

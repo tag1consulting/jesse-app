@@ -15,6 +15,20 @@ CI both run it). See the "Versioning" section of `bridge/README.md`.
 
 ## [Unreleased]
 
+## [Bridge 0.30.0] - 2026-07-23
+
+### Added
+- **Per-turn model selection on `POST /jesse/jesse`.** The turn request gains an optional
+  `model` field naming a registry id. When present, that model backs THAT turn only — its
+  `ANTHROPIC_*` backend, subagent model, price deck, and per-model write posture — and it is
+  validated exactly as `POST /jesse/model` BEFORE any admission, job creation, or child spawn
+  (unknown → `400`, unconfigured or unhealthy → `409`, `opus` always allowed), so a bad
+  selection never starts a turn. A per-turn selection NEVER mutates the stored global
+  `active`, so another device's `GET /jesse/models` is untouched. Absent or blank `model`
+  falls back to the stored default, byte-for-byte today's behavior for any older client or
+  non-app caller. This begins retiring the global model switch in favor of a fine-grained,
+  per-conversation, per-device choice the apps make locally.
+
 ## [Bridge 0.29.0] - 2026-07-23
 
 ### Changed
@@ -67,6 +81,20 @@ CI both run it). See the "Versioning" section of `bridge/README.md`.
   rejects an unconfigured OR unhealthy model with 409 (unknown id still 400; `opus` always
   selectable). If the active model goes unhealthy the bridge does NOT auto-switch — it keeps
   it active and lets the next turn surface the failure through the existing retry path.
+
+## [App 1.0 (75)] - 2026-07-23
+
+### Changed
+- **Per-conversation, per-device model selection (retiring the global switch).** The model a
+  conversation runs on is now remembered LOCALLY — per thread and per device — and sent as the
+  bridge's per-turn `model` field on every turn, so changing the model in one conversation or
+  on one device no longer switches it everywhere. The compose-bar picker (iPhone and Mac) now
+  sets THIS conversation's model; a new conversation defaults to the last model used on that
+  device (falling back to `opus`). Settings' model section is relabeled "Default model for new
+  conversations" and sets the LOCAL per-device default instead of the bridge's global one — the
+  apps no longer write `POST /jesse/model` from the switcher. Each reply's provenance chip still
+  names the model that actually served it, so a mixed-model thread reads correctly. Per-model
+  write access is unchanged.
 
 ## [App 1.0 (74)] - 2026-07-23
 

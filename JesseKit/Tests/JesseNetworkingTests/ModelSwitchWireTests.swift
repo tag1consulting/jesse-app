@@ -129,6 +129,48 @@ final class ModelSwitchWireTests: XCTestCase {
         XCTAssertNil(kimi.latencyMs)
     }
 
+    func testPerTurnModelFieldEncodesWhenSetAndOmitsWhenBlank() throws {
+        // The per-turn selection rides the `model` key. A non-blank value encodes it; a nil
+        // or blank value omits the key entirely (the bridge then uses its stored default,
+        // byte-for-byte today's behavior for an older client).
+        func encodedKeys(model: String?) throws -> [String: Any] {
+            let req = JesseBridgeClient.makeRequest(
+                mode: .ask, text: "hi", sessionId: nil, voice: false,
+                instructions: nil, floorOverride: nil, attachments: [], model: model)
+            let data = try JesseBridgeClient.encodeBody(req)
+            return try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
+        }
+        XCTAssertEqual(try encodedKeys(model: "glm-5.2")["model"] as? String, "glm-5.2")
+        XCTAssertNil(try encodedKeys(model: nil)["model"], "nil model omits the key")
+        XCTAssertNil(try encodedKeys(model: "  ")["model"], "blank model omits the key")
+    }
+
+    func testResolvedModelPrefersThreadThenDeviceThenOpus() throws {
+        let json = """
+        {
+          "active": "opus",
+          "models": [
+            { "id": "opus", "label": "Claude Opus", "kind": "ambient", "available": true, "writes_allowed": true },
+            { "id": "glm-5.2", "label": "GLM 5.2", "kind": "hosted", "available": true, "writes_allowed": false },
+            { "id": "down", "label": "Down", "kind": "hosted", "configured": true, "healthy": false,
+              "available": false, "writes_allowed": false }
+          ]
+        }
+        """
+        let state = try JSONDecoder().decode(ModelSwitchState.self, from: Data(json.utf8))
+        // The thread's own selection wins when it is available.
+        XCTAssertEqual(state.resolvedModel(threadModelID: "glm-5.2", deviceDefaultID: "opus")?.id, "glm-5.2")
+        // No thread selection → the device default.
+        XCTAssertEqual(state.resolvedModel(threadModelID: nil, deviceDefaultID: "glm-5.2")?.id, "glm-5.2")
+        // An unavailable stored id is skipped → fall through to opus.
+        XCTAssertEqual(state.resolvedModel(threadModelID: "down", deviceDefaultID: nil)?.id, "opus")
+        // Nothing stored → the ambient default.
+        XCTAssertEqual(state.resolvedModel(threadModelID: nil, deviceDefaultID: nil)?.id, "opus")
+        // Selectable excludes the unhealthy one; menu labels explain the disabled reason.
+        XCTAssertEqual(Set(state.selectable.map(\.id)), ["opus", "glm-5.2"])
+        XCTAssertEqual(state.models.first { $0.id == "down" }?.menuRowLabel, "Down — unreachable")
+    }
+
     func testLocalProvenanceWithoutCostDecodesAndHasNoCostLabel() throws {
         // A local route omits cost_usd; an older bridge omits it too. Both decode cleanly.
         let json = """

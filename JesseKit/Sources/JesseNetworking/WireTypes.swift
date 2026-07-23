@@ -253,11 +253,17 @@ public struct JesseRequest: Encodable, Equatable, Sendable {
     // Idempotency key (the send outbox's `OutboxItem.id`, as a string): the bridge
     // dedups a `POST /jesse` carrying a `request_id` it has already seen.
     public let requestId: String?
+    // Per-turn model selection (retire the global switch): a registry id (`opus`,
+    // `glm-5.2`, `local`, …) that backs THIS turn only. The apps remember it per thread
+    // and per device and send it on every turn; a nil field omits the key, so the bridge
+    // uses its stored default (byte-for-byte today's behavior for an older client).
+    public let model: String?
 
     public init(mode: String, text: String, sessionId: String?, voice: Bool?,
                 instructions: String?, floorOverride: String?, attachments: [Attachment]?,
                 healthContext: String?, healthContextRequested: Bool?,
-                healthContextUnavailable: Bool?, mealCorrectionsAck: Int?, requestId: String?) {
+                healthContextUnavailable: Bool?, mealCorrectionsAck: Int?, requestId: String?,
+                model: String? = nil) {
         self.mode = mode
         self.text = text
         self.sessionId = sessionId
@@ -270,6 +276,7 @@ public struct JesseRequest: Encodable, Equatable, Sendable {
         self.healthContextUnavailable = healthContextUnavailable
         self.mealCorrectionsAck = mealCorrectionsAck
         self.requestId = requestId
+        self.model = model
     }
 
     public struct Attachment: Encodable, Equatable, Sendable {
@@ -298,6 +305,7 @@ public struct JesseRequest: Encodable, Equatable, Sendable {
         case healthContextUnavailable = "health_context_unavailable"
         case mealCorrectionsAck = "meal_corrections_ack"
         case requestId = "request_id"
+        case model
     }
 }
 

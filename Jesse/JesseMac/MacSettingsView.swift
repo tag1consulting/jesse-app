@@ -20,9 +20,12 @@ struct MacSettingsView: View {
     // pure Tier-1 token matching with no on-device model calls.
     @AppStorage("searchExpansionEnabled") private var searchExpansionEnabled = true
 
-    // The global model switch (bridge 0.27.0), mirroring the iPhone's Settings switcher. The
-    // bridge is the source of truth, so both devices converge on one active model.
+    // Per-turn model selection (retire the global switch): the selectable models, used here
+    // ONLY to choose THIS Mac's default model for NEW conversations (`LastUsedModelStore`) —
+    // never the bridge's global default, so the phone is unaffected. `deviceDefaultID` mirrors
+    // the per-device default so the checkmark updates live.
     @State private var modelState: ModelSwitchState?
+    @State private var deviceDefaultID: String? = LastUsedModelStore.id
     @State private var loadingModels = false
     @State private var switchingModel = false
     @State private var modelsError: String?
@@ -91,17 +94,20 @@ struct MacSettingsView: View {
         }
     }
 
-    /// The global model switch section: the selectable models, the active one checked. An
-    /// unavailable model is disabled with a short reason — "not configured" or "unreachable" —
-    /// and the list polls on a light interval while Settings is open so a health change shows
-    /// live. Mirrors the iPhone's switcher.
+    /// The per-device DEFAULT-model section: the selectable models, this Mac's default checked.
+    /// Selecting a model sets THIS Mac's default for NEW conversations only
+    /// (`LastUsedModelStore`) — it never changes the bridge's global default and never touches
+    /// an existing conversation (each thread keeps its own choice, changed from the thread's own
+    /// picker). An unavailable model is disabled with a short reason — "not configured" or
+    /// "unreachable" — and the list polls on a light interval while Settings is open so a health
+    /// change shows live.
     @ViewBuilder
     private var modelSwitchSection: some View {
         Section {
             if let modelState {
                 ForEach(modelState.models) { model in
                     Button {
-                        selectModel(model)
+                        selectDefaultModel(model)
                     } label: {
                         HStack {
                             VStack(alignment: .leading, spacing: 2) {
@@ -116,13 +122,13 @@ struct MacSettingsView: View {
                                 }
                             }
                             Spacer()
-                            if model.id == modelState.active {
+                            if model.id == resolvedDefaultID {
                                 Image(systemName: "checkmark").foregroundStyle(.tint)
                             }
                         }
                     }
                     .buttonStyle(.plain)
-                    .disabled(!model.available || switchingModel)
+                    .disabled(!model.available)
                 }
             } else if loadingModels {
                 HStack { ProgressView().controlSize(.small); Text("Loading models…").foregroundStyle(.secondary) }
@@ -131,9 +137,9 @@ struct MacSettingsView: View {
                 Text(modelsError).font(.callout).foregroundStyle(.red)
             }
         } header: {
-            Text("Model")
+            Text("Default model for new conversations")
         } footer: {
-            Text("Chooses which model answers your conversations. The background helpers (titles, diet, vault lookups) are unaffected. A non-default model reads your vault but can't write it until you enable writes for it. A model that is unreachable or not yet configured is shown disabled.")
+            Text("Sets which model NEW conversations on this Mac start on. Each conversation keeps its own choice — change it from the picker inside a conversation — and this is per device, so your Mac and phone can differ. The background helpers (titles, diet, vault lookups) are unaffected. A non-default model reads your vault but can't write it until you enable writes for it. A model that is unreachable or not yet configured is shown disabled.")
                 .font(.caption).foregroundStyle(.secondary)
         }
         // Poll on appear and every `modelPollInterval` while Settings is open; SwiftUI cancels
@@ -233,20 +239,19 @@ struct MacSettingsView: View {
         }
     }
 
-    private func selectModel(_ model: ModelInfo) {
-        guard model.available, model.id != modelState?.active else { return }
-        Task {
-            switchingModel = true
-            defer { switchingModel = false }
-            do {
-                try await modelClient().setActiveModel(model.id)
-                modelsError = nil
-            } catch {
-                let detail = (error as? JesseError)?.errorDescription ?? error.localizedDescription
-                modelsError = "Couldn’t switch model. (\(detail))"
-            }
-            await loadModels()
-        }
+    /// This Mac's default shown checked: its stored default when still selectable, else the
+    /// ambient `opus` (the effective default a new conversation gets).
+    private var resolvedDefaultID: String? {
+        modelState?.resolvedModel(threadModelID: nil, deviceDefaultID: deviceDefaultID)?.id
+    }
+
+    /// Make `model` this Mac's default for NEW conversations (`LastUsedModelStore`). Purely
+    /// local — no bridge write — so the phone and every existing conversation are unaffected.
+    private func selectDefaultModel(_ model: ModelInfo) {
+        guard model.available else { return }
+        LastUsedModelStore.id = model.id
+        deviceDefaultID = model.id
+        modelsError = nil
     }
 
     private func save() {

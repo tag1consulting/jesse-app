@@ -122,11 +122,13 @@ struct ThreadDetailView: View {
                 .tint(thread.isFavorite ? .yellow : nil)
             }
             ToolbarItem(placement: .topBarTrailing) {
-                // The global model switch, one tap from the conversation: shows the active
-                // model and lets you swap without leaving the thread. Hidden on an older
+                // The PER-CONVERSATION model picker, one tap from the thread: shows the model
+                // THIS conversation will send its next turn on and lets you change it without
+                // leaving the thread. The choice is local — per thread and per device — so it
+                // never affects another conversation or another device. Hidden on an older
                 // bridge (no models route). The next turn uses the new model; earlier turns
                 // keep the model that served them (each reply's chip is authoritative).
-                ModelSwitchMenu()
+                ModelPickerMenu(thread: thread)
             }
             ToolbarItem(placement: .topBarTrailing) {
                 // Share the whole conversation as a role-labeled Markdown
@@ -827,44 +829,53 @@ struct SendButton: View {
     }
 }
 
-/// A compact toolbar affordance for the global model switch, reachable from the
-/// conversation so a swap is one tap. Self-contained: it reads the current bridge config,
-/// fetches the selectable models on appear, and sets the active model on selection (the
-/// bridge is the source of truth, so it refetches after a change). Renders nothing until
-/// models load, so an older bridge (no `/jesse/models`) shows no control.
-private struct ModelSwitchMenu: View {
+/// A compact toolbar affordance for THIS conversation's model, reachable from the thread so a
+/// change is one tap. The selection is LOCAL — stored on the thread (`selectedModelID`) and
+/// per device — so it never mutates the bridge's global default and never affects another
+/// conversation or another device. It fetches the selectable models on appear, shows the model
+/// the next turn will run on (the thread's own choice, else this device's default, else the
+/// ambient `opus`), and on a pick writes the thread's selection and updates this device's
+/// last-used default. Renders nothing until models load, so an older bridge (no
+/// `/jesse/models`) shows no control.
+private struct ModelPickerMenu: View {
+    @Environment(\.modelContext) private var context
+    @Bindable var thread: JesseThread
     @State private var modelState: ModelSwitchState?
-    @State private var switching = false
 
     var body: some View {
         Group {
             if let modelState {
                 Menu {
-                    ForEach(modelState.models) { model in
+                    ForEach(modelState.offered) { model in
                         Button {
                             select(model)
                         } label: {
-                            if model.id == modelState.active {
+                            if model.id == selectedID {
                                 Label(model.label, systemImage: "checkmark")
-                            } else if !model.available {
-                                Text("\(model.label) — pending")
                             } else {
-                                Text(model.label)
+                                // A disabled row still explains WHY (not configured /
+                                // unreachable) via the shared `menuRowLabel`.
+                                Text(model.menuRowLabel)
                             }
                         }
-                        .disabled(!model.available || switching)
+                        .disabled(!model.available)
                     }
                 } label: {
-                    Label(activeLabel(modelState), systemImage: "cpu")
+                    Label(currentLabel, systemImage: "cpu")
                 }
             }
         }
         .task { await load() }
     }
 
-    private func activeLabel(_ state: ModelSwitchState) -> String {
-        state.activeModel?.label ?? state.active
+    /// The model the next turn will run on: the thread's own selection, else this device's
+    /// default, else opus. Nil only before the list loads.
+    private var resolved: ModelInfo? {
+        modelState?.resolvedModel(threadModelID: thread.selectedModelID,
+                                  deviceDefaultID: LastUsedModelStore.id)
     }
+    private var selectedID: String? { resolved?.id }
+    private var currentLabel: String { resolved?.label ?? "Model" }
 
     private func load() async {
         let cfg = ConfigStore.load()
@@ -872,14 +883,17 @@ private struct ModelSwitchMenu: View {
         modelState = try? await JesseClient(config: cfg).fetchModels()
     }
 
+    /// Pick a model for THIS conversation: store it on the thread and make it this device's
+    /// default for the next new conversation. No bridge write — the selection is entirely
+    /// local, so another device is unaffected.
     private func select(_ model: ModelInfo) {
-        guard model.available, model.id != modelState?.active else { return }
-        Task {
-            switching = true
-            defer { switching = false }
-            let cfg = ConfigStore.load()
-            try? await JesseClient(config: cfg).setActiveModel(model.id)
-            await load()
+        guard model.available, model.id != thread.selectedModelID else { return }
+        thread.selectedModelID = model.id
+        LastUsedModelStore.id = model.id
+        do {
+            try context.save()
+        } catch {
+            Log.run.error("selecting model \(model.id) for thread \(thread.id): \(error.localizedDescription)")
         }
     }
 }

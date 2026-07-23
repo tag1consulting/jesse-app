@@ -85,6 +85,12 @@ struct MacThreadDetailView: View {
                 .frame(width: 130)
                 .disabled(running)
 
+                // The PER-CONVERSATION model this thread sends its next turn on. Local to this
+                // Mac and this thread — never the bridge's global default, so the phone is
+                // unaffected. Hidden on an older bridge (no models route).
+                MacModelPickerMenu(thread: thread, config: coordinator.configStore.config)
+                    .disabled(running)
+
                 TextField("Message Jesse…", text: $draft, axis: .vertical)
                     .textFieldStyle(.plain)
                     .lineLimit(1...8)
@@ -113,6 +119,67 @@ struct MacThreadDetailView: View {
         let text = draft
         draft = ""
         Task { await coordinator.send(text: text, mode: mode, thread: thread, context: context) }
+    }
+}
+
+/// The PER-CONVERSATION model picker for the Mac composer. The selection is LOCAL — stored on
+/// the thread (`selectedModelID`) and per device — so it never mutates the bridge's global
+/// default and never affects another conversation or the phone. It fetches the selectable
+/// models on appear, shows the model the next turn will run on (the thread's own choice, else
+/// this Mac's default, else the ambient `opus`), and on a pick writes the thread's selection
+/// and updates this Mac's last-used default. Renders nothing until models load (an older bridge
+/// has no `/jesse/models` route).
+private struct MacModelPickerMenu: View {
+    @Environment(\.modelContext) private var context
+    @Bindable var thread: JesseThread
+    let config: JesseConfig
+    @State private var modelState: ModelSwitchState?
+
+    var body: some View {
+        Group {
+            if let modelState {
+                Menu {
+                    ForEach(modelState.offered) { model in
+                        Button {
+                            select(model)
+                        } label: {
+                            if model.id == selectedID {
+                                Label(model.label, systemImage: "checkmark")
+                            } else {
+                                Text(model.menuRowLabel)
+                            }
+                        }
+                        .disabled(!model.available)
+                    }
+                } label: {
+                    Label(currentLabel, systemImage: "cpu")
+                }
+                .menuStyle(.borderlessButton)
+                .fixedSize()
+            }
+        }
+        .task { await load() }
+    }
+
+    private var resolved: ModelInfo? {
+        modelState?.resolvedModel(threadModelID: thread.selectedModelID,
+                                  deviceDefaultID: LastUsedModelStore.id)
+    }
+    private var selectedID: String? { resolved?.id }
+    private var currentLabel: String { resolved?.label ?? "Model" }
+
+    private func load() async {
+        guard config.isConfigured else { return }
+        modelState = try? await JesseBridgeClient(config: config).fetchModels()
+    }
+
+    /// Pick a model for THIS conversation: store it on the thread and make it this Mac's
+    /// default for the next new conversation. No bridge write — the phone is unaffected.
+    private func select(_ model: ModelInfo) {
+        guard model.available, model.id != thread.selectedModelID else { return }
+        thread.selectedModelID = model.id
+        LastUsedModelStore.id = model.id
+        try? context.save()
     }
 }
 

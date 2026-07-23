@@ -173,6 +173,16 @@ final class RunCoordinator {
         let text: String
         let instructions: String?
         let floorOverride: String?
+        // The PER-TURN model the original turn ran on, so the fulfillment retry answers on
+        // the SAME model. nil → the bridge's stored default.
+        var model: String? = nil
+    }
+
+    /// The PER-TURN model a thread should send on: its own stored selection, else this
+    /// device's last-used default (`LastUsedModelStore`). nil → the bridge uses its stored
+    /// default (opus). Resolved fresh at send time so a Retry/resume picks up any change.
+    private func modelID(for thread: JesseThread) -> String? {
+        thread.selectedModelID ?? LastUsedModelStore.id
     }
 
     // AI-title generation bookkeeping (see `ensureTitle`). Not observed by views —
@@ -477,6 +487,9 @@ final class RunCoordinator {
         // the turn; nil when this mode isn't customized.
         let instructions = instructionsProvider(mode)
         let floorOverride = floorProvider(mode)
+        // Resolve the PER-TURN model on the main actor before detaching — the thread's own
+        // selection, else this device's default. Sent on this turn only; never the global.
+        let model = modelID(for: thread)
         // Reconstitute the outgoing attachments from the persisted ORIGINAL bytes.
         let attachments = item.orderedAttachments.map {
             JesseAttachment(filename: $0.filename, mime: $0.mime, data: $0.data)
@@ -498,7 +511,8 @@ final class RunCoordinator {
                                                    instructions: instructions,
                                                    floorOverride: floorOverride,
                                                    attachments: attachments,
-                                                   requestId: requestId)
+                                                   requestId: requestId,
+                                                   model: model)
                 switch result {
                 case .reply(let reply, _):
                     // ACK (legacy inline 200 — effectively dead against the fixed
@@ -520,7 +534,8 @@ final class RunCoordinator {
                                        voice: voice, client: client, context: context,
                                        retry: HealthRetry(mode: mode, text: text,
                                                           instructions: instructions,
-                                                          floorOverride: floorOverride))
+                                                          floorOverride: floorOverride,
+                                                          model: model))
                 }
             } catch is CancellationError {
                 // Pre-ACK cancel: today this silently cleared, losing the message.
@@ -1121,7 +1136,8 @@ final class RunCoordinator {
         do {
             let result = try await client.sendFulfilling(
                 needs, mode: retry.mode, text: retry.text, sessionId: sessionId, voice: voice,
-                instructions: retry.instructions, floorOverride: retry.floorOverride)
+                instructions: retry.instructions, floorOverride: retry.floorOverride,
+                model: retry.model)
             switch result {
             case .reply(let reply, _):
                 finish(threadID: threadID, thread: thread, reply: Self.appCapped(reply),
@@ -1594,12 +1610,16 @@ extension RunCoordinator {
         let client = makeClient(configProvider())
         let instructions = instructionsProvider(mode)
         let floorOverride = floorProvider(mode)
+        // A relayed watch turn runs on the destination thread's model (its own selection,
+        // else this device's default) exactly like a typed turn.
+        let model = modelID(for: thread)
 
         let outcome: TurnOutcome
         do {
             let result = try await client.send(mode: mode, text: text, sessionId: sessionId,
                                                voice: voice, instructions: instructions,
-                                               floorOverride: floorOverride, attachments: [])
+                                               floorOverride: floorOverride, attachments: [],
+                                               requestId: nil, model: model)
             switch result {
             case .reply(let reply, _):
                 // An older bridge that answered inline. Deliver it directly.

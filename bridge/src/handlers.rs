@@ -60,6 +60,16 @@ pub struct JesseRequest {
     // app builds simply omit it) — every POST is a fresh turn.
     #[serde(default)]
     request_id: Option<String>,
+    // Optional PER-TURN model selection (retire the global switch). Names a registry id
+    // (`opus`, `glm-5.2`, `local`, …); when present that model backs THIS turn only —
+    // its `ANTHROPIC_*` backend, subagent model, price deck, and (per-model) write posture.
+    // Validated exactly as `POST /jesse/model` BEFORE any work: unknown → 400, unconfigured
+    // or unhealthy → 409, `opus` always allowed. A per-turn selection NEVER mutates the
+    // stored global default, so another device's `GET /jesse/models` is untouched. Absent
+    // (or blank) falls back to the stored default — byte-for-byte today's behavior for any
+    // older app build or non-app caller that omits the field.
+    #[serde(default)]
+    model: Option<String>,
 }
 
 /// Validate a POST /jesse idempotency `request_id`: at most 64 characters, ASCII
@@ -384,6 +394,19 @@ pub async fn jesse(
         }
     }
 
+    // Per-turn model selection (retire the global switch). When the request names a `model`,
+    // resolve + validate it HERE — before any admission, job creation, or child spawn — so a
+    // bad selection never starts a turn: an unknown id is a 400 and an unconfigured/unhealthy
+    // id a 409, exactly as `POST /jesse/model` (opus is always allowed, healthy by
+    // construction). The selection backs ONLY this turn and never mutates the stored global
+    // default. Absent or blank `model` falls back to the stored default via
+    // `resolve_active_model`, so an older client that omits the field is byte-for-byte
+    // today's behavior. Resolved once here and moved into the spawned turn task below.
+    let active = match req.model.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        Some(id) => st.resolve_requested_model(id)?,
+        None => st.resolve_active_model(),
+    };
+
     let mode = req.mode.trim().to_lowercase();
     // Kill switch + gate: attempt the local diet-logging pipeline only when a diet
     // backend is configured AND this is a diet-shaped Tell. With no backend this is
@@ -494,12 +517,11 @@ pub async fn jesse(
     let jobs = st.jobs.clone();
     let jid = job_id.clone();
     let sid = req.session_id.clone();
-    // The global model switch: resolve WHICH model backs this turn (id + ANTHROPIC_* env +
-    // subagent model + effective write permission + price deck) from the persisted
-    // selection and the registry, once, before spawning. For the ambient `opus` default
-    // this is byte-for-byte today's turn; a non-ambient model applies its backend to the
-    // main turn and its subagents and (Phase 1) runs read-only.
-    let active = st.resolve_active_model();
+    // `active` (WHICH model backs this turn: id + ANTHROPIC_* env + subagent model +
+    // effective write permission + price deck) was resolved above from the per-turn `model`
+    // field or, absent it, the stored default — moved into the task here. For the ambient
+    // `opus` default this is byte-for-byte today's turn; a non-ambient model applies its
+    // backend to the main turn and its subagents and runs read-only unless writes are enabled.
     // The raw utterance the local diet pipeline parses (distinct from the wrapped
     // `prompt`, which the hosted path — including any diet fall-through — still uses).
     // The vault-QA child answers this same raw question.

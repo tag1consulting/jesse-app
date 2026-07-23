@@ -5354,3 +5354,175 @@ async fn set_model_writes_on_the_default_model_is_rejected() {
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+// ---- Per-turn model selection (the request `model` field) -------------------
+//
+// A turn may name a `model` that backs ONLY that turn (retiring the global switch):
+// it is validated exactly as `POST /jesse/model` (unknown → 400, unhealthy → 409),
+// it badges the chosen model, it never mutates the stored global `active`, and an
+// absent field falls back to the stored default (byte-for-byte today's behavior).
+
+/// Drive one `POST /jesse` turn through `st` to completion and return its poll result.
+/// Mirrors `run_turn_emitting`'s poll loop but over a caller-supplied AppState, so a test
+/// can build its own switch registry + fake claude first.
+async fn drive_turn_to_done(st: &AppState, req_json: &str) -> Value {
+    let resp = app(st.clone())
+        .oneshot(jesse_request(Some("Bearer test-token"), req_json))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::ACCEPTED, "turn accepted");
+    let job_id = body_value(resp).await["job_id"].as_str().unwrap().to_string();
+    for _ in 0..80 {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let v = result_status(st, &job_id).await;
+        if v["status"] == "done" {
+            return v;
+        }
+    }
+    panic!("turn did not complete");
+}
+
+#[tokio::test]
+async fn per_turn_model_badges_that_model_and_leaves_the_global_default_unchanged() {
+    // A turn naming `glm-5.2` runs on glm and badges glm-5.2, while the stored `active`
+    // stays `opus` — a per-turn selection never mutates the global default another device
+    // reads from `GET /jesse/models`.
+    let dir = std::env::temp_dir().join(format!("jesse-model-it-{}", random_hex()));
+    let script = "#!/bin/sh\nprintf '%s' '{\"type\":\"result\",\"is_error\":false,\"result\":\"Answer from glm.\",\"session_id\":\"sess-glm\"}'\n";
+    let fake = write_fake_claude(script);
+    let cfg = Config {
+        claude_bin: fake.to_string_lossy().into_owned(),
+        model_badge: true,
+        timeout_secs: 30,
+        ..cfg_with_switch_registry(&dir)
+    };
+    let st = AppState::new(cfg);
+
+    let v = drive_turn_to_done(&st, r#"{"mode":"ask","text":"hi","model":"glm-5.2"}"#).await;
+    let resp_text = v["response"].as_str().unwrap();
+    assert!(
+        resp_text.starts_with("Answer from glm."),
+        "answer preserved: {resp_text:?}"
+    );
+    assert!(
+        resp_text.contains("[glm-5.2"),
+        "the badge names the per-turn model: {resp_text:?}"
+    );
+    assert_eq!(
+        v["provenance"]["model"], "glm-5.2",
+        "structured provenance names the per-turn model"
+    );
+
+    // The stored global default is untouched by the per-turn selection.
+    let models = app(st.clone())
+        .oneshot(models_request(Some("Bearer test-token")))
+        .await
+        .unwrap();
+    assert_eq!(
+        body_value(models).await["active"],
+        "opus",
+        "a per-turn selection must not mutate the stored global default"
+    );
+
+    let _ = std::fs::remove_file(&fake);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn a_turn_with_no_model_uses_the_stored_default() {
+    // The fallback: with no `model` field the turn uses the stored `active`. Set the stored
+    // default to glm-5.2 first, then a fieldless turn badges glm — proving absence resolves
+    // to the stored default (and, for a plain opus deploy, byte-for-byte today's behavior).
+    let dir = std::env::temp_dir().join(format!("jesse-model-it-{}", random_hex()));
+    let script = "#!/bin/sh\nprintf '%s' '{\"type\":\"result\",\"is_error\":false,\"result\":\"Default-backed answer.\",\"session_id\":\"sess-def\"}'\n";
+    let fake = write_fake_claude(script);
+    let cfg = Config {
+        claude_bin: fake.to_string_lossy().into_owned(),
+        model_badge: true,
+        timeout_secs: 30,
+        ..cfg_with_switch_registry(&dir)
+    };
+    let st = AppState::new(cfg);
+
+    // Move the stored default onto glm-5.2 (the legacy global switch still works server-side
+    // as the fallback default).
+    let set = app(st.clone())
+        .oneshot(set_model_request(Some("Bearer test-token"), r#"{"id":"glm-5.2"}"#))
+        .await
+        .unwrap();
+    assert_eq!(set.status(), StatusCode::OK);
+
+    let v = drive_turn_to_done(&st, r#"{"mode":"ask","text":"hi"}"#).await;
+    let resp_text = v["response"].as_str().unwrap();
+    assert!(
+        resp_text.contains("[glm-5.2"),
+        "a fieldless turn falls back to the stored default (glm-5.2): {resp_text:?}"
+    );
+
+    let _ = std::fs::remove_file(&fake);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn per_turn_unhealthy_model_is_409_and_spawns_nothing() {
+    // An unhealthy per-turn selection is rejected with 409 BEFORE any turn starts. The fake
+    // claude writes a sentinel file if it ever runs; the 409 path must leave it absent.
+    let dir = std::env::temp_dir().join(format!("jesse-model-it-{}", random_hex()));
+    let sentinel = std::env::temp_dir().join(format!("jesse-spawn-sentinel-{}", random_hex()));
+    let script = format!(
+        "#!/bin/sh\ntouch '{}'\nprintf '%s' '{{\"type\":\"result\",\"is_error\":false,\"result\":\"SHOULD_NOT_RUN\",\"session_id\":\"s\"}}'\n",
+        sentinel.to_string_lossy()
+    );
+    let fake = write_fake_claude(&script);
+    let cfg = Config {
+        claude_bin: fake.to_string_lossy().into_owned(),
+        timeout_secs: 30,
+        ..cfg_with_switch_registry(&dir)
+    };
+    let st = AppState::new(cfg);
+    // Mark glm unhealthy (a failed probe would do this in production).
+    st.health.set(
+        "glm-5.2",
+        HealthStatus {
+            healthy: false,
+            checked_at_ms: 5,
+            latency_ms: Some(3000),
+            last_error_class: Some("timeout".into()),
+        },
+    );
+
+    let resp = app(st.clone())
+        .oneshot(jesse_request(
+            Some("Bearer test-token"),
+            r#"{"mode":"ask","text":"hi","model":"glm-5.2"}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CONFLICT, "unhealthy selection → 409");
+    // Give any (erroneously) spawned child a beat to touch the sentinel, then prove it never ran.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(
+        !sentinel.exists(),
+        "a rejected per-turn selection must spawn no claude child"
+    );
+
+    let _ = std::fs::remove_file(&fake);
+    let _ = std::fs::remove_file(&sentinel);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn per_turn_unknown_model_is_400() {
+    // An unknown per-turn id is a 400, exactly as `POST /jesse/model`.
+    let dir = std::env::temp_dir().join(format!("jesse-model-it-{}", random_hex()));
+    let st = AppState::new(cfg_with_switch_registry(&dir));
+    let resp = app(st)
+        .oneshot(jesse_request(
+            Some("Bearer test-token"),
+            r#"{"mode":"ask","text":"hi","model":"no-such-model"}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "unknown model → 400");
+    let _ = std::fs::remove_dir_all(&dir);
+}
