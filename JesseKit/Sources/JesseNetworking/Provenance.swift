@@ -17,18 +17,29 @@ public struct JesseProvenance: Decodable, Equatable, Sendable {
     /// as the bridge metrics route). Kept as the raw string so an unrecognized future
     /// route still decodes and renders a generic chip rather than failing.
     public let route: String
-    /// The backend model that produced the reply, or nil on a bare `[hosted]` turn.
+    /// The model that produced the reply. On the hosted route this is the ACTIVE model the
+    /// switch selected (`opus`, `glm-5.2`, …); on a local route it is the role backend's
+    /// model. `nil` when unknown.
     public let model: String?
+    /// The turn's dollar cost (the hosted main turn's usage × the active model's price
+    /// deck), or `nil` on a local route / an older bridge. A free (`local`) model is `0`.
+    public let costUsd: Double?
     /// The exact text badge appended to the reply — the string the app strips from the
     /// end of the displayed message.
     public let badge: String
     public let flags: JesseProvenanceFlags
 
-    public init(route: String, model: String?, badge: String, flags: JesseProvenanceFlags) {
+    public init(route: String, model: String?, costUsd: Double? = nil, badge: String, flags: JesseProvenanceFlags) {
         self.route = route
         self.model = model
+        self.costUsd = costUsd
         self.badge = badge
         self.flags = flags
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case route, model, badge, flags
+        case costUsd = "cost_usd"
     }
 }
 
@@ -151,10 +162,27 @@ extension JesseProvenance {
         }
     }
 
-    /// The full accessibility sentence (route + model + any warning), for VoiceOver.
+    /// The compact chip title. On the hosted route this is the ACTIVE model the switch
+    /// selected (`opus`, `glm-5.2`, …) — the point of the switch — so a glance shows which
+    /// model served the turn; on a local route it is the route [`label`]. Falls back to the
+    /// label when no model is known.
+    public var chipTitle: String {
+        if route == "hosted", let model, !model.isEmpty { return model }
+        return label
+    }
+
+    /// The turn's cost formatted for the chip (fixed 4 decimals, matching the bridge's text
+    /// badge), or `nil` when no cost was reported (a local route / older bridge).
+    public var costLabel: String? {
+        guard let costUsd else { return nil }
+        return String(format: "$%.4f", costUsd)
+    }
+
+    /// The full accessibility sentence (route + model + cost + any warning), for VoiceOver.
     public var accessibilityText: String {
         var parts = [label]
         if let model, !model.isEmpty { parts.append("model \(model)") }
+        if let costLabel { parts.append("cost \(costLabel)") }
         if isWarning { parts.append("citations unverified") }
         return parts.joined(separator: ", ")
     }

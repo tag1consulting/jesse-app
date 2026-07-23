@@ -412,6 +412,23 @@ struct JesseClient: JesseClientProtocol {
         try await bridge.fetchPrompts()
     }
 
+    // MARK: - Global model switch (forwarded to the shared bridge client)
+
+    /// The selectable models + the active selection (`GET /jesse/models`).
+    func fetchModels() async throws -> ModelSwitchState {
+        try await bridge.fetchModels()
+    }
+
+    /// Make `id` the active model (`POST /jesse/model`).
+    func setActiveModel(_ id: String) async throws {
+        try await bridge.setActiveModel(id)
+    }
+
+    /// Set a model's write permission (`POST /jesse/model/{id}/writes`, Phase 2 effect).
+    func setModelWrites(id: String, enabled: Bool) async throws {
+        try await bridge.setWrites(id: id, enabled: enabled)
+    }
+
     // MARK: - Request building (iOS attachment mapping over the shared builder)
 
     /// Build the `POST /jesse` request from the iOS composer's `[JesseAttachment]` — the

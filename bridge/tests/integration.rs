@@ -1506,7 +1506,12 @@ async fn provenance_rides_the_poll_result_and_matches_the_appended_badge() {
     );
     assert_eq!(prov["route"], "hosted", "a plain hosted turn routes hosted");
     let badge = prov["badge"].as_str().expect("badge string present");
-    assert!(badge.starts_with("[hosted"), "hosted badge shape: {badge}");
+    // The hosted main turn names the ACTIVE model (the default is opus) plus its cost.
+    assert!(badge.starts_with("[opus"), "hosted badge names the active model: {badge}");
+    assert!(badge.contains('$'), "hosted badge carries a cost: {badge}");
+    // The structured provenance carries the model + a (possibly-zero) cost.
+    assert_eq!(prov["model"], "opus", "active model on the hosted route");
+    assert!(prov["cost_usd"].is_number(), "cost rides the hosted provenance: {prov}");
     // The structured badge is byte-identical to what was appended to the reply text.
     let response = v["response"].as_str().unwrap();
     assert!(
@@ -4218,9 +4223,8 @@ async fn vaultqa_uncited_answer_falls_through_to_the_hosted_turn() {
 
 #[tokio::test]
 async fn badge_on_hosted_turn_appends_a_hosted_badge() {
-    // A plain hosted Ask (no local backends) gets a trailing [hosted…] badge after
-    // its answer. ANTHROPIC_MODEL may or may not be set in the env, so assert the
-    // shape rather than an exact model string.
+    // A plain hosted Ask (no local backends) gets a trailing badge naming the ACTIVE
+    // model (the default is opus) and the turn's cost after its answer.
     let script = "#!/bin/sh\nprintf '%s' '{\"type\":\"result\",\"is_error\":false,\"result\":\"Your inbox has three threads.\",\"session_id\":\"sess-b\"}'\n";
     let fake = write_fake_claude(script);
     let cfg = Config {
@@ -4236,12 +4240,12 @@ async fn badge_on_hosted_turn_appends_a_hosted_badge() {
         "answer preserved: {resp:?}"
     );
     assert!(
-        resp.contains("\n\n[hosted"),
-        "a hosted badge is appended: {resp:?}"
+        resp.contains("\n\n[opus"),
+        "a hosted badge naming the active model is appended: {resp:?}"
     );
     assert!(resp.ends_with(']'), "badge is the trailing line: {resp:?}");
     // Exactly one appended badge.
-    assert_eq!(resp.matches("\n\n[hosted").count(), 1, "exactly one badge");
+    assert_eq!(resp.matches("\n\n[opus").count(), 1, "exactly one badge");
     let _ = std::fs::remove_file(&fake);
 }
 
@@ -5108,4 +5112,175 @@ async fn shadow_never_mirrors_a_tell() {
 
     let _ = std::fs::remove_file(&fake);
     let _ = std::fs::remove_file(&log);
+}
+
+// ---- The global model switch: GET /jesse/models, POST /jesse/model,
+//      POST /jesse/model/{id}/writes -----------------------------------------
+
+/// A Config whose registry offers opus (ambient), an AVAILABLE glm-5.2 (hosted), and an
+/// UNAVAILABLE kimi-k3 — so the endpoint tests can exercise select / reject / writes over
+/// a realistic registry. Persisted to a temp state dir so a re-read AppState converges.
+fn cfg_with_switch_registry(state_dir: &std::path::Path) -> Config {
+    let registry = ModelRegistry {
+        models: vec![
+            RegistryModel {
+                id: "opus".into(),
+                label: "Claude Opus".into(),
+                kind: ModelKind::Ambient,
+                backend: None,
+                available: true,
+                default_writes: true,
+                price: PriceDeck { in_per_m: 5.0, cached_per_m: 0.5, out_per_m: 25.0 },
+            },
+            RegistryModel {
+                id: "glm-5.2".into(),
+                label: "GLM 5.2".into(),
+                kind: ModelKind::Hosted,
+                backend: Some(("http://fireworks".into(), "fw-tok".into(), "glm-model".into())),
+                available: true,
+                default_writes: false,
+                price: PriceDeck { in_per_m: 1.4, cached_per_m: 0.14, out_per_m: 4.4 },
+            },
+            RegistryModel {
+                id: "kimi-k3".into(),
+                label: "Kimi K3".into(),
+                kind: ModelKind::Hosted,
+                backend: None,
+                available: false,
+                default_writes: false,
+                price: PriceDeck::ZERO,
+            },
+        ],
+    };
+    Config {
+        state_dir: Some(state_dir.to_string_lossy().into_owned()),
+        model_registry: registry,
+        ..test_config()
+    }
+}
+
+async fn body_value(resp: axum::response::Response) -> Value {
+    serde_json::from_str(&body_string(resp).await).unwrap()
+}
+
+#[tokio::test]
+async fn models_endpoint_requires_auth() {
+    let st = test_state();
+    let resp = app(st).oneshot(models_request(None)).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn models_endpoint_lists_the_registry_and_active_selection() {
+    let dir = std::env::temp_dir().join(format!("jesse-model-it-{}", random_hex()));
+    let st = AppState::new(cfg_with_switch_registry(&dir));
+    let resp = app(st)
+        .oneshot(models_request(Some("Bearer test-token")))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let v = body_value(resp).await;
+    assert_eq!(v["active"], "opus", "default active is opus");
+    let models = v["models"].as_array().unwrap();
+    assert_eq!(models.len(), 3);
+    // opus is ambient + available + writes-on.
+    let opus = models.iter().find(|m| m["id"] == "opus").unwrap();
+    assert_eq!(opus["kind"], "ambient");
+    assert_eq!(opus["available"], true);
+    assert_eq!(opus["writes_allowed"], true);
+    // glm is available but read-only by default.
+    let glm = models.iter().find(|m| m["id"] == "glm-5.2").unwrap();
+    assert_eq!(glm["kind"], "hosted");
+    assert_eq!(glm["available"], true);
+    assert_eq!(glm["writes_allowed"], false);
+    // kimi is present but unavailable.
+    let kimi = models.iter().find(|m| m["id"] == "kimi-k3").unwrap();
+    assert_eq!(kimi["available"], false);
+    // No secret leaks to the client.
+    let raw = v.to_string();
+    assert!(!raw.contains("fw-tok"), "the token must never reach a client: {raw}");
+    assert!(!raw.contains("fireworks"), "the base url must never reach a client: {raw}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn set_model_switches_active_and_persists_across_a_restart() {
+    let dir = std::env::temp_dir().join(format!("jesse-model-it-{}", random_hex()));
+    let st = AppState::new(cfg_with_switch_registry(&dir));
+    let resp = app(st.clone())
+        .oneshot(set_model_request(Some("Bearer test-token"), r#"{"id":"glm-5.2"}"#))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(body_value(resp).await["active"], "glm-5.2");
+
+    // A fresh AppState over the same state dir = the bridge restarting; it converges.
+    let st2 = AppState::new(cfg_with_switch_registry(&dir));
+    let resp = app(st2)
+        .oneshot(models_request(Some("Bearer test-token")))
+        .await
+        .unwrap();
+    assert_eq!(body_value(resp).await["active"], "glm-5.2", "selection survives restart");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn set_model_unknown_id_is_400() {
+    let dir = std::env::temp_dir().join(format!("jesse-model-it-{}", random_hex()));
+    let st = AppState::new(cfg_with_switch_registry(&dir));
+    let resp = app(st)
+        .oneshot(set_model_request(Some("Bearer test-token"), r#"{"id":"no-such-model"}"#))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn set_model_unavailable_is_409_and_does_not_switch() {
+    // An unavailable model (kimi-k3, pending a live Fireworks slug) cannot become active.
+    let dir = std::env::temp_dir().join(format!("jesse-model-it-{}", random_hex()));
+    let st = AppState::new(cfg_with_switch_registry(&dir));
+    let resp = app(st.clone())
+        .oneshot(set_model_request(Some("Bearer test-token"), r#"{"id":"kimi-k3"}"#))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CONFLICT);
+    // The active model is unchanged.
+    assert_eq!(st.models.active(), "opus", "an unavailable selection must not take effect");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn set_model_writes_stores_and_reflects_in_get() {
+    let dir = std::env::temp_dir().join(format!("jesse-model-it-{}", random_hex()));
+    let st = AppState::new(cfg_with_switch_registry(&dir));
+    let resp = app(st.clone())
+        .oneshot(set_model_writes_request(Some("Bearer test-token"), "glm-5.2", r#"{"enabled":true}"#))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(body_value(resp).await["writes_allowed"], true);
+    // GET now reflects glm as writes-on.
+    let resp = app(st)
+        .oneshot(models_request(Some("Bearer test-token")))
+        .await
+        .unwrap();
+    let v = body_value(resp).await;
+    let glm = v["models"].as_array().unwrap().iter().find(|m| m["id"] == "glm-5.2").unwrap().clone();
+    assert_eq!(glm["writes_allowed"], true, "the writes override is reflected");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn set_model_writes_on_the_default_model_is_rejected() {
+    // Opus is always writes-on and its permission is not user-settable.
+    let dir = std::env::temp_dir().join(format!("jesse-model-it-{}", random_hex()));
+    let st = AppState::new(cfg_with_switch_registry(&dir));
+    let resp = app(st)
+        .oneshot(set_model_writes_request(Some("Bearer test-token"), "opus", r#"{"enabled":false}"#))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let _ = std::fs::remove_dir_all(&dir);
 }

@@ -321,6 +321,13 @@ pub struct Config {
     // local file resolves to the generic default ("the user"), so no personal fact
     // is ever compiled in — personalization is pure runtime DATA.
     pub persona: Persona,
+    // The set of models the CONVERSATION (main turn + its subagents) can be switched
+    // onto, built once from `JESSE_MODEL_*` env at startup (see [`ModelRegistry`]).
+    // Always holds the ambient `opus` default; `glm-5.2` / `kimi-k3` / `local` are
+    // present-but-unavailable until their triples resolve. Distinct from the cheap-role
+    // offload backends above, which the switch never touches. Holds no persisted secret
+    // — the ACTIVE selection lives in the `ModelStore` (ids + booleans only).
+    pub model_registry: ModelRegistry,
 }
 
 impl Config {
@@ -367,6 +374,16 @@ impl Config {
         self.state_dir
             .as_deref()
             .map(|d| PathBuf::from(d).join("flags.json"))
+    }
+
+    /// The file the global model selection is persisted to (a sibling of `flags.json`),
+    /// or `None` when persistence is disabled (then the selection is in-memory only and
+    /// resets to `opus` on restart), the same degradation the job / title / device / flag
+    /// stores have. Holds only the active id and per-model write booleans, never a secret.
+    pub fn model_file(&self) -> Option<PathBuf> {
+        self.state_dir
+            .as_deref()
+            .map(|d| PathBuf::from(d).join("model.json"))
     }
 
     /// The file the per-session deletion tombstones are persisted to (a sibling of
@@ -616,6 +633,298 @@ pub fn resolve_context_carry() -> bool {
         .unwrap_or(true)
 }
 
+// ---- Model registry (the global model switch) -----------------------------
+//
+// The registry is the set of MODELS the conversation itself (the main turn and the
+// subagents it spawns) can be switched onto, chosen from the phone or the Mac. It is
+// entirely distinct from the cheap-role offload backends (`JESSE_TITLE_*`,
+// `JESSE_DIET_*`, `JESSE_VAULTQA_*`, `JESSE_SHADOW_*`) above: those keep serving their
+// own roles regardless of which model the conversation is switched to. Like every
+// backend triple in this file, a registry entry's credentials come ONLY from the
+// launch env (`JESSE_MODEL_*`) — no secret is compiled in, and nothing here is ever
+// persisted (the `ModelStore` holds only ids and booleans).
+
+/// A per-1,000,000-token price deck: input / cache-read / output dollars per million
+/// tokens. The per-turn cost badge multiplies a turn's `usage` vector by the ACTIVE
+/// model's deck (the same arithmetic the shadow audit uses — see [`ShadowUsage`]).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PriceDeck {
+    pub in_per_m: f64,
+    pub cached_per_m: f64,
+    pub out_per_m: f64,
+}
+
+impl PriceDeck {
+    /// A free model (the `local` entry): every turn costs `$0.00`.
+    pub const ZERO: PriceDeck = PriceDeck {
+        in_per_m: 0.0,
+        cached_per_m: 0.0,
+        out_per_m: 0.0,
+    };
+}
+
+/// How a selectable model's backend is applied to the MAIN turn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ModelKind {
+    /// The default (`opus`): NO `ANTHROPIC_*` overrides — the main turn inherits the
+    /// ambient process env, byte-for-byte today's behavior (the isolation property).
+    Ambient,
+    /// A hosted backend reached over the Anthropic `/v1/messages` surface (GLM, Kimi).
+    Hosted,
+    /// An Anthropic-compatible LOCAL endpoint.
+    Local,
+}
+
+/// One selectable model in the registry. Built from launch env; holds no secret beyond
+/// what the env supplied (the token lives ONLY inside `backend`, and is never
+/// serialized to a client or to `model.json`).
+#[derive(Debug, Clone)]
+pub struct RegistryModel {
+    /// The stable id the store + endpoints key on (`opus`, `glm-5.2`, `kimi-k3`, `local`).
+    pub id: String,
+    /// The human label shown in the app's switcher.
+    pub label: String,
+    pub kind: ModelKind,
+    /// `(base_url, auth_token, model_id)` — the same all-or-nothing triple shape as the
+    /// role backends. `None` for the ambient entry (it applies nothing) AND for a
+    /// hosted/local entry whose triple did not fully resolve (then `available` is false).
+    pub backend: Option<(String, String, String)>,
+    /// Whether this entry may be selected as the active model. Ambient is always
+    /// available; a hosted/local entry is available IFF its triple resolved.
+    pub available: bool,
+    /// The write permission a freshly-registered model gets before any explicit opt-in.
+    /// Ambient (`opus`) is always `true` (writes-on); every non-ambient entry defaults
+    /// `false` — read-only until writes are enabled per model (Phase 2).
+    pub default_writes: bool,
+    /// The price deck for the per-turn cost badge.
+    pub price: PriceDeck,
+}
+
+/// The set of models the conversation can be switched onto. Ordered as presented to the
+/// app (default first). Built once at startup from env; read-only thereafter.
+#[derive(Debug, Clone)]
+pub struct ModelRegistry {
+    pub models: Vec<RegistryModel>,
+}
+
+/// The id of the default, always-available model. Selecting it reproduces today's
+/// behavior byte-for-byte (no overrides, normal allowlist, writes-on).
+pub const DEFAULT_MODEL_ID: &str = "opus";
+
+impl ModelRegistry {
+    /// Look up an entry by id.
+    pub fn get(&self, id: &str) -> Option<&RegistryModel> {
+        self.models.iter().find(|m| m.id == id)
+    }
+
+    /// The default (ambient) entry — always present, so this never panics in practice;
+    /// falls back to a synthesized ambient opus if somehow absent.
+    pub fn default_model(&self) -> &RegistryModel {
+        self.get(DEFAULT_MODEL_ID)
+            .unwrap_or_else(|| &self.models[0])
+    }
+
+    /// Whether `id` names an entry that exists AND is available (selectable).
+    pub fn is_selectable(&self, id: &str) -> bool {
+        self.get(id).map(|m| m.available).unwrap_or(false)
+    }
+
+    /// The opus-only registry: the single always-available ambient default and nothing
+    /// else. The test fixture and any deploy with no `JESSE_MODEL_*` env resolve to
+    /// exactly this, so an unconfigured bridge behaves byte-for-byte as before.
+    pub fn opus_only() -> Self {
+        ModelRegistry {
+            models: vec![opus_entry()],
+        }
+    }
+
+    /// Build the four-entry registry from env. `opus` is always present and ambient;
+    /// `glm-5.2`, `kimi-k3`, and `local` resolve their triples from `JESSE_MODEL_*` and
+    /// are marked unavailable when incomplete (never a partial config).
+    pub fn from_env() -> Self {
+        // glm-5.2: hosted on Fireworks' Anthropic surface. base + model DEFAULT; only the
+        // token must be supplied, so an operator arms GLM with a single secret env var.
+        let glm_backend = resolve_model_backend(
+            "glm-5.2",
+            env_string("JESSE_MODEL_GLM_BASE_URL"),
+            env_string("JESSE_MODEL_GLM_AUTH_TOKEN"),
+            env_string("JESSE_MODEL_GLM_MODEL"),
+            Some("https://api.fireworks.ai/inference"),
+            Some("accounts/fireworks/models/glm-5p2"),
+        );
+        let glm = RegistryModel {
+            id: "glm-5.2".to_string(),
+            label: "GLM 5.2".to_string(),
+            kind: ModelKind::Hosted,
+            available: glm_backend.is_some(),
+            backend: glm_backend,
+            default_writes: false,
+            price: PriceDeck {
+                in_per_m: FW_IN_PER_M,
+                cached_per_m: FW_CACHED_PER_M,
+                out_per_m: FW_OUT_PER_M,
+            },
+        };
+
+        // kimi-k3: NO defaults — Fireworks does not yet serve Kimi K3 (open weights were
+        // due ~27 Jul 2026), so with no `JESSE_MODEL_KIMI_*` set it ships UNAVAILABLE and
+        // a selection attempt is rejected. When a live slug appears the operator supplies
+        // all three vars (and a real price deck via env) to arm it.
+        let kimi_backend = resolve_model_backend(
+            "kimi-k3",
+            env_string("JESSE_MODEL_KIMI_BASE_URL"),
+            env_string("JESSE_MODEL_KIMI_AUTH_TOKEN"),
+            env_string("JESSE_MODEL_KIMI_MODEL"),
+            None,
+            None,
+        );
+        let kimi = RegistryModel {
+            id: "kimi-k3".to_string(),
+            label: "Kimi K3".to_string(),
+            kind: ModelKind::Hosted,
+            available: kimi_backend.is_some(),
+            backend: kimi_backend,
+            default_writes: false,
+            // Placeholder until a live Fireworks slug + published pricing exist; overridable
+            // from env so arming Kimi later needs no code change.
+            price: model_price_from_env("JESSE_MODEL_KIMI", PriceDeck::ZERO),
+        };
+
+        // local: an Anthropic-compatible local endpoint. NO defaults — all three vars
+        // required. Free (price deck 0/0/0), so every local turn badges `$0.00`.
+        let local_backend = resolve_model_backend(
+            "local",
+            env_string("JESSE_MODEL_LOCAL_BASE_URL"),
+            env_string("JESSE_MODEL_LOCAL_AUTH_TOKEN"),
+            env_string("JESSE_MODEL_LOCAL_MODEL"),
+            None,
+            None,
+        );
+        let local = RegistryModel {
+            id: "local".to_string(),
+            label: "Local".to_string(),
+            kind: ModelKind::Local,
+            available: local_backend.is_some(),
+            backend: local_backend,
+            default_writes: false,
+            price: PriceDeck::ZERO,
+        };
+
+        ModelRegistry {
+            models: vec![opus_entry(), glm, kimi, local],
+        }
+    }
+}
+
+/// The registry model resolved for ONE turn, plus its effective write permission — the
+/// exact inputs the main-turn command builder ([`build_claude_command`]) needs. Built by
+/// the handler from the registry + the [`ModelStore`] (see `AppState::resolve_active_model`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct ActiveModel {
+    /// The active model id (`opus`, `glm-5.2`, `local`, …). Names the badge.
+    pub id: String,
+    pub kind: ModelKind,
+    /// The `ANTHROPIC_*` triple to apply to the MAIN turn, or `None` for the ambient
+    /// default (apply nothing — the isolation property). NEVER a per-ROLE backend.
+    pub env: Option<(String, String, String)>,
+    /// The subagent model id (== the triple's model) so the subagents the main turn
+    /// spawns follow the switch via `CLAUDE_CODE_SUBAGENT_MODEL`. `None` for ambient.
+    pub subagent_model: Option<String>,
+    /// Whether this turn may WRITE. `false` → the read-only allowlist (the Phase 1
+    /// default for every non-ambient model). Ambient (`opus`) is always `true`.
+    pub writes_allowed: bool,
+    /// The price deck for the per-turn cost badge.
+    pub price: PriceDeck,
+}
+
+impl ActiveModel {
+    /// The ambient default (`opus`): no env overrides, writes-on. A turn built with this
+    /// is byte-for-byte today's behavior — the value the title one-shot and any
+    /// no-switch caller pass so nothing about their command changes.
+    pub fn ambient() -> Self {
+        ActiveModel {
+            id: DEFAULT_MODEL_ID.to_string(),
+            kind: ModelKind::Ambient,
+            env: None,
+            subagent_model: None,
+            writes_allowed: true,
+            price: PriceDeck {
+                in_per_m: OPUS_IN_PER_M,
+                cached_per_m: OPUS_CACHED_PER_M,
+                out_per_m: OPUS_OUT_PER_M,
+            },
+        }
+    }
+
+    /// Whether this active model applies `ANTHROPIC_*` overrides to the main turn (i.e.
+    /// it is a hosted/local backend, not the ambient default).
+    pub fn is_non_ambient(&self) -> bool {
+        self.env.is_some()
+    }
+}
+
+/// The always-present ambient default entry.
+fn opus_entry() -> RegistryModel {
+    RegistryModel {
+        id: DEFAULT_MODEL_ID.to_string(),
+        label: "Claude Opus".to_string(),
+        kind: ModelKind::Ambient,
+        backend: None,
+        available: true,
+        default_writes: true,
+        price: PriceDeck {
+            in_per_m: OPUS_IN_PER_M,
+            cached_per_m: OPUS_CACHED_PER_M,
+            out_per_m: OPUS_OUT_PER_M,
+        },
+    }
+}
+
+/// Resolve a registry model's `(base_url, auth_token, model)` triple from its env parts,
+/// layering the optional defaults for base/model UNDER the env values. All-or-nothing,
+/// mirroring [`resolve_vaultqa_backend`]: returns `Some` only when all three resolve
+/// (env or default), else `None` (the model is UNAVAILABLE — never a partial config). A
+/// partial ENV config (some `JESSE_MODEL_<X>_*` set but the triple still incomplete)
+/// logs one startup warning; a model left entirely unset resolves to `None` silently.
+pub fn resolve_model_backend(
+    id: &str,
+    env_base: Option<String>,
+    env_token: Option<String>,
+    env_model: Option<String>,
+    default_base: Option<&str>,
+    default_model: Option<&str>,
+) -> Option<(String, String, String)> {
+    let env_count = env_base.is_some() as u8 + env_token.is_some() as u8 + env_model.is_some() as u8;
+    let base = env_base.or_else(|| default_base.map(str::to_string));
+    let model = env_model.or_else(|| default_model.map(str::to_string));
+    match (base, env_token, model) {
+        (Some(b), Some(t), Some(m)) => Some((b, t, m)),
+        _ => {
+            if env_count > 0 {
+                eprintln!(
+                    "jesse-bridge: WARNING partial JESSE_MODEL_* config for '{id}' \
+                     ({env_count} env var(s) set) — a selectable model needs base_url + \
+                     auth_token + model_id (base/model may default); treating '{id}' as \
+                     UNAVAILABLE."
+                );
+            }
+            None
+        }
+    }
+}
+
+/// Read an optional per-model price deck from `<prefix>_PRICE_IN` / `_PRICE_CACHED` /
+/// `_PRICE_OUT` (dollars per 1M tokens). Any missing/unparseable field falls back to the
+/// same field of `default`, so a fully-unset prefix yields `default` unchanged.
+pub fn model_price_from_env(prefix: &str, default: PriceDeck) -> PriceDeck {
+    PriceDeck {
+        in_per_m: env_parse(&format!("{prefix}_PRICE_IN"), default.in_per_m),
+        cached_per_m: env_parse(&format!("{prefix}_PRICE_CACHED"), default.cached_per_m),
+        out_per_m: env_parse(&format!("{prefix}_PRICE_OUT"), default.out_per_m),
+    }
+}
+
 impl Config {
     pub fn from_env() -> Self {
         let home = std::env::var("HOME").unwrap_or_default();
@@ -749,6 +1058,10 @@ impl Config {
             // Resolved once at startup against the captured HOME (used to find the
             // state-dir config location for a launchd service outside the repo).
             persona: Persona::load(&home),
+            // The selectable-model registry, built from JESSE_MODEL_* (see
+            // ModelRegistry::from_env). Always includes the ambient opus default; the
+            // hosted/local entries are unavailable until their triples resolve.
+            model_registry: ModelRegistry::from_env(),
         }
     }
 }
@@ -781,6 +1094,69 @@ mod tests {
         std::env::set_var("JESSE_TEST_ENV_PARSE", "not-a-number");
         assert_eq!(env_parse::<u64>("JESSE_TEST_ENV_PARSE", 7), 7);
         std::env::remove_var("JESSE_TEST_ENV_PARSE");
+    }
+
+    #[test]
+    fn resolve_model_backend_all_or_nothing_with_defaults() {
+        // GLM-shape: base + model DEFAULT, only the token supplied → available.
+        let glm = resolve_model_backend(
+            "glm-5.2",
+            None,
+            Some("tok".into()),
+            None,
+            Some("https://api.fireworks.ai/inference"),
+            Some("accounts/fireworks/models/glm-5p2"),
+        );
+        assert_eq!(
+            glm,
+            Some((
+                "https://api.fireworks.ai/inference".into(),
+                "tok".into(),
+                "accounts/fireworks/models/glm-5p2".into()
+            )),
+            "token-only arms a defaulted hosted model"
+        );
+        // No token → unavailable, even though base/model default.
+        assert_eq!(
+            resolve_model_backend(
+                "glm-5.2",
+                None,
+                None,
+                None,
+                Some("https://api.fireworks.ai/inference"),
+                Some("accounts/fireworks/models/glm-5p2"),
+            ),
+            None,
+            "no token → unavailable"
+        );
+        // No defaults (kimi/local): all three required.
+        assert_eq!(
+            resolve_model_backend("local", Some("http://l".into()), Some("t".into()), None, None, None),
+            None,
+            "a partial no-default triple is unavailable, never partial"
+        );
+        assert_eq!(
+            resolve_model_backend(
+                "local",
+                Some("http://l".into()),
+                Some("t".into()),
+                Some("m".into()),
+                None,
+                None
+            ),
+            Some(("http://l".into(), "t".into(), "m".into())),
+        );
+    }
+
+    #[test]
+    fn opus_only_registry_is_just_the_ambient_default() {
+        let r = ModelRegistry::opus_only();
+        assert_eq!(r.models.len(), 1);
+        let opus = r.default_model();
+        assert_eq!(opus.id, "opus");
+        assert!(matches!(opus.kind, ModelKind::Ambient));
+        assert!(opus.available && opus.default_writes);
+        assert!(!r.is_selectable("glm-5.2"), "an absent model is not selectable");
     }
 
     #[test]

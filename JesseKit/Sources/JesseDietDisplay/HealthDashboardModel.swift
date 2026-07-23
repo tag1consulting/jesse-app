@@ -138,8 +138,11 @@ public final class HealthDashboardModel {
     /// Fetch (or, for paging, reuse the cache for) `date` (nil = today). Pins the
     /// viewed date on success. A failed refresh never blanks an existing snapshot.
     private func fetch(date: String?, force: Bool) async {
-        // Instant cache hit for paging (never for a forced refresh).
-        if !force, let key = date ?? todayDate, let cached = cache[key] {
+        // Instant cache hit for paging (never for a forced refresh, and NEVER for the
+        // live day). The cache is keyed by each snapshot's own date, so after a day
+        // rollover `todayDate` still names yesterday — serving `date == nil` from it
+        // would render yesterday's meals as today. The live day is always refetched.
+        if !force, let key = date, let cached = cache[key] {
             snapshot = cached
             viewedDate = date
             lastError = nil

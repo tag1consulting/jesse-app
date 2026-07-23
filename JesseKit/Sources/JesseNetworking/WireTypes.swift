@@ -483,6 +483,74 @@ public struct JesseDeviceRegistration: Encodable {
     public init(token: String) { self.token = token }
 }
 
+// MARK: - Global model switch (GET /jesse/models, POST /jesse/model, .../writes)
+
+/// One selectable model in the bridge's global model switch. Ids and booleans only — never
+/// a token or base url (those live solely in the bridge launch env), so this is safe to hold
+/// and display. Shared so the iPhone and the Mac render one switcher and converge on one
+/// active selection (the bridge is the source of truth). Lives in JesseNetworking alongside
+/// the other wire types so its `Decodable` conformance stays nonisolated (JesseCore defaults
+/// to MainActor isolation, which a nonisolated client decode cannot use).
+public struct ModelInfo: Decodable, Equatable, Sendable, Identifiable {
+    /// The stable id the switch keys on (`opus`, `glm-5.2`, `kimi-k3`, `local`).
+    public let id: String
+    /// The human label shown in the switcher.
+    public let label: String
+    /// `ambient` | `hosted` | `local` — kept as the raw string so an unknown future kind
+    /// still decodes and renders rather than failing.
+    public let kind: String
+    /// Whether this model may be selected. An unavailable model (e.g. `kimi-k3` until a live
+    /// slug resolves) shows disabled with a "pending" note.
+    public let available: Bool
+    /// The effective write permission: the ambient default (`opus`) is always true; every
+    /// other model is false until writes are enabled per model (Phase 2).
+    public let writesAllowed: Bool
+
+    public init(id: String, label: String, kind: String, available: Bool, writesAllowed: Bool) {
+        self.id = id
+        self.label = label
+        self.kind = kind
+        self.available = available
+        self.writesAllowed = writesAllowed
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case id, label, kind, available
+        case writesAllowed = "writes_allowed"
+    }
+
+    /// The ambient default (`opus`) — never applies overrides and is always writes-on.
+    public var isDefault: Bool { kind == "ambient" }
+}
+
+/// The `GET /jesse/models` payload: the active model id plus the selectable models. The
+/// active id may name a model that is currently unavailable (a stale selection); the app
+/// shows it checked and the switcher's disabled state guides the user to a live choice.
+public struct ModelSwitchState: Decodable, Equatable, Sendable {
+    public let active: String
+    public let models: [ModelInfo]
+
+    public init(active: String, models: [ModelInfo]) {
+        self.active = active
+        self.models = models
+    }
+
+    /// The active model's info, if present in the list.
+    public var activeModel: ModelInfo? { models.first { $0.id == active } }
+}
+
+/// The `POST /jesse/model` body: the id of the model to make active.
+public struct SetModelBody: Encodable, Equatable {
+    public let id: String
+    public init(id: String) { self.id = id }
+}
+
+/// The `POST /jesse/model/{id}/writes` body: whether that model may write the vault.
+public struct SetWritesBody: Encodable, Equatable {
+    public let enabled: Bool
+    public init(enabled: Bool) { self.enabled = enabled }
+}
+
 /// The `POST /jesse/session/{id}/flags` body: any subset of the four flag fields. Only
 /// the flag(s) that changed are sent, each paired with its unix-millis change clock, so
 /// the bridge applies each last-writer-wins by that timestamp. A nil field omits its key

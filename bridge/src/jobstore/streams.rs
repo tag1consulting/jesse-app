@@ -29,7 +29,8 @@ pub enum StreamFrame {
         response: String,
         session_id: Option<String>,
         directives: Option<Directives>,
-        provenance: Option<Provenance>,
+        // Boxed to match `JobState::Done` — keeps this large terminal frame small.
+        provenance: Option<Box<Provenance>>,
     },
     /// Terminal: the turn failed. Carries the human-readable cause.
     Error(String),

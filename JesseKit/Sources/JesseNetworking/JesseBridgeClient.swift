@@ -217,6 +217,72 @@ public struct JesseBridgeClient: BridgeClientProtocol {
         throw JesseError.badResponse(http.statusCode, String(data: data, encoding: .utf8) ?? "")
     }
 
+    // MARK: - Global model switch
+
+    /// `GET /jesse/models` — the selectable models + the active selection. The bridge is the
+    /// source of truth, so the app fetches this on open and after any change rather than
+    /// caching an authoritative copy. Throws on a transport/auth/HTTP failure so the caller
+    /// can surface it; a bridge too old to expose the route returns 404 → `badResponse`.
+    public func fetchModels() async throws -> ModelSwitchState {
+        guard let req = authorized("/jesse/models", method: "GET") else {
+            throw JesseError.notConfigured
+        }
+        let data: Data, resp: URLResponse
+        do {
+            (data, resp) = try await session.data(for: req)
+        } catch {
+            throw JesseError.from(error, host: config.normalizedHost)
+        }
+        guard let http = resp as? HTTPURLResponse else { throw JesseError.decoding }
+        guard (200..<300).contains(http.statusCode) else {
+            throw JesseError.badResponse(http.statusCode, String(data: data, encoding: .utf8) ?? "")
+        }
+        guard let state = try? JSONDecoder().decode(ModelSwitchState.self, from: data) else {
+            throw JesseError.decoding
+        }
+        return state
+    }
+
+    /// `POST /jesse/model` — make `id` the active model. The bridge rejects an unknown (400)
+    /// or unavailable (409) id; both surface as `badResponse` so the caller can show a clear
+    /// message and re-fetch the authoritative state.
+    public func setActiveModel(_ id: String) async throws {
+        guard var req = authorized("/jesse/model", method: "POST") else {
+            throw JesseError.notConfigured
+        }
+        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        req.httpBody = try Self.encodeBody(SetModelBody(id: id))
+        try await Self.expect2xx(session: session, req: req, host: config.normalizedHost)
+    }
+
+    /// `POST /jesse/model/{id}/writes` — set a model's write permission (Phase 2 wires the
+    /// effect). The bridge rejects the ambient default (400) and unknown/unavailable ids;
+    /// those surface as `badResponse`.
+    public func setWrites(id: String, enabled: Bool) async throws {
+        guard var req = authorized("/jesse/model/\(id)/writes", method: "POST") else {
+            throw JesseError.notConfigured
+        }
+        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        req.httpBody = try Self.encodeBody(SetWritesBody(enabled: enabled))
+        try await Self.expect2xx(session: session, req: req, host: config.normalizedHost)
+    }
+
+    /// Fire a request and require a 2xx, mapping transport/HTTP failures to `JesseError`.
+    /// Shared by the two model-switch mutators (unlike the idempotent 404-is-ok calls, an
+    /// unknown/unavailable model is a real 4xx the caller must see).
+    static func expect2xx(session: URLSession, req: URLRequest, host: String) async throws {
+        let data: Data, resp: URLResponse
+        do {
+            (data, resp) = try await session.data(for: req)
+        } catch {
+            throw JesseError.from(error, host: host)
+        }
+        guard let http = resp as? HTTPURLResponse else { throw JesseError.decoding }
+        guard (200..<300).contains(http.statusCode) else {
+            throw JesseError.badResponse(http.statusCode, String(data: data, encoding: .utf8) ?? "")
+        }
+    }
+
     /// Register (idempotent upsert) a device's APNs token with the bridge
     /// (`POST /jesse/device`) so it can push when a backgrounded turn finishes. Strict:
     /// throws on a transport/auth/HTTP failure so the caller can retry (this is the one

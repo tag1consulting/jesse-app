@@ -263,6 +263,18 @@ struct SettingsView: View {
     // refreshed on appear and whenever we contact the bridge for defaults.
     @State private var bridgeVersion: String? = BridgeVersionStore.current
 
+    // The global model switch (bridge 0.27.0): the selectable models + active selection,
+    // fetched from the bridge (the source of truth) on open and after a change. `nil` until
+    // loaded / on an older bridge. `switchingModel` disables the rows during a swap.
+    @State private var modelState: ModelSwitchState?
+    @State private var loadingModels = false
+    @State private var switchingModel = false
+    @State private var modelsError: String?
+    // Phase 2: the model awaiting write-enable confirmation. Granting a non-default model
+    // write access is gated behind an explicit confirm that names it and warns it can modify
+    // the vault; revoking is immediate (it only ever reduces access).
+    @State private var pendingWriteModel: ModelInfo?
+
     // On-device search expansion (Tier 2), default ON. Off → pure multi-token
     // Tier-1 search with no model calls. Same key the thread list reads.
     @AppStorage("searchExpansionEnabled") private var searchExpansionEnabled = true
@@ -358,6 +370,8 @@ struct SettingsView: View {
                 }
 
                 floorSection(for: .tell)
+
+                modelSwitchSection
 
                 Section {
                     Toggle("Smart search expansion", isOn: $searchExpansionEnabled)
@@ -522,6 +536,166 @@ struct SettingsView: View {
             let detail = (error as? JesseError)?.errorDescription ?? error.localizedDescription
             promptsError = "Couldn’t load defaults — connect to the bridge first. (\(detail))"
             return nil
+        }
+    }
+
+    /// The global model switch section: one row per selectable model, the active one
+    /// checked, an unavailable model (e.g. Kimi K3 until a live slug resolves) disabled with
+    /// a "pending" note. Selecting a model is one tap; the bridge is the source of truth so
+    /// this refetches after a change. Hidden until models load (an older bridge has no route).
+    @ViewBuilder
+    private var modelSwitchSection: some View {
+        Section {
+            if let modelState {
+                ForEach(modelState.models) { model in
+                    Button {
+                        selectModel(model)
+                    } label: {
+                        HStack {
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text(model.label)
+                                    .foregroundStyle(model.available ? .primary : .secondary)
+                                if !model.available {
+                                    Text("pending — not yet available")
+                                        .font(.caption)
+                                        .foregroundStyle(.secondary)
+                                } else if !model.isDefault && !model.writesAllowed {
+                                    Text("read-only")
+                                        .font(.caption)
+                                        .foregroundStyle(.secondary)
+                                }
+                            }
+                            Spacer()
+                            if model.id == modelState.active {
+                                Image(systemName: "checkmark")
+                                    .foregroundStyle(.tint)
+                            }
+                        }
+                    }
+                    .disabled(!model.available || switchingModel)
+                }
+            } else if loadingModels {
+                HStack { ProgressView(); Text("Loading models…").foregroundStyle(.secondary) }
+            } else {
+                Button {
+                    Task { await loadModels() }
+                } label: {
+                    Label("Load models from bridge", systemImage: "cpu")
+                }
+            }
+            if let modelsError {
+                Text(modelsError)
+                    .font(.callout)
+                    .foregroundStyle(.red)
+            }
+        } header: {
+            Text("Model")
+        } footer: {
+            Text("Chooses which model answers your conversations (and the sub-agents it runs). The cheap background helpers — titles, diet logging, vault lookups — are unaffected. A non-default model can read your vault but not write it until you enable writes for it.")
+        }
+        .task { await loadModels() }
+
+        writeAccessSection
+    }
+
+    /// Phase 2: per-model write access. One toggle per available non-default model; turning
+    /// it ON is gated behind a confirmation that names the model and warns it can modify the
+    /// vault. Turning it OFF is immediate (it only reduces access). Hidden until models load.
+    @ViewBuilder
+    private var writeAccessSection: some View {
+        if let modelState, modelState.models.contains(where: { $0.available && !$0.isDefault }) {
+            Section {
+                ForEach(modelState.models.filter { $0.available && !$0.isDefault }) { model in
+                    Toggle(isOn: writeBinding(for: model)) {
+                        Text("Allow \(model.label) to write the vault")
+                    }
+                    .disabled(switchingModel)
+                }
+            } header: {
+                Text("Write access")
+            } footer: {
+                Text("Off by default, every non-default model can read your vault but not change it. Turn this on only for a model you trust to edit files. The reply badge marks a writing model (for example “glm-5.2 · write”).")
+            }
+            .alert("Allow writes?", isPresented: writeConfirmPresented) {
+                Button("Cancel", role: .cancel) { pendingWriteModel = nil }
+                Button("Allow writes", role: .destructive) {
+                    if let model = pendingWriteModel { setWrites(model, enabled: true) }
+                    pendingWriteModel = nil
+                }
+            } message: {
+                Text("\(pendingWriteModel?.label ?? "This model") will be able to modify files in your vault when it backs a conversation. You can turn this off at any time.")
+            }
+        }
+    }
+
+    /// A binding whose ON path asks for confirmation (via `pendingWriteModel`) and whose OFF
+    /// path revokes immediately.
+    private func writeBinding(for model: ModelInfo) -> Binding<Bool> {
+        Binding(
+            get: { modelState?.models.first { $0.id == model.id }?.writesAllowed ?? false },
+            set: { newValue in
+                if newValue {
+                    pendingWriteModel = model
+                } else {
+                    setWrites(model, enabled: false)
+                }
+            }
+        )
+    }
+
+    private var writeConfirmPresented: Binding<Bool> {
+        Binding(get: { pendingWriteModel != nil }, set: { if !$0 { pendingWriteModel = nil } })
+    }
+
+    /// Set a model's write permission on the bridge, then refetch the authoritative state.
+    private func setWrites(_ model: ModelInfo, enabled: Bool) {
+        Task {
+            switchingModel = true
+            defer { switchingModel = false }
+            let cfg = JesseConfig(host: host, port: Int(port) ?? JesseConfig.defaultPort, token: token)
+            do {
+                try await JesseClient(config: cfg).setModelWrites(id: model.id, enabled: enabled)
+                modelsError = nil
+            } catch {
+                let detail = (error as? JesseError)?.errorDescription ?? error.localizedDescription
+                modelsError = "Couldn’t change write access. (\(detail))"
+            }
+            await loadModels()
+        }
+    }
+
+    /// Fetch the selectable models + active selection using the entered host/token. Silent on
+    /// an older bridge (no `/jesse/models` route) — the section simply stays hidden.
+    private func loadModels() async {
+        let cfg = JesseConfig(host: host, port: Int(port) ?? JesseConfig.defaultPort, token: token)
+        guard cfg.isConfigured else { return }
+        loadingModels = true
+        defer { loadingModels = false }
+        do {
+            modelState = try await JesseClient(config: cfg).fetchModels()
+            modelsError = nil
+        } catch {
+            // An older bridge 404s here; leave the section hidden rather than shouting.
+            modelState = nil
+        }
+    }
+
+    /// Make `model` the active model, then refetch so the UI reflects the bridge's truth.
+    /// A no-op on the already-active model or an unavailable one.
+    private func selectModel(_ model: ModelInfo) {
+        guard model.available, model.id != modelState?.active else { return }
+        Task {
+            switchingModel = true
+            defer { switchingModel = false }
+            let cfg = JesseConfig(host: host, port: Int(port) ?? JesseConfig.defaultPort, token: token)
+            do {
+                try await JesseClient(config: cfg).setActiveModel(model.id)
+                modelsError = nil
+            } catch {
+                let detail = (error as? JesseError)?.errorDescription ?? error.localizedDescription
+                modelsError = "Couldn’t switch model. (\(detail))"
+            }
+            await loadModels()
         }
     }
 

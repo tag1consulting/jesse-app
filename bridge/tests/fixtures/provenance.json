@@ -4,25 +4,42 @@
   "cases": [
     {
       "name": "hosted",
+      "hosted_write": false,
       "provenance": {
         "route": "hosted",
-        "model": "claude-opus-4-8",
-        "badge": "[hosted · claude-opus-4-8]",
+        "model": "opus",
+        "cost_usd": 0.0123,
+        "badge": "[opus · $0.0123]",
         "flags": { "hosted_verify": false, "verify_queued": false, "citations_unverified": false }
       },
       "reply_body": "Here is your answer.",
-      "reply_text": "Here is your answer.\n\n[hosted · claude-opus-4-8]"
+      "reply_text": "Here is your answer.\n\n[opus · $0.0123]"
     },
     {
-      "name": "hosted-bare",
+      "name": "hosted-glm-readonly",
+      "hosted_write": false,
       "provenance": {
         "route": "hosted",
-        "model": null,
-        "badge": "[hosted]",
+        "model": "glm-5.2",
+        "cost_usd": 0.0021,
+        "badge": "[glm-5.2 · $0.0021]",
         "flags": { "hosted_verify": false, "verify_queued": false, "citations_unverified": false }
       },
-      "reply_body": "No ambient model was set.",
-      "reply_text": "No ambient model was set.\n\n[hosted]"
+      "reply_body": "The note says 52.",
+      "reply_text": "The note says 52.\n\n[glm-5.2 · $0.0021]"
+    },
+    {
+      "name": "hosted-glm-write",
+      "hosted_write": true,
+      "provenance": {
+        "route": "hosted",
+        "model": "glm-5.2",
+        "cost_usd": 0.0021,
+        "badge": "[glm-5.2 · write · $0.0021]",
+        "flags": { "hosted_verify": false, "verify_queued": false, "citations_unverified": false }
+      },
+      "reply_body": "Edited the note.",
+      "reply_text": "Edited the note.\n\n[glm-5.2 · write · $0.0021]"
     },
     {
       "name": "vault-local",

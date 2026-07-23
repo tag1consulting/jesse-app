@@ -54,7 +54,7 @@ pub fn frame_to_event(frame: &StreamFrame) -> Event {
                 "response": response,
                 "session_id": session_id,
                 "directives": directives_to_value(directives),
-                "provenance": provenance_to_value(provenance),
+                "provenance": provenance_to_value(provenance.as_deref()),
             }),
         ),
         StreamFrame::Error(error) => sse_event("error", json!({ "error": error })),
@@ -157,7 +157,7 @@ pub async fn jesse_stream(
                         "response": response,
                         "session_id": session_id,
                         "directives": directives_to_value(&directives),
-                        "provenance": provenance_to_value(&provenance),
+                        "provenance": provenance_to_value(provenance.as_deref()),
                     }),
                 )));
             }

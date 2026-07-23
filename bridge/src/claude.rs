@@ -7,6 +7,11 @@ pub enum ClaudeOutcome {
     Ok {
         result: String,
         session_id: Option<String>,
+        /// Token usage recovered from the terminal `result` line's `usage` object, for
+        /// the per-turn cost badge (multiplied by the active model's price deck). Empty
+        /// (all-`None`) when the line carried none or the answer came from the streamed
+        /// fallback rather than a `result` line. Content-free — token counts only.
+        usage: ShadowUsage,
     },
     /// Transient upstream failure (5xx / 429 / 529) — worth retrying.
     Retryable { message: String, status: u64 },
@@ -81,7 +86,18 @@ pub fn classify_result_value(v: &Value, raw: Option<&str>) -> ClaudeOutcome {
         .get("session_id")
         .and_then(|s| s.as_str())
         .map(|s| s.to_string());
-    ClaudeOutcome::Ok { result, session_id }
+    // The terminal `result` line carries a `usage` object on a successful turn; parse it
+    // for the per-turn cost badge. A missing/oddly-shaped object → empty usage (cost $0),
+    // never an error — the answer is authoritative regardless of whether usage parsed.
+    let usage = v
+        .get("usage")
+        .and_then(|u| serde_json::from_value::<ShadowUsage>(u.clone()).ok())
+        .unwrap_or_default();
+    ClaudeOutcome::Ok {
+        result,
+        session_id,
+        usage,
+    }
 }
 
 /// One line of `claude --output-format stream-json` decoded into what the bridge
@@ -168,6 +184,7 @@ pub fn interpret_claude_output(stdout: &str, stderr: &str, exit_success: bool) -
         ClaudeOutcome::Ok {
             result: stdout.trim().to_string(),
             session_id: None,
+            usage: ShadowUsage::default(),
         }
     } else {
         let err = truncate_chars(stderr.trim(), 500);
@@ -207,13 +224,22 @@ pub fn resolve_stream_outcome(
     match terminal {
         // Success envelope: prefer the authoritative `result`, but fall back to
         // the streamed text when `result` came back empty/blank.
-        Some(ClaudeOutcome::Ok { result, session_id }) => {
+        Some(ClaudeOutcome::Ok {
+            result,
+            session_id,
+            usage,
+        }) => {
             if !result.trim().is_empty() {
-                ClaudeOutcome::Ok { result, session_id }
+                ClaudeOutcome::Ok {
+                    result,
+                    session_id,
+                    usage,
+                }
             } else if !streamed.is_empty() {
                 ClaudeOutcome::Ok {
                     result: streamed.to_string(),
                     session_id,
+                    usage,
                 }
             } else {
                 // Success but no answer anywhere — never deliver an empty bubble.
@@ -233,6 +259,7 @@ pub fn resolve_stream_outcome(
                 ClaudeOutcome::Ok {
                     result: streamed.to_string(),
                     session_id: None,
+                    usage: ShadowUsage::default(),
                 }
             }
         }
@@ -247,7 +274,21 @@ pub fn resolve_stream_outcome(
 ///   * a `--disallowedTools` denylist as defense-in-depth
 ///
 /// A `session_id` adds `--resume <id>` to continue a thread.
-pub fn build_claude_args(cfg: &Config, prompt: &str, session_id: Option<&str>) -> Vec<String> {
+///
+/// `active` is the model backing this turn (the global switch). When it is writes-on
+/// (the ambient `opus` default, or a model whose writes were explicitly enabled) the
+/// args are byte-for-byte today's: the configured `--allowedTools` / `--disallowedTools`.
+/// When it is READ-ONLY (every non-ambient model in Phase 1) the tool posture is the
+/// contained read-only boundary ([`build_readonly_tool_args`]) — reads + search + the
+/// qmd vault MCP, and NO write/exec/send tool — so a weaker or unfamiliar model cannot
+/// mutate the vault regardless of what it tries. The boundary is the ALLOWLIST, not the
+/// prompt.
+pub fn build_claude_args(
+    cfg: &Config,
+    prompt: &str,
+    session_id: Option<&str>,
+    active: &ActiveModel,
+) -> Vec<String> {
     let mut args = vec![
         "-p".to_string(),
         prompt.to_string(),
@@ -264,12 +305,18 @@ pub fn build_claude_args(cfg: &Config, prompt: &str, session_id: Option<&str>) -
         // below rather than auto-accepted. Never acceptEdits/bypassPermissions.
         "--permission-mode".to_string(),
         "default".to_string(),
-        "--allowedTools".to_string(),
-        cfg.allowed_tools.clone(),
     ];
-    if !cfg.disallowed_tools.trim().is_empty() {
-        args.push("--disallowedTools".to_string());
-        args.push(cfg.disallowed_tools.clone());
+    if active.writes_allowed {
+        // Writes-on (opus, or a model granted writes in Phase 2): today's exact posture.
+        args.push("--allowedTools".to_string());
+        args.push(cfg.allowed_tools.clone());
+        if !cfg.disallowed_tools.trim().is_empty() {
+            args.push("--disallowedTools".to_string());
+            args.push(cfg.disallowed_tools.clone());
+        }
+    } else {
+        // Read-only (every non-ambient model in Phase 1): the contained boundary.
+        args.extend(build_readonly_tool_args());
     }
     if let Some(sid) = session_id {
         // A synthetic `local-<hex>` id (context carry) names a bridge-minted ledger
@@ -294,14 +341,65 @@ pub fn build_claude_args(cfg: &Config, prompt: &str, session_id: Option<&str>) -
 /// `apply_title_env`; the main-turn path never does, which is the isolation
 /// guarantee (proven by a dedicated test). Factored out so both paths stay
 /// byte-identical except for that one deliberate difference.
-pub fn build_claude_command(cfg: &Config, prompt: &str, session_id: Option<&str>) -> Command {
+pub fn build_claude_command(
+    cfg: &Config,
+    prompt: &str,
+    session_id: Option<&str>,
+    active: &ActiveModel,
+) -> Command {
     let mut cmd = Command::new(&cfg.claude_bin);
-    cmd.args(build_claude_args(cfg, prompt, session_id))
+    cmd.args(build_claude_args(cfg, prompt, session_id, active))
         .current_dir(&cfg.vault) // cwd = vault → CLAUDE.md auto-loads
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true); // killed if the timeout fires or the task is dropped
+    // Apply the active model's backend to the MAIN turn — and ONLY when it is
+    // non-ambient. For the ambient `opus` default this is a no-op, so the command carries
+    // NO `ANTHROPIC_*` and the main-turn isolation property holds byte-for-byte.
+    apply_main_env(&mut cmd, active);
     cmd
+}
+
+/// The tool-posture args for a READ-ONLY main turn (a non-ambient model with writes off).
+/// The contained boundary mirrors the vault-QA child's proven posture — a read-only ROOT
+/// allowlist ([`VAULTQA_CHILD_ROOT_TOOLS`]) so write/exec/orchestration built-ins are
+/// absent at the ROOT (deny-by-default, not permission-gated), a read-only
+/// `--allowedTools` grant (the three built-ins plus the four read-only qmd search tools),
+/// and an extended denylist as belt-and-suspenders. NO `Write`, NO `Edit`, NO `Bash`, and
+/// no outbound-send tool of any kind is reachable. MCP servers are still discovered from
+/// the vault project (so qmd works), but only the read-only qmd tools are granted.
+pub fn build_readonly_tool_args() -> Vec<String> {
+    vec![
+        // ROOT boundary: a read-only built-in root set (not the writes-on full set).
+        "--tools".to_string(),
+        VAULTQA_CHILD_ROOT_TOOLS.to_string(),
+        // Read + search built-ins plus the four read-only qmd search tools.
+        "--allowedTools".to_string(),
+        VAULTQA_CHILD_ALLOWED_TOOLS.to_string(),
+        // Belt-and-suspenders behind the root allowlist.
+        "--disallowedTools".to_string(),
+        MAIN_READONLY_DISALLOWED_TOOLS.to_string(),
+    ]
+}
+
+/// Layer the ACTIVE model's backend onto the MAIN turn's `Command` — the global model
+/// switch. For a non-ambient model it sets `ANTHROPIC_BASE_URL` / `ANTHROPIC_AUTH_TOKEN`
+/// / `ANTHROPIC_MODEL` so the main turn talks to that backend, AND
+/// `CLAUDE_CODE_SUBAGENT_MODEL` to the same model id so the subagents the turn spawns
+/// follow the switch too. For the ambient `opus` default (`active.env` is `None`) it is a
+/// NO-OP: the main turn inherits the ambient process env unchanged — the isolation
+/// property. Unlike `apply_title_env` / `apply_diet_env` / `apply_vaultqa_env` (which
+/// carry a per-ROLE backend), this carries the CONVERSATION's chosen model; the two
+/// never mix (a main turn never calls the role appliers, and vice versa).
+pub fn apply_main_env(cmd: &mut Command, active: &ActiveModel) {
+    if let Some((base_url, auth_token, model)) = &active.env {
+        cmd.env("ANTHROPIC_BASE_URL", base_url)
+            .env("ANTHROPIC_AUTH_TOKEN", auth_token)
+            .env("ANTHROPIC_MODEL", model);
+        if let Some(subagent) = &active.subagent_model {
+            cmd.env("CLAUDE_CODE_SUBAGENT_MODEL", subagent);
+        }
+    }
 }
 
 /// Layer the title-backend override onto a TITLE child's `Command`. When the
@@ -620,6 +718,15 @@ pub const VAULTQA_CHILD_ALLOWED_TOOLS: &str =
 pub const VAULTQA_CHILD_DISALLOWED_TOOLS: &str =
     "Bash,Write,Edit,NotebookEdit,WebFetch,WebSearch,Task,Agent,ToolSearch,Workflow,TodoWrite";
 
+/// The denylist for a READ-ONLY MAIN turn (a non-ambient model with writes off). The
+/// vault-QA child's denylist plus `Skill` — the main turn's normal allowlist can load
+/// the `diet-logging` skill (whose actions write), so it is named here as
+/// belt-and-suspenders behind the read-only root allowlist (`--tools "Read,Grep,Glob"`).
+/// Enumerated denial is fragile by nature (see the vault-QA child docs); the root
+/// allowlist is the real guarantee, this is defense-in-depth.
+pub const MAIN_READONLY_DISALLOWED_TOOLS: &str =
+    "Bash,Write,Edit,NotebookEdit,WebFetch,WebSearch,Task,Agent,ToolSearch,Workflow,TodoWrite,Skill";
+
 /// Build the base `Command` for the stateless, READ-ONLY vault-QA child. A near-clone
 /// of [`build_diet_child_command`] with deliberate deltas so the child can read the
 /// vault and answer a self-referential question from it:
@@ -740,7 +847,8 @@ pub async fn run_claude_streaming(
     session_id: Option<&str>,
     jobs: &JobStore,
     job_id: &str,
-) -> Result<(String, Option<String>), ApiError> {
+    active: &ActiveModel,
+) -> Result<(String, Option<String>, ShadowUsage), ApiError> {
     const MAX_ATTEMPTS: u32 = 3; // 1 try + 2 retries
 
     // A manual `loop` (not `for attempt in 1..=MAX_ATTEMPTS`) so the terminal
@@ -764,7 +872,11 @@ pub async fn run_claude_streaming(
         // build_claude_args (C1); the agent runs under --permission-mode default.
         // A main turn deliberately does NOT call apply_title_env: the title-backend
         // override touches the title child only, never a real agent turn.
-        let mut cmd = build_claude_command(cfg, prompt, session_id);
+        // The active model backs this turn: for a non-ambient model `build_claude_command`
+        // applies its ANTHROPIC_* + CLAUDE_CODE_SUBAGENT_MODEL and, when writes are off,
+        // the read-only allowlist; for the ambient default it applies nothing (byte-for-
+        // byte today's command).
+        let mut cmd = build_claude_command(cfg, prompt, session_id, active);
 
         let mut child = cmd.spawn().map_err(|e| {
             (
@@ -900,13 +1012,18 @@ pub async fn run_claude_streaming(
         let outcome = resolve_stream_outcome(terminal, &streamed, &stderr);
 
         match outcome {
-            ClaudeOutcome::Ok { result, session_id } => {
+            ClaudeOutcome::Ok {
+                result,
+                session_id,
+                usage,
+            } => {
                 // Cap the stored reply at MAX_OUTPUT_BYTES *bytes* on a char
                 // boundary (M1) — not chars, which for multibyte text could keep
                 // up to ~4× the budget. This matches the byte-based stream cap.
                 break Ok((
                     truncate_bytes_on_char_boundary(&result, MAX_OUTPUT_BYTES).to_string(),
                     session_id,
+                    usage,
                 ));
             }
             ClaudeOutcome::Fatal { message } => break Err((StatusCode::BAD_GATEWAY, message)),
@@ -932,6 +1049,20 @@ pub async fn run_claude_streaming(
     }
 }
 
+/// Split a streamed turn's result into the `(text, session_id)` pair the rest of the
+/// pipeline (`apply_directives`, badge, provenance) already consumes, plus the token
+/// `usage` peeled off for the per-turn cost badge. An error carries empty usage. This is
+/// the single seam between `run_claude_streaming`'s usage-bearing return and the existing
+/// `(String, Option<String>)`-shaped outcome, so nothing downstream had to change shape.
+pub fn split_turn_usage(
+    res: Result<(String, Option<String>, ShadowUsage), ApiError>,
+) -> (Result<(String, Option<String>), ApiError>, ShadowUsage) {
+    match res {
+        Ok((text, session_id, usage)) => (Ok((text, session_id)), usage),
+        Err(e) => (Err(e), ShadowUsage::default()),
+    }
+}
+
 /// A stateless, single `claude -p` invocation — the primitive behind
 /// `POST /jesse/title`. It reuses the exact same least-privilege args
 /// (`build_claude_args`, so identical `--permission-mode`/allow/deny posture),
@@ -952,8 +1083,11 @@ pub async fn run_claude_oneshot(
     timeout_secs: u64,
 ) -> Result<String, ApiError> {
     // Same args as a turn (stream-json + the least-privilege allow/deny lists),
-    // no --resume: a title call is never part of a thread.
-    let mut cmd = build_claude_command(cfg, prompt, None);
+    // no --resume: a title call is never part of a thread. The title path is AMBIENT and
+    // untouched by the model switch, so it passes the ambient active model — the command
+    // is byte-for-byte today's, and `apply_title_env` below still layers any title
+    // backend on top (the two never mix).
+    let mut cmd = build_claude_command(cfg, prompt, None, &ActiveModel::ambient());
     // Title-only backend override: point THIS child at the configured
     // base_url/token/model when all three JESSE_TITLE_* vars are set. A no-op
     // otherwise (ambient backend). Main turns never call this.
@@ -1113,7 +1247,7 @@ mod tests {
     fn interpret_success_envelope_is_ok() {
         let stdout = r#"{"type":"result","is_error":false,"result":"OK","session_id":"sess-1"}"#;
         match interpret_claude_output(stdout, "", true) {
-            ClaudeOutcome::Ok { result, session_id } => {
+            ClaudeOutcome::Ok { result, session_id, .. } => {
                 assert_eq!(result, "OK");
                 assert_eq!(session_id.as_deref(), Some("sess-1"));
             }
@@ -1123,7 +1257,7 @@ mod tests {
     #[test]
     fn interpret_non_json_success_is_raw_ok() {
         match interpret_claude_output("  just plain text  ", "", true) {
-            ClaudeOutcome::Ok { result, session_id } => {
+            ClaudeOutcome::Ok { result, session_id, .. } => {
                 assert_eq!(result, "just plain text");
                 assert!(session_id.is_none());
             }
@@ -1171,7 +1305,7 @@ mod tests {
     fn parse_terminal_result_ok() {
         let line = r#"{"type":"result","subtype":"success","is_error":false,"result":"the answer","session_id":"sess-9"}"#;
         match parse_stream_line(line) {
-            StreamEvent::Done(ClaudeOutcome::Ok { result, session_id }) => {
+            StreamEvent::Done(ClaudeOutcome::Ok { result, session_id, .. }) => {
                 assert_eq!(result, "the answer");
                 assert_eq!(session_id.as_deref(), Some("sess-9"));
             }
@@ -1213,7 +1347,7 @@ mod tests {
     fn build_claude_args_requests_partial_stream_json() {
         // The streaming contract: stream-json + the two flags `claude` requires
         // for token-level deltas under `-p`.
-        let args = build_claude_args(&test_config(), "hi", None);
+        let args = build_claude_args(&test_config(), "hi", None, &ActiveModel::ambient());
         let pos = |needle: &str| args.iter().position(|a| a == needle);
         let of = pos("--output-format").expect("--output-format present");
         assert_eq!(args[of + 1], "stream-json");
@@ -1230,7 +1364,7 @@ mod tests {
     fn real_success_turn_yields_full_result_text() {
         // Normal turn: the authoritative `result` text is delivered verbatim.
         match replay_outcome(FX_SUCCESS, "") {
-            ClaudeOutcome::Ok { result, session_id } => {
+            ClaudeOutcome::Ok { result, session_id, .. } => {
                 assert!(
                     result.contains("This vault is") && result.len() > 600,
                     "expected the full ~693-char answer, got {} chars",
@@ -1249,7 +1383,7 @@ mod tests {
         // Success envelope but `result` is "" — must deliver the streamed answer
         // (not an empty bubble), keeping the result line's session_id.
         match replay_outcome(FX_EMPTY_RESULT, "") {
-            ClaudeOutcome::Ok { result, session_id } => {
+            ClaudeOutcome::Ok { result, session_id, .. } => {
                 assert!(
                     result.contains("This vault is") && !result.trim().is_empty(),
                     "empty `result` should fall back to streamed text, got {result:?}"
@@ -1267,7 +1401,7 @@ mod tests {
         // No terminal `result` line at all, but the turn streamed an answer →
         // deliver it (not the old unconditional Fatal). session_id is unknown.
         match replay_outcome(FX_MISSING_RESULT, "") {
-            ClaudeOutcome::Ok { result, session_id } => {
+            ClaudeOutcome::Ok { result, session_id, .. } => {
                 assert!(result.contains("This vault is"), "got {result:?}");
                 assert!(session_id.is_none(), "no result line → no session_id");
             }
@@ -1302,7 +1436,7 @@ mod tests {
     #[test]
     fn build_claude_args_enforces_least_privilege() {
         let cfg = test_config();
-        let args = build_claude_args(&cfg, "hello", None);
+        let args = build_claude_args(&cfg, "hello", None, &ActiveModel::ambient());
 
         // --allowedTools is always present, with the configured list as its value.
         let idx = args
@@ -1445,7 +1579,7 @@ mod tests {
         // With the override configured, the TITLE child's Command carries exactly
         // ANTHROPIC_BASE_URL / _AUTH_TOKEN / _MODEL set to the configured values.
         let cfg = cfg_with_title_backend();
-        let mut cmd = build_claude_command(&cfg, "hi", None);
+        let mut cmd = build_claude_command(&cfg, "hi", None, &ActiveModel::ambient());
         apply_title_env(&mut cmd, &cfg);
         let env = cmd_env_overrides(&cmd);
         assert_eq!(
@@ -1472,7 +1606,7 @@ mod tests {
             cfg.title_backend.is_none(),
             "test_config must default to no override"
         );
-        let mut cmd = build_claude_command(&cfg, "hi", None);
+        let mut cmd = build_claude_command(&cfg, "hi", None, &ActiveModel::ambient());
         apply_title_env(&mut cmd, &cfg);
         let env = cmd_env_overrides(&cmd);
         for k in TITLE_ENV_KEYS {
@@ -1493,7 +1627,7 @@ mod tests {
         assert!(cfg.title_backend.is_some(), "precondition: override is set");
         // A resumed turn and a fresh turn are both built the main-turn way.
         for sid in [None, Some("sess-1")] {
-            let cmd = build_claude_command(&cfg, "do the thing", sid);
+            let cmd = build_claude_command(&cfg, "do the thing", sid, &ActiveModel::ambient());
             let env = cmd_env_overrides(&cmd);
             for k in TITLE_ENV_KEYS {
                 assert!(
@@ -1701,7 +1835,7 @@ mod tests {
         let cfg = cfg_with_diet_backend();
         assert!(cfg.diet_backend.is_some(), "precondition: override is set");
         for sid in [None, Some("sess-1")] {
-            let cmd = build_claude_command(&cfg, "do the thing", sid);
+            let cmd = build_claude_command(&cfg, "do the thing", sid, &ActiveModel::ambient());
             let env = cmd_env_overrides(&cmd);
             for k in TITLE_ENV_KEYS {
                 assert!(
@@ -1722,8 +1856,8 @@ mod tests {
         let mut without = with.clone();
         without.diet_backend = None;
         for sid in [None, Some("sess-42")] {
-            let a = build_claude_command(&with, "log a banana", sid);
-            let b = build_claude_command(&without, "log a banana", sid);
+            let a = build_claude_command(&with, "log a banana", sid, &ActiveModel::ambient());
+            let b = build_claude_command(&without, "log a banana", sid, &ActiveModel::ambient());
             let argv = |c: &Command| -> Vec<String> {
                 c.as_std()
                     .get_args()
@@ -1906,7 +2040,7 @@ mod tests {
             "precondition: override is set"
         );
         for sid in [None, Some("sess-1")] {
-            let cmd = build_claude_command(&cfg, "do the thing", sid);
+            let cmd = build_claude_command(&cfg, "do the thing", sid, &ActiveModel::ambient());
             let env = cmd_env_overrides(&cmd);
             for k in TITLE_ENV_KEYS {
                 assert!(
@@ -1925,8 +2059,8 @@ mod tests {
         let mut without = with.clone();
         without.vaultqa_backend = None;
         for sid in [None, Some("sess-42")] {
-            let a = build_claude_command(&with, "what is my vo2 max", sid);
-            let b = build_claude_command(&without, "what is my vo2 max", sid);
+            let a = build_claude_command(&with, "what is my vo2 max", sid, &ActiveModel::ambient());
+            let b = build_claude_command(&without, "what is my vo2 max", sid, &ActiveModel::ambient());
             let argv = |c: &Command| -> Vec<String> {
                 c.as_std()
                     .get_args()
@@ -1947,14 +2081,170 @@ mod tests {
         }
     }
 
+    // ---- The global model switch (main-turn model application) --------------
+
+    /// A resolved non-ambient (GLM) active model for the switch tests, with an env triple
+    /// DISTINCT from every role backend's so a leak is detectable.
+    fn glm_active() -> ActiveModel {
+        ActiveModel {
+            id: "glm-5.2".to_string(),
+            kind: ModelKind::Hosted,
+            env: Some((
+                "http://fireworks".to_string(),
+                "fw-tok".to_string(),
+                "glm-model".to_string(),
+            )),
+            subagent_model: Some("glm-model".to_string()),
+            writes_allowed: false,
+            price: PriceDeck::ZERO,
+        }
+    }
+
+    /// A cfg with ALL THREE role backends configured to distinct values — the switch must
+    /// never let any of them leak onto the main turn.
+    fn cfg_with_all_role_backends() -> Config {
+        let mut cfg = test_config();
+        cfg.title_backend = Some((
+            "http://title".to_string(),
+            "title-tok".to_string(),
+            "title-model".to_string(),
+        ));
+        cfg.diet_backend = Some((
+            "http://diet".to_string(),
+            "diet-tok".to_string(),
+            "diet-model".to_string(),
+        ));
+        cfg.vaultqa_backend = Some((
+            "http://vault".to_string(),
+            "vault-tok".to_string(),
+            "vault-model".to_string(),
+        ));
+        cfg
+    }
+
+    #[test]
+    fn main_turn_with_active_opus_carries_no_anthropic_env() {
+        // The updated isolation invariant, half one: with the DEFAULT (opus/ambient)
+        // active, the main-turn command carries none of the three ANTHROPIC_* overrides
+        // AND no subagent-model override — even when every role backend is configured.
+        let cfg = cfg_with_all_role_backends();
+        let opus = ActiveModel::ambient();
+        for sid in [None, Some("sess-1")] {
+            let cmd = build_claude_command(&cfg, "do the thing", sid, &opus);
+            let env = cmd_env_overrides(&cmd);
+            for k in TITLE_ENV_KEYS {
+                assert!(!env.contains_key(k), "opus main turn must NOT carry {k}");
+            }
+            assert!(
+                !env.contains_key("CLAUDE_CODE_SUBAGENT_MODEL"),
+                "opus main turn must NOT set a subagent model"
+            );
+        }
+    }
+
+    #[test]
+    fn main_turn_with_active_glm_carries_exactly_the_glm_triple_and_subagent_model() {
+        // The updated isolation invariant, half two: with a non-ambient model active, the
+        // main-turn command carries EXACTLY that model's triple + subagent model, and NONE
+        // of the title/diet/vault-QA role backends' distinct values leaks onto it.
+        let cfg = cfg_with_all_role_backends();
+        let active = glm_active();
+        for sid in [None, Some("sess-1")] {
+            let cmd = build_claude_command(&cfg, "do the thing", sid, &active);
+            let env = cmd_env_overrides(&cmd);
+            assert_eq!(
+                env.get("ANTHROPIC_BASE_URL").map(String::as_str),
+                Some("http://fireworks")
+            );
+            assert_eq!(
+                env.get("ANTHROPIC_AUTH_TOKEN").map(String::as_str),
+                Some("fw-tok")
+            );
+            assert_eq!(
+                env.get("ANTHROPIC_MODEL").map(String::as_str),
+                Some("glm-model")
+            );
+            // The subagents follow the switch.
+            assert_eq!(
+                env.get("CLAUDE_CODE_SUBAGENT_MODEL").map(String::as_str),
+                Some("glm-model")
+            );
+            // No role backend's distinct value appears anywhere in the env overrides.
+            for leaked in [
+                "http://title",
+                "title-tok",
+                "title-model",
+                "http://diet",
+                "diet-tok",
+                "diet-model",
+                "http://vault",
+                "vault-tok",
+                "vault-model",
+            ] {
+                assert!(
+                    !env.values().any(|v| v == leaked),
+                    "role backend value {leaked:?} leaked onto the switched main turn"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn readonly_main_turn_allowlist_has_no_write_or_send_tools() {
+        // A non-ambient READ-ONLY model (writes off) yields the contained boundary: a
+        // read-only root allowlist and no Write/Edit/Bash/send tool anywhere. The boundary
+        // is the allowlist, not the prompt.
+        let cfg = test_config();
+        let active = glm_active(); // writes_allowed = false
+        let args = build_claude_args(&cfg, "read the vault", None, &active);
+        let val = |flag: &str| -> Option<String> {
+            args.iter().position(|a| a == flag).map(|i| args[i + 1].clone())
+        };
+        // The read-only ROOT boundary is present.
+        assert_eq!(val("--tools").as_deref(), Some("Read,Grep,Glob"));
+        let allow = val("--allowedTools").expect("--allowedTools present");
+        let tools: Vec<&str> = allow.split(',').map(|t| t.trim()).collect();
+        assert!(tools.contains(&"Read"), "reads are allowed: {tools:?}");
+        // No write, edit, exec, or send tool is in the allowlist.
+        for forbidden in ["Write", "Edit", "Bash", "WebFetch", "WebSearch"] {
+            assert!(
+                !tools.iter().any(|t| *t == forbidden || t.starts_with(&format!("{forbidden}("))),
+                "read-only allowlist must not grant {forbidden}: {tools:?}"
+            );
+        }
+        // And no scoped Bash / node / Skill grant survives (they can write/exec).
+        assert!(
+            !tools.iter().any(|t| t.starts_with("Bash(") || t.starts_with("Skill")),
+            "read-only allowlist must drop the scoped Bash/Skill grants: {tools:?}"
+        );
+    }
+
+    #[test]
+    fn writes_on_non_ambient_model_uses_the_full_allowlist() {
+        // Phase 2 shape: a non-ambient model WITH writes enabled uses the same full
+        // allowlist opus does (byte-for-byte the configured list), not the read-only set.
+        let cfg = test_config();
+        let mut active = glm_active();
+        active.writes_allowed = true;
+        let args = build_claude_args(&cfg, "edit the vault", None, &active);
+        let allow = args
+            .iter()
+            .position(|a| a == "--allowedTools")
+            .map(|i| args[i + 1].clone())
+            .expect("--allowedTools present");
+        assert_eq!(allow, cfg.allowed_tools, "writes-on → the full allowlist");
+        // No read-only root boundary is added on the writes-on path.
+        assert!(!args.iter().any(|a| a == "--tools"), "no read-only root boundary when writes-on");
+    }
+
     #[test]
     fn build_claude_args_resume_when_session() {
         let cfg = test_config();
-        let args = build_claude_args(&cfg, "hi", Some("sess-42"));
+        let args = build_claude_args(&cfg, "hi", Some("sess-42"), &ActiveModel::ambient());
         let ridx = args.iter().position(|a| a == "--resume").expect("--resume");
         assert_eq!(args[ridx + 1], "sess-42");
         // No --resume without a session id.
-        let none = build_claude_args(&cfg, "hi", None);
+        let none = build_claude_args(&cfg, "hi", None, &ActiveModel::ambient());
         assert!(!none.iter().any(|a| a == "--resume"));
     }
     #[test]
@@ -1966,7 +2256,7 @@ mod tests {
         // success. Proven directly on the argv the child is spawned with.
         let cfg = test_config();
         let synthetic = format!("local-{}", random_hex());
-        let args = build_claude_args(&cfg, "hi", Some(&synthetic));
+        let args = build_claude_args(&cfg, "hi", Some(&synthetic), &ActiveModel::ambient());
         assert!(
             !args.iter().any(|a| a == "--resume"),
             "a synthetic local- id must never produce --resume: {args:?}"
@@ -1976,7 +2266,7 @@ mod tests {
             "the synthetic id must not appear anywhere in argv: {args:?}"
         );
         // A real id still resumes, unchanged.
-        let real = build_claude_args(&cfg, "hi", Some("real-sess-1"));
+        let real = build_claude_args(&cfg, "hi", Some("real-sess-1"), &ActiveModel::ambient());
         let ridx = real.iter().position(|a| a == "--resume").expect("--resume");
         assert_eq!(real[ridx + 1], "real-sess-1");
     }
