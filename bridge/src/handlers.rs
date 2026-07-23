@@ -1314,15 +1314,24 @@ pub fn effective_writes(m: &RegistryModel, store: &ModelStore) -> bool {
     matches!(m.kind, ModelKind::Ambient) || store.writes_override(&m.id).unwrap_or(m.default_writes)
 }
 
-/// One model row for `GET /jesse/models`. Exposes ids and booleans ONLY — never a base
-/// url or token (those live in the launch env and never reach a client).
-fn model_row(m: &RegistryModel, store: &ModelStore) -> Value {
+/// One model row for `GET /jesse/models`. Exposes ids, booleans, enums, and numbers ONLY —
+/// never a base url or token (those live in the launch env and never reach a client). The
+/// health fields let the app render the three distinguishable states: available (configured
+/// AND healthy), unhealthy (configured, last probe failed), and unconfigured (no token/
+/// triple). `last_checked_ms` / `latency_ms` are the last probe's stamp + round-trip (both
+/// optional — absent for opus and before the first probe).
+fn model_row(m: &RegistryModel, store: &ModelStore, health: &HealthStore) -> Value {
+    let h = model_health(m, health);
     json!({
         "id": m.id,
         "label": m.label,
         "kind": m.kind,
-        "available": m.available,
+        "configured": h.configured,
+        "healthy": h.healthy,
+        "available": h.available(),
         "writes_allowed": effective_writes(m, store),
+        "last_checked_ms": h.status.as_ref().map(|s| s.checked_at_ms),
+        "latency_ms": h.status.as_ref().and_then(|s| s.latency_ms),
     })
 }
 
@@ -1338,7 +1347,7 @@ pub async fn jesse_models(
         .model_registry
         .models
         .iter()
-        .map(|m| model_row(m, &st.models))
+        .map(|m| model_row(m, &st.models, &st.health))
         .collect();
     Ok(Json(json!({
         "active": st.models.active(),
@@ -1346,10 +1355,11 @@ pub async fn jesse_models(
     })))
 }
 
-/// `POST /jesse/model` — set the active model. Rejects an unknown id (400) or an
-/// unavailable one (409, e.g. `kimi-k3` until a live slug resolves, or a hosted model
-/// whose triple is unset) so the conversation never switches onto a model the bridge
-/// cannot actually reach. Same bearer auth as `/jesse`.
+/// `POST /jesse/model` — set the active model. Rejects an unknown id (400) or one that is
+/// unconfigured OR unhealthy (409) so the conversation never switches onto a model the
+/// bridge cannot actually reach: `kimi-k3` until a live slug resolves, a hosted model whose
+/// token is unset, or a configured model whose last health probe failed. `opus` is always
+/// selectable (healthy by construction). Same bearer auth as `/jesse`.
 pub async fn jesse_set_model(
     State(st): State<AppState>,
     headers: HeaderMap,
@@ -1358,14 +1368,23 @@ pub async fn jesse_set_model(
     check_auth(&headers, &st.cfg.token)?;
     let id = req.id.trim();
     match st.cfg.model_registry.get(id) {
-        Some(m) if m.available => {
-            let active = st.models.set_active(id);
-            Ok(Json(json!({ "active": active })))
+        Some(m) => {
+            let h = model_health(m, &st.health);
+            if h.available() {
+                let active = st.models.set_active(id);
+                Ok(Json(json!({ "active": active })))
+            } else if !h.configured {
+                Err((
+                    StatusCode::CONFLICT,
+                    format!("model '{id}' is not configured"),
+                ))
+            } else {
+                Err((
+                    StatusCode::CONFLICT,
+                    format!("model '{id}' is unhealthy (last probe failed)"),
+                ))
+            }
         }
-        Some(_) => Err((
-            StatusCode::CONFLICT,
-            format!("model '{id}' is unavailable"),
-        )),
         None => Err((StatusCode::BAD_REQUEST, format!("unknown model '{id}'"))),
     }
 }
@@ -1383,7 +1402,10 @@ pub async fn jesse_set_model_writes(
     check_auth(&headers, &st.cfg.token)?;
     let id = id.trim();
     match st.cfg.model_registry.get(id) {
-        Some(m) if m.available => {
+        // Gated on CONFIGURED (not health): a write preference can be set for a configured
+        // model even while it is momentarily unhealthy — it is a stored authorization, not a
+        // runtime action. An unconfigured model has no backend to authorize, so it 409s.
+        Some(m) if m.configured => {
             if matches!(m.kind, ModelKind::Ambient) {
                 return Err((
                     StatusCode::BAD_REQUEST,
@@ -1395,7 +1417,7 @@ pub async fn jesse_set_model_writes(
         }
         Some(_) => Err((
             StatusCode::CONFLICT,
-            format!("model '{id}' is unavailable"),
+            format!("model '{id}' is not configured"),
         )),
         None => Err((StatusCode::BAD_REQUEST, format!("unknown model '{id}'"))),
     }

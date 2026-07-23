@@ -60,6 +60,75 @@ final class ModelSwitchWireTests: XCTestCase {
         XCTAssertTrue(p.accessibilityText.contains("cost $0.0021"))
     }
 
+    func testModelsPayloadDecodesHealthFieldsAndReasons() throws {
+        // The health-checked registry (Part B): rows carry configured / healthy / available
+        // plus optional last_checked_ms / latency_ms, and the app derives the disabled reason.
+        let json = """
+        {
+          "active": "opus",
+          "models": [
+            { "id": "opus", "label": "Claude Opus", "kind": "ambient", "configured": true,
+              "healthy": true, "available": true, "writes_allowed": true },
+            { "id": "fireworks", "label": "Fireworks", "kind": "hosted", "configured": true,
+              "healthy": true, "available": true, "writes_allowed": false,
+              "last_checked_ms": 1700000000000, "latency_ms": 42 },
+            { "id": "glm-5.2", "label": "GLM 5.2", "kind": "hosted", "configured": true,
+              "healthy": false, "available": false, "writes_allowed": false,
+              "last_checked_ms": 1700000000000, "latency_ms": 3000 },
+            { "id": "kimi-k3", "label": "Kimi K3", "kind": "hosted", "configured": false,
+              "healthy": false, "available": false, "writes_allowed": false }
+          ]
+        }
+        """
+        let state = try JSONDecoder().decode(ModelSwitchState.self, from: Data(json.utf8))
+
+        let fw = try XCTUnwrap(state.models.first { $0.id == "fireworks" })
+        XCTAssertTrue(fw.configured && fw.healthy && fw.available)
+        XCTAssertNil(fw.unavailableReason, "a configured + healthy model is selectable")
+        XCTAssertEqual(fw.latencyMs, 42)
+        XCTAssertEqual(fw.lastCheckedMs, 1_700_000_000_000)
+
+        // Configured but the last probe failed → unreachable.
+        let glm = try XCTUnwrap(state.models.first { $0.id == "glm-5.2" })
+        XCTAssertTrue(glm.configured)
+        XCTAssertFalse(glm.healthy)
+        XCTAssertFalse(glm.available)
+        XCTAssertEqual(glm.unavailableReason, "unreachable")
+
+        // No token/triple armed → not configured.
+        let kimi = try XCTUnwrap(state.models.first { $0.id == "kimi-k3" })
+        XCTAssertFalse(kimi.configured)
+        XCTAssertEqual(kimi.unavailableReason, "not configured")
+
+        // Ambient opus: available with no probe timestamps.
+        let opus = try XCTUnwrap(state.models.first { $0.id == "opus" })
+        XCTAssertNil(opus.unavailableReason)
+        XCTAssertNil(opus.lastCheckedMs)
+    }
+
+    func testOlderBridgeWithoutHealthFieldsDefaultsToAvailable() throws {
+        // A pre-health bridge omits configured/healthy/last_checked_ms/latency_ms. The app must
+        // still decode, defaulting configured/healthy to `available` (the old configured⇒available
+        // model), so nothing regresses against an older bridge.
+        let json = """
+        {
+          "active": "opus",
+          "models": [
+            { "id": "opus", "label": "Claude Opus", "kind": "ambient", "available": true, "writes_allowed": true },
+            { "id": "kimi-k3", "label": "Kimi K3", "kind": "hosted", "available": false, "writes_allowed": false }
+          ]
+        }
+        """
+        let state = try JSONDecoder().decode(ModelSwitchState.self, from: Data(json.utf8))
+        let opus = try XCTUnwrap(state.models.first { $0.id == "opus" })
+        XCTAssertTrue(opus.configured && opus.healthy, "available ⇒ configured + healthy on an older bridge")
+        XCTAssertNil(opus.unavailableReason)
+        let kimi = try XCTUnwrap(state.models.first { $0.id == "kimi-k3" })
+        XCTAssertFalse(kimi.configured, "an older bridge's unavailable model reads as not configured")
+        XCTAssertEqual(kimi.unavailableReason, "not configured")
+        XCTAssertNil(kimi.latencyMs)
+    }
+
     func testLocalProvenanceWithoutCostDecodesAndHasNoCostLabel() throws {
         // A local route omits cost_usd; an older bridge omits it too. Both decode cleanly.
         let json = """

@@ -676,29 +676,39 @@ pub enum ModelKind {
     Local,
 }
 
-/// One selectable model in the registry. Built from launch env; holds no secret beyond
-/// what the env supplied (the token lives ONLY inside `backend`, and is never
-/// serialized to a client or to `model.json`).
+/// One selectable model in the registry. Built from the built-in ambient default, the
+/// `JESSE_MODEL_*` env triples, and the declarative `[[models]]` config; holds no secret
+/// beyond what the env supplied (the token lives ONLY inside `backend`, resolved from a
+/// named env var, and is never serialized to a client or to `model.json`).
 #[derive(Debug, Clone)]
 pub struct RegistryModel {
-    /// The stable id the store + endpoints key on (`opus`, `glm-5.2`, `kimi-k3`, `local`).
+    /// The stable id the store + endpoints key on (`opus`, `glm-5.2`, `kimi-k3`, `local`,
+    /// or any declarative id).
     pub id: String,
     /// The human label shown in the app's switcher.
     pub label: String,
     pub kind: ModelKind,
     /// `(base_url, auth_token, model_id)` — the same all-or-nothing triple shape as the
     /// role backends. `None` for the ambient entry (it applies nothing) AND for a
-    /// hosted/local entry whose triple did not fully resolve (then `available` is false).
+    /// hosted/local entry whose triple did not fully resolve (then `configured` is false).
     pub backend: Option<(String, String, String)>,
-    /// Whether this entry may be selected as the active model. Ambient is always
-    /// available; a hosted/local entry is available IFF its triple resolved.
-    pub available: bool,
+    /// The subagent model id the switch propagates via `CLAUDE_CODE_SUBAGENT_MODEL` (default
+    /// = the backend's `model_id`; a declarative entry may override it). `None` for the
+    /// ambient entry and any unconfigured entry.
+    pub subagent_model: Option<String>,
+    /// Whether this entry's backend/token RESOLVED (a selectable model must also be HEALTHY —
+    /// see [`model_health`]). Ambient is always configured; a hosted/local entry is
+    /// configured IFF its triple resolved (its token env var was set).
+    pub configured: bool,
     /// The write permission a freshly-registered model gets before any explicit opt-in.
     /// Ambient (`opus`) is always `true` (writes-on); every non-ambient entry defaults
-    /// `false` — read-only until writes are enabled per model (Phase 2).
+    /// `false` — read-only until writes are enabled per model.
     pub default_writes: bool,
     /// The price deck for the per-turn cost badge.
     pub price: PriceDeck,
+    /// The health-probe cadence + endpoint for this model (unused for the ambient entry,
+    /// which is healthy by construction and never probed).
+    pub health: HealthConfig,
 }
 
 /// The set of models the conversation can be switched onto. Ordered as presented to the
@@ -725,9 +735,12 @@ impl ModelRegistry {
             .unwrap_or_else(|| &self.models[0])
     }
 
-    /// Whether `id` names an entry that exists AND is available (selectable).
-    pub fn is_selectable(&self, id: &str) -> bool {
-        self.get(id).map(|m| m.available).unwrap_or(false)
+    /// Whether `id` names an entry that exists AND is CONFIGURED (its backend/token
+    /// resolved). Selectability additionally requires the model to be HEALTHY at the moment
+    /// of selection — the endpoint layer combines this with the live [`HealthStore`] (see
+    /// [`model_health`]); this alone cannot know the dynamic health state.
+    pub fn is_configured(&self, id: &str) -> bool {
+        self.get(id).map(|m| m.configured).unwrap_or(false)
     }
 
     /// The opus-only registry: the single always-available ambient default and nothing
@@ -739,81 +752,137 @@ impl ModelRegistry {
         }
     }
 
-    /// Build the four-entry registry from env. `opus` is always present and ambient;
-    /// `glm-5.2`, `kimi-k3`, and `local` resolve their triples from `JESSE_MODEL_*` and
-    /// are marked unavailable when incomplete (never a partial config).
-    pub fn from_env() -> Self {
-        // glm-5.2: hosted on Fireworks' Anthropic surface. base + model DEFAULT; only the
-        // token must be supplied, so an operator arms GLM with a single secret env var.
-        let glm_backend = resolve_model_backend(
-            "glm-5.2",
-            env_string("JESSE_MODEL_GLM_BASE_URL"),
-            env_string("JESSE_MODEL_GLM_AUTH_TOKEN"),
-            env_string("JESSE_MODEL_GLM_MODEL"),
-            Some("https://api.fireworks.ai/inference"),
-            Some("accounts/fireworks/models/glm-5p2"),
-        );
-        let glm = RegistryModel {
-            id: "glm-5.2".to_string(),
-            label: "GLM 5.2".to_string(),
-            kind: ModelKind::Hosted,
-            available: glm_backend.is_some(),
-            backend: glm_backend,
-            default_writes: false,
-            price: PriceDeck {
-                in_per_m: FW_IN_PER_M,
-                cached_per_m: FW_CACHED_PER_M,
-                out_per_m: FW_OUT_PER_M,
-            },
-        };
+    /// Build the registry by MERGING three sources, later overriding earlier BY ID:
+    ///   1. the built-in ambient `opus` (always present, never configurable — a declarative
+    ///      or env entry that tries to redefine it is refused);
+    ///   2. the `JESSE_MODEL_GLM_*` / `JESSE_MODEL_KIMI_*` / `JESSE_MODEL_LOCAL_*` env triples,
+    ///      preserved with the SAME ids, defaults, and prices as before so nothing deployed
+    ///      breaks;
+    ///   3. the declarative `[[models]]` array from the bridge config file (the same TOML the
+    ///      persona loads from — see [`load_local_models`]).
+    ///
+    /// With NO model config (no `JESSE_MODEL_*`, no `[[models]]`) this is exactly the
+    /// opus-only registry, so an unconfigured bridge is byte-for-byte today's behavior.
+    /// `home` is the captured `Config.home`, used to locate the config file.
+    pub fn from_env(home: &str) -> Self {
+        // Source 1: the built-in ambient default, first (the app presents default-first).
+        let mut models: Vec<RegistryModel> = vec![opus_entry()];
 
-        // kimi-k3: NO defaults — Fireworks does not yet serve Kimi K3 (open weights were
-        // due ~27 Jul 2026), so with no `JESSE_MODEL_KIMI_*` set it ships UNAVAILABLE and
-        // a selection attempt is rejected. When a live slug appears the operator supplies
-        // all three vars (and a real price deck via env) to arm it.
-        let kimi_backend = resolve_model_backend(
-            "kimi-k3",
-            env_string("JESSE_MODEL_KIMI_BASE_URL"),
-            env_string("JESSE_MODEL_KIMI_AUTH_TOKEN"),
-            env_string("JESSE_MODEL_KIMI_MODEL"),
-            None,
-            None,
-        );
-        let kimi = RegistryModel {
-            id: "kimi-k3".to_string(),
-            label: "Kimi K3".to_string(),
-            kind: ModelKind::Hosted,
-            available: kimi_backend.is_some(),
-            backend: kimi_backend,
-            default_writes: false,
-            // Placeholder until a live Fireworks slug + published pricing exist; overridable
-            // from env so arming Kimi later needs no code change.
-            price: model_price_from_env("JESSE_MODEL_KIMI", PriceDeck::ZERO),
-        };
+        // Source 2: the preserved env triples (same ids/defaults/prices as before).
+        upsert_model(&mut models, glm_env_entry());
+        upsert_model(&mut models, kimi_env_entry());
+        upsert_model(&mut models, local_env_entry());
 
-        // local: an Anthropic-compatible local endpoint. NO defaults — all three vars
-        // required. Free (price deck 0/0/0), so every local turn badges `$0.00`.
-        let local_backend = resolve_model_backend(
-            "local",
-            env_string("JESSE_MODEL_LOCAL_BASE_URL"),
-            env_string("JESSE_MODEL_LOCAL_AUTH_TOKEN"),
-            env_string("JESSE_MODEL_LOCAL_MODEL"),
-            None,
-            None,
-        );
-        let local = RegistryModel {
-            id: "local".to_string(),
-            label: "Local".to_string(),
-            kind: ModelKind::Local,
-            available: local_backend.is_some(),
-            backend: local_backend,
-            default_writes: false,
-            price: PriceDeck::ZERO,
-        };
-
-        ModelRegistry {
-            models: vec![opus_entry(), glm, kimi, local],
+        // Source 3: the declarative `[[models]]` entries (later overrides earlier by id).
+        for decl in load_local_models(home) {
+            if let Some(m) = registry_model_from_toml(&decl) {
+                upsert_model(&mut models, m);
+            }
         }
+
+        ModelRegistry { models }
+    }
+}
+
+/// Insert `m` into the list, REPLACING any existing entry with the same id IN PLACE (stable
+/// order, default-first preserved) or appending it when new. The ambient `opus` default is
+/// protected: an entry that tries to take its id is refused with a warning, so `opus` stays
+/// byte-for-byte the built-in. This is what makes the three-source merge "later overrides
+/// earlier by id" while keeping the always-present ambient default untouchable.
+fn upsert_model(models: &mut Vec<RegistryModel>, m: RegistryModel) {
+    if m.id == DEFAULT_MODEL_ID || matches!(m.kind, ModelKind::Ambient) {
+        eprintln!(
+            "jesse-bridge: WARNING model '{}' would redefine the built-in ambient default \
+             ('{DEFAULT_MODEL_ID}'); ignoring it — the ambient default is never configurable.",
+            m.id
+        );
+        return;
+    }
+    if let Some(existing) = models.iter_mut().find(|e| e.id == m.id) {
+        *existing = m;
+    } else {
+        models.push(m);
+    }
+}
+
+/// The `glm-5.2` env-triple entry (hosted on Fireworks' Anthropic surface). base + model
+/// DEFAULT; only the token must be supplied, so an operator arms GLM with a single secret
+/// env var.
+fn glm_env_entry() -> RegistryModel {
+    let backend = resolve_model_backend(
+        "glm-5.2",
+        env_string("JESSE_MODEL_GLM_BASE_URL"),
+        env_string("JESSE_MODEL_GLM_AUTH_TOKEN"),
+        env_string("JESSE_MODEL_GLM_MODEL"),
+        Some("https://api.fireworks.ai/inference"),
+        Some("accounts/fireworks/models/glm-5p2"),
+    );
+    RegistryModel {
+        id: "glm-5.2".to_string(),
+        label: "GLM 5.2".to_string(),
+        kind: ModelKind::Hosted,
+        subagent_model: backend.as_ref().map(|(_, _, m)| m.clone()),
+        configured: backend.is_some(),
+        backend,
+        default_writes: false,
+        price: PriceDeck {
+            in_per_m: FW_IN_PER_M,
+            cached_per_m: FW_CACHED_PER_M,
+            out_per_m: FW_OUT_PER_M,
+        },
+        health: HealthConfig::default(),
+    }
+}
+
+/// The `kimi-k3` env-triple entry. NO defaults — Fireworks does not yet serve Kimi K3, so
+/// with no `JESSE_MODEL_KIMI_*` set it ships UNCONFIGURED and a selection attempt is
+/// rejected. When a live slug appears the operator supplies all three vars (and a real price
+/// deck via env) to arm it.
+fn kimi_env_entry() -> RegistryModel {
+    let backend = resolve_model_backend(
+        "kimi-k3",
+        env_string("JESSE_MODEL_KIMI_BASE_URL"),
+        env_string("JESSE_MODEL_KIMI_AUTH_TOKEN"),
+        env_string("JESSE_MODEL_KIMI_MODEL"),
+        None,
+        None,
+    );
+    RegistryModel {
+        id: "kimi-k3".to_string(),
+        label: "Kimi K3".to_string(),
+        kind: ModelKind::Hosted,
+        subagent_model: backend.as_ref().map(|(_, _, m)| m.clone()),
+        configured: backend.is_some(),
+        backend,
+        default_writes: false,
+        // Placeholder until a live Fireworks slug + published pricing exist; overridable
+        // from env so arming Kimi later needs no code change.
+        price: model_price_from_env("JESSE_MODEL_KIMI", PriceDeck::ZERO),
+        health: HealthConfig::default(),
+    }
+}
+
+/// The `local` env-triple entry: an Anthropic-compatible local endpoint. NO defaults — all
+/// three vars required. Free (price deck 0/0/0), so every local turn badges `$0.00`.
+fn local_env_entry() -> RegistryModel {
+    let backend = resolve_model_backend(
+        "local",
+        env_string("JESSE_MODEL_LOCAL_BASE_URL"),
+        env_string("JESSE_MODEL_LOCAL_AUTH_TOKEN"),
+        env_string("JESSE_MODEL_LOCAL_MODEL"),
+        None,
+        None,
+    );
+    RegistryModel {
+        id: "local".to_string(),
+        label: "Local".to_string(),
+        kind: ModelKind::Local,
+        subagent_model: backend.as_ref().map(|(_, _, m)| m.clone()),
+        configured: backend.is_some(),
+        backend,
+        default_writes: false,
+        price: PriceDeck::ZERO,
+        health: HealthConfig::default(),
     }
 }
 
@@ -871,14 +940,182 @@ fn opus_entry() -> RegistryModel {
         label: "Claude Opus".to_string(),
         kind: ModelKind::Ambient,
         backend: None,
-        available: true,
+        subagent_model: None,
+        configured: true,
         default_writes: true,
         price: PriceDeck {
             in_per_m: OPUS_IN_PER_M,
             cached_per_m: OPUS_CACHED_PER_M,
             out_per_m: OPUS_OUT_PER_M,
         },
+        health: HealthConfig::default(),
     }
+}
+
+// ---- Declarative `[[models]]` config (source 3) ---------------------------
+//
+// A `[[models]]` array in the bridge config file (the same TOML the persona loads from)
+// declares a model with a pure config edit plus one env var for its token — no Rust change.
+// Every field is optional at the parse layer so a partial/typo'd entry is SKIPPED with a
+// warning rather than failing the whole file (which would also drop the persona); the
+// required fields (`id`, `kind`, `base_url`, `model`) are validated in code.
+
+/// The optional `price = { in_per_m, cached_per_m, out_per_m }` sub-table (each field
+/// defaults to 0.0 → a free model unless priced).
+#[derive(Deserialize, Debug, Default, Clone)]
+pub struct PriceToml {
+    pub in_per_m: Option<f64>,
+    pub cached_per_m: Option<f64>,
+    pub out_per_m: Option<f64>,
+}
+
+/// The optional `health = { path, interval_secs, timeout_secs }` sub-table (each field
+/// defaults independently — see [`HealthConfig`]).
+#[derive(Deserialize, Debug, Default, Clone)]
+pub struct HealthToml {
+    pub path: Option<String>,
+    pub interval_secs: Option<u64>,
+    pub timeout_secs: Option<u64>,
+}
+
+/// One `[[models]]` entry. `auth_token_env` is the NAME of the env var holding the token —
+/// NEVER the token itself; it is resolved from the process env at startup and a missing/
+/// unset var yields a configured-but-unarmed (present, not selectable) model.
+#[derive(Deserialize, Debug, Default, Clone)]
+pub struct ModelToml {
+    pub id: Option<String>,
+    pub label: Option<String>,
+    /// `hosted` | `local` (`ambient` is reserved for the built-in opus and refused).
+    pub kind: Option<String>,
+    pub base_url: Option<String>,
+    pub model: Option<String>,
+    pub subagent_model: Option<String>,
+    pub auth_token_env: Option<String>,
+    pub default_writes: Option<bool>,
+    pub price: Option<PriceToml>,
+    pub health: Option<HealthToml>,
+}
+
+/// Parse a declarative `kind` string into a [`ModelKind`]. Only `hosted` / `local` are
+/// valid; `ambient` (and anything else) is refused so a declarative entry can never claim
+/// the ambient contract.
+fn parse_declared_kind(kind: &str) -> Option<ModelKind> {
+    match kind.trim().to_ascii_lowercase().as_str() {
+        "hosted" => Some(ModelKind::Hosted),
+        "local" => Some(ModelKind::Local),
+        _ => None,
+    }
+}
+
+/// Resolve a declared model's token from its `auth_token_env` var NAME. `Some(token)` only
+/// when the field is present AND that env var is set to a non-blank value; otherwise `None`
+/// (the model is configured-but-unarmed — present in the list, not selectable). The token
+/// value is NEVER logged.
+fn resolve_declared_token(auth_token_env: Option<&str>) -> Option<String> {
+    auth_token_env
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .and_then(env_string)
+}
+
+/// Build a [`RegistryModel`] from one declarative `[[models]]` entry, or `None` (with a
+/// warning) when a required field is missing or `kind` is invalid. The backend resolves to
+/// `Some(triple)` — and `configured` to true — ONLY when the named token env var is set;
+/// otherwise the entry is present-but-unarmed (`configured = false`), the same treatment an
+/// unresolved env triple gets. No token is ever written back into the entry the endpoints
+/// serialize — it lives solely inside `backend`.
+pub fn registry_model_from_toml(t: &ModelToml) -> Option<RegistryModel> {
+    let id = t.id.as_deref().map(str::trim).filter(|s| !s.is_empty());
+    let (id, kind_str, base_url, model) = match (
+        id,
+        t.kind.as_deref().map(str::trim).filter(|s| !s.is_empty()),
+        t.base_url.as_deref().map(str::trim).filter(|s| !s.is_empty()),
+        t.model.as_deref().map(str::trim).filter(|s| !s.is_empty()),
+    ) {
+        (Some(id), Some(k), Some(b), Some(m)) => (id, k, b, m),
+        _ => {
+            eprintln!(
+                "jesse-bridge: WARNING a declarative [[models]] entry (id {:?}) is missing a \
+                 required field (id, kind, base_url, model are all required); ignoring it.",
+                t.id
+            );
+            return None;
+        }
+    };
+    let Some(kind) = parse_declared_kind(kind_str) else {
+        eprintln!(
+            "jesse-bridge: WARNING declarative model '{id}' has invalid kind '{kind_str}' \
+             (must be 'hosted' or 'local'; 'ambient' is reserved); ignoring it."
+        );
+        return None;
+    };
+    let token = resolve_declared_token(t.auth_token_env.as_deref());
+    if token.is_none() {
+        // Present-but-unarmed: log ONCE so a half-configured model is visible, then ship it
+        // unconfigured (in the list, not selectable) — never the token, only the var name.
+        match t.auth_token_env.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+            Some(var) => eprintln!(
+                "jesse-bridge: model '{id}' is configured-but-unarmed — its auth_token_env \
+                 '{var}' is unset; it appears in the list but is not selectable until armed."
+            ),
+            None => eprintln!(
+                "jesse-bridge: model '{id}' has no auth_token_env — it appears in the list but \
+                 is not selectable until an auth_token_env naming a set var is supplied."
+            ),
+        }
+    }
+    let configured = token.is_some();
+    let backend = token.map(|tok| (base_url.to_string(), tok, model.to_string()));
+    let subagent_model = t
+        .subagent_model
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        // Default the subagent model to the main model — but only when configured, so an
+        // unarmed entry carries no backend-derived value (mirrors the env triples).
+        .or_else(|| configured.then(|| model.to_string()));
+    let price = t
+        .price
+        .as_ref()
+        .map(|p| PriceDeck {
+            in_per_m: p.in_per_m.unwrap_or(0.0),
+            cached_per_m: p.cached_per_m.unwrap_or(0.0),
+            out_per_m: p.out_per_m.unwrap_or(0.0),
+        })
+        .unwrap_or(PriceDeck::ZERO);
+    let health = t
+        .health
+        .as_ref()
+        .map(|h| HealthConfig {
+            path: h
+                .path
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .unwrap_or(DEFAULT_HEALTH_PATH)
+                .to_string(),
+            interval_secs: h.interval_secs.filter(|n| *n > 0).unwrap_or(DEFAULT_HEALTH_INTERVAL_SECS),
+            timeout_secs: h.timeout_secs.filter(|n| *n > 0).unwrap_or(DEFAULT_HEALTH_TIMEOUT_SECS),
+        })
+        .unwrap_or_default();
+    Some(RegistryModel {
+        id: id.to_string(),
+        label: t
+            .label
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or(id)
+            .to_string(),
+        kind,
+        backend,
+        subagent_model,
+        configured,
+        default_writes: t.default_writes.unwrap_or(false),
+        price,
+        health,
+    })
 }
 
 /// Resolve a registry model's `(base_url, auth_token, model)` triple from its env parts,
@@ -1058,10 +1295,11 @@ impl Config {
             // Resolved once at startup against the captured HOME (used to find the
             // state-dir config location for a launchd service outside the repo).
             persona: Persona::load(&home),
-            // The selectable-model registry, built from JESSE_MODEL_* (see
-            // ModelRegistry::from_env). Always includes the ambient opus default; the
-            // hosted/local entries are unavailable until their triples resolve.
-            model_registry: ModelRegistry::from_env(),
+            // The selectable-model registry, MERGED from the built-in ambient opus, the
+            // JESSE_MODEL_* env triples, and the declarative `[[models]]` config file (see
+            // ModelRegistry::from_env). Always includes the ambient opus default; the other
+            // entries are unconfigured (present, not selectable) until their token resolves.
+            model_registry: ModelRegistry::from_env(&home),
         }
     }
 }
@@ -1155,8 +1393,8 @@ mod tests {
         let opus = r.default_model();
         assert_eq!(opus.id, "opus");
         assert!(matches!(opus.kind, ModelKind::Ambient));
-        assert!(opus.available && opus.default_writes);
-        assert!(!r.is_selectable("glm-5.2"), "an absent model is not selectable");
+        assert!(opus.configured && opus.default_writes);
+        assert!(!r.is_configured("glm-5.2"), "an absent model is not configured");
     }
 
     #[test]
@@ -1838,6 +2076,260 @@ mod tests {
         match saved {
             Some(v) => std::env::set_var("JESSE_CONTEXT_CARRY", v),
             None => std::env::remove_var("JESSE_CONTEXT_CARRY"),
+        }
+    }
+
+    // ---- Declarative `[[models]]` config + the three-source merge (Part B) -------
+
+    /// A minimal declarative model entry with the four required fields; `token_env` names the
+    /// (optional) auth-token env var. Every other field defaults.
+    fn model_toml(id: &str, kind: &str, token_env: Option<&str>) -> ModelToml {
+        ModelToml {
+            id: Some(id.into()),
+            kind: Some(kind.into()),
+            base_url: Some("https://gw.example/inference".into()),
+            model: Some("provider/model".into()),
+            auth_token_env: token_env.map(str::to_string),
+            ..Default::default()
+        }
+    }
+
+    /// The nine `JESSE_MODEL_*` env-triple vars, cleared so a test's registry is deterministic.
+    const MODEL_ENV_VARS: [&str; 9] = [
+        "JESSE_MODEL_GLM_BASE_URL",
+        "JESSE_MODEL_GLM_AUTH_TOKEN",
+        "JESSE_MODEL_GLM_MODEL",
+        "JESSE_MODEL_KIMI_BASE_URL",
+        "JESSE_MODEL_KIMI_AUTH_TOKEN",
+        "JESSE_MODEL_KIMI_MODEL",
+        "JESSE_MODEL_LOCAL_BASE_URL",
+        "JESSE_MODEL_LOCAL_AUTH_TOKEN",
+        "JESSE_MODEL_LOCAL_MODEL",
+    ];
+
+    #[test]
+    fn declarative_model_arms_only_when_its_token_env_is_set() {
+        // auth_token_env is the NAME of a var; the token is resolved from the process env at
+        // build time. A set var arms the model (configured, backend resolved, subagent model
+        // defaulting to the main model). An unset var (or none at all) yields a
+        // configured-but-unarmed entry — present in the list, not selectable.
+        let _g = ENV_LOCK.lock_ok();
+        std::env::set_var("JESSE_TEST_DECL_TOKEN", "sk-abc");
+        let armed =
+            registry_model_from_toml(&model_toml("fireworks", "hosted", Some("JESSE_TEST_DECL_TOKEN")))
+                .expect("a full entry parses");
+        assert!(armed.configured, "a set token env arms the model");
+        assert_eq!(
+            armed.backend,
+            Some((
+                "https://gw.example/inference".into(),
+                "sk-abc".into(),
+                "provider/model".into()
+            ))
+        );
+        assert_eq!(armed.subagent_model.as_deref(), Some("provider/model"));
+        assert!(matches!(armed.kind, ModelKind::Hosted));
+        assert!(!armed.default_writes, "non-ambient defaults read-only");
+
+        std::env::remove_var("JESSE_TEST_DECL_TOKEN");
+        let unarmed =
+            registry_model_from_toml(&model_toml("fireworks", "hosted", Some("JESSE_TEST_DECL_TOKEN")))
+                .expect("still parses, just unarmed");
+        assert!(!unarmed.configured, "an unset token env → unarmed");
+        assert!(unarmed.backend.is_none(), "no backend without a token");
+        assert!(unarmed.subagent_model.is_none(), "no backend-derived subagent model");
+
+        let no_env = registry_model_from_toml(&model_toml("fireworks", "hosted", None)).unwrap();
+        assert!(!no_env.configured, "no auth_token_env at all → unarmed");
+    }
+
+    #[test]
+    fn declarative_model_parses_price_subagent_and_health_overrides() {
+        let _g = ENV_LOCK.lock_ok();
+        std::env::set_var("JESSE_TEST_DECL_TOKEN2", "tok");
+        let t = ModelToml {
+            id: Some("codex".into()),
+            label: Some("Codex".into()),
+            kind: Some("local".into()),
+            base_url: Some("http://127.0.0.1:8900".into()),
+            model: Some("gpt-5-codex".into()),
+            subagent_model: Some("gpt-5-mini".into()),
+            auth_token_env: Some("JESSE_TEST_DECL_TOKEN2".into()),
+            default_writes: Some(true),
+            price: Some(PriceToml {
+                in_per_m: Some(2.0),
+                cached_per_m: Some(0.2),
+                out_per_m: Some(8.0),
+            }),
+            health: Some(HealthToml {
+                path: Some("/v1/messages".into()),
+                interval_secs: Some(30),
+                timeout_secs: Some(2),
+            }),
+        };
+        let m = registry_model_from_toml(&t).unwrap();
+        assert!(matches!(m.kind, ModelKind::Local));
+        assert_eq!(m.label, "Codex");
+        assert_eq!(m.subagent_model.as_deref(), Some("gpt-5-mini"), "explicit subagent override");
+        assert!(m.default_writes, "declarative default_writes honored");
+        assert_eq!(m.price.out_per_m, 8.0);
+        assert_eq!(m.health.interval_secs, 30);
+        assert_eq!(m.health.timeout_secs, 2);
+        std::env::remove_var("JESSE_TEST_DECL_TOKEN2");
+    }
+
+    #[test]
+    fn declarative_model_rejects_missing_fields_and_reserved_kind() {
+        // A missing required field → the entry is skipped (None), never a partial model.
+        let mut missing_model = model_toml("x", "hosted", Some("V"));
+        missing_model.model = None;
+        assert!(registry_model_from_toml(&missing_model).is_none());
+        // `ambient` is reserved for the built-in opus; an unknown kind is invalid too.
+        assert!(registry_model_from_toml(&model_toml("x", "ambient", Some("V"))).is_none());
+        assert!(registry_model_from_toml(&model_toml("x", "banana", Some("V"))).is_none());
+    }
+
+    #[test]
+    fn upsert_replaces_by_id_in_place_and_protects_the_ambient_default() {
+        // The merge primitive: later overrides earlier BY ID (in place, stable order), a new
+        // id appends, and the ambient `opus` is never replaceable.
+        let mut models = vec![opus_entry(), glm_env_entry()]; // glm unconfigured (no env)
+        let mut decl_glm = model_toml("glm-5.2", "hosted", None);
+        decl_glm.label = Some("Declared GLM".into());
+        upsert_model(&mut models, registry_model_from_toml(&decl_glm).unwrap());
+        assert_eq!(models.len(), 2, "same id replaces in place, not appends");
+        assert_eq!(models[1].id, "glm-5.2");
+        assert_eq!(models[1].label, "Declared GLM", "later source wins by id");
+
+        upsert_model(&mut models, registry_model_from_toml(&model_toml("fw", "hosted", None)).unwrap());
+        assert_eq!(models.len(), 3, "a new id appends");
+
+        // An entry that tries to redefine opus is refused; opus stays the built-in ambient.
+        let fake_opus = registry_model_from_toml(&model_toml("opus", "hosted", None)).unwrap();
+        upsert_model(&mut models, fake_opus);
+        assert_eq!(models.iter().filter(|m| m.id == "opus").count(), 1);
+        assert!(matches!(models[0].kind, ModelKind::Ambient), "opus stays ambient");
+    }
+
+    #[test]
+    fn from_env_with_no_model_config_is_todays_behavior_opus_only_selectable() {
+        // With no JESSE_MODEL_* and no [[models]], the ONLY selectable (configured) model is
+        // opus — byte-for-byte today: opus present + configured, and the preserved env-triple
+        // placeholders (glm/kimi/local) present but UNCONFIGURED (not selectable). No
+        // declarative entry appears.
+        let _g = ENV_LOCK.lock_ok();
+        let saved: Vec<(&str, Option<String>)> = MODEL_ENV_VARS
+            .iter()
+            .chain(["JESSE_CONFIG", "JESSE_STATE_DIR"].iter())
+            .map(|k| (*k, std::env::var(k).ok()))
+            .collect();
+        for k in MODEL_ENV_VARS {
+            std::env::remove_var(k);
+        }
+        std::env::remove_var("JESSE_STATE_DIR");
+        std::env::set_var("JESSE_CONFIG", "/nonexistent/jesse.local.toml");
+
+        let r = ModelRegistry::from_env("");
+        assert_eq!(r.models[0].id, "opus");
+        assert!(matches!(r.models[0].kind, ModelKind::Ambient));
+        assert!(r.is_configured("opus"), "opus is the only configured model");
+        for id in ["glm-5.2", "kimi-k3", "local"] {
+            let m = r.get(id).unwrap_or_else(|| panic!("{id} preserved as a placeholder"));
+            assert!(!m.configured, "{id} is present but not configured with no env");
+        }
+        assert_eq!(r.models.len(), 4, "no declarative entries appear with no config");
+
+        for (k, v) in saved {
+            match v {
+                Some(val) => std::env::set_var(k, val),
+                None => std::env::remove_var(k),
+            }
+        }
+    }
+
+    #[test]
+    fn from_env_merges_a_declarative_models_file_and_overrides_env_by_id() {
+        // Source 3: a [[models]] file. An armed declarative entry becomes configured; an
+        // unarmed one (missing token var) is present-but-unconfigured; and a declarative entry
+        // with an env-triple's id OVERRIDES it (later source wins).
+        let _g = ENV_LOCK.lock_ok();
+        let saved: Vec<(&str, Option<String>)> = MODEL_ENV_VARS
+            .iter()
+            .chain(["JESSE_CONFIG", "JESSE_STATE_DIR"].iter())
+            .map(|k| (*k, std::env::var(k).ok()))
+            .collect();
+        for k in MODEL_ENV_VARS {
+            std::env::remove_var(k);
+        }
+        std::env::remove_var("JESSE_STATE_DIR");
+        // Arm the env glm so we can prove the declarative override REPLACES it.
+        std::env::set_var("JESSE_MODEL_GLM_AUTH_TOKEN", "env-glm-tok");
+        std::env::set_var("JESSE_TEST_FW_TOKEN", "sk-fw");
+
+        let dir = std::env::temp_dir().join(format!("jesse-decl-{}", random_hex()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("jesse.local.toml");
+        std::fs::write(
+            &file,
+            r#"
+[[models]]
+id = "fireworks"
+label = "Fireworks GLM"
+kind = "hosted"
+base_url = "https://gw.example/inference"
+model = "accounts/fireworks/models/glm"
+auth_token_env = "JESSE_TEST_FW_TOKEN"
+price = { in_per_m = 1.4, cached_per_m = 0.14, out_per_m = 4.4 }
+health = { interval_secs = 30, timeout_secs = 2 }
+
+[[models]]
+id = "codex"
+kind = "hosted"
+base_url = "http://127.0.0.1:8900"
+model = "gpt-5-codex"
+auth_token_env = "JESSE_TEST_MISSING_TOKEN"
+
+[[models]]
+id = "glm-5.2"
+label = "Override GLM"
+kind = "hosted"
+base_url = "http://override"
+model = "override-model"
+auth_token_env = "JESSE_TEST_FW_TOKEN"
+"#,
+        )
+        .unwrap();
+        std::env::set_var("JESSE_CONFIG", &file);
+
+        let r = ModelRegistry::from_env("");
+        assert_eq!(r.models[0].id, "opus", "opus stays first");
+
+        // Armed declarative model → configured, price + health parsed, token held only in backend.
+        let fw = r.get("fireworks").expect("fireworks appears");
+        assert!(fw.configured);
+        assert_eq!(fw.backend.as_ref().unwrap().1, "sk-fw");
+        assert_eq!(fw.price.out_per_m, 4.4);
+        assert_eq!(fw.health.interval_secs, 30);
+        assert_eq!(fw.health.timeout_secs, 2);
+
+        // Unarmed declarative model (missing token var) → present but not configured.
+        let codex = r.get("codex").expect("codex appears");
+        assert!(!codex.configured);
+        assert!(codex.backend.is_none());
+
+        // Declarative glm-5.2 OVERRODE the env glm (later source wins), exactly one entry.
+        let glm = r.get("glm-5.2").unwrap();
+        assert_eq!(glm.label, "Override GLM");
+        assert_eq!(glm.backend.as_ref().unwrap().0, "http://override");
+        assert_eq!(r.models.iter().filter(|m| m.id == "glm-5.2").count(), 1);
+
+        std::env::remove_var("JESSE_TEST_FW_TOKEN");
+        let _ = std::fs::remove_dir_all(&dir);
+        for (k, v) in saved {
+            match v {
+                Some(val) => std::env::set_var(k, val),
+                None => std::env::remove_var(k),
+            }
         }
     }
 }

@@ -5128,27 +5128,33 @@ fn cfg_with_switch_registry(state_dir: &std::path::Path) -> Config {
                 label: "Claude Opus".into(),
                 kind: ModelKind::Ambient,
                 backend: None,
-                available: true,
+                subagent_model: None,
+                configured: true,
                 default_writes: true,
                 price: PriceDeck { in_per_m: 5.0, cached_per_m: 0.5, out_per_m: 25.0 },
+                health: HealthConfig::default(),
             },
             RegistryModel {
                 id: "glm-5.2".into(),
                 label: "GLM 5.2".into(),
                 kind: ModelKind::Hosted,
                 backend: Some(("http://fireworks".into(), "fw-tok".into(), "glm-model".into())),
-                available: true,
+                subagent_model: Some("glm-model".into()),
+                configured: true,
                 default_writes: false,
                 price: PriceDeck { in_per_m: 1.4, cached_per_m: 0.14, out_per_m: 4.4 },
+                health: HealthConfig::default(),
             },
             RegistryModel {
                 id: "kimi-k3".into(),
                 label: "Kimi K3".into(),
                 kind: ModelKind::Hosted,
                 backend: None,
-                available: false,
+                subagent_model: None,
+                configured: false,
                 default_writes: false,
                 price: PriceDeck::ZERO,
+                health: HealthConfig::default(),
             },
         ],
     };
@@ -5183,23 +5189,87 @@ async fn models_endpoint_lists_the_registry_and_active_selection() {
     assert_eq!(v["active"], "opus", "default active is opus");
     let models = v["models"].as_array().unwrap();
     assert_eq!(models.len(), 3);
-    // opus is ambient + available + writes-on.
+    // opus is ambient + configured + healthy + available + writes-on.
     let opus = models.iter().find(|m| m["id"] == "opus").unwrap();
     assert_eq!(opus["kind"], "ambient");
+    assert_eq!(opus["configured"], true);
+    assert_eq!(opus["healthy"], true);
     assert_eq!(opus["available"], true);
     assert_eq!(opus["writes_allowed"], true);
-    // glm is available but read-only by default.
+    // glm is configured + (optimistically) healthy → available, but read-only by default.
     let glm = models.iter().find(|m| m["id"] == "glm-5.2").unwrap();
     assert_eq!(glm["kind"], "hosted");
+    assert_eq!(glm["configured"], true);
+    assert_eq!(glm["healthy"], true, "a configured model is seeded optimistically healthy");
     assert_eq!(glm["available"], true);
     assert_eq!(glm["writes_allowed"], false);
-    // kimi is present but unavailable.
+    // kimi is present but UNCONFIGURED (no token) → not healthy, not available.
     let kimi = models.iter().find(|m| m["id"] == "kimi-k3").unwrap();
+    assert_eq!(kimi["configured"], false);
+    assert_eq!(kimi["healthy"], false);
     assert_eq!(kimi["available"], false);
-    // No secret leaks to the client.
+    // No secret leaks to the client — ids, booleans, enums, and numbers only.
     let raw = v.to_string();
     assert!(!raw.contains("fw-tok"), "the token must never reach a client: {raw}");
     assert!(!raw.contains("fireworks"), "the base url must never reach a client: {raw}");
+    assert!(!raw.contains("glm-model"), "the backend model id must never reach a client: {raw}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn set_model_on_an_unhealthy_configured_model_is_409_and_does_not_switch() {
+    // Health gating (B3): a CONFIGURED model whose last probe FAILED is unhealthy, so it is
+    // rejected with 409 and the active model is unchanged — the app must not switch onto a
+    // model the bridge currently can't reach.
+    let dir = std::env::temp_dir().join(format!("jesse-model-it-{}", random_hex()));
+    let st = AppState::new(cfg_with_switch_registry(&dir));
+    // Mark glm unhealthy (a failed probe would do this in production).
+    st.health.set(
+        "glm-5.2",
+        HealthStatus {
+            healthy: false,
+            checked_at_ms: 123,
+            latency_ms: Some(3000),
+            last_error_class: Some("timeout".into()),
+        },
+    );
+    // The row now reports it configured-but-unhealthy → not available.
+    let resp = app(st.clone())
+        .oneshot(models_request(Some("Bearer test-token")))
+        .await
+        .unwrap();
+    let v = body_value(resp).await;
+    let glm = v["models"].as_array().unwrap().iter().find(|m| m["id"] == "glm-5.2").unwrap().clone();
+    assert_eq!(glm["configured"], true);
+    assert_eq!(glm["healthy"], false);
+    assert_eq!(glm["available"], false);
+    assert_eq!(glm["latency_ms"], 3000);
+    // And selection is rejected with 409, leaving the active model unchanged.
+    let resp = app(st.clone())
+        .oneshot(set_model_request(Some("Bearer test-token"), r#"{"id":"glm-5.2"}"#))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CONFLICT);
+    assert_eq!(st.models.active(), "opus", "an unhealthy selection must not take effect");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn set_model_accepts_a_healthy_configured_model() {
+    // The positive half of the gate: a configured + healthy model IS accepted.
+    let dir = std::env::temp_dir().join(format!("jesse-model-it-{}", random_hex()));
+    let st = AppState::new(cfg_with_switch_registry(&dir));
+    // Seeded optimistic-healthy; make it explicit that a passing probe keeps it selectable.
+    st.health.set(
+        "glm-5.2",
+        HealthStatus { healthy: true, checked_at_ms: 1, latency_ms: Some(40), last_error_class: None },
+    );
+    let resp = app(st.clone())
+        .oneshot(set_model_request(Some("Bearer test-token"), r#"{"id":"glm-5.2"}"#))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(st.models.active(), "glm-5.2");
     let _ = std::fs::remove_dir_all(&dir);
 }
 

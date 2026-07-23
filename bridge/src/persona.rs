@@ -172,11 +172,15 @@ struct PersonaToml {
     diet_keywords_extra: Option<Vec<String>>,
 }
 
-/// The whole local overlay file. Only `[persona]` is consumed today; unknown keys
-/// are ignored so the example file can document forward-looking sections.
+/// The whole local overlay file. `[persona]` supplies the personalization; the declarative
+/// `[[models]]` array supplies the global model switch's registry (source 3 — see
+/// [`ModelRegistry::from_env`]). Unknown keys are ignored so the example file can document
+/// forward-looking sections.
 #[derive(Deserialize, Default)]
 struct LocalConfig {
     persona: Option<PersonaToml>,
+    #[serde(default)]
+    models: Vec<ModelToml>,
 }
 
 /// Resolve the local overlay file, first existing wins:
@@ -213,13 +217,29 @@ fn local_config_path(home: &str) -> Option<PathBuf> {
 /// a read or parse error logs one stderr warning and yields `None` (defaults),
 /// never aborting startup.
 fn load_local_persona(home: &str) -> Option<PersonaToml> {
+    load_local_config(home).and_then(|c| c.persona)
+}
+
+/// Read + parse the declarative `[[models]]` array from the SAME overlay file the persona
+/// loads from (same search order, same soft-fail: a missing/malformed file yields an empty
+/// list and the registry falls back to the env triples + built-in opus). Each entry is
+/// validated in [`registry_model_from_toml`], so a partial entry is skipped there, not here.
+pub fn load_local_models(home: &str) -> Vec<ModelToml> {
+    load_local_config(home).map(|c| c.models).unwrap_or_default()
+}
+
+/// Read + parse the whole local overlay file once. Soft-fails: a read or parse error logs
+/// one stderr warning and yields `None` (the callers then use their defaults), never
+/// aborting startup. Shared by the persona and the declarative-model loaders so the file is
+/// found by the one search order and a malformed file degrades both consistently.
+fn load_local_config(home: &str) -> Option<LocalConfig> {
     let path = local_config_path(home)?;
     match std::fs::read_to_string(&path) {
         Ok(s) => match toml::from_str::<LocalConfig>(&s) {
-            Ok(cfg) => cfg.persona,
+            Ok(cfg) => Some(cfg),
             Err(e) => {
                 eprintln!(
-                    "jesse-bridge: WARNING could not parse {} ({e}); using generic persona defaults.",
+                    "jesse-bridge: WARNING could not parse {} ({e}); using generic defaults.",
                     path.display()
                 );
                 None
@@ -227,7 +247,7 @@ fn load_local_persona(home: &str) -> Option<PersonaToml> {
         },
         Err(e) => {
             eprintln!(
-                "jesse-bridge: WARNING could not read {} ({e}); using generic persona defaults.",
+                "jesse-bridge: WARNING could not read {} ({e}); using generic defaults.",
                 path.display()
             );
             None

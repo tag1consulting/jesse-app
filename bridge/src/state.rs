@@ -37,6 +37,14 @@ pub struct AppState {
     // written by `POST /jesse/model` and `POST /jesse/model/{id}/writes`. Holds only ids
     // and booleans — never a token (credentials live in `cfg.model_registry`, from env).
     pub models: Arc<ModelStore>,
+    // Per-model HEALTH cache (the health prober): the last-known reachability of each
+    // configured non-ambient model, written by the background prober and read by
+    // `GET /jesse/models` + `POST /jesse/model` to gate selection (available = configured
+    // AND healthy). Seeded OPTIMISTICALLY healthy for configured models at startup so a
+    // configured model is selectable as today until a probe actually fails. Ambient `opus`
+    // is never here (healthy by construction). Empty + inert for an opus-only deploy — the
+    // prober (spawned in `main`) starts nothing then.
+    pub health: Arc<HealthStore>,
     // The registered APNs device token (single user). Always present so device
     // registration works even when push is off; persisted to the state dir.
     pub devices: Arc<DeviceStore>,
@@ -95,6 +103,10 @@ impl AppState {
         let sem = Arc::new(Semaphore::new(cfg.max_concurrency.max(1)));
         let queue = QueueGate::new(sem.clone(), cfg.max_queued);
         let limiter = Arc::new(RateLimiter::new(cfg.rate_per_min));
+        // Seed the health cache from the registry (configured non-ambient models → optimistic
+        // healthy). The live prober is spawned separately in `main` so tests never touch the
+        // network — they get the seeded cache and can inject explicit statuses.
+        let health = Arc::new(HealthStore::seeded(&cfg.model_registry));
         AppState {
             cfg: Arc::new(cfg),
             jobs: Arc::new(JobStore::new(job_ttl, retrieval_grace, jobs_dir)),
@@ -104,6 +116,7 @@ impl AppState {
             titles: Arc::new(TitleStore::new(titles_file)),
             flags: Arc::new(FlagStore::new(flags_file)),
             models: Arc::new(ModelStore::new(model_file)),
+            health,
             deletions: Arc::new(DeletionStore::new(deletions_file, deletion_retention_ms)),
             devices: Arc::new(DeviceStore::new(device_file)),
             notify: Arc::new(NotifyFlags::new()),
@@ -125,8 +138,12 @@ impl AppState {
     pub fn resolve_active_model(&self) -> ActiveModel {
         let id = self.models.active();
         let registry = &self.cfg.model_registry;
+        // Degrade to the always-available default only when the stored active id is unknown
+        // or its backend is NOT CONFIGURED — NOT merely unhealthy. A currently-unhealthy
+        // active model stays active (per the no-auto-switch rule): its next turn surfaces the
+        // failure through the existing retry/emergency path rather than silently switching.
         let m = match registry.get(&id) {
-            Some(m) if m.available => m,
+            Some(m) if m.configured => m,
             _ => registry.default_model(),
         };
         let writes_allowed = matches!(m.kind, ModelKind::Ambient)
@@ -138,7 +155,7 @@ impl AppState {
             id: m.id.clone(),
             kind: m.kind,
             env: m.backend.clone(),
-            subagent_model: m.backend.as_ref().map(|(_, _, model)| model.clone()),
+            subagent_model: m.subagent_model.clone(),
             writes_allowed,
             price: m.price,
         }
@@ -167,18 +184,22 @@ mod tests {
                     label: "Claude Opus".into(),
                     kind: ModelKind::Ambient,
                     backend: None,
-                    available: true,
+                    subagent_model: None,
+                    configured: true,
                     default_writes: true,
                     price: PriceDeck::ZERO,
+                    health: HealthConfig::default(),
                 },
                 RegistryModel {
                     id: "glm-5.2".into(),
                     label: "GLM 5.2".into(),
                     kind: ModelKind::Hosted,
                     backend: Some(("http://fw".into(), "fw-tok".into(), "glm-model".into())),
-                    available: true,
+                    subagent_model: Some("glm-model".into()),
+                    configured: true,
                     default_writes: false,
                     price: PriceDeck::ZERO,
+                    health: HealthConfig::default(),
                 },
             ],
         };

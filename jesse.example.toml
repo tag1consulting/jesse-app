@@ -46,3 +46,74 @@ diet_keywords_extra = [
   "corri",      # ran
   "peso",       # weight
 ]
+
+# =============================================================================
+# [[models]] — the global model switch's registry (declarative, operator-configurable)
+# =============================================================================
+#
+# The set of models the CONVERSATION can be switched onto (from the phone or the Mac).
+# The registry is MERGED from three sources, later overriding earlier BY ID:
+#   1. the built-in ambient `opus` — ALWAYS present, needs no config, is never
+#      configurable here, and is byte-for-byte today's behavior (normal allowlist,
+#      writes-on). A bridge with NO model config is opus-only.
+#   2. the legacy `JESSE_MODEL_GLM_* / _KIMI_* / _LOCAL_*` env triples (still supported).
+#   3. these `[[models]]` entries.
+#
+# Adding a model is a PURE CONFIG EDIT here plus ONE env var for its token — no bridge
+# code change. Each model is health-probed on an interval; the apps only offer a model
+# that is CONFIGURED (its token env var is set) AND HEALTHY (its last probe passed).
+#
+# Fields (id, kind, base_url, model are REQUIRED; the rest are optional):
+#   id             stable key the switch persists (e.g. "fireworks", "codex")
+#   label          shown in the app switcher (defaults to id)
+#   kind           "hosted" or "local"  ("ambient" is reserved for the built-in opus)
+#   base_url       the model's Anthropic-surface base URL (the bridge speaks /v1/messages)
+#   model          the backend model id
+#   subagent_model model for the subagents the turn spawns (defaults to `model`)
+#   auth_token_env the NAME of the env var holding the token — NEVER the token itself.
+#                  The token is read from the process env at startup; an unset var makes
+#                  the model configured-but-unarmed (it appears in the list, disabled,
+#                  until the var is set). No token is ever written to this file, to
+#                  model.json, or to any endpoint response.
+#   default_writes read-only unless true (default false) — a non-default model can read
+#                  your vault but not write it until you enable writes for it.
+#   price          { in_per_m, cached_per_m, out_per_m } dollars per 1M tokens (default
+#                  0/0/0), feeding the per-turn cost badge.
+#   health         { path, interval_secs, timeout_secs } — probe endpoint + cadence
+#                  (defaults: "/v1/messages", 60s, 3s).
+#
+# IMPORTANT: the bridge speaks the Anthropic `/v1/messages` contract. A model whose
+# NATIVE API is OpenAI-shaped (`/v1/chat/completions`, e.g. a "codex" model) must sit
+# behind a small Anthropic-surface GATEWAY that translates the two, and `base_url` must
+# point at that gateway — NOT at the OpenAI endpoint. No bridge code change is needed to
+# add it; only this config and the gateway.
+#
+# The examples below are COMMENTED OUT (uncomment + set the token env var to enable one):
+
+# A hosted provider (fireworks.ai) served on its Anthropic surface. Arm it by exporting
+# the named token in the bridge's launch env: FIREWORKS_API_KEY=fw-...
+# [[models]]
+# id = "fireworks"
+# label = "Fireworks GLM"
+# kind = "hosted"
+# base_url = "https://api.fireworks.ai/inference"
+# model = "accounts/fireworks/models/glm-5p2"
+# auth_token_env = "FIREWORKS_API_KEY"
+# default_writes = false
+# price = { in_per_m = 1.40, cached_per_m = 0.14, out_per_m = 4.40 }
+# health = { path = "/v1/messages", interval_secs = 60, timeout_secs = 3 }
+
+# An OpenAI-style "codex" model. Its native API is `/v1/chat/completions`, so base_url
+# points at a small Anthropic-surface gateway (running here on :8900), NOT at OpenAI.
+# Arm it with: CODEX_GATEWAY_TOKEN=...
+# [[models]]
+# id = "codex"
+# label = "Codex"
+# kind = "hosted"
+# base_url = "http://127.0.0.1:8900"       # the Anthropic-surface gateway, not OpenAI
+# model = "gpt-5-codex"
+# subagent_model = "gpt-5-mini"            # cheaper model for spawned subagents
+# auth_token_env = "CODEX_GATEWAY_TOKEN"
+# default_writes = false
+# price = { in_per_m = 1.25, cached_per_m = 0.13, out_per_m = 10.00 }
+# health = { interval_secs = 30, timeout_secs = 3 }
