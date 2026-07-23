@@ -15,6 +15,18 @@ CI both run it). See the "Versioning" section of `bridge/README.md`.
 
 ## [Unreleased]
 
+## [App 1.0 (72)] - 2026-07-23
+
+### Added
+- **Global model switch, Phase 2: opt-in writes per model.** Settings (iPhone and Mac)
+  now has a *Write access* toggle for each available non-default model. It is **off by
+  default** — a non-default model can read your vault but not change it — and turning it on
+  is gated behind an explicit confirmation that names the model and warns it can modify the
+  vault; turning it off is immediate. A writing non-default model is marked in the reply
+  badge (for example `glm-5.2 · write`). The default `opus` is always writes-on. (The bridge
+  already enforces the effect via `POST /jesse/model/{id}/writes` and the per-model
+  allowlist shipped in 0.27.0.)
+
 ## [Bridge 0.27.0] - 2026-07-23
 
 ### Added

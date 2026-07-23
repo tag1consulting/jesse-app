@@ -26,6 +26,8 @@ struct MacSettingsView: View {
     @State private var loadingModels = false
     @State private var switchingModel = false
     @State private var modelsError: String?
+    // Phase 2: the model awaiting write-enable confirmation (granting writes is gated).
+    @State private var pendingWriteModel: ModelInfo?
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -66,6 +68,7 @@ struct MacSettingsView: View {
                 }
 
                 modelSwitchSection
+                writeAccessSection
             }
             .formStyle(.grouped)
 
@@ -132,6 +135,63 @@ struct MacSettingsView: View {
                 .font(.caption).foregroundStyle(.secondary)
         }
         .task { await loadModels() }
+    }
+
+    /// Phase 2: per-model write access, gated behind a confirmation. Mirrors the iPhone.
+    @ViewBuilder
+    private var writeAccessSection: some View {
+        if let modelState, modelState.models.contains(where: { $0.available && !$0.isDefault }) {
+            Section {
+                ForEach(modelState.models.filter { $0.available && !$0.isDefault }) { model in
+                    Toggle(isOn: writeBinding(for: model)) {
+                        Text("Allow \(model.label) to write the vault")
+                    }
+                    .disabled(switchingModel)
+                }
+            } header: {
+                Text("Write access")
+            } footer: {
+                Text("Off by default, every non-default model can read your vault but not change it. Turn this on only for a model you trust to edit files; the reply badge marks a writing model (e.g. “glm-5.2 · write”).")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
+            .alert("Allow writes?", isPresented: writeConfirmPresented) {
+                Button("Cancel", role: .cancel) { pendingWriteModel = nil }
+                Button("Allow writes", role: .destructive) {
+                    if let model = pendingWriteModel { setWrites(model, enabled: true) }
+                    pendingWriteModel = nil
+                }
+            } message: {
+                Text("\(pendingWriteModel?.label ?? "This model") will be able to modify files in your vault when it backs a conversation. You can turn this off at any time.")
+            }
+        }
+    }
+
+    private func writeBinding(for model: ModelInfo) -> Binding<Bool> {
+        Binding(
+            get: { modelState?.models.first { $0.id == model.id }?.writesAllowed ?? false },
+            set: { newValue in
+                if newValue { pendingWriteModel = model } else { setWrites(model, enabled: false) }
+            }
+        )
+    }
+
+    private var writeConfirmPresented: Binding<Bool> {
+        Binding(get: { pendingWriteModel != nil }, set: { if !$0 { pendingWriteModel = nil } })
+    }
+
+    private func setWrites(_ model: ModelInfo, enabled: Bool) {
+        Task {
+            switchingModel = true
+            defer { switchingModel = false }
+            do {
+                try await modelClient().setWrites(id: model.id, enabled: enabled)
+                modelsError = nil
+            } catch {
+                let detail = (error as? JesseError)?.errorDescription ?? error.localizedDescription
+                modelsError = "Couldn’t change write access. (\(detail))"
+            }
+            await loadModels()
+        }
     }
 
     /// A bridge client over the entered fields (or the saved config), for the switch calls.
