@@ -146,6 +146,47 @@ impl AppState {
             Some(m) if m.configured => m,
             _ => registry.default_model(),
         };
+        self.active_model_for(m)
+    }
+
+    /// Resolve a PER-TURN model selection (the request's optional `model` field) to an
+    /// `ActiveModel`, validating it EXACTLY as `POST /jesse/model` does: an unknown id is a
+    /// `400`, an unconfigured OR unhealthy id is a `409`, and `opus` is always allowed
+    /// (healthy by construction). Unlike [`resolve_active_model`] this NEVER degrades a bad id
+    /// to the default — a per-turn selection the bridge cannot honor is rejected so the turn
+    /// never starts on the wrong model — and it does NOT touch the stored `active`: a per-turn
+    /// choice backs only that one turn, so another device's `GET /jesse/models` is unaffected.
+    /// The write posture is unchanged: a non-ambient model runs read-only unless writes are
+    /// enabled for it (via its `ModelStore` override / registry default).
+    pub fn resolve_requested_model(&self, id: &str) -> Result<ActiveModel, ApiError> {
+        let id = id.trim();
+        match self.cfg.model_registry.get(id) {
+            Some(m) => {
+                let h = model_health(m, &self.health);
+                if h.available() {
+                    Ok(self.active_model_for(m))
+                } else if !h.configured {
+                    Err((
+                        StatusCode::CONFLICT,
+                        format!("model '{id}' is not configured"),
+                    ))
+                } else {
+                    Err((
+                        StatusCode::CONFLICT,
+                        format!("model '{id}' is unhealthy (last probe failed)"),
+                    ))
+                }
+            }
+            None => Err((StatusCode::BAD_REQUEST, format!("unknown model '{id}'"))),
+        }
+    }
+
+    /// Build the `ActiveModel` for a resolved registry entry: its `ANTHROPIC_*` env, subagent
+    /// model, and price deck, plus its EFFECTIVE write permission (ambient `opus` is always
+    /// writes-on; a non-ambient model takes its `ModelStore` override, else its registry
+    /// `default_writes`). Shared by the stored-default resolution and the per-turn selection
+    /// so both produce a byte-identical `ActiveModel` for a given model.
+    fn active_model_for(&self, m: &RegistryModel) -> ActiveModel {
         let writes_allowed = matches!(m.kind, ModelKind::Ambient)
             || self
                 .models

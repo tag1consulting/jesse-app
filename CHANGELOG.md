@@ -15,6 +15,20 @@ CI both run it). See the "Versioning" section of `bridge/README.md`.
 
 ## [Unreleased]
 
+## [Bridge 0.30.0] - 2026-07-23
+
+### Added
+- **Per-turn model selection on `POST /jesse/jesse`.** The turn request gains an optional
+  `model` field naming a registry id. When present, that model backs THAT turn only — its
+  `ANTHROPIC_*` backend, subagent model, price deck, and per-model write posture — and it is
+  validated exactly as `POST /jesse/model` BEFORE any admission, job creation, or child spawn
+  (unknown → `400`, unconfigured or unhealthy → `409`, `opus` always allowed), so a bad
+  selection never starts a turn. A per-turn selection NEVER mutates the stored global
+  `active`, so another device's `GET /jesse/models` is untouched. Absent or blank `model`
+  falls back to the stored default, byte-for-byte today's behavior for any older client or
+  non-app caller. This begins retiring the global model switch in favor of a fine-grained,
+  per-conversation, per-device choice the apps make locally.
+
 ## [Bridge 0.29.0] - 2026-07-23
 
 ### Changed
