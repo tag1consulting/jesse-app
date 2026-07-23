@@ -15,6 +15,16 @@ CI both run it). See the "Versioning" section of `bridge/README.md`.
 
 ## [Unreleased]
 
+## [App 1.0 (73)] - 2026-07-23
+
+### Added
+- **macOS per-message provenance chip.** A JesseMac reply now shows the same native
+  provenance chip the iPhone has: which model produced the reply and what the turn cost
+  (and a write marker when a non-default writing model produced it). The Mac message store
+  now threads the reply's structured provenance through, persists it so the chip survives a
+  reload, and shows the badge-stripped body so the raw trailing text badge no longer appears.
+  An older-bridge reply with no provenance is shown verbatim with no chip.
+
 ## [App 1.0 (72)] - 2026-07-23
 
 ### Added

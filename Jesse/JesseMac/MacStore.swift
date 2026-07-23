@@ -2,6 +2,7 @@ import Foundation
 import SwiftData
 import Observation
 import JesseCore
+import JesseNetworking
 
 // The Mac client's local store + sync + turn runner. Cache-first (locked 2026-07-13):
 // the UI always renders from this local SwiftData store; the bridge is the sync
@@ -151,7 +152,7 @@ final class MacCoordinator {
                 attachments: [], requestId: UUID().uuidString)
             switch result {
             case let .reply(reply, _):
-                await finalize(thread: thread, reply: reply.text, sessionId: reply.sessionId,
+                await finalize(thread: thread, reply: reply, streamedText: nil,
                                context: context, client: cli)
             case let .running(jobId):
                 await runStream(jobId: jobId, thread: thread, context: context, client: cli)
@@ -163,8 +164,9 @@ final class MacCoordinator {
 
     private func runStream(jobId: String, thread: JesseThread, context: ModelContext,
                            client cli: any BridgeClientProtocol) async {
-        var terminalReply: String?
-        var terminalSession: String?
+        // The full terminal reply (text + session + structured provenance), so the model
+        // badge chip survives the stream path exactly as it does on the poll path.
+        var terminalReply: JesseReply?
         var sawTerminal = false
         var failure: String?
 
@@ -175,8 +177,7 @@ final class MacCoordinator {
                 case let .delta(s): streamingText += s
                 case let .activity(a): activity = a
                 case let .done(reply):
-                    terminalReply = reply.text.isEmpty ? streamingText : reply.text
-                    terminalSession = reply.sessionId
+                    terminalReply = reply
                     sawTerminal = true
                 case let .failed(msg):
                     failure = msg
@@ -194,8 +195,12 @@ final class MacCoordinator {
             if let failure {
                 lastError = failure
             } else {
-                await finalize(thread: thread, reply: terminalReply ?? streamingText,
-                               sessionId: terminalSession, context: context, client: cli)
+                // A `done` frame with an empty final response falls back to the live
+                // accumulator (already badge-free); a cancel with no terminal reply keeps
+                // whatever streamed, exactly as before.
+                let reply = terminalReply ?? JesseReply(text: streamingText, sessionId: nil)
+                await finalize(thread: thread, reply: reply, streamedText: streamingText,
+                               context: context, client: cli)
             }
             return
         }
@@ -213,7 +218,7 @@ final class MacCoordinator {
                 case .running:
                     try? await Task.sleep(for: .seconds(1))
                 case let .done(reply):
-                    await finalize(thread: thread, reply: reply.text, sessionId: reply.sessionId,
+                    await finalize(thread: thread, reply: reply, streamedText: nil,
                                    context: context, client: cli)
                     return
                 case let .failed(msg):
@@ -232,21 +237,38 @@ final class MacCoordinator {
         }
     }
 
+    /// The `(text, provenanceJSON)` a Jesse turn persists from a delivered reply: the
+    /// badge/warning/SPOKEN-stripped body (via `JesseReply.displayText`) plus the compact
+    /// provenance JSON, or the verbatim text and `nil` when no structured provenance rode
+    /// the reply (an older bridge / badges off). `streamedText` is the live accumulator,
+    /// used only when a terminal frame carried an EMPTY final response (the stream already
+    /// holds the badge-free body). Pure, so the ingestion contract is unit-tested directly.
+    static func turnFields(from reply: JesseReply, streamedText: String? = nil)
+        -> (text: String, provenanceJSON: String?) {
+        let raw = reply.text.isEmpty ? (streamedText ?? "") : reply.text
+        let effective = JesseReply(text: raw, sessionId: reply.sessionId, provenance: reply.provenance)
+        return (effective.displayText, reply.provenance?.jsonString)
+    }
+
     /// Append the assistant turn, adopt any new `session_id`, advance the hydration
     /// cursor past this exchange (so a later hydrate won't re-add it), and mint a title
-    /// for a still-untitled thread.
-    private func finalize(thread: JesseThread, reply: String, sessionId: String?,
+    /// for a still-untitled thread. The reply's structured provenance (model + per-turn
+    /// cost) is persisted on the turn so the native chip renders under it and survives a
+    /// reload, and the badge is stripped from the stored body (matching iOS).
+    private func finalize(thread: JesseThread, reply: JesseReply, streamedText: String?,
                           context: ModelContext, client cli: any BridgeClientProtocol) async {
-        if let sid = sessionId, !sid.isEmpty, thread.sessionId != sid {
+        if let sid = reply.sessionId, !sid.isEmpty, thread.sessionId != sid {
             thread.sessionId = sid
         }
-        let jesseTurn = Turn(role: .jesse, text: reply)
+        let fields = Self.turnFields(from: reply, streamedText: streamedText)
+        let jesseTurn = Turn(role: .jesse, text: fields.text)
+        jesseTurn.provenanceJSON = fields.provenanceJSON
         jesseTurn.thread = thread
         context.insert(jesseTurn)
         thread.updatedAt = Date()
         try? context.save()
 
-        onTurnFinished?(thread, reply)
+        onTurnFinished?(thread, fields.text)
 
         guard let sid = thread.sessionId, !sid.isEmpty else { return }
 
