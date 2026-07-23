@@ -768,14 +768,20 @@ impl ModelRegistry {
         // Source 1: the built-in ambient default, first (the app presents default-first).
         let mut models: Vec<RegistryModel> = vec![opus_entry()];
 
+        // The global default probe-interval override (`JESSE_HEALTH_INTERVAL_SECS`), resolved
+        // ONCE here so a bad value warns a single time. An explicit per-model interval still
+        // wins; env-triple models (which carry no explicit interval) pick up this default.
+        let global_health_interval = health_interval_override();
+        let default_health_interval = global_health_interval.unwrap_or(DEFAULT_HEALTH_INTERVAL_SECS);
+
         // Source 2: the preserved env triples (same ids/defaults/prices as before).
-        upsert_model(&mut models, glm_env_entry());
-        upsert_model(&mut models, kimi_env_entry());
-        upsert_model(&mut models, local_env_entry());
+        upsert_model(&mut models, glm_env_entry(default_health_interval));
+        upsert_model(&mut models, kimi_env_entry(default_health_interval));
+        upsert_model(&mut models, local_env_entry(default_health_interval));
 
         // Source 3: the declarative `[[models]]` entries (later overrides earlier by id).
         for decl in load_local_models(home) {
-            if let Some(m) = registry_model_from_toml(&decl) {
+            if let Some(m) = registry_model_from_toml(&decl, global_health_interval) {
                 upsert_model(&mut models, m);
             }
         }
@@ -808,7 +814,7 @@ fn upsert_model(models: &mut Vec<RegistryModel>, m: RegistryModel) {
 /// The `glm-5.2` env-triple entry (hosted on Fireworks' Anthropic surface). base + model
 /// DEFAULT; only the token must be supplied, so an operator arms GLM with a single secret
 /// env var.
-fn glm_env_entry() -> RegistryModel {
+fn glm_env_entry(default_interval_secs: u64) -> RegistryModel {
     let backend = resolve_model_backend(
         "glm-5.2",
         env_string("JESSE_MODEL_GLM_BASE_URL"),
@@ -830,7 +836,10 @@ fn glm_env_entry() -> RegistryModel {
             cached_per_m: FW_CACHED_PER_M,
             out_per_m: FW_OUT_PER_M,
         },
-        health: HealthConfig::default(),
+        health: HealthConfig {
+            interval_secs: default_interval_secs,
+            ..HealthConfig::default()
+        },
     }
 }
 
@@ -838,7 +847,7 @@ fn glm_env_entry() -> RegistryModel {
 /// with no `JESSE_MODEL_KIMI_*` set it ships UNCONFIGURED and a selection attempt is
 /// rejected. When a live slug appears the operator supplies all three vars (and a real price
 /// deck via env) to arm it.
-fn kimi_env_entry() -> RegistryModel {
+fn kimi_env_entry(default_interval_secs: u64) -> RegistryModel {
     let backend = resolve_model_backend(
         "kimi-k3",
         env_string("JESSE_MODEL_KIMI_BASE_URL"),
@@ -858,13 +867,16 @@ fn kimi_env_entry() -> RegistryModel {
         // Placeholder until a live Fireworks slug + published pricing exist; overridable
         // from env so arming Kimi later needs no code change.
         price: model_price_from_env("JESSE_MODEL_KIMI", PriceDeck::ZERO),
-        health: HealthConfig::default(),
+        health: HealthConfig {
+            interval_secs: default_interval_secs,
+            ..HealthConfig::default()
+        },
     }
 }
 
 /// The `local` env-triple entry: an Anthropic-compatible local endpoint. NO defaults — all
 /// three vars required. Free (price deck 0/0/0), so every local turn badges `$0.00`.
-fn local_env_entry() -> RegistryModel {
+fn local_env_entry(default_interval_secs: u64) -> RegistryModel {
     let backend = resolve_model_backend(
         "local",
         env_string("JESSE_MODEL_LOCAL_BASE_URL"),
@@ -882,7 +894,10 @@ fn local_env_entry() -> RegistryModel {
         backend,
         default_writes: false,
         price: PriceDeck::ZERO,
-        health: HealthConfig::default(),
+        health: HealthConfig {
+            interval_secs: default_interval_secs,
+            ..HealthConfig::default()
+        },
     }
 }
 
@@ -1023,8 +1038,10 @@ fn resolve_declared_token(auth_token_env: Option<&str>) -> Option<String> {
 /// `Some(triple)` — and `configured` to true — ONLY when the named token env var is set;
 /// otherwise the entry is present-but-unarmed (`configured = false`), the same treatment an
 /// unresolved env triple gets. No token is ever written back into the entry the endpoints
-/// serialize — it lives solely inside `backend`.
-pub fn registry_model_from_toml(t: &ModelToml) -> Option<RegistryModel> {
+/// serialize — it lives solely inside `backend`. `global_interval` is the resolved
+/// `JESSE_HEALTH_INTERVAL_SECS` override (or `None`), applied to this model's probe interval
+/// unless it declares its own `health.interval_secs` (see [`resolve_health_interval`]).
+pub fn registry_model_from_toml(t: &ModelToml, global_interval: Option<u64>) -> Option<RegistryModel> {
     let id = t.id.as_deref().map(str::trim).filter(|s| !s.is_empty());
     let (id, kind_str, base_url, model) = match (
         id,
@@ -1095,10 +1112,15 @@ pub fn registry_model_from_toml(t: &ModelToml) -> Option<RegistryModel> {
                 .filter(|s| !s.is_empty())
                 .unwrap_or(DEFAULT_HEALTH_PATH)
                 .to_string(),
-            interval_secs: h.interval_secs.filter(|n| *n > 0).unwrap_or(DEFAULT_HEALTH_INTERVAL_SECS),
+            // Explicit per-model interval wins; else the global override; else the default.
+            interval_secs: resolve_health_interval(h.interval_secs, global_interval),
             timeout_secs: h.timeout_secs.filter(|n| *n > 0).unwrap_or(DEFAULT_HEALTH_TIMEOUT_SECS),
         })
-        .unwrap_or_default();
+        // No `health` block at all: still honor the global override for the interval.
+        .unwrap_or_else(|| HealthConfig {
+            interval_secs: resolve_health_interval(None, global_interval),
+            ..HealthConfig::default()
+        });
     Some(RegistryModel {
         id: id.to_string(),
         label: t
@@ -2116,7 +2138,7 @@ mod tests {
         let _g = ENV_LOCK.lock_ok();
         std::env::set_var("JESSE_TEST_DECL_TOKEN", "sk-abc");
         let armed =
-            registry_model_from_toml(&model_toml("fireworks", "hosted", Some("JESSE_TEST_DECL_TOKEN")))
+            registry_model_from_toml(&model_toml("fireworks", "hosted", Some("JESSE_TEST_DECL_TOKEN")), None)
                 .expect("a full entry parses");
         assert!(armed.configured, "a set token env arms the model");
         assert_eq!(
@@ -2133,13 +2155,13 @@ mod tests {
 
         std::env::remove_var("JESSE_TEST_DECL_TOKEN");
         let unarmed =
-            registry_model_from_toml(&model_toml("fireworks", "hosted", Some("JESSE_TEST_DECL_TOKEN")))
+            registry_model_from_toml(&model_toml("fireworks", "hosted", Some("JESSE_TEST_DECL_TOKEN")), None)
                 .expect("still parses, just unarmed");
         assert!(!unarmed.configured, "an unset token env → unarmed");
         assert!(unarmed.backend.is_none(), "no backend without a token");
         assert!(unarmed.subagent_model.is_none(), "no backend-derived subagent model");
 
-        let no_env = registry_model_from_toml(&model_toml("fireworks", "hosted", None)).unwrap();
+        let no_env = registry_model_from_toml(&model_toml("fireworks", "hosted", None), None).unwrap();
         assert!(!no_env.configured, "no auth_token_env at all → unarmed");
     }
 
@@ -2167,7 +2189,7 @@ mod tests {
                 timeout_secs: Some(2),
             }),
         };
-        let m = registry_model_from_toml(&t).unwrap();
+        let m = registry_model_from_toml(&t, None).unwrap();
         assert!(matches!(m.kind, ModelKind::Local));
         assert_eq!(m.label, "Codex");
         assert_eq!(m.subagent_model.as_deref(), Some("gpt-5-mini"), "explicit subagent override");
@@ -2183,29 +2205,29 @@ mod tests {
         // A missing required field → the entry is skipped (None), never a partial model.
         let mut missing_model = model_toml("x", "hosted", Some("V"));
         missing_model.model = None;
-        assert!(registry_model_from_toml(&missing_model).is_none());
+        assert!(registry_model_from_toml(&missing_model, None).is_none());
         // `ambient` is reserved for the built-in opus; an unknown kind is invalid too.
-        assert!(registry_model_from_toml(&model_toml("x", "ambient", Some("V"))).is_none());
-        assert!(registry_model_from_toml(&model_toml("x", "banana", Some("V"))).is_none());
+        assert!(registry_model_from_toml(&model_toml("x", "ambient", Some("V")), None).is_none());
+        assert!(registry_model_from_toml(&model_toml("x", "banana", Some("V")), None).is_none());
     }
 
     #[test]
     fn upsert_replaces_by_id_in_place_and_protects_the_ambient_default() {
         // The merge primitive: later overrides earlier BY ID (in place, stable order), a new
         // id appends, and the ambient `opus` is never replaceable.
-        let mut models = vec![opus_entry(), glm_env_entry()]; // glm unconfigured (no env)
+        let mut models = vec![opus_entry(), glm_env_entry(DEFAULT_HEALTH_INTERVAL_SECS)]; // glm unconfigured (no env)
         let mut decl_glm = model_toml("glm-5.2", "hosted", None);
         decl_glm.label = Some("Declared GLM".into());
-        upsert_model(&mut models, registry_model_from_toml(&decl_glm).unwrap());
+        upsert_model(&mut models, registry_model_from_toml(&decl_glm, None).unwrap());
         assert_eq!(models.len(), 2, "same id replaces in place, not appends");
         assert_eq!(models[1].id, "glm-5.2");
         assert_eq!(models[1].label, "Declared GLM", "later source wins by id");
 
-        upsert_model(&mut models, registry_model_from_toml(&model_toml("fw", "hosted", None)).unwrap());
+        upsert_model(&mut models, registry_model_from_toml(&model_toml("fw", "hosted", None), None).unwrap());
         assert_eq!(models.len(), 3, "a new id appends");
 
         // An entry that tries to redefine opus is refused; opus stays the built-in ambient.
-        let fake_opus = registry_model_from_toml(&model_toml("opus", "hosted", None)).unwrap();
+        let fake_opus = registry_model_from_toml(&model_toml("opus", "hosted", None), None).unwrap();
         upsert_model(&mut models, fake_opus);
         assert_eq!(models.iter().filter(|m| m.id == "opus").count(), 1);
         assert!(matches!(models[0].kind, ModelKind::Ambient), "opus stays ambient");
@@ -2239,6 +2261,73 @@ mod tests {
         }
         assert_eq!(r.models.len(), 4, "no declarative entries appear with no config");
 
+        for (k, v) in saved {
+            match v {
+                Some(val) => std::env::set_var(k, val),
+                None => std::env::remove_var(k),
+            }
+        }
+    }
+
+    #[test]
+    fn global_health_interval_override_applies_unless_a_model_sets_its_own() {
+        // `JESSE_HEALTH_INTERVAL_SECS` lengthens the DEFAULT probe interval: env-triple models
+        // (no explicit interval) and a declarative model with no `health.interval_secs` pick it
+        // up, while a declarative model that sets its own interval still wins.
+        let _g = ENV_LOCK.lock_ok();
+        let saved: Vec<(&str, Option<String>)> = MODEL_ENV_VARS
+            .iter()
+            .chain(["JESSE_CONFIG", "JESSE_STATE_DIR", "JESSE_HEALTH_INTERVAL_SECS"].iter())
+            .map(|k| (*k, std::env::var(k).ok()))
+            .collect();
+        for k in MODEL_ENV_VARS {
+            std::env::remove_var(k);
+        }
+        std::env::remove_var("JESSE_STATE_DIR");
+        std::env::set_var("JESSE_HEALTH_INTERVAL_SECS", "600");
+        std::env::set_var("JESSE_TEST_HI_TOKEN", "sk-fw");
+
+        let dir = std::env::temp_dir().join(format!("jesse-hi-{}", random_hex()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("jesse.local.toml");
+        std::fs::write(
+            &file,
+            r#"
+[[models]]
+id = "fireworks"
+kind = "hosted"
+base_url = "https://gw.example/inference"
+model = "m"
+auth_token_env = "JESSE_TEST_HI_TOKEN"
+health = { interval_secs = 30 }
+
+[[models]]
+id = "codex"
+kind = "hosted"
+base_url = "http://127.0.0.1:8900"
+model = "m"
+auth_token_env = "JESSE_TEST_HI_TOKEN"
+"#,
+        )
+        .unwrap();
+        std::env::set_var("JESSE_CONFIG", &file);
+
+        let r = ModelRegistry::from_env("");
+        // Env-triple models carry no explicit interval → they pick up the global override.
+        for id in ["glm-5.2", "kimi-k3", "local"] {
+            assert_eq!(
+                r.get(id).unwrap().health.interval_secs,
+                600,
+                "{id} (no explicit interval) uses the global override"
+            );
+        }
+        // A declarative model with no health.interval_secs also uses the global override.
+        assert_eq!(r.get("codex").unwrap().health.interval_secs, 600);
+        // A declarative model that sets its own interval still wins over the global override.
+        assert_eq!(r.get("fireworks").unwrap().health.interval_secs, 30);
+
+        std::fs::remove_dir_all(&dir).ok();
+        std::env::remove_var("JESSE_TEST_HI_TOKEN");
         for (k, v) in saved {
             match v {
                 Some(val) => std::env::set_var(k, val),

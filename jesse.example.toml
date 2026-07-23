@@ -80,7 +80,17 @@ diet_keywords_extra = [
 #   price          { in_per_m, cached_per_m, out_per_m } dollars per 1M tokens (default
 #                  0/0/0), feeding the per-turn cost badge.
 #   health         { path, interval_secs, timeout_secs } — probe endpoint + cadence
-#                  (defaults: "/v1/messages", 60s, 3s).
+#                  (defaults: "/v1/messages", 60s, 3s). A probe that gets 401/403
+#                  (bad/expired token), 404 (path/model not served), or a 5xx marks the
+#                  model UNHEALTHY (hidden from the switcher); 400/422/429 stay healthy.
+#
+# JESSE_HEALTH_INTERVAL_SECS (env var, optional): a GLOBAL override for the DEFAULT probe
+#   interval, so an operator can probe idle configured models less often without writing a
+#   full [[models]] block. Seconds, floored at 5; a zero/unparseable value is ignored with
+#   a startup warning. Priority per model, highest first: an explicit per-model
+#   health.interval_secs (below) > JESSE_HEALTH_INTERVAL_SECS > the built-in 60s default.
+#   Applies to the env-triple models (glm-5.2, kimi-k3, local) and any [[models]] entry
+#   that omits its own interval_secs. Does NOT change the per-probe timeout or path.
 #
 # IMPORTANT: the bridge speaks the Anthropic `/v1/messages` contract. A model whose
 # NATIVE API is OpenAI-shaped (`/v1/chat/completions`, e.g. a "codex" model) must sit

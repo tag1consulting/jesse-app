@@ -15,6 +15,31 @@ CI both run it). See the "Versioning" section of `bridge/README.md`.
 
 ## [Unreleased]
 
+## [Bridge 0.29.0] - 2026-07-23
+
+### Changed
+- **Auth-aware health classification.** The health prober no longer treats every response
+  below 500 as healthy. A probe that gets `401`/`403` (a bad or expired token — the common
+  arming failure) now records the model UNHEALTHY with error class `unauthorized`, and a
+  `404` (the configured base URL / path / model does not answer on the very `/v1/messages`
+  path a real turn uses) records `unknown-model`. Both make the model non-selectable in the
+  switcher and cause `POST /jesse/model` to `409`, so a green health light means the model
+  will actually serve a turn. Any other `4xx` (400, 422, 429, …) stays healthy — the
+  endpoint is reachable and the key accepted, so a gateway body/header quirk or a transient
+  throttle does not blank the model out. `5xx` and the transport errors (timeout / connect /
+  transport) are unchanged. The status→health decision is a pure, unit-tested classifier; no
+  token, URL, or response body is ever logged.
+
+### Added
+- **`JESSE_HEALTH_INTERVAL_SECS`** — a global override for the DEFAULT probe interval, so an
+  operator can probe idle configured models less often without writing a full `[[models]]`
+  block. Seconds, floored at 5; a zero or unparseable value is ignored with a startup
+  warning. Resolution per model, highest priority first: an explicit per-model
+  `health.interval_secs`, then `JESSE_HEALTH_INTERVAL_SECS`, then the built-in 60s default.
+  Applies to the env-triple models (`glm-5.2`, `kimi-k3`, `local`) and any `[[models]]`
+  entry that omits its own interval; the per-probe timeout and path are untouched.
+  Documented in `jesse.example.toml`.
+
 ## [Bridge 0.28.0] - 2026-07-23
 
 ### Added
