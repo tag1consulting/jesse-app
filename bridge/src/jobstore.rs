@@ -39,8 +39,11 @@ pub enum JobState {
         // the badge/flags it encodes), carried on the terminal state so BOTH the
         // poll result and the SSE `done` frame surface the same value. Present
         // exactly when the text badge is appended; `None` when badges are off, on a
-        // persisted reply from before this field, or on an empty/error turn.
-        provenance: Option<Provenance>,
+        // persisted reply from before this field, or on an empty/error turn. Boxed so
+        // this large terminal variant stays well under clippy's enum-size gap threshold
+        // (the provenance object is present only on a badged reply — a heap hop on that
+        // rare terminal path, never on the hot `Running` state).
+        provenance: Option<Box<Provenance>>,
     },
     Failed {
         error: String,
@@ -182,7 +185,7 @@ pub fn job_to_value(id: &str, job: &Job) -> Option<Value> {
             Some(response.clone()),
             session_id.clone(),
             directives_to_value(directives),
-            provenance_to_value(provenance),
+            provenance_to_value(provenance.as_deref()),
             None,
         ),
         JobState::Failed { error } => (
@@ -242,7 +245,8 @@ pub fn value_to_job(v: &Value) -> Option<(String, Job)> {
             provenance: v
                 .get("provenance")
                 .filter(|p| !p.is_null())
-                .and_then(|p| serde_json::from_value(p.clone()).ok()),
+                .and_then(|p| serde_json::from_value::<Provenance>(p.clone()).ok())
+                .map(Box::new),
         },
         "failed" => JobState::Failed {
             error: v
@@ -603,7 +607,8 @@ impl JobStore {
                 response,
                 session_id,
                 directives,
-                provenance,
+                // Box on store — keeps the terminal variant small (see the field docs).
+                provenance: provenance.map(Box::new),
             },
             Err((_code, error)) => JobState::Failed { error },
         };

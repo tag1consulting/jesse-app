@@ -70,6 +70,9 @@ pub fn test_config() -> Config {
         shadow_timeout_secs: 120,
         // Generic default persona (owner "the user") — the fresh-clone identity.
         persona: Persona::default(),
+        // Opus-only registry: the ambient default, so the integration router runs
+        // byte-for-byte today's turn unless a test builds its own registry.
+        model_registry: ModelRegistry::opus_only(),
     }
 }
 pub fn test_state() -> AppState {
@@ -113,6 +116,36 @@ pub fn session_flags_request(auth: Option<&str>, session_id: &str, json: &str) -
     let mut b = Request::builder()
         .method("POST")
         .uri(format!("/jesse/session/{session_id}/flags"))
+        .header("content-type", "application/json");
+    if let Some(a) = auth {
+        b = b.header("authorization", a);
+    }
+    b.body(Body::from(json.to_string())).unwrap()
+}
+/// `GET /jesse/models` with the given (optional) auth header.
+pub fn models_request(auth: Option<&str>) -> Request<Body> {
+    let mut b = Request::builder().method("GET").uri("/jesse/models");
+    if let Some(a) = auth {
+        b = b.header("authorization", a);
+    }
+    b.body(Body::empty()).unwrap()
+}
+/// `POST /jesse/model` with the given (optional) auth header and body.
+pub fn set_model_request(auth: Option<&str>, json: &str) -> Request<Body> {
+    let mut b = Request::builder()
+        .method("POST")
+        .uri("/jesse/model")
+        .header("content-type", "application/json");
+    if let Some(a) = auth {
+        b = b.header("authorization", a);
+    }
+    b.body(Body::from(json.to_string())).unwrap()
+}
+/// `POST /jesse/model/{id}/writes` with the given (optional) auth header and body.
+pub fn set_model_writes_request(auth: Option<&str>, id: &str, json: &str) -> Request<Body> {
+    let mut b = Request::builder()
+        .method("POST")
+        .uri(format!("/jesse/model/{id}/writes"))
         .header("content-type", "application/json");
     if let Some(a) = auth {
         b = b.header("authorization", a);

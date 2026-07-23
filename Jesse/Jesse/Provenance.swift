@@ -16,8 +16,13 @@ struct ProvenanceChip: View {
         HStack(spacing: 4) {
             Image(systemName: provenance.iconName)
                 .font(.caption2)
-            Text(provenance.label)
+            Text(provenance.chipTitle)
                 .font(.caption2.weight(.medium))
+            if let cost = provenance.costLabel {
+                Text(cost)
+                    .font(.caption2)
+                    .foregroundStyle(tint.opacity(0.75))
+            }
         }
         .foregroundStyle(tint)
         .padding(.horizontal, 8)

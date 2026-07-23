@@ -15,6 +15,43 @@ CI both run it). See the "Versioning" section of `bridge/README.md`.
 
 ## [Unreleased]
 
+## [Bridge 0.27.0] - 2026-07-23
+
+### Added
+- **Global model switch (Phase 1: read-only).** One switch, set from the phone or the
+  Mac, chooses which model backs the conversation you are talking to — the main turn AND
+  the subagents it spawns follow it (`CLAUDE_CODE_SUBAGENT_MODEL`). It does NOT touch the
+  cheap-role offloads (title, diet extract, vault-QA), which keep their own backends.
+  - A config-driven registry (`JESSE_MODEL_*`) of four entries: `opus` (the default,
+    ambient — selecting it reproduces today's behavior byte for byte), `glm-5.2` (hosted
+    on Fireworks' Anthropic surface; base + model default, token from
+    `JESSE_MODEL_GLM_AUTH_TOKEN`), `kimi-k3` (ships **unavailable** until Fireworks lists a
+    live K3 slug), and `local` (an Anthropic-compatible local endpoint). No secret is
+    compiled in and none is persisted; a model with an incomplete triple is unavailable.
+  - The active selection + per-model write permission persist to `<state_dir>/model.json`
+    (a new `ModelStore`, ids and booleans only — never a token), so iPhone and Mac
+    converge. Endpoints: `GET /jesse/models`, `POST /jesse/model`,
+    `POST /jesse/model/{id}/writes` (behind the same bearer auth as `/jesse`).
+  - A non-default model runs **read-only** in Phase 1: the main turn (and its subagents)
+    get a contained allowlist — reads, search, and the qmd vault MCP, but no `Write`,
+    `Edit`, `Bash`, or any outbound-send tool. The boundary is the allowlist, not the
+    prompt. Writes are opt-in per model in Phase 2; the default `opus` is always writes-on.
+  - Every reply's badge now names the **active model** and that turn's **cost** in dollars
+    (usage × the model's price deck), surfaced both as the text badge (`[glm-5.2 · $0.0021]`)
+    and as structured `model` / `cost_usd` fields on the provenance the app renders as a chip.
+    A hosted `opus` turn stays byte-for-byte today's behavior with an `opus` badge.
+
+## [App 1.0 (71)] - 2026-07-23
+
+### Added
+- **Choose which model answers your conversations.** A new *Model* switcher in Settings
+  (iPhone and Mac) lists the available models with the active one checked; an unavailable
+  model like Kimi K3 shows disabled with a *pending* note, and a non-default model shows
+  *read-only*. A compact model menu in the conversation toolbar makes a swap one tap. The
+  bridge is the source of truth, so both devices converge on one choice. Requires bridge
+  0.27.0; against an older bridge the switcher simply doesn't appear.
+- **Each reply's provenance chip now shows the model that served it and the turn's cost.**
+
 ## [App 1.0 (70)] - 2026-07-23
 
 ### Fixed

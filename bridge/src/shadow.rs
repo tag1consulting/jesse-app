@@ -76,6 +76,13 @@ impl ShadowUsage {
         ((input + cache_create) * in_per_m + cached * cached_per_m + out * out_per_m) / 1_000_000.0
     }
 
+    /// Dollar cost of this usage vector on an arbitrary [`PriceDeck`] — the per-turn cost
+    /// badge multiplies a main turn's usage by the ACTIVE model's deck through this. The
+    /// two named helpers below are the audit's fixed-deck shorthands over the same math.
+    pub fn cost_on(&self, deck: &PriceDeck) -> f64 {
+        self.cost(deck.in_per_m, deck.cached_per_m, deck.out_per_m)
+    }
+
     /// Dollar cost of this usage vector on the Fireworks price deck.
     pub fn fireworks_cost(&self) -> f64 {
         self.cost(FW_IN_PER_M, FW_CACHED_PER_M, FW_OUT_PER_M)

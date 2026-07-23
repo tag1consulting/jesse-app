@@ -30,6 +30,13 @@ pub struct AppState {
     // `GET /jesse/sessions` so every device converges on removals the same way it
     // converges on favorite/archived flags. Age-based GC never records here.
     pub deletions: Arc<DeletionStore>,
+    // Server-side GLOBAL model selection (the model switch): the active model id and the
+    // per-model write overrides, persisted to `<state_dir>/model.json` (in-memory when no
+    // state dir). The bridge is the source of truth so iPhone and Mac converge on ONE
+    // choice of which model backs the conversation. Read into `GET /jesse/models`,
+    // written by `POST /jesse/model` and `POST /jesse/model/{id}/writes`. Holds only ids
+    // and booleans — never a token (credentials live in `cfg.model_registry`, from env).
+    pub models: Arc<ModelStore>,
     // The registered APNs device token (single user). Always present so device
     // registration works even when push is off; persisted to the state dir.
     pub devices: Arc<DeviceStore>,
@@ -79,6 +86,7 @@ impl AppState {
         let device_file = cfg.device_file();
         let titles_file = cfg.titles_file();
         let flags_file = cfg.flags_file();
+        let model_file = cfg.model_file();
         let deletions_file = cfg.deletions_file();
         let deletion_retention_ms = deletion_retention_ms(cfg.session_ttl_days);
         let context_file = cfg.context_file();
@@ -95,6 +103,7 @@ impl AppState {
             limiter,
             titles: Arc::new(TitleStore::new(titles_file)),
             flags: Arc::new(FlagStore::new(flags_file)),
+            models: Arc::new(ModelStore::new(model_file)),
             deletions: Arc::new(DeletionStore::new(deletions_file, deletion_retention_ms)),
             devices: Arc::new(DeviceStore::new(device_file)),
             notify: Arc::new(NotifyFlags::new()),
@@ -107,11 +116,117 @@ impl AppState {
         }
     }
 
+    /// Resolve the model that should back THIS turn from the persisted selection + the
+    /// registry: the active id, its `ANTHROPIC_*` env (None for ambient), the subagent
+    /// model, and its EFFECTIVE write permission. Ambient (`opus`) is always writes-on; a
+    /// non-ambient model's writes come from its `ModelStore` override, else its registry
+    /// `default_writes` (OFF in Phase 1). A stored active id that is unknown or no longer
+    /// available degrades to the always-available default rather than stranding the turn.
+    pub fn resolve_active_model(&self) -> ActiveModel {
+        let id = self.models.active();
+        let registry = &self.cfg.model_registry;
+        let m = match registry.get(&id) {
+            Some(m) if m.available => m,
+            _ => registry.default_model(),
+        };
+        let writes_allowed = matches!(m.kind, ModelKind::Ambient)
+            || self
+                .models
+                .writes_override(&m.id)
+                .unwrap_or(m.default_writes);
+        ActiveModel {
+            id: m.id.clone(),
+            kind: m.kind,
+            env: m.backend.clone(),
+            subagent_model: m.backend.as_ref().map(|(_, _, model)| model.clone()),
+            writes_allowed,
+            price: m.price,
+        }
+    }
+
     /// The `~/.claude/projects/<escaped-vault>` directory this bridge's vault
     /// sessions live in. Uses the HOME captured once in `Config` (see `cfg.home`);
     /// an unknown HOME yields a path that simply won't exist (→ empty session
     /// list), never an error.
     pub fn sessions_dir(&self) -> PathBuf {
         vault_sessions_dir(&self.cfg.home, &self.cfg.vault)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::testutil::*;
+
+    /// An AppState whose registry offers opus + an available glm-5.2 (read-only default).
+    fn state_with_glm() -> AppState {
+        let registry = ModelRegistry {
+            models: vec![
+                RegistryModel {
+                    id: "opus".into(),
+                    label: "Claude Opus".into(),
+                    kind: ModelKind::Ambient,
+                    backend: None,
+                    available: true,
+                    default_writes: true,
+                    price: PriceDeck::ZERO,
+                },
+                RegistryModel {
+                    id: "glm-5.2".into(),
+                    label: "GLM 5.2".into(),
+                    kind: ModelKind::Hosted,
+                    backend: Some(("http://fw".into(), "fw-tok".into(), "glm-model".into())),
+                    available: true,
+                    default_writes: false,
+                    price: PriceDeck::ZERO,
+                },
+            ],
+        };
+        AppState::new(Config {
+            model_registry: registry,
+            ..test_config()
+        })
+    }
+
+    #[test]
+    fn resolve_defaults_to_ambient_opus_writes_on() {
+        let st = test_state();
+        let a = st.resolve_active_model();
+        assert_eq!(a.id, "opus");
+        assert!(a.env.is_none(), "opus is ambient — no ANTHROPIC_* env");
+        assert!(a.writes_allowed, "opus is always writes-on");
+    }
+
+    #[test]
+    fn resolve_glm_applies_env_and_is_read_only_by_default() {
+        let st = state_with_glm();
+        st.models.set_active("glm-5.2");
+        let a = st.resolve_active_model();
+        assert_eq!(a.id, "glm-5.2");
+        assert_eq!(
+            a.env,
+            Some(("http://fw".into(), "fw-tok".into(), "glm-model".into()))
+        );
+        assert_eq!(a.subagent_model.as_deref(), Some("glm-model"));
+        assert!(!a.writes_allowed, "a non-ambient model is read-only until opted in");
+    }
+
+    #[test]
+    fn resolve_glm_honors_a_writes_override() {
+        let st = state_with_glm();
+        st.models.set_active("glm-5.2");
+        st.models.set_writes("glm-5.2", true);
+        assert!(st.resolve_active_model().writes_allowed, "override enables writes");
+    }
+
+    #[test]
+    fn resolve_falls_back_to_opus_when_the_stored_active_is_unavailable() {
+        // A stale selection (a model that became unavailable, or an unknown id) must never
+        // strand the conversation; the turn degrades to the always-available default.
+        let st = state_with_glm();
+        st.models.set_active("kimi-k3"); // not in this registry
+        let a = st.resolve_active_model();
+        assert_eq!(a.id, "opus", "unknown/unavailable active degrades to opus");
+        assert!(a.env.is_none());
     }
 }

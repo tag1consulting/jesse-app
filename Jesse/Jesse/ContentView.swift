@@ -263,6 +263,14 @@ struct SettingsView: View {
     // refreshed on appear and whenever we contact the bridge for defaults.
     @State private var bridgeVersion: String? = BridgeVersionStore.current
 
+    // The global model switch (bridge 0.27.0): the selectable models + active selection,
+    // fetched from the bridge (the source of truth) on open and after a change. `nil` until
+    // loaded / on an older bridge. `switchingModel` disables the rows during a swap.
+    @State private var modelState: ModelSwitchState?
+    @State private var loadingModels = false
+    @State private var switchingModel = false
+    @State private var modelsError: String?
+
     // On-device search expansion (Tier 2), default ON. Off → pure multi-token
     // Tier-1 search with no model calls. Same key the thread list reads.
     @AppStorage("searchExpansionEnabled") private var searchExpansionEnabled = true
@@ -358,6 +366,8 @@ struct SettingsView: View {
                 }
 
                 floorSection(for: .tell)
+
+                modelSwitchSection
 
                 Section {
                     Toggle("Smart search expansion", isOn: $searchExpansionEnabled)
@@ -522,6 +532,98 @@ struct SettingsView: View {
             let detail = (error as? JesseError)?.errorDescription ?? error.localizedDescription
             promptsError = "Couldn’t load defaults — connect to the bridge first. (\(detail))"
             return nil
+        }
+    }
+
+    /// The global model switch section: one row per selectable model, the active one
+    /// checked, an unavailable model (e.g. Kimi K3 until a live slug resolves) disabled with
+    /// a "pending" note. Selecting a model is one tap; the bridge is the source of truth so
+    /// this refetches after a change. Hidden until models load (an older bridge has no route).
+    @ViewBuilder
+    private var modelSwitchSection: some View {
+        Section {
+            if let modelState {
+                ForEach(modelState.models) { model in
+                    Button {
+                        selectModel(model)
+                    } label: {
+                        HStack {
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text(model.label)
+                                    .foregroundStyle(model.available ? .primary : .secondary)
+                                if !model.available {
+                                    Text("pending — not yet available")
+                                        .font(.caption)
+                                        .foregroundStyle(.secondary)
+                                } else if !model.isDefault && !model.writesAllowed {
+                                    Text("read-only")
+                                        .font(.caption)
+                                        .foregroundStyle(.secondary)
+                                }
+                            }
+                            Spacer()
+                            if model.id == modelState.active {
+                                Image(systemName: "checkmark")
+                                    .foregroundStyle(.tint)
+                            }
+                        }
+                    }
+                    .disabled(!model.available || switchingModel)
+                }
+            } else if loadingModels {
+                HStack { ProgressView(); Text("Loading models…").foregroundStyle(.secondary) }
+            } else {
+                Button {
+                    Task { await loadModels() }
+                } label: {
+                    Label("Load models from bridge", systemImage: "cpu")
+                }
+            }
+            if let modelsError {
+                Text(modelsError)
+                    .font(.callout)
+                    .foregroundStyle(.red)
+            }
+        } header: {
+            Text("Model")
+        } footer: {
+            Text("Chooses which model answers your conversations (and the sub-agents it runs). The cheap background helpers — titles, diet logging, vault lookups — are unaffected. A non-default model can read your vault but not write it until you enable writes for it.")
+        }
+        .task { await loadModels() }
+    }
+
+    /// Fetch the selectable models + active selection using the entered host/token. Silent on
+    /// an older bridge (no `/jesse/models` route) — the section simply stays hidden.
+    private func loadModels() async {
+        let cfg = JesseConfig(host: host, port: Int(port) ?? JesseConfig.defaultPort, token: token)
+        guard cfg.isConfigured else { return }
+        loadingModels = true
+        defer { loadingModels = false }
+        do {
+            modelState = try await JesseClient(config: cfg).fetchModels()
+            modelsError = nil
+        } catch {
+            // An older bridge 404s here; leave the section hidden rather than shouting.
+            modelState = nil
+        }
+    }
+
+    /// Make `model` the active model, then refetch so the UI reflects the bridge's truth.
+    /// A no-op on the already-active model or an unavailable one.
+    private func selectModel(_ model: ModelInfo) {
+        guard model.available, model.id != modelState?.active else { return }
+        Task {
+            switchingModel = true
+            defer { switchingModel = false }
+            let cfg = JesseConfig(host: host, port: Int(port) ?? JesseConfig.defaultPort, token: token)
+            do {
+                try await JesseClient(config: cfg).setActiveModel(model.id)
+                modelsError = nil
+            } catch {
+                let detail = (error as? JesseError)?.errorDescription ?? error.localizedDescription
+                modelsError = "Couldn’t switch model. (\(detail))"
+            }
+            await loadModels()
         }
     }
 

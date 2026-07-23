@@ -119,6 +119,9 @@ pub struct AskResult {
     pub badge: BadgeSource,
     pub route: MetricsRoute,
     pub model: Option<String>,
+    /// Token usage from the hosted attempt (for the per-turn cost badge). Empty on the
+    /// emergency-local path (a local child, no hosted usage) and on a hosted failure.
+    pub usage: ShadowUsage,
     pub emergency: bool,
     pub failclass: Option<String>,
     pub citations: Option<usize>,
@@ -161,8 +164,9 @@ fn emergency_validator(validator_ok: bool) -> String {
 /// emergency is armed, in which case go local-first), and on a TRANSPORT-class hosted
 /// failure with emergency armed, serve the read-only emergency child instead. On any
 /// non-transport failure, an unarmed bridge, or an emergency child failure, this
-/// returns the ORIGINAL hosted outcome exactly as today. `hosted_model` is the ambient
-/// `ANTHROPIC_MODEL` for the metrics/badge model field on the hosted path.
+/// returns the ORIGINAL hosted outcome exactly as today. `active` is the model backing the
+/// hosted attempt (the global switch): its id names the metrics/badge model on the hosted
+/// path, and its backend/allowlist are applied to the turn (byte-for-byte today's for opus).
 #[allow(clippy::too_many_arguments)]
 pub async fn run_ask_hosted_or_emergency(
     cfg: &Config,
@@ -174,7 +178,7 @@ pub async fn run_ask_hosted_or_emergency(
     health_context: Option<&str>,
     breaker: &CircuitBreaker,
     emergency_armed: bool,
-    hosted_model: Option<String>,
+    active: &ActiveModel,
     recent_context: Option<&str>,
 ) -> AskResult {
     let now = Instant::now();
@@ -202,6 +206,8 @@ pub async fn run_ask_hosted_or_emergency(
                     badge: BadgeSource::Emergency,
                     route: MetricsRoute::EmergencyLocal,
                     model: vaultqa_model.clone(),
+                    // A local child served this — no hosted usage, so cost is $0.
+                    usage: ShadowUsage::default(),
                     emergency: true,
                     failclass: Some(reason),
                     citations,
@@ -226,8 +232,9 @@ pub async fn run_ask_hosted_or_emergency(
         }
     }
 
-    // Attempt hosted.
-    let out = apply_directives(run_claude_streaming(cfg, prompt, sid, jobs, jid).await);
+    // Attempt hosted — under the ACTIVE model (byte-for-byte today's turn for opus).
+    let (out, usage) = split_turn_usage(run_claude_streaming(cfg, prompt, sid, jobs, jid, active).await);
+    let out = apply_directives(out);
     match out {
         Ok(v) => {
             if emergency_armed {
@@ -237,7 +244,8 @@ pub async fn run_ask_hosted_or_emergency(
                 outcome: Ok(v),
                 badge: BadgeSource::Hosted,
                 route: MetricsRoute::Hosted,
-                model: hosted_model,
+                model: Some(active.id.clone()),
+                usage,
                 emergency: false,
                 failclass: None,
                 citations: None,
@@ -259,7 +267,8 @@ pub async fn run_ask_hosted_or_emergency(
                     outcome: Err(e),
                     badge: BadgeSource::Hosted,
                     route: MetricsRoute::Hosted,
-                    model: hosted_model,
+                    model: Some(active.id.clone()),
+                    usage: ShadowUsage::default(),
                     emergency: true,
                     failclass: Some(cls.label().to_string()),
                     citations: None,
@@ -273,7 +282,8 @@ pub async fn run_ask_hosted_or_emergency(
                 outcome: Err(e),
                 badge: BadgeSource::Hosted,
                 route: MetricsRoute::Hosted,
-                model: hosted_model,
+                model: Some(active.id.clone()),
+                usage: ShadowUsage::default(),
                 emergency: false,
                 failclass: if emergency_armed {
                     Some(cls.label().to_string())
@@ -484,6 +494,12 @@ pub async fn jesse(
     let jobs = st.jobs.clone();
     let jid = job_id.clone();
     let sid = req.session_id.clone();
+    // The global model switch: resolve WHICH model backs this turn (id + ANTHROPIC_* env +
+    // subagent model + effective write permission + price deck) from the persisted
+    // selection and the registry, once, before spawning. For the ambient `opus` default
+    // this is byte-for-byte today's turn; a non-ambient model applies its backend to the
+    // main turn and its subagents and (Phase 1) runs read-only.
+    let active = st.resolve_active_model();
     // The raw utterance the local diet pipeline parses (distinct from the wrapped
     // `prompt`, which the hosted path — including any diet fall-through — still uses).
     // The vault-QA child answers this same raw question.
@@ -552,7 +568,6 @@ pub async fn jesse(
         // AND the vault-QA triple is set (it supplies the backend + read-only child).
         // With it disarmed, every branch below is byte-for-byte today's behavior.
         let emergency_armed = emergency_armed(&cfg);
-        let hosted_model = env_string("ANTHROPIC_MODEL");
         let diet_queue = DietQueue::from_cfg(&cfg);
 
         // ---- Context carry (Piece 3 + 4): read the thread's ledger UNDER THE PERMIT
@@ -591,16 +606,26 @@ pub async fn jesse(
         // from the text and attached under `directives`. This is today's path — and the
         // diet fall-through target. Uses `hosted_prompt` (the catch-up-spliced prompt).
         let run_hosted = || async {
-            apply_directives(
-                run_claude_streaming(&cfg, &hosted_prompt, sid.as_deref(), &jobs, &jid).await,
-            )
+            // The active model backs the hosted turn (byte-for-byte today's for opus).
+            // Peel the token usage off for the per-turn cost badge.
+            let (out, usage) = split_turn_usage(
+                run_claude_streaming(&cfg, &hosted_prompt, sid.as_deref(), &jobs, &jid, &active)
+                    .await,
+            );
+            (apply_directives(out), usage)
         };
 
         // Resolve the turn. Each branch yields the outcome, the BADGE SOURCE, the
         // metrics shape, and whether a hosted contact succeeded (which gates the
         // diet-queue replay below).
         let mut route = MetricsRoute::Hosted;
-        let mut m_model: Option<String> = hosted_model.clone();
+        // The hosted route's model is the ACTIVE model the switch selected (not the
+        // bridge's ambient ANTHROPIC_MODEL); a local route overrides this with its role
+        // backend's model below.
+        let mut m_model: Option<String> = Some(active.id.clone());
+        // Token usage for the per-turn cost badge — set from the hosted main turn; stays
+        // empty ($0) on a purely-local route (no main turn ran).
+        let mut m_usage = ShadowUsage::default();
         let mut m_rung: u8 = 0;
         let mut m_citations: Option<usize> = None;
         let mut m_validator: Option<String> = None;
@@ -676,7 +701,8 @@ pub async fn jesse(
                             Err(e) => {
                                 // Couldn't queue → today's behavior (run hosted).
                                 eprintln!("jesse-bridge: diet queue enqueue failed: {e} — hosted fallback");
-                                let out = run_hosted().await;
+                                let (out, usage) = run_hosted().await;
+                                m_usage = usage;
                                 hosted_succeeded = out.is_ok();
                                 if emergency_armed {
                                     update_breaker(&breaker, &out, Instant::now());
@@ -688,7 +714,8 @@ pub async fn jesse(
                     } else {
                         // Not armed or a non-transport verify error → today's behavior:
                         // exactly FallThrough { rung: Verify } (run the hosted turn).
-                        let out = run_hosted().await;
+                        let (out, usage) = run_hosted().await;
+                        m_usage = usage;
                         hosted_succeeded = out.is_ok();
                         if emergency_armed {
                             update_breaker(&breaker, &out, Instant::now());
@@ -698,7 +725,8 @@ pub async fn jesse(
                     }
                 }
                 DietPipelineOutcome::FallThrough { rung, reason } => {
-                    let out = run_hosted().await;
+                    let (out, usage) = run_hosted().await;
+                    m_usage = usage;
                     hosted_succeeded = out.is_ok();
                     if emergency_armed {
                         update_breaker(&breaker, &out, Instant::now());
@@ -739,12 +767,13 @@ pub async fn jesse(
                         health_context.as_deref(),
                         &breaker,
                         emergency_armed,
-                        hosted_model.clone(),
+                        &active,
                         recent_block.as_deref(),
                     )
                     .await;
                     route = r.route;
                     m_model = r.model;
+                    m_usage = r.usage;
                     m_emergency = r.emergency;
                     m_failclass = r.failclass;
                     m_citations = r.citations;
@@ -767,12 +796,13 @@ pub async fn jesse(
                 health_context.as_deref(),
                 &breaker,
                 emergency_armed,
-                hosted_model.clone(),
+                &active,
                 recent_block.as_deref(),
             )
             .await;
             route = r.route;
             m_model = r.model;
+            m_usage = r.usage;
             m_emergency = r.emergency;
             m_failclass = r.failclass;
             m_citations = r.citations;
@@ -784,7 +814,8 @@ pub async fn jesse(
             // A non-diet TELL: no local fallback exists, so always attempt hosted (the
             // breaker never skips here). Update the breaker so a Tell's hosted health
             // still feeds it when emergency is armed.
-            let out = run_hosted().await;
+            let (out, usage) = run_hosted().await;
+            m_usage = usage;
             hosted_succeeded = out.is_ok();
             if emergency_armed {
                 update_breaker(&breaker, &out, Instant::now());
@@ -861,6 +892,20 @@ pub async fn jesse(
             }
         }
 
+        // The hosted-route badge facts: the ACTIVE model id, its per-turn cost (usage ×
+        // the active model's price deck — the hosted main turn is the only route whose
+        // usage the active model produced), and the Phase 2 write marker (a non-default
+        // model that has write access). Ignored on a local route. Built once and shared by
+        // the provenance, the finalized text badge, and the metrics badge below so all
+        // three are byte-identical.
+        let hosted_badge = HostedBadge {
+            model_id: active.id.clone(),
+            write_marked: active.is_non_ambient() && active.writes_allowed,
+            cost_usd: match badge_source {
+                BadgeSource::Hosted => Some(m_usage.cost_on(&active.price)),
+                _ => None,
+            },
+        };
         // Build the structured provenance (v2) from the SAME pre-finalize outcome and
         // turn state that produce the text badge, so the two are always both-present or
         // both-absent. It rides on `JobState::Done` next to `directives`, reaching BOTH
@@ -874,7 +919,7 @@ pub async fn jesse(
             route,
             badge_source,
             m_model.clone(),
-            hosted_model.as_deref(),
+            &hosted_badge,
             m_citations_unverified,
         );
         // Shadow comparison (JESSE_SHADOW_*): capture the eligible turn's inputs from
@@ -900,7 +945,7 @@ pub async fn jesse(
 
         // Finalize the delivered reply: append the model badge (display only) at this
         // single point, so BOTH the poll result and the SSE `done` frame carry it.
-        let outcome = finalize_reply_badge(outcome, &cfg, badge_source, hosted_model.as_deref());
+        let outcome = finalize_reply_badge(outcome, &cfg, badge_source, &hosted_badge);
 
         // Structured metrics (Piece 3): one content-free line per GATED / ROUTED /
         // EMERGENCY turn, at this same finalization seam. A no-op when JESSE_METRICS_LOG
@@ -911,7 +956,7 @@ pub async fn jesse(
         if metrics_relevant {
             let badge = match &outcome {
                 Ok((text, _, _)) if !text.trim().is_empty() => {
-                    model_badge_line(&cfg, badge_source, hosted_model.as_deref())
+                    model_badge_line(&cfg, badge_source, &hosted_badge)
                 }
                 _ => None,
             };
@@ -1053,7 +1098,7 @@ pub async fn jesse_result(
             "response": response,
             "session_id": session_id,
             "directives": directives_to_value(&directives),
-            "provenance": provenance_to_value(&provenance),
+            "provenance": provenance_to_value(provenance.as_deref()),
         }))),
         Some(JobState::Failed { error }) => Ok(Json(json!({ "status": "failed", "error": error }))),
         Some(JobState::Cancelled) => Ok(Json(json!({ "status": "cancelled" }))),
@@ -1247,6 +1292,115 @@ pub async fn jesse_meal_corrections(
     }
 }
 
+// ---- Model switch endpoints (the global model switch) ----------------------
+
+/// Body of `POST /jesse/model`: the id of the model to make active.
+#[derive(Deserialize)]
+pub struct SetModelRequest {
+    id: String,
+}
+
+/// Body of `POST /jesse/model/{id}/writes`: whether that model may write the vault.
+#[derive(Deserialize)]
+pub struct SetWritesRequest {
+    enabled: bool,
+}
+
+/// The EFFECTIVE write permission for a registry model: the ambient default (`opus`) is
+/// always writes-on; every other model takes its `ModelStore` override, else its registry
+/// `default_writes` (OFF in Phase 1). This is what the app renders and what the turn path
+/// enforces via the allowlist.
+pub fn effective_writes(m: &RegistryModel, store: &ModelStore) -> bool {
+    matches!(m.kind, ModelKind::Ambient) || store.writes_override(&m.id).unwrap_or(m.default_writes)
+}
+
+/// One model row for `GET /jesse/models`. Exposes ids and booleans ONLY — never a base
+/// url or token (those live in the launch env and never reach a client).
+fn model_row(m: &RegistryModel, store: &ModelStore) -> Value {
+    json!({
+        "id": m.id,
+        "label": m.label,
+        "kind": m.kind,
+        "available": m.available,
+        "writes_allowed": effective_writes(m, store),
+    })
+}
+
+/// `GET /jesse/models` — the selectable models and the active selection, so the phone and
+/// the Mac render one switcher and converge on one choice. Same bearer auth as `/jesse`.
+pub async fn jesse_models(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, ApiError> {
+    check_auth(&headers, &st.cfg.token)?;
+    let rows: Vec<Value> = st
+        .cfg
+        .model_registry
+        .models
+        .iter()
+        .map(|m| model_row(m, &st.models))
+        .collect();
+    Ok(Json(json!({
+        "active": st.models.active(),
+        "models": rows,
+    })))
+}
+
+/// `POST /jesse/model` — set the active model. Rejects an unknown id (400) or an
+/// unavailable one (409, e.g. `kimi-k3` until a live slug resolves, or a hosted model
+/// whose triple is unset) so the conversation never switches onto a model the bridge
+/// cannot actually reach. Same bearer auth as `/jesse`.
+pub async fn jesse_set_model(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    Json(req): Json<SetModelRequest>,
+) -> Result<Json<Value>, ApiError> {
+    check_auth(&headers, &st.cfg.token)?;
+    let id = req.id.trim();
+    match st.cfg.model_registry.get(id) {
+        Some(m) if m.available => {
+            let active = st.models.set_active(id);
+            Ok(Json(json!({ "active": active })))
+        }
+        Some(_) => Err((
+            StatusCode::CONFLICT,
+            format!("model '{id}' is unavailable"),
+        )),
+        None => Err((StatusCode::BAD_REQUEST, format!("unknown model '{id}'"))),
+    }
+}
+
+/// `POST /jesse/model/{id}/writes` — set a model's write permission (Phase 2 wires the
+/// effect; Phase 1 accepts and stores it). The ambient default (`opus`) is always
+/// writes-on and not user-settable (400). Unknown/unavailable ids are rejected exactly as
+/// `POST /jesse/model`. Same bearer auth as `/jesse`.
+pub async fn jesse_set_model_writes(
+    State(st): State<AppState>,
+    UrlPath(id): UrlPath<String>,
+    headers: HeaderMap,
+    Json(req): Json<SetWritesRequest>,
+) -> Result<Json<Value>, ApiError> {
+    check_auth(&headers, &st.cfg.token)?;
+    let id = id.trim();
+    match st.cfg.model_registry.get(id) {
+        Some(m) if m.available => {
+            if matches!(m.kind, ModelKind::Ambient) {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    "the default model is always writes-on".to_string(),
+                ));
+            }
+            let enabled = st.models.set_writes(id, req.enabled);
+            Ok(Json(json!({ "id": id, "writes_allowed": enabled })))
+        }
+        Some(_) => Err((
+            StatusCode::CONFLICT,
+            format!("model '{id}' is unavailable"),
+        )),
+        None => Err((StatusCode::BAD_REQUEST, format!("unknown model '{id}'"))),
+    }
+}
+
 /// Build the axum router with its shared state. Kept separate from `main` so
 /// tests can drive the same routes via `tower::ServiceExt::oneshot` without
 /// binding a socket. The running server uses exactly this router.
@@ -1277,6 +1431,11 @@ pub fn app(state: AppState) -> Router {
         .route("/jesse/cancel/:job_id", post(jesse_cancel))
         .route("/jesse/device", post(jesse_device))
         .route("/jesse/notify/:job_id", post(jesse_notify))
+        // The global model switch: read the selectable models + active selection, set the
+        // active model, and set a model's write permission (Phase 2 wires the effect).
+        .route("/jesse/models", get(jesse_models))
+        .route("/jesse/model", post(jesse_set_model))
+        .route("/jesse/model/:id/writes", post(jesse_set_model_writes))
         .layer(DefaultBodyLimit::max(body_limit))
         .with_state(state)
 }

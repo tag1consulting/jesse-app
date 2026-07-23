@@ -73,6 +73,10 @@ pub(crate) fn test_config() -> Config {
         // every existing prompt/gate assertion is byte-for-byte the generic form.
         // Tests that exercise a named owner or extra diet vocab set this explicitly.
         persona: Persona::default(),
+        // Opus-only registry in the fixture: the single always-available ambient
+        // default, so a turn that doesn't opt into the switch is byte-for-byte today's
+        // behavior. Tests that exercise a hosted/local model build their own registry.
+        model_registry: ModelRegistry::opus_only(),
     }
 }
 pub(crate) fn test_state() -> AppState {

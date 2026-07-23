@@ -5,6 +5,7 @@ import PhotosUI
 import UniformTypeIdentifiers
 import AVFoundation
 import JesseCore
+import JesseNetworking
 
 // One conversation: the full turn transcript with the composer pinned at the
 // bottom. Being inside a thread *is* continuing it — every send auto-resumes the
@@ -119,6 +120,13 @@ struct ThreadDetailView: View {
                           systemImage: thread.isFavorite ? "star.fill" : "star")
                 }
                 .tint(thread.isFavorite ? .yellow : nil)
+            }
+            ToolbarItem(placement: .topBarTrailing) {
+                // The global model switch, one tap from the conversation: shows the active
+                // model and lets you swap without leaving the thread. Hidden on an older
+                // bridge (no models route). The next turn uses the new model; earlier turns
+                // keep the model that served them (each reply's chip is authoritative).
+                ModelSwitchMenu()
             }
             ToolbarItem(placement: .topBarTrailing) {
                 // Share the whole conversation as a role-labeled Markdown
@@ -815,6 +823,63 @@ struct SendButton: View {
             .buttonStyle(.plain)
             .disabled(disabled)
             .opacity(disabled && !running ? 0.5 : 1)
+        }
+    }
+}
+
+/// A compact toolbar affordance for the global model switch, reachable from the
+/// conversation so a swap is one tap. Self-contained: it reads the current bridge config,
+/// fetches the selectable models on appear, and sets the active model on selection (the
+/// bridge is the source of truth, so it refetches after a change). Renders nothing until
+/// models load, so an older bridge (no `/jesse/models`) shows no control.
+private struct ModelSwitchMenu: View {
+    @State private var modelState: ModelSwitchState?
+    @State private var switching = false
+
+    var body: some View {
+        Group {
+            if let modelState {
+                Menu {
+                    ForEach(modelState.models) { model in
+                        Button {
+                            select(model)
+                        } label: {
+                            if model.id == modelState.active {
+                                Label(model.label, systemImage: "checkmark")
+                            } else if !model.available {
+                                Text("\(model.label) — pending")
+                            } else {
+                                Text(model.label)
+                            }
+                        }
+                        .disabled(!model.available || switching)
+                    }
+                } label: {
+                    Label(activeLabel(modelState), systemImage: "cpu")
+                }
+            }
+        }
+        .task { await load() }
+    }
+
+    private func activeLabel(_ state: ModelSwitchState) -> String {
+        state.activeModel?.label ?? state.active
+    }
+
+    private func load() async {
+        let cfg = ConfigStore.load()
+        guard cfg.isConfigured else { return }
+        modelState = try? await JesseClient(config: cfg).fetchModels()
+    }
+
+    private func select(_ model: ModelInfo) {
+        guard model.available, model.id != modelState?.active else { return }
+        Task {
+            switching = true
+            defer { switching = false }
+            let cfg = ConfigStore.load()
+            try? await JesseClient(config: cfg).setActiveModel(model.id)
+            await load()
         }
     }
 }
