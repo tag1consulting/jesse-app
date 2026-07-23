@@ -30,6 +30,9 @@ use crate::*;
 
 /// Default probe cadence: a minimal request every 60 s, overridable per model.
 pub const DEFAULT_HEALTH_INTERVAL_SECS: u64 = 60;
+/// Floor for the global probe-interval override (`JESSE_HEALTH_INTERVAL_SECS`): never probe
+/// more often than every 5 s, so a too-eager operator value can't hammer a backend.
+pub const MIN_HEALTH_INTERVAL_SECS: u64 = 5;
 /// Default per-probe wall-clock budget: short (3 s) so a hung backend is quickly seen down.
 pub const DEFAULT_HEALTH_TIMEOUT_SECS: u64 = 3;
 /// Default probe endpoint on the model's Anthropic surface: a tiny `/v1/messages` call.
@@ -77,6 +80,51 @@ impl HealthStatus {
             checked_at_ms: 0,
             latency_ms: None,
             last_error_class: None,
+        }
+    }
+}
+
+/// Resolve a model's probe interval from its optional explicit per-model value and the
+/// optional global override, highest priority first: an explicit per-model
+/// `health.interval_secs` (a positive `[[models]]` value) wins, then the global
+/// `JESSE_HEALTH_INTERVAL_SECS` override, then the built-in [`DEFAULT_HEALTH_INTERVAL_SECS`].
+pub fn resolve_health_interval(explicit: Option<u64>, global: Option<u64>) -> u64 {
+    explicit
+        .filter(|n| *n > 0)
+        .or(global)
+        .unwrap_or(DEFAULT_HEALTH_INTERVAL_SECS)
+}
+
+/// Pure core of [`health_interval_override`]: map the raw `JESSE_HEALTH_INTERVAL_SECS` value
+/// to the clamped override. Unset/blank → `Ok(None)` (silent). A positive integer → the
+/// value floored at [`MIN_HEALTH_INTERVAL_SECS`]. Zero or unparseable → `Err(raw)` so the
+/// caller logs ONE startup warning and falls back (as the other numeric env parsers do).
+fn parse_health_interval_override(raw: Option<&str>) -> Result<Option<u64>, String> {
+    let Some(raw) = raw.map(str::trim).filter(|s| !s.is_empty()) else {
+        return Ok(None);
+    };
+    match raw.parse::<u64>() {
+        Ok(n) if n > 0 => Ok(Some(n.max(MIN_HEALTH_INTERVAL_SECS))),
+        _ => Err(raw.to_string()),
+    }
+}
+
+/// The global default-interval override from `JESSE_HEALTH_INTERVAL_SECS`: `Some(clamped)`
+/// when set to a positive integer (floored at [`MIN_HEALTH_INTERVAL_SECS`]), else `None`.
+/// A zero or unparseable value logs one startup warning and falls back — never a hard error.
+/// Lets an operator lengthen probing of idle configured models without writing a full
+/// `[[models]]` block; an explicit per-model interval still wins (see
+/// [`resolve_health_interval`]). Read ONCE at registry build so a bad value warns a single time.
+pub fn health_interval_override() -> Option<u64> {
+    match parse_health_interval_override(std::env::var("JESSE_HEALTH_INTERVAL_SECS").ok().as_deref()) {
+        Ok(v) => v,
+        Err(raw) => {
+            eprintln!(
+                "jesse-bridge: WARNING JESSE_HEALTH_INTERVAL_SECS={raw:?} is not a positive \
+                 integer; ignoring it (using the {DEFAULT_HEALTH_INTERVAL_SECS}s default probe \
+                 interval unless a per-model health.interval_secs is set)."
+            );
+            None
         }
     }
 }
@@ -291,11 +339,47 @@ pub fn spawn_health_prober(store: Arc<HealthStore>, probe: Arc<dyn HealthProbe>,
 
 // ---- The production reqwest probe -----------------------------------------
 
+/// Map an HTTP status from a probe RESPONSE to a health outcome (the caller fills in the
+/// latency). Pure, so the whole status→health decision is unit-testable without a live
+/// client. Only the `Ok(resp)` arm routes through here; the transport `Err` arm (timeout /
+/// connect / transport) is classified separately and is unchanged.
+///
+/// Rationale: a green health light must mean the model will actually SERVE a turn, not just
+/// that the endpoint answered. A bad or expired token — the common arming failure — returns
+/// 401/403, so those MUST read unhealthy or the switcher would offer a misconfigured model
+/// and only a real turn would reveal the auth failure. A 404 on the very `/v1/messages` path
+/// a real turn uses means the configured base URL / path / model do not answer there, so the
+/// model is not usable as configured. Any OTHER 4xx (400, 422, 429, …) stays HEALTHY: the
+/// endpoint is reachable and the key is accepted, so a gateway's body/header quirk or a
+/// transient 429 throttle must not blank the model out.
+///
+///   * `< 400`            → healthy
+///   * `401` / `403`      → unhealthy, `unauthorized`
+///   * `404`              → unhealthy, `unknown-model`
+///   * any other `4xx`    → healthy (reachable + authed, tolerated)
+///   * `>= 500`           → unhealthy, `http-5xx`
+pub fn classify_probe_status(status: u16) -> ProbeOutcome {
+    let (ok, error_class): (bool, Option<&str>) = match status {
+        s if s < 400 => (true, None),
+        401 | 403 => (false, Some("unauthorized")),
+        404 => (false, Some("unknown-model")),
+        s if s >= 500 => (false, Some("http-5xx")),
+        // Any other 4xx (400, 422, 429, …): reachable and authed — tolerate as today.
+        _ => (true, None),
+    };
+    ProbeOutcome {
+        ok,
+        latency_ms: 0, // filled in by the caller
+        error_class: error_class.map(str::to_string),
+    }
+}
+
 /// Production probe: a tiny `POST <base_url><health.path>` with a 1-token cap on the model's
-/// Anthropic surface, bounded by `health.timeout_secs`. Reachable-and-not-erroring (any HTTP
-/// status < 500) is HEALTHY — a reachability check tolerates a 4xx from header/body quirks
-/// on a gateway; a timeout, a transport/DNS/connect error, or a 5xx is UNHEALTHY. NEVER logs
-/// the token, the URL, or the response body — only a coarse error class reaches the store.
+/// Anthropic surface, bounded by `health.timeout_secs`. The response status is mapped by
+/// [`classify_probe_status`]: `< 400` and the tolerated 4xx (400/422/429/…) are HEALTHY, but
+/// 401/403 (`unauthorized`), 404 (`unknown-model`), and `>= 500` (`http-5xx`) are UNHEALTHY;
+/// a timeout, a transport/DNS/connect error is UNHEALTHY too. NEVER logs the token, the URL,
+/// or the response body — only a coarse error class reaches the store.
 pub struct ReqwestProbe {
     client: reqwest::Client,
 }
@@ -342,20 +426,9 @@ impl HealthProbe for ReqwestProbe {
             let latency_ms = started.elapsed().as_millis() as u64;
             match res {
                 Ok(resp) => {
-                    let status = resp.status().as_u16();
-                    if status < 500 {
-                        ProbeOutcome {
-                            ok: true,
-                            latency_ms,
-                            error_class: None,
-                        }
-                    } else {
-                        ProbeOutcome {
-                            ok: false,
-                            latency_ms,
-                            error_class: Some("http-5xx".to_string()),
-                        }
-                    }
+                    let mut outcome = classify_probe_status(resp.status().as_u16());
+                    outcome.latency_ms = latency_ms;
+                    outcome
                 }
                 Err(e) => {
                     let class = if e.is_timeout() {
@@ -437,6 +510,57 @@ mod tests {
             join_url("https://api.example/inference/", "v1/messages"),
             "https://api.example/inference/v1/messages"
         );
+    }
+
+    #[test]
+    fn classify_probe_status_is_auth_aware() {
+        // Healthy: any success, and the tolerated 4xx (reachable + authed, or throttled).
+        for s in [200u16, 201, 204, 302, 400, 422, 429] {
+            let o = classify_probe_status(s);
+            assert!(o.ok, "status {s} should be healthy");
+            assert_eq!(o.error_class, None, "status {s} carries no error class");
+        }
+        // A bad/expired token: 401 and 403 read unhealthy so the switcher hides the model.
+        for s in [401u16, 403] {
+            let o = classify_probe_status(s);
+            assert!(!o.ok, "status {s} should be unhealthy");
+            assert_eq!(o.error_class.as_deref(), Some("unauthorized"));
+        }
+        // 404 on the real turn path: the model is not usable as configured.
+        let o = classify_probe_status(404);
+        assert!(!o.ok);
+        assert_eq!(o.error_class.as_deref(), Some("unknown-model"));
+        // 5xx: unchanged.
+        for s in [500u16, 502, 503] {
+            let o = classify_probe_status(s);
+            assert!(!o.ok, "status {s} should be unhealthy");
+            assert_eq!(o.error_class.as_deref(), Some("http-5xx"));
+        }
+    }
+
+    #[test]
+    fn resolve_health_interval_priority_explicit_then_global_then_default() {
+        // No explicit interval → the global override is used when set.
+        assert_eq!(resolve_health_interval(None, Some(300)), 300);
+        // An explicit per-model interval still wins over the global override.
+        assert_eq!(resolve_health_interval(Some(30), Some(300)), 30);
+        // Neither set → the built-in default.
+        assert_eq!(resolve_health_interval(None, None), DEFAULT_HEALTH_INTERVAL_SECS);
+        // An explicit 0 is not a real interval → fall through to global, then default.
+        assert_eq!(resolve_health_interval(Some(0), Some(300)), 300);
+        assert_eq!(resolve_health_interval(Some(0), None), DEFAULT_HEALTH_INTERVAL_SECS);
+    }
+
+    #[test]
+    fn parse_health_interval_override_clamps_and_ignores_junk() {
+        assert_eq!(parse_health_interval_override(None), Ok(None), "unset → silent None");
+        assert_eq!(parse_health_interval_override(Some("  ")), Ok(None), "blank → silent None");
+        assert_eq!(parse_health_interval_override(Some("300")), Ok(Some(300)));
+        // Floored at MIN_HEALTH_INTERVAL_SECS so a too-eager value can't hammer a backend.
+        assert_eq!(parse_health_interval_override(Some("2")), Ok(Some(MIN_HEALTH_INTERVAL_SECS)));
+        // Zero and unparseable surface as Err(raw) → the caller warns and falls back.
+        assert_eq!(parse_health_interval_override(Some("0")), Err("0".to_string()));
+        assert_eq!(parse_health_interval_override(Some("banana")), Err("banana".to_string()));
     }
 
     #[tokio::test]
