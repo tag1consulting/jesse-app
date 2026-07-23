@@ -87,8 +87,11 @@ struct MacThreadDetailView: View {
 
                 // The PER-CONVERSATION model this thread sends its next turn on. Local to this
                 // Mac and this thread — never the bridge's global default, so the phone is
-                // unaffected. Hidden on an older bridge (no models route).
-                MacModelPickerMenu(thread: thread, config: coordinator.configStore.config)
+                // unaffected. Always present: it shows the model the next turn will use even
+                // before (or without) the model list loading.
+                MacModelPickerMenu(thread: thread,
+                                   store: coordinator.modelList,
+                                   config: coordinator.configStore.config)
                     .disabled(running)
 
                 TextField("Message Jesse…", text: $draft, axis: .vertical)
@@ -124,20 +127,24 @@ struct MacThreadDetailView: View {
 
 /// The PER-CONVERSATION model picker for the Mac composer. The selection is LOCAL — stored on
 /// the thread (`selectedModelID`) and per device — so it never mutates the bridge's global
-/// default and never affects another conversation or the phone. It fetches the selectable
-/// models on appear, shows the model the next turn will run on (the thread's own choice, else
-/// this Mac's default, else the ambient `opus`), and on a pick writes the thread's selection
-/// and updates this Mac's last-used default. Renders nothing until models load (an older bridge
-/// has no `/jesse/models` route).
+/// default and never affects another conversation or the phone. On a pick it writes the thread's
+/// selection and updates this Mac's last-used default.
+///
+/// The control is ALWAYS present. The button shows the model the next turn will run on (the
+/// thread's own choice, else this Mac's default, else the ambient `opus`) drawn from the shared
+/// `MacModelListStore` — even before the list loads, and even if it never does (an older bridge
+/// with no `/jesse/models` route, or a persistent failure): the button then simply shows the
+/// resolved model and is not expandable, rather than the whole control vanishing. The list is
+/// loaded once into the shared store and retried on failure.
 private struct MacModelPickerMenu: View {
     @Environment(\.modelContext) private var context
     @Bindable var thread: JesseThread
+    let store: MacModelListStore
     let config: JesseConfig
-    @State private var modelState: ModelSwitchState?
 
     var body: some View {
         Group {
-            if let modelState {
+            if let modelState = store.state {
                 Menu {
                     ForEach(modelState.offered) { model in
                         Button {
@@ -152,25 +159,47 @@ private struct MacModelPickerMenu: View {
                         .disabled(!model.available)
                     }
                 } label: {
-                    Label(currentLabel, systemImage: "cpu")
+                    buttonLabel
                 }
                 .menuStyle(.borderlessButton)
                 .fixedSize()
+            } else {
+                // The list has not loaded yet (slow / older bridge / transient failure). Show the
+                // resolved model, non-expandable, so the control is present and truthful about
+                // the next turn's model — never invisible.
+                buttonLabel
+                    .foregroundStyle(.secondary)
+                    .fixedSize()
+                    .help("The model this conversation will use. The full list is still loading.")
             }
         }
-        .task { await load() }
+        .task { await loadWithRetry() }
     }
 
-    private var resolved: ModelInfo? {
-        modelState?.resolvedModel(threadModelID: thread.selectedModelID,
-                                  deviceDefaultID: LastUsedModelStore.id)
-    }
-    private var selectedID: String? { resolved?.id }
-    private var currentLabel: String { resolved?.label ?? "Model" }
+    private var buttonLabel: some View { Label(currentLabel, systemImage: "cpu") }
 
-    private func load() async {
-        guard config.isConfigured else { return }
-        modelState = try? await JesseBridgeClient(config: config).fetchModels()
+    /// The resolved model's id (for the checkmark), meaningful only once the list has loaded.
+    private var selectedID: String? {
+        store.state?.resolvedModel(threadModelID: thread.selectedModelID,
+                                   deviceDefaultID: LastUsedModelStore.id)?.id
+    }
+    /// The button label, resolvable even before the list loads (falls back to the resolved id).
+    private var currentLabel: String {
+        ModelSelectionResolver.resolvedLabel(state: store.state,
+                                             threadModelID: thread.selectedModelID,
+                                             deviceDefaultID: LastUsedModelStore.id)
+    }
+
+    /// Populate the shared list, retrying on failure so a slow or briefly-unreachable bridge
+    /// fills in without user action. The button already shows the resolved model meanwhile; a
+    /// persistent failure just leaves it non-expandable. Stops when the list loads or the view
+    /// goes away.
+    private func loadWithRetry() async {
+        while !Task.isCancelled && store.state == nil {
+            await store.loadIfNeeded(config: config)
+            if store.state != nil { break }
+            try? await Task.sleep(for: .seconds(3))
+        }
     }
 
     /// Pick a model for THIS conversation: store it on the thread and make it this Mac's
