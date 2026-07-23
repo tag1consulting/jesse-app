@@ -15,6 +15,25 @@ CI both run it). See the "Versioning" section of `bridge/README.md`.
 
 ## [Unreleased]
 
+## [App 1.0 (70)] - 2026-07-23
+
+### Fixed
+- **The Health tab no longer shows yesterday's food after the day rolls over.**
+  Two independent causes, both fixed at the source:
+  - *No refresh on foreground.* The tab loaded via `.task` (once, on first appear)
+    plus two iOS triggers: a turn settling and the tab becoming active. Parked on
+    the Health tab overnight, none of those fire when the app is reopened, so the
+    screen kept rendering the snapshot fetched the previous day. `HealthTabView`
+    now also refreshes on `scenePhase → .active`, gated on the tab being the
+    selected one so a background app never refetches.
+  - *The live day was served from the paging cache.* `HealthDashboardModel.fetch`
+    fell back to `date ?? todayDate` as the cache key, and `todayDate` still names
+    the previous day until a fresh non-historical snapshot arrives — so
+    `goToToday()` after midnight returned yesterday's cached snapshot and pinned it
+    as today. The cache is now only consulted for an explicitly dated (historical)
+    request; the live day is always refetched. Regression test:
+    `testDayRolloverDoesNotServeYesterdayAsToday`.
+
 ## [App 1.0 (69)] - 2026-07-22
 
 ### Fixed
@@ -89,7 +108,6 @@ CI both run it). See the "Versioning" section of `bridge/README.md`.
     survives to the next drain.
   - No SwiftData schema change: the hydration cursor and the pending-delete queue are
     `UserDefaults`, not new model columns.
-
 ## [App 1.0 (67)] - 2026-07-22
 
 ### Added

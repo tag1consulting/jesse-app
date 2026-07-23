@@ -102,8 +102,9 @@ final class HealthDashboardModelTests: XCTestCase {
     /// dates it was asked for (nil → the live today snapshot).
     @MainActor
     private final class PagingFakeClient: DietSnapshotProviding {
-        let today: String
-        let available: [String]
+        /// `var` so a test can roll the bridge's idea of "today" mid-session (midnight).
+        var today: String
+        var available: [String]
         private(set) var requested: [String?] = []
         /// When set, a dated request returns this date instead of the requested one
         /// (simulates an old bridge that ignores `?date=`).
@@ -182,10 +183,31 @@ final class HealthDashboardModelTests: XCTestCase {
         let m = pagingModel(fake)
         await m.load()          // fetch today
         await m.goBack()        // fetch 2026-07-08
-        await m.goForward()     // today — cache hit, no refetch
+        await m.goForward()     // today — ALWAYS refetched (the live day is never cached)
         await m.goBack()        // 2026-07-08 — cache hit, no refetch
-        // Requests: nil (today), "2026-07-08" (back). The two cache hits add nothing.
-        XCTAssertEqual(fake.requested, [nil, "2026-07-08"], "paging back to a cached day does not refetch")
+        // Only the past day is served from cache; today is re-fetched every time.
+        XCTAssertEqual(fake.requested, [nil, "2026-07-08", nil],
+                       "paging back to a cached past day does not refetch, but today always does")
+    }
+
+    /// Regression: the app parked on the Health tab across midnight used to serve the
+    /// live day out of the cache keyed on the now-stale `todayDate`, so the screen kept
+    /// showing yesterday's meals. The live day must always be refetched.
+    @MainActor
+    func testDayRolloverDoesNotServeYesterdayAsToday() async {
+        let fake = PagingFakeClient(today: "2026-07-21", available: ["2026-07-20", "2026-07-21"])
+        let m = pagingModel(fake)
+        await m.load()          // today = 2026-07-21, cached under that date
+        await m.goBack()        // → 2026-07-20
+
+        // Midnight passes: the bridge's live day is now the 22nd.
+        fake.today = "2026-07-22"
+        fake.available = ["2026-07-20", "2026-07-21", "2026-07-22"]
+
+        await m.goToToday()
+        XCTAssertEqual(m.currentDate, "2026-07-22", "after rollover, today is the new day, not the cached one")
+        XCTAssertTrue(m.isViewingToday)
+        XCTAssertEqual(m.snapshot?.today.date, "2026-07-22")
     }
 
     @MainActor

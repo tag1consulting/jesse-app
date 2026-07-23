@@ -16,6 +16,7 @@ struct HealthTabView: View {
     let isActive: Bool
 
     @Environment(RunCoordinator.self) private var coordinator
+    @Environment(\.scenePhase) private var scenePhase
     @Environment(\.modelContext) private var context
     // The display model fetches through the narrow `DietSnapshotProviding` seam; iOS
     // injects its own `JesseClient` (which layers per-turn health context on top),
@@ -53,6 +54,13 @@ struct HealthTabView: View {
         }
         .onChange(of: isActive) { _, active in
             if active { Task { await model.load() } }
+        }
+        // Foregrounding is the third trigger, and the one that covers the overnight
+        // case: parked on this tab, the app suspended, `.task` already fired and
+        // `isActive` never changed — so without this the screen keeps rendering the
+        // snapshot it loaded yesterday, meals and all, until a manual pull-to-refresh.
+        .onChange(of: scenePhase) { _, phase in
+            if phase == .active && isActive { Task { await model.load() } }
         }
     }
 }
