@@ -171,6 +171,39 @@ final class ModelSwitchWireTests: XCTestCase {
         XCTAssertEqual(state.models.first { $0.id == "down" }?.menuRowLabel, "Down — unreachable")
     }
 
+    func testResolvedLabelPrefersThreadThenDeviceThenOpusAndSurvivesNoFetch() throws {
+        let json = """
+        {
+          "active": "opus",
+          "models": [
+            { "id": "opus", "label": "Claude Opus", "kind": "ambient", "available": true, "writes_allowed": true },
+            { "id": "glm-5.2", "label": "GLM 5.2", "kind": "hosted", "available": true, "writes_allowed": false },
+            { "id": "down", "label": "Down", "kind": "hosted", "configured": true, "healthy": false,
+              "available": false, "writes_allowed": false }
+          ]
+        }
+        """
+        let state = try JSONDecoder().decode(ModelSwitchState.self, from: Data(json.utf8))
+
+        // With the list loaded, the button shows the resolved model's LABEL, in the same
+        // thread → device → opus order `resolvedModel` uses (an unavailable stored id is skipped).
+        XCTAssertEqual(ModelSelectionResolver.resolvedLabel(state: state, threadModelID: "glm-5.2", deviceDefaultID: "opus"), "GLM 5.2")
+        XCTAssertEqual(ModelSelectionResolver.resolvedLabel(state: state, threadModelID: nil, deviceDefaultID: "glm-5.2"), "GLM 5.2")
+        XCTAssertEqual(ModelSelectionResolver.resolvedLabel(state: state, threadModelID: "down", deviceDefaultID: nil), "Claude Opus")
+        XCTAssertEqual(ModelSelectionResolver.resolvedLabel(state: state, threadModelID: nil, deviceDefaultID: nil), "Claude Opus")
+
+        // With NO list loaded (slow / failed fetch / older bridge), the control is STILL labeled —
+        // it shows the resolved id — so the picker's visibility never depends on a successful fetch.
+        XCTAssertEqual(ModelSelectionResolver.resolvedLabel(state: nil, threadModelID: "glm-5.2", deviceDefaultID: "opus"), "glm-5.2")
+        XCTAssertEqual(ModelSelectionResolver.resolvedLabel(state: nil, threadModelID: nil, deviceDefaultID: "kimi-k3"), "kimi-k3")
+        XCTAssertEqual(ModelSelectionResolver.resolvedLabel(state: nil, threadModelID: nil, deviceDefaultID: nil), "opus")
+
+        // The resolved ID follows the same order and defaults to the ambient id.
+        XCTAssertEqual(ModelSelectionResolver.resolvedID(threadModelID: "  ", deviceDefaultID: "glm-5.2"), "glm-5.2",
+                       "a blank thread id is treated as unset")
+        XCTAssertEqual(ModelSelectionResolver.resolvedID(threadModelID: nil, deviceDefaultID: nil), ModelSelectionResolver.ambientDefaultID)
+    }
+
     func testLocalProvenanceWithoutCostDecodesAndHasNoCostLabel() throws {
         // A local route omits cost_usd; an older bridge omits it too. Both decode cleanly.
         let json = """

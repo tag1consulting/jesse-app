@@ -49,6 +49,47 @@ public extension ModelSwitchState {
     }
 }
 
+/// Resolves what a model SWITCHER BUTTON should show for the next turn — usable even before the
+/// model list has loaded (or when it never loads: an older bridge / a persistent fetch failure).
+/// View-free so the iOS and macOS composer pickers share one label rule and neither hides the
+/// control on a nil/failed fetch. Selection is still gated on a model's `available` by the caller;
+/// this decides only the label and the resolved id.
+public enum ModelSelectionResolver {
+    /// The ambient default's id (`opus`), the last-ditch fallback when nothing is stored and no
+    /// list has loaded. Matches the bridge's always-available ambient model (`kind == "ambient"`).
+    public static let ambientDefaultID = "opus"
+
+    /// The id the next turn will run on — independent of whether the list has loaded: the thread's
+    /// own stored selection, else this device's default (last used), else the ambient default.
+    public static func resolvedID(threadModelID: String?, deviceDefaultID: String?) -> String {
+        if let id = threadModelID?.trimmedNonEmpty { return id }
+        if let id = deviceDefaultID?.trimmedNonEmpty { return id }
+        return ambientDefaultID
+    }
+
+    /// The human label the button shows: when the list has loaded, the resolved model's label
+    /// (which also skips a stored-but-now-unavailable id, matching `resolvedModel`); before the
+    /// list loads — or if it never does — the resolved id itself, so the control is never blank
+    /// and never hidden. `state == nil` is the slow / failed / older-bridge case.
+    public static func resolvedLabel(state: ModelSwitchState?,
+                                     threadModelID: String?, deviceDefaultID: String?) -> String {
+        if let state,
+           let model = state.resolvedModel(threadModelID: threadModelID,
+                                           deviceDefaultID: deviceDefaultID) {
+            return model.label
+        }
+        return resolvedID(threadModelID: threadModelID, deviceDefaultID: deviceDefaultID)
+    }
+}
+
+private extension String {
+    /// The trimmed value, or `nil` when blank — so a stored empty/whitespace id reads as "unset".
+    var trimmedNonEmpty: String? {
+        let t = trimmingCharacters(in: .whitespacesAndNewlines)
+        return t.isEmpty ? nil : t
+    }
+}
+
 /// The per-DEVICE model default: the model a NEW conversation starts on, updated to the last
 /// model the user picked on this device (and settable directly from Settings as "Default model
 /// for new conversations on this device"). Backed by `UserDefaults` so it is naturally

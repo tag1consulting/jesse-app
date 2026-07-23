@@ -155,6 +155,96 @@ final class MacHydrationTests: XCTestCase {
         XCTAssertEqual(MacCursorStore.offset(sid), 50, "even an empty delta advances the cursor")
     }
 
+    /// The reported double: a finalized exchange must show EXACTLY ONE assistant bubble — the
+    /// optimistic one carrying the provenance chip — even when a subsequent hydrate runs with a
+    /// cursor at/behind that exchange. Here the fake reproduces the bridge's transcript-flush lag:
+    /// `finalize`'s cursor-advance sees only the (flushed) user turn, so the cursor lands BEFORE
+    /// the assistant turn; the next on-open `hydrate` then returns that assistant turn. Without an
+    /// idempotent append it would be re-imported as a second, chip-less copy.
+    func testSendThenFinalizeThenHydrateYieldsOneAssistantTurnWithProvenance() async throws {
+        let context = try MacTestFixtures.context()
+        let sid = uniqueSid(); defer { clearCursor(sid) }
+        let thread = JesseThread(mode: .ask)
+        context.insert(thread); try? context.save()
+
+        let prov = JesseProvenance(route: "hosted", model: "glm-5.2", costUsd: 0.0021,
+                                   badge: "[glm-5.2 · $0.0021]",
+                                   flags: JesseProvenanceFlags(hostedVerify: false, verifyQueued: false,
+                                                               citationsUnverified: false))
+        let reply = JesseReply(text: "hi there\n\n" + prov.badge, sessionId: sid, provenance: prov)
+        let fake = MacFakeBridgeClient(
+            sendResult: .reply(reply, jobId: nil),
+            hydrate: { _, after in
+                switch after {
+                case 0:   return ([ht("user", "hello")], 100)          // flush lag: assistant not yet in the jsonl
+                case 100: return ([ht("assistant", "hi there")], 200)  // on-open hydrate now sees it
+                default:  return ([], after)
+                }
+            })
+        let coordinator = MacCoordinator(configStore: MacTestFixtures.configured(),
+                                         makeClient: { _ in fake },
+                                         sessionDeletionStore: MacTestFixtures.deletionStore())
+
+        await coordinator.send(text: "hello", mode: .ask, thread: thread, context: context)
+        await coordinator.hydrate(thread: thread, context: context)
+
+        let assistant = thread.orderedTurns.filter { !$0.isUser }
+        XCTAssertEqual(assistant.count, 1, "a completed exchange shows exactly one assistant bubble")
+        XCTAssertEqual(assistant.first?.text, "hi there", "with the badge stripped from the body")
+        XCTAssertEqual(JesseProvenance.from(json: assistant.first?.provenanceJSON)?.model, "glm-5.2",
+                       "and the surviving bubble keeps its provenance chip")
+        XCTAssertEqual(thread.orderedTurns.filter(\.isUser).count, 1, "the user turn is not duplicated either")
+    }
+
+    /// Idempotent hydration must still backfill a genuinely-new turn produced on ANOTHER device:
+    /// a hydrated turn that is NOT already present is appended (chip-less, as it carries no local
+    /// provenance), while one that duplicates a local turn is skipped.
+    func testHydrateStillBackfillsNewCrossDeviceTurns() async throws {
+        let context = try MacTestFixtures.context()
+        let sid = uniqueSid(); defer { clearCursor(sid) }
+        let thread = stub(sessionId: sid, in: context)
+        // A local optimistic reply already present (as `finalize` would leave it).
+        let local = Turn(role: .jesse, text: "local reply"); local.thread = thread
+        context.insert(local); try? context.save()
+
+        // The delta overlaps the local reply AND carries a new turn from the other device.
+        let fake = MacFakeBridgeClient(hydrate: { _, _ in
+            ([ht("assistant", "local reply"), ht("user", "from the phone")], 300)
+        })
+        let coordinator = MacCoordinator(configStore: MacTestFixtures.configured(),
+                                         makeClient: { _ in fake },
+                                         sessionDeletionStore: MacTestFixtures.deletionStore())
+
+        await coordinator.hydrate(thread: thread, context: context)
+
+        XCTAssertEqual(thread.orderedTurns.map(\.text), ["local reply", "from the phone"],
+                       "the overlapping turn is not duplicated; the genuinely-new turn is backfilled")
+        XCTAssertEqual(MacCursorStore.offset(sid), 300)
+    }
+
+    /// A user legitimately repeating the SAME message keeps both copies — the dedup consumes each
+    /// existing turn at most once, so it never collapses genuine repeats.
+    func testHydrateKeepsGenuineRepeatedMessages() async throws {
+        let context = try MacTestFixtures.context()
+        let sid = uniqueSid(); defer { clearCursor(sid) }
+        let thread = stub(sessionId: sid, in: context)
+        let first = Turn(role: .user, text: "ping"); first.thread = thread
+        context.insert(first); try? context.save()
+
+        // The transcript legitimately has "ping" twice; only one is already local.
+        let fake = MacFakeBridgeClient(hydrate: { _, _ in
+            ([ht("user", "ping"), ht("user", "ping")], 120)
+        })
+        let coordinator = MacCoordinator(configStore: MacTestFixtures.configured(),
+                                         makeClient: { _ in fake },
+                                         sessionDeletionStore: MacTestFixtures.deletionStore())
+
+        await coordinator.hydrate(thread: thread, context: context)
+
+        XCTAssertEqual(thread.orderedTurns.filter { $0.text == "ping" }.count, 2,
+                       "one existing 'ping' is consumed; the second is a genuine new copy and survives")
+    }
+
     func testCursorClearForgetsOffset() {
         let sid = uniqueSid()
         MacCursorStore.setOffset(sid, 123)

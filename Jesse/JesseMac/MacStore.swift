@@ -60,6 +60,53 @@ enum MacCursorStore {
     }
 }
 
+// MARK: - Shared model list
+
+/// One shared, last-known-good model list for the Mac's model pickers, so the composer's
+/// per-conversation picker never silently vanishes when `GET /jesse/models` is slow, briefly
+/// unreachable, or served by an older bridge, and so opening several conversations doesn't
+/// re-fetch the list each time. Fetched on first need and refreshable; a transient failure KEEPS
+/// the last-known list (only a list that has NEVER loaded stays `nil`, and the picker then falls
+/// back to the resolved model id — see `MacModelPickerMenu`). `@Observable` so the pickers
+/// re-render the instant the list arrives or a selection changes.
+@MainActor
+@Observable
+final class MacModelListStore {
+    /// The last successfully-fetched model list, or `nil` before the first success (an older
+    /// bridge with no models route stays `nil` forever, which the picker tolerates).
+    private(set) var state: ModelSwitchState?
+
+    /// Guards against overlapping fetches (several pickers driving the same store at once).
+    private var loading = false
+
+    /// The fetch seam (production: the real bridge client). Injected so tests drive it without a
+    /// live bridge.
+    private let fetch: @Sendable (JesseConfig) async throws -> ModelSwitchState
+
+    init(fetch: @escaping @Sendable (JesseConfig) async throws -> ModelSwitchState
+            = { try await JesseBridgeClient(config: $0).fetchModels() }) {
+        self.fetch = fetch
+    }
+
+    /// Load the list once if it has never loaded; a no-op once loaded. Used by a picker on
+    /// appear so the first open populates the shared list and later opens reuse it.
+    func loadIfNeeded(config: JesseConfig) async {
+        guard state == nil else { return }
+        await refresh(config: config)
+    }
+
+    /// Fetch the list, KEEPING the last-known list on any failure (an unconfigured bridge is a
+    /// no-op). Safe to call repeatedly; overlapping calls collapse to one in-flight fetch.
+    func refresh(config: JesseConfig) async {
+        guard config.isConfigured, !loading else { return }
+        loading = true
+        defer { loading = false }
+        if let fresh = try? await fetch(config) { state = fresh }
+        // On failure: leave `state` untouched — never blank a working list, never surface an error
+        // (the picker still shows the resolved model). The next `refresh` retries.
+    }
+}
+
 // MARK: - Coordinator
 
 /// App-scoped runner + sync. `@MainActor` (the UI binds to it and it mutates the
@@ -70,6 +117,11 @@ enum MacCursorStore {
 @Observable
 final class MacCoordinator {
     let configStore: MacConfigStore
+
+    /// Shared model list for the composer's per-conversation model picker (and available to any
+    /// other model UI), so a slow/unreachable `/jesse/models` never blanks the switcher and every
+    /// conversation renders the same list. Fetched lazily on first picker appearance.
+    let modelList = MacModelListStore()
 
     /// The thread whose turn is currently running, if any.
     private(set) var activeThreadID: UUID?
@@ -297,20 +349,48 @@ final class MacCoordinator {
     /// Pull any transcript turns appended since this thread's cursor and append them.
     /// Full transcript on first sight (cursor 0), then byte-deltas. A thread with no
     /// `session_id` yet (never got a reply) has nothing to hydrate.
+    ///
+    /// The append is IDEMPOTENT: a hydrated turn that duplicates one already present for this
+    /// thread is skipped rather than re-added. The cursor alone can't guarantee this — a hydrate
+    /// can legitimately run with an offset at or behind a freshly finalized exchange (a concurrent
+    /// on-open hydrate that captured the pre-`finalize` offset; a `finalize` cursor-advance that
+    /// failed or that raced the bridge's transcript flush and so didn't cover the assistant turn;
+    /// or simply the Mac cursor being absent — indistinguishable from 0 in `UserDefaults` — while
+    /// the optimistic turns are already persisted). Without the skip, this method re-imports the
+    /// optimistic user+assistant turns as a second, chip-less copy (the reported double bubble).
+    /// The skip preserves the optimistic turn (and its provenance chip) and still performs the
+    /// genuine cross-device backfill this method exists for.
     func hydrate(thread: JesseThread, context: ModelContext) async {
         guard configStore.isConfigured, let sid = thread.sessionId, !sid.isEmpty else { return }
         let after = MacCursorStore.offset(sid)
         do {
             let (turns, next) = try await client.hydrate(sessionId: sid, after: after)
             guard !turns.isEmpty else { MacCursorStore.setOffset(sid, next); return }
+
+            // Turns already present for this thread, as a consumable multiset keyed by
+            // role + normalized text. Each existing turn is matched at most once, so a hydrated
+            // turn that overlaps a local one is skipped while a user legitimately repeating the
+            // same message keeps both copies.
+            var present: [DedupKey: Int] = [:]
+            for t in thread.orderedTurns { present[DedupKey(t), default: 0] += 1 }
+
+            var appended = false
             for t in turns {
                 let role: TurnRole = (t.role == "assistant") ? .jesse : .user
+                let key = DedupKey(role: role, text: t.text)
+                if let count = present[key], count > 0 {
+                    present[key] = count - 1   // already have this turn — don't duplicate it
+                    continue
+                }
                 let turn = Turn(role: role, text: t.text, createdAt: Self.parseTimestamp(t.timestamp))
                 turn.thread = thread
                 context.insert(turn)
+                appended = true
             }
-            thread.updatedAt = Date()
-            try? context.save()
+            if appended {
+                thread.updatedAt = Date()
+                try? context.save()
+            }
             MacCursorStore.setOffset(sid, next)
         } catch JesseError.badResponse(404, _) {
             // The session is gone server-side (GC'd / deleted): the shared client surfaces
@@ -318,6 +398,20 @@ final class MacCoordinator {
         } catch {
             lastError = Self.friendly(error)
         }
+    }
+
+    /// Content identity used to skip a hydrated turn already present locally: a turn's role plus
+    /// its whitespace-normalized text. Deliberately content-based — the transcript jsonl carries
+    /// no stable per-turn id the local optimistic turns also hold — and consumed at most once per
+    /// existing turn (see `hydrate`), so genuine repeats are never collapsed.
+    private struct DedupKey: Hashable {
+        let role: TurnRole
+        let text: String
+        init(role: TurnRole, text: String) {
+            self.role = role
+            self.text = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+        init(_ turn: Turn) { self.init(role: turn.roleValue, text: turn.text) }
     }
 
     // MARK: Session-list sync
