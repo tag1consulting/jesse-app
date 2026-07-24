@@ -835,8 +835,15 @@ struct SendButton: View {
 /// conversation or another device. It fetches the selectable models on appear, shows the model
 /// the next turn will run on (the thread's own choice, else this device's default, else the
 /// ambient `opus`), and on a pick writes the thread's selection and updates this device's
-/// last-used default. Renders nothing until models load, so an older bridge (no
-/// `/jesse/models`) shows no control.
+/// last-used default.
+///
+/// The control is ALWAYS present (matching the Mac composer picker, PR #26): the button shows
+/// the model the next turn will run on — the thread's own choice, else this device's default,
+/// else the ambient `opus` — drawn from `ModelSelectionResolver`, even before the list loads and
+/// even if it never does (an older bridge with no `/jesse/models`, or a persistent fetch
+/// failure). In that case the button simply shows the resolved model and is not expandable,
+/// rather than the whole control vanishing. The list is fetched with a retry loop so a slow or
+/// briefly-unreachable bridge fills in without user action.
 private struct ModelPickerMenu: View {
     @Environment(\.modelContext) private var context
     @Bindable var thread: JesseThread
@@ -861,12 +868,20 @@ private struct ModelPickerMenu: View {
                         .disabled(!model.available)
                     }
                 } label: {
-                    Label(currentLabel, systemImage: "cpu")
+                    buttonLabel
                 }
+            } else {
+                // The list has not loaded yet (slow / older bridge / transient failure). Show the
+                // resolved model, non-expandable, so the control is present and truthful about the
+                // next turn's model — never invisible.
+                buttonLabel
+                    .foregroundStyle(.secondary)
             }
         }
-        .task { await load() }
+        .task { await loadWithRetry() }
     }
+
+    private var buttonLabel: some View { Label(currentLabel, systemImage: "cpu") }
 
     /// The model the next turn will run on: the thread's own selection, else this device's
     /// default, else opus. Nil only before the list loads.
@@ -875,12 +890,25 @@ private struct ModelPickerMenu: View {
                                   deviceDefaultID: LastUsedModelStore.id)
     }
     private var selectedID: String? { resolved?.id }
-    private var currentLabel: String { resolved?.label ?? "Model" }
+    /// The button label, resolvable even before the list loads (falls back to the resolved id).
+    private var currentLabel: String {
+        ModelSelectionResolver.resolvedLabel(state: modelState,
+                                             threadModelID: thread.selectedModelID,
+                                             deviceDefaultID: LastUsedModelStore.id)
+    }
 
-    private func load() async {
-        let cfg = ConfigStore.load()
-        guard cfg.isConfigured else { return }
-        modelState = try? await JesseClient(config: cfg).fetchModels()
+    /// Populate the list, retrying on failure so a slow or briefly-unreachable bridge fills in
+    /// without user action. The button already shows the resolved model meanwhile; a persistent
+    /// failure just leaves it non-expandable. Stops once the list loads or the view goes away.
+    private func loadWithRetry() async {
+        while !Task.isCancelled && modelState == nil {
+            let cfg = ConfigStore.load()
+            if cfg.isConfigured {
+                modelState = try? await JesseClient(config: cfg).fetchModels()
+                if modelState != nil { break }
+            }
+            try? await Task.sleep(for: .seconds(3))
+        }
     }
 
     /// Pick a model for THIS conversation: store it on the thread and make it this device's
