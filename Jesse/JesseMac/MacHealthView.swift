@@ -1,4 +1,6 @@
 import SwiftUI
+import SwiftData
+import JesseCore
 import JesseNetworking
 import JesseDietDisplay
 
@@ -20,9 +22,14 @@ struct MacHealthView: View {
     /// deliberately shows no retry), and the Chats sidebar toolbar is a different tab. This
     /// is the "nowhere to log in" fix: a Settings button that is always present on the tab.
     @Environment(\.openSettings) private var openSettings
+    // The Health tab needs a way to fire the morning refresh turn, like the Chats side.
+    // The model container is applied at the WindowGroup, so both reach this tab.
+    @Environment(MacCoordinator.self) private var coordinator
+    @Environment(\.modelContext) private var context
 
     private let configStore: MacConfigStore
     @State private var model: HealthDashboardModel
+    @State private var confirmNewDay = false
 
     init(configStore: MacConfigStore) {
         self.configStore = configStore
@@ -45,12 +52,36 @@ struct MacHealthView: View {
                         .help("Refresh the day on screen")
                     }
                     ToolbarItem {
+                        Button { confirmNewDay = true } label: {
+                            Label("Start new day", systemImage: "sun.horizon")
+                        }
+                        .help("Start a new health day")
+                    }
+                    ToolbarItem {
                         Button { openSettings() } label: {
                             Label("Settings", systemImage: "gearshape")
                         }
                         .help("Pair with your bridge, or change the connection")
                     }
                 }
+                // A tap could kick off the long morning routine, so confirm first.
+                .confirmationDialog("Start new day", isPresented: $confirmNewDay) {
+                    Button("Start new day") { startNewDay() }
+                    Button("Cancel", role: .cancel) {}
+                } message: {
+                    Text("Audit yesterday, log your weigh-in, and refresh the dashboard?")
+                }
         }
+    }
+
+    /// Fire the fixed morning refresh on a fresh Tell thread. The thread shows up in the
+    /// Chats sidebar and the coordinator's `onTurnFinished` posts the completion
+    /// notification when it lands; hit Refresh (or ⌘R) to repaint the dashboard. No tab
+    /// switch.
+    private func startNewDay() {
+        let thread = JesseThread(mode: .tell)
+        context.insert(thread)
+        try? context.save()
+        Task { await coordinator.send(text: HealthNewDay.prompt, mode: .tell, thread: thread, context: context) }
     }
 }

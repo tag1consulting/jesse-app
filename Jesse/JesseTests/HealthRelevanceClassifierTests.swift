@@ -1,4 +1,5 @@
 import XCTest
+import JesseCore
 @testable import Jesse
 
 /// A one-shot flag a `@Sendable` closure can set without capturing a mutable `var`
@@ -96,5 +97,19 @@ final class HealthRelevanceClassifierTests: XCTestCase {
         let union = UnionHealthClassifier(keyword: { _ in true }, model: { _ in nil })
         let relevant = await union.isRelevant("logged a swim")
         XCTAssertTrue(relevant)
+    }
+
+    // MARK: - "Start new day" fixed message
+
+    /// The Health tab's "Start new day" button sends `HealthNewDay.prompt` on a Tell
+    /// turn. On iOS the weigh-in only attaches when the message classifies as
+    /// health-related, so a future reword that drops the health words would silently
+    /// stop the weigh-in from attaching. Pin the classification here.
+    func testStartNewDayPromptClassifiesAsHealth() {
+        XCTAssertTrue(HealthKeywordClassifier.matches(HealthNewDay.prompt))
+    }
+
+    func testStartNewDayPromptIsNonEmpty() {
+        XCTAssertFalse(HealthNewDay.prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
     }
 }
