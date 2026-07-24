@@ -199,6 +199,10 @@ impl AppState {
             subagent_model: m.subagent_model.clone(),
             writes_allowed,
             price: m.price,
+            // Carry this model's vision pairing onto the turn so the preprocessor can run
+            // without re-reading the registry. Empty for ambient/unpaired (vision off).
+            vision: m.vision.clone(),
+            vision_complementary: m.vision_complementary,
         }
     }
 
@@ -230,6 +234,8 @@ mod tests {
                     default_writes: true,
                     price: PriceDeck::ZERO,
                     health: HealthConfig::default(),
+                    vision: Vec::new(),
+                    vision_complementary: false,
                 },
                 RegistryModel {
                     id: "glm-5.2".into(),
@@ -241,6 +247,8 @@ mod tests {
                     default_writes: false,
                     price: PriceDeck::ZERO,
                     health: HealthConfig::default(),
+                    vision: Vec::new(),
+                    vision_complementary: false,
                 },
             ],
         };

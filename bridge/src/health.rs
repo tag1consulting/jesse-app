@@ -619,6 +619,8 @@ mod tests {
             price: PriceDeck::ZERO,
             subagent_model: Some("m".into()),
             health: HealthConfig::default(),
+            vision: Vec::new(),
+            vision_complementary: false,
         };
         let registry = ModelRegistry {
             models: vec![glm.clone()],
@@ -652,6 +654,8 @@ mod tests {
             price: PriceDeck::ZERO,
             subagent_model: None,
             health: HealthConfig::default(),
+            vision: Vec::new(),
+            vision_complementary: false,
         };
         let registry = ModelRegistry {
             models: vec![kimi.clone()],

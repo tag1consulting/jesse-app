@@ -77,6 +77,7 @@ pub(crate) fn test_config() -> Config {
         // default, so a turn that doesn't opt into the switch is byte-for-byte today's
         // behavior. Tests that exercise a hosted/local model build their own registry.
         model_registry: ModelRegistry::opus_only(),
+        vision: VisionConfig::default(),
     }
 }
 pub(crate) fn test_state() -> AppState {

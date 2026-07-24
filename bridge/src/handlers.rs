@@ -471,8 +471,22 @@ pub async fn jesse(
     // Whether this turn carried attachments — the ledger records the raw text with a
     // `[attachment omitted]` marker rather than the bytes (context carry).
     let had_attachments = !decoded.is_empty();
-    let (prompt, scratch) = if decoded.is_empty() {
-        (prompt, None)
+    // VISION PATH GATE: a paired text model with at least one RESOLVABLE vision helper
+    // reads attachments through the helper layer instead of the CLI's Read tool. It must
+    // be resolvable, not merely paired, so a paired-but-broken model falls back to the
+    // old path rather than dropping the attachment. Every other model (ambient opus, an
+    // unpaired hosted/local model) is byte-for-byte today's behavior.
+    let vision_on = had_attachments
+        && !active.vision.is_empty()
+        && !vision::resolve_partners(&st.cfg, &active.vision).is_empty();
+    let (prompt, scratch, vision_inputs) = if decoded.is_empty() {
+        (prompt, None, Vec::new())
+    } else if vision_on {
+        // Carry the decoded bytes into the turn task (transcribed under the permit); no
+        // scratch file is written and no "read these files" suffix is appended — the text
+        // model can't read images, so the transcription block replaces that path entirely.
+        let inputs = VisionInput::from_decoded(&decoded, &req.attachments);
+        (prompt, None, inputs)
     } else {
         let scratch = ScratchDir::create(&st.cfg.scratch_base()).map_err(|e| {
             (
@@ -489,6 +503,7 @@ pub async fn jesse(
         (
             format!("{prompt}{}", attachment_prompt_suffix(&paths)),
             Some(scratch),
+            Vec::new(),
         )
     };
 
@@ -597,6 +612,44 @@ pub async fn jesse(
         // `pending` (for the hosted catch-up) and `recent` (for a local child) are read
         // once here; both are empty when carry is off (the ledger is inert) or the
         // thread is unknown, so every downstream splice/inject is a byte-for-byte no-op.
+        // VISION PREPROCESSING (paired text models only). Runs here — under the permit,
+        // before the catch-up splice — because it makes network calls to the helper(s):
+        // keeping it off the request hot path lets `POST /jesse` return 202 immediately and
+        // the turn's own timeout clock (in `run_claude_streaming`) start only after this.
+        // Each attachment is transcribed to text and a framed <attachment_view> block is
+        // appended to the prompt; the raw image never reaches the text model. Every call is
+        // audited to stderr (helper, pages, latency, tokens) for later cost/quality analysis.
+        // Inert (skipped, prompt unchanged) when `vision_inputs` is empty.
+        let prompt = if vision_inputs.is_empty() {
+            prompt
+        } else {
+            let outcome = vision::preprocess(&cfg, &active, &vision_inputs).await;
+            for a in &outcome.audit {
+                eprintln!(
+                    "jesse-bridge: vision job={jid} attachment={} source={:?} page={:?} \
+                     kind={} helper={} ok={} latency_ms={} in_tok={} out_tok={}{}",
+                    a.index,
+                    a.source,
+                    a.page,
+                    a.kind,
+                    a.helper,
+                    a.ok,
+                    a.latency_ms,
+                    a.input_tokens,
+                    a.output_tokens,
+                    a.error
+                        .as_ref()
+                        .map(|e| format!(" error={e:?}"))
+                        .unwrap_or_default(),
+                );
+            }
+            let block = vision::frame_views(&outcome.views);
+            if block.is_empty() {
+                prompt
+            } else {
+                format!("{prompt}{block}")
+            }
+        };
         let thread_key = sid.clone();
         let pending = thread_key
             .as_deref()
@@ -1342,8 +1395,29 @@ pub fn effective_writes(m: &RegistryModel, store: &ModelStore) -> bool {
 /// AND healthy), unhealthy (configured, last probe failed), and unconfigured (no token/
 /// triple). `last_checked_ms` / `latency_ms` are the last probe's stamp + round-trip (both
 /// optional — absent for opus and before the first probe).
-fn model_row(m: &RegistryModel, store: &ModelStore, health: &HealthStore) -> Value {
+fn model_row(
+    m: &RegistryModel,
+    store: &ModelStore,
+    health: &HealthStore,
+    registry: &ModelRegistry,
+) -> Value {
     let h = model_health(m, health);
+    // Vision capability: `enabled` is true ONLY when this model is paired AND at least one
+    // partner resolves to a configured registered model — a paired-but-broken model reports
+    // `enabled: false`, so an unpaired/misconfigured model surfaces as no-vision here rather
+    // than failing silently at turn time. Each partner carries a `resolved` flag so the gap
+    // is visible in the switcher.
+    let partners: Vec<Value> = m
+        .vision
+        .iter()
+        .map(|p| {
+            json!({
+                "id": p.id,
+                "role": p.role,
+                "resolved": registry.vision_partner(&p.id).is_some(),
+            })
+        })
+        .collect();
     json!({
         "id": m.id,
         "label": m.label,
@@ -1354,6 +1428,11 @@ fn model_row(m: &RegistryModel, store: &ModelStore, health: &HealthStore) -> Val
         "writes_allowed": effective_writes(m, store),
         "last_checked_ms": h.status.as_ref().map(|s| s.checked_at_ms),
         "latency_ms": h.status.as_ref().and_then(|s| s.latency_ms),
+        "vision": {
+            "enabled": registry.vision_enabled(m),
+            "complementary": m.vision_complementary,
+            "partners": partners,
+        },
     })
 }
 
@@ -1369,7 +1448,7 @@ pub async fn jesse_models(
         .model_registry
         .models
         .iter()
-        .map(|m| model_row(m, &st.models, &st.health))
+        .map(|m| model_row(m, &st.models, &st.health, &st.cfg.model_registry))
         .collect();
     Ok(Json(json!({
         "active": st.models.active(),
