@@ -15,6 +15,18 @@ CI both run it). See the "Versioning" section of `bridge/README.md`.
 
 ## [Unreleased]
 
+## [App 1.0 (76)] - 2026-07-24
+
+### Added
+- **The macOS app (JesseMac) now has an app icon matching iOS.** JesseMac shipped with a
+  blank/default icon because it had no asset catalog and no `ASSETCATALOG_COMPILER_APPICON_NAME`
+  build setting. It now carries the same Jesse mark the iOS app uses: a `JesseMac/Assets.xcassets`
+  with an `AppIcon` set built as the standard macOS icon ladder (16/32/128/256/512 pt at 1x/2x),
+  generated from the iOS `icon_1024x1024.png` source, wired via `ASSETCATALOG_COMPILER_APPICON_NAME`
+  on the Jesse Mac target only. The iOS icon is unchanged. Note: reusing the full-bleed iOS
+  artwork verbatim means the Mac icon renders as a square, not the native padded squircle; a
+  native macOS variant can be decided on later.
+
 ## [Bridge 0.30.0] - 2026-07-23
 
 ### Added
