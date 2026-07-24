@@ -15,6 +15,57 @@ CI both run it). See the "Versioning" section of `bridge/README.md`.
 
 ## [Unreleased]
 
+## [Bridge 0.31.0] - 2026-07-24
+
+### Added
+- **A vision-helper layer so a hosted text-only model can answer turns that carry image/PDF
+  attachments.** The everyday brain is now a text model (e.g. GLM on Fireworks) with no
+  vision, so uploaded images and PDFs were dead weight to it (verified: the Fireworks text
+  model rejects image inputs with `400 "This model does not support image inputs"`). A text
+  model now gains vision ONLY by being explicitly PAIRED, in config, with one or more
+  registered VISION HELPERS. When such a model is active and a turn carries attachments, a
+  new preprocessor (`vision.rs`) rasterizes each PDF page to a PNG (pdfium, bound at
+  runtime), routes each attachment to the right-role helper, calls the helper on the
+  Anthropic `/v1/messages` surface with a base64 `image` block + a faithful-transcription
+  instruction, and splices the result into the prompt as framed `<attachment_view>` blocks
+  the active model attributes as untrusted DATA. **The text model never receives the raw
+  image — only the transcription.** Everything is config-driven; no model id is compiled in.
+  - **Pairing is a property of the text model, not a global switch.** A text model with no
+    partner handles attachments exactly as before (scratch file + the CLI's Read tool),
+    byte-for-byte — that is the vision-off state, and `GET /jesse/models` reports it as
+    `vision.enabled: false`. Register a helper (`JESSE_MODEL_*_VISION`, or a `[[models]]`
+    entry with a `vision = [{ id, role }]` list) and vision turns on. `enabled` is true only
+    when a partner actually resolves to a configured registered model — a paired-but-broken
+    helper is warned about loudly at startup and reported as no-vision, never a silent
+    half-state.
+  - **Roles + routing** (`doc` document specialist / `general` images-charts-screenshots /
+    `any` single helper): a lone `any` helper takes everything; a `doc`+`general` pair routes
+    PDFs to `doc` and images to `general`, with deterministic fallback so a missing-role
+    attachment is never dropped. An optional per-model complementary mode runs BOTH helpers
+    over one attachment and concatenates (transcription + description), never arbitrates.
+  - **Comparison harness** (`vision-compare` bin): run one attachment through several helpers
+    via the exact live path and see their transcriptions, latency, and token cost side by
+    side — how a candidate helper is vetted before it earns a pairing slot, no chat turn
+    required. **Eval harness** (`vision-eval` bin) + a fixed committed eval set
+    (`eval/vision/`, regenerable via `vision-fixtures`): measures transcription faithfulness
+    (ground-truth substrings present) plus latency/cost per helper.
+  - Config knobs (env, no rebuild): `JESSE_VISION_PDF_PAGE_CAP` (default 10, truncation is
+    noted in the block, never silent), `JESSE_VISION_PDF_DPI` (200), `JESSE_VISION_MAX_TOKENS`
+    (4096), `JESSE_VISION_TIMEOUT_SECS` (60). Per-turn audit (helper, pages, latency, tokens)
+    is logged so cost/quality per helper is measurable after the fact.
+  - **Dependencies:** `pdfium-render` (PDF→bitmap; binds pdfium at RUNTIME via `dlopen`, so
+    `cargo build` and CI compile with no native lib present and the single-static-binary
+    property holds for every deploy that never turns vision on — a deploy that rasterizes
+    needs libpdfium, `JESSE_PDFIUM_LIB` points at it) and `image` (encode pages to PNG; pure
+    Rust). Rasterization tests are env-gated behind `JESSE_PDFIUM_LIB` so CI stays green
+    without the lib; verified end-to-end locally against a real pdfium.
+  - **Privacy:** enabling a helper sends the uploaded image/PDF bytes to that helper's
+    backend (Fireworks or the local Anthropic-surface gateway) — a real egress of user
+    uploads, consistent with already running a hosted text model there. A local-only helper
+    alias is the follow-up for uploads that must stay on-device. HEIC is not yet accepted by
+    the Anthropic image surface (it becomes an error view with a note); a transcode step is a
+    follow-up.
+
 ## [App 1.0 (76)] - 2026-07-24
 
 ### Added

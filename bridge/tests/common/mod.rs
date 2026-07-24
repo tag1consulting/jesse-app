@@ -73,6 +73,7 @@ pub fn test_config() -> Config {
         // Opus-only registry: the ambient default, so the integration router runs
         // byte-for-byte today's turn unless a test builds its own registry.
         model_registry: ModelRegistry::opus_only(),
+        vision: VisionConfig::default(),
     }
 }
 pub fn test_state() -> AppState {

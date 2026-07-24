@@ -2097,6 +2097,8 @@ mod tests {
             subagent_model: Some("glm-model".to_string()),
             writes_allowed: false,
             price: PriceDeck::ZERO,
+            vision: Vec::new(),
+            vision_complementary: false,
         }
     }
 

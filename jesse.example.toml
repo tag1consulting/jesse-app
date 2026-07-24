@@ -127,3 +127,68 @@ diet_keywords_extra = [
 # default_writes = false
 # price = { in_per_m = 1.25, cached_per_m = 0.13, out_per_m = 10.00 }
 # health = { interval_secs = 30, timeout_secs = 3 }
+
+# ---------------------------------------------------------------------------
+# Vision helpers — let a hosted TEXT model "see" image/PDF attachments
+# ---------------------------------------------------------------------------
+#
+# A text model (GLM, Codex, …) can't read images. It gains vision ONLY by being
+# PAIRED with one or more registered VISION HELPERS. A helper is just another
+# registered model (a [[models]] entry / JESSE_MODEL_* triple) whose base_url points
+# at the provider or the local Anthropic-surface gateway; the bridge calls it directly
+# on /v1/messages with the image as a base64 block and splices the transcription into
+# the prompt. The raw image never reaches the text model. Pairing is per-model, not a
+# global switch: an UNPAIRED model handles attachments exactly as before (the CLI Read
+# tool), and GET /jesse/models reports it as vision.enabled=false.
+#
+# PRIVACY: pairing a hosted helper sends the uploaded image/PDF bytes to that helper's
+# backend. That is a real egress of user uploads (consistent with running a hosted text
+# model there). Keep uploads local by pairing a local-only helper alias instead.
+#
+# 1) Register the helpers as ordinary models (armed by their token env var):
+#
+# [[models]]
+# id = "paddleocr-vl"
+# label = "PaddleOCR VL (doc)"
+# kind = "hosted"
+# base_url = "https://api.fireworks.ai/inference"   # or the local gateway
+# model = "accounts/fireworks/models/<resolved-slug>"  # resolve from GET /v1/models
+# auth_token_env = "FIREWORKS_API_KEY"
+# price = { in_per_m = 0.10, cached_per_m = 0.01, out_per_m = 0.30 }
+#
+# [[models]]
+# id = "qwen3-vl"
+# label = "Qwen3-VL (general)"
+# kind = "hosted"
+# base_url = "https://api.fireworks.ai/inference"
+# model = "accounts/fireworks/models/<resolved-slug>"
+# auth_token_env = "FIREWORKS_API_KEY"
+# price = { in_per_m = 0.20, cached_per_m = 0.02, out_per_m = 0.60 }
+#
+# 2) Pair a text model with them (role: "doc" | "general" | "any"). Declarative:
+#
+# [[models]]
+# id = "glm-5.2"
+# label = "GLM 5.2"
+# kind = "hosted"
+# base_url = "https://api.fireworks.ai/inference"
+# model = "accounts/fireworks/models/glm-5p2"
+# auth_token_env = "FIREWORKS_API_KEY"
+# vision = [ { id = "paddleocr-vl", role = "doc" }, { id = "qwen3-vl", role = "general" } ]
+# vision_complementary = false   # true = run BOTH helpers on one attachment, concatenate
+#
+#   Or pair the env-triple models without a [[models]] block:
+#     JESSE_MODEL_GLM_VISION="paddleocr-vl:doc,qwen3-vl:general"
+#     JESSE_MODEL_GLM_VISION_COMPLEMENTARY=off      # (glm-5.2 / kimi-k3 / local supported)
+#   A single "any" helper handles every attachment type:  JESSE_MODEL_GLM_VISION="qwen3-vl:any"
+#
+# 3) Global vision knobs (env, no rebuild):
+#     JESSE_VISION_PDF_PAGE_CAP=10     # pages rasterized+sent per PDF (truncation is noted)
+#     JESSE_VISION_PDF_DPI=200         # rasterization DPI
+#     JESSE_VISION_MAX_TOKENS=4096     # helper output-token cap
+#     JESSE_VISION_TIMEOUT_SECS=60     # per-helper-call budget
+#     JESSE_PDFIUM_LIB=/path/to/libpdfium.{so,dylib}  # required for the PDF path
+#
+# Vet a candidate helper before pairing it (no chat turn needed):
+#     vision-compare ./eval/vision/fixtures/statement.pdf paddleocr-vl,qwen3-vl
+#     vision-eval    ./eval/vision/manifest.json paddleocr-vl

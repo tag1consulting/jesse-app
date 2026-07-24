@@ -111,6 +111,7 @@ mod titlestore;
 mod util;
 mod vaultqa;
 mod vaultqagate;
+mod vision;
 
 // Flat internal namespace: every module's items reachable crate-wide by bare
 // name (so `use crate::*` in each module works exactly like the old single file).
@@ -154,6 +155,7 @@ pub use titlestore::*;
 pub use util::*;
 pub use vaultqa::*;
 pub use vaultqagate::*;
+pub use vision::*;
 
 #[cfg(test)]
 mod testutil;

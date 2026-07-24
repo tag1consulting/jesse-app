@@ -5133,6 +5133,8 @@ fn cfg_with_switch_registry(state_dir: &std::path::Path) -> Config {
                 default_writes: true,
                 price: PriceDeck { in_per_m: 5.0, cached_per_m: 0.5, out_per_m: 25.0 },
                 health: HealthConfig::default(),
+                vision: Vec::new(),
+                vision_complementary: false,
             },
             RegistryModel {
                 id: "glm-5.2".into(),
@@ -5144,6 +5146,8 @@ fn cfg_with_switch_registry(state_dir: &std::path::Path) -> Config {
                 default_writes: false,
                 price: PriceDeck { in_per_m: 1.4, cached_per_m: 0.14, out_per_m: 4.4 },
                 health: HealthConfig::default(),
+                vision: Vec::new(),
+                vision_complementary: false,
             },
             RegistryModel {
                 id: "kimi-k3".into(),
@@ -5155,6 +5159,8 @@ fn cfg_with_switch_registry(state_dir: &std::path::Path) -> Config {
                 default_writes: false,
                 price: PriceDeck::ZERO,
                 health: HealthConfig::default(),
+                vision: Vec::new(),
+                vision_complementary: false,
             },
         ],
     };
@@ -5525,4 +5531,254 @@ async fn per_turn_unknown_model_is_400() {
         .unwrap();
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "unknown model → 400");
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ---- Vision helper layer (mock /v1/messages backend) ----------------------
+//
+// These bind a REAL loopback socket (reqwest needs a URL) serving a canned Anthropic
+// response, so the full helper call path — base64 image block → POST → parse — is
+// exercised deterministically with no network and no live VL model.
+
+use axum::routing::post as axum_post;
+use axum::Json as AxumJson;
+use axum::Router as AxumRouter;
+
+/// A mock Anthropic `/v1/messages` helper: echoes the received image media type + whether
+/// image data was present into the transcription, PROVING the encoder sent a real image
+/// block, and returns a fixed usage vector.
+async fn mock_vision_helper(AxumJson(body): AxumJson<Value>) -> AxumJson<Value> {
+    let media = body
+        .pointer("/messages/0/content/0/source/media_type")
+        .and_then(|v| v.as_str())
+        .unwrap_or("NONE")
+        .to_string();
+    let has_data = body
+        .pointer("/messages/0/content/0/source/data")
+        .and_then(|v| v.as_str())
+        .map(|s| !s.is_empty())
+        .unwrap_or(false);
+    let has_instruction = body
+        .pointer("/messages/0/content/1/text")
+        .and_then(|v| v.as_str())
+        .map(|s| !s.is_empty())
+        .unwrap_or(false);
+    AxumJson(serde_json::json!({
+        "content": [{
+            "type": "text",
+            "text": format!("MOCK TRANSCRIPT media={media} data_present={has_data} instruction_present={has_instruction} GROUNDTRUTH-TOKEN"),
+        }],
+        "usage": { "input_tokens": 11, "output_tokens": 7 },
+    }))
+}
+
+async fn start_mock_helper() -> String {
+    let app = AxumRouter::new().route("/v1/messages", axum_post(mock_vision_helper));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    format!("http://{addr}")
+}
+
+fn chart_png_fixture() -> Vec<u8> {
+    let path = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../eval/vision/fixtures/chart.png"
+    );
+    std::fs::read(path).expect("committed chart.png fixture")
+}
+
+#[tokio::test]
+async fn vision_transcribes_an_image_over_a_mock_helper() {
+    let base = start_mock_helper().await;
+    let cfg = test_config();
+    let partner = ResolvedPartner {
+        id: "mock".into(),
+        role: VisionRole::General,
+        base_url: base,
+        token: "t".into(),
+        model: "m".into(),
+        price: PriceDeck::ZERO,
+    };
+    let input = VisionInput {
+        source: "chart.png".into(),
+        ext: "png".into(),
+        bytes: chart_png_fixture(),
+    };
+    let client = vision_client();
+    let results = transcribe_input(&client, &cfg, &partner, &input).await;
+    assert_eq!(results.len(), 1, "one image → one result");
+    let r = &results[0];
+    assert!(r.error.is_none(), "no error: {:?}", r.error);
+    assert!(
+        r.text.contains("media=image/png") && r.text.contains("data_present=true"),
+        "encoder sent a real base64 image/png block: {}",
+        r.text
+    );
+    assert!(r.text.contains("instruction_present=true"), "instruction sent");
+    assert_eq!(r.input_tokens, 11);
+    assert_eq!(r.output_tokens, 7);
+}
+
+#[tokio::test]
+async fn preprocess_pairs_and_frames_a_faithful_view() {
+    let base = start_mock_helper().await;
+    // A registry with the mock helper (configured) and a text model paired to it.
+    let helper = RegistryModel {
+        id: "mock".into(),
+        label: "Mock VL".into(),
+        kind: ModelKind::Hosted,
+        backend: Some((base, "t".into(), "m".into())),
+        subagent_model: Some("m".into()),
+        configured: true,
+        default_writes: false,
+        price: PriceDeck::ZERO,
+        health: HealthConfig::default(),
+        vision: Vec::new(),
+        vision_complementary: false,
+    };
+    let text = RegistryModel {
+        id: "glm".into(),
+        label: "GLM".into(),
+        kind: ModelKind::Hosted,
+        backend: Some(("http://text".into(), "tt".into(), "tm".into())),
+        subagent_model: Some("tm".into()),
+        configured: true,
+        default_writes: false,
+        price: PriceDeck::ZERO,
+        health: HealthConfig::default(),
+        vision: vec![VisionPartner {
+            id: "mock".into(),
+            role: VisionRole::General,
+        }],
+        vision_complementary: false,
+    };
+    let cfg = Config {
+        model_registry: ModelRegistry {
+            models: vec![helper, text],
+        },
+        ..test_config()
+    };
+    // The text model reports vision ENABLED (a resolvable partner).
+    let glm = cfg.model_registry.get("glm").unwrap();
+    assert!(cfg.model_registry.vision_enabled(glm), "paired + resolvable → enabled");
+
+    let active = ActiveModel {
+        id: "glm".into(),
+        kind: ModelKind::Hosted,
+        env: Some(("http://text".into(), "tt".into(), "tm".into())),
+        subagent_model: Some("tm".into()),
+        writes_allowed: false,
+        price: PriceDeck::ZERO,
+        vision: vec![VisionPartner {
+            id: "mock".into(),
+            role: VisionRole::General,
+        }],
+        vision_complementary: false,
+    };
+    let inputs = vec![VisionInput {
+        source: "chart.png".into(),
+        ext: "png".into(),
+        bytes: chart_png_fixture(),
+    }];
+    let outcome = jesse_bridge::preprocess(&cfg, &active, &inputs).await;
+    assert_eq!(outcome.views.len(), 1);
+    assert!(outcome.views[0].error.is_none());
+    assert!(outcome.views[0].text.contains("GROUNDTRUTH-TOKEN"));
+    assert_eq!(outcome.views[0].via, "mock");
+    assert_eq!(outcome.audit.len(), 1);
+    assert!(outcome.audit[0].ok);
+    assert_eq!(outcome.audit[0].output_tokens, 7);
+
+    let block = frame_views(&outcome.views);
+    assert!(block.contains(VISION_HEADER));
+    assert!(block.contains("<attachment_view index=\"1\""));
+    assert!(block.contains("GROUNDTRUTH-TOKEN"));
+    assert_eq!(
+        block.matches("<attachment_view ").count(),
+        block.matches("</attachment_view>").count(),
+        "well-formed frames"
+    );
+}
+
+#[tokio::test]
+async fn unpaired_model_reports_no_vision() {
+    // A configured text model with NO partners reports vision disabled — the capability
+    // rule: unpaired == no-vision, surfaced, never a silent half-state.
+    let text = RegistryModel {
+        id: "glm".into(),
+        label: "GLM".into(),
+        kind: ModelKind::Hosted,
+        backend: Some(("http://text".into(), "tt".into(), "tm".into())),
+        subagent_model: Some("tm".into()),
+        configured: true,
+        default_writes: false,
+        price: PriceDeck::ZERO,
+        health: HealthConfig::default(),
+        vision: Vec::new(),
+        vision_complementary: false,
+    };
+    let registry = ModelRegistry {
+        models: vec![text],
+    };
+    let glm = registry.get("glm").unwrap();
+    assert!(!registry.vision_enabled(glm), "no partners → no vision");
+
+    // And a model paired to a MISSING helper is also no-vision (paired but broken).
+    let broken = RegistryModel {
+        vision: vec![VisionPartner {
+            id: "ghost".into(),
+            role: VisionRole::Any,
+        }],
+        ..registry.get("glm").unwrap().clone()
+    };
+    let registry2 = ModelRegistry {
+        models: vec![broken],
+    };
+    assert!(
+        !registry2.vision_enabled(registry2.get("glm").unwrap()),
+        "paired to an unregistered helper → still no vision"
+    );
+}
+
+#[tokio::test]
+async fn vision_rasterizes_and_transcribes_a_pdf_when_pdfium_present() {
+    // GATED on JESSE_PDFIUM_LIB (CI has no pdfium → skips). Proves the full PDF path:
+    // rasterize → PNG page → image block → mock helper → per-page view.
+    if std::env::var("JESSE_PDFIUM_LIB")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .is_none()
+    {
+        eprintln!("skipping PDF vision test: JESSE_PDFIUM_LIB unset");
+        return;
+    }
+    let base = start_mock_helper().await;
+    let cfg = test_config();
+    let partner = ResolvedPartner {
+        id: "mock".into(),
+        role: VisionRole::Doc,
+        base_url: base,
+        token: "t".into(),
+        model: "m".into(),
+        price: PriceDeck::ZERO,
+    };
+    let pdf = std::fs::read(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../eval/vision/fixtures/statement.pdf"
+    ))
+    .unwrap();
+    let input = VisionInput {
+        source: "statement.pdf".into(),
+        ext: "pdf".into(),
+        bytes: pdf,
+    };
+    let client = vision_client();
+    let results = transcribe_input(&client, &cfg, &partner, &input).await;
+    assert_eq!(results.len(), 1, "one-page PDF → one page result");
+    assert_eq!(results[0].page_no, Some(1));
+    assert_eq!(results[0].total_pages, Some(1));
+    assert!(results[0].error.is_none(), "{:?}", results[0].error);
+    assert!(results[0].text.contains("media=image/png"), "page sent as PNG");
 }

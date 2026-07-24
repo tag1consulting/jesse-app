@@ -1,0 +1,35 @@
+{
+  "_comment": "Fixed vision eval set for `vision-eval`. Files are relative to this manifest's directory. Regenerate with `cargo run --bin vision-fixtures -- eval/vision/fixtures`. The text/table PDFs carry real text (meaningful faithfulness ground truth); the chart/screenshot/photo PNGs are synthetic placeholders (shapes/colors) — swap in representative real uploads before the definitive fidelity call. All content is fictional.",
+  "fixtures": [
+    {
+      "file": "fixtures/statement.pdf",
+      "kind": "text-pdf",
+      "ground_truth": ["ACME WIDGETS", "INV-2026-0042", "Globex", "Total Due: EUR 600.00", "net 30"],
+      "question": "What is the total due on this invoice, and who is it billed to?"
+    },
+    {
+      "file": "fixtures/table.pdf",
+      "kind": "table-pdf",
+      "ground_truth": ["QUARTERLY REVENUE", "North", "South", "Q2 2026", "455", "102", "557", "Full Year", "2203"],
+      "question": "What was the South region's Q2 2026 revenue, and the full-year total?"
+    },
+    {
+      "file": "fixtures/chart.png",
+      "kind": "chart-image",
+      "ground_truth": ["bar"],
+      "question": "How many bars are in this chart and which is tallest?"
+    },
+    {
+      "file": "fixtures/screenshot.png",
+      "kind": "ui-screenshot",
+      "ground_truth": ["button"],
+      "question": "How many buttons does this screen show?"
+    },
+    {
+      "file": "fixtures/photo.png",
+      "kind": "photo",
+      "ground_truth": ["gradient"],
+      "question": "Describe the colors in this image."
+    }
+  ]
+}

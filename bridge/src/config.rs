@@ -328,6 +328,11 @@ pub struct Config {
     // offload backends above, which the switch never touches. Holds no persisted secret
     // — the ACTIVE selection lives in the `ModelStore` (ids + booleans only).
     pub model_registry: ModelRegistry,
+    // Global knobs for the vision-helper layer (PDF page cap / DPI, helper output-token
+    // cap, per-call timeout). Env-tunable, bounded (see [`resolve_vision_config`]).
+    // Entirely inert unless a text model is paired with a helper and a turn carries an
+    // attachment; every non-vision path ignores it.
+    pub vision: VisionConfig,
 }
 
 impl Config {
@@ -661,6 +666,143 @@ impl PriceDeck {
         cached_per_m: 0.0,
         out_per_m: 0.0,
     };
+
+    /// Dollar cost of a simple `(input, output)` token vector on this deck — the vision
+    /// helper path has no cache reads, so this is the input+output shorthand the compare
+    /// harness and per-turn audit use. (The cache-aware form lives on `ShadowUsage`.)
+    pub fn cost(&self, input_tokens: u64, output_tokens: u64) -> f64 {
+        (input_tokens as f64 * self.in_per_m + output_tokens as f64 * self.out_per_m) / 1_000_000.0
+    }
+}
+
+// ---- Vision pairing (the vision-helper layer) -----------------------------
+//
+// A TEXT model gains the ability to "see" image/PDF attachments ONLY by being
+// PAIRED with one or more registered VISION HELPERS. The pairing is a property of
+// the text model (its `vision` list) — never a global switch: a model with an empty
+// list handles attachments exactly as before (the scratch-file + Read-tool path,
+// byte-for-byte), and that unpaired state is what `GET /jesse/models` reports as
+// no-vision. Helpers are themselves ordinary registry entries (a hosted/local
+// backend triple); the bridge calls a helper directly on the Anthropic
+// `/v1/messages` surface (see `vision.rs`), so "register a helper" == add a model
+// entry whose `base_url` points at the provider or the local Anthropic-surface gateway.
+
+/// The routing role a paired helper plays. `Doc` is the document/PDF specialist,
+/// `General` handles images/charts/screenshots/photos, and `Any` is a single helper
+/// that takes every attachment type (role routing is skipped when the sole partner
+/// is `Any`). Serializes lowercase for the `GET /jesse/models` capability view.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum VisionRole {
+    Doc,
+    General,
+    Any,
+}
+
+impl VisionRole {
+    /// Parse a role token (`doc` | `general` | `any`), case-insensitive. An empty or
+    /// unrecognized token defaults to `Any` — the safest single-helper behavior — so a
+    /// typo widens coverage rather than silently dropping an attachment type.
+    pub fn parse(s: &str) -> VisionRole {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "doc" | "document" => VisionRole::Doc,
+            "general" | "image" => VisionRole::General,
+            _ => VisionRole::Any,
+        }
+    }
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            VisionRole::Doc => "doc",
+            VisionRole::General => "general",
+            VisionRole::Any => "any",
+        }
+    }
+}
+
+/// One paired vision helper: the id of a registered model plus the role it plays in
+/// routing. List order is preserved (the config order) so fallback is deterministic.
+#[derive(Debug, Clone, PartialEq)]
+pub struct VisionPartner {
+    pub id: String,
+    pub role: VisionRole,
+}
+
+/// Parse the `JESSE_MODEL_<X>_VISION` env form: a comma-separated list of `id[:role]`
+/// items (e.g. `paddleocr-vl:doc,qwen3-vl:general`, or a single `qwen3-vl:any`). A
+/// missing role defaults to `Any`. Blank items are skipped; an empty/blank spec yields
+/// no partners (vision off for that model — byte-for-byte today's behavior).
+pub fn parse_vision_partners(spec: &str) -> Vec<VisionPartner> {
+    spec.split(',')
+        .filter_map(|item| {
+            let item = item.trim();
+            if item.is_empty() {
+                return None;
+            }
+            let (id, role) = match item.split_once(':') {
+                Some((id, role)) => (id.trim(), VisionRole::parse(role)),
+                None => (item, VisionRole::Any),
+            };
+            (!id.is_empty()).then(|| VisionPartner {
+                id: id.to_string(),
+                role,
+            })
+        })
+        .collect()
+}
+
+/// Parse a truthy env flag (`on`/`1`/`true`/`yes`), default false — the per-model
+/// complementary toggle and any other opt-in switch in this layer.
+fn env_flag_true(name: &str) -> bool {
+    std::env::var(name)
+        .ok()
+        .map(|v| {
+            let v = v.trim().to_ascii_lowercase();
+            v == "on" || v == "1" || v == "true" || v == "yes"
+        })
+        .unwrap_or(false)
+}
+
+/// Global knobs for the vision-helper layer, all env-tunable (no rebuild). Entirely
+/// inert unless a text model is paired with a helper AND a turn carries an attachment.
+#[derive(Debug, Clone, PartialEq)]
+pub struct VisionConfig {
+    /// Max PDF pages rasterized + sent per attachment (`JESSE_VISION_PDF_PAGE_CAP`,
+    /// default 10, floored at 1). Extra pages are dropped with a truncation note in the
+    /// spliced block, never silently.
+    pub pdf_page_cap: usize,
+    /// Rasterization DPI for PDF pages (`JESSE_VISION_PDF_DPI`, default 200, clamped
+    /// [36, 600]).
+    pub pdf_dpi: u32,
+    /// Output-token cap requested from each helper (`JESSE_VISION_MAX_TOKENS`, default
+    /// 4096, floored at 16) — bounds a transcription's length and cost.
+    pub max_tokens: u32,
+    /// Per-helper-call wall-clock budget in seconds (`JESSE_VISION_TIMEOUT_SECS`,
+    /// default 60, floored at 1).
+    pub timeout_secs: u64,
+}
+
+impl Default for VisionConfig {
+    fn default() -> Self {
+        VisionConfig {
+            pdf_page_cap: 10,
+            pdf_dpi: 200,
+            max_tokens: 4096,
+            timeout_secs: 60,
+        }
+    }
+}
+
+/// Resolve the [`VisionConfig`] from env, each field bounded so a fat-fingered value
+/// can never produce a zero page cap, a degenerate DPI, or an unbounded call.
+pub fn resolve_vision_config() -> VisionConfig {
+    let d = VisionConfig::default();
+    VisionConfig {
+        pdf_page_cap: env_parse("JESSE_VISION_PDF_PAGE_CAP", d.pdf_page_cap).max(1),
+        pdf_dpi: env_parse("JESSE_VISION_PDF_DPI", d.pdf_dpi).clamp(36, 600),
+        max_tokens: env_parse("JESSE_VISION_MAX_TOKENS", d.max_tokens).max(16),
+        timeout_secs: env_parse("JESSE_VISION_TIMEOUT_SECS", d.timeout_secs).max(1),
+    }
 }
 
 /// How a selectable model's backend is applied to the MAIN turn.
@@ -709,6 +851,16 @@ pub struct RegistryModel {
     /// The health-probe cadence + endpoint for this model (unused for the ambient entry,
     /// which is healthy by construction and never probed).
     pub health: HealthConfig,
+    /// The ordered vision helpers this (text) model is PAIRED with. Empty for the
+    /// common case and for every helper entry itself: an empty list means this model
+    /// cannot see attachments (handled the old way). A non-empty list confers vision,
+    /// routed by [`VisionRole`]. Partner ids that don't resolve to a configured entry
+    /// are inert (warned once at startup — see [`validate_vision_pairings`]).
+    pub vision: Vec<VisionPartner>,
+    /// Complementary mode: for a SINGLE attachment, call BOTH paired helpers and
+    /// concatenate their outputs under labeled sections (default off). Only meaningful
+    /// with a doc+general pair; ignored for a lone `Any` helper.
+    pub vision_complementary: bool,
 }
 
 /// The set of models the conversation can be switched onto. Ordered as presented to the
@@ -786,7 +938,55 @@ impl ModelRegistry {
             }
         }
 
+        // A paired vision helper that doesn't resolve is a config error worth shouting
+        // about — never a silent no-op. Log once per broken pairing at startup.
+        validate_vision_pairings(&models);
+
         ModelRegistry { models }
+    }
+
+    /// Resolve a vision partner id to its registered entry, but ONLY when that entry is
+    /// configured (its backend/token resolved) — an unconfigured partner is treated as
+    /// absent so it can never be called. This is the single gate both the capability
+    /// view (`GET /jesse/models`) and the live preprocessor consult.
+    pub fn vision_partner(&self, id: &str) -> Option<&RegistryModel> {
+        self.get(id).filter(|m| m.configured)
+    }
+
+    /// Whether a model actually HAS working vision: it is paired AND at least one partner
+    /// resolves to a configured registered model. A paired-but-all-broken model reports
+    /// `false` here (and `GET /jesse/models` shows no-vision), never a silent half-state.
+    pub fn vision_enabled(&self, m: &RegistryModel) -> bool {
+        m.vision.iter().any(|p| self.vision_partner(&p.id).is_some())
+    }
+}
+
+/// Log a loud warning for every paired vision partner that does NOT resolve to a
+/// configured registered model — a paired-but-broken helper must be visible, never a
+/// silent no-op. Does not mutate the registry: resolution happens again at call time,
+/// and the capability view reports vision as enabled only when a partner actually resolves.
+fn validate_vision_pairings(models: &[RegistryModel]) {
+    let configured: std::collections::HashSet<&str> = models
+        .iter()
+        .filter(|m| m.configured)
+        .map(|m| m.id.as_str())
+        .collect();
+    for m in models {
+        for p in &m.vision {
+            if !configured.contains(p.id.as_str()) {
+                eprintln!(
+                    "jesse-bridge: WARNING model '{}' is paired with vision helper '{}' \
+                     (role {}) which is not a configured registered model — that partner \
+                     is INERT (an attachment routed to it is dropped with a note in the \
+                     spliced block). Register '{}' (a [[models]] entry or JESSE_MODEL_* \
+                     triple whose token env var is set) to arm it.",
+                    m.id,
+                    p.id,
+                    p.role.as_str(),
+                    p.id
+                );
+            }
+        }
     }
 }
 
@@ -840,6 +1040,10 @@ fn glm_env_entry(default_interval_secs: u64) -> RegistryModel {
             interval_secs: default_interval_secs,
             ..HealthConfig::default()
         },
+        // Pair GLM with vision helpers via `JESSE_MODEL_GLM_VISION` (id[:role],…) and
+        // `JESSE_MODEL_GLM_VISION_COMPLEMENTARY`. Unset → no vision (today's behavior).
+        vision: parse_vision_partners(&env_string("JESSE_MODEL_GLM_VISION").unwrap_or_default()),
+        vision_complementary: env_flag_true("JESSE_MODEL_GLM_VISION_COMPLEMENTARY"),
     }
 }
 
@@ -871,6 +1075,8 @@ fn kimi_env_entry(default_interval_secs: u64) -> RegistryModel {
             interval_secs: default_interval_secs,
             ..HealthConfig::default()
         },
+        vision: parse_vision_partners(&env_string("JESSE_MODEL_KIMI_VISION").unwrap_or_default()),
+        vision_complementary: env_flag_true("JESSE_MODEL_KIMI_VISION_COMPLEMENTARY"),
     }
 }
 
@@ -898,6 +1104,8 @@ fn local_env_entry(default_interval_secs: u64) -> RegistryModel {
             interval_secs: default_interval_secs,
             ..HealthConfig::default()
         },
+        vision: parse_vision_partners(&env_string("JESSE_MODEL_LOCAL_VISION").unwrap_or_default()),
+        vision_complementary: env_flag_true("JESSE_MODEL_LOCAL_VISION_COMPLEMENTARY"),
     }
 }
 
@@ -920,6 +1128,12 @@ pub struct ActiveModel {
     pub writes_allowed: bool,
     /// The price deck for the per-turn cost badge.
     pub price: PriceDeck,
+    /// The vision helpers this model is paired with (copied from its registry entry) plus
+    /// the complementary toggle — the exact inputs the vision preprocessor needs. Empty
+    /// for ambient opus and any unpaired model: an empty list is the vision-off state on
+    /// the hot path, so those turns handle attachments the old way (byte-for-byte).
+    pub vision: Vec<VisionPartner>,
+    pub vision_complementary: bool,
 }
 
 impl ActiveModel {
@@ -938,6 +1152,9 @@ impl ActiveModel {
                 cached_per_m: OPUS_CACHED_PER_M,
                 out_per_m: OPUS_OUT_PER_M,
             },
+            // Ambient opus sees images natively (CLI Read tool); never uses the helper layer.
+            vision: Vec::new(),
+            vision_complementary: false,
         }
     }
 
@@ -964,6 +1181,10 @@ fn opus_entry() -> RegistryModel {
             out_per_m: OPUS_OUT_PER_M,
         },
         health: HealthConfig::default(),
+        // Ambient opus already sees images through the CLI's native Read tool, so it is
+        // never paired — vision helpers exist for the text backends that cannot.
+        vision: Vec::new(),
+        vision_complementary: false,
     }
 }
 
@@ -1009,6 +1230,19 @@ pub struct ModelToml {
     pub default_writes: Option<bool>,
     pub price: Option<PriceToml>,
     pub health: Option<HealthToml>,
+    /// Vision pairing: an ordered list of `{ id, role }` partner entries. Absent/empty
+    /// → this model has no vision (today's behavior). See [`VisionPartnerToml`].
+    pub vision: Option<Vec<VisionPartnerToml>>,
+    /// Complementary mode toggle (default false). See [`RegistryModel::vision_complementary`].
+    pub vision_complementary: Option<bool>,
+}
+
+/// One `vision = [{ id = "...", role = "doc|general|any" }]` partner entry. `id` is
+/// required (a blank one is skipped); `role` defaults to `any` when absent or unknown.
+#[derive(Deserialize, Debug, Default, Clone)]
+pub struct VisionPartnerToml {
+    pub id: Option<String>,
+    pub role: Option<String>,
 }
 
 /// Parse a declarative `kind` string into a [`ModelKind`]. Only `hosted` / `local` are
@@ -1137,6 +1371,20 @@ pub fn registry_model_from_toml(t: &ModelToml, global_interval: Option<u64>) -> 
         default_writes: t.default_writes.unwrap_or(false),
         price,
         health,
+        vision: t
+            .vision
+            .as_deref()
+            .unwrap_or(&[])
+            .iter()
+            .filter_map(|p| {
+                let id = p.id.as_deref().map(str::trim).filter(|s| !s.is_empty())?;
+                Some(VisionPartner {
+                    id: id.to_string(),
+                    role: VisionRole::parse(p.role.as_deref().unwrap_or("any")),
+                })
+            })
+            .collect(),
+        vision_complementary: t.vision_complementary.unwrap_or(false),
     })
 }
 
@@ -1322,6 +1570,8 @@ impl Config {
             // ModelRegistry::from_env). Always includes the ambient opus default; the other
             // entries are unconfigured (present, not selectable) until their token resolves.
             model_registry: ModelRegistry::from_env(&home),
+            // Vision-layer knobs; bounded so a bad env value can't degrade the pipeline.
+            vision: resolve_vision_config(),
         }
     }
 }
@@ -2166,6 +2416,115 @@ mod tests {
     }
 
     #[test]
+    fn parse_vision_partners_reads_the_env_form() {
+        // id[:role] items, comma-separated; missing role defaults to Any; blanks skipped.
+        let ps = parse_vision_partners("paddleocr:doc, qwen3-vl:general ,, solo");
+        assert_eq!(ps.len(), 3);
+        assert_eq!(ps[0].id, "paddleocr");
+        assert_eq!(ps[0].role, VisionRole::Doc);
+        assert_eq!(ps[1].id, "qwen3-vl");
+        assert_eq!(ps[1].role, VisionRole::General);
+        assert_eq!(ps[2].id, "solo");
+        assert_eq!(ps[2].role, VisionRole::Any, "no role → any");
+        // An empty/blank spec is no partners (vision off).
+        assert!(parse_vision_partners("").is_empty());
+        assert!(parse_vision_partners("  , ").is_empty());
+        // An unknown role token widens to Any rather than dropping.
+        assert_eq!(parse_vision_partners("x:bogus")[0].role, VisionRole::Any);
+    }
+
+    #[test]
+    fn declarative_model_parses_vision_pairing() {
+        let _g = ENV_LOCK.lock_ok();
+        std::env::set_var("JESSE_TEST_VIS_TOKEN", "tok");
+        let t = ModelToml {
+            id: Some("glm".into()),
+            kind: Some("hosted".into()),
+            base_url: Some("http://b".into()),
+            model: Some("m".into()),
+            auth_token_env: Some("JESSE_TEST_VIS_TOKEN".into()),
+            vision: Some(vec![
+                VisionPartnerToml {
+                    id: Some("paddle".into()),
+                    role: Some("doc".into()),
+                },
+                VisionPartnerToml {
+                    id: Some("qwen".into()),
+                    role: None,
+                },
+                VisionPartnerToml {
+                    id: Some("  ".into()),
+                    role: Some("general".into()),
+                },
+            ]),
+            vision_complementary: Some(true),
+            ..Default::default()
+        };
+        let m = registry_model_from_toml(&t, None).unwrap();
+        assert_eq!(m.vision.len(), 2, "the blank-id partner is skipped");
+        assert_eq!(m.vision[0].id, "paddle");
+        assert_eq!(m.vision[0].role, VisionRole::Doc);
+        assert_eq!(m.vision[1].role, VisionRole::Any, "missing role → any");
+        assert!(m.vision_complementary);
+        std::env::remove_var("JESSE_TEST_VIS_TOKEN");
+    }
+
+    #[test]
+    fn vision_enabled_requires_a_configured_partner() {
+        // A text model paired to an unconfigured helper reports no vision; configuring the
+        // helper flips it on.
+        let helper_unarmed = RegistryModel {
+            id: "vl".into(),
+            label: "VL".into(),
+            kind: ModelKind::Hosted,
+            backend: None,
+            subagent_model: None,
+            configured: false,
+            default_writes: false,
+            price: PriceDeck::ZERO,
+            health: HealthConfig::default(),
+            vision: Vec::new(),
+            vision_complementary: false,
+        };
+        let text = RegistryModel {
+            id: "glm".into(),
+            label: "GLM".into(),
+            kind: ModelKind::Hosted,
+            backend: Some(("http://b".into(), "t".into(), "m".into())),
+            subagent_model: Some("m".into()),
+            configured: true,
+            default_writes: false,
+            price: PriceDeck::ZERO,
+            health: HealthConfig::default(),
+            vision: vec![VisionPartner {
+                id: "vl".into(),
+                role: VisionRole::Any,
+            }],
+            vision_complementary: false,
+        };
+        let reg = ModelRegistry {
+            models: vec![helper_unarmed.clone(), text.clone()],
+        };
+        assert!(
+            !reg.vision_enabled(reg.get("glm").unwrap()),
+            "partner unconfigured → no vision"
+        );
+        let helper_armed = RegistryModel {
+            backend: Some(("http://b".into(), "t".into(), "m".into())),
+            configured: true,
+            ..helper_unarmed
+        };
+        let reg2 = ModelRegistry {
+            models: vec![helper_armed, text],
+        };
+        assert!(
+            reg2.vision_enabled(reg2.get("glm").unwrap()),
+            "partner configured → vision on"
+        );
+        assert!(reg2.vision_partner("vl").is_some());
+    }
+
+    #[test]
     fn declarative_model_parses_price_subagent_and_health_overrides() {
         let _g = ENV_LOCK.lock_ok();
         std::env::set_var("JESSE_TEST_DECL_TOKEN2", "tok");
@@ -2188,6 +2547,8 @@ mod tests {
                 interval_secs: Some(30),
                 timeout_secs: Some(2),
             }),
+            vision: None,
+            vision_complementary: None,
         };
         let m = registry_model_from_toml(&t, None).unwrap();
         assert!(matches!(m.kind, ModelKind::Local));
