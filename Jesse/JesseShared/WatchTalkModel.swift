@@ -30,6 +30,10 @@ protocol WatchAudioRecording: AnyObject {
 protocol WatchRequestSending: AnyObject {
     var isReachable: Bool { get }
     var onReply: ((WatchReply) -> Void)? { get set }
+    /// The phone reporting that the BRIDGE accepted this turn (it registered the conversation
+    /// and returned its 202). Optional with a default no-op assignment site, so a conformer
+    /// that does not model it simply never reports acceptance.
+    var onRegistered: ((WatchRegistered) -> Void)? { get set }
     func send(_ request: WatchRequest)
 }
 
@@ -47,6 +51,10 @@ final class WatchTalkModel {
         case idle
         case listening
         case thinking
+        /// The BRIDGE has the turn: it registered the conversation and accepted the work, so
+        /// the answer is coming even if the phone is put away. Distinct from `.thinking`,
+        /// which only means the phone took the request off the watch.
+        case received
         case reply(display: String, spoken: String)
         case error(String)
         /// Sent while the phone was unreachable — it'll be relayed once the phone is
@@ -76,6 +84,7 @@ final class WatchTalkModel {
         self.haptic = haptic
         self.recorder.onFinish = { [weak self] in self?.recordingFinished($0) }
         self.sender.onReply = { [weak self] in self?.receive($0) }
+        self.sender.onRegistered = { [weak self] in self?.registered($0) }
     }
 
     /// The single button. One tap starts listening; a second tap while listening is
@@ -88,7 +97,7 @@ final class WatchTalkModel {
         case .idle, .reply, .error, .queued:
             state = .listening
             recorder.start()
-        case .thinking:
+        case .thinking, .received:
             break
         }
     }
@@ -112,6 +121,20 @@ final class WatchTalkModel {
             sender.send(request)
         case .failure(let error):
             state = .error("Couldn't record: \(error.localizedDescription)")
+        }
+    }
+
+    /// The phone reported that the bridge accepted this turn. Only advances the CURRENT
+    /// request's state (a late registration for a superseded take is ignored), and only from
+    /// a still-working state: a reply that already landed must never be replaced by
+    /// "Received", which would read as going backwards.
+    private func registered(_ registration: WatchRegistered) {
+        guard registration.requestId == currentRequestId else { return }
+        switch state {
+        case .thinking, .queued:
+            state = .received
+        case .idle, .listening, .received, .reply, .error:
+            break
         }
     }
 

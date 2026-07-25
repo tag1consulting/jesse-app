@@ -999,10 +999,9 @@ curl -s http://127.0.0.1:8765/jesse/title \
   is persisted server-side under that conversation **before** the response, so
   `GET /jesse/conversations` can show it. A malformed id is a `400`. **Omitting it
   reproduces the stateless behavior exactly**: nothing is stored (old clients keep
-  working unchanged). A **deprecated** `"session_id"` is still accepted and resolved
-  through the conversation reverse index, since the store is conversation-keyed now; an
-  id that resolves to no conversation stores nothing rather than writing a key no read
-  path would look at. The store is a single JSON file `<state_dir>/titles.json` (0600,
+  working unchanged). A legacy `"session_id"` is still accepted and resolved through the
+  conversation reverse index, since the store is conversation-keyed; an id that resolves
+  to no conversation stores nothing rather than writing a key no read path would look at. The store is a single JSON file `<state_dir>/titles.json` (0600,
   atomic temp+rename, best-effort — a write failure is logged, never fatal),
   following the device-token store's discipline; with no state dir configured it is
   **in-memory only** (titles lost on restart, the same degradation the job store
@@ -1139,8 +1138,7 @@ curl -s "http://127.0.0.1:8765/jesse/conversations/<conversation_id>/transcript"
   offset of the jsonl line that produced this turn>"`. It is unique within the
   conversation and byte-identical across repeated hydrates, which is what lets a
   client merge history without duplicating a turn it already holds, including two
-  genuinely identical messages, which a content hash would wrongly collapse. It is
-  **absent** on the deprecated single-session route, which predates it.
+  genuinely identical messages, which a content hash would wrongly collapse.
 - **`404`** for an unknown `conversation_id`.
 - **`400`** for a malformed `conversation_id` (anything but a canonical lowercase
   UUID) or a malformed cursor. A bad cursor is deliberately an error rather than a
@@ -1172,11 +1170,8 @@ curl -s -X DELETE http://127.0.0.1:8765/jesse/conversation/<conversation_id> \
   never delete outside the vault projects dir.
 - **Title and flag cleanup.** The conversation's title and flag rows are dropped, so
   a deleted conversation can't resurrect a stale title or favorite.
-- **Tombstones in both key spaces.** One under the conversation id, and one under the
-  legacy session id of each bound transcript. The legacy half is not redundant:
-  forgetting the record removes the reverse-index entries, so there is nothing left to
-  project a conversation-keyed tombstone back through, and a pre-0.33 client on the
-  deprecated `GET /jesse/sessions` would silently stop receiving delete propagation.
+- **A durable tombstone**, under the conversation id, so a device that adopted this
+  conversation learns to drop it on its next sync.
 - **A deleted conversation is no longer resumable**. See the resume-after-sweep note
   under the GC sweep below.
 
@@ -1203,37 +1198,6 @@ curl -s -X POST http://127.0.0.1:8765/jesse/conversation/<conversation_id>/flags
   untouched. The two flags are independent registers.
 - **`404`** for an unknown conversation, **`400`** for a malformed id.
 - Persisted to `<state_dir>/flags.json`, keyed on the conversation id.
-
-## Deprecated session-keyed routes (removed in the next minor)
-
-These four kept working for one release so the bridge could ship ahead of the apps.
-Each resolves through the conversation reverse index. **Do not build against them.**
-
-| Deprecated | Replacement |
-| --- | --- |
-| `GET /jesse/sessions` | [`GET /jesse/conversations`](#conversation-list-get-jesseconversations) |
-| `GET /jesse/sessions/{session_id}` | [`GET /jesse/conversations/{id}/transcript`](#hydrate-a-conversation-get-jesseconversationsconversation_idtranscript) |
-| `DELETE /jesse/session/{session_id}` | [`DELETE /jesse/conversation/{id}`](#delete-a-conversation-delete-jesseconversationconversation_id) |
-| `POST /jesse/session/{session_id}/flags` | [`POST /jesse/conversation/{id}/flags`](#conversation-flags-post-jesseconversationconversation_idflags) |
-
-- **`GET /jesse/sessions`** returns the old
-  `{ "sessions": [ { "session_id", "last_modified", "first_message", "title",
-  "favorite", "favorite_updated_ms", "archived", "archived_updated_ms" } ],
-  "deleted": [ { "session_id", "deleted_ms" } ] }` shape, derived from the same
-  registry by projecting each conversation onto its **current** session id and
-  dropping any conversation that has none yet. Auth, rate limiting, `?since=`, and the
-  strong-ETag / `If-None-Match` behavior are unchanged.
-- **`GET /jesse/sessions/{session_id}`** keeps its plain byte-offset `?after=` /
-  `next_offset` behavior against that single file, and emits **no** `turn_key`.
-  `404` for an unknown id and for a title-mint id; `400` for a non-plain component.
-- **`DELETE /jesse/session/{session_id}`** resolves the session and deletes the
-  **whole** conversation (every alias transcript), not just that one file. An id that
-  resolves to no conversation falls back to the pre-registry single-file path, so a
-  retrying drainer still converges.
-- **`POST /jesse/session/{session_id}/flags`** resolves the session and writes the
-  conversation-keyed row every other device reads. `404` when the id resolves to no
-  conversation, including a synthetic `local-` id, which has no transcript by
-  construction, matching the previous behavior.
 
 ## Session GC sweep (`JESSE_SESSION_TTL_DAYS`)
 

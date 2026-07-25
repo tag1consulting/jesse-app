@@ -119,4 +119,35 @@ final class WatchMessageCodecTests: XCTestCase {
         XCTAssertNil(WatchMessage.decode(["v": 1, "type": "request", "requestId": UUID().uuidString,
                                           "mode": "ask", "audio": "not-data"]))
     }
+
+    // MARK: - The registration envelope (bridge acceptance)
+
+    func testRegisteredRoundTrips() throws {
+        let msg = WatchMessage.registered(
+            WatchRegistered(requestId: UUID(uuidString: "11111111-2222-4333-8444-555555555555")!,
+                            conversationId: "0f8c2b1e-9a4d-4c77-b2e1-6d5a0c3f9b84"))
+        let decoded = WatchMessage.decode(msg.encode())
+        XCTAssertEqual(decoded, msg)
+    }
+
+    func testRegisteredWithoutAConversationIsRejected() {
+        // A registration whose whole purpose is naming the conversation is malformed without
+        // one: rejected, not decoded into an empty id the watch would act on.
+        var dict = WatchMessage.registered(
+            WatchRegistered(requestId: UUID(), conversationId: "c")).encode()
+        dict["conversationId"] = nil
+        XCTAssertNil(WatchMessage.decode(dict))
+        dict["conversationId"] = ""
+        XCTAssertNil(WatchMessage.decode(dict))
+        dict["conversationId"] = 42          // not a String
+        XCTAssertNil(WatchMessage.decode(dict))
+    }
+
+    func testRegisteredCarriesOnlyPropertyListTypes() throws {
+        // Every transport (sendMessage / transferUserInfo / transferFile metadata) requires
+        // property-list values, so the new envelope must not smuggle anything else in.
+        let dict = WatchMessage.registered(
+            WatchRegistered(requestId: UUID(), conversationId: "c")).encode()
+        XCTAssertTrue(PropertyListSerialization.propertyList(dict, isValidFor: .binary))
+    }
 }

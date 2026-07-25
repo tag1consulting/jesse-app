@@ -37,9 +37,7 @@ pub struct AppState {
     // when (and only when) a client explicitly deletes a conversation, exposed as the
     // `deleted` array on `GET /jesse/conversations` so every device converges on
     // removals the same way it converges on favorite/archived flags. Age-based GC never
-    // records here. Holds BOTH key spaces for the deprecation window: the conversation
-    // id, and the legacy session id of each transcript that was bound to it, so a
-    // pre-0.33 client on `GET /jesse/sessions` keeps receiving delete propagation.
+    // records here. Keyed on the conversation id.
     pub deletions: Arc<DeletionStore>,
     // Server-side GLOBAL model selection (the model switch): the active model id and the
     // per-model write overrides, persisted to `<state_dir>/model.json` (in-memory when no

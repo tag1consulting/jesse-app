@@ -2,7 +2,7 @@ use crate::*;
 
 // ---- Server-side per-session favorite / archived flags ---------------------
 //
-// A single JSON file `<state_dir>/flags.json` mapping session_id -> SessionFlags,
+// A single JSON file `<state_dir>/flags.json` mapping conversation_id -> SessionFlags,
 // so a conversation's favorite / archived state is the bridge's (not one device's)
 // and every device converges on one set of favorites and one set of archived
 // conversations. Mirrors `TitleStore`'s discipline exactly: atomic temp+rename
@@ -80,7 +80,7 @@ pub struct FlagUpdate {
     pub archived_updated_ms: Option<u64>,
 }
 
-/// The session_id -> flags map. Cheaply shared behind an `Arc` in `AppState`.
+/// The conversation_id -> flags map. Cheaply shared behind an `Arc` in `AppState`.
 pub struct FlagStore {
     map: Mutex<HashMap<String, SessionFlags>>,
     // Where the map is persisted. `None` -> in-memory only.

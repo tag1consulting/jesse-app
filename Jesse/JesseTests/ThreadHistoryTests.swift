@@ -17,7 +17,7 @@ final class ThreadHistoryTests: XCTestCase {
         let data = #"{"mode":"ask","response":"hello","session_id":"sess-1","job_id":"job-1"}"#
             .data(using: .utf8)!
         let result = try JesseClient.decodeSend(data: data, resp: httpResponse(200))
-        guard case .reply(let reply, let jobId) = result else {
+        guard case .reply(let reply, let jobId, _) = result else {
             return XCTFail("expected .reply, got \(result)")
         }
         XCTAssertEqual(reply.text, "hello")
@@ -28,7 +28,7 @@ final class ThreadHistoryTests: XCTestCase {
     func testDecodeSend202IsRunningWithJobId() throws {
         let data = #"{"job_id":"job-42","status":"running"}"#.data(using: .utf8)!
         let result = try JesseClient.decodeSend(data: data, resp: httpResponse(202))
-        guard case .running(let jobId) = result else {
+        guard case .running(let jobId, _) = result else {
             return XCTFail("expected .running, got \(result)")
         }
         XCTAssertEqual(jobId, "job-42")

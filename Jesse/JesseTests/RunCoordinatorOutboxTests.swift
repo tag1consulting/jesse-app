@@ -30,30 +30,29 @@ final class RunCoordinatorOutboxTests: XCTestCase {
         var behaviors: [Behavior]
         private(set) var sendCallCount = 0
         private(set) var requestIds: [UUID?] = []
+        private(set) var conversationIds: [String] = []
         private(set) var sentAttachments: [[JesseAttachment]] = []
 
         init(_ behaviors: [Behavior]) { self.behaviors = behaviors }
 
-        func send(mode: JesseMode, text: String, sessionId: String?, voice: Bool,
+        /// The ONE send. There is no longer an overload that drops the request id or the
+        /// conversation id, which is the point: a forwarding overload is exactly how the wire
+        /// lost the idempotency key.
+        func send(mode: JesseMode, text: String, sessionId: String?,
+                  conversationId: String, voice: Bool,
                   instructions: String?, floorOverride: String?,
-                  attachments: [JesseAttachment]) async throws -> JesseSendResult {
-            try await send(mode: mode, text: text, sessionId: sessionId, voice: voice,
-                           instructions: instructions, floorOverride: floorOverride,
-                           attachments: attachments, requestId: nil)
-        }
-
-        func send(mode: JesseMode, text: String, sessionId: String?, voice: Bool,
-                  instructions: String?, floorOverride: String?,
-                  attachments: [JesseAttachment], requestId: UUID?) async throws -> JesseSendResult {
+                  attachments: [JesseAttachment], requestId: UUID,
+                  model: String?) async throws -> JesseSendResult {
             sendCallCount += 1
             requestIds.append(requestId)
+            conversationIds.append(conversationId)
             sentAttachments.append(attachments)
             let behavior = behaviors[min(sendCallCount - 1, behaviors.count - 1)]
             switch behavior {
             case .failPreACK(let error): throw error
             case .cancelPreACK: throw CancellationError()
-            case .running(let jobId): return .running(jobId: jobId)
-            case .reply(let reply): return .reply(reply, jobId: nil)
+            case .running(let jobId): return .running(jobId: jobId, conversationId: nil)
+            case .reply(let reply): return .reply(reply, jobId: nil, conversationId: nil)
             }
         }
 

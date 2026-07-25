@@ -22,11 +22,14 @@ final class WatchTalkModelTests: XCTestCase {
     private final class FakeSender: WatchRequestSending {
         var isReachable: Bool
         var onReply: ((WatchReply) -> Void)?
+        var onRegistered: ((WatchRegistered) -> Void)?
         private(set) var sent: [WatchRequest] = []
         init(reachable: Bool = true) { self.isReachable = reachable }
         func send(_ request: WatchRequest) { sent.append(request) }
         /// Simulate the phone answering.
         func reply(_ reply: WatchReply) { onReply?(reply) }
+        /// Simulate the phone reporting that the BRIDGE accepted the turn.
+        func register(_ registration: WatchRegistered) { onRegistered?(registration) }
     }
 
     private final class FakeSpeaker: WatchSpeaking {
@@ -159,5 +162,72 @@ final class WatchTalkModelTests: XCTestCase {
         h.model.tapTalk()
         XCTAssertEqual(h.model.state, .listening)
         XCTAssertEqual(h.recorder.startCount, 2)
+    }
+
+    // MARK: - Bridge acceptance ("Received")
+
+    func testWatchStateGoesThinkingThenReceivedOnRegistration() {
+        // The wrist needs a signal between "the phone took my request" (thinking) and the
+        // finished answer, which can be minutes later. The bridge's 202, relayed as a
+        // `WatchRegistered`, is that signal.
+        let h = makeHarness()
+        h.model.tapTalk()
+        h.recorder.deliver(.success(Data([1, 2, 3])))
+        XCTAssertEqual(h.model.state, .thinking, "the phone has the request")
+        let sent = try! XCTUnwrap(h.sender.sent.first)
+
+        h.sender.register(WatchRegistered(requestId: sent.requestId,
+                                          conversationId: "0f8c2b1e-9a4d-4c77-b2e1-6d5a0c3f9b84"))
+        XCTAssertEqual(h.model.state, .received, "the BRIDGE has the turn: the answer is coming")
+
+        // And the reply still lands normally from there.
+        h.sender.reply(WatchReply(requestId: sent.requestId, ok: true,
+                                  displayText: "the answer", spokenText: "the answer"))
+        XCTAssertEqual(h.model.state, .reply(display: "the answer", spoken: "the answer"))
+    }
+
+    func testAQueuedTurnAlsoAdvancesToReceived() {
+        // Sent while the phone was unreachable: once the phone relays it and the bridge
+        // accepts, the wrist should stop saying "will send later".
+        let h = makeHarness(reachable: false)
+        h.model.tapTalk()
+        h.recorder.deliver(.success(Data([1, 2, 3])))
+        XCTAssertEqual(h.model.state, .queued)
+        let sent = try! XCTUnwrap(h.sender.sent.first)
+        h.sender.register(WatchRegistered(requestId: sent.requestId, conversationId: "c"))
+        XCTAssertEqual(h.model.state, .received)
+    }
+
+    func testARegistrationForASupersededTakeIsIgnored() {
+        let h = makeHarness()
+        h.model.tapTalk()
+        h.recorder.deliver(.success(Data([1, 2, 3])))
+        h.sender.register(WatchRegistered(requestId: UUID(), conversationId: "c"))
+        XCTAssertEqual(h.model.state, .thinking, "a registration for another request changes nothing")
+    }
+
+    func testALateRegistrationNeverOverwritesADeliveredReply() {
+        // Ordering is not guaranteed across the two transports, so a registration arriving
+        // after the reply must not walk the UI backwards from the answer to "Received".
+        let h = makeHarness()
+        h.model.tapTalk()
+        h.recorder.deliver(.success(Data([1, 2, 3])))
+        let sent = try! XCTUnwrap(h.sender.sent.first)
+        h.sender.reply(WatchReply(requestId: sent.requestId, ok: true,
+                                  displayText: "done", spokenText: "done"))
+        h.sender.register(WatchRegistered(requestId: sent.requestId, conversationId: "c"))
+        XCTAssertEqual(h.model.state, .reply(display: "done", spoken: "done"))
+    }
+
+    func testATapIsIgnoredWhileReceived() {
+        // `.received` is still a working state: a tap must not start a fresh take over it.
+        let h = makeHarness()
+        h.model.tapTalk()
+        h.recorder.deliver(.success(Data([1, 2, 3])))
+        let sent = try! XCTUnwrap(h.sender.sent.first)
+        h.sender.register(WatchRegistered(requestId: sent.requestId, conversationId: "c"))
+        h.model.tapTalk()
+        XCTAssertEqual(h.model.state, .received)
+        XCTAssertEqual(h.recorder.startCount, 1, "no second recording was started")
     }
 }

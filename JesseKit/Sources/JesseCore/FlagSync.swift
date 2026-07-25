@@ -25,21 +25,23 @@ public nonisolated struct FlagWrite: Sendable, Equatable {
 }
 
 /// The narrow bridge seam the reconciler pushes a local-newer flag change through
-/// (`POST /jesse/session/{id}/flags`, sending only the flag(s) that changed with their
-/// millis timestamps). Both apps' clients adopt it — the shared `BridgeClientProtocol`
-/// refines it, and the iOS `JesseClientProtocol` conforms — and a test fake records the
-/// calls. The default no-op keeps older conformers (test fakes) and any pre-0.25.0 path
-/// compiling and degrading cleanly: against a bridge without the endpoint the push is a
-/// best-effort no-op.
+/// (`POST /jesse/conversation/{id}/flags`, sending only the flag(s) that changed with their
+/// millis timestamps). Both apps' clients adopt it: the shared `BridgeClientProtocol`
+/// refines it, the iOS `JesseClientProtocol` conforms, and a test fake records the calls.
+/// The default no-op keeps a conformer that does not model flags compiling and degrading
+/// cleanly: against a bridge without the endpoint the push is a best-effort no-op.
+///
+/// Keyed on the CONVERSATION, not a Claude session id: the flag store is conversation-keyed
+/// server-side, because a session id is not stable across a CLI fork.
 public protocol FlagSyncing: Sendable {
     // `nonisolated`: the witness is the nonisolated networking client (and test fakes),
     // called from the MainActor reconciler across an await. Marking it here keeps the
     // requirement isolation-agnostic so any Sendable conformer satisfies it.
-    nonisolated func setFlags(sessionId: String, favorite: FlagWrite?, archived: FlagWrite?) async throws
+    nonisolated func setFlags(conversationId: String, favorite: FlagWrite?, archived: FlagWrite?) async throws
 }
 
 public extension FlagSyncing {
-    nonisolated func setFlags(sessionId: String, favorite: FlagWrite?, archived: FlagWrite?) async throws {}
+    nonisolated func setFlags(conversationId: String, favorite: FlagWrite?, archived: FlagWrite?) async throws {}
 }
 
 /// The per-flag last-writer-wins outcome.
@@ -72,9 +74,12 @@ public enum FlagReconciler {
     /// `client`, and leaves a tie alone. Returns whether the local thread was mutated so
     /// the caller can decide to save.
     ///
-    /// A thread with no `session_id` is skipped: it is purely local and cannot sync until
-    /// its first reply lands (then it acquires an id and syncs on the next pass). At most
-    /// one `setFlags` call is made, carrying ONLY the flag(s) whose local clock is newer.
+    /// A thread with no `conversationId` is skipped: it is a pre-upgrade row the sync has
+    /// not bound yet, and it syncs on the next pass once bound. Note this is a WIDER window
+    /// than the old `session_id` guard: a thread acquires its conversation id the moment it
+    /// is created, so a brand-new conversation's flags sync from its first turn rather than
+    /// waiting for a reply to land. At most one `setFlags` call is made, carrying ONLY the
+    /// flag(s) whose local clock is newer.
     ///
     /// Best-effort and self-healing: a failed push is swallowed. Because the local clock
     /// stayed strictly newer than the server's, the NEXT sessions-sync reconcile decides
@@ -86,7 +91,7 @@ public enum FlagReconciler {
                                  serverFavorite: Bool, serverFavoriteUpdatedMs: Int,
                                  serverArchived: Bool, serverArchivedUpdatedMs: Int,
                                  client: any FlagSyncing) async -> Bool {
-        guard let sid = thread.sessionId, !sid.isEmpty else { return false }
+        guard let cid = thread.conversationId, !cid.isEmpty else { return false }
 
         let favorite = decide(localValue: thread.isFavorite, localMs: thread.favoriteUpdatedMs,
                               serverValue: serverFavorite, serverMs: serverFavoriteUpdatedMs)
@@ -117,7 +122,7 @@ public enum FlagReconciler {
         }
 
         if favoritePush != nil || archivedPush != nil {
-            try? await client.setFlags(sessionId: sid, favorite: favoritePush, archived: archivedPush)
+            try? await client.setFlags(conversationId: cid, favorite: favoritePush, archived: archivedPush)
         }
         return localChanged
     }

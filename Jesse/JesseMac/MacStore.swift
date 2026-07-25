@@ -40,23 +40,52 @@ enum MacModelContainer {
 
 // MARK: - Hydration cursors
 
-/// Per-session byte offset into the append-only transcript jsonl, so a hydrate fetches
-/// only the delta appended since (`?after=`). Kept in UserDefaults (small ints keyed by
-/// session id) rather than the shared schema, so tracking Mac-side sync state adds no
-/// column to the phone's model.
+/// Per-conversation cursor into the transcript, so a hydrate fetches only what was appended
+/// since. Kept in UserDefaults (keyed by conversation id) rather than the shared schema, so
+/// tracking Mac-side sync state adds no column to the phone's model.
+///
+/// Two fixes over the byte-offset version this replaces. The cursor is now the bridge's
+/// OPAQUE `"<segment>:<offset>"` string, because a conversation can span several transcript
+/// files and a bare offset is not a sufficient position. And it is PRESENCE-based: `offset`
+/// used to return 0 for an absent key, so the Mac could not tell "never hydrated" from
+/// "hydrated from byte zero", which is precisely the ambiguity that let a hydrate re-import
+/// turns already on screen.
 enum MacCursorStore {
-    private static func key(_ sessionId: String) -> String { "hydrate.cursor.\(sessionId)" }
+    /// The v2 prefix. Note the ordering hazard the purge below has to respect:
+    /// `hydrate.cursor.` is a PREFIX of `hydrate.cursor.v2.`.
+    private static let prefix = "hydrate.cursor.v2."
+    private static let legacyPrefix = "hydrate.cursor."
+    private static let purgedFlag = "hydrate.cursor.v1purged"
 
-    static func offset(_ sessionId: String, defaults: UserDefaults = .standard) -> UInt64 {
-        UInt64(max(0, defaults.integer(forKey: key(sessionId))))
+    private static func key(_ conversationId: String) -> String { prefix + conversationId }
+
+    /// The stored cursor, or nil when this conversation has never been hydrated.
+    static func cursor(_ conversationId: String, defaults: UserDefaults = .standard) -> String? {
+        purgeLegacyOnce(defaults: defaults)
+        guard let v = defaults.string(forKey: key(conversationId)), !v.isEmpty else { return nil }
+        return v
     }
-    static func setOffset(_ sessionId: String, _ value: UInt64, defaults: UserDefaults = .standard) {
-        defaults.set(Int(value), forKey: key(sessionId))
+    static func setCursor(_ conversationId: String, _ value: String,
+                         defaults: UserDefaults = .standard) {
+        purgeLegacyOnce(defaults: defaults)
+        defaults.set(value, forKey: key(conversationId))
     }
-    /// Forget a session's cursor, called when its local thread is deleted (locally or via
+    /// Forget a conversation's cursor, called when its local thread is deleted (locally or via
     /// a cross-device tombstone) so a re-adopted id later hydrates from scratch.
-    static func clear(_ sessionId: String, defaults: UserDefaults = .standard) {
-        defaults.removeObject(forKey: key(sessionId))
+    static func clear(_ conversationId: String, defaults: UserDefaults = .standard) {
+        defaults.removeObject(forKey: key(conversationId))
+    }
+
+    /// Drop every v1 byte-offset cursor, once. They are keyed on a session id and hold byte
+    /// offsets, so neither the key nor the value means anything against the opaque cursor.
+    /// The v2 prefix is filtered out explicitly, so this is safe whenever it runs.
+    static func purgeLegacyOnce(defaults: UserDefaults = .standard) {
+        guard !defaults.bool(forKey: purgedFlag) else { return }
+        for k in defaults.dictionaryRepresentation().keys
+        where k.hasPrefix(legacyPrefix) && !k.hasPrefix(prefix) && k != purgedFlag {
+            defaults.removeObject(forKey: k)
+        }
+        defaults.set(true, forKey: purgedFlag)
     }
 }
 
@@ -137,6 +166,31 @@ final class MacCoordinator {
     /// Fires when a turn completes, so the app can post a local notification.
     var onTurnFinished: (@MainActor (JesseThread, _ reply: String) -> Void)?
 
+    /// Guards `refreshSessions` against overlapping runs, exactly as the phone does.
+    private var isRefreshingSessions = false
+
+    /// Whether the bridge has ACCEPTED the running turn (its 202 came back), as opposed to the
+    /// POST still being in flight. `isRunning` deliberately covers both, which is why it cannot
+    /// answer this; the detail view's delivery caption reads `phase` below.
+    private(set) var accepted = false
+
+    /// Where the running turn is between "typed" and "answered", or nil when nothing is
+    /// running on `threadID`. Mirrors the phone's `RunCoordinator.phase`.
+    func phase(_ threadID: UUID) -> TurnPhase? {
+        guard isRunning, activeThreadID == threadID, lastError == nil else { return nil }
+        return accepted ? .accepted : .sending
+    }
+
+    /// Adopt the bridge's authoritative conversation id and stamp the first-ACK time. The
+    /// bridge stays free to override the requested id, so the echo is always written back; a
+    /// nil echo means a bridge too old to report one and the local id stands.
+    private func adoptRegistration(thread: JesseThread, conversationId: String?) {
+        if let conversationId, !conversationId.isEmpty, thread.conversationId != conversationId {
+            thread.conversationId = conversationId
+        }
+        if thread.registeredAt == nil { thread.registeredAt = Date() }
+    }
+
     private var sessionsETag: String? {
         get { UserDefaults.standard.string(forKey: "sessions.etag") }
         set { UserDefaults.standard.set(newValue, forKey: "sessions.etag") }
@@ -186,11 +240,13 @@ final class MacCoordinator {
 
         activeThreadID = thread.id
         isRunning = true
+        accepted = false
         streamingText = ""
         activity = ""
         lastError = nil
         defer {
             isRunning = false
+            accepted = false
             activeThreadID = nil
             streamingText = ""
             activity = ""
@@ -201,16 +257,25 @@ final class MacCoordinator {
         // device's default (`LastUsedModelStore`). Local to this Mac and this thread — it never
         // mutates the bridge's global default, so the phone is unaffected. nil → bridge default.
         let model = thread.selectedModelID ?? LastUsedModelStore.id
+        // The thread identity, sent on every turn. The Mac has no outbox to reuse a request id
+        // from, so it keeps generating one per attempt; identity is carried by the conversation.
+        let conversationId = thread.conversationId ?? JesseThread.mintConversationId()
+        if thread.conversationId != conversationId { thread.conversationId = conversationId }
         do {
             let result = try await cli.send(
                 mode: mode, text: trimmed, sessionId: thread.sessionId,
+                conversationId: conversationId,
                 voice: false, instructions: nil, floorOverride: nil,
                 attachments: [], requestId: UUID().uuidString, model: model)
+            // Adopt the AUTHORITATIVE id the bridge registered and stamp the first ACK, which
+            // is what the detail view's delivery caption reads.
+            adoptRegistration(thread: thread, conversationId: result.conversationId)
             switch result {
-            case let .reply(reply, _):
+            case let .reply(reply, _, _):
                 await finalize(thread: thread, reply: reply, streamedText: nil,
                                context: context, client: cli)
-            case let .running(jobId):
+            case let .running(jobId, _):
+                accepted = true
                 await runStream(jobId: jobId, thread: thread, context: context, client: cli)
             }
         } catch {
@@ -326,19 +391,19 @@ final class MacCoordinator {
 
         onTurnFinished?(thread, fields.text)
 
-        guard let sid = thread.sessionId, !sid.isEmpty else { return }
+        guard let cid = thread.conversationId, !cid.isEmpty else { return }
 
-        // Advance the cursor to the current transcript end WITHOUT re-appending: we keep
-        // the optimistic + streamed turns as the record, and just move past them so a
-        // future delta hydrate returns only genuinely-new content.
-        if let (_, next) = try? await cli.hydrate(sessionId: sid, after: MacCursorStore.offset(sid)) {
-            MacCursorStore.setOffset(sid, next)
-        }
+        // Hydrate through the SAME merge the open path uses, which binds the delivered turns'
+        // stable `turn_key`s and advances the cursor. This used to advance the cursor without
+        // reading anything, precisely because re-reading would have re-appended the turns just
+        // rendered; with the key-based merge that is no longer true, and binding the keys here
+        // is what makes every later hydrate a cheap no-op.
+        await hydrate(thread: thread, context: context)
 
         // Mint an AI title once, from the thread's first user turn.
         if (thread.aiTitle ?? "").isEmpty,
            let firstUser = thread.orderedTurns.first(where: { $0.isUser })?.text,
-           let title = await cli.title(text: firstUser, sessionId: sid) {
+           let title = await cli.title(text: firstUser, conversationId: cid) {
             thread.aiTitle = title
             try? context.save()
         }
@@ -346,91 +411,82 @@ final class MacCoordinator {
 
     // MARK: Hydration
 
-    /// Pull any transcript turns appended since this thread's cursor and append them.
-    /// Full transcript on first sight (cursor 0), then byte-deltas. A thread with no
-    /// `session_id` yet (never got a reply) has nothing to hydrate.
+    /// Pull whatever the bridge has appended past this thread's cursor and merge it in. Full
+    /// history on first sight (no cursor), then deltas. A thread the sync has not bound to a
+    /// conversation has nothing to hydrate.
     ///
-    /// The append is IDEMPOTENT: a hydrated turn that duplicates one already present for this
-    /// thread is skipped rather than re-added. The cursor alone can't guarantee this — a hydrate
-    /// can legitimately run with an offset at or behind a freshly finalized exchange (a concurrent
-    /// on-open hydrate that captured the pre-`finalize` offset; a `finalize` cursor-advance that
-    /// failed or that raced the bridge's transcript flush and so didn't cover the assistant turn;
-    /// or simply the Mac cursor being absent — indistinguishable from 0 in `UserDefaults` — while
-    /// the optimistic turns are already persisted). Without the skip, this method re-imports the
-    /// optimistic user+assistant turns as a second, chip-less copy (the reported double bubble).
-    /// The skip preserves the optimistic turn (and its provenance chip) and still performs the
-    /// genuine cross-device backfill this method exists for.
+    /// The merge is an IDENTITY, not a heuristic. Every hydrated turn carries the bridge's
+    /// stable `turn_key`; a turn already held under that key is skipped, an UNKEYED local turn
+    /// (the optimistic one this app rendered) has the key BOUND onto it, and only a genuinely
+    /// new turn is inserted. That replaces the content-hash multiset this used to keep, which
+    /// could not distinguish two genuinely identical messages and so silently dropped the
+    /// second one. It is also the same `TranscriptMerge` the phone uses, so the two platforms
+    /// cannot disagree about what counts as a turn already held.
     func hydrate(thread: JesseThread, context: ModelContext) async {
-        guard configStore.isConfigured, let sid = thread.sessionId, !sid.isEmpty else { return }
-        let after = MacCursorStore.offset(sid)
+        guard configStore.isConfigured, let cid = thread.conversationId, !cid.isEmpty else { return }
+        let after = MacCursorStore.cursor(cid)
         do {
-            let (turns, next) = try await client.hydrate(sessionId: sid, after: after)
-            guard !turns.isEmpty else { MacCursorStore.setOffset(sid, next); return }
+            let (turns, next) = try await client.hydrate(conversationId: cid, after: after)
+            guard !turns.isEmpty else { MacCursorStore.setCursor(cid, next); return }
 
-            // Turns already present for this thread, as a consumable multiset keyed by
-            // role + normalized text. Each existing turn is matched at most once, so a hydrated
-            // turn that overlaps a local one is skipped while a user legitimately repeating the
-            // same message keeps both copies.
-            var present: [DedupKey: Int] = [:]
-            for t in thread.orderedTurns { present[DedupKey(t), default: 0] += 1 }
-
-            var appended = false
-            for t in turns {
-                let role: TurnRole = (t.role == "assistant") ? .jesse : .user
-                let key = DedupKey(role: role, text: t.text)
-                if let count = present[key], count > 0 {
-                    present[key] = count - 1   // already have this turn — don't duplicate it
-                    continue
+            let existing = thread.orderedTurns
+            let plan = TranscriptMerge.plan(
+                existing: existing.map {
+                    TranscriptMerge.Existing(role: $0.role, text: $0.text, sourceKey: $0.sourceKey)
+                },
+                incoming: turns)
+            var changed = false
+            for (i, action) in plan.enumerated() where i < turns.count {
+                let t = turns[i]
+                switch action {
+                case .skip:
+                    break
+                case let .bind(existingIndex):
+                    guard existingIndex < existing.count, !t.turnKey.isEmpty else { break }
+                    existing[existingIndex].sourceKey = t.turnKey
+                    changed = true
+                case .insert:
+                    let turn = Turn(role: TranscriptMerge.role(for: t.role), text: t.text,
+                                    createdAt: TranscriptMerge.timestamp(t.timestamp))
+                    turn.sourceKey = t.turnKey.isEmpty ? nil : t.turnKey
+                    turn.thread = thread
+                    context.insert(turn)
+                    thread.updatedAt = Date()
+                    changed = true
                 }
-                let turn = Turn(role: role, text: t.text, createdAt: Self.parseTimestamp(t.timestamp))
-                turn.thread = thread
-                context.insert(turn)
-                appended = true
             }
-            if appended {
-                thread.updatedAt = Date()
-                try? context.save()
-            }
-            MacCursorStore.setOffset(sid, next)
+            if changed { try? context.save() }
+            MacCursorStore.setCursor(cid, next)
         } catch JesseError.badResponse(404, _) {
-            // The session is gone server-side (GC'd / deleted): the shared client surfaces
-            // an unknown/expired transcript as a 404. Leave the cached copy.
+            // The conversation is gone server-side (GC'd / deleted): the shared client
+            // surfaces an unknown transcript as a 404. Leave the cached copy.
         } catch {
             lastError = Self.friendly(error)
         }
     }
 
-    /// Content identity used to skip a hydrated turn already present locally: a turn's role plus
-    /// its whitespace-normalized text. Deliberately content-based — the transcript jsonl carries
-    /// no stable per-turn id the local optimistic turns also hold — and consumed at most once per
-    /// existing turn (see `hydrate`), so genuine repeats are never collapsed.
-    private struct DedupKey: Hashable {
-        let role: TurnRole
-        let text: String
-        init(role: TurnRole, text: String) {
-            self.role = role
-            self.text = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        }
-        init(_ turn: Turn) { self.init(role: turn.roleValue, text: turn.text) }
-    }
-
     // MARK: Session-list sync
 
-    /// Reconcile `GET /jesse/sessions` into local threads through the ONE shared
-    /// `SessionReconciler` both apps use: adopt Mac/phone-started threads, refresh
-    /// server-authoritative titles, converge the favorite/archive flags across devices
-    /// (last-writer-wins; see `FlagReconciler`), and honor cross-device deletion tombstones
-    /// (bridge 0.26.0). ETag-conditioned, so an unchanged list is a cheap 304. Also drains
+    /// Reconcile `GET /jesse/conversations` into local threads through the ONE shared
+    /// `ConversationReconciler` both apps use: adopt threads started elsewhere, refresh
+    /// server-authoritative titles and the current session, converge the favorite/archive
+    /// flags across devices (last-writer-wins; see `FlagReconciler`), and honor cross-device
+    /// deletion tombstones. ETag-conditioned, so an unchanged list is a cheap 304. Also drains
     /// any queued remote deletions (best-effort) whenever the list is pulled.
     func refreshSessions(context: ModelContext) async {
         guard configStore.isConfigured else { return }
+        // Same re-entrancy guard the phone has: two overlapping refreshes would fetch the same
+        // list under the same stale ETag and apply the same plan twice.
+        guard !isRefreshingSessions else { return }
+        isRefreshingSessions = true
+        defer { isRefreshingSessions = false }
         drainSessionDeletions()
         let cli = makeClient(configStore.config)
         do {
-            switch try await cli.listSessions(since: nil, etag: sessionsETag) {
+            switch try await cli.listConversations(since: nil, etag: sessionsETag) {
             case .notModified:
                 return
-            case let .sessions(list, deleted, etag):
+            case let .conversations(list, deleted, etag):
                 sessionsETag = etag
                 await upsert(list, deleted: deleted, client: cli, context: context)
             }
@@ -439,76 +495,173 @@ final class MacCoordinator {
         }
     }
 
-    private func upsert(_ list: [SessionSummary], deleted: [SessionTombstone],
+    /// The same FOUR passes the phone runs, in the same order, so the two devices cannot
+    /// diverge: legacy-bind a pre-upgrade thread, merge duplicates already on the device, then
+    /// plan and apply adopt / update / delete-local, then save.
+    private func upsert(_ list: [ConversationSummary], deleted: [ConversationTombstone],
                         client cli: any BridgeClientProtocol, context: ModelContext) async {
-        // Index existing threads that carry a session id.
         let existing = (try? context.fetch(FetchDescriptor<JesseThread>())) ?? []
-        var bySession: [String: JesseThread] = [:]
-        for t in existing { if let sid = t.sessionId, !sid.isEmpty { bySession[sid] = t } }
 
-        let plan = SessionReconciler.plan(
-            localSessionIds: Set(bySession.keys),
-            sessions: list,
-            tombstones: Set(deleted.map(\.sessionId)),
+        // ── Pass 1: legacy bind ────────────────────────────────────────────────────────
+        var conversationForSession: [String: String] = [:]
+        for c in list {
+            for sid in c.sessionIds { conversationForSession[sid] = c.conversationId }
+            if let sid = c.sessionId { conversationForSession[sid] = c.conversationId }
+        }
+        for t in existing where (t.conversationId ?? "").isEmpty {
+            guard let sid = t.sessionId, !sid.isEmpty,
+                  let cid = conversationForSession[sid] else { continue }
+            t.conversationId = cid
+        }
+
+        // ── Pass 2: merge duplicates ───────────────────────────────────────────────────
+        mergeDuplicateThreads(existing, remote: list, context: context)
+
+        // ── Pass 3: plan and apply ────────────────────────────────────────────────────
+        let live = (try? context.fetch(FetchDescriptor<JesseThread>())) ?? []
+        var byConversation: [String: JesseThread] = [:]
+        for t in live {
+            guard let cid = t.conversationId, !cid.isEmpty else { continue }
+            byConversation[cid] = t
+        }
+
+        let plan = ConversationReconciler.plan(
+            heldConversationIds: Set(byConversation.keys),
+            conversations: list,
+            tombstones: Set(deleted.map(\.conversationId)),
             pendingDeletion: sessionDeletionStore.pendingIds)
 
         // ADOPT a new stub, then reconcile flags (a zero-clock stub adopts server flags).
-        for s in plan.adopt {
-            let stamp = Date(timeIntervalSince1970: TimeInterval(s.lastModified))
-            let derived = s.firstMessage.map { JesseThread.deriveTitle(from: $0) } ?? ""
+        for c in plan.adopt {
+            let stamp = Date(timeIntervalSince1970: TimeInterval(c.lastModified))
+            let derived = c.firstMessage.map { JesseThread.deriveTitle(from: $0) } ?? ""
             let t = JesseThread(title: derived, mode: .ask, createdAt: stamp)
-            t.sessionId = s.sessionId
-            t.aiTitle = s.title
+            // The initializer minted a FRESH random id; an adopted thread must not keep it.
+            t.conversationId = c.conversationId
+            t.sessionId = c.sessionId
+            if c.registeredMs > 0 {
+                t.registeredAt = Date(timeIntervalSince1970: TimeInterval(c.registeredMs) / 1000)
+            }
+            t.aiTitle = c.title
             t.updatedAt = stamp
             context.insert(t)
             await FlagReconciler.reconcile(
                 thread: t,
-                serverFavorite: s.favorite, serverFavoriteUpdatedMs: Int(s.favoriteUpdatedMs),
-                serverArchived: s.archived, serverArchivedUpdatedMs: Int(s.archivedUpdatedMs),
+                serverFavorite: c.favorite, serverFavoriteUpdatedMs: Int(c.favoriteUpdatedMs),
+                serverArchived: c.archived, serverArchivedUpdatedMs: Int(c.archivedUpdatedMs),
                 client: cli)
         }
 
-        // UPDATE an existing thread: refresh title, then reconcile flags.
-        for s in plan.update {
-            guard let t = bySession[s.sessionId] else { continue }
-            let stamp = Date(timeIntervalSince1970: TimeInterval(s.lastModified))
-            if let title = s.title, !title.isEmpty { t.aiTitle = title }
-            if t.title.isEmpty, let fm = s.firstMessage {
+        // UPDATE an existing thread: the same rules the phone applies, so the two agree.
+        for c in plan.update {
+            guard let t = byConversation[c.conversationId] else { continue }
+            let stamp = Date(timeIntervalSince1970: TimeInterval(c.lastModified))
+            if let title = c.title, !title.isEmpty, t.aiTitle != title { t.aiTitle = title }
+            if t.title.isEmpty, let fm = c.firstMessage {
                 t.title = JesseThread.deriveTitle(from: fm)
             }
+            if let sid = c.sessionId, !sid.isEmpty, t.sessionId != sid { t.sessionId = sid }
             if stamp > t.updatedAt { t.updatedAt = stamp }
             await FlagReconciler.reconcile(
                 thread: t,
-                serverFavorite: s.favorite, serverFavoriteUpdatedMs: Int(s.favoriteUpdatedMs),
-                serverArchived: s.archived, serverArchivedUpdatedMs: Int(s.archivedUpdatedMs),
+                serverFavorite: c.favorite, serverFavoriteUpdatedMs: Int(c.favoriteUpdatedMs),
+                serverArchived: c.archived, serverArchivedUpdatedMs: Int(c.archivedUpdatedMs),
                 client: cli)
         }
 
         // DELETE-LOCAL a thread the bridge tombstoned (deleted on the phone): remove it
         // (turns cascade) and clear its hydration cursor.
-        for sid in plan.deleteLocalSessionIds {
-            guard let t = bySession[sid] else { continue }
+        for cid in plan.deleteLocalConversationIds {
+            guard let t = byConversation[cid] else { continue }
             context.delete(t)
-            MacCursorStore.clear(sid)
+            MacCursorStore.clear(cid)
         }
 
+        // ── Pass 4: save once ─────────────────────────────────────────────────────────
         try? context.save()
+    }
+
+    /// Collapse every group of local threads sharing one conversation id into the group's
+    /// OLDEST member. The Mac's half of the repair pass, identical in rules to the phone's:
+    /// turns move across under `TranscriptMerge` so nothing duplicates and nothing is lost,
+    /// flags resolve by the higher last-writer-wins clock, and it keys on the conversation id
+    /// and NEVER on the title (two conversations can legitimately share a title).
+    @discardableResult
+    private func mergeDuplicateThreads(_ threads: [JesseThread],
+                                       remote: [ConversationSummary],
+                                       context: ModelContext) -> Int {
+        var groups: [String: [JesseThread]] = [:]
+        for t in threads {
+            guard let cid = t.conversationId, !cid.isEmpty else { continue }
+            groups[cid, default: []].append(t)
+        }
+        let remoteById = Dictionary(remote.map { ($0.conversationId, $0) },
+                                   uniquingKeysWith: { a, _ in a })
+        var merges = 0
+        for (cid, group) in groups where group.count > 1 {
+            let ordered = group.sorted { $0.createdAt < $1.createdAt }
+            guard let winner = ordered.first else { continue }
+            for loser in ordered.dropFirst() {
+                let plan = TranscriptMerge.plan(
+                    existing: winner.orderedTurns.map {
+                        TranscriptMerge.Existing(role: $0.role, text: $0.text, sourceKey: $0.sourceKey)
+                    },
+                    incoming: loser.orderedTurns.map {
+                        HydratedTurn(role: $0.role, text: $0.text, timestamp: nil,
+                                     turnKey: $0.sourceKey ?? "")
+                    })
+                let loserTurns = loser.orderedTurns
+                let winnerTurns = winner.orderedTurns
+                for (i, action) in plan.enumerated() where i < loserTurns.count {
+                    let turn = loserTurns[i]
+                    switch action {
+                    case .skip:
+                        break
+                    case let .bind(existingIndex):
+                        if existingIndex < winnerTurns.count,
+                           let key = turn.sourceKey, !key.isEmpty,
+                           (winnerTurns[existingIndex].sourceKey ?? "").isEmpty {
+                            winnerTurns[existingIndex].sourceKey = key
+                        }
+                    case .insert:
+                        turn.thread = winner
+                    }
+                }
+                if loser.favoriteUpdatedMs > winner.favoriteUpdatedMs {
+                    winner.applyFavoriteFromSync(loser.isFavorite, updatedMs: loser.favoriteUpdatedMs)
+                }
+                if loser.archivedUpdatedMs > winner.archivedUpdatedMs {
+                    winner.applyArchivedFromSync(loser.isArchived, updatedMs: loser.archivedUpdatedMs)
+                }
+                if (winner.aiTitle ?? "").isEmpty, let title = loser.aiTitle, !title.isEmpty {
+                    winner.aiTitle = title
+                }
+                if winner.title.isEmpty, !loser.title.isEmpty { winner.title = loser.title }
+                winner.updatedAt = max(winner.updatedAt, loser.updatedAt)
+                if winner.registeredAt == nil { winner.registeredAt = loser.registeredAt }
+                context.delete(loser)
+                merges += 1
+            }
+            if let sid = remoteById[cid]?.sessionId, !sid.isEmpty { winner.sessionId = sid }
+        }
+        return merges
     }
 
     // MARK: - Remote session deletion (durable)
 
-    /// Enqueue a thread's bridge `sessionId` for durable remote deletion and kick a drain.
-    /// Called from the sidebar delete AFTER the instant local SwiftData delete: the local
-    /// delete is unchanged, and the remote transcript is reclaimed best-effort (and a
-    /// tombstone recorded so the phone converges). A blank id is a no-op.
-    func enqueueSessionDeletion(_ sessionId: String) {
-        sessionDeletionStore.enqueue(sessionId)
+    /// Enqueue a thread's bridge `conversationId` for durable remote deletion and kick a
+    /// drain. Called from the sidebar delete AFTER the instant local SwiftData delete: the
+    /// local delete is unchanged, and every remote transcript bound to the conversation is
+    /// reclaimed best-effort (and a tombstone recorded so the phone converges). A blank id is
+    /// a no-op.
+    func enqueueSessionDeletion(_ conversationId: String) {
+        sessionDeletionStore.enqueue(conversationId)
         drainSessionDeletions()
     }
 
     /// Fire-and-forget drain of the durable pending-deletions queue: for each tombstone,
-    /// `DELETE /jesse/session/{id}`; success (incl. the bridge's idempotent 404) clears it,
-    /// a network failure leaves it for the next drain (enqueue or the next sessions pull).
+    /// `DELETE /jesse/conversation/{id}`; success (incl. the bridge's idempotent 404) clears
+    /// it, a network failure leaves it for the next drain (enqueue or the next list pull).
     private func drainSessionDeletions() {
         guard configStore.isConfigured else { return }
         let store = sessionDeletionStore
@@ -516,8 +669,8 @@ final class MacCoordinator {
         Task {
             for item in store.pending {
                 do {
-                    try await cli.deleteSession(item.sessionId)
-                    store.remove(item.sessionId)
+                    try await cli.deleteConversation(item.conversationId)
+                    store.remove(item.conversationId)
                 } catch {
                     // Transport/auth/5xx: leave the tombstone; the next drain retries.
                 }
@@ -533,19 +686,19 @@ final class MacCoordinator {
     /// the next `refreshSessions` reconcile re-pushes it (the LWW reconcile self-heals, so
     /// no retry queue is needed and a failure never surfaces to the user).
     func pushFavoriteChange(for thread: JesseThread) {
-        guard let sid = thread.sessionId, !sid.isEmpty else { return }
+        guard let cid = thread.conversationId, !cid.isEmpty else { return }
         let write = FlagWrite(value: thread.isFavorite, updatedMs: thread.favoriteUpdatedMs)
         let cli = makeClient(configStore.config)
-        Task { try? await cli.setFlags(sessionId: sid, favorite: write, archived: nil) }
+        Task { try? await cli.setFlags(conversationId: cid, favorite: write, archived: nil) }
     }
 
     /// Optimistic best-effort push of a just-toggled ARCHIVE up. Mirror of
     /// `pushFavoriteChange`; same self-healing best-effort semantics.
     func pushArchivedChange(for thread: JesseThread) {
-        guard let sid = thread.sessionId, !sid.isEmpty else { return }
+        guard let cid = thread.conversationId, !cid.isEmpty else { return }
         let write = FlagWrite(value: thread.isArchived, updatedMs: thread.archivedUpdatedMs)
         let cli = makeClient(configStore.config)
-        Task { try? await cli.setFlags(sessionId: sid, favorite: nil, archived: write) }
+        Task { try? await cli.setFlags(conversationId: cid, favorite: nil, archived: write) }
     }
 
     // MARK: Helpers

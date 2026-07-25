@@ -15,6 +15,120 @@ CI both run it). See the "Versioning" section of `bridge/README.md`.
 
 ## [Unreleased]
 
+## [Bridge 0.34.0] - 2026-07-25
+
+### Removed
+- **The four deprecated session-keyed routes**: `GET /jesse/sessions`,
+  `GET /jesse/sessions/{id}`, `DELETE /jesse/session/{id}`, and
+  `POST /jesse/session/{id}/flags`. They existed for one release so the bridge could ship
+  ahead of the apps; the apps now speak the conversation surface. Their tests go with them,
+  since every property they asserted is covered on the canonical routes.
+- **The legacy session-keyed deletion tombstone.** A conversation delete recorded a
+  tombstone under each bound session id as well as the conversation id, purely so a pre-0.33
+  client reading `GET /jesse/sessions` kept receiving delete propagation. With that route
+  gone nothing reads the session key space, so the second key would only grow
+  `deletions.json`. The one-time key migration now MOVES a deletion key rather than
+  duplicating it. That half of the migration is idempotent only under the persisted
+  `migrated` guard rather than by inspection, because a converted key is indistinguishable
+  by shape from an unconverted one: a Claude session id is a canonical lowercase UUID too.
+  The guard is what production relies on, and it is asserted directly.
+
+## [App 1.0 (78)] - 2026-07-25
+
+### Added
+- **`JesseThread.conversationId`, `JesseThread.registeredAt`, and `Turn.sourceKey`**, three
+  additive optional properties (so SwiftData lightweight-migrates every existing store).
+  `conversationId` is the bridge-registered thread identity, minted in the model's
+  initializer so none of the dozens of construction sites can forget it, and sent on EVERY
+  turn. `JesseThread.id` was deliberately NOT retyped: it stays the SwiftData identity and
+  the key for the outbox, the in-flight map, the task map, and every view, because the
+  conversation id is a SYNC key, not an object identity, and retyping the identity would
+  force a real `SchemaMigrationPlan` with frozen copies of the old model types.
+- **A delivery caption under the last user bubble on iPhone, Mac, and Watch.** "Sending…"
+  is the pre-ACK window, where the message could still be lost with the POST; "Received"
+  means the bridge registered the conversation and accepted the turn, so it will be answered
+  even if the app is closed. Nothing in the UI distinguished those before: `isRunning`
+  deliberately ORs them, so the spinner looked identical either side of the 202. Derived
+  from state that already existed via a new shared `TurnPhase`, standard platform treatment
+  only (a `.caption2` / `.caption` secondary line, no new symbol, no tint, a default
+  crossfade), no third haptic, and the accessibility label carries the meaning the two words
+  cannot, announced on the transition into `.accepted`.
+- **`TranscriptMerge`, one shared hydration merge for both apps.** Two different bugs died
+  here. iOS appended every hydrated turn unconditionally, so any hydrate overlapping turns
+  already rendered produced a double bubble. macOS guarded the same path with a content-hash
+  multiset, which is the opposite failure: two genuinely identical messages are
+  indistinguishable by content, so it silently dropped the second one. The merge now keys on
+  the bridge's stable `turn_key`; the content match survives only as a ONE-TIME upgrade that
+  binds a key onto an optimistically created turn, tracked by a consumable multiset so it
+  cannot degenerate back into ongoing content dedup. `DedupKey` is gone from `MacStore`.
+- **A durable relay dedup on the phone.** `WatchRelay`'s `inFlight` / `completed` maps are
+  in memory, so a queued `transferUserInfo` redelivered after the phone app was killed and
+  relaunched found both empty and constructed a SECOND thread for the same utterance. A
+  bounded (FIFO, 128) `UserDefaults`-backed `requestId -> (threadID, conversationId)` record
+  now resolves it to the thread that already exists. The relay also sends a real
+  `request_id` at last: it used to send none, which disabled the bridge's own idempotency for
+  exactly the traffic most likely to be redelivered.
+- **A `WatchRegistered` wire envelope and a `.received` watch state.** The watch had no
+  signal between "the phone took my request" and the finished answer, which can be minutes
+  later, because `runRelayTurn` does not return until the whole poll completes. An
+  `onAccepted` seam threads the bridge's 202 up through the relay to the phone's session
+  manager, which ships it to the wrist. `WatchConnectivityClient.deliver` matched only
+  `.reply` before, so the registration would have been decoded and dropped.
+
+### Changed
+- **The sync is conversation-keyed and runs in FOUR passes**, identically on iOS and macOS
+  (the two used to diverge on their update rules): legacy-bind a pre-upgrade thread to the
+  conversation whose `session_ids` contains its session, MERGE duplicates already on the
+  device, then plan and apply adopt / update / delete-local, then save once. The order is
+  load-bearing: without the bind first, every pre-upgrade thread is classified unknown and
+  adopted as a duplicate of itself. `SessionReconciler` is now `ConversationReconciler`.
+- **The merge pass repairs duplicates already on a device.** It collapses each group of
+  threads sharing one conversation id into the group's oldest member, moving turns across
+  under `TranscriptMerge`, resolving favorite and archived by the higher last-writer-wins
+  clock, and taking the maximum activity stamp. It keys on the conversation id and NEVER on
+  the title, because two conversations can legitimately share one. It runs on every sync, is
+  a no-op once clean, and is what un-orphans the copy the old matcher silently dropped
+  (`bySession[sid] = t`, last write wins) so it was never title-refreshed, never
+  flag-reconciled, and never tombstone-deleted, yet stayed in the list.
+- **`refreshSessions` is guarded against overlapping runs** on both platforms. `ContentView`
+  fires one on `onAppear` and another on `scenePhase == .active`, and both could leave
+  holding the same stale ETag, fetch the same list, and apply the same plan twice.
+- **The hydration cursor is the bridge's opaque `"<segment>:<offset>"` string, keyed on the
+  conversation, and presence-based on BOTH platforms.** A conversation can span several
+  transcript files, so a byte offset is not a sufficient position. `MacCursorStore.offset`
+  also used to return 0 for an absent key, so the Mac could not tell "never hydrated" from
+  "hydrated from byte zero", precisely the ambiguity that let a hydrate re-import turns
+  already on screen. The v1 byte-offset keys are purged once (carefully: the v1 prefix is a
+  PREFIX of the v2 one, so the purge filters v2 out explicitly).
+- **`advanceCursorAfterDelivery` now really hydrates.** It used to seed the cursor to the
+  end without reading anything, a hack that existed only because re-reading would re-append
+  the turns just rendered. With the key-based merge, hydrating right after a delivery is
+  idempotent AND strictly better: it is what binds the delivered turns' keys in the first
+  place.
+- **`requestId` and `conversationId` are required on the send path**, with no overload that
+  drops either. Collapsing the overloads is the point: a forwarding default is exactly how
+  the wire lost its idempotency key (the base `send` and the watch relay each passed nil).
+- **Favorite / archive flags, remote deletion, and the title store all key on the
+  conversation.** The push gate moved from `sessionId` to `conversationId` and NARROWED: a
+  thread acquires its conversation id at creation, so a new conversation syncs its flags from
+  its first turn instead of waiting for a reply to land.
+- **`BridgeCompatibility.minimumBridgeVersion` is `0.33.0`.** Without the conversation
+  registry the bridge returns no thread identity at accept time, and the client cannot tell
+  its own conversation from a new one.
+- **The Mac prunes abandoned ⌘N threads on sidebar appear.** `MacRootView.newChat` inserts
+  AND SAVES immediately, so an unused new chat is a persisted empty row and they accumulate
+  and read exactly like duplicates. The rule is deliberately narrow (no turns, never sent,
+  never accepted, not running) so it can never take a thread holding history or one whose
+  turn is in flight. The Mac window subtitle also stopped conflating "not yet started" with
+  "accepted but no session id yet".
+- **The watch ack is sent on every delivery path.** It used to ride only the `sendMessage`
+  reply handler, so a request delivered by `transferUserInfo` (the queued-redelivery case the
+  durable dedup exists for) was never acknowledged at all.
+
+### Known limitation
+- macOS still gates on a single global `isRunning` plus `activeThreadID`, so only one turn
+  can run at a time there. Pre-existing, untouched by this change.
+
 ## [Bridge 0.33.0] - 2026-07-25
 
 ### Added

@@ -14,6 +14,7 @@ final class PromptOverrideTests: XCTestCase {
 
     func testRequestIncludesInstructionsWhenCustomized() {
         let r = JesseClient.makeRequest(mode: .ask, text: "hi", sessionId: nil,
+                                        conversationId: "11111111-2222-4333-8444-555555555555",
                                         voice: false, instructions: "CUSTOM WRAP",
                                         floorOverride: nil, attachments: [])
         XCTAssertEqual(r.instructions, "CUSTOM WRAP")
@@ -21,6 +22,7 @@ final class PromptOverrideTests: XCTestCase {
 
     func testRequestOmitsInstructionsWhenNil() {
         let r = JesseClient.makeRequest(mode: .ask, text: "hi", sessionId: nil,
+                                        conversationId: "11111111-2222-4333-8444-555555555555",
                                         voice: false, instructions: nil,
                                         floorOverride: nil, attachments: [])
         XCTAssertNil(r.instructions, "an absent override must omit the field")
@@ -32,6 +34,7 @@ final class PromptOverrideTests: XCTestCase {
 
     func testRequestOmitsBlankInstructions() {
         let r = JesseClient.makeRequest(mode: .tell, text: "hi", sessionId: nil,
+                                        conversationId: "11111111-2222-4333-8444-555555555555",
                                         voice: false, instructions: "   \n\t",
                                         floorOverride: nil, attachments: [])
         XCTAssertNil(r.instructions, "a blank override means use the default → omit")
@@ -39,6 +42,7 @@ final class PromptOverrideTests: XCTestCase {
 
     func testRequestVoiceAndOverrideCoexist() {
         let r = JesseClient.makeRequest(mode: .ask, text: "hi", sessionId: nil,
+                                        conversationId: "11111111-2222-4333-8444-555555555555",
                                         voice: true, instructions: "VOICE WRAP",
                                         floorOverride: nil, attachments: [])
         XCTAssertEqual(r.voice, true)
@@ -47,6 +51,7 @@ final class PromptOverrideTests: XCTestCase {
 
     func testRequestIncludesFloorOverrideWhenSet() {
         let r = JesseClient.makeRequest(mode: .ask, text: "hi", sessionId: nil,
+                                        conversationId: "11111111-2222-4333-8444-555555555555",
                                         voice: false, instructions: nil,
                                         floorOverride: "CUSTOM FLOOR", attachments: [])
         XCTAssertEqual(r.floorOverride, "CUSTOM FLOOR")
@@ -54,10 +59,12 @@ final class PromptOverrideTests: XCTestCase {
 
     func testRequestOmitsFloorOverrideWhenNilOrBlank() {
         let nilCase = JesseClient.makeRequest(mode: .ask, text: "hi", sessionId: nil,
+                                              conversationId: "11111111-2222-4333-8444-555555555555",
                                               voice: false, instructions: nil,
                                               floorOverride: nil, attachments: [])
         XCTAssertNil(nilCase.floorOverride, "an absent floor override must omit the field")
         let blankCase = JesseClient.makeRequest(mode: .ask, text: "hi", sessionId: nil,
+                                                conversationId: "11111111-2222-4333-8444-555555555555",
                                                 voice: false, instructions: nil,
                                                 floorOverride: "  \n\t", attachments: [])
         XCTAssertNil(blankCase.floorOverride, "a blank floor override means use the default → omit")
@@ -65,6 +72,7 @@ final class PromptOverrideTests: XCTestCase {
 
     func testRequestFloorOverrideDoesNotDropInstructions() {
         let r = JesseClient.makeRequest(mode: .tell, text: "hi", sessionId: nil,
+                                        conversationId: "11111111-2222-4333-8444-555555555555",
                                         voice: false, instructions: "WRAP",
                                         floorOverride: "FLOOR", attachments: [])
         XCTAssertEqual(r.instructions, "WRAP")
@@ -206,15 +214,17 @@ final class PromptOverrideTests: XCTestCase {
         private(set) var capturedVoice = false
         var onSend: (() -> Void)?
 
-        func send(mode: JesseMode, text: String, sessionId: String?, voice: Bool,
+        func send(mode: JesseMode, text: String, sessionId: String?,
+                  conversationId: String, voice: Bool,
                   instructions: String?, floorOverride: String?,
-                  attachments: [JesseAttachment]) async throws -> JesseSendResult {
+                  attachments: [JesseAttachment], requestId: UUID,
+                  model: String?) async throws -> JesseSendResult {
             sendCalled = true
             capturedInstructions = instructions
             capturedFloor = floorOverride
             capturedVoice = voice
             onSend?()
-            return .reply(JesseReply(text: "ok", sessionId: nil), jobId: nil)
+            return .reply(JesseReply(text: "ok", sessionId: nil), jobId: nil, conversationId: nil)
         }
 
         func result(jobId: String) async throws -> JesseResultState {

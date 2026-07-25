@@ -135,7 +135,8 @@ final class ModelSwitchWireTests: XCTestCase {
         // byte-for-byte today's behavior for an older client).
         func encodedKeys(model: String?) throws -> [String: Any] {
             let req = JesseBridgeClient.makeRequest(
-                mode: .ask, text: "hi", sessionId: nil, voice: false,
+                mode: .ask, text: "hi", sessionId: nil,
+                conversationId: "11111111-2222-4333-8444-555555555555", voice: false,
                 instructions: nil, floorOverride: nil, attachments: [], model: model)
             let data = try JesseBridgeClient.encodeBody(req)
             return try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])

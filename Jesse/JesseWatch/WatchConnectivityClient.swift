@@ -20,6 +20,7 @@ final class WatchConnectivityClient: NSObject, WatchRequestSending {
     static let shared = WatchConnectivityClient()
 
     var onReply: ((WatchReply) -> Void)?
+    var onRegistered: ((WatchRegistered) -> Void)?
 
     private var session: WCSession?
 
@@ -78,12 +79,24 @@ final class WatchConnectivityClient: NSObject, WatchRequestSending {
         }
     }
 
-    /// Hop an already-decoded (Sendable) reply to the main actor. Decoding happens
-    /// on the delegate thread so the non-Sendable `[String: Any]` never crosses the
-    /// isolation boundary — only the `Sendable` `WatchReply` does.
+    /// Hop an already-decoded (Sendable) message to the main actor. Decoding happens on the
+    /// delegate thread so the non-Sendable `[String: Any]` never crosses the isolation
+    /// boundary: only the `Sendable` value does.
+    ///
+    /// Both phone-to-watch envelopes are handled here: the reply, and the REGISTRATION that
+    /// says the bridge accepted the turn. Before this, only `.reply` was matched, so the
+    /// registration would have been decoded and then silently dropped.
     private nonisolated func deliver(_ message: WatchMessage?) {
-        guard case .reply(let reply)? = message else { return }
-        Task { @MainActor in self.onReply?(reply) }
+        switch message {
+        case .reply(let reply)?:
+            Task { @MainActor in self.onReply?(reply) }
+        case .registered(let registration)?:
+            Task { @MainActor in self.onRegistered?(registration) }
+        case .request?, .ack?, nil:
+            // A request is never sent to the watch, and the phone-received ack only means the
+            // phone has the request; the registration above is the signal that matters.
+            break
+        }
     }
 }
 

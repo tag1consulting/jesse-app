@@ -32,7 +32,12 @@ final class WatchTurnHandler {
     /// Resolve the request to text (transcribe audio, or use the dictated fallback),
     /// relay it through `WatchRelay`, and map the outcome to a `WatchReply`. Never
     /// throws — every failure becomes an `ok: false` reply with a user-safe message.
-    func handle(_ request: WatchRequest, context: ModelContext) async -> WatchReply {
+    ///
+    /// `onAccepted` fires with the conversation id the instant the BRIDGE accepts the turn,
+    /// which is minutes before this function returns. Without it the watch would have no
+    /// signal between "the phone took my request" and the finished answer.
+    func handle(_ request: WatchRequest, context: ModelContext,
+                onAccepted: @escaping (String) -> Void = { _ in }) async -> WatchReply {
         let text: String
         if let dictated = request.transcript?.trimmingCharacters(in: .whitespacesAndNewlines),
            !dictated.isEmpty {
@@ -52,7 +57,7 @@ final class WatchTurnHandler {
 
         let mode: JesseMode = (request.mode == .tell) ? .tell : .ask
         let turn = RelayedTurn(requestId: request.requestId, text: text, mode: mode, voice: true)
-        switch await relay.relay(turn, context: context) {
+        switch await relay.relay(turn, context: context, onAccepted: onAccepted) {
         case .delivered(let result):
             return WatchReply(requestId: request.requestId, ok: true,
                               displayText: result.displayText, spokenText: result.spokenText,
@@ -98,10 +103,13 @@ final class PhoneWatchConnectivity: NSObject {
         session = s
     }
 
-    // MARK: - Reply delivery (two paths, watch de-dupes by requestId)
+    // MARK: - Delivery to the watch (two paths, watch de-dupes by requestId)
 
-    private func send(_ reply: WatchReply) {
-        let dict = WatchMessage.reply(reply).encode()
+    /// Ship one phone-to-watch envelope on BOTH paths. Generalised from a reply-only sender so
+    /// the acceptance registration rides the exact same reliable + immediate delivery rather
+    /// than needing a second, weaker private sender.
+    private func send(_ message: WatchMessage) {
+        let dict = message.encode()
         guard let session, session.activationState == .activated else { return }
         // Reliable, background-delivered source of truth — survives the watch app not
         // being frontmost.
@@ -110,16 +118,28 @@ final class PhoneWatchConnectivity: NSObject {
         // duplicate by requestId.
         if session.isReachable {
             session.sendMessage(dict, replyHandler: nil) { error in
-                Log.run.error("watch reply sendMessage failed: \(error.localizedDescription)")
+                Log.run.error("watch send failed: \(error.localizedDescription)")
             }
         }
     }
 
-    /// Decode an incoming request, run the turn, and send the reply back.
-    private func process(_ request: WatchRequest) {
+    /// Decode an incoming request, run the turn, and send the reply back. The bridge's
+    /// acceptance is forwarded to the watch as soon as it happens, so the wrist can stop
+    /// showing "Thinking" long before the answer lands.
+    ///
+    /// The `WatchAck` is also sent here, on EVERY path. It used to ride only the `sendMessage`
+    /// reply handler, which meant a request delivered by `transferUserInfo` (the queued
+    /// redelivery case) was never acknowledged at all.
+    private func process(_ request: WatchRequest, ackNow: Bool) {
         Task { @MainActor in
-            let reply = await handler.handle(request, context: context)
-            send(reply)
+            if ackNow {
+                send(.ack(WatchAck(requestId: request.requestId, accepted: true)))
+            }
+            let reply = await handler.handle(request, context: context) { [weak self] conversationId in
+                self?.send(.registered(WatchRegistered(requestId: request.requestId,
+                                                       conversationId: conversationId)))
+            }
+            send(.reply(reply))
         }
     }
 
@@ -160,24 +180,25 @@ extension PhoneWatchConnectivity: WCSessionDelegate {
             return
         }
         replyHandler(WatchMessage.ack(WatchAck(requestId: request.requestId, accepted: true)).encode())
-        Task { @MainActor in self.process(request) }
+        Task { @MainActor in self.process(request, ackNow: false) }
     }
 
     nonisolated func session(_ session: WCSession, didReceiveMessage message: [String: Any]) {
         guard case .request(let request)? = WatchMessage.decode(message) else { return }
-        Task { @MainActor in self.process(request) }
+        Task { @MainActor in self.process(request, ackNow: true) }
     }
 
     // Reliable/queued path: a request that rode `transferUserInfo` (e.g. sent while
     // the phone was unreachable).
     nonisolated func session(_ session: WCSession, didReceiveUserInfo userInfo: [String: Any]) {
         guard case .request(let request)? = WatchMessage.decode(userInfo) else { return }
-        Task { @MainActor in self.process(request) }
+        // The queued-redelivery path, which is exactly the one that used to get no ack.
+        Task { @MainActor in self.process(request, ackNow: true) }
     }
 
     // Audio delivered out-of-band as a file (clips too big for `sendMessage`).
     nonisolated func session(_ session: WCSession, didReceive file: WCSessionFile) {
         guard let request = request(fromFile: file) else { return }
-        Task { @MainActor in self.process(request) }
+        Task { @MainActor in self.process(request, ackNow: true) }
     }
 }

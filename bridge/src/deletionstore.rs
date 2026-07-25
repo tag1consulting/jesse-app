@@ -6,10 +6,10 @@ use crate::*;
 // deleted_ms (unix millis of an explicit delete). Deleting a session already
 // reclaims its transcript, but a device that adopted that session earlier gets no
 // signal and keeps a stale local copy. A tombstone is that signal: recorded on an
-// explicit delete, exposed on `GET /jesse/sessions`, so every device converges on
+// explicit delete, exposed on `GET /jesse/conversations`, so every device converges on
 // removals the same way they already converge on favorite and archived flags.
 //
-// A tombstone is recorded ONLY on the explicit delete route (`jesse_session_delete`),
+// A tombstone is recorded ONLY on the explicit delete route (`jesse_conversation_delete`),
 // NEVER on age-based GC: a device that was merely offline while a session aged out
 // must keep its local copy, so GC deliberately records nothing here.
 //
@@ -42,8 +42,11 @@ pub fn deletion_retention_ms(session_ttl_days: u64) -> u64 {
     days.saturating_mul(24 * 60 * 60 * 1000)
 }
 
-/// One deletion tombstone as exposed on the sessions list: the deleted session's
-/// id and the unix-millis time it was deleted.
+/// One deletion tombstone as exposed on the conversation list: the deleted id and the
+/// unix-millis time it was deleted.
+///
+/// The field is still named `session_id` because that is the key the store maps; the list
+/// handler relabels it `conversation_id` on the wire, which is the key space it now holds.
 #[derive(serde::Serialize, serde::Deserialize, Clone, PartialEq, Debug)]
 pub struct Tombstone {
     pub session_id: String,

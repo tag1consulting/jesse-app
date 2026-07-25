@@ -270,7 +270,8 @@ pub async fn run_ask_hosted_or_emergency(
     }
 
     // Attempt hosted — under the ACTIVE model (byte-for-byte today's turn for opus).
-    let (out, usage) = split_turn_usage(run_claude_streaming(cfg, prompt, sid, jobs, jid, active).await);
+    let (out, usage) =
+        split_turn_usage(run_claude_streaming(cfg, prompt, sid, jobs, jid, active).await);
     let out = apply_directives(out);
     match out {
         Ok(v) => {
@@ -459,7 +460,12 @@ pub async fn jesse(
     // default. Absent or blank `model` falls back to the stored default via
     // `resolve_active_model`, so an older client that omits the field is byte-for-byte
     // today's behavior. Resolved once here and moved into the spawned turn task below.
-    let active = match req.model.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+    let active = match req
+        .model
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
         Some(id) => st.resolve_requested_model(id)?,
         None => st.resolve_active_model(),
     };
@@ -1695,19 +1701,6 @@ pub fn app(state: AppState) -> Router {
         .route(
             "/jesse/conversation/:conversation_id/flags",
             post(jesse_conversation_flags),
-        )
-        // DEPRECATED session-keyed routes, kept for one release so the bridge can ship
-        // ahead of the apps. Each resolves through the conversation reverse index; all
-        // four are removed in PR 4.
-        .route("/jesse/sessions", get(jesse_sessions))
-        .route("/jesse/sessions/:session_id", get(jesse_session_hydrate))
-        .route(
-            "/jesse/session/:session_id",
-            axum::routing::delete(jesse_session_delete),
-        )
-        .route(
-            "/jesse/session/:session_id/flags",
-            post(jesse_session_flags),
         )
         .route("/jesse/title", post(jesse_title))
         .route("/jesse/meal-corrections", post(jesse_meal_corrections))

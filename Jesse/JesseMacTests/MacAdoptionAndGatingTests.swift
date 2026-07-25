@@ -35,11 +35,13 @@ final class MacAdoptionAndGatingTests: XCTestCase {
 
     func testTwoSameTitledSessionsAdoptAsTwoDistinctThreadsAndRows() async throws {
         let context = try MacTestFixtures.context()
-        let a = SessionSummary(sessionId: "sess-A", lastModified: 1_700_000_000,
-                               firstMessage: "Weekly sync", title: "Weekly sync")
-        let b = SessionSummary(sessionId: "sess-B", lastModified: 1_700_000_050,
-                               firstMessage: "Weekly sync", title: "Weekly sync")
-        let fake = MacFakeBridgeClient(sessions: .sessions([a, b], deleted: [], etag: "e1"))
+        let a = ConversationSummary(conversationId: "conv-A", sessionId: "sess-A",
+                                    sessionIds: ["sess-A"], lastModified: 1_700_000_000,
+                                    firstMessage: "Weekly sync", title: "Weekly sync")
+        let b = ConversationSummary(conversationId: "conv-B", sessionId: "sess-B",
+                                    sessionIds: ["sess-B"], lastModified: 1_700_000_050,
+                                    firstMessage: "Weekly sync", title: "Weekly sync")
+        let fake = MacFakeBridgeClient(conversations: .conversations([a, b], deleted: [], etag: "e1"))
 
         await coordinator(fake).refreshSessions(context: context)
 
@@ -47,6 +49,8 @@ final class MacAdoptionAndGatingTests: XCTestCase {
         XCTAssertEqual(all.count, 2, "two same-titled sessions adopt as two distinct threads")
         XCTAssertEqual(Set(all.map(\.id)).count, 2, "distinct object identities")
         XCTAssertEqual(Set(all.compactMap(\.sessionId)), ["sess-A", "sess-B"])
+        XCTAssertEqual(Set(all.compactMap(\.conversationId)), ["conv-A", "conv-B"],
+                       "and each holds the bridge's conversation id, never the other's")
 
         let layout = MacThreadListModel().layout(all, now: Date(timeIntervalSince1970: 1_700_000_100),
                                                  calendar: .current)
@@ -57,23 +61,32 @@ final class MacAdoptionAndGatingTests: XCTestCase {
 
     func testUpdateRefreshesServerTitleOnMatchedThread() async throws {
         let context = try MacTestFixtures.context()
-        let held = JesseThread(mode: .ask); held.sessionId = "sess-1"; held.aiTitle = "old"
+        // A PRE-UPGRADE row: a session id and no conversation id. The legacy-bind pass has to
+        // match it to the remote conversation whose alias list contains that session, or it is
+        // adopted as a duplicate of itself.
+        let held = JesseThread(mode: .ask)
+        held.conversationId = nil
+        held.sessionId = "sess-1"
+        held.aiTitle = "old"
         context.insert(held); try context.save()
 
-        let summary = SessionSummary(sessionId: "sess-1", lastModified: 1_700_000_000,
-                                     firstMessage: "hi", title: "fresh title")
-        let fake = MacFakeBridgeClient(sessions: .sessions([summary], deleted: [], etag: "e1"))
+        let summary = ConversationSummary(conversationId: "conv-1", sessionId: "sess-1",
+                                          sessionIds: ["sess-1"], lastModified: 1_700_000_000,
+                                          firstMessage: "hi", title: "fresh title")
+        let fake = MacFakeBridgeClient(conversations: .conversations([summary], deleted: [], etag: "e1"))
         await coordinator(fake).refreshSessions(context: context)
 
         XCTAssertEqual(threads(context).count, 1, "a matched session updates, it does not duplicate")
         XCTAssertEqual(held.aiTitle, "fresh title")
+        XCTAssertEqual(held.conversationId, "conv-1", "and it is now bound to the conversation")
     }
 
     func testAdoptIsIdempotentAcrossRefreshes() async throws {
         let context = try MacTestFixtures.context()
-        let summary = SessionSummary(sessionId: "sess-1", lastModified: 1_700_000_000,
-                                     firstMessage: "hi", title: nil)
-        let fake = MacFakeBridgeClient(sessions: .sessions([summary], deleted: [], etag: "e1"))
+        let summary = ConversationSummary(conversationId: "conv-1", sessionId: "sess-1",
+                                          sessionIds: ["sess-1"], lastModified: 1_700_000_000,
+                                          firstMessage: "hi", title: nil)
+        let fake = MacFakeBridgeClient(conversations: .conversations([summary], deleted: [], etag: "e1"))
         let coord = coordinator(fake)
 
         await coord.refreshSessions(context: context)
@@ -104,7 +117,7 @@ final class MacAdoptionAndGatingTests: XCTestCase {
         let thread = JesseThread(mode: .ask); context.insert(thread); try context.save()
         let sid = "sess-\(UUID().uuidString)"; defer { MacCursorStore.clear(sid) }
         let fake = MacFakeBridgeClient(
-            sendResult: .reply(JesseReply(text: "reply from jesse", sessionId: sid), jobId: nil))
+            sendResult: .reply(JesseReply(text: "reply from jesse", sessionId: sid), jobId: nil, conversationId: nil))
         let coord = coordinator(fake)
 
         await coord.send(text: "hello", mode: .ask, thread: thread, context: context)

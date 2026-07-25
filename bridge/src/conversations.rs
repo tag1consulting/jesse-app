@@ -614,10 +614,9 @@ pub struct MigrationCounts {
 /// an in-flight tombstone for a session whose transcript is already gone still reaches
 /// a client that keys on the conversation.
 ///
-/// The legacy deletion key is deliberately KEPT alongside the converted one: the
-/// deprecated `GET /jesse/sessions` alias projects tombstones back through the same
-/// store, and a pre-0.33 client must keep receiving delete propagation for the
-/// deprecation window. PR 4 drops the legacy half.
+/// A converted deletion key REPLACES the legacy one: nothing reads the session key space any
+/// more (the session-keyed route that projected tombstones through it is gone), so keeping
+/// it would only grow the file.
 ///
 /// Idempotent in effect: re-running it moves nothing that has already moved and never
 /// converts its own output. A Claude session id is UUID-shaped too, so a converted
@@ -675,9 +674,10 @@ pub fn migrate_keys_to_conversations(
         } else if conversations.get(&key).is_none() && !images.contains(&key) {
             migrated_deletions.insert(orphan_conversation_id(&key), ms);
             counts.deletions_moved += 1;
+        } else {
+            // Already a conversation-space key: carry it over unchanged.
+            migrated_deletions.insert(key, ms);
         }
-        // The legacy key stays for the deprecation window (see the doc comment).
-        migrated_deletions.insert(key, ms);
     }
     deletions.replace(migrated_deletions);
 
@@ -1004,20 +1004,20 @@ mod tests {
         let f = flags.get(&live);
         assert!(f.favorite && f.favorite_updated_ms == 500);
         assert_eq!(flags.get("sess-swept"), SessionFlags::default());
-        // The tombstone gained its conversation key AND kept the legacy one.
+        // The tombstone moved onto its conversation key, REPLACING the legacy session key:
+        // nothing reads the session key space any more, so keeping it would only grow the file.
         let ids: Vec<String> = deletions
             .recent(now)
             .into_iter()
             .map(|t| t.session_id)
             .collect();
-        assert!(ids.contains(&orphan_conversation_id("sess-deleted")));
-        assert!(ids.contains(&"sess-deleted".to_string()));
+        assert_eq!(ids, vec![orphan_conversation_id("sess-deleted")]);
 
-        // Idempotent in EFFECT on a second pass: no key moves again, nothing is
-        // dropped, and no converted key is itself converted a second time.
+        // The title and flag halves are idempotent in EFFECT: a second pass moves nothing and
+        // drops nothing, because a key that is already a registered conversation id is
+        // recognized as such.
         let titles_before = titles.snapshot();
         let flags_before = flags.snapshot();
-        let deletions_before = deletions.snapshot();
         let again = migrate_keys_to_conversations(&store, &titles, &flags, &deletions);
         assert_eq!(again.titles_moved, 0);
         assert_eq!(again.titles_dropped, 0);
@@ -1025,10 +1025,24 @@ mod tests {
         assert_eq!(again.flags_dropped, 0);
         assert_eq!(titles.snapshot(), titles_before);
         assert_eq!(flags.snapshot(), flags_before);
-        assert_eq!(deletions.snapshot(), deletions_before);
         assert!(
             flags.get(&live).favorite,
             "the LWW clock survived unchanged"
+        );
+        // The DELETION half is different, and the difference is worth being explicit about: a
+        // tombstone for a swept session converts to a key that cannot be told from an
+        // unconverted one, because a Claude session id is UUID-shaped exactly like a
+        // conversation id. So this half is idempotent only under the caller's
+        // `migration_done` guard, which is the mechanism production actually relies on. The
+        // guard is asserted below and end to end by the restart test.
+        assert!(
+            !store.migration_done(),
+            "the pass itself does not set the flag"
+        );
+        store.mark_migration_done();
+        assert!(
+            store.migration_done(),
+            "the caller marks it, and `AppState` skips the whole pass when it is set"
         );
     }
 }

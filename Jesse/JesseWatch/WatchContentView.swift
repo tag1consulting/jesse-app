@@ -65,6 +65,16 @@ struct WatchContentView: View {
             Text("Listening…").font(.footnote).foregroundStyle(.secondary)
         case .thinking:
             Text("Jesse is thinking…").font(.footnote).foregroundStyle(.secondary)
+        case .received:
+            // The bridge has the turn, so the answer is coming even if the phone is put away.
+            // Standard watchOS only: the existing spinner plus one secondary footnote line, no
+            // custom animation and no new colour.
+            VStack(spacing: 4) {
+                ProgressView()
+                Text("Received").font(.footnote).foregroundStyle(.secondary)
+            }
+            .accessibilityElement(children: .combine)
+            .accessibilityLabel("Received by Jesse. Your message is saved and will be answered.")
         case .queued:
             Text("Will send when your phone is reachable.")
                 .font(.footnote).foregroundStyle(.secondary)

@@ -21,10 +21,12 @@ private final class HealthFakeClient: JesseClientProtocol, @unchecked Sendable {
         return scripted
     }
 
-    func send(mode: JesseMode, text: String, sessionId: String?, voice: Bool,
+    func send(mode: JesseMode, text: String, sessionId: String?,
+              conversationId: String, voice: Bool,
               instructions: String?, floorOverride: String?,
-              attachments: [JesseAttachment]) async throws -> JesseSendResult {
-        .running(jobId: "unused")
+              attachments: [JesseAttachment], requestId: UUID,
+              model: String?) async throws -> JesseSendResult {
+        .running(jobId: "unused", conversationId: nil)
     }
     func result(jobId: String) async throws -> JesseResultState { .running }
     func cancelJob(jobId: String) async throws {}
@@ -147,9 +149,18 @@ final class BridgeCompatibilityTests: XCTestCase {
     }
 
     func testDefaultMinimumIsAParseableTripleTheCurrentBridgeSatisfies() {
-        // The shipped floor must itself be a clean triple, and the current bridge
-        // (0.7.0) must not trip its own app's warning.
-        XCTAssertNotNil(SemVer(BridgeCompatibility.minimumBridgeVersion))
-        XCTAssertFalse(BridgeCompatibility.isOutdated(bridgeVersion: "0.7.0"))
+        // The shipped floor must itself be a clean triple, and a bridge AT the floor must not
+        // trip its own app's warning. The fixture tracks the floor rather than pinning an old
+        // version: the app now requires the conversation registry (bridge 0.33.0), because
+        // without it every turn's thread identity comes back unnamed and the client cannot
+        // tell its own conversation from a new one.
+        let floor = BridgeCompatibility.minimumBridgeVersion
+        XCTAssertNotNil(SemVer(floor))
+        XCTAssertFalse(BridgeCompatibility.isOutdated(bridgeVersion: floor),
+                       "a bridge exactly at the floor is not outdated")
+        XCTAssertFalse(BridgeCompatibility.isOutdated(bridgeVersion: "0.34.0"),
+                       "and a newer one certainly is not")
+        XCTAssertTrue(BridgeCompatibility.isOutdated(bridgeVersion: "0.32.0"),
+                      "the release before the registry IS outdated for this app")
     }
 }

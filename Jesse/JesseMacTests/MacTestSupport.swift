@@ -59,44 +59,61 @@ final class FakeKeychain: @unchecked Sendable {
 final class MacFakeBridgeClient: BridgeClientProtocol, @unchecked Sendable {
     private let lock = NSLock()
 
-    private var sessions: SessionsResult
+    private var conversations: ConversationsResult
     private var sendResult: JesseSendResult
-    /// Answers `hydrate(sessionId:after:)`. Throwing simulates a 404 / transport error.
-    private var hydrateHandler: (String, UInt64) throws -> (turns: [HydratedTurn], nextOffset: UInt64)
+    /// Answers `hydrate(conversationId:after:)`. Throwing simulates a 404 / transport error.
+    private var hydrateHandler: (String, String?) throws -> (turns: [HydratedTurn], nextCursor: String)
 
-    private var _hydrateCalls: [(sessionId: String, after: UInt64)] = []
+    private var _hydrateCalls: [(conversationId: String, after: String?)] = []
     private var _deleted: [String] = []
+    private var _sentConversationIds: [String] = []
 
-    var hydrateCalls: [(sessionId: String, after: UInt64)] { lock.withLock { _hydrateCalls } }
+    var hydrateCalls: [(conversationId: String, after: String?)] { lock.withLock { _hydrateCalls } }
     var deletedCalls: [String] { lock.withLock { _deleted } }
+    var sentConversationIds: [String] { lock.withLock { _sentConversationIds } }
 
     nonisolated init(
-        sessions: SessionsResult = .notModified,
-        sendResult: JesseSendResult = .reply(JesseReply(text: "reply", sessionId: "sess"), jobId: nil),
-        hydrate: @escaping (String, UInt64) throws -> (turns: [HydratedTurn], nextOffset: UInt64) = { _, after in ([], after) }
+        conversations: ConversationsResult = .notModified,
+        sendResult: JesseSendResult = .reply(JesseReply(text: "reply", sessionId: "sess"),
+                                            jobId: nil, conversationId: nil),
+        hydrate: @escaping (String, String?) throws -> (turns: [HydratedTurn], nextCursor: String)
+            = { _, after in ([], after ?? "0:0") }
     ) {
-        self.sessions = sessions
+        self.conversations = conversations
         self.sendResult = sendResult
         self.hydrateHandler = hydrate
     }
 
     nonisolated var config: JesseConfig { JesseConfig(host: "studio", port: 8765, token: "tok") }
 
-    nonisolated func listSessions(since: UInt64?, etag: String?) async throws -> SessionsResult {
-        lock.withLock { sessions }
+    nonisolated func listConversations(since: UInt64?, etag: String?) async throws -> ConversationsResult {
+        lock.withLock { conversations }
     }
-    nonisolated func setFlags(sessionId: String, favorite: FlagWrite?, archived: FlagWrite?) async throws {}
-    nonisolated func deleteSession(_ sessionId: String) async throws {
-        lock.withLock { _deleted.append(sessionId) }
+    nonisolated func setFlags(conversationId: String, favorite: FlagWrite?, archived: FlagWrite?) async throws {}
+    nonisolated func deleteConversation(_ conversationId: String) async throws {
+        lock.withLock { _deleted.append(conversationId) }
     }
-    nonisolated func hydrate(sessionId: String, after: UInt64) async throws -> (turns: [HydratedTurn], nextOffset: UInt64) {
-        lock.withLock { _hydrateCalls.append((sessionId, after)) }
-        return try lock.withLock { try hydrateHandler(sessionId, after) }
+    nonisolated func hydrate(conversationId: String, after cursor: String?) async throws
+        -> (turns: [HydratedTurn], nextCursor: String) {
+        lock.withLock { _hydrateCalls.append((conversationId, cursor)) }
+        return try lock.withLock { try hydrateHandler(conversationId, cursor) }
     }
-    nonisolated func send(mode: JesseMode, text: String, sessionId: String?, voice: Bool,
+    nonisolated func send(mode: JesseMode, text: String, sessionId: String?,
+                          conversationId: String, voice: Bool,
                           instructions: String?, floorOverride: String?,
-                          attachments: [JesseRequest.Attachment], requestId: String?) async throws -> JesseSendResult {
-        lock.withLock { sendResult }
+                          attachments: [JesseRequest.Attachment], requestId: String,
+                          model: String?) async throws -> JesseSendResult {
+        lock.withLock {
+            _sentConversationIds.append(conversationId)
+            // Echo the id back the way the bridge does, so the Mac's adopt-and-stamp path is
+            // exercised rather than bypassed.
+            switch sendResult {
+            case let .reply(reply, jobId, _):
+                return .reply(reply, jobId: jobId, conversationId: conversationId)
+            case let .running(jobId, _):
+                return .running(jobId: jobId, conversationId: conversationId)
+            }
+        }
     }
     nonisolated func sendPrepared(_ request: JesseRequest) async throws -> JesseSendResult {
         lock.withLock { sendResult }
@@ -105,7 +122,7 @@ final class MacFakeBridgeClient: BridgeClientProtocol, @unchecked Sendable {
     nonisolated func stream(jobId: String) -> AsyncThrowingStream<JesseStreamEvent, Error> {
         AsyncThrowingStream { $0.finish() }
     }
-    nonisolated func title(text: String, sessionId: String?) async -> String? { nil }
+    nonisolated func title(text: String, conversationId: String?) async -> String? { nil }
     nonisolated func cancelJob(jobId: String) async throws {}
     nonisolated func health() async throws -> BridgeHealth { BridgeHealth(version: nil) }
     nonisolated func fetchDietSnapshot(date: String?) async throws -> DietSnapshot { throw DietFetchError.notConfigured }

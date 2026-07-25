@@ -2,15 +2,15 @@ use crate::*;
 
 // ---- Server-side session title store ---------------------------------------
 //
-// A single JSON file `<state_dir>/titles.json` mapping session_id → title, so a
-// conversation's minted title survives a bridge restart and `GET /jesse/sessions`
+// A single JSON file `<state_dir>/titles.json` mapping conversation_id -> title, so a
+// conversation's minted title survives a bridge restart and `GET /jesse/conversations`
 // can show it. Mirrors `DeviceStore`'s discipline exactly: atomic temp+rename
 // writes, mode 0600, best-effort (a write failure is logged, never fatal). With
 // no state dir configured the store is in-memory only — the same degradation the
 // job store and device store have — so titles are lost on restart in that mode.
 // Only the title text is ever written; never a secret.
 
-/// The session_id → title map. Cheaply shared behind an `Arc` in `AppState`.
+/// The conversation_id -> title map. Cheaply shared behind an `Arc` in `AppState`.
 pub struct TitleStore {
     map: Mutex<HashMap<String, String>>,
     // Where the map is persisted. `None` → in-memory only.

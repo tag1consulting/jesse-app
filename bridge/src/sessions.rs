@@ -1,12 +1,17 @@
 use crate::*;
 
-// ---- GET /jesse/sessions — the session list --------------------------------
+// ---- Transcripts on disk, and the conversations built over them --------------
 //
-// Threads are Claude Code sessions. Each session's transcript is one jsonl file
-// under `~/.claude/projects/<escaped-vault-path>/<session_id>.jsonl`, where the
-// filename stem IS the session_id. This endpoint enumerates those files for the
-// bridge's vault, newest first by mtime, with the first user turn as a snippet and
-// the stored title (if any). Read-only: it never writes a session file.
+// A Claude Code session's transcript is one jsonl file under
+// `~/.claude/projects/<escaped-vault-path>/<session_id>.jsonl`, where the filename stem IS
+// the session id. This module owns everything that reads those files: the path arithmetic,
+// the scan and its filters, the turn shaping, the GC sweep, and the conversation surface
+// (`GET /jesse/conversations`, hydration, delete, flags) rendered over them.
+//
+// A session id is deliberately NOT a thread identity: the CLI can fork it on resume, and a
+// dropped `--resume` mints a new one. The bridge-owned conversation record (see
+// [`conversations`]) is the identity, and it owns the ordered list of session ids bound to
+// it. Read-only except for the explicit delete route: the scan never writes a transcript.
 
 /// How many bytes of a session jsonl to scan for the first user turn. A real
 /// first user turn sits at the top of the file, so a bounded prefix suffices — we
@@ -307,24 +312,6 @@ pub fn resolve_resume_session<'a>(cfg: &Config, session_id: Option<&'a str>) -> 
         );
     }
     effective
-}
-
-/// One session summary in the DEPRECATED `GET /jesse/sessions` body, newest-first
-/// ordered by the caller. Projected from a [`ConversationSummary`] onto its current
-/// session id (a conversation with no session yet is dropped), so the old shape stays
-/// byte-compatible for one release while the canonical list is conversation-keyed.
-///
-/// Removed in PR 4 together with the route. Replaced by [`ConversationSummary`].
-#[derive(serde::Serialize, PartialEq, Debug)]
-pub struct SessionSummary {
-    pub session_id: String,
-    pub last_modified: u64,
-    pub first_message: Option<String>,
-    pub title: Option<String>,
-    pub favorite: bool,
-    pub favorite_updated_ms: u64,
-    pub archived: bool,
-    pub archived_updated_ms: u64,
 }
 
 /// Pull the user text out of a `{"type":"user","message":{...}}` transcript line.
@@ -705,9 +692,9 @@ pub fn if_none_match_matches(header: &str, etag: &str) -> bool {
         .any(|candidate| candidate == "*" || candidate == etag)
 }
 
-/// Query params for the conversation list (and its deprecated session alias).
+/// Query params for the conversation list.
 #[derive(Deserialize)]
-pub struct SessionsQuery {
+pub struct ConversationsQuery {
     /// Only conversations with `last_modified` strictly greater than this (unix
     /// seconds).
     #[serde(default)]
@@ -716,8 +703,7 @@ pub struct SessionsQuery {
 
 /// Serve a list body under a strong ETag: a quoted lowercase hex SHA-256 over the
 /// exact bytes, with `If-None-Match` (honoring `*` and a comma list) short-circuiting
-/// to a `304` carrying the ETag and no body. Shared by the conversation list and its
-/// deprecated session alias so the two cannot drift on caching behavior.
+/// to a `304` carrying the ETag and no body.
 fn etag_list_response(headers: &HeaderMap, body: String) -> Response {
     let etag = strong_etag(&body);
     if let Some(inm) = headers
@@ -760,7 +746,7 @@ fn etag_list_response(headers: &HeaderMap, body: String) -> Response {
 pub async fn jesse_conversations(
     State(st): State<AppState>,
     headers: HeaderMap,
-    Query(params): Query<SessionsQuery>,
+    Query(params): Query<ConversationsQuery>,
 ) -> Result<Response, ApiError> {
     check_auth(&headers, &st.cfg.token)?;
     if !st.limiter.allow() {
@@ -787,59 +773,12 @@ pub async fn jesse_conversations(
     Ok(etag_list_response(&headers, body))
 }
 
-/// `GET /jesse/sessions` is DEPRECATED. Superseded by `GET /jesse/conversations`;
-/// removed in PR 4.
-///
-/// The old body shape, derived from the same registry by projecting each conversation
-/// onto its CURRENT session id and dropping any conversation that has none yet. Auth,
-/// rate limiting, `?since=`, and the strong-ETag / `If-None-Match` behavior are
-/// unchanged, so a pre-0.33 client keeps working untouched for one release.
-pub async fn jesse_sessions(
-    State(st): State<AppState>,
-    headers: HeaderMap,
-    Query(params): Query<SessionsQuery>,
-) -> Result<Response, ApiError> {
-    check_auth(&headers, &st.cfg.token)?;
-    if !st.limiter.allow() {
-        return Err((
-            StatusCode::TOO_MANY_REQUESTS,
-            "rate limit exceeded".to_string(),
-        ));
-    }
-
-    let dir = st.sessions_dir();
-    let now_ms = system_time_to_ms(SystemTime::now());
-    refresh_conversations(&dir, &st.conversations, now_ms);
-    let sessions: Vec<SessionSummary> =
-        list_conversations(&dir, &st.conversations, params.since, &st.titles, &st.flags)
-            .into_iter()
-            .filter_map(|c| {
-                c.session_id.map(|session_id| SessionSummary {
-                    session_id,
-                    last_modified: c.last_modified,
-                    first_message: c.first_message,
-                    title: c.title,
-                    favorite: c.favorite,
-                    favorite_updated_ms: c.favorite_updated_ms,
-                    archived: c.archived,
-                    archived_updated_ms: c.archived_updated_ms,
-                })
-            })
-            .collect();
-    let deleted = st.deletions.recent(now_ms);
-    let body = serde_json::to_string(&json!({ "sessions": sessions, "deleted": deleted }))
-        .unwrap_or_else(|_| r#"{"sessions":[],"deleted":[]}"#.to_string());
-    Ok(etag_list_response(&headers, body))
-}
-
-// ---- GET /jesse/sessions/{id} — transcript hydration -----------------------
+// ---- Transcript turn shaping -------------------------------------------------
 //
-// A client that never saw a session's earlier turns hydrates its history here. The
-// full transcript is the session's `<session_id>.jsonl`; this endpoint returns the
-// ordered, client-renderable turns (user utterances + visible assistant text),
-// wrapper-stripped exactly like the list snippet and shaped like a live SSE turn.
-// `?after=<byte offset>` returns only the bytes appended since — the jsonl is
-// append-only, so a reconnecting client re-syncs in one small round trip.
+// The shared primitives every hydrate goes through: how one jsonl line becomes a
+// renderable turn, and how a byte range of an append-only transcript becomes an ordered
+// list of them plus the offset to resume at. Pure and unit-tested directly, so the offset
+// math and the skip rules are asserted without touching a socket.
 
 /// One hydrated turn: a role, the visible text, and the transcript timestamp when
 /// present. `timestamp` is omitted from the JSON when a line carries none.
@@ -960,91 +899,6 @@ pub fn hydrate_from_file(
     let mut buf = Vec::new();
     file.read_to_end(&mut buf)?;
     Ok(parse_turns(&buf, after, session_id))
-}
-
-/// Query params for `GET /jesse/sessions/{id}`.
-#[derive(Deserialize)]
-pub struct HydrateQuery {
-    /// Return only content appended after this byte offset (the append-only delta
-    /// sync). Absent → the full transcript from offset 0.
-    #[serde(default)]
-    pub after: Option<u64>,
-}
-
-/// `GET /jesse/sessions/{session_id}` is DEPRECATED. Superseded by
-/// `GET /jesse/conversations/{conversation_id}/transcript`; removed in PR 4.
-///
-/// Hydrate one session's transcript into ordered, client-renderable turns. Same bearer
-/// auth and rate limiter as `/jesse/sessions`. Behavior is unchanged from before the
-/// conversation registry: a plain byte offset against that single file, and no
-/// `turn_key` on the returned turns (the field postdates this route).
-/// `?after=<byte offset>` returns only the turns appended since,
-/// with `next_offset` for the next round trip (the jsonl is append-only, so the
-/// offset math is exact and a reconnecting client syncs in one small call).
-///
-/// - **`404`** for an unknown id, and for a title-mint transcript (Wart 1 — a
-///   `POST /jesse/title` one-shot is not a real conversation; it is excluded from
-///   the list AND rejected here, identically to an unknown id).
-/// - **`400`** for a structurally-invalid id (not a plain filename component):
-///   path-traversal defense, rejected before the filesystem is touched, so a
-///   crafted id can never resolve outside the vault projects dir.
-/// - **Malformed / partial lines never 500** — they are skipped (a partial trailing
-///   line is returned on the next `?after=` call once complete).
-pub async fn jesse_session_hydrate(
-    State(st): State<AppState>,
-    UrlPath(session_id): UrlPath<String>,
-    headers: HeaderMap,
-    Query(params): Query<HydrateQuery>,
-) -> Result<Response, ApiError> {
-    check_auth(&headers, &st.cfg.token)?;
-    if !st.limiter.allow() {
-        return Err((
-            StatusCode::TOO_MANY_REQUESTS,
-            "rate limit exceeded".to_string(),
-        ));
-    }
-    // Path-traversal defense: a non-plain component can never name a file INSIDE the
-    // projects dir; reject it before the filesystem is touched (same posture as the
-    // DELETE endpoint), so a crafted id like `../../foo` can't escape the vault.
-    if !is_plain_session_component(&session_id) {
-        return Err((StatusCode::BAD_REQUEST, "invalid session id".to_string()));
-    }
-    let path = session_transcript_path(&st.cfg.home, &st.cfg.vault, &session_id);
-    if !path.is_file() {
-        return Err((StatusCode::NOT_FOUND, "unknown session".to_string()));
-    }
-    // Wart 1: a title-mint transcript is not a real conversation — 404 it, exactly as
-    // it is excluded from GET /jesse/sessions. Checked on the RAW first user turn.
-    if first_user_raw(&path)
-        .as_deref()
-        .map(is_title_mint_prompt)
-        .unwrap_or(false)
-    {
-        return Err((StatusCode::NOT_FOUND, "unknown session".to_string()));
-    }
-    let after = params.after.unwrap_or(0);
-    // `None`: this deprecated route keeps its pre-`turn_key` body shape byte for byte.
-    let (turns, next_offset) = hydrate_from_file(&path, after, None).map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("could not read session transcript: {e}"),
-        )
-    })?;
-    let body = serde_json::to_string(&json!({
-        "session_id": session_id,
-        "turns": turns,
-        "next_offset": next_offset,
-    }))
-    .unwrap_or_else(|_| r#"{"turns":[]}"#.to_string());
-    Ok((
-        StatusCode::OK,
-        [(
-            axum::http::header::CONTENT_TYPE,
-            "application/json".to_string(),
-        )],
-        body,
-    )
-        .into_response())
 }
 
 // ---- Conversation hydration -------------------------------------------------
@@ -1214,11 +1068,9 @@ pub async fn jesse_conversation_hydrate(
 /// and must never choke. Only a real I/O failure deleting a file that EXISTS is an
 /// error.
 ///
-/// Two key spaces are tombstoned: the conversation id, and the legacy session id of
-/// every bound transcript. The legacy half is not redundant. `forget` removes the
-/// reverse-index entries, so after the delete there is no conversation left to project
-/// a conversation-keyed tombstone back through, and a pre-0.33 client on the deprecated
-/// route would silently stop receiving delete propagation. PR 4 drops the legacy half.
+/// ONE tombstone, under the conversation id. A legacy session-keyed half existed only for
+/// the deprecation window, when a pre-0.33 client still read `GET /jesse/sessions`; with that
+/// route gone there is nothing left that reads the session key space.
 fn delete_conversation_core(st: &AppState, conversation_id: &str) -> Result<StatusCode, ApiError> {
     let dir = st.sessions_dir();
     let now_ms = system_time_to_ms(SystemTime::now());
@@ -1246,8 +1098,6 @@ fn delete_conversation_core(st: &AppState, conversation_id: &str) -> Result<Stat
                 ));
             }
         }
-        // The legacy key space, for a client still on the deprecated session route.
-        st.deletions.record(sid, now_ms);
     }
     // Drop any stashed title AND flags so the deleted conversation can't linger in
     // titles.json / flags.json and resurrect a stale title or favorite.
@@ -1316,133 +1166,6 @@ pub async fn jesse_conversation_flags(
     if st.conversations.get(&conversation_id).is_none() {
         return Err((StatusCode::NOT_FOUND, "unknown conversation".to_string()));
     }
-    let result = st.flags.apply(&conversation_id, &update);
-    Ok(Json(json!({
-        "favorite": result.favorite,
-        "favorite_updated_ms": result.favorite_updated_ms,
-        "archived": result.archived,
-        "archived_updated_ms": result.archived_updated_ms,
-    })))
-}
-
-/// `DELETE /jesse/session/{session_id}` is DEPRECATED. Superseded by
-/// `DELETE /jesse/conversation/{conversation_id}`; removed in PR 4.
-///
-/// Resolves the session through the conversation reverse index and delegates to the
-/// conversation delete, so an older client's delete removes the WHOLE conversation
-/// (every alias transcript) rather than one file of it. An id that resolves to no
-/// conversation falls back to deleting exactly that one file and tombstoning it, which
-/// is the pre-registry behavior.
-///
-/// **Idempotent**, as before: an unknown or already-gone id returns `204`, never an
-/// error. A structurally-invalid id (not a plain filename component) is a `400`.
-pub async fn jesse_session_delete(
-    State(st): State<AppState>,
-    UrlPath(session_id): UrlPath<String>,
-    headers: HeaderMap,
-) -> Result<StatusCode, ApiError> {
-    check_auth(&headers, &st.cfg.token)?;
-    // Defensive: a non-plain component can never name a session inside the projects
-    // dir; reject it up front so it can't reach `remove_file` (path traversal).
-    if !is_plain_session_component(&session_id) {
-        return Err((StatusCode::BAD_REQUEST, "invalid session id".to_string()));
-    }
-    // Adopt an as-yet-unregistered transcript first, so a legacy client's delete still
-    // removes the whole conversation rather than falling to the single-file path.
-    let dir = st.sessions_dir();
-    if st
-        .conversations
-        .conversation_for_session(&session_id)
-        .is_none()
-        && dir.join(format!("{session_id}.jsonl")).is_file()
-    {
-        refresh_conversations(
-            &dir,
-            &st.conversations,
-            system_time_to_ms(SystemTime::now()),
-        );
-    }
-    if let Some(conversation_id) = st.conversations.conversation_for_session(&session_id) {
-        return delete_conversation_core(&st, &conversation_id);
-    }
-    // No conversation owns it (already forgotten, or a synthetic id with no transcript):
-    // the pre-registry path, kept so a retrying drainer still converges.
-    let now_ms = system_time_to_ms(SystemTime::now());
-    match delete_session_file(&dir, &session_id) {
-        SessionDeleteOutcome::Deleted => {
-            st.titles.remove(&session_id);
-            st.flags.remove(&session_id);
-            st.deletions.record(&session_id, now_ms);
-            eprintln!("jesse-bridge: deleted unregistered session {session_id}");
-            Ok(StatusCode::NO_CONTENT)
-        }
-        SessionDeleteOutcome::AlreadyGone => {
-            // Idempotent: unknown / already-gone is success, not an error.
-            st.titles.remove(&session_id);
-            st.flags.remove(&session_id);
-            st.deletions.record(&session_id, now_ms);
-            eprintln!("jesse-bridge: session {session_id} already gone, no-op (idempotent)");
-            Ok(StatusCode::NO_CONTENT)
-        }
-        SessionDeleteOutcome::Failed(msg) => {
-            eprintln!("jesse-bridge: failed to delete session {session_id}: {msg}");
-            Err((
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("could not delete session: {msg}"),
-            ))
-        }
-    }
-}
-
-/// `POST /jesse/session/{session_id}/flags` is DEPRECATED. Superseded by
-/// `POST /jesse/conversation/{conversation_id}/flags`; removed in PR 4.
-///
-/// Resolves the session through the conversation reverse index and delegates, so an
-/// older client's favorite / archived write lands on the same conversation-keyed row
-/// every other device reads. Last-writer-wins semantics, the rate limiter, and the
-/// response shape are all unchanged.
-///
-/// - **`400`** for a structurally-invalid id (not a plain filename component):
-///   path-traversal defense, rejected before the filesystem is touched.
-/// - **`404`** for an id that resolves to no conversation, including a synthetic
-///   `local-` id, which has no transcript by construction. That matches the previous
-///   behavior, where a session with no transcript on disk was a `404`.
-pub async fn jesse_session_flags(
-    State(st): State<AppState>,
-    UrlPath(session_id): UrlPath<String>,
-    headers: HeaderMap,
-    Json(update): Json<FlagUpdate>,
-) -> Result<Json<Value>, ApiError> {
-    check_auth(&headers, &st.cfg.token)?;
-    if !st.limiter.allow() {
-        return Err((
-            StatusCode::TOO_MANY_REQUESTS,
-            "rate limit exceeded".to_string(),
-        ));
-    }
-    // Path-traversal defense: a non-plain component can never name a file inside the
-    // projects dir; reject it before the filesystem is touched (same as delete/hydrate).
-    if !is_plain_session_component(&session_id) {
-        return Err((StatusCode::BAD_REQUEST, "invalid session id".to_string()));
-    }
-    // Adopt the transcript first if it exists but was never registered, so an older
-    // client's flag write resolves rather than 404ing on a legacy conversation.
-    let dir = st.sessions_dir();
-    if st
-        .conversations
-        .conversation_for_session(&session_id)
-        .is_none()
-        && dir.join(format!("{session_id}.jsonl")).is_file()
-    {
-        refresh_conversations(
-            &dir,
-            &st.conversations,
-            system_time_to_ms(SystemTime::now()),
-        );
-    }
-    let Some(conversation_id) = st.conversations.conversation_for_session(&session_id) else {
-        return Err((StatusCode::NOT_FOUND, "unknown session".to_string()));
-    };
     let result = st.flags.apply(&conversation_id, &update);
     Ok(Json(json!({
         "favorite": result.favorite,

@@ -1507,11 +1507,17 @@ async fn provenance_rides_the_poll_result_and_matches_the_appended_badge() {
     assert_eq!(prov["route"], "hosted", "a plain hosted turn routes hosted");
     let badge = prov["badge"].as_str().expect("badge string present");
     // The hosted main turn names the ACTIVE model (the default is opus) plus its cost.
-    assert!(badge.starts_with("[opus"), "hosted badge names the active model: {badge}");
+    assert!(
+        badge.starts_with("[opus"),
+        "hosted badge names the active model: {badge}"
+    );
     assert!(badge.contains('$'), "hosted badge carries a cost: {badge}");
     // The structured provenance carries the model + a (possibly-zero) cost.
     assert_eq!(prov["model"], "opus", "active model on the hosted route");
-    assert!(prov["cost_usd"].is_number(), "cost rides the hosted provenance: {prov}");
+    assert!(
+        prov["cost_usd"].is_number(),
+        "cost rides the hosted provenance: {prov}"
+    );
     // The structured badge is byte-identical to what was appended to the reply text.
     let response = v["response"].as_str().unwrap();
     assert!(
@@ -3052,363 +3058,9 @@ async fn cancelling_a_queued_turn_frees_its_slot_and_never_spawns_claude() {
 
 // ---- GET /jesse/sessions ----------------------------------------------------
 
-#[tokio::test]
-async fn sessions_requires_auth() {
-    let st = test_state();
-    let resp = app(st)
-        .oneshot(sessions_request(None, None, None))
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
-}
-
-#[tokio::test]
-async fn sessions_empty_when_projects_dir_absent_with_stable_etag_and_304() {
-    // Point the vault at a path whose escaped projects dir does not exist → an
-    // empty list (never an error), a strong ETag, and a matching If-None-Match 304.
-    let cfg = Config {
-        vault: format!("/no/such/vault/{}", random_hex()),
-        ..test_config()
-    };
-    let st = AppState::new(cfg);
-
-    let resp = app(st.clone())
-        .oneshot(sessions_request(Some("Bearer test-token"), None, None))
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
-    let etag = resp
-        .headers()
-        .get("etag")
-        .unwrap()
-        .to_str()
-        .unwrap()
-        .to_string();
-    assert!(
-        etag.starts_with('"') && !etag.starts_with("W/"),
-        "strong etag: {etag}"
-    );
-    let body: Value = serde_json::from_str(&body_string(resp).await).unwrap();
-    assert_eq!(
-        body["sessions"],
-        serde_json::json!([]),
-        "absent projects dir → empty list"
-    );
-
-    // Same request with the ETag → 304 Not Modified, empty body.
-    let resp = app(st)
-        .oneshot(sessions_request(
-            Some("Bearer test-token"),
-            None,
-            Some(&etag),
-        ))
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), StatusCode::NOT_MODIFIED);
-    assert!(body_string(resp).await.is_empty(), "304 has an empty body");
-}
-
-#[tokio::test]
-async fn sessions_lists_a_real_transcript_with_first_message_and_title() {
-    // A throwaway HOME (via `cfg.home`, no global-env mutation) with a vault whose
-    // escaped projects dir holds one session.
-    let home = std::env::temp_dir().join(format!("jesse-home-{}", random_hex()));
-    let vault = format!("/vault/{}", random_hex());
-    let proj = home
-        .join(".claude")
-        .join("projects")
-        .join(escape_project_path(&vault));
-    std::fs::create_dir_all(&proj).unwrap();
-    std::fs::write(
-        proj.join("sess-42.jsonl"),
-        "{\"type\":\"system\"}\n{\"type\":\"user\",\"message\":{\"content\":\"what is on Today.md?\"}}\n",
-    )
-    .unwrap();
-
-    let cfg = Config {
-        home: home.to_string_lossy().into_owned(),
-        vault: vault.clone(),
-        state_dir: None,
-        ..test_config()
-    };
-    let st = AppState::new(cfg);
-    // Store a title for the session (as POST /jesse/title would). The title store is
-    // keyed on the CONVERSATION now, and `AppState::new` already adopted the transcript
-    // into one, so the key is looked up through the reverse index.
-    let conversation_id = st
-        .conversations
-        .conversation_for_session("sess-42")
-        .expect("the existing transcript was adopted into a conversation");
-    st.titles.set(&conversation_id, "Today Overview");
-
-    let resp = app(st)
-        .oneshot(sessions_request(Some("Bearer test-token"), None, None))
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
-    let body: Value = serde_json::from_str(&body_string(resp).await).unwrap();
-
-    let sessions = body["sessions"].as_array().unwrap();
-    assert_eq!(sessions.len(), 1);
-    assert_eq!(sessions[0]["session_id"], "sess-42");
-    assert_eq!(sessions[0]["first_message"], "what is on Today.md?");
-    assert_eq!(sessions[0]["title"], "Today Overview");
-    assert!(sessions[0]["last_modified"].as_u64().is_some());
-
-    let _ = std::fs::remove_dir_all(&home);
-}
-
 // ---- DELETE /jesse/session/{id} --------------------------------------------
 
-#[tokio::test]
-async fn session_delete_requires_auth() {
-    let st = test_state();
-    let resp = app(st)
-        .oneshot(session_delete_request(None, "some-session"))
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
-}
-
-#[tokio::test]
-async fn session_delete_unknown_id_is_idempotent_204() {
-    // An unknown / already-gone id is idempotent success (204), never an error —
-    // the app's durable delete-drainer and the GC sweep both retry safely.
-    let cfg = Config {
-        vault: format!("/no/such/vault/{}", random_hex()),
-        ..test_config()
-    };
-    let st = AppState::new(cfg);
-    let resp = app(st)
-        .oneshot(session_delete_request(
-            Some("Bearer test-token"),
-            "never-existed",
-        ))
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
-}
-
-// Deleting an EXISTING session removes its transcript, and the deleted session is
-// then no longer resumable. Uses a per-test `cfg.home` (no global-env mutation), so
-// it never races the claude-spawning turn tests.
-#[tokio::test]
-async fn session_delete_removes_transcript_and_makes_it_unresumable() {
-    let home = std::env::temp_dir().join(format!("jesse-home-{}", random_hex()));
-    let vault = format!("/vault/{}", random_hex());
-    let proj = home
-        .join(".claude")
-        .join("projects")
-        .join(escape_project_path(&vault));
-    std::fs::create_dir_all(&proj).unwrap();
-    let transcript = proj.join("sess-del.jsonl");
-    std::fs::write(
-        &transcript,
-        "{\"type\":\"user\",\"message\":{\"content\":\"hi\"}}\n",
-    )
-    .unwrap();
-
-    let cfg = Config {
-        home: home.to_string_lossy().into_owned(),
-        vault: vault.clone(),
-        state_dir: None,
-        ..test_config()
-    };
-    let st = AppState::new(cfg.clone());
-    let conversation_id = st
-        .conversations
-        .conversation_for_session("sess-del")
-        .expect("the existing transcript was adopted into a conversation");
-    st.titles.set(&conversation_id, "A Title");
-
-    // Before delete: the transcript exists and the session is resumable.
-    assert!(transcript.exists());
-    assert_eq!(
-        resolve_resume_session(&cfg, Some("sess-del")),
-        Some("sess-del")
-    );
-
-    let resp = app(st.clone())
-        .oneshot(session_delete_request(
-            Some("Bearer test-token"),
-            "sess-del",
-        ))
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
-
-    // The transcript is gone, the stashed title is dropped, and the session is no
-    // longer resumable (a resume now falls to a fresh session).
-    assert!(!transcript.exists(), "transcript file must be deleted");
-    assert!(
-        st.titles.get(&conversation_id).is_none(),
-        "stashed title must be dropped on delete"
-    );
-    assert!(
-        resolve_resume_session(&cfg, Some("sess-del")).is_none(),
-        "a deleted session must no longer be resumable"
-    );
-
-    // A repeat delete of the now-gone id is still idempotent success.
-    let resp2 = app(st)
-        .oneshot(session_delete_request(
-            Some("Bearer test-token"),
-            "sess-del",
-        ))
-        .await
-        .unwrap();
-    assert_eq!(
-        resp2.status(),
-        StatusCode::NO_CONTENT,
-        "repeat delete idempotent"
-    );
-
-    let _ = std::fs::remove_dir_all(&home);
-}
-
 // ---- Deletion tombstones (the `deleted` array on GET /jesse/sessions) -------
-
-#[tokio::test]
-async fn sessions_deleted_array_present_and_empty_by_default() {
-    // A bridge with no tombstones returns an empty `deleted` array (additive, always
-    // present) alongside `sessions`.
-    let cfg = Config {
-        vault: format!("/no/such/vault/{}", random_hex()),
-        ..test_config()
-    };
-    let st = AppState::new(cfg);
-    let resp = app(st)
-        .oneshot(sessions_request(Some("Bearer test-token"), None, None))
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
-    let body: Value = serde_json::from_str(&body_string(resp).await).unwrap();
-    assert_eq!(
-        body["deleted"],
-        serde_json::json!([]),
-        "no tombstones → empty deleted array"
-    );
-}
-
-#[tokio::test]
-async fn session_delete_records_a_tombstone_and_changes_the_sessions_etag() {
-    // An explicit delete records a durable tombstone that rides on GET /jesse/sessions
-    // as the `deleted` array, and adding it changes the strong ETag (so a cached 304
-    // is invalidated): the signal Prompt 10's app uses to converge removals.
-    let home = std::env::temp_dir().join(format!("jesse-home-{}", random_hex()));
-    let vault = format!("/vault/{}", random_hex());
-    let proj = home
-        .join(".claude")
-        .join("projects")
-        .join(escape_project_path(&vault));
-    std::fs::create_dir_all(&proj).unwrap();
-    std::fs::write(
-        proj.join("sess-keep.jsonl"),
-        "{\"type\":\"user\",\"message\":{\"content\":\"keep me\"}}\n",
-    )
-    .unwrap();
-    std::fs::write(
-        proj.join("sess-del.jsonl"),
-        "{\"type\":\"user\",\"message\":{\"content\":\"delete me\"}}\n",
-    )
-    .unwrap();
-
-    let cfg = Config {
-        home: home.to_string_lossy().into_owned(),
-        vault: vault.clone(),
-        state_dir: None,
-        ..test_config()
-    };
-    let st = AppState::new(cfg);
-
-    // Before delete: two sessions, an empty `deleted` array, capture the ETag.
-    let resp = app(st.clone())
-        .oneshot(sessions_request(Some("Bearer test-token"), None, None))
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
-    let etag_before = resp
-        .headers()
-        .get("etag")
-        .unwrap()
-        .to_str()
-        .unwrap()
-        .to_string();
-    let body: Value = serde_json::from_str(&body_string(resp).await).unwrap();
-    assert_eq!(body["sessions"].as_array().unwrap().len(), 2);
-    assert_eq!(body["deleted"], serde_json::json!([]));
-
-    // Delete one session.
-    let resp = app(st.clone())
-        .oneshot(session_delete_request(
-            Some("Bearer test-token"),
-            "sess-del",
-        ))
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
-
-    // After delete: `deleted` carries the tombstone, `sessions` no longer lists it,
-    // and the ETag changed.
-    let resp = app(st.clone())
-        .oneshot(sessions_request(Some("Bearer test-token"), None, None))
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
-    let etag_after = resp
-        .headers()
-        .get("etag")
-        .unwrap()
-        .to_str()
-        .unwrap()
-        .to_string();
-    assert_ne!(
-        etag_before, etag_after,
-        "adding a tombstone must change the strong ETag"
-    );
-    let body: Value = serde_json::from_str(&body_string(resp).await).unwrap();
-    let sessions = body["sessions"].as_array().unwrap();
-    assert_eq!(sessions.len(), 1, "the deleted session is no longer listed");
-    assert_eq!(sessions[0]["session_id"], "sess-keep");
-    let deleted = body["deleted"].as_array().unwrap();
-    // Two tombstones, deliberately: the deleted CONVERSATION's id, plus the legacy
-    // session id of the transcript that was bound to it. The legacy half is what keeps
-    // a pre-0.33 client on this deprecated route receiving delete propagation, since
-    // forgetting the record leaves nothing to project the conversation key back through.
-    let deleted_ids: Vec<&str> = deleted
-        .iter()
-        .map(|t| t["session_id"].as_str().unwrap())
-        .collect();
-    assert!(
-        deleted_ids.contains(&"sess-del"),
-        "the legacy session key is tombstoned: {deleted_ids:?}"
-    );
-    assert_eq!(deleted.len(), 2, "the conversation key is tombstoned too");
-    assert!(
-        deleted
-            .iter()
-            .all(|t| t["deleted_ms"].as_u64().unwrap() > 0),
-        "every tombstone carries a unix-millis delete time"
-    );
-
-    // The pre-delete ETag no longer matches (the cached 304 was invalidated): the
-    // same conditional request now returns a fresh 200, not 304.
-    let resp = app(st)
-        .oneshot(sessions_request(
-            Some("Bearer test-token"),
-            None,
-            Some(&etag_before),
-        ))
-        .await
-        .unwrap();
-    assert_eq!(
-        resp.status(),
-        StatusCode::OK,
-        "stale ETag → 200 (not a 304), because the tombstone changed the body"
-    );
-
-    let _ = std::fs::remove_dir_all(&home);
-}
 
 // Age-based GC reclaims a session past the TTL but records NO deletion tombstone: a
 // device merely offline while a session aged out must keep its local copy. Only an
@@ -3448,58 +3100,22 @@ async fn session_gc_records_no_tombstone() {
         "GC must record NO deletion tombstone"
     );
 
-    // And the sessions list shows an empty `deleted` array after GC.
+    // And the conversation list shows an empty `deleted` array after GC.
     let resp = app(st)
-        .oneshot(sessions_request(Some("Bearer test-token"), None, None))
+        .oneshot(conversations_request(Some("Bearer test-token"), None, None))
         .await
         .unwrap();
     let body: Value = serde_json::from_str(&body_string(resp).await).unwrap();
-    assert_eq!(body["deleted"], serde_json::json!([]), "no tombstone from GC");
+    assert_eq!(
+        body["deleted"],
+        serde_json::json!([]),
+        "no tombstone from GC"
+    );
 
     let _ = std::fs::remove_dir_all(&home);
 }
 
 // ---- POST /jesse/session/{id}/flags ----------------------------------------
-
-/// A throwaway HOME whose escaped vault projects dir holds one real `session_id`
-/// transcript; returns `(home, AppState)`. `state_dir` is None → flags are in-memory
-/// for the life of this AppState, which is all these endpoint tests need. Mirrors the
-/// session-list/delete test pattern (per-test `cfg.home`, no global-env mutation).
-fn flags_fixture(session_id: &str) -> (std::path::PathBuf, AppState) {
-    let home = std::env::temp_dir().join(format!("jesse-home-{}", random_hex()));
-    let vault = format!("/vault/{}", random_hex());
-    let proj = home
-        .join(".claude")
-        .join("projects")
-        .join(escape_project_path(&vault));
-    std::fs::create_dir_all(&proj).unwrap();
-    std::fs::write(
-        proj.join(format!("{session_id}.jsonl")),
-        "{\"type\":\"user\",\"message\":{\"content\":\"hi\"}}\n",
-    )
-    .unwrap();
-    let cfg = Config {
-        home: home.to_string_lossy().into_owned(),
-        vault,
-        state_dir: None,
-        ..test_config()
-    };
-    (home, AppState::new(cfg))
-}
-
-#[tokio::test]
-async fn session_flags_requires_auth() {
-    let st = test_state();
-    let resp = app(st)
-        .oneshot(session_flags_request(
-            None,
-            "some-session",
-            r#"{"favorite":true,"favorite_updated_ms":1}"#,
-        ))
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
-}
 
 #[tokio::test]
 async fn session_flags_unknown_id_is_404() {
@@ -3514,256 +3130,6 @@ async fn session_flags_unknown_id_is_404() {
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
-}
-
-#[tokio::test]
-async fn session_flags_rejects_a_path_traversal_id() {
-    // A crafted id that is not a plain filename component is a 400 before the
-    // filesystem is touched. Encoded slashes keep it a single routed path segment.
-    let (home, st) = flags_fixture("real");
-    let resp = app(st)
-        .oneshot(session_flags_request(
-            Some("Bearer test-token"),
-            "..%2f..%2fsecrets",
-            r#"{"favorite":true,"favorite_updated_ms":1}"#,
-        ))
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
-    let _ = std::fs::remove_dir_all(&home);
-}
-
-#[tokio::test]
-async fn session_flags_happy_path_sets_and_returns_flags() {
-    let (home, st) = flags_fixture("sess-f");
-    let resp = app(st.clone())
-        .oneshot(session_flags_request(
-            Some("Bearer test-token"),
-            "sess-f",
-            r#"{"favorite":true,"favorite_updated_ms":100,"archived":true,"archived_updated_ms":200}"#,
-        ))
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
-    let body: Value = serde_json::from_str(&body_string(resp).await).unwrap();
-    assert_eq!(body["favorite"], true);
-    assert_eq!(body["favorite_updated_ms"], 100);
-    assert_eq!(body["archived"], true);
-    assert_eq!(body["archived_updated_ms"], 200);
-    let _ = std::fs::remove_dir_all(&home);
-}
-
-#[tokio::test]
-async fn session_flags_partial_update_leaves_the_other_flag_untouched() {
-    // Set favorite first, then a body carrying ONLY archived; favorite (value + ts)
-    // must be preserved.
-    let (home, st) = flags_fixture("sess-p");
-    let _ = app(st.clone())
-        .oneshot(session_flags_request(
-            Some("Bearer test-token"),
-            "sess-p",
-            r#"{"favorite":true,"favorite_updated_ms":100}"#,
-        ))
-        .await
-        .unwrap();
-    let resp = app(st.clone())
-        .oneshot(session_flags_request(
-            Some("Bearer test-token"),
-            "sess-p",
-            r#"{"archived":true,"archived_updated_ms":50}"#,
-        ))
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
-    let body: Value = serde_json::from_str(&body_string(resp).await).unwrap();
-    assert_eq!(body["favorite"], true, "favorite value preserved");
-    assert_eq!(body["favorite_updated_ms"], 100, "favorite ts preserved");
-    assert_eq!(body["archived"], true, "archived set by the partial update");
-    assert_eq!(body["archived_updated_ms"], 50);
-    let _ = std::fs::remove_dir_all(&home);
-}
-
-#[tokio::test]
-async fn session_flags_lww_ignores_a_stale_write_over_the_endpoint() {
-    // End-to-end LWW: a newer write wins, an older one is ignored.
-    let (home, st) = flags_fixture("sess-lww");
-    let _ = app(st.clone())
-        .oneshot(session_flags_request(
-            Some("Bearer test-token"),
-            "sess-lww",
-            r#"{"favorite":true,"favorite_updated_ms":100}"#,
-        ))
-        .await
-        .unwrap();
-    // An OLDER write (ts 50) must not flip the value.
-    let resp = app(st.clone())
-        .oneshot(session_flags_request(
-            Some("Bearer test-token"),
-            "sess-lww",
-            r#"{"favorite":false,"favorite_updated_ms":50}"#,
-        ))
-        .await
-        .unwrap();
-    let body: Value = serde_json::from_str(&body_string(resp).await).unwrap();
-    assert_eq!(body["favorite"], true, "stale write ignored");
-    assert_eq!(body["favorite_updated_ms"], 100);
-    let _ = std::fs::remove_dir_all(&home);
-}
-
-#[tokio::test]
-async fn sessions_list_carries_flags_and_its_etag_changes_when_a_flag_changes() {
-    // The read path surfaces the flags AND folds them into the ETag: a fresh session
-    // lists false/0, and flipping a flag changes the body so a prior ETag no longer
-    // matches (no stale 304).
-    let (home, st) = flags_fixture("sess-e");
-
-    // First list: flags default to false/0; capture the ETag.
-    let resp = app(st.clone())
-        .oneshot(sessions_request(Some("Bearer test-token"), None, None))
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
-    let etag1 = resp
-        .headers()
-        .get("etag")
-        .unwrap()
-        .to_str()
-        .unwrap()
-        .to_string();
-    let body: Value = serde_json::from_str(&body_string(resp).await).unwrap();
-    let s0 = &body["sessions"][0];
-    assert_eq!(s0["session_id"], "sess-e");
-    assert_eq!(s0["favorite"], false);
-    assert_eq!(s0["favorite_updated_ms"], 0);
-    assert_eq!(s0["archived"], false);
-    assert_eq!(s0["archived_updated_ms"], 0);
-
-    // That ETag matches now (304).
-    let resp = app(st.clone())
-        .oneshot(sessions_request(
-            Some("Bearer test-token"),
-            None,
-            Some(&etag1),
-        ))
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), StatusCode::NOT_MODIFIED);
-
-    // Flip a flag.
-    let _ = app(st.clone())
-        .oneshot(session_flags_request(
-            Some("Bearer test-token"),
-            "sess-e",
-            r#"{"favorite":true,"favorite_updated_ms":100}"#,
-        ))
-        .await
-        .unwrap();
-
-    // The same If-None-Match no longer matches; the flag is in the body/ETag.
-    let resp = app(st.clone())
-        .oneshot(sessions_request(
-            Some("Bearer test-token"),
-            None,
-            Some(&etag1),
-        ))
-        .await
-        .unwrap();
-    assert_eq!(
-        resp.status(),
-        StatusCode::OK,
-        "changing a flag must invalidate the cached 304"
-    );
-    let body: Value = serde_json::from_str(&body_string(resp).await).unwrap();
-    assert_eq!(body["sessions"][0]["favorite"], true);
-    assert_eq!(body["sessions"][0]["favorite_updated_ms"], 100);
-
-    let _ = std::fs::remove_dir_all(&home);
-}
-
-#[tokio::test]
-async fn session_flags_survive_a_bridge_restart() {
-    // Persistence round-trip through the endpoint: write with a state dir configured,
-    // rebuild the store from that dir, and the flags are still there.
-    let home = std::env::temp_dir().join(format!("jesse-home-{}", random_hex()));
-    let vault = format!("/vault/{}", random_hex());
-    let proj = home
-        .join(".claude")
-        .join("projects")
-        .join(escape_project_path(&vault));
-    std::fs::create_dir_all(&proj).unwrap();
-    std::fs::write(
-        proj.join("sess-r.jsonl"),
-        "{\"type\":\"user\",\"message\":{\"content\":\"hi\"}}\n",
-    )
-    .unwrap();
-    let state_dir = std::env::temp_dir().join(format!("jesse-state-{}", random_hex()));
-    std::fs::create_dir_all(&state_dir).unwrap();
-    let cfg = Config {
-        home: home.to_string_lossy().into_owned(),
-        vault: vault.clone(),
-        state_dir: Some(state_dir.to_string_lossy().into_owned()),
-        ..test_config()
-    };
-    let st = AppState::new(cfg.clone());
-
-    let resp = app(st)
-        .oneshot(session_flags_request(
-            Some("Bearer test-token"),
-            "sess-r",
-            r#"{"favorite":true,"favorite_updated_ms":123}"#,
-        ))
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
-
-    // A fresh AppState over the same state dir reloads flags.json from disk, and
-    // rebuilds the reverse index so the same session still resolves to the same
-    // conversation (the deterministic v5 adoption id is what makes that hold).
-    let st2 = AppState::new(cfg);
-    let conversation_id = st2
-        .conversations
-        .conversation_for_session("sess-r")
-        .expect("the transcript resolves to the same conversation after a restart");
-    let reloaded = st2.flags.get(&conversation_id);
-    assert!(reloaded.favorite && reloaded.favorite_updated_ms == 123);
-
-    let _ = std::fs::remove_dir_all(&home);
-    let _ = std::fs::remove_dir_all(&state_dir);
-}
-
-#[tokio::test]
-async fn session_delete_drops_the_flags_row() {
-    // A deleted conversation must not resurrect a stale favorite: the flags row is
-    // dropped alongside the transcript and title on DELETE.
-    let (home, st) = flags_fixture("sess-d");
-    let _ = app(st.clone())
-        .oneshot(session_flags_request(
-            Some("Bearer test-token"),
-            "sess-d",
-            r#"{"favorite":true,"favorite_updated_ms":100}"#,
-        ))
-        .await
-        .unwrap();
-    let conversation_id = st
-        .conversations
-        .conversation_for_session("sess-d")
-        .expect("the existing transcript was adopted into a conversation");
-    assert!(
-        st.flags.get(&conversation_id).favorite,
-        "flag set before delete"
-    );
-
-    let resp = app(st.clone())
-        .oneshot(session_delete_request(Some("Bearer test-token"), "sess-d"))
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
-    assert_eq!(
-        st.flags.get(&conversation_id),
-        SessionFlags::default(),
-        "flags row dropped on delete"
-    );
-    let _ = std::fs::remove_dir_all(&home);
 }
 
 // ---- GET /jesse/sessions/{id} — transcript hydration -----------------------
@@ -3790,171 +3156,6 @@ fn hydrate_fixture(session_id: &str, jsonl: &str) -> (std::path::PathBuf, AppSta
 }
 
 #[tokio::test]
-async fn hydrate_requires_auth() {
-    let st = test_state();
-    let resp = app(st)
-        .oneshot(hydrate_request(None, "some-session", None))
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
-}
-
-#[tokio::test]
-async fn hydrate_returns_ordered_turns_from_a_transcript() {
-    // A realistic transcript: a system init line, a bridge-WRAPPED first user turn,
-    // an assistant turn with thinking + tool_use + text (only the text renders), and
-    // a follow-up user turn. Hydration returns clean, ordered, stripped turns.
-    let wrapped = build_prompt_at(
-        "Current date/time: Sunday, 2026-07-20 08:00 CEST (UTC+02:00).",
-        "ask",
-        "what is on Today.md?",
-        false,
-        false,
-        None,
-        None,
-        None,
-        false,
-        false,
-        &Persona::default(),
-    )
-    .unwrap();
-    let jsonl = format!(
-        concat!(
-            "{{\"type\":\"system\",\"subtype\":\"init\"}}\n",
-            "{{\"type\":\"user\",\"message\":{{\"content\":{}}}}}\n",
-            "{{\"type\":\"assistant\",\"message\":{{\"content\":[",
-            "{{\"type\":\"thinking\",\"thinking\":\"hmm\"}},",
-            "{{\"type\":\"tool_use\",\"name\":\"Read\",\"input\":{{}}}},",
-            "{{\"type\":\"text\",\"text\":\"Two things: a call and a run.\"}}]}}}}\n",
-            "{{\"type\":\"user\",\"message\":{{\"content\":[{{\"type\":\"tool_result\",\"content\":\"noise\"}}]}}}}\n"
-        ),
-        serde_json::to_string(&wrapped).unwrap(),
-    );
-    let (home, st) = hydrate_fixture("sess-hy", &jsonl);
-
-    let resp = app(st)
-        .oneshot(hydrate_request(Some("Bearer test-token"), "sess-hy", None))
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
-    let body: Value = serde_json::from_str(&body_string(resp).await).unwrap();
-    assert_eq!(body["session_id"], "sess-hy");
-    let turns = body["turns"].as_array().unwrap();
-    assert_eq!(turns.len(), 2, "system + tool_result carrier skipped");
-    assert_eq!(turns[0]["role"], "user");
-    assert_eq!(
-        turns[0]["text"], "what is on Today.md?",
-        "the wrapper is stripped from the hydrated user turn"
-    );
-    assert_eq!(turns[1]["role"], "assistant");
-    assert_eq!(
-        turns[1]["text"], "Two things: a call and a run.",
-        "only the assistant's visible text, no thinking/tool_use"
-    );
-    assert_eq!(
-        body["next_offset"].as_u64().unwrap(),
-        jsonl.len() as u64,
-        "next_offset is the full byte length"
-    );
-    let _ = std::fs::remove_dir_all(&home);
-}
-
-#[tokio::test]
-async fn hydrate_after_returns_only_the_delta_with_the_next_offset() {
-    let head = concat!(
-        "{\"type\":\"user\",\"message\":{\"content\":\"q1\"}}\n",
-        "{\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"a1\"}]}}\n",
-    );
-    let (home, st) = hydrate_fixture("sess-delta", head);
-
-    // First call (no `after`) returns everything and the head length as next_offset.
-    let resp = app(st.clone())
-        .oneshot(hydrate_request(
-            Some("Bearer test-token"),
-            "sess-delta",
-            None,
-        ))
-        .await
-        .unwrap();
-    let body: Value = serde_json::from_str(&body_string(resp).await).unwrap();
-    assert_eq!(body["turns"].as_array().unwrap().len(), 2);
-    let offset = body["next_offset"].as_u64().unwrap();
-    assert_eq!(offset, head.len() as u64);
-
-    // Append a new turn to the same transcript, then hydrate FROM the prior offset.
-    let dir = st.sessions_dir();
-    let path = dir.join("sess-delta.jsonl");
-    let more = "{\"type\":\"user\",\"message\":{\"content\":\"q2\"}}\n";
-    std::fs::write(&path, format!("{head}{more}")).unwrap();
-
-    let resp = app(st)
-        .oneshot(hydrate_request(
-            Some("Bearer test-token"),
-            "sess-delta",
-            Some(offset),
-        ))
-        .await
-        .unwrap();
-    let body: Value = serde_json::from_str(&body_string(resp).await).unwrap();
-    let turns = body["turns"].as_array().unwrap();
-    assert_eq!(turns.len(), 1, "only the appended turn");
-    assert_eq!(turns[0]["text"], "q2");
-    assert_eq!(
-        body["next_offset"].as_u64().unwrap(),
-        (head.len() + more.len()) as u64
-    );
-    let _ = std::fs::remove_dir_all(&home);
-}
-
-#[tokio::test]
-async fn hydrate_skips_a_partial_trailing_line_then_returns_it_next_call() {
-    // A complete turn followed by a partial line (no terminating newline yet).
-    let complete = "{\"type\":\"user\",\"message\":{\"content\":\"q1\"}}\n";
-    let partial = "{\"type\":\"user\",\"message\":{\"content\":\"q2 par";
-    let (home, st) = hydrate_fixture("sess-partial", &format!("{complete}{partial}"));
-
-    let resp = app(st.clone())
-        .oneshot(hydrate_request(
-            Some("Bearer test-token"),
-            "sess-partial",
-            None,
-        ))
-        .await
-        .unwrap();
-    let body: Value = serde_json::from_str(&body_string(resp).await).unwrap();
-    assert_eq!(
-        body["turns"].as_array().unwrap().len(),
-        1,
-        "the partial line is not returned yet (no 500)"
-    );
-    let offset = body["next_offset"].as_u64().unwrap();
-    assert_eq!(
-        offset,
-        complete.len() as u64,
-        "offset stops before the partial"
-    );
-
-    // The writer finishes the line; the next `?after=` call returns it.
-    let dir = st.sessions_dir();
-    let path = dir.join("sess-partial.jsonl");
-    std::fs::write(&path, format!("{complete}{partial}tial\"}}}}\n")).unwrap();
-
-    let resp = app(st)
-        .oneshot(hydrate_request(
-            Some("Bearer test-token"),
-            "sess-partial",
-            Some(offset),
-        ))
-        .await
-        .unwrap();
-    let body: Value = serde_json::from_str(&body_string(resp).await).unwrap();
-    let turns = body["turns"].as_array().unwrap();
-    assert_eq!(turns.len(), 1);
-    assert_eq!(turns[0]["text"], "q2 partial");
-    let _ = std::fs::remove_dir_all(&home);
-}
-
-#[tokio::test]
 async fn hydrate_unknown_id_is_404() {
     let (home, st) = hydrate_fixture(
         "exists",
@@ -3969,77 +3170,6 @@ async fn hydrate_unknown_id_is_404() {
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
-    let _ = std::fs::remove_dir_all(&home);
-}
-
-#[tokio::test]
-async fn hydrate_rejects_a_path_traversal_id() {
-    // A crafted id that is not a plain filename component must be a 400 BEFORE the
-    // filesystem is touched — it can never resolve outside the projects dir.
-    let (home, st) = hydrate_fixture(
-        "real",
-        "{\"type\":\"user\",\"message\":{\"content\":\"hi\"}}\n",
-    );
-    for bad in ["..%2f..%2fsecrets", "..", "."] {
-        let resp = app(st.clone())
-            .oneshot(hydrate_request(Some("Bearer test-token"), bad, None))
-            .await
-            .unwrap();
-        assert_eq!(
-            resp.status(),
-            StatusCode::BAD_REQUEST,
-            "traversal id {bad:?} must be rejected"
-        );
-    }
-    let _ = std::fs::remove_dir_all(&home);
-}
-
-#[tokio::test]
-async fn title_mint_transcript_is_excluded_from_list_and_hydration() {
-    // Wart 1 end-to-end: a title-mint transcript (first user turn is the fixed title
-    // instruction) never appears in the list AND 404s from hydration; a real session
-    // in the same dir is listed and hydratable.
-    let mint_line = format!(
-        "{{\"type\":\"user\",\"message\":{{\"content\":{}}}}}\n",
-        serde_json::to_string(&build_title_prompt("a digest of some real chat")).unwrap()
-    );
-    let (home, st) = hydrate_fixture("mint", &mint_line);
-    // Add a real session alongside the mint.
-    let proj = st.sessions_dir();
-    std::fs::write(
-        proj.join("real.jsonl"),
-        "{\"type\":\"user\",\"message\":{\"content\":\"what is on Today.md?\"}}\n",
-    )
-    .unwrap();
-
-    // The list shows only the real session.
-    let resp = app(st.clone())
-        .oneshot(sessions_request(Some("Bearer test-token"), None, None))
-        .await
-        .unwrap();
-    let body: Value = serde_json::from_str(&body_string(resp).await).unwrap();
-    let ids: Vec<&str> = body["sessions"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|s| s["session_id"].as_str().unwrap())
-        .collect();
-    assert_eq!(ids, ["real"], "title-mint excluded from the list");
-
-    // Hydrating the mint id is a 404; the real id hydrates.
-    let resp = app(st.clone())
-        .oneshot(hydrate_request(Some("Bearer test-token"), "mint", None))
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), StatusCode::NOT_FOUND, "title-mint id 404s");
-
-    let resp = app(st)
-        .oneshot(hydrate_request(Some("Bearer test-token"), "real", None))
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
-    let body: Value = serde_json::from_str(&body_string(resp).await).unwrap();
-    assert_eq!(body["turns"][0]["text"], "what is on Today.md?");
     let _ = std::fs::remove_dir_all(&home);
 }
 
@@ -4066,9 +3196,7 @@ async fn title_with_conversation_id_persists_and_survives_restart() {
     let resp = app(st.clone())
         .oneshot(title_request(
             Some("Bearer test-token"),
-            &format!(
-                r#"{{"text":"the roofer is coming Thursday","conversation_id":"{cid}"}}"#
-            ),
+            &format!(r#"{{"text":"the roofer is coming Thursday","conversation_id":"{cid}"}}"#),
         ))
         .await
         .unwrap();
@@ -4081,7 +3209,10 @@ async fn title_with_conversation_id_persists_and_survives_restart() {
 
     // Restart survival: a fresh store over the same state dir reloads the title.
     let reloaded = AppState::new(cfg);
-    assert_eq!(reloaded.titles.get(cid).as_deref(), Some("Roof Repair Plan"));
+    assert_eq!(
+        reloaded.titles.get(cid).as_deref(),
+        Some("Roof Repair Plan")
+    );
 
     // A malformed conversation_id is a 400 and stores nothing.
     let resp = app(st.clone())
@@ -4145,7 +3276,11 @@ async fn title_with_a_deprecated_session_id_resolves_through_the_reverse_index()
         Some("Roof Repair Plan"),
         "the title landed on the conversation the session belongs to"
     );
-    assert_eq!(st.titles.get("sess-roof"), None, "and not on the session id");
+    assert_eq!(
+        st.titles.get("sess-roof"),
+        None,
+        "and not on the session id"
+    );
 
     // An unresolvable session id stores nothing.
     let resp = app(st.clone())
@@ -6551,13 +5686,11 @@ async fn conversation_delete_removes_every_transcript_tombstones_and_is_idempote
         .iter()
         .map(|t| t["conversation_id"].as_str().unwrap())
         .collect();
-    assert!(
-        deleted.contains(&CID_A),
-        "conversation-keyed tombstone: {deleted:?}"
+    assert_eq!(
+        deleted,
+        vec![CID_A],
+        "ONE tombstone, under the conversation id: nothing reads the session key space now"
     );
-    // And the legacy key space, so a pre-0.33 client on the deprecated route converges.
-    assert!(deleted.contains(&"seg-a"));
-    assert!(deleted.contains(&"seg-b"));
     let rows = body["conversations"].as_array().unwrap();
     assert_eq!(rows.len(), 1, "only the untouched conversation is listed");
 
@@ -7078,106 +6211,5 @@ async fn a_real_conversation_steals_an_orphan_adopted_transcript_back() {
     let rows = conversation_rows(&st).await;
     assert_eq!(rows.len(), 1, "one row remains: {rows:?}");
     assert_eq!(rows[0]["conversation_id"], CID_A);
-    let _ = std::fs::remove_dir_all(&home);
-}
-
-#[tokio::test]
-async fn the_deprecated_session_routes_resolve_through_the_reverse_index() {
-    let (home, vault, proj) = conv_fixture();
-    write_transcript(&proj, "seg-a", "the first question");
-    write_transcript(&proj, "seg-b", "later");
-    let st = conv_state(&home, &vault);
-    st.conversations.register(CID_A, Some("phone"), 1_000);
-    st.conversations.bind_session(CID_A, "seg-a");
-    st.conversations.bind_session(CID_A, "seg-b");
-
-    // GET /jesse/sessions returns the OLD shape, projected onto the current session.
-    let resp = app(st.clone())
-        .oneshot(sessions_request(Some("Bearer test-token"), None, None))
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
-    let body: Value = serde_json::from_str(&body_string(resp).await).unwrap();
-    let sessions = body["sessions"].as_array().unwrap();
-    assert_eq!(sessions.len(), 1, "one conversation, one row");
-    assert_eq!(sessions[0]["session_id"], "seg-b", "the CURRENT session");
-    assert_eq!(sessions[0]["first_message"], "the first question");
-    assert!(
-        sessions[0].get("conversation_id").is_none(),
-        "the old shape is unchanged"
-    );
-
-    // The old hydrate route still works against that one file, with no turn_key.
-    let resp = app(st.clone())
-        .oneshot(hydrate_request(Some("Bearer test-token"), "seg-a", None))
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
-    let body: Value = serde_json::from_str(&body_string(resp).await).unwrap();
-    assert!(
-        body["next_offset"].as_u64().is_some(),
-        "the old cursor field"
-    );
-    let turns = body["turns"].as_array().unwrap();
-    assert_eq!(turns.len(), 1);
-    assert!(
-        turns[0].get("turn_key").is_none(),
-        "the deprecated route omits turn_key"
-    );
-
-    // POST /jesse/session/{id}/flags resolves to the CONVERSATION row.
-    let resp = app(st.clone())
-        .oneshot(session_flags_request(
-            Some("Bearer test-token"),
-            "seg-a",
-            r#"{"archived":true,"archived_updated_ms":900}"#,
-        ))
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
-    let f = st.flags.get(CID_A);
-    assert!(
-        f.archived && f.archived_updated_ms == 900,
-        "an older client's flag write lands on the conversation row"
-    );
-    // An id that resolves to nothing is still a 404.
-    let resp = app(st.clone())
-        .oneshot(session_flags_request(
-            Some("Bearer test-token"),
-            "local-abc",
-            r#"{"archived":true,"archived_updated_ms":1}"#,
-        ))
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
-
-    // DELETE /jesse/session/{id} deletes the WHOLE conversation and propagates as a
-    // legacy session-keyed tombstone on the deprecated list.
-    let resp = app(st.clone())
-        .oneshot(session_delete_request(Some("Bearer test-token"), "seg-a"))
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
-    assert!(!proj.join("seg-a.jsonl").exists());
-    assert!(
-        !proj.join("seg-b.jsonl").exists(),
-        "the alias transcript went too"
-    );
-    let resp = app(st.clone())
-        .oneshot(sessions_request(Some("Bearer test-token"), None, None))
-        .await
-        .unwrap();
-    let body: Value = serde_json::from_str(&body_string(resp).await).unwrap();
-    let deleted: Vec<&str> = body["deleted"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|t| t["session_id"].as_str().unwrap())
-        .collect();
-    assert!(
-        deleted.contains(&"seg-a") && deleted.contains(&"seg-b"),
-        "a pre-0.33 client still receives session-keyed delete propagation: {deleted:?}"
-    );
-    assert!(body["sessions"].as_array().unwrap().is_empty());
     let _ = std::fs::remove_dir_all(&home);
 }
