@@ -15,6 +15,44 @@ CI both run it). See the "Versioning" section of `bridge/README.md`.
 
 ## [Unreleased]
 
+## [App 1.0 (80)] - 2026-07-25
+
+### Fixed
+- **The macOS composer could not type a newline.** Every Return sent the message, so a multiline
+  message could only be pasted in, never written. The composer was a SwiftUI
+  `TextField(axis: .vertical)` whose send hung off `.onSubmit`, and `.onSubmit` is handed no
+  modifier state at all: by the time it fires, whether Shift was down is already gone. The rule
+  "Return sends, Return with a modifier makes a newline" was therefore not expressible in that
+  view at any level of cleverness, which is also why no test could catch it. Measured on the old
+  build: plain Return and Shift plus Return both fired `.onSubmit` and sent; Command plus Return
+  sent through the send button's keyboard shortcut; Control and Option plus Return did nothing
+  useful.
+  The composer is now an `NSTextView` in an `NSScrollView` (`ComposerTextView`), and the decision
+  lives in one pure function, `composerKeyAction(keyCode:modifiers:hasMarkedText:)`, called from
+  `keyDown(with:)` where the modifiers still exist. Plain Return and plain keypad Enter send;
+  Return with Shift, Control, Option, or Command inserts a newline at the caret; Return during an
+  input method composition commits the composition and never sends. Keypad Enter's own
+  `.function` and `.numericPad` flags are not mistaken for a held modifier. Paste, copy, cut,
+  select all, undo and redo, spell check, autocorrect, dictation, the emoji palette, the Services
+  menu and the context menu are all stock text view behavior and unchanged; so are the
+  placeholder, the one to eight line growth, the send button and its disabled state as the single
+  source of truth for whether a send is allowed. iOS and watchOS are untouched.
+- **A crash found while verifying the above:** typing a message, sending it, then pressing Cmd+Z
+  killed the app with `NSRangeException` ("Range {0, 5} out of bounds; string length 0"). Clearing
+  the draft after a send replaces the text without registering an undo step, so every undo action
+  recorded before it described ranges in text that no longer existed. The composer now owns its
+  undo manager and resets it at that boundary; the regression test reproduces the exact exception
+  against the unfixed code.
+
+### Changed
+- **Command plus Return in the macOS composer now inserts a newline instead of sending.** It used
+  to be the send button's keyboard shortcut. That shortcut is gone: a button shortcut wins the key
+  before the focused composer sees it, and Command plus Return is one of the four newline
+  combinations. Plain Return and the send button both still send.
+- The macOS composer no longer applies smart quote or smart dash substitution. Text typed here
+  goes to a coding agent, where a curly quote or a substituted dash inside a path or a code fence
+  is a defect rather than a nicety. Spell check and autocorrect are unchanged.
+
 ## [App 1.0 (79)] - 2026-07-25
 
 ### Fixed
