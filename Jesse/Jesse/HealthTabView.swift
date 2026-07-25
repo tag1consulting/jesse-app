@@ -23,17 +23,24 @@ struct HealthTabView: View {
     // preserving the exact client the tab used before the display layer moved out.
     @State private var model = HealthDashboardModel(makeClient: { JesseClient(config: ConfigStore.load()) })
     @State private var showQuickLog = false
+    @State private var confirmNewDay = false
 
     var body: some View {
         NavigationStack {
             HealthDashboardContent(model: model)
                 .toolbar {
-                    // Quick log is today-only (the logging path only logs today), so
-                    // it's hidden while paging back through a past day.
+                    // Quick log and "Start new day" are both today-only (they act on
+                    // today), so they're hidden while paging back through a past day.
                     if HistoryUI.showsQuickLog(isHistorical: model.snapshot?.isHistorical ?? false) {
                         ToolbarItem(placement: .primaryAction) {
                             Button { showQuickLog = true } label: { Image(systemName: "plus") }
                                 .accessibilityLabel("Quick log")
+                        }
+                        ToolbarItem(placement: .secondaryAction) {
+                            Button { confirmNewDay = true } label: {
+                                Image(systemName: "sun.horizon")
+                            }
+                            .accessibilityLabel("Start new day")
                         }
                     }
                 }
@@ -43,6 +50,13 @@ struct HealthTabView: View {
                         context.insert(thread)
                         coordinator.send(thread: thread, text: text, voice: false, context: context)
                     }
+                }
+                // A tap could kick off the long morning routine, so confirm first.
+                .confirmationDialog("Start new day", isPresented: $confirmNewDay) {
+                    Button("Start new day") { startNewDay() }
+                    Button("Cancel", role: .cancel) {}
+                } message: {
+                    Text("Audit yesterday, log your weigh-in, and refresh the dashboard?")
                 }
         }
         // Load-on-appear lives in the shared `HealthDashboardContent`; the shell adds
@@ -62,5 +76,14 @@ struct HealthTabView: View {
         .onChange(of: scenePhase) { _, phase in
             if phase == .active && isActive { Task { await model.load() } }
         }
+    }
+
+    /// Fire the fixed morning refresh on a fresh Tell thread, then return — the
+    /// long-running routine runs in the background and the after-turn refresh above
+    /// repaints the dashboard when it lands. Mirrors the Quick log send path.
+    private func startNewDay() {
+        let thread = JesseThread(mode: .tell)
+        context.insert(thread)
+        coordinator.send(thread: thread, text: HealthNewDay.prompt, voice: false, context: context)
     }
 }
