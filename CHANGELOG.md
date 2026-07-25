@@ -15,6 +15,104 @@ CI both run it). See the "Versioning" section of `bridge/README.md`.
 
 ## [Unreleased]
 
+## [Bridge 0.33.0] - 2026-07-25
+
+### Added
+- **A first-class, persisted `Conversation` record with a stable UUID, registered at
+  accept time.** The bridge previously had no concept of a conversation: the list was a
+  `read_dir` over the Claude Code CLI's transcript files and a thread's identity was the
+  filename stem of a jsonl the CLI created on its own schedule. `POST /jesse` named no
+  thread at all, so a client learned its `session_id` only from the terminal reply,
+  minutes later, while the CLI had already written the transcript and
+  `GET /jesse/sessions` was already advertising a session id the client could not
+  possibly know yet. A sync landing in that window adopted it as a second thread, and a
+  CLI session fork on `--resume` (or a dropped `--resume` after a GC sweep) produced a
+  third. A conversation now owns an **ordered list** of Claude session ids, so a fork
+  appends an alias instead of surfacing a new row, and the record is registered
+  **before** the 202 is returned so the client is never behind the server. Persisted to
+  `<state_dir>/conversations.json` with the same discipline as every other store (atomic
+  temp + rename, `sync_all`, mode 0600, `{"v":1,…}` envelope, best-effort).
+- **`conversation_id` on `POST /jesse`, echoed in the 202.** The client mints the UUID
+  and the bridge registers it; a bridge-minted id would reopen the exact race being
+  closed, leaving a window in which the server knows an identifier the client does not.
+  The 202 is now `{"job_id", "conversation_id", "status":"running"}` and carries the
+  **authoritative** id, so the bridge stays free to override the requested one.
+  Additive: a client decoding only `job_id` is unaffected. Registration is idempotent by
+  construction, and a `request_id` dedup hit returns the same job **and** the same
+  conversation. Only a canonical lowercase hyphenated UUID is accepted; anything else is
+  a `400` before any work happens. The 202 is also the acceptance signal a UI needs,
+  since its arrival is the first moment a client can know the turn is durably the
+  server's.
+- **`GET /jesse/conversations`**, the canonical list, rendered from the registry rather
+  than from a directory scan. Each row carries the conversation id, the current
+  `session_id` (`null` before the first turn binds one), the full `session_ids` alias
+  list, `last_modified` as the max mtime across bound transcripts, `first_message` from
+  the **oldest** bound transcript so a fork never changes the derived title, the title,
+  the four flag fields, and `registered_ms`. `?since=`, the strong ETag / `304`
+  handling, and the deterministic ordering are unchanged.
+- **`GET /jesse/conversations/{id}/transcript`**, hydration across every transcript
+  bound to a conversation, under an **opaque `"<segment>:<offset>"` cursor** (a bare
+  byte offset is no longer sufficient once a conversation can span files). A missing
+  segment is skipped and the cursor advances past it; a malformed cursor is a `400`
+  rather than a silent reset to zero, which would replay the whole conversation. Every
+  turn now carries a **`turn_key`** of `"<session_id>:<byte offset of its jsonl line>"`,
+  stable across repeated hydrates and unique within the conversation, so a client can
+  merge history without duplicating a turn it holds, including two genuinely identical
+  messages that a content hash would wrongly collapse.
+- **`DELETE /jesse/conversation/{id}`** deletes **every** bound transcript, and
+  **`POST /jesse/conversation/{id}/flags`** applies the same last-writer-wins flag
+  semantics on the conversation. Both idempotent and `400` on a malformed id, exactly as
+  their session-keyed predecessors.
+- **An in-flight claim table, which is what makes the whole design hold.** The CLI writes
+  its transcript at spawn, not at completion (verified against `claude 2.1.220`: the file
+  appears within a second of spawn on a multi-second turn), so a conversation-list
+  refresh issued mid-turn would find an unbound stem and adopt it as a separate
+  conversation, and the reply binding arrives far too late to help. Every running turn now
+  snapshots the stems that existed just before it spawned, and the refresh **skips** any
+  stem absent from every live snapshot: it produces no record and no list row that round.
+  On termination the turn binds the reply's session id and then diffs the stems, which
+  also rescues a turn that failed before returning any session id, and steals back a
+  transcript that was orphan-adopted while it ran. The claim is released by a drop guard,
+  so a panic or a cancel cannot wedge adoption.
+
+### Changed
+- **The title, flag, and deletion stores are keyed on the conversation id**, not the
+  session id, since a session id is no longer stable. An existing state dir is re-keyed
+  **once** at startup through the reverse index: a key that resolves moves onto its
+  conversation, a key that resolves to nothing is dropped for titles and flags and, for
+  deletions, is additionally recorded under its deterministic v5 id so an in-flight
+  tombstone is not lost. Flag rows are carried over unchanged, so every last-writer-wins
+  clock survives the re-keying. The pass is guarded by a flag persisted in
+  `conversations.json`, so it runs exactly once per deploy.
+- **Resume resolution is conversation-first.** The conversation's current bound session
+  wins over the id the request carried, so a client whose stored session id is behind a
+  CLI fork still resumes the right transcript. The result still passes through
+  `effective_resume_id`, so a missing transcript degrades to a clean fresh run.
+- **The reply binding sits OUTSIDE the `JESSE_CONTEXT_CARRY` gate.** The pre-existing
+  rekey lives inside that block, but conversation identity must never depend on a prompt
+  context feature flag: with carry off, a fork would otherwise surface as a new row again.
+- **A legacy transcript with no record is adopted under a deterministic UUIDv5** of its
+  session id. Determinism is the point: adoption is idempotent, and a state dir lost and
+  rebuilt from the transcripts alone reproduces exactly the ids clients already hold. A
+  `POST /jesse/title` one-shot transcript is never adopted.
+- **The GC sweep also drops conversation records** whose bound transcripts are all gone
+  and whose own `registered_ms` is past the TTL, together with their title and flag rows.
+  A conversation with a turn in flight is never dropped, however old its record. GC still
+  records no deletion tombstone in either phase.
+- **`POST /jesse/title` takes a `conversation_id`.** A deprecated `session_id` is still
+  accepted and resolved through the reverse index onto its conversation; an id resolving
+  to no conversation stores nothing, rather than writing a key no read path would look at.
+
+### Deprecated
+- **`GET /jesse/sessions`, `GET /jesse/sessions/{id}`, `DELETE /jesse/session/{id}`, and
+  `POST /jesse/session/{id}/flags`**, kept for one release so the bridge can ship ahead
+  of the apps. Each resolves through the conversation reverse index and returns its old
+  shape; the deprecated hydrate route keeps its plain byte offset and emits no
+  `turn_key`. A conversation delete records tombstones in **both** key spaces for the
+  window, because forgetting the record leaves nothing to project a conversation-keyed
+  tombstone back through and a pre-0.33 client would otherwise stop receiving delete
+  propagation. All four, and the legacy tombstone half, are removed in the next minor.
+
 ## [Bridge 0.32.0] - 2026-07-25
 
 ### Fixed

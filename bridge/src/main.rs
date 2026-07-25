@@ -100,7 +100,12 @@ async fn main() {
     // JESSE_SESSION_TTL_DAYS on a background sweep (one run at startup, then
     // periodic). Scoped to the vault project only; an actively-resumed session
     // touches its mtime and is never reclaimed.
-    spawn_session_gc_task(state.cfg.clone(), state.titles.clone(), state.flags.clone());
+    spawn_session_gc_task(
+        state.cfg.clone(),
+        state.conversations.clone(),
+        state.titles.clone(),
+        state.flags.clone(),
+    );
     // Health-probe each CONFIGURED non-ambient model on its interval so the apps only offer
     // models that are reachable right now. A no-op for an opus-only deploy (no targets), so
     // the health path is entirely absent there. Never blocks a turn (detached tasks); a

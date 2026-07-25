@@ -99,6 +99,27 @@ impl TitleStore {
         }
     }
 
+    /// A copy of the whole map. Needed by the one-time key migration, which has to
+    /// walk every existing key to re-key it onto a conversation id.
+    pub fn snapshot(&self) -> HashMap<String, String> {
+        self.map.lock_ok().clone()
+    }
+
+    /// Replace the whole map and persist. The one-time key migration's commit step:
+    /// it builds the re-keyed map and installs it in one write, so a partially
+    /// migrated file can never be observed. Not for ordinary use: `set` / `remove`
+    /// are the per-entry API.
+    pub fn replace(&self, titles: HashMap<String, String>) {
+        let snapshot = {
+            let mut map = self.map.lock_ok();
+            *map = titles;
+            map.clone()
+        };
+        if let Some(path) = &self.path {
+            persist_titles(path, &snapshot);
+        }
+    }
+
     /// Number of stored titles. For tests/introspection only.
     pub fn len(&self) -> usize {
         self.map.lock_ok().len()

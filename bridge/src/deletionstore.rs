@@ -120,6 +120,29 @@ impl DeletionStore {
         out
     }
 
+    /// A copy of the whole map. Needed by the one-time key migration, which has to
+    /// walk every existing key to re-key it onto a conversation id.
+    pub fn snapshot(&self) -> HashMap<String, u64> {
+        self.map.lock_ok().clone()
+    }
+
+    /// Replace the whole map and persist, pruning anything past the window first. The
+    /// one-time key migration's commit step: the re-keyed map is installed in one
+    /// write, so a partially migrated file can never be observed. Not for ordinary
+    /// use: `record` is the per-entry API.
+    pub fn replace(&self, deletions: HashMap<String, u64>) {
+        let now_ms = system_time_to_ms(SystemTime::now());
+        let snapshot = {
+            let mut map = self.map.lock_ok();
+            *map = deletions;
+            prune_map(&mut map, now_ms, self.retention_ms);
+            map.clone()
+        };
+        if let Some(path) = &self.path {
+            persist_deletions(path, &snapshot);
+        }
+    }
+
     /// Number of stored tombstones (including any not yet pruned). For
     /// tests / introspection only.
     pub fn len(&self) -> usize {

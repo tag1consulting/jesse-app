@@ -13,22 +13,33 @@ pub struct AppState {
     pub queue: Arc<QueueGate>,
     // Per-service request rate ceiling (C3).
     pub limiter: Arc<RateLimiter>,
-    // Server-side session_id → title store (persisted to `<state_dir>/titles.json`
+    // The conversation registry: the bridge's own notion of a thread, keyed on a stable
+    // UUID registered at accept time (before `POST /jesse` returns its 202) and owning
+    // the ORDERED list of Claude session ids bound to it. Persisted to
+    // `<state_dir>/conversations.json`; in-memory otherwise. Every other per-thread
+    // store below is keyed on a conversation id, and `GET /jesse/conversations` is
+    // rendered from this rather than from a directory scan, which is what stops a
+    // mid-turn sync or a CLI session fork from surfacing a duplicate thread.
+    pub conversations: Arc<ConversationStore>,
+    // Server-side conversation_id → title store (persisted to `<state_dir>/titles.json`
     // when a state dir is configured; in-memory otherwise). Filled by
-    // `POST /jesse/title` and read by `GET /jesse/sessions`.
+    // `POST /jesse/title` and read by `GET /jesse/conversations`.
     pub titles: Arc<TitleStore>,
-    // Server-side session_id -> favorite/archived flags store (persisted to
+    // Server-side conversation_id -> favorite/archived flags store (persisted to
     // `<state_dir>/flags.json` when a state dir is configured; in-memory otherwise).
     // The bridge is the source of truth for these two flags so every device (iPhone,
     // Mac) converges on one set of favorites and archived conversations. Read into
-    // `GET /jesse/sessions` and written by `POST /jesse/session/{id}/flags`.
+    // `GET /jesse/conversations` and written by
+    // `POST /jesse/conversation/{id}/flags`.
     pub flags: Arc<FlagStore>,
-    // Server-side session_id -> deletion tombstone store (persisted to
-    // `<state_dir>/deletions.json` when a state dir is configured; in-memory
-    // otherwise). Records a durable tombstone when (and only when) a client
-    // explicitly deletes a session, exposed as the `deleted` array on
-    // `GET /jesse/sessions` so every device converges on removals the same way it
-    // converges on favorite/archived flags. Age-based GC never records here.
+    // Server-side deletion tombstone store (persisted to `<state_dir>/deletions.json`
+    // when a state dir is configured; in-memory otherwise). Records a durable tombstone
+    // when (and only when) a client explicitly deletes a conversation, exposed as the
+    // `deleted` array on `GET /jesse/conversations` so every device converges on
+    // removals the same way it converges on favorite/archived flags. Age-based GC never
+    // records here. Holds BOTH key spaces for the deprecation window: the conversation
+    // id, and the legacy session id of each transcript that was bound to it, so a
+    // pre-0.33 client on `GET /jesse/sessions` keeps receiving delete propagation.
     pub deletions: Arc<DeletionStore>,
     // Server-side GLOBAL model selection (the model switch): the active model id and the
     // per-model write overrides, persisted to `<state_dir>/model.json` (in-memory when no
@@ -94,6 +105,7 @@ impl AppState {
         let device_file = cfg.device_file();
         let titles_file = cfg.titles_file();
         let flags_file = cfg.flags_file();
+        let conversations_file = cfg.conversations_file();
         let model_file = cfg.model_file();
         let deletions_file = cfg.deletions_file();
         let deletion_retention_ms = deletion_retention_ms(cfg.session_ttl_days);
@@ -107,12 +119,13 @@ impl AppState {
         // healthy). The live prober is spawned separately in `main` so tests never touch the
         // network — they get the seeded cache and can inject explicit statuses.
         let health = Arc::new(HealthStore::seeded(&cfg.model_registry));
-        AppState {
+        let st = AppState {
             cfg: Arc::new(cfg),
             jobs: Arc::new(JobStore::new(job_ttl, retrieval_grace, jobs_dir)),
             sem,
             queue,
             limiter,
+            conversations: Arc::new(ConversationStore::new(conversations_file)),
             titles: Arc::new(TitleStore::new(titles_file)),
             flags: Arc::new(FlagStore::new(flags_file)),
             models: Arc::new(ModelStore::new(model_file)),
@@ -126,6 +139,56 @@ impl AppState {
             context: Arc::new(ContextLedger::new(context_file, context_enabled)),
             // One shadow child at a time; separate from the production permit.
             shadow_slot: Arc::new(Semaphore::new(1)),
+        };
+        st.bootstrap_conversations();
+        st
+    }
+
+    /// Bring the conversation registry up to date with what is already on disk, once, at
+    /// construction. Two steps, in this order because the second needs the first:
+    ///
+    /// 1. Scan the vault's projects dir and adopt every transcript that has no record
+    ///    yet, which is how an existing deploy's whole history becomes conversations
+    ///    without any client involvement. This populates the session → conversation
+    ///    reverse index.
+    /// 2. Re-key the title, flag, and deletion stores off session ids and onto
+    ///    conversation ids through that index, ONCE per state dir (the flag is persisted
+    ///    in `conversations.json`). The list handler's own refresh is the ongoing
+    ///    incremental case and never re-runs the migration.
+    ///
+    /// Nothing here can fail loudly: a missing projects dir adopts nothing, and with no
+    /// state dir configured the whole registry is in-memory so the migration is a no-op
+    /// against empty stores.
+    fn bootstrap_conversations(&self) {
+        let dir = self.sessions_dir();
+        let now_ms = system_time_to_ms(SystemTime::now());
+        let adopted = refresh_conversations(&dir, &self.conversations, now_ms);
+        if !adopted.is_empty() {
+            eprintln!(
+                "jesse-bridge: adopted {} existing transcript(s) into conversations",
+                adopted.len()
+            );
+        }
+        if self.conversations.migration_done() {
+            return;
+        }
+        let counts = migrate_keys_to_conversations(
+            &self.conversations,
+            &self.titles,
+            &self.flags,
+            &self.deletions,
+        );
+        self.conversations.mark_migration_done();
+        if counts != MigrationCounts::default() {
+            eprintln!(
+                "jesse-bridge: conversation key migration: titles moved={} dropped={}, \
+                 flags moved={} dropped={}, deletions converted={}",
+                counts.titles_moved,
+                counts.titles_dropped,
+                counts.flags_moved,
+                counts.flags_dropped,
+                counts.deletions_moved
+            );
         }
     }
 
@@ -286,7 +349,10 @@ mod tests {
         let st = state_with_glm();
         st.models.set_active("glm-5.2");
         st.models.set_writes("glm-5.2", true);
-        assert!(st.resolve_active_model().writes_allowed, "override enables writes");
+        assert!(
+            st.resolve_active_model().writes_allowed,
+            "override enables writes"
+        );
     }
 
     #[test]

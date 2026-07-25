@@ -3132,8 +3132,14 @@ async fn sessions_lists_a_real_transcript_with_first_message_and_title() {
         ..test_config()
     };
     let st = AppState::new(cfg);
-    // Store a title for the session (as POST /jesse/title would).
-    st.titles.set("sess-42", "Today Overview");
+    // Store a title for the session (as POST /jesse/title would). The title store is
+    // keyed on the CONVERSATION now, and `AppState::new` already adopted the transcript
+    // into one, so the key is looked up through the reverse index.
+    let conversation_id = st
+        .conversations
+        .conversation_for_session("sess-42")
+        .expect("the existing transcript was adopted into a conversation");
+    st.titles.set(&conversation_id, "Today Overview");
 
     let resp = app(st)
         .oneshot(sessions_request(Some("Bearer test-token"), None, None))
@@ -3209,7 +3215,11 @@ async fn session_delete_removes_transcript_and_makes_it_unresumable() {
         ..test_config()
     };
     let st = AppState::new(cfg.clone());
-    st.titles.set("sess-del", "A Title");
+    let conversation_id = st
+        .conversations
+        .conversation_for_session("sess-del")
+        .expect("the existing transcript was adopted into a conversation");
+    st.titles.set(&conversation_id, "A Title");
 
     // Before delete: the transcript exists and the session is resumable.
     assert!(transcript.exists());
@@ -3231,7 +3241,7 @@ async fn session_delete_removes_transcript_and_makes_it_unresumable() {
     // longer resumable (a resume now falls to a fresh session).
     assert!(!transcript.exists(), "transcript file must be deleted");
     assert!(
-        st.titles.get("sess-del").is_none(),
+        st.titles.get(&conversation_id).is_none(),
         "stashed title must be dropped on delete"
     );
     assert!(
@@ -3361,11 +3371,24 @@ async fn session_delete_records_a_tombstone_and_changes_the_sessions_etag() {
     assert_eq!(sessions.len(), 1, "the deleted session is no longer listed");
     assert_eq!(sessions[0]["session_id"], "sess-keep");
     let deleted = body["deleted"].as_array().unwrap();
-    assert_eq!(deleted.len(), 1, "one tombstone");
-    assert_eq!(deleted[0]["session_id"], "sess-del");
+    // Two tombstones, deliberately: the deleted CONVERSATION's id, plus the legacy
+    // session id of the transcript that was bound to it. The legacy half is what keeps
+    // a pre-0.33 client on this deprecated route receiving delete propagation, since
+    // forgetting the record leaves nothing to project the conversation key back through.
+    let deleted_ids: Vec<&str> = deleted
+        .iter()
+        .map(|t| t["session_id"].as_str().unwrap())
+        .collect();
     assert!(
-        deleted[0]["deleted_ms"].as_u64().unwrap() > 0,
-        "tombstone carries a unix-millis delete time"
+        deleted_ids.contains(&"sess-del"),
+        "the legacy session key is tombstoned: {deleted_ids:?}"
+    );
+    assert_eq!(deleted.len(), 2, "the conversation key is tombstoned too");
+    assert!(
+        deleted
+            .iter()
+            .all(|t| t["deleted_ms"].as_u64().unwrap() > 0),
+        "every tombstone carries a unix-millis delete time"
     );
 
     // The pre-delete ETag no longer matches (the cached 304 was invalidated): the
@@ -3417,7 +3440,7 @@ async fn session_gc_records_no_tombstone() {
     };
     let st = AppState::new(cfg);
 
-    run_session_gc(&st.cfg, &st.titles, &st.flags);
+    run_session_gc(&st.cfg, &st.conversations, &st.titles, &st.flags);
 
     assert!(!ancient.exists(), "GC reclaimed the aged-out session");
     assert!(
@@ -3617,7 +3640,11 @@ async fn sessions_list_carries_flags_and_its_etag_changes_when_a_flag_changes() 
 
     // That ETag matches now (304).
     let resp = app(st.clone())
-        .oneshot(sessions_request(Some("Bearer test-token"), None, Some(&etag1)))
+        .oneshot(sessions_request(
+            Some("Bearer test-token"),
+            None,
+            Some(&etag1),
+        ))
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::NOT_MODIFIED);
@@ -3634,7 +3661,11 @@ async fn sessions_list_carries_flags_and_its_etag_changes_when_a_flag_changes() 
 
     // The same If-None-Match no longer matches; the flag is in the body/ETag.
     let resp = app(st.clone())
-        .oneshot(sessions_request(Some("Bearer test-token"), None, Some(&etag1)))
+        .oneshot(sessions_request(
+            Some("Bearer test-token"),
+            None,
+            Some(&etag1),
+        ))
         .await
         .unwrap();
     assert_eq!(
@@ -3685,9 +3716,15 @@ async fn session_flags_survive_a_bridge_restart() {
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
 
-    // A fresh AppState over the same state dir reloads flags.json from disk.
+    // A fresh AppState over the same state dir reloads flags.json from disk, and
+    // rebuilds the reverse index so the same session still resolves to the same
+    // conversation (the deterministic v5 adoption id is what makes that hold).
     let st2 = AppState::new(cfg);
-    let reloaded = st2.flags.get("sess-r");
+    let conversation_id = st2
+        .conversations
+        .conversation_for_session("sess-r")
+        .expect("the transcript resolves to the same conversation after a restart");
+    let reloaded = st2.flags.get(&conversation_id);
     assert!(reloaded.favorite && reloaded.favorite_updated_ms == 123);
 
     let _ = std::fs::remove_dir_all(&home);
@@ -3707,7 +3744,14 @@ async fn session_delete_drops_the_flags_row() {
         ))
         .await
         .unwrap();
-    assert!(st.flags.get("sess-d").favorite, "flag set before delete");
+    let conversation_id = st
+        .conversations
+        .conversation_for_session("sess-d")
+        .expect("the existing transcript was adopted into a conversation");
+    assert!(
+        st.flags.get(&conversation_id).favorite,
+        "flag set before delete"
+    );
 
     let resp = app(st.clone())
         .oneshot(session_delete_request(Some("Bearer test-token"), "sess-d"))
@@ -3715,7 +3759,7 @@ async fn session_delete_drops_the_flags_row() {
         .unwrap();
     assert_eq!(resp.status(), StatusCode::NO_CONTENT);
     assert_eq!(
-        st.flags.get("sess-d"),
+        st.flags.get(&conversation_id),
         SessionFlags::default(),
         "flags row dropped on delete"
     );
@@ -4002,9 +4046,11 @@ async fn title_mint_transcript_is_excluded_from_list_and_hydration() {
 // ---- POST /jesse/title server-side store -----------------------------------
 
 #[tokio::test]
-async fn title_with_session_id_persists_and_survives_restart() {
-    // A title request carrying a session_id persists the minted title under it; a
-    // fresh store over the same state dir reloads it (restart survival). Uses a
+async fn title_with_conversation_id_persists_and_survives_restart() {
+    // A title request carrying a conversation_id persists the minted title under it; a
+    // fresh store over the same state dir reloads it (restart survival). Same property
+    // as before the conversation registry, now on the key the title store actually
+    // uses: a session id is no longer stable, so it can no longer be that key. Uses a
     // fake claude that returns a clean title.
     let script = "#!/bin/sh\nprintf '%s' '{\"type\":\"result\",\"is_error\":false,\"result\":\"Roof Repair Plan\",\"session_id\":\"x\"}'\n";
     let fake = write_fake_claude(script);
@@ -4015,6 +4061,76 @@ async fn title_with_session_id_persists_and_survives_restart() {
         ..test_config()
     };
     let st = AppState::new(cfg.clone());
+    let cid = "9c0b7a15-3d24-4e88-b1f6-0a7c5e9d4b23";
+
+    let resp = app(st.clone())
+        .oneshot(title_request(
+            Some("Bearer test-token"),
+            &format!(
+                r#"{{"text":"the roofer is coming Thursday","conversation_id":"{cid}"}}"#
+            ),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body: Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    assert_eq!(body["title"], "Roof Repair Plan");
+
+    // In-memory store now has it, under the conversation.
+    assert_eq!(st.titles.get(cid).as_deref(), Some("Roof Repair Plan"));
+
+    // Restart survival: a fresh store over the same state dir reloads the title.
+    let reloaded = AppState::new(cfg);
+    assert_eq!(reloaded.titles.get(cid).as_deref(), Some("Roof Repair Plan"));
+
+    // A malformed conversation_id is a 400 and stores nothing.
+    let resp = app(st.clone())
+        .oneshot(title_request(
+            Some("Bearer test-token"),
+            r#"{"text":"x","conversation_id":"NOT-A-UUID"}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(st.titles.len(), 1);
+
+    let _ = std::fs::remove_dir_all(&state_dir);
+    let _ = std::fs::remove_file(&fake);
+}
+
+#[tokio::test]
+async fn title_with_a_deprecated_session_id_resolves_through_the_reverse_index() {
+    // A pre-0.33 client names a session. The title store is conversation-keyed, so the
+    // id is resolved through the reverse index and the title lands where the list reads
+    // it. An id that resolves to NO conversation stores nothing, rather than writing a
+    // key no read path would ever look at.
+    let home = std::env::temp_dir().join(format!("jesse-home-{}", random_hex()));
+    let vault_dir = std::env::temp_dir().join(format!("jesse-vault-{}", random_hex()));
+    std::fs::create_dir_all(&vault_dir).unwrap();
+    let vault = vault_dir.to_string_lossy().into_owned();
+    let proj = home
+        .join(".claude")
+        .join("projects")
+        .join(escape_project_path(&vault));
+    std::fs::create_dir_all(&proj).unwrap();
+    std::fs::write(
+        proj.join("sess-roof.jsonl"),
+        "{\"type\":\"user\",\"message\":{\"content\":\"the roofer\"}}\n",
+    )
+    .unwrap();
+    let script = "#!/bin/sh\nprintf '%s' '{\"type\":\"result\",\"is_error\":false,\"result\":\"Roof Repair Plan\",\"session_id\":\"x\"}'\n";
+    let fake = write_fake_claude(script);
+    let st = AppState::new(Config {
+        home: home.to_string_lossy().into_owned(),
+        vault,
+        state_dir: None,
+        claude_bin: fake.to_string_lossy().into_owned(),
+        ..test_config()
+    });
+    let cid = st
+        .conversations
+        .conversation_for_session("sess-roof")
+        .expect("adopted at startup");
 
     let resp = app(st.clone())
         .oneshot(title_request(
@@ -4024,29 +4140,33 @@ async fn title_with_session_id_persists_and_survives_restart() {
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
-    let body: Value = serde_json::from_str(&body_string(resp).await).unwrap();
-    assert_eq!(body["title"], "Roof Repair Plan");
-
-    // In-memory store now has it.
     assert_eq!(
-        st.titles.get("sess-roof").as_deref(),
-        Some("Roof Repair Plan")
+        st.titles.get(&cid).as_deref(),
+        Some("Roof Repair Plan"),
+        "the title landed on the conversation the session belongs to"
     );
+    assert_eq!(st.titles.get("sess-roof"), None, "and not on the session id");
 
-    // Restart survival: a fresh store over the same state dir reloads the title.
-    let reloaded = AppState::new(cfg);
-    assert_eq!(
-        reloaded.titles.get("sess-roof").as_deref(),
-        Some("Roof Repair Plan")
-    );
+    // An unresolvable session id stores nothing.
+    let resp = app(st.clone())
+        .oneshot(title_request(
+            Some("Bearer test-token"),
+            r#"{"text":"x","session_id":"local-abc"}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(st.titles.len(), 1, "nothing was stored for the unknown id");
 
-    let _ = std::fs::remove_dir_all(&state_dir);
+    let _ = std::fs::remove_dir_all(&home);
+    let _ = std::fs::remove_dir_all(&vault_dir);
     let _ = std::fs::remove_file(&fake);
 }
 
 #[tokio::test]
-async fn title_without_session_id_persists_nothing() {
-    // Omitting session_id reproduces today's stateless behavior — nothing stored.
+async fn title_without_a_thread_id_persists_nothing() {
+    // Naming neither a conversation nor a session reproduces the stateless behavior:
+    // nothing stored.
     let script = "#!/bin/sh\nprintf '%s' '{\"type\":\"result\",\"is_error\":false,\"result\":\"Some Title\",\"session_id\":\"x\"}'\n";
     let fake = write_fake_claude(script);
     let state_dir = std::env::temp_dir().join(format!("jesse-titlestate-{}", random_hex()));
@@ -4065,7 +4185,7 @@ async fn title_without_session_id_persists_nothing() {
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
-    assert!(st.titles.is_empty(), "no session_id → nothing persisted");
+    assert!(st.titles.is_empty(), "no thread id, nothing persisted");
 
     let _ = std::fs::remove_dir_all(&state_dir);
     let _ = std::fs::remove_file(&fake);
@@ -5131,7 +5251,11 @@ fn cfg_with_switch_registry(state_dir: &std::path::Path) -> Config {
                 subagent_model: None,
                 configured: true,
                 default_writes: true,
-                price: PriceDeck { in_per_m: 5.0, cached_per_m: 0.5, out_per_m: 25.0 },
+                price: PriceDeck {
+                    in_per_m: 5.0,
+                    cached_per_m: 0.5,
+                    out_per_m: 25.0,
+                },
                 health: HealthConfig::default(),
                 vision: Vec::new(),
                 vision_complementary: false,
@@ -5140,11 +5264,19 @@ fn cfg_with_switch_registry(state_dir: &std::path::Path) -> Config {
                 id: "glm-5.2".into(),
                 label: "GLM 5.2".into(),
                 kind: ModelKind::Hosted,
-                backend: Some(("http://fireworks".into(), "fw-tok".into(), "glm-model".into())),
+                backend: Some((
+                    "http://fireworks".into(),
+                    "fw-tok".into(),
+                    "glm-model".into(),
+                )),
                 subagent_model: Some("glm-model".into()),
                 configured: true,
                 default_writes: false,
-                price: PriceDeck { in_per_m: 1.4, cached_per_m: 0.14, out_per_m: 4.4 },
+                price: PriceDeck {
+                    in_per_m: 1.4,
+                    cached_per_m: 0.14,
+                    out_per_m: 4.4,
+                },
                 health: HealthConfig::default(),
                 vision: Vec::new(),
                 vision_complementary: false,
@@ -5206,7 +5338,10 @@ async fn models_endpoint_lists_the_registry_and_active_selection() {
     let glm = models.iter().find(|m| m["id"] == "glm-5.2").unwrap();
     assert_eq!(glm["kind"], "hosted");
     assert_eq!(glm["configured"], true);
-    assert_eq!(glm["healthy"], true, "a configured model is seeded optimistically healthy");
+    assert_eq!(
+        glm["healthy"], true,
+        "a configured model is seeded optimistically healthy"
+    );
     assert_eq!(glm["available"], true);
     assert_eq!(glm["writes_allowed"], false);
     // kimi is present but UNCONFIGURED (no token) → not healthy, not available.
@@ -5216,9 +5351,18 @@ async fn models_endpoint_lists_the_registry_and_active_selection() {
     assert_eq!(kimi["available"], false);
     // No secret leaks to the client — ids, booleans, enums, and numbers only.
     let raw = v.to_string();
-    assert!(!raw.contains("fw-tok"), "the token must never reach a client: {raw}");
-    assert!(!raw.contains("fireworks"), "the base url must never reach a client: {raw}");
-    assert!(!raw.contains("glm-model"), "the backend model id must never reach a client: {raw}");
+    assert!(
+        !raw.contains("fw-tok"),
+        "the token must never reach a client: {raw}"
+    );
+    assert!(
+        !raw.contains("fireworks"),
+        "the base url must never reach a client: {raw}"
+    );
+    assert!(
+        !raw.contains("glm-model"),
+        "the backend model id must never reach a client: {raw}"
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -5245,18 +5389,31 @@ async fn set_model_on_an_unhealthy_configured_model_is_409_and_does_not_switch()
         .await
         .unwrap();
     let v = body_value(resp).await;
-    let glm = v["models"].as_array().unwrap().iter().find(|m| m["id"] == "glm-5.2").unwrap().clone();
+    let glm = v["models"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["id"] == "glm-5.2")
+        .unwrap()
+        .clone();
     assert_eq!(glm["configured"], true);
     assert_eq!(glm["healthy"], false);
     assert_eq!(glm["available"], false);
     assert_eq!(glm["latency_ms"], 3000);
     // And selection is rejected with 409, leaving the active model unchanged.
     let resp = app(st.clone())
-        .oneshot(set_model_request(Some("Bearer test-token"), r#"{"id":"glm-5.2"}"#))
+        .oneshot(set_model_request(
+            Some("Bearer test-token"),
+            r#"{"id":"glm-5.2"}"#,
+        ))
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::CONFLICT);
-    assert_eq!(st.models.active(), "opus", "an unhealthy selection must not take effect");
+    assert_eq!(
+        st.models.active(),
+        "opus",
+        "an unhealthy selection must not take effect"
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -5268,10 +5425,18 @@ async fn set_model_accepts_a_healthy_configured_model() {
     // Seeded optimistic-healthy; make it explicit that a passing probe keeps it selectable.
     st.health.set(
         "glm-5.2",
-        HealthStatus { healthy: true, checked_at_ms: 1, latency_ms: Some(40), last_error_class: None },
+        HealthStatus {
+            healthy: true,
+            checked_at_ms: 1,
+            latency_ms: Some(40),
+            last_error_class: None,
+        },
     );
     let resp = app(st.clone())
-        .oneshot(set_model_request(Some("Bearer test-token"), r#"{"id":"glm-5.2"}"#))
+        .oneshot(set_model_request(
+            Some("Bearer test-token"),
+            r#"{"id":"glm-5.2"}"#,
+        ))
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
@@ -5284,7 +5449,10 @@ async fn set_model_switches_active_and_persists_across_a_restart() {
     let dir = std::env::temp_dir().join(format!("jesse-model-it-{}", random_hex()));
     let st = AppState::new(cfg_with_switch_registry(&dir));
     let resp = app(st.clone())
-        .oneshot(set_model_request(Some("Bearer test-token"), r#"{"id":"glm-5.2"}"#))
+        .oneshot(set_model_request(
+            Some("Bearer test-token"),
+            r#"{"id":"glm-5.2"}"#,
+        ))
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
@@ -5296,7 +5464,11 @@ async fn set_model_switches_active_and_persists_across_a_restart() {
         .oneshot(models_request(Some("Bearer test-token")))
         .await
         .unwrap();
-    assert_eq!(body_value(resp).await["active"], "glm-5.2", "selection survives restart");
+    assert_eq!(
+        body_value(resp).await["active"],
+        "glm-5.2",
+        "selection survives restart"
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -5305,7 +5477,10 @@ async fn set_model_unknown_id_is_400() {
     let dir = std::env::temp_dir().join(format!("jesse-model-it-{}", random_hex()));
     let st = AppState::new(cfg_with_switch_registry(&dir));
     let resp = app(st)
-        .oneshot(set_model_request(Some("Bearer test-token"), r#"{"id":"no-such-model"}"#))
+        .oneshot(set_model_request(
+            Some("Bearer test-token"),
+            r#"{"id":"no-such-model"}"#,
+        ))
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
@@ -5318,12 +5493,19 @@ async fn set_model_unavailable_is_409_and_does_not_switch() {
     let dir = std::env::temp_dir().join(format!("jesse-model-it-{}", random_hex()));
     let st = AppState::new(cfg_with_switch_registry(&dir));
     let resp = app(st.clone())
-        .oneshot(set_model_request(Some("Bearer test-token"), r#"{"id":"kimi-k3"}"#))
+        .oneshot(set_model_request(
+            Some("Bearer test-token"),
+            r#"{"id":"kimi-k3"}"#,
+        ))
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::CONFLICT);
     // The active model is unchanged.
-    assert_eq!(st.models.active(), "opus", "an unavailable selection must not take effect");
+    assert_eq!(
+        st.models.active(),
+        "opus",
+        "an unavailable selection must not take effect"
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -5332,7 +5514,11 @@ async fn set_model_writes_stores_and_reflects_in_get() {
     let dir = std::env::temp_dir().join(format!("jesse-model-it-{}", random_hex()));
     let st = AppState::new(cfg_with_switch_registry(&dir));
     let resp = app(st.clone())
-        .oneshot(set_model_writes_request(Some("Bearer test-token"), "glm-5.2", r#"{"enabled":true}"#))
+        .oneshot(set_model_writes_request(
+            Some("Bearer test-token"),
+            "glm-5.2",
+            r#"{"enabled":true}"#,
+        ))
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
@@ -5343,8 +5529,17 @@ async fn set_model_writes_stores_and_reflects_in_get() {
         .await
         .unwrap();
     let v = body_value(resp).await;
-    let glm = v["models"].as_array().unwrap().iter().find(|m| m["id"] == "glm-5.2").unwrap().clone();
-    assert_eq!(glm["writes_allowed"], true, "the writes override is reflected");
+    let glm = v["models"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["id"] == "glm-5.2")
+        .unwrap()
+        .clone();
+    assert_eq!(
+        glm["writes_allowed"], true,
+        "the writes override is reflected"
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -5354,7 +5549,11 @@ async fn set_model_writes_on_the_default_model_is_rejected() {
     let dir = std::env::temp_dir().join(format!("jesse-model-it-{}", random_hex()));
     let st = AppState::new(cfg_with_switch_registry(&dir));
     let resp = app(st)
-        .oneshot(set_model_writes_request(Some("Bearer test-token"), "opus", r#"{"enabled":false}"#))
+        .oneshot(set_model_writes_request(
+            Some("Bearer test-token"),
+            "opus",
+            r#"{"enabled":false}"#,
+        ))
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
@@ -5377,7 +5576,10 @@ async fn drive_turn_to_done(st: &AppState, req_json: &str) -> Value {
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::ACCEPTED, "turn accepted");
-    let job_id = body_value(resp).await["job_id"].as_str().unwrap().to_string();
+    let job_id = body_value(resp).await["job_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
     for _ in 0..80 {
         tokio::time::sleep(Duration::from_millis(50)).await;
         let v = result_status(st, &job_id).await;
@@ -5453,7 +5655,10 @@ async fn a_turn_with_no_model_uses_the_stored_default() {
     // Move the stored default onto glm-5.2 (the legacy global switch still works server-side
     // as the fallback default).
     let set = app(st.clone())
-        .oneshot(set_model_request(Some("Bearer test-token"), r#"{"id":"glm-5.2"}"#))
+        .oneshot(set_model_request(
+            Some("Bearer test-token"),
+            r#"{"id":"glm-5.2"}"#,
+        ))
         .await
         .unwrap();
     assert_eq!(set.status(), StatusCode::OK);
@@ -5504,7 +5709,11 @@ async fn per_turn_unhealthy_model_is_409_and_spawns_nothing() {
         ))
         .await
         .unwrap();
-    assert_eq!(resp.status(), StatusCode::CONFLICT, "unhealthy selection → 409");
+    assert_eq!(
+        resp.status(),
+        StatusCode::CONFLICT,
+        "unhealthy selection → 409"
+    );
     // Give any (erroneously) spawned child a beat to touch the sentinel, then prove it never ran.
     tokio::time::sleep(Duration::from_millis(100)).await;
     assert!(
@@ -5529,7 +5738,11 @@ async fn per_turn_unknown_model_is_400() {
         ))
         .await
         .unwrap();
-    assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "unknown model → 400");
+    assert_eq!(
+        resp.status(),
+        StatusCode::BAD_REQUEST,
+        "unknown model → 400"
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -5616,7 +5829,10 @@ async fn vision_transcribes_an_image_over_a_mock_helper() {
         "encoder sent a real base64 image/png block: {}",
         r.text
     );
-    assert!(r.text.contains("instruction_present=true"), "instruction sent");
+    assert!(
+        r.text.contains("instruction_present=true"),
+        "instruction sent"
+    );
     assert_eq!(r.input_tokens, 11);
     assert_eq!(r.output_tokens, 7);
 }
@@ -5662,7 +5878,10 @@ async fn preprocess_pairs_and_frames_a_faithful_view() {
     };
     // The text model reports vision ENABLED (a resolvable partner).
     let glm = cfg.model_registry.get("glm").unwrap();
-    assert!(cfg.model_registry.vision_enabled(glm), "paired + resolvable → enabled");
+    assert!(
+        cfg.model_registry.vision_enabled(glm),
+        "paired + resolvable → enabled"
+    );
 
     let active = ActiveModel {
         id: "glm".into(),
@@ -5719,9 +5938,7 @@ async fn unpaired_model_reports_no_vision() {
         vision: Vec::new(),
         vision_complementary: false,
     };
-    let registry = ModelRegistry {
-        models: vec![text],
-    };
+    let registry = ModelRegistry { models: vec![text] };
     let glm = registry.get("glm").unwrap();
     assert!(!registry.vision_enabled(glm), "no partners → no vision");
 
@@ -5780,5 +5997,1187 @@ async fn vision_rasterizes_and_transcribes_a_pdf_when_pdfium_present() {
     assert_eq!(results[0].page_no, Some(1));
     assert_eq!(results[0].total_pages, Some(1));
     assert!(results[0].error.is_none(), "{:?}", results[0].error);
-    assert!(results[0].text.contains("media=image/png"), "page sent as PNG");
+    assert!(
+        results[0].text.contains("media=image/png"),
+        "page sent as PNG"
+    );
+}
+
+// ---- The conversation registry ----------------------------------------------
+//
+// Every test below asserts a property of the identity model, not a smoke path.
+// The headline is `in_flight_transcript_produces_no_row_then_binds_on_terminal`:
+// without the in-flight claim table the design fails at exactly the problem it
+// exists to solve.
+
+/// A throwaway HOME + vault whose escaped projects dir exists, plus the dir path.
+/// Nothing global is mutated: the bridge reads HOME from `cfg.home`.
+fn conv_fixture() -> (std::path::PathBuf, String, std::path::PathBuf) {
+    let home = std::env::temp_dir().join(format!("jesse-home-{}", random_hex()));
+    // A REAL directory: the tests below spawn a fake claude, and the child's cwd is
+    // the vault, so a nonexistent path would fail the spawn rather than the assertion.
+    let vault_dir = std::env::temp_dir().join(format!("jesse-vault-{}", random_hex()));
+    std::fs::create_dir_all(&vault_dir).unwrap();
+    let vault = vault_dir.to_string_lossy().into_owned();
+    let proj = home
+        .join(".claude")
+        .join("projects")
+        .join(escape_project_path(&vault));
+    std::fs::create_dir_all(&proj).unwrap();
+    (home, vault, proj)
+}
+
+fn conv_state(home: &std::path::Path, vault: &str) -> AppState {
+    AppState::new(Config {
+        home: home.to_string_lossy().into_owned(),
+        vault: vault.to_string(),
+        state_dir: None,
+        ..test_config()
+    })
+}
+
+/// A minimal one-user-turn transcript.
+fn write_transcript(proj: &std::path::Path, stem: &str, question: &str) {
+    std::fs::write(
+        proj.join(format!("{stem}.jsonl")),
+        format!("{{\"type\":\"user\",\"message\":{{\"content\":\"{question}\"}}}}\n"),
+    )
+    .unwrap();
+}
+
+/// Set a file's mtime to exactly `secs` since the unix epoch, so `last_modified`
+/// and the `?since=` filter can be asserted against known values.
+fn set_mtime_secs(path: &std::path::Path, secs: u64) {
+    let f = std::fs::OpenOptions::new().write(true).open(path).unwrap();
+    f.set_modified(std::time::UNIX_EPOCH + Duration::from_secs(secs))
+        .unwrap();
+}
+
+/// A fake claude that returns the given session id after an optional sleep, and
+/// (like the real CLI, which writes its transcript at spawn rather than at
+/// completion) creates that transcript file BEFORE it answers.
+fn claude_writing_transcript(
+    proj: &std::path::Path,
+    sid: &str,
+    sleep_secs: u32,
+) -> std::path::PathBuf {
+    let script = format!(
+        "#!/bin/sh\n\
+         printf '%s\\n' '{{\"type\":\"user\",\"message\":{{\"content\":\"turn text\"}}}}' > '{}/{sid}.jsonl'\n\
+         sleep {sleep_secs}\n\
+         printf '%s' '{{\"type\":\"result\",\"is_error\":false,\"result\":\"ok\",\"session_id\":\"{sid}\"}}'\n",
+        proj.display()
+    );
+    write_fake_claude(&script)
+}
+
+async fn post_turn(st: &AppState, body: &str) -> Value {
+    let resp = app(st.clone())
+        .oneshot(jesse_request(Some("Bearer test-token"), body))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::ACCEPTED, "turn accepted");
+    serde_json::from_str(&body_string(resp).await).unwrap()
+}
+
+async fn conversation_rows(st: &AppState) -> Vec<Value> {
+    let resp = app(st.clone())
+        .oneshot(conversations_request(Some("Bearer test-token"), None, None))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body: Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    body["conversations"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+}
+
+const CID_A: &str = "11111111-2222-4333-8444-555555555555";
+const CID_B: &str = "66666666-7777-4888-8999-aaaaaaaaaaaa";
+
+#[tokio::test]
+async fn post_without_a_conversation_id_mints_a_canonical_one() {
+    let fake = write_fake_claude(
+        "#!/bin/sh\nprintf '%s' '{\"type\":\"result\",\"is_error\":false,\"result\":\"ok\",\"session_id\":\"s1\"}'\n",
+    );
+    let st = AppState::new(Config {
+        claude_bin: fake.to_string_lossy().into_owned(),
+        ..test_config()
+    });
+    let body = post_turn(&st, r#"{"mode":"ask","text":"hi"}"#).await;
+    let cid = body["conversation_id"]
+        .as_str()
+        .expect("the 202 names a conversation");
+    assert!(
+        validate_conversation_id(cid).is_ok(),
+        "the minted id is a canonical lowercase UUID: {cid}"
+    );
+    assert!(st.conversations.get(cid).is_some(), "and it is registered");
+    let _ = std::fs::remove_file(&fake);
+}
+
+#[tokio::test]
+async fn post_with_a_conversation_id_echoes_it_and_creates_one_record() {
+    let fake = write_fake_claude(
+        "#!/bin/sh\nprintf '%s' '{\"type\":\"result\",\"is_error\":false,\"result\":\"ok\",\"session_id\":\"s1\"}'\n",
+    );
+    let st = AppState::new(Config {
+        claude_bin: fake.to_string_lossy().into_owned(),
+        ..test_config()
+    });
+    let body = post_turn(
+        &st,
+        &format!(r#"{{"mode":"ask","text":"hi","conversation_id":"{CID_A}"}}"#),
+    )
+    .await;
+    assert_eq!(
+        body["conversation_id"], CID_A,
+        "the client's id is echoed exactly"
+    );
+    assert_eq!(st.conversations.len(), 1, "exactly one record");
+    let _ = std::fs::remove_file(&fake);
+}
+
+#[tokio::test]
+async fn two_turns_on_one_conversation_create_one_record_and_two_jobs() {
+    let counter = counter_path();
+    let _ = std::fs::remove_file(&counter);
+    let fake = spawn_counting_claude(&counter, 0);
+    let st = AppState::new(Config {
+        claude_bin: fake.to_string_lossy().into_owned(),
+        ..test_config()
+    });
+    let first = post_turn(
+        &st,
+        &format!(
+            r#"{{"mode":"ask","text":"one","conversation_id":"{CID_A}","request_id":"rid-one"}}"#
+        ),
+    )
+    .await;
+    wait_for_done(&st, first["job_id"].as_str().unwrap()).await;
+    let second = post_turn(
+        &st,
+        &format!(
+            r#"{{"mode":"ask","text":"two","conversation_id":"{CID_A}","request_id":"rid-two"}}"#
+        ),
+    )
+    .await;
+    wait_for_done(&st, second["job_id"].as_str().unwrap()).await;
+
+    assert_ne!(first["job_id"], second["job_id"], "two distinct jobs");
+    assert_eq!(first["conversation_id"], CID_A);
+    assert_eq!(second["conversation_id"], CID_A);
+    assert_eq!(
+        st.conversations.len(),
+        1,
+        "registration is idempotent: one conversation record"
+    );
+    let _ = std::fs::remove_file(&counter);
+    let _ = std::fs::remove_file(&fake);
+}
+
+#[tokio::test]
+async fn a_deduped_repost_returns_the_same_job_and_the_same_conversation() {
+    let counter = counter_path();
+    let _ = std::fs::remove_file(&counter);
+    // Sleeps, so the job is still live when the duplicate POST lands.
+    let fake = spawn_counting_claude(&counter, 2);
+    let st = AppState::new(Config {
+        claude_bin: fake.to_string_lossy().into_owned(),
+        timeout_secs: 30,
+        ..test_config()
+    });
+    let body = format!(
+        r#"{{"mode":"ask","text":"hi","conversation_id":"{CID_A}","request_id":"rid-dup"}}"#
+    );
+    let first = post_turn(&st, &body).await;
+    let again = post_turn(&st, &body).await;
+    assert_eq!(
+        first["job_id"], again["job_id"],
+        "the same job is handed back"
+    );
+    assert_eq!(
+        again["conversation_id"], CID_A,
+        "a dedup hit still carries the resolved conversation"
+    );
+    // The 202 returns before the detached task spawns the child, so wait for the first
+    // spawn to land before asserting there was only ever one.
+    for _ in 0..100 {
+        if spawn_count(&counter) >= 1 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(spawn_count(&counter), 1, "and only one turn ever spawned");
+    let _ = std::fs::remove_file(&counter);
+    let _ = std::fs::remove_file(&fake);
+}
+
+#[tokio::test]
+async fn a_malformed_conversation_id_is_a_400_with_a_json_error() {
+    let st = test_state();
+    for bad in [
+        "11111111-2222-4333-8444-55555555555",   // one hex short
+        "11111111222243338444555555555555",      // unhyphenated
+        "11111111-2222-4333-8444-555555555555 ", // trailing space
+        "AAAAAAAA-2222-4333-8444-555555555555",  // uppercase
+        "../x",
+        "",
+    ] {
+        let body = serde_json::to_string(&serde_json::json!({
+            "mode": "ask", "text": "hi", "conversation_id": bad,
+        }))
+        .unwrap();
+        let resp = app(st.clone())
+            .oneshot(jesse_request(Some("Bearer test-token"), &body))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "rejected: {bad:?}");
+        let v: Value = serde_json::from_str(&body_string(resp).await).unwrap();
+        assert!(
+            v["error"].as_str().is_some_and(|e| !e.is_empty()),
+            "a one-line JSON error body: {v}"
+        );
+    }
+    assert!(
+        st.conversations.is_empty(),
+        "a rejected id registers nothing"
+    );
+}
+
+#[tokio::test]
+async fn a_reply_with_a_different_session_id_appends_an_alias_not_a_new_row() {
+    // The fork path. The client asks to continue `sess-old`; the reply comes back
+    // naming `sess-new`. Both must belong to ONE conversation, and the list must
+    // still show exactly one row.
+    let (home, vault, proj) = conv_fixture();
+    write_transcript(&proj, "sess-old", "the original question");
+    let fake = claude_writing_transcript(&proj, "sess-new", 0);
+    let st = AppState::new(Config {
+        home: home.to_string_lossy().into_owned(),
+        vault: vault.clone(),
+        state_dir: None,
+        claude_bin: fake.to_string_lossy().into_owned(),
+        ..test_config()
+    });
+    // The client already holds this conversation and knows `sess-old` belongs to it
+    // (that is how it learned the id in the first place, from the list's `session_ids`),
+    // so bind it up front. This also exercises the steal: the transcript was
+    // orphan-adopted at startup and the real conversation takes it back.
+    st.conversations.register(CID_A, Some("phone"), 1_000);
+    st.conversations.bind_session(CID_A, "sess-old");
+    assert_eq!(
+        st.conversations
+            .conversation_for_session("sess-old")
+            .as_deref(),
+        Some(CID_A)
+    );
+    let body = post_turn(
+        &st,
+        &format!(
+            r#"{{"mode":"ask","text":"follow up","conversation_id":"{CID_A}","session_id":"sess-old"}}"#
+        ),
+    )
+    .await;
+    wait_for_done(&st, body["job_id"].as_str().unwrap()).await;
+
+    let rec = st
+        .conversations
+        .get(CID_A)
+        .expect("the conversation exists");
+    assert_eq!(
+        rec.session_ids,
+        vec!["sess-old".to_string(), "sess-new".to_string()],
+        "the fork APPENDS an alias, oldest first"
+    );
+    let rows = conversation_rows(&st).await;
+    assert_eq!(
+        rows.len(),
+        1,
+        "still exactly one conversation row: {rows:?}"
+    );
+    assert_eq!(rows[0]["conversation_id"], CID_A);
+    assert_eq!(rows[0]["session_id"], "sess-new", "the CURRENT session");
+    let _ = std::fs::remove_dir_all(&home);
+    let _ = std::fs::remove_file(&fake);
+}
+
+#[tokio::test]
+async fn binding_happens_with_context_carry_disabled() {
+    // Conversation identity must never depend on a prompt feature flag. The fixture
+    // already has `context_carry: false`, which is exactly the point: the same alias
+    // binding as the test above must still hold.
+    let (home, vault, proj) = conv_fixture();
+    let fake = claude_writing_transcript(&proj, "sess-carryoff", 0);
+    let st = AppState::new(Config {
+        home: home.to_string_lossy().into_owned(),
+        vault: vault.clone(),
+        state_dir: None,
+        claude_bin: fake.to_string_lossy().into_owned(),
+        context_carry: false,
+        ..test_config()
+    });
+    assert!(!st.cfg.context_carry, "the flag really is off");
+    let body = post_turn(
+        &st,
+        &format!(r#"{{"mode":"ask","text":"hi","conversation_id":"{CID_A}"}}"#),
+    )
+    .await;
+    wait_for_done(&st, body["job_id"].as_str().unwrap()).await;
+    assert_eq!(
+        st.conversations.current_session(CID_A).as_deref(),
+        Some("sess-carryoff"),
+        "the reply's session bound even with JESSE_CONTEXT_CARRY off"
+    );
+    let _ = std::fs::remove_dir_all(&home);
+    let _ = std::fs::remove_file(&fake);
+}
+
+#[tokio::test]
+async fn two_bound_transcripts_yield_one_row_with_the_oldest_snippet_and_newest_mtime() {
+    let (home, vault, proj) = conv_fixture();
+    write_transcript(&proj, "seg-a", "the first question");
+    write_transcript(&proj, "seg-b", "a later question");
+    let st = conv_state(&home, &vault);
+    // Both stems were adopted separately at startup; bind them into one conversation.
+    st.conversations.register(CID_A, Some("phone"), 1_000);
+    st.conversations.bind_session(CID_A, "seg-a");
+    st.conversations.bind_session(CID_A, "seg-b");
+    set_mtime_secs(&proj.join("seg-a.jsonl"), 1_000);
+    set_mtime_secs(&proj.join("seg-b.jsonl"), 5_000);
+
+    let rows = conversation_rows(&st).await;
+    assert_eq!(rows.len(), 1, "one row for two transcripts: {rows:?}");
+    assert_eq!(
+        rows[0]["first_message"], "the first question",
+        "the snippet comes from the OLDEST segment, so a fork never changes the title"
+    );
+    assert_eq!(
+        rows[0]["last_modified"].as_u64(),
+        Some(5_000),
+        "last_modified is the MAX mtime across segments"
+    );
+    assert_eq!(
+        rows[0]["session_ids"].as_array().unwrap().len(),
+        2,
+        "the full alias list is exposed so a client binds its history once"
+    );
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+#[tokio::test]
+async fn a_legacy_transcript_is_adopted_deterministically() {
+    let (home, vault, proj) = conv_fixture();
+    write_transcript(&proj, "sess-legacy", "an old question");
+    let st = conv_state(&home, &vault);
+    let rows = conversation_rows(&st).await;
+    assert_eq!(rows.len(), 1);
+    let cid = rows[0]["conversation_id"].as_str().unwrap().to_string();
+    assert_eq!(
+        cid,
+        orphan_conversation_id("sess-legacy"),
+        "the id is the deterministic v5 of the session id"
+    );
+    // A second bridge over the same dir (a state dir lost and rebuilt from the
+    // transcripts alone) derives the IDENTICAL id, so a client's stored id stays valid.
+    let st2 = conv_state(&home, &vault);
+    let rows2 = conversation_rows(&st2).await;
+    assert_eq!(rows2[0]["conversation_id"], cid);
+    assert_eq!(
+        st2.conversations.len(),
+        1,
+        "adopting twice makes one record"
+    );
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+#[tokio::test]
+async fn title_mint_transcripts_are_excluded_from_the_list_and_404_on_hydrate() {
+    let (home, vault, proj) = conv_fixture();
+    std::fs::write(
+        proj.join("mint.jsonl"),
+        format!(
+            "{{\"type\":\"user\",\"message\":{{\"content\":{}}}}}\n",
+            serde_json::to_string(&build_title_prompt("a digest")).unwrap()
+        ),
+    )
+    .unwrap();
+    write_transcript(&proj, "sess-real", "a real question");
+    let st = conv_state(&home, &vault);
+
+    let rows = conversation_rows(&st).await;
+    assert_eq!(rows.len(), 1, "the mint transcript is not a conversation");
+    assert_eq!(rows[0]["session_id"], "sess-real");
+    assert_eq!(
+        st.conversations.conversation_for_session("mint"),
+        None,
+        "and it was never even registered"
+    );
+    // Its would-be deterministic id is unknown, so hydrating it is a 404.
+    let resp = app(st.clone())
+        .oneshot(conversation_hydrate_request(
+            Some("Bearer test-token"),
+            &orphan_conversation_id("mint"),
+            None,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+#[tokio::test]
+async fn conversations_list_honors_etag_304_and_since() {
+    let (home, vault, proj) = conv_fixture();
+    write_transcript(&proj, "old", "old q");
+    write_transcript(&proj, "new", "new q");
+    let st = conv_state(&home, &vault);
+    set_mtime_secs(&proj.join("old.jsonl"), 1_000);
+    set_mtime_secs(&proj.join("new.jsonl"), 3_000);
+
+    let resp = app(st.clone())
+        .oneshot(conversations_request(Some("Bearer test-token"), None, None))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let etag = resp
+        .headers()
+        .get("etag")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+    assert!(
+        etag.starts_with('"') && !etag.starts_with("W/"),
+        "strong ETag"
+    );
+    let body: Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    let ids: Vec<&str> = body["conversations"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| c["session_id"].as_str().unwrap())
+        .collect();
+    assert_eq!(ids, ["new", "old"], "newest first");
+
+    // The same ETag conditionally: 304 with the ETag and an empty body.
+    let resp = app(st.clone())
+        .oneshot(conversations_request(
+            Some("Bearer test-token"),
+            None,
+            Some(&etag),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_MODIFIED);
+    assert_eq!(resp.headers().get("etag").unwrap().to_str().unwrap(), etag);
+    assert!(body_string(resp).await.is_empty(), "304 has an empty body");
+    // A `*` wildcard matches too.
+    let resp = app(st.clone())
+        .oneshot(conversations_request(
+            Some("Bearer test-token"),
+            None,
+            Some("*"),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_MODIFIED);
+
+    // ?since is strictly greater-than.
+    let resp = app(st.clone())
+        .oneshot(conversations_request(
+            Some("Bearer test-token"),
+            Some(1_000),
+            None,
+        ))
+        .await
+        .unwrap();
+    let body: Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    let ids: Vec<&str> = body["conversations"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| c["session_id"].as_str().unwrap())
+        .collect();
+    assert_eq!(ids, ["new"]);
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+#[tokio::test]
+async fn conversation_delete_removes_every_transcript_tombstones_and_is_idempotent() {
+    let (home, vault, proj) = conv_fixture();
+    write_transcript(&proj, "seg-a", "q1");
+    write_transcript(&proj, "seg-b", "q2");
+    write_transcript(&proj, "keep", "untouched");
+    let st = conv_state(&home, &vault);
+    st.conversations.register(CID_A, Some("phone"), 1_000);
+    st.conversations.bind_session(CID_A, "seg-a");
+    st.conversations.bind_session(CID_A, "seg-b");
+    st.titles.set(CID_A, "Doomed");
+
+    let resp = app(st.clone())
+        .oneshot(conversation_delete_request(
+            Some("Bearer test-token"),
+            CID_A,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    assert!(
+        !proj.join("seg-a.jsonl").exists(),
+        "every bound transcript is gone"
+    );
+    assert!(!proj.join("seg-b.jsonl").exists());
+    assert!(
+        proj.join("keep.jsonl").exists(),
+        "and nothing else is touched"
+    );
+    assert!(
+        st.conversations.get(CID_A).is_none(),
+        "the record is forgotten"
+    );
+    assert_eq!(st.titles.get(CID_A), None, "the title cannot resurrect");
+
+    // The tombstone rides on the list, keyed on the conversation.
+    let resp = app(st.clone())
+        .oneshot(conversations_request(Some("Bearer test-token"), None, None))
+        .await
+        .unwrap();
+    let body: Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    let deleted: Vec<&str> = body["deleted"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t["conversation_id"].as_str().unwrap())
+        .collect();
+    assert!(
+        deleted.contains(&CID_A),
+        "conversation-keyed tombstone: {deleted:?}"
+    );
+    // And the legacy key space, so a pre-0.33 client on the deprecated route converges.
+    assert!(deleted.contains(&"seg-a"));
+    assert!(deleted.contains(&"seg-b"));
+    let rows = body["conversations"].as_array().unwrap();
+    assert_eq!(rows.len(), 1, "only the untouched conversation is listed");
+
+    // Idempotent: deleting again is still 204.
+    let resp = app(st.clone())
+        .oneshot(conversation_delete_request(
+            Some("Bearer test-token"),
+            CID_A,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    // A malformed id is a 400 and never reaches the filesystem. (A traversal attempt
+    // with a slash in it cannot even match the route: the path segment splits, so axum
+    // 404s it before the handler runs. The guard is what stops every other shape.)
+    for bad in [
+        "not-a-uuid",
+        "AAAAAAAA-2222-4333-8444-555555555555",
+        "..",
+        "%2e%2e",
+    ] {
+        let resp = app(st.clone())
+            .oneshot(conversation_delete_request(Some("Bearer test-token"), bad))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::BAD_REQUEST,
+            "rejected id {bad:?}"
+        );
+    }
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+#[tokio::test]
+async fn conversation_flags_apply_lww_and_404_on_an_unknown_conversation() {
+    let (home, vault, proj) = conv_fixture();
+    write_transcript(&proj, "sess-f", "q");
+    let st = conv_state(&home, &vault);
+    let cid = st
+        .conversations
+        .conversation_for_session("sess-f")
+        .expect("adopted at startup");
+
+    let resp = app(st.clone())
+        .oneshot(conversation_flags_request(
+            Some("Bearer test-token"),
+            &cid,
+            r#"{"favorite":true,"favorite_updated_ms":200}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let v: Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    assert_eq!(v["favorite"], true);
+    assert_eq!(v["favorite_updated_ms"], 200);
+
+    // An OLDER write is ignored (strictly-newer LWW, unchanged).
+    let resp = app(st.clone())
+        .oneshot(conversation_flags_request(
+            Some("Bearer test-token"),
+            &cid,
+            r#"{"favorite":false,"favorite_updated_ms":100}"#,
+        ))
+        .await
+        .unwrap();
+    let v: Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    assert_eq!(v["favorite"], true, "a stale write loses");
+    assert_eq!(v["favorite_updated_ms"], 200);
+
+    // An unknown conversation is a 404; a malformed id is a 400.
+    let resp = app(st.clone())
+        .oneshot(conversation_flags_request(
+            Some("Bearer test-token"),
+            CID_B,
+            r#"{"favorite":true,"favorite_updated_ms":1}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    let resp = app(st.clone())
+        .oneshot(conversation_flags_request(
+            Some("Bearer test-token"),
+            "nope",
+            r#"{"favorite":true,"favorite_updated_ms":1}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// Hydrate a conversation and return `(turns, next_cursor)`.
+async fn hydrate_conv(st: &AppState, cid: &str, after: Option<&str>) -> (Vec<Value>, String) {
+    let resp = app(st.clone())
+        .oneshot(conversation_hydrate_request(
+            Some("Bearer test-token"),
+            cid,
+            after,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body: Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    (
+        body["turns"].as_array().cloned().unwrap_or_default(),
+        body["next_cursor"].as_str().unwrap().to_string(),
+    )
+}
+
+#[tokio::test]
+async fn hydrate_reads_full_then_delta_then_across_a_segment_boundary_without_repeating() {
+    let (home, vault, proj) = conv_fixture();
+    let seg_a = concat!(
+        r#"{"type":"user","message":{"content":"a1"}}"#,
+        "\n",
+        r#"{"type":"assistant","message":{"content":[{"type":"text","text":"r1"}]}}"#,
+        "\n",
+    );
+    std::fs::write(proj.join("seg-a.jsonl"), seg_a).unwrap();
+    let st = conv_state(&home, &vault);
+    st.conversations.register(CID_A, Some("phone"), 1_000);
+    st.conversations.bind_session(CID_A, "seg-a");
+
+    // Full read.
+    let (turns, cursor) = hydrate_conv(&st, CID_A, None).await;
+    assert_eq!(turns.len(), 2);
+    assert_eq!(turns[0]["text"], "a1");
+    assert_eq!(turns[1]["text"], "r1");
+    assert_eq!(cursor, format!("0:{}", seg_a.len()));
+
+    // A caught-up delta read returns nothing and the same cursor.
+    let (turns, cursor2) = hydrate_conv(&st, CID_A, Some(&cursor)).await;
+    assert!(turns.is_empty(), "nothing new");
+    assert_eq!(cursor2, cursor);
+
+    // Append to segment A AND add a second segment: the delta must carry both, in
+    // order, each exactly once.
+    let more_a = "{\"type\":\"user\",\"message\":{\"content\":\"a2\"}}\n";
+    std::fs::write(proj.join("seg-a.jsonl"), format!("{seg_a}{more_a}")).unwrap();
+    let seg_b = concat!(
+        r#"{"type":"user","message":{"content":"b1"}}"#,
+        "\n",
+        r#"{"type":"assistant","message":{"content":[{"type":"text","text":"rb"}]}}"#,
+        "\n",
+    );
+    std::fs::write(proj.join("seg-b.jsonl"), seg_b).unwrap();
+    st.conversations.bind_session(CID_A, "seg-b");
+
+    let (turns, cursor3) = hydrate_conv(&st, CID_A, Some(&cursor)).await;
+    let texts: Vec<&str> = turns.iter().map(|t| t["text"].as_str().unwrap()).collect();
+    assert_eq!(
+        texts,
+        ["a2", "b1", "rb"],
+        "the cross-boundary delta is in segment order, nothing repeated, nothing lost"
+    );
+    assert_eq!(cursor3, format!("1:{}", seg_b.len()));
+
+    // And a read from that cursor is empty: no turn is ever served twice.
+    let (turns, _) = hydrate_conv(&st, CID_A, Some(&cursor3)).await;
+    assert!(turns.is_empty());
+
+    // The full read from scratch sees every turn exactly once, in order.
+    let (all, _) = hydrate_conv(&st, CID_A, None).await;
+    let texts: Vec<&str> = all.iter().map(|t| t["text"].as_str().unwrap()).collect();
+    assert_eq!(texts, ["a1", "r1", "a2", "b1", "rb"]);
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+#[tokio::test]
+async fn turn_keys_are_stable_across_hydrates_and_unique_within_a_conversation() {
+    let (home, vault, proj) = conv_fixture();
+    // The SAME text twice in each segment: a content hash would collapse them, a key
+    // that names the byte offset cannot.
+    let seg = concat!(
+        r#"{"type":"user","message":{"content":"same"}}"#,
+        "\n",
+        r#"{"type":"user","message":{"content":"same"}}"#,
+        "\n",
+    );
+    std::fs::write(proj.join("seg-a.jsonl"), seg).unwrap();
+    std::fs::write(proj.join("seg-b.jsonl"), seg).unwrap();
+    let st = conv_state(&home, &vault);
+    st.conversations.register(CID_A, Some("phone"), 1_000);
+    st.conversations.bind_session(CID_A, "seg-a");
+    st.conversations.bind_session(CID_A, "seg-b");
+
+    let (first, _) = hydrate_conv(&st, CID_A, None).await;
+    let keys: Vec<&str> = first
+        .iter()
+        .map(|t| t["turn_key"].as_str().unwrap())
+        .collect();
+    assert_eq!(keys.len(), 4, "four turns");
+    let unique: std::collections::HashSet<&&str> = keys.iter().collect();
+    assert_eq!(unique.len(), 4, "every key is unique: {keys:?}");
+    assert_eq!(keys[0], "seg-a:0");
+    assert!(
+        keys[2].starts_with("seg-b:"),
+        "the key names its own segment"
+    );
+
+    // Repeating the hydrate yields byte-identical keys.
+    let (again, _) = hydrate_conv(&st, CID_A, None).await;
+    let keys2: Vec<&str> = again
+        .iter()
+        .map(|t| t["turn_key"].as_str().unwrap())
+        .collect();
+    assert_eq!(keys, keys2, "keys are stable across hydrates");
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+#[tokio::test]
+async fn hydrate_skips_a_deleted_segment_and_advances_past_it() {
+    let (home, vault, proj) = conv_fixture();
+    let seg_b = "{\"type\":\"user\",\"message\":{\"content\":\"survivor\"}}\n";
+    std::fs::write(proj.join("seg-b.jsonl"), seg_b).unwrap();
+    let st = conv_state(&home, &vault);
+    st.conversations.register(CID_A, Some("phone"), 1_000);
+    // Segment 0 is bound but its file never exists (swept by GC, or deleted).
+    st.conversations.bind_session(CID_A, "seg-gone");
+    st.conversations.bind_session(CID_A, "seg-b");
+
+    // A cursor pointing AT the missing segment skips it and reads on.
+    let (turns, cursor) = hydrate_conv(&st, CID_A, Some("0:0")).await;
+    let texts: Vec<&str> = turns.iter().map(|t| t["text"].as_str().unwrap()).collect();
+    assert_eq!(
+        texts,
+        ["survivor"],
+        "the missing segment is skipped, not an error"
+    );
+    assert_eq!(
+        cursor,
+        format!("1:{}", seg_b.len()),
+        "the cursor advanced past it"
+    );
+
+    // Malformed cursors are 400s, never a silent reset to zero (which would replay the
+    // whole conversation and duplicate every turn on the client).
+    for bad in ["abc", "0", "0:1:2", "-1:0", "0:x"] {
+        let resp = app(st.clone())
+            .oneshot(conversation_hydrate_request(
+                Some("Bearer test-token"),
+                CID_A,
+                Some(bad),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::BAD_REQUEST,
+            "rejected cursor {bad:?}"
+        );
+    }
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+#[tokio::test]
+async fn a_restart_reloads_the_registry_and_a_resume_still_resolves() {
+    let (home, vault, proj) = conv_fixture();
+    write_transcript(&proj, "sess-live", "q");
+    let state_dir = std::env::temp_dir().join(format!("jesse-state-{}", random_hex()));
+    std::fs::create_dir_all(&state_dir).unwrap();
+    let cfg = Config {
+        home: home.to_string_lossy().into_owned(),
+        vault: vault.clone(),
+        state_dir: Some(state_dir.to_string_lossy().into_owned()),
+        ..test_config()
+    };
+    {
+        let st = AppState::new(cfg.clone());
+        st.conversations.register(CID_A, Some("phone"), 1_000);
+        st.conversations.bind_session(CID_A, "sess-live");
+        st.titles.set(CID_A, "Persisted");
+    }
+    // A fresh bridge over the same state dir.
+    let st2 = AppState::new(cfg.clone());
+    let rec = st2.conversations.get(CID_A).expect("the record reloaded");
+    assert_eq!(rec.session_ids, vec!["sess-live".to_string()]);
+    assert_eq!(rec.registered_ms, 1_000, "timestamps survive");
+    assert_eq!(
+        st2.conversations
+            .conversation_for_session("sess-live")
+            .as_deref(),
+        Some(CID_A),
+        "the reverse index is rebuilt from the records, not persisted"
+    );
+    assert_eq!(st2.titles.get(CID_A).as_deref(), Some("Persisted"));
+    // And a resume after the restart still targets the right transcript.
+    let resumed = resolve_conversation_resume(&st2.conversations, CID_A, None);
+    assert_eq!(resumed.as_deref(), Some("sess-live"));
+    assert_eq!(
+        resolve_resume_session(&cfg, resumed.as_deref()),
+        Some("sess-live"),
+        "and the transcript is still there, so the resume is not dropped"
+    );
+    let _ = std::fs::remove_dir_all(&home);
+    let _ = std::fs::remove_dir_all(&state_dir);
+}
+
+#[tokio::test]
+async fn the_key_migration_runs_once_and_survives_a_restart() {
+    let (home, vault, proj) = conv_fixture();
+    write_transcript(&proj, "sess-old", "q");
+    let state_dir = std::env::temp_dir().join(format!("jesse-state-{}", random_hex()));
+    std::fs::create_dir_all(&state_dir).unwrap();
+    // A pre-upgrade state dir: titles and flags keyed on the SESSION id.
+    std::fs::write(
+        state_dir.join("titles.json"),
+        r#"{"v":1,"titles":{"sess-old":"Legacy Title"}}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        state_dir.join("flags.json"),
+        r#"{"v":1,"flags":{"sess-old":{"favorite":true,"favorite_updated_ms":777}}}"#,
+    )
+    .unwrap();
+    let cfg = Config {
+        home: home.to_string_lossy().into_owned(),
+        vault: vault.clone(),
+        state_dir: Some(state_dir.to_string_lossy().into_owned()),
+        ..test_config()
+    };
+    let st = AppState::new(cfg.clone());
+    let cid = orphan_conversation_id("sess-old");
+    assert_eq!(
+        st.titles.get(&cid).as_deref(),
+        Some("Legacy Title"),
+        "the title moved onto the conversation"
+    );
+    assert_eq!(st.titles.get("sess-old"), None, "and off the session id");
+    let f = st.flags.get(&cid);
+    assert!(
+        f.favorite && f.favorite_updated_ms == 777,
+        "the flag moved with its last-writer-wins clock intact"
+    );
+    assert!(st.conversations.migration_done());
+
+    // A restart does NOT re-run it, and nothing regresses.
+    let st2 = AppState::new(cfg);
+    assert!(st2.conversations.migration_done());
+    assert_eq!(st2.titles.get(&cid).as_deref(), Some("Legacy Title"));
+    assert!(st2.flags.get(&cid).favorite);
+    assert_eq!(st2.titles.len(), 1, "no duplicate key was created");
+    let _ = std::fs::remove_dir_all(&home);
+    let _ = std::fs::remove_dir_all(&state_dir);
+}
+
+#[tokio::test]
+async fn in_flight_transcript_produces_no_row_then_binds_on_terminal() {
+    // THE headline regression. A conversation is registered at accept time with no
+    // bound session, and the CLI writes its transcript file WHILE the turn runs. A list
+    // refresh landing in that window must NOT turn that stem into a second
+    // conversation, or the client adopts a duplicate. When the turn terminates the stem
+    // must belong to the conversation that produced it, and the list must show exactly
+    // one row.
+    let (home, vault, proj) = conv_fixture();
+    // Writes its transcript immediately, then sleeps before answering: the same
+    // ordering the real CLI has (verified against claude 2.1.220, where the file
+    // appears within a second of spawn on a multi-second turn).
+    let fake = claude_writing_transcript(&proj, "sess-mid", 2);
+    let st = AppState::new(Config {
+        home: home.to_string_lossy().into_owned(),
+        vault: vault.clone(),
+        state_dir: None,
+        claude_bin: fake.to_string_lossy().into_owned(),
+        timeout_secs: 30,
+        ..test_config()
+    });
+
+    let body = post_turn(
+        &st,
+        &format!(r#"{{"mode":"ask","text":"hi","conversation_id":"{CID_A}"}}"#),
+    )
+    .await;
+    let job_id = body["job_id"].as_str().unwrap().to_string();
+
+    // Wait until the transcript really is on disk, so this test asserts the suppression
+    // and not a race it happened to win.
+    let mut appeared = false;
+    for _ in 0..200 {
+        if proj.join("sess-mid.jsonl").exists() {
+            appeared = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(appeared, "the fake CLI wrote its transcript mid-turn");
+
+    // MID-TURN list refresh, twice, as backgrounding and reopening the app does.
+    for _ in 0..2 {
+        let rows = conversation_rows(&st).await;
+        assert_eq!(
+            rows.len(),
+            1,
+            "a mid-turn refresh must show exactly one conversation: {rows:?}"
+        );
+        assert_eq!(rows[0]["conversation_id"], CID_A);
+        assert!(
+            rows[0]["session_id"].is_null(),
+            "the in-flight transcript is not yet advertised as a session"
+        );
+    }
+    assert_eq!(
+        st.conversations.len(),
+        1,
+        "and no second RECORD was created either"
+    );
+    assert_eq!(
+        st.conversations.conversation_for_session("sess-mid"),
+        None,
+        "the suppressed stem is not bound to anything yet"
+    );
+
+    wait_for_done(&st, &job_id).await;
+
+    assert_eq!(
+        st.conversations
+            .conversation_for_session("sess-mid")
+            .as_deref(),
+        Some(CID_A),
+        "on termination the stem belongs to the conversation that produced it"
+    );
+    let rows = conversation_rows(&st).await;
+    assert_eq!(rows.len(), 1, "still exactly one row: {rows:?}");
+    assert_eq!(rows[0]["session_id"], "sess-mid");
+    let _ = std::fs::remove_dir_all(&home);
+    let _ = std::fs::remove_file(&fake);
+}
+
+#[tokio::test]
+async fn a_failed_turn_still_binds_the_transcript_it_created() {
+    // The failure variant: the CLI writes its transcript and then dies without ever
+    // returning a session id. The reply binding has nothing to work with, so the
+    // terminal STEM DIFF is the only thing that can claim the file. Without it the stem
+    // would be adopted on the next refresh as a separate conversation.
+    let (home, vault, proj) = conv_fixture();
+    let script = format!(
+        "#!/bin/sh\n\
+         printf '%s\\n' '{{\"type\":\"user\",\"message\":{{\"content\":\"orphaned\"}}}}' > '{}/sess-failed.jsonl'\n\
+         echo 'boom' >&2\n\
+         exit 1\n",
+        proj.display()
+    );
+    let fake = write_fake_claude(&script);
+    let st = AppState::new(Config {
+        home: home.to_string_lossy().into_owned(),
+        vault: vault.clone(),
+        state_dir: None,
+        claude_bin: fake.to_string_lossy().into_owned(),
+        timeout_secs: 30,
+        ..test_config()
+    });
+
+    let body = post_turn(
+        &st,
+        &format!(r#"{{"mode":"ask","text":"hi","conversation_id":"{CID_A}"}}"#),
+    )
+    .await;
+    let job_id = body["job_id"].as_str().unwrap().to_string();
+    let mut terminal = false;
+    for _ in 0..200 {
+        let v = result_status(&st, &job_id).await;
+        if v["status"] != "running" {
+            assert_eq!(v["status"], "failed", "the turn really failed: {v}");
+            terminal = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(terminal, "the turn reached a terminal state");
+
+    assert_eq!(
+        st.conversations
+            .conversation_for_session("sess-failed")
+            .as_deref(),
+        Some(CID_A),
+        "the stem diff bound the transcript even with no reply session id"
+    );
+    let rows = conversation_rows(&st).await;
+    assert_eq!(rows.len(), 1, "one row, not two: {rows:?}");
+    assert_eq!(rows[0]["conversation_id"], CID_A);
+    let _ = std::fs::remove_dir_all(&home);
+    let _ = std::fs::remove_file(&fake);
+}
+
+#[tokio::test]
+async fn a_real_conversation_steals_an_orphan_adopted_transcript_back() {
+    // The repair path end to end: a refresh orphan-adopts a transcript (say it beat the
+    // suppression window, or a previous bridge left it behind), and the turn that
+    // actually produced it then claims it. The orphan row must disappear.
+    let (home, vault, proj) = conv_fixture();
+    write_transcript(&proj, "sess-x", "q");
+    let st = conv_state(&home, &vault);
+    let orphan = orphan_conversation_id("sess-x");
+    assert_eq!(
+        st.conversations
+            .conversation_for_session("sess-x")
+            .as_deref(),
+        Some(&orphan[..]),
+        "startup adopted it as an orphan"
+    );
+    assert_eq!(conversation_rows(&st).await.len(), 1);
+
+    st.conversations.register(CID_A, Some("phone"), 2_000);
+    st.conversations.bind_session(CID_A, "sess-x");
+
+    assert_eq!(
+        st.conversations
+            .conversation_for_session("sess-x")
+            .as_deref(),
+        Some(CID_A),
+        "the real conversation won the session"
+    );
+    assert!(
+        st.conversations.get(&orphan).is_none(),
+        "the emptied orphan record is dropped"
+    );
+    let rows = conversation_rows(&st).await;
+    assert_eq!(rows.len(), 1, "one row remains: {rows:?}");
+    assert_eq!(rows[0]["conversation_id"], CID_A);
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+#[tokio::test]
+async fn the_deprecated_session_routes_resolve_through_the_reverse_index() {
+    let (home, vault, proj) = conv_fixture();
+    write_transcript(&proj, "seg-a", "the first question");
+    write_transcript(&proj, "seg-b", "later");
+    let st = conv_state(&home, &vault);
+    st.conversations.register(CID_A, Some("phone"), 1_000);
+    st.conversations.bind_session(CID_A, "seg-a");
+    st.conversations.bind_session(CID_A, "seg-b");
+
+    // GET /jesse/sessions returns the OLD shape, projected onto the current session.
+    let resp = app(st.clone())
+        .oneshot(sessions_request(Some("Bearer test-token"), None, None))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body: Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    let sessions = body["sessions"].as_array().unwrap();
+    assert_eq!(sessions.len(), 1, "one conversation, one row");
+    assert_eq!(sessions[0]["session_id"], "seg-b", "the CURRENT session");
+    assert_eq!(sessions[0]["first_message"], "the first question");
+    assert!(
+        sessions[0].get("conversation_id").is_none(),
+        "the old shape is unchanged"
+    );
+
+    // The old hydrate route still works against that one file, with no turn_key.
+    let resp = app(st.clone())
+        .oneshot(hydrate_request(Some("Bearer test-token"), "seg-a", None))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body: Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    assert!(
+        body["next_offset"].as_u64().is_some(),
+        "the old cursor field"
+    );
+    let turns = body["turns"].as_array().unwrap();
+    assert_eq!(turns.len(), 1);
+    assert!(
+        turns[0].get("turn_key").is_none(),
+        "the deprecated route omits turn_key"
+    );
+
+    // POST /jesse/session/{id}/flags resolves to the CONVERSATION row.
+    let resp = app(st.clone())
+        .oneshot(session_flags_request(
+            Some("Bearer test-token"),
+            "seg-a",
+            r#"{"archived":true,"archived_updated_ms":900}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let f = st.flags.get(CID_A);
+    assert!(
+        f.archived && f.archived_updated_ms == 900,
+        "an older client's flag write lands on the conversation row"
+    );
+    // An id that resolves to nothing is still a 404.
+    let resp = app(st.clone())
+        .oneshot(session_flags_request(
+            Some("Bearer test-token"),
+            "local-abc",
+            r#"{"archived":true,"archived_updated_ms":1}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+
+    // DELETE /jesse/session/{id} deletes the WHOLE conversation and propagates as a
+    // legacy session-keyed tombstone on the deprecated list.
+    let resp = app(st.clone())
+        .oneshot(session_delete_request(Some("Bearer test-token"), "seg-a"))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    assert!(!proj.join("seg-a.jsonl").exists());
+    assert!(
+        !proj.join("seg-b.jsonl").exists(),
+        "the alias transcript went too"
+    );
+    let resp = app(st.clone())
+        .oneshot(sessions_request(Some("Bearer test-token"), None, None))
+        .await
+        .unwrap();
+    let body: Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    let deleted: Vec<&str> = body["deleted"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t["session_id"].as_str().unwrap())
+        .collect();
+    assert!(
+        deleted.contains(&"seg-a") && deleted.contains(&"seg-b"),
+        "a pre-0.33 client still receives session-keyed delete propagation: {deleted:?}"
+    );
+    assert!(body["sessions"].as_array().unwrap().is_empty());
+    let _ = std::fs::remove_dir_all(&home);
 }
