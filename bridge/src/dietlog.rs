@@ -37,6 +37,7 @@
 //! ([`run_diet_pipeline`]) is a thin sequencer over the tested stages.
 
 use crate::*;
+use std::sync::LazyLock;
 
 // ---- Bounds ---------------------------------------------------------------
 
@@ -56,16 +57,249 @@ pub const DIET_EXTRACT_TIMEOUT_SECS: u64 = 60;
 /// an upstream blip, on overrun the pipeline degrades to the hosted turn (rung 3).
 pub const DIET_VERIFY_TIMEOUT_SECS: u64 = 30;
 
+// ---- The nutrient column table (ONE definition of every nutrient column) ----
+//
+// Every nutrient column past the core macros is described here EXACTLY ONCE: its
+// `food-log.csv` column name, its extract-schema JSON key, its meal-wire key (or
+// none), its unit, its app-snapshot key, and its FILL CLASS. Everything downstream
+// is DERIVED from this table — the CSV header ([`food_log_header`]), the keys the
+// extract schema accepts ([`parse_food`], [`diet_extract_schema`]), the nutrient
+// section of the extract prompt ([`build_diet_extract_prompt`]), the nutrient cells
+// of the appended row ([`food_row`]), the nutrient fields of the derived Apple
+// Health mirror ([`build_meal_log_from_food_rows`]), and the per-day nutrient
+// aggregates the app snapshot reads ([`diet::nutrient_cols`]).
+//
+// Adding a nutrient is therefore ONE table row, not eight edits in eight places —
+// and `synthetic_nutrient_flows_through_header_schema_and_prompt` proves nothing
+// downstream is hardcoded past this table.
+
+/// How a nutrient column is expected to be FILLED — the distinction the completion
+/// path and the extract prompt both key on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FillClass {
+    /// Expected on every row whose food is knowable: a label prints it, or standard
+    /// food-composition values for a label-less whole food supply it. A blank cell
+    /// here is INCOMPLETE data (what the Phase-4 completeness figure counts), not a
+    /// meaningful "this food has none".
+    ExpectedWhenKnowable,
+    /// Present only in marine foods (and small amounts in eggs/dairy). A blank cell
+    /// is the NORMAL, correct state for everything else, so it is never counted as
+    /// incomplete and never filled by hosted completion.
+    MarineOnly,
+}
+
+/// One nutrient column, described once. `getter`/`setter` are the field accessors on
+/// [`FoodEntry`] and `wire_setter` the one on [`Meal`], so a table row owns its own
+/// plumbing and no downstream match/list repeats the name.
+#[derive(Clone, Copy)]
+pub struct NutrientCol {
+    /// The `food-log.csv` column name.
+    pub csv: &'static str,
+    /// The extract-schema JSON key (also the completion key on a verify verdict).
+    pub key: &'static str,
+    /// The `JESSE_MEAL_LOG` meal-wire key, or `None` when the nutrient has no
+    /// HealthKit type and so never rides the wire (omega-3: there is no EPA/DHA
+    /// HealthKit quantity).
+    pub wire: Option<&'static str>,
+    /// The short key the app's diet snapshot uses (`GET /jesse/diet`).
+    pub app_key: &'static str,
+    /// `mg` or `g` — stated in the prompt so the child cannot mix units.
+    pub unit: &'static str,
+    /// Whether a blank cell means "incomplete" or "correctly absent".
+    pub fill: FillClass,
+    getter: fn(&FoodEntry) -> Option<f64>,
+    setter: fn(&mut FoodEntry, Option<f64>),
+    wire_setter: Option<fn(&mut Meal, Option<f64>)>,
+}
+
+impl NutrientCol {
+    /// This nutrient's value on a food entry.
+    pub fn get(&self, f: &FoodEntry) -> Option<f64> {
+        (self.getter)(f)
+    }
+    /// Set this nutrient's value on a food entry.
+    pub fn set(&self, f: &mut FoodEntry, v: Option<f64>) {
+        (self.setter)(f, v)
+    }
+    /// Set this nutrient's summed value on a mirror meal (no-op when the nutrient
+    /// has no wire field).
+    pub fn set_wire(&self, m: &mut Meal, v: Option<f64>) {
+        if let Some(set) = self.wire_setter {
+            set(m, v)
+        }
+    }
+    /// Whether a blank cell for this nutrient counts as incomplete data.
+    pub fn expected(&self) -> bool {
+        self.fill == FillClass::ExpectedWhenKnowable
+    }
+}
+
+impl std::fmt::Debug for NutrientCol {
+    // Hand-written: `fn` pointers have no useful Debug, and the table's identity is
+    // its names + class.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NutrientCol")
+            .field("csv", &self.csv)
+            .field("key", &self.key)
+            .field("wire", &self.wire)
+            .field("app_key", &self.app_key)
+            .field("unit", &self.unit)
+            .field("fill", &self.fill)
+            .finish()
+    }
+}
+
+/// The nutrient columns, in CSV order. Seven are [`FillClass::ExpectedWhenKnowable`];
+/// omega-3 alone is [`FillClass::MarineOnly`] (marine EPA+DHA, never plant ALA) and is
+/// also the one nutrient with no meal-wire field.
+pub const NUTRIENT_COLUMNS: &[NutrientCol] = &[
+    NutrientCol {
+        csv: "Fiber_g",
+        key: "fiber_g",
+        wire: Some("fiber_g"),
+        app_key: "fiber",
+        unit: "g",
+        fill: FillClass::ExpectedWhenKnowable,
+        getter: |f| f.fiber_g,
+        setter: |f, v| f.fiber_g = v,
+        wire_setter: Some(|m, v| m.fiber_g = v),
+    },
+    NutrientCol {
+        csv: "Sodium_mg",
+        key: "sodium_mg",
+        wire: Some("sodium_mg"),
+        app_key: "na",
+        unit: "mg",
+        fill: FillClass::ExpectedWhenKnowable,
+        getter: |f| f.sodium_mg,
+        setter: |f, v| f.sodium_mg = v,
+        wire_setter: Some(|m, v| m.sodium_mg = v),
+    },
+    NutrientCol {
+        csv: "SatFat_g",
+        key: "satfat_g",
+        wire: Some("satfat_g"),
+        app_key: "satf",
+        unit: "g",
+        fill: FillClass::ExpectedWhenKnowable,
+        getter: |f| f.satfat_g,
+        setter: |f, v| f.satfat_g = v,
+        wire_setter: Some(|m, v| m.satfat_g = v),
+    },
+    NutrientCol {
+        csv: "Sugar_g",
+        key: "sugar_g",
+        wire: Some("sugar_g"),
+        app_key: "sug",
+        unit: "g",
+        fill: FillClass::ExpectedWhenKnowable,
+        getter: |f| f.sugar_g,
+        setter: |f, v| f.sugar_g = v,
+        wire_setter: Some(|m, v| m.sugar_g = v),
+    },
+    NutrientCol {
+        csv: "Potassium_mg",
+        key: "potassium_mg",
+        wire: Some("potassium_mg"),
+        app_key: "k",
+        unit: "mg",
+        fill: FillClass::ExpectedWhenKnowable,
+        getter: |f| f.potassium_mg,
+        setter: |f, v| f.potassium_mg = v,
+        wire_setter: Some(|m, v| m.potassium_mg = v),
+    },
+    NutrientCol {
+        csv: "Calcium_mg",
+        key: "calcium_mg",
+        wire: Some("calcium_mg"),
+        app_key: "ca",
+        unit: "mg",
+        fill: FillClass::ExpectedWhenKnowable,
+        getter: |f| f.calcium_mg,
+        setter: |f, v| f.calcium_mg = v,
+        wire_setter: Some(|m, v| m.calcium_mg = v),
+    },
+    NutrientCol {
+        csv: "Omega3_mg",
+        key: "omega3_mg",
+        // No HealthKit EPA+DHA quantity (`dietaryFatPolyunsaturated` includes plant
+        // ALA, so it would be wrong), hence no meal-wire field.
+        wire: None,
+        app_key: "o3",
+        unit: "mg",
+        fill: FillClass::MarineOnly,
+        getter: |f| f.omega3_mg,
+        setter: |f, v| f.omega3_mg = v,
+        wire_setter: None,
+    },
+    NutrientCol {
+        csv: "Magnesium_mg",
+        key: "magnesium_mg",
+        wire: Some("magnesium_mg"),
+        app_key: "mg",
+        unit: "mg",
+        fill: FillClass::ExpectedWhenKnowable,
+        getter: |f| f.magnesium_mg,
+        setter: |f, v| f.magnesium_mg = v,
+        wire_setter: Some(|m, v| m.magnesium_mg = v),
+    },
+];
+
+/// How many nutrient columns a row is EXPECTED to carry (the denominator of the
+/// completeness figure): every [`FillClass::ExpectedWhenKnowable`] column.
+pub fn expected_nutrient_count() -> usize {
+    NUTRIENT_COLUMNS.iter().filter(|c| c.expected()).count()
+}
+
 // ---- Canonical CSV headers (single source of truth) -----------------------
 //
-// These header consts are the ONE definition of each log's column contract. BOTH
-// the append path (the row builders below target exactly these columns, in order)
-// AND the extract prompt (which inlines them verbatim) consume them, so the prompt
-// can never describe a schema the writer doesn't produce. `prompt_contract_matches_
+// These headers are the ONE definition of each log's column contract. BOTH the
+// append path (the row builders below target exactly these columns, in order) AND
+// the extract prompt (which inlines them verbatim) consume them, so the prompt can
+// never describe a schema the writer doesn't produce. `prompt_contract_matches_
 // append_schema` is the drift guard that enforces this (the parity mitigation).
+//
+// The food header's nutrient tail is DERIVED from [`NUTRIENT_COLUMNS`]; only the 14
+// core columns are spelled out here.
 
-pub const FOOD_LOG_HEADER: &str =
-    "Date,Meal,Item,Amount,Unit,Cal_per_100g,Grams,Calories,Protein_g,Fat_g,Carbs_g,Notes,Time,Meal_Type,Fiber_g,Sodium_mg,SatFat_g,Sugar_g,Potassium_mg,Calcium_mg,Omega3_mg,Magnesium_mg";
+/// The 14 core `food-log.csv` columns, in order, ahead of the nutrient tail.
+const FOOD_LOG_CORE_COLUMNS: &[&str] = &[
+    "Date",
+    "Meal",
+    "Item",
+    "Amount",
+    "Unit",
+    "Cal_per_100g",
+    "Grams",
+    "Calories",
+    "Protein_g",
+    "Fat_g",
+    "Carbs_g",
+    "Notes",
+    "Time",
+    "Meal_Type",
+];
+
+/// Build the food header for an arbitrary nutrient table (the parameterized form the
+/// synthetic-ninth-nutrient test drives; production calls [`food_log_header`]).
+fn build_food_log_header(cols: &[NutrientCol]) -> String {
+    FOOD_LOG_CORE_COLUMNS
+        .iter()
+        .copied()
+        .chain(cols.iter().map(|c| c.csv))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+static FOOD_LOG_HEADER_CELL: LazyLock<String> =
+    LazyLock::new(|| build_food_log_header(NUTRIENT_COLUMNS));
+
+/// The canonical `food-log.csv` header line: the 14 core columns plus one column per
+/// [`NUTRIENT_COLUMNS`] entry, in table order.
+pub fn food_log_header() -> &'static str {
+    &FOOD_LOG_HEADER_CELL
+}
+
 pub const EXERCISE_LOG_HEADER: &str =
     "Date,Type,Description,Distance_km,Duration,Pace_min_per_km,Elevation_m,Avg_HR,Cadence,Calories,Plan_Source,Notes,Start_Time";
 pub const WEIGHT_LOG_HEADER: &str =
@@ -114,6 +348,16 @@ pub struct FoodEntry {
     pub omega3_mg: Option<f64>,
     pub magnesium_mg: Option<f64>,
     pub notes: Option<String>,
+    /// The extract child's "I cannot identify this composite" signal: an unnamed
+    /// restaurant dish, an unknown sauce — something whose nutrients cannot be looked
+    /// up from a label OR from food-composition values for a named whole food. Such a
+    /// row still OMITS unknown nutrients (never guesses), and this flag tells the
+    /// hosted micronutrient completion pass and the completeness figure to skip it
+    /// rather than chase numbers nobody can know. Defaults to `false` (a plain named
+    /// food), and `#[serde(default)]` keeps the queue's persisted entries readable
+    /// across the upgrade.
+    #[serde(default)]
+    pub unknowable_composite: bool,
 }
 
 /// One extracted exercise session.
@@ -351,7 +595,9 @@ fn opt_extract_num_field(
     }
 }
 
-const FOOD_KEYS: &[&str] = &[
+/// The non-nutrient keys a food entry may carry; the nutrient keys come from
+/// [`NUTRIENT_COLUMNS`] (see [`is_food_key`]) so there is no second list of them.
+const FOOD_CORE_KEYS: &[&str] = &[
     "kind",
     "name",
     "meal",
@@ -362,20 +608,30 @@ const FOOD_KEYS: &[&str] = &[
     "protein_g",
     "carbs_g",
     "fat_g",
-    "fiber_g",
-    "sodium_mg",
-    "satfat_g",
-    "sugar_g",
-    "potassium_mg",
-    "calcium_mg",
-    "omega3_mg",
-    "magnesium_mg",
+    "unknowable_composite",
     "notes",
 ];
 
+/// Whether `k` is a key the food schema accepts: a core key or a nutrient key from
+/// the table. Every nutrient key is therefore accepted by construction.
+fn is_food_key(k: &str) -> bool {
+    FOOD_CORE_KEYS.contains(&k) || NUTRIENT_COLUMNS.iter().any(|c| c.key == k)
+}
+
+/// An optional boolean flag: absent or `null` → `false`; a real boolean is taken as
+/// given. Any non-boolean value is a schema violation (the child must not send a
+/// string "true").
+fn opt_bool_field(m: &serde_json::Map<String, Value>, key: &str) -> Result<bool, String> {
+    match m.get(key) {
+        None | Some(Value::Null) => Ok(false),
+        Some(Value::Bool(b)) => Ok(*b),
+        Some(_) => Err(format!("`{key}` is not a boolean")),
+    }
+}
+
 fn parse_food(m: &serde_json::Map<String, Value>) -> Result<FoodEntry, String> {
     for k in m.keys() {
-        if !FOOD_KEYS.contains(&k.as_str()) {
+        if !is_food_key(k) {
             return Err(format!("unknown food field {k:?}"));
         }
     }
@@ -385,7 +641,7 @@ fn parse_food(m: &serde_json::Map<String, Value>) -> Result<FoodEntry, String> {
             "food entry name {name:?} spans multiple items — the schema requires ONE entry per item"
         ));
     }
-    Ok(FoodEntry {
+    let mut f = FoodEntry {
         name,
         meal: req_str(m, "meal")?,
         // Optional: the bridge owns the received-at fallback (see the field docs).
@@ -396,16 +652,22 @@ fn parse_food(m: &serde_json::Map<String, Value>) -> Result<FoodEntry, String> {
         protein_g: opt_extract_num_field(m, "protein_g")?,
         carbs_g: opt_extract_num_field(m, "carbs_g")?,
         fat_g: opt_extract_num_field(m, "fat_g")?,
-        fiber_g: opt_extract_num_field(m, "fiber_g")?,
-        sodium_mg: opt_extract_num_field(m, "sodium_mg")?,
-        satfat_g: opt_extract_num_field(m, "satfat_g")?,
-        sugar_g: opt_extract_num_field(m, "sugar_g")?,
-        potassium_mg: opt_extract_num_field(m, "potassium_mg")?,
-        calcium_mg: opt_extract_num_field(m, "calcium_mg")?,
-        omega3_mg: opt_extract_num_field(m, "omega3_mg")?,
-        magnesium_mg: opt_extract_num_field(m, "magnesium_mg")?,
+        // Every nutrient is read from the table below, so none is named twice here.
+        fiber_g: None,
+        sodium_mg: None,
+        satfat_g: None,
+        sugar_g: None,
+        potassium_mg: None,
+        calcium_mg: None,
+        omega3_mg: None,
+        magnesium_mg: None,
         notes: opt_str_field(m, "notes"),
-    })
+        unknowable_composite: opt_bool_field(m, "unknowable_composite")?,
+    };
+    for c in NUTRIENT_COLUMNS {
+        c.set(&mut f, opt_extract_num_field(m, c.key)?);
+    }
+    Ok(f)
 }
 
 const EXERCISE_KEYS: &[&str] = &[
@@ -494,7 +756,8 @@ pub enum Verdict {
 }
 
 /// A parsed per-entry verdict: the verdict plus any corrected macro values the
-/// verifier supplied (only meaningful for `Correct`).
+/// verifier supplied (only meaningful for `Correct`), plus the optional
+/// micronutrient completion for the row.
 #[derive(Debug, Clone, PartialEq)]
 pub struct EntryVerdict {
     pub verdict: Verdict,
@@ -504,6 +767,90 @@ pub struct EntryVerdict {
     pub fat_g: Option<f64>,
     pub fiber_g: Option<f64>,
     pub reason: Option<String>,
+    /// The hosted completion for this row: food-composition values for the EXPECTED
+    /// nutrient columns the extract left blank. Default/empty when the verifier
+    /// supplied none — completion is additive, so an old-shaped verdict (no `micros`
+    /// key) parses exactly as before and simply completes nothing.
+    pub completion: MicroCompletion,
+}
+
+/// The verifier's micronutrient completion for ONE row: values keyed by nutrient
+/// schema key plus the one-line reference basis it used. `malformed` records that the
+/// verifier DID send a completion block but it was unusable (not an object, a
+/// non-numeric / negative / non-finite value) — the block is then dropped whole (no
+/// partial trust) and the turn records the degrade reason. The merge rules live in
+/// [`complete_food_micros`], never in the model.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct MicroCompletion {
+    /// Nutrient schema key → value, already validated finite and non-negative.
+    pub values: std::collections::BTreeMap<String, f64>,
+    /// One line naming the food-composition basis and the scaling used, e.g.
+    /// `USDA SR Legacy 09040 banana raw, scaled to 118 g edible`.
+    pub basis: Option<String>,
+    /// The verifier sent a completion block that could not be used.
+    pub malformed: bool,
+}
+
+impl MicroCompletion {
+    /// Whether the verifier supplied nothing usable for this row.
+    pub fn is_empty(&self) -> bool {
+        self.values.is_empty() && self.basis.is_none()
+    }
+}
+
+/// Parse one verdict's optional `micros` / `reference_basis` completion block.
+/// Tolerant by design (completion is a degrade-only enhancement): an absent or null
+/// block yields the default, and anything unusable sets `malformed` and yields NO
+/// values rather than failing the verdict — the row is then appended exactly as the
+/// extract produced it.
+fn parse_completion(m: &serde_json::Map<String, Value>) -> MicroCompletion {
+    let mut out = MicroCompletion {
+        basis: opt_str_field(m, "reference_basis").map(|s| sanitize_basis(&s)),
+        ..Default::default()
+    };
+    let raw = match m.get("micros") {
+        None | Some(Value::Null) => return out,
+        Some(v) => v,
+    };
+    let Some(obj) = raw.as_object() else {
+        out.malformed = true;
+        return out;
+    };
+    for (k, v) in obj {
+        // A null/blank is the verifier DECLINING this nutrient — normal, not malformed:
+        // the cell stays blank (never 0).
+        match v {
+            Value::Null => continue,
+            Value::String(s) if s.trim().is_empty() => continue,
+            _ => {}
+        }
+        match v.as_f64() {
+            Some(n) if n.is_finite() && n >= 0.0 => {
+                out.values.insert(k.clone(), n);
+            }
+            // One unusable value discredits the whole block: drop it all, no partial
+            // trust in numbers we cannot validate.
+            _ => {
+                out.values.clear();
+                out.malformed = true;
+                return out;
+            }
+        }
+    }
+    out
+}
+
+/// Squeeze a reference-basis string into ONE safe CSV note: collapse every run of
+/// whitespace (including the CR/LF that a bare newline in a CSV cell would smuggle
+/// in) to a single space, trim, and cap the length. The Notes cell is still
+/// RFC-4180-quoted by [`csv_field`]; this keeps the cell one readable line.
+fn sanitize_basis(s: &str) -> String {
+    const MAX_BASIS_CHARS: usize = 180;
+    let one_line = s.split_whitespace().collect::<Vec<_>>().join(" ");
+    match one_line.char_indices().nth(MAX_BASIS_CHARS) {
+        Some((i, _)) => one_line[..i].trim_end().to_string(),
+        None => one_line,
+    }
 }
 
 /// Parse the verify child's JSON into one verdict per entry (order-aligned with the
@@ -540,6 +887,9 @@ pub fn parse_verify_verdicts(json: &str, n_entries: usize) -> Result<Vec<EntryVe
             fat_g: opt_num_field(m, "fat_g")?,
             fiber_g: opt_num_field(m, "fiber_g")?,
             reason: opt_str_field(m, "reason"),
+            // Degrade-only: a bad completion block never fails the verdict (see
+            // `parse_completion`), it just completes nothing and is recorded.
+            completion: parse_completion(m),
         })
     }
     Ok(out)
@@ -594,6 +944,7 @@ fn resolve_food_verdict(f: &FoodEntry, v: &EntryVerdict) -> Option<DietEntry> {
         }
     };
     let corrected = FoodEntry {
+        unknowable_composite: false,
         kcal: apply(f.kcal, v.kcal).ok()?,
         protein_g: apply(f.protein_g, v.protein_g).ok()?,
         carbs_g: apply(f.carbs_g, v.carbs_g).ok()?,
@@ -602,6 +953,158 @@ fn resolve_food_verdict(f: &FoodEntry, v: &EntryVerdict) -> Option<DietEntry> {
         ..f.clone()
     };
     Some(DietEntry::Food(corrected))
+}
+
+// ---- Micronutrient completion (merge rules live HERE, not in the model) ----
+
+/// Merge one row's hosted completion into the entry and report how many blank cells
+/// it filled. EVERY merge rule is enforced here in trusted Rust, so a verifier that
+/// returns more than it should cannot widen the change:
+///
+///   * **Blank only.** A value fills a cell that is `None`; it NEVER overwrites a
+///     value the extract produced. A nutrition label therefore always wins.
+///   * **Never 0 for a declined value.** A nutrient the verifier omitted (or nulled,
+///     or sent unusably — see [`parse_completion`]) stays BLANK. Only an explicit,
+///     finite, non-negative number is written; an explicit `0` is a measured zero
+///     (plain meat really has 0 fiber), exactly as on the extract path.
+///   * **Expected columns only.** [`FillClass::MarineOnly`] (omega-3) is never
+///     completed — a blank there is the correct state for most foods — so a value
+///     the verifier volunteers for it is ignored.
+///   * **Composites are skipped whole.** An `unknowable_composite` row is left
+///     untouched, including its Notes.
+///   * **Notes only when empty.** The reference basis is written to Notes ONLY when
+///     Notes is empty AND at least one cell was actually filled; existing note text
+///     is never overwritten and nothing is appended to an uncompleted row.
+///   * **Nothing else moves.** Only nutrient fields and (conditionally) Notes are
+///     touched here: name, meal, time, amount, unit and the core macros are not
+///     reachable from this function. A changed macro is the verify CORRECTION path
+///     ([`resolve_verdict`]), which has already run by the time this does.
+pub fn complete_food_micros(f: &mut FoodEntry, c: &MicroCompletion) -> usize {
+    // A composite nobody can identify is not chased.
+    if f.unknowable_composite {
+        return 0;
+    }
+    let mut filled = 0;
+    for col in NUTRIENT_COLUMNS.iter().filter(|c| c.expected()) {
+        // Blank only — a value the extract produced (from a label) always wins.
+        if col.get(f).is_some() {
+            continue;
+        }
+        // Declined → stays blank. `parse_completion` has already rejected
+        // non-finite/negative values, and re-checking here keeps this function safe
+        // for any caller.
+        match c.values.get(col.key) {
+            Some(&v) if v.is_finite() && v >= 0.0 => {
+                col.set(f, Some(v));
+                filled += 1;
+            }
+            _ => {}
+        }
+    }
+    // The basis rides in Notes only when this row was actually completed and its
+    // Notes cell is empty.
+    if filled > 0 {
+        let notes_empty = f
+            .notes
+            .as_deref()
+            .map(|n| n.trim().is_empty())
+            .unwrap_or(true);
+        if notes_empty {
+            // Sanitized HERE as well as at parse time: the merge is the trusted layer,
+            // and a bare CR/newline in a CSV cell is exactly the defect that once broke
+            // the food log's own header line.
+            let basis = c
+                .basis
+                .as_deref()
+                .map(sanitize_basis)
+                .filter(|b| !b.is_empty());
+            if let Some(basis) = basis {
+                f.notes = Some(basis);
+            }
+        }
+    }
+    filled
+}
+
+/// The EXPECTED nutrient columns still blank on this row, by CSV column name — what
+/// the audit prints per item so an incomplete row can be repaired by hand. An
+/// `unknowable_composite` row reports nothing missing (it is excluded by design).
+pub fn missing_expected_nutrients(f: &FoodEntry) -> Vec<&'static str> {
+    if f.unknowable_composite {
+        return Vec::new();
+    }
+    NUTRIENT_COLUMNS
+        .iter()
+        .filter(|c| c.expected() && c.get(f).is_none())
+        .map(|c| c.csv)
+        .collect()
+}
+
+/// The turn's nutrient completeness as `(filled, expected)` over the food rows that
+/// completion applies to. `unknowable_composite` rows are excluded from BOTH numbers
+/// (they are not incomplete data), so a turn of only composites reports `0/0`.
+pub fn nutrient_completeness(rows: &[FoodEntry]) -> (usize, usize) {
+    let per_row = expected_nutrient_count();
+    let eligible: Vec<&FoodEntry> = rows.iter().filter(|r| !r.unknowable_composite).collect();
+    let expected = eligible.len() * per_row;
+    let filled = eligible
+        .iter()
+        .map(|r| {
+            NUTRIENT_COLUMNS
+                .iter()
+                .filter(|c| c.expected() && c.get(r).is_some())
+                .count()
+        })
+        .sum();
+    (filled, expected)
+}
+
+/// Why a turn still carries a blank EXPECTED nutrient column, as one content-free
+/// code for the provenance line and the metrics record. Emitted ONLY when at least
+/// one expected column is blank after the completion pass; a fully complete turn
+/// carries no reason at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MicroReason {
+    /// The verifier sent an unusable completion block (dropped whole; rows appended
+    /// exactly as extracted).
+    Unparseable,
+    /// Completion is switched off (`JESSE_DIET_MICRO_COMPLETE` falsey) — the old
+    /// behavior, so blanks are expected.
+    Disabled,
+    /// Completion ran and the verifier simply declined some columns.
+    Incomplete,
+}
+
+impl MicroReason {
+    /// The machine-readable code (content-free).
+    pub fn code(self) -> &'static str {
+        match self {
+            MicroReason::Unparseable => "micro_complete_unparseable",
+            MicroReason::Disabled => "micro_complete_off",
+            MicroReason::Incomplete => "micros_incomplete",
+        }
+    }
+}
+
+/// Decide the turn's micro reason code from the completeness figure and how the
+/// completion pass went. `None` when every expected column on every eligible row is
+/// filled (nothing to report), otherwise the most specific cause.
+pub fn micro_reason(
+    filled: usize,
+    expected: usize,
+    enabled: bool,
+    any_malformed: bool,
+) -> Option<MicroReason> {
+    if expected < 1 || filled >= expected {
+        return None;
+    }
+    Some(if any_malformed {
+        MicroReason::Unparseable
+    } else if !enabled {
+        MicroReason::Disabled
+    } else {
+        MicroReason::Incomplete
+    })
 }
 
 // ---- CSV row builders ------------------------------------------------------
@@ -630,7 +1133,10 @@ fn num_cell(n: Option<f64>) -> String {
 /// left BLANK, and the absolute macros go into `Calories,Protein_g,Fat_g,Carbs_g`
 /// (+ `Fiber_g`). `Meal_Type` mirrors `Meal`.
 pub fn food_row(e: &FoodEntry, date: &str) -> String {
-    let cols = [
+    // The 14 core cells, then one nutrient cell per NUTRIENT_COLUMNS entry IN TABLE
+    // ORDER — the same order `food_log_header()` names them, so the two cannot drift.
+    // Every nutrient cell is blank when unknown, never 0.
+    let mut cols = vec![
         date.to_string(),
         csv_field(&e.meal),
         csv_field(&e.name),
@@ -645,15 +1151,8 @@ pub fn food_row(e: &FoodEntry, date: &str) -> String {
         csv_field(e.notes.as_deref().unwrap_or("")),
         csv_field(e.time.as_deref().unwrap_or("")),
         csv_field(&e.meal), // Meal_Type mirrors Meal
-        num_cell(e.fiber_g),
-        num_cell(e.sodium_mg),    // Sodium_mg — blank when unknown, never 0
-        num_cell(e.satfat_g),     // SatFat_g
-        num_cell(e.sugar_g),      // Sugar_g
-        num_cell(e.potassium_mg), // Potassium_mg
-        num_cell(e.calcium_mg),   // Calcium_mg — blank when unknown, never 0
-        num_cell(e.omega3_mg),    // Omega3_mg  (marine EPA+DHA only)
-        num_cell(e.magnesium_mg), // Magnesium_mg
     ];
+    cols.extend(NUTRIENT_COLUMNS.iter().map(|c| num_cell(c.get(e))));
     cols.join(",")
 }
 
@@ -789,7 +1288,7 @@ pub fn build_meal_log_from_food_rows(
         .iter()
         .map(|g| {
             let names: Vec<&str> = g.rows.iter().map(|r| r.name.as_str()).collect();
-            Meal {
+            let mut meal = Meal {
                 // The deterministic hosted-contract id: `<date>-<slug>-<HHMM>`, no seq.
                 id: format!("{date}-{}-{}", g.slug, g.hhmm),
                 consumed_at: format!("{date}T{}:00{offset}", g.time),
@@ -799,20 +1298,24 @@ pub fn build_meal_log_from_food_rows(
                 protein_g: sum_known(g.rows.iter().map(|r| r.protein_g)),
                 carbs_g: sum_known(g.rows.iter().map(|r| r.carbs_g)),
                 fat_g: sum_known(g.rows.iter().map(|r| r.fat_g)),
-                fiber_g: sum_known(g.rows.iter().map(|r| r.fiber_g)),
-                // Micronutrients summed the same way: only the rows that stated a value
-                // contribute, and a group where none did omits the field (never Some(0)).
-                sodium_mg: sum_known(g.rows.iter().map(|r| r.sodium_mg)),
-                satfat_g: sum_known(g.rows.iter().map(|r| r.satfat_g)),
-                sugar_g: sum_known(g.rows.iter().map(|r| r.sugar_g)),
-                potassium_mg: sum_known(g.rows.iter().map(|r| r.potassium_mg)),
-                // Only the HealthKit-bound micros carry onto the Meal wire. Calcium and
-                // magnesium have HealthKit types; omega-3 does NOT (there is no EPA/DHA
-                // HealthKit quantity — `dietaryFatPolyunsaturated` includes ALA, so it is
-                // wrong), so there is no `omega3` Meal field and nothing to mirror for it.
-                calcium_mg: sum_known(g.rows.iter().map(|r| r.calcium_mg)),
-                magnesium_mg: sum_known(g.rows.iter().map(|r| r.magnesium_mg)),
+                // Every nutrient field is filled from the table below — including
+                // `fiber_g`, so no nutrient name is repeated here.
+                fiber_g: None,
+                sodium_mg: None,
+                satfat_g: None,
+                sugar_g: None,
+                potassium_mg: None,
+                calcium_mg: None,
+                magnesium_mg: None,
+            };
+            // Nutrients summed the same way, driven by the table: only the rows that
+            // stated a value contribute, and a group where none did omits the field
+            // (never Some(0)). A nutrient with no wire field (omega-3, which has no
+            // HealthKit EPA+DHA type) has no setter, so nothing is mirrored for it.
+            for c in NUTRIENT_COLUMNS {
+                c.set_wire(&mut meal, sum_known(g.rows.iter().map(|r| c.get(r))));
             }
+            meal
         })
         .collect();
     // The derived mirror is an insert-only v1-shaped block: it never retracts (the local
@@ -1061,7 +1564,10 @@ fn summary_line(totals: &MacroTotals, targets: &DietTargets) -> String {
             "You're on track — nicely balanced.".to_string()
         }
         0 => String::new(),
-        1 => format!("Coming together. A bit more {} rounds out the day.", shorts[0].0),
+        1 => format!(
+            "Coming together. A bit more {} rounds out the day.",
+            shorts[0].0
+        ),
         _ => format!(
             "Coming together. Some {} and some {} rounds out the day.",
             shorts[0].0, shorts[1].0
@@ -1432,7 +1938,12 @@ fn schema_field(msg: &str) -> Option<String> {
 /// One diet-turn provenance line (mirrors the title provenance line): local vs
 /// hosted-fallback with the rung, the extract backend (base URL + model, NEVER the
 /// token, no meal content), the verify verdict, the row count, whether a mirror was
-/// derived, and — on a rung-2 fall-through — the machine-readable [`Rung2Reason`] code.
+/// derived, the turn's nutrient completeness as `filled/expected` (plus the
+/// [`MicroReason`] code when any expected column is still blank), and — on a rung-2
+/// fall-through — the machine-readable [`Rung2Reason`] code.
+///
+/// Still strictly content-free: counts, codes, a base URL and a model name; never
+/// meal text and never a token.
 #[allow(clippy::too_many_arguments)] // a flat provenance line; a params struct would only obscure it
 pub fn format_diet_provenance(
     local: bool,
@@ -1443,6 +1954,7 @@ pub fn format_diet_provenance(
     rows: usize,
     mirror_derived: bool,
     reason: Option<&str>,
+    micros: Option<(usize, usize, Option<MicroReason>)>,
 ) -> String {
     let disposition = if local {
         "local".to_string()
@@ -1452,56 +1964,144 @@ pub fn format_diet_provenance(
     let mirror = if mirror_derived { "derived" } else { "omitted" };
     // The machine-readable rung-2 reason rides after the disposition (content-free).
     let reason = reason.map(|r| format!(" reason={r}")).unwrap_or_default();
+    // Nutrient completeness, `filled/expected` over the turn's eligible food rows.
+    // Omitted entirely on a turn that appended no eligible food row.
+    let micros = micros
+        .map(|(filled, expected, why)| {
+            let why = why
+                .map(|w| format!(" micro_reason={}", w.code()))
+                .unwrap_or_default();
+            format!(" micros={filled}/{expected}{why}")
+        })
+        .unwrap_or_default();
     format!(
         "jesse-bridge: diet turn -> {disposition}{reason} extract base_url={base_url} model={model}; \
-         verify verdict={verify}; rows={rows} mirror={mirror}"
+         verify verdict={verify}; rows={rows} mirror={mirror}{micros}"
     )
 }
 
 // ---- Prompts ---------------------------------------------------------------
 
-/// The verbatim JSON schema the extract child must return — a per-item `entries`
-/// array plus `no_loggable_content`. Kept as a const so the prompt and the report
-/// share one source. See [`parse_diet_entries`] for the enforcing validator.
-pub const DIET_EXTRACT_SCHEMA: &str = r#"{
+/// Build the JSON schema the extract child must return, for an arbitrary nutrient
+/// table (the parameterized form the synthetic-ninth-nutrient test drives;
+/// production calls [`diet_extract_schema`]). The food entry's nutrient keys come
+/// from the table, so a new nutrient column appears in the schema automatically.
+fn build_extract_schema(cols: &[NutrientCol]) -> String {
+    let nutrients = cols
+        .iter()
+        .map(|c| format!("\"{}\": <number, {}>", c.key, c.unit))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        r#"{{
   "no_loggable_content": <boolean: true if the message logs nothing NEW to eat/drink, no workout, no weight — OR if it AMENDS/corrects/moves/deletes something already logged instead of reporting new consumption; in either case return an empty entries array>,
   "entries": [
-    { "kind": "food", "name": "<ONE food item, never a combined meal>", "meal": "Breakfast|Lunch|Dinner|Snack", "time": "<HH:MM ONLY if the message states a clock time, else null/omit — never invent one>", "amount": "<e.g. 1 medium (~118g)>", "unit": "serving", "kcal": <number>, "protein_g": <number>, "carbs_g": <number>, "fat_g": <number>, "fiber_g": <number>, "sodium_mg": <number>, "satfat_g": <number>, "sugar_g": <number>, "potassium_mg": <number>, "calcium_mg": <number>, "omega3_mg": <number>, "magnesium_mg": <number>, "notes": "<optional>" },
-    { "kind": "exercise", "activity": "Run|Walk|Swim|Strength/Weights|...", "time": "<HH:MM ONLY if stated, else null/omit>", "description": "<optional>", "distance_km": <number>, "duration": "<e.g. 56:58>", "pace": "<e.g. 7:07>", "avg_hr": <number>, "calories": <number>, "notes": "<optional>" },
-    { "kind": "weight", "weight_lbs": <number>, "weight_kg": <number>, "body_fat_pct": <number>, "muscle_mass_lbs": <number>, "notes": "<optional>" }
+    {{ "kind": "food", "name": "<ONE food item, never a combined meal>", "meal": "Breakfast|Lunch|Dinner|Snack", "time": "<HH:MM ONLY if the message states a clock time, else null/omit — never invent one>", "amount": "<e.g. 1 medium (~118g)>", "unit": "serving", "kcal": <number>, "protein_g": <number>, "carbs_g": <number>, "fat_g": <number>, {nutrients}, "unknowable_composite": <boolean, optional, default false: true ONLY for a composite you cannot identify>, "notes": "<optional>" }},
+    {{ "kind": "exercise", "activity": "Run|Walk|Swim|Strength/Weights|...", "time": "<HH:MM ONLY if stated, else null/omit>", "description": "<optional>", "distance_km": <number>, "duration": "<e.g. 56:58>", "pace": "<e.g. 7:07>", "avg_hr": <number>, "calories": <number>, "notes": "<optional>" }},
+    {{ "kind": "weight", "weight_lbs": <number>, "weight_kg": <number>, "body_fat_pct": <number>, "muscle_mass_lbs": <number>, "notes": "<optional>" }}
   ]
-}"#;
+}}"#
+    )
+}
+
+static DIET_EXTRACT_SCHEMA_CELL: LazyLock<String> =
+    LazyLock::new(|| build_extract_schema(NUTRIENT_COLUMNS));
+
+/// The JSON schema the extract child must return — a per-item `entries` array plus
+/// `no_loggable_content`. Derived from [`NUTRIENT_COLUMNS`] so the prompt, the report
+/// and the validator share one source. See [`parse_diet_entries`] for the enforcing
+/// validator.
+pub fn diet_extract_schema() -> &'static str {
+    &DIET_EXTRACT_SCHEMA_CELL
+}
+
+/// Build the NUTRIENTS section of the extract prompt from a nutrient table.
+///
+/// This is the reversal of the original defect: the first contract told the child to
+/// fill a nutrient only from a label "or a confident estimate" and to OMIT it
+/// otherwise, and volunteered that potassium/calcium/magnesium are "usually absent
+/// from labels so usually omitted". The child obeyed, so every locally-logged row
+/// arrived with three or more knowable columns blank. The branches below tell it the
+/// opposite for a food it can identify, while keeping the honest-omission rule for
+/// the one case where nobody can know (an unidentifiable composite) and for the one
+/// nutrient that is genuinely absent from most foods (marine omega-3).
+///
+/// Worded for a small local model: short sentences, imperative, no hedging.
+fn build_nutrient_rules(cols: &[NutrientCol]) -> String {
+    let list =
+        |f: FillClass| -> Vec<&NutrientCol> { cols.iter().filter(|c| c.fill == f).collect() };
+    let expected = list(FillClass::ExpectedWhenKnowable);
+    let expected_named = expected
+        .iter()
+        .map(|c| format!("`{}` ({})", c.key, c.unit))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let mut s = String::new();
+    s.push_str(
+        "NUTRIENTS (fill these — a blank column is missing data, not a zero):\n\
+- EXPECTED on every food you can identify: ",
+    );
+    s.push_str(&expected_named);
+    s.push_str(
+        ". Fill EVERY one of them.\n\
+- PACKAGED FOOD WITH A NUTRITION PANEL IN THE MESSAGE: use the panel. Scale it to \
+the amount actually logged. If the label prints salt (\"sale\") in grams instead of \
+sodium, then sodium_mg = salt_grams × 400. `sugar_g` is TOTAL sugars (\"di cui \
+zuccheri\"), never added sugars. `satfat_g` is the saturated-fat line (\"di cui acidi \
+grassi saturi\").\n\
+- LABEL-LESS WHOLE FOOD — fruit, vegetables, eggs, plain meat, plain fish, plain \
+nuts, plain grains, milk: fill every EXPECTED nutrient from standard food-composition \
+values for that food, scaled to the EDIBLE grams logged. Exclude pit, peel, core, \
+shell and bone. Do NOT leave a column blank because no label printed it. A banana, an \
+egg, a chicken breast: you know these values. Write them.\n\
+- SODIUM is the food's own intrinsic sodium, plus label salt, plus restaurant \
+seasoning. Never add a \"probably salted it\" amount to a home-cooked item.\n",
+    );
+    for c in list(FillClass::MarineOnly) {
+        s.push_str(&format!(
+            "- `{}` ({}) is marine long-chain omega-3 (EPA+DHA) ONLY: fish, shellfish, \
+roe, and the small amounts in eggs and dairy. NEVER the plant ALA in walnuts, flax, \
+chia or vegetable oils. OMIT the key for a plant-ALA-only food.\n",
+            c.key, c.unit
+        ));
+    }
+    s.push_str(
+        "- A COMPOSITE YOU CANNOT IDENTIFY — an unnamed restaurant dish, an unknown \
+sauce: still OMIT rather than guess, and set `\"unknowable_composite\": true` on that \
+entry.\n\
+- `0` means a real measured zero (plain meat has 0 fiber and 0 sugar). NEVER write 0 \
+to mean \"I don't know\" — omit the key instead.\n",
+    );
+    s
+}
+
+static NUTRIENT_RULES_CELL: LazyLock<String> =
+    LazyLock::new(|| build_nutrient_rules(NUTRIENT_COLUMNS));
+
+/// The NUTRIENTS section of the extract prompt, derived from [`NUTRIENT_COLUMNS`].
+pub fn diet_nutrient_rules() -> &'static str {
+    &NUTRIENT_RULES_CELL
+}
 
 /// Build the stateless EXTRACT prompt: the CSV/macro contract (inlined from the same
 /// header consts the append path targets — the parity source of truth), the per-item
 /// anti-aggregation rule, the schema, and the JSON-only instruction. The raw
 /// utterance is appended. The child holds no tools, so everything it needs is here.
 pub fn build_diet_extract_prompt(utterance: &str, owner: &str) -> String {
+    let food_header = food_log_header();
+    let nutrient_rules = diet_nutrient_rules();
+    let schema = diet_extract_schema();
     format!(
         "You extract structured diet-log entries from a short message {owner} sent from \
 their phone. Return ONLY a single JSON object — no prose, no markdown, no code fence.\n\
 \n\
 CONTRACT (the vault's diet logs; you are parsing INTO these columns):\n\
-- food-log.csv columns: {FOOD_LOG_HEADER}\n\
+- food-log.csv columns: {food_header}\n\
 - exercise-log.csv columns: {EXERCISE_LOG_HEADER}\n\
 - weight-log.csv columns: {WEIGHT_LOG_HEADER}\n\
 - Macros are per-ITEM absolute grams/kcal. Omit any macro you don't know — NEVER \
 guess and NEVER write 0 as a placeholder (0 means a real measured zero).\n\
-- MICRONUTRIENTS (`sodium_mg`, `satfat_g`, `sugar_g`, `potassium_mg`, `calcium_mg`, \
-`omega3_mg`, `magnesium_mg`) follow the SAME rule: fill a value only from a nutrition \
-label in the message or a confident estimate, otherwise OMIT the key entirely (never \
-guess, never 0-as-placeholder). Units and conversions: `sodium_mg` is sodium in \
-MILLIGRAMS — when an EU label prints salt (\"sale\") in grams instead of sodium, convert \
-sodium_mg = salt_grams × 400. `satfat_g` is saturated fat in grams (the label's \"di cui \
-acidi grassi saturi\"). `sugar_g` is TOTAL sugars in grams (\"di cui zuccheri\"), NEVER \
-added sugars. `potassium_mg` is potassium in milligrams — optional on EU labels and \
-usually absent, so usually omitted. `calcium_mg` is calcium in MILLIGRAMS and \
-`magnesium_mg` is magnesium in milligrams — like potassium, both are usually absent on \
-EU labels and so usually omitted, but a confident whole-food estimate is fine. \
-`omega3_mg` is marine long-chain omega-3 (EPA+DHA) in MILLIGRAMS — count it ONLY for \
-fish, shellfish, roe, and the small amounts in eggs/dairy; NEVER the plant ALA in \
-walnuts, flax, chia, or vegetable oils, and OMIT it entirely for a plant-ALA-only food. \
-Scale every label value to the amount actually logged when the serving differs.\n\
+{nutrient_rules}\
 - `time` is the clock time the thing happened (HH:MM), but ONLY when the message \
 states one (\"at 12:30\", \"this morning\" is NOT a clock time). You have NO clock and \
 MUST NOT invent, guess, or infer a time — if the message gives no explicit clock time, \
@@ -1526,7 +2126,7 @@ path, which owns the correction contract. When you cannot tell a new item from a
 to an existing one, treat it as an amendment (omit it).\n\
 \n\
 SCHEMA (return exactly this shape):\n\
-{DIET_EXTRACT_SCHEMA}\n\
+{schema}\n\
 \n\
 MESSAGE:\n{utterance}"
     )
@@ -1536,7 +2136,49 @@ MESSAGE:\n{utterance}"
 /// a per-entry approve/correct/reject instruction with the tolerance band spelled
 /// out (differs by more than 20% OR 75 kcal per item). Returns a `verdicts` array,
 /// one verdict per candidate, in order.
-pub fn build_diet_verify_prompt(utterance: &str, candidates_json: &str, owner: &str) -> String {
+pub fn build_diet_verify_prompt(
+    utterance: &str,
+    candidates_json: &str,
+    owner: &str,
+    complete_micros: bool,
+) -> String {
+    // The completion half of the contract, present ONLY when
+    // `JESSE_DIET_MICRO_COMPLETE` is on. With it off the prompt is byte-for-byte the
+    // macro-verdict prompt this pipeline has always sent.
+    let (completion_task, completion_schema) = if complete_micros {
+        (
+            format!(
+                "\nALSO COMPLETE THE NUTRIENTS. Each candidate carries the nutrient values \
+the local model produced; a key that is ABSENT is a BLANK column in the log, not a \
+zero. For each candidate you judge to be a LABEL-LESS WHOLE FOOD (fruit, vegetables, \
+eggs, plain meat, plain fish, plain nuts, plain grains, milk), return in `micros` the \
+values for the EXPECTED nutrient keys that candidate LEFT BLANK, from standard \
+food-composition data for that food, scaled to the EDIBLE grams logged (pit, peel, \
+core, shell and bone excluded). Rules:\n\
+- EXPECTED keys: {expected}. Never return a value for a key the candidate already \
+carries — a nutrition label wins and your value would be discarded anyway.\n\
+- Omit a key you cannot source. An omitted key stays BLANK in the log. NEVER send 0 to \
+mean \"unknown\"; send 0 only for a real measured zero (plain meat has 0 fiber).\n\
+- Do NOT return `micros` for a candidate flagged `unknowable_composite`, for a \
+packaged food whose label the message quoted, or for a dish you cannot identify.\n\
+- `reference_basis`: ONE line naming the food-composition basis and the scaling you \
+used, e.g. \"USDA SR Legacy banana raw, 89 kcal/100 g, scaled to 118 g edible\". It is \
+written to the row's empty Notes cell.\n\
+- Completion is SEPARATE from the verdict. It never changes the item, the meal, the \
+time, the amount or any macro; correcting a macro is the `correct` verdict above.\n",
+                expected = NUTRIENT_COLUMNS
+                    .iter()
+                    .filter(|c| c.expected())
+                    .map(|c| format!("`{}` ({})", c.key, c.unit))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+            ", \"micros\": {{ \"<nutrient key>\": <num>, ... }}, \
+\"reference_basis\": \"<one line>\"",
+        )
+    } else {
+        (String::new(), "")
+    };
     format!(
         "You are the VERIFY gate for a diet-logging pipeline. A cheap local model \
 parsed {owner}'s message into candidate per-item entries. Check each one against the \
@@ -1554,11 +2196,12 @@ its macros are a whole-meal total rather than a per-item value.\n\
 TOLERANCE: treat a macro as out of band (needs \"correct\") when your estimate \
 differs from the candidate by MORE than the larger of 20% and 75 kcal per item; \
 within that, \"approve\".\n\
+{completion_task}\
 \n\
 SCHEMA:\n\
 {{ \"verdicts\": [ {{ \"verdict\": \"approve|correct|reject\", \"kcal\": <num>, \
 \"protein_g\": <num>, \"carbs_g\": <num>, \"fat_g\": <num>, \"fiber_g\": <num>, \
-\"reason\": \"<short>\" }} ] }}\n\
+\"reason\": \"<short>\"{completion_schema} }} ] }}\n\
 \n\
 MESSAGE:\n{utterance}\n\
 \n\
@@ -1575,11 +2218,28 @@ pub fn entries_to_json(entries: &[DietEntry]) -> String {
 
 fn entry_to_value(e: &DietEntry) -> Value {
     match e {
-        DietEntry::Food(f) => json!({
-            "kind": "food", "name": f.name, "meal": f.meal, "time": f.time,
-            "amount": f.amount, "kcal": f.kcal, "protein_g": f.protein_g,
-            "carbs_g": f.carbs_g, "fat_g": f.fat_g, "fiber_g": f.fiber_g,
-        }),
+        DietEntry::Food(f) => {
+            let mut v = json!({
+                "kind": "food", "name": f.name, "meal": f.meal, "time": f.time,
+                "amount": f.amount, "kcal": f.kcal, "protein_g": f.protein_g,
+                "carbs_g": f.carbs_g, "fat_g": f.fat_g,
+            });
+            let m = v.as_object_mut().expect("json! built an object");
+            // Every nutrient the extract KNOWS rides along, and an unknown one is
+            // OMITTED — that asymmetry is the completion contract's input: the verifier
+            // fills exactly the keys it does not see. (Before completion this shape
+            // carried only `fiber_g`, so the verifier could not tell blank from unsent.)
+            for c in NUTRIENT_COLUMNS {
+                if let Some(n) = c.get(f) {
+                    m.insert(c.key.to_string(), json!(n));
+                }
+            }
+            // Only sent when true, so the ordinary row's shape is unchanged.
+            if f.unknowable_composite {
+                m.insert("unknowable_composite".to_string(), json!(true));
+            }
+            v
+        }
         DietEntry::Exercise(x) => json!({
             "kind": "exercise", "activity": x.activity, "time": x.time,
             "distance_km": x.distance_km, "duration": x.duration, "calories": x.calories,
@@ -1619,15 +2279,74 @@ impl DietRung {
     }
 }
 
+/// The nutrient-completeness accounting for ONE local-route turn — the numbers the
+/// provenance line, the metrics record and the daily audit all report. Content-free
+/// by construction (counts and a code, never an item name).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct MicroStats {
+    /// Food rows appended on this turn.
+    pub food_rows: usize,
+    /// Food rows completion applies to (`food_rows` minus `unknowable_composite`).
+    pub eligible_rows: usize,
+    /// Eligible rows where the hosted completion filled at least one blank cell.
+    pub rows_completed: usize,
+    /// Eligible rows that STILL carry at least one blank expected column.
+    pub rows_incomplete: usize,
+    /// Expected nutrient cells actually filled across the eligible rows.
+    pub filled: usize,
+    /// Expected nutrient cells across the eligible rows (`eligible_rows` ×
+    /// [`expected_nutrient_count`]).
+    pub expected: usize,
+    /// Why anything is still blank ([`MicroReason`]); `None` when the turn is complete.
+    pub reason: Option<MicroReason>,
+}
+
+impl MicroStats {
+    /// Compute the turn's accounting from the appended food rows. `enabled` is the
+    /// completion flag and `any_malformed` whether the verifier's completion block was
+    /// unusable — together they explain a blank column.
+    pub fn compute(
+        rows: &[FoodEntry],
+        rows_completed: usize,
+        enabled: bool,
+        any_malformed: bool,
+    ) -> MicroStats {
+        let (filled, expected) = nutrient_completeness(rows);
+        let eligible: Vec<&FoodEntry> = rows.iter().filter(|r| !r.unknowable_composite).collect();
+        MicroStats {
+            food_rows: rows.len(),
+            eligible_rows: eligible.len(),
+            rows_completed,
+            rows_incomplete: eligible
+                .iter()
+                .filter(|r| !missing_expected_nutrients(r).is_empty())
+                .count(),
+            filled,
+            expected,
+            reason: micro_reason(filled, expected, enabled, any_malformed),
+        }
+    }
+
+    /// The `(filled, expected, reason)` triple the provenance line renders, or `None`
+    /// when the turn appended no eligible food row (nothing to report).
+    pub fn provenance(&self) -> Option<(usize, usize, Option<MicroReason>)> {
+        (self.eligible_rows > 0).then_some((self.filled, self.expected, self.reason))
+    }
+}
+
 /// The outcome of the local pipeline for one turn.
 pub enum DietPipelineOutcome {
     /// Logged locally: the ASCII dashboard reply plus the derived directives (mirror).
     Logged {
         dashboard: String,
         directives: Directives,
+        micros: MicroStats,
     },
     /// Logged locally but the mirror was omitted (rung 5): CSV committed, no directive.
-    LoggedNoMirror { dashboard: String },
+    LoggedNoMirror {
+        dashboard: String,
+        micros: MicroStats,
+    },
     /// Fall through to the hosted turn at the given rung (2–4). `reason` carries the
     /// machine-readable [`Rung2Reason`] on a rung-2 fall-through (the only rung with a
     /// reason taxonomy); `None` for rungs 3–4.
@@ -1712,10 +2431,14 @@ pub async fn run_diet_pipeline(cfg: &Config, utterance: &str) -> DietPipelineOut
     // the turn. The bridge stamps this onto any food entry whose time the utterance
     // never stated (see [`stamp_missing_food_times`]); the model never invents a time.
     let received_hhmm = local_hhmm();
+    // A fall-through provenance line: no rows were appended, so there is no nutrient
+    // completeness to report (`micros` is omitted).
     let prov = |local: bool, rung: Option<u8>, verify: &str, rows: usize, mirror: bool| {
         eprintln!(
             "{}",
-            format_diet_provenance(local, rung, &base_url, &model, verify, rows, mirror, None)
+            format_diet_provenance(
+                local, rung, &base_url, &model, verify, rows, mirror, None, None
+            )
         );
     };
     // Rung-2 (Child) fall-through: emit provenance WITH the machine-readable reason and
@@ -1733,6 +2456,7 @@ pub async fn run_diet_pipeline(cfg: &Config, utterance: &str) -> DietPipelineOut
                 0,
                 false,
                 Some(&reason.code()),
+                None,
             )
         );
         DietPipelineOutcome::FallThrough {
@@ -1768,10 +2492,21 @@ pub async fn run_diet_pipeline(cfg: &Config, utterance: &str) -> DietPipelineOut
         Err(msg) => return fall_child(Rung2Reason::from_parse_error(&msg)),
     };
 
-    // Stage 2 — verify (probation: mandatory, blocking, 100%).
+    // Stage 2 — verify (probation: mandatory, blocking, 100%). The SAME call also
+    // carries the micronutrient completion request when `JESSE_DIET_MICRO_COMPLETE`
+    // is on (default): it already holds the raw utterance and the candidate rows, so
+    // completion costs no extra round trip. The two behaviors stay independently
+    // flagged — probation owns whether this verdict blocks the append, this flag owns
+    // whether blank expected nutrient columns get filled.
+    let complete_micros = cfg.diet_micro_complete;
     let verify_raw = match run_diet_verify(
         cfg,
-        &build_diet_verify_prompt(utterance, &entries_to_json(&extract.entries), &cfg.persona.owner_name),
+        &build_diet_verify_prompt(
+            utterance,
+            &entries_to_json(&extract.entries),
+            &cfg.persona.owner_name,
+            complete_micros,
+        ),
         DIET_VERIFY_TIMEOUT_SECS,
     )
     .await
@@ -1829,6 +2564,33 @@ pub async fn run_diet_pipeline(cfg: &Config, utterance: &str) -> DietPipelineOut
         "approved"
     };
 
+    // Stage 2b — micronutrient completion. Runs AFTER the correction pass (so a
+    // corrected macro is already in place and a filled cell is never re-filled) and
+    // BEFORE rows are built, so a completed value flows through the normal row +
+    // mirror + dashboard path. Degrade-only: with the flag off, an errored/timed-out
+    // verify (which never reaches here), or an unusable completion block, the rows are
+    // appended EXACTLY as the extract produced them and the reason code records why.
+    let mut any_micro_malformed = false;
+    let mut rows_completed = 0usize;
+    if complete_micros {
+        for (entry, v) in verified.iter_mut().zip(verdicts.iter()) {
+            if v.completion.malformed {
+                any_micro_malformed = true;
+            }
+            if let DietEntry::Food(f) = entry {
+                if complete_food_micros(f, &v.completion) > 0 {
+                    rows_completed += 1;
+                }
+            }
+        }
+        if any_micro_malformed {
+            eprintln!(
+                "jesse-bridge: diet verify returned an unusable micronutrient completion block — \
+                 rows appended as extracted"
+            );
+        }
+    }
+
     // Stage 3 — append + hooks + commit (atomic per turn). Fill any unstated food
     // time with the turn's received-at wall clock BEFORE building rows, so the time
     // flows through the normal row + mirror path (bridge owns received-at).
@@ -1884,35 +2646,59 @@ pub async fn run_diet_pipeline(cfg: &Config, utterance: &str) -> DietPipelineOut
         .unwrap_or_default();
     let dashboard = render_diet_dashboard(&date, &totals, &targets);
 
+    // The turn's nutrient-completeness accounting over the rows just appended. Emitted
+    // on the provenance line and threaded to the metrics record; the audit aggregates it.
+    let micros = MicroStats::compute(&food, rows_completed, complete_micros, any_micro_malformed);
+    // A local success line, now carrying `micros=<filled>/<expected>` (+ the reason code
+    // when anything is still blank).
+    let prov_local = |rung: Option<u8>, mirror: bool| {
+        eprintln!(
+            "{}",
+            format_diet_provenance(
+                true,
+                rung,
+                &base_url,
+                &model,
+                verify_word,
+                verified.len(),
+                mirror,
+                None,
+                micros.provenance(),
+            )
+        );
+    };
+
     match build_meal_log_from_food_rows(&food, &date, &local_offset()) {
         Ok(Some(meal_log)) => {
-            prov(true, None, verify_word, verified.len(), true);
+            prov_local(None, true);
             DietPipelineOutcome::Logged {
                 dashboard,
                 directives: Directives {
                     needs_health: None,
                     meal_log: Some(meal_log),
                 },
+                micros,
             }
         }
         Ok(None) => {
             // No food rows (exercise/weigh-in-only): no mirror to emit — a normal
             // local success, not a failure.
-            prov(true, None, verify_word, verified.len(), false);
+            prov_local(None, false);
             DietPipelineOutcome::Logged {
                 dashboard,
                 directives: Directives {
                     needs_health: None,
                     meal_log: None,
                 },
+                micros,
             }
         }
         Err(e) => {
             // Mirror build failed AFTER a good append+commit (rung 5): keep the CSV,
             // omit the mirror (matches today's malformed-directive fail-safe).
             eprintln!("jesse-bridge: diet mirror build failed: {e}");
-            prov(true, Some(5), verify_word, verified.len(), false);
-            DietPipelineOutcome::LoggedNoMirror { dashboard }
+            prov_local(Some(5), false);
+            DietPipelineOutcome::LoggedNoMirror { dashboard, micros }
         }
     }
 }
@@ -2059,6 +2845,7 @@ mod tests {
         // empty, and reading that row back through the shipped CSV reader yields JSON
         // null (unknown) for `na` — never 0.
         let e = FoodEntry {
+            unknowable_composite: false,
             name: "Banana".into(),
             meal: "Snack".into(),
             time: Some("10:00".into()),
@@ -2078,7 +2865,7 @@ mod tests {
             magnesium_mg: None,
             notes: None,
         };
-        let csv = format!("{FOOD_LOG_HEADER}\n{}\n", food_row(&e, "2026-07-13"));
+        let csv = format!("{}\n{}\n", food_log_header(), food_row(&e, "2026-07-13"));
         let (meals, _errors) = crate::diet::reconstruct_meals(&csv, "2026-07-13");
         let item = &meals[0]["items"][0];
         assert!(
@@ -2101,6 +2888,7 @@ mod tests {
         // The mirror image: a KNOWN sodium survives the row build and reads back as its
         // number (proving the write column lands where the reader expects it).
         let e = FoodEntry {
+            unknowable_composite: false,
             name: "Prosciutto".into(),
             meal: "Lunch".into(),
             time: Some("12:00".into()),
@@ -2120,7 +2908,7 @@ mod tests {
             magnesium_mg: Some(20.0),
             notes: None,
         };
-        let csv = format!("{FOOD_LOG_HEADER}\n{}\n", food_row(&e, "2026-07-13"));
+        let csv = format!("{}\n{}\n", food_log_header(), food_row(&e, "2026-07-13"));
         let (meals, _errors) = crate::diet::reconstruct_meals(&csv, "2026-07-13");
         let item = &meals[0]["items"][0];
         assert_eq!(item["na"], 900.0);
@@ -2169,6 +2957,7 @@ mod tests {
         // append; an explicitly-stated time always wins and is left untouched.
         let mut entries = vec![
             DietEntry::Food(FoodEntry {
+                unknowable_composite: false,
                 name: "almond".into(),
                 meal: "Snack".into(),
                 time: None, // unstated → should be filled
@@ -2189,6 +2978,7 @@ mod tests {
                 notes: None,
             }),
             DietEntry::Food(FoodEntry {
+                unknowable_composite: false,
                 name: "toast".into(),
                 meal: "Breakfast".into(),
                 time: Some("07:15".into()), // explicit → must be preserved
@@ -2461,6 +3251,7 @@ mod tests {
 
     fn food(kcal: f64) -> DietEntry {
         DietEntry::Food(FoodEntry {
+            unknowable_composite: false,
             name: "Banana".into(),
             meal: "Snack".into(),
             time: Some("10:00".into()),
@@ -2483,6 +3274,7 @@ mod tests {
     }
     fn verdict(v: Verdict, kcal: Option<f64>) -> EntryVerdict {
         EntryVerdict {
+            completion: MicroCompletion::default(),
             verdict: v,
             kcal,
             protein_g: None,
@@ -2537,6 +3329,7 @@ mod tests {
         // `..f.clone()` spread untouched. A kcal correction must not disturb a known
         // sodium/calcium value (nor invent one on an absent potassium/magnesium).
         let e = DietEntry::Food(FoodEntry {
+            unknowable_composite: false,
             name: "Crackers".into(),
             meal: "Snack".into(),
             time: Some("15:00".into()),
@@ -2610,6 +3403,7 @@ mod tests {
     #[test]
     fn food_row_follows_fill_convention_and_quotes() {
         let e = FoodEntry {
+            unknowable_composite: false,
             name: "Salmon sockeye (Fiorfiore, canned)".into(),
             meal: "Breakfast".into(),
             time: Some("09:40".into()),
@@ -2635,7 +3429,11 @@ mod tests {
             .has_headers(false)
             .from_reader(row.as_bytes());
         let rec = rdr.records().next().unwrap().unwrap();
-        assert_eq!(rec.len(), FOOD_LOG_HEADER.split(',').count(), "22 columns");
+        assert_eq!(
+            rec.len(),
+            food_log_header().split(',').count(),
+            "22 columns"
+        );
         assert_eq!(&rec[0], "2026-07-13");
         assert_eq!(&rec[1], "Breakfast");
         assert_eq!(&rec[2], "Salmon sockeye (Fiorfiore, canned)");
@@ -2657,6 +3455,7 @@ mod tests {
     #[test]
     fn food_row_blank_macros_are_empty_cells() {
         let e = FoodEntry {
+            unknowable_composite: false,
             name: "Water".into(),
             meal: "Snack".into(),
             time: Some("12:00".into()),
@@ -2681,7 +3480,11 @@ mod tests {
             .has_headers(false)
             .from_reader(row.as_bytes());
         let rec = rdr.records().next().unwrap().unwrap();
-        assert_eq!(rec.len(), FOOD_LOG_HEADER.split(',').count(), "22 columns");
+        assert_eq!(
+            rec.len(),
+            food_log_header().split(',').count(),
+            "22 columns"
+        );
         assert_eq!(&rec[7], "", "absent kcal → empty cell, not 0");
         assert_eq!(&rec[14], "", "absent fiber → empty cell");
         assert_eq!(&rec[15], "", "absent sodium → empty cell, not 0");
@@ -2703,7 +3506,7 @@ mod tests {
         // AND that each row builder emits exactly that many columns.
         let p = build_diet_extract_prompt("hi", "the user");
         assert!(
-            p.contains(FOOD_LOG_HEADER),
+            p.contains(food_log_header()),
             "extract prompt must inline the food header"
         );
         assert!(
@@ -2726,6 +3529,7 @@ mod tests {
                 .len()
         };
         let f = FoodEntry {
+            unknowable_composite: false,
             name: "n".into(),
             meal: "Snack".into(),
             time: Some("09:00".into()),
@@ -2747,7 +3551,7 @@ mod tests {
         };
         assert_eq!(
             count(&food_row(&f, "2026-07-13")),
-            FOOD_LOG_HEADER.split(',').count()
+            food_log_header().split(',').count()
         );
         let x = ExerciseEntry {
             activity: "Run".into(),
@@ -2783,7 +3587,8 @@ mod tests {
         // child to classify a correction/amendment as `no_loggable_content` (routing it
         // to the hosted path), and the schema's `no_loggable_content` description must
         // say so too — so the child never re-logs a correction as a fresh entry.
-        let p = build_diet_extract_prompt("actually lunch was two bowls, about 700 kcal", "the user");
+        let p =
+            build_diet_extract_prompt("actually lunch was two bowls, about 700 kcal", "the user");
         assert!(
             p.contains("CORRECTIONS ARE NOT NEW LOGS"),
             "extract prompt must carry the amendment rule"
@@ -2799,11 +3604,11 @@ mod tests {
         // The schema's own `no_loggable_content` description is updated too (it is inlined
         // into the prompt via DIET_EXTRACT_SCHEMA).
         assert!(
-            DIET_EXTRACT_SCHEMA.contains("AMENDS/corrects/moves/deletes"),
+            diet_extract_schema().contains("AMENDS/corrects/moves/deletes"),
             "schema no_loggable_content description must cover amendments"
         );
         assert!(
-            p.contains(DIET_EXTRACT_SCHEMA),
+            p.contains(diet_extract_schema()),
             "the updated schema is inlined into the prompt"
         );
     }
@@ -2812,6 +3617,7 @@ mod tests {
 
     fn f(name: &str, meal: &str, time: &str, kcal: f64) -> FoodEntry {
         FoodEntry {
+            unknowable_composite: false,
             name: name.into(),
             meal: meal.into(),
             time: Some(time.into()),
@@ -2905,6 +3711,7 @@ mod tests {
         // known value alone (unknown contributes nothing); a group where NO row carries
         // the micro serializes no key at all — same shape for fiber and every micro.
         let with = |ca: Option<f64>, fib: Option<f64>, na: Option<f64>| FoodEntry {
+            unknowable_composite: false,
             name: "x".into(),
             meal: "Lunch".into(),
             time: Some("12:30".into()),
@@ -2960,6 +3767,7 @@ mod tests {
     #[test]
     fn mirror_omits_unknown_macros_never_null_pads() {
         let e = FoodEntry {
+            unknowable_composite: false,
             name: "Toast".into(),
             meal: "Breakfast".into(),
             time: Some("08:00".into()),
@@ -2996,6 +3804,7 @@ mod tests {
         // magnesium) produce NO wire field — never a 0. Omega-3 is NOT a Meal field at
         // all (no HealthKit type), so it never reaches the wire even when the row has it.
         let e = FoodEntry {
+            unknowable_composite: false,
             name: "Prosciutto".into(),
             meal: "Lunch".into(),
             time: Some("12:30".into()),
@@ -3133,10 +3942,11 @@ mod tests {
         // A day with an explicit-Calories row and a legacy per-100g row (blank
         // Calories → derived), plus a row for a DIFFERENT day that must be excluded.
         let csv = format!(
-            "{FOOD_LOG_HEADER}\n\
+            "{}\n\
              2026-07-13,Breakfast,Eggs,3,ea,,,210,18,15,1,,08:00,Breakfast,0\n\
              2026-07-13,Dinner,Rice,150,g,130,150,,3,0,28,,19:00,Dinner,\n\
-             2026-07-12,Snack,Banana,1,ea,,,105,1,0,27,,10:00,Snack,3\n"
+             2026-07-12,Snack,Banana,1,ea,,,105,1,0,27,,10:00,Snack,3\n",
+            food_log_header()
         );
         let t = sum_food_csv_for_date(&csv, "2026-07-13");
         assert_eq!(
@@ -3153,9 +3963,10 @@ mod tests {
     fn dashboard_renders_totals_and_bars_from_fixture_csv() {
         // Render straight from a food-log.csv fixture — the source of truth.
         let csv = format!(
-            "{FOOD_LOG_HEADER}\n\
+            "{}\n\
              2026-07-13,Breakfast,Eggs,3,ea,,,210,10,15,1,,08:00,Breakfast,0\n\
-             2026-07-13,Snack,Banana,1,ea,,,105,10,0,27,,10:00,Snack,3\n"
+             2026-07-13,Snack,Banana,1,ea,,,105,10,0,27,,10:00,Snack,3\n",
+            food_log_header()
         );
         let totals = sum_food_csv_for_date(&csv, "2026-07-13");
         assert_eq!(totals.kcal, 315.0);
@@ -3174,7 +3985,10 @@ mod tests {
             "bars are monochrome, no color emoji: {dash}"
         );
         // Calories comfortably under the ceiling reads as room, not a grade.
-        assert!(dash.contains("room for"), "calorie headroom framed kindly: {dash}");
+        assert!(
+            dash.contains("room for"),
+            "calorie headroom framed kindly: {dash}"
+        );
         // Floors far short read as "to go" — kind and action-first, never "need X".
         assert!(
             dash.contains("to go") && !dash.contains("need "),
@@ -3198,15 +4012,15 @@ mod tests {
     #[test]
     fn append_writes_rows_preserving_single_trailing_newline() {
         let dir = temp_logs();
-        std::fs::write(dir.join("food-log.csv"), format!("{FOOD_LOG_HEADER}\n")).unwrap();
+        std::fs::write(dir.join("food-log.csv"), format!("{}\n", food_log_header())).unwrap();
         let snap = append_rows_atomic(&dir, &["row-a".into(), "row-b".into()], &[], &[]).unwrap();
         let content = std::fs::read_to_string(dir.join("food-log.csv")).unwrap();
-        assert_eq!(content, format!("{FOOD_LOG_HEADER}\nrow-a\nrow-b\n"));
+        assert_eq!(content, format!("{}\nrow-a\nrow-b\n", food_log_header()));
         // Rollback restores the pre-append content exactly.
         snap.rollback();
         assert_eq!(
             std::fs::read_to_string(dir.join("food-log.csv")).unwrap(),
-            format!("{FOOD_LOG_HEADER}\n")
+            format!("{}\n", food_log_header())
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -3235,20 +4049,21 @@ mod tests {
     #[test]
     fn provenance_local_and_fallback_and_no_mirror() {
         assert_eq!(
-            format_diet_provenance(true, None, "http://u", "m", "approved", 2, true, None),
+            format_diet_provenance(true, None, "http://u", "m", "approved", 2, true, None, None),
             "jesse-bridge: diet turn -> local extract base_url=http://u model=m; verify verdict=approved; rows=2 mirror=derived"
         );
         assert_eq!(
-            format_diet_provenance(false, Some(3), "http://u", "m", "rejected", 1, false, None),
+            format_diet_provenance(false, Some(3), "http://u", "m", "rejected", 1, false, None, None),
             "jesse-bridge: diet turn -> hosted-fallback rung=3 extract base_url=http://u model=m; verify verdict=rejected; rows=1 mirror=omitted"
         );
         // Rung 5: logged locally, mirror omitted.
         assert_eq!(
-            format_diet_provenance(true, Some(5), "http://u", "m", "corrected", 11, false, None),
+            format_diet_provenance(true, Some(5), "http://u", "m", "corrected", 11, false, None, None),
             "jesse-bridge: diet turn -> local extract base_url=http://u model=m; verify verdict=corrected; rows=11 mirror=omitted"
         );
         // Never prints a token.
-        let line = format_diet_provenance(true, None, "http://u", "m", "approved", 1, true, None);
+        let line =
+            format_diet_provenance(true, None, "http://u", "m", "approved", 1, true, None, None);
         assert!(
             !line.contains("token"),
             "provenance must never carry a token"
@@ -3269,6 +4084,7 @@ mod tests {
             0,
             false,
             Some("schema_fail:time"),
+            None,
         );
         assert!(
             line.contains("reason=schema_fail:time"),
@@ -3276,7 +4092,8 @@ mod tests {
         );
         assert!(!line.contains("token"), "still never carries a token");
         // A local success (no reason) is unchanged — no `reason=` fragment.
-        let ok = format_diet_provenance(true, None, "http://u", "m", "approved", 1, true, None);
+        let ok =
+            format_diet_provenance(true, None, "http://u", "m", "approved", 1, true, None, None);
         assert!(
             !ok.contains("reason="),
             "a non-rung-2 line has no reason: {ok}"
@@ -3365,6 +4182,705 @@ mod tests {
                 );
             }
             _ => panic!("a failed extract spawn must fall through at rung 2"),
+        }
+    }
+
+    // ---- The nutrient table drives header / schema / prompt / row / mirror -----
+
+    /// A bare food entry with every nutrient blank — the starting point for the
+    /// completion tests.
+    fn blank_food(name: &str) -> FoodEntry {
+        FoodEntry {
+            name: name.into(),
+            meal: "Snack".into(),
+            time: Some("10:40".into()),
+            amount: Some("1 medium (~118g)".into()),
+            unit: Some("serving".into()),
+            kcal: Some(105.0),
+            protein_g: Some(1.3),
+            carbs_g: Some(27.0),
+            fat_g: Some(0.4),
+            fiber_g: None,
+            sodium_mg: None,
+            satfat_g: None,
+            sugar_g: None,
+            potassium_mg: None,
+            calcium_mg: None,
+            omega3_mg: None,
+            magnesium_mg: None,
+            notes: None,
+            unknowable_composite: false,
+        }
+    }
+
+    /// A completion carrying every EXPECTED nutrient (plausible banana values).
+    fn banana_completion() -> MicroCompletion {
+        let mut values = std::collections::BTreeMap::new();
+        for (k, v) in [
+            ("fiber_g", 3.1),
+            ("sodium_mg", 1.0),
+            ("satfat_g", 0.1),
+            ("sugar_g", 14.4),
+            ("potassium_mg", 422.0),
+            ("calcium_mg", 6.0),
+            ("magnesium_mg", 32.0),
+        ] {
+            values.insert(k.to_string(), v);
+        }
+        MicroCompletion {
+            values,
+            basis: Some("USDA SR Legacy 09040 banana raw, scaled to 118 g edible".into()),
+            malformed: false,
+        }
+    }
+
+    #[test]
+    fn header_is_the_22_canonical_columns_in_table_order() {
+        // The canonical contract, spelled out ONCE here so a reordering or rename in
+        // the table is caught by a failing test rather than by a corrupted log.
+        assert_eq!(
+            food_log_header(),
+            "Date,Meal,Item,Amount,Unit,Cal_per_100g,Grams,Calories,Protein_g,Fat_g,\
+Carbs_g,Notes,Time,Meal_Type,Fiber_g,Sodium_mg,SatFat_g,Sugar_g,Potassium_mg,\
+Calcium_mg,Omega3_mg,Magnesium_mg"
+        );
+        assert_eq!(food_log_header().split(',').count(), 22, "22 columns");
+    }
+
+    #[test]
+    fn nutrient_table_and_extract_schema_agree_both_ways() {
+        // Every table entry is accepted by the food-key validator...
+        for c in NUTRIENT_COLUMNS {
+            assert!(
+                is_food_key(c.key),
+                "table nutrient {:?} must be an accepted schema key",
+                c.key
+            );
+            // ...and appears in the schema text the child is shown.
+            assert!(
+                diet_extract_schema().contains(&format!("\"{}\"", c.key)),
+                "schema must name {:?}",
+                c.key
+            );
+        }
+        // ...and no nutrient key the schema text names is missing from the table: pull
+        // the food line's keys back out and check every nutrient-ish one resolves.
+        let food_line = diet_extract_schema()
+            .lines()
+            .find(|l| l.contains("\"kind\": \"food\""))
+            .expect("schema carries a food line");
+        for key in food_line
+            .split('"')
+            .filter(|t| t.ends_with("_g") || t.ends_with("_mg"))
+        {
+            let known = NUTRIENT_COLUMNS.iter().any(|c| c.key == key)
+                || ["protein_g", "carbs_g", "fat_g"].contains(&key);
+            assert!(known, "schema key {key:?} resolves to no table entry");
+        }
+        // The unit is stated for every nutrient, so the child cannot mix mg and g.
+        for c in NUTRIENT_COLUMNS {
+            assert!(
+                matches!(c.unit, "g" | "mg"),
+                "nutrient {:?} needs a real unit",
+                c.key
+            );
+        }
+    }
+
+    #[test]
+    fn generated_prompt_names_every_expected_nutrient_column() {
+        let p = build_diet_extract_prompt("ate a banana", "the user");
+        for c in NUTRIENT_COLUMNS.iter().filter(|c| c.expected()) {
+            assert!(
+                p.contains(c.key),
+                "extract prompt must name expected nutrient {:?}",
+                c.key
+            );
+            assert!(
+                p.contains(c.csv),
+                "prompt's inlined header must carry column {:?}",
+                c.csv
+            );
+        }
+    }
+
+    #[test]
+    fn food_row_emits_22_cells_with_nutrients_in_table_order() {
+        // Give each nutrient a DISTINCT value, then assert cell N+14 is the table's
+        // N-th nutrient — the row builder's order is the table's order, not a
+        // hand-written sequence.
+        let mut e = blank_food("Marker");
+        for (i, c) in NUTRIENT_COLUMNS.iter().enumerate() {
+            c.set(&mut e, Some((i + 1) as f64));
+        }
+        let row = food_row(&e, "2026-07-25");
+        let mut rdr = csv::ReaderBuilder::new()
+            .has_headers(false)
+            .from_reader(row.as_bytes());
+        let rec = rdr.records().next().unwrap().unwrap();
+        assert_eq!(rec.len(), 22, "22 cells");
+        for (i, c) in NUTRIENT_COLUMNS.iter().enumerate() {
+            assert_eq!(
+                &rec[14 + i],
+                &format!("{}", i + 1),
+                "cell {} must be {:?}",
+                14 + i,
+                c.csv
+            );
+        }
+    }
+
+    #[test]
+    fn synthetic_nutrient_flows_through_header_schema_and_prompt() {
+        // The anti-hardcoding proof: a NINTH table entry changes the header, the schema
+        // AND the prompt together. Nothing downstream carries its own copy of the list.
+        let synthetic = NutrientCol {
+            csv: "Selenium_ug",
+            key: "selenium_ug",
+            wire: Some("selenium_ug"),
+            app_key: "se",
+            unit: "ug",
+            fill: FillClass::ExpectedWhenKnowable,
+            // Accessors are irrelevant to the generated TEXT; reuse fiber's.
+            getter: |f| f.fiber_g,
+            setter: |f, v| f.fiber_g = v,
+            wire_setter: Some(|m, v| m.fiber_g = v),
+        };
+        let mut cols: Vec<NutrientCol> = NUTRIENT_COLUMNS.to_vec();
+        cols.push(synthetic);
+
+        let header = build_food_log_header(&cols);
+        assert_eq!(
+            header.split(',').count(),
+            23,
+            "the ninth nutrient extends it"
+        );
+        assert!(
+            header.ends_with(",Selenium_ug"),
+            "appended in table order: {header}"
+        );
+
+        let schema = build_extract_schema(&cols);
+        assert!(
+            schema.contains("\"selenium_ug\": <number, ug>"),
+            "schema gains the new key with its unit: {schema}"
+        );
+
+        let rules = build_nutrient_rules(&cols);
+        assert!(
+            rules.contains("`selenium_ug` (ug)"),
+            "the prompt's EXPECTED list gains it: {rules}"
+        );
+
+        // And the production table is untouched by the test's local copy.
+        assert_eq!(food_log_header().split(',').count(), 22);
+    }
+
+    // ---- Phase 2: the extract prompt now INSTRUCTS filling, not omission -----
+
+    #[test]
+    fn extract_prompt_states_every_nutrient_branch() {
+        let p = build_diet_extract_prompt("ate a banana", "the user");
+        for fragment in [
+            // Packaged food with a panel.
+            "PACKAGED FOOD WITH A NUTRITION PANEL IN THE MESSAGE",
+            "sodium_mg = salt_grams × 400",
+            "TOTAL sugars",
+            "saturated-fat line",
+            // Label-less whole food.
+            "LABEL-LESS WHOLE FOOD",
+            "standard food-composition",
+            "EDIBLE grams logged",
+            "Exclude pit, peel, core, shell and bone",
+            "Do NOT leave a column blank because no label printed it",
+            // Marine omega-3.
+            "marine long-chain omega-3 (EPA+DHA) ONLY",
+            "NEVER the plant ALA in walnuts, flax, chia or vegetable oils",
+            // Sodium scope.
+            "intrinsic sodium, plus label salt, plus restaurant",
+            "probably salted it",
+            // Unidentifiable composite.
+            "A COMPOSITE YOU CANNOT IDENTIFY",
+            "\"unknowable_composite\": true",
+            // Zero discipline.
+            "NEVER write 0 to mean",
+        ] {
+            assert!(
+                p.contains(fragment),
+                "extract prompt must state: {fragment}"
+            );
+        }
+    }
+
+    #[test]
+    fn extract_prompt_no_longer_instructs_omission_of_knowable_nutrients() {
+        // The defect, asserted gone: the old contract said a nutrient came only from a
+        // label "or a confident estimate" and that potassium/calcium/magnesium are
+        // "usually absent" from labels so "usually omitted". The child obeyed.
+        let p = build_diet_extract_prompt("ate a banana", "the user");
+        for gone in [
+            "usually absent",
+            "usually omitted",
+            "or a confident estimate",
+            "otherwise OMIT the key entirely",
+        ] {
+            assert!(
+                !p.contains(gone),
+                "the omission instruction must be gone, still found: {gone}"
+            );
+        }
+    }
+
+    #[test]
+    fn unknowable_composite_parses_and_defaults_false() {
+        let json = r#"{"entries":[
+          {"kind":"food","name":"House sauce","meal":"Dinner","kcal":90,"unknowable_composite":true},
+          {"kind":"food","name":"Banana","meal":"Snack","kcal":105}
+        ]}"#;
+        let ex = parse_diet_entries(json).expect("parses");
+        match (&ex.entries[0], &ex.entries[1]) {
+            (DietEntry::Food(a), DietEntry::Food(b)) => {
+                assert!(a.unknowable_composite, "explicit true is carried");
+                assert!(!b.unknowable_composite, "absent → false, never unknown");
+            }
+            other => panic!("expected two food entries, got {other:?}"),
+        }
+        // A non-boolean is a schema violation (no string "true").
+        assert!(
+            parse_diet_entries(
+                r#"{"entries":[{"kind":"food","name":"X","meal":"Snack","unknowable_composite":"yes"}]}"#
+            )
+            .is_err(),
+            "a non-boolean flag must reject"
+        );
+    }
+
+    // ---- Phase 3: verify-side completion contract ----------------------------
+
+    #[test]
+    fn verify_prompt_carries_the_completion_contract_only_when_enabled() {
+        let on = build_diet_verify_prompt("ate a banana", "{}", "the user", true);
+        assert!(on.contains("ALSO COMPLETE THE NUTRIENTS"));
+        assert!(on.contains("\"micros\""), "schema gains the micros object");
+        assert!(on.contains("reference_basis"));
+        assert!(
+            on.contains("NEVER send 0 to mean"),
+            "the zero discipline is restated to the verifier"
+        );
+        for c in NUTRIENT_COLUMNS.iter().filter(|c| c.expected()) {
+            assert!(on.contains(c.key), "completion must name {:?}", c.key);
+        }
+        assert!(
+            !on.contains("`omega3_mg` (mg),"),
+            "marine-only omega-3 is not in the EXPECTED completion list"
+        );
+
+        let off = build_diet_verify_prompt("ate a banana", "{}", "the user", false);
+        assert!(
+            !off.contains("ALSO COMPLETE THE NUTRIENTS") && !off.contains("reference_basis"),
+            "with completion off the verify prompt is the macro-verdict prompt"
+        );
+        // The macro half is identical either way.
+        assert!(on.contains("TOLERANCE:") && off.contains("TOLERANCE:"));
+    }
+
+    #[test]
+    fn candidates_json_sends_known_nutrients_and_omits_blank_ones() {
+        let mut f = blank_food("Salmon");
+        f.sodium_mg = Some(340.0);
+        f.omega3_mg = Some(1400.0);
+        let json = entries_to_json(&[DietEntry::Food(f)]);
+        assert!(
+            json.contains("\"sodium_mg\":340"),
+            "known nutrient rides: {json}"
+        );
+        assert!(json.contains("\"omega3_mg\":1400"));
+        for blank in ["potassium_mg", "calcium_mg", "magnesium_mg", "fiber_g"] {
+            assert!(
+                !json.contains(blank),
+                "a BLANK nutrient must be omitted (that is the completion input): {blank}"
+            );
+        }
+    }
+
+    #[test]
+    fn verdict_parses_a_completion_block_and_tolerates_its_absence() {
+        // Old shape (no micros): parses exactly as before, completing nothing.
+        let old = parse_verify_verdicts(r#"{"verdicts":[{"verdict":"approve"}]}"#, 1).unwrap();
+        assert!(old[0].completion.is_empty() && !old[0].completion.malformed);
+
+        let with = parse_verify_verdicts(
+            r#"{"verdicts":[{"verdict":"approve","micros":{"fiber_g":3.1,"potassium_mg":422},
+                "reference_basis":"USDA banana raw, scaled to 118 g"}]}"#,
+            1,
+        )
+        .unwrap();
+        assert_eq!(with[0].completion.values.get("fiber_g"), Some(&3.1));
+        assert_eq!(with[0].completion.values.get("potassium_mg"), Some(&422.0));
+        assert!(with[0]
+            .completion
+            .basis
+            .as_deref()
+            .unwrap()
+            .starts_with("USDA"));
+        assert!(!with[0].completion.malformed);
+
+        // A null/blank value is the verifier DECLINING — normal, not malformed.
+        let declined = parse_verify_verdicts(
+            r#"{"verdicts":[{"verdict":"approve","micros":{"fiber_g":null,"sugar_g":""}}]}"#,
+            1,
+        )
+        .unwrap();
+        assert!(declined[0].completion.values.is_empty());
+        assert!(
+            !declined[0].completion.malformed,
+            "a decline is not malformed"
+        );
+    }
+
+    #[test]
+    fn unusable_completion_block_is_dropped_whole_and_flagged() {
+        for bad in [
+            r#"{"verdicts":[{"verdict":"approve","micros":"lots"}]}"#,
+            r#"{"verdicts":[{"verdict":"approve","micros":{"fiber_g":3,"sodium_mg":-5}}]}"#,
+            r#"{"verdicts":[{"verdict":"approve","micros":{"fiber_g":"three"}}]}"#,
+        ] {
+            let v = parse_verify_verdicts(bad, 1).expect("the VERDICT still parses");
+            assert!(v[0].completion.malformed, "must be flagged: {bad}");
+            assert!(
+                v[0].completion.values.is_empty(),
+                "no partial trust in an unusable block: {bad}"
+            );
+        }
+    }
+
+    // ---- Phase 3: the merge rules -------------------------------------------
+
+    #[test]
+    fn completion_fills_only_blank_cells_and_a_label_always_wins() {
+        let mut e = blank_food("Banana");
+        e.sugar_g = Some(12.0); // came off a label
+        let filled = complete_food_micros(&mut e, &banana_completion());
+        assert_eq!(
+            e.sugar_g,
+            Some(12.0),
+            "the label value is NEVER overwritten"
+        );
+        assert_eq!(e.fiber_g, Some(3.1), "a blank cell is filled");
+        assert_eq!(e.potassium_mg, Some(422.0));
+        assert_eq!(e.calcium_mg, Some(6.0));
+        assert_eq!(e.magnesium_mg, Some(32.0));
+        assert_eq!(filled, 6, "six blanks filled, sugar left alone");
+        assert!(missing_expected_nutrients(&e).is_empty(), "row is complete");
+    }
+
+    #[test]
+    fn a_declined_nutrient_stays_blank_and_is_never_zero() {
+        let mut e = blank_food("Banana");
+        let mut c = banana_completion();
+        c.values.remove("potassium_mg");
+        c.values.remove("magnesium_mg");
+        complete_food_micros(&mut e, &c);
+        assert_eq!(e.potassium_mg, None, "declined → blank, NOT Some(0.0)");
+        assert_eq!(e.magnesium_mg, None);
+        assert_eq!(
+            missing_expected_nutrients(&e),
+            vec!["Potassium_mg", "Magnesium_mg"],
+            "and it is REPORTED as missing"
+        );
+        // The blank reaches the CSV as an empty cell, never a 0.
+        let row = food_row(&e, "2026-07-25");
+        let mut rdr = csv::ReaderBuilder::new()
+            .has_headers(false)
+            .from_reader(row.as_bytes());
+        let rec = rdr.records().next().unwrap().unwrap();
+        assert_eq!(&rec[18], "", "Potassium_mg blank, not 0");
+        assert_eq!(&rec[21], "", "Magnesium_mg blank, not 0");
+    }
+
+    #[test]
+    fn an_explicit_zero_from_the_verifier_is_a_measured_zero() {
+        // Plain meat really has 0 fiber and 0 sugar; the honest value is 0, and the
+        // prompt tells the verifier to omit rather than send 0 when it does not know.
+        let mut e = blank_food("Chicken breast");
+        let mut c = MicroCompletion::default();
+        c.values.insert("fiber_g".into(), 0.0);
+        c.values.insert("sugar_g".into(), 0.0);
+        let filled = complete_food_micros(&mut e, &c);
+        assert_eq!((e.fiber_g, e.sugar_g), (Some(0.0), Some(0.0)));
+        assert_eq!(filled, 2);
+    }
+
+    #[test]
+    fn completion_never_fills_the_marine_only_nutrient() {
+        let mut e = blank_food("Walnuts");
+        let mut c = banana_completion();
+        c.values.insert("omega3_mg".into(), 2500.0); // plant ALA mistake
+        complete_food_micros(&mut e, &c);
+        assert_eq!(
+            e.omega3_mg, None,
+            "MarineOnly is never completed — a blank there is the correct state"
+        );
+        // ...and a blank omega-3 is not counted as incomplete.
+        assert!(missing_expected_nutrients(&e).is_empty());
+    }
+
+    #[test]
+    fn an_unknowable_composite_row_is_skipped_entirely() {
+        let mut e = blank_food("House sauce");
+        e.unknowable_composite = true;
+        let filled = complete_food_micros(&mut e, &banana_completion());
+        assert_eq!(filled, 0, "nothing is filled");
+        assert_eq!(e.fiber_g, None);
+        assert_eq!(e.notes, None, "and its Notes are untouched");
+        assert!(
+            missing_expected_nutrients(&e).is_empty(),
+            "a composite is not counted as incomplete data"
+        );
+    }
+
+    #[test]
+    fn the_reference_basis_lands_in_notes_only_when_notes_is_empty() {
+        // Empty Notes → the basis is written.
+        let mut e = blank_food("Banana");
+        complete_food_micros(&mut e, &banana_completion());
+        assert_eq!(
+            e.notes.as_deref(),
+            Some("USDA SR Legacy 09040 banana raw, scaled to 118 g edible")
+        );
+
+        // Existing note text → never overwritten, even though cells were filled.
+        let mut e2 = blank_food("Banana");
+        e2.notes = Some("with peanut butter".into());
+        let filled = complete_food_micros(&mut e2, &banana_completion());
+        assert!(filled > 0, "cells were still completed");
+        assert_eq!(e2.notes.as_deref(), Some("with peanut butter"));
+
+        // Nothing filled (verifier declined everything) → nothing appended to Notes.
+        let mut e3 = blank_food("Banana");
+        e3.fiber_g = Some(3.0);
+        e3.sodium_mg = Some(1.0);
+        e3.satfat_g = Some(0.1);
+        e3.sugar_g = Some(14.0);
+        e3.potassium_mg = Some(422.0);
+        e3.calcium_mg = Some(6.0);
+        e3.magnesium_mg = Some(32.0);
+        let c = MicroCompletion {
+            values: std::collections::BTreeMap::new(),
+            basis: Some("USDA something".into()),
+            malformed: false,
+        };
+        assert_eq!(complete_food_micros(&mut e3, &c), 0);
+        assert_eq!(e3.notes, None, "an uncompleted row gets no note");
+    }
+
+    #[test]
+    fn completion_never_changes_identity_amount_time_or_a_core_macro() {
+        let before = blank_food("Banana");
+        let mut after = before.clone();
+        // A completion that ALSO tries to move the identity fields cannot: they are not
+        // reachable from the merge (only nutrient keys are honored).
+        let mut c = banana_completion();
+        c.values.insert("kcal".into(), 999.0);
+        c.values.insert("protein_g".into(), 99.0);
+        c.values.insert("carbs_g".into(), 99.0);
+        c.values.insert("fat_g".into(), 99.0);
+        complete_food_micros(&mut after, &c);
+        assert_eq!(after.name, before.name);
+        assert_eq!(after.meal, before.meal);
+        assert_eq!(after.time, before.time);
+        assert_eq!(after.amount, before.amount);
+        assert_eq!(after.unit, before.unit);
+        assert_eq!(after.kcal, before.kcal, "kcal untouched");
+        assert_eq!(after.protein_g, before.protein_g);
+        assert_eq!(after.carbs_g, before.carbs_g);
+        assert_eq!(after.fat_g, before.fat_g);
+    }
+
+    #[test]
+    fn a_malformed_completion_appends_the_rows_unchanged() {
+        // The degrade path: an unusable block completes nothing, so the row is written
+        // exactly as the extract produced it (and the turn is reported incomplete).
+        let extracted = blank_food("Banana");
+        let mut row = extracted.clone();
+        let v = parse_verify_verdicts(
+            r#"{"verdicts":[{"verdict":"approve","micros":{"fiber_g":"three"}}]}"#,
+            1,
+        )
+        .unwrap();
+        complete_food_micros(&mut row, &v[0].completion);
+        assert_eq!(row, extracted, "byte-for-byte the extracted entry");
+        let stats = MicroStats::compute(&[row], 0, true, v[0].completion.malformed);
+        assert_eq!(stats.filled, 0);
+        assert_eq!(stats.expected, 7);
+        assert_eq!(stats.reason, Some(MicroReason::Unparseable));
+        assert_eq!(stats.reason.unwrap().code(), "micro_complete_unparseable");
+    }
+
+    // ---- Phase 4: completeness accounting + provenance ----------------------
+
+    #[test]
+    fn completeness_counts_only_eligible_rows_and_reports_a_reason() {
+        let mut complete = blank_food("Banana");
+        complete_food_micros(&mut complete, &banana_completion());
+        let mut partial = blank_food("Soup");
+        let mut c = banana_completion();
+        c.values.remove("calcium_mg");
+        complete_food_micros(&mut partial, &c);
+        let mut composite = blank_food("House sauce");
+        composite.unknowable_composite = true;
+
+        let rows = vec![complete, partial, composite];
+        let stats = MicroStats::compute(&rows, 2, true, false);
+        assert_eq!(stats.food_rows, 3);
+        assert_eq!(stats.eligible_rows, 2, "the composite is excluded");
+        assert_eq!(stats.expected, 14, "2 eligible rows × 7 expected columns");
+        assert_eq!(stats.filled, 13);
+        assert_eq!(stats.rows_completed, 2);
+        assert_eq!(stats.rows_incomplete, 1);
+        assert_eq!(stats.reason, Some(MicroReason::Incomplete));
+        assert_eq!(
+            stats.provenance(),
+            Some((13, 14, Some(MicroReason::Incomplete)))
+        );
+
+        // A fully complete turn carries NO reason code.
+        let mut all = blank_food("Banana");
+        complete_food_micros(&mut all, &banana_completion());
+        let clean = MicroStats::compute(&[all], 1, true, false);
+        assert_eq!(clean.reason, None);
+        assert_eq!(clean.provenance(), Some((7, 7, None)));
+
+        // Completion disabled explains the blanks differently.
+        let off = MicroStats::compute(&[blank_food("Banana")], 0, false, false);
+        assert_eq!(off.reason, Some(MicroReason::Disabled));
+        assert_eq!(off.reason.unwrap().code(), "micro_complete_off");
+
+        // No eligible rows (exercise/weigh-in only, or an all-composite turn) → nothing
+        // to report on the provenance line.
+        let none = MicroStats::compute(&[], 0, true, false);
+        assert_eq!(none.provenance(), None);
+        assert_eq!(none.reason, None);
+    }
+
+    #[test]
+    fn provenance_carries_completeness_and_stays_content_free() {
+        let line = format_diet_provenance(
+            true,
+            None,
+            "http://u",
+            "m",
+            "approved",
+            2,
+            true,
+            None,
+            Some((13, 14, Some(MicroReason::Incomplete))),
+        );
+        assert!(
+            line.contains("micros=13/14"),
+            "filled over expected: {line}"
+        );
+        assert!(line.contains("micro_reason=micros_incomplete"), "{line}");
+        for forbidden in ["banana", "Banana", "token", "sk-"] {
+            assert!(!line.contains(forbidden), "no meal text / token: {line}");
+        }
+        // A complete turn shows the figure with no reason fragment.
+        let clean = format_diet_provenance(
+            true,
+            None,
+            "http://u",
+            "m",
+            "approved",
+            1,
+            true,
+            None,
+            Some((7, 7, None)),
+        );
+        assert!(clean.contains("micros=7/7") && !clean.contains("micro_reason="));
+        // A fall-through line omits the figure entirely (nothing was appended).
+        let fell = format_diet_provenance(
+            false,
+            Some(3),
+            "http://u",
+            "m",
+            "rejected",
+            0,
+            false,
+            None,
+            None,
+        );
+        assert!(!fell.contains("micros="), "{fell}");
+    }
+
+    #[test]
+    fn a_reference_basis_is_squeezed_into_one_safe_csv_line() {
+        // A multi-line / CR-carrying basis must not smuggle a bare CR into the CSV —
+        // that is exactly the defect that broke the food log's header once.
+        let mut e = blank_food("Banana");
+        let mut c = banana_completion();
+        c.basis = Some("USDA SR Legacy\r\n09040 banana raw,\r scaled to 118 g".into());
+        complete_food_micros(&mut e, &c);
+        let notes = e.notes.clone().unwrap();
+        assert!(
+            !notes.contains('\r') && !notes.contains('\n'),
+            "one line: {notes:?}"
+        );
+        assert_eq!(notes, "USDA SR Legacy 09040 banana raw, scaled to 118 g");
+        // The comma still forces RFC-4180 quoting, and the row keeps 22 fields.
+        let row = food_row(&e, "2026-07-25");
+        let mut rdr = csv::ReaderBuilder::new()
+            .has_headers(false)
+            .from_reader(row.as_bytes());
+        let rec = rdr.records().next().unwrap().unwrap();
+        assert_eq!(rec.len(), 22);
+        assert_eq!(&rec[11], &notes, "Notes cell round-trips intact");
+    }
+
+    #[test]
+    fn unknown_stays_unknown_end_to_end_including_the_derived_mirror() {
+        // The round trip: a nutrient the verifier declined must read back as UNKNOWN at
+        // every layer — blank CSV cell, JSON null in the read path, omitted meal-wire key
+        // — and never as 0.
+        let mut e = blank_food("Banana");
+        let mut c = banana_completion();
+        c.values.remove("potassium_mg");
+        c.values.remove("calcium_mg");
+        complete_food_micros(&mut e, &c);
+
+        let csv = format!("{}\n{}\n", food_log_header(), food_row(&e, "2026-07-25"));
+        // Read path (GET /jesse/diet): declined → null, filled → the number, never 0.
+        let (meals, errs) = crate::diet::reconstruct_meals(&csv, "2026-07-25");
+        assert!(errs.is_empty(), "{errs:?}");
+        let item = &meals[0]["items"][0];
+        assert!(item["k"].is_null(), "declined potassium reads null, not 0");
+        assert!(item["ca"].is_null(), "declined calcium reads null, not 0");
+        assert_eq!(item["mg"], 32.0, "a completed value reads back");
+        assert!(item["o3"].is_null(), "marine-only, never completed → null");
+
+        // Derived mirror: the declined nutrients are OMITTED from the wire.
+        let log = build_meal_log_from_food_rows(&[e], "2026-07-25", "+02:00")
+            .unwrap()
+            .unwrap();
+        let wire = serde_json::to_value(&log.meals[0]).unwrap();
+        assert!(
+            wire.get("potassium_mg").is_none(),
+            "omitted, never 0: {wire}"
+        );
+        assert!(wire.get("calcium_mg").is_none());
+        assert_eq!(wire["magnesium_mg"], 32.0);
+        assert!(
+            wire.get("omega3_mg").is_none(),
+            "omega-3 has no HealthKit type and never rides the wire"
+        );
+        // Every wire nutrient key present comes from the table.
+        for c in NUTRIENT_COLUMNS {
+            match c.wire {
+                None => assert!(wire.get(c.key).is_none()),
+                Some(k) => assert!(
+                    NUTRIENT_COLUMNS.iter().any(|t| t.wire == Some(k)),
+                    "wire key {k} must be table-owned"
+                ),
+            }
         }
     }
 

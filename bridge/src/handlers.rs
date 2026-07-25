@@ -710,6 +710,9 @@ pub async fn jesse(
         // code; None on every other turn). Threaded into the metrics line so the audit
         // can separate pipeline failures from correct rejections of non-loggable turns.
         let mut m_diet_reason: Option<String> = None;
+        // Nutrient-completeness accounting for a local diet turn that appended food rows
+        // (counts + a reason code, never item text). `None` on every other route.
+        let mut m_diet_micros: Option<DietMicros> = None;
         // Provenance-only: whether an emergency answer skipped the citation check.
         // Never feeds the metrics line (which records the validator verdict directly).
         let mut m_citations_unverified = false;
@@ -724,20 +727,23 @@ pub async fn jesse(
                 DietPipelineOutcome::Logged {
                     dashboard,
                     directives,
+                    micros,
                 } => {
                     // The blocking hosted verify succeeded → hosted is reachable.
                     hosted_succeeded = true;
                     route = MetricsRoute::DietLocal;
                     m_model = diet_model();
+                    m_diet_micros = Some(micros.into());
                     (
                         Ok((dashboard, None, Some(directives))),
                         BadgeSource::DietVerify,
                     )
                 }
-                DietPipelineOutcome::LoggedNoMirror { dashboard } => {
+                DietPipelineOutcome::LoggedNoMirror { dashboard, micros } => {
                     hosted_succeeded = true;
                     route = MetricsRoute::DietLocal;
                     m_model = diet_model();
+                    m_diet_micros = Some(micros.into());
                     (Ok((dashboard, None, None)), BadgeSource::DietVerify)
                 }
                 DietPipelineOutcome::VerifyUnavailable {
@@ -1053,6 +1059,7 @@ pub async fn jesse(
                     emergency: m_emergency,
                     hosted_failure_class: m_failclass,
                     diet_reason: m_diet_reason,
+                    diet_micros: m_diet_micros,
                 },
             );
         }

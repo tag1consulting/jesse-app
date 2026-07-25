@@ -43,6 +43,7 @@ pub fn test_config() -> Config {
         // (kill switch), so the integration router exercises today's hosted path.
         diet_backend: None,
         diet_probation: true,
+        diet_micro_complete: true,
         // No vault-QA backend override in tests — the route is inert (kill switch),
         // so the integration router exercises today's hosted Ask path.
         vaultqa_backend: None,

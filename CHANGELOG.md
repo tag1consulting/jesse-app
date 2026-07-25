@@ -15,6 +15,61 @@ CI both run it). See the "Versioning" section of `bridge/README.md`.
 
 ## [Unreleased]
 
+## [Bridge 0.32.0] - 2026-07-25
+
+### Fixed
+- **The local diet route no longer instructs the extract child to OMIT knowable nutrients.**
+  The inlined extract contract told the child to fill a nutrient only from a nutrition label
+  in the message "or a confident estimate" and to omit the key otherwise, and volunteered
+  that potassium, calcium and magnesium are "usually absent from labels so usually omitted".
+  The child obeyed: rows logged through the local route landed with three or more knowable
+  nutrient columns blank, the verify gate checked only macros so it approved them, and
+  nothing recorded that the row was incomplete — while the same foods logged through the
+  hosted path always carried those nutrients from food-composition values. The contract now
+  says the opposite for a food the child can identify, branch by branch: use a nutrition
+  panel scaled to the amount logged (with `sodium_mg = salt_grams × 400` for a salt-only
+  label, total sugars never added sugars); for a label-less whole food fill every expected
+  nutrient from standard food-composition values scaled to the EDIBLE grams (pit, peel,
+  core, shell and bone excluded); count `omega3_mg` as marine EPA+DHA only, never plant ALA;
+  count sodium as intrinsic + label salt + restaurant seasoning, never a "probably salted
+  it" allowance; and still omit — now flagging the new `unknowable_composite` — for a
+  composite nobody can identify. `0` remains a measured zero, never a stand-in for unknown.
+
+### Added
+- **One nutrient table (`dietlog::NUTRIENT_COLUMNS`) as the single definition of every
+  nutrient column.** Each column is described exactly once (CSV name, extract-schema key,
+  meal-wire key or none, unit, app-snapshot key, and a fill class of `ExpectedWhenKnowable`
+  or `MarineOnly`), and the CSV header, the schema's accepted nutrient keys, the nutrient
+  section of the extract prompt, the row builder's nutrient cells, the derived Apple Health
+  mirror's nutrient fields, and the app's per-day nutrient series are all derived from it.
+  The hand-maintained duplicates folded in: `FOOD_LOG_HEADER`, `FOOD_KEYS`, `diet.rs`'s
+  `NUTRIENT_COLS` + per-item read block + test header copy, and `directives.rs`'s
+  `MEAL_FIELDS`. A test adds a synthetic ninth entry and proves the header, the schema and
+  the prompt all change together.
+- **Hosted micronutrient completion (`JESSE_DIET_MICRO_COMPLETE`, default on).** The
+  blocking verify call — which already holds the raw utterance and the candidate rows —
+  now also returns, per row it judges a label-less whole food, food-composition values for
+  the expected nutrient columns the extract left blank plus a one-line reference basis, at
+  no extra round trip. Every merge rule is enforced in trusted Rust: blank cells only (a
+  label always wins), a declined value stays blank and is never `0`, expected columns only
+  (omega-3 is never completed), `unknowable_composite` rows skipped whole, the basis written
+  to `Notes` only when `Notes` is empty and only when a cell was actually filled, and
+  nothing outside the nutrient cells reachable from the merge. The candidate JSON sent to
+  the verifier now carries the nutrients the extract knows and omits the ones it does not,
+  which is what lets the verifier fill exactly the blanks. The flag is deliberately
+  independent of `JESSE_DIET_PROBATION`: probation owns the verify gate's posture,
+  this flag owns completion, so a later graduation does not silently stop it. Degrade-only:
+  an error, timeout or unusable completion block appends the extract's rows unchanged.
+- **Nutrient incompleteness is now visible.** The per-turn provenance line carries
+  `micros=<filled>/<expected>` (plus `micro_reason=micros_incomplete` /
+  `micro_complete_unparseable` / `micro_complete_off` when anything is still blank) and
+  stays content-free; the metrics record carries the same counts as a `diet_micros` object;
+  and the audit gained a *Diet nutrient completeness* section reporting per day the
+  local-route food rows appended, rows completed by the verifier, rows still incomplete, the
+  incomplete rate and cell fill rate, plus the still-incomplete rows by item name (read from
+  `food-log.csv`, so that list is not route-attributable) for hand repair. No auto-demotion:
+  the numbers are reported and the audit states that the threshold is not yet set.
+
 ## [Bridge 0.31.0] - 2026-07-24
 
 ### Added

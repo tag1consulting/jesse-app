@@ -94,6 +94,51 @@ pub struct MetricsRecord {
     /// pipeline FAILURE from a correct rejection of a non-loggable turn.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub diet_reason: Option<String>,
+    /// Nutrient-completeness accounting for a LOCAL-route diet turn that appended food
+    /// rows ([`dietlog::MicroStats`]); `None` on every other turn. Counts and a reason
+    /// code only — no item name, no meal text — so the line stays content-free.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub diet_micros: Option<DietMicros>,
+}
+
+/// The metrics-line twin of [`dietlog::MicroStats`]: how many nutrient cells the
+/// turn's appended food rows carry out of how many were expected, how many rows the
+/// hosted completion filled, and why anything is still blank.
+///
+/// Kept as its own nested object rather than six flat fields so a non-diet line is
+/// unchanged (one omitted key) and the audit can aggregate it as a unit.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DietMicros {
+    /// Food rows appended on this turn.
+    pub food_rows: usize,
+    /// Rows completion applies to (food rows minus unidentifiable composites).
+    pub eligible_rows: usize,
+    /// Rows the hosted completion filled at least one blank cell on.
+    pub rows_completed: usize,
+    /// Rows still carrying at least one blank expected nutrient column.
+    pub rows_incomplete: usize,
+    /// Expected nutrient cells filled.
+    pub filled: usize,
+    /// Expected nutrient cells in total.
+    pub expected: usize,
+    /// `micros_incomplete` / `micro_complete_unparseable` / `micro_complete_off`
+    /// ([`dietlog::MicroReason::code`]); absent when the turn is fully complete.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+impl From<crate::dietlog::MicroStats> for DietMicros {
+    fn from(s: crate::dietlog::MicroStats) -> Self {
+        DietMicros {
+            food_rows: s.food_rows,
+            eligible_rows: s.eligible_rows,
+            rows_completed: s.rows_completed,
+            rows_incomplete: s.rows_incomplete,
+            filled: s.filled,
+            expected: s.expected,
+            reason: s.reason.map(|r| r.code().to_string()),
+        }
+    }
 }
 
 /// Append one metrics line to `cfg.metrics_log`, or do nothing when it is unset.
@@ -151,6 +196,7 @@ mod tests {
             emergency: false,
             hosted_failure_class: None,
             diet_reason: None,
+            diet_micros: None,
         }
     }
 
@@ -173,6 +219,52 @@ mod tests {
         }
         let back: MetricsRecord = serde_json::from_str(&line).unwrap();
         assert_eq!(back, rec, "round-trip identity");
+    }
+
+    #[test]
+    fn diet_micros_round_trips_and_stays_content_free() {
+        let mut rec = sample();
+        rec.route = MetricsRoute::DietLocal;
+        rec.diet_micros = Some(DietMicros {
+            food_rows: 3,
+            eligible_rows: 2,
+            rows_completed: 2,
+            rows_incomplete: 1,
+            filled: 13,
+            expected: 14,
+            reason: Some("micros_incomplete".to_string()),
+        });
+        let line = serde_json::to_string(&rec).unwrap();
+        assert!(
+            line.contains("\"filled\":13") && line.contains("\"expected\":14"),
+            "{line}"
+        );
+        assert!(line.contains("\"reason\":\"micros_incomplete\""), "{line}");
+        // Still content-free: counts and a code, never an item name or meal text.
+        for forbidden in ["item", "Banana", "question", "answer", "tokens"] {
+            assert!(
+                !line.contains(forbidden),
+                "must not carry {forbidden:?}: {line}"
+            );
+        }
+        let back: MetricsRecord = serde_json::from_str(&line).unwrap();
+        assert_eq!(back, rec);
+
+        // A complete turn omits the reason; a non-diet turn omits the whole object.
+        let mut clean = sample();
+        clean.diet_micros = Some(DietMicros {
+            food_rows: 1,
+            eligible_rows: 1,
+            rows_completed: 1,
+            rows_incomplete: 0,
+            filled: 7,
+            expected: 7,
+            reason: None,
+        });
+        let cl = serde_json::to_string(&clean).unwrap();
+        assert!(!cl.contains("reason"), "no reason on a complete turn: {cl}");
+        let none = serde_json::to_string(&sample()).unwrap();
+        assert!(!none.contains("diet_micros"), "omitted entirely: {none}");
     }
 
     #[test]

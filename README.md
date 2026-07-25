@@ -236,6 +236,7 @@ Full table in [`bridge/README.md`](bridge/README.md#knobs-env-vars). Most-used:
 | `JESSE_DIET_AUTH_TOKEN` | _(off)_ | Auth token for the diet-extract backend (the extract child's `ANTHROPIC_AUTH_TOKEN`). |
 | `JESSE_DIET_MODEL` | _(off)_ | Model id for the diet-extract backend (the extract child's `ANTHROPIC_MODEL`). |
 | `JESSE_DIET_PROBATION` | `true` | Probation mode: the hosted verify gate is mandatory and blocking on every extracted entry. Only an explicit falsey value disables it (a future graduation state, not used yet). |
+| `JESSE_DIET_MICRO_COMPLETE` | `true` | Hosted micronutrient completion: the blocking verify call also fills the **blank** expected nutrient columns of a label-less whole food from food-composition values (blank-only merge, never overwriting a label, never writing `0` for a declined value). Only an explicit falsey value disables it — off is the old behavior that left knowable columns blank. Independent of `JESSE_DIET_PROBATION`: probation owns the verify gate, this owns completion. |
 
 The three `JESSE_TITLE_*` vars are **all-or-nothing** and **soft**: set all three
 to redirect titles only; leave any unset (the default) and titles use the ambient
