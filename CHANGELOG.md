@@ -15,6 +15,30 @@ CI both run it). See the "Versioning" section of `bridge/README.md`.
 
 ## [Unreleased]
 
+## [App 1.0 (79)] - 2026-07-25
+
+### Fixed
+- **The Health tab's "Start new day" button did nothing on iOS.** It shipped in App 1.0 (78)
+  as `ToolbarItem(placement: .secondaryAction)`, which on iOS is not "the second button":
+  UIKit collapses secondary items into a "More" overflow ellipsis, which is why the phone
+  showed an ellipsis instead of the `sun.horizon` symbol. The tap was dead for a second,
+  compounding reason: the item was declared inside the today-only `if` in the toolbar
+  builder, and a secondary item declared conditionally lands in the overflow with an EMPTY
+  menu, which UIKit declines to present. So the control rendered and swallowed every tap.
+  Both items are now `.primaryAction`, so the button is a real navigation bar button beside
+  "+". The today-only gate, the symbol, the accessibility label, the confirmation, and the
+  fixed prompt are all unchanged. macOS was never affected: it uses a plain `ToolbarItem`
+  with no conditional, which is why the same feature always worked there.
+
+### Added
+- **A `JesseUITests` XCUITest target** (in the `Jesse` scheme, so CI runs it). The button
+  above was verified only by a unit test pinning the prompt string's classification, which
+  a completely non-functional button passes: a toolbar item's PLACEMENT is invisible to a
+  unit test. The new suite drives the real app and asserts that "Start new day" is a
+  hittable navigation bar button showing `sun.horizon` and that tapping it presents the
+  confirmation, plus that "+" still opens Quick log with its four options. It fails against
+  the broken build and passes against this one.
+
 ## [Bridge 0.34.0] - 2026-07-25
 
 ### Removed
