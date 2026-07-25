@@ -36,11 +36,16 @@ struct HealthTabView: View {
                             Button { showQuickLog = true } label: { Image(systemName: "plus") }
                                 .accessibilityLabel("Quick log")
                         }
-                        ToolbarItem(placement: .secondaryAction) {
-                            Button { confirmNewDay = true } label: {
-                                Image(systemName: "sun.horizon")
-                            }
-                            .accessibilityLabel("Start new day")
+                        // BOTH items must be `.primaryAction`. `.secondaryAction` (which
+                        // this one shipped as) does NOT mean "the second button" on iOS:
+                        // UIKit collapses secondary items into a "More" overflow ellipsis.
+                        // Worse, an overflow item declared inside a conditional like this
+                        // `if` gets an EMPTY menu, and UIKit won't present an empty menu,
+                        // so the ellipsis rendered but was inert: no icon, no confirmation,
+                        // while the Mac (plain `ToolbarItem`, no conditional) was fine.
+                        ToolbarItem(placement: .primaryAction) {
+                            Button { confirmNewDay = true } label: { Image(systemName: "sun.horizon") }
+                                .accessibilityLabel("Start new day")
                         }
                     }
                 }
