@@ -2,7 +2,7 @@ use crate::*;
 
 // ---- Server-side per-session favorite / archived flags ---------------------
 //
-// A single JSON file `<state_dir>/flags.json` mapping session_id -> SessionFlags,
+// A single JSON file `<state_dir>/flags.json` mapping conversation_id -> SessionFlags,
 // so a conversation's favorite / archived state is the bridge's (not one device's)
 // and every device converges on one set of favorites and one set of archived
 // conversations. Mirrors `TitleStore`'s discipline exactly: atomic temp+rename
@@ -80,7 +80,7 @@ pub struct FlagUpdate {
     pub archived_updated_ms: Option<u64>,
 }
 
-/// The session_id -> flags map. Cheaply shared behind an `Arc` in `AppState`.
+/// The conversation_id -> flags map. Cheaply shared behind an `Arc` in `AppState`.
 pub struct FlagStore {
     map: Mutex<HashMap<String, SessionFlags>>,
     // Where the map is persisted. `None` -> in-memory only.
@@ -156,6 +156,28 @@ impl FlagStore {
             if map.remove(session_id).is_none() {
                 return;
             }
+            map.clone()
+        };
+        if let Some(path) = &self.path {
+            persist_flags(path, &snapshot);
+        }
+    }
+
+    /// A copy of the whole map. Needed by the one-time key migration, which has to
+    /// walk every existing key to re-key it onto a conversation id.
+    pub fn snapshot(&self) -> HashMap<String, SessionFlags> {
+        self.map.lock_ok().clone()
+    }
+
+    /// Replace the whole map and persist. The one-time key migration's commit step:
+    /// the re-keyed map is installed in one write, so a partially migrated file can
+    /// never be observed. Rows are carried over UNCHANGED, so each flag keeps its
+    /// last-writer-wins clock and convergence is unaffected by the re-keying. Not for
+    /// ordinary use: `apply` / `remove` are the per-entry API.
+    pub fn replace(&self, flags: HashMap<String, SessionFlags>) {
+        let snapshot = {
+            let mut map = self.map.lock_ok();
+            *map = flags;
             map.clone()
         };
         if let Some(path) = &self.path {

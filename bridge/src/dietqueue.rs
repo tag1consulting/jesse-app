@@ -254,6 +254,7 @@ pub async fn replay_diet_queue(cfg: &Config, queue: &DietQueue) {
                 &item.utterance,
                 &entries_to_json(&item.entries),
                 &cfg.persona.owner_name,
+                cfg.diet_micro_complete,
             ),
             DIET_VERIFY_TIMEOUT_SECS,
         )
@@ -350,6 +351,7 @@ mod tests {
             offset: "+02:00".to_string(),
             utterance: format!("ate a {name}"),
             entries: vec![DietEntry::Food(FoodEntry {
+                unknowable_composite: false,
                 name: name.to_string(),
                 meal: "Snack".to_string(),
                 time: Some("09:00".to_string()),

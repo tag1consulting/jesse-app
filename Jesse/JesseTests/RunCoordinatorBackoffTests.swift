@@ -26,10 +26,12 @@ final class RunCoordinatorBackoffTests: XCTestCase {
         private(set) var resultCalls = 0
         init(runningCount: Int) { self.runningCount = runningCount }
 
-        func send(mode: JesseMode, text: String, sessionId: String?, voice: Bool,
+        func send(mode: JesseMode, text: String, sessionId: String?,
+                  conversationId: String, voice: Bool,
                   instructions: String?, floorOverride: String?,
-                  attachments: [JesseAttachment]) async throws -> JesseSendResult {
-            .running(jobId: "job-backoff")
+                  attachments: [JesseAttachment], requestId: UUID,
+                  model: String?) async throws -> JesseSendResult {
+            .running(jobId: "job-backoff", conversationId: nil)
         }
         func result(jobId: String) async throws -> JesseResultState {
             resultCalls += 1

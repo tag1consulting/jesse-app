@@ -53,15 +53,17 @@ final class TitleCountingClient: JesseClientProtocol {
 
     init(returns scripted: String?) { self.scripted = scripted }
 
-    func title(forDigest digest: String) async -> String? {
+    func title(forDigest digest: String, conversationId: String?) async -> String? {
         titleCalls += 1; lastDigest = digest
         return scripted
     }
 
-    func send(mode: JesseMode, text: String, sessionId: String?, voice: Bool,
+    func send(mode: JesseMode, text: String, sessionId: String?,
+              conversationId: String, voice: Bool,
               instructions: String?, floorOverride: String?,
-              attachments: [JesseAttachment]) async throws -> JesseSendResult {
-        .running(jobId: "unused")
+              attachments: [JesseAttachment], requestId: UUID,
+              model: String?) async throws -> JesseSendResult {
+        .running(jobId: "unused", conversationId: nil)
     }
     func result(jobId: String) async throws -> JesseResultState { .running }
     func cancelJob(jobId: String) async throws {}
@@ -131,14 +133,14 @@ final class AITitleTests: XCTestCase {
     func testRealClient404YieldsNilNotThrow() async {
         TitleStubURLProtocol.behavior = .status(404, Data())
         let client = JesseClient(config: cfg, session: stubSession())
-        let title = await client.title(forDigest: "some digest")
+        let title = await client.title(forDigest: "some digest", conversationId: nil)
         XCTAssertNil(title, "a bridge without /jesse/title (404) yields no title, never an error")
     }
 
     func testRealClientTimeoutYieldsNil() async {
         TitleStubURLProtocol.behavior = .failTransport
         let client = JesseClient(config: cfg, session: stubSession())
-        let title = await client.title(forDigest: "some digest")
+        let title = await client.title(forDigest: "some digest", conversationId: nil)
         XCTAssertNil(title, "a timeout/offline yields nil, not a thrown error")
     }
 
@@ -146,7 +148,7 @@ final class AITitleTests: XCTestCase {
         let body = try! JSONSerialization.data(withJSONObject: ["title": "Weekend plans"])
         TitleStubURLProtocol.behavior = .status(200, body)
         let client = JesseClient(config: cfg, session: stubSession())
-        let title = await client.title(forDigest: "digest")
+        let title = await client.title(forDigest: "digest", conversationId: nil)
         XCTAssertEqual(title, "Weekend plans")
     }
 
@@ -154,7 +156,7 @@ final class AITitleTests: XCTestCase {
         let body = try! JSONSerialization.data(withJSONObject: ["title": "   "])
         TitleStubURLProtocol.behavior = .status(200, body)
         let client = JesseClient(config: cfg, session: stubSession())
-        let title = await client.title(forDigest: "digest")
+        let title = await client.title(forDigest: "digest", conversationId: nil)
         XCTAssertNil(title, "a blank title is treated as no title")
     }
 

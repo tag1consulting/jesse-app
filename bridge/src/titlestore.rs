@@ -2,15 +2,15 @@ use crate::*;
 
 // ---- Server-side session title store ---------------------------------------
 //
-// A single JSON file `<state_dir>/titles.json` mapping session_id → title, so a
-// conversation's minted title survives a bridge restart and `GET /jesse/sessions`
+// A single JSON file `<state_dir>/titles.json` mapping conversation_id -> title, so a
+// conversation's minted title survives a bridge restart and `GET /jesse/conversations`
 // can show it. Mirrors `DeviceStore`'s discipline exactly: atomic temp+rename
 // writes, mode 0600, best-effort (a write failure is logged, never fatal). With
 // no state dir configured the store is in-memory only — the same degradation the
 // job store and device store have — so titles are lost on restart in that mode.
 // Only the title text is ever written; never a secret.
 
-/// The session_id → title map. Cheaply shared behind an `Arc` in `AppState`.
+/// The conversation_id -> title map. Cheaply shared behind an `Arc` in `AppState`.
 pub struct TitleStore {
     map: Mutex<HashMap<String, String>>,
     // Where the map is persisted. `None` → in-memory only.
@@ -92,6 +92,27 @@ impl TitleStore {
             if map.remove(session_id).is_none() {
                 return;
             }
+            map.clone()
+        };
+        if let Some(path) = &self.path {
+            persist_titles(path, &snapshot);
+        }
+    }
+
+    /// A copy of the whole map. Needed by the one-time key migration, which has to
+    /// walk every existing key to re-key it onto a conversation id.
+    pub fn snapshot(&self) -> HashMap<String, String> {
+        self.map.lock_ok().clone()
+    }
+
+    /// Replace the whole map and persist. The one-time key migration's commit step:
+    /// it builds the re-keyed map and installs it in one write, so a partially
+    /// migrated file can never be observed. Not for ordinary use: `set` / `remove`
+    /// are the per-entry API.
+    pub fn replace(&self, titles: HashMap<String, String>) {
+        let snapshot = {
+            let mut map = self.map.lock_ok();
+            *map = titles;
             map.clone()
         };
         if let Some(path) = &self.path {

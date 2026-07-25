@@ -285,7 +285,7 @@ pub const TITLE_MINT_MARKER: &str = "Produce ONE very short title for the conver
 
 /// Whether `first_user_raw` (the RAW, un-stripped text of a transcript's first user
 /// turn) is a `POST /jesse/title` one-shot mint rather than a real conversation.
-/// Used to keep title-mint transcripts out of `GET /jesse/sessions` and to `404`
+/// Used to keep title-mint transcripts out of `GET /jesse/conversations` and to `404`
 /// them from hydration. Leading whitespace is tolerated before the marker.
 pub fn is_title_mint_prompt(first_user_raw: &str) -> bool {
     first_user_raw.trim_start().starts_with(TITLE_MINT_MARKER)
@@ -293,7 +293,7 @@ pub fn is_title_mint_prompt(first_user_raw: &str) -> bool {
 
 // ---- Un-wrapping a bridge prompt back to the user's words ------------------
 //
-// `GET /jesse/sessions` and the hydration endpoint show the USER's actual
+// `GET /jesse/conversations` and the hydration endpoint show the USER's actual
 // utterance, not the wrapper the bridge added around it. A wrapped prompt is
 // `{clock}\n\n[{health}\n\n][{catchup}\n\n]{floor}\n\n{preamble}{TEXT}{REVIEW_CAPABILITY}…`
 // (see [`build_prompt_at`]): the user's words sit BETWEEN the preamble's fixed

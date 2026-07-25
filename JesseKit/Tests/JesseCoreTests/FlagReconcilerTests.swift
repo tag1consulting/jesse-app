@@ -3,16 +3,20 @@ import SwiftData
 @testable import JesseCore
 
 // The cross-device favorite/archive reconciler, driven by a fake `FlagSyncing` client
-// and a real `JesseThread` — no view host, no server. Covers the four cases the sync
+// and a real `JesseThread`: no view host, no server. Covers the four cases the sync
 // contract rests on: server-newer adopts, local-newer pushes, equal is a no-op, and a
-// thread with no session_id is skipped. Plus the independence of the two flags and the
+// thread with no CONVERSATION id is skipped. Plus the independence of the two flags and the
 // self-healing swallow of a failed push.
+//
+// The flag store is conversation-keyed now (a Claude session id is not stable across a CLI
+// fork), so the skip guard and the pushed key moved from `sessionId` to `conversationId`.
+// Every last-writer-wins assertion below is unchanged.
 
 /// Records every `setFlags` call so a test can assert exactly what was pushed. `@unchecked
 /// Sendable` behind a lock because the reconciler awaits it off the main actor.
 private final class RecordingFlagClient: FlagSyncing, @unchecked Sendable {
     struct Call: Equatable {
-        let sessionId: String
+        let conversationId: String
         let favorite: FlagWrite?
         let archived: FlagWrite?
     }
@@ -23,9 +27,9 @@ private final class RecordingFlagClient: FlagSyncing, @unchecked Sendable {
 
     init(shouldThrow: Bool = false) { self.shouldThrow = shouldThrow }
 
-    func setFlags(sessionId: String, favorite: FlagWrite?, archived: FlagWrite?) async throws {
+    func setFlags(conversationId: String, favorite: FlagWrite?, archived: FlagWrite?) async throws {
         lock.withLock {
-            _calls.append(Call(sessionId: sessionId, favorite: favorite, archived: archived))
+            _calls.append(Call(conversationId: conversationId, favorite: favorite, archived: archived))
         }
         if shouldThrow { throw NSError(domain: "test", code: 1) }
     }
@@ -61,14 +65,16 @@ final class FlagReconcilerTests: XCTestCase {
 
     // MARK: - Integrated reconcile
 
-    private func makeThread(sessionId: String?) -> JesseThread {
+    /// A thread carrying `conversationId` as its sync key. The initializer mints one, so a
+    /// test that wants the "not yet bound" case must set it to nil / "" explicitly.
+    private func makeThread(conversationId: String?) -> JesseThread {
         let t = JesseThread(title: "t", mode: .ask)
-        t.sessionId = sessionId
+        t.conversationId = conversationId
         return t
     }
 
     func testServerNewerFavoriteAdoptedLocallyNoPush() async {
-        let t = makeThread(sessionId: "s1")
+        let t = makeThread(conversationId: "c1")
         // Local unstarred at t=100; server starred at t=200 → server wins.
         t.setFavorite(false, now: Date(timeIntervalSince1970: 0.1))   // ms 100
         let client = RecordingFlagClient()
@@ -85,7 +91,7 @@ final class FlagReconcilerTests: XCTestCase {
     }
 
     func testLocalNewerFavoritePushedNotAdopted() async {
-        let t = makeThread(sessionId: "s1")
+        let t = makeThread(conversationId: "c1")
         t.setFavorite(true, now: Date(timeIntervalSince1970: 0.3))    // ms 300
         let client = RecordingFlagClient()
         let changed = await FlagReconciler.reconcile(
@@ -96,13 +102,13 @@ final class FlagReconcilerTests: XCTestCase {
         XCTAssertFalse(changed, "local wins → no local mutation")
         XCTAssertTrue(t.isFavorite)
         XCTAssertEqual(client.calls.count, 1)
-        XCTAssertEqual(client.calls.first?.sessionId, "s1")
+        XCTAssertEqual(client.calls.first?.conversationId, "c1")
         XCTAssertEqual(client.calls.first?.favorite, FlagWrite(value: true, updatedMs: 300))
         XCTAssertNil(client.calls.first?.archived, "only the changed flag is pushed")
     }
 
     func testEqualClocksBothFlagsNoOp() async {
-        let t = makeThread(sessionId: "s1")
+        let t = makeThread(conversationId: "c1")
         t.setFavorite(true, now: Date(timeIntervalSince1970: 0.2))    // ms 200
         t.setArchived(true, now: Date(timeIntervalSince1970: 0.5))    // ms 500
         let client = RecordingFlagClient()
@@ -115,8 +121,8 @@ final class FlagReconcilerTests: XCTestCase {
         XCTAssertTrue(client.calls.isEmpty, "converged clocks push nothing and mutate nothing")
     }
 
-    func testNoSessionIdSkipped() async {
-        let t = makeThread(sessionId: nil)
+    func testNoConversationIdSkipped() async {
+        let t = makeThread(conversationId: nil)
         t.setFavorite(true, now: Date(timeIntervalSince1970: 0.3))
         let client = RecordingFlagClient()
         let changed = await FlagReconciler.reconcile(
@@ -124,13 +130,13 @@ final class FlagReconcilerTests: XCTestCase {
             serverFavorite: false, serverFavoriteUpdatedMs: 999,
             serverArchived: false, serverArchivedUpdatedMs: 0,
             client: client)
-        XCTAssertFalse(changed, "a purely-local thread never reconciles")
+        XCTAssertFalse(changed, "a thread the sync has not bound to a conversation never reconciles")
         XCTAssertTrue(client.calls.isEmpty)
         XCTAssertTrue(t.isFavorite, "and its local value is untouched")
     }
 
-    func testEmptySessionIdSkipped() async {
-        let t = makeThread(sessionId: "")
+    func testEmptyConversationIdSkipped() async {
+        let t = makeThread(conversationId: "")
         let client = RecordingFlagClient()
         let changed = await FlagReconciler.reconcile(
             thread: t,
@@ -142,7 +148,7 @@ final class FlagReconcilerTests: XCTestCase {
     }
 
     func testFlagsAreIndependentOnePushOneAdoptInOneCall() async {
-        let t = makeThread(sessionId: "s1")
+        let t = makeThread(conversationId: "c1")
         // Local favorite newer (push), server archived newer (adopt): one setFlags call
         // carrying only favorite, and the archived value adopted locally.
         t.setFavorite(true, now: Date(timeIntervalSince1970: 0.4))    // ms 400
@@ -162,7 +168,7 @@ final class FlagReconcilerTests: XCTestCase {
     }
 
     func testFailedPushIsSwallowedAndAdoptionStillApplies() async {
-        let t = makeThread(sessionId: "s1")
+        let t = makeThread(conversationId: "c1")
         t.setFavorite(true, now: Date(timeIntervalSince1970: 0.4))    // ms 400 → push
         t.setArchived(false, now: Date(timeIntervalSince1970: 0.1))   // ms 100 → adopt
         let client = RecordingFlagClient(shouldThrow: true)

@@ -39,6 +39,7 @@ pub(crate) fn test_config() -> Config {
         diet_backend: None,
         // Probation on by default, matching from_env's default.
         diet_probation: true,
+        diet_micro_complete: true,
         // No vault-QA backend override by default — the route is inert (kill
         // switch), so tests exercise today's hosted Ask path unless they set it.
         vaultqa_backend: None,

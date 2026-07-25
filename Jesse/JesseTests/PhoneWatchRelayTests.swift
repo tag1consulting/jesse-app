@@ -39,13 +39,15 @@ final class PhoneWatchRelayTests: XCTestCase {
             self.failAtResult = failAtResult
         }
 
-        func send(mode: JesseMode, text: String, sessionId: String?, voice: Bool,
+        func send(mode: JesseMode, text: String, sessionId: String?,
+                  conversationId: String, voice: Bool,
                   instructions: String?, floorOverride: String?,
-                  attachments: [JesseAttachment]) async throws -> JesseSendResult {
+                  attachments: [JesseAttachment], requestId: UUID,
+                  model: String?) async throws -> JesseSendResult {
             sendCount += 1
             lastText = text
             lastVoice = voice
-            return .running(jobId: "job-1")
+            return .running(jobId: "job-1", conversationId: nil)
         }
         func result(jobId: String) async throws -> JesseResultState {
             if failAtResult { throw JesseError.timedOut("asleep") }

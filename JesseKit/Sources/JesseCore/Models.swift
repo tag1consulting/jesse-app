@@ -10,6 +10,22 @@ public enum TurnRole: String {
     case jesse
 }
 
+/// Where a submitted turn is between "typed" and "answered".
+///
+/// `.sending` is the pre-ACK window: the POST is crossing the network and the message could
+/// still be lost with it. `.accepted` means the bridge returned its 202, having registered the
+/// conversation, so the turn is durably the server's and will be answered even if the app is
+/// closed. That distinction had no representation anywhere before, which is why both apps
+/// showed the identical spinner for both states.
+///
+/// Shared (rather than declared per app) so the phone and the Mac cannot drift on what their
+/// delivery captions mean. `nonisolated`: this module defaults to MainActor isolation for the
+/// `@Model` layer, but this is plain Sendable data.
+public nonisolated enum TurnPhase: Equatable, Sendable {
+    case sending
+    case accepted
+}
+
 /// Where a thread's first turn came from. `phone` is everything the app itself
 /// starts (typed composer, Siri); `watch` is a turn relayed through the phone
 /// from an Apple Watch. Modeled as a small String-backed enum so `JesseThread`
@@ -48,6 +64,27 @@ public final class JesseThread {
     public var mode: String = JesseMode.ask.rawValue
     // Bridge session for resume; nil until the first reply lands.
     public var sessionId: String?
+    // The BRIDGE-REGISTERED conversation this thread is, as a canonical lowercase UUID.
+    // This is the cross-device SYNC KEY, deliberately not the object identity: `id` above
+    // stays the SwiftData identity and the key for the outbox, the in-flight map, the task
+    // map, and every view. Retyping `id` would force a real SchemaMigrationPlan with frozen
+    // copies of the old model types and buy nothing.
+    //
+    // Minted here in the initializer (never at a call site, of which there are dozens) so
+    // no construction path can forget it, and sent on EVERY turn: the bridge registers it
+    // before returning its 202 and echoes back the authoritative id, so there is never a
+    // window in which the server knows a thread identifier the client does not. That window
+    // was the whole duplicate-conversation bug: a sync landing in it adopted the bridge's
+    // freshly-advertised session id as a SECOND thread.
+    //
+    // Optional so an existing store lightweight-migrates with nil; the first sync binds a
+    // pre-upgrade thread to the conversation whose `session_ids` contains its `sessionId`.
+    public var conversationId: String?
+    // When the bridge first ACKNOWLEDGED a turn on this conversation, set ONCE on the first
+    // 202. nil means no turn has ever been accepted, which is what distinguishes "still
+    // sending" from "the server has it" for the transcript's delivery caption. Additive
+    // optional property, so SwiftData lightweight-migrates existing stores.
+    public var registeredAt: Date?
     // The model this conversation sends its turns on (per-turn model selection — the
     // bridge's `model` request field). PER THREAD and PER DEVICE: changing it here affects
     // only this conversation on this device, never another thread or another device. A new
@@ -139,6 +176,19 @@ public final class JesseThread {
         self.mode = mode.rawValue
         self.createdAt = createdAt
         self.updatedAt = createdAt
+        // Mint the conversation sync key HERE rather than at any call site: there are
+        // dozens of construction sites across the app, the Mac, the watch relay, and the
+        // tests, and one that forgot would be a thread the bridge could never match. A
+        // thread ADOPTED from a remote conversation overwrites this immediately with the
+        // remote id (it must not keep a fresh random one).
+        self.conversationId = Self.mintConversationId()
+    }
+
+    /// A fresh conversation id in exactly the shape the bridge validates: a canonical
+    /// LOWERCASE hyphenated UUID. `UUID.uuidString` is uppercase, which the bridge rejects
+    /// outright, so the lowercasing is load-bearing rather than cosmetic.
+    public static func mintConversationId() -> String {
+        UUID().uuidString.lowercased()
     }
 
     public var modeValue: JesseMode { JesseMode(rawValue: mode) ?? .ask }
@@ -286,6 +336,18 @@ public final class Turn {
     // lightweight-migrates existing stores with no migration code (matching how
     // `origin`/`aiTitle`/`lastDeliveredJobId` were added).
     public var provenanceJSON: String?
+
+    // The bridge's `turn_key` for this turn: `"<session_id>:<byte offset of the jsonl line
+    // it came from>"`, stable across repeated hydrates and unique within a conversation.
+    // It is what lets hydration merge server history into a thread without duplicating a
+    // turn already rendered, including two genuinely identical messages that a content hash
+    // would wrongly collapse into one.
+    //
+    // nil for a turn created OPTIMISTICALLY (the local echo of a message being sent, or a
+    // reply delivered live) that has not yet been matched to its transcript line. The first
+    // hydrate that sees the matching content BINDS the key onto it rather than inserting a
+    // second bubble. Additive optional property, so SwiftData lightweight-migrates.
+    public var sourceKey: String?
 
     // Downscaled previews of the files the user attached to this turn (nil bytes
     // are never stored — see `TurnAttachment`). Cascade so deleting a Turn (or, via

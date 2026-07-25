@@ -20,10 +20,12 @@ final class SessionDeletionTests: XCTestCase {
         private(set) var deleteCalls = 0
 
         // Unused required methods (this seam only exercises deleteSession).
-        func send(mode: JesseMode, text: String, sessionId: String?, voice: Bool,
+        func send(mode: JesseMode, text: String, sessionId: String?,
+                  conversationId: String, voice: Bool,
                   instructions: String?, floorOverride: String?,
-                  attachments: [JesseAttachment]) async throws -> JesseSendResult {
-            .running(jobId: "unused")
+                  attachments: [JesseAttachment], requestId: UUID,
+                  model: String?) async throws -> JesseSendResult {
+            .running(jobId: "unused", conversationId: nil)
         }
         func result(jobId: String) async throws -> JesseResultState { .running }
         func cancelJob(jobId: String) async throws {}
@@ -32,10 +34,10 @@ final class SessionDeletionTests: XCTestCase {
         }
 
         // The method under test.
-        func deleteSession(_ sessionId: String) async throws {
+        func deleteConversation(_ conversationId: String) async throws {
             deleteCalls += 1
             if shouldThrow { throw JesseError.connectionLost }
-            deletedIds.append(sessionId)
+            deletedIds.append(conversationId)
         }
     }
 
@@ -56,17 +58,17 @@ final class SessionDeletionTests: XCTestCase {
         store.enqueue("sess-a")          // duplicate → ignored
         store.enqueue("   ")             // blank → ignored (no remote session)
         store.enqueue("sess-b")
-        XCTAssertEqual(store.pending.map(\.sessionId), ["sess-a", "sess-b"],
+        XCTAssertEqual(store.pending.map(\.conversationId), ["sess-a", "sess-b"],
                        "dedup by id, in enqueue order, blank dropped")
 
         // Persisted: a fresh store over the same defaults reloads the queue.
         let reloaded = PendingSessionDeletionStore(defaults: defaults)
-        XCTAssertEqual(reloaded.pending.map(\.sessionId), ["sess-a", "sess-b"])
+        XCTAssertEqual(reloaded.pending.map(\.conversationId), ["sess-a", "sess-b"])
 
         store.remove("sess-a")
-        XCTAssertEqual(store.pending.map(\.sessionId), ["sess-b"])
+        XCTAssertEqual(store.pending.map(\.conversationId), ["sess-b"])
         store.remove("ghost")            // no-op
-        XCTAssertEqual(store.pending.map(\.sessionId), ["sess-b"])
+        XCTAssertEqual(store.pending.map(\.conversationId), ["sess-b"])
         store.remove("sess-b")
         XCTAssertTrue(store.pending.isEmpty)
     }
@@ -100,7 +102,7 @@ final class SessionDeletionTests: XCTestCase {
         // Laptop asleep / offline: the delete throws, so the tombstone is kept.
         await drainer.drain()
         XCTAssertEqual(client.deleteCalls, 1)
-        XCTAssertEqual(store.pending.map(\.sessionId), ["sess-x"],
+        XCTAssertEqual(store.pending.map(\.conversationId), ["sess-x"],
                        "a network failure leaves the tombstone for next time")
 
         // Next foreground: the laptop is back, the drain succeeds, tombstone clears.
@@ -121,19 +123,21 @@ final class SessionDeletionTests: XCTestCase {
         // A client that throws only for "good-1".
         final class SelectiveClient: JesseClientProtocol, @unchecked Sendable {
             private(set) var deleted: [String] = []
-            func send(mode: JesseMode, text: String, sessionId: String?, voice: Bool,
+            func send(mode: JesseMode, text: String, sessionId: String?,
+                      conversationId: String, voice: Bool,
                       instructions: String?, floorOverride: String?,
-                      attachments: [JesseAttachment]) async throws -> JesseSendResult {
-                .running(jobId: "unused")
+                      attachments: [JesseAttachment], requestId: UUID,
+                      model: String?) async throws -> JesseSendResult {
+                .running(jobId: "unused", conversationId: nil)
             }
             func result(jobId: String) async throws -> JesseResultState { .running }
             func cancelJob(jobId: String) async throws {}
             func stream(jobId: String) -> AsyncThrowingStream<JesseStreamEvent, Error> {
                 AsyncThrowingStream { $0.finish() }
             }
-            func deleteSession(_ sessionId: String) async throws {
-                if sessionId == "good-1" { throw JesseError.connectionLost }
-                deleted.append(sessionId)
+            func deleteConversation(_ conversationId: String) async throws {
+                if conversationId == "good-1" { throw JesseError.connectionLost }
+                deleted.append(conversationId)
             }
         }
         let client = SelectiveClient()
@@ -141,7 +145,7 @@ final class SessionDeletionTests: XCTestCase {
         await drainer.drain()
 
         XCTAssertEqual(client.deleted, ["good-2"], "the second item is still deleted")
-        XCTAssertEqual(store.pending.map(\.sessionId), ["good-1"],
+        XCTAssertEqual(store.pending.map(\.conversationId), ["good-1"],
                        "only the failing item's tombstone remains")
     }
 }

@@ -101,9 +101,21 @@ public struct PromptDefaults: Equatable, Sendable {
 
 /// Outcome of a `POST /jesse`. The bridge either finishes within its grace
 /// window (inline reply, 200) or hands back a job id to poll (202).
+///
+/// Both cases carry the AUTHORITATIVE `conversationId` the bridge registered for this
+/// turn, which the caller writes back onto its thread. Optional so a pre-0.33 bridge that
+/// omits the field decodes cleanly to nil rather than throwing.
 public enum JesseSendResult: Sendable {
-    case reply(JesseReply, jobId: String?)
-    case running(jobId: String)
+    case reply(JesseReply, jobId: String?, conversationId: String?)
+    case running(jobId: String, conversationId: String?)
+
+    /// The conversation the bridge named, whichever shape came back.
+    public var conversationId: String? {
+        switch self {
+        case let .reply(_, _, cid): return cid
+        case let .running(_, cid): return cid
+        }
+    }
 }
 
 /// State of a job fetched via `GET /jesse/result/{job_id}`.
@@ -195,10 +207,30 @@ public struct HydratedTurn: Decodable, Sendable, Equatable {
     public let role: String
     public let text: String
     public let timestamp: String?
-    public init(role: String, text: String, timestamp: String?) {
+    /// The bridge's stable per-turn key, `"<session_id>:<byte offset of its jsonl line>"`.
+    /// Unique within a conversation and byte-identical across repeated hydrates, which is
+    /// what `TranscriptMerge` keys on. Empty only against the deprecated single-session
+    /// route, which predates the field; the merge treats an empty key as "unkeyed".
+    public let turnKey: String
+    public init(role: String, text: String, timestamp: String?, turnKey: String = "") {
         self.role = role
         self.text = text
         self.timestamp = timestamp
+        self.turnKey = turnKey
+    }
+    enum CodingKeys: String, CodingKey {
+        case role, text, timestamp
+        case turnKey = "turn_key"
+    }
+    // Custom decode so `turn_key` DEFAULTS rather than failing the whole hydrate against
+    // the deprecated route (which omits it), the same additive-forward-compatible pattern
+    // `SessionSummary` uses for the flag fields.
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        role = try c.decode(String.self, forKey: .role)
+        text = try c.decode(String.self, forKey: .text)
+        timestamp = try c.decodeIfPresent(String.self, forKey: .timestamp)
+        turnKey = try c.decodeIfPresent(String.self, forKey: .turnKey) ?? ""
     }
 }
 
@@ -228,6 +260,116 @@ public enum SessionsResult: Sendable, Equatable {
     case sessions([SessionSummary], deleted: [SessionTombstone], etag: String?)
 }
 
+// MARK: - Conversations
+
+/// One conversation in `GET /jesse/conversations` (bridge 0.33.0). Matches the bridge's
+/// `ConversationSummary`.
+///
+/// `conversationId` is the sync key. `sessionId` is the conversation's CURRENT Claude
+/// session, nil for a conversation registered but not yet run (including one whose first
+/// turn is still in flight). `sessionIds` is the full ordered alias list, oldest first: a
+/// client needs it to bind a pre-upgrade thread, whose only identity is a session id, to
+/// its conversation exactly once.
+public struct ConversationSummary: Decodable, Sendable, Equatable {
+    public let conversationId: String
+    public let sessionId: String?
+    public let sessionIds: [String]
+    public let lastModified: UInt64
+    public let firstMessage: String?
+    public let title: String?
+    public let favorite: Bool
+    public let favoriteUpdatedMs: UInt64
+    public let archived: Bool
+    public let archivedUpdatedMs: UInt64
+    public let registeredMs: UInt64
+
+    public init(conversationId: String, sessionId: String? = nil, sessionIds: [String] = [],
+                lastModified: UInt64 = 0, firstMessage: String? = nil, title: String? = nil,
+                favorite: Bool = false, favoriteUpdatedMs: UInt64 = 0,
+                archived: Bool = false, archivedUpdatedMs: UInt64 = 0,
+                registeredMs: UInt64 = 0) {
+        self.conversationId = conversationId
+        self.sessionId = sessionId
+        self.sessionIds = sessionIds
+        self.lastModified = lastModified
+        self.firstMessage = firstMessage
+        self.title = title
+        self.favorite = favorite
+        self.favoriteUpdatedMs = favoriteUpdatedMs
+        self.archived = archived
+        self.archivedUpdatedMs = archivedUpdatedMs
+        self.registeredMs = registeredMs
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case conversationId = "conversation_id"
+        case sessionId = "session_id"
+        case sessionIds = "session_ids"
+        case lastModified = "last_modified"
+        case firstMessage = "first_message"
+        case title, favorite
+        case favoriteUpdatedMs = "favorite_updated_ms"
+        case archived
+        case archivedUpdatedMs = "archived_updated_ms"
+        case registeredMs = "registered_ms"
+    }
+
+    // Only `conversation_id` is required; every other field defaults, so an added or
+    // omitted field never fails the whole list decode.
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        conversationId = try c.decode(String.self, forKey: .conversationId)
+        sessionId = try c.decodeIfPresent(String.self, forKey: .sessionId)
+        sessionIds = try c.decodeIfPresent([String].self, forKey: .sessionIds) ?? []
+        lastModified = try c.decodeIfPresent(UInt64.self, forKey: .lastModified) ?? 0
+        firstMessage = try c.decodeIfPresent(String.self, forKey: .firstMessage)
+        title = try c.decodeIfPresent(String.self, forKey: .title)
+        favorite = try c.decodeIfPresent(Bool.self, forKey: .favorite) ?? false
+        favoriteUpdatedMs = try c.decodeIfPresent(UInt64.self, forKey: .favoriteUpdatedMs) ?? 0
+        archived = try c.decodeIfPresent(Bool.self, forKey: .archived) ?? false
+        archivedUpdatedMs = try c.decodeIfPresent(UInt64.self, forKey: .archivedUpdatedMs) ?? 0
+        registeredMs = try c.decodeIfPresent(UInt64.self, forKey: .registeredMs) ?? 0
+    }
+}
+
+/// One deletion tombstone on `GET /jesse/conversations`: the id of a conversation an
+/// explicit delete removed, and the unix-millis time it was deleted. It rides the
+/// `deleted` array so a delete made on one device converges to the others.
+public struct ConversationTombstone: Decodable, Sendable, Equatable {
+    public let conversationId: String
+    public let deletedMs: UInt64
+    public init(conversationId: String, deletedMs: UInt64) {
+        self.conversationId = conversationId
+        self.deletedMs = deletedMs
+    }
+    enum CodingKeys: String, CodingKey {
+        case conversationId = "conversation_id"
+        case deletedMs = "deleted_ms"
+    }
+}
+
+/// Result of listing conversations: either fresh data (the conversations, the cross-device
+/// deletion tombstones, and the ETag to send back next time) or a 304 telling the caller
+/// its cache is current.
+public enum ConversationsResult: Sendable, Equatable {
+    case notModified
+    case conversations([ConversationSummary], deleted: [ConversationTombstone], etag: String?)
+}
+
+/// Decoded `GET /jesse/conversations` body.
+struct JesseConversationsBody: Decodable {
+    let conversations: [ConversationSummary]
+    let deleted: [ConversationTombstone]
+    enum CodingKeys: String, CodingKey {
+        case conversations, deleted
+    }
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        conversations = try c.decodeIfPresent([ConversationSummary].self, forKey: .conversations) ?? []
+        deleted = try c.decodeIfPresent([ConversationTombstone].self, forKey: .deleted) ?? []
+    }
+}
+
 // MARK: - Wire contract (Codable)
 
 /// The `POST /jesse` request body. A nil field omits its key, reproducing the old
@@ -237,6 +379,11 @@ public struct JesseRequest: Encodable, Equatable, Sendable {
     public let mode: String
     public let text: String
     public let sessionId: String?
+    /// The stable client-minted conversation identity, sent on EVERY turn (first and
+    /// follow-up alike). The bridge registers it before returning its 202 and echoes the
+    /// authoritative id back, which is what closes the window where the server knew a
+    /// thread identifier the client did not.
+    public let conversationId: String?
     public let voice: Bool?
     public let instructions: String?
     public let floorOverride: String?
@@ -259,7 +406,8 @@ public struct JesseRequest: Encodable, Equatable, Sendable {
     // uses its stored default (byte-for-byte today's behavior for an older client).
     public let model: String?
 
-    public init(mode: String, text: String, sessionId: String?, voice: Bool?,
+    public init(mode: String, text: String, sessionId: String?, conversationId: String? = nil,
+                voice: Bool?,
                 instructions: String?, floorOverride: String?, attachments: [Attachment]?,
                 healthContext: String?, healthContextRequested: Bool?,
                 healthContextUnavailable: Bool?, mealCorrectionsAck: Int?, requestId: String?,
@@ -267,6 +415,7 @@ public struct JesseRequest: Encodable, Equatable, Sendable {
         self.mode = mode
         self.text = text
         self.sessionId = sessionId
+        self.conversationId = conversationId
         self.voice = voice
         self.instructions = instructions
         self.floorOverride = floorOverride
@@ -297,6 +446,7 @@ public struct JesseRequest: Encodable, Equatable, Sendable {
     enum CodingKeys: String, CodingKey {
         case mode, text
         case sessionId = "session_id"
+        case conversationId = "conversation_id"
         case voice, instructions
         case floorOverride = "floor_override"
         case attachments
@@ -316,10 +466,14 @@ struct JesseSendResponse: Decodable {
     let status: String?
     let response: String?
     let sessionId: String?
+    /// The authoritative conversation the bridge registered for this turn. Optional so a
+    /// pre-0.33 bridge that omits it decodes cleanly.
+    let conversationId: String?
     enum CodingKeys: String, CodingKey {
         case jobId = "job_id"
         case status, response
         case sessionId = "session_id"
+        case conversationId = "conversation_id"
     }
 }
 
@@ -607,7 +761,7 @@ public struct SetWritesBody: Encodable, Equatable {
     public init(enabled: Bool) { self.enabled = enabled }
 }
 
-/// The `POST /jesse/session/{id}/flags` body: any subset of the four flag fields. Only
+/// The `POST /jesse/conversation/{id}/flags` body: any subset of the four flag fields. Only
 /// the flag(s) that changed are sent, each paired with its unix-millis change clock, so
 /// the bridge applies each last-writer-wins by that timestamp. A nil field omits its key
 /// (synthesized `encodeIfPresent`), so a favorite-only change carries no `archived` keys
@@ -638,14 +792,16 @@ public struct JesseFlagsRequest: Encodable, Equatable {
 /// a non-nil `sessionId` also persists the minted title server-side.
 public struct JesseTitleRequest: Encodable, Equatable {
     public let digest: String
-    public let sessionId: String?
-    public init(digest: String, sessionId: String? = nil) {
+    /// A non-nil conversation also persists the minted title server-side, keyed on the
+    /// conversation (the bridge's title store is conversation-keyed).
+    public let conversationId: String?
+    public init(digest: String, conversationId: String? = nil) {
         self.digest = digest
-        self.sessionId = sessionId
+        self.conversationId = conversationId
     }
     enum CodingKeys: String, CodingKey {
         case digest = "text"
-        case sessionId = "session_id"
+        case conversationId = "conversation_id"
     }
 }
 
@@ -670,14 +826,16 @@ struct JesseSessionsBody: Decodable {
     }
 }
 
-/// Decoded `GET /jesse/sessions/{id}` body.
-struct JesseHydrateBody: Decodable {
-    let sessionId: String
+/// Decoded `GET /jesse/conversations/{id}/transcript` body. `nextCursor` is OPAQUE: a
+/// conversation can span several transcript files, so a bare byte offset is not a
+/// sufficient position. The client only ever echoes it back.
+struct JesseConversationHydrateBody: Decodable {
+    let conversationId: String
     let turns: [HydratedTurn]
-    let nextOffset: UInt64
+    let nextCursor: String
     enum CodingKeys: String, CodingKey {
-        case sessionId = "session_id"
+        case conversationId = "conversation_id"
         case turns
-        case nextOffset = "next_offset"
+        case nextCursor = "next_cursor"
     }
 }

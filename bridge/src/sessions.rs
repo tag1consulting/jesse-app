@@ -1,12 +1,17 @@
 use crate::*;
 
-// ---- GET /jesse/sessions — the session list --------------------------------
+// ---- Transcripts on disk, and the conversations built over them --------------
 //
-// Threads are Claude Code sessions. Each session's transcript is one jsonl file
-// under `~/.claude/projects/<escaped-vault-path>/<session_id>.jsonl`, where the
-// filename stem IS the session_id. This endpoint enumerates those files for the
-// bridge's vault, newest first by mtime, with the first user turn as a snippet and
-// the stored title (if any). Read-only: it never writes a session file.
+// A Claude Code session's transcript is one jsonl file under
+// `~/.claude/projects/<escaped-vault-path>/<session_id>.jsonl`, where the filename stem IS
+// the session id. This module owns everything that reads those files: the path arithmetic,
+// the scan and its filters, the turn shaping, the GC sweep, and the conversation surface
+// (`GET /jesse/conversations`, hydration, delete, flags) rendered over them.
+//
+// A session id is deliberately NOT a thread identity: the CLI can fork it on resume, and a
+// dropped `--resume` mints a new one. The bridge-owned conversation record (see
+// [`conversations`]) is the identity, and it owns the ordered list of session ids bound to
+// it. Read-only except for the explicit delete route: the scan never writes a transcript.
 
 /// How many bytes of a session jsonl to scan for the first user turn. A real
 /// first user turn sits at the top of the file, so a bounded prefix suffices — we
@@ -177,27 +182,65 @@ pub fn sweep_expired_sessions(dir: &Path, now_secs: u64, ttl_days: u64) -> Vec<(
 
 /// Run one GC sweep over the bridge vault's projects dir at the current wall
 /// clock. Uses the HOME captured in `cfg.home` (mirroring `AppState::sessions_dir`)
-/// so the sweep stays scoped to exactly the vault project. Titles AND flags for
-/// reclaimed sessions are dropped from their stores so a reclaimed id can't linger
-/// in `titles.json` / `flags.json` and resurrect a stale title or favorite.
-pub fn run_session_gc(cfg: &Config, titles: &TitleStore, flags: &FlagStore) {
+/// so the sweep stays scoped to exactly the vault project.
+///
+/// Two phases. First the transcript sweep, unchanged: every `*.jsonl` older than the
+/// TTL is unlinked. Then the CONVERSATION sweep: a record whose bound transcripts are
+/// all gone and whose `registered_ms` is itself past the TTL is dropped, together with
+/// its title and flag rows (both now keyed on the conversation id, so a reclaimed id
+/// can't linger in `titles.json` / `flags.json` and resurrect a stale title or
+/// favorite). A conversation registered at accept time whose turn then failed has zero
+/// transcripts and is therefore eligible once it ages out; that is intended. A
+/// conversation with a turn IN FLIGHT is never dropped, however old its record.
+///
+/// GC intentionally records NO deletion tombstone in either phase: a device merely
+/// offline while a conversation aged out must keep its local copy, so only an explicit
+/// user delete records one.
+pub fn run_session_gc(
+    cfg: &Config,
+    conversations: &ConversationStore,
+    titles: &TitleStore,
+    flags: &FlagStore,
+) {
     let dir = vault_sessions_dir(&cfg.home, &cfg.vault);
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
     let reclaimed = sweep_expired_sessions(&dir, now, cfg.session_ttl_days);
-    for (id, _age) in &reclaimed {
-        titles.remove(id);
-        flags.remove(id);
-        // GC intentionally records NO deletion tombstone: a device merely offline while
-        // a session aged out must keep its local copy, so only an explicit user delete
-        // (jesse_session_delete) records one.
-    }
     if !reclaimed.is_empty() {
         eprintln!(
             "jesse-bridge: session GC swept {} orphaned session(s) older than {} days",
             reclaimed.len(),
+            cfg.session_ttl_days
+        );
+    }
+
+    let in_flight = conversations.in_flight_conversations();
+    let mut dropped = 0usize;
+    for rec in conversations.all() {
+        if in_flight.contains(&rec.conversation_id) {
+            continue;
+        }
+        let any_transcript_left = rec
+            .session_ids
+            .iter()
+            .any(|sid| dir.join(format!("{sid}.jsonl")).is_file());
+        if any_transcript_left {
+            continue;
+        }
+        if !is_session_expired(rec.registered_ms / 1000, now, cfg.session_ttl_days) {
+            continue;
+        }
+        titles.remove(&rec.conversation_id);
+        flags.remove(&rec.conversation_id);
+        conversations.forget(&rec.conversation_id);
+        dropped += 1;
+    }
+    if dropped > 0 {
+        eprintln!(
+            "jesse-bridge: session GC dropped {dropped} conversation record(s) with no \
+             surviving transcript, older than {} days",
             cfg.session_ttl_days
         );
     }
@@ -207,7 +250,12 @@ pub fn run_session_gc(cfg: &Config, titles: &TitleStore, flags: &FlagStore) {
 /// every `SESSION_GC_INTERVAL`, for the life of the process. A missing session
 /// TTL / projects dir is handled gracefully by `run_session_gc` (it reclaims
 /// nothing). Mirrors `spawn_eviction_task`'s shape.
-pub fn spawn_session_gc_task(cfg: Arc<Config>, titles: Arc<TitleStore>, flags: Arc<FlagStore>) {
+pub fn spawn_session_gc_task(
+    cfg: Arc<Config>,
+    conversations: Arc<ConversationStore>,
+    titles: Arc<TitleStore>,
+    flags: Arc<FlagStore>,
+) {
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(SESSION_GC_INTERVAL);
         // `interval` fires the first tick IMMEDIATELY, so this is the "one run at
@@ -215,7 +263,7 @@ pub fn spawn_session_gc_task(cfg: Arc<Config>, titles: Arc<TitleStore>, flags: A
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             tick.tick().await;
-            run_session_gc(&cfg, &titles, &flags);
+            run_session_gc(&cfg, &conversations, &titles, &flags);
         }
     });
 }
@@ -264,22 +312,6 @@ pub fn resolve_resume_session<'a>(cfg: &Config, session_id: Option<&'a str>) -> 
         );
     }
     effective
-}
-
-/// One session summary in the response, newest-first ordered by the caller. The
-/// four flag fields (`favorite`, `favorite_updated_ms`, `archived`,
-/// `archived_updated_ms`) are additive: they default to false/0 for a session with
-/// no flags row, and an older app that predates them simply ignores them.
-#[derive(serde::Serialize, PartialEq, Debug)]
-pub struct SessionSummary {
-    pub session_id: String,
-    pub last_modified: u64,
-    pub first_message: Option<String>,
-    pub title: Option<String>,
-    pub favorite: bool,
-    pub favorite_updated_ms: u64,
-    pub archived: bool,
-    pub archived_updated_ms: u64,
 }
 
 /// Pull the user text out of a `{"type":"user","message":{...}}` transcript line.
@@ -384,32 +416,35 @@ pub fn first_user_message(path: &Path) -> Option<String> {
     first_user_raw(path).as_deref().and_then(snippet_from_raw)
 }
 
-/// Enumerate the session jsonl files in `dir`, newest first by mtime, filling each
-/// summary's `first_message` and `title`. Robust by contract:
-/// - a missing/unreadable `dir` → an empty list (the bridge may run before any
-///   session exists), never an error;
-/// - only `*.jsonl` regular files directly in `dir` are considered — subdirs and
-///   other files are ignored;
-/// - a filename stem that isn't a plain component (empty, `.`/`..`, or containing a
-///   path separator) is skipped defensively, so a listing can never reach outside
-///   `dir`;
-/// - `since` (unix seconds), when set, keeps only sessions with mtime STRICTLY
-///   greater — the delta-poll filter.
+// ---- The conversation list --------------------------------------------------
+//
+// The canonical list is keyed on the bridge-owned conversation id, not on a transcript
+// filename stem. The directory scan survives, but only as the mechanism that DISCOVERS
+// transcripts a previous bridge (or an older client) left unregistered; the list itself
+// is rendered from the registry, so a CLI session fork appends an alias instead of
+// producing a second row.
+
+/// Whether a transcript filename stem is one the session list has always been willing
+/// to consider: a plain filename component that can only ever name a file INSIDE the
+/// projects dir. Defensive (the stem comes from a directory listing), but a name that
+/// could escape the dir must never become a session id.
+fn is_listable_stem(stem: &str) -> bool {
+    is_plain_session_component(stem)
+}
+
+/// Every transcript stem currently in a projects `dir`, under exactly the filters the
+/// list applies to a directory entry: a `*.jsonl` REGULAR FILE directly in `dir` whose
+/// stem is a plain filename component. A missing or unreadable dir yields an empty set,
+/// never an error.
 ///
-/// Each summary's four flag fields are filled from the `flags` store, defaulting to
-/// false/0 for a session with no row. The flags are part of the serialized body, so
-/// they are folded into the list's ETag automatically (see `jesse_sessions`):
-/// flipping a flag changes the body and therefore invalidates a cached 304.
-pub fn list_sessions(
-    dir: &Path,
-    since: Option<u64>,
-    titles: &TitleStore,
-    flags: &FlagStore,
-) -> Vec<SessionSummary> {
+/// Deliberately does NOT read file contents, so it is cheap enough to call immediately
+/// before every CLI spawn (the in-flight snapshot). The title-mint exclusion, which
+/// needs a file read, is applied by the callers that turn a stem into a conversation.
+pub fn transcript_stems(dir: &Path) -> std::collections::HashSet<String> {
+    let mut out = std::collections::HashSet::new();
     let Ok(entries) = std::fs::read_dir(dir) else {
-        return Vec::new();
+        return out;
     };
-    let mut out = Vec::new();
     for entry in entries.flatten() {
         let path = entry.path();
         if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
@@ -422,54 +457,215 @@ pub fn list_sessions(
         let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
             continue;
         };
-        // Defensive: the stem must be a plain filename component. It comes from a
-        // directory listing (so this is belt-and-suspenders), but a name that could
-        // escape the dir must never become a session_id.
-        if stem.is_empty()
-            || stem == "."
-            || stem == ".."
-            || stem.contains('/')
-            || stem.contains('\\')
-        {
+        if !is_listable_stem(stem) {
             continue;
         }
-        let mtime = meta
-            .modified()
-            .ok()
-            .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
-        if let Some(s) = since {
-            if mtime <= s {
+        out.insert(stem.to_string());
+    }
+    out
+}
+
+/// Whether a transcript is a `POST /jesse/title` one-shot rather than a real
+/// conversation. Its first user turn is the fixed title instruction; those have never
+/// been listed, and they must never become a conversation record either.
+fn is_title_mint_transcript(path: &Path) -> bool {
+    first_user_raw(path)
+        .as_deref()
+        .map(is_title_mint_prompt)
+        .unwrap_or(false)
+}
+
+/// Bring the registry up to date with the projects `dir`: adopt every transcript that
+/// has no conversation record yet. Returns how many were adopted.
+///
+/// Three stems are skipped, each for its own reason:
+/// - one already in the reverse index: it belongs to a conversation already;
+/// - one SUPPRESSED by the in-flight table: it is attributable to a turn that is
+///   still running, so adopting it now is exactly the duplicate this change removes.
+///   It produces no record and no list row this round; the owning turn binds it on
+///   termination, and a later refresh adopts it if that turn dies without binding it;
+/// - a title-mint transcript, which is never a conversation.
+pub fn refresh_conversations(
+    dir: &Path,
+    conversations: &ConversationStore,
+    now_ms: u64,
+) -> Vec<String> {
+    let mut orphans: Vec<String> = Vec::new();
+    for stem in transcript_stems(dir) {
+        if conversations.conversation_for_session(&stem).is_some() {
+            continue;
+        }
+        if conversations.suppresses_orphan(&stem) {
+            continue;
+        }
+        if is_title_mint_transcript(&dir.join(format!("{stem}.jsonl"))) {
+            continue;
+        }
+        orphans.push(stem);
+    }
+    if orphans.is_empty() {
+        return Vec::new();
+    }
+    // Deterministic order so a bulk adopt logs and persists reproducibly.
+    orphans.sort();
+    conversations.adopt_orphan_sessions(orphans.iter().map(String::as_str), now_ms);
+    orphans
+}
+
+/// Bind every transcript that appeared WHILE a turn was running to that turn's
+/// conversation. The turn's terminal step, run after the reply's own session id (if
+/// any) has been bound.
+///
+/// This is what rescues two cases the reply alone cannot: a turn that failed before
+/// returning a session id at all, and a turn whose transcript was orphan-adopted by a
+/// concurrent list refresh that beat the suppression window. A stem already bound to a
+/// genuine REGISTERED conversation is left alone (it is somebody else's); an
+/// orphan-adopted one is stolen back by `bind_session`. A title-mint transcript written
+/// during the turn is skipped: it is not part of the conversation.
+pub fn bind_new_stems(
+    dir: &Path,
+    conversations: &ConversationStore,
+    conversation_id: &str,
+    flight: &InFlight,
+) -> Vec<String> {
+    let mut bound = Vec::new();
+    let mut stems: Vec<String> = transcript_stems(dir)
+        .into_iter()
+        .filter(|s| !flight.stems_before.contains(s))
+        .collect();
+    stems.sort();
+    for stem in stems {
+        if let Some(owner) = conversations.conversation_for_session(&stem) {
+            if owner == conversation_id {
+                continue;
+            }
+            let registered = conversations
+                .get(&owner)
+                .map(|r| !r.is_orphan_adopted())
+                .unwrap_or(false);
+            if registered {
                 continue;
             }
         }
-        // Wart 1: a `POST /jesse/title` one-shot mints its own transcript whose
-        // first user turn is the fixed title instruction. Those are not real
-        // conversations — exclude them from the list entirely.
-        let raw = first_user_raw(&path);
-        if raw.as_deref().map(is_title_mint_prompt).unwrap_or(false) {
+        if is_title_mint_transcript(&dir.join(format!("{stem}.jsonl"))) {
             continue;
         }
-        let f = flags.get(stem);
-        out.push(SessionSummary {
-            session_id: stem.to_string(),
-            last_modified: mtime,
-            // Wart 2: strip the bridge wrapper so the snippet is the user's words.
-            first_message: raw.as_deref().and_then(snippet_from_raw),
-            title: titles.get(stem),
+        conversations.bind_session(conversation_id, &stem);
+        bound.push(stem);
+    }
+    bound
+}
+
+/// The session a turn should resume, resolved CONVERSATION FIRST: the conversation's
+/// current bound session wins, falling back to the id the request carried (an older
+/// client that knows nothing about conversations). Whichever id results is still fed
+/// through [`resolve_resume_session`] downstream, so a missing transcript degrades to a
+/// clean fresh run rather than a raw CLI error.
+pub fn resolve_conversation_resume(
+    conversations: &ConversationStore,
+    conversation_id: &str,
+    requested: Option<String>,
+) -> Option<String> {
+    conversations.current_session(conversation_id).or(requested)
+}
+
+/// One conversation in the `GET /jesse/conversations` body, newest-first ordered by
+/// the caller.
+///
+/// `session_id` is the CURRENT bound session (`null` for a conversation registered but
+/// not yet run) and `session_ids` the full ordered alias list. The client needs the
+/// latter to bind its pre-upgrade threads to a conversation exactly once. The four flag
+/// fields default to false/0 for a conversation with no flags row.
+#[derive(serde::Serialize, PartialEq, Debug)]
+pub struct ConversationSummary {
+    pub conversation_id: String,
+    pub session_id: Option<String>,
+    pub session_ids: Vec<String>,
+    pub last_modified: u64,
+    pub first_message: Option<String>,
+    pub title: Option<String>,
+    pub favorite: bool,
+    pub favorite_updated_ms: u64,
+    pub archived: bool,
+    pub archived_updated_ms: u64,
+    pub registered_ms: u64,
+}
+
+/// Render the registry as the conversation list, newest first.
+///
+/// - `last_modified` is the MAXIMUM mtime (unix seconds) across every bound transcript
+///   that still exists, falling back to `registered_ms / 1000` when there is none yet,
+///   so a conversation registered a moment ago sorts sensibly before its first
+///   transcript lands. Same units as the old session list.
+/// - `first_message` comes from the OLDEST bound transcript that yields one, so a fork
+///   never changes the derived title. Wrapper-stripped and truncated exactly as before.
+/// - `title` and the flags come from the title / flag stores, keyed on the conversation.
+/// - `since` (unix seconds), when set, keeps only conversations with `last_modified`
+///   STRICTLY greater: the delta-poll filter, unchanged.
+/// - Ordering is newest `last_modified` first, ties broken ASCENDING on
+///   `conversation_id`, so the body (and therefore the ETag) is stable across calls
+///   with unchanged inputs.
+///
+/// The flags are part of the serialized body, so they are folded into the ETag
+/// automatically: flipping a flag changes the body and invalidates a cached 304.
+pub fn list_conversations(
+    dir: &Path,
+    conversations: &ConversationStore,
+    since: Option<u64>,
+    titles: &TitleStore,
+    flags: &FlagStore,
+) -> Vec<ConversationSummary> {
+    let mut out = Vec::new();
+    for rec in conversations.all() {
+        let mut last_modified = 0u64;
+        let mut first_message = None;
+        for sid in &rec.session_ids {
+            let path = dir.join(format!("{sid}.jsonl"));
+            let Ok(meta) = std::fs::metadata(&path) else {
+                continue;
+            };
+            if !meta.is_file() {
+                continue;
+            }
+            let mtime = meta
+                .modified()
+                .ok()
+                .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            last_modified = last_modified.max(mtime);
+            if first_message.is_none() {
+                // Strip the bridge wrapper so the snippet is the user's words.
+                first_message = first_user_raw(&path).as_deref().and_then(snippet_from_raw);
+            }
+        }
+        if last_modified == 0 {
+            last_modified = rec.registered_ms / 1000;
+        }
+        if let Some(s) = since {
+            if last_modified <= s {
+                continue;
+            }
+        }
+        let f = flags.get(&rec.conversation_id);
+        out.push(ConversationSummary {
+            session_id: rec.current_session().map(str::to_string),
+            session_ids: rec.session_ids.clone(),
+            last_modified,
+            first_message,
+            title: titles.get(&rec.conversation_id),
             favorite: f.favorite,
             favorite_updated_ms: f.favorite_updated_ms,
             archived: f.archived,
             archived_updated_ms: f.archived_updated_ms,
+            registered_ms: rec.registered_ms,
+            conversation_id: rec.conversation_id,
         });
     }
-    // Newest first; break ties on session_id for a stable, deterministic order
-    // (so the ETag is stable across calls with unchanged inputs).
     out.sort_by(|a, b| {
         b.last_modified
             .cmp(&a.last_modified)
-            .then_with(|| a.session_id.cmp(&b.session_id))
+            .then_with(|| a.conversation_id.cmp(&b.conversation_id))
     });
     out
 }
@@ -496,55 +692,29 @@ pub fn if_none_match_matches(header: &str, etag: &str) -> bool {
         .any(|candidate| candidate == "*" || candidate == etag)
 }
 
-/// Query params for `GET /jesse/sessions`.
+/// Query params for the conversation list.
 #[derive(Deserialize)]
-pub struct SessionsQuery {
-    /// Only sessions with mtime strictly greater than this (unix seconds).
+pub struct ConversationsQuery {
+    /// Only conversations with `last_modified` strictly greater than this (unix
+    /// seconds).
     #[serde(default)]
     pub since: Option<u64>,
 }
 
-/// `GET /jesse/sessions` — list the vault's Claude Code sessions, newest first.
-/// Same bearer auth and rate limiter as `/jesse`. `?since=<unix seconds>` returns
-/// only sessions modified after that. Honors `If-None-Match` with a strong ETag
-/// over the body (`304 Not Modified`, empty body, when it matches). A missing
-/// projects dir yields an empty list, not an error.
-pub async fn jesse_sessions(
-    State(st): State<AppState>,
-    headers: HeaderMap,
-    Query(params): Query<SessionsQuery>,
-) -> Result<Response, ApiError> {
-    check_auth(&headers, &st.cfg.token)?;
-    if !st.limiter.allow() {
-        return Err((
-            StatusCode::TOO_MANY_REQUESTS,
-            "rate limit exceeded".to_string(),
-        ));
-    }
-
-    let dir = st.sessions_dir();
-    let sessions = list_sessions(&dir, params.since, &st.titles, &st.flags);
-    // Recent deletion tombstones ride inside the same body, so the existing strong
-    // ETag covers them automatically (a new tombstone changes the body → the ETag →
-    // invalidates a cached 304). Additive: an old app decodes only `sessions`.
-    let deleted = st.deletions.recent(system_time_to_ms(SystemTime::now()));
-    let body = serde_json::to_string(&json!({ "sessions": sessions, "deleted": deleted }))
-        .unwrap_or_else(|_| r#"{"sessions":[],"deleted":[]}"#.to_string());
+/// Serve a list body under a strong ETag: a quoted lowercase hex SHA-256 over the
+/// exact bytes, with `If-None-Match` (honoring `*` and a comma list) short-circuiting
+/// to a `304` carrying the ETag and no body.
+fn etag_list_response(headers: &HeaderMap, body: String) -> Response {
     let etag = strong_etag(&body);
-
-    // If-None-Match → 304 with the ETag and no body.
     if let Some(inm) = headers
         .get(axum::http::header::IF_NONE_MATCH)
         .and_then(|v| v.to_str().ok())
     {
         if if_none_match_matches(inm, &etag) {
-            return Ok(
-                (StatusCode::NOT_MODIFIED, [(axum::http::header::ETAG, etag)]).into_response(),
-            );
+            return (StatusCode::NOT_MODIFIED, [(axum::http::header::ETAG, etag)]).into_response();
         }
     }
-
-    Ok((
+    (
         StatusCode::OK,
         [
             (axum::http::header::ETAG, etag),
@@ -555,17 +725,60 @@ pub async fn jesse_sessions(
         ],
         body,
     )
-        .into_response())
+        .into_response()
 }
 
-// ---- GET /jesse/sessions/{id} — transcript hydration -----------------------
+/// `GET /jesse/conversations` serves the canonical conversation list, newest first. Same
+/// bearer auth and rate limiter as `/jesse`. `?since=<unix seconds>` returns only
+/// conversations touched after that. Honors `If-None-Match` with a strong ETag over the
+/// body (`304 Not Modified`, empty body, when it matches). A missing projects dir
+/// yields an empty list, not an error.
+///
+/// The registry is refreshed from disk first, so a transcript left by a previous bridge
+/// or written by the CLI outside the app is adopted into a conversation before the list
+/// is rendered, except one attributable to a turn still in flight, which is
+/// deliberately invisible this round (see [`refresh_conversations`]).
+///
+/// Deletion tombstones ride in the same body as `deleted`, so the ETag covers them
+/// automatically. Every tombstone is reported, whichever key space it was recorded
+/// under: a client only ever acts on an id it actually holds, so an id it does not
+/// recognize is inert.
+pub async fn jesse_conversations(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    Query(params): Query<ConversationsQuery>,
+) -> Result<Response, ApiError> {
+    check_auth(&headers, &st.cfg.token)?;
+    if !st.limiter.allow() {
+        return Err((
+            StatusCode::TOO_MANY_REQUESTS,
+            "rate limit exceeded".to_string(),
+        ));
+    }
+
+    let dir = st.sessions_dir();
+    let now_ms = system_time_to_ms(SystemTime::now());
+    refresh_conversations(&dir, &st.conversations, now_ms);
+    let conversations =
+        list_conversations(&dir, &st.conversations, params.since, &st.titles, &st.flags);
+    let deleted: Vec<Value> = st
+        .deletions
+        .recent(now_ms)
+        .into_iter()
+        .map(|t| json!({ "conversation_id": t.session_id, "deleted_ms": t.deleted_ms }))
+        .collect();
+    let body =
+        serde_json::to_string(&json!({ "conversations": conversations, "deleted": deleted }))
+            .unwrap_or_else(|_| r#"{"conversations":[],"deleted":[]}"#.to_string());
+    Ok(etag_list_response(&headers, body))
+}
+
+// ---- Transcript turn shaping -------------------------------------------------
 //
-// A client that never saw a session's earlier turns hydrates its history here. The
-// full transcript is the session's `<session_id>.jsonl`; this endpoint returns the
-// ordered, client-renderable turns (user utterances + visible assistant text),
-// wrapper-stripped exactly like the list snippet and shaped like a live SSE turn.
-// `?after=<byte offset>` returns only the bytes appended since — the jsonl is
-// append-only, so a reconnecting client re-syncs in one small round trip.
+// The shared primitives every hydrate goes through: how one jsonl line becomes a
+// renderable turn, and how a byte range of an append-only transcript becomes an ordered
+// list of them plus the offset to resume at. Pure and unit-tested directly, so the offset
+// math and the skip rules are asserted without touching a socket.
 
 /// One hydrated turn: a role, the visible text, and the transcript timestamp when
 /// present. `timestamp` is omitted from the JSON when a line carries none.
@@ -575,6 +788,13 @@ pub struct HydratedTurn {
     pub text: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub timestamp: Option<String>,
+    /// Stable, opaque, per-turn key: `"<session_id>:<absolute byte offset of the
+    /// jsonl line that produced this turn>"`. Unique and stable within a
+    /// conversation for the life of the transcript, which is what lets a client
+    /// merge hydrated history without duplicating turns it already holds. `None` on
+    /// the deprecated single-session route, which predates it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub turn_key: Option<String>,
 }
 
 /// Shape one transcript jsonl line into a renderable turn, or `None` to skip it.
@@ -583,7 +803,11 @@ pub struct HydratedTurn {
 /// tool-use / thinking-only turns and `tool_result` carriers (no visible text),
 /// subagent (`isSidechain`) traffic and CLI `isMeta` plumbing (e.g. the caveat line),
 /// non-turn line types (`system`, `summary`, …), and blank / malformed lines.
-fn shape_turn_line(line: &str) -> Option<HydratedTurn> {
+///
+/// `turn_key` names the session and the ABSOLUTE byte offset of the line this turn
+/// came from (`None` when no session id is supplied, as on the deprecated single-session
+/// route, which predates the field).
+fn shape_turn_line(line: &str, turn_key: Option<String>) -> Option<HydratedTurn> {
     let line = line.trim();
     if line.is_empty() {
         return None;
@@ -607,6 +831,7 @@ fn shape_turn_line(line: &str) -> Option<HydratedTurn> {
                 role: "user".to_string(),
                 text: text.to_string(),
                 timestamp: ts,
+                turn_key,
             })
         }
         Some("assistant") => {
@@ -616,6 +841,7 @@ fn shape_turn_line(line: &str) -> Option<HydratedTurn> {
                 role: "assistant".to_string(),
                 text: text.to_string(),
                 timestamp: ts,
+                turn_key,
             })
         }
         _ => None,
@@ -629,14 +855,21 @@ fn shape_turn_line(line: &str) -> Option<HydratedTurn> {
 /// `?after=` call returns it once the writer finishes it. A complete-but-malformed
 /// line is skipped and still advances the offset (it is gone, not replayed forever).
 /// Pure, so the offset math is unit-tested directly.
-pub fn parse_turns(bytes: &[u8], base: u64) -> (Vec<HydratedTurn>, u64) {
+///
+/// `session_id`, when supplied, stamps each turn with a `turn_key` of
+/// `"<session_id>:<absolute offset of the line's FIRST byte>"`, the line start, not
+/// the post-consumption offset, so the key is stable no matter how the file is later
+/// chunked across `?after=` calls. `None` reproduces the pre-`turn_key` shape for the
+/// deprecated single-session route.
+pub fn parse_turns(bytes: &[u8], base: u64, session_id: Option<&str>) -> (Vec<HydratedTurn>, u64) {
     let mut turns = Vec::new();
     let mut pos = 0usize;
     let mut consumed = 0usize;
     while let Some(rel) = bytes[pos..].iter().position(|&b| b == b'\n') {
         let end = pos + rel; // index of the '\n'
+        let key = session_id.map(|sid| format!("{sid}:{}", base + pos as u64));
         if let Ok(s) = std::str::from_utf8(&bytes[pos..end]) {
-            if let Some(t) = shape_turn_line(s) {
+            if let Some(t) = shape_turn_line(s, key) {
                 turns.push(t);
             }
         }
@@ -649,8 +882,13 @@ pub fn parse_turns(bytes: &[u8], base: u64) -> (Vec<HydratedTurn>, u64) {
 /// Read a transcript from byte offset `after` to EOF and shape the new turns,
 /// returning them with the next offset. `after` at or past EOF (a caught-up client,
 /// or a stale over-large offset) yields no turns and the current length. Append-only,
-/// so the offset math is exact.
-pub fn hydrate_from_file(path: &Path, after: u64) -> std::io::Result<(Vec<HydratedTurn>, u64)> {
+/// so the offset math is exact. `session_id` is threaded through to `parse_turns` to
+/// stamp each turn's `turn_key`; `None` omits it (the deprecated single-session route).
+pub fn hydrate_from_file(
+    path: &Path,
+    after: u64,
+    session_id: Option<&str>,
+) -> std::io::Result<(Vec<HydratedTurn>, u64)> {
     use std::io::{Read, Seek, SeekFrom};
     let mut file = std::fs::File::open(path)?;
     let len = file.metadata()?.len();
@@ -660,37 +898,124 @@ pub fn hydrate_from_file(path: &Path, after: u64) -> std::io::Result<(Vec<Hydrat
     file.seek(SeekFrom::Start(after))?;
     let mut buf = Vec::new();
     file.read_to_end(&mut buf)?;
-    Ok(parse_turns(&buf, after))
+    Ok(parse_turns(&buf, after, session_id))
 }
 
-/// Query params for `GET /jesse/sessions/{id}`.
-#[derive(Deserialize)]
-pub struct HydrateQuery {
-    /// Return only content appended after this byte offset (the append-only delta
-    /// sync). Absent → the full transcript from offset 0.
-    #[serde(default)]
-    pub after: Option<u64>,
+// ---- Conversation hydration -------------------------------------------------
+//
+// A conversation can span several transcript files (a CLI session fork, or a dropped
+// `--resume` after a sweep), so a bare byte offset is no longer a sufficient cursor.
+// The cursor is an opaque `"<segment_index>:<byte_offset>"` string: the index into the
+// conversation's ordered alias list, plus the offset within that segment's file. Its
+// internals are the bridge's business; a client only ever echoes it back.
+
+/// The cursor a client sends for a full read: the first segment, offset zero.
+pub const HYDRATE_CURSOR_START: &str = "0:0";
+
+/// Format an opaque hydrate cursor.
+pub fn format_hydrate_cursor(segment: usize, offset: u64) -> String {
+    format!("{segment}:{offset}")
 }
 
-/// `GET /jesse/sessions/{session_id}` — hydrate one session's transcript into
-/// ordered, client-renderable turns. Same bearer auth and rate limiter as
-/// `/jesse/sessions`. `?after=<byte offset>` returns only the turns appended since,
-/// with `next_offset` for the next round trip (the jsonl is append-only, so the
-/// offset math is exact and a reconnecting client syncs in one small call).
+/// Parse an opaque hydrate cursor into `(segment_index, byte_offset)`. An absent or
+/// empty cursor means "from the beginning". Anything else must be exactly two
+/// non-negative integers separated by one colon; a malformed cursor is an error (the
+/// handler surfaces it as a `400`) rather than being silently reset to zero, which
+/// would replay the whole conversation and duplicate every turn on the client.
+pub fn parse_hydrate_cursor(cursor: Option<&str>) -> Result<(usize, u64), String> {
+    let raw = cursor.unwrap_or("").trim();
+    if raw.is_empty() {
+        return Ok((0, 0));
+    }
+    let mut parts = raw.split(':');
+    let (Some(seg), Some(off), None) = (parts.next(), parts.next(), parts.next()) else {
+        return Err("cursor must be \"<segment>:<offset>\"".to_string());
+    };
+    let segment = seg
+        .parse::<usize>()
+        .map_err(|_| "cursor segment must be a non-negative integer".to_string())?;
+    let offset = off
+        .parse::<u64>()
+        .map_err(|_| "cursor offset must be a non-negative integer".to_string())?;
+    Ok((segment, offset))
+}
+
+/// Hydrate a whole conversation from a cursor: read the starting segment from its
+/// offset to EOF, then each subsequent segment from offset 0, concatenating the turns
+/// in segment order. Returns the turns and the cursor to resume from.
 ///
-/// - **`404`** for an unknown id, and for a title-mint transcript (Wart 1 — a
-///   `POST /jesse/title` one-shot is not a real conversation; it is excluded from
-///   the list AND rejected here, identically to an unknown id).
-/// - **`400`** for a structurally-invalid id (not a plain filename component):
-///   path-traversal defense, rejected before the filesystem is touched, so a
-///   crafted id can never resolve outside the vault projects dir.
-/// - **Malformed / partial lines never 500** — they are skipped (a partial trailing
-///   line is returned on the next `?after=` call once complete).
-pub async fn jesse_session_hydrate(
+/// A segment whose file is missing (swept by GC, or deleted) is SKIPPED and the cursor
+/// advances past it, never an error, since a conversation legitimately outlives one of
+/// its transcripts. Each segment keeps the per-file behavior of `parse_turns` intact,
+/// including leaving a trailing line with no newline unconsumed so the next call picks
+/// it up once the writer finishes it.
+///
+/// A cursor pointing past the last segment yields no turns and echoes itself back, so
+/// a caught-up client's poll is a cheap no-op.
+pub fn hydrate_conversation(
+    dir: &Path,
+    session_ids: &[String],
+    start: (usize, u64),
+) -> std::io::Result<(Vec<HydratedTurn>, String)> {
+    let (start_segment, start_offset) = start;
+    let mut turns = Vec::new();
+    let mut cursor_segment = start_segment;
+    let mut cursor_offset = start_offset;
+    let mut segment = start_segment;
+    let mut offset = start_offset;
+    while segment < session_ids.len() {
+        let sid = &session_ids[segment];
+        let path = dir.join(format!("{sid}.jsonl"));
+        if path.is_file() {
+            let (mut seg_turns, next) = hydrate_from_file(&path, offset, Some(sid))?;
+            turns.append(&mut seg_turns);
+            cursor_segment = segment;
+            cursor_offset = next;
+        } else {
+            // The file is gone: nothing to read, and the cursor moves to the start of
+            // this segment so a later call skips it again without erroring.
+            cursor_segment = segment;
+            cursor_offset = 0;
+        }
+        segment += 1;
+        offset = 0;
+    }
+    Ok((turns, format_hydrate_cursor(cursor_segment, cursor_offset)))
+}
+
+/// Query params for `GET /jesse/conversations/{id}/transcript`.
+#[derive(Deserialize)]
+pub struct ConversationHydrateQuery {
+    /// Return only content appended after this opaque cursor. Absent or empty means
+    /// the whole conversation from the beginning.
+    #[serde(default)]
+    pub after: Option<String>,
+}
+
+/// `GET /jesse/conversations/{conversation_id}/transcript` hydrates a conversation's
+/// whole history into ordered, client-renderable turns, across every transcript bound
+/// to it. Same bearer auth and rate limiter as the list.
+///
+/// `?after=<cursor>` returns only what was appended since, with `next_cursor` for the
+/// next round trip. Every turn carries a `turn_key`: the session id plus the byte
+/// offset of the jsonl line it came from, stable across repeated hydrates and unique
+/// within the conversation, so a client can merge history without duplicating a turn it
+/// already holds.
+///
+/// The turn shaping is unchanged from the session route: user utterances
+/// wrapper-stripped, visible assistant text only, and skipping `isSidechain`, `isMeta`,
+/// tool use, thinking-only turns, `tool_result` carriers, non-turn line types, and
+/// blank or malformed lines.
+///
+/// - **`400`** for a malformed conversation id or a malformed cursor.
+/// - **`404`** for an unknown conversation id.
+/// - **Malformed / partial lines never 500**: a partial trailing line is returned on
+///   the next call once complete.
+pub async fn jesse_conversation_hydrate(
     State(st): State<AppState>,
-    UrlPath(session_id): UrlPath<String>,
+    UrlPath(conversation_id): UrlPath<String>,
     headers: HeaderMap,
-    Query(params): Query<HydrateQuery>,
+    Query(params): Query<ConversationHydrateQuery>,
 ) -> Result<Response, ApiError> {
     check_auth(&headers, &st.cfg.token)?;
     if !st.limiter.allow() {
@@ -699,36 +1024,26 @@ pub async fn jesse_session_hydrate(
             "rate limit exceeded".to_string(),
         ));
     }
-    // Path-traversal defense: a non-plain component can never name a file INSIDE the
-    // projects dir; reject it before the filesystem is touched (same posture as the
-    // DELETE endpoint), so a crafted id like `../../foo` can't escape the vault.
-    if !is_plain_session_component(&session_id) {
-        return Err((StatusCode::BAD_REQUEST, "invalid session id".to_string()));
+    if let Err(msg) = validate_conversation_id(&conversation_id) {
+        return Err((StatusCode::BAD_REQUEST, msg));
     }
-    let path = session_transcript_path(&st.cfg.home, &st.cfg.vault, &session_id);
-    if !path.is_file() {
-        return Err((StatusCode::NOT_FOUND, "unknown session".to_string()));
-    }
-    // Wart 1: a title-mint transcript is not a real conversation — 404 it, exactly as
-    // it is excluded from GET /jesse/sessions. Checked on the RAW first user turn.
-    if first_user_raw(&path)
-        .as_deref()
-        .map(is_title_mint_prompt)
-        .unwrap_or(false)
-    {
-        return Err((StatusCode::NOT_FOUND, "unknown session".to_string()));
-    }
-    let after = params.after.unwrap_or(0);
-    let (turns, next_offset) = hydrate_from_file(&path, after).map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("could not read session transcript: {e}"),
-        )
-    })?;
+    let Some(rec) = st.conversations.get(&conversation_id) else {
+        return Err((StatusCode::NOT_FOUND, "unknown conversation".to_string()));
+    };
+    let start = parse_hydrate_cursor(params.after.as_deref())
+        .map_err(|msg| (StatusCode::BAD_REQUEST, msg))?;
+    let dir = st.sessions_dir();
+    let (turns, next_cursor) =
+        hydrate_conversation(&dir, &rec.session_ids, start).map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("could not read conversation transcript: {e}"),
+            )
+        })?;
     let body = serde_json::to_string(&json!({
-        "session_id": session_id,
+        "conversation_id": conversation_id,
         "turns": turns,
-        "next_offset": next_offset,
+        "next_cursor": next_cursor,
     }))
     .unwrap_or_else(|_| r#"{"turns":[]}"#.to_string());
     Ok((
@@ -742,68 +1057,86 @@ pub async fn jesse_session_hydrate(
         .into_response())
 }
 
-/// `DELETE /jesse/session/{session_id}` — delete one Claude Code session for the
-/// bridge's vault, scoped to the vault project only. Same bearer auth as `/jesse`.
+// ---- Conversation delete and flags -----------------------------------------
+
+/// Delete one conversation: every transcript bound to it, its title and flag rows, and
+/// the record itself, leaving durable tombstones behind. Shared by the conversation
+/// route and its deprecated session alias.
 ///
-/// **Idempotent**, mirroring `POST /jesse/cancel`: an unknown or already-gone id
-/// returns `204` (success), never an error — the app's durable delete-drainer
-/// retries and the GC sweep must never choke on a missing id. A real failure to
-/// delete a file that *exists* is a `500`. A structurally-invalid id (one that
-/// isn't a plain filename component — empty, `.`/`..`, or containing a path
-/// separator) is a `400`: it can only be a traversal attempt, never a real session
-/// id, so it must never reach the filesystem.
-pub async fn jesse_session_delete(
+/// **Idempotent**, mirroring `POST /jesse/cancel`: an unknown conversation, or one
+/// whose files are already gone, is success. The app's durable delete-drainer retries
+/// and must never choke. Only a real I/O failure deleting a file that EXISTS is an
+/// error.
+///
+/// ONE tombstone, under the conversation id. A legacy session-keyed half existed only for
+/// the deprecation window, when a pre-0.33 client still read `GET /jesse/sessions`; with that
+/// route gone there is nothing left that reads the session key space.
+fn delete_conversation_core(st: &AppState, conversation_id: &str) -> Result<StatusCode, ApiError> {
+    let dir = st.sessions_dir();
+    let now_ms = system_time_to_ms(SystemTime::now());
+    let session_ids = st
+        .conversations
+        .get(conversation_id)
+        .map(|r| r.session_ids)
+        .unwrap_or_default();
+    for sid in &session_ids {
+        match delete_session_file(&dir, sid) {
+            SessionDeleteOutcome::Deleted => {
+                eprintln!(
+                    "jesse-bridge: deleted transcript {sid} of conversation {conversation_id}"
+                );
+            }
+            SessionDeleteOutcome::AlreadyGone => {}
+            SessionDeleteOutcome::Failed(msg) => {
+                eprintln!(
+                    "jesse-bridge: failed to delete transcript {sid} of conversation \
+                     {conversation_id}: {msg}"
+                );
+                return Err((
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("could not delete conversation transcript: {msg}"),
+                ));
+            }
+        }
+    }
+    // Drop any stashed title AND flags so the deleted conversation can't linger in
+    // titles.json / flags.json and resurrect a stale title or favorite.
+    st.titles.remove(conversation_id);
+    st.flags.remove(conversation_id);
+    // A user-intent delete, so a device that adopted this conversation must learn to
+    // drop it. Only the explicit delete route records here; age-based GC never does.
+    st.deletions.record(conversation_id, now_ms);
+    st.conversations.forget(conversation_id);
+    eprintln!(
+        "jesse-bridge: deleted conversation {conversation_id} ({} transcript(s))",
+        session_ids.len()
+    );
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// `DELETE /jesse/conversation/{conversation_id}` deletes one conversation for the
+/// bridge's vault: every transcript bound to it, scoped to the vault project only. Same
+/// bearer auth as `/jesse`.
+///
+/// **Idempotent**: an unknown conversation or one already gone returns `204`, never an
+/// error. A malformed id is a `400` (it can only be a mistake or an attack, never a
+/// real conversation id, so it must never reach the filesystem). Only a real I/O
+/// failure is a `500`.
+pub async fn jesse_conversation_delete(
     State(st): State<AppState>,
-    UrlPath(session_id): UrlPath<String>,
+    UrlPath(conversation_id): UrlPath<String>,
     headers: HeaderMap,
 ) -> Result<StatusCode, ApiError> {
     check_auth(&headers, &st.cfg.token)?;
-    // Defensive: a non-plain component can never name a session inside the projects
-    // dir; reject it up front so it can't reach `remove_file` (path traversal).
-    if !is_plain_session_component(&session_id) {
-        return Err((StatusCode::BAD_REQUEST, "invalid session id".to_string()));
+    if let Err(msg) = validate_conversation_id(&conversation_id) {
+        return Err((StatusCode::BAD_REQUEST, msg));
     }
-    let dir = st.sessions_dir();
-    match delete_session_file(&dir, &session_id) {
-        SessionDeleteOutcome::Deleted => {
-            // Drop any stashed title AND flags so the reclaimed id can't linger in
-            // titles.json / flags.json and resurrect a stale title or favorite.
-            st.titles.remove(&session_id);
-            st.flags.remove(&session_id);
-            // Record a durable deletion tombstone: this is a user-intent delete, so a
-            // device that adopted this session earlier must learn to drop it. Only the
-            // explicit delete route records here; age-based GC never does.
-            st.deletions
-                .record(&session_id, system_time_to_ms(SystemTime::now()));
-            eprintln!("jesse-bridge: deleted session {session_id}");
-            Ok(StatusCode::NO_CONTENT)
-        }
-        SessionDeleteOutcome::AlreadyGone => {
-            // Idempotent: unknown / already-gone is success, not an error.
-            st.titles.remove(&session_id);
-            st.flags.remove(&session_id);
-            // Still a user-intent delete (a retry of the drainer, or a delete of an id
-            // whose file is already gone), so record the tombstone here too. Idempotent:
-            // it just refreshes the millis on a repeat.
-            st.deletions
-                .record(&session_id, system_time_to_ms(SystemTime::now()));
-            eprintln!("jesse-bridge: session {session_id} already gone — no-op (idempotent)");
-            Ok(StatusCode::NO_CONTENT)
-        }
-        SessionDeleteOutcome::Failed(msg) => {
-            eprintln!("jesse-bridge: failed to delete session {session_id}: {msg}");
-            Err((
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("could not delete session: {msg}"),
-            ))
-        }
-    }
+    delete_conversation_core(&st, &conversation_id)
 }
 
-/// `POST /jesse/session/{session_id}/flags` sets this session's favorite / archived
-/// flags, so the bridge (not one device) is the source of truth and every device
-/// converges. Same bearer auth, rate limiter, and id validation as the other
-/// per-session routes.
+/// `POST /jesse/conversation/{conversation_id}/flags` sets this conversation's
+/// favorite / archived flags, so the bridge (not one device) is the source of truth and
+/// every device converges. Same bearer auth and rate limiter as the other routes.
 ///
 /// The body carries any subset of `{ favorite, favorite_updated_ms, archived,
 /// archived_updated_ms }`; each provided flag is applied **last-writer-wins** by its
@@ -812,13 +1145,11 @@ pub async fn jesse_session_delete(
 /// converge deterministically. A partial body (one flag only) leaves the other flag
 /// untouched. The resulting `SessionFlags` is returned.
 ///
-/// - **`400`** for a structurally-invalid id (not a plain filename component):
-///   path-traversal defense, rejected before the filesystem is touched.
-/// - **`404`** for an unknown id (a session with no transcript on disk; a synthetic
-///   `local-` id has none by construction), identical to the hydrate route.
-pub async fn jesse_session_flags(
+/// - **`400`** for a malformed conversation id.
+/// - **`404`** for an unknown conversation.
+pub async fn jesse_conversation_flags(
     State(st): State<AppState>,
-    UrlPath(session_id): UrlPath<String>,
+    UrlPath(conversation_id): UrlPath<String>,
     headers: HeaderMap,
     Json(update): Json<FlagUpdate>,
 ) -> Result<Json<Value>, ApiError> {
@@ -829,19 +1160,13 @@ pub async fn jesse_session_flags(
             "rate limit exceeded".to_string(),
         ));
     }
-    // Path-traversal defense: a non-plain component can never name a file inside the
-    // projects dir; reject it before the filesystem is touched (same as delete/hydrate).
-    if !is_plain_session_component(&session_id) {
-        return Err((StatusCode::BAD_REQUEST, "invalid session id".to_string()));
+    if let Err(msg) = validate_conversation_id(&conversation_id) {
+        return Err((StatusCode::BAD_REQUEST, msg));
     }
-    // Unknown id is a 404, exactly like the hydrate route: the session must have a
-    // transcript on disk. (A synthetic `local-` id has none, so it 404s here; the
-    // app syncs flags only for real sessions.)
-    let path = session_transcript_path(&st.cfg.home, &st.cfg.vault, &session_id);
-    if !path.is_file() {
-        return Err((StatusCode::NOT_FOUND, "unknown session".to_string()));
+    if st.conversations.get(&conversation_id).is_none() {
+        return Err((StatusCode::NOT_FOUND, "unknown conversation".to_string()));
     }
-    let result = st.flags.apply(&session_id, &update);
+    let result = st.flags.apply(&conversation_id, &update);
     Ok(Json(json!({
         "favorite": result.favorite,
         "favorite_updated_ms": result.favorite_updated_ms,
@@ -922,7 +1247,10 @@ mod tests {
         let missing = std::env::temp_dir().join(format!("jesse-nope-{}", random_hex()));
         let titles = TitleStore::new(None);
         let flags = FlagStore::new(None);
-        assert!(list_sessions(&missing, None, &titles, &flags).is_empty());
+        let convs = ConversationStore::new(None);
+        assert!(refresh_conversations(&missing, &convs, 0).is_empty());
+        assert!(transcript_stems(&missing).is_empty());
+        assert!(list_conversations(&missing, &convs, None, &titles, &flags).is_empty());
     }
 
     #[test]
@@ -999,12 +1327,23 @@ mod tests {
         set_mtime(&dir.join("mid.jsonl"), 2_000);
         set_mtime(&dir.join("new.jsonl"), 3_000);
 
+        // The three transcripts are adopted into conversations first; the list is then
+        // rendered from the registry, keyed on conversation id.
+        let convs = ConversationStore::new(None);
+        let adopted = refresh_conversations(&dir, &convs, 0);
+        assert_eq!(
+            adopted.len(),
+            3,
+            "non-jsonl file and subdir are not adopted"
+        );
+        let mid_cid = orphan_conversation_id("mid");
+
         let titles = TitleStore::new(None);
-        titles.set("mid", "Middle Session");
-        // Flags filled from the store; a session with no row lists false/0.
+        titles.set(&mid_cid, "Middle Session");
+        // Flags filled from the store; a conversation with no row lists false/0.
         let flags = FlagStore::new(None);
         flags.apply(
-            "mid",
+            &mid_cid,
             &FlagUpdate {
                 favorite: Some(true),
                 favorite_updated_ms: Some(1_700),
@@ -1013,29 +1352,43 @@ mod tests {
             },
         );
 
-        let all = list_sessions(&dir, None, &titles, &flags);
-        let ids: Vec<&str> = all.iter().map(|s| s.session_id.as_str()).collect();
+        let all = list_conversations(&dir, &convs, None, &titles, &flags);
+        let ids: Vec<&str> = all
+            .iter()
+            .map(|c| c.session_id.as_deref().unwrap())
+            .collect();
         assert_eq!(
             ids,
             ["new", "mid", "old"],
             "newest first, non-jsonl/subdir ignored"
         );
         // Titles filled from the store; absent ones are null.
-        let mid = all.iter().find(|s| s.session_id == "mid").unwrap();
+        let mid = all
+            .iter()
+            .find(|c| c.conversation_id == mid_cid)
+            .expect("the mid conversation is listed");
         assert_eq!(mid.title.as_deref(), Some("Middle Session"));
         assert_eq!(mid.first_message.as_deref(), Some("mid q"));
-        // Flags filled for the flagged session.
+        assert_eq!(mid.last_modified, 2_000);
+        assert_eq!(mid.session_ids, vec!["mid".to_string()]);
+        // Flags filled for the flagged conversation.
         assert!(mid.favorite && mid.favorite_updated_ms == 1_700);
         assert!(mid.archived && mid.archived_updated_ms == 1_800);
-        let new = all.iter().find(|s| s.session_id == "new").unwrap();
+        let new = all
+            .iter()
+            .find(|c| c.session_id.as_deref() == Some("new"))
+            .unwrap();
         assert!(new.title.is_none());
-        // An unflagged session defaults to false/0 on all four flag fields.
+        // An unflagged conversation defaults to false/0 on all four flag fields.
         assert!(!new.favorite && new.favorite_updated_ms == 0);
         assert!(!new.archived && new.archived_updated_ms == 0);
 
         // ?since strictly greater: since=2000 keeps only "new" (mtime 3000).
-        let delta = list_sessions(&dir, Some(2_000), &titles, &flags);
-        let ids: Vec<&str> = delta.iter().map(|s| s.session_id.as_str()).collect();
+        let delta = list_conversations(&dir, &convs, Some(2_000), &titles, &flags);
+        let ids: Vec<&str> = delta
+            .iter()
+            .map(|c| c.session_id.as_deref().unwrap())
+            .collect();
         assert_eq!(ids, ["new"], "since is strictly greater-than");
 
         std::fs::remove_dir_all(&dir).ok();
@@ -1154,8 +1507,11 @@ mod tests {
     #[test]
     fn run_session_gc_reclaims_old_sessions_and_drops_their_titles() {
         // Wiring test over the cfg.home path (no global-env mutation): an ancient
-        // session (mtime at the epoch, far past any TTL) is reclaimed and its stashed
-        // title dropped; a fresh one survives.
+        // session (mtime at the epoch, far past any TTL) is reclaimed, and the
+        // CONVERSATION that owned it is then dropped along with its stashed title and
+        // flags; a fresh one survives untouched. Same property as before the conversation
+        // registry (a reclaimed thread's title and flags must not linger and resurrect),
+        // now asserted on the conversation-keyed rows the stores actually hold.
         let home = std::env::temp_dir().join(format!("jesse-home-{}", random_hex()));
         let vault = "/vault/gc";
         let dir = home
@@ -1173,48 +1529,123 @@ mod tests {
         cfg.vault = vault.to_string();
         cfg.session_ttl_days = 90;
 
-        let titles = TitleStore::new(None);
-        titles.set("ancient", "Old Title");
-        titles.set("fresh", "New Title");
-        // Flags for both sessions: the reclaimed one's row must be dropped too.
-        let flags = FlagStore::new(None);
-        flags.apply(
-            "ancient",
-            &FlagUpdate {
-                favorite: Some(true),
-                favorite_updated_ms: Some(1),
-                ..FlagUpdate::default()
-            },
-        );
-        flags.apply(
-            "fresh",
-            &FlagUpdate {
-                favorite: Some(true),
-                favorite_updated_ms: Some(1),
-                ..FlagUpdate::default()
-            },
-        );
+        // Both transcripts are registered as conversations, with the ancient one's record
+        // itself stamped at the epoch so it is past the TTL too.
+        let convs = ConversationStore::new(None);
+        convs.adopt_orphan_sessions(["ancient", "fresh"], 0);
+        let ancient_cid = orphan_conversation_id("ancient");
+        let fresh_cid = orphan_conversation_id("fresh");
 
-        run_session_gc(&cfg, &titles, &flags);
+        let titles = TitleStore::new(None);
+        titles.set(&ancient_cid, "Old Title");
+        titles.set(&fresh_cid, "New Title");
+        // Flags for both conversations: the reclaimed one's row must be dropped too.
+        let flags = FlagStore::new(None);
+        for cid in [&ancient_cid, &fresh_cid] {
+            flags.apply(
+                cid,
+                &FlagUpdate {
+                    favorite: Some(true),
+                    favorite_updated_ms: Some(1),
+                    ..FlagUpdate::default()
+                },
+            );
+        }
+
+        run_session_gc(&cfg, &convs, &titles, &flags);
 
         assert!(
             !dir.join("ancient.jsonl").exists(),
             "ancient session reclaimed"
         );
         assert!(dir.join("fresh.jsonl").exists(), "fresh session kept");
-        assert_eq!(titles.get("ancient"), None, "reclaimed title dropped");
+        assert!(
+            convs.get(&ancient_cid).is_none(),
+            "the conversation with no surviving transcript is dropped"
+        );
+        assert!(
+            convs.get(&fresh_cid).is_some(),
+            "the conversation whose transcript survives is kept"
+        );
+        assert_eq!(titles.get(&ancient_cid), None, "reclaimed title dropped");
         assert_eq!(
-            titles.get("fresh").as_deref(),
+            titles.get(&fresh_cid).as_deref(),
             Some("New Title"),
             "kept title stays"
         );
-        // The reclaimed session's flags row is dropped; the kept one's survives.
+        // The reclaimed conversation's flags row is dropped; the kept one's survives.
         assert_eq!(
-            flags.get("ancient"),
+            flags.get(&ancient_cid),
             SessionFlags::default(),
             "reclaimed flags dropped"
         );
-        assert!(flags.get("fresh").favorite, "kept flags stay");
+        assert!(flags.get(&fresh_cid).favorite, "kept flags stay");
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn gc_never_drops_a_conversation_with_a_turn_in_flight() {
+        // A conversation registered at accept time has no transcript at all, and its
+        // record is by construction older than nothing. While its turn is RUNNING it must
+        // survive GC regardless of age; once the turn is gone it becomes eligible.
+        let home = std::env::temp_dir().join(format!("jesse-home-{}", random_hex()));
+        let vault = "/vault/inflight-gc";
+        let dir = home
+            .join(".claude")
+            .join("projects")
+            .join(escape_project_path(vault));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut cfg = crate::testutil::test_config();
+        cfg.home = home.to_string_lossy().into_owned();
+        cfg.vault = vault.to_string();
+        cfg.session_ttl_days = 90;
+
+        let convs = Arc::new(ConversationStore::new(None));
+        let cid = uuid::Uuid::new_v4().hyphenated().to_string();
+        convs.register(&cid, Some("phone"), 0); // registered at the epoch: past any TTL
+        let titles = TitleStore::new(None);
+        let flags = FlagStore::new(None);
+
+        {
+            let _claim = convs.claim_flight("job-1", &cid, Default::default(), 0);
+            run_session_gc(&cfg, &convs, &titles, &flags);
+            assert!(
+                convs.get(&cid).is_some(),
+                "an in-flight conversation is never dropped, however old its record"
+            );
+        }
+        run_session_gc(&cfg, &convs, &titles, &flags);
+        assert!(
+            convs.get(&cid).is_none(),
+            "once no longer in flight, a transcript-less aged-out record is dropped"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn gc_records_no_tombstone_for_a_dropped_conversation() {
+        // Only an explicit user delete tombstones. A device merely offline while a
+        // conversation aged out must keep its local copy.
+        let home = std::env::temp_dir().join(format!("jesse-home-{}", random_hex()));
+        let vault = "/vault/gc-no-tombstone";
+        let dir = home
+            .join(".claude")
+            .join("projects")
+            .join(escape_project_path(vault));
+        std::fs::create_dir_all(&dir).unwrap();
+        write(&dir, "gone.jsonl", "{}\n");
+        set_mtime(&dir.join("gone.jsonl"), 0);
+        let mut cfg = crate::testutil::test_config();
+        cfg.home = home.to_string_lossy().into_owned();
+        cfg.vault = vault.to_string();
+        cfg.session_ttl_days = 90;
+
+        let convs = ConversationStore::new(None);
+        convs.adopt_orphan_sessions(["gone"], 0);
+        let deletions = DeletionStore::new(None, 30 * 24 * 60 * 60 * 1000);
+        run_session_gc(&cfg, &convs, &TitleStore::new(None), &FlagStore::new(None));
+        assert!(convs.is_empty(), "the record is gone");
+        assert!(deletions.is_empty(), "GC records no tombstone");
         std::fs::remove_dir_all(&home).ok();
     }
 
@@ -1316,7 +1747,7 @@ mod tests {
             r#"{"type":"assistant","message":{"content":[{"type":"text","text":"an answer"}]}}"#,
             "\n",
         );
-        let (turns, offset) = parse_turns(jsonl.as_bytes(), 0);
+        let (turns, offset) = parse_turns(jsonl.as_bytes(), 0, None);
         assert_eq!(offset, jsonl.len() as u64, "all complete lines consumed");
         assert_eq!(turns.len(), 2, "system line skipped");
         assert_eq!(turns[0].role, "user");
@@ -1339,7 +1770,7 @@ mod tests {
             r#"{"type":"user","message":{"content":"a real question"}}"#,
             "\n",
         );
-        let (turns, offset) = parse_turns(jsonl.as_bytes(), 0);
+        let (turns, offset) = parse_turns(jsonl.as_bytes(), 0, None);
         assert_eq!(offset, jsonl.len() as u64);
         assert_eq!(turns.len(), 1, "only the real user turn survives");
         assert_eq!(turns[0].text, "a real question");
@@ -1357,7 +1788,7 @@ mod tests {
         let partial = r#"{"type":"user","message":{"content":"q2 in"#;
         let full = format!("{complete}{partial}");
 
-        let (turns, offset) = parse_turns(full.as_bytes(), 0);
+        let (turns, offset) = parse_turns(full.as_bytes(), 0, None);
         assert_eq!(turns.len(), 2, "the partial line is NOT returned yet");
         assert_eq!(
             offset,
@@ -1368,7 +1799,7 @@ mod tests {
         // The writer finishes the line; the next `?after=` call returns it.
         let rest = "complete\"}}\n";
         let appended = format!("{partial}{rest}");
-        let (turns2, offset2) = parse_turns(appended.as_bytes(), offset);
+        let (turns2, offset2) = parse_turns(appended.as_bytes(), offset, None);
         assert_eq!(turns2.len(), 1);
         assert_eq!(turns2[0].text, "q2 incomplete");
         // The whole appended line is now consumed, from where the partial started.
@@ -1387,19 +1818,19 @@ mod tests {
         );
         std::fs::write(&path, first).unwrap();
 
-        let (turns, offset) = hydrate_from_file(&path, 0).unwrap();
+        let (turns, offset) = hydrate_from_file(&path, 0, None).unwrap();
         assert_eq!(turns.len(), 2);
         assert_eq!(offset, first.len() as u64);
 
         // A caught-up client (after == len) gets nothing new, offset unchanged.
-        let (none_yet, off2) = hydrate_from_file(&path, offset).unwrap();
+        let (none_yet, off2) = hydrate_from_file(&path, offset, None).unwrap();
         assert!(none_yet.is_empty());
         assert_eq!(off2, offset);
 
         // Append a turn; hydrating from the prior offset returns only the new one.
         let more = "{\"type\":\"user\",\"message\":{\"content\":\"q2\"}}\n";
         std::fs::write(&path, format!("{first}{more}")).unwrap();
-        let (delta, off3) = hydrate_from_file(&path, offset).unwrap();
+        let (delta, off3) = hydrate_from_file(&path, offset, None).unwrap();
         assert_eq!(delta.len(), 1);
         assert_eq!(delta[0].text, "q2");
         assert_eq!(off3, (first.len() + more.len()) as u64);
@@ -1424,8 +1855,16 @@ mod tests {
         );
         let titles = TitleStore::new(None);
         let flags = FlagStore::new(None);
-        let listed = list_sessions(&dir, None, &titles, &flags);
-        let ids: Vec<&str> = listed.iter().map(|s| s.session_id.as_str()).collect();
+        let convs = ConversationStore::new(None);
+        // A mint transcript is never even adopted, so it can produce no record and no row.
+        let adopted = refresh_conversations(&dir, &convs, 0);
+        assert_eq!(adopted, vec!["real".to_string()]);
+        assert_eq!(convs.conversation_for_session("mint"), None);
+        let listed = list_conversations(&dir, &convs, None, &titles, &flags);
+        let ids: Vec<&str> = listed
+            .iter()
+            .map(|c| c.session_id.as_deref().unwrap())
+            .collect();
         assert_eq!(
             ids,
             ["real"],

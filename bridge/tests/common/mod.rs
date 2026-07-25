@@ -43,6 +43,7 @@ pub fn test_config() -> Config {
         // (kill switch), so the integration router exercises today's hosted path.
         diet_backend: None,
         diet_probation: true,
+        diet_micro_complete: true,
         // No vault-QA backend override in tests — the route is inert (kill switch),
         // so the integration router exercises today's hosted Ask path.
         vaultqa_backend: None,
@@ -211,6 +212,66 @@ pub fn sessions_request(
         b = b.header("if-none-match", inm);
     }
     b.body(Body::empty()).unwrap()
+}
+/// `GET /jesse/conversations` with optional auth, `?since=`, and `If-None-Match`.
+pub fn conversations_request(
+    auth: Option<&str>,
+    since: Option<u64>,
+    if_none_match: Option<&str>,
+) -> Request<Body> {
+    let uri = match since {
+        Some(s) => format!("/jesse/conversations?since={s}"),
+        None => "/jesse/conversations".to_string(),
+    };
+    let mut b = Request::builder().method("GET").uri(uri);
+    if let Some(a) = auth {
+        b = b.header("authorization", a);
+    }
+    if let Some(inm) = if_none_match {
+        b = b.header("if-none-match", inm);
+    }
+    b.body(Body::empty()).unwrap()
+}
+/// `GET /jesse/conversations/{id}/transcript` with optional auth and `?after=<cursor>`.
+pub fn conversation_hydrate_request(
+    auth: Option<&str>,
+    conversation_id: &str,
+    after: Option<&str>,
+) -> Request<Body> {
+    let uri = match after {
+        Some(c) => format!("/jesse/conversations/{conversation_id}/transcript?after={c}"),
+        None => format!("/jesse/conversations/{conversation_id}/transcript"),
+    };
+    let mut b = Request::builder().method("GET").uri(uri);
+    if let Some(a) = auth {
+        b = b.header("authorization", a);
+    }
+    b.body(Body::empty()).unwrap()
+}
+/// `DELETE /jesse/conversation/{id}` with the given (optional) auth header.
+pub fn conversation_delete_request(auth: Option<&str>, conversation_id: &str) -> Request<Body> {
+    let mut b = Request::builder()
+        .method("DELETE")
+        .uri(format!("/jesse/conversation/{conversation_id}"));
+    if let Some(a) = auth {
+        b = b.header("authorization", a);
+    }
+    b.body(Body::empty()).unwrap()
+}
+/// `POST /jesse/conversation/{id}/flags` with the given (optional) auth header and body.
+pub fn conversation_flags_request(
+    auth: Option<&str>,
+    conversation_id: &str,
+    json: &str,
+) -> Request<Body> {
+    let mut b = Request::builder()
+        .method("POST")
+        .uri(format!("/jesse/conversation/{conversation_id}/flags"))
+        .header("content-type", "application/json");
+    if let Some(a) = auth {
+        b = b.header("authorization", a);
+    }
+    b.body(Body::from(json.to_string())).unwrap()
 }
 /// `GET /jesse/sessions/{id}` (transcript hydration) with optional auth and `?after=`.
 pub fn hydrate_request(auth: Option<&str>, session_id: &str, after: Option<u64>) -> Request<Body> {

@@ -25,7 +25,7 @@ struct MacThreadDetailView: View {
             composer
         }
         .navigationTitle(displayTitle)
-        .navigationSubtitle(thread.sessionId == nil ? "Not yet started" : "")
+        .navigationSubtitle(subtitle)
         .onAppear { mode = thread.modeValue }
         .task(id: thread.id) {
             await coordinator.hydrate(thread: thread, context: context)
@@ -38,6 +38,15 @@ struct MacThreadDetailView: View {
         return "New conversation"
     }
 
+    /// The window subtitle. This used to read "Not yet started" off `sessionId == nil`, which
+    /// conflated two different things: a brand-new conversation and one whose first turn the
+    /// bridge has already accepted but whose CLI session id has not come back yet. The phase
+    /// caption below the transcript now carries the delivery state, so the subtitle is only
+    /// about whether the thread has ever run.
+    private var subtitle: String {
+        thread.registeredAt == nil && (thread.sessionId ?? "").isEmpty ? "Not yet started" : ""
+    }
+
     private var transcript: some View {
         ScrollViewReader { proxy in
             ScrollView {
@@ -45,6 +54,13 @@ struct MacThreadDetailView: View {
                     ForEach(thread.orderedTurns) { turn in
                         MacTurnBubble(turn: turn)
                             .id(turn.id)
+                    }
+                    // Delivery caption under the last user bubble, the Mac's counterpart to the
+                    // phone's: "Sending…" is the pre-ACK window, "Received" means the bridge has
+                    // the turn and will answer it even if this window closes.
+                    if let phase = coordinator.phase(thread.id),
+                       thread.orderedTurns.last?.isUser == true {
+                        MacDeliveryCaption(phase: phase)
                     }
                     if running {
                         MacStreamingBubble(text: coordinator.streamingText, activity: coordinator.activity)
@@ -321,5 +337,41 @@ struct ProvenanceChip: View {
         case .emergency: return .orange
         case .warning: return .red
         }
+    }
+}
+
+/// The trailing delivery caption under the last user bubble. Standard macOS treatment: a
+/// `.caption`/`.secondary` line, trailing aligned, no new symbol and no tint. The
+/// accessibility label carries the meaning the two words cannot.
+private struct MacDeliveryCaption: View {
+    let phase: TurnPhase
+
+    private var text: String {
+        switch phase {
+        case .sending: return "Sending…"
+        case .accepted: return "Received"
+        }
+    }
+
+    private var label: String {
+        switch phase {
+        case .sending:
+            return "Sending"
+        case .accepted:
+            return "Received by Jesse. Your message is saved and will be answered even if you close this window."
+        }
+    }
+
+    var body: some View {
+        HStack {
+            Spacer(minLength: 0)
+            Text(text)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .accessibilityLabel(label)
+        }
+        .padding(.trailing, 4)
+        .padding(.top, 2)
+        .animation(.default, value: phase)
     }
 }

@@ -1,6 +1,6 @@
 [package]
 name = "jesse-bridge"
-version = "0.31.0"
+version = "0.34.0"
 edition = "2021"
 license = "Apache-2.0"
 
@@ -25,6 +25,19 @@ toml = { version = "0.8", default-features = false, features = ["parse"] }
 # crate handles quoting/escaping correctly.
 csv = "1"
 qrcode = "0.14"
+# uuid: conversation identity. A conversation is the bridge's first-class thread
+# record and its id must be a UUID for two distinct reasons, both of which need a
+# real implementation rather than a hand-rolled hex formatter:
+#   * v4 for a freshly minted conversation, so the bridge can hand an id back to a
+#     client that did not send one without any coordination or collision risk;
+#   * v5 for adopting a legacy transcript that has no record, so the id derived from
+#     a Claude session id is DETERMINISTIC: adoption is idempotent, and a lost state
+#     dir rebuilt from the transcripts alone reproduces exactly the same ids, which is
+#     what keeps a client's stored conversation ids valid across that recovery.
+# Only the two generators and the canonical lowercase-hyphenated formatting are used;
+# `v5` also pulls the sha1 hasher it is defined in terms of. No serde feature (the
+# record stores the id as a String, so the wire and disk shapes stay plain JSON).
+uuid = { version = "1", features = ["v4", "v5"] }
 subtle = "2"
 # Only the `Stream` trait, to feed axum's SSE response. Already in the lock
 # (a transitive dep of axum), so naming it directly pulls no new compiled code.

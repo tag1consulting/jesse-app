@@ -60,7 +60,11 @@ pub const MAX_RETRACT: usize = 10;
 /// The optional macro fields a meal may carry, and the only keys (besides the
 /// required `id`/`consumedAt`/`name`) allowed on a meal object. A typo'd or extra
 /// key is a loud failure, mirroring the needs-health payload's unknown-key check.
-const MEAL_FIELDS: &[&str] = &[
+/// The NON-nutrient keys a meal object may carry. The nutrient keys come from the ONE
+/// nutrient table ([`dietlog::NUTRIENT_COLUMNS`]) via [`is_meal_field`], so this file
+/// keeps no second list of them — and a nutrient with no wire field (omega-3, which
+/// has no HealthKit EPA/DHA quantity) stays an UNKNOWN key here by construction.
+const MEAL_CORE_FIELDS: &[&str] = &[
     "id",
     "consumedAt",
     "name",
@@ -68,17 +72,16 @@ const MEAL_FIELDS: &[&str] = &[
     "protein_g",
     "carbs_g",
     "fat_g",
-    "fiber_g",
-    "sodium_mg",
-    "satfat_g",
-    "sugar_g",
-    "potassium_mg",
-    // HealthKit-bound micros only: calcium and magnesium have HealthKit types. Omega-3
-    // does NOT (there is no EPA/DHA HealthKit quantity), so `omega3_mg` is deliberately
-    // NOT a meal wire field and stays an unknown key here.
-    "calcium_mg",
-    "magnesium_mg",
 ];
+
+/// Whether `key` is an allowed meal-object field: a core field, or the wire key of a
+/// nutrient that HAS a wire field.
+fn is_meal_field(key: &str) -> bool {
+    MEAL_CORE_FIELDS.contains(&key)
+        || dietlog::NUTRIENT_COLUMNS
+            .iter()
+            .any(|c| c.wire == Some(key))
+}
 
 /// Sections a `JESSE_NEEDS_HEALTH` directive may request (the phone-assembled
 /// two-section health block). Kept in sync with the app's formatter.
@@ -628,7 +631,7 @@ pub fn parse_meal_batch_v2(
 fn parse_meal(item: &Value) -> Result<Meal, String> {
     let m = item.as_object().ok_or("meal entry is not an object")?;
     for key in m.keys() {
-        if !MEAL_FIELDS.contains(&key.as_str()) {
+        if !is_meal_field(key.as_str()) {
             return Err(format!("unknown meal field {key:?}"));
         }
     }

@@ -51,6 +51,57 @@ pub struct AuditAgg {
     /// hosted route with no diet marker and are not separately attributable here — a
     /// documented v1 limitation (the reason taxonomy is rung-2-only by design).
     pub diet_identifiable: usize,
+    /// Nutrient completeness over the day's LOCAL-route diet turns (see
+    /// [`MicroCompleteness`]).
+    pub micros: MicroCompleteness,
+}
+
+/// The day's nutrient-completeness tally over local-route food rows, summed from the
+/// per-turn [`metrics::DietMicros`] objects. This is the reporting half of "make
+/// incompleteness visible": before it existed, a row logged locally with three blank
+/// knowable nutrient columns looked exactly like a complete one.
+///
+/// NO auto-demotion is computed here — the numbers are reported and the threshold at
+/// which an incomplete rate should stop the local route is NOT SET YET (a human call
+/// against accumulated audit history, like probation itself).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct MicroCompleteness {
+    /// Local-route food rows appended over the day.
+    pub food_rows: usize,
+    /// Of those, the rows completion applies to (composites excluded).
+    pub eligible_rows: usize,
+    /// Rows the hosted completion filled at least one blank nutrient cell on.
+    pub rows_completed: usize,
+    /// Rows still carrying at least one blank expected nutrient column.
+    pub rows_incomplete: usize,
+    /// Expected nutrient cells filled / expected in total.
+    pub filled: usize,
+    pub expected: usize,
+    /// Per-turn reason codes for a still-incomplete turn (`micros_incomplete`,
+    /// `micro_complete_unparseable`, `micro_complete_off`).
+    pub by_reason: std::collections::BTreeMap<String, usize>,
+}
+
+impl MicroCompleteness {
+    /// The share of eligible local-route rows still missing at least one expected
+    /// nutrient column, in [0.0, 1.0]; 0 when there were no eligible rows.
+    pub fn incomplete_rate(&self) -> f64 {
+        if self.eligible_rows == 0 {
+            0.0
+        } else {
+            self.rows_incomplete as f64 / self.eligible_rows as f64
+        }
+    }
+
+    /// The share of expected nutrient CELLS that are filled, in [0.0, 1.0]; 1.0 when
+    /// nothing was expected (nothing missing).
+    pub fn cell_fill_rate(&self) -> f64 {
+        if self.expected < 1 {
+            1.0
+        } else {
+            self.filled as f64 / self.expected as f64
+        }
+    }
 }
 
 impl AuditAgg {
@@ -102,6 +153,72 @@ impl AuditAgg {
     }
 }
 
+/// One still-incomplete food row, named so it can be repaired BY HAND. The metrics log
+/// is content-free (counts only), so the item names come from `food-log.csv` itself.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IncompleteFoodRow {
+    pub meal: String,
+    pub item: String,
+    pub time: String,
+    /// The EXPECTED nutrient columns this row leaves blank, by CSV column name.
+    pub missing: Vec<&'static str>,
+}
+
+/// Find the food rows for `date` that still leave an EXPECTED nutrient column blank,
+/// reading `food-log.csv` by header NAME (the log is ragged and column order has
+/// drifted; a short legacy row simply reads its trailing columns as blank).
+///
+/// Read-only and I/O-free (the caller supplies the file body).
+///
+/// **Attribution caveat:** the CSV records no route, so this lists every incomplete row
+/// for the day — local-route and hosted alike. The per-route COUNTS come from the
+/// metrics lines ([`MicroCompleteness`]); this list is the hand-repair worklist.
+pub fn incomplete_food_rows(food_csv: &str, date: &str) -> Vec<IncompleteFoodRow> {
+    let mut rdr = csv::ReaderBuilder::new()
+        .has_headers(true)
+        .flexible(true)
+        .from_reader(food_csv.as_bytes());
+    let idx: std::collections::HashMap<String, usize> = match rdr.headers() {
+        Ok(h) => h
+            .iter()
+            .enumerate()
+            .map(|(i, name)| (name.trim().to_string(), i))
+            .collect(),
+        Err(_) => return Vec::new(),
+    };
+    let cell = |rec: &csv::StringRecord, name: &str| -> String {
+        idx.get(name)
+            .and_then(|&j| rec.get(j))
+            .unwrap_or("")
+            .trim()
+            .to_string()
+    };
+    let mut out = Vec::new();
+    for rec in rdr.records().flatten() {
+        if cell(&rec, "Date") != date {
+            continue;
+        }
+        // Blank / unparseable → the column is UNKNOWN, which is exactly what
+        // "incomplete" means here.
+        let missing: Vec<&'static str> = dietlog::NUTRIENT_COLUMNS
+            .iter()
+            .filter(|c| c.expected())
+            .filter(|c| cell(&rec, c.csv).parse::<f64>().is_err())
+            .map(|c| c.csv)
+            .collect();
+        if missing.is_empty() {
+            continue;
+        }
+        out.push(IncompleteFoodRow {
+            meal: cell(&rec, "Meal"),
+            item: cell(&rec, "Item"),
+            time: cell(&rec, "Time"),
+            missing,
+        });
+    }
+    out
+}
+
 /// Parse a metrics-log body into records, skipping blank/malformed lines (a corrupt
 /// line never sinks the audit).
 pub fn parse_metrics_lines(body: &str) -> Vec<MetricsRecord> {
@@ -144,6 +261,7 @@ pub fn aggregate(records: &[&MetricsRecord]) -> AuditAgg {
     let mut diet_queued = 0;
     let mut rung2_by_reason: BTreeMap<String, usize> = BTreeMap::new();
     let mut diet_identifiable = 0;
+    let mut micros = MicroCompleteness::default();
     let mut walls: Vec<u64> = Vec::with_capacity(records.len());
 
     for r in records {
@@ -156,6 +274,18 @@ pub fn aggregate(records: &[&MetricsRecord]) -> AuditAgg {
         if let Some(reason) = &r.diet_reason {
             *rung2_by_reason.entry(reason.clone()).or_default() += 1;
             diet_identifiable += 1;
+        }
+        // Nutrient completeness, summed over the local diet turns that appended rows.
+        if let Some(m) = &r.diet_micros {
+            micros.food_rows += m.food_rows;
+            micros.eligible_rows += m.eligible_rows;
+            micros.rows_completed += m.rows_completed;
+            micros.rows_incomplete += m.rows_incomplete;
+            micros.filled += m.filled;
+            micros.expected += m.expected;
+            if let Some(reason) = &m.reason {
+                *micros.by_reason.entry(reason.clone()).or_default() += 1;
+            }
         }
         *route_counts
             .entry(route_key(r.route).to_string())
@@ -197,6 +327,7 @@ pub fn aggregate(records: &[&MetricsRecord]) -> AuditAgg {
         diet_queued,
         rung2_by_reason,
         diet_identifiable,
+        micros,
     }
 }
 
@@ -412,6 +543,105 @@ mod tests {
         assert!(
             tripwires(&agg, &inp2).is_empty(),
             "under-24h ages are not tripwires"
+        );
+    }
+    // ---- Nutrient completeness ---------------------------------------------
+
+    /// A day of DIET metrics lines carrying the nutrient-completeness object: one fully
+    /// complete local turn, one partially complete turn, and one turn whose completion
+    /// block was unusable.
+    const MICRO_LINES: &str = concat!(
+        r#"{"ts":"2026-07-25T08:00:00Z","turn_id":"m1","mode":"tell","route":"diet-local","model":"local-diet","rung":0,"wall_ms":8000,"emergency":false,"diet_micros":{"food_rows":1,"eligible_rows":1,"rows_completed":1,"rows_incomplete":0,"filled":7,"expected":7}}"#,
+        "\n",
+        r#"{"ts":"2026-07-25T09:00:00Z","turn_id":"m2","mode":"tell","route":"diet-local","model":"local-diet","rung":0,"wall_ms":8000,"emergency":false,"diet_micros":{"food_rows":3,"eligible_rows":2,"rows_completed":2,"rows_incomplete":1,"filled":13,"expected":14,"reason":"micros_incomplete"}}"#,
+        "\n",
+        r#"{"ts":"2026-07-25T10:00:00Z","turn_id":"m3","mode":"tell","route":"diet-local","model":"local-diet","rung":0,"wall_ms":8000,"emergency":false,"diet_micros":{"food_rows":1,"eligible_rows":1,"rows_completed":0,"rows_incomplete":1,"filled":0,"expected":7,"reason":"micro_complete_unparseable"}}"#,
+        "\n",
+        r#"{"ts":"2026-07-25T11:00:00Z","turn_id":"m4","mode":"ask","route":"hosted","model":"claude","rung":0,"wall_ms":9000,"emergency":false}"#,
+        "\n",
+    );
+
+    #[test]
+    fn aggregate_sums_nutrient_completeness_and_reason_codes() {
+        let all = parse_metrics_lines(MICRO_LINES);
+        assert_eq!(
+            all.len(),
+            4,
+            "all four lines parse (the object is optional)"
+        );
+        let day = records_for_date(&all, "2026-07-25");
+        let m = aggregate(&day).micros;
+        assert_eq!(m.food_rows, 5, "1 + 3 + 1 food rows");
+        assert_eq!(m.eligible_rows, 4, "the composite row is excluded upstream");
+        assert_eq!(m.rows_completed, 3);
+        assert_eq!(m.rows_incomplete, 2);
+        assert_eq!((m.filled, m.expected), (20, 28));
+        assert_eq!(m.incomplete_rate(), 0.5, "2 of 4 eligible rows");
+        assert!((m.cell_fill_rate() - 20.0 / 28.0).abs() < 1e-9);
+        assert_eq!(m.by_reason.get("micros_incomplete"), Some(&1));
+        assert_eq!(m.by_reason.get("micro_complete_unparseable"), Some(&1));
+        // A hosted turn contributes nothing (no diet_micros object).
+        assert_eq!(m.by_reason.len(), 2);
+    }
+
+    #[test]
+    fn a_day_with_no_diet_turns_reports_empty_completeness() {
+        let all = parse_metrics_lines(FIXTURE);
+        let day = records_for_date(&all, "2026-07-15");
+        let m = aggregate(&day).micros;
+        assert_eq!(m.food_rows, 0);
+        assert_eq!(m.incomplete_rate(), 0.0, "no eligible rows → 0, not NaN");
+        assert_eq!(
+            m.cell_fill_rate(),
+            1.0,
+            "nothing expected → nothing missing"
+        );
+        assert!(m.by_reason.is_empty());
+    }
+
+    #[test]
+    fn incomplete_food_rows_names_the_rows_to_repair_by_hand() {
+        // Row 1: complete (all seven expected columns).            → not listed
+        // Row 2: potassium + calcium blank.                        → listed
+        // Row 3: a ragged legacy row that stops before the tail.    → listed
+        // Row 4: complete but on ANOTHER date.                     → not listed
+        let csv = format!(
+            "{h}\n\
+             2026-07-25,Snack,Banana,1,serving,,,105,1.3,0.4,27,basis,10:40,Snack,3.1,1,0.1,14.4,422,6,,32\n\
+             2026-07-25,Lunch,Soup,1,bowl,,,220,8,6,30,,12:00,Lunch,7,600,1.5,4,,,,20\n\
+             2026-07-25,Breakfast,Eggs,3,ea,,,210,18,15,1,\n\
+             2026-07-24,Snack,Banana,1,serving,,,105,1.3,0.4,27,,10:40,Snack,3.1,1,0.1,14.4,422,6,,32\n",
+            h = dietlog::food_log_header()
+        );
+        let rows = incomplete_food_rows(&csv, "2026-07-25");
+        assert_eq!(rows.len(), 2, "two incomplete rows for the date: {rows:?}");
+        assert_eq!(rows[0].item, "Soup");
+        assert_eq!(rows[0].meal, "Lunch");
+        assert_eq!(rows[0].time, "12:00");
+        assert_eq!(rows[0].missing, vec!["Potassium_mg", "Calcium_mg"]);
+        assert_eq!(rows[1].item, "Eggs");
+        assert_eq!(
+            rows[1].missing,
+            vec![
+                "Fiber_g",
+                "Sodium_mg",
+                "SatFat_g",
+                "Sugar_g",
+                "Potassium_mg",
+                "Calcium_mg",
+                "Magnesium_mg"
+            ],
+            "a short legacy row is missing the whole tail"
+        );
+        // Omega-3 is MarineOnly, so a blank there is never reported as missing.
+        for r in &rows {
+            assert!(!r.missing.contains(&"Omega3_mg"));
+        }
+        // An empty / header-only log yields nothing rather than erroring.
+        assert!(incomplete_food_rows("", "2026-07-25").is_empty());
+        assert!(
+            incomplete_food_rows(&format!("{}\n", dietlog::food_log_header()), "2026-07-25")
+                .is_empty()
         );
     }
 }

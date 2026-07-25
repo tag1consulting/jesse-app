@@ -26,18 +26,21 @@ final class HealthRetryTests: XCTestCase {
             self.answerDirectives = answerDirectives
         }
 
-        func send(mode: JesseMode, text: String, sessionId: String?, voice: Bool,
+        func send(mode: JesseMode, text: String, sessionId: String?,
+                  conversationId: String, voice: Bool,
                   instructions: String?, floorOverride: String?,
-                  attachments: [JesseAttachment]) async throws -> JesseSendResult {
+                  attachments: [JesseAttachment], requestId: UUID,
+                  model: String?) async throws -> JesseSendResult {
             sendCalls += 1
-            return .running(jobId: "job-sentinel")
+            return .running(jobId: "job-sentinel", conversationId: nil)
         }
 
         func sendFulfilling(_ request: NeedsHealthRequest, mode: JesseMode, text: String,
-                            sessionId: String?, voice: Bool, instructions: String?,
-                            floorOverride: String?) async throws -> JesseSendResult {
+                            sessionId: String?, conversationId: String, voice: Bool,
+                            instructions: String?, floorOverride: String?,
+                            model: String?) async throws -> JesseSendResult {
             fulfillCalls.append((request, sessionId))
-            return .running(jobId: "job-answer")
+            return .running(jobId: "job-answer", conversationId: nil)
         }
 
         func result(jobId: String) async throws -> JesseResultState {

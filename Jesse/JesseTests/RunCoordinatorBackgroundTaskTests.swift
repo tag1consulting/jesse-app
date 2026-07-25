@@ -35,10 +35,12 @@ final class RunCoordinatorBackgroundTaskTests: XCTestCase {
     /// which must NOT double-end the grant.
     @MainActor
     private final class DoneClient: JesseClientProtocol {
-        func send(mode: JesseMode, text: String, sessionId: String?, voice: Bool,
+        func send(mode: JesseMode, text: String, sessionId: String?,
+                  conversationId: String, voice: Bool,
                   instructions: String?, floorOverride: String?,
-                  attachments: [JesseAttachment]) async throws -> JesseSendResult {
-            .running(jobId: "job-bg")
+                  attachments: [JesseAttachment], requestId: UUID,
+                  model: String?) async throws -> JesseSendResult {
+            .running(jobId: "job-bg", conversationId: nil)
         }
         func result(jobId: String) async throws -> JesseResultState {
             .done(JesseReply(text: "ok", sessionId: "sess"))

@@ -20,8 +20,9 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 
 use jesse_bridge::{
-    aggregate, parse_metrics_lines, records_for_date, route_key, tripwires,
-    validate_vaultqa_answer, AuditAgg, Config, DietQueue, TripwireInputs, TRIPWIRE_AGE_SECS,
+    aggregate, incomplete_food_rows, parse_metrics_lines, records_for_date, route_key, tripwires,
+    validate_vaultqa_answer, AuditAgg, Config, DietQueue, IncompleteFoodRow, TripwireInputs,
+    TRIPWIRE_AGE_SECS,
 };
 
 /// One joined (question, answer) pair recovered from the serving logs for a turn, so
@@ -133,6 +134,17 @@ fn main() {
 
     // Diet queue state (best-effort): pending/rejected counts + oldest backlog age.
     let cfg = Config::from_env();
+    // Still-incomplete food rows for the day, by ITEM NAME, read (read-only) from the
+    // vault's food-log.csv. The metrics lines carry the COUNTS but are content-free, so
+    // the names — the hand-repair worklist — can only come from the log itself. A
+    // missing/unreadable log simply yields an empty list.
+    let incomplete_rows = std::fs::read_to_string(
+        std::path::Path::new(&cfg.vault)
+            .join("diet-logs")
+            .join("food-log.csv"),
+    )
+    .map(|body| incomplete_food_rows(&body, &date))
+    .unwrap_or_default();
     let queue = DietQueue::from_cfg(&cfg);
     let pending = queue.pending();
     let rejected = queue.rejected();
@@ -215,6 +227,7 @@ fn main() {
         leaks,
         &judge_note,
         join.is_empty(),
+        &incomplete_rows,
     );
     let json = render_json(
         &date,
@@ -226,6 +239,7 @@ fn main() {
         revalidated,
         invented,
         leaks,
+        &incomplete_rows,
     );
 
     // Tripwires first, to stdout.
@@ -277,6 +291,7 @@ fn render_markdown(
     leaks: usize,
     judge_note: &str,
     join_empty: bool,
+    incomplete_rows: &[IncompleteFoodRow],
 ) -> String {
     let mut s = String::new();
     s.push_str(&format!("# Jesse vault-QA audit — {date}\n\n"));
@@ -376,6 +391,64 @@ fn render_markdown(
         agg.diet_identifiable
     ));
 
+    // Nutrient completeness — the reporting half of the micronutrient-completion work.
+    // Counts come from the content-free metrics lines; the item names come from the CSV.
+    let m = &agg.micros;
+    s.push_str("\n## Diet nutrient completeness (local route)\n\n");
+    s.push_str(&format!(
+        "- local-route food rows appended: {}\n",
+        m.food_rows
+    ));
+    s.push_str(&format!(
+        "- rows completion applies to (composites excluded): {}\n",
+        m.eligible_rows
+    ));
+    s.push_str(&format!(
+        "- rows completed by the verifier: {}\n",
+        m.rows_completed
+    ));
+    s.push_str(&format!(
+        "- rows still incomplete: {} ({:.1}% of eligible)\n",
+        m.rows_incomplete,
+        m.incomplete_rate() * 100.0
+    ));
+    s.push_str(&format!(
+        "- expected nutrient cells filled: {} / {} ({:.1}%)\n",
+        m.filled,
+        m.expected,
+        m.cell_fill_rate() * 100.0
+    ));
+    if m.by_reason.is_empty() {
+        s.push_str("- incomplete-turn reasons: none\n");
+    } else {
+        s.push_str("- incomplete-turn reasons:\n");
+        for (reason, n) in &m.by_reason {
+            s.push_str(&format!("  - {reason}: {n}\n"));
+        }
+    }
+    s.push_str(
+        "- **no auto-demotion**: these numbers are reported only. The incomplete rate at \
+which the local route should be demoted is NOT YET SET — like probation, that is a human \
+call against accumulated audit history.\n",
+    );
+    if incomplete_rows.is_empty() {
+        s.push_str("\nNo incomplete food rows in the log for this date.\n");
+    } else {
+        s.push_str(
+            "\nIncomplete rows to repair by hand (every route — the CSV records none, so \
+a hosted-path row can appear here too):\n\n",
+        );
+        for r in incomplete_rows {
+            s.push_str(&format!(
+                "- {} {} — {} — missing: {}\n",
+                r.time,
+                r.meal,
+                r.item,
+                r.missing.join(", ")
+            ));
+        }
+    }
+
     s.push_str("\n## Citation re-validation (read-only, vs vault)\n\n");
     if join_empty {
         s.push_str("- skipped — no serving-log join configured (set JESSE_AUDIT_SERVING_LOG)\n");
@@ -403,6 +476,7 @@ fn render_json(
     revalidated: usize,
     invented: usize,
     leaks: usize,
+    incomplete_rows: &[IncompleteFoodRow],
 ) -> String {
     let v = serde_json::json!({
         "date": date,
@@ -435,6 +509,25 @@ fn render_json(
             "pending_now": pending,
             "rejected": rejected,
             "oldest_pending_age_secs": oldest_pending_age,
+        },
+        "diet_nutrient_completeness": {
+            "food_rows": agg.micros.food_rows,
+            "eligible_rows": agg.micros.eligible_rows,
+            "rows_completed": agg.micros.rows_completed,
+            "rows_incomplete": agg.micros.rows_incomplete,
+            "incomplete_rate": agg.micros.incomplete_rate(),
+            "cells_filled": agg.micros.filled,
+            "cells_expected": agg.micros.expected,
+            "cell_fill_rate": agg.micros.cell_fill_rate(),
+            "by_reason": agg.micros.by_reason,
+            // No auto-demotion: the threshold is not set yet (a human call).
+            "demotion_threshold": serde_json::Value::Null,
+            "incomplete_rows": incomplete_rows.iter().map(|r| serde_json::json!({
+                "time": r.time,
+                "meal": r.meal,
+                "item": r.item,
+                "missing": r.missing,
+            })).collect::<Vec<_>>(),
         },
         "citations": {
             "revalidated": revalidated,

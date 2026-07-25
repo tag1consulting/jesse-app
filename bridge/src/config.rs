@@ -234,6 +234,22 @@ pub struct Config {
     // append path. Independent of `diet_backend`: it tunes the pipeline's verify
     // posture, not whether the pipeline is active.
     pub diet_probation: bool,
+    // Whether the hosted MICRONUTRIENT COMPLETION pass runs on the local diet route
+    // (env `JESSE_DIET_MICRO_COMPLETE`, default TRUE — off is the old, broken
+    // behavior in which a locally-logged row kept three or more knowable nutrient
+    // columns blank). When on, the same hosted verify call that judges macros also
+    // returns food-composition values for the EXPECTED nutrient columns an extracted
+    // row left BLANK, and the bridge merges them blank-only (see
+    // `dietlog::complete_food_micros`).
+    //
+    // WHICH FLAG OWNS WHAT — deliberately DECOUPLED from `diet_probation`:
+    //   * `diet_probation` owns the VERIFY GATE's posture: whether the hosted verdict
+    //     is mandatory and blocking on every entry before anything is appended.
+    //   * `diet_micro_complete` owns NUTRIENT COMPLETION: whether blank expected
+    //     nutrient columns get filled from the hosted call.
+    // So when probation is later lifted and the blocking verify becomes a sampled
+    // audit, completion still runs on EVERY local-route food row.
+    pub diet_micro_complete: bool,
     // Optional local vault-QA backend override: `Some((base_url, auth_token,
     // model))` only when ALL THREE of JESSE_VAULTQA_BASE_URL / JESSE_VAULTQA_AUTH_TOKEN
     // / JESSE_VAULTQA_MODEL are set (see `resolve_vaultqa_backend` — same all-or-
@@ -399,6 +415,17 @@ impl Config {
         self.state_dir
             .as_deref()
             .map(|d| PathBuf::from(d).join("deletions.json"))
+    }
+
+    /// The file the conversation registry is persisted to (a sibling of `titles.json`),
+    /// or `None` when persistence is disabled (then the registry is in-memory only and
+    /// every transcript is re-adopted on restart), the same degradation the job / title /
+    /// device / flag stores have. Holds conversation ids, the Claude session ids bound to
+    /// them, and timestamps: never conversation content and never a secret.
+    pub fn conversations_file(&self) -> Option<PathBuf> {
+        self.state_dir
+            .as_deref()
+            .map(|d| PathBuf::from(d).join("conversations.json"))
     }
 
     /// The file the context ledger is persisted to (a sibling of `titles.json`),
@@ -599,6 +626,22 @@ pub fn expand_tilde(raw: &str, home: &str) -> String {
 /// truthiness rule so operators reason about one convention.
 pub fn resolve_model_badge() -> bool {
     std::env::var("JESSE_MODEL_BADGE")
+        .ok()
+        .map(|v| {
+            let v = v.trim().to_ascii_lowercase();
+            !(v == "0" || v == "false" || v == "no" || v == "off")
+        })
+        .unwrap_or(true)
+}
+
+/// Parse `JESSE_DIET_MICRO_COMPLETE` into the `diet_micro_complete` flag. Default
+/// TRUE: only an explicit `off`/`0`/`false`/`no` disables the hosted micronutrient
+/// completion pass; unset keeps it ON, because OFF is the old behavior that left
+/// knowable nutrient columns blank. Same truthiness rule as `JESSE_DIET_PROBATION`,
+/// and deliberately INDEPENDENT of it: probation owns the verify gate's posture,
+/// this flag owns nutrient completion.
+pub fn resolve_diet_micro_complete() -> bool {
+    std::env::var("JESSE_DIET_MICRO_COMPLETE")
         .ok()
         .map(|v| {
             let v = v.trim().to_ascii_lowercase();
@@ -1516,6 +1559,11 @@ impl Config {
                     !(v == "0" || v == "false" || v == "no" || v == "off")
                 })
                 .unwrap_or(true),
+            // Micronutrient completion defaults to TRUE (same truthiness convention as
+            // probation/badge): OFF is the old behavior that left knowable nutrient
+            // columns blank, so an operator must opt OUT explicitly. Independent of
+            // `diet_probation` by design — see the field docs.
+            diet_micro_complete: resolve_diet_micro_complete(),
             // All-or-nothing local vault-QA backend override, same `env_string`
             // (trimmed, empty-filtered) semantics as every other string field. Partial
             // config logs one warning and resolves to None (see `resolve_vaultqa_backend`).
@@ -1948,6 +1996,57 @@ mod tests {
                 "{truthy:?} must keep probation on"
             );
         }
+
+        for (k, v) in saved {
+            match v {
+                Some(val) => std::env::set_var(k, val),
+                None => std::env::remove_var(k),
+            }
+        }
+    }
+
+    #[test]
+    fn micro_completion_defaults_on_and_is_independent_of_probation() {
+        let _g = ENV_LOCK.lock_ok();
+        let keys = ["JESSE_DIET_MICRO_COMPLETE", "JESSE_DIET_PROBATION"];
+        let saved: Vec<(&str, Option<String>)> =
+            keys.iter().map(|k| (*k, std::env::var(k).ok())).collect();
+        for k in &keys {
+            std::env::remove_var(k);
+        }
+
+        // Unset → ON. OFF is the old behavior that left knowable nutrient columns
+        // blank, so an operator must opt OUT explicitly.
+        assert!(
+            Config::from_env().diet_micro_complete,
+            "completion must default to true"
+        );
+        for falsey in ["0", "false", "no", "off", "OFF", " Off "] {
+            std::env::set_var("JESSE_DIET_MICRO_COMPLETE", falsey);
+            assert!(
+                !Config::from_env().diet_micro_complete,
+                "explicit {falsey:?} must disable completion"
+            );
+        }
+        for truthy in ["1", "true", "yes", "on", "anything-else"] {
+            std::env::set_var("JESSE_DIET_MICRO_COMPLETE", truthy);
+            assert!(
+                Config::from_env().diet_micro_complete,
+                "{truthy:?} keeps it on"
+            );
+        }
+
+        // DECOUPLED from probation, in both directions: graduating off probation must
+        // not silently stop nutrient completion, and disabling completion must not
+        // relax the verify gate.
+        std::env::remove_var("JESSE_DIET_MICRO_COMPLETE");
+        std::env::set_var("JESSE_DIET_PROBATION", "off");
+        let cfg = Config::from_env();
+        assert!(!cfg.diet_probation && cfg.diet_micro_complete);
+        std::env::set_var("JESSE_DIET_PROBATION", "on");
+        std::env::set_var("JESSE_DIET_MICRO_COMPLETE", "off");
+        let cfg = Config::from_env();
+        assert!(cfg.diet_probation && !cfg.diet_micro_complete);
 
         for (k, v) in saved {
             match v {

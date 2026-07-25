@@ -23,13 +23,14 @@ final class RunCoordinatorRecheckTests: XCTestCase {
         var phase: ResultPhase = .failRecoverable
         var onResult: (() -> Void)?
 
-        func send(mode: JesseMode, text: String,
-                  sessionId: String?, voice: Bool,
+        func send(mode: JesseMode, text: String, sessionId: String?,
+                  conversationId: String, voice: Bool,
                   instructions: String?, floorOverride: String?,
-                  attachments: [JesseAttachment]) async throws -> JesseSendResult {
+                  attachments: [JesseAttachment], requestId: UUID,
+                  model: String?) async throws -> JesseSendResult {
             // Always outruns the grace window so the coordinator persists a job
             // and enters the poll loop (where recoverable failures are retained).
-            .running(jobId: "job-recheck")
+            .running(jobId: "job-recheck", conversationId: nil)
         }
 
         func result(jobId: String) async throws -> JesseResultState {
@@ -147,10 +148,12 @@ final class RunCoordinatorRecheckTests: XCTestCase {
     @MainActor
     private final class ExpiringClient: JesseClientProtocol {
         var onResult: (() -> Void)?
-        func send(mode: JesseMode, text: String, sessionId: String?, voice: Bool,
+        func send(mode: JesseMode, text: String, sessionId: String?,
+                  conversationId: String, voice: Bool,
                   instructions: String?, floorOverride: String?,
-                  attachments: [JesseAttachment]) async throws -> JesseSendResult {
-            .running(jobId: "job-gone")
+                  attachments: [JesseAttachment], requestId: UUID,
+                  model: String?) async throws -> JesseSendResult {
+            .running(jobId: "job-gone", conversationId: nil)
         }
         func result(jobId: String) async throws -> JesseResultState {
             onResult?()
