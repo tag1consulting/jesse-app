@@ -20,11 +20,12 @@ final class RunCoordinatorCancelTests: XCTestCase {
         var cancelledJobIds: [String] = []
         var onCancelJob: ((String) -> Void)?
 
-        func send(mode: JesseMode, text: String,
-                  sessionId: String?, voice: Bool,
+        func send(mode: JesseMode, text: String, sessionId: String?,
+                  conversationId: String, voice: Bool,
                   instructions: String?, floorOverride: String?,
-                  attachments: [JesseAttachment]) async throws -> JesseSendResult {
-            .running(jobId: "job-test")
+                  attachments: [JesseAttachment], requestId: UUID,
+                  model: String?) async throws -> JesseSendResult {
+            .running(jobId: "job-test", conversationId: nil)
         }
 
         func result(jobId: String) async throws -> JesseResultState {

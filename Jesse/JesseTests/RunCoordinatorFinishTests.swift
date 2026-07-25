@@ -30,11 +30,13 @@ final class RunCoordinatorFinishTests: XCTestCase {
 
         init(phase: ResultPhase) { self.phase = phase }
 
-        func send(mode: JesseMode, text: String, sessionId: String?, voice: Bool,
+        func send(mode: JesseMode, text: String, sessionId: String?,
+                  conversationId: String, voice: Bool,
                   instructions: String?, floorOverride: String?,
-                  attachments: [JesseAttachment]) async throws -> JesseSendResult {
+                  attachments: [JesseAttachment], requestId: UUID,
+                  model: String?) async throws -> JesseSendResult {
             sendCount += 1
-            return .running(jobId: "job-finish")
+            return .running(jobId: "job-finish", conversationId: nil)
         }
 
         func result(jobId: String) async throws -> JesseResultState {

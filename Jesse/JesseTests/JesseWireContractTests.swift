@@ -24,6 +24,7 @@ final class JesseWireContractTests: XCTestCase {
     /// exactly as the old dictionary built it.
     func testMinimalRequestEncodesToExactBytes() throws {
         let r = JesseClient.makeRequest(mode: .ask, text: "hi", sessionId: nil,
+                                        conversationId: nil,
                                         voice: false, instructions: nil,
                                         floorOverride: nil, attachments: [])
         XCTAssertEqual(try body(r), #"{"mode":"ask","text":"hi"}"#)
@@ -36,6 +37,7 @@ final class JesseWireContractTests: XCTestCase {
         let att = JesseAttachment(filename: "a.png", mime: "image/png",
                                   data: Data([0x01, 0x02, 0x03]))
         let r = JesseClient.makeRequest(mode: .tell, text: "note", sessionId: "sess-1",
+                                        conversationId: nil,
                                         voice: true, instructions: "WRAP",
                                         floorOverride: "FLOOR", attachments: [att])
         let expected = #"{"attachments":[{"data_base64":"AQID","filename":"a.png","mime":"image/png"}],"floor_override":"FLOOR","instructions":"WRAP","mode":"tell","session_id":"sess-1","text":"note","voice":true}"#
@@ -46,6 +48,7 @@ final class JesseWireContractTests: XCTestCase {
     /// the bytes — same as the old conditional insert.
     func testBlankOverridesAndFalseVoiceAreOmittedFromBytes() throws {
         let r = JesseClient.makeRequest(mode: .ask, text: "hi", sessionId: nil,
+                                        conversationId: nil,
                                         voice: false, instructions: "  ",
                                         floorOverride: "\n\t", attachments: [])
         XCTAssertEqual(try body(r), #"{"mode":"ask","text":"hi"}"#)
@@ -55,6 +58,7 @@ final class JesseWireContractTests: XCTestCase {
     /// in sorted position, with the newline escaped — byte-for-byte.
     func testHealthContextEncodesToExactBytes() throws {
         let r = JesseClient.makeRequest(mode: .tell, text: "log my swim", sessionId: nil,
+                                        conversationId: nil,
                                         voice: false, instructions: nil, floorOverride: nil,
                                         attachments: [], healthContext: "Swim 30m\nWalk 45m")
         XCTAssertEqual(try body(r),
@@ -64,10 +68,10 @@ final class JesseWireContractTests: XCTestCase {
     /// A nil or blank `health_context` drops the field — an ordinary turn (feature
     /// off, no data, or an old build) is byte-for-byte unchanged.
     func testNilAndBlankHealthContextOmittedFromBytes() throws {
-        let none = JesseClient.makeRequest(mode: .ask, text: "hi", sessionId: nil, voice: false,
+        let none = JesseClient.makeRequest(mode: .ask, text: "hi", sessionId: nil, conversationId: nil, voice: false,
                                            instructions: nil, floorOverride: nil, attachments: [])
         XCTAssertEqual(try body(none), #"{"mode":"ask","text":"hi"}"#)
-        let blank = JesseClient.makeRequest(mode: .ask, text: "hi", sessionId: nil, voice: false,
+        let blank = JesseClient.makeRequest(mode: .ask, text: "hi", sessionId: nil, conversationId: nil, voice: false,
                                             instructions: nil, floorOverride: nil,
                                             attachments: [], healthContext: "  \n\t")
         XCTAssertEqual(try body(blank), #"{"mode":"ask","text":"hi"}"#)
@@ -78,14 +82,14 @@ final class JesseWireContractTests: XCTestCase {
     /// are true-or-omitted (a false flag would be meaningless to the bridge).
     func testHealthRequestFlagsEncodeToExactBytes() throws {
         let fulfilled = JesseClient.makeRequest(
-            mode: .ask, text: "how am I doing?", sessionId: "s1", voice: false,
+            mode: .ask, text: "how am I doing?", sessionId: "s1", conversationId: nil, voice: false,
             instructions: nil, floorOverride: nil, attachments: [],
             healthContext: "RHR 58", healthContextRequested: true)
         XCTAssertEqual(try body(fulfilled),
             #"{"health_context":"RHR 58","health_context_requested":true,"mode":"ask","session_id":"s1","text":"how am I doing?"}"#)
 
         let unavailable = JesseClient.makeRequest(
-            mode: .ask, text: "how am I doing?", sessionId: "s1", voice: false,
+            mode: .ask, text: "how am I doing?", sessionId: "s1", conversationId: nil, voice: false,
             instructions: nil, floorOverride: nil, attachments: [],
             healthContextUnavailable: true)
         XCTAssertEqual(try body(unavailable),
@@ -94,7 +98,7 @@ final class JesseWireContractTests: XCTestCase {
 
     /// A false/nil flag drops out — an ordinary turn never carries the retry flags.
     func testFalseHealthFlagsOmittedFromBytes() throws {
-        let r = JesseClient.makeRequest(mode: .ask, text: "hi", sessionId: nil, voice: false,
+        let r = JesseClient.makeRequest(mode: .ask, text: "hi", sessionId: nil, conversationId: nil, voice: false,
                                         instructions: nil, floorOverride: nil, attachments: [],
                                         healthContextRequested: false, healthContextUnavailable: false)
         XCTAssertEqual(try body(r), #"{"mode":"ask","text":"hi"}"#)
@@ -103,14 +107,14 @@ final class JesseWireContractTests: XCTestCase {
     /// A positive `meal_corrections_ack` (JESSE_MEAL_LOG v2) encodes to the wire key in
     /// sorted position; a nil/zero ack drops the field (an ordinary turn is unchanged).
     func testMealCorrectionsAckEncodesToExactBytes() throws {
-        let acked = JesseClient.makeRequest(mode: .ask, text: "hi", sessionId: nil, voice: false,
+        let acked = JesseClient.makeRequest(mode: .ask, text: "hi", sessionId: nil, conversationId: nil, voice: false,
                                             instructions: nil, floorOverride: nil, attachments: [],
                                             mealCorrectionsAck: 42)
         XCTAssertEqual(try body(acked),
             #"{"meal_corrections_ack":42,"mode":"ask","text":"hi"}"#)
 
         for absent in [nil, 0] as [Int?] {
-            let r = JesseClient.makeRequest(mode: .ask, text: "hi", sessionId: nil, voice: false,
+            let r = JesseClient.makeRequest(mode: .ask, text: "hi", sessionId: nil, conversationId: nil, voice: false,
                                             instructions: nil, floorOverride: nil, attachments: [],
                                             mealCorrectionsAck: absent)
             XCTAssertEqual(try body(r), #"{"mode":"ask","text":"hi"}"#,
@@ -122,7 +126,7 @@ final class JesseWireContractTests: XCTestCase {
     /// UUID's string form), in sorted position — byte-for-byte.
     func testRequestIdEncodesToExactBytes() throws {
         let id = UUID(uuidString: "E621E1F8-C36C-495A-93FC-0C247A3E6E5F")!
-        let r = JesseClient.makeRequest(mode: .ask, text: "hi", sessionId: nil, voice: false,
+        let r = JesseClient.makeRequest(mode: .ask, text: "hi", sessionId: nil, conversationId: nil, voice: false,
                                         instructions: nil, floorOverride: nil, attachments: [],
                                         requestId: id)
         XCTAssertEqual(try body(r),
@@ -132,7 +136,7 @@ final class JesseWireContractTests: XCTestCase {
     /// A nil `requestId` drops the field — every non-outbox call (watch relay,
     /// health-context retry) is byte-for-byte unchanged.
     func testNilRequestIdOmittedFromBytes() throws {
-        let r = JesseClient.makeRequest(mode: .ask, text: "hi", sessionId: nil, voice: false,
+        let r = JesseClient.makeRequest(mode: .ask, text: "hi", sessionId: nil, conversationId: nil, voice: false,
                                         instructions: nil, floorOverride: nil, attachments: [],
                                         requestId: nil)
         XCTAssertEqual(try body(r), #"{"mode":"ask","text":"hi"}"#)
@@ -140,7 +144,7 @@ final class JesseWireContractTests: XCTestCase {
 
     /// The per-turn `model` selection encodes the bridge's `model` key in sorted position.
     func testModelEncodesToExactBytes() throws {
-        let r = JesseClient.makeRequest(mode: .ask, text: "hi", sessionId: nil, voice: false,
+        let r = JesseClient.makeRequest(mode: .ask, text: "hi", sessionId: nil, conversationId: nil, voice: false,
                                         instructions: nil, floorOverride: nil, attachments: [],
                                         requestId: nil, model: "glm-5.2")
         // `.sortedKeys` orders the keys: "mode" < "model" (a prefix) < "text".
@@ -150,11 +154,11 @@ final class JesseWireContractTests: XCTestCase {
     /// A nil or blank `model` drops the field — a thread with no selection (and no device
     /// default) sends byte-for-byte today's request, so the bridge uses its stored default.
     func testNilAndBlankModelOmittedFromBytes() throws {
-        let none = JesseClient.makeRequest(mode: .ask, text: "hi", sessionId: nil, voice: false,
+        let none = JesseClient.makeRequest(mode: .ask, text: "hi", sessionId: nil, conversationId: nil, voice: false,
                                            instructions: nil, floorOverride: nil, attachments: [],
                                            requestId: nil, model: nil)
         XCTAssertEqual(try body(none), #"{"mode":"ask","text":"hi"}"#)
-        let blank = JesseClient.makeRequest(mode: .ask, text: "hi", sessionId: nil, voice: false,
+        let blank = JesseClient.makeRequest(mode: .ask, text: "hi", sessionId: nil, conversationId: nil, voice: false,
                                             instructions: nil, floorOverride: nil, attachments: [],
                                             requestId: nil, model: "   ")
         XCTAssertEqual(try body(blank), #"{"mode":"ask","text":"hi"}"#)
@@ -165,10 +169,13 @@ final class JesseWireContractTests: XCTestCase {
     /// the response shape changed).
     func testResponseDecodingUnchangedWithRequestId() throws {
         let json = Data(#"{"job_id":"job-idem","status":"running"}"#.utf8)
-        guard case .running(let id) = try JesseClient.decodeSend(data: json, resp: http(202)) else {
+        guard case .running(let id, let conversationId) =
+                try JesseClient.decodeSend(data: json, resp: http(202)) else {
             return XCTFail("expected .running")
         }
         XCTAssertEqual(id, "job-idem")
+        XCTAssertNil(conversationId,
+                     "a bridge that omits conversation_id decodes cleanly to nil, so the local id stands")
     }
 
     // MARK: - directives decode (poll result)
@@ -214,20 +221,53 @@ final class JesseWireContractTests: XCTestCase {
 
     func testDecodeSend202ReturnsRunningJobId() throws {
         let json = Data(#"{"job_id":"job-1","status":"running"}"#.utf8)
-        guard case .running(let id) = try JesseClient.decodeSend(data: json, resp: http(202)) else {
+        guard case .running(let id, _) = try JesseClient.decodeSend(data: json, resp: http(202)) else {
             return XCTFail("expected .running")
         }
         XCTAssertEqual(id, "job-1")
     }
 
+    /// The 202 carries the AUTHORITATIVE conversation the bridge registered, which is what
+    /// closes the window where the server knew a thread identifier the client did not.
+    func testDecodeSend202CarriesTheRegisteredConversationId() throws {
+        let json = Data(#"{"job_id":"job-1","conversation_id":"0f8c2b1e-9a4d-4c77-b2e1-6d5a0c3f9b84","status":"running"}"#.utf8)
+        guard case .running(let id, let conversationId) =
+                try JesseClient.decodeSend(data: json, resp: http(202)) else {
+            return XCTFail("expected .running")
+        }
+        XCTAssertEqual(id, "job-1")
+        XCTAssertEqual(conversationId, "0f8c2b1e-9a4d-4c77-b2e1-6d5a0c3f9b84")
+    }
+
     func testDecodeSend200ReturnsReplyWithSessionAndJobId() throws {
-        let json = Data(#"{"response":"hello","session_id":"s","job_id":"j"}"#.utf8)
-        guard case .reply(let reply, let jobId) = try JesseClient.decodeSend(data: json, resp: http(200)) else {
+        let json = Data(#"{"response":"hello","session_id":"s","job_id":"j","conversation_id":"0f8c2b1e-9a4d-4c77-b2e1-6d5a0c3f9b84"}"#.utf8)
+        guard case .reply(let reply, let jobId, let conversationId) =
+                try JesseClient.decodeSend(data: json, resp: http(200)) else {
             return XCTFail("expected .reply")
         }
         XCTAssertEqual(reply.text, "hello")
         XCTAssertEqual(reply.sessionId, "s")
         XCTAssertEqual(jobId, "j")
+        XCTAssertEqual(conversationId, "0f8c2b1e-9a4d-4c77-b2e1-6d5a0c3f9b84")
+    }
+
+    /// `conversation_id` rides the request body on EVERY turn.
+    func testRequestCarriesTheConversationId() throws {
+        let req = JesseClient.makeRequest(
+            mode: .ask, text: "hi", sessionId: nil,
+            conversationId: "0f8c2b1e-9a4d-4c77-b2e1-6d5a0c3f9b84", voice: false,
+            instructions: nil, floorOverride: nil, attachments: [])
+        let obj = try XCTUnwrap(JSONSerialization.jsonObject(
+            with: try JesseClient.encodeBody(req)) as? [String: Any])
+        XCTAssertEqual(obj["conversation_id"] as? String, "0f8c2b1e-9a4d-4c77-b2e1-6d5a0c3f9b84")
+        // A blank id omits the key, which is the OLDER-client shape (the bridge then mints
+        // one), never what a current caller should produce.
+        let blank = JesseClient.makeRequest(
+            mode: .ask, text: "hi", sessionId: nil, conversationId: "  ", voice: false,
+            instructions: nil, floorOverride: nil, attachments: [])
+        let blankObj = try XCTUnwrap(JSONSerialization.jsonObject(
+            with: try JesseClient.encodeBody(blank)) as? [String: Any])
+        XCTAssertNil(blankObj["conversation_id"])
     }
 
     func testDecodeSend202WithoutJobIdThrows() {

@@ -417,6 +417,17 @@ impl Config {
             .map(|d| PathBuf::from(d).join("deletions.json"))
     }
 
+    /// The file the conversation registry is persisted to (a sibling of `titles.json`),
+    /// or `None` when persistence is disabled (then the registry is in-memory only and
+    /// every transcript is re-adopted on restart), the same degradation the job / title /
+    /// device / flag stores have. Holds conversation ids, the Claude session ids bound to
+    /// them, and timestamps: never conversation content and never a secret.
+    pub fn conversations_file(&self) -> Option<PathBuf> {
+        self.state_dir
+            .as_deref()
+            .map(|d| PathBuf::from(d).join("conversations.json"))
+    }
+
     /// The file the context ledger is persisted to (a sibling of `titles.json`),
     /// or `None` when persistence is disabled — then the ledger is in-memory only,
     /// the same degradation the job/title/device stores have. Holds conversation

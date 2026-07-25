@@ -128,8 +128,31 @@ struct MacRootView: View {
             if storeError != nil { MacStoreErrorBanner() }
         }
         .task {
+            // Prune abandoned ⌘N threads BEFORE syncing, so an empty stub never reaches the
+            // merge or the list. `newChat` inserts AND SAVES immediately (the Mac has no
+            // deferred-insert path), so an unused new chat is a persisted empty row, and they
+            // accumulate and read exactly like duplicates. The phone already prunes on its
+            // list appear; this is the Mac's half.
+            pruneEmptyThreads()
             await coordinator.refreshSessions(context: context)
         }
+    }
+
+    /// Delete never-used empty threads: no turns, never sent (no session), and not the one
+    /// currently running. Deliberately narrow, so it can never take a thread whose turn is in
+    /// flight or one that holds any history.
+    private func pruneEmptyThreads() {
+        var pruned = 0
+        for t in threads where t.turns.isEmpty
+            && (t.sessionId ?? "").isEmpty
+            && t.registeredAt == nil
+            && !(coordinator.isRunning && coordinator.activeThreadID == t.id) {
+            if selection == t.id { selection = nil }
+            if let cid = t.conversationId, !cid.isEmpty { MacCursorStore.clear(cid) }
+            context.delete(t)
+            pruned += 1
+        }
+        if pruned > 0 { try? context.save() }
     }
 
     private var sidebar: some View {
@@ -349,13 +372,13 @@ struct MacRootView: View {
 
     private func delete(_ thread: JesseThread) {
         if selection == thread.id { selection = nil }
-        // If the thread had a bridge session, durably enqueue its remote deletion BEFORE
-        // the local delete reads it: the local delete stays instant; the remote reclaim
-        // (and the cross-device tombstone that converges the delete to the phone) is
-        // best-effort and retried on the next sessions pull if the Studio is asleep now.
-        if let sid = thread.sessionId, !sid.isEmpty {
-            coordinator.enqueueSessionDeletion(sid)
-            MacCursorStore.clear(sid)
+        // Durably enqueue the CONVERSATION's remote deletion BEFORE the local delete reads
+        // it: the local delete stays instant; reclaiming every remote transcript bound to the
+        // conversation (and the cross-device tombstone that converges the delete to the phone)
+        // is best-effort and retried on the next list pull if the Studio is asleep now.
+        if let cid = thread.conversationId, !cid.isEmpty {
+            coordinator.enqueueSessionDeletion(cid)
+            MacCursorStore.clear(cid)
         }
         context.delete(thread)
         try? context.save()

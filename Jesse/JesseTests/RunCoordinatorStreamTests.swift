@@ -26,11 +26,13 @@ final class RunCoordinatorStreamTests: XCTestCase {
         private(set) var pollCalls = 0
         private var continuation: AsyncThrowingStream<JesseStreamEvent, Error>.Continuation?
 
-        func send(mode: JesseMode, text: String, sessionId: String?, voice: Bool,
+        func send(mode: JesseMode, text: String, sessionId: String?,
+                  conversationId: String, voice: Bool,
                   instructions: String?, floorOverride: String?,
-                  attachments: [JesseAttachment]) async throws -> JesseSendResult {
+                  attachments: [JesseAttachment], requestId: UUID,
+                  model: String?) async throws -> JesseSendResult {
             // Always outrun the grace window so the coordinator streams.
-            .running(jobId: "job-stream")
+            .running(jobId: "job-stream", conversationId: nil)
         }
 
         func result(jobId: String) async throws -> JesseResultState {

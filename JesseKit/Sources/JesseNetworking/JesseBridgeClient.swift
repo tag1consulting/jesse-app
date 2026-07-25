@@ -21,40 +21,29 @@ import JesseCore
 public protocol BridgeClientProtocol: FlagSyncing, Sendable {
     var config: JesseConfig { get }
     func sendPrepared(_ request: JesseRequest) async throws -> JesseSendResult
-    func send(mode: JesseMode, text: String, sessionId: String?, voice: Bool,
-              instructions: String?, floorOverride: String?,
-              attachments: [JesseRequest.Attachment], requestId: String?) async throws -> JesseSendResult
-    /// Send carrying the PER-TURN `model` selection (retire the global switch). Additive: a
-    /// default implementation forwards to the no-model `send`, so existing conformers (the Mac
-    /// test fakes) need not implement it; the production client overrides it to pass `model`.
-    func send(mode: JesseMode, text: String, sessionId: String?, voice: Bool,
-              instructions: String?, floorOverride: String?,
-              attachments: [JesseRequest.Attachment], requestId: String?,
+    /// Send a turn. `requestId` (the bridge's idempotency key) and `conversationId` (the
+    /// thread identity) are BOTH required rather than defaulted: a caller that omitted the
+    /// request id disabled the bridge's own dedup for exactly the traffic that needs it, and
+    /// a caller that omitted the conversation id made the bridge mint one the client would
+    /// then not recognize. There is deliberately no overload that lets either be dropped.
+    func send(mode: JesseMode, text: String, sessionId: String?, conversationId: String,
+              voice: Bool, instructions: String?, floorOverride: String?,
+              attachments: [JesseRequest.Attachment], requestId: String,
               model: String?) async throws -> JesseSendResult
     func result(jobId: String) async throws -> JesseResultState
     func stream(jobId: String) -> AsyncThrowingStream<JesseStreamEvent, Error>
-    func listSessions(since: UInt64?, etag: String?) async throws -> SessionsResult
-    func hydrate(sessionId: String, after: UInt64) async throws -> (turns: [HydratedTurn], nextOffset: UInt64)
-    func title(text: String, sessionId: String?) async -> String?
+    func listConversations(since: UInt64?, etag: String?) async throws -> ConversationsResult
+    /// Hydrate a conversation's history across every transcript bound to it. `after` is the
+    /// bridge's OPAQUE cursor (nil for the whole history); the returned `nextCursor` is
+    /// echoed back next time.
+    func hydrate(conversationId: String, after cursor: String?) async throws
+        -> (turns: [HydratedTurn], nextCursor: String)
+    func title(text: String, conversationId: String?) async -> String?
     func cancelJob(jobId: String) async throws
-    func deleteSession(_ sessionId: String) async throws
+    func deleteConversation(_ conversationId: String) async throws
     func health() async throws -> BridgeHealth
     func fetchDietSnapshot(date: String?) async throws -> DietSnapshot
     func fetchPrompts() async throws -> PromptDefaults
-}
-
-public extension BridgeClientProtocol {
-    /// Default for conformers that predate the per-turn model field (the Mac test fakes):
-    /// forward to the no-model `send`, dropping `model`. The production `JesseBridgeClient`
-    /// overrides this to actually carry the selection.
-    func send(mode: JesseMode, text: String, sessionId: String?, voice: Bool,
-              instructions: String?, floorOverride: String?,
-              attachments: [JesseRequest.Attachment], requestId: String?,
-              model: String?) async throws -> JesseSendResult {
-        try await send(mode: mode, text: text, sessionId: sessionId, voice: voice,
-                       instructions: instructions, floorOverride: floorOverride,
-                       attachments: attachments, requestId: requestId)
-    }
 }
 
 public struct JesseBridgeClient: BridgeClientProtocol {
@@ -130,25 +119,17 @@ public struct JesseBridgeClient: BridgeClientProtocol {
     /// Send a health-free turn. The bridge treats an omitted `health_context` as an
     /// ordinary turn, so this is exactly what the Mac uses; the iOS layer builds a
     /// health-laden `JesseRequest` and calls `sendPrepared`.
-    public func send(mode: JesseMode, text: String, sessionId: String? = nil,
-                     voice: Bool = false, instructions: String? = nil,
-                     floorOverride: String? = nil,
-                     attachments: [JesseRequest.Attachment] = [],
-                     requestId: String? = nil) async throws -> JesseSendResult {
-        try await send(mode: mode, text: text, sessionId: sessionId, voice: voice,
-                       instructions: instructions, floorOverride: floorOverride,
-                       attachments: attachments, requestId: requestId, model: nil)
-    }
-
-    /// Send a turn naming the PER-TURN `model` (retire the global switch). `model` is
-    /// non-defaulted so it never collides with the no-model overload above; a nil/blank value
-    /// omits the field, so the bridge uses its stored default. The Mac send path calls this.
-    public func send(mode: JesseMode, text: String, sessionId: String?,
-                     voice: Bool, instructions: String?,
-                     floorOverride: String?,
+    ///
+    /// `conversationId` and `requestId` are required, with no overload that drops them: the
+    /// conversation is the thread identity the 202 echoes back, and the request id is the
+    /// bridge's idempotency key. A nil/blank `model` omits that field, so the bridge uses
+    /// its stored default.
+    public func send(mode: JesseMode, text: String, sessionId: String?, conversationId: String,
+                     voice: Bool, instructions: String?, floorOverride: String?,
                      attachments: [JesseRequest.Attachment],
-                     requestId: String?, model: String?) async throws -> JesseSendResult {
+                     requestId: String, model: String?) async throws -> JesseSendResult {
         let request = Self.makeRequest(mode: mode, text: text, sessionId: sessionId,
+                                       conversationId: conversationId,
                                        voice: voice, instructions: instructions,
                                        floorOverride: floorOverride, attachments: attachments,
                                        requestId: requestId, model: model)
@@ -214,23 +195,24 @@ public struct JesseBridgeClient: BridgeClientProtocol {
         try await idempotentCall("/jesse/cancel/\(jobId)", method: "POST")
     }
 
-    /// Delete a thread's remote Claude Code session (`DELETE /jesse/session/{id}`).
-    /// Idempotent-404 like `cancelJob`: a missing session is a success.
-    public func deleteSession(_ sessionId: String) async throws {
-        try await idempotentCall("/jesse/session/\(sessionId)", method: "DELETE")
+    /// Delete a thread's remote conversation, every transcript bound to it
+    /// (`DELETE /jesse/conversation/{id}`). Idempotent-404 like `cancelJob`: a conversation
+    /// the bridge no longer knows is a success.
+    public func deleteConversation(_ conversationId: String) async throws {
+        try await idempotentCall("/jesse/conversation/\(conversationId)", method: "DELETE")
     }
 
     // MARK: - Flags
 
-    /// Push a favorite/archive change up (`POST /jesse/session/{id}/flags`), sending ONLY
-    /// the flag(s) that changed with their unix-millis clocks so the bridge applies each
+    /// Push a favorite/archive change up (`POST /jesse/conversation/{id}/flags`), sending
+    /// ONLY the flag(s) that changed with their unix-millis clocks so the bridge applies each
     /// last-writer-wins. Best-effort: a 2xx (the bridge echoes the resulting flags) and a
-    /// 404 (an unknown id, or a pre-0.25.0 bridge with no such route) both count as
-    /// success, so degrading against an older bridge is a clean no-op. Only a genuine
-    /// transport/auth/5xx failure throws, and the caller (`FlagReconciler`) swallows even
-    /// that, because the local clock stays newer and the next reconcile re-pushes.
-    public func setFlags(sessionId: String, favorite: FlagWrite?, archived: FlagWrite?) async throws {
-        guard var req = authorized("/jesse/session/\(sessionId)/flags", method: "POST") else {
+    /// 404 (a conversation the bridge does not know, or a bridge with no such route) both
+    /// count as success, so degrading against an older bridge is a clean no-op. Only a
+    /// genuine transport/auth/5xx failure throws, and the caller (`FlagReconciler`) swallows
+    /// even that, because the local clock stays newer and the next reconcile re-pushes.
+    public func setFlags(conversationId: String, favorite: FlagWrite?, archived: FlagWrite?) async throws {
+        guard var req = authorized("/jesse/conversation/\(conversationId)/flags", method: "POST") else {
             throw JesseError.notConfigured
         }
         let body = JesseFlagsRequest(
@@ -363,11 +345,12 @@ public struct JesseBridgeClient: BridgeClientProtocol {
 
     // MARK: - Sessions list
 
-    /// `GET /jesse/sessions`. `since` narrows to sessions modified after that unix
-    /// second; `etag` is the caller's last ETag (a 304 → `.notModified`).
-    public func listSessions(since: UInt64? = nil, etag: String? = nil) async throws -> SessionsResult {
+    /// `GET /jesse/conversations`. `since` narrows to conversations touched after that unix
+    /// second; `etag` is the caller's last ETag (a 304 becomes `.notModified`).
+    public func listConversations(since: UInt64? = nil, etag: String? = nil) async throws
+        -> ConversationsResult {
         guard !config.normalizedHost.isEmpty, !config.token.isEmpty,
-              let base = config.endpoint("/jesse/sessions") else { throw JesseError.notConfigured }
+              let base = config.endpoint("/jesse/conversations") else { throw JesseError.notConfigured }
         let url: URL
         if let since {
             guard var comps = URLComponents(url: base, resolvingAgainstBaseURL: false) else {
@@ -396,29 +379,31 @@ public struct JesseBridgeClient: BridgeClientProtocol {
             throw JesseError.badResponse(http.statusCode, String(data: data, encoding: .utf8) ?? "")
         }
         let newETag = http.value(forHTTPHeaderField: "Etag")
-        guard let body = try? JSONDecoder().decode(JesseSessionsBody.self, from: data) else {
+        guard let body = try? JSONDecoder().decode(JesseConversationsBody.self, from: data) else {
             throw JesseError.decoding
         }
-        return .sessions(body.sessions, deleted: body.deleted, etag: newETag)
+        return .conversations(body.conversations, deleted: body.deleted, etag: newETag)
     }
 
     // MARK: - Hydrate
 
-    /// `GET /jesse/sessions/{id}`. `after` returns only the byte-delta appended since;
-    /// returns the ordered turns and the `nextOffset` for the next round trip. A 404
-    /// (unknown id / title-mint transcript) surfaces as `JesseError.badResponse(404, …)`.
-    public func hydrate(sessionId: String, after: UInt64 = 0) async throws
-        -> (turns: [HydratedTurn], nextOffset: UInt64) {
+    /// `GET /jesse/conversations/{id}/transcript`. `after` is the bridge's OPAQUE cursor
+    /// (nil/empty for the whole history); returns the ordered turns appended since and the
+    /// `nextCursor` to echo back next time. A 404 (a conversation the bridge does not know)
+    /// surfaces as `JesseError.badResponse(404, …)`, which callers treat as "leave the
+    /// cached copy alone".
+    public func hydrate(conversationId: String, after cursor: String? = nil) async throws
+        -> (turns: [HydratedTurn], nextCursor: String) {
         guard !config.normalizedHost.isEmpty, !config.token.isEmpty,
-              let base = config.endpoint("/jesse/sessions/\(sessionId)") else {
+              let base = config.endpoint("/jesse/conversations/\(conversationId)/transcript") else {
             throw JesseError.notConfigured
         }
         let url: URL
-        if after > 0 {
+        if let cursor, !cursor.isEmpty {
             guard var comps = URLComponents(url: base, resolvingAgainstBaseURL: false) else {
                 throw JesseError.notConfigured
             }
-            comps.queryItems = [URLQueryItem(name: "after", value: String(after))]
+            comps.queryItems = [URLQueryItem(name: "after", value: cursor)]
             guard let u = comps.url else { throw JesseError.notConfigured }
             url = u
         } else {
@@ -438,22 +423,23 @@ public struct JesseBridgeClient: BridgeClientProtocol {
         guard (200..<300).contains(http.statusCode) else {
             throw JesseError.badResponse(http.statusCode, String(data: data, encoding: .utf8) ?? "")
         }
-        guard let body = try? JSONDecoder().decode(JesseHydrateBody.self, from: data) else {
+        guard let body = try? JSONDecoder().decode(JesseConversationHydrateBody.self, from: data) else {
             throw JesseError.decoding
         }
-        return (body.turns, body.nextOffset)
+        return (body.turns, body.nextCursor)
     }
 
     // MARK: - Title
 
-    /// Mint a short conversation title (`POST /jesse/title`). Passing `sessionId`
-    /// persists it in the server's authoritative title store. Deliberately *total*:
-    /// EVERY failure mode collapses to `nil`, so a caller on the list path can fire it
-    /// without a `try` and the row simply keeps its derived title.
-    public func title(text: String, sessionId: String? = nil) async -> String? {
+    /// Mint a short conversation title (`POST /jesse/title`). Passing `conversationId`
+    /// persists it in the server's authoritative (conversation-keyed) title store.
+    /// Deliberately *total*: EVERY failure mode collapses to `nil`, so a caller on the list
+    /// path can fire it without a `try` and the row simply keeps its derived title.
+    public func title(text: String, conversationId: String? = nil) async -> String? {
         guard !config.normalizedHost.isEmpty, !config.token.isEmpty,
               let url = config.endpoint("/jesse/title"),
-              let body = try? Self.encodeBody(JesseTitleRequest(digest: text, sessionId: sessionId)) else {
+              let body = try? Self.encodeBody(
+                JesseTitleRequest(digest: text, conversationId: conversationId)) else {
             return nil
         }
         var req = URLRequest(url: url)
@@ -569,6 +555,7 @@ public struct JesseBridgeClient: BridgeClientProtocol {
     /// field that drops out of the encoded body: `voice == false`, a blank
     /// `instructions`/`floorOverride`, and an empty `attachments` all become nil.
     public static func makeRequest(mode: JesseMode, text: String, sessionId: String?,
+                                   conversationId: String?,
                                    voice: Bool, instructions: String?,
                                    floorOverride: String?,
                                    attachments: [JesseRequest.Attachment],
@@ -586,6 +573,9 @@ public struct JesseBridgeClient: BridgeClientProtocol {
             mode: mode.rawValue,
             text: text,
             sessionId: sessionId,
+            // The thread identity. Blank collapses to nil, which makes the bridge mint one:
+            // that is the older-client shape, never what a current caller should produce.
+            conversationId: nonBlank(conversationId),
             voice: voice ? true : nil,
             instructions: nonBlank(instructions),
             floorOverride: nonBlank(floorOverride),
@@ -601,7 +591,7 @@ public struct JesseBridgeClient: BridgeClientProtocol {
             // The outbox idempotency key; nil drops the field.
             requestId: requestId,
             // The per-turn model selection; blank collapses to nil so the field drops out
-            // (the bridge then uses its stored default — today's behavior).
+            // (the bridge then uses its stored default, today's behavior).
             model: nonBlank(model))
     }
 
@@ -621,14 +611,15 @@ public struct JesseBridgeClient: BridgeClientProtocol {
         if http.statusCode == 202 {
             guard let obj = try? JSONDecoder().decode(JesseSendResponse.self, from: data),
                   let jobId = obj.jobId else { throw JesseError.decoding }
-            return .running(jobId: jobId)
+            return .running(jobId: jobId, conversationId: obj.conversationId)
         }
         guard (200..<300).contains(http.statusCode) else {
             throw JesseError.badResponse(http.statusCode, String(data: data, encoding: .utf8) ?? "")
         }
         guard let obj = try? JSONDecoder().decode(JesseSendResponse.self, from: data),
               let reply = obj.response else { throw JesseError.decoding }
-        return .reply(JesseReply(text: reply, sessionId: obj.sessionId), jobId: obj.jobId)
+        return .reply(JesseReply(text: reply, sessionId: obj.sessionId), jobId: obj.jobId,
+                      conversationId: obj.conversationId)
     }
 
     public static func decodeResult(data: Data, resp: URLResponse) throws -> JesseResultState {

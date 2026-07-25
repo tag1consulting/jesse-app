@@ -16,40 +16,43 @@ final class MacFlagSyncTests: XCTestCase {
     /// two flag-sync methods do real work; the rest are inert stubs the sync path never
     /// calls.
     private final class FakeBridgeClient: BridgeClientProtocol, @unchecked Sendable {
-        struct Call: Equatable { let sessionId: String; let favorite: FlagWrite?; let archived: FlagWrite? }
+        struct Call: Equatable { let conversationId: String; let favorite: FlagWrite?; let archived: FlagWrite? }
         private let lock = NSLock()
         private var _calls: [Call] = []
         var calls: [Call] { lock.withLock { _calls } }
 
-        let scriptedSessions: SessionsResult
-        nonisolated init(sessions: SessionsResult = .notModified) { self.scriptedSessions = sessions }
+        let scriptedConversations: ConversationsResult
+        nonisolated init(conversations: ConversationsResult = .notModified) { self.scriptedConversations = conversations }
 
         nonisolated var config: JesseConfig { JesseConfig(host: "studio", port: 8765, token: "tok") }
 
-        nonisolated func listSessions(since: UInt64?, etag: String?) async throws -> SessionsResult {
-            scriptedSessions
+        nonisolated func listConversations(since: UInt64?, etag: String?) async throws -> ConversationsResult {
+            scriptedConversations
         }
-        nonisolated func setFlags(sessionId: String, favorite: FlagWrite?, archived: FlagWrite?) async throws {
-            lock.withLock { _calls.append(Call(sessionId: sessionId, favorite: favorite, archived: archived)) }
+        nonisolated func setFlags(conversationId: String, favorite: FlagWrite?, archived: FlagWrite?) async throws {
+            lock.withLock { _calls.append(Call(conversationId: conversationId, favorite: favorite, archived: archived)) }
         }
 
         // Inert turn-running / hydrate surface — never exercised by the flag-sync path.
         nonisolated func sendPrepared(_ request: JesseRequest) async throws -> JesseSendResult { throw JesseError.notConfigured }
-        nonisolated func send(mode: JesseMode, text: String, sessionId: String?, voice: Bool,
+        nonisolated func send(mode: JesseMode, text: String, sessionId: String?,
+                              conversationId: String, voice: Bool,
                               instructions: String?, floorOverride: String?,
-                              attachments: [JesseRequest.Attachment], requestId: String?) async throws -> JesseSendResult {
+                              attachments: [JesseRequest.Attachment], requestId: String,
+                              model: String?) async throws -> JesseSendResult {
             throw JesseError.notConfigured
         }
         nonisolated func result(jobId: String) async throws -> JesseResultState { throw JesseError.notConfigured }
         nonisolated func stream(jobId: String) -> AsyncThrowingStream<JesseStreamEvent, Error> {
             AsyncThrowingStream { $0.finish() }
         }
-        nonisolated func hydrate(sessionId: String, after: UInt64) async throws -> (turns: [HydratedTurn], nextOffset: UInt64) {
+        nonisolated func hydrate(conversationId: String, after cursor: String?) async throws
+            -> (turns: [HydratedTurn], nextCursor: String) {
             throw JesseError.notConfigured
         }
-        nonisolated func title(text: String, sessionId: String?) async -> String? { nil }
+        nonisolated func title(text: String, conversationId: String?) async -> String? { nil }
         nonisolated func cancelJob(jobId: String) async throws {}
-        nonisolated func deleteSession(_ sessionId: String) async throws {}
+        nonisolated func deleteConversation(_ conversationId: String) async throws {}
         nonisolated func health() async throws -> BridgeHealth { BridgeHealth(version: nil) }
         nonisolated func fetchDietSnapshot(date: String?) async throws -> DietSnapshot { throw DietFetchError.notConfigured }
         nonisolated func fetchPrompts() async throws -> PromptDefaults { throw JesseError.notConfigured }
@@ -70,8 +73,9 @@ final class MacFlagSyncTests: XCTestCase {
     }
 
     private func summary(_ id: String, favorite: Bool = false, favoriteMs: UInt64 = 0,
-                         archived: Bool = false, archivedMs: UInt64 = 0) -> SessionSummary {
-        SessionSummary(sessionId: id, lastModified: 1_700_000_000, firstMessage: "hi", title: nil,
+                         archived: Bool = false, archivedMs: UInt64 = 0) -> ConversationSummary {
+        ConversationSummary(conversationId: id, sessionId: "sess-\(id)", sessionIds: ["sess-\(id)"],
+                            lastModified: 1_700_000_000, firstMessage: "hi", title: nil,
                        favorite: favorite, favoriteUpdatedMs: favoriteMs,
                        archived: archived, archivedUpdatedMs: archivedMs)
     }
@@ -90,12 +94,13 @@ final class MacFlagSyncTests: XCTestCase {
     func testRefreshAdoptsNewerServerFavorite() async throws {
         let context = try makeContext()
         let thread = JesseThread(mode: .ask)
-        thread.sessionId = "s1"
+        thread.conversationId = "s1"
+        thread.sessionId = "sess-s1"
         thread.setFavorite(false, now: Date(timeIntervalSince1970: 0.1))    // local clock ms 100
         context.insert(thread)
         try context.save()
 
-        let fake = FakeBridgeClient(sessions: .sessions([summary("s1", favorite: true, favoriteMs: 200)], deleted: [], etag: "e1"))
+        let fake = FakeBridgeClient(conversations: .conversations([summary("s1", favorite: true, favoriteMs: 200)], deleted: [], etag: "e1"))
         let coordinator = makeCoordinator(fake)
         await coordinator.refreshSessions(context: context)
 
@@ -107,12 +112,13 @@ final class MacFlagSyncTests: XCTestCase {
     func testRefreshPushesNewerLocalArchived() async throws {
         let context = try makeContext()
         let thread = JesseThread(mode: .ask)
-        thread.sessionId = "s1"
+        thread.conversationId = "s1"
+        thread.sessionId = "sess-s1"
         thread.setArchived(true, now: Date(timeIntervalSince1970: 0.6))     // local clock ms 600
         context.insert(thread)
         try context.save()
 
-        let fake = FakeBridgeClient(sessions: .sessions([summary("s1", archived: false, archivedMs: 200)], deleted: [], etag: "e1"))
+        let fake = FakeBridgeClient(conversations: .conversations([summary("s1", archived: false, archivedMs: 200)], deleted: [], etag: "e1"))
         let coordinator = makeCoordinator(fake)
         await coordinator.refreshSessions(context: context)
 
@@ -126,7 +132,8 @@ final class MacFlagSyncTests: XCTestCase {
 
     func testToggleFavoriteIssuesPush() async throws {
         let thread = JesseThread(mode: .ask)
-        thread.sessionId = "s1"
+        thread.conversationId = "s1"
+        thread.sessionId = "sess-s1"
         thread.toggleFavorite(now: Date(timeIntervalSince1970: 0.4))        // ms 400
         let fake = FakeBridgeClient()
         let coordinator = makeCoordinator(fake)
@@ -134,18 +141,43 @@ final class MacFlagSyncTests: XCTestCase {
         coordinator.pushFavoriteChange(for: thread)
         await waitUntil("the favorite push to fire") { !fake.calls.isEmpty }
 
-        XCTAssertEqual(fake.calls.first?.sessionId, "s1")
+        XCTAssertEqual(fake.calls.first?.conversationId, "s1")
         XCTAssertEqual(fake.calls.first?.favorite, FlagWrite(value: true, updatedMs: 400))
     }
 
-    func testPushSkippedWithoutSessionId() async throws {
-        let thread = JesseThread(mode: .ask)   // no sessionId
+    /// A thread the sync has not bound to a conversation cannot push a flag: there is no key
+    /// to push it under.
+    ///
+    /// The gate MOVED here, and deliberately narrowed. It used to be "no `sessionId`", which
+    /// meant a brand-new conversation could not sync its flags until a reply landed; it is now
+    /// "no `conversationId`", which a thread acquires at creation, so a new conversation's
+    /// flags sync from its first turn. The only threads skipped are pre-upgrade rows the first
+    /// sync has not bound yet.
+    func testPushSkippedWithoutAConversationId() async throws {
+        let thread = JesseThread(mode: .ask)
+        thread.conversationId = nil   // a pre-upgrade row, not yet bound by a sync
         thread.toggleArchived()
         let fake = FakeBridgeClient()
         let coordinator = makeCoordinator(fake)
 
         coordinator.pushArchivedChange(for: thread)
         try? await Task.sleep(for: .milliseconds(80))
-        XCTAssertTrue(fake.calls.isEmpty, "no session_id → nothing to push")
+        XCTAssertTrue(fake.calls.isEmpty, "no conversation id, nothing to push under")
+    }
+
+    /// The other half of that change: a brand-new conversation, with no session id at all,
+    /// DOES push, because it already has its conversation identity.
+    func testPushHappensForANewConversationWithNoSessionYet() async throws {
+        let thread = JesseThread(mode: .ask)
+        thread.sessionId = nil
+        thread.toggleArchived()
+        let fake = FakeBridgeClient()
+        let coordinator = makeCoordinator(fake)
+
+        coordinator.pushArchivedChange(for: thread)
+        try? await Task.sleep(for: .milliseconds(80))
+        XCTAssertEqual(fake.calls.count, 1,
+                       "a conversation can sync its flags before its first reply lands")
+        XCTAssertEqual(fake.calls.first?.conversationId, thread.conversationId)
     }
 }

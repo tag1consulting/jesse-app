@@ -118,42 +118,34 @@ enum AttachmentLimits {
 // shared client. `FlagSyncing.setFlags` has a default no-op, so the test fakes keep
 // compiling; the production `JesseClient` forwards it to the bridge.
 protocol JesseClientProtocol: FlagSyncing, Sendable {
-    func send(mode: JesseMode, text: String, sessionId: String?, voice: Bool,
-              instructions: String?, floorOverride: String?,
-              attachments: [JesseAttachment]) async throws -> JesseSendResult
-    /// List sessions (`GET /jesse/sessions`, ETag-conditioned) so the app can reconcile
-    /// server-authoritative favorite/archive flags into local threads. Defaulted to
-    /// `.notModified` so a fake need not model the session list.
-    func listSessions(etag: String?) async throws -> SessionsResult
-    /// Pull a session's transcript delta (`GET /jesse/sessions/{id}`, `?after=` byte
-    /// cursor) so an adopted or opened conversation can hydrate on demand. Returns the
-    /// ordered turns appended since `after` and the next cursor. Defaulted in the
-    /// extension to a 404 (unknown transcript → leave the cached copy), so a fake that
-    /// does not model hydration degrades like a bridge with nothing to serve.
-    func hydrate(sessionId: String, after: UInt64) async throws -> (turns: [HydratedTurn], nextOffset: UInt64)
-    /// Send carrying the outbox idempotency key (`request_id`). Defaulted in the
-    /// extension to forward to the plain `send` (dropping the id).
-    func send(mode: JesseMode, text: String, sessionId: String?, voice: Bool,
-              instructions: String?, floorOverride: String?,
-              attachments: [JesseAttachment], requestId: UUID?) async throws -> JesseSendResult
-    /// Send carrying the idempotency key AND the PER-TURN `model` selection (retire the
-    /// global switch). Additive: a default forwards to the `requestId` send (dropping
-    /// `model`), so the test fakes need no change; the production `JesseClient` overrides it.
-    func send(mode: JesseMode, text: String, sessionId: String?, voice: Bool,
-              instructions: String?, floorOverride: String?,
-              attachments: [JesseAttachment], requestId: UUID?,
+    /// Send one turn. `conversationId` (the thread identity the bridge registers and echoes
+    /// back) and `requestId` (the bridge's idempotency key) are BOTH required, and there is
+    /// deliberately NO overload that lets either be dropped: an omitted request id disabled
+    /// the bridge's own dedup for exactly the traffic that needs it most, and an omitted
+    /// conversation id made the bridge mint an identity the client would not recognize,
+    /// which is how a duplicate thread appeared.
+    func send(mode: JesseMode, text: String, sessionId: String?, conversationId: String,
+              voice: Bool, instructions: String?, floorOverride: String?,
+              attachments: [JesseAttachment], requestId: UUID,
               model: String?) async throws -> JesseSendResult
+    /// List conversations (`GET /jesse/conversations`, ETag-conditioned) so the app can
+    /// adopt, update and delete-local against the bridge's own thread records. Defaulted to
+    /// `.notModified` so a fake need not model the list.
+    func listConversations(etag: String?) async throws -> ConversationsResult
+    /// Pull a conversation's transcript delta (`GET /jesse/conversations/{id}/transcript`,
+    /// `?after=` OPAQUE cursor) so an adopted or opened conversation can hydrate on demand.
+    /// Returns the ordered turns appended since `cursor` and the next cursor. Defaulted in
+    /// the extension to a 404 (nothing to serve, so leave the cached copy), so a fake that
+    /// does not model hydration degrades like a bridge with no such conversation.
+    func hydrate(conversationId: String, after cursor: String?) async throws
+        -> (turns: [HydratedTurn], nextCursor: String)
     /// Fulfill a `JESSE_NEEDS_HEALTH` directive and re-send the SAME turn on the SAME
-    /// thread with the requested data attached (bypassing the classifier).
+    /// thread with the requested data attached (bypassing the classifier), carrying the
+    /// PER-TURN `model` so the retry answers on the same model as the original turn.
     func sendFulfilling(_ request: NeedsHealthRequest, mode: JesseMode, text: String,
-                        sessionId: String?, voice: Bool, instructions: String?,
-                        floorOverride: String?) async throws -> JesseSendResult
-    /// Fulfill a needs-health directive carrying the PER-TURN `model`, so the retry answers on
-    /// the SAME model as the original turn. Additive: a default forwards to the model-less
-    /// `sendFulfilling`, so the test fakes need no change.
-    func sendFulfilling(_ request: NeedsHealthRequest, mode: JesseMode, text: String,
-                        sessionId: String?, voice: Bool, instructions: String?,
-                        floorOverride: String?, model: String?) async throws -> JesseSendResult
+                        sessionId: String?, conversationId: String, voice: Bool,
+                        instructions: String?, floorOverride: String?,
+                        model: String?) async throws -> JesseSendResult
     func result(jobId: String) async throws -> JesseResultState
     /// Fetch the diet snapshot (`GET /jesse/diet`) for the Health tab. Throws a
     /// `DietFetchError` distinguishing offline / auth / an older bridge / a bad date /
@@ -164,53 +156,35 @@ protocol JesseClientProtocol: FlagSyncing, Sendable {
     /// Best-effort request to stop an in-flight turn server-side. Idempotent.
     func cancelJob(jobId: String) async throws
     /// Delete a thread's remote Claude Code session server-side. Idempotent (404 → ok).
-    func deleteSession(_ sessionId: String) async throws
+    func deleteConversation(_ conversationId: String) async throws
     /// Live token stream for a running turn (`GET /jesse/stream/{job_id}`).
     func stream(jobId: String) -> AsyncThrowingStream<JesseStreamEvent, Error>
     /// Register (idempotent upsert) this phone's APNs device token with the bridge.
     func registerDevice(token: String) async throws
     /// Ask the bridge to push when `jobId` completes. Best-effort and idempotent.
     func notifyOnComplete(jobId: String) async throws
-    /// Ask the bridge to mint a short conversation title from `digest`. Returns the
-    /// title, or nil for ANY failure — it NEVER throws to the UI.
-    func title(forDigest digest: String) async -> String?
+    /// Ask the bridge to mint a short conversation title from `digest`, persisting it under
+    /// `conversationId` in the bridge's (conversation-keyed) title store. Returns the title,
+    /// or nil for ANY failure: it NEVER throws to the UI.
+    func title(forDigest digest: String, conversationId: String?) async -> String?
 }
 
 extension JesseClientProtocol {
-    // Default for fakes/callers that don't carry an idempotency key: forward to the
-    // plain `send`, dropping `requestId`.
-    func send(mode: JesseMode, text: String, sessionId: String?, voice: Bool,
-              instructions: String?, floorOverride: String?,
-              attachments: [JesseAttachment], requestId: UUID?) async throws -> JesseSendResult {
-        try await send(mode: mode, text: text, sessionId: sessionId, voice: voice,
-                       instructions: instructions, floorOverride: floorOverride,
-                       attachments: attachments)
-    }
-    // Default for fakes/callers that predate the per-turn model field: forward to the
-    // `requestId` send, dropping `model`. The production `JesseClient` overrides this.
-    func send(mode: JesseMode, text: String, sessionId: String?, voice: Bool,
-              instructions: String?, floorOverride: String?,
-              attachments: [JesseAttachment], requestId: UUID?,
-              model: String?) async throws -> JesseSendResult {
-        try await send(mode: mode, text: text, sessionId: sessionId, voice: voice,
-                       instructions: instructions, floorOverride: floorOverride,
-                       attachments: attachments, requestId: requestId)
-    }
-    // Default for fakes that don't exercise the metrics/retry channel: re-send the SAME
-    // turn via `send` (dropping the directive).
+    // Deliberately NO default for `send`: every conformer, production or fake, implements
+    // the one send that requires both the conversation id and the request id. A forwarding
+    // default is exactly how a call site quietly dropped one of them.
+    //
+    // Default for fakes that don't exercise the needs-health retry channel: re-send the
+    // SAME turn via `send` (dropping the directive), reusing the request id so the bridge
+    // still dedups a retry that actually landed.
     func sendFulfilling(_ request: NeedsHealthRequest, mode: JesseMode, text: String,
-                        sessionId: String?, voice: Bool, instructions: String?,
-                        floorOverride: String?) async throws -> JesseSendResult {
-        try await send(mode: mode, text: text, sessionId: sessionId, voice: voice,
-                       instructions: instructions, floorOverride: floorOverride, attachments: [])
-    }
-    // Default for fakes/callers that predate the per-turn model field: forward to the
-    // model-less `sendFulfilling`. The production `JesseClient` overrides this.
-    func sendFulfilling(_ request: NeedsHealthRequest, mode: JesseMode, text: String,
-                        sessionId: String?, voice: Bool, instructions: String?,
-                        floorOverride: String?, model: String?) async throws -> JesseSendResult {
-        try await sendFulfilling(request, mode: mode, text: text, sessionId: sessionId,
-                                 voice: voice, instructions: instructions, floorOverride: floorOverride)
+                        sessionId: String?, conversationId: String, voice: Bool,
+                        instructions: String?, floorOverride: String?,
+                        model: String?) async throws -> JesseSendResult {
+        try await send(mode: mode, text: text, sessionId: sessionId,
+                       conversationId: conversationId, voice: voice,
+                       instructions: instructions, floorOverride: floorOverride,
+                       attachments: [], requestId: UUID(), model: model)
     }
     // Default "no version" so existing conformers (the test fakes) need not implement
     // the health probe.
@@ -224,20 +198,21 @@ extension JesseClientProtocol {
     // methods; only the production `JesseClient` does the real calls.
     func registerDevice(token: String) async throws {}
     func notifyOnComplete(jobId: String) async throws {}
-    // Default no-op so fakes that don't exercise remote session deletion behave like a
-    // bridge that always succeeds.
-    func deleteSession(_ sessionId: String) async throws {}
-    // Default "no sessions to sync": a fake that doesn't model the session list behaves
-    // like an unchanged (304) list, so the flag-reconcile pass is a no-op for it.
-    func listSessions(etag: String?) async throws -> SessionsResult { .notModified }
-    // Default "unknown transcript": a fake that doesn't model hydration behaves like a
+    // Default no-op so fakes that don't exercise remote deletion behave like a bridge that
+    // always succeeds.
+    func deleteConversation(_ conversationId: String) async throws {}
+    // Default "nothing to sync": a fake that doesn't model the conversation list behaves
+    // like an unchanged (304) list, so the sync pass is a no-op for it.
+    func listConversations(etag: String?) async throws -> ConversationsResult { .notModified }
+    // Default "unknown conversation": a fake that doesn't model hydration behaves like a
     // bridge with nothing to serve (404), so an open leaves the cached copy untouched.
-    func hydrate(sessionId: String, after: UInt64) async throws -> (turns: [HydratedTurn], nextOffset: UInt64) {
+    func hydrate(conversationId: String, after cursor: String?) async throws
+        -> (turns: [HydratedTurn], nextCursor: String) {
         throw JesseError.badResponse(404, "")
     }
     // Default "no title": a fake that doesn't opt into titling degrades exactly like a
     // bridge without the endpoint (the row keeps its derived title).
-    func title(forDigest digest: String) async -> String? { nil }
+    func title(forDigest digest: String, conversationId: String?) async -> String? { nil }
 }
 
 /// The production `JesseClientProtocol`: the shared `JesseBridgeClient` plus the iOS-only
@@ -287,40 +262,18 @@ struct JesseClient: JesseClientProtocol {
 
     // MARK: - Send (with the iOS health_context body)
 
-    /// Pass `sessionId` to continue a thread; `voice` asks for a SPOKEN: summary. A
-    /// non-empty `instructions` overrides the bridge's built-in wrapper; a non-empty
-    /// `floorOverride` rewords the always-prepended safety floor. Returns either the
-    /// inline reply or, if the turn outran the grace window, a `running` job id to poll.
+    /// Send one turn. `conversationId` is the thread identity the bridge registers before
+    /// returning its 202 and echoes back authoritatively; `requestId` is the outbox's
+    /// idempotency key. Pass `sessionId` to continue a thread; `voice` asks for a SPOKEN:
+    /// summary. A non-empty `instructions` overrides the bridge's built-in wrapper; a
+    /// non-empty `floorOverride` rewords the always-prepended safety floor. A nil/blank
+    /// `model` omits the field, so the bridge uses its stored default.
     func send(mode: JesseMode, text: String,
-              sessionId: String? = nil, voice: Bool = false,
-              instructions: String? = nil,
-              floorOverride: String? = nil,
-              attachments: [JesseAttachment] = []) async throws -> JesseSendResult {
-        try await send(mode: mode, text: text, sessionId: sessionId, voice: voice,
-                       instructions: instructions, floorOverride: floorOverride,
-                       attachments: attachments, requestId: nil)
-    }
-
-    func send(mode: JesseMode, text: String,
-              sessionId: String?, voice: Bool,
+              sessionId: String?, conversationId: String, voice: Bool,
               instructions: String?,
               floorOverride: String?,
               attachments: [JesseAttachment],
-              requestId: UUID?) async throws -> JesseSendResult {
-        try await send(mode: mode, text: text, sessionId: sessionId, voice: voice,
-                       instructions: instructions, floorOverride: floorOverride,
-                       attachments: attachments, requestId: requestId, model: nil)
-    }
-
-    /// The model-aware send: identical to the `requestId` send but naming the PER-TURN
-    /// `model` (the bridge's `model` field). A nil/blank model omits the field, so the
-    /// bridge uses its stored default — byte-for-byte the model-less behavior.
-    func send(mode: JesseMode, text: String,
-              sessionId: String?, voice: Bool,
-              instructions: String?,
-              floorOverride: String?,
-              attachments: [JesseAttachment],
-              requestId: UUID?,
+              requestId: UUID,
               model: String?) async throws -> JesseSendResult {
         // Classify-then-attach, in the request-building path so EVERY turn — typed, Siri,
         // and the watch relay — inherits it. The block is attached ONLY when the master
@@ -339,6 +292,7 @@ struct JesseClient: JesseClientProtocol {
         let healthContext = DietContextComposer.combine(
             healthBlock: await healthBlock, dietRollup: await dietRollup)
         let request = Self.makeRequest(mode: mode, text: text, sessionId: sessionId,
+                                       conversationId: conversationId,
                                        voice: voice, instructions: instructions,
                                        floorOverride: floorOverride,
                                        attachments: attachments,
@@ -361,18 +315,11 @@ struct JesseClient: JesseClientProtocol {
         return text.isEmpty ? nil : text
     }
 
+    /// Re-send a needs-health retry on the SAME conversation and the SAME PER-TURN `model`
+    /// as the original turn (a nil/blank model omits the field, so the bridge uses its
+    /// stored default).
     func sendFulfilling(_ requested: NeedsHealthRequest, mode: JesseMode, text: String,
-                        sessionId: String?, voice: Bool,
-                        instructions: String?, floorOverride: String?) async throws -> JesseSendResult {
-        try await sendFulfilling(requested, mode: mode, text: text, sessionId: sessionId,
-                                 voice: voice, instructions: instructions,
-                                 floorOverride: floorOverride, model: nil)
-    }
-
-    /// The model-aware fulfillment: re-send the needs-health retry on the SAME PER-TURN
-    /// `model` as the original turn (nil/blank omits the field → the bridge's stored default).
-    func sendFulfilling(_ requested: NeedsHealthRequest, mode: JesseMode, text: String,
-                        sessionId: String?, voice: Bool,
+                        sessionId: String?, conversationId: String, voice: Bool,
                         instructions: String?, floorOverride: String?,
                         model: String?) async throws -> JesseSendResult {
         // A retry answering a JESSE_NEEDS_HEALTH directive: bypass the classifier, fulfill
@@ -382,6 +329,7 @@ struct JesseClient: JesseClientProtocol {
         // data and never re-requests (no loop).
         let outgoing = await fulfill(requested)
         let request = Self.makeRequest(mode: mode, text: text, sessionId: sessionId,
+                                       conversationId: conversationId,
                                        voice: voice, instructions: instructions,
                                        floorOverride: floorOverride,
                                        attachments: [],
@@ -432,17 +380,18 @@ struct JesseClient: JesseClientProtocol {
         try await bridge.cancelJob(jobId: jobId)
     }
 
-    func deleteSession(_ sessionId: String) async throws {
-        try await bridge.deleteSession(sessionId)
+    func deleteConversation(_ conversationId: String) async throws {
+        try await bridge.deleteConversation(conversationId)
     }
-    func listSessions(etag: String?) async throws -> SessionsResult {
-        try await bridge.listSessions(etag: etag)
+    func listConversations(etag: String?) async throws -> ConversationsResult {
+        try await bridge.listConversations(etag: etag)
     }
-    func hydrate(sessionId: String, after: UInt64) async throws -> (turns: [HydratedTurn], nextOffset: UInt64) {
-        try await bridge.hydrate(sessionId: sessionId, after: after)
+    func hydrate(conversationId: String, after cursor: String?) async throws
+        -> (turns: [HydratedTurn], nextCursor: String) {
+        try await bridge.hydrate(conversationId: conversationId, after: cursor)
     }
-    func setFlags(sessionId: String, favorite: FlagWrite?, archived: FlagWrite?) async throws {
-        try await bridge.setFlags(sessionId: sessionId, favorite: favorite, archived: archived)
+    func setFlags(conversationId: String, favorite: FlagWrite?, archived: FlagWrite?) async throws {
+        try await bridge.setFlags(conversationId: conversationId, favorite: favorite, archived: archived)
     }
 
     func registerDevice(token: String) async throws {
@@ -453,8 +402,8 @@ struct JesseClient: JesseClientProtocol {
         try await bridge.notifyOnComplete(jobId: jobId)
     }
 
-    func title(forDigest digest: String) async -> String? {
-        await bridge.title(text: digest, sessionId: nil)
+    func title(forDigest digest: String, conversationId: String?) async -> String? {
+        await bridge.title(text: digest, conversationId: conversationId)
     }
 
     func stream(jobId: String) -> AsyncThrowingStream<JesseStreamEvent, Error> {
@@ -496,6 +445,7 @@ struct JesseClient: JesseClientProtocol {
     /// same signature the app and wire tests already use) so the attachment encoding stays
     /// unit-testable while the byte-shape logic lives once in `JesseBridgeClient`.
     static func makeRequest(mode: JesseMode, text: String, sessionId: String?,
+                            conversationId: String?,
                             voice: Bool, instructions: String?,
                             floorOverride: String?,
                             attachments: [JesseAttachment],
@@ -506,7 +456,8 @@ struct JesseClient: JesseClientProtocol {
                             requestId: UUID? = nil,
                             model: String? = nil) -> JesseRequest {
         JesseBridgeClient.makeRequest(
-            mode: mode, text: text, sessionId: sessionId, voice: voice,
+            mode: mode, text: text, sessionId: sessionId,
+            conversationId: conversationId, voice: voice,
             instructions: instructions, floorOverride: floorOverride,
             // Base64-in-JSON, re-validated by the bridge for type and size.
             attachments: attachments.map {
@@ -659,7 +610,7 @@ struct SemVer: Comparable {
 enum BridgeCompatibility {
     /// The oldest bridge this app build expects. Bump when the app starts relying on a
     /// bridge behavior newer than the value here.
-    static let minimumBridgeVersion = "0.7.0"
+    static let minimumBridgeVersion = "0.33.0"
 
     /// True iff `bridgeVersion` is present, parseable, AND strictly older than `minimum`.
     static func isOutdated(bridgeVersion: String?,

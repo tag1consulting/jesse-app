@@ -6,6 +6,17 @@ pub struct JesseRequest {
     text: String,
     #[serde(default)]
     session_id: Option<String>, // set to continue a thread (a followup)
+    /// Stable client-minted conversation identity. Canonical lowercase UUID.
+    /// Registered at accept time and echoed in the 202. Absent means the bridge mints
+    /// one, which an older client will simply ignore.
+    ///
+    /// The client mints it rather than the bridge for one reason: a bridge-minted id
+    /// would reopen the race this closes, leaving a window in which the server knows an
+    /// identifier the client does not, so a sync landing in that window would adopt a
+    /// duplicate thread. The bridge still returns the AUTHORITATIVE id, and remains free
+    /// to override the requested one.
+    #[serde(default)]
+    conversation_id: Option<String>,
     #[serde(default)]
     voice: bool, // voice request → ask for a SPOKEN: summary line, keep it listenable
     // Optional per-request override of the active mode's wrapper instruction.
@@ -89,14 +100,24 @@ pub fn validate_request_id(id: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// The `202 { "job_id", "status": "running" }` accept response. The SAME shape is
-/// returned for a fresh turn and for an idempotent-dedup hit, so the client streams
-/// or polls the returned id identically either way (a job that already finished
-/// satisfies the first poll immediately).
-fn accepted_running(job_id: &str) -> Response {
+/// The `202 { "job_id", "conversation_id", "status": "running" }` accept response. The
+/// SAME shape is returned for a fresh turn and for an idempotent-dedup hit, so the
+/// client streams or polls the returned id identically either way (a job that already
+/// finished satisfies the first poll immediately) and a retried POST gets back both the
+/// same job AND the same conversation.
+///
+/// `conversation_id` is the AUTHORITATIVE conversation this turn belongs to, registered
+/// before this response is built. It is additive: a pre-0.33 client decoding only
+/// `job_id` is unaffected. It is also the acceptance signal the UI needs, since its
+/// arrival is the first moment a client can know the turn is durably the server's.
+fn accepted_running(job_id: &str, conversation_id: &str) -> Response {
     (
         StatusCode::ACCEPTED,
-        Json(json!({ "job_id": job_id, "status": "running" })),
+        Json(json!({
+            "job_id": job_id,
+            "conversation_id": conversation_id,
+            "status": "running",
+        })),
     )
         .into_response()
 }
@@ -112,9 +133,15 @@ pub struct DeviceRequest {
 pub struct TitleRequest {
     text: String,
     // Optional: when present, the minted title is persisted server-side under this
-    // session_id (so `GET /jesse/sessions` can show it). Absent → today's
+    // CONVERSATION (so `GET /jesse/conversations` can show it). Absent → the
     // stateless behavior exactly (nothing persisted). Additive and
     // backward-compatible: old clients simply omit it.
+    #[serde(default)]
+    conversation_id: Option<String>,
+    // DEPRECATED, removed with the other session-keyed surface: a session id to
+    // persist the title under. The title store is keyed on the conversation now, so
+    // this is resolved through the reverse index; an id that resolves to no
+    // conversation stores nothing (rather than writing a key nothing would ever read).
     #[serde(default)]
     session_id: Option<String>,
 }
@@ -243,7 +270,8 @@ pub async fn run_ask_hosted_or_emergency(
     }
 
     // Attempt hosted — under the ACTIVE model (byte-for-byte today's turn for opus).
-    let (out, usage) = split_turn_usage(run_claude_streaming(cfg, prompt, sid, jobs, jid, active).await);
+    let (out, usage) =
+        split_turn_usage(run_claude_streaming(cfg, prompt, sid, jobs, jid, active).await);
     let out = apply_directives(out);
     match out {
         Ok(v) => {
@@ -376,6 +404,36 @@ pub async fn jesse(
         ));
     }
 
+    // ---- Conversation identity, resolved BEFORE anything else -----------------
+    //
+    // This must happen before the job is created and before anything is spawned: the
+    // whole point of the conversation record is that the 202 names the thread, so the
+    // client is never behind the server. A malformed id is a 400 in the same JSON shape
+    // a bad `request_id` already uses.
+    if let Some(cid) = req.conversation_id.as_deref() {
+        if let Err(msg) = validate_conversation_id(cid) {
+            return Ok((StatusCode::BAD_REQUEST, Json(json!({ "error": msg }))).into_response());
+        }
+    }
+    let now_ms = system_time_to_ms(SystemTime::now());
+    // Registration is idempotent by construction, so a follow-up turn on an established
+    // conversation registers nothing new; an absent id means an older client, and the
+    // bridge mints one it can safely ignore.
+    let conversation = match req.conversation_id.as_deref() {
+        Some(cid) => st.conversations.register(cid, None, now_ms),
+        None => st.conversations.mint(None, now_ms),
+    };
+    let conversation_id = conversation.conversation_id.clone();
+    // A legacy `session_id` on a conversation that has no alias for it yet: bind it. This
+    // is what lets an older client keep working AND lets a newly upgraded client bind its
+    // existing history to its conversation on the very first turn it sends.
+    if let Some(sid) = req.session_id.as_deref() {
+        if !is_synthetic_session_id(sid) && st.conversations.conversation_for_session(sid).is_none()
+        {
+            st.conversations.bind_session(&conversation_id, sid);
+        }
+    }
+
     // Idempotency (POST /jesse dedup). Auth + rate limiting above are unchanged and
     // apply first. When a valid `request_id` is present AND already maps to a live
     // job (queued, running, or a terminal result still in its retention window),
@@ -390,7 +448,7 @@ pub async fn jesse(
             return Ok((StatusCode::BAD_REQUEST, Json(json!({ "error": msg }))).into_response());
         }
         if let Some(existing) = st.jobs.dedup_lookup(rid) {
-            return Ok(accepted_running(&existing));
+            return Ok(accepted_running(&existing, &conversation_id));
         }
     }
 
@@ -402,7 +460,12 @@ pub async fn jesse(
     // default. Absent or blank `model` falls back to the stored default via
     // `resolve_active_model`, so an older client that omits the field is byte-for-byte
     // today's behavior. Resolved once here and moved into the spawned turn task below.
-    let active = match req.model.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+    let active = match req
+        .model
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
         Some(id) => st.resolve_requested_model(id)?,
         None => st.resolve_active_model(),
     };
@@ -519,7 +582,9 @@ pub async fn jesse(
     // duplicate POSTs collapse to exactly one job.
     let job_id = match st.jobs.create_with_request_id(req.request_id.clone()) {
         CreateOutcome::Created(id) => id,
-        CreateOutcome::Duplicate(existing) => return Ok(accepted_running(&existing)),
+        CreateOutcome::Duplicate(existing) => {
+            return Ok(accepted_running(&existing, &conversation_id))
+        }
     };
     // Open the live stream before spawning so a phone that opens
     // `GET /jesse/stream/{job_id}` immediately finds the broadcast channel.
@@ -558,6 +623,12 @@ pub async fn jesse(
     // boundary from the same header the prompt was built with). All inert when carry off.
     let context = st.context.clone();
     let titles = st.titles.clone();
+    // Conversation identity (NOT a feature-flagged concern): the registry, this turn's
+    // conversation id, and the projects dir the in-flight snapshot and the terminal stem
+    // diff both read. All three are needed on every path, success or failure.
+    let conversations = st.conversations.clone();
+    let cid = conversation_id.clone();
+    let sessions_dir = st.sessions_dir();
     // Meal-corrections queue (JESSE_MEAL_LOG v2): merged into the delivered `meal_log` at
     // completion, so off-app corrections ride this turn's terminal result.
     let meal_corrections = st.meal_corrections.clone();
@@ -601,6 +672,31 @@ pub async fn jesse(
 
         // Turn wall clock starts here (after the permit — queued time doesn't count).
         let turn_start = Instant::now();
+
+        // ---- Claim the in-flight slot BEFORE the CLI can write a transcript --------
+        //
+        // The CLI creates `<session_id>.jsonl` while the turn is still running, so a
+        // conversation-list refresh issued mid-turn would find an unbound stem and
+        // orphan-adopt it into a SEPARATE conversation, which the client would then
+        // adopt as a duplicate. The claim snapshots the stems that exist right now; the
+        // refresh skips any stem missing from every live snapshot, and this turn's
+        // terminal step binds whatever appeared. The snapshot is taken as close to the
+        // spawn as possible (nothing between here and `run_claude_streaming` writes a
+        // transcript), and the claim's Drop releases it unconditionally, including on a
+        // panic or the task abort a cancel performs.
+        let flight = conversations.claim_flight(
+            &jid,
+            &cid,
+            transcript_stems(&sessions_dir),
+            system_time_to_ms(SystemTime::now()),
+        );
+
+        // Resume CONVERSATION-first: the conversation's current bound session is
+        // authoritative over the id the request carried, so a client whose stored
+        // session id is behind a CLI fork still resumes the right transcript. The
+        // resulting id still passes through `resolve_resume_session` inside
+        // `run_claude_streaming`, so a missing transcript degrades to a fresh run.
+        let sid = resolve_conversation_resume(&conversations, &cid, sid);
         // Emergency fallback (Piece 4) is armed only when JESSE_EMERGENCY_LOCAL is on
         // AND the vault-QA triple is set (it supplies the backend + read-only child).
         // With it disarmed, every branch below is byte-for-byte today's behavior.
@@ -904,6 +1000,37 @@ pub async fn jesse(
             (out, BadgeSource::Hosted)
         };
 
+        // ---- Conversation binding: the terminal identity step ----------------------
+        //
+        // Deliberately OUTSIDE the `cfg.context_carry` gate below. The old rekey lives
+        // inside that block, but conversation identity must never depend on a prompt
+        // context feature flag: with `JESSE_CONTEXT_CARRY` off, a fork would otherwise
+        // surface as a new conversation row again.
+        //
+        // Two bindings, in this order. First the reply's own session id, on EVERY
+        // terminal success and not just the first, so a fork joins this conversation's
+        // alias list instead of becoming a new row. Then the stem diff, which rescues
+        // what the reply cannot: a turn that failed before returning any session id, and
+        // a transcript that a concurrent refresh orphan-adopted while this turn ran (that
+        // one is stolen back by `bind_session`).
+        {
+            let reply_sid = match &outcome {
+                Ok((_, s, _)) => s.clone(),
+                Err(_) => None,
+            };
+            let claimed = flight.take();
+            if let Some(reply_sid) = reply_sid.as_deref() {
+                // A synthetic `local-` id has no transcript by construction, so it is
+                // never a session of the conversation.
+                if !is_synthetic_session_id(reply_sid) {
+                    conversations.bind_session(&cid, reply_sid);
+                }
+            }
+            if let Some(claimed) = &claimed {
+                bind_new_stems(&sessions_dir, &conversations, &cid, claimed);
+            }
+        }
+
         // ---- Context carry (Piece 1–3): from the SAME pre-badge outcome the badge and
         // metrics use, record the delivered turn, resolve the thread key + synthetic
         // session id, mark the injected pending entries on hosted success, re-key on a
@@ -1155,7 +1282,7 @@ pub async fn jesse(
     // phone never saw — unavoidably unrecoverable without an id. That window is
     // now one round-trip instead of a multi-second hold, which is the whole point
     // of delivering the id eagerly.
-    Ok(accepted_running(&job_id))
+    Ok(accepted_running(&job_id, &conversation_id))
 }
 
 /// Fetch a turn's state by job id. This is what the app polls after a dropped
@@ -1319,11 +1446,27 @@ pub async fn jesse_title(
             "claude returned no usable title".to_string(),
         ));
     }
-    // If the client named a session, persist the minted title under it before
-    // returning, so `GET /jesse/sessions` can show it. No session_id → today's
-    // stateless behavior (nothing stored). The store trims + clamps defensively.
-    if let Some(session_id) = req.session_id.as_deref() {
-        st.titles.set(session_id, &title);
+    // If the client named a conversation, persist the minted title under it before
+    // returning, so `GET /jesse/conversations` can show it. A deprecated `session_id`
+    // is resolved through the reverse index onto its conversation, since the title
+    // store is conversation-keyed; an id that resolves to nothing stores nothing
+    // rather than writing a key no read path would ever look at. Naming neither
+    // reproduces the stateless behavior (nothing stored). The store trims + clamps
+    // defensively.
+    let title_key = match req.conversation_id.as_deref() {
+        Some(cid) => {
+            if let Err(msg) = validate_conversation_id(cid) {
+                return Err((StatusCode::BAD_REQUEST, msg));
+            }
+            Some(cid.to_string())
+        }
+        None => req
+            .session_id
+            .as_deref()
+            .and_then(|sid| st.conversations.conversation_for_session(sid)),
+    };
+    if let Some(key) = title_key.as_deref() {
+        st.titles.set(key, &title);
     }
     Ok(Json(json!({ "title": title })))
 }
@@ -1544,15 +1687,20 @@ pub fn app(state: AppState) -> Router {
         .route("/jesse", post(jesse))
         .route("/jesse/prompts", get(jesse_prompts))
         .route("/jesse/diet", get(jesse_diet))
-        .route("/jesse/sessions", get(jesse_sessions))
-        .route("/jesse/sessions/:session_id", get(jesse_session_hydrate))
+        // The conversation surface: the bridge's own thread identity, keyed on a stable
+        // UUID registered at accept time rather than on a CLI transcript filename.
+        .route("/jesse/conversations", get(jesse_conversations))
         .route(
-            "/jesse/session/:session_id",
-            axum::routing::delete(jesse_session_delete),
+            "/jesse/conversations/:conversation_id/transcript",
+            get(jesse_conversation_hydrate),
         )
         .route(
-            "/jesse/session/:session_id/flags",
-            post(jesse_session_flags),
+            "/jesse/conversation/:conversation_id",
+            axum::routing::delete(jesse_conversation_delete),
+        )
+        .route(
+            "/jesse/conversation/:conversation_id/flags",
+            post(jesse_conversation_flags),
         )
         .route("/jesse/title", post(jesse_title))
         .route("/jesse/meal-corrections", post(jesse_meal_corrections))

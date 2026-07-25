@@ -87,11 +87,29 @@ public nonisolated struct WatchAck: Equatable, Sendable {
     }
 }
 
-/// The three message kinds, unified so one codec serves the whole wire.
+/// The phone telling the watch that the BRIDGE has accepted a relayed turn: it registered
+/// the conversation and returned its 202, so the turn is durably the server's and will be
+/// answered even if the phone is put away.
+///
+/// Distinct from `WatchAck`, and both are needed. The ack says "the phone received your
+/// request"; this says "the bridge received the turn". Only the second means the work is
+/// safe, and only the second carries the conversation the turn landed in.
+public nonisolated struct WatchRegistered: Equatable, Sendable {
+    public let requestId: UUID
+    public let conversationId: String
+
+    public nonisolated init(requestId: UUID, conversationId: String) {
+        self.requestId = requestId
+        self.conversationId = conversationId
+    }
+}
+
+/// The four message kinds, unified so one codec serves the whole wire.
 public nonisolated enum WatchMessage: Equatable, Sendable {
     case request(WatchRequest)
     case reply(WatchReply)
     case ack(WatchAck)
+    case registered(WatchRegistered)
 }
 
 public extension WatchMessage {
@@ -124,11 +142,13 @@ public extension WatchMessage {
         nonisolated static let sessionId = "sessionId"
         nonisolated static let threadId = "threadId"
         nonisolated static let error = "error"
+        nonisolated static let conversationId = "conversationId"
     }
     private enum Kind {
         nonisolated static let request = "request"
         nonisolated static let reply = "reply"
         nonisolated static let ack = "ack"
+        nonisolated static let registered = "registered"
     }
 
     /// Serialize to the `[String: Any]` dictionary WatchConnectivity carries. Only
@@ -157,6 +177,10 @@ public extension WatchMessage {
             dict[Key.type] = Kind.ack
             dict[Key.requestId] = a.requestId.uuidString
             dict[Key.ok] = a.accepted
+        case .registered(let r):
+            dict[Key.type] = Kind.registered
+            dict[Key.requestId] = r.requestId.uuidString
+            dict[Key.conversationId] = r.conversationId
         }
         return dict
     }
@@ -208,6 +232,12 @@ public extension WatchMessage {
         case Kind.ack:
             guard let accepted = dict[Key.ok] as? Bool else { return nil }
             return .ack(WatchAck(requestId: requestId, accepted: accepted))
+
+        case Kind.registered:
+            // A registration with no conversation is meaningless (the whole point is naming
+            // the thread the turn landed in), so an absent or over-long id is malformed.
+            guard let cid = boundedText(dict[Key.conversationId]), !cid.isEmpty else { return nil }
+            return .registered(WatchRegistered(requestId: requestId, conversationId: cid))
 
         default:
             return nil

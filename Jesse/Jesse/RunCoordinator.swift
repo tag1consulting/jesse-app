@@ -387,6 +387,22 @@ final class RunCoordinator {
     }
 
     func startDate(for threadID: UUID) -> Date? { startDates[threadID] }
+
+    /// Where a turn is between "typed" and "answered", derived entirely from state that
+    /// already exists rather than a new stored flag. `isRunning` deliberately ORs the pre-ACK
+    /// and post-ACK conditions (a spinner is a spinner), which is exactly why it cannot
+    /// answer this: before this existed nothing in the UI distinguished a message still
+    /// crossing the network from one the server had durably accepted.
+    ///
+    /// `.accepted` means the bridge returned its 202, so the turn is the server's: it will be
+    /// answered even if the app is closed. `nil` means there is nothing in flight (or an
+    /// error has surfaced, which the error UI owns).
+    func phase(_ threadID: UUID) -> TurnPhase? {
+        guard errors[threadID] == nil else { return nil }
+        if inFlight[threadID] != nil { return .accepted }
+        if startDates[threadID] != nil { return .sending }
+        return nil
+    }
     func error(for threadID: UUID) -> String? { errors[threadID] }
     func clearError(for threadID: UUID) { errors[threadID] = nil }
 
@@ -482,6 +498,12 @@ final class RunCoordinator {
         let voice = item.voice
         let mode = item.modeValue
         let sessionId = thread.sessionId
+        // The thread identity, sent on EVERY turn. A thread always has one (the model mints
+        // it at init), but a store row migrated from before the property reads nil until the
+        // first sync binds it; mint one now rather than let the bridge invent an identity
+        // this client would not recognize.
+        let conversationId = thread.conversationId ?? JesseThread.mintConversationId()
+        if thread.conversationId != conversationId { thread.conversationId = conversationId }
         let cfg = configProvider()
         // Resolve the wrapper and floor overrides on the main actor before detaching
         // the turn; nil when this mode isn't customized.
@@ -507,26 +529,35 @@ final class RunCoordinator {
             let client = self.makeClient(cfg)
             do {
                 let result = try await client.send(mode: mode, text: text,
-                                                   sessionId: sessionId, voice: voice,
+                                                   sessionId: sessionId,
+                                                   conversationId: conversationId,
+                                                   voice: voice,
                                                    instructions: instructions,
                                                    floorOverride: floorOverride,
                                                    attachments: attachments,
                                                    requestId: requestId,
                                                    model: model)
                 switch result {
-                case .reply(let reply, _):
+                case .reply(let reply, _, let remoteConversationId):
                     // ACK (legacy inline 200 — effectively dead against the fixed
                     // bridge, kept for an older one). Delivered → drop the outbox
                     // item, then finish against the live `thread` reference.
+                    self.adoptRegistration(thread: thread, conversationId: remoteConversationId)
                     self.ackDelete(item, context: context)
                     self.finish(threadID: threadID, thread: thread, reply: reply,
                                 voice: voice, jobId: nil, context: context)
-                case .running(let jobId):
+                case .running(let jobId, let remoteConversationId):
                     // ACK (202 — the normal path). Delivered → drop the outbox item,
                     // then persist the in-flight job (carrying the request_id so
                     // `reconcile` can resolve a kill/ACK race) and consume as before:
                     // stream (display) and poll (completion) race, and any later drop
                     // is recoverable via Re-check / `resume`.
+                    //
+                    // This is also the ACCEPTANCE moment: the bridge has registered the
+                    // conversation and the turn is durably its, which is what the
+                    // transcript's delivery caption reflects. Recorded in the SAME save
+                    // that drops the outbox item.
+                    self.adoptRegistration(thread: thread, conversationId: remoteConversationId)
                     self.ackDelete(item, context: context)
                     self.persist(threadID: threadID,
                                  job: InFlightJob(jobId: jobId, voice: voice, requestId: requestId))
@@ -568,6 +599,24 @@ final class RunCoordinator {
     /// a still-`.sending` item that `reconcile` collapses via the persisted job's
     /// request_id), and keeping it off the seam preserves the seam's meaning as "the
     /// optimistic-turn stage save + the finish save" that the finish tests count on.
+    /// Adopt the bridge's AUTHORITATIVE conversation id from a 202 (or an inline 200) and
+    /// stamp the first-ACK time.
+    ///
+    /// The client mints the id and the bridge registers it, so the echoed value normally
+    /// equals what was sent; it is still written back unconditionally because the bridge
+    /// stays free to override (it does exactly that when binding a legacy transcript). A nil
+    /// echo means a bridge too old to report one, in which case the local id stands.
+    ///
+    /// `registeredAt` is set ONCE, on the first accepted turn: it is the flag that separates
+    /// "still sending" from "the server has it", and re-stamping it on every follow-up would
+    /// make it a last-activity timestamp instead.
+    private func adoptRegistration(thread: JesseThread, conversationId: String?) {
+        if let conversationId, !conversationId.isEmpty, thread.conversationId != conversationId {
+            thread.conversationId = conversationId
+        }
+        if thread.registeredAt == nil { thread.registeredAt = Date() }
+    }
+
     private func ackDelete(_ item: OutboxItem, context: ModelContext) {
         context.delete(item)
         do {
@@ -636,6 +685,18 @@ final class RunCoordinator {
     /// The last ETag from `GET /jesse/sessions`, so an unchanged list is a cheap 304.
     /// Kept in UserDefaults (a tiny string), not the model store, since this is transient
     /// sync state, not conversation data.
+    /// Guards `refreshSessions` against overlapping runs. `ContentView` fires one on
+    /// `onAppear` and another on `scenePhase == .active`, and both can leave holding the same
+    /// stale ETag, so both would fetch the same list and apply the same plan.
+    private var isRefreshingSessions = false
+
+    /// Test-only reset of the cached list ETag, so a test can drive a SECOND full refresh
+    /// (the "background and reopen the app" case) without the 304 short-circuit hiding it.
+    var sessionsETagForTesting: String? {
+        get { sessionsETag }
+        set { sessionsETag = newValue }
+    }
+
     private var sessionsETag: String? {
         get { UserDefaults.standard.string(forKey: "jesse.sessions.etag") }
         set { UserDefaults.standard.set(newValue, forKey: "jesse.sessions.etag") }
@@ -660,195 +721,391 @@ final class RunCoordinator {
     func refreshSessions(context: ModelContext) async {
         let config = configProvider()
         guard config.isConfigured else { return }
+        // Re-entrancy guard. `ContentView` fires a refresh on `onAppear` AND on
+        // `scenePhase == .active`, and both can leave holding the same stale ETag, so both
+        // would fetch the same list and apply the same plan twice. Deliberately a flag with
+        // an early return rather than a queue: the second call's work is redundant by
+        // construction, so dropping it is correct, and a queue would just delay it.
+        guard !isRefreshingSessions else {
+            Log.run.debug("conversations refresh already in progress, skipping the overlap")
+            return
+        }
+        isRefreshingSessions = true
+        defer { isRefreshingSessions = false }
         let client = makeClient(config)
         do {
-            switch try await client.listSessions(etag: sessionsETag) {
+            switch try await client.listConversations(etag: sessionsETag) {
             case .notModified:
                 return
-            case let .sessions(list, deleted, etag):
+            case let .conversations(list, deleted, etag):
                 sessionsETag = etag
                 await applySessionSync(list, deleted: deleted, client: client, context: context)
             }
         } catch {
-            Log.run.debug("sessions refresh failed: \(error.localizedDescription)")
+            Log.run.debug("conversations refresh failed: \(error.localizedDescription)")
         }
     }
 
-    /// Apply the shared reconciler's plan to the local store: adopt, update, delete-local.
-    /// Saves once at the end if anything changed.
-    private func applySessionSync(_ list: [SessionSummary], deleted: [SessionTombstone],
+    /// Apply the shared reconciler's plan to the local store, in FOUR passes whose order is
+    /// load-bearing.
+    ///
+    /// 1. **Legacy bind.** A thread with no `conversationId` but a `sessionId` is a
+    ///    pre-upgrade row: find the remote conversation whose `session_ids` contains that
+    ///    session and adopt its id. This is how an existing install carries its whole
+    ///    history across with no client-side UUIDv5 implementation, and it must run BEFORE
+    ///    the plan or every such thread would be classified unknown and adopted as a
+    ///    duplicate of itself.
+    /// 2. **Merge duplicates.** Group local threads by conversation id and collapse each
+    ///    group into its oldest member. This is what repairs the duplicates already sitting
+    ///    on a device: it runs on every sync, is a no-op once clean, and is cheap.
+    /// 3. **Plan and apply.** Build the held set from `conversationId`, run the shared
+    ///    reconciler, then adopt / update / delete-local and reconcile the flags.
+    /// 4. **Save once**, if anything changed.
+    private func applySessionSync(_ list: [ConversationSummary], deleted: [ConversationTombstone],
                                   client: any JesseClientProtocol, context: ModelContext) async {
         let existing = (try? context.fetch(FetchDescriptor<JesseThread>())) ?? []
-        var bySession: [String: JesseThread] = [:]
-        for t in existing { if let sid = t.sessionId, !sid.isEmpty { bySession[sid] = t } }
-
-        let plan = SessionReconciler.plan(
-            localSessionIds: Set(bySession.keys),
-            sessions: list,
-            tombstones: Set(deleted.map(\.sessionId)),
-            pendingDeletion: sessionDeletionStore.pendingIds)
-
         var changed = false
 
-        // ADOPT: create a stub mirroring `MacCoordinator.upsert` (derived title, server
-        // aiTitle, session id, last-modified timestamps), then reconcile flags: a
-        // zero-clock stub simply adopts whatever the server holds.
-        for s in plan.adopt {
-            let stamp = Date(timeIntervalSince1970: TimeInterval(s.lastModified))
-            let derived = s.firstMessage.map { JesseThread.deriveTitle(from: $0) } ?? ""
+        // ── Pass 1: legacy bind ────────────────────────────────────────────────────────
+        // A thread with no session id was never sent, so it already carries a locally
+        // minted conversation id and needs nothing.
+        var conversationForSession: [String: String] = [:]
+        for c in list {
+            for sid in c.sessionIds { conversationForSession[sid] = c.conversationId }
+            if let sid = c.sessionId { conversationForSession[sid] = c.conversationId }
+        }
+        for t in existing where (t.conversationId ?? "").isEmpty {
+            guard let sid = t.sessionId, !sid.isEmpty,
+                  let cid = conversationForSession[sid] else { continue }
+            t.conversationId = cid
+            changed = true
+        }
+
+        // ── Pass 2: merge duplicates ───────────────────────────────────────────────────
+        let merged = mergeDuplicateThreads(existing, remote: list, context: context)
+        changed = changed || merged > 0
+
+        // ── Pass 3: plan and apply ────────────────────────────────────────────────────
+        let live = (try? context.fetch(FetchDescriptor<JesseThread>())) ?? []
+        var byConversation: [String: JesseThread] = [:]
+        for t in live {
+            guard let cid = t.conversationId, !cid.isEmpty else { continue }
+            byConversation[cid] = t
+        }
+
+        let plan = ConversationReconciler.plan(
+            heldConversationIds: Set(byConversation.keys),
+            conversations: list,
+            tombstones: Set(deleted.map(\.conversationId)),
+            pendingDeletion: sessionDeletionStore.pendingIds)
+
+        // ADOPT: create a stub for a conversation started elsewhere (the Mac, the CLI).
+        for c in plan.adopt {
+            let stamp = Date(timeIntervalSince1970: TimeInterval(c.lastModified))
+            let derived = c.firstMessage.map { JesseThread.deriveTitle(from: $0) } ?? ""
             let thread = JesseThread(title: derived, mode: .ask, createdAt: stamp)
-            thread.sessionId = s.sessionId
-            thread.aiTitle = s.title
+            // The initializer minted a FRESH random conversation id; an adopted thread must
+            // not keep it, or the next sync would see an id the bridge never heard of and
+            // this device would drift back out of convergence.
+            thread.conversationId = c.conversationId
+            thread.sessionId = c.sessionId
+            if c.registeredMs > 0 {
+                thread.registeredAt = Date(timeIntervalSince1970: TimeInterval(c.registeredMs) / 1000)
+            }
+            thread.aiTitle = c.title
             thread.updatedAt = stamp
             context.insert(thread)
             await FlagReconciler.reconcile(
                 thread: thread,
-                serverFavorite: s.favorite, serverFavoriteUpdatedMs: Int(s.favoriteUpdatedMs),
-                serverArchived: s.archived, serverArchivedUpdatedMs: Int(s.archivedUpdatedMs),
+                serverFavorite: c.favorite, serverFavoriteUpdatedMs: Int(c.favoriteUpdatedMs),
+                serverArchived: c.archived, serverArchivedUpdatedMs: Int(c.archivedUpdatedMs),
                 client: client)
             changed = true
         }
 
-        // UPDATE: refresh the server title and reconcile flags on an existing thread.
-        for s in plan.update {
-            guard let thread = bySession[s.sessionId] else { continue }
-            if let title = s.title, !title.isEmpty, thread.aiTitle != title {
+        // UPDATE: refresh the server title, the CURRENT session (which moves when the CLI
+        // forks), the activity stamp, and the flags. Applied identically on iOS and macOS:
+        // the two used to diverge here, which was its own source of confusion.
+        for c in plan.update {
+            guard let thread = byConversation[c.conversationId] else { continue }
+            if let title = c.title, !title.isEmpty, thread.aiTitle != title {
                 thread.aiTitle = title
+                changed = true
+            }
+            if let sid = c.sessionId, !sid.isEmpty, thread.sessionId != sid {
+                thread.sessionId = sid
+                changed = true
+            }
+            let stamp = Date(timeIntervalSince1970: TimeInterval(c.lastModified))
+            if stamp > thread.updatedAt {
+                thread.updatedAt = stamp
                 changed = true
             }
             let didChange = await FlagReconciler.reconcile(
                 thread: thread,
-                serverFavorite: s.favorite, serverFavoriteUpdatedMs: Int(s.favoriteUpdatedMs),
-                serverArchived: s.archived, serverArchivedUpdatedMs: Int(s.archivedUpdatedMs),
+                serverFavorite: c.favorite, serverFavoriteUpdatedMs: Int(c.favoriteUpdatedMs),
+                serverArchived: c.archived, serverArchivedUpdatedMs: Int(c.archivedUpdatedMs),
                 client: client)
             changed = changed || didChange
         }
 
-        // DELETE-LOCAL: the bridge tombstoned this session (deleted on the Mac). Remove the
-        // local thread (its turns cascade) and clear its hydration cursor.
-        for sid in plan.deleteLocalSessionIds {
-            guard let thread = bySession[sid] else { continue }
+        // DELETE-LOCAL: the bridge tombstoned this conversation (deleted on another device).
+        for cid in plan.deleteLocalConversationIds {
+            guard let thread = byConversation[cid] else { continue }
             cancel(thread.id)
             context.delete(thread)
-            hydrationCursorStore.clear(sid)
+            hydrationCursorStore.clear(cid)
             changed = true
         }
 
+        // ── Pass 4: save once ─────────────────────────────────────────────────────────
         if changed {
             do { try save(context) } catch {
-                Log.run.error("session sync save failed: \(error.localizedDescription)")
+                Log.run.error("conversation sync save failed: \(error.localizedDescription)")
             }
         }
+    }
+
+    /// Collapse every group of local threads sharing one conversation id into the group's
+    /// OLDEST member, and return how many merges happened.
+    ///
+    /// This is the pass that repairs damage already on the device: before the bridge owned
+    /// conversation identity, a sync landing mid-turn adopted a second thread for a
+    /// conversation the client already held, and the old matcher's `bySession[sid] = t`
+    /// silently collapsed the collision (last write wins) so one copy was permanently
+    /// orphaned from sync: never title-refreshed, never flag-reconciled, never tombstone
+    /// deleted, but still visible in the list.
+    ///
+    /// It keys on the conversation id and NEVER on the title: two conversations can
+    /// legitimately share a title, and merging those would destroy real content.
+    private func mergeDuplicateThreads(_ threads: [JesseThread],
+                                       remote: [ConversationSummary],
+                                       context: ModelContext) -> Int {
+        var groups: [String: [JesseThread]] = [:]
+        for t in threads {
+            guard let cid = t.conversationId, !cid.isEmpty else { continue }
+            groups[cid, default: []].append(t)
+        }
+        let remoteById = Dictionary(remote.map { ($0.conversationId, $0) }, uniquingKeysWith: { a, _ in a })
+        var merges = 0
+        for (cid, group) in groups where group.count > 1 {
+            // Oldest wins: it is the one the user has been looking at, and it holds the
+            // earliest turns.
+            let ordered = group.sorted { $0.createdAt < $1.createdAt }
+            guard let winner = ordered.first else { continue }
+            let losers = ordered.dropFirst()
+
+            for loser in losers {
+                // Move every turn across under the merge rules, so nothing is duplicated
+                // and nothing is lost.
+                let plan = TranscriptMerge.plan(
+                    existing: winner.orderedTurns.map {
+                        TranscriptMerge.Existing(role: $0.role, text: $0.text, sourceKey: $0.sourceKey)
+                    },
+                    incoming: loser.orderedTurns.map {
+                        HydratedTurn(role: $0.role, text: $0.text, timestamp: nil,
+                                     turnKey: $0.sourceKey ?? "")
+                    })
+                let loserTurns = loser.orderedTurns
+                let winnerTurns = winner.orderedTurns
+                for (i, action) in plan.enumerated() where i < loserTurns.count {
+                    let turn = loserTurns[i]
+                    switch action {
+                    case .skip:
+                        break
+                    case let .bind(existingIndex):
+                        if existingIndex < winnerTurns.count,
+                           let key = turn.sourceKey, !key.isEmpty,
+                           (winnerTurns[existingIndex].sourceKey ?? "").isEmpty {
+                            winnerTurns[existingIndex].sourceKey = key
+                        }
+                    case .insert:
+                        // Re-parent rather than copy, so attachments and provenance ride along.
+                        turn.thread = winner
+                    }
+                }
+                // Favorite and archived resolve by the HIGHER last-writer-wins clock, each
+                // carrying its own display timestamp, so a merge cannot lose a star made on
+                // the copy that happens not to be the oldest.
+                if loser.favoriteUpdatedMs > winner.favoriteUpdatedMs {
+                    winner.applyFavoriteFromSync(loser.isFavorite, updatedMs: loser.favoriteUpdatedMs)
+                }
+                if loser.archivedUpdatedMs > winner.archivedUpdatedMs {
+                    winner.applyArchivedFromSync(loser.isArchived, updatedMs: loser.archivedUpdatedMs)
+                }
+                if (winner.aiTitle ?? "").isEmpty, let title = loser.aiTitle, !title.isEmpty {
+                    winner.aiTitle = title
+                }
+                if winner.title.isEmpty, !loser.title.isEmpty {
+                    winner.title = loser.title
+                }
+                winner.updatedAt = max(winner.updatedAt, loser.updatedAt)
+                if winner.registeredAt == nil { winner.registeredAt = loser.registeredAt }
+                context.delete(loser)
+                merges += 1
+            }
+            // The current session comes from the remote row when there is one, since the
+            // bridge is authoritative about which transcript a resume targets.
+            if let sid = remoteById[cid]?.sessionId, !sid.isEmpty {
+                winner.sessionId = sid
+            }
+        }
+        if merges > 0 {
+            Log.run.notice("conversation sync merged \(merges) duplicate thread(s) into their originals")
+        }
+        return merges
     }
 
     // MARK: - Hydration (phone-side, on open)
 
     /// Pull a conversation's transcript from the bridge when it is opened, cache-first and
-    /// offline-tolerant, mirroring `MacCoordinator.hydrate` plus the seeding rule the
-    /// presence-based cursor enables:
-    ///  - cursor PRESENT → import only the byte-delta past it;
-    ///  - cursor ABSENT + the thread already has local turns → it is the phone's own record
-    ///    (a phone-started thread), so SEED the cursor to the transcript end and import
-    ///    NOTHING (never re-import our own turns);
-    ///  - cursor ABSENT + no local turns → it is an adopted stub, so import the FULL
-    ///    transcript.
-    /// A 404 (unknown / gc'd transcript) leaves the cached copy; a thread with no session
-    /// id has nothing to hydrate.
+    /// offline-tolerant:
+    ///  - cursor PRESENT, import only the delta past it;
+    ///  - cursor ABSENT and the thread already has local turns, it is this device's own
+    ///    record, so SEED the cursor to the transcript end and import nothing;
+    ///  - cursor ABSENT and no local turns, it is an adopted stub, so import the FULL
+    ///    history.
+    ///
+    /// A 404 (a conversation the bridge does not know, or one gc'd) leaves the cached copy;
+    /// a thread with no conversation id has nothing to hydrate. Importing is safe to repeat:
+    /// `TranscriptMerge` keys on the bridge's stable `turn_key`, so a turn already rendered
+    /// gets its key bound rather than duplicated.
     func hydrateOnOpen(thread: JesseThread, context: ModelContext) async {
         let config = configProvider()
-        guard config.isConfigured, let sid = thread.sessionId, !sid.isEmpty else { return }
+        guard config.isConfigured, let cid = thread.conversationId, !cid.isEmpty else { return }
         let client = makeClient(config)
 
-        if let cursor = hydrationCursorStore.offset(sid) {
-            await importTranscript(sid, after: cursor, into: thread, client: client, context: context)
+        if let cursor = hydrationCursorStore.cursor(cid) {
+            await importTranscript(cid, after: cursor, into: thread, client: client, context: context)
         } else if thread.turns.isEmpty {
-            await importTranscript(sid, after: 0, into: thread, client: client, context: context)
+            await importTranscript(cid, after: nil, into: thread, client: client, context: context)
         } else {
-            await seedCursorToEnd(sid, from: 0, client: client)
+            await seedCursorToEnd(cid, from: nil, client: client)
         }
     }
 
-    /// Import the transcript delta from `after` into `thread` (append turns) and advance
-    /// the cursor to the returned end. A 404 leaves the cache untouched.
-    private func importTranscript(_ sid: String, after: UInt64, into thread: JesseThread,
+    /// Import the transcript delta from `cursor` into `thread` and advance the cursor to the
+    /// returned end. A 404 leaves the cache untouched.
+    ///
+    /// Every incoming turn goes through the shared `TranscriptMerge`, which is what makes
+    /// this idempotent: a turn whose `turn_key` is already held is skipped, an UNKEYED turn
+    /// the app created optimistically has the key bound onto it (one bubble, not two), and
+    /// only a genuinely new turn is inserted. iOS previously appended every hydrated turn
+    /// unconditionally, which is exactly the double-bubble bug.
+    private func importTranscript(_ conversationId: String, after cursor: String?,
+                                  into thread: JesseThread,
                                   client: any JesseClientProtocol, context: ModelContext) async {
         do {
-            let (turns, next) = try await client.hydrate(sessionId: sid, after: after)
-            for t in turns {
-                let role: TurnRole = (t.role == "assistant") ? .jesse : .user
-                let turn = Turn(role: role, text: t.text, createdAt: Self.parseHydrateTimestamp(t.timestamp))
-                turn.thread = thread
-                context.insert(turn)
+            let (turns, next) = try await client.hydrate(conversationId: conversationId,
+                                                        after: cursor)
+            let existing = thread.orderedTurns
+            let plan = TranscriptMerge.plan(
+                existing: existing.map {
+                    TranscriptMerge.Existing(role: $0.role, text: $0.text, sourceKey: $0.sourceKey)
+                },
+                incoming: turns)
+            var inserted = 0
+            var bound = 0
+            for (i, action) in plan.enumerated() where i < turns.count {
+                let t = turns[i]
+                switch action {
+                case .skip:
+                    break
+                case let .bind(existingIndex):
+                    guard existingIndex < existing.count, !t.turnKey.isEmpty else { break }
+                    existing[existingIndex].sourceKey = t.turnKey
+                    bound += 1
+                case .insert:
+                    let turn = Turn(role: TranscriptMerge.role(for: t.role), text: t.text,
+                                    createdAt: TranscriptMerge.timestamp(t.timestamp))
+                    turn.sourceKey = t.turnKey.isEmpty ? nil : t.turnKey
+                    turn.thread = thread
+                    context.insert(turn)
+                    inserted += 1
+                }
             }
-            if !turns.isEmpty {
-                thread.updatedAt = Date()
+            if inserted > 0 { thread.updatedAt = Date() }
+            if inserted > 0 || bound > 0 {
                 do { try save(context) } catch {
                     Log.run.error("hydrate save failed: \(error.localizedDescription)")
                 }
             }
-            hydrationCursorStore.setOffset(sid, next)
+            hydrationCursorStore.setCursor(conversationId, next)
         } catch JesseError.badResponse(404, _) {
-            // Session gone server-side (gc'd / deleted): leave the cached copy.
+            // Conversation gone server-side (gc'd / deleted): leave the cached copy.
         } catch {
             Log.run.debug("hydrate failed: \(error.localizedDescription)")
         }
     }
 
-    /// Advance a session's cursor to the current transcript end WITHOUT importing, used to
-    /// seed a phone-started thread on first open and to move past the phone's own turns at
-    /// delivery, so a later hydrate returns only genuinely-new content. Best-effort: a 404
-    /// or transport failure leaves the cursor unchanged (the next open re-decides).
-    private func seedCursorToEnd(_ sid: String, from: UInt64, client: any JesseClientProtocol) async {
-        if let (_, next) = try? await client.hydrate(sessionId: sid, after: from) {
-            hydrationCursorStore.setOffset(sid, next)
+    /// Advance a conversation's cursor to the current transcript end WITHOUT importing, used
+    /// to seed a locally-started thread on its first open. Best-effort: a 404 or transport
+    /// failure leaves the cursor unchanged (the next open re-decides).
+    private func seedCursorToEnd(_ conversationId: String, from cursor: String?,
+                                 client: any JesseClientProtocol) async {
+        if let (_, next) = try? await client.hydrate(conversationId: conversationId, after: cursor) {
+            hydrationCursorStore.setCursor(conversationId, next)
         }
     }
 
-    /// Advance the hydration cursor past a reply that was just delivered locally (the
-    /// phone's own turns are already in the bridge transcript), mirroring
-    /// `MacCoordinator.finalize`. Fire-and-forget and best-effort so it never blocks or
-    /// fails the turn. Called from the ONE delivery point (`TurnWriter.write` → `.delivered`),
-    /// which every local-append path funnels through, so the cursor advances once per reply
-    /// and a later hydrate never re-imports the phone's own record.
-    private func advanceCursorAfterDelivery(sessionId: String?) {
-        guard let sid = sessionId, !sid.isEmpty, configProvider().isConfigured else { return }
+    /// After a reply is delivered locally, pull the transcript through the SAME merge the
+    /// open path uses, so the delivered turns acquire their stable `turn_key`s and the cursor
+    /// advances past them.
+    ///
+    /// This replaces a seed-to-end that imported nothing. That hack existed only because the
+    /// merge was unsafe: hydrating right after a delivery would re-append the turns the app
+    /// had just rendered. With the key-based merge, hydrating here is idempotent (a rendered
+    /// turn gets its key BOUND, never a second bubble) and strictly better, because it is what
+    /// binds the keys in the first place. Fire-and-forget and best-effort, so it never blocks
+    /// or fails the turn.
+    private func advanceCursorAfterDelivery(threadID: UUID, conversationId: String?,
+                                            context: ModelContext) {
+        guard let cid = conversationId, !cid.isEmpty, configProvider().isConfigured else { return }
         let client = makeClient(configProvider())
-        let from = hydrationCursorStore.offset(sid) ?? 0
-        Task { await seedCursorToEnd(sid, from: from, client: client) }
+        Task { [weak self] in
+            guard let self else { return }
+            let cursor = self.hydrationCursorStore.cursor(cid)
+            // Re-fetch by id: the task runs after the delivery, and the thread may have been
+            // deleted (or merged away) in between.
+            guard let thread = self.thread(threadID, context: context) else {
+                // Nothing to merge into: just move the cursor so a later open does not
+                // replay the whole transcript.
+                await self.seedCursorToEnd(cid, from: cursor, client: client)
+                return
+            }
+            await self.importTranscript(cid, after: cursor, into: thread,
+                                        client: client, context: context)
+        }
     }
 
-    /// Parse a transcript ISO-8601 timestamp; fall back to now so ordering stays stable
-    /// (mirrors `MacCoordinator.parseTimestamp`).
-    private static func parseHydrateTimestamp(_ s: String?) -> Date {
-        guard let s else { return Date() }
-        let iso = ISO8601DateFormatter()
-        iso.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        if let d = iso.date(from: s) { return d }
-        iso.formatOptions = [.withInternetDateTime]
-        return iso.date(from: s) ?? Date()
+    /// Fetch one thread by its local id.
+    private func thread(_ threadID: UUID, context: ModelContext) -> JesseThread? {
+        var d = FetchDescriptor<JesseThread>(predicate: #Predicate { $0.id == threadID })
+        d.fetchLimit = 1
+        return (try? context.fetch(d))?.first
     }
 
     /// Optimistic best-effort push of a just-toggled FAVORITE up to the bridge. The local
     /// write already happened (cache-first, the view saved it); this mirrors it up so the
-    /// other device converges on the next sync. No-op for a thread with no `session_id`
-    /// (purely local until its first reply lands). A failed push is intentionally
-    /// swallowed: the local `favoriteUpdatedMs` is now newer than the server, so the next
-    /// `refreshSessions` reconcile re-pushes it (the LWW reconcile is self-healing), so no
-    /// durable retry queue is needed and a failure never surfaces to the user.
+    /// other device converges on the next sync. No-op for a thread the sync has not bound to
+    /// a conversation yet. A failed push is intentionally swallowed: the local
+    /// `favoriteUpdatedMs` is now newer than the server, so the next `refreshSessions`
+    /// reconcile re-pushes it (the LWW reconcile is self-healing), so no durable retry queue
+    /// is needed and a failure never surfaces to the user.
     func pushFavoriteChange(for thread: JesseThread) {
-        guard let sid = thread.sessionId, !sid.isEmpty else { return }
+        guard let cid = thread.conversationId, !cid.isEmpty else { return }
         let write = FlagWrite(value: thread.isFavorite, updatedMs: thread.favoriteUpdatedMs)
         let client = makeClient(configProvider())
-        Task { try? await client.setFlags(sessionId: sid, favorite: write, archived: nil) }
+        Task { try? await client.setFlags(conversationId: cid, favorite: write, archived: nil) }
     }
 
     /// Optimistic best-effort push of a just-toggled ARCHIVE up to the bridge. Mirror of
     /// `pushFavoriteChange`; same self-healing best-effort semantics.
     func pushArchivedChange(for thread: JesseThread) {
-        guard let sid = thread.sessionId, !sid.isEmpty else { return }
+        guard let cid = thread.conversationId, !cid.isEmpty else { return }
         let write = FlagWrite(value: thread.isArchived, updatedMs: thread.archivedUpdatedMs)
         let client = makeClient(configProvider())
-        Task { try? await client.setFlags(sessionId: sid, favorite: nil, archived: write) }
+        Task { try? await client.setFlags(conversationId: cid, favorite: nil, archived: write) }
     }
 
     /// Manually retry a `.failed` outbox message — NEVER automatic. Re-runs the
@@ -1133,18 +1390,25 @@ final class RunCoordinator {
     private func fulfillAndRetry(threadID: UUID, thread: JesseThread?, needs: NeedsHealthRequest,
                                  retry: HealthRetry, voice: Bool, sessionId: String?,
                                  client: any JesseClientProtocol, context: ModelContext) async {
+        // The retry is the SAME turn on the SAME conversation, so it must carry the same
+        // identity: a fresh id here would register a second conversation for one message.
+        let conversationId = thread?.conversationId
+            ?? self.thread(threadID, context: context)?.conversationId
+            ?? JesseThread.mintConversationId()
         do {
             let result = try await client.sendFulfilling(
-                needs, mode: retry.mode, text: retry.text, sessionId: sessionId, voice: voice,
+                needs, mode: retry.mode, text: retry.text, sessionId: sessionId,
+                conversationId: conversationId, voice: voice,
                 instructions: retry.instructions, floorOverride: retry.floorOverride,
                 model: retry.model)
             switch result {
-            case .reply(let reply, _):
+            case .reply(let reply, _, _):
                 finish(threadID: threadID, thread: thread, reply: Self.appCapped(reply),
                        voice: voice, jobId: nil, context: context)
-            case .running(let jobId):
+            case .running(let jobId, let remoteConversationId):
                 // The new job replaces the sentinel's, so Re-check/resume target the
                 // answer turn. Consume with retry:nil — one retry per user message.
+                if let thread { adoptRegistration(thread: thread, conversationId: remoteConversationId) }
                 persist(threadID: threadID, job: InFlightJob(jobId: jobId, voice: voice))
                 await consume(threadID: threadID, thread: thread, jobId: jobId,
                               voice: voice, client: client, context: context, retry: nil)
@@ -1322,7 +1586,9 @@ final class RunCoordinator {
         // hydration cursor past it (best-effort) so a later open never re-imports the
         // phone's own reply. `.alreadyDelivered` re-entries already advanced on first sight.
         if case .delivered = outcome {
-            advanceCursorAfterDelivery(sessionId: reply.sessionId ?? thread?.sessionId)
+            advanceCursorAfterDelivery(threadID: threadID,
+                                       conversationId: thread?.conversationId,
+                                       context: context)
         }
         switch outcome {
         case .unresolvableThread:
@@ -1423,12 +1689,14 @@ final class RunCoordinator {
         titlesInFlight.insert(threadID)
         titleAttemptedKeys[threadID] = key
         let digest = titleDigest(for: thread)
+        // Persist the minted title under the conversation, so every device's list shows it.
+        let conversationId = thread.conversationId
         let cfg = configProvider()
 
         Task { [weak self] in
             guard let self else { return }
             let client = self.makeClient(cfg)
-            let title = await client.title(forDigest: digest)
+            let title = await client.title(forDigest: digest, conversationId: conversationId)
             self.titlesInFlight.remove(threadID)
             // nil = the bridge had no title (offline / no endpoint / empty) — keep
             // the derived title; `titleAttemptedKeys` prevents a re-fire for this
@@ -1602,11 +1870,24 @@ extension RunCoordinator {
     /// appends the `jesse` `Turn` via the shared `TurnWriter` on success. It never
     /// throws: every failure — a transport error, a bridge `.failed`, an expired or
     /// empty reply — becomes a `.failure(message)`.
+    /// `requestId` is the relay's idempotency key (the watch utterance's id), so a queued
+    /// `transferUserInfo` redelivered after the phone app restarts dedups at the bridge
+    /// rather than spawning a second turn.
+    ///
+    /// `onAccepted` fires with the conversation id at the 202, which is the ONLY point a
+    /// relayed turn has an acceptance signal: `runRelayTurn` itself does not return until the
+    /// whole poll completes, minutes later. Without this seam the watch could not tell
+    /// "still sending" from "the phone has it".
     func runRelayTurn(thread: JesseThread, text: String, voice: Bool,
-                      context: ModelContext) async -> RelayTurnResult {
+                      requestId: UUID, context: ModelContext,
+                      onAccepted: @escaping (String) -> Void = { _ in }) async -> RelayTurnResult {
         let mode = thread.modeValue
         let sessionId = thread.sessionId
         let threadID = thread.id
+        // A relayed turn is a turn: it carries the destination thread's conversation id, so
+        // the bridge registers it under the same thread a typed turn would.
+        let conversationId = thread.conversationId ?? JesseThread.mintConversationId()
+        if thread.conversationId != conversationId { thread.conversationId = conversationId }
         let client = makeClient(configProvider())
         let instructions = instructionsProvider(mode)
         let floorOverride = floorProvider(mode)
@@ -1617,14 +1898,21 @@ extension RunCoordinator {
         let outcome: TurnOutcome
         do {
             let result = try await client.send(mode: mode, text: text, sessionId: sessionId,
+                                               conversationId: conversationId,
                                                voice: voice, instructions: instructions,
                                                floorOverride: floorOverride, attachments: [],
-                                               requestId: nil, model: model)
+                                               requestId: requestId, model: model)
             switch result {
-            case .reply(let reply, _):
+            case .reply(let reply, _, let remoteConversationId):
                 // An older bridge that answered inline. Deliver it directly.
+                adoptRegistration(thread: thread, conversationId: remoteConversationId)
+                onAccepted(conversationId)
                 outcome = .done(reply)
-            case .running(let jobId):
+            case .running(let jobId, let remoteConversationId):
+                // The ACCEPTANCE moment for a relayed turn: report it back up so the watch
+                // can stop showing "Thinking" and say the phone has it.
+                adoptRegistration(thread: thread, conversationId: remoteConversationId)
+                onAccepted(remoteConversationId ?? conversationId)
                 // The normal path: poll the same authoritative completion loop a
                 // typed turn uses. No display stream is opened — the relay has no
                 // live view — so the poll alone owns completion here.
@@ -1654,7 +1942,9 @@ extension RunCoordinator {
             // Same delivery point as `finish`: advance the hydration cursor past the
             // relayed reply so a later open never re-imports the phone's own record.
             if case .delivered = outcome {
-                advanceCursorAfterDelivery(sessionId: reply.sessionId ?? thread.sessionId)
+                advanceCursorAfterDelivery(threadID: threadID,
+                                           conversationId: thread.conversationId,
+                                           context: context)
             }
             switch outcome {
             case .delivered, .alreadyDelivered:

@@ -5,29 +5,35 @@ import JesseCore
 import JesseNetworking
 
 /// A hydrated turn, built at file scope (nonisolated) so it can be constructed inside the
-/// fake's `hydrate` handler, which runs off the main actor.
-private func ht(_ role: String, _ text: String) -> HydratedTurn {
-    HydratedTurn(role: role, text: text, timestamp: nil)
+/// fake's `hydrate` handler, which runs off the main actor. `key` is the bridge's stable
+/// `turn_key`; an empty key means "unkeyed", which the merge treats as never matching a held
+/// key.
+private func ht(_ role: String, _ text: String, _ key: String = "") -> HydratedTurn {
+    HydratedTurn(role: role, text: text, timestamp: nil, turnKey: key)
 }
 
-/// Hydration on open. The path behind "old conversations show in the sidebar but clicking
-/// one never loads the transcript". Two failure modes are covered: the config lockout (an
-/// unconfigured coordinator silently no-ops, so nothing ever loads) and the cursor
-/// lifecycle for an adopted stub (full transcript on first open, byte-delta after). The old
-/// suite tested none of this because `MacCoordinator`'s send/hydrate client was built inline
-/// and could not be faked.
+/// Hydration on open. The path behind "old conversations show in the sidebar but clicking one
+/// never loads the transcript". Three failure modes are covered: the config lockout (an
+/// unconfigured coordinator silently no-ops, so nothing ever loads), the cursor lifecycle for
+/// an adopted stub (full history on first open, delta after), and the double-bubble the
+/// transcript-flush lag used to produce.
+///
+/// The cursor is the bridge's OPAQUE `"<segment>:<offset>"` string now, keyed on the
+/// CONVERSATION, and it is PRESENCE-based: an absent cursor is distinct from the start of the
+/// transcript, which the old `offset` returning 0 could not express.
 @MainActor
 final class MacHydrationTests: XCTestCase {
 
-    private func uniqueSid() -> String { "s-\(UUID().uuidString)" }
+    private func uniqueCid() -> String { "c-\(UUID().uuidString)" }
 
-    /// Clear a session's `.standard` cursor so tests don't contaminate each other (the
-    /// coordinator reads the cursor from `.standard`, keyed by session id).
-    private func clearCursor(_ sid: String) { MacCursorStore.clear(sid) }
+    /// Clear a conversation's `.standard` cursor so tests don't contaminate each other (the
+    /// coordinator reads the cursor from `.standard`, keyed by conversation id).
+    private func clearCursor(_ cid: String) { MacCursorStore.clear(cid) }
 
-    private func stub(sessionId: String, in context: ModelContext) -> JesseThread {
+    private func stub(conversationId: String, in context: ModelContext) -> JesseThread {
         let t = JesseThread(mode: .ask)
-        t.sessionId = sessionId
+        t.conversationId = conversationId
+        t.sessionId = "sess-\(conversationId)"
         context.insert(t)
         try? context.save()
         return t
@@ -35,13 +41,14 @@ final class MacHydrationTests: XCTestCase {
 
     func testAdoptedStubFullHydratesOnFirstOpen() async throws {
         let context = try MacTestFixtures.context()
-        let sid = uniqueSid(); defer { clearCursor(sid) }
-        let thread = stub(sessionId: sid, in: context)
+        let cid = uniqueCid(); defer { clearCursor(cid) }
+        let thread = stub(conversationId: cid, in: context)
 
-        // Cursor absent -> first open fetches from offset 0 and imports the whole transcript.
+        // Cursor ABSENT -> first open fetches the whole history. `nil` is the meaningful
+        // value here: it is what distinguishes "never hydrated" from "hydrated from the start".
         let fake = MacFakeBridgeClient(hydrate: { _, after in
-            XCTAssertEqual(after, 0, "an adopted stub full-hydrates from byte 0")
-            return ([ht("user", "hello"), ht("assistant", "hi there")], 200)
+            XCTAssertNil(after, "an adopted stub full-hydrates with NO cursor")
+            return ([ht("user", "hello", "s:0"), ht("assistant", "hi there", "s:60")], "0:200")
         })
         let coordinator = MacCoordinator(configStore: MacTestFixtures.configured(),
                                          makeClient: { _ in fake },
@@ -51,20 +58,23 @@ final class MacHydrationTests: XCTestCase {
 
         XCTAssertEqual(thread.orderedTurns.map(\.text), ["hello", "hi there"])
         XCTAssertEqual(thread.orderedTurns.map(\.isUser), [true, false])
-        XCTAssertEqual(MacCursorStore.offset(sid), 200, "the cursor advances past the imported transcript")
+        XCTAssertEqual(thread.orderedTurns.compactMap(\.sourceKey), ["s:0", "s:60"],
+                       "each imported turn carries its stable transcript key")
+        XCTAssertEqual(MacCursorStore.cursor(cid), "0:200",
+                       "the cursor advances past the imported history")
         XCTAssertEqual(fake.hydrateCalls.count, 1)
     }
 
     func testSecondOpenImportsOnlyTheDelta() async throws {
         let context = try MacTestFixtures.context()
-        let sid = uniqueSid(); defer { clearCursor(sid) }
-        let thread = stub(sessionId: sid, in: context)
+        let cid = uniqueCid(); defer { clearCursor(cid) }
+        let thread = stub(conversationId: cid, in: context)
 
         let fake = MacFakeBridgeClient(hydrate: { _, after in
             switch after {
-            case 0:   return ([ht("user", "hello"), ht("assistant", "hi there")], 200)
-            case 200: return ([ht("user", "more")], 260)   // only the new tail
-            default:  XCTFail("unexpected cursor \(after)"); return ([], after)
+            case nil:      return ([ht("user", "hello", "s:0"), ht("assistant", "hi there", "s:60")], "0:200")
+            case "0:200":  return ([ht("user", "more", "s:200")], "0:260")   // only the new tail
+            default:       XCTFail("unexpected cursor \(after ?? "nil")"); return ([], after ?? "0:0")
             }
         })
         let coordinator = MacCoordinator(configStore: MacTestFixtures.configured(),
@@ -76,16 +86,18 @@ final class MacHydrationTests: XCTestCase {
 
         XCTAssertEqual(thread.orderedTurns.map(\.text), ["hello", "hi there", "more"],
                        "the second open must append only the delta, not re-import")
-        XCTAssertEqual(MacCursorStore.offset(sid), 260)
-        XCTAssertEqual(fake.hydrateCalls.map(\.after), [0, 200])
+        XCTAssertEqual(MacCursorStore.cursor(cid), "0:260")
+        XCTAssertEqual(fake.hydrateCalls.map(\.after), [nil, "0:200"])
     }
 
     func testUnconfiguredHydrateIsASilentNoOp() async throws {
         let context = try MacTestFixtures.context()
-        let sid = uniqueSid(); defer { clearCursor(sid) }
-        let thread = stub(sessionId: sid, in: context)
+        let cid = uniqueCid(); defer { clearCursor(cid) }
+        let thread = stub(conversationId: cid, in: context)
 
-        let fake = MacFakeBridgeClient(hydrate: { _, _ in XCTFail("must not hit the bridge"); return ([], 0) })
+        let fake = MacFakeBridgeClient(hydrate: { _, _ in
+            XCTFail("must not hit the bridge"); return ([], "0:0")
+        })
         let coordinator = MacCoordinator(configStore: MacTestFixtures.unconfigured(),
                                          makeClient: { _ in fake },
                                          sessionDeletionStore: MacTestFixtures.deletionStore())
@@ -102,8 +114,8 @@ final class MacHydrationTests: XCTestCase {
     /// could. This is the concrete reproduction of "the transcript never appears".
     func testMigratedConfigHydratesWhereUnconfiguredCannot() async throws {
         let context = try MacTestFixtures.context()
-        let sid = uniqueSid(); defer { clearCursor(sid) }
-        let thread = stub(sessionId: sid, in: context)
+        let cid = uniqueCid(); defer { clearCursor(cid) }
+        let thread = stub(conversationId: cid, in: context)
 
         // Recover a pre-1.0(61) pairing via the migration.
         let kc = FakeKeychain()
@@ -114,7 +126,7 @@ final class MacHydrationTests: XCTestCase {
                                          defaults: d, legacyCopy: kc.copy, legacyDelete: kc.delete)
         XCTAssertTrue(configStore.isConfigured, "precondition: migration restored the pairing")
 
-        let fake = MacFakeBridgeClient(hydrate: { _, _ in ([ht("assistant", "restored")], 40) })
+        let fake = MacFakeBridgeClient(hydrate: { _, _ in ([ht("assistant", "restored", "s:0")], "0:40") })
         let coordinator = MacCoordinator(configStore: configStore, makeClient: { _ in fake },
                                          sessionDeletionStore: MacTestFixtures.deletionStore())
 
@@ -124,8 +136,8 @@ final class MacHydrationTests: XCTestCase {
 
     func testHydrate404LeavesTheCachedCopy() async throws {
         let context = try MacTestFixtures.context()
-        let sid = uniqueSid(); defer { clearCursor(sid) }
-        let thread = stub(sessionId: sid, in: context)
+        let cid = uniqueCid(); defer { clearCursor(cid) }
+        let thread = stub(conversationId: cid, in: context)
         let cached = Turn(role: .jesse, text: "cached reply"); cached.thread = thread
         context.insert(cached); try? context.save()
 
@@ -137,48 +149,51 @@ final class MacHydrationTests: XCTestCase {
         await coordinator.hydrate(thread: thread, context: context)
 
         XCTAssertEqual(thread.orderedTurns.map(\.text), ["cached reply"], "a 404 leaves the cache intact")
-        XCTAssertNil(coordinator.lastError, "a GC'd session is not a user-facing error")
+        XCTAssertNil(coordinator.lastError, "a GC'd conversation is not a user-facing error")
     }
 
     func testEmptyHydrateStillAdvancesCursor() async throws {
         let context = try MacTestFixtures.context()
-        let sid = uniqueSid(); defer { clearCursor(sid) }
-        let thread = stub(sessionId: sid, in: context)
+        let cid = uniqueCid(); defer { clearCursor(cid) }
+        let thread = stub(conversationId: cid, in: context)
 
-        let fake = MacFakeBridgeClient(hydrate: { _, _ in ([], 50) })
+        let fake = MacFakeBridgeClient(hydrate: { _, _ in ([], "0:50") })
         let coordinator = MacCoordinator(configStore: MacTestFixtures.configured(),
                                          makeClient: { _ in fake },
                                          sessionDeletionStore: MacTestFixtures.deletionStore())
 
         await coordinator.hydrate(thread: thread, context: context)
         XCTAssertTrue(thread.orderedTurns.isEmpty)
-        XCTAssertEqual(MacCursorStore.offset(sid), 50, "even an empty delta advances the cursor")
+        XCTAssertEqual(MacCursorStore.cursor(cid), "0:50", "even an empty delta advances the cursor")
     }
 
-    /// The reported double: a finalized exchange must show EXACTLY ONE assistant bubble — the
-    /// optimistic one carrying the provenance chip — even when a subsequent hydrate runs with a
-    /// cursor at/behind that exchange. Here the fake reproduces the bridge's transcript-flush lag:
-    /// `finalize`'s cursor-advance sees only the (flushed) user turn, so the cursor lands BEFORE
-    /// the assistant turn; the next on-open `hydrate` then returns that assistant turn. Without an
-    /// idempotent append it would be re-imported as a second, chip-less copy.
+    /// The reported double: a finalized exchange must show EXACTLY ONE assistant bubble, the
+    /// optimistic one carrying the provenance chip, even when a subsequent hydrate returns that
+    /// same turn. Here the fake reproduces the bridge's transcript-flush lag: the cursor lands
+    /// BEFORE the assistant turn, so the next on-open hydrate returns it.
+    ///
+    /// The turn is now BOUND to its transcript key rather than skipped by content, which is the
+    /// stronger property: it holds even when two turns are textually identical.
     func testSendThenFinalizeThenHydrateYieldsOneAssistantTurnWithProvenance() async throws {
         let context = try MacTestFixtures.context()
-        let sid = uniqueSid(); defer { clearCursor(sid) }
         let thread = JesseThread(mode: .ask)
+        let cid = try XCTUnwrap(thread.conversationId); defer { clearCursor(cid) }
         context.insert(thread); try? context.save()
 
         let prov = JesseProvenance(route: "hosted", model: "glm-5.2", costUsd: 0.0021,
                                    badge: "[glm-5.2 · $0.0021]",
                                    flags: JesseProvenanceFlags(hostedVerify: false, verifyQueued: false,
                                                                citationsUnverified: false))
-        let reply = JesseReply(text: "hi there\n\n" + prov.badge, sessionId: sid, provenance: prov)
+        let reply = JesseReply(text: "hi there\n\n" + prov.badge, sessionId: "sess-1", provenance: prov)
         let fake = MacFakeBridgeClient(
-            sendResult: .reply(reply, jobId: nil),
+            sendResult: .reply(reply, jobId: nil, conversationId: nil),
             hydrate: { _, after in
                 switch after {
-                case 0:   return ([ht("user", "hello")], 100)          // flush lag: assistant not yet in the jsonl
-                case 100: return ([ht("assistant", "hi there")], 200)  // on-open hydrate now sees it
-                default:  return ([], after)
+                // Flush lag: the assistant turn is not in the jsonl yet.
+                case nil:     return ([ht("user", "hello", "s:0")], "0:100")
+                // The on-open hydrate now sees it.
+                case "0:100": return ([ht("assistant", "hi there", "s:100")], "0:200")
+                default:      return ([], after ?? "0:0")
                 }
             })
         let coordinator = MacCoordinator(configStore: MacTestFixtures.configured(),
@@ -193,23 +208,25 @@ final class MacHydrationTests: XCTestCase {
         XCTAssertEqual(assistant.first?.text, "hi there", "with the badge stripped from the body")
         XCTAssertEqual(JesseProvenance.from(json: assistant.first?.provenanceJSON)?.model, "glm-5.2",
                        "and the surviving bubble keeps its provenance chip")
+        XCTAssertEqual(assistant.first?.sourceKey, "s:100",
+                       "the optimistic bubble was BOUND to its transcript key, not replaced")
         XCTAssertEqual(thread.orderedTurns.filter(\.isUser).count, 1, "the user turn is not duplicated either")
     }
 
     /// Idempotent hydration must still backfill a genuinely-new turn produced on ANOTHER device:
     /// a hydrated turn that is NOT already present is appended (chip-less, as it carries no local
-    /// provenance), while one that duplicates a local turn is skipped.
+    /// provenance), while one matching an unkeyed local turn is bound to it.
     func testHydrateStillBackfillsNewCrossDeviceTurns() async throws {
         let context = try MacTestFixtures.context()
-        let sid = uniqueSid(); defer { clearCursor(sid) }
-        let thread = stub(sessionId: sid, in: context)
-        // A local optimistic reply already present (as `finalize` would leave it).
+        let cid = uniqueCid(); defer { clearCursor(cid) }
+        let thread = stub(conversationId: cid, in: context)
+        // A local optimistic reply already present (as `finalize` would leave it), unkeyed.
         let local = Turn(role: .jesse, text: "local reply"); local.thread = thread
         context.insert(local); try? context.save()
 
         // The delta overlaps the local reply AND carries a new turn from the other device.
         let fake = MacFakeBridgeClient(hydrate: { _, _ in
-            ([ht("assistant", "local reply"), ht("user", "from the phone")], 300)
+            ([ht("assistant", "local reply", "s:0"), ht("user", "from the phone", "s:60")], "0:300")
         })
         let coordinator = MacCoordinator(configStore: MacTestFixtures.configured(),
                                          makeClient: { _ in fake },
@@ -219,21 +236,23 @@ final class MacHydrationTests: XCTestCase {
 
         XCTAssertEqual(thread.orderedTurns.map(\.text), ["local reply", "from the phone"],
                        "the overlapping turn is not duplicated; the genuinely-new turn is backfilled")
-        XCTAssertEqual(MacCursorStore.offset(sid), 300)
+        XCTAssertEqual(local.sourceKey, "s:0", "and the overlapping local turn acquired its key")
+        XCTAssertEqual(MacCursorStore.cursor(cid), "0:300")
     }
 
-    /// A user legitimately repeating the SAME message keeps both copies — the dedup consumes each
-    /// existing turn at most once, so it never collapses genuine repeats.
+    /// A user legitimately repeating the SAME message keeps both copies. This is the case the
+    /// old content-hash guard got WRONG in the other direction (it dropped the second one); a
+    /// key-based identity cannot.
     func testHydrateKeepsGenuineRepeatedMessages() async throws {
         let context = try MacTestFixtures.context()
-        let sid = uniqueSid(); defer { clearCursor(sid) }
-        let thread = stub(sessionId: sid, in: context)
+        let cid = uniqueCid(); defer { clearCursor(cid) }
+        let thread = stub(conversationId: cid, in: context)
         let first = Turn(role: .user, text: "ping"); first.thread = thread
         context.insert(first); try? context.save()
 
         // The transcript legitimately has "ping" twice; only one is already local.
         let fake = MacFakeBridgeClient(hydrate: { _, _ in
-            ([ht("user", "ping"), ht("user", "ping")], 120)
+            ([ht("user", "ping", "s:0"), ht("user", "ping", "s:60")], "0:120")
         })
         let coordinator = MacCoordinator(configStore: MacTestFixtures.configured(),
                                          makeClient: { _ in fake },
@@ -242,14 +261,16 @@ final class MacHydrationTests: XCTestCase {
         await coordinator.hydrate(thread: thread, context: context)
 
         XCTAssertEqual(thread.orderedTurns.filter { $0.text == "ping" }.count, 2,
-                       "one existing 'ping' is consumed; the second is a genuine new copy and survives")
+                       "the existing 'ping' is bound to the first key; the second is a genuine new copy")
     }
 
-    func testCursorClearForgetsOffset() {
-        let sid = uniqueSid()
-        MacCursorStore.setOffset(sid, 123)
-        XCTAssertEqual(MacCursorStore.offset(sid), 123)
-        MacCursorStore.clear(sid)
-        XCTAssertEqual(MacCursorStore.offset(sid), 0, "a cleared cursor re-hydrates from scratch")
+    func testCursorClearForgetsTheCursorAndAbsentIsNotTheStart() {
+        let cid = uniqueCid()
+        MacCursorStore.setCursor(cid, "1:123")
+        XCTAssertEqual(MacCursorStore.cursor(cid), "1:123")
+        MacCursorStore.clear(cid)
+        XCTAssertNil(MacCursorStore.cursor(cid),
+                     "a cleared cursor reads ABSENT, which is what distinguishes never-hydrated "
+                     + "from hydrated-from-the-start (the old `offset` returned 0 for both)")
     }
 }

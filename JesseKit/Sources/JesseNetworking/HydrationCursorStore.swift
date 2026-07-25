@@ -1,41 +1,69 @@
 import Foundation
 
-// Per-session byte cursor into a conversation's append-only transcript jsonl, so a
-// hydrate fetches only the delta appended since (`?after=`). PRESENCE-BASED on purpose:
-// an ABSENT cursor ("never hydrated") is distinct from a cursor at byte 0 ("hydrated,
-// nothing before the start"). That distinction is what lets the phone tell an adopted
-// stub (no cursor, no local turns → import the whole transcript) apart from a
-// phone-started thread (no cursor but its own turns already present → seed the cursor to
-// the end and import nothing, so the phone never re-imports its own record).
+// Per-conversation cursor into a conversation's transcript, so a hydrate fetches only what
+// was appended since. The cursor is the bridge's OPAQUE `"<segment>:<offset>"` string, not a
+// byte offset: a conversation can span several transcript files (a CLI session fork, or a
+// dropped `--resume` after a sweep), so a bare offset is not a sufficient position. The
+// client never parses it, only echoes it back.
 //
-// Kept in `UserDefaults` (small ints keyed by session id), NOT the SwiftData schema, so
-// tracking sync state adds no column to the model and needs no migration, the same
-// choice the Mac's `MacCursorStore` made. The backing `UserDefaults` is injected so a
-// test points it at a scratch suite.
+// PRESENCE-BASED on purpose: an ABSENT cursor ("never hydrated") is distinct from a cursor at
+// the very beginning ("hydrated, nothing before the start"). That distinction is what lets a
+// client tell an adopted stub (no cursor, no local turns, so import the whole transcript)
+// apart from a locally-started thread (no cursor but its own turns already present, so seed
+// the cursor to the end and import nothing).
+//
+// Kept in `UserDefaults` (small strings keyed by conversation id), NOT the SwiftData schema,
+// so tracking sync state adds no column to the model and needs no migration. The backing
+// `UserDefaults` is injected so a test points it at a scratch suite.
 public struct HydrationCursorStore {
     private let defaults: UserDefaults
-    private static let prefix = "jesse.hydrate.cursor."
+    /// The v2 prefix. The v1 keys held BYTE OFFSETS against a single session's transcript,
+    /// which are meaningless against the opaque conversation cursor and are keyed on a
+    /// session id rather than a conversation id, so they are purged rather than translated.
+    private static let prefix = "jesse.hydrate.cursor.v2."
+    /// The pre-conversation prefix, purged once on first use after the upgrade.
+    private static let legacyPrefix = "jesse.hydrate.cursor."
+    /// One-shot marker so the purge runs once rather than on every launch.
+    private static let purgedFlag = "jesse.hydrate.cursor.v1purged"
 
-    public init(defaults: UserDefaults = .standard) { self.defaults = defaults }
-
-    private func key(_ sessionId: String) -> String { Self.prefix + sessionId }
-
-    /// The stored cursor for a session, or `nil` if it has never been hydrated. `nil` is
-    /// meaningfully different from `0`: absent means "decide by whether the thread already
-    /// has local turns"; `0` means "hydrated from the very start".
-    public func offset(_ sessionId: String) -> UInt64? {
-        guard defaults.object(forKey: key(sessionId)) != nil else { return nil }
-        return UInt64(max(0, defaults.integer(forKey: key(sessionId))))
+    public init(defaults: UserDefaults = .standard) {
+        self.defaults = defaults
+        purgeLegacyCursorsOnce()
     }
 
-    /// Set the cursor to `value` (marks the session hydrated).
-    public func setOffset(_ sessionId: String, _ value: UInt64) {
-        defaults.set(Int(value), forKey: key(sessionId))
+    private func key(_ conversationId: String) -> String { Self.prefix + conversationId }
+
+    /// Drop every v1 byte-offset cursor, once. Note the ordering hazard this avoids:
+    /// `jesse.hydrate.cursor.` is a PREFIX of `jesse.hydrate.cursor.v2.`, so a purge that
+    /// ran after any v2 key had been written would delete live cursors. Filtering the v2
+    /// prefix out explicitly makes that safe regardless of when it runs.
+    private func purgeLegacyCursorsOnce() {
+        guard !defaults.bool(forKey: Self.purgedFlag) else { return }
+        for k in defaults.dictionaryRepresentation().keys
+        where k.hasPrefix(Self.legacyPrefix) && !k.hasPrefix(Self.prefix) && k != Self.purgedFlag {
+            defaults.removeObject(forKey: k)
+        }
+        defaults.set(true, forKey: Self.purgedFlag)
     }
 
-    /// Forget a session's cursor (so it reads as never-hydrated again), called when its
+    /// The stored cursor for a conversation, or `nil` if it has never been hydrated. `nil` is
+    /// meaningfully different from the start-of-transcript cursor: absent means "decide by
+    /// whether the thread already has local turns".
+    public func cursor(_ conversationId: String) -> String? {
+        guard let value = defaults.string(forKey: key(conversationId)), !value.isEmpty else {
+            return nil
+        }
+        return value
+    }
+
+    /// Set the cursor (marks the conversation hydrated).
+    public func setCursor(_ conversationId: String, _ value: String) {
+        defaults.set(value, forKey: key(conversationId))
+    }
+
+    /// Forget a conversation's cursor (so it reads as never-hydrated again), called when its
     /// local thread is deleted, cross-device or otherwise.
-    public func clear(_ sessionId: String) {
-        defaults.removeObject(forKey: key(sessionId))
+    public func clear(_ conversationId: String) {
+        defaults.removeObject(forKey: key(conversationId))
     }
 }

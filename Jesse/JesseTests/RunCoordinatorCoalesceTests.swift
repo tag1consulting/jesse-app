@@ -27,10 +27,12 @@ final class RunCoordinatorCoalesceTests: XCTestCase {
         var onStreamStarted: (() -> Void)?
         private var continuation: AsyncThrowingStream<JesseStreamEvent, Error>.Continuation?
 
-        func send(mode: JesseMode, text: String, sessionId: String?, voice: Bool,
+        func send(mode: JesseMode, text: String, sessionId: String?,
+                  conversationId: String, voice: Bool,
                   instructions: String?, floorOverride: String?,
-                  attachments: [JesseAttachment]) async throws -> JesseSendResult {
-            .running(jobId: "job-coalesce")
+                  attachments: [JesseAttachment], requestId: UUID,
+                  model: String?) async throws -> JesseSendResult {
+            .running(jobId: "job-coalesce", conversationId: nil)
         }
 
         // The poll never resolves, so `partialText` is never cleared by a terminal

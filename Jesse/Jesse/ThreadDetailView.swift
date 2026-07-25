@@ -174,6 +174,15 @@ struct ThreadDetailView: View {
                         .frame(maxWidth: .infinity, alignment: turn.isUser ? .trailing : .leading)
                         .id(turn.id)
                     }
+                    // Delivery caption under the LAST user bubble, exactly where Messages
+                    // puts "Delivered". "Sending…" is the pre-ACK window (the message could
+                    // still be lost with the POST); "Received" means the bridge registered
+                    // the conversation and accepted the turn, so it will be answered even if
+                    // the app is closed. It disappears when Jesse's turn is appended, just as
+                    // Messages' caption is replaced by the next message.
+                    if let phase = coordinator.phase(thread.id), turns.last?.isUser == true {
+                        DeliveryCaption(phase: phase)
+                    }
                     // Live, streaming reply: the partial text as it arrives, plus
                     // a coarse activity line under the spinner. Cleared and
                     // replaced by the persisted Turn the instant the turn finishes.
@@ -922,6 +931,54 @@ private struct ModelPickerMenu: View {
             try context.save()
         } catch {
             Log.run.error("selecting model \(model.id) for thread \(thread.id): \(error.localizedDescription)")
+        }
+    }
+}
+
+/// The trailing delivery caption under the last user bubble: the one place the UI
+/// distinguishes "still crossing the network" from "the server has it".
+///
+/// Standard iOS treatment only, and deliberately so: a caption in `.caption2`/`.secondary`,
+/// no new symbol, no checkmark glyph, no tint, and a default crossfade on the transition. It
+/// carries no second haptic either: there is already a light impact on send and a success
+/// haptic on the reply, and a third buzz in between is noise.
+///
+/// The accessibility label is where the actual meaning lives, and it is announced on the
+/// transition into `.accepted`, because that is the reassurance a screen-reader user needs
+/// and a two-word caption cannot convey.
+private struct DeliveryCaption: View {
+    let phase: TurnPhase
+
+    private var text: String {
+        switch phase {
+        case .sending: return "Sending…"
+        case .accepted: return "Received"
+        }
+    }
+
+    private var label: String {
+        switch phase {
+        case .sending:
+            return "Sending"
+        case .accepted:
+            return "Received by Jesse. Your message is saved and will be answered even if you leave the app."
+        }
+    }
+
+    var body: some View {
+        HStack {
+            Spacer(minLength: 0)
+            Text(text)
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+                .accessibilityLabel(label)
+        }
+        .padding(.trailing, 4)
+        .padding(.top, 2)
+        .animation(.default, value: phase)
+        .onChange(of: phase) { _, newPhase in
+            guard newPhase == .accepted else { return }
+            AccessibilityNotification.Announcement(label).post()
         }
     }
 }

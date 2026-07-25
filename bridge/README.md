@@ -66,6 +66,8 @@ change lives in one focused module:
 | `claude` | `build_claude_args` + `run_claude_streaming` and the `stream-json` parsing/classification (`parse_stream_line`, `classify_result_value`, `resolve_stream_outcome`) |
 | `attachments` | base64 decode + length helpers, magic-byte sniff, per-request `ScratchDir`, validation |
 | `apns` | the optional push path (device store, JWT minting, transport, completion→push decision) |
+| `conversations` | the conversation registry: the record, the session -> conversation reverse index, the in-flight claim table, and the one-time title/flag/deletion key migration |
+| `sessions` | the conversation list, hydration, delete and flags handlers, plus the projects-dir scan, the transcript-turn parser, and the GC sweep |
 | `state` / `handlers` / `sse` | shared `AppState`, the Axum handlers + router, and the SSE body/forwarder |
 | `startup` | pairing-QR payload + the `binary_exists`/bind startup checks |
 
@@ -97,12 +99,93 @@ curl -s http://127.0.0.1:8765/jesse \
 
 ## Threads / followups
 
-Each response returns a `session_id`. Omit it (or send `null`) for a fresh
-session — the default, so every Ask re-reads the vault. Pass it back to
-**continue the thread**, which is what clarification followups need (the question
-Jesse asked and your half-answer are conversation state, not vault facts).
+A **thread is a conversation**, and a conversation is a first-class bridge record
+with a stable UUID. Send `conversation_id` on every turn, first and follow-up
+alike; the 202 echoes back the authoritative id. See
+[Conversations](#conversations-the-thread-identity) for the model and
+[the conversation list](#conversation-list-get-jesseconversations) for the API.
+
+Each response also returns a `session_id`: the Claude Code session backing the
+conversation right now. A conversation owns an **ordered list** of those, so a CLI
+session fork does not split the thread. Passing `session_id` back still works (it
+is what a pre-0.33 client does), but `conversation_id` is what identifies the
+thread: when both are present the conversation's current session wins.
+
 Resuming keeps `CLAUDE.md` loaded and retains filesystem access — it only adds the
-prior turns on top.
+prior turns on top. Omitting `conversation_id` entirely makes the bridge mint one,
+so an older client keeps working unchanged.
+
+## Conversations, the thread identity
+
+Before 0.33 the bridge had **no concept of a conversation**. The list was a
+`read_dir` over the CLI's transcript files and a thread's identity was the filename
+stem of a jsonl the CLI created on its own schedule. That produced duplicates:
+
+- `POST /jesse` returned no thread identifier at all, so a client learned its
+  `session_id` only from the terminal reply, minutes later. Meanwhile the CLI had
+  already written the transcript, so `GET /jesse/sessions` was advertising a session
+  id the client could not possibly know yet, and a sync landing in that window
+  adopted it as a **second** thread.
+- A CLI session fork on `--resume`, or a dropped `--resume` after a GC sweep, minted
+  a **new** transcript, which the scan turned into yet another row.
+
+A conversation fixes both. It is **registered at accept time, before the 202 is
+returned**, and it owns the ordered list of session ids bound to it.
+
+```json
+{
+  "conversation_id": "0f8c2b1e-9a4d-4c77-b2e1-6d5a0c3f9b84",
+  "session_ids": ["0a61d246-…", "7c9e1f02-…"],
+  "created_ms": 1753430000123,
+  "registered_ms": 1753430000123,
+  "origin": "phone"
+}
+```
+
+Persisted to `<state_dir>/conversations.json` as
+`{"v":1,"migrated":true,"conversations":{ "<conversation_id>": { … } }}` with the
+same discipline as every other store (atomic temp + rename, `sync_all`, mode 0600,
+best-effort). With no state dir the registry is in-memory only, so every transcript
+is re-adopted on restart. Only ids and timestamps are ever written.
+
+- **`session_ids` is the alias list**, oldest first; the last element is what a
+  resume targets. A fork appends, so the conversation is still one row.
+- **`origin`** (`phone` / `mac` / `watch` / `cli`) is advisory. Nothing branches on it.
+
+**The client mints the UUID; the bridge registers it.** A bridge-minted id would
+reopen the exact race being closed: there would be a window in which the server
+knows an identifier the client does not. With a client-minted, bridge-registered id
+there is never such a window. The bridge still returns the **authoritative** id in
+the 202 and remains free to override the requested one, and registration is
+idempotent by construction: re-POSTing the same conversation registers nothing new.
+
+**Adopting a legacy transcript.** A transcript on disk with no record is adopted
+into a conversation whose id is the **deterministic UUIDv5** of its session id
+(namespace `f5c1a0b2-8e3d-4a19-9b77-2c0d6e4f8a31`). Determinism is the point:
+adoption is idempotent, and a state dir lost and rebuilt from the transcripts alone
+reproduces exactly the ids clients already hold. A `POST /jesse/title` one-shot
+transcript is never adopted: it is not a conversation.
+
+**A turn's transcript is not adopted while the turn is running.** The CLI writes
+`<session_id>.jsonl` at spawn, not at completion (verified against
+`claude 2.1.220`: the file appears within a second of spawn on a multi-second
+turn). A conversation-list refresh issued mid-turn would therefore find an unbound
+stem and adopt it separately, the very duplicate this design removes, and the
+reply binding arrives too late to help. So every running turn records the set of
+stems that existed just before it spawned, and the refresh **skips** any stem
+absent from every live snapshot: such a stem is by construction attributable to a
+turn still in flight. It produces no record and no list row that round. On
+termination the turn binds the reply's session id and then diffs the stems, which
+also rescues a turn that **failed** before returning any session id. The claim is
+released by a drop guard, so a panic or a cancel cannot wedge adoption.
+
+**Titles, flags, and tombstones are keyed on the conversation id**, not the session
+id (a session id is no longer stable). An existing state dir is re-keyed once at
+startup through the reverse index: a key that resolves moves onto its conversation,
+a key that resolves to nothing is dropped for titles and flags, and for deletions is
+additionally recorded under its deterministic v5 id so an in-flight tombstone is not
+lost. The pass is guarded by a persisted flag, so it runs exactly once, and it
+carries flag rows over unchanged so every last-writer-wins clock survives.
 
 ## Surviving a client disconnect (job store)
 
@@ -114,10 +197,19 @@ reply is never lost.
 `POST /jesse` returns the `job_id` **immediately** — it never holds the
 connection:
 
-- Always → **`202 { "job_id": "...", "status": "running" }`**, the instant the
-  turn is spawned. The turn then runs server-side and lands in the job store; the
-  phone fetches the reply via `GET /jesse/result/{job_id}` (poll) and/or
+- Always → **`202 { "job_id": "...", "conversation_id": "...", "status": "running" }`**,
+  the instant the turn is spawned. The turn then runs server-side and lands in the job
+  store; the phone fetches the reply via `GET /jesse/result/{job_id}` (poll) and/or
   `GET /jesse/stream/{job_id}` (live tokens).
+
+  `conversation_id` is the **authoritative** conversation this turn belongs to,
+  registered *before* this response is built (see
+  [Conversations](#conversations-the-thread-identity)). It is additive (a pre-0.33
+  client decoding only `job_id` is unaffected) and it is also the **acceptance
+  signal** a UI needs, since its arrival is the first moment a client can know the
+  turn is durably the server's. A malformed `conversation_id` is rejected with
+  `400 { "error": "…" }` before any work happens; only a canonical **lowercase
+  hyphenated** UUID is accepted (uppercase, braced, and urn forms are not).
 
 > **Why immediate, and not a grace hold?** An earlier design held the connection
 > up to a `JESSE_GRACE_SECS` window so a fast turn could answer inline with a
@@ -161,7 +253,8 @@ curl -s -X POST http://127.0.0.1:8765/jesse \
 curl -s -X POST http://127.0.0.1:8765/jesse \
   -H "Authorization: Bearer $JESSE_TOKEN" -H "Content-Type: application/json" \
   -d '{"mode":"ask","text":"When is my next race?","request_id":"2f9c1a-turn-0007"}'
-# → 202 { "job_id": "<same id as the first accept>", "status": "running" }
+# → 202 { "job_id": "<same id as the first accept>",
+#          "conversation_id": "<the same conversation>", "status": "running" }
 ```
 
 - **Optional and additive.** `request_id` is a string, `≤ 64` chars, **ASCII
@@ -876,12 +969,12 @@ curl -s http://127.0.0.1:8765/jesse/title \
   -d '{"text":"<a bounded digest of the conversation to title>"}'
 # → { "title": "Weekend Trip Planning" }
 
-# Optionally persist the minted title under a session so GET /jesse/sessions can
-# show it (see the title store below):
+# Optionally persist the minted title under a conversation so
+# GET /jesse/conversations can show it (see the title store below):
 curl -s http://127.0.0.1:8765/jesse/title \
   -H "Authorization: Bearer $JESSE_TOKEN" \
   -H "Content-Type: application/json" \
-  -d '{"text":"<digest>","session_id":"<claude session id>"}'
+  -d '{"text":"<digest>","conversation_id":"<conversation id>"}'
 ```
 
 - **Auth / rate limit.** Same bearer auth as `/jesse` (constant-time compare;
@@ -902,11 +995,13 @@ curl -s http://127.0.0.1:8765/jesse/title \
   to its existing derived title — it is never surfaced to the user as an error, and
   a title failure is never fatal to the bridge.
 - **Optional server-side title store.** The body accepts an optional
-  `"session_id"`. When present **and** the title call succeeds, the minted title is
-  persisted server-side under that session_id **before** the response, so
-  `GET /jesse/sessions` can show it. **Omitting `session_id` reproduces today's
-  stateless behavior exactly** — nothing is stored (old clients keep working
-  unchanged). The store is a single JSON file `<state_dir>/titles.json` (0600,
+  `"conversation_id"`. When present **and** the title call succeeds, the minted title
+  is persisted server-side under that conversation **before** the response, so
+  `GET /jesse/conversations` can show it. A malformed id is a `400`. **Omitting it
+  reproduces the stateless behavior exactly**: nothing is stored (old clients keep
+  working unchanged). A legacy `"session_id"` is still accepted and resolved through the
+  conversation reverse index, since the store is conversation-keyed; an id that resolves
+  to no conversation stores nothing rather than writing a key no read path would look at. The store is a single JSON file `<state_dir>/titles.json` (0600,
   atomic temp+rename, best-effort — a write failure is logged, never fatal),
   following the device-token store's discipline; with no state dir configured it is
   **in-memory only** (titles lost on restart, the same degradation the job store
@@ -915,134 +1010,194 @@ curl -s http://127.0.0.1:8765/jesse/title \
 
 Response: `{ "title": String }` (unchanged whether or not `session_id` is sent).
 
-## Session list (`GET /jesse/sessions`)
+## Conversation list (`GET /jesse/conversations`)
 
-Lists the vault's Claude Code **sessions** (threads), newest first, so the app can
-show a history of conversations. Threads are Claude Code sessions: each session's
-transcript is a `<session_id>.jsonl` file under
-`~/.claude/projects/<escaped-vault-path>/`. This endpoint enumerates those files
-for the bridge's vault. **Read-only** — it never writes a session file.
+Lists the vault's **conversations**, newest first, so the app can show a history of
+threads. This is the canonical list; it is rendered from the
+[conversation registry](#conversations-the-thread-identity), not from a directory
+scan, which is what stops a mid-turn sync or a CLI session fork from surfacing a
+duplicate row. **Read-only**: it never writes a transcript.
 
 ```bash
-curl -s http://127.0.0.1:8765/jesse/sessions \
+curl -s http://127.0.0.1:8765/jesse/conversations \
   -H "Authorization: Bearer $JESSE_TOKEN"
-# → { "sessions": [
-#      { "session_id": "0a61d246-…", "last_modified": 1752500000,
-#        "first_message": "What is on Today.md?", "title": "Today Overview" },
+# → { "conversations": [
+#      { "conversation_id": "0f8c2b1e-…",
+#        "session_id": "7c9e1f02-…",
+#        "session_ids": ["0a61d246-…", "7c9e1f02-…"],
+#        "last_modified": 1752500000,
+#        "first_message": "What is on Today.md?",
+#        "title": "Today Overview",
+#        "favorite": false, "favorite_updated_ms": 0,
+#        "archived": false, "archived_updated_ms": 0,
+#        "registered_ms": 1753430000123 },
 #      …newest first…
-#    ] }
+#    ],
+#    "deleted": [ { "conversation_id": "…", "deleted_ms": 1753430000123 } ] }
 ```
 
 - **Auth / rate limit.** Same bearer auth (`401` without/with a wrong bearer) and
   the same per-service rate limiter (`429` on a burst) as `/jesse`.
-- **Fields.** `session_id` is the jsonl filename stem. `last_modified` is the
-  file's mtime in unix seconds (the sort key, newest first). `first_message` is the
-  text of the session's **first user turn**, truncated to **120 chars** on a char
-  boundary — read from only a bounded 64 KiB prefix of the file; a session whose
-  first user turn isn't found within that prefix gets `first_message: null` (never
-  an error). `title` comes from the [title store](#conversation-titles-post-jessetitle),
-  or `null` if none was ever minted for that session.
+- **`session_id`** is the conversation's **current** bound session, or `null` for a
+  conversation registered but not yet run (including one whose first turn is still in
+  flight). **`session_ids`** is the full ordered alias list, which a client needs to
+  bind its pre-upgrade threads to a conversation exactly once.
+- **`last_modified`** is the **maximum** mtime in unix seconds across every bound
+  transcript that still exists, falling back to `registered_ms / 1000` when there is
+  none yet. It is the sort key, newest first.
+- **`first_message`** is the text of the **oldest** bound transcript's first user
+  turn, so a fork never changes the derived title. Truncated to **120 chars** on a
+  char boundary and read from only a bounded 64 KiB prefix; a transcript whose first
+  user turn is not found within that prefix yields `first_message: null` (never an
+  error).
 - **`first_message` is the user's words, not the wrapper.** A bridge turn's first
   user line is the *wrapped* prompt (the per-turn clock line, any attached health
   context, and the Ask/Tell preamble around the message); an interactive session can
   lead with `<local-command-caveat>` / `<command-…>` CLI plumbing. The bridge strips
   what it added (the preamble and the always-appended capability note) and the caveat
   framing, so the snippet is the actual utterance. The same stripping is applied to
-  every hydrated user turn (see below), so history and the list agree.
-- **Title-mint transcripts are excluded.** Every `POST /jesse/title` runs a
-  `claude -p` one-shot that mints its OWN transcript whose first user turn is the
-  fixed title instruction. Those are not real conversations, so `list_sessions`
-  recognizes and drops them (a prefix match on the instruction, coupled to the
-  constant by a test). The hydration endpoint `404`s a title-mint id for the same
-  reason.
-- **Projects-dir derivation (verified).** The `<escaped-vault-path>` is
-  `cfg.vault` with **every non-alphanumeric character replaced by `-`** (so `/`,
-  `.`, and `_` all become `-`; an existing `-` is kept; runs are not collapsed).
-  e.g. `/Users/you/vault` → `-Users-you-vault`. This was
-  verified against `claude 2.1.208` by creating a session in a controlled cwd and
-  matching the created directory name; it is a **pure, unit-tested** function
-  (`escape_project_path`) pinned against that convention.
-- **`?since=<unix seconds>`.** Returns only sessions with mtime **strictly
-  greater** than the value — a cheap delta poll (usually small and often empty in
-  steady state).
-- **ETag / `304`.** The response carries a **strong ETag** (a quoted SHA-256 over
-  the exact response body). Send it back as `If-None-Match` and an unchanged list
-  returns **`304 Not Modified`** with an empty body. `*` also matches.
+  every hydrated user turn, so history and the list agree.
+- **`title`** comes from the [title store](#conversation-titles-post-jessetitle),
+  keyed on the conversation id, or `null` if none was ever minted.
+- **`favorite` / `archived`** and their `_updated_ms` clocks come from the flag
+  store, keyed on the conversation id, defaulting to `false` / `0`. They are part of
+  the serialized body, so flipping a flag changes the ETag and invalidates a cached
+  `304` automatically.
+- **`deleted`** carries recent [deletion tombstones](#delete-a-conversation-delete-jesseconversationconversation_id)
+  so every device converges on removals the same way it converges on flags. It is
+  **not** filtered by `?since=`. Every tombstone is reported whichever key space it
+  was recorded under; a client only ever acts on an id it actually holds, so an id it
+  does not recognize is inert.
+- **`?since=<unix seconds>`.** Returns only conversations whose `last_modified` is
+  **strictly greater** than the value: a cheap delta poll (usually small and often
+  empty in steady state).
+- **ETag / `304`.** The response carries a **strong ETag** (a quoted lowercase-hex
+  SHA-256 over the exact response body). Send it back as `If-None-Match` and an
+  unchanged list returns **`304 Not Modified`** with an empty body. `*` and a
+  comma-separated list also match. Ordering is newest `last_modified` first with ties
+  broken **ascending** on `conversation_id`, so the body (and the ETag) is stable
+  across calls with unchanged inputs.
+- **The registry is refreshed from disk first**, so a transcript left by a previous
+  bridge or written by the CLI outside the app is adopted before the list is
+  rendered. A stem attributable to a turn **still in flight** is deliberately
+  skipped: it produces no record and no row that round. Title-mint transcripts are
+  never adopted.
+- **Projects-dir derivation (verified).** The `<escaped-vault-path>` is `cfg.vault`
+  with **every non-alphanumeric character replaced by `-`** (so `/`, `.`, and `_` all
+  become `-`; an existing `-` is kept; runs are not collapsed). e.g.
+  `/Users/you/vault` → `-Users-you-vault`. This was verified against `claude 2.1.208`
+  by creating a session in a controlled cwd and matching the created directory name;
+  it is a **pure, unit-tested** function (`escape_project_path`) pinned against that
+  convention.
 - **Robustness.** A missing projects directory returns an **empty list**, not an
-  error (the bridge may run before any session exists). Unparseable jsonl lines are
-  skipped; non-`.jsonl` files and subdirectories are ignored; a filename that isn't
-  a plain component is skipped defensively (a listing can never reach outside the
-  projects dir).
+  error (the bridge may run before any conversation exists). Unparseable jsonl lines
+  are skipped; non-`.jsonl` files and subdirectories are ignored; a filename that
+  isn't a plain component is skipped defensively (a listing can never reach outside
+  the projects dir).
 
-## Hydrate a transcript (`GET /jesse/sessions/{session_id}`)
+## Hydrate a conversation (`GET /jesse/conversations/{conversation_id}/transcript`)
 
-Returns one session's transcript as **ordered, client-renderable turns**, so a
-client that never saw a thread's earlier turns can render its history. The turns are
-shaped exactly like a **live SSE turn**: user utterances (wrapper-stripped, as in the
-list snippet) and the assistant's **visible text** only — thinking, `tool_use`, and
-`tool_result` noise the phone would not render are dropped, along with subagent
-(`isSidechain`) and CLI `isMeta` lines.
+Returns a conversation's whole history as **ordered, client-renderable turns**,
+across every transcript bound to it, so a client that never saw a thread's earlier
+turns can render them. The turns are shaped exactly like a **live SSE turn**: user
+utterances (wrapper-stripped, as in the list snippet) and the assistant's **visible
+text** only: thinking, `tool_use`, and `tool_result` noise the phone would not
+render are dropped, along with subagent (`isSidechain`) and CLI `isMeta` lines.
 
 ```bash
-curl -s http://127.0.0.1:8765/jesse/sessions/<session_id> \
+curl -s "http://127.0.0.1:8765/jesse/conversations/<conversation_id>/transcript" \
   -H "Authorization: Bearer $JESSE_TOKEN"
-# → { "session_id": "0a61d246-…",
+# → { "conversation_id": "0f8c2b1e-…",
 #     "turns": [
-#       { "role": "user",      "text": "What is on Today.md?", "timestamp": "2026-07-20T08:00:00.000Z" },
-#       { "role": "assistant", "text": "Two things: a call and a run.", "timestamp": "…" }
+#       { "role": "user",      "text": "What is on Today.md?",
+#         "timestamp": "2026-07-20T08:00:00.000Z", "turn_key": "0a61d246-…:0" },
+#       { "role": "assistant", "text": "Two things: a call and a run.",
+#         "timestamp": "…", "turn_key": "0a61d246-…:512" }
 #     ],
-#     "next_offset": 4821 }
+#     "next_cursor": "1:4096" }
 ```
 
 - **Auth / rate limit.** Same bearer auth (`401`) and the same per-service rate
-  limiter (`429`) as `/jesse/sessions`.
-- **`?after=<byte offset>` — the delta sync.** The transcript jsonl is
-  **append-only**, so the endpoint returns only the content appended after `after`
-  plus a fresh **`next_offset`** to send next time. Omit `after` (or send `0`) for the
-  full history. A reconnecting client re-syncs in one small round trip: send back the
-  `next_offset` it last saw. The offset is an exact byte position at a **line
-  boundary** — a **partial trailing line** (the file caught mid-write) is left
-  unconsumed, so `next_offset` points at its start and it is returned on the next
-  `?after=` call once the writer completes it. `after` at/after EOF returns no turns
-  and the current length.
-- **`404`** for an unknown id — and for a **title-mint** id (a `POST /jesse/title`
-  one-shot transcript), identically to the session list's exclusion.
-- **`400` — path-traversal safe.** The `session_id` must be a plain filename
-  component (non-empty, not `.`/`..`, no path separator); anything else is a `400`
-  **before** the filesystem is touched, so a crafted id can never resolve outside the
-  vault projects dir. The one file read is exactly `<session_id>.jsonl` in that dir,
-  via the same pure `session_transcript_path` / `escape_project_path` derivation
-  `/jesse/sessions` uses.
+  limiter (`429`) as the list.
+- **`?after=<cursor>`, the delta sync.** A conversation can span several transcript
+  files, so a bare byte offset is not a sufficient cursor. The cursor is an **opaque**
+  `"<segment_index>:<byte_offset>"` string: the index into the conversation's
+  `session_ids` plus the offset within that segment's file. Its internals are the
+  bridge's business: a client only echoes back the `next_cursor` it last saw. Omit
+  `after` (or send an empty value) for the whole history.
+- **Reading across segments.** The starting segment is read from its offset to EOF,
+  then each subsequent segment from offset 0, concatenated in segment order. Each
+  segment keeps the append-only per-file behavior: the offset is an exact byte
+  position at a **line boundary**, and a **partial trailing line** (the file caught
+  mid-write) is left unconsumed so it is returned on the next call once the writer
+  completes it. A cursor at or past the end yields no turns and echoes itself back.
+- **A missing segment is skipped, not an error.** A transcript swept by GC or deleted
+  while the conversation lived on is stepped over and the cursor advances past it. A
+  conversation legitimately outlives one of its transcripts.
+- **`turn_key`** is a stable, opaque per-turn key: `"<session_id>:<absolute byte
+  offset of the jsonl line that produced this turn>"`. It is unique within the
+  conversation and byte-identical across repeated hydrates, which is what lets a
+  client merge history without duplicating a turn it already holds, including two
+  genuinely identical messages, which a content hash would wrongly collapse.
+- **`404`** for an unknown `conversation_id`.
+- **`400`** for a malformed `conversation_id` (anything but a canonical lowercase
+  UUID) or a malformed cursor. A bad cursor is deliberately an error rather than a
+  silent reset to zero, which would replay the whole conversation and duplicate every
+  turn on the client.
 - **Never `500`s on a bad transcript.** Unparseable, non-UTF-8, or partial lines are
-  skipped (a partial trailing line is returned once complete); a session with only
-  tool traffic simply yields an empty `turns` array.
+  skipped; a conversation with only tool traffic simply yields an empty `turns` array.
 
-## Delete a session (`DELETE /jesse/session/{session_id}`)
+## Delete a conversation (`DELETE /jesse/conversation/{conversation_id}`)
 
-Deletes one Claude Code session for the bridge's vault — its transcript file
-`<home>/.claude/projects/<escaped-vault>/<session_id>.jsonl` — **scoped to the
-vault project only**. The app calls this when the user swipe-deletes a thread, so
-the remote transcript is reclaimed too (not just the phone's local copy).
+Deletes one conversation for the bridge's vault: **every** transcript bound to it,
+under `<home>/.claude/projects/<escaped-vault>/`, **scoped to the vault project
+only**. The app calls this when the user swipe-deletes a thread, so the remote
+transcripts are reclaimed too (not just the phone's local copy).
 
 ```bash
-curl -s -X DELETE http://127.0.0.1:8765/jesse/session/<session_id> \
+curl -s -X DELETE http://127.0.0.1:8765/jesse/conversation/<conversation_id> \
   -H "Authorization: Bearer $JESSE_TOKEN"
 # → 204 No Content
 ```
 
 - **Same bearer auth** as `/jesse` (`401` without/with a wrong bearer).
-- **Idempotent**, exactly like `POST /jesse/cancel`: an **unknown or already-gone**
-  id returns **`204`** (success), never an error — the app's durable delete-drainer
-  retries a queued delete, and the GC sweep below must never choke on a missing id.
-  A real failure to delete a file that *exists* is a `500`.
-- **Path-traversal safe.** The `session_id` must be a plain filename component
-  (non-empty, not `.`/`..`, no path separator); anything else is a `400` **before**
-  it can reach the filesystem, so a crafted id can never delete outside the vault
-  projects dir. The one file removed is exactly `<session_id>.jsonl` in that dir.
-- **Title cleanup.** Any title stashed for the session (see the title store) is
-  dropped, so a reclaimed id can't linger in `titles.json`.
-- **A deleted session is no longer resumable** — see the resume-after-sweep note
+- **Idempotent**, exactly like `POST /jesse/cancel`: an **unknown conversation, or
+  one whose files are already gone**, returns **`204`** (success), never an error:
+  the app's durable delete-drainer retries a queued delete, and the GC sweep below
+  must never choke. Only a real I/O failure deleting a file that *exists* is a `500`.
+- **`400`** for a malformed id, **before** the filesystem is touched. The ids are
+  canonical UUIDs, so a validated id is a safe path component by construction and can
+  never delete outside the vault projects dir.
+- **Title and flag cleanup.** The conversation's title and flag rows are dropped, so
+  a deleted conversation can't resurrect a stale title or favorite.
+- **A durable tombstone**, under the conversation id, so a device that adopted this
+  conversation learns to drop it on its next sync.
+- **A deleted conversation is no longer resumable**. See the resume-after-sweep note
   under the GC sweep below.
+
+## Conversation flags (`POST /jesse/conversation/{conversation_id}/flags`)
+
+Sets a conversation's **favorite / archived** flags, so the bridge (not one device)
+is the source of truth and every device converges on one set of favorites and one set
+of archived conversations.
+
+```bash
+curl -s -X POST http://127.0.0.1:8765/jesse/conversation/<conversation_id>/flags \
+  -H "Authorization: Bearer $JESSE_TOKEN" -H 'content-type: application/json' \
+  -d '{"favorite":true,"favorite_updated_ms":1753430000123}'
+# → { "favorite": true, "favorite_updated_ms": 1753430000123,
+#     "archived": false, "archived_updated_ms": 0 }
+```
+
+- **Same bearer auth and rate limiter** as the other routes.
+- The body carries any subset of `{ favorite, favorite_updated_ms, archived,
+  archived_updated_ms }`. Each provided flag is applied **last-writer-wins** by its
+  client-supplied change timestamp (unix millis): a **strictly newer** timestamp wins,
+  an equal or older write is ignored, so out-of-order writes from different devices
+  converge deterministically. A partial body (one flag only) leaves the other
+  untouched. The two flags are independent registers.
+- **`404`** for an unknown conversation, **`400`** for a malformed id.
+- Persisted to `<state_dir>/flags.json`, keyed on the conversation id.
 
 ## Session GC sweep (`JESSE_SESSION_TTL_DAYS`)
 
@@ -1059,8 +1214,17 @@ session jsonl whose **last-modified time is older than `JESSE_SESSION_TTL_DAYS`*
 - **Never deletes anything younger than the TTL, and never steps outside the vault
   project.** It enumerates only plain `*.jsonl` files directly under
   `<home>/.claude/projects/<escaped-vault>/` (the same scoping as
-  `GET /jesse/sessions`); subdirs, other files, and a non-plain stem are skipped.
+  `GET /jesse/conversations`); subdirs, other files, and a non-plain stem are skipped.
 - **Every reclaim is logged** with the session id and its age.
+- **Conversation records are swept too.** After the transcript sweep, a conversation
+  record whose bound transcripts are **all** gone and whose own `registered_ms` is
+  past the TTL is dropped, together with its title and flag rows. A conversation
+  registered at accept time whose turn then failed has zero transcripts and is
+  therefore eligible once it ages out; that is intended. A conversation with a turn
+  **in flight** is never dropped, however old its record.
+- **GC records no deletion tombstone**, in either phase. A device merely offline while
+  a conversation aged out must keep its local copy, so only an explicit user delete
+  tombstones.
 - **Resume-after-sweep safety.** Because a swept (or deleted) session can no longer
   be resumed while its phone thread still exists, a hosted turn whose requested
   session's transcript is gone starts a **fresh session** cleanly rather than
@@ -1532,9 +1696,12 @@ id is **never** passed to `--resume`; a follow-up carrying one runs the hosted t
 injects the catch-up block, and on success re-keys the ledger from the synthetic id to the
 real returned session id and moves any stored title with it.
 
-**Cosmetic limit.** A synthetic id has no jsonl transcript, so a thread served locally on
-its first turn will not appear in `GET /jesse/sessions` until its first hosted turn. The
-app's own thread list is app-side and unaffected.
+**Synthetic ids and the conversation list.** A synthetic `local-` id has no jsonl
+transcript and is never bound as a session of a conversation. The conversation itself is
+registered at accept time regardless, so a thread served locally on its first turn DOES
+appear in `GET /jesse/conversations`, with `session_id: null` until a hosted turn binds
+a real one. (Before the conversation registry it was invisible until then, because the
+list was a transcript scan.)
 
 **Content at rest.** `context.json` holds conversation content (raw questions and
 replies) in the state dir. That is the ledger's whole point; it is deliberately kept out

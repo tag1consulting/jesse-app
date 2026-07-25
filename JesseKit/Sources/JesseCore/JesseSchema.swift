@@ -40,6 +40,16 @@ import SwiftData
 //   • `Turn.attachments` → `TurnAttachment` (to-many, cascade, empty default)
 //   • the `WrittenMeal` entity, then its `contentHash` / `tombstoned` fields
 //   • the `OutboxItem` / `OutboxAttachment` entities (the send outbox)
+//   • `JesseThread.conversationId` (String?), `JesseThread.registeredAt` (Date?), and
+//     `Turn.sourceKey` (String?)  ← bridge-registered conversation identity: the
+//     cross-device sync key, the first-ACK stamp behind the delivery caption, and the
+//     per-turn transcript key hydration merges on. All three are additive optionals with
+//     nil defaults, deliberately so: `JesseThread.id` was NOT retyped to carry the
+//     conversation id, because that would be a real non-lightweight change (see the
+//     paragraph below) and the conversation id is a SYNC key, not an object identity.
+//     `conversationId` carries no `.unique` attribute either: a unique constraint on an
+//     optional String across two separate stores buys nothing, and uniqueness is enforced
+//     by the sync's merge pass instead.
 //
 // Each is a new property with a default, a new optional/relationship, or a new entity:
 // nothing renamed, retyped, or dropped. A store written before any of them opens under
