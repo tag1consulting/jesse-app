@@ -110,19 +110,25 @@ struct MacThreadDetailView: View {
                                    config: coordinator.configStore.config)
                     .disabled(running)
 
-                TextField("Message Jesse…", text: $draft, axis: .vertical)
-                    .textFieldStyle(.plain)
-                    .lineLimit(1...8)
+                // An AppKit-backed text view, not a SwiftUI TextField. A `TextField` reports
+                // Return through `.onSubmit`, which is handed no modifier state, so "Return
+                // sends, Return with a modifier makes a newline" cannot be written there at
+                // all. `ComposerTextView` decides in `keyDown(with:)`, where the modifiers
+                // still exist. Send remains gated by `send()` below, the same guard the send
+                // button's `disabled` state mirrors.
+                ComposerTextView(text: $draft, placeholder: "Message Jesse…", onSend: send)
+                    .frame(maxWidth: .infinity)
                     .padding(8)
                     .background(.quaternary.opacity(0.4), in: .rect(cornerRadius: 8))
-                    .onSubmit(send)
 
                 Button(action: send) {
                     Image(systemName: "arrow.up.circle.fill").font(.title2)
                 }
                 .buttonStyle(.plain)
-                .keyboardShortcut(.return, modifiers: .command)
                 .disabled(!canSend)
+                // No `.keyboardShortcut(.return, modifiers: .command)` here any more: Command
+                // plus Return is one of the newline combinations now, and a button shortcut
+                // would win the key before the focused composer ever saw it.
             }
         }
         .padding(12)

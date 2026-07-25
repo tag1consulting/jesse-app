@@ -67,21 +67,31 @@ final class MacFakeBridgeClient: BridgeClientProtocol, @unchecked Sendable {
     private var _hydrateCalls: [(conversationId: String, after: String?)] = []
     private var _deleted: [String] = []
     private var _sentConversationIds: [String] = []
+    private var _sentTexts: [String] = []
 
     var hydrateCalls: [(conversationId: String, after: String?)] { lock.withLock { _hydrateCalls } }
     var deletedCalls: [String] { lock.withLock { _deleted } }
     var sentConversationIds: [String] { lock.withLock { _sentConversationIds } }
+    /// The message text of every `send`, verbatim — so a test can assert what the bridge would
+    /// have received, embedded newlines included.
+    var sentTexts: [String] { lock.withLock { _sentTexts } }
+
+    /// Awaited at the top of `send`, before anything is recorded. A test that needs to observe the
+    /// in-flight state (the send gate while a turn runs) holds the send open here.
+    private let beforeSend: (@Sendable () async -> Void)?
 
     nonisolated init(
         conversations: ConversationsResult = .notModified,
         sendResult: JesseSendResult = .reply(JesseReply(text: "reply", sessionId: "sess"),
                                             jobId: nil, conversationId: nil),
         hydrate: @escaping (String, String?) throws -> (turns: [HydratedTurn], nextCursor: String)
-            = { _, after in ([], after ?? "0:0") }
+            = { _, after in ([], after ?? "0:0") },
+        beforeSend: (@Sendable () async -> Void)? = nil
     ) {
         self.conversations = conversations
         self.sendResult = sendResult
         self.hydrateHandler = hydrate
+        self.beforeSend = beforeSend
     }
 
     nonisolated var config: JesseConfig { JesseConfig(host: "studio", port: 8765, token: "tok") }
@@ -103,8 +113,10 @@ final class MacFakeBridgeClient: BridgeClientProtocol, @unchecked Sendable {
                           instructions: String?, floorOverride: String?,
                           attachments: [JesseRequest.Attachment], requestId: String,
                           model: String?) async throws -> JesseSendResult {
-        lock.withLock {
+        await beforeSend?()
+        return lock.withLock {
             _sentConversationIds.append(conversationId)
+            _sentTexts.append(text)
             // Echo the id back the way the bridge does, so the Mac's adopt-and-stamp path is
             // exercised rather than bypassed.
             switch sendResult {
