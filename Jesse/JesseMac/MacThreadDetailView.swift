@@ -212,16 +212,19 @@ private struct MacModelPickerMenu: View {
                                              deviceDefaultID: LastUsedModelStore.id)
     }
 
-    /// Populate the shared list, retrying on failure so a slow or briefly-unreachable bridge
-    /// fills in without user action. The button already shows the resolved model meanwhile; a
-    /// persistent failure just leaves it non-expandable. Stops when the list loads or the view
-    /// goes away.
+    /// Populate the shared list with ONE bounded, backed-off burst (`loadModelList`, the same
+    /// policy the iPhone uses), so a slow or briefly-unreachable bridge still fills in without
+    /// user action but a bridge that cannot answer no longer leaves a standing 3-second poll
+    /// running for as long as the conversation is open. The button already shows the resolved
+    /// model meanwhile; a persistent failure just leaves it non-expandable.
     private func loadWithRetry() async {
-        while !Task.isCancelled && store.state == nil {
-            await store.loadIfNeeded(config: config)
-            if store.state != nil { break }
-            try? await Task.sleep(for: .seconds(3))
-        }
+        _ = await loadModelList(
+            isConfigured: config.isConfigured,
+            fetch: {
+                await store.loadIfNeeded(config: config)
+                return store.state
+            },
+            sleep: { try? await Task.sleep(for: .seconds($0)) })
     }
 
     /// Pick a model for THIS conversation: store it on the thread and make it this Mac's

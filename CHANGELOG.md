@@ -15,6 +15,73 @@ CI both run it). See the "Versioning" section of `bridge/README.md`.
 
 ## [Unreleased]
 
+## [App 1.0 (81)] - 2026-07-26
+
+### Fixed
+- **The app burned battery whenever a conversation was on screen, and worse whenever a turn was
+  in flight.** All three causes were work that ran when nothing was changing. Measured on an
+  iPhone 17 simulator against a stub bridge that timestamps every request, with per-process CPU,
+  instruction and wakeup counters sampled from `proc_pid_rusage`. Baseline for reference: idle on
+  the conversation list, idle on the Health tab, and idle after a completed turn all measure
+  0.000% CPU, 0 wakeups and 0 requests, so every number below is pure waste.
+  - **The model picker's retry loop never stopped.** `ModelPickerMenu.loadWithRetry` (and its
+    macOS twin `MacModelPickerMenu`) ran `while !Task.isCancelled && state == nil { …fetch…;
+    sleep(3) }`, whose only exit other than cancellation was success. A bridge that cannot serve
+    `GET /jesse/models` — the laptop asleep, off the tailnet, an older bridge, a failed model
+    probe — makes the condition permanently false, so it re-fetched every 3 seconds for as long
+    as the conversation stayed open. Measured: **44 requests in 135 s (19.6/min, one every
+    3.07 s), with no backoff and no end**, plus 0.15% CPU sustained; on a phone the radio wake is
+    the expensive part. An unpaired app was worse: it skipped the fetch and looped on the sleep
+    forever, spinning on a condition retrying could never satisfy. Both pickers now share one
+    bounded, backed-off burst (`loadModelList` in JesseNetworking): four attempts 1 s, 2 s and
+    4 s apart, then stop; an unpaired app makes no attempt and takes no sleep at all. The retry's
+    own doc comment always said "a slow or *briefly* unreachable bridge" — only the code was
+    unbounded. The picker still shows the resolved model when the list never loads, and reopening
+    the conversation starts a fresh burst.
+  - **The send button held a display-link subscription for the entire duration of every turn.**
+    It was driven by `TimelineView(.animation(minimumInterval: 1/30, paused: !running))`, and
+    `.animation` is the display-link-backed schedule: `minimumInterval` throttles the body
+    re-evaluation but the app is still woken on every display frame (120 Hz on ProMotion).
+    Measured with one turn in flight and a completely static screen: **121–141 interrupt
+    wakeups/second plus up to 55 idle wakeups/second, and ~4% CPU, sustained**, attributed by
+    `sample` to `CADisplayLink → TimelineView.UpdateFilter → SendButton.body`. Jesse turns
+    routinely run for minutes. Nothing on the button changes at that rate: the fill sweep
+    finishes after 10 seconds and is a constant full-width rectangle afterwards, and the only
+    other time-varying thing is a whole-second counter. The button now uses a timer-driven
+    `SendButtonSchedule` — 30 Hz while the sweep is actually sweeping, 1 Hz afterwards, and
+    exactly one entry when no turn is running, so an idle button schedules nothing at all. The
+    sweep and the counter look exactly as before.
+  - **The streaming reply held a second display-link subscription for the whole turn**, about
+    20 interrupt wakeups/second on top of the button's, while a turn sat in tool use emitting no
+    text. That clock existed only to service a markdown parse the renderer's 10 Hz cap had
+    suppressed. `RunCoordinator` already publishes `partialText` no more often than that cap, so
+    a publish parses on the evaluation it triggers; the one exception is the tail, which
+    `flushPartial` publishes immediately. `StreamingPartialText` now holds no clock and arms a
+    single catch-up re-render only when `MarkdownStreamRenderer.hasRendered` says a publish
+    really was suppressed.
+- **A publish arriving exactly on the markdown coalescing interval was suppressed by
+  floating-point drift** (`0.4 - 0.3 == 0.09999999999999998`), found by the new test for the
+  above: roughly a third of on-cadence publishes were served the previous text. The interval
+  comparison now carries a nanosecond of slack.
+- **Push registration re-POSTed the same token on every foreground.** `refreshRegistration()`
+  runs on every `scenePhase == .active` and each one ends in `POST /jesse/device`; measured, eight
+  background/foreground toggles in 36 seconds produced eight identical writes. The write itself is
+  not waste — it is how a bridge restart, a rotated APNs token or a changed host gets covered — so
+  it still happens; only an identical repeat within 60 seconds is skipped (`PushRegistrationDedupe`),
+  since nothing it could detect can have changed in that window. A new token, a new host or port,
+  or a real return to the app all still register immediately.
+
+### Notes
+- Measured and left alone, so it is not re-investigated: the turn poll loop terminates correctly
+  (a whole completed turn costs 4 requests, the backoff reaches its 30 s ceiling, and 165 s of
+  idle afterwards costs 0 requests and 0 wakeups); closing a conversation does cancel its
+  in-flight view work; the Health tab and the conversation list are both silent when idle; there
+  are no `HKObserverQuery`, `HKAnchoredObjectQuery` or `enableBackgroundDelivery` calls anywhere
+  in the app, so HealthKit costs nothing at rest; Settings' model poll never even starts unless
+  the user scrolls its section into view; `WCSession` is activated once at launch and does not
+  poll; the voice capture's metering timer is invalidated on every teardown path; and the session
+  list refresh is ETag'd, so a repeat costs a 304.
+
 ## [App 1.0 (80)] - 2026-07-25
 
 ### Fixed

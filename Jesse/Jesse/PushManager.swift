@@ -21,6 +21,41 @@ final class PushRouter: ObservableObject {
     private init() {}
 }
 
+/// Whether a device-token registration needs to go to the bridge, or is a redundant
+/// repeat of one that just happened.
+///
+/// `refreshRegistration()` runs on EVERY `scenePhase == .active`, and each one ends in a
+/// `POST /jesse/device`. That is deliberate — it is how a bridge restart, a rotated APNs
+/// token, or a host change gets covered — but it means a rapid background/foreground
+/// toggle multiplies it: measured 8 identical `POST /jesse/device` writes for 8 toggles
+/// in 36 seconds, same token, same bridge, every one after the first a no-op server-side.
+///
+/// So: repeat the write when anything could have changed (a different token, a different
+/// bridge) or when enough time has passed that the bridge may have restarted, and skip it
+/// when the *same* registration was accepted moments ago. Pure, so the rule is testable
+/// without UIApplication, the Keychain, or the network.
+enum PushRegistrationDedupe {
+    /// How long an accepted registration is treated as still current. Short enough that a
+    /// genuine return to the app re-registers, long enough that flipping in and out of the
+    /// app does not write once per flip.
+    nonisolated static let window: TimeInterval = 60
+
+    /// One registration attempt's identity: the token plus the bridge it was sent to.
+    nonisolated struct Key: Equatable, Sendable {
+        let token: String
+        let host: String
+        let port: Int
+    }
+
+    /// Whether to send this registration. `last` is the previously accepted registration
+    /// and when it was accepted; `nil` means none yet (always send).
+    nonisolated static func shouldRegister(_ key: Key, last: (key: Key, at: Date)?, now: Date) -> Bool {
+        guard let last else { return true }
+        if last.key != key { return true }
+        return now.timeIntervalSince(last.at) >= window
+    }
+}
+
 /// Owns the device-token lifecycle and authorization request. A single shared
 /// instance; the AppDelegate forwards system callbacks here.
 @MainActor
@@ -31,6 +66,10 @@ final class PushManager {
     /// The most recent APNs device token (hex), kept so a foreground refresh can
     /// re-register it if the bridge restarted or the host changed.
     private var lastToken: String?
+    /// The last registration actually written to the bridge, and when — so an identical
+    /// repeat inside `PushRegistrationDedupe.window` is skipped instead of re-POSTed on
+    /// every foreground (see `PushRegistrationDedupe`).
+    private var lastRegistration: (key: PushRegistrationDedupe.Key, at: Date)?
     /// We only ever surface the system authorization prompt once.
     private var hasRequestedAuth = false
 
@@ -75,6 +114,17 @@ final class PushManager {
     private func registerWithBridge(token: String) {
         let cfg = ConfigStore.load()
         guard cfg.isConfigured else { return }
+        // Skip a registration that is byte-for-byte the one the bridge accepted moments
+        // ago — every foreground calls in here, and re-POSTing the same token to the same
+        // bridge on each one is a network write that cannot change anything.
+        let key = PushRegistrationDedupe.Key(token: token,
+                                             host: cfg.normalizedHost,
+                                             port: cfg.effectivePort)
+        let stamp = Date()
+        guard PushRegistrationDedupe.shouldRegister(key, last: lastRegistration, now: stamp) else {
+            return
+        }
+        lastRegistration = (key, stamp)
         let client = JesseClient(config: cfg)
         Task { try? await client.registerDevice(token: token) }
     }

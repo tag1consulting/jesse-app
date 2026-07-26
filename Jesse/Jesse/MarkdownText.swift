@@ -262,9 +262,17 @@ final class MarkdownStreamRenderer {
     /// changed AND at least `interval` has elapsed since the last parse; otherwise
     /// returns the cached blocks unchanged (so the view diff is a no-op and no parse
     /// runs). Unchanged text never re-parses.
+    /// Slack on the interval comparison so a publish arriving *at* the cadence the cap asks
+    /// for is not rejected by floating-point drift. `RunCoordinator` publishes `partialText`
+    /// exactly one `interval` apart, and without this a third of those land a fraction of a
+    /// femtosecond early (`0.4 - 0.3 == 0.09999999999999998`) and are suppressed — each one
+    /// then costing the streaming view a catch-up re-render for no reason.
+    private static let boundarySlack: TimeInterval = 1e-9
+
     func blocks(for text: String, now: Date) -> [MarkdownBlock] {
         if text == cachedSource { return cached }
-        if let last = lastParseAt, now.timeIntervalSince(last) < interval {
+        if let last = lastParseAt,
+           now.timeIntervalSince(last) < interval - Self.boundarySlack {
             return cached
         }
         cached = parse(text)
@@ -272,6 +280,15 @@ final class MarkdownStreamRenderer {
         lastParseAt = now
         return cached
     }
+
+    /// Whether `text` is what the cached blocks were parsed from — i.e. whether the last
+    /// `blocks(for:now:)` call actually rendered it, or the cadence cap served the previous
+    /// text instead.
+    ///
+    /// This is what lets the streaming view hold NO clock: it renders on each publish and
+    /// arms a single catch-up re-render only when a publish was suppressed, instead of
+    /// keeping a ticking timeline alive for the whole turn on the chance that one was.
+    func hasRendered(_ text: String) -> Bool { text == cachedSource }
 }
 
 /// Renders parsed markdown blocks as native SwiftUI views.
