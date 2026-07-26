@@ -196,7 +196,7 @@ struct ThreadDetailView: View {
                         if !partial.isEmpty {
                             // Coalesced to ~10Hz so a long stream doesn't re-parse
                             // the whole growing string on every delta (M8).
-                            StreamingPartialText(text: partial, running: running)
+                            StreamingPartialText(text: partial)
                                 .frame(maxWidth: .infinity, alignment: .leading)
                         }
                         if let activity = coordinator.activity(for: thread.id) {
@@ -640,20 +640,51 @@ struct ThreadDetailView: View {
 
 // MARK: - Pieces
 
-/// The live streaming reply, with its markdown parse coalesced to ~10Hz (M8). A
-/// `TimelineView` clock (the same pattern `SendButton` uses) re-evaluates at the
-/// renderer's interval; `MarkdownStreamRenderer` caches the parsed blocks between
-/// ticks, so the O(n²) "re-parse the whole growing string on every delta" is gone.
-/// The persisted Turn renders the complete text once the turn finishes.
+/// The live streaming reply, with its markdown parse coalesced to ~10Hz (M8).
+/// `MarkdownStreamRenderer` caches the parsed blocks, so the O(n²) "re-parse the whole
+/// growing string on every delta" is gone. The persisted Turn renders the complete text
+/// once the turn finishes.
+///
+/// This view holds NO clock. It used to render inside
+/// `TimelineView(.animation(minimumInterval: 0.1, paused: !running))`, which keeps a
+/// display-link subscription alive for the WHOLE turn — measured at roughly 20 interrupt
+/// wakeups/second on top of the send button's, for a screen whose text was not changing:
+/// a Jesse turn spends most of its time in tool use, emitting nothing.
+///
+/// The clock was only ever there to service a *suppressed* parse. `partialText` is
+/// published by `RunCoordinator` at most once per `MarkdownStreamRenderer.interval`
+/// already (that is where the coalescing belongs and is tested — `RunCoordinatorCoalesceTests`),
+/// so a publish normally parses immediately on the body re-evaluation it triggers. The one
+/// exception is the tail: `flushPartial` publishes the last chunk immediately, which can
+/// land inside the renderer's cooldown. So instead of a permanent timeline, arm exactly one
+/// catch-up re-render, and only when `hasRendered` says a publish really was suppressed.
 private struct StreamingPartialText: View {
     let text: String
-    let running: Bool
+    /// Bumped by the catch-up task to force one more body evaluation, past the renderer's
+    /// cooldown, so a suppressed tail is never left on screen.
+    @State private var catchUps = 0
     @State private var renderer = MarkdownStreamRenderer()
 
     var body: some View {
-        TimelineView(.animation(minimumInterval: MarkdownStreamRenderer.interval, paused: !running)) { context in
-            MarkdownText(blocks: renderer.blocks(for: text, now: context.date))
-        }
+        MarkdownText(blocks: renderer.blocks(for: text, now: Date()))
+            .task(id: CatchUpKey(text: text, catchUps: catchUps)) { await catchUpIfSuppressed() }
+    }
+
+    /// Identity for the catch-up task: a new text (or a completed catch-up) restarts it,
+    /// and SwiftUI cancels the previous one — so at most one is ever pending.
+    private struct CatchUpKey: Equatable {
+        let text: String
+        let catchUps: Int
+    }
+
+    /// If the render is already current — the overwhelmingly common case — do nothing at
+    /// all, so an idle stream costs zero timers. Otherwise wait out the renderer's cooldown
+    /// and trigger the single re-render that lets the parse through.
+    private func catchUpIfSuppressed() async {
+        guard !renderer.hasRendered(text) else { return }
+        try? await Task.sleep(for: .seconds(MarkdownStreamRenderer.interval))
+        guard !Task.isCancelled else { return }
+        catchUps &+= 1
     }
 }
 
@@ -793,6 +824,76 @@ private struct TurnAttachmentsView: View {
     }
 }
 
+/// How often the send button's clock has to tick, and for how long — the whole policy,
+/// pure and `nonisolated` so it is unit-testable with no view and no clock.
+///
+/// The button shows two time-varying things and nothing else:
+///  * the left→right fill sweep, which finishes at `fillSweepSeconds` and is a constant
+///    full-width rectangle from then on, and
+///  * the whole-second "Thinking… N" counter, which by construction changes at 1 Hz and
+///    is only shown once `N > fillSweepSeconds`.
+///
+/// So a smooth clock is needed for the first `fillSweepSeconds` of a turn, and 1 Hz for
+/// the rest of it. It used to run at the display refresh rate for the WHOLE turn: the
+/// button was driven by `TimelineView(.animation(minimumInterval: 1/30, paused: !running))`,
+/// and `.animation` is the display-link-backed schedule — `minimumInterval` throttles the
+/// body re-evaluation but the app is still woken on every display frame. Measured on an
+/// idle, unchanging screen with one turn in flight: **121–141 interrupt wakeups/second and
+/// ~4% CPU, sustained for the entire turn**, attributed by `sample` to
+/// `CADisplayLink → TimelineView.UpdateFilter → SendButton.body`. Jesse turns routinely run
+/// for minutes, and after the first 10 seconds not one pixel changed between those frames.
+enum SendButtonCadence {
+    /// Seconds for the left→right "thinking" fill to sweep fully across, and the
+    /// threshold past which the elapsed-seconds counter is shown.
+    nonisolated static let fillSweepSeconds: Double = 10
+    /// Frame interval while the sweep is actually sweeping.
+    nonisolated static let sweepInterval: TimeInterval = 1.0 / 30.0
+    /// Frame interval once the sweep is complete: only the whole-second counter changes.
+    nonisolated static let settledInterval: TimeInterval = 1
+
+    /// How long to wait before the next tick, for a turn that started `elapsed` ago.
+    nonisolated static func tickInterval(elapsed: TimeInterval) -> TimeInterval {
+        elapsed < fillSweepSeconds ? sweepInterval : settledInterval
+    }
+}
+
+/// The send button's timeline: `sweepInterval` ticks while the fill sweep is animating,
+/// `settledInterval` ticks afterwards, and — when no turn is running — exactly ONE entry,
+/// so the button renders once and no clock is left running at all.
+///
+/// Deliberately a timer-driven `TimelineSchedule` rather than `.animation`: a custom
+/// schedule asks the run loop for the next entry date, so an idle button holds no
+/// display-link subscription. That is the fix, not the cadence numbers.
+struct SendButtonSchedule: TimelineSchedule {
+    /// When the running turn started; `nil` when nothing is running (→ a static button).
+    let turnStart: Date?
+
+    func entries(from startDate: Date, mode: TimelineScheduleMode) -> AnyIterator<Date> {
+        guard let turnStart else {
+            // Not running: one entry, then the sequence ends and nothing is scheduled.
+            var delivered = false
+            return AnyIterator {
+                guard !delivered else { return nil }
+                delivered = true
+                return startDate
+            }
+        }
+        // SwiftUI asks for `.lowFrequency` in Low Power Mode (and on an always-on
+        // display). Honour it: drop the sweep's frame rate and keep only the cadence the
+        // counter needs — exactly the trade the mode is asking us to make.
+        let lowPower = mode == .lowFrequency
+        var next = startDate
+        return AnyIterator {
+            let entry = next
+            let elapsed = entry.timeIntervalSince(turnStart)
+            next = entry.addingTimeInterval(
+                lowPower ? SendButtonCadence.settledInterval
+                         : SendButtonCadence.tickInterval(elapsed: elapsed))
+            return entry
+        }
+    }
+}
+
 /// The send button with the left→right fill sweep, driven by a continuous clock
 /// (not a width tween) so it survives the layout shift the Cancel button causes.
 struct SendButton: View {
@@ -804,10 +905,10 @@ struct SendButton: View {
 
     /// Seconds for the left→right "thinking" fill to sweep fully across, and the
     /// threshold past which the elapsed-seconds counter is shown.
-    private static let fillSweepSeconds: Double = 10
+    private static let fillSweepSeconds: Double = SendButtonCadence.fillSweepSeconds
 
     var body: some View {
-        TimelineView(.animation(minimumInterval: 1.0 / 30.0, paused: !running)) { context in
+        TimelineView(SendButtonSchedule(turnStart: running ? startDate : nil)) { context in
             let elapsed = (running ? startDate.map { context.date.timeIntervalSince($0) } : nil) ?? 0
             let secs = Int(elapsed)
             Button(action: action) {
@@ -851,8 +952,9 @@ struct SendButton: View {
 /// else the ambient `opus` — drawn from `ModelSelectionResolver`, even before the list loads and
 /// even if it never does (an older bridge with no `/jesse/models`, or a persistent fetch
 /// failure). In that case the button simply shows the resolved model and is not expandable,
-/// rather than the whole control vanishing. The list is fetched with a retry loop so a slow or
-/// briefly-unreachable bridge fills in without user action.
+/// rather than the whole control vanishing. The list is fetched with ONE bounded, backed-off
+/// burst (`loadModelList`) so a slow or briefly-unreachable bridge fills in without user action
+/// — and an unreachable one does not leave a poll running for as long as the thread is open.
 private struct ModelPickerMenu: View {
     @Environment(\.modelContext) private var context
     @Bindable var thread: JesseThread
@@ -906,18 +1008,17 @@ private struct ModelPickerMenu: View {
                                              deviceDefaultID: LastUsedModelStore.id)
     }
 
-    /// Populate the list, retrying on failure so a slow or briefly-unreachable bridge fills in
-    /// without user action. The button already shows the resolved model meanwhile; a persistent
-    /// failure just leaves it non-expandable. Stops once the list loads or the view goes away.
+    /// Populate the list with ONE bounded, backed-off burst of attempts (`loadModelList`), so a
+    /// slow or briefly-unreachable bridge still fills in without user action but a bridge that
+    /// simply cannot answer no longer leaves a standing 3-second poll running for as long as the
+    /// conversation is open. The button already shows the resolved model meanwhile; a persistent
+    /// failure just leaves it non-expandable, and reopening the conversation retries.
     private func loadWithRetry() async {
-        while !Task.isCancelled && modelState == nil {
-            let cfg = ConfigStore.load()
-            if cfg.isConfigured {
-                modelState = try? await JesseClient(config: cfg).fetchModels()
-                if modelState != nil { break }
-            }
-            try? await Task.sleep(for: .seconds(3))
-        }
+        let cfg = ConfigStore.load()
+        modelState = await loadModelList(
+            isConfigured: cfg.isConfigured,
+            fetch: { try? await JesseClient(config: cfg).fetchModels() },
+            sleep: { try? await Task.sleep(for: .seconds($0)) })
     }
 
     /// Pick a model for THIS conversation: store it on the thread and make it this device's
