@@ -77,6 +77,44 @@ permitted tool can still do damage within its scope (e.g. `Bash(git:*)` can run
 arbitrary `git` subcommands, `Write` can overwrite vault files). Treat it as
 least-privilege within the vault, not as containment of a hostile agent.
 
+### MCP servers on a main turn (strict, qmd only)
+
+The main turn also passes `--strict-mcp-config` together with an explicit
+`--mcp-config`, on **both** branches `build_claude_args` can take (writes-enabled
+and read-only). Only the servers named in that config load:
+
+| Server | Why |
+| --- | --- |
+| `qmd` | Read-only vault search — the four `mcp__qmd__*` tools in the allowlist above. Required; the main path is the one route that must not degrade to an empty server set |
+
+Everything else is **absent at the root**, not denied by name — including the
+account-level cloud connectors (Gmail, Slack, Google Calendar, Google Drive) and
+`playwright`. `playwright` is excluded deliberately: no main-path feature
+references it, and it is the server a containment probe once drove to a live
+network fetch (see [Diet child tool
+isolation](#diet-child-tool-isolation-in-process-boundary)).
+
+**Why this is not redundant with the allowlist.** Before this, the main turn was
+the last child route without `--strict-mcp-config` — the diet and vault-QA
+children already had it — so the ambient user- and project-scope servers loaded
+into every phone turn. Their tools *were* refused, but only at the **permission
+layer**: the allowlist gates MCP tools exactly the way it gates built-ins, and a
+headless (`-p`) child cannot answer the resulting prompt. That is a real
+boundary, and a weaker one than never loading the server, because it survives
+only as long as nothing edits the allowlist, repairs a stale grant, or changes
+the CLI's default. Verified against the pinned CLI (2.1.220, 2026-07-27): a
+connector tool that previously came back *"requested permissions … but you
+haven't granted it yet"* now comes back *"No such tool available"*. A control
+pair on `qmd` — same flags, the tool present in `--allowedTools` versus omitted —
+confirms the allowlist is what gates MCP tools: present is approved with no
+prompt, omitted is the permission failure.
+
+`JESSE_MAIN_MCP_CONFIG` overrides the config (a file path or inline JSON). The
+shipped default resolves `qmd` from the child's `PATH`; set the override when
+`qmd` is not on it, since launchd's `PATH` is narrower than a login shell's.
+Vault search being absent from a turn is silent (never an error), so a wrong
+`PATH` degrades quietly rather than failing loudly.
+
 ## Diet child tool isolation (in-process boundary)
 
 The diet-logging pipeline (see the bridge README) spawns two **stateless,

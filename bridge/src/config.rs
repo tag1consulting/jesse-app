@@ -270,6 +270,15 @@ pub struct Config {
     // empty-servers const) and runs on the three read-only built-ins alone — qmd is
     // simply absent, never an error. Only the vault-QA child ever reads this.
     pub vaultqa_mcp_config: Option<String>,
+    // Optional MCP config for the MAIN turn — a file path or inline JSON, the same two
+    // forms `--mcp-config` accepts and the same resolution as `vaultqa_mcp_config` (env
+    // `JESSE_MAIN_MCP_CONFIG`). Unlike the vault-QA child, unset does NOT mean "no
+    // servers": the main path REQUIRES qmd, so unset falls back to
+    // `claude::MAIN_CHILD_MCP_CONFIG` (qmd only). Either way the main turn carries
+    // `--strict-mcp-config`, so the ambient user/project scopes — the account-level
+    // cloud connectors and playwright — never load. Set this when `qmd` is not on
+    // the bridge's PATH (launchd's PATH is narrower than a login shell's).
+    pub main_mcp_config: Option<String>,
     // Whether the bridge appends a one-line provenance BADGE to each delivered
     // `POST /jesse/jesse` reply (env `JESSE_MODEL_BADGE`, default TRUE). Display
     // only: it names which backend produced the delivered text (`[local · vault · …]`,
@@ -1577,6 +1586,9 @@ impl Config {
             // Optional MCP config path for the vault-QA child (the qmd server). Unset →
             // None → the child runs the read-only built-ins only, qmd absent.
             vaultqa_mcp_config: env_string("JESSE_VAULTQA_MCP_CONFIG"),
+            // Optional MCP config for the MAIN turn. Unset → None → the qmd-only inline
+            // const (`claude::MAIN_CHILD_MCP_CONFIG`), never the empty set.
+            main_mcp_config: env_string("JESSE_MAIN_MCP_CONFIG"),
             // Provenance badge on delivered replies; default on (see `resolve_model_badge`).
             model_badge: resolve_model_badge(),
             // Structured-metrics log path. Same `env_string` (trimmed, empty-filtered)

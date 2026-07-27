@@ -266,12 +266,34 @@ pub fn resolve_stream_outcome(
     }
 }
 
+/// The MCP server set for a MAIN turn, used when `JESSE_MAIN_MCP_CONFIG` is unset:
+/// exactly the **qmd** vault-search server and nothing else. Passed as `--mcp-config`
+/// alongside `--strict-mcp-config`, so the account-level cloud connectors (Gmail,
+/// Slack, Google Calendar, Google Drive) and `playwright` are never LOADED on a phone
+/// turn rather than merely refused at the permission layer.
+///
+/// `"command": "qmd"` is resolved from the child's `PATH`, mirroring how `claude_bin`
+/// defaults to the bare name `"claude"` with the absolute path supplied by env
+/// (`JESSE_CLAUDE_BIN`) in production. If `qmd` is not on the bridge's `PATH`, set
+/// `JESSE_MAIN_MCP_CONFIG` to a config naming the absolute interpreter + script path;
+/// no user-specific path is baked into this source.
+///
+/// Only qmd is declared. `playwright` is deliberately EXCLUDED: no main-path feature
+/// references it (verified — zero references under `bridge/` and zero in the vault's
+/// `CLAUDE.md` / skills), and it is the exact server a prior "fetch" probe drove to a
+/// live network fetch out of a child that was supposed to be contained.
+pub const MAIN_CHILD_MCP_CONFIG: &str =
+    r#"{"mcpServers":{"qmd":{"type":"stdio","command":"qmd","args":["mcp"]}}}"#;
+
 /// Build the argument vector for one `claude` invocation (everything after the
 /// binary name). Pure and side-effect-free so it can be unit-tested without
 /// spawning a process. Enforces the C1 least-privilege boundary:
 ///   * `--permission-mode default` (never `acceptEdits`/`bypassPermissions`)
 ///   * an explicit `--allowedTools` list (always present)
 ///   * a `--disallowedTools` denylist as defense-in-depth
+///   * `--strict-mcp-config` + an explicit `--mcp-config` (always present, on BOTH
+///     the writes-enabled and read-only branches) so ONLY the servers named there
+///     load — see [`MAIN_CHILD_MCP_CONFIG`]
 ///
 /// A `session_id` adds `--resume <id>` to continue a thread.
 ///
@@ -305,6 +327,27 @@ pub fn build_claude_args(
         // below rather than auto-accepted. Never acceptEdits/bypassPermissions.
         "--permission-mode".to_string(),
         "default".to_string(),
+        // ROOT MCP boundary, on EVERY main turn and on BOTH branches below: load only
+        // the servers named in `--mcp-config` (qmd). Without `--strict-mcp-config` the
+        // CLI also discovers the ambient user/project scopes, which is how the
+        // account-level cloud connectors (Gmail, Slack, Calendar, Drive) and
+        // playwright were loading into every phone turn — reachable at the root and
+        // stopped only by a permission prompt a headless `-p` child cannot answer.
+        // Live-verified on the pinned CLI 2.1.220 (2026-07-27): an MCP tool IN `--allowedTools`
+        // is approved automatically, while the SAME tool with the allowlist unchanged
+        // but the tool omitted fails with "requested permissions … but you haven't
+        // granted it yet". Refused-at-the-prompt is a weaker boundary than never
+        // loaded; this makes it never loaded. The main path was the LAST child route
+        // without this — the diet and vault-QA children already carry it.
+        "--strict-mcp-config".to_string(),
+        "--mcp-config".to_string(),
+        // Same resolution as the vault-QA child: `--mcp-config` takes a file PATH or
+        // inline JSON, so an env override supplies either; unset → the inline qmd-only
+        // const. NOT the empty-servers const — the main path REQUIRES qmd.
+        cfg.main_mcp_config
+            .as_deref()
+            .unwrap_or(MAIN_CHILD_MCP_CONFIG)
+            .to_string(),
     ];
     if active.writes_allowed {
         // Writes-on (opus, or a model granted writes in Phase 2): today's exact posture.
@@ -1792,6 +1835,83 @@ mod tests {
                 servers.map(|m| m.is_empty()).unwrap_or(true),
                 "the MCP config must declare NO servers: {mcp:?}"
             );
+        }
+    }
+
+    /// Positional lookup over a plain arg VECTOR (`build_claude_args` returns one, not a
+    /// `Command`), mirroring `cmd_arg_value`/`cmd_has_flag` for the diet/vault-QA children.
+    fn arg_value(args: &[String], flag: &str) -> Option<String> {
+        args.iter()
+            .position(|a| a == flag)
+            .and_then(|i| args.get(i + 1).cloned())
+    }
+
+    #[test]
+    fn main_turn_loads_only_the_declared_mcp_servers() {
+        // The MAIN path was the LAST child route without strict MCP config: the diet and
+        // vault-QA children already carried it, so ordinary phone turns were the one
+        // route still loading the ambient user/project MCP scopes — the account-level
+        // cloud connectors (Gmail, Slack, Calendar, Drive) and playwright. Those
+        // tools were refused, but only at the PERMISSION layer, which is a weaker
+        // boundary than never loading them (and one a headless `-p` child can only fail
+        // against, never answer). Asserted on BOTH branches `build_claude_args` can take
+        // — writes-enabled (ambient opus) and read-only (a non-ambient model) — because
+        // the flags are pushed before the branch and must never drift apart.
+        let cfg = test_config();
+        for (label, active) in [
+            ("writes-enabled", ActiveModel::ambient()),
+            ("read-only", glm_active()),
+        ] {
+            let args = build_claude_args(&cfg, "hi", None, &active);
+            assert!(
+                args.iter().any(|a| a == "--strict-mcp-config"),
+                "{label}: --strict-mcp-config must be present so ONLY --mcp-config servers load: {args:?}"
+            );
+            let mcp = arg_value(&args, "--mcp-config")
+                .unwrap_or_else(|| panic!("{label}: --mcp-config must be present: {args:?}"));
+            let parsed: serde_json::Value = serde_json::from_str(&mcp)
+                .unwrap_or_else(|e| panic!("{label}: --mcp-config must be valid JSON ({e}): {mcp:?}"));
+            let servers = parsed
+                .get("mcpServers")
+                .and_then(|v| v.as_object())
+                .unwrap_or_else(|| panic!("{label}: --mcp-config must declare mcpServers: {mcp:?}"));
+
+            // qmd is REQUIRED on the main path — unlike the vault-QA child, an unset
+            // override must NOT degrade to the empty server set.
+            assert!(
+                servers.contains_key("qmd"),
+                "{label}: the main path requires the qmd vault-search server: {mcp:?}"
+            );
+            // …and NOTHING else. An exact count (rather than a denylist of server names)
+            // is what makes re-adding ANY server — a cloud connector, playwright, or one
+            // that does not exist yet — a deliberate, test-breaking act instead of a
+            // silent widening. A name-based check would only catch the servers we
+            // happened to think of, the same fragility documented for the denylists.
+            assert_eq!(
+                servers.len(),
+                1,
+                "{label}: the main path must declare qmd and nothing else: {mcp:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn main_turn_mcp_config_honors_the_env_override() {
+        // Same resolution as the vault-QA child: `--mcp-config` accepts a file PATH or
+        // inline JSON, so `JESSE_MAIN_MCP_CONFIG` supplies either verbatim. This is the
+        // escape hatch for a host where `qmd` is not on the bridge's PATH (launchd's PATH
+        // is narrower than a login shell's) — no user-specific path is baked into the
+        // source. `--strict-mcp-config` still rides along.
+        let mut cfg = test_config();
+        cfg.main_mcp_config = Some("/etc/jesse/qmd.json".to_string());
+        for active in [ActiveModel::ambient(), glm_active()] {
+            let args = build_claude_args(&cfg, "hi", None, &active);
+            assert_eq!(
+                arg_value(&args, "--mcp-config").as_deref(),
+                Some("/etc/jesse/qmd.json"),
+                "the env override must be passed through verbatim: {args:?}"
+            );
+            assert!(args.iter().any(|a| a == "--strict-mcp-config"));
         }
     }
 

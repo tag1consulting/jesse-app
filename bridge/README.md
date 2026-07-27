@@ -1408,6 +1408,7 @@ persona-rendered defaults so the app's cached "default" matches what a turn buil
 | `JESSE_VAULTQA_AUTH_TOKEN` | _(off)_ | Vault-QA child's `ANTHROPIC_AUTH_TOKEN`. Required together with the other two `JESSE_VAULTQA_*` |
 | `JESSE_VAULTQA_MODEL` | _(off)_ | Vault-QA child's `ANTHROPIC_MODEL`. Required together with the other two `JESSE_VAULTQA_*`. A **partial** config (1–2 of the 3 set) logs a startup warning and is treated as unset. Each gated turn logs one provenance line (`vaultqa turn -> <local\|hosted-fallback rung=N> …`, base URL + model, never the token, never the question); every main turn stays on the ambient backend. A locally-answered turn does not enter the hosted session history (no `--resume` write); the **context ledger** (`JESSE_CONTEXT_CARRY`, on by default) closes that gap by injecting a catch-up block into the next hosted turn and a recent-conversation block into the local children — see [Context carry](#context-carry) |
 | `JESSE_VAULTQA_MCP_CONFIG` | _(off)_ | Optional path to an MCP config JSON declaring exactly the **qmd** vault-search server, layered onto the vault-QA child via `--mcp-config`. Unset → the child loads **no** MCP servers and answers on the three read-only built-ins alone (qmd simply absent, never an error) |
+| `JESSE_MAIN_MCP_CONFIG` | _(qmd only)_ | MCP config for the **main turn** — a file path **or** inline JSON, the two forms `--mcp-config` accepts. The main turn always passes `--strict-mcp-config` + `--mcp-config`, on **both** the writes-enabled and read-only branches, so **only** the servers named here load. Unlike `JESSE_VAULTQA_MCP_CONFIG`, unset does **not** mean "no servers": the main path requires qmd, so unset falls back to an inline **qmd-only** config whose `"command"` is the bare name `qmd`, resolved from the child's `PATH`. **Set this if `qmd` is not on the bridge's `PATH`** — launchd's `PATH` is narrower than a login shell's, and a missing qmd is silent (vault search simply absent, never an error). The account-level cloud connectors (Gmail, Slack, Google Calendar, Google Drive) and `playwright` are **never** loaded either way — see [`../SECURITY.md`](../SECURITY.md#mcp-servers-on-a-main-turn-strict-qmd-only) |
 | `JESSE_MODEL_BADGE` | `on` | Whether the bridge appends a one-line provenance **badge** to each delivered `POST /jesse/jesse` reply, naming the backend that produced it: `[local · vault · <model>]`, `[local · diet · <model> + hosted verify]`, `[local · emergency · <model>]`, `[local · diet · <model> + verify queued]`, or `[hosted · <model>]` / `[hosted]`. Display-only, derived from the bridge's own turn state (never model output), and **never** applied to the title endpoint or written into session state. Only an explicit falsey value (`0`/`false`/`no`/`off`) turns it off, reproducing the prior exact reply text. A machine-readable **`provenance`** object (route + model + this exact badge string + the flags it encodes) rides the poll result and SSE `done` frame alongside the text badge whenever the badge is present — see [Structured provenance](#structured-provenance-model-badge-v2) |
 | `JESSE_METRICS_LOG` | _(off)_ | Absolute path to a structured-metrics **JSONL** file. When set, the bridge appends **one content-free JSON line per gated / routed / emergency turn** at the reply-finalization point (ISO-8601 timestamp, turn id, mode, route [`hosted`/`vaultqa-local`/`diet-local`/`emergency-local`], backend model, ladder rung, wall ms, TTFT/tool-calls where recoverable, citation count + validator verdict, badge string, emergency flag, hosted-failure class, and — on a local diet turn that appended food rows — a `diet_micros` object carrying the nutrient-completeness counts + reason code). **Never** the question, answer, or tokens — content joins happen in the `vaultqa-audit` tool via the serving logs. All-or-nothing and soft: **unset (default) → zero metrics writes**, and a write failure logs to stderr and never disturbs the reply. Append-only, line-buffered, restart-safe |
 | `JESSE_EMERGENCY_LOCAL` | `off` | Arms the **emergency local fallback** (`on`/`off`). Inert unless it is **on** AND the `JESSE_VAULTQA_*` triple is also set (that supplies the backend + read-only child). When armed, a hosted turn that fails **transport-class** (spawn / network / timeout / CLI-surfaced 5xx / 429 / quota / auth — never a completed turn) is served locally instead of surfacing the outage: an **Ask** runs the read-only vault-QA child (regardless of the routine gate, citation validator advisory, badge `[local · emergency · <model>]`); a **diet Tell** whose blocking hosted verify is unreachable has its extracted entry **queued** by the bridge for later verify (badge `[local · diet · <model> + verify queued]`), replayed oldest-first on the next successful hosted contact through the exact verify-then-append path — **nothing reaches the CSVs unverified**. A circuit breaker goes local-first after 2 consecutive transport failures for 300 s. Default **off**; only an explicit `on`/`1`/`true`/`yes` arms it. **Untested-live until go-live's outage drill.** See [`../SECURITY.md`](../SECURITY.md#emergency-local-fallback-posture) |
@@ -1756,10 +1757,23 @@ This is **enforced**, not a convention:
 
 ## Connector caveat
 
-Headless Claude Code does **not** inherit Cowork's OAuth connectors (Gmail,
-Calendar, Slack, Notion, Drive). Local MCP servers (QMD, Home Assistant, etc.)
-and the filesystem **do** work. PoC scope = vault Q&A + capture, which is fine.
-To use the cloud connectors here, register them in this project's `.mcp.json`.
+The cloud OAuth connectors (Gmail, Calendar, Slack, Notion, Drive) are **not
+available** to a phone turn, and as of bridge 0.35.0 they are not even **loaded**.
+
+This section previously said headless runs simply do not inherit those
+connectors. That was wrong once they were registered at account scope: they
+loaded into every turn, and were stopped only by the permission layer, since the
+allowlist gates MCP tools the same way it gates built-ins and a headless (`-p`)
+child cannot answer a prompt. The main turn now passes `--strict-mcp-config` plus
+an explicit `--mcp-config` naming only **qmd**, so those servers are absent at the
+root — the same posture the diet and vault-QA children already had. Local MCP
+servers and the filesystem still work; scope remains vault Q&A + capture.
+
+Because `--strict-mcp-config` ignores the ambient user and project scopes,
+registering a server in this project's `.mcp.json` **no longer has any effect on a
+phone turn**. To add one deliberately, name it in `JESSE_MAIN_MCP_CONFIG` (and
+grant its tools in `JESSE_ALLOWED_TOOLS`) — both are required, and widening either
+is a security decision: see [`../SECURITY.md`](../SECURITY.md#mcp-servers-on-a-main-turn-strict-qmd-only).
 
 ## Code review (git checkouts under `Code/`)
 

@@ -44,6 +44,9 @@ pub(crate) fn test_config() -> Config {
         // switch), so tests exercise today's hosted Ask path unless they set it.
         vaultqa_backend: None,
         vaultqa_mcp_config: None,
+        // No main-path MCP override in the fixture — the main turn falls back to the
+        // qmd-only inline const, matching from_env's default.
+        main_mcp_config: None,
         // Badge OFF in the fixture so a turn's stored reply is byte-for-byte the
         // model text — the many exact-`response` assertions predate the badge and
         // must not have to account for it. Badge behavior is covered by dedicated
