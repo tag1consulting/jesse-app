@@ -914,15 +914,20 @@ impl ModelRegistry {
         // wins; env-triple models (which carry no explicit interval) pick up this default.
         let global_health_interval = health_interval_override();
         let default_health_interval = global_health_interval.unwrap_or(DEFAULT_HEALTH_INTERVAL_SECS);
+        // Likewise the global per-probe-timeout override (`JESSE_HEALTH_TIMEOUT_SECS`). Unlike
+        // the interval this is NOT collapsed to a single default here: each env entry carries
+        // its own built-in budget (a reasoning model needs a wider one), and the override wins
+        // over that only when actually set.
+        let global_health_timeout = health_timeout_override();
 
         // Source 2: the preserved env triples (same ids/defaults/prices as before).
-        upsert_model(&mut models, glm_env_entry(default_health_interval));
-        upsert_model(&mut models, kimi_env_entry(default_health_interval));
-        upsert_model(&mut models, local_env_entry(default_health_interval));
+        upsert_model(&mut models, glm_env_entry(default_health_interval, global_health_timeout));
+        upsert_model(&mut models, kimi_env_entry(default_health_interval, global_health_timeout));
+        upsert_model(&mut models, local_env_entry(default_health_interval, global_health_timeout));
 
         // Source 3: the declarative `[[models]]` entries (later overrides earlier by id).
         for decl in load_local_models(home) {
-            if let Some(m) = registry_model_from_toml(&decl, global_health_interval) {
+            if let Some(m) = registry_model_from_toml(&decl, global_health_interval, global_health_timeout) {
                 upsert_model(&mut models, m);
             }
         }
@@ -1003,7 +1008,7 @@ fn upsert_model(models: &mut Vec<RegistryModel>, m: RegistryModel) {
 /// The `glm-5.2` env-triple entry (hosted on Fireworks' Anthropic surface). base + model
 /// DEFAULT; only the token must be supplied, so an operator arms GLM with a single secret
 /// env var.
-fn glm_env_entry(default_interval_secs: u64) -> RegistryModel {
+fn glm_env_entry(default_interval_secs: u64, global_timeout_secs: Option<u64>) -> RegistryModel {
     let backend = resolve_model_backend(
         "glm-5.2",
         env_string("JESSE_MODEL_GLM_BASE_URL"),
@@ -1030,6 +1035,8 @@ fn glm_env_entry(default_interval_secs: u64) -> RegistryModel {
         },
         health: HealthConfig {
             interval_secs: default_interval_secs,
+            // GLM answers the 1-token probe in well under a second; the 3 s default stands.
+            timeout_secs: resolve_health_timeout(None, global_timeout_secs, DEFAULT_HEALTH_TIMEOUT_SECS),
             ..HealthConfig::default()
         },
         // Pair GLM with vision helpers via `JESSE_MODEL_GLM_VISION` (id[:role],…) and
@@ -1051,7 +1058,7 @@ fn glm_env_entry(default_interval_secs: u64) -> RegistryModel {
 /// would instead transcribe the image to text and hide the pixels from a model that can
 /// see them (see [`crate::vision`]). `JESSE_MODEL_KIMI_VISION` remains available for an
 /// operator who wants a helper anyway.
-fn kimi_env_entry(default_interval_secs: u64) -> RegistryModel {
+fn kimi_env_entry(default_interval_secs: u64, global_timeout_secs: Option<u64>) -> RegistryModel {
     let backend = resolve_model_backend(
         "kimi-k3",
         env_string("JESSE_MODEL_KIMI_BASE_URL"),
@@ -1083,6 +1090,14 @@ fn kimi_env_entry(default_interval_secs: u64) -> RegistryModel {
         ),
         health: HealthConfig {
             interval_secs: default_interval_secs,
+            // K3 THINKS before it answers, so even the `max_tokens: 1` probe runs 3–7 s and
+            // the 3 s default would mark a perfectly reachable model unhealthy — i.e. keep it
+            // out of the picker entirely. See [`REASONING_HEALTH_TIMEOUT_SECS`].
+            timeout_secs: resolve_health_timeout(
+                None,
+                global_timeout_secs,
+                REASONING_HEALTH_TIMEOUT_SECS,
+            ),
             ..HealthConfig::default()
         },
         vision: parse_vision_partners(&env_string("JESSE_MODEL_KIMI_VISION").unwrap_or_default()),
@@ -1092,7 +1107,7 @@ fn kimi_env_entry(default_interval_secs: u64) -> RegistryModel {
 
 /// The `local` env-triple entry: an Anthropic-compatible local endpoint. NO defaults — all
 /// three vars required. Free (price deck 0/0/0), so every local turn badges `$0.00`.
-fn local_env_entry(default_interval_secs: u64) -> RegistryModel {
+fn local_env_entry(default_interval_secs: u64, global_timeout_secs: Option<u64>) -> RegistryModel {
     let backend = resolve_model_backend(
         "local",
         env_string("JESSE_MODEL_LOCAL_BASE_URL"),
@@ -1115,6 +1130,7 @@ fn local_env_entry(default_interval_secs: u64) -> RegistryModel {
         price: PriceDeck::ZERO,
         health: HealthConfig {
             interval_secs: default_interval_secs,
+            timeout_secs: resolve_health_timeout(None, global_timeout_secs, DEFAULT_HEALTH_TIMEOUT_SECS),
             ..HealthConfig::default()
         },
         vision: parse_vision_partners(&env_string("JESSE_MODEL_LOCAL_VISION").unwrap_or_default()),
@@ -1320,7 +1336,11 @@ fn resolve_declared_token(auth_token_env: Option<&str>) -> Option<String> {
 /// serialize — it lives solely inside `backend`. `global_interval` is the resolved
 /// `JESSE_HEALTH_INTERVAL_SECS` override (or `None`), applied to this model's probe interval
 /// unless it declares its own `health.interval_secs` (see [`resolve_health_interval`]).
-pub fn registry_model_from_toml(t: &ModelToml, global_interval: Option<u64>) -> Option<RegistryModel> {
+pub fn registry_model_from_toml(
+    t: &ModelToml,
+    global_interval: Option<u64>,
+    global_timeout: Option<u64>,
+) -> Option<RegistryModel> {
     let id = t.id.as_deref().map(str::trim).filter(|s| !s.is_empty());
     let (id, kind_str, base_url, model) = match (
         id,
@@ -1393,11 +1413,19 @@ pub fn registry_model_from_toml(t: &ModelToml, global_interval: Option<u64>) -> 
                 .to_string(),
             // Explicit per-model interval wins; else the global override; else the default.
             interval_secs: resolve_health_interval(h.interval_secs, global_interval),
-            timeout_secs: h.timeout_secs.filter(|n| *n > 0).unwrap_or(DEFAULT_HEALTH_TIMEOUT_SECS),
+            // Same precedence for the timeout. A declarative entry has no way to say "I am a
+            // reasoning model", so its fallback stays the ordinary 3 s default — an operator
+            // who declares a slow model sets `health.timeout_secs` (or the global override).
+            timeout_secs: resolve_health_timeout(
+                h.timeout_secs,
+                global_timeout,
+                DEFAULT_HEALTH_TIMEOUT_SECS,
+            ),
         })
-        // No `health` block at all: still honor the global override for the interval.
+        // No `health` block at all: still honor the global overrides.
         .unwrap_or_else(|| HealthConfig {
             interval_secs: resolve_health_interval(None, global_interval),
+            timeout_secs: resolve_health_timeout(None, global_timeout, DEFAULT_HEALTH_TIMEOUT_SECS),
             ..HealthConfig::default()
         });
     Some(RegistryModel {
@@ -2124,7 +2152,7 @@ mod tests {
         let _g = ENV_LOCK.lock_ok();
         std::env::set_var("JESSE_TEST_DECL_TOKEN", "sk-abc");
         let armed =
-            registry_model_from_toml(&model_toml("fireworks", "hosted", Some("JESSE_TEST_DECL_TOKEN")), None)
+            registry_model_from_toml(&model_toml("fireworks", "hosted", Some("JESSE_TEST_DECL_TOKEN")), None, None)
                 .expect("a full entry parses");
         assert!(armed.configured, "a set token env arms the model");
         assert_eq!(
@@ -2141,13 +2169,13 @@ mod tests {
 
         std::env::remove_var("JESSE_TEST_DECL_TOKEN");
         let unarmed =
-            registry_model_from_toml(&model_toml("fireworks", "hosted", Some("JESSE_TEST_DECL_TOKEN")), None)
+            registry_model_from_toml(&model_toml("fireworks", "hosted", Some("JESSE_TEST_DECL_TOKEN")), None, None)
                 .expect("still parses, just unarmed");
         assert!(!unarmed.configured, "an unset token env → unarmed");
         assert!(unarmed.backend.is_none(), "no backend without a token");
         assert!(unarmed.subagent_model.is_none(), "no backend-derived subagent model");
 
-        let no_env = registry_model_from_toml(&model_toml("fireworks", "hosted", None), None).unwrap();
+        let no_env = registry_model_from_toml(&model_toml("fireworks", "hosted", None), None, None).unwrap();
         assert!(!no_env.configured, "no auth_token_env at all → unarmed");
     }
 
@@ -2198,7 +2226,7 @@ mod tests {
             vision_complementary: Some(true),
             ..Default::default()
         };
-        let m = registry_model_from_toml(&t, None).unwrap();
+        let m = registry_model_from_toml(&t, None, None).unwrap();
         assert_eq!(m.vision.len(), 2, "the blank-id partner is skipped");
         assert_eq!(m.vision[0].id, "paddle");
         assert_eq!(m.vision[0].role, VisionRole::Doc);
@@ -2292,7 +2320,7 @@ mod tests {
             vision: None,
             vision_complementary: None,
         };
-        let m = registry_model_from_toml(&t, None).unwrap();
+        let m = registry_model_from_toml(&t, None, None).unwrap();
         assert!(matches!(m.kind, ModelKind::Local));
         assert_eq!(m.label, "Codex");
         assert_eq!(m.subagent_model.as_deref(), Some("gpt-5-mini"), "explicit subagent override");
@@ -2308,29 +2336,29 @@ mod tests {
         // A missing required field → the entry is skipped (None), never a partial model.
         let mut missing_model = model_toml("x", "hosted", Some("V"));
         missing_model.model = None;
-        assert!(registry_model_from_toml(&missing_model, None).is_none());
+        assert!(registry_model_from_toml(&missing_model, None, None).is_none());
         // `ambient` is reserved for the built-in opus; an unknown kind is invalid too.
-        assert!(registry_model_from_toml(&model_toml("x", "ambient", Some("V")), None).is_none());
-        assert!(registry_model_from_toml(&model_toml("x", "banana", Some("V")), None).is_none());
+        assert!(registry_model_from_toml(&model_toml("x", "ambient", Some("V")), None, None).is_none());
+        assert!(registry_model_from_toml(&model_toml("x", "banana", Some("V")), None, None).is_none());
     }
 
     #[test]
     fn upsert_replaces_by_id_in_place_and_protects_the_ambient_default() {
         // The merge primitive: later overrides earlier BY ID (in place, stable order), a new
         // id appends, and the ambient `opus` is never replaceable.
-        let mut models = vec![opus_entry(), glm_env_entry(DEFAULT_HEALTH_INTERVAL_SECS)]; // glm unconfigured (no env)
+        let mut models = vec![opus_entry(), glm_env_entry(DEFAULT_HEALTH_INTERVAL_SECS, None)]; // glm unconfigured (no env)
         let mut decl_glm = model_toml("glm-5.2", "hosted", None);
         decl_glm.label = Some("Declared GLM".into());
-        upsert_model(&mut models, registry_model_from_toml(&decl_glm, None).unwrap());
+        upsert_model(&mut models, registry_model_from_toml(&decl_glm, None, None).unwrap());
         assert_eq!(models.len(), 2, "same id replaces in place, not appends");
         assert_eq!(models[1].id, "glm-5.2");
         assert_eq!(models[1].label, "Declared GLM", "later source wins by id");
 
-        upsert_model(&mut models, registry_model_from_toml(&model_toml("fw", "hosted", None), None).unwrap());
+        upsert_model(&mut models, registry_model_from_toml(&model_toml("fw", "hosted", None), None, None).unwrap());
         assert_eq!(models.len(), 3, "a new id appends");
 
         // An entry that tries to redefine opus is refused; opus stays the built-in ambient.
-        let fake_opus = registry_model_from_toml(&model_toml("opus", "hosted", None), None).unwrap();
+        let fake_opus = registry_model_from_toml(&model_toml("opus", "hosted", None), None, None).unwrap();
         upsert_model(&mut models, fake_opus);
         assert_eq!(models.iter().filter(|m| m.id == "opus").count(), 1);
         assert!(matches!(models[0].kind, ModelKind::Ambient), "opus stays ambient");
@@ -2369,6 +2397,29 @@ mod tests {
                 Some(val) => std::env::set_var(k, val),
                 None => std::env::remove_var(k),
             }
+        }
+    }
+
+    #[test]
+    fn kimi_probe_budget_is_wider_than_glms_and_yields_to_the_global_override() {
+        // K3 thinks before it answers, so its probe budget must exceed the 3 s default that
+        // GLM is fine with — otherwise a reachable K3 probes as unhealthy and never appears
+        // in the picker. `JESSE_HEALTH_TIMEOUT_SECS` overrides both.
+        assert_eq!(
+            kimi_env_entry(DEFAULT_HEALTH_INTERVAL_SECS, None).health.timeout_secs,
+            REASONING_HEALTH_TIMEOUT_SECS
+        );
+        assert_eq!(
+            glm_env_entry(DEFAULT_HEALTH_INTERVAL_SECS, None).health.timeout_secs,
+            DEFAULT_HEALTH_TIMEOUT_SECS
+        );
+        assert!(REASONING_HEALTH_TIMEOUT_SECS > DEFAULT_HEALTH_TIMEOUT_SECS);
+        for entry in [
+            kimi_env_entry(DEFAULT_HEALTH_INTERVAL_SECS, Some(25)),
+            glm_env_entry(DEFAULT_HEALTH_INTERVAL_SECS, Some(25)),
+            local_env_entry(DEFAULT_HEALTH_INTERVAL_SECS, Some(25)),
+        ] {
+            assert_eq!(entry.health.timeout_secs, 25, "{} honors the override", entry.id);
         }
     }
 

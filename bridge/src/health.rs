@@ -35,6 +35,16 @@ pub const DEFAULT_HEALTH_INTERVAL_SECS: u64 = 60;
 pub const MIN_HEALTH_INTERVAL_SECS: u64 = 5;
 /// Default per-probe wall-clock budget: short (3 s) so a hung backend is quickly seen down.
 pub const DEFAULT_HEALTH_TIMEOUT_SECS: u64 = 3;
+/// Ceiling for the global probe-timeout override (`JESSE_HEALTH_TIMEOUT_SECS`): a probe may
+/// never outlive its own cadence budget, so an operator can't wedge the prober on a hung
+/// backend. 60 s is far above any real first-token latency.
+pub const MAX_HEALTH_TIMEOUT_SECS: u64 = 60;
+/// Per-probe budget for a REASONING model on a hosted surface. A thinking model emits a
+/// reasoning block before its first content token, so even the `max_tokens: 1` probe costs
+/// real wall clock: Kimi K3 on Fireworks was measured at 2.9–6.9 s (2026-07-27), which the
+/// 3 s default fails most of the time — and a failed probe makes a perfectly reachable model
+/// unselectable. Still overridable per-model and by `JESSE_HEALTH_TIMEOUT_SECS`.
+pub const REASONING_HEALTH_TIMEOUT_SECS: u64 = 15;
 /// Default probe endpoint on the model's Anthropic surface: a tiny `/v1/messages` call.
 pub const DEFAULT_HEALTH_PATH: &str = "/v1/messages";
 
@@ -123,6 +133,49 @@ pub fn health_interval_override() -> Option<u64> {
                 "jesse-bridge: WARNING JESSE_HEALTH_INTERVAL_SECS={raw:?} is not a positive \
                  integer; ignoring it (using the {DEFAULT_HEALTH_INTERVAL_SECS}s default probe \
                  interval unless a per-model health.interval_secs is set)."
+            );
+            None
+        }
+    }
+}
+
+/// Resolve a model's per-probe timeout, highest priority first: an explicit per-model
+/// `health.timeout_secs` (a positive `[[models]]` value) wins, then the global
+/// `JESSE_HEALTH_TIMEOUT_SECS` override, then `entry_default` — which is
+/// [`DEFAULT_HEALTH_TIMEOUT_SECS`] for an ordinary model and
+/// [`REASONING_HEALTH_TIMEOUT_SECS`] for a thinking model that cannot answer inside 3 s.
+pub fn resolve_health_timeout(explicit: Option<u64>, global: Option<u64>, entry_default: u64) -> u64 {
+    explicit.filter(|n| *n > 0).or(global).unwrap_or(entry_default)
+}
+
+/// Pure core of [`health_timeout_override`]: map the raw `JESSE_HEALTH_TIMEOUT_SECS` value to
+/// the clamped override. Unset/blank → `Ok(None)` (silent). A positive integer → the value
+/// capped at [`MAX_HEALTH_TIMEOUT_SECS`]. Zero or unparseable → `Err(raw)` so the caller logs
+/// ONE startup warning and falls back, exactly as the interval override does.
+fn parse_health_timeout_override(raw: Option<&str>) -> Result<Option<u64>, String> {
+    let Some(raw) = raw.map(str::trim).filter(|s| !s.is_empty()) else {
+        return Ok(None);
+    };
+    match raw.parse::<u64>() {
+        Ok(n) if n > 0 => Ok(Some(n.min(MAX_HEALTH_TIMEOUT_SECS))),
+        _ => Err(raw.to_string()),
+    }
+}
+
+/// The global per-probe-timeout override from `JESSE_HEALTH_TIMEOUT_SECS`: `Some(capped)` when
+/// set to a positive integer (capped at [`MAX_HEALTH_TIMEOUT_SECS`]), else `None`. A zero or
+/// unparseable value logs one startup warning and falls back — never a hard error. Lets an
+/// operator widen the budget for a slow backend without writing a full `[[models]]` block; an
+/// explicit per-model timeout still wins (see [`resolve_health_timeout`]). Read ONCE at
+/// registry build so a bad value warns a single time.
+pub fn health_timeout_override() -> Option<u64> {
+    match parse_health_timeout_override(std::env::var("JESSE_HEALTH_TIMEOUT_SECS").ok().as_deref()) {
+        Ok(v) => v,
+        Err(raw) => {
+            eprintln!(
+                "jesse-bridge: WARNING JESSE_HEALTH_TIMEOUT_SECS={raw:?} is not a positive \
+                 integer; ignoring it (using each model's default probe timeout unless a \
+                 per-model health.timeout_secs is set)."
             );
             None
         }
@@ -498,6 +551,36 @@ mod tests {
         assert_eq!(h.path, "/v1/messages");
         assert_eq!(h.interval_secs, 60);
         assert_eq!(h.timeout_secs, 3);
+    }
+
+    #[test]
+    fn resolve_health_timeout_precedence() {
+        // Explicit per-model value wins over both the global override and the entry default.
+        assert_eq!(resolve_health_timeout(Some(7), Some(20), 15), 7);
+        // A zero/absent explicit falls through to the global override.
+        assert_eq!(resolve_health_timeout(Some(0), Some(20), 15), 20);
+        assert_eq!(resolve_health_timeout(None, Some(20), 15), 20);
+        // Neither set: the entry's own default — 3 s ordinarily, wider for a reasoning model.
+        assert_eq!(resolve_health_timeout(None, None, DEFAULT_HEALTH_TIMEOUT_SECS), 3);
+        assert_eq!(resolve_health_timeout(None, None, REASONING_HEALTH_TIMEOUT_SECS), 15);
+    }
+
+    #[test]
+    fn parse_health_timeout_override_clamps_and_rejects() {
+        assert_eq!(parse_health_timeout_override(None), Ok(None));
+        assert_eq!(parse_health_timeout_override(Some("  ")), Ok(None));
+        assert_eq!(parse_health_timeout_override(Some("10")), Ok(Some(10)));
+        // Capped at the ceiling so a probe can never outlive its cadence budget.
+        assert_eq!(
+            parse_health_timeout_override(Some("9000")),
+            Ok(Some(MAX_HEALTH_TIMEOUT_SECS))
+        );
+        // Zero and garbage warn once and fall back, never a hard error.
+        assert_eq!(parse_health_timeout_override(Some("0")), Err("0".to_string()));
+        assert_eq!(
+            parse_health_timeout_override(Some("banana")),
+            Err("banana".to_string())
+        );
     }
 
     #[test]
