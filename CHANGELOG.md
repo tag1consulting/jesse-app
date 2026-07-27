@@ -15,6 +15,48 @@ CI both run it). See the "Versioning" section of `bridge/README.md`.
 
 ## [Unreleased]
 
+## [Bridge 0.35.0] - 2026-07-27
+
+### Security
+- **Ordinary phone turns no longer LOAD the account-level cloud connectors.** Every child
+  route the bridge spawns already passed `--strict-mcp-config` — the diet extract/verify
+  children and the vault-QA child — except the one route that handles every real request:
+  the main turn built by `build_claude_args`. Without that flag the CLI also discovers the
+  ambient user- and project-scope MCP servers, so each turn loaded Gmail, Slack, Google
+  Calendar, Google Drive and `playwright` alongside the `qmd` vault search the turn
+  actually needs. Those connector tools were refused, but only at the **permission layer**,
+  and that is a materially weaker boundary than never loading them: it is one allowlist
+  edit, one stale-id repair, or one upstream default away from being granted, and the
+  refusal itself depends on a headless `-p` child being unable to answer a prompt. The main
+  turn now carries `--strict-mcp-config` together with an explicit `--mcp-config` naming
+  **only `qmd`**, on **both** branches the builder can take (writes-enabled and read-only),
+  so the connectors are absent at the root instead of denied by name.
+  - Verified live against the pinned CLI 2.1.220 on 2026-07-27 rather than assumed. Under
+    the old posture a connector tool reached the child and came back
+    *"requested permissions … but you haven't granted it yet"*; under the new posture the
+    same call returns *"No such tool available"* — the tool is gone, not gated. A control
+    pair on `qmd` itself (identical flags, the tool present in `--allowedTools` vs omitted)
+    isolates the allowlist as the thing doing the gating: present → approved automatically
+    with no prompt, omitted → the same permission failure. `qmd` still answers
+    (6,068 documents indexed) with the new config in place.
+  - `playwright` is deliberately **excluded**: no main-path feature references it (zero
+    references under `bridge/`, zero in the vault's `CLAUDE.md` and skills), and it is the
+    server a prior containment probe drove to a live network fetch out of a child that was
+    supposed to be unable to reach the network.
+  - The tool allowlist (`DEFAULT_ALLOWED_TOOLS`) is **unchanged**. This release changes only
+    which MCP servers are loaded, not which tools are granted.
+
+### Added
+- **`JESSE_MAIN_MCP_CONFIG`** — optional MCP config for the main turn, a file path or inline
+  JSON, the same two forms `--mcp-config` accepts and the same resolution as the vault-QA
+  child's `JESSE_VAULTQA_MCP_CONFIG`. Unlike that one, unset does **not** mean "no servers":
+  the main path requires `qmd`, so unset falls back to an inline `qmd`-only config whose
+  `"command"` is the bare name `qmd`, resolved from the child's `PATH` — mirroring how
+  `claude_bin` defaults to a bare name with the absolute path supplied by env in production.
+  **Set this if `qmd` is not on the bridge's `PATH`**: launchd's `PATH` is narrower than a
+  login shell's, and the shipped default resolves `qmd` from it. Without either, vault
+  search is simply absent from a turn (never an error), which would be a silent regression.
+
 ## [App 1.0 (81)] - 2026-07-26
 
 ### Fixed
