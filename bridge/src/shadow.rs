@@ -32,10 +32,19 @@ use serde::Serialize;
 // `ShadowUsage` so the one place that knows the usage shape also knows its price.
 // ===========================================================================
 
-/// Fireworks (`fw-glm` via the gateway) prices: $1.40 in / $0.14 cached / $4.40 out.
-pub const FW_IN_PER_M: f64 = 1.40;
-pub const FW_CACHED_PER_M: f64 = 0.14;
-pub const FW_OUT_PER_M: f64 = 4.40;
+/// GLM 5.2 on Fireworks (`fw-glm` via the gateway): $1.40 in / $0.14 cached / $4.40 out.
+/// Named for the MODEL, not the provider — Fireworks serves several models at different
+/// prices, and the old provider-generic `FW_*` names invited reusing GLM's deck for them.
+pub const FW_GLM_IN_PER_M: f64 = 1.40;
+pub const FW_GLM_CACHED_PER_M: f64 = 0.14;
+pub const FW_GLM_OUT_PER_M: f64 = 4.40;
+
+/// Kimi K3 on Fireworks: $3.00 in / $0.30 cached / $15.00 out (model page, 2026-07-27).
+/// Serves as the DEFAULT deck for the `kimi-k3` registry entry, still overridable via
+/// `JESSE_MODEL_KIMI_PRICE_{IN,CACHED,OUT}`.
+pub const FW_KIMI_K3_IN_PER_M: f64 = 3.00;
+pub const FW_KIMI_K3_CACHED_PER_M: f64 = 0.30;
+pub const FW_KIMI_K3_OUT_PER_M: f64 = 15.00;
 
 /// Opus prices: $5 in / $25 out; cache reads about a tenth of input ($0.50).
 pub const OPUS_IN_PER_M: f64 = 5.00;
@@ -83,9 +92,11 @@ impl ShadowUsage {
         self.cost(deck.in_per_m, deck.cached_per_m, deck.out_per_m)
     }
 
-    /// Dollar cost of this usage vector on the Fireworks price deck.
-    pub fn fireworks_cost(&self) -> f64 {
-        self.cost(FW_IN_PER_M, FW_CACHED_PER_M, FW_OUT_PER_M)
+    /// Dollar cost of this usage vector on the GLM-on-Fireworks price deck. The shadow
+    /// audit compares against `fw-glm` specifically, so this deck is GLM's — not "whatever
+    /// Fireworks charges", which varies per model (K3 is 3.00/0.30/15.00).
+    pub fn fw_glm_cost(&self) -> f64 {
+        self.cost(FW_GLM_IN_PER_M, FW_GLM_CACHED_PER_M, FW_GLM_OUT_PER_M)
     }
 
     /// Dollar cost of the SAME usage vector on the Opus price deck — i.e. what the
@@ -1175,11 +1186,11 @@ mod tests {
             cache_creation_input_tokens: None,
         };
         // Fireworks: 1M in @1.40 + 1M cached @0.14 + 1M out @4.40 = 5.94.
-        assert!((u.fireworks_cost() - (1.40 + 0.14 + 4.40)).abs() < 1e-9);
+        assert!((u.fw_glm_cost() - (1.40 + 0.14 + 4.40)).abs() < 1e-9);
         // Opus: 1M in @5 + 1M cached @0.50 + 1M out @25 = 30.50.
         assert!((u.opus_cost() - (5.0 + 0.50 + 25.0)).abs() < 1e-9);
         // Empty usage costs nothing.
-        assert_eq!(ShadowUsage::default().fireworks_cost(), 0.0);
+        assert_eq!(ShadowUsage::default().fw_glm_cost(), 0.0);
     }
 
     // ---- Tripwires -------------------------------------------------------------

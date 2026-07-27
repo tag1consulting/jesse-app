@@ -1608,8 +1608,8 @@ pub async fn jesse_models(
 
 /// `POST /jesse/model` — set the active model. Rejects an unknown id (400) or one that is
 /// unconfigured OR unhealthy (409) so the conversation never switches onto a model the
-/// bridge cannot actually reach: `kimi-k3` until a live slug resolves, a hosted model whose
-/// token is unset, or a configured model whose last health probe failed. `opus` is always
+/// bridge cannot actually reach: a hosted model whose token is unset, or a configured model
+/// whose last health probe failed. `opus` is always
 /// selectable (healthy by construction). Same bearer auth as `/jesse`.
 pub async fn jesse_set_model(
     State(st): State<AppState>,

@@ -59,6 +59,11 @@ diet_keywords_extra = [
 #   2. the legacy `JESSE_MODEL_GLM_* / _KIMI_* / _LOCAL_*` env triples (still supported).
 #   3. these `[[models]]` entries.
 #
+# `glm-5.2` and `kimi-k3` DEFAULT their base_url + slug to the live Fireworks values, so
+# each is armed by exporting ONE var — `JESSE_MODEL_GLM_AUTH_TOKEN` /
+# `JESSE_MODEL_KIMI_AUTH_TOKEN`. `local` has no defaults: all three vars are required.
+# Both default decks are overridable per model via `JESSE_MODEL_<NAME>_PRICE_{IN,CACHED,OUT}`.
+#
 # Adding a model is a PURE CONFIG EDIT here plus ONE env var for its token — no bridge
 # code change. Each model is health-probed on an interval; the apps only offer a model
 # that is CONFIGURED (its token env var is set) AND HEALTHY (its last probe passed).
@@ -144,6 +149,13 @@ diet_keywords_extra = [
 # PRIVACY: pairing a hosted helper sends the uploaded image/PDF bytes to that helper's
 # backend. That is a real egress of user uploads (consistent with running a hosted text
 # model there). Keep uploads local by pairing a local-only helper alias instead.
+#
+# DO NOT PAIR A NATIVELY-MULTIMODAL MODEL. `kimi-k3` reads images itself, so leaving it
+# UNPAIRED is what gives it vision: attachments take the CLI Read-tool path and the child
+# hands the model the actual image. Pairing it would transcribe the image to text first
+# and hide the pixels from a model that can see them — worse answers AND a second billed
+# call. GET /jesse/models will show vision.enabled=false for such a model; that flag means
+# "no HELPER is attached", not "cannot see".
 #
 # 1) Register the helpers as ordinary models (armed by their token env var):
 #

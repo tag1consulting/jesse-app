@@ -198,7 +198,7 @@ impl ModelHealth {
 /// Resolve a registry model's health state against the cache. Ambient `opus` is healthy by
 /// construction (never probed). A configured non-ambient model is healthy iff its last
 /// probe passed (before the first probe it carries the optimistic seed). An unconfigured
-/// model (no token/triple, e.g. `kimi-k3` until armed) is never healthy.
+/// model (no token/triple — e.g. `local` with no `JESSE_MODEL_LOCAL_*`) is never healthy.
 pub fn model_health(m: &RegistryModel, health: &HealthStore) -> ModelHealth {
     if matches!(m.kind, ModelKind::Ambient) {
         return ModelHealth {
@@ -644,9 +644,12 @@ mod tests {
 
     #[test]
     fn an_unconfigured_model_is_never_available() {
-        let kimi = RegistryModel {
-            id: "kimi-k3".into(),
-            label: "Kimi".into(),
+        // A SYNTHETIC id, deliberately not a real registry entry: this test is about the
+        // unconfigured path itself, so it must not go green merely because some shipped
+        // model happens to be unarmed today.
+        let unarmed = RegistryModel {
+            id: "test-unarmed".into(),
+            label: "Unarmed".into(),
             kind: ModelKind::Hosted,
             backend: None,
             configured: false,
@@ -658,11 +661,11 @@ mod tests {
             vision_complementary: false,
         };
         let registry = ModelRegistry {
-            models: vec![kimi.clone()],
+            models: vec![unarmed.clone()],
         };
         // Not seeded (unconfigured), so even in a seeded store it is unconfigured+unhealthy.
         let store = HealthStore::seeded(&registry);
-        let h = model_health(&kimi, &store);
+        let h = model_health(&unarmed, &store);
         assert!(!h.configured && !h.healthy && !h.available());
         assert!(probe_targets(&registry).is_empty(), "an unconfigured model is not probed");
     }

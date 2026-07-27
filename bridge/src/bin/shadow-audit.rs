@@ -276,10 +276,10 @@ fn main() {
     let write_attempts = pairs.iter().filter(|p| p.write_attempt).count() as u32;
 
     let fw_usage = sum_usage(complete.iter().copied());
-    let fireworks_usd = fw_usage.fireworks_cost();
+    let fireworks_usd = fw_usage.fw_glm_cost();
     let opus_equiv_usd = fw_usage.opus_cost();
     let today_usage = sum_usage(complete.iter().copied().filter(|p| p.date() == date));
-    let fireworks_today_usd = today_usage.fireworks_cost();
+    let fireworks_today_usd = today_usage.fw_glm_cost();
 
     let (cum_w, cum_l, cum_t) = tally_outcomes(state.judged.values().map(String::as_str));
     let days_armed = pairs
