@@ -15,6 +15,49 @@ CI both run it). See the "Versioning" section of `bridge/README.md`.
 
 ## [Unreleased]
 
+## [Bridge 0.36.0] - 2026-07-27
+
+### Added
+- **Kimi K3 is armed.** Fireworks now serves Kimi K3, so the `kimi-k3` registry entry —
+  which shipped deliberately unconfigured because no live slug existed — gets the same
+  treatment `glm-5.2` has: `base_url` defaults to `https://api.fireworks.ai/inference` and
+  the slug to `accounts/fireworks/models/kimi-k3`, so **exporting
+  `JESSE_MODEL_KIMI_AUTH_TOKEN` alone arms it**. With no token it still ships unconfigured
+  and a selection attempt is still rejected, exactly as before.
+
+  Verified against Fireworks directly before wiring anything: the bridge speaks the
+  Anthropic `/v1/messages` contract, and Fireworks' documented K3 surface is
+  `/v1/chat/completions`. `POST https://api.fireworks.ai/inference/v1/messages` with the K3
+  slug returns a genuine Anthropic-shaped body (`content` blocks, `stop_reason`, `usage`
+  with `cache_read_input_tokens`), so K3 needs **no** Anthropic-surface gateway.
+- **Real K3 pricing**, replacing the `PriceDeck::ZERO` placeholder: **$3.00 in / $0.30
+  cached / $15.00 out** per 1M tokens, so a K3 turn badges a true cost instead of `$0.00`.
+  Still overridable via `JESSE_MODEL_KIMI_PRICE_{IN,CACHED,OUT}`.
+
+### Changed
+- **`FW_*` price constants renamed to `FW_GLM_*`**, and `ShadowUsage::fireworks_cost()` to
+  `fw_glm_cost()`. The old names read as "what Fireworks charges" while holding GLM's
+  1.40/0.14/4.40 — an invitation to reuse one model's deck for another on the same
+  provider. Fireworks prices per model; K3 costs over 3× GLM. New `FW_KIMI_K3_*` constants
+  sit alongside. Internal renames only: no env var, endpoint, or logged value changes.
+
+### Notes
+- **K3 uses its own eyes; it is deliberately left UNPAIRED.** The vision-helper layer
+  exists so a *blind* text model can cope with an attachment: it transcribes the image to
+  text and splices that in, and "the active text model NEVER receives the raw image".
+  Pairing K3 with a helper — including with itself — would therefore hide the pixels from a
+  model that can read them, and bill a second call to do it. An unpaired model's
+  attachments take the scratch-file + Read-tool path where the CLI child hands the model
+  the actual image, which for a multimodal model *is* native vision rather than a fallback.
+  Confirmed end to end: Fireworks' Anthropic surface accepts base64 `image` blocks for K3,
+  and K3 read a test image's text back exactly.
+
+  Consequence worth knowing: `GET /jesse/models` reports `vision.enabled=false` for
+  `kimi-k3`. That flag means "no helper is attached", **not** "cannot see". Making the
+  capability view distinguish *natively multimodal* from *blind-and-unpaired* is follow-up
+  work; it needs a new per-model capability field plus app-side rendering, and it is
+  cosmetic — no turn behaves differently for want of it.
+
 ## [Bridge 0.35.0] - 2026-07-27
 
 ### Security

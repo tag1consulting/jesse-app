@@ -358,7 +358,7 @@ mod tests {
         // A stale selection (a model that became unavailable, or an unknown id) must never
         // strand the conversation; the turn degrades to the always-available default.
         let st = state_with_glm();
-        st.models.set_active("kimi-k3"); // not in this registry
+        st.models.set_active("test-absent"); // a synthetic id, deliberately not in this registry
         let a = st.resolve_active_model();
         assert_eq!(a.id, "opus", "unknown/unavailable active degrades to opus");
         assert!(a.env.is_none());

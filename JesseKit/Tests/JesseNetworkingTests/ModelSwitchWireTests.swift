@@ -14,7 +14,7 @@ final class ModelSwitchWireTests: XCTestCase {
           "models": [
             { "id": "opus", "label": "Claude Opus", "kind": "ambient", "available": true, "writes_allowed": true },
             { "id": "glm-5.2", "label": "GLM 5.2", "kind": "hosted", "available": true, "writes_allowed": false },
-            { "id": "kimi-k3", "label": "Kimi K3", "kind": "hosted", "available": false, "writes_allowed": false },
+            { "id": "test-unarmed", "label": "Unarmed Test Model", "kind": "hosted", "available": false, "writes_allowed": false },
             { "id": "local", "label": "Local", "kind": "local", "available": false, "writes_allowed": false }
           ]
         }
@@ -34,8 +34,8 @@ final class ModelSwitchWireTests: XCTestCase {
         XCTAssertFalse(glm.isDefault)
         XCTAssertFalse(glm.writesAllowed, "a non-default model is read-only by default")
 
-        let kimi = try XCTUnwrap(state.models.first { $0.id == "kimi-k3" })
-        XCTAssertFalse(kimi.available, "an unavailable model shows disabled")
+        let unarmed = try XCTUnwrap(state.models.first { $0.id == "test-unarmed" })
+        XCTAssertFalse(unarmed.available, "an unavailable model shows disabled")
     }
 
     func testMutatorBodiesEncodeTheBridgeFieldNames() throws {
@@ -75,7 +75,7 @@ final class ModelSwitchWireTests: XCTestCase {
             { "id": "glm-5.2", "label": "GLM 5.2", "kind": "hosted", "configured": true,
               "healthy": false, "available": false, "writes_allowed": false,
               "last_checked_ms": 1700000000000, "latency_ms": 3000 },
-            { "id": "kimi-k3", "label": "Kimi K3", "kind": "hosted", "configured": false,
+            { "id": "test-unarmed", "label": "Unarmed Test Model", "kind": "hosted", "configured": false,
               "healthy": false, "available": false, "writes_allowed": false }
           ]
         }
@@ -96,9 +96,9 @@ final class ModelSwitchWireTests: XCTestCase {
         XCTAssertEqual(glm.unavailableReason, "unreachable")
 
         // No token/triple armed → not configured.
-        let kimi = try XCTUnwrap(state.models.first { $0.id == "kimi-k3" })
-        XCTAssertFalse(kimi.configured)
-        XCTAssertEqual(kimi.unavailableReason, "not configured")
+        let unarmed = try XCTUnwrap(state.models.first { $0.id == "test-unarmed" })
+        XCTAssertFalse(unarmed.configured)
+        XCTAssertEqual(unarmed.unavailableReason, "not configured")
 
         // Ambient opus: available with no probe timestamps.
         let opus = try XCTUnwrap(state.models.first { $0.id == "opus" })
@@ -115,7 +115,7 @@ final class ModelSwitchWireTests: XCTestCase {
           "active": "opus",
           "models": [
             { "id": "opus", "label": "Claude Opus", "kind": "ambient", "available": true, "writes_allowed": true },
-            { "id": "kimi-k3", "label": "Kimi K3", "kind": "hosted", "available": false, "writes_allowed": false }
+            { "id": "test-unarmed", "label": "Unarmed Test Model", "kind": "hosted", "available": false, "writes_allowed": false }
           ]
         }
         """
@@ -123,10 +123,10 @@ final class ModelSwitchWireTests: XCTestCase {
         let opus = try XCTUnwrap(state.models.first { $0.id == "opus" })
         XCTAssertTrue(opus.configured && opus.healthy, "available ⇒ configured + healthy on an older bridge")
         XCTAssertNil(opus.unavailableReason)
-        let kimi = try XCTUnwrap(state.models.first { $0.id == "kimi-k3" })
-        XCTAssertFalse(kimi.configured, "an older bridge's unavailable model reads as not configured")
-        XCTAssertEqual(kimi.unavailableReason, "not configured")
-        XCTAssertNil(kimi.latencyMs)
+        let unarmed = try XCTUnwrap(state.models.first { $0.id == "test-unarmed" })
+        XCTAssertFalse(unarmed.configured, "an older bridge's unavailable model reads as not configured")
+        XCTAssertEqual(unarmed.unavailableReason, "not configured")
+        XCTAssertNil(unarmed.latencyMs)
     }
 
     func testPerTurnModelFieldEncodesWhenSetAndOmitsWhenBlank() throws {

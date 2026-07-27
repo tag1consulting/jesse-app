@@ -4373,8 +4373,9 @@ async fn shadow_never_mirrors_a_tell() {
 //      POST /jesse/model/{id}/writes -----------------------------------------
 
 /// A Config whose registry offers opus (ambient), an AVAILABLE glm-5.2 (hosted), and an
-/// UNAVAILABLE kimi-k3 — so the endpoint tests can exercise select / reject / writes over
-/// a realistic registry. Persisted to a temp state dir so a re-read AppState converges.
+/// UNAVAILABLE `test-unarmed` — a SYNTHETIC id rather than a shipped model, so these tests
+/// keep exercising the unconfigured branch no matter which real models are armed. They
+/// exercise select / reject / writes over a realistic registry. Persisted to a temp state dir so a re-read AppState converges.
 fn cfg_with_switch_registry(state_dir: &std::path::Path) -> Config {
     let registry = ModelRegistry {
         models: vec![
@@ -4417,8 +4418,8 @@ fn cfg_with_switch_registry(state_dir: &std::path::Path) -> Config {
                 vision_complementary: false,
             },
             RegistryModel {
-                id: "kimi-k3".into(),
-                label: "Kimi K3".into(),
+                id: "test-unarmed".into(),
+                label: "Unarmed Test Model".into(),
                 kind: ModelKind::Hosted,
                 backend: None,
                 subagent_model: None,
@@ -4479,11 +4480,11 @@ async fn models_endpoint_lists_the_registry_and_active_selection() {
     );
     assert_eq!(glm["available"], true);
     assert_eq!(glm["writes_allowed"], false);
-    // kimi is present but UNCONFIGURED (no token) → not healthy, not available.
-    let kimi = models.iter().find(|m| m["id"] == "kimi-k3").unwrap();
-    assert_eq!(kimi["configured"], false);
-    assert_eq!(kimi["healthy"], false);
-    assert_eq!(kimi["available"], false);
+    // the synthetic entry is present but UNCONFIGURED (no token) → not healthy, not available.
+    let unarmed = models.iter().find(|m| m["id"] == "test-unarmed").unwrap();
+    assert_eq!(unarmed["configured"], false);
+    assert_eq!(unarmed["healthy"], false);
+    assert_eq!(unarmed["available"], false);
     // No secret leaks to the client — ids, booleans, enums, and numbers only.
     let raw = v.to_string();
     assert!(
@@ -4624,13 +4625,13 @@ async fn set_model_unknown_id_is_400() {
 
 #[tokio::test]
 async fn set_model_unavailable_is_409_and_does_not_switch() {
-    // An unavailable model (kimi-k3, pending a live Fireworks slug) cannot become active.
+    // An unavailable model (the synthetic unconfigured entry) cannot become active.
     let dir = std::env::temp_dir().join(format!("jesse-model-it-{}", random_hex()));
     let st = AppState::new(cfg_with_switch_registry(&dir));
     let resp = app(st.clone())
         .oneshot(set_model_request(
             Some("Bearer test-token"),
-            r#"{"id":"kimi-k3"}"#,
+            r#"{"id":"test-unarmed"}"#,
         ))
         .await
         .unwrap();

@@ -1084,9 +1084,9 @@ fn glm_env_entry(default_interval_secs: u64) -> RegistryModel {
         backend,
         default_writes: false,
         price: PriceDeck {
-            in_per_m: FW_IN_PER_M,
-            cached_per_m: FW_CACHED_PER_M,
-            out_per_m: FW_OUT_PER_M,
+            in_per_m: FW_GLM_IN_PER_M,
+            cached_per_m: FW_GLM_CACHED_PER_M,
+            out_per_m: FW_GLM_OUT_PER_M,
         },
         health: HealthConfig {
             interval_secs: default_interval_secs,
@@ -1099,18 +1099,26 @@ fn glm_env_entry(default_interval_secs: u64) -> RegistryModel {
     }
 }
 
-/// The `kimi-k3` env-triple entry. NO defaults — Fireworks does not yet serve Kimi K3, so
-/// with no `JESSE_MODEL_KIMI_*` set it ships UNCONFIGURED and a selection attempt is
-/// rejected. When a live slug appears the operator supplies all three vars (and a real price
-/// deck via env) to arm it.
+/// The `kimi-k3` env-triple entry, ARMED — Fireworks serves Kimi K3 on the Anthropic
+/// `/v1/messages` surface (verified 2026-07-27), so this mirrors [`glm_env_entry`]: the
+/// base_url and slug default to the live Fireworks values and only
+/// `JESSE_MODEL_KIMI_AUTH_TOKEN` must be exported to arm it. Absent that token the entry
+/// still ships UNCONFIGURED and a selection attempt is rejected.
+///
+/// NO vision pairing by default, and that is deliberate rather than an omission: K3 is
+/// natively multimodal, so an UNPAIRED entry sends attachments down the scratch-file +
+/// Read-tool path where the CLI child hands K3 the actual image. Pairing it with a helper
+/// would instead transcribe the image to text and hide the pixels from a model that can
+/// see them (see [`crate::vision`]). `JESSE_MODEL_KIMI_VISION` remains available for an
+/// operator who wants a helper anyway.
 fn kimi_env_entry(default_interval_secs: u64) -> RegistryModel {
     let backend = resolve_model_backend(
         "kimi-k3",
         env_string("JESSE_MODEL_KIMI_BASE_URL"),
         env_string("JESSE_MODEL_KIMI_AUTH_TOKEN"),
         env_string("JESSE_MODEL_KIMI_MODEL"),
-        None,
-        None,
+        Some("https://api.fireworks.ai/inference"),
+        Some("accounts/fireworks/models/kimi-k3"),
     );
     RegistryModel {
         id: "kimi-k3".to_string(),
@@ -1120,9 +1128,16 @@ fn kimi_env_entry(default_interval_secs: u64) -> RegistryModel {
         configured: backend.is_some(),
         backend,
         default_writes: false,
-        // Placeholder until a live Fireworks slug + published pricing exist; overridable
-        // from env so arming Kimi later needs no code change.
-        price: model_price_from_env("JESSE_MODEL_KIMI", PriceDeck::ZERO),
+        // Fireworks' published K3 deck (3.00 / 0.30 / 15.00), still overridable from env
+        // via `JESSE_MODEL_KIMI_PRICE_{IN,CACHED,OUT}` if Fireworks reprices.
+        price: model_price_from_env(
+            "JESSE_MODEL_KIMI",
+            PriceDeck {
+                in_per_m: FW_KIMI_K3_IN_PER_M,
+                cached_per_m: FW_KIMI_K3_CACHED_PER_M,
+                out_per_m: FW_KIMI_K3_OUT_PER_M,
+            },
+        ),
         health: HealthConfig {
             interval_secs: default_interval_secs,
             ..HealthConfig::default()
@@ -1699,7 +1714,7 @@ mod tests {
             None,
             "no token → unavailable"
         );
-        // No defaults (kimi/local): all three required.
+        // No defaults (e.g. `local`): all three required.
         assert_eq!(
             resolve_model_backend("local", Some("http://l".into()), Some("t".into()), None, None, None),
             None,
