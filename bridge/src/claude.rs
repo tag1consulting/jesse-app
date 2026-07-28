@@ -1191,18 +1191,26 @@ pub async fn run_claude_oneshot(
     // untouched by the model switch, so it passes the ambient active model — the command
     // is byte-for-byte today's, and `apply_title_env` below still layers any title
     // backend on top (the two never mix).
-    // The capability and MCP set are stated explicitly here rather than derived from the
-    // ambient model, which makes today's posture visible: a title one-shot resolves
-    // through the ambient model, which is writes-on, so naming a conversation currently
-    // runs with the FULL writes-on toolset (and the qmd server) in the vault. Tightening
-    // that is a deliberate change, and is its own commit.
+    // BASIC with NO MCP servers, not the ambient model's Write + qmd. Both are stated
+    // here rather than derived from `active`, because they describe what THIS CHILD DOES,
+    // not what backs it: writing a short title from a transcript is a single-shot text
+    // transformation that needs no tools and no vault search. It used to resolve through
+    // the ambient model, which is writes-on, so naming a conversation ran with the FULL
+    // writes-on toolset — Write, Edit, the scoped Bash verbs, the `diet-logging` skill —
+    // and launched the qmd server, in the vault, for a job whose entire output is a
+    // handful of words the bridge then validates and truncates. Nothing about the title
+    // contract wanted that; it was inherited from sharing a builder with a real turn.
+    //
+    // cwd stays the vault. That is a per-call-site choice the capability says nothing
+    // about, and with `--tools ""` the child cannot read anything there anyway; leaving it
+    // keeps this diff to the one thing it is about.
     let mut cmd = build_claude_command(
         cfg,
         prompt,
         None,
         &ActiveModel::ambient(),
-        Capability::Write,
-        main_mcp_config(cfg),
+        Capability::Basic,
+        EMPTY_MCP_CONFIG,
     );
     // Title-only backend override: point THIS child at the configured
     // base_url/token/model when all three JESSE_TITLE_* vars are set. A no-op
@@ -2700,27 +2708,28 @@ mod tests {
             "diet extract/verify children"
         );
 
-        // 5. TITLE one-shot → Write today: it resolves through the ambient model, which is
-        //    writes-on, so naming a conversation currently runs with the FULL writes-on
-        //    toolset AND the qmd server in the vault. Identical to call site 1, which is
-        //    the thing this golden makes visible.
+        // 5. TITLE one-shot → Basic with NO MCP servers. Writing a short title needs no
+        //    tools and no vault search, so it is granted neither — the same posture as the
+        //    diet children, differing only in the cwd each call site chose.
         assert_eq!(
             cmd_argv(&build_claude_command(
                 &cfg,
                 "PROMPT",
                 None,
                 &ActiveModel::ambient(),
-                Capability::Write,
-                main_mcp_config(&cfg)
+                Capability::Basic,
+                EMPTY_MCP_CONFIG
             )),
             golden(&[
                 "--strict-mcp-config",
                 "--mcp-config",
-                GOLDEN_QMD_MCP,
+                GOLDEN_EMPTY_MCP,
+                "--tools",
+                "",
                 "--allowedTools",
-                &allow,
+                "",
                 "--disallowedTools",
-                &deny,
+                "Bash,Write,Edit,NotebookEdit,WebFetch,WebSearch,Task,Glob,Grep,Read,ToolSearch,Workflow,Agent,TodoWrite,Skill",
             ]),
             "title one-shot"
         );

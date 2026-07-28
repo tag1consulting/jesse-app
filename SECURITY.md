@@ -159,14 +159,28 @@ re-validated by the ambient verify gate and by trusted Rust before anything is
 written.) `claude 2.1.207` has no `--max-turns` flag, so the single-shot bound is
 by construction only, not CLI-enforced.
 
-**The title child is a different posture, deliberately.** The title one-shot
-(`run_claude_oneshot`) reuses `build_claude_args` — the **main-turn** scoped
-allowlist and the vault cwd — because it summarizes an already-produced reply and
-was never intended to be toolless. It therefore shares the main agent's tool
-surface (and, with it, the same CLI behavior around read/search/MCP tools), not
-the diet children's hard containment. Whether to tighten it is a separate
-decision; it does not carry the specific "empty allowlist assumed toolless" defect
-that the diet children did, because it never claimed to be toolless.
+## The title child
+
+**Now the same `Basic` posture as the diet children (bridge 0.39.0).** The title
+one-shot (`run_claude_oneshot`) used to reuse the **main-turn** allowlist and MCP
+set, because it shared a builder with a real turn: it resolved through the ambient
+model, which is writes-on, so naming a conversation ran with the **full writes-on
+toolset in the vault** — `Write`, `Edit`, the scoped `Bash` verbs,
+`Skill(diet-logging)` — and **launched the qmd server**, for a job whose entire
+output is a handful of words the bridge then validates and truncates.
+
+It is now granted `Capability::Basic` with an **empty** MCP server set, identical
+to the diet children: `--tools ""`, `--strict-mcp-config` naming no servers, empty
+`--allowedTools`, the same denylist. **What a title call can no longer reach:**
+every one of those grants, and the qmd server no longer starts for it. cwd stays
+the vault, which is inert under `--tools ""` (nothing can read it).
+
+Asserted on the argv the child is actually spawned with, not just on the builder
+(`title_oneshot_spawns_a_toolless_child_with_no_mcp_servers`), and live-probed
+against claude 2.1.220: before, 31 tools at the root and an executed `Write` that
+created the probe file; after, an empty root toolset, zero MCP servers, and zero
+executed `tool_use` across a write / ls / fetch / ToolSearch battery, with the
+endpoint still producing a title.
 
 ## Vault-QA child tool isolation (in-process boundary)
 
@@ -443,9 +457,11 @@ Security-relevant properties:
   and never any prompt content** — so a production audit has a trail of where
   titles went.
 - **Same request posture otherwise.** The title child still uses `build_claude_args`
-  (identical `--permission-mode`/allow/deny lists), the same `MAX_TITLE_INPUT_BYTES`
-  input cap and short `TITLE_TIMEOUT_SECS`, and remains a soft best-effort call —
-  a title failure is degraded from, never surfaced as an error.
+  (identical `--permission-mode`, and since bridge 0.39.0 the toolless
+  `Capability::Basic` allow/deny lists with no MCP servers — see
+  [The title child](#the-title-child)), the same `MAX_TITLE_INPUT_BYTES` input cap
+  and short `TITLE_TIMEOUT_SECS`, and remains a soft best-effort call — a title
+  failure is degraded from, never surfaced as an error.
 - **Optional server-side title store.** `POST /jesse/title` accepts an optional
   `session_id`. When present *and* the title call succeeds, the minted title is
   persisted so `GET /jesse/sessions` can show it — to a single JSON file

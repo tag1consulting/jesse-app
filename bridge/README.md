@@ -958,9 +958,14 @@ A lightweight endpoint the app calls to turn one conversation's text into a
 **very short title** (roughly 3–6 words, ~40 chars). It is **not a turn**: no job
 is created, no session, no live stream, no push, and no eviction interaction — it
 touches none of the jobs/streams/aborts state. It reuses the same `claude`
-invocation discipline as a turn (same `build_claude_args` allow/deny tool posture,
-`kill_on_drop`, and terminal-result classification) via a single bounded
-`run_claude_oneshot` call.
+invocation discipline as a turn (`kill_on_drop`, terminal-result classification)
+via a single bounded `run_claude_oneshot` call, but is granted
+**`Capability::Basic` with no MCP servers**: no tools at all. Writing a short title
+is a single-shot text transformation, so the child gets `--tools ""`, an empty
+strict MCP config and an empty allowlist — the same containment the diet children
+get. Until bridge 0.39.0 it shared the writes-on main-turn allowlist and launched
+the qmd server, because it shared a builder with a real turn; see
+[`../SECURITY.md`](../SECURITY.md#the-title-child).
 
 ```bash
 curl -s http://127.0.0.1:8765/jesse/title \

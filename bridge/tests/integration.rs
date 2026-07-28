@@ -1272,6 +1272,99 @@ async fn title_oversized_input_is_rejected_before_any_claude_spawn() {
     let _ = std::fs::remove_file(&fake);
 }
 #[tokio::test]
+async fn title_oneshot_spawns_a_toolless_child_with_no_mcp_servers() {
+    // THE TIGHTENING, proven on the argv the title child is actually spawned with (not
+    // just on the builder): a title one-shot is granted Capability::Basic with no MCP
+    // servers, so it holds NO tools and launches nothing. It used to resolve through the
+    // ambient model, which is writes-on, and ran with the full writes-on toolset plus the
+    // qmd server in the vault for a job whose whole output is a few words. A fake claude
+    // records its own argv, then returns a normal result line.
+    let argv_log = std::env::temp_dir().join(format!(
+        "jesse-title-argv-{}-{}.txt",
+        std::process::id(),
+        JOB_COUNTER.fetch_add(1, Ordering::Relaxed)
+    ));
+    let _ = std::fs::remove_file(&argv_log);
+    let script = format!(
+        "#!/bin/sh\n\
+             for a in \"$@\"; do printf '%s\\n' \"$a\" >> '{}'; done\n\
+             printf '%s' '{{\"type\":\"result\",\"is_error\":false,\"result\":\"A Title\"}}'\n",
+        argv_log.display()
+    );
+    let fake = write_fake_claude(&script);
+    let cfg = Config {
+        claude_bin: fake.to_string_lossy().into_owned(),
+        ..test_config()
+    };
+
+    let title = run_claude_oneshot(&cfg, "title this", 30)
+        .await
+        .expect("the title child must still work");
+    assert_eq!(title, "A Title");
+
+    let argv: Vec<String> = std::fs::read_to_string(&argv_log)
+        .expect("the fake claude must have recorded its argv")
+        .lines()
+        .map(str::to_string)
+        .collect();
+    let value_of = |flag: &str| -> Option<String> {
+        argv.iter()
+            .position(|a| a == flag)
+            .map(|i| argv[i + 1].clone())
+    };
+
+    // The root boundary: the entire built-in toolset is gone, and no MCP server loads.
+    assert_eq!(
+        value_of("--tools").as_deref(),
+        Some(""),
+        "the title child must disable the built-in toolset: {argv:?}"
+    );
+    assert!(
+        argv.iter().any(|a| a == "--strict-mcp-config"),
+        "the title child must not discover MCP servers: {argv:?}"
+    );
+    let mcp = value_of("--mcp-config").expect("--mcp-config present");
+    let parsed: serde_json::Value = serde_json::from_str(&mcp).expect("valid JSON");
+    assert!(
+        parsed
+            .get("mcpServers")
+            .and_then(|v| v.as_object())
+            .map(|m| m.is_empty())
+            .unwrap_or(false),
+        "the title child must declare NO servers — not even qmd: {mcp:?}"
+    );
+    assert!(
+        !mcp.contains("qmd"),
+        "the qmd server must not be launched for a title call: {mcp:?}"
+    );
+    assert_eq!(
+        value_of("--allowedTools").as_deref(),
+        Some(""),
+        "the title child must grant no tools: {argv:?}"
+    );
+    // And specifically NOT the writes-on allowlist it used to inherit. Checked against
+    // the configured list itself, and against the grants inside it that could act.
+    assert!(
+        !argv.contains(&cfg.allowed_tools),
+        "the configured writes-on allowlist must not appear in a title child: {argv:?}"
+    );
+    let allowed = value_of("--allowedTools").unwrap_or_default();
+    for granted in ["Write", "Edit", "Skill(diet-logging)", "Bash(git:*)"] {
+        assert!(
+            !allowed.contains(granted),
+            "{granted} must not be granted to a title child: {allowed:?}"
+        );
+    }
+    // Still a single-shot with no thread to resume.
+    assert!(
+        !argv.iter().any(|a| a == "--resume"),
+        "a title call is never part of a thread: {argv:?}"
+    );
+
+    let _ = std::fs::remove_file(&argv_log);
+    let _ = std::fs::remove_file(&fake);
+}
+#[tokio::test]
 async fn title_oneshot_times_out_when_claude_stalls() {
     // The short timeout bound is enforced: a fake claude that stalls far past
     // the passed timeout must yield a GATEWAY_TIMEOUT error, not hang. Driven

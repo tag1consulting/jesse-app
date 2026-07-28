@@ -15,6 +15,31 @@ CI both run it). See the "Versioning" section of `bridge/README.md`.
 
 ## [Unreleased]
 
+## [Bridge 0.39.0] - 2026-07-28
+
+### Changed
+- **The conversation-title one-shot is now toolless (`Capability::Basic`) and loads no MCP
+  servers.** It used to resolve through the ambient model, which is writes-on, so naming a
+  conversation ran with the FULL writes-on toolset in the vault AND launched the qmd
+  server, for a job whose entire output is a handful of words the bridge then validates
+  and truncates. Nothing about the title contract wanted that; it was inherited from
+  sharing a builder with a real turn.
+- **What a title call can no longer reach:** `Write`, `Edit`, every scoped `Bash` verb
+  (`git`, `mv`, `ls`, `cat`, `find`, `date`, `cal`, `head`, `tail`, `wc`, the three pinned
+  `node` diet scripts), `Skill(diet-logging)`, `Read`/`Grep`/`Glob`, the four qmd MCP
+  search tools, and the qmd server itself, which no longer starts for a title call. It now
+  gets `--tools ""`, `--strict-mcp-config` with an empty server set, an empty
+  `--allowedTools`, and the same denylist the diet children get.
+- cwd stays the vault, which is inert under `--tools ""` — nothing can read it. Working
+  directory remains a per-call-site choice rather than something a capability implies.
+- Asserted on the argv the child is **actually spawned with**
+  (`title_oneshot_spawns_a_toolless_child_with_no_mcp_servers` drives `run_claude_oneshot`
+  against a fake `claude` that records its own argv), not only on the builder, plus the
+  updated golden. Live-probed against claude 2.1.220: before, 31 tools at the root and an
+  executed `Write` that created the probe file; after, an empty root toolset, zero MCP
+  servers and zero executed `tool_use` across a write / ls / fetch / ToolSearch battery,
+  with the endpoint still producing a title.
+
 ## [Bridge 0.38.0] - 2026-07-28
 
 ### Changed
