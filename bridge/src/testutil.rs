@@ -82,6 +82,9 @@ pub(crate) fn test_config() -> Config {
         // behavior. Tests that exercise a hosted/local model build their own registry.
         model_registry: ModelRegistry::opus_only(),
         vision: VisionConfig::default(),
+        // The shipped harness registry: `claude-code` only, exactly as `from_env` builds
+        // it. A test that needs a second harness constructs its own `HarnessRegistry`.
+        harnesses: Arc::new(HarnessRegistry::claude_code_only()),
     }
 }
 pub(crate) fn test_state() -> AppState {

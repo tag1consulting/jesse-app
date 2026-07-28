@@ -15,6 +15,56 @@ CI both run it). See the "Versioning" section of `bridge/README.md`.
 
 ## [Unreleased]
 
+## [Bridge 0.40.0] - 2026-07-28
+
+### Changed
+- **The agent program the bridge spawns is now pluggable, behind a `Harness` trait.** Claude
+  Code is the only implementation and there is **no behaviour change**: same argv at all
+  five spawn sites, same wire, no new config. `bridge/src/harness/` holds the traits
+  (`mod.rs`) and today's code (`claude_code.rs`, moved rather than rewritten — argv,
+  containment flags, per-role env, `stream-json` parsing); `claude.rs` keeps what is not
+  harness-specific (the outcome vocabulary and the driver: spawn, read stdout line by line,
+  stop at the terminal result, bounded reap, resolve, retry a transient failure with a
+  stream reset between attempts).
+- **Parsing is a per-turn object (`TurnParser`), not a method on the harness.** A harness is
+  a shared registry singleton serving concurrent turns, so it can hold no per-turn state,
+  and a stateless per-line function could not express a harness whose terminal outcome is
+  assembled across lines. Claude Code's parser is a stateless wrapper around
+  `parse_stream_line`, because its result line carries answer, session id and usage at
+  once. The driver builds a FRESH parser per spawn attempt, so a retry can never see the
+  previous attempt's half-accumulated state.
+- **Capability governs the toolset; the request governs the MCP servers.** They stay two
+  axes: a `Read` child with qmd loaded (the main turn) and a `Read` child with no servers
+  (the vault-QA child) are both legitimate, so the server set — like the working directory
+  — rides in the `TurnRequest` as call-site policy. Collapsing them into the capability is
+  the obvious-looking simplification that would silently remove vault search.
+- **Session handling asks the harness where transcripts live** instead of hardcoding
+  `~/.claude/projects/<escaped-vault>`: adoption, the GC sweep, the resume existence check,
+  the conversation list, hydration and delete all range over
+  `Harness::transcript_dir`. A harness that keeps none is skipped by adoption, by the sweep
+  and by the resume check (there is no file whose absence could justify dropping a
+  `--resume`), and its conversations live in the registry like any other — the list is
+  rendered from the persisted conversation registry, not from a directory scan.
+- **Accepted degradation, stated explicitly:** `GET /jesse/conversations/{id}/transcript`
+  for a conversation whose bound transcripts are not on disk returns **200 with an empty
+  turn list**, never an error. For a transcript-less harness that means a new device — or a
+  reinstalled app — sees the conversation listed with no server-side history; the app's own
+  local transcript remains the user-visible record and the context ledger still feeds
+  catch-up. Hydrating from the ledger instead is real machinery for a rare case and is
+  deliberately not built.
+- The title one-shot now shares the one stateless-one-shot runner instead of carrying its
+  own copy of the spawn / read / reap loop (same timeout message, same classification, same
+  no-retry policy). That loop encodes several fixes that took real debugging — the hang when
+  a grandchild MCP server holds the stdout pipe open, the empty-`result` fallback, the byte-
+  rather than char-based truncation cap — so there are now exactly two copies of it, and
+  there must never be a third.
+- Verified: existing conversation, session and sweep tests unmodified and green; the golden
+  argv test byte-identical to 0.39.0 for every capability × MCP-set pair the bridge actually
+  spawns; the models endpoint untouched. New `tests/harness_registry.rs` registers a second,
+  transcript-less harness and proves adoption and the sweep skip it while its conversations
+  still list, still resume, and hydrate to an empty history with a 200 — with a control
+  harness that declares the same directory and does get adopted and swept.
+
 ## [Bridge 0.39.0] - 2026-07-28
 
 ### Changed

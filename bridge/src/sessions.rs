@@ -8,6 +8,15 @@ use crate::*;
 // the scan and its filters, the turn shaping, the GC sweep, and the conversation surface
 // (`GET /jesse/conversations`, hydration, delete, flags) rendered over them.
 //
+// WHICH directories those are is no longer assumed: it comes from the harness registry
+// (`Harness::transcript_dir`), so a harness that keeps no transcripts on disk contributes
+// none and is skipped by adoption, by the sweep and by the resume existence check. Its
+// conversations still live in the registry and still list — the list is rendered from the
+// persisted registry rather than from a directory scan — and they hydrate to an empty
+// history. The `<session_id>.jsonl` FILE LAYOUT below is still Claude Code's; a harness
+// with a different one would need more than a directory, which is why the trait hands back
+// a directory only when that layout applies.
+//
 // A session id is deliberately NOT a thread identity: the CLI can fork it on resume, and a
 // dropped `--resume` mints a new one. The bridge-owned conversation record (see
 // [`conversations`]) is the identity, and it owns the ordered list of session ids bound to
@@ -68,16 +77,30 @@ pub fn is_plain_session_component(session_id: &str) -> bool {
         && !session_id.contains('\\')
 }
 
-/// Whether a real (non-synthetic) session's transcript still exists on disk under
-/// the bridge's vault projects dir. Uses the HOME captured in `cfg.home` (like
-/// `AppState::sessions_dir`); an unknown HOME or a non-plain id yields `false`.
-/// A synthetic `local-` id (context carry) has no transcript by construction, so
-/// this reports `false` for it — callers that care special-case it first.
-pub fn session_transcript_exists(cfg: &Config, session_id: &str) -> bool {
+/// Whether a real (non-synthetic) session's transcript still exists on disk in
+/// `harness`'s transcript directory. A non-plain id, or a harness that keeps no
+/// transcripts at all, yields `false` — so callers that must not treat "no file" as "no
+/// session" (the resume check) ask about the harness FIRST; see
+/// [`resolve_resume_session_for_harness`]. A synthetic `local-` id (context carry) has no
+/// transcript by construction, so this reports `false` for it too.
+pub fn session_transcript_exists_for_harness(
+    cfg: &Config,
+    harness: &dyn Harness,
+    session_id: &str,
+) -> bool {
     if !is_plain_session_component(session_id) {
         return false;
     }
-    session_transcript_path(&cfg.home, &cfg.vault, session_id).is_file()
+    harness
+        .transcript_dir(cfg)
+        .map(|dir| dir.join(format!("{session_id}.jsonl")).is_file())
+        .unwrap_or(false)
+}
+
+/// [`session_transcript_exists_for_harness`] for the harness that serves turns — the
+/// convenience form for callers with no harness in hand.
+pub fn session_transcript_exists(cfg: &Config, session_id: &str) -> bool {
+    session_transcript_exists_for_harness(cfg, cfg.harnesses.turn_harness(), session_id)
 }
 
 /// The outcome of deleting one session's transcript. `Deleted` removed an existing
@@ -180,9 +203,11 @@ pub fn sweep_expired_sessions(dir: &Path, now_secs: u64, ttl_days: u64) -> Vec<(
     reclaimed
 }
 
-/// Run one GC sweep over the bridge vault's projects dir at the current wall
-/// clock. Uses the HOME captured in `cfg.home` (mirroring `AppState::sessions_dir`)
-/// so the sweep stays scoped to exactly the vault project.
+/// Run one GC sweep over every registered harness's transcript directory at the current
+/// wall clock, so the sweep stays scoped to exactly the directories the bridge's harnesses
+/// own. A harness that keeps no transcripts contributes no directory and is therefore
+/// skipped; its conversations still age out by the record rule below, exactly like a
+/// conversation whose turn failed before writing anything.
 ///
 /// Two phases. First the transcript sweep, unchanged: every `*.jsonl` older than the
 /// TTL is unlinked. Then the CONVERSATION sweep: a record whose bound transcripts are
@@ -202,12 +227,15 @@ pub fn run_session_gc(
     titles: &TitleStore,
     flags: &FlagStore,
 ) {
-    let dir = vault_sessions_dir(&cfg.home, &cfg.vault);
+    let dirs = cfg.harnesses.transcript_dirs(cfg);
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
-    let reclaimed = sweep_expired_sessions(&dir, now, cfg.session_ttl_days);
+    let reclaimed: Vec<(String, u64)> = dirs
+        .iter()
+        .flat_map(|dir| sweep_expired_sessions(dir, now, cfg.session_ttl_days))
+        .collect();
     if !reclaimed.is_empty() {
         eprintln!(
             "jesse-bridge: session GC swept {} orphaned session(s) older than {} days",
@@ -225,7 +253,7 @@ pub fn run_session_gc(
         let any_transcript_left = rec
             .session_ids
             .iter()
-            .any(|sid| dir.join(format!("{sid}.jsonl")).is_file());
+            .any(|sid| find_transcript(&dirs, sid).is_some());
         if any_transcript_left {
             continue;
         }
@@ -289,21 +317,31 @@ pub fn effective_resume_id(session_id: Option<&str>, transcript_exists: bool) ->
     }
 }
 
-/// Resolve the effective `--resume` session for a hosted turn: drop the resume
-/// when the requested real session's transcript no longer exists on disk (swept
-/// by GC or deleted while the phone thread lived on), so a stale resume becomes a
-/// clean FRESH session instead of a crash or a raw system error string. Reads HOME
-/// via `session_transcript_exists`; logs a named line when it drops a resume so the
-/// fall-to-fresh is visible, never silent. A synthetic id and a live real id pass
-/// through unchanged.
-pub fn resolve_resume_session<'a>(cfg: &Config, session_id: Option<&'a str>) -> Option<&'a str> {
+/// Resolve the effective `--resume` session for a hosted turn under `harness`: drop the
+/// resume when the requested real session's transcript no longer exists in that harness's
+/// transcript dir (swept by GC or deleted while the phone thread lived on), so a stale
+/// resume becomes a clean FRESH session instead of a crash or a raw system error string.
+/// Logs a named line when it drops a resume so the fall-to-fresh is visible, never silent.
+/// A synthetic id and a live real id pass through unchanged.
+///
+/// A harness that keeps NO transcripts is skipped entirely: there is no file whose absence
+/// could justify dropping the resume, and its thread state is its own business, so the id
+/// passes through untouched.
+pub fn resolve_resume_session_for_harness<'a>(
+    cfg: &Config,
+    harness: &dyn Harness,
+    session_id: Option<&'a str>,
+) -> Option<&'a str> {
     let sid = session_id?;
     // Synthetic ids never have a transcript and must not trigger a (false) fs miss
     // log — they are handled (never resumed) downstream in `build_claude_args`.
     if is_synthetic_session_id(sid) {
         return Some(sid);
     }
-    let exists = session_transcript_exists(cfg, sid);
+    if harness.transcript_dir(cfg).is_none() {
+        return Some(sid);
+    }
+    let exists = session_transcript_exists_for_harness(cfg, harness, sid);
     let effective = effective_resume_id(Some(sid), exists);
     if effective.is_none() {
         eprintln!(
@@ -312,6 +350,12 @@ pub fn resolve_resume_session<'a>(cfg: &Config, session_id: Option<&'a str>) -> 
         );
     }
     effective
+}
+
+/// [`resolve_resume_session_for_harness`] for the harness that serves turns — the
+/// convenience form for callers with no harness in hand.
+pub fn resolve_resume_session<'a>(cfg: &Config, session_id: Option<&'a str>) -> Option<&'a str> {
+    resolve_resume_session_for_harness(cfg, cfg.harnesses.turn_harness(), session_id)
 }
 
 /// Pull the user text out of a `{"type":"user","message":{...}}` transcript line.
@@ -423,6 +467,18 @@ pub fn first_user_message(path: &Path) -> Option<String> {
 // transcripts a previous bridge (or an older client) left unregistered; the list itself
 // is rendered from the registry, so a CLI session fork appends an alias instead of
 // producing a second row.
+
+/// The file holding one session's transcript, looked up across the transcript directories
+/// the registered harnesses own (see [`HarnessRegistry::transcript_dirs`]), or `None` when
+/// no directory holds it. A conversation record does not name the harness that produced it
+/// — it never had to, because the id is enough — so a lookup ranges over the dirs in their
+/// stable order and takes the first hit. An EMPTY slice is a legitimate input: a bridge
+/// whose harnesses keep no transcripts finds nothing, which is exactly the intended answer.
+fn find_transcript(dirs: &[PathBuf], session_id: &str) -> Option<PathBuf> {
+    dirs.iter()
+        .map(|dir| dir.join(format!("{session_id}.jsonl")))
+        .find(|path| path.is_file())
+}
 
 /// Whether a transcript filename stem is one the session list has always been willing
 /// to consider: a plain filename component that can only ever name a file INSIDE the
@@ -608,8 +664,13 @@ pub struct ConversationSummary {
 ///
 /// The flags are part of the serialized body, so they are folded into the ETag
 /// automatically: flipping a flag changes the body and invalidates a cached 304.
-pub fn list_conversations(
-    dir: &Path,
+///
+/// The list is rendered from the REGISTRY, not from a directory scan; `dirs` only supplies
+/// the mtime and the first-message snippet. A conversation with no transcript on disk —
+/// because it is registered but not yet run, because the sweep reclaimed its files, or
+/// because its harness keeps none — still lists, dated by `registered_ms`.
+pub fn list_conversations_in(
+    dirs: &[PathBuf],
     conversations: &ConversationStore,
     since: Option<u64>,
     titles: &TitleStore,
@@ -620,13 +681,12 @@ pub fn list_conversations(
         let mut last_modified = 0u64;
         let mut first_message = None;
         for sid in &rec.session_ids {
-            let path = dir.join(format!("{sid}.jsonl"));
+            let Some(path) = find_transcript(dirs, sid) else {
+                continue;
+            };
             let Ok(meta) = std::fs::metadata(&path) else {
                 continue;
             };
-            if !meta.is_file() {
-                continue;
-            }
             let mtime = meta
                 .modified()
                 .ok()
@@ -668,6 +728,18 @@ pub fn list_conversations(
             .then_with(|| a.conversation_id.cmp(&b.conversation_id))
     });
     out
+}
+
+/// [`list_conversations_in`] over a single transcript directory.
+pub fn list_conversations(
+    dir: &Path,
+    conversations: &ConversationStore,
+    since: Option<u64>,
+    titles: &TitleStore,
+    flags: &FlagStore,
+) -> Vec<ConversationSummary> {
+    let dirs = [dir.to_path_buf()];
+    list_conversations_in(&dirs, conversations, since, titles, flags)
 }
 
 /// Compute a strong ETag over the serialized response body: a quoted lowercase hex
@@ -756,11 +828,13 @@ pub async fn jesse_conversations(
         ));
     }
 
-    let dir = st.sessions_dir();
+    let dirs = st.transcript_dirs();
     let now_ms = system_time_to_ms(SystemTime::now());
-    refresh_conversations(&dir, &st.conversations, now_ms);
+    for dir in &dirs {
+        refresh_conversations(dir, &st.conversations, now_ms);
+    }
     let conversations =
-        list_conversations(&dir, &st.conversations, params.since, &st.titles, &st.flags);
+        list_conversations_in(&dirs, &st.conversations, params.since, &st.titles, &st.flags);
     let deleted: Vec<Value> = st
         .deletions
         .recent(now_ms)
@@ -952,8 +1026,15 @@ pub fn parse_hydrate_cursor(cursor: Option<&str>) -> Result<(usize, u64), String
 ///
 /// A cursor pointing past the last segment yields no turns and echoes itself back, so
 /// a caught-up client's poll is a cheap no-op.
-pub fn hydrate_conversation(
-    dir: &Path,
+///
+/// A conversation whose transcripts are on NO disk at all — every segment missing, or a
+/// harness that keeps none — therefore hydrates to an EMPTY turn list with a `200`, never
+/// an error. That degradation is deliberate and documented on [`Harness::transcript_dir`]:
+/// the app's own local transcript stays the user-visible record and the context ledger
+/// still feeds catch-up; hydrating from the ledger instead is real machinery for a rare
+/// case and is not built.
+pub fn hydrate_conversation_in(
+    dirs: &[PathBuf],
     session_ids: &[String],
     start: (usize, u64),
 ) -> std::io::Result<(Vec<HydratedTurn>, String)> {
@@ -965,8 +1046,7 @@ pub fn hydrate_conversation(
     let mut offset = start_offset;
     while segment < session_ids.len() {
         let sid = &session_ids[segment];
-        let path = dir.join(format!("{sid}.jsonl"));
-        if path.is_file() {
+        if let Some(path) = find_transcript(dirs, sid) {
             let (mut seg_turns, next) = hydrate_from_file(&path, offset, Some(sid))?;
             turns.append(&mut seg_turns);
             cursor_segment = segment;
@@ -981,6 +1061,16 @@ pub fn hydrate_conversation(
         offset = 0;
     }
     Ok((turns, format_hydrate_cursor(cursor_segment, cursor_offset)))
+}
+
+/// [`hydrate_conversation_in`] over a single transcript directory.
+pub fn hydrate_conversation(
+    dir: &Path,
+    session_ids: &[String],
+    start: (usize, u64),
+) -> std::io::Result<(Vec<HydratedTurn>, String)> {
+    let dirs = [dir.to_path_buf()];
+    hydrate_conversation_in(&dirs, session_ids, start)
 }
 
 /// Query params for `GET /jesse/conversations/{id}/transcript`.
@@ -1032,9 +1122,9 @@ pub async fn jesse_conversation_hydrate(
     };
     let start = parse_hydrate_cursor(params.after.as_deref())
         .map_err(|msg| (StatusCode::BAD_REQUEST, msg))?;
-    let dir = st.sessions_dir();
+    let dirs = st.transcript_dirs();
     let (turns, next_cursor) =
-        hydrate_conversation(&dir, &rec.session_ids, start).map_err(|e| {
+        hydrate_conversation_in(&dirs, &rec.session_ids, start).map_err(|e| {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 format!("could not read conversation transcript: {e}"),
@@ -1072,30 +1162,35 @@ pub async fn jesse_conversation_hydrate(
 /// the deprecation window, when a pre-0.33 client still read `GET /jesse/sessions`; with that
 /// route gone there is nothing left that reads the session key space.
 fn delete_conversation_core(st: &AppState, conversation_id: &str) -> Result<StatusCode, ApiError> {
-    let dir = st.sessions_dir();
+    let dirs = st.transcript_dirs();
     let now_ms = system_time_to_ms(SystemTime::now());
     let session_ids = st
         .conversations
         .get(conversation_id)
         .map(|r| r.session_ids)
         .unwrap_or_default();
+    // Each bound session is deleted from every harness's transcript dir: the record does
+    // not name the harness that wrote it, and a delete from a dir that never held the file
+    // is `AlreadyGone` (success), so the sweep across dirs stays idempotent.
     for sid in &session_ids {
-        match delete_session_file(&dir, sid) {
-            SessionDeleteOutcome::Deleted => {
-                eprintln!(
-                    "jesse-bridge: deleted transcript {sid} of conversation {conversation_id}"
-                );
-            }
-            SessionDeleteOutcome::AlreadyGone => {}
-            SessionDeleteOutcome::Failed(msg) => {
-                eprintln!(
-                    "jesse-bridge: failed to delete transcript {sid} of conversation \
-                     {conversation_id}: {msg}"
-                );
-                return Err((
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("could not delete conversation transcript: {msg}"),
-                ));
+        for dir in &dirs {
+            match delete_session_file(dir, sid) {
+                SessionDeleteOutcome::Deleted => {
+                    eprintln!(
+                        "jesse-bridge: deleted transcript {sid} of conversation {conversation_id}"
+                    );
+                }
+                SessionDeleteOutcome::AlreadyGone => {}
+                SessionDeleteOutcome::Failed(msg) => {
+                    eprintln!(
+                        "jesse-bridge: failed to delete transcript {sid} of conversation \
+                         {conversation_id}: {msg}"
+                    );
+                    return Err((
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!("could not delete conversation transcript: {msg}"),
+                    ));
+                }
             }
         }
     }
