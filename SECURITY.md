@@ -159,14 +159,28 @@ re-validated by the ambient verify gate and by trusted Rust before anything is
 written.) `claude 2.1.207` has no `--max-turns` flag, so the single-shot bound is
 by construction only, not CLI-enforced.
 
-**The title child is a different posture, deliberately.** The title one-shot
-(`run_claude_oneshot`) reuses `build_claude_args` — the **main-turn** scoped
-allowlist and the vault cwd — because it summarizes an already-produced reply and
-was never intended to be toolless. It therefore shares the main agent's tool
-surface (and, with it, the same CLI behavior around read/search/MCP tools), not
-the diet children's hard containment. Whether to tighten it is a separate
-decision; it does not carry the specific "empty allowlist assumed toolless" defect
-that the diet children did, because it never claimed to be toolless.
+## The title child
+
+**Now the same `Basic` posture as the diet children (bridge 0.39.0).** The title
+one-shot (`run_claude_oneshot`) used to reuse the **main-turn** allowlist and MCP
+set, because it shared a builder with a real turn: it resolved through the ambient
+model, which is writes-on, so naming a conversation ran with the **full writes-on
+toolset in the vault** — `Write`, `Edit`, the scoped `Bash` verbs,
+`Skill(diet-logging)` — and **launched the qmd server**, for a job whose entire
+output is a handful of words the bridge then validates and truncates.
+
+It is now granted `Capability::Basic` with an **empty** MCP server set, identical
+to the diet children: `--tools ""`, `--strict-mcp-config` naming no servers, empty
+`--allowedTools`, the same denylist. **What a title call can no longer reach:**
+every one of those grants, and the qmd server no longer starts for it. cwd stays
+the vault, which is inert under `--tools ""` (nothing can read it).
+
+Asserted on the argv the child is actually spawned with, not just on the builder
+(`title_oneshot_spawns_a_toolless_child_with_no_mcp_servers`), and live-probed
+against claude 2.1.220: before, 31 tools at the root and an executed `Write` that
+created the probe file; after, an empty root toolset, zero MCP servers, and zero
+executed `tool_use` across a write / ls / fetch / ToolSearch battery, with the
+endpoint still producing a title.
 
 ## Vault-QA child tool isolation (in-process boundary)
 
@@ -183,7 +197,24 @@ launched with:
 | --- | --- |
 | `--tools "Read,Grep,Glob"` | A read-only **root allowlist** (not the diet child's empty set). Exactly the three read-only built-ins exist at the root; `Bash`/`Write`/`Edit`, `ToolSearch`/`Workflow`/`Agent`, and everything else are absent at the root, not permission-gated. This is the load-bearing control. |
 | `--strict-mcp-config` + `--mcp-config <cfg>` | Loads **only** the servers in the config — the **qmd** vault-search server when `JESSE_VAULTQA_MCP_CONFIG` supplies it (its four tools are read-only search), or **no** servers otherwise. Nothing else can be reached, and `ToolSearch` (denied and absent at the root) cannot pull a server in. |
-| `--allowedTools` + expanded `--disallowedTools` | The allowlist names the three built-ins plus the four qmd tools; the denylist names `Bash,Write,Edit,NotebookEdit,WebFetch,WebSearch,Task,Agent,ToolSearch,Workflow,TodoWrite` as documented, **fragile** belt-and-suspenders behind the root flags (it names tools, so it breaks silently on a CLI tool rename/addition — it is not the guarantee). |
+| `--allowedTools` + expanded `--disallowedTools` | The allowlist names the three built-ins plus the four qmd tools; the denylist names `Bash,Write,Edit,NotebookEdit,WebFetch,WebSearch,Task,Agent,ToolSearch,Workflow,TodoWrite,Skill` as documented, **fragile** belt-and-suspenders behind the root flags (it names tools, so it breaks silently on a CLI tool rename/addition — it is not the guarantee). `Skill` was added in bridge 0.38.0 so both `Read` sites carry one list; see below. |
+
+**One `Read` posture, not two (bridge 0.38.0).** The read-only main turn already
+denied `Skill`; this child did not. The difference was undocumented and had no
+reason behind it — the two sites arrived at their lists separately. Both now take
+the stricter list, because a capability that means two different things at two
+call sites is not a boundary, it is a coincidence.
+
+Stated honestly, this is **defense-in-depth only**, not a change in what the child
+can reach: behind `--tools "Read,Grep,Glob"` the `Skill` tool does not exist at
+the root either way. Live-probed on claude 2.1.220 (2026-07-28) rather than
+assumed — asked to load the `diet-logging` skill, the child reported the same root
+toolset `["Glob", "Grep", "Read"]` and executed the same `Glob`/`Read` calls with
+and without the denial. The value is that the denylist now survives a CLI change
+that widened the root set at **both** `Read` sites rather than one. The MCP server
+set stays per call site: this child degrades to no servers while the main path
+requires qmd, and folding that into `Read` would silently remove vault search from
+a read-only turn.
 
 So the child can **read** the vault but cannot write, execute a shell, reach the
 network, spawn a subagent, or load an unlisted MCP tool.
@@ -426,9 +457,11 @@ Security-relevant properties:
   and never any prompt content** — so a production audit has a trail of where
   titles went.
 - **Same request posture otherwise.** The title child still uses `build_claude_args`
-  (identical `--permission-mode`/allow/deny lists), the same `MAX_TITLE_INPUT_BYTES`
-  input cap and short `TITLE_TIMEOUT_SECS`, and remains a soft best-effort call —
-  a title failure is degraded from, never surfaced as an error.
+  (identical `--permission-mode`, and since bridge 0.39.0 the toolless
+  `Capability::Basic` allow/deny lists with no MCP servers — see
+  [The title child](#the-title-child)), the same `MAX_TITLE_INPUT_BYTES` input cap
+  and short `TITLE_TIMEOUT_SECS`, and remains a soft best-effort call — a title
+  failure is degraded from, never surfaced as an error.
 - **Optional server-side title store.** `POST /jesse/title` accepts an optional
   `session_id`. When present *and* the title call succeeds, the minted title is
   persisted so `GET /jesse/sessions` can show it — to a single JSON file
