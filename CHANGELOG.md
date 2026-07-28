@@ -15,6 +15,54 @@ CI both run it). See the "Versioning" section of `bridge/README.md`.
 
 ## [Unreleased]
 
+## [Bridge 0.37.0] - 2026-07-28
+
+### Changed
+- **One capability vocabulary replaces four containment idioms.** The bridge spawns
+  `claude` from five places (the main turn with writes on, the main turn with writes off,
+  the vault-QA child, the diet extract/verify children, and the title one-shot) and each
+  expressed tool containment its own way: four shapes for three intents, with the shared
+  posture duplicated across `build_claude_args`, `build_readonly_tool_args`,
+  `build_diet_child_command`, and `build_vaultqa_child_command`. A new ordered
+  `Capability` enum (`Basic` < `Read` < `Write`, cumulative, no `Off` variant because a
+  model is disabled by removing its registry entry or unsetting its token) now names what
+  a child is granted, and one function (`capability_args`) maps a capability to its
+  toolset argument vector. All five call sites go through it. `Basic` names what the CHILD
+  is doing, not what model backs it: a single-shot text transformation that returns text
+  the bridge validates, so it is granted nothing.
+- **A capability covers the toolset only.** Two things stay per call site and are
+  deliberately not implied by it. The **MCP server set** (`mcp_args`): every site passes
+  `--strict-mcp-config` with its own config, and the divergence 0.36.0 introduced is
+  preserved exactly — the main path requires qmd (`MAIN_CHILD_MCP_CONFIG`), the vault-QA
+  child degrades to no servers. Folding that into `Read` would silently take vault search
+  away from a read-only turn. And the **working directory**: the `Basic` diet children run
+  in the neutral scratch base so the large vault `CLAUDE.md` cannot auto-load, while the
+  `Basic` title one-shot runs in the vault.
+- **Byte-for-byte at four of five sites**, pinned by a new golden test carrying the
+  captured literals. The one deviation is stated rather than buried: the two CHILD sites
+  emit the same flags with the same values in a different position (`--tools` used to
+  precede the MCP pair; every site now assembles base, MCP, toolset, which is what lets
+  one builder serve all five). `the_child_reorder_is_a_pure_permutation` proves the new
+  vector is a permutation of the old, so nothing was added, dropped, or altered in value.
+- The two `Read` call sites still differ in exactly one way — the read-only main turn
+  denies `Skill` and the vault-QA child does not — preserved behind a temporary
+  `ReadVariance` flag so the golden has a stable target. (They used to differ about
+  `--strict-mcp-config` too; 0.36.0 closed that for the main path.)
+- **The title one-shot is granted `Write` here**, which is its posture today rather than a
+  new one: it resolves through the ambient model, which is writes-on, so naming a
+  conversation currently runs with the full writes-on toolset and the qmd server in the
+  vault. This release only makes that visible in the argv and the golden.
+- **Constants renamed to name their capability rather than their historical first caller.**
+  `VAULTQA_CHILD_ROOT_TOOLS` → `READ_ROOT_TOOLS`, `VAULTQA_CHILD_ALLOWED_TOOLS` →
+  `READ_ALLOWED_TOOLS`, `MAIN_READONLY_DISALLOWED_TOOLS` → `READ_DISALLOWED_TOOLS`,
+  `DIET_CHILD_DISALLOWED_TOOLS` → `BASIC_DISALLOWED_TOOLS`, `DIET_CHILD_EMPTY_MCP_CONFIG`
+  → `EMPTY_MCP_CONFIG`. Several were named for the vault-QA child while being load-bearing
+  for the main turn. `build_claude_args` / `build_claude_command` take a `Capability` and
+  an MCP config; `build_claude_args` no longer needs the `ActiveModel` at all, since the
+  only thing it read from it was `writes_allowed` (now mapped by `turn_capability`).
+- Nothing about the streaming driver, the one-shot runner, the line parser, or the outcome
+  resolver changed. No capability is configurable.
+
 ## [Bridge 0.36.0] - 2026-07-27
 
 ### Added

@@ -285,31 +285,276 @@ pub fn resolve_stream_outcome(
 pub const MAIN_CHILD_MCP_CONFIG: &str =
     r#"{"mcpServers":{"qmd":{"type":"stdio","command":"qmd","args":["mcp"]}}}"#;
 
+
+// ---- Capability: one containment vocabulary --------------------------------
+
+/// What a `claude` child is allowed to do, as ONE ordered vocabulary shared by every
+/// place the bridge spawns one. Ordered and CUMULATIVE: `Write` implies `Read` implies
+/// `Basic`, so the derived `PartialOrd` is meaningful — `a >= b` reads "a is at least as
+/// capable as b" and is the right comparison wherever two capabilities meet.
+///
+/// Today the enum has ONE use: naming what a child is GRANTED, which
+/// [`capability_args`] maps to the containment flags that enforce it. The ordering is
+/// derived now anyway, because a capability is a general statement about ability rather
+/// than a per-call-site flag: a second use (a model declaring the CEILING it may be
+/// trusted with, taken against the grant) speaks the same vocabulary and needs the
+/// comparison.
+///
+/// There is deliberately NO `Off` variant. A model is disabled by removing its registry
+/// entry or unsetting its token env var — the configured-but-unarmed state the registry
+/// already understands. "Must not run at all" is the absence of a model, not a
+/// containment posture a spawned child could be given.
+///
+/// A capability covers the TOOLSET only. Two things a spawn site chooses independently
+/// are deliberately NOT implied by it:
+///   * The **MCP server set**. Every site passes `--strict-mcp-config` with its own
+///     `--mcp-config` ([`mcp_args`]); the main turn requires qmd
+///     ([`MAIN_CHILD_MCP_CONFIG`]), the vault-QA child degrades to no servers. Making
+///     that a property of `Read` would silently take qmd away from a read-only turn.
+///   * The **working directory**. The `Basic` diet children run in the neutral scratch
+///     base so the large vault `CLAUDE.md` cannot auto-load; the `Basic` title child runs
+///     in the vault. Both are intentional, so do not unify them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Capability {
+    /// No tools. Text in, text out.
+    ///
+    /// This names what the CHILD is doing and carries no assumption about the model
+    /// behind it. A `Basic` child is a single-shot text transformation: parse an
+    /// utterance into JSON, check that JSON, write a short title. It is granted nothing
+    /// because it needs nothing — it returns text, and the BRIDGE validates that text and
+    /// does any writing. That holds whatever model or harness serves the child.
+    Basic,
+    /// Read and search. No writes, no exec.
+    Read,
+    /// May change the vault.
+    Write,
+}
+
+/// The ROOT toolset (`--tools`) for a [`Capability::Read`] child: exactly the three
+/// read-only built-ins — file read and the two search tools. Nothing that can write,
+/// execute, or reach the network exists at the root, so those classes are absent rather
+/// than permission-gated.
+pub const READ_ROOT_TOOLS: &str = "Read,Grep,Glob";
+
+/// The `--allowedTools` grant for a [`Capability::Read`] child: the three read-only
+/// built-ins plus the four read-only qmd MCP search tools (present only when the site's
+/// MCP config supplies the qmd server; absent otherwise, and then simply never invoked).
+/// The web fetch and web search tools are deliberately NOT granted here — widening the
+/// read surface to the network is a separate decision with a security consequence.
+pub const READ_ALLOWED_TOOLS: &str =
+    "Read,Grep,Glob,mcp__qmd__query,mcp__qmd__get,mcp__qmd__multi_get,mcp__qmd__status";
+
+/// Tools DENIED to a READ-ONLY MAIN turn as belt-and-suspenders BEHIND the real boundary
+/// (the [`READ_ROOT_TOOLS`] root allowlist + strict MCP). It names every mutation /
+/// execution / network / orchestration class so a CLI change that widened the root set
+/// would still hit the denylist. `Skill` is named because a skill loads instruction text
+/// whose actions write (the `diet-logging` skill is exactly that). Enumerated denial is
+/// fragile by nature — it breaks SILENTLY on a tool rename or addition, exactly as
+/// [`BASIC_DISALLOWED_TOOLS`] documents — so the root allowlist is the guarantee and this
+/// is defense-in-depth.
+pub const READ_DISALLOWED_TOOLS: &str =
+    "Bash,Write,Edit,NotebookEdit,WebFetch,WebSearch,Task,Agent,ToolSearch,Workflow,TodoWrite,Skill";
+
+/// TEMPORARY, paired with [`ReadVariance::VaultQa`]: [`READ_DISALLOWED_TOOLS`] minus
+/// `Skill`, which is the vault-QA child's list as it stands today. The one remaining
+/// difference between the two `Read` call sites, deleted in the next commit when both
+/// take the stricter list.
+pub const READ_DISALLOWED_TOOLS_NO_SKILL: &str =
+    "Bash,Write,Edit,NotebookEdit,WebFetch,WebSearch,Task,Agent,ToolSearch,Workflow,TodoWrite";
+
+/// TEMPORARY. The two `Read` call sites still disagree in exactly one way: the read-only
+/// main turn denies `Skill` and the vault-QA child does not. (They used to disagree about
+/// `--strict-mcp-config` too; that was closed for the main path in bridge 0.36.0.) This
+/// flag preserves both flavours byte-for-byte through the mechanical collapse so the
+/// golden test has a stable target; the next commit deletes it by taking the stricter
+/// option both ways.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReadVariance {
+    /// The read-only MAIN turn: `Skill` denied.
+    MainTurn,
+    /// The vault-QA (and shadow) child: `Skill` not denied.
+    VaultQa,
+}
+
+/// Tools DENIED to a [`Capability::Basic`] child, as belt-and-suspenders BEHIND the real
+/// boundary (`--tools ""`, see [`capability_args`]). Beyond the mutation / execution /
+/// network classes it also names the read/search built-ins and the orchestration tools
+/// that an empty-`--allowedTools` posture left reachable: `Glob`, `Grep`, `Read`,
+/// `ToolSearch`, `Workflow`, `Agent`, `TodoWrite`, plus `Skill` (loads skill instruction
+/// text). `WebSearch` is here too.
+///
+/// KNOWN WEAKNESS — enumerated denial is fragile: it names tools, so it breaks SILENTLY
+/// whenever the CLI renames a tool, splits one, or adds a new one. The live proof of that
+/// fragility is right here — the vulnerability report's list also named `LS` and
+/// `NotebookRead`, but claude 2.1.207 has no such tools (verified: it warns `Permission
+/// deny rule "LS" matches no known tool`; directory listing and notebook reads fold into
+/// `Glob`/`Read`, which ARE denied). Naming a phantom tool is a no-op that also spams
+/// stderr on every child, so they are omitted here. Because this list cannot be trusted
+/// to stay complete across CLI versions, the actual guarantee is `--tools ""` (removes
+/// the whole built-in toolset at the root) + strict empty MCP, and the acceptance gate is
+/// the live probe battery re-run against the pinned CLI on every change to this posture.
+pub const BASIC_DISALLOWED_TOOLS: &str =
+    "Bash,Write,Edit,NotebookEdit,WebFetch,WebSearch,Task,Glob,Grep,Read,ToolSearch,Workflow,Agent,TodoWrite,Skill";
+
+/// An EMPTY MCP server set, passed as `--mcp-config` alongside `--strict-mcp-config` so
+/// the child loads NO MCP servers at all. `--strict-mcp-config` tells the CLI to use only
+/// servers declared here; this declares none — so every `mcp__*` tool, and anything
+/// `ToolSearch` could load from a server, is absent at the root rather than denied by
+/// name. (The vulnerability report saw a "fetch" probe reach
+/// `mcp__playwright__browser_navigate` and make a live network fetch under the old
+/// posture; strict empty MCP closes that at the source.)
+pub const EMPTY_MCP_CONFIG: &str = r#"{"mcpServers":{}}"#;
+
+/// The ROOT MCP boundary every spawn site carries: load ONLY the servers named in
+/// `config`. Deliberately separate from [`capability_args`] — the server set is a per
+/// call site choice, not something a capability implies. The main turn REQUIRES qmd
+/// ([`MAIN_CHILD_MCP_CONFIG`]) while the vault-QA child degrades to no servers
+/// ([`EMPTY_MCP_CONFIG`]), and folding that into `Read` would silently take vault search
+/// away from a read-only turn.
+///
+/// `--mcp-config` accepts a file PATH or inline JSON, so an env override supplies either
+/// and the fallback consts are inline JSON. Live-verified on claude 2.1.220 (2026-07-27):
+/// without `--strict-mcp-config` the CLI also discovers the ambient user/project scopes,
+/// and an MCP tool that IS in `--allowedTools` is approved automatically while the same
+/// tool omitted fails with "requested permissions … but you haven't granted it yet" —
+/// refused-at-the-prompt, which is a weaker boundary than never loaded.
+pub fn mcp_args(config: &str) -> Vec<String> {
+    vec![
+        "--strict-mcp-config".to_string(),
+        "--mcp-config".to_string(),
+        config.to_string(),
+    ]
+}
+
+/// The MCP server set for a MAIN turn (and the title one-shot, which shares its builder):
+/// `JESSE_MAIN_MCP_CONFIG` when set, else the qmd-only [`MAIN_CHILD_MCP_CONFIG`].
+pub fn main_mcp_config(cfg: &Config) -> &str {
+    cfg.main_mcp_config.as_deref().unwrap_or(MAIN_CHILD_MCP_CONFIG)
+}
+
+/// The MCP server set for the vault-QA child (and the shadow child, which shares its
+/// builder): `JESSE_VAULTQA_MCP_CONFIG` when set, else NO servers.
+pub fn vaultqa_mcp_config(cfg: &Config) -> &str {
+    cfg.vaultqa_mcp_config.as_deref().unwrap_or(EMPTY_MCP_CONFIG)
+}
+
+/// Map a [`Capability`] to the TOOLSET argument vector that enforces it. THE one function
+/// every spawn site funnels through, so the posture for a capability is stated once and
+/// cannot drift between call sites. The MCP server set ([`mcp_args`]), the working
+/// directory, and any env override stay with the caller.
+///
+/// # Why these exact flags
+///
+/// [`Capability::Basic`] does not mean "empty `--allowedTools`". Live validation against
+/// the pinned CLI (claude 2.1.207) on 2026-07-13 DISPROVED that assumption: an empty
+/// `--allowedTools` means "add nothing to the default set", not "allow nothing". A
+/// headless `-p` child still reached read/search built-ins (a "run ls" probe executed
+/// `Glob`), loaded MCP servers on demand via `ToolSearch` (a "fetch" probe drove
+/// `mcp__playwright__browser_navigate` to a live network fetch), and reached `Workflow` —
+/// none of which raise the permission prompt a headless child cannot answer. Only `Write`
+/// was actually contained. So the boundary is built at the ROOT, deny-by-default, not by
+/// enumeration: `--tools ""` disables the ENTIRE built-in toolset (control-tested:
+/// dropping it alone lets the "run ls" probe execute `Glob` again), with an empty
+/// `--allowedTools` and [`BASIC_DISALLOWED_TOOLS`] as belt-and-suspenders behind it.
+///
+/// [`Capability::Read`] is the same shape with a read-only root ALLOWLIST
+/// ([`READ_ROOT_TOOLS`]) instead of an empty root set, the [`READ_ALLOWED_TOOLS`] grant,
+/// and the read denylist behind it.
+///
+/// [`Capability::Write`] passes the configured `--allowedTools` / `--disallowedTools` and
+/// NO root `--tools` flag, which is exactly today's writes-on main-turn posture.
+///
+/// Rejected alternatives (for `Basic`, and by extension `Read`):
+///   * Enumerated denylist only — rejected: it breaks silently on any CLI tool
+///     rename/addition, and this very CLI already omits `LS`/`NotebookRead` from its tool
+///     namespace, so a name-based list cannot be trusted to stay complete. `--tools`
+///     sidesteps the namespace entirely.
+///   * `--bare` / `--safe-mode` — rejected: both alter auth resolution (`--bare` forces
+///     `ANTHROPIC_API_KEY`/`apiKeyHelper` and never reads OAuth/keychain), which would
+///     break the ambient-credential verify child. Containment must not change which
+///     backend a child talks to.
+///   * A single-turn cap for defense-in-depth — UNAVAILABLE: claude 2.1.207 exposes no
+///     `--max-turns` flag (verified via `--help`). The children are single-shot by
+///     construction, but the CLI offers no turn bound to enforce it. (`--max-budget-usd`
+///     exists but bounds cost, not agentic turns, and is not a containment control.)
+pub fn capability_args(
+    cfg: &Config,
+    capability: Capability,
+    variance: ReadVariance,
+) -> Vec<String> {
+    match capability {
+        Capability::Basic => vec![
+            // ROOT boundary: disable the entire built-in toolset (deny-by-default).
+            "--tools".to_string(),
+            String::new(),
+            // Belt-and-suspenders behind the root flag above and strict MCP.
+            "--allowedTools".to_string(),
+            String::new(),
+            "--disallowedTools".to_string(),
+            BASIC_DISALLOWED_TOOLS.to_string(),
+        ],
+        Capability::Read => vec![
+            // ROOT boundary: a read-only root allowlist (not an empty set) — the child
+            // may read, nothing more.
+            "--tools".to_string(),
+            READ_ROOT_TOOLS.to_string(),
+            "--allowedTools".to_string(),
+            READ_ALLOWED_TOOLS.to_string(),
+            "--disallowedTools".to_string(),
+            match variance {
+                ReadVariance::MainTurn => READ_DISALLOWED_TOOLS,
+                ReadVariance::VaultQa => READ_DISALLOWED_TOOLS_NO_SKILL,
+            }
+            .to_string(),
+        ],
+        Capability::Write => {
+            // Today's exact writes-on posture: the configured lists, and NO root
+            // `--tools` flag (so the full built-in toolset stands at the root).
+            let mut args = vec!["--allowedTools".to_string(), cfg.allowed_tools.clone()];
+            if !cfg.disallowed_tools.trim().is_empty() {
+                args.push("--disallowedTools".to_string());
+                args.push(cfg.disallowed_tools.clone());
+            }
+            args
+        }
+    }
+}
+
+/// The capability a MAIN turn is granted for the model backing it (the global switch).
+/// Writes-on (the ambient `opus` default, or a model whose writes were explicitly
+/// enabled) → [`Capability::Write`]; every read-only model → [`Capability::Read`], so a
+/// weaker or unfamiliar model cannot mutate the vault regardless of what it tries. The
+/// boundary is the toolset, not the prompt.
+pub fn turn_capability(active: &ActiveModel) -> Capability {
+    if active.writes_allowed {
+        Capability::Write
+    } else {
+        Capability::Read
+    }
+}
+
 /// Build the argument vector for one `claude` invocation (everything after the
 /// binary name). Pure and side-effect-free so it can be unit-tested without
 /// spawning a process. Enforces the C1 least-privilege boundary:
 ///   * `--permission-mode default` (never `acceptEdits`/`bypassPermissions`)
 ///   * an explicit `--allowedTools` list (always present)
 ///   * a `--disallowedTools` denylist as defense-in-depth
-///   * `--strict-mcp-config` + an explicit `--mcp-config` (always present, on BOTH
-///     the writes-enabled and read-only branches) so ONLY the servers named there
-///     load — see [`MAIN_CHILD_MCP_CONFIG`]
+///   * `--strict-mcp-config` + an explicit `--mcp-config` (always present) so ONLY the
+///     servers named there load — see [`mcp_args`] and [`MAIN_CHILD_MCP_CONFIG`]
 ///
 /// A `session_id` adds `--resume <id>` to continue a thread.
 ///
-/// `active` is the model backing this turn (the global switch). When it is writes-on
-/// (the ambient `opus` default, or a model whose writes were explicitly enabled) the
-/// args are byte-for-byte today's: the configured `--allowedTools` / `--disallowedTools`.
-/// When it is READ-ONLY (every non-ambient model in Phase 1) the tool posture is the
-/// contained read-only boundary ([`build_readonly_tool_args`]) — reads + search + the
-/// qmd vault MCP, and NO write/exec/send tool — so a weaker or unfamiliar model cannot
-/// mutate the vault regardless of what it tries. The boundary is the ALLOWLIST, not the
-/// prompt.
+/// `capability` names what this child is granted and [`capability_args`] turns it into
+/// the toolset flags; `mcp_config` names the servers it may load. A main turn derives its
+/// capability from the active model via [`turn_capability`] and passes
+/// [`main_mcp_config`]; the title one-shot passes its own. The boundary is the TOOLSET,
+/// not the prompt.
 pub fn build_claude_args(
     cfg: &Config,
     prompt: &str,
     session_id: Option<&str>,
-    active: &ActiveModel,
+    capability: Capability,
+    mcp_config: &str,
 ) -> Vec<String> {
     let mut args = vec![
         "-p".to_string(),
@@ -327,40 +572,11 @@ pub fn build_claude_args(
         // below rather than auto-accepted. Never acceptEdits/bypassPermissions.
         "--permission-mode".to_string(),
         "default".to_string(),
-        // ROOT MCP boundary, on EVERY main turn and on BOTH branches below: load only
-        // the servers named in `--mcp-config` (qmd). Without `--strict-mcp-config` the
-        // CLI also discovers the ambient user/project scopes, which is how the
-        // account-level cloud connectors (Gmail, Slack, Calendar, Drive) and
-        // playwright were loading into every phone turn — reachable at the root and
-        // stopped only by a permission prompt a headless `-p` child cannot answer.
-        // Live-verified on the pinned CLI 2.1.220 (2026-07-27): an MCP tool IN `--allowedTools`
-        // is approved automatically, while the SAME tool with the allowlist unchanged
-        // but the tool omitted fails with "requested permissions … but you haven't
-        // granted it yet". Refused-at-the-prompt is a weaker boundary than never
-        // loaded; this makes it never loaded. The main path was the LAST child route
-        // without this — the diet and vault-QA children already carry it.
-        "--strict-mcp-config".to_string(),
-        "--mcp-config".to_string(),
-        // Same resolution as the vault-QA child: `--mcp-config` takes a file PATH or
-        // inline JSON, so an env override supplies either; unset → the inline qmd-only
-        // const. NOT the empty-servers const — the main path REQUIRES qmd.
-        cfg.main_mcp_config
-            .as_deref()
-            .unwrap_or(MAIN_CHILD_MCP_CONFIG)
-            .to_string(),
     ];
-    if active.writes_allowed {
-        // Writes-on (opus, or a model granted writes in Phase 2): today's exact posture.
-        args.push("--allowedTools".to_string());
-        args.push(cfg.allowed_tools.clone());
-        if !cfg.disallowed_tools.trim().is_empty() {
-            args.push("--disallowedTools".to_string());
-            args.push(cfg.disallowed_tools.clone());
-        }
-    } else {
-        // Read-only (every non-ambient model in Phase 1): the contained boundary.
-        args.extend(build_readonly_tool_args());
-    }
+    // ROOT MCP boundary, then the capability's toolset. Every spawn site assembles in
+    // this order, which is what lets one builder serve all of them.
+    args.extend(mcp_args(mcp_config));
+    args.extend(capability_args(cfg, capability, ReadVariance::MainTurn));
     if let Some(sid) = session_id {
         // A synthetic `local-<hex>` id (context carry) names a bridge-minted ledger
         // thread with NO real claude session, so it must NEVER be resumed — the CLI
@@ -383,46 +599,36 @@ pub fn build_claude_args(
 /// exactly as before. The title path layers its backend override on top via
 /// `apply_title_env`; the main-turn path never does, which is the isolation
 /// guarantee (proven by a dedicated test). Factored out so both paths stay
-/// byte-identical except for that one deliberate difference.
+/// byte-identical except for that one deliberate difference and the `capability` /
+/// `mcp_config` each is granted.
+///
+/// cwd is the VAULT for both, and stays a per-call-site choice rather than something the
+/// capability implies — see [`Capability`].
 pub fn build_claude_command(
     cfg: &Config,
     prompt: &str,
     session_id: Option<&str>,
     active: &ActiveModel,
+    capability: Capability,
+    mcp_config: &str,
 ) -> Command {
     let mut cmd = Command::new(&cfg.claude_bin);
-    cmd.args(build_claude_args(cfg, prompt, session_id, active))
-        .current_dir(&cfg.vault) // cwd = vault → CLAUDE.md auto-loads
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true); // killed if the timeout fires or the task is dropped
+    cmd.args(build_claude_args(
+        cfg,
+        prompt,
+        session_id,
+        capability,
+        mcp_config,
+    ))
+    .current_dir(&cfg.vault) // cwd = vault → CLAUDE.md auto-loads
+    .stdout(Stdio::piped())
+    .stderr(Stdio::piped())
+    .kill_on_drop(true); // killed if the timeout fires or the task is dropped
     // Apply the active model's backend to the MAIN turn — and ONLY when it is
     // non-ambient. For the ambient `opus` default this is a no-op, so the command carries
     // NO `ANTHROPIC_*` and the main-turn isolation property holds byte-for-byte.
     apply_main_env(&mut cmd, active);
     cmd
-}
-
-/// The tool-posture args for a READ-ONLY main turn (a non-ambient model with writes off).
-/// The contained boundary mirrors the vault-QA child's proven posture — a read-only ROOT
-/// allowlist ([`VAULTQA_CHILD_ROOT_TOOLS`]) so write/exec/orchestration built-ins are
-/// absent at the ROOT (deny-by-default, not permission-gated), a read-only
-/// `--allowedTools` grant (the three built-ins plus the four read-only qmd search tools),
-/// and an extended denylist as belt-and-suspenders. NO `Write`, NO `Edit`, NO `Bash`, and
-/// no outbound-send tool of any kind is reachable. MCP servers are still discovered from
-/// the vault project (so qmd works), but only the read-only qmd tools are granted.
-pub fn build_readonly_tool_args() -> Vec<String> {
-    vec![
-        // ROOT boundary: a read-only built-in root set (not the writes-on full set).
-        "--tools".to_string(),
-        VAULTQA_CHILD_ROOT_TOOLS.to_string(),
-        // Read + search built-ins plus the four read-only qmd search tools.
-        "--allowedTools".to_string(),
-        VAULTQA_CHILD_ALLOWED_TOOLS.to_string(),
-        // Belt-and-suspenders behind the root allowlist.
-        "--disallowedTools".to_string(),
-        MAIN_READONLY_DISALLOWED_TOOLS.to_string(),
-    ]
 }
 
 /// Layer the ACTIVE model's backend onto the MAIN turn's `Command` — the global model
@@ -476,94 +682,11 @@ pub fn apply_diet_env(cmd: &mut Command, cfg: &Config) {
     }
 }
 
-/// Tools DENIED to the stateless diet children (extract + verify), as
-/// belt-and-suspenders BEHIND the real boundary (`--tools ""`, see
-/// [`build_diet_child_command`]). Expanded past the original seven mutation /
-/// execution / network classes to also name the read/search built-ins and the
-/// orchestration tools that the old empty-`--allowedTools` posture left reachable:
-/// `Glob`, `Grep`, `Read`, `ToolSearch`, `Workflow`, `Agent`, `TodoWrite`, plus
-/// `Skill` (loads skill instruction text). `WebSearch` is already in the original
-/// seven.
-///
-/// KNOWN WEAKNESS — enumerated denial is fragile: it names tools, so it breaks
-/// SILENTLY whenever the CLI renames a tool, splits one, or adds a new one. The
-/// live proof of that fragility is right here — the vulnerability report's list
-/// also named `LS` and `NotebookRead`, but claude 2.1.207 has no such tools
-/// (verified: it warns `Permission deny rule "LS" matches no known tool`; directory
-/// listing and notebook reads fold into `Glob`/`Read`, which ARE denied). Naming a
-/// phantom tool is a no-op that also spams stderr on every child, so they are
-/// omitted here. Because this list cannot be trusted to stay complete across CLI
-/// versions, the actual guarantee is `--tools ""` (removes the whole built-in
-/// toolset at the root) + strict empty MCP, and the acceptance gate is the live
-/// six-probe battery re-run against the pinned CLI on every change to this posture.
-pub const DIET_CHILD_DISALLOWED_TOOLS: &str =
-    "Bash,Write,Edit,NotebookEdit,WebFetch,WebSearch,Task,Glob,Grep,Read,ToolSearch,Workflow,Agent,TodoWrite,Skill";
-
-/// An EMPTY MCP server set, passed as `--mcp-config` alongside `--strict-mcp-config`
-/// so the diet child loads NO MCP servers at all. `--strict-mcp-config` tells the CLI
-/// to use only servers declared here; this declares none — so every `mcp__*` tool,
-/// and anything `ToolSearch` could load from a server, is absent at the root rather
-/// than denied by name. (The vulnerability report saw a "fetch" probe reach
-/// `mcp__playwright__browser_navigate` and make a live network fetch under the old
-/// posture; strict empty MCP closes that at the source.)
-pub const DIET_CHILD_EMPTY_MCP_CONFIG: &str = r#"{"mcpServers":{}}"#;
-
-/// Build the base `Command` for a stateless diet CHILD (extract or verify): the
-/// same `stream-json` + `--permission-mode default` posture as every other child,
-/// but hard-contained so the child cannot act. Unlike a turn or a title call it does
-/// NOT set the vault as cwd — the extract/verify contract is inlined in the prompt,
-/// so the child needs no vault context and must not auto-load the large vault
-/// `CLAUDE.md`; cwd is the neutral scratch base. Sets NO env overrides (callers layer
-/// `apply_diet_env` for extract, nothing for the ambient verify).
-///
-/// # Containment posture — why these exact flags
-///
-/// The extract and verify children are single-shot, text-in / JSON-text-out. They
-/// need NO tools. The original posture tried to express that with an EMPTY
-/// `--allowedTools` plus a seven-name denylist, on the assumption that an empty
-/// allowlist under `--permission-mode default` means "allow nothing". Live
-/// validation against the pinned CLI (claude 2.1.207) on 2026-07-13 DISPROVED that
-/// assumption: an empty `--allowedTools` means "add nothing to the default set", not
-/// "allow nothing". A headless `-p` child still reached read/search built-ins (a
-/// "run ls" probe executed `Glob`), loaded MCP servers on demand via `ToolSearch` (a
-/// "fetch" probe drove `mcp__playwright__browser_navigate` to a live network fetch),
-/// and reached `Workflow` — none of which raise the permission prompt that a
-/// headless child cannot answer. Only `Write` was actually contained.
-///
-/// So the boundary is rebuilt at the ROOT, deny-by-default, not by enumeration:
-///   * `--tools ""` — disable the ENTIRE built-in toolset. This is the load-bearing
-///     flag (control-tested: dropping it alone lets the "run ls" probe execute
-///     `Glob` again). No built-in tool exists to be invoked, so read/search,
-///     `ToolSearch`, `Workflow`, and `Agent` are gone at the source rather than
-///     permission-gated.
-///   * `--strict-mcp-config` + an empty `--mcp-config` ([`DIET_CHILD_EMPTY_MCP_CONFIG`])
-///     — load NO MCP servers, so every `mcp__*` tool (and anything `ToolSearch`
-///     could pull from a server) is absent at the root.
-///   * `--disallowedTools` ([`DIET_CHILD_DISALLOWED_TOOLS`]) and an empty
-///     `--allowedTools` — retained as belt-and-suspenders behind the two above. The
-///     denylist is fragile by nature (see its docs); the root flags are the real
-///     guarantee, and the live six-probe battery is the acceptance gate.
-///
-/// Rejected alternatives:
-///   * Enumerated denylist only (the task's fallback (c)) — rejected: it breaks
-///     silently on any CLI tool rename/addition, and this very CLI already omits
-///     `LS`/`NotebookRead` from its tool namespace, so a name-based list cannot be
-///     trusted to stay complete. `--tools ""` sidesteps the namespace entirely.
-///   * `--bare` / `--safe-mode` — rejected: both alter auth resolution (`--bare`
-///     forces `ANTHROPIC_API_KEY`/`apiKeyHelper` and never reads OAuth/keychain),
-///     which would break the ambient-credential verify child. Containment must not
-///     change which backend a child talks to.
-///   * A single-turn cap for defense-in-depth — UNAVAILABLE: claude 2.1.207 exposes
-///     no `--max-turns` flag (verified via `--help`). The children are single-shot
-///     by construction, but the CLI offers no turn bound to enforce it, so the tool
-///     posture stands alone on that axis. (`--max-budget-usd` exists but bounds cost,
-///     not agentic turns, and is not a containment control.)
-pub fn build_diet_child_command(cfg: &Config, prompt: &str) -> Command {
-    let mut cmd = Command::new(&cfg.claude_bin);
-    // Empty allowlist — retained belt-and-suspenders; the real boundary is
-    // `--tools ""` below. Ignore cfg.allowed_tools entirely.
-    let allowed = String::new();
-    cmd.args([
+/// The base args every stateless CHILD shares with a turn: `stream-json` with
+/// token-level deltas, and `--permission-mode default` so tools are gated by the
+/// capability's allow/deny lists rather than auto-accepted.
+fn child_base_args(prompt: &str) -> Vec<String> {
+    vec![
         "-p".to_string(),
         prompt.to_string(),
         "--output-format".to_string(),
@@ -572,23 +695,36 @@ pub fn build_diet_child_command(cfg: &Config, prompt: &str) -> Command {
         "--include-partial-messages".to_string(),
         "--permission-mode".to_string(),
         "default".to_string(),
-        // ROOT boundary #1: disable the entire built-in toolset (deny-by-default).
-        "--tools".to_string(),
-        String::new(),
-        // ROOT boundary #2: load NO MCP servers (strict + empty config).
-        "--strict-mcp-config".to_string(),
-        "--mcp-config".to_string(),
-        DIET_CHILD_EMPTY_MCP_CONFIG.to_string(),
-        // Belt-and-suspenders behind the two root flags above.
-        "--allowedTools".to_string(),
-        allowed,
-        "--disallowedTools".to_string(),
-        DIET_CHILD_DISALLOWED_TOOLS.to_string(),
-    ])
-    .current_dir(cfg.scratch_base()) // neutral cwd → no vault CLAUDE.md auto-load
-    .stdout(Stdio::piped())
-    .stderr(Stdio::piped())
-    .kill_on_drop(true);
+    ]
+}
+
+/// Build the base `Command` for a stateless diet CHILD (extract or verify): the same
+/// `stream-json` + `--permission-mode default` posture as every other child, contained at
+/// [`Capability::Basic`] with NO MCP servers — the extract and verify children are
+/// single-shot, text-in / JSON-text-out, so they are granted nothing. Why `Basic` is
+/// built the way it is (and what live validation disproved) is documented on
+/// [`capability_args`].
+///
+/// Unlike a turn or a title call it does NOT set the vault as cwd — the extract/verify
+/// contract is inlined in the prompt, so the child needs no vault context and must not
+/// auto-load the large vault `CLAUDE.md`; cwd is the neutral scratch base. That is a
+/// deliberate per-call-site choice, NOT something `Basic` implies (the title one-shot is
+/// also `Basic` and runs in the vault), so leave it alone. Sets NO env overrides (callers
+/// layer `apply_diet_env` for extract, nothing for the ambient verify).
+pub fn build_diet_child_command(cfg: &Config, prompt: &str) -> Command {
+    let mut cmd = Command::new(&cfg.claude_bin);
+    let mut args = child_base_args(prompt);
+    args.extend(mcp_args(EMPTY_MCP_CONFIG));
+    args.extend(capability_args(
+        cfg,
+        Capability::Basic,
+        ReadVariance::MainTurn, // ignored: variance only distinguishes the two Read flavours
+    ));
+    cmd.args(args)
+        .current_dir(cfg.scratch_base()) // neutral cwd → no vault CLAUDE.md auto-load
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
     cmd
 }
 
@@ -740,96 +876,32 @@ pub async fn run_diet_verify(
 
 // ---- Contained read-only vault-QA child ------------------------------------
 
-/// The root toolset the vault-QA child is launched with (`--tools`). Unlike the
-/// diet child's EMPTY set, the vault-QA child needs to READ the vault to answer, so
-/// it gets a root ALLOWLIST of exactly the three read-only built-ins — file read
-/// and the two search tools, nothing that can write, execute, or reach the network.
-pub const VAULTQA_CHILD_ROOT_TOOLS: &str = "Read,Grep,Glob";
-
-/// The `--allowedTools` grant for the vault-QA child: the same three read-only
-/// built-ins plus the four read-only qmd MCP search tools (present only when an MCP
-/// config supplies the qmd server; absent otherwise, and then simply never invoked).
-pub const VAULTQA_CHILD_ALLOWED_TOOLS: &str =
-    "Read,Grep,Glob,mcp__qmd__query,mcp__qmd__get,mcp__qmd__multi_get,mcp__qmd__status";
-
-/// Tools DENIED to the vault-QA child as documented belt-and-suspenders BEHIND the
-/// real boundary (the `--tools "Read,Grep,Glob"` root allowlist + strict MCP). It
-/// names every mutation / execution / network / orchestration class so a CLI change
-/// that widened the root set would still hit the denylist. Enumerated denial is
-/// fragile by nature (it breaks silently on a tool rename/addition), exactly as the
-/// diet child's denylist documents — the root allowlist is the guarantee.
-pub const VAULTQA_CHILD_DISALLOWED_TOOLS: &str =
-    "Bash,Write,Edit,NotebookEdit,WebFetch,WebSearch,Task,Agent,ToolSearch,Workflow,TodoWrite";
-
-/// The denylist for a READ-ONLY MAIN turn (a non-ambient model with writes off). The
-/// vault-QA child's denylist plus `Skill` — the main turn's normal allowlist can load
-/// the `diet-logging` skill (whose actions write), so it is named here as
-/// belt-and-suspenders behind the read-only root allowlist (`--tools "Read,Grep,Glob"`).
-/// Enumerated denial is fragile by nature (see the vault-QA child docs); the root
-/// allowlist is the real guarantee, this is defense-in-depth.
-pub const MAIN_READONLY_DISALLOWED_TOOLS: &str =
-    "Bash,Write,Edit,NotebookEdit,WebFetch,WebSearch,Task,Agent,ToolSearch,Workflow,TodoWrite,Skill";
-
-/// Build the base `Command` for the stateless, READ-ONLY vault-QA child. A near-clone
-/// of [`build_diet_child_command`] with deliberate deltas so the child can read the
-/// vault and answer a self-referential question from it:
+/// Build the base `Command` for the stateless, READ-ONLY vault-QA child: the shared child
+/// base args, the child's own MCP server set (`JESSE_VAULTQA_MCP_CONFIG`, else NO
+/// servers — see [`vaultqa_mcp_config`]), contained at [`Capability::Read`]. The child
+/// can read the vault and answer a self-referential question from it but cannot write,
+/// execute, or reach the network. The read-only root allowlist plus strict MCP are the
+/// boundary; see [`capability_args`].
 ///
-///   * `--tools "Read,Grep,Glob"` — a root ALLOWLIST (not the diet child's empty set):
-///     the child needs to read files, so it gets exactly the three read-only built-ins
-///     at the root and nothing else. No `Bash`/`Write`/`Edit`, no `ToolSearch`/
-///     `Workflow`/`Agent` — they are absent at the root, not permission-gated.
-///   * `--strict-mcp-config` + `--mcp-config` from `JESSE_VAULTQA_MCP_CONFIG` when set
-///     (the qmd server), else the shared empty-servers const so NO MCP loads.
-///   * `--allowedTools` naming the three built-ins plus the four read-only qmd tools.
-///   * `--disallowedTools` ([`VAULTQA_CHILD_DISALLOWED_TOOLS`]) as documented
-///     belt-and-suspenders behind the root allowlist.
-///
-/// THE ONE INTENTIONAL DIVERGENCE FROM THE DIET CHILD: cwd is the VAULT, not the
-/// neutral scratch base. The child must read vault files to answer, so it runs in the
-/// vault (CLAUDE.md auto-loads, but the prompt frames all file content as untrusted
-/// data). Containment therefore comes from the TOOLSET — the read-only root allowlist
-/// plus strict MCP mean the child can read but cannot write, execute, or reach the
-/// network — not from an isolated cwd, the same way the diet child's containment comes
-/// from `--tools ""`. Sets NO env override (the caller layers `apply_vaultqa_env`), and
-/// never passes `--resume` (the child is stateless).
+/// THE ONE INTENTIONAL DIVERGENCE FROM THE DIET CHILD: cwd is the VAULT, not the neutral
+/// scratch base. The child must read vault files to answer, so it runs in the vault
+/// (CLAUDE.md auto-loads, but the prompt frames all file content as untrusted data).
+/// Containment therefore comes from the TOOLSET, not from an isolated cwd — cwd is a
+/// per-call-site choice the capability says nothing about. Sets NO env override (the
+/// caller layers `apply_vaultqa_env`), and never passes `--resume` (the child is
+/// stateless).
 pub fn build_vaultqa_child_command(cfg: &Config, prompt: &str) -> Command {
     let mut cmd = Command::new(&cfg.claude_bin);
-    // `--mcp-config` accepts a file PATH or inline JSON. When JESSE_VAULTQA_MCP_CONFIG
-    // is set it is a path to a config declaring exactly the qmd server; unset → the
-    // shared inline empty-servers const, so strict-mcp-config loads NO servers.
-    let mcp_config = cfg
-        .vaultqa_mcp_config
-        .as_deref()
-        .unwrap_or(DIET_CHILD_EMPTY_MCP_CONFIG);
-    cmd.args([
-        "-p".to_string(),
-        prompt.to_string(),
-        "--output-format".to_string(),
-        "stream-json".to_string(),
-        "--verbose".to_string(),
-        "--include-partial-messages".to_string(),
-        "--permission-mode".to_string(),
-        "default".to_string(),
-        // ROOT boundary #1: a read-only root allowlist (not an empty set) — the child
-        // may read the vault, nothing more.
-        "--tools".to_string(),
-        VAULTQA_CHILD_ROOT_TOOLS.to_string(),
-        // ROOT boundary #2: only the servers in --mcp-config load (qmd, or none).
-        "--strict-mcp-config".to_string(),
-        "--mcp-config".to_string(),
-        mcp_config.to_string(),
-        // Belt-and-suspenders behind the two root flags above.
-        "--allowedTools".to_string(),
-        VAULTQA_CHILD_ALLOWED_TOOLS.to_string(),
-        "--disallowedTools".to_string(),
-        VAULTQA_CHILD_DISALLOWED_TOOLS.to_string(),
-    ])
-    // The ONE divergence from the diet child: cwd = the vault. The child must READ
-    // vault files; containment is the read-only toolset above, not the cwd.
-    .current_dir(&cfg.vault)
-    .stdout(Stdio::piped())
-    .stderr(Stdio::piped())
-    .kill_on_drop(true);
+    let mut args = child_base_args(prompt);
+    args.extend(mcp_args(vaultqa_mcp_config(cfg)));
+    args.extend(capability_args(cfg, Capability::Read, ReadVariance::VaultQa));
+    cmd.args(args)
+        // The ONE divergence from the diet child: cwd = the vault. The child must READ
+        // vault files; containment is the read-only toolset above, not the cwd.
+        .current_dir(&cfg.vault)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
     cmd
 }
 
@@ -916,10 +988,17 @@ pub async fn run_claude_streaming(
         // A main turn deliberately does NOT call apply_title_env: the title-backend
         // override touches the title child only, never a real agent turn.
         // The active model backs this turn: for a non-ambient model `build_claude_command`
-        // applies its ANTHROPIC_* + CLAUDE_CODE_SUBAGENT_MODEL and, when writes are off,
-        // the read-only allowlist; for the ambient default it applies nothing (byte-for-
-        // byte today's command).
-        let mut cmd = build_claude_command(cfg, prompt, session_id, active);
+        // applies its ANTHROPIC_* + CLAUDE_CODE_SUBAGENT_MODEL; for the ambient default it
+        // applies nothing (byte-for-byte today's command). The capability it is granted
+        // comes from the same model: writes-on → Write, read-only → Read.
+        let mut cmd = build_claude_command(
+            cfg,
+            prompt,
+            session_id,
+            active,
+            turn_capability(active),
+            main_mcp_config(cfg),
+        );
 
         let mut child = cmd.spawn().map_err(|e| {
             (
@@ -1130,7 +1209,19 @@ pub async fn run_claude_oneshot(
     // untouched by the model switch, so it passes the ambient active model — the command
     // is byte-for-byte today's, and `apply_title_env` below still layers any title
     // backend on top (the two never mix).
-    let mut cmd = build_claude_command(cfg, prompt, None, &ActiveModel::ambient());
+    // The capability and MCP set are stated explicitly here rather than derived from the
+    // ambient model, which makes today's posture visible: a title one-shot resolves
+    // through the ambient model, which is writes-on, so naming a conversation currently
+    // runs with the FULL writes-on toolset (and the qmd server) in the vault. Tightening
+    // that is a deliberate change, and is its own commit.
+    let mut cmd = build_claude_command(
+        cfg,
+        prompt,
+        None,
+        &ActiveModel::ambient(),
+        Capability::Write,
+        main_mcp_config(cfg),
+    );
     // Title-only backend override: point THIS child at the configured
     // base_url/token/model when all three JESSE_TITLE_* vars are set. A no-op
     // otherwise (ambient backend). Main turns never call this.
@@ -1390,7 +1481,7 @@ mod tests {
     fn build_claude_args_requests_partial_stream_json() {
         // The streaming contract: stream-json + the two flags `claude` requires
         // for token-level deltas under `-p`.
-        let args = build_claude_args(&test_config(), "hi", None, &ActiveModel::ambient());
+        let args = build_claude_args(&test_config(), "hi", None, Capability::Write, main_mcp_config(&test_config()));
         let pos = |needle: &str| args.iter().position(|a| a == needle);
         let of = pos("--output-format").expect("--output-format present");
         assert_eq!(args[of + 1], "stream-json");
@@ -1479,7 +1570,7 @@ mod tests {
     #[test]
     fn build_claude_args_enforces_least_privilege() {
         let cfg = test_config();
-        let args = build_claude_args(&cfg, "hello", None, &ActiveModel::ambient());
+        let args = build_claude_args(&cfg, "hello", None, Capability::Write, main_mcp_config(&cfg));
 
         // --allowedTools is always present, with the configured list as its value.
         let idx = args
@@ -1622,7 +1713,7 @@ mod tests {
         // With the override configured, the TITLE child's Command carries exactly
         // ANTHROPIC_BASE_URL / _AUTH_TOKEN / _MODEL set to the configured values.
         let cfg = cfg_with_title_backend();
-        let mut cmd = build_claude_command(&cfg, "hi", None, &ActiveModel::ambient());
+        let mut cmd = build_claude_command(&cfg, "hi", None, &ActiveModel::ambient(), Capability::Write, main_mcp_config(&cfg));
         apply_title_env(&mut cmd, &cfg);
         let env = cmd_env_overrides(&cmd);
         assert_eq!(
@@ -1649,7 +1740,7 @@ mod tests {
             cfg.title_backend.is_none(),
             "test_config must default to no override"
         );
-        let mut cmd = build_claude_command(&cfg, "hi", None, &ActiveModel::ambient());
+        let mut cmd = build_claude_command(&cfg, "hi", None, &ActiveModel::ambient(), Capability::Write, main_mcp_config(&cfg));
         apply_title_env(&mut cmd, &cfg);
         let env = cmd_env_overrides(&cmd);
         for k in TITLE_ENV_KEYS {
@@ -1670,7 +1761,7 @@ mod tests {
         assert!(cfg.title_backend.is_some(), "precondition: override is set");
         // A resumed turn and a fresh turn are both built the main-turn way.
         for sid in [None, Some("sess-1")] {
-            let cmd = build_claude_command(&cfg, "do the thing", sid, &ActiveModel::ambient());
+            let cmd = build_claude_command(&cfg, "do the thing", sid, &ActiveModel::ambient(), Capability::Write, main_mcp_config(&cfg));
             let env = cmd_env_overrides(&cmd);
             for k in TITLE_ENV_KEYS {
                 assert!(
@@ -1862,7 +1953,7 @@ mod tests {
             ("writes-enabled", ActiveModel::ambient()),
             ("read-only", glm_active()),
         ] {
-            let args = build_claude_args(&cfg, "hi", None, &active);
+            let args = build_claude_args(&cfg, "hi", None, turn_capability(&active), main_mcp_config(&cfg));
             assert!(
                 args.iter().any(|a| a == "--strict-mcp-config"),
                 "{label}: --strict-mcp-config must be present so ONLY --mcp-config servers load: {args:?}"
@@ -1905,7 +1996,7 @@ mod tests {
         let mut cfg = test_config();
         cfg.main_mcp_config = Some("/etc/jesse/qmd.json".to_string());
         for active in [ActiveModel::ambient(), glm_active()] {
-            let args = build_claude_args(&cfg, "hi", None, &active);
+            let args = build_claude_args(&cfg, "hi", None, turn_capability(&active), main_mcp_config(&cfg));
             assert_eq!(
                 arg_value(&args, "--mcp-config").as_deref(),
                 Some("/etc/jesse/qmd.json"),
@@ -1955,7 +2046,7 @@ mod tests {
         let cfg = cfg_with_diet_backend();
         assert!(cfg.diet_backend.is_some(), "precondition: override is set");
         for sid in [None, Some("sess-1")] {
-            let cmd = build_claude_command(&cfg, "do the thing", sid, &ActiveModel::ambient());
+            let cmd = build_claude_command(&cfg, "do the thing", sid, &ActiveModel::ambient(), Capability::Write, main_mcp_config(&cfg));
             let env = cmd_env_overrides(&cmd);
             for k in TITLE_ENV_KEYS {
                 assert!(
@@ -1976,8 +2067,8 @@ mod tests {
         let mut without = with.clone();
         without.diet_backend = None;
         for sid in [None, Some("sess-42")] {
-            let a = build_claude_command(&with, "log a banana", sid, &ActiveModel::ambient());
-            let b = build_claude_command(&without, "log a banana", sid, &ActiveModel::ambient());
+            let a = build_claude_command(&with, "log a banana", sid, &ActiveModel::ambient(), Capability::Write, main_mcp_config(&with));
+            let b = build_claude_command(&without, "log a banana", sid, &ActiveModel::ambient(), Capability::Write, main_mcp_config(&without));
             let argv = |c: &Command| -> Vec<String> {
                 c.as_std()
                     .get_args()
@@ -2160,7 +2251,7 @@ mod tests {
             "precondition: override is set"
         );
         for sid in [None, Some("sess-1")] {
-            let cmd = build_claude_command(&cfg, "do the thing", sid, &ActiveModel::ambient());
+            let cmd = build_claude_command(&cfg, "do the thing", sid, &ActiveModel::ambient(), Capability::Write, main_mcp_config(&cfg));
             let env = cmd_env_overrides(&cmd);
             for k in TITLE_ENV_KEYS {
                 assert!(
@@ -2179,8 +2270,8 @@ mod tests {
         let mut without = with.clone();
         without.vaultqa_backend = None;
         for sid in [None, Some("sess-42")] {
-            let a = build_claude_command(&with, "what is my vo2 max", sid, &ActiveModel::ambient());
-            let b = build_claude_command(&without, "what is my vo2 max", sid, &ActiveModel::ambient());
+            let a = build_claude_command(&with, "what is my vo2 max", sid, &ActiveModel::ambient(), Capability::Write, main_mcp_config(&with));
+            let b = build_claude_command(&without, "what is my vo2 max", sid, &ActiveModel::ambient(), Capability::Write, main_mcp_config(&without));
             let argv = |c: &Command| -> Vec<String> {
                 c.as_std()
                     .get_args()
@@ -2252,7 +2343,7 @@ mod tests {
         let cfg = cfg_with_all_role_backends();
         let opus = ActiveModel::ambient();
         for sid in [None, Some("sess-1")] {
-            let cmd = build_claude_command(&cfg, "do the thing", sid, &opus);
+            let cmd = build_claude_command(&cfg, "do the thing", sid, &opus, turn_capability(&opus), main_mcp_config(&cfg));
             let env = cmd_env_overrides(&cmd);
             for k in TITLE_ENV_KEYS {
                 assert!(!env.contains_key(k), "opus main turn must NOT carry {k}");
@@ -2272,7 +2363,7 @@ mod tests {
         let cfg = cfg_with_all_role_backends();
         let active = glm_active();
         for sid in [None, Some("sess-1")] {
-            let cmd = build_claude_command(&cfg, "do the thing", sid, &active);
+            let cmd = build_claude_command(&cfg, "do the thing", sid, &active, turn_capability(&active), main_mcp_config(&cfg));
             let env = cmd_env_overrides(&cmd);
             assert_eq!(
                 env.get("ANTHROPIC_BASE_URL").map(String::as_str),
@@ -2318,7 +2409,7 @@ mod tests {
         // is the allowlist, not the prompt.
         let cfg = test_config();
         let active = glm_active(); // writes_allowed = false
-        let args = build_claude_args(&cfg, "read the vault", None, &active);
+        let args = build_claude_args(&cfg, "read the vault", None, turn_capability(&active), main_mcp_config(&cfg));
         let val = |flag: &str| -> Option<String> {
             args.iter().position(|a| a == flag).map(|i| args[i + 1].clone())
         };
@@ -2348,7 +2439,7 @@ mod tests {
         let cfg = test_config();
         let mut active = glm_active();
         active.writes_allowed = true;
-        let args = build_claude_args(&cfg, "edit the vault", None, &active);
+        let args = build_claude_args(&cfg, "edit the vault", None, turn_capability(&active), main_mcp_config(&cfg));
         let allow = args
             .iter()
             .position(|a| a == "--allowedTools")
@@ -2362,11 +2453,11 @@ mod tests {
     #[test]
     fn build_claude_args_resume_when_session() {
         let cfg = test_config();
-        let args = build_claude_args(&cfg, "hi", Some("sess-42"), &ActiveModel::ambient());
+        let args = build_claude_args(&cfg, "hi", Some("sess-42"), Capability::Write, main_mcp_config(&cfg));
         let ridx = args.iter().position(|a| a == "--resume").expect("--resume");
         assert_eq!(args[ridx + 1], "sess-42");
         // No --resume without a session id.
-        let none = build_claude_args(&cfg, "hi", None, &ActiveModel::ambient());
+        let none = build_claude_args(&cfg, "hi", None, Capability::Write, main_mcp_config(&cfg));
         assert!(!none.iter().any(|a| a == "--resume"));
     }
     #[test]
@@ -2378,7 +2469,7 @@ mod tests {
         // success. Proven directly on the argv the child is spawned with.
         let cfg = test_config();
         let synthetic = format!("local-{}", random_hex());
-        let args = build_claude_args(&cfg, "hi", Some(&synthetic), &ActiveModel::ambient());
+        let args = build_claude_args(&cfg, "hi", Some(&synthetic), Capability::Write, main_mcp_config(&cfg));
         assert!(
             !args.iter().any(|a| a == "--resume"),
             "a synthetic local- id must never produce --resume: {args:?}"
@@ -2388,7 +2479,7 @@ mod tests {
             "the synthetic id must not appear anywhere in argv: {args:?}"
         );
         // A real id still resumes, unchanged.
-        let real = build_claude_args(&cfg, "hi", Some("real-sess-1"), &ActiveModel::ambient());
+        let real = build_claude_args(&cfg, "hi", Some("real-sess-1"), Capability::Write, main_mcp_config(&cfg));
         let ridx = real.iter().position(|a| a == "--resume").expect("--resume");
         assert_eq!(real[ridx + 1], "real-sess-1");
     }
@@ -2419,5 +2510,263 @@ mod tests {
             truncate_bytes_on_char_boundary("hello", MAX_OUTPUT_BYTES),
             "hello"
         );
+    }
+
+    // ---- Capability golden --------------------------------------------------
+
+    /// The eight args every `claude` child starts with, turn or one-shot.
+    const GOLDEN_BASE: [&str; 8] = [
+        "-p",
+        "PROMPT",
+        "--output-format",
+        "stream-json",
+        "--verbose",
+        "--include-partial-messages",
+        "--permission-mode",
+        "default",
+    ];
+
+    /// The qmd-only MCP config the main path falls back to when `JESSE_MAIN_MCP_CONFIG`
+    /// is unset, spelled out so the golden pins the literal a child is spawned with.
+    const GOLDEN_QMD_MCP: &str =
+        r#"{"mcpServers":{"qmd":{"type":"stdio","command":"qmd","args":["mcp"]}}}"#;
+    const GOLDEN_EMPTY_MCP: &str = r#"{"mcpServers":{}}"#;
+
+    /// The shared base plus a site's MCP + containment args — one full expected argv.
+    fn golden(tail: &[&str]) -> Vec<String> {
+        GOLDEN_BASE
+            .iter()
+            .chain(tail.iter())
+            .map(|s| (*s).to_string())
+            .collect()
+    }
+
+    /// A `Command`'s argv (everything after the binary name).
+    fn cmd_argv(cmd: &Command) -> Vec<String> {
+        cmd.as_std()
+            .get_args()
+            .map(|s| s.to_string_lossy().into_owned())
+            .collect()
+    }
+
+    #[test]
+    fn capability_ordering_is_cumulative() {
+        // Write implies Read implies Basic, so `>=` reads "at least as capable as".
+        assert!(Capability::Write > Capability::Read);
+        assert!(Capability::Read > Capability::Basic);
+        assert!(Capability::Write >= Capability::Write);
+        assert!(Capability::Basic < Capability::Write);
+    }
+
+    #[test]
+    fn turn_capability_follows_the_models_write_permission() {
+        assert_eq!(
+            turn_capability(&ActiveModel::ambient()),
+            Capability::Write,
+            "ambient opus is writes-on"
+        );
+        let mut off = ActiveModel::ambient();
+        off.writes_allowed = false;
+        assert_eq!(turn_capability(&off), Capability::Read);
+    }
+
+    /// THE GOLDEN. The exact argv each of the five spawn sites produces, captured from the
+    /// four separate builders that preceded the single `capability_args`. Every future
+    /// posture change has to edit a literal here, which is the point: a containment change
+    /// is never incidental.
+    ///
+    /// The `Write` allowlist/denylist are read from the fixture config because passing the
+    /// CONFIGURED lists verbatim is exactly what `Write` means; their contents are pinned
+    /// by `build_claude_args_enforces_least_privilege`.
+    #[test]
+    fn golden_argv_for_every_capability_call_site() {
+        let cfg = test_config();
+        let allow = cfg.allowed_tools.clone();
+        let deny = cfg.disallowed_tools.clone();
+
+        // 1. MAIN TURN, writes on → Write, qmd-only MCP. No root `--tools`.
+        assert_eq!(
+            build_claude_args(
+                &cfg,
+                "PROMPT",
+                None,
+                Capability::Write,
+                main_mcp_config(&cfg)
+            ),
+            golden(&[
+                "--strict-mcp-config",
+                "--mcp-config",
+                GOLDEN_QMD_MCP,
+                "--allowedTools",
+                &allow,
+                "--disallowedTools",
+                &deny,
+            ]),
+            "main turn (writes on)"
+        );
+
+        // 2. MAIN TURN, writes off → Read, same qmd-only MCP. `Skill` denied.
+        assert_eq!(
+            build_claude_args(
+                &cfg,
+                "PROMPT",
+                None,
+                Capability::Read,
+                main_mcp_config(&cfg)
+            ),
+            golden(&[
+                "--strict-mcp-config",
+                "--mcp-config",
+                GOLDEN_QMD_MCP,
+                "--tools",
+                "Read,Grep,Glob",
+                "--allowedTools",
+                "Read,Grep,Glob,mcp__qmd__query,mcp__qmd__get,mcp__qmd__multi_get,mcp__qmd__status",
+                "--disallowedTools",
+                "Bash,Write,Edit,NotebookEdit,WebFetch,WebSearch,Task,Agent,ToolSearch,Workflow,TodoWrite,Skill",
+            ]),
+            "main turn (writes off)"
+        );
+
+        // 3. VAULT-QA child (and the shadow child, which shares its builder) → Read, but
+        //    its OWN MCP set: unset `JESSE_VAULTQA_MCP_CONFIG` → no servers, where the
+        //    main path falls back to qmd. That divergence is deliberate and stays.
+        //    `Skill` is (for now) NOT denied here — the one remaining Read variance.
+        assert_eq!(
+            cmd_argv(&build_vaultqa_child_command(&cfg, "PROMPT")),
+            golden(&[
+                "--strict-mcp-config",
+                "--mcp-config",
+                GOLDEN_EMPTY_MCP,
+                "--tools",
+                "Read,Grep,Glob",
+                "--allowedTools",
+                "Read,Grep,Glob,mcp__qmd__query,mcp__qmd__get,mcp__qmd__multi_get,mcp__qmd__status",
+                "--disallowedTools",
+                "Bash,Write,Edit,NotebookEdit,WebFetch,WebSearch,Task,Agent,ToolSearch,Workflow,TodoWrite",
+            ]),
+            "vault-QA child (no MCP config)"
+        );
+
+        // 3b. The same child with the qmd MCP config path set: passed through verbatim.
+        let mut cfg_mcp = test_config();
+        cfg_mcp.vaultqa_mcp_config = Some("/etc/jesse/qmd.json".to_string());
+        assert_eq!(
+            cmd_argv(&build_vaultqa_child_command(&cfg_mcp, "PROMPT")),
+            golden(&[
+                "--strict-mcp-config",
+                "--mcp-config",
+                "/etc/jesse/qmd.json",
+                "--tools",
+                "Read,Grep,Glob",
+                "--allowedTools",
+                "Read,Grep,Glob,mcp__qmd__query,mcp__qmd__get,mcp__qmd__multi_get,mcp__qmd__status",
+                "--disallowedTools",
+                "Bash,Write,Edit,NotebookEdit,WebFetch,WebSearch,Task,Agent,ToolSearch,Workflow,TodoWrite",
+            ]),
+            "vault-QA child (qmd MCP config)"
+        );
+
+        // 4. DIET children (extract + verify) → Basic. Empty root toolset, no MCP.
+        assert_eq!(
+            cmd_argv(&build_diet_child_command(&cfg, "PROMPT")),
+            golden(&[
+                "--strict-mcp-config",
+                "--mcp-config",
+                GOLDEN_EMPTY_MCP,
+                "--tools",
+                "",
+                "--allowedTools",
+                "",
+                "--disallowedTools",
+                "Bash,Write,Edit,NotebookEdit,WebFetch,WebSearch,Task,Glob,Grep,Read,ToolSearch,Workflow,Agent,TodoWrite,Skill",
+            ]),
+            "diet extract/verify children"
+        );
+
+        // 5. TITLE one-shot → Write today: it resolves through the ambient model, which is
+        //    writes-on, so naming a conversation currently runs with the FULL writes-on
+        //    toolset AND the qmd server in the vault. Identical to call site 1, which is
+        //    the thing this golden makes visible.
+        assert_eq!(
+            cmd_argv(&build_claude_command(
+                &cfg,
+                "PROMPT",
+                None,
+                &ActiveModel::ambient(),
+                Capability::Write,
+                main_mcp_config(&cfg)
+            )),
+            golden(&[
+                "--strict-mcp-config",
+                "--mcp-config",
+                GOLDEN_QMD_MCP,
+                "--allowedTools",
+                &allow,
+                "--disallowedTools",
+                &deny,
+            ]),
+            "title one-shot"
+        );
+    }
+
+    /// The ONE way the collapse is not byte-identical, made explicit rather than buried.
+    ///
+    /// Four of the five sites are byte-for-byte what they were. The two CHILD sites emit
+    /// the same flags with the same values in a different POSITION: they used to put
+    /// `--tools` before the MCP pair, and now every site assembles in one order (base,
+    /// MCP, toolset), which is what lets one builder serve all five. `claude` does not
+    /// care about flag order, and this proves nothing was added, removed, or altered in
+    /// value: the new vector is a permutation of the pre-collapse one.
+    #[test]
+    fn the_child_reorder_is_a_pure_permutation() {
+        let cfg = test_config();
+        // The pre-collapse vectors, captured from the builders this commit replaced.
+        let old_vaultqa: Vec<String> = golden(&[
+            "--tools",
+            "Read,Grep,Glob",
+            "--strict-mcp-config",
+            "--mcp-config",
+            GOLDEN_EMPTY_MCP,
+            "--allowedTools",
+            "Read,Grep,Glob,mcp__qmd__query,mcp__qmd__get,mcp__qmd__multi_get,mcp__qmd__status",
+            "--disallowedTools",
+            "Bash,Write,Edit,NotebookEdit,WebFetch,WebSearch,Task,Agent,ToolSearch,Workflow,TodoWrite",
+        ]);
+        let old_diet: Vec<String> = golden(&[
+            "--tools",
+            "",
+            "--strict-mcp-config",
+            "--mcp-config",
+            GOLDEN_EMPTY_MCP,
+            "--allowedTools",
+            "",
+            "--disallowedTools",
+            "Bash,Write,Edit,NotebookEdit,WebFetch,WebSearch,Task,Glob,Grep,Read,ToolSearch,Workflow,Agent,TodoWrite,Skill",
+        ]);
+        let sorted = |v: &[String]| {
+            let mut v = v.to_vec();
+            v.sort();
+            v
+        };
+        for (label, old, new) in [
+            (
+                "vault-QA child",
+                old_vaultqa,
+                cmd_argv(&build_vaultqa_child_command(&cfg, "PROMPT")),
+            ),
+            (
+                "diet children",
+                old_diet,
+                cmd_argv(&build_diet_child_command(&cfg, "PROMPT")),
+            ),
+        ] {
+            assert_ne!(old, new, "{label}: this test is pointless if nothing moved");
+            assert_eq!(
+                sorted(&old),
+                sorted(&new),
+                "{label}: the reorder must not add, drop or change any argument"
+            );
+        }
     }
 }
