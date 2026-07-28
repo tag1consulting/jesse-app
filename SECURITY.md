@@ -183,7 +183,24 @@ launched with:
 | --- | --- |
 | `--tools "Read,Grep,Glob"` | A read-only **root allowlist** (not the diet child's empty set). Exactly the three read-only built-ins exist at the root; `Bash`/`Write`/`Edit`, `ToolSearch`/`Workflow`/`Agent`, and everything else are absent at the root, not permission-gated. This is the load-bearing control. |
 | `--strict-mcp-config` + `--mcp-config <cfg>` | Loads **only** the servers in the config — the **qmd** vault-search server when `JESSE_VAULTQA_MCP_CONFIG` supplies it (its four tools are read-only search), or **no** servers otherwise. Nothing else can be reached, and `ToolSearch` (denied and absent at the root) cannot pull a server in. |
-| `--allowedTools` + expanded `--disallowedTools` | The allowlist names the three built-ins plus the four qmd tools; the denylist names `Bash,Write,Edit,NotebookEdit,WebFetch,WebSearch,Task,Agent,ToolSearch,Workflow,TodoWrite` as documented, **fragile** belt-and-suspenders behind the root flags (it names tools, so it breaks silently on a CLI tool rename/addition — it is not the guarantee). |
+| `--allowedTools` + expanded `--disallowedTools` | The allowlist names the three built-ins plus the four qmd tools; the denylist names `Bash,Write,Edit,NotebookEdit,WebFetch,WebSearch,Task,Agent,ToolSearch,Workflow,TodoWrite,Skill` as documented, **fragile** belt-and-suspenders behind the root flags (it names tools, so it breaks silently on a CLI tool rename/addition — it is not the guarantee). `Skill` was added in bridge 0.38.0 so both `Read` sites carry one list; see below. |
+
+**One `Read` posture, not two (bridge 0.38.0).** The read-only main turn already
+denied `Skill`; this child did not. The difference was undocumented and had no
+reason behind it — the two sites arrived at their lists separately. Both now take
+the stricter list, because a capability that means two different things at two
+call sites is not a boundary, it is a coincidence.
+
+Stated honestly, this is **defense-in-depth only**, not a change in what the child
+can reach: behind `--tools "Read,Grep,Glob"` the `Skill` tool does not exist at
+the root either way. Live-probed on claude 2.1.220 (2026-07-28) rather than
+assumed — asked to load the `diet-logging` skill, the child reported the same root
+toolset `["Glob", "Grep", "Read"]` and executed the same `Glob`/`Read` calls with
+and without the denial. The value is that the denylist now survives a CLI change
+that widened the root set at **both** `Read` sites rather than one. The MCP server
+set stays per call site: this child degrades to no servers while the main path
+requires qmd, and folding that into `Read` would silently remove vault search from
+a read-only turn.
 
 So the child can **read** the vault but cannot write, execute a shell, reach the
 network, spawn a subagent, or load an unlisted MCP tool.

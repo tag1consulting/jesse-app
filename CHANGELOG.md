@@ -15,6 +15,29 @@ CI both run it). See the "Versioning" section of `bridge/README.md`.
 
 ## [Unreleased]
 
+## [Bridge 0.38.0] - 2026-07-28
+
+### Changed
+- **`Capability::Read` now means one thing.** The two `Read` call sites disagreed in
+  exactly one remaining way: the read-only main turn denied `Skill` and the vault-QA (and
+  shadow) child did not. The difference was undocumented and had no reason behind it — the
+  two sites arrived at their lists separately, and the child's simply predated the main
+  turn's. Both now take the stricter list and the temporary `ReadVariance` flag is gone. A
+  capability that means two different things at two call sites is not a boundary, it is a
+  coincidence. (They used to differ about `--strict-mcp-config` too; 0.36.0 closed that.)
+- **Stated honestly, this is defense-in-depth only.** Behind `--tools "Read,Grep,Glob"`
+  the `Skill` tool does not exist at the root either way, so the vault-QA child could not
+  load a skill before and cannot now. Live-probed on claude 2.1.220 rather than assumed:
+  asked to load the `diet-logging` skill, the child reported the same root toolset
+  `["Glob", "Grep", "Read"]` and executed the same `Glob`/`Read` calls with and without
+  the denial. The value is that the denylist now survives a CLI change that widened the
+  root set at **both** `Read` sites rather than one.
+- **The MCP server set stays per call site and is unchanged.** The main path still requires
+  qmd (`JESSE_MAIN_MCP_CONFIG`, else the qmd-only default) and the vault-QA child still
+  degrades to no servers (`JESSE_VAULTQA_MCP_CONFIG`). Folding that into `Read` would
+  silently remove vault search from a read-only turn, so it is not part of the capability.
+  No env var is renamed and no operator action is required.
+
 ## [Bridge 0.37.0] - 2026-07-28
 
 ### Changed

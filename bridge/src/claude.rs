@@ -344,37 +344,31 @@ pub const READ_ROOT_TOOLS: &str = "Read,Grep,Glob";
 pub const READ_ALLOWED_TOOLS: &str =
     "Read,Grep,Glob,mcp__qmd__query,mcp__qmd__get,mcp__qmd__multi_get,mcp__qmd__status";
 
-/// Tools DENIED to a READ-ONLY MAIN turn as belt-and-suspenders BEHIND the real boundary
-/// (the [`READ_ROOT_TOOLS`] root allowlist + strict MCP). It names every mutation /
-/// execution / network / orchestration class so a CLI change that widened the root set
+/// Tools DENIED to EVERY [`Capability::Read`] child as belt-and-suspenders BEHIND the real
+/// boundary (the [`READ_ROOT_TOOLS`] root allowlist + strict MCP). It names every mutation
+/// / execution / network / orchestration class so a CLI change that widened the root set
 /// would still hit the denylist. `Skill` is named because a skill loads instruction text
 /// whose actions write (the `diet-logging` skill is exactly that). Enumerated denial is
 /// fragile by nature — it breaks SILENTLY on a tool rename or addition, exactly as
 /// [`BASIC_DISALLOWED_TOOLS`] documents — so the root allowlist is the guarantee and this
 /// is defense-in-depth.
+///
+/// # This tightens the vault-QA child, and why the variance had to go
+///
+/// The read-only main turn already denied `Skill`; the vault-QA (and shadow) child did
+/// not. That difference was undocumented and had no reason behind it — the two sites
+/// arrived at their lists separately, and the child's simply predated the main turn's. A
+/// capability that means two different things at two call sites is not a boundary, it is a
+/// coincidence, so both now take the stricter list.
+///
+/// What it actually changes for the child is defense-in-depth only, and saying otherwise
+/// would overstate it: behind `--tools "Read,Grep,Glob"` the `Skill` tool does not exist
+/// at the root either way, so the child could not have loaded a skill before this change
+/// and cannot now. Live-probed on claude 2.1.220 rather than assumed. The value is that
+/// the denylist now survives a CLI change that widened the root set, at BOTH Read sites
+/// rather than one.
 pub const READ_DISALLOWED_TOOLS: &str =
     "Bash,Write,Edit,NotebookEdit,WebFetch,WebSearch,Task,Agent,ToolSearch,Workflow,TodoWrite,Skill";
-
-/// TEMPORARY, paired with [`ReadVariance::VaultQa`]: [`READ_DISALLOWED_TOOLS`] minus
-/// `Skill`, which is the vault-QA child's list as it stands today. The one remaining
-/// difference between the two `Read` call sites, deleted in the next commit when both
-/// take the stricter list.
-pub const READ_DISALLOWED_TOOLS_NO_SKILL: &str =
-    "Bash,Write,Edit,NotebookEdit,WebFetch,WebSearch,Task,Agent,ToolSearch,Workflow,TodoWrite";
-
-/// TEMPORARY. The two `Read` call sites still disagree in exactly one way: the read-only
-/// main turn denies `Skill` and the vault-QA child does not. (They used to disagree about
-/// `--strict-mcp-config` too; that was closed for the main path in bridge 0.36.0.) This
-/// flag preserves both flavours byte-for-byte through the mechanical collapse so the
-/// golden test has a stable target; the next commit deletes it by taking the stricter
-/// option both ways.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ReadVariance {
-    /// The read-only MAIN turn: `Skill` denied.
-    MainTurn,
-    /// The vault-QA (and shadow) child: `Skill` not denied.
-    VaultQa,
-}
 
 /// Tools DENIED to a [`Capability::Basic`] child, as belt-and-suspenders BEHIND the real
 /// boundary (`--tools ""`, see [`capability_args`]). Beyond the mutation / execution /
@@ -477,11 +471,7 @@ pub fn vaultqa_mcp_config(cfg: &Config) -> &str {
 ///     `--max-turns` flag (verified via `--help`). The children are single-shot by
 ///     construction, but the CLI offers no turn bound to enforce it. (`--max-budget-usd`
 ///     exists but bounds cost, not agentic turns, and is not a containment control.)
-pub fn capability_args(
-    cfg: &Config,
-    capability: Capability,
-    variance: ReadVariance,
-) -> Vec<String> {
+pub fn capability_args(cfg: &Config, capability: Capability) -> Vec<String> {
     match capability {
         Capability::Basic => vec![
             // ROOT boundary: disable the entire built-in toolset (deny-by-default).
@@ -501,11 +491,7 @@ pub fn capability_args(
             "--allowedTools".to_string(),
             READ_ALLOWED_TOOLS.to_string(),
             "--disallowedTools".to_string(),
-            match variance {
-                ReadVariance::MainTurn => READ_DISALLOWED_TOOLS,
-                ReadVariance::VaultQa => READ_DISALLOWED_TOOLS_NO_SKILL,
-            }
-            .to_string(),
+            READ_DISALLOWED_TOOLS.to_string(),
         ],
         Capability::Write => {
             // Today's exact writes-on posture: the configured lists, and NO root
@@ -576,7 +562,7 @@ pub fn build_claude_args(
     // ROOT MCP boundary, then the capability's toolset. Every spawn site assembles in
     // this order, which is what lets one builder serve all of them.
     args.extend(mcp_args(mcp_config));
-    args.extend(capability_args(cfg, capability, ReadVariance::MainTurn));
+    args.extend(capability_args(cfg, capability));
     if let Some(sid) = session_id {
         // A synthetic `local-<hex>` id (context carry) names a bridge-minted ledger
         // thread with NO real claude session, so it must NEVER be resumed — the CLI
@@ -715,11 +701,7 @@ pub fn build_diet_child_command(cfg: &Config, prompt: &str) -> Command {
     let mut cmd = Command::new(&cfg.claude_bin);
     let mut args = child_base_args(prompt);
     args.extend(mcp_args(EMPTY_MCP_CONFIG));
-    args.extend(capability_args(
-        cfg,
-        Capability::Basic,
-        ReadVariance::MainTurn, // ignored: variance only distinguishes the two Read flavours
-    ));
+    args.extend(capability_args(cfg, Capability::Basic));
     cmd.args(args)
         .current_dir(cfg.scratch_base()) // neutral cwd → no vault CLAUDE.md auto-load
         .stdout(Stdio::piped())
@@ -894,7 +876,7 @@ pub fn build_vaultqa_child_command(cfg: &Config, prompt: &str) -> Command {
     let mut cmd = Command::new(&cfg.claude_bin);
     let mut args = child_base_args(prompt);
     args.extend(mcp_args(vaultqa_mcp_config(cfg)));
-    args.extend(capability_args(cfg, Capability::Read, ReadVariance::VaultQa));
+    args.extend(capability_args(cfg, Capability::Read));
     cmd.args(args)
         // The ONE divergence from the diet child: cwd = the vault. The child must READ
         // vault files; containment is the read-only toolset above, not the cwd.
@@ -2550,6 +2532,40 @@ mod tests {
     }
 
     #[test]
+    fn the_two_read_call_sites_are_now_identical_apart_from_their_mcp_set() {
+        // The point of deleting the variance: `Read` means ONE thing, so neither site can
+        // drift into being the lenient one. The MCP server set is deliberately still per
+        // call site (the main path requires qmd, the vault-QA child degrades to none), so
+        // the comparison is on the toolset the capability owns.
+        let cfg = test_config();
+        assert_eq!(
+            capability_args(&cfg, Capability::Read),
+            vec![
+                "--tools".to_string(),
+                "Read,Grep,Glob".to_string(),
+                "--allowedTools".to_string(),
+                "Read,Grep,Glob,mcp__qmd__query,mcp__qmd__get,mcp__qmd__multi_get,mcp__qmd__status"
+                    .to_string(),
+                "--disallowedTools".to_string(),
+                "Bash,Write,Edit,NotebookEdit,WebFetch,WebSearch,Task,Agent,ToolSearch,Workflow,TodoWrite,Skill"
+                    .to_string(),
+            ],
+            "one Read posture, used verbatim by the main turn and the vault-QA child"
+        );
+        // And the vault-QA child really does carry it, `Skill` included.
+        let child = cmd_argv(&build_vaultqa_child_command(&cfg, "PROMPT"));
+        let deny = child
+            .iter()
+            .position(|a| a == "--disallowedTools")
+            .map(|i| child[i + 1].clone())
+            .expect("--disallowedTools present");
+        assert!(
+            deny.split(',').any(|t| t.trim() == "Skill"),
+            "the vault-QA child must now deny Skill too: {deny:?}"
+        );
+    }
+
+    #[test]
     fn capability_ordering_is_cumulative() {
         // Write implies Read implies Basic, so `>=` reads "at least as capable as".
         assert!(Capability::Write > Capability::Read);
@@ -2631,7 +2647,7 @@ mod tests {
         // 3. VAULT-QA child (and the shadow child, which shares its builder) → Read, but
         //    its OWN MCP set: unset `JESSE_VAULTQA_MCP_CONFIG` → no servers, where the
         //    main path falls back to qmd. That divergence is deliberate and stays.
-        //    `Skill` is (for now) NOT denied here — the one remaining Read variance.
+        //    The denylist is now the same at both Read sites.
         assert_eq!(
             cmd_argv(&build_vaultqa_child_command(&cfg, "PROMPT")),
             golden(&[
@@ -2643,7 +2659,7 @@ mod tests {
                 "--allowedTools",
                 "Read,Grep,Glob,mcp__qmd__query,mcp__qmd__get,mcp__qmd__multi_get,mcp__qmd__status",
                 "--disallowedTools",
-                "Bash,Write,Edit,NotebookEdit,WebFetch,WebSearch,Task,Agent,ToolSearch,Workflow,TodoWrite",
+                "Bash,Write,Edit,NotebookEdit,WebFetch,WebSearch,Task,Agent,ToolSearch,Workflow,TodoWrite,Skill",
             ]),
             "vault-QA child (no MCP config)"
         );
@@ -2662,7 +2678,7 @@ mod tests {
                 "--allowedTools",
                 "Read,Grep,Glob,mcp__qmd__query,mcp__qmd__get,mcp__qmd__multi_get,mcp__qmd__status",
                 "--disallowedTools",
-                "Bash,Write,Edit,NotebookEdit,WebFetch,WebSearch,Task,Agent,ToolSearch,Workflow,TodoWrite",
+                "Bash,Write,Edit,NotebookEdit,WebFetch,WebSearch,Task,Agent,ToolSearch,Workflow,TodoWrite,Skill",
             ]),
             "vault-QA child (qmd MCP config)"
         );
@@ -2710,29 +2726,24 @@ mod tests {
         );
     }
 
-    /// The ONE way the collapse is not byte-identical, made explicit rather than buried.
+    /// The ONE way the collapse was not byte-identical, made explicit rather than buried.
     ///
-    /// Four of the five sites are byte-for-byte what they were. The two CHILD sites emit
-    /// the same flags with the same values in a different POSITION: they used to put
-    /// `--tools` before the MCP pair, and now every site assembles in one order (base,
-    /// MCP, toolset), which is what lets one builder serve all five. `claude` does not
-    /// care about flag order, and this proves nothing was added, removed, or altered in
-    /// value: the new vector is a permutation of the pre-collapse one.
+    /// The CHILD sites emit the same flags with the same values in a different POSITION:
+    /// they used to put `--tools` before the MCP pair, and now every site assembles in one
+    /// order (base, MCP, toolset), which is what lets one builder serve all five. `claude`
+    /// does not care about flag order, and this proves nothing was added, removed, or
+    /// altered in value: the new vector is a permutation of the pre-collapse one.
     #[test]
     fn the_child_reorder_is_a_pure_permutation() {
         let cfg = test_config();
-        // The pre-collapse vectors, captured from the builders this commit replaced.
-        let old_vaultqa: Vec<String> = golden(&[
-            "--tools",
-            "Read,Grep,Glob",
-            "--strict-mcp-config",
-            "--mcp-config",
-            GOLDEN_EMPTY_MCP,
-            "--allowedTools",
-            "Read,Grep,Glob,mcp__qmd__query,mcp__qmd__get,mcp__qmd__multi_get,mcp__qmd__status",
-            "--disallowedTools",
-            "Bash,Write,Edit,NotebookEdit,WebFetch,WebSearch,Task,Agent,ToolSearch,Workflow,TodoWrite",
-        ]);
+        // The pre-collapse DIET vector, captured from the builder the collapse replaced.
+        //
+        // The vault-QA child is deliberately NOT checked here any more: its denylist
+        // gained `Skill` in this commit, so its argv is no longer value-identical to the
+        // pre-collapse one and asserting a permutation would mean rewriting the captured
+        // literal into a vector that never existed. That site's exact argv, before and
+        // after, is pinned by the golden instead. The diet children changed position only,
+        // which is what this test is for.
         let old_diet: Vec<String> = golden(&[
             "--tools",
             "",
@@ -2744,29 +2755,20 @@ mod tests {
             "--disallowedTools",
             "Bash,Write,Edit,NotebookEdit,WebFetch,WebSearch,Task,Glob,Grep,Read,ToolSearch,Workflow,Agent,TodoWrite,Skill",
         ]);
+        let new_diet = cmd_argv(&build_diet_child_command(&cfg, "PROMPT"));
         let sorted = |v: &[String]| {
             let mut v = v.to_vec();
             v.sort();
             v
         };
-        for (label, old, new) in [
-            (
-                "vault-QA child",
-                old_vaultqa,
-                cmd_argv(&build_vaultqa_child_command(&cfg, "PROMPT")),
-            ),
-            (
-                "diet children",
-                old_diet,
-                cmd_argv(&build_diet_child_command(&cfg, "PROMPT")),
-            ),
-        ] {
-            assert_ne!(old, new, "{label}: this test is pointless if nothing moved");
-            assert_eq!(
-                sorted(&old),
-                sorted(&new),
-                "{label}: the reorder must not add, drop or change any argument"
-            );
+        assert_ne!(
+            old_diet, new_diet,
+            "this test is pointless if nothing moved"
+        );
+        assert_eq!(
+            sorted(&old_diet),
+            sorted(&new_diet),
+            "the reorder must not add, drop or change any argument"
+        );
         }
-    }
 }
