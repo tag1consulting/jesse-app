@@ -139,6 +139,18 @@ diet_keywords_extra = [
 #                  a leftover key is a startup error. What a model may touch is config,
 #                  not something a phone can change.
 #
+#                  WHAT `level` DOES NOT BOUND, so "read" is not read as "nothing can
+#                  happen": it bounds the TOOLS the model is granted. It does not bound the
+#                  DIRECTIVE CHANNEL — the bridge parses a directive off the final line of a
+#                  reply and acts on it itself, so a model at any level can still cause the
+#                  effects that channel allows. Those effects are deliberately ungated and
+#                  are narrower than they sound: NO vault mutation at all, and Apple Health
+#                  writes/retractions on the phone behind six validation stages with no
+#                  partial application. The full enumeration — every effect, and what stands
+#                  between the model's output and each one — is the comment block above
+#                  `Directives` in `bridge/src/directives.rs`. Read it before assuming a
+#                  read-only model is inert.
+#
 #                  SUGGESTED ASSIGNMENT (guidance, not a compiled-in default):
 #                    Claude models .......... write
 #                    Codex models ........... write
