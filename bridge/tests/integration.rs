@@ -4479,7 +4479,8 @@ fn cfg_with_switch_registry(state_dir: &std::path::Path) -> Config {
                 backend: None,
                 subagent_model: None,
                 configured: true,
-                default_writes: true,
+                level: Capability::Write,
+                harness: CLAUDE_CODE_ID.to_string(),
                 price: PriceDeck {
                     in_per_m: 5.0,
                     cached_per_m: 0.5,
@@ -4500,7 +4501,8 @@ fn cfg_with_switch_registry(state_dir: &std::path::Path) -> Config {
                 )),
                 subagent_model: Some("glm-model".into()),
                 configured: true,
-                default_writes: false,
+                level: Capability::Read,
+                harness: CLAUDE_CODE_ID.to_string(),
                 price: PriceDeck {
                     in_per_m: 1.4,
                     cached_per_m: 0.14,
@@ -4517,7 +4519,8 @@ fn cfg_with_switch_registry(state_dir: &std::path::Path) -> Config {
                 backend: None,
                 subagent_model: None,
                 configured: false,
-                default_writes: false,
+                level: Capability::Read,
+                harness: CLAUDE_CODE_ID.to_string(),
                 price: PriceDeck::ZERO,
                 health: HealthConfig::default(),
                 vision: Vec::new(),
@@ -4738,54 +4741,47 @@ async fn set_model_unavailable_is_409_and_does_not_switch() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// THE REMOVAL, asserted rather than described. `POST /jesse/model/{id}/writes` let a
+/// device grant a model write access to the vault. It is gone: what a model may touch is
+/// its `level`, which lives in the bridge config and is validated at startup against the
+/// committed containment record. A control the phone had is a control the phone no longer
+/// has, so the route must 404 rather than quietly accept and ignore.
 #[tokio::test]
-async fn set_model_writes_stores_and_reflects_in_get() {
+async fn the_per_model_writes_endpoint_is_gone() {
     let dir = std::env::temp_dir().join(format!("jesse-model-it-{}", random_hex()));
     let st = AppState::new(cfg_with_switch_registry(&dir));
-    let resp = app(st.clone())
-        .oneshot(set_model_writes_request(
-            Some("Bearer test-token"),
-            "glm-5.2",
-            r#"{"enabled":true}"#,
-        ))
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
-    assert_eq!(body_value(resp).await["writes_allowed"], true);
-    // GET now reflects glm as writes-on.
+    for (id, body) in [("glm-5.2", r#"{"enabled":true}"#), ("opus", r#"{"enabled":false}"#)] {
+        let resp = app(st.clone())
+            .oneshot(set_model_writes_request(Some("Bearer test-token"), id, body))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::NOT_FOUND,
+            "the writes toggle must be gone, not merely inert, for {id}"
+        );
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// …and a model's write permission now reads off its configured level, with no way for a
+/// client to change it.
+#[tokio::test]
+async fn a_models_write_permission_comes_from_its_configured_level() {
+    let dir = std::env::temp_dir().join(format!("jesse-model-it-{}", random_hex()));
+    let st = AppState::new(cfg_with_switch_registry(&dir));
     let resp = app(st)
         .oneshot(models_request(Some("Bearer test-token")))
         .await
         .unwrap();
     let v = body_value(resp).await;
-    let glm = v["models"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|m| m["id"] == "glm-5.2")
-        .unwrap()
-        .clone();
-    assert_eq!(
-        glm["writes_allowed"], true,
-        "the writes override is reflected"
-    );
-    let _ = std::fs::remove_dir_all(&dir);
-}
-
-#[tokio::test]
-async fn set_model_writes_on_the_default_model_is_rejected() {
-    // Opus is always writes-on and its permission is not user-settable.
-    let dir = std::env::temp_dir().join(format!("jesse-model-it-{}", random_hex()));
-    let st = AppState::new(cfg_with_switch_registry(&dir));
-    let resp = app(st)
-        .oneshot(set_model_writes_request(
-            Some("Bearer test-token"),
-            "opus",
-            r#"{"enabled":false}"#,
-        ))
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let models = v["models"].as_array().unwrap().clone();
+    let glm = models.iter().find(|m| m["id"] == "glm-5.2").unwrap();
+    assert_eq!(glm["level"], "read", "a declared model defaults to Read");
+    assert_eq!(glm["writes_allowed"], false, "…so it may not write");
+    let opus = models.iter().find(|m| m["id"] == "opus").unwrap();
+    assert_eq!(opus["level"], "write", "the ambient default is the built-in Write entry");
+    assert_eq!(opus["writes_allowed"], true);
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -5077,7 +5073,8 @@ async fn preprocess_pairs_and_frames_a_faithful_view() {
         backend: Some((base, "t".into(), "m".into())),
         subagent_model: Some("m".into()),
         configured: true,
-        default_writes: false,
+        level: Capability::Read,
+        harness: CLAUDE_CODE_ID.to_string(),
         price: PriceDeck::ZERO,
         health: HealthConfig::default(),
         vision: Vec::new(),
@@ -5090,7 +5087,8 @@ async fn preprocess_pairs_and_frames_a_faithful_view() {
         backend: Some(("http://text".into(), "tt".into(), "tm".into())),
         subagent_model: Some("tm".into()),
         configured: true,
-        default_writes: false,
+        level: Capability::Read,
+        harness: CLAUDE_CODE_ID.to_string(),
         price: PriceDeck::ZERO,
         health: HealthConfig::default(),
         vision: vec![VisionPartner {
@@ -5117,7 +5115,8 @@ async fn preprocess_pairs_and_frames_a_faithful_view() {
         kind: ModelKind::Hosted,
         env: Some(("http://text".into(), "tt".into(), "tm".into())),
         subagent_model: Some("tm".into()),
-        writes_allowed: false,
+        level: Capability::Read,
+        harness: CLAUDE_CODE_ID.to_string(),
         price: PriceDeck::ZERO,
         vision: vec![VisionPartner {
             id: "mock".into(),
@@ -5161,7 +5160,8 @@ async fn unpaired_model_reports_no_vision() {
         backend: Some(("http://text".into(), "tt".into(), "tm".into())),
         subagent_model: Some("tm".into()),
         configured: true,
-        default_writes: false,
+        level: Capability::Read,
+        harness: CLAUDE_CODE_ID.to_string(),
         price: PriceDeck::ZERO,
         health: HealthConfig::default(),
         vision: Vec::new(),

@@ -5,9 +5,11 @@
 use std::path::Path;
 
 use jesse_bridge::{
-    app, binary_exists, build_apns, env_truthy, is_bind_allowed, manual_pairing_lines,
-    pairing_payload, show_token_opt_in, spawn_eviction_task, spawn_session_gc_task,
-    start_health_prober, AppState, Config,
+    app, binary_exists, build_apns, env_string, env_truthy, harness_bin_env,
+    harness_default_bin, harnesses_in_use, is_bind_allowed, load_local_models,
+    manual_pairing_lines, pairing_payload, show_token_opt_in, spawn_eviction_task,
+    spawn_session_gc_task, start_health_prober, validate_model_config, AppState, Config,
+    CONTAINMENT_RECORD,
 };
 
 #[tokio::main]
@@ -29,6 +31,48 @@ async fn main() {
         );
         std::process::exit(1);
     }
+    // THE STARTUP GATE: config cannot grant what containment has not proven.
+    //
+    // Every rejection here is fatal and names the model it belongs to. It runs BEFORE the
+    // socket opens and before any child can be spawned, because the failure it prevents is
+    // a bridge that serves turns at a posture the committed containment record never
+    // probed. A silently-ignored key would be a silent security downgrade, so nothing here
+    // warns and continues. See `levelgate`.
+    let declared = load_local_models(&cfg.home);
+    let errors = validate_model_config(&cfg, &declared, CONTAINMENT_RECORD);
+    if !errors.is_empty() {
+        eprintln!(
+            "jesse-bridge: refusing to start — {} configuration problem(s):",
+            errors.len()
+        );
+        for e in &errors {
+            eprintln!("  - {e}");
+        }
+        std::process::exit(1);
+    }
+    // One binary check per harness some configured model actually references. A config full
+    // of Codex models must not demand a Claude binary for the models it does not have — and
+    // the ambient default keeps `claude-code` in the list regardless.
+    for id in harnesses_in_use(&cfg) {
+        let bin = harness_bin_env(&id)
+            .and_then(env_string)
+            .or_else(|| harness_default_bin(&id).map(str::to_string));
+        match bin {
+            Some(bin) if binary_exists(&bin) => {}
+            Some(bin) => {
+                eprintln!(
+                    "jesse-bridge: harness '{id}' binary not found: {bin} — set {}.",
+                    harness_bin_env(&id).unwrap_or("its binary path variable")
+                );
+                std::process::exit(1);
+            }
+            None => {
+                eprintln!("jesse-bridge: harness '{id}' has no known binary path.");
+                std::process::exit(1);
+            }
+        }
+    }
+
     // If a custom attachment scratch base is set, it must already exist — fail
     // fast rather than surfacing a write error on the first attachment turn.
     if let Some(dir) = &cfg.scratch_dir {

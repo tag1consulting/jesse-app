@@ -59,17 +59,20 @@ pub enum Capability {
     Write,
 }
 
-/// The capability a MAIN turn is granted for the model backing it (the global switch).
-/// Writes-on (the ambient `opus` default, or a model whose writes were explicitly enabled)
-/// → [`Capability::Write`]; every read-only model → [`Capability::Read`], so a weaker or
-/// unfamiliar model cannot mutate the vault regardless of what it tries. The boundary is
+/// The capability a MAIN turn is granted for the model backing it: **the minimum of the
+/// model's level and [`Capability::Write`]**.
+///
+/// Half of the effective grant rule (the other half is [`RoutedJob::required`], which
+/// governs work the user did not choose a model for). The level is a CEILING and this is
+/// where it is taken against what a main turn needs: a `Write` model backing a conversation
+/// gets `Write`, a `Read` model gets the read-only posture, and a `Basic` model gets `Basic`
+/// — it can answer, with no tools, which is what its level says it may be trusted with.
+///
+/// The `min` is not decoration. A main turn never needs more than `Write`, so if a level
+/// above `Write` is ever added this stays correct without being revisited. The boundary is
 /// the toolset, not the prompt.
 pub fn turn_capability(active: &ActiveModel) -> Capability {
-    if active.writes_allowed {
-        Capability::Write
-    } else {
-        Capability::Read
-    }
+    active.level.min(Capability::Write)
 }
 
 /// Everything a harness needs to build ONE child invocation. Exactly the inputs the
@@ -222,8 +225,43 @@ pub trait TurnParser: Send {
     fn on_line(&mut self, line: &str) -> StreamEvent;
 }
 
-/// The id of the one harness registered today, and the one that serves every turn.
+/// The id of the built-in harness: the one the ambient default runs under, and the one
+/// that serves every turn today.
 pub const CLAUDE_CODE_ID: &str = "claude-code";
+
+/// Every harness this build knows how to construct, by id — the registry's vocabulary.
+///
+/// A model naming an id absent from here is a startup ERROR rather than a silent fallback
+/// to Claude Code: quietly running a Codex-configured model under a different harness is
+/// exactly the sort of "it worked, differently" that a config surface must not do.
+pub const KNOWN_HARNESS_IDS: &[&str] = &[CLAUDE_CODE_ID];
+
+/// Look a harness up in a registry by a config-supplied id, for the read paths that hold a
+/// `String` rather than a `&'static str`.
+pub fn registry_harness<'a>(reg: &'a HarnessRegistry, id: &str) -> Option<&'a dyn Harness> {
+    reg.get(id)
+}
+
+/// The env var naming a harness's binary, mirroring `JESSE_CLAUDE_BIN` for Claude Code:
+/// one variable per harness, defaulting to a bare name found on `PATH`.
+///
+/// It is consulted — and its absence is only fatal — for a harness some configured model
+/// actually references. A config full of Codex models must not demand a Claude binary for
+/// the models it does not have, and the converse holds too.
+pub fn harness_bin_env(id: &str) -> Option<&'static str> {
+    match id {
+        CLAUDE_CODE_ID => Some("JESSE_CLAUDE_BIN"),
+        _ => None,
+    }
+}
+
+/// The default binary name for a harness, resolved from `PATH` when its env var is unset.
+pub fn harness_default_bin(id: &str) -> Option<&'static str> {
+    match id {
+        CLAUDE_CODE_ID => Some("claude"),
+        _ => None,
+    }
+}
 
 /// The harness registry: id → implementation, built ONCE at startup and read-only
 /// afterwards, the same lifecycle (and the same "the default is built in and never
@@ -249,6 +287,34 @@ impl HarnessRegistry {
     /// The shipped registry: exactly one harness, `claude-code`.
     pub fn claude_code_only() -> Self {
         HarnessRegistry::new(Vec::new())
+    }
+
+    /// Build the registry for a set of configured models: only the harnesses those models
+    /// NAME, plus `claude-code`.
+    ///
+    /// Claude Code is unconditional because the ambient default still exists — it is the
+    /// out-of-box conversation backend and the routing rule's final fallback, so it is the
+    /// one harness that must be constructible whatever the config says. That is a KNOWN
+    /// LIMITATION carried deliberately, not an assumption this effort adds: de-privileging
+    /// ambient into an ordinary registry entry means solving auth, defaults and first-run,
+    /// and is out of scope here. The rule until then is that no change may add a NEW
+    /// assumption that ambient exists.
+    ///
+    /// Unknown ids are IGNORED here and refused by [`validate_model_config`], so the
+    /// registry stays total and the error arrives once, from the validator, naming the
+    /// model.
+    pub fn for_models<'a>(named: impl IntoIterator<Item = &'a str>) -> Self {
+        let mut extra: Vec<Box<dyn Harness>> = Vec::new();
+        for id in named {
+            match id {
+                // Every non-built-in harness is constructed here as it is added. The match
+                // is exhaustive over `KNOWN_HARNESS_IDS` minus the built-in.
+                CLAUDE_CODE_ID => {}
+                _ => continue,
+            }
+        }
+        // `new` always registers Claude Code first, so the ambient contract holds.
+        HarnessRegistry::new(std::mem::take(&mut extra))
     }
 
     /// Look one up by id.
@@ -327,7 +393,7 @@ mod tests {
             "ambient opus is writes-on"
         );
         let mut off = ActiveModel::ambient();
-        off.writes_allowed = false;
+        off.level = Capability::Read;
         assert_eq!(turn_capability(&off), Capability::Read);
     }
 

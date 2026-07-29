@@ -191,6 +191,13 @@ pub struct Config {
     pub bind: String,
     pub port: u16,
     pub claude_bin: String,
+    /// The ordered candidate list for work the user did NOT choose a model for
+    /// (`offload_order` in the config file). Empty by default, which routes every such job
+    /// to ambient — byte-for-byte the behavior before this key existed.
+    ///
+    /// It governs ONLY routed jobs. A main turn runs on the model the chip selected or it
+    /// fails; see [`crate::routing`] for why that boundary matters and what erodes it.
+    pub offload_order: Vec<String>,
     pub timeout_secs: u64,
     // Comma-separated tool allowlist passed to `claude --allowedTools`.
     pub allowed_tools: String,
@@ -933,10 +940,23 @@ pub struct RegistryModel {
     /// see [`model_health`]). Ambient is always configured; a hosted/local entry is
     /// configured IFF its triple resolved (its token env var was set).
     pub configured: bool,
-    /// The write permission a freshly-registered model gets before any explicit opt-in.
-    /// Ambient (`opus`) is always `true` (writes-on); every non-ambient entry defaults
-    /// `false` — read-only until writes are enabled per model.
-    pub default_writes: bool,
+    /// The MOST this model may be granted — a CEILING, not a grant. `Write` means it may
+    /// change the vault; `Read` that it may read and search; `Basic` that it may have no
+    /// tools at all. Absent from config it is [`Capability::Read`], the safe direction: a
+    /// newly declared model can be asked questions but cannot change anything.
+    ///
+    /// It is a ceiling because the JOB sets the actual grant beneath it — see
+    /// [`turn_capability`] and [`RoutedJob::required`]. A `Write` model serving a title runs
+    /// at `Basic`; a `Read` model backing a conversation runs read-only.
+    ///
+    /// Config-only, deliberately: it is not settable from a client. The per-model writes
+    /// toggle this replaced was (`POST /jesse/model/{id}/writes`, removed), which put a
+    /// containment decision on the phone.
+    pub level: Capability,
+    /// The harness that runs this model's child, by [`Harness::id`]. `claude-code` when the
+    /// entry declares none. The registry instantiates only the harnesses some configured
+    /// model actually names.
+    pub harness: String,
     /// The price deck for the per-turn cost badge.
     pub price: PriceDeck,
     /// The health-probe cadence + endpoint for this model (unused for the ambient entry,
@@ -964,6 +984,13 @@ pub struct ModelRegistry {
 /// The id of the default, always-available model. Selecting it reproduces today's
 /// behavior byte-for-byte (no overrides, normal allowlist, writes-on).
 pub const DEFAULT_MODEL_ID: &str = "opus";
+
+/// The level a model gets when its config declares none: [`Capability::Read`].
+///
+/// The safe direction, and the reason the default is not `Write`: a model that appears in
+/// the config without anyone deciding what it may touch can be asked questions and cannot
+/// change anything. Raising it is an explicit `level = "write"`.
+pub const DEFAULT_MODEL_LEVEL: Capability = Capability::Read;
 
 impl ModelRegistry {
     /// Look up an entry by id.
@@ -1121,7 +1148,10 @@ fn glm_env_entry(default_interval_secs: u64) -> RegistryModel {
         subagent_model: backend.as_ref().map(|(_, _, m)| m.clone()),
         configured: backend.is_some(),
         backend,
-        default_writes: false,
+        // No declarative entry, so no `level` key: the default applies. A deploy that wants
+        // one of these at Write says so in the `[[models]]` array.
+        level: Capability::Read,
+        harness: CLAUDE_CODE_ID.to_string(),
         price: PriceDeck {
             in_per_m: FW_GLM_IN_PER_M,
             cached_per_m: FW_GLM_CACHED_PER_M,
@@ -1166,7 +1196,10 @@ fn kimi_env_entry(default_interval_secs: u64) -> RegistryModel {
         subagent_model: backend.as_ref().map(|(_, _, m)| m.clone()),
         configured: backend.is_some(),
         backend,
-        default_writes: false,
+        // No declarative entry, so no `level` key: the default applies. A deploy that wants
+        // one of these at Write says so in the `[[models]]` array.
+        level: Capability::Read,
+        harness: CLAUDE_CODE_ID.to_string(),
         // Fireworks' published K3 deck (3.00 / 0.30 / 15.00), still overridable from env
         // via `JESSE_MODEL_KIMI_PRICE_{IN,CACHED,OUT}` if Fireworks reprices.
         price: model_price_from_env(
@@ -1204,7 +1237,10 @@ fn local_env_entry(default_interval_secs: u64) -> RegistryModel {
         subagent_model: backend.as_ref().map(|(_, _, m)| m.clone()),
         configured: backend.is_some(),
         backend,
-        default_writes: false,
+        // No declarative entry, so no `level` key: the default applies. A deploy that wants
+        // one of these at Write says so in the `[[models]]` array.
+        level: Capability::Read,
+        harness: CLAUDE_CODE_ID.to_string(),
         price: PriceDeck::ZERO,
         health: HealthConfig {
             interval_secs: default_interval_secs,
@@ -1229,9 +1265,11 @@ pub struct ActiveModel {
     /// The subagent model id (== the triple's model) so the subagents the main turn
     /// spawns follow the switch via `CLAUDE_CODE_SUBAGENT_MODEL`. `None` for ambient.
     pub subagent_model: Option<String>,
-    /// Whether this turn may WRITE. `false` → the read-only allowlist (the Phase 1
-    /// default for every non-ambient model). Ambient (`opus`) is always `true`.
-    pub writes_allowed: bool,
+    /// This model's LEVEL — the ceiling it may be granted, carried onto the turn so
+    /// [`turn_capability`] can take the minimum of it and `Write`. Never the grant itself.
+    pub level: Capability,
+    /// The harness that runs this model's child, by [`Harness::id`].
+    pub harness: String,
     /// The price deck for the per-turn cost badge.
     pub price: PriceDeck,
     /// The vision helpers this model is paired with (copied from its registry entry) plus
@@ -1243,6 +1281,16 @@ pub struct ActiveModel {
 }
 
 impl ActiveModel {
+    /// Whether this model may change the vault: its level is `Write`.
+    ///
+    /// Derived from the level rather than stored, so there is exactly one source of truth
+    /// for what a model may touch. The per-model boolean this replaced was settable from the
+    /// phone; a level is config-only and is validated at startup against the containment
+    /// record.
+    pub fn writes_allowed(&self) -> bool {
+        self.level >= Capability::Write
+    }
+
     /// The ambient default (`opus`): no env overrides, writes-on. A turn built with this
     /// is byte-for-byte today's behavior — the value the title one-shot and any
     /// no-switch caller pass so nothing about their command changes.
@@ -1252,7 +1300,8 @@ impl ActiveModel {
             kind: ModelKind::Ambient,
             env: None,
             subagent_model: None,
-            writes_allowed: true,
+            level: Capability::Write,
+            harness: CLAUDE_CODE_ID.to_string(),
             price: PriceDeck {
                 in_per_m: OPUS_IN_PER_M,
                 cached_per_m: OPUS_CACHED_PER_M,
@@ -1280,7 +1329,12 @@ fn opus_entry() -> RegistryModel {
         backend: None,
         subagent_model: None,
         configured: true,
-        default_writes: true,
+        // The ambient default is the out-of-box conversation backend and the routing rule's
+        // final fallback, so it is the one built-in `Write` entry. Not settable: there is no
+        // `[[models]]` entry for opus (a declarative entry that tries to redefine it is
+        // refused), which is what keeps the ambient contract out of config's reach.
+        level: Capability::Write,
+        harness: CLAUDE_CODE_ID.to_string(),
         price: PriceDeck {
             in_per_m: OPUS_IN_PER_M,
             cached_per_m: OPUS_CACHED_PER_M,
@@ -1333,6 +1387,20 @@ pub struct ModelToml {
     pub model: Option<String>,
     pub subagent_model: Option<String>,
     pub auth_token_env: Option<String>,
+    /// The harness that runs this model's child (`claude-code`, `codex`, …). Absent means
+    /// `claude-code`. An id no harness is registered under is a startup ERROR, never a
+    /// silent fallback — see [`validate_model_config`].
+    pub harness: Option<String>,
+    /// The CEILING this model may be granted: `basic` | `read` | `write`. Absent means
+    /// `read`. See [`RegistryModel::level`].
+    pub level: Option<String>,
+    /// REMOVED, and parsed only so its presence can be REFUSED at startup.
+    ///
+    /// The models deserializer ignores unknown keys (so a forward-looking example file
+    /// parses), which means a key that silently stops being read is a silent security
+    /// downgrade: a deploy that wrote `default_writes = true` would quietly become a
+    /// read-only model. Keeping the field here turns that into a loud startup error naming
+    /// `level` as its replacement.
     pub default_writes: Option<bool>,
     pub price: Option<PriceToml>,
     pub health: Option<HealthToml>,
@@ -1474,7 +1542,22 @@ pub fn registry_model_from_toml(t: &ModelToml, global_interval: Option<u64>) -> 
         backend,
         subagent_model,
         configured,
-        default_writes: t.default_writes.unwrap_or(false),
+        // A bad/absent `level` resolves to the safe default here; `validate_model_config`
+        // is what REFUSES an unparseable one at startup, so a typo is never a silent
+        // downgrade to Read.
+        level: t
+            .level
+            .as_deref()
+            .map(str::trim)
+            .and_then(parse_capability)
+            .unwrap_or(DEFAULT_MODEL_LEVEL),
+        harness: t
+            .harness
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or(CLAUDE_CODE_ID)
+            .to_string(),
         price,
         health,
         vision: t
@@ -1549,6 +1632,7 @@ impl Config {
             bind: env_string("JESSE_BIND").unwrap_or_else(|| "127.0.0.1".to_string()),
             port: env_parse("JESSE_PORT", 8765),
             claude_bin: env_string("JESSE_CLAUDE_BIN").unwrap_or_else(|| "claude".to_string()),
+            offload_order: load_offload_order(&home),
             // 1h default; clamped to [1, HARD_TIMEOUT_CEILING].
             timeout_secs: clamp_timeout_secs(env_parse("JESSE_TIMEOUT", 3600)),
             allowed_tools: env_string("JESSE_ALLOWED_TOOLS")
@@ -1782,7 +1866,7 @@ mod tests {
         let opus = r.default_model();
         assert_eq!(opus.id, "opus");
         assert!(matches!(opus.kind, ModelKind::Ambient));
-        assert!(opus.configured && opus.default_writes);
+        assert!(opus.configured && opus.level == Capability::Write);
         assert!(!r.is_configured("glm-5.2"), "an absent model is not configured");
     }
 
@@ -2569,7 +2653,7 @@ mod tests {
         );
         assert_eq!(armed.subagent_model.as_deref(), Some("provider/model"));
         assert!(matches!(armed.kind, ModelKind::Hosted));
-        assert!(!armed.default_writes, "non-ambient defaults read-only");
+        assert_eq!(armed.level, DEFAULT_MODEL_LEVEL, "non-ambient defaults to Read");
 
         std::env::remove_var("JESSE_TEST_DECL_TOKEN");
         let unarmed =
@@ -2606,6 +2690,8 @@ mod tests {
         let _g = ENV_LOCK.lock_ok();
         std::env::set_var("JESSE_TEST_VIS_TOKEN", "tok");
         let t = ModelToml {
+            harness: None,
+            default_writes: None,
             id: Some("glm".into()),
             kind: Some("hosted".into()),
             base_url: Some("http://b".into()),
@@ -2648,7 +2734,8 @@ mod tests {
             backend: None,
             subagent_model: None,
             configured: false,
-            default_writes: false,
+            level: Capability::Read,
+            harness: CLAUDE_CODE_ID.to_string(),
             price: PriceDeck::ZERO,
             health: HealthConfig::default(),
             vision: Vec::new(),
@@ -2661,7 +2748,8 @@ mod tests {
             backend: Some(("http://b".into(), "t".into(), "m".into())),
             subagent_model: Some("m".into()),
             configured: true,
-            default_writes: false,
+            level: Capability::Read,
+            harness: CLAUDE_CODE_ID.to_string(),
             price: PriceDeck::ZERO,
             health: HealthConfig::default(),
             vision: vec![VisionPartner {
@@ -2697,6 +2785,8 @@ mod tests {
         let _g = ENV_LOCK.lock_ok();
         std::env::set_var("JESSE_TEST_DECL_TOKEN2", "tok");
         let t = ModelToml {
+            harness: None,
+            default_writes: None,
             id: Some("codex".into()),
             label: Some("Codex".into()),
             kind: Some("local".into()),
@@ -2704,7 +2794,7 @@ mod tests {
             model: Some("gpt-5-codex".into()),
             subagent_model: Some("gpt-5-mini".into()),
             auth_token_env: Some("JESSE_TEST_DECL_TOKEN2".into()),
-            default_writes: Some(true),
+            level: Some("write".to_string()),
             price: Some(PriceToml {
                 in_per_m: Some(2.0),
                 cached_per_m: Some(0.2),
@@ -2722,7 +2812,7 @@ mod tests {
         assert!(matches!(m.kind, ModelKind::Local));
         assert_eq!(m.label, "Codex");
         assert_eq!(m.subagent_model.as_deref(), Some("gpt-5-mini"), "explicit subagent override");
-        assert!(m.default_writes, "declarative default_writes honored");
+        assert_eq!(m.level, Capability::Write, "declarative level honored");
         assert_eq!(m.price.out_per_m, 8.0);
         assert_eq!(m.health.interval_secs, 30);
         assert_eq!(m.health.timeout_secs, 2);

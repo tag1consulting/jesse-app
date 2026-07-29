@@ -2,10 +2,16 @@ use crate::*;
 
 // ---- The global model selection store --------------------------------------
 //
-// A single JSON file `<state_dir>/model.json` holding the ACTIVE model id and the
-// per-model `writes_allowed` overrides, so the choice of which model backs the
-// conversation is the BRIDGE's (not one device's) and every device — iPhone, Mac —
-// converges on one selection. Mirrors `FlagStore`'s discipline exactly: atomic
+// A single JSON file `<state_dir>/model.json` holding the ACTIVE model id, so the choice
+// of which model backs the conversation is the BRIDGE's (not one device's) and every
+// device — iPhone, Mac — converges on one selection.
+//
+// It used to hold a per-model `writes` map too, set by `POST /jesse/model/{id}/writes`.
+// Both are GONE: what a model may touch is its `level`, which lives in the bridge config
+// and is validated at startup against the containment record. A leftover `writes` map in
+// an existing file is dropped with one logged notice on first load (see `load_selection`)
+// rather than silently ignored, because a persisted grant that stops being honored should
+// say so once. Mirrors `FlagStore`'s discipline exactly: atomic
 // temp+rename writes, mode 0600, best-effort (a write failure is logged, never fatal).
 // With no state dir configured the store is in-memory only, the same degradation the
 // job / device / title / flag stores have, so the selection resets to the default on
@@ -16,23 +22,17 @@ use crate::*;
 // (the `ModelRegistry`); this store just records which of those the user picked and
 // whether they granted it write access.
 
-/// The persisted selection: the active model id and the per-model write overrides.
+/// The persisted selection: the active model id.
 #[derive(serde::Serialize, serde::Deserialize, Clone, PartialEq, Debug)]
 pub struct ModelSelection {
     /// The active model id. Defaults to [`DEFAULT_MODEL_ID`] (`opus`).
     pub active: String,
-    /// Per-model write overrides. A model absent from the map has no override and takes
-    /// its registry `default_writes` (opus always writes-on; every other model default
-    /// OFF). Only ever set by `POST /jesse/model/{id}/writes` (Phase 2 wires the effect).
-    #[serde(default)]
-    pub writes: HashMap<String, bool>,
 }
 
 impl Default for ModelSelection {
     fn default() -> Self {
         ModelSelection {
             active: DEFAULT_MODEL_ID.to_string(),
-            writes: HashMap::new(),
         }
     }
 }
@@ -64,14 +64,7 @@ impl ModelStore {
         self.state.lock_ok().active.clone()
     }
 
-    /// The stored write override for a model, or `None` when it has none (then the
-    /// registry default applies). Used to compute a model's effective write permission.
-    pub fn writes_override(&self, id: &str) -> Option<bool> {
-        self.state.lock_ok().writes.get(id).copied()
-    }
-
-    /// A clone of the whole selection (active + overrides) for the `GET /jesse/models`
-    /// read path.
+    /// A clone of the selection for the `GET /jesse/models` read path.
     pub fn snapshot(&self) -> ModelSelection {
         self.state.lock_ok().clone()
     }
@@ -92,28 +85,30 @@ impl ModelStore {
         snapshot.active
     }
 
-    /// Set (or clear) a model's write override and persist. `enabled` records an explicit
-    /// override; the registry default applies to any model with no override. Returns the
-    /// stored value.
-    pub fn set_writes(&self, id: &str, enabled: bool) -> bool {
-        let snapshot = {
-            let mut state = self.state.lock_ok();
-            state.writes.insert(id.to_string(), enabled);
-            state.clone()
-        };
-        if let Some(path) = &self.path {
-            persist_selection(path, &snapshot);
-        }
-        enabled
-    }
 }
 
 /// Load the selection from disk, tolerating corruption by returning `None` (→ the
 /// default). An unreadable/absent/garbage file, or one whose `active` is blank, yields
-/// `None`. Unknown fields are ignored and a missing `writes` defaults to empty, so a
-/// file written by a future bridge loads cleanly (additive-forward-compatible).
+/// `None`. Unknown fields are ignored, so a file written by a future bridge loads cleanly
+/// (additive-forward-compatible).
+///
+/// A leftover per-model `writes` map from a bridge that still had the toggle is DROPPED,
+/// with one logged notice. Silently ignoring it would leave an operator believing a grant
+/// they set is still in force; the notice says once that levels replaced it and where they
+/// live now.
 pub fn load_selection(path: &Path) -> Option<ModelSelection> {
     let text = std::fs::read_to_string(path).ok()?;
+    if serde_json::from_str::<Value>(&text)
+        .ok()
+        .and_then(|v| v.get("writes").cloned())
+        .map(|w| w.as_object().map(|m| !m.is_empty()).unwrap_or(false))
+        .unwrap_or(false)
+    {
+        eprintln!(
+            "jesse-bridge: NOTICE {} carries a per-model `writes` map from an older bridge.              The per-model writes toggle was removed; a model's `level` in the bridge config              now decides what it may touch. Dropping the stored overrides.",
+            path.display()
+        );
+    }
     let mut sel = serde_json::from_str::<ModelSelection>(&text).ok()?;
     sel.active = sel.active.trim().to_string();
     if sel.active.is_empty() {
@@ -126,7 +121,7 @@ pub fn load_selection(path: &Path) -> Option<ModelSelection> {
 /// `persist_flags`. Best-effort: a failure is logged, never fatal. The parent dir is
 /// created if missing so the store works regardless of init order.
 pub fn persist_selection(path: &Path, selection: &ModelSelection) {
-    let value = json!({ "v": 1, "active": selection.active, "writes": selection.writes });
+    let value = json!({ "v": 1, "active": selection.active });
     let tmp = path.with_extension("json.tmp");
     let write = || -> std::io::Result<()> {
         if let Some(parent) = path.parent() {
@@ -160,19 +155,34 @@ mod tests {
     fn fresh_store_defaults_to_opus_with_no_overrides() {
         let store = ModelStore::new(None);
         assert_eq!(store.active(), "opus");
-        assert_eq!(store.writes_override("glm-5.2"), None);
-        assert!(store.snapshot().writes.is_empty());
+        assert_eq!(store.snapshot().active, "opus");
     }
 
     #[test]
-    fn set_active_and_writes_round_trip_in_memory() {
+    fn set_active_round_trips_in_memory() {
         let store = ModelStore::new(None);
         assert_eq!(store.set_active("glm-5.2"), "glm-5.2");
         assert_eq!(store.active(), "glm-5.2");
-        assert!(store.set_writes("glm-5.2", true));
-        assert_eq!(store.writes_override("glm-5.2"), Some(true));
-        // An unrelated model still has no override.
-        assert_eq!(store.writes_override("local"), None);
+    }
+
+    /// A file written by a bridge that still had the writes toggle: the selection still
+    /// loads, and the stale grants are dropped rather than honored.
+    #[test]
+    fn a_leftover_writes_map_is_dropped_and_the_selection_still_loads() {
+        let path = temp_model_path();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &path,
+            r#"{"v":1,"active":"glm-5.2","writes":{"glm-5.2":true}}"#,
+        )
+        .unwrap();
+        let store = ModelStore::new(Some(path.clone()));
+        assert_eq!(store.active(), "glm-5.2", "the active id still loads");
+        // Re-persisting drops the map from disk entirely.
+        store.set_active("local");
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(!text.contains("writes"), "{text}");
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 
     #[test]
@@ -181,11 +191,9 @@ mod tests {
         {
             let store = ModelStore::new(Some(path.clone()));
             store.set_active("glm-5.2");
-            store.set_writes("glm-5.2", true);
         }
         let reloaded = ModelStore::new(Some(path.clone()));
         assert_eq!(reloaded.active(), "glm-5.2");
-        assert_eq!(reloaded.writes_override("glm-5.2"), Some(true));
 
         // File is 0600.
         use std::os::unix::fs::PermissionsExt;
@@ -213,7 +221,7 @@ mod tests {
     fn a_blank_active_field_loads_as_the_default() {
         let path = temp_model_path();
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        std::fs::write(&path, r#"{"v":1,"active":"   ","writes":{}}"#).unwrap();
+        std::fs::write(&path, r#"{"v":1,"active":"   "}"#).unwrap();
         let store = ModelStore::new(Some(path.clone()));
         assert_eq!(store.active(), "opus", "blank active → default");
         let _ = std::fs::remove_dir_all(path.parent().unwrap());

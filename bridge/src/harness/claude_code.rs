@@ -1688,7 +1688,8 @@ mod tests {
                 "glm-model".to_string(),
             )),
             subagent_model: Some("glm-model".to_string()),
-            writes_allowed: false,
+            level: Capability::Read,
+            harness: CLAUDE_CODE_ID.to_string(),
             price: PriceDeck::ZERO,
             vision: Vec::new(),
             vision_complementary: false,
@@ -1853,7 +1854,7 @@ mod tests {
         // allowlist opus does (byte-for-byte the configured list), not the read-only set.
         let cfg = test_config();
         let mut active = glm_active();
-        active.writes_allowed = true;
+        active.level = Capability::Write;
         let args = build_claude_args(
             &cfg,
             "edit the vault",

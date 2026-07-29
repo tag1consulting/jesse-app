@@ -6,6 +6,7 @@ use crate::*;
 pub(crate) static ENV_LOCK: Mutex<()> = Mutex::new(());
 pub(crate) fn test_config() -> Config {
     Config {
+        offload_order: Vec::new(),
         token: "test-token".to_string(),
         // Captured HOME for session-path lookups; tests that exercise session
         // paths override `home`/`vault` explicitly (no global-env mutation).

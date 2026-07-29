@@ -181,6 +181,10 @@ struct LocalConfig {
     persona: Option<PersonaToml>,
     #[serde(default)]
     models: Vec<ModelToml>,
+    /// The ordered candidate list for routed jobs (`offload_order = ["local", "glm-5.2"]`).
+    /// Absent → empty → every routed job goes to ambient, as before the key existed.
+    #[serde(default)]
+    offload_order: Vec<String>,
 }
 
 /// Resolve the local overlay file, first existing wins:
@@ -226,6 +230,20 @@ fn load_local_persona(home: &str) -> Option<PersonaToml> {
 /// validated in [`registry_model_from_toml`], so a partial entry is skipped there, not here.
 pub fn load_local_models(home: &str) -> Vec<ModelToml> {
     load_local_config(home).map(|c| c.models).unwrap_or_default()
+}
+
+/// Read the `offload_order` list from the same overlay file, blank ids dropped. Absent or
+/// malformed → empty, which routes every routed job to ambient.
+pub fn load_offload_order(home: &str) -> Vec<String> {
+    load_local_config(home)
+        .map(|c| {
+            c.offload_order
+                .into_iter()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// Read + parse the whole local overlay file once. Soft-fails: a read or parse error logs

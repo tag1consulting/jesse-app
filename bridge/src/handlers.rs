@@ -1137,7 +1137,7 @@ pub async fn jesse(
         // three are byte-identical.
         let hosted_badge = HostedBadge {
             model_id: active.id.clone(),
-            write_marked: active.is_non_ambient() && active.writes_allowed,
+            write_marked: active.is_non_ambient() && active.writes_allowed(),
             cost_usd: match badge_source {
                 BadgeSource::Hosted => Some(m_usage.cost_on(&active.price)),
                 _ => None,
@@ -1554,18 +1554,14 @@ pub struct SetModelRequest {
     id: String,
 }
 
-/// Body of `POST /jesse/model/{id}/writes`: whether that model may write the vault.
-#[derive(Deserialize)]
-pub struct SetWritesRequest {
-    enabled: bool,
-}
-
-/// The EFFECTIVE write permission for a registry model: the ambient default (`opus`) is
-/// always writes-on; every other model takes its `ModelStore` override, else its registry
-/// `default_writes` (OFF in Phase 1). This is what the app renders and what the turn path
-/// enforces via the allowlist.
-pub fn effective_writes(m: &RegistryModel, store: &ModelStore) -> bool {
-    matches!(m.kind, ModelKind::Ambient) || store.writes_override(&m.id).unwrap_or(m.default_writes)
+/// Whether a registry model may change the vault: its configured LEVEL is `Write`.
+///
+/// This is what the app renders and what the turn path enforces via the allowlist. It reads
+/// the level and nothing else — there is no per-model override to consult, because
+/// `POST /jesse/model/{id}/writes` and its persisted map are gone. A model below `Write`
+/// appears in the picker and can back a conversation; it simply cannot change anything.
+pub fn effective_writes(m: &RegistryModel) -> bool {
+    m.level >= Capability::Write
 }
 
 /// One model row for `GET /jesse/models`. Exposes ids, booleans, enums, and numbers ONLY —
@@ -1576,9 +1572,9 @@ pub fn effective_writes(m: &RegistryModel, store: &ModelStore) -> bool {
 /// optional — absent for opus and before the first probe).
 fn model_row(
     m: &RegistryModel,
-    store: &ModelStore,
     health: &HealthStore,
     registry: &ModelRegistry,
+    cfg_harnesses: &HarnessRegistry,
 ) -> Value {
     let h = model_health(m, health);
     // Vision capability: `enabled` is true ONLY when this model is paired AND at least one
@@ -1604,7 +1600,16 @@ fn model_row(
         "configured": h.configured,
         "healthy": h.healthy,
         "available": h.available(),
-        "writes_allowed": effective_writes(m, store),
+        "writes_allowed": effective_writes(m),
+        // The model's CEILING, as a string the clients render. `writes_allowed` stays
+        // alongside it (it is `level == write`) so an older client keeps working unchanged.
+        "level": capability_label(m.level),
+        // Derived from this model's HARNESS, not from the model: a client cannot render a
+        // spinner for a whole-answer harness if nothing tells it, and putting the flag on
+        // the model keeps the harness invisible as an identity while exposing it as a
+        // property. A harness that no longer resolves reports `true` — the streaming
+        // assumption every client already makes — rather than failing the row.
+        "streams_text": registry_harness(cfg_harnesses, &m.harness).map(|h| h.streams_text()).unwrap_or(true),
         "last_checked_ms": h.status.as_ref().map(|s| s.checked_at_ms),
         "latency_ms": h.status.as_ref().and_then(|s| s.latency_ms),
         "vision": {
@@ -1627,7 +1632,7 @@ pub async fn jesse_models(
         .model_registry
         .models
         .iter()
-        .map(|m| model_row(m, &st.models, &st.health, &st.cfg.model_registry))
+        .map(|m| model_row(m, &st.health, &st.cfg.model_registry, &st.cfg.harnesses))
         .collect();
     Ok(Json(json!({
         "active": st.models.active(),
@@ -1669,39 +1674,6 @@ pub async fn jesse_set_model(
     }
 }
 
-/// `POST /jesse/model/{id}/writes` — set a model's write permission (Phase 2 wires the
-/// effect; Phase 1 accepts and stores it). The ambient default (`opus`) is always
-/// writes-on and not user-settable (400). Unknown/unavailable ids are rejected exactly as
-/// `POST /jesse/model`. Same bearer auth as `/jesse`.
-pub async fn jesse_set_model_writes(
-    State(st): State<AppState>,
-    UrlPath(id): UrlPath<String>,
-    headers: HeaderMap,
-    Json(req): Json<SetWritesRequest>,
-) -> Result<Json<Value>, ApiError> {
-    check_auth(&headers, &st.cfg.token)?;
-    let id = id.trim();
-    match st.cfg.model_registry.get(id) {
-        // Gated on CONFIGURED (not health): a write preference can be set for a configured
-        // model even while it is momentarily unhealthy — it is a stored authorization, not a
-        // runtime action. An unconfigured model has no backend to authorize, so it 409s.
-        Some(m) if m.configured => {
-            if matches!(m.kind, ModelKind::Ambient) {
-                return Err((
-                    StatusCode::BAD_REQUEST,
-                    "the default model is always writes-on".to_string(),
-                ));
-            }
-            let enabled = st.models.set_writes(id, req.enabled);
-            Ok(Json(json!({ "id": id, "writes_allowed": enabled })))
-        }
-        Some(_) => Err((
-            StatusCode::CONFLICT,
-            format!("model '{id}' is not configured"),
-        )),
-        None => Err((StatusCode::BAD_REQUEST, format!("unknown model '{id}'"))),
-    }
-}
 
 /// Build the axum router with its shared state. Kept separate from `main` so
 /// tests can drive the same routes via `tower::ServiceExt::oneshot` without
@@ -1742,7 +1714,6 @@ pub fn app(state: AppState) -> Router {
         // active model, and set a model's write permission (Phase 2 wires the effect).
         .route("/jesse/models", get(jesse_models))
         .route("/jesse/model", post(jesse_set_model))
-        .route("/jesse/model/:id/writes", post(jesse_set_model_writes))
         .layer(DefaultBodyLimit::max(body_limit))
         .with_state(state)
 }
