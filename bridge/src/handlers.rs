@@ -207,6 +207,7 @@ fn emergency_validator(validator_ok: bool) -> String {
 #[allow(clippy::too_many_arguments)]
 pub async fn run_ask_hosted_or_emergency(
     cfg: &Config,
+    health: &HealthStore,
     prompt: &str,
     sid: Option<&str>,
     jobs: &JobStore,
@@ -219,9 +220,12 @@ pub async fn run_ask_hosted_or_emergency(
     recent_context: Option<&str>,
 ) -> AskResult {
     let now = Instant::now();
-    let vaultqa_model = cfg.vaultqa_backend.as_ref().map(|(_, _, m)| m.clone());
-    let base_url = cfg
-        .vaultqa_backend
+    // Which model would answer an emergency ask: the same routing rule the routine route
+    // uses, resolved once here for the provenance line.
+    let emergency_pick = route_job(cfg, health, RoutedJob::VaultQa, None, None);
+    let vaultqa_model = Some(emergency_pick.id.clone());
+    let base_url = emergency_pick
+        .backend
         .as_ref()
         .map(|(b, _, _)| b.clone())
         .unwrap_or_default();
@@ -229,7 +233,7 @@ pub async fn run_ask_hosted_or_emergency(
     // A small closure that runs the emergency child and packages the AskResult, or
     // returns None when the child hard-failed (caller decides the fallback).
     let emergency = |reason: String| async {
-        match run_emergency_ask_pipeline(cfg, question, health_context, recent_context).await {
+        match run_emergency_ask_pipeline(cfg, health, question, health_context, recent_context).await {
             EmergencyAskOutcome::Answered {
                 text,
                 citations,
@@ -487,7 +491,7 @@ pub async fn jesse(
     // always false, so the turn takes today's hosted path byte-for-byte. Decided here
     // (before any work) but ACTED ON inside the spawned task below, so a fall-through
     // reuses the same permit/scratch/job machinery as a normal turn.
-    let try_diet = should_try_local_diet(&st.cfg, &mode, &req.text);
+    let try_diet = should_try_local_diet(&st.cfg, &st.health, &mode, &req.text);
     // Kill switch + STRICT gate: attempt the contained read-only vault-QA child only
     // when a vault-QA backend is configured AND this is a self-referential Ask that
     // carries no attachment/image and is not diet-gate-shaped (diet keeps precedence —
@@ -497,7 +501,7 @@ pub async fn jesse(
     // ON inside the spawned task below, so a fall-through reuses the same permit/job
     // machinery as a normal turn.
     let try_vaultqa = !try_diet
-        && should_try_local_vaultqa(&st.cfg, &mode, &req.text, !req.attachments.is_empty());
+        && should_try_local_vaultqa(&st.cfg, &st.health, &mode, &req.text, !req.attachments.is_empty());
     let is_followup = req.session_id.is_some();
     // Compute the clock header ONCE here and build the prompt from it, so the SAME
     // clock can recompute the floor boundary when the hosted catch-up block is spliced
@@ -721,7 +725,7 @@ pub async fn jesse(
         // Emergency fallback (Piece 4) is armed only when JESSE_EMERGENCY_LOCAL is on
         // AND the vault-QA triple is set (it supplies the backend + read-only child).
         // With it disarmed, every branch below is byte-for-byte today's behavior.
-        let emergency_armed = emergency_armed(&cfg);
+        let emergency_armed = emergency_armed(&cfg, &st.health);
         let diet_queue = DietQueue::from_cfg(&cfg);
 
         // ---- Context carry (Piece 3 + 4): read the thread's ledger UNDER THE PERMIT
@@ -843,12 +847,14 @@ pub async fn jesse(
         let mut m_citations_unverified = false;
         let mut hosted_succeeded = false;
 
-        let diet_model = || cfg.diet_backend.as_ref().map(|(_, _, m)| m.clone());
-        let vaultqa_model = || cfg.vaultqa_backend.as_ref().map(|(_, _, m)| m.clone());
+        // The model that served each local route, for the metrics line: the routing rule's
+        // pick, resolved the same way the route itself resolved it.
+        let diet_model = || Some(route_job(&cfg, &st.health, RoutedJob::DietExtract, None, None).id);
+        let vaultqa_model = || Some(route_job(&cfg, &st.health, RoutedJob::VaultQa, None, None).id);
 
         let (mut outcome, badge_source) = if try_diet {
             // Local diet pipeline: extract → verify → append → derive mirror.
-            match run_diet_pipeline(&cfg, &raw_text).await {
+            match run_diet_pipeline(&cfg, &st.health, &raw_text).await {
                 DietPipelineOutcome::Logged {
                     dashboard,
                     directives,
@@ -948,6 +954,7 @@ pub async fn jesse(
             // attempt (which, when emergency is armed, may serve the emergency child).
             match run_vaultqa_pipeline(
                 &cfg,
+                &st.health,
                 &raw_text,
                 health_context.as_deref(),
                 recent_block.as_deref(),
@@ -965,6 +972,7 @@ pub async fn jesse(
                     m_rung = rung.num();
                     let r = run_ask_hosted_or_emergency(
                         &cfg,
+                        &st.health,
                         &hosted_prompt,
                         sid.as_deref(),
                         &jobs,
@@ -994,6 +1002,7 @@ pub async fn jesse(
             // failure. With emergency disarmed this is byte-for-byte the old hosted path.
             let r = run_ask_hosted_or_emergency(
                 &cfg,
+                &st.health,
                 &hosted_prompt,
                 sid.as_deref(),
                 &jobs,
@@ -1153,6 +1162,7 @@ pub async fn jesse(
         let provenance = reply_provenance(
             &outcome,
             &cfg,
+            &st.health,
             route,
             badge_source,
             m_model.clone(),
@@ -1182,7 +1192,7 @@ pub async fn jesse(
 
         // Finalize the delivered reply: append the model badge (display only) at this
         // single point, so BOTH the poll result and the SSE `done` frame carry it.
-        let outcome = finalize_reply_badge(outcome, &cfg, badge_source, &hosted_badge);
+        let outcome = finalize_reply_badge(outcome, &cfg, &st.health, badge_source, &hosted_badge);
 
         // Structured metrics (Piece 3): one content-free line per GATED / ROUTED /
         // EMERGENCY turn, at this same finalization seam. A no-op when JESSE_METRICS_LOG
@@ -1193,7 +1203,7 @@ pub async fn jesse(
         if metrics_relevant {
             let badge = match &outcome {
                 Ok((text, _, _)) if !text.trim().is_empty() => {
-                    model_badge_line(&cfg, badge_source, &hosted_badge)
+                    model_badge_line(&cfg, &st.health, badge_source, &hosted_badge)
                 }
                 _ => None,
             };
@@ -1256,7 +1266,7 @@ pub async fn jesse(
         // NEXT turn's start, never this reply. A no-op when emergency is disarmed, no
         // hosted contact succeeded, or the queue is empty.
         if emergency_armed && hosted_succeeded && diet_queue.is_available() {
-            replay_diet_queue(&cfg, &diet_queue).await;
+            replay_diet_queue(&cfg, &st.health, &diet_queue).await;
         }
 
         // Fire the completion push if this turn was flagged for it (the phone
@@ -1466,7 +1476,16 @@ pub async fn jesse_title(
     }
 
     // One bounded, stateless claude call. No job store, no stream, no session.
-    let raw = run_claude_oneshot(&st.cfg, &build_title_prompt(text), TITLE_TIMEOUT_SECS).await?;
+    // Naming a conversation is work the user did not choose a model for, so it goes
+    // through the routing rule at `Basic`.
+    let title_pick = route_job(&st.cfg, &st.health, RoutedJob::Title, None, None);
+    let raw = run_claude_oneshot(
+        &st.cfg,
+        &build_title_prompt(text),
+        TITLE_TIMEOUT_SECS,
+        &title_pick,
+    )
+    .await?;
     let title = sanitize_title(&raw);
     if title.is_empty() {
         // Nothing usable came back — a clean non-2xx the app degrades from.

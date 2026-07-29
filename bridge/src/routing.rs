@@ -156,6 +156,16 @@ pub fn pick_offload_model<'a>(
     None
 }
 
+/// Whether config named a model to OFFLOAD this job to — the walk yields a candidate.
+///
+/// This is the gate the local routes take: it replaces `cfg.<role>_backend.is_some()`, which
+/// asked whether a role's env triple was set. Falling through to ambient is not "offloaded",
+/// so a bridge with an empty `offload_order` takes the hosted path for every job exactly as
+/// one with no role backends configured did.
+pub fn has_offload_candidate(cfg: &Config, health: &HealthStore, job: RoutedJob) -> bool {
+    pick_offload_model(cfg, health, job.required(), None).is_some()
+}
+
 /// Resolve which model serves one routed job: the `offload_order` walk, then the
 /// conversation's model, then ambient.
 ///

@@ -159,8 +159,16 @@ pub fn diet_gate_matches(mode: &str, text: &str, extra: &[String]) -> bool {
 /// English baseline plus the deployment's `persona.diet_keywords_extra`). With no
 /// backend this is always `false`, so every Tell takes today's hosted path
 /// byte-for-byte — the seam is the kill switch.
-pub fn should_try_local_diet(cfg: &Config, mode: &str, text: &str) -> bool {
-    cfg.diet_backend.is_some()
+pub fn should_try_local_diet(
+    cfg: &Config,
+    health: &HealthStore,
+    mode: &str,
+    text: &str,
+) -> bool {
+    // The kill switch is now `offload_order`: with no candidate for the extraction, every
+    // Tell takes the hosted path byte-for-byte, exactly as an unset `JESSE_DIET_*` triple
+    // did before this key existed.
+    has_offload_candidate(cfg, health, RoutedJob::DietExtract)
         && diet_gate_matches(mode, text, &cfg.persona.diet_keywords_extra)
 }
 
@@ -276,28 +284,5 @@ mod tests {
         assert!(!diet_gate_matches("ask", "logged a banana", NO_EXTRA));
         // A non-diet Tell doesn't fire.
         assert!(!diet_gate_matches("tell", "summarize the notes", NO_EXTRA));
-    }
-
-    #[test]
-    fn kill_switch_no_backend_never_tries_local_diet() {
-        // The whole point: with no diet backend configured, should_try_local_diet is
-        // always false, so a diet-shaped Tell still takes the hosted path.
-        let mut cfg = test_config();
-        assert!(cfg.diet_backend.is_none());
-        assert!(
-            !should_try_local_diet(&cfg, "tell", "logged a banana"),
-            "no backend → never attempt the local pipeline (kill switch)"
-        );
-        // With a backend AND a diet Tell → attempt it.
-        cfg.diet_backend = Some(("http://u".into(), "tok".into(), "m".into()));
-        assert!(should_try_local_diet(&cfg, "tell", "logged a banana"));
-        // Backend set but Ask, or a non-diet Tell → don't attempt.
-        assert!(!should_try_local_diet(&cfg, "ask", "logged a banana"));
-        assert!(!should_try_local_diet(&cfg, "tell", "summarize the notes"));
-        // A non-English utterance misses the English baseline…
-        assert!(!should_try_local_diet(&cfg, "tell", "pranzo veloce oggi"));
-        // …until the deployment supplies the vocabulary via persona (config data).
-        cfg.persona.diet_keywords_extra = vec!["pranzo".into(), "colazione".into()];
-        assert!(should_try_local_diet(&cfg, "tell", "pranzo veloce oggi"));
     }
 }

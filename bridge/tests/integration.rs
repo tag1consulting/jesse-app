@@ -13,6 +13,44 @@ use std::sync::Arc;
 use std::time::Duration;
 use tower::ServiceExt;
 
+/// The ambient routed pick: applies no backend env, which is what every routed job
+/// resolves to when `offload_order` is empty.
+fn ambient_pick() -> RoutedPick {
+    RoutedPick {
+        id: DEFAULT_MODEL_ID.to_string(),
+        harness: CLAUDE_CODE_ID.to_string(),
+        level: Capability::Write,
+        backend: None,
+    }
+}
+
+/// Arm the local vault-QA route the way config does now: `offload_order` naming a
+/// configured, healthy model at `Read` or above. Replaces the `vaultqa_backend` triple.
+fn with_vaultqa_offload(mut cfg: Config) -> Config {
+    let mut models = cfg.model_registry.models.clone();
+    models.push(RegistryModel {
+        id: "local-vaultqa".to_string(),
+        label: "Local vault QA".to_string(),
+        kind: ModelKind::Local,
+        backend: Some((
+            "http://127.0.0.1:9100".into(),
+            "vaultqa-dummy-tok".into(),
+            "local-vaultqa".into(),
+        )),
+        subagent_model: None,
+        configured: true,
+        level: Capability::Read,
+        harness: CLAUDE_CODE_ID.to_string(),
+        price: PriceDeck::ZERO,
+        health: HealthConfig::default(),
+        vision: Vec::new(),
+        vision_complementary: false,
+    });
+    cfg.model_registry = ModelRegistry { models };
+    cfg.offload_order = vec!["local-vaultqa".to_string()];
+    cfg
+}
+
 #[tokio::test]
 async fn health_unauthenticated_is_ok_and_leaks_no_paths() {
     // Liveness only: 200 { "ok": true }, and crucially NONE of the operator
@@ -1297,7 +1335,7 @@ async fn title_oneshot_spawns_a_toolless_child_with_no_mcp_servers() {
         ..test_config()
     };
 
-    let title = run_claude_oneshot(&cfg, "title this", 30)
+    let title = run_claude_oneshot(&cfg, "title this", 30, &ambient_pick())
         .await
         .expect("the title child must still work");
     assert_eq!(title, "A Title");
@@ -1378,7 +1416,7 @@ async fn title_oneshot_times_out_when_claude_stalls() {
     };
 
     let started = std::time::Instant::now();
-    let res = run_claude_oneshot(&cfg, "title this", 1).await;
+    let res = run_claude_oneshot(&cfg, "title this", 1, &ambient_pick()).await;
     let elapsed = started.elapsed();
     let err = res.expect_err("a stalling claude must time out, not succeed");
     assert_eq!(err.0, StatusCode::GATEWAY_TIMEOUT);
@@ -3477,17 +3515,12 @@ async fn vaultqa_local_answer_is_delivered_and_skips_the_hosted_turn() {
         "Your VO2 max is 52 (todo-list/Today.md:2).",
         "HOSTED_SHOULD_NOT_RUN",
     );
-    let cfg = Config {
+    let cfg = with_vaultqa_offload(Config {
         claude_bin: fake.to_string_lossy().into_owned(),
         vault: vault.to_string_lossy().into_owned(),
-        vaultqa_backend: Some((
-            "http://127.0.0.1:9100".into(),
-            "vaultqa-dummy-tok".into(),
-            "local-vaultqa".into(),
-        )),
         timeout_secs: 30,
         ..test_config()
-    };
+    });
     let v = run_vaultqa_turn(cfg, "what is my VO2 max lately").await;
     assert_eq!(v["response"], "Your VO2 max is 52 (todo-list/Today.md:2).");
     assert!(
@@ -3515,17 +3548,12 @@ async fn vaultqa_no_vault_answer_falls_through_to_the_hosted_turn() {
     let vault = make_diet_vault();
     write_vault_file(&vault, "todo-list/Today.md", "# Today\n");
     let fake = write_sniffing_fake("NO_VAULT_ANSWER", "Hosted answered from the session.");
-    let cfg = Config {
+    let cfg = with_vaultqa_offload(Config {
         claude_bin: fake.to_string_lossy().into_owned(),
         vault: vault.to_string_lossy().into_owned(),
-        vaultqa_backend: Some((
-            "http://127.0.0.1:9100".into(),
-            "vaultqa-dummy-tok".into(),
-            "local-vaultqa".into(),
-        )),
         timeout_secs: 30,
         ..test_config()
-    };
+    });
     let v = run_vaultqa_turn(cfg, "what is my VO2 max lately").await;
     assert_eq!(
         v["response"], "Hosted answered from the session.",
@@ -3543,17 +3571,12 @@ async fn vaultqa_uncited_answer_falls_through_to_the_hosted_turn() {
         "Your VO2 max is about 52, from memory.",
         "Hosted answered instead.",
     );
-    let cfg = Config {
+    let cfg = with_vaultqa_offload(Config {
         claude_bin: fake.to_string_lossy().into_owned(),
         vault: vault.to_string_lossy().into_owned(),
-        vaultqa_backend: Some((
-            "http://127.0.0.1:9100".into(),
-            "vaultqa-dummy-tok".into(),
-            "local-vaultqa".into(),
-        )),
         timeout_secs: 30,
         ..test_config()
-    };
+    });
     let v = run_vaultqa_turn(cfg, "what is my VO2 max lately").await;
     assert_eq!(
         v["response"], "Hosted answered instead.",
@@ -3606,18 +3629,13 @@ async fn badge_on_vaultqa_local_answer_names_the_vault_backend() {
         "Your VO2 max is 52 (todo-list/Today.md:2).",
         "HOSTED_SHOULD_NOT_RUN",
     );
-    let cfg = Config {
+    let cfg = with_vaultqa_offload(Config {
         claude_bin: fake.to_string_lossy().into_owned(),
         vault: vault.to_string_lossy().into_owned(),
-        vaultqa_backend: Some((
-            "http://127.0.0.1:9100".into(),
-            "vaultqa-dummy-tok".into(),
-            "local-vaultqa".into(),
-        )),
         model_badge: true,
         timeout_secs: 30,
         ..test_config()
-    };
+    });
     let v = run_vaultqa_turn(cfg, "what is my VO2 max lately").await;
     let resp = v["response"].as_str().unwrap();
     assert!(
@@ -3694,18 +3712,13 @@ async fn context_carry_off_local_turn_is_stateless_today() {
     let vault = make_diet_vault();
     write_vault_file(&vault, "todo-list/Today.md", "# Today\nVO2 max is 52.\n");
     let fake = write_sniffing_fake("Your VO2 max is 52 (todo-list/Today.md:2).", "HOSTED");
-    let cfg = Config {
+    let cfg = with_vaultqa_offload(Config {
         claude_bin: fake.to_string_lossy().into_owned(),
         vault: vault.to_string_lossy().into_owned(),
-        vaultqa_backend: Some((
-            "http://127.0.0.1:9100".into(),
-            "vaultqa-dummy-tok".into(),
-            "local-vaultqa".into(),
-        )),
         context_carry: false,
         timeout_secs: 30,
         ..test_config()
-    };
+    });
     let st = AppState::new(cfg);
     let v = carry_post_and_wait(&st, r#"{"mode":"ask","text":"what is my VO2 max lately"}"#).await;
     assert_eq!(v["response"], "Your VO2 max is 52 (todo-list/Today.md:2).");
@@ -3726,18 +3739,13 @@ async fn context_carry_on_fresh_local_turn_mints_a_synthetic_id() {
     let vault = make_diet_vault();
     write_vault_file(&vault, "todo-list/Today.md", "# Today\nVO2 max is 52.\n");
     let fake = write_sniffing_fake("Your VO2 max is 52 (todo-list/Today.md:2).", "HOSTED");
-    let cfg = Config {
+    let cfg = with_vaultqa_offload(Config {
         claude_bin: fake.to_string_lossy().into_owned(),
         vault: vault.to_string_lossy().into_owned(),
-        vaultqa_backend: Some((
-            "http://127.0.0.1:9100".into(),
-            "vaultqa-dummy-tok".into(),
-            "local-vaultqa".into(),
-        )),
         context_carry: true,
         timeout_secs: 30,
         ..test_config()
-    };
+    });
     let st = AppState::new(cfg);
     let v = carry_post_and_wait(&st, r#"{"mode":"ask","text":"what is my VO2 max lately"}"#).await;
     let sid = v["session_id"]
@@ -3766,19 +3774,14 @@ async fn context_carry_records_pre_badge_reply_so_no_badge_leaks_into_a_block() 
     let vault = make_diet_vault();
     write_vault_file(&vault, "todo-list/Today.md", "# Today\nVO2 max is 52.\n");
     let fake = write_sniffing_fake("Your VO2 max is 52 (todo-list/Today.md:2).", "HOSTED");
-    let cfg = Config {
+    let cfg = with_vaultqa_offload(Config {
         claude_bin: fake.to_string_lossy().into_owned(),
         vault: vault.to_string_lossy().into_owned(),
-        vaultqa_backend: Some((
-            "http://127.0.0.1:9100".into(),
-            "vaultqa-dummy-tok".into(),
-            "local-vaultqa".into(),
-        )),
         context_carry: true,
         model_badge: true,
         timeout_secs: 30,
         ..test_config()
-    };
+    });
     let st = AppState::new(cfg);
     let v = carry_post_and_wait(&st, r#"{"mode":"ask","text":"what is my VO2 max lately"}"#).await;
     // The DELIVERED reply carries the display badge.
@@ -3853,19 +3856,14 @@ async fn context_carry_end_to_end_pins_todays_transcript() {
     let _ = std::fs::remove_file(&argv_file);
     let fake = write_transcript_fake(&count_file, &argv_file);
 
-    let cfg = Config {
+    let cfg = with_vaultqa_offload(Config {
         claude_bin: fake.to_string_lossy().into_owned(),
         vault: vault.to_string_lossy().into_owned(),
-        vaultqa_backend: Some((
-            "http://127.0.0.1:9100".into(),
-            "vaultqa-dummy-tok".into(),
-            "local-oss".into(),
-        )),
         emergency_local: true,
         context_carry: true,
         timeout_secs: 30,
         ..test_config()
-    };
+    });
     let st = AppState::new(cfg);
 
     // Turn 1: emergency-served, fresh thread → synthetic id.

@@ -277,6 +277,7 @@ pub async fn run_claude_oneshot(
     cfg: &Config,
     prompt: &str,
     timeout_secs: u64,
+    pick: &RoutedPick,
 ) -> Result<String, ApiError> {
     let harness = cfg.harnesses.turn_harness();
     // The title path is AMBIENT and untouched by the model switch, so it passes the ambient
@@ -292,18 +293,9 @@ pub async fn run_claude_oneshot(
     // Title-only backend override: point THIS child at the configured
     // base_url/token/model when all three JESSE_TITLE_* vars are set. A no-op
     // otherwise (ambient backend). Main turns never call this.
-    apply_title_env(&mut cmd, cfg);
-    // Provenance trail: one line per title call naming which backend served it
-    // (base URL + model, never the token; no prompt content) so a production
-    // audit can tell whether a title went to the override or the ambient backend.
-    match &cfg.title_backend {
-        Some((base_url, _token, model)) => {
-            eprintln!(
-                "jesse-bridge: title call → override backend base_url={base_url} model={model}"
-            )
-        }
-        None => eprintln!("jesse-bridge: title call → ambient backend (no JESSE_TITLE_* override)"),
-    }
+    // The routing rule's pick for this job. `RoutedPick::log` already named the model and
+    // harness that serves it (no prompt content), so there is no second provenance line.
+    apply_routed_env(&mut cmd, pick);
     run_stateless_oneshot(cfg, harness, cmd, timeout_secs, "title generation").await
 }
 
@@ -319,19 +311,12 @@ pub async fn run_diet_extract(
     cfg: &Config,
     prompt: &str,
     timeout_secs: u64,
+    pick: &RoutedPick,
 ) -> Result<String, ApiError> {
     let harness = cfg.harnesses.turn_harness();
     let ambient = ActiveModel::ambient();
     let mut cmd = harness.build_turn(cfg, &diet_child_request(cfg, prompt, &ambient))?;
-    apply_diet_env(&mut cmd, cfg);
-    match &cfg.diet_backend {
-        Some((base_url, _token, model)) => eprintln!(
-            "jesse-bridge: diet extract → override backend base_url={base_url} model={model}"
-        ),
-        None => {
-            eprintln!("jesse-bridge: diet extract → ambient backend (no JESSE_DIET_* override)")
-        }
-    }
+    apply_routed_env(&mut cmd, pick);
     run_stateless_oneshot(cfg, harness, cmd, timeout_secs, "diet extraction").await
 }
 
@@ -344,11 +329,15 @@ pub async fn run_diet_verify(
     cfg: &Config,
     prompt: &str,
     timeout_secs: u64,
+    pick: &RoutedPick,
 ) -> Result<String, ApiError> {
-    // Deliberately NO apply_diet_env / apply_title_env — the verify child is ambient.
+    // The verifier is whatever the routing rule picked at `Write`, with the extractor
+    // EXCLUDED — see `RoutedJob::DietVerify`. Ambient when nothing else qualifies, which is
+    // exactly the old behavior (the verify child was unconditionally ambient).
     let harness = cfg.harnesses.turn_harness();
     let ambient = ActiveModel::ambient();
-    let cmd = harness.build_turn(cfg, &diet_child_request(cfg, prompt, &ambient))?;
+    let mut cmd = harness.build_turn(cfg, &diet_child_request(cfg, prompt, &ambient))?;
+    apply_routed_env(&mut cmd, pick);
     run_stateless_oneshot(cfg, harness, cmd, timeout_secs, "diet verification").await
 }
 
@@ -361,11 +350,12 @@ pub async fn run_vaultqa_child(
     cfg: &Config,
     prompt: &str,
     timeout_secs: u64,
+    pick: &RoutedPick,
 ) -> Result<String, ApiError> {
     let harness = cfg.harnesses.turn_harness();
     let ambient = ActiveModel::ambient();
     let mut cmd = harness.build_turn(cfg, &vaultqa_child_request(cfg, prompt, &ambient))?;
-    apply_vaultqa_env(&mut cmd, cfg);
+    apply_routed_env(&mut cmd, pick);
     run_stateless_oneshot(cfg, harness, cmd, timeout_secs, "vault-QA lookup").await
 }
 

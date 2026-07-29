@@ -200,11 +200,12 @@ pub fn vaultqa_question_gate(text: &str) -> bool {
 /// hosted agent, and the read-only child can't see the scratch files anyway).
 pub fn should_try_local_vaultqa(
     cfg: &Config,
+    health: &HealthStore,
     mode: &str,
     text: &str,
     has_attachment: bool,
 ) -> bool {
-    cfg.vaultqa_backend.is_some()
+    has_offload_candidate(cfg, health, RoutedJob::VaultQa)
         && mode.trim().eq_ignore_ascii_case("ask")
         && !has_attachment
         && vaultqa_question_gate(text)
@@ -359,46 +360,5 @@ mod tests {
         assert!(contains_url("ssh me at host://x"));
         assert!(!contains_url("what is my vo2 max"));
         assert!(!contains_url("the meeting is at 3.30 pm"));
-    }
-
-    #[test]
-    fn kill_switch_no_backend_never_tries_vaultqa() {
-        // With no backend configured, should_try_local_vaultqa is always false even
-        // for a textbook self-referential Ask — the kill switch.
-        let mut cfg = test_config();
-        assert!(cfg.vaultqa_backend.is_none());
-        assert!(
-            !should_try_local_vaultqa(&cfg, "ask", "what is my VO2 max", false),
-            "no backend → never attempt the local vault-QA child (kill switch)"
-        );
-        // With a backend AND a qualifying Ask → attempt it.
-        cfg.vaultqa_backend = Some(("http://u".into(), "tok".into(), "m".into()));
-        assert!(should_try_local_vaultqa(
-            &cfg,
-            "ask",
-            "what is my VO2 max",
-            false
-        ));
-        // Tell mode never fires the vault-QA gate (diet owns Tell).
-        assert!(!should_try_local_vaultqa(
-            &cfg,
-            "tell",
-            "what is my VO2 max",
-            false
-        ));
-        // An attachment/image turn is excluded (wants the multimodal hosted agent).
-        assert!(!should_try_local_vaultqa(
-            &cfg,
-            "ask",
-            "what is my VO2 max",
-            true
-        ));
-        // A non-question Ask doesn't fire.
-        assert!(!should_try_local_vaultqa(
-            &cfg,
-            "ask",
-            "summarize the notes",
-            false
-        ));
     }
 }

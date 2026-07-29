@@ -243,7 +243,11 @@ pub fn queued_reply_text() -> String {
 /// unparseable → stop the pass). Emits one provenance line per terminal disposition.
 /// Best-effort: any append failure re-queues the entry and stops. A no-op when the
 /// queue is unavailable or empty.
-pub async fn replay_diet_queue(cfg: &Config, queue: &DietQueue) {
+pub async fn replay_diet_queue(cfg: &Config, health: &HealthStore, queue: &DietQueue) {
+    // The replayed entries were extracted during the outage by whichever model served the
+    // extraction then; the verifier is picked fresh now, at `Write`. Nothing is excluded:
+    // the extractor for a queued entry is not recorded, and re-deriving it would be a guess.
+    let verify_pick = route_job(cfg, health, RoutedJob::DietVerify, None, None);
     if !queue.is_available() {
         return;
     }
@@ -257,6 +261,7 @@ pub async fn replay_diet_queue(cfg: &Config, queue: &DietQueue) {
                 cfg.diet_micro_complete,
             ),
             DIET_VERIFY_TIMEOUT_SECS,
+            &verify_pick,
         )
         .await;
         match classify_replay(&item, &verify) {

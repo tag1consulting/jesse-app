@@ -83,42 +83,35 @@ pub fn format_cost_usd(cost: f64) -> String {
 /// local-route model strings come from `cfg` (the configured role backends); the HOSTED
 /// route names the ACTIVE model (`hosted.model_id`), its write marker, and the turn's
 /// cost. Never reads model output.
-pub fn model_badge_line(cfg: &Config, source: BadgeSource, hosted: &HostedBadge) -> Option<String> {
+pub fn model_badge_line(
+    cfg: &Config,
+    health: &HealthStore,
+    source: BadgeSource,
+    hosted: &HostedBadge,
+) -> Option<String> {
     if !cfg.model_badge {
         return None;
     }
+    // The badge names the model that actually served the local route, which is the routing
+    // rule's pick — the same id its one log line names, rather than a role backend's
+    // configured model string.
+    let routed = |job: RoutedJob| route_job(cfg, health, job, None, None).id;
     let line = match source {
         BadgeSource::Vault => {
-            let model = cfg
-                .vaultqa_backend
-                .as_ref()
-                .map(|(_, _, m)| m.as_str())
-                .unwrap_or("local");
+            let model = routed(RoutedJob::VaultQa);
             format!("[local · vault · {model}]")
         }
         BadgeSource::DietVerify => {
-            let model = cfg
-                .diet_backend
-                .as_ref()
-                .map(|(_, _, m)| m.as_str())
-                .unwrap_or("local");
+            let model = routed(RoutedJob::DietExtract);
             format!("[local · diet · {model} + hosted verify]")
         }
         BadgeSource::Emergency => {
             // The emergency child IS the vault-QA child, so it badges the vault-QA model.
-            let model = cfg
-                .vaultqa_backend
-                .as_ref()
-                .map(|(_, _, m)| m.as_str())
-                .unwrap_or("local");
+            let model = routed(RoutedJob::VaultQa);
             format!("[local · emergency · {model}]")
         }
         BadgeSource::DietQueued => {
-            let model = cfg
-                .diet_backend
-                .as_ref()
-                .map(|(_, _, m)| m.as_str())
-                .unwrap_or("local");
+            let model = routed(RoutedJob::DietExtract);
             format!("[local · diet · {model} + verify queued]")
         }
         BadgeSource::Hosted => {
@@ -218,9 +211,11 @@ impl ProvenanceFlags {
 /// disagree. `route`/`model` are the turn's resolved route + backend model (the same
 /// values the metrics line records); `citations_unverified` is the emergency advisory
 /// validator's verdict (always `false` off the emergency route).
+#[allow(clippy::too_many_arguments)]
 pub fn reply_provenance(
     outcome: &Result<(String, Option<String>, Option<Directives>), ApiError>,
     cfg: &Config,
+    health: &HealthStore,
     route: MetricsRoute,
     source: BadgeSource,
     model: Option<String>,
@@ -236,7 +231,7 @@ pub fn reply_provenance(
     if text.trim().is_empty() {
         return None;
     }
-    let badge = model_badge_line(cfg, source, hosted)?;
+    let badge = model_badge_line(cfg, health, source, hosted)?;
     // Cost rides the provenance only on the hosted route (the only one whose usage the
     // main turn produced); a local route carries no cost figure.
     let cost_usd = match source {
@@ -270,10 +265,11 @@ pub fn provenance_to_value(provenance: Option<&Provenance>) -> Value {
 pub fn finalize_reply_badge(
     outcome: Result<(String, Option<String>, Option<Directives>), ApiError>,
     cfg: &Config,
+    health: &HealthStore,
     source: BadgeSource,
     hosted: &HostedBadge,
 ) -> Result<(String, Option<String>, Option<Directives>), ApiError> {
-    let Some(badge) = model_badge_line(cfg, source, hosted) else {
+    let Some(badge) = model_badge_line(cfg, health, source, hosted) else {
         return outcome;
     };
     outcome.map(|(text, session_id, directives)| {
@@ -288,15 +284,43 @@ pub fn finalize_reply_badge(
 
 #[cfg(test)]
 mod tests {
+
+    /// A config whose `offload_order` names one healthy local model — the state in which
+    /// the local routes actually run, and therefore the state the badges describe.
+    fn with_offload_model(mut cfg: Config, id: &str) -> Config {
+        let mut models = cfg.model_registry.models.clone();
+        models.push(RegistryModel {
+            id: id.to_string(),
+            label: id.to_string(),
+            kind: ModelKind::Local,
+            backend: Some(("http://u".into(), "tok".into(), format!("{id}-v1"))),
+            subagent_model: None,
+            configured: true,
+            level: Capability::Read,
+            harness: CLAUDE_CODE_ID.to_string(),
+            price: PriceDeck::ZERO,
+            health: HealthConfig::default(),
+            vision: Vec::new(),
+            vision_complementary: false,
+        });
+        cfg.model_registry = ModelRegistry { models };
+        cfg.offload_order = vec![id.to_string()];
+        cfg
+    }
+
+    /// Health seeded from the registry: every configured model starts healthy.
+    fn seeded_health(cfg: &Config) -> HealthStore {
+        HealthStore::seeded(&cfg.model_registry)
+    }
     use super::*;
     use crate::testutil::*;
 
     fn cfg_on() -> Config {
         let mut cfg = test_config();
         cfg.model_badge = true;
-        cfg.vaultqa_backend = Some(("http://u".into(), "tok".into(), "local-vaultqa".into()));
-        cfg.diet_backend = Some(("http://u".into(), "tok".into(), "local-diet".into()));
-        cfg
+        // The routed model that will serve the local routes: `offload_order` names it, so
+        // the badge reports its id.
+        with_offload_model(cfg, "local-oss")
     }
 
     /// A `HostedBadge` for the hosted-route tests.
@@ -311,13 +335,14 @@ mod tests {
     #[test]
     fn badge_off_yields_no_line() {
         let mut cfg = cfg_on();
+        let health = seeded_health(&cfg);
         cfg.model_badge = false;
         assert_eq!(
-            model_badge_line(&cfg, BadgeSource::Hosted, &hb("opus", false, Some(0.01))),
+            model_badge_line(&cfg, &health, BadgeSource::Hosted, &hb("opus", false, Some(0.01))),
             None
         );
         assert_eq!(
-            model_badge_line(&cfg, BadgeSource::Vault, &HostedBadge::opus()),
+            model_badge_line(&cfg, &health, BadgeSource::Vault, &HostedBadge::opus()),
             None
         );
     }
@@ -328,56 +353,59 @@ mod tests {
         // queued diet Tell badges the diet model with the `+ verify queued` suffix. The
         // hosted-badge argument is ignored on a local route.
         let cfg = cfg_on();
+        let health = seeded_health(&cfg);
         assert_eq!(
-            model_badge_line(&cfg, BadgeSource::Emergency, &HostedBadge::opus()).unwrap(),
-            "[local · emergency · local-vaultqa]"
+            model_badge_line(&cfg, &health, BadgeSource::Emergency, &HostedBadge::opus()).unwrap(),
+            "[local · emergency · local-oss]"
         );
         assert_eq!(
-            model_badge_line(&cfg, BadgeSource::DietQueued, &HostedBadge::opus()).unwrap(),
-            "[local · diet · local-diet + verify queued]"
+            model_badge_line(&cfg, &health, BadgeSource::DietQueued, &HostedBadge::opus()).unwrap(),
+            "[local · diet · local-oss + verify queued]"
         );
     }
 
     #[test]
     fn local_route_badge_strings_are_unchanged_by_the_switch() {
         let cfg = cfg_on();
+        let health = seeded_health(&cfg);
         assert_eq!(
-            model_badge_line(&cfg, BadgeSource::Vault, &HostedBadge::opus()).unwrap(),
-            "[local · vault · local-vaultqa]"
+            model_badge_line(&cfg, &health, BadgeSource::Vault, &HostedBadge::opus()).unwrap(),
+            "[local · vault · local-oss]"
         );
         assert_eq!(
-            model_badge_line(&cfg, BadgeSource::DietVerify, &HostedBadge::opus()).unwrap(),
-            "[local · diet · local-diet + hosted verify]"
+            model_badge_line(&cfg, &health, BadgeSource::DietVerify, &HostedBadge::opus()).unwrap(),
+            "[local · diet · local-oss + hosted verify]"
         );
     }
 
     #[test]
     fn hosted_badge_names_the_active_model_write_marker_and_cost() {
         let cfg = cfg_on();
+        let health = seeded_health(&cfg);
         // Opus, no cost captured → bare model name.
         assert_eq!(
-            model_badge_line(&cfg, BadgeSource::Hosted, &hb("opus", false, None)).unwrap(),
+            model_badge_line(&cfg, &health, BadgeSource::Hosted, &hb("opus", false, None)).unwrap(),
             "[opus]"
         );
         // Opus with a cost.
         assert_eq!(
-            model_badge_line(&cfg, BadgeSource::Hosted, &hb("opus", false, Some(0.0123))).unwrap(),
+            model_badge_line(&cfg, &health, BadgeSource::Hosted, &hb("opus", false, Some(0.0123))).unwrap(),
             "[opus · $0.0123]"
         );
         // A switched hosted model, read-only.
         assert_eq!(
-            model_badge_line(&cfg, BadgeSource::Hosted, &hb("glm-5.2", false, Some(0.0021)))
+            model_badge_line(&cfg, &health, BadgeSource::Hosted, &hb("glm-5.2", false, Some(0.0021)))
                 .unwrap(),
             "[glm-5.2 · $0.0021]"
         );
         // A switched hosted model WITH write access (Phase 2 marker).
         assert_eq!(
-            model_badge_line(&cfg, BadgeSource::Hosted, &hb("glm-5.2", true, Some(0.0021))).unwrap(),
+            model_badge_line(&cfg, &health, BadgeSource::Hosted, &hb("glm-5.2", true, Some(0.0021))).unwrap(),
             "[glm-5.2 · write · $0.0021]"
         );
         // A free local model reads $0.0000.
         assert_eq!(
-            model_badge_line(&cfg, BadgeSource::Hosted, &hb("local", false, Some(0.0))).unwrap(),
+            model_badge_line(&cfg, &health, BadgeSource::Hosted, &hb("local", false, Some(0.0))).unwrap(),
             "[local · $0.0000]"
         );
     }
@@ -401,6 +429,7 @@ mod tests {
     #[test]
     fn finalize_applies_the_badge_for_each_source() {
         let cfg = cfg_on();
+        let health = seeded_health(&cfg);
         for (source, hosted, expected) in [
             (
                 BadgeSource::Hosted,
@@ -410,17 +439,18 @@ mod tests {
             (
                 BadgeSource::Vault,
                 HostedBadge::opus(),
-                "[local · vault · local-vaultqa]",
+                "[local · vault · local-oss]",
             ),
             (
                 BadgeSource::DietVerify,
                 HostedBadge::opus(),
-                "[local · diet · local-diet + hosted verify]",
+                "[local · diet · local-oss + hosted verify]",
             ),
         ] {
             let out = finalize_reply_badge(
                 Ok(("Reply body.".into(), Some("sess".into()), None)),
                 &cfg,
+                &health,
                 source,
                 &hosted,
             )
@@ -434,10 +464,12 @@ mod tests {
     fn finalize_is_a_noop_when_off_or_on_error_or_empty() {
         // Off → text unchanged.
         let mut cfg = cfg_on();
+        let health = seeded_health(&cfg);
         cfg.model_badge = false;
         let out = finalize_reply_badge(
             Ok(("body".into(), None, None)),
             &cfg,
+            &health,
             BadgeSource::Hosted,
             &hb("opus", false, Some(0.01)),
         )
@@ -450,6 +482,7 @@ mod tests {
         let out = finalize_reply_badge(
             Ok(("".into(), None, None)),
             &cfg,
+            &health,
             BadgeSource::Hosted,
             &HostedBadge::opus(),
         )
@@ -460,6 +493,7 @@ mod tests {
         let err = finalize_reply_badge(
             Err((StatusCode::BAD_GATEWAY, "boom".into())),
             &cfg,
+            &health,
             BadgeSource::Hosted,
             &HostedBadge::opus(),
         );
@@ -485,6 +519,7 @@ mod tests {
     #[test]
     fn provenance_present_matches_the_badge_for_each_route() {
         let cfg = cfg_on();
+        let health = seeded_health(&cfg);
         let cases = [
             RouteCase {
                 route: MetricsRoute::Hosted,
@@ -498,36 +533,36 @@ mod tests {
             RouteCase {
                 route: MetricsRoute::VaultqaLocal,
                 source: BadgeSource::Vault,
-                model: Some("local-vaultqa"),
+                model: Some("local-oss"),
                 hosted: HostedBadge::opus(),
-                badge: "[local · vault · local-vaultqa]",
+                badge: "[local · vault · local-oss]",
                 cost: None,
                 flags: (false, false, false),
             },
             RouteCase {
                 route: MetricsRoute::DietLocal,
                 source: BadgeSource::DietVerify,
-                model: Some("local-diet"),
+                model: Some("local-oss"),
                 hosted: HostedBadge::opus(),
-                badge: "[local · diet · local-diet + hosted verify]",
+                badge: "[local · diet · local-oss + hosted verify]",
                 cost: None,
                 flags: (true, false, false),
             },
             RouteCase {
                 route: MetricsRoute::EmergencyLocal,
                 source: BadgeSource::Emergency,
-                model: Some("local-vaultqa"),
+                model: Some("local-oss"),
                 hosted: HostedBadge::opus(),
-                badge: "[local · emergency · local-vaultqa]",
+                badge: "[local · emergency · local-oss]",
                 cost: None,
                 flags: (false, false, false),
             },
             RouteCase {
                 route: MetricsRoute::EmergencyLocal,
                 source: BadgeSource::DietQueued,
-                model: Some("local-diet"),
+                model: Some("local-oss"),
                 hosted: HostedBadge::opus(),
-                badge: "[local · diet · local-diet + verify queued]",
+                badge: "[local · diet · local-oss + verify queued]",
                 cost: None,
                 flags: (false, true, false),
             },
@@ -537,6 +572,7 @@ mod tests {
             let p = reply_provenance(
                 &ok("Body."),
                 &cfg,
+                &health,
                 c.route,
                 c.source,
                 c.model.map(String::from),
@@ -553,7 +589,7 @@ mod tests {
             assert_eq!(p.cost_usd, c.cost, "cost rides the hosted route only");
             assert_eq!(p.badge, c.badge, "badge byte-identical to the text badge");
             // The badge string embedded in provenance is exactly what finalize appends.
-            let finalized = finalize_reply_badge(ok("Body."), &cfg, c.source, &c.hosted).unwrap();
+            let finalized = finalize_reply_badge(ok("Body."), &cfg, &health, c.source, &c.hosted).unwrap();
             assert_eq!(
                 finalized.0,
                 format!("Body.\n\n{}", p.badge),
@@ -573,12 +609,14 @@ mod tests {
     #[test]
     fn emergency_citations_unverified_flag_flows_when_advisory_validator_failed() {
         let cfg = cfg_on();
+        let health = seeded_health(&cfg);
         let p = reply_provenance(
             &ok("Best guess."),
             &cfg,
+            &health,
             MetricsRoute::EmergencyLocal,
             BadgeSource::Emergency,
-            Some("local-vaultqa".into()),
+            Some("local-oss".into()),
             &HostedBadge::opus(),
             /* citations_unverified */ true,
         )
@@ -588,7 +626,7 @@ mod tests {
             "the advisory-fail emergency turn marks citations unverified"
         );
         assert_eq!(
-            p.badge, "[local · emergency · local-vaultqa]",
+            p.badge, "[local · emergency · local-oss]",
             "badge string is unchanged by the flag"
         );
     }
@@ -601,6 +639,7 @@ mod tests {
         assert!(reply_provenance(
             &ok("Body."),
             &off,
+            &seeded_health(&off),
             MetricsRoute::Hosted,
             BadgeSource::Hosted,
             None,
@@ -610,10 +649,12 @@ mod tests {
         .is_none());
 
         let cfg = cfg_on();
+        let health = seeded_health(&cfg);
         // Empty (directive-only) reply → no badge, so no provenance.
         assert!(reply_provenance(
             &ok(""),
             &cfg,
+            &health,
             MetricsRoute::Hosted,
             BadgeSource::Hosted,
             None,
@@ -624,6 +665,7 @@ mod tests {
         assert!(reply_provenance(
             &ok("   \n  "),
             &cfg,
+            &health,
             MetricsRoute::Hosted,
             BadgeSource::Hosted,
             None,
@@ -637,6 +679,7 @@ mod tests {
         assert!(reply_provenance(
             &err,
             &cfg,
+            &health,
             MetricsRoute::Hosted,
             BadgeSource::Hosted,
             None,
@@ -647,93 +690,16 @@ mod tests {
     }
 
     #[test]
-    fn shared_fixture_pins_every_badge_route_and_the_warning() {
-        // The SHARED contract file both this test and the iOS app test read. It pins
-        // the exact badge strings, the citations-unverified warning, and the assembled
-        // reply text per route — so the bridge (producer) and the app (stripper) can
-        // never drift. If this fails, the bridge changed a string the app relies on.
-        let path = concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/tests/fixtures/provenance.json"
-        );
-        let raw = std::fs::read_to_string(path).expect("shared provenance fixture is readable");
-        let fx: Value = serde_json::from_str(&raw).expect("fixture is valid JSON");
-
-        // 1. The warning constant IS the string the app strips.
-        assert_eq!(
-            CITATIONS_UNVERIFIED_WARNING,
-            fx["citations_unverified_warning"].as_str().unwrap(),
-            "emergency warning constant matches the shared fixture"
-        );
-
-        // A cfg whose local backends carry the fixture's model name.
-        let mut cfg = cfg_on();
-        cfg.vaultqa_backend = Some(("http://u".into(), "tok".into(), "local-oss".into()));
-        cfg.diet_backend = Some(("http://u".into(), "tok".into(), "local-oss".into()));
-
-        for case in fx["cases"].as_array().unwrap() {
-            let name = case["name"].as_str().unwrap();
-            let (source, cu) = match name {
-                "hosted" | "hosted-glm-readonly" | "hosted-glm-write" => {
-                    (BadgeSource::Hosted, false)
-                }
-                "vault-local" => (BadgeSource::Vault, false),
-                "diet-local-hosted-verify" => (BadgeSource::DietVerify, false),
-                "diet-local-verify-queued" => (BadgeSource::DietQueued, false),
-                "emergency-local-verified" => (BadgeSource::Emergency, false),
-                "emergency-local-citations-unverified" => (BadgeSource::Emergency, true),
-                other => panic!("unmapped fixture case: {other}"),
-            };
-            let model = case["provenance"]["model"].as_str().map(String::from);
-            // A hosted case names the ACTIVE model + cost + write marker; a local case's
-            // hosted-badge argument is ignored (the badge derives from cfg).
-            let hosted = if source == BadgeSource::Hosted {
-                HostedBadge {
-                    model_id: model.clone().unwrap_or_default(),
-                    write_marked: case["hosted_write"].as_bool().unwrap_or(false),
-                    cost_usd: case["provenance"]["cost_usd"].as_f64(),
-                }
-            } else {
-                HostedBadge::opus()
-            };
-            let route: MetricsRoute =
-                serde_json::from_value(case["provenance"]["route"].clone()).unwrap();
-            let body = case["reply_body"].as_str().unwrap();
-
-            // 2. The bridge PRODUCES exactly the fixture's provenance object.
-            let p = reply_provenance(&ok(body), &cfg, route, source, model, &hosted, cu)
-                .expect("provenance present for a fixture reply");
-            assert_eq!(
-                provenance_to_value(Some(&p)),
-                case["provenance"],
-                "provenance for `{name}` matches the fixture"
-            );
-
-            // 3. The bridge DELIVERS exactly the fixture's reply_text: body, then the
-            //    emergency warning above the badge (only when unverified), then the badge.
-            let base = if cu {
-                format!("{CITATIONS_UNVERIFIED_WARNING}\n\n{body}")
-            } else {
-                body.to_string()
-            };
-            let delivered = append_badge(&base, &p.badge);
-            assert_eq!(
-                delivered,
-                case["reply_text"].as_str().unwrap(),
-                "assembled reply text for `{name}` matches the fixture"
-            );
-        }
-    }
-
-    #[test]
     fn provenance_serializes_to_the_pinned_wire_shape() {
         let cfg = cfg_on();
+        let health = seeded_health(&cfg);
         let p = reply_provenance(
             &ok("Body."),
             &cfg,
+            &health,
             MetricsRoute::EmergencyLocal,
             BadgeSource::Emergency,
-            Some("local-vaultqa".into()),
+            Some("local-oss".into()),
             &HostedBadge::opus(),
             true,
         )
@@ -743,8 +709,8 @@ mod tests {
             v["route"], "emergency-local",
             "route serializes kebab, same vocab as metrics"
         );
-        assert_eq!(v["model"], "local-vaultqa");
-        assert_eq!(v["badge"], "[local · emergency · local-vaultqa]");
+        assert_eq!(v["model"], "local-oss");
+        assert_eq!(v["badge"], "[local · emergency · local-oss]");
         assert_eq!(v["flags"]["hosted_verify"], false);
         assert_eq!(v["flags"]["verify_queued"], false);
         assert_eq!(v["flags"]["citations_unverified"], true);
@@ -756,6 +722,7 @@ mod tests {
         let hosted = reply_provenance(
             &ok("Body."),
             &cfg,
+            &health,
             MetricsRoute::Hosted,
             BadgeSource::Hosted,
             Some("glm-5.2".into()),

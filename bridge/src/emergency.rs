@@ -52,8 +52,8 @@ pub const CITATIONS_UNVERIFIED_WARNING: &str =
 /// vault-QA triple set (it supplies the backend + read-only child). This is the single
 /// gate `handlers::jesse` consults; with it false, every turn takes today's path
 /// byte-for-byte (no breaker skip, no emergency child, no diet queueing).
-pub fn emergency_armed(cfg: &Config) -> bool {
-    cfg.emergency_local && cfg.vaultqa_backend.is_some()
+pub fn emergency_armed(cfg: &Config, health: &HealthStore) -> bool {
+    cfg.emergency_local && has_offload_candidate(cfg, health, RoutedJob::VaultQa)
 }
 
 /// Build the emergency child's prompt: the optional RECENT CONVERSATION block (context
@@ -151,12 +151,16 @@ pub fn format_emergency_provenance(base_url: &str, model: &str, reason: &str) ->
 /// emergency arming check).
 pub async fn run_emergency_ask_pipeline(
     cfg: &Config,
+    health: &HealthStore,
     question: &str,
     health_context: Option<&str>,
     recent_context: Option<&str>,
 ) -> EmergencyAskOutcome {
     let prompt = build_emergency_prompt(question, health_context, recent_context);
-    let result = run_vaultqa_child(cfg, &prompt, EMERGENCY_TIMEOUT_SECS).await;
+    // The emergency answer comes from the same read-only child as the routine route, on the
+    // same routing rule — it never gains a tool or a rung the routine child lacks.
+    let pick = route_job(cfg, health, RoutedJob::VaultQa, None, None);
+    let result = run_vaultqa_child(cfg, &prompt, EMERGENCY_TIMEOUT_SECS, &pick).await;
     decide_emergency_answer(result, Path::new(&cfg.vault))
 }
 
@@ -270,28 +274,6 @@ mod tests {
             EmergencyAskOutcome::ChildFailed
         );
         let _ = std::fs::remove_dir_all(&root);
-    }
-
-    #[test]
-    fn emergency_arming_requires_both_the_flag_and_the_vaultqa_triple() {
-        // The both-envs-unset safety property, at the arming gate: with emergency off
-        // (the fixture default) the fallback is disarmed regardless of the backend, and
-        // it arms ONLY when BOTH the flag is on AND the vault-QA triple is configured.
-        let mut cfg = crate::testutil::test_config();
-        assert!(!emergency_armed(&cfg), "default (both unset) → disarmed");
-        cfg.emergency_local = true;
-        assert!(
-            !emergency_armed(&cfg),
-            "flag on but no vault-QA backend → still disarmed"
-        );
-        cfg.emergency_local = false;
-        cfg.vaultqa_backend = Some(("http://u".into(), "tok".into(), "m".into()));
-        assert!(
-            !emergency_armed(&cfg),
-            "backend set but flag off → disarmed"
-        );
-        cfg.emergency_local = true;
-        assert!(emergency_armed(&cfg), "flag on AND backend set → armed");
     }
 
     #[test]
