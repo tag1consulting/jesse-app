@@ -77,6 +77,8 @@ pub fn test_config() -> Config {
         // byte-for-byte today's turn unless a test builds its own registry.
         model_registry: ModelRegistry::opus_only(),
         vision: VisionConfig::default(),
+        // The shipped harness registry: `claude-code` only, exactly as `from_env` builds it.
+        harnesses: Arc::new(HarnessRegistry::claude_code_only()),
     }
 }
 pub fn test_state() -> AppState {

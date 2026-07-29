@@ -158,9 +158,12 @@ impl AppState {
     /// state dir configured the whole registry is in-memory so the migration is a no-op
     /// against empty stores.
     fn bootstrap_conversations(&self) {
-        let dir = self.sessions_dir();
         let now_ms = system_time_to_ms(SystemTime::now());
-        let adopted = refresh_conversations(&dir, &self.conversations, now_ms);
+        let adopted: Vec<String> = self
+            .transcript_dirs()
+            .iter()
+            .flat_map(|dir| refresh_conversations(dir, &self.conversations, now_ms))
+            .collect();
         if !adopted.is_empty() {
             eprintln!(
                 "jesse-bridge: adopted {} existing transcript(s) into conversations",
@@ -267,12 +270,15 @@ impl AppState {
         }
     }
 
-    /// The `~/.claude/projects/<escaped-vault>` directory this bridge's vault
-    /// sessions live in. Uses the HOME captured once in `Config` (see `cfg.home`);
-    /// an unknown HOME yields a path that simply won't exist (→ empty session
-    /// list), never an error.
-    pub fn sessions_dir(&self) -> PathBuf {
-        vault_sessions_dir(&self.cfg.home, &self.cfg.vault)
+    /// Every transcript directory this bridge's registered harnesses own — the whole disk
+    /// surface the conversation store reads (adoption, the GC sweep, the list's mtime and
+    /// snippet lookups, hydration, delete). For the shipped `claude-code`-only registry
+    /// that is exactly one entry, `~/.claude/projects/<escaped-vault>`, built from the HOME
+    /// captured once in `Config`; an unknown HOME yields a path that simply won't exist (→
+    /// an empty conversation list), never an error. A harness that keeps no transcripts
+    /// contributes nothing, so an empty result is legitimate rather than a fault.
+    pub fn transcript_dirs(&self) -> Vec<PathBuf> {
+        self.cfg.harnesses.transcript_dirs(&self.cfg)
     }
 }
 

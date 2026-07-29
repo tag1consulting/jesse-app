@@ -12,7 +12,7 @@
 //! Security model: bind to loopback or the Tailscale/CGNAT interface only. The
 //! tailnet is WireGuard-encrypted and ACL-gated; the bearer token is a second
 //! factor. The headless agent runs under an explicit tool allowlist (see
-//! `build_claude_args`); that allowlist is the only in-process boundary — real
+//! [`harness`]); that allowlist is the only in-process boundary — real
 //! isolation (dedicated low-privilege user, OS sandbox) is a deployment concern
 //! documented in SECURITY.md.
 //!
@@ -22,8 +22,10 @@
 //! [`config`] (env-driven config), [`prompt`] (Ask/Tell wrappers + `build_prompt`),
 //! [`auth`] (constant-time bearer check), [`bind`] (bind safety), [`ratelimit`]
 //! (token bucket), [`jobstore`] (the turn-survives-disconnect job store, with the
-//! live-stream state isolated in [`jobstore::streams`]), [`claude`] (spawn + parse
-//! the `stream-json` turn), [`attachments`] (decode/sniff/scratch), [`apns`] (the
+//! live-stream state isolated in [`jobstore::streams`]), [`harness`] (the agent
+//! program behind a trait, with Claude Code as the one implementation) and
+//! [`claude`] (the harness-independent driver that spawns it, reads its output
+//! line by line and resolves the turn), [`attachments`] (decode/sniff/scratch), [`apns`] (the
 //! optional push path), [`state`] (shared `AppState`), [`handlers`]/[`sse`] (the
 //! Axum routes), and [`startup`] (pairing QR + binary/bind checks).
 
@@ -82,6 +84,7 @@ mod breaker;
 mod citations;
 mod claude;
 mod config;
+mod containment;
 mod context;
 mod conversations;
 mod deletionstore;
@@ -94,6 +97,7 @@ mod emergency;
 mod failclass;
 mod flagstore;
 mod handlers;
+mod harness;
 mod health;
 mod jobstore;
 mod mealqueue;
@@ -127,6 +131,7 @@ pub use breaker::*;
 pub use citations::*;
 pub use claude::*;
 pub use config::*;
+pub use containment::*;
 pub use context::*;
 pub use conversations::*;
 pub use deletionstore::*;
@@ -139,6 +144,7 @@ pub use emergency::*;
 pub use failclass::*;
 pub use flagstore::*;
 pub use handlers::*;
+pub use harness::*;
 pub use health::*;
 pub use jobstore::*;
 pub use mealqueue::*;

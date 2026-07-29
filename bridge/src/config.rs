@@ -358,6 +358,13 @@ pub struct Config {
     // Entirely inert unless a text model is paired with a helper and a turn carries an
     // attachment; every non-vision path ignores it.
     pub vision: VisionConfig,
+    // The agent programs the bridge knows how to spawn, built ONCE at startup and read-only
+    // afterwards — the same lifecycle as `model_registry`, and for the same reason (a
+    // registry of implementations, not a setting). Exactly one is registered today,
+    // `claude-code`, and no env or wire field selects another. It lives here rather than in
+    // `AppState` so every path that already carries a `&Config` — the turn driver, the
+    // resume check, the GC sweep — can ask which harness serves it without a new argument.
+    pub harnesses: Arc<HarnessRegistry>,
 }
 
 impl Config {
@@ -1647,6 +1654,9 @@ impl Config {
             model_registry: ModelRegistry::from_env(&home),
             // Vision-layer knobs; bounded so a bad env value can't degrade the pipeline.
             vision: resolve_vision_config(),
+            // The harness registry: exactly one implementation, `claude-code`. No env
+            // configures this — a second harness is a new file, not a setting.
+            harnesses: Arc::new(HarnessRegistry::claude_code_only()),
         }
     }
 }

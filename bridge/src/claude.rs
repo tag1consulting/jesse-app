@@ -1,7 +1,23 @@
 use crate::*;
 
-/// What one `claude -p --output-format json` run amounts to — decided from its
-/// output rather than its exit status alone (see `interpret_claude_output`).
+// ---- What a turn amounts to, and how to drive one ---------------------------
+//
+// This module is the HARNESS-INDEPENDENT half: the outcome vocabulary every harness
+// reports in, and the drivers that spawn a child, read its stdout line by line, stop at the
+// terminal result, reap it under a bound, resolve the outcome, and retry a transient
+// failure. Everything specific to the `claude` CLI — argv, containment flags, per-role env,
+// `stream-json` line parsing — lives in [`crate::harness::claude_code`], behind the
+// [`Harness`] trait.
+//
+// There are exactly TWO copies of the spawn/read/reap loop here (the retrying turn driver
+// and the no-retry one-shot runner), and there must never be a third: between them they
+// encode the hang when a grandchild MCP server holds the stdout pipe open, the fallback
+// when a success envelope carries an empty `result`, and the byte- (not char-) based
+// truncation cap. Every one of those was real debugging. A new call site takes a
+// `&dyn Harness` and calls one of these.
+
+/// What one agent run amounts to — decided from its output rather than its exit status
+/// alone (see [`interpret_claude_output`]).
 #[derive(Debug)]
 pub enum ClaudeOutcome {
     Ok {
@@ -44,66 +60,8 @@ pub fn truncate_bytes_on_char_boundary(s: &str, max_bytes: usize) -> &str {
     &s[..end]
 }
 
-/// Classify a parsed terminal `result` object into the bridge's Ok/Retryable/
-/// Fatal outcome — the single place that decides what a finished `claude` turn
-/// amounts to. Shared by `interpret_claude_output` (whole-buffer `json` mode)
-/// and `parse_stream_line` (the terminal `result` line of `stream-json` mode),
-/// so both modes classify identically. `raw` is the original text to fall back
-/// to as the answer when a success envelope somehow lacks a `result` field
-/// (only meaningful for the buffered path; `None` in streaming).
-pub fn classify_result_value(v: &Value, raw: Option<&str>) -> ClaudeOutcome {
-    let is_error = v.get("is_error").and_then(|e| e.as_bool()).unwrap_or(false);
-    if is_error {
-        let status = v.get("api_error_status").and_then(|s| s.as_u64());
-        // `result` holds the human-readable cause; synthesize one if absent.
-        let message = v
-            .get("result")
-            .and_then(|r| r.as_str())
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
-            .unwrap_or_else(|| match status {
-                Some(code) => format!("claude API error (status {code})"),
-                None => "claude reported an error with no detail".to_string(),
-            });
-        return match status {
-            // 5xx and 429 are transient upstream conditions (529 is >= 500).
-            Some(code) if code >= 500 || code == 429 => ClaudeOutcome::Retryable {
-                message,
-                status: code,
-            },
-            _ => ClaudeOutcome::Fatal { message },
-        };
-    }
-    // Success envelope — same extraction the bridge has always done.
-    let result = v
-        .get("result")
-        .and_then(|r| r.as_str())
-        .or(raw)
-        .unwrap_or("")
-        .trim()
-        .to_string();
-    let session_id = v
-        .get("session_id")
-        .and_then(|s| s.as_str())
-        .map(|s| s.to_string());
-    // The terminal `result` line carries a `usage` object on a successful turn; parse it
-    // for the per-turn cost badge. A missing/oddly-shaped object → empty usage (cost $0),
-    // never an error — the answer is authoritative regardless of whether usage parsed.
-    let usage = v
-        .get("usage")
-        .and_then(|u| serde_json::from_value::<ShadowUsage>(u.clone()).ok())
-        .unwrap_or_default();
-    ClaudeOutcome::Ok {
-        result,
-        session_id,
-        usage,
-    }
-}
-
-/// One line of `claude --output-format stream-json` decoded into what the bridge
-/// cares about. The stream is NDJSON (one JSON object per line); most lines we
-/// ignore. A pure mapping (no I/O) so it's unit-testable against captured
-/// fixtures. See `bridge/README.md` for the verified event schema.
+/// One line of a harness's output, decoded into what the bridge cares about. Produced by
+/// that harness's [`TurnParser`]; most lines are `Ignore`d.
 #[derive(Debug)]
 pub enum StreamEvent {
     /// A chunk of the visible answer (a `text_delta` inside a `text` block).
@@ -118,88 +76,15 @@ pub enum StreamEvent {
     Ignore,
 }
 
-/// Map a single NDJSON line from `stream-json` to a `StreamEvent`. Non-JSON or
-/// unrecognized lines are `Ignore`d (the terminal classification still comes
-/// from the `result` line, or from the no-result fallback if it never arrives).
-pub fn parse_stream_line(line: &str) -> StreamEvent {
-    let line = line.trim();
-    if line.is_empty() {
-        return StreamEvent::Ignore;
-    }
-    let Ok(v) = serde_json::from_str::<Value>(line) else {
-        return StreamEvent::Ignore;
-    };
-    match v.get("type").and_then(|t| t.as_str()) {
-        // The one terminal line — feeds the existing Ok/Retryable/Fatal logic.
-        Some("result") => StreamEvent::Done(classify_result_value(&v, None)),
-        // Token-level events (emitted under --include-partial-messages). The
-        // visible answer streams as `text_delta`s inside a `text` content block;
-        // tool use announces itself with a `tool_use` content-block start.
-        Some("stream_event") => {
-            let event = v.get("event");
-            match event.and_then(|e| e.get("type")).and_then(|t| t.as_str()) {
-                Some("content_block_delta") => {
-                    let delta = event.and_then(|e| e.get("delta"));
-                    let is_text = delta.and_then(|d| d.get("type")).and_then(|t| t.as_str())
-                        == Some("text_delta");
-                    match delta.and_then(|d| d.get("text")).and_then(|t| t.as_str()) {
-                        Some(text) if is_text => StreamEvent::TextDelta(text.to_string()),
-                        _ => StreamEvent::Ignore, // thinking/signature/input deltas
-                    }
-                }
-                Some("content_block_start") => {
-                    let block = event.and_then(|e| e.get("content_block"));
-                    let is_tool = block.and_then(|b| b.get("type")).and_then(|t| t.as_str())
-                        == Some("tool_use");
-                    match block.and_then(|b| b.get("name")).and_then(|n| n.as_str()) {
-                        Some(name) if is_tool => StreamEvent::ToolActivity {
-                            name: name.to_string(),
-                        },
-                        _ => StreamEvent::Ignore,
-                    }
-                }
-                _ => StreamEvent::Ignore,
-            }
-        }
-        _ => StreamEvent::Ignore,
-    }
-}
-
-/// Interpret one `claude -p --output-format json` run. `claude` can exit
-/// non-zero while still writing a JSON envelope whose `is_error` /
-/// `api_error_status` carry the real cause (e.g. a transient upstream 500), so
-/// parse stdout regardless of exit status and key off that — falling back to
-/// exit status + stderr only when stdout isn't JSON.
-pub fn interpret_claude_output(stdout: &str, stderr: &str, exit_success: bool) -> ClaudeOutcome {
-    if let Ok(v) = serde_json::from_str::<Value>(stdout) {
-        // The parsed envelope is the `result` object; classify it the one way,
-        // shared with the streaming parser's terminal `result` line.
-        return classify_result_value(&v, Some(stdout));
-    }
-
-    // stdout wasn't JSON. On a clean exit, treat it as the raw answer (the
-    // bridge's long-standing fallback). On a failure, surface stderr AND stdout
-    // so a non-JSON failure is never reported blank again.
-    if exit_success {
-        ClaudeOutcome::Ok {
-            result: stdout.trim().to_string(),
-            session_id: None,
-            usage: ShadowUsage::default(),
-        }
-    } else {
-        let err = truncate_chars(stderr.trim(), 500);
-        let out = truncate_chars(stdout.trim(), 500);
-        ClaudeOutcome::Fatal {
-            message: format!("claude failed (no JSON envelope) — stderr: {err} | stdout: {out}"),
-        }
-    }
-}
-
 /// Decide the final outcome of a *streamed* turn from its terminal `result` line
 /// (if one arrived) and the text already accumulated from the stream. The whole
 /// point: a turn that produced a visible answer must never be delivered as an
 /// empty bubble or discarded — the streamed text is the safety net under a
 /// success envelope whose `result` field is empty/missing.
+///
+/// `streamed` is empty for a harness whose [`Harness::streams_text`] is false: a
+/// whole-answer harness has no live text to fall back to, so its terminal outcome has to be
+/// complete on its own and must not be given a phantom safety net.
 ///
 /// Captured `stream-json` shapes this handles (see `bridge/README.md`):
 ///   * `Ok` with real `result` text → that authoritative answer (the normal case;
@@ -254,6 +139,8 @@ pub fn resolve_stream_outcome(
         // deliver it; otherwise this is a real failure — surface it via stderr.
         None => {
             if streamed.is_empty() {
+                // The no-envelope failure message is the CLI-shaped one the operator has
+                // always seen, stderr and all; that is why this reaches into the harness.
                 interpret_claude_output("", stderr, false)
             } else {
                 ClaudeOutcome::Ok {
@@ -266,461 +153,18 @@ pub fn resolve_stream_outcome(
     }
 }
 
-/// The MCP server set for a MAIN turn, used when `JESSE_MAIN_MCP_CONFIG` is unset:
-/// exactly the **qmd** vault-search server and nothing else. Passed as `--mcp-config`
-/// alongside `--strict-mcp-config`, so the account-level cloud connectors (Gmail,
-/// Slack, Google Calendar, Google Drive) and `playwright` are never LOADED on a phone
-/// turn rather than merely refused at the permission layer.
-///
-/// `"command": "qmd"` is resolved from the child's `PATH`, mirroring how `claude_bin`
-/// defaults to the bare name `"claude"` with the absolute path supplied by env
-/// (`JESSE_CLAUDE_BIN`) in production. If `qmd` is not on the bridge's `PATH`, set
-/// `JESSE_MAIN_MCP_CONFIG` to a config naming the absolute interpreter + script path;
-/// no user-specific path is baked into this source.
-///
-/// Only qmd is declared. `playwright` is deliberately EXCLUDED: no main-path feature
-/// references it (verified — zero references under `bridge/` and zero in the vault's
-/// `CLAUDE.md` / skills), and it is the exact server a prior "fetch" probe drove to a
-/// live network fetch out of a child that was supposed to be contained.
-pub const MAIN_CHILD_MCP_CONFIG: &str =
-    r#"{"mcpServers":{"qmd":{"type":"stdio","command":"qmd","args":["mcp"]}}}"#;
-
-
-// ---- Capability: one containment vocabulary --------------------------------
-
-/// What a `claude` child is allowed to do, as ONE ordered vocabulary shared by every
-/// place the bridge spawns one. Ordered and CUMULATIVE: `Write` implies `Read` implies
-/// `Basic`, so the derived `PartialOrd` is meaningful — `a >= b` reads "a is at least as
-/// capable as b" and is the right comparison wherever two capabilities meet.
-///
-/// Today the enum has ONE use: naming what a child is GRANTED, which
-/// [`capability_args`] maps to the containment flags that enforce it. The ordering is
-/// derived now anyway, because a capability is a general statement about ability rather
-/// than a per-call-site flag: a second use (a model declaring the CEILING it may be
-/// trusted with, taken against the grant) speaks the same vocabulary and needs the
-/// comparison.
-///
-/// There is deliberately NO `Off` variant. A model is disabled by removing its registry
-/// entry or unsetting its token env var — the configured-but-unarmed state the registry
-/// already understands. "Must not run at all" is the absence of a model, not a
-/// containment posture a spawned child could be given.
-///
-/// A capability covers the TOOLSET only. Two things a spawn site chooses independently
-/// are deliberately NOT implied by it:
-///   * The **MCP server set**. Every site passes `--strict-mcp-config` with its own
-///     `--mcp-config` ([`mcp_args`]); the main turn requires qmd
-///     ([`MAIN_CHILD_MCP_CONFIG`]), the vault-QA child degrades to no servers. Making
-///     that a property of `Read` would silently take qmd away from a read-only turn.
-///   * The **working directory**. The `Basic` diet children run in the neutral scratch
-///     base so the large vault `CLAUDE.md` cannot auto-load; the `Basic` title child runs
-///     in the vault. Both are intentional, so do not unify them.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub enum Capability {
-    /// No tools. Text in, text out.
-    ///
-    /// This names what the CHILD is doing and carries no assumption about the model
-    /// behind it. A `Basic` child is a single-shot text transformation: parse an
-    /// utterance into JSON, check that JSON, write a short title. It is granted nothing
-    /// because it needs nothing — it returns text, and the BRIDGE validates that text and
-    /// does any writing. That holds whatever model or harness serves the child.
-    Basic,
-    /// Read and search. No writes, no exec.
-    Read,
-    /// May change the vault.
-    Write,
-}
-
-/// The ROOT toolset (`--tools`) for a [`Capability::Read`] child: exactly the three
-/// read-only built-ins — file read and the two search tools. Nothing that can write,
-/// execute, or reach the network exists at the root, so those classes are absent rather
-/// than permission-gated.
-pub const READ_ROOT_TOOLS: &str = "Read,Grep,Glob";
-
-/// The `--allowedTools` grant for a [`Capability::Read`] child: the three read-only
-/// built-ins plus the four read-only qmd MCP search tools (present only when the site's
-/// MCP config supplies the qmd server; absent otherwise, and then simply never invoked).
-/// The web fetch and web search tools are deliberately NOT granted here — widening the
-/// read surface to the network is a separate decision with a security consequence.
-pub const READ_ALLOWED_TOOLS: &str =
-    "Read,Grep,Glob,mcp__qmd__query,mcp__qmd__get,mcp__qmd__multi_get,mcp__qmd__status";
-
-/// Tools DENIED to EVERY [`Capability::Read`] child as belt-and-suspenders BEHIND the real
-/// boundary (the [`READ_ROOT_TOOLS`] root allowlist + strict MCP). It names every mutation
-/// / execution / network / orchestration class so a CLI change that widened the root set
-/// would still hit the denylist. `Skill` is named because a skill loads instruction text
-/// whose actions write (the `diet-logging` skill is exactly that). Enumerated denial is
-/// fragile by nature — it breaks SILENTLY on a tool rename or addition, exactly as
-/// [`BASIC_DISALLOWED_TOOLS`] documents — so the root allowlist is the guarantee and this
-/// is defense-in-depth.
-///
-/// # This tightens the vault-QA child, and why the variance had to go
-///
-/// The read-only main turn already denied `Skill`; the vault-QA (and shadow) child did
-/// not. That difference was undocumented and had no reason behind it — the two sites
-/// arrived at their lists separately, and the child's simply predated the main turn's. A
-/// capability that means two different things at two call sites is not a boundary, it is a
-/// coincidence, so both now take the stricter list.
-///
-/// What it actually changes for the child is defense-in-depth only, and saying otherwise
-/// would overstate it: behind `--tools "Read,Grep,Glob"` the `Skill` tool does not exist
-/// at the root either way, so the child could not have loaded a skill before this change
-/// and cannot now. Live-probed on claude 2.1.220 rather than assumed. The value is that
-/// the denylist now survives a CLI change that widened the root set, at BOTH Read sites
-/// rather than one.
-pub const READ_DISALLOWED_TOOLS: &str =
-    "Bash,Write,Edit,NotebookEdit,WebFetch,WebSearch,Task,Agent,ToolSearch,Workflow,TodoWrite,Skill";
-
-/// Tools DENIED to a [`Capability::Basic`] child, as belt-and-suspenders BEHIND the real
-/// boundary (`--tools ""`, see [`capability_args`]). Beyond the mutation / execution /
-/// network classes it also names the read/search built-ins and the orchestration tools
-/// that an empty-`--allowedTools` posture left reachable: `Glob`, `Grep`, `Read`,
-/// `ToolSearch`, `Workflow`, `Agent`, `TodoWrite`, plus `Skill` (loads skill instruction
-/// text). `WebSearch` is here too.
-///
-/// KNOWN WEAKNESS — enumerated denial is fragile: it names tools, so it breaks SILENTLY
-/// whenever the CLI renames a tool, splits one, or adds a new one. The live proof of that
-/// fragility is right here — the vulnerability report's list also named `LS` and
-/// `NotebookRead`, but claude 2.1.207 has no such tools (verified: it warns `Permission
-/// deny rule "LS" matches no known tool`; directory listing and notebook reads fold into
-/// `Glob`/`Read`, which ARE denied). Naming a phantom tool is a no-op that also spams
-/// stderr on every child, so they are omitted here. Because this list cannot be trusted
-/// to stay complete across CLI versions, the actual guarantee is `--tools ""` (removes
-/// the whole built-in toolset at the root) + strict empty MCP, and the acceptance gate is
-/// the live probe battery re-run against the pinned CLI on every change to this posture.
-pub const BASIC_DISALLOWED_TOOLS: &str =
-    "Bash,Write,Edit,NotebookEdit,WebFetch,WebSearch,Task,Glob,Grep,Read,ToolSearch,Workflow,Agent,TodoWrite,Skill";
-
-/// An EMPTY MCP server set, passed as `--mcp-config` alongside `--strict-mcp-config` so
-/// the child loads NO MCP servers at all. `--strict-mcp-config` tells the CLI to use only
-/// servers declared here; this declares none — so every `mcp__*` tool, and anything
-/// `ToolSearch` could load from a server, is absent at the root rather than denied by
-/// name. (The vulnerability report saw a "fetch" probe reach
-/// `mcp__playwright__browser_navigate` and make a live network fetch under the old
-/// posture; strict empty MCP closes that at the source.)
-pub const EMPTY_MCP_CONFIG: &str = r#"{"mcpServers":{}}"#;
-
-/// The ROOT MCP boundary every spawn site carries: load ONLY the servers named in
-/// `config`. Deliberately separate from [`capability_args`] — the server set is a per
-/// call site choice, not something a capability implies. The main turn REQUIRES qmd
-/// ([`MAIN_CHILD_MCP_CONFIG`]) while the vault-QA child degrades to no servers
-/// ([`EMPTY_MCP_CONFIG`]), and folding that into `Read` would silently take vault search
-/// away from a read-only turn.
-///
-/// `--mcp-config` accepts a file PATH or inline JSON, so an env override supplies either
-/// and the fallback consts are inline JSON. Live-verified on claude 2.1.220 (2026-07-27):
-/// without `--strict-mcp-config` the CLI also discovers the ambient user/project scopes,
-/// and an MCP tool that IS in `--allowedTools` is approved automatically while the same
-/// tool omitted fails with "requested permissions … but you haven't granted it yet" —
-/// refused-at-the-prompt, which is a weaker boundary than never loaded.
-pub fn mcp_args(config: &str) -> Vec<String> {
-    vec![
-        "--strict-mcp-config".to_string(),
-        "--mcp-config".to_string(),
-        config.to_string(),
-    ]
-}
-
-/// The MCP server set for a MAIN turn (and the title one-shot, which shares its builder):
-/// `JESSE_MAIN_MCP_CONFIG` when set, else the qmd-only [`MAIN_CHILD_MCP_CONFIG`].
-pub fn main_mcp_config(cfg: &Config) -> &str {
-    cfg.main_mcp_config.as_deref().unwrap_or(MAIN_CHILD_MCP_CONFIG)
-}
-
-/// The MCP server set for the vault-QA child (and the shadow child, which shares its
-/// builder): `JESSE_VAULTQA_MCP_CONFIG` when set, else NO servers.
-pub fn vaultqa_mcp_config(cfg: &Config) -> &str {
-    cfg.vaultqa_mcp_config.as_deref().unwrap_or(EMPTY_MCP_CONFIG)
-}
-
-/// Map a [`Capability`] to the TOOLSET argument vector that enforces it. THE one function
-/// every spawn site funnels through, so the posture for a capability is stated once and
-/// cannot drift between call sites. The MCP server set ([`mcp_args`]), the working
-/// directory, and any env override stay with the caller.
-///
-/// # Why these exact flags
-///
-/// [`Capability::Basic`] does not mean "empty `--allowedTools`". Live validation against
-/// the pinned CLI (claude 2.1.207) on 2026-07-13 DISPROVED that assumption: an empty
-/// `--allowedTools` means "add nothing to the default set", not "allow nothing". A
-/// headless `-p` child still reached read/search built-ins (a "run ls" probe executed
-/// `Glob`), loaded MCP servers on demand via `ToolSearch` (a "fetch" probe drove
-/// `mcp__playwright__browser_navigate` to a live network fetch), and reached `Workflow` —
-/// none of which raise the permission prompt a headless child cannot answer. Only `Write`
-/// was actually contained. So the boundary is built at the ROOT, deny-by-default, not by
-/// enumeration: `--tools ""` disables the ENTIRE built-in toolset (control-tested:
-/// dropping it alone lets the "run ls" probe execute `Glob` again), with an empty
-/// `--allowedTools` and [`BASIC_DISALLOWED_TOOLS`] as belt-and-suspenders behind it.
-///
-/// [`Capability::Read`] is the same shape with a read-only root ALLOWLIST
-/// ([`READ_ROOT_TOOLS`]) instead of an empty root set, the [`READ_ALLOWED_TOOLS`] grant,
-/// and the read denylist behind it.
-///
-/// [`Capability::Write`] passes the configured `--allowedTools` / `--disallowedTools` and
-/// NO root `--tools` flag, which is exactly today's writes-on main-turn posture.
-///
-/// Rejected alternatives (for `Basic`, and by extension `Read`):
-///   * Enumerated denylist only — rejected: it breaks silently on any CLI tool
-///     rename/addition, and this very CLI already omits `LS`/`NotebookRead` from its tool
-///     namespace, so a name-based list cannot be trusted to stay complete. `--tools`
-///     sidesteps the namespace entirely.
-///   * `--bare` / `--safe-mode` — rejected: both alter auth resolution (`--bare` forces
-///     `ANTHROPIC_API_KEY`/`apiKeyHelper` and never reads OAuth/keychain), which would
-///     break the ambient-credential verify child. Containment must not change which
-///     backend a child talks to.
-///   * A single-turn cap for defense-in-depth — UNAVAILABLE: claude 2.1.207 exposes no
-///     `--max-turns` flag (verified via `--help`). The children are single-shot by
-///     construction, but the CLI offers no turn bound to enforce it. (`--max-budget-usd`
-///     exists but bounds cost, not agentic turns, and is not a containment control.)
-pub fn capability_args(cfg: &Config, capability: Capability) -> Vec<String> {
-    match capability {
-        Capability::Basic => vec![
-            // ROOT boundary: disable the entire built-in toolset (deny-by-default).
-            "--tools".to_string(),
-            String::new(),
-            // Belt-and-suspenders behind the root flag above and strict MCP.
-            "--allowedTools".to_string(),
-            String::new(),
-            "--disallowedTools".to_string(),
-            BASIC_DISALLOWED_TOOLS.to_string(),
-        ],
-        Capability::Read => vec![
-            // ROOT boundary: a read-only root allowlist (not an empty set) — the child
-            // may read, nothing more.
-            "--tools".to_string(),
-            READ_ROOT_TOOLS.to_string(),
-            "--allowedTools".to_string(),
-            READ_ALLOWED_TOOLS.to_string(),
-            "--disallowedTools".to_string(),
-            READ_DISALLOWED_TOOLS.to_string(),
-        ],
-        Capability::Write => {
-            // Today's exact writes-on posture: the configured lists, and NO root
-            // `--tools` flag (so the full built-in toolset stands at the root).
-            let mut args = vec!["--allowedTools".to_string(), cfg.allowed_tools.clone()];
-            if !cfg.disallowed_tools.trim().is_empty() {
-                args.push("--disallowedTools".to_string());
-                args.push(cfg.disallowed_tools.clone());
-            }
-            args
-        }
-    }
-}
-
-/// The capability a MAIN turn is granted for the model backing it (the global switch).
-/// Writes-on (the ambient `opus` default, or a model whose writes were explicitly
-/// enabled) → [`Capability::Write`]; every read-only model → [`Capability::Read`], so a
-/// weaker or unfamiliar model cannot mutate the vault regardless of what it tries. The
-/// boundary is the toolset, not the prompt.
-pub fn turn_capability(active: &ActiveModel) -> Capability {
-    if active.writes_allowed {
-        Capability::Write
-    } else {
-        Capability::Read
-    }
-}
-
-/// Build the argument vector for one `claude` invocation (everything after the
-/// binary name). Pure and side-effect-free so it can be unit-tested without
-/// spawning a process. Enforces the C1 least-privilege boundary:
-///   * `--permission-mode default` (never `acceptEdits`/`bypassPermissions`)
-///   * an explicit `--allowedTools` list (always present)
-///   * a `--disallowedTools` denylist as defense-in-depth
-///   * `--strict-mcp-config` + an explicit `--mcp-config` (always present) so ONLY the
-///     servers named there load — see [`mcp_args`] and [`MAIN_CHILD_MCP_CONFIG`]
-///
-/// A `session_id` adds `--resume <id>` to continue a thread.
-///
-/// `capability` names what this child is granted and [`capability_args`] turns it into
-/// the toolset flags; `mcp_config` names the servers it may load. A main turn derives its
-/// capability from the active model via [`turn_capability`] and passes
-/// [`main_mcp_config`]; the title one-shot passes its own. The boundary is the TOOLSET,
-/// not the prompt.
-pub fn build_claude_args(
-    cfg: &Config,
-    prompt: &str,
-    session_id: Option<&str>,
-    capability: Capability,
-    mcp_config: &str,
-) -> Vec<String> {
-    let mut args = vec![
-        "-p".to_string(),
-        prompt.to_string(),
-        // Stream the turn as NDJSON so the bridge can read tokens as they arrive
-        // and forward them live. `--verbose` is REQUIRED by `claude` whenever
-        // `-p`/`--print` is combined with `--output-format stream-json` (it errors
-        // out otherwise). `--include-partial-messages` upgrades the stream from
-        // whole-message events to token-level `text_delta`s for true live output.
-        "--output-format".to_string(),
-        "stream-json".to_string(),
-        "--verbose".to_string(),
-        "--include-partial-messages".to_string(),
-        // Default permission mode: tools are gated by the allow/deny lists
-        // below rather than auto-accepted. Never acceptEdits/bypassPermissions.
-        "--permission-mode".to_string(),
-        "default".to_string(),
-    ];
-    // ROOT MCP boundary, then the capability's toolset. Every spawn site assembles in
-    // this order, which is what lets one builder serve all of them.
-    args.extend(mcp_args(mcp_config));
-    args.extend(capability_args(cfg, capability));
-    if let Some(sid) = session_id {
-        // A synthetic `local-<hex>` id (context carry) names a bridge-minted ledger
-        // thread with NO real claude session, so it must NEVER be resumed — the CLI
-        // would error on an unknown session id. The hosted turn runs FRESH; on success
-        // the caller re-keys the ledger from the synthetic id to the real returned id
-        // and injects the catch-up block so the missed turns are not lost. A no-op for
-        // every real id (and when carry is off, no synthetic id ever exists).
-        if !is_synthetic_session_id(sid) {
-            args.push("--resume".to_string());
-            args.push(sid.to_string());
-        }
-    }
-    args
-}
-
-/// Build the base `claude` child `Command` shared by BOTH a main turn and a
-/// title one-shot: the least-privilege args (`build_claude_args`), the vault cwd
-/// (so CLAUDE.md auto-loads), piped stdio, and `kill_on_drop`. It sets NO
-/// environment overrides — the child inherits the bridge's process env unchanged,
-/// exactly as before. The title path layers its backend override on top via
-/// `apply_title_env`; the main-turn path never does, which is the isolation
-/// guarantee (proven by a dedicated test). Factored out so both paths stay
-/// byte-identical except for that one deliberate difference and the `capability` /
-/// `mcp_config` each is granted.
-///
-/// cwd is the VAULT for both, and stays a per-call-site choice rather than something the
-/// capability implies — see [`Capability`].
-pub fn build_claude_command(
-    cfg: &Config,
-    prompt: &str,
-    session_id: Option<&str>,
-    active: &ActiveModel,
-    capability: Capability,
-    mcp_config: &str,
-) -> Command {
-    let mut cmd = Command::new(&cfg.claude_bin);
-    cmd.args(build_claude_args(
-        cfg,
-        prompt,
-        session_id,
-        capability,
-        mcp_config,
-    ))
-    .current_dir(&cfg.vault) // cwd = vault → CLAUDE.md auto-loads
-    .stdout(Stdio::piped())
-    .stderr(Stdio::piped())
-    .kill_on_drop(true); // killed if the timeout fires or the task is dropped
-    // Apply the active model's backend to the MAIN turn — and ONLY when it is
-    // non-ambient. For the ambient `opus` default this is a no-op, so the command carries
-    // NO `ANTHROPIC_*` and the main-turn isolation property holds byte-for-byte.
-    apply_main_env(&mut cmd, active);
-    cmd
-}
-
-/// Layer the ACTIVE model's backend onto the MAIN turn's `Command` — the global model
-/// switch. For a non-ambient model it sets `ANTHROPIC_BASE_URL` / `ANTHROPIC_AUTH_TOKEN`
-/// / `ANTHROPIC_MODEL` so the main turn talks to that backend, AND
-/// `CLAUDE_CODE_SUBAGENT_MODEL` to the same model id so the subagents the turn spawns
-/// follow the switch too. For the ambient `opus` default (`active.env` is `None`) it is a
-/// NO-OP: the main turn inherits the ambient process env unchanged — the isolation
-/// property. Unlike `apply_title_env` / `apply_diet_env` / `apply_vaultqa_env` (which
-/// carry a per-ROLE backend), this carries the CONVERSATION's chosen model; the two
-/// never mix (a main turn never calls the role appliers, and vice versa).
-pub fn apply_main_env(cmd: &mut Command, active: &ActiveModel) {
-    if let Some((base_url, auth_token, model)) = &active.env {
-        cmd.env("ANTHROPIC_BASE_URL", base_url)
-            .env("ANTHROPIC_AUTH_TOKEN", auth_token)
-            .env("ANTHROPIC_MODEL", model);
-        if let Some(subagent) = &active.subagent_model {
-            cmd.env("CLAUDE_CODE_SUBAGENT_MODEL", subagent);
-        }
-    }
-}
-
-/// Layer the title-backend override onto a TITLE child's `Command`. When the
-/// override is configured (all three `JESSE_TITLE_*` vars set → `cfg.title_backend`
-/// is `Some`), set `ANTHROPIC_BASE_URL` / `ANTHROPIC_AUTH_TOKEN` / `ANTHROPIC_MODEL`
-/// on THIS child only, so the title one-shot talks to the override backend while
-/// every main-turn child keeps inheriting the ambient process env. A no-op when
-/// unset — the title child then inherits the process env byte-for-byte, exactly as
-/// before this feature. Call this ONLY on the title path; a main turn must never
-/// invoke it (that is the main-turn isolation property).
-pub fn apply_title_env(cmd: &mut Command, cfg: &Config) {
-    if let Some((base_url, auth_token, model)) = &cfg.title_backend {
-        cmd.env("ANTHROPIC_BASE_URL", base_url)
-            .env("ANTHROPIC_AUTH_TOKEN", auth_token)
-            .env("ANTHROPIC_MODEL", model);
-    }
-}
-
-/// Layer the DIET-extract backend override onto the stateless extract child's
-/// `Command`. Exact analogue of [`apply_title_env`], keyed off `cfg.diet_backend`
-/// (all three `JESSE_DIET_*` vars set → `Some`). When configured, the extract
-/// child — and ONLY that child — talks to the override backend; every main turn
-/// and the hosted verify child keep inheriting the ambient process env. A no-op
-/// when unset. Call this ONLY on the extract path; a main turn or the verify child
-/// must never invoke it (the main-turn isolation property, mirrored from title).
-pub fn apply_diet_env(cmd: &mut Command, cfg: &Config) {
-    if let Some((base_url, auth_token, model)) = &cfg.diet_backend {
-        cmd.env("ANTHROPIC_BASE_URL", base_url)
-            .env("ANTHROPIC_AUTH_TOKEN", auth_token)
-            .env("ANTHROPIC_MODEL", model);
-    }
-}
-
-/// The base args every stateless CHILD shares with a turn: `stream-json` with
-/// token-level deltas, and `--permission-mode default` so tools are gated by the
-/// capability's allow/deny lists rather than auto-accepted.
-fn child_base_args(prompt: &str) -> Vec<String> {
-    vec![
-        "-p".to_string(),
-        prompt.to_string(),
-        "--output-format".to_string(),
-        "stream-json".to_string(),
-        "--verbose".to_string(),
-        "--include-partial-messages".to_string(),
-        "--permission-mode".to_string(),
-        "default".to_string(),
-    ]
-}
-
-/// Build the base `Command` for a stateless diet CHILD (extract or verify): the same
-/// `stream-json` + `--permission-mode default` posture as every other child, contained at
-/// [`Capability::Basic`] with NO MCP servers — the extract and verify children are
-/// single-shot, text-in / JSON-text-out, so they are granted nothing. Why `Basic` is
-/// built the way it is (and what live validation disproved) is documented on
-/// [`capability_args`].
-///
-/// Unlike a turn or a title call it does NOT set the vault as cwd — the extract/verify
-/// contract is inlined in the prompt, so the child needs no vault context and must not
-/// auto-load the large vault `CLAUDE.md`; cwd is the neutral scratch base. That is a
-/// deliberate per-call-site choice, NOT something `Basic` implies (the title one-shot is
-/// also `Basic` and runs in the vault), so leave it alone. Sets NO env overrides (callers
-/// layer `apply_diet_env` for extract, nothing for the ambient verify).
-pub fn build_diet_child_command(cfg: &Config, prompt: &str) -> Command {
-    let mut cmd = Command::new(&cfg.claude_bin);
-    let mut args = child_base_args(prompt);
-    args.extend(mcp_args(EMPTY_MCP_CONFIG));
-    args.extend(capability_args(cfg, Capability::Basic));
-    cmd.args(args)
-        .current_dir(cfg.scratch_base()) // neutral cwd → no vault CLAUDE.md auto-load
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true);
-    cmd
-}
-
 /// Spawn a pre-built stateless one-shot `Command` and return its answer text.
-/// Shared by [`run_diet_extract`] and [`run_diet_verify`]: it reuses the exact same
-/// `stream-json` line reading, terminal-`result` classification
-/// (`parse_stream_line` + `resolve_stream_outcome`), and bounded-reap discipline as
-/// a turn, but creates no job, pushes no stream, resumes no session, persists
-/// nothing. The caller has already layered any env override (or none) and set the
-/// tool posture on `cmd`. No retry loop — a diet one-shot is best-effort and the
-/// pipeline degrades to the hosted path on any non-2xx. `label` names the child in
-/// the timeout message.
+/// Shared by [`run_claude_oneshot`], [`run_diet_extract`], [`run_diet_verify`] and
+/// [`run_vaultqa_child`]: it reuses the exact same line reading, terminal classification
+/// (the harness's [`TurnParser`] + [`resolve_stream_outcome`]), and bounded-reap discipline
+/// as a turn, but creates no job, pushes no stream, resumes no session, persists
+/// nothing. The caller has already built the command through `harness` and layered any
+/// env override (or none) on it. No retry — a one-shot is best-effort and every caller
+/// degrades to the hosted path on any non-2xx. `label` names the child in the timeout
+/// message.
 async fn run_stateless_oneshot(
     cfg: &Config,
+    harness: &dyn Harness,
     mut cmd: Command,
     timeout_secs: u64,
     label: &str,
@@ -749,7 +193,9 @@ async fn run_stateless_oneshot(
     });
 
     // Read stdout line by line into a LOCAL buffer, stopping at the terminal
-    // `result` line — the same completion rule as a turn.
+    // `result` line — the same completion rule as a turn. One FRESH parser for this
+    // spawn, so nothing from an earlier child can bleed in.
+    let mut parser = harness.parser();
     let read_lines = async {
         let mut lines = BufReader::new(stdout).lines();
         let mut terminal: Option<ClaudeOutcome> = None;
@@ -760,7 +206,7 @@ async fn run_stateless_oneshot(
                 .await
                 .map_err(|e| (StatusCode::BAD_GATEWAY, format!("claude io error: {e}")))?;
             let Some(line) = next else { break };
-            match parse_stream_line(&line) {
+            match parser.on_line(&line) {
                 StreamEvent::TextDelta(t) => {
                     if streamed.len() < MAX_OUTPUT_BYTES {
                         streamed.push_str(&t);
@@ -787,7 +233,7 @@ async fn run_stateless_oneshot(
     };
 
     // Bounded reap — once the authoritative result is in, a lingering child must
-    // never delay delivery. Mirrors the turn / title paths.
+    // never delay delivery. Mirrors the turn path.
     const REAP_TIMEOUT: Duration = Duration::from_secs(5);
     let stderr = if terminal.is_some() {
         tokio::spawn(async move {
@@ -815,9 +261,55 @@ async fn run_stateless_oneshot(
     }
 }
 
+/// A stateless, single agent invocation — the primitive behind `POST /jesse/title`.
+/// **Stateless and NOT a turn:** no job is created, no session, nothing is persisted, no
+/// live stream, and none of the jobs/streams/aborts mutexes are touched. The caller passes
+/// a short `timeout_secs` (see `TITLE_TIMEOUT_SECS`).
+///
+/// Contained at [`Capability::Basic`] with NO MCP servers — writing a short title from a
+/// transcript is a single-shot text transformation that needs no tools and no vault search
+/// — and pointed at the title backend when one is configured. There is no retry loop: the
+/// title path is a best-effort UI nicety the caller degrades from on any non-2xx, so a
+/// single bounded attempt keeps latency tight rather than re-running on an upstream blip.
+/// The streamed text is still accumulated as the empty-`result` fallback, so a success
+/// envelope with a blank `result` still yields the visible answer.
+pub async fn run_claude_oneshot(
+    cfg: &Config,
+    prompt: &str,
+    timeout_secs: u64,
+) -> Result<String, ApiError> {
+    let harness = cfg.harnesses.turn_harness();
+    // The title path is AMBIENT and untouched by the model switch, so it passes the ambient
+    // model — the command is byte-for-byte today's, and `apply_title_env` below still layers
+    // any title backend on top (the two never mix). BASIC with no MCP servers is stated at
+    // the call site rather than derived from the active model, because it describes what
+    // THIS CHILD DOES: naming a conversation used to resolve through the writes-on ambient
+    // model, so it ran with the FULL writes-on toolset and launched the qmd server, in the
+    // vault, for a job whose entire output is a handful of words the bridge then validates
+    // and truncates. Nothing about the title contract wanted that.
+    let ambient = ActiveModel::ambient();
+    let mut cmd = harness.build_turn(cfg, &title_child_request(cfg, prompt, &ambient))?;
+    // Title-only backend override: point THIS child at the configured
+    // base_url/token/model when all three JESSE_TITLE_* vars are set. A no-op
+    // otherwise (ambient backend). Main turns never call this.
+    apply_title_env(&mut cmd, cfg);
+    // Provenance trail: one line per title call naming which backend served it
+    // (base URL + model, never the token; no prompt content) so a production
+    // audit can tell whether a title went to the override or the ambient backend.
+    match &cfg.title_backend {
+        Some((base_url, _token, model)) => {
+            eprintln!(
+                "jesse-bridge: title call → override backend base_url={base_url} model={model}"
+            )
+        }
+        None => eprintln!("jesse-bridge: title call → ambient backend (no JESSE_TITLE_* override)"),
+    }
+    run_stateless_oneshot(cfg, harness, cmd, timeout_secs, "title generation").await
+}
+
 /// The stateless diet EXTRACT one-shot: parse a raw food/exercise/weigh-in
 /// utterance into structured JSON entries. Runs a toolless child
-/// ([`build_diet_child_command`]) pointed at the diet-extract backend
+/// ([`diet_child_request`]) pointed at the diet-extract backend
 /// ([`apply_diet_env`]) when configured; returns the child's raw JSON text for the
 /// pipeline to validate. Emits ONE provenance line (base URL + model, never the
 /// token, no utterance content) so an audit can tell which backend served the
@@ -828,7 +320,9 @@ pub async fn run_diet_extract(
     prompt: &str,
     timeout_secs: u64,
 ) -> Result<String, ApiError> {
-    let mut cmd = build_diet_child_command(cfg, prompt);
+    let harness = cfg.harnesses.turn_harness();
+    let ambient = ActiveModel::ambient();
+    let mut cmd = harness.build_turn(cfg, &diet_child_request(cfg, prompt, &ambient))?;
     apply_diet_env(&mut cmd, cfg);
     match &cfg.diet_backend {
         Some((base_url, _token, model)) => eprintln!(
@@ -838,7 +332,7 @@ pub async fn run_diet_extract(
             eprintln!("jesse-bridge: diet extract → ambient backend (no JESSE_DIET_* override)")
         }
     }
-    run_stateless_oneshot(cfg, cmd, timeout_secs, "diet extraction").await
+    run_stateless_oneshot(cfg, harness, cmd, timeout_secs, "diet extraction").await
 }
 
 /// The stateless diet VERIFY one-shot: a hosted judgment call that never touches
@@ -852,83 +346,39 @@ pub async fn run_diet_verify(
     timeout_secs: u64,
 ) -> Result<String, ApiError> {
     // Deliberately NO apply_diet_env / apply_title_env — the verify child is ambient.
-    let cmd = build_diet_child_command(cfg, prompt);
-    run_stateless_oneshot(cfg, cmd, timeout_secs, "diet verification").await
-}
-
-// ---- Contained read-only vault-QA child ------------------------------------
-
-/// Build the base `Command` for the stateless, READ-ONLY vault-QA child: the shared child
-/// base args, the child's own MCP server set (`JESSE_VAULTQA_MCP_CONFIG`, else NO
-/// servers — see [`vaultqa_mcp_config`]), contained at [`Capability::Read`]. The child
-/// can read the vault and answer a self-referential question from it but cannot write,
-/// execute, or reach the network. The read-only root allowlist plus strict MCP are the
-/// boundary; see [`capability_args`].
-///
-/// THE ONE INTENTIONAL DIVERGENCE FROM THE DIET CHILD: cwd is the VAULT, not the neutral
-/// scratch base. The child must read vault files to answer, so it runs in the vault
-/// (CLAUDE.md auto-loads, but the prompt frames all file content as untrusted data).
-/// Containment therefore comes from the TOOLSET, not from an isolated cwd — cwd is a
-/// per-call-site choice the capability says nothing about. Sets NO env override (the
-/// caller layers `apply_vaultqa_env`), and never passes `--resume` (the child is
-/// stateless).
-pub fn build_vaultqa_child_command(cfg: &Config, prompt: &str) -> Command {
-    let mut cmd = Command::new(&cfg.claude_bin);
-    let mut args = child_base_args(prompt);
-    args.extend(mcp_args(vaultqa_mcp_config(cfg)));
-    args.extend(capability_args(cfg, Capability::Read));
-    cmd.args(args)
-        // The ONE divergence from the diet child: cwd = the vault. The child must READ
-        // vault files; containment is the read-only toolset above, not the cwd.
-        .current_dir(&cfg.vault)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true);
-    cmd
-}
-
-/// Layer the vault-QA backend override onto the vault-QA child's `Command`. Exact
-/// analogue of [`apply_diet_env`] / [`apply_title_env`], keyed off `cfg.vaultqa_backend`
-/// (all three `JESSE_VAULTQA_*` vars set → `Some`). When configured, the vault-QA child
-/// — and ONLY that child — talks to the override backend; every main turn and the
-/// diet/title children keep their own env. A no-op when unset. Call this ONLY on the
-/// vault-QA path; a main turn must never invoke it (the main-turn isolation property).
-pub fn apply_vaultqa_env(cmd: &mut Command, cfg: &Config) {
-    if let Some((base_url, auth_token, model)) = &cfg.vaultqa_backend {
-        cmd.env("ANTHROPIC_BASE_URL", base_url)
-            .env("ANTHROPIC_AUTH_TOKEN", auth_token)
-            .env("ANTHROPIC_MODEL", model);
-    }
+    let harness = cfg.harnesses.turn_harness();
+    let ambient = ActiveModel::ambient();
+    let cmd = harness.build_turn(cfg, &diet_child_request(cfg, prompt, &ambient))?;
+    run_stateless_oneshot(cfg, harness, cmd, timeout_secs, "diet verification").await
 }
 
 /// Run the contained read-only vault-QA child: a toolless-except-read one-shot
-/// ([`build_vaultqa_child_command`]) pointed at the vault-QA backend
-/// ([`apply_vaultqa_env`]) when configured. Returns the child's raw answer text for
-/// the pipeline to validate. No retry — a vault lookup is best-effort and the ladder
-/// degrades to the hosted turn on any failure. `hard timeout` is [`VAULTQA_TIMEOUT_SECS`]
-/// (passed by the caller).
+/// ([`vaultqa_child_request`]) pointed at the vault-QA backend ([`apply_vaultqa_env`])
+/// when configured. Returns the child's raw answer text for the pipeline to validate. No
+/// retry — a vault lookup is best-effort and the ladder degrades to the hosted turn on any
+/// failure. The hard timeout is [`VAULTQA_TIMEOUT_SECS`] (passed by the caller).
 pub async fn run_vaultqa_child(
     cfg: &Config,
     prompt: &str,
     timeout_secs: u64,
 ) -> Result<String, ApiError> {
-    let mut cmd = build_vaultqa_child_command(cfg, prompt);
+    let harness = cfg.harnesses.turn_harness();
+    let ambient = ActiveModel::ambient();
+    let mut cmd = harness.build_turn(cfg, &vaultqa_child_request(cfg, prompt, &ambient))?;
     apply_vaultqa_env(&mut cmd, cfg);
-    run_stateless_oneshot(cfg, cmd, timeout_secs, "vault-QA lookup").await
+    run_stateless_oneshot(cfg, harness, cmd, timeout_secs, "vault-QA lookup").await
 }
 
-/// Invoke headless Claude Code in the vault, streaming its output. Returns
-/// (reply_text, session_id). Pass session_id to continue a thread; the returned
-/// id is always captured so the client can follow up later. Resuming keeps
-/// CLAUDE.md loaded and retains filesystem access — it only adds the prior
-/// conversation on top.
+/// Invoke the agent in the vault, streaming its output. Returns (reply_text,
+/// session_id, usage). Pass session_id to continue a thread; the returned id is always
+/// captured so the client can follow up later. Resuming keeps CLAUDE.md loaded and retains
+/// filesystem access — it only adds the prior conversation on top.
 ///
-/// Unlike the old buffered path, this reads `claude`'s `stream-json` stdout LINE
-/// BY LINE as tokens arrive, pushing each text delta and tool-activity hint onto
-/// the job's broadcast stream (`jobs.stream_*`) so subscribers see the reply
-/// build live. The terminal `result` line is classified by the exact same
-/// Ok/Retryable/Fatal logic as before, and that classified result — not the
-/// streamed deltas — is the authoritative value returned and persisted.
+/// Unlike the old buffered path, this reads the child's stdout LINE BY LINE as tokens
+/// arrive, pushing each text delta and tool-activity hint onto the job's broadcast stream
+/// (`jobs.stream_*`) so subscribers see the reply build live. The terminal result is
+/// classified by the exact same Ok/Retryable/Fatal logic as before, and that classified
+/// result — not the streamed deltas — is the authoritative value returned and persisted.
 ///
 /// Retries transient upstream failures (5xx/429/529) up to 3 attempts total.
 /// A retry re-runs the WHOLE prompt: a transient that lands *mid-Tell* (after an
@@ -938,6 +388,9 @@ pub async fn run_vaultqa_child(
 /// here in case that ever changes. Only `Retryable` outcomes retry; spawn/io/
 /// timeout failures (which happen before any output exists) do not. `kill_on_drop`,
 /// the per-attempt timeout, and the 3-attempt retry are all preserved.
+///
+/// `harness` names the agent program: it builds the child `Command` and supplies the
+/// per-attempt line parser. Everything else here is harness-independent.
 pub async fn run_claude_streaming(
     cfg: &Config,
     prompt: &str,
@@ -945,6 +398,7 @@ pub async fn run_claude_streaming(
     jobs: &JobStore,
     job_id: &str,
     active: &ActiveModel,
+    harness: &dyn Harness,
 ) -> Result<(String, Option<String>, ShadowUsage), ApiError> {
     const MAX_ATTEMPTS: u32 = 3; // 1 try + 2 retries
 
@@ -953,34 +407,39 @@ pub async fn run_claude_streaming(
     // every path breaks or `continue`s, so there is no post-loop `unreachable!()`
     // the compiler couldn't prove was dead.
     // Resume-after-sweep safety: if the requested session's transcript no longer
-    // exists on disk (reclaimed by the GC sweep, or deleted while the phone thread
-    // lived on), drop the `--resume` so `claude --resume <gone>` can never surface a
-    // raw CLI error — the turn runs FRESH and returns a new session id (the app keeps
-    // its local transcript and stores the new id). A live real id and a synthetic
-    // `local-` id pass through unchanged. Resolved ONCE here (not per attempt) since
-    // a mid-turn sweep can't remove a session claude is actively holding open.
-    let session_id = resolve_resume_session(cfg, session_id);
+    // exists in THIS HARNESS's transcript dir (reclaimed by the GC sweep, or deleted
+    // while the phone thread lived on), drop the `--resume` so a resume of a gone
+    // session can never surface a raw CLI error — the turn runs FRESH and returns a new
+    // session id (the app keeps its local transcript and stores the new id). A live real
+    // id and a synthetic `local-` id pass through unchanged, as does every id under a
+    // harness that keeps no transcripts (there is no file whose absence could justify
+    // dropping the resume). Resolved ONCE here (not per attempt) since a mid-turn sweep
+    // can't remove a session the agent is actively holding open.
+    let session_id = resolve_resume_session_for_harness(cfg, harness, session_id);
 
     let mut attempt = 0u32;
     loop {
         attempt += 1;
         // Fresh Command per attempt — same args, including --resume if present.
-        // Tool access is constrained by the explicit allow/deny lists in
-        // build_claude_args (C1); the agent runs under --permission-mode default.
+        // Tool access is constrained by the capability the active model implies (C1);
+        // the agent runs under the harness's own least-privilege posture.
         // A main turn deliberately does NOT call apply_title_env: the title-backend
         // override touches the title child only, never a real agent turn.
-        // The active model backs this turn: for a non-ambient model `build_claude_command`
-        // applies its ANTHROPIC_* + CLAUDE_CODE_SUBAGENT_MODEL; for the ambient default it
+        // The active model backs this turn: for a non-ambient model the harness applies
+        // its ANTHROPIC_* + CLAUDE_CODE_SUBAGENT_MODEL; for the ambient default it
         // applies nothing (byte-for-byte today's command). The capability it is granted
         // comes from the same model: writes-on → Write, read-only → Read.
-        let mut cmd = build_claude_command(
+        let mut cmd = harness.build_turn(
             cfg,
-            prompt,
-            session_id,
-            active,
-            turn_capability(active),
-            main_mcp_config(cfg),
-        );
+            &main_turn_request(
+                cfg,
+                prompt,
+                session_id,
+                active,
+                turn_capability(active),
+                main_mcp_config(cfg),
+            ),
+        )?;
 
         let mut child = cmd.spawn().map_err(|e| {
             (
@@ -1004,25 +463,26 @@ pub async fn run_claude_streaming(
         let stderr_task = tokio::spawn(async move {
             let mut reader = BufReader::new(stderr);
             let mut buf = Vec::new();
-            // Bounded by `claude`'s own stderr volume, then truncated for storage.
+            // Bounded by the child's own stderr volume, then truncated for storage.
             let _ = reader.read_to_end(&mut buf).await;
             let cap = buf.len().min(MAX_OUTPUT_BYTES);
             String::from_utf8_lossy(&buf[..cap]).into_owned()
         });
 
-        // Read stdout line by line, mapping each NDJSON line and pushing live
-        // frames, and STOP as soon as the terminal `result` line is parsed.
-        // Completion must be driven by that result line, never by stdout EOF:
-        // EOF only arrives once `claude` AND every grandchild that inherited its
-        // stdout fd (the MCP servers it launches — QMD, Home Assistant, …) close
-        // the pipe, so a single lingering subprocess would otherwise block this
-        // read until the per-attempt timeout, pinning the job as Running long
-        // after the answer (and its `result` line) already arrived. The
-        // stream-json contract emits exactly one terminal `result` line and it is
-        // the last meaningful line, so breaking on it still satisfies "the last
-        // result line wins." The no-`result` fallback below (clean EOF with
-        // accumulated streamed text) is preserved: that path is reached only when
+        // Read stdout line by line, mapping each line through a FRESH parser for THIS
+        // attempt (a retry must never see the previous attempt's half-accumulated
+        // state), pushing live frames, and STOPPING as soon as the terminal result is
+        // parsed. Completion must be driven by that terminal event, never by stdout
+        // EOF: EOF only arrives once the agent AND every grandchild that inherited its
+        // stdout fd (the MCP servers it launches — QMD, Home Assistant, …) close the
+        // pipe, so a single lingering subprocess would otherwise block this read until
+        // the per-attempt timeout, pinning the job as Running long after the answer (and
+        // its result line) already arrived. The stream contract emits exactly one
+        // terminal result and it is the last meaningful line, so breaking on it still
+        // satisfies "the last result line wins." The no-result fallback below (clean EOF
+        // with accumulated streamed text) is preserved: that path is reached only when
         // the loop ends via `next_line() == None` without ever seeing a `Done`.
+        let mut parser = harness.parser();
         let read_lines = async {
             let mut lines = BufReader::new(stdout).lines();
             let mut terminal: Option<ClaudeOutcome> = None;
@@ -1032,7 +492,7 @@ pub async fn run_claude_streaming(
                     .await
                     .map_err(|e| (StatusCode::BAD_GATEWAY, format!("claude io error: {e}")))?;
                 let Some(line) = next else { break };
-                match parse_stream_line(&line) {
+                match parser.on_line(&line) {
                     StreamEvent::TextDelta(t) => jobs.stream_push_delta(job_id, &t),
                     StreamEvent::ToolActivity { name } => jobs.stream_push_activity(job_id, &name),
                     StreamEvent::Done(outcome) => {
@@ -1072,10 +532,10 @@ pub async fn run_claude_streaming(
         };
 
         // Reap the child and collect its stderr — but BOUND both waits so a
-        // child (or, more likely, a grandchild MCP server that inherited
-        // claude's stdio) that won't exit can't pin this task. Once the result
-        // line is parsed the answer is authoritative; reaping is cleanup that
-        // must never delay or block delivery.
+        // child (or, more likely, a grandchild MCP server that inherited its
+        // stdio) that won't exit can't pin this task. Once the result is parsed
+        // the answer is authoritative; reaping is cleanup that must never delay
+        // or block delivery.
         const REAP_TIMEOUT: Duration = Duration::from_secs(5);
         let stderr = if terminal.is_some() {
             // We already have the authoritative `result` line, so stderr is
@@ -1106,13 +566,20 @@ pub async fn run_claude_streaming(
             }
         };
 
-        // Decide the outcome from the terminal `result` line AND the text already
-        // accumulated from the stream, so a turn that produced a visible answer is
-        // never delivered empty or discarded: an empty/missing `result` on an
-        // otherwise-successful turn falls back to the streamed text. Error
-        // envelopes (Retryable/Fatal) and the genuine no-answer case are surfaced
-        // unchanged. See `resolve_stream_outcome`.
-        let streamed = jobs.stream_snapshot(job_id).unwrap_or_default();
+        // Decide the outcome from the terminal result AND the text already accumulated
+        // from the stream, so a turn that produced a visible answer is never delivered
+        // empty or discarded: an empty/missing `result` on an otherwise-successful turn
+        // falls back to the streamed text. Error envelopes (Retryable/Fatal) and the
+        // genuine no-answer case are surfaced unchanged. See `resolve_stream_outcome`.
+        //
+        // The snapshot is taken only for a harness that STREAMS text; a whole-answer
+        // harness pushed no deltas, so there is nothing to fall back to and its terminal
+        // outcome stands on its own.
+        let streamed = if harness.streams_text() {
+            jobs.stream_snapshot(job_id).unwrap_or_default()
+        } else {
+            String::new()
+        };
         let outcome = resolve_stream_outcome(terminal, &streamed, &stderr);
 
         match outcome {
@@ -1167,165 +634,9 @@ pub fn split_turn_usage(
     }
 }
 
-/// A stateless, single `claude -p` invocation — the primitive behind
-/// `POST /jesse/title`. It reuses the exact same least-privilege args
-/// (`build_claude_args`, so identical `--permission-mode`/allow/deny posture),
-/// the same `kill_on_drop`, the same terminal-`result`-line classification
-/// (`parse_stream_line` + `resolve_stream_outcome`), and the same bounded-reap
-/// discipline as a turn — but creates NO job, pushes NO live stream, resumes NO
-/// session, persists NOTHING, and touches none of the jobs/streams/aborts
-/// mutexes. The caller passes a short `timeout_secs` (see `TITLE_TIMEOUT_SECS`).
-///
-/// Unlike `run_claude_streaming` there is no retry loop: the title path is a
-/// best-effort UI nicety the caller degrades from on any non-2xx, so a single
-/// bounded attempt keeps latency tight rather than re-running on an upstream blip.
-/// The streamed text is still accumulated locally as the empty-`result` fallback,
-/// so a success envelope with a blank `result` still yields the visible answer.
-pub async fn run_claude_oneshot(
-    cfg: &Config,
-    prompt: &str,
-    timeout_secs: u64,
-) -> Result<String, ApiError> {
-    // Same args as a turn (stream-json + the least-privilege allow/deny lists),
-    // no --resume: a title call is never part of a thread. The title path is AMBIENT and
-    // untouched by the model switch, so it passes the ambient active model — the command
-    // is byte-for-byte today's, and `apply_title_env` below still layers any title
-    // backend on top (the two never mix).
-    // BASIC with NO MCP servers, not the ambient model's Write + qmd. Both are stated
-    // here rather than derived from `active`, because they describe what THIS CHILD DOES,
-    // not what backs it: writing a short title from a transcript is a single-shot text
-    // transformation that needs no tools and no vault search. It used to resolve through
-    // the ambient model, which is writes-on, so naming a conversation ran with the FULL
-    // writes-on toolset — Write, Edit, the scoped Bash verbs, the `diet-logging` skill —
-    // and launched the qmd server, in the vault, for a job whose entire output is a
-    // handful of words the bridge then validates and truncates. Nothing about the title
-    // contract wanted that; it was inherited from sharing a builder with a real turn.
-    //
-    // cwd stays the vault. That is a per-call-site choice the capability says nothing
-    // about, and with `--tools ""` the child cannot read anything there anyway; leaving it
-    // keeps this diff to the one thing it is about.
-    let mut cmd = build_claude_command(
-        cfg,
-        prompt,
-        None,
-        &ActiveModel::ambient(),
-        Capability::Basic,
-        EMPTY_MCP_CONFIG,
-    );
-    // Title-only backend override: point THIS child at the configured
-    // base_url/token/model when all three JESSE_TITLE_* vars are set. A no-op
-    // otherwise (ambient backend). Main turns never call this.
-    apply_title_env(&mut cmd, cfg);
-    // Provenance trail: one line per title call naming which backend served it
-    // (base URL + model, never the token; no prompt content) so a production
-    // audit can tell whether a title went to the override or the ambient backend.
-    match &cfg.title_backend {
-        Some((base_url, _token, model)) => {
-            eprintln!(
-                "jesse-bridge: title call → override backend base_url={base_url} model={model}"
-            )
-        }
-        None => eprintln!("jesse-bridge: title call → ambient backend (no JESSE_TITLE_* override)"),
-    }
-
-    let mut child = cmd.spawn().map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("failed to spawn {}: {e}", cfg.claude_bin),
-        )
-    })?;
-    let (Some(stdout), Some(stderr)) = (child.stdout.take(), child.stderr.take()) else {
-        return Err((
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "claude child stdout/stderr pipe was not captured".to_string(),
-        ));
-    };
-
-    // Drain stderr concurrently (capped) so a chatty stderr can't deadlock the
-    // stdout pipe and so the no-`result` fallback has the failure cause.
-    let stderr_task = tokio::spawn(async move {
-        let mut reader = BufReader::new(stderr);
-        let mut buf = Vec::new();
-        let _ = reader.read_to_end(&mut buf).await;
-        let cap = buf.len().min(MAX_OUTPUT_BYTES);
-        String::from_utf8_lossy(&buf[..cap]).into_owned()
-    });
-
-    // Read stdout line by line, accumulating text deltas into a LOCAL buffer
-    // (not a job store) and stopping the instant the terminal `result` line is
-    // parsed — the same completion rule as a turn.
-    let read_lines = async {
-        let mut lines = BufReader::new(stdout).lines();
-        let mut terminal: Option<ClaudeOutcome> = None;
-        let mut streamed = String::new();
-        loop {
-            let next = lines
-                .next_line()
-                .await
-                .map_err(|e| (StatusCode::BAD_GATEWAY, format!("claude io error: {e}")))?;
-            let Some(line) = next else { break };
-            match parse_stream_line(&line) {
-                StreamEvent::TextDelta(t) => {
-                    if streamed.len() < MAX_OUTPUT_BYTES {
-                        streamed.push_str(&t);
-                    }
-                }
-                StreamEvent::Done(outcome) => {
-                    terminal = Some(outcome);
-                    break;
-                }
-                StreamEvent::ToolActivity { .. } | StreamEvent::Ignore => {}
-            }
-        }
-        Ok::<(Option<ClaudeOutcome>, String), ApiError>((terminal, streamed))
-    };
-
-    let (terminal, streamed) = match timeout(Duration::from_secs(timeout_secs), read_lines).await {
-        Ok(r) => r?,
-        Err(_) => {
-            // Timed out — kill_on_drop reaps the child as this future drops.
-            return Err((
-                StatusCode::GATEWAY_TIMEOUT,
-                format!("title generation exceeded the {timeout_secs}s limit"),
-            ));
-        }
-    };
-
-    // Bounded reap — once we have the authoritative result the child (or a
-    // lingering grandchild) must never delay delivery. Mirrors the turn path.
-    const REAP_TIMEOUT: Duration = Duration::from_secs(5);
-    let stderr = if terminal.is_some() {
-        tokio::spawn(async move {
-            if timeout(REAP_TIMEOUT, child.wait()).await.is_err() {
-                let _ = child.start_kill();
-            }
-            stderr_task.abort();
-        });
-        String::new()
-    } else {
-        if timeout(REAP_TIMEOUT, child.wait()).await.is_err() {
-            let _ = child.start_kill();
-        }
-        match timeout(REAP_TIMEOUT, stderr_task).await {
-            Ok(joined) => joined.unwrap_or_default(),
-            Err(_) => String::new(),
-        }
-    };
-
-    // Same Ok/Retryable/Fatal classification as a turn. No retry: a Retryable
-    // upstream blip is surfaced as a non-2xx the caller degrades from.
-    match resolve_stream_outcome(terminal, &streamed, &stderr) {
-        ClaudeOutcome::Ok { result, .. } => Ok(result),
-        ClaudeOutcome::Fatal { message } | ClaudeOutcome::Retryable { message, .. } => {
-            Err((StatusCode::BAD_GATEWAY, message))
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testutil::*;
     const FX_SUCCESS: &str = include_str!("../tests/fixtures/stream/success.ndjson");
     const FX_EMPTY_RESULT: &str =
         include_str!("../tests/fixtures/stream/empty_result_success.ndjson");
@@ -1338,8 +649,9 @@ mod tests {
     fn replay_outcome(fixture: &str, stderr: &str) -> ClaudeOutcome {
         let mut streamed = String::new();
         let mut terminal: Option<ClaudeOutcome> = None;
+        let mut parser = ClaudeCode.parser();
         for line in fixture.lines() {
-            match parse_stream_line(line) {
+            match parser.on_line(line) {
                 StreamEvent::TextDelta(t) => streamed.push_str(&t),
                 StreamEvent::Done(o) => terminal = Some(o),
                 StreamEvent::ToolActivity { .. } | StreamEvent::Ignore => {}
@@ -1348,147 +660,12 @@ mod tests {
         resolve_stream_outcome(terminal, &streamed, stderr)
     }
     #[test]
-    fn interpret_real_500_envelope_is_retryable() {
-        // The observed cold-start failure: non-zero exit, real cause in stdout.
-        let stdout = r#"{"type":"result","is_error":true,"api_error_status":500,"result":"API Error: 500 Internal server error. This is a server-side issue, usually temporary — try again in a moment.","session_id":"sess-x"}"#;
-        match interpret_claude_output(stdout, "", false) {
-            ClaudeOutcome::Retryable { status, message } => {
-                assert_eq!(status, 500);
-                assert!(message.contains("500"));
-            }
-            other => panic!("expected Retryable, got {other:?}"),
-        }
-    }
-    #[test]
-    fn interpret_400_envelope_is_fatal() {
-        let stdout = r#"{"is_error":true,"api_error_status":400,"result":"bad request"}"#;
-        match interpret_claude_output(stdout, "", false) {
-            ClaudeOutcome::Fatal { message } => assert!(message.contains("bad request")),
-            other => panic!("expected Fatal, got {other:?}"),
-        }
-    }
-    #[test]
-    fn interpret_success_envelope_is_ok() {
-        let stdout = r#"{"type":"result","is_error":false,"result":"OK","session_id":"sess-1"}"#;
-        match interpret_claude_output(stdout, "", true) {
-            ClaudeOutcome::Ok { result, session_id, .. } => {
-                assert_eq!(result, "OK");
-                assert_eq!(session_id.as_deref(), Some("sess-1"));
-            }
-            other => panic!("expected Ok, got {other:?}"),
-        }
-    }
-    #[test]
-    fn interpret_non_json_success_is_raw_ok() {
-        match interpret_claude_output("  just plain text  ", "", true) {
-            ClaudeOutcome::Ok { result, session_id, .. } => {
-                assert_eq!(result, "just plain text");
-                assert!(session_id.is_none());
-            }
-            other => panic!("expected Ok, got {other:?}"),
-        }
-    }
-    #[test]
-    fn interpret_non_json_failure_is_fatal_and_nonblank() {
-        // The old bug: a non-JSON failure reported nothing. Now both streams show.
-        match interpret_claude_output("partial stdout", "stderr detail", false) {
-            ClaudeOutcome::Fatal { message } => {
-                assert!(!message.is_empty());
-                assert!(message.contains("stderr detail"));
-                assert!(message.contains("partial stdout"));
-            }
-            other => panic!("expected Fatal, got {other:?}"),
-        }
-    }
-    #[test]
-    fn parse_text_delta_is_extracted() {
-        let line = r#"{"type":"stream_event","event":{"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":"Hello "}},"session_id":"s"}"#;
-        match parse_stream_line(line) {
-            StreamEvent::TextDelta(t) => assert_eq!(t, "Hello "),
-            other => panic!("expected TextDelta, got {other:?}"),
-        }
-    }
-    #[test]
-    fn parse_thinking_delta_is_ignored() {
-        // Thinking streams as `thinking_delta`/`signature_delta`, never as the
-        // visible answer — it must NOT be accumulated.
-        let thinking = r#"{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"pondering"}}}"#;
-        assert!(matches!(parse_stream_line(thinking), StreamEvent::Ignore));
-        let sig = r#"{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":"abc"}}}"#;
-        assert!(matches!(parse_stream_line(sig), StreamEvent::Ignore));
-    }
-    #[test]
-    fn parse_tool_use_start_is_activity() {
-        let line = r#"{"type":"stream_event","event":{"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"toolu_1","name":"Read","input":{}}}}"#;
-        match parse_stream_line(line) {
-            StreamEvent::ToolActivity { name } => assert_eq!(name, "Read"),
-            other => panic!("expected ToolActivity, got {other:?}"),
-        }
-    }
-    #[test]
-    fn parse_terminal_result_ok() {
-        let line = r#"{"type":"result","subtype":"success","is_error":false,"result":"the answer","session_id":"sess-9"}"#;
-        match parse_stream_line(line) {
-            StreamEvent::Done(ClaudeOutcome::Ok { result, session_id, .. }) => {
-                assert_eq!(result, "the answer");
-                assert_eq!(session_id.as_deref(), Some("sess-9"));
-            }
-            other => panic!("expected Done(Ok), got {other:?}"),
-        }
-    }
-    #[test]
-    fn parse_terminal_result_5xx_is_retryable() {
-        let line = r#"{"type":"result","subtype":"error","is_error":true,"api_error_status":529,"result":"overloaded"}"#;
-        match parse_stream_line(line) {
-            StreamEvent::Done(ClaudeOutcome::Retryable { status, .. }) => assert_eq!(status, 529),
-            other => panic!("expected Done(Retryable), got {other:?}"),
-        }
-    }
-    #[test]
-    fn parse_terminal_result_4xx_is_fatal() {
-        let line =
-            r#"{"type":"result","is_error":true,"api_error_status":400,"result":"bad request"}"#;
-        match parse_stream_line(line) {
-            StreamEvent::Done(ClaudeOutcome::Fatal { message }) => {
-                assert!(message.contains("bad request"))
-            }
-            other => panic!("expected Done(Fatal), got {other:?}"),
-        }
-    }
-    #[test]
-    fn parse_non_json_and_noise_lines_are_ignored() {
-        assert!(matches!(
-            parse_stream_line("not json at all"),
-            StreamEvent::Ignore
-        ));
-        assert!(matches!(parse_stream_line("   "), StreamEvent::Ignore));
-        let init = r#"{"type":"system","subtype":"init","session_id":"s","tools":[]}"#;
-        assert!(matches!(parse_stream_line(init), StreamEvent::Ignore));
-        let rate = r#"{"type":"rate_limit_event","rate_limit_info":{"status":"allowed"}}"#;
-        assert!(matches!(parse_stream_line(rate), StreamEvent::Ignore));
-    }
-    #[test]
-    fn build_claude_args_requests_partial_stream_json() {
-        // The streaming contract: stream-json + the two flags `claude` requires
-        // for token-level deltas under `-p`.
-        let args = build_claude_args(&test_config(), "hi", None, Capability::Write, main_mcp_config(&test_config()));
-        let pos = |needle: &str| args.iter().position(|a| a == needle);
-        let of = pos("--output-format").expect("--output-format present");
-        assert_eq!(args[of + 1], "stream-json");
-        assert!(
-            pos("--verbose").is_some(),
-            "stream-json + -p requires --verbose"
-        );
-        assert!(
-            pos("--include-partial-messages").is_some(),
-            "token-level deltas require --include-partial-messages"
-        );
-    }
-    #[test]
     fn real_success_turn_yields_full_result_text() {
         // Normal turn: the authoritative `result` text is delivered verbatim.
         match replay_outcome(FX_SUCCESS, "") {
-            ClaudeOutcome::Ok { result, session_id, .. } => {
+            ClaudeOutcome::Ok {
+                result, session_id, ..
+            } => {
                 assert!(
                     result.contains("This vault is") && result.len() > 600,
                     "expected the full ~693-char answer, got {} chars",
@@ -1507,7 +684,9 @@ mod tests {
         // Success envelope but `result` is "" — must deliver the streamed answer
         // (not an empty bubble), keeping the result line's session_id.
         match replay_outcome(FX_EMPTY_RESULT, "") {
-            ClaudeOutcome::Ok { result, session_id, .. } => {
+            ClaudeOutcome::Ok {
+                result, session_id, ..
+            } => {
                 assert!(
                     result.contains("This vault is") && !result.trim().is_empty(),
                     "empty `result` should fall back to streamed text, got {result:?}"
@@ -1525,7 +704,9 @@ mod tests {
         // No terminal `result` line at all, but the turn streamed an answer →
         // deliver it (not the old unconditional Fatal). session_id is unknown.
         match replay_outcome(FX_MISSING_RESULT, "") {
-            ClaudeOutcome::Ok { result, session_id, .. } => {
+            ClaudeOutcome::Ok {
+                result, session_id, ..
+            } => {
                 assert!(result.contains("This vault is"), "got {result:?}");
                 assert!(session_id.is_none(), "no result line → no session_id");
             }
@@ -1558,920 +739,22 @@ mod tests {
         );
     }
     #[test]
-    fn build_claude_args_enforces_least_privilege() {
-        let cfg = test_config();
-        let args = build_claude_args(&cfg, "hello", None, Capability::Write, main_mcp_config(&cfg));
-
-        // --allowedTools is always present, with the configured list as its value.
-        let idx = args
-            .iter()
-            .position(|a| a == "--allowedTools")
-            .expect("--allowedTools must always be present");
-        let allow = &args[idx + 1];
-        assert_eq!(allow, &cfg.allowed_tools);
-
-        // Permission mode is default — never an auto-accept / bypass mode.
-        let pidx = args
-            .iter()
-            .position(|a| a == "--permission-mode")
-            .expect("--permission-mode present");
-        assert_eq!(args[pidx + 1], "default");
-
-        // acceptEdits / bypassPermissions never appear anywhere in the args.
-        for a in &args {
-            assert!(
-                !a.contains("acceptEdits"),
-                "acceptEdits must not appear: {a}"
-            );
-            assert!(
-                !a.contains("bypassPermissions"),
-                "bypassPermissions must not appear: {a}"
-            );
+    fn a_whole_answer_harness_gets_no_streamed_fallback() {
+        // The one thing `streams_text` gates: with no live text, an empty `result` on a
+        // success envelope is a genuine no-answer failure, not something a phantom
+        // fallback can paper over. (The driver passes "" for such a harness.)
+        match resolve_stream_outcome(
+            Some(ClaudeOutcome::Ok {
+                result: String::new(),
+                session_id: Some("t-1".to_string()),
+                usage: ShadowUsage::default(),
+            }),
+            "",
+            "",
+        ) {
+            ClaudeOutcome::Fatal { message } => assert!(!message.is_empty()),
+            other => panic!("expected Fatal, got {other:?}"),
         }
-
-        // Unscoped `Bash` is not in the allowlist — only scoped Bash(...) verbs.
-        let tools: Vec<&str> = allow.split(',').map(|t| t.trim()).collect();
-        assert!(
-            !tools.contains(&"Bash"),
-            "unscoped Bash must not be allowed: {tools:?}"
-        );
-        assert!(
-            tools.iter().any(|t| t.starts_with("Bash(")),
-            "expected scoped Bash(...) entries: {tools:?}"
-        );
-
-        // `node` is granted ONLY for the three named diet-cache scripts — never a
-        // bare `Bash(node:*)`, which would permit `node -e "<arbitrary JS>"` (RCE
-        // from a phone request). Pin both the presence of the scoped scripts and
-        // the absence of any broader node scope.
-        for script in [
-            "Bash(node todo-list/generate-diet-today.js:*)",
-            "Bash(node todo-list/validate-diet-today.js:*)",
-            "Bash(node todo-list/verify-diet-consistency.js:*)",
-        ] {
-            assert!(
-                tools.contains(&script),
-                "expected scoped node script {script:?} in: {tools:?}"
-            );
-        }
-        assert!(
-            !tools
-                .iter()
-                .any(|t| *t == "Bash(node:*)" || *t == "Bash(node)"),
-            "a bare node scope (arbitrary-JS RCE) must never be allowed: {tools:?}"
-        );
-
-        // The Skill tool is granted ONLY for the named `diet-logging` skill — never
-        // a bare `Skill`, which would let any future vault skill run from a phone
-        // request. The Skill tool loads instruction text only; real actions still
-        // go through the scoped Read/Write/Edit + node scripts above.
-        assert!(
-            tools.contains(&"Skill(diet-logging)"),
-            "expected scoped Skill(diet-logging) in: {tools:?}"
-        );
-        assert!(
-            !tools.contains(&"Skill"),
-            "a bare Skill scope (any-skill from a phone request) must never be allowed: {tools:?}"
-        );
-
-        // The scoped read-only helpers backing the clock header + file inspection
-        // are present, and each is the `Bash(<verb>:*)` scoped form — never a bare
-        // verb or unscoped Bash. These are read-only / pure-compute (no write, no
-        // network), so they widen the read surface only.
-        for verb in ["date", "cal", "head", "tail", "wc"] {
-            assert!(
-                tools.contains(&format!("Bash({verb}:*)").as_str()),
-                "expected scoped Bash({verb}:*) in: {tools:?}"
-            );
-        }
-
-        // Denylist posture: WebFetch is denied; bare `Bash` MUST NOT be.
-        // Empirically (claude 2.1.199, verified on the Studio 2026-07-04) listing
-        // bare `Bash` in --disallowedTools removes the entire Bash tool class,
-        // shadowing EVERY scoped `Bash(<verb>:*)` allow entry above (git, node
-        // diet scripts, date/cal, …) — they become unavailable, not merely the
-        // unscoped form. Unscoped/unmatched Bash is already blocked without the
-        // deny entry: under --permission-mode default a Bash command that matches
-        // no scoped allow entry is denied (a phone request cannot answer the
-        // permission prompt), so default-deny + the scoped allowlist is the real
-        // boundary. Denying the class only breaks the scoped grants. So the
-        // denylist keeps WebFetch and drops bare Bash.
-        let didx = args
-            .iter()
-            .position(|a| a == "--disallowedTools")
-            .expect("--disallowedTools present");
-        let deny: Vec<&str> = args[didx + 1].split(',').map(|t| t.trim()).collect();
-        assert!(
-            deny.contains(&"WebFetch"),
-            "WebFetch must be denied: {deny:?}"
-        );
-        assert!(
-            !deny.contains(&"Bash"),
-            "bare Bash must NOT be in the denylist — it disables the whole Bash \
-             tool class and kills every scoped Bash(...) grant: {deny:?}"
-        );
-    }
-    /// The three env vars the title-backend override sets on the title child.
-    const TITLE_ENV_KEYS: [&str; 3] = [
-        "ANTHROPIC_BASE_URL",
-        "ANTHROPIC_AUTH_TOKEN",
-        "ANTHROPIC_MODEL",
-    ];
-
-    /// Read the env OVERRIDES a `Command` carries (what `.env()` added), as a
-    /// map. `get_envs()` yields only the explicit per-command overrides, not the
-    /// inherited process env, so this sees exactly what the builder set.
-    fn cmd_env_overrides(cmd: &Command) -> std::collections::HashMap<String, String> {
-        cmd.as_std()
-            .get_envs()
-            .filter_map(|(k, v)| Some((k.to_str()?.to_string(), v?.to_str()?.to_string())))
-            .collect()
-    }
-
-    fn cfg_with_title_backend() -> Config {
-        let mut cfg = test_config();
-        cfg.title_backend = Some((
-            "http://127.0.0.1:9100".to_string(),
-            "dsv4-local-dummy".to_string(),
-            "local-title".to_string(),
-        ));
-        cfg
-    }
-
-    #[test]
-    fn title_command_applies_env_triple_when_configured() {
-        // With the override configured, the TITLE child's Command carries exactly
-        // ANTHROPIC_BASE_URL / _AUTH_TOKEN / _MODEL set to the configured values.
-        let cfg = cfg_with_title_backend();
-        let mut cmd = build_claude_command(&cfg, "hi", None, &ActiveModel::ambient(), Capability::Write, main_mcp_config(&cfg));
-        apply_title_env(&mut cmd, &cfg);
-        let env = cmd_env_overrides(&cmd);
-        assert_eq!(
-            env.get("ANTHROPIC_BASE_URL").map(String::as_str),
-            Some("http://127.0.0.1:9100")
-        );
-        assert_eq!(
-            env.get("ANTHROPIC_AUTH_TOKEN").map(String::as_str),
-            Some("dsv4-local-dummy")
-        );
-        assert_eq!(
-            env.get("ANTHROPIC_MODEL").map(String::as_str),
-            Some("local-title")
-        );
-    }
-
-    #[test]
-    fn title_command_applies_nothing_when_unconfigured() {
-        // With no override (the default), the title child sets NONE of the three
-        // vars — it inherits the ambient process env byte-for-byte, exactly as
-        // before this feature existed.
-        let cfg = test_config();
-        assert!(
-            cfg.title_backend.is_none(),
-            "test_config must default to no override"
-        );
-        let mut cmd = build_claude_command(&cfg, "hi", None, &ActiveModel::ambient(), Capability::Write, main_mcp_config(&cfg));
-        apply_title_env(&mut cmd, &cfg);
-        let env = cmd_env_overrides(&cmd);
-        for k in TITLE_ENV_KEYS {
-            assert!(
-                !env.contains_key(k),
-                "unconfigured title child must not set {k}"
-            );
-        }
-    }
-
-    #[test]
-    fn main_turn_command_is_unaffected_by_title_backend() {
-        // THE SAFETY PROPERTY, tested directly: even when the title-backend
-        // override IS configured, a MAIN-TURN command carries none of the three
-        // ANTHROPIC_* overrides. The main-turn builder never calls apply_title_env,
-        // so a title-only redirect can never leak onto a real agent turn.
-        let cfg = cfg_with_title_backend();
-        assert!(cfg.title_backend.is_some(), "precondition: override is set");
-        // A resumed turn and a fresh turn are both built the main-turn way.
-        for sid in [None, Some("sess-1")] {
-            let cmd = build_claude_command(&cfg, "do the thing", sid, &ActiveModel::ambient(), Capability::Write, main_mcp_config(&cfg));
-            let env = cmd_env_overrides(&cmd);
-            for k in TITLE_ENV_KEYS {
-                assert!(
-                    !env.contains_key(k),
-                    "main-turn command must NOT carry {k} even when title backend is set"
-                );
-            }
-        }
-    }
-
-    // ---- Diet extract/verify children --------------------------------------
-
-    fn cfg_with_diet_backend() -> Config {
-        let mut cfg = test_config();
-        cfg.diet_backend = Some((
-            "http://127.0.0.1:9100".to_string(),
-            "dsv4-diet-dummy".to_string(),
-            "local-diet".to_string(),
-        ));
-        cfg
-    }
-
-    /// Extract the value following a flag in a Command's argv, or `None`.
-    fn cmd_arg_value(cmd: &Command, flag: &str) -> Option<String> {
-        let args: Vec<String> = cmd
-            .as_std()
-            .get_args()
-            .map(|a| a.to_string_lossy().into_owned())
-            .collect();
-        args.iter()
-            .position(|a| a == flag)
-            .map(|i| args[i + 1].clone())
-    }
-
-    /// True if a bare (valueless) flag appears anywhere in a Command's argv.
-    fn cmd_has_flag(cmd: &Command, flag: &str) -> bool {
-        cmd.as_std().get_args().any(|a| a.to_string_lossy() == flag)
-    }
-
-    #[test]
-    fn diet_extract_command_applies_env_triple_when_configured() {
-        // With the override configured, the EXTRACT child's Command carries exactly
-        // the three ANTHROPIC_* vars set to the diet-backend values.
-        let cfg = cfg_with_diet_backend();
-        let mut cmd = build_diet_child_command(&cfg, "hi");
-        apply_diet_env(&mut cmd, &cfg);
-        let env = cmd_env_overrides(&cmd);
-        assert_eq!(
-            env.get("ANTHROPIC_BASE_URL").map(String::as_str),
-            Some("http://127.0.0.1:9100")
-        );
-        assert_eq!(
-            env.get("ANTHROPIC_AUTH_TOKEN").map(String::as_str),
-            Some("dsv4-diet-dummy")
-        );
-        assert_eq!(
-            env.get("ANTHROPIC_MODEL").map(String::as_str),
-            Some("local-diet")
-        );
-    }
-
-    #[test]
-    fn diet_extract_command_applies_nothing_when_unconfigured() {
-        // No override → the extract child sets none of the three; it inherits the
-        // ambient process env, exactly as if the feature were absent.
-        let cfg = test_config();
-        assert!(cfg.diet_backend.is_none());
-        let mut cmd = build_diet_child_command(&cfg, "hi");
-        apply_diet_env(&mut cmd, &cfg);
-        let env = cmd_env_overrides(&cmd);
-        for k in TITLE_ENV_KEYS {
-            assert!(
-                !env.contains_key(k),
-                "unconfigured extract child must not set {k}"
-            );
-        }
-    }
-
-    #[test]
-    fn diet_verify_command_is_ambient_even_when_diet_backend_set() {
-        // THE POINT of the verify gate: it NEVER uses the diet backend. Even with the
-        // override configured, a verify child (built the ambient way — no
-        // apply_diet_env) carries none of the three ANTHROPIC_* overrides.
-        let cfg = cfg_with_diet_backend();
-        assert!(cfg.diet_backend.is_some());
-        let cmd = build_diet_child_command(&cfg, "verify this"); // no env layering
-        let env = cmd_env_overrides(&cmd);
-        for k in TITLE_ENV_KEYS {
-            assert!(
-                !env.contains_key(k),
-                "the verify child must be ambient — must NOT carry {k}"
-            );
-        }
-    }
-
-    #[test]
-    fn diet_child_holds_no_tools() {
-        // The diet children hold NO tools: an EMPTY --allowedTools, plus the
-        // class-level denylist removing the mutation/exec/network tool classes.
-        let cfg = cfg_with_diet_backend();
-        let cmd = build_diet_child_command(&cfg, "hi");
-        let allow = cmd_arg_value(&cmd, "--allowedTools").expect("--allowedTools present");
-        assert_eq!(
-            allow, "",
-            "the diet child's allowlist must be EMPTY (no tools)"
-        );
-        let deny = cmd_arg_value(&cmd, "--disallowedTools").expect("--disallowedTools present");
-        for class in ["Bash", "Write", "Edit", "WebFetch", "WebSearch", "Task"] {
-            assert!(
-                deny.split(',').any(|t| t.trim() == class),
-                "denylist must remove the {class} class: {deny:?}"
-            );
-        }
-    }
-
-    /// The diet children in `[None, Some(diet_backend)]` config — i.e. both the
-    /// ambient VERIFY child and the env-layered EXTRACT child — are built by the
-    /// one shared `build_diet_child_command`, so asserting the posture on the
-    /// builder proves it for `run_diet_extract` AND `run_diet_verify` at once. This
-    /// helper yields both command forms so every containment test below covers both.
-    fn both_diet_child_commands() -> Vec<Command> {
-        let ambient = build_diet_child_command(&test_config(), "hi"); // verify posture
-        let mut extract = build_diet_child_command(&cfg_with_diet_backend(), "hi");
-        apply_diet_env(&mut extract, &cfg_with_diet_backend()); // extract posture
-        vec![ambient, extract]
-    }
-
-    #[test]
-    fn diet_child_disables_all_builtin_tools_at_root() {
-        // Deny-by-default at the tool-SET level: `--tools ""` removes every built-in
-        // tool from the child's toolset at the root, so read/search built-ins (Glob,
-        // Grep, Read, …), ToolSearch, Workflow and Agent do not exist to be invoked —
-        // not merely permission-gated. This is the load-bearing containment flag
-        // (live-proven: without it a "run ls" probe executes Glob).
-        for cmd in both_diet_child_commands() {
-            let tools = cmd_arg_value(&cmd, "--tools")
-                .expect("--tools must be present (deny-by-default toolset)");
-            assert_eq!(
-                tools, "",
-                "--tools must be EMPTY to disable all built-in tools"
-            );
-        }
-    }
-
-    #[test]
-    fn diet_child_loads_no_mcp_servers() {
-        // No MCP servers at the root: `--strict-mcp-config` tells the CLI to use ONLY
-        // servers from `--mcp-config`, and that config declares an EMPTY server set —
-        // so every `mcp__*` tool (and anything ToolSearch could load from a server) is
-        // gone at the root, not denied by name.
-        for cmd in both_diet_child_commands() {
-            assert!(
-                cmd_has_flag(&cmd, "--strict-mcp-config"),
-                "--strict-mcp-config must be present so only --mcp-config servers load"
-            );
-            let mcp = cmd_arg_value(&cmd, "--mcp-config")
-                .expect("--mcp-config must be present (empty server set)");
-            let parsed: serde_json::Value =
-                serde_json::from_str(&mcp).expect("--mcp-config value must be valid JSON");
-            let servers = parsed.get("mcpServers").and_then(|v| v.as_object());
-            assert!(
-                servers.map(|m| m.is_empty()).unwrap_or(true),
-                "the MCP config must declare NO servers: {mcp:?}"
-            );
-        }
-    }
-
-    /// Positional lookup over a plain arg VECTOR (`build_claude_args` returns one, not a
-    /// `Command`), mirroring `cmd_arg_value`/`cmd_has_flag` for the diet/vault-QA children.
-    fn arg_value(args: &[String], flag: &str) -> Option<String> {
-        args.iter()
-            .position(|a| a == flag)
-            .and_then(|i| args.get(i + 1).cloned())
-    }
-
-    #[test]
-    fn main_turn_loads_only_the_declared_mcp_servers() {
-        // The MAIN path was the LAST child route without strict MCP config: the diet and
-        // vault-QA children already carried it, so ordinary phone turns were the one
-        // route still loading the ambient user/project MCP scopes — the account-level
-        // cloud connectors (Gmail, Slack, Calendar, Drive) and playwright. Those
-        // tools were refused, but only at the PERMISSION layer, which is a weaker
-        // boundary than never loading them (and one a headless `-p` child can only fail
-        // against, never answer). Asserted on BOTH branches `build_claude_args` can take
-        // — writes-enabled (ambient opus) and read-only (a non-ambient model) — because
-        // the flags are pushed before the branch and must never drift apart.
-        let cfg = test_config();
-        for (label, active) in [
-            ("writes-enabled", ActiveModel::ambient()),
-            ("read-only", glm_active()),
-        ] {
-            let args = build_claude_args(&cfg, "hi", None, turn_capability(&active), main_mcp_config(&cfg));
-            assert!(
-                args.iter().any(|a| a == "--strict-mcp-config"),
-                "{label}: --strict-mcp-config must be present so ONLY --mcp-config servers load: {args:?}"
-            );
-            let mcp = arg_value(&args, "--mcp-config")
-                .unwrap_or_else(|| panic!("{label}: --mcp-config must be present: {args:?}"));
-            let parsed: serde_json::Value = serde_json::from_str(&mcp)
-                .unwrap_or_else(|e| panic!("{label}: --mcp-config must be valid JSON ({e}): {mcp:?}"));
-            let servers = parsed
-                .get("mcpServers")
-                .and_then(|v| v.as_object())
-                .unwrap_or_else(|| panic!("{label}: --mcp-config must declare mcpServers: {mcp:?}"));
-
-            // qmd is REQUIRED on the main path — unlike the vault-QA child, an unset
-            // override must NOT degrade to the empty server set.
-            assert!(
-                servers.contains_key("qmd"),
-                "{label}: the main path requires the qmd vault-search server: {mcp:?}"
-            );
-            // …and NOTHING else. An exact count (rather than a denylist of server names)
-            // is what makes re-adding ANY server — a cloud connector, playwright, or one
-            // that does not exist yet — a deliberate, test-breaking act instead of a
-            // silent widening. A name-based check would only catch the servers we
-            // happened to think of, the same fragility documented for the denylists.
-            assert_eq!(
-                servers.len(),
-                1,
-                "{label}: the main path must declare qmd and nothing else: {mcp:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn main_turn_mcp_config_honors_the_env_override() {
-        // Same resolution as the vault-QA child: `--mcp-config` accepts a file PATH or
-        // inline JSON, so `JESSE_MAIN_MCP_CONFIG` supplies either verbatim. This is the
-        // escape hatch for a host where `qmd` is not on the bridge's PATH (launchd's PATH
-        // is narrower than a login shell's) — no user-specific path is baked into the
-        // source. `--strict-mcp-config` still rides along.
-        let mut cfg = test_config();
-        cfg.main_mcp_config = Some("/etc/jesse/qmd.json".to_string());
-        for active in [ActiveModel::ambient(), glm_active()] {
-            let args = build_claude_args(&cfg, "hi", None, turn_capability(&active), main_mcp_config(&cfg));
-            assert_eq!(
-                arg_value(&args, "--mcp-config").as_deref(),
-                Some("/etc/jesse/qmd.json"),
-                "the env override must be passed through verbatim: {args:?}"
-            );
-            assert!(args.iter().any(|a| a == "--strict-mcp-config"));
-        }
-    }
-
-    #[test]
-    fn diet_child_denylist_covers_read_search_and_orchestration_classes() {
-        // Belt-and-suspenders behind `--tools ""`: the enumerated denylist is expanded
-        // past the original seven mutation/exec/network classes to also name the
-        // read/search built-ins and the orchestration tools that the old empty-allowlist
-        // posture left reachable (Glob, Grep, Read, ToolSearch, Workflow, Agent,
-        // TodoWrite, Skill). Enumerated denial is fragile — it breaks silently when the
-        // CLI renames or adds tools — which is exactly why `--tools ""` above is the
-        // real guarantee and the live probe battery is the acceptance gate.
-        for cmd in both_diet_child_commands() {
-            let deny = cmd_arg_value(&cmd, "--disallowedTools").expect("--disallowedTools present");
-            let names: Vec<&str> = deny.split(',').map(|t| t.trim()).collect();
-            for class in [
-                "Glob",
-                "Grep",
-                "Read",
-                "ToolSearch",
-                "Workflow",
-                "Agent",
-                "TodoWrite",
-                "Skill",
-            ] {
-                assert!(
-                    names.contains(&class),
-                    "expanded denylist must name the {class} class: {names:?}"
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn main_turn_command_is_unaffected_by_diet_backend() {
-        // THE SAFETY / KILL-SWITCH PROPERTY, tested directly (clone of the title
-        // isolation test): even when the diet-backend override IS configured, a
-        // MAIN-TURN command carries none of the three ANTHROPIC_* overrides, because
-        // the main-turn builder never calls apply_diet_env. A diet-only redirect can
-        // never leak onto a real agent turn.
-        let cfg = cfg_with_diet_backend();
-        assert!(cfg.diet_backend.is_some(), "precondition: override is set");
-        for sid in [None, Some("sess-1")] {
-            let cmd = build_claude_command(&cfg, "do the thing", sid, &ActiveModel::ambient(), Capability::Write, main_mcp_config(&cfg));
-            let env = cmd_env_overrides(&cmd);
-            for k in TITLE_ENV_KEYS {
-                assert!(
-                    !env.contains_key(k),
-                    "main-turn command must NOT carry {k} even when diet backend is set"
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn main_turn_command_is_byte_identical_whether_diet_backend_set_or_not() {
-        // The kill switch, proven byte-for-byte on the SPAWNED command: unsetting the
-        // triple must reproduce today's exact main-turn invocation. The argv, the
-        // cwd, and the env overrides must all match between a config with the diet
-        // backend set and one without.
-        let with = cfg_with_diet_backend();
-        let mut without = with.clone();
-        without.diet_backend = None;
-        for sid in [None, Some("sess-42")] {
-            let a = build_claude_command(&with, "log a banana", sid, &ActiveModel::ambient(), Capability::Write, main_mcp_config(&with));
-            let b = build_claude_command(&without, "log a banana", sid, &ActiveModel::ambient(), Capability::Write, main_mcp_config(&without));
-            let argv = |c: &Command| -> Vec<String> {
-                c.as_std()
-                    .get_args()
-                    .map(|s| s.to_string_lossy().into_owned())
-                    .collect()
-            };
-            assert_eq!(argv(&a), argv(&b), "argv must be identical (kill switch)");
-            assert_eq!(
-                a.as_std().get_current_dir(),
-                b.as_std().get_current_dir(),
-                "cwd must be identical"
-            );
-            assert_eq!(
-                cmd_env_overrides(&a),
-                cmd_env_overrides(&b),
-                "env overrides must be identical (none, either way)"
-            );
-        }
-    }
-
-    // ---- Vault-QA child ----------------------------------------------------
-
-    fn cfg_with_vaultqa_backend() -> Config {
-        let mut cfg = test_config();
-        cfg.vaultqa_backend = Some((
-            "http://127.0.0.1:9100".to_string(),
-            "vaultqa-dummy-tok".to_string(),
-            "local-vaultqa".to_string(),
-        ));
-        cfg
-    }
-
-    #[test]
-    fn vaultqa_child_applies_env_triple_when_configured() {
-        // With the override configured, the vault-QA child's Command carries exactly
-        // the three ANTHROPIC_* vars set to the vault-QA backend values.
-        let cfg = cfg_with_vaultqa_backend();
-        let mut cmd = build_vaultqa_child_command(&cfg, "hi");
-        apply_vaultqa_env(&mut cmd, &cfg);
-        let env = cmd_env_overrides(&cmd);
-        assert_eq!(
-            env.get("ANTHROPIC_BASE_URL").map(String::as_str),
-            Some("http://127.0.0.1:9100")
-        );
-        assert_eq!(
-            env.get("ANTHROPIC_AUTH_TOKEN").map(String::as_str),
-            Some("vaultqa-dummy-tok")
-        );
-        assert_eq!(
-            env.get("ANTHROPIC_MODEL").map(String::as_str),
-            Some("local-vaultqa")
-        );
-    }
-
-    #[test]
-    fn vaultqa_child_applies_nothing_when_unconfigured() {
-        let cfg = test_config();
-        assert!(cfg.vaultqa_backend.is_none());
-        let mut cmd = build_vaultqa_child_command(&cfg, "hi");
-        apply_vaultqa_env(&mut cmd, &cfg);
-        let env = cmd_env_overrides(&cmd);
-        for k in TITLE_ENV_KEYS {
-            assert!(
-                !env.contains_key(k),
-                "unconfigured vault-QA child must not set {k}"
-            );
-        }
-    }
-
-    #[test]
-    fn vaultqa_child_is_read_only_at_the_root_with_no_resume_in_the_vault() {
-        // The child's containment posture, asserted on the built argv:
-        //   * `--tools "Read,Grep,Glob"` — a read-only ROOT allowlist (not empty).
-        //   * `--strict-mcp-config` present so only --mcp-config servers load.
-        //   * `--allowedTools` names the three built-ins plus the four qmd tools.
-        //   * `--disallowedTools` names the mutation/exec/network/orchestration classes.
-        //   * NO `--resume` (stateless), and cwd = the vault (the one divergence).
-        let cfg = cfg_with_vaultqa_backend();
-        let cmd = build_vaultqa_child_command(&cfg, "answer me");
-
-        let tools = cmd_arg_value(&cmd, "--tools").expect("--tools present");
-        assert_eq!(tools, "Read,Grep,Glob", "read-only root allowlist");
-
-        assert!(
-            cmd_has_flag(&cmd, "--strict-mcp-config"),
-            "--strict-mcp-config must be present"
-        );
-        // Unset MCP config → the shared empty-servers const (no servers).
-        let mcp = cmd_arg_value(&cmd, "--mcp-config").expect("--mcp-config present");
-        let parsed: serde_json::Value = serde_json::from_str(&mcp).expect("valid JSON");
-        assert!(
-            parsed
-                .get("mcpServers")
-                .and_then(|v| v.as_object())
-                .map(|m| m.is_empty())
-                .unwrap_or(true),
-            "unset MCP config → no servers: {mcp:?}"
-        );
-
-        let allow = cmd_arg_value(&cmd, "--allowedTools").expect("--allowedTools present");
-        let allowed: Vec<&str> = allow.split(',').map(|t| t.trim()).collect();
-        for t in [
-            "Read",
-            "Grep",
-            "Glob",
-            "mcp__qmd__query",
-            "mcp__qmd__get",
-            "mcp__qmd__multi_get",
-            "mcp__qmd__status",
-        ] {
-            assert!(allowed.contains(&t), "allowlist must name {t}: {allowed:?}");
-        }
-        // No mutation/exec built-in is granted.
-        for t in ["Write", "Edit", "Bash"] {
-            assert!(
-                !allowed.contains(&t),
-                "allowlist must NOT grant {t}: {allowed:?}"
-            );
-        }
-
-        let deny = cmd_arg_value(&cmd, "--disallowedTools").expect("--disallowedTools present");
-        let denied: Vec<&str> = deny.split(',').map(|t| t.trim()).collect();
-        for class in [
-            "Bash",
-            "Write",
-            "Edit",
-            "NotebookEdit",
-            "WebFetch",
-            "WebSearch",
-            "Task",
-            "Agent",
-            "ToolSearch",
-            "Workflow",
-            "TodoWrite",
-        ] {
-            assert!(
-                denied.contains(&class),
-                "denylist must name {class}: {denied:?}"
-            );
-        }
-
-        // Stateless: never --resume.
-        assert!(
-            !cmd_has_flag(&cmd, "--resume"),
-            "vault-QA child must not resume a session"
-        );
-
-        // cwd = the vault (the intentional divergence from the diet child's scratch cwd).
-        assert_eq!(
-            cmd.as_std().get_current_dir().map(|p| p.to_path_buf()),
-            Some(std::path::PathBuf::from(&cfg.vault)),
-            "vault-QA child cwd must be the vault"
-        );
-    }
-
-    #[test]
-    fn vaultqa_child_uses_mcp_config_path_when_set() {
-        // When JESSE_VAULTQA_MCP_CONFIG is set, its PATH is passed straight to
-        // --mcp-config (the CLI accepts a path or inline JSON), so the qmd server loads.
-        let mut cfg = cfg_with_vaultqa_backend();
-        cfg.vaultqa_mcp_config = Some("/etc/jesse/qmd.json".to_string());
-        let cmd = build_vaultqa_child_command(&cfg, "hi");
-        assert_eq!(
-            cmd_arg_value(&cmd, "--mcp-config").as_deref(),
-            Some("/etc/jesse/qmd.json"),
-            "the configured MCP config path must be passed verbatim"
-        );
-        assert!(cmd_has_flag(&cmd, "--strict-mcp-config"));
-    }
-
-    #[test]
-    fn main_turn_command_is_unaffected_by_vaultqa_backend() {
-        // THE SAFETY / KILL-SWITCH PROPERTY (clone of the diet/title isolation test):
-        // even when the vault-QA override IS configured, a MAIN-TURN command carries
-        // none of the three ANTHROPIC_* overrides, because the main-turn builder never
-        // calls apply_vaultqa_env. A vault-QA-only redirect can never leak onto a turn.
-        let cfg = cfg_with_vaultqa_backend();
-        assert!(
-            cfg.vaultqa_backend.is_some(),
-            "precondition: override is set"
-        );
-        for sid in [None, Some("sess-1")] {
-            let cmd = build_claude_command(&cfg, "do the thing", sid, &ActiveModel::ambient(), Capability::Write, main_mcp_config(&cfg));
-            let env = cmd_env_overrides(&cmd);
-            for k in TITLE_ENV_KEYS {
-                assert!(
-                    !env.contains_key(k),
-                    "main-turn command must NOT carry {k} even when vault-QA backend is set"
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn main_turn_command_is_byte_identical_whether_vaultqa_backend_set_or_not() {
-        // The kill switch, proven byte-for-byte on the SPAWNED command: unsetting the
-        // triple reproduces today's exact main-turn invocation (argv, cwd, env).
-        let with = cfg_with_vaultqa_backend();
-        let mut without = with.clone();
-        without.vaultqa_backend = None;
-        for sid in [None, Some("sess-42")] {
-            let a = build_claude_command(&with, "what is my vo2 max", sid, &ActiveModel::ambient(), Capability::Write, main_mcp_config(&with));
-            let b = build_claude_command(&without, "what is my vo2 max", sid, &ActiveModel::ambient(), Capability::Write, main_mcp_config(&without));
-            let argv = |c: &Command| -> Vec<String> {
-                c.as_std()
-                    .get_args()
-                    .map(|s| s.to_string_lossy().into_owned())
-                    .collect()
-            };
-            assert_eq!(argv(&a), argv(&b), "argv identical (kill switch)");
-            assert_eq!(
-                a.as_std().get_current_dir(),
-                b.as_std().get_current_dir(),
-                "cwd identical"
-            );
-            assert_eq!(
-                cmd_env_overrides(&a),
-                cmd_env_overrides(&b),
-                "env overrides identical (none)"
-            );
-        }
-    }
-
-    // ---- The global model switch (main-turn model application) --------------
-
-    /// A resolved non-ambient (GLM) active model for the switch tests, with an env triple
-    /// DISTINCT from every role backend's so a leak is detectable.
-    fn glm_active() -> ActiveModel {
-        ActiveModel {
-            id: "glm-5.2".to_string(),
-            kind: ModelKind::Hosted,
-            env: Some((
-                "http://fireworks".to_string(),
-                "fw-tok".to_string(),
-                "glm-model".to_string(),
-            )),
-            subagent_model: Some("glm-model".to_string()),
-            writes_allowed: false,
-            price: PriceDeck::ZERO,
-            vision: Vec::new(),
-            vision_complementary: false,
-        }
-    }
-
-    /// A cfg with ALL THREE role backends configured to distinct values — the switch must
-    /// never let any of them leak onto the main turn.
-    fn cfg_with_all_role_backends() -> Config {
-        let mut cfg = test_config();
-        cfg.title_backend = Some((
-            "http://title".to_string(),
-            "title-tok".to_string(),
-            "title-model".to_string(),
-        ));
-        cfg.diet_backend = Some((
-            "http://diet".to_string(),
-            "diet-tok".to_string(),
-            "diet-model".to_string(),
-        ));
-        cfg.vaultqa_backend = Some((
-            "http://vault".to_string(),
-            "vault-tok".to_string(),
-            "vault-model".to_string(),
-        ));
-        cfg
-    }
-
-    #[test]
-    fn main_turn_with_active_opus_carries_no_anthropic_env() {
-        // The updated isolation invariant, half one: with the DEFAULT (opus/ambient)
-        // active, the main-turn command carries none of the three ANTHROPIC_* overrides
-        // AND no subagent-model override — even when every role backend is configured.
-        let cfg = cfg_with_all_role_backends();
-        let opus = ActiveModel::ambient();
-        for sid in [None, Some("sess-1")] {
-            let cmd = build_claude_command(&cfg, "do the thing", sid, &opus, turn_capability(&opus), main_mcp_config(&cfg));
-            let env = cmd_env_overrides(&cmd);
-            for k in TITLE_ENV_KEYS {
-                assert!(!env.contains_key(k), "opus main turn must NOT carry {k}");
-            }
-            assert!(
-                !env.contains_key("CLAUDE_CODE_SUBAGENT_MODEL"),
-                "opus main turn must NOT set a subagent model"
-            );
-        }
-    }
-
-    #[test]
-    fn main_turn_with_active_glm_carries_exactly_the_glm_triple_and_subagent_model() {
-        // The updated isolation invariant, half two: with a non-ambient model active, the
-        // main-turn command carries EXACTLY that model's triple + subagent model, and NONE
-        // of the title/diet/vault-QA role backends' distinct values leaks onto it.
-        let cfg = cfg_with_all_role_backends();
-        let active = glm_active();
-        for sid in [None, Some("sess-1")] {
-            let cmd = build_claude_command(&cfg, "do the thing", sid, &active, turn_capability(&active), main_mcp_config(&cfg));
-            let env = cmd_env_overrides(&cmd);
-            assert_eq!(
-                env.get("ANTHROPIC_BASE_URL").map(String::as_str),
-                Some("http://fireworks")
-            );
-            assert_eq!(
-                env.get("ANTHROPIC_AUTH_TOKEN").map(String::as_str),
-                Some("fw-tok")
-            );
-            assert_eq!(
-                env.get("ANTHROPIC_MODEL").map(String::as_str),
-                Some("glm-model")
-            );
-            // The subagents follow the switch.
-            assert_eq!(
-                env.get("CLAUDE_CODE_SUBAGENT_MODEL").map(String::as_str),
-                Some("glm-model")
-            );
-            // No role backend's distinct value appears anywhere in the env overrides.
-            for leaked in [
-                "http://title",
-                "title-tok",
-                "title-model",
-                "http://diet",
-                "diet-tok",
-                "diet-model",
-                "http://vault",
-                "vault-tok",
-                "vault-model",
-            ] {
-                assert!(
-                    !env.values().any(|v| v == leaked),
-                    "role backend value {leaked:?} leaked onto the switched main turn"
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn readonly_main_turn_allowlist_has_no_write_or_send_tools() {
-        // A non-ambient READ-ONLY model (writes off) yields the contained boundary: a
-        // read-only root allowlist and no Write/Edit/Bash/send tool anywhere. The boundary
-        // is the allowlist, not the prompt.
-        let cfg = test_config();
-        let active = glm_active(); // writes_allowed = false
-        let args = build_claude_args(&cfg, "read the vault", None, turn_capability(&active), main_mcp_config(&cfg));
-        let val = |flag: &str| -> Option<String> {
-            args.iter().position(|a| a == flag).map(|i| args[i + 1].clone())
-        };
-        // The read-only ROOT boundary is present.
-        assert_eq!(val("--tools").as_deref(), Some("Read,Grep,Glob"));
-        let allow = val("--allowedTools").expect("--allowedTools present");
-        let tools: Vec<&str> = allow.split(',').map(|t| t.trim()).collect();
-        assert!(tools.contains(&"Read"), "reads are allowed: {tools:?}");
-        // No write, edit, exec, or send tool is in the allowlist.
-        for forbidden in ["Write", "Edit", "Bash", "WebFetch", "WebSearch"] {
-            assert!(
-                !tools.iter().any(|t| *t == forbidden || t.starts_with(&format!("{forbidden}("))),
-                "read-only allowlist must not grant {forbidden}: {tools:?}"
-            );
-        }
-        // And no scoped Bash / node / Skill grant survives (they can write/exec).
-        assert!(
-            !tools.iter().any(|t| t.starts_with("Bash(") || t.starts_with("Skill")),
-            "read-only allowlist must drop the scoped Bash/Skill grants: {tools:?}"
-        );
-    }
-
-    #[test]
-    fn writes_on_non_ambient_model_uses_the_full_allowlist() {
-        // Phase 2 shape: a non-ambient model WITH writes enabled uses the same full
-        // allowlist opus does (byte-for-byte the configured list), not the read-only set.
-        let cfg = test_config();
-        let mut active = glm_active();
-        active.writes_allowed = true;
-        let args = build_claude_args(&cfg, "edit the vault", None, turn_capability(&active), main_mcp_config(&cfg));
-        let allow = args
-            .iter()
-            .position(|a| a == "--allowedTools")
-            .map(|i| args[i + 1].clone())
-            .expect("--allowedTools present");
-        assert_eq!(allow, cfg.allowed_tools, "writes-on → the full allowlist");
-        // No read-only root boundary is added on the writes-on path.
-        assert!(!args.iter().any(|a| a == "--tools"), "no read-only root boundary when writes-on");
-    }
-
-    #[test]
-    fn build_claude_args_resume_when_session() {
-        let cfg = test_config();
-        let args = build_claude_args(&cfg, "hi", Some("sess-42"), Capability::Write, main_mcp_config(&cfg));
-        let ridx = args.iter().position(|a| a == "--resume").expect("--resume");
-        assert_eq!(args[ridx + 1], "sess-42");
-        // No --resume without a session id.
-        let none = build_claude_args(&cfg, "hi", None, Capability::Write, main_mcp_config(&cfg));
-        assert!(!none.iter().any(|a| a == "--resume"));
-    }
-    #[test]
-    fn build_claude_args_never_resumes_a_synthetic_local_id() {
-        // Context carry: a `local-<hex>` thread id names a bridge-minted ledger thread
-        // with NO real claude session behind it, so it must never reach --resume (the
-        // CLI would error on an unknown session). The hosted turn runs fresh; the
-        // caller re-keys the ledger from the synthetic id to the real returned id on
-        // success. Proven directly on the argv the child is spawned with.
-        let cfg = test_config();
-        let synthetic = format!("local-{}", random_hex());
-        let args = build_claude_args(&cfg, "hi", Some(&synthetic), Capability::Write, main_mcp_config(&cfg));
-        assert!(
-            !args.iter().any(|a| a == "--resume"),
-            "a synthetic local- id must never produce --resume: {args:?}"
-        );
-        assert!(
-            !args.iter().any(|a| a == &synthetic),
-            "the synthetic id must not appear anywhere in argv: {args:?}"
-        );
-        // A real id still resumes, unchanged.
-        let real = build_claude_args(&cfg, "hi", Some("real-sess-1"), Capability::Write, main_mcp_config(&cfg));
-        let ridx = real.iter().position(|a| a == "--resume").expect("--resume");
-        assert_eq!(real[ridx + 1], "real-sess-1");
     }
     #[test]
     fn truncate_bytes_caps_multibyte_on_char_boundary() {
@@ -2501,283 +784,4 @@ mod tests {
             "hello"
         );
     }
-
-    // ---- Capability golden --------------------------------------------------
-
-    /// The eight args every `claude` child starts with, turn or one-shot.
-    const GOLDEN_BASE: [&str; 8] = [
-        "-p",
-        "PROMPT",
-        "--output-format",
-        "stream-json",
-        "--verbose",
-        "--include-partial-messages",
-        "--permission-mode",
-        "default",
-    ];
-
-    /// The qmd-only MCP config the main path falls back to when `JESSE_MAIN_MCP_CONFIG`
-    /// is unset, spelled out so the golden pins the literal a child is spawned with.
-    const GOLDEN_QMD_MCP: &str =
-        r#"{"mcpServers":{"qmd":{"type":"stdio","command":"qmd","args":["mcp"]}}}"#;
-    const GOLDEN_EMPTY_MCP: &str = r#"{"mcpServers":{}}"#;
-
-    /// The shared base plus a site's MCP + containment args — one full expected argv.
-    fn golden(tail: &[&str]) -> Vec<String> {
-        GOLDEN_BASE
-            .iter()
-            .chain(tail.iter())
-            .map(|s| (*s).to_string())
-            .collect()
-    }
-
-    /// A `Command`'s argv (everything after the binary name).
-    fn cmd_argv(cmd: &Command) -> Vec<String> {
-        cmd.as_std()
-            .get_args()
-            .map(|s| s.to_string_lossy().into_owned())
-            .collect()
-    }
-
-    #[test]
-    fn the_two_read_call_sites_are_now_identical_apart_from_their_mcp_set() {
-        // The point of deleting the variance: `Read` means ONE thing, so neither site can
-        // drift into being the lenient one. The MCP server set is deliberately still per
-        // call site (the main path requires qmd, the vault-QA child degrades to none), so
-        // the comparison is on the toolset the capability owns.
-        let cfg = test_config();
-        assert_eq!(
-            capability_args(&cfg, Capability::Read),
-            vec![
-                "--tools".to_string(),
-                "Read,Grep,Glob".to_string(),
-                "--allowedTools".to_string(),
-                "Read,Grep,Glob,mcp__qmd__query,mcp__qmd__get,mcp__qmd__multi_get,mcp__qmd__status"
-                    .to_string(),
-                "--disallowedTools".to_string(),
-                "Bash,Write,Edit,NotebookEdit,WebFetch,WebSearch,Task,Agent,ToolSearch,Workflow,TodoWrite,Skill"
-                    .to_string(),
-            ],
-            "one Read posture, used verbatim by the main turn and the vault-QA child"
-        );
-        // And the vault-QA child really does carry it, `Skill` included.
-        let child = cmd_argv(&build_vaultqa_child_command(&cfg, "PROMPT"));
-        let deny = child
-            .iter()
-            .position(|a| a == "--disallowedTools")
-            .map(|i| child[i + 1].clone())
-            .expect("--disallowedTools present");
-        assert!(
-            deny.split(',').any(|t| t.trim() == "Skill"),
-            "the vault-QA child must now deny Skill too: {deny:?}"
-        );
-    }
-
-    #[test]
-    fn capability_ordering_is_cumulative() {
-        // Write implies Read implies Basic, so `>=` reads "at least as capable as".
-        assert!(Capability::Write > Capability::Read);
-        assert!(Capability::Read > Capability::Basic);
-        assert!(Capability::Write >= Capability::Write);
-        assert!(Capability::Basic < Capability::Write);
-    }
-
-    #[test]
-    fn turn_capability_follows_the_models_write_permission() {
-        assert_eq!(
-            turn_capability(&ActiveModel::ambient()),
-            Capability::Write,
-            "ambient opus is writes-on"
-        );
-        let mut off = ActiveModel::ambient();
-        off.writes_allowed = false;
-        assert_eq!(turn_capability(&off), Capability::Read);
-    }
-
-    /// THE GOLDEN. The exact argv each of the five spawn sites produces, captured from the
-    /// four separate builders that preceded the single `capability_args`. Every future
-    /// posture change has to edit a literal here, which is the point: a containment change
-    /// is never incidental.
-    ///
-    /// The `Write` allowlist/denylist are read from the fixture config because passing the
-    /// CONFIGURED lists verbatim is exactly what `Write` means; their contents are pinned
-    /// by `build_claude_args_enforces_least_privilege`.
-    #[test]
-    fn golden_argv_for_every_capability_call_site() {
-        let cfg = test_config();
-        let allow = cfg.allowed_tools.clone();
-        let deny = cfg.disallowed_tools.clone();
-
-        // 1. MAIN TURN, writes on → Write, qmd-only MCP. No root `--tools`.
-        assert_eq!(
-            build_claude_args(
-                &cfg,
-                "PROMPT",
-                None,
-                Capability::Write,
-                main_mcp_config(&cfg)
-            ),
-            golden(&[
-                "--strict-mcp-config",
-                "--mcp-config",
-                GOLDEN_QMD_MCP,
-                "--allowedTools",
-                &allow,
-                "--disallowedTools",
-                &deny,
-            ]),
-            "main turn (writes on)"
-        );
-
-        // 2. MAIN TURN, writes off → Read, same qmd-only MCP. `Skill` denied.
-        assert_eq!(
-            build_claude_args(
-                &cfg,
-                "PROMPT",
-                None,
-                Capability::Read,
-                main_mcp_config(&cfg)
-            ),
-            golden(&[
-                "--strict-mcp-config",
-                "--mcp-config",
-                GOLDEN_QMD_MCP,
-                "--tools",
-                "Read,Grep,Glob",
-                "--allowedTools",
-                "Read,Grep,Glob,mcp__qmd__query,mcp__qmd__get,mcp__qmd__multi_get,mcp__qmd__status",
-                "--disallowedTools",
-                "Bash,Write,Edit,NotebookEdit,WebFetch,WebSearch,Task,Agent,ToolSearch,Workflow,TodoWrite,Skill",
-            ]),
-            "main turn (writes off)"
-        );
-
-        // 3. VAULT-QA child (and the shadow child, which shares its builder) → Read, but
-        //    its OWN MCP set: unset `JESSE_VAULTQA_MCP_CONFIG` → no servers, where the
-        //    main path falls back to qmd. That divergence is deliberate and stays.
-        //    The denylist is now the same at both Read sites.
-        assert_eq!(
-            cmd_argv(&build_vaultqa_child_command(&cfg, "PROMPT")),
-            golden(&[
-                "--strict-mcp-config",
-                "--mcp-config",
-                GOLDEN_EMPTY_MCP,
-                "--tools",
-                "Read,Grep,Glob",
-                "--allowedTools",
-                "Read,Grep,Glob,mcp__qmd__query,mcp__qmd__get,mcp__qmd__multi_get,mcp__qmd__status",
-                "--disallowedTools",
-                "Bash,Write,Edit,NotebookEdit,WebFetch,WebSearch,Task,Agent,ToolSearch,Workflow,TodoWrite,Skill",
-            ]),
-            "vault-QA child (no MCP config)"
-        );
-
-        // 3b. The same child with the qmd MCP config path set: passed through verbatim.
-        let mut cfg_mcp = test_config();
-        cfg_mcp.vaultqa_mcp_config = Some("/etc/jesse/qmd.json".to_string());
-        assert_eq!(
-            cmd_argv(&build_vaultqa_child_command(&cfg_mcp, "PROMPT")),
-            golden(&[
-                "--strict-mcp-config",
-                "--mcp-config",
-                "/etc/jesse/qmd.json",
-                "--tools",
-                "Read,Grep,Glob",
-                "--allowedTools",
-                "Read,Grep,Glob,mcp__qmd__query,mcp__qmd__get,mcp__qmd__multi_get,mcp__qmd__status",
-                "--disallowedTools",
-                "Bash,Write,Edit,NotebookEdit,WebFetch,WebSearch,Task,Agent,ToolSearch,Workflow,TodoWrite,Skill",
-            ]),
-            "vault-QA child (qmd MCP config)"
-        );
-
-        // 4. DIET children (extract + verify) → Basic. Empty root toolset, no MCP.
-        assert_eq!(
-            cmd_argv(&build_diet_child_command(&cfg, "PROMPT")),
-            golden(&[
-                "--strict-mcp-config",
-                "--mcp-config",
-                GOLDEN_EMPTY_MCP,
-                "--tools",
-                "",
-                "--allowedTools",
-                "",
-                "--disallowedTools",
-                "Bash,Write,Edit,NotebookEdit,WebFetch,WebSearch,Task,Glob,Grep,Read,ToolSearch,Workflow,Agent,TodoWrite,Skill",
-            ]),
-            "diet extract/verify children"
-        );
-
-        // 5. TITLE one-shot → Basic with NO MCP servers. Writing a short title needs no
-        //    tools and no vault search, so it is granted neither — the same posture as the
-        //    diet children, differing only in the cwd each call site chose.
-        assert_eq!(
-            cmd_argv(&build_claude_command(
-                &cfg,
-                "PROMPT",
-                None,
-                &ActiveModel::ambient(),
-                Capability::Basic,
-                EMPTY_MCP_CONFIG
-            )),
-            golden(&[
-                "--strict-mcp-config",
-                "--mcp-config",
-                GOLDEN_EMPTY_MCP,
-                "--tools",
-                "",
-                "--allowedTools",
-                "",
-                "--disallowedTools",
-                "Bash,Write,Edit,NotebookEdit,WebFetch,WebSearch,Task,Glob,Grep,Read,ToolSearch,Workflow,Agent,TodoWrite,Skill",
-            ]),
-            "title one-shot"
-        );
-    }
-
-    /// The ONE way the collapse was not byte-identical, made explicit rather than buried.
-    ///
-    /// The CHILD sites emit the same flags with the same values in a different POSITION:
-    /// they used to put `--tools` before the MCP pair, and now every site assembles in one
-    /// order (base, MCP, toolset), which is what lets one builder serve all five. `claude`
-    /// does not care about flag order, and this proves nothing was added, removed, or
-    /// altered in value: the new vector is a permutation of the pre-collapse one.
-    #[test]
-    fn the_child_reorder_is_a_pure_permutation() {
-        let cfg = test_config();
-        // The pre-collapse DIET vector, captured from the builder the collapse replaced.
-        //
-        // The vault-QA child is deliberately NOT checked here any more: its denylist
-        // gained `Skill` in this commit, so its argv is no longer value-identical to the
-        // pre-collapse one and asserting a permutation would mean rewriting the captured
-        // literal into a vector that never existed. That site's exact argv, before and
-        // after, is pinned by the golden instead. The diet children changed position only,
-        // which is what this test is for.
-        let old_diet: Vec<String> = golden(&[
-            "--tools",
-            "",
-            "--strict-mcp-config",
-            "--mcp-config",
-            GOLDEN_EMPTY_MCP,
-            "--allowedTools",
-            "",
-            "--disallowedTools",
-            "Bash,Write,Edit,NotebookEdit,WebFetch,WebSearch,Task,Glob,Grep,Read,ToolSearch,Workflow,Agent,TodoWrite,Skill",
-        ]);
-        let new_diet = cmd_argv(&build_diet_child_command(&cfg, "PROMPT"));
-        let sorted = |v: &[String]| {
-            let mut v = v.to_vec();
-            v.sort();
-            v
-        };
-        assert_ne!(
-            old_diet, new_diet,
-            "this test is pointless if nothing moved"
-        );
-        assert_eq!(
-            sorted(&old_diet),
-            sorted(&new_diet),
-            "the reorder must not add, drop or change any argument"
-        );
-        }
 }

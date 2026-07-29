@@ -269,9 +269,20 @@ pub async fn run_ask_hosted_or_emergency(
         }
     }
 
-    // Attempt hosted — under the ACTIVE model (byte-for-byte today's turn for opus).
-    let (out, usage) =
-        split_turn_usage(run_claude_streaming(cfg, prompt, sid, jobs, jid, active).await);
+    // Attempt hosted — under the ACTIVE model (byte-for-byte today's turn for opus),
+    // through the harness that serves turns.
+    let (out, usage) = split_turn_usage(
+        run_claude_streaming(
+            cfg,
+            prompt,
+            sid,
+            jobs,
+            jid,
+            active,
+            cfg.harnesses.turn_harness(),
+        )
+        .await,
+    );
     let out = apply_directives(out);
     match out {
         Ok(v) => {
@@ -624,11 +635,14 @@ pub async fn jesse(
     let context = st.context.clone();
     let titles = st.titles.clone();
     // Conversation identity (NOT a feature-flagged concern): the registry, this turn's
-    // conversation id, and the projects dir the in-flight snapshot and the terminal stem
-    // diff both read. All three are needed on every path, success or failure.
+    // conversation id, and the TURN HARNESS's transcript dir, which the in-flight snapshot
+    // and the terminal stem diff both read. All three are needed on every path, success or
+    // failure. The dir is `None` for a harness that keeps no transcripts on disk: there are
+    // then no stems to snapshot and none to bind, and the session id the reply carries
+    // (bound below) is the whole record.
     let conversations = st.conversations.clone();
     let cid = conversation_id.clone();
-    let sessions_dir = st.sessions_dir();
+    let sessions_dir = st.cfg.harnesses.turn_harness().transcript_dir(&st.cfg);
     // Meal-corrections queue (JESSE_MEAL_LOG v2): merged into the delivered `meal_log` at
     // completion, so off-app corrections ride this turn's terminal result.
     let meal_corrections = st.meal_corrections.clone();
@@ -646,6 +660,10 @@ pub async fn jesse(
         // files therefore survive run_claude's internal retries and are cleaned
         // exactly once, here.
         let _scratch = scratch;
+        // The agent program this turn runs on. One is registered (`claude-code`) and
+        // nothing selects another; the driver calls through it for the child command and
+        // the per-attempt line parser.
+        let harness = cfg.harnesses.turn_harness();
         // If the body below panics — or the task is aborted (cancel) while still
         // waiting for a permit — this guard's Drop drives the job to a terminal
         // state + terminal stream frame (M2). It's write-once, so a cancel that
@@ -687,7 +705,10 @@ pub async fn jesse(
         let flight = conversations.claim_flight(
             &jid,
             &cid,
-            transcript_stems(&sessions_dir),
+            sessions_dir
+                .as_deref()
+                .map(transcript_stems)
+                .unwrap_or_default(),
             system_time_to_ms(SystemTime::now()),
         );
 
@@ -780,8 +801,16 @@ pub async fn jesse(
             // The active model backs the hosted turn (byte-for-byte today's for opus).
             // Peel the token usage off for the per-turn cost badge.
             let (out, usage) = split_turn_usage(
-                run_claude_streaming(&cfg, &hosted_prompt, sid.as_deref(), &jobs, &jid, &active)
-                    .await,
+                run_claude_streaming(
+                    &cfg,
+                    &hosted_prompt,
+                    sid.as_deref(),
+                    &jobs,
+                    &jid,
+                    &active,
+                    harness,
+                )
+                .await,
             );
             (apply_directives(out), usage)
         };
@@ -1026,8 +1055,8 @@ pub async fn jesse(
                     conversations.bind_session(&cid, reply_sid);
                 }
             }
-            if let Some(claimed) = &claimed {
-                bind_new_stems(&sessions_dir, &conversations, &cid, claimed);
+            if let (Some(claimed), Some(dir)) = (&claimed, &sessions_dir) {
+                bind_new_stems(dir, &conversations, &cid, claimed);
             }
         }
 
