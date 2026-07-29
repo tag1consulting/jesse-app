@@ -134,6 +134,23 @@ public enum LastUsedModelStore {
 /// default `ModelInfo.streamsText` uses on the wire. Both staleness directions are benign: a
 /// stale `false` shows a progress row that disappears the moment text arrives, and a stale
 /// `true` is exactly today's behaviour.
+///
+/// **Persisted across launches**, `UserDefaults`-backed and per-device like
+/// `LastUsedModelStore` above, so a relaunch still knows what the last list load taught it.
+/// The one uncovered case is a device that has NEVER loaded a list — first run, or after a
+/// reinstall — sending a turn before the picker's load completes: the record is empty, every
+/// id answers "streams", and the progress row does not appear for that turn. That is the
+/// benign direction and it self-corrects on the first successful load.
+///
+/// **DELETE THIS STORE when the model list stops being private `@State` in
+/// `ModelPickerMenu`.** That is the only reason it exists: the transcript needs the running
+/// model's `streamsText` and cannot see the picker's list, and lifting that state was a larger
+/// change to a working view than the problem warranted. The moment the list lives anywhere the
+/// transcript can read it — hoisted into the detail view, a shared observable, or the run
+/// coordinator recording the model's shape per turn — read `ModelInfo.streamsText` directly
+/// and remove this. Keeping it then would make it a second source of truth for a field
+/// `ModelInfo` already carries, and a cache that can disagree with the list it came from is
+/// worse than no cache.
 public enum NonStreamingModelStore {
     public static let defaultsKey = "jesse.nonStreamingModelIDs"
 
