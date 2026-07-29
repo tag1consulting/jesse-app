@@ -99,29 +99,52 @@ nonisolated struct HealthKitMealWriter: MealWriting {
         }
     }
 
-    /// The predicate selecting what `delete(id:)` may remove: the app's OWN `.food`
-    /// correlations whose external id is `id`. A conjunction of two clauses, and both
-    /// are load-bearing:
+    /// The clause that picks the meal: the external id stored as
+    /// `HKMetadataKeyExternalUUID` when the correlation was saved. Selection by this
+    /// clause ALONE would rest on a value that arrives in agent output and is validated
+    /// only as a non-empty string, so it is never used on its own — see
+    /// `deletePredicate(id:scopedTo:)`.
+    static func externalIDPredicate(id: String) -> NSPredicate {
+        HKQuery.predicateForObjects(
+            withMetadataKey: HKMetadataKeyExternalUUID, allowedValues: [id])
+    }
+
+    /// The app's own-source scope, and the reason the delete path is safe regardless of
+    /// what id it is handed.
     ///
-    /// * the metadata clause picks the meal, since the meal id is stored as
-    ///   `HKMetadataKeyExternalUUID` when the correlation is saved;
-    /// * the SOURCE clause scopes the query to samples this app saved.
+    /// **Never call this from a test.** `HKSource.default()` derives the client's
+    /// identity from the process's code-signing ENTITLEMENTS — not from `Info.plist`,
+    /// whose `CFBundleIdentifier` is present either way. A process built with
+    /// `CODE_SIGNING_ALLOWED=NO`, which is exactly how CI builds and tests this app, has
+    /// no entitlements, so this raises `NSGenericException` ("Unable to create default
+    /// source from entitlements") and, being an uncaught ObjC exception, terminates the
+    /// host. The shipping app is signed and carries the HealthKit entitlement, so the
+    /// production path is unaffected. This is why the composition below is factored out
+    /// and tested separately from the scope itself.
+    static func ownSourceScope() -> NSPredicate {
+        HKQuery.predicateForObjects(from: HKSource.default())
+    }
+
+    /// The predicate selecting what `delete(id:)` may remove: `sourceScope` AND the
+    /// external-id match. Both clauses are load-bearing, and the source clause is what
+    /// makes the scoping a property of this code rather than an inherited one.
     ///
-    /// The source clause is what makes the scoping a property of this code rather than
-    /// an inherited one. Two platform behaviours would otherwise have to hold for the
-    /// metadata clause alone to be safe — that HealthKit refuses to delete objects the
-    /// app did not write, and that an app with no dietary READ authorization can only
-    /// see its own food samples. Both are Apple-documented, neither is asserted here,
-    /// and the second silently stops holding the moment a dietary type is added to
-    /// `HealthContextProvider.readTypes` (say, to show intake across all sources). The
-    /// id reaching this method comes from agent output and is only validated as a
-    /// non-empty string, so it may name anything; this predicate is why that does not
-    /// matter. Exposed and pure so the conjunction is unit-testable without a store.
-    static func deletePredicate(id: String) -> NSPredicate {
+    /// Two platform behaviours would otherwise have to hold for the id clause alone to
+    /// be safe — that HealthKit refuses to delete objects the app did not write, and
+    /// that an app with no dietary READ authorization can only see its own food samples.
+    /// Both are Apple-documented, neither is asserted anywhere, and the second stops
+    /// holding the moment a dietary type is added to `HealthContextProvider.readTypes`
+    /// (say, to show intake across all sources).
+    ///
+    /// Pure, and takes the scope as a parameter rather than building it, so the
+    /// conjunction is unit-testable in an unsigned test host where `ownSourceScope()`
+    /// cannot be constructed at all. The one caller passes `ownSourceScope()`; that the
+    /// call site still does so is checked by `scripts/ci-guards.sh`, since no test in an
+    /// unsigned process can observe it.
+    static func deletePredicate(id: String, scopedTo sourceScope: NSPredicate) -> NSPredicate {
         NSCompoundPredicate(andPredicateWithSubpredicates: [
-            HKQuery.predicateForObjects(
-                withMetadataKey: HKMetadataKeyExternalUUID, allowedValues: [id]),
-            HKQuery.predicateForObjects(from: HKSource.default()),
+            externalIDPredicate(id: id),
+            sourceScope,
         ])
     }
 
@@ -138,7 +161,7 @@ nonisolated struct HealthKitMealWriter: MealWriting {
     func delete(id: String) async -> Bool {
         guard HKHealthStore.isHealthDataAvailable() else { return false }
         let store = HKHealthStore()
-        let predicate = Self.deletePredicate(id: id)
+        let predicate = Self.deletePredicate(id: id, scopedTo: Self.ownSourceScope())
         do {
             let correlations = try await withCheckedThrowingContinuation {
                 (cont: CheckedContinuation<[HKCorrelation], Error>) in

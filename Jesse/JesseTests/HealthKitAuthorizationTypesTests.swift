@@ -58,25 +58,38 @@ final class HealthKitAuthorizationTypesTests: XCTestCase {
         }
     }
 
-    /// The meal delete predicate must be a CONJUNCTION of the external-id match and a
-    /// source scope. Dropping the source clause would leave selection resting on the
+    /// The meal delete predicate must be a CONJUNCTION of the external-id match and the
+    /// scope it is given. Dropping either clause would leave selection resting on the
     /// metadata id alone, which comes from agent output and is validated only as a
-    /// non-empty string. Asserted structurally (a compound `AND` of exactly two
-    /// clauses, one of them the source predicate) because HealthKit's predicates are
-    /// opaque and a real store is unexercisable in the sandbox.
-    func testDeletePredicateIsScopedToThisAppsSource() {
-        let predicate = HealthKitMealWriter.deletePredicate(id: "2026-07-29-lunch")
+    /// non-empty string.
+    ///
+    /// The scope is passed in rather than built here for a reason worth stating: the
+    /// real scope, `HealthKitMealWriter.ownSourceScope()`, calls `HKSource.default()`,
+    /// which reads the process's code-signing entitlements and raises
+    /// `NSGenericException` when there are none. CI builds and tests this app with
+    /// `CODE_SIGNING_ALLOWED=NO`, so calling it here would terminate the test host — it
+    /// did, before this was split. Composition is therefore tested with a stand-in
+    /// scope, and the fact that the caller passes the real one is checked by
+    /// `scripts/ci-guards.sh`, which is a source-level pattern check rather than a
+    /// behavioural test. That is the honest division: an unsigned process cannot observe
+    /// the real scope at all.
+    func testDeletePredicateAndsTheIDClauseWithTheGivenScope() {
+        let scope = NSPredicate(format: "%K == %@", "stand_in_scope", "own-source")
+        let predicate = HealthKitMealWriter.deletePredicate(id: "2026-07-29-lunch",
+                                                           scopedTo: scope)
         guard let compound = predicate as? NSCompoundPredicate else {
             return XCTFail("delete predicate is not a compound predicate: \(predicate)")
         }
         XCTAssertEqual(compound.compoundPredicateType, .and,
                        "delete predicate must AND its clauses, never OR them")
         XCTAssertEqual(compound.subpredicates.count, 2,
-                       "delete predicate must carry exactly the id clause and the source clause")
-        let sourceClause = HKQuery.predicateForObjects(from: HKSource.default())
-        XCTAssertTrue(compound.subpredicates.contains { ($0 as? NSPredicate) == sourceClause },
-                      "delete predicate is missing the source scope — deletion would rest on "
-                      + "the agent-supplied external id alone")
+                       "delete predicate must carry exactly the id clause and the scope")
+        XCTAssertTrue(compound.subpredicates.contains { ($0 as? NSPredicate) == scope },
+                      "delete predicate dropped the scope it was given — deletion would rest "
+                      + "on the agent-supplied external id alone")
+        let idClause = HealthKitMealWriter.externalIDPredicate(id: "2026-07-29-lunch")
+        XCTAssertTrue(compound.subpredicates.contains { ($0 as? NSPredicate) == idClause },
+                      "delete predicate dropped the external-id clause")
     }
 
     /// No identifier in ANY authorization set (read or share) may be a correlation

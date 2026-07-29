@@ -15,7 +15,7 @@ CI both run it). See the "Versioning" section of `bridge/README.md`.
 
 ## [Unreleased]
 
-## [Bridge 0.43.3] - 2026-07-29 / [App 1.0 (84)]
+## [Bridge 0.43.3] - 2026-07-29 / [App 1.0 (85)]
 
 Meal deletion says in the app what it previously inherited from the platform, and the
 directive registry can no longer grow a field that nothing recognizes.
@@ -34,10 +34,22 @@ directive registry can no longer grow a field that nothing recognizes.
   app's own samples. Both are Apple-documented platform behaviours rather than
   properties of this code, and the second would have stopped holding silently the first
   time a dietary read type was added. Selection is now
-  `deletePredicate(id:)`, a conjunction of the external-id match AND
-  `HKQuery.predicateForObjects(from: HKSource.default())`, so correctness no longer
-  depends on either. Behaviour is otherwise unchanged, including the idempotent
-  zero-match success that keeps a junk id from becoming a retry loop.
+  `deletePredicate(id:scopedTo:)`, a conjunction of the external-id match AND
+  `ownSourceScope()` (`HKQuery.predicateForObjects(from: HKSource.default())`), so
+  correctness no longer depends on either. Behaviour is otherwise unchanged, including
+  the idempotent zero-match success that keeps a junk id from becoming a retry loop — a
+  source scope can only narrow the match set toward zero, which is the safe direction.
+- **`HKSource.default()` is entitlement-derived, so it cannot be called from a test
+  here.** It reads the process's code-signing entitlements rather than `Info.plist`
+  (whose `CFBundleIdentifier` is present regardless), and raises `NSGenericException`
+  when there are none — terminating the host, since it is an uncaught ObjC exception.
+  CI builds and tests this app with `CODE_SIGNING_ALLOWED=NO`, so the first version of
+  this change passed locally against a signed build and took the CI test host down. The
+  predicate is therefore split: `deletePredicate(id:scopedTo:)` is pure and takes the
+  scope as a parameter, so the conjunction is unit-tested with a stand-in scope, while
+  `ownSourceScope()` is confined to the one production call site. That the call site
+  still passes it is checked by `scripts/ci-guards.sh`, a source-level pattern check —
+  an unsigned process cannot observe the real scope at all.
 
 ### Added
 
