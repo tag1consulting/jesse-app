@@ -380,15 +380,27 @@ pub fn vaultqa_mcp_config(cfg: &Config) -> &str {
 /// read-only built-ins — file read and the two search tools. Nothing that can write,
 /// execute, or reach the network exists at the root, so those classes are absent rather
 /// than permission-gated.
+///
+/// TOOL NAMES ONLY, no path scope. `--tools` decides which tools EXIST at the root; the
+/// path boundary is expressed in the `--allowedTools` grant below, which is where the CLI
+/// reads a scope from. Writing `Read(./**)` here would name no known tool.
 pub const READ_ROOT_TOOLS: &str = "Read,Grep,Glob";
 
 /// The `--allowedTools` grant for a [`Capability::Read`] child: the three read-only
-/// built-ins plus the four read-only qmd MCP search tools (present only when the site's
-/// MCP config supplies the qmd server; absent otherwise, and then simply never invoked).
-/// The web fetch and web search tools are deliberately NOT granted here — widening the
-/// read surface to the network is a separate decision with a security consequence.
-pub const READ_ALLOWED_TOOLS: &str =
-    "Read,Grep,Glob,mcp__qmd__query,mcp__qmd__get,mcp__qmd__multi_get,mcp__qmd__status";
+/// built-ins, PATH-SCOPED to the child's working directory, plus the four read-only qmd
+/// MCP search tools (present only when the site's MCP config supplies the qmd server;
+/// absent otherwise, and then simply never invoked). The web fetch and web search tools are
+/// deliberately NOT granted here — widening the read surface to the network is a separate
+/// decision with a security consequence.
+///
+/// The `(./**)` scope is the same boundary, and the same hand-checked mechanism, as the
+/// writes-on allowlist's — see [`DEFAULT_ALLOWED_TOOLS`] for why it is relative and why
+/// `Grep` and `Glob` are scoped alongside `Read`. It matters MORE here than at `Write`:
+/// both `Read` rows back children that run unattended (the vault-QA child, the shadow
+/// child), and an unscoped read there reaches every file the bridge user can read.
+/// Both sites that spawn a `Read` child run it in the vault, so `./**` IS the vault.
+pub const READ_ALLOWED_TOOLS: &str = "Read(./**),Grep(./**),Glob(./**),\
+mcp__qmd__query,mcp__qmd__get,mcp__qmd__multi_get,mcp__qmd__status";
 
 /// Tools DENIED to EVERY [`Capability::Read`] child as belt-and-suspenders BEHIND the real
 /// boundary (the [`READ_ROOT_TOOLS`] root allowlist + strict MCP). It names every mutation
@@ -1511,15 +1523,24 @@ mod tests {
         let allow = cmd_arg_value(&cmd, "--allowedTools").expect("--allowedTools present");
         let allowed: Vec<&str> = allow.split(',').map(|t| t.trim()).collect();
         for t in [
-            "Read",
-            "Grep",
-            "Glob",
+            // PATH-SCOPED, not bare: this child runs unattended in the vault, and an
+            // unscoped read reaches every file the bridge user can read.
+            "Read(./**)",
+            "Grep(./**)",
+            "Glob(./**)",
             "mcp__qmd__query",
             "mcp__qmd__get",
             "mcp__qmd__multi_get",
             "mcp__qmd__status",
         ] {
             assert!(allowed.contains(&t), "allowlist must name {t}: {allowed:?}");
+        }
+        for bare in ["Read", "Grep", "Glob"] {
+            assert!(
+                !allowed.contains(&bare),
+                "an UNSCOPED {bare} grant would put the whole filesystem back in reach: \
+                 {allowed:?}"
+            );
         }
         // No mutation/exec built-in is granted.
         for t in ["Write", "Edit", "Bash"] {
@@ -1800,7 +1821,14 @@ mod tests {
         assert_eq!(val("--tools").as_deref(), Some("Read,Grep,Glob"));
         let allow = val("--allowedTools").expect("--allowedTools present");
         let tools: Vec<&str> = allow.split(',').map(|t| t.trim()).collect();
-        assert!(tools.contains(&"Read"), "reads are allowed: {tools:?}");
+        assert!(
+            tools.contains(&"Read(./**)"),
+            "reads are allowed, and path-scoped to the working directory: {tools:?}"
+        );
+        assert!(
+            !tools.contains(&"Read"),
+            "a bare Read grant reaches every file the bridge user can read: {tools:?}"
+        );
         // No write, edit, exec, or send tool is in the allowlist.
         for forbidden in ["Write", "Edit", "Bash", "WebFetch", "WebSearch"] {
             assert!(
@@ -1948,7 +1976,7 @@ mod tests {
                 "--tools".to_string(),
                 "Read,Grep,Glob".to_string(),
                 "--allowedTools".to_string(),
-                "Read,Grep,Glob,mcp__qmd__query,mcp__qmd__get,mcp__qmd__multi_get,mcp__qmd__status"
+                "Read(./**),Grep(./**),Glob(./**),mcp__qmd__query,mcp__qmd__get,mcp__qmd__multi_get,mcp__qmd__status"
                     .to_string(),
                 "--disallowedTools".to_string(),
                 "Bash,Write,Edit,NotebookEdit,WebFetch,WebSearch,Task,Agent,ToolSearch,Workflow,TodoWrite,Skill"
@@ -2020,7 +2048,7 @@ mod tests {
                 "--tools",
                 "Read,Grep,Glob",
                 "--allowedTools",
-                "Read,Grep,Glob,mcp__qmd__query,mcp__qmd__get,mcp__qmd__multi_get,mcp__qmd__status",
+                "Read(./**),Grep(./**),Glob(./**),mcp__qmd__query,mcp__qmd__get,mcp__qmd__multi_get,mcp__qmd__status",
                 "--disallowedTools",
                 "Bash,Write,Edit,NotebookEdit,WebFetch,WebSearch,Task,Agent,ToolSearch,Workflow,TodoWrite,Skill",
             ]),
@@ -2040,7 +2068,7 @@ mod tests {
                 "--tools",
                 "Read,Grep,Glob",
                 "--allowedTools",
-                "Read,Grep,Glob,mcp__qmd__query,mcp__qmd__get,mcp__qmd__multi_get,mcp__qmd__status",
+                "Read(./**),Grep(./**),Glob(./**),mcp__qmd__query,mcp__qmd__get,mcp__qmd__multi_get,mcp__qmd__status",
                 "--disallowedTools",
                 "Bash,Write,Edit,NotebookEdit,WebFetch,WebSearch,Task,Agent,ToolSearch,Workflow,TodoWrite,Skill",
             ]),
@@ -2059,7 +2087,7 @@ mod tests {
                 "--tools",
                 "Read,Grep,Glob",
                 "--allowedTools",
-                "Read,Grep,Glob,mcp__qmd__query,mcp__qmd__get,mcp__qmd__multi_get,mcp__qmd__status",
+                "Read(./**),Grep(./**),Glob(./**),mcp__qmd__query,mcp__qmd__get,mcp__qmd__multi_get,mcp__qmd__status",
                 "--disallowedTools",
                 "Bash,Write,Edit,NotebookEdit,WebFetch,WebSearch,Task,Agent,ToolSearch,Workflow,TodoWrite,Skill",
             ]),

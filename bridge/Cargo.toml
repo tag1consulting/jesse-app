@@ -1,8 +1,33 @@
 [package]
 name = "jesse-bridge"
-version = "0.41.0"
+version = "0.42.0"
 edition = "2021"
 license = "Apache-2.0"
+
+# The live containment battery — the probe prompts, the runner, its loopback listener
+# and the scratch worlds (`src/probe.rs`). OFF by default, so the serving binary is
+# built without a line of it: none of it answers a turn, and it would otherwise put the
+# probe machinery (and ~40 more names) inside the bridge that talks to the phone.
+#
+# The record itself (`bridge/containment.toml`), its parser and the scoring rules stay
+# on the always-compiled path in `src/containment.rs`, because the startup gate reads
+# all three on every boot.
+#
+#   cargo test    --features containment-probe          # incl. tests/containment.rs
+#   cargo run     --features containment-probe --bin containment-probe -- --write
+#   cargo build   --release                             # the serving binary, without it
+[features]
+containment-probe = []
+
+# Declared (rather than auto-discovered) so `required-features` can keep them out of a
+# default build; every other bin under src/bin stays auto-discovered.
+[[bin]]
+name = "containment-probe"
+required-features = ["containment-probe"]
+
+[[test]]
+name = "containment"
+required-features = ["containment-probe"]
 
 [dependencies]
 axum = "0.7"

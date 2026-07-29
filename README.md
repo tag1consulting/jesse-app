@@ -118,9 +118,12 @@ Read this before pairing a second device or running the bridge anywhere shared.
   tailnet can read and write your vault. Treat it like a password.
 - **The bridge runs Claude Code under an explicit tool allowlist inside your
   vault** — `--permission-mode default` plus a scoped `--allowedTools` list
-  (file read/write/search, read-only vault search, and scoped `git`/`mv`/`ls`/
-  `cat`/`find`), with unscoped shell and `WebFetch` denied. It can read and
-  modify files in the vault ("Tell Jesse" is how capture works). Point
+  (file read/write/search **path-scoped to the vault**, read-only vault search,
+  and scoped `git`/`mv`/`ls`/`cat`/`find`), with unscoped shell and `WebFetch`
+  denied. The path scope is checked by a live probe battery rather than assumed:
+  a child cannot read or write outside the vault, while the `git` scope's
+  network reach is a known-open finding recorded in `bridge/containment.toml`.
+  It can read and modify files in the vault ("Tell Jesse" is how capture works). Point
   `JESSE_VAULT` only at a directory you are comfortable letting it change, and
   only pair people you trust on your tailnet. The allowlist is the only
   in-process boundary; see [SECURITY.md](SECURITY.md) for the deployment posture
@@ -222,7 +225,7 @@ Full table in [`bridge/README.md`](bridge/README.md#knobs-env-vars). Most-used:
 | `JESSE_BIND` | `127.0.0.1` | Interface to bind. Set to the tailnet IP for phone access. Loopback/tailnet only unless `JESSE_ALLOW_PUBLIC_BIND=1`. |
 | `JESSE_ALLOW_PUBLIC_BIND` | _(off)_ | Set to `1` to allow binding a non-loopback/non-tailnet address. Off by default; an unsafe bind is otherwise a startup error. |
 | `JESSE_ALLOWED_TOOLS` | _(scoped default)_ | Comma-separated `--allowedTools` list for the agent. See [SECURITY.md](SECURITY.md). |
-| `JESSE_DISALLOWED_TOOLS` | `Bash,WebFetch` | Comma-separated `--disallowedTools` denylist (defense-in-depth). |
+| `JESSE_DISALLOWED_TOOLS` | `WebFetch` | Comma-separated `--disallowedTools` denylist (defense-in-depth). Bare `Bash` is deliberately absent — denying the class kills every scoped `Bash(<verb>:*)` grant; see [SECURITY.md](SECURITY.md). |
 | `JESSE_MAX_CONCURRENCY` | `1` | Max concurrent turns — a single global write lock by default, so one turn rewrites the vault at a time. A turn that can't get a permit is queued, not rejected. |
 | `JESSE_MAX_QUEUED` | `4` | Depth of the wait queue in front of the concurrency limit; when no permit is free, up to this many turns wait for one, and only load beyond the queue returns `429`. `0` disables the queue (immediate `429`). |
 | `JESSE_RATE_PER_MIN` | `30` | Accepted requests per rolling minute; bursts beyond it return `429`. |

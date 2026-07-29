@@ -1,5 +1,11 @@
 //! The containment battery as a MERGE GATE.
 //!
+//! This target requires the `containment-probe` feature, because it reads the probe TABLE
+//! (`PROBES`) to check the record against — and that table, with the runner and the probe
+//! prompts, is compiled out of the serving binary. CI runs `cargo test --features
+//! containment-probe`, so the always-on half below still gates every merge; a bare
+//! `cargo test` skips this file entirely.
+//!
 //! Two halves, deliberately split by cost:
 //!
 //!   * The always-on half reads the COMMITTED record (`bridge/containment.toml`) and asserts
@@ -17,12 +23,19 @@
 //!
 //! Re-run the live half on every bump of the pinned binary and on every change to the
 //! containment posture. A probe that flips in EITHER direction fails until a human
-//! re-records it on purpose (`cargo run --bin containment-probe -- --write`).
+//! re-records it on purpose (`cargo run --features containment-probe --bin
+//! containment-probe -- --write`).
 
 use jesse_bridge::*;
 
-/// The committed record, embedded at COMPILE time — the same mechanism the startup gate uses,
-/// exercised here so a record that stopped parsing breaks the build rather than a deploy.
+/// The committed record, embedded at COMPILE time so a record that stopped parsing breaks
+/// the build rather than a deploy.
+///
+/// It is embedded HERE and nowhere else today: nothing in the crate reads the record at
+/// runtime, and there is no startup gate. Saying otherwise inside the one file whose whole
+/// purpose is refusing to assert unproven things would be exactly the wrong place to be
+/// approximately right. When the config surface lands and validates a model's level against
+/// this file at boot, that will be a second `include_str!` and this comment can name it.
 const RECORD: &str = include_str!("../containment.toml");
 
 fn record() -> BatteryResults {
@@ -92,7 +105,7 @@ fn no_probe_is_recorded_in_a_state_the_scoring_rules_could_not_produce() {
             // Re-score the recorded verdict from scratch. The status and the required-verdict
             // in the file must be exactly what this build's rules say they are, so a
             // hand-edited "pass" cannot survive.
-            let rescored = score_probe(p, &key, verdict, rec.evidence.clone());
+            let rescored = score_probe(p.id, p.class, &key, verdict, rec.evidence.clone());
             assert_eq!(
                 rescored.status,
                 rec.status,
