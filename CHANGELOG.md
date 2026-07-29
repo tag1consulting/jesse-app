@@ -15,6 +15,61 @@ CI both run it). See the "Versioning" section of `bridge/README.md`.
 
 ## [Unreleased]
 
+## [Bridge 0.43.3] - 2026-07-29 / [App 1.0 (85)]
+
+Meal deletion says in the app what it previously inherited from the platform, and the
+directive registry can no longer grow a field that nothing recognizes.
+
+### Fixed
+
+- **The meal delete path is now scoped to this app's own Health data by its own
+  predicate.** `HealthKitMealWriter.delete(id:)` selected `.food` correlations by
+  `HKMetadataKeyExternalUUID` alone — no source clause, and no cross-check against the
+  app's record of what it wrote (`applyRetract` passes an unrecognized id straight
+  through by design, since a retract of an unknown id must still tombstone). The id
+  originates in agent output and is validated only as a non-empty string, so it could
+  name any food correlation the query was able to see. Nothing was reachable in
+  practice: HealthKit refuses to delete objects an app did not save, and with no
+  dietary type in `HealthContextProvider.readTypes` the query could only ever see this
+  app's own samples. Both are Apple-documented platform behaviours rather than
+  properties of this code, and the second would have stopped holding silently the first
+  time a dietary read type was added. Selection is now
+  `deletePredicate(id:scopedTo:)`, a conjunction of the external-id match AND
+  `ownSourceScope()` (`HKQuery.predicateForObjects(from: HKSource.default())`), so
+  correctness no longer depends on either. Behaviour is otherwise unchanged, including
+  the idempotent zero-match success that keeps a junk id from becoming a retry loop — a
+  source scope can only narrow the match set toward zero, which is the safe direction.
+- **`HKSource.default()` is entitlement-derived, so it cannot be called from a test
+  here.** It reads the process's code-signing entitlements rather than `Info.plist`
+  (whose `CFBundleIdentifier` is present regardless), and raises `NSGenericException`
+  when there are none — terminating the host, since it is an uncaught ObjC exception.
+  CI builds and tests this app with `CODE_SIGNING_ALLOWED=NO`, so the first version of
+  this change passed locally against a signed build and took the CI test host down. The
+  predicate is therefore split: `deletePredicate(id:scopedTo:)` is pure and takes the
+  scope as a parameter, so the conjunction is unit-tested with a stand-in scope, while
+  `ownSourceScope()` is confined to the one production call site. That the call site
+  still passes it is checked by `scripts/ci-guards.sh`, a source-level pattern check —
+  an unsigned process cannot observe the real scope at all.
+
+### Added
+
+- **A tripwire on the read set** (`testReadSetContainsNoDietaryType`): adding a dietary
+  identifier to `HealthContextProvider.readTypes` now fails the build. The delete path
+  no longer depends on its absence; the assertion exists so that "show intake across all
+  sources" is reviewed against the delete path rather than landing inside an unrelated
+  feature.
+- **Exhaustiveness over the directive registry** (`bridge`). `Directives` is a struct of
+  optional fields, so nothing forced a new directive to be wired up end to end. Three
+  tests now assert that every registry entry populates exactly its own field, that every
+  field is reachable from some registry entry, and that one directive never sets two
+  fields — backed by an exhaustive destructure that fails to compile when a field is
+  added, including after the struct-literal errors are cleared.
+
+### Changed
+
+- `bridge/Cargo.lock` records the crate version again; it was left at `0.43.0` when
+  0.43.2 shipped.
+
 ## [Bridge 0.43.2] - 2026-07-29 / [App 1.0 (83)]
 
 The whole configuration surface of the level effort: three keys, one routing rule, and a

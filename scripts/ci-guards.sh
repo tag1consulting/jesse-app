@@ -197,6 +197,30 @@ else
   echo "ci-guards: gitleaks not installed — skipping secret scan locally (enforced in CI)." >&2
 fi
 
+# 6b) (App) The HealthKit meal delete must stay scoped to this app's own source.
+#     `delete(id:)` selects `.food` correlations by an external id that arrives in
+#     AGENT output and is validated only as a non-empty string, so the source scope
+#     is the whole of what keeps it from naming another app's samples. This cannot
+#     be asserted by a test: the scope comes from `HKSource.default()`, which reads
+#     the process's code-signing entitlements and raises when there are none — which
+#     is precisely how CI builds and tests the app (`CODE_SIGNING_ALLOWED=NO`). So
+#     the composition is unit-tested with a stand-in scope and the CALL SITE is
+#     checked here, as a pattern. Loud, not clever: if the delete path stops passing
+#     the own-source scope, this fails.
+WRITER="$ROOT/Jesse/Jesse/HealthKitMealWriter.swift"
+if [ -f "$WRITER" ]; then
+  if ! grep -qE 'deletePredicate\(id: id, scopedTo: Self\.ownSourceScope\(\)\)' "$WRITER"; then
+    flag "HealthKitMealWriter.delete no longer scopes its predicate to ownSourceScope()" \
+      "$(grep -n 'deletePredicate' "$WRITER" || echo '  (no deletePredicate call found at all)')"
+  fi
+  if ! grep -qE 'predicateForObjects\(from: HKSource\.default\(\)\)' "$WRITER"; then
+    flag "HealthKitMealWriter.ownSourceScope no longer derives from HKSource.default()" \
+      "$(grep -n 'ownSourceScope' "$WRITER" || echo '  (no ownSourceScope found at all)')"
+  fi
+else
+  flag "expected $WRITER to exist (the meal delete guard has nothing to check)" ""
+fi
+
 # 7) (Versioning) Mandatory version bumps. A change to a component's sources must
 #    bump that component's version and update CHANGELOG.md. Delegated to the
 #    dedicated version-guard.sh (shared with the pre-push hook); it skips cleanly
