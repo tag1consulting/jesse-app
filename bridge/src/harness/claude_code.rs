@@ -645,45 +645,19 @@ pub fn apply_main_env(cmd: &mut Command, active: &ActiveModel) {
     }
 }
 
-/// Layer the title-backend override onto a TITLE child's `Command`. When the
-/// override is configured (all three `JESSE_TITLE_*` vars set → `cfg.title_backend`
-/// is `Some`), set `ANTHROPIC_BASE_URL` / `ANTHROPIC_AUTH_TOKEN` / `ANTHROPIC_MODEL`
-/// on THIS child only, so the title one-shot talks to the override backend while
-/// every main-turn child keeps inheriting the ambient process env. A no-op when
-/// unset — the title child then inherits the process env byte-for-byte, exactly as
-/// before this feature. Call this ONLY on the title path; a main turn must never
-/// invoke it (that is the main-turn isolation property).
-pub fn apply_title_env(cmd: &mut Command, cfg: &Config) {
-    if let Some((base_url, auth_token, model)) = &cfg.title_backend {
-        cmd.env("ANTHROPIC_BASE_URL", base_url)
-            .env("ANTHROPIC_AUTH_TOKEN", auth_token)
-            .env("ANTHROPIC_MODEL", model);
-    }
-}
-
-/// Layer the DIET-extract backend override onto the stateless extract child's
-/// `Command`. Exact analogue of [`apply_title_env`], keyed off `cfg.diet_backend`
-/// (all three `JESSE_DIET_*` vars set → `Some`). When configured, the extract
-/// child — and ONLY that child — talks to the override backend; every main turn
-/// and the hosted verify child keep inheriting the ambient process env. A no-op
-/// when unset. Call this ONLY on the extract path; a main turn or the verify child
-/// must never invoke it (the main-turn isolation property, mirrored from title).
-pub fn apply_diet_env(cmd: &mut Command, cfg: &Config) {
-    if let Some((base_url, auth_token, model)) = &cfg.diet_backend {
-        cmd.env("ANTHROPIC_BASE_URL", base_url)
-            .env("ANTHROPIC_AUTH_TOKEN", auth_token)
-            .env("ANTHROPIC_MODEL", model);
-    }
-}
-
-/// Layer the vault-QA backend override onto the vault-QA child's `Command`. Exact
-/// analogue of [`apply_diet_env`] / [`apply_title_env`], keyed off `cfg.vaultqa_backend`
-/// (all three `JESSE_VAULTQA_*` vars set → `Some`). When configured, the vault-QA child
-/// — and ONLY that child — talks to the override backend; every main turn and the
-/// diet/title children keep their own env. A no-op when unset. Call this ONLY on the
-/// vault-QA path; a main turn must never invoke it (the main-turn isolation property).
-pub fn apply_vaultqa_env(cmd: &mut Command, cfg: &Config) {
-    if let Some((base_url, auth_token, model)) = &cfg.vaultqa_backend {
+/// Layer a ROUTED job's chosen backend onto its child `Command`.
+///
+/// One applier for all four routed jobs (title, diet extract, diet verify, vault QA),
+/// replacing the three per-role ones that each read a different `JESSE_<ROLE>_*` triple
+/// from config. The triple now comes from the routing rule's pick, so which model serves a
+/// job is one ordered list rather than four independent env-var sets.
+///
+/// A no-op for an AMBIENT pick (`backend` is `None`): the child then inherits the bridge's
+/// process env byte-for-byte, exactly what each role call site did when its override was
+/// unset. Call this ONLY on a routed-job path — a main turn uses [`apply_main_env`] with the
+/// conversation's model, and the two must never mix.
+pub fn apply_routed_env(cmd: &mut Command, pick: &RoutedPick) {
+    if let Some((base_url, auth_token, model)) = &pick.backend {
         cmd.env("ANTHROPIC_BASE_URL", base_url)
             .env("ANTHROPIC_AUTH_TOKEN", auth_token)
             .env("ANTHROPIC_MODEL", model);
@@ -993,112 +967,9 @@ mod tests {
             .collect()
     }
 
-    fn cfg_with_title_backend() -> Config {
-        let mut cfg = test_config();
-        cfg.title_backend = Some((
-            "http://127.0.0.1:9100".to_string(),
-            "dsv4-local-dummy".to_string(),
-            "local-title".to_string(),
-        ));
-        cfg
-    }
-
-    #[test]
-    fn title_command_applies_env_triple_when_configured() {
-        // With the override configured, the TITLE child's Command carries exactly
-        // ANTHROPIC_BASE_URL / _AUTH_TOKEN / _MODEL set to the configured values.
-        let cfg = cfg_with_title_backend();
-        let mut cmd = build_claude_command(
-            &cfg,
-            "hi",
-            None,
-            &ActiveModel::ambient(),
-            Capability::Write,
-            main_mcp_config(&cfg),
-        );
-        apply_title_env(&mut cmd, &cfg);
-        let env = cmd_env_overrides(&cmd);
-        assert_eq!(
-            env.get("ANTHROPIC_BASE_URL").map(String::as_str),
-            Some("http://127.0.0.1:9100")
-        );
-        assert_eq!(
-            env.get("ANTHROPIC_AUTH_TOKEN").map(String::as_str),
-            Some("dsv4-local-dummy")
-        );
-        assert_eq!(
-            env.get("ANTHROPIC_MODEL").map(String::as_str),
-            Some("local-title")
-        );
-    }
-
-    #[test]
-    fn title_command_applies_nothing_when_unconfigured() {
-        // With no override (the default), the title child sets NONE of the three
-        // vars — it inherits the ambient process env byte-for-byte, exactly as
-        // before this feature existed.
-        let cfg = test_config();
-        assert!(
-            cfg.title_backend.is_none(),
-            "test_config must default to no override"
-        );
-        let mut cmd = build_claude_command(
-            &cfg,
-            "hi",
-            None,
-            &ActiveModel::ambient(),
-            Capability::Write,
-            main_mcp_config(&cfg),
-        );
-        apply_title_env(&mut cmd, &cfg);
-        let env = cmd_env_overrides(&cmd);
-        for k in TITLE_ENV_KEYS {
-            assert!(
-                !env.contains_key(k),
-                "unconfigured title child must not set {k}"
-            );
-        }
-    }
-
-    #[test]
-    fn main_turn_command_is_unaffected_by_title_backend() {
-        // THE SAFETY PROPERTY, tested directly: even when the title-backend
-        // override IS configured, a MAIN-TURN command carries none of the three
-        // ANTHROPIC_* overrides. The main-turn builder never calls apply_title_env,
-        // so a title-only redirect can never leak onto a real agent turn.
-        let cfg = cfg_with_title_backend();
-        assert!(cfg.title_backend.is_some(), "precondition: override is set");
-        // A resumed turn and a fresh turn are both built the main-turn way.
-        for sid in [None, Some("sess-1")] {
-            let cmd = build_claude_command(
-                &cfg,
-                "do the thing",
-                sid,
-                &ActiveModel::ambient(),
-                Capability::Write,
-                main_mcp_config(&cfg),
-            );
-            let env = cmd_env_overrides(&cmd);
-            for k in TITLE_ENV_KEYS {
-                assert!(
-                    !env.contains_key(k),
-                    "main-turn command must NOT carry {k} even when title backend is set"
-                );
-            }
-        }
-    }
 
     // ---- Diet extract/verify children --------------------------------------
 
-    fn cfg_with_diet_backend() -> Config {
-        let mut cfg = test_config();
-        cfg.diet_backend = Some((
-            "http://127.0.0.1:9100".to_string(),
-            "dsv4-diet-dummy".to_string(),
-            "local-diet".to_string(),
-        ));
-        cfg
-    }
 
     /// Extract the value following a flag in a Command's argv, or `None`.
     fn cmd_arg_value(cmd: &Command, flag: &str) -> Option<String> {
@@ -1117,14 +988,41 @@ mod tests {
         cmd.as_std().get_args().any(|a| a.to_string_lossy() == flag)
     }
 
+    /// A routed pick pointing at a local backend — the shape `apply_routed_env` layers.
+    fn routed_pick(id: &str) -> RoutedPick {
+        RoutedPick {
+            id: id.to_string(),
+            harness: CLAUDE_CODE_ID.to_string(),
+            level: Capability::Basic,
+            backend: Some((
+                "http://127.0.0.1:9100".to_string(),
+                "dsv4-diet-dummy".to_string(),
+                format!("{id}-v1"),
+            )),
+        }
+    }
+
+    /// Both diet children — the AMBIENT one (a pick that applies nothing) and the
+    /// ROUTED one (a pick carrying a backend triple) — are built by the one shared
+    /// `build_diet_child_command`, so asserting the posture on the builder proves it for
+    /// `run_diet_extract` AND `run_diet_verify` at once. This helper yields both command
+    /// forms so every containment test below covers both.
+    fn both_diet_child_commands() -> Vec<Command> {
+        let ambient = build_diet_child_command(&test_config(), "hi");
+        let mut routed = build_diet_child_command(&test_config(), "hi");
+        apply_routed_env(&mut routed, &routed_pick("local-oss"));
+        vec![ambient, routed]
+    }
+
+    /// The routed applier layers exactly the three `ANTHROPIC_*` vars for a pick that
+    /// carries a backend, and NOTHING for an ambient pick — which is what makes an
+    /// unconfigured `offload_order` byte-for-byte the old no-override behavior.
     #[test]
-    fn diet_extract_command_applies_env_triple_when_configured() {
-        // With the override configured, the EXTRACT child's Command carries exactly
-        // the three ANTHROPIC_* vars set to the diet-backend values.
-        let cfg = cfg_with_diet_backend();
-        let mut cmd = build_diet_child_command(&cfg, "hi");
-        apply_diet_env(&mut cmd, &cfg);
-        let env = cmd_env_overrides(&cmd);
+    fn the_routed_env_applier_is_all_three_vars_or_nothing() {
+        let cfg = test_config();
+        let mut routed = build_diet_child_command(&cfg, "hi");
+        apply_routed_env(&mut routed, &routed_pick("local-oss"));
+        let env = cmd_env_overrides(&routed);
         assert_eq!(
             env.get("ANTHROPIC_BASE_URL").map(String::as_str),
             Some("http://127.0.0.1:9100")
@@ -1135,74 +1033,51 @@ mod tests {
         );
         assert_eq!(
             env.get("ANTHROPIC_MODEL").map(String::as_str),
-            Some("local-diet")
+            Some("local-oss-v1")
         );
+
+        let mut ambient = build_diet_child_command(&cfg, "hi");
+        apply_routed_env(
+            &mut ambient,
+            &RoutedPick {
+                id: DEFAULT_MODEL_ID.to_string(),
+                harness: CLAUDE_CODE_ID.to_string(),
+                level: Capability::Write,
+                backend: None,
+            },
+        );
+        for k in TITLE_ENV_KEYS {
+            assert!(
+                !cmd_env_overrides(&ambient).contains_key(k),
+                "an ambient pick must set {k} nowhere — the child inherits the process env"
+            );
+        }
     }
 
+    /// THE MAIN-TURN ISOLATION PROPERTY, kept across the role-backend removal: a main-turn
+    /// command carries none of the three `ANTHROPIC_*` overrides a routed job would layer.
+    /// The main turn never calls `apply_routed_env`, and a routed job never calls
+    /// `apply_main_env`.
     #[test]
-    fn diet_extract_command_applies_nothing_when_unconfigured() {
-        // No override → the extract child sets none of the three; it inherits the
-        // ambient process env, exactly as if the feature were absent.
+    fn a_main_turn_command_never_carries_a_routed_jobs_backend() {
         let cfg = test_config();
-        assert!(cfg.diet_backend.is_none());
-        let mut cmd = build_diet_child_command(&cfg, "hi");
-        apply_diet_env(&mut cmd, &cfg);
-        let env = cmd_env_overrides(&cmd);
-        for k in TITLE_ENV_KEYS {
-            assert!(
-                !env.contains_key(k),
-                "unconfigured extract child must not set {k}"
+        for sid in [None, Some("sess-1")] {
+            let cmd = build_claude_command(
+                &cfg,
+                "do the thing",
+                sid,
+                &ActiveModel::ambient(),
+                Capability::Write,
+                main_mcp_config(&cfg),
             );
+            let env = cmd_env_overrides(&cmd);
+            for k in TITLE_ENV_KEYS {
+                assert!(
+                    !env.contains_key(k),
+                    "a main turn must never carry {k} from a routed job"
+                );
+            }
         }
-    }
-
-    #[test]
-    fn diet_verify_command_is_ambient_even_when_diet_backend_set() {
-        // THE POINT of the verify gate: it NEVER uses the diet backend. Even with the
-        // override configured, a verify child (built the ambient way — no
-        // apply_diet_env) carries none of the three ANTHROPIC_* overrides.
-        let cfg = cfg_with_diet_backend();
-        assert!(cfg.diet_backend.is_some());
-        let cmd = build_diet_child_command(&cfg, "verify this"); // no env layering
-        let env = cmd_env_overrides(&cmd);
-        for k in TITLE_ENV_KEYS {
-            assert!(
-                !env.contains_key(k),
-                "the verify child must be ambient — must NOT carry {k}"
-            );
-        }
-    }
-
-    #[test]
-    fn diet_child_holds_no_tools() {
-        // The diet children hold NO tools: an EMPTY --allowedTools, plus the
-        // class-level denylist removing the mutation/exec/network tool classes.
-        let cfg = cfg_with_diet_backend();
-        let cmd = build_diet_child_command(&cfg, "hi");
-        let allow = cmd_arg_value(&cmd, "--allowedTools").expect("--allowedTools present");
-        assert_eq!(
-            allow, "",
-            "the diet child's allowlist must be EMPTY (no tools)"
-        );
-        let deny = cmd_arg_value(&cmd, "--disallowedTools").expect("--disallowedTools present");
-        for class in ["Bash", "Write", "Edit", "WebFetch", "WebSearch", "Task"] {
-            assert!(
-                deny.split(',').any(|t| t.trim() == class),
-                "denylist must remove the {class} class: {deny:?}"
-            );
-        }
-    }
-
-    /// The diet children in `[None, Some(diet_backend)]` config — i.e. both the
-    /// ambient VERIFY child and the env-layered EXTRACT child — are built by the
-    /// one shared `build_diet_child_command`, so asserting the posture on the
-    /// builder proves it for `run_diet_extract` AND `run_diet_verify` at once. This
-    /// helper yields both command forms so every containment test below covers both.
-    fn both_diet_child_commands() -> Vec<Command> {
-        let ambient = build_diet_child_command(&test_config(), "hi"); // verify posture
-        let mut extract = build_diet_child_command(&cfg_with_diet_backend(), "hi");
-        apply_diet_env(&mut extract, &cfg_with_diet_backend()); // extract posture
-        vec![ambient, extract]
     }
 
     #[test]
@@ -1367,312 +1242,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn main_turn_command_is_unaffected_by_diet_backend() {
-        // THE SAFETY / KILL-SWITCH PROPERTY, tested directly (clone of the title
-        // isolation test): even when the diet-backend override IS configured, a
-        // MAIN-TURN command carries none of the three ANTHROPIC_* overrides, because
-        // the main-turn builder never calls apply_diet_env. A diet-only redirect can
-        // never leak onto a real agent turn.
-        let cfg = cfg_with_diet_backend();
-        assert!(cfg.diet_backend.is_some(), "precondition: override is set");
-        for sid in [None, Some("sess-1")] {
-            let cmd = build_claude_command(
-                &cfg,
-                "do the thing",
-                sid,
-                &ActiveModel::ambient(),
-                Capability::Write,
-                main_mcp_config(&cfg),
-            );
-            let env = cmd_env_overrides(&cmd);
-            for k in TITLE_ENV_KEYS {
-                assert!(
-                    !env.contains_key(k),
-                    "main-turn command must NOT carry {k} even when diet backend is set"
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn main_turn_command_is_byte_identical_whether_diet_backend_set_or_not() {
-        // The kill switch, proven byte-for-byte on the SPAWNED command: unsetting the
-        // triple must reproduce today's exact main-turn invocation. The argv, the
-        // cwd, and the env overrides must all match between a config with the diet
-        // backend set and one without.
-        let with = cfg_with_diet_backend();
-        let mut without = with.clone();
-        without.diet_backend = None;
-        for sid in [None, Some("sess-42")] {
-            let a = build_claude_command(
-                &with,
-                "log a banana",
-                sid,
-                &ActiveModel::ambient(),
-                Capability::Write,
-                main_mcp_config(&with),
-            );
-            let b = build_claude_command(
-                &without,
-                "log a banana",
-                sid,
-                &ActiveModel::ambient(),
-                Capability::Write,
-                main_mcp_config(&without),
-            );
-            let argv = |c: &Command| -> Vec<String> {
-                c.as_std()
-                    .get_args()
-                    .map(|s| s.to_string_lossy().into_owned())
-                    .collect()
-            };
-            assert_eq!(argv(&a), argv(&b), "argv must be identical (kill switch)");
-            assert_eq!(
-                a.as_std().get_current_dir(),
-                b.as_std().get_current_dir(),
-                "cwd must be identical"
-            );
-            assert_eq!(
-                cmd_env_overrides(&a),
-                cmd_env_overrides(&b),
-                "env overrides must be identical (none, either way)"
-            );
-        }
-    }
-
     // ---- Vault-QA child ----------------------------------------------------
 
-    fn cfg_with_vaultqa_backend() -> Config {
-        let mut cfg = test_config();
-        cfg.vaultqa_backend = Some((
-            "http://127.0.0.1:9100".to_string(),
-            "vaultqa-dummy-tok".to_string(),
-            "local-vaultqa".to_string(),
-        ));
-        cfg
-    }
-
-    #[test]
-    fn vaultqa_child_applies_env_triple_when_configured() {
-        // With the override configured, the vault-QA child's Command carries exactly
-        // the three ANTHROPIC_* vars set to the vault-QA backend values.
-        let cfg = cfg_with_vaultqa_backend();
-        let mut cmd = build_vaultqa_child_command(&cfg, "hi");
-        apply_vaultqa_env(&mut cmd, &cfg);
-        let env = cmd_env_overrides(&cmd);
-        assert_eq!(
-            env.get("ANTHROPIC_BASE_URL").map(String::as_str),
-            Some("http://127.0.0.1:9100")
-        );
-        assert_eq!(
-            env.get("ANTHROPIC_AUTH_TOKEN").map(String::as_str),
-            Some("vaultqa-dummy-tok")
-        );
-        assert_eq!(
-            env.get("ANTHROPIC_MODEL").map(String::as_str),
-            Some("local-vaultqa")
-        );
-    }
-
-    #[test]
-    fn vaultqa_child_applies_nothing_when_unconfigured() {
-        let cfg = test_config();
-        assert!(cfg.vaultqa_backend.is_none());
-        let mut cmd = build_vaultqa_child_command(&cfg, "hi");
-        apply_vaultqa_env(&mut cmd, &cfg);
-        let env = cmd_env_overrides(&cmd);
-        for k in TITLE_ENV_KEYS {
-            assert!(
-                !env.contains_key(k),
-                "unconfigured vault-QA child must not set {k}"
-            );
-        }
-    }
-
-    #[test]
-    fn vaultqa_child_is_read_only_at_the_root_with_no_resume_in_the_vault() {
-        // The child's containment posture, asserted on the built argv:
-        //   * `--tools "Read,Grep,Glob"` — a read-only ROOT allowlist (not empty).
-        //   * `--strict-mcp-config` present so only --mcp-config servers load.
-        //   * `--allowedTools` names the three built-ins plus the four qmd tools.
-        //   * `--disallowedTools` names the mutation/exec/network/orchestration classes.
-        //   * NO `--resume` (stateless), and cwd = the vault (the one divergence).
-        let cfg = cfg_with_vaultqa_backend();
-        let cmd = build_vaultqa_child_command(&cfg, "answer me");
-
-        let tools = cmd_arg_value(&cmd, "--tools").expect("--tools present");
-        assert_eq!(tools, "Read,Grep,Glob", "read-only root allowlist");
-
-        assert!(
-            cmd_has_flag(&cmd, "--strict-mcp-config"),
-            "--strict-mcp-config must be present"
-        );
-        // Unset MCP config → the shared empty-servers const (no servers).
-        let mcp = cmd_arg_value(&cmd, "--mcp-config").expect("--mcp-config present");
-        let parsed: serde_json::Value = serde_json::from_str(&mcp).expect("valid JSON");
-        assert!(
-            parsed
-                .get("mcpServers")
-                .and_then(|v| v.as_object())
-                .map(|m| m.is_empty())
-                .unwrap_or(true),
-            "unset MCP config → no servers: {mcp:?}"
-        );
-
-        let allow = cmd_arg_value(&cmd, "--allowedTools").expect("--allowedTools present");
-        let allowed: Vec<&str> = allow.split(',').map(|t| t.trim()).collect();
-        for t in [
-            // PATH-SCOPED, not bare: this child runs unattended in the vault, and an
-            // unscoped read reaches every file the bridge user can read.
-            "Read(./**)",
-            "Grep(./**)",
-            "Glob(./**)",
-            "mcp__qmd__query",
-            "mcp__qmd__get",
-            "mcp__qmd__multi_get",
-            "mcp__qmd__status",
-        ] {
-            assert!(allowed.contains(&t), "allowlist must name {t}: {allowed:?}");
-        }
-        for bare in ["Read", "Grep", "Glob"] {
-            assert!(
-                !allowed.contains(&bare),
-                "an UNSCOPED {bare} grant would put the whole filesystem back in reach: \
-                 {allowed:?}"
-            );
-        }
-        // No mutation/exec built-in is granted.
-        for t in ["Write", "Edit", "Bash"] {
-            assert!(
-                !allowed.contains(&t),
-                "allowlist must NOT grant {t}: {allowed:?}"
-            );
-        }
-
-        let deny = cmd_arg_value(&cmd, "--disallowedTools").expect("--disallowedTools present");
-        let denied: Vec<&str> = deny.split(',').map(|t| t.trim()).collect();
-        for class in [
-            "Bash",
-            "Write",
-            "Edit",
-            "NotebookEdit",
-            "WebFetch",
-            "WebSearch",
-            "Task",
-            "Agent",
-            "ToolSearch",
-            "Workflow",
-            "TodoWrite",
-        ] {
-            assert!(
-                denied.contains(&class),
-                "denylist must name {class}: {denied:?}"
-            );
-        }
-
-        // Stateless: never --resume.
-        assert!(
-            !cmd_has_flag(&cmd, "--resume"),
-            "vault-QA child must not resume a session"
-        );
-
-        // cwd = the vault (the intentional divergence from the diet child's scratch cwd).
-        assert_eq!(
-            cmd.as_std().get_current_dir().map(|p| p.to_path_buf()),
-            Some(std::path::PathBuf::from(&cfg.vault)),
-            "vault-QA child cwd must be the vault"
-        );
-    }
-
-    #[test]
-    fn vaultqa_child_uses_mcp_config_path_when_set() {
-        // When JESSE_VAULTQA_MCP_CONFIG is set, its PATH is passed straight to
-        // --mcp-config (the CLI accepts a path or inline JSON), so the qmd server loads.
-        let mut cfg = cfg_with_vaultqa_backend();
-        cfg.vaultqa_mcp_config = Some("/etc/jesse/qmd.json".to_string());
-        let cmd = build_vaultqa_child_command(&cfg, "hi");
-        assert_eq!(
-            cmd_arg_value(&cmd, "--mcp-config").as_deref(),
-            Some("/etc/jesse/qmd.json"),
-            "the configured MCP config path must be passed verbatim"
-        );
-        assert!(cmd_has_flag(&cmd, "--strict-mcp-config"));
-    }
-
-    #[test]
-    fn main_turn_command_is_unaffected_by_vaultqa_backend() {
-        // THE SAFETY / KILL-SWITCH PROPERTY (clone of the diet/title isolation test):
-        // even when the vault-QA override IS configured, a MAIN-TURN command carries
-        // none of the three ANTHROPIC_* overrides, because the main-turn builder never
-        // calls apply_vaultqa_env. A vault-QA-only redirect can never leak onto a turn.
-        let cfg = cfg_with_vaultqa_backend();
-        assert!(
-            cfg.vaultqa_backend.is_some(),
-            "precondition: override is set"
-        );
-        for sid in [None, Some("sess-1")] {
-            let cmd = build_claude_command(
-                &cfg,
-                "do the thing",
-                sid,
-                &ActiveModel::ambient(),
-                Capability::Write,
-                main_mcp_config(&cfg),
-            );
-            let env = cmd_env_overrides(&cmd);
-            for k in TITLE_ENV_KEYS {
-                assert!(
-                    !env.contains_key(k),
-                    "main-turn command must NOT carry {k} even when vault-QA backend is set"
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn main_turn_command_is_byte_identical_whether_vaultqa_backend_set_or_not() {
-        // The kill switch, proven byte-for-byte on the SPAWNED command: unsetting the
-        // triple reproduces today's exact main-turn invocation (argv, cwd, env).
-        let with = cfg_with_vaultqa_backend();
-        let mut without = with.clone();
-        without.vaultqa_backend = None;
-        for sid in [None, Some("sess-42")] {
-            let a = build_claude_command(
-                &with,
-                "what is my vo2 max",
-                sid,
-                &ActiveModel::ambient(),
-                Capability::Write,
-                main_mcp_config(&with),
-            );
-            let b = build_claude_command(
-                &without,
-                "what is my vo2 max",
-                sid,
-                &ActiveModel::ambient(),
-                Capability::Write,
-                main_mcp_config(&without),
-            );
-            let argv = |c: &Command| -> Vec<String> {
-                c.as_std()
-                    .get_args()
-                    .map(|s| s.to_string_lossy().into_owned())
-                    .collect()
-            };
-            assert_eq!(argv(&a), argv(&b), "argv identical (kill switch)");
-            assert_eq!(
-                a.as_std().get_current_dir(),
-                b.as_std().get_current_dir(),
-                "cwd identical"
-            );
-            assert_eq!(
-                cmd_env_overrides(&a),
-                cmd_env_overrides(&b),
-                "env overrides identical (none)"
-            );
-        }
-    }
 
     // ---- The global model switch (main-turn model application) --------------
 
@@ -1688,32 +1259,41 @@ mod tests {
                 "glm-model".to_string(),
             )),
             subagent_model: Some("glm-model".to_string()),
-            writes_allowed: false,
+            level: Capability::Read,
+            harness: CLAUDE_CODE_ID.to_string(),
             price: PriceDeck::ZERO,
             vision: Vec::new(),
             vision_complementary: false,
         }
     }
 
-    /// A cfg with ALL THREE role backends configured to distinct values — the switch must
-    /// never let any of them leak onto the main turn.
+    /// A cfg whose `offload_order` names a model for every routed job — the switch must
+    /// never let a routed job's backend leak onto the main turn. (Before the role backends
+    /// were replaced this fixture configured all three of them; the property it guards is
+    /// the same one, now with a single list behind it.)
     fn cfg_with_all_role_backends() -> Config {
         let mut cfg = test_config();
-        cfg.title_backend = Some((
-            "http://title".to_string(),
-            "title-tok".to_string(),
-            "title-model".to_string(),
-        ));
-        cfg.diet_backend = Some((
-            "http://diet".to_string(),
-            "diet-tok".to_string(),
-            "diet-model".to_string(),
-        ));
-        cfg.vaultqa_backend = Some((
-            "http://vault".to_string(),
-            "vault-tok".to_string(),
-            "vault-model".to_string(),
-        ));
+        let mut models = cfg.model_registry.models.clone();
+        models.push(RegistryModel {
+            id: "local-oss".to_string(),
+            label: "Local OSS".to_string(),
+            kind: ModelKind::Local,
+            backend: Some((
+                "http://routed".to_string(),
+                "routed-tok".to_string(),
+                "routed-model".to_string(),
+            )),
+            subagent_model: None,
+            configured: true,
+            level: Capability::Read,
+            harness: CLAUDE_CODE_ID.to_string(),
+            price: PriceDeck::ZERO,
+            health: HealthConfig::default(),
+            vision: Vec::new(),
+            vision_complementary: false,
+        });
+        cfg.model_registry = ModelRegistry { models };
+        cfg.offload_order = vec!["local-oss".to_string()];
         cfg
     }
 
@@ -1853,7 +1433,7 @@ mod tests {
         // allowlist opus does (byte-for-byte the configured list), not the read-only set.
         let cfg = test_config();
         let mut active = glm_active();
-        active.writes_allowed = true;
+        active.level = Capability::Write;
         let args = build_claude_args(
             &cfg,
             "edit the vault",
@@ -2257,4 +1837,135 @@ mod tests {
             "the reorder must not add, drop or change any argument"
         );
     }
+
+    #[test]
+    fn diet_child_holds_no_tools() {
+        // The diet children hold NO tools: an EMPTY --allowedTools, plus the
+        // class-level denylist removing the mutation/exec/network tool classes.
+        let cfg = test_config();
+        let cmd = build_diet_child_command(&cfg, "hi");
+        let allow = cmd_arg_value(&cmd, "--allowedTools").expect("--allowedTools present");
+        assert_eq!(
+            allow, "",
+            "the diet child's allowlist must be EMPTY (no tools)"
+        );
+        let deny = cmd_arg_value(&cmd, "--disallowedTools").expect("--disallowedTools present");
+        for class in ["Bash", "Write", "Edit", "WebFetch", "WebSearch", "Task"] {
+            assert!(
+                deny.split(',').any(|t| t.trim() == class),
+                "denylist must remove the {class} class: {deny:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn vaultqa_child_is_read_only_at_the_root_with_no_resume_in_the_vault() {
+        // The child's containment posture, asserted on the built argv:
+        //   * `--tools "Read,Grep,Glob"` — a read-only ROOT allowlist (not empty).
+        //   * `--strict-mcp-config` present so only --mcp-config servers load.
+        //   * `--allowedTools` names the three built-ins plus the four qmd tools.
+        //   * `--disallowedTools` names the mutation/exec/network/orchestration classes.
+        //   * NO `--resume` (stateless), and cwd = the vault (the one divergence).
+        let cfg = test_config();
+        let cmd = build_vaultqa_child_command(&cfg, "answer me");
+
+        let tools = cmd_arg_value(&cmd, "--tools").expect("--tools present");
+        assert_eq!(tools, "Read,Grep,Glob", "read-only root allowlist");
+
+        assert!(
+            cmd_has_flag(&cmd, "--strict-mcp-config"),
+            "--strict-mcp-config must be present"
+        );
+        // Unset MCP config → the shared empty-servers const (no servers).
+        let mcp = cmd_arg_value(&cmd, "--mcp-config").expect("--mcp-config present");
+        let parsed: serde_json::Value = serde_json::from_str(&mcp).expect("valid JSON");
+        assert!(
+            parsed
+                .get("mcpServers")
+                .and_then(|v| v.as_object())
+                .map(|m| m.is_empty())
+                .unwrap_or(true),
+            "unset MCP config → no servers: {mcp:?}"
+        );
+
+        let allow = cmd_arg_value(&cmd, "--allowedTools").expect("--allowedTools present");
+        let allowed: Vec<&str> = allow.split(',').map(|t| t.trim()).collect();
+        for t in [
+            // PATH-SCOPED, not bare: this child runs unattended in the vault, and an
+            // unscoped read reaches every file the bridge user can read.
+            "Read(./**)",
+            "Grep(./**)",
+            "Glob(./**)",
+            "mcp__qmd__query",
+            "mcp__qmd__get",
+            "mcp__qmd__multi_get",
+            "mcp__qmd__status",
+        ] {
+            assert!(allowed.contains(&t), "allowlist must name {t}: {allowed:?}");
+        }
+        for bare in ["Read", "Grep", "Glob"] {
+            assert!(
+                !allowed.contains(&bare),
+                "an UNSCOPED {bare} grant would put the whole filesystem back in reach: \
+                 {allowed:?}"
+            );
+        }
+        // No mutation/exec built-in is granted.
+        for t in ["Write", "Edit", "Bash"] {
+            assert!(
+                !allowed.contains(&t),
+                "allowlist must NOT grant {t}: {allowed:?}"
+            );
+        }
+
+        let deny = cmd_arg_value(&cmd, "--disallowedTools").expect("--disallowedTools present");
+        let denied: Vec<&str> = deny.split(',').map(|t| t.trim()).collect();
+        for class in [
+            "Bash",
+            "Write",
+            "Edit",
+            "NotebookEdit",
+            "WebFetch",
+            "WebSearch",
+            "Task",
+            "Agent",
+            "ToolSearch",
+            "Workflow",
+            "TodoWrite",
+        ] {
+            assert!(
+                denied.contains(&class),
+                "denylist must name {class}: {denied:?}"
+            );
+        }
+
+        // Stateless: never --resume.
+        assert!(
+            !cmd_has_flag(&cmd, "--resume"),
+            "vault-QA child must not resume a session"
+        );
+
+        // cwd = the vault (the intentional divergence from the diet child's scratch cwd).
+        assert_eq!(
+            cmd.as_std().get_current_dir().map(|p| p.to_path_buf()),
+            Some(std::path::PathBuf::from(&cfg.vault)),
+            "vault-QA child cwd must be the vault"
+        );
+    }
+
+    #[test]
+    fn vaultqa_child_uses_mcp_config_path_when_set() {
+        // When JESSE_VAULTQA_MCP_CONFIG is set, its PATH is passed straight to
+        // --mcp-config (the CLI accepts a path or inline JSON), so the qmd server loads.
+        let mut cfg = test_config();
+        cfg.vaultqa_mcp_config = Some("/etc/jesse/qmd.json".to_string());
+        let cmd = build_vaultqa_child_command(&cfg, "hi");
+        assert_eq!(
+            cmd_arg_value(&cmd, "--mcp-config").as_deref(),
+            Some("/etc/jesse/qmd.json"),
+            "the configured MCP config path must be passed verbatim"
+        );
+        assert!(cmd_has_flag(&cmd, "--strict-mcp-config"));
+    }
+
 }

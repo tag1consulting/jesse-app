@@ -12,6 +12,7 @@ use tower::ServiceExt; // ServiceExt::oneshot
 
 pub fn test_config() -> Config {
     Config {
+        offload_order: Vec::new(),
         token: "test-token".to_string(),
         // Captured HOME for session-path lookups; tests that exercise session
         // paths override `home`/`vault` explicitly (no global-env mutation).
@@ -38,15 +39,11 @@ pub fn test_config() -> Config {
         max_attachments_total_bytes: DEFAULT_MAX_ATTACHMENTS_TOTAL_BYTES,
         scratch_dir: None,
         // No title-backend override in tests — ambient-backend behavior.
-        title_backend: None,
         // No diet-extract backend override in tests — the pipeline is dormant
         // (kill switch), so the integration router exercises today's hosted path.
-        diet_backend: None,
-        diet_probation: true,
         diet_micro_complete: true,
         // No vault-QA backend override in tests — the route is inert (kill switch),
         // so the integration router exercises today's hosted Ask path.
-        vaultqa_backend: None,
         vaultqa_mcp_config: None,
         // No main-path MCP override — the main turn falls back to the qmd-only const.
         main_mcp_config: None,

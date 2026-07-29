@@ -271,20 +271,8 @@ public struct JesseBridgeClient: BridgeClientProtocol {
         try await Self.expect2xx(session: session, req: req, host: config.normalizedHost)
     }
 
-    /// `POST /jesse/model/{id}/writes` — set a model's write permission (Phase 2 wires the
-    /// effect). The bridge rejects the ambient default (400) and unknown/unavailable ids;
-    /// those surface as `badResponse`.
-    public func setWrites(id: String, enabled: Bool) async throws {
-        guard var req = authorized("/jesse/model/\(id)/writes", method: "POST") else {
-            throw JesseError.notConfigured
-        }
-        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        req.httpBody = try Self.encodeBody(SetWritesBody(enabled: enabled))
-        try await Self.expect2xx(session: session, req: req, host: config.normalizedHost)
-    }
-
     /// Fire a request and require a 2xx, mapping transport/HTTP failures to `JesseError`.
-    /// Shared by the two model-switch mutators (unlike the idempotent 404-is-ok calls, an
+    /// Shared by the model-switch mutator (unlike the idempotent 404-is-ok calls, an
     /// unknown/unavailable model is a real 4xx the caller must see).
     static func expect2xx(session: URLSession, req: URLRequest, host: String) async throws {
         let data: Data, resp: URLResponse

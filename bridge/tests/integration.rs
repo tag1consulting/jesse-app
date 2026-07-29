@@ -13,6 +13,44 @@ use std::sync::Arc;
 use std::time::Duration;
 use tower::ServiceExt;
 
+/// The ambient routed pick: applies no backend env, which is what every routed job
+/// resolves to when `offload_order` is empty.
+fn ambient_pick() -> RoutedPick {
+    RoutedPick {
+        id: DEFAULT_MODEL_ID.to_string(),
+        harness: CLAUDE_CODE_ID.to_string(),
+        level: Capability::Write,
+        backend: None,
+    }
+}
+
+/// Arm the local vault-QA route the way config does now: `offload_order` naming a
+/// configured, healthy model at `Read` or above. Replaces the `vaultqa_backend` triple.
+fn with_vaultqa_offload(mut cfg: Config) -> Config {
+    let mut models = cfg.model_registry.models.clone();
+    models.push(RegistryModel {
+        id: "local-vaultqa".to_string(),
+        label: "Local vault QA".to_string(),
+        kind: ModelKind::Local,
+        backend: Some((
+            "http://127.0.0.1:9100".into(),
+            "vaultqa-dummy-tok".into(),
+            "local-vaultqa".into(),
+        )),
+        subagent_model: None,
+        configured: true,
+        level: Capability::Read,
+        harness: CLAUDE_CODE_ID.to_string(),
+        price: PriceDeck::ZERO,
+        health: HealthConfig::default(),
+        vision: Vec::new(),
+        vision_complementary: false,
+    });
+    cfg.model_registry = ModelRegistry { models };
+    cfg.offload_order = vec!["local-vaultqa".to_string()];
+    cfg
+}
+
 #[tokio::test]
 async fn health_unauthenticated_is_ok_and_leaks_no_paths() {
     // Liveness only: 200 { "ok": true }, and crucially NONE of the operator
@@ -1297,7 +1335,7 @@ async fn title_oneshot_spawns_a_toolless_child_with_no_mcp_servers() {
         ..test_config()
     };
 
-    let title = run_claude_oneshot(&cfg, "title this", 30)
+    let title = run_claude_oneshot(&cfg, "title this", 30, &ambient_pick())
         .await
         .expect("the title child must still work");
     assert_eq!(title, "A Title");
@@ -1378,7 +1416,7 @@ async fn title_oneshot_times_out_when_claude_stalls() {
     };
 
     let started = std::time::Instant::now();
-    let res = run_claude_oneshot(&cfg, "title this", 1).await;
+    let res = run_claude_oneshot(&cfg, "title this", 1, &ambient_pick()).await;
     let elapsed = started.elapsed();
     let err = res.expect_err("a stalling claude must time out, not succeed");
     assert_eq!(err.0, StatusCode::GATEWAY_TIMEOUT);
@@ -3477,17 +3515,12 @@ async fn vaultqa_local_answer_is_delivered_and_skips_the_hosted_turn() {
         "Your VO2 max is 52 (todo-list/Today.md:2).",
         "HOSTED_SHOULD_NOT_RUN",
     );
-    let cfg = Config {
+    let cfg = with_vaultqa_offload(Config {
         claude_bin: fake.to_string_lossy().into_owned(),
         vault: vault.to_string_lossy().into_owned(),
-        vaultqa_backend: Some((
-            "http://127.0.0.1:9100".into(),
-            "vaultqa-dummy-tok".into(),
-            "local-vaultqa".into(),
-        )),
         timeout_secs: 30,
         ..test_config()
-    };
+    });
     let v = run_vaultqa_turn(cfg, "what is my VO2 max lately").await;
     assert_eq!(v["response"], "Your VO2 max is 52 (todo-list/Today.md:2).");
     assert!(
@@ -3515,17 +3548,12 @@ async fn vaultqa_no_vault_answer_falls_through_to_the_hosted_turn() {
     let vault = make_diet_vault();
     write_vault_file(&vault, "todo-list/Today.md", "# Today\n");
     let fake = write_sniffing_fake("NO_VAULT_ANSWER", "Hosted answered from the session.");
-    let cfg = Config {
+    let cfg = with_vaultqa_offload(Config {
         claude_bin: fake.to_string_lossy().into_owned(),
         vault: vault.to_string_lossy().into_owned(),
-        vaultqa_backend: Some((
-            "http://127.0.0.1:9100".into(),
-            "vaultqa-dummy-tok".into(),
-            "local-vaultqa".into(),
-        )),
         timeout_secs: 30,
         ..test_config()
-    };
+    });
     let v = run_vaultqa_turn(cfg, "what is my VO2 max lately").await;
     assert_eq!(
         v["response"], "Hosted answered from the session.",
@@ -3543,17 +3571,12 @@ async fn vaultqa_uncited_answer_falls_through_to_the_hosted_turn() {
         "Your VO2 max is about 52, from memory.",
         "Hosted answered instead.",
     );
-    let cfg = Config {
+    let cfg = with_vaultqa_offload(Config {
         claude_bin: fake.to_string_lossy().into_owned(),
         vault: vault.to_string_lossy().into_owned(),
-        vaultqa_backend: Some((
-            "http://127.0.0.1:9100".into(),
-            "vaultqa-dummy-tok".into(),
-            "local-vaultqa".into(),
-        )),
         timeout_secs: 30,
         ..test_config()
-    };
+    });
     let v = run_vaultqa_turn(cfg, "what is my VO2 max lately").await;
     assert_eq!(
         v["response"], "Hosted answered instead.",
@@ -3606,18 +3629,13 @@ async fn badge_on_vaultqa_local_answer_names_the_vault_backend() {
         "Your VO2 max is 52 (todo-list/Today.md:2).",
         "HOSTED_SHOULD_NOT_RUN",
     );
-    let cfg = Config {
+    let cfg = with_vaultqa_offload(Config {
         claude_bin: fake.to_string_lossy().into_owned(),
         vault: vault.to_string_lossy().into_owned(),
-        vaultqa_backend: Some((
-            "http://127.0.0.1:9100".into(),
-            "vaultqa-dummy-tok".into(),
-            "local-vaultqa".into(),
-        )),
         model_badge: true,
         timeout_secs: 30,
         ..test_config()
-    };
+    });
     let v = run_vaultqa_turn(cfg, "what is my VO2 max lately").await;
     let resp = v["response"].as_str().unwrap();
     assert!(
@@ -3694,18 +3712,13 @@ async fn context_carry_off_local_turn_is_stateless_today() {
     let vault = make_diet_vault();
     write_vault_file(&vault, "todo-list/Today.md", "# Today\nVO2 max is 52.\n");
     let fake = write_sniffing_fake("Your VO2 max is 52 (todo-list/Today.md:2).", "HOSTED");
-    let cfg = Config {
+    let cfg = with_vaultqa_offload(Config {
         claude_bin: fake.to_string_lossy().into_owned(),
         vault: vault.to_string_lossy().into_owned(),
-        vaultqa_backend: Some((
-            "http://127.0.0.1:9100".into(),
-            "vaultqa-dummy-tok".into(),
-            "local-vaultqa".into(),
-        )),
         context_carry: false,
         timeout_secs: 30,
         ..test_config()
-    };
+    });
     let st = AppState::new(cfg);
     let v = carry_post_and_wait(&st, r#"{"mode":"ask","text":"what is my VO2 max lately"}"#).await;
     assert_eq!(v["response"], "Your VO2 max is 52 (todo-list/Today.md:2).");
@@ -3726,18 +3739,13 @@ async fn context_carry_on_fresh_local_turn_mints_a_synthetic_id() {
     let vault = make_diet_vault();
     write_vault_file(&vault, "todo-list/Today.md", "# Today\nVO2 max is 52.\n");
     let fake = write_sniffing_fake("Your VO2 max is 52 (todo-list/Today.md:2).", "HOSTED");
-    let cfg = Config {
+    let cfg = with_vaultqa_offload(Config {
         claude_bin: fake.to_string_lossy().into_owned(),
         vault: vault.to_string_lossy().into_owned(),
-        vaultqa_backend: Some((
-            "http://127.0.0.1:9100".into(),
-            "vaultqa-dummy-tok".into(),
-            "local-vaultqa".into(),
-        )),
         context_carry: true,
         timeout_secs: 30,
         ..test_config()
-    };
+    });
     let st = AppState::new(cfg);
     let v = carry_post_and_wait(&st, r#"{"mode":"ask","text":"what is my VO2 max lately"}"#).await;
     let sid = v["session_id"]
@@ -3766,19 +3774,14 @@ async fn context_carry_records_pre_badge_reply_so_no_badge_leaks_into_a_block() 
     let vault = make_diet_vault();
     write_vault_file(&vault, "todo-list/Today.md", "# Today\nVO2 max is 52.\n");
     let fake = write_sniffing_fake("Your VO2 max is 52 (todo-list/Today.md:2).", "HOSTED");
-    let cfg = Config {
+    let cfg = with_vaultqa_offload(Config {
         claude_bin: fake.to_string_lossy().into_owned(),
         vault: vault.to_string_lossy().into_owned(),
-        vaultqa_backend: Some((
-            "http://127.0.0.1:9100".into(),
-            "vaultqa-dummy-tok".into(),
-            "local-vaultqa".into(),
-        )),
         context_carry: true,
         model_badge: true,
         timeout_secs: 30,
         ..test_config()
-    };
+    });
     let st = AppState::new(cfg);
     let v = carry_post_and_wait(&st, r#"{"mode":"ask","text":"what is my VO2 max lately"}"#).await;
     // The DELIVERED reply carries the display badge.
@@ -3853,19 +3856,14 @@ async fn context_carry_end_to_end_pins_todays_transcript() {
     let _ = std::fs::remove_file(&argv_file);
     let fake = write_transcript_fake(&count_file, &argv_file);
 
-    let cfg = Config {
+    let cfg = with_vaultqa_offload(Config {
         claude_bin: fake.to_string_lossy().into_owned(),
         vault: vault.to_string_lossy().into_owned(),
-        vaultqa_backend: Some((
-            "http://127.0.0.1:9100".into(),
-            "vaultqa-dummy-tok".into(),
-            "local-oss".into(),
-        )),
         emergency_local: true,
         context_carry: true,
         timeout_secs: 30,
         ..test_config()
-    };
+    });
     let st = AppState::new(cfg);
 
     // Turn 1: emergency-served, fresh thread → synthetic id.
@@ -4479,7 +4477,8 @@ fn cfg_with_switch_registry(state_dir: &std::path::Path) -> Config {
                 backend: None,
                 subagent_model: None,
                 configured: true,
-                default_writes: true,
+                level: Capability::Write,
+                harness: CLAUDE_CODE_ID.to_string(),
                 price: PriceDeck {
                     in_per_m: 5.0,
                     cached_per_m: 0.5,
@@ -4500,7 +4499,8 @@ fn cfg_with_switch_registry(state_dir: &std::path::Path) -> Config {
                 )),
                 subagent_model: Some("glm-model".into()),
                 configured: true,
-                default_writes: false,
+                level: Capability::Read,
+                harness: CLAUDE_CODE_ID.to_string(),
                 price: PriceDeck {
                     in_per_m: 1.4,
                     cached_per_m: 0.14,
@@ -4517,7 +4517,8 @@ fn cfg_with_switch_registry(state_dir: &std::path::Path) -> Config {
                 backend: None,
                 subagent_model: None,
                 configured: false,
-                default_writes: false,
+                level: Capability::Read,
+                harness: CLAUDE_CODE_ID.to_string(),
                 price: PriceDeck::ZERO,
                 health: HealthConfig::default(),
                 vision: Vec::new(),
@@ -4738,54 +4739,108 @@ async fn set_model_unavailable_is_409_and_does_not_switch() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+
+/// THE MODELS-ENDPOINT SHAPE, pinned. Each entry gains exactly two fields — `level` and
+/// `streams_text` — and keeps every field it had. A silently changed shape is a client
+/// that renders the wrong thing, so the whole key set is asserted rather than the new
+/// pair alone.
 #[tokio::test]
-async fn set_model_writes_stores_and_reflects_in_get() {
+async fn the_models_endpoint_entry_shape_is_pinned() {
     let dir = std::env::temp_dir().join(format!("jesse-model-it-{}", random_hex()));
     let st = AppState::new(cfg_with_switch_registry(&dir));
-    let resp = app(st.clone())
-        .oneshot(set_model_writes_request(
-            Some("Bearer test-token"),
-            "glm-5.2",
-            r#"{"enabled":true}"#,
-        ))
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
-    assert_eq!(body_value(resp).await["writes_allowed"], true);
-    // GET now reflects glm as writes-on.
     let resp = app(st)
         .oneshot(models_request(Some("Bearer test-token")))
         .await
         .unwrap();
     let v = body_value(resp).await;
-    let glm = v["models"]
+    let entry = v["models"].as_array().unwrap()[0].as_object().unwrap().clone();
+    let mut keys: Vec<&str> = entry.keys().map(String::as_str).collect();
+    keys.sort();
+    assert_eq!(
+        keys,
+        vec![
+            "available",
+            "configured",
+            "healthy",
+            "id",
+            "kind",
+            "label",
+            "last_checked_ms",
+            "latency_ms",
+            "level",
+            "streams_text",
+            "vision",
+            "writes_allowed",
+        ],
+        "the models entry shape changed — update the clients and the changelog"
+    );
+    // The two new fields carry the right types and values.
+    for m in v["models"].as_array().unwrap() {
+        assert!(
+            ["basic", "read", "write"].contains(&m["level"].as_str().unwrap()),
+            "level is one of the three capability labels: {m}"
+        );
+        assert!(
+            m["streams_text"].is_boolean(),
+            "streams_text is a boolean the client can key a spinner off: {m}"
+        );
+        // Every model registered today runs under Claude Code, which streams.
+        assert_eq!(m["streams_text"], true);
+    }
+    // Unconfigured and unhealthy stay DISTINCT, exactly as before.
+    let unarmed = v["models"]
         .as_array()
         .unwrap()
         .iter()
-        .find(|m| m["id"] == "glm-5.2")
-        .unwrap()
-        .clone();
-    assert_eq!(
-        glm["writes_allowed"], true,
-        "the writes override is reflected"
-    );
+        .find(|m| m["configured"] == false);
+    if let Some(u) = unarmed {
+        assert_eq!(u["available"], false);
+        assert_eq!(u["healthy"], false, "unconfigured is not 'unhealthy'");
+    }
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// THE REMOVAL, asserted rather than described. `POST /jesse/model/{id}/writes` let a
+/// device grant a model write access to the vault. It is gone: what a model may touch is
+/// its `level`, which lives in the bridge config and is validated at startup against the
+/// committed containment record. A control the phone had is a control the phone no longer
+/// has, so the route must 404 rather than quietly accept and ignore.
 #[tokio::test]
-async fn set_model_writes_on_the_default_model_is_rejected() {
-    // Opus is always writes-on and its permission is not user-settable.
+async fn the_per_model_writes_endpoint_is_gone() {
+    let dir = std::env::temp_dir().join(format!("jesse-model-it-{}", random_hex()));
+    let st = AppState::new(cfg_with_switch_registry(&dir));
+    for (id, body) in [("glm-5.2", r#"{"enabled":true}"#), ("opus", r#"{"enabled":false}"#)] {
+        let resp = app(st.clone())
+            .oneshot(set_model_writes_request(Some("Bearer test-token"), id, body))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::NOT_FOUND,
+            "the writes toggle must be gone, not merely inert, for {id}"
+        );
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// …and a model's write permission now reads off its configured level, with no way for a
+/// client to change it.
+#[tokio::test]
+async fn a_models_write_permission_comes_from_its_configured_level() {
     let dir = std::env::temp_dir().join(format!("jesse-model-it-{}", random_hex()));
     let st = AppState::new(cfg_with_switch_registry(&dir));
     let resp = app(st)
-        .oneshot(set_model_writes_request(
-            Some("Bearer test-token"),
-            "opus",
-            r#"{"enabled":false}"#,
-        ))
+        .oneshot(models_request(Some("Bearer test-token")))
         .await
         .unwrap();
-    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let v = body_value(resp).await;
+    let models = v["models"].as_array().unwrap().clone();
+    let glm = models.iter().find(|m| m["id"] == "glm-5.2").unwrap();
+    assert_eq!(glm["level"], "read", "a declared model defaults to Read");
+    assert_eq!(glm["writes_allowed"], false, "…so it may not write");
+    let opus = models.iter().find(|m| m["id"] == "opus").unwrap();
+    assert_eq!(opus["level"], "write", "the ambient default is the built-in Write entry");
+    assert_eq!(opus["writes_allowed"], true);
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -5077,7 +5132,8 @@ async fn preprocess_pairs_and_frames_a_faithful_view() {
         backend: Some((base, "t".into(), "m".into())),
         subagent_model: Some("m".into()),
         configured: true,
-        default_writes: false,
+        level: Capability::Read,
+        harness: CLAUDE_CODE_ID.to_string(),
         price: PriceDeck::ZERO,
         health: HealthConfig::default(),
         vision: Vec::new(),
@@ -5090,7 +5146,8 @@ async fn preprocess_pairs_and_frames_a_faithful_view() {
         backend: Some(("http://text".into(), "tt".into(), "tm".into())),
         subagent_model: Some("tm".into()),
         configured: true,
-        default_writes: false,
+        level: Capability::Read,
+        harness: CLAUDE_CODE_ID.to_string(),
         price: PriceDeck::ZERO,
         health: HealthConfig::default(),
         vision: vec![VisionPartner {
@@ -5117,7 +5174,8 @@ async fn preprocess_pairs_and_frames_a_faithful_view() {
         kind: ModelKind::Hosted,
         env: Some(("http://text".into(), "tt".into(), "tm".into())),
         subagent_model: Some("tm".into()),
-        writes_allowed: false,
+        level: Capability::Read,
+        harness: CLAUDE_CODE_ID.to_string(),
         price: PriceDeck::ZERO,
         vision: vec![VisionPartner {
             id: "mock".into(),
@@ -5161,7 +5219,8 @@ async fn unpaired_model_reports_no_vision() {
         backend: Some(("http://text".into(), "tt".into(), "tm".into())),
         subagent_model: Some("tm".into()),
         configured: true,
-        default_writes: false,
+        level: Capability::Read,
+        harness: CLAUDE_CODE_ID.to_string(),
         price: PriceDeck::ZERO,
         health: HealthConfig::default(),
         vision: Vec::new(),

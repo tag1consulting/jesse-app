@@ -191,6 +191,13 @@ pub struct Config {
     pub bind: String,
     pub port: u16,
     pub claude_bin: String,
+    /// The ordered candidate list for work the user did NOT choose a model for
+    /// (`offload_order` in the config file). Empty by default, which routes every such job
+    /// to ambient — byte-for-byte the behavior before this key existed.
+    ///
+    /// It governs ONLY routed jobs. A main turn runs on the model the chip selected or it
+    /// fails; see [`crate::routing`] for why that boundary matters and what erodes it.
+    pub offload_order: Vec<String>,
     pub timeout_secs: u64,
     // Comma-separated tool allowlist passed to `claude --allowedTools`.
     pub allowed_tools: String,
@@ -235,37 +242,6 @@ pub struct Config {
     // temp dir. Set JESSE_SCRATCH_DIR to point this at a sandbox-mounted path if
     // the bridge is ever confined so it can't read the system temp dir.
     pub scratch_dir: Option<String>,
-    // Optional title-endpoint backend override: `Some((base_url, auth_token,
-    // model))` only when ALL THREE of JESSE_TITLE_BASE_URL / JESSE_TITLE_AUTH_TOKEN
-    // / JESSE_TITLE_MODEL are set (see `resolve_title_backend` for the all-or-
-    // nothing rule). When `Some`, the `POST /jesse/title` one-shot child — and
-    // ONLY that child — gets ANTHROPIC_BASE_URL / ANTHROPIC_AUTH_TOKEN /
-    // ANTHROPIC_MODEL set to these values, so a title can be served by a cheap,
-    // fast local backend while main turns keep using the ambient credentials.
-    // `None` → titles use the ambient backend, byte-for-byte today's behavior.
-    pub title_backend: Option<(String, String, String)>,
-    // Optional local diet-extract backend override: `Some((base_url, auth_token,
-    // model))` only when ALL THREE of JESSE_DIET_BASE_URL / JESSE_DIET_AUTH_TOKEN /
-    // JESSE_DIET_MODEL are set (see `resolve_diet_backend` — same all-or-nothing
-    // rule as the title backend). When `Some`, the diet-logging pipeline's stateless
-    // EXTRACT child — and only that child — gets ANTHROPIC_BASE_URL /
-    // ANTHROPIC_AUTH_TOKEN / ANTHROPIC_MODEL set to these values, so a food/exercise/
-    // weigh-in utterance can be parsed by a cheap local model while every main turn
-    // and the hosted verify child keep using the ambient credentials.
-    //
-    // THE KILL SWITCH IS THIS SEAM ITSELF: leave the triple unset (the default) and
-    // `diet_backend` is `None`, so the gate in `handlers::jesse` never fires and every
-    // diet turn reverts BYTE-FOR-BYTE to today's hosted `run_claude_streaming` path —
-    // no redeploy, no code change. `None` is the safe, shipped-today behavior.
-    pub diet_backend: Option<(String, String, String)>,
-    // Whether the local diet pipeline runs in PROBATION mode (env
-    // `JESSE_DIET_PROBATION`, default TRUE). In probation the hosted verify gate is
-    // mandatory and blocking on every extracted entry. `false` is a future
-    // graduation state (flip blocking-verify to sampled-audit) and is NOT used yet —
-    // it exists so graduation later needs no change to the extract child or the
-    // append path. Independent of `diet_backend`: it tunes the pipeline's verify
-    // posture, not whether the pipeline is active.
-    pub diet_probation: bool,
     // Whether the hosted MICRONUTRIENT COMPLETION pass runs on the local diet route
     // (env `JESSE_DIET_MICRO_COMPLETE`, default TRUE — off is the old, broken
     // behavior in which a locally-logged row kept three or more knowable nutrient
@@ -274,28 +250,18 @@ pub struct Config {
     // row left BLANK, and the bridge merges them blank-only (see
     // `dietlog::complete_food_micros`).
     //
-    // WHICH FLAG OWNS WHAT — deliberately DECOUPLED from `diet_probation`:
-    //   * `diet_probation` owns the VERIFY GATE's posture: whether the hosted verdict
-    //     is mandatory and blocking on every entry before anything is appended.
+    // WHICH FLAG OWNS WHAT — this one owns the OUTPUT SHAPE, not model selection, which
+    // is why it survives the removal of the role backends:
+    //   * the verify GATE's posture is the EXTRACTING MODEL'S LEVEL (see
+    //     `routing::skips_verification`): at `Write` the extraction is taken as-is,
+    //     below it the hosted verdict is mandatory and blocking before anything is
+    //     appended. That replaced the `JESSE_DIET_PROBATION` flag, which asked where
+    //     the extraction ran rather than what the model was trusted with.
     //   * `diet_micro_complete` owns NUTRIENT COMPLETION: whether blank expected
     //     nutrient columns get filled from the hosted call.
-    // So when probation is later lifted and the blocking verify becomes a sampled
-    // audit, completion still runs on EVERY local-route food row.
+    // So a `Write` extractor that skips verification still gets completion on every
+    // local-route food row.
     pub diet_micro_complete: bool,
-    // Optional local vault-QA backend override: `Some((base_url, auth_token,
-    // model))` only when ALL THREE of JESSE_VAULTQA_BASE_URL / JESSE_VAULTQA_AUTH_TOKEN
-    // / JESSE_VAULTQA_MODEL are set (see `resolve_vaultqa_backend` — same all-or-
-    // nothing rule as the diet backend). When `Some`, a self-referential "Ask" that
-    // passes the strict vault-QA gate runs the CONTAINED, READ-ONLY vault-QA child —
-    // and only that child — pointed at these values via `apply_vaultqa_env`, so a
-    // vault lookup can be answered locally while every main turn and the diet/title
-    // children keep their own credentials.
-    //
-    // THE KILL SWITCH IS THIS SEAM ITSELF: leave the triple unset (the default) and
-    // `vaultqa_backend` is `None`, so the gate in `handlers::jesse` never fires and
-    // every Ask reverts BYTE-FOR-BYTE to today's hosted `run_claude_streaming` path —
-    // no redeploy, no code change. `None` is the safe, shipped-today behavior.
-    pub vaultqa_backend: Option<(String, String, String)>,
     // Optional path to an MCP config JSON declaring exactly the qmd vault-search
     // server, layered onto the vault-QA child via `--mcp-config` (env
     // `JESSE_VAULTQA_MCP_CONFIG`). When unset the child loads NO MCP servers (the
@@ -526,96 +492,8 @@ pub fn env_parse<T: std::str::FromStr>(name: &str, default: T) -> T {
         .unwrap_or(default)
 }
 
-/// Resolve the optional title-endpoint backend override from its three
-/// env-derived parts. Returns `Some((base_url, auth_token, model))` ONLY when all
-/// three are present; any partial combination (one or two set) resolves to `None`
-/// so titles fall back to the ambient backend — the "partial config is treated as
-/// unset" rule. On a partial config it logs one warning at startup so a
-/// half-configured deploy is visible rather than silently half-redirecting. Pure
-/// except for that warning; the `Some`/`None` result is what encodes the rule.
-pub fn resolve_title_backend(
-    base_url: Option<String>,
-    auth_token: Option<String>,
-    model: Option<String>,
-) -> Option<(String, String, String)> {
-    match (base_url, auth_token, model) {
-        (Some(b), Some(t), Some(m)) => Some((b, t, m)),
-        (b, t, m) => {
-            let set = b.is_some() as u8 + t.is_some() as u8 + m.is_some() as u8;
-            if set > 0 {
-                eprintln!(
-                    "jesse-bridge: WARNING partial JESSE_TITLE_* config ({set}/3 set) — the \
-                     title-backend override needs ALL of JESSE_TITLE_BASE_URL, \
-                     JESSE_TITLE_AUTH_TOKEN, JESSE_TITLE_MODEL; treating as unset \
-                     (titles use the ambient backend)."
-                );
-            }
-            None
-        }
-    }
-}
-
-/// Resolve the optional local diet-extract backend override from its three
-/// env-derived parts. Identical all-or-nothing rule as [`resolve_title_backend`]:
-/// returns `Some((base_url, auth_token, model))` ONLY when all three are present;
-/// any partial combination resolves to `None` (the diet pipeline stays dormant and
-/// diet turns keep using the ambient/hosted path). A partial config logs one
-/// startup warning so a half-configured deploy is visible rather than silently
-/// half-active. Pure except for that warning.
-pub fn resolve_diet_backend(
-    base_url: Option<String>,
-    auth_token: Option<String>,
-    model: Option<String>,
-) -> Option<(String, String, String)> {
-    match (base_url, auth_token, model) {
-        (Some(b), Some(t), Some(m)) => Some((b, t, m)),
-        (b, t, m) => {
-            let set = b.is_some() as u8 + t.is_some() as u8 + m.is_some() as u8;
-            if set > 0 {
-                eprintln!(
-                    "jesse-bridge: WARNING partial JESSE_DIET_* config ({set}/3 set) — the \
-                     local diet-extract backend needs ALL of JESSE_DIET_BASE_URL, \
-                     JESSE_DIET_AUTH_TOKEN, JESSE_DIET_MODEL; treating as unset (diet \
-                     turns use the hosted path)."
-                );
-            }
-            None
-        }
-    }
-}
-
-/// Resolve the optional local vault-QA backend override from its three env-derived
-/// parts. Identical all-or-nothing rule as [`resolve_diet_backend`] /
-/// [`resolve_title_backend`]: returns `Some((base_url, auth_token, model))` ONLY
-/// when all three are present; any partial combination resolves to `None` (the
-/// vault-QA route stays inert and Asks keep taking the hosted path). A partial
-/// config logs one startup warning so a half-configured deploy is visible rather
-/// than silently half-active. Pure except for that warning.
-pub fn resolve_vaultqa_backend(
-    base_url: Option<String>,
-    auth_token: Option<String>,
-    model: Option<String>,
-) -> Option<(String, String, String)> {
-    match (base_url, auth_token, model) {
-        (Some(b), Some(t), Some(m)) => Some((b, t, m)),
-        (b, t, m) => {
-            let set = b.is_some() as u8 + t.is_some() as u8 + m.is_some() as u8;
-            if set > 0 {
-                eprintln!(
-                    "jesse-bridge: WARNING partial JESSE_VAULTQA_* config ({set}/3 set) — the \
-                     local vault-QA backend needs ALL of JESSE_VAULTQA_BASE_URL, \
-                     JESSE_VAULTQA_AUTH_TOKEN, JESSE_VAULTQA_MODEL; treating as unset (Asks \
-                     use the hosted path)."
-                );
-            }
-            None
-        }
-    }
-}
-
 /// Resolve the optional SHADOW-comparison backend override from its three
-/// env-derived parts. Identical all-or-nothing rule as [`resolve_vaultqa_backend`]:
-/// returns `Some((base_url, auth_token, model))` ONLY when all three are present;
+/// env-derived parts. All-or-nothing: returns `Some((base_url, auth_token, model))` ONLY when all three are present;
 /// any partial combination resolves to `None` (shadow mode stays disarmed and no
 /// ask turn is ever mirrored). A partial config logs one startup warning so a
 /// half-configured deploy is visible rather than silently half-active. Pure except
@@ -933,10 +811,23 @@ pub struct RegistryModel {
     /// see [`model_health`]). Ambient is always configured; a hosted/local entry is
     /// configured IFF its triple resolved (its token env var was set).
     pub configured: bool,
-    /// The write permission a freshly-registered model gets before any explicit opt-in.
-    /// Ambient (`opus`) is always `true` (writes-on); every non-ambient entry defaults
-    /// `false` — read-only until writes are enabled per model.
-    pub default_writes: bool,
+    /// The MOST this model may be granted — a CEILING, not a grant. `Write` means it may
+    /// change the vault; `Read` that it may read and search; `Basic` that it may have no
+    /// tools at all. Absent from config it is [`Capability::Read`], the safe direction: a
+    /// newly declared model can be asked questions but cannot change anything.
+    ///
+    /// It is a ceiling because the JOB sets the actual grant beneath it — see
+    /// [`turn_capability`] and [`RoutedJob::required`]. A `Write` model serving a title runs
+    /// at `Basic`; a `Read` model backing a conversation runs read-only.
+    ///
+    /// Config-only, deliberately: it is not settable from a client. The per-model writes
+    /// toggle this replaced was (`POST /jesse/model/{id}/writes`, removed), which put a
+    /// containment decision on the phone.
+    pub level: Capability,
+    /// The harness that runs this model's child, by [`Harness::id`]. `claude-code` when the
+    /// entry declares none. The registry instantiates only the harnesses some configured
+    /// model actually names.
+    pub harness: String,
     /// The price deck for the per-turn cost badge.
     pub price: PriceDeck,
     /// The health-probe cadence + endpoint for this model (unused for the ambient entry,
@@ -964,6 +855,13 @@ pub struct ModelRegistry {
 /// The id of the default, always-available model. Selecting it reproduces today's
 /// behavior byte-for-byte (no overrides, normal allowlist, writes-on).
 pub const DEFAULT_MODEL_ID: &str = "opus";
+
+/// The level a model gets when its config declares none: [`Capability::Read`].
+///
+/// The safe direction, and the reason the default is not `Write`: a model that appears in
+/// the config without anyone deciding what it may touch can be asked questions and cannot
+/// change anything. Raising it is an explicit `level = "write"`.
+pub const DEFAULT_MODEL_LEVEL: Capability = Capability::Read;
 
 impl ModelRegistry {
     /// Look up an entry by id.
@@ -1121,7 +1019,10 @@ fn glm_env_entry(default_interval_secs: u64) -> RegistryModel {
         subagent_model: backend.as_ref().map(|(_, _, m)| m.clone()),
         configured: backend.is_some(),
         backend,
-        default_writes: false,
+        // No declarative entry, so no `level` key: the default applies. A deploy that wants
+        // one of these at Write says so in the `[[models]]` array.
+        level: Capability::Read,
+        harness: CLAUDE_CODE_ID.to_string(),
         price: PriceDeck {
             in_per_m: FW_GLM_IN_PER_M,
             cached_per_m: FW_GLM_CACHED_PER_M,
@@ -1166,7 +1067,10 @@ fn kimi_env_entry(default_interval_secs: u64) -> RegistryModel {
         subagent_model: backend.as_ref().map(|(_, _, m)| m.clone()),
         configured: backend.is_some(),
         backend,
-        default_writes: false,
+        // No declarative entry, so no `level` key: the default applies. A deploy that wants
+        // one of these at Write says so in the `[[models]]` array.
+        level: Capability::Read,
+        harness: CLAUDE_CODE_ID.to_string(),
         // Fireworks' published K3 deck (3.00 / 0.30 / 15.00), still overridable from env
         // via `JESSE_MODEL_KIMI_PRICE_{IN,CACHED,OUT}` if Fireworks reprices.
         price: model_price_from_env(
@@ -1204,7 +1108,10 @@ fn local_env_entry(default_interval_secs: u64) -> RegistryModel {
         subagent_model: backend.as_ref().map(|(_, _, m)| m.clone()),
         configured: backend.is_some(),
         backend,
-        default_writes: false,
+        // No declarative entry, so no `level` key: the default applies. A deploy that wants
+        // one of these at Write says so in the `[[models]]` array.
+        level: Capability::Read,
+        harness: CLAUDE_CODE_ID.to_string(),
         price: PriceDeck::ZERO,
         health: HealthConfig {
             interval_secs: default_interval_secs,
@@ -1229,9 +1136,11 @@ pub struct ActiveModel {
     /// The subagent model id (== the triple's model) so the subagents the main turn
     /// spawns follow the switch via `CLAUDE_CODE_SUBAGENT_MODEL`. `None` for ambient.
     pub subagent_model: Option<String>,
-    /// Whether this turn may WRITE. `false` → the read-only allowlist (the Phase 1
-    /// default for every non-ambient model). Ambient (`opus`) is always `true`.
-    pub writes_allowed: bool,
+    /// This model's LEVEL — the ceiling it may be granted, carried onto the turn so
+    /// [`turn_capability`] can take the minimum of it and `Write`. Never the grant itself.
+    pub level: Capability,
+    /// The harness that runs this model's child, by [`Harness::id`].
+    pub harness: String,
     /// The price deck for the per-turn cost badge.
     pub price: PriceDeck,
     /// The vision helpers this model is paired with (copied from its registry entry) plus
@@ -1243,6 +1152,16 @@ pub struct ActiveModel {
 }
 
 impl ActiveModel {
+    /// Whether this model may change the vault: its level is `Write`.
+    ///
+    /// Derived from the level rather than stored, so there is exactly one source of truth
+    /// for what a model may touch. The per-model boolean this replaced was settable from the
+    /// phone; a level is config-only and is validated at startup against the containment
+    /// record.
+    pub fn writes_allowed(&self) -> bool {
+        self.level >= Capability::Write
+    }
+
     /// The ambient default (`opus`): no env overrides, writes-on. A turn built with this
     /// is byte-for-byte today's behavior — the value the title one-shot and any
     /// no-switch caller pass so nothing about their command changes.
@@ -1252,7 +1171,8 @@ impl ActiveModel {
             kind: ModelKind::Ambient,
             env: None,
             subagent_model: None,
-            writes_allowed: true,
+            level: Capability::Write,
+            harness: CLAUDE_CODE_ID.to_string(),
             price: PriceDeck {
                 in_per_m: OPUS_IN_PER_M,
                 cached_per_m: OPUS_CACHED_PER_M,
@@ -1280,7 +1200,12 @@ fn opus_entry() -> RegistryModel {
         backend: None,
         subagent_model: None,
         configured: true,
-        default_writes: true,
+        // The ambient default is the out-of-box conversation backend and the routing rule's
+        // final fallback, so it is the one built-in `Write` entry. Not settable: there is no
+        // `[[models]]` entry for opus (a declarative entry that tries to redefine it is
+        // refused), which is what keeps the ambient contract out of config's reach.
+        level: Capability::Write,
+        harness: CLAUDE_CODE_ID.to_string(),
         price: PriceDeck {
             in_per_m: OPUS_IN_PER_M,
             cached_per_m: OPUS_CACHED_PER_M,
@@ -1333,6 +1258,20 @@ pub struct ModelToml {
     pub model: Option<String>,
     pub subagent_model: Option<String>,
     pub auth_token_env: Option<String>,
+    /// The harness that runs this model's child (`claude-code`, `codex`, …). Absent means
+    /// `claude-code`. An id no harness is registered under is a startup ERROR, never a
+    /// silent fallback — see [`validate_model_config`].
+    pub harness: Option<String>,
+    /// The CEILING this model may be granted: `basic` | `read` | `write`. Absent means
+    /// `read`. See [`RegistryModel::level`].
+    pub level: Option<String>,
+    /// REMOVED, and parsed only so its presence can be REFUSED at startup.
+    ///
+    /// The models deserializer ignores unknown keys (so a forward-looking example file
+    /// parses), which means a key that silently stops being read is a silent security
+    /// downgrade: a deploy that wrote `default_writes = true` would quietly become a
+    /// read-only model. Keeping the field here turns that into a loud startup error naming
+    /// `level` as its replacement.
     pub default_writes: Option<bool>,
     pub price: Option<PriceToml>,
     pub health: Option<HealthToml>,
@@ -1474,7 +1413,22 @@ pub fn registry_model_from_toml(t: &ModelToml, global_interval: Option<u64>) -> 
         backend,
         subagent_model,
         configured,
-        default_writes: t.default_writes.unwrap_or(false),
+        // A bad/absent `level` resolves to the safe default here; `validate_model_config`
+        // is what REFUSES an unparseable one at startup, so a typo is never a silent
+        // downgrade to Read.
+        level: t
+            .level
+            .as_deref()
+            .map(str::trim)
+            .and_then(parse_capability)
+            .unwrap_or(DEFAULT_MODEL_LEVEL),
+        harness: t
+            .harness
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or(CLAUDE_CODE_ID)
+            .to_string(),
         price,
         health,
         vision: t
@@ -1549,6 +1503,7 @@ impl Config {
             bind: env_string("JESSE_BIND").unwrap_or_else(|| "127.0.0.1".to_string()),
             port: env_parse("JESSE_PORT", 8765),
             claude_bin: env_string("JESSE_CLAUDE_BIN").unwrap_or_else(|| "claude".to_string()),
+            offload_order: load_offload_order(&home),
             // 1h default; clamped to [1, HARD_TIMEOUT_CEILING].
             timeout_secs: clamp_timeout_secs(env_parse("JESSE_TIMEOUT", 3600)),
             allowed_tools: env_string("JESSE_ALLOWED_TOOLS")
@@ -1593,50 +1548,11 @@ impl Config {
                 DEFAULT_MAX_ATTACHMENTS_TOTAL_BYTES,
             ),
             scratch_dir: env_string("JESSE_SCRATCH_DIR"),
-            // All-or-nothing title-backend override. Uses the same `env_string`
-            // (trimmed, empty-filtered) semantics as every other string field, so
-            // a blank value counts as unset. Partial config logs a warning and
-            // resolves to None (see `resolve_title_backend`).
-            title_backend: resolve_title_backend(
-                env_string("JESSE_TITLE_BASE_URL"),
-                env_string("JESSE_TITLE_AUTH_TOKEN"),
-                env_string("JESSE_TITLE_MODEL"),
-            ),
-            // All-or-nothing local diet-extract backend override, same `env_string`
-            // (trimmed, empty-filtered) semantics as every other string field. Partial
-            // config logs one warning and resolves to None (see `resolve_diet_backend`).
-            // Unset (the default) → None → the diet pipeline is dormant and every diet
-            // turn takes today's hosted path (the kill switch).
-            diet_backend: resolve_diet_backend(
-                env_string("JESSE_DIET_BASE_URL"),
-                env_string("JESSE_DIET_AUTH_TOKEN"),
-                env_string("JESSE_DIET_MODEL"),
-            ),
-            // Probation defaults to TRUE: the verify gate is mandatory unless an
-            // operator explicitly opts out with a falsey JESSE_DIET_PROBATION. Only an
-            // explicit false/0/no/off flips it; anything else (including unset) is true.
-            diet_probation: std::env::var("JESSE_DIET_PROBATION")
-                .ok()
-                .map(|v| {
-                    let v = v.trim().to_ascii_lowercase();
-                    !(v == "0" || v == "false" || v == "no" || v == "off")
-                })
-                .unwrap_or(true),
             // Micronutrient completion defaults to TRUE (same truthiness convention as
             // probation/badge): OFF is the old behavior that left knowable nutrient
             // columns blank, so an operator must opt OUT explicitly. Independent of
-            // `diet_probation` by design — see the field docs.
+            // model selection by design — see the field docs.
             diet_micro_complete: resolve_diet_micro_complete(),
-            // All-or-nothing local vault-QA backend override, same `env_string`
-            // (trimmed, empty-filtered) semantics as every other string field. Partial
-            // config logs one warning and resolves to None (see `resolve_vaultqa_backend`).
-            // Unset (the default) → None → the vault-QA route is inert and every Ask takes
-            // today's hosted path (the kill switch).
-            vaultqa_backend: resolve_vaultqa_backend(
-                env_string("JESSE_VAULTQA_BASE_URL"),
-                env_string("JESSE_VAULTQA_AUTH_TOKEN"),
-                env_string("JESSE_VAULTQA_MODEL"),
-            ),
             // Optional MCP config path for the vault-QA child (the qmd server). Unset →
             // None → the child runs the read-only built-ins only, qmd absent.
             vaultqa_mcp_config: env_string("JESSE_VAULTQA_MCP_CONFIG"),
@@ -1782,7 +1698,7 @@ mod tests {
         let opus = r.default_model();
         assert_eq!(opus.id, "opus");
         assert!(matches!(opus.kind, ModelKind::Ambient));
-        assert!(opus.configured && opus.default_writes);
+        assert!(opus.configured && opus.level == Capability::Write);
         assert!(!r.is_configured("glm-5.2"), "an absent model is not configured");
     }
 
@@ -1883,354 +1799,6 @@ mod tests {
         match saved {
             Some(v) => std::env::set_var("JESSE_TIMEOUT", v),
             None => std::env::remove_var("JESSE_TIMEOUT"),
-        }
-    }
-    #[test]
-    fn title_backend_resolves_only_when_all_three_present() {
-        // All-or-nothing: the override resolves ONLY when base_url, auth_token,
-        // AND model are all set. This is the load-bearing "partial config is
-        // treated as unset" rule — any missing part falls back to the ambient
-        // backend so a half-configured deploy never silently half-redirects.
-        let full = resolve_title_backend(
-            Some("http://127.0.0.1:9100".into()),
-            Some("dummy-tok".into()),
-            Some("local-title".into()),
-        );
-        assert_eq!(
-            full,
-            Some((
-                "http://127.0.0.1:9100".to_string(),
-                "dummy-tok".to_string(),
-                "local-title".to_string(),
-            ))
-        );
-        // Every partial combination (1 or 2 of 3 set) resolves to None.
-        let s = || Some("x".to_string());
-        let partials = [
-            (s(), s(), None),
-            (s(), None, s()),
-            (None, s(), s()),
-            (s(), None, None),
-            (None, s(), None),
-            (None, None, s()),
-            (None, None, None),
-        ];
-        for (b, t, m) in partials {
-            assert_eq!(
-                resolve_title_backend(b, t, m),
-                None,
-                "partial title config must resolve to None (treated as unset)"
-            );
-        }
-    }
-
-    #[test]
-    fn config_from_env_title_backend_all_or_nothing() {
-        let _g = ENV_LOCK.lock_ok();
-        let keys = [
-            "JESSE_TITLE_BASE_URL",
-            "JESSE_TITLE_AUTH_TOKEN",
-            "JESSE_TITLE_MODEL",
-        ];
-        let saved: Vec<(&str, Option<String>)> =
-            keys.iter().map(|k| (*k, std::env::var(k).ok())).collect();
-        for k in &keys {
-            std::env::remove_var(k);
-        }
-
-        // Unset by default → no override.
-        assert_eq!(Config::from_env().title_backend, None);
-
-        // All three set → the config carries the resolved triple.
-        std::env::set_var("JESSE_TITLE_BASE_URL", "http://127.0.0.1:9100");
-        std::env::set_var("JESSE_TITLE_AUTH_TOKEN", "dsv4-local-dummy");
-        std::env::set_var("JESSE_TITLE_MODEL", "local-title");
-        assert_eq!(
-            Config::from_env().title_backend,
-            Some((
-                "http://127.0.0.1:9100".to_string(),
-                "dsv4-local-dummy".to_string(),
-                "local-title".to_string(),
-            ))
-        );
-
-        // Drop one → partial → None (treated as unset).
-        std::env::remove_var("JESSE_TITLE_AUTH_TOKEN");
-        assert_eq!(Config::from_env().title_backend, None);
-
-        // A blank/whitespace value counts as unset (env_string semantics), so a
-        // set-but-empty var is still a partial config → None.
-        std::env::set_var("JESSE_TITLE_AUTH_TOKEN", "   ");
-        assert_eq!(Config::from_env().title_backend, None);
-
-        for (k, v) in saved {
-            match v {
-                Some(val) => std::env::set_var(k, val),
-                None => std::env::remove_var(k),
-            }
-        }
-    }
-
-    #[test]
-    fn diet_backend_resolves_only_when_all_three_present() {
-        // All-or-nothing, mirroring the title backend: the diet-extract override
-        // resolves ONLY when base_url, auth_token, AND model are all set. Any missing
-        // part falls back to None so the pipeline stays dormant (the kill switch).
-        let full = resolve_diet_backend(
-            Some("http://127.0.0.1:9100".into()),
-            Some("dummy-tok".into()),
-            Some("local-diet".into()),
-        );
-        assert_eq!(
-            full,
-            Some((
-                "http://127.0.0.1:9100".to_string(),
-                "dummy-tok".to_string(),
-                "local-diet".to_string(),
-            ))
-        );
-        // Every partial combination (1 or 2 of 3 set) resolves to None.
-        let s = || Some("x".to_string());
-        let partials = [
-            (s(), s(), None),
-            (s(), None, s()),
-            (None, s(), s()),
-            (s(), None, None),
-            (None, s(), None),
-            (None, None, s()),
-            (None, None, None),
-        ];
-        for (b, t, m) in partials {
-            assert_eq!(
-                resolve_diet_backend(b, t, m),
-                None,
-                "partial diet config must resolve to None (treated as unset)"
-            );
-        }
-    }
-
-    #[test]
-    fn config_from_env_diet_backend_all_or_nothing_and_probation_default_true() {
-        let _g = ENV_LOCK.lock_ok();
-        let keys = [
-            "JESSE_DIET_BASE_URL",
-            "JESSE_DIET_AUTH_TOKEN",
-            "JESSE_DIET_MODEL",
-            "JESSE_DIET_PROBATION",
-        ];
-        let saved: Vec<(&str, Option<String>)> =
-            keys.iter().map(|k| (*k, std::env::var(k).ok())).collect();
-        for k in &keys {
-            std::env::remove_var(k);
-        }
-
-        // Unset by default → no override, and probation defaults to TRUE.
-        let cfg = Config::from_env();
-        assert_eq!(cfg.diet_backend, None);
-        assert!(cfg.diet_probation, "probation must default to true");
-
-        // All three set → the config carries the resolved triple.
-        std::env::set_var("JESSE_DIET_BASE_URL", "http://127.0.0.1:9100");
-        std::env::set_var("JESSE_DIET_AUTH_TOKEN", "dsv4-diet-dummy");
-        std::env::set_var("JESSE_DIET_MODEL", "local-diet");
-        assert_eq!(
-            Config::from_env().diet_backend,
-            Some((
-                "http://127.0.0.1:9100".to_string(),
-                "dsv4-diet-dummy".to_string(),
-                "local-diet".to_string(),
-            ))
-        );
-
-        // Drop one → partial → None (treated as unset).
-        std::env::remove_var("JESSE_DIET_AUTH_TOKEN");
-        assert_eq!(Config::from_env().diet_backend, None);
-
-        // A blank/whitespace value counts as unset (env_string semantics).
-        std::env::set_var("JESSE_DIET_AUTH_TOKEN", "   ");
-        assert_eq!(Config::from_env().diet_backend, None);
-
-        // Probation: only an explicit falsey value flips it to false.
-        for falsey in ["0", "false", "no", "off", "FALSE", " Off "] {
-            std::env::set_var("JESSE_DIET_PROBATION", falsey);
-            assert!(
-                !Config::from_env().diet_probation,
-                "explicit {falsey:?} must disable probation"
-            );
-        }
-        for truthy in ["1", "true", "yes", "on", "anything-else"] {
-            std::env::set_var("JESSE_DIET_PROBATION", truthy);
-            assert!(
-                Config::from_env().diet_probation,
-                "{truthy:?} must keep probation on"
-            );
-        }
-
-        for (k, v) in saved {
-            match v {
-                Some(val) => std::env::set_var(k, val),
-                None => std::env::remove_var(k),
-            }
-        }
-    }
-
-    #[test]
-    fn micro_completion_defaults_on_and_is_independent_of_probation() {
-        let _g = ENV_LOCK.lock_ok();
-        let keys = ["JESSE_DIET_MICRO_COMPLETE", "JESSE_DIET_PROBATION"];
-        let saved: Vec<(&str, Option<String>)> =
-            keys.iter().map(|k| (*k, std::env::var(k).ok())).collect();
-        for k in &keys {
-            std::env::remove_var(k);
-        }
-
-        // Unset → ON. OFF is the old behavior that left knowable nutrient columns
-        // blank, so an operator must opt OUT explicitly.
-        assert!(
-            Config::from_env().diet_micro_complete,
-            "completion must default to true"
-        );
-        for falsey in ["0", "false", "no", "off", "OFF", " Off "] {
-            std::env::set_var("JESSE_DIET_MICRO_COMPLETE", falsey);
-            assert!(
-                !Config::from_env().diet_micro_complete,
-                "explicit {falsey:?} must disable completion"
-            );
-        }
-        for truthy in ["1", "true", "yes", "on", "anything-else"] {
-            std::env::set_var("JESSE_DIET_MICRO_COMPLETE", truthy);
-            assert!(
-                Config::from_env().diet_micro_complete,
-                "{truthy:?} keeps it on"
-            );
-        }
-
-        // DECOUPLED from probation, in both directions: graduating off probation must
-        // not silently stop nutrient completion, and disabling completion must not
-        // relax the verify gate.
-        std::env::remove_var("JESSE_DIET_MICRO_COMPLETE");
-        std::env::set_var("JESSE_DIET_PROBATION", "off");
-        let cfg = Config::from_env();
-        assert!(!cfg.diet_probation && cfg.diet_micro_complete);
-        std::env::set_var("JESSE_DIET_PROBATION", "on");
-        std::env::set_var("JESSE_DIET_MICRO_COMPLETE", "off");
-        let cfg = Config::from_env();
-        assert!(cfg.diet_probation && !cfg.diet_micro_complete);
-
-        for (k, v) in saved {
-            match v {
-                Some(val) => std::env::set_var(k, val),
-                None => std::env::remove_var(k),
-            }
-        }
-    }
-
-    #[test]
-    fn vaultqa_backend_resolves_only_when_all_three_present() {
-        // All-or-nothing, mirroring the diet/title backends: the vault-QA override
-        // resolves ONLY when base_url, auth_token, AND model are all set. Any missing
-        // part falls back to None so the route stays inert (the kill switch).
-        let full = resolve_vaultqa_backend(
-            Some("http://127.0.0.1:9100".into()),
-            Some("dummy-tok".into()),
-            Some("local-vaultqa".into()),
-        );
-        assert_eq!(
-            full,
-            Some((
-                "http://127.0.0.1:9100".to_string(),
-                "dummy-tok".to_string(),
-                "local-vaultqa".to_string(),
-            ))
-        );
-        // Every partial combination (1 or 2 of 3 set) resolves to None.
-        let s = || Some("x".to_string());
-        let partials = [
-            (s(), s(), None),
-            (s(), None, s()),
-            (None, s(), s()),
-            (s(), None, None),
-            (None, s(), None),
-            (None, None, s()),
-            (None, None, None),
-        ];
-        for (b, t, m) in partials {
-            assert_eq!(
-                resolve_vaultqa_backend(b, t, m),
-                None,
-                "partial vault-QA config must resolve to None (treated as unset)"
-            );
-        }
-    }
-
-    #[test]
-    fn config_from_env_vaultqa_backend_all_or_nothing_and_mcp_and_badge() {
-        let _g = ENV_LOCK.lock_ok();
-        let keys = [
-            "JESSE_VAULTQA_BASE_URL",
-            "JESSE_VAULTQA_AUTH_TOKEN",
-            "JESSE_VAULTQA_MODEL",
-            "JESSE_VAULTQA_MCP_CONFIG",
-            "JESSE_MODEL_BADGE",
-        ];
-        let saved: Vec<(&str, Option<String>)> =
-            keys.iter().map(|k| (*k, std::env::var(k).ok())).collect();
-        for k in &keys {
-            std::env::remove_var(k);
-        }
-
-        // Unset by default → no override, MCP config absent, badge ON.
-        let cfg = Config::from_env();
-        assert_eq!(cfg.vaultqa_backend, None);
-        assert_eq!(cfg.vaultqa_mcp_config, None);
-        assert!(cfg.model_badge, "badge must default to on");
-
-        // All three set → the config carries the resolved triple; MCP path honored.
-        std::env::set_var("JESSE_VAULTQA_BASE_URL", "http://127.0.0.1:9100");
-        std::env::set_var("JESSE_VAULTQA_AUTH_TOKEN", "vaultqa-dummy-tok");
-        std::env::set_var("JESSE_VAULTQA_MODEL", "local-vaultqa");
-        std::env::set_var("JESSE_VAULTQA_MCP_CONFIG", "/etc/jesse/qmd.json");
-        let cfg = Config::from_env();
-        assert_eq!(
-            cfg.vaultqa_backend,
-            Some((
-                "http://127.0.0.1:9100".to_string(),
-                "vaultqa-dummy-tok".to_string(),
-                "local-vaultqa".to_string(),
-            ))
-        );
-        assert_eq!(
-            cfg.vaultqa_mcp_config.as_deref(),
-            Some("/etc/jesse/qmd.json")
-        );
-
-        // Drop one → partial → None (treated as unset); a blank value counts as unset.
-        std::env::remove_var("JESSE_VAULTQA_AUTH_TOKEN");
-        assert_eq!(Config::from_env().vaultqa_backend, None);
-        std::env::set_var("JESSE_VAULTQA_AUTH_TOKEN", "   ");
-        assert_eq!(Config::from_env().vaultqa_backend, None);
-
-        // Badge: only an explicit falsey value flips it off.
-        for falsey in ["0", "false", "no", "off", "OFF", " Off "] {
-            std::env::set_var("JESSE_MODEL_BADGE", falsey);
-            assert!(
-                !Config::from_env().model_badge,
-                "explicit {falsey:?} disables the badge"
-            );
-        }
-        for truthy in ["1", "true", "yes", "on", "anything-else"] {
-            std::env::set_var("JESSE_MODEL_BADGE", truthy);
-            assert!(
-                Config::from_env().model_badge,
-                "{truthy:?} keeps the badge on"
-            );
-        }
-
-        for (k, v) in saved {
-            match v {
-                Some(val) => std::env::set_var(k, val),
-                None => std::env::remove_var(k),
-            }
         }
     }
 
@@ -2569,7 +2137,7 @@ mod tests {
         );
         assert_eq!(armed.subagent_model.as_deref(), Some("provider/model"));
         assert!(matches!(armed.kind, ModelKind::Hosted));
-        assert!(!armed.default_writes, "non-ambient defaults read-only");
+        assert_eq!(armed.level, DEFAULT_MODEL_LEVEL, "non-ambient defaults to Read");
 
         std::env::remove_var("JESSE_TEST_DECL_TOKEN");
         let unarmed =
@@ -2606,6 +2174,8 @@ mod tests {
         let _g = ENV_LOCK.lock_ok();
         std::env::set_var("JESSE_TEST_VIS_TOKEN", "tok");
         let t = ModelToml {
+            harness: None,
+            default_writes: None,
             id: Some("glm".into()),
             kind: Some("hosted".into()),
             base_url: Some("http://b".into()),
@@ -2648,7 +2218,8 @@ mod tests {
             backend: None,
             subagent_model: None,
             configured: false,
-            default_writes: false,
+            level: Capability::Read,
+            harness: CLAUDE_CODE_ID.to_string(),
             price: PriceDeck::ZERO,
             health: HealthConfig::default(),
             vision: Vec::new(),
@@ -2661,7 +2232,8 @@ mod tests {
             backend: Some(("http://b".into(), "t".into(), "m".into())),
             subagent_model: Some("m".into()),
             configured: true,
-            default_writes: false,
+            level: Capability::Read,
+            harness: CLAUDE_CODE_ID.to_string(),
             price: PriceDeck::ZERO,
             health: HealthConfig::default(),
             vision: vec![VisionPartner {
@@ -2697,6 +2269,8 @@ mod tests {
         let _g = ENV_LOCK.lock_ok();
         std::env::set_var("JESSE_TEST_DECL_TOKEN2", "tok");
         let t = ModelToml {
+            harness: None,
+            default_writes: None,
             id: Some("codex".into()),
             label: Some("Codex".into()),
             kind: Some("local".into()),
@@ -2704,7 +2278,7 @@ mod tests {
             model: Some("gpt-5-codex".into()),
             subagent_model: Some("gpt-5-mini".into()),
             auth_token_env: Some("JESSE_TEST_DECL_TOKEN2".into()),
-            default_writes: Some(true),
+            level: Some("write".to_string()),
             price: Some(PriceToml {
                 in_per_m: Some(2.0),
                 cached_per_m: Some(0.2),
@@ -2722,7 +2296,7 @@ mod tests {
         assert!(matches!(m.kind, ModelKind::Local));
         assert_eq!(m.label, "Codex");
         assert_eq!(m.subagent_model.as_deref(), Some("gpt-5-mini"), "explicit subagent override");
-        assert!(m.default_writes, "declarative default_writes honored");
+        assert_eq!(m.level, Capability::Write, "declarative level honored");
         assert_eq!(m.price.out_per_m, 8.0);
         assert_eq!(m.health.interval_secs, 30);
         assert_eq!(m.health.timeout_secs, 2);

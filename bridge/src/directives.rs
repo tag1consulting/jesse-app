@@ -198,6 +198,55 @@ pub struct MealLog {
     pub corrections_seq: Option<u64>,
 }
 
+// ---- WHAT A MODEL BELOW `Write` CAN CAUSE THROUGH THIS CHANNEL ----------------
+//
+// The bridge parses a directive off the FINAL LINE of a reply and acts on it itself, so
+// this channel is not covered by the model's `level`: a model granted no write TOOLS can
+// still reach these effects by emitting text. That is deliberate (a level describes what
+// the MODEL may touch, not what the bridge may do with validated output), and the decision
+// to leave it ungated should be taken against the actual list rather than the category.
+//
+// THE LIST IS EXACTLY TWO DIRECTIVES, AND NEITHER WRITES THE VAULT.
+//
+// 1. `JESSE_NEEDS_HEALTH` → [`NeedsHealth`]. Effect: the reply carries a request for health
+//    context, and the APP answers it by including that context on a subsequent turn.
+//    Mutation caused: NONE, on either side. It moves data toward the model, which is a
+//    disclosure question (the app decides what it sends), not a write.
+//
+// 2. `JESSE_MEAL_LOG` → [`MealLog`]. Effect: the APP writes the named meals into Apple
+//    Health, and (v2 `retract`) deletes previously written Health entries by id. Mutation
+//    caused: HealthKit entries on the user's device. Still NOT a vault write — nothing in
+//    the bridge appends a CSV, touches a note, or runs a vault script off a directive. The
+//    vault-side diet path is the separate extract/verify pipeline, which is gated on the
+//    extracting model's level (see `routing::skips_verification`) and never reads a
+//    directive.
+//
+// WHAT STANDS BETWEEN THE MODEL'S OUTPUT AND EACH EFFECT, in order:
+//
+//   * SHAPE. Only the last non-empty line is a candidate, and only if it starts with
+//     `JESSE_`. Anything else is returned untouched with no parsing at all.
+//   * SIZE. A directive-shaped line over [`MAX_DIRECTIVE_LINE_BYTES`] is passed through
+//     VISIBLE and logged rather than parsed — loud failure over silent loss.
+//   * PARSE. The payload must be valid JSON of the declared shape. A failure is passthrough
+//     plus a log; a half-parsed directive is never applied.
+//   * UNKNOWN KEYS ARE FATAL, per object. A typo'd or extra key rejects the WHOLE block
+//     rather than being ignored, so a model cannot smuggle a field past the contract.
+//   * CAPS. [`MAX_MEALS`] meals and [`MAX_RETRACT`] retractions per block; over either, the
+//     whole block is malformed and NOTHING is applied — never a partial batch.
+//   * FIELD VALIDATION. `id`, `consumedAt` and `name` must each be present, a string, and
+//     non-empty after trimming; every present macro must be a finite non-negative number.
+//     `consumedAt` is checked here only for presence — the APP parses the ISO-8601 offset
+//     strictly before writing, so the bridge's check is defense in depth rather than the
+//     authority on date shape.
+//   * IDEMPOTENCY. `id` is a stable key (date + meal slot) the app dedupes on, so a repeated
+//     directive converges rather than duplicating.
+//
+// THE RESIDUAL EXPOSURE, stated plainly: a model at any level can cause well-formed,
+// capped, deduplicated HEALTH entries to be written or retracted on the phone by emitting
+// a final line. It cannot exceed ten per turn, cannot invent a field, and cannot reach the
+// vault. Whether that warrants gating by level is a decision for whoever owns the
+// deployment; this comment exists so the decision is taken against the list above.
+
 /// The structured `directives` object attached to a terminal result. One
 /// optional field per known directive type; more are added as the registry
 /// grows. All-`None` never occurs — a `Directives` is attached only when at

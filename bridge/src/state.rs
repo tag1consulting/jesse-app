@@ -246,22 +246,22 @@ impl AppState {
     }
 
     /// Build the `ActiveModel` for a resolved registry entry: its `ANTHROPIC_*` env, subagent
-    /// model, and price deck, plus its EFFECTIVE write permission (ambient `opus` is always
-    /// writes-on; a non-ambient model takes its `ModelStore` override, else its registry
-    /// `default_writes`). Shared by the stored-default resolution and the per-turn selection
-    /// so both produce a byte-identical `ActiveModel` for a given model.
+    /// model, price deck, harness and LEVEL. Shared by the stored-default resolution and the
+    /// per-turn selection so both produce a byte-identical `ActiveModel` for a given model.
+    ///
+    /// The level comes from the registry (i.e. from config) and nowhere else. It used to be
+    /// a per-model boolean the phone could set through `POST /jesse/model/{id}/writes`; that
+    /// endpoint and its persisted override are gone, because what a model may touch is a
+    /// containment decision the startup gate validates against the containment record, not a
+    /// switch on a device.
     fn active_model_for(&self, m: &RegistryModel) -> ActiveModel {
-        let writes_allowed = matches!(m.kind, ModelKind::Ambient)
-            || self
-                .models
-                .writes_override(&m.id)
-                .unwrap_or(m.default_writes);
         ActiveModel {
             id: m.id.clone(),
             kind: m.kind,
             env: m.backend.clone(),
             subagent_model: m.subagent_model.clone(),
-            writes_allowed,
+            level: m.level,
+            harness: m.harness.clone(),
             price: m.price,
             // Carry this model's vision pairing onto the turn so the preprocessor can run
             // without re-reading the registry. Empty for ambient/unpaired (vision off).
@@ -298,7 +298,8 @@ mod tests {
                     backend: None,
                     subagent_model: None,
                     configured: true,
-                    default_writes: true,
+                    level: Capability::Write,
+                    harness: CLAUDE_CODE_ID.to_string(),
                     price: PriceDeck::ZERO,
                     health: HealthConfig::default(),
                     vision: Vec::new(),
@@ -311,7 +312,8 @@ mod tests {
                     backend: Some(("http://fw".into(), "fw-tok".into(), "glm-model".into())),
                     subagent_model: Some("glm-model".into()),
                     configured: true,
-                    default_writes: false,
+                    level: Capability::Read,
+                    harness: CLAUDE_CODE_ID.to_string(),
                     price: PriceDeck::ZERO,
                     health: HealthConfig::default(),
                     vision: Vec::new(),
@@ -331,7 +333,7 @@ mod tests {
         let a = st.resolve_active_model();
         assert_eq!(a.id, "opus");
         assert!(a.env.is_none(), "opus is ambient — no ANTHROPIC_* env");
-        assert!(a.writes_allowed, "opus is always writes-on");
+        assert!(a.writes_allowed(), "opus is always writes-on");
     }
 
     #[test]
@@ -345,18 +347,22 @@ mod tests {
             Some(("http://fw".into(), "fw-tok".into(), "glm-model".into()))
         );
         assert_eq!(a.subagent_model.as_deref(), Some("glm-model"));
-        assert!(!a.writes_allowed, "a non-ambient model is read-only until opted in");
+        assert!(!a.writes_allowed(), "a non-ambient model is read-only by default");
     }
 
+    /// The level now decides, and it comes from config — there is no per-model override to
+    /// honor, because `POST /jesse/model/{id}/writes` and its persisted map are gone.
     #[test]
-    fn resolve_glm_honors_a_writes_override() {
+    fn a_models_level_comes_from_the_registry_not_from_a_client() {
         let st = state_with_glm();
         st.models.set_active("glm-5.2");
-        st.models.set_writes("glm-5.2", true);
+        let active = st.resolve_active_model();
+        assert_eq!(active.id, "glm-5.2");
         assert!(
-            st.resolve_active_model().writes_allowed,
-            "override enables writes"
+            !active.writes_allowed(),
+            "a model declared at Read cannot be raised to Write from a device"
         );
+        assert_eq!(turn_capability(&active), Capability::Read);
     }
 
     #[test]

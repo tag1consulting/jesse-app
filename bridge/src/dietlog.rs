@@ -2415,17 +2415,16 @@ pub fn split_entries(
 ///
 /// `cfg.diet_backend` MUST be `Some` here (the handler gate guarantees it); the
 /// extract child is pointed at that backend and the verify child stays ambient.
-pub async fn run_diet_pipeline(cfg: &Config, utterance: &str) -> DietPipelineOutcome {
-    let (base_url, model) = match &cfg.diet_backend {
+pub async fn run_diet_pipeline(
+    cfg: &Config,
+    health: &HealthStore,
+    utterance: &str,
+) -> DietPipelineOutcome {
+    // Who extracts, per the routing rule at `Basic`.
+    let extract_pick = route_job(cfg, health, RoutedJob::DietExtract, None, None);
+    let (base_url, model) = match &extract_pick.backend {
         Some((b, _t, m)) => (b.clone(), m.clone()),
-        // Defensive: never entered without a backend, but degrade rather than panic.
-        None => {
-            eprintln!("jesse-bridge: diet pipeline invoked with no backend — falling through");
-            return DietPipelineOutcome::FallThrough {
-                rung: DietRung::Child,
-                reason: Some(Rung2Reason::ChildError),
-            };
-        }
+        None => (String::new(), extract_pick.id.clone()),
     };
     // The turn's received-at wall clock (`HH:MM`), captured as the pipeline receives
     // the turn. The bridge stamps this onto any food entry whose time the utterance
@@ -2470,6 +2469,7 @@ pub async fn run_diet_pipeline(cfg: &Config, utterance: &str) -> DietPipelineOut
         cfg,
         &build_diet_extract_prompt(utterance, &cfg.persona.owner_name),
         DIET_EXTRACT_TIMEOUT_SECS,
+        &extract_pick,
     )
     .await
     {
@@ -2499,44 +2499,94 @@ pub async fn run_diet_pipeline(cfg: &Config, utterance: &str) -> DietPipelineOut
     // flagged — probation owns whether this verdict blocks the append, this flag owns
     // whether blank expected nutrient columns get filled.
     let complete_micros = cfg.diet_micro_complete;
-    let verify_raw = match run_diet_verify(
-        cfg,
-        &build_diet_verify_prompt(
-            utterance,
-            &entries_to_json(&extract.entries),
-            &cfg.persona.owner_name,
-            complete_micros,
-        ),
-        DIET_VERIFY_TIMEOUT_SECS,
-    )
-    .await
-    {
-        Ok(s) => s,
-        Err(e) => {
-            // The verify child (ambient/hosted) errored — surface it as VerifyUnavailable
-            // carrying the extract so an emergency caller can queue it. A non-emergency
-            // caller maps this straight back to a hosted fall-through (Verify rung), so
-            // today's behavior is unchanged.
-            prov(false, Some(3), "unavailable", extract.entries.len(), false);
-            return DietPipelineOutcome::VerifyUnavailable {
-                err: e,
-                utterance: utterance.to_string(),
-                entries: extract.entries,
-                date: local_today(),
-                offset: local_offset(),
-            };
-        }
-    };
-    let verdicts = match parse_verify_verdicts(&verify_raw, extract.entries.len()) {
-        Ok(v) => v,
-        Err(_) => {
-            prov(false, Some(3), "unavailable", extract.entries.len(), false);
-            return DietPipelineOutcome::FallThrough {
-                rung: DietRung::Verify,
+
+    // WHETHER TO VERIFY AT ALL IS NOW THE EXTRACTOR'S LEVEL, not where it ran.
+    //
+    // The ladder used to encode "a local backend is probationary, a hosted one is not",
+    // which asked where the process lived rather than what it was trusted with. At `Write`
+    // the extraction is taken as-is; below it, it is verified.
+    //
+    // THIS IS ONE IMPERFECT PROXY SUBSTITUTED FOR ANOTHER, NOT A CLAIM THAT THEY ARE THE
+    // SAME PROPERTY. A model trusted with the vault can still be sloppy at parsing a
+    // sentence about lunch. The substitution is deliberate and the reasoning is on
+    // `routing::skips_verification`; what makes it defensible is that it is visible in
+    // config and correctable by a `level` edit rather than a code change.
+    let verdicts: Vec<EntryVerdict> = if skips_verification(extract_pick.level) {
+        eprintln!(
+            "jesse-bridge: diet verify skipped — extraction served by '{}' at level {}",
+            extract_pick.id,
+            capability_label(extract_pick.level)
+        );
+        // Take the extraction as it stands: one approving verdict per row, carrying no
+        // corrections and no completion. Downstream is byte-for-byte the "verifier approved
+        // everything" path, so nothing else in the pipeline learns that a stage was skipped.
+        extract
+            .entries
+            .iter()
+            .map(|_| EntryVerdict {
+                verdict: Verdict::Approve,
+                kcal: None,
+                protein_g: None,
+                carbs_g: None,
+                fat_g: None,
+                fiber_g: None,
                 reason: None,
-            };
+                completion: MicroCompletion::default(),
+            })
+            .collect()
+    } else {
+        // The verifier: the routing rule at `Write`, with the EXTRACTOR EXCLUDED so a model
+        // can never verify its own extraction. Without that exclusion the first cheap model
+        // in the list would do both, which silently deletes the property this gate exists to
+        // provide. When nothing qualifies the walk falls through to ambient — the hosted
+        // rung, exactly as the ladder degrades today.
+        let verify_pick = route_job(
+            cfg,
+            health,
+            RoutedJob::DietVerify,
+            None,
+            Some(&extract_pick.id),
+        );
+        let verify_raw = match run_diet_verify(
+            cfg,
+            &build_diet_verify_prompt(
+                utterance,
+                &entries_to_json(&extract.entries),
+                &cfg.persona.owner_name,
+                complete_micros,
+            ),
+            DIET_VERIFY_TIMEOUT_SECS,
+            &verify_pick,
+        )
+        .await
+        {
+            Ok(s) => s,
+            Err(e) => {
+                // The verify child errored — surface it as VerifyUnavailable carrying the
+                // extract so an emergency caller can queue it. A non-emergency caller maps
+                // this straight back to a hosted fall-through (Verify rung).
+                prov(false, Some(3), "unavailable", extract.entries.len(), false);
+                return DietPipelineOutcome::VerifyUnavailable {
+                    err: e,
+                    utterance: utterance.to_string(),
+                    entries: extract.entries,
+                    date: local_today(),
+                    offset: local_offset(),
+                };
+            }
+        };
+        match parse_verify_verdicts(&verify_raw, extract.entries.len()) {
+            Ok(v) => v,
+            Err(_) => {
+                prov(false, Some(3), "unavailable", extract.entries.len(), false);
+                return DietPipelineOutcome::FallThrough {
+                    rung: DietRung::Verify,
+                    reason: None,
+                };
+            }
         }
     };
+
     let mut verified = Vec::with_capacity(extract.entries.len());
     let mut any_corrected = false;
     for (entry, v) in extract.entries.iter().zip(verdicts.iter()) {
@@ -4159,31 +4209,6 @@ mod tests {
     // ---- Split -------------------------------------------------------------
 
     // ---- Orchestrator (async glue) -----------------------------------------
-
-    #[tokio::test]
-    async fn pipeline_falls_through_at_rung2_when_extract_child_cannot_spawn() {
-        // End-to-end through the async orchestrator without any network: point the
-        // extract child at a non-existent binary so the spawn fails → the pipeline
-        // degrades to a rung-2 fall-through (today's hosted path), never a partial log.
-        let mut cfg = crate::testutil::test_config();
-        cfg.claude_bin = "/no/such/diet-extract-binary".to_string();
-        cfg.diet_backend = Some((
-            "http://127.0.0.1:9100".into(),
-            "dsv4-diet-dummy".into(),
-            "local-diet".into(),
-        ));
-        match run_diet_pipeline(&cfg, "logged a banana").await {
-            DietPipelineOutcome::FallThrough { rung, reason } => {
-                assert_eq!(rung, DietRung::Child);
-                assert_eq!(
-                    reason,
-                    Some(Rung2Reason::ChildError),
-                    "a failed extract spawn is a child_error"
-                );
-            }
-            _ => panic!("a failed extract spawn must fall through at rung 2"),
-        }
-    }
 
     // ---- The nutrient table drives header / schema / prompt / row / mirror -----
 

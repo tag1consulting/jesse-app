@@ -220,22 +220,22 @@ fn rung_reason(rung: u8) -> &'static str {
 /// child is pointed at that backend.
 pub async fn run_vaultqa_pipeline(
     cfg: &Config,
+    health: &HealthStore,
     question: &str,
     health_context: Option<&str>,
     recent_context: Option<&str>,
 ) -> VaultqaOutcome {
-    let (base_url, model) = match &cfg.vaultqa_backend {
+    // Which model answers is the routing rule's call: the `offload_order` walk at `Read`,
+    // then the conversation's model, then ambient. The handler gate has already checked a
+    // candidate exists, so this re-walk is cheap and cannot come up empty in practice.
+    let pick = route_job(cfg, health, RoutedJob::VaultQa, None, None);
+    let (base_url, model) = match &pick.backend {
         Some((b, _t, m)) => (b.clone(), m.clone()),
-        // Defensive: never entered without a backend, but degrade rather than panic.
-        None => {
-            eprintln!("jesse-bridge: vault-QA pipeline invoked with no backend — falling through");
-            return VaultqaOutcome::FallThrough {
-                rung: VaultqaRung::Child,
-            };
-        }
+        // The ambient rung: no backend to name in provenance, so the model id stands in.
+        None => (String::new(), pick.id.clone()),
     };
     let prompt = build_vaultqa_prompt(question, health_context, recent_context);
-    let result = run_vaultqa_child(cfg, &prompt, VAULTQA_TIMEOUT_SECS).await;
+    let result = run_vaultqa_child(cfg, &prompt, VAULTQA_TIMEOUT_SECS, &pick).await;
     let outcome = decide_vaultqa_outcome(result, Path::new(&cfg.vault));
     match &outcome {
         VaultqaOutcome::Answered { citations, .. } => {
@@ -455,23 +455,5 @@ mod tests {
             !line.contains("token"),
             "provenance must never carry a token"
         );
-    }
-
-    #[tokio::test]
-    async fn pipeline_falls_through_when_child_cannot_spawn() {
-        // End-to-end through the async orchestrator with no network: point the child
-        // at a non-existent binary so the spawn fails → rung-1 fall-through, never a
-        // partial/uncited local answer.
-        let mut cfg = crate::testutil::test_config();
-        cfg.claude_bin = "/no/such/vaultqa-binary".to_string();
-        cfg.vaultqa_backend = Some((
-            "http://127.0.0.1:9100".into(),
-            "vaultqa-dummy-tok".into(),
-            "local-vaultqa".into(),
-        ));
-        match run_vaultqa_pipeline(&cfg, "what is my vo2 max", None, None).await {
-            VaultqaOutcome::FallThrough { rung } => assert_eq!(rung, VaultqaRung::Child),
-            other => panic!("a failed spawn must fall through at rung 1, got {other:?}"),
-        }
     }
 }

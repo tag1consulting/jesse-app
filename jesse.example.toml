@@ -48,6 +48,44 @@ diet_keywords_extra = [
 ]
 
 # =============================================================================
+# offload_order — which models serve work you did NOT choose a model for
+# =============================================================================
+#
+# ONE ordered list, replacing the four per-role backends (JESSE_TITLE_*, JESSE_DIET_*,
+# JESSE_VAULTQA_*) that each named a model for one call site. Those said WHERE a job ran
+# and, by implication, how much it was trusted. This says what a job REQUIRES and lets
+# config say which models can meet it.
+#
+# THE RULE. For a job requiring capability C, walk this list in order and take the first
+# model that is configured, healthy, and at level C or above. If none qualifies, use the
+# conversation's model; if that cannot meet C either, use the ambient default.
+#
+#   titles, diet extraction .... require basic
+#   vault Q&A .................. requires read
+#   diet verification .......... requires WRITE, and EXCLUDES the model that served the
+#                                extraction — `write` is the same trust threshold that
+#                                skips verification entirely, so without the exclusion the
+#                                first cheap model in the list would verify its own work
+#                                and silently delete the property the gate provides.
+#
+# Whether an extraction is verified at all is now the EXTRACTING model's level: at
+# `write` the output is taken as-is, below it the hosted verdict is mandatory and
+# blocking. (This uses the level as a deliberate PROXY for extraction accuracy; they are
+# not the same property, but it is visible in config rather than implied by deployment.)
+# `JESSE_DIET_PROBATION` was deleted along with the role backends.
+#
+# THIS NEVER GOVERNS A MAIN TURN. The bridge does not auto-switch a conversation off an
+# unhealthy model — answering as a silently different model is worse than surfacing the
+# failure — so a main turn runs on the model the chip selected or it fails. Failover here
+# walks to the next candidate on a TRANSPORT failure only, never on a refusal or a bad
+# answer, which are answers rather than outages.
+#
+# Absent or empty (the default) → every such job goes to the ambient default, which is
+# byte-for-byte the behavior before this key existed.
+#
+# offload_order = ["local", "glm-5.2"]
+
+# =============================================================================
 # [[models]] — the global model switch's registry (declarative, operator-configurable)
 # =============================================================================
 #
@@ -80,8 +118,32 @@ diet_keywords_extra = [
 #                  the model configured-but-unarmed (it appears in the list, disabled,
 #                  until the var is set). No token is ever written to this file, to
 #                  model.json, or to any endpoint response.
-#   default_writes read-only unless true (default false) — a non-default model can read
-#                  your vault but not write it until you enable writes for it.
+#   harness        the agent program that runs this model's child ("claude-code", …).
+#                  Absent means "claude-code". An id no harness is registered under is a
+#                  STARTUP ERROR naming the model, never a silent fallback. Each harness
+#                  has one binary-path env var (claude-code: JESSE_CLAUDE_BIN) which is
+#                  consulted, and only fatal, for a harness some configured model uses.
+#   level          the MOST this model may be granted: "basic" | "read" | "write".
+#                  Absent means "read" — the safe direction: a newly declared model can
+#                  be asked questions but cannot change anything.
+#                    basic  jobs needing no tools at all (titles, diet extraction)
+#                    read   may also read and search the vault
+#                    write  may also change the vault
+#                  The level is a CEILING, not a grant: the JOB sets the actual grant
+#                  beneath it. A `write` model serving a title runs at `basic`; a `read`
+#                  model backing a conversation gets the read-only posture.
+#                  It is validated at STARTUP against the committed containment record
+#                  (bridge/containment.toml): a level whose harness has no passing
+#                  battery row refuses to start, naming the highest level that passed.
+#                  There is NO per-model writes toggle — `default_writes` was removed and
+#                  a leftover key is a startup error. What a model may touch is config,
+#                  not something a phone can change.
+#
+#                  SUGGESTED ASSIGNMENT (guidance, not a compiled-in default):
+#                    Claude models .......... write
+#                    Codex models ........... write
+#                    Kimi 3, GLM ............ write
+#                    locally hosted models .. read
 #   price          { in_per_m, cached_per_m, out_per_m } dollars per 1M tokens (default
 #                  0/0/0), feeding the per-turn cost badge.
 #   health         { path, interval_secs, timeout_secs } — probe endpoint + cadence
@@ -114,7 +176,8 @@ diet_keywords_extra = [
 # base_url = "https://api.fireworks.ai/inference"
 # model = "accounts/fireworks/models/glm-5p2"
 # auth_token_env = "FIREWORKS_API_KEY"
-# default_writes = false
+# level = "write"                          # GLM: trusted with the vault
+# harness = "claude-code"                  # the default; shown here for completeness
 # price = { in_per_m = 1.40, cached_per_m = 0.14, out_per_m = 4.40 }
 # health = { path = "/v1/messages", interval_secs = 60, timeout_secs = 3 }
 
@@ -129,7 +192,7 @@ diet_keywords_extra = [
 # model = "gpt-5-codex"
 # subagent_model = "gpt-5-mini"            # cheaper model for spawned subagents
 # auth_token_env = "CODEX_GATEWAY_TOKEN"
-# default_writes = false
+# level = "write"                          # Codex: trusted with the vault
 # price = { in_per_m = 1.25, cached_per_m = 0.13, out_per_m = 10.00 }
 # health = { interval_secs = 30, timeout_secs = 3 }
 
