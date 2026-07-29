@@ -15,6 +15,17 @@ CI both run it). See the "Versioning" section of `bridge/README.md`.
 
 ## [Unreleased]
 
+## [Bridge 0.43.2] - 2026-07-29 / [App 1.0 (83)]
+
+### Fixed
+
+- **The macOS settings view did not build.** Removing the per-model writes toggle in 0.43.0
+  also deleted `modelClient()`, which `loadModels` still called, and the Mac picker bound a
+  level caveat it never rendered — both caught only by CI's warnings-as-errors Mac build,
+  because the local check had been `swift build`/`swift test` on JesseKit, which does not
+  compile the app targets. All four schemes (iOS, watch, Mac, JesseKit) now build clean with
+  `SWIFT_TREAT_WARNINGS_AS_ERRORS=YES` locally before pushing.
+
 ## [Bridge 0.43.1] - 2026-07-29
 
 Review follow-ups to 0.43.0. No behavior changes: two new invariants that fail the build,

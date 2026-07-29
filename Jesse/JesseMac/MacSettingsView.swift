@@ -116,7 +116,9 @@ struct MacSettingsView: View {
                                     Text(reason)
                                         .font(.caption).foregroundStyle(.secondary)
                                 } else if let caveat = model.levelCaveat {
-                                    Text("read-only")
+                                    // Every model appears in the picker whatever its level;
+                                    // one below Write says so here, before it is picked.
+                                    Text(caveat)
                                         .font(.caption).foregroundStyle(.secondary)
                                 }
                             }
@@ -186,6 +188,15 @@ struct MacSettingsView: View {
                     .font(.caption).foregroundStyle(.secondary)
             }
         }
+    }
+
+    /// The bridge client for the model endpoints, built from the fields being edited (or the
+    /// saved config where a field is blank). Shared by `loadModels` and the switcher.
+    private func modelClient() -> JesseBridgeClient {
+        let cfg = JesseConfig(host: host.isEmpty ? configStore.config.host : host,
+                              port: Int(port) ?? configStore.config.port,
+                              token: token.isEmpty ? configStore.config.token : token)
+        return JesseBridgeClient(config: cfg)
     }
 
     private func loadModels() async {
