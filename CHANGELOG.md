@@ -15,48 +15,7 @@ CI both run it). See the "Versioning" section of `bridge/README.md`.
 
 ## [Unreleased]
 
-## [Bridge 0.43.2] - 2026-07-29 / [App 1.0 (83)]
-
-### Fixed
-
-- **The macOS settings view did not build.** Removing the per-model writes toggle in 0.43.0
-  also deleted `modelClient()`, which `loadModels` still called, and the Mac picker bound a
-  level caveat it never rendered — both caught only by CI's warnings-as-errors Mac build,
-  because the local check had been `swift build`/`swift test` on JesseKit, which does not
-  compile the app targets. All four schemes (iOS, watch, Mac, JesseKit) now build clean with
-  `SWIFT_TREAT_WARNINGS_AS_ERRORS=YES` locally before pushing.
-
-## [Bridge 0.43.1] - 2026-07-29
-
-Review follow-ups to 0.43.0. No behavior changes: two new invariants that fail the build,
-and three pieces of reasoning written down where the code is rather than in a PR description.
-
-### Added
-
-- **A guard that every registered harness streams.** `streams_text` is plumbed end to end
-  but no client renders the whole-answer case yet, so a non-streaming harness would show an
-  empty bubble until the turn finished. That assumption is now load-bearing and noisy: adding
-  such a harness fails the build and names the rendering work it requires, rather than
-  shipping the empty bubble. Same pattern, and the same reason, as the host-paths test.
-
-### Changed (documentation only)
-
-- **The directive channel's exposure is enumerated** in `directives.rs`, where the parsing
-  happens, so the decision to leave it ungated can be taken against the list rather than the
-  category. The finding worth stating: **neither directive writes the vault.**
-  `JESSE_NEEDS_HEALTH` causes no mutation on either side; `JESSE_MEAL_LOG` causes the APP to
-  write and retract Apple Health entries. The residual exposure is that a model at any level
-  can cause well-formed, capped (10 per block), deduplicated HealthKit writes by emitting a
-  final line — it cannot invent a field (unknown keys reject the whole block), cannot apply a
-  partial batch, and cannot reach the vault. The six validation stages are listed in order.
-- **The strict argv comparison and `the_record_carries_no_absolute_host_paths` each name the
-  other**, with what each half fails to catch alone, so someone relaxing one has to see the
-  other. They are only viable as a pair.
-- **The diet verify gate says what it is**: one imperfect proxy substituted for another, not a
-  claim that trustworthiness and extraction accuracy are the same property — at both the rule
-  (`routing::skips_verification`) and the site where the branch is taken (`dietlog`).
-
-## [Bridge 0.43.0] - 2026-07-29 / [App 1.0 (82)]
+## [Bridge 0.43.0] - 2026-07-29 / [App 1.0 (83)]
 
 The whole configuration surface of the level effort: three keys, one routing rule, and a
 startup gate that refuses to run a posture the containment record cannot vouch for.
@@ -119,13 +78,34 @@ startup gate that refuses to run a posture the containment record cannot vouch f
   a silently different model is worse than surfacing the failure. Written into the doc comment
   and pinned by a test, because it is what a later change erodes by accident.
 
+### Invariants that fail the build
+
+- **Every registered harness must stream.** `streams_text` is plumbed end to end, but no
+  client renders the whole-answer case yet, so a non-streaming harness would show an empty
+  bubble until the turn finished. A test now fails the build and names the rendering work
+  that is required first, instead of leaving the assumption implicit.
+- **The strict argv comparison and `the_record_carries_no_absolute_host_paths` name each
+  other.** They are only viable as a pair — strict equality works because no host path may
+  enter the record, and the test is worth having because the comparison is strict — so each
+  site documents what the other half catches and what relaxing one alone would hide.
+- **The diet verify gate says what it is:** one imperfect proxy substituted for another, not
+  a claim that trustworthiness and extraction accuracy are the same property. Stated at both
+  the rule (`routing::skips_verification`) and the branch site (`dietlog`).
+
 ### Known limitations, named rather than papered over
 
-- **Directives are not gated by level.** The bridge parses a directive off the final line of a
-  reply and applies it itself, so a model at level Read can still cause vault changes through
-  that channel, exactly as a Basic model causes a food entry to be written. The level
-  describes what the MODEL may touch, not what the bridge may do with validated output.
-  Gating them later stays available and visible.
+- **Directives are not gated by level, and the exposure is enumerated rather than described
+  as a category.** The bridge parses a directive off the final line of a reply and acts on it
+  itself, so the level — which bounds the model's TOOLS — does not bound this channel. Traced
+  end to end, the surface is narrower than "a Read model can cause changes" suggests: it
+  causes **no vault mutation at all**. `JESSE_NEEDS_HEALTH` mutates nothing on either side;
+  `JESSE_MEAL_LOG` causes the APP to write and retract Apple Health entries. Six validation
+  stages stand in between (final-line `JESSE_` prefix, length cap, JSON parse, unknown keys
+  rejecting the whole block, 10-meal/10-retract caps with no partial application, required
+  non-empty fields with finite non-negative macros). The full list lives in the comment block
+  above `Directives` in `src/directives.rs`, and `jesse.example.toml` points at it from the
+  `level` docs so nobody reads "read" as "nothing can happen". Gating it later stays
+  available and visible.
 - **The ambient default remains built in.** Claude Code plus the local login is the routing
   rule's final fallback and the out-of-box conversation backend, so `claude-code` is still the
   one harness that must exist. De-privileging it into an ordinary registry entry is real work
