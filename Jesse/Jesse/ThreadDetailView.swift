@@ -208,6 +208,26 @@ struct ThreadDetailView: View {
                             }
                             .frame(maxWidth: .infinity, alignment: .leading)
                         }
+                        // A whole-answer model pushes no deltas, so without this the only sign
+                        // of a turn in flight is the "Received" receipt — indistinguishable
+                        // from a turn that has silently stalled. Shown only when nothing else
+                        // is, so there is never a second spinner.
+                        if WholeAnswerProgress.shouldShow(
+                            isRunning: true,
+                            streamsText: NonStreamingModelStore.streamsText(
+                                id: thread.selectedModelID ?? LastUsedModelStore.id),
+                            partialText: partial,
+                            activity: coordinator.activity(for: thread.id)) {
+                            HStack(spacing: 6) {
+                                ProgressView().controlSize(.small)
+                                Text(WholeAnswerProgress.caption)
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                            }
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .accessibilityElement(children: .combine)
+                            .accessibilityLabel("Working. This model replies all at once.")
+                        }
                     }
                     if let error = coordinator.error(for: thread.id) {
                         let recheckable = coordinator.canRecheck(thread.id)

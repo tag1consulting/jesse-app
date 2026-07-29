@@ -15,6 +15,37 @@ CI both run it). See the "Versioning" section of `bridge/README.md`.
 
 ## [Unreleased]
 
+## [Bridge 0.45.0] - 2026-07-29 / [App 1.0 (86)]
+
+A turn on a model that answers all at once now looks like it is working, because it is.
+
+### Added
+
+- **A progress row for whole-answer turns.** A model whose `streams_text` is false pushes no
+  deltas, so the transcript showed only the "Received" delivery receipt under the user's own
+  message until the terminal event landed — and a receipt is not progress: a turn still
+  working and a turn silently stuck looked identical. `WholeAnswerProgress` decides when the
+  row appears (running, model does not stream, nothing streamed, and no coarse activity line,
+  so there is never a second spinner on screen), and it is pure so it is tested without a
+  view. A streaming model's brief gap before its first delta is untouched.
+- **`NonStreamingModelStore`**, so the transcript can know the running model's shape. The
+  model list is owned by the picker, which may not have loaded; the ids that do NOT stream are
+  recorded whenever a list loads (`loadModelList`, the one funnel both clients use) and read
+  back by id. It stores only the non-streaming ids, so every unknown id — nothing loaded yet,
+  a new model, a downgraded bridge — answers "streams", matching `ModelInfo.streamsText`'s own
+  wire default. Both staleness directions are benign: a stale `false` shows a row that
+  disappears the moment text arrives, a stale `true` is exactly the previous behaviour.
+
+### Changed
+
+- **The harness guard's message now names what is actually missing.** It told the next reader
+  to build "tool activity + a spinner" before registering a non-streaming harness. The spinner
+  now exists, so the message said more than was true. It now says what remains: there is no
+  tool-activity view for a whole-answer turn and, more to the point, nothing yet defines what
+  event stream such a harness emits mid-turn. That contract cannot be designed honestly
+  without a real non-streaming harness to pin it against, so the guard stays in force for that
+  reason — not for the spinner. The assertion itself is unchanged and still in force.
+
 ## [Bridge 0.44.0] - 2026-07-29
 
 ### Fixed

@@ -121,3 +121,69 @@ public enum LastUsedModelStore {
         }
     }
 }
+
+/// Which models are known NOT to stream their answer, remembered across launches.
+///
+/// The transcript needs `streamsText` for the model a RUNNING turn is on, but the model list
+/// is loaded by the model picker, which owns its state and may not have loaded at all. Rather
+/// than lift that state up through the view tree, the ids that do not stream are recorded
+/// whenever a list is loaded (see `loadModelList`) and read back here.
+///
+/// Deliberately stores the NON-streaming ids rather than a full map, so every unknown id —
+/// nothing loaded yet, a brand-new model, a downgraded bridge — answers `true`, the same
+/// default `ModelInfo.streamsText` uses on the wire. Both staleness directions are benign: a
+/// stale `false` shows a progress row that disappears the moment text arrives, and a stale
+/// `true` is exactly today's behaviour.
+public enum NonStreamingModelStore {
+    public static let defaultsKey = "jesse.nonStreamingModelIDs"
+
+    private static var defaults: UserDefaults { .standard }
+
+    /// Record the non-streaming ids from a freshly loaded list. Replaces rather than merges:
+    /// the list is authoritative, so a model that starts streaming stops being remembered.
+    public static func record(_ state: ModelSwitchState) {
+        let ids = state.offered.filter { !$0.streamsText }.map(\.id).sorted()
+        if ids.isEmpty {
+            defaults.removeObject(forKey: defaultsKey)
+        } else {
+            defaults.set(ids, forKey: defaultsKey)
+        }
+    }
+
+    /// Whether `id` streams token-level deltas. Unknown ids stream, matching the wire default.
+    public static func streamsText(id: String?) -> Bool {
+        guard let id, !id.isEmpty else { return true }
+        let stored = defaults.array(forKey: defaultsKey) as? [String] ?? []
+        return !stored.contains(id)
+    }
+
+    /// Clear the record — for tests, and for a sign-out that should not leak model shape.
+    public static func reset() { defaults.removeObject(forKey: defaultsKey) }
+}
+
+/// Whether a running turn should show a standing progress row in place of nothing at all.
+///
+/// A turn on a whole-answer model pushes no deltas, so the transcript shows only the delivery
+/// caption ("Received") under the user's own message until the terminal event lands. That
+/// caption is a receipt, not progress: a turn still working and a turn silently stuck look
+/// identical. This row is the difference.
+///
+/// Scoped tightly on purpose. It appears only when the model does NOT stream, nothing has been
+/// streamed, and the coarse activity line (which carries its own spinner) is absent — so there
+/// is never a second spinner on screen, and a streaming model's brief pre-first-delta gap is
+/// left exactly as it is.
+///
+/// Pure and `nonisolated` so it is unit-testable with no view, matching how the send button's
+/// clock policy is factored.
+public enum WholeAnswerProgress {
+    public static func shouldShow(
+        isRunning: Bool, streamsText: Bool, partialText: String?, activity: String?
+    ) -> Bool {
+        guard isRunning, !streamsText, activity == nil else { return false }
+        return (partialText ?? "").isEmpty
+    }
+
+    /// The row's caption. Deliberately about the model's shape, not a fake progress claim:
+    /// there is no mid-turn signal from a whole-answer harness to report.
+    public static let caption = "Working… this model replies all at once"
+}

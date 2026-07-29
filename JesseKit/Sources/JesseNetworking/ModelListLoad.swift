@@ -80,7 +80,13 @@ public func loadModelList(
     guard isConfigured else { return nil }
     var attempts = 0
     while !Task.isCancelled {
-        if let state = await fetch() { return state }
+        if let state = await fetch() {
+            // The single funnel both clients load through, so it is where the models' shape is
+            // remembered for readers that have no list of their own — the transcript needs
+            // `streamsText` for a running turn's model and the picker owns the list.
+            NonStreamingModelStore.record(state)
+            return state
+        }
         attempts += 1
         guard !Task.isCancelled, let wait = ModelListRetry.delay(afterAttempt: attempts) else {
             return nil
