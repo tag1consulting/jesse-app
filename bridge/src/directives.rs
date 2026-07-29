@@ -1392,4 +1392,149 @@ mod tests {
         assert_eq!(text, reply);
         assert!(directives.is_none());
     }
+
+    // ---- Exhaustiveness over the directive registry -------------------------
+    //
+    // `Directives` is a struct of optional fields, not an enum, so nothing in the
+    // language forces a new directive to be wired up end to end. These three
+    // constructs restore that force:
+    //
+    //   1. `fields_set` destructures `Directives` EXHAUSTIVELY (no `..`), so
+    //      adding a field breaks this build until the field is accounted for;
+    //   2. `DirectiveField::label` matches EXHAUSTIVELY, so adding a variant
+    //      breaks this build until it is named;
+    //   3. `REGISTRY` mirrors the `match (name, version)` arms in
+    //      `extract_directives`, and the tests below assert the two directions of
+    //      coverage — every registry entry populates exactly its own field, and
+    //      every field is reachable from some registry entry.
+    //
+    // Net effect: a directive that is declared but not recognized (a field with no
+    // registry arm), or recognized but not declared, cannot land silently.
+
+    /// Test-side mirror of one field of [`Directives`].
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum DirectiveField {
+        NeedsHealth,
+        MealLog,
+    }
+
+    impl DirectiveField {
+        /// Every field, for the reachability direction below. Kept honest by
+        /// `label`'s exhaustive match: a new variant cannot be added without
+        /// touching this impl block.
+        const ALL: &'static [DirectiveField] = &[Self::NeedsHealth, Self::MealLog];
+
+        /// The wire field name. The match is exhaustive on purpose — a new
+        /// `DirectiveField` variant stops compiling here until it is named.
+        fn label(self) -> &'static str {
+            match self {
+                Self::NeedsHealth => "needs_health",
+                Self::MealLog => "meal_log",
+            }
+        }
+    }
+
+    /// Which fields a `Directives` has set.
+    ///
+    /// The destructure is EXHAUSTIVE (no `..`) BY DESIGN: adding a field to
+    /// `Directives` fails to compile here, which is the whole point — the new
+    /// directive must then be added to `DirectiveField` and to `REGISTRY`, and the
+    /// coverage tests below will not pass until it is genuinely recognized.
+    fn fields_set(d: &Directives) -> Vec<DirectiveField> {
+        let Directives {
+            needs_health,
+            meal_log,
+        } = d;
+        let mut set = Vec::new();
+        if needs_health.is_some() {
+            set.push(DirectiveField::NeedsHealth);
+        }
+        if meal_log.is_some() {
+            set.push(DirectiveField::MealLog);
+        }
+        set
+    }
+
+    /// Every `(name, version)` pair the registry recognizes, with a MINIMAL payload
+    /// that satisfies that directive's contract and the field it must populate. A
+    /// new arm in `extract_directives` belongs here; the tests below fail if the
+    /// two fall out of step.
+    const REGISTRY: &[(&str, u32, &str, DirectiveField)] = &[
+        (
+            "JESSE_NEEDS_HEALTH",
+            1,
+            r#"{"sections":["daily"]}"#,
+            DirectiveField::NeedsHealth,
+        ),
+        (
+            "JESSE_MEAL_LOG",
+            1,
+            r#"{"meals":[{"id":"a","consumedAt":"t","name":"n"}]}"#,
+            DirectiveField::MealLog,
+        ),
+        (
+            "JESSE_MEAL_LOG",
+            2,
+            r#"{"meals":[{"id":"a","consumedAt":"t","name":"n"}]}"#,
+            DirectiveField::MealLog,
+        ),
+    ];
+
+    #[test]
+    fn every_registry_entry_populates_exactly_its_own_field() {
+        for (name, version, payload, expected) in REGISTRY {
+            let reply = format!("prose\n\n{name} v{version} {payload}");
+            let (text, directives) = extract_directives(&reply);
+            assert_eq!(
+                text, "prose",
+                "{name} v{version} must strip its directive line"
+            );
+            let directives =
+                directives.unwrap_or_else(|| panic!("{name} v{version} must attach a directive"));
+            assert_eq!(
+                fields_set(&directives),
+                vec![*expected],
+                "{name} v{version} must populate exactly `{}` and no other field",
+                expected.label()
+            );
+        }
+    }
+
+    #[test]
+    fn every_directives_field_is_reachable_from_the_registry() {
+        // The other direction: a field declared on `Directives` that no registry
+        // arm can ever populate is dead wire surface, not a directive.
+        for field in DirectiveField::ALL {
+            let reached = REGISTRY.iter().any(|(name, version, payload, f)| {
+                f == field
+                    && matches!(
+                        extract_directives(&format!("{name} v{version} {payload}")).1,
+                        Some(ref d) if fields_set(d).contains(field)
+                    )
+            });
+            assert!(
+                reached,
+                "no registry entry populates `{}` — a directive field with no \
+                 recognizer is unreachable by any reply",
+                field.label()
+            );
+        }
+    }
+
+    #[test]
+    fn a_directive_never_populates_more_than_one_field() {
+        // The module contract: exactly one directive line is recognized per reply,
+        // so a `Directives` carries exactly one field. Guards a future arm that
+        // sets two fields from one line.
+        for (name, version, payload, _) in REGISTRY {
+            let directives = extract_directives(&format!("{name} v{version} {payload}"))
+                .1
+                .unwrap_or_else(|| panic!("{name} v{version} must attach a directive"));
+            assert_eq!(
+                fields_set(&directives).len(),
+                1,
+                "{name} v{version} set more than one directive field"
+            );
+        }
+    }
 }

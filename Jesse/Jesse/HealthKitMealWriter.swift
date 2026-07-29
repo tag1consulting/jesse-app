@@ -99,19 +99,46 @@ nonisolated struct HealthKitMealWriter: MealWriting {
         }
     }
 
+    /// The predicate selecting what `delete(id:)` may remove: the app's OWN `.food`
+    /// correlations whose external id is `id`. A conjunction of two clauses, and both
+    /// are load-bearing:
+    ///
+    /// * the metadata clause picks the meal, since the meal id is stored as
+    ///   `HKMetadataKeyExternalUUID` when the correlation is saved;
+    /// * the SOURCE clause scopes the query to samples this app saved.
+    ///
+    /// The source clause is what makes the scoping a property of this code rather than
+    /// an inherited one. Two platform behaviours would otherwise have to hold for the
+    /// metadata clause alone to be safe — that HealthKit refuses to delete objects the
+    /// app did not write, and that an app with no dietary READ authorization can only
+    /// see its own food samples. Both are Apple-documented, neither is asserted here,
+    /// and the second silently stops holding the moment a dietary type is added to
+    /// `HealthContextProvider.readTypes` (say, to show intake across all sources). The
+    /// id reaching this method comes from agent output and is only validated as a
+    /// non-empty string, so it may name anything; this predicate is why that does not
+    /// matter. Exposed and pure so the conjunction is unit-testable without a store.
+    static func deletePredicate(id: String) -> NSPredicate {
+        NSCompoundPredicate(andPredicateWithSubpredicates: [
+            HKQuery.predicateForObjects(
+                withMetadataKey: HKMetadataKeyExternalUUID, allowedValues: [id]),
+            HKQuery.predicateForObjects(from: HKSource.default()),
+        ])
+    }
+
     /// Delete the app's `.food` correlation for `id` and its contained quantity samples.
-    /// The meal id was stored as `HKMetadataKeyExternalUUID` on the correlation, so we
-    /// query for `.food` correlations with that value, then delete each correlation
-    /// **together with its `.objects`** (the contained samples) — correlation deletion
-    /// does not cascade, and there are now up to eleven quantity types per meal, so we
-    /// enumerate the present samples rather than assume a count. HealthKit only lets the
-    /// app delete objects IT wrote,
-    /// so another source's data is never touched even if it shared the external id.
+    /// Selection is `deletePredicate(id:)` — this app's own food correlations carrying
+    /// that external id — and each match is deleted **together with its `.objects`** (the
+    /// contained samples), because correlation deletion does not cascade and there are up
+    /// to eleven quantity types per meal, so we enumerate the present samples rather than
+    /// assume a count. A correlation's contained samples were saved with it, so scoping
+    /// the correlation to this app's source scopes its objects too.
+    ///
+    /// Idempotent by contract: an id matching nothing returns `true` (already absent), so
+    /// a retract of an id this app never wrote is a no-op success and never a retry loop.
     func delete(id: String) async -> Bool {
         guard HKHealthStore.isHealthDataAvailable() else { return false }
         let store = HKHealthStore()
-        let predicate = HKQuery.predicateForObjects(
-            withMetadataKey: HKMetadataKeyExternalUUID, allowedValues: [id])
+        let predicate = Self.deletePredicate(id: id)
         do {
             let correlations = try await withCheckedThrowingContinuation {
                 (cont: CheckedContinuation<[HKCorrelation], Error>) in

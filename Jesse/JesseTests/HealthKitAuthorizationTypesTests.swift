@@ -41,6 +41,44 @@ final class HealthKitAuthorizationTypesTests: XCTestCase {
                        "share set must be exactly the eleven dietary quantity types")
     }
 
+    /// The READ set must contain no dietary type. This is NOT what makes the meal
+    /// delete path safe — `HealthKitMealWriter.deletePredicate(id:)` scopes deletion
+    /// to this app's own source, and holds whatever the read set says. This is a
+    /// tripwire on a specific future change: adding a dietary read type is what
+    /// "show the user their intake across all sources" looks like, and that widens
+    /// what a `.food` correlation query can see. It should be a decision taken
+    /// deliberately and reviewed against the delete path, not one that lands
+    /// silently inside an unrelated feature. Failing here is the prompt to do that.
+    func testReadSetContainsNoDietaryType() {
+        let dietaryPrefix = "HKQuantityTypeIdentifierDietary"
+        for id in HealthContextProvider.readTypes.map(\.identifier) {
+            XCTAssertFalse(id.hasPrefix(dietaryPrefix),
+                           "read set contains a dietary type (\(id)) — this widens what a "
+                           + "food-correlation query can see; review HealthKitMealWriter.delete")
+        }
+    }
+
+    /// The meal delete predicate must be a CONJUNCTION of the external-id match and a
+    /// source scope. Dropping the source clause would leave selection resting on the
+    /// metadata id alone, which comes from agent output and is validated only as a
+    /// non-empty string. Asserted structurally (a compound `AND` of exactly two
+    /// clauses, one of them the source predicate) because HealthKit's predicates are
+    /// opaque and a real store is unexercisable in the sandbox.
+    func testDeletePredicateIsScopedToThisAppsSource() {
+        let predicate = HealthKitMealWriter.deletePredicate(id: "2026-07-29-lunch")
+        guard let compound = predicate as? NSCompoundPredicate else {
+            return XCTFail("delete predicate is not a compound predicate: \(predicate)")
+        }
+        XCTAssertEqual(compound.compoundPredicateType, .and,
+                       "delete predicate must AND its clauses, never OR them")
+        XCTAssertEqual(compound.subpredicates.count, 2,
+                       "delete predicate must carry exactly the id clause and the source clause")
+        let sourceClause = HKQuery.predicateForObjects(from: HKSource.default())
+        XCTAssertTrue(compound.subpredicates.contains { ($0 as? NSPredicate) == sourceClause },
+                      "delete predicate is missing the source scope — deletion would rest on "
+                      + "the agent-supplied external id alone")
+    }
+
     /// No identifier in ANY authorization set (read or share) may be a correlation
     /// type — HealthKit forbids requesting authorization for `HKCorrelationType` at
     /// all, and doing so crashes at the `requestAuthorization` call. This makes the
