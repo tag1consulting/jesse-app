@@ -119,7 +119,39 @@ pub const DEFAULT_MAX_ATTACHMENTS_TOTAL_BYTES: usize = 20 * 1024 * 1024;
 // from a phone request) — the narrowest scope the CLI accepts
 // (verified against claude 2.1.195). cwd is the vault, so the skill is discovered
 // from `.claude/skills/` there.
-pub const DEFAULT_ALLOWED_TOOLS: &str = "Read,Write,Edit,Grep,Glob,\
+// ---- Why the five file/search grants carry `(./**)` --------------------------
+//
+// PATH SCOPE, added 2026-07-29 after the live battery recorded three unmet hard
+// gates at `write/qmd`: a writes-on turn could write outside the vault through
+// `../`, through a symlink's resolved target, and into the bridge's own state
+// directory, and could read anything the bridge user could read. The tools were
+// granted by NAME, and a name carries no path — so the vault was where the child
+// worked, not a boundary it could not leave.
+//
+// `(./**)` is CWD-RELATIVE on purpose, not the absolute `(//<vault>/**)` form.
+// Every site that grants these tools runs the child in the vault (`main_turn_request`,
+// `vaultqa_child_request`), so the two forms are the same boundary — and both were
+// hand-checked against the pinned CLI (2.1.220, 2026-07-29): an outside read/write
+// is refused at the PERMISSION layer, which a headless `-p` child cannot answer,
+// while an in-vault read/write/search still lands. The relative form is chosen
+// because it names no host path: the containment record commits the exact argv it
+// probed, and an absolute vault path there would be both a personal-infra leak
+// (`scripts/ci-guards.sh`) and a record no other deployment could match.
+//
+// GREP AND GLOB ARE SCOPED TOO, and that is not over-reach. `Grep` reads file
+// CONTENT and takes a path argument, so an unscoped `Grep` walks straight out of
+// the vault — hand-checked: with `Read`/`Write`/`Edit` scoped and `Grep` bare, a
+// child still read a file outside the working directory. Scoping all five closed
+// every read and write escape while the four positive controls (vault read, vault
+// search, qmd search, vault write) kept passing, which is what says the scope is
+// tight rather than merely narrow.
+//
+// The `Bash(...)` grants below are deliberately NOT narrowed here. The network
+// route and the process that outlives a turn both come from `Bash(git:*)` with
+// unrestricted arguments — a separate decision with its own cost to the vault
+// workflows, and both stay recorded as known-open baselines in
+// `bridge/containment.toml` rather than being quietly closed as a side effect.
+pub const DEFAULT_ALLOWED_TOOLS: &str = "Read(./**),Write(./**),Edit(./**),Grep(./**),Glob(./**),\
 mcp__qmd__query,mcp__qmd__get,mcp__qmd__multi_get,mcp__qmd__status,\
 Skill(diet-logging),\
 Bash(git:*),Bash(mv:*),Bash(ls:*),Bash(cat:*),Bash(find:*),\

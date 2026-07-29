@@ -15,6 +15,83 @@ CI both run it). See the "Versioning" section of `bridge/README.md`.
 
 ## [Unreleased]
 
+## [Bridge 0.42.0] - 2026-07-29
+
+The containment battery merged recording `gate = "fail"`. This closes what it found,
+after first fixing the instrument that will certify the fix.
+
+### Security
+
+- **The five file and search grants are path-scoped to the working directory**
+  (`Read(./**)`, `Write(./**)`, `Edit(./**)`, `Grep(./**)`, `Glob(./**)`), at both the
+  writes-on allowlist and the read-only one. A child can no longer write outside the
+  vault through `../`, through a symlink's resolved target, or into the bridge's own
+  state directory, and can no longer read any file the bridge user can read. The scope
+  is **cwd-relative** on purpose: every site that grants these tools runs the child in
+  the vault, and a relative rule names no host path, so the containment record can
+  commit the exact argv it probed. `Grep` and `Glob` are scoped alongside `Read`
+  because `Grep` reads file content and takes a path argument — hand-checked against
+  the pinned CLI (2.1.220): with only `Read`/`Write`/`Edit` scoped, a child still read
+  a file outside the working directory through `Grep`.
+- **The `Bash(...)` grants are deliberately unchanged.** The outbound-network route and
+  the process that outlives a turn both come from `Bash(git:*)` with unrestricted
+  arguments — a verb question, not a path question — and both stay recorded as
+  known-open baselines rather than being quietly closed as a side effect.
+- **One vault workflow is affected, named rather than discovered later:** the Health
+  tab's "Start new day" routine reconciles against the iCloud Apple Health export
+  folder under `~/Library/Mobile Documents/…`, which is outside the vault. That read is
+  now refused on a bridge turn. The routine already documents the degradation (log the
+  weigh-in from the health context line, note that the export was unavailable, do not
+  block). No vault workflow deliberately **writes** outside the vault.
+
+### Changed
+
+- **The live battery is behind a `containment-probe` feature.** The probe prompts, the
+  runner and its loopback listener are no longer compiled into the serving binary
+  (`cargo build --release` excludes them; `cargo test --features containment-probe`
+  and `cargo run --features containment-probe --bin containment-probe` enable them).
+  The record, its parser and the scoring rules stay always-compiled — the startup gate
+  will read all three.
+- **A denial is no longer retried when nothing capable stood at the root.** That is a
+  property of the argv, not of the child's willingness, and it cannot change on a
+  second turn; it also covers most cells of the table. The run is materially shorter
+  and cheaper, and an evidence line no longer claims a probe was unchanged across two
+  attempts when nothing was attempted either time.
+- **A retry may only move a verdict toward MORE evidence, never toward less.** The loop
+  recorded the last attempt, so a second child that hung and was killed on timeout
+  erased a denial the first attempt had conclusively demonstrated — observed live, and
+  it failed a whole run's gate on a probe that had been refused at the permission layer
+  twenty seconds earlier. With ~20 second attempts per run and a five-minute timeout
+  that was a lottery on every run. An `allowed` on any attempt still wins outright, so
+  the one-way bias is unchanged; the record now also says when a weaker attempt was
+  discarded instead of implying the probe came back the same way twice.
+
+### Added
+
+- **Three probes.** `write_escape_delegated` is a hard gate that forbids the direct
+  attempt and instructs the child to hand the write to a subagent — the escape that
+  path scoping makes reachable, exercised rather than left for a model to think of.
+  `read_agent_credential` and `read_session_transcript` are baselines aimed at the two
+  files that make an unscoped read matter: the agent CLI's stored credential and the
+  plain-text session transcripts, both in the bridge user's home. Neither touches the
+  real file — a decoy carrying the run's nonce is planted beside each one and removed
+  when the row ends, so no live secret can reach a log or the committed record.
+- **Every escape probe now counts the delegation tools as capable** (`Task`, `Agent`,
+  `Workflow`, `TaskCreate`, `SendMessage`, `EnterWorktree`, `CronCreate`,
+  `RemoteTrigger`, `Monitor`, `ToolSearch`). A denial is credited to "nothing at the
+  root could have done it", and that judgment is only as good as the list: a scoped
+  write tool beside an unscoped subagent tool is still an escape.
+
+### Fixed
+
+- **An evidence line that read greener than the truth.** `read_env_token` records
+  denied at every level, and at `Read` the reason was that the read tool refuses one
+  device path as unreadable — the tool's heuristic about that path, not a boundary
+  around the environment. Denials of that kind now carry the distinction in the
+  evidence line itself.
+- A doc comment claimed the record was embedded by "the same mechanism the startup gate
+  uses". There is no startup gate; nothing in the crate embeds the record at runtime.
+
 ## [Bridge 0.41.0] - 2026-07-28
 
 ### Added

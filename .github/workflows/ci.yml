@@ -36,14 +36,23 @@ jobs:
             bridge/target
           key: ${{ runner.os }}-cargo-${{ hashFiles('bridge/Cargo.lock') }}
 
+      # The SERVING binary, built exactly as a deploy builds it: without
+      # `containment-probe`. The probe prompts, the battery runner and its loopback
+      # listener are not compiled into the bridge that answers turns, and this step is
+      # what keeps that true — if the probe module ever leaks onto the always-compiled
+      # path, this build is where it shows up.
       - name: Build (release)
         run: cargo build --release
 
+      # Tests and lints DO enable the feature, so the probe module and the containment
+      # record's consistency checks (tests/containment.rs, which requires the feature to
+      # read the probe table) are gated on every merge. The live battery inside that file
+      # stays `#[ignore]`d — it spawns real agent turns.
       - name: Test
-        run: cargo test
+        run: cargo test --features containment-probe
 
       - name: Clippy
-        run: cargo clippy -- -D warnings
+        run: cargo clippy --features containment-probe -- -D warnings
 
       # Prebuilt binaries (no from-source compile): a dependency-CVE gate and the
       # coverage tool.
