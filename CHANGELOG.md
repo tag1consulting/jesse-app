@@ -15,6 +15,38 @@ CI both run it). See the "Versioning" section of `bridge/README.md`.
 
 ## [Unreleased]
 
+## [Bridge 0.44.0] - 2026-07-29
+
+### Fixed
+- **A reasoning model could never pass its own health probe, so arming it left it out of the
+  picker.** The probe is a `max_tokens: 1` call bounded by a flat 3 s budget — fine for GLM
+  (measured 0.75–1.1 s), but a *thinking* model emits a reasoning block before its first
+  content token, so Kimi K3 on Fireworks answers the same probe in **2.9–6.9 s** (measured
+  2026-07-27). Every probe timed out, `healthy` went false, and since `available =
+  configured AND healthy`, `POST /jesse/model` rejected K3 with 409 — an armed, perfectly
+  reachable model that could not be selected. K3's entry now carries a 15 s budget
+  (`REASONING_HEALTH_TIMEOUT_SECS`); GLM and `local` keep the 3 s default.
+
+### Added
+- **`JESSE_HEALTH_TIMEOUT_SECS`** — a global per-probe timeout override, mirroring the
+  existing `JESSE_HEALTH_INTERVAL_SECS` in both precedence and failure behavior: an explicit
+  per-model `health.timeout_secs` wins, then this override, then the entry's own default. A
+  value is capped at `MAX_HEALTH_TIMEOUT_SECS` (60 s) so a probe can never outlive its own
+  cadence; zero or unparseable logs one startup warning and falls back rather than erroring.
+  Lets an operator widen the budget for a slow backend without writing a `[[models]]` block.
+
+### Known limitation
+- **Kimi K3 is armed but NOT usable for tool-driven turns**, which is every read-only Jesse
+  turn. Fireworks' K3 Anthropic surface mints `tool_use` ids as `<tool_name>:<index-in-turn>`
+  (`Read:0`) instead of a conversation-unique id — GLM on the same endpoint mints unique
+  `chatcmpl-tool-<hash>` ids. The counter restarts each turn, so the *second* sequential call
+  to the same tool reuses an id already spent. From that point the `tool_result` no longer
+  pairs, K3 reports "the user sent an empty message", and it re-issues the same call until
+  the turn is capped. A single turn calling one tool twice in parallel is fine (`Read:0`,
+  `Read:1`); the break is strictly across turns. Verified with the CLI talking straight to
+  Fireworks — the bridge is not in the message path — and GLM completes the identical prompt
+  correctly. This is upstream; the fix would be an id-rewriting proxy, not a bridge change.
+
 ## [Bridge 0.43.3] - 2026-07-29 / [App 1.0 (85)]
 
 Meal deletion says in the app what it previously inherited from the platform, and the
