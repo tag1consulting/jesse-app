@@ -518,7 +518,7 @@ mod tests {
 
     /// The record commits the exact argv it probed, and the startup assertion above compares
     /// it by strict equality with no normalization layer. That only works while the argv is
-    /// host-independent. A `Read(//Users/someone/vault/**)` would make every OTHER deployment
+    /// host-independent. A `Read(//Users/someuser/vault/**)` would make every OTHER deployment
     /// fail at boot — so this catches it at commit time instead.
     #[test]
     fn the_record_carries_no_absolute_host_paths() {

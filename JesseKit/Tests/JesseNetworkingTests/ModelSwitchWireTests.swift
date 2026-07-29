@@ -33,6 +33,9 @@ final class ModelSwitchWireTests: XCTestCase {
         XCTAssertEqual(glm.kind, "hosted")
         XCTAssertFalse(glm.isDefault)
         XCTAssertFalse(glm.writesAllowed, "a non-default model is read-only by default")
+        XCTAssertEqual(glm.level, "read", "a model with no declared level decodes as read")
+        XCTAssertTrue(glm.streamsText, "an omitted streams_text defaults to the streaming assumption")
+        XCTAssertEqual(glm.levelCaveat, "can answer, but can't change the vault")
 
         let unarmed = try XCTUnwrap(state.models.first { $0.id == "test-unarmed" })
         XCTAssertFalse(unarmed.available, "an unavailable model shows disabled")
@@ -43,9 +46,8 @@ final class ModelSwitchWireTests: XCTestCase {
             with: JSONEncoder().encode(SetModelBody(id: "glm-5.2"))) as? [String: Any]
         XCTAssertEqual(model?["id"] as? String, "glm-5.2")
 
-        let writes = try JSONSerialization.jsonObject(
-            with: JSONEncoder().encode(SetWritesBody(enabled: true))) as? [String: Any]
-        XCTAssertEqual(writes?["enabled"] as? Bool, true)
+        // There is no second mutator: the per-model writes toggle was removed, and what a
+        // model may touch is its `level` in the bridge config.
     }
 
     func testHostedProvenanceCarriesActiveModelAndCost() throws {

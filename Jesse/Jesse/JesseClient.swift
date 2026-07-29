@@ -432,11 +432,6 @@ struct JesseClient: JesseClientProtocol {
         try await bridge.setActiveModel(id)
     }
 
-    /// Set a model's write permission (`POST /jesse/model/{id}/writes`, Phase 2 effect).
-    func setModelWrites(id: String, enabled: Bool) async throws {
-        try await bridge.setWrites(id: id, enabled: enabled)
-    }
-
     // MARK: - Request building (iOS attachment mapping over the shared builder)
 
     /// Build the `POST /jesse` request from the iOS composer's `[JesseAttachment]` — the

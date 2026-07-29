@@ -4739,6 +4739,67 @@ async fn set_model_unavailable_is_409_and_does_not_switch() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+
+/// THE MODELS-ENDPOINT SHAPE, pinned. Each entry gains exactly two fields — `level` and
+/// `streams_text` — and keeps every field it had. A silently changed shape is a client
+/// that renders the wrong thing, so the whole key set is asserted rather than the new
+/// pair alone.
+#[tokio::test]
+async fn the_models_endpoint_entry_shape_is_pinned() {
+    let dir = std::env::temp_dir().join(format!("jesse-model-it-{}", random_hex()));
+    let st = AppState::new(cfg_with_switch_registry(&dir));
+    let resp = app(st)
+        .oneshot(models_request(Some("Bearer test-token")))
+        .await
+        .unwrap();
+    let v = body_value(resp).await;
+    let entry = v["models"].as_array().unwrap()[0].as_object().unwrap().clone();
+    let mut keys: Vec<&str> = entry.keys().map(String::as_str).collect();
+    keys.sort();
+    assert_eq!(
+        keys,
+        vec![
+            "available",
+            "configured",
+            "healthy",
+            "id",
+            "kind",
+            "label",
+            "last_checked_ms",
+            "latency_ms",
+            "level",
+            "streams_text",
+            "vision",
+            "writes_allowed",
+        ],
+        "the models entry shape changed — update the clients and the changelog"
+    );
+    // The two new fields carry the right types and values.
+    for m in v["models"].as_array().unwrap() {
+        assert!(
+            ["basic", "read", "write"].contains(&m["level"].as_str().unwrap()),
+            "level is one of the three capability labels: {m}"
+        );
+        assert!(
+            m["streams_text"].is_boolean(),
+            "streams_text is a boolean the client can key a spinner off: {m}"
+        );
+        // Every model registered today runs under Claude Code, which streams.
+        assert_eq!(m["streams_text"], true);
+    }
+    // Unconfigured and unhealthy stay DISTINCT, exactly as before.
+    let unarmed = v["models"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["configured"] == false);
+    if let Some(u) = unarmed {
+        assert_eq!(u["available"], false);
+        assert_eq!(u["healthy"], false, "unconfigured is not 'unhealthy'");
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// THE REMOVAL, asserted rather than described. `POST /jesse/model/{id}/writes` let a
 /// device grant a model write access to the vault. It is gone: what a model may touch is
 /// its `level`, which lives in the bridge config and is validated at startup against the

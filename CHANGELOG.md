@@ -15,6 +15,82 @@ CI both run it). See the "Versioning" section of `bridge/README.md`.
 
 ## [Unreleased]
 
+## [Bridge 0.43.0] - 2026-07-29 / [App 1.0 (82)]
+
+The whole configuration surface of the level effort: three keys, one routing rule, and a
+startup gate that refuses to run a posture the containment record cannot vouch for.
+
+### Added
+
+- **Two optional per-model keys** in the declarative `[[models]]` array. `harness` (absent
+  means `claude-code`) names the agent program that runs the model's child; each harness has
+  one binary-path env var, consulted and only fatal for a harness some configured model
+  actually references. `level` (`basic` | `read` | `write`, absent means **read**) is the
+  MOST a model may be granted — a ceiling, not a grant.
+- **`offload_order`**, one ordered list replacing the four per-role backends. For a job
+  requiring capability C, walk it and take the first model that is configured, healthy and at
+  level C or above; else the conversation's model; else ambient. Titles and diet extraction
+  require Basic, vault Q&A requires Read, diet verification requires **Write** with the
+  extracting model **excluded** — Write is the same threshold that skips verification
+  entirely, so without the exclusion the first cheap model would verify its own extraction.
+- **A startup gate.** Six rejections, each naming the model where it has one: a leftover
+  `default_writes`, an unparseable `level`, an unregistered harness id, a level above what
+  that harness has a passing battery row for, a containment record that is absent or does not
+  parse (fails closed), a removed role env var still set, and a mismatch between the argv this
+  deployment would run and the one the record was taken with. Passing requires EVERY MCP set
+  recorded at a level, keys on the hard gates alone (never the known-open baselines), and is a
+  contiguous prefix — `Capability` is cumulative, so a green `write` row above a failing
+  `read` row vouches for nothing.
+- The models endpoint gains exactly two fields per entry: `level` and `streams_text` (derived
+  from the model's harness, so a whole-answer harness can be rendered with a spinner rather
+  than an empty bubble). Unconfigured and unhealthy stay distinct. **A fixture pins the entry
+  shape**, so a silent change fails a test rather than a client.
+
+### Removed
+
+- **The per-model writes toggle, which is a control the phone had and no longer has.**
+  `POST /jesse/model/{id}/writes` is gone (404), along with its persisted `writes` map (a
+  leftover map is dropped with one logged notice on first load) and the `default_writes`
+  config key. What a model may touch is its `level`, which lives in the bridge config and is
+  validated at startup — a containment decision is not something a device sets. Both clients
+  lose the toggle and now SHOW each model's level instead; every model still appears in the
+  picker and can back a conversation, because being able to talk to all of them is the point.
+- **Ten env vars and the resolution code behind them:** `JESSE_TITLE_{BASE_URL,AUTH_TOKEN,MODEL}`,
+  `JESSE_DIET_{BASE_URL,AUTH_TOKEN,MODEL}`, `JESSE_VAULTQA_{BASE_URL,AUTH_TOKEN,MODEL}` and
+  `JESSE_DIET_PROBATION`. Still set at startup → a loud error naming `offload_order`.
+  `JESSE_DIET_MICRO_COMPLETE`, `JESSE_VAULTQA_MCP_CONFIG`, `JESSE_MAIN_MCP_CONFIG` and
+  `JESSE_SHADOW_*` all stay: none of them names a model for a role.
+
+### Changed
+
+- **The effective grant rule, stated once.** A routed job runs at exactly the job's required
+  capability, never at the serving model's level; a main turn runs at `min(level, Write)`. A
+  Write model serving a title gets Basic; a Read model backing a conversation gets the
+  read-only posture. There is no runtime ceiling arithmetic anywhere else.
+- **Diet verification is gated on the LEVEL of whichever model served the extraction**, not on
+  where it ran. At Write the extraction is taken as-is; below it the hosted verdict is
+  mandatory and blocking. This uses the level as a deliberate PROXY for extraction accuracy
+  rather than a claim that the two are the same property.
+- Each routed job logs which candidate served it, by model id and harness, with no prompt
+  content. Failover walks to the next candidate on a transport failure only — a refusal or a
+  bad answer is an answer, not an outage.
+- **A main turn never routes away from its selected model**, even when unhealthy: answering as
+  a silently different model is worse than surfacing the failure. Written into the doc comment
+  and pinned by a test, because it is what a later change erodes by accident.
+
+### Known limitations, named rather than papered over
+
+- **Directives are not gated by level.** The bridge parses a directive off the final line of a
+  reply and applies it itself, so a model at level Read can still cause vault changes through
+  that channel, exactly as a Basic model causes a food entry to be written. The level
+  describes what the MODEL may touch, not what the bridge may do with validated output.
+  Gating them later stays available and visible.
+- **The ambient default remains built in.** Claude Code plus the local login is the routing
+  rule's final fallback and the out-of-box conversation backend, so `claude-code` is still the
+  one harness that must exist. De-privileging it into an ordinary registry entry is real work
+  (auth, defaults, first run) and is out of scope; the rule until then is that no change may
+  add a NEW assumption that ambient exists.
+
 ## [Bridge 0.42.0] - 2026-07-29
 
 The containment battery merged recording `gate = "fail"`. This closes what it found,

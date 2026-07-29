@@ -30,7 +30,6 @@ struct MacSettingsView: View {
     @State private var switchingModel = false
     @State private var modelsError: String?
     // Phase 2: the model awaiting write-enable confirmation (granting writes is gated).
-    @State private var pendingWriteModel: ModelInfo?
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -116,7 +115,7 @@ struct MacSettingsView: View {
                                 if let reason = model.unavailableReason {
                                     Text(reason)
                                         .font(.caption).foregroundStyle(.secondary)
-                                } else if !model.isDefault && !model.writesAllowed {
+                                } else if let caveat = model.levelCaveat {
                                     Text("read-only")
                                         .font(.caption).foregroundStyle(.secondary)
                                 }
@@ -160,69 +159,33 @@ struct MacSettingsView: View {
         }
     }
 
-    /// Phase 2: per-model write access, gated behind a confirmation. Mirrors the iPhone.
+    /// What a model may touch is now CONFIG, not a switch on a device.
+    ///
+    /// This section used to carry a per-model "allow writes" toggle backed by
+    /// `POST /jesse/model/{id}/writes`. That endpoint is gone: a model's `level` lives in
+    /// the bridge config and is validated at startup against the committed containment
+    /// record, so a containment decision cannot be taken from a phone or a Mac. The
+    /// switcher still SHOWS what each model may do — see `ModelInfo.levelCaveat`.
     @ViewBuilder
     private var writeAccessSection: some View {
         if let modelState, modelState.models.contains(where: { $0.available && !$0.isDefault }) {
             Section {
                 ForEach(modelState.models.filter { $0.available && !$0.isDefault }) { model in
-                    Toggle(isOn: writeBinding(for: model)) {
-                        Text("Allow \(model.label) to write the vault")
+                    HStack {
+                        Text(model.label)
+                        Spacer()
+                        Text(model.writesAllowed ? "can write the vault" : (model.levelCaveat ?? "read-only"))
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
                     }
-                    .disabled(switchingModel)
                 }
             } header: {
-                Text("Write access")
+                Text("What each model may do")
             } footer: {
-                Text("Off by default, every non-default model can read your vault but not change it. Turn this on only for a model you trust to edit files; the reply badge marks a writing model (e.g. “glm-5.2 · write”).")
+                Text("Set by the bridge's config (each model's `level`), not from this app. A model below “write” can answer questions but cannot change your vault.")
                     .font(.caption).foregroundStyle(.secondary)
             }
-            .alert("Allow writes?", isPresented: writeConfirmPresented) {
-                Button("Cancel", role: .cancel) { pendingWriteModel = nil }
-                Button("Allow writes", role: .destructive) {
-                    if let model = pendingWriteModel { setWrites(model, enabled: true) }
-                    pendingWriteModel = nil
-                }
-            } message: {
-                Text("\(pendingWriteModel?.label ?? "This model") will be able to modify files in your vault when it backs a conversation. You can turn this off at any time.")
-            }
         }
-    }
-
-    private func writeBinding(for model: ModelInfo) -> Binding<Bool> {
-        Binding(
-            get: { modelState?.models.first { $0.id == model.id }?.writesAllowed ?? false },
-            set: { newValue in
-                if newValue { pendingWriteModel = model } else { setWrites(model, enabled: false) }
-            }
-        )
-    }
-
-    private var writeConfirmPresented: Binding<Bool> {
-        Binding(get: { pendingWriteModel != nil }, set: { if !$0 { pendingWriteModel = nil } })
-    }
-
-    private func setWrites(_ model: ModelInfo, enabled: Bool) {
-        Task {
-            switchingModel = true
-            defer { switchingModel = false }
-            do {
-                try await modelClient().setWrites(id: model.id, enabled: enabled)
-                modelsError = nil
-            } catch {
-                let detail = (error as? JesseError)?.errorDescription ?? error.localizedDescription
-                modelsError = "Couldn’t change write access. (\(detail))"
-            }
-            await loadModels()
-        }
-    }
-
-    /// A bridge client over the entered fields (or the saved config), for the switch calls.
-    private func modelClient() -> JesseBridgeClient {
-        let cfg = JesseConfig(host: host.isEmpty ? configStore.config.host : host,
-                              port: Int(port) ?? configStore.config.port,
-                              token: token.isEmpty ? configStore.config.token : token)
-        return JesseBridgeClient(config: cfg)
     }
 
     private func loadModels() async {

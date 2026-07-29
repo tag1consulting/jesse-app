@@ -645,7 +645,7 @@ public struct JesseDeviceRegistration: Encodable {
     public init(token: String) { self.token = token }
 }
 
-// MARK: - Global model switch (GET /jesse/models, POST /jesse/model, .../writes)
+// MARK: - Global model switch (GET /jesse/models, POST /jesse/model)
 
 /// One selectable model in the bridge's global model switch. Ids and booleans only — never
 /// a token or base url (those live solely in the bridge launch env), so this is safe to hold
@@ -677,11 +677,25 @@ public struct ModelInfo: Decodable, Equatable, Sendable, Identifiable {
     public let lastCheckedMs: UInt64?
     /// The last probe's round-trip latency in millis, or `nil` when not reported.
     public let latencyMs: UInt64?
-    /// The effective write permission: the ambient default (`opus`) is always true; every
-    /// other model is false until writes are enabled per model.
+    /// Whether this model may change the vault. It is `level == "write"` and comes from the
+    /// bridge CONFIG — there is no longer any way for a client to change it (the per-model
+    /// writes toggle was removed).
     public let writesAllowed: Bool
+    /// The most this model may be granted: `basic` | `read` | `write`. Kept as the raw string
+    /// so an unknown future level still decodes and renders. Defaults to `write` when a
+    /// pre-level bridge omits it, which is what `writesAllowed` alone used to imply for the
+    /// ambient default; every model below Write is shown as able to answer but not to change
+    /// the vault. Models are NEVER hidden from the picker by level — being able to talk to
+    /// all of them is the point.
+    public let level: String
+    /// Whether this model's HARNESS delivers its answer as token-level deltas (true) or whole,
+    /// in one terminal event (false). A whole-answer harness must render tool activity and a
+    /// spinner rather than an empty bubble, so the client needs to be told. Defaults to `true`
+    /// — the streaming assumption every client already made — against a bridge that omits it.
+    public let streamsText: Bool
 
     public init(id: String, label: String, kind: String, available: Bool, writesAllowed: Bool,
+                level: String? = nil, streamsText: Bool? = nil,
                 configured: Bool? = nil, healthy: Bool? = nil,
                 lastCheckedMs: UInt64? = nil, latencyMs: UInt64? = nil) {
         self.id = id
@@ -695,13 +709,16 @@ public struct ModelInfo: Decodable, Equatable, Sendable, Identifiable {
         self.lastCheckedMs = lastCheckedMs
         self.latencyMs = latencyMs
         self.writesAllowed = writesAllowed
+        self.level = level ?? (writesAllowed ? "write" : "read")
+        self.streamsText = streamsText ?? true
     }
 
     enum CodingKeys: String, CodingKey {
-        case id, label, kind, available, configured, healthy
+        case id, label, kind, available, configured, healthy, level
         case lastCheckedMs = "last_checked_ms"
         case latencyMs = "latency_ms"
         case writesAllowed = "writes_allowed"
+        case streamsText = "streams_text"
     }
 
     // Custom decode so the health fields DEFAULT (a pre-health bridge omits them) rather than
@@ -718,6 +735,22 @@ public struct ModelInfo: Decodable, Equatable, Sendable, Identifiable {
         healthy = try c.decodeIfPresent(Bool.self, forKey: .healthy) ?? available
         lastCheckedMs = try c.decodeIfPresent(UInt64.self, forKey: .lastCheckedMs)
         latencyMs = try c.decodeIfPresent(UInt64.self, forKey: .latencyMs)
+        // Additive-forward-compatible, the same pattern as the health fields: a bridge that
+        // predates levels omits both, and the defaults reproduce what the client assumed.
+        level = try c.decodeIfPresent(String.self, forKey: .level) ?? (writesAllowed ? "write" : "read")
+        streamsText = try c.decodeIfPresent(Bool.self, forKey: .streamsText) ?? true
+    }
+
+    /// What this model may touch, for the switcher subtitle. `nil` for a Write model (the
+    /// unremarkable case); a short phrase for anything below it, so a user who picks a
+    /// read-only model learns it can answer but not change the vault BEFORE they ask it to.
+    public var levelCaveat: String? {
+        switch level {
+        case "write": return nil
+        case "read": return "can answer, but can't change the vault"
+        case "basic": return "can answer only — no vault access"
+        default: return nil
+        }
     }
 
     /// The ambient default (`opus`) — never applies overrides and is always writes-on.
@@ -753,12 +786,6 @@ public struct ModelSwitchState: Decodable, Equatable, Sendable {
 public struct SetModelBody: Encodable, Equatable {
     public let id: String
     public init(id: String) { self.id = id }
-}
-
-/// The `POST /jesse/model/{id}/writes` body: whether that model may write the vault.
-public struct SetWritesBody: Encodable, Equatable {
-    public let enabled: Bool
-    public init(enabled: Bool) { self.enabled = enabled }
 }
 
 /// The `POST /jesse/conversation/{id}/flags` body: any subset of the four flag fields. Only

@@ -393,4 +393,83 @@ mod tests {
         assert!(!skips_verification(Capability::Read));
         assert!(!skips_verification(Capability::Basic));
     }
+
+    /// THE GOLDEN CASE, stated as one test: with NONE of the three keys set, model
+    /// selection and every serving path behave exactly as before this prompt.
+    ///
+    /// Each assertion pins one thing the three keys could have changed silently:
+    /// which model a routed job lands on, what env its child carries, whether the local
+    /// routes arm at all, and what the main turn is granted.
+    #[test]
+    fn with_none_of_the_three_keys_set_nothing_changes() {
+        let cfg = test_config(); // no `level`, no `harness`, no `offload_order`
+        assert!(cfg.offload_order.is_empty(), "no offload_order by default");
+        let health = HealthStore::seeded(&cfg.model_registry);
+
+        // 1. Every routed job lands on ambient, which applies no backend env — exactly
+        //    what each role call site did when its override was unset.
+        for job in [
+            RoutedJob::Title,
+            RoutedJob::DietExtract,
+            RoutedJob::DietVerify,
+            RoutedJob::VaultQa,
+        ] {
+            let pick = route_job(&cfg, &health, job, None, None);
+            assert_eq!(pick.id, DEFAULT_MODEL_ID, "{job:?} routes to ambient");
+            assert!(pick.backend.is_none(), "{job:?} applies no env");
+            assert_eq!(pick.harness, CLAUDE_CODE_ID);
+        }
+
+        // 2. The local routes stay DORMANT, so every Tell and Ask takes the hosted path —
+        //    the kill switch an unset role triple used to be.
+        assert!(!has_offload_candidate(&cfg, &health, RoutedJob::DietExtract));
+        assert!(!has_offload_candidate(&cfg, &health, RoutedJob::VaultQa));
+        assert!(!should_try_local_diet(&cfg, &health, "tell", "logged a banana"));
+        assert!(!should_try_local_vaultqa(&cfg, &health, "ask", "what is my vo2 max", false));
+        assert!(!emergency_armed(&cfg, &health), "emergency needs a candidate too");
+
+        // 3. The ambient default still backs a conversation at Write, so a main turn is
+        //    granted exactly what it was.
+        let ambient = ActiveModel::ambient();
+        assert_eq!(turn_capability(&ambient), Capability::Write);
+        assert!(ambient.writes_allowed());
+
+        // 4. A model declared with no `level` is Read — it can answer, and cannot change
+        //    the vault.
+        assert_eq!(DEFAULT_MODEL_LEVEL, Capability::Read);
+    }
+
+    /// A MAIN TURN NEVER ROUTES AWAY FROM ITS SELECTED MODEL, even when that model is
+    /// unhealthy and a perfectly good candidate sits in `offload_order`.
+    ///
+    /// This is the boundary the routing rule must not cross: answering as a silently
+    /// different model is worse than surfacing the failure. The test drives the real
+    /// resolution path rather than asserting on a comment.
+    #[test]
+    fn a_main_turn_never_routes_away_from_its_model_even_when_unhealthy() {
+        let cfg = cfg_with(
+            vec![
+                model("glm", Capability::Write),
+                model("healthy-spare", Capability::Write),
+            ],
+            &["healthy-spare"],
+        );
+        let health = all_healthy(&cfg);
+        mark_unhealthy(&health, "glm");
+
+        // A routed job DOES fall through to the spare — that is the point of the walk.
+        let pick = route_job(&cfg, &health, RoutedJob::Title, None, None);
+        assert_eq!(pick.id, "healthy-spare");
+
+        // The conversation's model does NOT: resolution keeps an unhealthy but configured
+        // model active, and the turn fails visibly rather than answering as someone else.
+        let st = AppState::new(cfg);
+        st.models.set_active("glm");
+        let active = st.resolve_active_model();
+        assert_eq!(
+            active.id, "glm",
+            "an unhealthy conversation model stays selected; the walk must not adopt it"
+        );
+    }
+
 }
