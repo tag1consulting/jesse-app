@@ -2504,9 +2504,13 @@ pub async fn run_diet_pipeline(
     //
     // The ladder used to encode "a local backend is probationary, a hosted one is not",
     // which asked where the process lived rather than what it was trusted with. At `Write`
-    // the extraction is taken as-is; below it, it is verified. See `skips_verification` for
-    // why the level is a deliberate PROXY for extraction accuracy rather than a claim that
-    // the two are the same property.
+    // the extraction is taken as-is; below it, it is verified.
+    //
+    // THIS IS ONE IMPERFECT PROXY SUBSTITUTED FOR ANOTHER, NOT A CLAIM THAT THEY ARE THE
+    // SAME PROPERTY. A model trusted with the vault can still be sloppy at parsing a
+    // sentence about lunch. The substitution is deliberate and the reasoning is on
+    // `routing::skips_verification`; what makes it defensible is that it is visible in
+    // config and correctable by a `level` edit rather than a code change.
     let verdicts: Vec<EntryVerdict> = if skips_verification(extract_pick.level) {
         eprintln!(
             "jesse-bridge: diet verify skipped — extraction served by '{}' at level {}",

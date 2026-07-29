@@ -85,11 +85,13 @@ impl RoutedJob {
 /// trust it" — a local backend was probationary, a hosted one was not. That is now stated
 /// as a level: at `Write`, take the output; below it, verify.
 ///
-/// This uses the level as a PROXY for extraction accuracy, deliberately, and they are not
-/// the same property: a model can be trusted with the vault and still be sloppy at parsing
-/// a sentence about lunch. It is a better proxy than the one it replaces (which asked where
-/// the process was running), it is visible in config rather than implied by deployment, and
-/// when it turns out to be wrong the fix is a `level` edit rather than a code change.
+/// THIS IS ONE IMPERFECT PROXY SUBSTITUTED FOR ANOTHER, NOT A CLAIM THAT THEY ARE THE SAME
+/// PROPERTY. A model can be trusted with the vault and still be sloppy at parsing a sentence
+/// about lunch; trustworthiness and extraction accuracy are different things, and using the
+/// first to decide the second is a deliberate approximation. It is a better proxy than the
+/// one it replaces (which asked where the process was running rather than anything about the
+/// model), it is visible in config rather than implied by deployment, and when it turns out
+/// to be wrong the fix is a `level` edit rather than a code change.
 pub fn skips_verification(level: Capability) -> bool {
     level >= Capability::Write
 }

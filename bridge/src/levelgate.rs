@@ -275,8 +275,21 @@ pub fn validate_model_config(
 /// the path scopes are cwd-relative (`Read(./**)`), so nothing in it varies by deployment —
 /// and it must stay that way. If an absolute host path ever lands in the record, this
 /// assertion should fail LOUDLY on every other machine rather than silently normalize the
-/// difference away. `the_record_carries_no_absolute_host_paths` catches that at commit time
-/// so the failure never has to be discovered at boot on someone else's machine.
+/// difference away.
+///
+/// # COUPLED WITH `the_record_carries_no_absolute_host_paths` — DO NOT RELAX ONE ALONE
+///
+/// Strict equality here is only viable BECAUSE that test forbids a host path in the record;
+/// that test is only worth having BECAUSE the comparison here is strict. Relaxing either one
+/// on its own produces a silent failure mode:
+///   * add normalization here, keep the test → the normalization is dead code that hides the
+///     next real drift;
+///   * drop the test, keep strict equality → the first absolute path committed to the record
+///     breaks every deployment except the one that recorded it, at BOOT, on someone else's
+///     machine.
+///
+/// If an absolute scope ever genuinely has to enter the record, change both together and
+/// decide deliberately what the comparison should then mean.
 pub fn validate_toolset_argv(cfg: &Config, record: &BatteryResults) -> Vec<ConfigError> {
     let mut errors = Vec::new();
     for row in &record.rows {
@@ -516,10 +529,17 @@ mod tests {
         assert!(errors.is_empty(), "{errors:?}");
     }
 
-    /// The record commits the exact argv it probed, and the startup assertion above compares
-    /// it by strict equality with no normalization layer. That only works while the argv is
+    /// The record commits the exact argv it probed, and [`validate_toolset_argv`] compares it
+    /// by STRICT EQUALITY with no normalization layer. That only works while the argv is
     /// host-independent. A `Read(//Users/someuser/vault/**)` would make every OTHER deployment
     /// fail at boot — so this catches it at commit time instead.
+    ///
+    /// # COUPLED WITH `validate_toolset_argv` — DO NOT RELAX ONE ALONE
+    ///
+    /// These two are a pair: the strict comparison there is only viable because this test
+    /// forbids a host path here, and this test is only worth having because that comparison
+    /// is strict. See the "COUPLED WITH" block on [`validate_toolset_argv`] for what each
+    /// half fails to catch on its own. Change both together or neither.
     #[test]
     fn the_record_carries_no_absolute_host_paths() {
         let r = record();

@@ -15,6 +15,36 @@ CI both run it). See the "Versioning" section of `bridge/README.md`.
 
 ## [Unreleased]
 
+## [Bridge 0.43.1] - 2026-07-29
+
+Review follow-ups to 0.43.0. No behavior changes: two new invariants that fail the build,
+and three pieces of reasoning written down where the code is rather than in a PR description.
+
+### Added
+
+- **A guard that every registered harness streams.** `streams_text` is plumbed end to end
+  but no client renders the whole-answer case yet, so a non-streaming harness would show an
+  empty bubble until the turn finished. That assumption is now load-bearing and noisy: adding
+  such a harness fails the build and names the rendering work it requires, rather than
+  shipping the empty bubble. Same pattern, and the same reason, as the host-paths test.
+
+### Changed (documentation only)
+
+- **The directive channel's exposure is enumerated** in `directives.rs`, where the parsing
+  happens, so the decision to leave it ungated can be taken against the list rather than the
+  category. The finding worth stating: **neither directive writes the vault.**
+  `JESSE_NEEDS_HEALTH` causes no mutation on either side; `JESSE_MEAL_LOG` causes the APP to
+  write and retract Apple Health entries. The residual exposure is that a model at any level
+  can cause well-formed, capped (10 per block), deduplicated HealthKit writes by emitting a
+  final line — it cannot invent a field (unknown keys reject the whole block), cannot apply a
+  partial batch, and cannot reach the vault. The six validation stages are listed in order.
+- **The strict argv comparison and `the_record_carries_no_absolute_host_paths` each name the
+  other**, with what each half fails to catch alone, so someone relaxing one has to see the
+  other. They are only viable as a pair.
+- **The diet verify gate says what it is**: one imperfect proxy substituted for another, not a
+  claim that trustworthiness and extraction accuracy are the same property — at both the rule
+  (`routing::skips_verification`) and the site where the branch is taken (`dietlog`).
+
 ## [Bridge 0.43.0] - 2026-07-29 / [App 1.0 (82)]
 
 The whole configuration surface of the level effort: three keys, one routing rule, and a

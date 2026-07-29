@@ -432,4 +432,45 @@ mod tests {
         let api: ApiError = e.into();
         assert_eq!(api.0, StatusCode::INTERNAL_SERVER_ERROR);
     }
+
+    /// EVERY REGISTERED HARNESS STREAMS — and this test exists to fail the day one does not.
+    ///
+    /// `streams_text` is plumbed end to end (the harness derives it, `GET /jesse/models`
+    /// exposes it per model, the clients decode it), but NO client renders the whole-answer
+    /// case yet: a harness that returns its answer in one terminal event would show an empty
+    /// bubble until the turn finished. Rather than leave that as an implicit assumption
+    /// waiting to be discovered by a user, it is made load-bearing and noisy here.
+    ///
+    /// If you are reading this because the assertion failed: you registered a harness that
+    /// does not stream, and the client-side rendering work (tool activity + a spinner in
+    /// place of the empty bubble, keyed off `ModelInfo.streamsText`) is now required before
+    /// it can ship. Do that work rather than relaxing this test.
+    ///
+    /// Same pattern, and the same reason, as `the_record_carries_no_absolute_host_paths` in
+    /// `levelgate`: an assumption the code depends on should break the build, not the user.
+    #[test]
+    fn every_registered_harness_streams_until_a_client_can_render_one_that_does_not() {
+        let reg = HarnessRegistry::new(Vec::new());
+        for h in reg.ordered() {
+            assert!(
+                h.streams_text(),
+                "harness '{}' does not stream, but no client renders the whole-answer case \
+                 yet — implement the spinner/tool-activity rendering keyed off \
+                 `ModelInfo.streamsText` before registering it",
+                h.id()
+            );
+        }
+        // …and the vocabulary the registry validates against is covered by the same rule, so
+        // a harness added to KNOWN_HARNESS_IDS but not yet constructible cannot slip past.
+        for id in KNOWN_HARNESS_IDS {
+            match reg.get(id) {
+                Some(h) => assert!(h.streams_text(), "{id} does not stream"),
+                None => panic!(
+                    "'{id}' is a known harness id with no registry entry — `for_models` must \
+                     be able to construct every id the validator accepts"
+                ),
+            }
+        }
+    }
+
 }
