@@ -191,6 +191,11 @@ pub struct Config {
     pub bind: String,
     pub port: u16,
     pub claude_bin: String,
+    /// The `codex` binary, for models whose harness is [`CODEX_ID`]. One variable per
+    /// harness, mirroring `claude_bin` — see [`harness_bin_env`]. Only consulted for a
+    /// harness some configured model actually references, so a Codex-free config never
+    /// demands it be present.
+    pub codex_bin: String,
     /// The ordered candidate list for work the user did NOT choose a model for
     /// (`offload_order` in the config file). Empty by default, which routes every such job
     /// to ambient — byte-for-byte the behavior before this key existed.
@@ -1531,6 +1536,7 @@ impl Config {
             bind: env_string("JESSE_BIND").unwrap_or_else(|| "127.0.0.1".to_string()),
             port: env_parse("JESSE_PORT", 8765),
             claude_bin: env_string("JESSE_CLAUDE_BIN").unwrap_or_else(|| "claude".to_string()),
+            codex_bin: env_string("JESSE_CODEX_BIN").unwrap_or_else(|| "codex".to_string()),
             offload_order: load_offload_order(&home),
             // 1h default; clamped to [1, HARD_TIMEOUT_CEILING].
             timeout_secs: clamp_timeout_secs(env_parse("JESSE_TIMEOUT", 3600)),
