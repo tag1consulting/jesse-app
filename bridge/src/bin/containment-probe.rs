@@ -1,6 +1,6 @@
 //! `containment-probe` — the containment battery, as a merge gate.
 //!
-//! [`jesse_bridge::capability_args`] records what this codebase learned the hard way: an empty
+//! [`jesse_bridge::claude_capability_args`] records what this codebase learned the hard way: an empty
 //! `--allowedTools` was believed to mean "no tools", and a live probe against the pinned CLI
 //! disproved it. The conclusion drawn there is the rule this binary enforces — enumerated
 //! denial is not a boundary, and the acceptance gate is a live probe battery re-run against

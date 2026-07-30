@@ -15,6 +15,76 @@ CI both run it). See the "Versioning" section of `bridge/README.md`.
 
 ## [Unreleased]
 
+## [Bridge 0.47.0] - 2026-07-30
+
+A harness is configured by what it CAN do, and every consumer reads the declaration.
+
+### Fixed
+
+- **A routed job could be handed to a harness with no posture for it — a live bug, not a
+  hypothetical.** `pick_offload_model` took the first candidate whose `level >= required` and
+  asked nothing about the harness. `RoutedJob::Title` requires `Basic` (pure text in, text out,
+  granted nothing because it needs nothing); a Codex model configured at `Read` clears
+  `>= Basic`, and Codex has no posture below `read-only` — so that title child would have been
+  spawned with a shell and the whole filesystem. `DietExtract` is the same shape. Both rungs of
+  the walk (the `offload_order` walk and the conversation's own model) now also require
+  `Harness::expresses(required)`.
+- **The containment record was a single file with a single `harness` field**, so there was no
+  path by which a second harness's record could ever be loaded: a Codex model was refused at
+  startup before its argv was compared to anything, and the refusal named the record's harness
+  as though there were one record to blame. `CONTAINMENT_RECORDS` is now a set, one file per
+  harness, and each model is held against the record for its own harness.
+- **`validate_toolset_argv` compared every row of every record against Claude Code's flags.**
+  Correct exactly while one harness existed; the moment the Codex record loaded, all four of
+  its rows would have mismatched. `capability_args` is now a `Harness` trait method and each
+  record is compared against its own harness's argv.
+- **`highest_passing_level` walked a ladder it assumed every harness had.** The walk is a
+  contiguous prefix from `Basic` up, so Codex's failing `basic` row broke it at the bottom and
+  returned `None` — refusing a `read` model whose every `read` row passes, with a message about
+  re-running a battery that would have changed nothing. It now skips the levels a harness does
+  not express, because the record cannot tell "failed" from "does not exist" and only the
+  harness knows which it is.
+
+### Added
+
+- **`Harness::expresses`** — whether a harness can express a capability as a posture distinct
+  from the ones below it, as opposed to whether we would like it to. `ClaudeCode` is true at
+  all three (its boundary is a tool allowlist, so "no tools at all" is a state it has); `Codex`
+  is false at `Basic` (its boundary is an OS sandbox mode, `--strict-config` proves
+  `tools.shell` is not a key that exists, and there is no lever that removes the shell — so its
+  weakest posture is byte-identical to `Read`). A model configured at a level its harness cannot
+  express is refused at startup with "cannot express", not "failed a gate": there is nothing to
+  go fix, and pointing an operator at a battery re-run would waste their evening.
+- **A build failure when a declaration and its record disagree**, in either direction. A harness
+  claiming a level must have a passing row for it; a harness disclaiming one must have no
+  passing row there. That is what stops `expresses` becoming a wish list of its own.
+- **`WORKSPACE_TOKEN` (`${WORKSPACE}`)**, so a host-varying scope can enter the record without a
+  host path entering it. Codex's `Write` posture scopes writes to the turn's own working
+  directory; the harness emits the token, the record commits the token, and the real directory
+  is filled in only where a child is spawned. The comparison therefore stays exactly what it
+  was — strict equality, no normalization layer — and `the_record_carries_no_absolute_host_paths`
+  now runs over every embedded record, forbids `/var/folders/`, `/tmp/` and `/private/` as well
+  as the home directories, and carries the converse: a row that scopes a writable root must name
+  it with the token. Both halves, or neither.
+- **`every_committed_record_is_exactly_what_the_writer_emits`.** The record's header is
+  machine-generated and carries the paragraphs an operator needs at 2am, so a hand-edited file
+  would keep a stale header until the next `--write` — and a hand-edited verdict could hide
+  behind reformatted whitespace. It is also what made the two new header paragraphs (what the
+  file-level `gate` key is, and what `${WORKSPACE}` means) safe to apply by re-rendering.
+
+### Changed
+
+- **The always-on half of `bridge/tests/containment.rs` runs over every embedded record**, not
+  `containment.toml` alone. A file that checked one harness while a second shipped unchecked
+  would read as though it checked them all.
+- **Nothing reads the file-level `gate` key, and the record now says so** rather than leaving a
+  reader to wonder. The question the startup gate asks is per level, not per file, and the two
+  genuinely differ: a harness that cannot express `basic` records a file-level `fail` while its
+  `read` and `write` rows vouch for exactly what they vouch for.
+
+Codex is still not registered: it is absent from `KNOWN_HARNESS_IDS`, `HarnessRegistry::for_models`
+cannot construct it, and no configured model can name it.
+
 ## [Bridge 0.46.0] - 2026-07-30
 
 The Codex harness exists, is probed, and is still not registered.

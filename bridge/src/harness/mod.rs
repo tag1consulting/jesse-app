@@ -27,7 +27,7 @@ pub use codex::*;
 /// b" and is the right comparison wherever two capabilities meet.
 ///
 /// Today the enum has ONE use: naming what a child is GRANTED, which each harness maps to
-/// the containment flags that enforce it (for Claude Code, [`capability_args`]). The
+/// the containment flags that enforce it (for Claude Code, [`claude_capability_args`]). The
 /// ordering is derived now anyway, because a capability is a general statement about
 /// ability rather than a per-call-site flag: a second use (a model declaring the CEILING it
 /// may be trusted with, taken against the grant) speaks the same vocabulary and needs the
@@ -50,11 +50,17 @@ pub use codex::*;
 pub enum Capability {
     /// No tools. Text in, text out.
     ///
-    /// This names what the CHILD is doing and carries no assumption about the model behind
-    /// it. A `Basic` child is a single-shot text transformation: parse an utterance into
-    /// JSON, check that JSON, write a short title. It is granted nothing because it needs
-    /// nothing — it returns text, and the BRIDGE validates that text and does any writing.
-    /// That holds whatever model or harness serves the child.
+    /// This names what the CHILD IS DOING, and nothing else. A `Basic` child is a
+    /// single-shot text transformation: parse an utterance into JSON, check that JSON, write
+    /// a short title. It is granted nothing because it needs nothing — it returns text, and
+    /// the BRIDGE validates that text and does any writing.
+    ///
+    /// Whether a given harness can actually EXPRESS that as a posture is a separate question
+    /// with a separate answer, and it is [`Harness::expresses`]. This doc comment used to end
+    /// "that holds whatever model or harness serves the child", which was false: Codex's
+    /// containment lever is an OS sandbox mode rather than a tool allowlist, there is no key
+    /// that removes its shell, and so its weakest posture is byte-identical to `Read`. A
+    /// level is not portable across harnesses merely because the enum is.
     Basic,
     /// Read and search. No writes, no exec.
     Read,
@@ -181,6 +187,43 @@ pub trait Harness: Send + Sync {
     /// — its terminal outcome has to be complete on its own.
     fn streams_text(&self) -> bool;
 
+    /// Whether this harness can actually express this capability, as a posture distinct from
+    /// the ones below it. NOT whether we would like it to.
+    ///
+    /// A harness is configured by what it CAN do. [`Capability`] is one vocabulary shared by
+    /// every spawn site, but the LEVERS behind it are per harness: a named tool allowlist for
+    /// Claude Code, an OS sandbox mode for Codex. A level whose lever a harness does not have
+    /// is not a level that harness fails — it is a level that harness does not HAVE, and the
+    /// difference matters to an operator, who has something to go fix in the first case and
+    /// nothing to go fix in the second.
+    ///
+    /// Two consumers read this and no third place may assume anything:
+    ///   * the startup gate ([`validate_model_config`]), which refuses a model configured at
+    ///     a level its harness cannot express;
+    ///   * [`crate::routing::pick_offload_model`], which must not hand a routed job to a
+    ///     harness that cannot give the job's child the posture the job requires.
+    ///
+    /// A declaration is not taken on trust: `the_containment_records_agree_with_what_each_harness_declares`
+    /// holds every embedded record against it, so a harness claiming a level its record has
+    /// no passing row for — or disclaiming one its record passes — is a BUILD failure. That
+    /// is what keeps this from becoming a wish list of its own.
+    fn expresses(&self, capability: Capability) -> bool;
+
+    /// The containment flags this harness turns a [`Capability`] into: the whole boundary,
+    /// in this harness's own flag vocabulary.
+    ///
+    /// On the trait rather than free-standing because the record is per harness and every row
+    /// in it must be compared against the argv ITS OWN harness would produce. When this lived
+    /// as one function, [`validate_toolset_argv`] compared every row of every record against
+    /// Claude Code's flags — which is correct exactly while one harness exists and silently
+    /// wrong the moment a second record loads.
+    ///
+    /// **A host-varying scope is named by [`WORKSPACE_TOKEN`], never by an absolute path.**
+    /// The recorded argv has to be identical on every machine or the startup comparison
+    /// cannot be strict equality; the token is substituted for the turn's real working
+    /// directory when the child is built, which is the only place that knows it.
+    fn capability_args(&self, cfg: &Config, capability: Capability) -> Vec<String>;
+
     /// Where this harness keeps its transcripts on disk, if it keeps any.
     ///
     /// `None` means it keeps none in a layout the bridge can read — its thread state is its
@@ -231,6 +274,21 @@ pub trait TurnParser: Send {
 /// The id of the built-in harness: the one the ambient default runs under, and the one
 /// that serves every turn today.
 pub const CLAUDE_CODE_ID: &str = "claude-code";
+
+/// The placeholder standing for the turn's own working directory inside a containment argv.
+///
+/// It exists so the committed record can name a host-varying scope WITHOUT naming a host
+/// path. `Harness::capability_args` emits it, the record therefore carries it, and the
+/// harness substitutes the real directory when it builds the child — the one place that
+/// knows which directory this turn runs in.
+///
+/// The alternative was normalizing at compare time, and it is worse: the comparison in
+/// [`validate_toolset_argv`] would stop being strict equality and would start quietly
+/// tolerating differences nobody chose. With a token, the comparison stays literal, and an
+/// untokenised absolute path in the record is still a loud boot failure on every machine but
+/// the one that recorded it — which is exactly the failure
+/// `the_record_carries_no_absolute_host_paths` exists to prevent at commit time instead.
+pub const WORKSPACE_TOKEN: &str = "${WORKSPACE}";
 
 /// Every harness this build knows how to construct, by id — the registry's vocabulary.
 ///
