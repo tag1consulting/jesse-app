@@ -3,6 +3,9 @@ use crate::*;
 mod claude_code;
 pub use claude_code::*;
 
+mod codex;
+pub use codex::*;
+
 // ---- The agent program, behind a trait --------------------------------------
 //
 // The bridge spawns a child agent program, reads its stdout, and turns what comes back

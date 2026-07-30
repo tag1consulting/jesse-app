@@ -13,6 +13,7 @@ DerivedData/
 target/
 # local agent settings (never commit; may hold machine-local config)
 .claude/
+.codex/
 # internal worklog — never shipped (R5: no personal infra in tracked files)
 STATUS.md
 

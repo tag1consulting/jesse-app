@@ -15,6 +15,43 @@ CI both run it). See the "Versioning" section of `bridge/README.md`.
 
 ## [Unreleased]
 
+## [Bridge 0.46.0] - 2026-07-30
+
+The Codex harness exists, is probed, and is still not registered.
+
+### Added
+
+- **A Codex harness implementation (`bridge/src/harness/codex.rs`), deliberately unregistered.**
+  It is not in `KNOWN_HARNESS_IDS` and `HarnessRegistry::for_models` cannot construct it, so
+  no configured model can name it and nothing spawns it. What it carries is the posture,
+  verified live against codex-cli 0.146.0 rather than read off the docs: a per-turn
+  `CODEX_HOME` seeded with a copy of the canonical credential (two concurrent turns each
+  answered from their own config and neither home acquired the other's state),
+  `--ignore-user-config` so an operator's `~/.codex/config.toml` cannot widen it,
+  `--ignore-rules` so vault content cannot influence what the child may execute, and `-c`
+  overrides for everything the harness decides. Its containment lever is an OS sandbox mode,
+  not a tool allowlist: `--strict-config` used as an oracle proves `tools.shell` is not a key
+  that exists, so the shell cannot be removed.
+- **`JESSE_CODEX_BIN`**, mirroring `JESSE_CLAUDE_BIN`: one binary variable per harness,
+  consulted only for a harness some configured model actually references.
+- **`bridge/containment-codex.toml`** — the Codex battery, recorded. It is a `gate = "fail"`
+  record and that is the honest result, not a defect: `basic` cannot be expressed on this
+  harness at all (see the harness doc comment), and `read` carries open read baselines
+  because a read-only sandbox is read-*only*, not read-*scoped*. Nothing loads this file yet;
+  `levelgate.rs` still embeds `containment.toml` alone.
+- **The battery can probe a harness the shipped registry does not carry** (`--harness <id>`,
+  and `BatteryOptions::harness`). That ordering is the point: the record is what decides
+  whether a harness may be armed, so the run has to be possible before the registration is.
+
+### Changed
+
+- **The probe trace is now built per harness.** `parse_codex_trace` maps Codex's JSONL onto
+  the same `RunTrace` the scoring rules read, and it reads STDERR as well as stdout — because
+  on this harness a sandbox-rejected native tool call emits no event at all, only an
+  `ERROR codex_core::tools::router: error=patch rejected…` line on the log channel. Scoring
+  that turn off stdout alone would record "the child never tried" for a child that tried and
+  was refused, which is the precise inversion the battery exists to prevent.
+
 ## [Bridge 0.45.0] - 2026-07-29 / [App 1.0 (86)]
 
 A turn on a model that answers all at once now looks like it is working, because it is.
