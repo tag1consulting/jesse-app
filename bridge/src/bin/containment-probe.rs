@@ -1,6 +1,6 @@
 //! `containment-probe` — the containment battery, as a merge gate.
 //!
-//! [`jesse_bridge::capability_args`] records what this codebase learned the hard way: an empty
+//! [`jesse_bridge::claude_capability_args`] records what this codebase learned the hard way: an empty
 //! `--allowedTools` was believed to mean "no tools", and a live probe against the pinned CLI
 //! disproved it. The conclusion drawn there is the rule this binary enforces — enumerated
 //! denial is not a boundary, and the acceptance gate is a live probe battery re-run against
@@ -34,6 +34,18 @@ use jesse_bridge::{
 /// means this repo's file no matter where it is run from — and so the next step (embedding the
 /// record with `include_str!` and validating config against it at startup) names one path.
 const RESULTS_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/containment.toml");
+const CODEX_RESULTS_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/containment-codex.toml");
+
+/// The record file for a harness. ONE FILE PER HARNESS, because a containment verdict
+/// describes a (harness, capability, MCP set) triple: nothing recorded for one harness says
+/// anything about another, and a single file with a `harness` field could only ever describe
+/// the last one probed.
+fn results_path(harness: &str) -> &'static str {
+    match harness {
+        jesse_bridge::CODEX_ID => CODEX_RESULTS_PATH,
+        _ => RESULTS_PATH,
+    }
+}
 
 fn usage() -> ! {
     eprintln!(
@@ -48,7 +60,8 @@ fn usage() -> ! {
          \x20 --rows <a/b,...>   only these rows (e.g. read/qmd,write/qmd). Never with --write.\n\
          \x20 --probes <id,...>  only these probes. Never with --write.\n\
          \x20 --timeout <secs>   per-probe timeout (default 300)\n\
-         \x20 --keep             keep the scratch trees for inspection\n"
+         \x20 --keep             keep the scratch trees for inspection\n\
+         \x20 --harness <id>     which harness to probe (claude-code | codex)\n"
     );
     std::process::exit(2)
 }
@@ -65,6 +78,10 @@ async fn main() {
             "--write" => write = true,
             "--show" => show = true,
             "--keep" => opts.keep_scratch = true,
+            "--harness" => {
+                i += 1;
+                opts.harness = args.get(i).cloned().unwrap_or_else(|| usage());
+            }
             "--rows" => {
                 i += 1;
                 let list = args.get(i).cloned().unwrap_or_else(|| usage());
@@ -91,13 +108,14 @@ async fn main() {
         i += 1;
     }
 
-    let recorded_text = std::fs::read_to_string(RESULTS_PATH).ok();
+    let results_path = results_path(&opts.harness);
+    let recorded_text = std::fs::read_to_string(results_path).ok();
 
     if show {
         match recorded_text {
             Some(text) => print_record(&text),
             None => {
-                eprintln!("containment-probe: no record at {RESULTS_PATH}");
+                eprintln!("containment-probe: no record at {results_path}");
                 std::process::exit(1);
             }
         }
@@ -115,15 +133,21 @@ async fn main() {
     }
 
     let cfg = Config::from_env();
+    let bin = if opts.harness == jesse_bridge::CODEX_ID {
+        &cfg.codex_bin
+    } else {
+        &cfg.claude_bin
+    };
     eprintln!(
-        "containment-probe: {} rows x {} probes against {} ({})",
+        "containment-probe: {} rows x {} probes against {} ({}) [harness {}]",
         opts.rows.len(),
         opts.probes
             .as_ref()
             .map(|p| p.len())
             .unwrap_or(jesse_bridge::PROBES.len()),
-        cfg.claude_bin,
-        jesse_bridge::probe_binary_version(&cfg.claude_bin)
+        bin,
+        jesse_bridge::probe_binary_version(bin),
+        opts.harness,
     );
 
     let outcome = match run_battery(&cfg, &opts).await {
@@ -182,11 +206,11 @@ async fn main() {
             }
         }
         let text = render_results(fresh);
-        if let Err(e) = std::fs::write(RESULTS_PATH, &text) {
-            eprintln!("containment-probe: could not write {RESULTS_PATH}: {e}");
+        if let Err(e) = std::fs::write(results_path, &text) {
+            eprintln!("containment-probe: could not write {results_path}: {e}");
             std::process::exit(1);
         }
-        eprintln!("\ncontainment-probe: recorded {RESULTS_PATH}");
+        eprintln!("\ncontainment-probe: recorded {results_path}");
         if !failures.is_empty() {
             eprintln!(
                 "containment-probe: the record says gate = fail — {} hard gate(s) are not met. \
@@ -201,7 +225,7 @@ async fn main() {
     // Gate mode: drift against the record, plus the record's own health.
     let Some(text) = recorded_text else {
         eprintln!(
-            "\ncontainment-probe: no record at {RESULTS_PATH} — nothing to compare against. \
+            "\ncontainment-probe: no record at {results_path} — nothing to compare against. \
              Re-run with --write to record this battery."
         );
         std::process::exit(1);
@@ -209,7 +233,7 @@ async fn main() {
     let recorded = match parse_results(&text) {
         Ok(r) => r,
         Err(e) => {
-            eprintln!("containment-probe: {RESULTS_PATH} does not parse: {e}");
+            eprintln!("containment-probe: {results_path} does not parse: {e}");
             std::process::exit(1);
         }
     };
@@ -261,7 +285,7 @@ fn print_record(text: &str) {
     let r = match parse_results(text) {
         Ok(r) => r,
         Err(e) => {
-            eprintln!("containment-probe: {RESULTS_PATH} does not parse: {e}");
+            eprintln!("containment-probe: the committed record does not parse: {e}");
             std::process::exit(1);
         }
     };

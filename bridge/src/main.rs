@@ -9,7 +9,7 @@ use jesse_bridge::{
     harness_default_bin, harnesses_in_use, is_bind_allowed, load_local_models,
     manual_pairing_lines, pairing_payload, show_token_opt_in, spawn_eviction_task,
     spawn_session_gc_task, start_health_prober, validate_model_config, AppState, Config,
-    CONTAINMENT_RECORD,
+    CONTAINMENT_RECORDS,
 };
 
 #[tokio::main]
@@ -39,7 +39,7 @@ async fn main() {
     // probed. A silently-ignored key would be a silent security downgrade, so nothing here
     // warns and continues. See `levelgate`.
     let declared = load_local_models(&cfg.home);
-    let errors = validate_model_config(&cfg, &declared, CONTAINMENT_RECORD);
+    let errors = validate_model_config(&cfg, &declared, CONTAINMENT_RECORDS);
     if !errors.is_empty() {
         eprintln!(
             "jesse-bridge: refusing to start — {} configuration problem(s):",

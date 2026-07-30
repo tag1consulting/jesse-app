@@ -16,6 +16,7 @@ pub(crate) fn test_config() -> Config {
         bind: "127.0.0.1".to_string(),
         port: 8765,
         claude_bin: "claude".to_string(),
+        codex_bin: "codex".to_string(),
         timeout_secs: 1800,
         allowed_tools: DEFAULT_ALLOWED_TOOLS.to_string(),
         disallowed_tools: DEFAULT_DISALLOWED_TOOLS.to_string(),

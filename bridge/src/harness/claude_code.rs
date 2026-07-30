@@ -57,6 +57,20 @@ impl Harness for ClaudeCode {
         true
     }
 
+    /// TRUE AT EVERY LEVEL. Claude Code's boundary is a named tool allowlist with path
+    /// scopes, so each of the three is a posture it genuinely has and they are genuinely
+    /// distinct: `Basic` is `--tools ""` (no toolset at all at the root), `Read` is a
+    /// read-only root allowlist with `Read(./**)` scoping, `Write` is the configured lists
+    /// with the full built-in toolset standing. "No tools at all" is a state this harness can
+    /// be put in, which is what makes `Basic` real here and unreachable on Codex.
+    fn expresses(&self, _capability: Capability) -> bool {
+        true
+    }
+
+    fn capability_args(&self, cfg: &Config, capability: Capability) -> Vec<String> {
+        claude_capability_args(cfg, capability)
+    }
+
     /// `~/.claude/projects/<escaped-vault>` — the layout the session code used to hardcode.
     fn transcript_dir(&self, cfg: &Config) -> Option<PathBuf> {
         Some(vault_sessions_dir(&cfg.home, &cfg.vault))
@@ -340,7 +354,7 @@ pub const MAIN_CHILD_MCP_CONFIG: &str =
 pub const EMPTY_MCP_CONFIG: &str = r#"{"mcpServers":{}}"#;
 
 /// The ROOT MCP boundary every spawn site carries: load ONLY the servers named in
-/// `config`. Deliberately separate from [`capability_args`] — the server set is a per
+/// `config`. Deliberately separate from [`Harness::capability_args`] — the server set is a per
 /// call site choice, not something a capability implies (see [`TurnRequest::mcp_config`]).
 /// The main turn REQUIRES qmd ([`MAIN_CHILD_MCP_CONFIG`]) while the vault-QA child degrades
 /// to no servers ([`EMPTY_MCP_CONFIG`]), and folding that into `Read` would silently take
@@ -429,7 +443,7 @@ pub const READ_DISALLOWED_TOOLS: &str =
     "Bash,Write,Edit,NotebookEdit,WebFetch,WebSearch,Task,Agent,ToolSearch,Workflow,TodoWrite,Skill";
 
 /// Tools DENIED to a [`Capability::Basic`] child, as belt-and-suspenders BEHIND the real
-/// boundary (`--tools ""`, see [`capability_args`]). Beyond the mutation / execution /
+/// boundary (`--tools ""`, see [`Harness::capability_args`]). Beyond the mutation / execution /
 /// network classes it also names the read/search built-ins and the orchestration tools
 /// that an empty-`--allowedTools` posture left reachable: `Glob`, `Grep`, `Read`,
 /// `ToolSearch`, `Workflow`, `Agent`, `TodoWrite`, plus `Skill` (loads skill instruction
@@ -448,10 +462,16 @@ pub const READ_DISALLOWED_TOOLS: &str =
 pub const BASIC_DISALLOWED_TOOLS: &str =
     "Bash,Write,Edit,NotebookEdit,WebFetch,WebSearch,Task,Glob,Grep,Read,ToolSearch,Workflow,Agent,TodoWrite,Skill";
 
-/// Map a [`Capability`] to the TOOLSET argument vector that enforces it. THE one function
-/// every spawn site funnels through, so the posture for a capability is stated once and
-/// cannot drift between call sites. The MCP server set ([`mcp_args`]), the working
-/// directory, and any env override stay with the caller.
+/// Map a [`Capability`] to CLAUDE CODE's toolset argument vector. Reached through
+/// [`Harness::capability_args`], which is how every consumer asks — a free function here and
+/// [`codex_capability_args`] there, each a pure statement of one harness's flags that can be
+/// unit-tested without a registry. The MCP server set ([`mcp_args`]), the working directory,
+/// and any env override stay with the caller.
+///
+/// This argv is host-independent as written: every path scope is cwd-relative (`Read(./**)`),
+/// so no [`WORKSPACE_TOKEN`] appears in it. That is a property of Claude Code's scopes, not a
+/// rule this function follows — the rule is that a host-varying scope must be tokenised, and
+/// this harness happens to have none.
 ///
 /// # Why these exact flags
 ///
@@ -487,7 +507,7 @@ pub const BASIC_DISALLOWED_TOOLS: &str =
 ///     `--max-turns` flag (verified via `--help`). The children are single-shot by
 ///     construction, but the CLI offers no turn bound to enforce it. (`--max-budget-usd`
 ///     exists but bounds cost, not agentic turns, and is not a containment control.)
-pub fn capability_args(cfg: &Config, capability: Capability) -> Vec<String> {
+pub fn claude_capability_args(cfg: &Config, capability: Capability) -> Vec<String> {
     match capability {
         Capability::Basic => vec![
             // ROOT boundary: disable the entire built-in toolset (deny-by-default).
@@ -535,7 +555,7 @@ pub fn capability_args(cfg: &Config, capability: Capability) -> Vec<String> {
 ///
 /// A `session_id` adds `--resume <id>` to continue a thread.
 ///
-/// `capability` names what this child is granted and [`capability_args`] turns it into
+/// `capability` names what this child is granted and [`Harness::capability_args`] turns it into
 /// the toolset flags; `mcp_config` names the servers it may load. A main turn derives its
 /// capability from the active model via [`turn_capability`] and passes
 /// [`main_mcp_config`]; the title one-shot passes its own. The boundary is the TOOLSET,
@@ -567,7 +587,7 @@ pub fn build_claude_args(
     // ROOT MCP boundary, then the capability's toolset. Every spawn site assembles in
     // this order, which is what lets one builder serve all of them.
     args.extend(mcp_args(mcp_config));
-    args.extend(capability_args(cfg, capability));
+    args.extend(claude_capability_args(cfg, capability));
     if let Some(sid) = session_id {
         // A synthetic `local-<hex>` id (context carry) names a bridge-minted ledger
         // thread with NO real claude session, so it must NEVER be resumed — the CLI
@@ -604,7 +624,7 @@ pub fn build_claude_command(
 /// `stream-json` + `--permission-mode default` posture as every other child, contained at
 /// [`Capability::Basic`] with NO MCP servers — the extract and verify children are
 /// single-shot, text-in / JSON-text-out, so they are granted nothing. Why `Basic` is built
-/// the way it is (and what live validation disproved) is documented on [`capability_args`];
+/// the way it is (and what live validation disproved) is documented on [`Harness::capability_args`];
 /// why the cwd is the neutral scratch base is on [`diet_child_request`]. Sets NO env
 /// overrides (callers layer `apply_diet_env` for extract, nothing for the ambient verify).
 pub fn build_diet_child_command(cfg: &Config, prompt: &str) -> Command {
@@ -616,7 +636,7 @@ pub fn build_diet_child_command(cfg: &Config, prompt: &str) -> Command {
 /// [`Capability::Read`] with the child's own MCP server set, in the vault. The child can
 /// read the vault and answer a self-referential question from it but cannot write, execute,
 /// or reach the network; the read-only root allowlist plus strict MCP are the boundary (see
-/// [`capability_args`] and [`vaultqa_child_request`]). Sets NO env override (the caller
+/// [`Harness::capability_args`] and [`vaultqa_child_request`]). Sets NO env override (the caller
 /// layers `apply_vaultqa_env`), and never passes `--resume`.
 pub fn build_vaultqa_child_command(cfg: &Config, prompt: &str) -> Command {
     let ambient = ActiveModel::ambient();
@@ -1551,7 +1571,7 @@ mod tests {
         // the comparison is on the toolset the capability owns.
         let cfg = test_config();
         assert_eq!(
-            capability_args(&cfg, Capability::Read),
+            claude_capability_args(&cfg, Capability::Read),
             vec![
                 "--tools".to_string(),
                 "Read,Grep,Glob".to_string(),
@@ -1578,7 +1598,7 @@ mod tests {
     }
 
     /// THE GOLDEN. The exact argv each of the five spawn sites produces, captured from the
-    /// four separate builders that preceded the single `capability_args`. Every future
+    /// four separate builders that preceded the single `claude_capability_args`. Every future
     /// posture change has to edit a literal here, which is the point: a containment change
     /// is never incidental.
     ///

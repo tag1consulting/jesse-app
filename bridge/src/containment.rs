@@ -15,7 +15,7 @@ use crate::*;
 //     not enable. None of it answers a turn, so none of it belongs in the bridge that
 //     does.
 //
-// [`capability_args`] documents what this codebase learned the hard way: an empty
+// [`Harness::capability_args`] documents what this codebase learned the hard way: an empty
 // `--allowedTools` was BELIEVED to mean "no tools", and a live probe against the pinned CLI
 // DISPROVED it — a headless child still reached the search built-ins, still loaded MCP
 // servers on demand through `ToolSearch`, and still made a live network request. The rule
@@ -351,7 +351,7 @@ pub struct RowResult {
     /// loaded, not what we asked for. Informational; not compared.
     #[serde(default)]
     pub mcp_servers: Vec<String>,
-    /// The exact toolset argv this row was probed with ([`capability_args`]). Recorded so a
+    /// The exact toolset argv this row was probed with ([`Harness::capability_args`]). Recorded so a
     /// startup gate can check the config it is about to run against the posture that was
     /// actually probed, rather than trusting the row label.
     #[serde(default)]
@@ -390,7 +390,14 @@ pub struct BatteryResults {
     pub bridge_version: String,
     /// `YYYY-MM-DD` the record was taken.
     pub recorded: String,
-    /// `pass` only when every row passes.
+    /// `pass` only when every row passes — a HUMAN-FACING SUMMARY, read by nothing.
+    ///
+    /// Deliberately not wired into the startup gate, and the record's own header says so. The
+    /// question the gate asks is per LEVEL, not per file ([`highest_passing_level`]), and the
+    /// two answers genuinely differ: a harness that cannot express `basic` records a failing
+    /// `basic` row and so a file-level `fail`, while its `read` and `write` rows vouch for
+    /// exactly what they vouch for. Refusing the whole record on this key would refuse levels
+    /// that passed, on the strength of a level that was never available.
     pub gate: String,
     #[serde(default, rename = "row")]
     pub rows: Vec<RowResult>,
@@ -538,6 +545,23 @@ pub fn render_results(r: &BatteryResults) -> String {
          # here or it is not a combination this project ships. Enumerated denial is not a\n\
          # boundary (see `capability_args`), so the boundary is proven by attempting the escape\n\
          # and checking out of band whether it worked — never by asking the child what it did.\n\
+         #\n\
+         # ONE FILE PER HARNESS. A containment verdict describes a (harness, capability, MCP\n\
+         # set) triple, and nothing recorded for one harness says anything about another —\n\
+         # the levels are one vocabulary but the levers behind them are not. The `harness`\n\
+         # key below names whose record this is, and the build embeds one file per harness.\n\
+         #\n\
+         # THE FILE-LEVEL `gate` KEY IS A HUMAN-FACING SUMMARY. Nothing reads it. The startup\n\
+         # gate walks the ROWS (`highest_passing_level`): a level is grantable when every MCP\n\
+         # set recorded at it met every hard gate, so a record whose overall gate is `fail`\n\
+         # can still vouch for the levels that did pass — which is the case for a harness that\n\
+         # cannot express `basic` at all. Do not wire this key without first deciding what a\n\
+         # harness failing one level and passing another is supposed to mean.\n\
+         #\n\
+         # ${WORKSPACE} IN A `toolset_args` ENTRY stands for the turn's own working directory,\n\
+         # substituted by the harness when it builds a child. Host-varying scopes are named by\n\
+         # token because the startup comparison is STRICT EQUALITY with no normalization: an\n\
+         # absolute path recorded here would fail every deployment but the one that wrote it.\n\
          #\n\
          # WHEN TO RE-RUN. On every bump of `binary_version` (the pinned CLI), on every change\n\
          # to the containment posture (`capability_args`, the tool lists, the MCP server sets),\n\
