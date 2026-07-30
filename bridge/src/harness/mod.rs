@@ -435,16 +435,22 @@ mod tests {
 
     /// EVERY REGISTERED HARNESS STREAMS — and this test exists to fail the day one does not.
     ///
-    /// `streams_text` is plumbed end to end (the harness derives it, `GET /jesse/models`
-    /// exposes it per model, the clients decode it), but NO client renders the whole-answer
-    /// case yet: a harness that returns its answer in one terminal event would show an empty
-    /// bubble until the turn finished. Rather than leave that as an implicit assumption
-    /// waiting to be discovered by a user, it is made load-bearing and noisy here.
+    /// `streams_text` is plumbed end to end: the harness derives it, `GET /jesse/models`
+    /// exposes it per model, the clients decode it, and the iOS client now RENDERS the
+    /// whole-answer case — a turn on a non-streaming model shows a spinner rather than the
+    /// empty bubble it used to show until the terminal event landed.
+    ///
+    /// So the spinner is no longer what's missing. What is still missing is TOOL ACTIVITY:
+    /// there is no live view of what a whole-answer harness is doing mid-turn, because
+    /// nothing yet defines what event stream such a harness emits. That contract cannot be
+    /// designed honestly without a real non-streaming harness to pin it against — inventing
+    /// it here would force the first real one to match a guess made without it.
     ///
     /// If you are reading this because the assertion failed: you registered a harness that
-    /// does not stream, and the client-side rendering work (tool activity + a spinner in
-    /// place of the empty bubble, keyed off `ModelInfo.streamsText`) is now required before
-    /// it can ship. Do that work rather than relaxing this test.
+    /// does not stream. The spinner will render its turns, so this is no longer about an
+    /// empty bubble. What you owe first is a decision about the event stream your harness
+    /// emits mid-turn, and the client-side tool-activity rendering that consumes it. Make
+    /// that decision deliberately, with the harness in hand, rather than relaxing this test.
     ///
     /// Same pattern, and the same reason, as `the_record_carries_no_absolute_host_paths` in
     /// `levelgate`: an assumption the code depends on should break the build, not the user.
@@ -454,9 +460,10 @@ mod tests {
         for h in reg.ordered() {
             assert!(
                 h.streams_text(),
-                "harness '{}' does not stream, but no client renders the whole-answer case \
-                 yet — implement the spinner/tool-activity rendering keyed off \
-                 `ModelInfo.streamsText` before registering it",
+                "harness '{}' does not stream. Its turns will render the spinner keyed off \
+                 `ModelInfo.streamsText`, but there is still no tool-activity view for a \
+                 whole-answer turn, and no definition of the mid-turn event stream one \
+                 emits — decide that with the harness in hand before registering it",
                 h.id()
             );
         }
