@@ -44,6 +44,18 @@ A harness is configured by what it CAN do, and every consumer reads the declarat
   re-running a battery that would have changed nothing. It now skips the levels a harness does
   not express, because the record cannot tell "failed" from "does not exist" and only the
   harness knows which it is.
+- **A level-gate test set a removed role env var in the real process environment**, and
+  `cargo test` runs a module's tests as threads in ONE process — so
+  `a_removed_role_env_var_still_set_is_refused_and_names_offload_order` exported
+  `JESSE_VAULTQA_MODEL` into whatever sibling test happened to be inside `validate_model_config`
+  at that moment, which reported a global error into that test's result. Latent since the check
+  was written; it landed the moment a test above asserted `errors.is_empty()`, and CI failed on
+  `a_level_the_harness_cannot_express_is_refused_in_those_words` with a message about an env var
+  that test never mentions. The gate's step 5 now reads its environment through a supplied
+  lookup (`validate_model_config_with_env`), so the test that exercises it injects the var
+  instead of exporting it and no test mutates process-wide state. Serializing on `ENV_LOCK`
+  would have needed every READER to take the lock too, leaving the next test added to the module
+  free to reopen the race silently.
 
 ### Added
 

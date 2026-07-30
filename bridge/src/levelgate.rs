@@ -188,6 +188,28 @@ pub fn validate_model_config(
     declared: &[ModelToml],
     records: &[(&str, &str)],
 ) -> Vec<ConfigError> {
+    validate_model_config_with_env(cfg, declared, records, &|var| std::env::var(var).ok())
+}
+
+/// [`validate_model_config`], with the environment step 5 reads supplied rather than read from
+/// the process.
+///
+/// The seam exists for ONE reason and it is not configurability: `cargo test` runs a module's
+/// tests as threads in a SINGLE process, so a test that set a removed role var for real set it
+/// for every sibling test running beside it. The gate then reported a global error into some
+/// other test's `errors` vec, and whichever test asserted `errors.is_empty()` failed with a
+/// message about an env var it had never heard of. Serializing on the shared `ENV_LOCK` would
+/// not have fixed it either: the mutating test and the READERS would both have to hold the
+/// lock, so any future test added to this module without it silently reopens the race.
+///
+/// Production has exactly one caller and it passes the real environment. Nothing else should
+/// call this to inject a fake env into a running bridge.
+pub fn validate_model_config_with_env(
+    cfg: &Config,
+    declared: &[ModelToml],
+    records: &[(&str, &str)],
+    env: &dyn Fn(&str) -> Option<String>,
+) -> Vec<ConfigError> {
     let mut errors = Vec::new();
 
     // 1. A `default_writes` key anywhere in the models array. Removed, and silently ignored
@@ -330,7 +352,7 @@ pub fn validate_model_config(
 
     // 5. A removed role-backend env var still set in the environment.
     for var in REMOVED_ROLE_ENV_VARS {
-        if std::env::var(var).map(|v| !v.trim().is_empty()).unwrap_or(false) {
+        if env(var).map(|v| !v.trim().is_empty()).unwrap_or(false) {
             errors.push(ConfigError::global(format!(
                 "{var} is set, but the per-role backends were removed. One ordered \
                  `offload_order` list in the config file replaces all of them; a job now \
@@ -447,6 +469,27 @@ mod tests {
     use super::*;
     use crate::testutil::*;
 
+    /// The gate, held against a KNOWN-EMPTY environment. Every test here goes through this
+    /// rather than [`validate_model_config`], and that is the structural half of the fix for
+    /// the flake described on [`validate_model_config_with_env`]: step 5 of the gate reads the
+    /// environment, so a test asserting `errors.is_empty()` against the real process env is
+    /// asserting something about the machine it runs on. That made it fail for a sibling
+    /// test's exported var, and it would equally fail for a developer with a leftover
+    /// `JESSE_DIET_MODEL` in their shell — a dozen level assertions breaking with a message
+    /// about an env var none of them mentions. Reading through a fixed empty env means no
+    /// future env mutation anywhere in the process can reach these assertions.
+    ///
+    /// The one test that is ABOUT step 5 supplies its own env. What that leaves uncovered is
+    /// `validate_model_config`'s one-line real-env closure, which is the point: it is the only
+    /// part that cannot be tested without depending on the environment.
+    fn validate(
+        cfg: &Config,
+        declared: &[ModelToml],
+        records: &[(&str, &str)],
+    ) -> Vec<ConfigError> {
+        validate_model_config_with_env(cfg, declared, records, &|_| None)
+    }
+
     fn record() -> BatteryResults {
         parse_results(claude_record()).expect("the committed record must parse")
     }
@@ -511,7 +554,7 @@ mod tests {
     #[test]
     fn a_clean_config_starts() {
         let cfg = test_config();
-        let errors = validate_model_config(&cfg, &[], &claude_only(claude_record()));
+        let errors = validate(&cfg, &[], &claude_only(claude_record()));
         assert!(errors.is_empty(), "{errors:?}");
     }
 
@@ -522,7 +565,7 @@ mod tests {
             default_writes: Some(true),
             ..ModelToml::default()
         }];
-        let errors = validate_model_config(&test_config(), &decl, &claude_only(claude_record()));
+        let errors = validate(&test_config(), &decl, &claude_only(claude_record()));
         let e = errors.first().expect("a leftover default_writes must be refused");
         assert_eq!(e.model.as_deref(), Some("glm-5.2"));
         assert!(e.message.contains("`level`"), "{e}");
@@ -536,7 +579,7 @@ mod tests {
             level: Some("wrote".to_string()),
             ..ModelToml::default()
         }];
-        let errors = validate_model_config(&test_config(), &decl, &claude_only(claude_record()));
+        let errors = validate(&test_config(), &decl, &claude_only(claude_record()));
         assert!(
             errors.iter().any(|e| e.message.contains("unknown level 'wrote'")),
             "{errors:?}"
@@ -546,7 +589,7 @@ mod tests {
     #[test]
     fn an_unregistered_harness_is_refused_and_names_the_model() {
         let cfg = cfg_with_model("codex-mini", "codex", Capability::Read);
-        let errors = validate_model_config(&cfg, &[], &claude_only(claude_record()));
+        let errors = validate(&cfg, &[], &claude_only(claude_record()));
         let e = errors
             .iter()
             .find(|e| e.model.as_deref() == Some("codex-mini"))
@@ -576,7 +619,7 @@ mod tests {
             Some(Capability::Read)
         );
         let cfg = cfg_with_model("bold", CLAUDE_CODE_ID, Capability::Write);
-        let errors = validate_model_config(&cfg, &[], &claude_only(&text));
+        let errors = validate(&cfg, &[], &claude_only(&text));
         let e = errors
             .iter()
             .find(|e| e.model.as_deref() == Some("bold"))
@@ -627,12 +670,12 @@ mod tests {
 
     #[test]
     fn a_record_that_does_not_parse_fails_closed() {
-        let errors = validate_model_config(&test_config(), &[], &claude_only("this is not toml {{{"));
+        let errors = validate(&test_config(), &[], &claude_only("this is not toml {{{"));
         assert_eq!(errors.len(), 1, "{errors:?}");
         assert!(errors[0].message.contains("does not parse"), "{errors:?}");
         // …and a foreign schema is the same failure, not a permissive read.
         let bumped = claude_record().replace("schema = 1", "schema = 99");
-        let errors = validate_model_config(&test_config(), &[], &claude_only(&bumped));
+        let errors = validate(&test_config(), &[], &claude_only(&bumped));
         assert!(!errors.is_empty());
     }
 
@@ -729,7 +772,7 @@ mod tests {
     #[test]
     fn a_level_the_harness_cannot_express_is_refused_in_those_words() {
         let cfg = cfg_with_codex_model("codex-mini", Capability::Basic);
-        let errors = validate_model_config(&cfg, &[], CONTAINMENT_RECORDS);
+        let errors = validate(&cfg, &[], CONTAINMENT_RECORDS);
         let e = errors
             .iter()
             .find(|e| e.model.as_deref() == Some("codex-mini"))
@@ -738,7 +781,7 @@ mod tests {
         assert!(!e.message.contains("passing containment battery"), "{e}");
         // …and the level it DOES express starts cleanly.
         let cfg = cfg_with_codex_model("codex-mini", Capability::Read);
-        let errors = validate_model_config(&cfg, &[], CONTAINMENT_RECORDS);
+        let errors = validate(&cfg, &[], CONTAINMENT_RECORDS);
         assert!(errors.is_empty(), "{errors:?}");
     }
 
@@ -749,7 +792,7 @@ mod tests {
     fn a_harness_with_no_embedded_record_says_exactly_that() {
         let cfg = cfg_with_codex_model("codex-mini", Capability::Read);
         let claude_only = &CONTAINMENT_RECORDS[..1];
-        let errors = validate_model_config(&cfg, &[], claude_only);
+        let errors = validate(&cfg, &[], claude_only);
         let e = errors
             .iter()
             .find(|e| e.model.as_deref() == Some("codex-mini"))
@@ -762,7 +805,7 @@ mod tests {
     #[test]
     fn a_record_embedded_under_the_wrong_harness_is_refused() {
         let mismatched = &[(CODEX_ID, claude_record())][..];
-        let errors = validate_model_config(&test_config(), &[], mismatched);
+        let errors = validate(&test_config(), &[], mismatched);
         assert!(
             errors.iter().any(|e| e.message.contains("declares itself")),
             "{errors:?}"
@@ -834,18 +877,39 @@ mod tests {
         }
     }
 
+    /// Through the `_with_env` seam, NOT by calling `std::env::set_var`: this module's other
+    /// tests read the same environment through the same gate, and cargo runs them as threads
+    /// in one process, so a real `set_var` here landed a global error in a sibling test's
+    /// result and failed its `errors.is_empty()` assertion. See
+    /// [`validate_model_config_with_env`]. A future test here must set env the same way.
     #[test]
     fn a_removed_role_env_var_still_set_is_refused_and_names_offload_order() {
         let var = "JESSE_VAULTQA_MODEL";
-        std::env::set_var(var, "local-oss");
-        let errors = validate_model_config(&test_config(), &[], &claude_only(claude_record()));
-        std::env::remove_var(var);
+        let errors = validate_model_config_with_env(
+            &test_config(),
+            &[],
+            &claude_only(claude_record()),
+            &|v| (v == var).then(|| "local-oss".to_string()),
+        );
         let e = errors
             .iter()
             .find(|e| e.message.contains(var))
             .expect("a removed role env var must be refused");
         assert!(e.message.contains("offload_order"), "{e}");
         assert!(e.model.is_none(), "it belongs to no single model");
+    }
+
+    /// A var that is set but EMPTY (or whitespace) is not a configured backend, so it must not
+    /// refuse startup — the same distinction `from_env` draws everywhere else.
+    #[test]
+    fn a_removed_role_env_var_set_to_whitespace_is_not_refused() {
+        let errors = validate_model_config_with_env(
+            &test_config(),
+            &[],
+            &claude_only(claude_record()),
+            &|_| Some("   ".to_string()),
+        );
+        assert!(errors.is_empty(), "{errors:?}");
     }
 
     #[test]
