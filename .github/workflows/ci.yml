@@ -22,7 +22,13 @@ jobs:
       run:
         working-directory: bridge
     steps:
+      # Full history, NOT the default depth-1: scripts/version-guard.sh derives its
+      # diff base from the merge base with origin/main, and at depth 1 there is no
+      # history to derive it from. That is not a hypothetical — the guard silently
+      # skipped every CI run it was ever part of, logging "no diff base" and passing.
       - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
 
       - name: Install Rust toolchain
         run: rustup component add clippy llvm-tools-preview

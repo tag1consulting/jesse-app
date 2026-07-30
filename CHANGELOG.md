@@ -36,6 +36,26 @@ A turn on a model that answers all at once now looks like it is working, because
   wire default. Both staleness directions are benign: a stale `false` shows a row that
   disappears the moment text arrives, a stale `true` is exactly the previous behaviour.
 
+### Fixed
+
+- **`version-guard.sh` never ran in CI, and reported success anyway.** `ci-guards.sh`
+  invoked it with no base, so it fell back to `HEAD~1`; `actions/checkout` defaults to
+  `fetch-depth: 1`, so that commit was not in the checkout; so its "shallow checkout —
+  skipping" branch fired on every run and the job printed "all guards passed". Verified
+  across three runs and both event types (the PR run for #44, the push runs for #42 and
+  #43): all three logged `no diff base (HEAD~1) — skipping`. The mandatory bump rule was
+  enforced only by the pre-push hook and by hand. Now: the base is the merge base with
+  `origin/main` (the right question for a branch of any length, where `HEAD~1` checked
+  only its final commit); on the integration branch itself it is `HEAD~1`, because the
+  merge base with oneself is `HEAD` and would compare a commit against itself; an
+  explicit `VERSION_GUARD_BASE` is still honoured but REJECTED when behind the upstream,
+  which is a false pass that already happened against a stale local `main`; a missing
+  upstream is fetched once and then fails loudly rather than skipping. The only surviving
+  skip is a genuine initial commit, and it says so distinctly. A self-check asserts the
+  resolved base is an ancestor of `HEAD`, so no future edit can quietly restore the
+  vacuum. `ci.yml`'s bridge job now checks out with `fetch-depth: 0`, without which none
+  of this resolves.
+
 ### Changed
 
 - **The harness guard's message now names what is actually missing.** It told the next reader

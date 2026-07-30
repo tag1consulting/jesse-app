@@ -25,16 +25,94 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 
-BASE="${VERSION_GUARD_BASE:-HEAD~1}"
-
-# No parent to compare against (initial commit, shallow clone): nothing to guard.
-if ! git rev-parse --verify --quiet "${BASE}^{commit}" >/dev/null 2>&1; then
-  echo "version-guard: no diff base (${BASE}) — skipping (initial commit or shallow checkout)."
-  exit 0
-fi
-
 fail=0
 flag() { echo "VERSION GUARD FAILED: $1" >&2; fail=1; }
+
+# --- Base resolution. This used to be `HEAD~1` with a clean skip when that commit
+#     was absent, and the consequence was that this guard NEVER RAN IN CI: the
+#     workflow checks out at depth 1, so `HEAD~1` is not in the repository and every
+#     single run logged "no diff base — skipping" and then "all guards passed". A
+#     guard that reports success for a check it did not perform is worse than no
+#     guard, so the skip is gone and the base is derived from the integration branch
+#     instead.
+#
+#     `HEAD~1` was also the wrong question. What the rule means is "compared with
+#     what is on main", which for a feature branch of any length is the MERGE BASE,
+#     not the previous commit — otherwise only the last commit of a branch is
+#     checked. The needed history is why CI must check out with `fetch-depth: 0`.
+UPSTREAM="${VERSION_GUARD_UPSTREAM:-origin/main}"
+
+if [ -n "${VERSION_GUARD_BASE:-}" ]; then
+  # An explicit base (the pre-push hook passes the upstream range's base; a human
+  # passes `main`). Honour it, but never trust it blindly: a base that is BEHIND the
+  # upstream measures the wrong range and can report a pass for versions that were
+  # already bumped by someone else's merge. That is not hypothetical — a local `main`
+  # left stale by days of merges elsewhere produced exactly that false pass.
+  BASE="$VERSION_GUARD_BASE"
+  if ! git rev-parse --verify --quiet "${BASE}^{commit}" >/dev/null 2>&1; then
+    flag "VERSION_GUARD_BASE=${BASE} is not a commit in this repository."
+    echo "version-guard: enforcement failed (bad explicit base)." >&2
+    exit 1
+  fi
+  if git rev-parse --verify --quiet "${UPSTREAM}^{commit}" >/dev/null 2>&1 \
+     && ! git merge-base --is-ancestor "$UPSTREAM" "$BASE"; then
+    behind="$(git rev-list --count "${BASE}..${UPSTREAM}")"
+    flag "VERSION_GUARD_BASE=${BASE} is ${behind} commit(s) behind ${UPSTREAM} — the
+  comparison would measure the wrong range. Run 'git fetch origin' and use
+  ${UPSTREAM} (or omit VERSION_GUARD_BASE entirely and let it resolve)."
+    echo "version-guard: enforcement failed (stale explicit base)." >&2
+    exit 1
+  fi
+else
+  # The upstream ref may be absent in a fresh CI checkout. Try ONCE to fetch it
+  # before giving up, so the guard does not depend on how the workflow happens to be
+  # configured — `fetch-depth: 0` makes this a no-op, and this makes a future
+  # regression of that setting non-fatal.
+  if ! git rev-parse --verify --quiet "${UPSTREAM}^{commit}" >/dev/null 2>&1; then
+    case "$UPSTREAM" in
+      */*) git fetch --quiet --no-tags "${UPSTREAM%%/*}" "${UPSTREAM#*/}" 2>/dev/null || true ;;
+    esac
+  fi
+fi
+
+if [ -z "${BASE:-}" ]; then
+  if ! git rev-parse --verify --quiet "${UPSTREAM}^{commit}" >/dev/null 2>&1; then
+    if [ "$(git rev-list --count HEAD)" = "1" ]; then
+      # The genuine initial commit: nothing to compare against, and saying so
+      # distinctly matters — this is the ONLY remaining skip.
+      echo "version-guard: initial commit (no parent) — nothing to compare."
+      exit 0
+    fi
+    flag "cannot resolve a diff base: ${UPSTREAM} is missing, and fetching it failed.
+  In CI this means the checkout has no history — set 'fetch-depth: 0' on
+  actions/checkout. Locally, run 'git fetch origin'. Refusing to pass vacuously."
+    echo "version-guard: enforcement failed (no resolvable base)." >&2
+    exit 1
+  fi
+  if [ "$(git rev-parse "$UPSTREAM")" = "$(git rev-parse HEAD)" ]; then
+    # We ARE the integration branch (a push to main, or a local main). The merge base
+    # with ourselves is HEAD, which would compare a commit against itself and pass
+    # vacuously — the very shape being removed here. The meaningful base is the
+    # previous commit on the branch.
+    if ! BASE="$(git rev-parse --verify --quiet HEAD~1)"; then
+      echo "version-guard: initial commit (no parent) — nothing to compare."
+      exit 0
+    fi
+  else
+    BASE="$(git merge-base "$UPSTREAM" HEAD)"
+  fi
+fi
+
+# Self-check the resolved base before trusting any comparison against it, in the
+# spirit of ci-guards.sh's matcher self-check: a base that is not an ancestor of HEAD
+# makes every `git diff BASE HEAD` below meaningless.
+if ! git merge-base --is-ancestor "$BASE" HEAD; then
+  flag "resolved base $(git rev-parse --short "$BASE") is not an ancestor of HEAD —
+  the diffs below would not describe this branch's own changes."
+  echo "version-guard: enforcement failed (base is not an ancestor)." >&2
+  exit 1
+fi
+echo "version-guard: base $(git rev-parse --short "$BASE") (from ${VERSION_GUARD_BASE:+VERSION_GUARD_BASE=$VERSION_GUARD_BASE}${VERSION_GUARD_BASE:-merge-base with $UPSTREAM})."
 
 changed_under() {
   # Files changed between BASE and HEAD under a given pathspec (may be empty).
