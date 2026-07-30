@@ -141,13 +141,15 @@ pub struct Codex;
 ///
 /// The one thing it must never become is `--dangerously-bypass-approvals-and-sandbox`,
 /// which removes the sandbox entirely. Nothing here constructs that flag.
-pub fn codex_capability_args(capability: Capability, cwd: &Path) -> Vec<String> {
+pub fn codex_capability_args(capability: Capability) -> Vec<String> {
     let mut args: Vec<String> = Vec::new();
 
     match capability {
         // See the doc comment: `Basic` is UNREACHABLE on this harness and deliberately
         // falls through to the `Read` posture rather than claiming a containment Codex
-        // cannot implement. The battery records the consequence.
+        // cannot implement. `Codex::expresses` is what says so out loud; this arm exists so
+        // that a caller who asks anyway gets the strictest posture Codex HAS rather than a
+        // panic or a wider one.
         Capability::Basic | Capability::Read => {
             args.push("-c".to_string());
             args.push("sandbox_mode=\"read-only\"".to_string());
@@ -155,11 +157,14 @@ pub fn codex_capability_args(capability: Capability, cwd: &Path) -> Vec<String> 
         Capability::Write => {
             args.push("-c".to_string());
             args.push("sandbox_mode=\"workspace-write\"".to_string());
-            // Exactly the turn's cwd, and nothing else, is writable.
+            // Exactly the turn's cwd, and nothing else, is writable — named by
+            // [`WORKSPACE_TOKEN`] rather than by the path, and filled in by
+            // [`fill_workspace`] when the child is built. The record therefore commits a
+            // scope that is identical on every machine, which is what lets the startup
+            // comparison stay strict equality.
             args.push("-c".to_string());
             args.push(format!(
-                "sandbox_workspace_write.writable_roots=[{}]",
-                toml_string(&cwd.display().to_string())
+                "sandbox_workspace_write.writable_roots=[\"{WORKSPACE_TOKEN}\"]"
             ));
             // A world-writable directory is a laundering route for a write that then gets
             // read back in, so both are excluded from the writable set.
@@ -186,6 +191,21 @@ pub fn codex_capability_args(capability: Capability, cwd: &Path) -> Vec<String> 
     args.push("tools.web_search=false".to_string());
 
     args
+}
+
+/// Replace [`WORKSPACE_TOKEN`] with the turn's real working directory, TOML-quoted.
+///
+/// The token is written into the argv already surrounded by its quotes
+/// (`writable_roots=["${WORKSPACE}"]`) so the recorded row reads like the override it
+/// becomes; substitution therefore swaps the quoted token for a freshly quoted path rather
+/// than swapping the bare token inside quotes it did not escape. A cwd containing a `"` or a
+/// `\` would otherwise change the meaning of the whole override.
+fn fill_workspace(args: Vec<String>, cwd: &Path) -> Vec<String> {
+    let quoted_token = format!("\"{WORKSPACE_TOKEN}\"");
+    let real = toml_string(&cwd.display().to_string());
+    args.into_iter()
+        .map(|a| a.replace(&quoted_token, &real))
+        .collect()
 }
 
 /// Quote a string as a TOML basic string, for a `-c key=value` override whose value is a
@@ -366,7 +386,7 @@ pub fn build_codex_args(
     args.push("-C".to_string());
     args.push(cwd.display().to_string());
 
-    args.extend(codex_capability_args(capability, cwd));
+    args.extend(fill_workspace(codex_capability_args(capability), cwd));
     args.extend_from_slice(mcp_args);
 
     // The prompt is positional and LAST, so nothing after it can be read as a flag.
@@ -409,6 +429,36 @@ impl Harness for Codex {
     /// token-level delta for the visible answer at all, only whole items.
     fn streams_text(&self) -> bool {
         false
+    }
+
+    /// FALSE at `Basic`, true at `Read` and `Write`.
+    ///
+    /// `Basic` means "no tools at all: text in, text out", and on this harness there is no
+    /// lever that produces it. The containment surface is an OS sandbox MODE, not a tool
+    /// allowlist, and the shell is not an optional tool — it is the harness. Verified against
+    /// codex-cli 0.146.0 with `--strict-config` as an oracle (it rejects an unknown `-c`
+    /// field BY NAME): `tools.web_search` exists and is accepted, `tools.shell` is rejected
+    /// as unknown, and no other key removes the shell. So Codex's weakest posture is
+    /// `sandbox_mode="read-only"`, which is byte-identical to its `Read` posture.
+    ///
+    /// **`Basic` is therefore not a level Codex FAILS, it is a level Codex does not HAVE.**
+    /// The distinction is the whole reason this method exists rather than a startup check
+    /// reading the record: a failing row says "go fix the posture", and there is nothing here
+    /// to fix short of a different CLI. Refusing at config time with "cannot express" tells
+    /// an operator the truth; refusing with "failed a gate" sends them looking for a flag
+    /// that does not exist.
+    ///
+    /// Do not be tempted to express it in the prompt instead. The boundary is the toolset,
+    /// and a prompt is not a boundary.
+    fn expresses(&self, capability: Capability) -> bool {
+        capability > Capability::Basic
+    }
+
+    /// The argv WITH [`WORKSPACE_TOKEN`] still in it — this is the recorded, host-independent
+    /// form the startup gate compares against. [`build_codex_args`] fills the token in when
+    /// it builds a real child, because only a spawn knows its own working directory.
+    fn capability_args(&self, _cfg: &Config, capability: Capability) -> Vec<String> {
+        codex_capability_args(capability)
     }
 
     /// `None`: Codex keeps its threads privately, in a layout the bridge does not read.
@@ -559,5 +609,79 @@ fn codex_usage(usage: Option<&serde_json::Value>) -> ShadowUsage {
             (None, None) => None,
             (a, b) => Some(a.unwrap_or(0) + b.unwrap_or(0)),
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::testutil::*;
+
+    /// The recorded posture and the spawned posture are the SAME statement with one hole
+    /// filled: the argv the gate compares carries the token, and the argv the child actually
+    /// gets carries this turn's directory. If these two ever come from different code the
+    /// record stops describing what runs, which is the whole failure the token exists to make
+    /// impossible.
+    #[test]
+    fn the_workspace_token_is_recorded_and_filled_in_at_spawn() {
+        let recorded = Codex.capability_args(&test_config(), Capability::Write);
+        assert!(
+            recorded
+                .iter()
+                .any(|a| a.contains("writable_roots") && a.contains(WORKSPACE_TOKEN)),
+            "{recorded:?}"
+        );
+        let args = build_codex_args(
+            "hi",
+            None,
+            Capability::Write,
+            Path::new("/srv/vault notes"),
+            &[],
+        );
+        assert!(
+            args.iter()
+                .any(|a| a == "sandbox_workspace_write.writable_roots=[\"/srv/vault notes\"]"),
+            "{args:?}"
+        );
+        assert!(
+            !args.iter().any(|a| a.contains(WORKSPACE_TOKEN)),
+            "a token reached the child: {args:?}"
+        );
+    }
+
+    /// A working directory containing a quote must not be able to reinterpret the whole `-c`
+    /// override — the substitution quotes the path, it does not paste it.
+    #[test]
+    fn a_quote_in_the_working_directory_cannot_escape_the_override() {
+        let args = build_codex_args(
+            "hi",
+            None,
+            Capability::Write,
+            Path::new("/srv/we\"ird"),
+            &[],
+        );
+        let root = args
+            .iter()
+            .find(|a| a.starts_with("sandbox_workspace_write.writable_roots"))
+            .expect("a writable-roots override");
+        assert_eq!(
+            root,
+            "sandbox_workspace_write.writable_roots=[\"/srv/we\\\"ird\"]"
+        );
+    }
+
+    /// `Basic` is not a posture Codex has, and asking for it anyway yields the STRICTEST one
+    /// it does have rather than a wider one. Nothing in a running bridge asks — the startup
+    /// gate and the routing walk both read `expresses` first — but a fallback that silently
+    /// widened would be the worst possible answer to a call that should not happen.
+    #[test]
+    fn asking_for_a_posture_codex_lacks_yields_its_strictest_one() {
+        assert!(!Codex.expresses(Capability::Basic));
+        assert!(Codex.expresses(Capability::Read));
+        assert!(Codex.expresses(Capability::Write));
+        assert_eq!(
+            codex_capability_args(Capability::Basic),
+            codex_capability_args(Capability::Read)
+        );
     }
 }

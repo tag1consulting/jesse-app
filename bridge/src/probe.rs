@@ -1139,8 +1139,10 @@ pub fn parse_trace(stdout: &str) -> RunTrace {
 /// `inconclusive` — so the rejection lines are parsed out of stderr and recorded as both an
 /// attempt and a tool error.
 pub fn parse_codex_trace(stdout: &str, stderr: &str, mcp: McpSet) -> RunTrace {
-    let mut t = RunTrace::default();
-    t.root_tools = vec!["Bash".to_string()];
+    let mut t = RunTrace {
+        root_tools: vec!["Bash".to_string()],
+        ..Default::default()
+    };
     if mcp == McpSet::Qmd {
         t.root_tools.push("mcp__qmd__status".to_string());
         t.mcp_servers = vec!["qmd".to_string()];
@@ -1755,13 +1757,16 @@ async fn run_row(
         mcp_set: row.mcp.label().to_string(),
         mcp_servers,
         // The posture this row was probed under, in the probed harness's own flag
-        // vocabulary — this is what the startup gate holds a deployment's config against,
-        // so it must describe the harness that actually ran.
-        toolset_args: if opts.harness == CODEX_ID {
-            codex_capability_args(row.capability, &env.vault)
-        } else {
-            capability_args(&cfg, row.capability)
-        },
+        // vocabulary — this is what the startup gate holds a deployment's config against, so
+        // it must describe the harness that actually ran. Taken through the trait, so it is
+        // the same call the gate makes and cannot drift from it. A host-varying scope arrives
+        // here already named by `WORKSPACE_TOKEN`; nothing in this writer substitutes a real
+        // path, which is what keeps the record identical on every machine.
+        toolset_args: cfg
+            .harnesses
+            .get(&opts.harness)
+            .unwrap_or_else(|| cfg.harnesses.turn_harness())
+            .capability_args(&cfg, row.capability),
         root_tools,
         status: status.to_string(),
         probes: results,

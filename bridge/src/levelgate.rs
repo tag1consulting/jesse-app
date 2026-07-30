@@ -22,13 +22,33 @@ use crate::*;
 // the effective grant is the two-line rule in [`crate::routing`]. There is no runtime
 // arithmetic anywhere.
 
-/// The committed containment record, embedded at COMPILE time.
+/// The committed containment records, embedded at COMPILE time — ONE PER HARNESS.
 ///
 /// Embedded rather than read from disk on purpose: the record a build was gated against is
 /// a property of the BINARY, so a deploy cannot be pointed at a friendlier file, and a
 /// record that stopped parsing breaks the build rather than a boot. This is the
 /// `include_str!` `bridge/tests/containment.rs` refers to.
-pub const CONTAINMENT_RECORD: &str = include_str!("../containment.toml");
+///
+/// A SET rather than one file, because a containment verdict describes a (harness,
+/// capability, MCP set) triple and nothing recorded for one harness says anything about
+/// another. While this was a single `include_str!` with a single `harness` field there was no
+/// path by which a second harness's record could ever be loaded: a Codex model was refused at
+/// startup before its argv was compared to anything, and the refusal blamed the record's
+/// harness field as though there were one record to blame.
+///
+/// A harness with no entry here is not a harness this build can vouch for at any level.
+pub const CONTAINMENT_RECORDS: &[(&str, &str)] = &[
+    (CLAUDE_CODE_ID, include_str!("../containment.toml")),
+    (CODEX_ID, include_str!("../containment-codex.toml")),
+];
+
+/// The embedded record for one harness, or `None` when this build embeds none for it.
+pub fn containment_record(harness: &str) -> Option<&'static str> {
+    CONTAINMENT_RECORDS
+        .iter()
+        .find(|(id, _)| *id == harness)
+        .map(|(_, text)| *text)
+}
 
 /// The env vars the per-role backends used, deleted along with the roles they configured.
 ///
@@ -81,12 +101,24 @@ pub const REMOVED_ROLE_ENV_VARS: &[&str] = &[
 /// `read` posture — so a green `write` row above a failing `read` row vouches for nothing.
 /// The walk therefore stops at the first level that did not pass, and a level with no
 /// recorded rows at all stops it too: "not probed" is not "fine".
-pub fn highest_passing_level(record: &BatteryResults, harness: &str) -> Option<Capability> {
-    if record.harness != harness {
+///
+/// **The prefix runs over the levels this harness EXPRESSES, and skips the ones it does
+/// not.** A level a harness does not have cannot be spawned, so a failing row for it says
+/// nothing about the levels above — where a failing row for a level the harness DOES have
+/// says everything. Without this the walk read Codex's ladder as broken at the bottom and
+/// returned `None`, refusing a `read` model whose every `read` row passes, with a message
+/// about a battery to re-run that would have changed nothing. That is the whole reason
+/// [`Harness::expresses`] is a declaration and not an inference from the record: the record
+/// cannot tell "failed" from "does not exist", and only the harness knows which it is.
+pub fn highest_passing_level(record: &BatteryResults, harness: &dyn Harness) -> Option<Capability> {
+    if record.harness != harness.id() {
         return None;
     }
     let mut best: Option<Capability> = None;
     for cap in [Capability::Basic, Capability::Read, Capability::Write] {
+        if !harness.expresses(cap) {
+            continue; // not a rung of this harness's ladder — see above
+        }
         let label = capability_label(cap);
         let rows: Vec<&RowResult> = record
             .rows
@@ -148,10 +180,13 @@ impl ConfigError {
 ///
 /// `declared` is the raw `[[models]]` array as parsed (needed for the removed-key check,
 /// which asks whether a key was PRESENT — something the built registry can no longer say).
+///
+/// `records` is the embedded set, one per harness ([`CONTAINMENT_RECORDS`]); each model is
+/// held against the record for ITS OWN harness and against nothing else.
 pub fn validate_model_config(
     cfg: &Config,
     declared: &[ModelToml],
-    record_text: &str,
+    records: &[(&str, &str)],
 ) -> Vec<ConfigError> {
     let mut errors = Vec::new();
 
@@ -180,30 +215,49 @@ pub fn validate_model_config(
         }
     }
 
-    // 4. The record itself, FIRST among the checks that depend on it: absent or unparseable
-    //    fails closed rather than falling back to permissive.
-    let record = match parse_results(record_text) {
-        Ok(r) => r,
-        Err(e) => {
+    // 4. The records themselves, FIRST among the checks that depend on them: absent or
+    //    unparseable fails closed rather than falling back to permissive.
+    let mut parsed: Vec<(&str, BatteryResults)> = Vec::new();
+    for (harness, text) in records {
+        let r = match parse_results(text) {
+            Ok(r) => r,
+            Err(e) => {
+                errors.push(ConfigError::global(format!(
+                    "the containment record for harness '{harness}' does not parse ({e}). It \
+                     is embedded at compile time and is what says which postures were probed; \
+                     without it nothing can be granted, so the bridge refuses to start rather \
+                     than assuming a posture."
+                )));
+                return errors;
+            }
+        };
+        if r.rows.is_empty() {
             errors.push(ConfigError::global(format!(
-                "the containment record does not parse ({e}). It is embedded at compile time \
-                 and is what says which postures were probed; without it nothing can be \
-                 granted, so the bridge refuses to start rather than assuming a posture."
+                "the containment record for harness '{harness}' has no rows — nothing has \
+                 been probed, so no level can be granted."
             )));
             return errors;
         }
-    };
-    if record.rows.is_empty() {
-        errors.push(ConfigError::global(
-            "the containment record has no rows — nothing has been probed, so no level can \
-             be granted.".to_string(),
-        ));
-        return errors;
+        // A record embedded under one harness that declares itself another is a build-time
+        // mix-up whose whole effect would be to vouch for the wrong harness. Refuse rather
+        // than trust either half of the disagreement.
+        if r.harness != *harness {
+            errors.push(ConfigError::global(format!(
+                "the containment record embedded for harness '{harness}' declares itself \
+                 '{}'. One of the two is wrong and neither can be trusted to say which.",
+                r.harness
+            )));
+            return errors;
+        }
+        parsed.push((harness, r));
     }
 
     for m in &cfg.model_registry.models {
-        // 2. An unregistered harness id.
-        if !KNOWN_HARNESS_IDS.contains(&m.harness.as_str()) {
+        // 2. A harness this build cannot construct. Asked of the REGISTRY rather than of
+        //    `KNOWN_HARNESS_IDS`, because the registry is what would actually have to serve
+        //    the model — the two agree by construction (`for_models` builds exactly the known
+        //    ids) and asking the thing that does the work leaves one source of truth.
+        let Some(harness) = cfg.harnesses.get(&m.harness) else {
             errors.push(ConfigError::for_model(
                 &m.id,
                 format!(
@@ -212,14 +266,34 @@ pub fn validate_model_config(
                      model under a harness its author did not choose is worse than not \
                      starting.",
                     m.harness,
-                    KNOWN_HARNESS_IDS.join(", ")
+                    cfg.harnesses.ids().join(", ")
                 ),
             ));
-            continue; // the level check below would be meaningless against no harness
+            continue; // the level checks below would be meaningless against no harness
+        };
+
+        // 3. A level the harness CANNOT EXPRESS. Checked before the record, and worded
+        //    differently on purpose: this is not a gate the harness failed, it is a posture
+        //    the harness does not have, so there is nothing to go fix and no battery to
+        //    re-run. See [`Harness::expresses`].
+        if !harness.expresses(m.level) {
+            errors.push(ConfigError::for_model(
+                &m.id,
+                format!(
+                    "harness '{}' cannot express level '{}' — it is not a posture this harness \
+                     has, as distinct from one it failed a battery for. Nothing can be \
+                     re-recorded to make it available; configure this model at a level the \
+                     harness expresses, or run it under a different harness.",
+                    m.harness,
+                    capability_label(m.level),
+                ),
+            ));
+            continue;
         }
 
-        // 3. A level the model's harness has no passing battery row for.
-        match highest_passing_level(&record, &m.harness) {
+        // 4. A level the model's harness has no passing battery row for, in its OWN record.
+        let record = parsed.iter().find(|(id, _)| *id == m.harness).map(|(_, r)| r);
+        match record.and_then(|r| highest_passing_level(r, harness)) {
             Some(highest) if m.level <= highest => {}
             Some(highest) => errors.push(ConfigError::for_model(
                 &m.id,
@@ -233,13 +307,22 @@ pub fn validate_model_config(
                     capability_label(m.level),
                 ),
             )),
+            None if record.is_none() => errors.push(ConfigError::for_model(
+                &m.id,
+                format!(
+                    "harness '{}' has NO containment record embedded in this build. Nothing \
+                     was ever probed for it, so no level can be granted — record a battery \
+                     for it and embed the file in `CONTAINMENT_RECORDS`.",
+                    m.harness
+                ),
+            )),
             None => errors.push(ConfigError::for_model(
                 &m.id,
                 format!(
-                    "harness '{}' has no passing containment battery row at any level in the \
-                     committed record (which was taken against harness '{}'). A (harness, \
-                     level) pair with no passing row is not a combination this project ships.",
-                    m.harness, record.harness
+                    "harness '{}' has no passing containment battery row at any level in its \
+                     committed record. A (harness, level) pair with no passing row is not a \
+                     combination this project ships.",
+                    m.harness
                 ),
             )),
         }
@@ -257,8 +340,16 @@ pub fn validate_model_config(
         }
     }
 
-    // 6. The posture the record speaks for versus the posture this deployment would run.
-    errors.extend(validate_toolset_argv(cfg, &record));
+    // 6. The posture each record speaks for versus the posture this deployment would run —
+    //    every record against ITS OWN harness. A record whose harness this build cannot
+    //    construct is skipped rather than compared against a stand-in: nothing can spawn that
+    //    posture, so there is no deployment drift to detect, and comparing it against some
+    //    other harness's flags would report a mismatch that means nothing.
+    for (harness, record) in &parsed {
+        if let Some(h) = cfg.harnesses.get(harness) {
+            errors.extend(validate_toolset_argv(cfg, h, record));
+        }
+    }
 
     errors
 }
@@ -271,11 +362,19 @@ pub fn validate_model_config(
 /// serve another. A deployment whose allowlist has been widened by an environment variable
 /// (`JESSE_ALLOWED_TOOLS`) is running a posture the record cannot speak for.
 ///
-/// **No normalization layer, deliberately.** The recorded argv is host-independent today —
-/// the path scopes are cwd-relative (`Read(./**)`), so nothing in it varies by deployment —
-/// and it must stay that way. If an absolute host path ever lands in the record, this
-/// assertion should fail LOUDLY on every other machine rather than silently normalize the
-/// difference away.
+/// **Each record is compared against ITS OWN harness's flags.** The argv is a statement in a
+/// harness's private flag vocabulary — `--tools` / `--allowedTools` for Claude Code, `-c
+/// sandbox_mode=…` for Codex — so a single global function would have reported every row of
+/// the second record as drift, which is why [`Harness::capability_args`] is on the trait.
+///
+/// **No normalization layer, deliberately, and that survived an absolute scope entering the
+/// record.** Codex's `Write` posture scopes writes to the turn's own working directory, which
+/// is a different path on every machine and in every probe run. It is named by
+/// [`WORKSPACE_TOKEN`] rather than substituted here: the harness emits the token, the record
+/// commits the token, and the real directory is filled in only where a child is actually
+/// spawned. So what the comparison means now is precisely what it meant before —
+/// **strict equality over an argv whose host-varying scopes are named by token** — and an
+/// untokenised absolute path is still a loud boot failure on every other machine.
 ///
 /// # COUPLED WITH `the_record_carries_no_absolute_host_paths` — DO NOT RELAX ONE ALONE
 ///
@@ -288,9 +387,13 @@ pub fn validate_model_config(
 ///     breaks every deployment except the one that recorded it, at BOOT, on someone else's
 ///     machine.
 ///
-/// If an absolute scope ever genuinely has to enter the record, change both together and
-/// decide deliberately what the comparison should then mean.
-pub fn validate_toolset_argv(cfg: &Config, record: &BatteryResults) -> Vec<ConfigError> {
+/// That test now runs over EVERY embedded record and carries the converse half too: a row
+/// whose argv scopes a workspace must use the token. Both halves, or neither.
+pub fn validate_toolset_argv(
+    cfg: &Config,
+    harness: &dyn Harness,
+    record: &BatteryResults,
+) -> Vec<ConfigError> {
     let mut errors = Vec::new();
     for row in &record.rows {
         let Some(cap) = parse_capability(&row.capability) else {
@@ -300,15 +403,16 @@ pub fn validate_toolset_argv(cfg: &Config, record: &BatteryResults) -> Vec<Confi
             )));
             continue;
         };
-        let running = capability_args(cfg, cap);
+        let running = harness.capability_args(cfg, cap);
         if running != row.toolset_args {
             errors.push(ConfigError::global(format!(
-                "the toolset this deployment would run at '{}' is not the one the containment \
-                 record was taken with, so the record cannot speak for it.\n  recorded: {:?}\n  \
-                 running: {:?}\nThe usual cause is JESSE_ALLOWED_TOOLS / JESSE_DISALLOWED_TOOLS \
-                 widening the allowlist. Unset them, or re-run the battery against this posture \
-                 and commit the record.",
+                "the toolset this deployment would run at '{}' on harness '{}' is not the one \
+                 the containment record was taken with, so the record cannot speak for it.\n  \
+                 recorded: {:?}\n  running: {:?}\nThe usual cause is JESSE_ALLOWED_TOOLS / \
+                 JESSE_DISALLOWED_TOOLS widening the allowlist. Unset them, or re-run the \
+                 battery against this posture and commit the record.",
                 row.label(),
+                harness.id(),
                 row.toolset_args,
                 running,
             )));
@@ -344,7 +448,30 @@ mod tests {
     use crate::testutil::*;
 
     fn record() -> BatteryResults {
-        parse_results(CONTAINMENT_RECORD).expect("the committed record must parse")
+        parse_results(claude_record()).expect("the committed record must parse")
+    }
+
+    fn claude_record() -> &'static str {
+        containment_record(CLAUDE_CODE_ID).expect("claude-code has an embedded record")
+    }
+
+    /// Just Claude Code's record, as the embedded set is shaped. Enough for every test that
+    /// says nothing about a second harness, and it keeps a doctored record from being held
+    /// against a harness it was not doctored for.
+    fn claude_only(text: &str) -> Vec<(&str, &str)> {
+        vec![(CLAUDE_CODE_ID, text)]
+    }
+
+    /// As [`cfg_with_model`], but with a harness registry that can actually CONSTRUCT Codex.
+    ///
+    /// Codex is not in the shipped registry yet, and the checks it is subject to are exactly
+    /// the ones that must be right BEFORE it is — so the tests build the registry the
+    /// registration will produce rather than waiting for it. This is the same thing the
+    /// battery does for the same reason.
+    fn cfg_with_codex_model(id: &str, level: Capability) -> Config {
+        let mut cfg = cfg_with_model(id, CODEX_ID, level);
+        cfg.harnesses = Arc::new(HarnessRegistry::new(vec![Box::new(Codex)]));
+        cfg
     }
 
     /// A config whose registry holds exactly one declared model.
@@ -375,16 +502,16 @@ mod tests {
         // harness may be granted up to Write. If this ever fails, the record regressed and
         // the ambient default itself would stop being grantable.
         assert_eq!(
-            highest_passing_level(&record(), CLAUDE_CODE_ID),
+            highest_passing_level(&record(), &ClaudeCode),
             Some(Capability::Write)
         );
-        assert_eq!(highest_passing_level(&record(), "codex"), None);
+        assert_eq!(highest_passing_level(&record(), &Codex), None);
     }
 
     #[test]
     fn a_clean_config_starts() {
         let cfg = test_config();
-        let errors = validate_model_config(&cfg, &[], CONTAINMENT_RECORD);
+        let errors = validate_model_config(&cfg, &[], &claude_only(claude_record()));
         assert!(errors.is_empty(), "{errors:?}");
     }
 
@@ -395,7 +522,7 @@ mod tests {
             default_writes: Some(true),
             ..ModelToml::default()
         }];
-        let errors = validate_model_config(&test_config(), &decl, CONTAINMENT_RECORD);
+        let errors = validate_model_config(&test_config(), &decl, &claude_only(claude_record()));
         let e = errors.first().expect("a leftover default_writes must be refused");
         assert_eq!(e.model.as_deref(), Some("glm-5.2"));
         assert!(e.message.contains("`level`"), "{e}");
@@ -409,7 +536,7 @@ mod tests {
             level: Some("wrote".to_string()),
             ..ModelToml::default()
         }];
-        let errors = validate_model_config(&test_config(), &decl, CONTAINMENT_RECORD);
+        let errors = validate_model_config(&test_config(), &decl, &claude_only(claude_record()));
         assert!(
             errors.iter().any(|e| e.message.contains("unknown level 'wrote'")),
             "{errors:?}"
@@ -419,7 +546,7 @@ mod tests {
     #[test]
     fn an_unregistered_harness_is_refused_and_names_the_model() {
         let cfg = cfg_with_model("codex-mini", "codex", Capability::Read);
-        let errors = validate_model_config(&cfg, &[], CONTAINMENT_RECORD);
+        let errors = validate_model_config(&cfg, &[], &claude_only(claude_record()));
         let e = errors
             .iter()
             .find(|e| e.model.as_deref() == Some("codex-mini"))
@@ -445,11 +572,11 @@ mod tests {
         }
         let text = render_results(&r);
         assert_eq!(
-            highest_passing_level(&parse_results(&text).unwrap(), CLAUDE_CODE_ID),
+            highest_passing_level(&parse_results(&text).unwrap(), &ClaudeCode),
             Some(Capability::Read)
         );
         let cfg = cfg_with_model("bold", CLAUDE_CODE_ID, Capability::Write);
-        let errors = validate_model_config(&cfg, &[], &text);
+        let errors = validate_model_config(&cfg, &[], &claude_only(&text));
         let e = errors
             .iter()
             .find(|e| e.model.as_deref() == Some("bold"))
@@ -476,7 +603,7 @@ mod tests {
         let text = render_results(&r);
         let parsed = parse_results(&text).unwrap();
         assert_eq!(
-            highest_passing_level(&parsed, CLAUDE_CODE_ID),
+            highest_passing_level(&parsed, &ClaudeCode),
             Some(Capability::Basic),
             "one failing MCP set at `read` disqualifies the level"
         );
@@ -493,19 +620,19 @@ mod tests {
             "precondition: the Write row has known-open baselines"
         );
         assert_eq!(
-            highest_passing_level(&r, CLAUDE_CODE_ID),
+            highest_passing_level(&r, &ClaudeCode),
             Some(Capability::Write)
         );
     }
 
     #[test]
     fn a_record_that_does_not_parse_fails_closed() {
-        let errors = validate_model_config(&test_config(), &[], "this is not toml {{{");
+        let errors = validate_model_config(&test_config(), &[], &claude_only("this is not toml {{{"));
         assert_eq!(errors.len(), 1, "{errors:?}");
         assert!(errors[0].message.contains("does not parse"), "{errors:?}");
         // …and a foreign schema is the same failure, not a permissive read.
-        let bumped = CONTAINMENT_RECORD.replace("schema = 1", "schema = 99");
-        let errors = validate_model_config(&test_config(), &[], &bumped);
+        let bumped = claude_record().replace("schema = 1", "schema = 99");
+        let errors = validate_model_config(&test_config(), &[], &claude_only(&bumped));
         assert!(!errors.is_empty());
     }
 
@@ -515,7 +642,7 @@ mod tests {
         // an env var widened the allowlist, so the record cannot speak for what would run.
         let mut cfg = test_config();
         cfg.allowed_tools = format!("{DEFAULT_ALLOWED_TOOLS},Bash");
-        let errors = validate_toolset_argv(&cfg, &record());
+        let errors = validate_toolset_argv(&cfg, &ClaudeCode, &record());
         let e = errors.first().expect("a widened allowlist must be refused");
         assert!(e.message.contains("recorded:"), "{e}");
         assert!(e.message.contains("running:"), "{e}");
@@ -524,15 +651,140 @@ mod tests {
 
     #[test]
     fn the_shipped_posture_matches_the_record_exactly() {
-        // Strict equality, no normalization: the shipped defaults ARE what was probed.
-        let errors = validate_toolset_argv(&test_config(), &record());
+        // Strict equality, no normalization: the shipped defaults ARE what was probed. Every
+        // embedded record against its own harness, because a comparison that only ever ran
+        // against Claude Code's flags is the bug this became a set to fix.
+        for (id, text) in CONTAINMENT_RECORDS {
+            let r = parse_results(text).expect("parses");
+            let h: Box<dyn Harness> = match *id {
+                CODEX_ID => Box::new(Codex),
+                _ => Box::new(ClaudeCode),
+            };
+            let errors = validate_toolset_argv(&test_config(), h.as_ref(), &r);
+            assert!(errors.is_empty(), "{id}: {errors:?}");
+        }
+    }
+
+    /// EVERY EMBEDDED RECORD AGREES WITH WHAT ITS HARNESS DECLARES. This is what stops
+    /// [`Harness::expresses`] becoming a wish list of its own.
+    ///
+    /// Both directions, because each catches a different lie:
+    ///   * a harness that CLAIMS a level must have a passing row for it — otherwise the
+    ///     startup gate would let a model through on a declaration nothing probed;
+    ///   * a harness that DISCLAIMS one must have no passing row for it — otherwise the
+    ///     declaration is hiding a posture that demonstrably works, and the walk in
+    ///     [`highest_passing_level`] is silently skipping a rung that exists.
+    ///
+    /// A declaration the record contradicts is a BUILD failure, in either direction.
+    #[test]
+    fn the_containment_records_agree_with_what_each_harness_declares() {
+        for (id, text) in CONTAINMENT_RECORDS {
+            let r = parse_results(text).expect("parses");
+            let h: Box<dyn Harness> = match *id {
+                CODEX_ID => Box::new(Codex),
+                _ => Box::new(ClaudeCode),
+            };
+            for cap in [Capability::Basic, Capability::Read, Capability::Write] {
+                let label = capability_label(cap);
+                let rows: Vec<&RowResult> =
+                    r.rows.iter().filter(|row| row.capability == label).collect();
+                let passing = !rows.is_empty()
+                    && rows.iter().all(|row| {
+                        row.probes
+                            .iter()
+                            .filter(|p| p.class == ProbeClass::HardGate.label())
+                            .all(|p| p.status == "pass")
+                    });
+                assert_eq!(
+                    h.expresses(cap),
+                    passing,
+                    "{id}: declares expresses({label}) = {} but its record's rows at that \
+                     level {} pass. A declaration and its proof must agree in BOTH \
+                     directions — fix whichever one is wrong, and never the test.",
+                    h.expresses(cap),
+                    if passing { "all" } else { "do not all" },
+                );
+            }
+        }
+    }
+
+    /// Codex's ladder has no bottom rung, and the walk reads that from the declaration rather
+    /// than from the failing `basic` row.
+    #[test]
+    fn a_harness_that_does_not_express_basic_is_still_granted_the_levels_it_passes() {
+        let r = parse_results(containment_record(CODEX_ID).expect("embedded")).unwrap();
+        assert!(
+            r.row("basic", "none").expect("a basic row").status == "failing",
+            "precondition: the record records what happens if `basic` is asked for anyway"
+        );
+        assert_eq!(
+            highest_passing_level(&r, &Codex),
+            Some(Capability::Write),
+            "a failing row for a level the harness does not HAVE must not break the prefix"
+        );
+    }
+
+    /// A model configured at a level its harness cannot express is refused, and the message
+    /// says so — not "failed a gate", which would send an operator looking for a flag.
+    #[test]
+    fn a_level_the_harness_cannot_express_is_refused_in_those_words() {
+        let cfg = cfg_with_codex_model("codex-mini", Capability::Basic);
+        let errors = validate_model_config(&cfg, &[], CONTAINMENT_RECORDS);
+        let e = errors
+            .iter()
+            .find(|e| e.model.as_deref() == Some("codex-mini"))
+            .expect("basic on codex must be refused");
+        assert!(e.message.contains("cannot express"), "{e}");
+        assert!(!e.message.contains("passing containment battery"), "{e}");
+        // …and the level it DOES express starts cleanly.
+        let cfg = cfg_with_codex_model("codex-mini", Capability::Read);
+        let errors = validate_model_config(&cfg, &[], CONTAINMENT_RECORDS);
         assert!(errors.is_empty(), "{errors:?}");
+    }
+
+    /// A harness with no embedded record is a different fault from one whose record has no
+    /// passing row, and the message must not blame "the record's harness" as though there
+    /// were one record.
+    #[test]
+    fn a_harness_with_no_embedded_record_says_exactly_that() {
+        let cfg = cfg_with_codex_model("codex-mini", Capability::Read);
+        let claude_only = &CONTAINMENT_RECORDS[..1];
+        let errors = validate_model_config(&cfg, &[], claude_only);
+        let e = errors
+            .iter()
+            .find(|e| e.model.as_deref() == Some("codex-mini"))
+            .expect("a harness with no record must be refused");
+        assert!(e.message.contains("NO containment record"), "{e}");
+    }
+
+    /// A record embedded under one harness that declares itself another vouches for the wrong
+    /// thing, so neither half is trusted.
+    #[test]
+    fn a_record_embedded_under_the_wrong_harness_is_refused() {
+        let mismatched = &[(CODEX_ID, claude_record())][..];
+        let errors = validate_model_config(&test_config(), &[], mismatched);
+        assert!(
+            errors.iter().any(|e| e.message.contains("declares itself")),
+            "{errors:?}"
+        );
     }
 
     /// The record commits the exact argv it probed, and [`validate_toolset_argv`] compares it
     /// by STRICT EQUALITY with no normalization layer. That only works while the argv is
     /// host-independent. A `Read(//Users/someuser/vault/**)` would make every OTHER deployment
     /// fail at boot — so this catches it at commit time instead.
+    ///
+    /// Two halves now, because an absolute scope genuinely had to enter the record: Codex
+    /// scopes its writes to the turn's own working directory, which is a different path on
+    /// every machine AND in every probe run. The forbid half keeps a real path out; the
+    /// require half keeps the token in. A workspace-scoped row with NEITHER would pass a
+    /// forbid-only test simply by being written some third way, and the comparison would go
+    /// back to failing on someone else's machine.
+    ///
+    /// `/var/folders/`, `/tmp/` and `/private/` are named alongside the home directories
+    /// because the probe scratch trees live there: the path this test first caught was
+    /// `/var/folders/4n/…/write-qmd/vault`, a per-run temporary directory that could never
+    /// equal a deployment's computed value even on the machine that recorded it.
     ///
     /// # COUPLED WITH `validate_toolset_argv` — DO NOT RELAX ONE ALONE
     ///
@@ -542,18 +794,41 @@ mod tests {
     /// half fails to catch on its own. Change both together or neither.
     #[test]
     fn the_record_carries_no_absolute_host_paths() {
-        let r = record();
-        for row in &r.rows {
-            for arg in &row.toolset_args {
-                for bad in ["/Users/", "/home/", "/private/var/", "$HOME"] {
-                    assert!(
-                        !arg.contains(bad),
-                        "{}: recorded toolset argv contains an absolute host path ({bad}): \
-                         {arg:?}. The startup assertion compares this by strict equality with \
-                         no normalization, so a host path here fails every other deployment \
-                         at boot. Keep the scopes cwd-relative.",
-                        row.label()
-                    );
+        for (id, text) in CONTAINMENT_RECORDS {
+            let r = parse_results(text).expect("parses");
+            for row in &r.rows {
+                for arg in &row.toolset_args {
+                    for bad in [
+                        "/Users/",
+                        "/home/",
+                        "/private/var/",
+                        "/private/",
+                        "/var/folders/",
+                        "/tmp/",
+                        "$HOME",
+                    ] {
+                        assert!(
+                            !arg.contains(bad),
+                            "{id} {}: recorded toolset argv contains an absolute host path \
+                             ({bad}): {arg:?}. The startup assertion compares this by strict \
+                             equality with no normalization, so a host path here fails every \
+                             other deployment at boot. Keep the scopes cwd-relative, or name \
+                             the workspace with {WORKSPACE_TOKEN}.",
+                            row.label()
+                        );
+                    }
+                    // The converse. A scope that varies by host must be NAMED, not omitted:
+                    // the token is what lets the comparison stay strict.
+                    if arg.contains("writable_roots") {
+                        assert!(
+                            arg.contains(WORKSPACE_TOKEN),
+                            "{id} {}: {arg:?} scopes a writable root without naming it \
+                             {WORKSPACE_TOKEN}. A workspace scope is host-varying by \
+                             definition; if this row really does scope something fixed, say \
+                             so here rather than leaving the two halves disagreeing.",
+                            row.label()
+                        );
+                    }
                 }
             }
         }
@@ -563,7 +838,7 @@ mod tests {
     fn a_removed_role_env_var_still_set_is_refused_and_names_offload_order() {
         let var = "JESSE_VAULTQA_MODEL";
         std::env::set_var(var, "local-oss");
-        let errors = validate_model_config(&test_config(), &[], CONTAINMENT_RECORD);
+        let errors = validate_model_config(&test_config(), &[], &claude_only(claude_record()));
         std::env::remove_var(var);
         let e = errors
             .iter()
