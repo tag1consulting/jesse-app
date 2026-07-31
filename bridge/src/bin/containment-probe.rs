@@ -187,11 +187,16 @@ async fn main() {
     }
 
     if write {
+        // A fresh run knows what the boundary did; it cannot know who agreed to ship it.
+        // Carry the committed acceptances across, or `--write` would erase the decision
+        // record at exactly the moment an operator most needs to read it.
+        let mut fresh = fresh.clone();
         // Re-recording is a deliberate act, so say what it is about to change. A silent
         // overwrite is how a posture regression gets committed as "the new baseline" without
         // anyone deciding that it should be.
         if let Some(prev) = recorded_text.as_deref().and_then(|t| parse_results(t).ok()) {
-            let drift = compare_results(&prev, fresh);
+            fresh.accepted = prev.accepted.clone();
+            let drift = compare_results(&prev, &fresh);
             if drift.is_empty() {
                 eprintln!(
                     "\ncontainment-probe: re-recording — nothing moved since {} (this run \
@@ -205,7 +210,28 @@ async fn main() {
                 }
             }
         }
-        let text = render_results(fresh);
+        // Which of the open doors has nobody signed for? "We accepted the read opens" must
+        // not quietly come to mean "we accepted everything the battery found".
+        let unsigned = fresh.unaccepted_known_open();
+        if !unsigned.is_empty() {
+            eprintln!(
+                "\nKNOWN-OPEN AND UNACCEPTED ({}) — no [[accepted]] entry covers these:",
+                unsigned.len()
+            );
+            for u in &unsigned {
+                eprintln!("  ! {u}");
+            }
+        }
+        // An acceptance that outlived its finding is not an error — the door may simply have
+        // closed — but it must not be left to imply a risk nobody is carrying any more.
+        let stale = fresh.stale_acceptances();
+        if !stale.is_empty() {
+            eprintln!("\nSTALE ACCEPTANCES ({}) — remove them on purpose:", stale.len());
+            for s in &stale {
+                eprintln!("  ~ {s}");
+            }
+        }
+        let text = render_results(&fresh);
         if let Err(e) = std::fs::write(results_path, &text) {
             eprintln!("containment-probe: could not write {results_path}: {e}");
             std::process::exit(1);

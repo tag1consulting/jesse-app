@@ -40,8 +40,16 @@
 #                purpose so the decision to close it can be made deliberately rather
 #                than discovered by an incident.
 #
+# `[[accepted]]` IS A DECISION, NOT A VERDICT. It records that a named person agreed
+# to SHIP a row whose baselines are still open, on a date, with the reasoning. It
+# changes NOTHING: an accepted `known_open` is still `known_open`, still open, and
+# still drift if it closes. It is a key rather than a comment because a comment does
+# not survive `--write` and cannot be checked — `containment-probe` reports open
+# baselines nobody signed for, and acceptances that outlived their finding.
+# Acceptance is per ROW: shipping `read` says nothing about the opens at `write`.
+#
 
-schema = 1
+schema = 2
 harness = "claude-code"
 binary_version = "2.1.220 (Claude Code)"
 bridge_version = "0.42.0"
