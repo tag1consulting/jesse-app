@@ -15,6 +15,32 @@ CI both run it). See the "Versioning" section of `bridge/README.md`.
 
 ## [Unreleased]
 
+## [Bridge 0.49.0] - 2026-07-31
+
+### Changed
+- **CI's clippy now checks the test targets, not just the shipping ones.** The bridge
+  job ran `cargo clippy --features containment-probe -- -D warnings`, which lints the
+  library and the binaries and nothing else. Test code was therefore ungated, and three
+  warnings had accumulated in it on `main` — invisible to every merge that let them
+  through. The job now passes `--all-targets`, so an unused import or a dead assertion
+  in a `#[cfg(test)]` module turns CI red the way one in `src/` already did.
+
+### Fixed
+- **The three clippy warnings that had accumulated in test code**, fixed at the source
+  rather than silenced — no `#[allow]` was added for any of them.
+
+  Two were `use crate::testutil::*;` imports left behind in `dietgate.rs` and
+  `vaultqagate.rs`. Both modules once had a kill-switch test that built a `test_config()`;
+  that half of the gate moved to `has_offload_candidate`, and its coverage moved with it
+  to `routing.rs`. The imports are what stayed behind, and they are removed.
+
+  The third was `assert!(REASONING_HEALTH_TIMEOUT_SECS > DEFAULT_HEALTH_TIMEOUT_SECS)`
+  in a `config.rs` test — a real invariant asserted in the wrong place and at the wrong
+  time. It relates the two constants to each other, so nothing about it needs a test to
+  run: it is now `const _: () = assert!(...)` beside the definitions in `health.rs`,
+  which means it holds for the release build too and fails at compile time rather than
+  during a test pass that a release build never performs.
+
 ## [Bridge 0.48.0] - 2026-07-31
 
 > Rebased from PR #46, which was merged into a feature branch rather than `main` and so

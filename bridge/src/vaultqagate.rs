@@ -214,7 +214,6 @@ pub fn should_try_local_vaultqa(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testutil::*;
 
     // Self-referential questions the vault could answer — deliberately avoiding any
     // diet-keyword token (those belong to the diet gate) and any act/web/URL shape.
