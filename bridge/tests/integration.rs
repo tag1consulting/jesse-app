@@ -3389,10 +3389,7 @@ async fn title_with_a_deprecated_session_id_resolves_through_the_reverse_index()
         claude_bin: fake.to_string_lossy().into_owned(),
         ..test_config()
     });
-    let cid = st
-        .conversations
-        .conversation_for_session("sess-roof")
-        .expect("adopted at startup");
+    let cid = own_transcript(&st, "sess-roof");
 
     let resp = app(st.clone())
         .oneshot(title_request(
@@ -5333,6 +5330,21 @@ fn write_transcript(proj: &std::path::Path, stem: &str, question: &str) {
     .unwrap();
 }
 
+/// Make an on-disk transcript one the bridge OWNS, the way a real turn does: register a
+/// conversation and bind the session to it.
+///
+/// Needed because the bridge no longer adopts transcripts it finds in a projects dir —
+/// that directory is shared with every other `claude` run against the same cwd, so a
+/// transcript with no record is deliberately not the bridge's. Tests that want a
+/// pre-existing conversation must say so. The deterministic v5 id keeps these fixtures
+/// readable and matches what the old adoption path minted.
+fn own_transcript(st: &AppState, stem: &str) -> String {
+    let cid = orphan_conversation_id(stem);
+    st.conversations.register(&cid, None, 0);
+    st.conversations.bind_session(&cid, stem);
+    cid
+}
+
 /// Set a file's mtime to exactly `secs` since the unix epoch, so `last_modified`
 /// and the `?since=` filter can be asserted against known values.
 fn set_mtime_secs(path: &std::path::Path, secs: u64) {
@@ -5655,28 +5667,70 @@ async fn two_bound_transcripts_yield_one_row_with_the_oldest_snippet_and_newest_
 }
 
 #[tokio::test]
-async fn a_legacy_transcript_is_adopted_deterministically() {
+async fn a_foreign_transcript_is_never_adopted_and_is_left_untouched() {
+    // The defect this replaces: a projects dir is keyed only on the cwd, so a desktop
+    // Claude Code run against the same vault wrote here and the bridge adopted it into a
+    // conversation. On the deploy that surfaced this, 731 of 831 records were foreign
+    // transcripts. A transcript with no record is now left entirely alone.
     let (home, vault, proj) = conv_fixture();
-    write_transcript(&proj, "sess-legacy", "an old question");
+    write_transcript(&proj, "sess-foreign", "a question typed at a terminal");
+    let path = proj.join("sess-foreign.jsonl");
+    let before = std::fs::read(&path).unwrap();
+    let mtime_before = std::fs::metadata(&path).unwrap().modified().unwrap();
+
     let st = conv_state(&home, &vault);
+    assert!(
+        conversation_rows(&st).await.is_empty(),
+        "a foreign transcript produces no conversation row"
+    );
+    assert!(st.conversations.is_empty(), "and no record");
+    assert_eq!(
+        st.conversations.conversation_for_session("sess-foreign"),
+        None
+    );
+
+    // Listing again must not change that, and must not touch the file either way.
+    assert!(conversation_rows(&st).await.is_empty());
+    assert_eq!(std::fs::read(&path).unwrap(), before, "byte-identical");
+    assert_eq!(
+        std::fs::metadata(&path).unwrap().modified().unwrap(),
+        mtime_before,
+        "the bridge never writes into a transcript it did not create"
+    );
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+#[tokio::test]
+async fn a_transcript_the_bridge_started_still_round_trips() {
+    // The other side of the contract: ownership comes from the store, so a session the
+    // bridge bound lists normally with its deterministic id.
+    let (home, vault, proj) = conv_fixture();
+    write_transcript(&proj, "sess-ours", "an old question");
+    let st = conv_state(&home, &vault);
+    let cid = own_transcript(&st, "sess-ours");
+
     let rows = conversation_rows(&st).await;
     assert_eq!(rows.len(), 1);
-    let cid = rows[0]["conversation_id"].as_str().unwrap().to_string();
-    assert_eq!(
-        cid,
-        orphan_conversation_id("sess-legacy"),
-        "the id is the deterministic v5 of the session id"
+    assert_eq!(rows[0]["conversation_id"], cid);
+    assert_eq!(rows[0]["session_id"], "sess-ours");
+    assert_eq!(rows[0]["first_message"], "an old question");
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+#[tokio::test]
+async fn a_projects_dir_full_of_foreign_stems_adopts_nothing_at_startup() {
+    // The startup sweep is what bulk-adopted 708 transcripts in one go. It is gone: a
+    // directory full of foreign stems must leave the registry empty.
+    let (home, vault, proj) = conv_fixture();
+    for i in 0..25 {
+        write_transcript(&proj, &format!("sess-foreign-{i}"), "not ours");
+    }
+    let st = conv_state(&home, &vault);
+    assert!(
+        st.conversations.is_empty(),
+        "the startup scan adopts nothing"
     );
-    // A second bridge over the same dir (a state dir lost and rebuilt from the
-    // transcripts alone) derives the IDENTICAL id, so a client's stored id stays valid.
-    let st2 = conv_state(&home, &vault);
-    let rows2 = conversation_rows(&st2).await;
-    assert_eq!(rows2[0]["conversation_id"], cid);
-    assert_eq!(
-        st2.conversations.len(),
-        1,
-        "adopting twice makes one record"
-    );
+    assert!(conversation_rows(&st).await.is_empty());
     let _ = std::fs::remove_dir_all(&home);
 }
 
@@ -5693,6 +5747,7 @@ async fn title_mint_transcripts_are_excluded_from_the_list_and_404_on_hydrate() 
     .unwrap();
     write_transcript(&proj, "sess-real", "a real question");
     let st = conv_state(&home, &vault);
+    own_transcript(&st, "sess-real");
 
     let rows = conversation_rows(&st).await;
     assert_eq!(rows.len(), 1, "the mint transcript is not a conversation");
@@ -5721,6 +5776,8 @@ async fn conversations_list_honors_etag_304_and_since() {
     write_transcript(&proj, "old", "old q");
     write_transcript(&proj, "new", "new q");
     let st = conv_state(&home, &vault);
+    own_transcript(&st, "old");
+    own_transcript(&st, "new");
     set_mtime_secs(&proj.join("old.jsonl"), 1_000);
     set_mtime_secs(&proj.join("new.jsonl"), 3_000);
 
@@ -5803,6 +5860,8 @@ async fn conversation_delete_removes_every_transcript_tombstones_and_is_idempote
     st.conversations.bind_session(CID_A, "seg-a");
     st.conversations.bind_session(CID_A, "seg-b");
     st.titles.set(CID_A, "Doomed");
+    // `keep` belongs to a second conversation, so it survives the delete AND still lists.
+    own_transcript(&st, "keep");
 
     let resp = app(st.clone())
         .oneshot(conversation_delete_request(
@@ -5883,10 +5942,7 @@ async fn conversation_flags_apply_lww_and_404_on_an_unknown_conversation() {
     let (home, vault, proj) = conv_fixture();
     write_transcript(&proj, "sess-f", "q");
     let st = conv_state(&home, &vault);
-    let cid = st
-        .conversations
-        .conversation_for_session("sess-f")
-        .expect("adopted at startup");
+    let cid = own_transcript(&st, "sess-f");
 
     let resp = app(st.clone())
         .oneshot(conversation_flags_request(
@@ -6166,8 +6222,17 @@ async fn the_key_migration_runs_once_and_survives_a_restart() {
         state_dir: Some(state_dir.to_string_lossy().into_owned()),
         ..test_config()
     };
-    let st = AppState::new(cfg.clone());
+    // A pre-existing record for the session, which is what the migration re-keys
+    // THROUGH. It used to come from the startup sweep adopting every transcript on disk;
+    // that sweep is gone, so ownership has to be in the store already.
     let cid = orphan_conversation_id("sess-old");
+    {
+        let seed = ConversationStore::new(Some(state_dir.join("conversations.json")));
+        seed.register(&cid, None, 0);
+        seed.bind_session(&cid, "sess-old");
+    }
+
+    let st = AppState::new(cfg.clone());
     assert_eq!(
         st.titles.get(&cid).as_deref(),
         Some("Legacy Title"),
@@ -6187,6 +6252,49 @@ async fn the_key_migration_runs_once_and_survives_a_restart() {
     assert_eq!(st2.titles.get(&cid).as_deref(), Some("Legacy Title"));
     assert!(st2.flags.get(&cid).favorite);
     assert_eq!(st2.titles.len(), 1, "no duplicate key was created");
+    let _ = std::fs::remove_dir_all(&home);
+    let _ = std::fs::remove_dir_all(&state_dir);
+}
+
+#[tokio::test]
+async fn the_key_migration_drops_keys_for_sessions_the_bridge_never_owned() {
+    // CONSEQUENCE of removing the startup sweep, pinned so it cannot be rediscovered by
+    // accident. The one-time migration re-keys titles/flags from session id onto
+    // conversation id THROUGH the reverse index. That index used to be populated by
+    // adopting every transcript on disk; now it holds only what the bridge bound itself.
+    //
+    // So a state dir that predates conversations AND has never migrated loses the titles
+    // and favorites belonging to sessions with no record — `migrate_keys_to_conversations`
+    // drops an unmapped key rather than keeping it. Already-migrated deploys are
+    // unaffected (the flag is persisted and the migration never re-runs), and a fresh
+    // install has nothing to migrate.
+    let (home, vault, proj) = conv_fixture();
+    write_transcript(&proj, "sess-unowned", "q");
+    let state_dir = std::env::temp_dir().join(format!("jesse-state-{}", random_hex()));
+    std::fs::create_dir_all(&state_dir).unwrap();
+    std::fs::write(
+        state_dir.join("titles.json"),
+        r#"{"v":1,"titles":{"sess-unowned":"Title On A Foreign Session"}}"#,
+    )
+    .unwrap();
+
+    let st = AppState::new(Config {
+        home: home.to_string_lossy().into_owned(),
+        vault,
+        state_dir: Some(state_dir.to_string_lossy().into_owned()),
+        ..test_config()
+    });
+    assert!(st.conversations.is_empty(), "nothing was adopted");
+    assert_eq!(
+        st.titles.get(&orphan_conversation_id("sess-unowned")),
+        None,
+        "there is no conversation to move it onto"
+    );
+    assert_eq!(
+        st.titles.get("sess-unowned"),
+        None,
+        "and the unmapped key is dropped, not kept"
+    );
     let _ = std::fs::remove_dir_all(&home);
     let _ = std::fs::remove_dir_all(&state_dir);
 }
@@ -6331,19 +6439,23 @@ async fn a_failed_turn_still_binds_the_transcript_it_created() {
 
 #[tokio::test]
 async fn a_real_conversation_steals_an_orphan_adopted_transcript_back() {
-    // The repair path end to end: a refresh orphan-adopts a transcript (say it beat the
-    // suppression window, or a previous bridge left it behind), and the turn that
-    // actually produced it then claims it. The orphan row must disappear.
+    // The repair path end to end: an orphan-adopted record owns a transcript, and the
+    // turn that actually produced it then claims it. The orphan row must disappear.
+    //
+    // Nothing adopts at runtime any more, but this state is not synthetic: every store
+    // written before that change still holds orphan-adopted records (731 of them on the
+    // deploy that surfaced the defect), so the steal path stays reachable for them. Seed
+    // it explicitly rather than via a directory scan.
     let (home, vault, proj) = conv_fixture();
     write_transcript(&proj, "sess-x", "q");
     let st = conv_state(&home, &vault);
-    let orphan = orphan_conversation_id("sess-x");
+    let orphan = st.conversations.adopt_orphan_session("sess-x", 0);
+    assert_eq!(orphan, orphan_conversation_id("sess-x"));
     assert_eq!(
         st.conversations
             .conversation_for_session("sess-x")
             .as_deref(),
         Some(&orphan[..]),
-        "startup adopted it as an orphan"
     );
     assert_eq!(conversation_rows(&st).await.len(), 1);
 
