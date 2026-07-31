@@ -45,6 +45,11 @@ pub const MAX_HEALTH_TIMEOUT_SECS: u64 = 60;
 /// 3 s default fails most of the time — and a failed probe makes a perfectly reachable model
 /// unselectable. Still overridable per-model and by `JESSE_HEALTH_TIMEOUT_SECS`.
 pub const REASONING_HEALTH_TIMEOUT_SECS: u64 = 15;
+// The reasoning budget only means anything if it is WIDER than the default one. If a future
+// edit ever narrows it to the default or below, a thinking model probes as unhealthy again and
+// silently leaves the picker — the exact regression this const was added to fix. Checked at
+// compile time, so it holds for the release build and not just when the tests run.
+const _: () = assert!(REASONING_HEALTH_TIMEOUT_SECS > DEFAULT_HEALTH_TIMEOUT_SECS);
 /// Default probe endpoint on the model's Anthropic surface: a tiny `/v1/messages` call.
 pub const DEFAULT_HEALTH_PATH: &str = "/v1/messages";
 

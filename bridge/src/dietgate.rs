@@ -175,7 +175,6 @@ pub fn should_try_local_diet(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testutil::*;
 
     // Synthetic, generic English diet utterances the baseline gate must catch.
     const HITS: &[&str] = &[

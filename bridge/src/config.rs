@@ -2413,7 +2413,9 @@ mod tests {
             glm_env_entry(DEFAULT_HEALTH_INTERVAL_SECS, None).health.timeout_secs,
             DEFAULT_HEALTH_TIMEOUT_SECS
         );
-        assert!(REASONING_HEALTH_TIMEOUT_SECS > DEFAULT_HEALTH_TIMEOUT_SECS);
+        // (That REASONING_HEALTH_TIMEOUT_SECS exceeds the default is an invariant of the two
+        // constants, not of this wiring — it is asserted at compile time where they are
+        // defined, in health.rs.)
         for entry in [
             kimi_env_entry(DEFAULT_HEALTH_INTERVAL_SECS, Some(25)),
             glm_env_entry(DEFAULT_HEALTH_INTERVAL_SECS, Some(25)),

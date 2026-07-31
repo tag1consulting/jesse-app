@@ -58,7 +58,7 @@ jobs:
         run: cargo test --features containment-probe
 
       - name: Clippy
-        run: cargo clippy --features containment-probe -- -D warnings
+        run: cargo clippy --all-targets --features containment-probe -- -D warnings
 
       # Prebuilt binaries (no from-source compile): a dependency-CVE gate and the
       # coverage tool.
@@ -178,9 +178,9 @@ jobs:
           # on, so the app installs regardless of which iOS the runner ships.
           echo "deployment_target=${RUNTIME_VER}" >> "$GITHUB_OUTPUT"
 
-      # Warnings are errors for PRODUCTION code — symmetric with the bridge's
-      # `cargo clippy -- -D warnings`, which (without `--all-targets`) gates the
-      # library/binary, not the test code. The `build` action compiles the app and
+      # Warnings are errors for PRODUCTION code — the Swift-side counterpart of the
+      # bridge's `cargo clippy --all-targets -- -D warnings`, though narrower than it:
+      # that one covers the bridge's test code too. The `build` action compiles the app and
       # its embedded dependencies (watch app + widget extension) but not the
       # XCTest bundle, so this fails on any warning in shipping code while leaving
       # the (separately accumulated) test-only Swift-6-mode warnings out of scope.
