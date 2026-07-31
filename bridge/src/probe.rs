@@ -1884,6 +1884,10 @@ pub async fn run_battery(base: &Config, opts: &BatteryOptions) -> Result<RunOutc
         recorded: today(),
         gate: gate.to_string(),
         rows,
+        // A run probes the boundary; it has no opinion on who agreed to ship it. The
+        // committed record's acceptances are carried across by the `--write` path, which is
+        // the only place that can see the previous file.
+        accepted: Vec::new(),
     };
 
     if !opts.keep_scratch {

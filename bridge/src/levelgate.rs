@@ -674,7 +674,13 @@ mod tests {
         assert_eq!(errors.len(), 1, "{errors:?}");
         assert!(errors[0].message.contains("does not parse"), "{errors:?}");
         // …and a foreign schema is the same failure, not a permissive read.
-        let bumped = claude_record().replace("schema = 1", "schema = 99");
+        // Keyed off the constant, not a literal: this forgery silently became a no-op the
+        // last time the schema was bumped, and the test passed anyway.
+        let bumped = claude_record().replace(
+            &format!("schema = {}", crate::containment::RESULTS_SCHEMA),
+            "schema = 99",
+        );
+        assert!(bumped.contains("schema = 99"), "the forgery must have landed");
         let errors = validate(&test_config(), &[], &claude_only(&bumped));
         assert!(!errors.is_empty());
     }

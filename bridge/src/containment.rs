@@ -375,6 +375,56 @@ impl RowResult {
     }
 }
 
+/// An operator's recorded decision to SHIP a level whose record still has open baselines.
+///
+/// # Why this is a first-class key and not a comment
+///
+/// A `known_open` row says "this door is open". It deliberately says nothing about whether
+/// anyone agreed to ship it — the status exists so that decision is made on purpose rather
+/// than discovered by an incident. Once the decision IS made, it has to live somewhere the
+/// record can carry, for two reasons:
+///
+///   * a comment does not survive `--write`. The file is machine-rendered by
+///     [`render_results`], so a hand-added paragraph is erased by the next re-record — the
+///     one moment an operator most needs to see what was previously accepted.
+///   * a comment cannot be checked. With the decision as data, [`BatteryResults::unaccepted_known_open`]
+///     can name the open baselines nobody has signed for, and
+///     [`BatteryResults::stale_acceptances`] can name acceptances that outlived the finding
+///     they excused.
+///
+/// # What it does NOT do
+///
+/// It does not change a verdict, a status, or a gate. An accepted `known_open` is still
+/// `known_open`, still open, and still drift if it closes. Acceptance is a fact recorded
+/// ALONGSIDE the finding, never a rewrite of it — nothing in the scoring path reads this
+/// type, and nothing should. Accepting a finding is a statement about people, not about the
+/// boundary.
+#[derive(Debug, Clone, PartialEq, serde::Deserialize)]
+pub struct Acceptance {
+    /// The probe IDs this decision covers.
+    pub probes: Vec<String>,
+    /// The row labels (`read/qmd`, …) it covers. Acceptance is per ROW, not per level:
+    /// shipping `read` says nothing about the opens recorded at `write`.
+    pub rows: Vec<String>,
+    /// `YYYY-MM-DD` the decision was taken.
+    pub decided: String,
+    /// Who took it. A decision with no name on it is not a decision.
+    pub decided_by: String,
+    /// One line for a reader scanning the file.
+    pub summary: String,
+    /// The full reasoning, one array element per line so it round-trips through TOML
+    /// without a multi-line string literal.
+    #[serde(default)]
+    pub rationale: Vec<String>,
+}
+
+impl Acceptance {
+    /// Does this decision cover a given probe at a given row?
+    pub fn covers(&self, row_label: &str, probe_id: &str) -> bool {
+        self.rows.iter().any(|r| r == row_label) && self.probes.iter().any(|p| p == probe_id)
+    }
+}
+
 /// The whole committed record: what was probed, against which binary, when, and what came
 /// back per row and per probe.
 #[derive(Debug, Clone, PartialEq, serde::Deserialize)]
@@ -401,6 +451,11 @@ pub struct BatteryResults {
     pub gate: String,
     #[serde(default, rename = "row")]
     pub rows: Vec<RowResult>,
+    /// Decisions to ship a level whose record still has open baselines. Read by humans and
+    /// by the two reconciliation helpers below; read by NOTHING on the scoring or gating
+    /// path. See [`Acceptance`].
+    #[serde(default, rename = "accepted")]
+    pub accepted: Vec<Acceptance>,
 }
 
 impl BatteryResults {
@@ -408,6 +463,46 @@ impl BatteryResults {
         self.rows
             .iter()
             .find(|r| r.capability == capability && r.mcp_set == mcp_set)
+    }
+    /// Every open baseline that no [`Acceptance`] covers — the findings nobody has signed
+    /// for. Reported by `containment-probe` so "we accepted the read opens" cannot quietly
+    /// come to mean "we accepted everything".
+    pub fn unaccepted_known_open(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        for r in &self.rows {
+            for p in r.probes.iter().filter(|p| p.is_known_open()) {
+                if !self.accepted.iter().any(|a| a.covers(&r.label(), &p.id)) {
+                    out.push(format!("{}: {}", r.label(), p.id));
+                }
+            }
+        }
+        out
+    }
+    /// Every (acceptance, probe, row) that no longer names an open baseline — a decision
+    /// that outlived the finding it excused. Not an error: it means the door closed, or the
+    /// row was renamed. It does mean the acceptance should be removed on purpose rather
+    /// than left to imply a risk that is no longer being carried.
+    pub fn stale_acceptances(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        for a in &self.accepted {
+            for row_label in &a.rows {
+                for probe_id in &a.probes {
+                    let still_open = self
+                        .rows
+                        .iter()
+                        .find(|r| r.label() == *row_label)
+                        .and_then(|r| r.probe(probe_id))
+                        .is_some_and(|p| p.is_known_open());
+                    if !still_open {
+                        out.push(format!(
+                            "{row_label}: {probe_id} — accepted {} but is no longer known_open",
+                            a.decided
+                        ));
+                    }
+                }
+            }
+        }
+        out
     }
     /// Every hard gate that is not met, as operator-facing lines.
     pub fn hard_gate_failures(&self) -> Vec<String> {
@@ -450,7 +545,11 @@ pub fn parse_results(s: &str) -> Result<BatteryResults, String> {
 }
 
 /// The results-file schema version. Bump when the file's SHAPE changes.
-pub const RESULTS_SCHEMA: u32 = 1;
+///
+/// 2 — added the top-level `[[accepted]]` array ([`Acceptance`]). Both committed records
+/// carry it, so both were re-stamped; a schema-1 file is a loud parse failure rather than a
+/// file whose acceptances silently read as "none".
+pub const RESULTS_SCHEMA: u32 = 2;
 
 /// Compare a fresh run against the committed record. An empty result means they agree.
 ///
@@ -576,6 +675,14 @@ pub fn render_results(r: &BatteryResults) -> String {
          #   known_open — recorded reality, currently OPEN. A real finding, named here on\n\
          #                purpose so the decision to close it can be made deliberately rather\n\
          #                than discovered by an incident.\n\
+         #\n\
+         # `[[accepted]]` IS A DECISION, NOT A VERDICT. It records that a named person agreed\n\
+         # to SHIP a row whose baselines are still open, on a date, with the reasoning. It\n\
+         # changes NOTHING: an accepted `known_open` is still `known_open`, still open, and\n\
+         # still drift if it closes. It is a key rather than a comment because a comment does\n\
+         # not survive `--write` and cannot be checked — `containment-probe` reports open\n\
+         # baselines nobody signed for, and acceptances that outlived their finding.\n\
+         # Acceptance is per ROW: shipping `read` says nothing about the opens at `write`.\n\
          #\n",
     );
     s.push_str(&format!("\nschema = {}\n", r.schema));
@@ -590,6 +697,22 @@ pub fn render_results(r: &BatteryResults) -> String {
     ));
     s.push_str(&format!("recorded = {}\n", toml_string(&r.recorded)));
     s.push_str(&format!("gate = {}\n", toml_string(&r.gate)));
+
+    // The acceptances go ABOVE the rows on purpose: a reader who opens this file because a
+    // level shipped with open doors should meet the decision before the 24 rows it covers.
+    for a in &r.accepted {
+        s.push_str("\n[[accepted]]\n");
+        s.push_str(&format!("probes = {}\n", toml_array(&a.probes)));
+        s.push_str(&format!("rows = {}\n", toml_array(&a.rows)));
+        s.push_str(&format!("decided = {}\n", toml_string(&a.decided)));
+        s.push_str(&format!("decided_by = {}\n", toml_string(&a.decided_by)));
+        s.push_str(&format!("summary = {}\n", toml_string(&a.summary)));
+        s.push_str("rationale = [\n");
+        for line in &a.rationale {
+            s.push_str(&format!("  {},\n", toml_string(line)));
+        }
+        s.push_str("]\n");
+    }
 
     for row in &r.rows {
         let heading = format!("{} + mcp:{}", row.capability, row.mcp_set);
@@ -800,6 +923,14 @@ mod tests {
             bridge_version: "0.42.0".to_string(),
             recorded: "2026-07-29".to_string(),
             gate: "pass".to_string(),
+            accepted: vec![Acceptance {
+                probes: vec!["network_outbound".to_string()],
+                rows: vec!["read/qmd".to_string()],
+                decided: "2026-07-31".to_string(),
+                decided_by: "operator".to_string(),
+                summary: "shipped with the git verb scope open".to_string(),
+                rationale: vec!["a line".to_string(), String::new(), "another".to_string()],
+            }],
             rows: vec![RowResult {
                 capability: "read".to_string(),
                 mcp_set: "qmd".to_string(),
@@ -841,9 +972,70 @@ mod tests {
     }
 
     #[test]
+    fn an_acceptance_survives_being_rendered_and_re_parsed() {
+        // The whole reason acceptance is a KEY and not a comment: `--write` re-renders this
+        // file, and a comment would not come back.
+        let r = sample_results();
+        let parsed = parse_results(&render_results(&r)).expect("must parse");
+        assert_eq!(parsed.accepted, r.accepted);
+        let rendered = render_results(&r);
+        assert!(rendered.contains("[[accepted]]"), "{rendered}");
+        assert!(rendered.contains("decided_by"), "{rendered}");
+        // …and the file explains what the key does and does not mean.
+        assert!(rendered.contains("IS A DECISION, NOT A VERDICT"), "{rendered}");
+    }
+
+    #[test]
+    fn acceptance_changes_no_verdict_status_or_gate() {
+        // Accepting a finding is a statement about people. If this ever fails, something has
+        // started letting a decision rewrite the boundary it was a decision ABOUT.
+        let mut accepted = sample_results();
+        let bare = BatteryResults {
+            accepted: Vec::new(),
+            ..accepted.clone()
+        };
+        assert_eq!(accepted.gate, bare.gate);
+        assert_eq!(accepted.rows, bare.rows);
+        assert!(accepted.rows[0].probes[1].is_known_open());
+        assert!(compare_results(&bare, &accepted).is_empty(), "drift is verdict-only");
+        // Scoring never consults an acceptance: same inputs, same status.
+        accepted.accepted.clear();
+        assert!(accepted.rows[0].probes[1].is_known_open());
+    }
+
+    #[test]
+    fn an_open_baseline_nobody_signed_for_is_named() {
+        let mut r = sample_results();
+        // The sample accepts network_outbound at read/qmd, which is its one open baseline.
+        assert!(r.unaccepted_known_open().is_empty(), "{:?}", r.unaccepted_known_open());
+        // Acceptance is per ROW: the same probe open at a row nobody signed for is unsigned.
+        r.accepted[0].rows = vec!["write/qmd".to_string()];
+        let unsigned = r.unaccepted_known_open();
+        assert_eq!(unsigned.len(), 1);
+        assert!(unsigned[0].contains("read/qmd"), "{unsigned:?}");
+        assert!(unsigned[0].contains("network_outbound"), "{unsigned:?}");
+    }
+
+    #[test]
+    fn an_acceptance_that_outlived_its_finding_is_named() {
+        let mut r = sample_results();
+        assert!(r.stale_acceptances().is_empty());
+        // The door closed. The decision to carry that risk is now describing nothing.
+        r.rows[0].probes[1].status = "baseline".to_string();
+        r.rows[0].probes[1].verdict = "denied".to_string();
+        let stale = r.stale_acceptances();
+        assert_eq!(stale.len(), 1);
+        assert!(stale[0].contains("no longer known_open"), "{stale:?}");
+    }
+
+    #[test]
     fn a_results_file_from_another_schema_is_a_loud_failure() {
         let r = sample_results();
-        let rendered = render_results(&r).replace("schema = 1", "schema = 99");
+        // Keyed off the constant, not a literal: this test silently stopped forging anything
+        // the last time the schema was bumped.
+        let rendered = render_results(&r)
+            .replace(&format!("schema = {RESULTS_SCHEMA}"), "schema = 99");
+        assert!(rendered.contains("schema = 99"), "the forgery must have landed");
         let err = parse_results(&rendered).expect_err("a foreign schema must not parse");
         assert!(err.contains("schema"), "{err}");
     }
