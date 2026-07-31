@@ -68,9 +68,12 @@ impl ConversationRecord {
     /// single session it was adopted from, and only adoption ever mints an id that
     /// way. That keeps the persisted shape exactly the record above, and it stays
     /// correct across a state-dir rebuild (the derivation is the same function that
-    /// produced the id). Used by `bind_session` to decide whether a session may be
-    /// STOLEN: an orphan record is a placeholder for a transcript whose owning turn
-    /// had not finished yet, so a real conversation claiming that session must win.
+    /// produced the id).
+    ///
+    /// It used to decide whether `bind_session` could STEAL a session, on the theory that
+    /// an orphan record was a placeholder a real conversation should win. It no longer
+    /// does: a session belongs to whichever conversation already holds it. This is now
+    /// purely descriptive — it says where a record came from, and nothing branches on it.
     pub fn is_orphan_adopted(&self) -> bool {
         self.session_ids
             .first()
@@ -143,20 +146,14 @@ pub struct InFlight {
 /// The release must be unconditional, including on a panic and on the task abort a
 /// cancel performs, because a leaked row would suppress orphan adoption for that
 /// stem forever. Tying it to a guard's `Drop` (rather than an explicit call on each
-/// terminal path) is what makes that guarantee structural. The terminal path calls
-/// [`FlightClaim::take`] to consume the row it needs for the stem diff; the drop then
-/// finds nothing left to release.
+/// terminal path) is what makes that guarantee structural.
+///
+/// The turn holds the claim until AFTER it has bound the session ids its children
+/// reported, so no list refresh can adopt one of this turn's stems in the window between
+/// the turn ending and its ids being bound.
 pub struct FlightClaim {
     store: Arc<ConversationStore>,
     job_id: String,
-}
-
-impl FlightClaim {
-    /// Remove and return this turn's row, for the terminal stem diff. A second call
-    /// (or a call after the row was already released) yields `None`.
-    pub fn take(&self) -> Option<InFlight> {
-        self.store.release_flight(&self.job_id)
-    }
 }
 
 impl Drop for FlightClaim {
@@ -282,12 +279,18 @@ impl ConversationStore {
     /// dropped `--resume` after a sweep) into an ALIAS of the same conversation rather
     /// than a new row.
     ///
-    /// When the session is currently bound elsewhere, the other record is checked:
-    /// an ORPHAN-ADOPTED record (see [`ConversationRecord::is_orphan_adopted`]), or one
-    /// holding no other session, loses the session to this conversation and is dropped
-    /// once empty. That steal is the backstop that repairs a transcript orphan-adopted
-    /// before its owning turn finished. A genuine registered conversation holding OTHER
-    /// sessions keeps it, and the refusal is logged.
+    /// When the session is already bound to a DIFFERENT conversation it is left there,
+    /// whatever kind of record that is and however many sessions it holds. A session
+    /// belongs to one conversation; a second claim on it is a bug somewhere upstream, not
+    /// an instruction to move it.
+    ///
+    /// This used to steal, under a guard that refused only when the other record was
+    /// registered AND held more than one session — so an orphan-adopted record lost its
+    /// session unconditionally, and a REGISTERED conversation holding exactly one session
+    /// lost it too. The steal existed to repair a transcript orphan-adopted before its
+    /// owning turn finished; ownership now comes from the id the harness reports on its
+    /// first line, bound while the in-flight claim is still held, so there is no window
+    /// left for that repair to be needed.
     pub fn bind_session(&self, conversation_id: &str, session_id: &str) {
         let session_id = session_id.trim();
         if conversation_id.is_empty() || session_id.is_empty() {
@@ -312,26 +315,11 @@ impl ConversationStore {
                     inner.reindex();
                     snapshot
                 } else {
-                    let other = inner.map.get(&owner).cloned().unwrap_or_default();
-                    if !other.is_orphan_adopted() && other.session_ids.len() > 1 {
-                        eprintln!(
-                            "jesse-bridge: session {session_id} is already bound to registered \
-                             conversation {owner} with other sessions, not stealing it for \
-                             {conversation_id}"
-                        );
-                        return;
-                    }
-                    if let Some(loser) = inner.map.get_mut(&owner) {
-                        loser.session_ids.retain(|s| s != session_id);
-                        if loser.session_ids.is_empty() {
-                            inner.map.remove(&owner);
-                        }
-                    }
-                    let rec = inner.map.get_mut(conversation_id).expect("checked above");
-                    rec.session_ids.push(session_id.to_string());
-                    let snapshot = inner.snapshot();
-                    inner.reindex();
-                    snapshot
+                    eprintln!(
+                        "jesse-bridge: session {session_id} is already bound to conversation \
+                         {owner}, not rebinding it to {conversation_id}"
+                    );
+                    return;
                 }
             } else {
                 let rec = inner.map.get_mut(conversation_id).expect("checked above");
@@ -816,9 +804,12 @@ mod tests {
     }
 
     #[test]
-    fn bind_steals_a_session_from_an_orphan_record_and_drops_it() {
-        // The repair path: a transcript orphan-adopted while its owning turn was still
-        // running must be reclaimed by the real conversation when that turn finishes.
+    fn bind_never_steals_a_session_from_an_orphan_adopted_record() {
+        // The steal used to fire here unconditionally: an orphan-adopted record lost its
+        // session to any conversation that claimed it. It repaired a transcript adopted
+        // before its owning turn finished — a window the reported-session-id binding no
+        // longer leaves open — while also letting a foreign transcript be aliased onto a
+        // live phone thread. A session belongs to one conversation.
         let store = ConversationStore::new(None);
         let orphan = store.adopt_orphan_session("sess-1", 10);
         let real = cid();
@@ -826,13 +817,14 @@ mod tests {
         store.bind_session(&real, "sess-1");
         assert_eq!(
             store.conversation_for_session("sess-1").as_deref(),
-            Some(&real[..])
+            Some(&orphan[..]),
+            "the adopted record keeps its session"
         );
         assert!(
-            store.get(&orphan).is_none(),
-            "emptied orphan record is dropped"
+            store.get(&real).unwrap().session_ids.is_empty(),
+            "and the claimant gains nothing"
         );
-        assert_eq!(store.len(), 1, "exactly one conversation remains");
+        assert_eq!(store.len(), 2, "both records survive");
     }
 
     #[test]
@@ -852,6 +844,56 @@ mod tests {
         );
         assert!(store.get(&thief).unwrap().session_ids.is_empty());
         assert_eq!(store.get(&owner).unwrap().session_ids.len(), 2);
+    }
+
+    #[test]
+    fn bind_refuses_to_steal_from_a_registered_conversation_holding_exactly_one_session() {
+        // THE CASE THE OLD GUARD MISSED. It refused only when the other record was
+        // registered AND held more than one session, so a registered conversation whose
+        // single session was its only one could be stolen from outright — the same
+        // exposure the orphan case had, on a genuine phone thread.
+        let store = ConversationStore::new(None);
+        let owner = cid();
+        store.register(&owner, Some("phone"), 1);
+        store.bind_session(&owner, "sess-solo");
+        assert_eq!(store.get(&owner).unwrap().session_ids.len(), 1);
+
+        let thief = cid();
+        store.register(&thief, Some("mac"), 2);
+        store.bind_session(&thief, "sess-solo");
+
+        assert_eq!(
+            store.conversation_for_session("sess-solo").as_deref(),
+            Some(&owner[..]),
+            "a registered conversation keeps its only session"
+        );
+        assert!(store.get(&thief).unwrap().session_ids.is_empty());
+        assert!(store.get(&owner).is_some(), "and is not dropped");
+    }
+
+    #[test]
+    fn rebinding_a_session_a_conversation_already_owns_makes_it_current() {
+        // The one case that is NOT a steal and must keep working: a conversation
+        // re-binding its own session promotes it to current, which is what a resume
+        // targets. Continuing an orphan-adopted conversation from the phone runs straight
+        // through this path.
+        let store = ConversationStore::new(None);
+        let id = cid();
+        store.register(&id, Some("phone"), 1);
+        store.bind_session(&id, "sess-a");
+        store.bind_session(&id, "sess-b");
+        assert_eq!(store.current_session(&id).as_deref(), Some("sess-b"));
+        store.bind_session(&id, "sess-a");
+        assert_eq!(
+            store.current_session(&id).as_deref(),
+            Some("sess-a"),
+            "re-binding an owned session promotes it to current"
+        );
+        assert_eq!(
+            store.get(&id).unwrap().session_ids.len(),
+            2,
+            "and does not duplicate it"
+        );
     }
 
     #[test]
@@ -943,12 +985,12 @@ mod tests {
         assert!(!store.suppresses_orphan("old-1"));
         // A stem that appeared DURING the turn is suppressed: it is this turn's.
         assert!(store.suppresses_orphan("mid-turn"));
-        // Taking the row for the terminal stem diff releases it.
-        let row = claim.take().expect("the claim is still live");
-        assert_eq!(row.conversation_id, id);
-        assert_eq!(row.spawn_ms, 100);
+        // Dropping the claim — what the turn does once it has bound the ids its children
+        // reported — releases the suppression.
+        assert_eq!(store.in_flight_conversations().len(), 1);
+        drop(claim);
         assert!(!store.suppresses_orphan("mid-turn"));
-        assert!(claim.take().is_none(), "a second take yields nothing");
+        assert!(store.in_flight_conversations().is_empty());
     }
 
     #[test]

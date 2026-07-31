@@ -15,6 +15,72 @@ CI both run it). See the "Versioning" section of `bridge/README.md`.
 
 ## [Unreleased]
 
+## [Bridge 0.47.0] - 2026-07-31
+
+> Builds on Bridge 0.46.0 (the no-blanket-adoption change), which landed first.
+
+### Changed
+- **A turn's session is now the id the harness REPORTS, not one inferred from a directory
+  diff.**
+
+  Root cause: the terminal binding step diffed the transcript directory before and after
+  the turn and bound every stem that had appeared. That directory
+  (`~/.claude/projects/<escaped-cwd>`) is keyed only on the cwd and is shared with every
+  other `claude` invocation against the same vault, so a transcript written by an unrelated
+  terminal run *while a phone turn happened to be in flight* was attributed to that
+  conversation — and, because a conversation resumes its LAST bound session, became its
+  resume target. Nothing in the diff could tell the two apart; a directory listing carries
+  no provenance.
+
+  Claude Code states the answer outright: the `system`/`init` event, the first line of
+  `--output-format stream-json`, carries `session_id`, and that id names the transcript
+  stem exactly (verified against claude 2.1.220 by running the CLI with the harness's own
+  flags; `--resume` reports the resumed id rather than minting a fresh one). The driver now
+  records it via a new `StreamEvent::SessionId`, and the turn binds exactly those ids.
+
+  Because the id arrives on the child's FIRST line rather than in the terminal `result`
+  envelope, this also fixes the case the diff existed for: a turn that dies mid-flight has
+  already said which session it owns. The reply's `session_id` remains only as a fallback
+  for a harness that reports none.
+
+  A retry contributes one id per attempt, all bound in spawn order, so the last stays
+  current — a resume continues the attempt that actually answered, and no earlier attempt's
+  transcript is stranded.
+
+- **A session already bound to a conversation is never reassigned to another.**
+
+  The old guard in `bind_session` refused a steal only when the other record was
+  *registered* AND held *more than one* session. Two holes followed: an orphan-adopted
+  record lost its session unconditionally, and — less obviously — a genuine REGISTERED
+  conversation holding exactly one session could be stolen from outright. Combined with the
+  directory diff above, that is the mechanism by which a foreign transcript could be
+  aliased onto a live phone thread.
+
+  A session now belongs to one conversation, whatever kind of record holds it and however
+  many sessions that record holds. A second claim is a bug upstream, not an instruction to
+  move it; it is logged and ignored. Re-binding a session a conversation *already owns*
+  still promotes it to current, which is what a resume targets, so continuing an existing
+  thread is unaffected.
+
+  The steal existed to repair a transcript orphan-adopted before its owning turn finished.
+  That window is now closed at the source: the turn holds its in-flight claim until after
+  it has bound the reported ids, so no concurrent list refresh can adopt one of its stems
+  first.
+
+### Removed
+- **The stem-diff binding path** (`bind_new_stems`) and its residue (`FlightClaim::take`,
+  which existed only to hand the in-flight row to that diff).
+
+  Neither the diff nor the steal has ever fired in the deployed log, so this is a latent
+  correctness fix rather than an incident repair.
+
+  The in-flight table is KEPT for now, but note what it is after 0.46.0 removed adoption:
+  `stems_before` fed `suppresses_orphan`, whose only caller was the adoption scan, so the
+  suppression now has **no production reader**. `claim_flight` still lists the projects dir
+  before every spawn to build that set. It is inert rather than wrong — the claim's
+  lifetime is still what keeps the bind window closed — but the snapshot itself is dead
+  weight and should come out in its own change rather than widening this one.
+
 ## [Bridge 0.46.0] - 2026-07-31
 
 ### Removed

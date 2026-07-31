@@ -604,50 +604,6 @@ impl UnownedReason {
     }
 }
 
-/// Bind every transcript that appeared WHILE a turn was running to that turn's
-/// conversation. The turn's terminal step, run after the reply's own session id (if
-/// any) has been bound.
-///
-/// This is what rescues two cases the reply alone cannot: a turn that failed before
-/// returning a session id at all, and a turn whose transcript was orphan-adopted by a
-/// concurrent list refresh that beat the suppression window. A stem already bound to a
-/// genuine REGISTERED conversation is left alone (it is somebody else's); an
-/// orphan-adopted one is stolen back by `bind_session`. A title-mint transcript written
-/// during the turn is skipped: it is not part of the conversation.
-pub fn bind_new_stems(
-    dir: &Path,
-    conversations: &ConversationStore,
-    conversation_id: &str,
-    flight: &InFlight,
-) -> Vec<String> {
-    let mut bound = Vec::new();
-    let mut stems: Vec<String> = transcript_stems(dir)
-        .into_iter()
-        .filter(|s| !flight.stems_before.contains(s))
-        .collect();
-    stems.sort();
-    for stem in stems {
-        if let Some(owner) = conversations.conversation_for_session(&stem) {
-            if owner == conversation_id {
-                continue;
-            }
-            let registered = conversations
-                .get(&owner)
-                .map(|r| !r.is_orphan_adopted())
-                .unwrap_or(false);
-            if registered {
-                continue;
-            }
-        }
-        if is_title_mint_transcript(&dir.join(format!("{stem}.jsonl"))) {
-            continue;
-        }
-        conversations.bind_session(conversation_id, &stem);
-        bound.push(stem);
-    }
-    bound
-}
-
 /// The session a turn should resume, resolved CONVERSATION FIRST: the conversation's
 /// current bound session wins, falling back to the id the request carried (an older
 /// client that knows nothing about conversations). Whichever id results is still fed
