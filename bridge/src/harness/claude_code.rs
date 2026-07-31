@@ -243,6 +243,16 @@ pub fn parse_stream_line(line: &str) -> StreamEvent {
     match v.get("type").and_then(|t| t.as_str()) {
         // The one terminal line — feeds the existing Ok/Retryable/Fatal logic.
         Some("result") => StreamEvent::Done(classify_result_value(&v, None)),
+        // The `init` event, first line of the stream, carrying the session id this turn
+        // runs under. It is the authoritative answer to "which session does this turn
+        // belong to" and replaces inferring it from a directory diff. Any other `system`
+        // subtype (`status`, …) carries nothing.
+        Some("system") if v.get("subtype").and_then(|s| s.as_str()) == Some("init") => v
+            .get("session_id")
+            .and_then(|s| s.as_str())
+            .filter(|s| !s.trim().is_empty())
+            .map(|s| StreamEvent::SessionId(s.to_string()))
+            .unwrap_or(StreamEvent::Ignore),
         // Token-level events (emitted under --include-partial-messages). The
         // visible answer streams as `text_delta`s inside a `text` content block;
         // tool use announces itself with a `tool_use` content-block start.
@@ -790,10 +800,30 @@ mod tests {
             StreamEvent::Ignore
         ));
         assert!(matches!(parse_stream_line("   "), StreamEvent::Ignore));
-        let init = r#"{"type":"system","subtype":"init","session_id":"s","tools":[]}"#;
-        assert!(matches!(parse_stream_line(init), StreamEvent::Ignore));
         let rate = r#"{"type":"rate_limit_event","rate_limit_info":{"status":"allowed"}}"#;
         assert!(matches!(parse_stream_line(rate), StreamEvent::Ignore));
+        // A `system` event that is not `init` names no session.
+        let status = r#"{"type":"system","subtype":"status","session_id":"s"}"#;
+        assert!(matches!(parse_stream_line(status), StreamEvent::Ignore));
+    }
+
+    #[test]
+    fn the_init_event_yields_the_session_id_the_cli_reported() {
+        // Verified against claude 2.1.220: `system`/`init` is the FIRST line of the
+        // stream and carries the session id, which names the transcript stem exactly.
+        // This is the authoritative answer to "which session does this turn belong to".
+        let init = r#"{"type":"system","subtype":"init","session_id":"a92c3087-9cc5-47e4-8a61-391ada0dec0d","cwd":"/v","tools":[]}"#;
+        match parse_stream_line(init) {
+            StreamEvent::SessionId(id) => {
+                assert_eq!(id, "a92c3087-9cc5-47e4-8a61-391ada0dec0d")
+            }
+            other => panic!("expected SessionId, got {other:?}"),
+        }
+        // A malformed init (no id, or a blank one) must not manufacture a binding.
+        let no_id = r#"{"type":"system","subtype":"init","cwd":"/v"}"#;
+        assert!(matches!(parse_stream_line(no_id), StreamEvent::Ignore));
+        let blank = r#"{"type":"system","subtype":"init","session_id":"  "}"#;
+        assert!(matches!(parse_stream_line(blank), StreamEvent::Ignore));
     }
 
     /// The per-turn parser is a thin wrapper: the same line yields the same event, and a

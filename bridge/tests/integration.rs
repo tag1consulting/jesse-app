@@ -5361,8 +5361,12 @@ fn claude_writing_transcript(
     sid: &str,
     sleep_secs: u32,
 ) -> std::path::PathBuf {
+    // Mirrors the real CLI's ordering, verified against claude 2.1.220: the
+    // `system`/`init` line naming the session comes out FIRST, before the transcript
+    // exists, and the terminal `result` line repeats the same id.
     let script = format!(
         "#!/bin/sh\n\
+         printf '%s\\n' '{{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"{sid}\",\"cwd\":\"/v\"}}'\n\
          printf '%s\\n' '{{\"type\":\"user\",\"message\":{{\"content\":\"turn text\"}}}}' > '{}/{sid}.jsonl'\n\
          sleep {sleep_secs}\n\
          printf '%s' '{{\"type\":\"result\",\"is_error\":false,\"result\":\"ok\",\"session_id\":\"{sid}\"}}'\n",
@@ -5552,7 +5556,6 @@ async fn a_reply_with_a_different_session_id_appends_an_alias_not_a_new_row() {
     // naming `sess-new`. Both must belong to ONE conversation, and the list must
     // still show exactly one row.
     let (home, vault, proj) = conv_fixture();
-    write_transcript(&proj, "sess-old", "the original question");
     let fake = claude_writing_transcript(&proj, "sess-new", 0);
     let st = AppState::new(Config {
         home: home.to_string_lossy().into_owned(),
@@ -5563,10 +5566,11 @@ async fn a_reply_with_a_different_session_id_appends_an_alias_not_a_new_row() {
     });
     // The client already holds this conversation and knows `sess-old` belongs to it
     // (that is how it learned the id in the first place, from the list's `session_ids`),
-    // so bind it up front. This also exercises the steal: the transcript was
-    // orphan-adopted at startup and the real conversation takes it back.
+    // so bind it up front — then the transcript lands under an id the conversation
+    // already owns, which is the ordering a real turn has.
     st.conversations.register(CID_A, Some("phone"), 1_000);
     st.conversations.bind_session(CID_A, "sess-old");
+    write_transcript(&proj, "sess-old", "the original question");
     assert_eq!(
         st.conversations
             .conversation_for_session("sess-old")
@@ -5637,13 +5641,15 @@ async fn binding_happens_with_context_carry_disabled() {
 #[tokio::test]
 async fn two_bound_transcripts_yield_one_row_with_the_oldest_snippet_and_newest_mtime() {
     let (home, vault, proj) = conv_fixture();
-    write_transcript(&proj, "seg-a", "the first question");
-    write_transcript(&proj, "seg-b", "a later question");
+    // The conversation owns both segments from the start. (Previously these were written
+    // first, orphan-adopted at startup, and STOLEN back by `bind_session` — a steal that
+    // no longer happens, and never belonged in a fixture whose subject is the list.)
     let st = conv_state(&home, &vault);
-    // Both stems were adopted separately at startup; bind them into one conversation.
     st.conversations.register(CID_A, Some("phone"), 1_000);
     st.conversations.bind_session(CID_A, "seg-a");
     st.conversations.bind_session(CID_A, "seg-b");
+    write_transcript(&proj, "seg-a", "the first question");
+    write_transcript(&proj, "seg-b", "a later question");
     set_mtime_secs(&proj.join("seg-a.jsonl"), 1_000);
     set_mtime_secs(&proj.join("seg-b.jsonl"), 5_000);
 
@@ -5852,9 +5858,6 @@ async fn conversations_list_honors_etag_304_and_since() {
 #[tokio::test]
 async fn conversation_delete_removes_every_transcript_tombstones_and_is_idempotent() {
     let (home, vault, proj) = conv_fixture();
-    write_transcript(&proj, "seg-a", "q1");
-    write_transcript(&proj, "seg-b", "q2");
-    write_transcript(&proj, "keep", "untouched");
     let st = conv_state(&home, &vault);
     st.conversations.register(CID_A, Some("phone"), 1_000);
     st.conversations.bind_session(CID_A, "seg-a");
@@ -5862,6 +5865,10 @@ async fn conversation_delete_removes_every_transcript_tombstones_and_is_idempote
     st.titles.set(CID_A, "Doomed");
     // `keep` belongs to a second conversation, so it survives the delete AND still lists.
     own_transcript(&st, "keep");
+    // Written after every binding, which is the ordering a real turn has.
+    write_transcript(&proj, "seg-a", "q1");
+    write_transcript(&proj, "seg-b", "q2");
+    write_transcript(&proj, "keep", "untouched");
 
     let resp = app(st.clone())
         .oneshot(conversation_delete_request(
@@ -6019,10 +6026,10 @@ async fn hydrate_reads_full_then_delta_then_across_a_segment_boundary_without_re
         r#"{"type":"assistant","message":{"content":[{"type":"text","text":"r1"}]}}"#,
         "\n",
     );
-    std::fs::write(proj.join("seg-a.jsonl"), seg_a).unwrap();
     let st = conv_state(&home, &vault);
     st.conversations.register(CID_A, Some("phone"), 1_000);
     st.conversations.bind_session(CID_A, "seg-a");
+    std::fs::write(proj.join("seg-a.jsonl"), seg_a).unwrap();
 
     // Full read.
     let (turns, cursor) = hydrate_conv(&st, CID_A, None).await;
@@ -6080,11 +6087,11 @@ async fn turn_keys_are_stable_across_hydrates_and_unique_within_a_conversation()
         r#"{"type":"user","message":{"content":"same"}}"#,
         "\n",
     );
-    std::fs::write(proj.join("seg-a.jsonl"), seg).unwrap();
-    std::fs::write(proj.join("seg-b.jsonl"), seg).unwrap();
     let st = conv_state(&home, &vault);
     st.conversations.register(CID_A, Some("phone"), 1_000);
     st.conversations.bind_session(CID_A, "seg-a");
+    std::fs::write(proj.join("seg-a.jsonl"), seg).unwrap();
+    std::fs::write(proj.join("seg-b.jsonl"), seg).unwrap();
     st.conversations.bind_session(CID_A, "seg-b");
 
     let (first, _) = hydrate_conv(&st, CID_A, None).await;
@@ -6115,12 +6122,12 @@ async fn turn_keys_are_stable_across_hydrates_and_unique_within_a_conversation()
 async fn hydrate_skips_a_deleted_segment_and_advances_past_it() {
     let (home, vault, proj) = conv_fixture();
     let seg_b = "{\"type\":\"user\",\"message\":{\"content\":\"survivor\"}}\n";
-    std::fs::write(proj.join("seg-b.jsonl"), seg_b).unwrap();
     let st = conv_state(&home, &vault);
     st.conversations.register(CID_A, Some("phone"), 1_000);
     // Segment 0 is bound but its file never exists (swept by GC, or deleted).
     st.conversations.bind_session(CID_A, "seg-gone");
     st.conversations.bind_session(CID_A, "seg-b");
+    std::fs::write(proj.join("seg-b.jsonl"), seg_b).unwrap();
 
     // A cursor pointing AT the missing segment skips it and reads on.
     let (turns, cursor) = hydrate_conv(&st, CID_A, Some("0:0")).await;
@@ -6159,7 +6166,6 @@ async fn hydrate_skips_a_deleted_segment_and_advances_past_it() {
 #[tokio::test]
 async fn a_restart_reloads_the_registry_and_a_resume_still_resolves() {
     let (home, vault, proj) = conv_fixture();
-    write_transcript(&proj, "sess-live", "q");
     let state_dir = std::env::temp_dir().join(format!("jesse-state-{}", random_hex()));
     std::fs::create_dir_all(&state_dir).unwrap();
     let cfg = Config {
@@ -6174,6 +6180,9 @@ async fn a_restart_reloads_the_registry_and_a_resume_still_resolves() {
         st.conversations.bind_session(CID_A, "sess-live");
         st.titles.set(CID_A, "Persisted");
     }
+    // Written AFTER the conversation owns it, so the second bridge's startup adoption has
+    // nothing to claim — the record is what carries ownership across the restart.
+    write_transcript(&proj, "sess-live", "q");
     // A fresh bridge over the same state dir.
     let st2 = AppState::new(cfg.clone());
     let rec = st2.conversations.get(CID_A).expect("the record reloaded");
@@ -6382,14 +6391,145 @@ async fn in_flight_transcript_produces_no_row_then_binds_on_terminal() {
 }
 
 #[tokio::test]
-async fn a_failed_turn_still_binds_the_transcript_it_created() {
-    // The failure variant: the CLI writes its transcript and then dies without ever
-    // returning a session id. The reply binding has nothing to work with, so the
-    // terminal STEM DIFF is the only thing that can claim the file. Without it the stem
-    // would be adopted on the next refresh as a separate conversation.
+async fn a_turn_binds_only_the_session_it_reported_not_a_stem_that_merely_appeared() {
+    // THE defect this change removes. The turn's own session is `sess-mine`; while it
+    // runs, a transcript the bridge did not start — a desktop Claude Code run against the
+    // same vault, whose projects dir is keyed only on the cwd — appears in the same
+    // directory. The old terminal step diffed the directory and bound EVERY stem that had
+    // appeared, so that foreign transcript was aliased onto this live conversation and
+    // became its resume target.
+    //
+    // Ownership now comes from the id the child reported on its `init` line, so the
+    // foreign stem is simply not this turn's business.
     let (home, vault, proj) = conv_fixture();
     let script = format!(
         "#!/bin/sh\n\
+         printf '%s\\n' '{{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"sess-mine\",\"cwd\":\"/v\"}}'\n\
+         printf '%s\\n' '{{\"type\":\"user\",\"message\":{{\"content\":\"mine\"}}}}' > '{p}/sess-mine.jsonl'\n\
+         printf '%s\\n' '{{\"type\":\"user\",\"message\":{{\"content\":\"somebody else\\u0027s terminal run\"}}}}' > '{p}/sess-foreign.jsonl'\n\
+         printf '%s' '{{\"type\":\"result\",\"is_error\":false,\"result\":\"ok\",\"session_id\":\"sess-mine\"}}'\n",
+        p = proj.display()
+    );
+    let fake = write_fake_claude(&script);
+    let st = AppState::new(Config {
+        home: home.to_string_lossy().into_owned(),
+        vault: vault.clone(),
+        state_dir: None,
+        claude_bin: fake.to_string_lossy().into_owned(),
+        timeout_secs: 30,
+        ..test_config()
+    });
+
+    let body = post_turn(
+        &st,
+        &format!(r#"{{"mode":"ask","text":"hi","conversation_id":"{CID_A}"}}"#),
+    )
+    .await;
+    wait_for_done(&st, body["job_id"].as_str().unwrap()).await;
+
+    assert_eq!(
+        st.conversations
+            .conversation_for_session("sess-mine")
+            .as_deref(),
+        Some(CID_A),
+        "the reported session is bound"
+    );
+    assert_eq!(
+        st.conversations.get(CID_A).unwrap().session_ids,
+        vec!["sess-mine".to_string()],
+        "and it is the ONLY session bound — the concurrent stem is not this turn's"
+    );
+    assert_ne!(
+        st.conversations
+            .conversation_for_session("sess-foreign")
+            .as_deref(),
+        Some(CID_A),
+        "the foreign transcript is never aliased onto this conversation"
+    );
+    // And it cannot become this conversation's resume target, which is what made the
+    // original symptom self-sustaining.
+    assert_eq!(
+        resolve_conversation_resume(&st.conversations, CID_A, None).as_deref(),
+        Some("sess-mine")
+    );
+    let _ = std::fs::remove_dir_all(&home);
+    let _ = std::fs::remove_file(&fake);
+}
+
+#[tokio::test]
+async fn a_retried_turn_binds_every_attempt_and_the_last_stays_current() {
+    // A retry spawns a fresh child with a fresh session and a fresh transcript. All of
+    // them are this conversation's; binding them in spawn order leaves the LAST current,
+    // which is what a resume targets. Ignoring the earlier ones would strand a transcript
+    // that nothing else will ever claim.
+    let (home, vault, proj) = conv_fixture();
+    let counter = std::env::temp_dir().join(format!("jesse-retry-{}", random_hex()));
+    // Attempt 1 announces `sess-try1`, writes its transcript, then returns a RETRYABLE
+    // envelope. Attempt 2 announces `sess-try2` and succeeds.
+    let script = format!(
+        "#!/bin/sh\n\
+         n=$(cat '{c}' 2>/dev/null || echo 0)\n\
+         n=$((n+1)); printf '%s' \"$n\" > '{c}'\n\
+         if [ \"$n\" = \"1\" ]; then\n\
+           printf '%s\\n' '{{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"sess-try1\",\"cwd\":\"/v\"}}'\n\
+           printf '%s\\n' '{{\"type\":\"user\",\"message\":{{\"content\":\"attempt one\"}}}}' > '{p}/sess-try1.jsonl'\n\
+           printf '%s' '{{\"type\":\"result\",\"is_error\":true,\"subtype\":\"error_during_execution\",\"api_error_status\":503,\"result\":\"upstream 503\",\"session_id\":\"sess-try1\"}}'\n\
+         else\n\
+           printf '%s\\n' '{{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"sess-try2\",\"cwd\":\"/v\"}}'\n\
+           printf '%s\\n' '{{\"type\":\"user\",\"message\":{{\"content\":\"attempt two\"}}}}' > '{p}/sess-try2.jsonl'\n\
+           printf '%s' '{{\"type\":\"result\",\"is_error\":false,\"result\":\"ok\",\"session_id\":\"sess-try2\"}}'\n\
+         fi\n",
+        c = counter.display(),
+        p = proj.display()
+    );
+    let fake = write_fake_claude(&script);
+    let st = AppState::new(Config {
+        home: home.to_string_lossy().into_owned(),
+        vault: vault.clone(),
+        state_dir: None,
+        claude_bin: fake.to_string_lossy().into_owned(),
+        timeout_secs: 30,
+        ..test_config()
+    });
+
+    let body = post_turn(
+        &st,
+        &format!(r#"{{"mode":"ask","text":"hi","conversation_id":"{CID_A}"}}"#),
+    )
+    .await;
+    wait_for_done(&st, body["job_id"].as_str().unwrap()).await;
+
+    assert_eq!(
+        st.conversations.get(CID_A).unwrap().session_ids,
+        vec!["sess-try1".to_string(), "sess-try2".to_string()],
+        "both attempts' sessions belong to the conversation, in spawn order"
+    );
+    assert_eq!(
+        resolve_conversation_resume(&st.conversations, CID_A, None).as_deref(),
+        Some("sess-try2"),
+        "the last attempt is what a resume continues"
+    );
+    let rows = conversation_rows(&st).await;
+    assert_eq!(rows.len(), 1, "one row, not one per attempt: {rows:?}");
+    let _ = std::fs::remove_dir_all(&home);
+    let _ = std::fs::remove_file(&fake);
+    let _ = std::fs::remove_file(&counter);
+}
+
+#[tokio::test]
+async fn a_failed_turn_still_binds_the_transcript_it_created() {
+    // The failure variant, and the case that most justifies reading the id off the stream:
+    // the CLI announces its session on the `init` line, writes its transcript, and THEN
+    // dies without ever reaching a `result` line. There is no reply session id to bind and
+    // no terminal envelope at all — but the child already said which session it owns, so
+    // the transcript is still claimed and does not surface as a second conversation.
+    //
+    // The fake mirrors the real ordering (verified against claude 2.1.220: `system`/`init`
+    // carrying `session_id` is the first line out, before any transcript exists).
+    let (home, vault, proj) = conv_fixture();
+    let script = format!(
+        "#!/bin/sh\n\
+         printf '%s\\n' '{{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"sess-failed\",\"cwd\":\"/v\"}}'\n\
          printf '%s\\n' '{{\"type\":\"user\",\"message\":{{\"content\":\"orphaned\"}}}}' > '{}/sess-failed.jsonl'\n\
          echo 'boom' >&2\n\
          exit 1\n",
@@ -6428,7 +6568,8 @@ async fn a_failed_turn_still_binds_the_transcript_it_created() {
             .conversation_for_session("sess-failed")
             .as_deref(),
         Some(CID_A),
-        "the stem diff bound the transcript even with no reply session id"
+        "the id the child reported on `init` bound the transcript, with no reply session id \
+         and no result line at all"
     );
     let rows = conversation_rows(&st).await;
     assert_eq!(rows.len(), 1, "one row, not two: {rows:?}");
@@ -6438,14 +6579,21 @@ async fn a_failed_turn_still_binds_the_transcript_it_created() {
 }
 
 #[tokio::test]
-async fn a_real_conversation_steals_an_orphan_adopted_transcript_back() {
-    // The repair path end to end: an orphan-adopted record owns a transcript, and the
-    // turn that actually produced it then claims it. The orphan row must disappear.
+async fn a_session_already_owned_is_never_reassigned_to_another_conversation() {
+    // The steal is GONE, and this is what replaces it end to end. A transcript owned by
+    // one conversation (here an orphan-adopted record) stays there when a different
+    // conversation claims the same session.
     //
-    // Nothing adopts at runtime any more, but this state is not synthetic: every store
-    // written before that change still holds orphan-adopted records (731 of them on the
-    // deploy that surfaced the defect), so the steal path stays reachable for them. Seed
-    // it explicitly rather than via a directory scan.
+    // The steal existed to repair a transcript orphan-adopted before its owning turn
+    // finished. That window is closed at the source now: a turn binds the id its child
+    // reported on `init`, while the in-flight claim is still held, so no refresh can adopt
+    // the stem first. What the steal ALSO did was let any conversation take over a session
+    // another one already held — which is how a foreign transcript could be aliased onto a
+    // live phone thread and become its resume target.
+    //
+    // Nothing adopts at runtime any more, so the orphan record is seeded explicitly. That
+    // state is not synthetic: every store written before adoption was removed still holds
+    // orphan-adopted records (731 of them on the deploy that surfaced the defect).
     let (home, vault, proj) = conv_fixture();
     write_transcript(&proj, "sess-x", "q");
     let st = conv_state(&home, &vault);
@@ -6466,15 +6614,22 @@ async fn a_real_conversation_steals_an_orphan_adopted_transcript_back() {
         st.conversations
             .conversation_for_session("sess-x")
             .as_deref(),
-        Some(CID_A),
-        "the real conversation won the session"
+        Some(&orphan[..]),
+        "the session stays with the conversation that already held it"
     );
     assert!(
-        st.conversations.get(&orphan).is_none(),
-        "the emptied orphan record is dropped"
+        st.conversations.get(&orphan).is_some(),
+        "and that record is not dropped"
     );
-    let rows = conversation_rows(&st).await;
-    assert_eq!(rows.len(), 1, "one row remains: {rows:?}");
-    assert_eq!(rows[0]["conversation_id"], CID_A);
+    assert!(
+        st.conversations.get(CID_A).unwrap().session_ids.is_empty(),
+        "the claimant gains nothing"
+    );
+    // The resume target is unaffected: CID_A owns no session, so it starts fresh rather
+    // than silently continuing somebody else's transcript.
+    assert_eq!(
+        resolve_conversation_resume(&st.conversations, CID_A, None),
+        None
+    );
     let _ = std::fs::remove_dir_all(&home);
 }

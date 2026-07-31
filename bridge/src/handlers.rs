@@ -218,6 +218,7 @@ pub async fn run_ask_hosted_or_emergency(
     emergency_armed: bool,
     active: &ActiveModel,
     recent_context: Option<&str>,
+    spawned: &SpawnedSessions,
 ) -> AskResult {
     let now = Instant::now();
     // Which model would answer an emergency ask: the same routing rule the routine route
@@ -284,6 +285,7 @@ pub async fn run_ask_hosted_or_emergency(
             jid,
             active,
             cfg.harnesses.turn_harness(),
+            spawned,
         )
         .await,
     );
@@ -695,17 +697,21 @@ pub async fn jesse(
         // Turn wall clock starts here (after the permit — queued time doesn't count).
         let turn_start = Instant::now();
 
+        // Where the driver records the session id each spawned child reports on its first
+        // line. THE authority on which sessions this turn owns — the terminal step binds
+        // exactly these, rather than inferring ownership from a directory diff.
+        let spawned = SpawnedSessions::new();
+
         // ---- Claim the in-flight slot BEFORE the CLI can write a transcript --------
         //
         // The CLI creates `<session_id>.jsonl` while the turn is still running, so a
         // conversation-list refresh issued mid-turn would find an unbound stem and
         // orphan-adopt it into a SEPARATE conversation, which the client would then
-        // adopt as a duplicate. The claim snapshots the stems that exist right now; the
-        // refresh skips any stem missing from every live snapshot, and this turn's
-        // terminal step binds whatever appeared. The snapshot is taken as close to the
-        // spawn as possible (nothing between here and `run_claude_streaming` writes a
-        // transcript), and the claim's Drop releases it unconditionally, including on a
-        // panic or the task abort a cancel performs.
+        // adopt as a duplicate. The claim snapshots the stems that exist right now and the
+        // refresh skips any stem missing from every live snapshot, which is what holds
+        // that window shut until this turn binds the ids the children reported. The claim
+        // is released only AFTER that binding (see the terminal step), and its Drop
+        // releases it unconditionally on a panic or the task abort a cancel performs.
         let flight = conversations.claim_flight(
             &jid,
             &cid,
@@ -813,6 +819,7 @@ pub async fn jesse(
                     &jid,
                     &active,
                     harness,
+                    &spawned,
                 )
                 .await,
             );
@@ -983,6 +990,7 @@ pub async fn jesse(
                         emergency_armed,
                         &active,
                         recent_block.as_deref(),
+                        &spawned,
                     )
                     .await;
                     route = r.route;
@@ -1013,6 +1021,7 @@ pub async fn jesse(
                 emergency_armed,
                 &active,
                 recent_block.as_deref(),
+                &spawned,
             )
             .await;
             route = r.route;
@@ -1045,28 +1054,39 @@ pub async fn jesse(
         // context feature flag: with `JESSE_CONTEXT_CARRY` off, a fork would otherwise
         // surface as a new conversation row again.
         //
-        // Two bindings, in this order. First the reply's own session id, on EVERY
-        // terminal success and not just the first, so a fork joins this conversation's
-        // alias list instead of becoming a new row. Then the stem diff, which rescues
-        // what the reply cannot: a turn that failed before returning any session id, and
-        // a transcript that a concurrent refresh orphan-adopted while this turn ran (that
-        // one is stolen back by `bind_session`).
+        // ONE source of truth: the session ids the children REPORTED on their own first
+        // line, in spawn order (a retry contributes one per attempt, and the last stays
+        // current — which is what a resume targets).
+        //
+        // This replaces a diff of the transcript directory before and after the turn. That
+        // diff inferred ownership from a directory the bridge does not exclusively own, so
+        // any transcript another `claude` run happened to write during the turn was
+        // attributed to this conversation. The reply's own session id is kept as the
+        // fallback for a harness that reports no id at all; it cannot lead, because it
+        // arrives only on success and a turn that fails still owns its transcript.
+        //
+        // The in-flight claim is released only AFTER this, so no concurrent list refresh
+        // can orphan-adopt a stem in the window between the turn ending and its ids being
+        // bound.
         {
+            let reported = spawned.ids();
             let reply_sid = match &outcome {
                 Ok((_, s, _)) => s.clone(),
                 Err(_) => None,
             };
-            let claimed = flight.take();
-            if let Some(reply_sid) = reply_sid.as_deref() {
+            let to_bind: Vec<String> = if reported.is_empty() {
+                reply_sid.into_iter().collect()
+            } else {
+                reported
+            };
+            for sid in &to_bind {
                 // A synthetic `local-` id has no transcript by construction, so it is
                 // never a session of the conversation.
-                if !is_synthetic_session_id(reply_sid) {
-                    conversations.bind_session(&cid, reply_sid);
+                if !is_synthetic_session_id(sid) {
+                    conversations.bind_session(&cid, sid);
                 }
             }
-            if let (Some(claimed), Some(dir)) = (&claimed, &sessions_dir) {
-                bind_new_stems(dir, &conversations, &cid, claimed);
-            }
+            drop(flight);
         }
 
         // ---- Context carry (Piece 1–3): from the SAME pre-badge outcome the badge and

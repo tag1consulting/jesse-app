@@ -71,9 +71,60 @@ pub enum StreamEvent {
     ToolActivity { name: String },
     /// The terminal `result` line: classify it exactly as the buffered path does.
     Done(ClaudeOutcome),
-    /// Anything else (init/system, rate-limit, message envelopes, thinking
-    /// deltas, tool input deltas, …) — carries nothing the bridge needs.
+    /// The session this turn is running under, as the harness itself reported it —
+    /// AUTHORITATIVE for which session a turn belongs to.
+    ///
+    /// Claude Code emits it on the `system`/`init` event, the very first line of the
+    /// stream, and repeats it on every line thereafter (verified against claude 2.1.220;
+    /// the id names the transcript stem exactly, and `--resume` reports the resumed id
+    /// rather than a fresh one). Arriving FIRST is what makes it better than the terminal
+    /// `result` line's copy: a turn that dies mid-flight has still told the bridge which
+    /// session it owns.
+    ///
+    /// The driver keeps the first one it sees, so a harness that repeats the id per line
+    /// costs nothing.
+    SessionId(String),
+    /// Anything else (rate-limit, message envelopes, thinking deltas, tool input
+    /// deltas, …) — carries nothing the bridge needs.
     Ignore,
+}
+
+/// Every session id a turn's children reported, in spawn order — the turn's own record of
+/// which sessions it owns, filled from [`StreamEvent::SessionId`] as each child starts.
+///
+/// A `Vec`, not a single id, because a RETRY spawns a fresh child with a fresh session and
+/// a fresh transcript. All of them belong to the conversation, and binding them in order
+/// leaves the LAST one current — which is what a resume targets. Ignoring the earlier ones
+/// would strand their transcripts.
+///
+/// Recorded even when the turn goes on to fail, because the id arrives on the child's first
+/// line: a turn that dies mid-flight has still said which session it owns. That is the
+/// whole reason this replaces a directory diff.
+#[derive(Clone, Default, Debug)]
+pub struct SpawnedSessions(Arc<Mutex<Vec<String>>>);
+
+impl SpawnedSessions {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Record one reported id, ignoring blanks and repeats. Claude Code repeats the id on
+    /// every line of the stream, so idempotence here is what lets the driver stay dumb.
+    pub fn record(&self, session_id: &str) {
+        let id = session_id.trim();
+        if id.is_empty() {
+            return;
+        }
+        let mut ids = self.0.lock_ok();
+        if !ids.iter().any(|s| s == id) {
+            ids.push(id.to_string());
+        }
+    }
+
+    /// The reported ids, in spawn order.
+    pub fn ids(&self) -> Vec<String> {
+        self.0.lock_ok().clone()
+    }
 }
 
 /// Decide the final outcome of a *streamed* turn from its terminal `result` line
@@ -216,7 +267,11 @@ async fn run_stateless_oneshot(
                     terminal = Some(outcome);
                     break;
                 }
-                StreamEvent::ToolActivity { .. } | StreamEvent::Ignore => {}
+                // A one-shot child (title / diet / vault-QA) is not a conversation, so the
+                // session it names is nothing this path binds.
+                StreamEvent::SessionId(_)
+                | StreamEvent::ToolActivity { .. }
+                | StreamEvent::Ignore => {}
             }
         }
         Ok::<(Option<ClaudeOutcome>, String), ApiError>((terminal, streamed))
@@ -381,6 +436,10 @@ pub async fn run_vaultqa_child(
 ///
 /// `harness` names the agent program: it builds the child `Command` and supplies the
 /// per-attempt line parser. Everything else here is harness-independent.
+// One more than the lint's ceiling, and each is a distinct collaborator the turn needs
+// (config, prompt, resume target, job store + id, model, harness, session recorder). A
+// params struct would only rename the same eight.
+#[allow(clippy::too_many_arguments)]
 pub async fn run_claude_streaming(
     cfg: &Config,
     prompt: &str,
@@ -389,6 +448,7 @@ pub async fn run_claude_streaming(
     job_id: &str,
     active: &ActiveModel,
     harness: &dyn Harness,
+    spawned: &SpawnedSessions,
 ) -> Result<(String, Option<String>, ShadowUsage), ApiError> {
     const MAX_ATTEMPTS: u32 = 3; // 1 try + 2 retries
 
@@ -485,6 +545,9 @@ pub async fn run_claude_streaming(
                 match parser.on_line(&line) {
                     StreamEvent::TextDelta(t) => jobs.stream_push_delta(job_id, &t),
                     StreamEvent::ToolActivity { name } => jobs.stream_push_activity(job_id, &name),
+                    // The child named its session. Record it the moment it arrives, so a
+                    // turn that dies after this line has still told us what it owns.
+                    StreamEvent::SessionId(id) => spawned.record(&id),
                     StreamEvent::Done(outcome) => {
                         terminal = Some(outcome);
                         break;
@@ -644,7 +707,9 @@ mod tests {
             match parser.on_line(line) {
                 StreamEvent::TextDelta(t) => streamed.push_str(&t),
                 StreamEvent::Done(o) => terminal = Some(o),
-                StreamEvent::ToolActivity { .. } | StreamEvent::Ignore => {}
+                StreamEvent::SessionId(_)
+                | StreamEvent::ToolActivity { .. }
+                | StreamEvent::Ignore => {}
             }
         }
         resolve_stream_outcome(terminal, &streamed, stderr)
