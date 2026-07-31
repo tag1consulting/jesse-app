@@ -1434,16 +1434,36 @@ async fn start_probe_listener() -> std::io::Result<(u16, Arc<Mutex<Vec<String>>>
 }
 
 /// Spawn one probe child, read it to completion (or kill it on timeout), and hand back its
-/// stdout plus whether it was killed.
-async fn run_probe_child(mut cmd: Command, timeout_secs: u64) -> (String, bool) {
+/// stdout, its STDERR, and whether it was killed.
+///
+/// # Why stderr is returned rather than drained and dropped
+///
+/// It was already being READ — it has to be, or a child that fills the stderr pipe while we
+/// only drain stdout deadlocks and looks like a timeout — and then thrown away. That was safe
+/// only under an assumption this battery should never have been making: that a child's event
+/// stream on stdout reports every tool call it made.
+///
+/// It does not have to. An agent CLI is free to emit a FAILED tool call to its log rather
+/// than its event stream, and at least one does: a sandbox-rejected patch that produces no
+/// event at all, and only a line on stderr. A battery that cannot see the attempt scores
+/// "the child never tried" for a child that tried and was refused, which turns a genuine
+/// `denied` into an `inconclusive`.
+///
+/// That direction of error is the tolerable one (an `inconclusive` fails the gate, so nothing
+/// unsafe ships because of it), but it is still the instrument lying about what happened, and
+/// a gate whose instrument is known to be blind in one channel is not a gate. So the channel
+/// is now carried to the trace parser, and each harness's parser decides what its own CLI
+/// puts there. Claude Code's `stream-json` reports failed tools as `tool_result` blocks with
+/// `is_error`, so its parser reads stdout alone and this changes nothing for it.
+async fn run_probe_child(mut cmd: Command, timeout_secs: u64) -> (String, String, bool) {
     let mut child = match cmd.spawn() {
         Ok(c) => c,
-        Err(e) => return (format!("spawn failed: {e}"), true),
+        Err(e) => return (format!("spawn failed: {e}"), String::new(), true),
     };
     let mut out = String::new();
     let mut err = String::new();
     let (Some(mut so), Some(mut se)) = (child.stdout.take(), child.stderr.take()) else {
-        return (String::new(), true);
+        return (String::new(), String::new(), true);
     };
     let timed_out = {
         // Both pipes drained concurrently: a child that fills stderr while we only read
@@ -1460,7 +1480,7 @@ async fn run_probe_child(mut cmd: Command, timeout_secs: u64) -> (String, bool) 
     } else {
         let _ = child.wait().await;
     }
-    (out, timed_out)
+    (out, err, timed_out)
 }
 
 /// Probe ONE row: build its scratch world, run every probe through the SHIPPED harness
@@ -1541,7 +1561,12 @@ async fn run_row(
             cmd.env(PROBE_ENV_VAR, env.secret("read_env_token"));
 
             let started = Instant::now();
-            let (stdout, timed_out) = run_probe_child(cmd, opts.timeout_secs).await;
+            // `_stderr`: Claude Code reports a failed tool as a `tool_result` block with
+            // `is_error` on stdout, so its trace needs nothing from the log channel. The
+            // channel is carried here rather than dropped in the runner because whether it
+            // matters is a property of the HARNESS, not of the runner — see
+            // [`run_probe_child`].
+            let (stdout, _stderr, timed_out) = run_probe_child(cmd, opts.timeout_secs).await;
             let mut trace = parse_trace(&stdout);
             trace.timed_out = timed_out;
             if root_tools.is_empty() {

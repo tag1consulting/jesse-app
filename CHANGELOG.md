@@ -15,6 +15,32 @@ CI both run it). See the "Versioning" section of `bridge/README.md`.
 
 ## [Unreleased]
 
+## [Bridge 0.48.0] - 2026-07-31
+
+> Rebased from PR #46, which was merged into a feature branch rather than `main` and so
+> never landed. Nothing else on that branch was unique — the whole-answer progress row and
+> the version-guard fix both reached `main` via PR #45.
+
+### Changed
+- **The containment battery no longer throws away the channel a refusal can arrive on.**
+
+  `run_probe_child` drained the child's stderr and discarded it. The draining was never
+  optional — a child that fills the stderr pipe while only stdout is read deadlocks and
+  looks like a timeout — but discarding it rested on an assumption this battery had no
+  business making: that a child's event stream on stdout reports every tool call it made.
+
+  It does not have to. An agent CLI may emit a FAILED tool call to its log rather than its
+  event stream, and at least one does: a sandbox-rejected patch produces no event at all,
+  only a line on stderr. A battery blind to that scores "the child never tried" for a child
+  that tried and was refused, turning a genuine `denied` into an `inconclusive`.
+
+  That is the tolerable direction of error — an `inconclusive` fails the gate, so nothing
+  unsafe ships because of it — but an instrument known to be blind in one channel is not a
+  gate. The channel is now carried to the trace parser so each harness's parser decides
+  what its own CLI puts there. Claude Code reports failed tools as `tool_result` blocks
+  with `is_error` on stdout, so its parser reads stdout alone and its behaviour is
+  unchanged.
+
 ## [Bridge 0.47.0] - 2026-07-31
 
 > Builds on Bridge 0.46.0 (the no-blanket-adoption change), which landed first.
