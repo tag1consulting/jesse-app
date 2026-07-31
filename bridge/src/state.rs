@@ -142,32 +142,33 @@ impl AppState {
         st
     }
 
-    /// Bring the conversation registry up to date with what is already on disk, once, at
-    /// construction. Two steps, in this order because the second needs the first:
+    /// Reconcile the persisted stores at construction, once.
     ///
-    /// 1. Scan the vault's projects dir and adopt every transcript that has no record
-    ///    yet, which is how an existing deploy's whole history becomes conversations
-    ///    without any client involvement. This populates the session → conversation
-    ///    reverse index.
+    /// 1. Scan the projects dirs and LOG the transcripts with no conversation record,
+    ///    adopting none of them. Those dirs are keyed only on the cwd, so every `claude`
+    ///    run with that cwd writes into them; a transcript the bridge did not start is
+    ///    not the bridge's to list. The reverse index therefore comes purely from the
+    ///    persisted records, which is where the sessions the bridge actually started
+    ///    already are.
     /// 2. Re-key the title, flag, and deletion stores off session ids and onto
     ///    conversation ids through that index, ONCE per state dir (the flag is persisted
-    ///    in `conversations.json`). The list handler's own refresh is the ongoing
-    ///    incremental case and never re-runs the migration.
+    ///    in `conversations.json`).
     ///
-    /// Nothing here can fail loudly: a missing projects dir adopts nothing, and with no
+    /// Nothing here can fail loudly: a missing projects dir reports nothing, and with no
     /// state dir configured the whole registry is in-memory so the migration is a no-op
     /// against empty stores.
     fn bootstrap_conversations(&self) {
-        let now_ms = system_time_to_ms(SystemTime::now());
-        let adopted: Vec<String> = self
+        let unowned: Vec<String> = self
             .transcript_dirs()
             .iter()
-            .flat_map(|dir| refresh_conversations(dir, &self.conversations, now_ms))
+            .flat_map(|dir| report_unowned_transcripts(dir, &self.conversations))
+            .map(|(stem, _)| stem)
             .collect();
-        if !adopted.is_empty() {
+        if !unowned.is_empty() {
             eprintln!(
-                "jesse-bridge: adopted {} existing transcript(s) into conversations",
-                adopted.len()
+                "jesse-bridge: {} transcript(s) in the projects dir(s) have no conversation \
+                 record; left alone (not started by this bridge)",
+                unowned.len()
             );
         }
         if self.conversations.migration_done() {

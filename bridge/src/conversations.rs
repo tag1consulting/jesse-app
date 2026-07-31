@@ -175,6 +175,10 @@ struct Inner {
     /// Keyed on JOB id, not conversation id: two turns of one conversation can be in
     /// flight at once (`JESSE_MAX_CONCURRENCY` > 1) and neither may clobber the other.
     in_flight: HashMap<String, InFlight>,
+    /// Transcript stems already reported as unowned, so the scan logs each one ONCE per
+    /// process instead of once per conversation-list poll. In memory only, never
+    /// persisted: re-reporting the directory after a restart is the point.
+    reported_unowned: HashSet<String>,
     migrated: bool,
 }
 
@@ -216,6 +220,7 @@ impl ConversationStore {
             map,
             by_session: HashMap::new(),
             in_flight: HashMap::new(),
+            reported_unowned: HashSet::new(),
             migrated,
         };
         inner.reindex();
@@ -485,6 +490,20 @@ impl ConversationStore {
             .in_flight
             .values()
             .any(|f| f.stems_before.contains(stem))
+    }
+
+    /// Claim the right to report `stem` as an unowned transcript: `true` the FIRST time
+    /// it is offered, `false` every time after, so the conversation-list scan logs each
+    /// foreign transcript once per process rather than once per poll.
+    ///
+    /// Recording it is not a claim of ownership — the stem gets no record and no list
+    /// row. It exists only to bound the log and to keep the title-mint file read off the
+    /// hot path.
+    pub fn note_unowned_transcript(&self, stem: &str) -> bool {
+        self.inner
+            .lock_ok()
+            .reported_unowned
+            .insert(stem.to_string())
     }
 
     /// The conversation ids of every turn currently in flight. GC must never drop one.

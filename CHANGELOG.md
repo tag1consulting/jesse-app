@@ -15,6 +15,56 @@ CI both run it). See the "Versioning" section of `bridge/README.md`.
 
 ## [Unreleased]
 
+## [Bridge 0.46.0] - 2026-07-31
+
+### Removed
+- **Blanket orphan adoption of transcripts found in the projects dirs, including the
+  startup sweep.**
+
+  Root cause: the bridge inferred ownership of a transcript from a **directory scan over a
+  directory it does not exclusively own**. `~/.claude/projects/<escaped-cwd>` is keyed only
+  on the cwd, so *every* `claude` invocation with that cwd writes there — this bridge, a
+  desktop Claude Code run, anything else. `refresh_conversations` adopted every stem it had
+  no record of, minting a deterministic UUIDv5 conversation for it, and had no way to tell
+  its own transcripts from a foreign one because a directory listing carries no provenance.
+
+  The result on the deploy that surfaced this: **731 of 831 conversation records were
+  foreign transcripts** (`origin: "cli"`, one session id each), including a one-off terminal
+  prompt that appeared in the app as a conversation the user had not created and could not
+  account for. The startup sweep alone adopted 708 in a single go.
+
+  Ownership now comes from the conversation store, which is authoritative: the bridge
+  registers a conversation at accept time and binds the session to it, so a transcript with
+  no record is by construction not one the bridge started. It is left entirely alone — no
+  record, no list row, and the file itself is never touched.
+
+  **Behaviour lost, deliberately:** continuing a terminal-started Claude Code session from
+  the phone. It worked only as a side effect of the directory scan. If it is wanted back it
+  should return as an explicit opt-in action on a chosen session, not an automatic sweep
+  that adopts everything in a shared directory.
+
+  **Existing records are untouched.** This is prevention only — the 731 already in
+  `conversations.json` stay until they are cleaned up deliberately.
+
+  **One consequence, pinned by a test**
+  (`the_key_migration_drops_keys_for_sessions_the_bridge_never_owned`): the one-time
+  title/flag key migration re-keys *through* the session → conversation index, which the
+  startup sweep used to populate. A state dir that predates conversations **and** has never
+  migrated now loses titles/favourites for sessions with no record, because
+  `migrate_keys_to_conversations` drops an unmapped key. Already-migrated deploys are
+  unaffected (the flag is persisted; the migration never re-runs) and a fresh install has
+  nothing to migrate.
+
+### Added
+- **Info-level logging for every transcript the scan skips**, with the session id and the
+  reason (`UnownedReason::TitleMint` for a `POST /jesse/title` one-shot, `NotOurs` for
+  anything with no conversation record), so a projects dir filling up with something
+  unexpected is visible in the log rather than only in the app. Reported **once per stem per
+  process** — memoized in the store — because the list handler runs this on every poll and
+  because the title-mint classification needs a file read that must not sit on the hot path.
+  The reason is returned from `report_unowned_transcripts`, not merely logged, so it is
+  assertable.
+
 ## [Bridge 0.45.0] - 2026-07-29 / [App 1.0 (86)]
 
 A turn on a model that answers all at once now looks like it is working, because it is.

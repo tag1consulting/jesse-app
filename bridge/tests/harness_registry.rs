@@ -1,8 +1,8 @@
 //! A registry with TWO harnesses, the second of which keeps no transcripts on disk.
 //!
 //! Only `claude-code` ships, so this is the test that proves the seam actually holds the
-//! shape the trait promises: a harness whose `transcript_dir` is `None` is skipped by
-//! conversation adoption, skipped by the GC sweep, and skipped by the resume existence
+//! shape the trait promises: a harness whose `transcript_dir` is `None` is skipped by the
+//! unowned-transcript scan, skipped by the GC sweep, and skipped by the resume existence
 //! check — while its conversations still live in the registry, still list, still resolve a
 //! resume, and hydrate to an EMPTY history with a `200` rather than an error.
 mod common;
@@ -153,7 +153,7 @@ fn the_registry_holds_both_and_only_the_transcript_bearing_one_contributes_a_dir
 }
 
 #[tokio::test]
-async fn a_transcriptless_harness_is_skipped_by_adoption_and_the_sweep_but_still_converses() {
+async fn a_transcriptless_harness_is_skipped_by_the_scan_and_the_sweep_but_still_converses() {
     let (home, vault, claude_dir, other_dir) = two_harness_fixture();
 
     // One transcript in each directory, both ancient. Only the claude-code one is in a
@@ -166,20 +166,33 @@ async fn a_transcriptless_harness_is_skipped_by_adoption_and_the_sweep_but_still
     let cfg = two_harness_config(&home, &vault);
     let st = AppState::new(cfg.clone());
 
-    // ---- Adoption skips it -------------------------------------------------
-    // Startup adoption scanned claude-code's dir and adopted its stray; the other dir was
-    // never scanned, so its stray produced no conversation.
+    // ---- The scan skips it -------------------------------------------------
+    // Neither stray becomes a conversation any more: the bridge adopts nothing it did not
+    // start. What still differs is WHICH directory the startup scan visited at all, and
+    // the report memo is the witness — a stem reported once is never reported again, so a
+    // second call returns nothing for the dir that was scanned and the stem for the dir
+    // that was not.
     assert!(
         st.conversations
             .conversation_for_session("claude-orphan")
-            .is_some(),
-        "the transcript-bearing harness's stray is adopted, as before"
+            .is_none(),
+        "a stray in a declared dir is scanned, but never adopted"
     );
     assert!(
         st.conversations
             .conversation_for_session("other-orphan")
             .is_none(),
-        "a transcript-less harness contributes no directory, so nothing is adopted from it"
+        "and a transcript-less harness contributes no directory to scan at all"
+    );
+    assert_eq!(
+        report_unowned_transcripts(&claude_dir, &st.conversations),
+        vec![],
+        "claude-code's dir was already scanned at startup, so its stray is not re-reported"
+    );
+    assert_eq!(
+        report_unowned_transcripts(&other_dir, &st.conversations),
+        vec![("other-orphan".to_string(), UnownedReason::NotOurs)],
+        "the other dir was never scanned, so its stray is being seen for the first time"
     );
 
     // A conversation belonging to that harness, registered the way any turn registers one.
@@ -283,10 +296,10 @@ async fn a_transcriptless_harness_is_skipped_by_adoption_and_the_sweep_but_still
 }
 
 /// The control. The very same stray, in the very same directory, under a harness that
-/// DECLARES that directory: now it is adopted at startup and reclaimed by the sweep. So the
+/// DECLARES that directory: now it is scanned at startup and reclaimed by the sweep. So the
 /// file's survival in the test above is the `None` doing the work.
 #[tokio::test]
-async fn the_same_stray_is_adopted_and_swept_once_a_harness_declares_its_directory() {
+async fn the_same_stray_is_scanned_and_swept_once_a_harness_declares_its_directory() {
     let (home, vault, _claude_dir, other_dir) = two_harness_fixture();
     write_transcript(&other_dir, "other-orphan", "adopt me after all");
     make_ancient(&other_dir.join("other-orphan.jsonl"));
@@ -301,8 +314,13 @@ async fn the_same_stray_is_adopted_and_swept_once_a_harness_declares_its_directo
     assert!(
         st.conversations
             .conversation_for_session("other-orphan")
-            .is_some(),
-        "a declared directory IS scanned by adoption"
+            .is_none(),
+        "a declared directory is scanned, but a stray in it is still never adopted"
+    );
+    assert_eq!(
+        report_unowned_transcripts(&other_dir, &st.conversations),
+        vec![],
+        "a declared directory IS scanned at startup — its stray was already reported"
     );
     run_session_gc(&st.cfg, &st.conversations, &st.titles, &st.flags);
     assert!(

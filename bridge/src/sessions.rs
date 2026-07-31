@@ -531,41 +531,77 @@ fn is_title_mint_transcript(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
-/// Bring the registry up to date with the projects `dir`: adopt every transcript that
-/// has no conversation record yet. Returns how many were adopted.
+/// Report the transcripts in the projects `dir` that the bridge has no record of, and
+/// adopt NONE of them. Returns the stems reported this call (those not reported before),
+/// in deterministic order.
 ///
-/// Three stems are skipped, each for its own reason:
-/// - one already in the reverse index: it belongs to a conversation already;
-/// - one SUPPRESSED by the in-flight table: it is attributable to a turn that is
-///   still running, so adopting it now is exactly the duplicate this change removes.
-///   It produces no record and no list row this round; the owning turn binds it on
-///   termination, and a later refresh adopts it if that turn dies without binding it;
-/// - a title-mint transcript, which is never a conversation.
-pub fn refresh_conversations(
+/// The projects dir is keyed only on the vault cwd, so EVERY `claude` invocation with
+/// that cwd writes here: this bridge, a desktop Claude Code run, anything else. A
+/// directory scan cannot tell those apart, so ownership is taken from the conversation
+/// store instead — the bridge registers a conversation at accept time and binds the
+/// session to it, which means a transcript with no record is by construction not one the
+/// bridge started. It is somebody else's file and is left alone.
+///
+/// This replaces the blanket adoption that used to run here. That adoption is why a
+/// one-off terminal Claude Code run in the vault surfaced in the app as a conversation:
+/// 731 of 831 records on the first deploy to hit this were foreign transcripts.
+///
+/// Reporting is once per stem per process, memoized in the store, for two reasons: the
+/// list handler calls this on every poll and an unmemoized log would emit thousands of
+/// lines a minute, and the title-mint check needs a file read that must not run per poll.
+pub fn report_unowned_transcripts(
     dir: &Path,
     conversations: &ConversationStore,
-    now_ms: u64,
-) -> Vec<String> {
-    let mut orphans: Vec<String> = Vec::new();
+) -> Vec<(String, UnownedReason)> {
+    let mut fresh: Vec<String> = Vec::new();
     for stem in transcript_stems(dir) {
         if conversations.conversation_for_session(&stem).is_some() {
             continue;
         }
-        if conversations.suppresses_orphan(&stem) {
+        // Memo first: the file read below must not run on every poll.
+        if !conversations.note_unowned_transcript(&stem) {
             continue;
         }
-        if is_title_mint_transcript(&dir.join(format!("{stem}.jsonl"))) {
-            continue;
+        fresh.push(stem);
+    }
+    // Deterministic order so a bulk scan logs reproducibly.
+    fresh.sort();
+    fresh
+        .into_iter()
+        .map(|stem| {
+            let reason = if is_title_mint_transcript(&dir.join(format!("{stem}.jsonl"))) {
+                UnownedReason::TitleMint
+            } else {
+                UnownedReason::NotOurs
+            };
+            eprintln!(
+                "jesse-bridge: skipping transcript {stem}: {}",
+                reason.as_str()
+            );
+            (stem, reason)
+        })
+        .collect()
+}
+
+/// Why a transcript in the projects dir got no conversation record. Carried out of
+/// [`report_unowned_transcripts`] so the classification is assertable, not just loggable.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum UnownedReason {
+    /// A `POST /jesse/title` one-shot: the bridge wrote it, but a title call is not a
+    /// conversation and never was.
+    TitleMint,
+    /// No conversation record, so the bridge did not start it — a desktop Claude Code
+    /// run, another tool, or a previous deploy. Somebody else's file.
+    NotOurs,
+}
+
+impl UnownedReason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::TitleMint => "title one-shot minted by this bridge, never a conversation",
+            Self::NotOurs => "no conversation record — not started by this bridge",
         }
-        orphans.push(stem);
     }
-    if orphans.is_empty() {
-        return Vec::new();
-    }
-    // Deterministic order so a bulk adopt logs and persists reproducibly.
-    orphans.sort();
-    conversations.adopt_orphan_sessions(orphans.iter().map(String::as_str), now_ms);
-    orphans
 }
 
 /// Bind every transcript that appeared WHILE a turn was running to that turn's
@@ -806,10 +842,11 @@ fn etag_list_response(headers: &HeaderMap, body: String) -> Response {
 /// body (`304 Not Modified`, empty body, when it matches). A missing projects dir
 /// yields an empty list, not an error.
 ///
-/// The registry is refreshed from disk first, so a transcript left by a previous bridge
-/// or written by the CLI outside the app is adopted into a conversation before the list
-/// is rendered, except one attributable to a turn still in flight, which is
-/// deliberately invisible this round (see [`refresh_conversations`]).
+/// The list is rendered from the conversation registry alone. A transcript sitting in a
+/// projects dir with no record is NOT adopted into a conversation — those dirs are keyed
+/// on the cwd and are shared with every other `claude` invocation there, so an unrecorded
+/// transcript is somebody else's (see [`report_unowned_transcripts`], which logs it once
+/// and leaves it).
 ///
 /// Deletion tombstones ride in the same body as `deleted`, so the ETag covers them
 /// automatically. Every tombstone is reported, whichever key space it was recorded
@@ -831,7 +868,7 @@ pub async fn jesse_conversations(
     let dirs = st.transcript_dirs();
     let now_ms = system_time_to_ms(SystemTime::now());
     for dir in &dirs {
-        refresh_conversations(dir, &st.conversations, now_ms);
+        report_unowned_transcripts(dir, &st.conversations);
     }
     let conversations =
         list_conversations_in(&dirs, &st.conversations, params.since, &st.titles, &st.flags);
@@ -1343,7 +1380,7 @@ mod tests {
         let titles = TitleStore::new(None);
         let flags = FlagStore::new(None);
         let convs = ConversationStore::new(None);
-        assert!(refresh_conversations(&missing, &convs, 0).is_empty());
+        assert!(report_unowned_transcripts(&missing, &convs).is_empty());
         assert!(transcript_stems(&missing).is_empty());
         assert!(list_conversations(&missing, &convs, None, &titles, &flags).is_empty());
     }
@@ -1422,16 +1459,21 @@ mod tests {
         set_mtime(&dir.join("mid.jsonl"), 2_000);
         set_mtime(&dir.join("new.jsonl"), 3_000);
 
-        // The three transcripts are adopted into conversations first; the list is then
-        // rendered from the registry, keyed on conversation id.
+        // The registry is the only source of rows, so bind the three transcripts the way
+        // a real turn does. The non-jsonl file and the subdir have no record and so
+        // cannot produce a row whatever the scan does.
         let convs = ConversationStore::new(None);
-        let adopted = refresh_conversations(&dir, &convs, 0);
-        assert_eq!(
-            adopted.len(),
-            3,
-            "non-jsonl file and subdir are not adopted"
-        );
         let mid_cid = orphan_conversation_id("mid");
+        for stem in ["old", "mid", "new"] {
+            let cid = orphan_conversation_id(stem);
+            convs.register(&cid, None, 0);
+            convs.bind_session(&cid, stem);
+        }
+        assert_eq!(
+            report_unowned_transcripts(&dir, &convs),
+            vec![],
+            "every transcript is owned, so nothing is reported unowned"
+        );
 
         let titles = TitleStore::new(None);
         titles.set(&mid_cid, "Middle Session");
@@ -1951,24 +1993,25 @@ mod tests {
         let titles = TitleStore::new(None);
         let flags = FlagStore::new(None);
         let convs = ConversationStore::new(None);
-        // A mint transcript is never even adopted, so it can produce no record and no row.
-        let adopted = refresh_conversations(&dir, &convs, 0);
-        assert_eq!(adopted, vec!["real".to_string()]);
+        // Neither becomes a conversation: the mint because a title call never was one,
+        // the real session because nothing in the store says this bridge started it. Each
+        // is reported once, with the reason that distinguishes them.
+        assert_eq!(
+            report_unowned_transcripts(&dir, &convs),
+            vec![
+                ("mint".to_string(), UnownedReason::TitleMint),
+                ("real".to_string(), UnownedReason::NotOurs),
+            ]
+        );
         assert_eq!(convs.conversation_for_session("mint"), None);
-        let listed = list_conversations(&dir, &convs, None, &titles, &flags);
-        let ids: Vec<&str> = listed
-            .iter()
-            .map(|c| c.session_id.as_deref().unwrap())
-            .collect();
-        assert_eq!(
-            ids,
-            ["real"],
-            "title-mint transcript excluded from the list"
+        assert_eq!(convs.conversation_for_session("real"), None);
+        assert!(
+            list_conversations(&dir, &convs, None, &titles, &flags).is_empty(),
+            "an unowned transcript produces no list row"
         );
-        assert_eq!(
-            listed[0].first_message.as_deref(),
-            Some("what is on Today.md?")
-        );
+        // Reporting is once per process: a second scan is silent, so the poll path never
+        // re-reads these files.
+        assert_eq!(report_unowned_transcripts(&dir, &convs), vec![]);
         std::fs::remove_dir_all(&dir).ok();
     }
 
