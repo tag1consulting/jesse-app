@@ -9,6 +9,23 @@
 # boundary (see `capability_args`), so the boundary is proven by attempting the escape
 # and checking out of band whether it worked — never by asking the child what it did.
 #
+# ONE FILE PER HARNESS. A containment verdict describes a (harness, capability, MCP
+# set) triple, and nothing recorded for one harness says anything about another —
+# the levels are one vocabulary but the levers behind them are not. The `harness`
+# key below names whose record this is, and the build embeds one file per harness.
+#
+# THE FILE-LEVEL `gate` KEY IS A HUMAN-FACING SUMMARY. Nothing reads it. The startup
+# gate walks the ROWS (`highest_passing_level`): a level is grantable when every MCP
+# set recorded at it met every hard gate, so a record whose overall gate is `fail`
+# can still vouch for the levels that did pass — which is the case for a harness that
+# cannot express `basic` at all. Do not wire this key without first deciding what a
+# harness failing one level and passing another is supposed to mean.
+#
+# ${WORKSPACE} IN A `toolset_args` ENTRY stands for the turn's own working directory,
+# substituted by the harness when it builds a child. Host-varying scopes are named by
+# token because the startup comparison is STRICT EQUALITY with no normalization: an
+# absolute path recorded here would fail every deployment but the one that wrote it.
+#
 # WHEN TO RE-RUN. On every bump of `binary_version` (the pinned CLI), on every change
 # to the containment posture (`capability_args`, the tool lists, the MCP server sets),
 # and before shipping a new (capability, MCP set) pair. A probe that flips in EITHER
@@ -23,8 +40,16 @@
 #                purpose so the decision to close it can be made deliberately rather
 #                than discovered by an incident.
 #
+# `[[accepted]]` IS A DECISION, NOT A VERDICT. It records that a named person agreed
+# to SHIP a row whose baselines are still open, on a date, with the reasoning. It
+# changes NOTHING: an accepted `known_open` is still `known_open`, still open, and
+# still drift if it closes. It is a key rather than a comment because a comment does
+# not survive `--write` and cannot be checked — `containment-probe` reports open
+# baselines nobody signed for, and acceptances that outlived their finding.
+# Acceptance is per ROW: shipping `read` says nothing about the opens at `write`.
+#
 
-schema = 1
+schema = 2
 harness = "claude-code"
 binary_version = "2.1.220 (Claude Code)"
 bridge_version = "0.42.0"

@@ -27,6 +27,12 @@ impl Harness for NoTranscriptHarness {
     fn streams_text(&self) -> bool {
         false
     }
+    fn expresses(&self, _capability: Capability) -> bool {
+        true
+    }
+    fn capability_args(&self, _cfg: &Config, _capability: Capability) -> Vec<String> {
+        Vec::new()
+    }
     fn transcript_dir(&self, _cfg: &Config) -> Option<PathBuf> {
         None
     }
@@ -54,6 +60,12 @@ impl Harness for FixedDirHarness {
     }
     fn streams_text(&self) -> bool {
         true
+    }
+    fn expresses(&self, _capability: Capability) -> bool {
+        true
+    }
+    fn capability_args(&self, _cfg: &Config, _capability: Capability) -> Vec<String> {
+        Vec::new()
     }
     fn transcript_dir(&self, _cfg: &Config) -> Option<PathBuf> {
         Some(self.0.clone())

@@ -134,6 +134,16 @@ impl RoutedPick {
 /// Health is consulted, and this is the one place a routed job may switch models: a routed
 /// job has no user-visible identity to betray, so silently using the next candidate is the
 /// right behavior — the opposite of the main-turn rule at the top of this module.
+///
+/// **`m.level >= required` is not sufficient on its own, and treating it as sufficient was a
+/// live bug rather than a hypothetical.** A level is a ceiling the OPERATOR set; whether the
+/// candidate's harness can hand the job's child the posture the job requires is a property of
+/// the HARNESS, and is [`Harness::expresses`]. `RoutedJob::Title` requires `Basic` — pure text
+/// in, text out, granted nothing because it needs nothing — and a Codex model configured at
+/// `Read` satisfies `>= Basic` at every rung of this walk. Codex has no posture below
+/// `read-only`, so that title child would have been spawned with a shell and the whole
+/// filesystem, for a job whose entire definition is that it needs neither. `DietExtract` is
+/// the same shape.
 pub fn pick_offload_model<'a>(
     cfg: &'a Config,
     health: &HealthStore,
@@ -150,12 +160,28 @@ pub fn pick_offload_model<'a>(
         if m.level < required {
             continue;
         }
+        if !harness_expresses(cfg, &m.harness, required) {
+            continue;
+        }
         if !model_health(m, health).available() {
             continue;
         }
         return Some(m);
     }
     None
+}
+
+/// Whether the harness backing a candidate can express the posture a routed job needs.
+///
+/// A harness this build cannot construct answers `false`: it could not serve the job at all,
+/// so skipping it is the same answer arrived at earlier. Such a model is separately refused
+/// at startup by [`validate_model_config`], so in a running bridge this is never the reason a
+/// candidate is skipped — it is here so the walk stays total without asserting.
+fn harness_expresses(cfg: &Config, harness: &str, required: Capability) -> bool {
+    cfg.harnesses
+        .get(harness)
+        .map(|h| h.expresses(required))
+        .unwrap_or(false)
 }
 
 /// Whether config named a model to OFFLOAD this job to — the walk yields a candidate.
@@ -198,7 +224,14 @@ pub fn route_job(
         return pick;
     }
     if let Some(active) = conversation {
-        if active.level >= required && exclude != Some(active.id.as_str()) {
+        // The same two questions as the walk above, for the same reason: the level is the
+        // operator's ceiling, and whether the harness HAS the posture is the harness's to
+        // say. A conversation running on a harness with no `Basic` must not serve a `Basic`
+        // job just because the conversation's own level clears the bar.
+        if active.level >= required
+            && harness_expresses(cfg, &active.harness, required)
+            && exclude != Some(active.id.as_str())
+        {
             let pick = RoutedPick {
                 id: active.id.clone(),
                 harness: active.harness.clone(),
@@ -261,6 +294,76 @@ mod tests {
     /// Every configured model in `cfg` seeded healthy — the startup state.
     fn all_healthy(cfg: &Config) -> HealthStore {
         HealthStore::seeded(&cfg.model_registry)
+    }
+
+    /// A `Read`-level Codex model at the front of the walk, with a registry that can
+    /// construct Codex. Codex is not registered in the shipped build yet; the walk's rule has
+    /// to be right BEFORE it is, or registration is the moment the bug goes live.
+    fn cfg_with_codex_first() -> Config {
+        let mut m = model("codex-mini", Capability::Read);
+        m.harness = CODEX_ID.to_string();
+        let mut cfg = cfg_with(vec![m, model("local-oss", Capability::Read)], &[
+            "codex-mini",
+            "local-oss",
+        ]);
+        cfg.harnesses = Arc::new(HarnessRegistry::new(vec![Box::new(Codex)]));
+        cfg
+    }
+
+    /// THE BUG THIS CHECK EXISTS FOR, stated as a test rather than as a comment.
+    ///
+    /// `Title` requires `Basic` — text in, text out, granted nothing because it needs
+    /// nothing. A Codex model configured at `Read` clears `>= Basic`, so on level alone it
+    /// wins the walk; and because Codex has no posture below `read-only`, that title child
+    /// would be spawned with a shell and the whole filesystem. `DietExtract` is the same
+    /// shape. The next candidate — a harness that HAS `Basic` — must serve them instead.
+    #[test]
+    fn a_harness_without_basic_never_wins_the_walk_for_a_basic_job() {
+        let cfg = cfg_with_codex_first();
+        let health = all_healthy(&cfg);
+        for job in [RoutedJob::Title, RoutedJob::DietExtract] {
+            assert_eq!(job.required(), Capability::Basic, "precondition for {job:?}");
+            let picked = pick_offload_model(&cfg, &health, job.required(), None)
+                .expect("the next candidate serves it");
+            assert_eq!(
+                picked.id, "local-oss",
+                "{job:?} went to a harness with no `basic` posture"
+            );
+            assert_eq!(route_job(&cfg, &health, job, None, None).id, "local-oss");
+        }
+    }
+
+    /// …and the same model is not blacklisted, only skipped where it has nothing to offer:
+    /// at a level Codex DOES express it wins the walk exactly as any other candidate would.
+    #[test]
+    fn a_harness_without_basic_still_wins_the_walk_at_a_level_it_expresses() {
+        let cfg = cfg_with_codex_first();
+        let health = all_healthy(&cfg);
+        let picked = pick_offload_model(&cfg, &health, Capability::Read, None)
+            .expect("read is a posture codex has");
+        assert_eq!(picked.id, "codex-mini");
+    }
+
+    /// The conversation rung asks the same two questions as the walk. A conversation running
+    /// on a harness with no `Basic` must not serve a `Basic` job just because its own level
+    /// clears the bar — it would spawn the same over-granted child by a different route.
+    #[test]
+    fn the_conversation_rung_also_reads_the_declaration() {
+        let mut cfg = cfg_with_codex_first();
+        cfg.offload_order.clear(); // no walk candidate: the conversation is the next rung
+        let health = all_healthy(&cfg);
+        let mut active = ActiveModel::ambient();
+        active.id = "codex-mini".to_string();
+        active.harness = CODEX_ID.to_string();
+        active.level = Capability::Read;
+        let pick = route_job(&cfg, &health, RoutedJob::Title, Some(&active), None);
+        assert_eq!(
+            pick.id, DEFAULT_MODEL_ID,
+            "a Basic job fell through to ambient rather than to a harness with no Basic"
+        );
+        // The same conversation model DOES serve a job at a level it expresses.
+        let pick = route_job(&cfg, &health, RoutedJob::VaultQa, Some(&active), None);
+        assert_eq!(pick.id, "codex-mini");
     }
 
     /// Mark one model unhealthy, as a failed probe would.
