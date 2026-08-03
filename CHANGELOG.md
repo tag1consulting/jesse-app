@@ -15,6 +15,25 @@ CI both run it). See the "Versioning" section of `bridge/README.md`.
 
 ## [Unreleased]
 
+## [Bridge 0.52.1] - 2026-08-03
+
+Makes the Codex registration of 0.52.0 actually reachable. Registering the harness was
+only half of it: nothing on the startup path ever built a registry containing it, so a
+`harness = "codex"` model could not start at all.
+
+### Fixed
+
+- **A Codex model can now start.** `Config::from_env` hardcoded
+  `HarnessRegistry::claude_code_only()`, and the startup gate resolves a model's harness
+  through `cfg.harnesses` — so every `harness = "codex"` entry was refused before the
+  socket opened with `unknown harness 'codex' (registered: claude-code)`. Despite
+  `KNOWN_HARNESS_IDS`, `for_models` and `serving()` all landing in 0.52.0,
+  `HarnessRegistry::for_models` had **no production caller**. The registry is now built
+  from the harnesses the config names — from every declared model, not just the configured
+  ones, so an unarmed entry is still refused for a level its harness cannot express rather
+  than for a missing harness. The suite stayed green through this because every Codex test
+  hand-patches `cfg.harnesses`, the one field production never set that way.
+
 ## [App 1.0 (87)] - 2026-08-03
 
 Ships the client half of Bridge 0.52.0's whole-answer turn — see that entry for the
