@@ -100,7 +100,7 @@ pub fn session_transcript_exists_for_harness(
 /// [`session_transcript_exists_for_harness`] for the harness that serves turns — the
 /// convenience form for callers with no harness in hand.
 pub fn session_transcript_exists(cfg: &Config, session_id: &str) -> bool {
-    session_transcript_exists_for_harness(cfg, cfg.harnesses.turn_harness(), session_id)
+    session_transcript_exists_for_harness(cfg, cfg.harnesses.fallback_harness(), session_id)
 }
 
 /// The outcome of deleting one session's transcript. `Deleted` removed an existing
@@ -355,7 +355,7 @@ pub fn resolve_resume_session_for_harness<'a>(
 /// [`resolve_resume_session_for_harness`] for the harness that serves turns — the
 /// convenience form for callers with no harness in hand.
 pub fn resolve_resume_session<'a>(cfg: &Config, session_id: Option<&'a str>) -> Option<&'a str> {
-    resolve_resume_session_for_harness(cfg, cfg.harnesses.turn_harness(), session_id)
+    resolve_resume_session_for_harness(cfg, cfg.harnesses.fallback_harness(), session_id)
 }
 
 /// Pull the user text out of a `{"type":"user","message":{...}}` transcript line.

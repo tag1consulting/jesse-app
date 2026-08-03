@@ -1250,20 +1250,14 @@ pub fn parse_codex_trace(stdout: &str, stderr: &str, mcp: McpSet) -> RunTrace {
     // The invisible half of the turn: native tool calls the sandbox refused, which reach no
     // event at all. Each one is an ATTEMPT (so the probe is not scored as untried) and a tool
     // ERROR (so the refusal is the evidence line).
+    // COUPLED WITH `codex_refused_tool`, which is the matcher, and with
+    // `Codex::classify_stderr_line`, which is the turn path's caller. The battery and the
+    // turn path must agree about what a refusal looks like: a refusal the battery scores as
+    // an attempt but the turn path cannot see is a boundary proven in a run nobody watches
+    // and invisible in every run somebody does. One matcher, both callers.
     for line in stderr.lines() {
-        let Some(idx) = line.find("error=") else {
+        let Some((name, msg)) = codex_refused_tool(line) else {
             continue;
-        };
-        if !line.contains("codex_core::tools") {
-            continue;
-        }
-        let msg = line[idx + "error=".len()..].trim();
-        // Named for the tool the probes' `tools` lists would have expected to do the deed:
-        // a patch is how Codex writes a file, which is Claude Code's `Write`/`Edit`.
-        let name = if msg.starts_with("patch") {
-            "Write"
-        } else {
-            "Bash"
         };
         t.tool_uses.push(name.to_string());
         t.tool_errors
@@ -1763,7 +1757,7 @@ async fn run_row(
             let harness = cfg
                 .harnesses
                 .get(&opts.harness)
-                .unwrap_or_else(|| cfg.harnesses.turn_harness());
+                .unwrap_or_else(|| cfg.harnesses.fallback_harness());
             let mut cmd = match harness.build_turn(&cfg, &req) {
                 Ok(c) => c,
                 Err(e) => {
@@ -1865,7 +1859,7 @@ async fn run_row(
         toolset_args: cfg
             .harnesses
             .get(&opts.harness)
-            .unwrap_or_else(|| cfg.harnesses.turn_harness())
+            .unwrap_or_else(|| cfg.harnesses.fallback_harness())
             .capability_args(&cfg, row.capability),
         root_tools,
         status: status.to_string(),
@@ -1917,7 +1911,7 @@ pub async fn run_battery(base: &Config, opts: &BatteryOptions) -> Result<RunOutc
     let real_home = PathBuf::from(&base.home);
     let transcript_dir = base
         .harnesses
-        .turn_harness()
+        .fallback_harness()
         .transcript_dir(base)
         .unwrap_or_else(|| real_home.join(".claude/projects"));
     let swept = sweep_stale_decoys(&real_home, &transcript_dir);

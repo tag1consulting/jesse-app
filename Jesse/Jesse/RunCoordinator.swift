@@ -1459,8 +1459,8 @@ final class RunCoordinator {
                 case .delta(let chunk):
                     appendPartial(threadID, chunk)
                     noteStreamActivity(threadID)
-                case .activity(let tool):
-                    activity[threadID] = Self.activityLabel(for: tool)
+                case .activity(let a):
+                    activity[threadID] = Self.activityLabel(for: a)
                     // Push the new human activity line to the Live Activity.
                     syncLiveActivity(threadID)
                 case .done(let reply):
@@ -1482,17 +1482,10 @@ final class RunCoordinator {
         return nil
     }
 
-    /// Map a coarse tool name from a `tool_use` event to a human activity line.
-    private static func activityLabel(for tool: String) -> String {
-        switch tool {
-        case "Read", "Glob", "Grep": return "Reading the vault…"
-        case "Write", "Edit", "NotebookEdit": return "Writing a file…"
-        case "Bash": return "Running a command…"
-        case "WebFetch", "WebSearch": return "Searching the web…"
-        case "Task": return "Working on it…"
-        default: return "Using \(tool)…"
-        }
-    }
+    /// Map a coarse tool activity to a human line. The mapping itself lives on
+    /// `ToolActivity` in JesseKit, because the Mac app renders the same line and a
+    /// whole-answer turn has nothing else to show — see `ToolActivity.displayLabel`.
+    static func activityLabel(for activity: ToolActivity) -> String { activity.displayLabel }
 
     /// Poll `GET /jesse/result/{jobId}` until the turn resolves, returning the
     /// terminal `TurnOutcome` (or `nil` on cancellation). This is the

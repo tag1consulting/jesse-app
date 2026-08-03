@@ -210,7 +210,7 @@ pub async fn run_ask_hosted_or_emergency(
     health: &HealthStore,
     prompt: &str,
     sid: Option<&str>,
-    jobs: &JobStore,
+    jobs: &Arc<JobStore>,
     jid: &str,
     question: &str,
     health_context: Option<&str>,
@@ -284,7 +284,7 @@ pub async fn run_ask_hosted_or_emergency(
             jobs,
             jid,
             active,
-            cfg.harnesses.turn_harness(),
+            cfg.harnesses.serving(active),
             spawned,
         )
         .await,
@@ -641,14 +641,18 @@ pub async fn jesse(
     let context = st.context.clone();
     let titles = st.titles.clone();
     // Conversation identity (NOT a feature-flagged concern): the registry, this turn's
-    // conversation id, and the TURN HARNESS's transcript dir, which the in-flight snapshot
-    // and the terminal stem diff both read. All three are needed on every path, success or
-    // failure. The dir is `None` for a harness that keeps no transcripts on disk: there are
-    // then no stems to snapshot and none to bind, and the session id the reply carries
-    // (bound below) is the whole record.
+    // conversation id, and THIS TURN'S OWN harness's transcript dir, which the in-flight
+    // snapshot and the terminal stem diff both read. All three are needed on every path,
+    // success or failure. The dir is `None` for a harness that keeps no transcripts on disk:
+    // there are then no stems to snapshot and none to bind, and the session id the reply
+    // carries (bound below) is the whole record.
+    //
+    // Resolved from `active`, not from a fixed harness: a Codex turn keeps no transcripts,
+    // and reading Claude Code's directory for it would diff a directory this turn never
+    // wrote — every stem in it would look like a stray the turn had just created.
     let conversations = st.conversations.clone();
     let cid = conversation_id.clone();
-    let sessions_dir = st.cfg.harnesses.turn_harness().transcript_dir(&st.cfg);
+    let sessions_dir = st.cfg.harnesses.serving(&active).transcript_dir(&st.cfg);
     // Meal-corrections queue (JESSE_MEAL_LOG v2): merged into the delivered `meal_log` at
     // completion, so off-app corrections ride this turn's terminal result.
     let meal_corrections = st.meal_corrections.clone();
@@ -666,10 +670,14 @@ pub async fn jesse(
         // files therefore survive run_claude's internal retries and are cleaned
         // exactly once, here.
         let _scratch = scratch;
-        // The agent program this turn runs on. One is registered (`claude-code`) and
-        // nothing selects another; the driver calls through it for the child command and
-        // the per-attempt line parser.
-        let harness = cfg.harnesses.turn_harness();
+        // The agent program this turn runs on: THE ACTIVE MODEL'S OWN harness. The driver
+        // calls through it for the child command and the per-attempt line parser.
+        //
+        // COUPLED WITH `sessions_dir` above, which is resolved from the same `active`. Both
+        // describe the same child, so they must be asked of the same harness — a turn spawned
+        // by one harness whose transcripts were looked for in another's directory is the exact
+        // mismatch `Harness::transcript_dir` returning `None` is meant to be safe against.
+        let harness = cfg.harnesses.serving(&active);
         // If the body below panics — or the task is aborted (cancel) while still
         // waiting for a permit — this guard's Drop drives the job to a terminal
         // state + terminal stream frame (M2). It's write-once, so a cancel that
@@ -689,7 +697,7 @@ pub async fn jesse(
                 // Reflect the wait in the live stream, reusing the activity hint
                 // mechanism (no new SSE frame type). A late/reconnecting subscriber
                 // sees it via the accumulated snapshot on subscribe.
-                jobs.stream_push_activity(&jid, QUEUED_ACTIVITY);
+                jobs.stream_push_activity(&jid, ToolActivity::used(QUEUED_ACTIVITY));
                 ticket.wait_for_permit().await
             }
         };

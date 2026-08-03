@@ -38,11 +38,26 @@ pub fn sse_reset(text: &str) -> Event {
     sse_event("reset", json!({ "text": text }))
 }
 
+/// An `activity` frame. ONE encoder, because two paths emit it — the live broadcast and
+/// the replay a late subscriber gets — and a subscriber that joined a beat late must not
+/// be told something different from one that was there.
+///
+/// `refused` is OMITTED when false, so the frame a Claude Code turn emits is byte-for-byte
+/// the one it emitted before this field existed: an older client decoding only `name` is
+/// unaffected, and a newer one defaults the missing field to false. See `ToolActivity`.
+pub fn sse_activity(a: &ToolActivity) -> Event {
+    if a.refused {
+        sse_event("activity", json!({ "name": a.name, "refused": true }))
+    } else {
+        sse_event("activity", json!({ "name": a.name }))
+    }
+}
+
 /// Translate a broadcast `StreamFrame` into its wire SSE event.
 pub fn frame_to_event(frame: &StreamFrame) -> Event {
     match frame {
         StreamFrame::Delta(text) => sse_event("delta", json!({ "text": text })),
-        StreamFrame::Activity(name) => sse_event("activity", json!({ "name": name })),
+        StreamFrame::Activity(a) => sse_activity(a),
         StreamFrame::Done {
             response,
             session_id,
@@ -130,8 +145,8 @@ pub async fn jesse_stream(
         // frames on a task that ends when the terminal frame arrives or the
         // client goes away (the mpsc send fails once the response body is dropped).
         let _ = tx.try_send(Ok(sse_reset(&text)));
-        if let Some(name) = activity {
-            let _ = tx.try_send(Ok(sse_event("activity", json!({ "name": name }))));
+        if let Some(a) = activity {
+            let _ = tx.try_send(Ok(sse_activity(&a)));
         }
         tokio::spawn(forward_live_frames(
             brx,

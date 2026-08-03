@@ -145,7 +145,7 @@ fn the_registry_holds_both_and_only_the_transcript_bearing_one_contributes_a_dir
         "the turn harness sorts first, then the rest by id"
     );
     assert_eq!(
-        cfg.harnesses.turn_harness().id(),
+        cfg.harnesses.fallback_harness().id(),
         CLAUDE_CODE_ID,
         "registering a second harness does not change which one serves turns"
     );
@@ -386,5 +386,105 @@ fn the_shipped_registry_is_unchanged_by_any_of_this() {
     assert_eq!(
         cfg.harnesses.transcript_dirs(&cfg),
         vec![PathBuf::from("/home/bob/.claude/projects/-vault-notes")]
+    );
+}
+
+/// A CODEX CONVERSATION RESUMES ACROSS THREE TURNS, end to end through the same pieces a
+/// real turn uses: the parser reads the thread id off the child's stream, the driver's
+/// `SpawnedSessions` records it, the conversation store binds it, the next turn resolves it
+/// back out, and the argv builder turns it into `codex exec resume <id>`.
+///
+/// **Three turns rather than two, because two cannot catch the bug this guards.** Turn 2
+/// proves a resume happens at all. Turn 3 proves the conversation tracks the id FORWARD: a
+/// resumed Codex turn reports a NEW thread id (the thread forks, exactly as a resumed Claude
+/// Code session gets a fresh transcript stem), and a store that kept binding the first one
+/// would resume turn 1's thread forever while every turn appeared to succeed. Nothing about
+/// that failure is visible from the outside — the answers would just quietly lose the middle
+/// of the conversation.
+///
+/// This is the whole safety net for Codex resume. `transcript_dir` is `None`, so there is no
+/// file on disk to fall back to and `resolve_resume_session_for_harness` deliberately skips
+/// its existence check: the bound id IS the record.
+#[test]
+fn a_codex_conversation_resumes_across_three_turns() {
+    let cfg = test_config();
+    let conversations = ConversationStore::new(None);
+    const CID: &str = "conv-codex-resume";
+    conversations.register(CID, None, 1_000);
+
+    // Each turn's child reports its own thread id, and a resumed thread reports a new one.
+    let threads = ["th_aaa", "th_bbb", "th_ccc"];
+    let mut resumed: Vec<Option<String>> = Vec::new();
+
+    for (turn, thread) in threads.iter().enumerate() {
+        // What this turn will resume, resolved the way the handler resolves it: the
+        // conversation's bound session leads, and the request carries nothing.
+        let sid = resolve_conversation_resume(&conversations, CID, None);
+        let sid = resolve_resume_session_for_harness(&cfg, &Codex, sid.as_deref())
+            .map(str::to_string);
+        resumed.push(sid.clone());
+
+        // The argv the harness would actually spawn.
+        let argv = build_codex_args(
+            "what did I say?",
+            sid.as_deref(),
+            Capability::Read,
+            std::path::Path::new("/vault/notes"),
+            &[],
+        );
+        match &sid {
+            None => assert!(
+                !argv.contains(&"resume".to_string()),
+                "turn {turn} has nothing to resume and must not pass `resume`"
+            ),
+            Some(id) => {
+                let at = argv.iter().position(|a| a == "resume").unwrap_or_else(|| {
+                    panic!("turn {turn} should have resumed {id}, argv: {argv:?}")
+                });
+                assert_eq!(argv[at - 1], "exec", "`resume` is a subcommand of `exec`");
+                assert_eq!(&argv[at + 1], id, "resume must name the bound thread");
+            }
+        }
+
+        // Now run this turn's stream through the real parser and the real driver-side
+        // recorder, and bind what it reported — the `spawned.ids()` path in the handler.
+        let spawned = SpawnedSessions::new();
+        let mut parser = Codex.parser();
+        let mut done = None;
+        for line in [
+            format!(r#"{{"type":"thread.started","thread_id":"{thread}"}}"#),
+            r#"{"type":"item.completed","item":{"type":"agent_message","text":"ok"}}"#
+                .to_string(),
+            r#"{"type":"turn.completed","usage":{"input_tokens":10,"output_tokens":2}}"#
+                .to_string(),
+        ] {
+            match parser.on_line(&line) {
+                StreamEvent::SessionId(id) => spawned.record(&id),
+                StreamEvent::Done(o) => done = Some(o),
+                _ => {}
+            }
+        }
+        assert!(matches!(done, Some(ClaudeOutcome::Ok { .. })), "turn {turn} ok");
+        assert_eq!(
+            spawned.ids(),
+            vec![thread.to_string()],
+            "turn {turn}: the id must reach the driver from `thread.started`, not only from \
+             the terminal event — a turn that dies mid-flight still owns its thread"
+        );
+        for id in spawned.ids() {
+            conversations.bind_session(CID, &id);
+        }
+    }
+
+    assert_eq!(
+        resumed,
+        vec![None, Some("th_aaa".to_string()), Some("th_bbb".to_string())],
+        "turn 1 starts fresh; turn 2 resumes turn 1's thread; turn 3 resumes turn 2's — the \
+         conversation follows the fork rather than pinning the first id"
+    );
+    assert_eq!(
+        conversations.get(CID).map(|c| c.session_ids),
+        Some(threads.iter().map(|s| s.to_string()).collect::<Vec<_>>()),
+        "every thread the conversation ever ran stays an alias, newest current"
     );
 }

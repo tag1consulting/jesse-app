@@ -21,7 +21,7 @@ pub enum StreamFrame {
     /// Incremental answer text — append to what the client has so far.
     Delta(String),
     /// A coarse "Jesse is using the <name> tool" activity hint.
-    Activity(String),
+    Activity(ToolActivity),
     /// Terminal: the turn finished. Carries the authoritative final text,
     /// session id, any extracted directives, and the structured provenance (same
     /// values `complete` persisted), not the accumulated deltas.
@@ -39,6 +39,48 @@ pub enum StreamFrame {
     Cancelled,
 }
 
+/// One coarse tool-activity hint: WHICH tool, and whether the containment boundary
+/// REFUSED the call.
+///
+/// `refused` is a separate field rather than a suffix on `name` because `name` is a
+/// VOCABULARY — the same one both harnesses emit and `RunCoordinator.activityLabel`
+/// switches on — and folding a display word into it would make every client parse a
+/// string grammar to get one bit back out. A refused `Write` is still a `Write`.
+///
+/// It carries a bit rather than the child's own error text ON PURPOSE: that text names
+/// the path or the command the model tried, and this value reaches a phone screen.
+///
+/// COUPLED WITH `JesseStreamEvent.activity` in `JesseKit/Sources/JesseNetworking/
+/// WireTypes.swift`, which is the same pair on the client side, and with `frame_to_event`,
+/// which omits `refused` from the wire when false so an older client decoding only `name`
+/// is unaffected.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ToolActivity {
+    pub name: String,
+    pub refused: bool,
+}
+
+impl ToolActivity {
+    /// A tool call the child made and the harness observed succeeding, or at least
+    /// starting — the ordinary case, and every activity Claude Code emits.
+    pub fn used(name: impl Into<String>) -> Self {
+        ToolActivity {
+            name: name.into(),
+            refused: false,
+        }
+    }
+
+    /// A tool call the containment boundary refused. Not a turn failure: the boundary
+    /// working is the system working, and the model routinely tries something, is
+    /// refused, and answers anyway. What it must not be is invisible.
+    pub fn refused(name: impl Into<String>) -> Self {
+        ToolActivity {
+            name: name.into(),
+            refused: true,
+        }
+    }
+}
+
 /// Per-job live-stream state: the broadcast sender plus the text accumulated so
 /// far (so a phone that opens the stream a beat late, or reconnects after a
 /// blip, can be replayed the beginning) and the most recent tool-activity hint.
@@ -49,7 +91,7 @@ pub enum StreamFrame {
 struct StreamHandle {
     tx: broadcast::Sender<StreamFrame>,
     text: String,
-    activity: Option<String>,
+    activity: Option<ToolActivity>,
 }
 
 /// Broadcast backlog per job. Generous so a briefly-slow subscriber doesn't lag
@@ -104,11 +146,11 @@ impl StreamRegistry {
     }
 
     /// Record the latest tool-activity hint and broadcast it. No-op if gone.
-    pub fn push_activity(&self, id: &str, name: &str) {
+    pub fn push_activity(&self, id: &str, activity: ToolActivity) {
         let mut guard = self.streams.lock_ok();
         if let Some(h) = guard.get_mut(id) {
-            h.activity = Some(name.to_string());
-            let _ = h.tx.send(StreamFrame::Activity(name.to_string()));
+            h.activity = Some(activity.clone());
+            let _ = h.tx.send(StreamFrame::Activity(activity));
         }
     }
 
@@ -130,7 +172,7 @@ impl StreamRegistry {
     pub fn subscribe(
         &self,
         id: &str,
-    ) -> Option<(String, Option<String>, broadcast::Receiver<StreamFrame>)> {
+    ) -> Option<(String, Option<ToolActivity>, broadcast::Receiver<StreamFrame>)> {
         let guard = self.streams.lock_ok();
         let h = guard.get(id)?;
         Some((h.text.clone(), h.activity.clone(), h.tx.subscribe()))

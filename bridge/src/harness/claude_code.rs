@@ -126,64 +126,6 @@ pub fn main_turn_request<'a>(
     }
 }
 
-/// The TITLE one-shot's request: [`Capability::Basic`] with NO MCP servers, ambient model,
-/// no session. cwd stays the vault — a per-call-site choice the capability says nothing
-/// about, and with `--tools ""` the child cannot read anything there anyway.
-pub fn title_child_request<'a>(
-    cfg: &'a Config,
-    prompt: &'a str,
-    ambient: &'a ActiveModel,
-) -> TurnRequest<'a> {
-    TurnRequest {
-        prompt,
-        session_id: None,
-        active: ambient,
-        capability: Capability::Basic,
-        cwd: PathBuf::from(&cfg.vault),
-        mcp_config: EMPTY_MCP_CONFIG,
-    }
-}
-
-/// A stateless DIET child's request (extract or verify): [`Capability::Basic`] with no MCP
-/// servers, and the neutral scratch base as cwd so the large vault `CLAUDE.md` cannot
-/// auto-load (the extract/verify contract is inlined in the prompt). That cwd is a
-/// deliberate per-call-site choice, NOT something `Basic` implies — the title one-shot is
-/// also `Basic` and runs in the vault — so leave it alone.
-pub fn diet_child_request<'a>(
-    cfg: &'a Config,
-    prompt: &'a str,
-    ambient: &'a ActiveModel,
-) -> TurnRequest<'a> {
-    TurnRequest {
-        prompt,
-        session_id: None,
-        active: ambient,
-        capability: Capability::Basic,
-        cwd: cfg.scratch_base(), // neutral cwd → no vault CLAUDE.md auto-load
-        mcp_config: EMPTY_MCP_CONFIG,
-    }
-}
-
-/// The read-only VAULT-QA child's request (shared with the shadow child):
-/// [`Capability::Read`] and the child's own MCP server set (`JESSE_VAULTQA_MCP_CONFIG`,
-/// else NO servers). THE ONE INTENTIONAL DIVERGENCE from the diet child is the cwd: the
-/// vault, because the child must read vault files to answer. Containment therefore comes
-/// from the TOOLSET, not from an isolated cwd. Never resumes (the child is stateless).
-pub fn vaultqa_child_request<'a>(
-    cfg: &'a Config,
-    prompt: &'a str,
-    ambient: &'a ActiveModel,
-) -> TurnRequest<'a> {
-    TurnRequest {
-        prompt,
-        session_id: None,
-        active: ambient,
-        capability: Capability::Read,
-        cwd: PathBuf::from(&cfg.vault),
-        mcp_config: vaultqa_mcp_config(cfg),
-    }
-}
-
 // ---- `stream-json` parsing --------------------------------------------------
 
 /// Classify a parsed terminal `result` object into the bridge's Ok/Retryable/Fatal outcome
@@ -287,9 +229,13 @@ pub fn parse_stream_line(line: &str) -> StreamEvent {
                     let is_tool = block.and_then(|b| b.get("type")).and_then(|t| t.as_str())
                         == Some("tool_use");
                     match block.and_then(|b| b.get("name")).and_then(|n| n.as_str()) {
-                        Some(name) if is_tool => StreamEvent::ToolActivity {
-                            name: name.to_string(),
-                        },
+                        // Never `refused`: Claude Code's boundary is a tool ALLOWLIST, so a
+                        // call it will not permit produces no `tool_use` block to start.
+                        // There is nothing here to mark refused, which is the difference
+                        // from Codex — see `Harness::classify_stderr_line`.
+                        Some(name) if is_tool => {
+                            StreamEvent::ToolActivity(ToolActivity::used(name))
+                        }
                         _ => StreamEvent::Ignore,
                     }
                 }
@@ -777,7 +723,7 @@ mod tests {
     fn parse_tool_use_start_is_activity() {
         let line = r#"{"type":"stream_event","event":{"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"toolu_1","name":"Read","input":{}}}}"#;
         match parse_stream_line(line) {
-            StreamEvent::ToolActivity { name } => assert_eq!(name, "Read"),
+            StreamEvent::ToolActivity(a) => assert_eq!(a, ToolActivity::used("Read")),
             other => panic!("expected ToolActivity, got {other:?}"),
         }
     }
@@ -1777,7 +1723,7 @@ mod tests {
     fn build_turn_matches_the_named_builder_at_every_call_site() {
         let cfg = test_config();
         let ambient = ActiveModel::ambient();
-        let harness = cfg.harnesses.turn_harness();
+        let harness = cfg.harnesses.fallback_harness();
         let same = |a: &Command, b: &Command, label: &str| {
             assert_eq!(cmd_argv(a), cmd_argv(b), "{label}: argv");
             assert_eq!(

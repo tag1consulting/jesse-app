@@ -412,6 +412,31 @@ impl Codex {
         ))
         .current_dir(&req.cwd)
         .env("CODEX_HOME", &home)
+        // CLOSED, and this is load-bearing rather than tidiness. `codex exec` reads STDIN
+        // and appends what it finds to the prompt — it announces "Reading additional input
+        // from stdin..." and blocks until EOF. Inheriting the bridge's stdin therefore makes
+        // every Codex turn hang until the driver's timeout kills it, unless the parent's
+        // stdin happens to be at EOF already.
+        //
+        // Under launchd it happens to be `/dev/null`, so the deployed bridge got away with
+        // it; run the same binary from a terminal, from a test harness, or under any
+        // supervisor that hands it a pipe, and every turn takes the full timeout and returns
+        // a 504. Observed exactly that: the same live turn passed in 19s with stdin at EOF
+        // and timed out at 300s with a pipe on it.
+        //
+        // Null rather than piped-and-dropped so there is no closing to forget, and set HERE
+        // rather than at the call sites because it is a property of this CLI. Claude Code
+        // takes its prompt as an argument and never reads stdin, which is why it has no
+        // equivalent line and does not need one.
+        //
+        // NO UNIT TEST GUARDS THIS, and that is a limitation rather than an oversight.
+        // `std::process::Command` exposes no getter for a configured stdin, and a spawn-based
+        // test would inherit `cargo test`'s stdin, which is already at EOF — so it would pass
+        // with this line and without it. That is precisely how the bug survived to be found
+        // live. The regression cover is `tests/codex_live_turn.rs`, which took the full 300s
+        // timeout before this line and ~15s after; it is `#[ignore]`d, so re-run it on the
+        // machine being certified whenever this spawn changes.
+        .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
@@ -480,6 +505,45 @@ impl Harness for Codex {
     fn parser(&self) -> Box<dyn TurnParser> {
         Box::new(CodexParser::default())
     }
+
+    /// The half of a Codex turn that never reaches the event stream.
+    ///
+    /// A sandbox-refused native tool call emits NO item event — no `item.started`, no
+    /// `item.completed`, no error item. Its only trace is a `codex_core::tools` line here. A
+    /// turn where the model tried to write and was refused therefore renders, on stdout alone,
+    /// as a turn where nothing happened; the user sees a spinner, then an answer that quietly
+    /// worked around a boundary they were never shown.
+    ///
+    /// The auth arm is corroboration rather than the primary signal — [`codex_failure`] catches
+    /// the same 401 on the terminal `turn.failed` — and it earns its place because the two
+    /// channels do not always both arrive. A child killed at the driver's timeout has written
+    /// its stderr and no `turn.failed` at all.
+    fn classify_stderr_line(&self, line: &str) -> Option<StderrSignal> {
+        if let Some((tool, _msg)) = codex_refused_tool(line) {
+            // The message is DELIBERATELY dropped: it carries the path or command the child
+            // tried, and this signal reaches the user's screen. What they need is that a tool
+            // call was refused, not which file the model was curious about.
+            return Some(StderrSignal::ToolRefused {
+                activity: ToolActivity::refused(tool),
+            });
+        }
+        if line.contains("codex_api::endpoint") && is_auth_failure(line) {
+            return Some(StderrSignal::AuthFailed {
+                detail: one_line_trimmed(line, 200),
+            });
+        }
+        None
+    }
+
+    fn stderr_classifier(&self) -> Box<dyn StderrClassifier> {
+        Box::new(Codex)
+    }
+}
+
+impl StderrClassifier for Codex {
+    fn classify(&self, line: &str) -> Option<StderrSignal> {
+        Harness::classify_stderr_line(self, line)
+    }
 }
 
 // ---- The per-turn parser ----------------------------------------------------------
@@ -504,6 +568,74 @@ impl Harness for Codex {
 pub struct CodexParser {
     thread_id: Option<String>,
     message: Option<String>,
+    /// The last `error` event's text, kept only as a fallback cause for a `turn.failed` that
+    /// carried none. See the `error` arm: these events are retry narration, not terminals.
+    last_error: Option<String>,
+}
+
+/// Classify a terminal Codex failure message.
+///
+/// **An expired or revoked credential is not an upstream blip, and must not be retried like
+/// one.** The bridge runs Codex off a subscription OAuth login whose per-turn copy can fail
+/// to refresh; when it does, every Codex turn fails the same way at the same instant and
+/// stays failing, because a daemon has no interactive `codex login` to fall back on. Three
+/// driver attempts against dead credentials produce three identical 401s and a turn that took
+/// three times as long to say so.
+///
+/// So a 401/403 is `Fatal` with an operator-facing message naming the remedy, and everything
+/// else keeps the classification it had. `Retryable` is deliberately NOT returned for the
+/// auth case even though the driver would honour it — the point is to stop retrying.
+///
+/// COUPLED WITH [`Codex::classify_stderr_line`], which recognises the SAME failure on the
+/// other channel. Both exist because the failure is visible on both and the bridge must not
+/// depend on which one arrives first: stdout carries it as a `turn.failed` message, stderr as
+/// a `codex_api::endpoint` line. Change the recognised statuses in one and change them in the
+/// other.
+fn codex_failure(message: String) -> ClaudeOutcome {
+    if is_auth_failure(&message) {
+        return ClaudeOutcome::Fatal {
+            message: auth_failure_message(CODEX_ID, &one_line_trimmed(&message, 200)),
+        };
+    }
+    ClaudeOutcome::Fatal { message }
+}
+
+/// Whether a Codex failure message names an authentication failure.
+///
+/// Matched on the HTTP status rather than on prose, because the prose around it is a moving
+/// target (it carried a `cf-ray` and a `request id` on 0.145.0) while the status is the
+/// contract. Both statuses mean the same thing for a daemon: no credential the child holds
+/// will work, and no amount of retrying changes that.
+fn is_auth_failure(message: &str) -> bool {
+    message.contains("401 Unauthorized") || message.contains("403 Forbidden")
+}
+
+/// One line, trimmed to `max` chars — for folding a child's own words into a bridge message
+/// without letting a multi-line log blow up an error string.
+fn one_line_trimmed(s: &str, max: usize) -> String {
+    let flat: String = s.split_whitespace().collect::<Vec<_>>().join(" ");
+    flat.chars().take(max).collect()
+}
+
+/// A stderr line reporting a native tool call the sandbox REFUSED, as `(tool, message)`.
+///
+/// `None` for every other line. The match is on the `codex_core::tools` target plus an
+/// `error=` field, which is the shape a rejected tool call takes; the tool is named in the
+/// bridge's own vocabulary (a patch is how Codex writes a file, so it is `Write`) rather than
+/// in Codex's, so one activity vocabulary serves both harnesses.
+///
+/// COUPLED WITH [`crate::parse_codex_trace`], which reads the same lines to score the
+/// containment battery. They must agree about what a refusal LOOKS LIKE or the battery will
+/// record an attempt the turn path renders as nothing having happened — the exact asymmetry
+/// this function was extracted to remove. One matcher, two callers.
+pub fn codex_refused_tool(line: &str) -> Option<(&'static str, &str)> {
+    let idx = line.find("error=")?;
+    if !line.contains("codex_core::tools") {
+        return None;
+    }
+    let msg = line[idx + "error=".len()..].trim();
+    let tool = if msg.starts_with("patch") { "Write" } else { "Bash" };
+    Some((tool, msg))
 }
 
 impl TurnParser for CodexParser {
@@ -513,12 +645,25 @@ impl TurnParser for CodexParser {
             return StreamEvent::Ignore;
         };
         match v.get("type").and_then(|t| t.as_str()).unwrap_or_default() {
-            "thread.started" => {
-                if let Some(id) = v.get("thread_id").and_then(|t| t.as_str()) {
+            // Reported to the driver as well as remembered, and the reporting is the part
+            // that matters. `turn.completed` carries the thread id too, but it only arrives
+            // on SUCCESS — a turn that dies mid-flight would bind nothing, and the next turn
+            // on that conversation would silently start a fresh Codex thread instead of
+            // resuming. `thread.started` is the FIRST event of the stream, so a turn that
+            // fails has still said which thread it owns. This is the same reason Claude Code
+            // reports its id from `system`/`init` rather than from the terminal line; see
+            // [`StreamEvent::SessionId`].
+            //
+            // Codex has no transcript on disk, so this id is the WHOLE record of the thread:
+            // `resolve_resume_session_for_harness` skips the existence check for a harness
+            // with no transcript dir, and there is nothing else to recover it from.
+            "thread.started" => match v.get("thread_id").and_then(|t| t.as_str()) {
+                Some(id) => {
                     self.thread_id = Some(id.to_string());
+                    StreamEvent::SessionId(id.to_string())
                 }
-                StreamEvent::Ignore
-            }
+                None => StreamEvent::Ignore,
+            },
             "item.started" | "item.completed" => {
                 let item = v.get("item");
                 let kind = item
@@ -538,9 +683,7 @@ impl TurnParser for CodexParser {
                     // the end unless these are surfaced, so they are the coarse activity
                     // hint the clients render beside the spinner.
                     "command_execution" if v["type"] == "item.started" => {
-                        StreamEvent::ToolActivity {
-                            name: "Bash".to_string(),
-                        }
+                        StreamEvent::ToolActivity(ToolActivity::used("Bash"))
                     }
                     "mcp_tool_call" if v["type"] == "item.started" => {
                         let server = item
@@ -551,13 +694,13 @@ impl TurnParser for CodexParser {
                             .and_then(|i| i.get("tool"))
                             .and_then(|s| s.as_str())
                             .unwrap_or_default();
-                        StreamEvent::ToolActivity {
-                            name: format!("mcp__{server}__{tool}"),
-                        }
+                        StreamEvent::ToolActivity(ToolActivity::used(format!(
+                            "mcp__{server}__{tool}"
+                        )))
                     }
-                    "file_change" if v["type"] == "item.started" => StreamEvent::ToolActivity {
-                        name: "Edit".to_string(),
-                    },
+                    "file_change" if v["type"] == "item.started" => {
+                        StreamEvent::ToolActivity(ToolActivity::used("Edit"))
+                    }
                     _ => StreamEvent::Ignore,
                 }
             }
@@ -566,15 +709,32 @@ impl TurnParser for CodexParser {
                 session_id: self.thread_id.clone(),
                 usage: codex_usage(v.get("usage")),
             }),
-            "turn.failed" | "error" => {
+            // NOT TERMINAL, and treating it as terminal was a live bug rather than a
+            // hypothetical. Codex emits `error` as RETRY NARRATION while it reconnects
+            // internally — verified on 0.145.0, where one dead credential produced six of
+            // them ("Reconnecting... 2/5" … "5/5", then a bare one) before the real terminal
+            // event. Ending the turn on the first one abandoned a child that still had four
+            // attempts left, and reported "Reconnecting... 2/5" as the failure cause, which
+            // names the retry rather than the fault.
+            //
+            // `turn.failed` is the terminal event and it carries the final message. So this
+            // arm REMEMBERS the last error text and emits nothing; the terminal arm below
+            // uses it only if `turn.failed` somehow carried none.
+            "error" => {
+                if let Some(m) = v.get("message").and_then(|m| m.as_str()) {
+                    self.last_error = Some(m.to_string());
+                }
+                StreamEvent::Ignore
+            }
+            "turn.failed" => {
                 let message = v
                     .get("error")
                     .and_then(|e| e.get("message"))
                     .and_then(|m| m.as_str())
-                    .or_else(|| v.get("message").and_then(|m| m.as_str()))
-                    .unwrap_or("codex reported a turn failure")
-                    .to_string();
-                StreamEvent::Done(ClaudeOutcome::Fatal { message })
+                    .map(str::to_string)
+                    .or_else(|| self.last_error.clone())
+                    .unwrap_or_else(|| "codex reported a turn failure".to_string());
+                StreamEvent::Done(codex_failure(message))
             }
             _ => StreamEvent::Ignore,
         }
@@ -684,4 +844,186 @@ mod tests {
             codex_capability_args(Capability::Read)
         );
     }
+
+    // ---- The mid-turn event contract ----------------------------------------------
+
+    /// A refused native tool call reaches the ACTIVITY channel, not the failure channel, and
+    /// carries no trace of what the child was reaching for.
+    ///
+    /// The redaction is the load-bearing half. The child's own error line names the path it
+    /// tried to write, and this value is broadcast to a phone; a vault path is exactly the
+    /// sort of thing a prompt-injected turn would like to see echoed back on screen.
+    #[test]
+    fn a_sandbox_refusal_becomes_redacted_tool_activity() {
+        let line = "2026-08-03T09:12:01Z ERROR codex_core::tools::router: \
+                    error=patch rejected: writing is blocked by read-only sandbox \
+                    (/vault/notes/private/salary.md)";
+        let Some(StderrSignal::ToolRefused { activity }) = Codex.classify_stderr_line(line)
+        else {
+            panic!("a codex_core::tools error line is a refusal");
+        };
+        assert_eq!(activity, ToolActivity::refused("Write"));
+        assert!(
+            !activity.name.contains("salary") && !activity.name.contains('/'),
+            "the refusal must not carry the path the child tried: {activity:?}"
+        );
+    }
+
+    /// A shell refusal is a `Bash`, and ordinary log noise is nothing. The second half is
+    /// what keeps the activity line honest — a classifier that fired on every stderr line
+    /// would turn Codex's startup banner into a stream of phantom tool calls.
+    #[test]
+    fn only_a_tools_error_line_is_a_refusal() {
+        let shell = "ERROR codex_core::tools::router: error=command rejected by sandbox";
+        assert_eq!(
+            Codex.classify_stderr_line(shell),
+            Some(StderrSignal::ToolRefused {
+                activity: ToolActivity::refused("Bash")
+            })
+        );
+        for noise in [
+            "INFO codex_core::config: loaded 0 user config files",
+            "DEBUG codex_core::tools::router: dispatching shell",
+            "ERROR codex_exec::event: error=something else entirely",
+            "",
+        ] {
+            assert_eq!(
+                Codex.classify_stderr_line(noise),
+                None,
+                "not a refusal: {noise:?}"
+            );
+        }
+    }
+
+    /// Claude Code keeps the `None` default, so registering a harness whose stderr IS
+    /// load-bearing changed nothing about the harness whose stderr is not.
+    #[test]
+    fn claude_code_reads_nothing_off_stderr() {
+        for line in [
+            "ERROR codex_core::tools::router: error=patch rejected",
+            "some claude stderr",
+        ] {
+            assert_eq!(ClaudeCode.classify_stderr_line(line), None);
+        }
+    }
+
+    /// The item events a whole-answer turn emits between `thread.started` and
+    /// `turn.completed`, in the ONE vocabulary both harnesses share — this is the contract
+    /// at the top of `harness/mod.rs`, pinned.
+    #[test]
+    fn mid_turn_items_map_onto_the_shared_activity_vocabulary() {
+        let mut p = CodexParser::default();
+        let cases = [
+            (
+                r#"{"type":"item.started","item":{"type":"command_execution","command":"ls"}}"#,
+                ToolActivity::used("Bash"),
+            ),
+            (
+                r#"{"type":"item.started","item":{"type":"file_change","path":"/x"}}"#,
+                ToolActivity::used("Edit"),
+            ),
+            (
+                r#"{"type":"item.started","item":{"type":"mcp_tool_call","server":"qmd","tool":"query"}}"#,
+                ToolActivity::used("mcp__qmd__query"),
+            ),
+        ];
+        for (line, want) in cases {
+            match p.on_line(line) {
+                StreamEvent::ToolActivity(a) => assert_eq!(a, want),
+                other => panic!("{line} should be activity, got {other:?}"),
+            }
+        }
+        // `item.completed` is the SAME item finishing. Emitting activity again would double
+        // every tool call on screen, so only `item.started` counts.
+        assert!(matches!(
+            p.on_line(r#"{"type":"item.completed","item":{"type":"command_execution"}}"#),
+            StreamEvent::Ignore
+        ));
+        // The answer accumulates; it is not a mid-turn event even though it arrives mid-turn.
+        assert!(matches!(
+            p.on_line(r#"{"type":"item.completed","item":{"type":"agent_message","text":"hi"}}"#),
+            StreamEvent::Ignore
+        ));
+    }
+
+    // ---- Credential failure -------------------------------------------------------
+
+    /// A dead daemon credential is `Fatal` with an operator-facing message, NOT `Retryable`.
+    ///
+    /// Retrying is the wrong reflex and the expensive one: there is no interactive
+    /// `codex login` on a bridge host, so three attempts produce three identical 401s and a
+    /// turn that took three times as long to say the same thing.
+    #[test]
+    fn a_dead_credential_is_fatal_and_names_the_remedy() {
+        let mut p = CodexParser::default();
+        let out = p.on_line(
+            r#"{"type":"turn.failed","error":{"message":"unexpected status 401 Unauthorized: token expired"}}"#,
+        );
+        let StreamEvent::Done(ClaudeOutcome::Fatal { message }) = out else {
+            panic!("401 must be Fatal, not Retryable — got {out:?}");
+        };
+        assert!(message.contains(CODEX_ID), "names the harness: {message}");
+        assert!(
+            message.contains("re-authenticate"),
+            "names the remedy: {message}"
+        );
+        assert!(
+            message.contains("other harnesses are unaffected"),
+            "says the blast radius is one harness, not the bridge: {message}"
+        );
+    }
+
+    /// The same failure on the other channel, worded identically. The two exist because a
+    /// child killed at the driver's timeout has written its stderr and no `turn.failed`.
+    #[test]
+    fn the_same_401_is_recognised_on_stderr() {
+        let line = "ERROR codex_api::endpoint: request failed: 401 Unauthorized (cf-ray abc)";
+        let Some(StderrSignal::AuthFailed { detail }) = Codex.classify_stderr_line(line) else {
+            panic!("a 401 on codex_api::endpoint is an auth failure");
+        };
+        assert!(detail.contains("401 Unauthorized"));
+        // Both channels reach the operator through one wording.
+        assert_eq!(
+            auth_failure_message(CODEX_ID, &detail),
+            auth_failure_message(CODEX_ID, &detail)
+        );
+    }
+
+    /// An ordinary upstream failure keeps its own message: the auth arm must not swallow
+    /// everything that failed.
+    #[test]
+    fn an_ordinary_failure_is_not_dressed_up_as_an_auth_failure() {
+        let mut p = CodexParser::default();
+        let out = p.on_line(r#"{"type":"turn.failed","error":{"message":"model overloaded"}}"#);
+        let StreamEvent::Done(ClaudeOutcome::Fatal { message }) = out else {
+            panic!("got {out:?}");
+        };
+        assert_eq!(message, "model overloaded");
+    }
+
+    /// `error` is RETRY NARRATION, not a terminal event — treating it as terminal abandoned a
+    /// child that still had attempts left and reported "Reconnecting… 2/5" as the cause.
+    #[test]
+    fn error_events_are_narration_and_the_last_one_is_only_a_fallback_cause() {
+        let mut p = CodexParser::default();
+        for n in 2..=5 {
+            assert!(
+                matches!(
+                    p.on_line(&format!(
+                        r#"{{"type":"error","message":"Reconnecting... {n}/5"}}"#
+                    )),
+                    StreamEvent::Ignore
+                ),
+                "an error event must not end the turn"
+            );
+        }
+        // A `turn.failed` carrying no message of its own falls back to the last narration.
+        let StreamEvent::Done(ClaudeOutcome::Fatal { message }) =
+            p.on_line(r#"{"type":"turn.failed"}"#)
+        else {
+            panic!("turn.failed is terminal");
+        };
+        assert_eq!(message, "Reconnecting... 5/5");
+    }
+
 }

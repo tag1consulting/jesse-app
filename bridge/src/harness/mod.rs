@@ -18,8 +18,66 @@ pub use codex::*;
 //     three attempts with a stream reset between them. That stays in [`crate::claude`] and
 //     calls through `&dyn Harness`.
 //
-// One harness is registered today (`claude-code`) and nothing selects another; the point
-// of the seam is that a second one is a new file rather than a second copy of the driver.
+// ---- THE MID-TURN EVENT CONTRACT --------------------------------------------
+//
+// WHAT A HARNESS OWES BETWEEN "I STARTED" AND "I FINISHED". Written here rather than
+// left implicit because Codex is the FIRST harness whose answer arrives whole, and there
+// is no second one to check the shape against — so the shape is stated, not inferred from
+// the one implementation that has it.
+//
+// The bridge's mid-turn vocabulary is exactly TWO things, and a harness emits some mixture
+// of them per turn:
+//
+//   * [`StreamEvent::TextDelta`] — a chunk of the visible answer. A harness emits these
+//     only if [`Harness::streams_text`] is true. Codex's is FALSE and that is not a defect
+//     to route around: its `--json` stream carries no token-level delta for the visible
+//     answer at all, only whole items.
+//   * [`StreamEvent::ToolActivity`] — a coarse "the child is doing X" hint. Named in ONE
+//     vocabulary across harnesses (`Bash`, `Edit`, `Read`, `mcp__<server>__<tool>`), so
+//     the clients' one `activityLabel` switch serves both. Carries a `refused` bit; see
+//     [`ToolActivity`].
+//
+// A WHOLE-ANSWER HARNESS THEREFORE OWES TOOL ACTIVITY, and owes it as its ONLY mid-turn
+// signal. A streaming harness's activity line is a garnish — deltas are already arriving,
+// so a missed activity event costs nothing. On a whole-answer harness the activity line is
+// the entire difference between a turn the user can see working and a turn that is
+// indistinguishable from one that has silently hung. The spinner (keyed off
+// `ModelInfo.streamsText`) says "this model replies all at once"; the activity line is the
+// only thing that says what it is doing while it does.
+//
+// Concretely, for Codex, between `thread.started` and `turn.completed`:
+//   * `item.started` with a `command_execution` item  → `Bash`
+//   * `item.started` with a `file_change` item        → `Edit`
+//   * `item.started` with an `mcp_tool_call` item     → `mcp__<server>__<tool>`
+//   * a `codex_core::tools` line ON STDERR            → the same, with `refused` set
+//   * `item.completed` with an `agent_message` item   → accumulated, NOT emitted mid-turn
+//
+// THE LAST TWO ARE THE ONES A NEXT READER WILL GET WRONG. The agent_message is not a
+// mid-turn event even though it arrives mid-turn: Codex emits a short preamble message
+// before it starts calling tools, and delivering that as the answer is a bug the parser
+// already guards against (last one wins). And the refusal is not on stdout at all — see
+// below.
+//
+// STDERR IS PART OF THE CONTRACT, AND THAT WAS A DECISION. A sandbox-refused native tool
+// call emits NO item event on Codex's `--json` stream: no `item.started`, no
+// `item.completed`, no error item. The only trace is a `codex_core::tools` line on stderr.
+// The alternative — declaring that refused tool calls are simply invisible — was rejected
+// because on a READ-ONLY harness a refusal is not an edge case: it is the boundary doing
+// its job, on a turn the model expected to be able to write. A user watching a turn work
+// around a boundary they were never shown has been told something false about what
+// happened. So the contract consumes stderr, via [`Harness::classify_stderr_line`], and
+// the cost is that ONE harness's stderr is load-bearing rather than log noise. Claude Code
+// takes the `None` default and is byte-for-byte unaffected.
+//
+// WHAT IS STILL NOT IN THE CONTRACT, deliberately: tool RESULTS, tool INPUTS, token
+// counts, and any per-tool timing. All of them would reach a phone screen, all of them
+// carry vault content or the model's guesses about it, and none of them is needed to
+// answer "is this turn alive". A harness must not smuggle them into an activity name.
+//
+// TWO harnesses are registered, and the serving one is chosen by the MODEL — see
+// [`HarnessRegistry::serving`]. `claude-code` remains unconditionally constructible and is
+// the fallback for every path with no model in hand; that is the ambient assumption the
+// registry always carried, kept rather than widened.
 
 /// What a child agent is allowed to do, as ONE ordered vocabulary shared by every place
 /// the bridge spawns one. Ordered and CUMULATIVE: `Write` implies `Read` implies `Basic`,
@@ -253,6 +311,103 @@ pub trait Harness: Send + Sync {
     /// A FRESH parser for one spawn attempt. The driver creates one per attempt, so a retry
     /// never sees the previous attempt's half-accumulated state.
     fn parser(&self) -> Box<dyn TurnParser>;
+
+    /// Classify one line of the child's STDERR. `None` for the overwhelming majority of
+    /// lines, which are log noise.
+    ///
+    /// **This exists because a harness's stdout stream is not necessarily the whole story,
+    /// and for Codex it demonstrably is not.** A sandbox-rejected native tool call emits NO
+    /// item event on the `--json` stream at all — the only trace is a line on stderr. A turn
+    /// where the child tried something and was refused would otherwise render as a turn where
+    /// nothing happened, and a turn whose credentials are dead would render as a generic
+    /// upstream error. Both are recoverable only by reading stderr.
+    ///
+    /// `&self` and stateless BY CONSTRUCTION, unlike [`TurnParser`]: stderr is drained by a
+    /// SEPARATE concurrent task (it has to be, or a chatty stderr deadlocks the stdout pipe),
+    /// so it cannot borrow the per-turn parser mutably. A signal that genuinely needed
+    /// cross-line accumulation would need the two channels merged first, and nothing needs
+    /// that yet — say so here rather than discovering it in a driver rewrite.
+    ///
+    /// The default is `None` for every line: Claude Code's stderr carries nothing the bridge
+    /// acts on (its refusals and its auth failures both arrive as `stream-json` events), so it
+    /// takes the default and its behaviour is byte-for-byte unchanged.
+    fn classify_stderr_line(&self, _line: &str) -> Option<StderrSignal> {
+        None
+    }
+
+    /// An OWNED classifier for one spawn's stderr, mirroring [`Harness::parser`] and for the
+    /// same structural reason: stderr must be drained by a task that OUTLIVES the borrow of
+    /// the registry, so the driver cannot hold a `&dyn Harness` across it.
+    ///
+    /// Implementations are unit structs, so this is a boxed copy of nothing. Override it only
+    /// if a harness ever needs per-spawn stderr state — and read the note on
+    /// [`Harness::classify_stderr_line`] about why none does today.
+    fn stderr_classifier(&self) -> Box<dyn StderrClassifier> {
+        Box::new(NoStderrSignals)
+    }
+}
+
+/// What the operator is told when a harness's daemon credential is dead, in ONE place so both
+/// channels that can detect it say the same thing.
+///
+/// The wording is deliberate on three points, and they are the whole reason this is not an
+/// inline `format!`. It names the HARNESS, because only that harness's turns are affected and
+/// a user staring at a failed turn should not conclude the bridge is down. It names the
+/// REMEDY and where to run it, because the fix is a shell command on the bridge host and
+/// nothing the phone can do. And it says the failure is total rather than intermittent, so
+/// nobody spends an evening retrying.
+pub fn auth_failure_message(harness: &str, detail: &str) -> String {
+    format!(
+        "{harness} could not authenticate ({detail}). The bridge's {harness} login has expired \
+         or been revoked, so every {harness} turn will fail until an operator re-authenticates \
+         on the bridge host. Turns on other harnesses are unaffected."
+    )
+}
+
+/// The owned, `Send` half of [`Harness::classify_stderr_line`] — see
+/// [`Harness::stderr_classifier`].
+pub trait StderrClassifier: Send {
+    fn classify(&self, line: &str) -> Option<StderrSignal>;
+}
+
+/// The classifier for a harness whose stderr carries nothing the bridge acts on. The default,
+/// and what Claude Code uses.
+pub struct NoStderrSignals;
+
+impl StderrClassifier for NoStderrSignals {
+    fn classify(&self, _line: &str) -> Option<StderrSignal> {
+        None
+    }
+}
+
+/// Something the bridge must act on that arrived on STDERR rather than the event stream.
+///
+/// Two variants because there are exactly two things a turn does differently, and adding a
+/// third means deciding what the turn does about it first. This is not a log level.
+#[derive(Debug, Clone, PartialEq)]
+pub enum StderrSignal {
+    /// A tool call the child attempted and the containment boundary refused.
+    ///
+    /// Surfaced as ordinary tool ACTIVITY, not as a failure: the boundary working is not the
+    /// turn failing, and the model routinely tries something, is refused, and answers anyway.
+    /// What it must not be is INVISIBLE — see [`Harness::classify_stderr_line`].
+    ToolRefused {
+        /// The same coarse activity a successful call produces, with `refused` set. Never
+        /// the raw log line: those carry paths and command text.
+        activity: ToolActivity,
+    },
+    /// The child could not authenticate, so no turn on this harness can succeed until an
+    /// operator intervenes.
+    ///
+    /// Distinguished from an ordinary upstream error ON PURPOSE, and that distinction is the
+    /// whole point of the variant. A daemon has no interactive login path, so this failure
+    /// takes EVERY turn on the harness down at once and stays down — it is not a blip worth
+    /// retrying, and a retry loop against dead credentials just burns the turn budget three
+    /// times before saying the same thing.
+    AuthFailed {
+        /// The child's own words, truncated, with no credential material in it.
+        detail: String,
+    },
 }
 
 /// The per-turn line parser: fed every line of the child's stdout, in order.
@@ -290,12 +445,94 @@ pub const CLAUDE_CODE_ID: &str = "claude-code";
 /// `the_record_carries_no_absolute_host_paths` exists to prevent at commit time instead.
 pub const WORKSPACE_TOKEN: &str = "${WORKSPACE}";
 
+// ---- The routed jobs' child requests ----------------------------------------
+//
+// WHAT A JOB NEEDS, not what a harness does — which is why these live here and not in
+// [`claude_code`], where they used to sit back when Claude Code was the only harness that
+// could serve them.
+//
+// Each one states a JOB's contract: the capability the job needs, the MCP servers it may
+// load, and the directory it runs in. None of that varies by harness, and it must not: the
+// title job needs no tools because writing a title needs no tools, whichever program runs
+// it. The serving harness is chosen by [`HarnessRegistry::serving_pick`] and turns the same
+// request into its own argv via [`Harness::build_turn`].
+//
+// THE HARDCODED CAPABILITIES ARE THE POINT, not a leftover. A job's capability is its
+// contract, so it is fixed here; whether a candidate's HARNESS can express that posture is a
+// separate question, asked by [`Harness::expresses`] in `pick_offload_model` before a
+// candidate can win the walk. That split is load-bearing: a Codex model configured at `Read`
+// satisfies `>= Basic`, and Codex has no posture below `read-only`, so without the second
+// check a title child — a job whose entire definition is that it needs nothing — would be
+// spawned with a shell and the whole filesystem.
+//
+// `mcp_config` is the bridge's canonical `{"mcpServers":{…}}` shape rather than any one
+// harness's format: Claude Code passes it through as `--mcp-config`, and `codex_mcp_args`
+// translates it into `-c` overrides.
+
+/// The TITLE one-shot's request: [`Capability::Basic`] with NO MCP servers, ambient model,
+/// no session. cwd stays the vault — a per-call-site choice the capability says nothing
+/// about, and with `--tools ""` the child cannot read anything there anyway.
+pub fn title_child_request<'a>(
+    cfg: &'a Config,
+    prompt: &'a str,
+    ambient: &'a ActiveModel,
+) -> TurnRequest<'a> {
+    TurnRequest {
+        prompt,
+        session_id: None,
+        active: ambient,
+        capability: Capability::Basic,
+        cwd: PathBuf::from(&cfg.vault),
+        mcp_config: EMPTY_MCP_CONFIG,
+    }
+}
+
+/// A stateless DIET child's request (extract or verify): [`Capability::Basic`] with no MCP
+/// servers, and the neutral scratch base as cwd so the large vault `CLAUDE.md` cannot
+/// auto-load (the extract/verify contract is inlined in the prompt). That cwd is a
+/// deliberate per-call-site choice, NOT something `Basic` implies — the title one-shot is
+/// also `Basic` and runs in the vault — so leave it alone.
+pub fn diet_child_request<'a>(
+    cfg: &'a Config,
+    prompt: &'a str,
+    ambient: &'a ActiveModel,
+) -> TurnRequest<'a> {
+    TurnRequest {
+        prompt,
+        session_id: None,
+        active: ambient,
+        capability: Capability::Basic,
+        cwd: cfg.scratch_base(), // neutral cwd → no vault CLAUDE.md auto-load
+        mcp_config: EMPTY_MCP_CONFIG,
+    }
+}
+
+/// The read-only VAULT-QA child's request (shared with the shadow child):
+/// [`Capability::Read`] and the child's own MCP server set (`JESSE_VAULTQA_MCP_CONFIG`,
+/// else NO servers). THE ONE INTENTIONAL DIVERGENCE from the diet child is the cwd: the
+/// vault, because the child must read vault files to answer. Containment therefore comes
+/// from the TOOLSET, not from an isolated cwd. Never resumes (the child is stateless).
+pub fn vaultqa_child_request<'a>(
+    cfg: &'a Config,
+    prompt: &'a str,
+    ambient: &'a ActiveModel,
+) -> TurnRequest<'a> {
+    TurnRequest {
+        prompt,
+        session_id: None,
+        active: ambient,
+        capability: Capability::Read,
+        cwd: PathBuf::from(&cfg.vault),
+        mcp_config: vaultqa_mcp_config(cfg),
+    }
+}
+
 /// Every harness this build knows how to construct, by id — the registry's vocabulary.
 ///
 /// A model naming an id absent from here is a startup ERROR rather than a silent fallback
 /// to Claude Code: quietly running a Codex-configured model under a different harness is
 /// exactly the sort of "it worked, differently" that a config surface must not do.
-pub const KNOWN_HARNESS_IDS: &[&str] = &[CLAUDE_CODE_ID];
+pub const KNOWN_HARNESS_IDS: &[&str] = &[CLAUDE_CODE_ID, CODEX_ID];
 
 /// Look a harness up in a registry by a config-supplied id, for the read paths that hold a
 /// `String` rather than a `&'static str`.
@@ -312,6 +549,7 @@ pub fn registry_harness<'a>(reg: &'a HarnessRegistry, id: &str) -> Option<&'a dy
 pub fn harness_bin_env(id: &str) -> Option<&'static str> {
     match id {
         CLAUDE_CODE_ID => Some("JESSE_CLAUDE_BIN"),
+        CODEX_ID => Some("JESSE_CODEX_BIN"),
         _ => None,
     }
 }
@@ -320,6 +558,7 @@ pub fn harness_bin_env(id: &str) -> Option<&'static str> {
 pub fn harness_default_bin(id: &str) -> Option<&'static str> {
     match id {
         CLAUDE_CODE_ID => Some("claude"),
+        CODEX_ID => Some("codex"),
         _ => None,
     }
 }
@@ -335,7 +574,7 @@ pub struct HarnessRegistry {
 impl HarnessRegistry {
     /// Build the registry: the built-in [`ClaudeCode`] harness first, then any `extra`
     /// implementations, later overriding earlier BY ID. Claude Code is always present, so
-    /// [`HarnessRegistry::turn_harness`] can never come up empty.
+    /// [`HarnessRegistry::fallback_harness`] can never come up empty.
     pub fn new(extra: Vec<Box<dyn Harness>>) -> Self {
         let mut harnesses: HashMap<&'static str, Box<dyn Harness>> = HashMap::new();
         harnesses.insert(ClaudeCode.id(), Box::new(ClaudeCode));
@@ -371,6 +610,7 @@ impl HarnessRegistry {
                 // Every non-built-in harness is constructed here as it is added. The match
                 // is exhaustive over `KNOWN_HARNESS_IDS` minus the built-in.
                 CLAUDE_CODE_ID => {}
+                CODEX_ID => extra.push(Box::new(Codex)),
                 _ => continue,
             }
         }
@@ -383,18 +623,51 @@ impl HarnessRegistry {
         self.harnesses.get(id).map(|h| h.as_ref())
     }
 
-    /// The harness that serves a turn. `claude-code` — nothing selects another today, and
-    /// there is no config or wire field that could.
-    pub fn turn_harness(&self) -> &dyn Harness {
+    /// The harness every unattributed path falls back to: `claude-code`.
+    ///
+    /// It is the FALLBACK, not "the harness that serves a turn" — that is
+    /// [`HarnessRegistry::serving`], which reads the model. This one exists because Claude
+    /// Code is the one harness always constructible (see [`HarnessRegistry::for_models`]),
+    /// so a lookup that finds nothing has somewhere total to land.
+    ///
+    /// That is the SAME ambient assumption the registry already carried, kept rather than
+    /// widened: nothing new depends on ambient because of harness selection, and the one
+    /// place that did depend on it still does.
+    pub fn fallback_harness(&self) -> &dyn Harness {
         // `new` always registers it; the fallback keeps this total rather than panicking if
         // that invariant is ever broken.
         self.get(CLAUDE_CODE_ID).unwrap_or(&ClaudeCode)
     }
 
+    /// The harness that serves a child for `model` — **the model's own `harness` key**.
+    ///
+    /// This is the selection, and the model is the only thing that carries it: a turn runs
+    /// under the harness its model was configured with, and a routed job runs under the
+    /// harness of whichever candidate the walk picked. There is no separate harness config
+    /// key and there must not be one — a model that named a harness it did not run under
+    /// would make every containment record meaningless.
+    ///
+    /// An unregistered id falls back rather than failing, because it CANNOT happen in a
+    /// running bridge and the totality is worth more than the assertion:
+    /// [`validate_model_config`] refuses such a model at startup, naming it. Making this
+    /// return `Option` would push that already-settled error onto every call site.
+    pub fn serving(&self, model: &ActiveModel) -> &dyn Harness {
+        self.get(&model.harness).unwrap_or_else(|| self.fallback_harness())
+    }
+
+    /// The harness that serves one routed job, from the pick the routing rule made.
+    ///
+    /// COUPLED WITH [`RoutedPick::harness`]: the pick names a harness id and this resolves
+    /// it, so a routed child is built by the same harness the routing log line named. If
+    /// these two ever disagree the log stops describing what ran.
+    pub fn serving_pick(&self, pick: &RoutedPick) -> &dyn Harness {
+        self.get(&pick.harness).unwrap_or_else(|| self.fallback_harness())
+    }
+
     /// Every registered harness in a STABLE order: the turn harness first, then the rest by
     /// id. Stable so a sweep, an adoption pass and a log line are reproducible.
     pub fn ordered(&self) -> Vec<&dyn Harness> {
-        let turn = self.turn_harness();
+        let turn = self.fallback_harness();
         let mut ids: Vec<&'static str> = self
             .harnesses
             .keys()
@@ -462,10 +735,10 @@ mod tests {
     fn the_shipped_registry_holds_exactly_claude_code() {
         let reg = HarnessRegistry::claude_code_only();
         assert_eq!(reg.ids(), vec![CLAUDE_CODE_ID]);
-        assert_eq!(reg.turn_harness().id(), CLAUDE_CODE_ID);
+        assert_eq!(reg.fallback_harness().id(), CLAUDE_CODE_ID);
         assert!(reg.get("codex").is_none());
         assert!(
-            reg.turn_harness().streams_text(),
+            reg.fallback_harness().streams_text(),
             "Claude Code streams token-level deltas"
         );
     }
@@ -476,7 +749,7 @@ mod tests {
         cfg.home = "/home/bob".to_string();
         cfg.vault = "/vault/notes".to_string();
         assert_eq!(
-            cfg.harnesses.turn_harness().transcript_dir(&cfg),
+            cfg.harnesses.fallback_harness().transcript_dir(&cfg),
             Some(PathBuf::from("/home/bob/.claude/projects/-vault-notes")),
             "the harness returns exactly the path the session code used to hardcode"
         );
@@ -494,51 +767,59 @@ mod tests {
         assert_eq!(api.0, StatusCode::INTERNAL_SERVER_ERROR);
     }
 
-    /// EVERY REGISTERED HARNESS STREAMS — and this test exists to fail the day one does not.
+    /// EVERY KNOWN HARNESS IS CONSTRUCTIBLE — the assumption that replaced
+    /// `every_registered_harness_streams_until_a_client_can_render_one_that_does_not`.
     ///
-    /// `streams_text` is plumbed end to end: the harness derives it, `GET /jesse/models`
-    /// exposes it per model, the clients decode it, and the iOS client now RENDERS the
-    /// whole-answer case — a turn on a non-streaming model shows a spinner rather than the
-    /// empty bubble it used to show until the terminal event landed.
+    /// **What the old test held, and why it is gone.** It asserted that every registered
+    /// harness had `streams_text() == true`, as a gate: registration must not land before a
+    /// client could render a turn that delivers its answer whole. That was never a claim
+    /// about harnesses — it was a claim about the CLIENTS, parked on the one file that
+    /// would notice. Codex satisfies it now rather than evading it: the mid-turn event
+    /// contract is written down at the top of this module, both clients render the tool
+    /// activity it defines, and `WholeAnswerProgress` keeps a turn with no activity yet
+    /// visibly alive. The gate was met, so the gate is retired. It was never relaxed — no
+    /// commit weakened its assertion to get green.
     ///
-    /// So the spinner is no longer what's missing. What is still missing is TOOL ACTIVITY:
-    /// there is no live view of what a whole-answer harness is doing mid-turn, because
-    /// nothing yet defines what event stream such a harness emits. That contract cannot be
-    /// designed honestly without a real non-streaming harness to pin it against — inventing
-    /// it here would force the first real one to match a guess made without it.
-    ///
-    /// If you are reading this because the assertion failed: you registered a harness that
-    /// does not stream. The spinner will render its turns, so this is no longer about an
-    /// empty bubble. What you owe first is a decision about the event stream your harness
-    /// emits mid-turn, and the client-side tool-activity rendering that consumes it. Make
-    /// that decision deliberately, with the harness in hand, rather than relaxing this test.
+    /// **What replaces it is narrower on purpose.** `streams_text` is now a property a
+    /// harness may hold either way, so nothing about it is an invariant. What IS still an
+    /// invariant is the one the old test carried in its second loop, and it outlives the
+    /// first: `KNOWN_HARNESS_IDS` is the vocabulary [`validate_model_config`] accepts, and
+    /// accepting an id [`HarnessRegistry::for_models`] cannot construct would let a model
+    /// pass startup validation and then fall back to Claude Code at spawn time — running a
+    /// Codex-configured model under a different harness, with a different containment
+    /// record, and reporting success. The two lists must not drift apart.
     ///
     /// Same pattern, and the same reason, as `the_record_carries_no_absolute_host_paths` in
     /// `levelgate`: an assumption the code depends on should break the build, not the user.
     #[test]
-    fn every_registered_harness_streams_until_a_client_can_render_one_that_does_not() {
-        let reg = HarnessRegistry::new(Vec::new());
-        for h in reg.ordered() {
-            assert!(
-                h.streams_text(),
-                "harness '{}' does not stream. Its turns will render the spinner keyed off \
-                 `ModelInfo.streamsText`, but there is still no tool-activity view for a \
-                 whole-answer turn, and no definition of the mid-turn event stream one \
-                 emits — decide that with the harness in hand before registering it",
-                h.id()
-            );
-        }
-        // …and the vocabulary the registry validates against is covered by the same rule, so
-        // a harness added to KNOWN_HARNESS_IDS but not yet constructible cannot slip past.
+    fn every_known_harness_id_can_actually_be_constructed() {
+        // Built through the same door the validator's ids go through, so this exercises the
+        // real `for_models` match rather than a hand-built registry that agrees by luck.
+        let reg = HarnessRegistry::for_models(KNOWN_HARNESS_IDS.iter().copied());
         for id in KNOWN_HARNESS_IDS {
-            match reg.get(id) {
-                Some(h) => assert!(h.streams_text(), "{id} does not stream"),
-                None => panic!(
+            let h = reg.get(id).unwrap_or_else(|| {
+                panic!(
                     "'{id}' is a known harness id with no registry entry — `for_models` must \
-                     be able to construct every id the validator accepts"
-                ),
-            }
+                     be able to construct every id the validator accepts, or a model naming \
+                     it passes startup and then silently runs under the fallback harness"
+                )
+            });
+            assert_eq!(h.id(), *id, "the registry keyed '{id}' under another id");
         }
     }
 
+    /// A whole-answer harness is registered, so the property the old streaming gate asserted
+    /// is now false — and that is the point. Pinned rather than left implicit: the moment
+    /// this fails, someone has made Codex claim to stream, and every client that keys a
+    /// spinner off `ModelInfo.streamsText` starts waiting for deltas that never arrive.
+    #[test]
+    fn codex_is_registered_and_does_not_stream() {
+        let reg = HarnessRegistry::for_models([CODEX_ID]);
+        let codex = reg.get(CODEX_ID).expect("codex is registered");
+        assert!(!codex.streams_text());
+        assert!(
+            reg.get(CLAUDE_CODE_ID).is_some_and(|h| h.streams_text()),
+            "claude-code is still unconditionally registered and still streams"
+        );
+    }
 }

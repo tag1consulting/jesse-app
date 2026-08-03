@@ -342,7 +342,7 @@ final class JesseWireContractTests: XCTestCase {
     func testDecodeStreamFrames() {
         XCTAssertEqual(JesseClient.decodeStreamFrame(event: "reset", data: #"{"text":"hi"}"#), .reset("hi"))
         XCTAssertEqual(JesseClient.decodeStreamFrame(event: "delta", data: #"{"text":"x"}"#), .delta("x"))
-        XCTAssertEqual(JesseClient.decodeStreamFrame(event: "activity", data: #"{"name":"Read"}"#), .activity("Read"))
+        XCTAssertEqual(JesseClient.decodeStreamFrame(event: "activity", data: #"{"name":"Read"}"#), .activity(ToolActivity(name: "Read")))
         XCTAssertEqual(JesseClient.decodeStreamFrame(event: "done", data: #"{"response":"r","session_id":"s"}"#),
                        .done(JesseReply(text: "r", sessionId: "s")))
         XCTAssertEqual(JesseClient.decodeStreamFrame(event: "error", data: #"{"error":"boom"}"#), .failed("boom"))
