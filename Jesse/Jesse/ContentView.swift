@@ -63,7 +63,10 @@ struct ContentView: View {
                 } detail: {
                     if let thread = path.last {
                         // Its own stack so the detail's toolbar/title behave normally.
-                        NavigationStack { ThreadDetailView(thread: thread) }
+                        // `hidesTabBar: false` — the detail column is permanent here
+                        // (nothing pops it), so hiding the tab bar would make Health
+                        // unreachable for the rest of the launch.
+                        NavigationStack { ThreadDetailView(thread: thread, hidesTabBar: false) }
                             .id(thread.id)
                     } else {
                         ContentUnavailableView {

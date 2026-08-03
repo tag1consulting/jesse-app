@@ -15,6 +15,14 @@ struct ThreadDetailView: View {
     @Environment(RunCoordinator.self) private var coordinator
     @Bindable var thread: JesseThread
 
+    /// Whether opening this conversation should hide the root tab bar. True only
+    /// when the detail was PUSHED onto a stack (iPhone/compact), where the back
+    /// swipe pops the thread and brings the bar back. In the iPad split view the
+    /// detail column has no pop — selecting a thread just replaces it — so hiding
+    /// the bar there strands the user in Chats with no way back to Health. The
+    /// caller decides, because `ContentView` is what knows which layout it built.
+    var hidesTabBar = true
+
     @State private var input = ""
     // Plain @State (not @FocusState): the composer is a UITextView-backed
     // representable that drives first-responder from this binding.
@@ -93,8 +101,8 @@ struct ThreadDetailView: View {
         // present on the conversation list and within Health but gone inside a
         // thread. Applying it here (on the pushed detail) means every entry point
         // that lands on a thread — deep link, Siri, notification tap — inherits it,
-        // since they all converge on this view.
-        .toolbar(.hidden, for: .tabBar)
+        // since they all converge on this view. Compact only: see `hidesTabBar`.
+        .toolbar(hidesTabBar ? .hidden : .automatic, for: .tabBar)
         // Hydrate the transcript from the bridge when this conversation is opened,
         // cache-first: an adopted stub (started on the Mac) pulls its full transcript
         // here, a phone-started thread just seeds its cursor, and either way an

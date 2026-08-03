@@ -15,6 +15,31 @@ CI both run it). See the "Versioning" section of `bridge/README.md`.
 
 ## [Unreleased]
 
+## [App 1.0 (88)] - 2026-08-03
+
+The iPad could reach Chats but never leave it.
+
+### Fixed
+
+- **On iPad, opening a conversation hid the tab bar for the rest of the launch, so
+  Health became unreachable.** `ThreadDetailView` carried an unconditional
+  `.toolbar(.hidden, for: .tabBar)`. On iPhone that is right: the detail is PUSHED,
+  and the back swipe pops it and brings the bar back. On iPad the same view is the
+  DETAIL COLUMN of a `NavigationSplitView` (`ContentView`, regular width), where
+  nothing ever pops it — selecting another conversation only replaces it, and the
+  UI offers no way to clear the selection back to the "Select a conversation"
+  placeholder. So the first tap on a conversation hid the only control that could
+  switch tabs, permanently, and the tabs read as one-way: Chats reachable from
+  Health, Health never reachable again until relaunch. Not an iPadOS 26 API
+  regression — the floating tab bar just made an always-present bug visible, since
+  the split view has no back button standing in for it.
+- **The decision moved to the caller, which is the half that knows the layout.** The
+  view gained `hidesTabBar` (default `true`, so every compact entry point — deep
+  link, Siri, notification tap — is unchanged), and the split view's detail passes
+  `false`. Deciding inside the view off `horizontalSizeClass` would have been wrong:
+  a narrow multitasking split can report compact for the column while the split
+  layout is still on screen, which is exactly the state that strands the user.
+
 ## [Bridge 0.52.1] - 2026-08-03
 
 Makes the Codex registration of 0.52.0 actually reachable. Registering the harness was
@@ -189,7 +214,6 @@ retired by being SATISFIED, not relaxed: nothing weakened its assertion to get g
   pinned Codex binary and its OAuth posture only.
 - **Codex `Write` is still not granted.** The `[[accepted]]` entry covers `read/none` and
   `read/qmd` only. Granting `Write` is a new decision and needs a new entry.
-
 ## [Bridge 0.51.0] - 2026-08-02
 
 A refusal was being recorded as containment. Both harnesses re-recorded on the fix.
