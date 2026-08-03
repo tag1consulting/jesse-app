@@ -15,6 +15,162 @@ CI both run it). See the "Versioning" section of `bridge/README.md`.
 
 ## [Unreleased]
 
+## [App 1.0 (87)] - 2026-08-03
+
+Ships the client half of Bridge 0.52.0's whole-answer turn — see that entry for the
+contract. Nothing here changes a streaming turn: the activity line renders as it always
+did, and the `refused` field it can now carry is absent from every frame Claude Code emits.
+
+### Added
+
+- **`ToolActivity.displayLabel` (JesseKit)** — one mapping from the bridge's tool vocabulary
+  to prose, shared by iOS and macOS instead of one each. A refused call reads "Blocked from
+  writing a file…" rather than "Writing a file…"; an MCP tool is named by its server
+  ("Using qmd…") rather than by its `mcp__qmd__query` routing key.
+
+### Changed
+
+- **The macOS streaming bubble shows the same prose the iOS one does.** It previously
+  rendered the raw tool name with an ellipsis appended ("Read…"); the line now arrives
+  already human, and the view no longer appends punctuation to it.
+- **`WholeAnswerProgress` is the floor of the whole-answer view, not the whole of it** — it
+  covers the gap before the first activity frame and yields the moment one arrives.
+
+## [Bridge 0.52.0] - 2026-08-03
+
+**Codex is registered.** A model may name `harness = "codex"`, the picker offers it, and it
+serves a turn. The guard test that stood between the spike and this
+(`every_registered_harness_streams_until_a_client_can_render_one_that_does_not`) was
+retired by being SATISFIED, not relaxed: nothing weakened its assertion to get green.
+
+### Added
+
+- **The mid-turn event contract for a whole-answer harness**, written down at the top of
+  `bridge/src/harness/mod.rs` because Codex is the first harness whose answer arrives whole
+  and there is no second one to check the shape against. A harness emits `TextDelta` only if
+  it streams; it owes `ToolActivity` either way, named in ONE vocabulary across harnesses
+  (`Bash`, `Edit`, `Read`, `mcp__<server>__<tool>`). For a whole-answer harness that
+  activity is the ONLY mid-turn signal, so it is the entire difference between a turn the
+  user can see working and one indistinguishable from a turn that has silently hung.
+  Deliberately still NOT in the contract: tool results, tool inputs, token counts, per-tool
+  timing. All of them reach a phone screen and all of them carry vault content.
+- **`Harness::classify_stderr_line`, and stderr as part of the turn path** — the decision
+  item 2 of this stage demanded be made on purpose. A sandbox-refused native tool call emits
+  NO item event on Codex's `--json` stream: no `item.started`, no `item.completed`, no error
+  item. The only trace is a `codex_core::tools` line on stderr. The alternative — declaring
+  refused tool calls simply invisible — was **rejected**, because on a read-only harness a
+  refusal is not an edge case but the boundary doing its job, and a user watching a turn
+  quietly work around a boundary they were never shown has been told something false about
+  what happened. The cost is that one harness's stderr is load-bearing rather than log
+  noise; Claude Code takes the `None` default and is byte-for-byte unaffected.
+- **`ToolActivity { name, refused }`**, on both sides of the wire. `refused` is a field
+  rather than a word inside `name` because `name` is a vocabulary the clients switch on, and
+  folding a display word in would make every reader parse a string grammar to get one bit
+  back out. It carries a BIT rather than the child's own error text on purpose: that text
+  names the path or command the model tried, and this value is rendered on screen. The wire
+  omits `refused` when false, so a Claude Code activity frame is byte-for-byte what it was.
+- **Client rendering of a whole-answer turn** (iOS + macOS), from one mapping in JesseKit
+  (`ToolActivity.displayLabel`) rather than two. A refused call reads "Blocked from writing
+  a file…" rather than "Writing a file…" — the two are opposite facts about the turn, and
+  rendering the second while the sandbox refuses every write states something that did not
+  happen. It is not rendered as a failed turn, because it is not one. An MCP tool is named
+  by its SERVER (`Using qmd…`), not by the `mcp__qmd__query` routing key: a Read-level Codex
+  turn's visible work is mostly qmd calls, so without this most of the turn read as a
+  routing key. `WholeAnswerProgress` is now the FLOOR of that view rather than the whole of
+  it — it covers the gap before the first activity frame and yields the moment one arrives.
+- **A three-turn Codex resume test** (`a_codex_conversation_resumes_across_three_turns`).
+  Three rather than two because two cannot catch the bug: turn 2 proves a resume happens,
+  turn 3 proves the conversation follows the thread FORWARD. A resumed Codex turn reports a
+  NEW thread id, and a store that kept binding the first would resume turn 1's thread
+  forever while every turn appeared to succeed — losing the middle of the conversation with
+  nothing visible from the outside.
+
+### Changed
+
+- **`CodexParser` reports its thread id from `thread.started`**, as `StreamEvent::SessionId`,
+  rather than only carrying it to the terminal event. `turn.completed` carries it too, but
+  only on SUCCESS: a turn that died mid-flight bound nothing, and the next turn on that
+  conversation silently started a fresh Codex thread. `thread.started` is the first event of
+  the stream. With `transcript_dir` `None` there is no file to recover it from — the bound
+  id IS the record.
+- **Routing selects by harness.** `HarnessRegistry::turn_harness()` — "the harness that
+  serves a turn", which returned `claude-code` unconditionally — is now
+  `fallback_harness()`, and the selection is `serving(&ActiveModel)` / `serving_pick(&RoutedPick)`
+  off the model's own `harness` key. The routed child call sites in `claude.rs` (title, diet
+  extract, diet verify, vault-QA) and the turn path and transcript dir in `handlers.rs` are
+  harness-generic. No second rule: the B1 `expresses` declaration still governs which
+  harness may serve which job. Claude Code stays unconditionally constructible and remains
+  the fallback — no new assumption that ambient exists, and the existing one is not removed.
+- **The routed jobs' child requests moved out of `claude_code.rs` into the harness-generic
+  layer.** `title_child_request`, `diet_child_request` and `vaultqa_child_request` describe a
+  JOB's contract — the capability it needs, the servers it may load, the directory it runs in
+  — none of which varies by harness; they sat in the Claude module only because Claude Code
+  was the one harness that could serve them. Their public paths are unchanged. Their
+  hardcoded capabilities stay hardcoded, and that is the point: a job's capability is its
+  contract, while whether a candidate's HARNESS can express that posture is the separate
+  question `Harness::expresses` answers in `pick_offload_model`. `mcp_config` was already the
+  bridge's canonical `{"mcpServers":{…}}` shape rather than any one harness's format — Claude
+  Code passes it through, `codex_mcp_args` translates it to `-c` overrides.
+- **The transcript dir a turn diffs is resolved from the turn's own harness.** Reading
+  Claude Code's directory for a Codex turn would diff a directory that turn never wrote, and
+  every stem in it would look like a stray the turn had just created.
+
+### Fixed
+
+- **A dead Codex credential is `Fatal`, names the remedy, and is not retried.** The bridge
+  runs Codex off a subscription OAuth login, and a daemon has no interactive `codex login`,
+  so a refresh failure takes EVERY Codex turn down at once and stays down. Three driver
+  attempts against dead credentials produce three identical 401s and a turn that took three
+  times as long to say so. A 401/403 now yields an operator-facing message naming the
+  harness, the remedy and its blast radius ("Turns on other harnesses are unaffected"), on
+  BOTH channels — the terminal `turn.failed` and the `codex_api::endpoint` stderr line —
+  because the two do not always both arrive: a child killed at the driver's timeout has
+  written its stderr and no `turn.failed` at all. Matched on the HTTP status rather than the
+  prose, which is a moving target.
+- **`error` events are retry narration, not terminals.** Codex emits them while it
+  reconnects internally; one dead credential produced six ("Reconnecting... 2/5" … "5/5")
+  before the real terminal event. Ending the turn on the first abandoned a child that still
+  had four attempts left and reported "Reconnecting... 2/5" as the failure cause. The last
+  one is now kept only as a fallback cause for a `turn.failed` that carried none.
+- **A Codex child no longer inherits the bridge's stdin, which was hanging every turn.**
+  `codex exec` READS stdin and appends what it finds to the prompt — it announces "Reading
+  additional input from stdin..." and blocks until EOF. The harness never set it, so the
+  child inherited the bridge's. Under launchd that happens to be `/dev/null` and the
+  deployed bridge got away with it; run the same binary from a terminal, from a test
+  harness, or under any supervisor that hands it a pipe, and every Codex turn blocks until
+  the driver's timeout kills it and returns a 504. Found by the live turn test, which took
+  the full 300s with a pipe on stdin and ~15s with `Stdio::null()`. No unit test guards it:
+  `std::process::Command` exposes no stdin getter, and a spawn-based test inherits `cargo
+  test`'s already-at-EOF stdin, so it would pass either way — which is how this survived.
+  The cover is `tests/codex_live_turn.rs`, `#[ignore]`d and re-run per machine.
+- **One refusal matcher, two callers.** `codex_refused_tool` is shared by
+  `parse_codex_trace` (the containment battery) and `Codex::classify_stderr_line` (the turn
+  path). They must agree about what a refusal looks like: a refusal the battery scores as an
+  attempt but the turn path cannot see is a boundary proven in a run nobody watches and
+  invisible in every run somebody does.
+
+### Retired
+
+- `every_registered_harness_streams_until_a_client_can_render_one_that_does_not` →
+  `every_known_harness_id_can_actually_be_constructed`. The old test's first loop was never
+  a claim about harnesses; it was a claim about the CLIENTS, parked on the file that would
+  notice. Its second loop holds an invariant that outlives it and is kept: `KNOWN_HARNESS_IDS`
+  is the vocabulary `validate_model_config` accepts, and accepting an id `for_models` cannot
+  construct would let a model pass startup and then fall back to Claude Code at spawn — a
+  Codex-configured model running under a different harness, against a different containment
+  record, reporting success.
+
+### Not in this release
+
+- **No containment re-record.** `capability_args` did not change, the pinned binary did not
+  change, and the MCP sets and tool lists did not change, so none of the re-run triggers
+  fired. The record `origin/main` carries (codex-cli 0.145.0, recorded 2026-08-02) is what
+  the startup gate holds this build to, unchanged.
+- **No second machine armed.** Certification is per machine; this certifies the Studio's
+  pinned Codex binary and its OAuth posture only.
+- **Codex `Write` is still not granted.** The `[[accepted]]` entry covers `read/none` and
+  `read/qmd` only. Granting `Write` is a new decision and needs a new entry.
+
 ## [Bridge 0.51.0] - 2026-08-02
 
 A refusal was being recorded as containment. Both harnesses re-recorded on the fix.

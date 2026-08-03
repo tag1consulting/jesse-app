@@ -448,6 +448,16 @@ whose `.git/config` carries an embedded token. **Codex should run as its own uni
 separate from the bridge, with the vault shared in and nothing else readable. *That posture
 is not yet in place;* the acceptance assumes it.
 
+**As of Bridge 0.52.0 that gap is live rather than hypothetical.** Codex is registered: a
+model may name `harness = "codex"` and the picker offers it, so a Codex turn can be spawned
+by anyone who can reach the bridge. Until the unix-user isolation above is in place, every
+such turn reads as the bridge user — which on this machine means the whole of that user's
+filesystem, including the canonical `~/.codex/auth.json`. Registration did not widen the
+read surface (it is exactly what the record has always described), and it did not change a
+verdict; what it changed is that the surface is now reachable in production rather than
+only in the battery. **Configure Codex models deliberately, and do not configure one on a
+host whose bridge user can read anything that would matter if published.**
+
 Under that isolation, `read_escape_parent`, `read_escape_symlink`, `read_state_dir` and
 `read_session_transcript` all close — what they reach stops being visible to the Codex
 user. `read_env_token` closes only if the child's environment is scrubbed, which is a

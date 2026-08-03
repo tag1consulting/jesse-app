@@ -190,6 +190,12 @@ public enum NonStreamingModelStore {
 /// is never a second spinner on screen, and a streaming model's brief pre-first-delta gap is
 /// left exactly as it is.
 ///
+/// That last condition is what makes this row the FLOOR of the whole-answer view rather than
+/// the whole of it: a whole-answer turn's tool activity is a real mid-turn signal (see
+/// `JesseStreamEvent.activity`), so once the child starts working this yields to a line that
+/// says what it is doing. This covers the gap before that — a Codex turn spends its first
+/// seconds thinking, with no event of any kind on the wire.
+///
 /// Pure and `nonisolated` so it is unit-testable with no view, matching how the send button's
 /// clock policy is factored.
 public enum WholeAnswerProgress {
@@ -200,7 +206,9 @@ public enum WholeAnswerProgress {
         return (partialText ?? "").isEmpty
     }
 
-    /// The row's caption. Deliberately about the model's shape, not a fake progress claim:
-    /// there is no mid-turn signal from a whole-answer harness to report.
+    /// The row's caption. Deliberately about the model's SHAPE rather than a progress claim,
+    /// because at the moment it shows there is genuinely nothing to report: this row appears
+    /// only before the first activity frame, and yields to the real line the moment one
+    /// arrives. Saying "Reading…" here would be inventing an activity nobody observed.
     public static let caption = "Working… this model replies all at once"
 }

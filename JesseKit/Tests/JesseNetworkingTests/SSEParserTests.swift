@@ -70,7 +70,7 @@ final class SSEParserTests: XCTestCase {
     func testActivityAndError() {
         XCTAssertEqual(
             SSEParser.framesFromLines(["event: activity", #"data: {"name":"Read"}"#, ""]),
-            [.activity("Read")])
+            [.activity(ToolActivity(name: "Read"))])
         XCTAssertEqual(
             SSEParser.framesFromLines(["event: error", #"data: {"error":"boom"}"#, ""]),
             [.failed("boom")])
@@ -88,7 +88,7 @@ final class SSEParserTests: XCTestCase {
     func testDecodeStreamFrames() {
         XCTAssertEqual(SSEParser.decodeStreamFrame(event: "reset", data: #"{"text":"hi"}"#), .reset("hi"))
         XCTAssertEqual(SSEParser.decodeStreamFrame(event: "delta", data: #"{"text":"x"}"#), .delta("x"))
-        XCTAssertEqual(SSEParser.decodeStreamFrame(event: "activity", data: #"{"name":"Read"}"#), .activity("Read"))
+        XCTAssertEqual(SSEParser.decodeStreamFrame(event: "activity", data: #"{"name":"Read"}"#), .activity(ToolActivity(name: "Read")))
         XCTAssertEqual(SSEParser.decodeStreamFrame(event: "done", data: #"{"response":"r","session_id":"s"}"#),
                        .done(JesseReply(text: "r", sessionId: "s")))
         XCTAssertEqual(SSEParser.decodeStreamFrame(event: "error", data: #"{"error":"boom"}"#), .failed("boom"))

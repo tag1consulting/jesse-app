@@ -58,7 +58,8 @@ public struct SSEParser: Sendable {
         switch event {
         case "reset": return .reset(obj?.text ?? "")
         case "delta": return .delta(obj?.text ?? "")
-        case "activity": return .activity(obj?.name ?? "")
+        case "activity":
+            return .activity(ToolActivity(name: obj?.name ?? "", refused: obj?.refused ?? false))
         case "done":
             return .done(JesseReply(text: obj?.response ?? "", sessionId: obj?.sessionId,
                                     directives: obj?.directives, provenance: obj?.provenance))

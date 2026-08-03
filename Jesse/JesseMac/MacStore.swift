@@ -156,7 +156,9 @@ final class MacCoordinator {
     private(set) var activeThreadID: UUID?
     /// Live assistant text for the active turn (reset REPLACES, delta APPENDS).
     private(set) var streamingText: String = ""
-    /// Coarse current tool activity ("Read", "Write", …) for the active turn.
+    /// The current tool-activity LINE for the active turn, already human ("Reading the
+    /// vault…"), from `ToolActivity.displayLabel` — the same mapping the iOS app uses.
+    /// Empty when the turn has not reported any activity yet.
     private(set) var activity: String = ""
     private(set) var isRunning = false
     /// Last user-facing error (send/stream failure, sync failure). Cleared on the next
@@ -296,7 +298,7 @@ final class MacCoordinator {
                 switch ev {
                 case let .reset(s): streamingText = s
                 case let .delta(s): streamingText += s
-                case let .activity(a): activity = a
+                case let .activity(a): activity = a.displayLabel
                 case let .done(reply):
                     terminalReply = reply
                     sawTerminal = true

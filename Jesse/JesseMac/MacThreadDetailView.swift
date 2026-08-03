@@ -282,6 +282,8 @@ struct MacTurnBubble: View {
 /// The in-flight assistant reply while a turn streams.
 struct MacStreamingBubble: View {
     let text: String
+    /// Already a human line with its own ellipsis (`ToolActivity.displayLabel`), so
+    /// nothing here appends punctuation to it.
     let activity: String
 
     var body: some View {
@@ -291,13 +293,13 @@ struct MacStreamingBubble: View {
                 if text.isEmpty {
                     HStack(spacing: 8) {
                         ProgressView().controlSize(.small)
-                        Text(activity.isEmpty ? "Thinking…" : "\(activity)…")
+                        Text(activity.isEmpty ? "Thinking…" : activity)
                             .font(.caption).foregroundStyle(.secondary)
                     }
                 } else {
                     MacMarkdownView(text: text)
                     if !activity.isEmpty {
-                        Text("\(activity)…").font(.caption2).foregroundStyle(.secondary)
+                        Text(activity).font(.caption2).foregroundStyle(.secondary)
                     }
                 }
             }

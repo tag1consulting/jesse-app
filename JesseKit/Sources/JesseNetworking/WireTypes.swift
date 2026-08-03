@@ -132,13 +132,82 @@ public enum JesseResultState: Sendable {
     case cancelled
 }
 
+/// One coarse tool-activity hint: WHICH tool, and whether the containment boundary
+/// REFUSED the call.
+///
+/// `refused` is a separate field rather than a word inside `name` because `name` is a
+/// VOCABULARY the bridge and both clients share — `RunCoordinator.activityLabel`
+/// switches on it — and folding a display word in would make every reader parse a string
+/// grammar to get one bit back out. A refused `Write` is still a `Write`.
+///
+/// It carries a bit rather than the child's own error text ON PURPOSE: that text names the
+/// path or the command the model tried, and this value is rendered on screen.
+///
+/// COUPLED WITH `ToolActivity` in `bridge/src/jobstore/streams.rs`, the same pair on the
+/// bridge side. The wire OMITS `refused` when false, so this defaults to false and a
+/// bridge that predates the field decodes exactly as it always did.
+public struct ToolActivity: Equatable, Sendable {
+    public let name: String
+    public let refused: Bool
+
+    public init(name: String, refused: Bool = false) {
+        self.name = name
+        self.refused = refused
+    }
+
+    /// The human line for this activity, ellipsis included — ONE mapping, in JesseKit,
+    /// because both clients render it and a whole-answer turn has nothing else to show.
+    ///
+    /// Two cases carry weight, and neither is cosmetic:
+    ///
+    /// A REFUSED call gets its own phrasing, because the two are opposite facts about the
+    /// turn: "Writing a file…" while the sandbox is refusing every write tells the user
+    /// something that did not happen. It reads as a statement about the boundary rather than
+    /// an error, because it is not one — the model routinely tries something, is refused, and
+    /// answers anyway. It is deliberately NOT rendered as a failed turn.
+    ///
+    /// An MCP tool arrives as `mcp__<server>__<tool>`, which is a routing key and not
+    /// something to show anyone; the server is the useful half. This case needs handling
+    /// because a Read-level Codex turn's visible work is mostly qmd calls — without it, most
+    /// of the turn would read `Using mcp__qmd__query…`.
+    public var displayLabel: String {
+        if refused {
+            switch name {
+            case "Write", "Edit", "NotebookEdit": return "Blocked from writing a file…"
+            case "Bash": return "Blocked from running a command…"
+            default: return "Blocked from using \(Self.showable(name))…"
+            }
+        }
+        switch name {
+        case "Read", "Glob", "Grep": return "Reading the vault…"
+        case "Write", "Edit", "NotebookEdit": return "Writing a file…"
+        case "Bash": return "Running a command…"
+        case "WebFetch", "WebSearch": return "Searching the web…"
+        case "Task": return "Working on it…"
+        default: return "Using \(Self.showable(name))…"
+        }
+    }
+
+    /// The showable half of a tool name: `mcp__qmd__query` → `qmd`, anything else verbatim.
+    static func showable(_ tool: String) -> String {
+        guard tool.hasPrefix("mcp__") else { return tool }
+        let server = tool.dropFirst("mcp__".count).components(separatedBy: "__").first ?? ""
+        return server.isEmpty ? tool : server
+    }
+}
+
 /// One decoded frame from the live SSE stream (`GET /jesse/stream/{job_id}`).
 /// `reset` carries the full text-so-far and REPLACES the partial buffer; `delta`
 /// APPENDS. The three terminal frames mirror `JesseResultState`.
+///
+/// `activity` is the ONLY mid-turn frame a whole-answer model produces — see
+/// `ModelInfo.streamsText`. On a streaming model it is a garnish beside the deltas; on a
+/// whole-answer one it is the entire difference between a turn the user can see working
+/// and one indistinguishable from a turn that has silently hung.
 public enum JesseStreamEvent: Equatable, Sendable {
     case reset(String)
     case delta(String)
-    case activity(String)   // coarse tool name, e.g. "Read" / "Write"
+    case activity(ToolActivity)
     case done(JesseReply)
     case failed(String)
     case cancelled
@@ -627,13 +696,16 @@ struct JessePromptsResponse: Decodable {
 public struct JesseStreamFrameData: Decodable {
     public let text: String?
     public let name: String?
+    /// Absent on every frame but a REFUSED activity, and absent from a bridge that predates
+    /// the field — so it decodes to nil and means false.
+    public let refused: Bool?
     public let response: String?
     public let sessionId: String?
     public let directives: JesseDirectives?
     public let provenance: JesseProvenance?
     public let error: String?
     enum CodingKeys: String, CodingKey {
-        case text, name, response
+        case text, name, refused, response
         case sessionId = "session_id"
         case directives, provenance, error
     }

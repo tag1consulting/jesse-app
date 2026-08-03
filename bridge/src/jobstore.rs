@@ -1,7 +1,7 @@
 use crate::*;
 
 mod streams;
-pub use streams::{StreamFrame, StreamRegistry};
+pub use streams::{StreamFrame, StreamRegistry, ToolActivity};
 
 // ---- Job store — keeps a turn alive past the client connection ------------
 //
@@ -667,8 +667,8 @@ impl JobStore {
     }
 
     /// Record the latest tool-activity hint and broadcast it.
-    pub fn stream_push_activity(&self, id: &str, name: &str) {
-        self.streams.push_activity(id, name);
+    pub fn stream_push_activity(&self, id: &str, activity: ToolActivity) {
+        self.streams.push_activity(id, activity);
     }
 
     /// Clear the accumulated text before a retry re-runs the whole prompt.
@@ -680,7 +680,7 @@ impl JobStore {
     pub fn stream_subscribe(
         &self,
         id: &str,
-    ) -> Option<(String, Option<String>, broadcast::Receiver<StreamFrame>)> {
+    ) -> Option<(String, Option<ToolActivity>, broadcast::Receiver<StreamFrame>)> {
         self.streams.subscribe(id)
     }
 

@@ -67,8 +67,9 @@ pub enum StreamEvent {
     /// A chunk of the visible answer (a `text_delta` inside a `text` block).
     /// Thinking deltas carry a different delta type and are deliberately excluded.
     TextDelta(String),
-    /// The agent started using a tool — surfaced as a coarse activity hint.
-    ToolActivity { name: String },
+    /// The agent started using a tool — surfaced as a coarse activity hint. See
+    /// [`ToolActivity`] for why refusal is a field on it rather than a word in its name.
+    ToolActivity(ToolActivity),
     /// The terminal `result` line: classify it exactly as the buffered path does.
     Done(ClaudeOutcome),
     /// The session this turn is running under, as the harness itself reported it —
@@ -270,7 +271,7 @@ async fn run_stateless_oneshot(
                 // A one-shot child (title / diet / vault-QA) is not a conversation, so the
                 // session it names is nothing this path binds.
                 StreamEvent::SessionId(_)
-                | StreamEvent::ToolActivity { .. }
+                | StreamEvent::ToolActivity(_)
                 | StreamEvent::Ignore => {}
             }
         }
@@ -334,7 +335,7 @@ pub async fn run_claude_oneshot(
     timeout_secs: u64,
     pick: &RoutedPick,
 ) -> Result<String, ApiError> {
-    let harness = cfg.harnesses.turn_harness();
+    let harness = cfg.harnesses.serving_pick(pick);
     // The title path is AMBIENT and untouched by the model switch, so it passes the ambient
     // model — the command is byte-for-byte today's, and `apply_title_env` below still layers
     // any title backend on top (the two never mix). BASIC with no MCP servers is stated at
@@ -368,7 +369,7 @@ pub async fn run_diet_extract(
     timeout_secs: u64,
     pick: &RoutedPick,
 ) -> Result<String, ApiError> {
-    let harness = cfg.harnesses.turn_harness();
+    let harness = cfg.harnesses.serving_pick(pick);
     let ambient = ActiveModel::ambient();
     let mut cmd = harness.build_turn(cfg, &diet_child_request(cfg, prompt, &ambient))?;
     apply_routed_env(&mut cmd, pick);
@@ -389,7 +390,7 @@ pub async fn run_diet_verify(
     // The verifier is whatever the routing rule picked at `Write`, with the extractor
     // EXCLUDED — see `RoutedJob::DietVerify`. Ambient when nothing else qualifies, which is
     // exactly the old behavior (the verify child was unconditionally ambient).
-    let harness = cfg.harnesses.turn_harness();
+    let harness = cfg.harnesses.serving_pick(pick);
     let ambient = ActiveModel::ambient();
     let mut cmd = harness.build_turn(cfg, &diet_child_request(cfg, prompt, &ambient))?;
     apply_routed_env(&mut cmd, pick);
@@ -407,7 +408,7 @@ pub async fn run_vaultqa_child(
     timeout_secs: u64,
     pick: &RoutedPick,
 ) -> Result<String, ApiError> {
-    let harness = cfg.harnesses.turn_harness();
+    let harness = cfg.harnesses.serving_pick(pick);
     let ambient = ActiveModel::ambient();
     let mut cmd = harness.build_turn(cfg, &vaultqa_child_request(cfg, prompt, &ambient))?;
     apply_routed_env(&mut cmd, pick);
@@ -444,7 +445,7 @@ pub async fn run_claude_streaming(
     cfg: &Config,
     prompt: &str,
     session_id: Option<&str>,
-    jobs: &JobStore,
+    jobs: &Arc<JobStore>,
     job_id: &str,
     active: &ActiveModel,
     harness: &dyn Harness,
@@ -508,15 +509,52 @@ pub async fn run_claude_streaming(
             ));
         };
 
-        // Drain stderr concurrently (capped), so a chatty stderr can't deadlock
-        // the stdout pipe and so the no-`result` fallback below has the cause.
+        // Drain stderr concurrently (capped), so a chatty stderr can't deadlock the stdout
+        // pipe and so the no-`result` fallback below has the cause.
+        //
+        // LINE BY LINE, and classified as it arrives, because for some harnesses stderr is
+        // not merely a failure cause — it is the only channel a whole class of events uses.
+        // Codex reports a sandbox-refused tool call there and nowhere else, so a turn read off
+        // stdout alone renders a refused child as an idle one. See
+        // `Harness::classify_stderr_line`.
+        //
+        // The task owns its classifier rather than borrowing the harness: it outlives this
+        // iteration's borrows, which is exactly why `stderr_classifier` returns a box.
+        let classifier = harness.stderr_classifier();
+        let auth_failure: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+        let stderr_jobs = jobs.clone();
+        let stderr_job_id = job_id.to_string();
+        let stderr_auth = auth_failure.clone();
         let stderr_task = tokio::spawn(async move {
-            let mut reader = BufReader::new(stderr);
-            let mut buf = Vec::new();
-            // Bounded by the child's own stderr volume, then truncated for storage.
-            let _ = reader.read_to_end(&mut buf).await;
-            let cap = buf.len().min(MAX_OUTPUT_BYTES);
-            String::from_utf8_lossy(&buf[..cap]).into_owned()
+            let mut lines = BufReader::new(stderr).lines();
+            let mut buf = String::new();
+            while let Ok(Some(line)) = lines.next_line().await {
+                match classifier.classify(&line) {
+                    // The boundary refusing a tool call is not the turn failing, so it rides
+                    // the ordinary activity channel — the same one a successful tool call
+                    // uses. What it must never be is silent.
+                    Some(StderrSignal::ToolRefused { activity }) => {
+                        stderr_jobs.stream_push_activity(&stderr_job_id, activity);
+                    }
+                    // Recorded, not acted on here: this task cannot end the turn, and the
+                    // driver below owns that decision. FIRST one wins — a dead credential
+                    // produces one line per internal retry and they all say the same thing.
+                    Some(StderrSignal::AuthFailed { detail }) => {
+                        let mut slot = stderr_auth.lock_ok();
+                        if slot.is_none() {
+                            *slot = Some(detail);
+                        }
+                    }
+                    None => {}
+                }
+                // Still accumulated verbatim: the no-`result` fallback surfaces this to the
+                // operator as the failure cause, and classification must not eat it.
+                if buf.len() < MAX_OUTPUT_BYTES {
+                    buf.push_str(&line);
+                    buf.push('\n');
+                }
+            }
+            buf
         });
 
         // Read stdout line by line, mapping each line through a FRESH parser for THIS
@@ -544,7 +582,7 @@ pub async fn run_claude_streaming(
                 let Some(line) = next else { break };
                 match parser.on_line(&line) {
                     StreamEvent::TextDelta(t) => jobs.stream_push_delta(job_id, &t),
-                    StreamEvent::ToolActivity { name } => jobs.stream_push_activity(job_id, &name),
+                    StreamEvent::ToolActivity(a) => jobs.stream_push_activity(job_id, a),
                     // The child named its session. Record it the moment it arrives, so a
                     // turn that dies after this line has still told us what it owns.
                     StreamEvent::SessionId(id) => spawned.record(&id),
@@ -635,6 +673,22 @@ pub async fn run_claude_streaming(
         };
         let outcome = resolve_stream_outcome(terminal, &streamed, &stderr);
 
+        // A credential failure seen on stderr overrides a FAILING outcome's message, and only
+        // a failing one — a turn that produced an answer succeeded, whatever the child logged
+        // on its way there. The point is what the operator is told: an expired daemon login
+        // takes every turn on that harness down at once and cannot be fixed from the phone, so
+        // it must not read as a generic bad gateway.
+        //
+        // COUPLED WITH `codex_failure`, which recognises the same failure on the terminal
+        // event. This arm is the one that still works when there IS no terminal event — a
+        // child killed at the timeout has written its stderr and no `turn.failed` at all.
+        let outcome = match auth_failure.lock_ok().take() {
+            Some(detail) if !matches!(outcome, ClaudeOutcome::Ok { .. }) => ClaudeOutcome::Fatal {
+                message: auth_failure_message(harness.id(), &detail),
+            },
+            _ => outcome,
+        };
+
         match outcome {
             ClaudeOutcome::Ok {
                 result,
@@ -708,7 +762,7 @@ mod tests {
                 StreamEvent::TextDelta(t) => streamed.push_str(&t),
                 StreamEvent::Done(o) => terminal = Some(o),
                 StreamEvent::SessionId(_)
-                | StreamEvent::ToolActivity { .. }
+                | StreamEvent::ToolActivity(_)
                 | StreamEvent::Ignore => {}
             }
         }

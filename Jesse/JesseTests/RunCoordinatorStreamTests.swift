@@ -96,7 +96,7 @@ final class RunCoordinatorStreamTests: XCTestCase {
         try await settle()
         XCTAssertEqual(coordinator.partialText(for: thread.id), "Hello ")
 
-        fake.emit(.activity("Read"))
+        fake.emit(.activity(ToolActivity(name: "Read")))
         try await settle()
         XCTAssertEqual(coordinator.activity(for: thread.id), "Reading the vault…")
 

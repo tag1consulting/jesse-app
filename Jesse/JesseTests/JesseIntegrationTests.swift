@@ -23,7 +23,10 @@ import JesseCore
 enum StubFrame {
     case reset(String)
     case delta(String)
-    case activity(String)
+    /// Carries the same `ToolActivity` the real wire does, so a stub can emit a REFUSED
+    /// activity and the decode path is exercised for real rather than only for the
+    /// not-refused case. `frameBytes` omits `refused` when false, matching the bridge.
+    case activity(ToolActivity)
     case done(response: String, sessionId: String?)
     case error(String)
     case cancelled
@@ -255,7 +258,8 @@ final class StubURLProtocol: URLProtocol {
         switch frame {
         case .reset(let t): (event, data) = ("reset", ["text": t])
         case .delta(let t): (event, data) = ("delta", ["text": t])
-        case .activity(let n): (event, data) = ("activity", ["name": n])
+        case .activity(let a):
+            (event, data) = ("activity", a.refused ? ["name": a.name, "refused": true] : ["name": a.name])
         case .done(let r, let s):
             var o: [String: Any] = ["response": r]
             if let s { o["session_id"] = s }
@@ -459,7 +463,7 @@ final class JesseIntegrationTests: XCTestCase {
         // stream stalls — no terminal frame, no close.
         let bridge = StubBridge(
             post: .immediate202(jobId: "job-halfopen"),
-            stream: .framesThenStall([.reset("Hello world"), .activity("Read")]),
+            stream: .framesThenStall([.reset("Hello world"), .activity(ToolActivity(name: "Read"))]),
             results: [.running, .done(response: "Hello world", sessionId: "sess-ho")])
         StubURLProtocol.bridge = bridge
         let coordinator = makeCoordinator(realClient())
@@ -493,7 +497,7 @@ final class JesseIntegrationTests: XCTestCase {
         let bridge = StubBridge(
             post: .immediate202(jobId: "job-stream"),
             stream: .framesThenClose([
-                .reset(""), .delta("Hello "), .activity("Read"), .delta("world"),
+                .reset(""), .delta("Hello "), .activity(ToolActivity(name: "Read")), .delta("world"),
                 .done(response: "Hello world", sessionId: "sess-stream"),
             ]),
             results: [.running])   // poll never completes — the stream must

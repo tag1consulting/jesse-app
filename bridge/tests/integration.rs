@@ -3057,7 +3057,7 @@ async fn queued_turn_returns_202_immediately_and_stream_reflects_the_wait() {
     let mut saw_queue_activity = false;
     for _ in 0..30 {
         if let Some((_text, activity, _rx)) = st.jobs.stream_subscribe(&queued_id) {
-            if activity.as_deref() == Some(QUEUED_ACTIVITY) {
+            if activity.as_ref().map(|a| a.name.as_str()) == Some(QUEUED_ACTIVITY) {
                 saw_queue_activity = true;
                 break;
             }
