@@ -237,11 +237,19 @@ fn toml_string(s: &str) -> String {
 /// express is a [`HarnessError`], never a silent drop — a child spawned without the vault
 /// search it was promised would answer from nothing and look like a bad model.
 ///
-/// Verified live (0.146.0): with qmd configured this way the tools ARE surfaced and ARE
-/// preferred — a turn asked a vault question with no mention of MCP went straight to
-/// `qmd.query` / `qmd.get` and never touched the shell. The earlier report that Codex
-/// "ignored its MCP tools and shelled out to the qmd CLI" was a configuration failure, not a
-/// model preference.
+/// Surfacing a server is NOT the same as the child using it. Verified live (0.146.0): with
+/// qmd configured this way the tools are surfaced, but a turn asked a vault question answered
+/// it through nine `Bash` calls and zero MCP events — it shelled out to the qmd CLI rather
+/// than calling `qmd.query` / `qmd.get`. An earlier note here claimed the opposite ("went
+/// straight to the MCP tools and never touched the shell"); it was wrong, and code written
+/// against it would assume a retrieval path Codex does not take.
+///
+/// The consequence for containment, decided deliberately: under a `read` grant Codex may
+/// retrieve through the read-only shell, so the boundary that holds is the OS read-only
+/// sandbox this harness spawns under — NOT qmd tool-scoping. Do not treat the MCP allowlist
+/// as the thing confining a `read` child's reads; it scopes what MCP offers, and the shell
+/// sits beside it. Narrowing what those shell reads can reach (to the vault rather than
+/// everything the invoking unix user can read) is unix-user isolation, still pending.
 pub fn codex_mcp_args(harness: &'static str, mcp_config: &str) -> Result<Vec<String>, HarnessError> {
     let parsed: serde_json::Value = serde_json::from_str(mcp_config).map_err(|e| {
         HarnessError::unsupported(harness, format!("an MCP server set it could not parse ({e})"))
