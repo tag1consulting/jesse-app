@@ -1528,6 +1528,9 @@ pub fn model_price_from_env(prefix: &str, default: PriceDeck) -> PriceDeck {
 impl Config {
     pub fn from_env() -> Self {
         let home = std::env::var("HOME").unwrap_or_default();
+        // Built BEFORE the struct literal so the harness registry below can be built from
+        // the harnesses this config actually names. Nothing else about it changed.
+        let model_registry = ModelRegistry::from_env(&home);
         Config {
             token: env_string("JESSE_TOKEN").unwrap_or_default(),
             // Capture HOME once — session-path lookups read `cfg.home`, not the env.
@@ -1633,12 +1636,30 @@ impl Config {
             // JESSE_MODEL_* env triples, and the declarative `[[models]]` config file (see
             // ModelRegistry::from_env). Always includes the ambient opus default; the other
             // entries are unconfigured (present, not selectable) until their token resolves.
-            model_registry: ModelRegistry::from_env(&home),
             // Vision-layer knobs; bounded so a bad env value can't degrade the pipeline.
             vision: resolve_vision_config(),
-            // The harness registry: exactly one implementation, `claude-code`. No env
-            // configures this — a second harness is a new file, not a setting.
-            harnesses: Arc::new(HarnessRegistry::claude_code_only()),
+            // The harness registry, built from the harnesses the CONFIG names — not a
+            // hardcoded singleton. No env configures this: a model's `harness` key is what
+            // asks for one, and `for_models` constructs only the ids it knows (always
+            // registering Claude Code first, so the ambient contract holds regardless).
+            //
+            // This is deliberately built from EVERY declared model, not just the configured
+            // ones, because the startup gate validates unarmed entries too: a model that is
+            // present-but-unarmed must still be refused for a level its harness cannot
+            // express, rather than for the unrelated reason that its harness was missing.
+            //
+            // While this was `claude_code_only()` a `harness = "codex"` model could not
+            // start at all — the gate refused it as an "unknown harness", so registering
+            // Codex in `KNOWN_HARNESS_IDS` and `for_models` bought nothing on the startup
+            // path and every Codex test had to hand-patch this field to pass.
+            harnesses: Arc::new(HarnessRegistry::for_models(
+                model_registry
+                    .models
+                    .iter()
+                    .map(|m| m.harness.as_str())
+                    .collect::<Vec<_>>(),
+            )),
+            model_registry,
         }
     }
 }
