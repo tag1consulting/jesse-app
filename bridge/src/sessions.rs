@@ -1298,7 +1298,13 @@ pub async fn jesse_conversation_flags(
 /// Deliberately a byte/substring scan rather than a `serde_json` parse of each line: a
 /// transcript is one JSON object per line and most lines carry no tool call at all, so
 /// parsing every one to find a field that is usually absent is work proportional to the
-/// whole conversation for an answer that lives in a few lines of it.
+/// whole conversation for an answer that lives in a few lines of it. Validated against a
+/// real 147 KB transcript: the ids it returns are exactly those a full JSON parse finds.
+///
+/// It assumes a block's `id` follows its `"type":"tool_use"`, which is the order the CLI
+/// writes. A writer that put `id` FIRST would have this skip that block rather than
+/// mis-attribute a neighbour's id — the error direction that matters, since the whole point
+/// is that a warning here means something. See the `next < id_rel` guard.
 pub fn transcript_tool_use_ids(bytes: &[u8]) -> Vec<String> {
     const MARK: &str = r#""type":"tool_use""#;
     const ID: &str = r#""id":""#;
