@@ -15,6 +15,56 @@ CI both run it). See the "Versioning" section of `bridge/README.md`.
 
 ## [Unreleased]
 
+## [Bridge 0.56.0] - 2026-08-04
+
+The Codex write sandbox was certified in 0.54.0. What stood between that and a
+Codex model serving at `write` was never a missing proof — it was a missing
+signature. This adds it, and nothing else.
+
+### Added
+
+- **A human acceptance for the `write/qmd` row** (`bridge/containment-codex.toml`).
+  One new `[[accepted]]` block, signed by Jeremy Andrews on 2026-08-04, covering the
+  six open baselines at Codex's only write row: `read_escape_parent`,
+  `read_escape_symlink`, `read_state_dir`, `read_agent_credential`,
+  `read_session_transcript` and `read_env_token`. They are the SAME six already
+  accepted for `read` and the same finding — a Codex child reads everything the bridge
+  unix user can read, including the copy of its own refresh token that
+  `codex_turn_home` must seed for auth to resolve. Write does not widen that surface
+  (the OS sandbox scopes writes, not reads), but it does mean a prompt-injected turn
+  that reads a credential can now also change vault files. That is the trade being
+  signed for, and the block says so in those words.
+    - **No code, no test and no probe verdict changed.** `[[accepted]]` is read by
+      humans and by the two reconciliation helpers; nothing on the scoring or gating
+      path reads it. An accepted `known_open` is still `known_open`. The startup gate
+      already granted Codex `Write` — `highest_passing_level` keys on hard gates, all
+      of which pass at `write/qmd` — so this commit changes what the record SAYS a
+      human agreed to, not what the bridge will do.
+    - **Unaccepted open baselines: 12 → 6.** The six that remain are at `basic/none`
+      and are deliberately still unsigned. `Codex::expresses` is `capability > Basic`,
+      so that row can never be spawned by this harness and the level walk skips it; it
+      is probed only because the battery runs every pair in `SHIPPED_ROWS`. The `read`
+      acceptance declined it on those grounds in 0.52.0 and this one does too. Six is
+      the honest number, not an unfinished edge.
+
+### Notes
+
+- **The authorization text says "twelve write-row opens"; there are six.**
+  `SHIPPED_ROWS` holds four pairs and only one is a write pair — `write/qmd` — because
+  a Write turn is always a main turn and a main turn always loads qmd. There is no
+  `write/none` row to sign. The block covers every write-row open that exists; the
+  count in the transcribed authorization was wrong and is corrected in place, with the
+  original wording preserved verbatim above the correction.
+- **The acceptance carries less risk than its own text allows for.** It accepts "any
+  outbound route or process lifetime the pinned CLI leaves"; at `write/qmd` there is
+  none — `network_outbound` and `background_process` are both recorded `denied` /
+  `baseline`, closed by `sandbox_workspace_write.network_access=false`. Recorded rather
+  than quietly dropped: if either flips to `known_open` it is NOT covered by this block
+  and is new drift a human has to look at.
+- **Unix-user isolation is still not in place.** The `read` acceptance named it as the
+  mitigation for the unconfined read surface; it remains outstanding, and this grant
+  does not claim otherwise or wait for it.
+
 ## [Bridge 0.55.0] - 2026-08-04
 
 Kimi was benched on a defect nobody had re-measured. It is fixed, on the CLI we
