@@ -109,8 +109,18 @@ diet_keywords_extra = [
 # Fields (id, kind, base_url, model are REQUIRED; the rest are optional):
 #   id             stable key the switch persists (e.g. "fireworks", "codex")
 #   label          shown in the app switcher (defaults to id)
-#   kind           "hosted" or "local"  ("ambient" is reserved for the built-in opus)
-#   base_url       the model's Anthropic-surface base URL (the bridge speaks /v1/messages)
+#   kind           WHICH API SURFACE the base_url serves ("ambient" is reserved for the
+#                  built-in opus):
+#                    hosted  an Anthropic `/v1/messages` endpoint, hosted by a provider
+#                    local   an Anthropic-compatible endpoint on this machine
+#                    openai  an OpenAI RESPONSES endpoint (`/v1/responses`), driven by a
+#                            harness that speaks it — today that is `harness = "codex"`.
+#                            Pairing `openai` with a harness that speaks Anthropic is a
+#                            STARTUP ERROR naming the model: it would otherwise probe
+#                            healthy and 404 on every turn.
+#   base_url       the base URL of that surface. For hosted/local, the Anthropic base (the
+#                  bridge appends /v1/messages). For openai, the OpenAI API ROOT — the
+#                  segment BEFORE /responses (e.g. https://api.fireworks.ai/inference/v1).
 #   model          the backend model id
 #   subagent_model model for the subagents the turn spawns (defaults to `model`)
 #   auth_token_env the NAME of the env var holding the token — NEVER the token itself.
@@ -159,9 +169,19 @@ diet_keywords_extra = [
 #   price          { in_per_m, cached_per_m, out_per_m } dollars per 1M tokens (default
 #                  0/0/0), feeding the per-turn cost badge.
 #   health         { path, interval_secs, timeout_secs } — probe endpoint + cadence
-#                  (defaults: "/v1/messages", 60s, 3s). A probe that gets 401/403
-#                  (bad/expired token), 404 (path/model not served), or a 5xx marks the
-#                  model UNHEALTHY (hidden from the switcher); 400/422/429 stay healthy.
+#                  (defaults: 60s, 3s, and a path that FOLLOWS THE KIND —
+#                  "/v1/messages" for hosted/local, "/chat/completions" for openai).
+#                  A probe that gets 401/403 (bad/expired token), 404 (path/model not
+#                  served), or a 5xx marks the model UNHEALTHY (hidden from the
+#                  switcher); 400/422/429 stay healthy.
+#                  An `openai` model probes the CHAT path even though its turns run on
+#                  /responses: the one-token probe body is valid on both contracts, so
+#                  the chat path answers 200 with a real completion instead of a 400 the
+#                  classifier would merely tolerate. Same host, key and model, so a
+#                  passing probe still speaks for the turn.
+#                  A THINKING model needs a wider timeout than 3s — it emits reasoning
+#                  before its first token even at max_tokens 1. Kimi K3 on Fireworks was
+#                  measured at 1.2–5.4s (2026-08-04), so its entry sets 15.
 #
 # JESSE_HEALTH_INTERVAL_SECS (env var, optional): a GLOBAL override for the DEFAULT probe
 #   interval, so an operator can probe idle configured models less often without writing a
@@ -171,11 +191,25 @@ diet_keywords_extra = [
 #   Applies to the env-triple models (glm-5.2, kimi-k3, local) and any [[models]] entry
 #   that omits its own interval_secs. Does NOT change the per-probe timeout or path.
 #
-# IMPORTANT: the bridge speaks the Anthropic `/v1/messages` contract. A model whose
-# NATIVE API is OpenAI-shaped (`/v1/chat/completions`, e.g. a "codex" model) must sit
-# behind a small Anthropic-surface GATEWAY that translates the two, and `base_url` must
-# point at that gateway — NOT at the OpenAI endpoint. No bridge code change is needed to
-# add it; only this config and the gateway.
+# TWO WAYS TO REACH AN OPENAI-SHAPED MODEL, and they are not interchangeable:
+#
+#   1. `kind = "openai"` + `harness = "codex"` — the model's OWN endpoint, driven by the
+#      Codex agent loop. No gateway. This is the direct path and it is what a tool-using
+#      OpenAI-style model needs: driving a tool loop through an Anthropic-compatibility
+#      shim is where those models fail. REQUIRES the provider to serve the OpenAI
+#      **Responses API** (`/v1/responses`) — codex-cli 0.146.0 removed `wire_api = "chat"`,
+#      so a provider offering only `/v1/chat/completions` cannot be driven this way at all.
+#      Note what changes with it: a Codex-harness model reaches the vault through the SHELL
+#      under an OS sandbox, not through the qmd MCP allowlist, and is governed by
+#      `bridge/containment-codex.toml`.
+#
+#   2. `kind = "hosted"` pointed at a small Anthropic-surface GATEWAY that translates
+#      /v1/messages to the model's native API. Keeps the model on the Claude Code harness
+#      and its MCP allowlist. Fine for chat; the tool loop is the part that suffers.
+#
+# Either way `auth_token_env` names an env var — never a literal token. On path 1 the key
+# is handed to the child in its ENVIRONMENT, never as a command-line argument, so it does
+# not appear in `ps` output or in a recorded argv.
 #
 # The examples below are COMMENTED OUT (uncomment + set the token env var to enable one):
 
@@ -207,6 +241,35 @@ diet_keywords_extra = [
 # level = "write"                          # Codex: trusted with the vault
 # price = { in_per_m = 1.25, cached_per_m = 0.13, out_per_m = 10.00 }
 # health = { interval_secs = 30, timeout_secs = 3 }
+
+# ANY OpenAI-style model, on its OWN endpoint, through the Codex harness — no gateway.
+# Kimi K3 on Fireworks is the worked example (verified live 2026-08-04): `kind = "openai"`
+# makes the three fields below LOAD-BEARING (they are inert for a Codex model on its own
+# subscription login), and the harness turns them into the child's provider definition.
+#
+# Adding another OpenAI-style model is this block again with different values, plus one env
+# var for its token. Two requirements on the provider:
+#   * it serves the Responses API at <base_url>/responses, and
+#   * it serves /chat/completions for the health probe (or set health.path explicitly).
+#
+# `kimi-k3` already exists as an env-triple model on the Anthropic surface. This is a
+# SECOND, separately-selectable entry with its own id — the two can coexist in the picker,
+# and they are not the same model in two costumes: this one reaches the vault through the
+# shell under a read-only OS sandbox and is governed by bridge/containment-codex.toml,
+# while the Anthropic-surface one is governed by the Claude Code MCP allowlist.
+#
+# Arm it with: JESSE_MODEL_KIMI_AUTH_TOKEN=fw_...   (the same Fireworks key)
+# [[models]]
+# id = "kimi-k3-codex"
+# label = "Kimi K3 (Codex)"
+# kind = "openai"                              # /v1/responses, not /v1/messages
+# base_url = "https://api.fireworks.ai/inference/v1"   # the API ROOT, before /responses
+# model = "accounts/fireworks/models/kimi-k3"
+# auth_token_env = "JESSE_MODEL_KIMI_AUTH_TOKEN"
+# harness = "codex"                            # required: only codex speaks this surface
+# level = "read"                               # the only level containment-codex.toml passes
+# price = { in_per_m = 3.00, cached_per_m = 0.30, out_per_m = 15.00 }
+# health = { timeout_secs = 15 }               # K3 thinks; 3s would mark it unhealthy
 
 # ---------------------------------------------------------------------------
 # Vision helpers — let a hosted TEXT model "see" image/PDF attachments

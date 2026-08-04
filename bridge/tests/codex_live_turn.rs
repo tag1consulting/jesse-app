@@ -51,6 +51,29 @@ fn codex_model() -> ActiveModel {
     m
 }
 
+/// A model on its OWN OpenAI-style provider, as `jesse.example.toml`'s `kimi-k3-codex`
+/// entry declares it: Kimi K3 on Fireworks' Responses API, served by the Codex harness at
+/// `Read`. `None` when the Fireworks key is not in this shell's environment, so the test
+/// SKIPS rather than failing on a machine that has no key.
+fn kimi_codex_model() -> Option<ActiveModel> {
+    let token = std::env::var("JESSE_MODEL_KIMI_AUTH_TOKEN")
+        .ok()
+        .filter(|t| !t.trim().is_empty())?;
+    let mut m = ActiveModel::ambient();
+    m.id = "kimi-k3-codex".to_string();
+    m.kind = ModelKind::OpenAi;
+    m.harness = CODEX_ID.to_string();
+    m.level = Capability::Read;
+    m.env = Some((
+        std::env::var("JESSE_MODEL_KIMI_BASE_URL")
+            .unwrap_or_else(|_| "https://api.fireworks.ai/inference/v1".to_string()),
+        token,
+        std::env::var("JESSE_MODEL_KIMI_MODEL")
+            .unwrap_or_else(|_| "accounts/fireworks/models/kimi-k3".to_string()),
+    ));
+    Some(m)
+}
+
 /// A client watching this job's stream from BEFORE the turn starts.
 ///
 /// Subscribing first is not tidiness — it is the only thing that works. The stream is a
@@ -145,6 +168,85 @@ async fn a_codex_turn_answers_and_shows_what_it_was_doing() {
     assert!(
         acts.iter().all(|a| !a.name.contains('/')),
         "no activity name may carry a path: {acts:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(&vault);
+}
+
+/// A NON-OPENAI MODEL, ON ITS OWN OPENAI-STYLE ENDPOINT, USING A TOOL.
+///
+/// The turn this whole change exists for, and every clause of that sentence is load-bearing:
+///   * NOT OpenAI's model — Kimi K3, on Fireworks, authenticated with an API key rather than
+///     the bridge's subscription login;
+///   * through the CODEX harness and its OS sandbox, not through an Anthropic-compatibility
+///     shim;
+///   * USING A TOOL, which is the case the Anthropic-surface path fails. Kimi has been armed
+///     on `/v1/messages` since 0.36.0 and answers chat there; its tool loop is what does not
+///     survive the translation. So a turn that merely answered would prove nothing — the
+///     assertion that matters is the `Bash` activity, meaning the child actually went and
+///     read the file before speaking.
+///
+/// Run it with a Fireworks key in the environment; it SKIPS without one:
+///
+/// ```text
+/// JESSE_CODEX_BIN=$(which codex) JESSE_MODEL_KIMI_AUTH_TOKEN=fw_... \
+///   cargo test --features containment-probe --test codex_live_turn -- \
+///   --ignored --nocapture --test-threads=1
+/// ```
+#[tokio::test]
+#[ignore = "spawns a real Kimi turn on Fireworks — costs money and minutes; run explicitly"]
+async fn a_kimi_turn_uses_a_tool_through_codex_against_an_openai_provider() {
+    let Some(model) = kimi_codex_model() else {
+        eprintln!("SKIPPED: JESSE_MODEL_KIMI_AUTH_TOKEN is not set in this environment");
+        return;
+    };
+    let vault = scratch_vault("kimi");
+    let cfg = live_config(&vault);
+    let jobs = Arc::new(JobStore::new(
+        std::time::Duration::from_secs(cfg.job_ttl_secs),
+        std::time::Duration::from_secs(cfg.retrieval_grace_secs),
+        None,
+    ));
+    let jid = "live-kimi-codex";
+    jobs.stream_register(jid);
+    let watcher = watch(&jobs, jid);
+    let spawned = SpawnedSessions::new();
+
+    let started = std::time::Instant::now();
+    let out = run_claude_streaming(
+        &cfg,
+        "Read note.md in this directory and tell me the agreed cadence. Quote it.",
+        None,
+        &jobs,
+        jid,
+        &model,
+        &Codex,
+        &spawned,
+    )
+    .await;
+    let elapsed = started.elapsed();
+
+    let acts = collected(&jobs, jid, watcher).await;
+    let (text, session, usage) = out.expect("a live Kimi-on-Codex turn should answer");
+    eprintln!(
+        "answer: {text}\nthread: {session:?}\nusage: {usage:?}\nactivity: {acts:?}\nelapsed: {elapsed:?}"
+    );
+
+    assert!(!text.trim().is_empty(), "the answer arrived whole, not empty");
+    assert!(
+        text.to_lowercase().contains("tuesday"),
+        "the child actually read the file rather than guessing: {text}"
+    );
+    assert!(
+        acts.iter().any(|a| a.name == "Bash"),
+        "THE POINT OF THIS TEST: a tool-using turn. Kimi answers chat on the Anthropic \
+         surface already; what fails there is the tool loop, so a turn with no tool activity \
+         proves nothing about this path. Frames seen: {acts:?}"
+    );
+    assert_eq!(
+        session.as_deref(),
+        spawned.ids().first().map(String::as_str),
+        "the thread id is reported from thread.started, exactly as on the OAuth path"
     );
 
     let _ = std::fs::remove_dir_all(&vault);

@@ -15,6 +15,77 @@ CI both run it). See the "Versioning" section of `bridge/README.md`.
 
 ## [Unreleased]
 
+## [Bridge 0.53.0] - 2026-08-04
+
+**Any OpenAI-style model can now be served, on its own endpoint, through the Codex harness.**
+Kimi K3 is the worked example. Not a config edit: a Codex model's `base_url`, `model` and
+`auth_token_env` were INERT — auth came from `~/.codex/auth.json` and the endpoint came with
+it — so there was no code that read them on the turn path. This adds the reading of them,
+once. Adding the NEXT such model is a config edit plus one env var for its token.
+
+### Added
+
+- **A provider seam on the Codex harness** (`codex_provider_args`). A model declaring the new
+  `kind = "openai"` gets its three existing fields turned into the child's provider
+  definition: `-c model_providers.jesse.{base_url,wire_api,env_key}`, `-c model_provider`,
+  `-c model`. **No fourth config key** — the three that were inert become load-bearing,
+  selected by the kind the entry already declares.
+- **`ModelKind::OpenAi`** — the first variant that names an API SURFACE rather than a hosting
+  arrangement. `Hosted` and `Local` differ only in where the endpoint lives and both speak
+  `/v1/messages`; this one speaks `/v1/responses`, and every place that assumed "a configured
+  backend is an Anthropic backend" now has to ask.
+- **`Harness::speaks_openai_backend`**, and a startup refusal built on it: an `openai`-kind
+  model on a harness that speaks Anthropic is rejected by name. That pairing is the nastiest
+  shape a model config has — it passes its health probe (the probe posts at the OpenAI path
+  and gets a 200), so the picker shows the model green, and then every turn 404s because the
+  child was handed an `ANTHROPIC_BASE_URL` that serves only `/v1/responses`. Asked of the
+  harness rather than by hardcoding an id, for the same reason the level check asks
+  `expresses`.
+- **A kind-aware default probe path** (`/chat/completions` for `openai`, `/v1/messages`
+  otherwise). Without it, an operator who declares an OpenAI-surface model and omits the
+  `health` block gets `/v1/messages` posted at an OpenAI root, a 404, and a model that is
+  configured, armed, correct — and permanently unselectable for a reason nothing in their
+  config file mentions. The CHAT path rather than `/responses` because the one-token probe
+  body is valid on both contracts, so it answers `200` with a real completion instead of a
+  `400` the classifier would merely tolerate; same host, key and model, so it still speaks
+  for the turn.
+- **A live tool-using turn through the whole path**
+  (`a_kimi_turn_uses_a_tool_through_codex_against_an_openai_provider`, `#[ignore]`d, skips
+  without a key). The assertion that matters is the `Bash` activity, not the answer: Kimi has
+  answered chat on the Anthropic surface since 0.36.0, so a turn that merely replied would
+  prove nothing about this path.
+
+### Changed
+
+- **A provider turn's per-turn `CODEX_HOME` holds no credential at all.** It authenticates
+  from the environment and never reads `auth.json`, so copying the subscription credential in
+  would put a live OAuth token for a DIFFERENT provider inside a turn with no use for it. The
+  read surface this harness accepts (`read_agent_credential`'s decoy is reachable *because*
+  the OAuth copy is deliberately in the home) is therefore ABSENT on this path rather than
+  tolerated there. This only ever removes a file from the child's reach, so no containment row
+  it was probed against can be widened by it.
+- **The API key travels in the child's ENVIRONMENT, never in its argv.** A `-c` override is a
+  command-line argument — visible in `ps` to every process on the host, and present in any
+  recorded argv. Codex's providers take an `env_key` naming a variable precisely so the secret
+  travels out of band; the harness names `JESSE_CODEX_PROVIDER_KEY` in the argv and sets the
+  value on the child. Pinned by a test that greps the argv for the token.
+- **`jesse.example.toml` no longer says an OpenAI-shaped model must sit behind a translating
+  gateway.** That was true when nothing read those fields; there are now two documented ways
+  in, with the difference between them stated — a Codex-harness model reaches the vault
+  through the SHELL under an OS sandbox and is governed by `containment-codex.toml`, not by
+  the Claude Code MCP allowlist.
+
+### Notes
+
+- **`wire_api = "chat"` is gone from codex-cli 0.146.0** — it is a hard config error naming
+  its own removal. So this seam reaches only providers that serve the **Responses API**; one
+  offering `/v1/chat/completions` and nothing else cannot be driven through this harness at
+  all, whatever the config says. Fireworks serves `/inference/v1/responses`, which is what
+  makes Kimi reachable.
+- **Nothing is armed by this change.** The `kimi-k3-codex` entry ships COMMENTED OUT in
+  `jesse.example.toml`; the deployed `codex` model is `kind = "hosted"` on its subscription
+  login, names no provider, and its argv is byte-for-byte what it was.
+
 ## [App 1.0 (88)] - 2026-08-03
 
 The iPad could reach Chats but never leave it.

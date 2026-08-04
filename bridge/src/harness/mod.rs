@@ -267,6 +267,24 @@ pub trait Harness: Send + Sync {
     /// is what keeps this from becoming a wish list of its own.
     fn expresses(&self, capability: Capability) -> bool;
 
+    /// Whether this harness drives its model over an **OpenAI-style** API surface
+    /// (`/v1/responses`) rather than Anthropic's `/v1/messages`.
+    ///
+    /// The one thing [`ModelKind::OpenAi`] needs to know about a harness, and it lives here
+    /// for the same reason [`Harness::expresses`] does: it is a fact about what the harness
+    /// CAN do, and the alternative was [`validate_model_config`] hardcoding a harness id,
+    /// which puts a per-harness fact in the one file that is supposed to ask rather than
+    /// know.
+    ///
+    /// The default is `false` — a harness speaks Anthropic unless it says otherwise, which is
+    /// what every harness did before Codex gained a provider seam. The gate reads it in ONE
+    /// direction: an `openai`-kind model on a harness that answers `false` is refused. The
+    /// converse is legitimate and must stay so — a Codex model on its own OAuth login is
+    /// `hosted`, names no provider, and is exactly the deployed posture.
+    fn speaks_openai_backend(&self) -> bool {
+        false
+    }
+
     /// The containment flags this harness turns a [`Capability`] into: the whole boundary,
     /// in this harness's own flag vocabulary.
     ///

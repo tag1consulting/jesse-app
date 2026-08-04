@@ -780,6 +780,12 @@ pub fn resolve_vision_config() -> VisionConfig {
 }
 
 /// How a selectable model's backend is applied to the MAIN turn.
+///
+/// **This names an API SURFACE, not a hosting arrangement**, which is what the fourth variant
+/// added and what a reader skimming the first three would otherwise get wrong: `Hosted` and
+/// `Local` differ only in where the endpoint lives, and both speak Anthropic's
+/// `/v1/messages`. `OpenAi` is the first variant that changes the CONTRACT, and every place
+/// that assumed "a configured backend is an Anthropic backend" has to ask.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ModelKind {
@@ -790,6 +796,22 @@ pub enum ModelKind {
     Hosted,
     /// An Anthropic-compatible LOCAL endpoint.
     Local,
+    /// A backend reached over an **OpenAI-style** surface — `/v1/responses`, not
+    /// `/v1/messages` — driven by a harness that speaks it.
+    ///
+    /// The variant exists because the backend triple means something DIFFERENT here, and the
+    /// difference is not expressible as a flag on `Hosted`. For an Anthropic-surface model the
+    /// triple becomes `ANTHROPIC_BASE_URL` / `ANTHROPIC_AUTH_TOKEN` / `ANTHROPIC_MODEL` on a
+    /// Claude Code child. For this one it becomes a **provider definition** the OpenAI-style
+    /// harness is pointed at (see [`codex_provider_args`]): the same three fields, consumed by
+    /// a different transport.
+    ///
+    /// **A model declaring this kind must run under a harness that speaks it**, and
+    /// [`validate_model_config`] refuses the pairing at startup rather than letting a Claude
+    /// Code child be handed an `ANTHROPIC_BASE_URL` that answers only `/v1/responses` — which
+    /// would fail every turn with a 404 from a model the picker showed as healthy.
+    #[serde(rename = "openai")]
+    OpenAi,
 }
 
 /// One selectable model in the registry. Built from the built-in ambient default, the
@@ -1311,13 +1333,14 @@ pub struct VisionPartnerToml {
     pub role: Option<String>,
 }
 
-/// Parse a declarative `kind` string into a [`ModelKind`]. Only `hosted` / `local` are
-/// valid; `ambient` (and anything else) is refused so a declarative entry can never claim
-/// the ambient contract.
+/// Parse a declarative `kind` string into a [`ModelKind`]. Only `hosted` / `local` /
+/// `openai` are valid; `ambient` (and anything else) is refused so a declarative entry can
+/// never claim the ambient contract.
 fn parse_declared_kind(kind: &str) -> Option<ModelKind> {
     match kind.trim().to_ascii_lowercase().as_str() {
         "hosted" => Some(ModelKind::Hosted),
         "local" => Some(ModelKind::Local),
+        "openai" => Some(ModelKind::OpenAi),
         _ => None,
     }
 }
@@ -1414,7 +1437,9 @@ pub fn registry_model_from_toml(
                 .as_deref()
                 .map(str::trim)
                 .filter(|s| !s.is_empty())
-                .unwrap_or(DEFAULT_HEALTH_PATH)
+                // The default is KIND-AWARE: an OpenAI-surface model's base_url answers
+                // `/chat/completions`, not `/v1/messages`. See [`default_health_path`].
+                .unwrap_or_else(|| default_health_path(kind))
                 .to_string(),
             // Explicit per-model interval wins; else the global override; else the default.
             interval_secs: resolve_health_interval(h.interval_secs, global_interval),
@@ -1427,11 +1452,12 @@ pub fn registry_model_from_toml(
                 DEFAULT_HEALTH_TIMEOUT_SECS,
             ),
         })
-        // No `health` block at all: still honor the global overrides.
+        // No `health` block at all: still honor the global overrides, and still take the
+        // kind-aware default path.
         .unwrap_or_else(|| HealthConfig {
+            path: default_health_path(kind).to_string(),
             interval_secs: resolve_health_interval(None, global_interval),
             timeout_secs: resolve_health_timeout(None, global_timeout, DEFAULT_HEALTH_TIMEOUT_SECS),
-            ..HealthConfig::default()
         });
     Some(RegistryModel {
         id: id.to_string(),
@@ -2356,6 +2382,46 @@ mod tests {
         assert_eq!(m.health.interval_secs, 30);
         assert_eq!(m.health.timeout_secs, 2);
         std::env::remove_var("JESSE_TEST_DECL_TOKEN2");
+    }
+
+    /// AN OPENAI-KIND ENTRY NEEDS NO `health` BLOCK TO BE PROBEABLE.
+    ///
+    /// The default probe path follows the KIND, because the default is a statement about
+    /// which API the `base_url` serves and that is exactly what the kind names. Without this,
+    /// an operator who declares an OpenAI-surface model and omits the health block gets
+    /// `/v1/messages` posted at an OpenAI root, a 404, `unknown-model`, and a model that is
+    /// configured, armed, correct — and permanently unselectable for a reason nothing in
+    /// their config file mentions.
+    #[test]
+    fn an_openai_kind_model_defaults_its_probe_to_the_openai_path() {
+        let _g = ENV_LOCK.lock_ok();
+        std::env::set_var("JESSE_TEST_OPENAI_TOKEN", "tok");
+        let mut t = model_toml("kimi-k3-codex", "openai", Some("JESSE_TEST_OPENAI_TOKEN"));
+        t.harness = Some("codex".into());
+
+        let m = registry_model_from_toml(&t, None, None).expect("openai is a valid kind");
+        assert!(matches!(m.kind, ModelKind::OpenAi));
+        assert_eq!(m.harness, "codex");
+        assert_eq!(m.health.path, "/chat/completions");
+
+        // An explicit path still wins — the kind supplies a DEFAULT, not a policy.
+        t.health = Some(HealthToml {
+            path: Some("/responses".into()),
+            interval_secs: None,
+            timeout_secs: None,
+        });
+        let explicit = registry_model_from_toml(&t, None, None).expect("a model");
+        assert_eq!(explicit.health.path, "/responses");
+
+        // And an Anthropic-surface kind is untouched by any of it.
+        let hosted = registry_model_from_toml(
+            &model_toml("h", "hosted", Some("JESSE_TEST_OPENAI_TOKEN")),
+            None,
+            None,
+        )
+        .expect("a model");
+        assert_eq!(hosted.health.path, "/v1/messages");
+        std::env::remove_var("JESSE_TEST_OPENAI_TOKEN");
     }
 
     #[test]

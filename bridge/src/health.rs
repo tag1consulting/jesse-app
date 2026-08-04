@@ -52,6 +52,32 @@ pub const REASONING_HEALTH_TIMEOUT_SECS: u64 = 15;
 const _: () = assert!(REASONING_HEALTH_TIMEOUT_SECS > DEFAULT_HEALTH_TIMEOUT_SECS);
 /// Default probe endpoint on the model's Anthropic surface: a tiny `/v1/messages` call.
 pub const DEFAULT_HEALTH_PATH: &str = "/v1/messages";
+/// Default probe endpoint for a [`ModelKind::OpenAi`] backend, whose `base_url` is an OpenAI
+/// API ROOT (`…/v1`) rather than an Anthropic surface.
+///
+/// `/chat/completions` rather than `/responses`, and the choice is deliberate: the probe body
+/// is a minimal `{model, max_tokens, messages}`, which is a VALID request on both contracts,
+/// so the chat path answers `200` with a real one-token completion. That makes the green
+/// light mean what it is supposed to mean — this key, on this endpoint, produces tokens from
+/// this model — rather than "the endpoint rejected our body with a 400 we tolerate". The
+/// turn itself still runs on `/responses`, which is the only wire codex-cli 0.146.0 speaks;
+/// the two share the same host, key and model, so a passing probe still speaks for the turn.
+pub const DEFAULT_OPENAI_HEALTH_PATH: &str = "/chat/completions";
+
+/// The probe path a model gets when its config declares none — [`ModelKind`]-aware, because
+/// the default is a statement about which API the `base_url` serves and that is exactly what
+/// the kind names. An explicit `health.path` still wins over this.
+///
+/// Without this an operator declaring an OpenAI-surface model and omitting the `health` block
+/// gets `/v1/messages` posted at an OpenAI root, a 404, `unknown-model`, and a model that is
+/// configured, armed, correct — and permanently unselectable, for a reason nothing in their
+/// config file mentions.
+pub fn default_health_path(kind: ModelKind) -> &'static str {
+    match kind {
+        ModelKind::OpenAi => DEFAULT_OPENAI_HEALTH_PATH,
+        _ => DEFAULT_HEALTH_PATH,
+    }
+}
 
 /// One model's probe cadence + endpoint. Built from a declarative entry's optional
 /// `health = { path, interval_secs, timeout_secs }` (each field defaulted independently),
