@@ -15,6 +15,64 @@ CI both run it). See the "Versioning" section of `bridge/README.md`.
 
 ## [Unreleased]
 
+## [Bridge 0.54.0] - 2026-08-04
+
+Codex could already write. Nothing proved it end to end, and the record was cut on
+a CLI this machine no longer runs.
+
+### Added
+
+- **Three live tests that certify the Codex `Write` posture through the bridge's own
+  turn path** (`bridge/tests/codex_write_turn.rs`, `#[ignore]`d — they spawn real
+  agent turns). The containment battery already proved the boundary, but it spawns
+  its own children with its own scratch trees; these run `run_claude_streaming`, the
+  real driver and the real registry, which is the code a deployed bridge executes.
+  A battery row can pass while the turn path hands the child a different posture.
+    - A `Write` child CHANGES the vault and the change PERSISTS — the positive
+      control. A sandbox that denied everything would pass every escape test while
+      making `Write` a grant of nothing.
+    - A `Write` child is DENIED every write outside `writable_roots`, by the three
+      routes that would each individually undo the grant: its own per-turn
+      `CODEX_HOME` (where it could rewrite its own config and widen its own posture
+      mid-turn), the bridge's state directory, and the home directory. Asserted out
+      of band over the whole state tree, because the per-turn home's name is a UUID
+      minted inside the turn. A control file in the vault distinguishes "the escapes
+      were refused" from "the child never tried anything".
+    - BOTH harnesses serve concurrently in one process with Codex at `Write`, each
+      from its own vault, neither seeing the other's context.
+
+### Changed
+
+- **The Codex containment record is re-cut against `codex-cli 0.146.0`**
+  (`bridge/containment-codex.toml`). It was taken on 0.145.0, but the deployed
+  bridge pins `JESSE_CODEX_BIN=~/.local/bin/codex`, which is 0.146.0 — so the
+  record described a binary production does not run. **Nothing moved:** all 64
+  probes across the four shipped rows came back conclusive and every verdict,
+  status, class and recorded argv is byte-identical to the 0.145.0 run. Only the
+  version headers and eleven evidence strings differ. `read/none`, `read/qmd` and
+  `write/qmd` all pass their hard gates; `basic/none` still fails its positive
+  controls, which is the designed outcome for a harness that cannot express
+  `basic` at all.
+- **`jesse.example.toml` documents the Codex harness.** The `harness` field now
+  names `codex` and its `JESSE_CODEX_BIN`, and says out loud that a harness bounds
+  the level — `harness = "codex"` with `level = "basic"` refuses to start, with
+  "cannot express" rather than "failed a gate". A second worked `[[models]]` block
+  shows a `level = "write"` model on the Codex harness, with the token as a named
+  env var, and states plainly what the `workspace-write` sandbox does and does not
+  do: it confines WRITES to the vault, it does not narrow reads.
+
+### Notes
+
+- **The six open read baselines on the `write/qmd` row remain UNACCEPTED, on
+  purpose.** The existing `[[accepted]]` block covers `read/none` and `read/qmd`
+  only and says so explicitly: "Granting Codex `write` is a new decision and needs a
+  new entry." An `[[accepted]]` entry records that a *named person* agreed to ship a
+  row on a date, so it is not something this change can author on the operator's
+  behalf. `containment-probe` reports the twelve unsigned opens (six here, six at
+  the unreachable `basic/none`) on every run until one is written.
+- Carried forward and unchanged by this work: the broad Codex read surface, the
+  mis-scoped `search_qmd` gate, and unix-user isolation.
+
 ## [Bridge 0.53.0] - 2026-08-04
 
 **Any OpenAI-style model can now be served, on its own endpoint, through the Codex harness.**
