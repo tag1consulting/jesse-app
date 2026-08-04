@@ -35,9 +35,14 @@ a CLI this machine no longer runs.
       routes that would each individually undo the grant: its own per-turn
       `CODEX_HOME` (where it could rewrite its own config and widen its own posture
       mid-turn), the bridge's state directory, and the home directory. Asserted out
-      of band over the whole state tree, because the per-turn home's name is a UUID
-      minted inside the turn. A control file in the vault distinguishes "the escapes
-      were refused" from "the child never tried anything".
+      of band by sweeping the state tree for the escape file's NAME, because the
+      per-turn home is named by a UUID minted inside the turn. By name and not by
+      emptiness, deliberately: the `codex` process fills its own `CODEX_HOME` with
+      ordinary bookkeeping (`auth.json`, `sessions/`, `skills/`, plugin caches), and
+      that is the CLI writing, not the sandboxed tool surface. A control file in the
+      vault distinguishes "the escapes were refused" from "the child never tried".
+      Live evidence: the vault write succeeds and all three escapes come back
+      `operation not permitted` from the OS.
     - BOTH harnesses serve concurrently in one process with Codex at `Write`, each
       from its own vault, neither seeing the other's context.
 
