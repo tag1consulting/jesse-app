@@ -128,11 +128,21 @@ diet_keywords_extra = [
 #                  the model configured-but-unarmed (it appears in the list, disabled,
 #                  until the var is set). No token is ever written to this file, to
 #                  model.json, or to any endpoint response.
-#   harness        the agent program that runs this model's child ("claude-code", …).
+#   harness        the agent program that runs this model's child ("claude-code", "codex").
 #                  Absent means "claude-code". An id no harness is registered under is a
 #                  STARTUP ERROR naming the model, never a silent fallback. Each harness
-#                  has one binary-path env var (claude-code: JESSE_CLAUDE_BIN) which is
-#                  consulted, and only fatal, for a harness some configured model uses.
+#                  has one binary-path env var (claude-code: JESSE_CLAUDE_BIN, codex:
+#                  JESSE_CODEX_BIN) which is consulted, and only fatal, for a harness some
+#                  configured model uses.
+#
+#                  THE HARNESS BOUNDS THE LEVEL, and not every harness has every level.
+#                  A harness declares which levels it can EXPRESS, and a level it cannot
+#                  express is a startup error saying "cannot express" rather than "failed a
+#                  gate" — the two send an operator looking in different places. Codex has
+#                  no `basic`: its containment lever is an OS sandbox mode, not a tool
+#                  allowlist, and there is no config key that removes its shell, so its
+#                  weakest posture is byte-identical to `read`. `harness = "codex"` with
+#                  `level = "basic"` therefore refuses to start.
 #   level          the MOST this model may be granted: "basic" | "read" | "write".
 #                  Absent means "read" — the safe direction: a newly declared model can
 #                  be asked questions but cannot change anything.
@@ -227,8 +237,11 @@ diet_keywords_extra = [
 # price = { in_per_m = 1.40, cached_per_m = 0.14, out_per_m = 4.40 }
 # health = { path = "/v1/messages", interval_secs = 60, timeout_secs = 3 }
 
-# An OpenAI-style "codex" model. Its native API is `/v1/chat/completions`, so base_url
-# points at a small Anthropic-surface gateway (running here on :8900), NOT at OpenAI.
+# An OpenAI-style "codex" model run through the ANTHROPIC-SURFACE GATEWAY, on the
+# claude-code harness. Its native API is `/v1/chat/completions`, so base_url points at a
+# small translating gateway (running here on :8900), NOT at OpenAI. This is the older of
+# the two ways to reach Codex and needs no `harness` key, because the child really is a
+# claude-code child talking to a gateway.
 # Arm it with: CODEX_GATEWAY_TOKEN=...
 # [[models]]
 # id = "codex"
@@ -267,9 +280,44 @@ diet_keywords_extra = [
 # model = "accounts/fireworks/models/kimi-k3"
 # auth_token_env = "JESSE_MODEL_KIMI_AUTH_TOKEN"
 # harness = "codex"                            # required: only codex speaks this surface
-# level = "read"                               # the only level containment-codex.toml passes
+# level = "read"                               # `write` also passes — see the block below
 # price = { in_per_m = 3.00, cached_per_m = 0.30, out_per_m = 15.00 }
 # health = { timeout_secs = 15 }               # K3 thinks; 3s would mark it unhealthy
+
+# The SAME model on the CODEX HARNESS, at `write` — a real `codex exec` child rather than a
+# claude-code child behind a gateway. No gateway, no translation: the bridge runs the codex
+# CLI directly off its own subscription login (`codex login`, whose credential the harness
+# copies into a fresh per-turn CODEX_HOME).
+#
+# WHAT `level = "write"` BUYS AND WHAT IT DOES NOT. It puts the child in Codex's
+# `workspace-write` sandbox with `writable_roots` scoped to the turn's working directory and
+# nothing else, so writes outside the vault are refused BY THE OPERATING SYSTEM — including
+# writes into the per-turn CODEX_HOME and the bridge's own state directory, both of which sit
+# outside that root by construction. Network egress is off.
+#
+# IT DOES NOT NARROW READS, and reading this entry as if it did would be a mistake. Codex's
+# sandbox scopes WRITES only — there is no `readable_roots` — so the child can read anything
+# the bridge's unix user can read, at every level. That is a RECORDED, ACCEPTED property of
+# this harness (see the `[[accepted]]` block in bridge/containment-codex.toml), not an
+# oversight, and the remedy if it ever stops being acceptable is unix-user isolation, not a
+# config key.
+#
+# `level = "basic"` is refused at startup on this harness — see the `harness` field above.
+#
+# Arm it with: JESSE_CODEX_TOKEN=...
+# [[models]]
+# id = "codex-native"
+# label = "Codex (native)"
+# kind = "hosted"
+# harness = "codex"                        # a real `codex exec` child
+# base_url = "http://127.0.0.1:8900"       # health probe only on this path; the turn does
+#                                          # not use it — auth and endpoint come from the
+#                                          # subscription login in ~/.codex
+# model = "gpt-5-codex"
+# auth_token_env = "JESSE_CODEX_TOKEN"     # the NAME of the env var, never the token
+# level = "write"                          # OS-sandboxed writes, scoped to the vault
+# price = { in_per_m = 1.25, cached_per_m = 0.13, out_per_m = 10.00 }
+# health = { interval_secs = 30, timeout_secs = 3 }
 
 # ---------------------------------------------------------------------------
 # Vision helpers — let a hosted TEXT model "see" image/PDF attachments
