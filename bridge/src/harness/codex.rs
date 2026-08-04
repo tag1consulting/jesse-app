@@ -226,6 +226,99 @@ fn toml_string(s: &str) -> String {
     out
 }
 
+// ---- The provider seam: a non-OpenAI model on an OpenAI-style endpoint ------------
+//
+// Codex is an OPENAI-STYLE AGENT LOOP, not OpenAI's agent loop, and this is the whole of the
+// difference. Everything above assumes the bridge's own subscription login and OpenAI's own
+// endpoint; everything here is what a model reaches instead when it names one.
+//
+// WHY THIS IS RUST AND NOT CONFIG. Before this, a Codex model's `base_url`, `model` and
+// `auth_token_env` were INERT: auth came from `~/.codex/auth.json`, the endpoint came with
+// it, and `base_url` existed only so the startup health probe had something to POST at. The
+// deployed `codex` entry says exactly that in a comment. So pointing Codex at Kimi could not
+// be a config edit — there was no code that read those fields on the turn path at all. What
+// this adds is the READING of them, once; adding the NEXT OpenAI-style model is a config edit
+// plus one env var for its token, which is the rule the whole effort runs on.
+//
+// NO FOURTH CONFIG KEY. The three fields that were inert become load-bearing, selected by the
+// kind the entry already declares ([`ModelKind::OpenAi`]). `base_url` becomes the provider's
+// API ROOT, `model` becomes the slug the child asks for, and `auth_token_env` names where the
+// bridge reads the key — as it already did for every other model.
+
+/// The provider id the bridge writes its own provider definition under. Bridge-owned, so it
+/// cannot collide with a provider an operator defined: `--ignore-user-config` means the child
+/// starts from no `config.toml` at all and this is the only provider it has ever heard of.
+pub const CODEX_PROVIDER_ID: &str = "jesse";
+
+/// The environment variable the child reads its provider API key from.
+///
+/// **This is why the key is not in the argv**, and that is the point of the name existing at
+/// all rather than the harness passing the token as a `-c` value. A `-c` override is a
+/// command-line ARGUMENT: it is visible in `ps` to every process on the host, it lands in a
+/// crash dump, and Codex echoes its own effective config into its logs. Codex's providers
+/// take an `env_key` naming a variable precisely so the secret travels out of band, and the
+/// harness sets that variable on the child.
+///
+/// A FIXED, bridge-owned name rather than the model's own `auth_token_env`: the harness is
+/// handed a resolved TOKEN by the registry, not the name of the variable it came from, and
+/// inventing a way to thread the name through would buy nothing — the child needs a variable
+/// with the key in it, not a particular spelling of one.
+pub const CODEX_PROVIDER_KEY_ENV: &str = "JESSE_CODEX_PROVIDER_KEY";
+
+/// The wire protocol the provider is declared with.
+///
+/// **`responses`, and there is no longer a choice.** codex-cli 0.146.0 REMOVED
+/// `wire_api = "chat"` — it is a hard config error naming its own removal ("`wire_api =
+/// \"chat\"` is no longer supported"), verified against the pinned binary. So an
+/// OpenAI-style provider is reachable through this harness only if it serves the
+/// **Responses API**; a provider that offers `/v1/chat/completions` and nothing else cannot
+/// be driven by this harness at all, whatever the config says. Fireworks serves
+/// `/inference/v1/responses` (verified live, 2026-08-04), which is what makes Kimi reachable.
+///
+/// Not a config key, deliberately: with one accepted value a key would only let an operator
+/// choose the value that fails.
+const CODEX_WIRE_API: &str = "responses";
+
+/// The `-c` overrides that point a Codex turn at a model's OWN provider, or `None` for the
+/// subscription-OAuth posture (which is every Codex turn that came before this).
+///
+/// `None` — meaning "change nothing" — for anything but a [`ModelKind::OpenAi`] model with a
+/// resolved backend, and both halves of that condition matter. The kind is what distinguishes
+/// the two postures: the DEPLOYED `codex` entry is `kind = "hosted"` and armed with a token
+/// env var (it has to be, or it would not be selectable), so keying off "has a backend" alone
+/// would have silently repointed a running production model at its own health-probe URL. And
+/// an unarmed entry has no key to give the child, so it falls through to the OAuth path and
+/// fails with Codex's own "not logged in" rather than with a provider missing its key.
+///
+/// THE TOKEN IS NOT IN THE RETURNED ARGV. Only the NAME [`CODEX_PROVIDER_KEY_ENV`] is; the
+/// value is put on the child's environment by [`Codex::command`]. Anything that logs, records
+/// or compares this argv — and the containment record does exactly that — is therefore safe
+/// to write down. See the pinning test.
+pub fn codex_provider_args(active: &ActiveModel) -> Option<Vec<String>> {
+    if !matches!(active.kind, ModelKind::OpenAi) {
+        return None;
+    }
+    let (base_url, _token, model) = active.env.as_ref()?;
+    let p = CODEX_PROVIDER_ID;
+    Some(vec![
+        "-c".to_string(),
+        format!("model_providers.{p}.name={}", toml_string(p)),
+        "-c".to_string(),
+        format!("model_providers.{p}.base_url={}", toml_string(base_url)),
+        "-c".to_string(),
+        format!("model_providers.{p}.wire_api={}", toml_string(CODEX_WIRE_API)),
+        "-c".to_string(),
+        format!(
+            "model_providers.{p}.env_key={}",
+            toml_string(CODEX_PROVIDER_KEY_ENV)
+        ),
+        "-c".to_string(),
+        format!("model_provider={}", toml_string(p)),
+        "-c".to_string(),
+        format!("model={}", toml_string(model)),
+    ])
+}
+
 // ---- The MCP server set, translated ---------------------------------------------
 
 /// Translate the bridge's MCP server set — expressed in Claude Code's `{"mcpServers":{…}}`
@@ -314,7 +407,8 @@ pub fn codex_canonical_home(cfg: &Config) -> PathBuf {
         .unwrap_or_else(|| PathBuf::from(&cfg.home).join(".codex"))
 }
 
-/// Build a fresh per-turn `CODEX_HOME`, seeded with a COPY of the canonical credential.
+/// Build a fresh per-turn `CODEX_HOME`, seeded with a COPY of the canonical credential when
+/// `seed_credential` is set.
 ///
 /// This is the mechanism the whole isolation argument rests on, so it does exactly two
 /// things and nothing else: make a directory nothing else writes to, and put a copy of
@@ -324,13 +418,27 @@ pub fn codex_canonical_home(cfg: &Config) -> PathBuf {
 /// A missing canonical credential is NOT an error here: the directory is still made, the
 /// child still spawns, and it fails with Codex's own "not logged in" message, which is a far
 /// better operator signal than this function inventing one.
-pub fn codex_turn_home(cfg: &Config) -> std::io::Result<PathBuf> {
+///
+/// # `seed_credential = false`, and why it NARROWS the posture
+///
+/// A model on its own provider ([`codex_provider_args`]) authenticates from
+/// [`CODEX_PROVIDER_KEY_ENV`] and never reads `auth.json`, so copying the subscription
+/// credential into its home would put a live OAuth token — for a DIFFERENT provider — inside
+/// the reach of a turn that has no use for it. The read surface documented at the top of this
+/// file (`read_agent_credential`'s decoy is reachable in principle, because the credential is
+/// deliberately in the per-turn home) is therefore ABSENT on this path rather than accepted:
+/// there is nothing in the home to read. Verified live — every provider turn in this change's
+/// evidence ran with an empty per-turn home and authenticated fine.
+///
+/// This only ever removes a file from the child's reach, so no containment row it was probed
+/// against can be widened by it.
+pub fn codex_turn_home(cfg: &Config, seed_credential: bool) -> std::io::Result<PathBuf> {
     let base = codex_home_base(cfg);
     std::fs::create_dir_all(&base)?;
     let dir = base.join(uuid::Uuid::new_v4().to_string());
     std::fs::create_dir_all(&dir)?;
     let auth = codex_canonical_home(cfg).join("auth.json");
-    if auth.is_file() {
+    if seed_credential && auth.is_file() {
         let dest = dir.join("auth.json");
         std::fs::copy(&auth, &dest)?;
         // The copy carries a live OAuth credential; keep it owner-only, matching the mode
@@ -356,6 +464,7 @@ pub fn build_codex_args(
     capability: Capability,
     cwd: &Path,
     mcp_args: &[String],
+    provider_args: &[String],
 ) -> Vec<String> {
     let mut args = vec!["exec".to_string()];
 
@@ -388,6 +497,10 @@ pub fn build_codex_args(
 
     args.extend(fill_workspace(codex_capability_args(capability), cwd));
     args.extend_from_slice(mcp_args);
+    // AFTER the containment flags, so a provider definition is visibly not part of the
+    // boundary — and empty for every turn on the subscription login, which is what keeps
+    // that turn's argv byte-for-byte what it was.
+    args.extend_from_slice(provider_args);
 
     // The prompt is positional and LAST, so nothing after it can be read as a flag.
     args.push(prompt.to_string());
@@ -396,10 +509,16 @@ pub fn build_codex_args(
 
 impl Codex {
     /// Build one child `Command`: a fresh per-turn `CODEX_HOME`, the capability's sandbox
-    /// posture, the translated MCP set, piped stdio and `kill_on_drop`.
+    /// posture, the translated MCP set, the model's own provider (if it names one), piped
+    /// stdio and `kill_on_drop`.
     pub fn command(&self, cfg: &Config, req: &TurnRequest<'_>) -> Result<Command, HarnessError> {
         let mcp = codex_mcp_args(CODEX_ID, req.mcp_config)?;
-        let home = codex_turn_home(cfg).map_err(|e| {
+        // `None` for the subscription-OAuth posture, which is every turn that came before
+        // this and still the deployed one. See [`codex_provider_args`].
+        let provider = codex_provider_args(req.active);
+        // A provider turn authenticates from the environment, so it gets a home with NO
+        // credential in it at all — see [`codex_turn_home`].
+        let home = codex_turn_home(cfg, provider.is_none()).map_err(|e| {
             HarnessError::unsupported(CODEX_ID, format!("a per-turn home directory ({e})"))
         })?;
         let mut cmd = Command::new(&cfg.codex_bin);
@@ -409,6 +528,7 @@ impl Codex {
             req.capability,
             &req.cwd,
             &mcp,
+            provider.as_deref().unwrap_or_default(),
         ))
         .current_dir(&req.cwd)
         .env("CODEX_HOME", &home)
@@ -440,6 +560,14 @@ impl Codex {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
+        // The provider's API key, OUT OF BAND. The argv above names the variable; this puts
+        // the value in it, on this child only, so the secret never reaches a process listing,
+        // a log, or the recorded argv. See [`CODEX_PROVIDER_KEY_ENV`].
+        if provider.is_some() {
+            if let Some((_, token, _)) = req.active.env.as_ref() {
+                cmd.env(CODEX_PROVIDER_KEY_ENV, token);
+            }
+        }
         Ok(cmd)
     }
 }
@@ -454,6 +582,13 @@ impl Harness for Codex {
     /// token-level delta for the visible answer at all, only whole items.
     fn streams_text(&self) -> bool {
         false
+    }
+
+    /// TRUE: Codex speaks the OpenAI Responses API, so a [`ModelKind::OpenAi`] model may name
+    /// it. That does not make every Codex model an OpenAI-kind one — the subscription-OAuth
+    /// posture is `hosted` and names no provider; see [`codex_provider_args`].
+    fn speaks_openai_backend(&self) -> bool {
+        true
     }
 
     /// FALSE at `Basic`, true at `Read` and `Write`.
@@ -797,6 +932,7 @@ mod tests {
             Capability::Write,
             Path::new("/srv/vault notes"),
             &[],
+            &[],
         );
         assert!(
             args.iter()
@@ -818,6 +954,7 @@ mod tests {
             None,
             Capability::Write,
             Path::new("/srv/we\"ird"),
+            &[],
             &[],
         );
         let root = args
@@ -843,6 +980,171 @@ mod tests {
             codex_capability_args(Capability::Basic),
             codex_capability_args(Capability::Read)
         );
+    }
+
+    // ---- The provider seam ---------------------------------------------------------
+
+    /// A model on its OWN OpenAI-style provider, as a deploy would declare it.
+    fn openai_model(base_url: &str, model: &str, token: &str) -> ActiveModel {
+        let mut m = ActiveModel::ambient();
+        m.id = "kimi-k3-codex".to_string();
+        m.kind = ModelKind::OpenAi;
+        m.harness = CODEX_ID.to_string();
+        m.level = Capability::Read;
+        m.env = Some((base_url.to_string(), token.to_string(), model.to_string()));
+        m
+    }
+
+    /// A `Config` whose codex homes land in a scratch directory rather than the operator's
+    /// real state dir — these tests BUILD children, and building one makes a home. Returns
+    /// the directory so the test can remove it.
+    fn scratch_config(tag: &str) -> (Config, PathBuf) {
+        let dir = std::env::temp_dir().join(format!("jesse-codex-{tag}-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let mut cfg = test_config();
+        cfg.state_dir = Some(dir.to_string_lossy().into_owned());
+        (cfg, dir)
+    }
+
+    /// THE WHOLE SEAM, in one assertion set: the three fields that were inert become the
+    /// provider, the wire, and the slug — and **the token is not among them**.
+    ///
+    /// The last clause is the one worth failing a build over. A `-c` override is a command
+    /// line argument, visible in `ps` to every process on the host; the key travels in the
+    /// environment and the argv carries only the NAME of the variable. Everything that logs
+    /// or records an argv depends on that being true.
+    #[test]
+    fn an_openai_model_names_its_provider_and_never_its_token() {
+        let m = openai_model(
+            "https://api.example/inference/v1",
+            "accounts/example/models/k3",
+            "sk-super-secret",
+        );
+        let args = codex_provider_args(&m).expect("an openai-kind model names a provider");
+        let joined = args.join(" ");
+
+        assert!(joined.contains("model_provider=\"jesse\""), "{joined}");
+        assert!(
+            joined.contains("model_providers.jesse.base_url=\"https://api.example/inference/v1\""),
+            "{joined}"
+        );
+        assert!(
+            joined.contains("model_providers.jesse.wire_api=\"responses\""),
+            "codex-cli 0.146.0 removed `chat`; `responses` is the only wire left: {joined}"
+        );
+        assert!(
+            joined.contains("model_providers.jesse.env_key=\"JESSE_CODEX_PROVIDER_KEY\""),
+            "{joined}"
+        );
+        assert!(
+            joined.contains("model=\"accounts/example/models/k3\""),
+            "the slug is load-bearing now, not inert: {joined}"
+        );
+        assert!(
+            !joined.contains("sk-super-secret"),
+            "THE TOKEN REACHED THE ARGV, where `ps` can read it: {joined}"
+        );
+    }
+
+    /// THE DEPLOYED POSTURE IS UNTOUCHED, and this is the test that says so.
+    ///
+    /// The live `codex` entry is `kind = "hosted"` and IS armed with a token env var — it has
+    /// to be, or the registry would not call it configured and the picker would not offer it.
+    /// So "does this model have a resolved backend?" is true for it, and keying the seam off
+    /// that alone would have silently repointed a running production model at its own
+    /// health-probe URL. The kind is the discriminator; this pins that it is.
+    #[test]
+    fn an_armed_oauth_codex_model_gets_no_provider_at_all() {
+        for kind in [ModelKind::Hosted, ModelKind::Local, ModelKind::Ambient] {
+            let mut m = openai_model("http://127.0.0.1:9100", "gpt-5-codex", "tok");
+            m.kind = kind;
+            assert_eq!(
+                codex_provider_args(&m),
+                None,
+                "{kind:?} is an Anthropic-surface kind and must keep the OAuth posture"
+            );
+        }
+        // …and an OpenAI-kind entry whose token env var was never set has no key to give the
+        // child, so it falls through to OAuth and fails with Codex's own "not logged in"
+        // rather than with a provider missing its key.
+        let mut unarmed = openai_model("https://api.example/v1", "m", "t");
+        unarmed.env = None;
+        assert_eq!(codex_provider_args(&unarmed), None);
+    }
+
+    /// The argv of a turn on the subscription login is BYTE-FOR-BYTE what it was: an empty
+    /// provider list appends nothing. The seam is additive or it is a regression.
+    #[test]
+    fn the_oauth_argv_is_unchanged_by_the_seam() {
+        let plain = build_codex_args("hi", None, Capability::Read, Path::new("/v"), &[], &[]);
+        assert!(
+            !plain.iter().any(|a| a.contains("model_provider")),
+            "{plain:?}"
+        );
+        assert_eq!(plain.last().map(String::as_str), Some("hi"));
+    }
+
+    /// The provider overrides land BEFORE the prompt — the prompt is positional and must stay
+    /// last, or a `-c` after it is read as the prompt and the real prompt as a stray argument.
+    #[test]
+    fn the_prompt_stays_last_behind_the_provider_overrides() {
+        let m = openai_model("https://api.example/v1", "slug", "tok");
+        let provider = codex_provider_args(&m).expect("a provider");
+        let args = build_codex_args(
+            "what is the cadence?",
+            None,
+            Capability::Read,
+            Path::new("/v"),
+            &[],
+            &provider,
+        );
+        assert_eq!(args.last().map(String::as_str), Some("what is the cadence?"));
+        let last_c = args.iter().rposition(|a| a == "-c").expect("a -c override");
+        assert!(last_c < args.len() - 1, "{args:?}");
+    }
+
+    /// The key travels in the ENVIRONMENT of the child, and the per-turn home a provider turn
+    /// gets holds NO credential — there is nothing in it to read.
+    ///
+    /// The second half is the containment half. The read surface this harness accepts
+    /// (`read_agent_credential`'s decoy is reachable because the OAuth copy is deliberately in
+    /// the home) is ABSENT on the provider path rather than tolerated there.
+    #[test]
+    fn a_provider_turn_carries_the_key_in_the_env_and_no_credential_on_disk() {
+        let (cfg, dir) = scratch_config("provider-env");
+        let m = openai_model("https://api.example/v1", "slug", "sk-super-secret");
+        let req = TurnRequest {
+            prompt: "hi",
+            session_id: None,
+            active: &m,
+            capability: Capability::Read,
+            cwd: std::env::temp_dir(),
+            mcp_config: EMPTY_MCP_CONFIG,
+        };
+        let cmd = Codex.build_turn(&cfg, &req).expect("a provider child");
+
+        let env: std::collections::HashMap<String, String> = cmd
+            .as_std()
+            .get_envs()
+            .filter_map(|(k, v)| Some((k.to_str()?.to_string(), v?.to_str()?.to_string())))
+            .collect();
+        assert_eq!(
+            env.get(CODEX_PROVIDER_KEY_ENV).map(String::as_str),
+            Some("sk-super-secret"),
+            "the child must be able to authenticate: {:?}",
+            env.keys().collect::<Vec<_>>()
+        );
+
+        let home = PathBuf::from(env.get("CODEX_HOME").expect("a per-turn home"));
+        assert!(home.is_dir(), "the home is made even with no credential in it");
+        assert!(
+            !home.join("auth.json").exists(),
+            "a provider turn authenticates from the environment; copying the subscription \
+             credential into its home would put a live OAuth token for a DIFFERENT provider \
+             inside a turn that has no use for it"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // ---- The mid-turn event contract ----------------------------------------------

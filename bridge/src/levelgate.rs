@@ -294,6 +294,35 @@ pub fn validate_model_config_with_env(
             continue; // the level checks below would be meaningless against no harness
         };
 
+        // 2b. A model whose BACKEND SURFACE the harness does not speak. `kind = "openai"`
+        //     means the base_url answers `/v1/responses`, and a harness that speaks
+        //     Anthropic's `/v1/messages` would hand its child that URL as
+        //     `ANTHROPIC_BASE_URL` — producing a model the picker shows as healthy (its
+        //     probe hits the OpenAI path and passes) whose every turn 404s. Refused here
+        //     rather than left to fail per turn, and asked of the HARNESS rather than
+        //     hardcoding an id, for the same reason item 3 asks `expresses`.
+        if matches!(m.kind, ModelKind::OpenAi) && !harness.speaks_openai_backend() {
+            errors.push(ConfigError::for_model(
+                &m.id,
+                format!(
+                    "kind 'openai' names a backend on the OpenAI Responses surface, which \
+                     harness '{}' does not speak — it drives its child over Anthropic's \
+                     /v1/messages. Run this model under a harness that speaks the OpenAI \
+                     surface (registered: {}), or declare it 'hosted'/'local' and point \
+                     base_url at an Anthropic-surface endpoint.",
+                    m.harness,
+                    cfg.harnesses
+                        .ordered()
+                        .iter()
+                        .filter(|h| h.speaks_openai_backend())
+                        .map(|h| h.id())
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                ),
+            ));
+            continue;
+        }
+
         // 3. A level the harness CANNOT EXPRESS. Checked before the record, and worded
         //    differently on purpose: this is not a gate the harness failed, it is a posture
         //    the harness does not have, so there is nothing to go fix and no battery to
@@ -789,6 +818,54 @@ mod tests {
         let cfg = cfg_with_codex_model("codex-mini", Capability::Read);
         let errors = validate(&cfg, &[], CONTAINMENT_RECORDS);
         assert!(errors.is_empty(), "{errors:?}");
+    }
+
+    /// A MODEL ON A SURFACE ITS HARNESS DOES NOT SPEAK IS REFUSED AT STARTUP.
+    ///
+    /// The failure this prevents is the nastiest shape a model config has: `kind = "openai"`
+    /// on the Claude Code harness passes its HEALTH PROBE (the probe posts at the OpenAI path
+    /// and gets a 200), so the picker shows the model green — and then every turn 404s,
+    /// because the child was handed an `ANTHROPIC_BASE_URL` that serves `/v1/responses` and
+    /// nothing else. Green in the switcher, dead on arrival, with nothing tying the two
+    /// together.
+    #[test]
+    fn an_openai_kind_model_is_refused_on_a_harness_that_speaks_anthropic() {
+        let mut cfg = cfg_with_model("kimi-k3-codex", CLAUDE_CODE_ID, Capability::Read);
+        cfg.harnesses = Arc::new(HarnessRegistry::new(vec![Box::new(Codex)]));
+        if let Some(m) = cfg
+            .model_registry
+            .models
+            .iter_mut()
+            .find(|m| m.id == "kimi-k3-codex")
+        {
+            m.kind = ModelKind::OpenAi;
+        }
+        let errors = validate(&cfg, &[], CONTAINMENT_RECORDS);
+        let e = errors
+            .iter()
+            .find(|e| e.model.as_deref() == Some("kimi-k3-codex"))
+            .expect("an openai-kind model on claude-code must be refused");
+        assert!(e.message.contains("does not speak"), "{e}");
+        assert!(
+            e.message.contains(CODEX_ID),
+            "the message must name a harness that WOULD serve it: {e}"
+        );
+
+        // The same model on the harness that speaks the surface starts cleanly — the gate
+        // refuses a pairing, not a kind.
+        let mut ok = cfg_with_codex_model("kimi-k3-codex", Capability::Read);
+        if let Some(m) = ok
+            .model_registry
+            .models
+            .iter_mut()
+            .find(|m| m.id == "kimi-k3-codex")
+        {
+            m.kind = ModelKind::OpenAi;
+        }
+        assert!(
+            validate(&ok, &[], CONTAINMENT_RECORDS).is_empty(),
+            "openai-kind on codex is exactly the pairing this change adds"
+        );
     }
 
     /// A harness with no embedded record is a different fault from one whose record has no
