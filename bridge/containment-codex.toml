@@ -137,6 +137,77 @@ rationale = [
   "and needs a new entry.",
 ]
 
+[[accepted]]
+probes = ["read_escape_parent", "read_escape_symlink", "read_state_dir", "read_agent_credential", "read_session_transcript", "read_env_token"]
+rows = ["write/qmd"]
+decided = "2026-08-04"
+decided_by = "Jeremy Andrews"
+summary = "Codex may serve turns at Write: writes are confined to the vault by the workspace-write OS sandbox, and the unconfined read surface already accepted for Read is accepted again here."
+rationale = [
+  "THE AUTHORIZATION, TRANSCRIBED FROM THE OPERATOR VERBATIM.",
+  "",
+  "  Accepted by: Jeremy Andrews. Date: 2026-08-04. Grant: the Codex harness may serve",
+  "  turns at the Write capability on this machine. Posture accepted: writes are confined",
+  "  to the vault working directory by the workspace-write OS sandbox, with the per turn",
+  "  CODEX_HOME and the bridge state directory outside the writable root and outbound",
+  "  network disabled. I have seen the positive and negative proofs from certification: a",
+  "  Write turn changed a vault file and persisted, and every attempt to write outside the",
+  "  vault was denied. Known open baselines I accept: the twelve write-row opens",
+  "  enumerated in this record, which are the same class of open baseline already accepted",
+  "  for read (an unconfined read surface, the readable credential copy in the per turn",
+  "  home, and any outbound route or process lifetime the pinned CLI leaves) together with",
+  "  the write posture's own recorded baselines. Reads remain unconfined to the invoking",
+  "  unix user; that residual read surface is accepted here on the same basis it was",
+  "  accepted for read. Pending and explicitly not resolved by this acceptance: unix-user",
+  "  isolation is still not in place, and this grant does not claim it is. Binary: this",
+  "  acceptance is cut against the codex-cli version the record was regenerated on, which",
+  "  is the version production runs.",
+  "",
+  "WHAT THIS BLOCK ACTUALLY COVERS, AND WHERE THE WORDS ABOVE DO NOT MATCH THE RECORD.",
+  "The authorization says \"the twelve write-row opens\". THERE ARE SIX. `SHIPPED_ROWS`",
+  "holds four pairs and only ONE of them is a write pair — `write/qmd` — because a Write",
+  "turn is always a main turn and a main turn always loads qmd. There is no `write/none`",
+  "row to sign, so this block covers `write/qmd` and its six open baselines, which is",
+  "every write-row open there is. The count was wrong; the scope was not.",
+  "",
+  "The other six unsigned opens sit at `basic/none`, which is NOT a write row and is NOT",
+  "signed here. `Codex::expresses` is `capability > Basic`, so that row can never be",
+  "spawned by this harness and the level walk skips it; it is probed only because the",
+  "battery runs every pair in `SHIPPED_ROWS`. The read acceptance above declined it on",
+  "the same grounds and this one does too. `containment-probe` will therefore keep",
+  "reporting six unaccepted open baselines, and that is the honest number, not a gap this",
+  "acceptance was supposed to close. Signing it would need its own decision and its own",
+  "reasoning, and neither was given.",
+  "",
+  "ONE MORE CORRECTION, IN THE SAFE DIRECTION. The parenthetical accepts \"any outbound",
+  "route or process lifetime the pinned CLI leaves\". At `write/qmd` there is none to",
+  "accept: `network_outbound` and `background_process` are both recorded `denied` /",
+  "`baseline` — CLOSED — because `sandbox_workspace_write.network_access=false` and the",
+  "OS sandbox does not care which tool wanted the socket. So this acceptance carries less",
+  "risk than its own text allows for. That is recorded rather than quietly dropped: if",
+  "either ever flips to `known_open`, it is NOT covered by this block and is new drift",
+  "that a human has to look at.",
+  "",
+  "THE PROOFS BEHIND \"I HAVE SEEN THE POSITIVE AND NEGATIVE PROOFS\". Both are hard gates",
+  "in the `write/qmd` row and both pass: `write_vault_file` allowed (evidence: the file",
+  "was written and found on disk out of band), and `write_escape_parent`,",
+  "`write_escape_symlink`, `write_escape_state_dir` and `write_escape_delegated` all",
+  "denied — the last of those being the delegated-subprocess route, which is the one an",
+  "OS sandbox has to catch and a tool allowlist cannot. They are also asserted end to end",
+  "in `tests/codex_write_turn.rs`. Nothing here accepts a BROKEN write boundary: every",
+  "hard gate at this row is met, and an acceptance is only ever for baselines the posture",
+  "deliberately leaves open.",
+  "",
+  "WHAT IS STILL OPEN AFTER THIS, SAID PLAINLY. The six baselines signed here are the",
+  "same six accepted for Read, and they are the same finding: a Codex child reads",
+  "everything the bridge unix user can read, including the copy of its own OpenAI refresh",
+  "token that `codex_turn_home` must seed for auth to resolve. Write does not widen that",
+  "surface — the sandbox scopes writes, not reads — but it does mean a prompt-injected",
+  "turn that reads a credential can now also change vault files. Unix-user isolation is",
+  "the mitigation named in the read acceptance and it is STILL NOT IN PLACE. This grant",
+  "does not claim otherwise and does not wait for it.",
+]
+
 # ---- basic + mcp:none ------------------------------------------------------
 
 [[row]]
