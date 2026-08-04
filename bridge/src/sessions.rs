@@ -1263,6 +1263,143 @@ pub async fn jesse_conversation_flags(
     })))
 }
 
+// ---- The cross-turn tool-id guard ---------------------------------------------
+//
+// WHY THIS EXISTS, and why it is a DETECTOR rather than a fix.
+//
+// Bridge 0.44.0 recorded that Kimi K3 was armed but unusable for tool-driven turns: the
+// provider minted `tool_use` ids from a counter that RESTARTED every turn, so the second
+// turn of a conversation re-issued an id the first had already spent and the pairing the
+// API needs came apart. That defect is GONE — measured 2026-08-04 against the pinned
+// claude 2.1.220 and against 2.1.221, three resumed turns, six sequential same-tool calls,
+// ids `Read_0`…`Read_5` with no reuse and every `tool_result` correctly paired.
+//
+// But note WHERE the fix lives. On one binary, with one set of flags, the id FORMAT differs
+// by model — Kimi mints `Read_<n>`, GLM mints `chatcmpl-tool-<hash>` — so the ids come from
+// the PROVIDER, not from the agent CLI and not from anything in this repository. The counter
+// is now conversation-scoped rather than per-turn (it continues across process boundaries on
+// `--resume`), which is a real fix and not a cosmetic one. It is also a fix nobody here
+// controls and nobody upstream promised, and a silent regression of it would look like
+// "tool turns on this model mysteriously stopped working".
+//
+// So the repo owns the DETECTION. A rewriting proxy was considered and rejected: it would
+// put a live man-in-the-middle in the message path of every turn to renumber ids that are
+// already unique, which is new failure surface bought against a defect that does not
+// currently reproduce. What this does instead is name the regression the moment it happens,
+// out of material the bridge already has on disk.
+//
+// NOT A GATE. A collision is logged, never fatal: by the time it is visible the turn has
+// already produced whatever it produced, and failing it would turn a provider's bad day
+// into a bridge outage.
+
+/// Every `tool_use` id in one session transcript, in file order, with duplicates KEPT —
+/// the caller is looking for exactly those.
+///
+/// Deliberately a byte/substring scan rather than a `serde_json` parse of each line: a
+/// transcript is one JSON object per line and most lines carry no tool call at all, so
+/// parsing every one to find a field that is usually absent is work proportional to the
+/// whole conversation for an answer that lives in a few lines of it.
+pub fn transcript_tool_use_ids(bytes: &[u8]) -> Vec<String> {
+    const MARK: &str = r#""type":"tool_use""#;
+    const ID: &str = r#""id":""#;
+    let mut out = Vec::new();
+    let Ok(text) = std::str::from_utf8(bytes) else {
+        return out;
+    };
+    for line in text.lines() {
+        // A single assistant message can hold SEVERAL `tool_use` blocks (parallel calls),
+        // so every occurrence on the line is walked, not just the first.
+        let mut from = 0usize;
+        while let Some(rel) = line[from..].find(MARK) {
+            let at = from + rel + MARK.len();
+            from = at;
+            // The `id` belongs to this block only if it arrives before the next block does.
+            let Some(id_rel) = line[at..].find(ID) else {
+                break;
+            };
+            if let Some(next) = line[at..].find(MARK) {
+                if next < id_rel {
+                    continue; // this block carried no id; move on to the next one
+                }
+            }
+            let start = at + id_rel + ID.len();
+            let Some(end_rel) = line[start..].find('"') else {
+                break;
+            };
+            out.push(line[start..start + end_rel].to_string());
+            from = start + end_rel;
+        }
+    }
+    out
+}
+
+/// The ids that appear MORE THAN ONCE, each named once, in first-seen order.
+///
+/// Order is stable rather than incidental because this string reaches an operator's log and
+/// a set's iteration order would make the same finding read differently on every run.
+pub fn duplicate_tool_use_ids(ids: &[String]) -> Vec<String> {
+    let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    let mut dup_once: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    for id in ids {
+        if !seen.insert(id.as_str()) && dup_once.insert(id.as_str()) {
+            out.push(id.clone());
+        }
+    }
+    out
+}
+
+/// Check a just-finished turn's session transcript for `tool_use` ids spent twice, and say
+/// so LOUDLY if any were. Returns the offending ids (empty when clean, and empty whenever
+/// the check could not run — an unreadable transcript is not evidence of a collision).
+///
+/// Called for NON-AMBIENT models only, which is where the risk actually is: the ambient
+/// Anthropic surface mints `toolu_<random>` and cannot collide by construction, so paying a
+/// transcript read on every ambient turn would buy nothing. A harness that keeps no
+/// transcript on disk (Codex) has nothing to read and is skipped by the same token — its
+/// provider mints ids inside its own Responses contract, where the defect cannot arise.
+///
+/// EVENTUALLY CONSISTENT, and one-directional in the safe sense. The check runs when the
+/// turn's terminal `result` arrives, and the CLI's last writes to the transcript may not
+/// have landed yet — so a collision minted in the closing moments of a turn can be missed
+/// HERE and caught on the next turn, when those lines are certainly on disk. What it cannot
+/// do is invent one: every id it compares was actually written by the CLI.
+///
+/// The read is the whole file, once per non-ambient turn. That is deliberately not
+/// optimised: a bounded prefix would silently stop checking exactly the long conversations
+/// where a restarting counter has had the most chances to collide, and the cost is a file
+/// read beside a turn that just spent seconds in a language model.
+pub fn report_tool_id_collisions(
+    cfg: &Config,
+    harness: &dyn Harness,
+    model_id: &str,
+    session_id: &str,
+) -> Vec<String> {
+    let Some(dir) = harness.transcript_dir(cfg) else {
+        return Vec::new();
+    };
+    if !is_plain_session_component(session_id) {
+        return Vec::new();
+    }
+    let path = dir.join(format!("{session_id}.jsonl"));
+    let Ok(bytes) = std::fs::read(&path) else {
+        return Vec::new();
+    };
+    let dupes = duplicate_tool_use_ids(&transcript_tool_use_ids(&bytes));
+    if !dupes.is_empty() {
+        eprintln!(
+            "jesse-bridge: WARNING model '{model_id}' re-used {} tool_use id(s) within session \
+             {session_id} ({}). The provider is minting ids that collide ACROSS TURNS — the \
+             defect recorded for Kimi K3 in bridge 0.44.0. Tool-driven turns on this model \
+             will fail until the provider mints unique ids; the model is still selectable and \
+             non-tool turns are unaffected.",
+            dupes.len(),
+            dupes.join(", "),
+        );
+    }
+    dupes
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2010,4 +2147,158 @@ mod tests {
         f.set_modified(UNIX_EPOCH + Duration::from_secs(secs))
             .unwrap();
     }
+
+    // ---- The cross-turn tool-id guard ----------------------------------------
+
+    /// One transcript line as the CLI writes it: an assistant message whose content is a
+    /// list of blocks. Shaped from real `stream-json` captured off claude 2.1.220 talking
+    /// to Fireworks on 2026-08-04, so the guard is written against the format that actually
+    /// lands on disk rather than an idealised one.
+    fn assistant_line(ids: &[&str]) -> String {
+        let blocks: Vec<String> = ids
+            .iter()
+            .map(|id| {
+                format!(
+                    r#"{{"type":"tool_use","id":"{id}","name":"Read","input":{{"file_path":"/x"}}}}"#
+                )
+            })
+            .collect();
+        format!(
+            r#"{{"type":"assistant","message":{{"role":"assistant","content":[{}]}}}}"#,
+            blocks.join(",")
+        )
+    }
+
+    #[test]
+    fn the_ids_measured_on_the_pinned_cli_carry_no_collision() {
+        // VERBATIM from the live probe: three resumed turns against Kimi K3 through
+        // claude 2.1.220, two sequential Reads each. This is the shape the 0.44.0 defect
+        // broke, and it is the regression test for the finding that it no longer does.
+        let transcript = [
+            assistant_line(&["Read_0"]),
+            assistant_line(&["Read_1"]),
+            assistant_line(&["Read_2"]),
+            assistant_line(&["Read_3"]),
+            assistant_line(&["Read_4"]),
+            assistant_line(&["Read_5"]),
+        ]
+        .join("\n");
+        let ids = transcript_tool_use_ids(transcript.as_bytes());
+        assert_eq!(ids, ["Read_0", "Read_1", "Read_2", "Read_3", "Read_4", "Read_5"]);
+        assert!(duplicate_tool_use_ids(&ids).is_empty());
+    }
+
+    #[test]
+    fn the_0_44_0_defect_is_what_the_guard_catches() {
+        // The recorded failure: a per-turn counter that RESTARTS, so turn two re-issues the
+        // ids turn one already spent. Both are named, once each, in first-seen order.
+        let transcript = [
+            assistant_line(&["Read_0"]),
+            assistant_line(&["Read_1"]),
+            // …resume; the counter went back to zero.
+            assistant_line(&["Read_0"]),
+            assistant_line(&["Read_1"]),
+        ]
+        .join("\n");
+        let ids = transcript_tool_use_ids(transcript.as_bytes());
+        assert_eq!(duplicate_tool_use_ids(&ids), ["Read_0", "Read_1"]);
+    }
+
+    #[test]
+    fn several_tool_calls_on_one_line_are_all_seen() {
+        // A parallel call puts several `tool_use` blocks in ONE assistant message. Reading
+        // only the first id per line would miss a collision between them entirely.
+        let line = assistant_line(&["Read_0", "Read_1", "Read_0"]);
+        let ids = transcript_tool_use_ids(line.as_bytes());
+        assert_eq!(ids, ["Read_0", "Read_1", "Read_0"]);
+        assert_eq!(duplicate_tool_use_ids(&ids), ["Read_0"]);
+    }
+
+    #[test]
+    fn glms_hashed_ids_and_the_ambient_surfaces_uuids_never_look_like_a_collision() {
+        // The two id shapes that are unique BY CONSTRUCTION: Fireworks mints
+        // `chatcmpl-tool-<hash>` for GLM (captured live 2026-08-04) and the ambient
+        // Anthropic surface mints `toolu_<random>`. Neither must ever trip the guard.
+        let ids = transcript_tool_use_ids(
+            [
+                assistant_line(&["chatcmpl-tool-91a5f881ca01aa57"]),
+                assistant_line(&["chatcmpl-tool-80dfb95e141f9b40"]),
+                assistant_line(&["toolu_01A09q90qw90lkasdjl"]),
+            ]
+            .join("\n")
+            .as_bytes(),
+        );
+        assert_eq!(ids.len(), 3);
+        assert!(duplicate_tool_use_ids(&ids).is_empty());
+    }
+
+    #[test]
+    fn a_transcript_with_no_tool_calls_costs_nothing_and_finds_nothing() {
+        // The common case: most lines of a transcript carry no tool call at all.
+        let plain = concat!(
+            r#"{"type":"user","message":{"role":"user","content":"hello"}}"#,
+            "\n",
+            r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"hi"}]}}"#
+        );
+        assert!(transcript_tool_use_ids(plain.as_bytes()).is_empty());
+        // …and a truncated / non-UTF8 file is not evidence of anything.
+        assert!(transcript_tool_use_ids(&[0xff, 0xfe]).is_empty());
+    }
+
+    #[test]
+    fn a_real_collision_is_actually_reported_from_a_transcript_on_disk() {
+        // End to end through the FILE path, not just the pure scanner: a detector whose
+        // reporting arm has never run is a detector nobody has seen work.
+        // A SCRATCH home and vault, never the real ones: `test_config` captures the live
+        // $HOME, and a test that wrote transcripts under it would litter the developer's
+        // own `~/.claude/projects`.
+        let home = std::env::temp_dir().join(format!("jesse-home-{}", random_hex()));
+        let mut cfg = crate::testutil::test_config();
+        cfg.home = home.to_string_lossy().into_owned();
+        cfg.vault = "/vault/toolid".to_string();
+        let dir = ClaudeCode
+            .transcript_dir(&cfg)
+            .expect("claude-code keeps transcripts");
+        std::fs::create_dir_all(&dir).expect("scratch projects dir");
+        let sid = "11111111-2222-3333-4444-555555555555";
+        // Turn one spends Read_0/Read_1; turn two re-issues them — the 0.44.0 shape.
+        let body = [
+            assistant_line(&["Read_0"]),
+            assistant_line(&["Read_1"]),
+            assistant_line(&["Read_0"]),
+            assistant_line(&["Read_1"]),
+        ]
+        .join("\n");
+        std::fs::write(dir.join(format!("{sid}.jsonl")), body).expect("write transcript");
+
+        let dupes = report_tool_id_collisions(&cfg, &ClaudeCode, "kimi-k3", sid);
+        assert_eq!(dupes, ["Read_0", "Read_1"]);
+
+        // …and the same transcript without the reuse reports nothing.
+        let clean = [assistant_line(&["Read_0"]), assistant_line(&["Read_1"])].join("\n");
+        let sid2 = "66666666-7777-8888-9999-000000000000";
+        std::fs::write(dir.join(format!("{sid2}.jsonl")), clean).expect("write transcript");
+        assert!(report_tool_id_collisions(&cfg, &ClaudeCode, "kimi-k3", sid2).is_empty());
+
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn a_missing_transcript_is_not_reported_as_a_collision() {
+        // An unreadable file must come back CLEAN, never as a finding: the guard's whole
+        // value is that its warning means something.
+        let mut cfg = crate::testutil::test_config();
+        cfg.home = std::env::temp_dir()
+            .join(format!("jesse-home-{}", random_hex()))
+            .to_string_lossy()
+            .into_owned();
+        let dupes = report_tool_id_collisions(
+            &cfg,
+            &crate::harness::ClaudeCode,
+            "kimi-k3",
+            "no-such-session-00000000",
+        );
+        assert!(dupes.is_empty());
+    }
+
 }

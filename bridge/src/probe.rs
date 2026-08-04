@@ -1569,6 +1569,16 @@ pub struct BatteryOptions {
     /// harness generalises to another — so this is part of the run's identity, not a
     /// convenience. Defaults to [`CLAUDE_CODE_ID`].
     pub harness: String,
+    /// WHICH MODEL probes, or `None` for the ambient default.
+    ///
+    /// Part of the run's identity for the same reason `harness` is. The OS-sandbox posture a
+    /// row records is model-INDEPENDENT — the flags are the flags — but the rows that
+    /// describe how a TURN behaves are not: whether a capable tool stood at the root and went
+    /// untried, whether the child retried after a refusal, whether it found the delegation
+    /// route at all are all things a different model does differently. A record probed by one
+    /// model therefore vouches for the sandbox generally and for that model's turn behavior
+    /// specifically, which is why [`BatteryResults::model`] writes the name down.
+    pub model: Option<ActiveModel>,
 }
 
 impl Default for BatteryOptions {
@@ -1579,6 +1589,7 @@ impl Default for BatteryOptions {
             timeout_secs: DEFAULT_PROBE_TIMEOUT_SECS,
             keep_scratch: false,
             harness: CLAUDE_CODE_ID.to_string(),
+            model: None,
         }
     }
 }
@@ -1716,7 +1727,9 @@ async fn run_row(
     cfg.vault = env.vault.display().to_string();
     cfg.state_dir = Some(env.state.display().to_string());
 
-    let ambient = ActiveModel::ambient();
+    // The model this row is probed AS. `None` is the ambient default, which is what every
+    // run before the `--model` seam used and what the claude-code record was taken with.
+    let probing_model = opts.model.clone().unwrap_or_else(ActiveModel::ambient);
     let mut results = Vec::new();
     let mut root_tools = Vec::new();
     let mut mcp_servers = Vec::new();
@@ -1747,7 +1760,7 @@ async fn run_row(
             let req = TurnRequest {
                 prompt: &prompt,
                 session_id: None,
-                active: &ambient,
+                active: &probing_model,
                 capability: row.capability,
                 cwd: env.vault.clone(),
                 mcp_config: row.mcp.config(),
@@ -1975,6 +1988,9 @@ pub async fn run_battery(base: &Config, opts: &BatteryOptions) -> Result<RunOutc
             &cfg.claude_bin
         }),
         bridge_version: env!("CARGO_PKG_VERSION").to_string(),
+        // `None` for an ambient run, so a record taken without `--model` renders exactly as
+        // it did before the seam existed.
+        model: opts.model.as_ref().map(|m| m.id.clone()),
         recorded: today(),
         gate: gate.to_string(),
         rows,

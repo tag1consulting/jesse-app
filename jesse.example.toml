@@ -97,9 +97,20 @@ diet_keywords_extra = [
 #   2. the legacy `JESSE_MODEL_GLM_* / _KIMI_* / _LOCAL_*` env triples (still supported).
 #   3. these `[[models]]` entries.
 #
-# `glm-5.2` and `kimi-k3` DEFAULT their base_url + slug to the live Fireworks values, so
-# each is armed by exporting ONE var — `JESSE_MODEL_GLM_AUTH_TOKEN` /
+# `glm-5.2`, `kimi-k3` and `kimi-k3-codex` DEFAULT their base_url + slug to the live
+# Fireworks values, so each is armed by exporting ONE var — `JESSE_MODEL_GLM_AUTH_TOKEN` /
 # `JESSE_MODEL_KIMI_AUTH_TOKEN`. `local` has no defaults: all three vars are required.
+#
+# KIMI K3 IS REGISTERED TWICE, ON PURPOSE, and the two are not one model in two costumes:
+#   * `kimi-k3`        — the ANTHROPIC surface (`/v1/messages`) on a claude-code child,
+#                        contained by the tool allowlist + strict MCP recorded in
+#                        bridge/containment.toml.
+#   * `kimi-k3-codex`  — the OPENAI surface (`/v1/responses`) on a real `codex exec` child,
+#                        contained by the OS sandbox recorded in
+#                        bridge/containment-codex.toml, reaching the vault via the shell.
+# K3 is natively an OpenAI-style model, so the Codex entry is the RECOMMENDED path for it;
+# the Anthropic entry stays first-class. `JESSE_MODEL_KIMI_AUTH_TOKEN` (one Fireworks key)
+# arms BOTH — set `JESSE_MODEL_KIMI_CODEX_AUTH_TOKEN` to give them separate keys.
 # Both default decks are overridable per model via `JESSE_MODEL_<NAME>_PRICE_{IN,CACHED,OUT}`.
 #
 # Adding a model is a PURE CONFIG EDIT here plus ONE env var for its token — no bridge
@@ -265,13 +276,16 @@ diet_keywords_extra = [
 #   * it serves the Responses API at <base_url>/responses, and
 #   * it serves /chat/completions for the health probe (or set health.path explicitly).
 #
-# `kimi-k3` already exists as an env-triple model on the Anthropic surface. This is a
-# SECOND, separately-selectable entry with its own id — the two can coexist in the picker,
-# and they are not the same model in two costumes: this one reaches the vault through the
-# shell under a read-only OS sandbox and is governed by bridge/containment-codex.toml,
-# while the Anthropic-surface one is governed by the Claude Code MCP allowlist.
+# `kimi-k3-codex` IS NOW A BUILT-IN ENTRY and needs no block here at all: exporting
+# `JESSE_MODEL_KIMI_AUTH_TOKEN` arms it exactly as it arms its Anthropic-surface sibling.
+# The block below is what that built-in is EQUIVALENT TO — write it out only to override a
+# field (a different slug, its own key, `level = "write"`, a different deck).
 #
-# Arm it with: JESSE_MODEL_KIMI_AUTH_TOKEN=fw_...   (the same Fireworks key)
+# NOTE THE `/v1` ON base_url. It is the API ROOT the codex harness appends `/responses` to,
+# where the Anthropic-surface sibling's base_url is a host claude-code appends
+# `/v1/messages` to. Swapping the two yields a model that is armed, correct-looking and
+# permanently unreachable.
+#
 # [[models]]
 # id = "kimi-k3-codex"
 # label = "Kimi K3 (Codex)"

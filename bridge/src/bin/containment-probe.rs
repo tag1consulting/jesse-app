@@ -61,7 +61,8 @@ fn usage() -> ! {
          \x20 --probes <id,...>  only these probes. Never with --write.\n\
          \x20 --timeout <secs>   per-probe timeout (default 300)\n\
          \x20 --keep             keep the scratch trees for inspection\n\
-         \x20 --harness <id>     which harness to probe (claude-code | codex)\n"
+         \x20 --harness <id>     which harness to probe (claude-code | codex)\n\
+         \x20 --model <id>       probe AS this registry model (default: the ambient one)\n"
     );
     std::process::exit(2)
 }
@@ -72,6 +73,8 @@ async fn main() {
     let mut opts = BatteryOptions::default();
     let mut write = false;
     let mut show = false;
+    // Resolved AFTER `Config::from_env()` below, because the registry it names lives there.
+    let mut model_id: Option<String> = None;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -81,6 +84,10 @@ async fn main() {
             "--harness" => {
                 i += 1;
                 opts.harness = args.get(i).cloned().unwrap_or_else(|| usage());
+            }
+            "--model" => {
+                i += 1;
+                model_id = Some(args.get(i).cloned().unwrap_or_else(|| usage()));
             }
             "--rows" => {
                 i += 1;
@@ -133,13 +140,45 @@ async fn main() {
     }
 
     let cfg = Config::from_env();
+
+    // Resolve `--model` against the SAME registry the serving bridge builds, and demand it be
+    // CONFIGURED. An unarmed entry has no credential to give the child, so every probe would
+    // come back inconclusive and the run would record a battery that proved nothing — the
+    // exact lie the `--write` guard above exists to stop, arriving by a different door.
+    if let Some(id) = &model_id {
+        let Some(m) = cfg.model_registry.get(id) else {
+            eprintln!(
+                "containment-probe: unknown model '{id}' — it must be a registered entry \
+                 (a [[models]] block or a JESSE_MODEL_* triple)."
+            );
+            std::process::exit(2);
+        };
+        if !m.configured {
+            eprintln!(
+                "containment-probe: model '{id}' is registered but NOT configured (its token \
+                 env var is unset), so every probe would run without a credential and prove \
+                 nothing. Arm it and re-run."
+            );
+            std::process::exit(2);
+        }
+        if m.harness != opts.harness {
+            eprintln!(
+                "containment-probe: model '{id}' runs on harness '{}' but this run probes \
+                 '{}' — a record must be written by a model the harness actually serves.",
+                m.harness, opts.harness
+            );
+            std::process::exit(2);
+        }
+        opts.model = Some(jesse_bridge::ActiveModel::from_registry(m));
+    }
+
     let bin = if opts.harness == jesse_bridge::CODEX_ID {
         &cfg.codex_bin
     } else {
         &cfg.claude_bin
     };
     eprintln!(
-        "containment-probe: {} rows x {} probes against {} ({}) [harness {}]",
+        "containment-probe: {} rows x {} probes against {} ({}) [harness {}, model {}]",
         opts.rows.len(),
         opts.probes
             .as_ref()
@@ -148,6 +187,10 @@ async fn main() {
         bin,
         jesse_bridge::probe_binary_version(bin),
         opts.harness,
+        opts.model
+            .as_ref()
+            .map(|m| m.id.as_str())
+            .unwrap_or("the ambient default"),
     );
 
     let outcome = match run_battery(&cfg, &opts).await {
@@ -268,6 +311,19 @@ async fn main() {
             "\ncontainment-probe: the record was taken against {} and this is {} — the battery \
              is re-run on every binary version bump.",
             recorded.binary_version, fresh.binary_version
+        );
+    }
+    // Said out loud for the same reason as the binary version: the turn-behavior half of a
+    // row is model-dependent, so comparing a K3 run against an ambient-probed record is
+    // comparing two different questions. Not a failure by itself — the drift list below is
+    // still the verdict — but a reader must not have to infer it.
+    if recorded.model != fresh.model {
+        let name = |m: &Option<String>| m.clone().unwrap_or_else(|| "the ambient default".into());
+        eprintln!(
+            "\ncontainment-probe: the record was probed by {} and this run by {} — the OS \
+             boundary is model-independent, but which tools a child TRIED is not.",
+            name(&recorded.model),
+            name(&fresh.model)
         );
     }
     let drift = compare_results(&recorded, fresh);
