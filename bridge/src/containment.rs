@@ -438,6 +438,21 @@ pub struct BatteryResults {
     pub binary_version: String,
     /// The bridge crate version at record time.
     pub bridge_version: String,
+    /// The registry id of the model that PROBED this record, or `None` for the ambient
+    /// default (which is what every record taken before the `--model` seam was written by).
+    ///
+    /// The sandbox posture a row describes is model-independent, but the rows that describe
+    /// how a TURN behaved are not — an untried capable tool, a child that gave up after one
+    /// refusal, a delegation route never found are all model behavior. So a record vouches
+    /// for the OS boundary generally and for THIS model's turn behavior specifically, and a
+    /// reader cannot tell which without the name being written down.
+    ///
+    /// OPTIONAL, and deliberately NOT a [`RESULTS_SCHEMA`] bump: the key is purely additive,
+    /// an older record simply lacks it, and there is no way to MIS-READ its absence (absent
+    /// means ambient). Bumping the schema would instead make every existing record a
+    /// parse-time failure at startup, refusing levels that were correctly recorded.
+    #[serde(default)]
+    pub model: Option<String>,
     /// `YYYY-MM-DD` the record was taken.
     pub recorded: String,
     /// `pass` only when every row passes — a HUMAN-FACING SUMMARY, read by nothing.
@@ -650,6 +665,13 @@ pub fn render_results(r: &BatteryResults) -> String {
          # the levels are one vocabulary but the levers behind them are not. The `harness`\n\
          # key below names whose record this is, and the build embeds one file per harness.\n\
          #\n\
+         # THE `model` KEY NAMES WHO PROBED. The OS-sandbox posture is model-independent — the\n\
+         # flags are the flags — but the rows describing how a TURN BEHAVED are not. Whether a\n\
+         # capable tool stood at the root and went untried, whether the child retried after a\n\
+         # refusal, whether it ever found the delegation route: all model behavior. So this\n\
+         # record vouches for the boundary generally and for THAT model's turn behavior\n\
+         # specifically. An ABSENT `model` key means the ambient default probed it.\n\
+         #\n\
          # THE FILE-LEVEL `gate` KEY IS A HUMAN-FACING SUMMARY. Nothing reads it. The startup\n\
          # gate walks the ROWS (`highest_passing_level`): a level is grantable when every MCP\n\
          # set recorded at it met every hard gate, so a record whose overall gate is `fail`\n\
@@ -695,6 +717,11 @@ pub fn render_results(r: &BatteryResults) -> String {
         "bridge_version = {}\n",
         toml_string(&r.bridge_version)
     ));
+    // Written only when a model was named: an ABSENT key means the ambient default, and
+    // rendering `model = "opus"` for it would silently rewrite every pre-seam record.
+    if let Some(model) = &r.model {
+        s.push_str(&format!("model = {}\n", toml_string(model)));
+    }
     s.push_str(&format!("recorded = {}\n", toml_string(&r.recorded)));
     s.push_str(&format!("gate = {}\n", toml_string(&r.gate)));
 
@@ -921,6 +948,7 @@ mod tests {
             harness: CLAUDE_CODE_ID.to_string(),
             binary_version: "2.1.220 (Claude Code)".to_string(),
             bridge_version: "0.42.0".to_string(),
+            model: None,
             recorded: "2026-07-29".to_string(),
             gate: "pass".to_string(),
             accepted: vec![Acceptance {
@@ -969,6 +997,38 @@ mod tests {
         // …and it carries the explanation an operator needs, not just the data.
         assert!(rendered.contains("known_open"), "{rendered}");
         assert!(rendered.contains("WHEN TO RE-RUN"), "{rendered}");
+    }
+
+    #[test]
+    fn the_probing_model_round_trips_and_its_absence_still_means_ambient() {
+        // The key Job 3 added: a record must be able to say WHO probed it, because the
+        // turn-behavior half of a row is model-dependent even though the sandbox is not.
+        let mut named = sample_results();
+        named.model = Some("kimi-k3-codex".to_string());
+        let rendered = render_results(&named);
+        assert!(rendered.contains(r#"model = "kimi-k3-codex""#), "{rendered}");
+        assert_eq!(parse_results(&rendered).expect("must parse"), named);
+
+        // …and the converse, which is what keeps every record written before the seam
+        // readable: NO key is rendered for an ambient run, and its absence parses back to
+        // `None` rather than to some stand-in name.
+        let ambient = sample_results();
+        assert_eq!(ambient.model, None);
+        let rendered = render_results(&ambient);
+        assert!(!rendered.contains("\nmodel = "), "{rendered}");
+        assert_eq!(parse_results(&rendered).expect("must parse").model, None);
+    }
+
+    #[test]
+    fn the_committed_records_still_parse_with_the_model_key_added() {
+        // The additive key is why this is NOT a schema bump: bumping would make every
+        // already-correct record a parse failure at startup and refuse the levels they
+        // vouch for. Both shipped files must keep parsing at RESULTS_SCHEMA.
+        for (id, text) in crate::CONTAINMENT_RECORDS {
+            let r = parse_results(text)
+                .unwrap_or_else(|e| panic!("the embedded {id} record must parse: {e}"));
+            assert_eq!(r.schema, RESULTS_SCHEMA, "{id}");
+        }
     }
 
     #[test]

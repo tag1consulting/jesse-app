@@ -255,20 +255,12 @@ impl AppState {
     /// endpoint and its persisted override are gone, because what a model may touch is a
     /// containment decision the startup gate validates against the containment record, not a
     /// switch on a device.
+    ///
+    /// The mapping itself lives on [`ActiveModel::from_registry`] so the containment battery
+    /// can build the same value without an app state behind it; this stays as the name the
+    /// turn path calls, and carries the doc about WHERE the level comes from.
     fn active_model_for(&self, m: &RegistryModel) -> ActiveModel {
-        ActiveModel {
-            id: m.id.clone(),
-            kind: m.kind,
-            env: m.backend.clone(),
-            subagent_model: m.subagent_model.clone(),
-            level: m.level,
-            harness: m.harness.clone(),
-            price: m.price,
-            // Carry this model's vision pairing onto the turn so the preprocessor can run
-            // without re-reading the registry. Empty for ambient/unpaired (vision off).
-            vision: m.vision.clone(),
-            vision_complementary: m.vision_complementary,
-        }
+        ActiveModel::from_registry(m)
     }
 
     /// Every transcript directory this bridge's registered harnesses own — the whole disk

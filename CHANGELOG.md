@@ -15,6 +15,118 @@ CI both run it). See the "Versioning" section of `bridge/README.md`.
 
 ## [Unreleased]
 
+## [Bridge 0.55.0] - 2026-08-04
+
+Kimi was benched on a defect nobody had re-measured. It is fixed, on the CLI we
+actually run — and both of its surfaces are now first-class.
+
+### Added
+
+- **Kimi K3 is registered on BOTH surfaces, each first-class and separately
+  selectable** (`bridge/src/config.rs`). `kimi-k3-codex` (`kind = "openai"`,
+  `harness = "codex"`) reaches Fireworks' Responses API through a real `codex exec`
+  child under the OS sandbox recorded in `containment-codex.toml`; `kimi-k3` stays on
+  the Anthropic `/v1/messages` surface through a claude-code child under the tool
+  allowlist recorded in `containment.toml`. They are NOT one model listed twice: same
+  weights, different transport, different containment record, different failure modes.
+  K3 is natively an OpenAI-style model, so the Codex entry is the recommended path for
+  it. Labels now name the surface (`Kimi K3 (Anthropic)` / `Kimi K3 (Codex)`) because
+  a picker showing "Kimi K3" twice would be asking the user to choose blind.
+    - **One secret arms both.** `JESSE_MODEL_KIMI_AUTH_TOKEN` (the existing Fireworks
+      key) arms the Codex entry too; `JESSE_MODEL_KIMI_CODEX_AUTH_TOKEN` overrides it
+      for a deploy that wants them on separate keys. **Consequence, stated plainly: a
+      deploy that already exports the Kimi key gains a second selectable model the
+      moment it runs this bridge.** That is the intent of making both first-class, not
+      an accident, but it is a picker change nobody typed a config line for.
+    - `base_url` differs from the sibling's by a `/v1` suffix and that is load-bearing:
+      one is an API ROOT the codex harness appends `/responses` to, the other a host
+      claude-code appends `/v1/messages` to. GLM's routing is untouched.
+- **A cross-turn tool-id collision guard the bridge owns** (`bridge/src/sessions.rs`).
+  Bridge 0.44.0 recorded Kimi K3 as armed but unusable for tool-driven turns: the
+  provider minted `tool_use` ids from a counter that RESTARTED each turn, so turn two
+  re-issued an id turn one had spent. That defect is gone (below) — but it was fixed
+  by the PROVIDER, not by anything in this repository, so the repo now owns the
+  DETECTION rather than trusting the property. After a non-ambient turn the session
+  transcript already on disk holds every id across every turn; a duplicate is named in
+  a loud warning. Log-only and never a gate: by the time it is visible the turn has
+  already produced whatever it produced, and failing it would turn a provider's bad day
+  into a bridge outage.
+    - A rewriting proxy was **considered and rejected**: it would put a live
+      man-in-the-middle in the message path of every Kimi turn to renumber ids that are
+      already unique — new failure surface bought against a defect that does not
+      reproduce.
+- **`containment-probe --model <id>`** — the battery can now probe AS a registered
+  model instead of always the ambient default, and the record gained an optional
+  `model` key naming who probed it. The OS-sandbox posture is model-independent, but
+  the rows describing how a TURN behaved are not (an untried capable tool, a child that
+  gave up after one refusal, a delegation route never found are all model behavior), so
+  a record that does not name its prober cannot say which half it vouches for. The key
+  is additive and deliberately **not** a schema bump: bumping would make every existing
+  record a parse-time failure at startup and refuse the levels they correctly vouch for.
+
+### Changed
+
+- **The Codex containment record is re-cut with Kimi K3 as the probing model**
+  (`bridge/containment-codex.toml`, now `model = "kimi-k3-codex"`). Its behavioral rows
+  had been probed by a different model, so the record did not vouch for the model it
+  governs. **Nothing moved.** All 64 probes across the four
+  shipped rows came back conclusive and every verdict, status, class and recorded argv is
+  byte-identical to the ambient-probed run; only the `model` key, `bridge_version`, and 25
+  evidence strings differ (a different model reaches the same boundary by a different route,
+  and the evidence is the route). `read/none`, `read/qmd` and `write/qmd` pass their hard
+  gates; `basic/none` still fails its positive controls, the designed outcome for a harness
+  that cannot express `basic` at all. Both `[[accepted]]` decisions are carried across
+  unchanged. So the record now *vouches for the model it governs* — which it previously did
+  not — and says so where a reader can check it, rather than the posture having been assumed
+  to transfer.
+    - **One finding was discarded rather than recorded, and the discarding is the point.** A
+      first run came back with `search_qmd` FAILING on both qmd rows, which would have read
+      as "K3 cannot reach vault search". It was an artifact of the probe host, not of K3:
+      `qmd` is installed under nvm node-22 and the run inherited a shell `PATH` carrying
+      homebrew node 26, where `qmd` is not even resolvable — so the MCP server never
+      started. Re-run with the `PATH` the bridge actually gives its children, `search_qmd`
+      passes on every row. A battery is only as good as the world it runs in, and a
+      positive control failing is the battery reporting that world, not the model.
+
+### Notes
+
+- **The tool-id defect is fixed, and it is fixed on the CLI this project pins.**
+  Measured with the `claude` CLI talking straight to Fireworks and the bridge out of
+  the message path — the setup that verified the original defect — over three resumed
+  turns each making two SEQUENTIAL same-tool calls:
+    - **claude 2.1.220 (the pin):** `Read_0`, `Read_1` / `Read_2`, `Read_3` / `Read_4`,
+      `Read_5`. Six distinct ids, every `tool_result` paired, every answer correct.
+    - **claude 2.1.221:** byte-for-byte the same id sequence.
+  So **the pin was NOT bumped**: 2.1.220 already exhibits the fixed behavior, and
+  adopting a new CLI on evidence that says the current one is fine would be an
+  un-evidenced change forcing a full containment re-certification for nothing.
+- **The mechanism, since a delimiter change would not have been one.** The earlier
+  report that ids now render `Read_0` rather than `Read:0` does not by itself explain a
+  fix, and the operator was right to reject it: renaming a separator does not make a
+  restarting counter unique. What actually changed is that the counter is
+  **conversation-scoped rather than per-turn** — it continues across process boundaries
+  (`Read_2` is minted by a *fresh* `claude` process resuming the session), which is what
+  "does not restart" means. And the ids come from **Fireworks, not the CLI**: on one
+  binary with one set of flags the id FORMAT differs by model — Kimi mints `Read_<n>`,
+  GLM mints `chatcmpl-tool-<hash>` — which is why the claude-code version cannot be the
+  variable, and why GLM never needed anything.
+- **Verified end to end through the bridge, not only through the raw CLI**: a resumed
+  conversation on `kimi-k3` calling the same vault-search tool across two turns produced
+  `mcp__qmd__query_0` … `mcp__qmd__query_5` — six distinct ids, six paired results.
+- **Codex leaves NO usable trace for `view_image`, so nothing was built for it.** The
+  gap is real: `view_image` emits no `item.started` and no `item.completed`, so an image
+  turn renders as a bare spinner. But its only trace is a `codex_core::stream_events_utils:
+  ToolCall:` line at **INFO**, and the bridge sets `RUST_LOG` nowhere, so its children run
+  at codex's default level where only ERROR reaches stderr. Controlled A/B, same prompt,
+  same provider, same binary: `RUST_LOG` unset → 2 stderr lines, 0 INFO, 0 `ToolCall`;
+  `RUST_LOG=codex_core=info` → 16 lines, 7 INFO, 1 `ToolCall`. Detecting a line that never
+  arrives would have been a feature that does nothing in production. Making it arrive means
+  raising the child's log level, which puts full tool payloads — the shell command, absolute
+  paths — onto the very channel the refusal path deliberately redacts before it reaches a
+  user's screen. That is a security-relevant decision, not a spinner fix, and it is left
+  for a deliberate one.
+
+
 ## [Bridge 0.54.0] - 2026-08-04
 
 Codex could already write. Nothing proved it end to end, and the record was cut on

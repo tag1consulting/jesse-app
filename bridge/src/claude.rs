@@ -695,6 +695,17 @@ pub async fn run_claude_streaming(
                 session_id,
                 usage,
             } => {
+                // The cross-turn tool-id guard. A turn that succeeded is still the moment
+                // the evidence exists: the transcript now holds THIS turn's ids beside every
+                // earlier turn's, which is the only place a collision is visible at all.
+                // Non-ambient models only — see `report_tool_id_collisions` for why. Never
+                // affects what is returned; a provider regression must not become a bridge
+                // outage.
+                if active.is_non_ambient() {
+                    if let Some(sid) = session_id.as_deref() {
+                        report_tool_id_collisions(cfg, harness, &active.id, sid);
+                    }
+                }
                 // Cap the stored reply at MAX_OUTPUT_BYTES *bytes* on a char
                 // boundary (M1) — not chars, which for multibyte text could keep
                 // up to ~4× the budget. This matches the byte-based stream cap.

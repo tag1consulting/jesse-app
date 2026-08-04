@@ -14,6 +14,13 @@
 # the levels are one vocabulary but the levers behind them are not. The `harness`
 # key below names whose record this is, and the build embeds one file per harness.
 #
+# THE `model` KEY NAMES WHO PROBED. The OS-sandbox posture is model-independent — the
+# flags are the flags — but the rows describing how a TURN BEHAVED are not. Whether a
+# capable tool stood at the root and went untried, whether the child retried after a
+# refusal, whether it ever found the delegation route: all model behavior. So this
+# record vouches for the boundary generally and for THAT model's turn behavior
+# specifically. An ABSENT `model` key means the ambient default probed it.
+#
 # THE FILE-LEVEL `gate` KEY IS A HUMAN-FACING SUMMARY. Nothing reads it. The startup
 # gate walks the ROWS (`highest_passing_level`): a level is grantable when every MCP
 # set recorded at it met every hard gate, so a record whose overall gate is `fail`
