@@ -185,6 +185,19 @@ struct LocalConfig {
     /// Absent → empty → every routed job goes to ambient, as before the key existed.
     #[serde(default)]
     offload_order: Vec<String>,
+    /// Per-model concurrency slots plus the global ceiling (`[concurrency]`).
+    ///
+    /// A TABLE KEYED BY MODEL ID rather than a `concurrency` key on each `[[models]]` entry,
+    /// and the reason is coverage: five of the seven models in the deployed registry — the
+    /// built-in ambient `opus` and the four env-triple models — have no `[[models]]` entry to
+    /// hang a key on. A per-entry key would be unreachable for most of the registry and would
+    /// need a second mechanism for `opus` anyway.
+    ///
+    /// Values stay untyped here so a bad one can be reported precisely, naming the model,
+    /// instead of failing the whole overlay file (which would silently take the persona and
+    /// the model registry down with it).
+    #[serde(default)]
+    concurrency: HashMap<String, toml::Value>,
 }
 
 /// Resolve the local overlay file, first existing wins:
@@ -230,6 +243,31 @@ fn load_local_persona(home: &str) -> Option<PersonaToml> {
 /// validated in [`registry_model_from_toml`], so a partial entry is skipped there, not here.
 pub fn load_local_models(home: &str) -> Vec<ModelToml> {
     load_local_config(home).map(|c| c.models).unwrap_or_default()
+}
+
+/// Read the `[concurrency]` table from the same overlay file.
+///
+/// `total` is lifted out; every other key is a model id. A value that is not a positive
+/// integer is left for [`resolve_slot_plan`] to reject BY NAME — see the note on the field.
+pub fn load_concurrency(home: &str) -> ConcurrencySettings {
+    let mut out = ConcurrencySettings::default();
+    let Some(cfg) = load_local_config(home) else {
+        return out;
+    };
+    for (k, v) in cfg.concurrency {
+        let n = v.as_integer().filter(|n| *n >= 0).map(|n| n as usize);
+        if k == "total" {
+            out.total = n;
+            continue;
+        }
+        match n {
+            Some(n) => {
+                out.per_model.insert(k, n);
+            }
+            None => out.invalid.push(k),
+        }
+    }
+    out
 }
 
 /// Read the `offload_order` list from the same overlay file, blank ids dropped. Absent or

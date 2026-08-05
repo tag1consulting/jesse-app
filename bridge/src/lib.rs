@@ -116,6 +116,7 @@ mod ratelimit;
 mod routing;
 mod sessions;
 mod shadow;
+mod slots;
 mod sse;
 mod startup;
 mod state;
@@ -124,6 +125,7 @@ mod util;
 mod vaultqa;
 mod vaultqagate;
 mod vision;
+mod writelock;
 
 // Flat internal namespace: every module's items reachable crate-wide by bare
 // name (so `use crate::*` in each module works exactly like the old single file).
@@ -167,12 +169,14 @@ pub use ratelimit::*;
 pub use routing::*;
 pub use sessions::*;
 pub use shadow::*;
+pub use slots::*;
 pub use sse::*;
 pub use startup::*;
 pub use state::*;
 pub use titlestore::*;
 pub use util::*;
 pub use vaultqa::*;
+pub use writelock::*;
 pub use vaultqagate::*;
 pub use vision::*;
 

@@ -225,11 +225,13 @@ pub struct Config {
     pub allowed_tools: String,
     // Comma-separated tool denylist passed to `claude --disallowedTools`.
     pub disallowed_tools: String,
-    // Max concurrent turns. Defaults to 1 — a single global write lock, so at
-    // most one turn runs (and can rewrite vault files) at a time regardless of how
-    // many clients are connected. A request that can't get a permit immediately is
-    // QUEUED (up to `max_queued`) rather than rejected; beyond the queue, 429.
-    pub max_concurrency: usize,
+    /// Per-model concurrency slots and the global ceiling — see [`crate::slots`].
+    ///
+    /// Replaces the single `max_concurrency` semaphore this field used to be. That key's
+    /// comment said what it was really doing: "a single global write lock, so at most one
+    /// turn runs (and can rewrite vault files) at a time". It was standing in for a vault
+    /// write lock the bridge did not have; now it has one ([`crate::writelock`]).
+    pub concurrency: ConcurrencySettings,
     // Depth of the wait queue in front of the concurrency semaphore. When no
     // permit is free, up to this many turns may wait for one; beyond it, load is
     // shed with 429 (the pre-queue behavior). Floor 0 → no queue.
@@ -473,6 +475,34 @@ impl Config {
         self.state_dir
             .as_deref()
             .map(|d| PathBuf::from(d).join("context.json"))
+    }
+
+    /// The vault write lock's broker socket.
+    ///
+    /// Under the STATE DIR, which is what makes it reachable by BOTH harnesses' hooks — a
+    /// Codex child's own sandbox cannot write here, but its hook subprocess is not sandboxed
+    /// and can (measured on codex-cli 0.146.0). Never in the vault: that would put lock state
+    /// in the tree git and the autocommit timer watch. See [`crate::writelock`].
+    pub fn writelock_socket(&self) -> Option<PathBuf> {
+        self.state_dir
+            .as_deref()
+            .map(|d| PathBuf::from(d).join("writelock.sock"))
+    }
+
+    /// Resolve the per-model slot plan, or every problem with it.
+    ///
+    /// Called twice on purpose: once by the startup gate in `main`, which turns the errors
+    /// into a refusal to start, and once by [`AppState::new`], where it is guaranteed to
+    /// succeed because the gate already ran.
+    pub fn slot_plan(&self) -> Result<SlotPlan, Vec<String>> {
+        resolve_slot_plan(
+            &self.model_registry,
+            &HarnessRegistry::for_models(
+                self.model_registry.models.iter().map(|m| m.harness.as_str()),
+            ),
+            &self.concurrency,
+            &|var| std::env::var(var).ok(),
+        )
     }
 }
 
@@ -1703,15 +1733,22 @@ impl Config {
                 .unwrap_or_else(|| DEFAULT_ALLOWED_TOOLS.to_string()),
             disallowed_tools: env_string("JESSE_DISALLOWED_TOOLS")
                 .unwrap_or_else(|| DEFAULT_DISALLOWED_TOOLS.to_string()),
-            // `>= 1` floor: a parsed 0 falls back to the default (not to a 1-clamp),
-            // the long-standing behavior — so kept explicit, not via `env_parse`.
-            // Default 1 (single-writer): protects vault files from concurrent
-            // rewrites by multiple clients — one turn runs anywhere at a time.
-            max_concurrency: std::env::var("JESSE_MAX_CONCURRENCY")
-                .ok()
-                .and_then(|s| s.parse().ok())
-                .filter(|n| *n >= 1)
-                .unwrap_or(1),
+            // THE DEPRECATED KEY IS REMAPPED, NOT IGNORED AND NOT FATAL.
+            //
+            // `JESSE_MAX_CONCURRENCY` used to be the one global limit. An operator who set it
+            // to 1 on purpose must not silently end up with six turns in flight after an
+            // upgrade, so it becomes the GLOBAL CEILING — which for a value of 1 reproduces
+            // today's behavior exactly. Erroring instead would break a running deploy on its
+            // next restart, and ignoring it would be the silent widening. Announced at
+            // startup; see `warn_deprecated_concurrency`.
+            concurrency: {
+                let mut c = load_concurrency(&home);
+                c.legacy_max_concurrency = std::env::var("JESSE_MAX_CONCURRENCY")
+                    .ok()
+                    .and_then(|s| s.parse::<usize>().ok())
+                    .filter(|n| *n >= 1);
+                c
+            },
             // Wait-queue depth; floor 0 (0 → no queue). A parsed value is honored
             // as-is; unset/unparseable → DEFAULT_MAX_QUEUED.
             max_queued: env_parse("JESSE_MAX_QUEUED", DEFAULT_MAX_QUEUED),
@@ -1948,7 +1985,7 @@ mod tests {
         assert_eq!(cfg.timeout_secs, 3600);
         // Single-writer default: one turn runs at a time; a burst of up to
         // DEFAULT_MAX_QUEUED waits behind it rather than being rejected.
-        assert_eq!(cfg.max_concurrency, 1);
+        assert_eq!(cfg.concurrency.legacy_max_concurrency, None);
         assert_eq!(cfg.max_queued, DEFAULT_MAX_QUEUED);
         // Eviction defaults: 24h hold for an unfetched reply, short post-fetch grace.
         assert_eq!(cfg.job_ttl_secs, DEFAULT_JOB_TTL_SECS);

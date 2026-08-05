@@ -6,11 +6,19 @@ use crate::*;
 pub struct AppState {
     pub cfg: Arc<Config>,
     pub jobs: Arc<JobStore>,
-    // Bounds concurrent turns (C3). A permit is held for the life of a turn.
-    pub sem: Arc<Semaphore>,
-    // Bounds the wait QUEUE in front of `sem` and issues admission decisions:
-    // run-now, queue-and-wait, or shed (429). Wraps the same `sem`.
-    pub queue: Arc<QueueGate>,
+    // PER-MODEL slots plus the global ceiling, and the per-model wait queues in front of
+    // them. Replaces the single global semaphore + queue this used to be; see `slots`.
+    pub slots: Arc<SlotTable>,
+    // The vault write lock's broker. Locks are taken by a child's hooks and released by the
+    // post hook, by the TURN ENDING (which only this process knows), or by timeout.
+    pub broker: Arc<LockBroker>,
+    // The `jesse-hook` helper the children's hooks invoke, resolved once at startup.
+    // `None` disarms the write lock — every write-level model is then capped at one slot.
+    pub hook_helper: Option<PathBuf>,
+    // One lock per CONVERSATION, held for the whole turn. Two turns of one conversation
+    // resume the same underlying session, so the second would resume a transcript the first
+    // is still writing. Bridge-level and harness-independent: both harnesses resume.
+    pub conversation_locks: Arc<ConversationLocks>,
     // Per-service request rate ceiling (C3).
     pub limiter: Arc<RateLimiter>,
     // The conversation registry: the bridge's own notion of a thread, keyed on a stable
@@ -110,8 +118,20 @@ impl AppState {
         let context_file = cfg.context_file();
         let context_enabled = cfg.context_carry;
         let meal_corrections = Arc::new(MealCorrectionsQueue::from_cfg(&cfg));
-        let sem = Arc::new(Semaphore::new(cfg.max_concurrency.max(1)));
-        let queue = QueueGate::new(sem.clone(), cfg.max_queued);
+        // `main` has already run the startup gate, so a plan is guaranteed to resolve here.
+        // The fallback is the SAFE one rather than a panic: one slot per model reproduces the
+        // pre-0.60.0 single-writer posture.
+        let plan = cfg.slot_plan().unwrap_or_else(|_| SlotPlan {
+            total: 1,
+            per_model: cfg
+                .model_registry
+                .models
+                .iter()
+                .map(|m| (m.id.clone(), 1))
+                .collect(),
+        });
+        let slots = Arc::new(SlotTable::new(&plan, cfg.max_queued));
+        let hook_helper = resolve_hook_helper();
         let limiter = Arc::new(RateLimiter::new(cfg.rate_per_min));
         // Seed the health cache from the registry (configured non-ambient models → optimistic
         // healthy). The live prober is spawned separately in `main` so tests never touch the
@@ -120,8 +140,10 @@ impl AppState {
         let st = AppState {
             cfg: Arc::new(cfg),
             jobs: Arc::new(JobStore::new(job_ttl, retrieval_grace, jobs_dir)),
-            sem,
-            queue,
+            slots,
+            broker: Arc::new(LockBroker::new()),
+            hook_helper,
+            conversation_locks: Arc::new(ConversationLocks::default()),
             limiter,
             conversations: Arc::new(ConversationStore::new(conversations_file)),
             titles: Arc::new(TitleStore::new(titles_file)),

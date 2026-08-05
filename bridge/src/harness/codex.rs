@@ -452,6 +452,69 @@ pub fn codex_turn_home(cfg: &Config, seed_credential: bool) -> std::io::Result<P
     Ok(dir)
 }
 
+/// Write this turn's `hooks.json` into its per-turn `CODEX_HOME`. `true` if it landed.
+///
+/// `$CODEX_HOME/hooks.json` rather than an inline `[hooks]` table in `config.toml`, and the
+/// difference is not cosmetic: this harness passes `--ignore-user-config`, which discards
+/// `config.toml` wholesale, and a `hooks.json` survives it. Measured on codex-cli 0.146.0.
+/// Codex also REFUSES to load both at once ("prefer a single representation for this layer"),
+/// so writing one and only one matters.
+///
+/// The home is per turn and is removed with the turn, so the file needs no separate cleanup.
+///
+/// The matcher is `*`. Codex's tool vocabulary is not Claude Code's — its writes arrive as
+/// `apply_patch` and its shell as a native exec item — and an enumerated matcher that missed a
+/// tool would fail OPEN. Filtering happens in [`Codex::hook_write_target`], where a tool that
+/// is not a write returns [`WriteTarget::None`] and the helper exits without asking for a lock.
+fn install_write_lock_hooks(home: &Path, wl: &WriteLockChild) -> bool {
+    let doc = json!({
+        "hooks": {
+            "PreToolUse": [{
+                "matcher": "*",
+                "hooks": [{ "type": "command", "command": wl.command(CODEX_ID, "pre") }],
+            }],
+            "PostToolUse": [{
+                "matcher": "*",
+                "hooks": [{ "type": "command", "command": wl.command(CODEX_ID, "post") }],
+            }],
+        }
+    });
+    match serde_json::to_vec_pretty(&doc) {
+        Ok(bytes) => std::fs::write(home.join("hooks.json"), bytes).is_ok(),
+        Err(_) => false,
+    }
+}
+
+/// Pull the target path out of an `apply_patch` envelope.
+///
+/// Codex's `PreToolUse` payload carries NO path field — measured on 0.146.0, the whole
+/// `tool_input` is `{"command": "*** Begin Patch\n*** Add File: hello.txt\n+banana\n*** End
+/// Patch"}`. The path is inside patch syntax and is RELATIVE to the payload's `cwd`.
+///
+/// Returns every path the patch touches. A patch naming more than one file is real (Codex
+/// batches edits), and locking only the first would leave the rest unprotected — so the caller
+/// takes the coarse lock rather than a lock on one arbitrary member. That is a deliberate
+/// choice of "sound and coarse" over "precise and partial"; see the call site.
+pub fn apply_patch_targets(command: &str) -> Vec<String> {
+    command
+        .lines()
+        .filter_map(|line| {
+            let line = line.trim();
+            for marker in ["*** Add File:", "*** Update File:", "*** Delete File:"] {
+                if let Some(rest) = line.strip_prefix(marker) {
+                    return Some(rest.trim().to_string());
+                }
+            }
+            // A rename carries two paths; both must be locked, so the caller sees two entries.
+            if let Some(rest) = line.strip_prefix("*** Move to:") {
+                return Some(rest.trim().to_string());
+            }
+            None
+        })
+        .filter(|p| !p.is_empty())
+        .collect()
+}
+
 // ---- The argument vector ---------------------------------------------------------
 
 /// Build the argument vector for one `codex` invocation (everything after the binary name).
@@ -465,6 +528,7 @@ pub fn build_codex_args(
     cwd: &Path,
     mcp_args: &[String],
     provider_args: &[String],
+    write_lock_hooks: bool,
 ) -> Vec<String> {
     let mut args = Vec::new();
 
@@ -508,6 +572,27 @@ pub fn build_codex_args(
     // containment surface; the sandbox is. Loading them would let vault CONTENT influence
     // what the child may execute.
     args.push("--ignore-rules".to_string());
+    // THE VAULT WRITE LOCK'S HOOKS, on a write-capable turn only.
+    //
+    // Codex reads hooks from `$CODEX_HOME/hooks.json` — which SURVIVES `--ignore-user-config`
+    // (measured on 0.146.0: two runs differing only in this flag, hooks fired in both once
+    // trust was granted). What does NOT survive is hook TRUST: an untrusted hooks file is
+    // skipped **silently** — no stdout item, no stderr line, `0 warn` from `codex doctor` —
+    // and the write lands unlocked. A bridge that believes it is locking and is not is the
+    // exact failure this whole mechanism exists to prevent, so trust cannot be left to chance.
+    //
+    // WHAT THIS FLAG DOES AND DOES NOT DO. It bypasses review of the hooks FILE. It does not
+    // touch `sandbox_mode`, `sandbox_workspace_write.writable_roots`, `network_access`,
+    // `exclude_tmpdir_env_var`, `exclude_slash_tmp` or `approval_policy` — every one of those
+    // is still emitted by `codex_capability_args` and still recorded. The file it trusts is
+    // written by the BRIDGE into a per-turn `CODEX_HOME` that nothing else can reach, so the
+    // source being trusted is this process, not the vault and not the operator's config.
+    //
+    // It is NOT `--dangerously-bypass-approvals-and-sandbox`, which removes the sandbox
+    // entirely. Nothing here constructs that flag.
+    if write_lock_hooks {
+        args.push("--dangerously-bypass-hook-trust".to_string());
+    }
 
     // EVERYTHING FROM HERE ON MUST BE ACCEPTED BY `codex exec resume` TOO, not just by
     // `codex exec` — a flag only the latter defines is invisible until a resume turn, which
@@ -543,6 +628,12 @@ impl Codex {
             HarnessError::unsupported(CODEX_ID, format!("a per-turn home directory ({e})"))
         })?;
         let mut cmd = Command::new(&cfg.codex_bin);
+        // Install this turn's hooks into the per-turn home BEFORE building the argv, so the
+        // trust-bypass flag is emitted only when there is actually a hooks file to trust.
+        let hooks = req
+            .write_lock
+            .map(|wl| install_write_lock_hooks(&home, wl))
+            .unwrap_or(false);
         cmd.args(build_codex_args(
             req.prompt,
             req.session_id,
@@ -550,6 +641,7 @@ impl Codex {
             &req.cwd,
             &mcp,
             provider.as_deref().unwrap_or_default(),
+            hooks,
         ))
         .current_dir(&req.cwd)
         .env("CODEX_HOME", &home)
@@ -633,6 +725,78 @@ impl Harness for Codex {
     /// and a prompt is not a boundary.
     fn expresses(&self, capability: Capability) -> bool {
         capability > Capability::Basic
+    }
+
+    /// THREE, matching Claude Code. Codex reached `Write` on 2026-08-04 and installs the same
+    /// write-lock hooks, so there is no reason for it to be the throttled harness.
+    fn default_concurrency(&self) -> usize {
+        3
+    }
+
+    /// TRUE, with one caveat an operator should know about.
+    ///
+    /// Verified live against codex-cli 0.146.0: `PreToolUse` and `PostToolUse` both fire, a
+    /// `permissionDecision: "deny"` BLOCKS the write, and — the measurement that made this
+    /// design possible at all — **the hook subprocess is not sandboxed**, so it can reach the
+    /// broker socket in the state dir without widening `writable_roots`.
+    ///
+    /// THE CAVEAT: this rests on `--dangerously-bypass-hook-trust` being on the child's argv,
+    /// because an untrusted hooks file is skipped SILENTLY. `build_codex_args` emits that flag
+    /// exactly when a hooks file was written; if that ever stops being true, this method is
+    /// lying and the fail-safe cap in `resolve_slot_plan` will not save the vault, because it
+    /// reads this declaration. The containment record is what holds the pair together.
+    fn supports_write_lock(&self) -> bool {
+        true
+    }
+
+    /// Codex names nothing directly — see [`apply_patch_targets`].
+    fn hook_write_target(&self, payload: &HookPayload) -> WriteTarget {
+        match payload.tool_name.as_str() {
+            "apply_patch" => {
+                let command = payload
+                    .tool_input
+                    .get("command")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default();
+                let targets = apply_patch_targets(command);
+                match targets.len() {
+                    // A patch that names nothing parseable still writes something.
+                    0 => WriteTarget::Global,
+                    1 => WriteTarget::Path(resolve_lock_path(
+                        Path::new(&targets[0]),
+                        &payload.cwd,
+                    )),
+                    // A multi-file patch is ONE atomic tool call, so locking one of its files
+                    // would leave the others open. The broker holds one lock per call, so the
+                    // sound answer is the coarse one.
+                    _ => WriteTarget::Global,
+                }
+            }
+            // Codex's containment is an OS sandbox, not a tool allowlist: its shell is the
+            // harness and it is always present. Every exec is a potential write with no
+            // parseable target.
+            "shell" | "exec" | "local_shell" | "unified_exec" | "container.exec" => {
+                WriteTarget::Global
+            }
+            // The MCP sets this project gives Codex are read-only and recorded as such.
+            other if other.starts_with("mcp__") => WriteTarget::None,
+            "web_search" | "view_image" => WriteTarget::None,
+            // Unknown means lock everything. Codex's tool surface is the one that moves under
+            // us, so this arm is the one doing real work.
+            _ => WriteTarget::Global,
+        }
+    }
+
+    /// NONE, and this is the honest answer rather than a stub.
+    ///
+    /// Codex has no native read tool whose payload names a file: it reads through the shell,
+    /// which is exactly the case that records no baseline. So a Codex conversation gets the
+    /// per-file write LOCK (two writes to one path serialize) but not the compare-and-swap
+    /// (a lost update through read-then-write is still possible). That is a wider instance of
+    /// the hole named in the 0.60.0 CHANGELOG, and it is wider on this harness than on Claude
+    /// Code. Do not paper over it by guessing a path out of a shell command string.
+    fn hook_read_target(&self, _payload: &HookPayload) -> Option<PathBuf> {
+        None
     }
 
     /// The argv WITH [`WORKSPACE_TOKEN`] still in it — this is the recorded, host-independent
@@ -965,6 +1129,7 @@ mod tests {
             Path::new("/srv/vault notes"),
             &[],
             &[],
+            false,
         );
         assert!(
             args.iter()
@@ -1034,6 +1199,7 @@ mod tests {
                 "mcp_servers.qmd.command=\"qmd\"".to_string(),
             ],
             &["-c".to_string(), "model=\"slug\"".to_string()],
+            false,
         );
 
         let at = args
@@ -1083,7 +1249,7 @@ mod tests {
     /// it would be contained against the wrong root.
     #[test]
     fn a_first_turn_still_names_its_working_directory_at_the_root() {
-        let args = build_codex_args("hi", None, Capability::Read, Path::new("/v"), &[], &[]);
+        let args = build_codex_args("hi", None, Capability::Read, Path::new("/v"), &[], &[], false);
         assert_eq!(args[0], "-C", "{args:?}");
         assert_eq!(args[1], "/v", "{args:?}");
         assert_eq!(args[2], "exec", "{args:?}");
@@ -1101,6 +1267,7 @@ mod tests {
             Path::new("/srv/we\"ird"),
             &[],
             &[],
+            false,
         );
         let root = args
             .iter()
@@ -1221,7 +1388,7 @@ mod tests {
     /// provider list appends nothing. The seam is additive or it is a regression.
     #[test]
     fn the_oauth_argv_is_unchanged_by_the_seam() {
-        let plain = build_codex_args("hi", None, Capability::Read, Path::new("/v"), &[], &[]);
+        let plain = build_codex_args("hi", None, Capability::Read, Path::new("/v"), &[], &[], false);
         assert!(
             !plain.iter().any(|a| a.contains("model_provider")),
             "{plain:?}"
@@ -1242,6 +1409,7 @@ mod tests {
             Path::new("/v"),
             &[],
             &provider,
+            false,
         );
         assert_eq!(args.last().map(String::as_str), Some("what is the cadence?"));
         let last_c = args.iter().rposition(|a| a == "-c").expect("a -c override");
@@ -1265,6 +1433,7 @@ mod tests {
             capability: Capability::Read,
             cwd: std::env::temp_dir(),
             mcp_config: EMPTY_MCP_CONFIG,
+            write_lock: None,
         };
         let cmd = Codex.build_turn(&cfg, &req).expect("a provider child");
 

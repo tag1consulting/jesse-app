@@ -314,7 +314,7 @@ async fn cancel_running_turn_kills_child_and_frees_slot() {
 
     let cfg = Config {
         claude_bin: fake.to_string_lossy().into_owned(),
-        max_concurrency: 1, // a freed slot is observable via available_permits
+        concurrency: ConcurrencySettings::uniform(1, &["opus"]), // a freed slot is observable via available_permits
         ..test_config()
     };
     let st = AppState::new(cfg);
@@ -332,7 +332,7 @@ async fn cancel_running_turn_kills_child_and_frees_slot() {
     let job_id = body["job_id"].as_str().unwrap().to_string();
     // The turn holds the only permit while it runs.
     assert_eq!(
-        st.sem.available_permits(),
+        st.slots.ceiling_free(),
         0,
         "running turn holds the permit"
     );
@@ -347,7 +347,7 @@ async fn cancel_running_turn_kills_child_and_frees_slot() {
     // The abort drops the task asynchronously; wait for the permit to come back.
     let mut freed = false;
     for _ in 0..50 {
-        if st.sem.available_permits() == 1 {
+        if st.slots.ceiling_free() == 1 {
             freed = true;
             break;
         }
@@ -860,7 +860,7 @@ async fn queue_full_sheds_with_429() {
     let fake = write_fake_claude(script);
     let cfg = Config {
         claude_bin: fake.to_string_lossy().into_owned(),
-        max_concurrency: 1, // exactly one permit
+        concurrency: ConcurrencySettings::uniform(1, &["opus"]), // exactly one permit
         max_queued: 1,      // room for exactly one waiter
         ..test_config()
     };
@@ -1440,7 +1440,7 @@ async fn turn_completes_when_claude_eofs_but_does_not_exit() {
     let fake = write_fake_claude(script);
     let cfg = Config {
         claude_bin: fake.to_string_lossy().into_owned(),
-        max_concurrency: 1,
+        concurrency: ConcurrencySettings::uniform(1, &["opus"]),
         ..test_config()
     };
     let st = AppState::new(cfg);
@@ -1460,7 +1460,7 @@ async fn turn_completes_when_claude_eofs_but_does_not_exit() {
     // is back — proof the reap is bounded, not pinned by the lingering child.
     let mut done = false;
     for _ in 0..50 {
-        if st.sem.available_permits() == 1 {
+        if st.slots.ceiling_free() == 1 {
             if result_status(&st, &job_id).await["status"] == "done" {
                 done = true;
                 break;
@@ -2962,7 +2962,7 @@ async fn two_overlapping_turns_serialize_and_both_complete() {
     let fake = write_fake_claude(&script);
     let cfg = Config {
         claude_bin: fake.to_string_lossy().into_owned(),
-        max_concurrency: 1,
+        concurrency: ConcurrencySettings::uniform(1, &["opus"]),
         max_queued: 4,
         ..test_config()
     };
@@ -3018,7 +3018,7 @@ async fn queued_turn_returns_202_immediately_and_stream_reflects_the_wait() {
     let fake = write_fake_claude(script);
     let cfg = Config {
         claude_bin: fake.to_string_lossy().into_owned(),
-        max_concurrency: 1,
+        concurrency: ConcurrencySettings::uniform(1, &["opus"]),
         max_queued: 4,
         ..test_config()
     };
@@ -3098,7 +3098,7 @@ async fn cancelling_a_queued_turn_frees_its_slot_and_never_spawns_claude() {
     let fake = write_fake_claude(&script);
     let cfg = Config {
         claude_bin: fake.to_string_lossy().into_owned(),
-        max_concurrency: 1,
+        concurrency: ConcurrencySettings::uniform(1, &["opus"]),
         max_queued: 1,
         ..test_config()
     };
@@ -4048,7 +4048,7 @@ async fn dedup_two_concurrent_duplicate_posts_yield_one_job() {
         claude_bin: fake.to_string_lossy().into_owned(),
         timeout_secs: 30,
         // Two permits so BOTH would run concurrently if the dedup didn't collapse them.
-        max_concurrency: 2,
+        concurrency: ConcurrencySettings::uniform(2, &["opus"]),
         ..test_config()
     };
     let st = AppState::new(cfg);

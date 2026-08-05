@@ -30,12 +30,20 @@ impl ClaudeCode {
     /// dedicated tests.
     pub fn command(&self, cfg: &Config, req: &TurnRequest<'_>) -> Command {
         let mut cmd = Command::new(&cfg.claude_bin);
+        // The write lock's hooks, when this turn is one that can write the vault. A failure to
+        // WRITE the settings file leaves `None`, and the caller's own gate (a turn is only
+        // given `write_lock` when the broker is armed) means the turn then runs at one slot
+        // rather than unlocked — see `install_write_lock_settings`.
+        let settings = req
+            .write_lock
+            .and_then(|wl| install_write_lock_settings(cfg, wl));
         cmd.args(build_claude_args(
             cfg,
             req.prompt,
             req.session_id,
             req.capability,
             req.mcp_config,
+            settings.as_deref(),
         ))
         .current_dir(&req.cwd)
         .stdout(Stdio::piped())
@@ -65,6 +73,57 @@ impl Harness for ClaudeCode {
     /// be put in, which is what makes `Basic` real here and unreachable on Codex.
     fn expresses(&self, _capability: Capability) -> bool {
         true
+    }
+
+    /// THREE. Claude Code is the harness the bridge has run since the beginning, it installs
+    /// the write-lock hooks, and it backs the ambient `opus` default every main turn uses.
+    fn default_concurrency(&self) -> usize {
+        3
+    }
+
+    /// TRUE. Verified live against claude 2.1.222: `PreToolUse` and `PostToolUse` both fire in
+    /// a headless `-p` child under `--permission-mode default`, and a pre hook exiting 2 BLOCKS
+    /// the tool call — the write never lands, the model reads the hook's stderr and reacts, and
+    /// the denial is recorded in the result envelope's `permission_denials`. That last part is
+    /// what makes the compare-and-swap refusal a recoverable outcome rather than a crash.
+    fn supports_write_lock(&self) -> bool {
+        true
+    }
+
+    /// Claude Code names its target directly: `tool_input.file_path`, already ABSOLUTE.
+    ///
+    /// The contrast with Codex is the whole reason this is a trait method — see
+    /// [`Harness::hook_write_target`].
+    fn hook_write_target(&self, payload: &HookPayload) -> WriteTarget {
+        match payload.tool_name.as_str() {
+            "Write" | "Edit" | "NotebookEdit" => payload
+                .tool_input
+                .get("file_path")
+                .and_then(|v| v.as_str())
+                .map(|p| WriteTarget::Path(resolve_lock_path(Path::new(p), &payload.cwd)))
+                // A write tool whose payload carries no path is not a write we can name, and
+                // "cannot name" means lock everything, never lock nothing.
+                .unwrap_or(WriteTarget::Global),
+            // A shell call gets a COMMAND STRING, not a path. Redirection, `sed -i`, `tee` and
+            // the vault's own hooks all write through here, and parsing a conservative
+            // allowlist of shapes out of a command string is precise and leaky. One global
+            // lock is imprecise and sound.
+            "Bash" | "BashOutput" | "KillShell" => WriteTarget::Global,
+            // Everything the read-only matcher lets through, plus the MCP sets, which this
+            // project records as read-only in its containment battery.
+            "Read" | "Grep" | "Glob" | "WebFetch" | "WebSearch" | "TodoWrite" => WriteTarget::None,
+            other if other.starts_with("mcp__") => WriteTarget::None,
+            _ => WriteTarget::Global,
+        }
+    }
+
+    /// `Read` names the file whose content becomes this conversation's compare-and-swap
+    /// baseline. A file read through the SHELL (`cat`) records nothing — the named hole.
+    fn hook_read_target(&self, payload: &HookPayload) -> Option<PathBuf> {
+        (payload.tool_name == "Read")
+            .then(|| payload.tool_input.get("file_path")?.as_str())
+            .flatten()
+            .map(|p| resolve_lock_path(Path::new(p), &payload.cwd))
     }
 
     fn capability_args(&self, cfg: &Config, capability: Capability) -> Vec<String> {
@@ -132,6 +191,9 @@ pub fn main_turn_request<'a>(
         capability,
         cwd: PathBuf::from(&cfg.vault), // cwd = vault → CLAUDE.md auto-loads
         mcp_config,
+        // Callers that CAN write the vault set this after the fact (`req.write_lock =
+        // Some(&wl)`), so the common request builder stays a five-argument function.
+        write_lock: None,
     }
 }
 
@@ -564,6 +626,7 @@ pub fn build_claude_args(
     session_id: Option<&str>,
     capability: Capability,
     mcp_config: &str,
+    write_lock_settings: Option<&Path>,
 ) -> Vec<String> {
     let mut args = vec![
         "-p".to_string(),
@@ -581,7 +644,11 @@ pub fn build_claude_args(
         // below rather than auto-accepted. Never acceptEdits/bypassPermissions.
         "--permission-mode".to_string(),
         "default".to_string(),
-        // SETTINGS SCOPES: user + project, never `local`.
+        // SETTINGS SCOPES: user + project, never `local`. `--settings` (below) is ADDITIVE to
+        // these rather than a replacement — verified against claude 2.1.222 by running a
+        // project-scope hook and a `--settings` hook together and observing BOTH fire — which
+        // is what lets the bridge install its write-lock hooks without displacing the vault's
+        // own diet-regeneration and draft-guard hooks.
         //
         // The child's cwd is the vault, so Claude Code performs settings discovery there and
         // ANY permission entry it finds is a grant the containment record and the startup
@@ -604,6 +671,17 @@ pub fn build_claude_args(
         "--setting-sources".to_string(),
         "user,project".to_string(),
     ];
+    // THE VAULT WRITE LOCK'S HOOKS, on a write-capable turn only.
+    //
+    // A bridge-OWNED settings file, outside the vault, rather than hooks added to the vault's
+    // own `.claude/settings.json`. The deciding argument is self-disarming: the vault's
+    // settings file lives inside the tree a write-level child can edit, so a child could
+    // switch off the very hook that locks it. This file is in the state dir, which no child
+    // can reach. It is the same reasoning 0.58.0 used to drop the `local` scope, one step on.
+    if let Some(path) = write_lock_settings {
+        args.push("--settings".to_string());
+        args.push(path.display().to_string());
+    }
     // ROOT MCP boundary, then the capability's toolset. Every spawn site assembles in
     // this order, which is what lets one builder serve all of them.
     args.extend(mcp_args(mcp_config));
@@ -621,6 +699,51 @@ pub fn build_claude_args(
         }
     }
     args
+}
+
+/// Write this turn's bridge-owned settings file, carrying only the write-lock hooks, and
+/// return its path.
+///
+/// One file per TURN, under `<state_dir>/claude-settings/`, removed when the turn ends. It
+/// lives in the state dir for the reason given at the `--settings` push site: a file inside
+/// the vault is a file a write-level child can edit, and a lock a child can switch off is not
+/// a lock.
+///
+/// `None` on any IO failure, which drops the `--settings` flag. That degradation is safe
+/// because of where the decision is made rather than anything here: a turn is only handed a
+/// [`WriteLockChild`] when the broker is armed, and a model whose harness cannot lock is
+/// already capped at one write-level slot — so a turn that fails to install its hooks runs
+/// alone, not unlocked.
+///
+/// The matchers are the two halves of the mechanism. `PreToolUse` covers the tools that WRITE
+/// (plus `Bash`, which writes through a command string this cannot parse); `PostToolUse` adds
+/// `Read`, whose only job is to record the compare-and-swap baseline.
+pub fn install_write_lock_settings(cfg: &Config, wl: &WriteLockChild) -> Option<PathBuf> {
+    let dir = cfg.state_dir.as_deref().map(PathBuf::from)?.join("claude-settings");
+    std::fs::create_dir_all(&dir).ok()?;
+    let path = dir.join(format!("{}.json", wl.turn));
+    let doc = json!({
+        "hooks": {
+            "PreToolUse": [{
+                "matcher": "Write|Edit|NotebookEdit|Bash",
+                "hooks": [{ "type": "command", "command": wl.command(CLAUDE_CODE_ID, "pre") }],
+            }],
+            "PostToolUse": [{
+                "matcher": "Write|Edit|NotebookEdit|Bash|Read",
+                "hooks": [{ "type": "command", "command": wl.command(CLAUDE_CODE_ID, "post") }],
+            }],
+        }
+    });
+    std::fs::write(&path, serde_json::to_vec_pretty(&doc).ok()?).ok()?;
+    Some(path)
+}
+
+/// Remove one turn's settings file. Best-effort: a leftover file is inert (it names a turn
+/// that no longer exists), so a failure here is not worth failing a turn over.
+pub fn remove_write_lock_settings(cfg: &Config, turn: &str) {
+    if let Some(dir) = cfg.state_dir.as_deref() {
+        let _ = std::fs::remove_file(PathBuf::from(dir).join("claude-settings").join(format!("{turn}.json")));
+    }
 }
 
 /// Build the base `claude` child `Command` for a MAIN turn or a title one-shot. A thin
@@ -883,6 +1006,7 @@ mod tests {
             None,
             Capability::Write,
             main_mcp_config(&test_config(), &ClaudeCode),
+            None
         );
         let pos = |needle: &str| args.iter().position(|a| a == needle);
         let of = pos("--output-format").expect("--output-format present");
@@ -899,7 +1023,7 @@ mod tests {
     #[test]
     fn build_claude_args_enforces_least_privilege() {
         let cfg = test_config();
-        let args = build_claude_args(&cfg, "hello", None, Capability::Write, main_mcp_config(&cfg, &ClaudeCode));
+        let args = build_claude_args(&cfg, "hello", None, Capability::Write, main_mcp_config(&cfg, &ClaudeCode), None);
 
         // --allowedTools is always present, with the configured list as its value.
         let idx = args
@@ -1220,6 +1344,7 @@ mod tests {
                 None,
                 turn_capability(&active),
                 main_mcp_config(&cfg, &ClaudeCode),
+            None
             );
             assert!(
                 args.iter().any(|a| a == "--strict-mcp-config"),
@@ -1279,6 +1404,7 @@ mod tests {
                 None,
                 turn_capability(&active),
                 main_mcp_config(&cfg, &ClaudeCode),
+            None
             );
             assert_eq!(
                 arg_value(&args, "--mcp-config").as_deref(),
@@ -1468,6 +1594,7 @@ mod tests {
             None,
             turn_capability(&active),
             main_mcp_config(&cfg, &ClaudeCode),
+            None
         );
         let val = |flag: &str| -> Option<String> {
             args.iter()
@@ -1517,6 +1644,7 @@ mod tests {
             None,
             turn_capability(&active),
             main_mcp_config(&cfg, &ClaudeCode),
+            None
         );
         let allow = args
             .iter()
@@ -1540,11 +1668,12 @@ mod tests {
             Some("sess-42"),
             Capability::Write,
             main_mcp_config(&cfg, &ClaudeCode),
+            None
         );
         let ridx = args.iter().position(|a| a == "--resume").expect("--resume");
         assert_eq!(args[ridx + 1], "sess-42");
         // No --resume without a session id.
-        let none = build_claude_args(&cfg, "hi", None, Capability::Write, main_mcp_config(&cfg, &ClaudeCode));
+        let none = build_claude_args(&cfg, "hi", None, Capability::Write, main_mcp_config(&cfg, &ClaudeCode), None);
         assert!(!none.iter().any(|a| a == "--resume"));
     }
     #[test]
@@ -1562,6 +1691,7 @@ mod tests {
             Some(&synthetic),
             Capability::Write,
             main_mcp_config(&cfg, &ClaudeCode),
+            None
         );
         assert!(
             !args.iter().any(|a| a == "--resume"),
@@ -1578,6 +1708,7 @@ mod tests {
             Some("real-sess-1"),
             Capability::Write,
             main_mcp_config(&cfg, &ClaudeCode),
+            None
         );
         let ridx = real.iter().position(|a| a == "--resume").expect("--resume");
         assert_eq!(real[ridx + 1], "real-sess-1");
@@ -1680,7 +1811,7 @@ mod tests {
                 "PROMPT",
                 None,
                 Capability::Write,
-                main_mcp_config(&cfg, &ClaudeCode)
+                main_mcp_config(&cfg, &ClaudeCode), None
             ),
             golden(&[
                 "--strict-mcp-config",
@@ -1701,7 +1832,7 @@ mod tests {
                 "PROMPT",
                 None,
                 Capability::Read,
-                main_mcp_config(&cfg, &ClaudeCode)
+                main_mcp_config(&cfg, &ClaudeCode), None
             ),
             golden(&[
                 "--strict-mcp-config",

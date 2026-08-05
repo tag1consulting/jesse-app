@@ -178,6 +178,95 @@ pub struct TurnRequest<'a> {
     /// at all is exactly what [`HarnessError`] is for; Claude Code is not that harness, so
     /// nothing on this path constructs one — it consumes this field.
     pub mcp_config: &'a str,
+    /// When set, this child must be spawned with the vault write lock's hooks installed,
+    /// pointed at the broker named here.
+    ///
+    /// `None` for every child that cannot write the vault (the `Basic` diet and title
+    /// one-shots, the read-only vault-QA child), because a lock on a turn that cannot write
+    /// is pure overhead. `Some` for a write-level main turn whenever the broker is armed.
+    ///
+    /// The INSTALLATION is per harness and lives in [`Harness::build_turn`] — a settings file
+    /// for Claude Code, a `hooks.json` in the per-turn home for Codex — which is why this is
+    /// a request field the harness reads rather than argv the bridge assembles.
+    pub write_lock: Option<&'a WriteLockChild>,
+}
+
+/// Everything a child needs to talk to the write-lock broker.
+///
+/// Every field is baked into the hook COMMAND STRING the bridge writes into that child's
+/// per-turn hook config, rather than passed through the environment. That is deliberate: it
+/// costs nothing (the bridge is already writing a per-turn file) and it removes an assumption
+/// about env inheritance through whatever process tree each CLI uses to run a hook.
+pub struct WriteLockChild {
+    /// The broker's unix socket, under the state dir.
+    pub socket: PathBuf,
+    /// This TURN's key — the job id. What [`crate::LockBroker::release_turn`] releases.
+    pub turn: String,
+    /// This CONVERSATION's id, which keys the compare-and-swap read baselines. Not the
+    /// harness's own session id: a Codex turn gets a fresh `CODEX_HOME` every turn, so a
+    /// baseline keyed on the harness's own state would not survive a resume.
+    pub conversation: String,
+    /// The `jesse-hook` helper binary, resolved once at startup.
+    pub helper: PathBuf,
+}
+
+impl WriteLockChild {
+    /// The hook command string for one event, as this harness's hook config will carry it.
+    pub fn command(&self, harness: &str, event: &str) -> String {
+        format!(
+            "{} --harness {} --event {} --socket {} --turn {} --conversation {}",
+            shell_quote(&self.helper.display().to_string()),
+            harness,
+            event,
+            shell_quote(&self.socket.display().to_string()),
+            shell_quote(&self.turn),
+            shell_quote(&self.conversation),
+        )
+    }
+}
+
+/// Resolve a path from a hook payload into THE one key a lock is taken on.
+///
+/// Absolute-ise against the payload's `cwd`, then canonicalize so symlinks collapse. Both
+/// halves are load-bearing and they close different holes:
+///
+///   * A Claude Code child names `/vault/notes/a.md` while a Codex child names `notes/a.md`
+///     relative to the same cwd. Two spellings, one file — and without the join they would
+///     take two different locks and protect nothing.
+///   * The vault is reachable through at least one symlinked path on this host, and
+///     `/tmp` is itself a symlink to `/private/tmp` on macOS. Canonicalizing collapses those
+///     too.
+///
+/// A path that does not exist yet (the common case: a file being CREATED) cannot be
+/// canonicalized, so its existing parent is canonicalized and the file name re-joined. That
+/// keeps a create and a later overwrite of the same file on the same key.
+pub fn resolve_lock_path(path: &Path, cwd: &str) -> PathBuf {
+    let joined = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        Path::new(cwd).join(path)
+    };
+    if let Ok(real) = joined.canonicalize() {
+        return real;
+    }
+    match (joined.parent(), joined.file_name()) {
+        (Some(parent), Some(name)) => match parent.canonicalize() {
+            Ok(real_parent) => real_parent.join(name),
+            Err(_) => joined,
+        },
+        _ => joined,
+    }
+}
+
+/// Single-quote one argument for a hook command string.
+///
+/// Both CLIs take a hook as a COMMAND STRING run through a shell, so a path with a space in
+/// it would otherwise split into two arguments. None of these values contain a quote today
+/// (they are a binary path, a state-dir path and two uuids), but the state dir is operator
+/// configurable and a bridge that mangles its own lock wiring on a path with a space would
+/// fail in the least debuggable way available.
+fn shell_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', r"'\''"))
 }
 
 /// A harness refusing a request it cannot express, rather than quietly downgrading it.
@@ -283,6 +372,72 @@ pub trait Harness: Send + Sync {
     /// `hosted`, names no provider, and is exactly the deployed posture.
     fn speaks_openai_backend(&self) -> bool {
         false
+    }
+
+    /// How many turns of a model on THIS harness may run at once, absent any config.
+    ///
+    /// A DEFAULT DECLARED BY THE HARNESS, not a per-harness test in the config loader. The
+    /// alternative — `if harness == "codex" { 3 }` somewhere in `slots.rs` — puts a
+    /// per-harness fact in the one file that is supposed to ask rather than know, and makes
+    /// the third harness a config-loader edit instead of an implementation.
+    ///
+    /// The default is `1`: a harness that declares nothing gets one thread, which is
+    /// throttled but never unsafe. Overridable per model (`[concurrency]`, or
+    /// `JESSE_MODEL_<ID>_CONCURRENCY`) — this is only where the number comes from when
+    /// nobody said otherwise.
+    fn default_concurrency(&self) -> usize {
+        1
+    }
+
+    /// Whether this harness can participate in the bridge's vault write lock
+    /// ([`crate::writelock`]).
+    ///
+    /// **The default is `false`, and that is the whole safety property.** Slot accounting is
+    /// harness-independent, but the write-lock MECHANISM is not: Claude Code installs hooks
+    /// through a settings file, Codex through `$CODEX_HOME/hooks.json` plus a trust flag, and
+    /// a third harness will do something else again. A harness that has not implemented it
+    /// must not be handed concurrent write-level turns just because the config asked — so
+    /// [`resolve_slot_plan`] caps such a harness at ONE write-level slot.
+    ///
+    /// Adding a third harness that implements nothing therefore produces a THROTTLED bridge,
+    /// never an unlocked vault. `every_known_harness_declares_write_lock_support` holds every
+    /// id in [`KNOWN_HARNESS_IDS`] against this so the question cannot be skipped.
+    fn supports_write_lock(&self) -> bool {
+        false
+    }
+
+    /// Parse one of THIS harness's hook payloads into the write it is about to perform.
+    ///
+    /// Per harness because the payloads genuinely differ, measured against the pinned
+    /// binaries on 2026-08-05:
+    ///
+    ///   * Claude Code hands over a STRUCTURED absolute path:
+    ///     `tool_name: "Write"`, `tool_input: {"file_path": "/abs/path", "content": …}`.
+    ///   * Codex hands over NO path field at all: `tool_name: "apply_patch"`, `tool_input:
+    ///     {"command": "*** Begin Patch\n*** Add File: hello.txt\n+…"}` — the target is
+    ///     inside patch envelope syntax and is RELATIVE to the payload's `cwd`.
+    ///
+    /// Those are exactly the two spellings of one file that must collapse to one lock key, so
+    /// every implementation returns a FULLY RESOLVED ABSOLUTE PATH (symlinks resolved) or
+    /// [`WriteTarget::Global`]. A harness that returns a cwd-relative path for one child and
+    /// an absolute one for another has built two locks over one file and protected nothing.
+    ///
+    /// The default is [`WriteTarget::Global`] for anything a harness does not recognise:
+    /// unknown means "lock everything", never "lock nothing".
+    fn hook_write_target(&self, _payload: &HookPayload) -> WriteTarget {
+        WriteTarget::Global
+    }
+
+    /// The file a hook payload says this call READ, whose content becomes the conversation's
+    /// compare-and-swap baseline. `None` when the call read nothing nameable.
+    ///
+    /// The default is `None`, which is the SAFE default here and the opposite of
+    /// [`Harness::hook_write_target`]'s: recording no baseline means the compare-and-swap has
+    /// nothing to compare and the write is allowed (the named hole), whereas recording a WRONG
+    /// baseline would refuse legitimate writes forever. A harness that cannot name what it
+    /// read should say nothing rather than guess.
+    fn hook_read_target(&self, _payload: &HookPayload) -> Option<PathBuf> {
+        None
     }
 
     /// The containment flags this harness turns a [`Capability`] into: the whole boundary,
@@ -521,6 +676,7 @@ pub fn title_child_request<'a>(
         capability: Capability::Basic,
         cwd: PathBuf::from(&cfg.vault),
         mcp_config: EMPTY_MCP_CONFIG,
+        write_lock: None,
     }
 }
 
@@ -541,6 +697,7 @@ pub fn diet_child_request<'a>(
         capability: Capability::Basic,
         cwd: cfg.scratch_base(), // neutral cwd → no vault CLAUDE.md auto-load
         mcp_config: EMPTY_MCP_CONFIG,
+        write_lock: None,
     }
 }
 
@@ -561,6 +718,7 @@ pub fn vaultqa_child_request<'a>(
         capability: Capability::Read,
         cwd: PathBuf::from(&cfg.vault),
         mcp_config: vaultqa_mcp_config(cfg),
+        write_lock: None,
     }
 }
 
