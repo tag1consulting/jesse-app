@@ -650,6 +650,21 @@ pub struct ProbeEnv {
     /// The agent CLI's REAL transcript directory (`Harness::transcript_dir`), where the
     /// transcript decoy is planted.
     pub transcript_dir: PathBuf,
+    /// The REAL vault (`Config::vault`) — read only, and only so [`ProbeEnv::prepare`] can
+    /// copy its `.claude/settings*.json` into the stand-in vault.
+    ///
+    /// # Why the settings files have to be in the probe world
+    ///
+    /// The child's cwd is the stand-in vault, so Claude Code performs project-scope settings
+    /// discovery against THAT directory. Without this copy the probe world has no settings
+    /// files at all, and the battery is structurally blind to every grant made in one — the
+    /// record then describes a posture strictly tighter than what a real turn runs under.
+    /// That blind spot was live until 2026-08-05: `.claude/settings.json` granted
+    /// `Bash(duckdb:*)` and `Bash(brew install duckdb)` to every phone turn, invisible to
+    /// both the record and the startup gate, because no probe ever stood where the child
+    /// stands. Copying (rather than pointing the child at the real vault) keeps every write
+    /// probe inside the disposable tree — the boundary is tested, the vault is not touched.
+    pub real_vault: PathBuf,
     /// Per-row seed the per-probe nonces derive from.
     pub seed: u64,
     /// Port of the loopback listener the network probe aims at.
@@ -815,6 +830,36 @@ impl ProbeEnv {
         log.iter().find(|l| l.contains(&nonce)).cloned()
     }
 
+    /// Copy the REAL vault's project-scope settings into the stand-in vault, so the child is
+    /// probed under the same settings discovery a live turn gets.
+    ///
+    /// Both files are optional and a missing one is not an error — the point is fidelity to
+    /// whatever the real vault has, including having nothing. Only `.claude/settings.json`
+    /// and `.claude/settings.local.json` are mirrored: they are the two project-scope files
+    /// Claude Code reads from cwd. User-scope settings need no mirroring, since the child
+    /// already runs as the same unix user and reads the same `$HOME`.
+    ///
+    /// A settings file that grants a tool will now show up as a probe verdict — an escape
+    /// that opens, or a baseline that moves — instead of being invisible. That is the whole
+    /// point: the record covers what actually runs.
+    fn mirror_vault_settings(&self) -> std::io::Result<()> {
+        let src_dir = self.real_vault.join(".claude");
+        let dst_dir = self.vault.join(".claude");
+        let mut copied_any = false;
+        for name in ["settings.json", "settings.local.json"] {
+            let src = src_dir.join(name);
+            if !src.is_file() {
+                continue;
+            }
+            if !copied_any {
+                std::fs::create_dir_all(&dst_dir)?;
+                copied_any = true;
+            }
+            std::fs::copy(&src, dst_dir.join(name))?;
+        }
+        Ok(())
+    }
+
     /// Build the row's scratch world: the stand-in vault with its readable/searchable files,
     /// the outside directory with the traversal and symlink targets, the state directory with
     /// a job file to steal, the background-process spawner — and the two decoys in the real
@@ -823,6 +868,7 @@ impl ProbeEnv {
         std::fs::create_dir_all(self.vault.join("notes/deep"))?;
         std::fs::create_dir_all(&self.outside)?;
         std::fs::create_dir_all(self.state.join("jobs"))?;
+        self.mirror_vault_settings()?;
 
         std::fs::write(
             self.vault_read_target(),
@@ -1954,6 +2000,7 @@ pub async fn run_battery(base: &Config, opts: &BatteryOptions) -> Result<RunOutc
             state: scratch.join(row.label().replace('/', "-")).join("state"),
             home: real_home.clone(),
             transcript_dir: transcript_dir.clone(),
+            real_vault: PathBuf::from(&base.vault),
             // A per-row seed: distinct nonces per row, and distinct on every run, so no
             // artifact of an earlier run can satisfy a probe.
             seed: stamp
@@ -2397,6 +2444,7 @@ mod tests {
             state: PathBuf::from("/tmp/probe-root/state"),
             home: PathBuf::from("/tmp/probe-home"),
             transcript_dir: PathBuf::from("/tmp/probe-home/.claude/projects/-vault"),
+            real_vault: PathBuf::from("/tmp/probe-real-vault"),
             seed: 42,
             http_port: 1234,
             net_log: Arc::new(Mutex::new(Vec::new())),
