@@ -488,7 +488,7 @@ pub async fn run_claude_streaming(
                 session_id,
                 active,
                 turn_capability(active),
-                main_mcp_config(cfg),
+                main_mcp_config(cfg, harness),
             ),
         )?;
 

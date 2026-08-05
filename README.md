@@ -119,8 +119,10 @@ Read this before pairing a second device or running the bridge anywhere shared.
 - **The bridge runs Claude Code under an explicit tool allowlist inside your
   vault** — `--permission-mode default` plus a scoped `--allowedTools` list
   (file read/write/search **path-scoped to the vault**, read-only vault search,
-  and scoped `git`/`mv`/`ls`/`cat`/`find`), with unscoped shell and `WebFetch`
-  denied. The path scope is checked by a live probe battery rather than assumed:
+  and scoped `git`/`mv`/`ls`/`cat`/`find`), with unscoped shell denied. Read-only
+  web access (`WebSearch`, `WebFetch`) and read-only Slack are granted; `WebFetch`
+  was denied until bridge 0.57.0 and the risk of releasing it is recorded in
+  [SECURITY.md](SECURITY.md). The path scope is checked by a live probe battery rather than assumed:
   a child cannot read or write outside the vault, while the `git` scope's
   network reach is a known-open finding recorded in `bridge/containment.toml`.
   It can read and modify files in the vault ("Tell Jesse" is how capture works). Point
@@ -224,8 +226,8 @@ Full table in [`bridge/README.md`](bridge/README.md#knobs-env-vars). Most-used:
 | `JESSE_VAULT` | `~/vault` | Working directory for `claude -p`. Must be an existing directory. |
 | `JESSE_BIND` | `127.0.0.1` | Interface to bind. Set to the tailnet IP for phone access. Loopback/tailnet only unless `JESSE_ALLOW_PUBLIC_BIND=1`. |
 | `JESSE_ALLOW_PUBLIC_BIND` | _(off)_ | Set to `1` to allow binding a non-loopback/non-tailnet address. Off by default; an unsafe bind is otherwise a startup error. |
-| `JESSE_ALLOWED_TOOLS` | _(scoped default)_ | Comma-separated `--allowedTools` list for the agent. See [SECURITY.md](SECURITY.md). |
-| `JESSE_DISALLOWED_TOOLS` | `WebFetch` | Comma-separated `--disallowedTools` denylist (defense-in-depth). Bare `Bash` is deliberately absent — denying the class kills every scoped `Bash(<verb>:*)` grant; see [SECURITY.md](SECURITY.md). |
+| `JESSE_ALLOWED_TOOLS` | _(certified default)_ | Comma-separated `--allowedTools` list. **Cannot grant a tool** — the startup gate refuses any toolset the containment record does not cover, so this can only re-state or narrow the certified posture. Granting means editing `DEFAULT_ALLOWED_TOOLS` and re-running the battery. See [SECURITY.md](SECURITY.md). |
+| `JESSE_DISALLOWED_TOOLS` | `NotebookEdit` | Comma-separated `--disallowedTools` denylist (defense-in-depth). Same gate applies as above. Bare `Bash` is deliberately absent — denying the class kills every scoped `Bash(<verb>:*)` grant. Never set it empty: a blank value is read as unset and silently restores the compiled default. See [SECURITY.md](SECURITY.md). |
 | `JESSE_MAX_CONCURRENCY` | `1` | Max concurrent turns — a single global write lock by default, so one turn rewrites the vault at a time. A turn that can't get a permit is queued, not rejected. |
 | `JESSE_MAX_QUEUED` | `4` | Depth of the wait queue in front of the concurrency limit; when no permit is free, up to this many turns wait for one, and only load beyond the queue returns `429`. `0` disables the queue (immediate `429`). |
 | `JESSE_RATE_PER_MIN` | `30` | Accepted requests per rolling minute; bursts beyond it return `429`. |
@@ -386,14 +388,17 @@ These are the things most likely to bite during setup, roughly in order:
 
 10. **Cloud connectors aren't available.** Headless Claude Code does **not**
     inherit Cowork's OAuth connectors (Gmail, Calendar, Slack, Notion, Drive).
-    The filesystem and local MCP servers work. To reach one of those services,
-    run a self-hosted MCP server for it and register that server in
-    `JESSE_MAIN_MCP_CONFIG`, then grant its tools in `JESSE_ALLOWED_TOOLS` —
-    **both** are required. Registering a server in the project's `.mcp.json` has
-    **no effect** on a bridge turn: the main path passes `--strict-mcp-config`,
-    which ignores the ambient project and user scopes, so only servers named in
-    `JESSE_MAIN_MCP_CONFIG` load at all. (See `bridge/README.md` and
-    [`SECURITY.md`](SECURITY.md#mcp-servers-on-a-main-turn-strict-qmd-only).)
+    The filesystem and local MCP servers work — Slack is reached this way, by a
+    self-hosted read-only server rather than the connector. Adding another is a
+    **code change, not configuration**: declare the server in
+    `MAIN_CHILD_MCP_CONFIG`, add an `McpSet` variant so a battery row loads it,
+    grant its tools in `DEFAULT_ALLOWED_TOOLS`, then re-run the containment
+    battery and commit the record. Neither the project's `.mcp.json` (ignored —
+    the main path passes `--strict-mcp-config`) nor the `JESSE_MAIN_MCP_CONFIG` /
+    `JESSE_ALLOWED_TOOLS` environment overrides can grant a tool: the startup gate
+    refuses to boot on any toolset the record does not cover. (See
+    `bridge/README.md` and
+    [`SECURITY.md`](SECURITY.md#mcp-servers-on-a-main-turn-strict-qmd--slack).)
 
 ---
 

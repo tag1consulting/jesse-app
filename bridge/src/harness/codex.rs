@@ -621,6 +621,17 @@ impl Harness for Codex {
         codex_capability_args(capability)
     }
 
+    /// qmd ALONE. Codex deliberately does not get the Slack server Claude Code carries:
+    /// nothing drives Slack through Codex, and giving it one would invalidate this
+    /// harness's record and orphan the operator acceptances keyed to its row labels.
+    fn main_mcp_config(&self) -> &'static str {
+        QMD_ONLY_MCP_CONFIG
+    }
+
+    fn shipped_rows(&self) -> &'static [ContainmentRow] {
+        &CODEX_SHIPPED_ROWS
+    }
+
     /// `None`: Codex keeps its threads privately, in a layout the bridge does not read.
     ///
     /// The consequences are the ones [`Harness::transcript_dir`] already specifies, and they

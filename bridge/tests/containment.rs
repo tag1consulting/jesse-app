@@ -66,11 +66,11 @@ fn the_record_covers_every_row_the_bridge_actually_spawns() {
         assert_eq!(r.harness, id, "a record embedded under the wrong harness id");
         assert_eq!(
             r.rows.len(),
-            SHIPPED_ROWS.len(),
-            "{id}: every (capability, MCP set) pair the bridge spawns needs its own row — a \
+            harness.shipped_rows().len(),
+            "{id}: every (capability, MCP set) pair THIS harness spawns needs its own row — a \
              level passes only when every MCP set recorded at that level passes"
         );
-        for row in SHIPPED_ROWS {
+        for row in harness.shipped_rows().iter().copied() {
             let rec = r
                 .row(capability_label(row.capability), row.mcp.label())
                 .unwrap_or_else(|| panic!("{id}: no recorded row for {}", row.label()));

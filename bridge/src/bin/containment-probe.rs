@@ -27,7 +27,7 @@
 
 use jesse_bridge::{
     compare_results, parse_results, render_results, run_battery, BatteryOptions, Config,
-    ContainmentRow, McpSet, SHIPPED_ROWS,
+    ContainmentRow, Harness, McpSet,
 };
 
 /// The committed record. Resolved against the crate root at COMPILE time so the binary always
@@ -131,7 +131,11 @@ async fn main() {
 
     // A partial run cannot be a record: a file missing rows or probes reads as a battery that
     // covered everything and found nothing, which is the exact lie this gate exists to stop.
-    if write && (opts.probes.is_some() || opts.rows.len() != SHIPPED_ROWS.len()) {
+    let shipped_row_count = match opts.harness.as_str() {
+        jesse_bridge::CODEX_ID => jesse_bridge::Codex.shipped_rows().len(),
+        _ => jesse_bridge::ClaudeCode.shipped_rows().len(),
+    };
+    if write && (opts.probes.is_some() || opts.rows.len() != shipped_row_count) {
         eprintln!(
             "containment-probe: --write records the WHOLE battery. Drop --rows/--probes, or \
              drop --write."

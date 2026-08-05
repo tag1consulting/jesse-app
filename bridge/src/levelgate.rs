@@ -459,9 +459,18 @@ pub fn validate_toolset_argv(
             errors.push(ConfigError::global(format!(
                 "the toolset this deployment would run at '{}' on harness '{}' is not the one \
                  the containment record was taken with, so the record cannot speak for it.\n  \
-                 recorded: {:?}\n  running: {:?}\nThe usual cause is JESSE_ALLOWED_TOOLS / \
-                 JESSE_DISALLOWED_TOOLS widening the allowlist. Unset them, or re-run the \
-                 battery against this posture and commit the record.",
+                 recorded: {:?}\n  running: {:?}\n\
+                 \nThe tool allowlist is NOT a config setting — it is a certified posture. \
+                 JESSE_ALLOWED_TOOLS / JESSE_DISALLOWED_TOOLS can only ever RE-STATE what the \
+                 battery already recorded; they cannot grant a tool. Setting them to anything \
+                 else fails here, at boot, exactly as it just did.\n\
+                 \nTo actually grant or remove a tool: edit DEFAULT_ALLOWED_TOOLS / \
+                 DEFAULT_DISALLOWED_TOOLS in bridge/src/config.rs (and, for a new MCP server, \
+                 MAIN_CHILD_MCP_CONFIG plus an McpSet variant so a row loads it), re-run \
+                 `cargo run --bin containment-probe -- --write`, commit the updated \
+                 bridge/containment.toml, rebuild, and restart. Budget ~30 minutes and a live \
+                 API spend for the battery; it is not a config edit.\n\
+                 \nTo get booting again right now: unset both variables and restart.",
                 row.label(),
                 harness.id(),
                 row.toolset_args,
@@ -686,7 +695,17 @@ mod tests {
         // The Write row records an open network route and a process that outlives the turn.
         // Passing keys on the hard gates alone, or Write would be ungrantable forever.
         let r = record();
-        let write_row = r.row("write", "qmd").expect("the write row");
+        // Derived from the harness rather than hardcoded: the claude-code write row is
+        // `write/qmd+slack` since 0.57.0, and a literal label here would silently need
+        // editing on every MCP-set change instead of following the harness that owns it.
+        let write_label = ClaudeCode
+            .shipped_rows()
+            .iter()
+            .find(|row| row.capability == Capability::Write)
+            .expect("claude-code ships a write row")
+            .mcp
+            .label();
+        let write_row = r.row("write", write_label).expect("the write row");
         assert!(
             write_row.probes.iter().any(|p| p.status == "known_open"),
             "precondition: the Write row has known-open baselines"

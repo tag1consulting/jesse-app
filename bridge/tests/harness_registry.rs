@@ -27,6 +27,12 @@ impl Harness for NoTranscriptHarness {
     fn streams_text(&self) -> bool {
         false
     }
+    fn main_mcp_config(&self) -> &'static str {
+        jesse_bridge::EMPTY_MCP_CONFIG
+    }
+    fn shipped_rows(&self) -> &'static [jesse_bridge::ContainmentRow] {
+        &jesse_bridge::CODEX_SHIPPED_ROWS
+    }
     fn expresses(&self, _capability: Capability) -> bool {
         true
     }
@@ -60,6 +66,12 @@ impl Harness for FixedDirHarness {
     }
     fn streams_text(&self) -> bool {
         true
+    }
+    fn main_mcp_config(&self) -> &'static str {
+        jesse_bridge::EMPTY_MCP_CONFIG
+    }
+    fn shipped_rows(&self) -> &'static [jesse_bridge::ContainmentRow] {
+        &jesse_bridge::CODEX_SHIPPED_ROWS
     }
     fn expresses(&self, _capability: Capability) -> bool {
         true

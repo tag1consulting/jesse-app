@@ -1176,9 +1176,18 @@ pub fn parse_codex_trace(stdout: &str, stderr: &str, mcp: McpSet) -> RunTrace {
         root_tools: vec!["Bash".to_string()],
         ..Default::default()
     };
-    if mcp == McpSet::Qmd {
+    // EVERY set that contains qmd, not just the qmd-only one. Matching a single variant is
+    // the same landmine `hard_gate_requirement` carried: a new set containing qmd would
+    // leave `mcp__qmd__status` out of the root tools, so a child that used qmd correctly
+    // would score as one that had no qmd tool at all — turning a working positive control
+    // into a `denied`. Codex does not spawn `QmdSlack` today; this is written so that if it
+    // ever does, the trace is right rather than quietly wrong.
+    if mcp.contains_qmd() {
         t.root_tools.push("mcp__qmd__status".to_string());
         t.mcp_servers = vec!["qmd".to_string()];
+        if mcp == McpSet::QmdSlack {
+            t.mcp_servers.push("slack".to_string());
+        }
     }
     for line in stdout.lines() {
         let line = line.trim();
@@ -1555,7 +1564,9 @@ const _: () = assert!(PROBE_MAX_ATTEMPTS > PROBE_ATTEMPTS);
 /// What to run and where.
 #[derive(Clone)]
 pub struct BatteryOptions {
-    /// The rows to probe. [`SHIPPED_ROWS`] for a real gate run; a subset only for iterating.
+    /// The rows to probe. The spawning harness's own shipped rows for a real gate run
+    /// (`CLAUDE_CODE_SHIPPED_ROWS` by default, matching the default harness); a subset only
+    /// for iterating.
     pub rows: Vec<ContainmentRow>,
     /// Probe ids to run, or `None` for all of them. A subset NEVER produces a committable
     /// record — the caller is responsible for not writing one.
@@ -1584,7 +1595,7 @@ pub struct BatteryOptions {
 impl Default for BatteryOptions {
     fn default() -> Self {
         BatteryOptions {
-            rows: SHIPPED_ROWS.to_vec(),
+            rows: CLAUDE_CODE_SHIPPED_ROWS.to_vec(),
             probes: None,
             timeout_secs: DEFAULT_PROBE_TIMEOUT_SECS,
             keep_scratch: false,
@@ -2035,7 +2046,7 @@ mod tests {
         for p in PROBES {
             assert!(seen.insert(p.id), "duplicate probe id {}", p.id);
             assert!(!p.tools.is_empty(), "{} names no capable tool", p.id);
-            for r in SHIPPED_ROWS {
+            for r in CLAUDE_CODE_SHIPPED_ROWS.iter().chain(CODEX_SHIPPED_ROWS.iter()).copied() {
                 // Panics (via the unreachable! arm) if a hard gate is added without a stated
                 // requirement — the table cannot silently grow a probe nothing asserts.
                 let req = hard_gate_requirement(p.id, p.class, &r);

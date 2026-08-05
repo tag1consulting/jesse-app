@@ -71,6 +71,15 @@ impl Harness for ClaudeCode {
         claude_capability_args(cfg, capability)
     }
 
+    /// qmd PLUS the self-hosted read-only Slack server.
+    fn main_mcp_config(&self) -> &'static str {
+        MAIN_CHILD_MCP_CONFIG
+    }
+
+    fn shipped_rows(&self) -> &'static [ContainmentRow] {
+        &CLAUDE_CODE_SHIPPED_ROWS
+    }
+
     /// `~/.claude/projects/<escaped-vault>` — the layout the session code used to hardcode.
     fn transcript_dir(&self, cfg: &Config) -> Option<PathBuf> {
         Some(vault_sessions_dir(&cfg.home, &cfg.vault))
@@ -293,11 +302,26 @@ pub fn interpret_claude_output(stdout: &str, stderr: &str, exit_success: bool) -
 /// `JESSE_MAIN_MCP_CONFIG` to a config naming the absolute interpreter + script path;
 /// no user-specific path is baked into this source.
 ///
-/// Only qmd is declared. `playwright` is deliberately EXCLUDED: no main-path feature
+/// qmd and slack are declared. `playwright` is deliberately EXCLUDED: no main-path feature
 /// references it (verified — zero references under `bridge/` and zero in the vault's
 /// `CLAUDE.md` / skills), and it is the exact server a prior "fetch" probe drove to a
 /// live network fetch out of a child that was supposed to be contained.
-pub const MAIN_CHILD_MCP_CONFIG: &str =
+///
+/// `slack` is a SELF-HOSTED read-only Slack server (npm `slack-mcp-server`), not the
+/// account-level claude.ai Slack connector — that one is still never loaded. It is declared
+/// here rather than supplied through `JESSE_MAIN_MCP_CONFIG` on purpose: the containment
+/// battery probes the SHIPPED consts, so a server reached only through the env override
+/// would be granted in the allowlist but never exercised by any probe. Its token arrives
+/// separately, by environment inheritance (`SLACK_MCP_XOXP_TOKEN`), so no secret is baked
+/// in here. `SLACK_MCP_ADD_MESSAGE_TOOL` and its siblings are deliberately never set:
+/// without them the server does not even register `conversations_add_message`.
+pub const MAIN_CHILD_MCP_CONFIG: &str = r#"{"mcpServers":{"qmd":{"type":"stdio","command":"qmd","args":["mcp"]},"slack":{"type":"stdio","command":"npx","args":["-y","slack-mcp-server@latest","--transport","stdio"]}}}"#;
+
+/// The qmd server ALONE — the main turn's server set before slack was added (bridge 0.57.0).
+/// No shipped spawn site uses it today; it is retained because [`McpSet::Qmd`] still names a
+/// posture a deployment can express, and because dropping it would silently re-point that
+/// label at a set containing slack.
+pub const QMD_ONLY_MCP_CONFIG: &str =
     r#"{"mcpServers":{"qmd":{"type":"stdio","command":"qmd","args":["mcp"]}}}"#;
 
 /// An EMPTY MCP server set, passed as `--mcp-config` alongside `--strict-mcp-config` so
@@ -331,11 +355,14 @@ pub fn mcp_args(config: &str) -> Vec<String> {
 }
 
 /// The MCP server set for a MAIN turn (and the title one-shot, which shares its builder):
-/// `JESSE_MAIN_MCP_CONFIG` when set, else the qmd-only [`MAIN_CHILD_MCP_CONFIG`].
-pub fn main_mcp_config(cfg: &Config) -> &str {
+/// `JESSE_MAIN_MCP_CONFIG` when set, else **the spawning harness's own** shipped set —
+/// qmd+slack for Claude Code, qmd alone for Codex. It takes the harness rather than
+/// reaching for a single global const precisely so that adding a server to one harness
+/// cannot silently change another's posture; see [`Harness::main_mcp_config`].
+pub fn main_mcp_config<'a>(cfg: &'a Config, harness: &dyn Harness) -> &'a str {
     cfg.main_mcp_config
         .as_deref()
-        .unwrap_or(MAIN_CHILD_MCP_CONFIG)
+        .unwrap_or_else(|| harness.main_mcp_config())
 }
 
 /// The MCP server set for the vault-QA child (and the shadow child, which shares its
@@ -818,7 +845,7 @@ mod tests {
             "hi",
             None,
             Capability::Write,
-            main_mcp_config(&test_config()),
+            main_mcp_config(&test_config(), &ClaudeCode),
         );
         let pos = |needle: &str| args.iter().position(|a| a == needle);
         let of = pos("--output-format").expect("--output-format present");
@@ -835,7 +862,7 @@ mod tests {
     #[test]
     fn build_claude_args_enforces_least_privilege() {
         let cfg = test_config();
-        let args = build_claude_args(&cfg, "hello", None, Capability::Write, main_mcp_config(&cfg));
+        let args = build_claude_args(&cfg, "hello", None, Capability::Write, main_mcp_config(&cfg, &ClaudeCode));
 
         // --allowedTools is always present, with the configured list as its value.
         let idx = args
@@ -930,15 +957,25 @@ mod tests {
         // no scoped allow entry is denied (a phone request cannot answer the
         // permission prompt), so default-deny + the scoped allowlist is the real
         // boundary. Denying the class only breaks the scoped grants. So the
-        // denylist keeps WebFetch and drops bare Bash.
+        // denylist drops bare Bash.
+        //
+        // WebFetch left this list in 0.57.0 (see DEFAULT_DISALLOWED_TOOLS). What
+        // is asserted now is the property that outlives any particular entry: the
+        // list must be NON-EMPTY. `env_string` treats a blank value as unset and
+        // the field falls back to the compiled default, so an empty denylist does
+        // not mean "deny nothing" — it silently means "deny whatever the default
+        // says", which would re-arm the WebFetch deny and kill the capability with
+        // no error. A non-empty list is the invariant; which tool holds the slot
+        // is a posture decision the containment record signs off on.
         let didx = args
             .iter()
             .position(|a| a == "--disallowedTools")
             .expect("--disallowedTools present");
         let deny: Vec<&str> = args[didx + 1].split(',').map(|t| t.trim()).collect();
         assert!(
-            deny.contains(&"WebFetch"),
-            "WebFetch must be denied: {deny:?}"
+            !deny.is_empty() && deny.iter().any(|t| !t.is_empty()),
+            "the denylist must never be empty — a blank value silently restores \
+             DEFAULT_DISALLOWED_TOOLS: {deny:?}"
         );
         assert!(
             !deny.contains(&"Bash"),
@@ -1064,7 +1101,7 @@ mod tests {
                 sid,
                 &ActiveModel::ambient(),
                 Capability::Write,
-                main_mcp_config(&cfg),
+                main_mcp_config(&cfg, &ClaudeCode),
             );
             let env = cmd_env_overrides(&cmd);
             for k in TITLE_ENV_KEYS {
@@ -1145,7 +1182,7 @@ mod tests {
                 "hi",
                 None,
                 turn_capability(&active),
-                main_mcp_config(&cfg),
+                main_mcp_config(&cfg, &ClaudeCode),
             );
             assert!(
                 args.iter().any(|a| a == "--strict-mcp-config"),
@@ -1169,15 +1206,22 @@ mod tests {
                 servers.contains_key("qmd"),
                 "{label}: the main path requires the qmd vault-search server: {mcp:?}"
             );
+            // …plus the self-hosted read-only Slack server, since 0.57.0.
+            assert!(
+                servers.contains_key("slack"),
+                "{label}: the main path declares the read-only slack server: {mcp:?}"
+            );
             // …and NOTHING else. An exact count (rather than a denylist of server names)
             // is what makes re-adding ANY server — a cloud connector, playwright, or one
             // that does not exist yet — a deliberate, test-breaking act instead of a
             // silent widening. A name-based check would only catch the servers we
             // happened to think of, the same fragility documented for the denylists.
+            // Raising this number is the test-breaking act; it must stay in lockstep
+            // with a battery row that actually loads the new set.
             assert_eq!(
                 servers.len(),
-                1,
-                "{label}: the main path must declare qmd and nothing else: {mcp:?}"
+                2,
+                "{label}: the main path must declare qmd and slack and nothing else: {mcp:?}"
             );
         }
     }
@@ -1197,7 +1241,7 @@ mod tests {
                 "hi",
                 None,
                 turn_capability(&active),
-                main_mcp_config(&cfg),
+                main_mcp_config(&cfg, &ClaudeCode),
             );
             assert_eq!(
                 arg_value(&args, "--mcp-config").as_deref(),
@@ -1307,7 +1351,7 @@ mod tests {
                 sid,
                 &opus,
                 turn_capability(&opus),
-                main_mcp_config(&cfg),
+                main_mcp_config(&cfg, &ClaudeCode),
             );
             let env = cmd_env_overrides(&cmd);
             for k in TITLE_ENV_KEYS {
@@ -1334,7 +1378,7 @@ mod tests {
                 sid,
                 &active,
                 turn_capability(&active),
-                main_mcp_config(&cfg),
+                main_mcp_config(&cfg, &ClaudeCode),
             );
             let env = cmd_env_overrides(&cmd);
             assert_eq!(
@@ -1386,7 +1430,7 @@ mod tests {
             "read the vault",
             None,
             turn_capability(&active),
-            main_mcp_config(&cfg),
+            main_mcp_config(&cfg, &ClaudeCode),
         );
         let val = |flag: &str| -> Option<String> {
             args.iter()
@@ -1435,7 +1479,7 @@ mod tests {
             "edit the vault",
             None,
             turn_capability(&active),
-            main_mcp_config(&cfg),
+            main_mcp_config(&cfg, &ClaudeCode),
         );
         let allow = args
             .iter()
@@ -1458,12 +1502,12 @@ mod tests {
             "hi",
             Some("sess-42"),
             Capability::Write,
-            main_mcp_config(&cfg),
+            main_mcp_config(&cfg, &ClaudeCode),
         );
         let ridx = args.iter().position(|a| a == "--resume").expect("--resume");
         assert_eq!(args[ridx + 1], "sess-42");
         // No --resume without a session id.
-        let none = build_claude_args(&cfg, "hi", None, Capability::Write, main_mcp_config(&cfg));
+        let none = build_claude_args(&cfg, "hi", None, Capability::Write, main_mcp_config(&cfg, &ClaudeCode));
         assert!(!none.iter().any(|a| a == "--resume"));
     }
     #[test]
@@ -1480,7 +1524,7 @@ mod tests {
             "hi",
             Some(&synthetic),
             Capability::Write,
-            main_mcp_config(&cfg),
+            main_mcp_config(&cfg, &ClaudeCode),
         );
         assert!(
             !args.iter().any(|a| a == "--resume"),
@@ -1496,7 +1540,7 @@ mod tests {
             "hi",
             Some("real-sess-1"),
             Capability::Write,
-            main_mcp_config(&cfg),
+            main_mcp_config(&cfg, &ClaudeCode),
         );
         let ridx = real.iter().position(|a| a == "--resume").expect("--resume");
         assert_eq!(real[ridx + 1], "real-sess-1");
@@ -1516,10 +1560,11 @@ mod tests {
         "default",
     ];
 
-    /// The qmd-only MCP config the main path falls back to when `JESSE_MAIN_MCP_CONFIG`
-    /// is unset, spelled out so the golden pins the literal a child is spawned with.
-    const GOLDEN_QMD_MCP: &str =
-        r#"{"mcpServers":{"qmd":{"type":"stdio","command":"qmd","args":["mcp"]}}}"#;
+    /// The MCP config the main path falls back to when `JESSE_MAIN_MCP_CONFIG` is unset —
+    /// qmd plus the read-only slack server since 0.57.0. Spelled out rather than referencing
+    /// [`MAIN_CHILD_MCP_CONFIG`] so the golden pins the literal a child is spawned with: a
+    /// const-vs-const comparison would pass no matter what the const became.
+    const GOLDEN_QMD_MCP: &str = r#"{"mcpServers":{"qmd":{"type":"stdio","command":"qmd","args":["mcp"]},"slack":{"type":"stdio","command":"npx","args":["-y","slack-mcp-server@latest","--transport","stdio"]}}}"#;
     const GOLDEN_EMPTY_MCP: &str = r#"{"mcpServers":{}}"#;
 
     /// The shared base plus a site's MCP + containment args — one full expected argv.
@@ -1594,7 +1639,7 @@ mod tests {
                 "PROMPT",
                 None,
                 Capability::Write,
-                main_mcp_config(&cfg)
+                main_mcp_config(&cfg, &ClaudeCode)
             ),
             golden(&[
                 "--strict-mcp-config",
@@ -1615,7 +1660,7 @@ mod tests {
                 "PROMPT",
                 None,
                 Capability::Read,
-                main_mcp_config(&cfg)
+                main_mcp_config(&cfg, &ClaudeCode)
             ),
             golden(&[
                 "--strict-mcp-config",
@@ -1743,7 +1788,7 @@ mod tests {
                 Some("sess-1"),
                 &ambient,
                 capability,
-                main_mcp_config(&cfg),
+                main_mcp_config(&cfg, &ClaudeCode),
             );
             same(
                 &harness.build_turn(&cfg, &req).expect("claude never refuses"),
@@ -1753,7 +1798,7 @@ mod tests {
                     Some("sess-1"),
                     &ambient,
                     capability,
-                    main_mcp_config(&cfg),
+                    main_mcp_config(&cfg, &ClaudeCode),
                 ),
                 label,
             );

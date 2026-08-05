@@ -195,10 +195,12 @@ and read-only). Only the servers named in that config load:
 | `qmd` | Read-only vault search — the four `mcp__qmd__*` tools in the allowlist above. Required; the main path is the one route that must not degrade to an empty server set |
 | `slack` | Read-only Slack read and search, added 2026-08-05 — six `mcp__slack__*` tools in the allowlist above. See [Slack](#slack-read-only-2026-08-05) |
 
-The compiled default `MAIN_CHILD_MCP_CONFIG`
-(`src/harness/claude_code.rs:301`) still names **qmd alone**; `slack` is added by
-the `JESSE_MAIN_MCP_CONFIG` override in the LaunchAgent, so a deployment that
-does not set that variable gets qmd only.
+Both are named in the compiled `MAIN_CHILD_MCP_CONFIG`
+(`src/harness/claude_code.rs`), not supplied by a LaunchAgent override. That is
+deliberate and load-bearing: `McpSet::config()` resolves the **shipped** consts,
+so a server reached only through `JESSE_MAIN_MCP_CONFIG` would be granted in the
+allowlist and never loaded by any probe — certified on paper, untested in fact.
+Declaring it here is what lets the `qmd+slack` battery rows exercise it.
 
 Everything else is **absent at the root**, not denied by name — including the
 account-level cloud connectors (Gmail, Slack, Google Calendar, Google Drive) and
@@ -231,8 +233,8 @@ Vault search being absent from a turn is silent (never an error), so a wrong
 ### Slack (read-only, 2026-08-05)
 
 A self-hosted `slack-mcp-server` (npm `slack-mcp-server`, upstream
-`korotovsky/slack-mcp-server`, v1.3.0), run under `npx` and declared in
-`JESSE_MAIN_MCP_CONFIG`. It is **not** the account-level claude.ai Slack
+`korotovsky/slack-mcp-server`, v1.3.0), run under `npx` and declared in the
+compiled `MAIN_CHILD_MCP_CONFIG`. It is **not** the account-level claude.ai Slack
 connector named above — that one is still never loaded; this is a separate
 process the bridge starts itself, which is why it reaches a headless turn at all.
 
@@ -651,6 +653,28 @@ acceptances that outlived the finding they excused.
 
 ### Re-running it
 
+**Order matters: get a passing record FIRST, build the serving binary LAST.** The record is
+embedded with `include_str!`, so a binary built while the record is stale or failing is a
+binary that **refuses to start**. Because launchd runs with `KeepAlive`, that binary sits at
+`target/release/jesse-bridge` doing no harm at all — until the running process restarts for
+any reason, at which point the bridge goes down and stays down. The running process keeps
+serving from memory, so nothing looks wrong while the trap is armed.
+
+The safe sequence, in this order:
+
+1. Change the posture (`config.rs`, `MAIN_CHILD_MCP_CONFIG`, an `McpSet` variant, rows).
+2. Re-run the battery with `--write` and confirm `gate = "pass"`. Use a scratch
+   `CARGO_TARGET_DIR` for the probe build, so building the probe does **not** overwrite the
+   serving binary while the record is still unsettled.
+3. Commit the record.
+4. **Only now** `cargo build --release`.
+5. Restart, and verify `/health`.
+
+Steps 2 and 4 were inverted on 2026-08-05 and left a twenty-minute window in which any crash
+of the running bridge would have been permanent. Nothing crashed; the window was the whole
+finding. If you must build before the record settles, build into a scratch
+`CARGO_TARGET_DIR` — never the one launchd's binary path points at.
+
 Re-run the battery on **every bump of the pinned agent binary**, on every change to the
 containment posture (`capability_args`, the tool lists, the MCP server sets), and before
 shipping a new `(capability, MCP set)` pair. A probe that flips in **either** direction — an
@@ -794,24 +818,26 @@ treated as disclosed and rotated — `JESSE_TOKEN`, both Fireworks tokens, and
 `SLACK_MCP_XOXP_TOKEN` once it is added. Re-run the checks above before trusting
 this paragraph; it records a state verified on one date, not a standing property.
 
-**Maintenance: re-sync the plist allowlist on every bridge upgrade.** Setting
-`JESSE_ALLOWED_TOOLS` in the LaunchAgent **pins** the allowlist and shadows
-`DEFAULT_ALLOWED_TOOLS` (`src/config.rs:154`) entirely. Any grant a later bridge
-release adds to that constant will **not** reach a deployment that sets the
-variable, and nothing warns about the divergence — the turn simply lacks a tool
-the release notes say it has. After upgrading the bridge, diff the plist value
-against the compiled constant and re-apply any additions. The same applies to
-`JESSE_DISALLOWED_TOOLS`.
+**The tool allowlist is not deployment configuration.** `JESSE_ALLOWED_TOOLS` and
+`JESSE_DISALLOWED_TOOLS` exist, and they look like the seam for granting a tool.
+They are not. `validate_toolset_argv` compares the argv this deployment *would*
+run against every row of the committed containment record and **refuses to
+start** on any difference, so those variables can only ever re-state what the
+battery already recorded. Setting them to anything else is a boot failure, not a
+grant.
 
-**Provenance of the pinned value.** `DEFAULT_ALLOWED_TOOLS` carries **23**
-comma-separated entries as of bridge 0.56.0; the plist pins **25** — those 23
-verbatim, plus `WebSearch` and `WebFetch`. The copy was not transcribed by eye:
-the constant was extracted from `src/config.rs`, its Rust line-continuations
-collapsed, and compared programmatically against the value read back out of the
-plist with `PlistBuddy`, asserting the plist value equals the constant plus
-exactly the `,WebSearch,WebFetch` suffix. Re-do that comparison rather than a
-visual diff when re-syncing — a single dropped entry in a 25-item single-line
-string is invisible to a reader and silently removes a grant.
+Granting or removing a tool therefore means: edit `DEFAULT_ALLOWED_TOOLS` /
+`DEFAULT_DISALLOWED_TOOLS` in `src/config.rs` — and for a new MCP server,
+`MAIN_CHILD_MCP_CONFIG` plus an `McpSet` variant so a row actually loads it —
+re-run `cargo run --features=containment-probe --bin containment-probe -- --write`,
+commit the updated `bridge/containment.toml`, rebuild, restart. Budget the
+battery's wall-clock and API spend; it is not a config edit. This was learned the
+expensive way on 2026-08-05: a plist-only grant looked correct, passed every
+local check, and failed at boot with a mismatch the message did not explain. The
+message now names this path.
+
+The variables keep one honest use: pinning a deployment to the posture it was
+already certified with, or narrowing it. Neither widens anything.
 
 ## Network bind safety
 

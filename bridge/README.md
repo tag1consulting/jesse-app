@@ -1385,8 +1385,8 @@ persona-rendered defaults so the app's cached "default" matches what a turn buil
 | `JESSE_VAULT` | `~/vault` | cwd for `claude -p` (loads CLAUDE.md) |
 | `JESSE_BIND` | `127.0.0.1` | Interface to bind — set to tailnet IP. Loopback/tailnet (`100.64.0.0/10`) only unless `JESSE_ALLOW_PUBLIC_BIND=1` |
 | `JESSE_ALLOW_PUBLIC_BIND` | (off) | Set `1`/`true` to allow a non-loopback/non-tailnet bind; otherwise such a bind is a startup error |
-| `JESSE_ALLOWED_TOOLS` | (scoped default) | Comma-separated `--allowedTools` list for the agent (see [`../SECURITY.md`](../SECURITY.md)) |
-| `JESSE_DISALLOWED_TOOLS` | `WebFetch` | Comma-separated `--disallowedTools` denylist. **Only `WebFetch`** — bare `Bash` is deliberately not here: denying it removes the whole Bash tool class and kills every scoped `Bash(...)` grant; unscoped Bash is still blocked by default-deny. See [`../SECURITY.md`](../SECURITY.md#agent-tool-allowlist-in-process-boundary) |
+| `JESSE_ALLOWED_TOOLS` | (certified default) | Comma-separated `--allowedTools` list. **Cannot grant a tool** — `validate_toolset_argv` refuses to boot on any toolset the containment record does not cover, so this can only re-state or narrow the certified posture (see [`../SECURITY.md`](../SECURITY.md)) |
+| `JESSE_DISALLOWED_TOOLS` | `NotebookEdit` | Comma-separated `--disallowedTools` denylist, subject to the same startup gate as above. `WebFetch` left this list in 0.57.0; `NotebookEdit` is a placeholder that keeps it **non-empty**, because a blank value is read as unset and silently restores the compiled default. Bare `Bash` is deliberately not here: denying it removes the whole Bash tool class and kills every scoped `Bash(...)` grant. See [`../SECURITY.md`](../SECURITY.md#agent-tool-allowlist-in-process-boundary) |
 | `JESSE_MAX_CONCURRENCY` | `1` | Max concurrent turns — a **single global write lock** by default, so at most one turn runs (and can rewrite vault files) at a time regardless of how many clients are connected. A turn that can't get a permit immediately is **queued** (see `JESSE_MAX_QUEUED`), not rejected |
 | `JESSE_MAX_QUEUED` | `4` | Depth of the wait queue in front of the concurrency limit. When no permit is free, up to this many turns **wait** for one (returning `202` immediately and streaming a "queued behind another turn" activity line while they wait); beyond the queue, load is shed with `429`. `0` disables the queue (an unavailable permit sheds `429` immediately — the pre-queue behavior) |
 | `JESSE_RATE_PER_MIN` | `30` | Accepted requests per rolling minute; bursts beyond it return `429` |
@@ -1779,6 +1779,27 @@ question rather than a path question and are left open deliberately. See
 [SECURITY.md](../SECURITY.md#containment-battery-the-acceptance-gate) for the full table
 and what is and is not decided about it.
 
+## Deploying a containment-posture change (build order)
+
+For an ordinary change, build and restart in any order you like. For a change to the
+**containment posture** — the tool lists, `MAIN_CHILD_MCP_CONFIG`, an `McpSet` variant, the
+shipped rows — the order is load-bearing, because the containment record is compiled in with
+`include_str!`:
+
+1. Change the posture.
+2. Re-run the battery (`--write`) and confirm `gate = "pass"`. Give the probe its own
+   `CARGO_TARGET_DIR` so this step cannot overwrite the serving binary.
+3. Commit `bridge/containment.toml`.
+4. **Then** `cargo build --release`.
+5. `launchctl bootout` + `bootstrap` (a plist env change needs a reload; `kickstart -k`
+   re-runs the in-memory job definition and will not re-read the file), then poll `/health`.
+
+Building before the record passes leaves a binary at `target/release/jesse-bridge` that
+**refuses to start**, while the already-running process keeps serving from memory — so
+everything looks healthy until the next restart, and `KeepAlive` then makes the outage
+permanent rather than transient. This is not hypothetical; see `../SECURITY.md`
+§ "Re-running it".
+
 ## Versioning
 
 The **bridge** and the **app** are versioned **independently**:
@@ -1838,9 +1859,14 @@ servers and the filesystem still work; scope remains vault Q&A + capture.
 
 Because `--strict-mcp-config` ignores the ambient user and project scopes,
 registering a server in this project's `.mcp.json` **no longer has any effect on a
-phone turn**. To add one deliberately, name it in `JESSE_MAIN_MCP_CONFIG` (and
-grant its tools in `JESSE_ALLOWED_TOOLS`) — both are required, and widening either
-is a security decision: see [`../SECURITY.md`](../SECURITY.md#mcp-servers-on-a-main-turn-strict-qmd-only).
+phone turn**. Nor does the `JESSE_MAIN_MCP_CONFIG` / `JESSE_ALLOWED_TOOLS` pair:
+those look like the seam, but the startup gate refuses to boot on any toolset the
+containment record does not cover, so they can only re-state the certified
+posture. Adding a server is a **code change** — declare it in
+`MAIN_CHILD_MCP_CONFIG`, add an `McpSet` variant so a battery row loads it (a
+server the battery never loads is granted but unproven), grant its tools in
+`DEFAULT_ALLOWED_TOOLS`, re-run the battery, commit the record. See
+[`../SECURITY.md`](../SECURITY.md#mcp-servers-on-a-main-turn-strict-qmd--slack).
 
 ## Code review (git checkouts under `Code/`)
 

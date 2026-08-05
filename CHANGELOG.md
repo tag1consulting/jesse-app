@@ -15,6 +15,89 @@ CI both run it). See the "Versioning" section of `bridge/README.md`.
 
 ## [Unreleased]
 
+## [Bridge 0.57.0] - 2026-08-05
+
+Two read-only reaches the bridge did not have: the open web, and Slack. Both are
+grants in the shipped posture, so both are certified by the battery rather than
+asserted by a config file.
+
+### Added
+
+- **Read-only web access on a main turn.** `WebSearch` and `WebFetch` join
+  `DEFAULT_ALLOWED_TOOLS` (`bridge/src/config.rs`). `WebSearch` was merely absent;
+  `WebFetch` was denied and had to be released — see Changed.
+- **A read-only Slack server on a main turn.** `MAIN_CHILD_MCP_CONFIG`
+  (`bridge/src/harness/claude_code.rs`) now declares `slack` alongside `qmd`: the
+  self-hosted npm `slack-mcp-server` (upstream `korotovsky/slack-mcp-server`), run
+  under `npx`. This is **not** the account-level claude.ai Slack connector, which
+  is still never loaded. Its `xoxp` token arrives by environment inheritance
+  (`SLACK_MCP_XOXP_TOKEN`), so no secret is baked into any config.
+- **Six `mcp__slack__*` tools**, all read-only, join the allowlist:
+  `conversations_history`, `conversations_replies`, `conversations_search_messages`,
+  `channels_list`, `channels_me`, `users_search`.
+- **`McpSet::QmdSlack` and the two battery rows that load it.** Claude Code's
+  main-turn rows moved from `qmd` to `qmd+slack`. Without this the Slack tools would
+  have been granted in the allowlist but never exercised by any probe:
+  `McpSet::config()` deliberately resolves the SHIPPED consts, not the env
+  overrides, so a server reached only through `JESSE_MAIN_MCP_CONFIG` is invisible
+  to the battery — certified on paper, untested in fact.
+- **`McpSet::contains_qmd()`, exhaustively matched with no `_` arm.** The
+  `search_qmd` positive control asked `row.mcp == McpSet::Qmd`, so adding a variant
+  silently inverted it from "qmd search must work" to "must be denied" — a live
+  battery run failed its own positive control on rows where qmd was working, and
+  recorded `gate = fail` that read like a containment finding and was not. Adding a
+  future set containing qmd is now a compile error at one line instead.
+
+### Changed — per-harness containment rows
+
+- **`SHIPPED_ROWS` is gone, replaced by `Harness::shipped_rows()`** with
+  `CLAUDE_CODE_SHIPPED_ROWS` (`…, read/qmd+slack, write/qmd+slack`) and
+  `CODEX_SHIPPED_ROWS` (`…, read/qmd, write/qmd`). `Harness::main_mcp_config()` is
+  per-harness for the same reason, and `main_mcp_config(cfg, harness)` now takes the
+  spawning harness rather than reaching for one global const.
+
+  One shared row list meant the row key was a global: giving **Claude Code** a Slack
+  server changed the key for **Codex** too, which would have invalidated
+  `containment-codex.toml`, demanded a battery re-run against a harness whose token
+  is the literal string `unused`, and orphaned two human `[[accepted]]` blocks keyed
+  by row label — including an operator signature on `write/qmd` dated 2026-08-04.
+  None of that had anything to do with Slack. Codex keeps qmd alone; its record and
+  both signatures are untouched by this release.
+- **`parse_codex_trace` carried the same landmine** and now asks `contains_qmd()`.
+  It registered qmd's tools only for the qmd-only set, so a Codex run on any future
+  qmd-bearing set would have scored a working positive control as a denial. Fixed
+  now rather than left armed for whoever re-records Codex next.
+
+### Changed
+
+- **`WebFetch` moved off `DEFAULT_DISALLOWED_TOOLS`.** Its rationale — *"the SSRF /
+  data-exfiltration surface the Ask/Tell workflows don't need"* — is **superseded,
+  not refuted**: read-only web access became a wanted capability, so the premise
+  "don't need" stopped holding. The surface it named is real and still present, and
+  is **accepted** rather than mitigated. The residual risk is that fetched content
+  enters a turn holding `Write(./**)` as a non-sandboxed user, which is a
+  prompt-injection path to the vault. A `WebFetch(domain:...)` allowlist was
+  considered and declined: it narrows one outbound door while `Bash(git:*)` leaves
+  another open, and that decision is explicitly coupled to any future narrowing of
+  `Bash(git:*)`.
+- **`DEFAULT_DISALLOWED_TOOLS` is now `NotebookEdit`** — a placeholder, because the
+  list **must never be empty**. `env_string` trims and treats blank as unset, and
+  the field falls back with `unwrap_or_else(|| DEFAULT_DISALLOWED_TOOLS)`, so an
+  empty value silently RESTORES the default and would re-arm the `WebFetch` deny
+  with no error anywhere. `NotebookEdit` is safe to deny: nothing in the allowlist
+  grants it, so it shadows no grant (unlike bare `Bash`).
+- **The startup gate now names the fix.** `validate_toolset_argv` previously
+  reported a toolset mismatch and suggested unsetting `JESSE_ALLOWED_TOOLS` —
+  accurate but unhelpful, since it never said that the allowlist is a *certified
+  posture* and that the env vars can only re-state it, never grant. The message now
+  says so, and names the actual path: edit the consts, re-run the battery, commit
+  the record, rebuild, restart. This was the day's real cost — a plist edit that
+  looked like a working seam and failed at boot with an error describing a mismatch
+  without naming the remedy.
+- `build_claude_args_enforces_least_privilege` no longer asserts that `WebFetch` is
+  denied; it asserts the invariant that outlives any entry — that the denylist is
+  **non-empty**.
+
 ## [Bridge 0.56.0] - 2026-08-04
 
 The Codex write sandbox was certified in 0.54.0. What stood between that and a
