@@ -15,6 +15,27 @@ CI both run it). See the "Versioning" section of `bridge/README.md`.
 
 ## [Unreleased]
 
+## [Bridge 0.60.1] - 2026-08-05
+
+Review follow-ups to 0.60.0. No behavioural change — the same locks, the same
+slots, the same argv.
+
+### Changed
+
+- **The per-turn re-entrancy fix now has its two properties asserted
+  separately.** One test was covering both "a turn's second tool call must not
+  block on its own first call's lock" (the regression 0.60.0 fixed) and "a
+  DIFFERENT turn still blocks" (the property that protects the vault). Split, so
+  a future break says which of the two it broke. The regression test drives the
+  real `LockBroker::handle` path under a deadline far below `LOCK_WAIT_TIMEOUT`,
+  so a regression fails the test rather than hanging the suite for 30 seconds.
+- **The open containment gap is now tracked as #66 and named in the code**, in a
+  comment above `the_write_lock_adds_exactly_one_known_flag_per_harness` — the
+  test that is standing in for a probed record. A note in a CHANGELOG nobody
+  re-reads is not a handoff; the next person to change something behind the write
+  lock will be looking at that test.
+
+
 ## [Bridge 0.60.0] - 2026-08-05
 
 The bridge ran exactly one turn at a time, across every client and every model,
@@ -98,7 +119,8 @@ not have. Now it has the lock, so the limit can do its own job.
   would re-probe the unhooked posture and prove nothing new about this change.
   Making the record speak for the write lock means teaching the battery to probe
   write-level rows with hooks installed. That is a deliberate decision, not an
-  oversight, and it is flagged for a human before merge.
+  oversight, and it is tracked as issue #66 — the exception to this project's
+  standing rule that an unprobed posture is not a shipped posture.
 
 
 ## [Bridge 0.59.0] - 2026-08-05

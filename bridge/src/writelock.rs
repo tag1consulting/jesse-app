@@ -782,36 +782,120 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_git_lock_is_re_entrant_within_one_call_but_not_across_turns() {
+    async fn one_tool_call_holds_both_the_file_lock_and_the_git_lock() {
         let b = Arc::new(LockBroker::new());
         let d = tmpdir();
         let f = d.join("a.txt");
         std::fs::write(&f, "x").unwrap();
-        let p = f.display().to_string();
         let r = b
             .handle(HookRequest::Pre {
                 turn: "t1".into(),
                 conversation: "c1".into(),
                 tool_use_id: "call1".into(),
-                target: Some(Some(p)),
+                target: Some(Some(f.display().to_string())),
                 git: true,
             })
             .await;
         assert!(r.allow);
-        // The same call holds both the file lock and the git lock.
-        assert_eq!(b.held_count(), 2);
-        // A different turn cannot take the git lock.
-        assert!(!b.try_take(&LockKey::Git, "t2", "call2"));
-        // …but the SAME turn's next call takes it over rather than blocking on itself.
+        assert_eq!(b.held_count(), 2, "the file lock AND the git lock");
+    }
+
+    /// REGRESSION: a turn's SECOND tool call must not block on a lock its own FIRST call
+    /// still holds.
+    ///
+    /// This shipped broken once. Re-entrancy was keyed on `(turn, tool_use_id)`, which looks
+    /// right until you notice that a post hook and the next pre hook are separate short-lived
+    /// processes with no ordering guarantee between them — so call B routinely arrives while
+    /// call A's lock is still held, and would wait out the full 30s timeout for a lock nothing
+    /// was actually contending for, then be refused.
+    ///
+    /// Driven through the REAL `handle` path with a deadline far under `LOCK_WAIT_TIMEOUT`:
+    /// if this ever regresses, the call blocks and the timeout here fails the test rather than
+    /// the suite hanging for half a minute.
+    #[tokio::test]
+    async fn a_turns_second_call_does_not_block_on_its_own_first_calls_lock() {
+        let b = Arc::new(LockBroker::new());
+        let d = tmpdir();
+        let (a, z) = (d.join("a.txt"), d.join("z.txt"));
+        std::fs::write(&a, "x").unwrap();
+        std::fs::write(&z, "x").unwrap();
+
+        // Call 1 writes a.txt and takes the git lock with it. No post hook — the race this
+        // guards against is exactly the one where the post has not landed yet.
         assert!(
-            b.try_take(&LockKey::Git, "t1", "call2"),
-            "a turn must never block on a lock its own previous call still holds"
+            b.handle(HookRequest::Pre {
+                turn: "t1".into(),
+                conversation: "c1".into(),
+                tool_use_id: "call1".into(),
+                target: Some(Some(a.display().to_string())),
+                git: true,
+            })
+            .await
+            .allow
         );
-        // And that re-key means call2's post hook is what releases it.
+
+        // Call 2 of the SAME turn writes a different file, and also wants git.
+        let second = timeout(
+            Duration::from_millis(500),
+            b.handle(HookRequest::Pre {
+                turn: "t1".into(),
+                conversation: "c1".into(),
+                tool_use_id: "call2".into(),
+                target: Some(Some(z.display().to_string())),
+                git: true,
+            }),
+        )
+        .await
+        .expect("a turn must never wait on itself — this is the regression");
+        assert!(second.allow, "and it must be allowed, not refused");
+
+        // The re-key means call2's post hook releases the git lock it inherited, rather than
+        // leaving it stranded until the turn ends.
         b.handle(post("t1", "call2", None)).await;
         assert!(
             b.try_take(&LockKey::Git, "t2", "other"),
-            "once released, another turn gets it"
+            "a different turn gets the git lock once call2 released it"
+        );
+    }
+
+    /// The other half, asserted SEPARATELY: re-entrancy per turn must not have loosened the
+    /// cross-turn property, which is the one that actually protects the vault.
+    #[tokio::test]
+    async fn a_different_turn_still_blocks_on_a_held_lock() {
+        let b = Arc::new(LockBroker::new());
+        let d = tmpdir();
+        let f = d.join("a.txt");
+        std::fs::write(&f, "x").unwrap();
+        assert!(
+            b.handle(HookRequest::Pre {
+                turn: "t1".into(),
+                conversation: "c1".into(),
+                tool_use_id: "call1".into(),
+                target: Some(Some(f.display().to_string())),
+                git: true,
+            })
+            .await
+            .allow
+        );
+        // A DIFFERENT turn gets neither the file lock nor the git lock.
+        assert!(!b.try_take(&LockKey::Path(f.clone()), "t2", "call2"));
+        assert!(!b.try_take(&LockKey::Git, "t2", "call2"));
+        // And it genuinely waits rather than being handed the lock.
+        let blocked = timeout(
+            Duration::from_millis(400),
+            b.handle(HookRequest::Pre {
+                turn: "t2".into(),
+                conversation: "c2".into(),
+                tool_use_id: "call2".into(),
+                target: Some(Some(f.display().to_string())),
+                git: false,
+            }),
+        )
+        .await;
+        assert!(
+            blocked.is_err(),
+            "another turn must BLOCK on a held lock — per-turn re-entrancy must not leak \
+             across turns, or the vault is unprotected"
         );
     }
 
