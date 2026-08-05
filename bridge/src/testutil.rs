@@ -20,7 +20,7 @@ pub(crate) fn test_config() -> Config {
         timeout_secs: 1800,
         allowed_tools: DEFAULT_ALLOWED_TOOLS.to_string(),
         disallowed_tools: DEFAULT_DISALLOWED_TOOLS.to_string(),
-        max_concurrency: 2,
+        concurrency: ConcurrencySettings::uniform(2, &["opus"]),
         max_queued: DEFAULT_MAX_QUEUED,
         rate_per_min: 30,
         job_ttl_secs: 600,

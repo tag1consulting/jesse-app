@@ -444,6 +444,7 @@ fn a_codex_conversation_resumes_across_three_turns() {
             std::path::Path::new("/vault/notes"),
             &[],
             &[],
+            false,
         );
         match &sid {
             None => assert!(

@@ -54,6 +54,11 @@ impl QueueGate {
         *self.waiting.lock_ok()
     }
 
+    /// Free permits right now — the slot counts the admission log line reports.
+    pub fn available(&self) -> usize {
+        self.sem.available_permits()
+    }
+
     /// Decide whether to run a new turn now, queue it, or shed it:
     /// - a permit is free right now → `Some(Ready(permit))` (run immediately);
     /// - no free permit but `waiting < max_queued` → `Some(Queued(ticket))`
@@ -79,6 +84,29 @@ impl QueueGate {
         let mut waiting = self.waiting.lock_ok();
         if *waiting >= self.max_queued {
             return None; // queue full → shed (429)
+        }
+        *waiting += 1;
+        Some(Admission::Queued(QueueTicket {
+            gate: self.clone(),
+            counted: true,
+        }))
+    }
+
+    /// Reserve a queue slot WITHOUT trying to take a permit, or shed if the queue is full.
+    ///
+    /// For a turn the caller already knows must wait for something else first — today, a turn
+    /// whose CONVERSATION is busy. Such a turn must not take a model slot on the request path
+    /// and then park on the conversation lock: that is head-of-line blocking, where two
+    /// queued messages of one thread occupy two of a model's slots doing nothing while a
+    /// different conversation's turn queues behind them.
+    ///
+    /// So it takes a ticket instead, waits for the conversation, and only then competes for a
+    /// slot — which also keeps the bridge's one acquisition order honest end to end:
+    /// conversation lock → model slot → global ceiling.
+    pub fn admit_queued_only(self: &Arc<Self>) -> Option<Admission> {
+        let mut waiting = self.waiting.lock_ok();
+        if *waiting >= self.max_queued {
+            return None;
         }
         *waiting += 1;
         Some(Admission::Queued(QueueTicket {

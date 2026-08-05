@@ -528,8 +528,8 @@ fn shadow_model_alias(cfg: &Config) -> String {
 /// behind it. The shadow task holds no production permit, so this reads reality only
 /// after the delivering turn has released its own — which the handler does before it
 /// hands the job here.
-pub fn production_busy(sem: &Semaphore, queue: &QueueGate) -> bool {
-    sem.available_permits() == 0 || queue.waiting() > 0
+pub fn production_busy(slots: &SlotTable) -> bool {
+    slots.production_busy()
 }
 
 /// Spawn the shadow mirror on a DETACHED, permit-free task and return its handle
@@ -540,8 +540,7 @@ pub fn production_busy(sem: &Semaphore, queue: &QueueGate) -> bool {
 /// awaited by the delivery path.
 pub fn spawn_shadow(
     cfg: Arc<Config>,
-    sem: Arc<Semaphore>,
-    queue: Arc<QueueGate>,
+    slots: Arc<SlotTable>,
     slot: Arc<Semaphore>,
     job: ShadowJob,
 ) -> tokio::task::JoinHandle<()> {
@@ -554,7 +553,7 @@ pub fn spawn_shadow(
         };
         let model = shadow_model_alias(&cfg);
         // Yield to production: a running/queued phone turn means skip + record it.
-        if production_busy(&sem, &queue) {
+        if production_busy(&slots) {
             append_shadow_pair(&cfg, &skipped_busy_pair(&job, &model));
             return;
         }
@@ -1040,15 +1039,20 @@ mod tests {
 
     #[test]
     fn production_busy_detects_held_permit_and_queue() {
-        let sem = Arc::new(Semaphore::new(1));
-        let queue = QueueGate::new(sem.clone(), 4);
+        let slots = SlotTable::new(
+            &SlotPlan {
+                total: 1,
+                per_model: HashMap::from([("opus".to_string(), 1)]),
+            },
+            4,
+        );
         // Idle: not busy.
-        assert!(!production_busy(&sem, &queue));
-        // Permit held by a production turn → busy.
-        let held = sem.clone().try_acquire_owned().unwrap();
-        assert!(production_busy(&sem, &queue));
+        assert!(!production_busy(&slots));
+        // A slot held by a production turn → busy.
+        let held = slots.admit("opus", false).unwrap();
+        assert!(production_busy(&slots));
         drop(held);
-        assert!(!production_busy(&sem, &queue));
+        assert!(!production_busy(&slots));
     }
 
     #[tokio::test]
@@ -1058,11 +1062,16 @@ mod tests {
         let mut cfg = armed_cfg();
         cfg.shadow_log = log.to_string_lossy().into_owned();
 
-        let sem = Arc::new(Semaphore::new(1));
-        let queue = QueueGate::new(sem.clone(), 4);
+        let slots = Arc::new(SlotTable::new(
+            &SlotPlan {
+                total: 1,
+                per_model: HashMap::from([("opus".to_string(), 1)]),
+            },
+            4,
+        ));
         let slot = Arc::new(Semaphore::new(1));
-        // A production turn holds the permit while the shadow runs.
-        let _held = sem.clone().try_acquire_owned().unwrap();
+        // A production turn holds the slot while the shadow runs.
+        let _held = slots.admit("opus", false).unwrap();
 
         let job = ShadowJob {
             turn_id: "turn-busy".to_string(),
@@ -1071,7 +1080,7 @@ mod tests {
             hosted_text: "hosted answer".to_string(),
             hosted_wall_ms: 1234,
         };
-        spawn_shadow(Arc::new(cfg), sem.clone(), queue, slot, job)
+        spawn_shadow(Arc::new(cfg), slots.clone(), slot, job)
             .await
             .unwrap();
 
@@ -1082,7 +1091,7 @@ mod tests {
         assert_eq!(pairs[0].hosted_text, "hosted answer");
         assert!(pairs[0].shadow_text.is_none());
         // The shadow never took the production permit.
-        assert_eq!(sem.available_permits(), 0);
+        assert_eq!(slots.ceiling_free(), 0);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

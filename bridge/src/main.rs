@@ -10,7 +10,7 @@ use jesse_bridge::{
     harness_default_bin, harnesses_in_use, is_bind_allowed, load_local_models,
     manual_pairing_lines, pairing_payload, show_token_opt_in, spawn_eviction_task,
     spawn_session_gc_task, start_health_prober, validate_model_config, AppState, Config,
-    BINARY_DRIFT, CONTAINMENT_RECORDS,
+    bind_broker, serve_broker, BINARY_DRIFT, CONTAINMENT_RECORDS, ConfigError,
 };
 
 #[tokio::main]
@@ -40,7 +40,16 @@ async fn main() {
     // probed. A silently-ignored key would be a silent security downgrade, so nothing here
     // warns and continues. See `levelgate`.
     let declared = load_local_models(&cfg.home);
-    let errors = validate_model_config(&cfg, &declared, CONTAINMENT_RECORDS);
+    let mut errors = validate_model_config(&cfg, &declared, CONTAINMENT_RECORDS);
+    // The `[concurrency]` table joins the SAME gate. A misspelled model id there is refused by
+    // name rather than silently ignored — a config surface that quietly does nothing is the
+    // failure mode this project keeps designing against.
+    if let Err(slot_errors) = cfg.slot_plan() {
+        errors.extend(slot_errors.into_iter().map(|message| ConfigError {
+            model: None,
+            message,
+        }));
+    }
     if !errors.is_empty() {
         eprintln!(
             "jesse-bridge: refusing to start — {} configuration problem(s):",
@@ -88,6 +97,18 @@ async fn main() {
         }
     }
     let _ = SETTINGS_DRIFT.set(settings_grants);
+
+    // The DEPRECATED single-limit key, announced rather than silently applied. An operator who
+    // set it to 1 on purpose gets a global ceiling of 1, which is exactly the pre-0.60.0
+    // behavior — but they are told, because the key they set no longer means what it did.
+    if let Some(n) = cfg.concurrency.legacy_max_concurrency {
+        eprintln!(
+            "jesse-bridge: NOTE — JESSE_MAX_CONCURRENCY is deprecated. Its value ({n}) is being \
+             used as the GLOBAL CEILING on turns in flight across all models. Per-model slots \
+             now come from the [concurrency] table (or JESSE_MODEL_<ID>_CONCURRENCY); set \
+             [concurrency].total or JESSE_MAX_TURNS to name the ceiling directly."
+        );
+    }
 
     // One binary check per harness some configured model actually references. A config full
     // of Codex models must not demand a Claude binary for the models it does not have — and
@@ -194,6 +215,44 @@ async fn main() {
     // the health path is entirely absent there. Never blocks a turn (detached tasks); a
     // probe failure only demotes that model to unhealthy, never disturbs the bridge.
     start_health_prober(state.health.clone(), &state.cfg.model_registry);
+    // THE VAULT WRITE LOCK'S BROKER. Children's `PreToolUse` / `PostToolUse` hooks connect to
+    // this socket to take and release per-file locks; the bridge holds them, and releases
+    // every lock a turn holds when that turn's task ends (see `TurnLockRelease`).
+    //
+    // Bound in the STATE DIR, which is reachable by BOTH harnesses' hooks — a Codex child's
+    // own sandbox cannot write there, but its hook subprocess is not sandboxed and can. That
+    // measurement is what let this ship without widening `sandbox_workspace_write`.
+    //
+    // A bind failure DISARMS the lock rather than blocking boot, and that degradation is safe
+    // because the slot plan is resolved independently: a write-level model whose harness
+    // cannot lock is already capped at one slot, and with no helper or no socket no turn is
+    // handed a `WriteLockChild` at all. The result is a bridge that behaves like 0.59.0.
+    match (state.cfg.writelock_socket(), state.hook_helper.clone()) {
+        (Some(path), Some(helper)) => match bind_broker(&path) {
+            Ok(listener) => {
+                println!(
+                    "jesse-bridge: vault write lock armed — broker {} , helper {}",
+                    path.display(),
+                    helper.display()
+                );
+                tokio::spawn(serve_broker(listener, state.broker.clone()));
+            }
+            Err(e) => eprintln!(
+                "jesse-bridge: WARNING — could not bind the write-lock broker at {} ({e}). \
+                 Concurrent write-level turns are DISARMED; the bridge will serve them one at \
+                 a time.",
+                path.display()
+            ),
+        },
+        (_, None) => eprintln!(
+            "jesse-bridge: WARNING — the `jesse-hook` helper was not found beside this binary. \
+             The vault write lock is DISARMED; write-level turns will not run concurrently."
+        ),
+        (None, _) => eprintln!(
+            "jesse-bridge: WARNING — no state dir, so there is nowhere to put the write-lock \
+             broker socket. The vault write lock is DISARMED."
+        ),
+    }
     axum::serve(listener, app(state))
         .await
         .expect("server error");

@@ -15,6 +15,92 @@ CI both run it). See the "Versioning" section of `bridge/README.md`.
 
 ## [Unreleased]
 
+## [Bridge 0.60.0] - 2026-08-05
+
+The bridge ran exactly one turn at a time, across every client and every model,
+because a concurrency limit of 1 was standing in for a vault write lock it did
+not have. Now it has the lock, so the limit can do its own job.
+
+### Added
+
+- **Per-model concurrency slots, plus a global ceiling.** Every configured model
+  gets its own slot count and its own wait queue; a global ceiling bounds total
+  turns in flight so six configured models cannot put eighteen agent children on
+  one machine. Both are keyed on MODEL ID and neither branches on a harness id —
+  the harness is consulted once, at startup, for a default
+  (`Harness::default_concurrency`, 3 for both shipped harnesses, 1 for anything
+  that declares nothing). Because each model owns its queue, a saturated harness
+  cannot shed an admissible turn belonging to the other one.
+- **A vault write lock**, taken by the child through each agent CLI's
+  `PreToolUse`/`PostToolUse` hooks and held by the bridge. One lock per target
+  file — keyed on the fully-resolved absolute path, so a Claude child's absolute
+  spelling and a Codex child's `cwd`-relative one collapse to one key — plus one
+  global lock around git, and one coarse lock for any write whose target cannot
+  be named. Reads, searches and thinking never contend at all.
+- **A compare-and-swap against what was read.** A per-conversation record of the
+  content hash of every file the session read through a tool; a write whose file
+  changed since is refused with a re-read-and-retry message, which both harnesses
+  surface to the model as a recoverable error rather than a crash.
+- **A per-conversation lock**, so two turns of one thread never run at once
+  whatever the slot counts say — they resume the same underlying session, and the
+  second would otherwise resume a transcript the first is still writing. The
+  second turn queues; it is not rejected.
+- `jesse-hook`, a second binary in the same crate, invoked by both harnesses'
+  hooks. No new dependency: the SHA-256 comes from `ring`, already in the graph.
+
+### Changed
+
+- **`JESSE_MAX_CONCURRENCY` is deprecated and REMAPPED to the global ceiling**,
+  with a startup notice. An operator who set it to 1 on purpose still gets one
+  turn at a time — exactly the old behavior — rather than silently inheriting six.
+  Per-model slots now come from a `[concurrency]` table keyed by model id (or
+  `JESSE_MODEL_<ID>_CONCURRENCY`); `[concurrency].total` or `JESSE_MAX_TURNS`
+  names the ceiling directly. A `[concurrency]` key naming a model that is not in
+  the registry is a startup error that names the key, not a silent no-op.
+- **An operator who configures nothing new** gets: 3 slots for every model on both
+  shipped harnesses, a global ceiling of 6, the write lock armed, and the same
+  429-when-the-queue-is-full behavior as before.
+- Codex children spawned for a WRITE-level turn now also pass
+  `--dangerously-bypass-hook-trust`, and Claude Code children a bridge-owned
+  `--settings`. Neither touches `capability_args`, so the committed containment
+  records still match what the startup gate compares — see the caveat below.
+
+### Fixed
+
+- Nothing user-visible; this is the fix for the hazard the old
+  `max_concurrency = 1` default was silently working around.
+
+### Known races, named deliberately
+
+- **A file read through the SHELL records no hash**, so the compare-and-swap has
+  no baseline for it and the write is allowed. Failing closed would refuse every
+  first write and every write to a file the session never opened through a tool.
+  A lost update through `cat`-then-write therefore remains possible. It is logged
+  each time it happens. This is wider on Codex than on Claude Code, because Codex
+  has no native read tool that names a file — it reads through the shell — so a
+  Codex conversation gets the per-file lock but not the compare-and-swap.
+- **A multi-file `apply_patch` takes the coarse global lock** rather than a lock
+  per file, because the broker holds one lock per tool call and locking one member
+  of an atomic patch would leave the rest unprotected.
+- **A live Codex turn intermittently ends with no final message** (~1 run in 5),
+  which the driver reports as `502 empty result`. Measured with the write lock ON
+  and OFF at the same rate, and 4/4 clean at the CLI level, so it is NOT caused by
+  this change. Deliberately not fixed here — see
+  `a_codex_turn_without_the_write_lock_is_the_control`.
+
+### Containment
+
+- `capability_args` is unchanged on both harnesses, asserted by
+  `the_write_lock_adds_exactly_one_known_flag_per_harness`, so both committed
+  records still match the argv the startup gate compares and boot is unaffected.
+- **Neither record VOUCHES for the hooked child, and that gap is open.** The
+  battery builds its children with `write_lock: None`, so re-cutting it today
+  would re-probe the unhooked posture and prove nothing new about this change.
+  Making the record speak for the write lock means teaching the battery to probe
+  write-level rows with hooks installed. That is a deliberate decision, not an
+  oversight, and it is flagged for a human before merge.
+
+
 ## [Bridge 0.59.0] - 2026-08-05
 
 Every Codex turn after a conversation's first one died before the model ran, and

@@ -455,6 +455,7 @@ pub async fn run_claude_streaming(
     active: &ActiveModel,
     harness: &dyn Harness,
     spawned: &SpawnedSessions,
+    write_lock: Option<&WriteLockChild>,
 ) -> Result<(String, Option<String>, ShadowUsage), ApiError> {
     const MAX_ATTEMPTS: u32 = 3; // 1 try + 2 retries
 
@@ -485,17 +486,19 @@ pub async fn run_claude_streaming(
         // its ANTHROPIC_* + CLAUDE_CODE_SUBAGENT_MODEL; for the ambient default it
         // applies nothing (byte-for-byte today's command). The capability it is granted
         // comes from the same model: writes-on → Write, read-only → Read.
-        let mut cmd = harness.build_turn(
+        let mut req = main_turn_request(
             cfg,
-            &main_turn_request(
-                cfg,
-                prompt,
-                session_id,
-                active,
-                turn_capability(active),
-                main_mcp_config(cfg, harness),
-            ),
-        )?;
+            prompt,
+            session_id,
+            active,
+            turn_capability(active),
+            main_mcp_config(cfg, harness),
+        );
+        // THE VAULT WRITE LOCK, installed per attempt because the child is rebuilt per
+        // attempt. `None` for a turn that cannot write the vault or a deployment where the
+        // broker is disarmed; the harness then builds exactly the child 0.59.0 built.
+        req.write_lock = write_lock;
+        let mut cmd = harness.build_turn(cfg, &req)?;
 
         let mut child = cmd.spawn().map_err(|e| {
             (

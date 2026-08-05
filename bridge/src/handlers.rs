@@ -219,6 +219,7 @@ pub async fn run_ask_hosted_or_emergency(
     active: &ActiveModel,
     recent_context: Option<&str>,
     spawned: &SpawnedSessions,
+    write_lock: Option<&WriteLockChild>,
 ) -> AskResult {
     let now = Instant::now();
     // Which model would answer an emergency ask: the same routing rule the routine route
@@ -286,6 +287,7 @@ pub async fn run_ask_hosted_or_emergency(
             active,
             cfg.harnesses.serving(active),
             spawned,
+            write_lock,
         )
         .await,
     );
@@ -542,24 +544,58 @@ pub async fn jesse(
         &st.cfg.persona,
     )?;
 
-    // Concurrency + bounded queue: decide whether this turn runs now, waits for a
-    // permit, or is shed. A free permit → run immediately (as before). No free
-    // permit but the wait queue has room → QUEUE it: we still create the job and
-    // return 202 below, and the permit is acquired INSIDE the spawned task, so a
-    // second client's turn waits for the first to finish and then runs (the
-    // single-writer default protects vault files from concurrent rewrites). Beyond
-    // the queue (`max_queued`) → shed with 429, exactly as before. The admission is
-    // carried into the task; on any early return below it drops cleanly (a Ready
-    // permit is released, a Queued ticket frees its reserved slot).
-    let admission = match st.queue.admit() {
+    // PER-MODEL SLOTS + the global ceiling: does this turn run now, wait, or shed?
+    //
+    // A free slot under the ceiling → run immediately. A free slot with the ceiling full →
+    // still `Ready`, and the task waits for the ceiling holding its model slot. No free slot
+    // (or a conversation that is already running a turn) → QUEUE it: the job is created and
+    // 202 returned below, and the slot is taken INSIDE the spawned task. Beyond that model's
+    // own queue (`max_queued`) → 429.
+    //
+    // The queues are PER MODEL, which is what stops a saturated Claude queue shedding a Codex
+    // turn that has a free slot. The admission is carried into the task; on any early return
+    // below it drops cleanly (a Ready permit is released, a Queued ticket frees its slot).
+    let model_id = active.id.clone();
+    let conversation_busy = st.conversation_locks.is_busy(&conversation_id);
+    let admission = match st.slots.admit(&model_id, conversation_busy) {
         Some(a) => a,
         None => {
+            eprintln!(
+                "jesse-bridge: SHED turn on model '{}' (harness {}) — {} slot(s), {} free, {} \
+                 waiting, ceiling {}/{}",
+                model_id,
+                st.cfg.harnesses.serving(&active).id(),
+                st.slots.limit_for(&model_id),
+                st.slots.free_for(&model_id),
+                st.slots.waiting_for(&model_id),
+                st.slots.ceiling_free(),
+                st.slots.total(),
+            );
             return Err((
                 StatusCode::TOO_MANY_REQUESTS,
                 "busy: too many turns queued".to_string(),
-            ))
+            ));
         }
     };
+    // EVERY admission decision is logged at info, naming the model, the harness and the slot
+    // counts, so a stuck queue is visible in the log rather than only in the app.
+    eprintln!(
+        "jesse-bridge: ADMIT turn on model '{}' (harness {}) — {} — {} slot(s), {} free, {} \
+         waiting, ceiling {}/{}{}",
+        model_id,
+        st.cfg.harnesses.serving(&active).id(),
+        match &admission {
+            TurnAdmission::Ready { ceiling: Some(_), .. } => "running now",
+            TurnAdmission::Ready { ceiling: None, .. } => "waiting for the global ceiling",
+            TurnAdmission::Queued { .. } => "queued",
+        },
+        st.slots.limit_for(&model_id),
+        st.slots.free_for(&model_id),
+        st.slots.waiting_for(&model_id),
+        st.slots.ceiling_free(),
+        st.slots.total(),
+        if conversation_busy { " (its conversation is busy)" } else { "" },
+    );
 
     // Decode + validate any attachments (bad input → 400; the permit drops on
     // this early return), then write them to a per-request scratch dir and name
@@ -679,9 +715,13 @@ pub async fn jesse(
     // a live/queued phone turn) and the at-most-one shadow slot. All three are Arcs;
     // entirely inert unless `cfg.shadow_backend` is set — with shadow disarmed nothing
     // below reads them and every path is byte-for-byte today's behavior.
-    let shadow_sem = st.sem.clone();
-    let shadow_queue = st.queue.clone();
+    let shadow_slots = st.slots.clone();
     let shadow_slot = st.shadow_slot.clone();
+    // The gates and the write lock, moved into the task.
+    let slots = st.slots.clone();
+    let conversation_locks = st.conversation_locks.clone();
+    let broker = st.broker.clone();
+    let hook_helper = st.hook_helper.clone();
     let handle = tokio::spawn(async move {
         // Hold the scratch dir for the whole turn; its Drop removes the decoded
         // attachment files when the task ends — success, error, or timeout. The
@@ -709,16 +749,76 @@ pub async fn jesse(
         //
         // The turn/timeout clock starts only AFTER this — `run_claude_streaming`'s
         // JESSE_TIMEOUT is measured from its own call below, never while queued.
-        let _permit: OwnedSemaphorePermit = match admission {
-            Admission::Ready(p) => p,
-            Admission::Queued(ticket) => {
+        // ---- THE ONE ACQUISITION ORDER --------------------------------------------
+        //
+        //     conversation lock → model slot → global ceiling
+        //
+        // …continuing, once the child is running, into the write lock's
+        //
+        //     → per-file write lock → global git lock
+        //
+        // One fixed order everywhere is what rules out a deadlock; WHICH order is decided by
+        // starvation (see `SlotTable`). The conversation lock is outermost because it is the
+        // only one a turn can be certain it needs before it knows anything else.
+        //
+        // THE CONVERSATION LOCK IS NOT OPTIONAL and is independent of the slot count: two
+        // turns of one conversation resume the same underlying session, so the second would
+        // resume a transcript the first is still writing. Both harnesses resume, so this is
+        // one bridge-level lock rather than anything per harness.
+        let conv_mutex = conversation_locks.get(&cid);
+        let _conv_guard = match conv_mutex.clone().try_lock_owned() {
+            Ok(g) => g,
+            Err(_) => {
+                // The one wait a user can actually act on: they sent two messages.
+                jobs.stream_push_activity(
+                    &jid,
+                    ToolActivity::used(CONVERSATION_WAIT_ACTIVITY),
+                );
+                conv_mutex.lock_owned().await
+            }
+        };
+        // Now the slots. A Queued admission takes its model slot here; a Ready one already
+        // holds it and may still owe the ceiling. Cancelling a queued turn aborts this task
+        // while it waits: the ticket's Drop frees its queue slot and no child is ever spawned.
+        //
+        // The turn/timeout clock starts only AFTER all of this — `run_claude_streaming`'s
+        // JESSE_TIMEOUT is measured from its own call below, never while queued.
+        let _permits = match admission {
+            TurnAdmission::Ready {
+                model,
+                ceiling: Some(ceiling),
+                ..
+            } => SlotTable::permits(model, ceiling),
+            TurnAdmission::Ready { model, .. } => {
+                jobs.stream_push_activity(&jid, ToolActivity::used(QUEUED_ACTIVITY));
+                let ceiling = slots.acquire_ceiling().await;
+                SlotTable::permits(model, ceiling)
+            }
+            TurnAdmission::Queued { ticket } => {
                 // Reflect the wait in the live stream, reusing the activity hint
                 // mechanism (no new SSE frame type). A late/reconnecting subscriber
                 // sees it via the accumulated snapshot on subscribe.
                 jobs.stream_push_activity(&jid, ToolActivity::used(QUEUED_ACTIVITY));
-                ticket.wait_for_permit().await
+                let model = ticket.wait_for_permit().await;
+                let ceiling = slots.acquire_ceiling().await;
+                SlotTable::permits(model, ceiling)
             }
         };
+        // RELEASE EVERY WRITE LOCK THIS TURN HOLDS WHEN IT ENDS — however it ends.
+        //
+        // This is the release the whole broker design rests on, and it is why the bridge is
+        // the broker rather than a lock file with a reaper: a child killed between its pre
+        // hook and its post hook leaves a lock nothing else would ever clear. Its Drop runs on
+        // success, on error, on timeout, on panic and on the task abort a cancel performs.
+        let _lock_release = TurnLockRelease {
+            broker: broker.clone(),
+            cfg: cfg.clone(),
+            turn: jid.clone(),
+        };
+        // GATED ON CAPABILITY, NOT ON HARNESS. `turn_capability` already derives Write vs
+        // Read from the model's level, so a read-level turn never touches the broker at all
+        // and never pays for a lock it cannot need.
+        let write_lock = build_write_lock_child(&cfg, &hook_helper, &active, &jid, &cid);
 
         // Turn wall clock starts here (after the permit — queued time doesn't count).
         let turn_start = Instant::now();
@@ -846,6 +946,7 @@ pub async fn jesse(
                     &active,
                     harness,
                     &spawned,
+                    write_lock.as_ref(),
                 )
                 .await,
             );
@@ -1017,6 +1118,7 @@ pub async fn jesse(
                         &active,
                         recent_block.as_deref(),
                         &spawned,
+                        write_lock.as_ref(),
                     )
                     .await;
                     route = r.route;
@@ -1048,6 +1150,7 @@ pub async fn jesse(
                 &active,
                 recent_block.as_deref(),
                 &spawned,
+                write_lock.as_ref(),
             )
             .await;
             route = r.route;
@@ -1333,11 +1436,10 @@ pub async fn jesse(
         // phone. `None` (disarmed/ineligible/unsampled — the common case) leaves this a
         // no-op and the permit drops at task end exactly as before.
         if let Some(job) = shadow_job {
-            drop(_permit);
+            drop(_permits);
             spawn_shadow(
                 cfg.clone(),
-                shadow_sem.clone(),
-                shadow_queue.clone(),
+                shadow_slots.clone(),
                 shadow_slot.clone(),
                 job,
             );
