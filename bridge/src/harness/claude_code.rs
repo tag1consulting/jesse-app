@@ -586,7 +586,8 @@ pub fn build_claude_args(
         // The child's cwd is the vault, so Claude Code performs settings discovery there and
         // ANY permission entry it finds is a grant the containment record and the startup
         // gate cannot see. On 2026-08-05 the battery — once its probe world was made faithful
-        // — caught `.claude/settings.local.json` granting `Read(//Users/jandrews/**)`, which
+        // — caught `.claude/settings.local.json` granting `Read(//Users/user/**)` (the
+        // operator's whole home, redacted here to the documented placeholder), which
         // let a `read`-level child read the agent-credential decoy and session transcripts in
         // the real home. That file also carried arbitrary-execution grants
         // (`Bash(/opt/homebrew/bin/node *)`, `Bash(env -i … sh -c ' *)`, `Bash(brew install *)`).
