@@ -15,6 +15,45 @@ CI both run it). See the "Versioning" section of `bridge/README.md`.
 
 ## [Unreleased]
 
+## [Bridge 0.58.0] - 2026-08-05
+
+The battery could not see a whole class of grant, and the record therefore
+overstated the boundary. This closes the blind spot and makes CLI staleness loud.
+
+### Fixed
+
+- **The probe world now mirrors the real vault's project settings.** The child's
+  cwd is a disposable stand-in vault, so Claude Code does project-scope settings
+  discovery against *that* directory — and a scratch tree with no `.claude/` made
+  the battery structurally blind to every grant made in a settings file.
+  `ProbeEnv::prepare` copies `.claude/settings.json` and `.claude/settings.local.json`
+  from the real vault into the stand-in, so a settings-file grant now surfaces as a
+  probe verdict instead of as nothing. Copying (rather than pointing the child at the
+  real vault) keeps every write probe inside the disposable tree.
+
+  Found the hard way: the vault's `.claude/settings.json` had been granting
+  `Bash(duckdb:*)` and `Bash(brew install duckdb)` to every phone turn — arbitrary
+  package installation from a phone request — invisible to both the record and the
+  startup gate, because no probe ever stood where the child stands. Both entries are
+  removed; nothing on a bridge turn needs duckdb (`Skill()` is pinned to
+  `diet-logging`, and the only duckdb consumer is the `diet-query` skill, which a
+  phone turn cannot reach).
+
+### Added
+
+- **Advisory containment-record staleness check** (`detect_binary_drift`). The record
+  names `binary_version`, but until now nothing in the serving path read it — only
+  `containment-probe` compared it, i.e. only while already re-running the battery. A
+  routine agent-CLI upgrade therefore invalidated what the record described **in
+  silence**. The bridge now compares the live `<bin> --version` per in-use harness at
+  startup, prints a warning naming the re-run command, and reports it on `GET /health`
+  as `containment_stale` (auth-gated, absent when there is no drift).
+
+  **It warns, it never blocks.** A self-updating CLI must not be able to turn someone
+  else's release into an outage on a morning nobody chose — a stale record that
+  announces itself is strictly better. An unreadable version is not reported as drift:
+  "we could not check" must not read as "it moved".
+
 ## [Bridge 0.57.0] - 2026-08-05
 
 Two read-only reaches the bridge did not have: the open web, and Slack. Both are

@@ -487,6 +487,20 @@ cargo run --bin containment-probe -- --write # re-run and RE-RECORD (a deliberat
 cargo run --bin containment-probe -- --show  # print the record, run nothing
 ```
 
+**The probe world mirrors the real vault's project settings.** The child's cwd is a
+disposable stand-in vault, so Claude Code performs project-scope settings discovery against
+*that* directory — which means a battery whose scratch tree has no `.claude/` is structurally
+blind to every grant made in a settings file, and the record then describes a posture strictly
+tighter than what a real turn runs under. That blind spot was live until 2026-08-05: the
+vault's `.claude/settings.json` granted `Bash(duckdb:*)` and `Bash(brew install duckdb)` to
+every phone turn, invisible to both the record and the startup gate, because no probe ever
+stood where the child stands. `ProbeEnv::prepare` now copies the real vault's
+`.claude/settings.json` and `.claude/settings.local.json` into the stand-in vault, so a
+settings-file grant surfaces as a probe verdict — an escape that opens, or a baseline that
+moves — rather than as nothing at all. Copying rather than pointing the child at the real
+vault keeps every write probe inside the disposable tree: the boundary is tested, the vault
+is not touched.
+
 **Rows are `(capability, MCP server set)` pairs, not capabilities.** `Read` names two
 containments the bridge actually spawns — the main read-only turn *with* qmd, and the
 vault-QA child with *no* servers — and one row cannot describe both. Four rows are
@@ -650,6 +664,39 @@ open baseline is still open, and still fails the gate as drift if it closes. `[[
 is a statement about people, not about the boundary — no code on the scoring or gating path
 reads it. `containment-probe` reports open baselines that no acceptance covers, and
 acceptances that outlived the finding they excused.
+
+### The record names a CLI version, but nothing enforces it (known gap)
+
+`binary_version` in the record is the agent CLI the battery actually ran against. **It is not
+a pin.** Until 0.58.0 nothing in the serving path read it — only `containment-probe` compared
+it, i.e. only when you were already re-running the battery. So a routine agent-CLI upgrade
+never tripped the gate and never blocked boot; the record simply went **stale in silence**,
+still asserting a posture measured against a binary no longer installed.
+
+That is the failure mode with teeth here. The founding lesson of this entire system is that a
+CLI version **changed what an empty `--allowedTools` meant** — a verdict recorded under one
+version is not evidence about another.
+
+Since 0.58.0 the bridge compares the live `<bin> --version` against each in-use harness's
+record at startup and **warns**:
+
+```
+jesse-bridge: WARNING — containment record for harness 'claude-code' was taken against
+2.1.222 (Claude Code), but the installed binary is 2.1.230 (Claude Code). …
+```
+
+It also appears on `GET /health` behind the bearer token, as a `containment_stale` array
+(absent when there is no drift), so staleness is visible without reading logs.
+
+**It warns rather than refuses, deliberately.** The agent CLI can update itself, so a hard
+block would convert someone else's release into an outage on a morning nobody chose — strictly
+worse than a stale record that announces itself. Staleness should be loud, not fatal. An
+unreadable version is **not** reported as drift either: "we could not check" must not be
+indistinguishable from "it moved".
+
+**The remaining gap is that nothing forces the re-run.** The warning is advisory; a bridge
+serving on a drifted record is a bridge whose containment claims are unverified for the binary
+it is actually running. Treat the warning as work, not noise.
 
 ### Re-running it
 
