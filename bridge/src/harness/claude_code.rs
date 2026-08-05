@@ -263,7 +263,22 @@ pub fn parse_stream_line(line: &str) -> StreamEvent {
 /// Still reached from the driver's `resolve_stream_outcome`, which uses it for the
 /// no-`result`-line-and-no-text case so that genuine failure keeps carrying the child's
 /// stderr verbatim.
-pub fn interpret_claude_output(stdout: &str, stderr: &str, exit_success: bool) -> ClaudeOutcome {
+///
+/// `harness` NAMES THE CHILD THAT ACTUALLY FAILED and is threaded in rather than hardcoded,
+/// because that shared driver path reaches this for EVERY harness. With the label baked in,
+/// a Codex child that died on a clap usage error reported "claude failed" next to a `codex
+/// exec resume` usage string, and the operator could not tell whether the app had silently
+/// switched models. Pass the caller's own `Harness::id`.
+///
+/// The label is presentation ONLY. `failclass::classify_hosted_failure` keys on the stderr
+/// and stdout content carried in this message and never on the harness word, so renaming a
+/// harness cannot change how its failures are classified or retried.
+pub fn interpret_claude_output(
+    harness: &str,
+    stdout: &str,
+    stderr: &str,
+    exit_success: bool,
+) -> ClaudeOutcome {
     if let Ok(v) = serde_json::from_str::<Value>(stdout) {
         // The parsed envelope is the `result` object; classify it the one way,
         // shared with the streaming parser's terminal `result` line.
@@ -283,7 +298,7 @@ pub fn interpret_claude_output(stdout: &str, stderr: &str, exit_success: bool) -
         let err = truncate_chars(stderr.trim(), 500);
         let out = truncate_chars(stdout.trim(), 500);
         ClaudeOutcome::Fatal {
-            message: format!("claude failed (no JSON envelope) — stderr: {err} | stdout: {out}"),
+            message: format!("{harness} failed (no JSON envelope) — stderr: {err} | stdout: {out}"),
         }
     }
 }
@@ -697,7 +712,7 @@ mod tests {
     fn interpret_real_500_envelope_is_retryable() {
         // The observed cold-start failure: non-zero exit, real cause in stdout.
         let stdout = r#"{"type":"result","is_error":true,"api_error_status":500,"result":"API Error: 500 Internal server error. This is a server-side issue, usually temporary — try again in a moment.","session_id":"sess-x"}"#;
-        match interpret_claude_output(stdout, "", false) {
+        match interpret_claude_output(CLAUDE_CODE_ID, stdout, "", false) {
             ClaudeOutcome::Retryable { status, message } => {
                 assert_eq!(status, 500);
                 assert!(message.contains("500"));
@@ -708,7 +723,7 @@ mod tests {
     #[test]
     fn interpret_400_envelope_is_fatal() {
         let stdout = r#"{"is_error":true,"api_error_status":400,"result":"bad request"}"#;
-        match interpret_claude_output(stdout, "", false) {
+        match interpret_claude_output(CLAUDE_CODE_ID, stdout, "", false) {
             ClaudeOutcome::Fatal { message } => assert!(message.contains("bad request")),
             other => panic!("expected Fatal, got {other:?}"),
         }
@@ -716,7 +731,7 @@ mod tests {
     #[test]
     fn interpret_success_envelope_is_ok() {
         let stdout = r#"{"type":"result","is_error":false,"result":"OK","session_id":"sess-1"}"#;
-        match interpret_claude_output(stdout, "", true) {
+        match interpret_claude_output(CLAUDE_CODE_ID, stdout, "", true) {
             ClaudeOutcome::Ok {
                 result, session_id, ..
             } => {
@@ -728,7 +743,7 @@ mod tests {
     }
     #[test]
     fn interpret_non_json_success_is_raw_ok() {
-        match interpret_claude_output("  just plain text  ", "", true) {
+        match interpret_claude_output(CLAUDE_CODE_ID, "  just plain text  ", "", true) {
             ClaudeOutcome::Ok {
                 result, session_id, ..
             } => {
@@ -741,7 +756,7 @@ mod tests {
     #[test]
     fn interpret_non_json_failure_is_fatal_and_nonblank() {
         // The old bug: a non-JSON failure reported nothing. Now both streams show.
-        match interpret_claude_output("partial stdout", "stderr detail", false) {
+        match interpret_claude_output(CLAUDE_CODE_ID, "partial stdout", "stderr detail", false) {
             ClaudeOutcome::Fatal { message } => {
                 assert!(!message.is_empty());
                 assert!(message.contains("stderr detail"));

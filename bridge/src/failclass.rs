@@ -232,6 +232,39 @@ mod tests {
         }
     }
 
+    /// THE HARNESS LABEL IS PRESENTATION, NEVER A CLASSIFICATION KEY. These messages now
+    /// name the harness that actually failed, so the same failure arrives under several
+    /// different first words — and two children that died the same way must still be
+    /// classified, retried and counted the same way. Keying on the harness word would mean
+    /// renaming a harness silently changed what arms the emergency breaker.
+    #[test]
+    fn the_harness_label_does_not_change_the_classification() {
+        for label in ["claude", "claude-code", "codex"] {
+            let msg = format!(
+                "{label} failed (no JSON envelope) — stderr: connect ECONNREFUSED 127.0.0.1:9100 | stdout: "
+            );
+            let c = classify_hosted_failure(&err(StatusCode::BAD_GATEWAY, &msg));
+            assert_eq!(c, HostedFailureClass::Network, "{msg}");
+            assert!(c.is_transport(), "{msg}");
+        }
+        for label in ["claude", "claude-code", "codex"] {
+            let msg = format!("{label} returned an empty result and streamed no text");
+            let c = classify_hosted_failure(&err(StatusCode::BAD_GATEWAY, &msg));
+            assert_eq!(c, HostedFailureClass::Completed, "{msg}");
+            assert!(
+                !c.is_transport(),
+                "a completed turn must not arm emergency: {msg}"
+            );
+        }
+        // A Codex clap usage error is a local, non-transport failure whichever harness
+        // name precedes it — it must never look like an upstream outage worth retrying.
+        let usage = "codex failed (no JSON envelope) — stderr: error: unexpected argument '-C' found | stdout: ";
+        assert!(
+            !classify_hosted_failure(&err(StatusCode::BAD_GATEWAY, usage)).is_transport(),
+            "a child that never started must not arm emergency"
+        );
+    }
+
     #[test]
     fn a_completed_but_empty_or_max_turns_turn_is_not_transport() {
         for msg in [

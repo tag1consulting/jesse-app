@@ -152,7 +152,12 @@ impl SpawnedSessions {
 ///     failure is never papered over with mid-turn narration.
 ///   * No `result` line AND no streamed text → `Fatal` over stderr — a genuine
 ///     failure, surfaced (never a silent empty success).
+///
+/// `harness` is the id of the child that produced this outcome ([`Harness::id`]), and is
+/// used ONLY to name it in a failure message. This function is shared by every harness, so a
+/// hardcoded label here reports one harness's death under another's name.
 pub fn resolve_stream_outcome(
+    harness: &str,
     terminal: Option<ClaudeOutcome>,
     streamed: &str,
     stderr: &str,
@@ -181,7 +186,7 @@ pub fn resolve_stream_outcome(
             } else {
                 // Success but no answer anywhere — never deliver an empty bubble.
                 ClaudeOutcome::Fatal {
-                    message: "claude returned an empty result and streamed no text".to_string(),
+                    message: format!("{harness} returned an empty result and streamed no text"),
                 }
             }
         }
@@ -193,7 +198,7 @@ pub fn resolve_stream_outcome(
             if streamed.is_empty() {
                 // The no-envelope failure message is the CLI-shaped one the operator has
                 // always seen, stderr and all; that is why this reaches into the harness.
-                interpret_claude_output("", stderr, false)
+                interpret_claude_output(harness, "", stderr, false)
             } else {
                 ClaudeOutcome::Ok {
                     result: streamed.to_string(),
@@ -309,7 +314,7 @@ async fn run_stateless_oneshot(
         }
     };
 
-    match resolve_stream_outcome(terminal, &streamed, &stderr) {
+    match resolve_stream_outcome(harness.id(), terminal, &streamed, &stderr) {
         ClaudeOutcome::Ok { result, .. } => Ok(result),
         ClaudeOutcome::Fatal { message } | ClaudeOutcome::Retryable { message, .. } => {
             Err((StatusCode::BAD_GATEWAY, message))
@@ -671,7 +676,7 @@ pub async fn run_claude_streaming(
         } else {
             String::new()
         };
-        let outcome = resolve_stream_outcome(terminal, &streamed, &stderr);
+        let outcome = resolve_stream_outcome(harness.id(), terminal, &streamed, &stderr);
 
         // A credential failure seen on stderr overrides a FAILING outcome's message, and only
         // a failing one — a turn that produced an answer succeeded, whatever the child logged
@@ -777,7 +782,7 @@ mod tests {
                 | StreamEvent::Ignore => {}
             }
         }
-        resolve_stream_outcome(terminal, &streamed, stderr)
+        resolve_stream_outcome(ClaudeCode.id(), terminal, &streamed, stderr)
     }
     #[test]
     fn real_success_turn_yields_full_result_text() {
@@ -837,7 +842,7 @@ mod tests {
     fn no_result_and_no_text_is_fatal_with_message() {
         // The genuine failure: nothing streamed and no result line. Must be a
         // Fatal carrying the stderr cause — never a blank Ok.
-        match resolve_stream_outcome(None, "", "claude: connection reset") {
+        match resolve_stream_outcome(ClaudeCode.id(), None, "", "claude: connection reset") {
             ClaudeOutcome::Fatal { message } => {
                 assert!(!message.trim().is_empty(), "Fatal must carry a message");
                 assert!(message.contains("connection reset"), "got {message:?}");
@@ -845,6 +850,61 @@ mod tests {
             other => panic!("expected Fatal, got {other:?}"),
         }
     }
+    /// A CODEX FAILURE MUST NAME CODEX. The no-envelope Fatal message is built in the Claude
+    /// Code module, and this shared driver path reaches it for EVERY harness — so with the
+    /// label hardcoded, a Codex child that died on a clap usage error reported "claude
+    /// failed" directly above a `codex exec resume` usage string. That is what sent Jeremy
+    /// looking for a model switch that never happened.
+    ///
+    /// Both no-answer messages are checked, because both were hardcoded.
+    #[test]
+    fn a_codex_failure_names_codex_and_never_claude() {
+        // The real stderr from the resume break, verbatim.
+        let stderr = "error: unexpected argument '-C' found\n\nUsage: codex exec resume [OPTIONS] [SESSION_ID] [PROMPT]";
+        match resolve_stream_outcome(Codex.id(), None, "", stderr) {
+            ClaudeOutcome::Fatal { message } => {
+                assert!(message.starts_with("codex failed"), "got {message:?}");
+                assert!(
+                    !message.contains("claude"),
+                    "a Codex failure named claude: {message:?}"
+                );
+                // The child's own stderr still travels verbatim — the label changed, the
+                // diagnostic did not.
+                assert!(message.contains("unexpected argument"), "got {message:?}");
+            }
+            other => panic!("expected Fatal, got {other:?}"),
+        }
+
+        // The other no-answer message: a success envelope with nothing in it.
+        match resolve_stream_outcome(
+            Codex.id(),
+            Some(ClaudeOutcome::Ok {
+                result: String::new(),
+                session_id: None,
+                usage: ShadowUsage::default(),
+            }),
+            "",
+            "",
+        ) {
+            ClaudeOutcome::Fatal { message } => {
+                assert!(
+                    message.starts_with("codex returned an empty result"),
+                    "got {message:?}"
+                );
+                assert!(!message.contains("claude"), "got {message:?}");
+            }
+            other => panic!("expected Fatal, got {other:?}"),
+        }
+
+        // And the Claude Code path still names itself, under its registry id.
+        match resolve_stream_outcome(ClaudeCode.id(), None, "", "connection reset") {
+            ClaudeOutcome::Fatal { message } => {
+                assert!(message.starts_with("claude-code failed"), "got {message:?}")
+            }
+            other => panic!("expected Fatal, got {other:?}"),
+        }
+    }
+
     #[test]
     fn error_envelope_with_streamed_text_stays_fatal() {
         // A real error envelope (error_max_turns, is_error: true, result: null)
@@ -864,6 +924,7 @@ mod tests {
         // success envelope is a genuine no-answer failure, not something a phantom
         // fallback can paper over. (The driver passes "" for such a harness.)
         match resolve_stream_outcome(
+            ClaudeCode.id(),
             Some(ClaudeOutcome::Ok {
                 result: String::new(),
                 session_id: Some("t-1".to_string()),

@@ -466,7 +466,23 @@ pub fn build_codex_args(
     mcp_args: &[String],
     provider_args: &[String],
 ) -> Vec<String> {
-    let mut args = vec!["exec".to_string()];
+    let mut args = Vec::new();
+
+    // THE WORKING DIRECTORY FLAG GOES AT THE ROOT, AHEAD OF THE SUBCOMMAND. `-C`/`--cd` is
+    // defined on the root `codex` command and on `codex exec`, but NOT on `codex exec
+    // resume` (verified against codex-cli 0.146.0's `--help` for all three). clap stops at
+    // the first argument a subcommand does not define, so emitting it after `resume` exited
+    // 2 with `unexpected argument '-C' found` before the model ran — which made EVERY turn
+    // after a conversation's first one fail, since only a resumed turn carries the
+    // subcommand. At the root it is accepted whether or not `resume` follows, and `resume`
+    // still sits directly after `exec`.
+    //
+    // NOT redundant with the child `Command`'s `current_dir`, which is why it is moved and
+    // not deleted: it is also what anchors Codex's own config and sandbox resolution.
+    args.push("-C".to_string());
+    args.push(cwd.display().to_string());
+
+    args.push("exec".to_string());
 
     // Resume BEFORE the prompt: `codex exec resume <id> <prompt>` is a subcommand, not a
     // flag. A synthetic `local-<hex>` id names a bridge-minted ledger thread with no real
@@ -492,9 +508,14 @@ pub fn build_codex_args(
     // containment surface; the sandbox is. Loading them would let vault CONTENT influence
     // what the child may execute.
     args.push("--ignore-rules".to_string());
-    args.push("-C".to_string());
-    args.push(cwd.display().to_string());
 
+    // EVERYTHING FROM HERE ON MUST BE ACCEPTED BY `codex exec resume` TOO, not just by
+    // `codex exec` — a flag only the latter defines is invisible until a resume turn, which
+    // is exactly how the `-C` break shipped. The four long flags above and every argument
+    // below are `-c key=value` overrides or flags `exec resume` declares (checked against
+    // 0.146.0: `-c`, `--json`, `--skip-git-repo-check`, `--ignore-user-config`,
+    // `--ignore-rules` are all on the resume subcommand). Adding one that is not is a
+    // regression the resume-shaped builder test below catches.
     args.extend(fill_workspace(codex_capability_args(capability), cwd));
     args.extend_from_slice(mcp_args);
     // AFTER the containment flags, so a provider definition is visibly not part of the
@@ -954,6 +975,119 @@ mod tests {
             !args.iter().any(|a| a.contains(WORKSPACE_TOKEN)),
             "a token reached the child: {args:?}"
         );
+    }
+
+    // ---- The resume-shaped argv -----------------------------------------------------
+
+    /// Exactly the option list `codex exec resume --help` prints on codex-cli 0.146.0 — the
+    /// installed binary, read rather than assumed. `codex exec` declares MORE than this
+    /// (`-C`/`--cd`, `--add-dir`, `-s`/`--sandbox`, `-p`/`--profile`, `--oss`,
+    /// `--local-provider`, `--color`), and that gap is the whole bug: a flag only `exec`
+    /// defines parses fine on a first turn and kills every turn after it.
+    const RESUME_ACCEPTS: &[&str] = &[
+        "-c",
+        "--config",
+        "--last",
+        "--all",
+        "--enable",
+        "--disable",
+        "-i",
+        "--image",
+        "--strict-config",
+        "-m",
+        "--model",
+        "--dangerously-bypass-approvals-and-sandbox",
+        "--dangerously-bypass-hook-trust",
+        "--skip-git-repo-check",
+        "--ephemeral",
+        "--ignore-user-config",
+        "--ignore-rules",
+        "--output-schema",
+        "--json",
+        "-o",
+        "--output-last-message",
+    ];
+
+    /// A RESUMED TURN MUST EMIT NO FLAG `codex exec resume` REJECTS — and the working
+    /// directory flag is one it rejects.
+    ///
+    /// **This is the test whose absence let the break ship.** Every other builder test here
+    /// passes `None` for the session id, so nothing ever constructed the argv shape a
+    /// conversation's SECOND and later turns use. `-C`/`--cd` belongs to the root command
+    /// and to `codex exec`, not to `codex exec resume`; emitted after the subcommand, clap
+    /// exited 2 with `unexpected argument '-C' found` before the model ran. A first turn
+    /// carries no session id, so it parsed — which is exactly why this looked like an
+    /// intermittent fault rather than a total one.
+    ///
+    /// It asserts the general rule, not just the one flag: everything after `resume` is
+    /// checked against the real subcommand's option list, so the NEXT flag added to this
+    /// builder fails here rather than in the morning health routine.
+    #[test]
+    fn a_resumed_turn_emits_no_flag_the_resume_subcommand_rejects() {
+        let args = build_codex_args(
+            "what did I say?",
+            Some("th_abc"),
+            Capability::Write,
+            Path::new("/vault/notes"),
+            &[
+                "-c".to_string(),
+                "mcp_servers.qmd.command=\"qmd\"".to_string(),
+            ],
+            &["-c".to_string(), "model=\"slug\"".to_string()],
+        );
+
+        let at = args
+            .iter()
+            .position(|a| a == "resume")
+            .unwrap_or_else(|| panic!("a resume subcommand, argv: {args:?}"));
+
+        // The working directory flag sits at the ROOT, directly ahead of `exec` — and so
+        // ahead of `resume`, whatever follows.
+        let cd = args
+            .iter()
+            .position(|a| a == "-C")
+            .unwrap_or_else(|| panic!("a working directory flag, argv: {args:?}"));
+        assert!(cd < at, "`-C` must precede `resume`, argv: {args:?}");
+        assert_eq!(args[cd + 1], "/vault/notes", "{args:?}");
+        assert_eq!(
+            args[cd + 2], "exec",
+            "`-C <dir>` sits directly ahead of `exec`, argv: {args:?}"
+        );
+        // The ordering the registry test also depends on stays true.
+        assert_eq!(args[at - 1], "exec", "{args:?}");
+        assert_eq!(&args[at + 1], "th_abc", "{args:?}");
+        assert_eq!(
+            args.iter().filter(|a| *a == "-C").count(),
+            1,
+            "the working directory flag must be emitted once, argv: {args:?}"
+        );
+
+        // Nothing after `resume` may be a flag the subcommand does not declare.
+        for (i, a) in args.iter().enumerate().skip(at + 1) {
+            // The prompt is positional and LAST; a `-c` VALUE is whatever follows a `-c`.
+            if i == args.len() - 1 || args[i - 1] == "-c" {
+                continue;
+            }
+            if a.starts_with('-') && a.len() > 1 {
+                assert!(
+                    RESUME_ACCEPTS.contains(&a.as_str()),
+                    "`{a}` is not a flag `codex exec resume` defines, argv: {args:?}"
+                );
+            }
+        }
+    }
+
+    /// The FIRST turn keeps the working directory it always had — the fix moves the flag,
+    /// it does not drop it. The child `Command` sets `current_dir` to the same path, but
+    /// `-C` is also what anchors Codex's config and sandbox resolution, so a turn that lost
+    /// it would be contained against the wrong root.
+    #[test]
+    fn a_first_turn_still_names_its_working_directory_at_the_root() {
+        let args = build_codex_args("hi", None, Capability::Read, Path::new("/v"), &[], &[]);
+        assert_eq!(args[0], "-C", "{args:?}");
+        assert_eq!(args[1], "/v", "{args:?}");
+        assert_eq!(args[2], "exec", "{args:?}");
+        assert!(!args.contains(&"resume".to_string()), "{args:?}");
     }
 
     /// A working directory containing a quote must not be able to reinterpret the whole `-c`

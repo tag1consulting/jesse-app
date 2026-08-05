@@ -15,6 +15,53 @@ CI both run it). See the "Versioning" section of `bridge/README.md`.
 
 ## [Unreleased]
 
+## [Bridge 0.59.0] - 2026-08-05
+
+Every Codex turn after a conversation's first one died before the model ran, and
+the failure told the operator that Claude had failed.
+
+### Fixed
+
+- **The working directory flag was emitted after a subcommand that does not accept
+  it, so every resumed Codex turn failed before the model ran.** `-C`/`--cd` is
+  defined on the root `codex` command and on `codex exec`, but not on `codex exec
+  resume`; the argv builder pushed it after the `resume` token, so clap exited 2
+  with `unexpected argument '-C' found` and never reached the model. A first turn
+  carries no session id and therefore no `resume`, which is why the flag parsed
+  there and the fault read as intermittent rather than total. The flag now sits at
+  the root, ahead of `exec`, where both shapes accept it — `codex -C <dir> exec
+  resume <id> …`. It is not redundant with the child `Command`'s `current_dir`: it
+  is also what anchors Codex's config and sandbox resolution, so it was moved, not
+  dropped.
+- **Audited every flag that followed it**, since clap stops at the first unknown
+  argument and none of them had ever been parsed on a resume turn. The capability
+  overrides, the translated MCP set and the provider seam are all `-c key=value`,
+  and `-c`, `--json`, `--skip-git-repo-check`, `--ignore-user-config` and
+  `--ignore-rules` are all declared by `codex exec resume` on the installed
+  codex-cli 0.146.0. `-C` was the only offender.
+- **A Codex failure no longer reports itself as Claude.** The no-envelope fatal
+  message is built in the Claude Code module, and the shared driver reaches it for
+  every harness, so a Codex child that died on a clap usage error printed `claude
+  failed (no JSON envelope)` directly above a `codex exec resume` usage string —
+  and the operator could not tell whether the app had silently switched models.
+  The failing harness's id is now threaded through `resolve_stream_outcome` and
+  `interpret_claude_output` and names the child that actually died; the same
+  applies to the empty-result message. The label is presentation only:
+  `classify_hosted_failure` still keys on the stderr and stdout content and never
+  on the harness word, so a renamed harness cannot change how a failure is
+  classified or retried.
+
+### Added
+
+- **A builder test that constructs the resume-shaped argv**, which is what was
+  missing: every prior `build_codex_args` test passed `None` for the session id,
+  so the vector that every second-and-later turn uses was never built. It checks
+  everything after `resume` against the real option list from `codex exec resume
+  --help`, so the next flag added to the builder fails in CI rather than in the
+  morning health routine. The three-turn resume test now asserts flag placement,
+  not just subcommand position, and the classifier has a test that the harness
+  label does not change the classification.
+
 ## [Bridge 0.58.0] - 2026-08-05
 
 The battery could not see a whole class of grant, and the record therefore
