@@ -330,11 +330,28 @@ pub fn codex_provider_args(active: &ActiveModel) -> Option<Vec<String>> {
 /// express is a [`HarnessError`], never a silent drop — a child spawned without the vault
 /// search it was promised would answer from nothing and look like a bad model.
 ///
-/// Verified live (0.146.0): with qmd configured this way the tools ARE surfaced and ARE
-/// preferred — a turn asked a vault question with no mention of MCP went straight to
-/// `qmd.query` / `qmd.get` and never touched the shell. The earlier report that Codex
-/// "ignored its MCP tools and shelled out to the qmd CLI" was a configuration failure, not a
-/// model preference.
+/// Verified live (0.146.0, re-measured 2026-08-05): with qmd configured this way the tools
+/// ARE surfaced and ARE preferred. Three UNPROMPTED vault questions — none mentioning MCP,
+/// qmd or tools — produced **10 `qmd.query`/`qmd.get` calls and ZERO shell events** between
+/// them. Preference, not just reachability: nothing in those prompts told the child which
+/// retrieval path to take.
+///
+/// THE TRAP THAT MADE THIS LOOK FALSE, twice. `qmd` lives only on the nvm node-22 bin (node
+/// 26 breaks its better-sqlite3), so a child whose PATH lacks it is handed an MCP server
+/// whose command does not exist. It then has no `mcp__qmd__*` tool at all and falls back to
+/// the shell — which reads exactly like a model that prefers `Bash`. That is what produced
+/// the 2026-08-03 report of "nine `Bash` calls and zero MCP events", and the same defect
+/// drove the containment battery's `search_qmd` to `inconclusive`. Both were environmental.
+/// Before concluding anything about Codex's tool preference, confirm `qmd` resolves on the
+/// PATH the child actually inherits — the deployed bridge gets it from the launchd plist.
+///
+/// PREFERENCE IS NOT CONFINEMENT, and the distinction is load-bearing. That the child
+/// *chooses* qmd does not mean it *must*: under a `read` grant it may still retrieve through
+/// the read-only shell. So the boundary that holds is the OS read-only sandbox this harness
+/// spawns under, NOT qmd tool-scoping — do not treat the MCP set as the thing confining a
+/// `read` child's reads. It scopes what MCP offers; the shell sits beside it. Narrowing what
+/// those shell reads can reach (to the vault, rather than everything the invoking unix user
+/// can read) is unix-user isolation, still pending.
 pub fn codex_mcp_args(harness: &'static str, mcp_config: &str) -> Result<Vec<String>, HarnessError> {
     let parsed: serde_json::Value = serde_json::from_str(mcp_config).map_err(|e| {
         HarnessError::unsupported(harness, format!("an MCP server set it could not parse ({e})"))
