@@ -44,6 +44,8 @@ Default allowlist (`JESSE_ALLOWED_TOOLS` to override):
 | `Bash(head:*)`, `Bash(tail:*)`, `Bash(wc:*)` | Strictly read-only inspection of large files/logs (the diet CSVs and logs) without slurping the whole file — rounds out the existing `cat`/`ls`/`find` read set. No writes, no network |
 | `Bash(node todo-list/generate-diet-today.js:*)` | Regenerate the `diet-today.js` dashboard cache from the authoritative CSVs after a food/exercise/weigh-in log (without it, a phone log appends the CSV but leaves the cache stale) |
 | `Bash(node todo-list/validate-diet-today.js:*)`, `Bash(node todo-list/verify-diet-consistency.js:*)` | The generator's two guards — field-contract validation and CSV-vs-cache consistency — run after each regeneration |
+| `WebSearch` | Read-only web search (titles, URLs, snippets). Added 2026-08-05 — see [Web access](#web-access-websearch-and-webfetch-2026-08-05) |
+| `WebFetch` | Read-only fetch of a web page. Added 2026-08-05, **reversing a standing deny** — see [Web access](#web-access-websearch-and-webfetch-2026-08-05) for the decision, the residual risk, and the available narrowing |
 
 These three `node` entries are pinned to the **exact script paths**, never a bare
 `Bash(node:*)`: a bare node scope would allow `node -e "<arbitrary JS>"` —
@@ -55,7 +57,29 @@ reach the allowlist:
 
 | Tool | Why |
 | --- | --- |
-| `WebFetch` | SSRF / data-exfiltration surface the workflows don't need |
+| `NotebookEdit` | An unused write surface (no vault workflow touches notebooks), and nothing in the allowlist grants it, so denying it shadows nothing. It is also what keeps this variable **non-empty** — see the note below |
+
+**`WebFetch` was on this list from the beginning until 2026-08-05.** The entry
+read, verbatim:
+
+> | `WebFetch` | SSRF / data-exfiltration surface the workflows don't need |
+
+That rationale is **superseded, not deleted**: the premise "the workflows don't
+need it" stopped being true when read-only web access became a wanted capability
+for the phone bridge. The SSRF and exfiltration surface it named is *real and
+still present* — it was not refuted, it was accepted. See [Web
+access](#web-access-websearch-and-webfetch-2026-08-05) for the accepted risk and
+the narrowing available if it is later judged too broad.
+
+**Why this list can never be empty.** `config::env_string` trims its value and
+treats blank as unset (`src/config.rs:480-485`, pinned by
+`env_string_trims_and_filters_empty`), and the field falls back with
+`unwrap_or_else(|| DEFAULT_DISALLOWED_TOOLS)`. So setting
+`JESSE_DISALLOWED_TOOLS=""` does **not** clear the denylist — it silently
+restores the compiled default, which would put `WebFetch` back and kill the
+capability with no error anywhere. A denylist that omits `WebFetch` must
+therefore name some other tool. `NotebookEdit` is that placeholder, chosen
+because denying it costs nothing.
 
 **Why bare `Bash` is not on the denylist (and how unscoped shell is still
 blocked).** Listing bare `Bash` in `--disallowedTools` removes the entire Bash
@@ -100,7 +124,67 @@ it remains the route behind the two known-open baselines below (outbound network
 process that outlives the turn). Narrowing it is a separate decision with its own cost
 to the vault workflows.
 
-### MCP servers on a main turn (strict, qmd only)
+### Web access (`WebSearch` and `WebFetch`, 2026-08-05)
+
+Both tools are granted on the main turn. `WebFetch` required removing the deny
+recorded above; `WebSearch` was merely absent and needed only a grant.
+
+**Verified against the pinned CLI (claude 2.1.222, 2026-08-05)**, five headless
+`-p` probes against the real argv shape:
+
+| # | `--allowedTools` | `--disallowedTools` | Target | Result |
+| --- | --- | --- | --- | --- |
+| 1 | `WebFetch(domain:example.com)` | `NotebookEdit` | `example.com` | **fetched**, no prompt |
+| 2 | `WebFetch(domain:example.com)` | `NotebookEdit` | `iana.org` | **denied**, no prompt |
+| 3 | `WebFetch` | `NotebookEdit` | `iana.org` | **fetched**, no prompt |
+| 4 | `WebFetch(domain:example.com)` | `WebFetch` | `example.com` | **denied** — the deny shadows the scoped grant |
+| 5 | `WebSearch` | `WebFetch` | — | **results returned** |
+
+Three things follow. Probe 4 is the `Bash` lesson again: a bare name on the
+denylist shadows every scoped grant of the same tool, so `WebFetch` cannot appear
+on both lists. Probe 5 shows `WebSearch` is independent of the `WebFetch` deny —
+it can be granted without touching this decision at all. Probes 1–3 close the
+**headless-approval question**: the feared interactive domain-approval prompt
+that a `-p` turn cannot answer does **not** occur on this CLI, with either a bare
+or a scoped grant. Denial is immediate and legible, not a hang or a silent stall.
+
+**Accepted residual risk.** The bridge runs as Jeremy's own login user with
+`Write(./**)` over the vault (see [Deployment](#deployment-run-isolated-and-least-privilege)
+— the dedicated sandboxed user is still not in place). `WebFetch` puts attacker-
+controlled text from an arbitrary URL into a turn that holds those write grants,
+which is a prompt-injection path to the vault: a fetched page can carry
+instructions, and the same turn can act on them. This is the same class of
+concern that parks browser automation, differing in degree — no clicks, no forms,
+no logged-in session, no credential reuse — not in kind. `WebSearch` carries a
+weaker form of it (snippets are still untrusted text). Accepted knowingly on
+2026-08-05 rather than mitigated.
+
+**A domain allowlist was considered and declined (2026-08-05).** The mechanism
+works — this is measured, not assumed. Probe 1 fetched `example.com` under
+`WebFetch(domain:example.com)`; probe 2, same grant, **denied** `iana.org`. The
+matching rules are usable: case-insensitive on the hostname, `*.example.com`
+covers subdomains at any depth but not the apex, and a wildcard in any other
+position cannot cross a dot, so `example.*` will not match `example.evil.com`.
+Swapping the bare `WebFetch` grant for a list of `WebFetch(domain:...)` entries
+would be a one-string change with no code change and no extra restart cost.
+
+It was declined anyway, because **it would narrow one door in a room with another
+door already propped open**. A `WebFetch` domain list bounds `WebFetch` and
+nothing else; `Bash(git:*)` takes unrestricted arguments and remains an outbound
+network route, recorded as a known-open baseline in `bridge/containment.toml`.
+Constraining the named tool while an unconstrained one sits beside it in the same
+allowlist buys the appearance of a boundary rather than a boundary. The honest
+posture — bare `WebFetch`, with the risk written down above — was preferred over
+the tidier-looking one.
+
+**This decision is coupled to `Bash(git:*)`, deliberately.** If that grant is
+ever narrowed to a fixed subcommand set or otherwise loses its outbound-network
+route, the objection above disappears and the `WebFetch` domain list becomes
+worth applying **the same day** — at that point it would be the remaining open
+door, not one of two. Whoever narrows `Bash(git:*)` should treat this paragraph
+as part of that change's checklist.
+
+### MCP servers on a main turn (strict, qmd + slack)
 
 The main turn also passes `--strict-mcp-config` together with an explicit
 `--mcp-config`, on **both** branches `build_claude_args` can take (writes-enabled
@@ -109,6 +193,12 @@ and read-only). Only the servers named in that config load:
 | Server | Why |
 | --- | --- |
 | `qmd` | Read-only vault search — the four `mcp__qmd__*` tools in the allowlist above. Required; the main path is the one route that must not degrade to an empty server set |
+| `slack` | Read-only Slack read and search, added 2026-08-05 — six `mcp__slack__*` tools in the allowlist above. See [Slack](#slack-read-only-2026-08-05) |
+
+The compiled default `MAIN_CHILD_MCP_CONFIG`
+(`src/harness/claude_code.rs:301`) still names **qmd alone**; `slack` is added by
+the `JESSE_MAIN_MCP_CONFIG` override in the LaunchAgent, so a deployment that
+does not set that variable gets qmd only.
 
 Everything else is **absent at the root**, not denied by name — including the
 account-level cloud connectors (Gmail, Slack, Google Calendar, Google Drive) and
@@ -137,6 +227,79 @@ shipped default resolves `qmd` from the child's `PATH`; set the override when
 `qmd` is not on it, since launchd's `PATH` is narrower than a login shell's.
 Vault search being absent from a turn is silent (never an error), so a wrong
 `PATH` degrades quietly rather than failing loudly.
+
+### Slack (read-only, 2026-08-05)
+
+A self-hosted `slack-mcp-server` (npm `slack-mcp-server`, upstream
+`korotovsky/slack-mcp-server`, v1.3.0), run under `npx` and declared in
+`JESSE_MAIN_MCP_CONFIG`. It is **not** the account-level claude.ai Slack
+connector named above — that one is still never loaded; this is a separate
+process the bridge starts itself, which is why it reaches a headless turn at all.
+
+Read-only is enforced at two independent layers: **the token carries no write
+scopes**, and **the allowlist names only read tools**. Either alone would do;
+both are present because neither is self-evidently permanent.
+
+**Layer 1 — token scopes.** The `xoxp` User OAuth token lives only in
+`SLACK_MCP_XOXP_TOKEN` in the LaunchAgent and reaches the server by environment
+inheritance, so no config file contains it. Grant exactly these 11 scopes:
+
+```
+channels:history  channels:read
+groups:history    groups:read
+im:history        im:read
+mpim:history      mpim:read
+users:read        search:read
+usergroups:read
+```
+
+Slack adds a twelfth, `identify`, on its own. **Do not copy the scope list from
+the server's own README**: it is published as `"channels:history", "channels:read",
+"groups:history", "groups:read", "im:history", "im:read", "im:write",
+"mpim:history", "mpim:read", "mpim:write", "users:read", "chat:write",
+"search:read", "usergroups:read", "usergroups:write", "channels:write"` — it
+includes **`chat:write`** plus four other write scopes, because it is the maximal
+set for the server's write tools. Granting it verbatim would silently re-arm
+posting and destroy this layer, with nothing in the config looking any different.
+Verified on 2026-08-05: `auth.test` reports the 12 read scopes above and
+`chat.postMessage` returns `missing_scope` (`needed: chat:write:bot`).
+
+**Layer 2 — allowlist.** The server is **not read-only by construction**; the
+guarantee comes from scope starvation plus name-level omission. Its live
+handshake advertises **15** tools, and the set was read off the running server
+rather than its README — which was wrong in both directions, listing `saved_*`
+tools that do not appear and claiming `conversations_mark` is gated behind
+`SLACK_MCP_MARK_TOOL` when it registers with that variable unset.
+
+| Granted (6) | |
+| --- | --- |
+| `conversations_history` | Channel and DM message history |
+| `conversations_replies` | Thread reads |
+| `conversations_search_messages` | `search.messages`; the start-of-day scanner depends on it |
+| `channels_list` | Channel enumeration |
+| `channels_me` | Channels the user belongs to — a narrower read than `channels_list` |
+| `users_search` | Resolves user IDs to names; without it messages are unreadable walls of `U…` IDs |
+
+| Omitted (9) | Why |
+| --- | --- |
+| `conversations_join` | **Mutates** — joins a channel, visible to the workspace. Registered by default with no opt-in |
+| `conversations_leave` | **Mutates** — leaves a channel |
+| `conversations_mark` | **Mutates** — marks conversations read. Registered despite `SLACK_MCP_MARK_TOOL` being unset |
+| `usergroups_create` | **Mutates** — creates a mention group |
+| `usergroups_update` | **Mutates** — renames/re-handles a group |
+| `usergroups_users_update` | **Mutates, destructively** — "completely replaces the member list" |
+| `usergroups_me` | **Mixed** — `action='list'` reads but `action='join'`/`'leave'` mutate. A grant names a tool, not an argument, so the whole tool is omitted. This is why omission is by name and not by reading tool descriptions for the word "list" |
+| `usergroups_list` | Read-only, but no use case. Minimal grant: every entry should earn its place |
+| `conversations_unreads` | Read-only, but outside the agreed read set and unread-state semantics vary between token types. Available on request |
+
+Four tools never appeared at all, because their opt-in variables are unset and
+must stay unset: `conversations_add_message` (**posting** —
+`SLACK_MCP_ADD_MESSAGE_TOOL`), `reactions_add` / `reactions_remove`
+(`SLACK_MCP_REACTION_TOOL`), and `attachment_get_data`
+(`SLACK_MCP_ATTACHMENT_TOOL`).
+
+**Do not "complete" the allowlist from the server's tool listing.** The omissions
+are the safety property, not an oversight, and seven of the nine mutate.
 
 ## Diet child tool isolation (in-process boundary)
 
@@ -602,6 +765,53 @@ process. Operate the bridge as follows:
   - Linux/containers: a container or a systemd unit with a read-only root,
     `ProtectHome`, a bind-mounted vault, and a restricted egress network policy.
 - **Bind to a safe interface.** See below.
+- **Keep the plist file mode owner-only (`600`).** `EnvironmentVariables` holds
+  every bridge secret in plaintext — `JESSE_TOKEN`, the model provider tokens,
+  and (once configured) `SLACK_MCP_XOXP_TOKEN`. LaunchAgent plists are created
+  `644` by default, which makes all of them world-readable to any local account.
+
+**Plist mode was `644` until 2026-08-05; secrets were not rotated (decision).**
+The LaunchAgent was created world-readable and had held `JESSE_TOKEN` and both
+model-provider tokens in plaintext at that mode. The mode was corrected to `600`.
+The tokens were **not** rotated, on the reasoning that the exposure was bounded
+by the machine: a single-user Studio with no other login accounts and no evidence
+of another reader. That judgement rests on the file never having left the disk,
+which was checked rather than assumed on 2026-08-05 — `tmutil isexcluded` reports
+the file in scope but `tmutil destinationinfo` reports **no destination
+configured**, so no Time Machine backup of it exists; `~/Library/LaunchAgents` is
+a real directory, not a symlink into a synced tree; there is no iCloud Drive,
+Dropbox, Google Drive or OneDrive directory in `$HOME`; the directory is not
+inside a git repository; and no third-party backup or sync agent (Backblaze, Arq,
+CrashPlan, Syncthing, Resilio, and similar) is installed or loaded. The only
+local snapshots are `com.apple.os.update-*` APFS snapshots, which stay on the
+same encrypted volume and are root-only.
+
+**What flips this to "rotate".** The bounded-exposure argument dies the moment a
+copy exists off the machine. If that plist is ever found in a backup set, a
+synced or cloud folder, a git repository, a screen-share or paste, or on a
+machine with a second login account, then every secret it has ever held must be
+treated as disclosed and rotated — `JESSE_TOKEN`, both Fireworks tokens, and
+`SLACK_MCP_XOXP_TOKEN` once it is added. Re-run the checks above before trusting
+this paragraph; it records a state verified on one date, not a standing property.
+
+**Maintenance: re-sync the plist allowlist on every bridge upgrade.** Setting
+`JESSE_ALLOWED_TOOLS` in the LaunchAgent **pins** the allowlist and shadows
+`DEFAULT_ALLOWED_TOOLS` (`src/config.rs:154`) entirely. Any grant a later bridge
+release adds to that constant will **not** reach a deployment that sets the
+variable, and nothing warns about the divergence — the turn simply lacks a tool
+the release notes say it has. After upgrading the bridge, diff the plist value
+against the compiled constant and re-apply any additions. The same applies to
+`JESSE_DISALLOWED_TOOLS`.
+
+**Provenance of the pinned value.** `DEFAULT_ALLOWED_TOOLS` carries **23**
+comma-separated entries as of bridge 0.56.0; the plist pins **25** — those 23
+verbatim, plus `WebSearch` and `WebFetch`. The copy was not transcribed by eye:
+the constant was extracted from `src/config.rs`, its Rust line-continuations
+collapsed, and compared programmatically against the value read back out of the
+plist with `PlistBuddy`, asserting the plist value equals the constant plus
+exactly the `,WebSearch,WebFetch` suffix. Re-do that comparison rather than a
+visual diff when re-syncing — a single dropped entry in a 25-item single-line
+string is invisible to a reader and silently removes a grant.
 
 ## Network bind safety
 

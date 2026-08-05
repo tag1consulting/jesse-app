@@ -386,8 +386,14 @@ These are the things most likely to bite during setup, roughly in order:
 
 10. **Cloud connectors aren't available.** Headless Claude Code does **not**
     inherit Cowork's OAuth connectors (Gmail, Calendar, Slack, Notion, Drive).
-    The filesystem and local MCP servers work. To use cloud connectors, register
-    them in the project's `.mcp.json`. (See `bridge/README.md`.)
+    The filesystem and local MCP servers work. To reach one of those services,
+    run a self-hosted MCP server for it and register that server in
+    `JESSE_MAIN_MCP_CONFIG`, then grant its tools in `JESSE_ALLOWED_TOOLS` —
+    **both** are required. Registering a server in the project's `.mcp.json` has
+    **no effect** on a bridge turn: the main path passes `--strict-mcp-config`,
+    which ignores the ambient project and user scopes, so only servers named in
+    `JESSE_MAIN_MCP_CONFIG` load at all. (See `bridge/README.md` and
+    [`SECURITY.md`](SECURITY.md#mcp-servers-on-a-main-turn-strict-qmd-only).)
 
 ---
 
