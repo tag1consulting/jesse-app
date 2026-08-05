@@ -650,6 +650,21 @@ pub struct ProbeEnv {
     /// The agent CLI's REAL transcript directory (`Harness::transcript_dir`), where the
     /// transcript decoy is planted.
     pub transcript_dir: PathBuf,
+    /// The REAL vault (`Config::vault`) — read only, and only so [`ProbeEnv::prepare`] can
+    /// copy its `.claude/settings*.json` into the stand-in vault.
+    ///
+    /// # Why the settings files have to be in the probe world
+    ///
+    /// The child's cwd is the stand-in vault, so Claude Code performs project-scope settings
+    /// discovery against THAT directory. Without this copy the probe world has no settings
+    /// files at all, and the battery is structurally blind to every grant made in one — the
+    /// record then describes a posture strictly tighter than what a real turn runs under.
+    /// That blind spot was live until 2026-08-05: `.claude/settings.json` granted
+    /// `Bash(duckdb:*)` and `Bash(brew install duckdb)` to every phone turn, invisible to
+    /// both the record and the startup gate, because no probe ever stood where the child
+    /// stands. Copying (rather than pointing the child at the real vault) keeps every write
+    /// probe inside the disposable tree — the boundary is tested, the vault is not touched.
+    pub real_vault: PathBuf,
     /// Per-row seed the per-probe nonces derive from.
     pub seed: u64,
     /// Port of the loopback listener the network probe aims at.
@@ -815,6 +830,36 @@ impl ProbeEnv {
         log.iter().find(|l| l.contains(&nonce)).cloned()
     }
 
+    /// Copy the REAL vault's project-scope settings into the stand-in vault, so the child is
+    /// probed under the same settings discovery a live turn gets.
+    ///
+    /// Both files are optional and a missing one is not an error — the point is fidelity to
+    /// whatever the real vault has, including having nothing. Only `.claude/settings.json`
+    /// and `.claude/settings.local.json` are mirrored: they are the two project-scope files
+    /// Claude Code reads from cwd. User-scope settings need no mirroring, since the child
+    /// already runs as the same unix user and reads the same `$HOME`.
+    ///
+    /// A settings file that grants a tool will now show up as a probe verdict — an escape
+    /// that opens, or a baseline that moves — instead of being invisible. That is the whole
+    /// point: the record covers what actually runs.
+    fn mirror_vault_settings(&self) -> std::io::Result<()> {
+        let src_dir = self.real_vault.join(".claude");
+        let dst_dir = self.vault.join(".claude");
+        let mut copied_any = false;
+        for name in ["settings.json", "settings.local.json"] {
+            let src = src_dir.join(name);
+            if !src.is_file() {
+                continue;
+            }
+            if !copied_any {
+                std::fs::create_dir_all(&dst_dir)?;
+                copied_any = true;
+            }
+            std::fs::copy(&src, dst_dir.join(name))?;
+        }
+        Ok(())
+    }
+
     /// Build the row's scratch world: the stand-in vault with its readable/searchable files,
     /// the outside directory with the traversal and symlink targets, the state directory with
     /// a job file to steal, the background-process spawner — and the two decoys in the real
@@ -823,6 +868,7 @@ impl ProbeEnv {
         std::fs::create_dir_all(self.vault.join("notes/deep"))?;
         std::fs::create_dir_all(&self.outside)?;
         std::fs::create_dir_all(self.state.join("jobs"))?;
+        self.mirror_vault_settings()?;
 
         std::fs::write(
             self.vault_read_target(),
@@ -1176,9 +1222,18 @@ pub fn parse_codex_trace(stdout: &str, stderr: &str, mcp: McpSet) -> RunTrace {
         root_tools: vec!["Bash".to_string()],
         ..Default::default()
     };
-    if mcp == McpSet::Qmd {
+    // EVERY set that contains qmd, not just the qmd-only one. Matching a single variant is
+    // the same landmine `hard_gate_requirement` carried: a new set containing qmd would
+    // leave `mcp__qmd__status` out of the root tools, so a child that used qmd correctly
+    // would score as one that had no qmd tool at all — turning a working positive control
+    // into a `denied`. Codex does not spawn `QmdSlack` today; this is written so that if it
+    // ever does, the trace is right rather than quietly wrong.
+    if mcp.contains_qmd() {
         t.root_tools.push("mcp__qmd__status".to_string());
         t.mcp_servers = vec!["qmd".to_string()];
+        if mcp == McpSet::QmdSlack {
+            t.mcp_servers.push("slack".to_string());
+        }
     }
     for line in stdout.lines() {
         let line = line.trim();
@@ -1555,7 +1610,9 @@ const _: () = assert!(PROBE_MAX_ATTEMPTS > PROBE_ATTEMPTS);
 /// What to run and where.
 #[derive(Clone)]
 pub struct BatteryOptions {
-    /// The rows to probe. [`SHIPPED_ROWS`] for a real gate run; a subset only for iterating.
+    /// The rows to probe. The spawning harness's own shipped rows for a real gate run
+    /// (`CLAUDE_CODE_SHIPPED_ROWS` by default, matching the default harness); a subset only
+    /// for iterating.
     pub rows: Vec<ContainmentRow>,
     /// Probe ids to run, or `None` for all of them. A subset NEVER produces a committable
     /// record — the caller is responsible for not writing one.
@@ -1584,7 +1641,7 @@ pub struct BatteryOptions {
 impl Default for BatteryOptions {
     fn default() -> Self {
         BatteryOptions {
-            rows: SHIPPED_ROWS.to_vec(),
+            rows: CLAUDE_CODE_SHIPPED_ROWS.to_vec(),
             probes: None,
             timeout_secs: DEFAULT_PROBE_TIMEOUT_SECS,
             keep_scratch: false,
@@ -1943,6 +2000,7 @@ pub async fn run_battery(base: &Config, opts: &BatteryOptions) -> Result<RunOutc
             state: scratch.join(row.label().replace('/', "-")).join("state"),
             home: real_home.clone(),
             transcript_dir: transcript_dir.clone(),
+            real_vault: PathBuf::from(&base.vault),
             // A per-row seed: distinct nonces per row, and distinct on every run, so no
             // artifact of an earlier run can satisfy a probe.
             seed: stamp
@@ -2035,10 +2093,13 @@ mod tests {
         for p in PROBES {
             assert!(seen.insert(p.id), "duplicate probe id {}", p.id);
             assert!(!p.tools.is_empty(), "{} names no capable tool", p.id);
-            for r in SHIPPED_ROWS {
+            for r in CLAUDE_CODE_SHIPPED_ROWS
+                .iter()
+                .chain(CODEX_SHIPPED_ROWS.iter())
+            {
                 // Panics (via the unreachable! arm) if a hard gate is added without a stated
                 // requirement — the table cannot silently grow a probe nothing asserts.
-                let req = hard_gate_requirement(p.id, p.class, &r);
+                let req = hard_gate_requirement(p.id, p.class, r);
                 assert_eq!(
                     req.is_some(),
                     p.class == ProbeClass::HardGate,
@@ -2386,6 +2447,7 @@ mod tests {
             state: PathBuf::from("/tmp/probe-root/state"),
             home: PathBuf::from("/tmp/probe-home"),
             transcript_dir: PathBuf::from("/tmp/probe-home/.claude/projects/-vault"),
+            real_vault: PathBuf::from("/tmp/probe-real-vault"),
             seed: 42,
             http_port: 1234,
             net_log: Arc::new(Mutex::new(Vec::new())),

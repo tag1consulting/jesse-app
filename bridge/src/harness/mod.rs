@@ -300,6 +300,25 @@ pub trait Harness: Send + Sync {
     /// directory when the child is built, which is the only place that knows it.
     fn capability_args(&self, cfg: &Config, capability: Capability) -> Vec<String>;
 
+    /// The MCP server set a MAIN turn of THIS harness spawns when no override is set.
+    ///
+    /// PER HARNESS, because the postures genuinely differ: Claude Code's main turn loads
+    /// qmd plus the read-only Slack server, Codex's loads qmd alone. Sharing one const
+    /// meant adding a server to one harness silently changed the other's posture — and
+    /// since the containment record is keyed by MCP set, that would have invalidated a
+    /// record and orphaned its human `[[accepted]]` signatures as a side effect of a
+    /// change that had nothing to do with it.
+    fn main_mcp_config(&self) -> &'static str;
+
+    /// Every (capability, MCP set) pair THIS harness actually spawns, and therefore every
+    /// row its record must carry.
+    ///
+    /// PER HARNESS for the same reason as [`Harness::main_mcp_config`], of which this is
+    /// the direct consequence: the rows a battery must probe follow from the server sets
+    /// the harness spawns. A shared list forced every harness to be re-recorded whenever
+    /// any one of them gained a server.
+    fn shipped_rows(&self) -> &'static [ContainmentRow];
+
     /// Where this harness keeps its transcripts on disk, if it keeps any.
     ///
     /// `None` means it keeps none in a layout the bridge can read — its thread state is its

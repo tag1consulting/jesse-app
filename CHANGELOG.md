@@ -15,6 +15,175 @@ CI both run it). See the "Versioning" section of `bridge/README.md`.
 
 ## [Unreleased]
 
+## [Bridge 0.59.0] - 2026-08-05
+
+Every Codex turn after a conversation's first one died before the model ran, and
+the failure told the operator that Claude had failed.
+
+### Fixed
+
+- **The working directory flag was emitted after a subcommand that does not accept
+  it, so every resumed Codex turn failed before the model ran.** `-C`/`--cd` is
+  defined on the root `codex` command and on `codex exec`, but not on `codex exec
+  resume`; the argv builder pushed it after the `resume` token, so clap exited 2
+  with `unexpected argument '-C' found` and never reached the model. A first turn
+  carries no session id and therefore no `resume`, which is why the flag parsed
+  there and the fault read as intermittent rather than total. The flag now sits at
+  the root, ahead of `exec`, where both shapes accept it — `codex -C <dir> exec
+  resume <id> …`. It is not redundant with the child `Command`'s `current_dir`: it
+  is also what anchors Codex's config and sandbox resolution, so it was moved, not
+  dropped.
+- **Audited every flag that followed it**, since clap stops at the first unknown
+  argument and none of them had ever been parsed on a resume turn. The capability
+  overrides, the translated MCP set and the provider seam are all `-c key=value`,
+  and `-c`, `--json`, `--skip-git-repo-check`, `--ignore-user-config` and
+  `--ignore-rules` are all declared by `codex exec resume` on the installed
+  codex-cli 0.146.0. `-C` was the only offender.
+- **A Codex failure no longer reports itself as Claude.** The no-envelope fatal
+  message is built in the Claude Code module, and the shared driver reaches it for
+  every harness, so a Codex child that died on a clap usage error printed `claude
+  failed (no JSON envelope)` directly above a `codex exec resume` usage string —
+  and the operator could not tell whether the app had silently switched models.
+  The failing harness's id is now threaded through `resolve_stream_outcome` and
+  `interpret_claude_output` and names the child that actually died; the same
+  applies to the empty-result message. The label is presentation only:
+  `classify_hosted_failure` still keys on the stderr and stdout content and never
+  on the harness word, so a renamed harness cannot change how a failure is
+  classified or retried.
+
+### Added
+
+- **A builder test that constructs the resume-shaped argv**, which is what was
+  missing: every prior `build_codex_args` test passed `None` for the session id,
+  so the vector that every second-and-later turn uses was never built. It checks
+  everything after `resume` against the real option list from `codex exec resume
+  --help`, so the next flag added to the builder fails in CI rather than in the
+  morning health routine. The three-turn resume test now asserts flag placement,
+  not just subcommand position, and the classifier has a test that the harness
+  label does not change the classification.
+
+## [Bridge 0.58.0] - 2026-08-05
+
+The battery could not see a whole class of grant, and the record therefore
+overstated the boundary. This closes the blind spot and makes CLI staleness loud.
+
+### Fixed
+
+- **The probe world now mirrors the real vault's project settings.** The child's
+  cwd is a disposable stand-in vault, so Claude Code does project-scope settings
+  discovery against *that* directory — and a scratch tree with no `.claude/` made
+  the battery structurally blind to every grant made in a settings file.
+  `ProbeEnv::prepare` copies `.claude/settings.json` and `.claude/settings.local.json`
+  from the real vault into the stand-in, so a settings-file grant now surfaces as a
+  probe verdict instead of as nothing. Copying (rather than pointing the child at the
+  real vault) keeps every write probe inside the disposable tree.
+
+  Found the hard way: the vault's `.claude/settings.json` had been granting
+  `Bash(duckdb:*)` and `Bash(brew install duckdb)` to every phone turn — arbitrary
+  package installation from a phone request — invisible to both the record and the
+  startup gate, because no probe ever stood where the child stands. Both entries are
+  removed; nothing on a bridge turn needs duckdb (`Skill()` is pinned to
+  `diet-logging`, and the only duckdb consumer is the `diet-query` skill, which a
+  phone turn cannot reach).
+
+### Added
+
+- **Advisory containment-record staleness check** (`detect_binary_drift`). The record
+  names `binary_version`, but until now nothing in the serving path read it — only
+  `containment-probe` compared it, i.e. only while already re-running the battery. A
+  routine agent-CLI upgrade therefore invalidated what the record described **in
+  silence**. The bridge now compares the live `<bin> --version` per in-use harness at
+  startup, prints a warning naming the re-run command, and reports it on `GET /health`
+  as `containment_stale` (auth-gated, absent when there is no drift).
+
+  **It warns, it never blocks.** A self-updating CLI must not be able to turn someone
+  else's release into an outage on a morning nobody chose — a stale record that
+  announces itself is strictly better. An unreadable version is not reported as drift:
+  "we could not check" must not read as "it moved".
+
+## [Bridge 0.57.0] - 2026-08-05
+
+Two read-only reaches the bridge did not have: the open web, and Slack. Both are
+grants in the shipped posture, so both are certified by the battery rather than
+asserted by a config file.
+
+### Added
+
+- **Read-only web access on a main turn.** `WebSearch` and `WebFetch` join
+  `DEFAULT_ALLOWED_TOOLS` (`bridge/src/config.rs`). `WebSearch` was merely absent;
+  `WebFetch` was denied and had to be released — see Changed.
+- **A read-only Slack server on a main turn.** `MAIN_CHILD_MCP_CONFIG`
+  (`bridge/src/harness/claude_code.rs`) now declares `slack` alongside `qmd`: the
+  self-hosted npm `slack-mcp-server` (upstream `korotovsky/slack-mcp-server`), run
+  under `npx`. This is **not** the account-level claude.ai Slack connector, which
+  is still never loaded. Its `xoxp` token arrives by environment inheritance
+  (`SLACK_MCP_XOXP_TOKEN`), so no secret is baked into any config.
+- **Six `mcp__slack__*` tools**, all read-only, join the allowlist:
+  `conversations_history`, `conversations_replies`, `conversations_search_messages`,
+  `channels_list`, `channels_me`, `users_search`.
+- **`McpSet::QmdSlack` and the two battery rows that load it.** Claude Code's
+  main-turn rows moved from `qmd` to `qmd+slack`. Without this the Slack tools would
+  have been granted in the allowlist but never exercised by any probe:
+  `McpSet::config()` deliberately resolves the SHIPPED consts, not the env
+  overrides, so a server reached only through `JESSE_MAIN_MCP_CONFIG` is invisible
+  to the battery — certified on paper, untested in fact.
+- **`McpSet::contains_qmd()`, exhaustively matched with no `_` arm.** The
+  `search_qmd` positive control asked `row.mcp == McpSet::Qmd`, so adding a variant
+  silently inverted it from "qmd search must work" to "must be denied" — a live
+  battery run failed its own positive control on rows where qmd was working, and
+  recorded `gate = fail` that read like a containment finding and was not. Adding a
+  future set containing qmd is now a compile error at one line instead.
+
+### Changed — per-harness containment rows
+
+- **`SHIPPED_ROWS` is gone, replaced by `Harness::shipped_rows()`** with
+  `CLAUDE_CODE_SHIPPED_ROWS` (`…, read/qmd+slack, write/qmd+slack`) and
+  `CODEX_SHIPPED_ROWS` (`…, read/qmd, write/qmd`). `Harness::main_mcp_config()` is
+  per-harness for the same reason, and `main_mcp_config(cfg, harness)` now takes the
+  spawning harness rather than reaching for one global const.
+
+  One shared row list meant the row key was a global: giving **Claude Code** a Slack
+  server changed the key for **Codex** too, which would have invalidated
+  `containment-codex.toml`, demanded a battery re-run against a harness whose token
+  is the literal string `unused`, and orphaned two human `[[accepted]]` blocks keyed
+  by row label — including an operator signature on `write/qmd` dated 2026-08-04.
+  None of that had anything to do with Slack. Codex keeps qmd alone; its record and
+  both signatures are untouched by this release.
+- **`parse_codex_trace` carried the same landmine** and now asks `contains_qmd()`.
+  It registered qmd's tools only for the qmd-only set, so a Codex run on any future
+  qmd-bearing set would have scored a working positive control as a denial. Fixed
+  now rather than left armed for whoever re-records Codex next.
+
+### Changed
+
+- **`WebFetch` moved off `DEFAULT_DISALLOWED_TOOLS`.** Its rationale — *"the SSRF /
+  data-exfiltration surface the Ask/Tell workflows don't need"* — is **superseded,
+  not refuted**: read-only web access became a wanted capability, so the premise
+  "don't need" stopped holding. The surface it named is real and still present, and
+  is **accepted** rather than mitigated. The residual risk is that fetched content
+  enters a turn holding `Write(./**)` as a non-sandboxed user, which is a
+  prompt-injection path to the vault. A `WebFetch(domain:...)` allowlist was
+  considered and declined: it narrows one outbound door while `Bash(git:*)` leaves
+  another open, and that decision is explicitly coupled to any future narrowing of
+  `Bash(git:*)`.
+- **`DEFAULT_DISALLOWED_TOOLS` is now `NotebookEdit`** — a placeholder, because the
+  list **must never be empty**. `env_string` trims and treats blank as unset, and
+  the field falls back with `unwrap_or_else(|| DEFAULT_DISALLOWED_TOOLS)`, so an
+  empty value silently RESTORES the default and would re-arm the `WebFetch` deny
+  with no error anywhere. `NotebookEdit` is safe to deny: nothing in the allowlist
+  grants it, so it shadows no grant (unlike bare `Bash`).
+- **The startup gate now names the fix.** `validate_toolset_argv` previously
+  reported a toolset mismatch and suggested unsetting `JESSE_ALLOWED_TOOLS` —
+  accurate but unhelpful, since it never said that the allowlist is a *certified
+  posture* and that the env vars can only re-state it, never grant. The message now
+  says so, and names the actual path: edit the consts, re-run the battery, commit
+  the record, rebuild, restart. This was the day's real cost — a plist edit that
+  looked like a working seam and failed at boot with an error describing a mismatch
+  without naming the remedy.
+- `build_claude_args_enforces_least_privilege` no longer asserts that `WebFetch` is
+  denied; it asserts the invariant that outlives any entry — that the denylist is
+  **non-empty**.
+
 ## [Bridge 0.56.0] - 2026-08-04
 
 The Codex write sandbox was certified in 0.54.0. What stood between that and a

@@ -5,11 +5,12 @@
 use std::path::Path;
 
 use jesse_bridge::{
-    app, binary_exists, build_apns, env_string, env_truthy, harness_bin_env,
+    app, binary_exists, build_apns, detect_binary_drift, env_string, env_truthy, harness_bin_env,
+    settings_permission_drift, SETTINGS_DRIFT,
     harness_default_bin, harnesses_in_use, is_bind_allowed, load_local_models,
     manual_pairing_lines, pairing_payload, show_token_opt_in, spawn_eviction_task,
     spawn_session_gc_task, start_health_prober, validate_model_config, AppState, Config,
-    CONTAINMENT_RECORDS,
+    BINARY_DRIFT, CONTAINMENT_RECORDS,
 };
 
 #[tokio::main]
@@ -50,6 +51,44 @@ async fn main() {
         }
         std::process::exit(1);
     }
+    // ADVISORY, never fatal: is each harness's live agent binary the one its record was taken
+    // with? A self-updating CLI must not be able to block boot (see `detect_binary_drift`),
+    // but a record silently describing a binary nobody is running is exactly the quiet
+    // staleness this project cannot afford. So: warn loudly, serve anyway, and report it on
+    // `/health` so it is visible without reading logs.
+    let drift = detect_binary_drift(&cfg, CONTAINMENT_RECORDS);
+    for d in &drift {
+        eprintln!(
+            "jesse-bridge: WARNING — containment record for harness '{}' was taken against \
+             {}, but the installed binary is {}. The record still gates startup, but it now \
+             describes a binary that is not running. Re-run the containment battery and \
+             commit the record: cargo run --features=containment-probe --bin \
+             containment-probe -- --write --harness {}",
+            d.harness, d.recorded, d.live, d.harness
+        );
+    }
+    let _ = BINARY_DRIFT.set(drift);
+
+    // The one settings scope the child still loads. `local` is excluded by
+    // `--setting-sources user,project`; `project` is kept for the vault's hooks, so a
+    // permission entry appearing THERE is the remaining way to grant a tool the record
+    // cannot see. Advisory and loud — never silent. See `settings_permission_drift`.
+    let settings_grants = settings_permission_drift(&cfg);
+    if !settings_grants.is_empty() {
+        eprintln!(
+            "jesse-bridge: WARNING — {} permission entr(ies) in {}/.claude/settings.json are \
+             granted to every turn but are NOT in the containment record and NOT checked by \
+             the startup gate. Move them to DEFAULT_ALLOWED_TOOLS (and re-run the battery), \
+             or delete them:",
+            settings_grants.len(),
+            cfg.vault
+        );
+        for g in &settings_grants {
+            eprintln!("    {g}");
+        }
+    }
+    let _ = SETTINGS_DRIFT.set(settings_grants);
+
     // One binary check per harness some configured model actually references. A config full
     // of Codex models must not demand a Claude binary for the models it does not have — and
     // the ambient default keeps `claude-code` in the list regardless.

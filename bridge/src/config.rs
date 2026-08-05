@@ -158,11 +158,28 @@ Bash(git:*),Bash(mv:*),Bash(ls:*),Bash(cat:*),Bash(find:*),\
 Bash(date:*),Bash(cal:*),Bash(head:*),Bash(tail:*),Bash(wc:*),\
 Bash(node todo-list/generate-diet-today.js:*),\
 Bash(node todo-list/validate-diet-today.js:*),\
-Bash(node todo-list/verify-diet-consistency.js:*)";
+Bash(node todo-list/verify-diet-consistency.js:*),\
+WebSearch,WebFetch,\
+mcp__slack__conversations_history,mcp__slack__conversations_replies,\
+mcp__slack__conversations_search_messages,mcp__slack__channels_list,\
+mcp__slack__channels_me,mcp__slack__users_search";
 
 // Defense-in-depth: tools that must never run from the bridge even if they slip
-// into the allowlist. WebFetch is the SSRF / data-exfiltration surface the
-// Ask/Tell workflows don't need. Override with JESSE_DISALLOWED_TOOLS.
+// into the allowlist. Override with JESSE_DISALLOWED_TOOLS.
+//
+// WebFetch was the sole entry until 0.57.0, as "the SSRF / data-exfiltration
+// surface the Ask/Tell workflows don't need". That rationale is SUPERSEDED, not
+// refuted: read-only web access became a wanted capability, so the premise
+// "don't need" stopped holding. The surface it named is real and still present,
+// and is accepted rather than mitigated — see SECURITY.md "Web access".
+//
+// THIS LIST MUST NEVER BE EMPTY, and NotebookEdit is here to keep it non-empty.
+// `env_string` trims and treats blank as unset, and the field falls back with
+// `unwrap_or_else(|| DEFAULT_DISALLOWED_TOOLS)` — so a deployment setting
+// JESSE_DISALLOWED_TOOLS="" would silently RESTORE this default and re-arm the
+// WebFetch deny with no error anywhere. The same trap applies to emptying the
+// const itself. NotebookEdit is a safe placeholder: nothing in the allowlist
+// grants it, so denying it shadows no grant (unlike bare `Bash`, below).
 //
 // Bare `Bash` is deliberately NOT here. Listing it removes the entire Bash tool
 // class — which shadows EVERY scoped `Bash(<verb>:*)` grant in the allowlist
@@ -175,7 +192,7 @@ Bash(node todo-list/verify-diet-consistency.js:*)";
 // turn cannot answer, so it is denied. Default-deny + the scoped allowlist is the
 // real least-privilege boundary; denying the tool class only breaks the scoped
 // grants (and silently broke diet-logging + the clock verbs until this fix).
-pub const DEFAULT_DISALLOWED_TOOLS: &str = "WebFetch";
+pub const DEFAULT_DISALLOWED_TOOLS: &str = "NotebookEdit";
 
 #[derive(Clone)]
 pub struct Config {

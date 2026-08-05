@@ -459,9 +459,18 @@ pub fn validate_toolset_argv(
             errors.push(ConfigError::global(format!(
                 "the toolset this deployment would run at '{}' on harness '{}' is not the one \
                  the containment record was taken with, so the record cannot speak for it.\n  \
-                 recorded: {:?}\n  running: {:?}\nThe usual cause is JESSE_ALLOWED_TOOLS / \
-                 JESSE_DISALLOWED_TOOLS widening the allowlist. Unset them, or re-run the \
-                 battery against this posture and commit the record.",
+                 recorded: {:?}\n  running: {:?}\n\
+                 \nThe tool allowlist is NOT a config setting — it is a certified posture. \
+                 JESSE_ALLOWED_TOOLS / JESSE_DISALLOWED_TOOLS can only ever RE-STATE what the \
+                 battery already recorded; they cannot grant a tool. Setting them to anything \
+                 else fails here, at boot, exactly as it just did.\n\
+                 \nTo actually grant or remove a tool: edit DEFAULT_ALLOWED_TOOLS / \
+                 DEFAULT_DISALLOWED_TOOLS in bridge/src/config.rs (and, for a new MCP server, \
+                 MAIN_CHILD_MCP_CONFIG plus an McpSet variant so a row loads it), re-run \
+                 `cargo run --bin containment-probe -- --write`, commit the updated \
+                 bridge/containment.toml, rebuild, and restart. Budget ~30 minutes and a live \
+                 API spend for the battery; it is not a config edit.\n\
+                 \nTo get booting again right now: unset both variables and restart.",
                 row.label(),
                 harness.id(),
                 row.toolset_args,
@@ -478,6 +487,117 @@ pub fn validate_toolset_argv(
 /// Absence is reported by the caller (startup) rather than being fatal here, because the
 /// ambient default's binary is checked by the existing startup probe and this must not
 /// duplicate its message.
+/// Permission entries found in the vault's PROJECT settings — grants the containment record
+/// and the startup gate cannot see.
+///
+/// The child runs with `--setting-sources user,project`, so `.claude/settings.local.json` is
+/// out of reach entirely. `project` is deliberately still loaded, because the vault's
+/// `settings.json` carries the diet-regeneration and draft-guard hooks. That leaves exactly
+/// one uncovered path: someone adds a `permissions.allow` entry to THAT file. This finds it.
+///
+/// Advisory, like [`detect_binary_drift`]: it warns and serves. A vault file is not a
+/// deployment invariant, and refusing to boot because someone appended a `Bash(jq:*)` for
+/// desktop work would make the bridge hostage to an editor. But it must never be SILENT —
+/// silence is how `Bash(duckdb:*)` and `Bash(brew install duckdb)` reached every phone turn
+/// unnoticed until 2026-08-05.
+pub fn settings_permission_drift(cfg: &Config) -> Vec<String> {
+    let path = std::path::Path::new(&cfg.vault)
+        .join(".claude")
+        .join("settings.json");
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        return Vec::new();
+    };
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) else {
+        return Vec::new();
+    };
+    // Every list is reported, not just `allow`: an `ask` entry a headless child cannot answer
+    // is a denial, but a `deny` or a `defaultMode` here is still posture the record never saw.
+    let mut found = Vec::new();
+    for key in ["allow", "ask", "deny"] {
+        if let Some(items) = v
+            .get("permissions")
+            .and_then(|p| p.get(key))
+            .and_then(|a| a.as_array())
+        {
+            for item in items.iter().filter_map(|i| i.as_str()) {
+                found.push(format!("{key}: {item}"));
+            }
+        }
+    }
+    found
+}
+
+/// The project-settings grants found at startup, for `/health` to report.
+pub static SETTINGS_DRIFT: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+
+/// One harness whose LIVE agent binary is not the one its containment record was taken with.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BinaryDrift {
+    pub harness: String,
+    /// `binary_version` from the committed record.
+    pub recorded: String,
+    /// What `<bin> --version` says right now.
+    pub live: String,
+}
+
+/// The drift detected at startup, for `/health` to report without re-spawning a process.
+pub static BINARY_DRIFT: std::sync::OnceLock<Vec<BinaryDrift>> = std::sync::OnceLock::new();
+
+/// Compare each in-use harness's live agent binary against the version its record was taken
+/// with. **Advisory: this WARNS, it never blocks startup.**
+///
+/// # Why this exists, and why it is not fatal
+///
+/// The record names `binary_version`, and until 0.58.0 nothing in the serving path read it —
+/// only `containment-probe` compared it, i.e. only when you were already re-running the
+/// battery. So a routine agent-CLI upgrade silently invalidated what the record described:
+/// the gate kept passing, the file kept asserting a posture measured against a binary no
+/// longer installed, and nothing anywhere said so. That is the failure mode with teeth here,
+/// because the founding lesson of this whole system is that a CLI version CHANGED what an
+/// empty `--allowedTools` meant.
+///
+/// It warns rather than refuses because the agent CLI can update itself. A hard block would
+/// turn someone else's release into an outage on a morning nobody chose — strictly worse than
+/// a stale record that is loudly announced. Staleness should be noisy, not fatal.
+pub fn detect_binary_drift(cfg: &Config, records: &[(&str, &str)]) -> Vec<BinaryDrift> {
+    let mut out = Vec::new();
+    for id in harnesses_in_use(cfg) {
+        let Some(record) = records
+            .iter()
+            .find(|(rid, _)| *rid == id)
+            .and_then(|(_, text)| parse_results(text).ok())
+        else {
+            continue;
+        };
+        let Some(bin) = harness_bin_env(&id)
+            .and_then(env_string)
+            .or_else(|| harness_default_bin(&id).map(str::to_string))
+        else {
+            continue;
+        };
+        let live = std::process::Command::new(&bin)
+            .arg("--version")
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .and_then(|o| String::from_utf8(o.stdout).ok())
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+        // An unreadable version is NOT reported as drift: "we could not check" would then be
+        // indistinguishable from "it moved", and the startup binary check already reports a
+        // missing binary in its own words.
+        let Some(live) = live else { continue };
+        if live != record.binary_version {
+            out.push(BinaryDrift {
+                harness: id,
+                recorded: record.binary_version,
+                live,
+            });
+        }
+    }
+    out
+}
+
 pub fn harnesses_in_use(cfg: &Config) -> Vec<String> {
     let mut ids: Vec<String> = cfg
         .model_registry
@@ -686,7 +806,17 @@ mod tests {
         // The Write row records an open network route and a process that outlives the turn.
         // Passing keys on the hard gates alone, or Write would be ungrantable forever.
         let r = record();
-        let write_row = r.row("write", "qmd").expect("the write row");
+        // Derived from the harness rather than hardcoded: the claude-code write row is
+        // `write/qmd+slack` since 0.57.0, and a literal label here would silently need
+        // editing on every MCP-set change instead of following the harness that owns it.
+        let write_label = ClaudeCode
+            .shipped_rows()
+            .iter()
+            .find(|row| row.capability == Capability::Write)
+            .expect("claude-code ships a write row")
+            .mcp
+            .label();
+        let write_row = r.row("write", write_label).expect("the write row");
         assert!(
             write_row.probes.iter().any(|p| p.status == "known_open"),
             "precondition: the Write row has known-open baselines"

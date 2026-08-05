@@ -27,6 +27,12 @@ impl Harness for NoTranscriptHarness {
     fn streams_text(&self) -> bool {
         false
     }
+    fn main_mcp_config(&self) -> &'static str {
+        jesse_bridge::EMPTY_MCP_CONFIG
+    }
+    fn shipped_rows(&self) -> &'static [jesse_bridge::ContainmentRow] {
+        &jesse_bridge::CODEX_SHIPPED_ROWS
+    }
     fn expresses(&self, _capability: Capability) -> bool {
         true
     }
@@ -60,6 +66,12 @@ impl Harness for FixedDirHarness {
     }
     fn streams_text(&self) -> bool {
         true
+    }
+    fn main_mcp_config(&self) -> &'static str {
+        jesse_bridge::EMPTY_MCP_CONFIG
+    }
+    fn shipped_rows(&self) -> &'static [jesse_bridge::ContainmentRow] {
+        &jesse_bridge::CODEX_SHIPPED_ROWS
     }
     fn expresses(&self, _capability: Capability) -> bool {
         true
@@ -444,6 +456,25 @@ fn a_codex_conversation_resumes_across_three_turns() {
                 });
                 assert_eq!(argv[at - 1], "exec", "`resume` is a subcommand of `exec`");
                 assert_eq!(&argv[at + 1], id, "resume must name the bound thread");
+
+                // PLACEMENT, not just position. Asserting only that `resume` follows `exec`
+                // is what let a resumed turn ship with `-C` AFTER the subcommand: `-C` is a
+                // flag of the root command and of `codex exec`, but not of `codex exec
+                // resume`, so clap exited 2 before the model ran and every turn but the
+                // first failed. This vector must be one the real binary accepts.
+                let cd = argv
+                    .iter()
+                    .position(|a| a == "-C")
+                    .unwrap_or_else(|| panic!("turn {turn} lost its cwd flag, argv: {argv:?}"));
+                assert!(
+                    cd < at,
+                    "turn {turn} passes `-C` to a subcommand that rejects it, argv: {argv:?}"
+                );
+                assert_eq!(
+                    argv[cd + 2],
+                    "exec",
+                    "turn {turn}: `-C <dir>` belongs at the root, ahead of `exec`, argv: {argv:?}"
+                );
             }
         }
 
