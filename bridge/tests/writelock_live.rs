@@ -335,6 +335,20 @@ async fn a_claude_child_acquires_the_lock_through_the_bridge_owned_settings() {
 ///
 /// If someone later adds a third flag behind the write lock, this fails and they have to
 /// decide, deliberately, whether the containment record still speaks for the child.
+///
+/// # THE OPEN GAP THIS TEST IS STANDING IN FOR — tag1consulting/jesse-app#66
+///
+/// This asserts that the recorded posture still MATCHES what the gate compares. It does NOT
+/// establish that the hooked child was ever probed, and it was not: `probe.rs` builds every
+/// battery child with `write_lock: None`, so both committed records describe the UNHOOKED
+/// shape. Re-cutting them as they stand would re-probe the old posture and prove nothing about
+/// the write lock.
+///
+/// That is a deliberate decision recorded in the 0.60.0 CHANGELOG, not an oversight — and it
+/// is the exception to this project's standing rule that a posture the record has not probed
+/// is not a posture we ship. **Issue #66 is how it gets closed.** If you are here because you
+/// changed something behind the write lock, read that issue before deciding this test is
+/// enough.
 #[test]
 fn the_write_lock_adds_exactly_one_known_flag_per_harness() {
     let s = Scratch::new("argv");
