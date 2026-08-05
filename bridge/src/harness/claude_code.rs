@@ -566,6 +566,27 @@ pub fn build_claude_args(
         // below rather than auto-accepted. Never acceptEdits/bypassPermissions.
         "--permission-mode".to_string(),
         "default".to_string(),
+        // SETTINGS SCOPES: user + project, never `local`.
+        //
+        // The child's cwd is the vault, so Claude Code performs settings discovery there and
+        // ANY permission entry it finds is a grant the containment record and the startup
+        // gate cannot see. On 2026-08-05 the battery — once its probe world was made faithful
+        // — caught `.claude/settings.local.json` granting `Read(//Users/jandrews/**)`, which
+        // let a `read`-level child read the agent-credential decoy and session transcripts in
+        // the real home. That file also carried arbitrary-execution grants
+        // (`Bash(/opt/homebrew/bin/node *)`, `Bash(env -i … sh -c ' *)`, `Bash(brew install *)`).
+        //
+        // `local` is excluded because it is the untracked, personal, fast-growing scope — the
+        // one a desktop session appends to with "yes, don't ask again" and nobody reviews.
+        // `project` is KEPT because the vault's `settings.json` carries the diet-regeneration
+        // and draft-guard hooks, which earn their keep daily and are not permission grants.
+        // Verified against claude 2.1.222 that the split works: with `user,project` a
+        // project-scope grant still applies and a local-scope grant is refused.
+        //
+        // This is a floor, not the boundary: `project` can still grant, which is why its
+        // `permissions` block is asserted empty at startup (see `settings_permission_drift`).
+        "--setting-sources".to_string(),
+        "user,project".to_string(),
     ];
     // ROOT MCP boundary, then the capability's toolset. Every spawn site assembles in
     // this order, which is what lets one builder serve all of them.
@@ -1548,8 +1569,10 @@ mod tests {
 
     // ---- Capability golden --------------------------------------------------
 
-    /// The eight args every `claude` child starts with, turn or one-shot.
-    const GOLDEN_BASE: [&str; 8] = [
+    /// The ten args every `claude` child starts with, turn or one-shot. `--setting-sources`
+    /// is here rather than per-site: EVERY child runs with a cwd where settings discovery
+    /// happens, so excluding the `local` scope is a floor, not a per-call-site choice.
+    const GOLDEN_BASE: [&str; 10] = [
         "-p",
         "PROMPT",
         "--output-format",
@@ -1558,6 +1581,8 @@ mod tests {
         "--include-partial-messages",
         "--permission-mode",
         "default",
+        "--setting-sources",
+        "user,project",
     ];
 
     /// The MCP config the main path falls back to when `JESSE_MAIN_MCP_CONFIG` is unset —

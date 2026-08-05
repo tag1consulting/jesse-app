@@ -369,6 +369,24 @@ pub async fn health(State(st): State<AppState>, headers: HeaderMap) -> Json<Valu
     if check_auth(&headers, &st.cfg.token).is_ok() {
         body["vault"] = json!(st.cfg.vault);
         body["claude"] = json!(st.cfg.claude_bin);
+        // Containment-record staleness, computed once at startup (see `detect_binary_drift`)
+        // so this handler never spawns a process. Absent field = no drift, which is the
+        // common case; present = the record describes an agent binary that is not the one
+        // installed, and the battery should be re-run. Auth-gated with the rest of the
+        // operator detail: it names local binary versions.
+        if let Some(g) = SETTINGS_DRIFT.get().filter(|g| !g.is_empty()) {
+            body["settings_grants_unrecorded"] = json!(g);
+        }
+        if let Some(drift) = BINARY_DRIFT.get().filter(|d| !d.is_empty()) {
+            body["containment_stale"] = json!(drift
+                .iter()
+                .map(|d| json!({
+                    "harness": d.harness,
+                    "recorded": d.recorded,
+                    "installed": d.live,
+                }))
+                .collect::<Vec<_>>());
+        }
     }
     Json(body)
 }
