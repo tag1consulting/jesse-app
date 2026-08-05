@@ -2093,10 +2093,13 @@ mod tests {
         for p in PROBES {
             assert!(seen.insert(p.id), "duplicate probe id {}", p.id);
             assert!(!p.tools.is_empty(), "{} names no capable tool", p.id);
-            for r in CLAUDE_CODE_SHIPPED_ROWS.iter().chain(CODEX_SHIPPED_ROWS.iter()).copied() {
+            for r in CLAUDE_CODE_SHIPPED_ROWS
+                .iter()
+                .chain(CODEX_SHIPPED_ROWS.iter())
+            {
                 // Panics (via the unreachable! arm) if a hard gate is added without a stated
                 // requirement — the table cannot silently grow a probe nothing asserts.
-                let req = hard_gate_requirement(p.id, p.class, &r);
+                let req = hard_gate_requirement(p.id, p.class, r);
                 assert_eq!(
                     req.is_some(),
                     p.class == ProbeClass::HardGate,
