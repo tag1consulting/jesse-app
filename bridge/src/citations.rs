@@ -16,8 +16,9 @@
 //! **Path normalization.** qmd returns collection-relative paths, and the design
 //! probes caught the local model PREPENDING its cwd to them. So before resolving, a
 //! cited path is stripped of any absolute prefix up to and including the vault root
-//! or a `todo-list/` component, and the remainder is tried against the vault root AND
-//! against `todo-list/` under it.
+//! or a notes-root component (`vault/` or the historical `todo-list/`, which survives
+//! as qmd's collection name), and the remainder is tried against the vault root AND
+//! against the notes subdir under it.
 
 use crate::*;
 
@@ -94,8 +95,15 @@ pub fn extract_citations(answer: &str) -> Vec<Citation> {
 /// Candidate on-disk paths a cited `raw` path may resolve to under `vault_root`.
 /// Applies the normalization the design requires: try the path as-is (relative);
 /// strip any prefix up to and including the vault root; strip any prefix up to a
-/// `todo-list/` component; then resolve each remainder against the vault root AND
-/// against `todo-list/` under it.
+/// notes-root component; then resolve each remainder against the vault root AND
+/// against the notes subdir (`config::VAULT_SUBDIR`) under it.
+///
+/// BOTH `vault/` and the historical `todo-list/` are accepted as the notes-root
+/// marker, and each is tried with the marker KEPT and with it DROPPED. That is not
+/// legacy cruft: after the 2026-08-06 relocation the directory is `vault/`, but
+/// citations keep arriving `todo-list/`-prefixed because that is QMD's collection
+/// NAME and the vault's wiki-link convention, neither of which is a real path. A
+/// resolver that accepted only the on-disk spelling would fail every such citation.
 pub fn normalize_candidates(raw: &str, vault_root: &Path) -> Vec<PathBuf> {
     let raw = raw.trim();
     let vault_str = vault_root.to_string_lossy().to_string();
@@ -104,9 +112,12 @@ pub fn normalize_candidates(raw: &str, vault_root: &Path) -> Vec<PathBuf> {
     if let Some(idx) = raw.find(&vault_str) {
         remainders.push(raw[idx + vault_str.len()..].to_string());
     }
-    // Strip up to (and including the start of) a `todo-list/` component.
-    if let Some(idx) = raw.rfind("todo-list/") {
-        remainders.push(raw[idx..].to_string());
+    // Strip up to a notes-root component, keeping AND dropping the marker itself.
+    for marker in ["todo-list/", "vault/"] {
+        if let Some(idx) = raw.rfind(marker) {
+            remainders.push(raw[idx..].to_string());
+            remainders.push(raw[idx + marker.len()..].to_string());
+        }
     }
     let mut out = Vec::new();
     for rem in remainders {
@@ -115,7 +126,7 @@ pub fn normalize_candidates(raw: &str, vault_root: &Path) -> Vec<PathBuf> {
             continue;
         }
         out.push(vault_root.join(rem));
-        out.push(vault_root.join("todo-list").join(rem));
+        out.push(vault_root.join(crate::config::VAULT_SUBDIR).join(rem));
     }
     out
 }
@@ -233,13 +244,17 @@ pub fn validate_vaultqa_answer(answer: &str, vault_root: &Path) -> Result<usize,
 mod tests {
     use super::*;
 
-    /// A throwaway vault with `todo-list/Today.md` holding known lines. Returns the
-    /// root; the caller removes it.
+    /// A throwaway vault with `vault/Today.md` holding known lines. Returns the
+    /// root; the caller removes it. NOTE the on-disk notes dir is `vault/` while most
+    /// tests below cite it as `todo-list/…` on purpose — that is the live shape after
+    /// the 2026-08-06 relocation (qmd's collection name and the wiki-link convention
+    /// both still say `todo-list`), and it is what the two-spelling marker loop in
+    /// `normalize_candidates` exists to serve.
     fn temp_vault() -> PathBuf {
         let root = std::env::temp_dir().join(format!("jesse-vaultqa-cite-{}", random_hex()));
-        std::fs::create_dir_all(root.join("todo-list")).unwrap();
+        std::fs::create_dir_all(root.join("vault")).unwrap();
         std::fs::write(
-            root.join("todo-list/Today.md"),
+            root.join("vault/Today.md"),
             "# Today\nVO2 max is 52 as of last week.\nDentist appointment is on Friday.\n",
         )
         .unwrap();
@@ -260,15 +275,29 @@ mod tests {
     #[test]
     fn valid_relative_path_passes() {
         let root = temp_vault();
+        // The on-disk spelling.
+        let answer = "Your VO2 max is 52 (vault/Today.md:2).";
+        assert_eq!(validate_vaultqa_answer(answer, &root), Ok(1));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn legacy_todo_list_prefix_still_resolves_after_the_relocation() {
+        // REGRESSION (2026-08-06 relocation): the notes dir is `vault/` on disk, but
+        // citations keep arriving `todo-list/`-prefixed because that is qmd's
+        // collection NAME and the vault's wiki-link convention. Dropping the marker
+        // and re-rooting under VAULT_SUBDIR is what makes this resolve; without it
+        // every locally-answered vault-QA turn fails validation and falls through.
+        let root = temp_vault();
         let answer = "Your VO2 max is 52 (todo-list/Today.md:2).";
         assert_eq!(validate_vaultqa_answer(answer, &root), Ok(1));
         let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
-    fn bare_name_resolves_under_todo_list() {
-        // A citation without the `todo-list/` prefix resolves via the "against
-        // todo-list/ under the vault" arm.
+    fn bare_name_resolves_under_the_notes_subdir() {
+        // A citation with no notes-root prefix resolves via the "against the notes
+        // subdir under the vault" arm.
         let root = temp_vault();
         let answer = "Friday, per Today.md.";
         assert_eq!(validate_vaultqa_answer(answer, &root), Ok(1));
@@ -279,12 +308,13 @@ mod tests {
     fn misrooted_absolute_path_from_the_probes_is_normalized_and_passes() {
         // The model prepended its cwd (the vault) to a collection-relative path, the
         // exact mis-rooting the design probes caught. Stripping up to and including
-        // the vault root recovers `todo-list/Today.md`, which resolves.
+        // the vault root recovers `vault/Today.md`, which resolves.
         let root = temp_vault();
-        let mis = format!("{}/todo-list/Today.md:2", root.display());
+        let mis = format!("{}/vault/Today.md:2", root.display());
         let answer = format!("VO2 max is 52 ({mis}).");
         assert_eq!(validate_vaultqa_answer(&answer, &root), Ok(1));
-        // Also handle a DIFFERENT absolute cwd prefix, stripped at the todo-list/ arm.
+        // Also handle a DIFFERENT absolute cwd prefix, stripped at the notes-root arm
+        // — and in its legacy `todo-list/` spelling, which is still what qmd emits.
         let other = "/private/tmp/scratch/todo-list/Today.md:2".to_string();
         let answer2 = format!("VO2 max is 52 ({other}).");
         assert_eq!(validate_vaultqa_answer(&answer2, &root), Ok(1));

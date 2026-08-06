@@ -39,10 +39,10 @@ permission.";
 pub const TELL_FLOOR: &str = "Record any durable fact, correction, or status change \
 to the right vault file immediately per CLAUDE.md — that is never optional and \
 never needs {owner_pronoun} permission. When the fact is a food, exercise, or weigh-in log, \
-`todo-list/diet-today.js` is a DERIVED cache: after appending the CSV row(s), \
-regenerate it by running `node todo-list/generate-diet-today.js`, then verify \
-with `node todo-list/validate-diet-today.js` and \
-`node todo-list/verify-diet-consistency.js` — never hand-edit the meals, weight, \
+`vault/diet-today.js` is a DERIVED cache: after appending the CSV row(s), \
+regenerate it by running `node vault/generate-diet-today.js`, then verify \
+with `node vault/validate-diet-today.js` and \
+`node vault/verify-diet-consistency.js` — never hand-edit the meals, weight, \
 or exercise data into it.";
 
 // Editable wrappers (the framing the app's Settings can override). The fixed

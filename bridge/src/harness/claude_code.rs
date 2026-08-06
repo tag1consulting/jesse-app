@@ -1146,9 +1146,9 @@ mod tests {
         // from a phone request). Pin both the presence of the scoped scripts and
         // the absence of any broader node scope.
         for script in [
-            "Bash(node todo-list/generate-diet-today.js:*)",
-            "Bash(node todo-list/validate-diet-today.js:*)",
-            "Bash(node todo-list/verify-diet-consistency.js:*)",
+            "Bash(node vault/generate-diet-today.js:*)",
+            "Bash(node vault/validate-diet-today.js:*)",
+            "Bash(node vault/verify-diet-consistency.js:*)",
         ] {
             assert!(
                 tools.contains(&script),

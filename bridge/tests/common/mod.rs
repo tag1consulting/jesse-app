@@ -304,13 +304,13 @@ pub fn diet_request_date(auth: Option<&str>, date: &str) -> Request<Body> {
     }
     b.body(Body::empty()).unwrap()
 }
-/// Create a throwaway vault dir with `todo-list/` and `diet-logs/`
+/// Create a throwaway vault dir with `vault/` and `diet-logs/`
 /// subdirectories and return its path. Caller writes fixture files into it and
 /// removes it when done. Realistic-but-invented data only — never a copy of
 /// the real personal vault.
 pub fn make_diet_vault() -> std::path::PathBuf {
     let root = std::env::temp_dir().join(format!("jesse-vault-{}", random_hex()));
-    std::fs::create_dir_all(root.join("todo-list")).unwrap();
+    std::fs::create_dir_all(root.join("vault")).unwrap();
     std::fs::create_dir_all(root.join("diet-logs")).unwrap();
     root
 }

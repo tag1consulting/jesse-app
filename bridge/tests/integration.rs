@@ -2351,10 +2351,10 @@ const FIX_WEIGHT_CSV: &str = "Date,Weight_lbs,Weight_kg,Phase,BodyFat_pct,Muscle
 /// Build a fully-populated synthetic vault and an AppState pointed at it.
 fn diet_state_full() -> (AppState, std::path::PathBuf) {
     let vault = make_diet_vault();
-    write_vault_file(&vault, "todo-list/diet-today.js", FIX_TODAY);
-    write_vault_file(&vault, "todo-list/diet-progress.js", FIX_PROGRESS);
-    write_vault_file(&vault, "todo-list/diet-coach-notes.js", FIX_COACH);
-    write_vault_file(&vault, "todo-list/proposed-diet-today.js", FIX_PROPOSED);
+    write_vault_file(&vault, "vault/diet-today.js", FIX_TODAY);
+    write_vault_file(&vault, "vault/diet-progress.js", FIX_PROGRESS);
+    write_vault_file(&vault, "vault/diet-coach-notes.js", FIX_COACH);
+    write_vault_file(&vault, "vault/proposed-diet-today.js", FIX_PROPOSED);
     write_vault_file(&vault, "diet-logs/weight-log.csv", FIX_WEIGHT_CSV);
     write_vault_file(&vault, "diet-logs/food-log.csv", FIX_FOOD_CSV);
     let cfg = Config {
@@ -2510,7 +2510,7 @@ async fn diet_minimal_today_omits_optional_fields_cleanly() {
     // An old-style file with no dayStyle, no weigh-in, no fiber/carbsBase must
     // still parse and 200 — the absent fields simply don't appear.
     let vault = make_diet_vault();
-    write_vault_file(&vault, "todo-list/diet-today.js", FIX_TODAY_MINIMAL);
+    write_vault_file(&vault, "vault/diet-today.js", FIX_TODAY_MINIMAL);
     write_vault_file(&vault, "diet-logs/weight-log.csv", FIX_WEIGHT_CSV);
     let cfg = Config {
         vault: vault.to_string_lossy().into_owned(),
@@ -2583,7 +2583,7 @@ async fn diet_broken_today_is_503() {
     let vault = make_diet_vault();
     write_vault_file(
         &vault,
-        "todo-list/diet-today.js",
+        "vault/diet-today.js",
         "window.DIET_TODAY = { date: , oops };",
     );
     let cfg = Config {
@@ -2603,13 +2603,13 @@ async fn diet_section_isolation_bad_progress_still_200() {
     // A broken progress file must NOT fail the endpoint: today parsed, so 200,
     // progress null, and a human-readable errors entry naming the section.
     let vault = make_diet_vault();
-    write_vault_file(&vault, "todo-list/diet-today.js", FIX_TODAY);
+    write_vault_file(&vault, "vault/diet-today.js", FIX_TODAY);
     write_vault_file(
         &vault,
-        "todo-list/diet-progress.js",
+        "vault/diet-progress.js",
         "window.DIET_PROGRESS = { not valid ]",
     );
-    write_vault_file(&vault, "todo-list/diet-coach-notes.js", FIX_COACH);
+    write_vault_file(&vault, "vault/diet-coach-notes.js", FIX_COACH);
     write_vault_file(&vault, "diet-logs/weight-log.csv", FIX_WEIGHT_CSV);
     let cfg = Config {
         vault: vault.to_string_lossy().into_owned(),
@@ -2643,8 +2643,8 @@ async fn diet_legacy_progress_without_targets_still_serves() {
     // progress block passes through, and `targets` is simply absent — the app
     // synthesizes goals locally, so deploy order is independent of the rollout.
     let vault = make_diet_vault();
-    write_vault_file(&vault, "todo-list/diet-today.js", FIX_TODAY);
-    write_vault_file(&vault, "todo-list/diet-progress.js", FIX_PROGRESS_LEGACY);
+    write_vault_file(&vault, "vault/diet-today.js", FIX_TODAY);
+    write_vault_file(&vault, "vault/diet-progress.js", FIX_PROGRESS_LEGACY);
     write_vault_file(&vault, "diet-logs/weight-log.csv", FIX_WEIGHT_CSV);
     let cfg = Config {
         vault: vault.to_string_lossy().into_owned(),
@@ -2672,10 +2672,10 @@ async fn diet_empty_targets_round_trips_as_empty_array() {
     // `targets: []` means the user has no weight goals right now — it must survive
     // as an empty array, distinct from an absent or null field.
     let vault = make_diet_vault();
-    write_vault_file(&vault, "todo-list/diet-today.js", FIX_TODAY);
+    write_vault_file(&vault, "vault/diet-today.js", FIX_TODAY);
     write_vault_file(
         &vault,
-        "todo-list/diet-progress.js",
+        "vault/diet-progress.js",
         FIX_PROGRESS_EMPTY_TARGETS,
     );
     write_vault_file(&vault, "diet-logs/weight-log.csv", FIX_WEIGHT_CSV);
@@ -2716,7 +2716,7 @@ const FIX_EXERCISE_CSV: &str = "Date,Type,Description,Distance_km,Duration,Pace_
 /// and the weight log (which carries 2026-07-06..08).
 fn diet_state_history() -> (AppState, std::path::PathBuf) {
     let vault = make_diet_vault();
-    write_vault_file(&vault, "todo-list/diet-today.js", FIX_TODAY);
+    write_vault_file(&vault, "vault/diet-today.js", FIX_TODAY);
     write_vault_file(&vault, "diet-logs/weight-log.csv", FIX_WEIGHT_CSV);
     write_vault_file(&vault, "diet-logs/food-log.csv", FIX_FOOD_CSV);
     write_vault_file(&vault, "diet-logs/exercise-log.csv", FIX_EXERCISE_CSV);
@@ -3507,9 +3507,9 @@ async fn vaultqa_local_answer_is_delivered_and_skips_the_hosted_turn() {
     // NOT run — proven because the hosted branch of the fake would emit the sentinel
     // HOSTED_SHOULD_NOT_RUN, which must be absent from the reply.
     let vault = make_diet_vault();
-    write_vault_file(&vault, "todo-list/Today.md", "# Today\nVO2 max is 52.\n");
+    write_vault_file(&vault, "vault/Today.md", "# Today\nVO2 max is 52.\n");
     let fake = write_sniffing_fake(
-        "Your VO2 max is 52 (todo-list/Today.md:2).",
+        "Your VO2 max is 52 (vault/Today.md:2).",
         "HOSTED_SHOULD_NOT_RUN",
     );
     let cfg = with_vaultqa_offload(Config {
@@ -3519,7 +3519,7 @@ async fn vaultqa_local_answer_is_delivered_and_skips_the_hosted_turn() {
         ..test_config()
     });
     let v = run_vaultqa_turn(cfg, "what is my VO2 max lately").await;
-    assert_eq!(v["response"], "Your VO2 max is 52 (todo-list/Today.md:2).");
+    assert_eq!(v["response"], "Your VO2 max is 52 (vault/Today.md:2).");
     assert!(
         !v["response"]
             .as_str()
@@ -3543,7 +3543,7 @@ async fn vaultqa_no_vault_answer_falls_through_to_the_hosted_turn() {
     // is the HOSTED text, proving the ladder handed off rather than delivering the
     // sentinel to the user.
     let vault = make_diet_vault();
-    write_vault_file(&vault, "todo-list/Today.md", "# Today\n");
+    write_vault_file(&vault, "vault/Today.md", "# Today\n");
     let fake = write_sniffing_fake("NO_VAULT_ANSWER", "Hosted answered from the session.");
     let cfg = with_vaultqa_offload(Config {
         claude_bin: fake.to_string_lossy().into_owned(),
@@ -3621,9 +3621,9 @@ async fn badge_on_hosted_turn_appends_a_hosted_badge() {
 async fn badge_on_vaultqa_local_answer_names_the_vault_backend() {
     // A validated local vault-QA answer gets the [local · vault · <model>] badge.
     let vault = make_diet_vault();
-    write_vault_file(&vault, "todo-list/Today.md", "# Today\nVO2 max is 52.\n");
+    write_vault_file(&vault, "vault/Today.md", "# Today\nVO2 max is 52.\n");
     let fake = write_sniffing_fake(
-        "Your VO2 max is 52 (todo-list/Today.md:2).",
+        "Your VO2 max is 52 (vault/Today.md:2).",
         "HOSTED_SHOULD_NOT_RUN",
     );
     let cfg = with_vaultqa_offload(Config {
@@ -3636,7 +3636,7 @@ async fn badge_on_vaultqa_local_answer_names_the_vault_backend() {
     let v = run_vaultqa_turn(cfg, "what is my VO2 max lately").await;
     let resp = v["response"].as_str().unwrap();
     assert!(
-        resp.starts_with("Your VO2 max is 52 (todo-list/Today.md:2)."),
+        resp.starts_with("Your VO2 max is 52 (vault/Today.md:2)."),
         "answer preserved: {resp:?}"
     );
     assert!(
@@ -3707,8 +3707,8 @@ async fn context_carry_off_local_turn_is_stateless_today() {
     // local vault-QA answer carries session_id: null (today's stateless behavior) and
     // the ledger records NOTHING. This is the byte-for-byte control for the ON tests.
     let vault = make_diet_vault();
-    write_vault_file(&vault, "todo-list/Today.md", "# Today\nVO2 max is 52.\n");
-    let fake = write_sniffing_fake("Your VO2 max is 52 (todo-list/Today.md:2).", "HOSTED");
+    write_vault_file(&vault, "vault/Today.md", "# Today\nVO2 max is 52.\n");
+    let fake = write_sniffing_fake("Your VO2 max is 52 (vault/Today.md:2).", "HOSTED");
     let cfg = with_vaultqa_offload(Config {
         claude_bin: fake.to_string_lossy().into_owned(),
         vault: vault.to_string_lossy().into_owned(),
@@ -3718,7 +3718,7 @@ async fn context_carry_off_local_turn_is_stateless_today() {
     });
     let st = AppState::new(cfg);
     let v = carry_post_and_wait(&st, r#"{"mode":"ask","text":"what is my VO2 max lately"}"#).await;
-    assert_eq!(v["response"], "Your VO2 max is 52 (todo-list/Today.md:2).");
+    assert_eq!(v["response"], "Your VO2 max is 52 (vault/Today.md:2).");
     assert!(
         v["session_id"].is_null(),
         "carry off → stateless, no synthetic id"
@@ -3734,8 +3734,8 @@ async fn context_carry_on_fresh_local_turn_mints_a_synthetic_id() {
     // `local-<hex>` session id so the app can send it back on the follow-up, and the
     // turn is recorded under that id as PENDING (not yet in any hosted session).
     let vault = make_diet_vault();
-    write_vault_file(&vault, "todo-list/Today.md", "# Today\nVO2 max is 52.\n");
-    let fake = write_sniffing_fake("Your VO2 max is 52 (todo-list/Today.md:2).", "HOSTED");
+    write_vault_file(&vault, "vault/Today.md", "# Today\nVO2 max is 52.\n");
+    let fake = write_sniffing_fake("Your VO2 max is 52 (vault/Today.md:2).", "HOSTED");
     let cfg = with_vaultqa_offload(Config {
         claude_bin: fake.to_string_lossy().into_owned(),
         vault: vault.to_string_lossy().into_owned(),
@@ -3769,8 +3769,8 @@ async fn context_carry_records_pre_badge_reply_so_no_badge_leaks_into_a_block() 
     // the badge ON: the delivered response carries the trailing badge, but the recorded
     // ledger reply — and any block built from it — does not.
     let vault = make_diet_vault();
-    write_vault_file(&vault, "todo-list/Today.md", "# Today\nVO2 max is 52.\n");
-    let fake = write_sniffing_fake("Your VO2 max is 52 (todo-list/Today.md:2).", "HOSTED");
+    write_vault_file(&vault, "vault/Today.md", "# Today\nVO2 max is 52.\n");
+    let fake = write_sniffing_fake("Your VO2 max is 52 (vault/Today.md:2).", "HOSTED");
     let cfg = with_vaultqa_offload(Config {
         claude_bin: fake.to_string_lossy().into_owned(),
         vault: vault.to_string_lossy().into_owned(),
@@ -3797,7 +3797,7 @@ async fn context_carry_records_pre_badge_reply_so_no_badge_leaks_into_a_block() 
         !recorded.contains("[local") && !recorded.contains("[hosted"),
         "the ledger stores pre-badge text: {recorded}"
     );
-    assert_eq!(recorded, "Your VO2 max is 52 (todo-list/Today.md:2).");
+    assert_eq!(recorded, "Your VO2 max is 52 (vault/Today.md:2).");
     let _ = std::fs::remove_dir_all(&vault);
     let _ = std::fs::remove_file(&fake);
 }

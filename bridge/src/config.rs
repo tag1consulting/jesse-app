@@ -49,6 +49,17 @@ pub const DEFAULT_SESSION_TTL_DAYS: u64 = 90;
 // under a full turn.
 pub const VAULTQA_TIMEOUT_SECS: u64 = 60;
 
+// The notes subdirectory inside the vault repo (`$JESSE_VAULT/<VAULT_SUBDIR>`). It was
+// `todo-list` until the 2026-08-06 relocation renamed it to `vault` (repo moved to
+// `~/jesse`, so the Obsidian vault is `~/jesse/vault`). Anything that composes a path
+// under the notes root uses THIS, never a bare literal, so the next rename is one edit.
+//
+// NOTE on citations: model-authored citations still arrive `todo-list/`-prefixed — that
+// prefix is QMD's collection NAME (unchanged) and the vault's wiki-link convention, not a
+// real directory. `citations::normalize_candidates` therefore accepts BOTH spellings and
+// resolves them against this subdir. Do not "clean up" that tolerance.
+pub const VAULT_SUBDIR: &str = "vault";
+
 // Hard timeout (seconds) for the EMERGENCY vault-QA child (Piece 4). Looser than
 // the routine `VAULTQA_TIMEOUT_SECS` because there is no ladder rung below it: when
 // hosted is unavailable the emergency answer is the only answer, so it is worth
@@ -99,7 +110,7 @@ pub const DEFAULT_MAX_ATTACHMENTS_TOTAL_BYTES: usize = 20 * 1024 * 1024;
 // diet CSVs and logs without slurping a whole file. None of the five can write,
 // send, or reach the network, so the action surface is unchanged.
 //
-// The three `Bash(node todo-list/<script>.js:*)` scopes let a food/exercise/
+// The three `Bash(node vault/<script>.js:*)` scopes let a food/exercise/
 // weigh-in log REGENERATE the dashboard cache (`diet-today.js`) from the CSV
 // source of truth and re-run its two guards — the per-item-log step the vault's
 // Diet-Logging-Flow prescribes. Without them the agent could append the CSV row
@@ -113,7 +124,7 @@ pub const DEFAULT_MAX_ATTACHMENTS_TOTAL_BYTES: usize = 20 * 1024 * 1024;
 // skill (`.claude/skills/diet-logging/SKILL.md`) on a food/exercise/weigh-in
 // mention. The Skill tool only LOADS instruction text — it executes nothing
 // itself; every real action the skill prescribes still flows through the
-// already-scoped `Read`/`Write`/`Edit` and the three `Bash(node todo-list/*.js:*)`
+// already-scoped `Read`/`Write`/`Edit` and the three `Bash(node vault/*.js:*)`
 // scripts above, so the action surface is unchanged. It is pinned to the SINGLE
 // named skill, NOT a bare `Skill` (which would let any future vault skill run
 // from a phone request) — the narrowest scope the CLI accepts
@@ -156,9 +167,9 @@ mcp__qmd__query,mcp__qmd__get,mcp__qmd__multi_get,mcp__qmd__status,\
 Skill(diet-logging),\
 Bash(git:*),Bash(mv:*),Bash(ls:*),Bash(cat:*),Bash(find:*),\
 Bash(date:*),Bash(cal:*),Bash(head:*),Bash(tail:*),Bash(wc:*),\
-Bash(node todo-list/generate-diet-today.js:*),\
-Bash(node todo-list/validate-diet-today.js:*),\
-Bash(node todo-list/verify-diet-consistency.js:*),\
+Bash(node vault/generate-diet-today.js:*),\
+Bash(node vault/validate-diet-today.js:*),\
+Bash(node vault/verify-diet-consistency.js:*),\
 WebSearch,WebFetch,\
 mcp__slack__conversations_history,mcp__slack__conversations_replies,\
 mcp__slack__conversations_search_messages,mcp__slack__channels_list,\

@@ -1750,9 +1750,9 @@ pub fn append_rows_atomic(
 /// Edit to trigger that hook, so the bridge runs them itself.
 pub async fn run_diet_hooks(vault: &Path) -> Result<(), String> {
     for script in [
-        "todo-list/generate-diet-today.js",
-        "todo-list/validate-diet-today.js",
-        "todo-list/verify-diet-consistency.js",
+        "vault/generate-diet-today.js",
+        "vault/validate-diet-today.js",
+        "vault/verify-diet-consistency.js",
     ] {
         let out = Command::new("node")
             .arg(script)
@@ -1775,7 +1775,7 @@ pub async fn run_diet_hooks(vault: &Path) -> Result<(), String> {
 /// Stages the diet-logs + regenerated cache and commits; a git failure is an `Err`.
 pub async fn commit_diet_logs(vault: &Path, date: &str, hhmm: &str) -> Result<(), String> {
     let add = Command::new("git")
-        .args(["add", "diet-logs", "todo-list/diet-today.js"])
+        .args(["add", "diet-logs", "vault/diet-today.js"])
         .current_dir(vault)
         .output()
         .await

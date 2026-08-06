@@ -15,6 +15,35 @@ CI both run it). See the "Versioning" section of `bridge/README.md`.
 
 ## [Unreleased]
 
+## [Bridge 0.63.1] - 2026-08-06
+
+### Fixed
+
+- **The bridge could not start after the vault was relocated.** The vault repo moved
+  from `~/devel/tag1/jesse` to `~/jesse` and its notes subdirectory was renamed
+  `todo-list` → `vault`. The bridge had `todo-list` hardcoded in nine files, so it
+  failed its startup gate (`EX_CONFIG`) and, had it started, would have broken diet
+  logging and citation resolution.
+
+  The root cause is that the notes subdirectory name was a bare literal at every use
+  site rather than one named constant. It is now `config::VAULT_SUBDIR`, and the
+  runtime call sites that compose a path under the notes root (`diet.rs`,
+  `citations.rs`) go through it. The child permission allowlist
+  (`DEFAULT_ALLOWED_TOOLS`, `harness/claude_code.rs`, `containment.toml`) grants the
+  three diet scripts at `vault/…`, and `dietlog.rs` runs and stages them there —
+  without that, a phone-logged meal would append the CSV row and then be denied
+  permission to regenerate `diet-today.js`, leaving the cache stale.
+
+  **Citations deliberately keep accepting the old spelling.** Model-authored citations
+  still arrive `todo-list/`-prefixed, because `todo-list` remains qmd's *collection
+  name* and the vault's wiki-link convention — neither of which is a real directory.
+  `citations::normalize_candidates` therefore tries both `todo-list/` and `vault/` as
+  the notes-root marker, each with the marker kept and dropped, and resolves the
+  remainder under `VAULT_SUBDIR`. A resolver that accepted only the on-disk spelling
+  would fail every such citation and drop every locally-answered vault-QA turn to the
+  hosted path. Covered by
+  `citations::tests::legacy_todo_list_prefix_still_resolves_after_the_relocation`.
+
 ## [Bridge 0.63.0] - 2026-08-06
 
 ### Fixed
