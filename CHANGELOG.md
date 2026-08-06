@@ -15,6 +15,28 @@ CI both run it). See the "Versioning" section of `bridge/README.md`.
 
 ## [Unreleased]
 
+## [Bridge 0.60.2] - 2026-08-05
+
+Comment only — no behaviour change, no argv change.
+
+### Changed
+
+- **Settled by measurement whether Codex reaches for qmd or the shell, and recorded
+  the environmental trap that made it look wrong twice.** Three UNPROMPTED vault
+  questions against codex-cli 0.146.0 produced 10 `qmd.query`/`qmd.get` calls and
+  zero shell events, so the tools are not merely surfaced but preferred. The
+  contrary 2026-08-03 report ("nine `Bash` calls and zero MCP events") and the
+  containment battery's `inconclusive` `search_qmd` had one shared cause: `qmd`
+  resolves only on the nvm node-22 bin, so a child whose PATH lacks it gets an MCP
+  server whose command does not exist and falls back to the shell — which looks
+  exactly like a model preferring `Bash`. The doc comment now names the trap, so
+  the next person checks PATH before concluding anything about tool preference.
+- **Said plainly that preference is not confinement.** Choosing qmd is not being
+  confined to it: a `read` child may still retrieve through the read-only shell, so
+  the boundary that holds is the OS sandbox, never qmd tool-scoping. The MCP set
+  scopes what MCP offers; the shell sits beside it. Narrowing those shell reads to
+  the vault is unix-user isolation, still pending.
+
 ## [Bridge 0.60.1] - 2026-08-05
 
 Review follow-ups to 0.60.0. No behavioural change — the same locks, the same
