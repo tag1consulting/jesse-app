@@ -15,6 +15,74 @@ CI both run it). See the "Versioning" section of `bridge/README.md`.
 
 ## [Unreleased]
 
+## [Bridge 0.63.0] - 2026-08-06
+
+### Fixed
+
+- **A delivered reply came back a second time as its own bubble.** The transcript
+  route returned a reply with its directive and spoken lines intact while delivery
+  returned them stripped, so the content match that binds a delivered turn failed
+  and hydration inserted a second copy.
+
+  A turn the app has already rendered carries no transcript key yet, so the only
+  thing that can bind it to its hydrated twin is an exact text match
+  (`TranscriptMerge.matchKey` is the role plus the trimmed text and nothing else).
+  Two transformations broke that equality. The bridge strips a recognized directive
+  line from the reply it delivers but the transcript keeps it, which is why a
+  meal-log turn rendered twice with a raw `JESSE_MEAL_LOG v2 {…}` line visible in
+  the first copy. And every client drops `SPOKEN:` lines from the body via
+  `JesseReply.displayText`, while the transcript keeps those too — so a voice turn
+  duplicated on its own, with no directive involved at all. The inserted turn takes
+  the transcript key, so later hydrates skip it and the duplicate is permanent.
+
+  Both transformations now live behind one function, `directives::delivered_text`,
+  applied to every assistant turn in `hydrate_conversation_in`. The invariant it
+  states: the assistant text hydration returns is the text delivery produced. A
+  reply that normalizes to nothing — a `JESSE_NEEDS_HEALTH` turn is the directive
+  line alone — hydrates to no turn, matching an app that never persisted one.
+
+  What counts as a directive is decided in exactly one place. `extract_directives`
+  and `delivered_text` now share a classifier, so the delivery path and the
+  hydration path cannot drift apart again by one of them learning a new directive.
+  Only delivery logs an unhonored directive: hydration re-reads every historical
+  reply on each poll and would otherwise repeat that diagnostic forever.
+
+  The normalization is applied ABOVE the transcript parser rather than inside it.
+  `sessions.rs` parses Claude Code's private jsonl layout, and a second
+  transcript-capable harness would bring its own parser, which would not inherit a
+  strip placed there. `hydrate_conversation_in` is the single funnel every hydrated
+  turn passes through on the way to a client, so it covers whatever parser produced
+  the turn. Nothing was added on the Swift side: the client is deliberately
+  harness-blind, and a fuzzier `matchKey` would have made a genuinely repeated
+  message collapse into its predecessor.
+
+  Codex does not reproduce this today — `Codex::transcript_dir` returns `None`, so
+  its threads hydrate empty — but a conversation is harness-blind and a thread where
+  the model was switched mid-conversation carries both harnesses' session ids in one
+  record. Its Claude segments duplicated like any other, and are covered.
+
+  The model badge is deliberately untouched: the bridge appends it after the model,
+  so it never reaches the transcript, and the client strips it from the delivered
+  copy — already net zero on both sides.
+
+  Not fixed here: the live streaming bubble still shows the raw directive line while
+  the answer is being written, because a delta cannot be known to be the final line
+  until the stream ends. The delivered text is correct; only the in-flight view is
+  affected, and buffering the stream tail to fix it is a change to every harness's
+  streaming path rather than a cheap one.
+
+## [App 1.0 (89)] - 2026-08-06
+
+Test-only — no behaviour change.
+
+### Added
+
+- Two tests pinning the app's half of the contract above: that the merge cannot
+  absorb a text that differs by a trailing directive or `SPOKEN:` line (so the
+  bridge must be the one to normalize), and that a voice turn which also logged a
+  meal shows exactly one bubble whose stored body is the string the transcript
+  route has to return.
+
 ## [Bridge 0.62.1] - 2026-08-06
 
 Test-only — no behaviour change, no argv change.
