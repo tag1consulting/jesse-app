@@ -277,11 +277,60 @@ pub fn attachment_body_limit(cfg: &Config) -> usize {
     base64_encoded_len(cfg.max_attachments_total_bytes) + 256 * 1024
 }
 
+/// WHICH OF TWO MUTUALLY EXCLUSIVE ROUTES this turn's attachments take.
+///
+/// There are exactly two ways an attachment reaches a model, and a turn takes ONE. Stated
+/// as a type rather than left as a chain of `if`s because the failure mode of getting it
+/// wrong is silent and expensive: wire both and the image is transcribed by the helper AND
+/// written to disk for the child, so the model is sent the same picture twice, pays for it
+/// twice, and may describe it twice.
+///
+/// The order below is the decision order, and it is not arbitrary. [`Self::VisionHelper`]
+/// is tried first because it is the route for a model that CANNOT read an image at all —
+/// a text-only model with a resolving vision partner. Only a model that can see for itself
+/// falls through to [`Self::ChildReadsFiles`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AttachmentRoute {
+    /// No attachments on this turn. No scratch dir, no prompt suffix, no read grant —
+    /// byte-for-byte an ordinary turn, which is nearly all of them.
+    None,
+    /// The BRIDGE reads the images and hands the model text. The decoded bytes ride into
+    /// the turn task and are transcribed by the resolving vision partner; nothing is
+    /// written to disk, so there is no directory for a child to be granted.
+    VisionHelper,
+    /// THE CHILD reads the files itself. The bytes are written to a per-request scratch
+    /// dir, their paths are named in the prompt, and the harness is told where they are
+    /// (Claude Code needs `--add-dir`; Codex's sandbox already permits the read).
+    ChildReadsFiles,
+}
+
+/// Decide the route. Pure, so the exclusivity is a property the tests can hold rather than
+/// a shape a reader has to re-derive from the handler.
+///
+/// `vision_resolves` must mean RESOLVABLE, not merely configured: a model paired with a
+/// broken helper falls through to the child-reads-files route rather than dropping the
+/// attachment on the floor.
+pub fn attachment_route(has_attachments: bool, vision_resolves: bool) -> AttachmentRoute {
+    match (has_attachments, vision_resolves) {
+        (false, _) => AttachmentRoute::None,
+        (true, true) => AttachmentRoute::VisionHelper,
+        (true, false) => AttachmentRoute::ChildReadsFiles,
+    }
+}
+
 /// A per-request scratch directory under `base` (the system temp dir by
 /// default, or `JESSE_SCRATCH_DIR`) — NOT the vault, so attachments never
-/// pollute it; verified that headless `claude` reads paths here via its Read
-/// tool with no `--add-dir`. Removed by `Drop` on every exit path — success,
-/// error, or timeout — so decoded files never outlive the turn.
+/// pollute it. Removed by `Drop` on every exit path — success, error, or
+/// timeout — so decoded files never outlive the turn.
+///
+/// THIS DIRECTORY IS OUTSIDE THE CLAUDE CODE CHILD'S READ SCOPE, and the turn must
+/// hand it over explicitly. This comment used to claim the opposite — "verified that
+/// headless `claude` reads paths here via its Read tool with no `--add-dir`" — which
+/// was true when it was written and was made false by the 2026-07-29 scoping change
+/// (`Read` → `Read(./**)`, commit 98ad92e). Between those two dates every attachment
+/// read on this harness was refused at the permission layer. The turn now passes the
+/// path as [`TurnRequest::attachment_dir`] and the Claude Code builder emits
+/// `--add-dir`; Codex's OS sandbox leaves reads broad and needs nothing.
 pub struct ScratchDir {
     pub path: PathBuf,
 }
@@ -323,20 +372,236 @@ impl Drop for ScratchDir {
     }
 }
 
+/// WHAT A HARNESS'S OWN ATTACHMENT TOOL CAN ACTUALLY TAKE, and what to tell its model.
+///
+/// The two harnesses reach an attachment by different tools with different appetites, and
+/// a prompt fragment that names the wrong one is worse than none: it sends the model
+/// looking for a tool it does not have. So the fragment and the format list travel
+/// together, behind [`Harness::attachment_support`], and the bridge's job is to convert
+/// anything the serving harness cannot take into something it can.
+///
+/// Both lists are MEASURED, not read off documentation. See the per-harness constants.
+pub struct AttachmentSupport {
+    /// On-disk extensions this harness's attachment tool renders as an IMAGE (or, for
+    /// Claude Code, as a document). Anything else must be converted before the path is
+    /// named in the prompt, or the turn fails loudly.
+    pub native: &'static [&'static str],
+    /// The sentence that tells this harness's model how to reach the files. Named
+    /// per harness because the tool is: Claude Code has `Read`, Codex has `view_image`.
+    pub instruction: &'static str,
+}
+
+impl AttachmentSupport {
+    /// Whether a file with this sniffed extension can be handed over as-is.
+    pub fn takes(&self, ext: &str) -> bool {
+        self.native.contains(&ext)
+    }
+}
+
+/// This turn's attachments, converted where the serving harness needed it: the paths to
+/// NAME IN THE PROMPT, plus any note the user must see about what was dropped.
+#[derive(Debug)]
+pub struct PreparedAttachments {
+    pub paths: Vec<PathBuf>,
+    /// Human-readable notes appended to the prompt fragment — today only PDF page-cap
+    /// truncation. Never silent: a dropped page the user is not told about is a wrong
+    /// answer they have no way to detect.
+    pub notes: Vec<String>,
+}
+
+/// Convert this turn's written attachments into files the SERVING HARNESS can actually
+/// read, in place in the same per-request scratch dir so the existing `Drop` covers every
+/// byte written here.
+///
+/// # Why this exists at all
+///
+/// The permission fix alone leaves a second, quieter defect: a file can be perfectly
+/// readable and still not become an IMAGE. Both harnesses dispatch on what the file is, and
+/// both have a hole, measured on the installed binaries:
+///
+/// * **HEIC fails on BOTH.** claude 2.1.223 returned a `.heic` holding valid image bytes as
+///   raw binary rather than as an image. codex-cli 0.146.0's `view_image` refused it with
+///   "image content omitted because it could not be processed". This is the common case,
+///   not an exotic one: a photo straight from the iOS camera roll is HEIC, and the composer
+///   uploads a picked photo's own bytes verbatim — only the over-cap path re-encodes.
+/// * **PDF fails on Codex only.** claude 2.1.223 read a PDF directly with `Read`, unprompted.
+///   Codex never called `view_image` for one at all: it went straight to the shell
+///   (`pdftotext`, absent; then `strings`; then a hand-rolled zlib inflate through `python3`)
+///   and only got the text because the fixture had a text layer and an interpreter happened
+///   to be on PATH. That is not a route, so a PDF is rasterized for Codex.
+///
+/// # Conversions
+///
+/// HEIC → JPEG through `sips`, which ships with macOS: no new dependency, no supply chain,
+/// and it runs in the BRIDGE process rather than in a sandboxed child. A decoding library
+/// would mean adding a HEIF decoder (the `image` crate has none), which is a native codec
+/// on the attachment attack surface — the wrong trade for one format macOS already decodes.
+///
+/// PDF → PNG pages through [`vision::rasterize_pdf`], the rasterizer that is already here,
+/// honouring `JESSE_VISION_PDF_DPI` and `JESSE_VISION_PDF_PAGE_CAP` and carrying the same
+/// truncation note. A second rasterizer would be a second set of page/DPI semantics to keep
+/// in step.
+///
+/// # No viable route fails LOUDLY
+///
+/// A silent drop is the failure this whole change exists to eliminate, so an attachment
+/// that cannot be converted returns an error naming the type and what to do about it —
+/// never a turn that quietly proceeds as if the user had sent nothing.
+pub fn prepare_attachments_for_harness(
+    cfg: &Config,
+    scratch: &ScratchDir,
+    paths: &[PathBuf],
+    support: &AttachmentSupport,
+) -> Result<PreparedAttachments, ApiError> {
+    let mut out = Vec::with_capacity(paths.len());
+    let mut notes = Vec::new();
+    for (i, p) in paths.iter().enumerate() {
+        let label = i + 1;
+        let ext = p
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        if support.takes(&ext) {
+            out.push(p.clone());
+            continue;
+        }
+        match ext.as_str() {
+            "heic" => {
+                let jpg = scratch.path.join(format!("{label:02}-{}.jpg", random_hex()));
+                convert_heic_to_jpeg(p, &jpg).map_err(|e| {
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!(
+                            "attachment {label}: could not convert the HEIC photo to JPEG ({e}). \
+                             The model cannot read HEIC on either harness, so the photo would \
+                             have been silently dropped. `sips` ships with macOS — check it is \
+                             on the bridge's PATH."
+                        ),
+                    )
+                })?;
+                // The original is not named in the prompt once a converted file exists;
+                // it stays on disk only until the scratch dir's `Drop` removes it.
+                out.push(jpg);
+            }
+            "pdf" => {
+                let bytes = std::fs::read(p).map_err(|e| {
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!("attachment {label}: could not re-read the PDF ({e})"),
+                    )
+                })?;
+                let r = vision::rasterize_pdf(&bytes, cfg.vision.pdf_dpi, cfg.vision.pdf_page_cap)
+                    .map_err(|e| {
+                        (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            format!(
+                                "attachment {label}: this harness cannot read a PDF directly, so \
+                                 the bridge must rasterize it, and that failed ({e}). Install \
+                                 libpdfium or set JESSE_PDFIUM_LIB to its path — or send the \
+                                 pages as images, or ask on a Claude Code model, whose Read tool \
+                                 takes a PDF as-is."
+                            ),
+                        )
+                    })?;
+                for (n, page) in r.pages.iter().enumerate() {
+                    let png = scratch
+                        .path
+                        .join(format!("{label:02}-p{:02}-{}.png", n + 1, random_hex()));
+                    write_scratch_file(&png, page).map_err(|e| {
+                        (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            format!("attachment {label}: could not write PDF page {} ({e})", n + 1),
+                        )
+                    })?;
+                    out.push(png);
+                }
+                if r.truncated {
+                    notes.push(format!(
+                        "attachment {label} is a {}-page PDF; only the first {} page(s) are \
+                         attached as images",
+                        r.total_pages,
+                        r.pages.len()
+                    ));
+                }
+            }
+            other => {
+                // Unreachable while the sniff whitelist and the native lists agree, which is
+                // exactly what the per-type tests hold. If they ever drift, this is the loud
+                // failure rather than an attachment that vanishes.
+                return Err((
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!(
+                        "attachment {label}: no way to show a {other:?} file to this model, and \
+                         the bridge knows no conversion for it — the file was NOT sent. Convert \
+                         it to a PNG or JPEG and attach that."
+                    ),
+                ));
+            }
+        }
+    }
+    Ok(PreparedAttachments { paths: out, notes })
+}
+
+/// Transcode a HEIC to JPEG with macOS's own `sips`. Separate so the test for it names the
+/// tool it is really exercising.
+fn convert_heic_to_jpeg(src: &Path, dst: &Path) -> Result<(), String> {
+    let out = std::process::Command::new("/usr/bin/sips")
+        .args(["-s", "format", "jpeg"])
+        .arg(src)
+        .arg("--out")
+        .arg(dst)
+        .output()
+        .map_err(|e| format!("could not run sips: {e}"))?;
+    if !out.status.success() {
+        return Err(format!(
+            "sips exited {}: {}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    // `sips` can exit 0 having written nothing useful; the file is the proof.
+    match std::fs::metadata(dst) {
+        Ok(m) if m.len() > 0 => Ok(()),
+        _ => Err("sips wrote no output file".to_string()),
+    }
+}
+
+/// Write one derived file into the scratch dir with the same 0600 posture `write_all` uses.
+fn write_scratch_file(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)?;
+    f.write_all(bytes)
+}
+
 /// The prompt fragment that points the agent at the written attachment paths.
 /// Names the on-disk paths only (never the untrusted client filename) so a
 /// crafted filename can't ride into the prompt.
-pub fn attachment_prompt_suffix(paths: &[PathBuf]) -> String {
-    let list = paths
+///
+/// `instruction` is the SERVING HARNESS's own, from [`AttachmentSupport`]. This fragment
+/// used to tell every model to "read them with the Read tool", which is right for Claude
+/// Code and wrong for Codex, whose route is `view_image` and which has no `Read` tool at
+/// all. One fragment, harness-parameterised — not two fragments to keep in step.
+pub fn attachment_prompt_suffix(prepared: &PreparedAttachments, instruction: &str) -> String {
+    let list = prepared
+        .paths
         .iter()
         .map(|p| p.display().to_string())
         .collect::<Vec<_>>()
         .join(", ");
-    format!(
+    let mut s = format!(
         "\n\n(The user attached {} file(s) with this message, saved at these \
-         path(s) — read them with the Read tool as needed to answer: {list})",
-        paths.len()
-    )
+         path(s) — {instruction} Paths: {list}",
+        prepared.paths.len()
+    );
+    for n in &prepared.notes {
+        s.push_str(&format!(". Note: {n}"));
+    }
+    s.push(')');
+    s
 }
 
 #[cfg(test)]
@@ -619,13 +884,260 @@ mod tests {
         assert!(!created.exists(), "scratch dir removed on Drop");
         let _ = std::fs::remove_dir_all(&base);
     }
+    /// THE HELPER ROUTE AND THE FILE ROUTE CANNOT BOTH FIRE.
+    ///
+    /// The property that matters is not which route wins but that exactly one does: a turn
+    /// on the helper route writes NO scratch dir, and no scratch dir means the turn request
+    /// carries no `attachment_dir`, so `--add-dir` cannot be emitted for it and the image
+    /// cannot be sent twice. The three cases below are the whole space.
+    #[test]
+    fn the_vision_helper_and_the_child_file_routes_are_mutually_exclusive() {
+        // No attachments at all → neither route; an ordinary turn.
+        assert_eq!(attachment_route(false, false), AttachmentRoute::None);
+        assert_eq!(
+            attachment_route(false, true),
+            AttachmentRoute::None,
+            "a resolving vision partner on a turn with nothing attached is still nothing to do"
+        );
+        // Attachments + a RESOLVING partner → the bridge transcribes; no file is written.
+        assert_eq!(
+            attachment_route(true, true),
+            AttachmentRoute::VisionHelper
+        );
+        // Attachments + no resolving partner (ambient opus, or a paired-but-broken helper)
+        // → the child reads the files itself. This is the route the read grant serves.
+        assert_eq!(
+            attachment_route(true, false),
+            AttachmentRoute::ChildReadsFiles
+        );
+    }
+
     #[test]
     fn attachment_prompt_suffix_names_paths_only() {
-        let paths = vec![PathBuf::from("/tmp/jesse-attach-ab/01-cd.png")];
-        let s = attachment_prompt_suffix(&paths);
+        let prepared = PreparedAttachments {
+            paths: vec![PathBuf::from("/tmp/jesse-attach-ab/01-cd.png")],
+            notes: Vec::new(),
+        };
+        let s = attachment_prompt_suffix(&prepared, CLAUDE_CODE_ATTACHMENTS.instruction);
         assert!(s.contains("/tmp/jesse-attach-ab/01-cd.png"));
         assert!(s.contains("Read tool"));
         assert!(s.contains("1 file"));
+    }
+
+    /// Write `bytes` into a fresh scratch dir under `name` and hand back both, so a route
+    /// test exercises the real on-disk path rather than a synthetic one.
+    fn staged(name: &str, bytes: &[u8]) -> (ScratchDir, Vec<PathBuf>) {
+        let s = ScratchDir::create(&std::env::temp_dir()).expect("scratch");
+        let p = s.path.join(name);
+        std::fs::write(&p, bytes).expect("stage");
+        (s, vec![p])
+    }
+
+    /// EVERY WHITELISTED TYPE, AND THE ROUTE IT TAKES ON EACH HARNESS.
+    ///
+    /// One case per type the sniffer accepts, naming the type, so a format can never be
+    /// added to the whitelist without someone deciding how it reaches a model. The routes
+    /// are the measured ones documented on `CLAUDE_CODE_ATTACHMENTS` and
+    /// `CODEX_ATTACHMENTS`.
+    #[test]
+    fn png_jpeg_gif_and_webp_are_handed_over_untouched_on_both_harnesses() {
+        let cfg = test_config();
+        for (ext, bytes) in [
+            ("png", PNG_BYTES),
+            ("jpg", JPEG_BYTES),
+            ("gif", GIF_BYTES),
+            ("webp", WEBP_BYTES),
+        ] {
+            for support in [&CLAUDE_CODE_ATTACHMENTS, &CODEX_ATTACHMENTS] {
+                let (s, paths) = staged(&format!("01-aa.{ext}"), bytes);
+                let out = prepare_attachments_for_harness(&cfg, &s, &paths, support)
+                    .unwrap_or_else(|e| panic!("{ext} must have a route: {e:?}"));
+                assert_eq!(
+                    out.paths, paths,
+                    "{ext}: a natively-readable type must be passed through unconverted"
+                );
+                assert!(out.notes.is_empty(), "{ext}: nothing to warn about");
+            }
+        }
+    }
+
+    /// HEIC IS CONVERTED TO JPEG, ON BOTH HARNESSES, because neither can read it: claude
+    /// 2.1.223 returned a `.heic` as raw binary and codex 0.146.0's `view_image` refused it
+    /// with "image content omitted because it could not be processed". This is the common
+    /// case — a photo straight from the iOS camera roll.
+    ///
+    /// Uses a REAL HEIC (built with `sips` from a PNG, skipped if the platform cannot make
+    /// one) rather than the 12-byte magic-only fixture, because the thing under test is the
+    /// transcode itself, not the branch that reaches it.
+    #[test]
+    fn heic_is_converted_to_jpeg_before_any_model_sees_it() {
+        let cfg = test_config();
+        let src = ScratchDir::create(&std::env::temp_dir()).expect("scratch");
+        let png = src.path.join("seed.png");
+        // A 1x1 PNG is enough for sips to transcode.
+        const TINY_PNG: &[u8] = &[
+            0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48,
+            0x44, 0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00,
+            0x00, 0x1F, 0x15, 0xC4, 0x89, 0x00, 0x00, 0x00, 0x0A, 0x49, 0x44, 0x41, 0x54, 0x78,
+            0x9C, 0x63, 0x00, 0x01, 0x00, 0x00, 0x05, 0x00, 0x01, 0x0D, 0x0A, 0x2D, 0xB4, 0x00,
+            0x00, 0x00, 0x00, 0x49, 0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82,
+        ];
+        std::fs::write(&png, TINY_PNG).expect("seed");
+        let heic = src.path.join("01-aa.heic");
+        let made = std::process::Command::new("/usr/bin/sips")
+            .args(["-s", "format", "heic"])
+            .arg(&png)
+            .arg("--out")
+            .arg(&heic)
+            .output();
+        let have_heic = matches!(&made, Ok(o) if o.status.success())
+            && std::fs::metadata(&heic).map(|m| m.len() > 0).unwrap_or(false);
+        if !have_heic {
+            eprintln!("skipping heic transcode: this platform's sips cannot write HEIC");
+            return;
+        }
+
+        for support in [&CLAUDE_CODE_ATTACHMENTS, &CODEX_ATTACHMENTS] {
+            let out =
+                prepare_attachments_for_harness(&cfg, &src, std::slice::from_ref(&heic), support)
+                    .expect("heic must have a route on every harness");
+            assert_eq!(out.paths.len(), 1);
+            let p = &out.paths[0];
+            assert_eq!(
+                p.extension().and_then(|e| e.to_str()),
+                Some("jpg"),
+                "heic must be handed over as JPEG"
+            );
+            assert_ne!(p, &heic, "the original HEIC must not be named in the prompt");
+            // A real JPEG, not an empty file sips exited 0 over.
+            let converted = std::fs::read(p).expect("converted file");
+            assert!(
+                converted.starts_with(&[0xFF, 0xD8, 0xFF]),
+                "the converted file must actually be a JPEG"
+            );
+            // In the SAME scratch dir, so the existing Drop guard cleans it.
+            assert_eq!(p.parent(), Some(src.path.as_path()));
+        }
+    }
+
+    /// PDF SPLITS BY HARNESS, and this is the one type where the two answers differ.
+    ///
+    /// Claude Code's `Read` takes a PDF directly (measured, unprompted, on 2.1.223), so it
+    /// is passed through untouched. Codex never reaches `view_image` for one — it shells out
+    /// to `pdftotext`/`strings`/`python3` — so the bridge must rasterize. That rasterizer is
+    /// `vision::rasterize_pdf`, which binds pdfium at RUNTIME; where pdfium is absent (this
+    /// deploy box, and CI) the route must fail LOUDLY with something actionable rather than
+    /// dropping the attachment, which is the half this asserts unconditionally.
+    #[test]
+    fn pdf_passes_through_on_claude_code_and_is_rasterized_or_refused_on_codex() {
+        let cfg = test_config();
+
+        let (s1, paths) = staged("01-aa.pdf", PDF_BYTES);
+        let cc = prepare_attachments_for_harness(&cfg, &s1, &paths, &CLAUDE_CODE_ATTACHMENTS)
+            .expect("Claude Code reads a PDF directly");
+        assert_eq!(cc.paths, paths, "no conversion on the harness that can read it");
+
+        let (s2, paths2) = staged("01-aa.pdf", PDF_BYTES);
+        match prepare_attachments_for_harness(&cfg, &s2, &paths2, &CODEX_ATTACHMENTS) {
+            // pdfium present: every named path is a rendered page, never the PDF itself.
+            Ok(out) => {
+                assert!(!out.paths.is_empty(), "a rasterized PDF yields page images");
+                for p in &out.paths {
+                    assert_eq!(p.extension().and_then(|e| e.to_str()), Some("png"));
+                }
+                assert!(!out.paths.contains(&paths2[0]), "the PDF itself is not named");
+            }
+            // pdfium absent: LOUD, and the message must say what to do about it.
+            Err((code, msg)) => {
+                assert_eq!(code, StatusCode::INTERNAL_SERVER_ERROR);
+                assert!(
+                    msg.contains("JESSE_PDFIUM_LIB") || msg.contains("libpdfium"),
+                    "a failure must name the fix, got: {msg}"
+                );
+                assert!(
+                    msg.contains("rasterize") || msg.contains("PDF"),
+                    "a failure must name what failed, got: {msg}"
+                );
+            }
+        }
+    }
+
+    /// AN ATTACHMENT WITH NO ROUTE FAILS LOUDLY RATHER THAN VANISHING.
+    ///
+    /// The whole point of this work: a file the model never sees must never look, to the
+    /// user, like a file the model saw and had nothing to say about. A type outside both
+    /// the native list and the conversion table is an error naming the type and the remedy.
+    #[test]
+    fn an_attachment_with_no_route_is_an_error_not_a_silent_drop() {
+        let cfg = test_config();
+        let (s, paths) = staged("01-aa.tiff", b"II*\x00 not a supported type");
+        let err = prepare_attachments_for_harness(&cfg, &s, &paths, &CODEX_ATTACHMENTS)
+            .expect_err("an unroutable type must not succeed quietly");
+        assert_eq!(err.0, StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(err.1.contains("tiff"), "name the type: {}", err.1);
+        assert!(
+            err.1.contains("NOT sent"),
+            "say the file did not reach the model: {}",
+            err.1
+        );
+    }
+
+    /// THE NATIVE LISTS AND THE SNIFF WHITELIST MUST NOT DRIFT APART.
+    ///
+    /// Every extension the sniffer can produce needs either a native slot or a conversion,
+    /// on every harness. Without this, adding a format to `sniff_attachment` would compile,
+    /// pass, deploy, and then fail at runtime on the first user who sent one.
+    #[test]
+    fn every_sniffable_type_has_a_route_on_every_harness() {
+        const CONVERTED: &[&str] = &["heic", "pdf"];
+        for ext in ["png", "jpg", "gif", "pdf", "webp", "heic"] {
+            for (name, support) in [
+                ("claude-code", &CLAUDE_CODE_ATTACHMENTS),
+                ("codex", &CODEX_ATTACHMENTS),
+            ] {
+                assert!(
+                    support.takes(ext) || CONVERTED.contains(&ext),
+                    "{name}: {ext} has no route — either add it to `native` or give \
+                     `prepare_attachments_for_harness` a conversion for it"
+                );
+            }
+        }
+    }
+
+    /// THE FRAGMENT NAMES THE SERVING HARNESS'S OWN TOOL, and never the other one's.
+    ///
+    /// The old fragment told every model to "read them with the Read tool". Codex has no
+    /// `Read` tool at all, so on that harness the one instruction the model was given
+    /// pointed at nothing. This is the assertion that the seam is actually wired, rather
+    /// than the trait method existing and the handler still hard-coding one sentence.
+    #[test]
+    fn the_prompt_fragment_is_per_harness() {
+        let prepared = PreparedAttachments {
+            paths: vec![PathBuf::from("/tmp/jesse-attach-ab/01-cd.png")],
+            notes: Vec::new(),
+        };
+        let cc = attachment_prompt_suffix(&prepared, CLAUDE_CODE_ATTACHMENTS.instruction);
+        assert!(cc.contains("Read tool"), "{cc}");
+        assert!(!cc.contains("view_image"), "{cc}");
+
+        let cx = attachment_prompt_suffix(&prepared, CODEX_ATTACHMENTS.instruction);
+        assert!(cx.contains("view_image"), "{cx}");
+        assert!(!cx.contains("Read tool"), "{cx}");
+    }
+
+    /// A TRUNCATED PDF SAYS SO IN THE PROMPT. Dropped pages the user is never told about
+    /// are a wrong answer they have no way to detect.
+    #[test]
+    fn a_page_cap_truncation_note_reaches_the_prompt() {
+        let prepared = PreparedAttachments {
+            paths: vec![PathBuf::from("/tmp/a/01-p01-x.png")],
+            notes: vec!["attachment 1 is a 30-page PDF; only the first 10 page(s) are attached \
+                         as images"
+                .to_string()],
+        };
+        let s = attachment_prompt_suffix(&prepared, CODEX_ATTACHMENTS.instruction);
+        assert!(s.contains("30-page PDF"), "{s}");
+        assert!(s.contains("only the first 10"), "{s}");
     }
     #[test]
     fn body_limit_exceeds_total_cap_for_base64_inflation() {

@@ -50,6 +50,10 @@ impl Harness for NoTranscriptHarness {
             "spawning a child",
         ))
     }
+    fn attachment_support(&self) -> &'static AttachmentSupport {
+        // Neither fixture ever spawns, so neither ever shows a file to a model.
+        &CLAUDE_CODE_ATTACHMENTS
+    }
     fn parser(&self) -> Box<dyn TurnParser> {
         Box::new(NoTranscriptParser)
     }
@@ -84,6 +88,10 @@ impl Harness for FixedDirHarness {
     }
     fn build_turn(&self, _cfg: &Config, _req: &TurnRequest<'_>) -> Result<Command, HarnessError> {
         Err(HarnessError::unsupported("test-fixed-dir", "spawning a child"))
+    }
+    fn attachment_support(&self) -> &'static AttachmentSupport {
+        // Neither fixture ever spawns, so neither ever shows a file to a model.
+        &CLAUDE_CODE_ATTACHMENTS
     }
     fn parser(&self) -> Box<dyn TurnParser> {
         Box::new(NoTranscriptParser)

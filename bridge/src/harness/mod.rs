@@ -189,6 +189,18 @@ pub struct TurnRequest<'a> {
     /// for Claude Code, a `hooks.json` in the per-turn home for Codex — which is why this is
     /// a request field the harness reads rather than argv the bridge assembles.
     pub write_lock: Option<&'a WriteLockChild>,
+    /// The per-request scratch directory this turn's decoded attachments were written to.
+    ///
+    /// CALL SITE POLICY, exactly like `cwd`: the bridge decided where to write the files, so
+    /// the bridge is what knows the path. A harness reads it and decides what, if anything,
+    /// its CLI must be told — Claude Code needs the directory added to the child's read
+    /// scope, Codex's OS sandbox already leaves reads broad and needs nothing.
+    ///
+    /// `None` for every ordinary turn, which is nearly all of them: no attachments at all, or
+    /// attachments that the VISION HELPER reads instead of the child. Those two routes are
+    /// mutually exclusive and the gate is in `handlers` — when the helper serves the turn no
+    /// scratch dir is written at all, so there is no directory to name here.
+    pub attachment_dir: Option<&'a Path>,
 }
 
 /// Everything a child needs to talk to the write-lock broker.
@@ -500,6 +512,21 @@ pub trait Harness: Send + Sync {
     /// Build the child `Command` for one turn — argv, cwd, stdio, env — or refuse.
     fn build_turn(&self, cfg: &Config, req: &TurnRequest<'_>) -> Result<Command, HarnessError>;
 
+    /// HOW THIS HARNESS'S MODEL GETS AT AN ATTACHMENT: the tool to tell it to use, and the
+    /// on-disk types that tool can actually take.
+    ///
+    /// A trait method rather than a constant the handler switches on, for the same reason
+    /// `capability_args` is one: the two answers differ in BOTH halves and the halves must
+    /// not drift apart. Claude Code reads files with `Read`, which takes images and PDFs
+    /// directly; Codex has no `Read` at all and reaches pixels through `view_image`, which
+    /// takes images and not PDFs. A single fragment naming the wrong tool sends the model
+    /// hunting for something it does not have, and a single format list would either
+    /// rasterize PDFs nobody needed rasterized or hand Codex one it cannot open.
+    ///
+    /// The bridge converts anything outside `native` before naming a path — see
+    /// [`prepare_attachments_for_harness`].
+    fn attachment_support(&self) -> &'static AttachmentSupport;
+
     /// A FRESH parser for one spawn attempt. The driver creates one per attempt, so a retry
     /// never sees the previous attempt's half-accumulated state.
     fn parser(&self) -> Box<dyn TurnParser>;
@@ -677,6 +704,8 @@ pub fn title_child_request<'a>(
         cwd: PathBuf::from(&cfg.vault),
         mcp_config: EMPTY_MCP_CONFIG,
         write_lock: None,
+        // A single-shot child never carries an attachment.
+        attachment_dir: None,
     }
 }
 
@@ -698,6 +727,8 @@ pub fn diet_child_request<'a>(
         cwd: cfg.scratch_base(), // neutral cwd → no vault CLAUDE.md auto-load
         mcp_config: EMPTY_MCP_CONFIG,
         write_lock: None,
+        // A single-shot child never carries an attachment.
+        attachment_dir: None,
     }
 }
 
@@ -719,6 +750,8 @@ pub fn vaultqa_child_request<'a>(
         cwd: PathBuf::from(&cfg.vault),
         mcp_config: vaultqa_mcp_config(cfg),
         write_lock: None,
+        // A single-shot child never carries an attachment.
+        attachment_dir: None,
     }
 }
 

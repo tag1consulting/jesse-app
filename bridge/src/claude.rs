@@ -442,9 +442,9 @@ pub async fn run_vaultqa_child(
 ///
 /// `harness` names the agent program: it builds the child `Command` and supplies the
 /// per-attempt line parser. Everything else here is harness-independent.
-// One more than the lint's ceiling, and each is a distinct collaborator the turn needs
-// (config, prompt, resume target, job store + id, model, harness, session recorder). A
-// params struct would only rename the same eight.
+// Over the lint's ceiling, and each is a distinct collaborator the turn needs (config,
+// prompt, resume target, job store + id, model, harness, session recorder, write lock,
+// attachment dir). A params struct would only rename the same ten.
 #[allow(clippy::too_many_arguments)]
 pub async fn run_claude_streaming(
     cfg: &Config,
@@ -456,6 +456,7 @@ pub async fn run_claude_streaming(
     harness: &dyn Harness,
     spawned: &SpawnedSessions,
     write_lock: Option<&WriteLockChild>,
+    attachment_dir: Option<&Path>,
 ) -> Result<(String, Option<String>, ShadowUsage), ApiError> {
     const MAX_ATTEMPTS: u32 = 3; // 1 try + 2 retries
 
@@ -498,6 +499,12 @@ pub async fn run_claude_streaming(
         // attempt. `None` for a turn that cannot write the vault or a deployment where the
         // broker is disarmed; the harness then builds exactly the child 0.59.0 built.
         req.write_lock = write_lock;
+        // THIS TURN'S ATTACHMENT DIRECTORY, set per attempt for the same reason the write
+        // lock is: the child is rebuilt per attempt, and the scratch dir outlives all three
+        // attempts (its `Drop` runs in the turn task, not here). `None` on every turn with
+        // no attachments and on every turn the vision helper serves, which is then
+        // byte-for-byte the child 0.60.1 built.
+        req.attachment_dir = attachment_dir;
         let mut cmd = harness.build_turn(cfg, &req)?;
 
         let mut child = cmd.spawn().map_err(|e| {

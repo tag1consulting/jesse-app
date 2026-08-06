@@ -15,6 +15,138 @@ CI both run it). See the "Versioning" section of `bridge/README.md`.
 
 ## [Unreleased]
 
+## [Bridge 0.62.1] - 2026-08-06
+
+Test-only — no behaviour change, no argv change.
+
+### Fixed
+
+- **Two new argv tests asserted macOS's answer on every platform and failed on the
+  Linux CI runner.** The added-directory flag passes the scratch path and its
+  realpath *when they differ*: on macOS `std::env::temp_dir()` is `/var/folders/…`
+  whose realpath is `/private/var/folders/…`, so two values are emitted, while on a
+  Linux runner `/tmp` is its own realpath and one is. The production code was
+  already conditional and is unchanged; the tests hardcoded two values and a fixed
+  argv offset. They now read the variadic list's length from the argv and assert the
+  platform's own answer, so both arrangements are checked rather than assumed —
+  verified locally in both, by running them once under the default symlinked
+  `TMPDIR` and once under a canonical one.
+
+  The property that actually matters is platform-independent and is now asserted as
+  such: the flag's variadic list must be terminated by a following flag rather than
+  running to the end of the argv, where it would swallow anything a later change
+  appended.
+
+## [Bridge 0.62.0] - 2026-08-06
+
+### Fixed
+
+- **A whitelisted attachment could be perfectly readable and still never become an
+  image, because each harness dispatches on what the file is and each has a hole
+  the permission fix does not touch.** Measured on the installed binaries rather
+  than assumed:
+
+  - **HEIC failed on BOTH harnesses.** claude 2.1.223 returned a `.heic` holding
+    valid image bytes as raw binary rather than as an image — silently, with no
+    permission denial involved. codex-cli 0.146.0's `view_image` refused it with
+    "image content omitted because it could not be processed". This is the common
+    case, not an exotic one: a photo straight from the iOS camera roll is HEIC and
+    the composer uploads a picked photo's own bytes verbatim, so only the over-cap
+    path ever re-encoded. HEIC is now transcoded to JPEG in the bridge with `sips`,
+    which ships with macOS — no new dependency, no native codec added to the
+    attachment attack surface, and it runs in the bridge process rather than in a
+    sandboxed child. The converted file goes in the same per-request scratch dir, so
+    the existing `Drop` cleans it, and the original is no longer named in the prompt.
+
+  - **PDF failed on Codex only.** claude 2.1.223 read a PDF directly with `Read`,
+    unprompted, so nothing changes there. Codex never called `view_image` for one at
+    all: it went straight to the shell — `pdftotext` (absent), then `strings`, then
+    a hand-rolled zlib inflate through `python3` — and got the text only because the
+    fixture had a text layer and an interpreter happened to be on PATH. A scanned
+    label would have yielded nothing. PDFs are now rasterized to PNG pages for Codex
+    through the rasterizer already in `vision.rs`, honouring `JESSE_VISION_PDF_DPI`
+    and `JESSE_VISION_PDF_PAGE_CAP` and carrying the same truncation note.
+
+  PNG, JPEG, GIF and WebP were each handed to claude 2.1.223 and came back as
+  content — including a WebP photograph described correctly — so they pass through
+  untouched on both harnesses.
+
+- **The prompt fragment told every model to use the Read tool, and Codex has no
+  Read tool.** The one instruction a Codex turn was given pointed at nothing. The
+  fragment is now the serving harness's own, behind `Harness::attachment_support`,
+  which carries the tool sentence and the format list together so the two cannot
+  drift: Claude Code is told the Read tool takes images and PDFs directly and that
+  no shell is needed; Codex is told to use `view_image` and not to shell out.
+
+- **An attachment with no route now fails loudly instead of vanishing.** A file the
+  model never saw must not look, to the user, like a file the model saw and had
+  nothing to say about. Anything outside both the native list and the conversion
+  table is an error naming the type and the remedy, and a test holds that every type
+  `sniff_attachment` accepts has a route on every harness — so a format cannot be
+  added to the whitelist without someone deciding how it reaches a model.
+
+  **Operationally: `libpdfium` is not installed on the Studio and
+  `JESSE_PDFIUM_LIB` is unset**, so a PDF on a Codex model surfaces that actionable
+  error rather than an answer. That is the intended behaviour of this change and not
+  a regression — the same gap already disabled the vision helper's PDF path — but it
+  is the one route that needs an install before it works.
+
+### Changed
+
+- **Corrected two comments that claimed Codex can only read a file through the
+  shell.** It ships `view_image`, which takes a path and returns pixels, and 0.146.0
+  used it for an unprompted PNG with zero shell events. The narrow, lock-specific
+  claim those comments were really making — that nothing Codex reaches for records a
+  compare-and-swap baseline — is true and is kept, now stated as the narrow claim it
+  is. The CLI image flag (`-i`/`--image`) is deliberately still not emitted: a second
+  route to pixels that already arrive, on a subcommand pair that has already shipped
+  one flag-placement break.
+
+## [Bridge 0.61.0] - 2026-08-06
+
+### Fixed
+
+- **The Claude Code child's read grant was scoped to its working directory while
+  attachments continued to be written under the system temp directory, and no
+  directory was added for the turn, so every attachment read was refused at the
+  permission layer.** The 2026-07-29 scoping change (`Read` → `Read(./**)`, commit
+  98ad92e) made the allowlist cwd-relative, and the cwd is the vault; `ScratchDir`
+  writes under `std::env::temp_dir()`, which on macOS is `/var/folders/…`. So the
+  path the prompt named was outside the only directory the model could read, the
+  Read became a permission REQUEST, and a headless `-p` child has nobody to answer
+  one. Reproduced on claude 2.1.223: the denial lands in the result envelope's
+  `permission_denials` naming the Read call, and the model narrates that it cannot
+  read the file — which is exactly the report from the phone. A turn that carries
+  attachments now passes its scratch directory to the child with `--add-dir`, in
+  both the `/var/folders/…` and `/private/var/folders/…` spellings.
+
+  The grant is per turn and read-only, both re-verified on 2.1.223: with
+  `Write(./**)` allowed and the directory added, a write INTO it was still refused
+  (denial recorded, file never created), and a file sitting BESIDE the added
+  directory was still refused. It is emitted in `build_claude_args`, never in
+  `claude_capability_args`, because `validate_toolset_argv` compares the latter
+  against the recorded `toolset_args` by strict equality — a per-turn absolute host
+  path there would fail the startup gate on every machine but the one that cut the
+  record. **No containment record moves on either harness**, and a turn with no
+  attachments is byte-for-byte the child 0.60.2 built.
+
+- **`ScratchDir`'s doc comment claimed the opposite of the truth.** It read
+  "verified that headless `claude` reads paths here via its Read tool with no
+  `--add-dir`", which was true when written and was falsified by the scoping change
+  the same week. Corrected, and the correction names both dates so the window in
+  which every attachment silently failed is on the record.
+
+### Changed
+
+- **Named the two attachment routes as a type instead of a chain of `if`s.** A turn
+  either transcribes images through a resolving vision partner or writes files for
+  the child to read — never both, or the model is sent the same picture twice and
+  billed for it twice. `AttachmentRoute` makes the exclusivity a property tests can
+  hold rather than a shape a reader has to re-derive from the handler. Codex needs
+  no new plumbing on either route: its OS sandbox leaves reads broad and its
+  built-in `view_image` takes the path from the prompt, so its argv is unchanged and
+  a test now pins that.
+
 ## [Bridge 0.60.2] - 2026-08-05
 
 Comment only — no behaviour change, no argv change.

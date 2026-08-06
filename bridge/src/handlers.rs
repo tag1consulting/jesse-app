@@ -220,6 +220,7 @@ pub async fn run_ask_hosted_or_emergency(
     recent_context: Option<&str>,
     spawned: &SpawnedSessions,
     write_lock: Option<&WriteLockChild>,
+    attachment_dir: Option<&Path>,
 ) -> AskResult {
     let now = Instant::now();
     // Which model would answer an emergency ask: the same routing rule the routine route
@@ -288,6 +289,7 @@ pub async fn run_ask_hosted_or_emergency(
             cfg.harnesses.serving(active),
             spawned,
             write_lock,
+            attachment_dir,
         )
         .await,
     );
@@ -613,32 +615,51 @@ pub async fn jesse(
     let vision_on = had_attachments
         && !active.vision.is_empty()
         && !vision::resolve_partners(&st.cfg, &active.vision).is_empty();
-    let (prompt, scratch, vision_inputs) = if decoded.is_empty() {
-        (prompt, None, Vec::new())
-    } else if vision_on {
-        // Carry the decoded bytes into the turn task (transcribed under the permit); no
-        // scratch file is written and no "read these files" suffix is appended — the text
-        // model can't read images, so the transcription block replaces that path entirely.
-        let inputs = VisionInput::from_decoded(&decoded, &req.attachments);
-        (prompt, None, inputs)
-    } else {
-        let scratch = ScratchDir::create(&st.cfg.scratch_base()).map_err(|e| {
+    // THE TWO ROUTES ARE EXCLUSIVE, and the `match` is what says so. Exactly one arm runs,
+    // so a turn either transcribes through the helper or writes files for the child —
+    // never both, which would send the model the same image twice. See [`AttachmentRoute`].
+    let (prompt, scratch, vision_inputs) = match attachment_route(had_attachments, vision_on) {
+        AttachmentRoute::None => (prompt, None, Vec::new()),
+        AttachmentRoute::VisionHelper => {
+            // Carry the decoded bytes into the turn task (transcribed under the permit); no
+            // scratch file is written and no "read these files" suffix is appended — the text
+            // model can't read images, so the transcription block replaces that path entirely.
+            // NO SCRATCH DIR MEANS NO `attachment_dir` ON THE TURN REQUEST, which is what
+            // makes the child's read grant impossible to hand out on this route.
+            let inputs = VisionInput::from_decoded(&decoded, &req.attachments);
+            (prompt, None, inputs)
+        }
+        AttachmentRoute::ChildReadsFiles => {
+            let scratch = ScratchDir::create(&st.cfg.scratch_base()).map_err(|e| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("could not create attachment scratch dir: {e}"),
+                )
+            })?;
+            let paths = scratch.write_all(&decoded).map_err(|e| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("could not write attachment: {e}"),
+                )
+            })?;
+            // CONVERT WHAT THIS HARNESS CANNOT READ, and name its own tool in the prompt.
+            // Both are the serving harness's answer, not the bridge's: HEIC is unreadable on
+            // both harnesses and is transcoded for either, a PDF is native to Claude Code's
+            // `Read` and must be rasterized for Codex, and the sentence naming `Read` would
+            // send a Codex model looking for a tool it does not have. Anything with no route
+            // errors here rather than becoming a turn that silently answers without the file.
+            let support = st.cfg.harnesses.serving(&active).attachment_support();
+            let prepared =
+                prepare_attachments_for_harness(&st.cfg, &scratch, &paths, support)?;
             (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("could not create attachment scratch dir: {e}"),
+                format!(
+                    "{prompt}{}",
+                    attachment_prompt_suffix(&prepared, support.instruction)
+                ),
+                Some(scratch),
+                Vec::new(),
             )
-        })?;
-        let paths = scratch.write_all(&decoded).map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("could not write attachment: {e}"),
-            )
-        })?;
-        (
-            format!("{prompt}{}", attachment_prompt_suffix(&paths)),
-            Some(scratch),
-            Vec::new(),
-        )
+        }
     };
 
     // Eviction runs on a periodic background task (`spawn_eviction_task`), NOT
@@ -728,6 +749,13 @@ pub async fn jesse(
         // files therefore survive run_claude's internal retries and are cleaned
         // exactly once, here.
         let _scratch = scratch;
+        // THE DIRECTORY THOSE FILES ARE IN, for the child that must read them. `Some` only
+        // when this turn actually wrote a scratch dir, which is exactly when it had
+        // attachments AND the vision helper did not take them: the gate above returns
+        // `None` for the scratch dir on the helper route, so the two routes cannot both
+        // fire and the image is never sent twice. Cloned rather than borrowed because the
+        // guard is moved into this task and the driver is called across awaits.
+        let attachment_dir: Option<PathBuf> = _scratch.as_ref().map(|s| s.path.clone());
         // The agent program this turn runs on: THE ACTIVE MODEL'S OWN harness. The driver
         // calls through it for the child command and the per-attempt line parser.
         //
@@ -947,6 +975,7 @@ pub async fn jesse(
                     harness,
                     &spawned,
                     write_lock.as_ref(),
+                    attachment_dir.as_deref(),
                 )
                 .await,
             );
@@ -1119,6 +1148,7 @@ pub async fn jesse(
                         recent_block.as_deref(),
                         &spawned,
                         write_lock.as_ref(),
+                        attachment_dir.as_deref(),
                     )
                     .await;
                     route = r.route;
@@ -1151,6 +1181,7 @@ pub async fn jesse(
                 recent_block.as_deref(),
                 &spawned,
                 write_lock.as_ref(),
+                attachment_dir.as_deref(),
             )
             .await;
             route = r.route;

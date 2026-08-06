@@ -73,8 +73,16 @@ pub struct Codex;
 /// such surface.** Verified against 0.146.0 with `--strict-config` as an oracle (it rejects
 /// an unknown `-c` field by name): `tools.web_search` exists, and `tools.shell` does NOT —
 /// nor does any other key that would remove the shell. The shell is not an optional tool on
-/// this harness; it is the harness. Codex reaches for it for everything, including reads: a
-/// live turn asked only to read a file ran ``/bin/zsh -lc "sed -n '1p' AGENTS.md"``.
+/// this harness; it is the harness. Codex reaches for it for most things, including reading
+/// a file as text: a live turn asked only to read a file ran
+/// ``/bin/zsh -lc "sed -n '1p' AGENTS.md"``.
+///
+/// "Codex has no way to read a file except the shell" is the wider claim, and it is FALSE —
+/// it ships `view_image`, which takes a path and returns pixels, and 0.146.0 used it for an
+/// unprompted PNG with zero shell events. The narrow claim is what matters here and it
+/// stands: nothing the model reaches for records a compare-and-swap baseline, because the
+/// shell path names no file the bridge can see and `view_image` returns pixels rather than
+/// the bytes a baseline is taken over. See [`CODEX_ATTACHMENTS`] for the measured surface.
 ///
 /// So there is no file-surface / shell-surface asymmetry to exploit here, and the remedy
 /// that closed Claude Code's read escapes — a path-scoped tool grant — HAS NO ANALOGUE.
@@ -141,6 +149,34 @@ pub struct Codex;
 ///
 /// The one thing it must never become is `--dangerously-bypass-approvals-and-sandbox`,
 /// which removes the sandbox entirely. Nothing here constructs that flag.
+/// WHAT CODEX'S `view_image` TAKES, measured against codex-cli 0.146.0 in the read-only
+/// sandbox with the file under the system temp dir — which its sandbox already permits it to
+/// read, so no path had to be granted.
+///
+/// * `png` — transcribed the text printed in the image exactly, on an UNPROMPTED turn, with
+///   zero shell events on the `--json` stream. (`view_image` emits no stdout event of its
+///   own, so its absence from the stream is not evidence it was not used; the pixels
+///   arriving is.)
+/// * `heic` — REFUSED: "image content omitted because it could not be processed". Same hole
+///   as Claude Code's, differently spelled, so the bridge's transcode serves both.
+/// * `pdf` — NOT native, and the reason is worth stating because a model will claim
+///   otherwise. Told explicitly to use `view_image` on a PDF, the model reported that it
+///   "returned the PDF payload successfully" and then immediately shelled out to read the
+///   text anyway. Unprompted, it never called `view_image` at all: `pdftotext` (absent),
+///   then `strings`, then a hand-rolled zlib inflate through `python3`. It got the answer
+///   only because that fixture had a text layer and an interpreter was on PATH; a scanned
+///   nutrition label would have yielded nothing. So PDFs are rasterized to PNG pages for
+///   this harness rather than handed over.
+///
+/// `jpg`, `gif` and `webp` ride the same image path as `png`. They are listed on the
+/// strength of that shared path rather than one probe each — unlike the two entries above,
+/// where the interesting result was a failure and each was measured directly.
+pub static CODEX_ATTACHMENTS: AttachmentSupport = AttachmentSupport {
+    native: &["png", "jpg", "gif", "webp"],
+    instruction: "look at them with the view_image tool as needed to answer. Do not try to \
+                  read them with shell commands.",
+};
+
 pub fn codex_capability_args(capability: Capability) -> Vec<String> {
     let mut args: Vec<String> = Vec::new();
 
@@ -806,8 +842,12 @@ impl Harness for Codex {
 
     /// NONE, and this is the honest answer rather than a stub.
     ///
-    /// Codex has no native read tool whose payload names a file: it reads through the shell,
-    /// which is exactly the case that records no baseline. So a Codex conversation gets the
+    /// Codex has no native read tool whose payload names a file THAT IT READS AS TEXT: it
+    /// reads source through the shell, which is exactly the case that records no baseline.
+    /// (`view_image` does name a path, but it returns pixels to the model rather than the
+    /// bytes a compare-and-swap baseline would be taken over, so it is no help here — see
+    /// [`CODEX_ATTACHMENTS`], which is where the general claim about Codex reading lives.)
+    /// So a Codex conversation gets the
     /// per-file write LOCK (two writes to one path serialize) but not the compare-and-swap
     /// (a lost update through read-then-write is still possible). That is a wider instance of
     /// the hole named in the 0.60.0 CHANGELOG, and it is wider on this harness than on Claude
@@ -821,6 +861,10 @@ impl Harness for Codex {
     /// it builds a real child, because only a spawn knows its own working directory.
     fn capability_args(&self, _cfg: &Config, capability: Capability) -> Vec<String> {
         codex_capability_args(capability)
+    }
+
+    fn attachment_support(&self) -> &'static AttachmentSupport {
+        &CODEX_ATTACHMENTS
     }
 
     /// qmd ALONE. Codex deliberately does not get the Slack server Claude Code carries:
@@ -1437,6 +1481,69 @@ mod tests {
     /// gets holds NO credential — there is nothing in it to read.
     ///
     /// The second half is the containment half. The read surface this harness accepts
+    /// A CODEX TURN'S ARGV IS UNCHANGED BY THE ATTACHMENT FIELD.
+    ///
+    /// `TurnRequest::attachment_dir` is call-site policy that each harness answers for
+    /// itself, and Codex's answer is "nothing to do": its containment is an OS sandbox that
+    /// scopes writes and network and leaves READS broad, so a file under the system temp
+    /// directory is already reachable and its built-in `view_image` takes the path straight
+    /// from the prompt. Measured on codex-cli 0.146.0: an unprompted turn pointed at a PNG
+    /// there transcribed the text printed in it, with zero shell events on the `--json`
+    /// stream.
+    ///
+    /// So the CLI image flag (`-i`/`--image`) is deliberately NOT emitted. It is a second
+    /// route to pixels that already arrive, it would have to be placed correctly on both the
+    /// plain and the `resume` form of the subcommand, and this harness has already shipped
+    /// one break of exactly that shape (`-C` after `resume`). This test is what says the
+    /// decision was made rather than forgotten.
+    #[test]
+    fn an_attachment_dir_changes_nothing_about_a_codex_child() {
+        let (cfg, _dir) = scratch_config("attach-noop");
+        let m = openai_model("https://api.example/v1", "slug", "sk-secret");
+        let scratch = std::env::temp_dir().join(format!("jesse-attach-{}", random_hex()));
+        std::fs::create_dir(&scratch).expect("scratch dir");
+
+        let base = TurnRequest {
+            prompt: "hi",
+            session_id: None,
+            active: &m,
+            capability: Capability::Read,
+            cwd: std::env::temp_dir(),
+            mcp_config: EMPTY_MCP_CONFIG,
+            write_lock: None,
+            attachment_dir: None,
+        };
+        let with = TurnRequest {
+            attachment_dir: Some(scratch.as_path()),
+            ..TurnRequest {
+                prompt: "hi",
+                session_id: None,
+                active: &m,
+                capability: Capability::Read,
+                cwd: std::env::temp_dir(),
+                mcp_config: EMPTY_MCP_CONFIG,
+                write_lock: None,
+                attachment_dir: None,
+            }
+        };
+        let argv = |req: &TurnRequest<'_>| -> Vec<String> {
+            Codex
+                .build_turn(&cfg, req)
+                .expect("a codex child")
+                .as_std()
+                .get_args()
+                .map(|s| s.to_string_lossy().into_owned())
+                .collect()
+        };
+        let (a, b) = (argv(&base), argv(&with));
+        assert_eq!(a, b, "an attachment must not move a single Codex argument");
+        assert!(
+            !b.iter().any(|x| x == "-i" || x == "--image" || x == "--add-dir"),
+            "no image or added-directory flag belongs on this harness: {b:?}"
+        );
+        let _ = std::fs::remove_dir(&scratch);
+    }
+
     /// (`read_agent_credential`'s decoy is reachable because the OAuth copy is deliberately in
     /// the home) is ABSENT on the provider path rather than tolerated there.
     #[test]
@@ -1451,6 +1558,7 @@ mod tests {
             cwd: std::env::temp_dir(),
             mcp_config: EMPTY_MCP_CONFIG,
             write_lock: None,
+            attachment_dir: None,
         };
         let cmd = Codex.build_turn(&cfg, &req).expect("a provider child");
 

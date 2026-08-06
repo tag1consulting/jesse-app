@@ -44,6 +44,7 @@ impl ClaudeCode {
             req.capability,
             req.mcp_config,
             settings.as_deref(),
+            req.attachment_dir,
         ))
         .current_dir(&req.cwd)
         .stdout(Stdio::piped())
@@ -148,6 +149,10 @@ impl Harness for ClaudeCode {
         Ok(self.command(cfg, req))
     }
 
+    fn attachment_support(&self) -> &'static AttachmentSupport {
+        &CLAUDE_CODE_ATTACHMENTS
+    }
+
     fn parser(&self) -> Box<dyn TurnParser> {
         Box::new(ClaudeCodeParser)
     }
@@ -194,6 +199,9 @@ pub fn main_turn_request<'a>(
         // Callers that CAN write the vault set this after the fact (`req.write_lock =
         // Some(&wl)`), so the common request builder stays a five-argument function.
         write_lock: None,
+        // Set after the fact by the driver too, and for the same reason: only the handler
+        // that decoded the attachments knows whether this turn has any and where they went.
+        attachment_dir: None,
     }
 }
 
@@ -602,6 +610,30 @@ pub fn claude_capability_args(cfg: &Config, capability: Capability) -> Vec<Strin
     }
 }
 
+/// WHAT CLAUDE CODE'S `Read` TOOL TAKES, measured against claude 2.1.223 with the file in
+/// an `--add-dir` directory. Each type was handed over and the model asked to report what it
+/// saw; every one below came back as content, not as bytes:
+///
+/// * `png`, `jpg`, `gif` — transcribed the text printed in the image exactly.
+/// * `webp` — described a photograph correctly (a pink water lily on still water).
+/// * `pdf` — reported the page's text, and reached for `Read` UNPROMPTED to do it.
+///
+/// `heic` is deliberately ABSENT: a `.heic` holding valid image bytes came back as raw
+/// binary rather than as an image, silently, with no permission denial involved. The bridge
+/// transcodes it to JPEG before the path is named.
+///
+/// The instruction names `Read` and says no shell is needed. The measured behaviour on this
+/// version was already to use `Read` for a PDF unprompted — the earlier note that an
+/// unprompted PDF went to `Bash` did not reproduce on 2.1.223, in two samples. The sentence
+/// stays because it is one clause, because the allowlist refuses every `pdftotext`-shaped
+/// command it could otherwise try, and because saying so costs nothing on a turn that was
+/// going to do the right thing anyway.
+pub static CLAUDE_CODE_ATTACHMENTS: AttachmentSupport = AttachmentSupport {
+    native: &["png", "jpg", "gif", "webp", "pdf"],
+    instruction: "read them with the Read tool as needed to answer. The Read tool takes \
+                  images and PDFs directly; no shell command is needed and none will work.",
+};
+
 // ---- Argument vectors --------------------------------------------------------
 
 /// Build the argument vector for one `claude` invocation (everything after the
@@ -613,7 +645,10 @@ pub fn claude_capability_args(cfg: &Config, capability: Capability) -> Vec<Strin
 ///   * `--strict-mcp-config` + an explicit `--mcp-config` (always present) so ONLY the
 ///     servers named there load — see [`mcp_args`] and [`MAIN_CHILD_MCP_CONFIG`]
 ///
-/// A `session_id` adds `--resume <id>` to continue a thread.
+/// A `session_id` adds `--resume <id>` to continue a thread. An `attachment_dir` adds
+/// `--add-dir` for that one directory, so this turn's attachments are inside the child's
+/// read scope; see the comment at the push site for what that grant does and does not
+/// confer. Both are `None` on an ordinary turn, which is then byte-identical to before.
 ///
 /// `capability` names what this child is granted and [`Harness::capability_args`] turns it into
 /// the toolset flags; `mcp_config` names the servers it may load. A main turn derives its
@@ -627,6 +662,7 @@ pub fn build_claude_args(
     capability: Capability,
     mcp_config: &str,
     write_lock_settings: Option<&Path>,
+    attachment_dir: Option<&Path>,
 ) -> Vec<String> {
     let mut args = vec![
         "-p".to_string(),
@@ -671,6 +707,47 @@ pub fn build_claude_args(
         "--setting-sources".to_string(),
         "user,project".to_string(),
     ];
+    // THIS TURN'S ATTACHMENT DIRECTORY, and only when this turn has one.
+    //
+    // WHY IT IS NEEDED. The allowlist scopes reads to `Read(./**)` — cwd-relative, and the
+    // cwd is the vault — while attachments are written under the system temp dir by
+    // `ScratchDir`. So the path the prompt tells the model to read is outside the only
+    // directory the model may read, the Read call becomes a permission REQUEST, and a
+    // headless `-p` child has nobody to answer it. Verified against claude 2.1.223: the
+    // denial lands in the result envelope's `permission_denials` naming the Read call, and
+    // the model narrates "I can't read that path" — Jeremy's report exactly.
+    //
+    // WHAT THE FLAG DOES AND DOES NOT DO, both re-verified on 2.1.223:
+    //   * It grants READS inside this one directory, for this one turn. It confers NO
+    //     write: with `Write(./**)` allowed and the directory added, a write INTO the added
+    //     directory was still refused (denial recorded, file never created).
+    //   * Its scope holds. A file sitting BESIDE the added directory was still refused.
+    // It is a per-turn read grant over a directory that exists for seconds and is removed
+    // by `ScratchDir`'s `Drop`, not a standing widening of the allowlist.
+    //
+    // BOTH SYMLINK SPELLINGS. On macOS `std::env::temp_dir()` yields `/var/folders/…`, whose
+    // realpath is `/private/var/folders/…`, and the failing turn shows the model trying
+    // both. 2.1.223 resolves symlinks when matching, so either spelling alone was enough in
+    // both directions when measured — but the flag is variadic and a second value is free,
+    // so both are passed rather than resting the fix on a matching rule that is not part of
+    // the CLI's contract.
+    //
+    // IT GOES HERE, NOT IN `claude_capability_args`. `validate_toolset_argv` compares a
+    // harness's `capability_args` against the recorded `toolset_args` by STRICT EQUALITY, so
+    // a per-turn absolute host path in there would fail the startup gate on every machine
+    // except the one that recorded it. Emitted here, no containment record moves on either
+    // harness. Placed before `--settings`/`--mcp-config` so a FLAG always follows it and its
+    // variadic argument list can never swallow the next value.
+    if let Some(dir) = attachment_dir {
+        args.push("--add-dir".to_string());
+        args.push(dir.display().to_string());
+        // The realpath too, when it differs — see the symlink note above.
+        if let Ok(real) = dir.canonicalize() {
+            if real != dir {
+                args.push(real.display().to_string());
+            }
+        }
+    }
     // THE VAULT WRITE LOCK'S HOOKS, on a write-capable turn only.
     //
     // A bridge-OWNED settings file, outside the vault, rather than hooks added to the vault's
@@ -1006,7 +1083,8 @@ mod tests {
             None,
             Capability::Write,
             main_mcp_config(&test_config(), &ClaudeCode),
-            None
+            None,
+            None,
         );
         let pos = |needle: &str| args.iter().position(|a| a == needle);
         let of = pos("--output-format").expect("--output-format present");
@@ -1023,7 +1101,7 @@ mod tests {
     #[test]
     fn build_claude_args_enforces_least_privilege() {
         let cfg = test_config();
-        let args = build_claude_args(&cfg, "hello", None, Capability::Write, main_mcp_config(&cfg, &ClaudeCode), None);
+        let args = build_claude_args(&cfg, "hello", None, Capability::Write, main_mcp_config(&cfg, &ClaudeCode), None, None);
 
         // --allowedTools is always present, with the configured list as its value.
         let idx = args
@@ -1344,7 +1422,8 @@ mod tests {
                 None,
                 turn_capability(&active),
                 main_mcp_config(&cfg, &ClaudeCode),
-            None
+                None,
+                None,
             );
             assert!(
                 args.iter().any(|a| a == "--strict-mcp-config"),
@@ -1404,7 +1483,8 @@ mod tests {
                 None,
                 turn_capability(&active),
                 main_mcp_config(&cfg, &ClaudeCode),
-            None
+                None,
+                None,
             );
             assert_eq!(
                 arg_value(&args, "--mcp-config").as_deref(),
@@ -1594,7 +1674,8 @@ mod tests {
             None,
             turn_capability(&active),
             main_mcp_config(&cfg, &ClaudeCode),
-            None
+            None,
+            None,
         );
         let val = |flag: &str| -> Option<String> {
             args.iter()
@@ -1644,7 +1725,8 @@ mod tests {
             None,
             turn_capability(&active),
             main_mcp_config(&cfg, &ClaudeCode),
-            None
+            None,
+            None,
         );
         let allow = args
             .iter()
@@ -1668,12 +1750,13 @@ mod tests {
             Some("sess-42"),
             Capability::Write,
             main_mcp_config(&cfg, &ClaudeCode),
-            None
+            None,
+            None,
         );
         let ridx = args.iter().position(|a| a == "--resume").expect("--resume");
         assert_eq!(args[ridx + 1], "sess-42");
         // No --resume without a session id.
-        let none = build_claude_args(&cfg, "hi", None, Capability::Write, main_mcp_config(&cfg, &ClaudeCode), None);
+        let none = build_claude_args(&cfg, "hi", None, Capability::Write, main_mcp_config(&cfg, &ClaudeCode), None, None);
         assert!(!none.iter().any(|a| a == "--resume"));
     }
     #[test]
@@ -1691,7 +1774,8 @@ mod tests {
             Some(&synthetic),
             Capability::Write,
             main_mcp_config(&cfg, &ClaudeCode),
-            None
+            None,
+            None,
         );
         assert!(
             !args.iter().any(|a| a == "--resume"),
@@ -1708,7 +1792,8 @@ mod tests {
             Some("real-sess-1"),
             Capability::Write,
             main_mcp_config(&cfg, &ClaudeCode),
-            None
+            None,
+            None,
         );
         let ridx = real.iter().position(|a| a == "--resume").expect("--resume");
         assert_eq!(real[ridx + 1], "real-sess-1");
@@ -1790,6 +1875,156 @@ mod tests {
         );
     }
 
+    /// A TURN WITH ATTACHMENTS ADDS THE DIRECTORY; A TURN WITHOUT IS BYTE IDENTICAL.
+    ///
+    /// The whole fix, stated as a difference: the ONLY thing an attachment adds to the child
+    /// is a read grant over the one directory its own files are in. Everything else about
+    /// the argv — permission mode, settings scopes, MCP boundary, toolset — is untouched, so
+    /// the containment posture of an attachment-bearing turn is the posture of every other
+    /// turn.
+    #[test]
+    fn attachment_turn_adds_its_scratch_dir_and_an_ordinary_turn_is_unchanged() {
+        let cfg = test_config();
+        let dir = std::env::temp_dir().join(format!("jesse-attach-{}", random_hex()));
+        std::fs::create_dir(&dir).expect("scratch dir");
+
+        let plain = build_claude_args(
+            &cfg,
+            "PROMPT",
+            None,
+            Capability::Write,
+            main_mcp_config(&cfg, &ClaudeCode),
+            None,
+            None,
+        );
+        let attached = build_claude_args(
+            &cfg,
+            "PROMPT",
+            None,
+            Capability::Write,
+            main_mcp_config(&cfg, &ClaudeCode),
+            None,
+            Some(dir.as_path()),
+        );
+
+        // No attachments → not one byte moves. This is what keeps every ordinary turn, and
+        // every containment argument written about it, exactly as it was.
+        assert!(
+            !plain.iter().any(|a| a == "--add-dir"),
+            "a turn with no attachments must not carry the flag: {plain:?}"
+        );
+
+        // Attachments → the flag, naming the directory AS CREATED first.
+        let at = attached
+            .iter()
+            .position(|a| a == "--add-dir")
+            .expect("an attachment turn carries --add-dir");
+        // The flag is variadic, so its values run until the next flag.
+        let values = attached[at + 1..]
+            .iter()
+            .take_while(|a| !a.starts_with("--"))
+            .count();
+        assert_eq!(attached[at + 1], dir.display().to_string());
+
+        // The SECOND spelling is conditional on the platform, and deliberately so. On macOS
+        // — the deployment target, and where the reported bug happened —
+        // `std::env::temp_dir()` is `/var/folders/…` whose realpath is
+        // `/private/var/folders/…`, and the failing turn shows the model trying both. On a
+        // Linux CI runner `/tmp` IS its own realpath, so there is no second spelling to pass
+        // and emitting the same path twice would be noise. Asserting the platform's own
+        // answer rather than macOS's keeps this test honest on both.
+        let real = dir.canonicalize().expect("realpath");
+        if real != dir {
+            assert_eq!(values, 2, "a symlinked temp dir passes both spellings");
+            assert_eq!(attached[at + 2], real.display().to_string());
+        } else {
+            assert_eq!(values, 1, "no distinct realpath means one value, not a duplicate");
+        }
+
+        // …and NOTHING else changed: strip the flag and its values and the two argvs are
+        // equal.
+        let mut stripped = attached.clone();
+        stripped.drain(at..at + 1 + values);
+        assert_eq!(
+            stripped, plain,
+            "an attachment must add the read grant and nothing else"
+        );
+        let _ = std::fs::remove_dir(&dir);
+    }
+
+    /// THE FLAG IS VARIADIC, SO A FLAG MUST FOLLOW IT.
+    ///
+    /// `--add-dir` takes one or more directories, so whatever comes next is swallowed as
+    /// another directory unless it starts a new flag. Pinned at both spawn shapes an
+    /// attachment turn can take — with the write lock's `--settings` file and without it —
+    /// because those two put DIFFERENT flags next.
+    #[test]
+    fn add_dir_is_always_followed_by_another_flag() {
+        let cfg = test_config();
+        let dir = std::env::temp_dir().join(format!("jesse-attach-{}", random_hex()));
+        std::fs::create_dir(&dir).expect("scratch dir");
+        let settings = dir.join("settings.json");
+
+        for (label, wl) in [("no write lock", None), ("write lock", Some(&settings))] {
+            let args = build_claude_args(
+                &cfg,
+                "PROMPT",
+                Some("sess-1"),
+                Capability::Write,
+                main_mcp_config(&cfg, &ClaudeCode),
+                wl.map(|p| p.as_path()),
+                Some(dir.as_path()),
+            );
+            let at = args.iter().position(|a| a == "--add-dir").expect(label);
+            // The directory values run until the next flag (one or two of them, depending on
+            // whether the temp dir has a distinct realpath — see the test above). What must
+            // hold on every platform is that the list ENDS at a flag rather than at the end
+            // of the argv: a trailing `--add-dir` would swallow whatever a later change
+            // appended after it.
+            let values = args[at + 1..]
+                .iter()
+                .take_while(|a| !a.starts_with("--"))
+                .count();
+            assert!(values >= 1, "{label}: --add-dir must name a directory: {args:?}");
+            assert!(
+                at + 1 + values < args.len(),
+                "{label}: --add-dir's variadic list must be terminated by a following flag, \
+                 but it runs to the end of the argv: {args:?}"
+            );
+            // And it lands ahead of the settings flag, where the comment says it does.
+            if wl.is_some() {
+                let s = args.iter().position(|a| a == "--settings").expect(label);
+                assert!(at < s, "{label}: --add-dir must precede --settings");
+            }
+        }
+        let _ = std::fs::remove_dir(&dir);
+    }
+
+    /// THE READ GRANT IS NOT PART OF THE CONTAINMENT RECORD, AND MUST NOT BECOME PART OF IT.
+    ///
+    /// `validate_toolset_argv` compares `Harness::capability_args` against the recorded
+    /// `toolset_args` by STRICT EQUALITY. A per-turn absolute host path in there would fail
+    /// the startup gate on every machine except the one that cut the record, so the flag
+    /// lives in `build_claude_args` instead. This asserts the separation directly rather
+    /// than trusting the call graph: no capability's args mention the flag or any temp path,
+    /// at any level.
+    #[test]
+    fn the_attachment_grant_never_reaches_capability_args() {
+        let cfg = test_config();
+        for cap in [Capability::Basic, Capability::Read, Capability::Write] {
+            let args = ClaudeCode.capability_args(&cfg, cap);
+            assert!(
+                !args.iter().any(|a| a == "--add-dir"),
+                "{cap:?}: the containment argv must not carry the per-turn read grant: {args:?}"
+            );
+            assert_eq!(
+                args,
+                claude_capability_args(&cfg, cap),
+                "{cap:?}: capability args must be byte-for-byte what the record compares"
+            );
+        }
+    }
+
     /// THE GOLDEN. The exact argv each of the five spawn sites produces, captured from the
     /// four separate builders that preceded the single `claude_capability_args`. Every future
     /// posture change has to edit a literal here, which is the point: a containment change
@@ -1811,7 +2046,9 @@ mod tests {
                 "PROMPT",
                 None,
                 Capability::Write,
-                main_mcp_config(&cfg, &ClaudeCode), None
+                main_mcp_config(&cfg, &ClaudeCode),
+                None,
+                None,
             ),
             golden(&[
                 "--strict-mcp-config",
@@ -1832,7 +2069,9 @@ mod tests {
                 "PROMPT",
                 None,
                 Capability::Read,
-                main_mcp_config(&cfg, &ClaudeCode), None
+                main_mcp_config(&cfg, &ClaudeCode),
+                None,
+                None,
             ),
             golden(&[
                 "--strict-mcp-config",
