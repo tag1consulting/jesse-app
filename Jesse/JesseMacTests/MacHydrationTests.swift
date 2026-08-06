@@ -213,6 +213,55 @@ final class MacHydrationTests: XCTestCase {
         XCTAssertEqual(thread.orderedTurns.filter(\.isUser).count, 1, "the user turn is not duplicated either")
     }
 
+    /// The other half of the double-bubble contract, from the app's end: a voice turn that
+    /// also logged a meal. The bridge delivers the SPOKEN: line (the watch and TTS need it)
+    /// and appends the badge, and the app stores neither — `displayText` drops both. So the
+    /// string the app holds for this reply is "Logged it.", and that is exactly the string
+    /// the transcript route has to return for the turn to bind.
+    ///
+    /// This test pins the TARGET; `sessions.rs` pins that the bridge produces it. The
+    /// directive line is deliberately absent from the delivered reply — the bridge strips it
+    /// before delivery — while the transcript keeps it, which is the asymmetry that made this
+    /// turn render twice. The app is not asked to know that: it is harness-blind, and there
+    /// is no strip on this side to compensate with.
+    func testAVoiceTurnThatAlsoLoggedAMealShowsExactlyOneBubble() async throws {
+        let context = try MacTestFixtures.context()
+        let thread = JesseThread(mode: .ask)
+        let cid = try XCTUnwrap(thread.conversationId); defer { clearCursor(cid) }
+        context.insert(thread); try? context.save()
+
+        let prov = JesseProvenance(route: "hosted", model: "opus", costUsd: 0.004,
+                                   badge: "[opus · $0.0040]",
+                                   flags: JesseProvenanceFlags(hostedVerify: false, verifyQueued: false,
+                                                               citationsUnverified: false))
+        // As delivered: directive already stripped, SPOKEN: line kept, badge appended.
+        let reply = JesseReply(text: "Logged it.\nSPOKEN: Logged it.\n\n" + prov.badge,
+                               sessionId: "sess-v", provenance: prov)
+        let fake = MacFakeBridgeClient(
+            sendResult: .reply(reply, jobId: nil, conversationId: nil),
+            hydrate: { _, after in
+                switch after {
+                case nil:     return ([ht("user", "log the kefir", "s:0")], "0:100")
+                // What a normalizing bridge returns for that reply: no SPOKEN: line, no
+                // sentinel — the same string the app stored.
+                case "0:100": return ([ht("assistant", "Logged it.", "s:100")], "0:200")
+                default:      return ([], after ?? "0:0")
+                }
+            })
+        let coordinator = MacCoordinator(configStore: MacTestFixtures.configured(),
+                                         makeClient: { _ in fake },
+                                         sessionDeletionStore: MacTestFixtures.deletionStore())
+
+        await coordinator.send(text: "log the kefir", mode: .ask, thread: thread, context: context)
+        await coordinator.hydrate(thread: thread, context: context)
+
+        let assistant = thread.orderedTurns.filter { !$0.isUser }
+        XCTAssertEqual(assistant.count, 1, "a voice turn must not render twice")
+        XCTAssertEqual(assistant.first?.text, "Logged it.",
+                       "the stored body drops the SPOKEN: line and the badge")
+        XCTAssertEqual(assistant.first?.sourceKey, "s:100", "and it BOUND rather than inserting")
+    }
+
     /// Idempotent hydration must still backfill a genuinely-new turn produced on ANOTHER device:
     /// a hydrated turn that is NOT already present is appended (chip-less, as it carries no local
     /// provenance), while one matching an unkeyed local turn is bound to it.

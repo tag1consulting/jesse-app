@@ -101,6 +101,44 @@ final class TranscriptMergeTests: XCTestCase {
         XCTAssertEqual(plan, [.skip, .skip, .insert, .insert])
     }
 
+    /// The asymmetry that produced the reported double, pinned as the merge's OWN
+    /// behavior so the reason the bridge must normalize is written down where the merge
+    /// lives. Every other test here passes the same string to both sides; in production
+    /// they differed, because the bridge stripped a directive line on delivery while the
+    /// transcript route returned it intact.
+    ///
+    /// A content match is the ONLY thing that can bind a just-delivered, still-unkeyed
+    /// turn to its transcript twin, and the match is exact. So a one-line difference is
+    /// not a near-miss the merge can absorb — it is a different turn, and `.insert` is
+    /// the correct answer to the question it was asked. This is deliberately NOT fixed
+    /// by fuzzing `matchKey`: the client is harness-blind and does not know what a
+    /// directive is. The fix belongs to whoever produces both strings, which is the
+    /// bridge (`directives::delivered_text`).
+    func testTextDifferingByATrailingDirectiveLineDoesNotBindAndInsertsInstead() {
+        let delivered = "Logged your breakfast — about 320 kcal."
+        let withSentinel = delivered + "\nJESSE_MEAL_LOG v2 {\"meals\":[]}"
+        let plan = TranscriptMerge.plan(
+            existing: [existing("jesse", delivered)],
+            incoming: [incoming("jesse", withSentinel, "s:100")])
+        XCTAssertEqual(plan, [.insert],
+                       "an exact match cannot absorb a trailing line — hence the second bubble")
+
+        // The same reply once the bridge normalizes both views: it binds, as it must.
+        XCTAssertEqual(
+            TranscriptMerge.plan(existing: [existing("jesse", delivered)],
+                                 incoming: [incoming("jesse", delivered, "s:100")]),
+            [.bind(existingIndex: 0)])
+    }
+
+    /// The voice case, which duplicates on its own with no directive involved: the app
+    /// stores `displayText` (SPOKEN: line removed) while the transcript holds the line.
+    func testTextDifferingByASpokenLineDoesNotBindEither() {
+        let plan = TranscriptMerge.plan(
+            existing: [existing("jesse", "Three things left today.")],
+            incoming: [incoming("jesse", "Three things left today.\nSPOKEN: Three left.", "s:100")])
+        XCTAssertEqual(plan, [.insert])
+    }
+
     func testRoleAndTimestampHelpers() {
         XCTAssertEqual(TranscriptMerge.role(for: "assistant"), .jesse)
         XCTAssertEqual(TranscriptMerge.role(for: "user"), .user)

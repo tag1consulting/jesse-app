@@ -285,6 +285,119 @@ pub fn apply_directives(
     })
 }
 
+/// What a reply's final line turned out to be. Decided ONCE, by
+/// [`classify_final_line`], so the two readers of a reply — delivery
+/// ([`extract_directives`]) and hydration ([`delivered_text`]) — cannot disagree
+/// about what counts as a directive.
+enum FinalLine {
+    /// Not a directive candidate at all: a normal reply. Text is untouched, and
+    /// nothing is logged (this is the overwhelmingly common case).
+    Plain,
+    /// Directive-SHAPED but not honored, carrying the diagnostic to log. The text
+    /// is passed through untouched and VISIBLE — a loud contract failure, never a
+    /// silent strip. Only delivery logs it; hydration re-reads the same reply on
+    /// every poll and would otherwise repeat the diagnostic forever.
+    Unhonored(String),
+    /// A known directive that parsed and validated: the line is stripped.
+    Honored(Directives),
+}
+
+/// Classify a reply's final non-empty line. Pure — no logging, no allocation of
+/// the reply — so both the delivery path and the hydration path can ask the same
+/// question and get the same answer.
+///
+/// Exactly one directive line is recognized per reply: the final non-empty one.
+fn classify_final_line(reply: &str) -> FinalLine {
+    // The candidate is the last non-empty line. `trim_end` drops any trailing
+    // blank lines so the directive can sit under trailing newlines.
+    let trimmed_reply = reply.trim_end();
+    let last_line = match trimmed_reply.rsplit('\n').next() {
+        Some(l) => l.trim(),
+        None => return FinalLine::Plain,
+    };
+
+    // Fast path: only a `JESSE_`-prefixed final line is ever a directive
+    // candidate. A normal reply is returned untouched with no logging.
+    if !last_line.starts_with("JESSE_") {
+        return FinalLine::Plain;
+    }
+
+    // Over-cap: a directive-shaped final line that is too long is not parsed —
+    // pass it through visible (loud failure over silent loss).
+    if last_line.len() > MAX_DIRECTIVE_LINE_BYTES {
+        return FinalLine::Unhonored(format!(
+            "final line looks like a directive but exceeds the \
+             {MAX_DIRECTIVE_LINE_BYTES}-byte cap — passing through untouched"
+        ));
+    }
+
+    // Shape: `JESSE_<NAME> v<N> {json}`.
+    let Some((name, version, json)) = parse_directive_shape(last_line) else {
+        return FinalLine::Unhonored(
+            "final line starts with JESSE_ but is not a valid \
+             `JESSE_<NAME> v<N> {json}` directive — passing through untouched"
+                .to_string(),
+        );
+    };
+
+    // Registry: exactly the known (name, version) pairs are recognized. Unknown
+    // names or versions pass through untouched and VISIBLE — a loud contract
+    // failure the operator/agent can see, never a silent strip. Each arm enforces
+    // its OWN per-directive line cap (checked before its payload parse), so a
+    // directive's contract owns its bound; the generic ceiling above is only the
+    // outer DoS guard sized to the largest directive.
+    match (name, version) {
+        ("JESSE_NEEDS_HEALTH", 1) => {
+            if last_line.len() > MAX_NEEDS_HEALTH_LINE_BYTES {
+                return FinalLine::Unhonored(format!(
+                    "JESSE_NEEDS_HEALTH v1 exceeds its \
+                     {MAX_NEEDS_HEALTH_LINE_BYTES}-byte cap — passing through untouched"
+                ));
+            }
+            match parse_needs_health(json) {
+                Ok(needs_health) => FinalLine::Honored(Directives {
+                    needs_health: Some(needs_health),
+                    meal_log: None,
+                }),
+                Err(reason) => FinalLine::Unhonored(format!(
+                    "JESSE_NEEDS_HEALTH v1 payload rejected ({reason}) — \
+                     passing through untouched"
+                )),
+            }
+        }
+        ("JESSE_MEAL_LOG", ver @ (1 | 2)) => {
+            if last_line.len() > MAX_MEAL_LOG_LINE_BYTES {
+                return FinalLine::Unhonored(format!(
+                    "JESSE_MEAL_LOG v{ver} exceeds its \
+                     {MAX_MEAL_LOG_LINE_BYTES}-byte cap — passing through untouched"
+                ));
+            }
+            // v1: `meals` only (retract is an unknown key → malformed). v2: `meals`
+            // upserts plus optional `retract`. Both share one 8 KiB cap and the same
+            // per-meal validation; the version only selects which top-level shape is legal.
+            let parsed = if ver == 1 {
+                parse_meal_log_v1(json)
+            } else {
+                parse_meal_log_v2(json)
+            };
+            match parsed {
+                Ok(meal_log) => FinalLine::Honored(Directives {
+                    needs_health: None,
+                    meal_log: Some(meal_log),
+                }),
+                Err(reason) => FinalLine::Unhonored(format!(
+                    "JESSE_MEAL_LOG v{ver} payload rejected ({reason}) — \
+                     passing through untouched"
+                )),
+            }
+        }
+        _ => FinalLine::Unhonored(format!(
+            "unknown directive `{name} v{version}` — passing through \
+             untouched (visible contract failure)"
+        )),
+    }
+}
+
 /// Extract a recognized directive from a reply's final non-empty line.
 ///
 /// Returns `(text, directives)`:
@@ -300,112 +413,80 @@ pub fn apply_directives(
 /// Exactly one directive line is recognized per reply — the final non-empty one.
 /// Pure (aside from `eprintln!` diagnostics), so it is unit-tested directly.
 pub fn extract_directives(reply: &str) -> (String, Option<Directives>) {
-    // The candidate is the last non-empty line. `trim_end` drops any trailing
-    // blank lines so the directive can sit under trailing newlines.
-    let trimmed_reply = reply.trim_end();
-    let last_line = match trimmed_reply.rsplit('\n').next() {
-        Some(l) => l.trim(),
-        None => return (reply.to_string(), None),
-    };
-
-    // Fast path: only a `JESSE_`-prefixed final line is ever a directive
-    // candidate. A normal reply is returned untouched with no logging.
-    if !last_line.starts_with("JESSE_") {
-        return (reply.to_string(), None);
-    }
-
-    // Over-cap: a directive-shaped final line that is too long is not parsed —
-    // pass it through visible and log (loud failure over silent loss).
-    if last_line.len() > MAX_DIRECTIVE_LINE_BYTES {
-        eprintln!(
-            "directive: final line looks like a directive but exceeds the \
-             {MAX_DIRECTIVE_LINE_BYTES}-byte cap — passing through untouched"
-        );
-        return (reply.to_string(), None);
-    }
-
-    // Shape: `JESSE_<NAME> v<N> {json}`.
-    let Some((name, version, json)) = parse_directive_shape(last_line) else {
-        eprintln!(
-            "directive: final line starts with JESSE_ but is not a valid \
-             `JESSE_<NAME> v<N> {{json}}` directive — passing through untouched"
-        );
-        return (reply.to_string(), None);
-    };
-
-    // Registry: exactly the known (name, version) pairs are recognized. Unknown
-    // names or versions pass through untouched and VISIBLE — a loud contract
-    // failure the operator/agent can see, never a silent strip. Each arm enforces
-    // its OWN per-directive line cap (checked before its payload parse), so a
-    // directive's contract owns its bound; the generic ceiling above is only the
-    // outer DoS guard sized to the largest directive.
-    match (name, version) {
-        ("JESSE_NEEDS_HEALTH", 1) => {
-            if last_line.len() > MAX_NEEDS_HEALTH_LINE_BYTES {
-                eprintln!(
-                    "directive: JESSE_NEEDS_HEALTH v1 exceeds its \
-                     {MAX_NEEDS_HEALTH_LINE_BYTES}-byte cap — passing through untouched"
-                );
-                return (reply.to_string(), None);
-            }
-            match parse_needs_health(json) {
-                Ok(needs_health) => {
-                    let directives = Directives {
-                        needs_health: Some(needs_health),
-                        meal_log: None,
-                    };
-                    (strip_final_line(reply), Some(directives))
-                }
-                Err(reason) => {
-                    eprintln!(
-                        "directive: JESSE_NEEDS_HEALTH v1 payload rejected ({reason}) — \
-                         passing through untouched"
-                    );
-                    (reply.to_string(), None)
-                }
-            }
-        }
-        ("JESSE_MEAL_LOG", ver @ (1 | 2)) => {
-            if last_line.len() > MAX_MEAL_LOG_LINE_BYTES {
-                eprintln!(
-                    "directive: JESSE_MEAL_LOG v{ver} exceeds its \
-                     {MAX_MEAL_LOG_LINE_BYTES}-byte cap — passing through untouched"
-                );
-                return (reply.to_string(), None);
-            }
-            // v1: `meals` only (retract is an unknown key → malformed). v2: `meals`
-            // upserts plus optional `retract`. Both share one 8 KiB cap and the same
-            // per-meal validation; the version only selects which top-level shape is legal.
-            let parsed = if ver == 1 {
-                parse_meal_log_v1(json)
-            } else {
-                parse_meal_log_v2(json)
-            };
-            match parsed {
-                Ok(meal_log) => {
-                    let directives = Directives {
-                        needs_health: None,
-                        meal_log: Some(meal_log),
-                    };
-                    (strip_final_line(reply), Some(directives))
-                }
-                Err(reason) => {
-                    eprintln!(
-                        "directive: JESSE_MEAL_LOG v{ver} payload rejected ({reason}) — \
-                         passing through untouched"
-                    );
-                    (reply.to_string(), None)
-                }
-            }
-        }
-        _ => {
-            eprintln!(
-                "directive: unknown directive `{name} v{version}` — passing through \
-                 untouched (visible contract failure)"
-            );
+    match classify_final_line(reply) {
+        FinalLine::Plain => (reply.to_string(), None),
+        FinalLine::Unhonored(reason) => {
+            eprintln!("directive: {reason}");
             (reply.to_string(), None)
         }
+        FinalLine::Honored(directives) => (strip_final_line(reply), Some(directives)),
     }
+}
+
+/// The assistant text the USER ends up seeing for a reply, derived from the raw
+/// model output. The one place that answer is defined.
+///
+/// Delivery and hydration are two views of the same reply and the app binds a
+/// delivered turn to its hydrated twin by exact text equality
+/// (`TranscriptMerge.matchKey` is role + trimmed text and nothing else). So any
+/// transformation applied on one path and not the other splits one turn into two
+/// bubbles. Two transformations are in that class:
+///
+/// - the **directive line**, stripped on delivery by [`extract_directives`];
+/// - a **`SPOKEN:` line**, which the bridge asks for on voice turns (see
+///   `prompt.rs`) and every client drops from the body via `JesseReply.displayText`.
+///
+/// Both are emitted by the model, so both are in the transcript, and hydration has
+/// to remove them to land on the same string. The model badge is deliberately NOT
+/// handled here: the bridge appends it AFTER the model, so it never reaches the
+/// transcript, and the client strips it from the delivered copy — net zero on both
+/// sides already.
+///
+/// Kept byte-compatible with `displayText`: lines are matched case-insensitively
+/// after leading horizontal whitespace, and the result is trimmed.
+pub fn delivered_text(raw: &str) -> String {
+    // Reuse the ONE definition of what counts as a directive. Classification is
+    // silent here on purpose: hydration re-reads every historical reply on every
+    // poll, so logging an unhonored directive from this path would repeat that
+    // diagnostic for the life of the conversation. Delivery already logged it once.
+    let stripped = match classify_final_line(raw) {
+        FinalLine::Honored(_) => strip_final_line(raw),
+        FinalLine::Plain | FinalLine::Unhonored(_) => raw.to_string(),
+    };
+    strip_spoken_lines(&stripped)
+}
+
+/// The `SPOKEN:` marker, matched case-insensitively. Mirrors
+/// `JesseReply.displayText`'s `marker`.
+const SPOKEN_MARKER: &str = "SPOKEN:";
+
+/// Drop every `SPOKEN:` line, mirroring `JesseReply.displayText`: split on `\n`
+/// keeping empty lines, filter, rejoin, then trim the ends.
+fn strip_spoken_lines(text: &str) -> String {
+    text.split('\n')
+        .filter(|line| !is_spoken_line(line))
+        .collect::<Vec<_>>()
+        .join("\n")
+        .trim()
+        .to_string()
+}
+
+/// Whether a line is a `SPOKEN:` line, matching the client's test: leading
+/// HORIZONTAL whitespace ignored, then a case-insensitive `SPOKEN:` prefix.
+fn is_spoken_line(line: &str) -> bool {
+    // `get(..n)` yields None for a short line AND for an index that would split a
+    // multi-byte char, so it is the whole bounds check.
+    line.trim_start_matches(is_horizontal_whitespace)
+        .get(..SPOKEN_MARKER.len())
+        .is_some_and(|head| head.eq_ignore_ascii_case(SPOKEN_MARKER))
+}
+
+/// Swift's `CharacterSet.whitespaces` — tab plus the Unicode space separators —
+/// and deliberately NOT Rust's `char::is_whitespace`, which also covers CR, form
+/// feed, vertical tab and NEL. Matching the client's set is what keeps this
+/// function's output equal to `displayText`'s on the same input.
+fn is_horizontal_whitespace(c: char) -> bool {
+    c == '\t' || (c.is_whitespace() && !matches!(c, '\n' | '\r' | '\u{b}' | '\u{c}' | '\u{85}'))
 }
 
 /// Split a candidate line into `(name, version, json)` if it matches
@@ -1071,6 +1152,64 @@ mod tests {
         // Err: passed through unchanged.
         let err = apply_directives(Err((StatusCode::BAD_GATEWAY, "boom".into())));
         assert!(err.is_err());
+    }
+
+    #[test]
+    fn delivered_text_strips_a_directive_and_leaves_a_plain_reply_alone() {
+        // The directive half is the SAME decision `extract_directives` makes — one
+        // classifier, so the two can never disagree about what a directive is.
+        assert_eq!(
+            delivered_text("answer\nJESSE_NEEDS_HEALTH v1 {\"sections\":[\"daily\"]}"),
+            "answer"
+        );
+        // A plain reply is untouched (beyond the trim).
+        assert_eq!(delivered_text("just an answer"), "just an answer");
+        // A directive-SHAPED line the registry does not know stays visible, matching
+        // delivery's loud-failure behavior.
+        let unknown = "answer\nJESSE_NOPE v1 {\"a\":1}";
+        assert_eq!(delivered_text(unknown), unknown);
+    }
+
+    #[test]
+    fn delivered_text_drops_spoken_lines_the_way_the_client_does() {
+        // The client matches `SPOKEN:` case-insensitively, after leading horizontal
+        // whitespace, and does not require a space after the colon. Mirror all three,
+        // or a voice turn hydrates to text the app never rendered.
+        assert_eq!(delivered_text("body\nSPOKEN: said aloud"), "body");
+        assert_eq!(delivered_text("body\n  spoken: said aloud"), "body");
+        assert_eq!(delivered_text("body\n\tSpOkEn:tight"), "body");
+        // A SPOKEN: line is dropped wherever it sits, not only last.
+        assert_eq!(delivered_text("SPOKEN: aloud\nbody"), "body");
+        // A mention of the word mid-line is NOT a SPOKEN line.
+        let prose = "he had spoken: quietly";
+        assert_eq!(delivered_text(prose), prose);
+        // Both transformations at once, directive last.
+        assert_eq!(
+            delivered_text(
+                "body\nSPOKEN: aloud\nJESSE_NEEDS_HEALTH v1 {\"sections\":[\"daily\"]}"
+            ),
+            "body"
+        );
+        // A reply that is nothing but a directive collapses to empty — the app never
+        // persists a turn for it, so hydration must not invent one.
+        assert_eq!(
+            delivered_text("JESSE_NEEDS_HEALTH v1 {\"sections\":[\"daily\"]}"),
+            ""
+        );
+    }
+
+    #[test]
+    fn delivered_text_does_not_change_what_delivery_sends() {
+        // `delivered_text` must NOT be wired into the delivery path: the bridge ships
+        // the SPOKEN: line so the app and the watch have something to read aloud
+        // (`JesseReply.spokenText`), and only the client drops it from the body.
+        let raw = "body\nSPOKEN: aloud";
+        let (delivered, _, _) = apply_directives(Ok((raw.to_string(), None))).unwrap();
+        assert_eq!(
+            delivered, raw,
+            "delivery keeps SPOKEN: — dropping it here would silence voice"
+        );
+        assert_eq!(delivered_text(raw), "body", "hydration drops it");
     }
 
     #[test]

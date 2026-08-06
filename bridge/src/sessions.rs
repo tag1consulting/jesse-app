@@ -902,6 +902,12 @@ fn shape_turn_line(line: &str, turn_key: Option<String>) -> Option<HydratedTurn>
             })
         }
         Some("assistant") => {
+            // Raw model text, deliberately. Unlike the user arm above, this one does
+            // NOT normalize: removing what delivery removed (the directive line, a
+            // voice turn's `SPOKEN:` line) belongs to `hydrate_conversation_in`, which
+            // sits above this Claude-Code-specific parser and so also covers a future
+            // harness's parser. Do not re-derive that strip here — two copies is how
+            // the two paths drift apart, which is the bug this arrangement fixes.
             let text = extract_assistant_text(&v)?;
             let text = text.trim();
             (!text.is_empty()).then(|| HydratedTurn {
@@ -1053,6 +1059,31 @@ pub fn hydrate_conversation_in(
         segment += 1;
         offset = 0;
     }
+    // THE INVARIANT: the assistant text hydration returns is the text delivery
+    // produced. The app binds a delivered turn to its hydrated twin by exact text
+    // equality, so a reply whose two views differ by even one line is merged as a
+    // second turn and the answer renders twice, permanently. `delivered_text` owns
+    // both transformations that used to differ (the directive line and a voice
+    // turn's `SPOKEN:` line) and is the same function the delivery path defers to.
+    //
+    // It is applied HERE, above the parser, rather than inside `shape_turn_line`:
+    // that function reads Claude Code's private jsonl layout and a second
+    // transcript-capable harness would bring its own parser, which would not inherit
+    // a strip placed there. This is the single funnel every hydrated turn passes
+    // through on the way to a client — the route calls it and the single-directory
+    // helper delegates to it — so normalizing here covers whatever parser produced
+    // the turn.
+    //
+    // A turn normalizing to EMPTY is dropped rather than returned blank: a
+    // `JESSE_NEEDS_HEALTH` reply is the directive line alone, so its whole text is
+    // the strip, and the app never persisted a turn for it either.
+    turns.retain_mut(|turn| {
+        if turn.role != "assistant" {
+            return true;
+        }
+        turn.text = directives::delivered_text(&turn.text);
+        !turn.text.is_empty()
+    });
     Ok((turns, format_hydrate_cursor(cursor_segment, cursor_offset)))
 }
 
@@ -2071,6 +2102,187 @@ mod tests {
         assert_eq!(delta[0].text, "q2");
         assert_eq!(off3, (first.len() + more.len()) as u64);
 
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // ---- Delivery and hydration return the SAME assistant text -----------------
+    //
+    // The app binds a delivered turn to its hydrated twin by exact text equality, so
+    // these are the tests that would have caught a reply rendering twice. Each one
+    // runs ONE raw reply down BOTH paths and asserts the two strings are equal:
+    //
+    //   delivery:  `apply_directives` (what the poll result / SSE `done` carries)
+    //              then the client's own `displayText` (below), which drops SPOKEN:
+    //   hydration: a transcript holding that same raw reply, through the real route
+    //
+    // `display_text` is re-derived here from `JesseReply.displayText` rather than
+    // calling the bridge's own helper: the point is to pin the CLIENT's behavior, so
+    // a test that called our implementation on both sides could agree with itself
+    // while disagreeing with the app.
+
+    /// Mirror of `JesseReply.displayText`'s SPOKEN: filter (WireTypes.swift): drop
+    /// every line that begins, after horizontal whitespace, with a case-insensitive
+    /// `SPOKEN:`; rejoin; trim. The badge half is not modeled — the bridge appends it
+    /// after the model, so it is never in a transcript and never in this comparison.
+    fn display_text(delivered: &str) -> String {
+        delivered
+            .split('\n')
+            .filter(|l| {
+                !l.trim_start().to_uppercase().starts_with("SPOKEN:")
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+            .trim()
+            .to_string()
+    }
+
+    /// One assistant transcript line carrying `text` verbatim.
+    fn assistant_text_line(text: &str) -> String {
+        format!(
+            "{{\"type\":\"assistant\",\"message\":{{\"content\":[{{\"type\":\"text\",\"text\":{}}}]}}}}\n",
+            serde_json::to_string(text).unwrap()
+        )
+    }
+
+    /// Hydrate a single-segment conversation whose only assistant turn is `raw`.
+    fn hydrate_one_reply(dir: &Path, raw: &str) -> Vec<HydratedTurn> {
+        let sid = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+        write(dir, &format!("{sid}.jsonl"), &assistant_text_line(raw));
+        let (turns, _) =
+            hydrate_conversation(dir, std::slice::from_ref(&sid.to_string()), (0, 0)).unwrap();
+        turns
+    }
+
+    /// The delivered-then-rendered text for a raw reply: exactly what the app stores
+    /// for the optimistic turn it just rendered.
+    fn rendered_after_delivery(raw: &str) -> String {
+        let (delivered, _, _) =
+            crate::directives::apply_directives(Ok((raw.to_string(), None))).unwrap();
+        display_text(&delivered)
+    }
+
+    #[test]
+    fn hydration_returns_what_delivery_returned_for_a_directive_reply() {
+        let dir = temp_dir();
+        // The shape Jeremy hit: a real answer with a meal-log directive under it.
+        let raw = "Logged your breakfast — about 320 kcal.\n\
+                   JESSE_MEAL_LOG v2 {\"meals\":[{\"id\":\"2026-08-05-breakfast\",\
+                   \"consumedAt\":\"2026-08-05T08:10:00+02:00\",\"name\":\"Kefir\",\"kcal\":320}]}";
+
+        let delivered = rendered_after_delivery(raw);
+        assert_eq!(delivered, "Logged your breakfast — about 320 kcal.");
+
+        let turns = hydrate_one_reply(&dir, raw);
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].role, "assistant");
+        assert!(
+            !turns[0].text.contains("JESSE_MEAL_LOG"),
+            "the raw sentinel must never reach the client from the transcript route"
+        );
+        assert_eq!(
+            turns[0].text, delivered,
+            "hydration must return the text delivery produced, or the merge inserts a second bubble"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn hydration_returns_what_delivery_returned_for_a_spoken_reply() {
+        let dir = temp_dir();
+        // A voice turn duplicates on its OWN, with no directive anywhere in it.
+        let raw = "You have three things left today.\nSPOKEN: Three things left today.";
+
+        let delivered = rendered_after_delivery(raw);
+        assert_eq!(delivered, "You have three things left today.");
+
+        let turns = hydrate_one_reply(&dir, raw);
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].text, delivered);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn hydration_returns_what_delivery_returned_for_a_reply_carrying_both() {
+        let dir = temp_dir();
+        // A voice turn that also logged a meal: both transformations on one reply,
+        // and the directive is the final line, under the SPOKEN: one.
+        let raw = "Logged it.\n\
+                   SPOKEN: Logged it.\n\
+                   JESSE_MEAL_LOG v1 {\"meals\":[{\"id\":\"2026-08-05-lunch\",\
+                   \"consumedAt\":\"2026-08-05T12:00:00+02:00\",\"name\":\"Soup\",\"kcal\":210}]}";
+
+        let delivered = rendered_after_delivery(raw);
+        assert_eq!(delivered, "Logged it.");
+
+        let turns = hydrate_one_reply(&dir, raw);
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].text, delivered);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_directive_only_reply_hydrates_to_no_turn_at_all() {
+        let dir = temp_dir();
+        // What a JESSE_NEEDS_HEALTH turn is: the directive line is the whole reply.
+        // Delivery yields an empty answer the app does not persist, so hydration must
+        // not conjure a turn the app never rendered.
+        let raw = "JESSE_NEEDS_HEALTH v1 {\"sections\":[\"daily\"]}";
+
+        assert_eq!(rendered_after_delivery(raw), "");
+
+        let turns = hydrate_one_reply(&dir, raw);
+        assert!(
+            turns.is_empty(),
+            "a directive-only reply must hydrate to nothing, got {turns:?}"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn an_unhonored_directive_line_stays_visible_on_both_paths() {
+        let dir = temp_dir();
+        // A directive-shaped line the registry does not know passes through VISIBLE on
+        // delivery (a loud contract failure). Hydration must agree, or the two paths
+        // differ again — this time in the other direction.
+        let raw = "Here you go.\nJESSE_FUTURE_THING v9 {\"a\":1}";
+
+        let delivered = rendered_after_delivery(raw);
+        assert_eq!(delivered, raw, "unknown directive passes through untouched");
+
+        let turns = hydrate_one_reply(&dir, raw);
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].text, delivered);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_mixed_harness_conversation_normalizes_claude_and_skips_codex() {
+        // A thread where the model was switched mid-conversation: ONE conversation
+        // record carrying both a Claude Code session id and a Codex one. Codex keeps no
+        // transcript on disk (`Harness::transcript_dir` → None), so its segment finds no
+        // file and must contribute NOTHING rather than erroring, while the Claude
+        // segments still come back normalized.
+        let dir = temp_dir();
+        let claude_sid = "11111111-2222-3333-4444-555555555555".to_string();
+        let codex_sid = "99999999-8888-7777-6666-555555555555".to_string();
+        let raw = "Breakfast is in.\n\
+                   JESSE_MEAL_LOG v1 {\"meals\":[{\"id\":\"2026-08-05-breakfast\",\
+                   \"consumedAt\":\"2026-08-05T08:00:00+02:00\",\"name\":\"Eggs\",\"kcal\":180}]}";
+        write(
+            &dir,
+            &format!("{claude_sid}.jsonl"),
+            &assistant_text_line(raw),
+        );
+
+        // Codex first, then Claude, then Codex again — the interleaving a real switch
+        // produces. Only the Claude directory is in `dirs`, as the registry would have it.
+        let session_ids = vec![codex_sid.clone(), claude_sid, codex_sid];
+        let (turns, cursor) = hydrate_conversation(&dir, &session_ids, (0, 0))
+            .expect("a missing Codex transcript is skipped, never an error");
+
+        assert_eq!(turns.len(), 1, "only the Claude segment contributes a turn");
+        assert_eq!(turns[0].text, rendered_after_delivery(raw));
+        assert!(!cursor.is_empty());
         std::fs::remove_dir_all(&dir).ok();
     }
 
