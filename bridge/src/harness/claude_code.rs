@@ -1914,25 +1914,37 @@ mod tests {
             "a turn with no attachments must not carry the flag: {plain:?}"
         );
 
-        // Attachments → the flag, with the directory AS CREATED and its realpath, which on
-        // macOS differ (`/var/folders/…` vs `/private/var/folders/…`).
+        // Attachments → the flag, naming the directory AS CREATED first.
         let at = attached
             .iter()
             .position(|a| a == "--add-dir")
             .expect("an attachment turn carries --add-dir");
-        let real = dir.canonicalize().expect("realpath");
+        // The flag is variadic, so its values run until the next flag.
+        let values = attached[at + 1..]
+            .iter()
+            .take_while(|a| !a.starts_with("--"))
+            .count();
         assert_eq!(attached[at + 1], dir.display().to_string());
-        assert_eq!(
-            attached[at + 2],
-            real.display().to_string(),
-            "both symlink spellings are passed"
-        );
-        assert_ne!(dir, real, "the fixture must actually exercise the symlink");
 
-        // …and NOTHING else changed: strip the flag and its two values and the two argvs
-        // are equal.
+        // The SECOND spelling is conditional on the platform, and deliberately so. On macOS
+        // — the deployment target, and where the reported bug happened —
+        // `std::env::temp_dir()` is `/var/folders/…` whose realpath is
+        // `/private/var/folders/…`, and the failing turn shows the model trying both. On a
+        // Linux CI runner `/tmp` IS its own realpath, so there is no second spelling to pass
+        // and emitting the same path twice would be noise. Asserting the platform's own
+        // answer rather than macOS's keeps this test honest on both.
+        let real = dir.canonicalize().expect("realpath");
+        if real != dir {
+            assert_eq!(values, 2, "a symlinked temp dir passes both spellings");
+            assert_eq!(attached[at + 2], real.display().to_string());
+        } else {
+            assert_eq!(values, 1, "no distinct realpath means one value, not a duplicate");
+        }
+
+        // …and NOTHING else changed: strip the flag and its values and the two argvs are
+        // equal.
         let mut stripped = attached.clone();
-        stripped.drain(at..at + 3);
+        stripped.drain(at..at + 1 + values);
         assert_eq!(
             stripped, plain,
             "an attachment must add the read grant and nothing else"
@@ -1964,12 +1976,20 @@ mod tests {
                 Some(dir.as_path()),
             );
             let at = args.iter().position(|a| a == "--add-dir").expect(label);
-            // Two directory values, then a flag — never a bare value the variadic list
-            // could absorb.
-            let next = &args[at + 3];
+            // The directory values run until the next flag (one or two of them, depending on
+            // whether the temp dir has a distinct realpath — see the test above). What must
+            // hold on every platform is that the list ENDS at a flag rather than at the end
+            // of the argv: a trailing `--add-dir` would swallow whatever a later change
+            // appended after it.
+            let values = args[at + 1..]
+                .iter()
+                .take_while(|a| !a.starts_with("--"))
+                .count();
+            assert!(values >= 1, "{label}: --add-dir must name a directory: {args:?}");
             assert!(
-                next.starts_with("--"),
-                "{label}: --add-dir's list must end at a flag, found {next:?} in {args:?}"
+                at + 1 + values < args.len(),
+                "{label}: --add-dir's variadic list must be terminated by a following flag, \
+                 but it runs to the end of the argv: {args:?}"
             );
             // And it lands ahead of the settings flag, where the comment says it does.
             if wl.is_some() {

@@ -15,6 +15,28 @@ CI both run it). See the "Versioning" section of `bridge/README.md`.
 
 ## [Unreleased]
 
+## [Bridge 0.62.1] - 2026-08-06
+
+Test-only — no behaviour change, no argv change.
+
+### Fixed
+
+- **Two new argv tests asserted macOS's answer on every platform and failed on the
+  Linux CI runner.** The added-directory flag passes the scratch path and its
+  realpath *when they differ*: on macOS `std::env::temp_dir()` is `/var/folders/…`
+  whose realpath is `/private/var/folders/…`, so two values are emitted, while on a
+  Linux runner `/tmp` is its own realpath and one is. The production code was
+  already conditional and is unchanged; the tests hardcoded two values and a fixed
+  argv offset. They now read the variadic list's length from the argv and assert the
+  platform's own answer, so both arrangements are checked rather than assumed —
+  verified locally in both, by running them once under the default symlinked
+  `TMPDIR` and once under a canonical one.
+
+  The property that actually matters is platform-independent and is now asserted as
+  such: the flag's variadic list must be terminated by a following flag rather than
+  running to the end of the argv, where it would swallow anything a later change
+  appended.
+
 ## [Bridge 0.62.0] - 2026-08-06
 
 ### Fixed
