@@ -31,7 +31,7 @@ jobs:
           fetch-depth: 0
 
       - name: Install Rust toolchain
-        run: rustup component add clippy llvm-tools-preview
+        run: rustup component add clippy rustfmt llvm-tools-preview
 
       - name: Cache cargo
         uses: actions/cache@v6
@@ -59,6 +59,27 @@ jobs:
 
       - name: Clippy
         run: cargo clippy --all-targets --features containment-probe -- -D warnings
+
+      # Formatting is enforced, not merely conventional. It sits AFTER build/test/clippy
+      # for the same reason clippy sits after test: steps stop at the first failure, and a
+      # reflowed line is the least useful thing to learn at the cost of not learning
+      # whether the tests passed.
+      #
+      # This gate exists because the crate had drifted out of `cargo fmt` shape entirely
+      # (41 files across both crates, reformatted in bf8225f). The cost of that drift was
+      # paid by every unrelated PR, which had to choose between carrying reformat noise
+      # through files it never touched or hand-reverting rustfmt after each run. Neither
+      # is reviewable, so the drift is now a build failure instead of a judgement call.
+      #
+      # SCOPE: the bridge only. `eval/` is fmt-clean as of bf8225f but no CI job compiles
+      # or checks it, and this job's `working-directory: bridge` means this step cannot
+      # see it — `bridge/` is deliberately excluded from the root workspace (see the root
+      # Cargo.toml), so one `cargo fmt` never covers both. Enforcing eval needs its own
+      # step at the workspace root, which is worth doing when eval joins CI at all: it
+      # currently fails `cargo clippy -- -D warnings` (6 x doc_overindented_list_items),
+      # so a step there would need that fixed first if it ever grows past --check.
+      - name: Format check
+        run: cargo fmt --all --check
 
       # Prebuilt binaries (no from-source compile): a dependency-CVE gate and the
       # coverage tool.

@@ -75,8 +75,19 @@ CI both run it). See the "Versioning" section of `bridge/README.md`.
   nothing else. Neither had been formatted in a while and 41 files had drifted, which
   made every unrelated PR carry a choice between reformat noise and hand-reverting
   rustfmt. This is pure reflow — line breaks and trailing commas only, no token
-  changed — and both crates build, lint and test identically before and after. CI runs
-  no fmt check, so nothing here is enforced yet; keeping it clean is by hand for now.
+  changed — and both crates build, lint and test identically before and after.
+
+- **CI now enforces formatting** (`cargo fmt --all --check`, a new step in the bridge
+  job), so the drift that made the reformat above necessary becomes a build failure
+  rather than a judgement call on each PR. The step is placed after build/test/clippy for
+  the same reason clippy sits after test: steps stop at the first failure, and a reflowed
+  line is the least useful thing to learn at the cost of not learning whether the tests
+  passed. Verified to fail on misformatted input, not merely to pass on clean input.
+
+  It covers the **bridge only**. `eval/` is fmt-clean as of this release but no CI job
+  compiles or checks it, and `bridge/` is excluded from the root workspace, so a single
+  `cargo fmt` cannot cover both. Enforcing eval belongs with bringing eval into CI at
+  all, which it is not today.
 
 ## [Bridge 0.63.1] - 2026-08-06
 
