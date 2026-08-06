@@ -362,7 +362,10 @@ mod tests {
             Some(("http://fw".into(), "fw-tok".into(), "glm-model".into()))
         );
         assert_eq!(a.subagent_model.as_deref(), Some("glm-model"));
-        assert!(!a.writes_allowed(), "a non-ambient model is read-only by default");
+        assert!(
+            !a.writes_allowed(),
+            "a non-ambient model is read-only by default"
+        );
     }
 
     /// The level now decides, and it comes from config — there is no per-model override to

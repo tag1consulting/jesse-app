@@ -19,7 +19,10 @@ use std::process::ExitCode;
 use std::time::Duration;
 
 #[derive(Parser)]
-#[command(name = "jesse-eval", about = "Offline eval harness for the Jesse assistant")]
+#[command(
+    name = "jesse-eval",
+    about = "Offline eval harness for the Jesse assistant"
+)]
 struct Cli {
     #[command(subcommand)]
     command: Commands,

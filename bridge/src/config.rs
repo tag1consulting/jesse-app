@@ -509,7 +509,10 @@ impl Config {
         resolve_slot_plan(
             &self.model_registry,
             &HarnessRegistry::for_models(
-                self.model_registry.models.iter().map(|m| m.harness.as_str()),
+                self.model_registry
+                    .models
+                    .iter()
+                    .map(|m| m.harness.as_str()),
             ),
             &self.concurrency,
             &|var| std::env::var(var).ok(),
@@ -998,7 +1001,8 @@ impl ModelRegistry {
         // ONCE here so a bad value warns a single time. An explicit per-model interval still
         // wins; env-triple models (which carry no explicit interval) pick up this default.
         let global_health_interval = health_interval_override();
-        let default_health_interval = global_health_interval.unwrap_or(DEFAULT_HEALTH_INTERVAL_SECS);
+        let default_health_interval =
+            global_health_interval.unwrap_or(DEFAULT_HEALTH_INTERVAL_SECS);
         // Likewise the global per-probe-timeout override (`JESSE_HEALTH_TIMEOUT_SECS`). Unlike
         // the interval this is NOT collapsed to a single default here: each env entry carries
         // its own built-in budget (a reasoning model needs a wider one), and the override wins
@@ -1006,8 +1010,14 @@ impl ModelRegistry {
         let global_health_timeout = health_timeout_override();
 
         // Source 2: the preserved env triples (same ids/defaults/prices as before).
-        upsert_model(&mut models, glm_env_entry(default_health_interval, global_health_timeout));
-        upsert_model(&mut models, kimi_env_entry(default_health_interval, global_health_timeout));
+        upsert_model(
+            &mut models,
+            glm_env_entry(default_health_interval, global_health_timeout),
+        );
+        upsert_model(
+            &mut models,
+            kimi_env_entry(default_health_interval, global_health_timeout),
+        );
         // Kimi's OTHER surface, registered right beside it: one model, two transports, each
         // selectable on its own id. See [`kimi_codex_env_entry`] for why they are not
         // interchangeable.
@@ -1015,11 +1025,16 @@ impl ModelRegistry {
             &mut models,
             kimi_codex_env_entry(default_health_interval, global_health_timeout),
         );
-        upsert_model(&mut models, local_env_entry(default_health_interval, global_health_timeout));
+        upsert_model(
+            &mut models,
+            local_env_entry(default_health_interval, global_health_timeout),
+        );
 
         // Source 3: the declarative `[[models]]` entries (later overrides earlier by id).
         for decl in load_local_models(home) {
-            if let Some(m) = registry_model_from_toml(&decl, global_health_interval, global_health_timeout) {
+            if let Some(m) =
+                registry_model_from_toml(&decl, global_health_interval, global_health_timeout)
+            {
                 upsert_model(&mut models, m);
             }
         }
@@ -1043,7 +1058,9 @@ impl ModelRegistry {
     /// resolves to a configured registered model. A paired-but-all-broken model reports
     /// `false` here (and `GET /jesse/models` shows no-vision), never a silent half-state.
     pub fn vision_enabled(&self, m: &RegistryModel) -> bool {
-        m.vision.iter().any(|p| self.vision_partner(&p.id).is_some())
+        m.vision
+            .iter()
+            .any(|p| self.vision_partner(&p.id).is_some())
     }
 }
 
@@ -1128,7 +1145,11 @@ fn glm_env_entry(default_interval_secs: u64, global_timeout_secs: Option<u64>) -
         health: HealthConfig {
             interval_secs: default_interval_secs,
             // GLM answers the 1-token probe in well under a second; the 3 s default stands.
-            timeout_secs: resolve_health_timeout(None, global_timeout_secs, DEFAULT_HEALTH_TIMEOUT_SECS),
+            timeout_secs: resolve_health_timeout(
+                None,
+                global_timeout_secs,
+                DEFAULT_HEALTH_TIMEOUT_SECS,
+            ),
             ..HealthConfig::default()
         },
         // Pair GLM with vision helpers via `JESSE_MODEL_GLM_VISION` (id[:role],…) and
@@ -1303,7 +1324,11 @@ fn local_env_entry(default_interval_secs: u64, global_timeout_secs: Option<u64>)
         price: PriceDeck::ZERO,
         health: HealthConfig {
             interval_secs: default_interval_secs,
-            timeout_secs: resolve_health_timeout(None, global_timeout_secs, DEFAULT_HEALTH_TIMEOUT_SECS),
+            timeout_secs: resolve_health_timeout(
+                None,
+                global_timeout_secs,
+                DEFAULT_HEALTH_TIMEOUT_SECS,
+            ),
             ..HealthConfig::default()
         },
         vision: parse_vision_partners(&env_string("JESSE_MODEL_LOCAL_VISION").unwrap_or_default()),
@@ -1544,7 +1569,10 @@ pub fn registry_model_from_toml(
     let (id, kind_str, base_url, model) = match (
         id,
         t.kind.as_deref().map(str::trim).filter(|s| !s.is_empty()),
-        t.base_url.as_deref().map(str::trim).filter(|s| !s.is_empty()),
+        t.base_url
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty()),
         t.model.as_deref().map(str::trim).filter(|s| !s.is_empty()),
     ) {
         (Some(id), Some(k), Some(b), Some(m)) => (id, k, b, m),
@@ -1568,7 +1596,12 @@ pub fn registry_model_from_toml(
     if token.is_none() {
         // Present-but-unarmed: log ONCE so a half-configured model is visible, then ship it
         // unconfigured (in the list, not selectable) — never the token, only the var name.
-        match t.auth_token_env.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        match t
+            .auth_token_env
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
             Some(var) => eprintln!(
                 "jesse-bridge: model '{id}' is configured-but-unarmed — its auth_token_env \
                  '{var}' is unset; it appears in the list but is not selectable until armed."
@@ -1692,7 +1725,8 @@ pub fn resolve_model_backend(
     default_base: Option<&str>,
     default_model: Option<&str>,
 ) -> Option<(String, String, String)> {
-    let env_count = env_base.is_some() as u8 + env_token.is_some() as u8 + env_model.is_some() as u8;
+    let env_count =
+        env_base.is_some() as u8 + env_token.is_some() as u8 + env_model.is_some() as u8;
     let base = env_base.or_else(|| default_base.map(str::to_string));
     let model = env_model.or_else(|| default_model.map(str::to_string));
     match (base, env_token, model) {
@@ -1933,7 +1967,14 @@ mod tests {
         );
         // No defaults (e.g. `local`): all three required.
         assert_eq!(
-            resolve_model_backend("local", Some("http://l".into()), Some("t".into()), None, None, None),
+            resolve_model_backend(
+                "local",
+                Some("http://l".into()),
+                Some("t".into()),
+                None,
+                None,
+                None
+            ),
             None,
             "a partial no-default triple is unavailable, never partial"
         );
@@ -1958,7 +1999,10 @@ mod tests {
         assert_eq!(opus.id, "opus");
         assert!(matches!(opus.kind, ModelKind::Ambient));
         assert!(opus.configured && opus.level == Capability::Write);
-        assert!(!r.is_configured("glm-5.2"), "an absent model is not configured");
+        assert!(
+            !r.is_configured("glm-5.2"),
+            "an absent model is not configured"
+        );
     }
 
     #[test]
@@ -2387,9 +2431,12 @@ mod tests {
         // configured-but-unarmed entry — present in the list, not selectable.
         let _g = ENV_LOCK.lock_ok();
         std::env::set_var("JESSE_TEST_DECL_TOKEN", "sk-abc");
-        let armed =
-            registry_model_from_toml(&model_toml("fireworks", "hosted", Some("JESSE_TEST_DECL_TOKEN")), None, None)
-                .expect("a full entry parses");
+        let armed = registry_model_from_toml(
+            &model_toml("fireworks", "hosted", Some("JESSE_TEST_DECL_TOKEN")),
+            None,
+            None,
+        )
+        .expect("a full entry parses");
         assert!(armed.configured, "a set token env arms the model");
         assert_eq!(
             armed.backend,
@@ -2401,17 +2448,27 @@ mod tests {
         );
         assert_eq!(armed.subagent_model.as_deref(), Some("provider/model"));
         assert!(matches!(armed.kind, ModelKind::Hosted));
-        assert_eq!(armed.level, DEFAULT_MODEL_LEVEL, "non-ambient defaults to Read");
+        assert_eq!(
+            armed.level, DEFAULT_MODEL_LEVEL,
+            "non-ambient defaults to Read"
+        );
 
         std::env::remove_var("JESSE_TEST_DECL_TOKEN");
-        let unarmed =
-            registry_model_from_toml(&model_toml("fireworks", "hosted", Some("JESSE_TEST_DECL_TOKEN")), None, None)
-                .expect("still parses, just unarmed");
+        let unarmed = registry_model_from_toml(
+            &model_toml("fireworks", "hosted", Some("JESSE_TEST_DECL_TOKEN")),
+            None,
+            None,
+        )
+        .expect("still parses, just unarmed");
         assert!(!unarmed.configured, "an unset token env → unarmed");
         assert!(unarmed.backend.is_none(), "no backend without a token");
-        assert!(unarmed.subagent_model.is_none(), "no backend-derived subagent model");
+        assert!(
+            unarmed.subagent_model.is_none(),
+            "no backend-derived subagent model"
+        );
 
-        let no_env = registry_model_from_toml(&model_toml("fireworks", "hosted", None), None, None).unwrap();
+        let no_env =
+            registry_model_from_toml(&model_toml("fireworks", "hosted", None), None, None).unwrap();
         assert!(!no_env.configured, "no auth_token_env at all → unarmed");
     }
 
@@ -2559,7 +2616,11 @@ mod tests {
         let m = registry_model_from_toml(&t, None, None).unwrap();
         assert!(matches!(m.kind, ModelKind::Local));
         assert_eq!(m.label, "Codex");
-        assert_eq!(m.subagent_model.as_deref(), Some("gpt-5-mini"), "explicit subagent override");
+        assert_eq!(
+            m.subagent_model.as_deref(),
+            Some("gpt-5-mini"),
+            "explicit subagent override"
+        );
         assert_eq!(m.level, Capability::Write, "declarative level honored");
         assert_eq!(m.price.out_per_m, 8.0);
         assert_eq!(m.health.interval_secs, 30);
@@ -2614,30 +2675,47 @@ mod tests {
         missing_model.model = None;
         assert!(registry_model_from_toml(&missing_model, None, None).is_none());
         // `ambient` is reserved for the built-in opus; an unknown kind is invalid too.
-        assert!(registry_model_from_toml(&model_toml("x", "ambient", Some("V")), None, None).is_none());
-        assert!(registry_model_from_toml(&model_toml("x", "banana", Some("V")), None, None).is_none());
+        assert!(
+            registry_model_from_toml(&model_toml("x", "ambient", Some("V")), None, None).is_none()
+        );
+        assert!(
+            registry_model_from_toml(&model_toml("x", "banana", Some("V")), None, None).is_none()
+        );
     }
 
     #[test]
     fn upsert_replaces_by_id_in_place_and_protects_the_ambient_default() {
         // The merge primitive: later overrides earlier BY ID (in place, stable order), a new
         // id appends, and the ambient `opus` is never replaceable.
-        let mut models = vec![opus_entry(), glm_env_entry(DEFAULT_HEALTH_INTERVAL_SECS, None)]; // glm unconfigured (no env)
+        let mut models = vec![
+            opus_entry(),
+            glm_env_entry(DEFAULT_HEALTH_INTERVAL_SECS, None),
+        ]; // glm unconfigured (no env)
         let mut decl_glm = model_toml("glm-5.2", "hosted", None);
         decl_glm.label = Some("Declared GLM".into());
-        upsert_model(&mut models, registry_model_from_toml(&decl_glm, None, None).unwrap());
+        upsert_model(
+            &mut models,
+            registry_model_from_toml(&decl_glm, None, None).unwrap(),
+        );
         assert_eq!(models.len(), 2, "same id replaces in place, not appends");
         assert_eq!(models[1].id, "glm-5.2");
         assert_eq!(models[1].label, "Declared GLM", "later source wins by id");
 
-        upsert_model(&mut models, registry_model_from_toml(&model_toml("fw", "hosted", None), None, None).unwrap());
+        upsert_model(
+            &mut models,
+            registry_model_from_toml(&model_toml("fw", "hosted", None), None, None).unwrap(),
+        );
         assert_eq!(models.len(), 3, "a new id appends");
 
         // An entry that tries to redefine opus is refused; opus stays the built-in ambient.
-        let fake_opus = registry_model_from_toml(&model_toml("opus", "hosted", None), None, None).unwrap();
+        let fake_opus =
+            registry_model_from_toml(&model_toml("opus", "hosted", None), None, None).unwrap();
         upsert_model(&mut models, fake_opus);
         assert_eq!(models.iter().filter(|m| m.id == "opus").count(), 1);
-        assert!(matches!(models[0].kind, ModelKind::Ambient), "opus stays ambient");
+        assert!(
+            matches!(models[0].kind, ModelKind::Ambient),
+            "opus stays ambient"
+        );
     }
 
     #[test]
@@ -2663,10 +2741,19 @@ mod tests {
         assert!(matches!(r.models[0].kind, ModelKind::Ambient));
         assert!(r.is_configured("opus"), "opus is the only configured model");
         for id in ["glm-5.2", "kimi-k3", "kimi-k3-codex", "local"] {
-            let m = r.get(id).unwrap_or_else(|| panic!("{id} preserved as a placeholder"));
-            assert!(!m.configured, "{id} is present but not configured with no env");
+            let m = r
+                .get(id)
+                .unwrap_or_else(|| panic!("{id} preserved as a placeholder"));
+            assert!(
+                !m.configured,
+                "{id} is present but not configured with no env"
+            );
         }
-        assert_eq!(r.models.len(), 5, "no declarative entries appear with no config");
+        assert_eq!(
+            r.models.len(),
+            5,
+            "no declarative entries appear with no config"
+        );
 
         for (k, v) in saved {
             match v {
@@ -2700,7 +2787,10 @@ mod tests {
         let anthropic = r.get("kimi-k3").expect("the Anthropic-surface entry");
         let codex = r.get("kimi-k3-codex").expect("the Codex-surface entry");
 
-        assert!(anthropic.configured && codex.configured, "one key arms both");
+        assert!(
+            anthropic.configured && codex.configured,
+            "one key arms both"
+        );
 
         // Different SURFACE — the whole point of the step.
         assert!(matches!(anthropic.kind, ModelKind::Hosted));
@@ -2779,11 +2869,15 @@ mod tests {
         // GLM is fine with — otherwise a reachable K3 probes as unhealthy and never appears
         // in the picker. `JESSE_HEALTH_TIMEOUT_SECS` overrides both.
         assert_eq!(
-            kimi_env_entry(DEFAULT_HEALTH_INTERVAL_SECS, None).health.timeout_secs,
+            kimi_env_entry(DEFAULT_HEALTH_INTERVAL_SECS, None)
+                .health
+                .timeout_secs,
             REASONING_HEALTH_TIMEOUT_SECS
         );
         assert_eq!(
-            glm_env_entry(DEFAULT_HEALTH_INTERVAL_SECS, None).health.timeout_secs,
+            glm_env_entry(DEFAULT_HEALTH_INTERVAL_SECS, None)
+                .health
+                .timeout_secs,
             DEFAULT_HEALTH_TIMEOUT_SECS
         );
         // (That REASONING_HEALTH_TIMEOUT_SECS exceeds the default is an invariant of the two
@@ -2794,7 +2888,11 @@ mod tests {
             glm_env_entry(DEFAULT_HEALTH_INTERVAL_SECS, Some(25)),
             local_env_entry(DEFAULT_HEALTH_INTERVAL_SECS, Some(25)),
         ] {
-            assert_eq!(entry.health.timeout_secs, 25, "{} honors the override", entry.id);
+            assert_eq!(
+                entry.health.timeout_secs, 25,
+                "{} honors the override",
+                entry.id
+            );
         }
     }
 
@@ -2806,7 +2904,14 @@ mod tests {
         let _g = ENV_LOCK.lock_ok();
         let saved: Vec<(&str, Option<String>)> = MODEL_ENV_VARS
             .iter()
-            .chain(["JESSE_CONFIG", "JESSE_STATE_DIR", "JESSE_HEALTH_INTERVAL_SECS"].iter())
+            .chain(
+                [
+                    "JESSE_CONFIG",
+                    "JESSE_STATE_DIR",
+                    "JESSE_HEALTH_INTERVAL_SECS",
+                ]
+                .iter(),
+            )
             .map(|k| (*k, std::env::var(k).ok()))
             .collect();
         for k in MODEL_ENV_VARS {

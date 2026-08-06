@@ -78,7 +78,9 @@ impl Scratch {
         cfg.timeout_secs = 300;
         // Both harnesses registered, exactly as a deploy with a Codex model configured
         // builds it. The concurrency test depends on this being one shared registry.
-        cfg.harnesses = Arc::new(HarnessRegistry::for_models(KNOWN_HARNESS_IDS.iter().copied()));
+        cfg.harnesses = Arc::new(HarnessRegistry::for_models(
+            KNOWN_HARNESS_IDS.iter().copied(),
+        ));
         cfg
     }
 }
@@ -125,7 +127,10 @@ async fn turn(
     ));
     jobs.stream_register(jid);
     let spawned = SpawnedSessions::new();
-    let out = run_claude_streaming(cfg, prompt, None, &jobs, jid, model, harness, &spawned, None, None).await;
+    let out = run_claude_streaming(
+        cfg, prompt, None, &jobs, jid, model, harness, &spawned, None, None,
+    )
+    .await;
     jobs.stream_finish(jid, StreamFrame::Cancelled);
     out.map(|(text, _session, _usage)| text)
 }
@@ -170,8 +175,11 @@ async fn a_write_level_codex_turn_changes_the_vault_and_the_change_persists() {
     let scratch = Scratch::new("positive");
     let cfg = scratch.config();
     let note = scratch.vault.join("note.md");
-    std::fs::write(&note, "# Cadence\n\nThe agreed cadence is every second Tuesday.\n")
-        .expect("seed the note");
+    std::fs::write(
+        &note,
+        "# Cadence\n\nThe agreed cadence is every second Tuesday.\n",
+    )
+    .expect("seed the note");
 
     let text = turn(
         &cfg,
@@ -347,9 +355,10 @@ async fn a_write_level_codex_turn_is_denied_every_write_outside_the_vault() {
 async fn both_harnesses_serve_concurrently_with_codex_at_write() {
     let scratch = Scratch::new("concurrent");
     let mut cfg = scratch.config();
-    cfg.claude_bin = std::env::var("JESSE_CLAUDE_BIN")
-        .expect("set JESSE_CLAUDE_BIN to the pinned claude binary — the one on PATH is often a \
-                 stale nvm shim");
+    cfg.claude_bin = std::env::var("JESSE_CLAUDE_BIN").expect(
+        "set JESSE_CLAUDE_BIN to the pinned claude binary — the one on PATH is often a \
+                 stale nvm shim",
+    );
 
     // Two vaults, two facts. Each child can only answer its own question correctly.
     let codex_vault = scratch.vault.clone();

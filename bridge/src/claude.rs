@@ -275,9 +275,7 @@ async fn run_stateless_oneshot(
                 }
                 // A one-shot child (title / diet / vault-QA) is not a conversation, so the
                 // session it names is nothing this path binds.
-                StreamEvent::SessionId(_)
-                | StreamEvent::ToolActivity(_)
-                | StreamEvent::Ignore => {}
+                StreamEvent::SessionId(_) | StreamEvent::ToolActivity(_) | StreamEvent::Ignore => {}
             }
         }
         Ok::<(Option<ClaudeOutcome>, String), ApiError>((terminal, streamed))
@@ -787,9 +785,7 @@ mod tests {
             match parser.on_line(line) {
                 StreamEvent::TextDelta(t) => streamed.push_str(&t),
                 StreamEvent::Done(o) => terminal = Some(o),
-                StreamEvent::SessionId(_)
-                | StreamEvent::ToolActivity(_)
-                | StreamEvent::Ignore => {}
+                StreamEvent::SessionId(_) | StreamEvent::ToolActivity(_) | StreamEvent::Ignore => {}
             }
         }
         resolve_stream_outcome(ClaudeCode.id(), terminal, &streamed, stderr)

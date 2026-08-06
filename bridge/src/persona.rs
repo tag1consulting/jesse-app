@@ -242,7 +242,9 @@ fn load_local_persona(home: &str) -> Option<PersonaToml> {
 /// list and the registry falls back to the env triples + built-in opus). Each entry is
 /// validated in [`registry_model_from_toml`], so a partial entry is skipped there, not here.
 pub fn load_local_models(home: &str) -> Vec<ModelToml> {
-    load_local_config(home).map(|c| c.models).unwrap_or_default()
+    load_local_config(home)
+        .map(|c| c.models)
+        .unwrap_or_default()
 }
 
 /// Read the `[concurrency]` table from the same overlay file.
@@ -348,7 +350,10 @@ mod tests {
             "The user is ASKING from their phone."
         );
         // A no-placeholder override (an app-supplied wrapper) is untouched.
-        assert_eq!(p.render("Custom wrapper, no tokens."), "Custom wrapper, no tokens.");
+        assert_eq!(
+            p.render("Custom wrapper, no tokens."),
+            "Custom wrapper, no tokens."
+        );
     }
 
     #[test]

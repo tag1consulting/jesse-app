@@ -468,7 +468,9 @@ pub fn prepare_attachments_for_harness(
         }
         match ext.as_str() {
             "heic" => {
-                let jpg = scratch.path.join(format!("{label:02}-{}.jpg", random_hex()));
+                let jpg = scratch
+                    .path
+                    .join(format!("{label:02}-{}.jpg", random_hex()));
                 convert_heic_to_jpeg(p, &jpg).map_err(|e| {
                     (
                         StatusCode::INTERNAL_SERVER_ERROR,
@@ -505,13 +507,17 @@ pub fn prepare_attachments_for_harness(
                         )
                     })?;
                 for (n, page) in r.pages.iter().enumerate() {
-                    let png = scratch
-                        .path
-                        .join(format!("{label:02}-p{:02}-{}.png", n + 1, random_hex()));
+                    let png =
+                        scratch
+                            .path
+                            .join(format!("{label:02}-p{:02}-{}.png", n + 1, random_hex()));
                     write_scratch_file(&png, page).map_err(|e| {
                         (
                             StatusCode::INTERNAL_SERVER_ERROR,
-                            format!("attachment {label}: could not write PDF page {} ({e})", n + 1),
+                            format!(
+                                "attachment {label}: could not write PDF page {} ({e})",
+                                n + 1
+                            ),
                         )
                     })?;
                     out.push(png);
@@ -900,10 +906,7 @@ mod tests {
             "a resolving vision partner on a turn with nothing attached is still nothing to do"
         );
         // Attachments + a RESOLVING partner → the bridge transcribes; no file is written.
-        assert_eq!(
-            attachment_route(true, true),
-            AttachmentRoute::VisionHelper
-        );
+        assert_eq!(attachment_route(true, true), AttachmentRoute::VisionHelper);
         // Attachments + no resolving partner (ambient opus, or a paired-but-broken helper)
         // → the child reads the files itself. This is the route the read grant serves.
         assert_eq!(
@@ -991,7 +994,9 @@ mod tests {
             .arg(&heic)
             .output();
         let have_heic = matches!(&made, Ok(o) if o.status.success())
-            && std::fs::metadata(&heic).map(|m| m.len() > 0).unwrap_or(false);
+            && std::fs::metadata(&heic)
+                .map(|m| m.len() > 0)
+                .unwrap_or(false);
         if !have_heic {
             eprintln!("skipping heic transcode: this platform's sips cannot write HEIC");
             return;
@@ -1008,7 +1013,10 @@ mod tests {
                 Some("jpg"),
                 "heic must be handed over as JPEG"
             );
-            assert_ne!(p, &heic, "the original HEIC must not be named in the prompt");
+            assert_ne!(
+                p, &heic,
+                "the original HEIC must not be named in the prompt"
+            );
             // A real JPEG, not an empty file sips exited 0 over.
             let converted = std::fs::read(p).expect("converted file");
             assert!(
@@ -1035,7 +1043,10 @@ mod tests {
         let (s1, paths) = staged("01-aa.pdf", PDF_BYTES);
         let cc = prepare_attachments_for_harness(&cfg, &s1, &paths, &CLAUDE_CODE_ATTACHMENTS)
             .expect("Claude Code reads a PDF directly");
-        assert_eq!(cc.paths, paths, "no conversion on the harness that can read it");
+        assert_eq!(
+            cc.paths, paths,
+            "no conversion on the harness that can read it"
+        );
 
         let (s2, paths2) = staged("01-aa.pdf", PDF_BYTES);
         match prepare_attachments_for_harness(&cfg, &s2, &paths2, &CODEX_ATTACHMENTS) {
@@ -1045,7 +1056,10 @@ mod tests {
                 for p in &out.paths {
                     assert_eq!(p.extension().and_then(|e| e.to_str()), Some("png"));
                 }
-                assert!(!out.paths.contains(&paths2[0]), "the PDF itself is not named");
+                assert!(
+                    !out.paths.contains(&paths2[0]),
+                    "the PDF itself is not named"
+                );
             }
             // pdfium absent: LOUD, and the message must say what to do about it.
             Err((code, msg)) => {
@@ -1131,9 +1145,11 @@ mod tests {
     fn a_page_cap_truncation_note_reaches_the_prompt() {
         let prepared = PreparedAttachments {
             paths: vec![PathBuf::from("/tmp/a/01-p01-x.png")],
-            notes: vec!["attachment 1 is a 30-page PDF; only the first 10 page(s) are attached \
+            notes: vec![
+                "attachment 1 is a 30-page PDF; only the first 10 page(s) are attached \
                          as images"
-                .to_string()],
+                    .to_string(),
+            ],
         };
         let s = attachment_prompt_suffix(&prepared, CODEX_ATTACHMENTS.instruction);
         assert!(s.contains("30-page PDF"), "{s}");

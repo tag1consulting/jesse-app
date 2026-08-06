@@ -49,10 +49,7 @@ impl ModelStore {
     /// configured. An unreadable/absent/garbage file loads as the default (`opus`, no
     /// overrides), never an error.
     pub fn new(path: Option<PathBuf>) -> Self {
-        let state = path
-            .as_deref()
-            .and_then(load_selection)
-            .unwrap_or_default();
+        let state = path.as_deref().and_then(load_selection).unwrap_or_default();
         ModelStore {
             state: Mutex::new(state),
             path,
@@ -84,7 +81,6 @@ impl ModelStore {
         }
         snapshot.active
     }
-
 }
 
 /// Load the selection from disk, tolerating corruption by returning `None` (→ the

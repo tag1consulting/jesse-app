@@ -302,10 +302,10 @@ mod tests {
     fn cfg_with_codex_first() -> Config {
         let mut m = model("codex-mini", Capability::Read);
         m.harness = CODEX_ID.to_string();
-        let mut cfg = cfg_with(vec![m, model("local-oss", Capability::Read)], &[
-            "codex-mini",
-            "local-oss",
-        ]);
+        let mut cfg = cfg_with(
+            vec![m, model("local-oss", Capability::Read)],
+            &["codex-mini", "local-oss"],
+        );
         cfg.harnesses = Arc::new(HarnessRegistry::new(vec![Box::new(Codex)]));
         cfg
     }
@@ -322,7 +322,11 @@ mod tests {
         let cfg = cfg_with_codex_first();
         let health = all_healthy(&cfg);
         for job in [RoutedJob::Title, RoutedJob::DietExtract] {
-            assert_eq!(job.required(), Capability::Basic, "precondition for {job:?}");
+            assert_eq!(
+                job.required(),
+                Capability::Basic,
+                "precondition for {job:?}"
+            );
             let picked = pick_offload_model(&cfg, &health, job.required(), None)
                 .expect("the next candidate serves it");
             assert_eq!(
@@ -382,7 +386,10 @@ mod tests {
     #[test]
     fn the_walk_takes_the_first_qualifying_candidate() {
         let cfg = cfg_with(
-            vec![model("local", Capability::Read), model("glm", Capability::Write)],
+            vec![
+                model("local", Capability::Read),
+                model("glm", Capability::Write),
+            ],
             &["local", "glm"],
         );
         let pick = pick_offload_model(&cfg, &all_healthy(&cfg), Capability::Read, None)
@@ -424,7 +431,10 @@ mod tests {
     #[test]
     fn an_unhealthy_first_candidate_falls_through_to_the_next() {
         let cfg = cfg_with(
-            vec![model("local", Capability::Write), model("glm", Capability::Write)],
+            vec![
+                model("local", Capability::Write),
+                model("glm", Capability::Write),
+            ],
             &["local", "glm"],
         );
         let health = all_healthy(&cfg);
@@ -438,15 +448,20 @@ mod tests {
         // The diet-verify rule: the model that served the extraction is out of the running,
         // so it cannot verify its own work.
         let cfg = cfg_with(
-            vec![model("local", Capability::Write), model("glm", Capability::Write)],
+            vec![
+                model("local", Capability::Write),
+                model("glm", Capability::Write),
+            ],
             &["local", "glm"],
         );
-        let pick = pick_offload_model(&cfg, &all_healthy(&cfg), Capability::Write, Some("local")).unwrap();
+        let pick =
+            pick_offload_model(&cfg, &all_healthy(&cfg), Capability::Write, Some("local")).unwrap();
         assert_eq!(pick.id, "glm");
         // With only the extractor qualifying, nothing does.
         let cfg = cfg_with(vec![model("local", Capability::Write)], &["local"]);
         assert!(
-            pick_offload_model(&cfg, &all_healthy(&cfg), Capability::Write, Some("local")).is_none(),
+            pick_offload_model(&cfg, &all_healthy(&cfg), Capability::Write, Some("local"))
+                .is_none(),
             "a lone extractor cannot verify itself"
         );
     }
@@ -477,10 +492,22 @@ mod tests {
         convo.level = Capability::Read;
         convo.env = Some(("http://glm".into(), "tok".into(), "glm-v1".into()));
         // A Read conversation model serves a Read job…
-        let pick = route_job(&cfg, &all_healthy(&cfg), RoutedJob::VaultQa, Some(&convo), None);
+        let pick = route_job(
+            &cfg,
+            &all_healthy(&cfg),
+            RoutedJob::VaultQa,
+            Some(&convo),
+            None,
+        );
         assert_eq!(pick.id, "glm");
         // …but not a Write one; that falls through to ambient.
-        let pick = route_job(&cfg, &all_healthy(&cfg), RoutedJob::DietVerify, Some(&convo), None);
+        let pick = route_job(
+            &cfg,
+            &all_healthy(&cfg),
+            RoutedJob::DietVerify,
+            Some(&convo),
+            None,
+        );
         assert_eq!(pick.id, DEFAULT_MODEL_ID);
     }
 
@@ -527,11 +554,29 @@ mod tests {
 
         // 2. The local routes stay DORMANT, so every Tell and Ask takes the hosted path —
         //    the kill switch an unset role triple used to be.
-        assert!(!has_offload_candidate(&cfg, &health, RoutedJob::DietExtract));
+        assert!(!has_offload_candidate(
+            &cfg,
+            &health,
+            RoutedJob::DietExtract
+        ));
         assert!(!has_offload_candidate(&cfg, &health, RoutedJob::VaultQa));
-        assert!(!should_try_local_diet(&cfg, &health, "tell", "logged a banana"));
-        assert!(!should_try_local_vaultqa(&cfg, &health, "ask", "what is my vo2 max", false));
-        assert!(!emergency_armed(&cfg, &health), "emergency needs a candidate too");
+        assert!(!should_try_local_diet(
+            &cfg,
+            &health,
+            "tell",
+            "logged a banana"
+        ));
+        assert!(!should_try_local_vaultqa(
+            &cfg,
+            &health,
+            "ask",
+            "what is my vo2 max",
+            false
+        ));
+        assert!(
+            !emergency_armed(&cfg, &health),
+            "emergency needs a candidate too"
+        );
 
         // 3. The ambient default still backs a conversation at Write, so a main turn is
         //    granted exactly what it was.
@@ -576,5 +621,4 @@ mod tests {
             "an unhealthy conversation model stays selected; the walk must not adopt it"
         );
     }
-
 }

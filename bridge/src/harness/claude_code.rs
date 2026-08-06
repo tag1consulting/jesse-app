@@ -453,7 +453,9 @@ pub fn main_mcp_config<'a>(cfg: &'a Config, harness: &dyn Harness) -> &'a str {
 /// The MCP server set for the vault-QA child (and the shadow child, which shares its
 /// builder): `JESSE_VAULTQA_MCP_CONFIG` when set, else NO servers.
 pub fn vaultqa_mcp_config(cfg: &Config) -> &str {
-    cfg.vaultqa_mcp_config.as_deref().unwrap_or(EMPTY_MCP_CONFIG)
+    cfg.vaultqa_mcp_config
+        .as_deref()
+        .unwrap_or(EMPTY_MCP_CONFIG)
 }
 
 // ---- Capability → containment flags -----------------------------------------
@@ -796,7 +798,11 @@ pub fn build_claude_args(
 /// (plus `Bash`, which writes through a command string this cannot parse); `PostToolUse` adds
 /// `Read`, whose only job is to record the compare-and-swap baseline.
 pub fn install_write_lock_settings(cfg: &Config, wl: &WriteLockChild) -> Option<PathBuf> {
-    let dir = cfg.state_dir.as_deref().map(PathBuf::from)?.join("claude-settings");
+    let dir = cfg
+        .state_dir
+        .as_deref()
+        .map(PathBuf::from)?
+        .join("claude-settings");
     std::fs::create_dir_all(&dir).ok()?;
     let path = dir.join(format!("{}.json", wl.turn));
     let doc = json!({
@@ -819,7 +825,11 @@ pub fn install_write_lock_settings(cfg: &Config, wl: &WriteLockChild) -> Option<
 /// that no longer exists), so a failure here is not worth failing a turn over.
 pub fn remove_write_lock_settings(cfg: &Config, turn: &str) {
     if let Some(dir) = cfg.state_dir.as_deref() {
-        let _ = std::fs::remove_file(PathBuf::from(dir).join("claude-settings").join(format!("{turn}.json")));
+        let _ = std::fs::remove_file(
+            PathBuf::from(dir)
+                .join("claude-settings")
+                .join(format!("{turn}.json")),
+        );
     }
 }
 
@@ -1101,7 +1111,15 @@ mod tests {
     #[test]
     fn build_claude_args_enforces_least_privilege() {
         let cfg = test_config();
-        let args = build_claude_args(&cfg, "hello", None, Capability::Write, main_mcp_config(&cfg, &ClaudeCode), None, None);
+        let args = build_claude_args(
+            &cfg,
+            "hello",
+            None,
+            Capability::Write,
+            main_mcp_config(&cfg, &ClaudeCode),
+            None,
+            None,
+        );
 
         // --allowedTools is always present, with the configured list as its value.
         let idx = args
@@ -1239,9 +1257,7 @@ mod tests {
             .collect()
     }
 
-
     // ---- Diet extract/verify children --------------------------------------
-
 
     /// Extract the value following a flag in a Command's argv, or `None`.
     fn cmd_arg_value(cmd: &Command, flag: &str) -> Option<String> {
@@ -1527,7 +1543,6 @@ mod tests {
 
     // ---- Vault-QA child ----------------------------------------------------
 
-
     // ---- The global model switch (main-turn model application) --------------
 
     /// A resolved non-ambient (GLM) active model for the switch tests, with an env triple
@@ -1756,7 +1771,15 @@ mod tests {
         let ridx = args.iter().position(|a| a == "--resume").expect("--resume");
         assert_eq!(args[ridx + 1], "sess-42");
         // No --resume without a session id.
-        let none = build_claude_args(&cfg, "hi", None, Capability::Write, main_mcp_config(&cfg, &ClaudeCode), None, None);
+        let none = build_claude_args(
+            &cfg,
+            "hi",
+            None,
+            Capability::Write,
+            main_mcp_config(&cfg, &ClaudeCode),
+            None,
+            None,
+        );
         assert!(!none.iter().any(|a| a == "--resume"));
     }
     #[test]
@@ -1938,7 +1961,10 @@ mod tests {
             assert_eq!(values, 2, "a symlinked temp dir passes both spellings");
             assert_eq!(attached[at + 2], real.display().to_string());
         } else {
-            assert_eq!(values, 1, "no distinct realpath means one value, not a duplicate");
+            assert_eq!(
+                values, 1,
+                "no distinct realpath means one value, not a duplicate"
+            );
         }
 
         // …and NOTHING else changed: strip the flag and its values and the two argvs are
@@ -1985,7 +2011,10 @@ mod tests {
                 .iter()
                 .take_while(|a| !a.starts_with("--"))
                 .count();
-            assert!(values >= 1, "{label}: --add-dir must name a directory: {args:?}");
+            assert!(
+                values >= 1,
+                "{label}: --add-dir must name a directory: {args:?}"
+            );
             assert!(
                 at + 1 + values < args.len(),
                 "{label}: --add-dir's variadic list must be terminated by a following flag, \
@@ -2202,7 +2231,9 @@ mod tests {
                 main_mcp_config(&cfg, &ClaudeCode),
             );
             same(
-                &harness.build_turn(&cfg, &req).expect("claude never refuses"),
+                &harness
+                    .build_turn(&cfg, &req)
+                    .expect("claude never refuses"),
                 &build_claude_command(
                     &cfg,
                     "PROMPT",
@@ -2419,5 +2450,4 @@ mod tests {
         );
         assert!(cmd_has_flag(&cmd, "--strict-mcp-config"));
     }
-
 }

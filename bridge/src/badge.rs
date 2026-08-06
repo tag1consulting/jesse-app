@@ -338,7 +338,12 @@ mod tests {
         let health = seeded_health(&cfg);
         cfg.model_badge = false;
         assert_eq!(
-            model_badge_line(&cfg, &health, BadgeSource::Hosted, &hb("opus", false, Some(0.01))),
+            model_badge_line(
+                &cfg,
+                &health,
+                BadgeSource::Hosted,
+                &hb("opus", false, Some(0.01))
+            ),
             None
         );
         assert_eq!(
@@ -389,23 +394,46 @@ mod tests {
         );
         // Opus with a cost.
         assert_eq!(
-            model_badge_line(&cfg, &health, BadgeSource::Hosted, &hb("opus", false, Some(0.0123))).unwrap(),
+            model_badge_line(
+                &cfg,
+                &health,
+                BadgeSource::Hosted,
+                &hb("opus", false, Some(0.0123))
+            )
+            .unwrap(),
             "[opus · $0.0123]"
         );
         // A switched hosted model, read-only.
         assert_eq!(
-            model_badge_line(&cfg, &health, BadgeSource::Hosted, &hb("glm-5.2", false, Some(0.0021)))
-                .unwrap(),
+            model_badge_line(
+                &cfg,
+                &health,
+                BadgeSource::Hosted,
+                &hb("glm-5.2", false, Some(0.0021))
+            )
+            .unwrap(),
             "[glm-5.2 · $0.0021]"
         );
         // A switched hosted model WITH write access (Phase 2 marker).
         assert_eq!(
-            model_badge_line(&cfg, &health, BadgeSource::Hosted, &hb("glm-5.2", true, Some(0.0021))).unwrap(),
+            model_badge_line(
+                &cfg,
+                &health,
+                BadgeSource::Hosted,
+                &hb("glm-5.2", true, Some(0.0021))
+            )
+            .unwrap(),
             "[glm-5.2 · write · $0.0021]"
         );
         // A free local model reads $0.0000.
         assert_eq!(
-            model_badge_line(&cfg, &health, BadgeSource::Hosted, &hb("local", false, Some(0.0))).unwrap(),
+            model_badge_line(
+                &cfg,
+                &health,
+                BadgeSource::Hosted,
+                &hb("local", false, Some(0.0))
+            )
+            .unwrap(),
             "[local · $0.0000]"
         );
     }
@@ -589,7 +617,8 @@ mod tests {
             assert_eq!(p.cost_usd, c.cost, "cost rides the hosted route only");
             assert_eq!(p.badge, c.badge, "badge byte-identical to the text badge");
             // The badge string embedded in provenance is exactly what finalize appends.
-            let finalized = finalize_reply_badge(ok("Body."), &cfg, &health, c.source, &c.hosted).unwrap();
+            let finalized =
+                finalize_reply_badge(ok("Body."), &cfg, &health, c.source, &c.hosted).unwrap();
             assert_eq!(
                 finalized.0,
                 format!("Body.\n\n{}", p.badge),

@@ -161,7 +161,10 @@ fn main() {
                 .hook_read_target(&payload)
                 .map(|p| p.display().to_string()),
         },
-        other => deny(&args.harness, &format!("jesse-hook: unknown event '{other}'")),
+        other => deny(
+            &args.harness,
+            &format!("jesse-hook: unknown event '{other}'"),
+        ),
     };
 
     let resp = ask_broker_blocking(&socket, &req);

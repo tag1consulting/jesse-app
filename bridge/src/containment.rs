@@ -853,10 +853,7 @@ mod tests {
         // The corrected row key: `Read` names TWO containments (the main read-only turn with
         // qmd, the vault-QA child with no servers), so one `Read` row would describe a
         // posture that was never probed.
-        let cc: Vec<String> = CLAUDE_CODE_SHIPPED_ROWS
-            .iter()
-            .map(|r| r.label())
-            .collect();
+        let cc: Vec<String> = CLAUDE_CODE_SHIPPED_ROWS.iter().map(|r| r.label()).collect();
         assert_eq!(
             cc,
             vec![
@@ -871,10 +868,7 @@ mod tests {
         // whole point of splitting them is that one harness gaining a server must not move
         // the other's row keys, and a shared assertion would hide exactly that.
         let cx: Vec<String> = CODEX_SHIPPED_ROWS.iter().map(|r| r.label()).collect();
-        assert_eq!(
-            cx,
-            vec!["basic/none", "read/none", "read/qmd", "write/qmd"]
-        );
+        assert_eq!(cx, vec!["basic/none", "read/none", "read/qmd", "write/qmd"]);
     }
 
     #[test]
@@ -888,7 +882,10 @@ mod tests {
             "write_escape_state_dir",
             "write_escape_delegated",
         ] {
-            for r in CLAUDE_CODE_SHIPPED_ROWS.iter().chain(CODEX_SHIPPED_ROWS.iter()) {
+            for r in CLAUDE_CODE_SHIPPED_ROWS
+                .iter()
+                .chain(CODEX_SHIPPED_ROWS.iter())
+            {
                 assert_eq!(
                     hard_gate_requirement(id, ProbeClass::HardGate, r),
                     Some(ProbeVerdict::Denied),
@@ -909,7 +906,11 @@ mod tests {
             "write_vault_file",
         ] {
             assert_eq!(
-                hard_gate_requirement(id, ProbeClass::HardGate, &row(Capability::Basic, McpSet::None)),
+                hard_gate_requirement(
+                    id,
+                    ProbeClass::HardGate,
+                    &row(Capability::Basic, McpSet::None)
+                ),
                 Some(ProbeVerdict::Denied),
                 "{id} must fail at Basic"
             );
@@ -1088,7 +1089,10 @@ mod tests {
         let mut named = sample_results();
         named.model = Some("kimi-k3-codex".to_string());
         let rendered = render_results(&named);
-        assert!(rendered.contains(r#"model = "kimi-k3-codex""#), "{rendered}");
+        assert!(
+            rendered.contains(r#"model = "kimi-k3-codex""#),
+            "{rendered}"
+        );
         assert_eq!(parse_results(&rendered).expect("must parse"), named);
 
         // …and the converse, which is what keeps every record written before the seam
@@ -1124,7 +1128,10 @@ mod tests {
         assert!(rendered.contains("[[accepted]]"), "{rendered}");
         assert!(rendered.contains("decided_by"), "{rendered}");
         // …and the file explains what the key does and does not mean.
-        assert!(rendered.contains("IS A DECISION, NOT A VERDICT"), "{rendered}");
+        assert!(
+            rendered.contains("IS A DECISION, NOT A VERDICT"),
+            "{rendered}"
+        );
     }
 
     #[test]
@@ -1139,7 +1146,10 @@ mod tests {
         assert_eq!(accepted.gate, bare.gate);
         assert_eq!(accepted.rows, bare.rows);
         assert!(accepted.rows[0].probes[1].is_known_open());
-        assert!(compare_results(&bare, &accepted).is_empty(), "drift is verdict-only");
+        assert!(
+            compare_results(&bare, &accepted).is_empty(),
+            "drift is verdict-only"
+        );
         // Scoring never consults an acceptance: same inputs, same status.
         accepted.accepted.clear();
         assert!(accepted.rows[0].probes[1].is_known_open());
@@ -1149,7 +1159,11 @@ mod tests {
     fn an_open_baseline_nobody_signed_for_is_named() {
         let mut r = sample_results();
         // The sample accepts network_outbound at read/qmd, which is its one open baseline.
-        assert!(r.unaccepted_known_open().is_empty(), "{:?}", r.unaccepted_known_open());
+        assert!(
+            r.unaccepted_known_open().is_empty(),
+            "{:?}",
+            r.unaccepted_known_open()
+        );
         // Acceptance is per ROW: the same probe open at a row nobody signed for is unsigned.
         r.accepted[0].rows = vec!["write/qmd".to_string()];
         let unsigned = r.unaccepted_known_open();
@@ -1175,9 +1189,12 @@ mod tests {
         let r = sample_results();
         // Keyed off the constant, not a literal: this test silently stopped forging anything
         // the last time the schema was bumped.
-        let rendered = render_results(&r)
-            .replace(&format!("schema = {RESULTS_SCHEMA}"), "schema = 99");
-        assert!(rendered.contains("schema = 99"), "the forgery must have landed");
+        let rendered =
+            render_results(&r).replace(&format!("schema = {RESULTS_SCHEMA}"), "schema = 99");
+        assert!(
+            rendered.contains("schema = 99"),
+            "the forgery must have landed"
+        );
         let err = parse_results(&rendered).expect_err("a foreign schema must not parse");
         assert!(err.contains("schema"), "{err}");
     }

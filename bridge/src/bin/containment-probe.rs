@@ -273,7 +273,10 @@ async fn main() {
         // closed — but it must not be left to imply a risk nobody is carrying any more.
         let stale = fresh.stale_acceptances();
         if !stale.is_empty() {
-            eprintln!("\nSTALE ACCEPTANCES ({}) — remove them on purpose:", stale.len());
+            eprintln!(
+                "\nSTALE ACCEPTANCES ({}) — remove them on purpose:",
+                stale.len()
+            );
             for s in &stale {
                 eprintln!("  ~ {s}");
             }

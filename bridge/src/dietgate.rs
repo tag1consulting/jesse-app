@@ -133,9 +133,9 @@ const DIET_KEYWORDS: &[&str] = &[
 /// is a safe, cheap fall-through. `extra` is empty on a fresh clone, so the baseline
 /// behavior is unchanged unless a local config adds vocabulary.
 pub fn diet_intent(text: &str, extra: &[String]) -> bool {
-    tokens(text).iter().any(|t| {
-        DIET_KEYWORDS.contains(&t.as_str()) || extra.iter().any(|e| e == t)
-    })
+    tokens(text)
+        .iter()
+        .any(|t| DIET_KEYWORDS.contains(&t.as_str()) || extra.iter().any(|e| e == t))
 }
 
 /// Tokenize into lowercased alphanumeric words (unicode-aware), so keyword matching
@@ -159,12 +159,7 @@ pub fn diet_gate_matches(mode: &str, text: &str, extra: &[String]) -> bool {
 /// English baseline plus the deployment's `persona.diet_keywords_extra`). With no
 /// backend this is always `false`, so every Tell takes today's hosted path
 /// byte-for-byte — the seam is the kill switch.
-pub fn should_try_local_diet(
-    cfg: &Config,
-    health: &HealthStore,
-    mode: &str,
-    text: &str,
-) -> bool {
+pub fn should_try_local_diet(cfg: &Config, health: &HealthStore, mode: &str, text: &str) -> bool {
     // The kill switch is now `offload_order`: with no candidate for the extraction, every
     // Tell takes the hosted path byte-for-byte, exactly as an unset `JESSE_DIET_*` triple
     // did before this key existed.
@@ -230,7 +225,10 @@ mod tests {
     #[test]
     fn gate_ignores_non_diet_tells() {
         for u in MISSES {
-            assert!(!diet_intent(u, NO_EXTRA), "should NOT detect diet intent: {u:?}");
+            assert!(
+                !diet_intent(u, NO_EXTRA),
+                "should NOT detect diet intent: {u:?}"
+            );
         }
     }
 
@@ -249,7 +247,10 @@ mod tests {
     fn whole_token_matching_avoids_substring_false_positives() {
         // 'ate' is a keyword, but 'escalate'/'plate'/'later' contain it and must not
         // match; likewise 'eat' inside 'weather'/'theater'.
-        assert!(!diet_intent("please escalate this and update later", NO_EXTRA));
+        assert!(!diet_intent(
+            "please escalate this and update later",
+            NO_EXTRA
+        ));
         assert!(!diet_intent("the theater weather was fine", NO_EXTRA));
         // The bare keyword as its own word does match.
         assert!(diet_intent("I ate lunch", NO_EXTRA));
@@ -271,7 +272,7 @@ mod tests {
         assert!(diet_intent("solo una colazione leggera", &extra));
         assert!(!diet_intent("just Tacos please", NO_EXTRA)); // baseline misses it
         assert!(diet_intent("just Tacos please", &extra)); // extra catches it
-        // A word not in baseline or extras still misses (whole-token, no substring).
+                                                           // A word not in baseline or extras still misses (whole-token, no substring).
         assert!(!diet_intent("pranzoni enormi", &extra)); // 'pranzoni' != 'pranzo'
     }
 

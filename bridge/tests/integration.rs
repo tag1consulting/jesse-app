@@ -331,11 +331,7 @@ async fn cancel_running_turn_kills_child_and_frees_slot() {
     let body: Value = serde_json::from_str(&body_string(resp).await).unwrap();
     let job_id = body["job_id"].as_str().unwrap().to_string();
     // The turn holds the only permit while it runs.
-    assert_eq!(
-        st.slots.ceiling_free(),
-        0,
-        "running turn holds the permit"
-    );
+    assert_eq!(st.slots.ceiling_free(), 0, "running turn holds the permit");
 
     // Cancel it.
     let resp = app(st.clone())
@@ -861,7 +857,7 @@ async fn queue_full_sheds_with_429() {
     let cfg = Config {
         claude_bin: fake.to_string_lossy().into_owned(),
         concurrency: ConcurrencySettings::uniform(1, &["opus"]), // exactly one permit
-        max_queued: 1,      // room for exactly one waiter
+        max_queued: 1,                                           // room for exactly one waiter
         ..test_config()
     };
     let st = AppState::new(cfg);
@@ -2793,11 +2789,7 @@ async fn diet_empty_targets_round_trips_as_empty_array() {
     // as an empty array, distinct from an absent or null field.
     let vault = make_diet_vault();
     write_vault_file(&vault, "vault/diet-today.js", FIX_TODAY);
-    write_vault_file(
-        &vault,
-        "vault/diet-progress.js",
-        FIX_PROGRESS_EMPTY_TARGETS,
-    );
+    write_vault_file(&vault, "vault/diet-progress.js", FIX_PROGRESS_EMPTY_TARGETS);
     write_vault_file(&vault, "diet-logs/weight-log.csv", FIX_WEIGHT_CSV);
     let cfg = Config {
         vault: vault.to_string_lossy().into_owned(),
@@ -4865,7 +4857,6 @@ async fn set_model_unavailable_is_409_and_does_not_switch() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-
 /// THE MODELS-ENDPOINT SHAPE, pinned. Each entry gains exactly two fields — `level` and
 /// `streams_text` — and keeps every field it had. A silently changed shape is a client
 /// that renders the wrong thing, so the whole key set is asserted rather than the new
@@ -4879,7 +4870,10 @@ async fn the_models_endpoint_entry_shape_is_pinned() {
         .await
         .unwrap();
     let v = body_value(resp).await;
-    let entry = v["models"].as_array().unwrap()[0].as_object().unwrap().clone();
+    let entry = v["models"].as_array().unwrap()[0]
+        .as_object()
+        .unwrap()
+        .clone();
     let mut keys: Vec<&str> = entry.keys().map(String::as_str).collect();
     keys.sort();
     assert_eq!(
@@ -4935,9 +4929,16 @@ async fn the_models_endpoint_entry_shape_is_pinned() {
 async fn the_per_model_writes_endpoint_is_gone() {
     let dir = std::env::temp_dir().join(format!("jesse-model-it-{}", random_hex()));
     let st = AppState::new(cfg_with_switch_registry(&dir));
-    for (id, body) in [("glm-5.2", r#"{"enabled":true}"#), ("opus", r#"{"enabled":false}"#)] {
+    for (id, body) in [
+        ("glm-5.2", r#"{"enabled":true}"#),
+        ("opus", r#"{"enabled":false}"#),
+    ] {
         let resp = app(st.clone())
-            .oneshot(set_model_writes_request(Some("Bearer test-token"), id, body))
+            .oneshot(set_model_writes_request(
+                Some("Bearer test-token"),
+                id,
+                body,
+            ))
             .await
             .unwrap();
         assert_eq!(
@@ -4965,7 +4966,10 @@ async fn a_models_write_permission_comes_from_its_configured_level() {
     assert_eq!(glm["level"], "read", "a declared model defaults to Read");
     assert_eq!(glm["writes_allowed"], false, "…so it may not write");
     let opus = models.iter().find(|m| m["id"] == "opus").unwrap();
-    assert_eq!(opus["level"], "write", "the ambient default is the built-in Write entry");
+    assert_eq!(
+        opus["level"], "write",
+        "the ambient default is the built-in Write entry"
+    );
     assert_eq!(opus["writes_allowed"], true);
     let _ = std::fs::remove_dir_all(&dir);
 }

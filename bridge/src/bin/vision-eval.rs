@@ -125,7 +125,9 @@ async fn main() {
     } else {
         total_hits as f64 / total_gt as f64 * 100.0
     };
-    println!("\n=== aggregate: {total_hits}/{total_gt} ground-truth strings found ({overall:.0}%) ===");
+    println!(
+        "\n=== aggregate: {total_hits}/{total_gt} ground-truth strings found ({overall:.0}%) ==="
+    );
     if any_error {
         std::process::exit(1);
     }

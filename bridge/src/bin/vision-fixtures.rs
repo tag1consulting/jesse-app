@@ -26,12 +26,37 @@ fn main() {
         (72.0, 720.0, 20.0, "ACME WIDGETS — INVOICE"),
         (72.0, 690.0, 12.0, "Invoice Number: INV-2026-0042"),
         (72.0, 672.0, 12.0, "Date: 2026-07-24"),
-        (72.0, 654.0, 12.0, "Bill To: Globex SRL, 1 Example Way, Springfield"),
-        (72.0, 620.0, 12.0, "Description                 Qty     Amount"),
-        (72.0, 602.0, 12.0, "Fiber install (annual)       1      EUR 480.00"),
-        (72.0, 584.0, 12.0, "Static IP block              1      EUR 120.00"),
+        (
+            72.0,
+            654.0,
+            12.0,
+            "Bill To: Globex SRL, 1 Example Way, Springfield",
+        ),
+        (
+            72.0,
+            620.0,
+            12.0,
+            "Description                 Qty     Amount",
+        ),
+        (
+            72.0,
+            602.0,
+            12.0,
+            "Fiber install (annual)       1      EUR 480.00",
+        ),
+        (
+            72.0,
+            584.0,
+            12.0,
+            "Static IP block              1      EUR 120.00",
+        ),
         (72.0, 560.0, 14.0, "Total Due: EUR 600.00"),
-        (72.0, 520.0, 11.0, "Payment terms: net 30. Thank you for your business."),
+        (
+            72.0,
+            520.0,
+            11.0,
+            "Payment terms: net 30. Thank you for your business.",
+        ),
     ]);
     write(dir.join("statement.pdf"), &statement);
 
@@ -117,16 +142,18 @@ fn text_pdf(lines: &[(f32, f32, f32, &str)]) -> Vec<u8> {
 }
 
 fn escape_pdf_text(s: &str) -> String {
-    s.replace('\\', "\\\\").replace('(', "\\(").replace(')', "\\)")
+    s.replace('\\', "\\\\")
+        .replace('(', "\\(")
+        .replace(')', "\\)")
 }
 
 fn bar_chart() -> RgbImage {
     let (w, h) = (480u32, 320u32);
     let mut img: RgbImage = ImageBuffer::from_pixel(w, h, Rgb([255, 255, 255]));
     let bars = [
-        (60u32, 200u32, Rgb([220, 60, 60])),   // red, tall
-        (200u32, 120u32, Rgb([60, 160, 80])),  // green, medium
-        (340u32, 260u32, Rgb([70, 90, 200])),  // blue, tallest
+        (60u32, 200u32, Rgb([220, 60, 60])),  // red, tall
+        (200u32, 120u32, Rgb([60, 160, 80])), // green, medium
+        (340u32, 260u32, Rgb([70, 90, 200])), // blue, tallest
     ];
     let bar_w = 80u32;
     for (x0, bh, color) in bars {

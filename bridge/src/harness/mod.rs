@@ -880,7 +880,8 @@ impl HarnessRegistry {
     /// [`validate_model_config`] refuses such a model at startup, naming it. Making this
     /// return `Option` would push that already-settled error onto every call site.
     pub fn serving(&self, model: &ActiveModel) -> &dyn Harness {
-        self.get(&model.harness).unwrap_or_else(|| self.fallback_harness())
+        self.get(&model.harness)
+            .unwrap_or_else(|| self.fallback_harness())
     }
 
     /// The harness that serves one routed job, from the pick the routing rule made.
@@ -889,7 +890,8 @@ impl HarnessRegistry {
     /// it, so a routed child is built by the same harness the routing log line named. If
     /// these two ever disagree the log stops describing what ran.
     pub fn serving_pick(&self, pick: &RoutedPick) -> &dyn Harness {
-        self.get(&pick.harness).unwrap_or_else(|| self.fallback_harness())
+        self.get(&pick.harness)
+            .unwrap_or_else(|| self.fallback_harness())
     }
 
     /// Every registered harness in a STABLE order: the turn harness first, then the rest by

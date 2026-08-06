@@ -75,7 +75,9 @@ impl Scratch {
         if let Ok(b) = std::env::var("JESSE_CLAUDE_BIN") {
             cfg.claude_bin = b;
         }
-        cfg.harnesses = Arc::new(HarnessRegistry::for_models(KNOWN_HARNESS_IDS.iter().copied()));
+        cfg.harnesses = Arc::new(HarnessRegistry::for_models(
+            KNOWN_HARNESS_IDS.iter().copied(),
+        ));
         cfg
     }
 }
@@ -93,10 +95,7 @@ impl Drop for Scratch {
 /// the test itself in `deps/`.
 fn helper() -> PathBuf {
     let exe = std::env::current_exe().expect("the test binary");
-    let debug_dir = exe
-        .parent()
-        .and_then(|p| p.parent())
-        .expect("target/debug");
+    let debug_dir = exe.parent().and_then(|p| p.parent()).expect("target/debug");
     let p = debug_dir.join("jesse-hook");
     assert!(
         p.is_file(),
@@ -179,8 +178,10 @@ async fn turn(
     jobs.stream_register(jid);
     let spawned = SpawnedSessions::new();
     let harness = cfg.harnesses.serving(model);
-    let out =
-        run_claude_streaming(cfg, prompt, None, &jobs, jid, model, harness, &spawned, wl, None).await;
+    let out = run_claude_streaming(
+        cfg, prompt, None, &jobs, jid, model, harness, &spawned, wl, None,
+    )
+    .await;
     jobs.stream_finish(jid, StreamFrame::Cancelled);
     out.map(|(text, _s, _u)| text)
 }
@@ -355,15 +356,7 @@ fn the_write_lock_adds_exactly_one_known_flag_per_harness() {
     let cfg = s.config();
 
     // ---- Codex ----------------------------------------------------------------
-    let plain = build_codex_args(
-        "hi",
-        None,
-        Capability::Write,
-        &s.vault,
-        &[],
-        &[],
-        false,
-    );
+    let plain = build_codex_args("hi", None, Capability::Write, &s.vault, &[], &[], false);
     let locked = build_codex_args("hi", None, Capability::Write, &s.vault, &[], &[], true);
     let added: Vec<&String> = locked.iter().filter(|a| !plain.contains(a)).collect();
     assert_eq!(
@@ -393,7 +386,15 @@ fn the_write_lock_adds_exactly_one_known_flag_per_harness() {
     );
 
     // ---- Claude Code ----------------------------------------------------------
-    let plain = build_claude_args(&cfg, "hi", None, Capability::Write, EMPTY_MCP_CONFIG, None, None);
+    let plain = build_claude_args(
+        &cfg,
+        "hi",
+        None,
+        Capability::Write,
+        EMPTY_MCP_CONFIG,
+        None,
+        None,
+    );
     let settings = PathBuf::from("/some/state/dir/claude-settings/job-1.json");
     let locked = build_claude_args(
         &cfg,
@@ -408,10 +409,7 @@ fn the_write_lock_adds_exactly_one_known_flag_per_harness() {
     let added: Vec<&String> = locked.iter().filter(|a| !plain.contains(a)).collect();
     assert_eq!(
         added,
-        vec![
-            &"--settings".to_string(),
-            &settings.display().to_string()
-        ],
+        vec![&"--settings".to_string(), &settings.display().to_string()],
         "the Claude Code write lock must add EXACTLY --settings <path>"
     );
     // The settings file is in the STATE dir, never in the vault — a child-writable settings
@@ -421,11 +419,15 @@ fn the_write_lock_adds_exactly_one_known_flag_per_harness() {
         "the bridge-owned settings file must never live where a child can edit it"
     );
     assert!(
-        plain.windows(2).any(|w| w[0] == "--setting-sources" && w[1] == "user,project"),
+        plain
+            .windows(2)
+            .any(|w| w[0] == "--setting-sources" && w[1] == "user,project"),
         "control: the scope flag is still there"
     );
     assert!(
-        locked.windows(2).any(|w| w[0] == "--setting-sources" && w[1] == "user,project"),
+        locked
+            .windows(2)
+            .any(|w| w[0] == "--setting-sources" && w[1] == "user,project"),
         "--settings is ADDITIVE to the scopes, so the vault's own hooks keep working"
     );
 }
@@ -464,7 +466,10 @@ async fn a_claude_write_and_a_codex_write_to_one_path_serialize() {
             "command": "*** Begin Patch\n*** Update File: shared.md\n+from codex\n*** End Patch",
         }),
     });
-    assert_eq!(claude, codex, "one file, one lock key, whichever harness names it");
+    assert_eq!(
+        claude, codex,
+        "one file, one lock key, whichever harness names it"
+    );
 
     // And that key actually serializes ACROSS the two harnesses at the broker.
     let broker = LockBroker::new();

@@ -357,10 +357,7 @@ impl SlotTable {
 
     /// Free slots right now, for the admission log line.
     pub fn free_for(&self, model: &str) -> usize {
-        self.models
-            .get(model)
-            .map(|g| g.available())
-            .unwrap_or(0)
+        self.models.get(model).map(|g| g.available()).unwrap_or(0)
     }
 
     pub fn ceiling_free(&self) -> usize {
@@ -433,10 +430,7 @@ mod tests {
     fn plan(total: usize, models: &[(&str, usize)]) -> SlotPlan {
         SlotPlan {
             total,
-            per_model: models
-                .iter()
-                .map(|(k, v)| (k.to_string(), *v))
-                .collect(),
+            per_model: models.iter().map(|(k, v)| (k.to_string(), *v)).collect(),
         }
     }
 
@@ -454,7 +448,10 @@ mod tests {
         );
         // … while a DIFFERENT model with a free slot runs immediately.
         assert!(
-            matches!(t.admit("codex-write", false), Some(TurnAdmission::Ready { .. })),
+            matches!(
+                t.admit("codex-write", false),
+                Some(TurnAdmission::Ready { .. })
+            ),
             "a different model with a free slot must not be blocked"
         );
     }
@@ -469,9 +466,15 @@ mod tests {
             Some(TurnAdmission::Queued { ticket }) => ticket,
             _ => panic!("second opus turn should queue"),
         };
-        assert!(t.admit("opus", false).is_none(), "opus is saturated and sheds");
         assert!(
-            matches!(t.admit("codex-write", false), Some(TurnAdmission::Ready { .. })),
+            t.admit("opus", false).is_none(),
+            "opus is saturated and sheds"
+        );
+        assert!(
+            matches!(
+                t.admit("codex-write", false),
+                Some(TurnAdmission::Ready { .. })
+            ),
             "a saturated harness must NOT shed an admissible turn on the other harness"
         );
     }
@@ -484,7 +487,13 @@ mod tests {
         let b = t.admit("codex-write", false).unwrap();
         for adm in [&a, &b] {
             assert!(
-                matches!(adm, TurnAdmission::Ready { ceiling: Some(_), .. }),
+                matches!(
+                    adm,
+                    TurnAdmission::Ready {
+                        ceiling: Some(_),
+                        ..
+                    }
+                ),
                 "the first two turns are under the ceiling"
             );
         }
@@ -511,7 +520,11 @@ mod tests {
         };
         assert_eq!(t.waiting_for("opus"), 1);
         drop(ticket); // the cancel path: the task is aborted before it ever spawns a child
-        assert_eq!(t.waiting_for("opus"), 0, "a cancelled queued turn frees its slot");
+        assert_eq!(
+            t.waiting_for("opus"),
+            0,
+            "a cancelled queued turn frees its slot"
+        );
     }
 
     #[test]
@@ -534,8 +547,14 @@ mod tests {
             let locks = ConversationLocks::default();
             let conv = format!("conv-on-{model}");
 
-            let _first = locks.get(&conv).try_lock_owned().expect("first turn takes it");
-            assert!(locks.is_busy(&conv), "a running turn marks the conversation busy");
+            let _first = locks
+                .get(&conv)
+                .try_lock_owned()
+                .expect("first turn takes it");
+            assert!(
+                locks.is_busy(&conv),
+                "a running turn marks the conversation busy"
+            );
             // A second turn of the SAME conversation cannot take it …
             assert!(
                 locks.get(&conv).try_lock_owned().is_err(),
@@ -573,13 +592,26 @@ mod tests {
     #[tokio::test]
     async fn the_acquisition_order_cannot_deadlock_across_two_harnesses() {
         // One ceiling permit, one slot each, two harnesses.
-        let t = Arc::new(SlotTable::new(&plan(1, &[("opus", 1), ("codex-write", 1)]), 4));
+        let t = Arc::new(SlotTable::new(
+            &plan(1, &[("opus", 1), ("codex-write", 1)]),
+            4,
+        ));
         let a = t.admit("opus", false).unwrap();
         let b = t.admit("codex-write", false).unwrap();
         // Exactly one of them got the ceiling; the other holds only its model slot.
         let (with_ceiling, without) = match (&a, &b) {
-            (TurnAdmission::Ready { ceiling: Some(_), .. }, TurnAdmission::Ready { ceiling: None, .. }) => (a, b),
-            (TurnAdmission::Ready { ceiling: None, .. }, TurnAdmission::Ready { ceiling: Some(_), .. }) => (b, a),
+            (
+                TurnAdmission::Ready {
+                    ceiling: Some(_), ..
+                },
+                TurnAdmission::Ready { ceiling: None, .. },
+            ) => (a, b),
+            (
+                TurnAdmission::Ready { ceiling: None, .. },
+                TurnAdmission::Ready {
+                    ceiling: Some(_), ..
+                },
+            ) => (b, a),
             _ => panic!("with a ceiling of 1, exactly one of the two turns holds it"),
         };
         // The one without the ceiling parks on it. It must NOT be able to proceed while the
@@ -590,7 +622,10 @@ mod tests {
             t2.acquire_ceiling().await
         });
         tokio::time::sleep(Duration::from_millis(50)).await;
-        assert!(!waiter.is_finished(), "the ceiling is held; the other turn must wait");
+        assert!(
+            !waiter.is_finished(),
+            "the ceiling is held; the other turn must wait"
+        );
         drop(with_ceiling); // the first turn ends, releasing model slot AND ceiling
         let got = timeout(Duration::from_secs(5), waiter).await;
         assert!(
@@ -612,7 +647,9 @@ mod tests {
     fn every_known_harness_declares_write_lock_support() {
         let reg = HarnessRegistry::for_models(KNOWN_HARNESS_IDS.iter().copied());
         for id in KNOWN_HARNESS_IDS {
-            let h = reg.get(id).unwrap_or_else(|| panic!("{id} must be constructible"));
+            let h = reg
+                .get(id)
+                .unwrap_or_else(|| panic!("{id} must be constructible"));
             // Both harnesses shipped today declare TRUE, having been verified live against
             // their pinned binaries. A third one answering `false` is legitimate — it is then
             // capped at one write-level slot by the test below — but it must ANSWER.
@@ -663,7 +700,11 @@ mod tests {
             fn transcript_dir(&self, _c: &Config) -> Option<PathBuf> {
                 None
             }
-            fn build_turn(&self, _c: &Config, _r: &TurnRequest<'_>) -> Result<Command, HarnessError> {
+            fn build_turn(
+                &self,
+                _c: &Config,
+                _r: &TurnRequest<'_>,
+            ) -> Result<Command, HarnessError> {
                 Err(HarnessError::unsupported("silent", "a turn"))
             }
             fn attachment_support(&self) -> &'static AttachmentSupport {
@@ -740,10 +781,18 @@ mod tests {
             ..Default::default()
         };
         let plan = resolve_slot_plan(&registry, &harnesses, &settings, &|_| None).unwrap();
-        assert_eq!(plan.total, 1, "JESSE_MAX_CONCURRENCY=1 must still mean one turn at a time");
+        assert_eq!(
+            plan.total, 1,
+            "JESSE_MAX_CONCURRENCY=1 must still mean one turn at a time"
+        );
         // With nothing set at all, the documented default.
-        let plan = resolve_slot_plan(&registry, &harnesses, &ConcurrencySettings::default(), &|_| None)
-            .unwrap();
+        let plan = resolve_slot_plan(
+            &registry,
+            &harnesses,
+            &ConcurrencySettings::default(),
+            &|_| None,
+        )
+        .unwrap();
         assert_eq!(plan.total, DEFAULT_TOTAL_CEILING);
         assert_eq!(
             plan.per_model.get("opus"),

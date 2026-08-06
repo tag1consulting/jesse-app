@@ -69,6 +69,15 @@ CI both run it). See the "Versioning" section of `bridge/README.md`.
   The "fully populated" diet test vault was missing `exercise-log.csv` — it now has one,
   so its no-errors assertion tests clean data rather than a hole.
 
+### Changed
+
+- **Both Rust crates are now `cargo fmt` clean**, in a separate commit that contains
+  nothing else. Neither had been formatted in a while and 41 files had drifted, which
+  made every unrelated PR carry a choice between reformat noise and hand-reverting
+  rustfmt. This is pure reflow — line breaks and trailing commas only, no token
+  changed — and both crates build, lint and test identically before and after. CI runs
+  no fmt check, so nothing here is enforced yet; keeping it clean is by hand for now.
+
 ## [Bridge 0.63.1] - 2026-08-06
 
 ### Fixed

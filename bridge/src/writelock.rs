@@ -299,7 +299,11 @@ impl LockBroker {
                 return false;
             }
             // Wake on the next release, but never sleep past the deadline.
-            let _ = timeout(remaining.min(Duration::from_secs(1)), self.released.notified()).await;
+            let _ = timeout(
+                remaining.min(Duration::from_secs(1)),
+                self.released.notified(),
+            )
+            .await;
         }
     }
 
@@ -700,7 +704,10 @@ mod tests {
         let r = b.handle(pre("t1", "write1", Some(&p))).await;
         assert!(!r.allow, "a stale write must be refused");
         let why = r.reason.unwrap();
-        assert!(why.contains("Re-read"), "the refusal must be actionable: {why}");
+        assert!(
+            why.contains("Re-read"),
+            "the refusal must be actionable: {why}"
+        );
         // The refusal released the lock it took to do the check.
         assert_eq!(b.held_count(), 0);
     }
@@ -727,7 +734,11 @@ mod tests {
         assert!(b.handle(pre("t1", "call1", Some(&p))).await.allow);
         assert_eq!(b.held_count(), 1);
         b.release_turn("t1");
-        assert_eq!(b.held_count(), 0, "turn end must release, not the post hook alone");
+        assert_eq!(
+            b.held_count(),
+            0,
+            "turn end must release, not the post hook alone"
+        );
         assert!(b.handle(pre("t2", "call2", Some(&p))).await.allow);
     }
 
@@ -764,8 +775,14 @@ mod tests {
             b.acquire(&LockKey::Global, "t2", "c2"),
         )
         .await;
-        assert!(got.is_err(), "the waiter must still be blocked, not allowed");
-        assert!(start.elapsed() < LOCK_WAIT_TIMEOUT, "it must not have given up early");
+        assert!(
+            got.is_err(),
+            "the waiter must still be blocked, not allowed"
+        );
+        assert!(
+            start.elapsed() < LOCK_WAIT_TIMEOUT,
+            "it must not have given up early"
+        );
     }
 
     #[tokio::test]
@@ -774,7 +791,9 @@ mod tests {
         let d = tmpdir();
         let f = d.join("never-read.txt");
         std::fs::write(&f, "content this conversation never read through a tool").unwrap();
-        let r = b.handle(pre("t1", "c1", Some(&f.display().to_string()))).await;
+        let r = b
+            .handle(pre("t1", "c1", Some(&f.display().to_string())))
+            .await;
         assert!(
             r.allow,
             "no baseline must ALLOW — failing closed would refuse every first write"
@@ -983,11 +1002,19 @@ mod tests {
         // Neither harness can name what a shell command will write, so both must answer
         // Global. This is the 6d gap, asserted rather than left to a comment.
         assert_eq!(
-            ClaudeCode.hook_write_target(&payload("Bash", "/v", json!({ "command": "echo hi > a" }))),
+            ClaudeCode.hook_write_target(&payload(
+                "Bash",
+                "/v",
+                json!({ "command": "echo hi > a" })
+            )),
             WriteTarget::Global
         );
         assert_eq!(
-            Codex.hook_write_target(&payload("shell", "/v", json!({ "command": ["sh", "-c", "echo hi > a"] }))),
+            Codex.hook_write_target(&payload(
+                "shell",
+                "/v",
+                json!({ "command": ["sh", "-c", "echo hi > a"] })
+            )),
             WriteTarget::Global
         );
     }
@@ -997,7 +1024,11 @@ mod tests {
         let d = tmpdir().canonicalize().unwrap();
         let f = d.join("a.md");
         std::fs::write(&f, "x").unwrap();
-        let p = payload("Read", &d.display().to_string(), json!({ "file_path": f.display().to_string() }));
+        let p = payload(
+            "Read",
+            &d.display().to_string(),
+            json!({ "file_path": f.display().to_string() }),
+        );
         assert_eq!(
             ClaudeCode.hook_write_target(&p),
             WriteTarget::None,
@@ -1034,7 +1065,9 @@ mod tests {
             "locking one file of a multi-file patch would leave the rest unprotected"
         );
         assert_eq!(
-            apply_patch_targets("*** Begin Patch\n*** Update File: a.md\n+x\n*** Add File: b.md\n+y\n*** End Patch"),
+            apply_patch_targets(
+                "*** Begin Patch\n*** Update File: a.md\n+x\n*** Add File: b.md\n+y\n*** End Patch"
+            ),
             vec!["a.md".to_string(), "b.md".to_string()]
         );
     }
