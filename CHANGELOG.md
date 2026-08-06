@@ -15,6 +15,51 @@ CI both run it). See the "Versioning" section of `bridge/README.md`.
 
 ## [Unreleased]
 
+## [Bridge 0.61.0] - 2026-08-06
+
+### Fixed
+
+- **The Claude Code child's read grant was scoped to its working directory while
+  attachments continued to be written under the system temp directory, and no
+  directory was added for the turn, so every attachment read was refused at the
+  permission layer.** The 2026-07-29 scoping change (`Read` → `Read(./**)`, commit
+  98ad92e) made the allowlist cwd-relative, and the cwd is the vault; `ScratchDir`
+  writes under `std::env::temp_dir()`, which on macOS is `/var/folders/…`. So the
+  path the prompt named was outside the only directory the model could read, the
+  Read became a permission REQUEST, and a headless `-p` child has nobody to answer
+  one. Reproduced on claude 2.1.223: the denial lands in the result envelope's
+  `permission_denials` naming the Read call, and the model narrates that it cannot
+  read the file — which is exactly the report from the phone. A turn that carries
+  attachments now passes its scratch directory to the child with `--add-dir`, in
+  both the `/var/folders/…` and `/private/var/folders/…` spellings.
+
+  The grant is per turn and read-only, both re-verified on 2.1.223: with
+  `Write(./**)` allowed and the directory added, a write INTO it was still refused
+  (denial recorded, file never created), and a file sitting BESIDE the added
+  directory was still refused. It is emitted in `build_claude_args`, never in
+  `claude_capability_args`, because `validate_toolset_argv` compares the latter
+  against the recorded `toolset_args` by strict equality — a per-turn absolute host
+  path there would fail the startup gate on every machine but the one that cut the
+  record. **No containment record moves on either harness**, and a turn with no
+  attachments is byte-for-byte the child 0.60.2 built.
+
+- **`ScratchDir`'s doc comment claimed the opposite of the truth.** It read
+  "verified that headless `claude` reads paths here via its Read tool with no
+  `--add-dir`", which was true when written and was falsified by the scoping change
+  the same week. Corrected, and the correction names both dates so the window in
+  which every attachment silently failed is on the record.
+
+### Changed
+
+- **Named the two attachment routes as a type instead of a chain of `if`s.** A turn
+  either transcribes images through a resolving vision partner or writes files for
+  the child to read — never both, or the model is sent the same picture twice and
+  billed for it twice. `AttachmentRoute` makes the exclusivity a property tests can
+  hold rather than a shape a reader has to re-derive from the handler. Codex needs
+  no new plumbing on either route: its OS sandbox leaves reads broad and its
+  built-in `view_image` takes the path from the prompt, so its argv is unchanged and
+  a test now pins that.
+
 ## [Bridge 0.60.2] - 2026-08-05
 
 Comment only — no behaviour change, no argv change.

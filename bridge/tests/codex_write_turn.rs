@@ -125,7 +125,7 @@ async fn turn(
     ));
     jobs.stream_register(jid);
     let spawned = SpawnedSessions::new();
-    let out = run_claude_streaming(cfg, prompt, None, &jobs, jid, model, harness, &spawned, None).await;
+    let out = run_claude_streaming(cfg, prompt, None, &jobs, jid, model, harness, &spawned, None, None).await;
     jobs.stream_finish(jid, StreamFrame::Cancelled);
     out.map(|(text, _session, _usage)| text)
 }

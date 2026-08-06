@@ -277,11 +277,60 @@ pub fn attachment_body_limit(cfg: &Config) -> usize {
     base64_encoded_len(cfg.max_attachments_total_bytes) + 256 * 1024
 }
 
+/// WHICH OF TWO MUTUALLY EXCLUSIVE ROUTES this turn's attachments take.
+///
+/// There are exactly two ways an attachment reaches a model, and a turn takes ONE. Stated
+/// as a type rather than left as a chain of `if`s because the failure mode of getting it
+/// wrong is silent and expensive: wire both and the image is transcribed by the helper AND
+/// written to disk for the child, so the model is sent the same picture twice, pays for it
+/// twice, and may describe it twice.
+///
+/// The order below is the decision order, and it is not arbitrary. [`Self::VisionHelper`]
+/// is tried first because it is the route for a model that CANNOT read an image at all —
+/// a text-only model with a resolving vision partner. Only a model that can see for itself
+/// falls through to [`Self::ChildReadsFiles`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AttachmentRoute {
+    /// No attachments on this turn. No scratch dir, no prompt suffix, no read grant —
+    /// byte-for-byte an ordinary turn, which is nearly all of them.
+    None,
+    /// The BRIDGE reads the images and hands the model text. The decoded bytes ride into
+    /// the turn task and are transcribed by the resolving vision partner; nothing is
+    /// written to disk, so there is no directory for a child to be granted.
+    VisionHelper,
+    /// THE CHILD reads the files itself. The bytes are written to a per-request scratch
+    /// dir, their paths are named in the prompt, and the harness is told where they are
+    /// (Claude Code needs `--add-dir`; Codex's sandbox already permits the read).
+    ChildReadsFiles,
+}
+
+/// Decide the route. Pure, so the exclusivity is a property the tests can hold rather than
+/// a shape a reader has to re-derive from the handler.
+///
+/// `vision_resolves` must mean RESOLVABLE, not merely configured: a model paired with a
+/// broken helper falls through to the child-reads-files route rather than dropping the
+/// attachment on the floor.
+pub fn attachment_route(has_attachments: bool, vision_resolves: bool) -> AttachmentRoute {
+    match (has_attachments, vision_resolves) {
+        (false, _) => AttachmentRoute::None,
+        (true, true) => AttachmentRoute::VisionHelper,
+        (true, false) => AttachmentRoute::ChildReadsFiles,
+    }
+}
+
 /// A per-request scratch directory under `base` (the system temp dir by
 /// default, or `JESSE_SCRATCH_DIR`) — NOT the vault, so attachments never
-/// pollute it; verified that headless `claude` reads paths here via its Read
-/// tool with no `--add-dir`. Removed by `Drop` on every exit path — success,
-/// error, or timeout — so decoded files never outlive the turn.
+/// pollute it. Removed by `Drop` on every exit path — success, error, or
+/// timeout — so decoded files never outlive the turn.
+///
+/// THIS DIRECTORY IS OUTSIDE THE CLAUDE CODE CHILD'S READ SCOPE, and the turn must
+/// hand it over explicitly. This comment used to claim the opposite — "verified that
+/// headless `claude` reads paths here via its Read tool with no `--add-dir`" — which
+/// was true when it was written and was made false by the 2026-07-29 scoping change
+/// (`Read` → `Read(./**)`, commit 98ad92e). Between those two dates every attachment
+/// read on this harness was refused at the permission layer. The turn now passes the
+/// path as [`TurnRequest::attachment_dir`] and the Claude Code builder emits
+/// `--add-dir`; Codex's OS sandbox leaves reads broad and needs nothing.
 pub struct ScratchDir {
     pub path: PathBuf,
 }
@@ -619,6 +668,34 @@ mod tests {
         assert!(!created.exists(), "scratch dir removed on Drop");
         let _ = std::fs::remove_dir_all(&base);
     }
+    /// THE HELPER ROUTE AND THE FILE ROUTE CANNOT BOTH FIRE.
+    ///
+    /// The property that matters is not which route wins but that exactly one does: a turn
+    /// on the helper route writes NO scratch dir, and no scratch dir means the turn request
+    /// carries no `attachment_dir`, so `--add-dir` cannot be emitted for it and the image
+    /// cannot be sent twice. The three cases below are the whole space.
+    #[test]
+    fn the_vision_helper_and_the_child_file_routes_are_mutually_exclusive() {
+        // No attachments at all → neither route; an ordinary turn.
+        assert_eq!(attachment_route(false, false), AttachmentRoute::None);
+        assert_eq!(
+            attachment_route(false, true),
+            AttachmentRoute::None,
+            "a resolving vision partner on a turn with nothing attached is still nothing to do"
+        );
+        // Attachments + a RESOLVING partner → the bridge transcribes; no file is written.
+        assert_eq!(
+            attachment_route(true, true),
+            AttachmentRoute::VisionHelper
+        );
+        // Attachments + no resolving partner (ambient opus, or a paired-but-broken helper)
+        // → the child reads the files itself. This is the route the read grant serves.
+        assert_eq!(
+            attachment_route(true, false),
+            AttachmentRoute::ChildReadsFiles
+        );
+    }
+
     #[test]
     fn attachment_prompt_suffix_names_paths_only() {
         let paths = vec![PathBuf::from("/tmp/jesse-attach-ab/01-cd.png")];

@@ -1437,6 +1437,69 @@ mod tests {
     /// gets holds NO credential — there is nothing in it to read.
     ///
     /// The second half is the containment half. The read surface this harness accepts
+    /// A CODEX TURN'S ARGV IS UNCHANGED BY THE ATTACHMENT FIELD.
+    ///
+    /// `TurnRequest::attachment_dir` is call-site policy that each harness answers for
+    /// itself, and Codex's answer is "nothing to do": its containment is an OS sandbox that
+    /// scopes writes and network and leaves READS broad, so a file under the system temp
+    /// directory is already reachable and its built-in `view_image` takes the path straight
+    /// from the prompt. Measured on codex-cli 0.146.0: an unprompted turn pointed at a PNG
+    /// there transcribed the text printed in it, with zero shell events on the `--json`
+    /// stream.
+    ///
+    /// So the CLI image flag (`-i`/`--image`) is deliberately NOT emitted. It is a second
+    /// route to pixels that already arrive, it would have to be placed correctly on both the
+    /// plain and the `resume` form of the subcommand, and this harness has already shipped
+    /// one break of exactly that shape (`-C` after `resume`). This test is what says the
+    /// decision was made rather than forgotten.
+    #[test]
+    fn an_attachment_dir_changes_nothing_about_a_codex_child() {
+        let (cfg, _dir) = scratch_config("attach-noop");
+        let m = openai_model("https://api.example/v1", "slug", "sk-secret");
+        let scratch = std::env::temp_dir().join(format!("jesse-attach-{}", random_hex()));
+        std::fs::create_dir(&scratch).expect("scratch dir");
+
+        let base = TurnRequest {
+            prompt: "hi",
+            session_id: None,
+            active: &m,
+            capability: Capability::Read,
+            cwd: std::env::temp_dir(),
+            mcp_config: EMPTY_MCP_CONFIG,
+            write_lock: None,
+            attachment_dir: None,
+        };
+        let with = TurnRequest {
+            attachment_dir: Some(scratch.as_path()),
+            ..TurnRequest {
+                prompt: "hi",
+                session_id: None,
+                active: &m,
+                capability: Capability::Read,
+                cwd: std::env::temp_dir(),
+                mcp_config: EMPTY_MCP_CONFIG,
+                write_lock: None,
+                attachment_dir: None,
+            }
+        };
+        let argv = |req: &TurnRequest<'_>| -> Vec<String> {
+            Codex
+                .build_turn(&cfg, req)
+                .expect("a codex child")
+                .as_std()
+                .get_args()
+                .map(|s| s.to_string_lossy().into_owned())
+                .collect()
+        };
+        let (a, b) = (argv(&base), argv(&with));
+        assert_eq!(a, b, "an attachment must not move a single Codex argument");
+        assert!(
+            !b.iter().any(|x| x == "-i" || x == "--image" || x == "--add-dir"),
+            "no image or added-directory flag belongs on this harness: {b:?}"
+        );
+        let _ = std::fs::remove_dir(&scratch);
+    }
+
     /// (`read_agent_credential`'s decoy is reachable because the OAuth copy is deliberately in
     /// the home) is ABSENT on the provider path rather than tolerated there.
     #[test]
@@ -1451,6 +1514,7 @@ mod tests {
             cwd: std::env::temp_dir(),
             mcp_config: EMPTY_MCP_CONFIG,
             write_lock: None,
+            attachment_dir: None,
         };
         let cmd = Codex.build_turn(&cfg, &req).expect("a provider child");
 

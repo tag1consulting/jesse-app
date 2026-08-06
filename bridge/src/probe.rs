@@ -1822,6 +1822,7 @@ async fn run_row(
                 cwd: env.vault.clone(),
                 mcp_config: row.mcp.config(),
                 write_lock: None,
+                attachment_dir: None,
             };
             // Through the harness the bridge actually ships: a battery that built its own argv
             // would be probing a posture nothing spawns.

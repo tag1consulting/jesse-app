@@ -189,6 +189,18 @@ pub struct TurnRequest<'a> {
     /// for Claude Code, a `hooks.json` in the per-turn home for Codex — which is why this is
     /// a request field the harness reads rather than argv the bridge assembles.
     pub write_lock: Option<&'a WriteLockChild>,
+    /// The per-request scratch directory this turn's decoded attachments were written to.
+    ///
+    /// CALL SITE POLICY, exactly like `cwd`: the bridge decided where to write the files, so
+    /// the bridge is what knows the path. A harness reads it and decides what, if anything,
+    /// its CLI must be told — Claude Code needs the directory added to the child's read
+    /// scope, Codex's OS sandbox already leaves reads broad and needs nothing.
+    ///
+    /// `None` for every ordinary turn, which is nearly all of them: no attachments at all, or
+    /// attachments that the VISION HELPER reads instead of the child. Those two routes are
+    /// mutually exclusive and the gate is in `handlers` — when the helper serves the turn no
+    /// scratch dir is written at all, so there is no directory to name here.
+    pub attachment_dir: Option<&'a Path>,
 }
 
 /// Everything a child needs to talk to the write-lock broker.
@@ -677,6 +689,8 @@ pub fn title_child_request<'a>(
         cwd: PathBuf::from(&cfg.vault),
         mcp_config: EMPTY_MCP_CONFIG,
         write_lock: None,
+        // A single-shot child never carries an attachment.
+        attachment_dir: None,
     }
 }
 
@@ -698,6 +712,8 @@ pub fn diet_child_request<'a>(
         cwd: cfg.scratch_base(), // neutral cwd → no vault CLAUDE.md auto-load
         mcp_config: EMPTY_MCP_CONFIG,
         write_lock: None,
+        // A single-shot child never carries an attachment.
+        attachment_dir: None,
     }
 }
 
@@ -719,6 +735,8 @@ pub fn vaultqa_child_request<'a>(
         cwd: PathBuf::from(&cfg.vault),
         mcp_config: vaultqa_mcp_config(cfg),
         write_lock: None,
+        // A single-shot child never carries an attachment.
+        attachment_dir: None,
     }
 }
 

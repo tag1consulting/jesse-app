@@ -142,6 +142,8 @@ async fn a_codex_turn_answers_and_shows_what_it_was_doing() {
         &Codex,
         &spawned,
         None,
+        // no attachments on this turn
+        None,
     )
     .await;
 
@@ -224,6 +226,8 @@ async fn a_kimi_turn_uses_a_tool_through_codex_against_an_openai_provider() {
         &Codex,
         &spawned,
         None,
+        // no attachments on this turn
+        None,
     )
     .await;
     let elapsed = started.elapsed();
@@ -289,6 +293,8 @@ async fn a_refused_write_reaches_the_client_as_activity_not_silence() {
         &codex_model(),
         &Codex,
         &spawned,
+        None,
+        // no attachments on this turn
         None,
     )
     .await;

@@ -180,7 +180,7 @@ async fn turn(
     let spawned = SpawnedSessions::new();
     let harness = cfg.harnesses.serving(model);
     let out =
-        run_claude_streaming(cfg, prompt, None, &jobs, jid, model, harness, &spawned, wl).await;
+        run_claude_streaming(cfg, prompt, None, &jobs, jid, model, harness, &spawned, wl, None).await;
     jobs.stream_finish(jid, StreamFrame::Cancelled);
     out.map(|(text, _s, _u)| text)
 }
@@ -393,7 +393,7 @@ fn the_write_lock_adds_exactly_one_known_flag_per_harness() {
     );
 
     // ---- Claude Code ----------------------------------------------------------
-    let plain = build_claude_args(&cfg, "hi", None, Capability::Write, EMPTY_MCP_CONFIG, None);
+    let plain = build_claude_args(&cfg, "hi", None, Capability::Write, EMPTY_MCP_CONFIG, None, None);
     let settings = PathBuf::from("/some/state/dir/claude-settings/job-1.json");
     let locked = build_claude_args(
         &cfg,
@@ -402,6 +402,8 @@ fn the_write_lock_adds_exactly_one_known_flag_per_harness() {
         Capability::Write,
         EMPTY_MCP_CONFIG,
         Some(&settings),
+        // no attachments on this turn
+        None,
     );
     let added: Vec<&String> = locked.iter().filter(|a| !plain.contains(a)).collect();
     assert_eq!(
