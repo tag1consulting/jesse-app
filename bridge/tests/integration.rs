@@ -2357,6 +2357,10 @@ fn diet_state_full() -> (AppState, std::path::PathBuf) {
     write_vault_file(&vault, "vault/proposed-diet-today.js", FIX_PROPOSED);
     write_vault_file(&vault, "diet-logs/weight-log.csv", FIX_WEIGHT_CSV);
     write_vault_file(&vault, "diet-logs/food-log.csv", FIX_FOOD_CSV);
+    // The exercise log belongs in a "fully populated" vault like every other log:
+    // exerciseSeries reports a missing one as an error, and this fixture asserts the
+    // clean-data case carries none.
+    write_vault_file(&vault, "diet-logs/exercise-log.csv", FIX_EXERCISE_CSV);
     let cfg = Config {
         vault: vault.to_string_lossy().into_owned(),
         ..test_config()
@@ -2501,6 +2505,122 @@ async fn diet_happy_path_returns_full_normalized_snapshot() {
     assert!(n.get("na").is_none(), "no Sodium_mg column → key omitted");
     assert!(n.get("k").is_none(), "no Potassium_mg column → key omitted");
     assert!(n.get("unsat").is_none(), "no SatFat_g → unsat omitted");
+
+    // sourceSeries: the same food-log.csv day, but per ITEM rather than summed.
+    let ss = body["sourceSeries"].as_array().unwrap();
+    assert_eq!(ss.len(), 1, "one day in the food log");
+    assert_eq!(ss[0]["date"], "2026-04-15");
+    let items = ss[0]["items"].as_array().unwrap();
+    assert_eq!(items.len(), 4, "all four rows, in file order");
+    assert_eq!(items[0]["name"], "Oatmeal");
+    assert_eq!(items[0]["n"]["cal"], 300.0);
+    assert_eq!(items[0]["n"]["fiber"], 8.0);
+    // Banana's Calories cell is blank → the key is OMITTED, never 0; its other
+    // nutrients survive. Same unknown-is-not-zero contract as nutrientSeries.
+    assert_eq!(items[1]["name"], "Banana");
+    assert!(
+        items[1]["n"].get("cal").is_none(),
+        "blank Calories → cal omitted, not 0"
+    );
+    assert_eq!(items[1]["n"]["c"], 27.0);
+    // This fixture's header stops at Fiber_g, so no item carries a micro or unsat.
+    assert!(items[0]["n"].get("na").is_none());
+    assert!(items[0]["n"].get("unsat").is_none());
+
+    // exerciseSeries: the exercise log's one day, summed and counted.
+    let es = body["exerciseSeries"].as_array().unwrap();
+    assert_eq!(es.len(), 1, "one day in the exercise log");
+    assert_eq!(es[0]["date"], "2026-04-15");
+    assert_eq!(es[0]["kcal"], 740.0, "520 + 220");
+    assert_eq!(es[0]["sessions"], 2);
+
+    let _ = std::fs::remove_dir_all(&vault);
+}
+
+#[tokio::test]
+async fn diet_missing_logs_yield_empty_series_and_recorded_errors() {
+    // A vault with `today` alone: every log is absent. sourceSeries and
+    // exerciseSeries must be `[]` (never null, never a panic) with one diagnostic
+    // each, so the app renders an empty chart instead of failing to decode.
+    let vault = make_diet_vault();
+    write_vault_file(&vault, "vault/diet-today.js", FIX_TODAY);
+    let cfg = Config {
+        vault: vault.to_string_lossy().into_owned(),
+        ..test_config()
+    };
+    let resp = app(AppState::new(cfg))
+        .oneshot(diet_request(Some("Bearer test-token")))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "missing logs are not fatal");
+    let body: Value = serde_json::from_str(&body_string(resp).await).unwrap();
+
+    assert_eq!(
+        body["sourceSeries"],
+        serde_json::json!([]),
+        "missing food-log.csv → [], not null"
+    );
+    assert_eq!(
+        body["exerciseSeries"],
+        serde_json::json!([]),
+        "missing exercise-log.csv → [], not null"
+    );
+    let errors: Vec<&str> = body["errors"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e.as_str().unwrap())
+        .collect();
+    assert!(
+        errors.iter().any(|e| e.starts_with("sourceSeries: ")),
+        "the unreadable food log is reported: {errors:?}"
+    );
+    assert!(
+        errors.iter().any(|e| e.starts_with("exerciseSeries: ")),
+        "the unreadable exercise log is reported: {errors:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(&vault);
+}
+
+#[tokio::test]
+async fn diet_empty_logs_yield_empty_series_without_errors() {
+    // Present-but-header-only logs are a real state (a fresh vault): both series are
+    // `[]` and, unlike the missing case, nothing is reported.
+    let vault = make_diet_vault();
+    write_vault_file(&vault, "vault/diet-today.js", FIX_TODAY);
+    // Header line only, taken from the fixtures themselves rather than re-typed.
+    let header_of = |csv: &str| format!("{}\n", csv.lines().next().unwrap());
+    write_vault_file(&vault, "diet-logs/food-log.csv", &header_of(FIX_FOOD_CSV));
+    write_vault_file(
+        &vault,
+        "diet-logs/exercise-log.csv",
+        &header_of(FIX_EXERCISE_CSV),
+    );
+    let cfg = Config {
+        vault: vault.to_string_lossy().into_owned(),
+        ..test_config()
+    };
+    let resp = app(AppState::new(cfg))
+        .oneshot(diet_request(Some("Bearer test-token")))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body: Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    assert_eq!(body["sourceSeries"], serde_json::json!([]));
+    assert_eq!(body["exerciseSeries"], serde_json::json!([]));
+    let errors: Vec<&str> = body["errors"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e.as_str().unwrap())
+        .collect();
+    assert!(
+        !errors
+            .iter()
+            .any(|e| e.starts_with("sourceSeries: ") || e.starts_with("exerciseSeries: ")),
+        "an empty log is not an error: {errors:?}"
+    );
 
     let _ = std::fs::remove_dir_all(&vault);
 }
@@ -2858,6 +2978,15 @@ async fn diet_reconstructed_day_has_null_targets_and_real_logs() {
     );
     // weightSeries (the historical chart) is still returned in full.
     assert_eq!(body["weightSeries"].as_array().unwrap().len(), 3);
+    // sourceSeries and exerciseSeries ride along on history exactly as they do on
+    // today: whole-log history, not just the requested day.
+    let ss = body["sourceSeries"].as_array().unwrap();
+    assert_eq!(ss[0]["date"], "2026-04-15");
+    assert_eq!(ss[0]["items"].as_array().unwrap().len(), 4);
+    let es = body["exerciseSeries"].as_array().unwrap();
+    assert_eq!(es[0]["date"], "2026-04-15");
+    assert_eq!(es[0]["kcal"], 740.0);
+    assert_eq!(es[0]["sessions"], 2);
     let _ = std::fs::remove_dir_all(&vault);
 }
 

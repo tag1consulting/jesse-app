@@ -15,6 +15,60 @@ CI both run it). See the "Versioning" section of `bridge/README.md`.
 
 ## [Unreleased]
 
+## [Bridge 0.64.0] - 2026-08-06
+
+### Added
+
+- **`GET /jesse/diet` now carries `sourceSeries` and `exerciseSeries`** — two additive
+  per-day history arrays, attached to BOTH the today response and the historical one
+  exactly as `nutrientSeries` and `weightSeries` already are. Nothing else about the
+  endpoint moved: the today pass-through, per-item day reconstruction, targets, the two
+  existing series and the CSVs are all untouched, so an older client decodes the
+  response unchanged.
+
+  - **`sourceSeries`** answers a question `nutrientSeries` structurally cannot: not "how
+    much magnesium that day" but "which foods delivered it". It is the same per-day pass
+    over `food-log.csv` — the SAME single read the existing series and `availableDays`
+    use, not a second one — but it RETAINS per-item detail:
+    `{ date, items: [ { name, n: { cal, p, f, c, fiber, na, satf, sug, k, ca, o3, mg,
+    unsat } } ] }`, one item per logged row, in the order they were logged.
+
+    Unknown is not zero, the same rule the rest of the micronutrient stack runs on: `n`
+    carries ONLY the keys whose cell was actually KNOWN for that row. A blank cell is
+    OMITTED rather than written as 0, because a food credited with `na: 0` reads as a
+    food that supplied no sodium — a claim the log never made. A written `0` is a known
+    zero and is kept, which is exactly the distinction a blank-to-0 read destroys. A
+    legacy short row that ends before the micro columns keeps its macros and omits what
+    it predates; an item with no known nutrient at all is dropped. Derived `unsat`
+    (`Fat_g` − `SatFat_g`) appears only when both are known, clamped at 0.
+
+    Capped to the most recent 45 dates (`SOURCE_SERIES_MAX_DAYS`), deliberately tighter
+    than the nutrient series' 90: Sources is a recent-foods view, so 45 covers the app's
+    30-day window with headroom while keeping a per-ITEM payload bounded. The app labels
+    the range it shows.
+
+  - **`exerciseSeries`** aggregates the whole `exercise-log.csv` (where
+    `reconstruct_exercise` maps a single date) into `{ date, kcal, sessions }` per day,
+    ascending, capped to 90 dates. The asymmetry with the nutrient rule is intentional
+    and load-bearing: a blank `Calories` cell counts as **0**, not unknown. Exercise
+    kcal is not a micronutrient — a session logged without a calorie figure burned an
+    amount this total does not include, and the day's session count still records that
+    it happened. A date with no rows never appears, so a rest day stays a gap rather
+    than a 0-kcal point the bridge invented.
+
+  Both are `[]` plus one entry in the response's `errors` when their log is missing or
+  unreadable — never `null`, never a panic — so the app renders an empty chart instead
+  of failing to decode. The `exercise-log.csv` read now keeps its `Result` for that
+  reason, the way the food and weight reads already did.
+
+  The unknown-aware cell reader that `nutrient_series` had as a local closure is now the
+  named `opt_cell`, shared by all three series so unknown-awareness has ONE definition
+  rather than a copy per series. `nutrient_series`' behaviour is unchanged; its closure
+  now delegates.
+
+  The "fully populated" diet test vault was missing `exercise-log.csv` — it now has one,
+  so its no-errors assertion tests clean data rather than a hole.
+
 ## [Bridge 0.63.1] - 2026-08-06
 
 ### Fixed
