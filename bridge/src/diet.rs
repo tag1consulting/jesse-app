@@ -758,7 +758,7 @@ pub async fn jesse_diet(
 ) -> Result<Response, ApiError> {
     check_auth(&headers, &st.cfg.token)?;
 
-    let todo = Path::new(&st.cfg.vault).join("todo-list");
+    let todo = Path::new(&st.cfg.vault).join(crate::config::VAULT_SUBDIR);
     let logs = Path::new(&st.cfg.vault).join("diet-logs");
     let days_dir = logs.join("days");
 
