@@ -73,8 +73,16 @@ pub struct Codex;
 /// such surface.** Verified against 0.146.0 with `--strict-config` as an oracle (it rejects
 /// an unknown `-c` field by name): `tools.web_search` exists, and `tools.shell` does NOT —
 /// nor does any other key that would remove the shell. The shell is not an optional tool on
-/// this harness; it is the harness. Codex reaches for it for everything, including reads: a
-/// live turn asked only to read a file ran ``/bin/zsh -lc "sed -n '1p' AGENTS.md"``.
+/// this harness; it is the harness. Codex reaches for it for most things, including reading
+/// a file as text: a live turn asked only to read a file ran
+/// ``/bin/zsh -lc "sed -n '1p' AGENTS.md"``.
+///
+/// "Codex has no way to read a file except the shell" is the wider claim, and it is FALSE —
+/// it ships `view_image`, which takes a path and returns pixels, and 0.146.0 used it for an
+/// unprompted PNG with zero shell events. The narrow claim is what matters here and it
+/// stands: nothing the model reaches for records a compare-and-swap baseline, because the
+/// shell path names no file the bridge can see and `view_image` returns pixels rather than
+/// the bytes a baseline is taken over. See [`CODEX_ATTACHMENTS`] for the measured surface.
 ///
 /// So there is no file-surface / shell-surface asymmetry to exploit here, and the remedy
 /// that closed Claude Code's read escapes — a path-scoped tool grant — HAS NO ANALOGUE.
@@ -141,6 +149,34 @@ pub struct Codex;
 ///
 /// The one thing it must never become is `--dangerously-bypass-approvals-and-sandbox`,
 /// which removes the sandbox entirely. Nothing here constructs that flag.
+/// WHAT CODEX'S `view_image` TAKES, measured against codex-cli 0.146.0 in the read-only
+/// sandbox with the file under the system temp dir — which its sandbox already permits it to
+/// read, so no path had to be granted.
+///
+/// * `png` — transcribed the text printed in the image exactly, on an UNPROMPTED turn, with
+///   zero shell events on the `--json` stream. (`view_image` emits no stdout event of its
+///   own, so its absence from the stream is not evidence it was not used; the pixels
+///   arriving is.)
+/// * `heic` — REFUSED: "image content omitted because it could not be processed". Same hole
+///   as Claude Code's, differently spelled, so the bridge's transcode serves both.
+/// * `pdf` — NOT native, and the reason is worth stating because a model will claim
+///   otherwise. Told explicitly to use `view_image` on a PDF, the model reported that it
+///   "returned the PDF payload successfully" and then immediately shelled out to read the
+///   text anyway. Unprompted, it never called `view_image` at all: `pdftotext` (absent),
+///   then `strings`, then a hand-rolled zlib inflate through `python3`. It got the answer
+///   only because that fixture had a text layer and an interpreter was on PATH; a scanned
+///   nutrition label would have yielded nothing. So PDFs are rasterized to PNG pages for
+///   this harness rather than handed over.
+///
+/// `jpg`, `gif` and `webp` ride the same image path as `png`. They are listed on the
+/// strength of that shared path rather than one probe each — unlike the two entries above,
+/// where the interesting result was a failure and each was measured directly.
+pub static CODEX_ATTACHMENTS: AttachmentSupport = AttachmentSupport {
+    native: &["png", "jpg", "gif", "webp"],
+    instruction: "look at them with the view_image tool as needed to answer. Do not try to \
+                  read them with shell commands.",
+};
+
 pub fn codex_capability_args(capability: Capability) -> Vec<String> {
     let mut args: Vec<String> = Vec::new();
 
@@ -806,8 +842,12 @@ impl Harness for Codex {
 
     /// NONE, and this is the honest answer rather than a stub.
     ///
-    /// Codex has no native read tool whose payload names a file: it reads through the shell,
-    /// which is exactly the case that records no baseline. So a Codex conversation gets the
+    /// Codex has no native read tool whose payload names a file THAT IT READS AS TEXT: it
+    /// reads source through the shell, which is exactly the case that records no baseline.
+    /// (`view_image` does name a path, but it returns pixels to the model rather than the
+    /// bytes a compare-and-swap baseline would be taken over, so it is no help here — see
+    /// [`CODEX_ATTACHMENTS`], which is where the general claim about Codex reading lives.)
+    /// So a Codex conversation gets the
     /// per-file write LOCK (two writes to one path serialize) but not the compare-and-swap
     /// (a lost update through read-then-write is still possible). That is a wider instance of
     /// the hole named in the 0.60.0 CHANGELOG, and it is wider on this harness than on Claude
@@ -821,6 +861,10 @@ impl Harness for Codex {
     /// it builds a real child, because only a spawn knows its own working directory.
     fn capability_args(&self, _cfg: &Config, capability: Capability) -> Vec<String> {
         codex_capability_args(capability)
+    }
+
+    fn attachment_support(&self) -> &'static AttachmentSupport {
+        &CODEX_ATTACHMENTS
     }
 
     /// qmd ALONE. Codex deliberately does not get the Slack server Claude Code carries:

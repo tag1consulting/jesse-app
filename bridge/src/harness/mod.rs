@@ -512,6 +512,21 @@ pub trait Harness: Send + Sync {
     /// Build the child `Command` for one turn — argv, cwd, stdio, env — or refuse.
     fn build_turn(&self, cfg: &Config, req: &TurnRequest<'_>) -> Result<Command, HarnessError>;
 
+    /// HOW THIS HARNESS'S MODEL GETS AT AN ATTACHMENT: the tool to tell it to use, and the
+    /// on-disk types that tool can actually take.
+    ///
+    /// A trait method rather than a constant the handler switches on, for the same reason
+    /// `capability_args` is one: the two answers differ in BOTH halves and the halves must
+    /// not drift apart. Claude Code reads files with `Read`, which takes images and PDFs
+    /// directly; Codex has no `Read` at all and reaches pixels through `view_image`, which
+    /// takes images and not PDFs. A single fragment naming the wrong tool sends the model
+    /// hunting for something it does not have, and a single format list would either
+    /// rasterize PDFs nobody needed rasterized or hand Codex one it cannot open.
+    ///
+    /// The bridge converts anything outside `native` before naming a path — see
+    /// [`prepare_attachments_for_harness`].
+    fn attachment_support(&self) -> &'static AttachmentSupport;
+
     /// A FRESH parser for one spawn attempt. The driver creates one per attempt, so a retry
     /// never sees the previous attempt's half-accumulated state.
     fn parser(&self) -> Box<dyn TurnParser>;

@@ -15,6 +15,71 @@ CI both run it). See the "Versioning" section of `bridge/README.md`.
 
 ## [Unreleased]
 
+## [Bridge 0.62.0] - 2026-08-06
+
+### Fixed
+
+- **A whitelisted attachment could be perfectly readable and still never become an
+  image, because each harness dispatches on what the file is and each has a hole
+  the permission fix does not touch.** Measured on the installed binaries rather
+  than assumed:
+
+  - **HEIC failed on BOTH harnesses.** claude 2.1.223 returned a `.heic` holding
+    valid image bytes as raw binary rather than as an image — silently, with no
+    permission denial involved. codex-cli 0.146.0's `view_image` refused it with
+    "image content omitted because it could not be processed". This is the common
+    case, not an exotic one: a photo straight from the iOS camera roll is HEIC and
+    the composer uploads a picked photo's own bytes verbatim, so only the over-cap
+    path ever re-encoded. HEIC is now transcoded to JPEG in the bridge with `sips`,
+    which ships with macOS — no new dependency, no native codec added to the
+    attachment attack surface, and it runs in the bridge process rather than in a
+    sandboxed child. The converted file goes in the same per-request scratch dir, so
+    the existing `Drop` cleans it, and the original is no longer named in the prompt.
+
+  - **PDF failed on Codex only.** claude 2.1.223 read a PDF directly with `Read`,
+    unprompted, so nothing changes there. Codex never called `view_image` for one at
+    all: it went straight to the shell — `pdftotext` (absent), then `strings`, then
+    a hand-rolled zlib inflate through `python3` — and got the text only because the
+    fixture had a text layer and an interpreter happened to be on PATH. A scanned
+    label would have yielded nothing. PDFs are now rasterized to PNG pages for Codex
+    through the rasterizer already in `vision.rs`, honouring `JESSE_VISION_PDF_DPI`
+    and `JESSE_VISION_PDF_PAGE_CAP` and carrying the same truncation note.
+
+  PNG, JPEG, GIF and WebP were each handed to claude 2.1.223 and came back as
+  content — including a WebP photograph described correctly — so they pass through
+  untouched on both harnesses.
+
+- **The prompt fragment told every model to use the Read tool, and Codex has no
+  Read tool.** The one instruction a Codex turn was given pointed at nothing. The
+  fragment is now the serving harness's own, behind `Harness::attachment_support`,
+  which carries the tool sentence and the format list together so the two cannot
+  drift: Claude Code is told the Read tool takes images and PDFs directly and that
+  no shell is needed; Codex is told to use `view_image` and not to shell out.
+
+- **An attachment with no route now fails loudly instead of vanishing.** A file the
+  model never saw must not look, to the user, like a file the model saw and had
+  nothing to say about. Anything outside both the native list and the conversion
+  table is an error naming the type and the remedy, and a test holds that every type
+  `sniff_attachment` accepts has a route on every harness — so a format cannot be
+  added to the whitelist without someone deciding how it reaches a model.
+
+  **Operationally: `libpdfium` is not installed on the Studio and
+  `JESSE_PDFIUM_LIB` is unset**, so a PDF on a Codex model surfaces that actionable
+  error rather than an answer. That is the intended behaviour of this change and not
+  a regression — the same gap already disabled the vision helper's PDF path — but it
+  is the one route that needs an install before it works.
+
+### Changed
+
+- **Corrected two comments that claimed Codex can only read a file through the
+  shell.** It ships `view_image`, which takes a path and returns pixels, and 0.146.0
+  used it for an unprompted PNG with zero shell events. The narrow, lock-specific
+  claim those comments were really making — that nothing Codex reaches for records a
+  compare-and-swap baseline — is true and is kept, now stated as the narrow claim it
+  is. The CLI image flag (`-i`/`--image`) is deliberately still not emitted: a second
+  route to pixels that already arrive, on a subcommand pair that has already shipped
+  one flag-placement break.
+
 ## [Bridge 0.61.0] - 2026-08-06
 
 ### Fixed

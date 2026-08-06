@@ -149,6 +149,10 @@ impl Harness for ClaudeCode {
         Ok(self.command(cfg, req))
     }
 
+    fn attachment_support(&self) -> &'static AttachmentSupport {
+        &CLAUDE_CODE_ATTACHMENTS
+    }
+
     fn parser(&self) -> Box<dyn TurnParser> {
         Box::new(ClaudeCodeParser)
     }
@@ -605,6 +609,30 @@ pub fn claude_capability_args(cfg: &Config, capability: Capability) -> Vec<Strin
         }
     }
 }
+
+/// WHAT CLAUDE CODE'S `Read` TOOL TAKES, measured against claude 2.1.223 with the file in
+/// an `--add-dir` directory. Each type was handed over and the model asked to report what it
+/// saw; every one below came back as content, not as bytes:
+///
+/// * `png`, `jpg`, `gif` — transcribed the text printed in the image exactly.
+/// * `webp` — described a photograph correctly (a pink water lily on still water).
+/// * `pdf` — reported the page's text, and reached for `Read` UNPROMPTED to do it.
+///
+/// `heic` is deliberately ABSENT: a `.heic` holding valid image bytes came back as raw
+/// binary rather than as an image, silently, with no permission denial involved. The bridge
+/// transcodes it to JPEG before the path is named.
+///
+/// The instruction names `Read` and says no shell is needed. The measured behaviour on this
+/// version was already to use `Read` for a PDF unprompted — the earlier note that an
+/// unprompted PDF went to `Bash` did not reproduce on 2.1.223, in two samples. The sentence
+/// stays because it is one clause, because the allowlist refuses every `pdftotext`-shaped
+/// command it could otherwise try, and because saying so costs nothing on a turn that was
+/// going to do the right thing anyway.
+pub static CLAUDE_CODE_ATTACHMENTS: AttachmentSupport = AttachmentSupport {
+    native: &["png", "jpg", "gif", "webp", "pdf"],
+    instruction: "read them with the Read tool as needed to answer. The Read tool takes \
+                  images and PDFs directly; no shell command is needed and none will work.",
+};
 
 // ---- Argument vectors --------------------------------------------------------
 

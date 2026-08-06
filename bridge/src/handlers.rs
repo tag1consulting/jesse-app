@@ -642,8 +642,20 @@ pub async fn jesse(
                     format!("could not write attachment: {e}"),
                 )
             })?;
+            // CONVERT WHAT THIS HARNESS CANNOT READ, and name its own tool in the prompt.
+            // Both are the serving harness's answer, not the bridge's: HEIC is unreadable on
+            // both harnesses and is transcoded for either, a PDF is native to Claude Code's
+            // `Read` and must be rasterized for Codex, and the sentence naming `Read` would
+            // send a Codex model looking for a tool it does not have. Anything with no route
+            // errors here rather than becoming a turn that silently answers without the file.
+            let support = st.cfg.harnesses.serving(&active).attachment_support();
+            let prepared =
+                prepare_attachments_for_harness(&st.cfg, &scratch, &paths, support)?;
             (
-                format!("{prompt}{}", attachment_prompt_suffix(&paths)),
+                format!(
+                    "{prompt}{}",
+                    attachment_prompt_suffix(&prepared, support.instruction)
+                ),
                 Some(scratch),
                 Vec::new(),
             )

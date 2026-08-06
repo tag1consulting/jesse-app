@@ -666,6 +666,10 @@ mod tests {
             fn build_turn(&self, _c: &Config, _r: &TurnRequest<'_>) -> Result<Command, HarnessError> {
                 Err(HarnessError::unsupported("silent", "a turn"))
             }
+            fn attachment_support(&self) -> &'static AttachmentSupport {
+                // This fixture never spawns, so it never shows anything to anyone.
+                &CLAUDE_CODE_ATTACHMENTS
+            }
             fn parser(&self) -> Box<dyn TurnParser> {
                 unreachable!("never spawned in this test")
             }
