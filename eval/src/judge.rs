@@ -115,9 +115,10 @@ pub struct JudgmentReport {
 /// Read a run's `results.json`.
 fn load_report(dir: &Path) -> Result<RunReport, String> {
     let path = dir.join("results.json");
-    let bytes = std::fs::read(&path)
-        .map_err(|e| format!("could not read {}: {e}", path.display()))?;
-    serde_json::from_slice(&bytes).map_err(|e| format!("invalid results.json in {}: {e}", dir.display()))
+    let bytes =
+        std::fs::read(&path).map_err(|e| format!("could not read {}: {e}", path.display()))?;
+    serde_json::from_slice(&bytes)
+        .map_err(|e| format!("invalid results.json in {}: {e}", dir.display()))
 }
 
 /// Run one judge call via `claude` with NO env overrides (ambient auth + default
@@ -169,7 +170,10 @@ fn run_judge_call(claude_bin: &str, prompt: &str, timeout: Duration) -> Result<S
     let parsed = transcript::parse(&lines);
     parsed.final_answer.ok_or_else(|| {
         let e = err_handle.join().unwrap_or_default();
-        format!("judge produced no answer; stderr: {}", e.lines().rev().take(4).collect::<Vec<_>>().join(" | "))
+        format!(
+            "judge produced no answer; stderr: {}",
+            e.lines().rev().take(4).collect::<Vec<_>>().join(" | ")
+        )
     })
 }
 
@@ -199,9 +203,17 @@ pub fn judge(
         let a_cand = ct.final_answer.clone().unwrap_or_default();
 
         // Call 1: baseline = Answer 1, candidate = Answer 2.
-        let r1 = run_judge_call(claude_bin, &judge_prompt(&rubric, &a_base, &a_cand), timeout);
+        let r1 = run_judge_call(
+            claude_bin,
+            &judge_prompt(&rubric, &a_base, &a_cand),
+            timeout,
+        );
         // Call 2: swapped — candidate = Answer 1, baseline = Answer 2.
-        let r2 = run_judge_call(claude_bin, &judge_prompt(&rubric, &a_cand, &a_base), timeout);
+        let r2 = run_judge_call(
+            claude_bin,
+            &judge_prompt(&rubric, &a_cand, &a_base),
+            timeout,
+        );
 
         let (v1, reasoning1) = split_verdict(&r1);
         let (v2, reasoning2) = split_verdict(&r2);
@@ -348,8 +360,14 @@ mod tests {
     fn parses_verdicts() {
         assert_eq!(parse_verdict("VERDICT: 1\nbecause"), Some(Verdict::One));
         assert_eq!(parse_verdict("verdict: 2"), Some(Verdict::Two));
-        assert_eq!(parse_verdict("VERDICT: TIE\nboth equal"), Some(Verdict::Tie));
-        assert_eq!(parse_verdict("I think answer 2 is best"), Some(Verdict::Two));
+        assert_eq!(
+            parse_verdict("VERDICT: TIE\nboth equal"),
+            Some(Verdict::Tie)
+        );
+        assert_eq!(
+            parse_verdict("I think answer 2 is best"),
+            Some(Verdict::Two)
+        );
         assert_eq!(parse_verdict("no digits here at all"), None);
     }
 }

@@ -826,8 +826,13 @@ pub async fn jesse_conversations(
     for dir in &dirs {
         report_unowned_transcripts(dir, &st.conversations);
     }
-    let conversations =
-        list_conversations_in(&dirs, &st.conversations, params.since, &st.titles, &st.flags);
+    let conversations = list_conversations_in(
+        &dirs,
+        &st.conversations,
+        params.since,
+        &st.titles,
+        &st.flags,
+    );
     let deleted: Vec<Value> = st
         .deletions
         .recent(now_ms)
@@ -2127,9 +2132,7 @@ mod tests {
     fn display_text(delivered: &str) -> String {
         delivered
             .split('\n')
-            .filter(|l| {
-                !l.trim_start().to_uppercase().starts_with("SPOKEN:")
-            })
+            .filter(|l| !l.trim_start().to_uppercase().starts_with("SPOKEN:"))
             .collect::<Vec<_>>()
             .join("\n")
             .trim()
@@ -2402,7 +2405,10 @@ mod tests {
         ]
         .join("\n");
         let ids = transcript_tool_use_ids(transcript.as_bytes());
-        assert_eq!(ids, ["Read_0", "Read_1", "Read_2", "Read_3", "Read_4", "Read_5"]);
+        assert_eq!(
+            ids,
+            ["Read_0", "Read_1", "Read_2", "Read_3", "Read_4", "Read_5"]
+        );
         assert!(duplicate_tool_use_ids(&ids).is_empty());
     }
 
@@ -2518,5 +2524,4 @@ mod tests {
         );
         assert!(dupes.is_empty());
     }
-
 }

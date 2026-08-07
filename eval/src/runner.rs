@@ -97,10 +97,7 @@ pub struct RunReport {
 
 /// Populate a fresh workspace for a fixture task; return the dir to run in.
 /// For vault tasks, returns the real vault path and writes nothing.
-fn prepare_workspace(
-    task: &Task,
-    temp_root: &Path,
-) -> Result<PathBuf, String> {
+fn prepare_workspace(task: &Task, temp_root: &Path) -> Result<PathBuf, String> {
     match task.workspace {
         Workspace::VaultReadonly => Ok(crate::suite::vault_dir()),
         Workspace::Fixture => {
@@ -181,7 +178,10 @@ fn spawn_claude(task: &Task, cwd: &Path, cfg: &RunConfig) -> RawCapture {
         for line in reader.lines() {
             match line {
                 Ok(l) => {
-                    if tx.send((reader_start.elapsed().as_millis() as u64, l)).is_err() {
+                    if tx
+                        .send((reader_start.elapsed().as_millis() as u64, l))
+                        .is_err()
+                    {
                         break;
                     }
                 }
@@ -230,9 +230,21 @@ fn spawn_claude(task: &Task, cwd: &Path, cfg: &RunConfig) -> RawCapture {
         diagnostic = format!("timed out after {}s", cfg.timeout.as_secs());
     } else if !ok {
         let code = status
-            .map(|s| s.code().map(|c| c.to_string()).unwrap_or_else(|| "signal".into()))
+            .map(|s| {
+                s.code()
+                    .map(|c| c.to_string())
+                    .unwrap_or_else(|| "signal".into())
+            })
             .unwrap_or_else(|_| "unknown".into());
-        let tail: String = stderr_text.lines().rev().take(8).collect::<Vec<_>>().into_iter().rev().collect::<Vec<_>>().join("\n");
+        let tail: String = stderr_text
+            .lines()
+            .rev()
+            .take(8)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect::<Vec<_>>()
+            .join("\n");
         diagnostic = format!("claude exited {code}; stderr tail:\n{tail}");
     }
 
@@ -294,8 +306,7 @@ fn replay_mock(task: &Task, cwd: &Path, mock: &MockFile) -> RawCapture {
 
 /// Run a whole suite. Returns the report (also written to `out_dir`).
 pub fn run_suite(suite: &Suite, cfg: &RunConfig) -> Result<RunReport, String> {
-    std::fs::create_dir_all(&cfg.out_dir)
-        .map_err(|e| format!("could not create out dir: {e}"))?;
+    std::fs::create_dir_all(&cfg.out_dir).map_err(|e| format!("could not create out dir: {e}"))?;
     let transcripts_dir = cfg.out_dir.join("transcripts");
     std::fs::create_dir_all(&transcripts_dir)
         .map_err(|e| format!("could not create transcripts dir: {e}"))?;

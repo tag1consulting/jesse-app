@@ -5,12 +5,12 @@
 use std::path::Path;
 
 use jesse_bridge::{
-    app, binary_exists, build_apns, detect_binary_drift, env_string, env_truthy, harness_bin_env,
-    settings_permission_drift, SETTINGS_DRIFT,
-    harness_default_bin, harnesses_in_use, is_bind_allowed, load_local_models,
-    manual_pairing_lines, pairing_payload, show_token_opt_in, spawn_eviction_task,
-    spawn_session_gc_task, start_health_prober, validate_model_config, AppState, Config,
-    bind_broker, serve_broker, BINARY_DRIFT, CONTAINMENT_RECORDS, ConfigError,
+    app, binary_exists, bind_broker, build_apns, detect_binary_drift, env_string, env_truthy,
+    harness_bin_env, harness_default_bin, harnesses_in_use, is_bind_allowed, load_local_models,
+    manual_pairing_lines, pairing_payload, serve_broker, settings_permission_drift,
+    show_token_opt_in, spawn_eviction_task, spawn_session_gc_task, start_health_prober,
+    validate_model_config, AppState, Config, ConfigError, BINARY_DRIFT, CONTAINMENT_RECORDS,
+    SETTINGS_DRIFT,
 };
 
 #[tokio::main]

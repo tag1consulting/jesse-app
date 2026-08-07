@@ -63,7 +63,10 @@ fn harness_for(id: &str) -> Box<dyn Harness> {
 fn the_record_covers_every_row_the_bridge_actually_spawns() {
     for (id, r) in records() {
         let harness = harness_for(id);
-        assert_eq!(r.harness, id, "a record embedded under the wrong harness id");
+        assert_eq!(
+            r.harness, id,
+            "a record embedded under the wrong harness id"
+        );
         assert_eq!(
             r.rows.len(),
             harness.shipped_rows().len(),

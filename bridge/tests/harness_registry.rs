@@ -87,7 +87,10 @@ impl Harness for FixedDirHarness {
         Some(self.0.clone())
     }
     fn build_turn(&self, _cfg: &Config, _req: &TurnRequest<'_>) -> Result<Command, HarnessError> {
-        Err(HarnessError::unsupported("test-fixed-dir", "spawning a child"))
+        Err(HarnessError::unsupported(
+            "test-fixed-dir",
+            "spawning a child",
+        ))
     }
     fn attachment_support(&self) -> &'static AttachmentSupport {
         // Neither fixture ever spawns, so neither ever shows a file to a model.
@@ -440,8 +443,8 @@ fn a_codex_conversation_resumes_across_three_turns() {
         // What this turn will resume, resolved the way the handler resolves it: the
         // conversation's bound session leads, and the request carries nothing.
         let sid = resolve_conversation_resume(&conversations, CID, None);
-        let sid = resolve_resume_session_for_harness(&cfg, &Codex, sid.as_deref())
-            .map(str::to_string);
+        let sid =
+            resolve_resume_session_for_harness(&cfg, &Codex, sid.as_deref()).map(str::to_string);
         resumed.push(sid.clone());
 
         // The argv the harness would actually spawn.
@@ -494,8 +497,7 @@ fn a_codex_conversation_resumes_across_three_turns() {
         let mut done = None;
         for line in [
             format!(r#"{{"type":"thread.started","thread_id":"{thread}"}}"#),
-            r#"{"type":"item.completed","item":{"type":"agent_message","text":"ok"}}"#
-                .to_string(),
+            r#"{"type":"item.completed","item":{"type":"agent_message","text":"ok"}}"#.to_string(),
             r#"{"type":"turn.completed","usage":{"input_tokens":10,"output_tokens":2}}"#
                 .to_string(),
         ] {
@@ -505,7 +507,10 @@ fn a_codex_conversation_resumes_across_three_turns() {
                 _ => {}
             }
         }
-        assert!(matches!(done, Some(ClaudeOutcome::Ok { .. })), "turn {turn} ok");
+        assert!(
+            matches!(done, Some(ClaudeOutcome::Ok { .. })),
+            "turn {turn} ok"
+        );
         assert_eq!(
             spawned.ids(),
             vec![thread.to_string()],

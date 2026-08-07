@@ -343,7 +343,10 @@ pub fn validate_model_config_with_env(
         }
 
         // 4. A level the model's harness has no passing battery row for, in its OWN record.
-        let record = parsed.iter().find(|(id, _)| *id == m.harness).map(|(_, r)| r);
+        let record = parsed
+            .iter()
+            .find(|(id, _)| *id == m.harness)
+            .map(|(_, r)| r);
         match record.and_then(|r| highest_passing_level(r, harness)) {
             Some(highest) if m.level <= highest => {}
             Some(highest) => errors.push(ConfigError::for_model(
@@ -715,7 +718,9 @@ mod tests {
             ..ModelToml::default()
         }];
         let errors = validate(&test_config(), &decl, &claude_only(claude_record()));
-        let e = errors.first().expect("a leftover default_writes must be refused");
+        let e = errors
+            .first()
+            .expect("a leftover default_writes must be refused");
         assert_eq!(e.model.as_deref(), Some("glm-5.2"));
         assert!(e.message.contains("`level`"), "{e}");
         assert!(e.to_string().starts_with("model 'glm-5.2'"), "{e}");
@@ -730,7 +735,9 @@ mod tests {
         }];
         let errors = validate(&test_config(), &decl, &claude_only(claude_record()));
         assert!(
-            errors.iter().any(|e| e.message.contains("unknown level 'wrote'")),
+            errors
+                .iter()
+                .any(|e| e.message.contains("unknown level 'wrote'")),
             "{errors:?}"
         );
     }
@@ -839,7 +846,10 @@ mod tests {
             &format!("schema = {}", crate::containment::RESULTS_SCHEMA),
             "schema = 99",
         );
-        assert!(bumped.contains("schema = 99"), "the forgery must have landed");
+        assert!(
+            bumped.contains("schema = 99"),
+            "the forgery must have landed"
+        );
         let errors = validate(&test_config(), &[], &claude_only(&bumped));
         assert!(!errors.is_empty());
     }
@@ -894,8 +904,11 @@ mod tests {
             };
             for cap in [Capability::Basic, Capability::Read, Capability::Write] {
                 let label = capability_label(cap);
-                let rows: Vec<&RowResult> =
-                    r.rows.iter().filter(|row| row.capability == label).collect();
+                let rows: Vec<&RowResult> = r
+                    .rows
+                    .iter()
+                    .filter(|row| row.capability == label)
+                    .collect();
                 let passing = !rows.is_empty()
                     && rows.iter().all(|row| {
                         row.probes

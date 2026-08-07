@@ -176,9 +176,9 @@ pub use state::*;
 pub use titlestore::*;
 pub use util::*;
 pub use vaultqa::*;
-pub use writelock::*;
 pub use vaultqagate::*;
 pub use vision::*;
+pub use writelock::*;
 
 #[cfg(test)]
 mod testutil;

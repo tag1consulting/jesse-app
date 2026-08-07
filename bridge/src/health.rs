@@ -157,7 +157,9 @@ fn parse_health_interval_override(raw: Option<&str>) -> Result<Option<u64>, Stri
 /// `[[models]]` block; an explicit per-model interval still wins (see
 /// [`resolve_health_interval`]). Read ONCE at registry build so a bad value warns a single time.
 pub fn health_interval_override() -> Option<u64> {
-    match parse_health_interval_override(std::env::var("JESSE_HEALTH_INTERVAL_SECS").ok().as_deref()) {
+    match parse_health_interval_override(
+        std::env::var("JESSE_HEALTH_INTERVAL_SECS").ok().as_deref(),
+    ) {
         Ok(v) => v,
         Err(raw) => {
             eprintln!(
@@ -175,8 +177,15 @@ pub fn health_interval_override() -> Option<u64> {
 /// `JESSE_HEALTH_TIMEOUT_SECS` override, then `entry_default` — which is
 /// [`DEFAULT_HEALTH_TIMEOUT_SECS`] for an ordinary model and
 /// [`REASONING_HEALTH_TIMEOUT_SECS`] for a thinking model that cannot answer inside 3 s.
-pub fn resolve_health_timeout(explicit: Option<u64>, global: Option<u64>, entry_default: u64) -> u64 {
-    explicit.filter(|n| *n > 0).or(global).unwrap_or(entry_default)
+pub fn resolve_health_timeout(
+    explicit: Option<u64>,
+    global: Option<u64>,
+    entry_default: u64,
+) -> u64 {
+    explicit
+        .filter(|n| *n > 0)
+        .or(global)
+        .unwrap_or(entry_default)
 }
 
 /// Pure core of [`health_timeout_override`]: map the raw `JESSE_HEALTH_TIMEOUT_SECS` value to
@@ -200,7 +209,8 @@ fn parse_health_timeout_override(raw: Option<&str>) -> Result<Option<u64>, Strin
 /// explicit per-model timeout still wins (see [`resolve_health_timeout`]). Read ONCE at
 /// registry build so a bad value warns a single time.
 pub fn health_timeout_override() -> Option<u64> {
-    match parse_health_timeout_override(std::env::var("JESSE_HEALTH_TIMEOUT_SECS").ok().as_deref()) {
+    match parse_health_timeout_override(std::env::var("JESSE_HEALTH_TIMEOUT_SECS").ok().as_deref())
+    {
         Ok(v) => v,
         Err(raw) => {
             eprintln!(
@@ -382,7 +392,11 @@ fn now_unix_ms() -> u64 {
 /// Join a backend base url and a probe path into one URL (`base` + `/` + `path`), tolerating
 /// a trailing slash on the base and a leading slash on the path.
 pub fn join_url(base: &str, path: &str) -> String {
-    format!("{}/{}", base.trim_end_matches('/'), path.trim_start_matches('/'))
+    format!(
+        "{}/{}",
+        base.trim_end_matches('/'),
+        path.trim_start_matches('/')
+    )
 }
 
 /// Wire the PRODUCTION prober from app state: build the reqwest probe and the configured
@@ -403,7 +417,11 @@ pub fn start_health_prober(health: Arc<HealthStore>, registry: &ModelRegistry) {
 /// ticking on its own `health.interval_secs` (the first tick fires immediately, so a fresh
 /// deploy is probed at startup). A no-op when there are no targets (an opus-only deploy),
 /// so the health path is entirely absent then. `probe` is the shared network seam.
-pub fn spawn_health_prober(store: Arc<HealthStore>, probe: Arc<dyn HealthProbe>, targets: Vec<ProbeTarget>) {
+pub fn spawn_health_prober(
+    store: Arc<HealthStore>,
+    probe: Arc<dyn HealthProbe>,
+    targets: Vec<ProbeTarget>,
+) {
     for target in targets {
         let store = store.clone();
         let probe = probe.clone();
@@ -592,8 +610,14 @@ mod tests {
         assert_eq!(resolve_health_timeout(Some(0), Some(20), 15), 20);
         assert_eq!(resolve_health_timeout(None, Some(20), 15), 20);
         // Neither set: the entry's own default — 3 s ordinarily, wider for a reasoning model.
-        assert_eq!(resolve_health_timeout(None, None, DEFAULT_HEALTH_TIMEOUT_SECS), 3);
-        assert_eq!(resolve_health_timeout(None, None, REASONING_HEALTH_TIMEOUT_SECS), 15);
+        assert_eq!(
+            resolve_health_timeout(None, None, DEFAULT_HEALTH_TIMEOUT_SECS),
+            3
+        );
+        assert_eq!(
+            resolve_health_timeout(None, None, REASONING_HEALTH_TIMEOUT_SECS),
+            15
+        );
     }
 
     #[test]
@@ -607,7 +631,10 @@ mod tests {
             Ok(Some(MAX_HEALTH_TIMEOUT_SECS))
         );
         // Zero and garbage warn once and fall back, never a hard error.
-        assert_eq!(parse_health_timeout_override(Some("0")), Err("0".to_string()));
+        assert_eq!(
+            parse_health_timeout_override(Some("0")),
+            Err("0".to_string())
+        );
         assert_eq!(
             parse_health_timeout_override(Some("banana")),
             Err("banana".to_string())
@@ -659,22 +686,45 @@ mod tests {
         // An explicit per-model interval still wins over the global override.
         assert_eq!(resolve_health_interval(Some(30), Some(300)), 30);
         // Neither set → the built-in default.
-        assert_eq!(resolve_health_interval(None, None), DEFAULT_HEALTH_INTERVAL_SECS);
+        assert_eq!(
+            resolve_health_interval(None, None),
+            DEFAULT_HEALTH_INTERVAL_SECS
+        );
         // An explicit 0 is not a real interval → fall through to global, then default.
         assert_eq!(resolve_health_interval(Some(0), Some(300)), 300);
-        assert_eq!(resolve_health_interval(Some(0), None), DEFAULT_HEALTH_INTERVAL_SECS);
+        assert_eq!(
+            resolve_health_interval(Some(0), None),
+            DEFAULT_HEALTH_INTERVAL_SECS
+        );
     }
 
     #[test]
     fn parse_health_interval_override_clamps_and_ignores_junk() {
-        assert_eq!(parse_health_interval_override(None), Ok(None), "unset → silent None");
-        assert_eq!(parse_health_interval_override(Some("  ")), Ok(None), "blank → silent None");
+        assert_eq!(
+            parse_health_interval_override(None),
+            Ok(None),
+            "unset → silent None"
+        );
+        assert_eq!(
+            parse_health_interval_override(Some("  ")),
+            Ok(None),
+            "blank → silent None"
+        );
         assert_eq!(parse_health_interval_override(Some("300")), Ok(Some(300)));
         // Floored at MIN_HEALTH_INTERVAL_SECS so a too-eager value can't hammer a backend.
-        assert_eq!(parse_health_interval_override(Some("2")), Ok(Some(MIN_HEALTH_INTERVAL_SECS)));
+        assert_eq!(
+            parse_health_interval_override(Some("2")),
+            Ok(Some(MIN_HEALTH_INTERVAL_SECS))
+        );
         // Zero and unparseable surface as Err(raw) → the caller warns and falls back.
-        assert_eq!(parse_health_interval_override(Some("0")), Err("0".to_string()));
-        assert_eq!(parse_health_interval_override(Some("banana")), Err("banana".to_string()));
+        assert_eq!(
+            parse_health_interval_override(Some("0")),
+            Err("0".to_string())
+        );
+        assert_eq!(
+            parse_health_interval_override(Some("banana")),
+            Err("banana".to_string())
+        );
     }
 
     #[tokio::test]
@@ -684,7 +734,10 @@ mod tests {
         probe_and_record(&target("glm-5.2"), &probe, &store, 1_700_000_000_000).await;
         let s = store.get("glm-5.2").expect("status recorded");
         assert!(s.healthy);
-        assert_eq!(s.checked_at_ms, 1_700_000_000_000, "the injected clock is stamped");
+        assert_eq!(
+            s.checked_at_ms, 1_700_000_000_000,
+            "the injected clock is stamped"
+        );
         assert_eq!(s.latency_ms, Some(42));
         assert_eq!(s.last_error_class, None);
         assert_eq!(probe.calls.load(Ordering::SeqCst), 1);
@@ -741,7 +794,10 @@ mod tests {
             models: vec![glm.clone()],
         };
         let store = HealthStore::seeded(&registry);
-        assert!(model_health(&glm, &store).available(), "seeded configured → available");
+        assert!(
+            model_health(&glm, &store).available(),
+            "seeded configured → available"
+        );
 
         // A failed probe demotes it: configured but not healthy → not available.
         store.set(
@@ -783,6 +839,9 @@ mod tests {
         let store = HealthStore::seeded(&registry);
         let h = model_health(&unarmed, &store);
         assert!(!h.configured && !h.healthy && !h.available());
-        assert!(probe_targets(&registry).is_empty(), "an unconfigured model is not probed");
+        assert!(
+            probe_targets(&registry).is_empty(),
+            "an unconfigured model is not probed"
+        );
     }
 }

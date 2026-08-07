@@ -342,7 +342,10 @@ pub fn codex_provider_args(active: &ActiveModel) -> Option<Vec<String>> {
         "-c".to_string(),
         format!("model_providers.{p}.base_url={}", toml_string(base_url)),
         "-c".to_string(),
-        format!("model_providers.{p}.wire_api={}", toml_string(CODEX_WIRE_API)),
+        format!(
+            "model_providers.{p}.wire_api={}",
+            toml_string(CODEX_WIRE_API)
+        ),
         "-c".to_string(),
         format!(
             "model_providers.{p}.env_key={}",
@@ -388,9 +391,15 @@ pub fn codex_provider_args(active: &ActiveModel) -> Option<Vec<String>> {
 /// `read` child's reads. It scopes what MCP offers; the shell sits beside it. Narrowing what
 /// those shell reads can reach (to the vault, rather than everything the invoking unix user
 /// can read) is unix-user isolation, still pending.
-pub fn codex_mcp_args(harness: &'static str, mcp_config: &str) -> Result<Vec<String>, HarnessError> {
+pub fn codex_mcp_args(
+    harness: &'static str,
+    mcp_config: &str,
+) -> Result<Vec<String>, HarnessError> {
     let parsed: serde_json::Value = serde_json::from_str(mcp_config).map_err(|e| {
-        HarnessError::unsupported(harness, format!("an MCP server set it could not parse ({e})"))
+        HarnessError::unsupported(
+            harness,
+            format!("an MCP server set it could not parse ({e})"),
+        )
     })?;
     let Some(servers) = parsed.get("mcpServers").and_then(|v| v.as_object()) else {
         return Err(HarnessError::unsupported(
@@ -429,10 +438,7 @@ pub fn codex_mcp_args(harness: &'static str, mcp_config: &str) -> Result<Vec<Str
                 .map(toml_string)
                 .collect();
             args.push("-c".to_string());
-            args.push(format!(
-                "mcp_servers.{name}.args=[{}]",
-                rendered.join(", ")
-            ));
+            args.push(format!("mcp_servers.{name}.args=[{}]", rendered.join(", ")));
         }
     }
     Ok(args)
@@ -815,10 +821,7 @@ impl Harness for Codex {
                 match targets.len() {
                     // A patch that names nothing parseable still writes something.
                     0 => WriteTarget::Global,
-                    1 => WriteTarget::Path(resolve_lock_path(
-                        Path::new(&targets[0]),
-                        &payload.cwd,
-                    )),
+                    1 => WriteTarget::Path(resolve_lock_path(Path::new(&targets[0]), &payload.cwd)),
                     // A multi-file patch is ONE atomic tool call, so locking one of its files
                     // would leave the others open. The broker holds one lock per call, so the
                     // sound answer is the coarse one.
@@ -1026,7 +1029,11 @@ pub fn codex_refused_tool(line: &str) -> Option<(&'static str, &str)> {
         return None;
     }
     let msg = line[idx + "error=".len()..].trim();
-    let tool = if msg.starts_with("patch") { "Write" } else { "Bash" };
+    let tool = if msg.starts_with("patch") {
+        "Write"
+    } else {
+        "Bash"
+    };
     Some((tool, msg))
 }
 
@@ -1064,7 +1071,8 @@ impl TurnParser for CodexParser {
                     .unwrap_or_default();
                 match kind {
                     "agent_message" => {
-                        if let Some(text) = item.and_then(|i| i.get("text")).and_then(|t| t.as_str())
+                        if let Some(text) =
+                            item.and_then(|i| i.get("text")).and_then(|t| t.as_str())
                         {
                             // Last one wins — see the struct doc.
                             self.message = Some(text.to_string());
@@ -1277,7 +1285,8 @@ mod tests {
         assert!(cd < at, "`-C` must precede `resume`, argv: {args:?}");
         assert_eq!(args[cd + 1], "/vault/notes", "{args:?}");
         assert_eq!(
-            args[cd + 2], "exec",
+            args[cd + 2],
+            "exec",
             "`-C <dir>` sits directly ahead of `exec`, argv: {args:?}"
         );
         // The ordering the registry test also depends on stays true.
@@ -1310,7 +1319,15 @@ mod tests {
     /// it would be contained against the wrong root.
     #[test]
     fn a_first_turn_still_names_its_working_directory_at_the_root() {
-        let args = build_codex_args("hi", None, Capability::Read, Path::new("/v"), &[], &[], false);
+        let args = build_codex_args(
+            "hi",
+            None,
+            Capability::Read,
+            Path::new("/v"),
+            &[],
+            &[],
+            false,
+        );
         assert_eq!(args[0], "-C", "{args:?}");
         assert_eq!(args[1], "/v", "{args:?}");
         assert_eq!(args[2], "exec", "{args:?}");
@@ -1449,7 +1466,15 @@ mod tests {
     /// provider list appends nothing. The seam is additive or it is a regression.
     #[test]
     fn the_oauth_argv_is_unchanged_by_the_seam() {
-        let plain = build_codex_args("hi", None, Capability::Read, Path::new("/v"), &[], &[], false);
+        let plain = build_codex_args(
+            "hi",
+            None,
+            Capability::Read,
+            Path::new("/v"),
+            &[],
+            &[],
+            false,
+        );
         assert!(
             !plain.iter().any(|a| a.contains("model_provider")),
             "{plain:?}"
@@ -1472,7 +1497,10 @@ mod tests {
             &provider,
             false,
         );
-        assert_eq!(args.last().map(String::as_str), Some("what is the cadence?"));
+        assert_eq!(
+            args.last().map(String::as_str),
+            Some("what is the cadence?")
+        );
         let last_c = args.iter().rposition(|a| a == "-c").expect("a -c override");
         assert!(last_c < args.len() - 1, "{args:?}");
     }
@@ -1538,7 +1566,8 @@ mod tests {
         let (a, b) = (argv(&base), argv(&with));
         assert_eq!(a, b, "an attachment must not move a single Codex argument");
         assert!(
-            !b.iter().any(|x| x == "-i" || x == "--image" || x == "--add-dir"),
+            !b.iter()
+                .any(|x| x == "-i" || x == "--image" || x == "--add-dir"),
             "no image or added-directory flag belongs on this harness: {b:?}"
         );
         let _ = std::fs::remove_dir(&scratch);
@@ -1575,7 +1604,10 @@ mod tests {
         );
 
         let home = PathBuf::from(env.get("CODEX_HOME").expect("a per-turn home"));
-        assert!(home.is_dir(), "the home is made even with no credential in it");
+        assert!(
+            home.is_dir(),
+            "the home is made even with no credential in it"
+        );
         assert!(
             !home.join("auth.json").exists(),
             "a provider turn authenticates from the environment; copying the subscription \
@@ -1599,8 +1631,7 @@ mod tests {
         let line = "2026-08-03T09:12:01Z ERROR codex_core::tools::router: \
                     error=patch rejected: writing is blocked by read-only sandbox \
                     (/vault/notes/private/salary.md)";
-        let Some(StderrSignal::ToolRefused { activity }) = Codex.classify_stderr_line(line)
-        else {
+        let Some(StderrSignal::ToolRefused { activity }) = Codex.classify_stderr_line(line) else {
             panic!("a codex_core::tools error line is a refusal");
         };
         assert_eq!(activity, ToolActivity::refused("Write"));
@@ -1766,5 +1797,4 @@ mod tests {
         };
         assert_eq!(message, "Reconnecting... 5/5");
     }
-
 }

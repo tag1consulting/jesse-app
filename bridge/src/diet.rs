@@ -342,6 +342,22 @@ fn opt_num(s: &str) -> Value {
     s.parse::<f64>().map(|f| json!(f)).unwrap_or(Value::Null)
 }
 
+/// An OPTIONAL numeric cell addressed by header NAME: `Some(f64)` only when the column
+/// exists on this row AND its cell is non-blank AND it parses; blank / unparseable /
+/// absent (a short legacy row that ends before the column) → `None`, meaning UNKNOWN.
+///
+/// This is the one definition of unknown-awareness for the per-day series
+/// ([`nutrient_series`], [`source_series`], [`exercise_series`]) — the same semantics as
+/// [`opt_num`], but yielding `Option<f64>` so a caller can tell unknown apart from 0
+/// instead of collapsing a blank the way the blank-to-0 [`num_or_zero`] item totals do.
+fn opt_cell(idx: &HashMap<String, usize>, rec: &csv::StringRecord, name: &str) -> Option<f64> {
+    idx.get(name)
+        .and_then(|&j| rec.get(j))
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .and_then(|s| s.parse::<f64>().ok())
+}
+
 /// Reconstruct a day's meals from `food-log.csv` for `date`. Rows are grouped into
 /// meals keyed by `(Meal, Time)` (blank Time groups by Meal alone) preserving
 /// first-seen order, then sorted chronologically (null time first). A structurally
@@ -545,16 +561,9 @@ pub fn nutrient_series(food_csv: &str) -> Vec<Value> {
         Err(_) => return vec![],
     };
     // An optional numeric cell by header name → Some(f64) only when present AND
-    // parseable; blank / unparseable / absent (short legacy row) → None (UNKNOWN).
-    // Same semantics as `opt_num`, but yielding Option<f64> so the aggregate can
-    // count known vs unknown rather than collapsing a blank to 0.
-    let opt = |rec: &csv::StringRecord, name: &str| -> Option<f64> {
-        idx.get(name)
-            .and_then(|&j| rec.get(j))
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .and_then(|s| s.parse::<f64>().ok())
-    };
+    // parseable; blank / unparseable / absent (short legacy row) → None (UNKNOWN), so
+    // the aggregate can count known vs unknown rather than collapsing a blank to 0.
+    let opt = |rec: &csv::StringRecord, name: &str| -> Option<f64> { opt_cell(&idx, rec, name) };
 
     // Date (ascending, deduped) → nutrient key → tally. BTreeMap keeps dates sorted
     // so the 90-cap can keep the most recent tail and emit ascending.
@@ -608,6 +617,148 @@ pub fn nutrient_series(food_csv: &str) -> Vec<Value> {
         out.push(json!({ "date": date, "nutrients": Value::Object(nutrients) }));
     }
     out
+}
+
+/// The 45-most-recent-dates cap on [`source_series`]. Deliberately tighter than
+/// [`NUTRIENT_SERIES_MAX_DAYS`]: Sources is a RECENT-foods view (which foods actually
+/// delivered a nutrient lately), so 45 covers the app's 30-day window with headroom
+/// while keeping a per-ITEM payload — which is far larger than the per-day nutrient
+/// aggregate — bounded. The app labels the range it is showing.
+const SOURCE_SERIES_MAX_DAYS: usize = 45;
+
+/// The 90-most-recent-dates cap on [`exercise_series`], matching
+/// [`NUTRIENT_SERIES_MAX_DAYS`]: both are per-day aggregates over the same span.
+const EXERCISE_SERIES_MAX_DAYS: usize = 90;
+
+/// Build `sourceSeries`: the same per-day pass as [`nutrient_series`] over
+/// `food-log.csv`, but RETAINING per-food-item detail so the app can answer "which
+/// foods delivered this nutrient" rather than only "how much". One object per DATE
+/// ascending, capped to the most recent [`SOURCE_SERIES_MAX_DAYS`] dates:
+///
+/// ```text
+/// { "date": "YYYY-MM-DD", "items": [ { "name": "Soup", "n": { "cal": 220, ... } } ] }
+/// ```
+///
+/// UNKNOWN IS NOT ZERO, exactly as in [`nutrient_series`]: `n` carries ONLY the keys
+/// whose cell was KNOWN for that row (via [`opt_cell`]) — a blank/unparseable/absent
+/// cell is OMITTED, never stored as 0, so no downstream sum can read it as a real zero
+/// contribution. An item with no known nutrient at all is dropped; an item with some is
+/// kept with whatever it knows (a legacy short row keeps its macros and omits the micros
+/// it predates). Row order within a day is preserved. Pure and unit-testable;
+/// std/serde_json only, flexible reader, columns by header NAME.
+pub fn source_series(food_csv: &str) -> Vec<Value> {
+    let mut rdr = csv::ReaderBuilder::new()
+        .has_headers(true)
+        .flexible(true)
+        .from_reader(food_csv.as_bytes());
+    let idx = match rdr.headers() {
+        Ok(h) => header_index(h),
+        Err(_) => return vec![],
+    };
+
+    // Date (ascending, deduped) → that day's items in FILE order. BTreeMap keeps dates
+    // sorted so the cap can keep the most recent tail and emit ascending; the Vec keeps
+    // rows in the order they were logged.
+    let mut by_day: BTreeMap<String, Vec<Value>> = BTreeMap::new();
+    for rec in rdr.records().flatten() {
+        let date = idx
+            .get("Date")
+            .and_then(|&j| rec.get(j))
+            .unwrap_or("")
+            .trim();
+        // Only real ISO dates form a series bucket (mirrors `nutrient_series`).
+        if valid_iso_date(date).is_none() {
+            continue;
+        }
+        let name = idx
+            .get("Item")
+            .and_then(|&j| rec.get(j))
+            .unwrap_or("")
+            .trim();
+        // Known nutrients only, emitted in the nutrient table's order for a stable shape.
+        let mut n = serde_json::Map::new();
+        for &(key, col) in nutrient_cols() {
+            if let Some(v) = opt_cell(&idx, &rec, col) {
+                n.insert(key.to_string(), json!(v));
+            }
+        }
+        // Derived unsaturated fat: present ONLY when BOTH Fat_g and SatFat_g are known
+        // (same rule as `nutrient_series`), with a rounding-negative clamped to 0.
+        if let (Some(f), Some(sf)) = (
+            opt_cell(&idx, &rec, "Fat_g"),
+            opt_cell(&idx, &rec, "SatFat_g"),
+        ) {
+            n.insert("unsat".to_string(), json!((f - sf).max(0.0)));
+        }
+        // A row that knows NOTHING carries no source information — drop it rather than
+        // emit an item whose empty `n` would read as a food that supplied zero of
+        // everything. This is the ONLY reason an item is omitted.
+        if n.is_empty() {
+            continue;
+        }
+        by_day
+            .entry(date.to_string())
+            .or_default()
+            .push(json!({ "name": name, "n": Value::Object(n) }));
+    }
+
+    let skip = by_day.len().saturating_sub(SOURCE_SERIES_MAX_DAYS);
+    by_day
+        .into_iter()
+        .skip(skip)
+        .map(|(date, items)| json!({ "date": date, "items": items }))
+        .collect()
+}
+
+/// Build `exerciseSeries`: a per-day aggregate over the WHOLE `exercise-log.csv` (where
+/// [`reconstruct_exercise`] maps a single date's sessions), one object per DATE
+/// ascending, capped to the most recent [`EXERCISE_SERIES_MAX_DAYS`] dates:
+///
+/// ```text
+/// { "date": "YYYY-MM-DD", "kcal": 800.0, "sessions": 2 }
+/// ```
+///
+/// `kcal` is the sum of the `Calories` column that date and `sessions` the number of
+/// rows. Note the deliberate asymmetry with the nutrient stack: a blank session-calorie
+/// counts as **0**, not unknown. Exercise kcal is not a micronutrient — a session logged
+/// without a calorie figure burned an unrecorded amount that this total simply does not
+/// include, and the day's session COUNT still carries that it happened. A date with no
+/// rows never appears. Pure and unit-testable; flexible reader, columns by header NAME.
+pub fn exercise_series(ex_csv: &str) -> Vec<Value> {
+    let mut rdr = csv::ReaderBuilder::new()
+        .has_headers(true)
+        .flexible(true)
+        .from_reader(ex_csv.as_bytes());
+    let idx = match rdr.headers() {
+        Ok(h) => header_index(h),
+        Err(_) => return vec![],
+    };
+
+    // Date → (kcal so far, session count). BTreeMap for the sorted tail + ascending emit.
+    let mut by_day: BTreeMap<String, (f64, u64)> = BTreeMap::new();
+    for rec in rdr.records().flatten() {
+        let date = idx
+            .get("Date")
+            .and_then(|&j| rec.get(j))
+            .unwrap_or("")
+            .trim();
+        if valid_iso_date(date).is_none() {
+            continue;
+        }
+        // Blank/unparseable Calories → a 0 contribution to the total (see above), while
+        // the row still counts as a session.
+        let kcal = opt_cell(&idx, &rec, "Calories").unwrap_or(0.0);
+        let day = by_day.entry(date.to_string()).or_insert((0.0, 0));
+        day.0 += kcal;
+        day.1 += 1;
+    }
+
+    let skip = by_day.len().saturating_sub(EXERCISE_SERIES_MAX_DAYS);
+    by_day
+        .into_iter()
+        .skip(skip)
+        .map(|(date, (kcal, sessions))| json!({ "date": date, "kcal": kcal, "sessions": sessions }))
+        .collect()
 }
 
 /// Reconstruct a day's exercise from `exercise-log.csv` for `date`, mapped to the
@@ -808,7 +959,11 @@ pub async fn jesse_diet(
     let food_path = logs.join("food-log.csv");
     let food_read = std::fs::read_to_string(&food_path);
     let food_csv = food_read.as_deref().ok();
-    let exercise_csv = std::fs::read_to_string(logs.join("exercise-log.csv")).ok();
+    // The exercise read keeps its Result (rather than collapsing to Option) for the same
+    // reason the food and weight reads do: `exerciseSeries` reports WHY it is empty.
+    let exercise_path = logs.join("exercise-log.csv");
+    let exercise_read = std::fs::read_to_string(&exercise_path);
+    let exercise_csv = exercise_read.as_deref().ok();
     let weight_path = logs.join("weight-log.csv");
     let weight_read = std::fs::read_to_string(&weight_path);
 
@@ -849,6 +1004,34 @@ pub async fn jesse_diet(
         ),
     };
 
+    // sourceSeries: shared by today and history (the Sources view is inherently
+    // historical), built from the SAME food-log.csv read as nutrientSeries. Like
+    // nutrientSeries, a missing/unreadable file → `[]` + one error, never null.
+    let (source_series_val, source_errors): (Value, Vec<String>) = match &food_read {
+        Ok(content) => (Value::Array(source_series(content)), Vec::new()),
+        Err(e) => (
+            Value::Array(vec![]),
+            vec![format!(
+                "sourceSeries: cannot read {}: {e}",
+                food_path.display()
+            )],
+        ),
+    };
+
+    // exerciseSeries: shared by today and history, built from the SAME
+    // exercise-log.csv read that feeds availableDays and reconstruction. Missing or
+    // unreadable → `[]` + one error, never null.
+    let (exercise_series_val, exercise_errors): (Value, Vec<String>) = match &exercise_read {
+        Ok(content) => (Value::Array(exercise_series(content)), Vec::new()),
+        Err(e) => (
+            Value::Array(vec![]),
+            vec![format!(
+                "exerciseSeries: cannot read {}: {e}",
+                exercise_path.display()
+            )],
+        ),
+    };
+
     // availableDays: union of every date the app can page to, sorted + deduped.
     let mut days: BTreeSet<String> = BTreeSet::new();
     if !today_date.is_empty() {
@@ -857,7 +1040,7 @@ pub async fn jesse_diet(
     if let Some(c) = food_csv {
         days.extend(csv_dates(c));
     }
-    if let Some(c) = &exercise_csv {
+    if let Some(c) = exercise_csv {
         days.extend(csv_dates(c));
     }
     if let Ok(c) = &weight_read {
@@ -903,6 +1086,8 @@ pub async fn jesse_diet(
         };
         errors.extend(weight_errors);
         errors.extend(nutrient_errors);
+        errors.extend(source_errors);
+        errors.extend(exercise_errors);
 
         return Ok(Json(json!({
             "asOf": rfc3339_utc(SystemTime::now()),
@@ -913,6 +1098,8 @@ pub async fn jesse_diet(
             "coach": coach,
             "weightSeries": weight_series,
             "nutrientSeries": nutrient_series_val,
+            "sourceSeries": source_series_val,
+            "exerciseSeries": exercise_series_val,
             "errors": errors,
             "availableDays": available,
             "historical": false,
@@ -947,23 +1134,15 @@ pub async fn jesse_diet(
             Err(e) => {
                 // Archive present but broken: fall back to reconstruction, note it.
                 errors.push(format!("archive: {e}"));
-                let (recon, errs) = reconstruct_day(
-                    &date,
-                    food_csv,
-                    exercise_csv.as_deref(),
-                    weight_read.as_deref().ok(),
-                );
+                let (recon, errs) =
+                    reconstruct_day(&date, food_csv, exercise_csv, weight_read.as_deref().ok());
                 errors.extend(errs);
                 (recon, "reconstructed", None)
             }
         },
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            let (recon, errs) = reconstruct_day(
-                &date,
-                food_csv,
-                exercise_csv.as_deref(),
-                weight_read.as_deref().ok(),
-            );
+            let (recon, errs) =
+                reconstruct_day(&date, food_csv, exercise_csv, weight_read.as_deref().ok());
             errors.extend(errs);
             (recon, "reconstructed", None)
         }
@@ -972,18 +1151,16 @@ pub async fn jesse_diet(
                 "archive: cannot read {}: {e}",
                 archive_path.display()
             ));
-            let (recon, errs) = reconstruct_day(
-                &date,
-                food_csv,
-                exercise_csv.as_deref(),
-                weight_read.as_deref().ok(),
-            );
+            let (recon, errs) =
+                reconstruct_day(&date, food_csv, exercise_csv, weight_read.as_deref().ok());
             errors.extend(errs);
             (recon, "reconstructed", None)
         }
     };
     errors.extend(weight_errors);
     errors.extend(nutrient_errors);
+    errors.extend(source_errors);
+    errors.extend(exercise_errors);
 
     // Historical requests never carry proposed/progress/coach — those files
     // describe the CURRENT state, so attaching them to a past date would be wrong.
@@ -996,6 +1173,8 @@ pub async fn jesse_diet(
         "coach": Value::Null,
         "weightSeries": weight_series,
         "nutrientSeries": nutrient_series_val,
+        "sourceSeries": source_series_val,
+        "exerciseSeries": exercise_series_val,
         "errors": errors,
         "availableDays": available,
         "historical": true,
@@ -1640,6 +1819,254 @@ mod tests {
         let n = day_nutrients(&series, "2026-04-15").expect("day present");
         assert_eq!(n["unsat"]["sum"], 0.0, "9 - 9.1 clamps to 0, not negative");
         assert_eq!(n["unsat"]["known"], 1);
+    }
+
+    // ---- source_series -----------------------------------------------------
+
+    /// The items array for `date` in a source series, or None if that date is absent.
+    fn day_items<'a>(series: &'a [Value], date: &str) -> Option<&'a Vec<Value>> {
+        series
+            .iter()
+            .find(|d| d["date"] == json!(date))
+            .and_then(|d| d["items"].as_array())
+    }
+
+    #[test]
+    fn source_series_keeps_both_items_of_a_day_in_file_order() {
+        let csv = format!(
+            "{h}\n\
+             2026-04-15,Lunch,Soup,1,bowl,,,220,8,6,30,,12:00,Lunch,7,480,2.5,9,610,120,300,45\n\
+             2026-04-15,Dinner,Beans,1,cup,,,240,15,1,40,,18:00,Dinner,12,5,0.2,2,500,80,50,60\n",
+            h = food_header()
+        );
+        let series = source_series(&csv);
+        assert_eq!(series.len(), 1, "one day");
+        assert_eq!(series[0]["date"], "2026-04-15");
+        let items = day_items(&series, "2026-04-15").expect("day present");
+        assert_eq!(items.len(), 2, "both items retained (not aggregated)");
+        // File order, not time order — the app groups; the bridge preserves the log.
+        assert_eq!(items[0]["name"], "Soup");
+        assert_eq!(items[1]["name"], "Beans");
+        // Per-item nutrients, NOT the day's sum.
+        assert_eq!(items[0]["n"]["k"], 610.0);
+        assert_eq!(items[1]["n"]["k"], 500.0);
+        assert_eq!(items[0]["n"]["cal"], 220.0);
+        // Derived unsat is per item: 6 - 2.5.
+        assert_eq!(items[0]["n"]["unsat"], 3.5);
+    }
+
+    #[test]
+    fn source_series_blank_cell_omits_the_key_rather_than_storing_zero() {
+        // The Chips row has a BLANK Sodium_mg. Its `n` must omit `na` entirely — an
+        // `na: 0` would be a false claim that the food supplied no sodium.
+        let csv = format!(
+            "{h}\n\
+             2026-04-15,Lunch,Soup,1,bowl,,,220,8,6,30,,12:00,Lunch,7,480,2.5,9,610,120,300,45\n\
+             2026-04-15,Snack,Chips,1,bag,,,150,2,10,15,,15:00,Snack,1,,1.0,0,50,10,0,20\n",
+            h = food_header()
+        );
+        let series = source_series(&csv);
+        let items = day_items(&series, "2026-04-15").expect("day present");
+        assert_eq!(items[0]["n"]["na"], 480.0, "known sodium kept");
+        assert!(
+            items[1]["n"].get("na").is_none(),
+            "blank sodium → key omitted, never na: 0"
+        );
+        // Everything else the Chips row DOES know is still there.
+        assert_eq!(items[1]["n"]["cal"], 150.0);
+        assert_eq!(items[1]["n"]["k"], 50.0);
+        // A genuine zero cell is a KNOWN zero and is kept — the distinction blank-to-0
+        // would destroy.
+        assert_eq!(items[1]["n"]["o3"], 0.0, "a written 0 is known, and kept");
+    }
+
+    #[test]
+    fn source_series_unsat_omitted_when_satfat_unknown() {
+        // Item A: fat 14 and satfat 2 known → unsat 12. Item B: fat known, satfat
+        // BLANK → unsat cannot be derived, so the key is absent (not 14, not 0).
+        let csv = format!(
+            "{h}\n\
+             2026-04-15,Lunch,Nuts,28,g,,,164,6,14,6,,12:00,Lunch,3,5,2,1,200,80,100,60\n\
+             2026-04-15,Snack,Oil,1,tbsp,,,120,0,14,0,,15:00,Snack,0,0,,0,0,0,0,0\n",
+            h = food_header()
+        );
+        let series = source_series(&csv);
+        let items = day_items(&series, "2026-04-15").expect("day present");
+        assert_eq!(items[0]["n"]["unsat"], 12.0, "14 - 2");
+        assert_eq!(items[0]["n"]["satf"], 2.0);
+        assert!(
+            items[1]["n"].get("unsat").is_none(),
+            "blank SatFat_g → unsat omitted"
+        );
+        assert!(
+            items[1]["n"].get("satf").is_none(),
+            "blank SatFat_g → satf omitted too"
+        );
+        assert_eq!(items[1]["n"]["f"], 14.0, "the known fat survives");
+    }
+
+    #[test]
+    fn source_series_legacy_short_row_keeps_macros_omits_missing_micros() {
+        // A row that ends before the micro columns is not malformed: it keeps what it
+        // has and omits what it predates.
+        let csv = format!(
+            "{h}\n\
+             2026-03-30,Breakfast,Toast,2,ea,,,180,6,2,32,,08:00,Breakfast,3\n",
+            h = food_header()
+        );
+        let series = source_series(&csv);
+        let items = day_items(&series, "2026-03-30").expect("day present");
+        assert_eq!(items.len(), 1);
+        let n = &items[0]["n"];
+        assert_eq!(items[0]["name"], "Toast");
+        assert_eq!(n["cal"], 180.0);
+        assert_eq!(n["p"], 6.0);
+        assert_eq!(n["c"], 32.0);
+        assert_eq!(n["fiber"], 3.0, "Fiber_g is this row's last field");
+        assert!(n.get("na").is_none(), "row ends before Sodium_mg → omitted");
+        assert!(
+            n.get("k").is_none(),
+            "row ends before Potassium_mg → omitted"
+        );
+        assert!(n.get("unsat").is_none(), "no SatFat_g → no unsat");
+    }
+
+    #[test]
+    fn source_series_item_with_no_known_nutrient_is_omitted() {
+        // Water knows nothing; the Soup row on the same day does. The day appears with
+        // ONLY the soup.
+        let csv = format!(
+            "{h}\n\
+             2026-04-15,Snack,Water,1,glass,,,,,,,,15:00,Snack,\n\
+             2026-04-15,Lunch,Soup,1,bowl,,,220,8,6,30,,12:00,Lunch,7,480,2.5,9,610,120,300,45\n",
+            h = food_header()
+        );
+        let series = source_series(&csv);
+        let items = day_items(&series, "2026-04-15").expect("day present");
+        assert_eq!(items.len(), 1, "the all-unknown row is dropped");
+        assert_eq!(items[0]["name"], "Soup");
+
+        // And a day whose ONLY row knows nothing does not appear at all.
+        let csv = format!(
+            "{h}\n\
+             2026-04-15,Snack,Water,1,glass,,,,,,,,15:00,Snack,\n",
+            h = food_header()
+        );
+        assert!(
+            source_series(&csv).is_empty(),
+            "no known nutrient anywhere → no day"
+        );
+    }
+
+    #[test]
+    fn source_series_caps_at_forty_five_most_recent_dates_ascending() {
+        // 60 distinct dates → exactly the most recent 45, ascending; the oldest 15 are
+        // dropped entirely.
+        let dates = &ninety_plus_dates()[..60];
+        let mut csv = String::from(food_header());
+        csv.push('\n');
+        for d in dates {
+            csv.push_str(&format!(
+                "{d},Snack,Bite,1,ea,,,100,5,2,10,,12:00,Snack,1,50,0.5,1,100,20,10,15\n"
+            ));
+        }
+        let series = source_series(&csv);
+        assert_eq!(series.len(), 45, "capped to 45");
+        assert_eq!(series[0]["date"], dates[15], "oldest kept is #16 of 60");
+        assert_eq!(series[44]["date"], dates[59], "newest kept is the last");
+        let dates_out: Vec<&str> = series.iter().map(|d| d["date"].as_str().unwrap()).collect();
+        let mut sorted = dates_out.clone();
+        sorted.sort_unstable();
+        assert_eq!(dates_out, sorted, "emitted ascending");
+    }
+
+    #[test]
+    fn source_series_missing_header_and_empty_body_yield_empty_no_panic() {
+        assert!(source_series(&format!("{h}\n", h = food_header())).is_empty());
+        assert!(source_series("").is_empty());
+    }
+
+    // ---- exercise_series ---------------------------------------------------
+
+    /// The day object for `date` in an exercise series, or None if absent.
+    fn day_exercise<'a>(series: &'a [Value], date: &str) -> Option<&'a Value> {
+        series.iter().find(|d| d["date"] == json!(date))
+    }
+
+    #[test]
+    fn exercise_series_sums_calories_and_counts_sessions_per_day() {
+        let csv = format!(
+            "{EX_HEADER}\n\
+             2026-04-15,run,Morning run,8.0,56:58,7:07,45,142,168,500,plan,easy,06:30\n\
+             2026-04-15,strength,Evening lift,,0:45:00,,,110,,300,plan,gym,18:00\n\
+             2026-04-16,run,Recovery,5.0,40:00,8:00,10,130,166,260,plan,,07:00\n"
+        );
+        let series = exercise_series(&csv);
+        assert_eq!(series.len(), 2, "two days");
+        let d15 = day_exercise(&series, "2026-04-15").expect("day present");
+        assert_eq!(d15["kcal"], 800.0, "500 + 300");
+        assert_eq!(d15["sessions"], 2);
+        let d16 = day_exercise(&series, "2026-04-16").expect("day present");
+        assert_eq!(d16["kcal"], 260.0);
+        assert_eq!(d16["sessions"], 1);
+        // Ascending.
+        assert_eq!(series[0]["date"], "2026-04-15");
+        assert_eq!(series[1]["date"], "2026-04-16");
+    }
+
+    #[test]
+    fn exercise_series_blank_calories_contributes_zero_not_an_error() {
+        // Deliberately NOT the micronutrient rule: a session with no calorie figure
+        // adds 0 to the total (and is not an error), but still counts as a session.
+        let csv = format!(
+            "{EX_HEADER}\n\
+             2026-04-15,run,Morning run,8.0,56:58,7:07,45,142,168,500,plan,easy,06:30\n\
+             2026-04-15,walk,Evening walk,2.0,30:00,,,,,,plan,,20:00\n"
+        );
+        let series = exercise_series(&csv);
+        let d = day_exercise(&series, "2026-04-15").expect("day present");
+        assert_eq!(d["kcal"], 500.0, "blank Calories adds 0");
+        assert_eq!(d["sessions"], 2, "the blank-calorie session still counts");
+    }
+
+    #[test]
+    fn exercise_series_date_with_no_rows_does_not_appear() {
+        // Only 2026-04-15 has rows; the surrounding days are simply absent (a rest day
+        // is a gap, not a 0-kcal point the bridge invents).
+        let csv = format!(
+            "{EX_HEADER}\n\
+             2026-04-15,run,Morning run,8.0,56:58,7:07,45,142,168,500,plan,easy,06:30\n"
+        );
+        let series = exercise_series(&csv);
+        assert_eq!(series.len(), 1);
+        assert!(day_exercise(&series, "2026-04-14").is_none());
+        assert!(day_exercise(&series, "2026-04-16").is_none());
+    }
+
+    #[test]
+    fn exercise_series_caps_at_ninety_most_recent_dates_ascending() {
+        let dates = ninety_plus_dates(); // 100 consecutive dates
+        let mut csv = String::from(EX_HEADER);
+        csv.push('\n');
+        for d in &dates {
+            csv.push_str(&format!(
+                "{d},run,Daily,5.0,40:00,8:00,10,130,166,300,plan,,07:00\n"
+            ));
+        }
+        let series = exercise_series(&csv);
+        assert_eq!(series.len(), 90, "capped to 90");
+        assert_eq!(series[0]["date"], dates[10], "oldest kept is #11 of 100");
+        assert_eq!(series[89]["date"], dates[99], "newest kept is the last");
+        let dates_out: Vec<&str> = series.iter().map(|d| d["date"].as_str().unwrap()).collect();
+        let mut sorted = dates_out.clone();
+        sorted.sort_unstable();
+        assert_eq!(dates_out, sorted, "emitted ascending");
+    }
+
+    #[test]
+    fn exercise_series_missing_header_and_empty_body_yield_empty_no_panic() {
+        assert!(exercise_series(&format!("{EX_HEADER}\n")).is_empty());
+        assert!(exercise_series("").is_empty());
     }
 
     // ---- reconstruct_exercise ----------------------------------------------

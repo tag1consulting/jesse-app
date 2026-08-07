@@ -220,8 +220,7 @@ pub fn append_shadow_pair(cfg: &Config, pair: &ShadowPair) {
 }
 
 fn append_shadow_pair_to(path: &str, pair: &ShadowPair) -> std::io::Result<()> {
-    let line = serde_json::to_string(pair)
-        .map_err(std::io::Error::other)?;
+    let line = serde_json::to_string(pair).map_err(std::io::Error::other)?;
     if let Some(parent) = Path::new(path)
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
@@ -685,9 +684,7 @@ pub fn parse_verdict(text: &str) -> Option<JudgeVerdict> {
             break; // first meaningful token after "verdict" decides (or falls through)
         }
     }
-    lower
-        .split(|c: char| !c.is_alphanumeric())
-        .find_map(token)
+    lower.split(|c: char| !c.is_alphanumeric()).find_map(token)
 }
 
 /// Combine the two ordering verdicts into a pair outcome. Call 1 presents HOSTED as
@@ -828,8 +825,7 @@ impl ShadowAuditState {
         if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
             std::fs::create_dir_all(parent)?;
         }
-        let body = serde_json::to_string_pretty(self)
-            .map_err(std::io::Error::other)?;
+        let body = serde_json::to_string_pretty(self).map_err(std::io::Error::other)?;
         std::fs::write(path, body)
     }
 }

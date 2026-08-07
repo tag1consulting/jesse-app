@@ -680,7 +680,11 @@ impl JobStore {
     pub fn stream_subscribe(
         &self,
         id: &str,
-    ) -> Option<(String, Option<ToolActivity>, broadcast::Receiver<StreamFrame>)> {
+    ) -> Option<(
+        String,
+        Option<ToolActivity>,
+        broadcast::Receiver<StreamFrame>,
+    )> {
         self.streams.subscribe(id)
     }
 

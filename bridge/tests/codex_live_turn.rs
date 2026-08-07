@@ -38,7 +38,9 @@ fn live_config(vault: &std::path::Path) -> Config {
         std::env::var("JESSE_CODEX_BIN").expect("set JESSE_CODEX_BIN to the pinned codex binary");
     cfg.timeout_secs = 300;
     // Both harnesses registered, exactly as a deploy with a Codex model configured builds it.
-    cfg.harnesses = Arc::new(HarnessRegistry::for_models(KNOWN_HARNESS_IDS.iter().copied()));
+    cfg.harnesses = Arc::new(HarnessRegistry::for_models(
+        KNOWN_HARNESS_IDS.iter().copied(),
+    ));
     cfg
 }
 
@@ -152,7 +154,10 @@ async fn a_codex_turn_answers_and_shows_what_it_was_doing() {
     let (text, session, _usage) = out.expect("a live Codex turn should answer");
     eprintln!("answer: {text}\nthread: {session:?}\nactivity: {acts:?}");
 
-    assert!(!text.trim().is_empty(), "the answer arrived whole, not empty");
+    assert!(
+        !text.trim().is_empty(),
+        "the answer arrived whole, not empty"
+    );
     assert!(
         text.to_lowercase().contains("tuesday"),
         "the child actually read the file: {text}"
@@ -162,7 +167,10 @@ async fn a_codex_turn_answers_and_shows_what_it_was_doing() {
         1,
         "the thread id is reported from thread.started, before any answer exists"
     );
-    assert_eq!(session.as_deref(), spawned.ids().first().map(String::as_str));
+    assert_eq!(
+        session.as_deref(),
+        spawned.ids().first().map(String::as_str)
+    );
     assert!(
         !acts.is_empty(),
         "a whole-answer turn MUST push activity — with none, the client shows a spinner and \
@@ -238,7 +246,10 @@ async fn a_kimi_turn_uses_a_tool_through_codex_against_an_openai_provider() {
         "answer: {text}\nthread: {session:?}\nusage: {usage:?}\nactivity: {acts:?}\nelapsed: {elapsed:?}"
     );
 
-    assert!(!text.trim().is_empty(), "the answer arrived whole, not empty");
+    assert!(
+        !text.trim().is_empty(),
+        "the answer arrived whole, not empty"
+    );
     assert!(
         text.to_lowercase().contains("tuesday"),
         "the child actually read the file rather than guessing: {text}"

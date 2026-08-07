@@ -264,7 +264,11 @@ mod tests {
         store.set("sess-b", "Roof Notes");
         store.remove("sess-a");
         assert_eq!(store.get("sess-a"), None, "removed title is gone");
-        assert_eq!(store.get("sess-b").as_deref(), Some("Roof Notes"), "others untouched");
+        assert_eq!(
+            store.get("sess-b").as_deref(),
+            Some("Roof Notes"),
+            "others untouched"
+        );
         // No-ops.
         store.remove("ghost");
         store.remove("");

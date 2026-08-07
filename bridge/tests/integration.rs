@@ -331,11 +331,7 @@ async fn cancel_running_turn_kills_child_and_frees_slot() {
     let body: Value = serde_json::from_str(&body_string(resp).await).unwrap();
     let job_id = body["job_id"].as_str().unwrap().to_string();
     // The turn holds the only permit while it runs.
-    assert_eq!(
-        st.slots.ceiling_free(),
-        0,
-        "running turn holds the permit"
-    );
+    assert_eq!(st.slots.ceiling_free(), 0, "running turn holds the permit");
 
     // Cancel it.
     let resp = app(st.clone())
@@ -861,7 +857,7 @@ async fn queue_full_sheds_with_429() {
     let cfg = Config {
         claude_bin: fake.to_string_lossy().into_owned(),
         concurrency: ConcurrencySettings::uniform(1, &["opus"]), // exactly one permit
-        max_queued: 1,      // room for exactly one waiter
+        max_queued: 1,                                           // room for exactly one waiter
         ..test_config()
     };
     let st = AppState::new(cfg);
@@ -2357,6 +2353,10 @@ fn diet_state_full() -> (AppState, std::path::PathBuf) {
     write_vault_file(&vault, "vault/proposed-diet-today.js", FIX_PROPOSED);
     write_vault_file(&vault, "diet-logs/weight-log.csv", FIX_WEIGHT_CSV);
     write_vault_file(&vault, "diet-logs/food-log.csv", FIX_FOOD_CSV);
+    // The exercise log belongs in a "fully populated" vault like every other log:
+    // exerciseSeries reports a missing one as an error, and this fixture asserts the
+    // clean-data case carries none.
+    write_vault_file(&vault, "diet-logs/exercise-log.csv", FIX_EXERCISE_CSV);
     let cfg = Config {
         vault: vault.to_string_lossy().into_owned(),
         ..test_config()
@@ -2501,6 +2501,122 @@ async fn diet_happy_path_returns_full_normalized_snapshot() {
     assert!(n.get("na").is_none(), "no Sodium_mg column → key omitted");
     assert!(n.get("k").is_none(), "no Potassium_mg column → key omitted");
     assert!(n.get("unsat").is_none(), "no SatFat_g → unsat omitted");
+
+    // sourceSeries: the same food-log.csv day, but per ITEM rather than summed.
+    let ss = body["sourceSeries"].as_array().unwrap();
+    assert_eq!(ss.len(), 1, "one day in the food log");
+    assert_eq!(ss[0]["date"], "2026-04-15");
+    let items = ss[0]["items"].as_array().unwrap();
+    assert_eq!(items.len(), 4, "all four rows, in file order");
+    assert_eq!(items[0]["name"], "Oatmeal");
+    assert_eq!(items[0]["n"]["cal"], 300.0);
+    assert_eq!(items[0]["n"]["fiber"], 8.0);
+    // Banana's Calories cell is blank → the key is OMITTED, never 0; its other
+    // nutrients survive. Same unknown-is-not-zero contract as nutrientSeries.
+    assert_eq!(items[1]["name"], "Banana");
+    assert!(
+        items[1]["n"].get("cal").is_none(),
+        "blank Calories → cal omitted, not 0"
+    );
+    assert_eq!(items[1]["n"]["c"], 27.0);
+    // This fixture's header stops at Fiber_g, so no item carries a micro or unsat.
+    assert!(items[0]["n"].get("na").is_none());
+    assert!(items[0]["n"].get("unsat").is_none());
+
+    // exerciseSeries: the exercise log's one day, summed and counted.
+    let es = body["exerciseSeries"].as_array().unwrap();
+    assert_eq!(es.len(), 1, "one day in the exercise log");
+    assert_eq!(es[0]["date"], "2026-04-15");
+    assert_eq!(es[0]["kcal"], 740.0, "520 + 220");
+    assert_eq!(es[0]["sessions"], 2);
+
+    let _ = std::fs::remove_dir_all(&vault);
+}
+
+#[tokio::test]
+async fn diet_missing_logs_yield_empty_series_and_recorded_errors() {
+    // A vault with `today` alone: every log is absent. sourceSeries and
+    // exerciseSeries must be `[]` (never null, never a panic) with one diagnostic
+    // each, so the app renders an empty chart instead of failing to decode.
+    let vault = make_diet_vault();
+    write_vault_file(&vault, "vault/diet-today.js", FIX_TODAY);
+    let cfg = Config {
+        vault: vault.to_string_lossy().into_owned(),
+        ..test_config()
+    };
+    let resp = app(AppState::new(cfg))
+        .oneshot(diet_request(Some("Bearer test-token")))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "missing logs are not fatal");
+    let body: Value = serde_json::from_str(&body_string(resp).await).unwrap();
+
+    assert_eq!(
+        body["sourceSeries"],
+        serde_json::json!([]),
+        "missing food-log.csv → [], not null"
+    );
+    assert_eq!(
+        body["exerciseSeries"],
+        serde_json::json!([]),
+        "missing exercise-log.csv → [], not null"
+    );
+    let errors: Vec<&str> = body["errors"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e.as_str().unwrap())
+        .collect();
+    assert!(
+        errors.iter().any(|e| e.starts_with("sourceSeries: ")),
+        "the unreadable food log is reported: {errors:?}"
+    );
+    assert!(
+        errors.iter().any(|e| e.starts_with("exerciseSeries: ")),
+        "the unreadable exercise log is reported: {errors:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(&vault);
+}
+
+#[tokio::test]
+async fn diet_empty_logs_yield_empty_series_without_errors() {
+    // Present-but-header-only logs are a real state (a fresh vault): both series are
+    // `[]` and, unlike the missing case, nothing is reported.
+    let vault = make_diet_vault();
+    write_vault_file(&vault, "vault/diet-today.js", FIX_TODAY);
+    // Header line only, taken from the fixtures themselves rather than re-typed.
+    let header_of = |csv: &str| format!("{}\n", csv.lines().next().unwrap());
+    write_vault_file(&vault, "diet-logs/food-log.csv", &header_of(FIX_FOOD_CSV));
+    write_vault_file(
+        &vault,
+        "diet-logs/exercise-log.csv",
+        &header_of(FIX_EXERCISE_CSV),
+    );
+    let cfg = Config {
+        vault: vault.to_string_lossy().into_owned(),
+        ..test_config()
+    };
+    let resp = app(AppState::new(cfg))
+        .oneshot(diet_request(Some("Bearer test-token")))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body: Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    assert_eq!(body["sourceSeries"], serde_json::json!([]));
+    assert_eq!(body["exerciseSeries"], serde_json::json!([]));
+    let errors: Vec<&str> = body["errors"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e.as_str().unwrap())
+        .collect();
+    assert!(
+        !errors
+            .iter()
+            .any(|e| e.starts_with("sourceSeries: ") || e.starts_with("exerciseSeries: ")),
+        "an empty log is not an error: {errors:?}"
+    );
 
     let _ = std::fs::remove_dir_all(&vault);
 }
@@ -2673,11 +2789,7 @@ async fn diet_empty_targets_round_trips_as_empty_array() {
     // as an empty array, distinct from an absent or null field.
     let vault = make_diet_vault();
     write_vault_file(&vault, "vault/diet-today.js", FIX_TODAY);
-    write_vault_file(
-        &vault,
-        "vault/diet-progress.js",
-        FIX_PROGRESS_EMPTY_TARGETS,
-    );
+    write_vault_file(&vault, "vault/diet-progress.js", FIX_PROGRESS_EMPTY_TARGETS);
     write_vault_file(&vault, "diet-logs/weight-log.csv", FIX_WEIGHT_CSV);
     let cfg = Config {
         vault: vault.to_string_lossy().into_owned(),
@@ -2858,6 +2970,15 @@ async fn diet_reconstructed_day_has_null_targets_and_real_logs() {
     );
     // weightSeries (the historical chart) is still returned in full.
     assert_eq!(body["weightSeries"].as_array().unwrap().len(), 3);
+    // sourceSeries and exerciseSeries ride along on history exactly as they do on
+    // today: whole-log history, not just the requested day.
+    let ss = body["sourceSeries"].as_array().unwrap();
+    assert_eq!(ss[0]["date"], "2026-04-15");
+    assert_eq!(ss[0]["items"].as_array().unwrap().len(), 4);
+    let es = body["exerciseSeries"].as_array().unwrap();
+    assert_eq!(es[0]["date"], "2026-04-15");
+    assert_eq!(es[0]["kcal"], 740.0);
+    assert_eq!(es[0]["sessions"], 2);
     let _ = std::fs::remove_dir_all(&vault);
 }
 
@@ -4736,7 +4857,6 @@ async fn set_model_unavailable_is_409_and_does_not_switch() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-
 /// THE MODELS-ENDPOINT SHAPE, pinned. Each entry gains exactly two fields — `level` and
 /// `streams_text` — and keeps every field it had. A silently changed shape is a client
 /// that renders the wrong thing, so the whole key set is asserted rather than the new
@@ -4750,7 +4870,10 @@ async fn the_models_endpoint_entry_shape_is_pinned() {
         .await
         .unwrap();
     let v = body_value(resp).await;
-    let entry = v["models"].as_array().unwrap()[0].as_object().unwrap().clone();
+    let entry = v["models"].as_array().unwrap()[0]
+        .as_object()
+        .unwrap()
+        .clone();
     let mut keys: Vec<&str> = entry.keys().map(String::as_str).collect();
     keys.sort();
     assert_eq!(
@@ -4806,9 +4929,16 @@ async fn the_models_endpoint_entry_shape_is_pinned() {
 async fn the_per_model_writes_endpoint_is_gone() {
     let dir = std::env::temp_dir().join(format!("jesse-model-it-{}", random_hex()));
     let st = AppState::new(cfg_with_switch_registry(&dir));
-    for (id, body) in [("glm-5.2", r#"{"enabled":true}"#), ("opus", r#"{"enabled":false}"#)] {
+    for (id, body) in [
+        ("glm-5.2", r#"{"enabled":true}"#),
+        ("opus", r#"{"enabled":false}"#),
+    ] {
         let resp = app(st.clone())
-            .oneshot(set_model_writes_request(Some("Bearer test-token"), id, body))
+            .oneshot(set_model_writes_request(
+                Some("Bearer test-token"),
+                id,
+                body,
+            ))
             .await
             .unwrap();
         assert_eq!(
@@ -4836,7 +4966,10 @@ async fn a_models_write_permission_comes_from_its_configured_level() {
     assert_eq!(glm["level"], "read", "a declared model defaults to Read");
     assert_eq!(glm["writes_allowed"], false, "…so it may not write");
     let opus = models.iter().find(|m| m["id"] == "opus").unwrap();
-    assert_eq!(opus["level"], "write", "the ambient default is the built-in Write entry");
+    assert_eq!(
+        opus["level"], "write",
+        "the ambient default is the built-in Write entry"
+    );
     assert_eq!(opus["writes_allowed"], true);
     let _ = std::fs::remove_dir_all(&dir);
 }

@@ -236,7 +236,9 @@ pub async fn run_ask_hosted_or_emergency(
     // A small closure that runs the emergency child and packages the AskResult, or
     // returns None when the child hard-failed (caller decides the fallback).
     let emergency = |reason: String| async {
-        match run_emergency_ask_pipeline(cfg, health, question, health_context, recent_context).await {
+        match run_emergency_ask_pipeline(cfg, health, question, health_context, recent_context)
+            .await
+        {
             EmergencyAskOutcome::Answered {
                 text,
                 citations,
@@ -525,7 +527,13 @@ pub async fn jesse(
     // ON inside the spawned task below, so a fall-through reuses the same permit/job
     // machinery as a normal turn.
     let try_vaultqa = !try_diet
-        && should_try_local_vaultqa(&st.cfg, &st.health, &mode, &req.text, !req.attachments.is_empty());
+        && should_try_local_vaultqa(
+            &st.cfg,
+            &st.health,
+            &mode,
+            &req.text,
+            !req.attachments.is_empty(),
+        );
     let is_followup = req.session_id.is_some();
     // Compute the clock header ONCE here and build the prompt from it, so the SAME
     // clock can recompute the floor boundary when the hosted catch-up block is spliced
@@ -587,7 +595,9 @@ pub async fn jesse(
         model_id,
         st.cfg.harnesses.serving(&active).id(),
         match &admission {
-            TurnAdmission::Ready { ceiling: Some(_), .. } => "running now",
+            TurnAdmission::Ready {
+                ceiling: Some(_), ..
+            } => "running now",
             TurnAdmission::Ready { ceiling: None, .. } => "waiting for the global ceiling",
             TurnAdmission::Queued { .. } => "queued",
         },
@@ -596,7 +606,11 @@ pub async fn jesse(
         st.slots.waiting_for(&model_id),
         st.slots.ceiling_free(),
         st.slots.total(),
-        if conversation_busy { " (its conversation is busy)" } else { "" },
+        if conversation_busy {
+            " (its conversation is busy)"
+        } else {
+            ""
+        },
     );
 
     // Decode + validate any attachments (bad input → 400; the permit drops on
@@ -649,8 +663,7 @@ pub async fn jesse(
             // send a Codex model looking for a tool it does not have. Anything with no route
             // errors here rather than becoming a turn that silently answers without the file.
             let support = st.cfg.harnesses.serving(&active).attachment_support();
-            let prepared =
-                prepare_attachments_for_harness(&st.cfg, &scratch, &paths, support)?;
+            let prepared = prepare_attachments_for_harness(&st.cfg, &scratch, &paths, support)?;
             (
                 format!(
                     "{prompt}{}",
@@ -798,10 +811,7 @@ pub async fn jesse(
             Ok(g) => g,
             Err(_) => {
                 // The one wait a user can actually act on: they sent two messages.
-                jobs.stream_push_activity(
-                    &jid,
-                    ToolActivity::used(CONVERSATION_WAIT_ACTIVITY),
-                );
+                jobs.stream_push_activity(&jid, ToolActivity::used(CONVERSATION_WAIT_ACTIVITY));
                 conv_mutex.lock_owned().await
             }
         };
@@ -1012,7 +1022,8 @@ pub async fn jesse(
 
         // The model that served each local route, for the metrics line: the routing rule's
         // pick, resolved the same way the route itself resolved it.
-        let diet_model = || Some(route_job(&cfg, &st.health, RoutedJob::DietExtract, None, None).id);
+        let diet_model =
+            || Some(route_job(&cfg, &st.health, RoutedJob::DietExtract, None, None).id);
         let vaultqa_model = || Some(route_job(&cfg, &st.health, RoutedJob::VaultQa, None, None).id);
 
         let (mut outcome, badge_source) = if try_diet {
@@ -1468,12 +1479,7 @@ pub async fn jesse(
         // no-op and the permit drops at task end exactly as before.
         if let Some(job) = shadow_job {
             drop(_permits);
-            spawn_shadow(
-                cfg.clone(),
-                shadow_slots.clone(),
-                shadow_slot.clone(),
-                job,
-            );
+            spawn_shadow(cfg.clone(), shadow_slots.clone(), shadow_slot.clone(), job);
         }
     });
 
@@ -1871,7 +1877,6 @@ pub async fn jesse_set_model(
         None => Err((StatusCode::BAD_REQUEST, format!("unknown model '{id}'"))),
     }
 }
-
 
 /// Build the axum router with its shared state. Kept separate from `main` so
 /// tests can drive the same routes via `tower::ServiceExt::oneshot` without

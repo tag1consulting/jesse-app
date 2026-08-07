@@ -295,15 +295,24 @@ mod tests {
 
         // An OLDER write (ts 50) is ignored (value and timestamp both unchanged).
         let r = store.apply("s", &fav(false, 50));
-        assert!(r.favorite && r.favorite_updated_ms == 100, "older write ignored");
+        assert!(
+            r.favorite && r.favorite_updated_ms == 100,
+            "older write ignored"
+        );
 
         // An EQUAL write (ts 100) is ignored too (strictly-newer only).
         let r = store.apply("s", &fav(false, 100));
-        assert!(r.favorite && r.favorite_updated_ms == 100, "equal write ignored");
+        assert!(
+            r.favorite && r.favorite_updated_ms == 100,
+            "equal write ignored"
+        );
 
         // A strictly NEWER write (ts 101) wins.
         let r = store.apply("s", &fav(false, 101));
-        assert!(!r.favorite && r.favorite_updated_ms == 101, "newer write wins");
+        assert!(
+            !r.favorite && r.favorite_updated_ms == 101,
+            "newer write wins"
+        );
     }
 
     #[test]
@@ -348,7 +357,10 @@ mod tests {
         let store = FlagStore::new(None);
         store.apply("s", &fav(true, 100));
         let r = store.apply("s", &arch(true, 200));
-        assert!(r.favorite && r.favorite_updated_ms == 100, "favorite untouched");
+        assert!(
+            r.favorite && r.favorite_updated_ms == 100,
+            "favorite untouched"
+        );
         assert!(r.archived && r.archived_updated_ms == 200, "archived set");
     }
 
@@ -390,7 +402,11 @@ mod tests {
         store.apply("sess-a", &fav(true, 10));
         store.apply("sess-b", &arch(true, 10));
         store.remove("sess-a");
-        assert_eq!(store.get("sess-a"), SessionFlags::default(), "removed row gone");
+        assert_eq!(
+            store.get("sess-a"),
+            SessionFlags::default(),
+            "removed row gone"
+        );
         assert!(store.get("sess-b").archived, "others untouched");
         // No-ops.
         store.remove("ghost");
@@ -440,7 +456,10 @@ mod tests {
         let store = FlagStore::new(Some(path.clone()));
         let f = store.get("s");
         assert!(f.favorite && f.favorite_updated_ms == 9);
-        assert!(!f.archived && f.archived_updated_ms == 0, "missing fields default");
+        assert!(
+            !f.archived && f.archived_updated_ms == 0,
+            "missing fields default"
+        );
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 }

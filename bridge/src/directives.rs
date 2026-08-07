@@ -1185,9 +1185,7 @@ mod tests {
         assert_eq!(delivered_text(prose), prose);
         // Both transformations at once, directive last.
         assert_eq!(
-            delivered_text(
-                "body\nSPOKEN: aloud\nJESSE_NEEDS_HEALTH v1 {\"sections\":[\"daily\"]}"
-            ),
+            delivered_text("body\nSPOKEN: aloud\nJESSE_NEEDS_HEALTH v1 {\"sections\":[\"daily\"]}"),
             "body"
         );
         // A reply that is nothing but a directive collapses to empty — the app never

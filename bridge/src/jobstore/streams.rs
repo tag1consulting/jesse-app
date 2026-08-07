@@ -172,7 +172,11 @@ impl StreamRegistry {
     pub fn subscribe(
         &self,
         id: &str,
-    ) -> Option<(String, Option<ToolActivity>, broadcast::Receiver<StreamFrame>)> {
+    ) -> Option<(
+        String,
+        Option<ToolActivity>,
+        broadcast::Receiver<StreamFrame>,
+    )> {
         let guard = self.streams.lock_ok();
         let h = guard.get(id)?;
         Some((h.text.clone(), h.activity.clone(), h.tx.subscribe()))
