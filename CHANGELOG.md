@@ -15,6 +15,52 @@ CI both run it). See the "Versioning" section of `bridge/README.md`.
 
 ## [Unreleased]
 
+## [Bridge 0.65.0] - 2026-08-07
+
+### Fixed
+
+- **Every day in `nutrientSeries` now carries its OWN targets.** Each entry gains an
+  additive `targets` object — `{ calories, carbs, carbsBase, protein, fat, fiber,
+  sodium, satFat, potassium, calcium, omega3, magnesium }` — alongside its `nutrients`.
+  Nothing else about the endpoint moved: the today pass-through, the day's own targets
+  object, per-item reconstruction, `weightSeries` and the CSVs are untouched, so an
+  older client decodes the response unchanged.
+
+  The defect this fixes is a wrong verdict, not a missing field. The response carried a
+  multi-day series and a SINGLE targets object, and the app applied that one object to
+  every day in the series. But the calorie target is not a constant: it is recomputed on
+  every exercise log as a base plus a fraction of that day's logged exercise kcal, so it
+  differs day to day and moves within a day as sessions are logged. Carbs has the same
+  shape (a base floor plus an optional add-back band). Comparing a multi-day median of
+  intake against today's number therefore judged most of the range against a target that
+  never applied to it — a 2487-kcal day that came in at 2300 and a 1912-kcal day that
+  came in at the same 2300 are opposite outcomes, and one shared target could only call
+  them identical.
+
+  Each day's number comes from that day's **archived snapshot** (`diet-logs/days/
+  <date>.js`, the same file the `?date=` path already serves, read with the same
+  extractor — no second parser). The archived figure is the RECORD of what the target
+  actually was, including any manual adjustment, so it is copied through **verbatim**
+  rather than recomputed: a formula re-implemented in the bridge would silently diverge
+  from the one that produced the day. Only the keys the archive actually holds are
+  passed on; none is defaulted in. An absent `carbsBase` in particular is meaningful —
+  it is the carb-load-day signal — so it stays absent rather than being invented.
+
+  **Unknown is not zero**, the same discipline the nutrient values already follow: a
+  date with no archive, or one whose archive cannot be read or parsed, gets **no
+  `targets` key at all** — never the current targets, never a computed stand-in, never
+  a partial object of nulls. A day whose target is unrecoverable is reported as unknown
+  instead of judged against a target that was not its own. An unreadable or unparseable
+  archive also appends a line to `errors` (a missing one is silent — most days have
+  none, and reconstruction is the normal tier for them) and never fails the request.
+
+  Today is the one exception: its archive is written at the next morning's roll, so
+  today's entry takes the live `diet-today.js` targets the response already serves and
+  is judged against its up-to-the-minute number. Archives are read once per request for
+  the series dates only (at most the 90-date cap), and no deltas, medians or verdicts
+  are computed here — that math stays the app's, as the nutrient medians and the weight
+  moving average already are.
+
 ## [App 1.0 (92)] - 2026-08-07
 
 ### Added

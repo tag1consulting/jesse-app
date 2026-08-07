@@ -619,6 +619,102 @@ pub fn nutrient_series(food_csv: &str) -> Vec<Value> {
     out
 }
 
+/// Attach each `nutrientSeries` day's OWN targets, in place.
+///
+/// The calorie target is not a constant: it is recomputed on every exercise log (a
+/// base plus a fraction of that day's logged exercise kcal), so it differs from day
+/// to day and even within a day; carbs has the same shape (a base floor plus an
+/// optional add-back band). Serving one current-day `targets` object for a whole
+/// series makes the app compare a multi-day intake against a target that never
+/// applied to most of those days. So every day carries the target that actually
+/// applied to IT.
+///
+/// The archived day snapshot (`days/<date>.js`, the same file the `?date=` path
+/// serves, read with the same [`extract_js_literal`]) is the RECORD of what that
+/// day's target was — including any manual adjustment. It is copied through
+/// VERBATIM: only the keys the archive actually has, never a default filled in for a
+/// missing one. In particular an absent `carbsBase` is meaningful (a carb-load day),
+/// so it is left absent rather than invented.
+///
+/// UNKNOWN IS NOT ZERO, the same discipline the nutrient values already follow: a
+/// date with no archive (or an archive that can't be read or parsed) gets NO
+/// `targets` key at all — never the current targets, never a computed one, never a
+/// partial object of nulls — so the app can report that day as unknown instead of
+/// judging it against a target that isn't its own.
+///
+/// `today_date` is the exception: today's archive is only written at the next
+/// morning's roll, so today's entry takes `live_targets` (the live `diet-today.js`
+/// targets the today response already serves) and is judged against its
+/// up-to-the-minute target.
+///
+/// Reads at most one file per series date (the series is capped at
+/// [`NUTRIENT_SERIES_MAX_DAYS`]), once per request. A missing archive is silent —
+/// most days have none and the reconstruction tier is normal — while an unreadable
+/// or unparseable one returns a diagnostic line for the caller's `errors` vector,
+/// exactly as `weightSeries` reports its skipped rows. Neither ever fails the
+/// request. No deltas, medians or verdicts here: that math is the app's, as the
+/// nutrient medians and the weight moving average already are.
+pub fn attach_series_targets(
+    series: &mut [Value],
+    days_dir: &Path,
+    today_date: &str,
+    live_targets: Option<&Value>,
+) -> Vec<String> {
+    let mut errors: Vec<String> = Vec::new();
+    // Date → that day's targets, built up front from the days directory for ONLY the
+    // dates that appear in the series, so no archive is read twice and none outside
+    // the series is read at all.
+    let mut by_date: BTreeMap<String, Value> = BTreeMap::new();
+    for date in series
+        .iter()
+        .filter_map(|d| d.get("date").and_then(|v| v.as_str()))
+        .filter(|d| *d != today_date)
+    {
+        if by_date.contains_key(date) {
+            continue;
+        }
+        let path = days_dir.join(format!("{date}.js"));
+        match std::fs::read_to_string(&path) {
+            Ok(content) => match extract_js_literal(&content) {
+                // Only an OBJECT of targets is a record; an archive that simply never
+                // recorded them leaves the day unknown, quietly.
+                Ok(v) => {
+                    if let Some(t) = v.get("targets").filter(|t| t.is_object()) {
+                        by_date.insert(date.to_string(), t.clone());
+                    }
+                }
+                Err(e) => errors.push(format!("targets {date}: {e}")),
+            },
+            // No archive for that date is the normal case, not a problem to report.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => errors.push(format!(
+                "targets {date}: cannot read {}: {e}",
+                path.display()
+            )),
+        }
+    }
+
+    for entry in series.iter_mut() {
+        let Some(date) = entry
+            .get("date")
+            .and_then(|v| v.as_str())
+            .map(str::to_string)
+        else {
+            continue;
+        };
+        let targets = if date == today_date {
+            live_targets.filter(|t| t.is_object()).cloned()
+        } else {
+            by_date.get(&date).cloned()
+        };
+        // Absent stays ABSENT — an entry never gains a null `targets`.
+        if let (Some(t), Some(obj)) = (targets, entry.as_object_mut()) {
+            obj.insert("targets".to_string(), t);
+        }
+    }
+    errors
+}
+
 /// The 45-most-recent-dates cap on [`source_series`]. Deliberately tighter than
 /// [`NUTRIENT_SERIES_MAX_DAYS`]: Sources is a RECENT-foods view (which foods actually
 /// delivered a nutrient lately), so 45 covers the app's 30-day window with headroom
@@ -993,16 +1089,27 @@ pub async fn jesse_diet(
     // and availableDays. Present → the array (possibly empty); a missing/unreadable
     // file → `[]` + one error (an absent chart is fine; a null crash is not — so it
     // is `[]`, not null, unlike weightSeries).
-    let (nutrient_series_val, nutrient_errors): (Value, Vec<String>) = match &food_read {
-        Ok(content) => (Value::Array(nutrient_series(content)), Vec::new()),
+    let (mut nutrient_rows, mut nutrient_errors): (Vec<Value>, Vec<String>) = match &food_read {
+        Ok(content) => (nutrient_series(content), Vec::new()),
         Err(e) => (
-            Value::Array(vec![]),
+            vec![],
             vec![format!(
                 "nutrientSeries: cannot read {}: {e}",
                 food_path.display()
             )],
         ),
     };
+    // Each day's OWN targets, from that day's archived snapshot (today's from the
+    // live file). The exercise-adjusted calorie and carb targets move day to day, so
+    // one shared targets object would have the app judging most days against a target
+    // that never applied to them. A day with no recoverable target carries none.
+    nutrient_errors.extend(attach_series_targets(
+        &mut nutrient_rows,
+        &days_dir,
+        &today_date,
+        today.get("targets"),
+    ));
+    let nutrient_series_val = Value::Array(nutrient_rows);
 
     // sourceSeries: shared by today and history (the Sources view is inherently
     // historical), built from the SAME food-log.csv read as nutrientSeries. Like
@@ -1819,6 +1926,211 @@ mod tests {
         let n = day_nutrients(&series, "2026-04-15").expect("day present");
         assert_eq!(n["unsat"]["sum"], 0.0, "9 - 9.1 clamps to 0, not negative");
         assert_eq!(n["unsat"]["known"], 1);
+    }
+
+    // ---- attach_series_targets (per-day targets) ---------------------------
+
+    /// A scratch `days/` directory for the archive fixtures below.
+    fn days_dir() -> PathBuf {
+        let d = std::env::temp_dir().join(format!("jesse-diet-targets-{}/days", random_hex()));
+        std::fs::create_dir_all(&d).expect("create scratch days dir");
+        d
+    }
+
+    /// Write `<date>.js` with the same `window.DIET_TODAY = {…};` wrapper the vault
+    /// writes, carrying `targets` verbatim as the caller spells it.
+    fn write_archive(dir: &Path, date: &str, targets_literal: &str) {
+        std::fs::write(
+            dir.join(format!("{date}.js")),
+            format!(
+                "// archived day\n\
+                 window.DIET_TODAY = {{ date: '{date}', targets: {targets_literal}, meals: [] }};\n"
+            ),
+        )
+        .expect("write archive fixture");
+    }
+
+    /// A one-row food-log day, enough to make that date a nutrientSeries entry.
+    fn food_day(date: &str) -> String {
+        format!("{date},Lunch,Soup,1,bowl,,,220,8,6,30,,12:00,Lunch,7,480,2.5,9,610,120,300,45\n")
+    }
+
+    /// The series entry for `date`, or None.
+    fn day_entry<'a>(series: &'a [Value], date: &str) -> Option<&'a Value> {
+        series.iter().find(|d| d["date"] == json!(date))
+    }
+
+    #[test]
+    fn series_targets_carry_archived_values_verbatim() {
+        // The archived numbers are the RECORD of what that day's target was; they are
+        // copied through as-is, not recomputed from any formula.
+        let dir = days_dir();
+        write_archive(
+            &dir,
+            "2026-04-15",
+            "{ calories: 2487, protein: 140, fat: 65, carbs: 335, carbsBase: 139 }",
+        );
+        let mut series = nutrient_series(&format!(
+            "{h}\n{r}",
+            h = food_header(),
+            r = food_day("2026-04-15")
+        ));
+        let errs = attach_series_targets(&mut series, &dir, "2026-08-07", None);
+        assert!(
+            errs.is_empty(),
+            "a readable archive reports nothing: {errs:?}"
+        );
+        let t = &day_entry(&series, "2026-04-15").expect("day present")["targets"];
+        assert_eq!(t["calories"], 2487, "archived calorie target verbatim");
+        assert_eq!(t["carbsBase"], 139, "archived carb floor verbatim");
+        assert_eq!(t["protein"], 140);
+    }
+
+    #[test]
+    fn series_date_without_archive_has_no_targets_key_at_all() {
+        // Unknown is not zero and not "the current targets": the key must be ABSENT so
+        // the app reports the day as unjudged rather than judging it wrongly.
+        let dir = days_dir(); // empty — no archive for this date
+        let live = json!({ "calories": 1700, "carbs": 139 });
+        let mut series = nutrient_series(&format!(
+            "{h}\n{r}",
+            h = food_header(),
+            r = food_day("2026-04-15")
+        ));
+        let errs = attach_series_targets(&mut series, &dir, "2026-08-07", Some(&live));
+        assert!(
+            errs.is_empty(),
+            "a missing archive is normal, not a problem"
+        );
+        let entry = day_entry(&series, "2026-04-15").expect("day still present");
+        assert!(
+            entry.get("targets").is_none(),
+            "no archive → key absent, not null: {entry}"
+        );
+        assert_ne!(
+            entry.get("targets"),
+            Some(&live),
+            "and never a fallback to the current targets"
+        );
+    }
+
+    #[test]
+    fn series_targets_omit_carbs_base_when_the_archive_omits_it() {
+        // An absent carbsBase is the carb-load-day signal the app depends on — it must
+        // not be filled in with a default.
+        let dir = days_dir();
+        write_archive(&dir, "2026-04-15", "{ calories: 2487, carbs: 335 }");
+        let mut series = nutrient_series(&format!(
+            "{h}\n{r}",
+            h = food_header(),
+            r = food_day("2026-04-15")
+        ));
+        attach_series_targets(&mut series, &dir, "2026-08-07", None);
+        let t = &day_entry(&series, "2026-04-15").expect("day present")["targets"];
+        assert_eq!(t["calories"], 2487, "the keys that ARE there pass through");
+        assert!(
+            t.get("carbsBase").is_none(),
+            "omitted in the archive → omitted on the wire: {t}"
+        );
+    }
+
+    #[test]
+    fn series_malformed_archive_yields_no_targets_plus_a_diagnostic() {
+        // A truncated archive is a missing target for that date and a note in errors —
+        // never a failed request, and never a target borrowed from elsewhere.
+        let dir = days_dir();
+        std::fs::write(
+            dir.join("2026-04-15.js"),
+            "window.DIET_TODAY = { date: '2026-04-15', targets: { calories: 24",
+        )
+        .expect("write truncated archive");
+        write_archive(&dir, "2026-04-16", "{ calories: 2100 }");
+        let mut series = nutrient_series(&format!(
+            "{h}\n{a}{b}",
+            h = food_header(),
+            a = food_day("2026-04-15"),
+            b = food_day("2026-04-16")
+        ));
+        let errs = attach_series_targets(&mut series, &dir, "2026-08-07", None);
+        assert_eq!(errs.len(), 1, "one diagnostic: {errs:?}");
+        assert!(
+            errs[0].contains("2026-04-15"),
+            "the diagnostic names the date: {}",
+            errs[0]
+        );
+        assert_eq!(series.len(), 2, "the rest of the series still comes back");
+        assert!(
+            day_entry(&series, "2026-04-15")
+                .expect("day present")
+                .get("targets")
+                .is_none(),
+            "broken archive → no targets for that day"
+        );
+        assert_eq!(
+            day_entry(&series, "2026-04-16").expect("day present")["targets"]["calories"],
+            2100,
+            "the readable neighbour is unaffected"
+        );
+    }
+
+    #[test]
+    fn series_two_dates_keep_their_own_calorie_targets() {
+        // THE regression test for the defect: an exercise-adjusted target differs day
+        // to day, so two days must come back with two different numbers — one shared
+        // targets object is exactly the bug.
+        let dir = days_dir();
+        write_archive(&dir, "2026-04-15", "{ calories: 2487, carbsBase: 139 }");
+        write_archive(&dir, "2026-04-16", "{ calories: 1912, carbsBase: 139 }");
+        let mut series = nutrient_series(&format!(
+            "{h}\n{a}{b}",
+            h = food_header(),
+            a = food_day("2026-04-15"),
+            b = food_day("2026-04-16")
+        ));
+        attach_series_targets(&mut series, &dir, "2026-08-07", None);
+        let a = &day_entry(&series, "2026-04-15").expect("day present")["targets"]["calories"];
+        let b = &day_entry(&series, "2026-04-16").expect("day present")["targets"]["calories"];
+        assert_eq!(a, &json!(2487));
+        assert_eq!(b, &json!(1912));
+        assert_ne!(a, b, "each day carries ITS target, not a shared one");
+    }
+
+    #[test]
+    fn series_today_entry_carries_the_live_current_day_targets() {
+        // Today has no archive yet (it is written at the next morning's roll), so the
+        // live targets keep the current day judged up to the minute.
+        let dir = days_dir();
+        let live = json!({ "calories": 2044, "carbs": 240, "carbsBase": 139 });
+        let mut series = nutrient_series(&format!(
+            "{h}\n{r}",
+            h = food_header(),
+            r = food_day("2026-08-07")
+        ));
+        let errs = attach_series_targets(&mut series, &dir, "2026-08-07", Some(&live));
+        assert!(errs.is_empty(), "today reads no archive at all: {errs:?}");
+        let t = &day_entry(&series, "2026-08-07").expect("today present")["targets"];
+        assert_eq!(t["calories"], 2044, "the live, up-to-the-minute target");
+        assert_eq!(t["carbsBase"], 139);
+    }
+
+    #[test]
+    fn series_with_no_archives_at_all_keeps_every_day_untargeted() {
+        // The series itself is never reduced by the absence of archives.
+        let dir = days_dir();
+        let mut series = nutrient_series(&format!(
+            "{h}\n{a}{b}{c}",
+            h = food_header(),
+            a = food_day("2026-04-15"),
+            b = food_day("2026-04-16"),
+            c = food_day("2026-04-17")
+        ));
+        let errs = attach_series_targets(&mut series, &dir, "2026-08-07", None);
+        assert!(errs.is_empty());
+        assert_eq!(series.len(), 3, "every day entry still returned");
+        for d in &series {
+            assert!(d.get("nutrients").is_some(), "nutrients untouched: {d}");
+            assert!(d.get("targets").is_none(), "and no targets key: {d}");
+        }
     }
 
     // ---- source_series -----------------------------------------------------
