@@ -46,6 +46,8 @@ Default allowlist (`JESSE_ALLOWED_TOOLS` to override):
 | `Bash(node todo-list/validate-diet-today.js:*)`, `Bash(node todo-list/verify-diet-consistency.js:*)` | The generator's two guards — field-contract validation and CSV-vs-cache consistency — run after each regeneration |
 | `WebSearch` | Read-only web search (titles, URLs, snippets). Added 2026-08-05 — see [Web access](#web-access-websearch-and-webfetch-2026-08-05) |
 | `WebFetch` | Read-only fetch of a web page. Added 2026-08-05, **reversing a standing deny** — see [Web access](#web-access-websearch-and-webfetch-2026-08-05) for the decision, the residual risk, and the available narrowing |
+| `mcp__slack__*` (six) | Read-only Slack read and search. See [Slack](#slack-read-only-2026-08-05) for the six granted and the nine withheld |
+| `mcp__browser__*` (nineteen) | Headless browser: navigate, read, and the interaction verbs. Added 2026-08-07, because `WebFetch` is refused outright on a large set of hosts. See [Browser](#browser-headless-2026-08-07) for the five withheld and why |
 
 These three `node` entries are pinned to the **exact script paths**, never a bare
 `Bash(node:*)`: a bare node scope would allow `node -e "<arbitrary JS>"` —
@@ -184,7 +186,7 @@ worth applying **the same day** — at that point it would be the remaining open
 door, not one of two. Whoever narrows `Bash(git:*)` should treat this paragraph
 as part of that change's checklist.
 
-### MCP servers on a main turn (strict, qmd + slack)
+### MCP servers on a main turn (strict, qmd + slack + browser)
 
 The main turn also passes `--strict-mcp-config` together with an explicit
 `--mcp-config`, on **both** branches `build_claude_args` can take (writes-enabled
@@ -194,20 +196,31 @@ and read-only). Only the servers named in that config load:
 | --- | --- |
 | `qmd` | Read-only vault search — the four `mcp__qmd__*` tools in the allowlist above. Required; the main path is the one route that must not degrade to an empty server set |
 | `slack` | Read-only Slack read and search, added 2026-08-05 — six `mcp__slack__*` tools in the allowlist above. See [Slack](#slack-read-only-2026-08-05) |
+| `browser` | Headless web fetch, added 2026-08-07 — nineteen `mcp__browser__*` tools in the allowlist above. See [Browser](#browser-headless-2026-08-07) |
 
-Both are named in the compiled `MAIN_CHILD_MCP_CONFIG`
+**All three servers now load on BOTH harnesses.** Until 0.66.0 Claude Code had
+qmd+slack and Codex had qmd alone; a capability now lands on every harness in the
+same change, and the enforcement differs per harness — see
+[Browser](#browser-headless-2026-08-07).
+
+All three are named in the compiled `MAIN_CHILD_MCP_CONFIG`
 (`src/harness/claude_code.rs`), not supplied by a LaunchAgent override. That is
 deliberate and load-bearing: `McpSet::config()` resolves the **shipped** consts,
 so a server reached only through `JESSE_MAIN_MCP_CONFIG` would be granted in the
 allowlist and never loaded by any probe — certified on paper, untested in fact.
-Declaring it here is what lets the `qmd+slack` battery rows exercise it.
+Declaring it here is what lets the `qmd+slack+browser` battery rows exercise it.
 
 Everything else is **absent at the root**, not denied by name — including the
-account-level cloud connectors (Gmail, Slack, Google Calendar, Google Drive) and
-`playwright`. `playwright` is excluded deliberately: no main-path feature
-references it, and it is the server a containment probe once drove to a live
-network fetch (see [Diet child tool
-isolation](#diet-child-tool-isolation-in-process-boundary)).
+account-level cloud connectors (Gmail, Slack, Google Calendar, Google Drive).
+
+The `playwright` server was excluded until 2026-08-07 on the grounds that "no
+main-path feature references it, and it is the server a containment probe once
+drove to a live network fetch". The first half stopped being true: reaching a
+page the built-in `WebFetch` is refused on **is** the feature. The second half was
+never a defect in the server — it described a child that was supposed to be
+contained and was not, which `--strict-mcp-config` plus the allowlist now fix at
+the source. It is admitted deliberately, as `browser`, with five of its
+twenty-four tools withheld.
 
 **Why this is not redundant with the allowlist.** Before this, the main turn was
 the last child route without `--strict-mcp-config` — the diet and vault-QA
@@ -229,6 +242,89 @@ shipped default resolves `qmd` from the child's `PATH`; set the override when
 `qmd` is not on it, since launchd's `PATH` is narrower than a login shell's.
 Vault search being absent from a turn is silent (never an error), so a wrong
 `PATH` degrades quietly rather than failing loudly.
+
+### Browser (headless, 2026-08-07)
+
+npm `@playwright/mcp`, run under `npx` and declared in the compiled
+`MAIN_CHILD_MCP_CONFIG` as `browser` — named for the capability, not the
+implementation, so a swap of the underlying server does not rename the posture.
+
+**Why a browser at all.** `WebFetch` is granted but is refused outright on a large
+set of hosts. That is measured, not inferred: `WebFetch` answers *"Claude Code is
+unable to fetch from stackoverflow.com"*, while the browser renders that page in
+full. A capability that fails on the pages most worth reading is not a capability.
+
+**Twenty of twenty-four tools are granted** — navigate, read, screenshot, and the
+interaction verbs (click, type, fill_form, press_key, hover, select_option, drag,
+handle_dialog, tabs, resize, close). A browser that cannot dismiss a cookie wall
+or page through results cannot reach the sites this exists for. The four withheld,
+by class:
+
+| Withheld | Class |
+| --- | --- |
+| `browser_evaluate` | Runs arbitrary JS in the page |
+| `browser_run_code_unsafe` | Runs arbitrary JS **in the Playwright server process**, which is outside both harnesses' sandboxes. The server's own description calls it unsafe |
+| `browser_file_upload`, `browser_drop` | Read local files *into* a page — an exfiltration route out of the vault that no network policy would see |
+
+**`browser_take_screenshot` is granted, and the image really is consumed.** The
+PNG goes to `--output-dir` under `/tmp`, never the vault, so it is not a write
+escape. It earns its grant because the image **reaches the model** on *both*
+harnesses — verified 2026-08-07 by rendering a page whose colours appear nowhere
+in its accessibility tree and asking for them back: Claude Code returned
+`#7B2D8B`/`#F2C41E`, Codex `#812C90`/`#F9C719`, against an actual
+`#7B2D8E`/`#F2C31A`. Only pixels produce that. It is what reads a chart, a canvas,
+or a rendered layout that `browser_snapshot`'s text tree cannot express.
+
+**The limit, because it is not obvious: the image reaches the MODEL, never the
+USER.** The bridge's mid-turn contract is `TextDelta` plus
+`ToolActivity { name, refused }` and deliberately excludes tool RESULTS, so a
+phone receives the model's *description* of a screenshot and never the picture
+itself. There is no outbound image channel, and adding one would be a separate
+change to that contract.
+
+**Four flags that are containment, not preference.**
+
+- `--output-dir` — `browser_navigate` writes a snapshot `.yml` and a console
+  `.log` per navigation, and `browser_take_screenshot` a `.png`. With no output dir
+  they go into the child's **cwd**, which every main turn sets to the vault. An MCP
+  server is **not** inside either harness's sandbox — measured: a canary server
+  wrote `/tmp` under Codex's `sandbox_mode="read-only"` — so nothing else stops it.
+  The path is under `/tmp` because the containment record is compared by strict
+  equality and a home directory would pin the record to one machine. The directory
+  is created on demand.
+- `--output-max-size` — 100 MB eviction threshold. Every navigation and every
+  screenshot leaves a file behind and nothing else deletes one, so an unbounded
+  output directory grows without limit on a long-lived daemon.
+- `--isolated` — the browser profile lives in memory and dies with the turn, so no
+  cookie or history state accumulates on disk.
+- `--headless` — there is no display on a daemon host. Attaching a real Chrome
+  profile (`--browser chrome --user-data-dir …`) was tested on 2026-08-07 and
+  **rejected**: it did not defeat the bot walls that block `WebFetch`, so it would
+  have bought only logged-in sessions, at the cost of handing a phone-triggered
+  agent every cookie the operator holds.
+
+`browser_wait_for` is granted for a concrete reason rather than as filler: the bot
+walls that block `WebFetch` clear only after a delay, so without it the browser
+returns a 403 interstitial on exactly the pages it was added to read.
+
+**The two harnesses enforce this differently, and Codex's is stronger.** On Claude
+Code the server loads whole and the allowlist gates its tools at the **permission
+layer** — so `browser_evaluate` *stands at the root* and is refused when called,
+which the battery records in the `read/qmd+slack+browser` root toolset. On Codex
+there is no `--allowedTools`, so `codex_mcp_args` emits `enabled_tools` and a
+withheld tool is **absent**: a child asking for one gets `TypeError:
+tools.mcp__browser__browser_evaluate is not a function`. Both lists are derived
+from the same `DEFAULT_ALLOWED_TOOLS` string, so they cannot drift.
+
+**Residual risk, accepted.** The browser is a live network route out of a
+phone-triggered turn, and a page it visits is untrusted input. That is the same
+SSRF/exfiltration surface accepted for `WebFetch` on 2026-08-05, not a new one —
+but it is *wider*, because a browser follows redirects, runs the page's own
+scripts, and can be steered by page content through the interaction verbs. Script
+execution *initiated by the model* is withheld (`browser_evaluate`,
+`browser_run_code_unsafe`); script execution *by the page itself* is inherent to
+rendering and is not prevented. `network_outbound` remains a recorded known-open
+baseline at `write`.
 
 ### Slack (read-only, 2026-08-05)
 

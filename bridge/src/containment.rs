@@ -67,10 +67,23 @@ pub enum McpSet {
     /// main turn, and every Claude Code main turn before bridge 0.57.0. Its four tools are
     /// read-only search. See [`CODEX_SHIPPED_ROWS`].
     Qmd,
-    /// qmd PLUS the self-hosted read-only Slack server ([`MAIN_CHILD_MCP_CONFIG`]): every main
-    /// turn from bridge 0.57.0. Slack contributes six read-only tools to the allowlist; the
+    /// qmd PLUS the self-hosted read-only Slack server: every Claude Code main turn from
+    /// bridge 0.57.0 to 0.64.0. Slack contributes six read-only tools to the allowlist; the
     /// nine others it advertises — seven of which mutate — are deliberately not granted.
+    ///
+    /// NO SHIPPED SPAWN SITE USES THIS TODAY (0.66.0 moved every main turn to
+    /// [`McpSet::QmdSlackBrowser`]). It is retained for the same reason [`McpSet::Qmd`] is:
+    /// the label names a posture a deployment can still express, and deleting it would
+    /// silently re-point an existing `qmd+slack` row label at a different server set.
     QmdSlack,
+    /// qmd PLUS Slack PLUS the headless browser ([`MAIN_CHILD_MCP_CONFIG`]): **every main
+    /// turn on every harness** from bridge 0.66.0.
+    ///
+    /// This is the first set BOTH harnesses spawn. Before it, Claude Code ran `QmdSlack` and
+    /// Codex ran `Qmd` — a gap that predated the standing rule that a capability lands on
+    /// every harness in the same change. The rows are still per harness (see
+    /// [`Harness::shipped_rows`]); it is only the server set that is now common.
+    QmdSlackBrowser,
 }
 
 impl McpSet {
@@ -80,6 +93,7 @@ impl McpSet {
             McpSet::None => "none",
             McpSet::Qmd => "qmd",
             McpSet::QmdSlack => "qmd+slack",
+            McpSet::QmdSlackBrowser => "qmd+slack+browser",
         }
     }
 
@@ -89,6 +103,7 @@ impl McpSet {
             "none" => Some(McpSet::None),
             "qmd" => Some(McpSet::Qmd),
             "qmd+slack" => Some(McpSet::QmdSlack),
+            "qmd+slack+browser" => Some(McpSet::QmdSlackBrowser),
             _ => None,
         }
     }
@@ -101,7 +116,8 @@ impl McpSet {
         match self {
             McpSet::None => EMPTY_MCP_CONFIG,
             McpSet::Qmd => QMD_ONLY_MCP_CONFIG,
-            McpSet::QmdSlack => MAIN_CHILD_MCP_CONFIG,
+            McpSet::QmdSlack => QMD_SLACK_MCP_CONFIG,
+            McpSet::QmdSlackBrowser => MAIN_CHILD_MCP_CONFIG,
         }
     }
 
@@ -124,8 +140,52 @@ impl McpSet {
     pub fn contains_qmd(&self) -> bool {
         match self {
             McpSet::None => false,
-            McpSet::Qmd | McpSet::QmdSlack => true,
+            McpSet::Qmd | McpSet::QmdSlack | McpSet::QmdSlackBrowser => true,
         }
+    }
+
+    /// Whether this set loads the read-only Slack server, and therefore whether
+    /// `mcp__slack__*` stands at the root of a child probed on this row.
+    ///
+    /// # Exhaustive ON PURPOSE, for the same reason as [`McpSet::contains_qmd`]
+    ///
+    /// This replaced a bare `mcp == McpSet::QmdSlack` in [`crate::parse_codex_trace`], which
+    /// was the SAME landmine `contains_qmd` was written to defuse, just one file over and not
+    /// yet detonated: adding `QmdSlackBrowser` would have left `slack` out of the recorded
+    /// `mcp_servers` for a child that had Slack loaded and working. The equality test was
+    /// harmless only while Codex spawned no set containing Slack, which stopped being true in
+    /// 0.66.0. Never add a `_` arm.
+    pub fn contains_slack(&self) -> bool {
+        match self {
+            McpSet::None | McpSet::Qmd => false,
+            McpSet::QmdSlack | McpSet::QmdSlackBrowser => true,
+        }
+    }
+
+    /// Whether this set loads the headless browser server — same exhaustiveness rule as its
+    /// two siblings above, and never a `_` arm.
+    pub fn contains_browser(&self) -> bool {
+        match self {
+            McpSet::None | McpSet::Qmd | McpSet::QmdSlack => false,
+            McpSet::QmdSlackBrowser => true,
+        }
+    }
+
+    /// Every MCP server name this set loads, in the order the config declares them. ONE
+    /// source of truth for the three predicates above, so a trace, a probe and a record
+    /// cannot disagree about which servers a row had.
+    pub fn server_names(&self) -> Vec<&'static str> {
+        let mut out = Vec::new();
+        if self.contains_qmd() {
+            out.push("qmd");
+        }
+        if self.contains_slack() {
+            out.push("slack");
+        }
+        if self.contains_browser() {
+            out.push("browser");
+        }
+        out
     }
 }
 
@@ -166,10 +226,11 @@ pub fn parse_capability(s: &str) -> Option<Capability> {
 /// EVERY (capability, MCP set) pair the bridge spawns, and therefore every row that must have
 /// a recorded battery. A level passes only when EVERY MCP set recorded at that level passes.
 ///
-///   * `basic` + no servers   — the diet extract/verify children and the title one-shot.
-///   * `read`  + no servers   — the vault-QA child (and the shadow child sharing its builder).
-///   * `read`  + qmd+slack    — a main turn backed by a read-only model.
-///   * `write` + qmd+slack    — a main turn backed by a writes-on model.
+///   * `basic` + no servers          — the diet extract/verify children and the title one-shot.
+///   * `read`  + no servers          — the vault-QA child (and the shadow child sharing its
+///     builder).
+///   * `read`  + qmd+slack+browser   — a main turn backed by a read-only model.
+///   * `write` + qmd+slack+browser   — a main turn backed by a writes-on model.
 ///
 /// The two `read` rows are expected to agree on the escape probes and differ only in whether
 /// MCP search is reachable — but both are probed and recorded rather than reasoned about.
@@ -194,16 +255,25 @@ pub const CLAUDE_CODE_SHIPPED_ROWS: [ContainmentRow; 4] = [
     },
     ContainmentRow {
         capability: Capability::Read,
-        mcp: McpSet::QmdSlack,
+        mcp: McpSet::QmdSlackBrowser,
     },
     ContainmentRow {
         capability: Capability::Write,
-        mcp: McpSet::QmdSlack,
+        mcp: McpSet::QmdSlackBrowser,
     },
 ];
 
-/// Codex's rows. Its main turn loads **qmd alone** — it does not get the Slack server, so
-/// its record and its acceptances are untouched by anything Slack-related.
+/// Codex's rows. Its main turn loads **the same three servers Claude Code's does** as of
+/// 0.66.0 — qmd, Slack and the browser.
+///
+/// THE ROW LABELS MOVED, AND THAT COST TWO SIGNATURES. Until 0.66.0 Codex's main turn was
+/// `qmd` alone, so these were `read/qmd` and `write/qmd` — the labels two operator
+/// `[[accepted]]` blocks in `containment-codex.toml` were keyed on. Renaming a row orphans
+/// its signature (acceptances match by `ContainmentRow::label`), so this change could not be
+/// made unilaterally: the six `read_*` known-opens were re-signed under the new labels by
+/// the owner, on the record that the read boundary is the OS read-only sandbox and that an
+/// MCP server, which runs OUTSIDE that sandbox but reads nothing on the child's behalf, does
+/// not widen it. Do not rename these again without going back for the same decision.
 pub const CODEX_SHIPPED_ROWS: [ContainmentRow; 4] = [
     ContainmentRow {
         capability: Capability::Basic,
@@ -215,11 +285,11 @@ pub const CODEX_SHIPPED_ROWS: [ContainmentRow; 4] = [
     },
     ContainmentRow {
         capability: Capability::Read,
-        mcp: McpSet::Qmd,
+        mcp: McpSet::QmdSlackBrowser,
     },
     ContainmentRow {
         capability: Capability::Write,
-        mcp: McpSet::Qmd,
+        mcp: McpSet::QmdSlackBrowser,
     },
 ];
 
@@ -859,16 +929,27 @@ mod tests {
             vec![
                 "basic/none",
                 "read/none",
-                "read/qmd+slack",
-                "write/qmd+slack"
+                "read/qmd+slack+browser",
+                "write/qmd+slack+browser"
             ]
         );
 
-        // Codex keeps qmd alone. The two lists are asserted SEPARATELY and deliberately: the
-        // whole point of splitting them is that one harness gaining a server must not move
-        // the other's row keys, and a shared assertion would hide exactly that.
+        // Codex spawns the SAME three-server set from 0.66.0. The two lists are still
+        // asserted SEPARATELY and deliberately: they agree today, and the moment one harness
+        // gains a server the other does not, this is where that shows up. A shared assertion
+        // would hide exactly the drift the split exists to catch — and these labels are what
+        // the operator `[[accepted]]` blocks are keyed on, so a change here orphans a
+        // signature.
         let cx: Vec<String> = CODEX_SHIPPED_ROWS.iter().map(|r| r.label()).collect();
-        assert_eq!(cx, vec!["basic/none", "read/none", "read/qmd", "write/qmd"]);
+        assert_eq!(
+            cx,
+            vec![
+                "basic/none",
+                "read/none",
+                "read/qmd+slack+browser",
+                "write/qmd+slack+browser"
+            ]
+        );
     }
 
     #[test]
