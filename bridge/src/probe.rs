@@ -1224,15 +1224,18 @@ pub fn parse_codex_trace(stdout: &str, stderr: &str, mcp: McpSet) -> RunTrace {
     // the same landmine `hard_gate_requirement` carried: a new set containing qmd would
     // leave `mcp__qmd__status` out of the root tools, so a child that used qmd correctly
     // would score as one that had no qmd tool at all — turning a working positive control
-    // into a `denied`. Codex does not spawn `QmdSlack` today; this is written so that if it
-    // ever does, the trace is right rather than quietly wrong.
+    // into a `denied`.
     if mcp.contains_qmd() {
         t.root_tools.push("mcp__qmd__status".to_string());
-        t.mcp_servers = vec!["qmd".to_string()];
-        if mcp == McpSet::QmdSlack {
-            t.mcp_servers.push("slack".to_string());
-        }
     }
+    // THE SERVER LIST COMES FROM THE SET, NOT FROM AN EQUALITY TEST. This was
+    // `if mcp == McpSet::QmdSlack { push("slack") }` until 0.66.0 — the same landmine as
+    // above, one file over and not yet detonated: it was correct only while Codex spawned no
+    // set containing Slack, and 0.66.0 made every main turn spawn one. A `QmdSlackBrowser`
+    // row would have recorded a child that had Slack loaded and working as one that had no
+    // Slack server at all. `server_names` is exhaustively matched per server, so a future
+    // set is a compile error at `McpSet` rather than a wrong record here.
+    t.mcp_servers = mcp.server_names().into_iter().map(str::to_string).collect();
     for line in stdout.lines() {
         let line = line.trim();
         if line.is_empty() {

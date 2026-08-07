@@ -15,6 +15,100 @@ CI both run it). See the "Versioning" section of `bridge/README.md`.
 
 ## [Unreleased]
 
+## [Bridge 0.66.0] - 2026-08-07
+
+### Added
+
+- **Slack and a headless browser now reach BOTH harnesses.** A main turn on Claude Code
+  *and* on Codex loads the same three MCP servers — `qmd`, `slack`, `browser` — where
+  before Claude Code had qmd+slack and Codex had qmd alone. That gap predated the standing
+  rule that a capability lands on every harness in the same change; this closes it and the
+  rule now holds with no exception outstanding.
+
+  - **`browser` is npm `@playwright/mcp`**, headless and profile-isolated. It exists because
+    the built-in `WebFetch` is refused outright on a large set of hosts — measured, not
+    assumed: `WebFetch` answers "Claude Code is unable to fetch from stackoverflow.com",
+    while the browser renders that page in full. Twenty of its twenty-four tools are granted
+    (navigate, read, screenshot, and the interaction verbs). The four omitted are
+    `browser_evaluate` and `browser_run_code_unsafe` (arbitrary JS — the latter in the
+    Playwright *server* process, which is outside both harnesses' sandboxes), plus
+    `browser_file_upload` and `browser_drop` (read local files into a page).
+
+    **`browser_take_screenshot` is granted and the image really is consumed.** It reaches
+    the MODEL on both harnesses — verified by rendering a page whose colours appear nowhere
+    in its accessibility tree and asking for them back: Claude Code returned
+    `#7B2D8B`/`#F2C41E` and Codex `#812C90`/`#F9C719` against an actual
+    `#7B2D8E`/`#F2C31A`. It is what reads a chart or a canvas that `browser_snapshot`'s text
+    tree cannot express. It does **not** reach the user: the mid-turn contract carries
+    `ToolActivity { name, refused }` and excludes tool results, so a phone gets the model's
+    description of a screenshot, never the picture.
+
+    `--output-dir` is **containment, not tidiness**: navigation writes a snapshot and a
+    console log, screenshot writes a PNG, and with no output dir they go into the child's cwd
+    — which every main turn sets to the vault. An MCP server is not inside either harness's
+    sandbox, so nothing else would stop it. `--output-max-size` bounds that directory at
+    100 MB, because nothing else ever deletes a file from it. `browser_wait_for` is granted
+    for an equally concrete reason: the bot walls that block `WebFetch` clear only after a
+    delay, so without it the browser returns a 403 interstitial on exactly the pages it was
+    added to read.
+
+    The server refuses `file:` URLs itself ("Access to 'file:' protocol is blocked"), so the
+    browser is not a route to local files even before the allowlist is consulted. Noted, not
+    relied on — it is upstream's choice, not a boundary this project controls.
+
+    Attaching a real Chrome profile was tested and **rejected**: it did not defeat those bot
+    walls, so it would have bought only logged-in sessions — at the cost of handing a
+    phone-triggered agent every cookie the operator holds.
+
+  - **Slack reaches Codex** with the same six read-only tools Claude Code has had since
+    0.57.0. The token still arrives out of band and still cannot post: it holds no
+    `chat:write` scope of any kind (`chat.postMessage` → `missing_scope`, verified live), and
+    `SLACK_MCP_ADD_MESSAGE_TOOL` remains unset so no posting tool is registered at all. Two
+    independent boundaries, both shut.
+
+### Fixed
+
+- **Three things Codex needs to carry an MCP server that Claude Code does not.** Each was
+  measured against codex-cli 0.146.0, and each produced a server that looked configured and
+  did nothing. They were invisible until a second harness carried a second server.
+
+  - **Codex SCRUBS the environment of an MCP subprocess** — a canary server saw eight
+    variables and nothing else, so `SLACK_MCP_XOXP_TOKEN` never arrived, the Slack server
+    exited fatally at startup, and it registered ZERO tools with no item event and no stderr
+    line the bridge could see. `codex_mcp_args` now emits `env_vars`, which forwards a
+    variable **by name**, so the value travels out of band exactly as the provider key does
+    and never reaches argv, a `ps` listing or a crash dump.
+  - **Codex gates tools on their annotations.** A tool advertising `destructiveHint: true`
+    needs approval, and under `approval_policy = "never"` there is nobody to ask, so the call
+    returns `user cancelled MCP tool call`. The Slack server annotates even its read-only
+    tools `destructive`, so every Slack tool was refused; so was `browser_navigate`. Now
+    emits `default_tools_approval_mode = "approve"` per server. `"auto"` does not lift it —
+    only `"approve"` does. The approval policy itself stays `never`, so the **shell** posture
+    this harness is recorded with is unchanged.
+  - **`enabled_tools` is Codex's tool allowlist, and it is stronger than Claude Code's.** An
+    omitted tool is ABSENT (`TypeError: tools.mcp__slack__conversations_join is not a
+    function`), not merely refused at a permission layer as it is on Claude Code. The names
+    are derived from the same `--allowedTools` string Claude Code is handed, so the two
+    harnesses cannot drift: one allowlist, expressed twice.
+
+- **`parse_codex_trace` no longer identifies a row's servers by equality.** It asked
+  `mcp == McpSet::QmdSlack`, which was the same landmine `McpSet::contains_qmd` was written
+  to defuse, one file over and not yet detonated: correct only while Codex spawned no set
+  containing Slack, which stopped being true in this release. A `qmd+slack+browser` row would
+  have recorded a child that had Slack loaded and working as one with no Slack server at all.
+  It now asks `McpSet::server_names`, whose per-server predicates are exhaustively matched, so
+  a future set is a compile error at the enum rather than a wrong record.
+
+### Changed
+
+- **Codex's containment record rows moved, and that cost two signatures.** Its main-turn rows
+  were `read/qmd` and `write/qmd` and are now `read/qmd+slack+browser` and
+  `write/qmd+slack+browser`. Acceptances are keyed by row label, so renaming a row orphans its
+  signature — the six `read_*` known-opens were therefore re-signed by the owner under the new
+  labels, on the record that the read boundary is the OS read-only sandbox and that an MCP
+  server, which runs outside that sandbox but reads nothing on the child's behalf, does not
+  widen it. Both harnesses' batteries were re-run against the pinned binaries.
+
 ## [Bridge 0.65.0] - 2026-08-07
 
 ### Fixed

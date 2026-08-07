@@ -391,9 +391,43 @@ pub fn codex_provider_args(active: &ActiveModel) -> Option<Vec<String>> {
 /// `read` child's reads. It scopes what MCP offers; the shell sits beside it. Narrowing what
 /// those shell reads can reach (to the vault, rather than everything the invoking unix user
 /// can read) is unix-user isolation, still pending.
+///
+/// # THREE THINGS CODEX NEEDS THAT CLAUDE CODE DOES NOT
+///
+/// All three were measured against 0.146.0 on 2026-08-07, and each one produced a server
+/// that looked configured and did nothing. Claude Code needs none of them, which is exactly
+/// why they were invisible until a second harness carried a second server.
+///
+/// 1. **`env_vars` — Codex SCRUBS the environment of an MCP subprocess.** A canary server
+///    spawned by Codex saw eight variables (`HOME LOGNAME PATH SHELL TERM TMPDIR USER
+///    __CF_USER_TEXT_ENCODING`) and nothing else. `SLACK_MCP_XOXP_TOKEN` therefore never
+///    arrived, the Slack server exited fatally on startup, and it registered ZERO tools —
+///    silently, with no item event and no stderr line the bridge could see. The symptom is a
+///    model reporting the server "is not installed". `env_vars` forwards a variable **by
+///    NAME**, so the value travels out of band exactly as [`CODEX_PROVIDER_KEY_ENV`] does and
+///    never reaches argv, a `ps` listing or a crash dump. See [`CODEX_MCP_ENV_PASSTHROUGH`].
+///
+/// 2. **`default_tools_approval_mode = "approve"` — Codex gates tools on their ANNOTATIONS.**
+///    A tool advertising `destructiveHint: true` needs approval, and under the
+///    `approval_policy = "never"` this harness spawns with there is nobody to ask, so the call
+///    comes back `user cancelled MCP tool call`. That is not hypothetical: the Slack server
+///    annotates even its READ-ONLY tools `destructive: true` (a defect in that server, but its
+///    annotations are what Codex reads), so every Slack tool was refused; so was
+///    `browser_navigate`. `"auto"` does NOT lift it — measured, only `"approve"` does. The
+///    approval policy itself is left at `never`, so the SHELL posture this harness is recorded
+///    with is unchanged; only MCP tools already narrowed by `enabled_tools` are auto-approved.
+///
+/// 3. **`enabled_tools` — this is Codex's tool allowlist, and it is STRONGER than Claude
+///    Code's.** Codex has no `--allowedTools`, so without this every tool a loaded server
+///    advertises stands at the root. With it, an omitted tool is ABSENT rather than refused:
+///    a child asked for `conversations_join` got `TypeError: tools.mcp__slack__
+///    conversations_join is not a function`. The names come from
+///    [`granted_mcp_tools`] reading the SAME `--allowedTools` string Claude Code is given, so
+///    the two harnesses cannot drift apart — there is one allowlist, expressed twice.
 pub fn codex_mcp_args(
     harness: &'static str,
     mcp_config: &str,
+    allowed_tools: &str,
 ) -> Result<Vec<String>, HarnessError> {
     let parsed: serde_json::Value = serde_json::from_str(mcp_config).map_err(|e| {
         HarnessError::unsupported(
@@ -440,8 +474,67 @@ pub fn codex_mcp_args(
             args.push("-c".to_string());
             args.push(format!("mcp_servers.{name}.args=[{}]", rendered.join(", ")));
         }
+        // The secret's NAME, never its value — see the doc comment, point 1.
+        if let Some((_, vars)) = CODEX_MCP_ENV_PASSTHROUGH.iter().find(|(s, _)| *s == name) {
+            let rendered: Vec<String> = vars.iter().map(|v| toml_string(v)).collect();
+            args.push("-c".to_string());
+            args.push(format!(
+                "mcp_servers.{name}.env_vars=[{}]",
+                rendered.join(", ")
+            ));
+        }
+        // The tool allowlist, derived from the one Claude Code is given — point 3.
+        //
+        // A server with NO granted tool still gets an EMPTY list rather than the key being
+        // omitted, and the difference is the whole safety property: an omitted key means
+        // "every tool this server advertises", which is the opposite of what an empty grant
+        // means. Failing closed here costs nothing (no shipped set has such a server) and
+        // makes a future ungranted server inert instead of wide open.
+        let granted = granted_mcp_tools(allowed_tools, name);
+        let rendered: Vec<String> = granted.iter().map(|t| toml_string(t)).collect();
+        args.push("-c".to_string());
+        args.push(format!(
+            "mcp_servers.{name}.enabled_tools=[{}]",
+            rendered.join(", ")
+        ));
+        // Auto-approve what survived that allowlist — point 2. Ordered AFTER the allowlist
+        // so it reads as "approve these", not "approve anything".
+        args.push("-c".to_string());
+        args.push(format!(
+            "mcp_servers.{name}.default_tools_approval_mode=\"approve\""
+        ));
     }
     Ok(args)
+}
+
+/// The environment variables each MCP server needs forwarded into it, BY NAME.
+///
+/// Codex-only: Claude Code's MCP subprocesses inherit the bridge's environment, so this
+/// table has no Claude Code equivalent and must not grow one. Empty for every server that
+/// needs no secret — qmd and browser take nothing, and adding a name here that a server does
+/// not need widens what a subprocess can read for no gain.
+///
+/// A NAME, NOT A VALUE. The bridge never reads the token; it tells Codex which variable to
+/// pass through from its own environment, where launchd put it. Nothing here is a secret and
+/// nothing here belongs in the plist beyond the value itself.
+pub const CODEX_MCP_ENV_PASSTHROUGH: &[(&str, &[&str])] = &[("slack", &["SLACK_MCP_XOXP_TOKEN"])];
+
+/// Every tool granted on `server`, read out of the SAME `--allowedTools` string Claude Code
+/// is handed — the one source of truth for what an MCP server may expose.
+///
+/// Returns the BARE tool names (`channels_list`), not the wire names
+/// (`mcp__slack__channels_list`), because that is what Codex's `enabled_tools` takes.
+/// Entries that are not `mcp__<server>__<tool>` — the built-ins, the scoped `Bash(…)` forms,
+/// another server's grants — are skipped, so this stays correct as the allowlist grows.
+pub fn granted_mcp_tools(allowed_tools: &str, server: &str) -> Vec<String> {
+    let prefix = format!("mcp__{server}__");
+    allowed_tools
+        .split(',')
+        .map(str::trim)
+        .filter_map(|entry| entry.strip_prefix(&prefix))
+        .filter(|tool| !tool.is_empty())
+        .map(str::to_string)
+        .collect()
 }
 
 // ---- The per-turn home ----------------------------------------------------------
@@ -677,7 +770,7 @@ impl Codex {
     /// posture, the translated MCP set, the model's own provider (if it names one), piped
     /// stdio and `kill_on_drop`.
     pub fn command(&self, cfg: &Config, req: &TurnRequest<'_>) -> Result<Command, HarnessError> {
-        let mcp = codex_mcp_args(CODEX_ID, req.mcp_config)?;
+        let mcp = codex_mcp_args(CODEX_ID, req.mcp_config, &cfg.allowed_tools)?;
         // `None` for the subscription-OAuth posture, which is every turn that came before
         // this and still the deployed one. See [`codex_provider_args`].
         let provider = codex_provider_args(req.active);
@@ -870,11 +963,16 @@ impl Harness for Codex {
         &CODEX_ATTACHMENTS
     }
 
-    /// qmd ALONE. Codex deliberately does not get the Slack server Claude Code carries:
-    /// nothing drives Slack through Codex, and giving it one would invalidate this
-    /// harness's record and orphan the operator acceptances keyed to its row labels.
+    /// THE SAME THREE SERVERS CLAUDE CODE CARRIES — qmd, slack, browser — as of 0.66.0.
+    ///
+    /// This method's previous body was `QMD_ONLY_MCP_CONFIG`, and its comment said Codex
+    /// "deliberately does not get the Slack server … giving it one would invalidate this
+    /// harness's record and orphan the operator acceptances keyed to its row labels". The
+    /// second half was true and is exactly what happened: the record was re-run and the two
+    /// acceptances were re-signed under the new row labels. The first half was the gap the
+    /// standing rule now forbids — a capability lands on every harness in the same change.
     fn main_mcp_config(&self) -> &'static str {
-        QMD_ONLY_MCP_CONFIG
+        MAIN_CHILD_MCP_CONFIG
     }
 
     fn shipped_rows(&self) -> &'static [ContainmentRow] {
@@ -1796,5 +1894,92 @@ mod tests {
             panic!("turn.failed is terminal");
         };
         assert_eq!(message, "Reconnecting... 5/5");
+    }
+
+    /// The three overrides Codex needs and Claude Code does not — see `codex_mcp_args`.
+    /// Each was measured against 0.146.0 and each, when absent, produces a server that looks
+    /// configured and does nothing.
+    #[test]
+    fn the_mcp_translation_carries_the_allowlist_the_secret_name_and_the_approval() {
+        let allowed = "Read(./**),mcp__qmd__query,mcp__qmd__status,\
+                       mcp__slack__channels_list,mcp__slack__users_search,\
+                       mcp__browser__browser_navigate,WebSearch";
+        let args = codex_mcp_args(CODEX_ID, MAIN_CHILD_MCP_CONFIG, allowed).expect("translates");
+        let flat = args.join(" ");
+
+        // The allowlist, per server, derived from the ONE string Claude Code also gets.
+        assert!(
+            flat.contains(r#"mcp_servers.slack.enabled_tools=["channels_list", "users_search"]"#),
+            "{args:?}"
+        );
+        assert!(
+            flat.contains(r#"mcp_servers.browser.enabled_tools=["browser_navigate"]"#),
+            "{args:?}"
+        );
+        // A tool NOT granted must not appear anywhere in the argv.
+        assert!(
+            !flat.contains("conversations_join"),
+            "an ungranted tool leaked into the child's argv: {args:?}"
+        );
+        assert!(
+            !flat.contains("browser_run_code_unsafe"),
+            "an ungranted tool leaked into the child's argv: {args:?}"
+        );
+
+        // The secret's NAME travels; nothing resembling a value does. This is the whole
+        // reason `env_vars` is used instead of `env` — an `env` table would put the token in
+        // argv, visible in `ps` to every process on the host.
+        assert!(
+            flat.contains(r#"mcp_servers.slack.env_vars=["SLACK_MCP_XOXP_TOKEN"]"#),
+            "{args:?}"
+        );
+        assert!(
+            !flat.contains("xoxp-"),
+            "a token value reached the argv: {args:?}"
+        );
+        // Only the server that needs a secret gets the key at all.
+        assert!(!flat.contains("mcp_servers.qmd.env_vars"), "{args:?}");
+        assert!(!flat.contains("mcp_servers.browser.env_vars"), "{args:?}");
+
+        // Every server is auto-approved, because `approval_policy="never"` would otherwise
+        // auto-CANCEL any tool the server annotates `destructive` — which the Slack server
+        // does even for its read-only tools.
+        for server in ["qmd", "slack", "browser"] {
+            assert!(
+                flat.contains(&format!(
+                    r#"mcp_servers.{server}.default_tools_approval_mode="approve""#
+                )),
+                "{server} is not auto-approved, so its calls will be cancelled: {args:?}"
+            );
+        }
+    }
+
+    /// A server with NO granted tool gets an EMPTY allowlist, never an omitted key. Omitting
+    /// the key means "everything this server advertises" — the exact opposite of what an
+    /// empty grant means, so this fails CLOSED.
+    #[test]
+    fn a_server_with_no_granted_tools_is_inert_rather_than_wide_open() {
+        let args = codex_mcp_args(CODEX_ID, MAIN_CHILD_MCP_CONFIG, "Read(./**),WebSearch")
+            .expect("translates");
+        let flat = args.join(" ");
+        for server in ["qmd", "slack", "browser"] {
+            assert!(
+                flat.contains(&format!("mcp_servers.{server}.enabled_tools=[]")),
+                "{server} must be granted nothing rather than everything: {args:?}"
+            );
+        }
+    }
+
+    /// `granted_mcp_tools` reads the allowlist and nothing else: it must not confuse one
+    /// server's grants for another's, and must ignore every non-MCP entry.
+    #[test]
+    fn granted_mcp_tools_reads_only_its_own_servers_entries() {
+        let allowed = "Read(./**),Bash(git:*),mcp__qmd__query,mcp__slack__channels_list,\
+                       mcp__slackother__nope,WebFetch";
+        assert_eq!(granted_mcp_tools(allowed, "qmd"), vec!["query"]);
+        assert_eq!(granted_mcp_tools(allowed, "slack"), vec!["channels_list"]);
+        assert_eq!(granted_mcp_tools(allowed, "browser"), Vec::<String>::new());
+        // A prefix that merely STARTS with another server's name is a different server.
+        assert_eq!(granted_mcp_tools(allowed, "slackother"), vec!["nope"]);
     }
 }

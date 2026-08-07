@@ -375,22 +375,17 @@ pub fn interpret_claude_output(
 
 // ---- MCP server sets --------------------------------------------------------
 
-/// The MCP server set for a MAIN turn, used when `JESSE_MAIN_MCP_CONFIG` is unset:
-/// exactly the **qmd** vault-search server and nothing else. Passed as `--mcp-config`
-/// alongside `--strict-mcp-config`, so the account-level cloud connectors (Gmail,
-/// Slack, Google Calendar, Google Drive) and `playwright` are never LOADED on a phone
-/// turn rather than merely refused at the permission layer.
+/// The MCP server set for a MAIN turn on EVERY harness, used when `JESSE_MAIN_MCP_CONFIG`
+/// is unset: **qmd**, **slack** and **browser**. Passed as `--mcp-config` alongside
+/// `--strict-mcp-config`, so the account-level cloud connectors (Gmail, Slack, Google
+/// Calendar, Google Drive) are never LOADED on a phone turn rather than merely refused at
+/// the permission layer.
 ///
 /// `"command": "qmd"` is resolved from the child's `PATH`, mirroring how `claude_bin`
 /// defaults to the bare name `"claude"` with the absolute path supplied by env
 /// (`JESSE_CLAUDE_BIN`) in production. If `qmd` is not on the bridge's `PATH`, set
 /// `JESSE_MAIN_MCP_CONFIG` to a config naming the absolute interpreter + script path;
 /// no user-specific path is baked into this source.
-///
-/// qmd and slack are declared. `playwright` is deliberately EXCLUDED: no main-path feature
-/// references it (verified — zero references under `bridge/` and zero in the vault's
-/// `CLAUDE.md` / skills), and it is the exact server a prior "fetch" probe drove to a
-/// live network fetch out of a child that was supposed to be contained.
 ///
 /// `slack` is a SELF-HOSTED read-only Slack server (npm `slack-mcp-server`), not the
 /// account-level claude.ai Slack connector — that one is still never loaded. It is declared
@@ -400,12 +395,55 @@ pub fn interpret_claude_output(
 /// separately, by environment inheritance (`SLACK_MCP_XOXP_TOKEN`), so no secret is baked
 /// in here. `SLACK_MCP_ADD_MESSAGE_TOOL` and its siblings are deliberately never set:
 /// without them the server does not even register `conversations_add_message`.
-pub const MAIN_CHILD_MCP_CONFIG: &str = r#"{"mcpServers":{"qmd":{"type":"stdio","command":"qmd","args":["mcp"]},"slack":{"type":"stdio","command":"npx","args":["-y","slack-mcp-server@latest","--transport","stdio"]}}}"#;
+///
+/// # `browser` — what it is, and the three flags that are not decoration
+///
+/// npm `@playwright/mcp`, named for the CAPABILITY rather than the implementation so
+/// [`McpSet::contains_browser`] and a swap of the underlying server do not disagree. It
+/// exists because the built-in `WebFetch` is refused outright on too many hosts to be
+/// useful — measured, not assumed: `WebFetch` returns "Claude Code is unable to fetch from
+/// stackoverflow.com", while this server renders that page in full.
+///
+///   * `--headless` — there is no display on a daemon host. Verified 2026-08-07 that
+///     attaching a real Chrome profile (`--browser chrome --user-data-dir …`) does NOT
+///     defeat the bot walls that block `WebFetch`, so the profile buys only logged-in
+///     sessions — at the cost of handing a phone-triggered agent every cookie the operator
+///     holds. Deliberately not done.
+///   * `--isolated` — the profile lives in memory and is discarded with the turn, so no
+///     cross-turn cookie or history state accumulates on disk.
+///   * `--output-dir` — **load-bearing containment, not tidiness.** `browser_navigate`
+///     writes a snapshot `.yml` and a console `.log` per navigation, and
+///     `browser_take_screenshot` a `.png`; with no output dir they go into the CHILD'S CWD,
+///     which every main turn sets to the vault. An MCP server is not inside either
+///     harness's sandbox (measured: a canary server wrote `/tmp` under Codex's
+///     `sandbox_mode="read-only"`), so nothing else stops it. The path is under `/tmp`
+///     because it must be identical on every deployment — the containment record is
+///     compared by strict equality and a home directory here would pin the record to one
+///     machine (see `the_record_carries_no_absolute_host_paths`). The directory is created
+///     on demand, so nothing has to provision it.
+///   * `--output-max-size` — a 100 MB eviction threshold, because every navigation and
+///     every screenshot leaves a file behind and nothing else ever deletes one. Without a
+///     bound this grows without limit on a long-lived daemon. The number is not tuned to
+///     anything; it is simply far above one turn's worth and far below "fills the disk".
+///
+/// `browser_evaluate` and `browser_run_code_unsafe` are loaded but NOT granted; see
+/// [`crate::DEFAULT_ALLOWED_TOOLS`] for the full granted/omitted split and why.
+///
+/// **`file:` URLs are refused by the server itself** — "Access to 'file:' protocol is
+/// blocked", measured 2026-08-07. So the browser is not a route to local files even before
+/// the allowlist is consulted. Not relied upon as the boundary (it is upstream's choice, not
+/// ours), but worth knowing it is there.
+pub const MAIN_CHILD_MCP_CONFIG: &str = r#"{"mcpServers":{"qmd":{"type":"stdio","command":"qmd","args":["mcp"]},"slack":{"type":"stdio","command":"npx","args":["-y","slack-mcp-server@latest","--transport","stdio"]},"browser":{"type":"stdio","command":"npx","args":["-y","@playwright/mcp@latest","--headless","--isolated","--output-dir","/tmp/jesse-browser","--output-max-size","104857600"]}}}"#;
 
-/// The qmd server ALONE — the main turn's server set before slack was added (bridge 0.57.0).
-/// No shipped spawn site uses it today; it is retained because [`McpSet::Qmd`] still names a
-/// posture a deployment can express, and because dropping it would silently re-point that
-/// label at a set containing slack.
+/// qmd PLUS slack — the main turn's server set from bridge 0.57.0 until the browser was
+/// added in 0.66.0. No shipped spawn site uses it today; it is retained because
+/// [`McpSet::QmdSlack`] still names a posture a deployment can express, and because dropping
+/// it would silently re-point that label at a set containing the browser.
+pub const QMD_SLACK_MCP_CONFIG: &str = r#"{"mcpServers":{"qmd":{"type":"stdio","command":"qmd","args":["mcp"]},"slack":{"type":"stdio","command":"npx","args":["-y","slack-mcp-server@latest","--transport","stdio"]}}}"#;
+
+/// The qmd server ALONE — the main turn's server set before slack was added (bridge 0.57.0),
+/// and Codex's until 0.66.0. No shipped spawn site uses it today; retained for the same
+/// reason as [`QMD_SLACK_MCP_CONFIG`].
 pub const QMD_ONLY_MCP_CONFIG: &str =
     r#"{"mcpServers":{"qmd":{"type":"stdio","command":"qmd","args":["mcp"]}}}"#;
 
@@ -1468,17 +1506,40 @@ mod tests {
                 servers.contains_key("slack"),
                 "{label}: the main path declares the read-only slack server: {mcp:?}"
             );
+            // …plus the headless browser, since 0.66.0.
+            assert!(
+                servers.contains_key("browser"),
+                "{label}: the main path declares the browser server: {mcp:?}"
+            );
+            // THE BROWSER'S OUTPUT DIRECTORY IS PART OF THE POSTURE, not a preference.
+            // Without it `browser_navigate` writes a snapshot and a console log into the
+            // child's cwd, which every main turn sets to the VAULT — and an MCP server sits
+            // outside both harnesses' sandboxes, so nothing else stops it. Asserted here
+            // because the flag lives in a JSON string const where a careless edit would drop
+            // it silently.
+            let browser_args = servers["browser"]["args"].as_array().expect("args");
+            assert!(
+                browser_args.iter().any(|a| a == "--output-dir"),
+                "{label}: the browser must redirect its file writes out of the vault: {mcp:?}"
+            );
+            // Every navigation and every screenshot leaves a file behind and nothing
+            // deletes one, so an unbounded output dir grows forever on a daemon.
+            assert!(
+                browser_args.iter().any(|a| a == "--output-max-size"),
+                "{label}: the browser's output directory must be size-bounded: {mcp:?}"
+            );
             // …and NOTHING else. An exact count (rather than a denylist of server names)
-            // is what makes re-adding ANY server — a cloud connector, playwright, or one
-            // that does not exist yet — a deliberate, test-breaking act instead of a
-            // silent widening. A name-based check would only catch the servers we
-            // happened to think of, the same fragility documented for the denylists.
-            // Raising this number is the test-breaking act; it must stay in lockstep
-            // with a battery row that actually loads the new set.
+            // is what makes re-adding ANY server — a cloud connector, or one that does not
+            // exist yet — a deliberate, test-breaking act instead of a silent widening. A
+            // name-based check would only catch the servers we happened to think of, the
+            // same fragility documented for the denylists. Raising this number is the
+            // test-breaking act; it must stay in lockstep with a battery row that actually
+            // loads the new set.
             assert_eq!(
                 servers.len(),
-                2,
-                "{label}: the main path must declare qmd and slack and nothing else: {mcp:?}"
+                3,
+                "{label}: the main path must declare qmd, slack and browser and nothing \
+                 else: {mcp:?}"
             );
         }
     }
@@ -1841,10 +1902,12 @@ mod tests {
     ];
 
     /// The MCP config the main path falls back to when `JESSE_MAIN_MCP_CONFIG` is unset —
-    /// qmd plus the read-only slack server since 0.57.0. Spelled out rather than referencing
-    /// [`MAIN_CHILD_MCP_CONFIG`] so the golden pins the literal a child is spawned with: a
-    /// const-vs-const comparison would pass no matter what the const became.
-    const GOLDEN_QMD_MCP: &str = r#"{"mcpServers":{"qmd":{"type":"stdio","command":"qmd","args":["mcp"]},"slack":{"type":"stdio","command":"npx","args":["-y","slack-mcp-server@latest","--transport","stdio"]}}}"#;
+    /// qmd plus the read-only slack server since 0.57.0, plus the headless browser since
+    /// 0.66.0. Spelled out rather than referencing [`MAIN_CHILD_MCP_CONFIG`] so the golden
+    /// pins the literal a child is spawned with: a const-vs-const comparison would pass no
+    /// matter what the const became. `--output-dir` is part of the pinned literal on
+    /// purpose — dropping it silently moves the browser's file writes into the vault.
+    const GOLDEN_QMD_MCP: &str = r#"{"mcpServers":{"qmd":{"type":"stdio","command":"qmd","args":["mcp"]},"slack":{"type":"stdio","command":"npx","args":["-y","slack-mcp-server@latest","--transport","stdio"]},"browser":{"type":"stdio","command":"npx","args":["-y","@playwright/mcp@latest","--headless","--isolated","--output-dir","/tmp/jesse-browser","--output-max-size","104857600"]}}}"#;
     const GOLDEN_EMPTY_MCP: &str = r#"{"mcpServers":{}}"#;
 
     /// The shared base plus a site's MCP + containment args — one full expected argv.

@@ -162,6 +162,64 @@ pub const DEFAULT_MAX_ATTACHMENTS_TOTAL_BYTES: usize = 20 * 1024 * 1024;
 // unrestricted arguments — a separate decision with its own cost to the vault
 // workflows, and both stay recorded as known-open baselines in
 // `bridge/containment.toml` rather than being quietly closed as a side effect.
+//
+// ---- The MCP grants, and why they are the ONE source of truth ----------------
+//
+// EVERY `mcp__<server>__<tool>` entry below is read twice, and that is the point.
+// Claude Code gets them verbatim as `--allowedTools`. Codex has no tool-allowlist
+// flag at all, so `codex_mcp_args` DERIVES its per-server `enabled_tools` from
+// this same const (see `granted_mcp_tools`). A tool granted here is granted on
+// both harnesses; a tool omitted here is absent on both. There is no second list
+// to keep in step, because a second list would drift.
+//
+// The names were enumerated LIVE against the pinned servers on 2026-08-07
+// (`initialize` + `tools/list`), never from a README — the Slack server's README
+// was wrong in both directions, listing scopes that do not exist and omitting
+// mutating tools that do.
+//
+// SLACK: six of fifteen. Granted are the six read-only ones above. The nine
+// omitted, by name and reason: `conversations_join`, `conversations_leave`,
+// `conversations_mark` (all mutate; `conversations_mark` registers by default
+// despite the README saying otherwise), `usergroups_create` / `usergroups_update`
+// / `usergroups_users_update` (mutate), `usergroups_me` (multiplexes read and
+// write behind an `action` argument, so its read half cannot be granted alone),
+// `usergroups_list` (read-only, no use case) and `conversations_unreads`
+// (read-only, outside the agreed set). The TOKEN cannot post either way — it holds
+// no `chat:write` scope of any kind, verified live: `chat.postMessage` returns
+// `missing_scope`. The allowlist and the token are two independent boundaries and
+// both are shut.
+//
+// BROWSER: twenty of twenty-four. The four omitted are the ones that would turn a
+// page fetch into something else, and they split into exactly two classes:
+//   * ARBITRARY CODE — `browser_evaluate` (runs JS in the page) and
+//     `browser_run_code_unsafe` (runs JS in the Playwright SERVER process, which
+//     is not inside either harness's sandbox — the server's own description calls
+//     it unsafe). These are the reason a browser server is not simply granted
+//     whole.
+//   * LOCAL FILES INTO A PAGE — `browser_file_upload` and `browser_drop` read
+//     local files into a web page, which is an exfiltration route out of the vault
+//     that no network policy would see.
+// Everything else — navigate, read, screenshot, and the interaction verbs (click,
+// type, fill_form, press_key, hover, select_option, drag, handle_dialog, tabs,
+// resize, close) — is granted, because a read-only browser that cannot dismiss a
+// cookie wall or page through results cannot reach the sites this capability
+// exists for.
+//
+// `browser_take_screenshot` IS granted, and it is not a write escape: the PNG goes
+// to the server's `--output-dir` under `/tmp`, never the vault. It earns its place
+// because the image genuinely REACHES THE MODEL — verified 2026-08-07 on BOTH
+// harnesses by rendering a page whose colours appear nowhere in its accessibility
+// tree and asking for them back: Claude Code returned #7B2D8B/#F2C41E and Codex
+// #812C90/#F9C719 against an actual #7B2D8E/#F2C31A. Only pixels produce that. It
+// is what reads a chart, a canvas, or a rendered layout that `browser_snapshot`'s
+// text tree cannot express. NOTE the limit, because it is not obvious: the image
+// reaches the MODEL, never the USER — the bridge's mid-turn contract carries
+// `ToolActivity { name, refused }` and deliberately excludes tool RESULTS, so a
+// phone gets the model's DESCRIPTION of a screenshot and never the picture.
+//
+// `browser_wait_for` is NOT filler: the bot walls that block `WebFetch` clear only
+// after a delay, and without it the browser returns a 403 interstitial on exactly
+// the pages it was added to read (measured on stackoverflow.com, 2026-08-07).
 pub const DEFAULT_ALLOWED_TOOLS: &str = "Read(./**),Write(./**),Edit(./**),Grep(./**),Glob(./**),\
 mcp__qmd__query,mcp__qmd__get,mcp__qmd__multi_get,mcp__qmd__status,\
 Skill(diet-logging),\
@@ -173,7 +231,17 @@ Bash(node vault/verify-diet-consistency.js:*),\
 WebSearch,WebFetch,\
 mcp__slack__conversations_history,mcp__slack__conversations_replies,\
 mcp__slack__conversations_search_messages,mcp__slack__channels_list,\
-mcp__slack__channels_me,mcp__slack__users_search";
+mcp__slack__channels_me,mcp__slack__users_search,\
+mcp__browser__browser_navigate,mcp__browser__browser_navigate_back,\
+mcp__browser__browser_snapshot,mcp__browser__browser_find,\
+mcp__browser__browser_wait_for,mcp__browser__browser_console_messages,\
+mcp__browser__browser_network_requests,mcp__browser__browser_network_request,\
+mcp__browser__browser_click,mcp__browser__browser_type,\
+mcp__browser__browser_fill_form,mcp__browser__browser_press_key,\
+mcp__browser__browser_hover,mcp__browser__browser_select_option,\
+mcp__browser__browser_drag,mcp__browser__browser_handle_dialog,\
+mcp__browser__browser_tabs,mcp__browser__browser_resize,\
+mcp__browser__browser_close,mcp__browser__browser_take_screenshot";
 
 // Defense-in-depth: tools that must never run from the bridge even if they slip
 // into the allowlist. Override with JESSE_DISALLOWED_TOOLS.
