@@ -76,14 +76,37 @@ pub enum McpSet {
     /// the label names a posture a deployment can still express, and deleting it would
     /// silently re-point an existing `qmd+slack` row label at a different server set.
     QmdSlack,
-    /// qmd PLUS Slack PLUS the headless browser ([`MAIN_CHILD_MCP_CONFIG`]): **every main
-    /// turn on every harness** from bridge 0.66.0.
+    /// qmd PLUS Slack PLUS the headless browser ([`QMD_SLACK_BROWSER_MCP_CONFIG`]): every
+    /// main turn on every harness from bridge 0.66.0 to 0.66.x.
     ///
     /// This is the first set BOTH harnesses spawn. Before it, Claude Code ran `QmdSlack` and
     /// Codex ran `Qmd` — a gap that predated the standing rule that a capability lands on
     /// every harness in the same change. The rows are still per harness (see
     /// [`Harness::shipped_rows`]); it is only the server set that is now common.
+    ///
+    /// NO SHIPPED SPAWN SITE USES THIS TODAY (0.67.0 moved every main turn to
+    /// [`McpSet::House`]), and it is retained for the same reason its two predecessors are.
     QmdSlackBrowser,
+    /// qmd + Slack + browser + **Home Assistant** + **Roon** ([`MAIN_CHILD_MCP_CONFIG`]):
+    /// every main turn on every harness from bridge 0.67.0.
+    ///
+    /// Named `House` rather than spelled out because the spelled-out form
+    /// (`QmdSlackBrowserHomeAssistantRoon`) has stopped paying for itself — the label
+    /// string is still exhaustive and is what the record and `--rows` are keyed on, so
+    /// nothing is lost by giving the VARIANT a short name.
+    ///
+    /// TWO THINGS ARE NEW HERE AND NEITHER IS THE SERVER COUNT. This is the first set whose
+    /// servers speak **HTTP** rather than stdio, and the first whose tools **actuate
+    /// physical hardware** — the entrance gate, lights, climate and covers. The containment
+    /// story for the second one is deliberately NOT in the toolset: full house control was
+    /// authorized by the operator, so the allowlist grants it. See SECURITY.md.
+    ///
+    /// THE ROW LABELS MOVED AGAIN, AND AGAIN IT COST THE CODEX SIGNATURES. `read/qmd+slack+browser`
+    /// and `write/qmd+slack+browser` became `read/{label}` and `write/{label}`, orphaning
+    /// the two operator `[[accepted]]` blocks in `containment-codex.toml` exactly as 0.66.0
+    /// did. Re-pointed by the owner on the same record as before. Do not rename these
+    /// without going back for that decision — see [`CODEX_SHIPPED_ROWS`].
+    House,
 }
 
 impl McpSet {
@@ -94,6 +117,7 @@ impl McpSet {
             McpSet::Qmd => "qmd",
             McpSet::QmdSlack => "qmd+slack",
             McpSet::QmdSlackBrowser => "qmd+slack+browser",
+            McpSet::House => "qmd+slack+browser+homeassistant+roon",
         }
     }
 
@@ -104,6 +128,7 @@ impl McpSet {
             "qmd" => Some(McpSet::Qmd),
             "qmd+slack" => Some(McpSet::QmdSlack),
             "qmd+slack+browser" => Some(McpSet::QmdSlackBrowser),
+            "qmd+slack+browser+homeassistant+roon" => Some(McpSet::House),
             _ => None,
         }
     }
@@ -117,7 +142,8 @@ impl McpSet {
             McpSet::None => EMPTY_MCP_CONFIG,
             McpSet::Qmd => QMD_ONLY_MCP_CONFIG,
             McpSet::QmdSlack => QMD_SLACK_MCP_CONFIG,
-            McpSet::QmdSlackBrowser => MAIN_CHILD_MCP_CONFIG,
+            McpSet::QmdSlackBrowser => QMD_SLACK_BROWSER_MCP_CONFIG,
+            McpSet::House => MAIN_CHILD_MCP_CONFIG,
         }
     }
 
@@ -140,7 +166,7 @@ impl McpSet {
     pub fn contains_qmd(&self) -> bool {
         match self {
             McpSet::None => false,
-            McpSet::Qmd | McpSet::QmdSlack | McpSet::QmdSlackBrowser => true,
+            McpSet::Qmd | McpSet::QmdSlack | McpSet::QmdSlackBrowser | McpSet::House => true,
         }
     }
 
@@ -158,7 +184,7 @@ impl McpSet {
     pub fn contains_slack(&self) -> bool {
         match self {
             McpSet::None | McpSet::Qmd => false,
-            McpSet::QmdSlack | McpSet::QmdSlackBrowser => true,
+            McpSet::QmdSlack | McpSet::QmdSlackBrowser | McpSet::House => true,
         }
     }
 
@@ -167,7 +193,30 @@ impl McpSet {
     pub fn contains_browser(&self) -> bool {
         match self {
             McpSet::None | McpSet::Qmd | McpSet::QmdSlack => false,
-            McpSet::QmdSlackBrowser => true,
+            McpSet::QmdSlackBrowser | McpSet::House => true,
+        }
+    }
+
+    /// Whether this set loads the Home Assistant server, and therefore whether
+    /// `mcp__homeassistant__*` stands at the root of a child probed on this row.
+    ///
+    /// Same exhaustiveness rule as its siblings above, and never a `_` arm — the whole
+    /// point of that rule is that adding the NEXT set is a compile error here rather than a
+    /// silently wrong record. This one carries more than a search tool: a set that loads it
+    /// can move the entrance gate.
+    pub fn contains_homeassistant(&self) -> bool {
+        match self {
+            McpSet::None | McpSet::Qmd | McpSet::QmdSlack | McpSet::QmdSlackBrowser => false,
+            McpSet::House => true,
+        }
+    }
+
+    /// Whether this set loads the Roon music server — same exhaustiveness rule, never a `_`
+    /// arm.
+    pub fn contains_roon(&self) -> bool {
+        match self {
+            McpSet::None | McpSet::Qmd | McpSet::QmdSlack | McpSet::QmdSlackBrowser => false,
+            McpSet::House => true,
         }
     }
 
@@ -184,6 +233,12 @@ impl McpSet {
         }
         if self.contains_browser() {
             out.push("browser");
+        }
+        if self.contains_homeassistant() {
+            out.push("homeassistant");
+        }
+        if self.contains_roon() {
+            out.push("roon");
         }
         out
     }
@@ -229,8 +284,8 @@ pub fn parse_capability(s: &str) -> Option<Capability> {
 ///   * `basic` + no servers          — the diet extract/verify children and the title one-shot.
 ///   * `read`  + no servers          — the vault-QA child (and the shadow child sharing its
 ///     builder).
-///   * `read`  + qmd+slack+browser   — a main turn backed by a read-only model.
-///   * `write` + qmd+slack+browser   — a main turn backed by a writes-on model.
+///   * `read`  + the [`McpSet::House`] set — a main turn backed by a read-only model.
+///   * `write` + the [`McpSet::House`] set — a main turn backed by a writes-on model.
 ///
 /// The two `read` rows are expected to agree on the escape probes and differ only in whether
 /// MCP search is reachable — but both are probed and recorded rather than reasoned about.
@@ -255,25 +310,31 @@ pub const CLAUDE_CODE_SHIPPED_ROWS: [ContainmentRow; 4] = [
     },
     ContainmentRow {
         capability: Capability::Read,
-        mcp: McpSet::QmdSlackBrowser,
+        mcp: McpSet::House,
     },
     ContainmentRow {
         capability: Capability::Write,
-        mcp: McpSet::QmdSlackBrowser,
+        mcp: McpSet::House,
     },
 ];
 
-/// Codex's rows. Its main turn loads **the same three servers Claude Code's does** as of
-/// 0.66.0 — qmd, Slack and the browser.
+/// Codex's rows. Its main turn loads **the same five servers Claude Code's does** as of
+/// 0.67.0 — qmd, Slack, the browser, Home Assistant and Roon.
 ///
-/// THE ROW LABELS MOVED, AND THAT COST TWO SIGNATURES. Until 0.66.0 Codex's main turn was
-/// `qmd` alone, so these were `read/qmd` and `write/qmd` — the labels two operator
-/// `[[accepted]]` blocks in `containment-codex.toml` were keyed on. Renaming a row orphans
-/// its signature (acceptances match by `ContainmentRow::label`), so this change could not be
-/// made unilaterally: the six `read_*` known-opens were re-signed under the new labels by
-/// the owner, on the record that the read boundary is the OS read-only sandbox and that an
-/// MCP server, which runs OUTSIDE that sandbox but reads nothing on the child's behalf, does
-/// not widen it. Do not rename these again without going back for the same decision.
+/// THE ROW LABELS HAVE NOW MOVED TWICE, AND EACH TIME IT COST THE SAME TWO SIGNATURES.
+/// Until 0.66.0 Codex's main turn was `qmd` alone (`read/qmd`, `write/qmd`); 0.66.0 made it
+/// `qmd+slack+browser`; 0.67.0 makes it [`McpSet::House`]. Each rename orphans the two
+/// operator `[[accepted]]` blocks in `containment-codex.toml`, because acceptances match by
+/// `ContainmentRow::label` — so neither change could be made unilaterally. Both times the
+/// six `read_*` known-opens were re-signed under the new labels by the owner, on the same
+/// record: the read boundary is the OS read-only sandbox, and an MCP server — which runs
+/// OUTSIDE that sandbox but reads nothing on the child's behalf — does not widen it.
+///
+/// THAT RATIONALE IS ABOUT READS, AND IT SURVIVES 0.67.0 UNCHANGED, but note what it does
+/// NOT cover: Home Assistant's granted intents WRITE to the physical world. That is not a
+/// widening of the read sandbox these signatures speak to, so it does not undermine them —
+/// it is a separate, explicitly accepted risk recorded in SECURITY.md. Do not rename these
+/// rows again without going back for the same decision.
 pub const CODEX_SHIPPED_ROWS: [ContainmentRow; 4] = [
     ContainmentRow {
         capability: Capability::Basic,
@@ -285,11 +346,11 @@ pub const CODEX_SHIPPED_ROWS: [ContainmentRow; 4] = [
     },
     ContainmentRow {
         capability: Capability::Read,
-        mcp: McpSet::QmdSlackBrowser,
+        mcp: McpSet::House,
     },
     ContainmentRow {
         capability: Capability::Write,
-        mcp: McpSet::QmdSlackBrowser,
+        mcp: McpSet::House,
     },
 ];
 
@@ -929,8 +990,8 @@ mod tests {
             vec![
                 "basic/none",
                 "read/none",
-                "read/qmd+slack+browser",
-                "write/qmd+slack+browser"
+                "read/qmd+slack+browser+homeassistant+roon",
+                "write/qmd+slack+browser+homeassistant+roon"
             ]
         );
 
@@ -946,8 +1007,8 @@ mod tests {
             vec![
                 "basic/none",
                 "read/none",
-                "read/qmd+slack+browser",
-                "write/qmd+slack+browser"
+                "read/qmd+slack+browser+homeassistant+roon",
+                "write/qmd+slack+browser+homeassistant+roon"
             ]
         );
     }

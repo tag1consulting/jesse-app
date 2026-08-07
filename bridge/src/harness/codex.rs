@@ -444,44 +444,82 @@ pub fn codex_mcp_args(
 
     let mut args = Vec::new();
     for (name, spec) in servers {
-        // Only stdio servers are expressible. The bridge ships exactly one server (qmd,
-        // stdio), so anything else is a config the bridge does not make today — and it
-        // must refuse rather than spawn a child missing a server it was told to load.
+        // TWO TRANSPORTS, and the split is per server rather than per harness. `stdio`
+        // spawns a subprocess; `http` dials a Streamable HTTP endpoint. Anything else is a
+        // config the bridge does not make today, and it must REFUSE rather than spawn a
+        // child silently missing a server it was told to load.
         let kind = spec.get("type").and_then(|v| v.as_str()).unwrap_or("stdio");
-        if kind != "stdio" {
-            return Err(HarnessError::unsupported(
-                harness,
-                format!("a `{kind}` MCP server (`{name}`); only stdio servers are supported"),
-            ));
-        }
-        let Some(command) = spec.get("command").and_then(|v| v.as_str()) else {
-            return Err(HarnessError::unsupported(
-                harness,
-                format!("an MCP server (`{name}`) with no `command`"),
-            ));
-        };
-        args.push("-c".to_string());
-        args.push(format!(
-            "mcp_servers.{name}.command={}",
-            toml_string(command)
-        ));
-        if let Some(list) = spec.get("args").and_then(|v| v.as_array()) {
-            let rendered: Vec<String> = list
-                .iter()
-                .filter_map(|a| a.as_str())
-                .map(toml_string)
-                .collect();
-            args.push("-c".to_string());
-            args.push(format!("mcp_servers.{name}.args=[{}]", rendered.join(", ")));
-        }
-        // The secret's NAME, never its value — see the doc comment, point 1.
-        if let Some((_, vars)) = CODEX_MCP_ENV_PASSTHROUGH.iter().find(|(s, _)| *s == name) {
-            let rendered: Vec<String> = vars.iter().map(|v| toml_string(v)).collect();
-            args.push("-c".to_string());
-            args.push(format!(
-                "mcp_servers.{name}.env_vars=[{}]",
-                rendered.join(", ")
-            ));
+        match kind {
+            "stdio" => {
+                let Some(command) = spec.get("command").and_then(|v| v.as_str()) else {
+                    return Err(HarnessError::unsupported(
+                        harness,
+                        format!("a stdio MCP server (`{name}`) with no `command`"),
+                    ));
+                };
+                args.push("-c".to_string());
+                args.push(format!(
+                    "mcp_servers.{name}.command={}",
+                    toml_string(command)
+                ));
+                if let Some(list) = spec.get("args").and_then(|v| v.as_array()) {
+                    let rendered: Vec<String> = list
+                        .iter()
+                        .filter_map(|a| a.as_str())
+                        .map(toml_string)
+                        .collect();
+                    args.push("-c".to_string());
+                    args.push(format!("mcp_servers.{name}.args=[{}]", rendered.join(", ")));
+                }
+                // The secret's NAME, never its value — see the doc comment, point 1.
+                // STDIO ONLY: `env_vars` forwards variables into a SUBPROCESS's environment,
+                // and an HTTP server has no subprocess to forward them into. An HTTP server
+                // needing a credential takes the `bearer_token_env_var` route below instead.
+                if let Some((_, vars)) = CODEX_MCP_ENV_PASSTHROUGH.iter().find(|(s, _)| *s == name)
+                {
+                    let rendered: Vec<String> = vars.iter().map(|v| toml_string(v)).collect();
+                    args.push("-c".to_string());
+                    args.push(format!(
+                        "mcp_servers.{name}.env_vars=[{}]",
+                        rendered.join(", ")
+                    ));
+                }
+            }
+            "http" => {
+                let Some(url) = spec.get("url").and_then(|v| v.as_str()) else {
+                    return Err(HarnessError::unsupported(
+                        harness,
+                        format!("an http MCP server (`{name}`) with no `url`"),
+                    ));
+                };
+                args.push("-c".to_string());
+                args.push(format!("mcp_servers.{name}.url={}", toml_string(url)));
+                // THE BEARER TOKEN, BY VARIABLE NAME. Codex reads the variable itself, so
+                // the credential never reaches argv, a `ps` listing or a crash dump — the
+                // same property `env_vars` gives a stdio server, reached through a
+                // different key because the transports differ. See [`CODEX_MCP_BEARER_ENV`].
+                //
+                // The canonical config carries the token as an `Authorization` HEADER with a
+                // `${VAR}` placeholder, which is what Claude Code expands. Codex has no
+                // header-expansion equivalent, so the two harnesses spell the SAME secret
+                // two ways; the table below is what keeps them naming one variable.
+                if let Some((_, var)) = CODEX_MCP_BEARER_ENV.iter().find(|(s, _)| *s == name) {
+                    args.push("-c".to_string());
+                    args.push(format!(
+                        "mcp_servers.{name}.bearer_token_env_var={}",
+                        toml_string(var)
+                    ));
+                }
+            }
+            other => {
+                return Err(HarnessError::unsupported(
+                    harness,
+                    format!(
+                        "a `{other}` MCP server (`{name}`); only stdio and http servers are \
+                         supported"
+                    ),
+                ));
+            }
         }
         // The tool allowlist, derived from the one Claude Code is given — point 3.
         //
@@ -518,6 +556,25 @@ pub fn codex_mcp_args(
 /// pass through from its own environment, where launchd put it. Nothing here is a secret and
 /// nothing here belongs in the plist beyond the value itself.
 pub const CODEX_MCP_ENV_PASSTHROUGH: &[(&str, &[&str])] = &[("slack", &["SLACK_MCP_XOXP_TOKEN"])];
+
+/// The environment variable holding each HTTP MCP server's BEARER TOKEN, BY NAME.
+///
+/// The HTTP counterpart of [`CODEX_MCP_ENV_PASSTHROUGH`], and separate from it because the
+/// mechanisms are genuinely different rather than merely differently spelled: `env_vars`
+/// populates a subprocess's environment, which an HTTP server does not have, while
+/// `bearer_token_env_var` tells Codex to read the variable and send an `Authorization`
+/// header itself. Putting an HTTP server in the stdio table would forward a token to a
+/// process that does not exist and leave the request unauthenticated.
+///
+/// A NAME, NOT A VALUE — the same rule and the same reason as the stdio table. `roon` is
+/// deliberately ABSENT: the Roon bridge serves plain HTTP on the LAN with no auth at all, so
+/// there is no token to name (see SECURITY.md; this adds no credential surface).
+///
+/// `HA_MCP_TOKEN` is a Home Assistant long-lived access token, set in the LaunchAgent plist.
+/// Claude Code reaches the SAME variable through `${HA_MCP_TOKEN}` expansion in the
+/// `Authorization` header of [`MAIN_CHILD_MCP_CONFIG`] — one variable, two spellings, and
+/// they must not drift apart.
+pub const CODEX_MCP_BEARER_ENV: &[(&str, &str)] = &[("homeassistant", "HA_MCP_TOKEN")];
 
 /// Every tool granted on `server`, read out of the SAME `--allowedTools` string Claude Code
 /// is handed — the one source of truth for what an MCP server may expose.
@@ -1944,7 +2001,7 @@ mod tests {
         // Every server is auto-approved, because `approval_policy="never"` would otherwise
         // auto-CANCEL any tool the server annotates `destructive` — which the Slack server
         // does even for its read-only tools.
-        for server in ["qmd", "slack", "browser"] {
+        for server in ["qmd", "slack", "browser", "homeassistant", "roon"] {
             assert!(
                 flat.contains(&format!(
                     r#"mcp_servers.{server}.default_tools_approval_mode="approve""#
@@ -1952,6 +2009,92 @@ mod tests {
                 "{server} is not auto-approved, so its calls will be cancelled: {args:?}"
             );
         }
+    }
+
+    /// THE HTTP TRANSPORT, which this path refused outright until 0.67.0.
+    ///
+    /// The refusal was a limit of THIS CODE, not of Codex: measured against codex-cli
+    /// 0.146.0 on 2026-08-07, `codex exec` loads a Streamable HTTP MCP server from a plain
+    /// `url` key and authenticates it from `bearer_token_env_var`. So neither new server
+    /// needs an `npx mcp-remote` stdio wrapper — which would have cost a subprocess per
+    /// server per turn and, worse, put the token on a command line.
+    ///
+    /// The two halves asserted here are the ones that silently produce a DEAD server rather
+    /// than an error: an http server emitted with `command`/`args` (Codex would try to exec
+    /// a URL), and a token forwarded through `env_vars` (an HTTP server has no subprocess
+    /// environment to receive it, so the request would go out unauthenticated and the server
+    /// would register zero tools).
+    #[test]
+    fn an_http_server_travels_as_a_url_with_its_token_named_not_valued() {
+        let allowed = "mcp__homeassistant__GetLiveContext,mcp__homeassistant__HassTurnOn,\
+                       mcp__roon__hifi_zones";
+        let args = codex_mcp_args(CODEX_ID, MAIN_CHILD_MCP_CONFIG, allowed).expect("translates");
+        let flat = args.join(" ");
+
+        assert!(
+            flat.contains(r#"mcp_servers.homeassistant.url="http://10.20.30.10:8123/api/mcp""#),
+            "{args:?}"
+        );
+        assert!(
+            flat.contains(r#"mcp_servers.roon.url="http://10.40.0.2:8088/mcp""#),
+            "{args:?}"
+        );
+        // An HTTP server must never be given the stdio keys — Codex would try to execute
+        // the URL as a program.
+        for server in ["homeassistant", "roon"] {
+            assert!(
+                !flat.contains(&format!("mcp_servers.{server}.command")),
+                "{server} is http and must carry no command: {args:?}"
+            );
+        }
+
+        // The token by NAME, through the http-specific key. `env_vars` would be silently
+        // useless here.
+        assert!(
+            flat.contains(r#"mcp_servers.homeassistant.bearer_token_env_var="HA_MCP_TOKEN""#),
+            "{args:?}"
+        );
+        assert!(
+            !flat.contains("mcp_servers.homeassistant.env_vars"),
+            "an http server must not use the stdio env-forwarding key: {args:?}"
+        );
+        // Roon genuinely has no auth, so it must not acquire a credential key by accident.
+        assert!(
+            !flat.contains("mcp_servers.roon.bearer_token_env_var"),
+            "roon has no auth; naming a variable for it invents a credential: {args:?}"
+        );
+        // The allowlist still governs, transport notwithstanding.
+        assert!(
+            flat.contains(
+                r#"mcp_servers.homeassistant.enabled_tools=["GetLiveContext", "HassTurnOn"]"#
+            ),
+            "{args:?}"
+        );
+        assert!(
+            !flat.contains("HassTurnOff"),
+            "an ungranted tool leaked into the child's argv: {args:?}"
+        );
+    }
+
+    /// A transport neither harness can express is REFUSED, never silently dropped — a child
+    /// spawned without a server it was told to load is the failure this whole path exists to
+    /// prevent. `sse` stands in for "some future transport".
+    #[test]
+    fn an_unknown_transport_is_refused_rather_than_skipped() {
+        let cfg = r#"{"mcpServers":{"weird":{"type":"sse","url":"http://example.invalid/sse"}}}"#;
+        let err = codex_mcp_args(CODEX_ID, cfg, "mcp__weird__thing").expect_err("must refuse");
+        assert!(err.what.contains("sse"), "{err:?}");
+        assert!(err.what.contains("weird"), "{err:?}");
+    }
+
+    /// An http server with no `url` is refused for the same reason a stdio one with no
+    /// `command` is: there is nothing to dial, and a server that silently fails to load is
+    /// worse than a turn that fails loudly.
+    #[test]
+    fn an_http_server_with_no_url_is_refused() {
+        let cfg = r#"{"mcpServers":{"nourl":{"type":"http"}}}"#;
+        let err = codex_mcp_args(CODEX_ID, cfg, "mcp__nourl__thing").expect_err("must refuse");
+        assert!(err.what.contains("url"), "{err:?}");
     }
 
     /// A server with NO granted tool gets an EMPTY allowlist, never an omitted key. Omitting
@@ -1962,7 +2105,7 @@ mod tests {
         let args = codex_mcp_args(CODEX_ID, MAIN_CHILD_MCP_CONFIG, "Read(./**),WebSearch")
             .expect("translates");
         let flat = args.join(" ");
-        for server in ["qmd", "slack", "browser"] {
+        for server in ["qmd", "slack", "browser", "homeassistant", "roon"] {
             assert!(
                 flat.contains(&format!("mcp_servers.{server}.enabled_tools=[]")),
                 "{server} must be granted nothing rather than everything: {args:?}"

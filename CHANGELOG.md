@@ -15,6 +15,79 @@ CI both run it). See the "Versioning" section of `bridge/README.md`.
 
 ## [Unreleased]
 
+## [Bridge 0.67.0] - 2026-08-07
+
+### Added
+
+- **Home Assistant and Roon, on BOTH harnesses, in one posture change.** A main turn on
+  either harness now loads five MCP servers — `qmd`, `slack`, `browser`, `homeassistant`
+  and `roon` — so the bridge can control the house and the music from a phone turn.
+
+  - **Home Assistant** is the built-in Model Context Protocol Server (the Assist API) at
+    `/api/mcp`. **All twenty-one advertised tools are granted**, which is the entire
+    control surface: the three read intents (`GetLiveContext`, `GetDateTime`,
+    `todo_get_items`) and all eighteen control intents (`HassTurnOn`, `HassTurnOff`,
+    `HassLightSet`, `HassSetPosition`, `HassStopMoving`, `HassClimateSetTemperature`, the
+    media transport and volume set, `HassListAddItem`, `HassListCompleteItem`,
+    `HassCancelAllTimers`). Nothing is omitted.
+  - **Roon** is `unified-hifi-control`. All six advertised tools are granted
+    (`hifi_zones`, `hifi_now_playing`, `hifi_control`, `hifi_search`, `hifi_play`,
+    `hifi_status`). The `hifi_hqplayer_*` tools upstream documents are **not advertised by
+    the running server** — HQPlayer is not connected — so there was nothing to omit.
+
+  Both tool lists were enumerated LIVE (`initialize` + `tools/list`) against the running
+  servers, never from a README.
+
+  **What "full control" reaches is decided in Home Assistant, not here.** These intents act
+  only on entities HA exposes to Assist: 388 of the installation's 1199. The entrance gate
+  is among them, as `switch.cancello_ingresso`, so `HassTurnOn`/`HassTurnOff` move it.
+  There is **no `lock` and no `alarm_control_panel` entity in the installation at all**, so
+  locks and an alarm are not granted and cannot be — they do not exist. Changing that reach
+  is an HA Expose edit, not a bridge change.
+
+  **This makes physical actuation reachable from a turn that also has a browser**, which is
+  a prompt-injection-to-physical-action path. It was accepted explicitly by the operator to
+  get full control rather than mitigated here; the threat, the decision, and the HA-side
+  mitigations that were deliberately NOT implemented are recorded in `SECURITY.md`.
+
+- **The Codex harness can carry an HTTP MCP server.** `codex_mcp_args` refused every
+  non-stdio server outright, which turned out to be a limit of that code rather than of
+  Codex: measured against codex-cli 0.146.0, `codex exec` loads a Streamable HTTP server
+  from a plain `url` and authenticates it from `bearer_token_env_var`. So **neither new
+  server needs an `npx mcp-remote` stdio wrapper** — no extra subprocess per server per
+  turn, and no token on a command line. Unknown transports are still refused rather than
+  silently dropped.
+
+- **A `bearer_token_env_var` table (`CODEX_MCP_BEARER_ENV`)**, the HTTP counterpart of the
+  stdio `CODEX_MCP_ENV_PASSTHROUGH`. The two are separate because the mechanisms are:
+  `env_vars` populates a subprocess environment, which an HTTP server does not have, so
+  putting an HTTP server in the stdio table would leave its requests unauthenticated and
+  the server registering zero tools. Roon is deliberately absent from both — it has no auth.
+
+### Changed
+
+- **The Home Assistant token never reaches a config file or argv on either harness.** Claude
+  Code gets `"Authorization": "Bearer ${HA_MCP_TOKEN}"` and expands it from the child's
+  environment; Codex gets the variable NAME via `bearer_token_env_var` and reads it itself.
+  One variable, two spellings. The golden argv test now asserts the placeholder travels
+  **unexpanded**, so a refactor that "helpfully" resolved it — putting a live long-lived HA
+  token into `ps` output and every crash dump — breaks the build.
+
+- **The `McpSet` row key gained a `House` variant**, and the main-turn rows on both
+  harnesses moved to it. The row labels are now
+  `read/qmd+slack+browser+homeassistant+roon` and `write/…`. Every predicate over `McpSet`
+  stays exhaustively matched with no wildcard arm — `contains_homeassistant` and
+  `contains_roon` join the existing three — so the next server set is a compile error at
+  the enum rather than a silently wrong record.
+
+- **`QMD_SLACK_BROWSER_MCP_CONFIG` was split out** of `MAIN_CHILD_MCP_CONFIG`. The two were
+  the same string until now, so growing the main set in place would have silently
+  re-pointed the existing `qmd+slack+browser` row label at a set that also actuates the
+  house.
+
+- **Both containment records re-recorded** (`bridge/containment.toml`,
+  `bridge/containment-codex.toml`) — both harnesses' argv changed, so both were stale.
+
 ## [App 1.0 (93)] - 2026-08-07
 
 ### Fixed

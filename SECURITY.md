@@ -186,7 +186,7 @@ worth applying **the same day** — at that point it would be the remaining open
 door, not one of two. Whoever narrows `Bash(git:*)` should treat this paragraph
 as part of that change's checklist.
 
-### MCP servers on a main turn (strict, qmd + slack + browser)
+### MCP servers on a main turn (strict, qmd + slack + browser + homeassistant + roon)
 
 The main turn also passes `--strict-mcp-config` together with an explicit
 `--mcp-config`, on **both** branches `build_claude_args` can take (writes-enabled
@@ -197,18 +197,29 @@ and read-only). Only the servers named in that config load:
 | `qmd` | Read-only vault search — the four `mcp__qmd__*` tools in the allowlist above. Required; the main path is the one route that must not degrade to an empty server set |
 | `slack` | Read-only Slack read and search, added 2026-08-05 — six `mcp__slack__*` tools in the allowlist above. See [Slack](#slack-read-only-2026-08-05) |
 | `browser` | Headless web fetch, added 2026-08-07 — nineteen `mcp__browser__*` tools in the allowlist above. See [Browser](#browser-headless-2026-08-07) |
+| `homeassistant` | **Full house control**, added 2026-08-07 — all twenty-one `mcp__homeassistant__*` tools. This is the one server granted whole, by explicit operator decision. See [Home Assistant](#home-assistant-full-control-2026-08-07) |
+| `roon` | Music control, added 2026-08-07 — all six `mcp__roon__*` tools. No auth of any kind. See [Roon](#roon-no-auth-2026-08-07) |
 
-**All three servers now load on BOTH harnesses.** Until 0.66.0 Claude Code had
+**All five servers load on BOTH harnesses.** Until 0.66.0 Claude Code had
 qmd+slack and Codex had qmd alone; a capability now lands on every harness in the
 same change, and the enforcement differs per harness — see
 [Browser](#browser-headless-2026-08-07).
 
-All three are named in the compiled `MAIN_CHILD_MCP_CONFIG`
+All five are named in the compiled `MAIN_CHILD_MCP_CONFIG`
 (`src/harness/claude_code.rs`), not supplied by a LaunchAgent override. That is
 deliberate and load-bearing: `McpSet::config()` resolves the **shipped** consts,
 so a server reached only through `JESSE_MAIN_MCP_CONFIG` would be granted in the
 allowlist and never loaded by any probe — certified on paper, untested in fact.
-Declaring it here is what lets the `qmd+slack+browser` battery rows exercise it.
+Declaring it here is what lets the
+`qmd+slack+browser+homeassistant+roon` battery rows exercise it.
+
+**The two HTTP servers name LAN addresses in that compiled const**, which is
+forced rather than chosen: the record commits the exact argv it probed and
+compares it by strict equality at boot, and `JESSE_MAIN_MCP_CONFIG` is refused by
+the startup gate, so the server set of a certified posture cannot come from the
+environment. The consequence is that these entries name *this* deployment's
+hosts; pointing another deployment elsewhere is a source edit and a fresh
+battery.
 
 Everything else is **absent at the root**, not denied by name — including the
 account-level cloud connectors (Gmail, Slack, Google Calendar, Google Drive).
@@ -325,6 +336,129 @@ execution *initiated by the model* is withheld (`browser_evaluate`,
 `browser_run_code_unsafe`); script execution *by the page itself* is inherent to
 rendering and is not prevented. `network_outbound` remains a recorded known-open
 baseline at `write`.
+
+### Home Assistant (FULL control, 2026-08-07)
+
+Home Assistant's built-in **Model Context Protocol Server** (the Assist API),
+reached over HTTP at `/api/mcp` with a long-lived access token as a bearer
+credential, declared in the compiled `MAIN_CHILD_MCP_CONFIG` as `homeassistant`.
+
+**All twenty-one advertised tools are granted.** This is the only server in the
+set granted whole, and it is a deliberate operator decision rather than an
+oversight: three read intents (`GetLiveContext`, `GetDateTime`,
+`todo_get_items`) and eighteen control intents (`HassTurnOn`, `HassTurnOff`,
+`HassLightSet`, `HassSetPosition`, `HassStopMoving`,
+`HassClimateSetTemperature`, `HassMediaUnpause`, `HassMediaPause`,
+`HassMediaNext`, `HassMediaPrevious`, `HassSetVolume`,
+`HassSetVolumeRelative`, `HassMediaPlayerMute`, `HassMediaPlayerUnmute`,
+`HassMediaSearchAndPlay`, `HassListAddItem`, `HassListCompleteItem`,
+`HassCancelAllTimers`). Nothing is withheld. The list was enumerated live
+(`initialize` + `tools/list`) against HA 1.26.0 on 2026-08-07.
+
+#### What that actually reaches is decided in Home Assistant, not here
+
+The intents act **only on entities HA exposes to Assist** (Settings → Voice
+Assistants → Expose). That list, not this allowlist, is the real boundary, and
+it is not the bridge's to change. Enumerated 2026-08-07: **388 of the
+installation's 1199 entities are exposed** — 282 `light`, 36 `switch`, 23
+`climate`, 18 `media_player`, 16 `binary_sensor`, 8 `sensor`, 4 `cover`, 1
+`todo`.
+
+| Asked about | Exposed? | Reachable by a turn? |
+| --- | --- | --- |
+| **Entrance gate** | **Yes**, as `switch.cancello_ingresso` | **Yes** — `HassTurnOn` / `HassTurnOff` operate it |
+| **Locks** | No such entity **anywhere in the installation** | No — there is no `lock` domain to grant |
+| **Alarm** | No such entity **anywhere in the installation** | No — there is no `alarm_control_panel` domain to grant |
+| Covers | 4 (Office shutters) | Yes — `HassSetPosition`, `HassStopMoving` |
+| Climate | 23 zones | Yes — `HassClimateSetTemperature` |
+| Pool pump, irrigation | Yes, as switches | Yes — `HassTurnOn` / `HassTurnOff` |
+
+So "locks and alarm are granted" is **not** an accurate description of this
+posture, and the reason is that those entities do not exist rather than that
+they were withheld. If either is ever added to HA and exposed, it becomes
+reachable **with no bridge change at all** — `HassTurnOn`/`HassTurnOff` are
+multiplexers over every exposed domain, and their own descriptions say they
+lock/unlock a lock and open/close a cover. That is the property to keep in mind
+when adding entities to HA.
+
+#### The accepted risk: prompt injection to physical action
+
+**A main turn holds both this server and a headless browser.** A malicious page
+that the browser visits can attempt to steer the turn into calling
+`HassTurnOn` — and the turn runs as the operator's own unix user, triggered from
+a phone, with **no human in the loop mid-turn**. There is no confirmation step
+between a model deciding to open the gate and the gate opening.
+
+**This was accepted explicitly and knowingly by the operator (Jeremy Andrews,
+2026-08-07) in order to have full house control**, against exactly this stated
+risk. It is recorded here rather than mitigated in code, and no guard was
+implemented that would reduce the granted control — that was the decision.
+
+**The strongest residual mitigations are HA-side, available later, and
+deliberately NOT implemented here:**
+
+1. Put the highest-consequence entities behind an HA `input_boolean` ("agent
+   control enabled") that their automations check, so actuation requires a
+   deliberate arming step outside the turn.
+2. **Unexpose** those entities in HA when they are not needed. This is the
+   strongest of the two — an unexposed entity is invisible to the API entirely,
+   so no allowlist, model or prompt can reach it.
+
+Both live in Home Assistant precisely because the bridge is the component under
+injection pressure; a guard implemented inside the thing being steered is worth
+less than one outside it.
+
+#### The token
+
+A Home Assistant long-lived access token, supplied as `HA_MCP_TOKEN` in the
+LaunchAgent plist — the one thing that belongs there. **It never reaches a config
+file or a command line on either harness**, by two different mechanisms: Claude
+Code gets `"Authorization": "Bearer ${HA_MCP_TOKEN}"` and expands it from the
+child's environment, while Codex is given the variable NAME
+(`bearer_token_env_var`) and reads it itself. A golden test asserts the
+placeholder reaches the child **unexpanded**, so a refactor that resolved it —
+putting a live token into `ps` output and every crash dump — fails the build.
+
+The token is unscoped: HA long-lived tokens carry the full permissions of the
+user that minted them, so it is *not* a second boundary the way the read-only
+Slack token is. The allowlist and HA's Expose list are the boundaries; the token
+is only a credential.
+
+### Roon (no auth, 2026-08-07)
+
+`unified-hifi-control` (open-horizon-labs), reached over Streamable HTTP on the
+LAN, declared as `roon`. All six advertised tools are granted — `hifi_zones`,
+`hifi_now_playing`, `hifi_search` and `hifi_status` are read-only;
+`hifi_control` and `hifi_play` start, stop and queue playback. The
+`hifi_hqplayer_*` tools upstream documents are **not advertised by the running
+server** (HQPlayer is not connected), so there was nothing to withhold; if
+HQPlayer is ever connected the surface grows upstream and the allowlist must be
+revisited against a fresh enumeration.
+
+**The Roon bridge has no authentication of any kind** — it serves plain HTTP on
+VLAN 40 with no token. Recorded here as a fact rather than a finding: **anyone
+already on VLAN 40 can control Roon today**, so admitting it to the bridge adds
+**no new credential, no new secret to protect, and no new authorization
+surface** — only music control, reachable by a component that could already
+reach the network. The blast radius of a prompt-injected Roon call is that the
+music changes.
+
+### Neither server annotates any tool `destructive`
+
+Worth stating because it is the opposite of what a list that can open a gate
+would suggest: Home Assistant ships **no** MCP tool annotations at all, and Roon
+ships only `readOnlyHint` on its four read tools. Nothing downstream may infer
+"safe" from a missing `destructiveHint`. The bridge sets
+`default_tools_approval_mode="approve"` per server unconditionally (Codex would
+otherwise auto-cancel under `approval_policy="never"`), so **the allowlist, not
+an annotation, is the boundary.**
+
+### The shell known-opens are unchanged by this
+
+`network_outbound` and `background_process` remain recorded known-open baselines
+at `write`, and **these two servers do not touch them**. Both of those findings
+come from `Bash(git:*)` with unrestricted arguments — a shell route, unrelated to
+MCP — and their status is exactly what it was before this change.
 
 ### Slack (read-only, 2026-08-05)
 
