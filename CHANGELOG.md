@@ -88,6 +88,39 @@ CI both run it). See the "Versioning" section of `bridge/README.md`.
 - **Both containment records re-recorded** (`bridge/containment.toml`,
   `bridge/containment-codex.toml`) — both harnesses' argv changed, so both were stale.
 
+- **The two Codex `[[accepted]]` blocks re-pointed** at the row labels the record now
+  emits. Adding servers renames a row, and acceptances match by row label, so both
+  signatures were orphaned exactly as the browser change orphaned them. Re-pointed by the
+  owner on the standing rationale: Home Assistant and Roon are two more Streamable HTTP MCP
+  servers that run outside the sandbox and read nothing on the child's behalf, so they do
+  not widen the read boundary. Prior reasoning preserved beneath.
+
+### Security
+
+- **A read escape at the `write` row is now recorded open, and `SECURITY.md` no longer
+  claims otherwise.** That file asserted "the read escapes are closed as well, at every row
+  that grants a read". That was **false for the write row**, and had been for as long as
+  that row granted a shell. The 0.67.0 battery caught it: `read_escape_parent` and
+  `read_escape_symlink` both came back `allowed`, with the child echoing a planted secret it
+  could only have read.
+
+  The route is the unscoped `Bash` read verbs — `Bash(cat:*)`, `Bash(head:*)`,
+  `Bash(tail:*)`, `Bash(find:*)`, `Bash(ls:*)`, `Bash(wc:*)`. A verb scope constrains the
+  command name and not the path argument, so a read leaves `./**` by a route the permission
+  layer never evaluates. The `Read`/`Grep`/`Glob` grants beside them are path-scoped;
+  a shell verb is not.
+
+  **Pre-existing and accepted, not introduced here.** These grants are present on shipped
+  `main`, and the two new servers expose no filesystem capability. It ships open on the same
+  basis as the two `Bash(git:*)` known-opens. **It is intermittent** — observed on one run
+  in five — so a `denied` on either probe is not evidence of containment; every denial seen
+  came from the CLI's own command-parsing heuristics tripping on whichever route the child
+  happened to try.
+
+  **The tightening is deferred to its own task**: cut the unscoped `Bash` read verbs to what
+  a write turn actually needs, verified against live turn usage, then re-record so both
+  probes read a deterministic `denied`.
+
 ## [App 1.0 (93)] - 2026-08-07
 
 ### Fixed
