@@ -15,6 +15,20 @@ import JesseNetworking
 // under a floor or over a ceiling, and NEVER interpolated across. Coverage
 // (days known / logged days in the window) rides alongside every verdict so a thin
 // reading can be hedged instead of asserted.
+//
+// THE SECOND UNKNOWN, and the reason this file was reworked: A TARGET IS NOT A
+// CONSTANT. The calorie target is recomputed on every exercise log (roughly the base
+// plus a share of that day's logged training), and the carb target is a base floor plus
+// an OPTIONAL add-back band above it. Applying the CURRENT day's target to a month of
+// history therefore invents a verdict: it read "2793 median against a 2113 target" on a
+// day whose own target was 2487, and it called a comfortably-fuelled carb day "short"
+// because it measured against the fuelled number rather than the base. So every verdict
+// here resolves the target PER DAY, from that day's own archived `targets`, and a day
+// that archived none is TARGET-UNKNOWN: it still counts in the distribution (median,
+// min, max) and is EXCLUDED from every over/under/compliant count, reported as its own
+// coverage number. The current target is NEVER substituted for a missing one, and
+// neither is a neighbouring day's — a wrong target is worse than no target, exactly as
+// a phantom 0 is worse than a gap.
 
 // MARK: - Nutrient model (single source of truth)
 
@@ -30,6 +44,34 @@ enum TrendKind: Equatable, Sendable {
     case target
     /// Composition only (total sugars, unsaturated fat). A direction, never a good/bad label.
     case informational
+}
+
+/// ONE day's own basis for judging ONE nutrient, resolved from that day's archived
+/// targets and from nothing else. Its absence (a nil `DayTarget`) is the TARGET-UNKNOWN
+/// state: the day's value is still real and still counts in the distribution, but no
+/// verdict may be pinned on it.
+struct DayTarget: Equatable, Sendable {
+    /// The number THIS day is judged against.
+    let value: Double
+    /// How the day is judged. `.floor` — at or above `value` is a pass, full stop, and
+    /// only below it is under (carbs against that day's base). `.target` — the signed
+    /// distance from `value` is the statistic (calories, fat, and a carb-load day's full
+    /// carb number). `.ceiling` — over `value` is the breach. `.informational` never
+    /// resolves a day target at all.
+    let kind: TrendKind
+    /// The top of an OPTIONAL band above `value`: carbs' exercise add-back on a day whose
+    /// base is known. Eating into the band is PERMISSION on a heavy day, never a duty, so
+    /// it is drawn and named but never judged. Nil for every other nutrient and for a
+    /// carb-load day (whose full number is the target, not a band).
+    let band: Double?
+
+    init(value: Double, kind: TrendKind, band: Double? = nil) {
+        self.value = value; self.kind = kind; self.band = band
+    }
+
+    /// Where `value` sits relative to this day's basis, as the signed distance
+    /// (positive = above). For a floor day, positive is simply a pass with room to spare.
+    func delta(_ value: Double) -> Double { value - self.value }
 }
 
 /// How long a window a nutrient's PASS/FAIL COLOR is judged over. This is a THIRD
@@ -243,6 +285,36 @@ enum TrendNutrient: String, CaseIterable, Identifiable, Sendable {
         }
     }
 
+    /// THE per-day resolution: what ONE past day's own archived targets say this nutrient
+    /// should have been judged against that day, or nil when they say nothing about it
+    /// (TARGET-UNKNOWN — the day keeps its value and loses only its verdict).
+    ///
+    /// Carbs is the one nutrient whose basis is not simply "its target": compliance is
+    /// measured against `carbsBase` ALONE, as a floor — at or above the base is a pass,
+    /// however far it sits below the fuelled `carbs` number, because everything above the
+    /// base is an optional exercise add-back and never an obligation. The band is carried
+    /// so a chart can draw it and a caption can name it, never so a verdict can use it.
+    /// An ABSENT `carbsBase` marks a carb-load day, whose full `carbs` number IS the
+    /// genuine target for that day and is judged as one.
+    ///
+    /// Every other nutrient resolves to its own key in the day's targets under its normal
+    /// `kind`; an informational nutrient never resolves one, because it is never judged.
+    func dayTarget(in t: DietTargets) -> DayTarget? {
+        guard kind != .informational else { return nil }
+        if self == .c {
+            if let base = t.carbsBase {
+                // The add-back band, only when it is genuinely above the base.
+                let band = t.carbs.flatMap { $0 > base ? $0 : nil }
+                return DayTarget(value: base, kind: .floor, band: band)
+            }
+            // Carb-load day: no base was set, so the full number is the day's real target.
+            guard let carbs = t.carbs else { return nil }
+            return DayTarget(value: carbs, kind: .target)
+        }
+        guard let v = target(in: t) else { return nil }
+        return DayTarget(value: v, kind: kind)
+    }
+
     /// This nutrient's per-item value (nil = UNKNOWN for that item, never 0), used to rank
     /// the foods that fed it over a range. Unsaturated fat is DERIVED — `fat − saturated
     /// fat`, known only when saturated fat is known — mirroring `Micronutrient`.
@@ -399,15 +471,33 @@ enum TrendDirection: Equatable, Sendable {
 
 // MARK: - Result types
 
-/// One plottable day: a known value on a date, and whether the day was PARTIAL (at least
-/// one item that day lacked the value, so `value` is a lower bound). Gap days are simply
-/// absent from the points list — never a point at 0.
+/// One plottable day: a known value on a date, whether the day was PARTIAL (at least
+/// one item that day lacked the value, so `value` is a lower bound), and THAT DAY's own
+/// judging basis. Gap days are simply absent from the points list — never a point at 0.
 struct NutrientTrendPoint: Equatable, Sendable, Identifiable {
     /// The ISO `yyyy-MM-dd` date — unique within a series, so a stable `ForEach` identity.
     let date: String
     let value: Double
     let isPartial: Bool
+    /// This day's own target basis, or nil when the day archived none (TARGET-UNKNOWN).
+    /// A nil here plots (dimmed) and counts toward the distribution; it never counts
+    /// toward a verdict, and it is never filled in from today's target or a neighbour's.
+    let dayTarget: DayTarget?
     var id: String { date }
+
+    init(date: String, value: Double, isPartial: Bool, dayTarget: DayTarget? = nil) {
+        self.date = date; self.value = value; self.isPartial = isPartial
+        self.dayTarget = dayTarget
+    }
+
+    /// Signed distance from this day's OWN target (positive = above it). Nil when the day
+    /// is target-unknown.
+    var delta: Double? { dayTarget?.delta(value) }
+    /// Strictly below this day's own basis — the only thing that counts as "under" for a
+    /// floor day. Nil when target-unknown (never false, which would read as a pass).
+    var isUnder: Bool? { dayTarget.map { value < $0.value } }
+    /// Strictly above this day's own basis. Nil when target-unknown.
+    var isOver: Bool? { dayTarget.map { value > $0.value } }
 }
 
 /// One food that fed a nutrient over the visible range, with its summed KNOWN
@@ -424,7 +514,12 @@ struct NutrientSource: Equatable, Sendable, Identifiable {
 struct NutrientTrend: Equatable, Sendable {
     let nutrient: TrendNutrient
     let kind: TrendKind
-    /// The reference target, or nil when the snapshot carries none (value-only, no judgment).
+    /// The CURRENT day's reference target, or nil when the snapshot carries none.
+    ///
+    /// DISPLAY CONTEXT ONLY — the flat rule mark a constant floor/ceiling draws, the
+    /// y-domain, and the epsilon a direction is called flat within. It is deliberately
+    /// NOT the basis of any count here: a verdict comes from `points[i].dayTarget`, the
+    /// day's own archived number, or it does not come at all.
     let target: Double?
     let unit: String
     /// The window in days, or nil for "all available".
@@ -446,45 +541,64 @@ struct NutrientTrend: Equatable, Sendable {
     let maxKnown: Double?
     /// How many known days were partial (a lower bound).
     let partialCount: Int
-    /// Known days strictly under the target (the floor stat; 0 without a target).
+    /// Known days that carried their OWN archived target — the only days any count below
+    /// is taken over, and the denominator every verdict must be read against.
+    let daysJudged: Int
+    /// Known days that archived NO target for this nutrient. They are in the distribution
+    /// and in no verdict; stated separately so a count can never be mistaken for covering
+    /// days it did not judge.
+    let daysTargetUnknown: Int
+    /// Judged days strictly under that day's own basis (the floor stat).
     let countUnderTarget: Int
-    /// Known days strictly over the target (the ceiling stat; 0 without a target).
+    /// Judged days strictly over that day's own basis (the ceiling stat).
     let countOverTarget: Int
+    /// THE headline statistic for a target-kind nutrient: the median of the PER-DAY
+    /// distances from each day's own target (positive = over it). Computed per day and
+    /// then aggregated — never a median of raw values with one target subtracted from it,
+    /// which is the original defect wearing a different hat. Nil when no day was judged.
+    let medianDelta: Double?
     /// The kind-relative direction over the window (see `TrendDirection`).
     let direction: TrendDirection
 
     /// At least one known day to speak to.
     var hasData: Bool { daysKnown > 0 }
+    /// At least one day carried its own target, so a verdict is permitted at all.
+    var hasJudgedDays: Bool { daysJudged > 0 }
+
+    /// The one basis EVERY judged day shared, or nil when they differed (or none were
+    /// judged). This is the gate on printing a single target number beside a window:
+    /// a lone number may be shown only where a lone number is actually true of the whole
+    /// window, which for the exercise-adjusted calorie target is essentially never.
+    var singleJudgedTarget: Double? {
+        let bases = points.compactMap { $0.dayTarget?.value }
+        guard let first = bases.first, bases.allSatisfy({ $0 == first }) else { return nil }
+        return first
+    }
 
     /// Coverage as a fraction (known / logged days in window), nil when no logged days.
     var coverageFraction: Double? {
         daysInWindow > 0 ? Double(daysKnown) / Double(daysInWindow) : nil
     }
 
-    /// Fraction of known days under the floor — only meaningful for a floor with a target.
+    /// Fraction of JUDGED days under the floor — only meaningful for a floor.
     var pctUnderTarget: Double? {
-        guard kind == .floor, target != nil, daysKnown > 0 else { return nil }
-        return Double(countUnderTarget) / Double(daysKnown)
+        guard kind == .floor, daysJudged > 0 else { return nil }
+        return Double(countUnderTarget) / Double(daysJudged)
     }
 
-    /// Fraction of known days over the ceiling — only meaningful for a ceiling with a target.
+    /// Fraction of JUDGED days over the ceiling — only meaningful for a ceiling.
     var pctOverTarget: Double? {
-        guard kind == .ceiling, target != nil, daysKnown > 0 else { return nil }
-        return Double(countOverTarget) / Double(daysKnown)
+        guard kind == .ceiling, daysJudged > 0 else { return nil }
+        return Double(countOverTarget) / Double(daysJudged)
     }
 
-    /// Signed distance of the median from the target (median − target; negative = under) —
-    /// the headline stat for a target-kind nutrient. Nil without a median or target.
-    var medianDistanceFromTarget: Double? {
-        guard let median, let target else { return nil }
-        return median - target
-    }
-
-    /// A STANDING problem: a judged floor under target (or ceiling over it) on MOST known
-    /// days, with enough coverage to say so. Drives the coach's per-problem consequence +
-    /// sources + fix guidance. Informational and target-kind nutrients are never "problems".
+    /// A STANDING problem: a judged floor under target (or ceiling over it) on MOST JUDGED
+    /// days, with enough judged days to say so. Drives the coach's per-problem consequence
+    /// + sources + fix guidance. Informational and target-kind nutrients are never
+    /// "problems". A window with too few judged days is never a standing problem, however
+    /// many known days it holds — a pattern nobody measured a target for is not a pattern.
     var isStandingProblem: Bool {
-        guard daysKnown >= NutrientTrends.minKnownForDirection else { return false }
+        guard daysJudged >= NutrientTrends.minKnownForDirection else { return false }
         if let pct = pctUnderTarget { return pct >= 0.5 }
         if let pct = pctOverTarget { return pct >= 0.5 }
         return false
@@ -557,7 +671,15 @@ public enum NutrientTrends {
     /// by comparing the median of the earlier half to the later half. Below the minimum
     /// known-day count → `.notEnoughData`. A change within 5% of the target (or, absent a
     /// target, 5% of the overall median magnitude) reads as `.flat`.
-    static func direction(for nutrient: TrendNutrient, values: [Double], target: Double?) -> TrendDirection {
+    ///
+    /// `deltas` are the per-day distances from each day's OWN target, ascending, for the
+    /// days that had one. A target-kind nutrient's direction is "am I getting closer to
+    /// the target I actually had?", which only these can answer — measuring a moving
+    /// target's history against today's number would call a week of perfectly-fuelled
+    /// training days "worsening". With too few of them the direction degrades to the
+    /// neutral rising/falling of the raw values, never to a judgment.
+    static func direction(for nutrient: TrendNutrient, values: [Double], target: Double?,
+                          deltas: [Double] = []) -> TrendDirection {
         guard values.count >= minKnownForDirection else { return .notEnoughData }
         let mid = values.count / 2
         let earlier = Array(values.prefix(mid))
@@ -567,6 +689,13 @@ public enum NutrientTrends {
         let scale = target ?? (median(values).map(abs) ?? 0)
         let epsilon = scale * 0.05
 
+        /// The neutral read of the raw values — a direction, never a good/bad label.
+        func neutral() -> TrendDirection {
+            let delta = lm - em
+            if abs(delta) <= epsilon { return .flat }
+            return delta > 0 ? .rising : .falling
+        }
+
         switch nutrient.kind {
         case .floor, .ceiling:
             let delta = lm - em
@@ -575,26 +704,33 @@ public enum NutrientTrends {
             if nutrient.kind == .floor { return rising ? .improving : .worsening }
             return rising ? .worsening : .improving
         case .informational:
-            let delta = lm - em
-            if abs(delta) <= epsilon { return .flat }
-            return delta > 0 ? .rising : .falling
+            return neutral()
         case .target:
-            guard let target else {
-                // No target to sit near → report the neutral direction only.
-                let delta = lm - em
-                if abs(delta) <= epsilon { return .flat }
-                return delta > 0 ? .rising : .falling
-            }
-            // Closer to target is improving; farther is worsening.
-            let dd = abs(lm - target) - abs(em - target)
+            guard deltas.count >= minKnownForDirection else { return neutral() }
+            // Closer to that day's own target is improving; farther is worsening.
+            let dmid = deltas.count / 2
+            guard let ed = median(deltas.prefix(dmid).map(abs)),
+                  let ld = median(deltas.suffix(deltas.count - dmid).map(abs))
+            else { return neutral() }
+            let dd = ld - ed
             if abs(dd) <= epsilon { return .flat }
             return dd < 0 ? .improving : .worsening
         }
     }
 
-    /// Analyze ONE nutrient over ONE window from the decoded `nutrientSeries` and the day's
-    /// targets. Everything is computed over the days the nutrient is PRESENT — a gap is
-    /// never a 0, never an under-floor/over-ceiling day.
+    /// Analyze ONE nutrient over ONE window from the decoded `nutrientSeries`. Everything
+    /// is computed over the days the nutrient is PRESENT — a gap is never a 0, never an
+    /// under-floor/over-ceiling day.
+    ///
+    /// TWO independent coverage questions are answered, and they must not be conflated.
+    /// "Known" is whether the nutrient was MEASURED that day (`daysKnown` / `daysInWindow`)
+    /// and governs the distribution. "Judged" is whether that day archived its OWN target
+    /// (`daysJudged` / `daysTargetUnknown`) and governs every count and the delta. A day
+    /// can be known and unjudged — measured perfectly, with nothing legitimate to measure
+    /// it against — and it is then reported as exactly that.
+    ///
+    /// `targets` is the CURRENT day's targets. It supplies the display reference and the
+    /// direction epsilon, and it is never used to judge a past day.
     static func analyze(_ series: [NutrientDay], nutrient: TrendNutrient,
                         targets: DietTargets, windowDays: Int?) -> NutrientTrend {
         let ordered = sorted(series)
@@ -615,20 +751,23 @@ public enum NutrientTrends {
         for day in window {
             // A nutrient ABSENT from the day's map is a GAP — skip it entirely (never a 0).
             guard let v = day.nutrients[nutrient.key], v.known >= 1 else { continue }
-            points.append(NutrientTrendPoint(date: day.date, value: v.sum, isPartial: v.unknown > 0))
+            // The day's OWN basis, from the day's OWN archived targets. A day that
+            // archived none stays nil: target-unknown, never back-filled from today's.
+            points.append(NutrientTrendPoint(date: day.date, value: v.sum,
+                                             isPartial: v.unknown > 0,
+                                             dayTarget: day.targets.flatMap { nutrient.dayTarget(in: $0) }))
         }
 
         let values = points.map(\.value)
         let daysKnown = points.count
         let med = median(values)
 
-        var countUnder = 0, countOver = 0
-        if let target {
-            for v in values {
-                if v < target { countUnder += 1 }
-                if v > target { countOver += 1 }
-            }
-        }
+        // Every count below is over the JUDGED days alone — the days that carried a target
+        // of their own. A target-unknown day is neither over, nor under, nor compliant.
+        let deltas = points.compactMap(\.delta)
+        let countUnder = points.filter { $0.isUnder == true }.count
+        let countOver = points.filter { $0.isOver == true }.count
+        let daysJudged = deltas.count
 
         return NutrientTrend(
             nutrient: nutrient, kind: nutrient.kind, target: target, unit: nutrient.unit,
@@ -636,8 +775,10 @@ public enum NutrientTrends {
             daysKnown: daysKnown, daysInWindow: window.count,
             median: med, minKnown: values.min(), maxKnown: values.max(),
             partialCount: points.filter(\.isPartial).count,
+            daysJudged: daysJudged, daysTargetUnknown: daysKnown - daysJudged,
             countUnderTarget: countUnder, countOverTarget: countOver,
-            direction: direction(for: nutrient, values: values, target: target))
+            medianDelta: median(deltas),
+            direction: direction(for: nutrient, values: values, target: target, deltas: deltas))
     }
 
     // MARK: - Per-day goal status (chart coloring)
@@ -903,7 +1044,36 @@ public enum NutrientTrends {
     /// disagree with the rest of the Health tab.
     static func fmt(_ x: Double) -> String { String(Int(x.rounded())) }
 
+    /// A signed distance in plain words: "190 kcal over", "45 g under", or "level with"
+    /// when it rounds to nothing — so a 0.4 kcal delta never prints the bare "0 over" that
+    /// would read as a direction it doesn't have.
+    static func deltaWords(_ d: Double, _ unit: String) -> String {
+        let r = d.rounded()
+        if r == 0 { return "level with" }
+        return "\(fmt(abs(r))) \(unit) \(r > 0 ? "over" : "under")"
+    }
+
+    /// The same distance in the coach's terse register: "+487", "-500", "0". The sign
+    /// carries the direction, so the words don't have to repeat it per window.
+    static func signedDelta(_ d: Double) -> String {
+        let r = d.rounded()
+        return r > 0 ? "+\(fmt(r))" : fmt(r)
+    }
+
+    /// The one sentence a window says when it measured days but none of them recorded a
+    /// target of their own. Deliberately not a verdict and not a shrug: it names WHY there
+    /// is no judgment, so the absence can't be read as "fine".
+    static let noArchivedTargets =
+        "No day in this range recorded its own target, so nothing here is judged."
+
     // MARK: - Plain-language verdict (chart summary band)
+
+    /// The noun a day's own basis goes by in prose. Carbs is judged against that day's
+    /// BASE, and calling that "the target" is precisely the confusion this file exists to
+    /// undo: the fuelled carb number above the base is an option, not a duty.
+    static func basisNoun(_ nutrient: TrendNutrient) -> String {
+        nutrient == .c ? "that day's own carb base" : "that day's own target"
+    }
 
     /// A thin reading below this coverage fraction is hedged as a hint, not a pattern.
     static let thinCoverageFraction = 0.5
@@ -913,10 +1083,15 @@ public enum NutrientTrends {
 
     /// The plain-language verdict for the chart summary band, straight from the analysis —
     /// coverage always stated first, a judgment only where the kind allows one, and a
-    /// hedge when coverage is thin. Never asserts a gap as a low day; every count is over
-    /// known days. Example: "Magnesium: known on 22 of the last 30 logged days. Median 250
-    /// mg vs a 400 mg floor. Under the floor on 20 of 22 known days. Trend: flat. This is a
-    /// consistent gap, not a one-off."
+    /// hedge when coverage is thin. Never asserts a gap as a low day, never asserts a
+    /// target a day did not have; every count is over the days that were actually judged,
+    /// and the days that weren't are named. Examples:
+    ///
+    ///   "Magnesium: known on 22 of the last 30 logged days. Median 250 mg vs a 400 mg
+    ///    floor. Under the floor on 20 of 22 judged days. Trend: flat. This is a consistent
+    ///    gap, not a one-off."
+    ///   "Calories: known on 7 of the last 7 logged days. Median 190 kcal over that day's
+    ///    own target (raw median 2793 kcal). Over on 5 of 7 judged days, under on 2."
     static func verdict(_ t: NutrientTrend) -> String {
         let name = t.nutrient.fullName
         let window = t.windowDays.map { "the last \($0) logged days" } ?? "all \(t.daysInWindow) logged days"
@@ -926,28 +1101,51 @@ public enum NutrientTrends {
         }
 
         var out = "\(name): known on \(t.daysKnown) of \(window)."
+        let rawMedian = "Median \(fmt(median)) \(t.unit)"
 
-        // Distribution / target line.
+        // Distribution / basis line, then the count line — both driven by the days that
+        // carried their own target, never by today's.
         switch t.kind {
-        case .floor where t.target != nil:
-            out += " Median \(fmt(median)) \(t.unit) vs a \(fmt(t.target!)) \(t.unit) floor."
-        case .ceiling where t.target != nil:
-            out += " Median \(fmt(median)) \(t.unit) vs a \(fmt(t.target!)) \(t.unit) ceiling."
-        case .target where t.target != nil:
-            out += " Median \(fmt(median)) \(t.unit) vs a \(fmt(t.target!)) \(t.unit) target."
-        default:
+        case .informational:
             if let lo = t.minKnown, let hi = t.maxKnown, lo != hi {
-                out += " Median \(fmt(median)) \(t.unit) (range \(fmt(lo))–\(fmt(hi)) \(t.unit))."
+                out += " \(rawMedian) (range \(fmt(lo))–\(fmt(hi)) \(t.unit))."
             } else {
-                out += " Median \(fmt(median)) \(t.unit)."
+                out += " \(rawMedian)."
             }
+        case .target:
+            // Calories, fat, carbs: the headline is the distance from each day's OWN
+            // number. The raw median rides along as context and never as a verdict.
+            if let md = t.medianDelta {
+                out += " Median \(deltaWords(md, t.unit)) \(basisNoun(t.nutrient))"
+                out += " (raw median \(fmt(median)) \(t.unit))."
+                out += t.nutrient == .c
+                    ? " Under the base on \(t.countUnderTarget) of \(t.daysJudged) judged days."
+                    : " Over on \(t.countOverTarget) of \(t.daysJudged) judged days,"
+                        + " under on \(t.countUnderTarget)."
+            } else {
+                out += " \(rawMedian). \(noArchivedTargets)"
+            }
+        case .floor, .ceiling:
+            let word = t.kind == .floor ? "floor" : "ceiling"
+            guard t.hasJudgedDays else {
+                out += " \(rawMedian). \(noArchivedTargets)"
+                break
+            }
+            if let one = t.singleJudgedTarget {
+                out += " \(rawMedian) vs a \(fmt(one)) \(t.unit) \(word)."
+            } else {
+                out += " \(rawMedian), against each day's own \(word)."
+            }
+            out += t.kind == .floor
+                ? " Under the floor on \(t.countUnderTarget) of \(t.daysJudged) judged days."
+                : " Over the ceiling on \(t.countOverTarget) of \(t.daysJudged) judged days."
         }
 
-        // Count line — only where a floor/ceiling judgment applies.
-        if t.kind == .floor, t.target != nil {
-            out += " Under the floor on \(t.countUnderTarget) of \(t.daysKnown) known days."
-        } else if t.kind == .ceiling, t.target != nil {
-            out += " Over the ceiling on \(t.countOverTarget) of \(t.daysKnown) known days."
+        // The second coverage number, whenever a measured day went unjudged: the reader
+        // must never be able to read a count as covering days it did not judge.
+        if t.kind != .informational, t.daysTargetUnknown > 0, t.hasJudgedDays {
+            out += " \(t.daysTargetUnknown) of those days recorded no target of their own"
+                + " and are in no count here."
         }
 
         // Trend line.
@@ -993,22 +1191,48 @@ public enum NutrientTrends {
         }
     }
 
-    /// One nutrient's rollup line across the 7/30/all windows, e.g.
+    /// One nutrient's rollup line across the 7/30/all windows.
+    ///
+    /// A floor or ceiling — whose targets are constants in practice, though they are still
+    /// resolved per day through the same path — keeps its terse shape:
     /// "Magnesium (floor 400 mg): 7d median 260 known 5/6 under 5/5; 30d median 250 known
-    /// 22/28 under 20/22; all median 255 known 61/80 under 55/61." A window without enough
-    /// known-day coverage says "insufficient data" rather than a misleading number; counts
-    /// are ALWAYS over known days, and the coverage (known/logged) is stated so the model
-    /// can hedge. Returns nil when the nutrient has no data in any window.
+    /// 22/28 under 20/22; all median 255 known 61/80 under 55/61."
+    ///
+    /// Calories, fat and carbs state a DELTA instead, because a median of raw intake
+    /// against one number is meaningless when the number moved every day:
+    /// "Calories (delta vs that day's own target): 7d median 190 kcal over that day's own
+    /// target, over on 5 of 7 judged days (targets known 7/7); …"
+    ///
+    /// A window without enough known-day coverage says "insufficient data" rather than a
+    /// misleading number; counts are ALWAYS over JUDGED days, coverage (known/logged) and
+    /// target coverage (judged/known) are stated so the model can hedge, and a window that
+    /// judged nothing says so instead of showing an empty count. Returns nil when the
+    /// nutrient has no data in any window.
     static func coachLine(_ series: [NutrientDay], nutrient: TrendNutrient,
                           targets: DietTargets) -> String? {
         let analyses = coachWindows.map { analyze(series, nutrient: nutrient, targets: targets, windowDays: $0) }
         guard analyses.contains(where: { $0.hasData }) else { return nil }
 
+        // The header's basis. A single number may be named only where every judged day in
+        // the WIDEST window actually shared it — otherwise the kind alone, and for the
+        // moving targets the explicit "that day's own".
+        let widest = analyses.last ?? analyses[0]
         let prefix: String
-        if let target = nutrient.target(in: targets), nutrient.kind != .informational {
-            prefix = "\(nutrient.fullName) (\(kindLabel(nutrient.kind)) \(fmt(target)) \(nutrient.unit))"
-        } else {
+        switch nutrient.kind {
+        case .informational:
             prefix = "\(nutrient.fullName) (\(kindLabel(nutrient.kind)) \(nutrient.unit))"
+        case .target:
+            prefix = nutrient == .c
+                ? "Carbs (floor, that day's own base)"
+                : "\(nutrient.fullName) (delta vs that day's own target)"
+        case .floor, .ceiling:
+            if let one = widest.singleJudgedTarget {
+                prefix = "\(nutrient.fullName) (\(kindLabel(nutrient.kind)) \(fmt(one)) \(nutrient.unit))"
+            } else if widest.hasJudgedDays {
+                prefix = "\(nutrient.fullName) (\(kindLabel(nutrient.kind)), that day's own, \(nutrient.unit))"
+            } else {
+                prefix = "\(nutrient.fullName) (\(kindLabel(nutrient.kind)) \(nutrient.unit))"
+            }
         }
 
         let segments = analyses.map { t -> String in
@@ -1016,11 +1240,39 @@ public enum NutrientTrends {
             guard t.daysKnown >= minKnownForDirection, let median = t.median else {
                 return "\(w) insufficient data"
             }
+            if t.kind == .target {
+                // The basis is named once, in the prefix; each window then carries only
+                // the numbers — the signed median distance, the count over the days that
+                // were actually judged, and the measurement coverage behind it.
+                guard let md = t.medianDelta else {
+                    return "\(w) raw median \(fmt(median)) known \(t.daysKnown)/\(t.daysInWindow),"
+                        + " no day recorded its own target"
+                }
+                var s = "\(w) median \(signedDelta(md)) \(t.unit)"
+                s += t.nutrient == .c
+                    ? ", under on \(t.countUnderTarget) of \(t.daysJudged) judged days"
+                    : ", over on \(t.countOverTarget) of \(t.daysJudged) judged days"
+                // Both coverages, stated only where they are actually incomplete — these
+                // three lines are the long ones, and a caveat that says "nothing was
+                // missing" costs budget another nutrient's line could have had.
+                if t.daysKnown < t.daysInWindow { s += ", known \(t.daysKnown)/\(t.daysInWindow)" }
+                if t.daysTargetUnknown > 0 { s += ", targets known \(t.daysJudged)/\(t.daysKnown)" }
+                return s
+            }
             var s = "\(w) median \(fmt(median)) known \(t.daysKnown)/\(t.daysInWindow)"
-            if t.kind == .floor, t.target != nil {
-                s += " under \(t.countUnderTarget)/\(t.daysKnown)"
-            } else if t.kind == .ceiling, t.target != nil {
-                s += " over \(t.countOverTarget)/\(t.daysKnown)"
+            switch t.kind {
+            case .floor where t.hasJudgedDays:
+                s += " under \(t.countUnderTarget)/\(t.daysJudged)"
+            case .ceiling where t.hasJudgedDays:
+                s += " over \(t.countOverTarget)/\(t.daysJudged)"
+            case .floor, .ceiling:
+                s += " no targets recorded"
+            case .target, .informational:
+                break
+            }
+            // Only where it is actually incomplete: a full line stays terse.
+            if t.kind != .informational, t.hasJudgedDays, t.daysTargetUnknown > 0 {
+                s += ", targets known \(t.daysJudged)/\(t.daysKnown)"
             }
             return s
         }
@@ -1088,7 +1340,11 @@ public enum NutrientTrends {
             + "(the consequence), where they are getting or missing it (the real top sources), "
             + "and one or two concrete fixes from their good-source foods — favoring what is in "
             + "season and already in their kitchen, and fitting the calorie deficit. Never "
-            + "present a coverage gap as a low day."
+            + "present a coverage gap as a low day. "
+            + "Calorie and carb targets are PER-DAY and exercise-adjusted (calories rise with "
+            + "that day's training; carbs above the base are optional fuel), so raw intake "
+            + "says nothing about a deficit on its own — frame calories as NET: intake minus "
+            + "that day's logged exercise."
 
         // The same-day blow-out line rides at the FRONT of the greedy fit, ahead of every
         // rolling line. It carries the one thing the windows structurally cannot: a single

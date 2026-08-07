@@ -451,10 +451,15 @@ final class HealthContextTests: XCTestCase {
         f.timeZone = utc
         f.dateFormat = "yyyy-MM-dd"
         let end = f.date(from: "2026-07-04")!
+        // Each day archives its OWN targets, with the calorie number moving the way the
+        // real one does (it is recomputed from that day's logged exercise) — so the rollup
+        // under test is the full-size one the coach actually receives.
         return (0..<30).reversed().map { back in
             NutrientDay(date: f.string(from: cal.date(byAdding: .day, value: -back, to: end)!),
                         nutrients: ["cal": NutrientDayValue(sum: 2100, known: 6, unknown: 0),
-                                    "satf": NutrientDayValue(sum: 14, known: 2, unknown: 0)])
+                                    "satf": NutrientDayValue(sum: 14, known: 2, unknown: 0)],
+                        targets: DietTargets(calories: back % 2 == 0 ? 1910 : 2487,
+                                             satFat: 22, magnesium: 400))
         }
     }
 

@@ -15,6 +15,69 @@ CI both run it). See the "Versioning" section of `bridge/README.md`.
 
 ## [Unreleased]
 
+## [App 1.0 (93)] - 2026-08-07
+
+### Fixed
+
+- **The nutrient trends judged a moving target as if it stood still.** The trend engine
+  and the coach rollup it feeds took the snapshot's ONE current targets object and applied
+  it to every day of history. Two of those targets are not constants, and both were being
+  misread:
+
+  - **Calories is recomputed on every exercise log** (roughly a base plus a share of that
+    day's logged training). On 2026-08-07 the same rollup said "target 1910" at 10:41 and
+    "target 2113" at 13:07, while 2026-08-06's own target had been 2487. Against a training
+    week the number moves by hundreds of calories, so a median of raw intake measured
+    against whichever number happened to be current said nothing at all about whether the
+    days were in deficit.
+  - **Carbs is a base floor with an OPTIONAL add-back band above it.** Compliance is
+    against `carbsBase` alone — at or above the base is a pass, full stop, because the band
+    is permission to eat more on a heavy day and never an obligation. The rollup printed
+    the fuelled number as the target, so a comfortable pass was reported as a miss: 340 g
+    over a 300 g base read as "140 g short".
+
+  Every verdict now resolves the target **per day**, from that day's own archived targets
+  (`nutrientSeries[].targets`, optional, with optional members). Calories, fat and carbs
+  report the **distance from that day's own target**, computed per day and then aggregated
+  — never a median of raw values with one target subtracted from it, which is the same
+  defect in a different shape. Carbs is judged as a floor against that day's `carbsBase`,
+  and a day whose base was omitted is a carb-load day whose full number is the genuine
+  target. The floor and ceiling nutrients keep their counting shape but resolve through the
+  same per-day path, so this cannot come back.
+
+  The doctrine is the one the rest of the stack already lives by, extended from values to
+  targets: **a wrong target is worse than no target, exactly as a phantom 0 is worse than a
+  gap.** A day that archived no target of its own is TARGET-UNKNOWN — it still contributes
+  to the distribution (median, min, max) and is excluded from every over/under/compliant
+  count, reported as its own coverage number beside the existing known/logged one, so a
+  verdict can never be read as covering days it did not judge. The current target is never
+  substituted for a missing one, and neither is a neighbouring day's.
+
+  This is the app half of **Bridge 0.65.0**, which archives the per-day `targets` object.
+  The field is additive and optional, so an older payload still decodes cleanly — but
+  against a bridge below 0.65.0, or for a day whose archive was never written, every such
+  day reads target-unknown and the trend verdicts and coach counts go quiet rather than
+  assert against today's number. The daily and rolling Health-tab gauges are unaffected:
+  they judge today's value against today's target, which is correct.
+
+### Changed
+
+- **The trend chart draws the reference that actually applied.** Calories, fat and carbs
+  get a stepped target line that walks with the data instead of one flat rule across a
+  month of training days; for carbs the rule is that day's base with the optional exercise
+  fuel shaded above it, matching how the dashboards render it. Days with no recorded target
+  render dimmed, the summary band states the delta verdict and how many days in view were
+  not judged, and the scrub readout names that day's own target and the distance from it.
+  The constant floors and ceilings keep their flat rule mark.
+- **The coach's `health_context` states deltas, not medians against one number.** Calorie
+  and carb lines never print a single target number as if it applied to a window; each
+  window carries the signed median distance, the count over the days actually judged, and
+  the target coverage wherever any day went unjudged. The framing block now tells the coach
+  that calorie and carb targets are per-day and exercise-adjusted, that a raw intake number
+  therefore says nothing about a deficit on its own, and that net (intake minus that day's
+  logged exercise) is the meaningful framing for prose. The block stays inside the same
+  2.5 KiB budget with the same worst-first truncation.
+
 ## [Bridge 0.66.0] - 2026-08-07
 
 ### Added

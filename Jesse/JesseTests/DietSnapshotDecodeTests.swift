@@ -344,6 +344,79 @@ final class DietSnapshotDecodeTests: XCTestCase {
         XCTAssertNil(try decode(degraded).nutrientSeries)
     }
 
+    // MARK: - Per-day targets on nutrientSeries — a THIRD state, not zero and not today's
+
+    // A day's calorie target is recomputed from that day's logged exercise and its carb
+    // target carries an optional band above a base, so a past day may only be judged
+    // against the targets IT recorded. Absent must therefore survive decoding as absent.
+    private let withDayTargets = """
+    {
+      "asOf": "2026-08-07T14:50:55Z",
+      "today": {
+        "date": "2026-08-07", "exercise": [], "meals": [],
+        "targets": { "calories": 2113, "carbs": 480, "carbsBase": 300 }
+      },
+      "errors": [],
+      "nutrientSeries": [
+        { "date": "2026-08-05",
+          "nutrients": { "cal": { "sum": 2600, "known": 6, "unknown": 0 } },
+          "targets": { "calories": 2487, "carbs": 520, "carbsBase": 300, "protein": 190,
+                       "magnesium": 400 } },
+        { "date": "2026-08-06",
+          "nutrients": { "cal": { "sum": 2400, "known": 5, "unknown": 0 } },
+          "targets": { "calories": 1910, "carbs": 300 } },
+        { "date": "2026-08-07",
+          "nutrients": { "cal": { "sum": 2000, "known": 4, "unknown": 0 } } }
+      ]
+    }
+    """
+
+    func testDecodesPerDayTargets() throws {
+        let series = try XCTUnwrap(try decode(withDayTargets).nutrientSeries)
+        XCTAssertEqual(series.count, 3)
+
+        // A fully archived day: its own numbers, not today's.
+        let full = try XCTUnwrap(series[0].targets)
+        XCTAssertEqual(full.calories, 2487)
+        XCTAssertEqual(full.carbsBase, 300)
+        XCTAssertEqual(full.carbs, 520)
+        XCTAssertEqual(full.protein, 190)
+        // A key the archive never recorded stays ABSENT, never 0 and never today's value.
+        XCTAssertNil(full.fiber)
+        XCTAssertNil(full.sodium)
+
+        // An OMITTED carbsBase is meaningful in its own right: that day was a carb-load
+        // day, whose full carb number is a genuine target rather than a floor.
+        let load = try XCTUnwrap(series[1].targets)
+        XCTAssertEqual(load.calories, 1910)
+        XCTAssertEqual(load.carbs, 300)
+        XCTAssertNil(load.carbsBase)
+    }
+
+    func testDayWithoutItsOwnTargetsDecodesAsNil() throws {
+        let series = try XCTUnwrap(try decode(withDayTargets).nutrientSeries)
+        XCTAssertNil(series[2].targets, "no targets object at all is nil, not an empty one")
+        // …and is distinguishable from a day that archived an EMPTY targets object.
+        let empty = """
+        { "asOf": "t", "today": { "date": "2026-08-07", "exercise": [], "meals": [],
+          "targets": {} }, "errors": [],
+          "nutrientSeries": [ { "date": "2026-08-06",
+            "nutrients": { "cal": { "sum": 2000, "known": 4, "unknown": 0 } },
+            "targets": {} } ] }
+        """
+        let day = try XCTUnwrap(try decode(empty).nutrientSeries?.first)
+        XCTAssertNotNil(day.targets, "an empty object is present, just uninformative")
+        XCTAssertNil(day.targets?.calories)
+    }
+
+    func testSnapshotWithNoPerDayTargetsAnywhereStillDecodes() throws {
+        // The older bridge's payload: a nutrientSeries with no `targets` key on any day.
+        let series = try XCTUnwrap(try decode(withSeries).nutrientSeries)
+        XCTAssertEqual(series.count, 2)
+        XCTAssertTrue(series.allSatisfy { $0.targets == nil })
+        XCTAssertEqual(series[0].nutrients["cal"]?.sum, 2000, "the rest still decodes")
+    }
+
     // MARK: - decodeDiet status mapping
 
     private func resp(_ code: Int) -> HTTPURLResponse {

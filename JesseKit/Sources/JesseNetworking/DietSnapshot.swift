@@ -108,6 +108,10 @@ public struct DietWeight: Decodable, Equatable, Sendable {
 /// `magnesium` (bridge ≥ 0.18.0) are the optional micronutrient day targets. Each is a
 /// reference the matching gauge judges against; when absent the gauge shows the value
 /// only, with no judgment. (Unsaturated fat is derived, not tracked, and has no target.)
+///
+/// The same shape carries a PAST day's frozen targets in `NutrientDay.targets`. Every
+/// member is optional there for the same reason it is optional here: a key the archive
+/// never recorded is unknown for that day, never zero.
 public struct DietTargets: Decodable, Equatable, Sendable {
     // Public memberwise init (all fields optional → all default nil, so `DietTargets()`
     // and any partial fixture both construct across the module boundary).
@@ -381,26 +385,41 @@ public struct NutrientDayValue: Decodable, Equatable, Sendable {
     }
 }
 
-/// One day in `nutrientSeries`: an ISO `yyyy-MM-dd` date and the per-nutrient
+/// One day in `nutrientSeries`: an ISO `yyyy-MM-dd` date, the per-nutrient
 /// aggregates PRESENT that day, keyed by the bridge's short nutrient key
-/// (`cal`/`p`/`f`/`c`/`fiber`/`na`/`satf`/`sug`/`k`/`ca`/`o3`/`mg`/`unsat`). A nutrient
+/// (`cal`/`p`/`f`/`c`/`fiber`/`na`/`satf`/`sug`/`k`/`ca`/`o3`/`mg`/`unsat`), and — when
+/// the archive recorded them — THAT DAY's own targets. A nutrient
 /// key is present only when at least one item that day carried a known value; a key
 /// ABSENT from `nutrients` is a GAP (all-unknown that day), never a zero. Pure data —
 /// every gap-aware computation lives in `NutrientTrends`, never here.
 public struct NutrientDay: Decodable, Equatable, Sendable {
     public var date: String
     public var nutrients: [String: NutrientDayValue]
+    /// That day's FROZEN targets as the archive recorded them, or nil when the day never
+    /// archived any — which is a THIRD state, distinct from both zero and "the target we
+    /// have today". Two of these targets genuinely move day to day: `calories` is
+    /// recomputed from the day's logged exercise, and `carbs` carries an optional
+    /// add-back band above `carbsBase`. Judging a past day against today's numbers is
+    /// therefore a category error, so `NutrientTrends` treats a nil here (or a nil member
+    /// inside it) as TARGET-UNKNOWN for that day and never substitutes any other day's.
+    /// An OMITTED `carbsBase` with a present `carbs` is meaningful: that day was a
+    /// carb-load day, whose full carb number is a genuine target rather than a floor.
+    public var targets: DietTargets?
 
-    enum CodingKeys: String, CodingKey { case date, nutrients }
+    enum CodingKeys: String, CodingKey { case date, nutrients, targets }
     public init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         date = try c.decode(String.self, forKey: .date)
         nutrients = try c.decodeIfPresent([String: NutrientDayValue].self, forKey: .nutrients) ?? [:]
+        // decodeIfPresent, so an older bridge that sends no per-day targets at all decodes
+        // to nil rather than failing — and an explicit `null` reads the same as absent.
+        targets = try c.decodeIfPresent(DietTargets.self, forKey: .targets)
     }
     // A memberwise init for tests/previews (the custom decoder suppresses the
     // synthesized one).
-    public init(date: String, nutrients: [String: NutrientDayValue] = [:]) {
-        self.date = date; self.nutrients = nutrients
+    public init(date: String, nutrients: [String: NutrientDayValue] = [:],
+                targets: DietTargets? = nil) {
+        self.date = date; self.nutrients = nutrients; self.targets = targets
     }
 }
 
@@ -507,7 +526,8 @@ public struct DietSnapshot: Decodable, Equatable, Sendable {
     /// most recent 90 logged days. The source for the per-nutrient trend charts and the
     /// coach's multi-window rollup. Absent/empty on an older bridge → the trend
     /// affordance hides, no crash. UNKNOWN ≠ ZERO: every computation over this runs only
-    /// on days where the nutrient key is present (see `NutrientTrends`).
+    /// on days where the nutrient key is present (see `NutrientTrends`), and only on the
+    /// days that carry their own `targets` where a verdict is involved.
     public var nutrientSeries: [NutrientDay]?
     /// Per-day, per-ITEM food history (bridge ≥ 0.28.0), ascending by date, most recent 45
     /// logged days — the source for the Sources view ("which foods delivered this

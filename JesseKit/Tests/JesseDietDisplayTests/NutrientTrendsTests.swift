@@ -6,6 +6,10 @@ import JesseNetworking
 // GAP day (nutrient key absent) is never a 0, never a day under a floor/over a ceiling,
 // and never plotted. Coverage (known / logged days in window) rides alongside every
 // verdict. Deterministic — dates are fixtures, never `Date()`.
+//
+// The SECOND unknown these fixtures carry: a day's own TARGET. A day here archives its
+// targets exactly as the bridge does, because that is the only thing a verdict may be
+// taken against — the current target is never a stand-in for a day that recorded none.
 
 @MainActor
 final class NutrientTrendsTests: XCTestCase {
@@ -40,19 +44,25 @@ final class NutrientTrendsTests: XCTestCase {
         var d = DietTargets(); t(&d); return d
     }
 
+    /// A logged day that archived its OWN targets — the shape the engine may judge.
+    private func day(_ date: String, _ nutrients: [String: NutrientDayValue],
+                     _ archived: DietTargets?) -> NutrientDay {
+        NutrientDay(date: date, nutrients: nutrients, targets: archived)
+    }
+
     // MARK: - Unknown-aware: gaps are neither 0 nor a breach
 
     func testGapDayNeverCountsAsZeroOrUnderFloor() {
         // 4 logged days; magnesium known on days 1,2,4 (300, 500, 400) and a GAP on day 3
         // (that day logged food — cal is known — but no item carried magnesium).
         let d = dates(from: "2026-07-01", count: 4)
-        let series = [
-            NutrientDay(date: d[0], nutrients: ["cal": val(2000, known: 5), "mg": val(300, known: 3, unknown: 2)]),
-            NutrientDay(date: d[1], nutrients: ["cal": val(1900, known: 5), "mg": val(500, known: 4)]),
-            NutrientDay(date: d[2], nutrients: ["cal": val(2100, known: 5)]), // magnesium GAP
-            NutrientDay(date: d[3], nutrients: ["cal": val(2000, known: 5), "mg": val(400, known: 4)]),
-        ]
         let t = targets { $0.magnesium = 400 }
+        let series = [
+            day(d[0], ["cal": val(2000, known: 5), "mg": val(300, known: 3, unknown: 2)], t),
+            day(d[1], ["cal": val(1900, known: 5), "mg": val(500, known: 4)], t),
+            day(d[2], ["cal": val(2100, known: 5)], t), // magnesium GAP
+            day(d[3], ["cal": val(2000, known: 5), "mg": val(400, known: 4)], t),
+        ]
         let trend = N.analyze(series, nutrient: .mg, targets: t, windowDays: nil)
 
         // Median over KNOWN days only — the gap is not a phantom 0 dragging it down.
@@ -75,10 +85,10 @@ final class NutrientTrendsTests: XCTestCase {
 
     func testFloorPctUnderCountsOnlyKnownDaysBelow() {
         let d = dates(from: "2026-07-01", count: 3)
-        let series = d.enumerated().map { i, date in
-            NutrientDay(date: date, nutrients: ["p": val([180, 190, 200][i])])
-        }
         let t = targets { $0.protein = 190 }
+        let series = d.enumerated().map { i, date in
+            day(date, ["p": val([180, 190, 200][i])], t)
+        }
         let trend = N.analyze(series, nutrient: .p, targets: t, windowDays: nil)
         // 180 under; 190 AT target (not under); 200 over.
         XCTAssertEqual(trend.countUnderTarget, 1)
@@ -88,10 +98,10 @@ final class NutrientTrendsTests: XCTestCase {
 
     func testCeilingPctOverIsSymmetric() {
         let d = dates(from: "2026-07-01", count: 3)
-        let series = d.enumerated().map { i, date in
-            NutrientDay(date: date, nutrients: ["na": val([2000, 2300, 2400][i])])
-        }
         let t = targets { $0.sodium = 2300 }
+        let series = d.enumerated().map { i, date in
+            day(date, ["na": val([2000, 2300, 2400][i])], t)
+        }
         let trend = N.analyze(series, nutrient: .na, targets: t, windowDays: nil)
         // 2400 over; 2300 AT the ceiling (not over); 2000 under.
         XCTAssertEqual(trend.countOverTarget, 1)
@@ -342,10 +352,11 @@ final class NutrientTrendsTests: XCTestCase {
     /// known on only 3 recent days (thin coverage).
     private func coachSeries() -> [NutrientDay] {
         let d = dates(from: "2026-06-10", count: 30)
+        let archived = targets { $0.magnesium = 400; $0.calcium = 1200 }
         return d.enumerated().map { i, date in
             var nutrients: [String: NutrientDayValue] = ["cal": val(2000, known: 5), "mg": val(250)]
             if i >= 27 { nutrients["ca"] = val(500) } // last 3 days only
-            return NutrientDay(date: date, nutrients: nutrients)
+            return day(date, nutrients, archived)
         }
     }
 
@@ -389,7 +400,7 @@ final class NutrientTrendsTests: XCTestCase {
         let t = targets { $0.magnesium = 400 }
         // A budget above the framing but too small for every block → truncation note, and
         // the standing problem is retained.
-        let rollup = N.coachRollup(series: coachSeries(), targets: t, meals: [], budgetBytes: 800)
+        let rollup = N.coachRollup(series: coachSeries(), targets: t, meals: [], budgetBytes: 1100)
         XCTAssertTrue(rollup.contains("truncated"), "an oversized set says it was truncated")
         XCTAssertTrue(rollup.contains("Magnesium"), "the standing problem is kept, not dropped")
     }
@@ -406,7 +417,7 @@ final class NutrientTrendsTests: XCTestCase {
         let v = N.verdict(trend)
         XCTAssertTrue(v.hasPrefix("Magnesium: known on 30 of the last 30 logged days."))
         XCTAssertTrue(v.contains("400 mg floor"))
-        XCTAssertTrue(v.contains("Under the floor on 30 of 30 known days"))
+        XCTAssertTrue(v.contains("Under the floor on 30 of 30 judged days"))
         XCTAssertTrue(v.contains("consistent gap"))
     }
 
@@ -682,6 +693,338 @@ final class NutrientTrendsTests: XCTestCase {
         XCTAssertFalse(calm.contains("TODAY RAN HOT"))
     }
 
+    // MARK: - Per-day targets: the moving target is judged where it moved
+
+    /// A week of days, each archiving its OWN calorie target — the exercise-adjusted shape
+    /// the real data has: a base near 1700 plus a share of that day's training.
+    private func calorieWeek(_ pairs: [(intake: Double, target: Double?)]) -> [NutrientDay] {
+        let d = dates(from: "2026-07-01", count: pairs.count)
+        return zip(d, pairs).map { date, p in
+            day(date, ["cal": val(p.intake, known: 6)],
+                p.target.map { t in targets { $0.calories = t } })
+        }
+    }
+
+    func testSameIntakeDifferentDayTargetsProduceDifferentDeltas() {
+        // THE regression test for the defect. Two weeks with byte-identical intake: one of
+        // rest days (target 1700), one of hard training days (target 2500). Judged against
+        // a single number they are indistinguishable — which is exactly what the old rollup
+        // said. Judged against the target each day actually had, one week is 300 over and
+        // the other is 500 under, and they must not compare equal.
+        let intake: [Double] = [2000, 2000, 2000, 2000, 2000, 2000, 2000]
+        let rest = calorieWeek(intake.map { ($0, 1700) })
+        let training = calorieWeek(intake.map { ($0, 2500) })
+        let t = targets { $0.calories = 2100 } // today's number: used by neither
+
+        let restTrend = N.analyze(rest, nutrient: .cal, targets: t, windowDays: nil)
+        let trainTrend = N.analyze(training, nutrient: .cal, targets: t, windowDays: nil)
+
+        XCTAssertEqual(restTrend.median, trainTrend.median, "identical intake, by construction")
+        XCTAssertNotEqual(restTrend.medianDelta, trainTrend.medianDelta,
+                          "the same intake against different targets is not the same day")
+        XCTAssertEqual(restTrend.medianDelta, 300)
+        XCTAssertEqual(trainTrend.medianDelta, -500)
+        XCTAssertEqual(restTrend.countOverTarget, 7)
+        XCTAssertEqual(restTrend.countUnderTarget, 0)
+        XCTAssertEqual(trainTrend.countUnderTarget, 7)
+        XCTAssertEqual(trainTrend.countOverTarget, 0)
+    }
+
+    func testMedianDeltaIsPerDayNotAMedianMinusATarget() {
+        // The distinction the defect hid: a median of the raw values minus ONE target is
+        // not the median of the per-day distances. Intake is flat at 2000 while the target
+        // swings; the raw median (2000) less the middle target (2000) would say "level",
+        // while the true per-day median distance is +300.
+        let series = calorieWeek([(2000, 1700), (2000, 1700), (2000, 1700), (2000, 2000),
+                                  (2000, 2300), (2000, 2300), (2000, 1700)])
+        let t = N.analyze(series, nutrient: .cal, targets: DietTargets(), windowDays: nil)
+        XCTAssertEqual(t.median, 2000)
+        XCTAssertEqual(t.medianDelta, 300, "the median of the deltas, not a delta of the medians")
+    }
+
+    func testTargetUnknownDayCountsInTheDistributionAndInNoVerdict() {
+        // Four days at the same intake; the third archived no targets at all.
+        let series = calorieWeek([(1800, 1700), (2400, 1700), (3000, nil), (2000, 1700)])
+        let t = N.analyze(series, nutrient: .cal, targets: targets { $0.calories = 2100 },
+                          windowDays: nil)
+        // In the distribution: all four days, including the unjudged one (which is the max).
+        XCTAssertEqual(t.daysKnown, 4)
+        XCTAssertEqual(t.points.count, 4)
+        XCTAssertEqual(t.maxKnown, 3000, "an unjudged day is still real data")
+        XCTAssertEqual(t.median, (2000 + 2400) / 2)
+        // In no verdict: three judged, one target-unknown, and the 3000 day — far over
+        // every other day's target — is in neither the over count nor the delta.
+        XCTAssertEqual(t.daysJudged, 3)
+        XCTAssertEqual(t.daysTargetUnknown, 1)
+        XCTAssertEqual(t.countOverTarget, 3)
+        XCTAssertEqual(t.countUnderTarget, 0)
+        XCTAssertEqual(t.medianDelta, 300, "the deltas are 100, 700, 300 → 300")
+        XCTAssertFalse(t.points.first { $0.date == t.points[2].date }?.dayTarget != nil)
+        XCTAssertNil(t.points[2].isUnder, "unjudged is not false — that would read as a pass")
+        XCTAssertNil(t.points[2].isOver)
+    }
+
+    func testCurrentTargetIsNeverSubstitutedForAMissingPerDayTarget() {
+        // Every archived day sat at 1700 and every intake cleared it. Today's target is
+        // wildly different (4000) — if it leaked in, every day would flip to "under".
+        let series = calorieWeek(Array(repeating: (2000.0, 1700.0), count: 7))
+        let far = N.analyze(series, nutrient: .cal, targets: targets { $0.calories = 4000 },
+                            windowDays: nil)
+        let near = N.analyze(series, nutrient: .cal, targets: targets { $0.calories = 1700 },
+                             windowDays: nil)
+        XCTAssertEqual(far.countUnderTarget, 0, "today's 4000 must not make a 2000 day short")
+        XCTAssertEqual(far.countOverTarget, 7)
+        XCTAssertEqual(far.medianDelta, 300)
+        XCTAssertEqual(far.medianDelta, near.medianDelta,
+                       "the verdict cannot move when only TODAY's target changes")
+        XCTAssertEqual(far.countUnderTarget, near.countUnderTarget)
+        // Nor does a neighbouring day's fill a gap: a lone unarchived day stays unjudged
+        // even when every day around it archived the same number.
+        var withHole = series
+        withHole[3] = NutrientDay(date: withHole[3].date, nutrients: withHole[3].nutrients)
+        let holed = N.analyze(withHole, nutrient: .cal, targets: DietTargets(), windowDays: nil)
+        XCTAssertEqual(holed.daysJudged, 6)
+        XCTAssertEqual(holed.daysTargetUnknown, 1)
+    }
+
+    // MARK: - Carbs: a FLOOR against that day's base, never the fuelled number
+
+    /// A day archiving a carb base plus (optionally) the fuelled add-back above it.
+    private func carbDay(_ date: String, eaten: Double, base: Double?, fuelled: Double?) -> NutrientDay {
+        day(date, ["c": val(eaten)], targets { $0.carbsBase = base; $0.carbs = fuelled })
+    }
+
+    func testCarbsAtTheBaseIsAPassAndAboveItStaysAPassHoweverFarBelowTheFuelledNumber() {
+        let d = dates(from: "2026-07-01", count: 3)
+        // 300 base with a 480 g fuelled ceiling on a heavy training day: at the base, just
+        // above it, and most of the way up the band. All three cleared the floor.
+        let series = [carbDay(d[0], eaten: 300, base: 300, fuelled: 480),
+                      carbDay(d[1], eaten: 310, base: 300, fuelled: 480),
+                      carbDay(d[2], eaten: 450, base: 300, fuelled: 480)]
+        let t = N.analyze(series, nutrient: .c, targets: targets { $0.carbs = 480; $0.carbsBase = 300 },
+                          windowDays: nil)
+        XCTAssertEqual(t.daysJudged, 3)
+        XCTAssertEqual(t.countUnderTarget, 0, "at or above the base is a pass, full stop")
+        XCTAssertEqual(t.medianDelta, 10, "the distance is from the BASE, not the fuelled number")
+        // And the words that would misread it are not producible.
+        let v = N.verdict(t)
+        for word in ["short", "under-fuelled", "needs carbs"] {
+            XCTAssertFalse(v.lowercased().contains(word), "\(word) in: \(v)")
+        }
+        XCTAssertTrue(v.contains("Under the base on 0 of 3 judged days"), v)
+    }
+
+    func testCarbsBelowTheBaseIsTheOnlyUnderDay() {
+        let d = dates(from: "2026-07-01", count: 2)
+        let series = [carbDay(d[0], eaten: 299, base: 300, fuelled: 480),
+                      carbDay(d[1], eaten: 300, base: 300, fuelled: 480)]
+        let t = N.analyze(series, nutrient: .c, targets: DietTargets(), windowDays: nil)
+        XCTAssertEqual(t.countUnderTarget, 1, "one gram under the base is under; at it is not")
+        XCTAssertEqual(t.points[0].isUnder, true)
+        XCTAssertEqual(t.points[1].isUnder, false)
+    }
+
+    func testCarbLoadDayWithNoBaseIsJudgedAgainstTheFullNumber() {
+        // An OMITTED carbsBase marks a carb-load day, whose full number is the genuine
+        // target — so 450 against a 600 g carb-load target really is under.
+        let d = dates(from: "2026-07-01", count: 2)
+        let series = [carbDay(d[0], eaten: 450, base: nil, fuelled: 600),
+                      carbDay(d[1], eaten: 650, base: nil, fuelled: 600)]
+        let t = N.analyze(series, nutrient: .c, targets: DietTargets(), windowDays: nil)
+        XCTAssertEqual(t.points[0].dayTarget?.value, 600)
+        XCTAssertEqual(t.points[0].dayTarget?.kind, .target, "a carb-load day is a target day")
+        XCTAssertNil(t.points[0].dayTarget?.band, "there is no optional band above a load target")
+        XCTAssertEqual(t.countUnderTarget, 1)
+        XCTAssertEqual(t.countOverTarget, 1)
+    }
+
+    func testCarbsCarriesTheOptionalFuelBandForTheChartButNeverJudgesIt() {
+        let series = [carbDay(dates(from: "2026-07-01", count: 1)[0],
+                              eaten: 320, base: 300, fuelled: 480)]
+        let t = N.analyze(series, nutrient: .c, targets: DietTargets(), windowDays: nil)
+        let basis = t.points[0].dayTarget
+        XCTAssertEqual(basis?.value, 300, "the judged line is the base")
+        XCTAssertEqual(basis?.kind, .floor)
+        XCTAssertEqual(basis?.band, 480, "the add-back is carried so a chart can draw it")
+        XCTAssertEqual(t.countUnderTarget, 0, "160 g below the fuelled number is still a pass")
+    }
+
+    func testCarbsWithNoArchivedCarbNumbersAtAllIsTargetUnknown() {
+        let d = dates(from: "2026-07-01", count: 1)
+        let series = [day(d[0], ["c": val(320)], targets { $0.protein = 190 })]
+        let t = N.analyze(series, nutrient: .c, targets: targets { $0.carbsBase = 300 },
+                          windowDays: nil)
+        XCTAssertEqual(t.daysTargetUnknown, 1)
+        XCTAssertEqual(t.daysJudged, 0)
+        XCTAssertNil(t.medianDelta)
+    }
+
+    // MARK: - An older bridge: no archived targets anywhere
+
+    func testWithoutArchivedTargetsEveryDayIsTargetUnknownAndNoVerdictIsProduced() {
+        // The pre-per-day-targets payload: a full month of measured days, not one of which
+        // recorded what it was aiming at. Every day plots; nothing is judged; and no text
+        // anywhere claims otherwise.
+        let d = dates(from: "2026-06-10", count: 30)
+        let series = d.map { NutrientDay(date: $0, nutrients: ["cal": val(2800, known: 6),
+                                                              "c": val(200),
+                                                              "mg": val(250)]) }
+        let current = targets { $0.calories = 2100; $0.carbs = 480; $0.carbsBase = 300
+                                $0.magnesium = 400 }
+        for nutrient in [TrendNutrient.cal, .c, .mg] {
+            let t = N.analyze(series, nutrient: nutrient, targets: current, windowDays: 30)
+            XCTAssertEqual(t.daysKnown, 30, "\(nutrient.fullName) still plots every measured day")
+            XCTAssertEqual(t.daysJudged, 0, "\(nutrient.fullName)")
+            XCTAssertEqual(t.daysTargetUnknown, 30, "\(nutrient.fullName)")
+            XCTAssertEqual(t.countUnderTarget, 0, "\(nutrient.fullName)")
+            XCTAssertEqual(t.countOverTarget, 0, "\(nutrient.fullName)")
+            XCTAssertNil(t.medianDelta, "\(nutrient.fullName)")
+            XCTAssertNil(t.pctUnderTarget, "\(nutrient.fullName)")
+            XCTAssertNil(t.pctOverTarget, "\(nutrient.fullName)")
+            XCTAssertFalse(t.isStandingProblem, "\(nutrient.fullName)")
+            XCTAssertNotNil(t.median, "the distribution survives — only the verdict is withheld")
+            // The verdict says WHY there is no judgment rather than implying compliance.
+            XCTAssertTrue(N.verdict(t).contains(N.noArchivedTargets), N.verdict(t))
+        }
+        // 2800 kcal against a 2100 "current" target is a blatant over — and stays uncounted.
+        let cal = N.analyze(series, nutrient: .cal, targets: current, windowDays: 30)
+        XCTAssertEqual(cal.countOverTarget, 0, "today's target must not judge a month of history")
+        let line = N.coachLine(series, nutrient: .cal, targets: current)
+        XCTAssertEqual(line?.contains("no day recorded its own target"), true, line ?? "")
+        XCTAssertEqual(line?.contains("2100"), false, "no window-wide target number")
+    }
+
+    func testOlderBridgeTrendViewBuildsWithoutCrashing() {
+        // The view's derived state over a target-unknown series: every point resolves, the
+        // stepped-target runs are simply empty, and nothing force-unwraps a basis.
+        let d = dates(from: "2026-06-10", count: 10)
+        let series = d.map { NutrientDay(date: $0, nutrients: ["cal": val(2500, known: 6)]) }
+        let context = NutrientTrendContext(nutrient: .cal, series: series,
+                                           targets: targets { $0.calories = 2100 }, meals: [])
+        let view = NutrientTrendDetail(context: context)
+        XCTAssertNotNil(view.body)
+    }
+
+    // MARK: - Coach text: a delta, never a median against one number
+
+    /// A realistic month for the coach: every nutrient measured daily, and every day
+    /// archiving its own targets — with the calorie target MOVING the way the real one
+    /// does (1910 on a rest day, 2487 after a long run) and carbs carrying a base plus a
+    /// fuel band. Today's targets, passed separately, differ from all of them.
+    private func archivedMonth(unjudgedDays: Int = 0) -> [NutrientDay] {
+        let d = dates(from: "2026-06-10", count: 30)
+        let calTargets: [Double] = [1910, 2113, 2487]
+        return d.enumerated().map { i, date in
+            let nutrients: [String: NutrientDayValue] = [
+                "cal": val(2600, known: 6), "p": val(200), "f": val(60), "c": val(340),
+                "fiber": val(40), "na": val(2000), "satf": val(14), "sug": val(60),
+                "k": val(3500), "ca": val(1300), "o3": val(600), "mg": val(250),
+                "unsat": val(46),
+            ]
+            let archived: DietTargets? = i < unjudgedDays ? nil : targets {
+                $0.calories = calTargets[i % calTargets.count]
+                $0.protein = 190; $0.fat = 60; $0.carbsBase = 300; $0.carbs = 480
+                $0.fiber = 38; $0.sodium = 2300; $0.satFat = 22; $0.sugar = 50
+                $0.potassium = 3500; $0.calcium = 1200; $0.omega3 = 500; $0.magnesium = 400
+            }
+            return day(date, nutrients, archived)
+        }
+    }
+
+    /// Today's targets — deliberately unlike every archived day, so a leak is visible.
+    private func todayTargets() -> DietTargets {
+        targets {
+            $0.calories = 2113; $0.protein = 190; $0.fat = 60
+            $0.carbsBase = 300; $0.carbs = 480; $0.fiber = 38
+            $0.sodium = 2300; $0.satFat = 22; $0.sugar = 50
+            $0.potassium = 3500; $0.calcium = 1200; $0.omega3 = 500; $0.magnesium = 400
+        }
+    }
+
+    func testCalorieLineStatesADeltaAndNoWindowWideTargetNumber() throws {
+        let line = try XCTUnwrap(N.coachLine(archivedMonth(), nutrient: .cal, targets: todayTargets()))
+        XCTAssertTrue(line.contains("that day's own target"), line)
+        XCTAssertTrue(line.contains("judged days"), line)
+        // Not one of the day targets, and not today's, is printed as if it applied to the
+        // window — the whole defect in one assertion.
+        for number in ["1910", "2113", "2487"] {
+            XCTAssertFalse(line.contains(number), "\(number) printed as a window target: \(line)")
+        }
+        // And the raw median is not the basis of the verdict.
+        XCTAssertFalse(line.contains("median 2600"), line)
+    }
+
+    func testCarbLineIsAFloorAgainstTheBaseAndNeverCallsAClearedDayShort() throws {
+        // 340 g eaten against a 300 g base and a 480 g fuelled ceiling: comfortably a pass,
+        // which the old shape reported as 140 g short of "the target".
+        let line = try XCTUnwrap(N.coachLine(archivedMonth(), nutrient: .c, targets: todayTargets()))
+        XCTAssertTrue(line.hasPrefix("Carbs (floor, that day's own base)"), line)
+        XCTAssertTrue(line.contains("median +40 g"), line)
+        XCTAssertTrue(line.contains("under on 0 of 30 judged days"), line)
+        XCTAssertFalse(line.contains("480"), "the fuelled number is never the target: \(line)")
+        for word in ["short", "under-fuelled", "needs carbs"] {
+            XCTAssertFalse(line.lowercased().contains(word), "\(word) in: \(line)")
+        }
+    }
+
+    func testEveryLineWithAnUnjudgedDayStatesItsTargetCoverage() throws {
+        // Ten of the thirty days archived no targets. Every judged line must say so.
+        let series = archivedMonth(unjudgedDays: 10)
+        for nutrient in [TrendNutrient.cal, .c, .f, .p, .mg, .na] {
+            let line = try XCTUnwrap(N.coachLine(series, nutrient: nutrient, targets: todayTargets()),
+                                     nutrient.fullName)
+            XCTAssertTrue(line.contains("targets known 20/30"),
+                          "\(nutrient.fullName) hides its target coverage: \(line)")
+        }
+        // The verdict band says it too, and names the days it did not judge.
+        let v = N.verdict(N.analyze(series, nutrient: .cal, targets: todayTargets(), windowDays: 30))
+        XCTAssertTrue(v.contains("10 of those days recorded no target of their own"), v)
+        XCTAssertTrue(v.contains("of 20 judged days"), v)
+    }
+
+    func testAFullyJudgedLineStaysTerse() throws {
+        // The mirror: with every day judged, no line pays for a coverage clause it doesn't
+        // need. (The moving targets always state theirs — there the number is the point.)
+        let line = try XCTUnwrap(N.coachLine(archivedMonth(), nutrient: .mg, targets: todayTargets()))
+        XCTAssertEqual(line,
+            "Magnesium (floor 400 mg): 7d median 250 known 7/7 under 7/7; "
+            + "30d median 250 known 30/30 under 30/30; all median 250 known 30/30 under 30/30.")
+    }
+
+    func testFramingNamesPerDayExerciseAdjustedTargetsAndNet() {
+        let rollup = N.coachRollup(series: archivedMonth(), targets: todayTargets(), meals: [])
+        XCTAssertTrue(rollup.contains("PER-DAY and exercise-adjusted"), rollup)
+        XCTAssertTrue(rollup.contains("says nothing about a deficit on its own"), rollup)
+        XCTAssertTrue(rollup.contains("NET: intake minus that day's logged exercise"), rollup)
+    }
+
+    func testAFullThirteenNutrientRollupStaysInsideTheProductionBudget() {
+        // The whole point of the byte budget: a full thirteen-nutrient month with three
+        // delta lines still fits, and what it sheds it sheds worst-last — the standing
+        // problem and the four macros survive, the informational pair are the first out.
+        let rollup = N.coachRollup(series: archivedMonth(), targets: todayTargets(), meals: [])
+        XCTAssertLessThanOrEqual(rollup.utf8.count, N.coachRollupBudget)
+        for n in [TrendNutrient.mg, .cal, .p, .f, .c] {
+            XCTAssertTrue(rollup.contains(n.fullName), "\(n.fullName) dropped at the real budget")
+        }
+        if rollup.contains("truncated") {
+            XCTAssertFalse(rollup.contains(TrendNutrient.unsat.fullName),
+                           "an informational line outlived a judged one")
+        }
+    }
+
+    func testWorstFirstTruncationKeepsTheStandingProblemAndTheMovingTargets() {
+        // A month where magnesium is a standing shortfall, squeezed into a budget that
+        // cannot hold everything: the standing problem and the macros stay, the
+        // informational lines go.
+        let rollup = N.coachRollup(series: archivedMonth(), targets: todayTargets(),
+                                   meals: [], budgetBytes: 1500)
+        XCTAssertTrue(rollup.contains("truncated"), rollup)
+        XCTAssertTrue(rollup.contains("Magnesium"), "the standing problem is kept")
+        XCTAssertFalse(rollup.contains("Unsaturated Fat"), "informational lines go first")
+        XCTAssertLessThanOrEqual(rollup.utf8.count, 1500)
+    }
+
     func testTightBudgetDropsInformationalLinesBeforeTheSameDayLine() {
         // A budget too small for the whole set: the one-day line survives and the
         // lower-priority nutrient lines are the ones that go.
@@ -692,11 +1035,12 @@ final class NutrientTrendsTests: XCTestCase {
             n["unsat"] = val(30)
             return NutrientDay(date: day.date, nutrients: n)
         }
-        let rollup = N.coachRollup(series: series, targets: t, meals: hotMeals(), budgetBytes: 900)
+        let budget = 1200
+        let rollup = N.coachRollup(series: series, targets: t, meals: hotMeals(), budgetBytes: budget)
         XCTAssertTrue(rollup.contains("TODAY RAN HOT"), rollup)
         XCTAssertTrue(rollup.contains("truncated"))
         XCTAssertFalse(rollup.contains("Total Sugars"), "informational lines go first")
         XCTAssertFalse(rollup.contains("Unsaturated Fat"))
-        XCTAssertLessThanOrEqual(rollup.utf8.count, 900)
+        XCTAssertLessThanOrEqual(rollup.utf8.count, budget)
     }
 }
