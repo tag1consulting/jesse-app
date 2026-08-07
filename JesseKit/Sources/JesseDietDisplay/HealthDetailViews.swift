@@ -39,14 +39,21 @@ struct MacrosCaloriesDetail: View {
     /// each nutrient row can push its trend. Nil/empty on an older bridge → no trend
     /// affordance. Defaulted so previews/older call sites compile unchanged.
     var nutrientSeries: [NutrientDay]? = nil
+    /// True when this is a PAST day. The trend chart behind a drill-down is inherently
+    /// historical and always gets the full series above; the buffered gauges' rolling COLOR
+    /// must not be, so a past day judges on its own numbers alone (see `judgeSeries`).
+    var isHistorical: Bool = false
     @State private var explainer: Explainer?
 
-    private var g: DietGauges { DietSemantics.gauges(for: today, hour: hour) }
+    /// The history the buffered gauges take their color from — today's day only.
+    private var judgeSeries: [NutrientDay]? { isHistorical ? nil : nutrientSeries }
+    private var g: DietGauges { DietSemantics.gauges(for: today, hour: hour, series: judgeSeries) }
     private var totals: MacroTotals { DietSemantics.dayTotals(today.meals) }
     private var net: NetCalories { NetCalories(intake: totals.cal, burned: DietSemantics.burnedCalories(today.exercise)) }
     /// One micronutrient's gauge for the current day.
     private func microGauge(_ n: Micronutrient) -> MetricGauge {
-        DietSemantics.micronutrientGauge(n, meals: today.meals, targets: today.targets, hour: hour)
+        DietSemantics.micronutrientGauge(n, meals: today.meals, targets: today.targets,
+                                         hour: hour, series: judgeSeries)
     }
     /// Whether a nutrient carried at least one known value that day — the gate for
     /// surfacing a row (an all-unknown "not tracked yet" row is noise, not shown).

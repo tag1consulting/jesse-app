@@ -599,4 +599,176 @@ final class DietSemanticsTests: XCTestCase {
         XCTAssertEqual(bd.contributions.first?.share ?? 0, 15.0 / 22.0, accuracy: 0.0001)
         XCTAssertTrue(bd.unknownFoods.isEmpty)
     }
+
+    // MARK: - Buffered gauges: today's number, the window's colour
+
+    /// `count` consecutive ISO dates ending on the day the `microDay` fixture uses, so a
+    /// window anchored on the series' last known day covers exactly these days.
+    private func historyDates(_ count: Int) -> [String] {
+        var cal = Calendar(identifier: .gregorian)
+        cal.timeZone = TimeZone(identifier: "UTC")!
+        let f = DateFormatter()
+        f.calendar = cal
+        f.timeZone = TimeZone(identifier: "UTC")
+        f.dateFormat = "yyyy-MM-dd"
+        let end = f.date(from: "2026-07-09")!
+        return (0..<count).reversed().map { f.string(from: cal.date(byAdding: .day, value: -$0, to: end)!) }
+    }
+
+    /// A history where one nutrient key carries `values` on consecutive days.
+    private func history(_ key: String, _ values: [Double]) -> [NutrientDay] {
+        zip(historyDates(values.count), values).map {
+            NutrientDay(date: $0, nutrients: ["cal": NutrientDayValue(sum: 2000, known: 5, unknown: 0),
+                                              key: NutrientDayValue(sum: $1, known: 1, unknown: 0)])
+        }
+    }
+
+    func testSaturatedFatShowsTodayButColoursFromTheWeek() {
+        // Today is 34 g against a 22 g ceiling — red on its own. The week's median is 15 g,
+        // so the row reads green, still showing today's 34 and captioned "7d".
+        let today = microDay([micro(satf: 34)], targets: DietTargets(satFat: 22))
+        let series = history("satf", [10, 12, 14, 15, 16, 18, 34])
+        let g = S.micronutrientGauge(.saturatedFat, meals: today.meals, targets: today.targets,
+                                     hour: 20, series: series)
+        XCTAssertEqual(g.value, 34, "the displayed number is TODAY's")
+        XCTAssertEqual(g.remaining, "12g over", "the words stay today's too")
+        XCTAssertEqual(g.goalStatus, .over(12), "the goal outcome is today's")
+        XCTAssertEqual(g.status, .green, "the colour is the week's median")
+        XCTAssertEqual(g.tone, .onTrack)
+        XCTAssertEqual(S.rollingChip(g.judgment), "7d")
+        XCTAssertEqual(S.judgmentNote(g.judgment), "color: 7d median of 7 logged days · number: today")
+    }
+
+    func testABlowoutDayCoexistsWithAGreenRollingColour() {
+        // The same day: green over the week AND flagged as a blow-out, which is the whole
+        // point — the median is what hides it.
+        let today = microDay([micro(satf: 34)], targets: DietTargets(satFat: 22))
+        let series = history("satf", [10, 12, 14, 15, 16, 18, 34])
+        let g = S.micronutrientGauge(.saturatedFat, meals: today.meals, targets: today.targets,
+                                     hour: 20, series: series)
+        XCTAssertEqual(g.status, .green)
+        XCTAssertTrue(g.blowout, "34 g is 1.5x the 22 g target")
+
+        // A mild day over the same week is neither red nor flagged.
+        let mild = microDay([micro(satf: 25)], targets: DietTargets(satFat: 22))
+        let m = S.micronutrientGauge(.saturatedFat, meals: mild.meals, targets: mild.targets,
+                                     hour: 20, series: series)
+        XCTAssertFalse(m.blowout, "1.14x is not a blow-out")
+    }
+
+    func testMagnesiumColoursFromTheMonth() {
+        let today = microDay([micro(mg: 500)], targets: DietTargets(magnesium: 400))
+        let series = history("mg", Array(repeating: 150, count: 7) + [500])
+        let g = S.micronutrientGauge(.magnesium, meals: today.meals, targets: today.targets,
+                                     hour: 20, series: series)
+        XCTAssertEqual(g.value, 500)
+        XCTAssertEqual(g.goalStatus, .met, "today did clear the floor")
+        XCTAssertEqual(g.status, .red, "the month's median is 150 of a 400 mg floor")
+        XCTAssertEqual(S.rollingChip(g.judgment), "30d")
+    }
+
+    func testThinWindowKeepsTheDailyColourAndSaysWhy() {
+        // Four known days is under the engine's minimum: the colour is today's and the row
+        // says so rather than claiming a pattern.
+        let today = microDay([micro(satf: 34)], targets: DietTargets(satFat: 22))
+        let series = history("satf", [10, 12, 14, 34])
+        let g = S.micronutrientGauge(.saturatedFat, meals: today.meals, targets: today.targets,
+                                     hour: 20, series: series)
+        XCTAssertEqual(g.status, .red, "today's band, unchanged")
+        XCTAssertNil(S.rollingChip(g.judgment), "a thin window claims no pattern")
+        XCTAssertEqual(S.judgmentNote(g.judgment),
+                       "only 4 logged days — not enough for a 7d read, so this is today's")
+    }
+
+    func testProteinAndFiberAreByteIdenticalToTheSingleDayPath() {
+        // The regression guard: a history that would read comfortably over a week must not
+        // touch the two floors that are judged daily on purpose.
+        let meals = [DietMeal(name: "all", time: "12:00", items: [item(1200, 60, 40, 300, 12)])]
+        let targets = DietTargets(calories: 2100, protein: 140, fat: 65, carbs: 210,
+                                  carbsBase: 180, fiber: 38)
+        let day = todayNormal(meals: meals, targets: targets)
+        var series = history("p", Array(repeating: 200, count: 30))
+        for (i, d) in series.enumerated() {
+            var n = d.nutrients
+            n["fiber"] = NutrientDayValue(sum: 50, known: 1, unknown: 0)
+            series[i] = NutrientDay(date: d.date, nutrients: n)
+        }
+        for hour in [9, 20] {
+            let plain = S.gauges(for: day, hour: hour)
+            let withHistory = S.gauges(for: day, hour: hour, series: series)
+            XCTAssertEqual(withHistory.protein, plain.protein, "protein at \(hour)h")
+            XCTAssertEqual(withHistory.fiber, plain.fiber, "fiber at \(hour)h")
+            XCTAssertEqual(withHistory.calories, plain.calories, "calories at \(hour)h")
+            XCTAssertEqual(withHistory.carbs, plain.carbs, "carbs at \(hour)h")
+            XCTAssertEqual(withHistory.protein.judgment, .daily)
+            XCTAssertEqual(withHistory.fiber.judgment, .daily)
+        }
+    }
+
+    func testTotalFatRingBuffersOverTheWeekAndFlagsAHardCapDay() {
+        // 78 g today: red on the day's window, but a 58 g weekly median colours it green —
+        // and the same-day flame marks the 70 g cap breach.
+        let meals = [DietMeal(name: "all", time: "12:00", items: [item(2000, 120, 78, 200, 30)])]
+        let targets = DietTargets(calories: 2600, protein: 140, fat: 65, carbs: 300,
+                                  carbsBase: 300, fiber: 38)
+        let day = todayNormal(meals: meals, targets: targets)
+        let series = history("f", [55, 57, 58, 58, 60, 62, 78])
+        let g = S.gauges(for: day, hour: 20, series: series)
+        XCTAssertEqual(g.fat.value, 78, "today's grams")
+        XCTAssertEqual(g.fat.remaining, "13g above the range")
+        XCTAssertEqual(g.fat.status, .green, "the 58 g median sits inside the 50–65 window")
+        XCTAssertEqual(S.rollingChip(g.fat.judgment), "7d")
+        XCTAssertTrue(g.fat.blowout, "78 g is over the 70 g hard cap")
+        // Without the history it is the pre-change single-day red.
+        XCTAssertEqual(S.gauges(for: day, hour: 20).fat.status, .red)
+    }
+
+    func testCarbLoadFatStaysJudgedOnTheDay() {
+        // A carb-load day's fat ceiling is a one-day goal the history cannot know about.
+        let meals = [DietMeal(name: "all", time: "12:00", items: [item(3000, 140, 78, 450, 20)])]
+        let targets = DietTargets(calories: 3000, protein: 140, fat: 50, carbs: 450,
+                                  carbsBase: 450, fiber: 38)
+        let day = todayNormal(meals: meals, targets: targets, dayStyle: "carb-load-training")
+        let series = history("f", [55, 57, 58, 58, 60, 62, 78])
+        let g = S.gauges(for: day, hour: 20, series: series)
+        XCTAssertEqual(g.fat.goal, .ceiling)
+        XCTAssertEqual(g.fat.status, .red, "78 g against a 50 g carb-load ceiling, today")
+        XCTAssertEqual(g.fat.judgment, .daily)
+    }
+
+    func testNoSeriesRevertsEveryGaugeToSingleDayBehaviour() {
+        // An older bridge sends no `nutrientSeries`: every gauge is the pre-change one, with
+        // no caption, no crash.
+        let meals = [DietMeal(name: "all", time: "12:00",
+                              items: [micro(na: 4000, satf: 34, k: 900, ca: 200, o3: 50, mg: 100, f: 78)])]
+        let targets = DietTargets(calories: 2100, protein: 140, fat: 65, carbs: 210,
+                                  carbsBase: 180, fiber: 38, sodium: 2300, satFat: 22,
+                                  potassium: 3500, sugar: 50, calcium: 1200, omega3: 500,
+                                  magnesium: 400)
+        let day = todayNormal(meals: meals, targets: targets)
+        for g in S.micronutrientGauges(for: day, hour: 20, series: nil) {
+            XCTAssertEqual(g.judgment, .daily, g.label)
+            XCTAssertNil(S.judgmentNote(g.judgment), g.label)
+        }
+        XCTAssertEqual(S.micronutrientGauges(for: day, hour: 20, series: nil),
+                       S.micronutrientGauges(for: day, hour: 20))
+        XCTAssertEqual(S.micronutrientGauges(for: day, hour: 20, series: []),
+                       S.micronutrientGauges(for: day, hour: 20))
+        // Sodium at 4000 mg against a 2300 mg ceiling is still red, and still a blow-out.
+        let na = S.micronutrientGauges(for: day, hour: 20, series: nil).first { $0.label == "Sodium" }!
+        XCTAssertEqual(na.status, .red)
+        XCTAssertTrue(na.blowout, "1.7x the ceiling — a same-day signal that needs no history")
+    }
+
+    func testInformationalNutrientsNeverGainAWindow() {
+        let today = microDay([micro(satf: 5, sug: 200, f: 40)], targets: DietTargets(sugar: 50))
+        let series = history("sug", Array(repeating: 200, count: 30))
+        for n in [Micronutrient.totalSugars, .unsaturatedFat] {
+            let g = S.micronutrientGauge(n, meals: today.meals, targets: today.targets,
+                                         hour: 20, series: series)
+            XCTAssertEqual(g.status, .suspended, n.displayName)
+            XCTAssertEqual(g.judgment, .daily, n.displayName)
+            XCTAssertFalse(g.blowout, n.displayName)
+        }
+    }
 }

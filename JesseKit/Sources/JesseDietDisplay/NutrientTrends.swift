@@ -32,6 +32,58 @@ enum TrendKind: Equatable, Sendable {
     case informational
 }
 
+/// How long a window a nutrient's PASS/FAIL COLOR is judged over. This is a THIRD
+/// question, deliberately distinct from the two the model already answers: `kind` says
+/// which way a nutrient is drifting, `dayGoal` says whether ONE day was good, and this
+/// says how many days the gauge's color is allowed to average over before it calls today
+/// a problem.
+enum JudgmentWindow: Equatable, Sendable {
+    /// Judged on today's number alone — the pre-existing single-day behavior.
+    case daily
+    /// Judged on the MEDIAN of the KNOWN days in the trailing window (a gap is never a 0,
+    /// so it never counts toward the median).
+    case rolling(days: Int)
+
+    /// The window length in days, nil when daily.
+    var days: Int? {
+        switch self {
+        case .daily: return nil
+        case .rolling(let d): return d
+        }
+    }
+
+    /// The short caption a rolling gauge shows ("7d"/"30d") so the color is never read as
+    /// a verdict on today's number. Nil when daily — there is nothing to caption.
+    var caption: String? { days.map { "\($0)d" } }
+
+    var isRolling: Bool { days != nil }
+}
+
+/// Where a gauge's pass/fail COLOR came from. Carried on the gauge so the row can SAY it:
+/// a rolling color beside today's number is only honest if the window is named.
+enum JudgmentSource: Equatable, Sendable {
+    /// Today's number alone — the daily-judged nutrients, and every nutrient when the
+    /// bridge sends no `nutrientSeries` (the graceful-degrade path).
+    case daily
+    /// The median of the window's known days. `caption` is the "7d"/"30d" chip.
+    case rolling(caption: String, daysKnown: Int)
+    /// The window exists but carries too few known days to assert a pattern, so the color
+    /// fell back to TODAY's number and the row says so rather than claiming a trend.
+    case thinWindow(caption: String, daysKnown: Int)
+
+    /// The window caption, for either rolling state; nil for a daily judgment.
+    var caption: String? {
+        switch self {
+        case .daily: return nil
+        case .rolling(let c, _), .thinWindow(let c, _): return c
+        }
+    }
+    /// True when the color really is the window's median (not today's number).
+    var isRolling: Bool { if case .rolling = self { return true } else { return false } }
+    /// True when a rolling nutrient fell back to today's number for want of known days.
+    var isThinWindow: Bool { if case .thinWindow = self { return true } else { return false } }
+}
+
 /// The thirteen nutrients the trend engine plots and the coach reasons over — the
 /// SINGLE source of truth for each one's key, full name, unit, kind, and the curated
 /// insight copy (why it matters + good sources) that grounds every health claim so the
@@ -106,6 +158,54 @@ enum TrendNutrient: String, CaseIterable, Identifiable, Sendable {
         case .sug, .unsat: return nil
         }
     }
+
+    /// How long a window this nutrient's gauge COLOR is judged over (see `JudgmentWindow`).
+    /// The value stays today's on every gauge; only the color's window changes.
+    ///
+    /// DAILY — protein, fiber, calories, carbs. Protein and fiber are daily DELIBERATELY,
+    /// and the deficit is the reason: a floor averaged over a week hides the low days that
+    /// are exactly the ones that matter. Three 60 g protein days and four 160 g days
+    /// median out to a comfortable number while the three thin days are where lean mass
+    /// and recovery are actually lost; the same argument holds for fiber's digestion and
+    /// satiety. A floor you must clear TODAY cannot be paid back on Friday, so it is
+    /// judged today. Calories and carbs are the day's plan, likewise judged against the
+    /// day they belong to.
+    ///
+    /// ROLLING 7 — saturated fat, sodium, total fat. These genuinely buffer: LDL and blood
+    /// pressure answer to the week, not to one cheese board or one bowl of ramen, and a
+    /// single red day on a body that is otherwise fine is a false alarm that teaches the
+    /// gauge to be ignored. A week is long enough to smooth a meal out and short enough
+    /// that a real drift shows up while it can still be corrected.
+    ///
+    /// ROLLING 30 — calcium, omega-3, magnesium, potassium. Body stores and the label data
+    /// both argue for the month: these are stored/regulated on a scale of weeks, and they
+    /// are the nutrients food labels most often omit, so a week rarely holds enough KNOWN
+    /// days to say anything. Thirty days gathers the coverage a verdict needs.
+    ///
+    /// The informational nutrients (total sugars, unsaturated fat) carry no verdict at all,
+    /// so this is never consulted for them; they answer `.daily` only because the property
+    /// is total.
+    var judgmentWindow: JudgmentWindow {
+        switch self {
+        case .p, .fiber, .cal, .c: return .daily
+        case .satf, .na, .f: return .rolling(days: 7)
+        case .ca, .o3, .mg, .k: return .rolling(days: 30)
+        case .sug, .unsat: return .daily // informational — never judged, never consulted
+        }
+    }
+
+    /// The nutrient's HARD same-day cap in its own unit, where the daily gauge defines one:
+    /// total fat's 70 g cap (`DietSemantics.fatHardCap`), the line the normal-day fat window
+    /// already treats as "take note" rather than a nudge. Nil for every other nutrient —
+    /// their same-day line is a multiple of the day's target instead (see
+    /// `NutrientTrends.blowout`).
+    var dailyHardCap: Double? { self == .f ? DietSemantics.fatHardCap : nil }
+
+    /// Whether a SAME-DAY blow-out can be flagged for this nutrient at all: the two ceiling
+    /// nutrients (sodium, saturated fat) plus total fat via its hard cap. A floor cannot be
+    /// blown out — going far OVER a floor is not a problem — and an informational nutrient
+    /// carries no line to cross.
+    var hasSameDayCeiling: Bool { kind == .ceiling || dailyHardCap != nil }
 
     /// This nutrient's reference target from the day's targets object, or nil when the
     /// snapshot carries none (then the trend renders value-only, with NO judgment). Total
@@ -578,6 +678,183 @@ public enum NutrientTrends {
         }
     }
 
+    // MARK: - Rolling gauge verdict (the gauge's COLOR)
+
+    /// The gauge judgment for one nutrient: the band its color comes from, the goal outcome
+    /// behind that band (so the caller derives the display tone through the SAME
+    /// `DietSemantics.tone` path every daily gauge uses), and where the color came from.
+    ///
+    /// The judged VALUE here is not necessarily today's: on a rolling nutrient it is the
+    /// window's median. The gauge still DISPLAYS today's number — only the color moves.
+    struct NutrientJudgment: Equatable, Sendable {
+        /// The band the gauge colors from.
+        let status: DietSemantics.Status
+        /// The goal outcome behind that band (met / short / over / no-goal).
+        let goalStatus: DietSemantics.GoalStatus
+        /// Whether the judged value breached a hard cap (the 70 g total-fat cap).
+        let hardOver: Bool
+        /// Where the color came from — today, the window's median, or today because the
+        /// window was too thin to assert a pattern.
+        let source: JudgmentSource
+        /// The value that was judged: the window median, or today's total otherwise.
+        let judgedValue: Double
+        /// Known days in the rolling window (0 on a daily judgment).
+        let daysKnown: Int
+    }
+
+    /// The band + goal outcome for ONE value under a nutrient's `dayGoal`, straight through
+    /// the daily gauge's own helpers. This is the single place the rolling verdict and the
+    /// daily one meet: both call this, so the thresholds exist once and the two can never
+    /// drift apart. A nutrient with no `dayGoal` (informational) or no usable target makes
+    /// NO claim.
+    static func bands(_ nutrient: TrendNutrient, value: Double, target: Double?)
+        -> (status: DietSemantics.Status, goalStatus: DietSemantics.GoalStatus, hardOver: Bool) {
+        guard let goal = nutrient.dayGoal else { return (.suspended, .noGoal, false) }
+        switch goal {
+        case .floor:
+            guard let target, target > 0 else { return (.suspended, .noGoal, false) }
+            return (DietSemantics.floorStatus(value: value, target: target),
+                    DietSemantics.floorGoalStatus(value: value, target: target), false)
+        case .ceiling:
+            guard let target, target > 0 else { return (.suspended, .noGoal, false) }
+            return (DietSemantics.ceilingStatus(value: value, target: target),
+                    DietSemantics.ceilingGoalStatus(value: value, target: target), false)
+        case .window:
+            // Total fat: the fixed 50–65 g window with its 70 g hard cap, independent of the
+            // day's target — the same band the normal-day fat gauge uses.
+            return (DietSemantics.fatWindowStatus(grams: value),
+                    DietSemantics.fatWindowGoalStatus(grams: value),
+                    value > DietSemantics.fatHardCap)
+        }
+    }
+
+    /// THE gauge verdict for one nutrient under its `judgmentWindow`.
+    ///
+    /// * A DAILY nutrient (protein, fiber, calories, carbs) is judged on `todayValue`
+    ///   through the very same helpers as before — byte-identical to the single-day path.
+    /// * A ROLLING nutrient is judged on the MEDIAN of the known days in its window: a
+    ///   ceiling reads green when the median sits comfortably under target, yellow near it,
+    ///   red over; a floor is the mirror; total fat reuses the fat window against the
+    ///   median. Gaps are never counted (see `analyze`).
+    /// * A rolling nutrient with FEWER than `minKnownForDirection` known days in the window
+    ///   has no pattern to assert, so it falls back to today's number and is marked
+    ///   `.thinWindow` — the UI says "not enough days yet" instead of claiming a trend.
+    /// * No `nutrientSeries` at all (an older bridge) → every nutrient is daily. No crash,
+    ///   no caption, no behavior change.
+    static func judgment(for nutrient: TrendNutrient, todayValue: Double,
+                         series: [NutrientDay]?, targets: DietTargets) -> NutrientJudgment {
+        let target = nutrient.target(in: targets)
+        let today = bands(nutrient, value: todayValue, target: target)
+        func daily(_ source: JudgmentSource, daysKnown: Int = 0) -> NutrientJudgment {
+            NutrientJudgment(status: today.status, goalStatus: today.goalStatus,
+                             hardOver: today.hardOver, source: source,
+                             judgedValue: todayValue, daysKnown: daysKnown)
+        }
+        // A nutrient that makes no claim today (informational, or no usable target) makes
+        // none over a window either — a caption there would advertise a verdict that isn't.
+        guard case .rolling(let days) = nutrient.judgmentWindow,
+              today.goalStatus != .noGoal,
+              let series, isAvailable(series),
+              let caption = nutrient.judgmentWindow.caption
+        else { return daily(.daily) }
+
+        let t = analyze(series, nutrient: nutrient, targets: targets, windowDays: days)
+        guard t.daysKnown >= minKnownForDirection, let median = t.median else {
+            return daily(.thinWindow(caption: caption, daysKnown: t.daysKnown),
+                         daysKnown: t.daysKnown)
+        }
+        let rolling = bands(nutrient, value: median, target: target)
+        return NutrientJudgment(status: rolling.status, goalStatus: rolling.goalStatus,
+                                hardOver: rolling.hardOver,
+                                source: .rolling(caption: caption, daysKnown: t.daysKnown),
+                                judgedValue: median, daysKnown: t.daysKnown)
+    }
+
+    // MARK: - Same-day blow-out (a separate signal, never the verdict)
+
+    /// Today's total at or above this multiple of a ceiling nutrient's DAILY target is a
+    /// blow-out: a single day loud enough to name even when the rolling color is green.
+    ///
+    /// 1.5 is the tuned line, not an arbitrary one. Against a 22 g saturated-fat target it
+    /// catches a 34 g day (a cheese board, a fatty cut) and leaves a mild 25 g day alone —
+    /// which is the whole point of buffering the color in the first place: if every 25 g day
+    /// raised a marker, the marker would mean "most days" and be ignored. The multiplier is
+    /// deliberately one number in one place, so it can be tuned after living with it.
+    static let blowoutMultiplier = 1.5
+
+    /// One nutrient's same-day blow-out: what it was, today's KNOWN total, and which line it
+    /// crossed. This NEVER feeds the rolling verdict — it is a parallel signal, so a green
+    /// 7-day color and a blow-out marker can (and should) coexist on the same row.
+    struct NutrientBlowout: Equatable, Sendable {
+        let nutrient: TrendNutrient
+        /// Today's KNOWN total (an unknown item is never a 0, so this is a lower bound).
+        let value: Double
+        /// The day's target the multiple is measured against, when the day carries one.
+        let target: Double?
+        /// `value / target`, nil for a nutrient judged only against a hard cap.
+        let multiple: Double?
+        /// True when a defined daily hard cap (total fat's 70 g) was crossed.
+        let overHardCap: Bool
+    }
+
+    /// Today's blow-out for one nutrient, or nil. Two independent triggers, either sufficient:
+    /// at/over `blowoutMultiplier` × the day's target (ceiling nutrients), or over a defined
+    /// daily hard cap (total fat's 70 g). A floor nutrient can never blow out.
+    static func blowout(_ nutrient: TrendNutrient, todayValue: Double,
+                        targets: DietTargets) -> NutrientBlowout? {
+        guard nutrient.hasSameDayCeiling else { return nil }
+        let target = nutrient.target(in: targets)
+        let overHardCap = nutrient.dailyHardCap.map { todayValue > $0 } ?? false
+        // The multiple is a CEILING nutrient's rule. Total fat's same-day line is its hard
+        // cap (a multiple of the fat target would sit far above it and never fire first).
+        let multiple: Double? = (nutrient.kind == .ceiling && (target ?? 0) > 0)
+            ? todayValue / target! : nil
+        guard overHardCap || (multiple ?? 0) >= blowoutMultiplier else { return nil }
+        return NutrientBlowout(nutrient: nutrient, value: todayValue, target: target,
+                               multiple: multiple, overHardCap: overHardCap)
+    }
+
+    /// Today's KNOWN total for one nutrient across the day's meals — the same unknown-aware
+    /// aggregate the daily gauges use (an item without the value is UNKNOWN, never a 0).
+    static func todayTotal(_ nutrient: TrendNutrient, meals: [DietMeal]) -> MicronutrientTotal {
+        DietSemantics.micronutrientTotal(for: meals, nutrient.value(in:))
+    }
+
+    /// Every nutrient that blew out TODAY, in canonical nutrient order. An untracked
+    /// nutrient (no item carried a value) never appears — unknown is not a blow-out.
+    static func blowouts(meals: [DietMeal], targets: DietTargets) -> [NutrientBlowout] {
+        TrendNutrient.allCases.compactMap { n in
+            guard n.hasSameDayCeiling else { return nil }
+            let agg = todayTotal(n, meals: meals)
+            guard agg.tracked else { return nil }
+            return blowout(n, todayValue: agg.knownSum, targets: targets)
+        }
+    }
+
+    /// The coach's SAME-DAY blow-out line, or nil on an ordinary day. Deliberately short and
+    /// distinct from the rolling rollup: the rollup is about persistent patterns, and a
+    /// median's whole job is to smooth a single loud day away — which is exactly the day the
+    /// coach should be able to mention. E.g.
+    /// "TODAY RAN HOT (one day, not a pattern): saturated fat 34 g (1.5x the 22 g target)."
+    static func blowoutLine(meals: [DietMeal], targets: DietTargets) -> String? {
+        let hits = blowouts(meals: meals, targets: targets)
+        guard !hits.isEmpty else { return nil }
+        let parts = hits.map { b -> String in
+            // "Fat" alone would read as a macro row; the same-day cap is on the TOTAL.
+            let name = b.nutrient == .f ? "total fat" : b.nutrient.fullName.lowercased()
+            let amount = "\(name) \(fmt(b.value)) \(b.nutrient.unit)"
+            if let m = b.multiple, m >= blowoutMultiplier, let t = b.target {
+                return "\(amount) (\(String(format: "%.1f", m))x the \(fmt(t)) \(b.nutrient.unit) target)"
+            }
+            if let cap = b.nutrient.dailyHardCap, b.overHardCap {
+                return "\(amount) (over the \(fmt(cap)) \(b.nutrient.unit) cap)"
+            }
+            return amount
+        }
+        return "TODAY RAN HOT (one day, not a pattern — the medians below smooth it away): "
+            + parts.joined(separator: "; ") + "."
+    }
+
     // MARK: - Top sources
 
     /// The foods that contributed the most of a nutrient over the meals the app has for the
@@ -748,8 +1025,9 @@ public enum NutrientTrends {
 
     /// The compact, plain-text multi-window nutrient rollup the coach receives on a
     /// diet-related turn, so it can reason over the week and month instead of a single day.
-    /// A framing sentence states the intent and the daily instruction; then one terse line
-    /// per nutrient across 7/30/all; then, for each STANDING problem, its consequence
+    /// A framing sentence states the intent and the daily instruction; then — on a day that
+    /// blew a ceiling — the one same-day line the medians cannot show (`blowoutLine`); then
+    /// one terse line per nutrient across 7/30/all; then, for each STANDING problem, its consequence
     /// (`whyItMatters`), the real top-contributing foods over the range, and its
     /// good-source foods so the coach grounds a fix in real foods. Everything is over KNOWN
     /// days only — a gap is never a low day.
@@ -793,6 +1071,12 @@ public enum NutrientTrends {
             + "season and already in their kitchen, and fitting the calorie deficit. Never "
             + "present a coverage gap as a low day."
 
+        // The same-day blow-out line rides at the FRONT of the greedy fit, ahead of every
+        // rolling line. It carries the one thing the windows structurally cannot: a single
+        // day loud enough to matter, which every median below is designed to smooth away.
+        // Under budget pressure the informational nutrient lines are dropped and this stays.
+        let hotLine = blowoutLine(meals: meals, targets: targets)
+
         // Build every candidate block, in priority order, then greedily fit the budget.
         var blocks: [String] = []
         for n in ranked {
@@ -816,7 +1100,7 @@ public enum NutrientTrends {
         var truncated = false
         func byteLen(_ parts: [String]) -> Int { parts.joined(separator: "\n").utf8.count }
         let reserve = 80 // room for the truncation note if we need it
-        for block in blocks + details {
+        for block in (hotLine.map { [$0] } ?? []) + blocks + details {
             if byteLen(kept + [block]) + reserve <= budgetBytes {
                 kept.append(block)
             } else {

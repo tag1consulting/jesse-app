@@ -27,6 +27,12 @@ enum DietSemantics {
     /// surface. Before this hour an unfilled floor is simply in progress, never a problem.
     static let nagHour = 16
 
+    /// The hour a SETTLED reading is judged at. A rolling verdict speaks to days that are
+    /// already finished, so the day-in-progress softening `nagHour` provides must not apply
+    /// to it: a week-long shortfall is not "still in progress, come back later". Numerically
+    /// the same end-of-day hour a past day is rendered at (`HistoryRender.endOfDayHour`).
+    static let settledHour = 24
+
     /// How far over a ceiling (as a fraction of its target), late in the day, escalates
     /// a nudge into the firmer "take note" tone — e.g. well over the calorie ceiling in
     /// the evening. Deliberately gentle: this is a heads-up, never an alarm.
@@ -343,7 +349,11 @@ enum DietSemantics {
     /// Build the five macro/calorie gauges plus the optional carbs-bonus line and
     /// the net-calorie split, from today's snapshot and the injected hour. This is
     /// what the screens render; no view recomputes any of it.
-    static func gauges(for today: DietToday, hour: Int) -> DietGauges {
+    ///
+    /// `series` is the decoded `nutrientSeries` history. Of the five, ONLY total fat on a
+    /// normal day is buffered by it (a 7-day window): calories, protein, carbs and fiber are
+    /// judged on today, deliberately. Absent → every gauge keeps the single-day behavior.
+    static func gauges(for today: DietToday, hour: Int, series: [NutrientDay]? = nil) -> DietGauges {
         let carbLoad = isCarbLoad(dayStyle: today.dayStyle, dayType: today.dayType)
         let t = today.targets
         let sum = dayTotals(today.meals)
@@ -394,7 +404,10 @@ enum DietSemantics {
             tone: tone(goalStatus: cGoal, hour: hour, target: (t.carbsBase ?? t.carbs), nearGoal: cStatus == .green),
             flag: nil, unit: "g", fraction: fraction(sum.c, cTarget))
 
-        // Fat: window on a normal day, minimize-it ceiling on a carb-load day.
+        // Fat: window on a normal day, minimize-it ceiling on a carb-load day. The carb-load
+        // branch stays judged on TODAY: it is a deliberate one-day goal (leave calorie room
+        // for carbs), and the history carries no day styles, so a rolling median there would
+        // judge a carb-load day by a week of normal ones.
         let fat: MetricGauge
         if carbLoad {
             let fTarget = t.fat ?? 0
@@ -407,16 +420,25 @@ enum DietSemantics {
                 flag: nil, unit: "g", fraction: fraction(sum.f, fTarget))
         } else {
             let fGoal = fatWindowGoalStatus(grams: sum.f)
-            // The 70g hard cap is the firmer line: a breach reads "take note", not a nudge.
-            let fatHardOver = sum.f > fatHardCap
+            // Total fat is BUFFERED: the color is the 7-day median's band against the same
+            // 50–65 g window, while the grams, the remaining phrase, the goal outcome and the
+            // after-4pm "under the 50 g floor" flag all stay today's. The 70 g hard cap is
+            // still the firmer line — a breach of it by the JUDGED value reads "take note",
+            // not a nudge; a breach by TODAY's value is the separate blow-out marker below.
+            let fJudged = NutrientTrends.judgment(for: .f, todayValue: sum.f,
+                                                  series: series, targets: t)
             fat = MetricGauge(
                 label: Macro.fat.displayName, goal: .window, value: sum.f, target: fatCap,
-                status: fatWindowStatus(grams: sum.f),
+                status: fJudged.status,
                 remaining: fatWindowRemaining(grams: sum.f),
                 goalStatus: fGoal,
-                tone: tone(goalStatus: fGoal, hour: hour, target: fatCap, hardOver: fatHardOver),
+                tone: tone(goalStatus: fJudged.goalStatus,
+                           hour: fJudged.source.isRolling ? settledHour : hour,
+                           target: fatCap, hardOver: fJudged.hardOver),
                 flag: fatLowFlag(fat: sum.f, hour: hour),
-                unit: "g", fraction: fraction(sum.f, fatCap))
+                unit: "g", fraction: fraction(sum.f, fatCap),
+                judgment: fJudged.source,
+                blowout: NutrientTrends.blowout(.f, todayValue: sum.f, targets: t) != nil)
         }
 
         // Fiber: floor, but suspended (shown plain) on a carb-load day.
@@ -464,15 +486,25 @@ enum DietSemantics {
     /// magnesium, and omega-3 are floors; total sugars and unsaturated fat are
     /// informational (never judged); an absent target shows the value only, with no
     /// judgment.
-    static func micronutrientGauges(for today: DietToday, hour: Int = 12) -> [MetricGauge] {
-        Micronutrient.allCases.map { micronutrientGauge($0, meals: today.meals, targets: today.targets, hour: hour) }
+    static func micronutrientGauges(for today: DietToday, hour: Int = 12,
+                                    series: [NutrientDay]? = nil) -> [MetricGauge] {
+        Micronutrient.allCases.map {
+            micronutrientGauge($0, meals: today.meals, targets: today.targets,
+                               hour: hour, series: series)
+        }
     }
 
     /// Build one micronutrient gauge from the day's items and targets. `hour` feeds the
     /// display tone the same way the macro gauges use it (a floor short before `nagHour`
     /// reads neutral, not as a problem).
+    ///
+    /// `series` is the decoded `nutrientSeries` history. When present, a BUFFERED nutrient
+    /// (sodium and saturated fat over 7 days; potassium, calcium, omega-3 and magnesium over
+    /// 30) takes its `status`/`tone` from that window's median instead of today alone, while
+    /// `value`, `remaining` and `goalStatus` stay today's — see `MetricGauge.judgment`.
+    /// Absent (an older bridge, or a past day) every nutrient keeps the single-day behavior.
     static func micronutrientGauge(_ n: Micronutrient, meals: [DietMeal], targets: DietTargets,
-                                   hour: Int = 12) -> MetricGauge {
+                                   hour: Int = 12, series: [NutrientDay]? = nil) -> MetricGauge {
         let agg = micronutrientTotal(for: meals, n.value(in:))
         let value = agg.knownSum
         let target = n.target(in: targets)
@@ -519,12 +551,50 @@ enum DietSemantics {
         case .window:
             break // not used by any micronutrient
         }
-        g.tone = tone(goalStatus: g.goalStatus, hour: hour, target: target, nearGoal: g.status == .green)
+        // The buffered nutrients' COLOR comes from their trailing window's median; the
+        // number, the remaining phrase and the goal outcome above stay today's. A daily
+        // nutrient, a thin window, or no series at all leaves this exactly as it was.
+        let trend = TrendNutrient(metric: .micronutrient(n))
+        let judged = NutrientTrends.judgment(for: trend, todayValue: value,
+                                             series: series, targets: targets)
+        g.status = judged.status
+        g.judgment = judged.source
+        g.blowout = NutrientTrends.blowout(trend, todayValue: value, targets: targets) != nil
+        g.tone = tone(goalStatus: judged.goalStatus,
+                      hour: judged.source.isRolling ? settledHour : hour,
+                      target: target, nearGoal: judged.status == .green,
+                      hardOver: judged.hardOver)
         return g
     }
 
     /// The neutral caption for a nutrient no item that day carried a value for.
     static let notTrackedCaption = "not tracked yet"
+
+    /// The window chip a BUFFERED row shows beside its label — "7d" / "30d". Present only
+    /// when the color really is that window's median, so a green color sitting next to a
+    /// number that looks high explains itself at a glance. Nil on a daily-judged row and on
+    /// a thin window (which is showing today's color and must not imply a pattern).
+    static func rollingChip(_ source: JudgmentSource) -> String? {
+        source.isRolling ? source.caption : nil
+    }
+
+    /// The one-line footnote under a buffered row, spelling out what the color means so the
+    /// chip is never the only signal (accessibility, and plain honesty about the split
+    /// between a rolling color and today's number). Nil on a daily-judged row.
+    static func judgmentNote(_ source: JudgmentSource) -> String? {
+        switch source {
+        case .daily:
+            return nil
+        case .rolling(let caption, let days):
+            return "color: \(caption) median of \(days) logged \(days == 1 ? "day" : "days") · number: today"
+        case .thinWindow(let caption, let days):
+            return "only \(days) logged \(days == 1 ? "day" : "days") — not enough for a \(caption) read, so this is today's"
+        }
+    }
+
+    /// The same-day blow-out marker's words. Shown alongside (never instead of) the rolling
+    /// color: the point is that one loud day is visible even when the window is fine.
+    static let blowoutCaption = "today ran hot — well past the day's line"
 
     /// The "N items not estimated" caption for a partial micronutrient total, or nil
     /// when the total is complete (every contributing item carried the value).
@@ -972,6 +1042,21 @@ struct MetricGauge: Equatable, Sendable {
     var partial: Bool = false
     var unknownItemCount: Int = 0
     var knownItemCount: Int? = nil
+    /// Where this row's COLOR came from (see `JudgmentSource`). `.daily` — today's number,
+    /// which is every gauge on an older bridge and always protein/fiber/calories/carbs.
+    /// `.rolling` — the buffered nutrients (saturated fat, sodium, total fat over 7 days;
+    /// calcium, omega-3, magnesium, potassium over 30), where the color is the window
+    /// median's band and the caption names the window.
+    ///
+    /// `value`, `remaining`, `goalStatus`, `partial` and the flags ALWAYS stay TODAY's, on
+    /// every gauge — only `status` and `tone` follow the window. That split is the whole
+    /// design: the number you ate today, colored by the pattern it belongs to.
+    var judgment: JudgmentSource = .daily
+    /// Today blew through a ceiling: at/over `NutrientTrends.blowoutMultiplier` × the day's
+    /// target, or over a defined daily hard cap (total fat's 70 g). A SEPARATE signal that
+    /// never touches `status`/`tone` — a green rolling color and this marker coexist by
+    /// design, because that is precisely the day the rolling median hides.
+    var blowout: Bool = false
 }
 
 /// The exercise carb add-back — extra carb budget earned by exercise, optional

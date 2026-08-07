@@ -176,6 +176,20 @@ struct MacroRing: View {
                     Text(gauge.goal.glyph)
                         .font(.caption2.weight(.bold))
                         .foregroundStyle(.secondary)
+                    // Fat is the one buffered ring: name its window so the color isn't read
+                    // as a verdict on today's grams.
+                    if let chip = DietSemantics.rollingChip(gauge.judgment) {
+                        Text(chip)
+                            .font(.caption2.monospacedDigit())
+                            .foregroundStyle(.tertiary)
+                            .lineLimit(1)
+                            .minimumScaleFactor(0.7)
+                    }
+                    if gauge.blowout {
+                        Image(systemName: "flame.fill")
+                            .font(.caption2)
+                            .foregroundStyle(.orange)
+                    }
                 }
             }
             .frame(maxWidth: .infinity)
@@ -183,7 +197,7 @@ struct MacroRing: View {
         }
         .buttonStyle(.plain)
         .accessibilityElement(children: .combine)
-        .accessibilityLabel("\(gauge.label): \(HealthRing.centerLabel(gauge)), \(gauge.remaining)")
+        .accessibilityLabel(HealthRing.accessibilityLabel(gauge))
     }
 }
 
@@ -492,6 +506,15 @@ struct MetricBarRow: View {
                     Text(gauge.label)
                         .font((isSubEntry ? Font.footnote : .subheadline).weight(.semibold))
                         .foregroundStyle(isSubEntry ? AnyShapeStyle(.secondary) : AnyShapeStyle(.primary))
+                    // A buffered row's color is its window's median, not today's number —
+                    // the chip says which window, right next to the name.
+                    if let chip = DietSemantics.rollingChip(gauge.judgment) {
+                        Text(chip)
+                            .font(.caption2.weight(.semibold).monospacedDigit())
+                            .padding(.horizontal, 5).padding(.vertical, 1)
+                            .background(Capsule().fill(Color.dietSubtleFill))
+                            .foregroundStyle(.secondary)
+                    }
                     Spacer()
                     Text(valueTarget).font(.subheadline.monospacedDigit())
                         .foregroundStyle(toneColor(gauge.tone))
@@ -512,6 +535,17 @@ struct MetricBarRow: View {
                 if let cap = DietSemantics.partialCaption(unknownItemCount: gauge.unknownItemCount) {
                     Label(cap, systemImage: "questionmark.circle")
                         .font(.caption2).foregroundStyle(.secondary)
+                }
+                // What the color is reading — the window's median, or today because the
+                // window is too thin to claim a pattern.
+                if let note = DietSemantics.judgmentNote(gauge.judgment) {
+                    Text(note).font(.caption2).foregroundStyle(.tertiary)
+                }
+                // One loud day, shown even when the rolling color is green — that is exactly
+                // the day a median hides.
+                if gauge.blowout {
+                    Label(DietSemantics.blowoutCaption, systemImage: "flame")
+                        .font(.caption2.weight(.semibold)).foregroundStyle(.orange)
                 }
                 if let flag = gauge.flag {
                     Label(flag, systemImage: "clock.badge.exclamationmark")

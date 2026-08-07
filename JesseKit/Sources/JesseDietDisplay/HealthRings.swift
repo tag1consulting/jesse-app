@@ -29,6 +29,16 @@ enum HealthRing {
     static func centerLabel(_ gauge: MetricGauge) -> String {
         "\(DietSemantics.fmt(gauge.value))\(gauge.unit)"
     }
+
+    /// A ring's spoken label. Color is never the only signal, so a buffered ring says which
+    /// window its color is reading and a blow-out day says so in words — a VoiceOver user
+    /// gets exactly what the chip and the flame glyph convey.
+    static func accessibilityLabel(_ gauge: MetricGauge) -> String {
+        var out = "\(gauge.label): \(centerLabel(gauge)), \(gauge.remaining)"
+        if let note = DietSemantics.judgmentNote(gauge.judgment) { out += ". \(note)" }
+        if gauge.blowout { out += ". \(DietSemantics.blowoutCaption)" }
+        return out
+    }
 }
 
 enum CaloriesHero {

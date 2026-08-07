@@ -1,5 +1,7 @@
 import XCTest
 @testable import Jesse
+import JesseDietDisplay
+import JesseNetworking
 
 /// Pure-logic tests for the two-section health context: the daily-summary formatter
 /// (each metric present/absent, nap labeling, fixed order, recency windows), the
@@ -435,5 +437,50 @@ final class HealthContextTests: XCTestCase {
     func testGatherEmptyFetchesYieldEmptySnapshot() async {
         let snap = await HealthContextGather.snapshot(.empty)
         XCTAssertEqual(snap, .empty)
+    }
+
+    // MARK: - Diet rollup composition: the same-day blow-out line
+
+    /// A 30-day history where saturated fat sits quietly under its ceiling — the pattern a
+    /// median would (rightly) call fine, which is exactly why one loud day needs its own line.
+    private func quietSatFatMonth() -> [NutrientDay] {
+        var cal = Calendar(identifier: .gregorian)
+        cal.timeZone = utc
+        let f = DateFormatter()
+        f.calendar = cal
+        f.timeZone = utc
+        f.dateFormat = "yyyy-MM-dd"
+        let end = f.date(from: "2026-07-04")!
+        return (0..<30).reversed().map { back in
+            NutrientDay(date: f.string(from: cal.date(byAdding: .day, value: -back, to: end)!),
+                        nutrients: ["cal": NutrientDayValue(sum: 2100, known: 6, unknown: 0),
+                                    "satf": NutrientDayValue(sum: 14, known: 2, unknown: 0)])
+        }
+    }
+
+    func testCombinedGroundingCarriesTheBlowoutLineUnderTheCap() throws {
+        let targets = DietTargets(satFat: 22, magnesium: 400)
+        let meals = [DietMeal(name: "Dinner", time: "19:00",
+                              items: [DietItem(item: "Cheese board", satf: 34)])]
+        let rollup = NutrientTrends.coachRollup(series: quietSatFatMonth(), targets: targets,
+                                                meals: meals)
+        XCTAssertTrue(rollup.contains("TODAY RAN HOT"), rollup)
+        // Composed with a full-size HealthKit block, the whole context stays under the
+        // ceiling that keeps it inside the bridge's 8 KiB cap.
+        let health = String(repeating: "x", count: 3 * 1024)
+        let combined = try XCTUnwrap(DietContextComposer.combine(healthBlock: health,
+                                                                 dietRollup: rollup))
+        XCTAssertTrue(combined.contains("TODAY RAN HOT"))
+        XCTAssertLessThanOrEqual(combined.utf8.count, DietContextComposer.maxBytes)
+    }
+
+    func testAnOrdinaryDayAddsNoBlowoutLine() {
+        let targets = DietTargets(satFat: 22)
+        let meals = [DietMeal(name: "Dinner", time: "19:00",
+                              items: [DietItem(item: "Salmon and rice", satf: 5)])]
+        let rollup = NutrientTrends.coachRollup(series: quietSatFatMonth(), targets: targets,
+                                                meals: meals)
+        XCTAssertFalse(rollup.contains("TODAY RAN HOT"))
+        XCTAssertFalse(rollup.isEmpty, "the rolling rollup is unaffected")
     }
 }

@@ -15,6 +15,74 @@ CI both run it). See the "Versioning" section of `bridge/README.md`.
 
 ## [Unreleased]
 
+## [App 1.0 (90)] - 2026-08-07
+
+### Changed
+
+- **A buffered nutrient's gauge colour is now a trailing rolling read, while the number
+  it shows stays today's.** The Health tab judged every nutrient the same way — today's
+  total against today's target — and for the nutrients that actually buffer that is the
+  wrong question. One cheese board turned saturated fat red on a body whose week was
+  fine, and a gauge that cries wolf on a Tuesday is a gauge that gets ignored on the
+  Tuesday that matters. Which window each nutrient is judged over is now a property of
+  the nutrient model itself (`TrendNutrient.judgmentWindow`), one source of truth beside
+  `kind` and `dayGoal`:
+
+  - **Daily** — protein, fiber, calories, carbs. Protein and fiber are daily
+    DELIBERATELY: a floor averaged over a week hides the low days that are exactly the
+    ones that cost lean mass and recovery in a deficit, and a floor you must clear today
+    cannot be paid back on Friday.
+  - **Rolling 7 days** — saturated fat, sodium, total fat. LDL and blood pressure answer
+    to the week, not to one meal.
+  - **Rolling 30 days** — calcium, omega-3, magnesium, potassium. These are stored and
+    regulated over weeks, and they are the nutrients labels most often omit, so a week
+    rarely holds enough KNOWN days to say anything at all.
+
+  The verdict itself is `NutrientTrends.judgment(for:todayValue:series:targets:)`, pure
+  and gap-aware like everything else in that engine: it runs `analyze` over the window
+  and bands the MEDIAN of the KNOWN days through the very same
+  `floorStatus`/`ceilingStatus`/`fatWindowStatus` helpers the daily gauges use, so the
+  thresholds exist in exactly one place. A gap day is never a 0 and never a low day.
+  Below the engine's existing six-known-day floor there is no pattern to assert, so the
+  colour falls back to today's and the row says why ("only 4 logged days — not enough
+  for a 7d read, so this is today's") rather than claiming a trend it cannot support.
+
+  On the row, only `status` and `tone` follow the window: the value, the remaining
+  phrase ("12g over"), the goal outcome, the partial "≥" and the gated flags all stay
+  today's. A "7d"/"30d" chip sits beside the label and a caption spells the split out,
+  because a green colour next to a number that looks high is only honest if the window
+  is named. Paging back to a past day judges that day on its own numbers — a window
+  anchored near today must not colour a day it ends after.
+
+### Added
+
+- **A same-day blow-out marker for the ceiling nutrients**, so buffering the colour
+  never buries a genuinely loud day. Today's known total at or over
+  `NutrientTrends.blowoutMultiplier` (1.5) × the day's target — or over a defined daily
+  hard cap, which is how total fat's 70 g line is enforced — raises a flame on the row
+  and a flag on the gauge model. 1.5 is tuned, not arbitrary: against a 22 g
+  saturated-fat target it catches a 34 g day and leaves a mild 25 g day alone, because a
+  marker that fired on most days would mean nothing. It never touches the rolling
+  verdict — a green 7-day colour and a blow-out marker coexist by design, since that is
+  precisely the day a median hides.
+
+- **The coach hears about that day the same day.** `NutrientTrends.coachRollup` now
+  opens, on a blown-out day only, with one short line ahead of every rolling line:
+  "TODAY RAN HOT (one day, not a pattern — the medians below smooth it away): saturated
+  fat 34 g (1.5x the 22 g target)." It sits at the FRONT of the existing greedy budget
+  fit, so under pressure the informational nutrient lines are dropped and it survives;
+  the combined `health_context` stays inside the same ceiling as before.
+
+- Tests: the window table for all thirteen nutrients; a ceiling whose week reads green
+  through a red day and the mirror; medians over known days only with gaps inside the
+  window; the thin-coverage fallback; a regression guard that protein, fiber, calories
+  and carbs are byte-identical to the pre-change single-day gauges with a history
+  attached; the blow-out at 1.5x and not at 1.49x, the hard cap firing independently,
+  and a green rolling colour coexisting with the flag; the coach line present on a hot
+  day, absent on an ordinary one, and surviving a tight budget that drops the
+  informational lines; and the graceful degrade — an older bridge with no
+  `nutrientSeries` reverts every gauge to single-day behaviour.
+
 ## [Bridge 0.64.0] - 2026-08-06
 
 ### Added

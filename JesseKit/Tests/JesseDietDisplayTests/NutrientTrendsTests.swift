@@ -416,4 +416,287 @@ final class NutrientTrendsTests: XCTestCase {
         XCTAssertFalse(trend.hasData)
         XCTAssertTrue(N.verdict(trend).contains("no known"))
     }
+
+    // MARK: - Judgment window (which nutrients buffer, and which deliberately don't)
+
+    func testDailyNutrientsAreTheOnesAWeekWouldHide() {
+        // Protein and fiber are floors in a deficit: a week's median hides the thin days
+        // that are exactly the ones that cost lean mass. Calories and carbs are the day's
+        // plan. None of the four may carry a window caption.
+        for n in [TrendNutrient.p, .fiber, .cal, .c] {
+            XCTAssertEqual(n.judgmentWindow, .daily, "\(n.fullName) must stay judged on the day")
+            XCTAssertNil(n.judgmentWindow.days)
+            XCTAssertNil(n.judgmentWindow.caption, "a daily gauge has no window to caption")
+            XCTAssertFalse(n.judgmentWindow.isRolling)
+        }
+    }
+
+    func testTheBufferedFatsAndSodiumRollOverAWeek() {
+        for n in [TrendNutrient.satf, .na, .f] {
+            XCTAssertEqual(n.judgmentWindow, .rolling(days: 7), "\(n.fullName) buffers over a week")
+            XCTAssertEqual(n.judgmentWindow.days, 7)
+            XCTAssertEqual(n.judgmentWindow.caption, "7d")
+            XCTAssertTrue(n.judgmentWindow.isRolling)
+        }
+    }
+
+    func testTheStoredMineralsRollOverAMonth() {
+        for n in [TrendNutrient.ca, .o3, .mg, .k] {
+            XCTAssertEqual(n.judgmentWindow, .rolling(days: 30), "\(n.fullName) buffers over a month")
+            XCTAssertEqual(n.judgmentWindow.caption, "30d")
+        }
+    }
+
+    func testEveryNutrientAnswersTheWindowQuestion() {
+        // All thirteen, no gaps: the informational pair answer `.daily` because the property
+        // is total, and their verdict is never consulted (they carry no `dayGoal`).
+        let expected: [TrendNutrient: JudgmentWindow] = [
+            .cal: .daily, .p: .daily, .c: .daily, .fiber: .daily,
+            .satf: .rolling(days: 7), .na: .rolling(days: 7), .f: .rolling(days: 7),
+            .ca: .rolling(days: 30), .o3: .rolling(days: 30),
+            .mg: .rolling(days: 30), .k: .rolling(days: 30),
+            .sug: .daily, .unsat: .daily,
+        ]
+        XCTAssertEqual(expected.count, TrendNutrient.allCases.count)
+        for n in TrendNutrient.allCases {
+            XCTAssertEqual(n.judgmentWindow, expected[n], "\(n.fullName)")
+        }
+        XCTAssertNil(TrendNutrient.sug.dayGoal, "informational — no verdict to window")
+        XCTAssertNil(TrendNutrient.unsat.dayGoal)
+    }
+
+    // MARK: - Rolling verdict (the gauge's colour)
+
+    /// A 7-day saturated-fat series with the given per-day values (nil = a GAP day, which
+    /// still logged food). Ends on the most recent date, so the 7-day window covers it all.
+    private func satfWeek(_ values: [Double?]) -> [NutrientDay] {
+        let d = dates(from: "2026-07-01", count: values.count)
+        return zip(d, values).map { date, v in
+            var nutrients: [String: NutrientDayValue] = ["cal": val(2000, known: 5)]
+            if let v { nutrients["satf"] = val(v) }
+            return NutrientDay(date: date, nutrients: nutrients)
+        }
+    }
+
+    func testCeilingRollingGreenEvenWhenTodayIsOver() {
+        // Median of the week is 15 g against a 22 g ceiling (68% — comfortably under), while
+        // TODAY sits at 34 g. The colour follows the week; the daily band would have been red.
+        let series = satfWeek([10, 12, 14, 15, 16, 18, 34])
+        let t = targets { $0.satFat = 22 }
+        let j = N.judgment(for: .satf, todayValue: 34, series: series, targets: t)
+        XCTAssertEqual(j.status, .green)
+        XCTAssertEqual(j.judgedValue, 15, "the median of the known days, not today")
+        XCTAssertEqual(j.daysKnown, 7)
+        XCTAssertEqual(j.source, .rolling(caption: "7d", daysKnown: 7))
+        XCTAssertTrue(j.source.isRolling)
+        // The single-day path it replaced still reads red on today's number.
+        XCTAssertEqual(DietSemantics.ceilingStatus(value: 34, target: 22), .red)
+    }
+
+    func testCeilingRollingRedEvenWhenTodayIsUnder() {
+        // The mirror: a week that sits over the ceiling stays red on a good day.
+        let series = satfWeek([30, 32, 28, 26, 31, 29, 10])
+        let t = targets { $0.satFat = 22 }
+        let j = N.judgment(for: .satf, todayValue: 10, series: series, targets: t)
+        XCTAssertEqual(j.status, .red)
+        XCTAssertEqual(j.judgedValue, 29)
+        XCTAssertEqual(DietSemantics.ceilingStatus(value: 10, target: 22), .green,
+                       "today alone would have read green")
+    }
+
+    func testRollingMedianIsOverKnownDaysOnlyAndNeverCountsAGap() {
+        // Two GAP days inside the window: they are neither 0 nor a low day. The median is
+        // over the five KNOWN days (28, 29, 30, 31, 32 → 30), not over seven with phantom 0s.
+        let series = satfWeek([28, nil, 29, 30, nil, 31, 32])
+        let t = targets { $0.satFat = 22 }
+        let month = N.analyze(series, nutrient: .satf, targets: t, windowDays: 7)
+        XCTAssertEqual(month.daysKnown, 5)
+        XCTAssertEqual(month.daysInWindow, 7, "the gap days still logged food")
+        XCTAssertEqual(month.median, 30)
+        // Five known days is below the engine's floor, so no pattern may be asserted.
+        let j = N.judgment(for: .satf, todayValue: 32, series: series, targets: t)
+        XCTAssertEqual(j.source, .thinWindow(caption: "7d", daysKnown: 5))
+    }
+
+    func testFloorRollingIsTheMirrorOverThirtyDays() {
+        // Magnesium known on 8 of 30 days, median 150 against a 400 mg floor → red, even
+        // though TODAY cleared the floor outright.
+        let d = dates(from: "2026-06-10", count: 30)
+        let series = d.enumerated().map { i, date -> NutrientDay in
+            var nutrients: [String: NutrientDayValue] = ["cal": val(2000, known: 5)]
+            if i >= 22 { nutrients["mg"] = val(i == 29 ? 500 : 150) }
+            return NutrientDay(date: date, nutrients: nutrients)
+        }
+        let t = targets { $0.magnesium = 400 }
+        let j = N.judgment(for: .mg, todayValue: 500, series: series, targets: t)
+        XCTAssertEqual(j.status, .red)
+        XCTAssertEqual(j.judgedValue, 150)
+        XCTAssertEqual(j.source, .rolling(caption: "30d", daysKnown: 8))
+        XCTAssertEqual(DietSemantics.floorStatus(value: 500, target: 400), .green,
+                       "today alone would have read green")
+    }
+
+    func testThinWindowFallsBackToTodayAndSaysSo() {
+        // Five known days is one short of the engine's minimum, so the verdict is TODAY's
+        // band and the source records that the window was too thin to speak.
+        XCTAssertEqual(N.minKnownForDirection, 6)
+        let series = satfWeek([10, 12, 14, 15, 16, nil, nil])
+        let t = targets { $0.satFat = 22 }
+        let j = N.judgment(for: .satf, todayValue: 40, series: series, targets: t)
+        XCTAssertEqual(j.source, .thinWindow(caption: "7d", daysKnown: 5))
+        XCTAssertTrue(j.source.isThinWindow)
+        XCTAssertFalse(j.source.isRolling)
+        XCTAssertEqual(j.status, DietSemantics.ceilingStatus(value: 40, target: 22))
+        XCTAssertEqual(j.judgedValue, 40, "the fallback judges today's number")
+    }
+
+    func testDailyNutrientsAreUnchangedByAnySeries() {
+        // A protein series that would read green over a week must not colour a thin day:
+        // the daily nutrients never consult the history at all.
+        let d = dates(from: "2026-07-01", count: 7)
+        let series = d.map { NutrientDay(date: $0, nutrients: ["p": val(200)]) }
+        let t = targets { $0.protein = 190; $0.fiber = 38 }
+        let p = N.judgment(for: .p, todayValue: 40, series: series, targets: t)
+        XCTAssertEqual(p.source, .daily)
+        XCTAssertEqual(p.status, DietSemantics.floorStatus(value: 40, target: 190))
+        XCTAssertEqual(p.status, .red)
+        XCTAssertEqual(p.judgedValue, 40)
+        let fiber = N.judgment(for: .fiber, todayValue: 10, series: series, targets: t)
+        XCTAssertEqual(fiber.source, .daily)
+        XCTAssertEqual(fiber.status, DietSemantics.floorStatus(value: 10, target: 38))
+    }
+
+    func testNoSeriesMeansEveryNutrientIsJudgedOnTheDay() {
+        // An older bridge sends no `nutrientSeries` — every nutrient degrades to the
+        // single-day band, with no caption and no crash.
+        let t = targets { $0.satFat = 22; $0.magnesium = 400 }
+        for (n, value) in [(TrendNutrient.satf, 34.0), (.mg, 150.0), (.f, 80.0)] {
+            for series in [nil, []] as [[NutrientDay]?] {
+                let j = N.judgment(for: n, todayValue: value, series: series, targets: t)
+                XCTAssertEqual(j.source, .daily, "\(n.fullName)")
+                XCTAssertNil(j.source.caption)
+                XCTAssertEqual(j.judgedValue, value)
+            }
+        }
+    }
+
+    func testTotalFatRollsTheFixedWindowAgainstTheMedian() {
+        // Total fat reuses the 50–65 g window (its hard cap at 70) against the week's
+        // median: a 58 g median reads green through a single 95 g day.
+        let d = dates(from: "2026-07-01", count: 7)
+        let values: [Double] = [55, 57, 58, 58, 60, 62, 95]
+        let series = zip(d, values).map { NutrientDay(date: $0, nutrients: ["f": val($1)]) }
+        let j = N.judgment(for: .f, todayValue: 95, series: series, targets: DietTargets())
+        XCTAssertEqual(j.judgedValue, 58)
+        XCTAssertEqual(j.status, .green)
+        XCTAssertFalse(j.hardOver, "the MEDIAN is nowhere near the 70 g cap")
+        XCTAssertEqual(j.source, .rolling(caption: "7d", daysKnown: 7))
+    }
+
+    // MARK: - Same-day blow-out (a separate signal from the rolling verdict)
+
+    func testBlowoutFiresAtTheMultiplierAndNotJustUnderIt() throws {
+        let t = targets { $0.satFat = 20 }
+        XCTAssertEqual(N.blowoutMultiplier, 1.5)
+        let hit = try XCTUnwrap(N.blowout(.satf, todayValue: 30, targets: t))
+        XCTAssertEqual(hit.multiple, 1.5)
+        XCTAssertEqual(hit.value, 30)
+        XCTAssertFalse(hit.overHardCap)
+        XCTAssertNil(N.blowout(.satf, todayValue: 29.8, targets: t), "1.49x is not a blow-out")
+    }
+
+    func testBlowoutCatchesTheRealDayAndLeavesTheMildOneAlone() {
+        // The tuning claim, asserted: against a 22 g target a 34 g day is named and a mild
+        // 25 g day is not.
+        let t = targets { $0.satFat = 22 }
+        XCTAssertNotNil(N.blowout(.satf, todayValue: 34, targets: t))
+        XCTAssertNil(N.blowout(.satf, todayValue: 25, targets: t))
+    }
+
+    func testHardCapTriggersIndependentlyOfAnyTarget() throws {
+        // Total fat has no ceiling target at all — its same-day line is the 70 g hard cap.
+        XCTAssertEqual(TrendNutrient.f.dailyHardCap, DietSemantics.fatHardCap)
+        let hit = try XCTUnwrap(N.blowout(.f, todayValue: 78, targets: DietTargets()))
+        XCTAssertTrue(hit.overHardCap)
+        XCTAssertNil(hit.multiple, "fat is judged against the cap, not a multiple")
+        XCTAssertNil(N.blowout(.f, todayValue: 70, targets: DietTargets()), "at the cap is not over it")
+    }
+
+    func testAFloorNutrientCanNeverBlowOut() {
+        let t = targets { $0.magnesium = 400; $0.sugar = 50 }
+        XCTAssertFalse(TrendNutrient.mg.hasSameDayCeiling)
+        XCTAssertNil(N.blowout(.mg, todayValue: 4000, targets: t))
+        XCTAssertNil(N.blowout(.sug, todayValue: 500, targets: t), "informational — no line to cross")
+    }
+
+    func testBlowoutDoesNotMoveTheRollingVerdict() {
+        // The same green week as above, with today at 34 g: the verdict stays green AND the
+        // blow-out is flagged. Both signals, neither overwriting the other.
+        let series = satfWeek([10, 12, 14, 15, 16, 18, 34])
+        let t = targets { $0.satFat = 22 }
+        let j = N.judgment(for: .satf, todayValue: 34, series: series, targets: t)
+        XCTAssertEqual(j.status, .green)
+        XCTAssertNotNil(N.blowout(.satf, todayValue: 34, targets: t))
+    }
+
+    // MARK: - Coach grounding: the same-day line
+
+    private func hotMeals() -> [DietMeal] {
+        [DietMeal(name: "Dinner", time: "19:00", items: [
+            DietItem(item: "Cheese board", na: 900, satf: 34),
+            DietItem(item: "Bread"), // unknown — never a 0, never inflates the day
+        ])]
+    }
+
+    func testBlowoutLineNamesTheDayAndItsMultiple() throws {
+        let t = targets { $0.satFat = 22; $0.sodium = 2300 }
+        let line = try XCTUnwrap(N.blowoutLine(meals: hotMeals(), targets: t))
+        XCTAssertTrue(line.hasPrefix("TODAY RAN HOT"))
+        XCTAssertTrue(line.contains("saturated fat 34 g (1.5x the 22 g target)"), line)
+        XCTAssertFalse(line.contains("sodium"), "900 mg against a 2300 mg ceiling is not hot")
+    }
+
+    func testBlowoutLineIsAbsentOnAnOrdinaryDay() {
+        let t = targets { $0.satFat = 22; $0.sodium = 2300 }
+        let meals = [DietMeal(name: "Dinner", time: "19:00", items: [
+            DietItem(item: "Chicken and rice", na: 700, satf: 6),
+        ])]
+        XCTAssertNil(N.blowoutLine(meals: meals, targets: t))
+    }
+
+    func testBlowoutLineNamesAHardCapBreachInItsOwnWords() throws {
+        let meals = [DietMeal(name: "Dinner", time: nil, items: [DietItem(item: "Fry-up", f: 78, satf: 8)])]
+        let t = targets { $0.satFat = 22 }
+        let line = try XCTUnwrap(N.blowoutLine(meals: meals, targets: t))
+        XCTAssertTrue(line.contains("total fat 78 g (over the 70 g cap)"), line)
+    }
+
+    func testCoachRollupCarriesTheSameDayLineAlongsideTheWindows() {
+        let t = targets { $0.magnesium = 400; $0.satFat = 22 }
+        let rollup = N.coachRollup(series: coachSeries(), targets: t, meals: hotMeals())
+        XCTAssertTrue(rollup.contains("TODAY RAN HOT"))
+        XCTAssertTrue(rollup.contains("Magnesium"), "the rolling rollup is still there")
+        XCTAssertLessThanOrEqual(rollup.utf8.count, N.coachRollupBudget)
+        // An ordinary day adds nothing.
+        let calm = N.coachRollup(series: coachSeries(), targets: t, meals: [])
+        XCTAssertFalse(calm.contains("TODAY RAN HOT"))
+    }
+
+    func testTightBudgetDropsInformationalLinesBeforeTheSameDayLine() {
+        // A budget too small for the whole set: the one-day line survives and the
+        // lower-priority nutrient lines are the ones that go.
+        let t = targets { $0.magnesium = 400; $0.satFat = 22; $0.sugar = 50 }
+        let series = coachSeries().map { day -> NutrientDay in
+            var n = day.nutrients
+            n["sug"] = val(60)
+            n["unsat"] = val(30)
+            return NutrientDay(date: day.date, nutrients: n)
+        }
+        let rollup = N.coachRollup(series: series, targets: t, meals: hotMeals(), budgetBytes: 900)
+        XCTAssertTrue(rollup.contains("TODAY RAN HOT"), rollup)
+        XCTAssertTrue(rollup.contains("truncated"))
+        XCTAssertFalse(rollup.contains("Total Sugars"), "informational lines go first")
+        XCTAssertFalse(rollup.contains("Unsaturated Fat"))
+        XCTAssertLessThanOrEqual(rollup.utf8.count, 900)
+    }
 }

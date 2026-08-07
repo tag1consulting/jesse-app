@@ -17,7 +17,11 @@ struct TodayScreen: View {
     // The engine's current-hour: real clock for today, end-of-day (24) for a past
     // day so time-gated flags are fully resolved rather than clock-suppressed.
     private var hour: Int { HistoryRender.engineHour(isHistorical: snapshot.isHistorical, clockHour: clockHour) }
-    private var gauges: DietGauges { DietSemantics.gauges(for: today, hour: hour) }
+    private var gauges: DietGauges { DietSemantics.gauges(for: today, hour: hour, series: judgeSeries) }
+    /// The history the BUFFERED gauges take their color from — only ever today's. Paging
+    /// back must not color a past day from a window that ends after it, so a historical day
+    /// judges on its own numbers alone (the same fallback an older bridge gets).
+    private var judgeSeries: [NutrientDay]? { snapshot.isHistorical ? nil : snapshot.nutrientSeries }
     private var totals: MacroTotals { DietSemantics.dayTotals(today.meals) }
     private var net: NetCalories { NetCalories(intake: totals.cal, burned: DietSemantics.burnedCalories(today.exercise)) }
     // A reconstructed day renders with NO judgment; live/archived render full.
@@ -260,7 +264,8 @@ struct TodayScreen: View {
         Section {
             NavigationLink {
                 MacrosCaloriesDetail(today: today, hour: hour, neutral: isNeutral,
-                                     nutrientSeries: snapshot.nutrientSeries)
+                                     nutrientSeries: snapshot.nutrientSeries,
+                                     isHistorical: snapshot.isHistorical)
             } label: {
                 NavRow(title: "Macros & calories", icon: "chart.bar.fill",
                        subtitle: macrosSubtitle)
