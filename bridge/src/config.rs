@@ -220,6 +220,46 @@ pub const DEFAULT_MAX_ATTACHMENTS_TOTAL_BYTES: usize = 20 * 1024 * 1024;
 // `browser_wait_for` is NOT filler: the bot walls that block `WebFetch` clear only
 // after a delay, and without it the browser returns a 403 interstitial on exactly
 // the pages it was added to read (measured on stackoverflow.com, 2026-08-07).
+//
+// HOME ASSISTANT: twenty-one of twenty-one — the ENTIRE advertised surface, and the
+// only server here granted whole. That is an explicit operator decision, not an
+// oversight and not a default: full house control was asked for knowingly, against
+// the stated risk that the browser above makes a prompt-injected page a route to
+// physical actuation. Nothing is omitted because nothing on this server is both
+// dangerous and unused — the three read intents (`GetLiveContext`, `GetDateTime`,
+// `todo_get_items`) and the eighteen control intents are the capability.
+//
+// WHAT "FULL CONTROL" ACTUALLY REACHES IS DECIDED IN HOME ASSISTANT, NOT HERE, and
+// that is the load-bearing half a reader will miss. These intents act only on
+// entities HA EXPOSES to its Assist API (Settings → Voice Assistants → Expose);
+// an unexposed entity is invisible to every tool below. Enumerated live on
+// 2026-08-07: 388 of the installation's 1199 entities are exposed — 282 lights, 36
+// switches, 23 climate, 18 media_player, 16 binary_sensor, 8 sensor, 4 cover, 1
+// todo. There is NO `lock` and NO `alarm_control_panel` entity in the whole
+// installation, so "locks and alarm" are not granted by this list and cannot be:
+// they do not exist. The entrance gate DOES, as `switch.cancello_ingresso`, and it
+// is exposed — so `HassTurnOn`/`HassTurnOff` move it. Changing that reach is an HA
+// Expose edit, not a bridge change.
+//
+// Note `HassTurnOn`/`HassTurnOff` are multiplexers over every exposed domain (their
+// own descriptions say they lock/unlock a lock and open/close a cover), which is
+// why granting them IS granting the gate. There is no narrower intent to prefer.
+//
+// ROON: six of six, also whole, for a different and much duller reason — the server
+// advertises exactly six tools and all six are music. `hifi_zones`,
+// `hifi_now_playing`, `hifi_search` and `hifi_status` are `readOnlyHint`; the two
+// that act (`hifi_control`, `hifi_play`) start, stop and queue playback. The
+// `hifi_hqplayer_*` tools the upstream README documents are NOT advertised by the
+// running server and so are not omitted here — HQPlayer is not connected, and
+// tools/list returns six, not more. If HQPlayer is ever connected the surface grows
+// upstream and this list must be revisited against a fresh enumeration.
+//
+// NEITHER SERVER ANNOTATES ANY TOOL `destructive`, which is worth stating because it
+// is the opposite of what one would assume from a list that can open a gate: HA
+// ships no annotations at all, Roon ships only `readOnlyHint`. So nothing downstream
+// may infer "safe" from a missing `destructiveHint` — the bridge sets
+// `default_tools_approval_mode="approve"` per server unconditionally (see
+// `codex_mcp_args`), and this allowlist, not an annotation, is the boundary.
 pub const DEFAULT_ALLOWED_TOOLS: &str = "Read(./**),Write(./**),Edit(./**),Grep(./**),Glob(./**),\
 mcp__qmd__query,mcp__qmd__get,mcp__qmd__multi_get,mcp__qmd__status,\
 Skill(diet-logging),\
@@ -241,7 +281,21 @@ mcp__browser__browser_fill_form,mcp__browser__browser_press_key,\
 mcp__browser__browser_hover,mcp__browser__browser_select_option,\
 mcp__browser__browser_drag,mcp__browser__browser_handle_dialog,\
 mcp__browser__browser_tabs,mcp__browser__browser_resize,\
-mcp__browser__browser_close,mcp__browser__browser_take_screenshot";
+mcp__browser__browser_close,mcp__browser__browser_take_screenshot,\
+mcp__homeassistant__GetLiveContext,mcp__homeassistant__GetDateTime,\
+mcp__homeassistant__todo_get_items,\
+mcp__homeassistant__HassTurnOn,mcp__homeassistant__HassTurnOff,\
+mcp__homeassistant__HassSetPosition,mcp__homeassistant__HassStopMoving,\
+mcp__homeassistant__HassCancelAllTimers,mcp__homeassistant__HassLightSet,\
+mcp__homeassistant__HassClimateSetTemperature,\
+mcp__homeassistant__HassMediaUnpause,mcp__homeassistant__HassMediaPause,\
+mcp__homeassistant__HassMediaNext,mcp__homeassistant__HassMediaPrevious,\
+mcp__homeassistant__HassSetVolume,mcp__homeassistant__HassSetVolumeRelative,\
+mcp__homeassistant__HassMediaPlayerMute,mcp__homeassistant__HassMediaPlayerUnmute,\
+mcp__homeassistant__HassMediaSearchAndPlay,\
+mcp__homeassistant__HassListAddItem,mcp__homeassistant__HassListCompleteItem,\
+mcp__roon__hifi_zones,mcp__roon__hifi_now_playing,mcp__roon__hifi_control,\
+mcp__roon__hifi_search,mcp__roon__hifi_play,mcp__roon__hifi_status";
 
 // Defense-in-depth: tools that must never run from the bridge even if they slip
 // into the allowlist. Override with JESSE_DISALLOWED_TOOLS.

@@ -376,7 +376,8 @@ pub fn interpret_claude_output(
 // ---- MCP server sets --------------------------------------------------------
 
 /// The MCP server set for a MAIN turn on EVERY harness, used when `JESSE_MAIN_MCP_CONFIG`
-/// is unset: **qmd**, **slack** and **browser**. Passed as `--mcp-config` alongside
+/// is unset: **qmd**, **slack**, **browser**, **homeassistant** and **roon**. Passed as
+/// `--mcp-config` alongside
 /// `--strict-mcp-config`, so the account-level cloud connectors (Gmail, Slack, Google
 /// Calendar, Google Drive) are never LOADED on a phone turn rather than merely refused at
 /// the permission layer.
@@ -433,7 +434,51 @@ pub fn interpret_claude_output(
 /// blocked", measured 2026-08-07. So the browser is not a route to local files even before
 /// the allowlist is consulted. Not relied upon as the boundary (it is upstream's choice, not
 /// ours), but worth knowing it is there.
-pub const MAIN_CHILD_MCP_CONFIG: &str = r#"{"mcpServers":{"qmd":{"type":"stdio","command":"qmd","args":["mcp"]},"slack":{"type":"stdio","command":"npx","args":["-y","slack-mcp-server@latest","--transport","stdio"]},"browser":{"type":"stdio","command":"npx","args":["-y","@playwright/mcp@latest","--headless","--isolated","--output-dir","/tmp/jesse-browser","--output-max-size","104857600"]}}}"#;
+///
+/// # `homeassistant` and `roon` — the first HTTP servers, and the first PHYSICAL ones
+///
+/// Both are **`type: "http"`** (Streamable HTTP), which every server before them was not.
+/// That was the load-bearing unknown when they landed and it resolved in the good
+/// direction: BOTH harnesses carry an HTTP MCP server natively, so neither needs an
+/// `npx mcp-remote` stdio wrapper. Measured 2026-08-07 against codex-cli 0.146.0 and
+/// claude 2.1.224 — see [`codex_mcp_args`] for the `url` / `bearer_token_env_var` forms
+/// Codex takes. A wrapper would have added a subprocess per turn per server and put the
+/// token on a command line; neither cost is paid.
+///
+/// **The URLs are LAN addresses baked into a const, and that is forced rather than chosen.**
+/// The containment record commits the exact argv it probed and compares it by strict
+/// equality at boot, and `JESSE_MAIN_MCP_CONFIG` is refused by the startup gate — so the
+/// server set a certified posture loads cannot come from the environment. Same reasoning as
+/// the browser's `/tmp/jesse-browser`: the const must read identically on every machine.
+/// The consequence is that these two entries name THIS deployment's hosts; another
+/// deployment pointing elsewhere is a source edit and a fresh battery, not a config change.
+///
+/// `homeassistant` is Home Assistant's built-in Model Context Protocol Server (the Assist
+/// API), reached at `/api/mcp`. Its bearer token arrives by ENV EXPANSION —
+/// `${HA_MCP_TOKEN}`, which the CLI substitutes from the child's environment — so the
+/// literal token is absent from this const, from the `--mcp-config` argument, and from any
+/// file. The variable is set in the LaunchAgent plist, which is where secrets belong.
+///
+/// **`roon` HAS NO AUTH AT ALL**, and that is a fact about the deployment rather than an
+/// omission here: the bridge serves plain HTTP on VLAN 40 with no token, so anyone already
+/// on that VLAN can control the music. Adding it introduces no new credential and no new
+/// secret to protect — only music control. See SECURITY.md.
+///
+/// **WHAT THESE TWO ADD IS PHYSICAL ACTUATION**, which no previous server had: the granted
+/// Home Assistant intents move real hardware (the entrance gate, lights, climate, covers).
+/// Combined with the browser above, that is a prompt-injection-to-physical-action path, and
+/// it was accepted deliberately by the operator rather than mitigated here. The full
+/// reasoning, the residual mitigations that were NOT implemented, and why, are in
+/// SECURITY.md — read it before narrowing or widening this set.
+pub const MAIN_CHILD_MCP_CONFIG: &str = r#"{"mcpServers":{"qmd":{"type":"stdio","command":"qmd","args":["mcp"]},"slack":{"type":"stdio","command":"npx","args":["-y","slack-mcp-server@latest","--transport","stdio"]},"browser":{"type":"stdio","command":"npx","args":["-y","@playwright/mcp@latest","--headless","--isolated","--output-dir","/tmp/jesse-browser","--output-max-size","104857600"]},"homeassistant":{"type":"http","url":"http://10.20.30.10:8123/api/mcp","headers":{"Authorization":"Bearer ${HA_MCP_TOKEN}"}},"roon":{"type":"http","url":"http://10.40.0.2:8088/mcp"}}}"#;
+
+/// qmd PLUS slack PLUS browser — the main turn's server set from bridge 0.66.0 until Home
+/// Assistant and Roon were added in 0.67.0. No shipped spawn site uses it today; retained
+/// for exactly the reason [`QMD_SLACK_MCP_CONFIG`] is, and it had to be SPLIT OUT rather
+/// than left as an alias of [`MAIN_CHILD_MCP_CONFIG`]: until 0.67.0 the two were the same
+/// string, so growing the main set in place would have silently re-pointed the
+/// `qmd+slack+browser` row label at a set that also actuates the house.
+pub const QMD_SLACK_BROWSER_MCP_CONFIG: &str = r#"{"mcpServers":{"qmd":{"type":"stdio","command":"qmd","args":["mcp"]},"slack":{"type":"stdio","command":"npx","args":["-y","slack-mcp-server@latest","--transport","stdio"]},"browser":{"type":"stdio","command":"npx","args":["-y","@playwright/mcp@latest","--headless","--isolated","--output-dir","/tmp/jesse-browser","--output-max-size","104857600"]}}}"#;
 
 /// qmd PLUS slack — the main turn's server set from bridge 0.57.0 until the browser was
 /// added in 0.66.0. No shipped spawn site uses it today; it is retained because
@@ -1537,9 +1582,25 @@ mod tests {
             // loads the new set.
             assert_eq!(
                 servers.len(),
-                3,
-                "{label}: the main path must declare qmd, slack and browser and nothing \
-                 else: {mcp:?}"
+                5,
+                "{label}: the main path must declare qmd, slack, browser, homeassistant and \
+                 roon and nothing else: {mcp:?}"
+            );
+            // THE HOME ASSISTANT TOKEN MUST REACH THE CHILD UNEXPANDED. The whole reason
+            // the credential is safe on this path is that the CLI resolves `${HA_MCP_TOKEN}`
+            // from the environment at load time — so what the bridge puts on the command
+            // line is a placeholder, not a secret. A refactor that "helpfully" expanded it
+            // here would put a live long-lived HA token into argv, a `ps` listing and any
+            // crash dump, with nothing else in the system to notice. Asserted on the whole
+            // config string rather than the one header so it also catches the token
+            // arriving through some other key.
+            assert!(
+                mcp.contains("${HA_MCP_TOKEN}"),
+                "{label}: the HA bearer token must ride as an unexpanded placeholder: {mcp:?}"
+            );
+            assert!(
+                !mcp.contains("Bearer eyJ"),
+                "{label}: an expanded HA token has leaked into the child's argv: {mcp:?}"
             );
         }
     }
@@ -1903,11 +1964,17 @@ mod tests {
 
     /// The MCP config the main path falls back to when `JESSE_MAIN_MCP_CONFIG` is unset —
     /// qmd plus the read-only slack server since 0.57.0, plus the headless browser since
-    /// 0.66.0. Spelled out rather than referencing [`MAIN_CHILD_MCP_CONFIG`] so the golden
+    /// 0.67.0. Spelled out rather than referencing [`MAIN_CHILD_MCP_CONFIG`] so the golden
     /// pins the literal a child is spawned with: a const-vs-const comparison would pass no
     /// matter what the const became. `--output-dir` is part of the pinned literal on
     /// purpose — dropping it silently moves the browser's file writes into the vault.
-    const GOLDEN_QMD_MCP: &str = r#"{"mcpServers":{"qmd":{"type":"stdio","command":"qmd","args":["mcp"]},"slack":{"type":"stdio","command":"npx","args":["-y","slack-mcp-server@latest","--transport","stdio"]},"browser":{"type":"stdio","command":"npx","args":["-y","@playwright/mcp@latest","--headless","--isolated","--output-dir","/tmp/jesse-browser","--output-max-size","104857600"]}}}"#;
+    ///
+    /// The Home Assistant entry's `${HA_MCP_TOKEN}` is pinned as the LITERAL placeholder,
+    /// and that is the assertion, not an artifact of writing the test: the child must be
+    /// spawned with an unexpanded placeholder so the CLI resolves it from the environment.
+    /// If this golden ever has to change because a real token appeared here, the secret has
+    /// leaked into argv and the test has caught exactly what it is for.
+    const GOLDEN_QMD_MCP: &str = r#"{"mcpServers":{"qmd":{"type":"stdio","command":"qmd","args":["mcp"]},"slack":{"type":"stdio","command":"npx","args":["-y","slack-mcp-server@latest","--transport","stdio"]},"browser":{"type":"stdio","command":"npx","args":["-y","@playwright/mcp@latest","--headless","--isolated","--output-dir","/tmp/jesse-browser","--output-max-size","104857600"]},"homeassistant":{"type":"http","url":"http://10.20.30.10:8123/api/mcp","headers":{"Authorization":"Bearer ${HA_MCP_TOKEN}"}},"roon":{"type":"http","url":"http://10.40.0.2:8088/mcp"}}}"#;
     const GOLDEN_EMPTY_MCP: &str = r#"{"mcpServers":{}}"#;
 
     /// The shared base plus a site's MCP + containment args — one full expected argv.
