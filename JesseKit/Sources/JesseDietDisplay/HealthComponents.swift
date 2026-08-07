@@ -31,6 +31,19 @@ func toneColor(_ tone: DietSemantics.Tone) -> Color {
     }
 }
 
+/// A metric's IDENTITY color — the macro palette from the calorie-source bar, the accent
+/// for calories, and a per-nutrient identity color for a micronutrient. Identity, not
+/// judgment: it says WHICH nutrient a bar belongs to and never how the day went (that is
+/// `toneColor`'s job alone). One place, so the day drill-down and the range-wide Sources
+/// list cannot drift into speaking different color languages for the same nutrient.
+func metricTint(_ metric: ContributionMetric) -> Color {
+    switch metric {
+    case .calories: return .accentColor
+    case .macro(let m): return MacroColor.color(for: m)
+    case .micronutrient(let n): return MicronutrientColor.color(for: n)
+    }
+}
+
 extension Color {
     /// The "take note" tone: a muted clay/terracotta that reads as "worth attention"
     /// without the alarm of pure red — deliberately calmer than `.red`. Resolved per
@@ -644,14 +657,16 @@ struct FoodDrilldown: Equatable, Sendable {
     /// gauge's own value, so the foods reconcile against the number the tap came from,
     /// and the insight is fed the gauge's deterministic goal status rather than guessing.
     ///
-    /// `series`/`targets` are additive: when the snapshot carries a `nutrientSeries`, the
-    /// tapped metric's per-nutrient trend rides along so the sheet can push
-    /// `NutrientTrendDetail`. Defaulted so callers without history (previews, older
-    /// paths) build exactly as before.
+    /// `series`/`targets`/`sourceSeries` are additive: when the snapshot carries a
+    /// `nutrientSeries`, the tapped metric's per-nutrient trend rides along so the sheet can
+    /// push `NutrientTrendDetail`, and the per-item `sourceSeries` rides along inside it so
+    /// that chart can push the range-wide Sources ranking. Defaulted so callers without
+    /// history (previews, older paths) build exactly as before.
     static func build(meals: [DietMeal], metric: ContributionMetric,
                       gauge: MetricGauge, isCarbLoad: Bool,
                       series: [NutrientDay]? = nil,
-                      targets: DietTargets = DietTargets()) -> FoodDrilldown {
+                      targets: DietTargets = DietTargets(),
+                      sourceSeries: [SourceDay]? = nil) -> FoodDrilldown {
         let breakdown = FoodContributions.breakdown(meals, metric: metric, total: gauge.value)
         // An informational metric (total sugars) is grounded WITHOUT a target, so the
         // insight frames no goal and the judgment forbid stands alone; every other
@@ -671,7 +686,8 @@ struct FoodDrilldown: Equatable, Sendable {
         let trend: NutrientTrendContext? = {
             guard let series, NutrientTrends.isAvailable(series) else { return nil }
             return NutrientTrendContext(nutrient: TrendNutrient(metric: metric),
-                                        series: series, targets: targets, meals: meals)
+                                        series: series, targets: targets, meals: meals,
+                                        sourceSeries: sourceSeries)
         }()
         return FoodDrilldown(breakdown: breakdown, insightInput: input, trend: trend)
     }
@@ -941,16 +957,9 @@ struct ContributionRow: View {
         }
     }
 
-    /// The metric's identity color — the macro palette from the calorie-source bar so
-    /// the drill-down speaks the same color language, the accent for calories, and a
-    /// per-nutrient identity color for a micronutrient.
-    private var barColor: Color {
-        switch metric {
-        case .calories: return .accentColor
-        case .macro(let m): return MacroColor.color(for: m)
-        case .micronutrient(let n): return MicronutrientColor.color(for: n)
-        }
-    }
+    /// The metric's identity color, from the one shared seam — so the drill-down and the
+    /// range-wide Sources list speak the same color language for the same nutrient.
+    private var barColor: Color { metricTint(metric) }
 }
 
 /// Identity colors for the micronutrients. A sub-entry micronutrient takes a lightened

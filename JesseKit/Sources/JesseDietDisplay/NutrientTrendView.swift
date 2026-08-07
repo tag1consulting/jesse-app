@@ -194,6 +194,21 @@ struct NutrientTrendDetail: View {
             if !topSources.isEmpty {
                 sourcesRow
             }
+            // The line above covers only the LOADED day's meals; when the bridge sends the
+            // per-item history, the range-wide ranking is one tap away. This is the whole
+            // point of the pairing: the chart raises "saturated fat runs high", and that
+            // screen answers "from what".
+            if let sourceSeries = context.sourceSeries, NutrientSources.isAvailable(sourceSeries) {
+                NavigationLink {
+                    NutrientSourcesDetail(nutrient: nutrient, series: sourceSeries,
+                                          targets: context.targets,
+                                          nutrientSeries: context.series, meals: context.meals,
+                                          initialRange: range == .d7 ? 7 : 30)
+                } label: {
+                    NavRow(title: "Where it comes from", icon: "list.bullet.rectangle",
+                           subtitle: "top foods over the last 7 or 30 days")
+                }
+            }
             if let raiseHint {
                 Text(raiseHint)
                     .font(.footnote).foregroundStyle(.secondary)

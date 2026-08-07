@@ -362,6 +362,11 @@ struct NutrientTrendContext: Equatable, Sendable {
     let series: [NutrientDay]
     let targets: DietTargets
     let meals: [DietMeal]
+    /// The per-item food history, when the bridge sends it — the chart's "top sources" line
+    /// covers only the loaded day's meals, so this is what lets the chart offer the
+    /// RANGE-wide answer one tap deeper. Defaulted to nil so an older bridge (and every
+    /// existing call site) simply doesn't offer it.
+    var sourceSeries: [SourceDay]?
 }
 
 // MARK: - Trend direction

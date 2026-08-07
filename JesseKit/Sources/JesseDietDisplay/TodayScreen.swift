@@ -54,6 +54,29 @@ struct TodayScreen: View {
     /// The trend chart's opening range for anything tapped in the current mode.
     private var trendRange: NutrientTrendDetail.Range { .matching(windowMode) }
 
+    // MARK: - The multi-day histories
+
+    /// The per-item food history the Sources screens read, and the same past-day rule the
+    /// window switcher and the buffered gauges follow: a range that ends AFTER the day you
+    /// are reading would answer a question about days that day could not have had, so paging
+    /// back hides it. Absent on an older bridge → the affordance simply isn't offered.
+    private var historySources: [SourceDay]? { snapshot.isHistorical ? nil : snapshot.sourceSeries }
+    private var sourcesAvailable: Bool { NutrientSources.isAvailable(historySources) }
+
+    /// The exercise history the Patterns screen reads, under the same past-day rule.
+    private var historyExercise: [ExerciseDay]? { snapshot.isHistorical ? nil : snapshot.exerciseSeries }
+    /// Whether Patterns has all three histories it needs. The exercise field is the one an
+    /// older bridge omits, and its absence hides the row rather than showing a diet-only
+    /// version under a heading that promises training.
+    private var correlationsAvailable: Bool {
+        DietCorrelations.isAvailable(weight: snapshot.weightSeries, nutrients: windowSeries,
+                                     exercise: historyExercise)
+    }
+
+    /// The Sources range that matches the tab's window mode, so a nutrient opened from a 7d
+    /// read lands on 7d. The Day mode has no matching range and keeps the 30-day default.
+    private var sourcesRange: Int { windowMode == .week ? 7 : 30 }
+
     var body: some View {
         List {
             // Paging is a DAY control: a rolling window is anchored on the data, not on the
@@ -135,7 +158,8 @@ struct TodayScreen: View {
         var enriched = ex
         enriched.drilldown = FoodDrilldown.build(meals: today.meals, metric: metric,
                                                  gauge: gauge, isCarbLoad: gauges.isCarbLoad,
-                                                 series: snapshot.nutrientSeries, targets: today.targets)
+                                                 series: snapshot.nutrientSeries, targets: today.targets,
+                                                 sourceSeries: historySources)
         explainer = enriched
     }
 
@@ -377,6 +401,39 @@ struct TodayScreen: View {
                 }
             }
 
+            // Sources: the other half of every rolling read. The window switcher and the
+            // trend charts say a nutrient runs high or short; this says which foods it is
+            // actually coming from, which is the half you can act on. Inherently multi-day,
+            // so it is present in every window mode.
+            if sourcesAvailable, let sources = historySources {
+                NavigationLink {
+                    NutrientSourcesOverview(series: sources, targets: today.targets,
+                                            nutrientSeries: windowSeries, meals: today.meals,
+                                            initialRange: sourcesRange)
+                } label: {
+                    NavRow(title: "Sources", icon: "list.bullet.rectangle",
+                           subtitle: sourcesSubtitle)
+                }
+            }
+
+            // Patterns: what moved together across weight, training and intake. Guarded hard
+            // in the engine (a minimum sample, a weak floor, association wording only), and
+            // hidden entirely unless all three histories are present.
+            if correlationsAvailable {
+                let report = DietCorrelations.report(weight: snapshot.weightSeries,
+                                                     nutrients: windowSeries,
+                                                     exercise: historyExercise)
+                if let subtitle = DietCorrelations.subtitle(report) {
+                    NavigationLink {
+                        DietCorrelationsDetail(weightSeries: snapshot.weightSeries ?? [],
+                                               nutrientSeries: windowSeries ?? [],
+                                               exerciseSeries: historyExercise ?? [])
+                    } label: {
+                        NavRow(title: "Patterns", icon: "chart.dots.scatter", subtitle: subtitle)
+                    }
+                }
+            }
+
             NavigationLink {
                 FoodJournalDetail(today: today, proposed: snapshot.proposed)
             } label: {
@@ -416,6 +473,16 @@ struct TodayScreen: View {
                 }
             }
         }
+    }
+
+    /// The Sources row's subtitle: how many nutrients the range can actually answer for.
+    /// Never a leading food name — which food leads depends on the nutrient, and picking one
+    /// for the row would be a verdict the screen hasn't been asked for yet.
+    private var sourcesSubtitle: String {
+        let count = NutrientSources.overview(historySources ?? [], windowDays: sourcesRange).count
+        return count == 0
+            ? "last \(sourcesRange) days"
+            : "\(count) \(count == 1 ? "nutrient" : "nutrients") · last \(sourcesRange) days"
     }
 
     private var weightSubtitle: String? {

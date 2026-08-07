@@ -15,6 +15,68 @@ CI both run it). See the "Versioning" section of `bridge/README.md`.
 
 ## [Unreleased]
 
+## [App 1.0 (92)] - 2026-08-07
+
+### Added
+
+- **A Sources screen: which foods actually delivered a nutrient, over the last week or
+  month.** The rolling windows and the trend charts answer "how much, and is that a
+  pattern". They structurally cannot answer the question that follows, which is the
+  actionable half: saturated fat running high on the 7-day median is a reading, and
+  "it is mostly pecorino and salami, on 25 of the last 30 days" is something you can
+  do about it.
+
+  Reached from a nav row on the Health tab (an overview listing each nutrient with its
+  leading foods, then the full ranking one tap deeper) and — the path that matters —
+  from the per-nutrient trend chart itself, so the screen that raises the question is
+  one tap from the screen that answers it. Each food shows its summed contribution,
+  its share of the measured total, and **how many days it appeared on**, which is what
+  separates a staple from a single cheese board.
+
+  The rule the whole feature is built around, stated on the screen rather than left
+  implied: **a food the log never measured for a nutrient is unknown, not zero.** Such
+  a food is excluded from the ranking AND from the total the shares are taken against,
+  because a denominator quietly padded with unmeasured foods would understate every
+  listed food's real share. A measured 0 is a different thing and is treated as such
+  (it contributes nothing, but it leaves the total exact rather than a floor). When
+  unmeasured foods are present the total reads "≥", with the count said out loud; when
+  nothing in a range was measured, the screen shows **nothing rather than a guess**.
+
+- **A Patterns screen: what moved together across weight, training and intake.** It
+  crosses the weight history, the per-day nutrient totals and the exercise log over
+  their overlapping days, and it is deliberately more restrained than it is clever —
+  the restraint is the feature. Daily n is small and the series are noisy, and a
+  correlation over a dozen points will happily produce an impressive-looking
+  coefficient out of nothing at all. Four guardrails sit between the arithmetic and
+  the screen:
+
+  - **Never causation.** Every finding is an association, and the wording is fixed in
+    the engine rather than the view so no layout change can quietly upgrade "these
+    moved together over 39 days" into "sodium raises your weight". Both directions are
+    equally consistent with the data, and so is a third thing driving both.
+  - **A minimum sample.** Below **14 overlapping day-pairs** there is no coefficient at
+    all — not a hedged one, not a greyed-out one. The pair reads "not enough data —
+    9 of 14 days needed", and the number is never computed into view.
+  - **A weak floor.** Below 0.30 in magnitude an association is suppressed, so the
+    screen shows what is worth a look instead of a wall of noise around zero.
+  - **Nothing is silently dropped.** Pairs set aside for thin data or weakness are
+    listed BY NAME with the reason, because a screen showing two findings and nothing
+    else implies those are the only relationships in the data.
+
+  Pairs are lagged where that is the only well-posed form of the question (yesterday's
+  sodium against **this morning's weight change** — the day-over-day delta, not raw
+  weight, which is dominated by the cut trend and would mostly rediscover that time
+  passed). Spearman rather than Pearson, so one holiday dinner or one dehydrated
+  post-race weigh-in cannot author a finding. A day missing on either side is left out
+  of the pair rather than filled in: a rest day carries no exercise row, and reading it
+  as 0 kcal would invent training data the log never recorded.
+
+  Both screens hide entirely on an older bridge that sends neither field, and each
+  degrades independently — the affected section disappears, nothing else changes, and
+  nothing crashes. Both are hidden while paging back through a past day, under the same
+  rule the rolling windows already follow: a range that ends after the day you are
+  reading would judge it by data it could not have had.
+
 ## [App 1.0 (91)] - 2026-08-07
 
 ### Added
