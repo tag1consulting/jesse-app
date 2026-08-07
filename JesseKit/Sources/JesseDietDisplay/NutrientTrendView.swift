@@ -22,13 +22,33 @@ struct NutrientTrendDetail: View {
         var days: Int? {
             switch self { case .d7: return 7; case .d30: return 30; case .d90: return 90; case .all: return nil }
         }
+
+        /// The range that matches the Health tab's window mode, so a nutrient tapped from a
+        /// 7d list opens on 7d rather than snapping to the screen's own default. The Day
+        /// mode has no matching range and keeps the 30-day default.
+        static func matching(_ mode: NutrientWindowMode) -> Range {
+            switch mode {
+            case .day: return .d30
+            case .week: return .d7
+            case .month: return .d30
+            }
+        }
     }
 
     // 30 days is the meaningful default here (the coverage examples speak to "the last
     // 30 logged days"); the weight trend's 90-day default is for a slower signal. The 7-day
-    // option reads the recent tail at a glance — handy while traveling.
-    @State private var range: Range = .d30
+    // option reads the recent tail at a glance — handy while traveling. A caller arriving
+    // from the Health tab's window switcher overrides it with the matching range.
+    @State private var range: Range
     @State private var scrubDate: Date?
+
+    /// `initialRange` is the range the chart OPENS on; the picker is free from then on.
+    /// Defaulted so every existing call site (the drill-down sheet's "View trend" link)
+    /// keeps the 30-day default it has always had.
+    init(context: NutrientTrendContext, initialRange: Range = .d30) {
+        self.context = context
+        _range = State(initialValue: initialRange)
+    }
 
     private var nutrient: TrendNutrient { context.nutrient }
 

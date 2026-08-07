@@ -59,6 +59,21 @@ struct GoalChip: View {
     }
 }
 
+/// The window capsule shown beside a nutrient's name ("7d" / "30d"), naming the trailing
+/// window a median — or a colour drawn from one — belongs to. One spelling, used by the
+/// buffered day rows and by the window switcher's reframed rows alike, so a chip never
+/// means two different things depending on which screen drew it.
+struct WindowChip: View {
+    let text: String
+    var body: some View {
+        Text(text)
+            .font(.caption2.weight(.semibold).monospacedDigit())
+            .padding(.horizontal, 5).padding(.vertical, 1)
+            .background(Capsule().fill(Color.dietSubtleFill))
+            .foregroundStyle(.secondary)
+    }
+}
+
 /// A thin tone-tinted progress meter. `fraction` is clamped to [0, 1] for the fill;
 /// values over target simply peg full (the remaining text says "over"). The fill color
 /// is the one-meaning `Tone`, so the meter never disagrees with the row's words.
@@ -489,9 +504,15 @@ struct MetricBarRow: View {
             HStack(spacing: 6) {
                 GoalChip(goal: gauge.goal)
                 Text(gauge.label).font(.subheadline.weight(.semibold))
+                if let chip = windowChip {
+                    WindowChip(text: chip)
+                }
                 Spacer()
-                Text(DietSemantics.notTrackedCaption)
+                // A rolling row says which window found nothing ("no known days in the last
+                // 30 logged days"); a day row keeps the plain "not tracked yet".
+                Text(gauge.windowRead?.coverage ?? DietSemantics.notTrackedCaption)
                     .font(.caption).foregroundStyle(.secondary)
+                    .multilineTextAlignment(.trailing)
                 // A tappable not-tracked row (a micronutrient drill-down) still opens the
                 // sheet — with every item under "Not estimated" — so show the affordance.
                 if onTap != nil {
@@ -507,13 +528,11 @@ struct MetricBarRow: View {
                         .font((isSubEntry ? Font.footnote : .subheadline).weight(.semibold))
                         .foregroundStyle(isSubEntry ? AnyShapeStyle(.secondary) : AnyShapeStyle(.primary))
                     // A buffered row's color is its window's median, not today's number —
-                    // the chip says which window, right next to the name.
-                    if let chip = DietSemantics.rollingChip(gauge.judgment) {
-                        Text(chip)
-                            .font(.caption2.weight(.semibold).monospacedDigit())
-                            .padding(.horizontal, 5).padding(.vertical, 1)
-                            .background(Capsule().fill(Color.dietSubtleFill))
-                            .foregroundStyle(.secondary)
+                    // the chip says which window, right next to the name. A row the window
+                    // switcher reframed carries the same chip for the same reason: its
+                    // NUMBER is a median too, so the window has to be named.
+                    if let chip = windowChip {
+                        WindowChip(text: chip)
                     }
                     Spacer()
                     Text(valueTarget).font(.subheadline.monospacedDigit())
@@ -559,6 +578,13 @@ struct MetricBarRow: View {
     /// The "not tracked yet" state: a micronutrient gauge with no known contributor.
     private var notTracked: Bool { gauge.knownItemCount == 0 }
 
+    /// The window chip beside the label — "7d"/"30d". Either the buffered-colour chip (the
+    /// number is today's, the colour is the window's) or the switcher's reframed-row chip
+    /// (both are the window's). A row is never both, so one accessor covers them.
+    private var windowChip: String? {
+        gauge.windowRead?.chip ?? DietSemantics.rollingChip(gauge.judgment)
+    }
+
     private var valueTarget: String {
         // A partial total is a floor: prefix "≥" so it's never shown as complete.
         let prefix = gauge.partial ? "≥" : ""
@@ -567,6 +593,11 @@ struct MetricBarRow: View {
         return "\(prefix)\(v)\(gauge.unit)"
     }
     private var percent: String? {
+        // A rolling row with NO verdict shows no percentage. An informational nutrient at
+        // "104% of the reference" and a thin window at "67% of the floor" both read as
+        // exactly the judgment those rows exist to withhold; the bar alone carries the
+        // position without asserting one.
+        if let window = gauge.windowRead, !window.hasVerdict { return nil }
         guard let f = gauge.fraction else { return nil }
         return "\(gauge.partial ? "≥" : "")\(Int((f * 100).rounded()))%"
     }

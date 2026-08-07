@@ -159,6 +159,20 @@ enum TrendNutrient: String, CaseIterable, Identifiable, Sendable {
         }
     }
 
+    /// The goal GLYPH a row shows for this nutrient (≥ floor, ≤ ceiling, ↕ window). For a
+    /// judged nutrient it is simply `dayGoal`. The two informational nutrients carry no
+    /// `dayGoal` at all — they are never judged — but a row still has to draw a glyph, so
+    /// they take the direction their `Micronutrient` twin already shows: total sugars reads
+    /// as a ceiling, unsaturated fat (the good-fat share) as a floor. A glyph is a
+    /// direction, never a verdict; the colour is what an informational row withholds.
+    var displayGoal: DietSemantics.Goal {
+        switch self {
+        case .sug: return .ceiling
+        case .unsat: return .floor
+        default: return dayGoal ?? .floor
+        }
+    }
+
     /// How long a window this nutrient's gauge COLOR is judged over (see `JudgmentWindow`).
     /// The value stays today's on every gauge; only the color's window changes.
     ///

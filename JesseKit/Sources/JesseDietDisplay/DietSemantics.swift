@@ -1052,6 +1052,16 @@ struct MetricGauge: Equatable, Sendable {
     /// every gauge — only `status` and `tone` follow the window. That split is the whole
     /// design: the number you ate today, colored by the pattern it belongs to.
     var judgment: JudgmentSource = .daily
+    /// Set ONLY on a row the Health tab's window switcher reframed to a rolling read (7d /
+    /// 30d): the window's median, its coverage, and whether that median earned a verdict.
+    /// Nil on every day-scoped gauge, which then renders exactly as it always has. The row
+    /// uses it for two things and no more — the window chip beside the label, and the
+    /// caption on a window with nothing measured in it.
+    ///
+    /// Distinct from `judgment`, deliberately: `judgment` describes a row whose NUMBER is
+    /// today's and whose COLOUR came from a window, which is the buffered-nutrient design.
+    /// This describes a row where the number is the window's too.
+    var windowRead: NutrientWindowRead? = nil
     /// Today blew through a ceiling: at/over `NutrientTrends.blowoutMultiplier` × the day's
     /// target, or over a defined daily hard cap (total fat's 70 g). A SEPARATE signal that
     /// never touches `status`/`tone` — a green rolling color and this marker coexist by

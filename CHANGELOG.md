@@ -15,6 +15,62 @@ CI both run it). See the "Versioning" section of `bridge/README.md`.
 
 ## [Unreleased]
 
+## [App 1.0 (91)] - 2026-08-07
+
+### Added
+
+- **A Day / 7d / 30d window switcher at the top of the Health tab, so every nutrient
+  gains a weekly and a monthly read without losing the day.** The buffered-gauge work
+  gave the nutrients that genuinely buffer a rolling COLOUR while their number stayed
+  today's. This is the other half of that argument: sometimes the question is not "how
+  is today going" but "how has the last month actually gone", and until now the only
+  way to ask it was to open thirteen separate trend charts one at a time.
+
+  - **Day** is the default and is unchanged, byte for byte: today's numbers, the
+    rolling-aware verdict colours, the same blow-out markers. It is also where a fresh
+    launch always starts, because the day is the thing you can still act on.
+  - **7d / 30d** reframe every measured nutrient to the median of its KNOWN days in that
+    window, coloured by the very same ceiling/floor/window helpers the daily gauge uses,
+    with coverage stated on every row ("known 22 of 30 logged days"). Tapping a nutrient
+    in any mode pushes the per-nutrient trend chart that already existed, opened on the
+    matching range.
+
+  The switcher changes the data a gauge reads and its coverage caption, and nothing else:
+  the same `MetricBarRow`, the same bands, the same chart one tap deeper. Three things it
+  deliberately refuses to do:
+
+  - A nutrient with fewer than six known days in the window reads **"not enough data"**
+    and shows no colour at all. Four measured days out of thirty is not a monthly verdict,
+    and dressing it up as one is how a gauge earns the right to be ignored.
+  - The informational nutrients (total sugars, unsaturated fat) show their DISTRIBUTION
+    and never a pass or fail, in every mode — including the percentage, which is now
+    suppressed on any row without a verdict. "104% of the reference" beside a nutrient
+    that is deliberately unjudged reads as exactly the judgment the row is withholding.
+  - A past day never offers the switcher. A rolling window that ends after the day you
+    are reading would judge that day by data it could not have had, which is the same
+    rule the buffered colours already follow.
+
+- **A Consistency screen, reached from a nav row on the Health tab.** A median says what a
+  typical day looks like; it structurally cannot say whether a goal is being HELD. Four
+  good days and three bad ones median out to the same number as seven middling ones. So
+  for every nutrient that carries a verdict there is now a current streak, the longest
+  streak in the series, and how long since the last miss.
+
+  The rule that made this worth building carefully, stated on the screen itself: **a day
+  the nutrient wasn't measured does not break a streak, but it does not extend one
+  either.** You may well have hit the goal; the label just didn't say. And a PARTIAL day
+  only decides the direction its lower bound already proves — a floor already cleared is a
+  real hit, a ceiling already breached is a real miss, and every other partial day is
+  undecided and behaves like a gap. Every row states how many measured days it stands on,
+  and hedges itself when that is thin.
+
+  The streak maths is a pure, Foundation-only engine (`NutrientStreaks`) beside the
+  window engine (`NutrientWindows`), both unit-tested; the views only draw.
+
+  The selected window lives on the display model for the session only and is written
+  nowhere. Both platforms get all of this through the shared `HealthDashboardContent`;
+  verified on the iPhone simulator and in the macOS client.
+
 ## [App 1.0 (90)] - 2026-08-07
 
 ### Changed

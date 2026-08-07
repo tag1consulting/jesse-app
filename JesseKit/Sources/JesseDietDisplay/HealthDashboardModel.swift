@@ -48,6 +48,15 @@ public final class HealthDashboardModel {
     /// The live day's date, learned from the most recent non-historical snapshot.
     private(set) var todayDate: String?
 
+    /// Which read the Health tab is showing: today's numbers, or the rolling 7/30-day
+    /// reframe of every nutrient. Session-scoped ON PURPOSE — it lives here for as long as
+    /// the app is running and is written nowhere, so a fresh launch always opens on the
+    /// day. The day is what you can still act on; a window is a review you opt into.
+    ///
+    /// It sits on the model rather than in a view's `@State` so paging, a refresh, or a
+    /// transient loading state can't silently reset the mode out from under the user.
+    public var nutrientWindow: NutrientWindowMode = .day
+
     /// In-memory cache keyed by each snapshot's own `today.date`, so a paged-back
     /// day renders instantly on return.
     private var cache: [String: DietSnapshot] = [:]

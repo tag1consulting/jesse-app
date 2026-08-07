@@ -33,15 +33,44 @@ struct TodayScreen: View {
             && HealthDisplay.isStale(todayDate: today.date, now: now)
     }
 
+    // MARK: - The Day / 7d / 30d window
+
+    /// The history the WINDOW SWITCHER reads — the same series the buffered gauges take
+    /// their colour from, and for the same reason: a past day must not be reframed by a
+    /// window that ends after it. Paging back therefore hides the switcher and the day
+    /// renders exactly as it always has.
+    private var windowSeries: [NutrientDay]? { judgeSeries }
+    /// Whether the rolling modes are offered at all. An older bridge sends no
+    /// `nutrientSeries`, so there is nothing to roll over: the switcher, the rolling list,
+    /// and the Consistency row simply don't appear. Graceful degrade, never a crash.
+    private var windowAvailable: Bool { NutrientTrends.isAvailable(windowSeries) }
+    /// The mode actually in force: the session's choice, clamped to `.day` whenever the
+    /// rolling modes aren't available, so a selection made on today can't strand a paged-back
+    /// day on a window it has no data for.
+    private var windowMode: NutrientWindowMode { windowAvailable ? model.nutrientWindow : .day }
+    private var windowBinding: Binding<NutrientWindowMode> {
+        Binding(get: { model.nutrientWindow }, set: { model.nutrientWindow = $0 })
+    }
+    /// The trend chart's opening range for anything tapped in the current mode.
+    private var trendRange: NutrientTrendDetail.Range { .matching(windowMode) }
+
     var body: some View {
         List {
-            pagingSection
+            // Paging is a DAY control: a rolling window is anchored on the data, not on the
+            // day you happen to be reading, so it has nothing to page.
+            if windowMode == .day { pagingSection }
+            windowSection
             headerSection
-            summarySection
-            caloriesSection
-            macroRingsSection
+            if windowMode == .day {
+                summarySection
+                caloriesSection
+                macroRingsSection
+            } else if let series = windowSeries, let days = windowMode.days {
+                rollingSection(series: series, windowDays: days)
+            }
             weightSection
-            coachHeadlineSection
+            // The coach's headline speaks to today; a rolling review isn't the place for it.
+            if windowMode == .day { coachHeadlineSection }
             navRowsSection
             updatedStampSection
         }
@@ -49,6 +78,53 @@ struct TodayScreen: View {
         .dietNavTitle(.large)
         .refreshable { await model.refresh() }
         .sheet(item: $explainer) { ExplainerSheet(explainer: $0) }
+    }
+
+    // The switcher itself. It changes WHICH read every nutrient shows — today's total, or
+    // the median of its known days over the last 7 or 30 — and nothing else: the same
+    // gauges, the same bands, the same trend chart one tap deeper.
+    @ViewBuilder
+    private var windowSection: some View {
+        if windowAvailable {
+            Section {
+                Picker("Window", selection: windowBinding) {
+                    ForEach(NutrientWindowMode.allCases) { Text($0.title).tag($0) }
+                }
+                .pickerStyle(.segmented)
+                .accessibilityLabel("Nutrient window")
+                .listRowBackground(Color.clear)
+            }
+        }
+    }
+
+    // The rolling read: every measured nutrient reframed to its window median, drawn by the
+    // SAME `MetricBarRow` the day-scoped nutrient rows use — the switcher changes the data a
+    // gauge reads and its coverage caption, not the gauge. Tapping a row pushes the existing
+    // per-nutrient trend chart, opened on the matching range.
+    private func rollingSection(series: [NutrientDay], windowDays: Int) -> some View {
+        let rows = NutrientWindows.gauges(series: series, targets: today.targets,
+                                          windowDays: windowDays)
+        return Section {
+            if rows.isEmpty {
+                Text("Nothing has been measured yet, so there is nothing to roll up.")
+                    .font(.callout).foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            ForEach(rows, id: \.nutrient) { row in
+                NavigationLink {
+                    NutrientTrendDetail(
+                        context: NutrientTrendContext(nutrient: row.nutrient, series: series,
+                                                      targets: today.targets, meals: today.meals),
+                        initialRange: trendRange)
+                } label: {
+                    MetricBarRow(gauge: row.gauge)
+                }
+            }
+        } header: {
+            Text("Last \(windowDays) days")
+        } footer: {
+            Text(NutrientWindows.coverageFootnote)
+        }
     }
 
     /// Open a metric's drill-down from a Today-screen ring tap: attach the shared
@@ -102,42 +178,55 @@ struct TodayScreen: View {
     }
 
     // Header: the day-style chip (full days only — a reconstructed day has no judged
-    // style) plus the stale / refresh-failed / history-unsupported banners.
-    private var headerSection: some View {
-        Section {
-            VStack(alignment: .leading, spacing: 8) {
-                if !isNeutral {
-                    Button {
-                        explainer = Explainers.dayStyle(today.dayStyle, isCarbLoad: gauges.isCarbLoad)
-                    } label: {
-                        HStack(spacing: 5) {
-                            DayStyleChip(dayStyle: today.dayStyle, isCarbLoad: gauges.isCarbLoad)
-                            Image(systemName: "info.circle")
-                                .font(.caption2)
-                                .foregroundStyle(.tertiary)
-                        }
-                        .contentShape(Rectangle())
-                    }
-                    .buttonStyle(.plain)
-                    .accessibilityLabel("Day type: \(DayStyleExplain.headline(dayStyle: today.dayStyle, isCarbLoad: gauges.isCarbLoad)). What this changes.")
-                }
+    // style) plus the stale / refresh-failed / history-unsupported banners. Emitted only
+    // when it actually has something to say: an empty `Section` still claims its list
+    // spacing, which on a rolling window (where the chip is suppressed) left a band of
+    // dead air above the nutrients.
+    private var hasHeaderContent: Bool {
+        (!isNeutral && windowMode == .day) || model.historyUnsupported || isStale
+            || refreshError != nil
+    }
 
-                if model.historyUnsupported {
-                    Label("Update the bridge to page back through earlier days.",
-                          systemImage: "arrow.up.circle")
-                        .font(.caption).foregroundStyle(.secondary)
+    @ViewBuilder
+    private var headerSection: some View {
+        if hasHeaderContent {
+            Section {
+                VStack(alignment: .leading, spacing: 8) {
+                    // The day-style chip describes TODAY's rules; a rolling window spans days
+                    // of several styles, so it would be claiming something it doesn't know.
+                    if !isNeutral, windowMode == .day {
+                        Button {
+                            explainer = Explainers.dayStyle(today.dayStyle, isCarbLoad: gauges.isCarbLoad)
+                        } label: {
+                            HStack(spacing: 5) {
+                                DayStyleChip(dayStyle: today.dayStyle, isCarbLoad: gauges.isCarbLoad)
+                                Image(systemName: "info.circle")
+                                    .font(.caption2)
+                                    .foregroundStyle(.tertiary)
+                            }
+                            .contentShape(Rectangle())
+                        }
+                        .buttonStyle(.plain)
+                        .accessibilityLabel("Day type: \(DayStyleExplain.headline(dayStyle: today.dayStyle, isCarbLoad: gauges.isCarbLoad)). What this changes.")
+                    }
+
+                    if model.historyUnsupported {
+                        Label("Update the bridge to page back through earlier days.",
+                              systemImage: "arrow.up.circle")
+                            .font(.caption).foregroundStyle(.secondary)
+                    }
+                    if isStale {
+                        Label("showing \(today.date); nothing logged today yet",
+                              systemImage: "clock.arrow.circlepath")
+                            .font(.caption).foregroundStyle(.secondary)
+                    }
+                    if refreshError != nil {
+                        Label("couldn't refresh — showing the last update", systemImage: "wifi.exclamationmark")
+                            .font(.caption).foregroundStyle(.secondary)
+                    }
                 }
-                if isStale {
-                    Label("showing \(today.date); nothing logged today yet",
-                          systemImage: "clock.arrow.circlepath")
-                        .font(.caption).foregroundStyle(.secondary)
-                }
-                if refreshError != nil {
-                    Label("couldn't refresh — showing the last update", systemImage: "wifi.exclamationmark")
-                        .font(.caption).foregroundStyle(.secondary)
-                }
+                .listRowBackground(Color.clear)
             }
-            .listRowBackground(Color.clear)
         }
     }
 
@@ -269,6 +358,23 @@ struct TodayScreen: View {
             } label: {
                 NavRow(title: "Macros & calories", icon: "chart.bar.fill",
                        subtitle: macrosSubtitle)
+            }
+
+            // Consistency: not "what is a typical day" (that is the rolling median above)
+            // but "is this being held" — a run of days meeting each goal. A nav row rather
+            // than an inline block, matching how every other multi-day view on this screen
+            // is reached, and present in every mode because a streak is inherently
+            // multi-day. Hidden entirely when the bridge sent no history.
+            if windowAvailable, let series = windowSeries {
+                let streaks = NutrientStreaks.all(series: series, targets: today.targets)
+                if let subtitle = NutrientStreaks.subtitle(streaks) {
+                    NavigationLink {
+                        NutrientStreaksDetail(series: series, targets: today.targets,
+                                              meals: today.meals, trendRange: trendRange)
+                    } label: {
+                        NavRow(title: "Consistency", icon: "flame", subtitle: subtitle)
+                    }
+                }
             }
 
             NavigationLink {
