@@ -15,6 +15,62 @@ CI both run it). See the "Versioning" section of `bridge/README.md`.
 
 ## [Unreleased]
 
+## [Bridge 0.68.0] - 2026-08-08
+
+### Fixed
+
+- **Home Assistant never actually loaded in 0.67.0, and now does.** A main turn on either
+  harness saw four MCP servers instead of five: `homeassistant` was declared, configured
+  correctly, given a valid token, and **silently dropped**. The child's own init event was
+  the only place it showed at all, as `{"name":"homeassistant","status":"failed"}`.
+
+  **Root cause: macOS Local Network privacy (Apple FB16131937).** The launchd-spawned agent
+  child is denied a socket to any host on the Studio's own on-link subnet. The connection
+  fails in ~5 ms — `HTTP Connection failed after 5ms ... (code: FailedToOpenSocket, errno:
+  none)` — and Claude Code drops the server without an error anywhere the bridge or Home
+  Assistant can see. Not auth, not a timeout, not connection-refused.
+
+  **The fix is to reach HA over the tailnet** (CGNAT, routed over `utun`), which macOS does
+  not gate. Verified three times under `launchctl` with the real child environment:
+  `Successfully connected (transport: http)` in 149/86/27 ms.
+
+  **Roon is unchanged and stays on its LAN address** — it is reached through a gateway
+  rather than on-link, so it was never gated. That asymmetry is exactly why Roon working
+  proved nothing about Home Assistant, and it cost several wrong hypotheses before a
+  same-subnet comparison settled it.
+
+### Added
+
+- **Two more Home Assistant tools, 23 of 23 granted**: `HassBroadcast` (speaks a message
+  through Assist satellites) and `HassListRemoveItem`. The running server began advertising
+  them on 2026-08-08 with no change here — a fixed allowlist does not notice a server
+  growing underneath it. Granted on the same explicit "full control" decision. **Re-enumerate
+  live before every battery**; never carry a tool list forward assuming it is complete.
+
+### Changed
+
+- **`scripts/ci-guards.sh` gained a per-line `ci-guards:deployment-address` exemption.** The
+  HA endpoint must live in tracked source (the record compares argv by strict equality and
+  `JESSE_MAIN_MCP_CONFIG` is refused at startup), and a tailnet address trips the R5
+  personal-infrastructure rule. Exempting a **marked line** rather than allowlisting the
+  value keeps the generic CGNAT range covering the rest of the tree and makes a second
+  exempted address a visible diff. The address appears exactly **once** in the repository,
+  behind `home_assistant_mcp_url!` — a macro rather than a `const` only because `concat!`
+  accepts a macro expanding to a literal and `MAIN_CHILD_MCP_CONFIG` must stay a `&'static
+  str` literal.
+
+- **`read_escape_symlink` came back `denied` in the 0.68.0 re-record** and is now a closed
+  baseline; `read_escape_parent` is still `known_open`. Nothing was changed to close it — it
+  was `allowed` a day earlier under an identical posture. That is the intermittency
+  SECURITY.md describes, demonstrated: the recorded verdict says which route that run's child
+  tried, not which routes exist. Known-opens at the write row are 3, not 4. **Do not read the
+  new `denied` as a boundary.**
+
+- **claude-code record re-recorded** for the two new grants. Note the address change alone
+  would *not* have required it: `capability_args` emits only the tool lists, so no MCP URL
+  is in the record. Codex's record is untouched — its containment lever is the OS sandbox,
+  not a tool allowlist, and its `enabled_tools` are derived from the same const.
+
 ## [Bridge 0.67.0] - 2026-08-07
 
 ### Added

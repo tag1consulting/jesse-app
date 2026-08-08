@@ -221,13 +221,21 @@ pub const DEFAULT_MAX_ATTACHMENTS_TOTAL_BYTES: usize = 20 * 1024 * 1024;
 // after a delay, and without it the browser returns a 403 interstitial on exactly
 // the pages it was added to read (measured on stackoverflow.com, 2026-08-07).
 //
-// HOME ASSISTANT: twenty-one of twenty-one — the ENTIRE advertised surface, and the
-// only server here granted whole. That is an explicit operator decision, not an
+// HOME ASSISTANT: twenty-three of twenty-three — the ENTIRE advertised surface, and
+// the only server here granted whole. That is an explicit operator decision, not an
 // oversight and not a default: full house control was asked for knowingly, against
 // the stated risk that the browser above makes a prompt-injected page a route to
 // physical actuation. Nothing is omitted because nothing on this server is both
 // dangerous and unused — the three read intents (`GetLiveContext`, `GetDateTime`,
-// `todo_get_items`) and the eighteen control intents are the capability.
+// `todo_get_items`) and the twenty control intents are the capability.
+//
+// IT WAS TWENTY-ONE IN 0.67.0. The live enumeration on 2026-08-08 returned two more
+// that the running server had not advertised the day before: `HassBroadcast` (speaks
+// a message through Assist satellites) and `HassListRemoveItem` (removes a to-do
+// item). Both were granted on the same "full control" decision rather than defaulted
+// in. THE LESSON IS THE COUNT, NOT THE TWO NAMES: a server's surface grows underneath
+// a fixed allowlist without any signal here, so re-enumerate live before every battery
+// and never carry a tool list forward on the assumption it is still complete.
 //
 // WHAT "FULL CONTROL" ACTUALLY REACHES IS DECIDED IN HOME ASSISTANT, NOT HERE, and
 // that is the load-bearing half a reader will miss. These intents act only on
@@ -294,6 +302,7 @@ mcp__homeassistant__HassSetVolume,mcp__homeassistant__HassSetVolumeRelative,\
 mcp__homeassistant__HassMediaPlayerMute,mcp__homeassistant__HassMediaPlayerUnmute,\
 mcp__homeassistant__HassMediaSearchAndPlay,\
 mcp__homeassistant__HassListAddItem,mcp__homeassistant__HassListCompleteItem,\
+mcp__homeassistant__HassListRemoveItem,mcp__homeassistant__HassBroadcast,\
 mcp__roon__hifi_zones,mcp__roon__hifi_now_playing,mcp__roon__hifi_control,\
 mcp__roon__hifi_search,mcp__roon__hifi_play,mcp__roon__hifi_status";
 

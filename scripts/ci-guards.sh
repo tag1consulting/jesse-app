@@ -150,12 +150,37 @@ if [ "$selfcheck_fail" -ne 0 ]; then
     "the R5 denylist/allowlist regex is broken — fix it before trusting a green run"
 fi
 
+# 5b) DEPLOYMENT ADDRESS EXEMPTION, by explicit per-line marker.
+#
+#     A line carrying the literal `ci-guards:deployment-address` is exempt from the R5
+#     personal-infra scan. It exists because ONE address genuinely has to live in tracked
+#     source: the Home Assistant MCP endpoint baked into `MAIN_CHILD_MCP_CONFIG`. The
+#     containment record compares the child's argv by strict equality and the startup gate
+#     REFUSES `JESSE_MAIN_MCP_CONFIG`, so the server set of a certified posture cannot come
+#     from the environment — there is no config seam to move it to.
+#
+#     That address is a TAILNET address (CGNAT, 100.64.0.0/10), which the R5 denylist flags
+#     by design. It is a tailnet address because the LAN one does not work: macOS Local
+#     Network privacy denies the launchd-spawned agent child a socket to any host on the
+#     Studio's own on-link subnet, silently (`FailedToOpenSocket`, ~5ms, no log anywhere).
+#
+#     WHY A MARKER RATHER THAN ALLOWLISTING THE VALUE. The allowlist above deliberately
+#     carries no real address — an earlier version hard-listed IPs, missed one in the same
+#     range, and shipped it green. Adding this IP there would repeat that and would silently
+#     exempt the same value everywhere. A marker exempts a LINE a reviewer can see, leaves
+#     the generic range covering every other line in the tree, and makes a second exempted
+#     address a visible diff rather than a quiet widening.
+#
+#     Keep exempted lines to the minimum: the address should appear ONCE in the tree.
+PERSONAL_MARKER='ci-guards:deployment-address'
+
 if git -C "$ROOT" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
   # Exclude this script: it is the one reviewed place these patterns must appear
   # (as the matcher and its self-check samples), so it would otherwise flag itself.
   if hits="$(git -C "$ROOT" ls-files -z -- . ':!:scripts/ci-guards.sh' \
       | xargs -0 grep -nE "$PERSONAL_DENY" 2>/dev/null \
-      | grep -vE "$PERSONAL_ALLOW" || true)"; then
+      | grep -vE "$PERSONAL_ALLOW" \
+      | grep -vF "$PERSONAL_MARKER" || true)"; then
     if [ -n "$hits" ]; then
       flag "personal infra (tailnet IP / MagicDNS / machine name / launchd label / home path) in a tracked file" "$hits"
     fi
