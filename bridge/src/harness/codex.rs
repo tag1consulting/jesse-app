@@ -2031,8 +2031,25 @@ mod tests {
         let args = codex_mcp_args(CODEX_ID, MAIN_CHILD_MCP_CONFIG, allowed).expect("translates");
         let flat = args.join(" ");
 
+        // The HA host is NOT spelled out here — it lives in exactly one place in the tree
+        // (see `home_assistant_mcp_url`, exempted from the ci-guards personal-infra scan by
+        // line) and a second copy would need a second exemption. Derived from the shipped
+        // config instead, which is not vacuous: it asserts the translation CARRIES the
+        // declared url into a `-c` override, which is the behaviour under test. A config
+        // whose url never reached the argv would still fail.
+        let declared_ha_url = MAIN_CHILD_MCP_CONFIG
+            .split(r#""homeassistant":{"type":"http","url":""#)
+            .nth(1)
+            .and_then(|rest| rest.split('"').next())
+            .expect("the shipped config declares an http url for homeassistant");
         assert!(
-            flat.contains(r#"mcp_servers.homeassistant.url="http://10.20.30.10:8123/api/mcp""#),
+            declared_ha_url.starts_with("http://"),
+            "unexpected HA url shape: {declared_ha_url}"
+        );
+        assert!(
+            flat.contains(&format!(
+                r#"mcp_servers.homeassistant.url="{declared_ha_url}""#
+            )),
             "{args:?}"
         );
         assert!(

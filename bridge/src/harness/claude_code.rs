@@ -470,7 +470,41 @@ pub fn interpret_claude_output(
 /// it was accepted deliberately by the operator rather than mitigated here. The full
 /// reasoning, the residual mitigations that were NOT implemented, and why, are in
 /// SECURITY.md — read it before narrowing or widening this set.
-pub const MAIN_CHILD_MCP_CONFIG: &str = r#"{"mcpServers":{"qmd":{"type":"stdio","command":"qmd","args":["mcp"]},"slack":{"type":"stdio","command":"npx","args":["-y","slack-mcp-server@latest","--transport","stdio"]},"browser":{"type":"stdio","command":"npx","args":["-y","@playwright/mcp@latest","--headless","--isolated","--output-dir","/tmp/jesse-browser","--output-max-size","104857600"]},"homeassistant":{"type":"http","url":"http://10.20.30.10:8123/api/mcp","headers":{"Authorization":"Bearer ${HA_MCP_TOKEN}"}},"roon":{"type":"http","url":"http://10.40.0.2:8088/mcp"}}}"#;
+/// **THE ONE PLACE THIS DEPLOYMENT'S HOME ASSISTANT ADDRESS IS WRITTEN.** A macro rather
+/// than a `const` for one reason: [`MAIN_CHILD_MCP_CONFIG`] must stay a `&'static str`
+/// literal (the record compares argv by strict equality and `McpSet::config` returns
+/// `&'static str`), and `concat!` accepts a macro that expands to a literal while it cannot
+/// accept a `const` item. So this keeps the address to a SINGLE occurrence in the tree
+/// instead of one in the const and one in a doc comment that would drift.
+///
+/// **It is a TAILNET address, and that is load-bearing rather than cosmetic.** Home
+/// Assistant also answers on the LAN at an on-link RFC1918 address, and using that one is
+/// what the bridge shipped in 0.67.0 — where it did not work at all. macOS Local Network
+/// privacy denies the launchd-spawned child a socket to any host on the Studio's own
+/// on-link subnet: the connection fails in ~5ms with `FailedToOpenSocket` and Claude Code
+/// silently drops the server, so a main turn saw four servers and no Home Assistant. There
+/// is no error in any bridge log; the only trace is the child's own `--debug mcp` output.
+/// The tailnet address routes over `utun`, is therefore not "local network" in the sense
+/// macOS gates, and connects from exactly the same launchd context.
+///
+/// Roon is untouched and stays on its LAN address: it is reached THROUGH a gateway rather
+/// than on-link, so it was never gated — which is precisely why Roon working proved nothing
+/// about Home Assistant, and why a same-subnet comparison is the only meaningful one.
+///
+/// `scripts/ci-guards.sh` flags CGNAT addresses as personal infrastructure. This line is
+/// exempted BY NAME (`ci-guards:deployment-address`) so the generic rule keeps covering
+/// every other file; see the guard for the reasoning and the deliberate narrowness.
+macro_rules! home_assistant_mcp_url {
+    () => {
+        "http://100.105.110.60:8123/api/mcp" // ci-guards:deployment-address
+    };
+}
+
+pub const MAIN_CHILD_MCP_CONFIG: &str = concat!(
+    r#"{"mcpServers":{"qmd":{"type":"stdio","command":"qmd","args":["mcp"]},"slack":{"type":"stdio","command":"npx","args":["-y","slack-mcp-server@latest","--transport","stdio"]},"browser":{"type":"stdio","command":"npx","args":["-y","@playwright/mcp@latest","--headless","--isolated","--output-dir","/tmp/jesse-browser","--output-max-size","104857600"]},"homeassistant":{"type":"http","url":""#,
+    home_assistant_mcp_url!(),
+    r#"","headers":{"Authorization":"Bearer ${HA_MCP_TOKEN}"}},"roon":{"type":"http","url":"http://10.40.0.2:8088/mcp"}}}"#
+);
 
 /// qmd PLUS slack PLUS browser — the main turn's server set from bridge 0.66.0 until Home
 /// Assistant and Roon were added in 0.67.0. No shipped spawn site uses it today; retained
@@ -1974,7 +2008,20 @@ mod tests {
     /// spawned with an unexpanded placeholder so the CLI resolves it from the environment.
     /// If this golden ever has to change because a real token appeared here, the secret has
     /// leaked into argv and the test has caught exactly what it is for.
-    const GOLDEN_QMD_MCP: &str = r#"{"mcpServers":{"qmd":{"type":"stdio","command":"qmd","args":["mcp"]},"slack":{"type":"stdio","command":"npx","args":["-y","slack-mcp-server@latest","--transport","stdio"]},"browser":{"type":"stdio","command":"npx","args":["-y","@playwright/mcp@latest","--headless","--isolated","--output-dir","/tmp/jesse-browser","--output-max-size","104857600"]},"homeassistant":{"type":"http","url":"http://10.20.30.10:8123/api/mcp","headers":{"Authorization":"Bearer ${HA_MCP_TOKEN}"}},"roon":{"type":"http","url":"http://10.40.0.2:8088/mcp"}}}"#;
+    ///
+    /// THE ONE THING THIS GOLDEN NO LONGER PINS is the Home Assistant HOST, which comes
+    /// through [`home_assistant_mcp_url`] rather than being spelled out. That is a
+    /// deliberate trade and it does weaken the golden by exactly one value: a change to the
+    /// HA address will not break this test. It is done because the address is exempted from
+    /// the `ci-guards.sh` personal-infrastructure scan BY LINE, and a second copy here would
+    /// need a second exemption — which is how a narrow exemption quietly becomes a broad
+    /// one. Everything else the child is spawned with is still pinned literally, including
+    /// the token placeholder, the browser's `--output-dir`, and the full server set.
+    const GOLDEN_QMD_MCP: &str = concat!(
+        r#"{"mcpServers":{"qmd":{"type":"stdio","command":"qmd","args":["mcp"]},"slack":{"type":"stdio","command":"npx","args":["-y","slack-mcp-server@latest","--transport","stdio"]},"browser":{"type":"stdio","command":"npx","args":["-y","@playwright/mcp@latest","--headless","--isolated","--output-dir","/tmp/jesse-browser","--output-max-size","104857600"]},"homeassistant":{"type":"http","url":""#,
+        home_assistant_mcp_url!(),
+        r#"","headers":{"Authorization":"Bearer ${HA_MCP_TOKEN}"}},"roon":{"type":"http","url":"http://10.40.0.2:8088/mcp"}}}"#
+    );
     const GOLDEN_EMPTY_MCP: &str = r#"{"mcpServers":{}}"#;
 
     /// The shared base plus a site's MCP + containment args — one full expected argv.
