@@ -68,6 +68,8 @@ final class MacFakeBridgeClient: BridgeClientProtocol, @unchecked Sendable {
     private var _deleted: [String] = []
     private var _sentConversationIds: [String] = []
     private var _sentTexts: [String] = []
+    private var _sentModes: [JesseMode] = []
+    private var _sentSessionIds: [String?] = []
 
     var hydrateCalls: [(conversationId: String, after: String?)] { lock.withLock { _hydrateCalls } }
     var deletedCalls: [String] { lock.withLock { _deleted } }
@@ -75,6 +77,11 @@ final class MacFakeBridgeClient: BridgeClientProtocol, @unchecked Sendable {
     /// The message text of every `send`, verbatim — so a test can assert what the bridge would
     /// have received, embedded newlines included.
     var sentTexts: [String] { lock.withLock { _sentTexts } }
+    /// The mode each turn went out under. Ask and Tell carry different floors, so "which
+    /// mode did this action send" is a behavioral assertion, not bookkeeping.
+    var sentModes: [JesseMode] { lock.withLock { _sentModes } }
+    /// The `session_id` each turn resumed, if any — nil is a conversation that resumes nothing.
+    var sentSessionIds: [String?] { lock.withLock { _sentSessionIds } }
 
     /// Awaited at the top of `send`, before anything is recorded. A test that needs to observe the
     /// in-flight state (the send gate while a turn runs) holds the send open here.
@@ -117,6 +124,8 @@ final class MacFakeBridgeClient: BridgeClientProtocol, @unchecked Sendable {
         return lock.withLock {
             _sentConversationIds.append(conversationId)
             _sentTexts.append(text)
+            _sentModes.append(mode)
+            _sentSessionIds.append(sessionId)
             // Echo the id back the way the bridge does, so the Mac's adopt-and-stamp path is
             // exercised rather than bypassed.
             switch sendResult {

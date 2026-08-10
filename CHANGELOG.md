@@ -15,6 +15,65 @@ CI both run it). See the "Versioning" section of `bridge/README.md`.
 
 ## [Unreleased]
 
+## [App 1.0 (99)] - 2026-08-10
+
+### Added
+
+- **The Mac has a Today tab, and it is the same Today tab.** `MacTodayView` is a wrapper
+  around the SHARED `TodayListView` — the narrative header, the schedule block, the
+  sections in file order, the project stripes, the sort lens, the evidence sheet, the
+  Process-updates confirmation, the drag-and-drop reorder. None of it was re-implemented
+  for macOS and none of it could sensibly have been: the portable library exists so that
+  the second platform is a shell and not a second screen. What this file adds is only
+  what a Mac window knows — the toolbar, the keyboard, where a conversation opens, and
+  when to refetch. It holds no state of its own beyond the shared bridge state, so check,
+  move and glance all round-trip through the same endpoints the phone writes to and the
+  later action wins on the next refresh.
+
+  **Today leads the Mac's tab bar**, matching the iPhone: the day file is what the app is
+  for, and a shell that opens on Chats makes the user's first act a tab switch. Chats
+  keeps every one of its behaviors (⌘N, ⌘⇧F, ⌘⇧A, search, favorites, archive) untouched,
+  and each tab owns its own ⌘R because only the selected tab's toolbar is live.
+
+- **A keyboard that means something: arrow keys walk the day, space ticks the selected
+  row.** Space runs the same function a click on the checkbox runs, so the evidence sheet
+  appears with its "Done, no note" fast path intact and a read-only day refuses the space
+  key exactly as it refuses the click — a second spelling of "what checking an item
+  means" is the one that would forget to ask for evidence. ⌘R re-reads the day file.
+  Selecting a row is what the single click now does on the Mac, so opening the note
+  behind it is the second click; the phone is untouched and still opens on one tap.
+
+- **Discuss and Propagate open a conversation from the day.** Both go through the Mac's
+  own thread-opening path onto a fresh thread, and both carry the frozen prompt builders
+  in JesseCore rather than any inline string. Discuss OPENS WITHOUT FIRING, as on the
+  phone: the item, its links and the anti-routing framing wait as attached context and
+  ride Jeremy's own first message, composed by the shared `TodayThreadContext` — so a
+  discussion on the Mac is scoped by byte-identical text to one on the phone, and an
+  empty send is still the explicit "just look at it". Propagate and a wiki chip are
+  execute actions and fire on the click. The conversation opens in a sheet rather than
+  stealing the Chats tab's sidebar selection; it is a real thread, so it is in the
+  sidebar afterwards either way.
+
+### Changed
+
+- **`TodayTurn` moved from the iOS target into JesseTodayDisplay** (its own commit).
+  Which prompt an action sends and in what mode — Discuss is an Ask carrying
+  `TodayDiscuss.prompt`, Propagate a Tell carrying `TodayPropagate.prompt` — is a fact
+  about the screen and not about a platform, and the Mac tab was about to become the
+  second place that knew it. The second copy is the one that drifts, and drift here means
+  a turn missing the scope clause that keeps an item discussion from tripping the morning
+  routine. What stayed in each app target is the half that genuinely differs: how a turn
+  is DISPATCHED (fire now, or hold for the first message) and on what thread.
+
+- **`TodayListView` learned an optional selection**, and `TodayItemRow` an optional
+  double-tap-to-open (also its own commit, and both default to the phone's existing
+  behavior). Selection is not free on iOS — a `List` handed a selection binding shows
+  selection circles in edit mode, which is exactly where this screen puts its accessible
+  reorder grips — so the phone passes nothing and gets the list it had. The Mac passes a
+  binding and gets what selection is for: a keyboard. The double-tap parameter is not
+  really about the operating system either; it is about whether the list has a selection
+  competing for the first click, which is why it is a parameter and not an `#if`.
+
 ## [App 1.0 (98)] - 2026-08-10
 
 ### Added
