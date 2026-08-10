@@ -15,6 +15,53 @@ CI both run it). See the "Versioning" section of `bridge/README.md`.
 
 ## [Unreleased]
 
+## [Bridge 0.70.0] - 2026-08-10
+
+### Added
+
+- **`GET /jesse/today` — the vault's day file as a structured snapshot.** A read-only
+  endpoint that parses `<vault>/vault/Today.md` and serves it as ids and values, so the
+  phone can render the day as a screen instead of a wall of markdown. Same posture as
+  `GET /jesse/diet`: bearer auth, strictly read-only, and a pure function of file state.
+  No `date` parameter — the file is undated by design and is overwritten every morning,
+  so there is only ever a current state to serve.
+
+  - **The parser is non-destructive.** It never re-serializes the document. Every node
+    (section, item, prose line, report row) keeps the byte range it came from, so a
+    later write path can check a box by splicing exactly those bytes and leaving every
+    other byte alone. The file is hand-edited and agent-edited between rebuilds; a
+    round-trip through a markdown serializer would reflow prose and normalize whitespace
+    that a person chose. A test splices one item out by its range and asserts the rest of
+    the file is byte-identical.
+  - **It is tolerant, with no error path.** A missing H1, an unparseable date, a
+    half-written checkbox, an unknown section name — each degrades to a null, a prose
+    line, or the default `tasks` kind. A missing day file is `200` with an empty
+    snapshot and `missing: true`, never a `404`: before the morning routine has run
+    there is legitimately no file, and the phone should render an empty day.
+  - **Item ids survive the morning rebuild.** `id` is the first 12 hex of
+    `sha256(section + "|" + normalized_lead + "|" + added_date)`. The file is rewritten
+    in full each day and nothing in it is stable except the words, so identity is taken
+    from exactly the parts that identify an item — never the `updated` trailer, the body
+    after the lead, the continuations or the checkbox. An item can be reworded, re-dated,
+    extended or ticked without changing id, and client-side state keyed on that id
+    survives the rebuild. Duplicates within one parse take `-2` / `-3` suffixes in file
+    order.
+  - **Section `kind` is a rendering hint, not a parse mode.** `schedule` / `briefing` /
+    `tasks` tells the client how to lay a section out; task lines are parsed wherever
+    they appear, including in the briefing sections that regularly carry one.
+  - **A strong ETag, over the file's content only.** `generatedAt` is deliberately
+    excluded from the hashed bytes — folding a wall clock in would mint a fresh tag on
+    every request and no client would ever see a `304`. The same tag is echoed inside
+    the body for clients that store the payload without its headers.
+
+  Out of scope, and noted as follow-on: any write path (checking a box, marking a
+  glanceable seen) and SSE push of `Today.md` changes.
+
+- **A read-only glance store, deliberately ahead of its writer.** Report rows carry
+  `seen` / `seenMs` merged from `<state_dir>/glance.json`. **No such file exists yet.**
+  It is read now rather than later so the absent case and the present case are one code
+  path: an absent, unreadable or malformed store reads as empty and never as an error.
+
 ## [Bridge 0.69.0] - 2026-08-09
 
 ### Added

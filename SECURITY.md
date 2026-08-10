@@ -1338,6 +1338,42 @@ To keep a single client (or a runaway turn) from exhausting the host:
   20 MB). The request body limit is sized from these (base64-inflated) so an
   oversized upload is refused before it's buffered.
 
+## Day file (`GET /jesse/today`)
+
+`GET /jesse/today` serves the vault's `Today.md` as a structured snapshot so the
+app can render the day as a screen. It is **read-only**: it opens one file, parses
+it in memory, and writes nothing — not the day file, not a cache, not a log line.
+
+- **Same trust class as `/jesse/diet`.** Both serve **personal vault content** to
+  an authenticated tailnet client, and both are gated by exactly the same two
+  factors: the WireGuard/ACL-gated interface the bridge binds to, and the bearer
+  token. An **unauthenticated** caller gets `401` and learns nothing, including
+  whether the file exists. It also shares the global rate limiter (`429` on a
+  burst), which `/jesse/diet` does not — see the note in that PR.
+- **What an authenticated caller can now read.** The whole day file: task text,
+  the day narrative, the schedule, the briefing sections and every wiki/URL link
+  in them. That is more personal than the diet snapshot's numbers — it is names,
+  commitments and calendar — but it is the **same content, the same trust class
+  and the same single credential** as the "Ask Jesse" turns that already read and
+  quote this file. This endpoint moves no boundary; it changes the shape the
+  content arrives in.
+- **One path, composed from config, with no traversal surface.** The file read is
+  `<JESSE_VAULT>/<VAULT_SUBDIR>/Today.md` — a constant filename joined onto the
+  configured vault root, the same resolution `/jesse/diet` uses for its data
+  files. **No part of the path comes from the request**: the endpoint takes no
+  query parameters and no path segments, so there is nothing for a caller to
+  traverse with.
+- **No containment-record change.** This adds no MCP server, no tool grant and no
+  agent capability — no child process is involved at all. The containment rows
+  and the startup gate are untouched.
+- **A missing file is not an error.** It returns `200` with an empty snapshot and
+  `missing: true`, so a caller cannot use a `404`/`200` difference to probe the
+  filesystem, and the app renders an empty day before the morning routine has run.
+- **The glance store is read-only here too.** `<state_dir>/glance.json` (which
+  does not exist yet) is read for report-row `seen` state and never written by
+  this endpoint. An absent, unreadable or malformed store reads as **empty**, not
+  as an error.
+
 ## Session list (`GET /jesse/sessions`)
 
 `GET /jesse/sessions` lets the app show a history of conversations. It is

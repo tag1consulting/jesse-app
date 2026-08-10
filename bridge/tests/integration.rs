@@ -6869,7 +6869,10 @@ async fn today_happy_path_returns_the_structured_snapshot() {
     // Ids and values only: every item carries an id and a byte range.
     for s in sections {
         for it in s["items"].as_array().unwrap() {
-            assert!(!it["id"].as_str().unwrap().is_empty(), "every item has an id");
+            assert!(
+                !it["id"].as_str().unwrap().is_empty(),
+                "every item has an id"
+            );
             assert!(it["range"]["end"].as_u64().unwrap() > it["range"]["start"].as_u64().unwrap());
         }
     }
@@ -6921,7 +6924,10 @@ async fn today_etag_is_stable_and_if_none_match_gives_304() {
         .await
         .unwrap();
     assert_eq!(cached.status(), StatusCode::NOT_MODIFIED);
-    assert_eq!(cached.headers().get("etag").unwrap().to_str().unwrap(), etag);
+    assert_eq!(
+        cached.headers().get("etag").unwrap().to_str().unwrap(),
+        etag
+    );
     assert!(body_string(cached).await.is_empty(), "304 carries no body");
 
     let wildcard = app(st.clone())
@@ -6968,7 +6974,10 @@ async fn today_missing_file_is_200_with_an_empty_snapshot_and_a_missing_marker()
     assert!(body["sections"].as_array().unwrap().is_empty());
     assert!(body["leadItems"].as_array().unwrap().is_empty());
     assert_eq!(body["counts"]["open"], 0);
-    assert!(body["etag"].as_str().is_some(), "an empty snapshot still tags");
+    assert!(
+        body["etag"].as_str().is_some(),
+        "an empty snapshot still tags"
+    );
 
     let _ = std::fs::remove_dir_all(&vault);
 }
