@@ -1,0 +1,419 @@
+{
+  "counts": {
+    "done": 3,
+    "open": 6,
+    "reportsUnseen": 6
+  },
+  "date": "2026-03-03",
+  "etag": "\"843ee2a1380e9d233e1b031ba83d1117321e3ed52ed72c451df5deeef1963916\"",
+  "generatedAt": "2026-03-03T09:00:00Z",
+  "leadItems": [
+    {
+      "addedDate": "2026-01-04",
+      "appCompleted": null,
+      "checked": false,
+      "id": "8997e65be5bd",
+      "lead": "TOP PRIORITY: Finish the kiln rebuild",
+      "links": [
+        {
+          "kind": "wiki",
+          "target": "notes/Projects/kiln-rebuild"
+        }
+      ],
+      "range": {
+        "end": 306,
+        "start": 33
+      },
+      "sectionName": "",
+      "text": "- [ ] TOP PRIORITY: Finish the kiln rebuild (Added 2026-01-04)\n\t**Standing lead item (decided 2026-01-04): stays the FIRST item at every rebuild until the kiln fires clean.**\n\tWhere it stands: the new elements are in, the controller is not. [[notes/Projects/kiln-rebuild]]",
+      "updatedDate": null
+    }
+  ],
+  "missing": false,
+  "narrative": "**Tuesday, and it is a short day: one vendor call at 09:00 and the rest is workshop time.**",
+  "sections": [
+    {
+      "items": [],
+      "kind": "schedule",
+      "name": "Schedule",
+      "prose": [
+        {
+          "range": {
+            "end": 515,
+            "start": 413
+          },
+          "text": "* **09:00 to 09:30 — Kiln vendor call** (Ada, phone). Agenda: [[notes/drafts/2026-03-03-kiln-call]]"
+        },
+        {
+          "range": {
+            "end": 581,
+            "start": 515
+          },
+          "text": "* **13:00 to 15:00 — Workshop block.** No interruptions booked."
+        }
+      ],
+      "range": {
+        "end": 582,
+        "start": 400
+      },
+      "reports": []
+    },
+    {
+      "items": [
+        {
+          "addedDate": "2026-03-01",
+          "appCompleted": null,
+          "checked": false,
+          "id": "31c498907462",
+          "lead": "Order the replacement thermocouple.",
+          "links": [],
+          "range": {
+            "end": 746,
+            "start": 593
+          },
+          "sectionName": "Do Now",
+          "text": "* [ ] **Order the replacement thermocouple.** Part number TC-4417, two of them, and ask about the ceramic sleeve. (Added 2026-03-01, updated 2026-03-03)",
+          "updatedDate": "2026-03-03"
+        },
+        {
+          "addedDate": "2026-02-27",
+          "appCompleted": null,
+          "checked": false,
+          "id": "fae3ec2a79d2",
+          "lead": "Reply to Ada about the firing schedule.",
+          "links": [
+            {
+              "kind": "url",
+              "target": "https://example.invalid/kiln/schedule"
+            },
+            {
+              "kind": "wiki",
+              "target": "notes/Dashboard/Workshop"
+            }
+          ],
+          "range": {
+            "end": 919,
+            "start": 746
+          },
+          "sectionName": "Do Now",
+          "text": "* [ ] **Reply to Ada about the firing schedule.** She wants a date before Friday: https://example.invalid/kiln/schedule and [[notes/Dashboard/Workshop]]. (Added 2026-02-27)",
+          "updatedDate": null
+        },
+        {
+          "addedDate": null,
+          "appCompleted": null,
+          "checked": false,
+          "id": "971252d7ef9b",
+          "lead": "Plain unbolded item with no trailer at all.",
+          "links": [],
+          "range": {
+            "end": 1015,
+            "start": 919
+          },
+          "sectionName": "Do Now",
+          "text": "* [ ] Plain unbolded item with no trailer at all. This second sentence must not reach the lead.",
+          "updatedDate": null
+        },
+        {
+          "addedDate": null,
+          "appCompleted": null,
+          "checked": false,
+          "id": "b696ea448edc",
+          "lead": "",
+          "links": [],
+          "range": {
+            "end": 1021,
+            "start": 1015
+          },
+          "sectionName": "Do Now",
+          "text": "* [ ]",
+          "updatedDate": null
+        }
+      ],
+      "kind": "tasks",
+      "name": "Do Now",
+      "prose": [
+        {
+          "range": {
+            "end": 1093,
+            "start": 1021
+          },
+          "text": "- [] not really a task — the box is malformed, so this line is prose."
+        }
+      ],
+      "range": {
+        "end": 1094,
+        "start": 582
+      },
+      "reports": []
+    },
+    {
+      "items": [
+        {
+          "addedDate": "2026-03-02",
+          "appCompleted": {
+            "at": "2026-03-03T08:12:00Z",
+            "evidence": "checked off on the phone"
+          },
+          "checked": true,
+          "id": "8dd0678d544b",
+          "lead": "Collect the glaze order.",
+          "links": [],
+          "range": {
+            "end": 1255,
+            "start": 1106
+          },
+          "sectionName": "Errands",
+          "text": "* [x] **Collect the glaze order.** Picked up first thing. (Added 2026-03-02)\n    *(app-completed 2026-03-03T08:12:00Z — checked off on the phone)*",
+          "updatedDate": null
+        },
+        {
+          "addedDate": "2026-03-02",
+          "appCompleted": null,
+          "checked": true,
+          "id": "94cf6a2af737",
+          "lead": "Return the borrowed clamps.",
+          "links": [],
+          "range": {
+            "end": 1340,
+            "start": 1255
+          },
+          "sectionName": "Errands",
+          "text": "* [X] **Return the borrowed clamps.** Ada's, borrowed in January. (Added 2026-03-02)",
+          "updatedDate": null
+        }
+      ],
+      "kind": "tasks",
+      "name": "Errands",
+      "prose": [],
+      "range": {
+        "end": 1341,
+        "start": 1094
+      },
+      "reports": []
+    },
+    {
+      "items": [
+        {
+          "addedDate": "2026-02-20",
+          "appCompleted": null,
+          "checked": false,
+          "id": "cfccd89d4a7e",
+          "lead": "Book the annual check-up.",
+          "links": [],
+          "range": {
+            "end": 1620,
+            "start": 1525
+          },
+          "sectionName": "Health",
+          "text": "* [ ] **Book the annual check-up.** The surgery takes bookings a month out. (Added 2026-02-20)",
+          "updatedDate": null
+        }
+      ],
+      "kind": "briefing",
+      "name": "Health",
+      "prose": [
+        {
+          "range": {
+            "end": 1524,
+            "start": 1456
+          },
+          "text": "Plain prose with no bold and no link, carried as section body text."
+        }
+      ],
+      "range": {
+        "end": 1621,
+        "start": 1341
+      },
+      "reports": [
+        {
+          "id": "d301bf762058",
+          "kind": "health",
+          "links": [
+            {
+              "kind": "wiki",
+              "target": "notes/Health/Running"
+            }
+          ],
+          "range": {
+            "end": 1455,
+            "start": 1352
+          },
+          "sectionName": "Health",
+          "seen": false,
+          "seenMs": 0,
+          "title": "Tuesday is a run day."
+        }
+      ]
+    },
+    {
+      "items": [],
+      "kind": "briefing",
+      "name": "Currency",
+      "prose": [
+        {
+          "range": {
+            "end": 1706,
+            "start": 1634
+          },
+          "text": "Both rate reports ran again this morning, and neither has a fixing yet."
+        },
+        {
+          "range": {
+            "end": 1923,
+            "start": 1829
+          },
+          "text": "* **A bold line carrying no link at all**, which stays in prose because it is not glanceable."
+        }
+      ],
+      "range": {
+        "end": 1924,
+        "start": 1621
+      },
+      "reports": [
+        {
+          "id": "50060968519b",
+          "kind": "currency",
+          "links": [
+            {
+              "kind": "wiki",
+              "target": "notes/Currency/2026-03-02"
+            }
+          ],
+          "range": {
+            "end": 1829,
+            "start": 1707
+          },
+          "sectionName": "Currency",
+          "seen": false,
+          "seenMs": 0,
+          "title": "USD/EUR: the fixing has not posted yet"
+        }
+      ]
+    },
+    {
+      "items": [],
+      "kind": "briefing",
+      "name": "Still open (aging)",
+      "prose": [],
+      "range": {
+        "end": 2153,
+        "start": 1924
+      },
+      "reports": [
+        {
+          "id": "94b417b772a4",
+          "kind": "general",
+          "links": [
+            {
+              "kind": "wiki",
+              "target": "notes/Dashboard/Insurance"
+            }
+          ],
+          "range": {
+            "end": 2055,
+            "start": 1947
+          },
+          "sectionName": "Still open (aging)",
+          "seen": false,
+          "seenMs": 0,
+          "title": "41 days: the workshop insurance renewal."
+        },
+        {
+          "id": "c580d420bd16",
+          "kind": "philosophy",
+          "links": [
+            {
+              "kind": "wiki",
+              "target": "notes/Reference/sep-note"
+            }
+          ],
+          "range": {
+            "end": 2152,
+            "start": 2055
+          },
+          "sectionName": "Still open (aging)",
+          "seen": false,
+          "seenMs": 0,
+          "title": "19 days: the SEP note on workshop philosophy is still unread."
+        }
+      ]
+    },
+    {
+      "items": [],
+      "kind": "briefing",
+      "name": "Reminders (Mar 3 to Mar 10)",
+      "prose": [],
+      "range": {
+        "end": 2352,
+        "start": 2153
+      },
+      "reports": [
+        {
+          "id": "d31fd08915e3",
+          "kind": "cheatsheet",
+          "links": [
+            {
+              "kind": "wiki",
+              "target": "notes/Reference/kiln-cheatsheet"
+            }
+          ],
+          "range": {
+            "end": 2271,
+            "start": 2185
+          },
+          "sectionName": "Reminders (Mar 3 to Mar 10)",
+          "seen": false,
+          "seenMs": 0,
+          "title": "FYI: the kiln cheatsheet was refreshed overnight."
+        },
+        {
+          "id": "3cd2b901bcc5",
+          "kind": "general",
+          "links": [
+            {
+              "kind": "wiki",
+              "target": "notes/Dashboard/Workshop"
+            }
+          ],
+          "range": {
+            "end": 2351,
+            "start": 2272
+          },
+          "sectionName": "Reminders (Mar 3 to Mar 10)",
+          "seen": false,
+          "seenMs": 0,
+          "title": "Wed Mar 4:"
+        }
+      ]
+    },
+    {
+      "items": [
+        {
+          "addedDate": "2026-03-03",
+          "appCompleted": null,
+          "checked": true,
+          "id": "c383a7ee348f",
+          "lead": "Start of day processing (2026-03-03, Tuesday):",
+          "links": [],
+          "range": {
+            "end": 2481,
+            "start": 2367
+          },
+          "sectionName": "Done Today",
+          "text": "* [x] **Start of day processing (2026-03-03, Tuesday):** four scanners and the workshop sweep. (Added 2026-03-03)",
+          "updatedDate": null
+        }
+      ],
+      "kind": "tasks",
+      "name": "Done Today",
+      "prose": [],
+      "range": {
+        "end": 2481,
+        "start": 2352
+      },
+      "reports": []
+    }
+  ],
+  "title": "Today: Tuesday, March 3, 2026"
+}

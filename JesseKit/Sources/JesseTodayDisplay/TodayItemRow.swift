@@ -1,0 +1,274 @@
+import SwiftUI
+import JesseNetworking
+
+// One task row, and the pieces it is built from. Pure SwiftUI: no UIKit, no AppKit,
+// no platform conditionals. Every color is a semantic one that exists on both
+// platforms (`.secondary`, `.tint`, the material fills), which is what lets this
+// file — and this whole target — compile for macOS with no PlatformCompat seam at
+// all.
+
+// MARK: - The checkbox
+
+/// The tap target. Deliberately a `Button` with a plain style rather than a `Toggle`:
+/// a checked row can also open the evidence sheet, and a toggle's binding would fire
+/// on the way in AND on the way back out when the sheet is dismissed.
+struct TodayCheckbox: View {
+    let checked: Bool
+    let pending: Bool
+    let action: () -> Void
+
+    var body: some View {
+        Button(action: action) {
+            Image(systemName: checked ? "checkmark.circle.fill" : "circle")
+                .font(.title3)
+                .foregroundStyle(checked ? AnyShapeStyle(.tint) : AnyShapeStyle(.secondary))
+                .symbolEffect(.bounce, value: checked)
+                // A tap that has not landed yet reads as slightly withdrawn rather than
+                // as a spinner: the state is committed locally, it is just not
+                // acknowledged, and a spinner would suggest it might not stick.
+                .opacity(pending ? 0.55 : 1)
+                .contentShape(.rect)
+                .frame(width: 32, height: 32)
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel(checked ? "Completed" : "Not completed")
+        .accessibilityAddTraits(checked ? [.isSelected, .isButton] : .isButton)
+    }
+}
+
+// MARK: - Link chips
+
+/// One link as a tappable chip. Wiki targets show their leaf name, URLs their host —
+/// a full vault path would not fit and would not help.
+public struct TodayLinkChip: View {
+    let link: TodayLink
+    let onOpen: (TodayLink) -> Void
+
+    public var body: some View {
+        Button { onOpen(link) } label: {
+            Label(link.chipLabel, systemImage: link.isWiki ? "doc.text" : "link")
+                .font(.caption2)
+                .lineLimit(1)
+                .padding(.horizontal, 8)
+                .padding(.vertical, 3)
+                .background(.quaternary, in: .capsule)
+        }
+        .buttonStyle(.plain)
+        .foregroundStyle(.secondary)
+        .accessibilityLabel("Open \(link.chipLabel)")
+    }
+}
+
+/// An item's links, wrapped so a row with many of them grows downward instead of
+/// truncating. Nothing renders when there are none.
+struct TodayLinkChips: View {
+    let links: [TodayLink]
+    let onOpen: (TodayLink) -> Void
+
+    var body: some View {
+        if !links.isEmpty {
+            // `Layout`-free wrapping: a flexible grid with a minimum column width lets
+            // chips flow onto as many rows as they need on a phone and a Mac window
+            // alike, with no measurement pass of our own.
+            FlowRow(spacing: 6) {
+                ForEach(links, id: \.target) { TodayLinkChip(link: $0, onOpen: onOpen) }
+            }
+        }
+    }
+}
+
+/// A minimal wrapping row. SwiftUI has no built-in flow layout, and the alternative
+/// — a horizontal `ScrollView` — hides links behind a scroll gesture that competes
+/// with the list's own.
+struct FlowRow: Layout {
+    var spacing: CGFloat = 6
+
+    func sizeThatFits(proposal: ProposedViewSize, subviews: Subviews,
+                      cache: inout ()) -> CGSize {
+        let width = proposal.width ?? .infinity
+        let rows = arrange(subviews: subviews, width: width)
+        let height = rows.reduce(0) { $0 + $1.height } + spacing * CGFloat(max(0, rows.count - 1))
+        let widest = rows.map(\.width).max() ?? 0
+        return CGSize(width: min(width, max(widest, 0)), height: height)
+    }
+
+    func placeSubviews(in bounds: CGRect, proposal: ProposedViewSize, subviews: Subviews,
+                       cache: inout ()) {
+        var y = bounds.minY
+        for row in arrange(subviews: subviews, width: bounds.width) {
+            var x = bounds.minX
+            for index in row.indices {
+                let size = subviews[index].sizeThatFits(.unspecified)
+                subviews[index].place(at: CGPoint(x: x, y: y), proposal: ProposedViewSize(size))
+                x += size.width + spacing
+            }
+            y += row.height + spacing
+        }
+    }
+
+    private struct Row {
+        var indices: [Int] = []
+        var width: CGFloat = 0
+        var height: CGFloat = 0
+    }
+
+    private func arrange(subviews: Subviews, width: CGFloat) -> [Row] {
+        var rows: [Row] = []
+        var current = Row()
+        for index in subviews.indices {
+            let size = subviews[index].sizeThatFits(.unspecified)
+            let needed = current.indices.isEmpty ? size.width : current.width + spacing + size.width
+            if needed > width, !current.indices.isEmpty {
+                rows.append(current)
+                current = Row()
+            }
+            current.width = current.indices.isEmpty ? size.width : current.width + spacing + size.width
+            current.height = max(current.height, size.height)
+            current.indices.append(index)
+        }
+        if !current.indices.isEmpty { rows.append(current) }
+        return rows
+    }
+}
+
+// MARK: - The row
+
+/// One task line: its checkbox, its bold lead with the detail after it, its
+/// continuations, its links, its dates, and the evidence a completion recorded.
+public struct TodayItemRow: View {
+    let item: TodayItem
+    let pending: Bool
+    let evidence: String?
+    let availableMoves: [TodayMoveOp]
+    let onToggle: (Bool) -> Void
+    let onMove: (TodayMoveOp) -> Void
+    let onDiscuss: () -> Void
+    let onPropagate: () -> Void
+    let onOpenLink: (TodayLink) -> Void
+
+    public init(item: TodayItem, pending: Bool = false, evidence: String? = nil,
+                availableMoves: [TodayMoveOp] = [],
+                onToggle: @escaping (Bool) -> Void,
+                onMove: @escaping (TodayMoveOp) -> Void = { _ in },
+                onDiscuss: @escaping () -> Void = {},
+                onPropagate: @escaping () -> Void = {},
+                onOpenLink: @escaping (TodayLink) -> Void = { _ in }) {
+        self.item = item
+        self.pending = pending
+        self.evidence = evidence
+        self.availableMoves = availableMoves
+        self.onToggle = onToggle
+        self.onMove = onMove
+        self.onDiscuss = onDiscuss
+        self.onPropagate = onPropagate
+        self.onOpenLink = onOpenLink
+    }
+
+    private var parts: (lead: String, detail: String) { TodaySemantics.leadAndDetail(item) }
+
+    public var body: some View {
+        HStack(alignment: .top, spacing: 10) {
+            TodayCheckbox(checked: item.checked, pending: pending) { onToggle(!item.checked) }
+            VStack(alignment: .leading, spacing: 4) {
+                text
+                ForEach(TodaySemantics.continuationLines(item), id: \.self) { line in
+                    Text(line)
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+                }
+                TodayLinkChips(links: item.links, onOpen: onOpenLink)
+                if let evidence {
+                    Label(evidence, systemImage: "text.quote")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .labelStyle(.titleAndIcon)
+                }
+                if let caption = TodaySemantics.dateCaption(item) {
+                    Text(caption)
+                        .font(.caption2)
+                        .foregroundStyle(.tertiary)
+                }
+            }
+            Spacer(minLength: 0)
+            TodayItemMenu(item: item, availableMoves: availableMoves,
+                          onMove: onMove, onDiscuss: onDiscuss, onPropagate: onPropagate)
+        }
+        .padding(.vertical, 4)
+        .accessibilityElement(children: .contain)
+    }
+
+    /// The bold lead and the rest of the line as one string, so it wraps as a
+    /// paragraph rather than as two stacked blocks. A completed row is struck through
+    /// and dimmed; the text stays readable because a done item is still evidence of
+    /// what the day held.
+    private var text: some View {
+        Text(attributed)
+            .font(.body)
+            .strikethrough(item.checked, color: .secondary)
+            .foregroundStyle(item.checked ? AnyShapeStyle(.secondary) : AnyShapeStyle(.primary))
+            .fixedSize(horizontal: false, vertical: true)
+    }
+
+    /// One attributed string rather than two concatenated `Text`s, so the lead and
+    /// the detail wrap as a single paragraph — and because `Text + Text` is deprecated
+    /// on the platforms this targets.
+    private var attributed: AttributedString {
+        let (lead, detail) = parts
+        var out = AttributedString(lead)
+        out.font = .body.weight(.semibold)
+        guard !detail.isEmpty else { return out }
+        out.append(AttributedString(" " + detail))
+        return out
+    }
+}
+
+// MARK: - The per-item menu
+
+/// The row's overflow menu: the moves that would actually do something, plus the two
+/// conversation actions. Rendered as nothing at all when there is nothing to offer —
+/// which is the case for the standing lead item, whose every move the bridge refuses.
+struct TodayItemMenu: View {
+    let item: TodayItem
+    let availableMoves: [TodayMoveOp]
+    let onMove: (TodayMoveOp) -> Void
+    let onDiscuss: () -> Void
+    let onPropagate: () -> Void
+
+    var body: some View {
+        Menu {
+            Button { onDiscuss() } label: {
+                Label("Discuss this item", systemImage: "bubble.left.and.text.bubble.right")
+            }
+            // Propagation closes an item AT SOURCE — in its project file and its
+            // Dashboard — so it is only offered for something already completed.
+            // Offering it on an open item would invite a turn that closes work the
+            // user has not done.
+            if item.checked {
+                Button { onPropagate() } label: {
+                    Label("Close it at source", systemImage: "arrow.up.forward.square")
+                }
+            }
+            if !availableMoves.isEmpty {
+                Divider()
+                ForEach(availableMoves, id: \.self) { op in
+                    Button { onMove(op) } label: {
+                        Label(TodaySemantics.label(for: op),
+                              systemImage: TodaySemantics.symbol(for: op))
+                    }
+                }
+            }
+        } label: {
+            Image(systemName: "ellipsis")
+                .font(.footnote)
+                .foregroundStyle(.secondary)
+                .frame(width: 28, height: 28)
+                .contentShape(.rect)
+        }
+        // No `.menuStyle` here on purpose: the borderless-button style is a macOS
+        // spelling, and this file must compile unchanged for both platforms. The
+        // automatic style plus a hidden indicator gives the same bare-glyph result.
+        .menuIndicator(.hidden)
+        .fixedSize()
+        .accessibilityLabel("Actions for \(item.lead)")
+    }
+}
