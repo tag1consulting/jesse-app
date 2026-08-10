@@ -2,20 +2,23 @@ import SwiftUI
 import JesseNetworking
 import JesseTodayDisplay
 
-// The app root: a three-tab shell. "Chats" hosts the existing conversation UI
-// (`ContentView`) exactly as before — every Siri/push/voice entry point it owns
-// keeps working, because the whole view (and its scene-phase + onChange handlers)
-// lives inside the tab, which TabView keeps mounted. "Health" is the native diet
-// dashboard; "Today" is the vault's day file. Wrapping (rather than restructuring)
-// `ContentView` is the non-invasive path: nothing about the old root's behavior
-// changes.
+// The app root: a three-tab shell. "Today" is the vault's day file and comes FIRST,
+// because it is what the app is for — the day's work, on the phone. "Chats" hosts the
+// existing conversation UI (`ContentView`) exactly as before — every Siri/push/voice
+// entry point it owns keeps working, because the whole view (and its scene-phase +
+// onChange handlers) lives inside the tab, which TabView keeps mounted. "Health" is
+// the native diet dashboard. Wrapping (rather than restructuring) `ContentView` is the
+// non-invasive path: nothing about the old root's behavior changes.
 struct RootTabView: View {
     /// The tabs, as data. A `CaseIterable` enum the body ITERATES rather than a
     /// hand-written list of three `.tabItem`s: the set of tabs, their order, and
     /// their labels then have exactly one definition, which is also the one a test
     /// can assert against.
+    ///
+    /// CASE ORDER IS BAR ORDER. The body iterates `allCases`, so moving a case moves
+    /// the tab, and there is no second list to keep in step.
     enum Tab: String, Hashable, CaseIterable, Identifiable {
-        case chats, health, today
+        case today, chats, health
 
         var id: String { rawValue }
 
@@ -42,7 +45,13 @@ struct RootTabView: View {
         }
     }
 
-    @State private var selection: Tab = .chats
+    /// What the app launches on. Today: the day file is the app's primary purpose,
+    /// and a shell that opens on Chats makes the user's first act a tab switch. Named
+    /// rather than written inline so the launch tab and the bar's leading tab are one
+    /// decision a test can hold to (`Tab.allCases.first`).
+    static let defaultTab: Tab = .today
+
+    @State private var selection: Tab = RootTabView.defaultTab
 
     /// The Today screen's model lives HERE, not in `TodayTabView`, because the tab
     /// item's badge and the screen must read the same number. Injected through the

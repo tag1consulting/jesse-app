@@ -151,4 +151,39 @@ final class TodayPromptsTests: XCTestCase {
                           "the item block is fenced by blank lines")
         }
     }
+
+    // MARK: - Attached context
+
+    /// A discussion no longer fires on open: the prompt is ATTACHED to an empty
+    /// thread and joins the user's own first message. The context comes first —
+    /// scope before question — and the typed words are the last thing the agent
+    /// reads, under a label so a multi-line message can't read as instruction.
+    func testTheFirstMessageKeepsTheContextAheadOfTheTypedText() {
+        let context = TodayDiscuss.prompt(item: item)
+        let composed = TodayThreadContext.firstMessage(context: context,
+                                                       typed: "Is this still worth doing?")
+
+        XCTAssertTrue(composed.hasPrefix(context), "the frozen framing still opens the turn")
+        XCTAssertTrue(composed.hasSuffix("Is this still worth doing?"))
+        XCTAssertTrue(composed.contains(item), "the item markdown still travels verbatim")
+        XCTAssertTrue(composed.contains("Do not run start of day"),
+                      "and the anti-routing guard is still in the turn")
+    }
+
+    /// An explicit send with nothing typed is "just look at it": the context alone,
+    /// byte for byte, with no empty label dangling off the end for the agent to read
+    /// as a message that never arrived.
+    func testAnEmptyMessageSendsTheContextAlone() {
+        let context = TodayDiscuss.prompt(item: item)
+        XCTAssertEqual(TodayThreadContext.firstMessage(context: context, typed: ""), context)
+        XCTAssertEqual(TodayThreadContext.firstMessage(context: context, typed: "  \n "), context)
+    }
+
+    /// Surrounding whitespace on the typed text is trimmed, and the composed message
+    /// never ends in the trailing newlines a multi-line composer leaves behind.
+    func testTheTypedTextIsTrimmed() {
+        let composed = TodayThreadContext.firstMessage(context: "CONTEXT", typed: "  ask me\n\n")
+        XCTAssertTrue(composed.hasSuffix("ask me"))
+        XCTAssertFalse(composed.contains("  ask me"))
+    }
 }

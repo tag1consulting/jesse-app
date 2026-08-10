@@ -44,12 +44,17 @@ struct TodayTabView: View {
     /// and dismissing it returns them to the row they acted on.
     @State private var openedThread: JesseThread?
 
+    /// The thread a Discuss STAGED, remembered only so its attached context can be
+    /// dropped if the sheet is dismissed without a send. `.sheet(item:)` nils its
+    /// binding before calling `onDismiss`, so the id has to be held separately.
+    @State private var stagedThreadID: UUID?
+
     var body: some View {
         NavigationStack {
             TodayListView(model: model,
                           onOpenLink: openLink,
-                          onDiscuss: { start(.discuss(item: $0)) },
-                          onPropagate: { start(.propagate(item: $0, evidence: $1)) })
+                          onDiscuss: { discuss(.discuss(item: $0)) },
+                          onPropagate: { execute(.propagate(item: $0, evidence: $1)) })
                 // The day file's own title is a sentence ("Today: Monday, August 10,
                 // 2026"), which a large title truncates to "Today: Monday, Augus…" on
                 // a phone. Inline fits it and buys back the vertical space the list
@@ -58,7 +63,7 @@ struct TodayTabView: View {
                 // for macOS too — the shell is where platform spellings belong.
                 .navigationBarTitleDisplayMode(.inline)
         }
-        .sheet(item: $openedThread) { thread in
+        .sheet(item: $openedThread, onDismiss: dropUnsentContext) { thread in
             // `hidesTabBar: false`: a sheet already covers the tab bar, and asking the
             // detail view to hide it would leave the bar hidden after dismissal.
             NavigationStack { ThreadDetailView(thread: thread, hidesTabBar: false) }
@@ -107,15 +112,37 @@ struct TodayTabView: View {
 
     /// A link chip: the web opens in the browser, a vault note opens a conversation
     /// about the row that referenced it (there is no in-app vault viewer in v1).
+    ///
+    /// A chip FIRES, unlike Discuss. "Open this note" has an answer the agent can
+    /// produce unprompted — it reads the file the app cannot — so the tap is a
+    /// request, not the opening of a conversation with nothing in it yet.
     private func openLink(_ origin: TodayLinkOrigin) {
         if let turn = TodayTurn.openLink(origin) {
-            start(turn)
+            execute(turn)
         } else if let url = URL(string: origin.link.target) {
             openURL(url)
         }
     }
 
-    private func start(_ turn: TodayTurn) {
-        openedThread = TodayThreadOpener.open(turn, coordinator: coordinator, context: context)
+    /// Discuss: open a conversation about the item and start NOTHING. The item, its
+    /// links and the frozen framing ride along as attached context and reach the
+    /// bridge with the user's own first message — see `TodayThreadOpener.stage`.
+    private func discuss(_ turn: TodayTurn) {
+        let thread = TodayThreadOpener.stage(turn, coordinator: coordinator)
+        stagedThreadID = thread.id
+        openedThread = thread
+    }
+
+    /// Propagate and wiki chips: an explicit "do this now", so the turn goes out on
+    /// the tap and the sheet opens onto a conversation already running.
+    private func execute(_ turn: TodayTurn) {
+        openedThread = TodayThreadOpener.run(turn, coordinator: coordinator, context: context)
+    }
+
+    /// Dismissing a staged discussion without sending drops the context with it — a
+    /// no-op once the first send has consumed it.
+    private func dropUnsentContext() {
+        if let id = stagedThreadID { coordinator.clearAttachedContext(for: id) }
+        stagedThreadID = nil
     }
 }

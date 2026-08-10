@@ -49,6 +49,12 @@ struct ThreadDetailView: View {
     private var running: Bool { coordinator.isRunning(thread.id) }
     private var turns: [Turn] { thread.orderedTurns }
 
+    /// Context a screen attached to this thread without firing a turn (today: the
+    /// Today tab's Discuss). Non-nil means the transcript is empty ON PURPOSE — the
+    /// item is already in hand, waiting on the user's first message — which is what
+    /// makes an empty composer sendable here and nowhere else.
+    private var attachedContext: String? { coordinator.attachedContext(for: thread.id) }
+
     /// The `.failed` outbox item for a given user turn, if any — drives the compact
     /// per-message "Not delivered" line with Retry/Discard under that bubble.
     private func failedItem(for turnID: UUID) -> OutboxItem? {
@@ -110,6 +116,12 @@ struct ThreadDetailView: View {
         // Mac detail view's `.task(id:)` hydrate.
         .task(id: thread.id) {
             await coordinator.hydrateOnOpen(thread: thread, context: context)
+        }
+        // A staged discussion opens ON the composer, empty and focused: not firing a
+        // turn is only an improvement if the user's first move is to type. (A thread
+        // opened any other way keeps the keyboard down, as before.)
+        .onAppear {
+            if attachedContext != nil && turns.isEmpty { inputFocused = true }
         }
         .toolbar {
             ToolbarItem(placement: .topBarTrailing) {
@@ -349,6 +361,18 @@ struct ThreadDetailView: View {
                     .font(.caption)
                     .foregroundStyle(.red)
                     .frame(maxWidth: .infinity, alignment: .leading)
+            }
+
+            // Says why the composer is empty and why Send works with nothing typed.
+            // Without it, a discussion opened from Today looks like a blank new chat
+            // that has somehow forgotten which item it is about.
+            if attachedContext != nil && turns.isEmpty {
+                Label("This item is attached. Ask about it, or send an empty message to have Jesse just read it.",
+                      systemImage: "paperclip")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .accessibilityElement(children: .combine)
             }
 
             if !attachments.isEmpty {
@@ -640,8 +664,11 @@ struct ThreadDetailView: View {
         attachments.append(candidate)
     }
 
+    /// Empty input is normally nothing to send. With a context attached it is the
+    /// explicit "just look at it" — the one send that runs a turn on no prose of the
+    /// user's, and only ever because they tapped Send.
     private var sendDisabled: Bool {
-        running || input.trimmingCharacters(in: .whitespaces).isEmpty
+        running || (input.trimmingCharacters(in: .whitespaces).isEmpty && attachedContext == nil)
     }
 
     private func send() {

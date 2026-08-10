@@ -6,10 +6,11 @@ import JesseTodayDisplay
 
 // How a Today-tab gesture becomes a turn.
 //
-// Two small pieces, kept out of the view because both are things a test should be
-// able to state: WHICH prompt an action sends (`TodayTurn`), and that starting one
-// creates a NEW conversation rather than appending to whatever was last open
-// (`TodayThreadOpener`).
+// Two small pieces, kept out of the view because all three are things a test should
+// be able to state: WHICH prompt an action sends (`TodayTurn`), that starting one
+// creates a NEW conversation rather than appending to whatever was last open, and
+// WHEN it is sent — on the tap for an execute action, on the user's own first
+// message for a discussion (`TodayThreadOpener`).
 //
 // The prompt text is never assembled here. `TodayDiscuss.prompt` and
 // `TodayPropagate.prompt` (JesseCore) are frozen wordings whose scope clauses are
@@ -23,6 +24,9 @@ struct TodayTurn: Equatable {
     let text: String
 
     /// "Discuss this item with me."
+    ///
+    /// Its text is ATTACHED, not fired: a discussion opens on an empty composer and
+    /// sends this with the user's own first message (`TodayThreadOpener.stage`).
     ///
     /// ASK, not Tell. The turn's purpose is a conversation, and Ask carries the
     /// floor that forbids task-work Jeremy did not request — which is exactly the
@@ -57,23 +61,52 @@ struct TodayTurn: Equatable {
     }
 }
 
-/// Starts a Today action's turn on a brand-new thread.
+/// Opens a Today action on a brand-new thread, in one of the two ways an action can
+/// reach a conversation.
 ///
-/// The same path the Health tab's "Start new day" button takes — construct the
-/// thread, insert it, hand it to `RunCoordinator.send` — and for the same reason:
-/// the coordinator owns the optimistic user turn, the background task, the poll
-/// loop and the re-attach on foreground, so a turn started from a tab behaves
-/// exactly like one typed in the composer. A fresh thread every time is deliberate:
-/// these prompts are scoped to ONE item, and resuming an existing session would
-/// carry unrelated context into a turn whose safety comes from its narrowness.
+/// A fresh thread every time, either way: these prompts are scoped to ONE item, and
+/// resuming an existing session would carry unrelated context into a turn whose
+/// safety comes from its narrowness.
+///
+/// The split is between EXECUTING and DISCUSSING, and it is the whole point of this
+/// type. `run` is the Health tab's "Start new day" path — construct, insert, hand to
+/// `RunCoordinator.send` — for an action whose meaning is "do this now". `stage` is
+/// for an action whose meaning is "let's talk about this": it opens the thread and
+/// fires NOTHING, because a discussion has no content until the user has said what
+/// their concern is, and firing on tap made them wait out a full turn before they
+/// could type a word.
 @MainActor
 enum TodayThreadOpener {
+    /// EXECUTE now. The turn is on the transcript the instant the button is tapped —
+    /// Propagate, and a wiki chip, whose answer is "go read this and tell me".
     @discardableResult
-    static func open(_ turn: TodayTurn, coordinator: RunCoordinator,
-                     context: ModelContext) -> JesseThread {
+    static func run(_ turn: TodayTurn, coordinator: RunCoordinator,
+                    context: ModelContext) -> JesseThread {
         let thread = JesseThread(mode: turn.mode)
         context.insert(thread)
         coordinator.send(thread: thread, text: turn.text, voice: false, context: context)
+        return thread
+    }
+
+    /// OPEN for discussion. A new thread carrying `turn.text` as attached context, an
+    /// empty composer, and no turn at all; the first turn is the user's own send,
+    /// which the coordinator composes with the attachment so the item, its links and
+    /// the frozen anti-routing framing still scope it.
+    ///
+    /// Deliberately NOT inserted into the store. A staged thread has no turns yet, so
+    /// inserting it would leave a stray empty conversation in the list the moment the
+    /// user changes their mind — and worse, the Chats list's `pruneEmpty` reaps empty
+    /// thread-less threads on appear, which could delete this one out from under the
+    /// open sheet. `RunCoordinator.send` inserts on the first send (the same path the
+    /// composer's "+ new conversation" relies on), so a discussion that is actually
+    /// had is persisted and one that is abandoned costs nothing. `JesseThread.id` is a
+    /// stored UUID assigned at construction, so the attachment key is stable across
+    /// that later insert. (Hence no `context:` here: staging touches the store at all
+    /// only through the send that may never come.)
+    @discardableResult
+    static func stage(_ turn: TodayTurn, coordinator: RunCoordinator) -> JesseThread {
+        let thread = JesseThread(mode: turn.mode)
+        coordinator.attach(context: turn.text, to: thread.id)
         return thread
     }
 }
