@@ -27,6 +27,7 @@ let package = Package(
         .library(name: "JesseConversations", targets: ["JesseConversations"]),
         .library(name: "JesseSearch", targets: ["JesseSearch"]),
         .library(name: "JesseDietDisplay", targets: ["JesseDietDisplay"]),
+        .library(name: "JesseTodayDisplay", targets: ["JesseTodayDisplay"]),
     ],
     targets: [
         .target(
@@ -60,6 +61,13 @@ let package = Package(
         .testTarget(
             name: "JesseNetworkingTests",
             dependencies: ["JesseNetworking"],
+            // Checked-in wire fixtures for the day-file decode tests. They are the
+            // bridge's OWN serializer's output over the bridge's OWN synthetic
+            // `tests/fixtures/today/*.md` — invented content about a kiln rebuild, never
+            // a copy of the real personal Today.md, which matters because this repo is
+            // public. Regenerating them means re-running the bridge parser over those
+            // same fixtures, not hand-editing the JSON.
+            resources: [.copy("Fixtures")],
             swiftSettings: [
                 .swiftLanguageMode(.v6),
             ]
@@ -150,6 +158,47 @@ let package = Package(
         .testTarget(
             name: "JesseDietDisplayTests",
             dependencies: ["JesseDietDisplay", "JesseNetworking"],
+            swiftSettings: [
+                .swiftLanguageMode(.v6),
+            ]
+        ),
+        // The portable DAY-FILE display layer — the Today tab — and the peer of
+        // JesseDietDisplay in every structural respect: the pure semantics
+        // (TodaySemantics: the optimistic overlay, the per-section open counts, the Do
+        // Now total the tab badge reads), the @MainActor view model
+        // (TodayDashboardModel, fetching through the narrow TodayProviding seam so each
+        // platform injects its own client), and the SwiftUI views. One implementation,
+        // every platform.
+        //
+        // HealthKit-free and UIKit-free BY CONSTRUCTION. JesseDietDisplay holds the
+        // HealthKit line the same way (HealthKit is an iOS-only enrichment/write
+        // concern that never reaches a display) but still reaches for UIKit behind
+        // `#if canImport(UIKit)` in PlatformCompat.swift, to reproduce iOS's exact
+        // system fills. This target has no such file and needs none: every color it
+        // uses is a SwiftUI semantic (`.secondary`, `.tint`, the material fills), so
+        // there is no `import UIKit` here at all, conditional or otherwise. `swift
+        // build` on the macOS runner is what proves it — a UIKit reference would not
+        // resolve there.
+        //
+        // Isolation: default (nonisolated), matching JesseNetworking and
+        // JesseDietDisplay rather than the app targets' MainActor default. The
+        // semantics are pure functions over value types, called from the MainActor
+        // views AND from off-main callers (a badge count computed while building a
+        // turn's context), so a MainActor default would break the latter; the views
+        // get MainActor from their `View` conformance and the model is explicitly
+        // @MainActor. TodayDashboardModel carries a `nonisolated deinit` so an
+        // off-main release (a unit-test host tears objects down off-actor) never
+        // routes through the isolated-deinit executor hop and aborts.
+        .target(
+            name: "JesseTodayDisplay",
+            dependencies: ["JesseCore", "JesseNetworking"],
+            swiftSettings: [
+                .swiftLanguageMode(.v6),
+            ]
+        ),
+        .testTarget(
+            name: "JesseTodayDisplayTests",
+            dependencies: ["JesseTodayDisplay", "JesseNetworking"],
             swiftSettings: [
                 .swiftLanguageMode(.v6),
             ]

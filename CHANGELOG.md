@@ -15,6 +15,61 @@ CI both run it). See the "Versioning" section of `bridge/README.md`.
 
 ## [Unreleased]
 
+## [App 1.0 (94)] - 2026-08-10
+
+### Added
+
+- **`JesseTodayDisplay`: the Today tab, as one portable implementation.** A new JesseKit
+  library, peer of `JesseDietDisplay`, so iOS and macOS render the day file from the same
+  source instead of growing two divergent screens the way the Health tab once did. It holds
+  the pure semantics (`TodaySemantics`), the `@MainActor` view model
+  (`TodayDashboardModel`), and the SwiftUI views: `TodayListView` (sections in FILE order,
+  the schedule block, a collapsible narrative header), `TodayItemRow` (checkbox, bold-lead
+  rendering, link chips, Added/updated caption, evidence), `TodayReportRow` (glance state
+  with an unseen dot), `EvidenceSheet`, and the per-item move menu.
+
+  **UIKit-free and HealthKit-free by construction.** `JesseDietDisplay` holds the HealthKit
+  line the same way but still reaches for UIKit behind `#if canImport(UIKit)` in
+  `PlatformCompat.swift` to reproduce iOS's exact system fills; this target has no such file
+  and needs none — every color is a SwiftUI semantic, so there is no `import UIKit` at all,
+  conditional or otherwise. The macOS `swift build`/`swift test` in CI is what proves it.
+
+- **Day-file wire types and client calls in `JesseNetworking`.** `TodaySnapshot` and its
+  nodes mirror `bridge/src/today.rs` exactly, and `TodayProviding` adds `getToday`,
+  `checkItem`, `moveItem` and `glance` on `JesseBridgeClient` behind a narrow seam (the
+  `DietSnapshotProviding` shape) so each platform injects its own client.
+
+  The statuses that are ORDINARY OUTCOMES of a screen that polls and writes optimistically
+  are typed results rather than thrown errors: `304` (unchanged), `410` (the item left the
+  file), `412` (our ETag is stale), plus `409` (a structurally impossible move) and `428`
+  (no `If-Match` sent). Only transport, auth and 5xx throw. Decode tests run against
+  fixtures checked into the repo that are the **bridge's own serializer output** over the
+  bridge's own synthetic `tests/fixtures/today/*.md` — invented content, never the real
+  personal day file.
+
+- **`TodayDiscuss.prompt(item:)` and `TodayPropagate.prompt(item:evidence:)` in
+  `JesseCore`**, peers of `HealthNewDay.prompt`. Both wordings are frozen and load-bearing:
+  each names its own scope positively and names the routines it must not trigger
+  negatively, because the vault's morning routines are selected by what a turn's text says.
+  A test pins that "start of day" appears in the discuss prompt ONLY inside the
+  negative-scope sentence — if it ever migrated into the positive half, keyword routing
+  would read a request to talk about one line as a request to rebuild the whole day.
+
+### Fixed
+
+- **A move can change an item's id, and the client now survives it.** An item's id is
+  `sha256(sectionName | normalizedLead | addedDate)`, so `to_do_now` — the only op that
+  crosses sections — returns the item under a **new id**. `TodayDashboardModel` treats the
+  move response as authoritative: it locates the item by the `(lead, addedDate)` pair a
+  byte-splicing move cannot change, preferring an id the client has not seen before (the
+  bridge disambiguates duplicate leads with `-2`/`-3` ordinals), and migrates every
+  optimistic and glance entry from the old id to the new one. Nothing is left under the old
+  id, so the row never renders twice and never becomes a ghost whose every tap fails.
+
+  Covered end to end: an optimistic `to_do_now`, a server snapshot carrying the item under
+  a different id, and an assertion that exactly one row survives, re-keyed, with the pending
+  check still showing under its new key.
+
 ## [Bridge 0.71.1] - 2026-08-10
 
 ### Fixed
