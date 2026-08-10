@@ -600,7 +600,10 @@ pub const CODEX_MCP_ENV_PASSTHROUGH: &[(&str, &[&str])] = &[
             "UNIFI_SITE",
         ],
     ),
-    ("routeros", &["ROUTEROS_DEVICES_CONFIG", "ROUTEROS_SSH_PORT"]),
+    (
+        "routeros",
+        &["ROUTEROS_DEVICES_CONFIG", "ROUTEROS_SSH_PORT"],
+    ),
 ];
 
 /// The environment variable holding each HTTP MCP server's BEARER TOKEN, BY NAME.

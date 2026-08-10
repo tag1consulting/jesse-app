@@ -2175,13 +2175,17 @@ pub fn export_mcp_server_env() {
         // and default to writing into the cwd, which is the vault.
         set_if_unset(
             "WORKSPACE_ATTACHMENT_DIR",
-            &home.join(".config/jesse-google/attachments").to_string_lossy(),
+            &home
+                .join(".config/jesse-google/attachments")
+                .to_string_lossy(),
         );
         // RouterOS reads its device list from a FILE rather than the environment, so what
         // gets forwarded is the path, not a credential.
         set_if_unset(
             "ROUTEROS_DEVICES_CONFIG",
-            &home.join(".config/routeros-mcp/devices.yaml").to_string_lossy(),
+            &home
+                .join(".config/routeros-mcp/devices.yaml")
+                .to_string_lossy(),
         );
     }
 }
