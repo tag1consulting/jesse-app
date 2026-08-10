@@ -15,6 +15,81 @@ CI both run it). See the "Versioning" section of `bridge/README.md`.
 
 ## [Unreleased]
 
+## [Bridge 0.73.0] - 2026-08-10
+
+### Added
+
+- **WhatsApp, iMessage and a second Google account, on BOTH harnesses in one posture
+  change.** A main turn now declares **fourteen** MCP servers and the allowlist grants **210**
+  MCP tools. Batched for the reason 0.69.0 was: a posture change re-stales each harness's
+  record and costs a battery run per harness, so three separate changes would have cost three
+  signing sessions.
+
+  - **WhatsApp — 8 of 12 tools granted.** Read only: chats, messages, contacts and message
+    context. **`send_message`, `send_file` and `send_audio_message` are never granted** —
+    sending is the standing bright line. **`download_media` is never granted either**, and
+    not because it sends: it **writes a file**. Its name reads like the read tools around it,
+    which is exactly why it is called out here.
+  - **iMessage — 10 of 11 tools granted**, reading `chat.db` and the AddressBook.
+    **`tool_send_message` is never granted.** `tool_get_attachment` IS granted and that is
+    deliberate rather than inconsistent with `download_media`: it resolves an existing path
+    and returns it, neither fetching nor writing.
+  - **Google (Perseido) — 16 of 18 tools granted**, the same sixteen as the tag1 `google`
+    server. Read-only at BOTH layers: the OAuth scopes are `*.readonly` and the allowlist
+    names read tools only. `get_gmail_attachment_content` (writes to local disk) and
+    `start_google_auth` (interactive consent) are omitted, as on tag1.
+
+- **`McpSet::contains_whatsapp`, `contains_imessage` and `contains_google_perseido`**, each
+  exhaustively matched with no wildcard arm, so the next set is a compile error here rather
+  than a silently wrong record. `google-perseido` is deliberately its own predicate rather
+  than folded into `contains_google`: two servers, two OAuth clients, two accounts.
+
+### Changed
+
+- **`McpSet::Messages`** is the new main set; `McpSet::Morning` keeps its old eleven-server
+  meaning against a new `MORNING_MCP_CONFIG` const. Splitting rather than growing in place is
+  what stops the `…+routeros+proxmox` row label silently re-pointing at a set that also reads
+  every message body Jeremy has received.
+- **The Codex row labels moved for the fourth time**, orphaning the two operator
+  `[[accepted]]` blocks again (0.66.0, 0.67.0, 0.69.0, now 0.73.0). Re-pointed by the owner.
+- **Both Google entries now carry `--single-user --read-only --tools …` in the bridge's own
+  const.** The Perseido instance previously had them baked into its host launcher, where
+  neither the containment record nor a test could see them. A test now asserts the flags on
+  both entries in one loop, since the failure worth catching is one instance drifting from
+  the other.
+
+### Security
+
+- **This is the first time a stranger can put text into a bridge turn.** Every read source
+  before these was authored or curated by Jeremy or his employer. Anyone who knows his phone
+  number can now write into a context that holds vault `Write` and `Edit`, a browser, the
+  house, the network and the hypervisor. **Read-only sends do not close this** — they bound
+  what the server can do, not what the child does with what it read. The mitigation that
+  would close it is the dedicated sandboxed unix user; it is still not implemented, and the
+  exposure is accepted deliberately. See SECURITY.md.
+- **The allowlist is the ONLY boundary on the two message servers.** They read local files and
+  hold no credential, so there is no second layer behind the omitted send tools.
+- **iMessage requires Full Disk Access** — a whole-home-directory read grant, because macOS
+  offers nothing narrower. TCC attributes it to the binary exec'd, so it is held by
+  `mac-messages-mcp` and never by `jesse-bridge`, which must not be given it.
+
+### Notes
+
+- **Full Disk Access is honoured under launchd and refused from an interactive terminal.**
+  Measured 2026-08-10: the identical server returns "Permission denied" when its process tree
+  is rooted in a shell and reads all 91 tables when submitted as a launchd job. A failed
+  iMessage read from a terminal proves nothing; verify from a real bridge turn.
+- **`google-perseido` is the first server name carrying a HYPHEN**, and both harnesses were
+  checked rather than assumed: Claude Code matched and called
+  `mcp__google-perseido__list_calendars`, and codex 0.146.0 accepted
+  `mcp_servers.google-perseido.*` under `--strict-config` (a deliberately bad value still
+  errored, proving the key was read). `granted_mcp_tools` splits on the full
+  `mcp__<server>__` prefix, so `google` and `google-perseido` cannot bleed into each other.
+- **This release adds NO plist secret.** The Perseido OAuth client is a mode-`600`
+  `client_secret.json` that its launcher points at, which keeps it out of launchd's
+  environment where every MCP child would inherit it. WhatsApp and iMessage need nothing
+  forwarded on either harness — both resolve their inputs from their own file locations.
+
 ## [App 1.0 (99)] - 2026-08-10
 
 ### Added

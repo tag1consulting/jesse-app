@@ -662,6 +662,116 @@ safe to open`), which sits ABOVE the allowlist — so a `WebFetch(domain:...)` g
 it. The already-granted browser MCP returns the same data and is the working cross-harness
 route. No server, no secret and no grant were added for currency.
 
+## Message sources: WhatsApp, iMessage, and a second Google account
+
+Bridge 0.73.0 adds three more MCP servers to every main turn on both harnesses: **WhatsApp**,
+**iMessage**, and a **second Google Workspace instance** for a personal account
+(`google-perseido`). All three are read-only. Fourteen servers now load on a main turn.
+
+The server count is not what matters here. **The first two are the first read sources whose
+content is written by people who are not Jeremy and who need no permission to write into
+them.** That changes the character of the risk, and this section exists for that.
+
+### What each one can do
+
+| Server | Posture | Enforced by |
+|---|---|---|
+| WhatsApp | read-only | **the allowlist ONLY** — there is no credential to scope |
+| iMessage | read-only | **the allowlist ONLY** — there is no credential to scope |
+| Google (Perseido) | read-only | credential (`*.readonly` scopes only) **and** allowlist **and** the server's `--read-only` flag |
+
+Granted and omitted, enumerated live on 2026-08-10 against the running servers:
+
+- **WhatsApp — 8 of 12 granted.** `search_contacts`, `list_messages`, `list_chats`,
+  `get_chat`, `get_direct_chat_by_contact`, `get_contact_chats`, `get_last_interaction`,
+  `get_message_context`. **Never granted:** `send_message`, `send_file`, `send_audio_message`
+  (all send outbound messages under Jeremy's own number) and `download_media` (it **writes a
+  file** — it is the one omission that is not about sending, and its name invites the wrong
+  inference).
+- **iMessage — 10 of 11 granted.** `tool_get_recent_messages`, `tool_fuzzy_search_messages`,
+  `tool_get_chats`, `tool_find_contact`, `tool_check_contacts`, `tool_check_addressbook`,
+  `tool_check_db_access`, `tool_check_imessage_availability`, `tool_search_attachments`,
+  `tool_get_attachment`. **Never granted:** `tool_send_message`. `tool_get_attachment` is
+  granted because it resolves an existing path and returns it — unlike WhatsApp's
+  `download_media`, it neither fetches nor writes.
+- **Google (Perseido) — 16 of 18 granted**, the same sixteen as the tag1 `google` server, by
+  mirroring rather than re-deciding. **Omitted:** `get_gmail_attachment_content` (writes
+  attachment bytes to local disk — `--read-only` bounds writes to Google, not to this host)
+  and `start_google_auth` (an interactive consent flow a headless turn cannot complete).
+
+### The allowlist is the only boundary on the two message servers
+
+Every other read-only server in the set is read-only twice over: the credential cannot write
+even if the allowlist failed. These two have **no credential at all** — they read local files
+(a SQLite store the WhatsApp Go bridge keeps in sync; `~/Library/Messages/chat.db`). The
+omitted send tools are not a second layer behind a first. They are the only layer.
+
+One thing that layer cannot reach: the WhatsApp Go bridge **serves its own unauthenticated
+send API on a local port**, below the MCP layer entirely. Omitting the send tools stops this
+child; it does not stop anything else on the host. See the existing note on that exposure.
+
+### The prompt-injection surface, stated plainly
+
+A main turn holds vault `Write` and `Edit`, a web browser, full Home Assistant control, full
+UniFi and Proxmox control, and read access to five mailboxes. **Anyone who knows Jeremy's
+phone number can now put arbitrary text into that context**, unsolicited and unauthenticated,
+by sending him a WhatsApp or iMessage message. The browser already made a visited page
+untrusted input; this makes untrusted input arrive without anyone visiting anything.
+
+**Read-only sends do not close this, and it would be a mistake to read the table above as if
+they did.** Omitting `send_message` bounds what the SERVER can do. It says nothing about what
+the CHILD does after it has read the text — and the child can edit vault files, actuate the
+house, and reconfigure the network. The boundary that would actually contain this is process
+isolation, not tool selection.
+
+**The real mitigation is the dedicated sandboxed unix user, and it is not implemented.** It
+has been the named residual mitigation since 0.69.0 and it remains deferred. Jeremy is
+accepting this exposure knowingly in order to get the read reach; it is recorded here rather
+than gated, on the same basis as the Home Assistant and Proxmox decisions before it.
+
+### iMessage requires Full Disk Access, which is broader than the database
+
+`mac-messages-mcp` reads `chat.db` and the AddressBook, and macOS gates both behind **Full
+Disk Access** — a grant over the entire home directory. There is no narrower grant; macOS does
+not offer per-file TCC. So the executable holding it can read every file the user can, not
+merely the two databases it wants.
+
+Two mechanics worth recording:
+
+- **TCC attributes the grant to the binary actually exec'd**, so it is held by
+  `mac-messages-mcp`'s own Python interpreter and never by `jesse-bridge`. The bridge does not
+  need FDA and must not be given it.
+- **The grant is honoured under launchd and NOT from an interactive terminal.** Measured
+  2026-08-10: the same server, same binary, same arguments, returns "Permission denied … grant
+  Full Disk Access" when its process tree is rooted in a terminal, and reads all 91 tables when
+  submitted as a launchd job. A failed iMessage read from a shell is therefore not evidence of
+  a broken grant, and an iMessage read must be verified from a real bridge turn.
+
+### The second Google account is a second read surface
+
+`google-perseido` reads a personal account's calendar, mail and Drive — a distinct account
+(`jeremiah@perseido.it`) from the tag1 one, under its own OAuth client, its own consent and
+its own token cache at `~/.config/jesse-google-perseido/creds`. It is a second server rather
+than a second account on one server because `workspace-mcp` takes its client and credentials
+directory only from the environment, and the bridge gives every MCP child one shared
+environment — a second entry sharing the `workspace-mcp` command would silently authenticate
+as the tag1 account.
+
+**Its credential is the one in the whole set that is NOT in the plist.** The
+`workspace-mcp-perseido` launcher points the server at a mode-`600` `client_secret.json` and
+clears the inherited `GOOGLE_OAUTH_*` variables (the library resolves env before file, so
+leaving them set IS the crossover). That keeps this client out of launchd's environment, where
+every MCP child would otherwise inherit it. The trade is that the launcher is host setup and
+therefore invisible to the containment record — which is why the `--read-only` and `--tools`
+flags for BOTH Google instances live in the bridge's own const, where a test asserts them.
+
+### Residual mitigations NOT implemented
+
+- Run the bridge as a dedicated, sandboxed unix user rather than as Jeremy. **This is the one
+  that matters for the message servers**, and it is still deferred.
+- Bind the WhatsApp Go bridge's REST port to loopback (it is lost on any re-clone).
+- Narrow iMessage to a copy of `chat.db` refreshed out of band, so the server needs no FDA.
+
 ## Diet child tool isolation (in-process boundary)
 
 The diet-logging pipeline (see the bridge README) spawns two **stateless,
