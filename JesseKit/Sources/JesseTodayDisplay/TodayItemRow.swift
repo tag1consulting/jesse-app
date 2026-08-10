@@ -176,16 +176,20 @@ public struct TodayItemRow: View {
     let pending: Bool
     let evidence: String?
     let availableMoves: [TodayMoveOp]
+    let focusActions: [TodayFocus]
     let onToggle: (Bool) -> Void
     let onMove: (TodayMoveOp) -> Void
+    let onFocus: (TodayFocus) -> Void
     let onDiscuss: () -> Void
     let onPropagate: () -> Void
     let onOpenLink: (TodayLinkOrigin) -> Void
 
     public init(item: TodayItem, pending: Bool = false, evidence: String? = nil,
                 availableMoves: [TodayMoveOp] = [],
+                focusActions: [TodayFocus] = [],
                 onToggle: @escaping (Bool) -> Void,
                 onMove: @escaping (TodayMoveOp) -> Void = { _ in },
+                onFocus: @escaping (TodayFocus) -> Void = { _ in },
                 onDiscuss: @escaping () -> Void = {},
                 onPropagate: @escaping () -> Void = {},
                 onOpenLink: @escaping (TodayLinkOrigin) -> Void = { _ in }) {
@@ -193,8 +197,10 @@ public struct TodayItemRow: View {
         self.pending = pending
         self.evidence = evidence
         self.availableMoves = availableMoves
+        self.focusActions = focusActions
         self.onToggle = onToggle
         self.onMove = onMove
+        self.onFocus = onFocus
         self.onDiscuss = onDiscuss
         self.onPropagate = onPropagate
         self.onOpenLink = onOpenLink
@@ -219,15 +225,12 @@ public struct TodayItemRow: View {
                         .foregroundStyle(.secondary)
                         .labelStyle(.titleAndIcon)
                 }
-                if let caption = TodaySemantics.dateCaption(item) {
-                    Text(caption)
-                        .font(.caption2)
-                        .foregroundStyle(.tertiary)
-                }
+                caption
             }
             Spacer(minLength: 0)
             TodayItemMenu(item: item, availableMoves: availableMoves,
-                          onMove: onMove, onDiscuss: onDiscuss, onPropagate: onPropagate)
+                          focusActions: focusActions, onMove: onMove, onFocus: onFocus,
+                          onDiscuss: onDiscuss, onPropagate: onPropagate)
         }
         .padding(.vertical, 4)
         // The same actions the ellipsis menu offers, on a long press. Two ways in
@@ -235,9 +238,39 @@ public struct TodayItemRow: View {
         // added to it appears in both without either falling behind the other.
         .contextMenu {
             TodayItemActions(item: item, availableMoves: availableMoves,
-                             onMove: onMove, onDiscuss: onDiscuss, onPropagate: onPropagate)
+                             focusActions: focusActions, onMove: onMove, onFocus: onFocus,
+                             onDiscuss: onDiscuss, onPropagate: onPropagate)
         }
         .accessibilityElement(children: .contain)
+    }
+
+    /// The bookkeeping line under a row: which project the item rolls up to, then its
+    /// dates.
+    ///
+    /// The project shows as a DOT plus its name, never as colour alone — the palette is
+    /// chosen to survive colour blindness, but no palette says anything to a screen
+    /// reader, and a row whose only project cue is a hue is a row that loses it under
+    /// Grayscale. An `unfiled` item shows nothing at all here: "no project" is an
+    /// absence, and a grey dot labelled "No project" on the large minority of items that
+    /// have none would be the loudest thing on the screen.
+    @ViewBuilder
+    private var caption: some View {
+        let dates = TodaySemantics.dateCaption(item)
+        if !item.project.isUnfiled || dates != nil {
+            HStack(spacing: 6) {
+                if !item.project.isUnfiled {
+                    TodayProjectDot(project: item.project)
+                    Text(TodayProjectPalette.role(for: item.project).label)
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                }
+                if let dates {
+                    Text(dates)
+                        .font(.caption2)
+                        .foregroundStyle(.tertiary)
+                }
+            }
+        }
     }
 
     /// The bold lead and the rest of the line as one string, so it wraps as a
@@ -275,11 +308,23 @@ public struct TodayItemRow: View {
 struct TodayItemActions: View {
     let item: TodayItem
     let availableMoves: [TodayMoveOp]
+    let focusActions: [TodayFocus]
     let onMove: (TodayMoveOp) -> Void
+    let onFocus: (TodayFocus) -> Void
     let onDiscuss: () -> Void
     let onPropagate: () -> Void
 
     var body: some View {
+        // Focus first, and above the divider: "work on this next" is what a user
+        // actually wants from a row, and it stays in the same place whatever the view
+        // sort is doing — unlike the relative moves below it, which the list withholds
+        // while a sort is on because their direction would be meaningless.
+        ForEach(focusActions) { focus in
+            Button { onFocus(focus) } label: {
+                Label(focus.label, systemImage: focus.symbol)
+            }
+        }
+        if !focusActions.isEmpty { Divider() }
         Button { onDiscuss() } label: {
             Label("Discuss this item", systemImage: "bubble.left.and.text.bubble.right")
         }
@@ -292,9 +337,14 @@ struct TodayItemActions: View {
                 Label("Close it at source", systemImage: "arrow.up.forward.square")
             }
         }
-        if !availableMoves.isEmpty {
+        // The moves a focus button already covers are dropped rather than listed twice:
+        // "Focus — move to Do Now" and "Move to Do Now" are the same write, and a menu
+        // that offers both invites the reading that they differ.
+        let focused = Set(focusActions.map(\.moveOp))
+        let remaining = availableMoves.filter { !focused.contains($0) }
+        if !remaining.isEmpty {
             Divider()
-            ForEach(availableMoves, id: \.self) { op in
+            ForEach(remaining, id: \.self) { op in
                 Button { onMove(op) } label: {
                     Label(TodaySemantics.label(for: op),
                           systemImage: TodaySemantics.symbol(for: op))
@@ -307,14 +357,17 @@ struct TodayItemActions: View {
 struct TodayItemMenu: View {
     let item: TodayItem
     let availableMoves: [TodayMoveOp]
+    let focusActions: [TodayFocus]
     let onMove: (TodayMoveOp) -> Void
+    let onFocus: (TodayFocus) -> Void
     let onDiscuss: () -> Void
     let onPropagate: () -> Void
 
     var body: some View {
         Menu {
             TodayItemActions(item: item, availableMoves: availableMoves,
-                             onMove: onMove, onDiscuss: onDiscuss, onPropagate: onPropagate)
+                             focusActions: focusActions, onMove: onMove, onFocus: onFocus,
+                             onDiscuss: onDiscuss, onPropagate: onPropagate)
         } label: {
             Image(systemName: "ellipsis")
                 .font(.footnote)

@@ -5,7 +5,7 @@
     "reportsUnseen": 6
   },
   "date": "2026-03-03",
-  "etag": "\"d17ee47c16e1a995f1ee112fb61c1a930b3cc54f79b78907c036a37ff1ebc004\"",
+  "etag": "\"6d7a795082d5da762bba16d4e5f9a50371c509bf65eeec0b4abb32f8496b1ed8\"",
   "generatedAt": "2026-03-03T09:00:00Z",
   "leadItems": [
     {
@@ -20,6 +20,7 @@
           "target": "notes/Projects/kiln-rebuild"
         }
       ],
+      "project": "unfiled",
       "range": {
         "end": 306,
         "start": 33
@@ -71,6 +72,7 @@
           "id": "66db276d8cbc",
           "lead": "Collect the glaze order.",
           "links": [],
+          "project": "unfiled",
           "range": {
             "end": 742,
             "start": 593
@@ -86,6 +88,7 @@
           "id": "31c498907462",
           "lead": "Order the replacement thermocouple.",
           "links": [],
+          "project": "unfiled",
           "range": {
             "end": 895,
             "start": 742
@@ -110,6 +113,7 @@
               "target": "notes/Dashboard/Workshop"
             }
           ],
+          "project": "unfiled",
           "range": {
             "end": 1068,
             "start": 895
@@ -125,6 +129,7 @@
           "id": "971252d7ef9b",
           "lead": "Plain unbolded item with no trailer at all.",
           "links": [],
+          "project": "unfiled",
           "range": {
             "end": 1164,
             "start": 1068
@@ -140,6 +145,7 @@
           "id": "b696ea448edc",
           "lead": "",
           "links": [],
+          "project": "unfiled",
           "range": {
             "end": 1170,
             "start": 1164
@@ -175,6 +181,7 @@
           "id": "94cf6a2af737",
           "lead": "Return the borrowed clamps.",
           "links": [],
+          "project": "unfiled",
           "range": {
             "end": 1340,
             "start": 1255
@@ -202,6 +209,7 @@
           "id": "cfccd89d4a7e",
           "lead": "Book the annual check-up.",
           "links": [],
+          "project": "unfiled",
           "range": {
             "end": 1620,
             "start": 1525
@@ -397,6 +405,7 @@
           "id": "c383a7ee348f",
           "lead": "Start of day processing (2026-03-03, Tuesday):",
           "links": [],
+          "project": "unfiled",
           "range": {
             "end": 2481,
             "start": 2367

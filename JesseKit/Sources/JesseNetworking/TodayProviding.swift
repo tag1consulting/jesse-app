@@ -166,7 +166,12 @@ extension JesseBridgeClient: TodayProviding {
     // MARK: - Shared plumbing
 
     /// A bearer-authed request for a day-file path, or nil when unconfigured.
-    private func todayRequest(_ path: String, method: String) -> URLRequest? {
+    ///
+    /// Package-internal rather than file-private: the detail call in
+    /// `TodayItemDetail.swift` is the same family of endpoints and must compose its
+    /// request the same way, and a second copy of "bearer + endpoint + nil when
+    /// unconfigured" is how one of them ends up sending a request with no token.
+    func todayRequest(_ path: String, method: String) -> URLRequest? {
         guard !config.normalizedHost.isEmpty, !config.token.isEmpty,
               let url = config.endpoint(path) else { return nil }
         var req = URLRequest(url: url)
@@ -176,8 +181,9 @@ extension JesseBridgeClient: TodayProviding {
     }
 
     /// Send and unwrap to an `HTTPURLResponse`, mapping URL-loading failures to the
-    /// host-naming `JesseError`.
-    private func todaySend(_ req: URLRequest) async throws -> (Data, HTTPURLResponse) {
+    /// host-naming `JesseError`. Package-internal for the same reason as
+    /// `todayRequest`.
+    func todaySend(_ req: URLRequest) async throws -> (Data, HTTPURLResponse) {
         let data: Data, resp: URLResponse
         do {
             (data, resp) = try await session.data(for: req)

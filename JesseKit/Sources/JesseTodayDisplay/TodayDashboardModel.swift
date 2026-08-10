@@ -87,8 +87,48 @@ public final class TodayDashboardModel {
 
     /// The document to render: the server's, with the overlay applied and the counts
     /// recomputed. Nil until the first successful load.
+    ///
+    /// **In FILE ORDER, always.** This is the document as the day file has it, and it is
+    /// what every judgement about identity and position is made against — which item is
+    /// first in its section, what a move would do, whether an id still exists. The view
+    /// sort is applied on top of it by `displaySnapshot` and never here; a model whose
+    /// own idea of the document was reordered by a lens would compute `up` against rows
+    /// the file does not have in that order.
     public var snapshot: TodaySnapshot? {
         serverSnapshot.map { TodaySemantics.display($0, applying: overlay) }
+    }
+
+    /// **The view sort.** A lens over the rows, not a change to the day: it reorders
+    /// what is on screen and writes nothing, and `.fileOrder` (the default) is the
+    /// identity. Durable reordering is `move(id:op:)` / `focus(id:_:)`, which change the
+    /// FILE.
+    ///
+    /// Settable rather than derived because it is a preference about this screen, and
+    /// deliberately NOT persisted here: where a per-device preference lives is the
+    /// shell's business, and a library that reached for storage would be making that
+    /// decision for both platforms.
+    public var sortKey: TodaySortKey = .fileOrder
+
+    /// The document to DRAW: `snapshot` with the view sort applied. Counts and
+    /// membership are identical to `snapshot` — a lens changes order, never what is in
+    /// the day.
+    public var displaySnapshot: TodaySnapshot? {
+        snapshot.map { TodaySemantics.sortedForDisplay($0, by: sortKey) }
+    }
+
+    /// The moves worth offering for one row, judged against the FILE order and filtered
+    /// for the lens in effect. The one place a view should ask, so no shell re-derives
+    /// the pairing of "which snapshot" with "which sort" and gets it half right.
+    public func availableMoves(for item: TodayItem) -> [TodayMoveOp] {
+        guard let snapshot else { return [] }
+        return TodaySemantics.availableMoves(for: item, in: snapshot, sortedBy: sortKey)
+    }
+
+    /// The focus actions worth offering for one row. Unaffected by the lens: both are
+    /// absolute positions.
+    public func availableFocus(for item: TodayItem) -> [TodayFocus] {
+        guard let snapshot else { return [] }
+        return TodaySemantics.availableFocus(for: item, in: snapshot)
     }
 
     /// What the tab root shows.
@@ -105,7 +145,7 @@ public final class TodayDashboardModel {
     }
 
     public var displayState: DisplayState {
-        if let snap = snapshot {
+        if let snap = displaySnapshot {
             return snap.missing ? .noDayFile : .content(snap)
         }
         if let message = lastErrorMessage { return .unavailable(message) }
@@ -333,6 +373,18 @@ public final class TodayDashboardModel {
         }) { client in
             try await client.moveItem(id: id, op: op, at: self.now(), ifMatch: tag)
         }
+    }
+
+    /// **Focus an item** — "work on this next", as a durable edit to the day file.
+    ///
+    /// One line, because that is the whole of it: focus is spelled in terms of the two
+    /// absolute move ops the bridge already has, so it inherits the optimistic overlay,
+    /// the ETag, the re-key after a cross-section move and every `409`/`410`/`412` path
+    /// that `move` already handles. A separate write path for focus would be a second
+    /// implementation of all of that, and the second one is the one that gets the
+    /// re-keying wrong.
+    public func focus(id: String, _ focus: TodayFocus) async {
+        await move(id: id, op: focus.moveOp)
     }
 
     /// Mark a glanceable row seen. The dot clears at once; the bridge's glance store
