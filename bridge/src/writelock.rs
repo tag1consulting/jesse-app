@@ -330,6 +330,34 @@ impl LockBroker {
         }
     }
 
+    /// Whether any turn currently holds a lock that could be mid-write to `path`.
+    ///
+    /// [`LockKey::Global`] counts, and that is the point: it is the key every write
+    /// the bridge cannot name takes — a shell command, an unrecognized tool — and a
+    /// turn holding it may well be rewriting this very file. Answering "no" there
+    /// would be the one wrong answer, because it would send an app mutation down the
+    /// apply-immediately path in exactly the case the journal exists to cover.
+    ///
+    /// Read-only and non-blocking on purpose: the caller uses it to decide whether to
+    /// APPLY or to PARK, never to wait. Nothing about the day-file write path may
+    /// block on a turn (see [`crate::todayjournal`]).
+    /// BOTH spellings of the path are compared — as given, and canonicalized —
+    /// because the broker stores exactly the key its caller handed over. A hook
+    /// resolves before sending ([`resolve_lock_path`]), but nothing in the type
+    /// system says so, and on macOS an unresolved `/var/…` and a resolved
+    /// `/private/var/…` are the same file under two names. A miss here would not
+    /// fail loudly: it would silently send an app tap down the apply-immediately
+    /// path in exactly the case the journal exists to cover, so this errs toward
+    /// answering yes.
+    pub fn holds_write_on(&self, path: &Path) -> bool {
+        let resolved = resolve_lock_path(path, "/");
+        self.inner.lock_ok().held.keys().any(|k| match k {
+            LockKey::Global => true,
+            LockKey::Path(p) => p == path || *p == resolved,
+            LockKey::Git => false,
+        })
+    }
+
     /// Forget a conversation's read baselines. Called when a conversation is deleted.
     pub fn forget_conversation(&self, conversation: &str) {
         self.inner.lock_ok().baselines.remove(conversation);
@@ -506,6 +534,18 @@ impl Drop for TurnLockRelease {
         // The Claude Code settings file is per turn; the Codex hooks.json lives in the
         // per-turn CODEX_HOME and goes with it.
         remove_write_lock_settings(&self.cfg, &self.turn);
+        // THE TURN-COMPLETION HOOK for the day file's intent journal.
+        //
+        // It rides HERE rather than on the happy path for the same reason the lock
+        // release does: this is the one place that runs whenever a turn ends, including
+        // the paths where a child was killed, timed out or panicked — and a turn that
+        // died halfway through rewriting Today.md is precisely when a clobbered checkbox
+        // needs repairing. AFTER `release_turn`, so replay sees the lock free and does
+        // not mistake this turn's own residue for a live writer.
+        //
+        // A no-op with an empty journal (the overwhelming majority of turns), which it
+        // establishes with one cheap read before taking any lock.
+        replay_after_turn(&self.cfg);
     }
 }
 

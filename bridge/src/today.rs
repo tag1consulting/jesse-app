@@ -1,8 +1,13 @@
-//! `GET /jesse/today` — a structured, read-only snapshot of the vault's
-//! `Today.md`, the file the morning routine rewrites in full every day.
+//! `GET /jesse/today` — a structured snapshot of the vault's `Today.md`, the
+//! file the morning routine rewrites in full every day, plus the parser and the
+//! item identity contract every other day-file module is built on.
 //!
-//! Read-only. There is no write path here — checking a box, marking a
-//! glanceable seen and pushing a change over SSE are all follow-on work.
+//! **This module reads; it does not write.** The mutations — checking a box,
+//! moving an item, marking a glanceable seen — live in [`crate::todaywrite`],
+//! and the durability machinery behind them in [`crate::todayjournal`]. The one
+//! thing here that writes at all is [`GlanceStore::record`], which touches the
+//! state dir and never the vault. Pushing a change over SSE remains follow-on
+//! work.
 //!
 //! Same posture as the other snapshot endpoint, [`jesse_diet`]: bearer auth, the
 //! shared rate limiter, ids-and-values-only JSON, and a **pure function of file
@@ -14,13 +19,14 @@
 //! ## The parser is line-oriented, tolerant and NON-DESTRUCTIVE
 //!
 //! It never re-serializes the document. Every node keeps the byte range it came
-//! from ([`SourceRange`]), so a later write path can splice a line — check a box,
+//! from ([`SourceRange`]), so the write path splices a line — check a box,
 //! append a sub-line — by replacing exactly those bytes and leaving every other
 //! byte of the file untouched. That matters because the file is hand-edited and
 //! agent-edited between rebuilds: a round-trip through a markdown serializer
 //! would reflow prose, renumber lists and normalize whitespace that a human
-//! chose. There is no write path here yet (this endpoint is read-only); the
-//! ranges are what makes one possible without a reformat.
+//! chose. These ranges are what make [`crate::todaywrite`] possible without a
+//! reformat, and a unit test there asserts a check flips three bytes and no
+//! others.
 //!
 //! Tolerance is the other half: the file is prose written by an agent, so the
 //! parser has no error path. A missing H1, an unparseable date, a half-written
@@ -449,6 +455,14 @@ fn trailer_date(hay: &str, key: &str) -> Option<String> {
 /// The app's `*(app-completed <at> — <evidence>)*` sub-line, parsed leniently: a
 /// leading timestamp-looking token becomes `at` and the remainder `evidence`;
 /// anything that does not look like a timestamp is all evidence.
+///
+/// TWO timestamp spellings are recognized, and that is deliberate rather than
+/// sloppy. The bridge writes one frozen shape — `YYYY-MM-DD HH:MM:`, a SPACE
+/// between the date and the clock (see [`app_completed_sub_line`]) — which a
+/// naive split-on-whitespace would tear in half, leaving the clock stranded at
+/// the front of the evidence. A single ISO instant (`2026-03-03T08:12:00Z`) is
+/// the older spelling, still written by hand and by the agent. Both parse to the
+/// same two fields.
 fn app_completed(continuations: &[&str]) -> Option<AppCompleted> {
     let line = continuations.iter().find(|l| l.contains("app-completed"))?;
     let after = line.split_once("app-completed")?.1;
@@ -459,14 +473,39 @@ fn app_completed(continuations: &[&str]) -> Option<AppCompleted> {
         .trim();
     let (head, tail) = body.split_once(char::is_whitespace).unwrap_or((body, ""));
     let timestamp = head.starts_with(|c: char| c.is_ascii_digit());
-    let evidence = if timestamp { tail } else { body }
+    // `YYYY-MM-DD HH:MM:` — the bridge's own grammar. Pull the clock into `at`
+    // rather than leaving it at the head of the evidence.
+    let (at, rest) = match tail.split_once(char::is_whitespace).unwrap_or((tail, "")) {
+        (clock, remainder)
+            if valid_iso_date(head).is_some() && is_clock(clock.trim_end_matches(':')) =>
+        {
+            (
+                Some(format!("{head} {}", clock.trim_end_matches(':'))),
+                remainder,
+            )
+        }
+        _ => (timestamp.then(|| head.to_string()), tail),
+    };
+    let evidence = if at.is_some() { rest } else { body }
         .trim()
         .trim_start_matches(['—', '-', '–'])
         .trim();
     Some(AppCompleted {
-        at: timestamp.then(|| head.to_string()),
+        at,
         evidence: (!evidence.is_empty()).then(|| evidence.to_string()),
     })
+}
+
+/// An `HH:MM` clock, strictly.
+fn is_clock(s: &str) -> bool {
+    let Some((h, m)) = s.split_once(':') else {
+        return false;
+    };
+    h.len() == 2
+        && m.len() == 2
+        && h.bytes().chain(m.bytes()).all(|c| c.is_ascii_digit())
+        && h.parse::<u32>().is_ok_and(|h| h < 24)
+        && m.parse::<u32>().is_ok_and(|m| m < 60)
 }
 
 // ---- Classification --------------------------------------------------------
@@ -757,7 +796,7 @@ impl TodaySnapshot {
 // ---- The glance store (read-only) ------------------------------------------
 
 /// One report row's client-side state, as the glance store records it.
-#[derive(serde::Deserialize, Default, Clone)]
+#[derive(serde::Serialize, serde::Deserialize, Default, Clone)]
 pub struct GlanceFlag {
     #[serde(default)]
     pub seen: bool,
@@ -765,27 +804,42 @@ pub struct GlanceFlag {
     pub seen_ms: u64,
 }
 
-/// Report-row `seen` state, keyed on the item id, read from
-/// `<state_dir>/glance.json`.
+/// How long a glance survives. A row's `seen` state is only meaningful while the
+/// row can still be re-emitted by a rebuild; a week past its day it is dead
+/// weight, and GC is what keeps the store from growing without bound.
+pub const GLANCE_RETENTION_DAYS: i64 = 7;
+
+/// Report-row `seen` state, read from `<state_dir>/glance.json` and keyed
+/// `"YYYY-MM-DD/<id>"`.
 ///
-/// **No such file exists yet** — the write path that would create it is out of
-/// scope for this endpoint. It is read here rather than deferred because the
-/// absent case and the present case must be the same code path: an absent,
-/// unreadable or malformed store reads as EMPTY, never as an error, so this
-/// endpoint keeps working identically whether the store lands later or never.
+/// **Why the date is part of the key.** A report row's id is a content hash, so
+/// the same briefing line re-emitted tomorrow gets the SAME id — which is right
+/// for a task (a check should survive the rebuild) and wrong for a glanceable
+/// (today's currency report is a new thing to read, even when it is worded
+/// identically). Scoping the key to the day the snapshot is for makes "seen"
+/// mean "seen today", which is what the screen is actually claiming.
+///
+/// A bare-id key is still honored on read so a store written by hand, or by any
+/// earlier shape of this file, degrades to its old meaning rather than to an
+/// error. An absent, unreadable or malformed store reads as EMPTY, never as an
+/// error — the day screen is never blocked by its own bookkeeping.
 #[derive(Default)]
 pub struct GlanceStore {
     map: HashMap<String, GlanceFlag>,
 }
 
 impl GlanceStore {
-    /// Load the store, or an empty one. Any failure — no state dir, no file, bad
-    /// JSON — is an empty store; the day screen is never blocked by it.
+    /// The composite key for one row on one day.
+    pub fn key(date: &str, id: &str) -> String {
+        format!("{date}/{id}")
+    }
+
+    /// Load the store, or an empty one.
     pub fn load(state_dir: Option<&str>) -> Self {
-        let Some(dir) = state_dir else {
+        let Some(path) = glance_path(state_dir) else {
             return Self::default();
         };
-        let map = std::fs::read_to_string(Path::new(dir).join("glance.json"))
+        let map = std::fs::read_to_string(path)
             .ok()
             .and_then(|s| serde_json::from_str::<HashMap<String, GlanceFlag>>(&s).ok())
             .unwrap_or_default();
@@ -795,20 +849,136 @@ impl GlanceStore {
     /// Stamp `seen` / `seenMs` onto the report rows the store knows about, and
     /// bring `counts.reportsUnseen` back in line.
     pub fn merge_into(&self, snapshot: &mut TodaySnapshot) {
-        if !self.map.is_empty() {
-            for report in snapshot
-                .sections
-                .iter_mut()
-                .flat_map(|s| s.reports.iter_mut())
-            {
-                if let Some(flag) = self.map.get(&report.id) {
-                    report.seen = flag.seen;
-                    report.seen_ms = flag.seen_ms;
-                }
-            }
-            snapshot.recount();
+        if self.map.is_empty() {
+            return;
         }
+        let date = snapshot.date.clone().unwrap_or_default();
+        for report in snapshot
+            .sections
+            .iter_mut()
+            .flat_map(|s| s.reports.iter_mut())
+        {
+            if let Some(flag) = self
+                .map
+                .get(&Self::key(&date, &report.id))
+                .or_else(|| self.map.get(&report.id))
+            {
+                report.seen = flag.seen;
+                report.seen_ms = flag.seen_ms;
+            }
+        }
+        snapshot.recount();
     }
+
+    /// Record that one row was glanced at, last-writer-wins on the client's
+    /// millisecond timestamp, and GC everything older than
+    /// [`GLANCE_RETENTION_DAYS`] in the same write.
+    ///
+    /// LWW on a client clock, exactly like [`SessionFlags`]: two devices marking
+    /// the same row converge on the later one whatever order the writes arrive
+    /// in, and a stale write is ignored rather than winning by being last.
+    ///
+    /// Best-effort and never fatal — a glance that fails to persist costs one
+    /// re-read of a briefing row.
+    pub fn record(state_dir: Option<&str>, date: &str, id: &str, glanced_ms: u64) {
+        let Some(path) = glance_path(state_dir) else {
+            return;
+        };
+        let mut map = Self::load(state_dir).map;
+        let key = Self::key(date, id);
+        let entry = map.entry(key).or_default();
+        if glanced_ms > entry.seen_ms {
+            entry.seen = true;
+            entry.seen_ms = glanced_ms;
+        }
+        gc_glances(&mut map, date);
+        persist_glances(&path, &map);
+    }
+
+    /// The stored rows. Tests and introspection only.
+    pub fn len(&self) -> usize {
+        self.map.len()
+    }
+
+    /// Whether the store holds nothing.
+    pub fn is_empty(&self) -> bool {
+        self.map.is_empty()
+    }
+}
+
+/// `<state_dir>/glance.json`, or `None` with no state dir (then glances are not
+/// recorded at all — the same degradation every other bridge store has).
+fn glance_path(state_dir: Option<&str>) -> Option<PathBuf> {
+    state_dir.map(|d| Path::new(d).join("glance.json"))
+}
+
+/// Drop entries whose key names a day more than [`GLANCE_RETENTION_DAYS`] before
+/// `reference`.
+///
+/// Aged against the SNAPSHOT's date rather than the wall clock, so the store
+/// stays a pure function of what it is asked about — the same discipline the
+/// parser keeps. A key whose date does not parse is kept: it is either the
+/// legacy bare-id shape or something hand-written, and neither is ours to
+/// discard.
+fn gc_glances(map: &mut HashMap<String, GlanceFlag>, reference: &str) {
+    let Some(today) = valid_iso_date(reference).map(civil_days) else {
+        return;
+    };
+    map.retain(|k, _| {
+        let Some((date, _)) = k.split_once('/') else {
+            return true;
+        };
+        match valid_iso_date(date).map(civil_days) {
+            Some(day) => today - day <= GLANCE_RETENTION_DAYS,
+            None => true,
+        }
+    });
+}
+
+/// Persist the glance map atomically (temp + rename), mode 0600 — the same
+/// discipline as [`persist_flags`]. Best-effort: a failure is logged, never fatal.
+fn persist_glances(path: &Path, map: &HashMap<String, GlanceFlag>) {
+    let tmp = path.with_extension("json.tmp");
+    let write = || -> std::io::Result<()> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&tmp)?;
+        f.write_all(serde_json::to_string(map).unwrap_or_default().as_bytes())?;
+        f.sync_all()?;
+        std::fs::rename(&tmp, path)
+    };
+    if let Err(e) = write() {
+        eprintln!("warning: could not persist the glance store: {e}");
+        let _ = std::fs::remove_file(&tmp);
+    }
+}
+
+/// Days since the civil epoch (1970-01-01) for a `(y, m, d)`, so two dates can be
+/// subtracted. Howard Hinnant's `days_from_civil`, which is exact for every date
+/// in the proleptic Gregorian calendar and needs no date library.
+pub fn civil_days((y, m, d): (i64, i64, i64)) -> i64 {
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = y - era * 400;
+    let mp = (m + 9) % 12;
+    let doy = (153 * mp + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146_097 + doe - 719_468
+}
+
+/// The UTC `YYYY-MM-DD` of a unix-millis instant. The fallback date for a glance
+/// against a day file whose title carries no parseable date.
+pub fn date_from_ms(ms: u64) -> String {
+    rfc3339_utc(UNIX_EPOCH + Duration::from_millis(ms))
+        .chars()
+        .take(10)
+        .collect()
 }
 
 // ---- The endpoint ----------------------------------------------------------
@@ -823,7 +993,7 @@ impl GlanceStore {
 /// stored the payload can compare without keeping headers.
 fn today_response(headers: &HeaderMap, snapshot: &TodaySnapshot) -> Response {
     let mut value = serde_json::to_value(snapshot).unwrap_or_else(|_| json!({}));
-    let etag = strong_etag(&serde_json::to_string(&value).unwrap_or_default());
+    let etag = snapshot_etag(snapshot);
     if let Some(inm) = headers
         .get(axum::http::header::IF_NONE_MATCH)
         .and_then(|v| v.to_str().ok())
@@ -872,19 +1042,52 @@ pub async fn jesse_today(
             "rate limit exceeded".to_string(),
         ));
     }
+    let (_, snapshot) = build_snapshot(&st.cfg);
+    Ok(today_response(&headers, &snapshot))
+}
 
-    let path = Path::new(&st.cfg.vault)
+/// The day file's absolute path: a constant filename joined onto the configured
+/// vault root. **No part of it comes from a request** — there is no traversal
+/// surface on any of these endpoints, and this one function being the only way
+/// to name the file is what keeps that true as endpoints are added.
+pub fn day_file_path(cfg: &Config) -> PathBuf {
+    Path::new(&cfg.vault)
         .join(crate::config::VAULT_SUBDIR)
-        .join(TODAY_FILE);
-    let mut snapshot = match std::fs::read_to_string(&path) {
-        Ok(src) => parse_today(&src),
-        Err(_) => TodaySnapshot {
+        .join(TODAY_FILE)
+}
+
+/// The strong ETag for a snapshot: a hash of the exact serialized snapshot,
+/// WITHOUT `generatedAt` and `etag`.
+///
+/// The one definition, used by the `GET` and by every mutation's `If-Match`
+/// check. If those two ever computed a tag differently, `If-Match` would reject
+/// every write a client made from a tag it had just been handed — so they share
+/// this function rather than each hashing their own body.
+pub fn snapshot_etag(snapshot: &TodaySnapshot) -> String {
+    strong_etag(&serde_json::to_string(snapshot).unwrap_or_default())
+}
+
+/// Build the snapshot every reader and every precondition check sees: the file
+/// on disk, with pending intents merged in and glance state stamped on.
+///
+/// Returns the RAW on-disk source alongside it, because those two are different
+/// documents whenever an intent is parked and a mutation must splice against the
+/// former while addressing items in the latter.
+///
+/// The pending merge is what makes the app read its own writes: a tap parked
+/// behind a running turn is not in the file yet, and a screen that showed the box
+/// spring back open would be read as a failed tap.
+pub fn build_snapshot(cfg: &Config) -> (Option<String>, TodaySnapshot) {
+    let raw = std::fs::read_to_string(day_file_path(cfg)).ok();
+    let mut snapshot = match &raw {
+        Some(src) => parse_today(&merge_pending(src, &pending_intents(cfg))),
+        None => TodaySnapshot {
             missing: true,
             ..TodaySnapshot::default()
         },
     };
-    GlanceStore::load(st.cfg.state_dir.as_deref()).merge_into(&mut snapshot);
-    Ok(today_response(&headers, &snapshot))
+    GlanceStore::load(cfg.state_dir.as_deref()).merge_into(&mut snapshot);
+    (raw, snapshot)
 }
 
 #[cfg(test)]

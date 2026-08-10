@@ -15,6 +15,107 @@ CI both run it). See the "Versioning" section of `bridge/README.md`.
 
 ## [Unreleased]
 
+## [Bridge 0.71.0] - 2026-08-10
+
+### Added
+
+- **The day file's write path — `POST /jesse/today/items/{id}/check`, `.../move` and
+  `POST /jesse/today/glance`.** The first thing in the bridge that writes the agent's
+  own working files, so the safety machinery is the feature rather than scaffolding
+  around it. Bearer auth and the shared rate limiter, exactly as the read path; every
+  mutation additionally gated on an `If-Match` carrying the snapshot etag.
+
+  - **The frozen `app-completed` sub-line grammar.** Checking an item with evidence
+    appends exactly one tab-indented line directly beneath it:
+    `\t*(app-completed YYYY-MM-DD HH:MM: <evidence>)*`. That is the ONLY content the
+    bridge composes into the vault. Evidence is flattened to one line, capped at 500
+    characters and markdown-escaped (`\ * _ ` [ ] ( ) # ~ | < >`), so it cannot close
+    the wrapper early and continue as document text. The spelling is a contract with
+    two other programs — the parser reads it back, and the morning routine reads it
+    when deciding what carries over — not a formatting choice.
+  - **Line-level splices, never a re-serialization.** A check flips three bytes; a
+    move splices one contiguous block (its line plus its continuation block, which
+    travels with it). Tests assert a check changes exactly one byte of the file and
+    that check-then-uncheck is byte-identical to where it started.
+  - **Whole-file atomic rename, never an in-place edit.** `Today.md` is watched by an
+    external sync tool, so an in-place rewrite would be observable half-written. Every
+    write goes to a temp file in the same directory and lands with one `rename(2)`,
+    inheriting the existing file's mode rather than tightening it to `0600`.
+  - **Items are re-found by re-parsing at write time**, never by a byte offset from a
+    served snapshot. An unknown id is `410` (it vanished in a rebuild — the client
+    refetches), a stale `If-Match` is `412` and touches nothing at all, and a missing
+    `If-Match` is `428` so a client can tell "you sent none" from "yours is stale".
+  - **Guards on `move`.** The standing top-priority item in the lead block cannot be
+    moved by any op, and nothing can be spliced above the first `## ` heading (`409`,
+    asserted on both the source and the destination side). `to_do_now` is `409` when
+    no section is named `Do Now…`. `up` on the first item, `down` on the last, and
+    `top_of_section` on something already at the top are no-ops that write nothing
+    and journal nothing.
+  - **The glance store now has a write path**, keyed `"YYYY-MM-DD/<id>"` on the
+    snapshot's date. Last-writer-wins on a client millisecond timestamp, exactly like
+    the session flags, with entries older than 7 days garbage-collected on write. A
+    report row's id is a content hash, so an identically-worded briefing line
+    re-emitted tomorrow is a NEW thing to read; scoping the key to the day is what
+    makes "seen" mean "seen today". Bare-id keys are still honored on read. This
+    endpoint writes no vault content at all.
+
+- **A durable intent journal (`<state_dir>/today-intents.json`) — and the race it
+  closes.** An agent turn reads `Today.md`, thinks for minutes, and writes back a
+  whole file composed from the copy it read. A checkbox tapped in that window is
+  silently reverted when the turn's write lands. Making the tap wait for the write
+  lock would be the wrong fix: a UI that freezes for minutes is broken.
+
+  So a mutation **never blocks on the turn lock**. Every check and move intent is
+  journaled BEFORE any file edit, applied immediately when no write-enabled turn
+  holds the lock, and parked when one does. On turn completion — the `TurnLockRelease`
+  drop guard, which runs on success, error, timeout, panic and the abort a cancel
+  performs — the journal is replayed: the file is re-parsed and any intent whose
+  effect is absent is re-applied against whatever the agent actually wrote. The
+  clobber still happens; it is repaired within milliseconds of the turn ending.
+
+  - **Journal-then-edit is also what makes it crash-safe.** An intent on disk whose
+    effect is not yet in the file is exactly the state replay resolves, so a bridge
+    killed between the two recovers rather than losing the tap. Recovery does not wait
+    for a turn: the next mutation drains the journal inside its own critical section.
+  - **Intents are recorded by IDENTITY, not by id.** `today_id` hashes the section
+    name, so an item moved between sections legitimately gets a new id and a `-2`
+    duplicate suffix can shift. An intent stores the identity contract's three actual
+    inputs — section, lead, `(Added …)` date — and re-finds its item by re-parsing.
+  - **Every journaled effect is idempotent.** `up` and `down` are not, so a move is
+    never journaled as a relative op: it is resolved at request time into an absolute
+    landing (*above item X*, or *last in section S*), which can be both verified and
+    re-applied any number of times with the same result.
+  - **Replay resolves every intent**: applied, verified as already present, or dropped
+    with a log line (a vanished item is never re-added — the morning routine's decision
+    to retire a line is the agent's, not a stale tap's). Capped at 200 entries, oldest
+    dropped; only intents dated the current file's date or newer are replayed, so
+    yesterday's tap can never re-apply itself to today's rebuilt day.
+  - **`GET /jesse/today` merges pending intents into the snapshot**, so the app reads
+    its own writes instantly and a parked checkbox does not visibly spring back open.
+    The mutation response carries the fresh snapshot, its new etag, and `pending`.
+
+### Changed
+
+- **`app-completed` now parses the `YYYY-MM-DD HH:MM:` spelling** the bridge writes,
+  in addition to the single-token ISO instant already understood. A naive
+  split-on-whitespace tore the new form in half and stranded the clock at the front of
+  the evidence.
+- **A short internal mutex serializes the bridge's own day-file writes**, so two taps
+  arriving together cannot interleave their read-modify-write cycles and lose one. It
+  is deliberately NOT the turn lock: the agent is a separate process, and the journal
+  is what covers that. An integration test fires two concurrent taps and asserts both
+  survive.
+
+### Known gaps
+
+- **With no state dir there is no journal.** The write path degrades to
+  apply-immediately: a mutation still lands, but a tap that races a running turn can
+  still be clobbered and nothing replays it. Same degradation every other bridge store
+  has, and the reason a real deploy configures a state dir.
+- **The bridge never propagates a completion beyond `Today.md`.** Closing the item at
+  its source — a Dashboard, a project note — belongs to the agent and the morning
+  routine, and the bridge does not re-implement it.
+
 ## [Bridge 0.70.0] - 2026-08-10
 
 ### Added
