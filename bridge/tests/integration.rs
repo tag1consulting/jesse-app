@@ -6766,3 +6766,209 @@ async fn a_session_already_owned_is_never_reassigned_to_another_conversation() {
     );
     let _ = std::fs::remove_dir_all(&home);
 }
+
+// ---- GET /jesse/today -----------------------------------------------------
+//
+// Synthetic, invented fixture (never a copy of the real personal Today.md) —
+// the same file the parser's unit tests use, so the endpoint and the parser
+// are asserted against one grammar.
+
+const FIX_TODAY_MD: &str = include_str!("fixtures/today/full.md");
+
+/// A vault containing the day file, and an AppState pointed at it.
+fn today_state() -> (AppState, std::path::PathBuf) {
+    let vault = make_diet_vault();
+    write_vault_file(&vault, "vault/Today.md", FIX_TODAY_MD);
+    let cfg = Config {
+        vault: vault.to_string_lossy().into_owned(),
+        ..test_config()
+    };
+    (AppState::new(cfg), vault)
+}
+
+#[tokio::test]
+async fn today_no_auth_is_401() {
+    let resp = app(test_state())
+        .oneshot(today_request(None, None))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn today_wrong_token_is_401() {
+    let resp = app(test_state())
+        .oneshot(today_request(Some("Bearer wrong"), None))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn today_happy_path_returns_the_structured_snapshot() {
+    let (st, vault) = today_state();
+    let resp = app(st)
+        .oneshot(today_request(Some("Bearer test-token"), None))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let etag_header = resp
+        .headers()
+        .get("etag")
+        .and_then(|v| v.to_str().ok())
+        .unwrap()
+        .to_string();
+    let body: Value = serde_json::from_str(&body_string(resp).await).unwrap();
+
+    assert_eq!(body["title"], "Today: Tuesday, March 3, 2026");
+    assert_eq!(body["date"], "2026-03-03");
+    assert_eq!(body["missing"], false);
+    assert!(body["generatedAt"].as_str().unwrap().ends_with('Z'));
+    assert_eq!(
+        body["etag"].as_str().unwrap(),
+        etag_header,
+        "the body's etag is the one on the header"
+    );
+    assert!(body["narrative"]
+        .as_str()
+        .unwrap()
+        .contains("it is a short day"));
+
+    // Lead items sit above the sections.
+    let lead = body["leadItems"].as_array().unwrap();
+    assert_eq!(lead.len(), 1);
+    assert!(lead[0]["lead"]
+        .as_str()
+        .unwrap()
+        .starts_with("TOP PRIORITY"));
+
+    // Sections carry name/kind/prose/items/reports, in file order.
+    let sections = body["sections"].as_array().unwrap();
+    let names: Vec<&str> = sections
+        .iter()
+        .map(|s| s["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        names,
+        vec![
+            "Schedule",
+            "Do Now",
+            "Errands",
+            "Health",
+            "Currency",
+            "Still open (aging)",
+            "Reminders (Mar 3 to Mar 10)",
+            "Done Today",
+        ]
+    );
+    let health = sections.iter().find(|s| s["name"] == "Health").unwrap();
+    assert_eq!(health["kind"], "briefing");
+    assert_eq!(health["items"].as_array().unwrap().len(), 1);
+    assert_eq!(health["reports"][0]["kind"], "health");
+
+    // Ids and values only: every item carries an id and a byte range.
+    for s in sections {
+        for it in s["items"].as_array().unwrap() {
+            assert!(!it["id"].as_str().unwrap().is_empty(), "every item has an id");
+            assert!(it["range"]["end"].as_u64().unwrap() > it["range"]["start"].as_u64().unwrap());
+        }
+    }
+
+    let counts = &body["counts"];
+    let total_items: usize = sections
+        .iter()
+        .map(|s| s["items"].as_array().unwrap().len())
+        .sum::<usize>()
+        + lead.len();
+    assert_eq!(
+        counts["open"].as_u64().unwrap() + counts["done"].as_u64().unwrap(),
+        total_items as u64
+    );
+    assert!(counts["reportsUnseen"].as_u64().unwrap() > 0);
+
+    let _ = std::fs::remove_dir_all(&vault);
+}
+
+#[tokio::test]
+async fn today_etag_is_stable_and_if_none_match_gives_304() {
+    let (st, vault) = today_state();
+    let first = app(st.clone())
+        .oneshot(today_request(Some("Bearer test-token"), None))
+        .await
+        .unwrap();
+    let etag = first
+        .headers()
+        .get("etag")
+        .and_then(|v| v.to_str().ok())
+        .unwrap()
+        .to_string();
+    assert!(etag.starts_with('"'), "strong ETag is quoted: {etag}");
+
+    // Same file state → same ETag, even though `generatedAt` moved on. The tag is
+    // a pure function of the file, so a poll that changes nothing costs one 304.
+    let second = app(st.clone())
+        .oneshot(today_request(Some("Bearer test-token"), None))
+        .await
+        .unwrap();
+    assert_eq!(
+        second.headers().get("etag").unwrap().to_str().unwrap(),
+        etag,
+        "the ETag must not move with the clock"
+    );
+
+    let cached = app(st.clone())
+        .oneshot(today_request(Some("Bearer test-token"), Some(&etag)))
+        .await
+        .unwrap();
+    assert_eq!(cached.status(), StatusCode::NOT_MODIFIED);
+    assert_eq!(cached.headers().get("etag").unwrap().to_str().unwrap(), etag);
+    assert!(body_string(cached).await.is_empty(), "304 carries no body");
+
+    let wildcard = app(st.clone())
+        .oneshot(today_request(Some("Bearer test-token"), Some("*")))
+        .await
+        .unwrap();
+    assert_eq!(wildcard.status(), StatusCode::NOT_MODIFIED);
+
+    // A changed file changes the tag.
+    write_vault_file(&vault, "vault/Today.md", "# Today: Friday, March 6, 2026\n");
+    let changed = app(st)
+        .oneshot(today_request(Some("Bearer test-token"), Some(&etag)))
+        .await
+        .unwrap();
+    assert_eq!(changed.status(), StatusCode::OK, "a stale tag re-fetches");
+    assert_ne!(
+        changed.headers().get("etag").unwrap().to_str().unwrap(),
+        etag
+    );
+
+    let _ = std::fs::remove_dir_all(&vault);
+}
+
+#[tokio::test]
+async fn today_missing_file_is_200_with_an_empty_snapshot_and_a_missing_marker() {
+    let vault = make_diet_vault(); // no Today.md written
+    let cfg = Config {
+        vault: vault.to_string_lossy().into_owned(),
+        ..test_config()
+    };
+    let resp = app(AppState::new(cfg))
+        .oneshot(today_request(Some("Bearer test-token"), None))
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "a missing day file is an empty state, not an error"
+    );
+    let body: Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    assert_eq!(body["missing"], true, "the client renders an empty state");
+    assert_eq!(body["title"], Value::Null);
+    assert_eq!(body["date"], Value::Null);
+    assert!(body["sections"].as_array().unwrap().is_empty());
+    assert!(body["leadItems"].as_array().unwrap().is_empty());
+    assert_eq!(body["counts"]["open"], 0);
+    assert!(body["etag"].as_str().is_some(), "an empty snapshot still tags");
+
+    let _ = std::fs::remove_dir_all(&vault);
+}

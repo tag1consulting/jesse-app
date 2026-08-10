@@ -1891,6 +1891,9 @@ pub fn app(state: AppState) -> Router {
         .route("/jesse", post(jesse))
         .route("/jesse/prompts", get(jesse_prompts))
         .route("/jesse/diet", get(jesse_diet))
+        // The day file, read-only: the same snapshot posture as /jesse/diet, plus a
+        // strong ETag so a poll that changes nothing costs one 304.
+        .route("/jesse/today", get(jesse_today))
         // The conversation surface: the bridge's own thread identity, keyed on a stable
         // UUID registered at accept time rather than on a CLI transcript filename.
         .route("/jesse/conversations", get(jesse_conversations))
