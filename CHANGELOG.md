@@ -15,6 +15,87 @@ CI both run it). See the "Versioning" section of `bridge/README.md`.
 
 ## [Unreleased]
 
+## [App 1.0 (95)] - 2026-08-10
+
+### Added
+
+- **A third iOS tab: Today.** The day file, live, on the phone. `RootTabView` grew a
+  `Today` tab (`sun.max`) that renders the portable `TodayListView` from
+  `JesseTodayDisplay` against the bridge's day-file endpoints, so the screen App 1.0 (94)
+  built as a library now has a consumer.
+
+  The tabs are now DATA (`RootTabView.Tab`, `CaseIterable`) that the body iterates rather
+  than three hand-written `.tabItem`s: the set of tabs, their order and their labels have
+  one definition, which is also what a test can assert. `sun.max` and not `sun.horizon` —
+  the latter already means "start the morning routine" on the Health tab and in the
+  day-file empty state, and a tab icon that also means "start something" is one glyph
+  carrying two claims.
+
+- **The tab badge, computed by the semantics.** `TodaySemantics.tabBadge` = open Do Now
+  work + unseen briefing rows, surfaced as `TodayDashboardModel.tabBadgeCount`. One
+  function rather than a sum written at the call site, because the moment two halves are
+  added up in a view, each platform's shell owns a private definition of what the badge
+  means and they drift. The model lives in `RootTabView` so the badge and the screen read
+  the same number.
+
+- **Discuss and Close-at-source, through the coordinator.** A row's menu, its context
+  menu and its swipe both reach `RunCoordinator` on a NEW thread — the same path the
+  Health tab's "Start new day" button takes — carrying the FROZEN `TodayDiscuss.prompt` /
+  `TodayPropagate.prompt` text from `JesseCore`, never a string assembled in the view
+  (`TodayTurn`, `TodayThreadOpener`). Discuss is an ASK (its floor forbids task-work that
+  was not requested, which is the right posture for a screen made of tasks); Propagate is
+  a TELL (it writes to the project file and the Dashboard). The thread is presented
+  MODALLY from the Today tab: no precedent exists in this app for one tab driving
+  another's navigation, and `ContentView` owns its path privately in two different shapes
+  (stack on iPhone, split view on iPad).
+
+- **Wiki chips open a discussion.** There is no in-app vault viewer in v1 (follow-on), so
+  a `[[wiki]]` chip starts a conversation seeded with the row that referenced the note —
+  the agent can read the file, the app cannot. URLs open in the browser through the
+  system's own handling. `TodayLinkOrigin` carries the tapped link together with the raw
+  markdown of its row, which is exactly what the discuss builder embeds.
+
+### Changed
+
+- **The day goes read-only when the bridge is out of reach, and a tap is REFUSED, never
+  queued.** `TodayDashboardModel` gained `isNetworkUnreachable` (fed by the shell's
+  existing `BridgeReachabilityModel` probe through the same `shouldShowOfflineBanner`
+  gate the Chats list uses — one definition of "offline", not two), `isReadOnly`, and a
+  one-line refusal. A queued check would be a promise about a document the app cannot
+  see: `Today.md` is rewritten in full every morning, every mutation is gated on an
+  `If-Match` ETag, and a tag captured before an outage is worthless after it — the tap
+  would replay against a line that has since moved, been reworded, or been closed by
+  someone else. Refusing costs one re-tap. The last snapshot keeps rendering throughout.
+  A successful round trip to the day-file endpoints clears both signals, so one
+  pull-to-refresh restores editing without waiting for the next probe.
+
+- **`409` and the read-only refusal are one inline notice, not a modal alert.** An alert
+  demands a dismissal before the user can look at the thing it is about; for "that move
+  isn't possible" the useful next act is to look at the list and pick another one.
+
+- **Swipe actions and a context menu on every task row.** `TodayItemActions` is the one
+  list of actions the ellipsis menu and the long-press menu both render, so neither can
+  fall behind the other. Swipe carries what is worth a one-handed gesture (Discuss on the
+  leading edge; Close at source, Move to Do Now, Top on the trailing); the menus carry the
+  complete set including all four moves, because a swipe slot cannot open a submenu.
+
+### Fixed
+
+- **Link chips rendered as a bare glyph in an empty capsule** on iOS — the label style a
+  `Button` inside a `List` row resolves to drops the title, so a chip said a link existed
+  but not to what. Pinned with an explicit `.labelStyle(.titleAndIcon)`, the modifier the
+  row's evidence line already carries for the same reason. Found by running the tab in the
+  Simulator; no unit test would have seen it.
+
+- **Prose and schedule rows keyed by source range collapsed when two ranges matched.**
+  `ForEach(section.prose, id: \.range)` renders one line twice and silently drops the
+  other whenever a producer's ranges are not per-line. Keyed by position now, which is
+  unique by construction.
+
+- **The day file's title truncated in the navigation bar** ("Today: Monday, Augus…"). The
+  iOS shell asks for an inline title; the modifier is UIKit-only, so it stays out of the
+  cross-platform package.
+
 ## [App 1.0 (94)] - 2026-08-10
 
 ### Added

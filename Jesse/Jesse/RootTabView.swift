@@ -1,14 +1,55 @@
 import SwiftUI
+import JesseNetworking
+import JesseTodayDisplay
 
-// The app root: a two-tab shell. "Chats" hosts the existing conversation UI
+// The app root: a three-tab shell. "Chats" hosts the existing conversation UI
 // (`ContentView`) exactly as before — every Siri/push/voice entry point it owns
 // keeps working, because the whole view (and its scene-phase + onChange handlers)
-// lives inside the tab, which TabView keeps mounted. "Health" is the new native
-// diet dashboard. Wrapping (rather than restructuring) `ContentView` is the
-// non-invasive path: nothing about the old root's behavior changes.
+// lives inside the tab, which TabView keeps mounted. "Health" is the native diet
+// dashboard; "Today" is the vault's day file. Wrapping (rather than restructuring)
+// `ContentView` is the non-invasive path: nothing about the old root's behavior
+// changes.
 struct RootTabView: View {
-    enum Tab: Hashable { case chats, health }
+    /// The tabs, as data. A `CaseIterable` enum the body ITERATES rather than a
+    /// hand-written list of three `.tabItem`s: the set of tabs, their order, and
+    /// their labels then have exactly one definition, which is also the one a test
+    /// can assert against.
+    enum Tab: String, Hashable, CaseIterable, Identifiable {
+        case chats, health, today
+
+        var id: String { rawValue }
+
+        var title: String {
+            switch self {
+            case .chats: return "Chats"
+            case .health: return "Health"
+            case .today: return "Today"
+            }
+        }
+
+        /// `sun.max` for Today: it reads as "the day", and it collides with nothing
+        /// on the bar (Chats is a speech bubble, Health a heart). It is deliberately
+        /// NOT `sun.horizon`, which the day-file screen already uses for its own
+        /// "the morning routine hasn't run yet" empty state and for the Health tab's
+        /// Start-new-day button — a tab icon that also means "start the morning"
+        /// would be one glyph carrying two claims.
+        var systemImage: String {
+            switch self {
+            case .chats: return "bubble.left.and.bubble.right"
+            case .health: return "heart.text.square"
+            case .today: return "sun.max"
+            }
+        }
+    }
+
     @State private var selection: Tab = .chats
+
+    /// The Today screen's model lives HERE, not in `TodayTabView`, because the tab
+    /// item's badge and the screen must read the same number. Injected through the
+    /// same narrow `TodayProviding` seam the Health tab uses for diet data — the
+    /// shared `JesseBridgeClient`, rebuilt per call so a re-pairing is picked up.
+    @State private var todayModel = TodayDashboardModel(
+        makeClient: { JesseBridgeClient(config: ConfigStore.load()) })
 
     /// Non-nil only when the on-disk conversation store couldn't be opened and the
     /// app is running on the in-memory fallback (see `AppModelStore`). When set, a
@@ -18,19 +59,36 @@ struct RootTabView: View {
 
     var body: some View {
         TabView(selection: $selection) {
-            ContentView()
-                .tabItem { Label("Chats", systemImage: "bubble.left.and.bubble.right") }
-                .tag(Tab.chats)
-
-            HealthTabView(isActive: selection == .health)
-                .tabItem { Label("Health", systemImage: "heart.text.square") }
-                .tag(Tab.health)
+            ForEach(Tab.allCases) { tab in
+                view(for: tab)
+                    .tabItem { Label(tab.title, systemImage: tab.systemImage) }
+                    .badge(badge(for: tab))
+                    .tag(tab)
+            }
         }
         .safeAreaInset(edge: .top) {
             if storeError != nil {
                 StoreErrorBanner()
             }
         }
+    }
+
+    @ViewBuilder
+    private func view(for tab: Tab) -> some View {
+        switch tab {
+        case .chats:
+            ContentView()
+        case .health:
+            HealthTabView(isActive: selection == .health)
+        case .today:
+            TodayTabView(isActive: selection == .today, model: todayModel)
+        }
+    }
+
+    /// Only Today carries a number, and the number is the semantics' — open Do Now
+    /// work plus unseen briefing rows. `0` renders as no badge at all.
+    private func badge(for tab: Tab) -> Int {
+        tab == .today ? todayModel.tabBadgeCount : 0
     }
 }
 

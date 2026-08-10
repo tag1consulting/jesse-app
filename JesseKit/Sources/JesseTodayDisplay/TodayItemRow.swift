@@ -38,15 +38,48 @@ struct TodayCheckbox: View {
 
 // MARK: - Link chips
 
+/// A tapped link together with the row it came from.
+///
+/// The row travels with the link because the two kinds of link want opposite
+/// things. A URL opens in a browser and the row is irrelevant. A `[[wiki]]` target
+/// addresses a vault note the app cannot render — there is no in-app viewer — so the
+/// only useful thing a tap can do is start a conversation ABOUT that note, and a
+/// conversation needs the line that referenced it, verbatim, or the agent is left
+/// guessing why the file came up. `sourceText` is that line's RAW markdown, which is
+/// exactly what the discuss prompt builder embeds.
+public struct TodayLinkOrigin: Equatable, Sendable {
+    public var link: TodayLink
+    public var sourceText: String
+
+    public init(link: TodayLink, sourceText: String) {
+        self.link = link
+        self.sourceText = sourceText
+    }
+}
+
 /// One link as a tappable chip. Wiki targets show their leaf name, URLs their host —
 /// a full vault path would not fit and would not help.
 public struct TodayLinkChip: View {
     let link: TodayLink
-    let onOpen: (TodayLink) -> Void
+    let sourceText: String
+    let onOpen: (TodayLinkOrigin) -> Void
+
+    public init(link: TodayLink, sourceText: String,
+                onOpen: @escaping (TodayLinkOrigin) -> Void) {
+        self.link = link
+        self.sourceText = sourceText
+        self.onOpen = onOpen
+    }
 
     public var body: some View {
-        Button { onOpen(link) } label: {
+        Button { onOpen(TodayLinkOrigin(link: link, sourceText: sourceText)) } label: {
             Label(link.chipLabel, systemImage: link.isWiki ? "doc.text" : "link")
+                // Explicit, not inherited: run on a phone, this chip rendered as a
+                // bare glyph in an otherwise empty capsule — the label style a
+                // `Button` inside a `List` row resolves to drops the title. The row's
+                // evidence line carries the same modifier for the same reason. A chip
+                // that shows only an icon says a link exists but not to what.
+                .labelStyle(.titleAndIcon)
                 .font(.caption2)
                 .lineLimit(1)
                 .padding(.horizontal, 8)
@@ -63,7 +96,8 @@ public struct TodayLinkChip: View {
 /// truncating. Nothing renders when there are none.
 struct TodayLinkChips: View {
     let links: [TodayLink]
-    let onOpen: (TodayLink) -> Void
+    let sourceText: String
+    let onOpen: (TodayLinkOrigin) -> Void
 
     var body: some View {
         if !links.isEmpty {
@@ -71,7 +105,9 @@ struct TodayLinkChips: View {
             // chips flow onto as many rows as they need on a phone and a Mac window
             // alike, with no measurement pass of our own.
             FlowRow(spacing: 6) {
-                ForEach(links, id: \.target) { TodayLinkChip(link: $0, onOpen: onOpen) }
+                ForEach(links, id: \.target) {
+                    TodayLinkChip(link: $0, sourceText: sourceText, onOpen: onOpen)
+                }
             }
         }
     }
@@ -144,7 +180,7 @@ public struct TodayItemRow: View {
     let onMove: (TodayMoveOp) -> Void
     let onDiscuss: () -> Void
     let onPropagate: () -> Void
-    let onOpenLink: (TodayLink) -> Void
+    let onOpenLink: (TodayLinkOrigin) -> Void
 
     public init(item: TodayItem, pending: Bool = false, evidence: String? = nil,
                 availableMoves: [TodayMoveOp] = [],
@@ -152,7 +188,7 @@ public struct TodayItemRow: View {
                 onMove: @escaping (TodayMoveOp) -> Void = { _ in },
                 onDiscuss: @escaping () -> Void = {},
                 onPropagate: @escaping () -> Void = {},
-                onOpenLink: @escaping (TodayLink) -> Void = { _ in }) {
+                onOpenLink: @escaping (TodayLinkOrigin) -> Void = { _ in }) {
         self.item = item
         self.pending = pending
         self.evidence = evidence
@@ -176,7 +212,7 @@ public struct TodayItemRow: View {
                         .font(.footnote)
                         .foregroundStyle(.secondary)
                 }
-                TodayLinkChips(links: item.links, onOpen: onOpenLink)
+                TodayLinkChips(links: item.links, sourceText: item.text, onOpen: onOpenLink)
                 if let evidence {
                     Label(evidence, systemImage: "text.quote")
                         .font(.caption)
@@ -194,6 +230,13 @@ public struct TodayItemRow: View {
                           onMove: onMove, onDiscuss: onDiscuss, onPropagate: onPropagate)
         }
         .padding(.vertical, 4)
+        // The same actions the ellipsis menu offers, on a long press. Two ways in
+        // rather than two menus: `TodayItemActions` is the single list, so an action
+        // added to it appears in both without either falling behind the other.
+        .contextMenu {
+            TodayItemActions(item: item, availableMoves: availableMoves,
+                             onMove: onMove, onDiscuss: onDiscuss, onPropagate: onPropagate)
+        }
         .accessibilityElement(children: .contain)
     }
 
@@ -227,6 +270,40 @@ public struct TodayItemRow: View {
 /// The row's overflow menu: the moves that would actually do something, plus the two
 /// conversation actions. Rendered as nothing at all when there is nothing to offer —
 /// which is the case for the standing lead item, whose every move the bridge refuses.
+/// The complete set of actions for one row, as menu buttons. Rendered by the
+/// ellipsis menu AND by the row's context menu, so the two can never disagree.
+struct TodayItemActions: View {
+    let item: TodayItem
+    let availableMoves: [TodayMoveOp]
+    let onMove: (TodayMoveOp) -> Void
+    let onDiscuss: () -> Void
+    let onPropagate: () -> Void
+
+    var body: some View {
+        Button { onDiscuss() } label: {
+            Label("Discuss this item", systemImage: "bubble.left.and.text.bubble.right")
+        }
+        // Propagation closes an item AT SOURCE — in its project file and its
+        // Dashboard — so it is only offered for something already completed.
+        // Offering it on an open item would invite a turn that closes work the
+        // user has not done.
+        if item.checked {
+            Button { onPropagate() } label: {
+                Label("Close it at source", systemImage: "arrow.up.forward.square")
+            }
+        }
+        if !availableMoves.isEmpty {
+            Divider()
+            ForEach(availableMoves, id: \.self) { op in
+                Button { onMove(op) } label: {
+                    Label(TodaySemantics.label(for: op),
+                          systemImage: TodaySemantics.symbol(for: op))
+                }
+            }
+        }
+    }
+}
+
 struct TodayItemMenu: View {
     let item: TodayItem
     let availableMoves: [TodayMoveOp]
@@ -236,27 +313,8 @@ struct TodayItemMenu: View {
 
     var body: some View {
         Menu {
-            Button { onDiscuss() } label: {
-                Label("Discuss this item", systemImage: "bubble.left.and.text.bubble.right")
-            }
-            // Propagation closes an item AT SOURCE — in its project file and its
-            // Dashboard — so it is only offered for something already completed.
-            // Offering it on an open item would invite a turn that closes work the
-            // user has not done.
-            if item.checked {
-                Button { onPropagate() } label: {
-                    Label("Close it at source", systemImage: "arrow.up.forward.square")
-                }
-            }
-            if !availableMoves.isEmpty {
-                Divider()
-                ForEach(availableMoves, id: \.self) { op in
-                    Button { onMove(op) } label: {
-                        Label(TodaySemantics.label(for: op),
-                              systemImage: TodaySemantics.symbol(for: op))
-                    }
-                }
-            }
+            TodayItemActions(item: item, availableMoves: availableMoves,
+                             onMove: onMove, onDiscuss: onDiscuss, onPropagate: onPropagate)
         } label: {
             Image(systemName: "ellipsis")
                 .font(.footnote)

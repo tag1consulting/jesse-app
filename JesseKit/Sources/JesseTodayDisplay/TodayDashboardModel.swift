@@ -57,6 +57,18 @@ public final class TodayDashboardModel {
     /// and cleared on the next action.
     public private(set) var lastConflictMessage: String?
 
+    /// Set to true by the platform shell when its own reachability probe says the
+    /// bridge is unreachable, so the screen goes read-only BEFORE a tap rather than
+    /// after one fails. Settable (not derived) because the probe is the shell's: iOS
+    /// runs `BridgeReachabilityModel` against `GET /health`, and a library that
+    /// reached for a probe of its own would be a second answer to the same question.
+    public var isNetworkUnreachable = false
+
+    /// The refusal a tap got while the screen was read-only. Distinct from
+    /// `lastErrorMessage` (which describes a call that FAILED) because nothing was
+    /// attempted here at all — and nothing was queued either. See `refuseIfReadOnly`.
+    public private(set) var lastReadOnlyNotice: String?
+
     /// Whether the newest response said the change is journaled but not yet in the
     /// file — a turn is mid-write and replay will land it. Worth a quiet indicator:
     /// the tap is safe, it is just not on disk yet.
@@ -100,7 +112,7 @@ public final class TodayDashboardModel {
         return .loading
     }
 
-    /// The tab badge: open Do Now items plus the standing lead item.
+    /// Open Do Now items plus the standing lead item.
     public var badgeCount: Int {
         snapshot.map(TodaySemantics.doNowOpenCount) ?? 0
     }
@@ -109,6 +121,20 @@ public final class TodayDashboardModel {
     public var unseenReportCount: Int {
         snapshot.map(TodaySemantics.unseenReportCount) ?? 0
     }
+
+    /// **The number the tab shows** — the two counts above, added up by the semantics
+    /// and never by a view. Nothing yet loaded is a badge of zero, not a guess.
+    public var tabBadgeCount: Int {
+        snapshot.map(TodaySemantics.tabBadge) ?? 0
+    }
+
+    /// Whether the day on screen can still be changed.
+    ///
+    /// Read-only means one of two things, and they deserve the same treatment: the
+    /// shell's probe says the bridge is unreachable, or our own last call to it
+    /// failed. In both cases the honest screen is the last snapshot, rendered and
+    /// readable, with taps refused rather than queued — see `refuseIfReadOnly`.
+    public var isReadOnly: Bool { isOffline || isNetworkUnreachable }
 
     /// Whether this item has a tap the server has not confirmed yet.
     public func isPending(_ id: String) -> Bool {
@@ -191,6 +217,13 @@ public final class TodayDashboardModel {
     private func clearFailure() {
         isOffline = false
         lastErrorMessage = nil
+        // A completed round trip to the day-file endpoints outranks the shell's
+        // `GET /health` probe about whether the bridge is reachable: it is the same
+        // question asked of the exact route this screen writes to. Clearing the
+        // shell's flag here means one successful pull-to-refresh restores editing
+        // immediately, instead of leaving the screen read-only until the next probe.
+        isNetworkUnreachable = false
+        lastReadOnlyNotice = nil
     }
 
     private func fail(_ error: any Error) {
@@ -201,6 +234,50 @@ public final class TodayDashboardModel {
 
     // MARK: - Mutations
 
+    /// The wording a refused tap gets. Public so a shell can render it without
+    /// inventing a second sentence for the same situation.
+    public static let readOnlyNotice =
+        "You're offline, so the day is read-only. Nothing was saved and nothing is waiting to send — try again once the bridge is reachable."
+
+    /// Refuse a mutation while the screen is read-only, and say so.
+    ///
+    /// Deliberately NOT a queue. A queued check would be a promise about a document
+    /// the app cannot see: `Today.md` is rewritten in full every morning and edited
+    /// by the agent all day, and an ETag captured before a network outage is
+    /// worthless after it — the tap would replay against a line that has since moved,
+    /// been reworded, or been closed by someone else. Refusing costs the user one
+    /// re-tap; queueing would spend their trust on a write aimed at a file that no
+    /// longer exists.
+    private func refuseIfReadOnly() -> Bool {
+        guard isReadOnly else {
+            lastReadOnlyNotice = nil
+            return false
+        }
+        lastReadOnlyNotice = Self.readOnlyNotice
+        return true
+    }
+
+    /// Refuse an interaction the view has not started yet, and say so — the same
+    /// refusal a mutation would hit, reachable BEFORE the flow that would lead to
+    /// one. The evidence sheet is the case that matters: opening it while the day is
+    /// read-only would take a note off the user and then throw it away.
+    ///
+    /// Returns whether the interaction was refused, so a caller reads as a guard.
+    @discardableResult
+    public func refuseInteractionIfReadOnly() -> Bool { refuseIfReadOnly() }
+
+    /// Dismiss whichever one-line notice is showing. Both are transient by design:
+    /// they describe one refused interaction, not a state of the document.
+    public func dismissNotice() {
+        lastReadOnlyNotice = nil
+        lastConflictMessage = nil
+    }
+
+    /// The one notice the screen shows, if any. The read-only refusal wins: when the
+    /// bridge is unreachable, a stale conflict message is about a round trip that
+    /// happened in a different world.
+    public var notice: String? { lastReadOnlyNotice ?? lastConflictMessage }
+
     /// Tick or untick an item, optionally recording one line of evidence.
     ///
     /// The box flips before the request is sent and stays flipped until the server
@@ -208,10 +285,14 @@ public final class TodayDashboardModel {
     /// snapshot wins). A tap on an item with no ETag in hand is dropped rather than
     /// sent: without one the bridge answers `428`, and the honest thing is to refetch.
     public func check(id: String, checked: Bool, evidence: String? = nil) async {
+        // Order matters: the missing-tag path runs FIRST. With no ETag in hand there
+        // is nothing to refuse against — the only useful act is to go and get one,
+        // which is also a live re-test of whether the bridge is reachable at all.
         guard let tag = etag, !tag.isEmpty else {
             await load()
             return
         }
+        if refuseIfReadOnly() { return }
         lastConflictMessage = nil
         overlay.checks[id] = checked
         let note = evidence?.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -232,10 +313,14 @@ public final class TodayDashboardModel {
     /// destination section the client cannot compute — and the response's snapshot
     /// then decides where it really lives and under what id. See `settleMove`.
     public func move(id: String, op: TodayMoveOp) async {
+        // Order matters: the missing-tag path runs FIRST. With no ETag in hand there
+        // is nothing to refuse against — the only useful act is to go and get one,
+        // which is also a live re-test of whether the bridge is reachable at all.
         guard let tag = etag, !tag.isEmpty else {
             await load()
             return
         }
+        if refuseIfReadOnly() { return }
         lastConflictMessage = nil
         let before = serverSnapshot
         let knownIds = Set(before?.allItems.map(\.id) ?? [])
@@ -253,10 +338,14 @@ public final class TodayDashboardModel {
     /// Mark a glanceable row seen. The dot clears at once; the bridge's glance store
     /// is what makes it stay cleared across a relaunch.
     public func glance(id: String) async {
+        // Order matters: the missing-tag path runs FIRST. With no ETag in hand there
+        // is nothing to refuse against — the only useful act is to go and get one,
+        // which is also a live re-test of whether the bridge is reachable at all.
         guard let tag = etag, !tag.isEmpty else {
             await load()
             return
         }
+        if refuseIfReadOnly() { return }
         overlay.seen.insert(id)
         await perform(id: id) { client in
             try await client.glance(id: id, at: self.now(), ifMatch: tag)

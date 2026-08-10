@@ -12,10 +12,10 @@ import JesseNetworking
 public struct TodayReportRow: View {
     let report: TodayReport
     let onGlance: () -> Void
-    let onOpenLink: (TodayLink) -> Void
+    let onOpenLink: (TodayLinkOrigin) -> Void
 
     public init(report: TodayReport, onGlance: @escaping () -> Void,
-                onOpenLink: @escaping (TodayLink) -> Void = { _ in }) {
+                onOpenLink: @escaping (TodayLinkOrigin) -> Void = { _ in }) {
         self.report = report
         self.onGlance = onGlance
         self.onOpenLink = onOpenLink
@@ -40,7 +40,10 @@ public struct TodayReportRow: View {
                                                      : AnyShapeStyle(.primary))
                         .multilineTextAlignment(.leading)
                         .fixedSize(horizontal: false, vertical: true)
-                    TodayLinkChips(links: report.links, onOpen: onOpenLink)
+                    // A briefing row has no task line, so its own title IS the row a
+                    // discussion would be seeded with.
+                    TodayLinkChips(links: report.links, sourceText: report.title,
+                                   onOpen: onOpenLink)
                 }
                 Spacer(minLength: 0)
                 if !report.seen {
