@@ -672,6 +672,24 @@ impl Config {
             .map(|d| PathBuf::from(d).join("context.json"))
     }
 
+    /// The file the day-file intent journal is persisted to (a sibling of
+    /// `flags.json`), or `None` when persistence is disabled.
+    ///
+    /// With no state dir there is NO journal, and the write path degrades to
+    /// apply-immediately: a mutation still lands, but a tap that races a running
+    /// turn can still be clobbered and nothing replays it. That is the same
+    /// degradation every other store has, and it is the reason a real deploy
+    /// configures a state dir — see `SECURITY.md`.
+    ///
+    /// Holds item identity (section, lead, `(Added …)` date) and the app's own
+    /// evidence text: vault CONTENT, so it stays in the state dir and never
+    /// reaches a log line, the metrics log, or provenance.
+    pub fn today_intents_file(&self) -> Option<PathBuf> {
+        self.state_dir
+            .as_deref()
+            .map(|d| PathBuf::from(d).join("today-intents.json"))
+    }
+
     /// The vault write lock's broker socket.
     ///
     /// Under the STATE DIR, which is what makes it reachable by BOTH harnesses' hooks — a

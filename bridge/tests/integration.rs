@@ -6981,3 +6981,525 @@ async fn today_missing_file_is_200_with_an_empty_snapshot_and_a_missing_marker()
 
     let _ = std::fs::remove_dir_all(&vault);
 }
+
+// ---- POST /jesse/today — the write path -----------------------------------
+//
+// The bridge's first writes to the agent's own working files. Same synthetic
+// fixture as the read path, so one grammar is asserted end to end.
+
+/// A vault with the day file AND a state dir, so the intent journal and the
+/// glance store are both live (they degrade to nothing without one).
+fn today_write_state() -> (AppState, std::path::PathBuf) {
+    let vault = make_diet_vault();
+    write_vault_file(&vault, "vault/Today.md", FIX_TODAY_MD);
+    let state = vault.join("state");
+    std::fs::create_dir_all(&state).unwrap();
+    let cfg = Config {
+        vault: vault.to_string_lossy().into_owned(),
+        state_dir: Some(state.to_string_lossy().into_owned()),
+        ..test_config()
+    };
+    (AppState::new(cfg), vault)
+}
+
+/// The current snapshot and its etag, through the real `GET`.
+async fn today_snapshot(st: &AppState) -> (Value, String) {
+    let resp = app(st.clone())
+        .oneshot(today_request(Some("Bearer test-token"), None))
+        .await
+        .unwrap();
+    let etag = resp
+        .headers()
+        .get("etag")
+        .and_then(|v| v.to_str().ok())
+        .unwrap()
+        .to_string();
+    (
+        serde_json::from_str(&body_string(resp).await).unwrap(),
+        etag,
+    )
+}
+
+/// The id of the first item whose lead starts with `lead_starts`.
+fn id_of(snapshot: &Value, lead_starts: &str) -> String {
+    let mut items: Vec<&Value> = snapshot["leadItems"].as_array().unwrap().iter().collect();
+    for section in snapshot["sections"].as_array().unwrap() {
+        items.extend(section["items"].as_array().unwrap().iter());
+    }
+    items
+        .iter()
+        .find(|i| {
+            i["lead"]
+                .as_str()
+                .unwrap_or_default()
+                .starts_with(lead_starts)
+        })
+        .unwrap_or_else(|| panic!("no item starting {lead_starts:?}"))
+        .get("id")
+        .unwrap()
+        .as_str()
+        .unwrap()
+        .to_string()
+}
+
+/// One item's parsed state out of a snapshot body.
+fn item_state(snapshot: &Value, lead_starts: &str) -> (bool, Option<String>) {
+    let mut items: Vec<&Value> = snapshot["leadItems"].as_array().unwrap().iter().collect();
+    for section in snapshot["sections"].as_array().unwrap() {
+        items.extend(section["items"].as_array().unwrap().iter());
+    }
+    let it = items
+        .iter()
+        .find(|i| {
+            i["lead"]
+                .as_str()
+                .unwrap_or_default()
+                .starts_with(lead_starts)
+        })
+        .unwrap_or_else(|| panic!("no item starting {lead_starts:?}"));
+    (
+        it["checked"].as_bool().unwrap(),
+        it["appCompleted"]["evidence"].as_str().map(str::to_string),
+    )
+}
+
+#[tokio::test]
+async fn today_check_no_auth_is_401() {
+    let resp = app(test_state())
+        .oneshot(today_check_request(
+            None,
+            "abc",
+            Some("*"),
+            r#"{"checked":true,"at":"2026-03-03T09:30:00Z"}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn today_move_and_glance_are_401_without_a_bearer() {
+    for req in [
+        today_move_request(
+            None,
+            "abc",
+            Some("*"),
+            r#"{"op":"up","at":"2026-03-03T09:30:00Z"}"#,
+        ),
+        today_glance_request(None, Some("*"), r#"{"id":"abc","glancedAt":1}"#),
+    ] {
+        let resp = app(test_state()).oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+}
+
+/// THE CORE CYCLE: check, read it back, uncheck, read it back — and the file is
+/// byte-identical to where it started.
+#[tokio::test]
+async fn today_check_get_uncheck_get_round_trips_the_file() {
+    let (st, vault) = today_write_state();
+    let day = vault.join("vault/Today.md");
+    let original = std::fs::read_to_string(&day).unwrap();
+
+    let (snapshot, etag) = today_snapshot(&st).await;
+    let id = id_of(&snapshot, "Reply to Ada");
+    assert!(!item_state(&snapshot, "Reply to Ada").0);
+
+    let resp = app(st.clone())
+        .oneshot(today_check_request(
+            Some("Bearer test-token"),
+            &id,
+            Some(&etag),
+            r#"{"checked":true,"evidence":"sent Ada the date","at":"2026-03-03T09:30:00Z"}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let posted: Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    assert_eq!(posted["pending"], false, "applied, not parked");
+    assert_eq!(
+        item_state(&posted, "Reply to Ada"),
+        (true, Some("sent Ada the date".to_string())),
+        "the mutation's own response already shows the new state"
+    );
+
+    // …and a fresh GET agrees, from the file.
+    let (after_check, etag2) = today_snapshot(&st).await;
+    assert_eq!(
+        item_state(&after_check, "Reply to Ada"),
+        (true, Some("sent Ada the date".to_string()))
+    );
+    assert_ne!(etag2, etag, "the etag moved with the file");
+    let on_disk = std::fs::read_to_string(&day).unwrap();
+    assert!(on_disk.contains("\t*(app-completed 2026-03-03 09:30: sent Ada the date)*"));
+
+    let resp = app(st.clone())
+        .oneshot(today_check_request(
+            Some("Bearer test-token"),
+            &id,
+            Some(&etag2),
+            r#"{"checked":false,"at":"2026-03-03T09:40:00Z"}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let (after_uncheck, _) = today_snapshot(&st).await;
+    assert_eq!(item_state(&after_uncheck, "Reply to Ada"), (false, None));
+    assert_eq!(
+        std::fs::read_to_string(&day).unwrap(),
+        original,
+        "check then uncheck leaves the file byte-identical"
+    );
+    let _ = std::fs::remove_dir_all(&vault);
+}
+
+#[tokio::test]
+async fn today_a_stale_if_match_is_412_and_touches_nothing() {
+    let (st, vault) = today_write_state();
+    let day = vault.join("vault/Today.md");
+    let (snapshot, etag) = today_snapshot(&st).await;
+    let id = id_of(&snapshot, "Reply to Ada");
+
+    // Something else rewrites the file behind the client's back.
+    let rewritten = format!("{FIX_TODAY_MD}\n## Late addition\n\n* [ ] Added by the agent.\n");
+    std::fs::write(&day, &rewritten).unwrap();
+
+    let resp = app(st.clone())
+        .oneshot(today_check_request(
+            Some("Bearer test-token"),
+            &id,
+            Some(&etag),
+            r#"{"checked":true,"at":"2026-03-03T09:30:00Z"}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::PRECONDITION_FAILED);
+    assert_eq!(
+        std::fs::read_to_string(&day).unwrap(),
+        rewritten,
+        "a 412 must not write a byte"
+    );
+    assert!(
+        !st.cfg.today_intents_file().unwrap().exists()
+            || load_intents(&st.cfg.today_intents_file().unwrap()).is_empty(),
+        "…and must not journal an intent either"
+    );
+    let _ = std::fs::remove_dir_all(&vault);
+}
+
+#[tokio::test]
+async fn today_a_missing_if_match_is_428() {
+    let (st, vault) = today_write_state();
+    let (snapshot, _) = today_snapshot(&st).await;
+    let id = id_of(&snapshot, "Reply to Ada");
+    let resp = app(st.clone())
+        .oneshot(today_check_request(
+            Some("Bearer test-token"),
+            &id,
+            None,
+            r#"{"checked":true,"at":"2026-03-03T09:30:00Z"}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::PRECONDITION_REQUIRED,
+        "a missing precondition is distinct from a stale one"
+    );
+    let _ = std::fs::remove_dir_all(&vault);
+}
+
+#[tokio::test]
+async fn today_an_unknown_item_id_is_410() {
+    let (st, vault) = today_write_state();
+    let (_, etag) = today_snapshot(&st).await;
+    let resp = app(st.clone())
+        .oneshot(today_check_request(
+            Some("Bearer test-token"),
+            "ffffffffffff",
+            Some(&etag),
+            r#"{"checked":true,"at":"2026-03-03T09:30:00Z"}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::GONE,
+        "the item vanished in a rebuild — the client refetches"
+    );
+    let _ = std::fs::remove_dir_all(&vault);
+}
+
+#[tokio::test]
+async fn today_a_bad_at_or_op_is_400() {
+    let (st, vault) = today_write_state();
+    let (snapshot, etag) = today_snapshot(&st).await;
+    let id = id_of(&snapshot, "Reply to Ada");
+    let bad_at = app(st.clone())
+        .oneshot(today_check_request(
+            Some("Bearer test-token"),
+            &id,
+            Some(&etag),
+            r#"{"checked":true,"at":"whenever"}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(bad_at.status(), StatusCode::BAD_REQUEST);
+    let bad_op = app(st.clone())
+        .oneshot(today_move_request(
+            Some("Bearer test-token"),
+            &id,
+            Some(&etag),
+            r#"{"op":"sideways","at":"2026-03-03T09:30:00Z"}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(bad_op.status(), StatusCode::BAD_REQUEST);
+    let _ = std::fs::remove_dir_all(&vault);
+}
+
+#[tokio::test]
+async fn today_move_to_do_now_lifts_an_item_across_sections() {
+    let (st, vault) = today_write_state();
+    let (snapshot, etag) = today_snapshot(&st).await;
+    let id = id_of(&snapshot, "Book the annual check-up");
+
+    let resp = app(st.clone())
+        .oneshot(today_move_request(
+            Some("Bearer test-token"),
+            &id,
+            Some(&etag),
+            r#"{"op":"to_do_now","at":"2026-03-03T09:30:00Z"}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let (after, _) = today_snapshot(&st).await;
+    let do_now = after["sections"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["name"] == "Do Now")
+        .unwrap();
+    assert!(
+        do_now["items"][0]["lead"]
+            .as_str()
+            .unwrap()
+            .starts_with("Book the annual check-up"),
+        "it landed at the top of Do Now"
+    );
+    let _ = std::fs::remove_dir_all(&vault);
+}
+
+#[tokio::test]
+async fn today_moving_the_standing_lead_item_is_409() {
+    let (st, vault) = today_write_state();
+    let (snapshot, etag) = today_snapshot(&st).await;
+    let id = id_of(&snapshot, "TOP PRIORITY");
+    let resp = app(st.clone())
+        .oneshot(today_move_request(
+            Some("Bearer test-token"),
+            &id,
+            Some(&etag),
+            r#"{"op":"to_do_now","at":"2026-03-03T09:30:00Z"}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::CONFLICT,
+        "the standing top-priority item is untouchable"
+    );
+    let _ = std::fs::remove_dir_all(&vault);
+}
+
+/// THE RACE THIS FEATURE EXISTS FOR: a tap that lands while a turn holds the
+/// write lock is journaled and parked, is visible to the app immediately, and is
+/// applied to the file the instant that turn ends.
+#[tokio::test]
+async fn today_a_tap_during_a_turn_parks_reads_back_and_replays_at_turn_end() {
+    let (st, vault) = today_write_state();
+    let day = vault.join("vault/Today.md");
+    let before = std::fs::read_to_string(&day).unwrap();
+
+    // A turn takes the write lock on the day file, as its PreToolUse hook would.
+    let held = st
+        .broker
+        .handle(HookRequest::Pre {
+            turn: "turn-1".into(),
+            conversation: "conv-1".into(),
+            tool_use_id: "call-1".into(),
+            target: Some(Some(day.to_string_lossy().into_owned())),
+            git: false,
+        })
+        .await;
+    assert!(held.allow, "the turn holds the day file's lock");
+
+    let (snapshot, etag) = today_snapshot(&st).await;
+    let id = id_of(&snapshot, "Reply to Ada");
+    let resp = app(st.clone())
+        .oneshot(today_check_request(
+            Some("Bearer test-token"),
+            &id,
+            Some(&etag),
+            r#"{"checked":true,"evidence":"tapped mid-turn","at":"2026-03-03T09:30:00Z"}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "a tap must NEVER block on a running turn"
+    );
+    let posted: Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    assert_eq!(posted["pending"], true, "parked behind the turn");
+    assert_eq!(
+        std::fs::read_to_string(&day).unwrap(),
+        before,
+        "and the file is untouched while the turn owns it"
+    );
+
+    // READ-YOUR-WRITES: the app sees its own tap even though the file has not
+    // changed, or the checkbox would visibly spring back open.
+    let (during, _) = today_snapshot(&st).await;
+    assert_eq!(
+        item_state(&during, "Reply to Ada"),
+        (true, Some("tapped mid-turn".to_string())),
+        "the pending intent is merged into the snapshot"
+    );
+
+    // The turn now rewrites the file from the stale copy it read — the clobber.
+    std::fs::write(&day, &before).unwrap();
+
+    // Turn completion: the drop guard releases the locks and replays the journal.
+    drop(TurnLockRelease {
+        broker: st.broker.clone(),
+        cfg: st.cfg.clone(),
+        turn: "turn-1".to_string(),
+    });
+
+    let on_disk = std::fs::read_to_string(&day).unwrap();
+    assert!(
+        on_disk.contains("\t*(app-completed 2026-03-03 09:30: tapped mid-turn)*"),
+        "the clobbered tap was re-applied at turn completion"
+    );
+    let (after, _) = today_snapshot(&st).await;
+    assert_eq!(
+        item_state(&after, "Reply to Ada"),
+        (true, Some("tapped mid-turn".to_string()))
+    );
+    assert!(
+        load_intents(&st.cfg.today_intents_file().unwrap()).is_empty(),
+        "the verified intent was pruned"
+    );
+    let _ = std::fs::remove_dir_all(&vault);
+}
+
+/// Two taps arriving together must both land. Without the internal mutex their
+/// read-modify-write cycles interleave and one is silently lost.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn today_two_concurrent_taps_serialize_and_neither_is_lost() {
+    let (st, vault) = today_write_state();
+    let (snapshot, _) = today_snapshot(&st).await;
+    let one = id_of(&snapshot, "Reply to Ada");
+    let two = id_of(&snapshot, "Order the replacement thermocouple");
+
+    // `If-Match: *` on purpose: the precondition is not what is under test here,
+    // the mutex is. Both taps are admitted and must both survive.
+    let a = tokio::spawn({
+        let st = st.clone();
+        let id = one.clone();
+        async move {
+            app(st)
+                .oneshot(today_check_request(
+                    Some("Bearer test-token"),
+                    &id,
+                    Some("*"),
+                    r#"{"checked":true,"evidence":"tap A","at":"2026-03-03T09:30:00Z"}"#,
+                ))
+                .await
+                .unwrap()
+                .status()
+        }
+    });
+    let b = tokio::spawn({
+        let st = st.clone();
+        let id = two.clone();
+        async move {
+            app(st)
+                .oneshot(today_check_request(
+                    Some("Bearer test-token"),
+                    &id,
+                    Some("*"),
+                    r#"{"checked":true,"evidence":"tap B","at":"2026-03-03T09:31:00Z"}"#,
+                ))
+                .await
+                .unwrap()
+                .status()
+        }
+    });
+    assert_eq!(a.await.unwrap(), StatusCode::OK);
+    assert_eq!(b.await.unwrap(), StatusCode::OK);
+
+    let (after, _) = today_snapshot(&st).await;
+    assert_eq!(
+        item_state(&after, "Reply to Ada"),
+        (true, Some("tap A".to_string())),
+        "tap A survived"
+    );
+    assert_eq!(
+        item_state(&after, "Order the replacement thermocouple"),
+        (true, Some("tap B".to_string())),
+        "and so did tap B — neither read-modify-write clobbered the other"
+    );
+    let _ = std::fs::remove_dir_all(&vault);
+}
+
+#[tokio::test]
+async fn today_glance_marks_a_report_row_seen_under_a_date_scoped_key() {
+    let (st, vault) = today_write_state();
+    let (snapshot, etag) = today_snapshot(&st).await;
+    let unseen_before = snapshot["counts"]["reportsUnseen"].as_u64().unwrap();
+    let report_id = snapshot["sections"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .flat_map(|s| s["reports"].as_array().unwrap().iter())
+        .next()
+        .unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let resp = app(st.clone())
+        .oneshot(today_glance_request(
+            Some("Bearer test-token"),
+            Some(&etag),
+            &format!(r#"{{"id":"{report_id}","glancedAt":1772000000000}}"#),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let (after, _) = today_snapshot(&st).await;
+    assert_eq!(
+        after["counts"]["reportsUnseen"].as_u64().unwrap(),
+        unseen_before - 1,
+        "the row is seen now"
+    );
+    // Keyed by the SNAPSHOT's date, not by the bare id.
+    let stored = std::fs::read_to_string(vault.join("state/glance.json")).unwrap();
+    assert!(
+        stored.contains(&format!("2026-03-03/{report_id}")),
+        "the glance key is date-scoped: {stored}"
+    );
+    // The day file is never touched by a glance.
+    assert_eq!(
+        std::fs::read_to_string(vault.join("vault/Today.md")).unwrap(),
+        FIX_TODAY_MD,
+        "a glance writes no vault content at all"
+    );
+    let _ = std::fs::remove_dir_all(&vault);
+}

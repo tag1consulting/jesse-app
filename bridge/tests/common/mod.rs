@@ -454,3 +454,53 @@ pub fn attachment_json(mime: &str, bytes: &[u8]) -> String {
         b64(bytes)
     )
 }
+
+/// `POST /jesse/today/items/{id}/check` — tick or untick one item.
+pub fn today_check_request(
+    auth: Option<&str>,
+    id: &str,
+    if_match: Option<&str>,
+    json: &str,
+) -> Request<Body> {
+    today_post(
+        auth,
+        &format!("/jesse/today/items/{id}/check"),
+        if_match,
+        json,
+    )
+}
+/// `POST /jesse/today/items/{id}/move` — reorder one item.
+pub fn today_move_request(
+    auth: Option<&str>,
+    id: &str,
+    if_match: Option<&str>,
+    json: &str,
+) -> Request<Body> {
+    today_post(
+        auth,
+        &format!("/jesse/today/items/{id}/move"),
+        if_match,
+        json,
+    )
+}
+/// `POST /jesse/today/glance` — mark one report row seen.
+pub fn today_glance_request(
+    auth: Option<&str>,
+    if_match: Option<&str>,
+    json: &str,
+) -> Request<Body> {
+    today_post(auth, "/jesse/today/glance", if_match, json)
+}
+fn today_post(auth: Option<&str>, uri: &str, if_match: Option<&str>, json: &str) -> Request<Body> {
+    let mut b = Request::builder()
+        .method("POST")
+        .uri(uri.to_string())
+        .header("content-type", "application/json");
+    if let Some(a) = auth {
+        b = b.header("authorization", a);
+    }
+    if let Some(m) = if_match {
+        b = b.header("if-match", m);
+    }
+    b.body(Body::from(json.to_string())).unwrap()
+}
