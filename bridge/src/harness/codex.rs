@@ -568,6 +568,27 @@ pub fn codex_mcp_args(
 /// `proxmox` is deliberately ABSENT and that is not an oversight: it loads its credentials
 /// itself from `__dirname/../.env`, relative to its own file rather than the cwd, so it needs
 /// nothing forwarded and forwarding anything would widen the subprocess for no gain.
+///
+/// **`whatsapp`, `imessage` and `google-perseido` are ABSENT for the same class of reason,
+/// and each was confirmed rather than assumed** — an unforwarded secret means a server that
+/// starts, registers zero tools, and reports itself "not installed", so absence here is a
+/// claim that has to be checked:
+///   * `whatsapp` reads a SQLite store it locates from its own `__file__`, and reaches the Go
+///     bridge at a hard-coded `http://localhost:8080/api`. Neither is configurable by
+///     environment, so there is nothing to name.
+///   * `imessage` reads `~/Library/Messages/chat.db` and the AddressBook through the Full
+///     Disk Access grant held by its own executable. That grant is a TCC property of the
+///     binary, not a variable — no environment can carry it, and `HOME` (which it does need)
+///     is already one of the eight Codex leaves in place.
+///   * `google-perseido` needs the SAME four variables the `google` entry forwards, and must
+///     NOT be given them: they carry the tag1 client and the tag1 credentials directory, and
+///     `workspace-mcp` resolves the client from the environment BEFORE its client-secret
+///     file, so forwarding them is precisely how this instance would silently authenticate as
+///     the wrong account. The `workspace-mcp-perseido` launcher unsets the two `GOOGLE_OAUTH_*`
+///     names for exactly that reason and then points the client and credentials directory at
+///     the Perseido ones itself. Codex's env scrub happens to do the same job here, but the
+///     launcher does not rely on it — Claude Code's MCP children inherit the bridge's full
+///     environment, tag1 client included, and the same launcher has to hold there too.
 pub const CODEX_MCP_ENV_PASSTHROUGH: &[(&str, &[&str])] = &[
     ("slack", &["SLACK_MCP_XOXP_TOKEN"]),
     (

@@ -513,8 +513,13 @@ pub const HOUSE_MCP_CONFIG: &str = concat!(
     r#"","headers":{"Authorization":"Bearer ${HA_MCP_TOKEN}"}},"roon":{"type":"http","url":"http://10.40.0.2:8088/mcp"}}}"#
 );
 
-/// The house set PLUS the six morning-routine servers — every main turn on every harness
-/// from bridge 0.68.0.
+/// The house set PLUS the six morning-routine servers — the main turn's server set from
+/// bridge 0.69.0 until the two message sources and the second Google account were added in
+/// 0.73.0. No shipped spawn site uses it today; retained for exactly the reason
+/// [`HOUSE_MCP_CONFIG`] is, and SPLIT OUT for the same reason it was: until 0.73.0 this and
+/// [`MAIN_CHILD_MCP_CONFIG`] were one string, so growing the main set in place would have
+/// silently re-pointed the `…+routeros+proxmox` row label at a set that also reads every
+/// WhatsApp and iMessage message body Jeremy has received.
 ///
 /// **Every new server is `stdio` and every command is a BARE NAME**, resolved off the
 /// bridge's `PATH` exactly as `qmd` and `npx` already are. That is deliberate and it is what
@@ -538,10 +543,64 @@ pub const HOUSE_MCP_CONFIG: &str = concat!(
 /// write-capable by design and the granted tools include every mutator, up to
 /// `proxmox_execute_vm_command` (arbitrary command execution inside a guest). Read SECURITY.md
 /// before narrowing or widening this set.
-pub const MAIN_CHILD_MCP_CONFIG: &str = concat!(
+pub const MORNING_MCP_CONFIG: &str = concat!(
     r#"{"mcpServers":{"qmd":{"type":"stdio","command":"qmd","args":["mcp"]},"slack":{"type":"stdio","command":"npx","args":["-y","slack-mcp-server@latest","--transport","stdio"]},"browser":{"type":"stdio","command":"npx","args":["-y","@playwright/mcp@latest","--headless","--isolated","--output-dir","/tmp/jesse-browser","--output-max-size","104857600"]},"homeassistant":{"type":"http","url":""#,
     home_assistant_mcp_url!(),
     r#"","headers":{"Authorization":"Bearer ${HA_MCP_TOKEN}"}},"roon":{"type":"http","url":"http://10.40.0.2:8088/mcp"},"google":{"type":"stdio","command":"workspace-mcp","args":["--single-user","--read-only","--tools","calendar","gmail","drive"]},"github":{"type":"stdio","command":"github-mcp-server","args":["stdio","--read-only","--toolsets","repos,actions"]},"fastmail":{"type":"stdio","command":"npx","args":["-y","github:jeremyandrews/jmap-mcp-server"]},"unifi":{"type":"stdio","command":"unifi-network-mcp","args":[]},"routeros":{"type":"stdio","command":"routeros-mcp","args":[]},"proxmox":{"type":"stdio","command":"mcp-proxmox","args":[]}}}"#
+);
+
+/// The morning set PLUS **WhatsApp**, **iMessage** and a SECOND Google account — every main
+/// turn on every harness from bridge 0.73.0. Fourteen servers.
+///
+/// All three are `stdio` with a BARE-NAME command, for the reason [`MORNING_MCP_CONFIG`]
+/// spells out: the record commits this argv verbatim and compares it by strict equality at
+/// boot, so an absolute path here would pin the posture to one home directory and fail
+/// `scripts/ci-guards.sh`. All three need a host launcher on the bridge's `PATH`
+/// (`whatsapp-mcp`, `mac-messages-mcp`, `workspace-mcp-perseido`); those launchers are host
+/// setup, documented in SECURITY.md, not repo content.
+///
+/// # The two message servers are the first sources ANYONE CAN WRITE INTO
+///
+/// This is the change that matters here, and it is not the server count. Every read source
+/// before these was one Jeremy or his employer controls: his mail, his calendar, his Drive,
+/// his Slack, his repositories. **A WhatsApp or iMessage message body is attacker-authored
+/// by default** — anyone who knows the number can put arbitrary text into a context that
+/// holds vault `Write` and `Edit`, a browser, full house control, and full network and
+/// hypervisor control. Read-only tool grants do NOT close that: they bound what this server
+/// can do, not what the CHILD does after reading the text. The mitigation that would close
+/// it is the dedicated sandboxed unix user, which is still not implemented. The exposure is
+/// accepted deliberately by the operator; SECURITY.md carries the full reasoning and must be
+/// read before touching this set.
+///
+/// `whatsapp` is the Python half of `lharries/whatsapp-mcp`. It reads a SQLite store the Go
+/// half keeps in sync over the WhatsApp Web protocol, and it resolves that store relative to
+/// its OWN file (`__file__/../../whatsapp-bridge/store/messages.db`) rather than from the
+/// environment — which is why no variable is forwarded for it on either harness, and why the
+/// launcher must exec the checkout's `main.py` rather than a copy. Its four sending and
+/// downloading tools are loaded but NOT granted; see [`crate::DEFAULT_ALLOWED_TOOLS`].
+///
+/// `imessage` is `mac-messages-mcp`, reading `~/Library/Messages/chat.db` and the AddressBook
+/// directly. **It requires FULL DISK ACCESS**, which is a whole-home-directory read grant on
+/// the executable — far broader than the two databases it wants, and macOS offers no narrower
+/// grant. TCC attributes that grant to the binary actually exec'd, so it is held by
+/// `mac-messages-mcp` itself and never by `jesse-bridge`. Its one send tool is not granted.
+///
+/// `google-perseido` is a SECOND instance of the same `workspace-mcp` the `google` entry
+/// runs, against a different account. It is a second SERVER rather than a second account on
+/// one server because upstream has no working multi-account mode over stdio: the OAuth client
+/// and the credentials directory come only from the environment, and the bridge gives every
+/// MCP child ONE shared environment — so a second entry sharing the `workspace-mcp` command
+/// would silently re-authenticate as the tag1 account. The `workspace-mcp-perseido` launcher
+/// is exactly that missing per-instance environment: it clears the inherited
+/// `GOOGLE_OAUTH_*` (env beats the client-secret file, so leaving them set IS the crossover)
+/// and points the client and credentials directory at the Perseido ones. NOTE both instances
+/// carry `--read-only` and the same `--tools` here rather than inside the launcher, so this
+/// const — the thing the record commits and the tests check — is where the read-only posture
+/// is written for both.
+pub const MAIN_CHILD_MCP_CONFIG: &str = concat!(
+    r#"{"mcpServers":{"qmd":{"type":"stdio","command":"qmd","args":["mcp"]},"slack":{"type":"stdio","command":"npx","args":["-y","slack-mcp-server@latest","--transport","stdio"]},"browser":{"type":"stdio","command":"npx","args":["-y","@playwright/mcp@latest","--headless","--isolated","--output-dir","/tmp/jesse-browser","--output-max-size","104857600"]},"homeassistant":{"type":"http","url":""#,
+    home_assistant_mcp_url!(),
+    r#"","headers":{"Authorization":"Bearer ${HA_MCP_TOKEN}"}},"roon":{"type":"http","url":"http://10.40.0.2:8088/mcp"},"google":{"type":"stdio","command":"workspace-mcp","args":["--single-user","--read-only","--tools","calendar","gmail","drive"]},"github":{"type":"stdio","command":"github-mcp-server","args":["stdio","--read-only","--toolsets","repos,actions"]},"fastmail":{"type":"stdio","command":"npx","args":["-y","github:jeremyandrews/jmap-mcp-server"]},"unifi":{"type":"stdio","command":"unifi-network-mcp","args":[]},"routeros":{"type":"stdio","command":"routeros-mcp","args":[]},"proxmox":{"type":"stdio","command":"mcp-proxmox","args":[]},"whatsapp":{"type":"stdio","command":"whatsapp-mcp","args":[]},"imessage":{"type":"stdio","command":"mac-messages-mcp","args":[]},"google-perseido":{"type":"stdio","command":"workspace-mcp-perseido","args":["--single-user","--read-only","--tools","calendar","gmail","drive"]}}}"#
 );
 
 /// qmd PLUS slack PLUS browser — the main turn's server set from bridge 0.66.0 until Home
@@ -1654,22 +1713,67 @@ mod tests {
             // loads the new set.
             assert_eq!(
                 servers.len(),
-                11,
+                14,
                 "{label}: the main path must declare qmd, slack, browser, homeassistant, roon, \
-                 google, github, fastmail, unifi, routeros and proxmox and nothing else: {mcp:?}"
+                 google, github, fastmail, unifi, routeros, proxmox, whatsapp, imessage and \
+                 google-perseido and nothing else: {mcp:?}"
             );
-            // THE GOOGLE SERVER MUST STAY READ-ONLY AT THE SERVER LAYER. `--read-only` is
-            // what deregisters its write tools (event create, send, Drive mutate) so they
+            // BOTH GOOGLE SERVERS MUST STAY READ-ONLY AT THE SERVER LAYER. `--read-only` is
+            // what deregisters their write tools (event create, send, Drive mutate) so they
             // are absent at the root rather than merely ungranted, and `--tools` is what
             // keeps the surface to the three services the morning routine reads. Asserted
             // here because both live in a JSON string const, and dropping either would widen
             // the set silently — the allowlist alone would still hide it from Claude Code
             // while leaving the tools present for anything that bypassed the allowlist.
-            let google_args = servers["google"]["args"].as_array().expect("google args");
-            assert!(
-                google_args.iter().any(|a| a == "--read-only"),
-                "{label}: the Google server must run --read-only: {mcp:?}"
-            );
+            //
+            // LOOPED OVER BOTH ENTRIES RATHER THAN WRITTEN TWICE, and that is the point of
+            // the loop: `google-perseido` is a second instance of the same binary, and the
+            // failure this guards against is one instance drifting from the other. Its flags
+            // are here rather than inside the `workspace-mcp-perseido` launcher precisely so
+            // this assertion can see them — a flag hidden in a host script is invisible to
+            // both the test and the containment record.
+            for name in ["google", "google-perseido"] {
+                let google_args = servers[name]["args"]
+                    .as_array()
+                    .unwrap_or_else(|| panic!("{label}: {name} args"));
+                assert!(
+                    google_args.iter().any(|a| a == "--read-only"),
+                    "{label}: the {name} server must run --read-only: {mcp:?}"
+                );
+                assert!(
+                    google_args.iter().any(|a| a == "--tools"),
+                    "{label}: the {name} server must scope --tools: {mcp:?}"
+                );
+            }
+            // THE TWO MESSAGE SERVERS ARE PRESENT AND THEIR SEND TOOLS ARE NOT GRANTED.
+            // Asserted together because the pair is the whole posture: loading a message
+            // source is only acceptable while the sending half stays out of the allowlist,
+            // and a future edit that adds one without noticing the other is exactly the
+            // mistake worth failing a build over. The names are the live ones enumerated on
+            // 2026-08-10 — `download_media` is in this list because it writes a file, not
+            // because it sends.
+            for name in ["whatsapp", "imessage"] {
+                assert!(
+                    servers.contains_key(name),
+                    "{label}: the main path declares the {name} server: {mcp:?}"
+                );
+            }
+            let allowed = arg_value(&args, "--allowedTools")
+                .unwrap_or_else(|| panic!("{label}: --allowedTools must be present"));
+            let granted: Vec<&str> = allowed.split(',').map(|t| t.trim()).collect();
+            for never in [
+                "mcp__whatsapp__send_message",
+                "mcp__whatsapp__send_file",
+                "mcp__whatsapp__send_audio_message",
+                "mcp__whatsapp__download_media",
+                "mcp__imessage__tool_send_message",
+            ] {
+                assert!(
+                    !granted.contains(&never),
+                    "{label}: {never} must never be granted — a message source is read-only \
+                     or it is not shipped: {granted:?}"
+                );
+            }
             // THE GITHUB SERVER'S READ-ONLY POSTURE IS ITS ONLY LAYER. Its credential is a
             // personal CLASSIC PAT carrying `repo` + `workflow` — write-capable — because a
             // fine-grained PAT is single-owner and cannot reach org repos at all. So unlike
@@ -2089,7 +2193,7 @@ mod tests {
     const GOLDEN_QMD_MCP: &str = concat!(
         r#"{"mcpServers":{"qmd":{"type":"stdio","command":"qmd","args":["mcp"]},"slack":{"type":"stdio","command":"npx","args":["-y","slack-mcp-server@latest","--transport","stdio"]},"browser":{"type":"stdio","command":"npx","args":["-y","@playwright/mcp@latest","--headless","--isolated","--output-dir","/tmp/jesse-browser","--output-max-size","104857600"]},"homeassistant":{"type":"http","url":""#,
         home_assistant_mcp_url!(),
-        r#"","headers":{"Authorization":"Bearer ${HA_MCP_TOKEN}"}},"roon":{"type":"http","url":"http://10.40.0.2:8088/mcp"},"google":{"type":"stdio","command":"workspace-mcp","args":["--single-user","--read-only","--tools","calendar","gmail","drive"]},"github":{"type":"stdio","command":"github-mcp-server","args":["stdio","--read-only","--toolsets","repos,actions"]},"fastmail":{"type":"stdio","command":"npx","args":["-y","github:jeremyandrews/jmap-mcp-server"]},"unifi":{"type":"stdio","command":"unifi-network-mcp","args":[]},"routeros":{"type":"stdio","command":"routeros-mcp","args":[]},"proxmox":{"type":"stdio","command":"mcp-proxmox","args":[]}}}"#
+        r#"","headers":{"Authorization":"Bearer ${HA_MCP_TOKEN}"}},"roon":{"type":"http","url":"http://10.40.0.2:8088/mcp"},"google":{"type":"stdio","command":"workspace-mcp","args":["--single-user","--read-only","--tools","calendar","gmail","drive"]},"github":{"type":"stdio","command":"github-mcp-server","args":["stdio","--read-only","--toolsets","repos,actions"]},"fastmail":{"type":"stdio","command":"npx","args":["-y","github:jeremyandrews/jmap-mcp-server"]},"unifi":{"type":"stdio","command":"unifi-network-mcp","args":[]},"routeros":{"type":"stdio","command":"routeros-mcp","args":[]},"proxmox":{"type":"stdio","command":"mcp-proxmox","args":[]},"whatsapp":{"type":"stdio","command":"whatsapp-mcp","args":[]},"imessage":{"type":"stdio","command":"mac-messages-mcp","args":[]},"google-perseido":{"type":"stdio","command":"workspace-mcp-perseido","args":["--single-user","--read-only","--tools","calendar","gmail","drive"]}}}"#
     );
     const GOLDEN_EMPTY_MCP: &str = r#"{"mcpServers":{}}"#;
 

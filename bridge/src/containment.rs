@@ -140,8 +140,51 @@ pub enum McpSet {
     ///
     /// THE ROW LABELS MOVED AGAIN AND IT COST THE CODEX SIGNATURES AGAIN — third time, same
     /// mechanism as 0.66.0 and 0.67.0. See [`CODEX_SHIPPED_ROWS`].
+    ///
+    /// NO SHIPPED SPAWN SITE USES THIS TODAY (0.73.0 moved every main turn to
+    /// [`McpSet::Messages`]), and it is retained for the same reason its predecessors are.
     Morning,
+    /// The morning set PLUS **WhatsApp**, **iMessage** and a **second Google account**
+    /// ([`MAIN_CHILD_MCP_CONFIG`]): every main turn on every harness from bridge 0.73.0.
+    /// Fourteen servers.
+    ///
+    /// Named `Messages` for what makes it different, on the same reasoning that named
+    /// [`McpSet::House`] and [`McpSet::Morning`] — the LABEL is still exhaustive, and it is
+    /// the label the record and `--rows` are keyed on.
+    ///
+    /// **WHAT IS NEW IS THE DIRECTION THE TEXT COMES FROM.** Every read source in
+    /// [`McpSet::Morning`] was one Jeremy or his employer authors or curates — his mail, his
+    /// calendar, his Drive, his Slack, his repositories. WhatsApp and iMessage are the first
+    /// sources whose CONTENT IS WRITTEN BY ANYONE WHO KNOWS HIS NUMBER, delivered
+    /// unauthenticated and unsolicited. A crafted message becomes untrusted text inside a
+    /// child that holds vault `Write` and `Edit`, a browser, the house, the network and the
+    /// hypervisor. That is a prompt-injection surface, and read-only tool grants do not close
+    /// it — they bound what the SERVER can do, not what the child does with what it read.
+    /// The real mitigation is the dedicated sandboxed unix user; it is not implemented, so
+    /// the exposure is recorded and accepted rather than fixed. See SECURITY.md.
+    ///
+    /// Two lesser things also arrive here and are named so they are not lost behind the
+    /// first: iMessage needs **Full Disk Access**, a whole-home-directory read grant on the
+    /// `mac-messages-mcp` executable (macOS offers nothing narrower, and TCC attributes it to
+    /// the binary exec'd, never to `jesse-bridge`); and `google-perseido` is a SECOND Google
+    /// read surface — calendar, mail and Drive on a personal account — whose credential is a
+    /// mode-600 client-secret FILE rather than a plist variable, which is the one credential
+    /// in the whole set that does not sit in launchd's environment.
+    ///
+    /// THE ROW LABELS MOVED AGAIN AND IT COST THE CODEX SIGNATURES AGAIN — fourth time, same
+    /// mechanism as 0.66.0, 0.67.0 and 0.69.0. See [`CODEX_SHIPPED_ROWS`].
+    Messages,
 }
+
+/// The label for [`McpSet::Messages`], written ONCE.
+///
+/// Every earlier label is spelled out twice — once in [`McpSet::label`] and once as a match
+/// arm in [`McpSet::parse`]. At fourteen servers that string is 130 characters and the two
+/// copies would be checked by nothing: a typo in the `parse` arm makes the round trip fail
+/// only for this set, which is exactly the row a startup gate needs to resolve. A `const` in
+/// a pattern position is structural-match and costs nothing.
+const MESSAGES_LABEL: &str = "qmd+slack+browser+homeassistant+roon+google+github+fastmail+\
+unifi+routeros+proxmox+whatsapp+imessage+google-perseido";
 
 impl McpSet {
     /// The label used in the results file and on the command line.
@@ -155,6 +198,7 @@ impl McpSet {
             McpSet::Morning => {
                 "qmd+slack+browser+homeassistant+roon+google+github+fastmail+unifi+routeros+proxmox"
             }
+            McpSet::Messages => MESSAGES_LABEL,
         }
     }
 
@@ -169,6 +213,7 @@ impl McpSet {
             "qmd+slack+browser+homeassistant+roon+google+github+fastmail+unifi+routeros+proxmox" => {
                 Some(McpSet::Morning)
             }
+            MESSAGES_LABEL => Some(McpSet::Messages),
             _ => None,
         }
     }
@@ -184,7 +229,8 @@ impl McpSet {
             McpSet::QmdSlack => QMD_SLACK_MCP_CONFIG,
             McpSet::QmdSlackBrowser => QMD_SLACK_BROWSER_MCP_CONFIG,
             McpSet::House => HOUSE_MCP_CONFIG,
-            McpSet::Morning => MAIN_CHILD_MCP_CONFIG,
+            McpSet::Morning => MORNING_MCP_CONFIG,
+            McpSet::Messages => MAIN_CHILD_MCP_CONFIG,
         }
     }
 
@@ -211,7 +257,8 @@ impl McpSet {
             | McpSet::QmdSlack
             | McpSet::QmdSlackBrowser
             | McpSet::House
-            | McpSet::Morning => true,
+            | McpSet::Morning
+            | McpSet::Messages => true,
         }
     }
 
@@ -229,7 +276,11 @@ impl McpSet {
     pub fn contains_slack(&self) -> bool {
         match self {
             McpSet::None | McpSet::Qmd => false,
-            McpSet::QmdSlack | McpSet::QmdSlackBrowser | McpSet::House | McpSet::Morning => true,
+            McpSet::QmdSlack
+            | McpSet::QmdSlackBrowser
+            | McpSet::House
+            | McpSet::Morning
+            | McpSet::Messages => true,
         }
     }
 
@@ -238,7 +289,7 @@ impl McpSet {
     pub fn contains_browser(&self) -> bool {
         match self {
             McpSet::None | McpSet::Qmd | McpSet::QmdSlack => false,
-            McpSet::QmdSlackBrowser | McpSet::House | McpSet::Morning => true,
+            McpSet::QmdSlackBrowser | McpSet::House | McpSet::Morning | McpSet::Messages => true,
         }
     }
 
@@ -252,7 +303,7 @@ impl McpSet {
     pub fn contains_homeassistant(&self) -> bool {
         match self {
             McpSet::None | McpSet::Qmd | McpSet::QmdSlack | McpSet::QmdSlackBrowser => false,
-            McpSet::House | McpSet::Morning => true,
+            McpSet::House | McpSet::Morning | McpSet::Messages => true,
         }
     }
 
@@ -261,7 +312,7 @@ impl McpSet {
     pub fn contains_roon(&self) -> bool {
         match self {
             McpSet::None | McpSet::Qmd | McpSet::QmdSlack | McpSet::QmdSlackBrowser => false,
-            McpSet::House | McpSet::Morning => true,
+            McpSet::House | McpSet::Morning | McpSet::Messages => true,
         }
     }
 
@@ -274,7 +325,7 @@ impl McpSet {
             | McpSet::QmdSlack
             | McpSet::QmdSlackBrowser
             | McpSet::House => false,
-            McpSet::Morning => true,
+            McpSet::Morning | McpSet::Messages => true,
         }
     }
 
@@ -286,7 +337,7 @@ impl McpSet {
             | McpSet::QmdSlack
             | McpSet::QmdSlackBrowser
             | McpSet::House => false,
-            McpSet::Morning => true,
+            McpSet::Morning | McpSet::Messages => true,
         }
     }
 
@@ -298,7 +349,7 @@ impl McpSet {
             | McpSet::QmdSlack
             | McpSet::QmdSlackBrowser
             | McpSet::House => false,
-            McpSet::Morning => true,
+            McpSet::Morning | McpSet::Messages => true,
         }
     }
 
@@ -312,7 +363,7 @@ impl McpSet {
             | McpSet::QmdSlack
             | McpSet::QmdSlackBrowser
             | McpSet::House => false,
-            McpSet::Morning => true,
+            McpSet::Morning | McpSet::Messages => true,
         }
     }
 
@@ -325,7 +376,7 @@ impl McpSet {
             | McpSet::QmdSlack
             | McpSet::QmdSlackBrowser
             | McpSet::House => false,
-            McpSet::Morning => true,
+            McpSet::Morning | McpSet::Messages => true,
         }
     }
 
@@ -339,7 +390,57 @@ impl McpSet {
             | McpSet::QmdSlack
             | McpSet::QmdSlackBrowser
             | McpSet::House => false,
-            McpSet::Morning => true,
+            McpSet::Morning | McpSet::Messages => true,
+        }
+    }
+
+    /// Whether this set loads the WhatsApp server. Same exhaustiveness rule as every sibling,
+    /// never a `_` arm — and this is the first predicate that answers "can a stranger put
+    /// text into this child?", so a future set that loads it inherits that, not just eight
+    /// read tools.
+    pub fn contains_whatsapp(&self) -> bool {
+        match self {
+            McpSet::None
+            | McpSet::Qmd
+            | McpSet::QmdSlack
+            | McpSet::QmdSlackBrowser
+            | McpSet::House
+            | McpSet::Morning => false,
+            McpSet::Messages => true,
+        }
+    }
+
+    /// Whether this set loads the iMessage server — same rule, never a `_` arm. Carries the
+    /// same attacker-authored-text property as [`McpSet::contains_whatsapp`], plus the Full
+    /// Disk Access grant the server needs to read `chat.db`.
+    pub fn contains_imessage(&self) -> bool {
+        match self {
+            McpSet::None
+            | McpSet::Qmd
+            | McpSet::QmdSlack
+            | McpSet::QmdSlackBrowser
+            | McpSet::House
+            | McpSet::Morning => false,
+            McpSet::Messages => true,
+        }
+    }
+
+    /// Whether this set loads the SECOND, personal-account Google Workspace server — same
+    /// rule, never a `_` arm.
+    ///
+    /// Deliberately its own predicate rather than folded into [`McpSet::contains_google`]:
+    /// they are two servers, two OAuth clients, two credential stores and two accounts, and a
+    /// caller asking "is the tag1 mailbox loaded?" must not be answered "yes" because a
+    /// personal one is.
+    pub fn contains_google_perseido(&self) -> bool {
+        match self {
+            McpSet::None
+            | McpSet::Qmd
+            | McpSet::QmdSlack
+            | McpSet::QmdSlackBrowser
+            | McpSet::House
+            | McpSet::Morning => false,
+            McpSet::Messages => true,
         }
     }
 
@@ -380,6 +481,15 @@ impl McpSet {
         }
         if self.contains_proxmox() {
             out.push("proxmox");
+        }
+        if self.contains_whatsapp() {
+            out.push("whatsapp");
+        }
+        if self.contains_imessage() {
+            out.push("imessage");
+        }
+        if self.contains_google_perseido() {
+            out.push("google-perseido");
         }
         out
     }
@@ -425,8 +535,8 @@ pub fn parse_capability(s: &str) -> Option<Capability> {
 ///   * `basic` + no servers          — the diet extract/verify children and the title one-shot.
 ///   * `read`  + no servers          — the vault-QA child (and the shadow child sharing its
 ///     builder).
-///   * `read`  + the [`McpSet::House`] set — a main turn backed by a read-only model.
-///   * `write` + the [`McpSet::House`] set — a main turn backed by a writes-on model.
+///   * `read`  + the [`McpSet::Messages`] set — a main turn backed by a read-only model.
+///   * `write` + the [`McpSet::Messages`] set — a main turn backed by a writes-on model.
 ///
 /// The two `read` rows are expected to agree on the escape probes and differ only in whether
 /// MCP search is reachable — but both are probed and recorded rather than reasoned about.
@@ -451,31 +561,33 @@ pub const CLAUDE_CODE_SHIPPED_ROWS: [ContainmentRow; 4] = [
     },
     ContainmentRow {
         capability: Capability::Read,
-        mcp: McpSet::Morning,
+        mcp: McpSet::Messages,
     },
     ContainmentRow {
         capability: Capability::Write,
-        mcp: McpSet::Morning,
+        mcp: McpSet::Messages,
     },
 ];
 
-/// Codex's rows. Its main turn loads **the same five servers Claude Code's does** as of
-/// 0.67.0 — qmd, Slack, the browser, Home Assistant and Roon.
+/// Codex's rows. Its main turn loads **the same fourteen servers Claude Code's does** as of
+/// 0.73.0.
 ///
-/// THE ROW LABELS HAVE NOW MOVED TWICE, AND EACH TIME IT COST THE SAME TWO SIGNATURES.
+/// THE ROW LABELS HAVE NOW MOVED FOUR TIMES, AND EACH TIME IT COST THE SAME TWO SIGNATURES.
 /// Until 0.66.0 Codex's main turn was `qmd` alone (`read/qmd`, `write/qmd`); 0.66.0 made it
-/// `qmd+slack+browser`; 0.67.0 makes it [`McpSet::House`]. Each rename orphans the two
+/// `qmd+slack+browser`; 0.67.0 made it [`McpSet::House`]; 0.69.0 made it
+/// [`McpSet::Morning`]; 0.73.0 makes it [`McpSet::Messages`]. Each rename orphans the two
 /// operator `[[accepted]]` blocks in `containment-codex.toml`, because acceptances match by
-/// `ContainmentRow::label` — so neither change could be made unilaterally. Both times the
+/// `ContainmentRow::label` — so no such change can be made unilaterally. Every time, the
 /// six `read_*` known-opens were re-signed under the new labels by the owner, on the same
 /// record: the read boundary is the OS read-only sandbox, and an MCP server — which runs
 /// OUTSIDE that sandbox but reads nothing on the child's behalf — does not widen it.
 ///
-/// THAT RATIONALE IS ABOUT READS, AND IT SURVIVES 0.67.0 UNCHANGED, but note what it does
-/// NOT cover: Home Assistant's granted intents WRITE to the physical world. That is not a
-/// widening of the read sandbox these signatures speak to, so it does not undermine them —
-/// it is a separate, explicitly accepted risk recorded in SECURITY.md. Do not rename these
-/// rows again without going back for the same decision.
+/// THAT RATIONALE IS ABOUT READS, AND IT SURVIVES 0.73.0, but note twice over what it does
+/// NOT cover. Home Assistant's granted intents WRITE to the physical world, and the two
+/// message servers this set adds carry ATTACKER-AUTHORED TEXT into the child. Neither is a
+/// widening of the read sandbox these signatures speak to, so neither undermines them — both
+/// are separate, explicitly accepted risks recorded in SECURITY.md. Do not rename these rows
+/// again without going back for the same decision.
 pub const CODEX_SHIPPED_ROWS: [ContainmentRow; 4] = [
     ContainmentRow {
         capability: Capability::Basic,
@@ -487,11 +599,11 @@ pub const CODEX_SHIPPED_ROWS: [ContainmentRow; 4] = [
     },
     ContainmentRow {
         capability: Capability::Read,
-        mcp: McpSet::Morning,
+        mcp: McpSet::Messages,
     },
     ContainmentRow {
         capability: Capability::Write,
-        mcp: McpSet::Morning,
+        mcp: McpSet::Messages,
     },
 ];
 
@@ -1131,12 +1243,12 @@ mod tests {
             vec![
                 "basic/none",
                 "read/none",
-                "read/qmd+slack+browser+homeassistant+roon+google+github+fastmail+unifi+routeros+proxmox",
-                "write/qmd+slack+browser+homeassistant+roon+google+github+fastmail+unifi+routeros+proxmox"
+                &format!("read/{MESSAGES_LABEL}"),
+                &format!("write/{MESSAGES_LABEL}")
             ]
         );
 
-        // Codex spawns the SAME three-server set from 0.66.0. The two lists are still
+        // Codex spawns the SAME fourteen-server set from 0.73.0. The two lists are still
         // asserted SEPARATELY and deliberately: they agree today, and the moment one harness
         // gains a server the other does not, this is where that shows up. A shared assertion
         // would hide exactly the drift the split exists to catch — and these labels are what
@@ -1148,8 +1260,8 @@ mod tests {
             vec![
                 "basic/none",
                 "read/none",
-                "read/qmd+slack+browser+homeassistant+roon+google+github+fastmail+unifi+routeros+proxmox",
-                "write/qmd+slack+browser+homeassistant+roon+google+github+fastmail+unifi+routeros+proxmox"
+                &format!("read/{MESSAGES_LABEL}"),
+                &format!("write/{MESSAGES_LABEL}")
             ]
         );
     }

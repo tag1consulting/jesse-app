@@ -268,6 +268,61 @@ pub const DEFAULT_MAX_ATTACHMENTS_TOTAL_BYTES: usize = 20 * 1024 * 1024;
 // may infer "safe" from a missing `destructiveHint` — the bridge sets
 // `default_tools_approval_mode="approve"` per server unconditionally (see
 // `codex_mcp_args`), and this allowlist, not an annotation, is the boundary.
+//
+// ---- The two message servers: the allowlist IS the whole boundary ------------
+//
+// WHATSAPP AND IMESSAGE HAVE NO CREDENTIAL TO SCOPE. Every other read-only server
+// here is read-only twice over — a token carrying no write scope AND a list naming
+// read tools only. These two read LOCAL FILES (a SQLite store the WhatsApp Go
+// bridge syncs; `~/Library/Messages/chat.db` under Full Disk Access), so there is
+// no scope to withhold. The omitted send tools below are not a second layer behind
+// the first; they ARE the first, and the only. Enumerated live on 2026-08-10
+// against the running servers, never a README.
+//
+// WHATSAPP: eight of twelve. Granted are the eight read tools above. The four
+// omitted, by name and reason:
+//   * `send_message`, `send_file`, `send_audio_message` — outbound messages under
+//     Jeremy's own number. Sending is the standing rule's bright line: it is the
+//     one action whose consequence lands on somebody else, cannot be undone, and
+//     is indistinguishable to the recipient from Jeremy having written it.
+//   * `download_media` — it WRITES A FILE. It is the only non-send omission and it
+//     is easy to mistake for a read: the name says download, and the surrounding
+//     tools all read. It fetches attachment bytes through the Go bridge's REST API
+//     and puts them on disk, so it belongs with the writers.
+// Note what the allowlist CANNOT reach: that Go bridge serves an UNAUTHENTICATED
+// send API of its own, and it is below this layer entirely — omitting the tools
+// stops this child, not anything else on the host. See SECURITY.md.
+//
+// IMESSAGE: ten of eleven. The one omitted is `tool_send_message`, for exactly the
+// reason WhatsApp's three are. Everything else the server advertises reads.
+// `tool_get_attachment` is granted and that is deliberate rather than an oversight
+// on the `download_media` reasoning above: it RESOLVES AN EXISTING PATH on disk and
+// returns it; it neither fetches nor writes. Checked against the source, because
+// the two names are close enough that the pair invites a wrong inference in both
+// directions.
+// FOUR OF THE TEN READ THE ADDRESSBOOK, NOT chat.db — `tool_find_contact`,
+// `tool_check_contacts`, `tool_check_addressbook`, and the contact resolution
+// inside `tool_get_recent_messages`. That is a second protected macOS path, and it
+// is why the Full Disk Access grant is not merely about messages.
+//
+// GOOGLE-PERSEIDO: sixteen of eighteen — the SAME sixteen granted on the tag1
+// `google` server, chosen by mirroring rather than re-deciding, because the two
+// servers are the same binary at the same version against a different account and
+// a divergence between them would be an accident rather than a policy. The two
+// omitted are the same two: `get_gmail_attachment_content` (writes attachment
+// bytes to local disk — `--read-only` bounds writes to GOOGLE, not to the host)
+// and `start_google_auth` (an interactive consent flow, which a headless turn
+// cannot complete and must not begin). Read-only holds at BOTH layers here, the
+// same as tag1: the OAuth scopes are `calendar.readonly` / `gmail.readonly` /
+// `drive.readonly`, and this list names read tools only.
+//
+// THE SERVER NAME CARRIES A HYPHEN, which no server before it did, and both
+// harnesses were checked rather than assumed: Claude Code matched
+// `mcp__google-perseido__list_calendars` from this allowlist and called it, and
+// codex 0.146.0 accepted `mcp_servers.google-perseido.*` under `--strict-config`
+// (a deliberately bad value still errored, so the key was really being read).
+// `granted_mcp_tools` splits on the `mcp__<server>__` prefix, so `google` and
+// `google-perseido` cannot bleed into one another in either direction.
 pub const DEFAULT_ALLOWED_TOOLS: &str = "Read(./**),Write(./**),Edit(./**),Grep(./**),Glob(./**),\
 mcp__qmd__query,mcp__qmd__get,mcp__qmd__multi_get,mcp__qmd__status,\
 Skill(diet-logging),\
@@ -357,7 +412,27 @@ mcp__proxmox__proxmox_get_vm_config,mcp__proxmox__proxmox_whoami,\
 mcp__proxmox__proxmox_migrate_vm,mcp__proxmox__proxmox_get_guest_ips,\
 mcp__proxmox__proxmox_convert_to_template,mcp__proxmox__proxmox_set_cloudinit,\
 mcp__proxmox__proxmox_get_rrd_data,mcp__proxmox__proxmox_get_pools,\
-mcp__proxmox__proxmox_get_ha_resources,mcp__proxmox__proxmox_get_firewall_rules";
+mcp__proxmox__proxmox_get_ha_resources,mcp__proxmox__proxmox_get_firewall_rules,\
+mcp__whatsapp__search_contacts,mcp__whatsapp__list_messages,mcp__whatsapp__list_chats,\
+mcp__whatsapp__get_chat,mcp__whatsapp__get_direct_chat_by_contact,\
+mcp__whatsapp__get_contact_chats,mcp__whatsapp__get_last_interaction,\
+mcp__whatsapp__get_message_context,\
+mcp__imessage__tool_get_recent_messages,mcp__imessage__tool_fuzzy_search_messages,\
+mcp__imessage__tool_get_chats,mcp__imessage__tool_find_contact,\
+mcp__imessage__tool_check_contacts,mcp__imessage__tool_check_addressbook,\
+mcp__imessage__tool_check_db_access,mcp__imessage__tool_check_imessage_availability,\
+mcp__imessage__tool_search_attachments,mcp__imessage__tool_get_attachment,\
+mcp__google-perseido__list_calendars,mcp__google-perseido__get_events,\
+mcp__google-perseido__query_freebusy,mcp__google-perseido__search_gmail_messages,\
+mcp__google-perseido__get_gmail_message_content,\
+mcp__google-perseido__get_gmail_messages_content_batch,\
+mcp__google-perseido__get_gmail_thread_content,\
+mcp__google-perseido__get_gmail_threads_content_batch,\
+mcp__google-perseido__list_gmail_labels,mcp__google-perseido__search_drive_files,\
+mcp__google-perseido__get_drive_file_content,mcp__google-perseido__get_drive_file_download_url,\
+mcp__google-perseido__list_drive_items,mcp__google-perseido__get_drive_file_permissions,\
+mcp__google-perseido__check_drive_file_public_access,\
+mcp__google-perseido__get_drive_shareable_link";
 
 // Defense-in-depth: tools that must never run from the bridge even if they slip
 // into the allowlist. Override with JESSE_DISALLOWED_TOOLS.
