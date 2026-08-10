@@ -15,6 +15,68 @@ CI both run it). See the "Versioning" section of `bridge/README.md`.
 
 ## [Unreleased]
 
+## [Bridge 0.69.0] - 2026-08-09
+
+### Added
+
+- **The six morning-routine MCP servers, on BOTH harnesses in one posture change.** Google
+  Workspace (Calendar + Gmail + Drive under one OAuth client), Fastmail (JMAP), GitHub,
+  UniFi Network, RouterOS and Proxmox join qmd, Slack, the browser, Home Assistant and Roon.
+  A main turn now declares **eleven** servers and the allowlist grants **176** MCP tools.
+  Batched deliberately: a posture change re-stales each harness's record and costs one
+  battery run per harness, so adding these one at a time would have cost six signing
+  sessions instead of one.
+
+  - **Read-only at BOTH layers — Google, Fastmail, RouterOS.** The credential carries no
+    write scope AND the allowlist names read tools only. Google's OAuth grant is
+    `calendar.readonly` + `gmail.readonly` + `drive.readonly` and nothing else; Fastmail's
+    JMAP session reports `isReadOnly: true`; RouterOS's one write path (`command`, arbitrary
+    CLI) is **not granted**.
+  - **GitHub is read-only at ONE layer, and that is a real difference.** Its credential is a
+    personal **classic** PAT carrying `repo` + `workflow` — write-capable — because a
+    fine-grained PAT is single-owner and cannot reach `tag1consulting`-owned repos at all
+    (measured: it 404s every private repo, including the reporter's own). The read-only
+    posture is the server's `--read-only` flag plus the allowlist, and nothing else.
+  - **UniFi and Proxmox ship at FULL CONTROL**, using their existing write-capable
+    credentials, on the operator's explicit decision (2026-08-09) — the same knowing
+    risk-acceptance as the full-control Home Assistant decision in 0.67.0, made because
+    debugging needs write. The sharpest single edge is `proxmox_execute_vm_command`
+    (arbitrary command execution inside any guest); it is granted and named in SECURITY.md
+    rather than quietly dropped.
+
+- **`export_mcp_server_env`** republishes the LaunchAgent's `JESSE_*` credentials under the
+  names each server actually reads (`UNIFI_USERNAME`, `GITHUB_PERSONAL_ACCESS_TOKEN`, …)
+  before any child spawns. Both harnesses need it and neither could do it: Claude Code's MCP
+  subprocesses inherit this environment, and Codex's `env_vars` forwards BY NAME with no
+  ability to rename. Paths under `$HOME` are composed at runtime rather than written as
+  literals, so the source stays machine-independent.
+
+### Changed
+
+- **`McpSet::Morning`** is the new main set; `McpSet::House` keeps its old five-server
+  meaning against the new `HOUSE_MCP_CONFIG` const. Splitting rather than growing in place is
+  what stops the `qmd+slack+browser+homeassistant+roon` row label silently re-pointing at a
+  set that also reads Jeremy's mail and holds the hypervisor.
+- **The Codex row labels moved for the third time**, orphaning the two operator `[[accepted]]`
+  blocks again (0.66.0, 0.67.0, now 0.69.0). Re-pointed by the owner on the same record.
+
+### Notes
+
+- **`checks` is not a real GitHub toolset and the server silently ignores unknown names** —
+  passing a garbage toolset yields the same 16 tools and no warning. There is therefore **no
+  check-run tool**; the Friday scan reads workflow runs. Asserted in a test so the mistake
+  cannot be made silently.
+- **`get_drive_file_download_url` is annotated `readOnlyHint: true` and writes to local
+  disk.** It is granted at the operator's request, with `WORKSPACE_ATTACHMENT_DIR` pointed
+  out of the working tree — MCP servers run outside the child's sandbox and default to
+  writing into the cwd, which is the vault.
+- **The Monday cheatsheets check does not use GitHub.** It reads upstream registries and
+  project sites for ~33 technologies; there is no repo for it to be missing.
+- **`mcp-proxmox` must be a launcher that `exec`s the real file, never a symlink to it.** The
+  server loads its credentials from `__dirname/../.env`; a symlinked entry point resolves
+  `__dirname` to the link's directory, drops every `PROXMOX_*` value, and hangs at
+  `initialize` with an empty stderr.
+
 ## [Bridge 0.68.0] - 2026-08-08
 
 ### Fixed

@@ -555,7 +555,53 @@ pub fn codex_mcp_args(
 /// A NAME, NOT A VALUE. The bridge never reads the token; it tells Codex which variable to
 /// pass through from its own environment, where launchd put it. Nothing here is a secret and
 /// nothing here belongs in the plist beyond the value itself.
-pub const CODEX_MCP_ENV_PASSTHROUGH: &[(&str, &[&str])] = &[("slack", &["SLACK_MCP_XOXP_TOKEN"])];
+/// **THE NAMES HERE ARE THE SERVERS' OWN, NOT THE PLIST'S.** The LaunchAgent stores
+/// `JESSE_*`-prefixed variables (`JESSE_UNIFI_USERNAME`, `JESSE_GITHUB_PAT`, …) so the
+/// bridge's own environment stays legible, but each server reads the name its vendor chose
+/// (`UNIFI_USERNAME`, `GITHUB_PERSONAL_ACCESS_TOKEN`, …). Codex's `env_vars` forwards a
+/// variable BY NAME and cannot rename one in flight, so [`crate::export_mcp_server_env`]
+/// republishes the plist values under the vendor names in the bridge's process environment
+/// before any child spawns — which is also what makes them reachable on Claude Code, whose
+/// MCP subprocesses simply inherit. Name a variable here that `export_mcp_server_env` does
+/// not publish and the server silently registers zero tools.
+///
+/// `proxmox` is deliberately ABSENT and that is not an oversight: it loads its credentials
+/// itself from `__dirname/../.env`, relative to its own file rather than the cwd, so it needs
+/// nothing forwarded and forwarding anything would widen the subprocess for no gain.
+pub const CODEX_MCP_ENV_PASSTHROUGH: &[(&str, &[&str])] = &[
+    ("slack", &["SLACK_MCP_XOXP_TOKEN"]),
+    (
+        "google",
+        &[
+            "GOOGLE_OAUTH_CLIENT_ID",
+            "GOOGLE_OAUTH_CLIENT_SECRET",
+            "WORKSPACE_MCP_CREDENTIALS_DIR",
+            "WORKSPACE_ATTACHMENT_DIR",
+            "USER_GOOGLE_EMAIL",
+        ],
+    ),
+    ("github", &["GITHUB_PERSONAL_ACCESS_TOKEN"]),
+    // NO `NODE_OPTIONS` HERE, and that is a measured decision rather than an omission. The
+    // JMAP fork needed `--experimental-require-module` on older node; it does NOT on the
+    // 22.20 first on the bridge's PATH, where `require(esm)` is unflagged (verified
+    // 2026-08-09: 3 tools registered with the variable unset). Forwarding it anyway would
+    // have meant publishing a global node flag into the bridge's own environment, which
+    // every other node MCP child — slack, browser, qmd — would then inherit for no reason.
+    ("fastmail", &["JMAP_TOKEN", "JMAP_SESSION_URL"]),
+    (
+        "unifi",
+        &[
+            "UNIFI_USERNAME",
+            "UNIFI_PASSWORD",
+            "UNIFI_HOST",
+            "UNIFI_PORT",
+            "UNIFI_CONTROLLER_TYPE",
+            "UNIFI_VERIFY_SSL",
+            "UNIFI_SITE",
+        ],
+    ),
+    ("routeros", &["ROUTEROS_DEVICES_CONFIG", "ROUTEROS_SSH_PORT"]),
+];
 
 /// The environment variable holding each HTTP MCP server's BEARER TOKEN, BY NAME.
 ///

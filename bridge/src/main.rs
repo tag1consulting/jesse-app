@@ -6,6 +6,7 @@ use std::path::Path;
 
 use jesse_bridge::{
     app, binary_exists, bind_broker, build_apns, detect_binary_drift, env_string, env_truthy,
+    export_mcp_server_env,
     harness_bin_env, harness_default_bin, harnesses_in_use, is_bind_allowed, load_local_models,
     manual_pairing_lines, pairing_payload, serve_broker, settings_permission_drift,
     show_token_opt_in, spawn_eviction_task, spawn_session_gc_task, start_health_prober,
@@ -15,6 +16,12 @@ use jesse_bridge::{
 
 #[tokio::main]
 async fn main() {
+    // BEFORE any child spawns: republish the plist's `JESSE_*` credentials under the names
+    // the MCP servers read, and supply their non-secret settings. Both harnesses depend on
+    // this having already run — Claude Code because its subprocesses inherit this
+    // environment, Codex because `env_vars` can only forward a variable that exists here.
+    export_mcp_server_env();
+
     let cfg = Config::from_env();
 
     if cfg.token.is_empty() {

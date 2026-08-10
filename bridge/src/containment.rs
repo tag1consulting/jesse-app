@@ -107,6 +107,40 @@ pub enum McpSet {
     /// did. Re-pointed by the owner on the same record as before. Do not rename these
     /// without going back for that decision — see [`CODEX_SHIPPED_ROWS`].
     House,
+    /// The house set PLUS the six morning-routine servers — Google Workspace, GitHub,
+    /// Fastmail, UniFi, RouterOS and Proxmox ([`MAIN_CHILD_MCP_CONFIG`]): every main turn on
+    /// every harness from bridge 0.68.0.
+    ///
+    /// Named `Morning` for the routine it exists to serve, on the same reasoning that named
+    /// [`McpSet::House`] — the spelled-out variant would be unreadable and the LABEL is still
+    /// exhaustive, which is what the record and `--rows` are keyed on.
+    ///
+    /// **WHAT IS NEW HERE IS BLAST RADIUS, NOT SERVER COUNT.** Three axes, none of which any
+    /// previous set had:
+    ///
+    /// 1. **Read reach into Jeremy's correspondence and documents** — work mail, personal
+    ///    mail, calendar, Drive, and private source. Read-only at BOTH layers for Google,
+    ///    Fastmail and GitHub (the credential carries no write scope — GitHub excepted, see
+    ///    below — and the allowlist names read tools only).
+    /// 2. **Full write control of the network and the hypervisor.** UniFi and Proxmox ship
+    ///    with their existing write-capable credentials and every mutator granted, on the
+    ///    operator's explicit decision (2026-08-09), the same knowing risk-acceptance as the
+    ///    full-control Home Assistant decision in 0.67.0. The sharpest single edge is
+    ///    `proxmox_execute_vm_command`: arbitrary command execution inside any guest.
+    /// 3. **GitHub is the one server whose read-only posture is SINGLE-layer.** Its credential
+    ///    is a personal CLASSIC PAT carrying `repo` + `workflow` — write-capable — because a
+    ///    fine-grained PAT is single-owner and cannot reach org repos at all. The read-only
+    ///    posture is therefore the server's `--read-only` flag plus this allowlist, and
+    ///    nothing else. Do not describe it as credential-enforced.
+    ///
+    /// Combined with the browser this set already carries, that is a
+    /// prompt-injection-to-network-and-hypervisor path from a phone-injectable turn. It was
+    /// accepted deliberately rather than mitigated here; the residual mitigations that were
+    /// NOT implemented are named in SECURITY.md.
+    ///
+    /// THE ROW LABELS MOVED AGAIN AND IT COST THE CODEX SIGNATURES AGAIN — third time, same
+    /// mechanism as 0.66.0 and 0.67.0. See [`CODEX_SHIPPED_ROWS`].
+    Morning,
 }
 
 impl McpSet {
@@ -118,6 +152,9 @@ impl McpSet {
             McpSet::QmdSlack => "qmd+slack",
             McpSet::QmdSlackBrowser => "qmd+slack+browser",
             McpSet::House => "qmd+slack+browser+homeassistant+roon",
+            McpSet::Morning => {
+                "qmd+slack+browser+homeassistant+roon+google+github+fastmail+unifi+routeros+proxmox"
+            }
         }
     }
 
@@ -129,6 +166,9 @@ impl McpSet {
             "qmd+slack" => Some(McpSet::QmdSlack),
             "qmd+slack+browser" => Some(McpSet::QmdSlackBrowser),
             "qmd+slack+browser+homeassistant+roon" => Some(McpSet::House),
+            "qmd+slack+browser+homeassistant+roon+google+github+fastmail+unifi+routeros+proxmox" => {
+                Some(McpSet::Morning)
+            }
             _ => None,
         }
     }
@@ -143,7 +183,8 @@ impl McpSet {
             McpSet::Qmd => QMD_ONLY_MCP_CONFIG,
             McpSet::QmdSlack => QMD_SLACK_MCP_CONFIG,
             McpSet::QmdSlackBrowser => QMD_SLACK_BROWSER_MCP_CONFIG,
-            McpSet::House => MAIN_CHILD_MCP_CONFIG,
+            McpSet::House => HOUSE_MCP_CONFIG,
+            McpSet::Morning => MAIN_CHILD_MCP_CONFIG,
         }
     }
 
@@ -166,7 +207,11 @@ impl McpSet {
     pub fn contains_qmd(&self) -> bool {
         match self {
             McpSet::None => false,
-            McpSet::Qmd | McpSet::QmdSlack | McpSet::QmdSlackBrowser | McpSet::House => true,
+            McpSet::Qmd
+            | McpSet::QmdSlack
+            | McpSet::QmdSlackBrowser
+            | McpSet::House
+            | McpSet::Morning => true,
         }
     }
 
@@ -184,7 +229,7 @@ impl McpSet {
     pub fn contains_slack(&self) -> bool {
         match self {
             McpSet::None | McpSet::Qmd => false,
-            McpSet::QmdSlack | McpSet::QmdSlackBrowser | McpSet::House => true,
+            McpSet::QmdSlack | McpSet::QmdSlackBrowser | McpSet::House | McpSet::Morning => true,
         }
     }
 
@@ -193,7 +238,7 @@ impl McpSet {
     pub fn contains_browser(&self) -> bool {
         match self {
             McpSet::None | McpSet::Qmd | McpSet::QmdSlack => false,
-            McpSet::QmdSlackBrowser | McpSet::House => true,
+            McpSet::QmdSlackBrowser | McpSet::House | McpSet::Morning => true,
         }
     }
 
@@ -207,7 +252,7 @@ impl McpSet {
     pub fn contains_homeassistant(&self) -> bool {
         match self {
             McpSet::None | McpSet::Qmd | McpSet::QmdSlack | McpSet::QmdSlackBrowser => false,
-            McpSet::House => true,
+            McpSet::House | McpSet::Morning => true,
         }
     }
 
@@ -216,13 +261,91 @@ impl McpSet {
     pub fn contains_roon(&self) -> bool {
         match self {
             McpSet::None | McpSet::Qmd | McpSet::QmdSlack | McpSet::QmdSlackBrowser => false,
-            McpSet::House => true,
+            McpSet::House | McpSet::Morning => true,
+        }
+    }
+
+    /// Whether this set loads the read-only Google Workspace server (Calendar, Gmail, Drive
+    /// under ONE OAuth client) — same exhaustiveness rule as every sibling, never a `_` arm.
+    pub fn contains_google(&self) -> bool {
+        match self {
+            McpSet::None
+            | McpSet::Qmd
+            | McpSet::QmdSlack
+            | McpSet::QmdSlackBrowser
+            | McpSet::House => false,
+            McpSet::Morning => true,
+        }
+    }
+
+    /// Whether this set loads the read-only GitHub server — same rule, never a `_` arm.
+    pub fn contains_github(&self) -> bool {
+        match self {
+            McpSet::None
+            | McpSet::Qmd
+            | McpSet::QmdSlack
+            | McpSet::QmdSlackBrowser
+            | McpSet::House => false,
+            McpSet::Morning => true,
+        }
+    }
+
+    /// Whether this set loads the read-only Fastmail JMAP server — same rule, never a `_` arm.
+    pub fn contains_fastmail(&self) -> bool {
+        match self {
+            McpSet::None
+            | McpSet::Qmd
+            | McpSet::QmdSlack
+            | McpSet::QmdSlackBrowser
+            | McpSet::House => false,
+            McpSet::Morning => true,
+        }
+    }
+
+    /// Whether this set loads the UniFi Network server. Same rule, never a `_` arm — and this
+    /// one carries FULL network control behind a single dispatcher tool, so a set that loads
+    /// it can re-shape the network.
+    pub fn contains_unifi(&self) -> bool {
+        match self {
+            McpSet::None
+            | McpSet::Qmd
+            | McpSet::QmdSlack
+            | McpSet::QmdSlackBrowser
+            | McpSet::House => false,
+            McpSet::Morning => true,
+        }
+    }
+
+    /// Whether this set loads the RouterOS server (reads only — `command` is not granted).
+    /// Same rule, never a `_` arm.
+    pub fn contains_routeros(&self) -> bool {
+        match self {
+            McpSet::None
+            | McpSet::Qmd
+            | McpSet::QmdSlack
+            | McpSet::QmdSlackBrowser
+            | McpSet::House => false,
+            McpSet::Morning => true,
+        }
+    }
+
+    /// Whether this set loads the Proxmox server. Same rule, never a `_` arm — and this is the
+    /// highest-consequence predicate in the file: a set that loads it can execute arbitrary
+    /// commands inside any guest (`proxmox_execute_vm_command`).
+    pub fn contains_proxmox(&self) -> bool {
+        match self {
+            McpSet::None
+            | McpSet::Qmd
+            | McpSet::QmdSlack
+            | McpSet::QmdSlackBrowser
+            | McpSet::House => false,
+            McpSet::Morning => true,
         }
     }
 
     /// Every MCP server name this set loads, in the order the config declares them. ONE
-    /// source of truth for the three predicates above, so a trace, a probe and a record
-    /// cannot disagree about which servers a row had.
+    /// source of truth for the predicates above, so a trace, a probe and a record cannot
+    /// disagree about which servers a row had.
     pub fn server_names(&self) -> Vec<&'static str> {
         let mut out = Vec::new();
         if self.contains_qmd() {
@@ -239,6 +362,24 @@ impl McpSet {
         }
         if self.contains_roon() {
             out.push("roon");
+        }
+        if self.contains_google() {
+            out.push("google");
+        }
+        if self.contains_github() {
+            out.push("github");
+        }
+        if self.contains_fastmail() {
+            out.push("fastmail");
+        }
+        if self.contains_unifi() {
+            out.push("unifi");
+        }
+        if self.contains_routeros() {
+            out.push("routeros");
+        }
+        if self.contains_proxmox() {
+            out.push("proxmox");
         }
         out
     }
@@ -310,11 +451,11 @@ pub const CLAUDE_CODE_SHIPPED_ROWS: [ContainmentRow; 4] = [
     },
     ContainmentRow {
         capability: Capability::Read,
-        mcp: McpSet::House,
+        mcp: McpSet::Morning,
     },
     ContainmentRow {
         capability: Capability::Write,
-        mcp: McpSet::House,
+        mcp: McpSet::Morning,
     },
 ];
 
@@ -346,11 +487,11 @@ pub const CODEX_SHIPPED_ROWS: [ContainmentRow; 4] = [
     },
     ContainmentRow {
         capability: Capability::Read,
-        mcp: McpSet::House,
+        mcp: McpSet::Morning,
     },
     ContainmentRow {
         capability: Capability::Write,
-        mcp: McpSet::House,
+        mcp: McpSet::Morning,
     },
 ];
 
@@ -990,8 +1131,8 @@ mod tests {
             vec![
                 "basic/none",
                 "read/none",
-                "read/qmd+slack+browser+homeassistant+roon",
-                "write/qmd+slack+browser+homeassistant+roon"
+                "read/qmd+slack+browser+homeassistant+roon+google+github+fastmail+unifi+routeros+proxmox",
+                "write/qmd+slack+browser+homeassistant+roon+google+github+fastmail+unifi+routeros+proxmox"
             ]
         );
 
@@ -1007,8 +1148,8 @@ mod tests {
             vec![
                 "basic/none",
                 "read/none",
-                "read/qmd+slack+browser+homeassistant+roon",
-                "write/qmd+slack+browser+homeassistant+roon"
+                "read/qmd+slack+browser+homeassistant+roon+google+github+fastmail+unifi+routeros+proxmox",
+                "write/qmd+slack+browser+homeassistant+roon+google+github+fastmail+unifi+routeros+proxmox"
             ]
         );
     }

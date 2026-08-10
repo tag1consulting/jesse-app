@@ -567,6 +567,101 @@ must stay unset: `conversations_add_message` (**posting** —
 **Do not "complete" the allowlist from the server's tool listing.** The omissions
 are the safety property, not an oversight, and seven of the nine mutate.
 
+## Morning-routine servers: mail, documents, source, the network and the hypervisor
+
+Bridge 0.69.0 adds six MCP servers to every main turn on both harnesses: Google Workspace
+(Calendar, Gmail, Drive), Fastmail, GitHub, UniFi Network, RouterOS and Proxmox. This is the
+largest single widening of the bridge's reach to date and it is recorded here rather than
+gated, because the operator chose it deliberately.
+
+### What each one can do
+
+| Server | Posture | Enforced by |
+|---|---|---|
+| Google Workspace | read-only | credential (`*.readonly` scopes only) **and** allowlist **and** the server's `--read-only` flag |
+| Fastmail (JMAP) | read-only | credential (`isReadOnly: true`) **and** allowlist; the fork has no write tool at all |
+| GitHub | read-only | **the `--read-only` flag and the allowlist ONLY** — see below |
+| RouterOS | read-only | allowlist only (the server emits no annotations); `command` is NOT granted |
+| UniFi Network | **FULL CONTROL** | nothing — intended |
+| Proxmox | **FULL CONTROL** | nothing — intended |
+
+### GitHub's read-only posture is single-layer, and that is not an oversight
+
+Every other read-only server here is protected twice: the credential cannot write even if the
+allowlist failed. GitHub is not. Its credential is a personal **classic** PAT carrying `repo`
+and `workflow` — write-capable — and it is that way because the alternative does not work: a
+fine-grained PAT is scoped to a single owner and cannot reach `tag1consulting`-owned
+repositories at all. Measured 2026-08-09: a correctly-scoped fine-grained token returned 404
+for every private repo including the token holder's own, while every "successful" read it did
+perform returned byte-identical results **unauthenticated** — it was reading public data and
+proving nothing. So the working credential is the classic PAT, and the read-only posture is
+the server's `--read-only` flag plus the allowlist. If either is removed, writes become
+possible with no second line of defence.
+
+### UniFi and Proxmox are full control, by decision
+
+Both ship with their existing write-capable credentials and every mutator granted. This is the
+operator's explicit call (2026-08-09), superseding an earlier read-only-first plan, made
+because debugging the network and the hypervisor requires write access. It is the same knowing
+risk-acceptance as the full-control Home Assistant decision in 0.67.0.
+
+Two specifics deserve naming rather than burying:
+
+- **`proxmox_execute_vm_command` is granted.** It executes arbitrary commands inside any
+  guest. It is the highest-consequence tool the bridge can reach, and it is reachable from a
+  phone-injectable turn that also runs a web browser.
+- **UniFi cannot be contained by an allowlist even in principle.** The server exposes five
+  meta-tools; `unifi_execute` is a universal dispatcher over 189 tools, 82 of them mutating
+  (`unifi_adopt_device`, `unifi_authorize_guest`, `unifi_delete_network`, …), and it is
+  annotated `destructive=False`. Granting that one name grants all 189; omitting it leaves the
+  server useless. There is no middle setting, which is part of why full control was chosen
+  rather than pretended against.
+
+The Proxmox credential (`claude@pam`) is effectively root-equivalent — `Permissions.Modify`,
+`Sys.PowerMgmt`, `User.Modify`, `VM.Allocate` on `/`. `PROXMOX_ALLOW_ELEVATED=true` is
+required and set: it gates at CALL time only, and all 67 tools register either way.
+
+### The composed risk
+
+A main turn now reads work mail, personal mail, calendar, Drive and private source, **and**
+holds full write control of the network and the hypervisor, **and** runs a web browser, as
+Jeremy's own user. A page the browser visits is untrusted input in the same context that can
+reconfigure the network and execute commands inside guests. That is a
+prompt-injection-to-network-and-hypervisor path. It is accepted, not mitigated.
+
+Read access is also not as bounded as "read-only" suggests: the Fastmail account receives
+**live MFA codes** (a Ubiquiti verification code was in the inbox during acceptance testing).
+Read access there is sufficient to complete second-factor challenges for any service that
+mails codes to it. Read-only bounds what a turn can change; it does not bound what it can
+learn.
+
+### Residual mitigations NOT implemented
+
+Available, deliberately deferred, and the right things to reach for if this is ever narrowed:
+
+- Run the bridge as a dedicated, sandboxed unix user rather than as Jeremy.
+- Drop `proxmox_execute_vm_command` alone, keeping the rest of Proxmox.
+- Give UniFi a read-only Viewer account, accepting the loss of write debugging.
+- Scope Fastmail to specific mailboxes rather than the whole account.
+
+### Credentials
+
+All six live in the LaunchAgent plist at mode `600`, as `JESSE_*` names; the bridge
+republishes them under each server's own variable name at startup
+(`export_mcp_server_env`). RouterOS reads a file (`ROUTEROS_DEVICES_CONFIG`) and Proxmox
+loads its own `.env` relative to its install directory, so neither takes a plist secret.
+The Google OAuth token cache lives at `~/.config/jesse-google/creds` and **must not** be on
+`/tmp`: a reboot would wipe it and force an interactive re-consent that a headless bridge
+turn cannot perform.
+
+### On Codex, the currency step must use the browser, not `WebFetch`
+
+Settled 2026-08-09 and unchanged by this release. On Claude Code `WebFetch` reaches the FX and
+BTC endpoints normally. On Codex it is refused by **Codex's own URL-safety gate** (`is not
+safe to open`), which sits ABOVE the allowlist — so a `WebFetch(domain:...)` grant cannot fix
+it. The already-granted browser MCP returns the same data and is the working cross-harness
+route. No server, no secret and no grant were added for currency.
+
 ## Diet child tool isolation (in-process boundary)
 
 The diet-logging pipeline (see the bridge README) spawns two **stateless,
