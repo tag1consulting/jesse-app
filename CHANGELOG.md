@@ -75,10 +75,17 @@ CI both run it). See the "Versioning" section of `bridge/README.md`.
 
 ### Notes
 
-- **Full Disk Access is honoured under launchd and refused from an interactive terminal.**
-  Measured 2026-08-10: the identical server returns "Permission denied" when its process tree
-  is rooted in a shell and reads all 91 tables when submitted as a launchd job. A failed
-  iMessage read from a terminal proves nothing; verify from a real bridge turn.
+- **iMessage ships LOADED AND GRANTED BUT UNABLE TO READ, and that is a TCC problem rather
+  than a bridge one.** Verified from real bridge turns on both harnesses after deploy: every
+  read returns `Permission denied … chat.db`. Walking the chain one link at a time,
+  `launchd → sh → python` reads all 91 tables, while `launchd → sh → claude → server` and the
+  bridge's own `jesse-bridge → claude → server` are both denied. TCC consults the
+  **responsible process**, not only the binary exec'd, and once a harness binary is in the
+  chain that becomes the harness — which holds no FDA. **A direct launchd job is therefore not
+  a valid preflight for an FDA-dependent server**; that is the check that reported this ready.
+  Closing it needs FDA on the harness binaries (a large widening, GUI-only) or a copy of
+  `chat.db` refreshed out of band. The grants are left in place so posture, record and
+  batteries describe one set; nothing should be built on iMessage reads yet. See SECURITY.md.
 - **`google-perseido` is the first server name carrying a HYPHEN**, and both harnesses were
   checked rather than assumed: Claude Code matched and called
   `mcp__google-perseido__list_calendars`, and codex 0.146.0 accepted

@@ -736,16 +736,48 @@ Disk Access** — a grant over the entire home directory. There is no narrower g
 not offer per-file TCC. So the executable holding it can read every file the user can, not
 merely the two databases it wants.
 
-Two mechanics worth recording:
+### iMessage is LOADED AND GRANTED BUT CANNOT READ TODAY
 
-- **TCC attributes the grant to the binary actually exec'd**, so it is held by
-  `mac-messages-mcp`'s own Python interpreter and never by `jesse-bridge`. The bridge does not
-  need FDA and must not be given it.
-- **The grant is honoured under launchd and NOT from an interactive terminal.** Measured
-  2026-08-10: the same server, same binary, same arguments, returns "Permission denied … grant
-  Full Disk Access" when its process tree is rooted in a terminal, and reads all 91 tables when
-  submitted as a launchd job. A failed iMessage read from a shell is therefore not evidence of
-  a broken grant, and an iMessage read must be verified from a real bridge turn.
+**This is the one part of 0.73.0 that does not work, and it is a TCC problem rather than a
+bridge one.** The server starts, its ten read tools are granted on both harnesses, and every
+single one returns `Permission denied when trying to read ~/Library/Messages/chat.db`.
+Verified from real bridge turns on **both** harnesses after deploying 0.73.0.
+
+The mechanism, measured 2026-08-10 by walking the process chain one link at a time:
+
+| Chain | Result |
+|---|---|
+| `launchd → sh → python(mac-messages-mcp)` | **reads** — all 91 tables |
+| `launchd → sh → claude → mac-messages-mcp` | **denied** |
+| `jesse-bridge (launchd) → claude → mac-messages-mcp` | **denied** |
+| terminal `→ … → mac-messages-mcp` | **denied** |
+
+So "TCC attributes the grant to the binary exec'd" is **not the whole rule, and believing it
+is what made this look green**. TCC also consults the **responsible process** — the ancestor
+it holds accountable for the spawn — and once a harness binary is in the chain, that becomes
+the harness, which holds no FDA. The grant on the leaf Python interpreter is real and is why
+the direct launchd job works; it simply is not what gets consulted when the bridge spawns the
+server through `claude` or `codex`.
+
+**A direct launchd job is therefore NOT a valid preflight for this server.** That is exactly
+the check that reported iMessage ready, and it passed while the thing it was standing in for
+does not work. Any future FDA-dependent server must be proven from a real turn through the
+harness, never from a bare launchd job.
+
+Closing it means one of:
+
+- Granting Full Disk Access to the **harness** binaries (`claude`, `codex`). This is a large
+  widening — FDA on `claude` covers every claude-code invocation on the machine, not just the
+  bridge's — and it is a GUI grant nobody can script.
+- Reading a **copy** of `chat.db` refreshed out of band, so the server needs no FDA at all.
+  Already named below as a residual mitigation, and it is now the preferred route.
+
+Until one of those happens, iMessage is inert: granted, harmless, and returning errors. The
+grants are left in place rather than reverted so the posture, the record and the batteries all
+describe one set — but nothing should be built on top of iMessage reads yet.
+
+One mechanic that does hold regardless: **the bridge itself does not need FDA and must not be
+given it.** Its cdhash changes on every rebuild, so the grant would silently lapse.
 
 ### The second Google account is a second read surface
 
