@@ -6982,6 +6982,312 @@ async fn today_missing_file_is_200_with_an_empty_snapshot_and_a_missing_marker()
     let _ = std::fs::remove_dir_all(&vault);
 }
 
+#[tokio::test]
+async fn today_items_carry_a_project_slug_read_from_the_dashboard_pages() {
+    let vault = make_diet_vault();
+    write_vault_file(
+        &vault,
+        "vault/Today.md",
+        "# Today: Tuesday, March 3, 2026\n\n\
+         ## Do Now\n\n\
+         * [ ] **A declared home.** [[todo-list/Dashboard/Network]] (Added 2026-03-01)\n\
+         * [ ] **A note the Tag1 page claims.** [[todo-list/Projects/Demo/Claimed]] (Added 2026-03-01)\n\
+         * [ ] **No lineage at all.** (Added 2026-03-01)\n",
+    );
+    std::fs::create_dir_all(vault.join("vault/Dashboard")).unwrap();
+    write_vault_file(
+        &vault,
+        "vault/Dashboard/Tag1.md",
+        "# Tag1\n\n* [[todo-list/Projects/Demo/Claimed]]\n",
+    );
+    let cfg = Config {
+        vault: vault.to_string_lossy().into_owned(),
+        ..test_config()
+    };
+    let st = AppState::new(cfg);
+
+    let resp = app(st.clone())
+        .oneshot(today_request(Some("Bearer test-token"), None))
+        .await
+        .unwrap();
+    let etag = resp
+        .headers()
+        .get("etag")
+        .and_then(|v| v.to_str().ok())
+        .unwrap()
+        .to_string();
+    let body: Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    let items = body["sections"][0]["items"].as_array().unwrap();
+    assert_eq!(items[0]["project"], "network", "a declared home link");
+    assert_eq!(
+        items[1]["project"], "tag1",
+        "a note the Tag1 Dashboard page claims rolls up to Tag1"
+    );
+    assert_eq!(items[2]["project"], "unfiled", "no lineage is not a guess");
+    // A slug and nothing else — colour and label stay a client concern.
+    assert!(items[0].get("color").is_none() && items[0].get("projectLabel").is_none());
+
+    // Un-claiming the note in the Dashboard page re-files the item AND moves the
+    // snapshot etag, so a client's cache cannot survive the re-filing.
+    write_vault_file(
+        &vault,
+        "vault/Dashboard/Tag1.md",
+        "# Tag1\n\nnothing here.\n",
+    );
+    let after = app(st)
+        .oneshot(today_request(Some("Bearer test-token"), Some(&etag)))
+        .await
+        .unwrap();
+    assert_eq!(
+        after.status(),
+        StatusCode::OK,
+        "a changed project must invalidate the cached tag"
+    );
+    let body: Value = serde_json::from_str(&body_string(after).await).unwrap();
+    assert_eq!(body["sections"][0]["items"][1]["project"], "unfiled");
+
+    let _ = std::fs::remove_dir_all(&vault);
+}
+
+// ---- GET /jesse/today/items/{id}/detail ------------------------------------
+//
+// Synthetic vault, invented notes. The security half of this endpoint is unit
+// tested in `todaydetail`; what is asserted here is the HTTP contract — auth,
+// the strong ETag and its 304, the 410 for a vanished item, and the typed
+// no-detail answer — plus one end-to-end proof that a target pointing out of the
+// vault is refused through the real route rather than only in the resolver.
+
+const FIX_DETAIL_MD: &str = "# Today: Tuesday, March 3, 2026\n\n\
+     ## Do Now\n\n\
+     * [ ] **The item with a note.** [[todo-list/Projects/Demo/Widget]] (Added 2026-03-01)\n\
+     * [ ] **The item with no link at all.** (Added 2026-03-01)\n\
+     * [ ] **The item whose link escapes the vault.** [[todo-list/../outside-secret]] (Added 2026-03-01)\n";
+
+/// A vault with the day file above, one real note, and one secret OUTSIDE the
+/// notes root that a traversal target would reach.
+fn detail_state() -> (AppState, std::path::PathBuf) {
+    let vault = make_diet_vault();
+    write_vault_file(&vault, "vault/Today.md", FIX_DETAIL_MD);
+    std::fs::create_dir_all(vault.join("vault/Projects/Demo")).unwrap();
+    write_vault_file(
+        &vault,
+        "vault/Projects/Demo/Widget.md",
+        "# Widget\n\nEverything you need to know about the widget.\n",
+    );
+    // One level above `vault/` — inside the repo, outside the notes root.
+    std::fs::write(vault.join("outside-secret.md"), "TOP SECRET\n").unwrap();
+    let cfg = Config {
+        vault: vault.to_string_lossy().into_owned(),
+        ..test_config()
+    };
+    (AppState::new(cfg), vault)
+}
+
+/// The ids of the three fixture items, in file order.
+async fn detail_item_ids(st: AppState) -> Vec<String> {
+    let resp = app(st)
+        .oneshot(today_request(Some("Bearer test-token"), None))
+        .await
+        .unwrap();
+    let body: Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    body["sections"][0]["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|i| i["id"].as_str().unwrap().to_string())
+        .collect()
+}
+
+#[tokio::test]
+async fn today_detail_no_auth_is_401() {
+    let resp = app(test_state())
+        .oneshot(today_detail_request("abc123", None, None))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+    let wrong = app(test_state())
+        .oneshot(today_detail_request("abc123", Some("Bearer wrong"), None))
+        .await
+        .unwrap();
+    assert_eq!(
+        wrong.status(),
+        StatusCode::UNAUTHORIZED,
+        "auth is checked before the id is even looked up"
+    );
+}
+
+#[tokio::test]
+async fn today_detail_serves_the_note_then_304s_on_the_same_tag() {
+    let (st, vault) = detail_state();
+    let ids = detail_item_ids(st.clone()).await;
+
+    let resp = app(st.clone())
+        .oneshot(today_detail_request(
+            &ids[0],
+            Some("Bearer test-token"),
+            None,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let etag = resp
+        .headers()
+        .get("etag")
+        .and_then(|v| v.to_str().ok())
+        .unwrap()
+        .to_string();
+    assert!(etag.starts_with('"'), "strong ETag is quoted: {etag}");
+    let body: Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    assert_eq!(body["status"], "ok");
+    assert_eq!(body["id"], ids[0]);
+    assert_eq!(body["path"], "Projects/Demo/Widget.md");
+    assert_eq!(body["target"], "todo-list/Projects/Demo/Widget");
+    assert!(body["markdown"]
+        .as_str()
+        .unwrap()
+        .contains("Everything you need to know"));
+    assert_eq!(body["truncated"], false);
+    assert_eq!(
+        body["etag"].as_str().unwrap(),
+        etag,
+        "the body's etag is the one on the header"
+    );
+
+    // Same file state → same tag, so a poll costs one 304 with no body.
+    let cached = app(st.clone())
+        .oneshot(today_detail_request(
+            &ids[0],
+            Some("Bearer test-token"),
+            Some(&etag),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(cached.status(), StatusCode::NOT_MODIFIED);
+    assert_eq!(
+        cached.headers().get("etag").unwrap().to_str().unwrap(),
+        etag
+    );
+    assert!(body_string(cached).await.is_empty(), "304 carries no body");
+
+    // Editing the NOTE (not the day file) moves the tag.
+    write_vault_file(
+        &vault,
+        "vault/Projects/Demo/Widget.md",
+        "# Widget\n\nRewritten.\n",
+    );
+    let changed = app(st)
+        .oneshot(today_detail_request(
+            &ids[0],
+            Some("Bearer test-token"),
+            Some(&etag),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(changed.status(), StatusCode::OK, "a stale tag re-fetches");
+    assert_ne!(
+        changed.headers().get("etag").unwrap().to_str().unwrap(),
+        etag
+    );
+
+    let _ = std::fs::remove_dir_all(&vault);
+}
+
+#[tokio::test]
+async fn today_detail_is_typed_no_detail_rather_than_an_error() {
+    let (st, vault) = detail_state();
+    let ids = detail_item_ids(st.clone()).await;
+
+    // An item with no wiki link at all.
+    let resp = app(st.clone())
+        .oneshot(today_detail_request(
+            &ids[1],
+            Some("Bearer test-token"),
+            None,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "an item with no note is an ordinary item, not a failure"
+    );
+    let body: Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    assert_eq!(body["status"], "no-detail");
+    assert_eq!(body["reason"], "no-target");
+    assert!(
+        body["markdown"].is_null(),
+        "no content on a no-detail answer"
+    );
+    assert!(
+        body["etag"].as_str().is_some(),
+        "a no-detail answer still tags"
+    );
+
+    let _ = std::fs::remove_dir_all(&vault);
+}
+
+#[tokio::test]
+async fn today_detail_refuses_a_target_that_escapes_the_vault_root() {
+    let (st, vault) = detail_state();
+    let ids = detail_item_ids(st.clone()).await;
+
+    let resp = app(st)
+        .oneshot(today_detail_request(
+            &ids[2],
+            Some("Bearer test-token"),
+            None,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let raw = body_string(resp).await;
+    let body: Value = serde_json::from_str(&raw).unwrap();
+    assert_eq!(
+        body["status"], "no-detail",
+        "a `..` target is refused, not served"
+    );
+    assert_eq!(
+        body["reason"], "unresolved-target",
+        "…and it is indistinguishable from a note that simply is not there"
+    );
+    assert!(
+        !raw.contains("TOP SECRET"),
+        "nothing outside the vault reaches the wire: {raw}"
+    );
+    assert!(
+        !raw.contains(vault.to_string_lossy().as_ref()),
+        "no absolute vault path on the wire either: {raw}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(vault.join("outside-secret.md")).unwrap(),
+        "TOP SECRET\n",
+        "the file outside the vault is untouched"
+    );
+
+    let _ = std::fs::remove_dir_all(&vault);
+}
+
+#[tokio::test]
+async fn today_detail_for_an_unknown_id_is_410_gone() {
+    let (st, vault) = detail_state();
+    let resp = app(st)
+        .oneshot(today_detail_request(
+            "0123456789ab",
+            Some("Bearer test-token"),
+            None,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::GONE,
+        "the client had this id from a snapshot — the item is gone, not the URL wrong"
+    );
+
+    let _ = std::fs::remove_dir_all(&vault);
+}
+
 // ---- POST /jesse/today — the write path -----------------------------------
 //
 // The bridge's first writes to the agent's own working files. Same synthetic

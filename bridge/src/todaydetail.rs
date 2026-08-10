@@ -123,7 +123,10 @@ pub fn resolve_under_root(root: &Path, rel: &str) -> Option<PathBuf> {
     }
     // `canonicalize` resolved every symlink already, so this asks about the real
     // target: a directory or a device is not a note.
-    std::fs::metadata(&canonical).ok()?.is_file().then_some(canonical)
+    std::fs::metadata(&canonical)
+        .ok()?
+        .is_file()
+        .then_some(canonical)
 }
 
 /// The filenames a wiki target can name, in preference order.
@@ -276,7 +279,9 @@ pub async fn jesse_today_detail(
         .and_then(|v| v.to_str().ok())
     {
         if if_none_match_matches(inm, &etag) {
-            return Ok((StatusCode::NOT_MODIFIED, [(axum::http::header::ETAG, etag)]).into_response());
+            return Ok(
+                (StatusCode::NOT_MODIFIED, [(axum::http::header::ETAG, etag)]).into_response(),
+            );
         }
     }
     let body = detail_body(&id, &detail, &etag);
@@ -338,7 +343,9 @@ mod tests {
     }
 
     fn item_with(links: &str) -> TodayItem {
-        let snap = parse_today(&format!("# Today\n\n## Do Now\n\n* [ ] **A thing.** {links}\n"));
+        let snap = parse_today(&format!(
+            "# Today\n\n## Do Now\n\n* [ ] **A thing.** {links}\n"
+        ));
         snap.sections[0].items[0].clone()
     }
 
@@ -382,7 +389,8 @@ mod tests {
         let v = Vault::new("order");
         v.write("Projects/Second.md", "second\n");
         // The FIRST wiki link names a note that does not exist; the second does.
-        let item = item_with("[[todo-list/Projects/Missing]] and [[todo-list/Projects/Second#A-Heading]]");
+        let item =
+            item_with("[[todo-list/Projects/Missing]] and [[todo-list/Projects/Second#A-Heading]]");
         let got = detail_for(&v.notes(), &item).unwrap();
         assert_eq!(got.path, "Projects/Second.md");
         assert!(got.markdown.contains("second"));
@@ -497,10 +505,7 @@ mod tests {
         assert!(resolve_under_root(&root, "Inside.md").is_some());
         assert!(resolve_under_root(&root, "./Inside.md").is_some());
         for bad in ["", "   ", "/etc/passwd", "../x", "a/../../x", "In\0side.md"] {
-            assert!(
-                resolve_under_root(&root, bad).is_none(),
-                "accepted {bad:?}"
-            );
+            assert!(resolve_under_root(&root, bad).is_none(), "accepted {bad:?}");
         }
     }
 
@@ -568,7 +573,10 @@ mod tests {
         let body = detail_body(&id, &detail, &etag);
         assert_eq!(body["status"], "ok");
         assert_eq!(body["path"], "Projects/Demo.md");
-        assert!(body["markdown"].as_str().unwrap().contains("the detail note"));
+        assert!(body["markdown"]
+            .as_str()
+            .unwrap()
+            .contains("the detail note"));
 
         // The `If-None-Match` contract this endpoint honours.
         assert!(if_none_match_matches(&etag, &etag));

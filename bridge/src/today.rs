@@ -402,11 +402,12 @@ impl ProjectRollup {
         if self.map.is_empty() {
             return;
         }
-        for item in snapshot
-            .lead_items
-            .iter_mut()
-            .chain(snapshot.sections.iter_mut().flat_map(|s| s.items.iter_mut()))
-        {
+        for item in snapshot.lead_items.iter_mut().chain(
+            snapshot
+                .sections
+                .iter_mut()
+                .flat_map(|s| s.items.iter_mut()),
+        ) {
             item.project = derive_project(&item.links, &item.section_name, self);
         }
     }
@@ -1955,7 +1956,10 @@ mod tests {
         assert_eq!(note_key("Projects/A/B"), "projects/a/b");
         // A path is NOT lowercased — the notes root may be case-sensitive.
         assert_eq!(vault_relative("todo-list/Projects/A/B"), "Projects/A/B");
-        assert_eq!(vault_relative("todo-list/Projects/A/B.md"), "Projects/A/B.md");
+        assert_eq!(
+            vault_relative("todo-list/Projects/A/B.md"),
+            "Projects/A/B.md"
+        );
         assert_eq!(vault_relative("todo-list/Projects/A#H"), "Projects/A");
     }
 
