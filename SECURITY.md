@@ -1440,14 +1440,21 @@ tool call. **So a mutation never blocks on the turn lock.** Instead:
    file edit. A crash between the two leaves an intent whose effect is absent, which
    is exactly the state replay resolves — the tap is not lost.
 2. **Apply, or park.** If no write-enabled turn holds the lock on the day file, the
-   intent is applied immediately and pruned. If one does, it is parked, and
-   `GET /jesse/today` merges pending intents into the snapshot so the app still reads
-   its own writes.
+   intent is applied immediately. If one does, it is parked, and `GET /jesse/today`
+   merges pending intents into the snapshot so the app still reads its own writes.
+   Either way the intent is **retained until no turn is in flight** — a turn holds the
+   lock only for the instant of a tool call and spends the rest of its life holding
+   nothing, having read the file early and thinking, so "a lock is held right now" is
+   far too narrow a test for "something could still clobber this". Retention is what
+   makes the applied-then-clobbered case repairable; `JOURNAL_CAP` bounds it.
 3. **Replay at turn completion.** The `TurnLockRelease` drop guard — which runs when
    a turn ends *however* it ended, including a kill between hooks, a timeout, a panic
    and the abort a cancel performs — re-parses the file and re-applies any journaled
    intent whose effect is absent. The clobber still happens; it is repaired within
-   milliseconds of the turn ending, against whatever the agent actually wrote.
+   milliseconds of the turn ending, against whatever the agent actually wrote. Replay
+   separates **repair** from **pruning**: repair always runs, pruning only when the
+   conversation registry reports nothing else in flight, so one turn ending never
+   discards an intent another running turn could still overwrite.
 
 An intent is recorded by **identity** (section, lead, `(Added …)` date — the identity
 contract's three real inputs), not by id or byte offset, so it survives the morning

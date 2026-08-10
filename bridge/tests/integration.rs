@@ -7378,6 +7378,7 @@ async fn today_a_tap_during_a_turn_parks_reads_back_and_replays_at_turn_end() {
         broker: st.broker.clone(),
         cfg: st.cfg.clone(),
         turn: "turn-1".to_string(),
+        conversations: st.conversations.clone(),
     });
 
     let on_disk = std::fs::read_to_string(&day).unwrap();
@@ -7500,6 +7501,111 @@ async fn today_glance_marks_a_report_row_seen_under_a_date_scoped_key() {
         std::fs::read_to_string(vault.join("vault/Today.md")).unwrap(),
         FIX_TODAY_MD,
         "a glance writes no vault content at all"
+    );
+    let _ = std::fs::remove_dir_all(&vault);
+}
+
+/// THE OTHER HALF OF THE RACE, and the one a lock cannot catch: a turn spends
+/// almost all of its life holding NO lock. It read the file early, is thinking,
+/// and writes minutes later from the copy it holds. A tap in that window is
+/// applied immediately — correctly — and the turn's eventual write still
+/// clobbers it. The intent has to OUTLIVE its own apply for that to be repaired.
+///
+/// Found by a manual test against the deployed bridge, where the tap landed
+/// while the turn was thinking rather than writing, and the intent had already
+/// been pruned by the time the clobber came.
+#[tokio::test]
+async fn today_a_tap_applied_while_a_turn_thinks_is_repaired_after_the_turn_clobbers_it() {
+    let (st, vault) = today_write_state();
+    let day = vault.join("vault/Today.md");
+    let journal = st.cfg.today_intents_file().unwrap();
+
+    // A turn is IN FLIGHT but holds no lock — it has read the file and is
+    // thinking. This is the state the broker cannot see.
+    let _flight =
+        st.conversations
+            .claim_flight("job-1", "conv-1", Default::default(), 1_772_000_000_000);
+    let stale_copy = std::fs::read_to_string(&day).unwrap();
+
+    let (snapshot, etag) = today_snapshot(&st).await;
+    let id = id_of(&snapshot, "Reply to Ada");
+    let resp = app(st.clone())
+        .oneshot(today_check_request(
+            Some("Bearer test-token"),
+            &id,
+            Some(&etag),
+            r#"{"checked":true,"evidence":"tapped while thinking","at":"2026-03-03T09:30:00Z"}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let posted: Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    assert_eq!(
+        posted["pending"], false,
+        "no lock is held, so it applies immediately rather than parking"
+    );
+    assert!(
+        std::fs::read_to_string(&day)
+            .unwrap()
+            .contains("tapped while thinking"),
+        "and it really is in the file"
+    );
+    assert_eq!(
+        load_intents(&journal).len(),
+        1,
+        "THE FIX: the intent is RETAINED while a turn is in flight, because that \
+         turn's write has not landed yet"
+    );
+
+    // The turn now writes back the copy it read before the tap. The clobber.
+    std::fs::write(&day, &stale_copy).unwrap();
+    assert!(!std::fs::read_to_string(&day)
+        .unwrap()
+        .contains("tapped while thinking"));
+
+    // That turn ends. Its flight claim drops first (locals drop in reverse), so
+    // replay sees nothing in flight and both repairs and prunes.
+    drop(_flight);
+    drop(TurnLockRelease {
+        broker: st.broker.clone(),
+        cfg: st.cfg.clone(),
+        turn: "job-1".to_string(),
+        conversations: st.conversations.clone(),
+    });
+
+    assert!(
+        std::fs::read_to_string(&day)
+            .unwrap()
+            .contains("\t*(app-completed 2026-03-03 09:30: tapped while thinking)*"),
+        "the clobbered tap was repaired at turn completion"
+    );
+    assert!(
+        load_intents(&journal).is_empty(),
+        "and pruned now that nothing is in flight to clobber it again"
+    );
+    let _ = std::fs::remove_dir_all(&vault);
+}
+
+/// With nothing in flight the journal must go straight back to empty, or every
+/// GET would pay to re-apply a growing pile of already-applied intents.
+#[tokio::test]
+async fn today_a_tap_with_no_turn_running_leaves_the_journal_empty() {
+    let (st, vault) = today_write_state();
+    let (snapshot, etag) = today_snapshot(&st).await;
+    let id = id_of(&snapshot, "Reply to Ada");
+    let resp = app(st.clone())
+        .oneshot(today_check_request(
+            Some("Bearer test-token"),
+            &id,
+            Some(&etag),
+            r#"{"checked":true,"at":"2026-03-03T09:30:00Z"}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert!(
+        load_intents(&st.cfg.today_intents_file().unwrap()).is_empty(),
+        "a spent intent is not kept: nothing is running that could clobber it"
     );
     let _ = std::fs::remove_dir_all(&vault);
 }

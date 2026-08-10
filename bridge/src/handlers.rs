@@ -852,6 +852,7 @@ pub async fn jesse(
             broker: broker.clone(),
             cfg: cfg.clone(),
             turn: jid.clone(),
+            conversations: conversations.clone(),
         };
         // GATED ON CAPABILITY, NOT ON HARNESS. `turn_capability` already derives Write vs
         // Read from the model's level, so a read-level turn never touches the broker at all
