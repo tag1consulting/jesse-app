@@ -96,11 +96,16 @@ public struct TodayItem: Decodable, Equatable, Hashable, Identifiable, Sendable 
     public var updatedDate: String?
     public var appCompleted: TodayAppCompleted?
     public var sectionName: String
+    /// The topic this item rolls up to, as the bridge derived it from the item's links,
+    /// its section heading and the five Dashboard pages. `.unfiled` is the honest
+    /// answer for an item that declares no lineage, and is common — see `TodayProject`.
+    public var project: TodayProject
     public var range: TodaySourceRange
 
     public init(id: String, checked: Bool = false, lead: String = "", text: String = "",
                 links: [TodayLink] = [], addedDate: String? = nil, updatedDate: String? = nil,
                 appCompleted: TodayAppCompleted? = nil, sectionName: String = "",
+                project: TodayProject = .unfiled,
                 range: TodaySourceRange = TodaySourceRange(start: 0, end: 0)) {
         self.id = id
         self.checked = checked
@@ -111,7 +116,35 @@ public struct TodayItem: Decodable, Equatable, Hashable, Identifiable, Sendable 
         self.updatedDate = updatedDate
         self.appCompleted = appCompleted
         self.sectionName = sectionName
+        self.project = project
         self.range = range
+    }
+
+    /// A tolerant decode, for the same reason `TodaySnapshot` has one: a bridge that
+    /// predates a field and one that grows a field must both decode. `project` is the
+    /// live case — every bridge before 0.72.0 sends no such key, and an item with no
+    /// declared topic is exactly what `.unfiled` means, so its absence is not an error.
+    /// Only `id` is required, because an item the client cannot key state by is not an
+    /// item it can render.
+    private enum CodingKeys: String, CodingKey {
+        case id, checked, lead, text, links, addedDate, updatedDate
+        case appCompleted, sectionName, project, range
+    }
+
+    public init(from decoder: any Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        id = try c.decode(String.self, forKey: .id)
+        checked = try c.decodeIfPresent(Bool.self, forKey: .checked) ?? false
+        lead = try c.decodeIfPresent(String.self, forKey: .lead) ?? ""
+        text = try c.decodeIfPresent(String.self, forKey: .text) ?? ""
+        links = try c.decodeIfPresent([TodayLink].self, forKey: .links) ?? []
+        addedDate = try c.decodeIfPresent(String.self, forKey: .addedDate)
+        updatedDate = try c.decodeIfPresent(String.self, forKey: .updatedDate)
+        appCompleted = try c.decodeIfPresent(TodayAppCompleted.self, forKey: .appCompleted)
+        sectionName = try c.decodeIfPresent(String.self, forKey: .sectionName) ?? ""
+        project = try c.decodeIfPresent(TodayProject.self, forKey: .project) ?? .unfiled
+        range = try c.decodeIfPresent(TodaySourceRange.self, forKey: .range)
+            ?? TodaySourceRange(start: 0, end: 0)
     }
 
     /// Whether this item sits in the lead block above every heading — the standing

@@ -51,6 +51,14 @@ public struct TodayListView: View {
                 content(snapshot)
             }
         }
+        .toolbar {
+            // `.primaryAction`, not `.secondaryAction`: the latter collapses into an
+            // overflow "More" ellipsis on iOS, which is where a control goes to be
+            // undiscoverable.
+            ToolbarItem(placement: .primaryAction) {
+                TodaySortMenu(selection: $model.sortKey)
+            }
+        }
         .task { await model.load() }
         .refreshable { await model.refresh() }
         .sheet(item: $evidenceFor) { target in
@@ -71,6 +79,16 @@ public struct TodayListView: View {
                 TodayStatusBanner(isOffline: model.isReadOnly,
                                   isPendingReplay: model.isPendingReplay,
                                   message: model.lastErrorMessage)
+                    .listRowSeparator(.hidden)
+            }
+            if model.sortKey.reorders {
+                // Said out loud, every time. The day file's order is the day's own
+                // argument, and a screen quietly showing a different one — with move
+                // buttons that write to the file — would have the user reasoning about
+                // an order nobody wrote.
+                Label(model.sortKey.caption, systemImage: model.sortKey.symbol)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
                     .listRowSeparator(.hidden)
             }
             if let narrative = snapshot.narrative, !narrative.isEmpty {
@@ -125,12 +143,17 @@ public struct TodayListView: View {
     }
 
     private func row(_ item: TodayItem, in snapshot: TodaySnapshot) -> some View {
-        let moves = TodaySemantics.availableMoves(for: item, in: snapshot)
+        // Asked of the MODEL, not of the snapshot being drawn: what a move would do is a
+        // fact about the day file's order, and the snapshot in hand here may be a
+        // sorted lens over it. The model holds both and pairs them correctly once.
+        let moves = model.availableMoves(for: item)
+        let focusActions = model.availableFocus(for: item)
         return TodayItemRow(
             item: item,
             pending: model.isPending(item.id),
             evidence: model.evidence(for: item),
             availableMoves: moves,
+            focusActions: focusActions,
             onToggle: { wantsChecked in
                 // Read-only is answered HERE, before the sheet: the alternative is
                 // taking a line of evidence off the user and then refusing to write it.
@@ -144,6 +167,7 @@ public struct TodayListView: View {
                 }
             },
             onMove: { op in Task { await model.move(id: item.id, op: op) } },
+            onFocus: { focus in Task { await model.focus(id: item.id, focus) } },
             onDiscuss: { onDiscuss(item) },
             onPropagate: { onPropagate(item, model.evidence(for: item)) },
             onOpenLink: onOpenLink)
@@ -189,6 +213,40 @@ public struct TodayListView: View {
                           },
                           onCancel: { evidenceFor = nil })
         }
+    }
+}
+
+// MARK: - The sort control
+
+/// The view sort, as a menu.
+///
+/// A LENS, and it says so: every option carries the line that says whether it touches
+/// the file (none of them do). The control is deliberately not called "Sort the day" —
+/// sorting the day is what the move menu does, one item at a time, in the file.
+public struct TodaySortMenu: View {
+    @Binding private var selection: TodaySortKey
+
+    public init(selection: Binding<TodaySortKey>) {
+        self._selection = selection
+    }
+
+    public var body: some View {
+        Menu {
+            Picker("Order", selection: $selection) {
+                ForEach(TodaySortKey.allCases) { key in
+                    Label(key.label, systemImage: key.symbol).tag(key)
+                }
+            }
+            .pickerStyle(.inline)
+        } label: {
+            // The glyph changes with the lens, so the current order is legible from the
+            // toolbar without opening the menu.
+            Image(systemName: selection.reorders
+                  ? "line.3.horizontal.decrease.circle.fill"
+                  : "line.3.horizontal.decrease.circle")
+        }
+        .menuIndicator(.hidden)
+        .accessibilityLabel("Order: \(selection.label)")
     }
 }
 

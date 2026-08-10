@@ -38,11 +38,12 @@ enum Fixt {
     static func item(_ id: String, lead: String, section: String, checked: Bool = false,
                      added: String? = nil, updated: String? = nil,
                      text: String? = nil, links: [TodayLink] = [],
-                     appCompleted: TodayAppCompleted? = nil) -> TodayItem {
+                     appCompleted: TodayAppCompleted? = nil,
+                     project: TodayProject = .unfiled) -> TodayItem {
         TodayItem(id: id, checked: checked, lead: lead,
                   text: text ?? "* [\(checked ? "x" : " ")] **\(lead)**",
                   links: links, addedDate: added, updatedDate: updated,
-                  appCompleted: appCompleted, sectionName: section)
+                  appCompleted: appCompleted, sectionName: section, project: project)
     }
 
     static func report(_ id: String, title: String, section: String, kind: String,

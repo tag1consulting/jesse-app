@@ -15,6 +15,81 @@ CI both run it). See the "Versioning" section of `bridge/README.md`.
 
 ## [Unreleased]
 
+## [App 1.0 (97)] - 2026-08-10
+
+### Added
+
+- **The day screen reads the project slug bridge 0.72.0 started sending.** `TodayProject`
+  is a closed enum over the frozen wire set (`tag1`, `personal`, `network`, `via-con-me`,
+  `perseido`, `unfiled`) — closed because the bridge's own docs freeze it and say the
+  decoder is entitled to treat it as such. Closed is not brittle: a slug this build has
+  never heard of decodes to `.unfiled` rather than throwing, and so does an ABSENT
+  `project` key, which is what every bridge before 0.72.0 sends. A sixth topic on the
+  server must never blank a day screen on a phone that has not been updated.
+
+- **One project colour table, `TodayProjectPalette`, for every platform and every
+  surface.** The bridge sends the slug only; the colour, the label and the ordering are
+  client concerns, and this is the single place any of them are decided. Views resolve a
+  ROLE (a colour per appearance, a label, an accessibility label, a glyph) and never a
+  raw hue, so a row's dot, the detail accent and anything added later cannot disagree.
+
+  Each role carries an explicit light and dark value rather than a system semantic colour,
+  because the system colours are tuned to be pleasant rather than to be told apart —
+  `.blue`, `.indigo` and `.purple` collapse into one another under deuteranopia. The
+  values are chosen so every colour clears **4.5:1** against its own background and every
+  PAIR stays at least **ΔE\*ab 10** apart under normal vision and under simulated
+  protanopia, deuteranopia and tritanopia. Both properties are asserted by
+  `TodayProjectPaletteTests`, which does the colour-vision simulation itself rather than
+  trusting a design tool, so a future hue edit is checked by the suite. `unfiled` is a
+  true grey and the only neutral: "no project" is an absence, not a sixth project, and on
+  the live day file it is a large minority of items. Colour is never the only cue —
+  every surface that draws one also carries the project's name.
+
+- **The note behind an item** — `GET /jesse/today/items/{id}/detail`, as wire types
+  (`TodayItemDetail`, `TodayNoDetail`), a typed `TodayDetailResult`, a narrow
+  `TodayDetailProviding` seam, a `TodayDetailModel` and a pure `TodayDetailView`.
+  Three of the four outcomes are ordinary and are states rather than thrown errors: a
+  `304` re-uses what is cached under that ETag (the common answer when a note is
+  re-opened), a `410` means the item left the day file, and a typed `no-detail` answer
+  is an ordinary item with nothing behind it — the bridge refuses to call that a `500`
+  precisely so the app does not render a failure for a healthy day file, and the client
+  keeps it that way. Only transport, auth, 5xx and an undecodable body throw.
+
+  The model caches per item id with the tag its answer came under, so a re-open costs one
+  conditional request; a failed refresh keeps the cached note on screen and raises a
+  stale flag rather than blanking a note the user was reading a second ago. Notes render
+  through a small block model (headings, bullets, quotes, fenced code, rules) with the
+  SAME `strippedMarkdown` the day rows use and the SAME `TodayLinkChip` for links —
+  Foundation's markdown parser knows nothing about `[[wiki links]]`, which are the one
+  part of a note the app can act on. Nothing in a note is ever dropped: a construct the
+  block model does not know survives as a paragraph.
+
+- **A view sort, and a focus affordance that is deliberately not one.** `TodaySortKey`
+  (`fileOrder` — the default and the identity, `project`, `age`) reorders rows within
+  each section and writes nothing: `Today.md` is written by the morning routine and its
+  order is the day's own argument, so a lens must never quietly overrule it. The screen
+  says so out loud whenever a lens is on. Sorting never crosses a section boundary, never
+  touches the lead block, and cannot change the counts or the tab badge — all asserted.
+  The sort is stable by construction (decorated with the file index), because
+  `Array.sorted(by:)` is not, and an unstable sort over a key with many ties would
+  reshuffle the unfiled group on every re-render.
+
+  Durable reordering stays the existing move ops. `TodayFocus` maps onto exactly two of
+  them — `to_do_now` and `top_of_section` — so "work on this next" is a real edit to the
+  day file, going through the same optimistic, ETagged path with the same re-keying after
+  a cross-section move. While a lens is on, `up` and `down` are withheld: they swap the
+  item with its FILE neighbour, which under `by project` may be nowhere near the row the
+  user is looking at. The two absolute ops mean the same thing under every lens and stay.
+
+### Changed
+
+- The Today wire fixtures are regenerated from the current bridge, so `today-full.json`
+  and `today-moved.json` carry the `project` key the live serializer emits; the diff is
+  that key and the ETag it moves, and every id in them is unchanged. Three new fixtures
+  (`today-projects.json`, `today-detail-ok.json`, and the two no-detail answers) are the
+  bridge's own output over its own synthetic day-file fixtures, captured through the real
+  routes — invented content throughout, as this repo is public.
+
 ## [Bridge 0.72.0] - 2026-08-10
 
 ### Added

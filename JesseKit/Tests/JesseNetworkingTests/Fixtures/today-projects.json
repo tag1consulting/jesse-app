@@ -1,0 +1,449 @@
+{
+  "counts": {
+    "done": 0,
+    "open": 19,
+    "reportsUnseen": 0
+  },
+  "date": "2026-03-03",
+  "etag": "\"0a437d44f4a8a8facb4f3f41acf74356d57996458f3a22ef7b926e3c7c662952\"",
+  "generatedAt": "2026-03-03T09:00:00Z",
+  "leadItems": [],
+  "missing": false,
+  "narrative": "Synthetic fixture for the project derivation. Invented items and invented note\n\npaths — the five topic NAMES are real because they are the frozen wire taxonomy,\n\nbut nothing else here is a copy of a real day file.",
+  "sections": [
+    {
+      "items": [
+        {
+          "addedDate": "2026-03-01",
+          "appCompleted": null,
+          "checked": false,
+          "id": "15ae6d9d0b08",
+          "lead": "A Tag1 home link.",
+          "links": [
+            {
+              "kind": "wiki",
+              "target": "todo-list/Dashboard/Tag1"
+            }
+          ],
+          "project": "tag1",
+          "range": {
+            "end": 335,
+            "start": 259
+          },
+          "sectionName": "Do Now",
+          "text": "* [ ] **A Tag1 home link.** [[todo-list/Dashboard/Tag1]] (Added 2026-03-01)",
+          "updatedDate": null
+        },
+        {
+          "addedDate": "2026-03-01",
+          "appCompleted": null,
+          "checked": false,
+          "id": "118be5136e42",
+          "lead": "A Personal home link.",
+          "links": [
+            {
+              "kind": "wiki",
+              "target": "todo-list/Dashboard/Personal"
+            }
+          ],
+          "project": "personal",
+          "range": {
+            "end": 419,
+            "start": 335
+          },
+          "sectionName": "Do Now",
+          "text": "* [ ] **A Personal home link.** [[todo-list/Dashboard/Personal]] (Added 2026-03-01)",
+          "updatedDate": null
+        },
+        {
+          "addedDate": "2026-03-01",
+          "appCompleted": null,
+          "checked": false,
+          "id": "eef48e2f9300",
+          "lead": "A Network home link.",
+          "links": [
+            {
+              "kind": "wiki",
+              "target": "todo-list/Dashboard/Network"
+            }
+          ],
+          "project": "network",
+          "range": {
+            "end": 501,
+            "start": 419
+          },
+          "sectionName": "Do Now",
+          "text": "* [ ] **A Network home link.** [[todo-list/Dashboard/Network]] (Added 2026-03-01)",
+          "updatedDate": null
+        },
+        {
+          "addedDate": "2026-03-01",
+          "appCompleted": null,
+          "checked": false,
+          "id": "8ed1f7e685d5",
+          "lead": "A Via-Con-Me home link.",
+          "links": [
+            {
+              "kind": "wiki",
+              "target": "todo-list/Dashboard/Via-Con-Me"
+            }
+          ],
+          "project": "via-con-me",
+          "range": {
+            "end": 589,
+            "start": 501
+          },
+          "sectionName": "Do Now",
+          "text": "* [ ] **A Via-Con-Me home link.** [[todo-list/Dashboard/Via-Con-Me]] (Added 2026-03-01)",
+          "updatedDate": null
+        },
+        {
+          "addedDate": "2026-03-01",
+          "appCompleted": null,
+          "checked": false,
+          "id": "1551ebd1b767",
+          "lead": "A Perseido home link.",
+          "links": [
+            {
+              "kind": "wiki",
+              "target": "todo-list/Dashboard/Perseido"
+            }
+          ],
+          "project": "perseido",
+          "range": {
+            "end": 673,
+            "start": 589
+          },
+          "sectionName": "Do Now",
+          "text": "* [ ] **A Perseido home link.** [[todo-list/Dashboard/Perseido]] (Added 2026-03-01)",
+          "updatedDate": null
+        },
+        {
+          "addedDate": "2026-03-01",
+          "appCompleted": null,
+          "checked": false,
+          "id": "250af4b4d42e",
+          "lead": "No link at all, so no declared home.",
+          "links": [],
+          "project": "unfiled",
+          "range": {
+            "end": 739,
+            "start": 673
+          },
+          "sectionName": "Do Now",
+          "text": "* [ ] **No link at all, so no declared home.** (Added 2026-03-01)",
+          "updatedDate": null
+        },
+        {
+          "addedDate": "2026-03-01",
+          "appCompleted": null,
+          "checked": false,
+          "id": "96846dfc3bed",
+          "lead": "A wiki link no topic page claims.",
+          "links": [
+            {
+              "kind": "wiki",
+              "target": "todo-list/Knowledge/Orphan-Note"
+            }
+          ],
+          "project": "unfiled",
+          "range": {
+            "end": 838,
+            "start": 739
+          },
+          "sectionName": "Do Now",
+          "text": "* [ ] **A wiki link no topic page claims.** [[todo-list/Knowledge/Orphan-Note]] (Added 2026-03-01)",
+          "updatedDate": null
+        },
+        {
+          "addedDate": "2026-03-01",
+          "appCompleted": null,
+          "checked": false,
+          "id": "e68bbc180fe8",
+          "lead": "A URL is not a lineage.",
+          "links": [
+            {
+              "kind": "url",
+              "target": "https://example.invalid/x"
+            }
+          ],
+          "project": "unfiled",
+          "range": {
+            "end": 917,
+            "start": 838
+          },
+          "sectionName": "Do Now",
+          "text": "* [ ] **A URL is not a lineage.** https://example.invalid/x (Added 2026-03-01)",
+          "updatedDate": null
+        },
+        {
+          "addedDate": "2026-03-01",
+          "appCompleted": null,
+          "checked": false,
+          "id": "dccd40c2f8ec",
+          "lead": "A note one topic page claims.",
+          "links": [
+            {
+              "kind": "wiki",
+              "target": "todo-list/Projects/Demo/Claimed-Once"
+            }
+          ],
+          "project": "tag1",
+          "range": {
+            "end": 1017,
+            "start": 917
+          },
+          "sectionName": "Do Now",
+          "text": "* [ ] **A note one topic page claims.** [[todo-list/Projects/Demo/Claimed-Once]] (Added 2026-03-01)",
+          "updatedDate": null
+        },
+        {
+          "addedDate": "2026-03-01",
+          "appCompleted": null,
+          "checked": false,
+          "id": "b3bc20913fb3",
+          "lead": "A note two topic pages claim.",
+          "links": [
+            {
+              "kind": "wiki",
+              "target": "todo-list/Projects/Demo/Claimed-Twice"
+            }
+          ],
+          "project": "unfiled",
+          "range": {
+            "end": 1118,
+            "start": 1017
+          },
+          "sectionName": "Do Now",
+          "text": "* [ ] **A note two topic pages claim.** [[todo-list/Projects/Demo/Claimed-Twice]] (Added 2026-03-01)",
+          "updatedDate": null
+        },
+        {
+          "addedDate": "2026-03-01",
+          "appCompleted": null,
+          "checked": false,
+          "id": "1b7687c7b755",
+          "lead": "A home link outranks a rollup link.",
+          "links": [
+            {
+              "kind": "wiki",
+              "target": "todo-list/Dashboard/Network"
+            },
+            {
+              "kind": "wiki",
+              "target": "todo-list/Projects/Demo/Claimed-Once"
+            }
+          ],
+          "project": "network",
+          "range": {
+            "end": 1260,
+            "start": 1118
+          },
+          "sectionName": "Do Now",
+          "text": "* [ ] **A home link outranks a rollup link.** [[todo-list/Dashboard/Network]] and [[todo-list/Projects/Demo/Claimed-Once]] (Added 2026-03-01)",
+          "updatedDate": null
+        },
+        {
+          "addedDate": "2026-03-01",
+          "appCompleted": null,
+          "checked": false,
+          "id": "7f12421a5719",
+          "lead": "An alias and a heading still resolve.",
+          "links": [
+            {
+              "kind": "wiki",
+              "target": "todo-list/Dashboard/Tag1#This-Week"
+            }
+          ],
+          "project": "tag1",
+          "range": {
+            "end": 1381,
+            "start": 1260
+          },
+          "sectionName": "Do Now",
+          "text": "* [ ] **An alias and a heading still resolve.** [[todo-list/Dashboard/Tag1#This-Week|the Tag1 board]] (Added 2026-03-01)",
+          "updatedDate": null
+        },
+        {
+          "addedDate": "2026-03-01",
+          "appCompleted": null,
+          "checked": false,
+          "id": "663231fd0d42",
+          "lead": "The vault-subdir spelling resolves too.",
+          "links": [
+            {
+              "kind": "wiki",
+              "target": "vault/Dashboard/Perseido"
+            }
+          ],
+          "project": "perseido",
+          "range": {
+            "end": 1479,
+            "start": 1381
+          },
+          "sectionName": "Do Now",
+          "text": "* [ ] **The vault-subdir spelling resolves too.** [[vault/Dashboard/Perseido]] (Added 2026-03-01)",
+          "updatedDate": null
+        },
+        {
+          "addedDate": "2026-03-01",
+          "appCompleted": null,
+          "checked": false,
+          "id": "8945a6a7a4ed",
+          "lead": "Two home links with nothing to separate them.",
+          "links": [
+            {
+              "kind": "wiki",
+              "target": "todo-list/Dashboard/Tag1"
+            },
+            {
+              "kind": "wiki",
+              "target": "todo-list/Dashboard/Personal"
+            }
+          ],
+          "project": "unfiled",
+          "range": {
+            "end": 1620,
+            "start": 1479
+          },
+          "sectionName": "Do Now",
+          "text": "* [ ] **Two home links with nothing to separate them.** [[todo-list/Dashboard/Tag1]] and [[todo-list/Dashboard/Personal]] (Added 2026-03-01)",
+          "updatedDate": null
+        }
+      ],
+      "kind": "tasks",
+      "name": "Do Now",
+      "prose": [],
+      "range": {
+        "end": 1621,
+        "start": 248
+      },
+      "reports": []
+    },
+    {
+      "items": [
+        {
+          "addedDate": "2026-03-02",
+          "appCompleted": null,
+          "checked": false,
+          "id": "fced55720eb6",
+          "lead": "A heading tie-break over a two-topic rollup.",
+          "links": [
+            {
+              "kind": "wiki",
+              "target": "todo-list/Projects/Demo/Claimed-Twice"
+            }
+          ],
+          "project": "tag1",
+          "range": {
+            "end": 1775,
+            "start": 1659
+          },
+          "sectionName": "Tag1 (owed replies and decisions)",
+          "text": "* [ ] **A heading tie-break over a two-topic rollup.** [[todo-list/Projects/Demo/Claimed-Twice]] (Added 2026-03-02)",
+          "updatedDate": null
+        },
+        {
+          "addedDate": "2026-03-02",
+          "appCompleted": null,
+          "checked": false,
+          "id": "e6327255df0e",
+          "lead": "A heading never files an item that declared nothing.",
+          "links": [],
+          "project": "unfiled",
+          "range": {
+            "end": 1857,
+            "start": 1775
+          },
+          "sectionName": "Tag1 (owed replies and decisions)",
+          "text": "* [ ] **A heading never files an item that declared nothing.** (Added 2026-03-02)",
+          "updatedDate": null
+        },
+        {
+          "addedDate": "2026-03-02",
+          "appCompleted": null,
+          "checked": false,
+          "id": "6f6ef29f1bc2",
+          "lead": "A duplicate lead, first copy.",
+          "links": [
+            {
+              "kind": "wiki",
+              "target": "todo-list/Dashboard/Tag1"
+            }
+          ],
+          "project": "tag1",
+          "range": {
+            "end": 1945,
+            "start": 1857
+          },
+          "sectionName": "Tag1 (owed replies and decisions)",
+          "text": "* [ ] **A duplicate lead, first copy.** [[todo-list/Dashboard/Tag1]] (Added 2026-03-02)",
+          "updatedDate": null
+        },
+        {
+          "addedDate": "2026-03-02",
+          "appCompleted": null,
+          "checked": false,
+          "id": "6f6ef29f1bc2-2",
+          "lead": "A duplicate lead, first copy.",
+          "links": [
+            {
+              "kind": "wiki",
+              "target": "todo-list/Dashboard/Tag1"
+            }
+          ],
+          "project": "tag1",
+          "range": {
+            "end": 2033,
+            "start": 1945
+          },
+          "sectionName": "Tag1 (owed replies and decisions)",
+          "text": "* [ ] **A duplicate lead, first copy.** [[todo-list/Dashboard/Tag1]] (Added 2026-03-02)",
+          "updatedDate": null
+        }
+      ],
+      "kind": "tasks",
+      "name": "Tag1 (owed replies and decisions)",
+      "prose": [],
+      "range": {
+        "end": 2034,
+        "start": 1621
+      },
+      "reports": []
+    },
+    {
+      "items": [
+        {
+          "addedDate": "2026-03-02",
+          "appCompleted": null,
+          "checked": false,
+          "id": "7416a43ab9c7",
+          "lead": "A heading that names a candidate the links did not offer.",
+          "links": [
+            {
+              "kind": "wiki",
+              "target": "todo-list/Projects/Demo/Claimed-Once"
+            }
+          ],
+          "project": "tag1",
+          "range": {
+            "end": 2194,
+            "start": 2066
+          },
+          "sectionName": "Personal, family and travel",
+          "text": "* [ ] **A heading that names a candidate the links did not offer.** [[todo-list/Projects/Demo/Claimed-Once]] (Added 2026-03-02)",
+          "updatedDate": null
+        }
+      ],
+      "kind": "tasks",
+      "name": "Personal, family and travel",
+      "prose": [],
+      "range": {
+        "end": 2194,
+        "start": 2034
+      },
+      "reports": []
+    }
+  ],
+  "title": "Today: Tuesday, March 3, 2026"
+}
