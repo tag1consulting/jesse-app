@@ -15,6 +15,48 @@ CI both run it). See the "Versioning" section of `bridge/README.md`.
 
 ## [Unreleased]
 
+## [App 1.0 (96)] - 2026-08-10
+
+### Changed
+
+- **Discuss opens a conversation; it no longer fires a turn.** Tapping Discuss on a
+  Today item used to send `TodayDiscuss.prompt` on the spot, so the first thing that
+  happened was a minute or more of waiting for a turn the user had not asked a question
+  in yet. Backwards: there is nothing for the agent to do until the concern has been
+  stated. Discuss now opens a new thread, attaches the item (its raw markdown, its
+  links, and the frozen `TodayDiscuss` framing) as CONTEXT, focuses an empty composer,
+  and starts nothing. The first turn is the user's own send, and the attached context
+  goes out ahead of it, so the scope clauses that keep an item discussion from tripping
+  the morning routine are still what bound the turn.
+
+  Sending an empty composer is the explicit "just look at it": it sends the attached
+  context alone, which is byte for byte what the old tap-to-fire behavior sent. That is
+  the only path that runs a turn on no prose of the user's, and it still takes a
+  deliberate Send.
+
+  The seam is `RunCoordinator`'s attached-context map, spent by a thread's first send
+  (`TodayThreadContext.firstMessage` composes the two). Composing in the coordinator
+  rather than the composer means every send path honors it, and an empty composer with
+  a context attached is a real turn instead of a silently dropped one. No new thread
+  type: `TodayThreadOpener` grew `stage` (open, attach, fire nothing) beside `run`
+  (execute now), and a staged thread is deliberately not inserted into the store until
+  its first send, so an abandoned discussion leaves nothing behind and the Chats list's
+  `pruneEmpty` cannot delete a thread out from under an open sheet.
+
+  **Propagate is unchanged**: it is an explicit execute action ("I finished this, close
+  it at source"), so it still fires its Tell turn the moment it is tapped. Wiki chips
+  likewise still fire — "open this note" has an answer the agent can produce unprompted,
+  because it reads the file the app cannot.
+
+- **Today is the first tab, and the app opens on it.** The bar is now Today, Chats,
+  Health. The day's work is what the app is for, and a shell that opened on Chats made
+  the user's first act a tab switch. One edit, because the tab set is one `CaseIterable`
+  definition the body iterates: case order is bar order. The launch tab is
+  `RootTabView.defaultTab`, pinned by test to `Tab.allCases.first` so the leading tab
+  and the launch tab cannot drift apart. The badge still reads the same
+  `TodayDashboardModel` the screen does, and hiding the tab bar inside a conversation is
+  driven by the pushed detail's `hidesTabBar`, neither of which depends on tab order.
+
 ## [App 1.0 (95)] - 2026-08-10
 
 ### Added

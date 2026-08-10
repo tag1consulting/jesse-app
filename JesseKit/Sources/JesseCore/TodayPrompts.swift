@@ -47,6 +47,42 @@ public enum TodayDiscuss {
     }
 }
 
+/// How an ATTACHED context and the user's own first message become one turn.
+///
+/// A discussion does not fire when it is opened. Tapping Discuss used to send
+/// `TodayDiscuss.prompt` immediately, which made Jeremy wait out a full turn before
+/// he could type — backwards, because there is nothing for the agent to do until he
+/// has said what his concern is. So the prompt is HELD against the empty thread and
+/// travels with whatever he sends first.
+///
+/// Nothing about the framing is relaxed by that: the item markdown, its links and the
+/// negative-scope sentence are all still in the turn, still ahead of anything he
+/// typed. This is the composition rule the Mac and Watch Today tabs must use too — a
+/// second spelling of it on another platform is a second definition of what an
+/// item discussion is scoped to.
+public enum TodayThreadContext {
+    /// The label the typed message is filed under, so a multi-line message can never
+    /// be read as more instruction.
+    public nonisolated static let messageLabel = "Jeremy's message:"
+
+    /// Compose the held `context` with the user's first `typed` message.
+    ///
+    /// Context FIRST (scope before question), typed text last and labeled. Empty
+    /// typed text is the explicit "just look at it" send and yields the context
+    /// alone, byte for byte — never a dangling label with nothing under it.
+    public nonisolated static func firstMessage(context: String, typed: String) -> String {
+        let message = typed.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !message.isEmpty else { return context }
+        return """
+        \(context)
+
+        \(messageLabel)
+
+        \(message)
+        """
+    }
+}
+
 /// "I finished this — close it at source" — propagates one completed item out to
 /// the project file and Dashboard it came from.
 public enum TodayPropagate {

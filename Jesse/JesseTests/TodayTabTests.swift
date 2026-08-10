@@ -18,14 +18,22 @@ final class TodayTabTests: XCTestCase {
 
     // MARK: - The tab
 
-    /// The root tab bar has three tabs, and Today is one of them. The tab set is a
-    /// `CaseIterable` enum that `RootTabView` renders by iterating, so this is an
-    /// assertion about what the shell actually builds rather than about a constant
-    /// kept next to it.
-    func testTheRootTabBarHasAThirdTabForToday() {
-        XCTAssertEqual(RootTabView.Tab.allCases, [.chats, .health, .today])
+    /// The root tab bar has three tabs, Today FIRST. The tab set is a `CaseIterable`
+    /// enum that `RootTabView` renders by iterating, so this is an assertion about
+    /// what the shell actually builds rather than about a constant kept next to it —
+    /// including the order, which is the enum's case order and nothing else.
+    func testTheRootTabBarLeadsWithToday() {
+        XCTAssertEqual(RootTabView.Tab.allCases, [.today, .chats, .health])
         XCTAssertEqual(RootTabView.Tab.today.title, "Today")
         XCTAssertEqual(RootTabView.Tab.today.systemImage, "sun.max")
+    }
+
+    /// The app OPENS on Today: it is what the app is for. Asserted against the same
+    /// single definition the shell selects with, and pinned to the first case so the
+    /// bar's leading tab and the launch tab can't drift apart.
+    func testTheAppOpensOnToday() {
+        XCTAssertEqual(RootTabView.defaultTab, .today)
+        XCTAssertEqual(RootTabView.Tab.allCases.first, RootTabView.defaultTab)
     }
 
     /// Two tabs sharing a glyph is a UI bug that no other test would catch.
@@ -105,9 +113,14 @@ final class TodayTabTests: XCTestCase {
         XCTAssertNil(TodayTurn.openLink(origin))
     }
 
-    /// End to end through the real coordinator: a Discuss action creates a NEW
-    /// thread whose first message IS the frozen builder output, and sends it.
-    func testDiscussCreatesANewThreadWhoseFirstMessageIsTheFrozenPrompt() async throws {
+    // MARK: - Discuss opens; it does not fire
+
+    /// End to end through the real coordinator: Discuss OPENS a conversation and runs
+    /// NOTHING. There is nothing for the agent to do until Jeremy has said what he
+    /// wants, and firing on tap made him wait out a whole turn before he could type.
+    /// So the item rides along as ATTACHED CONTEXT on an empty thread, and no turn
+    /// exists until he sends one.
+    func testDiscussOpensAThreadAndFiresNoTurn() async throws {
         let context = try Self.makeContext()
         let fake = CapturingClient()
         let coordinator = RunCoordinator(
@@ -115,32 +128,128 @@ final class TodayTabTests: XCTestCase {
             makeClient: { _ in fake })
         let existing = try context.fetch(FetchDescriptor<JesseThread>()).count
 
-        let thread = TodayThreadOpener.open(.discuss(item: Self.openItem),
-                                            coordinator: coordinator, context: context)
+        let thread = TodayThreadOpener.stage(.discuss(item: Self.openItem), coordinator: coordinator)
 
-        XCTAssertEqual(try context.fetch(FetchDescriptor<JesseThread>()).count, existing + 1,
-                       "a NEW thread, never an append to whatever was last open")
         XCTAssertEqual(thread.mode, JesseMode.ask.rawValue)
-        let firstMessage = thread.turns.filter(\.isUser).sorted { $0.createdAt < $1.createdAt }.first
-        XCTAssertEqual(firstMessage?.text, TodayDiscuss.prompt(item: Self.openItem.text))
+        XCTAssertTrue(thread.turns.isEmpty, "an empty composer, not a sent prompt")
+        XCTAssertFalse(coordinator.isRunning(thread.id), "no turn was started on open")
+        XCTAssertEqual(coordinator.attachedContext(for: thread.id),
+                       TodayDiscuss.prompt(item: Self.openItem.text),
+                       "the item, its links and the frozen framing are held for the first send")
+        XCTAssertEqual(try context.fetch(FetchDescriptor<JesseThread>()).count, existing,
+                       "an abandoned discussion leaves no empty thread behind")
         await Self.settle()
-        XCTAssertEqual(fake.sent.first?.text, TodayDiscuss.prompt(item: Self.openItem.text))
-        XCTAssertEqual(fake.sent.first?.mode, .ask)
-        XCTAssertNil(fake.sent.first?.sessionId, "a fresh thread resumes nothing")
+        XCTAssertTrue(fake.sent.isEmpty, "nothing reached the bridge")
     }
 
-    func testPropagateSendsTheTellPromptOnItsOwnThread() async throws {
+    /// The first turn is Jeremy's own send, and the attached context goes WITH it —
+    /// the item markdown and the frozen anti-routing framing are still what scopes
+    /// the turn, so a discussion still can't trip the morning routine.
+    func testTheFirstSendCarriesTheItemContextAndTheFrozenFraming() async throws {
         let context = try Self.makeContext()
         let fake = CapturingClient()
         let coordinator = RunCoordinator(
             config: { JesseConfig(host: "studio", port: 8765, token: "tok") },
             makeClient: { _ in fake })
+        let thread = TodayThreadOpener.stage(.discuss(item: Self.openItem), coordinator: coordinator)
 
-        let thread = TodayThreadOpener.open(
+        coordinator.send(thread: thread, text: "Why has this been stuck for a week?",
+                         voice: false, context: context)
+        await Self.settle()
+
+        XCTAssertEqual(fake.sent.count, 1)
+        XCTAssertEqual(fake.sent.first?.text,
+                       TodayThreadContext.firstMessage(
+                           context: TodayDiscuss.prompt(item: Self.openItem.text),
+                           typed: "Why has this been stuck for a week?"))
+        XCTAssertEqual(fake.sent.first?.mode, .ask)
+        XCTAssertNil(fake.sent.first?.sessionId, "a fresh thread resumes nothing")
+        XCTAssertTrue(fake.sent.first?.text.contains(Self.openItem.text) ?? false)
+        XCTAssertTrue(fake.sent.first?.text.contains("Why has this been stuck for a week?") ?? false)
+        XCTAssertNil(coordinator.attachedContext(for: thread.id), "consumed by the first send")
+    }
+
+    /// The one path that runs a turn on no prose of Jeremy's: an EXPLICIT send with
+    /// an empty composer, which means "just look at it". It sends the attached
+    /// context alone — the same frozen prompt the old tap-to-fire behavior sent —
+    /// and only ever on his send, never on open.
+    func testAnEmptySendIsTheExplicitJustLookAtIt() async throws {
+        let context = try Self.makeContext()
+        let fake = CapturingClient()
+        let coordinator = RunCoordinator(
+            config: { JesseConfig(host: "studio", port: 8765, token: "tok") },
+            makeClient: { _ in fake })
+        let thread = TodayThreadOpener.stage(.discuss(item: Self.openItem), coordinator: coordinator)
+
+        coordinator.send(thread: thread, text: "", voice: false, context: context)
+        await Self.settle()
+
+        XCTAssertEqual(fake.sent.first?.text, TodayDiscuss.prompt(item: Self.openItem.text))
+        XCTAssertEqual(fake.sent.first?.mode, .ask)
+    }
+
+    /// An empty send on a thread with NO attached context is still nothing: the
+    /// composer's own guard is not what makes this safe, so the coordinator holds it.
+    func testAnEmptySendWithoutAttachedContextSendsNothing() async throws {
+        let context = try Self.makeContext()
+        let fake = CapturingClient()
+        let coordinator = RunCoordinator(
+            config: { JesseConfig(host: "studio", port: 8765, token: "tok") },
+            makeClient: { _ in fake })
+        let thread = JesseThread(mode: .ask)
+        context.insert(thread)
+
+        coordinator.send(thread: thread, text: "   ", voice: false, context: context)
+        await Self.settle()
+
+        XCTAssertTrue(fake.sent.isEmpty)
+    }
+
+    /// The context rides the FIRST message only. The thread resumes its session from
+    /// there, so re-sending the item on every follow-up would just re-paste what the
+    /// agent already has.
+    func testTheSecondMessageDoesNotRepeatTheContext() async throws {
+        let context = try Self.makeContext()
+        let fake = CapturingClient()
+        let coordinator = RunCoordinator(
+            config: { JesseConfig(host: "studio", port: 8765, token: "tok") },
+            makeClient: { _ in fake })
+        let thread = TodayThreadOpener.stage(.discuss(item: Self.openItem), coordinator: coordinator)
+
+        coordinator.send(thread: thread, text: "First", voice: false, context: context)
+        await Self.settle()
+        coordinator.send(thread: thread, text: "Second", voice: false, context: context)
+        await Self.settle()
+
+        XCTAssertEqual(fake.sent.count, 2)
+        XCTAssertEqual(fake.sent.last?.text, "Second")
+    }
+
+    // MARK: - Propagate still fires on tap
+
+    /// Propagate is an EXECUTE action — Jeremy has already done the thing and is
+    /// asking for it to be closed at source — so it fires its Tell turn the moment
+    /// it is tapped, exactly as before. Unchanged by the Discuss correction.
+    func testPropagateSendsTheTellPromptOnItsOwnThreadImmediately() async throws {
+        let context = try Self.makeContext()
+        let fake = CapturingClient()
+        let coordinator = RunCoordinator(
+            config: { JesseConfig(host: "studio", port: 8765, token: "tok") },
+            makeClient: { _ in fake })
+        let existing = try context.fetch(FetchDescriptor<JesseThread>()).count
+
+        let thread = TodayThreadOpener.run(
             .propagate(item: Self.doneItem, evidence: "shipped it"),
             coordinator: coordinator, context: context)
 
         XCTAssertEqual(thread.mode, JesseMode.tell.rawValue)
+        XCTAssertEqual(try context.fetch(FetchDescriptor<JesseThread>()).count, existing + 1,
+                       "a NEW thread, never an append to whatever was last open")
+        let firstMessage = thread.turns.filter(\.isUser).sorted { $0.createdAt < $1.createdAt }.first
+        XCTAssertEqual(firstMessage?.text,
+                       TodayPropagate.prompt(item: Self.doneItem.text, evidence: "shipped it"),
+                       "the turn is on the transcript the instant the button is tapped")
+        XCTAssertNil(coordinator.attachedContext(for: thread.id), "an execute action attaches nothing")
         await Self.settle()
         XCTAssertEqual(fake.sent.first?.text,
                        TodayPropagate.prompt(item: Self.doneItem.text, evidence: "shipped it"))

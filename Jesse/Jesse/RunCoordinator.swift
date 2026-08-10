@@ -77,6 +77,25 @@ final class RunCoordinator {
     private(set) var partialText: [UUID: String] = [:]
     // threadID → a coarse "what Jesse is doing" line from tool-use events.
     private(set) var activity: [UUID: String] = [:]
+    // threadID → context a screen ATTACHED to a thread it opened without firing a
+    // turn, consumed by (and only by) that thread's first send.
+    //
+    // The Today tab's Discuss is the case this exists for: it opens a conversation
+    // about one item with an EMPTY composer and starts nothing, because there is
+    // nothing for the agent to do until Jeremy has said what he wants. The frozen
+    // `TodayDiscuss.prompt` — the item's markdown, its links, and the sentence that
+    // keeps a discussion from tripping the morning routine — waits here and rides his
+    // first message (see `TodayThreadContext.firstMessage`). Scope is preserved
+    // whether he types a question or sends an empty composer to mean "just look at it".
+    //
+    // Deliberately OBSERVED (not `@ObservationIgnored`): the composer's send button
+    // is enabled on an empty input only while a context is attached, so the view has
+    // to re-evaluate when the first send consumes it.
+    //
+    // In memory only. An attachment describes a thread that has never been sent to,
+    // and such a thread is not persisted either — both die together with the process,
+    // and `TodayTabView` drops the attachment when its sheet is dismissed.
+    private var attachedContexts: [UUID: String] = [:]
 
     // Not observed by views — just lifecycle bookkeeping.
     @ObservationIgnored private var tasks: [UUID: Task<Void, Never>] = [:]
@@ -412,15 +431,47 @@ final class RunCoordinator {
     /// The current coarse activity line (e.g. "Reading the vault…"), if any.
     func activity(for threadID: UUID) -> String? { activity[threadID] }
 
+    // MARK: - Attached context
+
+    /// Hold `context` against a thread that was OPENED without firing a turn; the
+    /// thread's first send will carry it. Replaces any previous attachment.
+    func attach(context: String, to threadID: UUID) {
+        attachedContexts[threadID] = context
+    }
+
+    /// The context waiting on this thread's first send, if any. nil once consumed —
+    /// which is also what tells the composer that an empty send is no longer a turn.
+    func attachedContext(for threadID: UUID) -> String? { attachedContexts[threadID] }
+
+    /// Drop an attachment that will never be sent (its screen was dismissed). A no-op
+    /// once the first send has consumed it.
+    func clearAttachedContext(for threadID: UUID) {
+        attachedContexts[threadID] = nil
+    }
+
     // MARK: - Send
 
     /// Start a turn on `thread`. Appends the user message optimistically, then
     /// runs the bridge call on a per-thread task that survives navigation.
+    ///
+    /// If the thread carries an ATTACHED context (a screen opened it without firing —
+    /// today only the Today tab's Discuss), this send is the one that spends it: the
+    /// context is composed AHEAD of whatever the user typed and the attachment is
+    /// dropped, so it rides the first message and only the first. Composing here
+    /// rather than in the composer is deliberate — every send path (the button, a
+    /// voice send, a retry) then honors it, and an empty composer with a context
+    /// attached is a real turn ("just look at it") instead of a silently dropped one.
     func send(thread: JesseThread, text: String, voice: Bool, context: ModelContext,
               attachments: [JesseAttachment] = []) {
-        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty, !isRunning(thread.id) else { return }
         let threadID = thread.id
+        let attached = attachedContexts[threadID]
+        let trimmed = attached.map { TodayThreadContext.firstMessage(context: $0, typed: text) }
+            ?? text.trimmingCharacters(in: .whitespacesAndNewlines)
+        // The guards run on the COMPOSED text and before the attachment is spent, so a
+        // send refused because a turn is already running leaves the context attached
+        // for the send that does go through.
+        guard !trimmed.isEmpty, !isRunning(thread.id) else { return }
+        attachedContexts[threadID] = nil
         errors[threadID] = nil
         // A new turn is a "next turn" drain point for any meal writes that failed
         // earlier (device locked, transient HealthKit error) — retry them now.
