@@ -47,6 +47,20 @@ struct TodayTurn: Equatable {
         TodayTurn(mode: .tell, text: TodayPropagate.prompt(item: item.text, evidence: evidence))
     }
 
+    /// "Process the updates" — every item ticked today, closed at source in ONE turn.
+    ///
+    /// TELL, and the largest one this screen can send: it writes to each item's project
+    /// file, to the Dashboard, and to `Today.md` itself, from which the processed lines
+    /// are removed. Which is exactly why it is confirmed against a list of the actual
+    /// rows before it fires (`TodayProcessSheet`) and never on the toolbar tap.
+    ///
+    /// The RAW markdown of each item, like the two single-item prompts: the links are
+    /// how the agent finds each home and the `(Added …)` trailers are how it tells two
+    /// similarly-worded lines apart.
+    static func processUpdates(items: [TodayItem]) -> TodayTurn {
+        TodayTurn(mode: .tell, text: TodayProcessUpdates.prompt(items: items.map(\.text)))
+    }
+
     /// What a tapped link chip should do, when the answer is "a conversation".
     ///
     /// A URL is not one — it opens in the browser through the system's own handling,
@@ -108,5 +122,67 @@ enum TodayThreadOpener {
         let thread = JesseThread(mode: turn.mode)
         coordinator.attach(context: turn.text, to: thread.id)
         return thread
+    }
+}
+
+/// The Process-updates action, as a small piece of state: which turn is ours, and the
+/// refetch that has to follow it.
+///
+/// It exists because "fire and forget" is wrong for exactly this action. The turn
+/// REMOVES rows from `Today.md` and may add new ones from the Dashboard, so the screen
+/// the user is looking at is stale the moment it lands — and unlike a Propagate, which
+/// leaves its row checked and in place, there is no way to tell from the row itself
+/// that anything happened. So the run is remembered, and the day is refetched when it
+/// settles.
+///
+/// One at a time, by construction: `start` refuses while a run is outstanding. Two
+/// concurrent batches would be two turns rewriting one file with a stale idea of what
+/// the other removed, which is the whole reason this is a batch rather than n
+/// propagations.
+@MainActor
+@Observable
+final class TodayProcessRun {
+    // A @MainActor class's synthesized deinit is MainActor-isolated; releasing this off
+    // the main actor (a unit-test host does) would route through the isolated-deinit
+    // executor hop and abort. Same pattern as the JesseKit models.
+    nonisolated deinit {}
+
+    /// The thread the outstanding batch is running on, if any.
+    private(set) var threadID: UUID?
+
+    /// Whether our turn is still going, asked of the coordinator rather than tracked
+    /// separately — a second copy of "is it running" is a second thing to get wrong.
+    func isRunning(_ coordinator: RunCoordinator) -> Bool {
+        guard let threadID else { return false }
+        return coordinator.isRunning(threadID)
+    }
+
+    /// Fire the one combined turn on a fresh Tell thread. Nil when there is nothing to
+    /// process or a batch is already out.
+    @discardableResult
+    func start(items: [TodayItem], coordinator: RunCoordinator,
+               context: ModelContext) -> JesseThread? {
+        guard !items.isEmpty, threadID == nil else { return nil }
+        let thread = TodayThreadOpener.run(.processUpdates(items: items),
+                                           coordinator: coordinator, context: context)
+        threadID = thread.id
+        return thread
+    }
+
+    /// A turn settled. If it was OURS, forget it and refetch the day.
+    ///
+    /// Unconditionally (`refresh`, not `load`): the turn rewrote the file, so an
+    /// `If-None-Match` would be asking a question we already know the answer to, and a
+    /// `304` from a bridge that had not finished flushing would leave the removed rows
+    /// on screen.
+    ///
+    /// Returns whether it handled the settlement, so the caller knows not to also run
+    /// its own generic refetch for the same event.
+    @discardableResult
+    func settled(coordinator: RunCoordinator, day: TodayDashboardModel) async -> Bool {
+        guard let id = threadID, !coordinator.isRunning(id) else { return false }
+        threadID = nil
+        await day.refresh()
+        return true
     }
 }

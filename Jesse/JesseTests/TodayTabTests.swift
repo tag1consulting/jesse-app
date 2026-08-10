@@ -256,6 +256,89 @@ final class TodayTabTests: XCTestCase {
         XCTAssertEqual(fake.sent.first?.mode, .tell)
     }
 
+    // MARK: - Process updates
+
+    /// The batch prompt is the frozen one, over the RAW markdown of every checked item,
+    /// as a TELL — it writes to project files, the Dashboard and the day file.
+    func testProcessUpdatesIsTheFrozenBatchTellPrompt() {
+        let turn = TodayTurn.processUpdates(items: [Self.doneItem, Self.openItem])
+
+        XCTAssertEqual(turn.mode, .tell)
+        XCTAssertEqual(turn.text,
+                       TodayProcessUpdates.prompt(items: [Self.doneItem.text, Self.openItem.text]))
+        XCTAssertTrue(turn.text.contains(Self.doneItem.text), "raw markdown, not the display lead")
+    }
+
+    /// **The whole action, end to end.** Confirming fires EXACTLY ONE turn carrying the
+    /// frozen prompt over exactly the checked items, and when that turn settles the day
+    /// is re-read — because the batch removed those rows from `Today.md` and may have
+    /// added others, so the screen (and the tab badge) is stale until it is.
+    ///
+    /// One turn is the load-bearing half. n propagations would be n turns racing to
+    /// rewrite one file, each with a stale idea of what the others removed.
+    func testProcessUpdatesFiresOneTurnWithTheFrozenPromptAndRefetchesWhenItSettles() async throws {
+        let context = try Self.makeContext()
+        let fake = CapturingClient()
+        let coordinator = RunCoordinator(
+            config: { JesseConfig(host: "studio", port: 8765, token: "tok") },
+            makeClient: { _ in fake })
+        let stub = StubTodayClient(day: Self.day())
+        let day = TodayDashboardModel(makeClient: { stub })
+        await day.load()
+
+        let items = day.itemsToProcess
+        XCTAssertEqual(items.map(\.id), ["item-done"], "only what is actually ticked")
+
+        let run = TodayProcessRun()
+        let thread = run.start(items: items, coordinator: coordinator, context: context)
+
+        XCTAssertEqual(thread?.mode, JesseMode.tell.rawValue)
+        let userTurns = thread?.turns.filter(\.isUser) ?? []
+        XCTAssertEqual(userTurns.count, 1, "one turn, not one per item")
+        XCTAssertEqual(userTurns.first?.text,
+                       TodayProcessUpdates.prompt(items: items.map(\.text)))
+        await Self.settle()
+        XCTAssertEqual(fake.sent.count, 1, "exactly one turn reached the bridge")
+        XCTAssertEqual(fake.sent.first?.mode, .tell)
+        XCTAssertNil(fake.sent.first?.sessionId, "a fresh thread resumes nothing")
+
+        let before = stub.fetchCount
+        let handled = await run.settled(coordinator: coordinator, day: day)
+
+        XCTAssertTrue(handled, "the settled turn was ours")
+        XCTAssertEqual(stub.fetchCount, before + 1, "the day is re-read after the batch")
+        XCTAssertNil(run.threadID, "and the run is finished, so the next one can start")
+    }
+
+    /// One batch at a time. Two concurrent ones would be two turns rewriting one file,
+    /// each with a stale idea of what the other removed.
+    func testASecondBatchIsRefusedWhileOneIsOutstanding() async throws {
+        let context = try Self.makeContext()
+        let coordinator = RunCoordinator(
+            config: { JesseConfig(host: "studio", port: 8765, token: "tok") },
+            makeClient: { _ in CapturingClient() })
+        let run = TodayProcessRun()
+
+        XCTAssertNotNil(run.start(items: [Self.doneItem], coordinator: coordinator,
+                                  context: context))
+        XCTAssertNil(run.start(items: [Self.doneItem], coordinator: coordinator,
+                               context: context))
+        await Self.settle()
+    }
+
+    /// Nothing ticked is nothing to do — never an empty turn asking the agent to
+    /// process a list with no items in it.
+    func testAnEmptyBatchFiresNothing() throws {
+        let context = try Self.makeContext()
+        let coordinator = RunCoordinator(
+            config: { JesseConfig(host: "studio", port: 8765, token: "tok") },
+            makeClient: { _ in CapturingClient() })
+        let run = TodayProcessRun()
+
+        XCTAssertNil(run.start(items: [], coordinator: coordinator, context: context))
+        XCTAssertNil(run.threadID)
+    }
+
     // MARK: - Offline
 
     /// The tab hands its own reachability probe to the model, so the day goes
@@ -358,13 +441,17 @@ final class TodayTabTests: XCTestCase {
     /// change, so "nothing was sent" is assertable.
     private final class StubTodayClient: TodayProviding, @unchecked Sendable {
         let day: TodaySnapshot
+        private(set) var fetchCount = 0
         private(set) var checkCount = 0
         private(set) var moveCount = 0
         private(set) var glanceCount = 0
 
         init(day: TodaySnapshot) { self.day = day }
 
-        func getToday(ifNoneMatch: String?) async throws -> TodayFetchResult { .snapshot(day) }
+        func getToday(ifNoneMatch: String?) async throws -> TodayFetchResult {
+            fetchCount += 1
+            return .snapshot(day)
+        }
         func checkItem(id: String, checked: Bool, evidence: String?, at: Date,
                        ifMatch: String) async throws -> TodayMutationResult {
             checkCount += 1

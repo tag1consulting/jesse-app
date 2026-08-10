@@ -39,6 +39,10 @@ final class TodayDashboardModelTests: XCTestCase {
         private(set) var lastIfMatch: String?
         private(set) var lastCheck: (id: String, checked: Bool, evidence: String?)?
         private(set) var lastMove: (id: String, op: TodayMoveOp)?
+        /// EVERY move, in order. One drag can be several ops (a row dragged three
+        /// places up is three `up`s), and "which ops, in what order, under which id"
+        /// is the whole assertion for a drag — `lastMove` cannot express it.
+        private(set) var moveLog: [(id: String, op: TodayMoveOp)] = []
         private(set) var lastGlanceId: String?
         private(set) var lastAt: Date?
 
@@ -67,6 +71,7 @@ final class TodayDashboardModelTests: XCTestCase {
         func moveItem(id: String, op: TodayMoveOp, at: Date,
                       ifMatch: String) async throws -> TodayMutationResult {
             lastMove = (id, op)
+            moveLog.append((id, op))
             lastIfMatch = ifMatch
             lastAt = at
             let out = outcome(moves, moveCount)
@@ -359,6 +364,27 @@ final class TodayDashboardModelTests: XCTestCase {
         XCTAssertTrue(m.overlay.removed.contains(Fixt.ada))
         XCTAssertFalse(m.isPending(Fixt.ada), "and nothing optimistic survives it")
         XCTAssertEqual(fake.fetchCount, 2, "it refetched the rest of the day")
+        XCTAssertFalse(m.isOffline, "a 410 is an answer, not a failure")
+    }
+
+    /// The SAME `410`, learned somewhere else. The detail read is keyed by the same item
+    /// id, so it finds out the row has left the file while the list is still drawing it —
+    /// and the list must not need a failed tap of its own to catch up. One method, so the
+    /// two ways of learning it cannot diverge.
+    func testAnItemThatVanishedElsewhereIsRemovedSaidOutLoudAndRefetched() async {
+        let fake = FakeClient()
+        fake.fetches = [.snapshot(Fixt.snapshot(etag: "\"tag-1\""))]
+        let m = model(fake)
+        await m.load()
+        let before = m.snapshot?.allItems.count ?? 0
+
+        await m.itemVanished(id: Fixt.ada)
+
+        XCTAssertNil(m.snapshot?.item(id: Fixt.ada))
+        XCTAssertEqual(m.snapshot?.allItems.count, before - 1)
+        XCTAssertEqual(m.notice, TodayDashboardModel.itemGoneNotice,
+                       "a row that disappears under the user is worth one sentence")
+        XCTAssertEqual(fake.fetchCount, 2, "and the rest of the day is re-read")
         XCTAssertFalse(m.isOffline, "a 410 is an answer, not a failure")
     }
 

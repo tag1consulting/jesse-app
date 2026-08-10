@@ -110,3 +110,44 @@ public enum TodayPropagate {
         """
     }
 }
+
+/// **"Process updates"** — every item ticked today, closed at source in ONE turn, and
+/// the day file tidied behind them.
+///
+/// The batch peer of `TodayPropagate`, and deliberately a different prompt rather than
+/// that one sent n times. Three reasons, all of them about what the vault ends up
+/// looking like:
+///
+///   1. **One turn, one rewrite.** `Today.md` is a single file. Firing n propagations
+///      means n turns racing to rewrite it, each with a stale idea of what the others
+///      removed — the ETag path protects the APP's writes, not the agent's.
+///   2. **The refill is a whole-file judgement.** "Top the day back up from the
+///      Dashboard if it is now short" cannot be decided one item at a time; it is a
+///      claim about the day that is only true once every closure has landed.
+///   3. **Removal, not filing.** A single propagation keeps its item checked and moves
+///      it to Done, because the user is still looking at that row. A batch is the end
+///      of the day's bookkeeping, so the lines leave.
+///
+/// The negative clauses are carried over verbatim in spirit from `TodayPropagate` and
+/// matter MORE here, because the blast radius is every ticked line at once: the list
+/// below is exhaustive, roll-up lines are never bulk closes, and no other routine runs.
+public enum TodayProcessUpdates {
+    /// Build the batch prompt over the RAW markdown of every checked item.
+    ///
+    /// Raw for the same reason a single propagation is raw: the links are how the agent
+    /// finds each item's home, and the `(Added …)` trailers are how it tells which of
+    /// two similarly-worded lines it is looking at. The items are numbered so the
+    /// instruction can say "the items listed above" and mean a countable set.
+    public nonisolated static func prompt(items: [String]) -> String {
+        let listed = items.enumerated()
+            .map { "\($0.offset + 1). \($0.element)" }
+            .joined(separator: "\n\n")
+        return """
+        Jeremy checked these \(items.count) Today.md item\(items.count == 1 ? "" : "s") off in the Jesse App and wants them all processed now:
+
+        \(listed)
+
+        For each item listed above, in order: write the completion context and its evidence into the linked project file as (completed YYYY-MM-DD: <evidence>), and close or remove the matching Dashboard entry. Then remove those items from Today.md entirely, and if that leaves the day short, refill it from the Dashboard the way start of day would, adding the new items at the bottom. Scope: exactly the items listed above and nothing else. Never treat a roll-up line that summarizes many tasks as a bulk close. Do not run start of day, scanners, currency, or cheatsheets, and do not rebuild the rest of Today.md.
+        """
+    }
+}
