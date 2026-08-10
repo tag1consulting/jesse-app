@@ -83,6 +83,15 @@ pub enum SpliceError {
     NoDoNowSection,
     /// The destination section named by a journaled move is gone.
     UnknownSection,
+    /// `to_section` naming a section this day file does not have. `404`.
+    ///
+    /// Deliberately NOT [`SpliceError::UnknownSection`], which is the same shape
+    /// of problem at a different moment: that one is a JOURNALED move whose
+    /// destination vanished between the tap and the replay, which the client
+    /// cannot do anything about and which is therefore a conflict. This one is a
+    /// request naming a section that is not in the document the client just
+    /// read, and the useful client response is to refetch and pick again.
+    DestinationSectionNotFound,
 }
 
 impl SpliceError {
@@ -95,6 +104,7 @@ impl SpliceError {
             SpliceError::LeadBlockImmutable
             | SpliceError::NoDoNowSection
             | SpliceError::UnknownSection => StatusCode::CONFLICT,
+            SpliceError::DestinationSectionNotFound => StatusCode::NOT_FOUND,
         }
     }
 
@@ -112,6 +122,9 @@ impl SpliceError {
             }
             SpliceError::NoDoNowSection => "this day file has no \"Do Now\" section",
             SpliceError::UnknownSection => "that section is no longer in the day file",
+            SpliceError::DestinationSectionNotFound => {
+                "no section by that name in today's day file — refetch GET /jesse/today"
+            }
         }
     }
 }
@@ -123,29 +136,75 @@ impl From<SpliceError> for ApiError {
 }
 
 /// The move operations the app may request.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// Two of them cross a section boundary, and they are deliberately different
+/// shapes. `ToDoNow` is a SHORTHAND: it names no destination and resolves to the
+/// first heading that starts with `Do Now`, because "put this at the front of the
+/// day" is one gesture the client should not have to spell out. `ToSection`
+/// NAMES its destination, because there is nothing for a general demotion to
+/// resolve against — an item id is a content hash and carries no memory of where
+/// it was, so there is no "back where it came from" to send it to. Asking the
+/// user which section is the only honest answer to that.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MoveOp {
     /// Above every other item of the item's own section.
     TopOfSection,
     /// Above every other item of the first section named `Do Now…`.
     ToDoNow,
+    /// Above every other item of the section with EXACTLY this name.
+    ToSection(String),
     /// Swap with the item above it, within its section.
     Up,
     /// Swap with the item below it, within its section.
     Down,
 }
 
+/// Why a move body could not be read as an op. Each maps to one `400` message
+/// that names what the client got wrong, rather than a single "bad op" for two
+/// different mistakes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MoveParseError {
+    /// `op` is not one of the five spellings.
+    UnknownOp,
+    /// `op` is `to_section`, which has no meaning without a destination.
+    MissingSection,
+}
+
+impl MoveParseError {
+    pub fn message(&self) -> &'static str {
+        match self {
+            MoveParseError::UnknownOp => {
+                "`op` must be one of top_of_section, to_do_now, to_section, up, down"
+            }
+            MoveParseError::MissingSection => {
+                "`op` of to_section requires a non-empty `section` naming the destination"
+            }
+        }
+    }
+}
+
+impl From<MoveParseError> for ApiError {
+    fn from(e: MoveParseError) -> ApiError {
+        (StatusCode::BAD_REQUEST, e.message().to_string())
+    }
+}
+
 impl MoveOp {
-    /// Parse the wire spelling. Deliberately hand-rolled rather than derived, so
-    /// an unknown op is a `400` naming the four valid ops instead of serde's
+    /// Parse the wire spelling, with the destination the body carried alongside
+    /// it. Deliberately hand-rolled rather than derived, so a bad request is a
+    /// `400` that names the valid ops (or the missing field) instead of serde's
     /// generic body-rejection.
-    pub fn parse(s: &str) -> Option<MoveOp> {
+    pub fn parse(s: &str, section: Option<&str>) -> Result<MoveOp, MoveParseError> {
         match s {
-            "top_of_section" => Some(MoveOp::TopOfSection),
-            "to_do_now" => Some(MoveOp::ToDoNow),
-            "up" => Some(MoveOp::Up),
-            "down" => Some(MoveOp::Down),
-            _ => None,
+            "top_of_section" => Ok(MoveOp::TopOfSection),
+            "to_do_now" => Ok(MoveOp::ToDoNow),
+            "to_section" => match section.map(str::trim).filter(|s| !s.is_empty()) {
+                Some(name) => Ok(MoveOp::ToSection(name.to_string())),
+                None => Err(MoveParseError::MissingSection),
+            },
+            "up" => Ok(MoveOp::Up),
+            "down" => Ok(MoveOp::Down),
+            _ => Err(MoveParseError::UnknownOp),
         }
     }
 }
@@ -476,7 +535,7 @@ fn splice_block(src: &str, start: usize, end: usize, insert_at: usize) -> String
 pub fn resolve_landing(
     snapshot: &TodaySnapshot,
     located: &Located,
-    op: MoveOp,
+    op: &MoveOp,
 ) -> Result<Option<(String, Landing)>, SpliceError> {
     let section = located.section.ok_or(SpliceError::LeadBlockImmutable)?;
     let resolved = match op {
@@ -486,6 +545,27 @@ pub fn resolve_landing(
                 .iter()
                 .find(|s| s.name.starts_with("Do Now"))
                 .ok_or(SpliceError::NoDoNowSection)?;
+            (dest.name.clone(), top_landing(dest, located.item))
+        }
+        MoveOp::ToSection(name) => {
+            // An EXACT name, not a prefix. `to_do_now` matches by prefix because
+            // it is shorthand for a family of headings the client never names;
+            // this op is handed a name the client read out of the snapshot
+            // itself, and a prefix match would let "Do Now" silently claim a
+            // request meant for "Do Now (carried, owed replies and decisions)".
+            let dest = snapshot
+                .sections
+                .iter()
+                .find(|s| s.name == *name)
+                .ok_or(SpliceError::DestinationSectionNotFound)?;
+            // Already there. Handled before the landing is computed rather than
+            // left to the generic no-op check below, because `to_section` names a
+            // DESTINATION and not a position: an item already in that section has
+            // nothing to do, whereas the generic check would read the request as
+            // "move to the top" and write.
+            if dest.name == section.name {
+                return Ok(None);
+            }
             (dest.name.clone(), top_landing(dest, located.item))
         }
         MoveOp::TopOfSection => (section.name.clone(), top_landing(section, located.item)),
@@ -600,8 +680,27 @@ pub struct CheckBody {
 pub struct MoveBody {
     #[serde(default)]
     pub op: String,
+    /// The destination heading, for `op: "to_section"` and for nothing else.
+    /// Optional on the wire so every existing op's body is unchanged, and
+    /// rejected as a `400` when the op that needs it arrives without it.
+    #[serde(default)]
+    pub section: Option<String>,
     #[serde(default)]
     pub at: String,
+}
+
+/// `POST /jesse/today/items/{id}/defer` — postpone one item for the day.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeferBody {
+    #[serde(default)]
+    pub deferred: bool,
+    /// The client's millisecond clock, which is what resolves two devices
+    /// postponing the same row (last writer wins). Not a stamp for the vault —
+    /// nothing about this reaches `Today.md` — so unlike `check` and `move` it is
+    /// a number rather than an ISO instant, exactly as `glance` is.
+    #[serde(default)]
+    pub at_ms: u64,
 }
 
 /// `POST /jesse/today/glance` — mark one report row seen.
@@ -866,10 +965,7 @@ pub async fn jesse_today_move(
             "rate limit exceeded".to_string(),
         ));
     }
-    let op = MoveOp::parse(body.op.trim()).ok_or((
-        StatusCode::BAD_REQUEST,
-        "`op` must be one of top_of_section, to_do_now, up, down".to_string(),
-    ))?;
+    let op = MoveOp::parse(body.op.trim(), body.section.as_deref())?;
     if stamp_from_iso(&body.at).is_none() {
         return Err((
             StatusCode::BAD_REQUEST,
@@ -878,7 +974,7 @@ pub async fn jesse_today_move(
     }
     let at = body.at.clone();
     mutate(&st, &headers, &id, &at, move |snapshot, located| {
-        let resolved = resolve_landing(snapshot, located, op)?;
+        let resolved = resolve_landing(snapshot, located, &op)?;
         Ok(resolved.map(|(to_section, landing)| Effect::Move {
             to_section,
             landing,
@@ -923,6 +1019,76 @@ pub async fn jesse_today_glance(
         .unwrap_or_else(|| date_from_ms(body.glanced_at));
     GlanceStore::record(st.cfg.state_dir.as_deref(), &date, id, body.glanced_at);
     GlanceStore::load(st.cfg.state_dir.as_deref()).merge_into(&mut snapshot);
+    Ok(mutation_response(&snapshot, false))
+}
+
+/// `POST /jesse/today/items/{id}/defer` — postpone one item for the day, or
+/// bring it back.
+///
+/// **This endpoint writes no markdown at all**, and that is the design rather
+/// than an implementation detail. Postponement is a claim about TODAY, not about
+/// the task: nothing about the item changes, so nothing about the item is
+/// written. It is recorded in [`DeferStore`], whose keys are day-scoped and
+/// therefore expire on their own — which is what brings the item back tomorrow
+/// with no user action and no unwinding write. Writing it into `Today.md`
+/// instead would put UI state in front of the morning rebuild and in front of
+/// every agent that reads the day.
+///
+/// Consequences of that, each deliberate: it takes NO day-file write lock (there
+/// is nothing to serialize against), it journals nothing (there is no turn that
+/// could clobber it), and a lead item may be postponed even though it can never
+/// be MOVED — the lead item counts toward the app's badge, so a badge that
+/// cannot be cleared without lying about the work being done is exactly the
+/// problem this endpoint exists to fix.
+///
+/// `If-Match` is still required, like every other mutation: the answer is a full
+/// snapshot carrying a fresh etag, and a client editing from a stale view should
+/// refetch rather than act on a day it is not looking at.
+pub async fn jesse_today_defer(
+    State(st): State<AppState>,
+    UrlPath(id): UrlPath<String>,
+    headers: HeaderMap,
+    Json(body): Json<DeferBody>,
+) -> Result<Response, ApiError> {
+    check_auth(&headers, &st.cfg.token)?;
+    if !st.limiter.allow() {
+        return Err((
+            StatusCode::TOO_MANY_REQUESTS,
+            "rate limit exceeded".to_string(),
+        ));
+    }
+    let if_match = required_if_match(&headers)?;
+    let (_, mut snapshot) = build_snapshot(&st.cfg);
+    if !if_match_matches(&if_match, &snapshot_etag(&snapshot)) {
+        return Err((
+            StatusCode::PRECONDITION_FAILED,
+            "the day file changed since you read it — refetch GET /jesse/today".to_string(),
+        ));
+    }
+    // NOT_FOUND rather than the GONE the file mutations answer with. Those are
+    // saying "the item left the document, throw the row away"; this is saying
+    // "there is no such id in the day you are asking me about", which is the
+    // ordinary meaning of a path that addresses nothing.
+    if locate_by_id(&snapshot, &id).is_none() {
+        return Err((
+            StatusCode::NOT_FOUND,
+            "no item with that id in today's day file — refetch GET /jesse/today".to_string(),
+        ));
+    }
+    // The snapshot's own date scopes the key, so yesterday's postponement never
+    // silences today's re-emitted row.
+    let date = snapshot
+        .date
+        .clone()
+        .unwrap_or_else(|| date_from_ms(body.at_ms));
+    DeferStore::record(
+        st.cfg.state_dir.as_deref(),
+        &date,
+        &id,
+        body.deferred,
+        body.at_ms,
+    );
+    DeferStore::load(st.cfg.state_dir.as_deref()).merge_into(&mut snapshot);
     Ok(mutation_response(&snapshot, false))
 }
 
@@ -1167,7 +1333,7 @@ mod tests {
     // ---- Moves -------------------------------------------------------------
 
     /// Apply a move the way the endpoint does: resolve the op, then splice.
-    fn do_move(src: &str, lead_starts: &str, op: MoveOp) -> Result<String, SpliceError> {
+    fn do_move(src: &str, lead_starts: &str, op: &MoveOp) -> Result<String, SpliceError> {
         let snapshot = parse_today(src);
         let item = item_named(&snapshot, lead_starts);
         let located = locate_by_id(&snapshot, &item.id).unwrap();
@@ -1199,7 +1365,7 @@ mod tests {
     #[test]
     fn up_swaps_an_item_with_the_one_above_it() {
         let before = leads(FULL, "Do Now");
-        let out = do_move(FULL, "Plain unbolded item", MoveOp::Up).unwrap();
+        let out = do_move(FULL, "Plain unbolded item", &MoveOp::Up).unwrap();
         let after = leads(&out, "Do Now");
         assert_eq!(after[1], before[2], "the item rose one row");
         assert_eq!(after[2], before[1], "and its neighbour fell one");
@@ -1210,7 +1376,7 @@ mod tests {
     #[test]
     fn down_swaps_an_item_with_the_one_below_it() {
         let before = leads(FULL, "Do Now");
-        let out = do_move(FULL, "Reply to Ada", MoveOp::Down).unwrap();
+        let out = do_move(FULL, "Reply to Ada", &MoveOp::Down).unwrap();
         let after = leads(&out, "Do Now");
         assert_eq!(after[1], before[2]);
         assert_eq!(after[2], before[1]);
@@ -1220,7 +1386,7 @@ mod tests {
     #[test]
     fn up_on_the_first_item_and_down_on_the_last_are_no_ops() {
         assert_eq!(
-            do_move(FULL, "Order the replacement", MoveOp::Up).unwrap(),
+            do_move(FULL, "Order the replacement", &MoveOp::Up).unwrap(),
             FULL
         );
         // The last Do Now item is the empty checkbox.
@@ -1235,14 +1401,14 @@ mod tests {
             .unwrap();
         let located = locate_by_id(&snapshot, &last.id).unwrap();
         assert_eq!(
-            resolve_landing(&snapshot, &located, MoveOp::Down).unwrap(),
+            resolve_landing(&snapshot, &located, &MoveOp::Down).unwrap(),
             None
         );
     }
 
     #[test]
     fn top_of_section_lifts_an_item_above_every_sibling() {
-        let out = do_move(FULL, "Plain unbolded item", MoveOp::TopOfSection).unwrap();
+        let out = do_move(FULL, "Plain unbolded item", &MoveOp::TopOfSection).unwrap();
         let after = leads(&out, "Do Now");
         assert!(after[0].starts_with("Plain unbolded item"));
         assert_eq!(after.len(), 4, "and the section still has all four");
@@ -1252,14 +1418,14 @@ mod tests {
     #[test]
     fn top_of_section_on_something_already_at_the_top_is_a_no_op() {
         assert_eq!(
-            do_move(FULL, "Order the replacement", MoveOp::TopOfSection).unwrap(),
+            do_move(FULL, "Order the replacement", &MoveOp::TopOfSection).unwrap(),
             FULL
         );
     }
 
     #[test]
     fn to_do_now_moves_an_item_across_sections_with_its_continuations() {
-        let out = do_move(FULL, "Collect the glaze order", MoveOp::ToDoNow).unwrap();
+        let out = do_move(FULL, "Collect the glaze order", &MoveOp::ToDoNow).unwrap();
         let do_now = leads(&out, "Do Now");
         assert!(do_now[0].starts_with("Collect the glaze order"));
         assert_eq!(
@@ -1284,10 +1450,146 @@ mod tests {
     fn to_do_now_is_409_when_there_is_no_do_now_section() {
         let doc = "# Today: 2026-03-03\n\n## Errands\n\n* [ ] A thing.\n";
         assert_eq!(
-            do_move(doc, "A thing.", MoveOp::ToDoNow),
+            do_move(doc, "A thing.", &MoveOp::ToDoNow),
             Err(SpliceError::NoDoNowSection)
         );
         assert_eq!(SpliceError::NoDoNowSection.status(), StatusCode::CONFLICT);
+    }
+
+    // ---- to_section: the inverse of the one-way trip into Do Now -----------
+
+    #[test]
+    fn to_section_moves_an_item_out_of_do_now_and_lands_it_at_the_top() {
+        let out = do_move(
+            FULL,
+            "Reply to Ada",
+            &MoveOp::ToSection("Errands".to_string()),
+        )
+        .unwrap();
+        let errands = leads(&out, "Errands");
+        assert!(
+            errands[0].starts_with("Reply to Ada"),
+            "the landing is the TOP of the destination: a demotion to the bottom of a \
+             long section is a demotion to invisibility, got {errands:?}"
+        );
+        assert_eq!(errands.len(), 3);
+        assert_eq!(
+            leads(&out, "Do Now").len(),
+            3,
+            "and it left the section it came from"
+        );
+        assert_eq!(out.len(), FULL.len(), "every other byte is carried across");
+    }
+
+    #[test]
+    fn to_section_carries_an_items_continuation_lines_with_it() {
+        let out = do_move(
+            FULL,
+            "Collect the glaze order",
+            &MoveOp::ToSection("Health".to_string()),
+        )
+        .unwrap();
+        let reparsed = parse_today(&out);
+        let moved = item_named(&reparsed, "Collect the glaze order");
+        assert_eq!(moved.section_name, "Health");
+        assert!(
+            moved.text.contains("app-completed"),
+            "the whole block travels, exactly as to_do_now moves it: {:?}",
+            moved.text
+        );
+    }
+
+    #[test]
+    fn to_section_into_the_items_own_section_writes_nothing() {
+        // Not "move it to the top of where it already is" — `to_section` names a
+        // DESTINATION, and the item is already at it.
+        assert_eq!(
+            do_move(
+                FULL,
+                "Reply to Ada",
+                &MoveOp::ToSection("Do Now".to_string())
+            )
+            .unwrap(),
+            FULL
+        );
+    }
+
+    #[test]
+    fn to_section_naming_a_section_the_day_does_not_have_is_404() {
+        assert_eq!(
+            do_move(
+                FULL,
+                "Reply to Ada",
+                &MoveOp::ToSection("Someday Maybe".to_string())
+            ),
+            Err(SpliceError::DestinationSectionNotFound)
+        );
+        assert_eq!(
+            SpliceError::DestinationSectionNotFound.status(),
+            StatusCode::NOT_FOUND
+        );
+    }
+
+    #[test]
+    fn to_section_matches_the_exact_heading_while_to_do_now_matches_the_prefix() {
+        // A day carrying BOTH shapes of Do Now heading, which this vault's day
+        // file does. A prefix match here would let the first heading silently
+        // claim a request meant for the second, and the two are indistinguishable
+        // to a user reading a menu that shortened them.
+        let doc = "# Today: 2026-03-03\n\n\
+## Do Now\n\n\
+* [ ] First thing.\n\n\
+## Do Now (carried, owed replies and decisions)\n\n\
+* [ ] Carried thing.\n\n\
+## Errands\n\n\
+* [ ] An errand.\n";
+        let out = do_move(
+            doc,
+            "An errand.",
+            &MoveOp::ToSection("Do Now (carried, owed replies and decisions)".to_string()),
+        )
+        .unwrap();
+        assert_eq!(
+            leads(&out, "Do Now (carried, owed replies and decisions)"),
+            vec!["An errand.", "Carried thing."],
+            "the exact name wins"
+        );
+        assert_eq!(leads(&out, "Do Now"), vec!["First thing."]);
+
+        let promoted = do_move(doc, "An errand.", &MoveOp::ToDoNow).unwrap();
+        assert_eq!(
+            leads(&promoted, "Do Now"),
+            vec!["An errand.", "First thing."],
+            "and the shorthand still resolves to the FIRST Do Now"
+        );
+    }
+
+    #[test]
+    fn to_section_without_a_destination_is_a_400_that_names_the_field() {
+        assert_eq!(
+            MoveOp::parse("to_section", None),
+            Err(MoveParseError::MissingSection)
+        );
+        assert_eq!(
+            MoveOp::parse("to_section", Some("   ")),
+            Err(MoveParseError::MissingSection)
+        );
+        assert!(MoveParseError::MissingSection.message().contains("section"));
+        assert_eq!(
+            ApiError::from(MoveParseError::MissingSection).0,
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            MoveOp::parse("sideways", None),
+            Err(MoveParseError::UnknownOp)
+        );
+        assert_eq!(
+            MoveOp::parse("to_section", Some(" Errands ")),
+            Ok(MoveOp::ToSection("Errands".to_string())),
+            "a destination is trimmed, because a heading never has edge whitespace"
+        );
+        // The `section` field is ignored by every op that does not name one.
+        assert_eq!(MoveOp::parse("up", Some("Errands")), Ok(MoveOp::Up));
     }
 
     #[test]
@@ -1297,9 +1599,10 @@ mod tests {
             MoveOp::Down,
             MoveOp::TopOfSection,
             MoveOp::ToDoNow,
+            MoveOp::ToSection("Errands".to_string()),
         ] {
             assert_eq!(
-                do_move(FULL, "TOP PRIORITY", op),
+                do_move(FULL, "TOP PRIORITY", &op),
                 Err(SpliceError::LeadBlockImmutable),
                 "the lead block is untouchable, including by {op:?}"
             );
@@ -1324,8 +1627,10 @@ mod tests {
                 MoveOp::Down,
                 MoveOp::TopOfSection,
                 MoveOp::ToDoNow,
+                MoveOp::ToSection("Do Now".to_string()),
+                MoveOp::ToSection("Errands".to_string()),
             ] {
-                let Ok(out) = do_move(FULL, lead, op) else {
+                let Ok(out) = do_move(FULL, lead, &op) else {
                     continue;
                 };
                 let head = &out[..first_heading];
@@ -1345,7 +1650,7 @@ mod tests {
     #[test]
     fn a_move_into_an_empty_section_lands_under_its_heading() {
         let doc = "# Today: 2026-03-03\n\n## Do Now\n\n## Errands\n\n* [ ] A thing.\n";
-        let out = do_move(doc, "A thing.", MoveOp::ToDoNow).unwrap();
+        let out = do_move(doc, "A thing.", &MoveOp::ToDoNow).unwrap();
         assert_eq!(
             out, "# Today: 2026-03-03\n\n## Do Now\n\n* [ ] A thing.\n## Errands\n\n",
             "the item sits under the heading, past its blank line"

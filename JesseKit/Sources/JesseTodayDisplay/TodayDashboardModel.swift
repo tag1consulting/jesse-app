@@ -290,6 +290,16 @@ public final class TodayDashboardModel {
             }
             if item.checked == checked { overlay.settle(id) }
         }
+        for (id, deferred) in overlay.deferrals {
+            guard let item = byId[id] else {
+                overlay.deferrals.removeValue(forKey: id)
+                continue
+            }
+            // Per-field, like a check: retired only once the server's item agrees,
+            // so a fetch that raced ahead of a still-in-flight postponement cannot
+            // put the row back in the badge under the user's hand.
+            if item.deferred == deferred { overlay.deferrals.removeValue(forKey: id) }
+        }
         for id in overlay.moves.keys where byId[id] == nil {
             overlay.moves.removeValue(forKey: id)
         }
@@ -511,6 +521,35 @@ public final class TodayDashboardModel {
     /// re-keying wrong.
     public func focus(id: String, _ focus: TodayFocus) async {
         await move(id: id, op: focus.moveOp)
+    }
+
+    /// **Postpone an item for today**, or bring it back.
+    ///
+    /// The third state between open and done, and the reason it exists: a day that
+    /// holds work which is not going to happen today could only be cleared by
+    /// ticking the item off, which records it as DONE and which `Close it at source`
+    /// would then propagate into the project files. Postponing takes the row out of
+    /// the badge and out of its section's open count, leaves the item otherwise
+    /// untouched, and expires with the day.
+    ///
+    /// **Nothing is written to `Today.md`.** The bridge keeps this in a day-scoped
+    /// store, so there is no markdown to unwind tomorrow and no ETag conflict with a
+    /// turn mid-write — but the ETag is still sent and still checked, because the
+    /// response is a whole fresh snapshot and a client editing a day it is not
+    /// looking at should refetch rather than act.
+    public func postpone(id: String, deferred: Bool) async {
+        // Order matters, exactly as in `check`: with no ETag in hand there is
+        // nothing to refuse against, and the only useful act is to go and get one.
+        guard let tag = etag, !tag.isEmpty else {
+            await load()
+            return
+        }
+        if refuseIfReadOnly() { return }
+        lastConflictMessage = nil
+        overlay.deferrals[id] = deferred
+        await perform(id: id) { client in
+            try await client.postpone(id: id, deferred: deferred, at: self.now(), ifMatch: tag)
+        }
     }
 
     /// Mark a glanceable row seen. The dot clears at once; the bridge's glance store

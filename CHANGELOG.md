@@ -15,6 +15,111 @@ CI both run it). See the "Versioning" section of `bridge/README.md`.
 
 ## [Unreleased]
 
+## [Bridge 0.75.0] - 2026-08-11
+
+### Added
+
+- **`POST /jesse/today/items/{id}/defer`** — postpone one item for the day, or bring it
+  back. Body `{ "deferred": true|false, "atMs": <unix millis> }`, answered with the whole
+  fresh snapshot exactly as `check` and `move` are, and gated on the same `If-Match`.
+
+  **It writes no markdown at all**, and that is the design rather than an implementation
+  detail. Postponement is a claim about TODAY, not about the task: nothing about the item
+  changes, so nothing about the item is written. It lives in a new `DeferStore` at
+  `<state_dir>/defer.json`, keyed `"YYYY-MM-DD/<item id>"` and modelled on the glance
+  store — last writer wins on the client's millisecond clock so two devices converge and
+  a stale write loses, garbage collected against the snapshot's date on the same
+  retention window, and an absent, unreadable or malformed store reads as EMPTY rather
+  than as an error. Writing it into `Today.md` instead would put UI state in front of the
+  morning rebuild and in front of every agent that reads the day, and would need unwinding
+  tomorrow by something that remembered to. The day-scoped key is what brings the item
+  back with no user action and no second write.
+
+  Consequences, each deliberate: no day-file write lock (there is nothing to serialize
+  against), no journalled intent (there is no turn that could clobber it), and a LEAD item
+  may be postponed even though it can never be moved — it counts toward the app's badge,
+  so a badge that cannot be cleared without lying about the work being done is the exact
+  problem this endpoint exists to fix. An id that is not in the current day is `404`.
+
+- **`op: "to_section"` on the move endpoint**, with the destination in a new optional
+  `section` field. `to_do_now` was the only op that crossed a section boundary, so
+  promotion into Do Now was a one-way trip. The op NAMES its destination rather than
+  trying to send an item back where it came from: an item id is a content hash over
+  `(section, lead, Added date)` and carries no memory of its history, so a bare `demote`
+  has no well-defined target and asking the user is the only honest answer.
+
+  The name is matched EXACTLY, unlike `to_do_now`'s prefix match — that one is shorthand
+  for a family of headings the client never names, while this one is handed a name the
+  client read out of the snapshot itself, and a prefix match would let `Do Now` silently
+  claim a request meant for `Do Now (carried, owed replies and decisions)`. The item lands
+  at the TOP of the destination with its continuation lines, because a demotion to the
+  bottom of a long section is a demotion to invisibility. `to_section` with an absent or
+  empty `section` is `400` naming the field; an unknown section name is `404`; the item's
+  own section writes nothing; the lead block still answers `409`.
+
+- `deferred` and `deferredMs` on every item in the snapshot, stamped on after the parse
+  alongside the glance flags and the project rollup (both read and write paths go through
+  the one `hydrate`, or every `If-Match` would fail). `counts` is unchanged: a postponed
+  item is neither done nor out of the day, and what postponement takes out of a count is
+  the app's badge, which the client computes over the rows it draws.
+
+## [App 1.0 (100)] - 2026-08-11
+
+### Added
+
+- **Postpone an item for the day.** A third state between open and done. The tab badge
+  counts open Do Now work plus the standing lead item, so a day holding something that
+  is not going to happen today could only be cleared by ticking it off — which records
+  it as DONE, and which `Close it at source` would then propagate into the project
+  files. Postponing takes the row out of the badge and out of its section's open count,
+  changes nothing about the item, and expires by itself overnight.
+
+  It is offered as a trailing swipe (the fast one-handed gesture) and in both the
+  ellipsis menu and the long-press menu, which are built from one list so they cannot
+  diverge. The standing lead item can be postponed even though it can never be moved:
+  it counts toward the badge, so it has to be dismissible. Checking an item clears its
+  postponement — done beats postponed, and a row never claims both.
+
+  A postponed row **stays on screen**: dimmed, with a `Postponed` chip in its caption
+  and an accessibility label that says so out loud, and NOT struck through, because a
+  strikethrough says "done" and that is precisely the lie this replaces. It sinks to the
+  bottom of its own section under every lens including file order, and never to another
+  section — crossing a boundary would change the item's id and its project rollup, and
+  the whole claim of the feature is that nothing about the item changes. Section headers
+  read `4 open, 2 postponed` so the set-aside rows are accounted for rather than missing
+  from a number.
+
+  Nothing is written to `Today.md`, and a test asserts the file is byte-identical after
+  a postponement. See the bridge notes below for why.
+
+- **Move an item OUT of Do Now**, through a `Move to section` submenu listing every
+  section of the day but the item's own, in file order and under each heading's full
+  name (a day file carries both a `Do Now` and a `Do Now (carried, owed replies and
+  decisions)`; two entries reading "Do Now" would be unusable). Promotion into Do Now
+  used to be a one-way trip — the only ops that remained were reorderings inside it —
+  so an item that turned out not to belong at the top of the day could only be ticked
+  off. The one-tap `Move to Do Now` shortcut is unchanged.
+
+### Changed
+
+- **Chats leads the tab bar again; Today is second and the app opens on Chats.** The
+  conversation is what the app is opened for most of the time, and the day is one tap
+  away with a badge that says whether it wants attention — which a landing tab cannot
+  say about itself. The launch tab and the bar's leading tab remain one decision
+  (`Tab.allCases.first`), asserted by a test. The Mac's shell mirrors the order.
+
+- **The Today tab is a `sunrise`.** It used to be `sun.max`, with a comment reserving
+  `sun.horizon` for the idea of starting the morning. That reservation is void: the
+  Today tab IS where the day gets started, so the glyph says so. It deliberately shares
+  its meaning with the day screen's empty state and the Health tab's Start-new-day
+  button — one glyph, one claim, three places.
+
+- The accessible edit-mode reorder grips are withheld for a section holding a postponed
+  row, as they already are for a section on a view sort, and for the same reason: they
+  hand over an INDEX, and a display order that differs from the file's has no index the
+  bridge can address. Drag-and-drop is unaffected, because it resolves its landing from
+  the row it was dropped on, by identity.
+
 ## [Bridge 0.74.1] - 2026-08-11
 
 ### Fixed

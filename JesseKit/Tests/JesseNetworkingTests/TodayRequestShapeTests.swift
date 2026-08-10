@@ -41,9 +41,32 @@ final class TodayRequestShapeTests: XCTestCase {
     }
 
     func testMoveBodyCarriesTheWireSpelling() throws {
-        let encoded = try body(TodayMoveBody(op: TodayMoveOp.toDoNow.rawValue,
+        let op = TodayMoveOp.toDoNow
+        let encoded = try body(TodayMoveBody(op: op.wireOp, section: op.destinationSection,
                                              at: JesseBridgeClient.isoInstant(instant)))
-        XCTAssertEqual(encoded, #"{"at":"2026-03-03T09:30:00Z","op":"to_do_now"}"#)
+        XCTAssertEqual(encoded, #"{"at":"2026-03-03T09:30:00Z","op":"to_do_now"}"#,
+                       "the section field is OMITTED for every op that names no destination")
+    }
+
+    /// The one op that carries a destination, and the exact name it carries: the
+    /// bridge matches the heading verbatim, so a client that trimmed or prettified it
+    /// would get a `404` for a section that is plainly there.
+    func testToSectionCarriesTheHeadingVerbatim() throws {
+        let op = TodayMoveOp.toSection("Do Now (carried, owed replies and decisions)")
+        let encoded = try body(TodayMoveBody(op: op.wireOp, section: op.destinationSection,
+                                             at: JesseBridgeClient.isoInstant(instant)))
+        XCTAssertEqual(
+            encoded,
+            #"{"at":"2026-03-03T09:30:00Z","op":"to_section","section":"Do Now (carried, owed replies and decisions)"}"#)
+    }
+
+    /// Milliseconds, like a glance and unlike the two file mutations: nothing about a
+    /// postponement reaches the vault, so the number is a clock the defer store
+    /// resolves races with, not a stamp anyone reads in the day file.
+    func testDeferBodyCarriesTheFlagAndMillis() throws {
+        let encoded = try body(TodayDeferBody(deferred: true,
+                                              atMs: JesseBridgeClient.unixMillis(instant)))
+        XCTAssertEqual(encoded, #"{"atMs":1772530200000,"deferred":true}"#)
     }
 
     func testGlanceBodyCarriesIdAndMillis() throws {

@@ -146,9 +146,48 @@ final class TodaySemanticsTests: XCTestCase {
                        "the section name follows the row, so a re-key matches on the right pair")
     }
 
+    /// The other cross-section op, and the one that names where it is going. Same
+    /// landing (the top) and same id rule (unchanged until the server answers) as
+    /// `to_do_now`, because they are one splice with two ways of choosing a section.
+    func testOptimisticToSectionLandsTheRowAtTheTopOfTheNamedSection() {
+        let out = TodaySemantics.display(Fixt.snapshot(), applying:
+            TodayOptimism(moves: [Fixt.ada: .toSection("Errands")]))
+        XCTAssertEqual(out.sections[1].items.first?.id, Fixt.ada,
+                       "a demotion to the bottom of a long section is a demotion to "
+                       + "invisibility")
+        XCTAssertFalse(out.sections[0].items.contains { $0.id == Fixt.ada },
+                       "and it left Do Now — no duplicate")
+        XCTAssertEqual(out.item(id: Fixt.ada)?.sectionName, "Errands",
+                       "the section name follows the row, so a re-key matches on the right pair")
+    }
+
+    /// The destination is matched EXACTLY, as the bridge matches it. A day file
+    /// carries both a `Do Now` and a `Do Now (carried…)`, and a prefix match would
+    /// land the row optimistically in one and really in the other.
+    func testOptimisticToSectionMatchesTheHeadingExactly() {
+        let snap = Fixt.snapshot()
+        let out = TodaySemantics.display(snap, applying:
+            TodayOptimism(moves: [Fixt.ada: .toSection("Do No")]))
+        XCTAssertEqual(out.sections.map { $0.items.map(\.id) },
+                       snap.sections.map { $0.items.map(\.id) },
+                       "a name that is only a prefix moves nothing")
+    }
+
+    /// The op crosses a boundary, so the id changes and the client's state has to
+    /// follow the server's answer — the same re-key `to_do_now` already relies on,
+    /// reached through the identity that survives a move rather than through the id.
+    func testAToSectionMoveIsRekeyedFromTheServersSnapshot() throws {
+        let before = Fixt.snapshot()
+        let item = try XCTUnwrap(before.item(id: Fixt.glazeInErrands))
+        let after = Fixt.snapshotAfterGlazeMovedToDoNow()
+        let known = Set(before.allItems.map(\.id))
+        XCTAssertEqual(TodaySemantics.rekeyed(item, in: after, excluding: known),
+                       Fixt.glazeInDoNow)
+    }
+
     func testAMoveOfALeadItemIsNeverAppliedOptimistically() {
         let snap = Fixt.snapshot()
-        for op in TodayMoveOp.allCases {
+        for op in [TodayMoveOp.up, .down, .topOfSection, .toDoNow, .toSection("Errands")] {
             let out = TodaySemantics.display(snap, applying:
                 TodayOptimism(moves: [Fixt.standing: op]))
             XCTAssertEqual(out.leadItems.map(\.id), [Fixt.standing],
@@ -241,8 +280,12 @@ final class TodaySemanticsTests: XCTestCase {
 
     func testAvailableMovesMirrorTheBridgesNoOpRules() throws {
         let snap = Fixt.snapshot()
+        /// The REORDERINGS only — the destination submenu is asserted separately
+        /// below, and it is offered for every row alike, so repeating it in each of
+        /// these four expectations would say nothing about the no-op rules.
         func moves(_ id: String) throws -> [TodayMoveOp] {
             TodaySemantics.availableMoves(for: try XCTUnwrap(snap.item(id: id)), in: snap)
+                .filter { $0.destinationSection == nil }
         }
         XCTAssertEqual(try moves(Fixt.thermocouple), [.down],
                        "first in Do Now: no up, no top, no to-Do-Now")
@@ -251,6 +294,28 @@ final class TodaySemanticsTests: XCTestCase {
                        "last in Do Now: no down")
         XCTAssertEqual(try moves(Fixt.glazeInErrands), [.down, .toDoNow],
                        "first in Errands, and Do Now is elsewhere")
+    }
+
+    /// **Every section but the item's own**, in file order.
+    ///
+    /// Not filtered down to "sensible" destinations, because there is no such
+    /// judgement to make from here: which section a piece of work belongs in is the
+    /// thing only the user knows. The item's own section is left out because moving
+    /// to where you already are writes nothing (the bridge treats it as a no-op) and
+    /// reads as a broken button.
+    func testTheDestinationSubmenuOffersEverySectionButTheItemsOwn() throws {
+        let snap = Fixt.snapshot()
+        func destinations(_ id: String) throws -> [String] {
+            TodaySemantics.availableMoves(for: try XCTUnwrap(snap.item(id: id)), in: snap)
+                .compactMap(\.destinationSection)
+        }
+        XCTAssertEqual(try destinations(Fixt.ada), ["Errands", "Health"])
+        XCTAssertEqual(try destinations(Fixt.glazeInErrands), ["Do Now", "Health"])
+        // And the full names, verbatim: a menu that shortened them would show two
+        // entries reading "Do Now" on a day file that carries both headings.
+        XCTAssertEqual(
+            try destinations(Fixt.ada).map { TodaySemantics.label(for: .toSection($0)) },
+            ["Errands", "Health"])
     }
 
     /// The standing lead item gets NO menu rather than four buttons that each answer

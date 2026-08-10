@@ -26,11 +26,13 @@ final class TodayDashboardModelTests: XCTestCase {
         var fetches: [Fetch] = []
         var checks: [TodayMutationResult] = []
         var moves: [TodayMutationResult] = []
+        var postpones: [TodayMutationResult] = []
         var glances: [TodayMutationResult] = []
 
         private(set) var fetchCount = 0
         private(set) var checkCount = 0
         private(set) var moveCount = 0
+        private(set) var postponeCount = 0
         private(set) var glanceCount = 0
 
         /// Double-optional on purpose: the outer says "a fetch happened", the inner
@@ -39,6 +41,7 @@ final class TodayDashboardModelTests: XCTestCase {
         private(set) var lastIfMatch: String?
         private(set) var lastCheck: (id: String, checked: Bool, evidence: String?)?
         private(set) var lastMove: (id: String, op: TodayMoveOp)?
+        private(set) var lastPostpone: (id: String, deferred: Bool)?
         /// EVERY move, in order. One drag can be several ops (a row dragged three
         /// places up is three `up`s), and "which ops, in what order, under which id"
         /// is the whole assertion for a drag — `lastMove` cannot express it.
@@ -76,6 +79,16 @@ final class TodayDashboardModelTests: XCTestCase {
             lastAt = at
             let out = outcome(moves, moveCount)
             moveCount += 1
+            return out
+        }
+
+        func postpone(id: String, deferred: Bool, at: Date,
+                      ifMatch: String) async throws -> TodayMutationResult {
+            lastPostpone = (id, deferred)
+            lastIfMatch = ifMatch
+            lastAt = at
+            let out = outcome(postpones, postponeCount)
+            postponeCount += 1
             return out
         }
 
@@ -491,6 +504,10 @@ final class TodayDashboardModelTests: XCTestCase {
             throw JesseError.connectionLost
         }
         func moveItem(id: String, op: TodayMoveOp, at: Date,
+                      ifMatch: String) async throws -> TodayMutationResult {
+            throw JesseError.connectionLost
+        }
+        func postpone(id: String, deferred: Bool, at: Date,
                       ifMatch: String) async throws -> TodayMutationResult {
             throw JesseError.connectionLost
         }

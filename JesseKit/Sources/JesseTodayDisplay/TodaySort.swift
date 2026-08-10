@@ -149,6 +149,26 @@ extension TodaySemantics {
             .map(\.element)
     }
 
+    /// One section's items as the screen should draw them: the lens applied, then
+    /// every postponed row sunk to the bottom.
+    ///
+    /// **Postponed rows sink under EVERY lens, `.fileOrder` included**, which is why
+    /// this is not simply a fourth sort key. Setting something aside for today is a
+    /// statement about what is left to do, and a row that stays interleaved with the
+    /// live work keeps costing attention it was explicitly told to stop costing. It
+    /// still renders — hiding it would be a day silently dropping rows — it just
+    /// stops being in the way.
+    ///
+    /// The sink is stable for the same reason the lens is: `partition`-style
+    /// reordering with the file index as the tiebreak, so two postponed rows keep
+    /// their relative order instead of swapping on every redraw.
+    public nonisolated static func orderedForDisplay(_ items: [TodayItem],
+                                                     by key: TodaySortKey) -> [TodayItem] {
+        let sorted = sorted(items, by: key)
+        guard sorted.contains(where: isPostponed) else { return sorted }
+        return sorted.filter { !isPostponed($0) } + sorted.filter(isPostponed)
+    }
+
     /// The whole day, ordered for display: each section's items sorted, everything else
     /// untouched.
     ///
@@ -158,11 +178,10 @@ extension TodaySemantics {
     /// Counts are unaffected: a lens changes order, never membership.
     public nonisolated static func sortedForDisplay(_ snapshot: TodaySnapshot,
                                                     by key: TodaySortKey) -> TodaySnapshot {
-        guard key.reorders else { return snapshot }
         var out = snapshot
         out.sections = out.sections.map { section in
             var s = section
-            s.items = sorted(s.items, by: key)
+            s.items = orderedForDisplay(s.items, by: key)
             return s
         }
         return out
@@ -178,11 +197,10 @@ extension TodaySemantics {
     public nonisolated static func sortedForDisplay(_ snapshot: TodaySnapshot,
                                                     by keys: [String: TodaySortKey],
                                                     default key: TodaySortKey) -> TodaySnapshot {
-        guard key.reorders || keys.values.contains(where: \.reorders) else { return snapshot }
         var out = snapshot
         out.sections = out.sections.map { section in
             var s = section
-            s.items = sorted(s.items, by: keys[section.name] ?? key)
+            s.items = orderedForDisplay(s.items, by: keys[section.name] ?? key)
             return s
         }
         return out

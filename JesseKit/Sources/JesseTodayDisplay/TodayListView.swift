@@ -224,11 +224,21 @@ public struct TodayListView: View {
                 .onMove { source, destination in
                     move(in: section, from: source, to: destination)
                 }
-                .moveDisabled(model.sortKey(for: section.name).reorders)
+                // The grips hand over an INDEX, and an index is only addressable
+                // while the rows on screen sit where the file has them. A lens
+                // reorders them, and so does a postponed row sinking to the bottom
+                // of its section — in both cases the index the finger picked names
+                // a position the day file does not have, and writing it would move
+                // the row somewhere nobody pointed at. The drag-and-drop path is
+                // unaffected because it resolves its landing from the row it was
+                // dropped ON, by identity, not by a position.
+                .moveDisabled(model.sortKey(for: section.name).reorders
+                              || section.items.contains(where: TodaySemantics.isPostponed))
             }
         } header: {
             TodaySectionHeader(section: section,
                                open: TodaySemantics.openCount(in: section),
+                               postponed: TodaySemantics.postponedCount(in: section),
                                sort: model.sortKey(for: section.name),
                                onSort: { model.setSortKey($0, for: section.name) })
                 // The Do Now heading is a drop target in its own right: "put this at
@@ -258,6 +268,7 @@ public struct TodayListView: View {
             onToggle: { _ in toggle(item) },
             onMove: { op in Task { await model.move(id: item.id, op: op) } },
             onFocus: { focus in Task { await model.focus(id: item.id, focus) } },
+            onPostpone: { postpone(item) },
             onOpen: { onOpenDetail(item) },
             onDiscuss: { onDiscuss(item) },
             onPropagate: { onPropagate(item, model.evidence(for: item)) },
@@ -279,6 +290,15 @@ public struct TodayListView: View {
                 }
                 .tint(.green)
             }
+            // "Not today" is the fast one-handed gesture, and the menu is its
+            // fallback rather than the other way round: the whole value of
+            // postponing is that clearing a badge honestly costs one flick, not a
+            // long press and a hunt through a list.
+            Button { postpone(item) } label: {
+                Label(item.deferred ? "Bring back" : "Not today",
+                      systemImage: item.deferred ? "arrow.uturn.backward" : "moon.zzz")
+            }
+            .tint(.gray)
             // FOCUS, not a bare move — the same durable write, named for what the user
             // means by it. Both focus ops are absolute, so they mean the same thing
             // under every lens and are offered whatever the section is sorted by.
@@ -304,6 +324,18 @@ public struct TodayListView: View {
         } else {
             evidenceFor = EvidenceTarget(id: item.id)
         }
+    }
+
+    /// **Postpone a row, or bring it back**, from either of the two affordances that
+    /// offer it. One function for the same reason `toggle` is one: the read-only
+    /// refusal belongs to the action, not to whichever gesture reached it.
+    ///
+    /// No sheet and no confirmation, unlike checking. There is nothing to record
+    /// about a decision to not do something today, and the action undoes itself with
+    /// the same swipe.
+    private func postpone(_ item: TodayItem) {
+        guard !model.refuseInteractionIfReadOnly() else { return }
+        Task { await model.postpone(id: item.id, deferred: !item.deferred) }
     }
 
     // MARK: - Landing a drag
@@ -578,19 +610,33 @@ struct TodayNarrativeHeader: View {
 struct TodaySectionHeader: View {
     let section: TodaySection
     let open: Int
+    let postponed: Int
     let sort: TodaySortKey
     let onSort: (TodaySortKey) -> Void
+
+    /// The count as words: open items only, matching the tab badge, plus the
+    /// postponed tally when there is one.
+    ///
+    /// The two numbers are shown together rather than summed. "6" for a section
+    /// holding four live rows and two set aside would restate the number
+    /// postponing exists to reduce; "4" alone would leave the two rows still on
+    /// screen unaccounted for, which reads as a miscount.
+    private var countLabel: String {
+        postponed > 0 ? "\(open) open, \(postponed) postponed" : "\(open)"
+    }
 
     var body: some View {
         HStack {
             Text(section.name)
             Spacer()
-            if open > 0, !section.isBriefing {
-                Text("\(open)")
+            if open > 0 || postponed > 0, !section.isBriefing {
+                Text(countLabel)
                     .font(.caption)
                     .monospacedDigit()
                     .foregroundStyle(.secondary)
-                    .accessibilityLabel("\(open) open")
+                    .accessibilityLabel(postponed > 0
+                                        ? "\(open) open, \(postponed) postponed"
+                                        : "\(open) open")
             }
             if !section.isSchedule, !section.items.isEmpty {
                 Menu {

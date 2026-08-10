@@ -306,6 +306,7 @@ final class MacTodayTests: XCTestCase {
         let day: TodaySnapshot
         private(set) var fetchCount = 0
         private(set) var checkCount = 0
+        private(set) var postponeCount = 0
 
         init(day: TodaySnapshot) { self.day = day }
 
@@ -321,6 +322,11 @@ final class MacTodayTests: XCTestCase {
         func moveItem(id: String, op: TodayMoveOp, at: Date,
                       ifMatch: String) async throws -> TodayMutationResult {
             .snapshot(day)
+        }
+        func postpone(id: String, deferred: Bool, at: Date,
+                      ifMatch: String) async throws -> TodayMutationResult {
+            postponeCount += 1
+            return .snapshot(day)
         }
         func glance(id: String, at: Date, ifMatch: String) async throws -> TodayMutationResult {
             .snapshot(day)

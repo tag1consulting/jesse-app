@@ -18,21 +18,31 @@ final class TodayTabTests: XCTestCase {
 
     // MARK: - The tab
 
-    /// The root tab bar has three tabs, Today FIRST. The tab set is a `CaseIterable`
-    /// enum that `RootTabView` renders by iterating, so this is an assertion about
-    /// what the shell actually builds rather than about a constant kept next to it —
-    /// including the order, which is the enum's case order and nothing else.
-    func testTheRootTabBarLeadsWithToday() {
-        XCTAssertEqual(RootTabView.Tab.allCases, [.today, .chats, .health])
+    /// The root tab bar has three tabs, Chats FIRST and Today second. The tab set is
+    /// a `CaseIterable` enum that `RootTabView` renders by iterating, so this is an
+    /// assertion about what the shell actually builds rather than about a constant
+    /// kept next to it — including the order, which is the enum's case order and
+    /// nothing else. The Mac's `MacShellView` is a hand-written list that mirrors it.
+    func testTheRootTabBarLeadsWithChatsAndPutsTodaySecond() {
+        XCTAssertEqual(RootTabView.Tab.allCases, [.chats, .today, .health])
         XCTAssertEqual(RootTabView.Tab.today.title, "Today")
-        XCTAssertEqual(RootTabView.Tab.today.systemImage, "sun.max")
     }
 
-    /// The app OPENS on Today: it is what the app is for. Asserted against the same
-    /// single definition the shell selects with, and pinned to the first case so the
-    /// bar's leading tab and the launch tab can't drift apart.
-    func testTheAppOpensOnToday() {
-        XCTAssertEqual(RootTabView.defaultTab, .today)
+    /// The Today tab is a SUNRISE, not the flat midday sun it used to be: the tab is
+    /// where the day gets started, so the glyph should say so. It deliberately shares
+    /// its meaning with the day screen's empty state and the Health tab's
+    /// Start-new-day button — one glyph, one claim, three places.
+    func testTheTodayTabIsASunrise() {
+        XCTAssertEqual(RootTabView.Tab.today.systemImage, "sunrise")
+    }
+
+    /// The app OPENS on Chats: the conversation is what it is opened for most of the
+    /// time, and the day is one tap away with a badge that says whether it wants
+    /// attention. Asserted against the same single definition the shell selects with,
+    /// and pinned to the first case so the bar's leading tab and the launch tab can't
+    /// drift apart.
+    func testTheAppOpensOnTheLeadingTab() {
+        XCTAssertEqual(RootTabView.defaultTab, .chats)
         XCTAssertEqual(RootTabView.Tab.allCases.first, RootTabView.defaultTab)
     }
 
@@ -444,6 +454,7 @@ final class TodayTabTests: XCTestCase {
         private(set) var fetchCount = 0
         private(set) var checkCount = 0
         private(set) var moveCount = 0
+        private(set) var postponeCount = 0
         private(set) var glanceCount = 0
 
         init(day: TodaySnapshot) { self.day = day }
@@ -460,6 +471,11 @@ final class TodayTabTests: XCTestCase {
         func moveItem(id: String, op: TodayMoveOp, at: Date,
                       ifMatch: String) async throws -> TodayMutationResult {
             moveCount += 1
+            return .snapshot(day)
+        }
+        func postpone(id: String, deferred: Bool, at: Date,
+                      ifMatch: String) async throws -> TodayMutationResult {
+            postponeCount += 1
             return .snapshot(day)
         }
         func glance(id: String, at: Date, ifMatch: String) async throws -> TodayMutationResult {

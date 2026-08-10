@@ -58,16 +58,25 @@ public enum TodayMutationResult: Equatable, Sendable {
     /// `409` — the move is structurally impossible: the standing lead item cannot be
     /// moved, or the file has no `Do Now` section to move into. The message is the
     /// bridge's own, written to be shown or logged without translation.
+    ///
+    /// A `404` maps here too, and deliberately not onto `itemGone`. The bridge
+    /// answers `404` when a request names something the current day does not have —
+    /// an id it cannot find, a `to_section` destination that is not a heading — and
+    /// the useful response to both is the notice row plus a refetch, NOT taking a
+    /// row off the screen. Mapping it to `itemGone` would also mean a bridge too old
+    /// to know the route at all (whose `404` is the router's, not ours) quietly
+    /// deleted a row from the day.
     case conflict(String)
 }
 
-/// The four day-file calls the Today screen makes.
+/// The five day-file calls the Today screen makes.
 ///
 /// `at` is a `Date` on every mutation even though the wire spellings differ — the
 /// two file mutations take an ISO8601 instant (the bridge rejects anything else with
 /// a `400` rather than substituting its own clock, because the stamp records when
-/// the USER tapped) while `glance` takes unix milliseconds. Both are derived from
-/// the one `Date` here so no caller has to know which endpoint wants which.
+/// the USER tapped) while `glance` and `postpone` take unix milliseconds. All are
+/// derived from the one `Date` here so no caller has to know which endpoint wants
+/// which.
 public protocol TodayProviding: Sendable {
     /// `GET /jesse/today`. Pass the last ETag to get a `304` when nothing changed.
     func getToday(ifNoneMatch: String?) async throws -> TodayFetchResult
@@ -78,11 +87,23 @@ public protocol TodayProviding: Sendable {
     func checkItem(id: String, checked: Bool, evidence: String?, at: Date,
                    ifMatch: String) async throws -> TodayMutationResult
 
-    /// `POST /jesse/today/items/{id}/move` — reorder one item. For `.toDoNow` the
-    /// returned snapshot may carry the item under a DIFFERENT id (the id hashes the
-    /// section name); the response is authoritative and the caller must re-key any
-    /// state it holds under the old one.
+    /// `POST /jesse/today/items/{id}/move` — reorder one item. For the two ops that
+    /// cross a section boundary (`.toDoNow`, `.toSection`) the returned snapshot may
+    /// carry the item under a DIFFERENT id (the id hashes the section name); the
+    /// response is authoritative and the caller must re-key any state it holds under
+    /// the old one.
     func moveItem(id: String, op: TodayMoveOp, at: Date,
+                  ifMatch: String) async throws -> TodayMutationResult
+
+    /// `POST /jesse/today/items/{id}/defer` — postpone one item for the day, or
+    /// bring it back.
+    ///
+    /// Like `glance`, this writes NO markdown: postponing is a decision about today,
+    /// not a fact about the task, and it lives in a day-scoped bridge store whose
+    /// keys expire — which is what brings the item back tomorrow with nothing to
+    /// unwind. Unlike a move, the standing lead item MAY be postponed: it counts
+    /// toward the badge, so it has to be dismissible.
+    func postpone(id: String, deferred: Bool, at: Date,
                   ifMatch: String) async throws -> TodayMutationResult
 
     /// `POST /jesse/today/glance` — mark one report row seen. The only mutation that
@@ -107,12 +128,20 @@ struct TodayCheckBody: Encodable {
 
 struct TodayMoveBody: Encodable {
     var op: String
+    /// Omitted for every op but `to_section`, whose destination the bridge rejects
+    /// as a `400` when it is absent or blank.
+    var section: String?
     var at: String
 }
 
 struct TodayGlanceBody: Encodable {
     var id: String
     var glancedAt: UInt64
+}
+
+struct TodayDeferBody: Encodable {
+    var deferred: Bool
+    var atMs: UInt64
 }
 
 // MARK: - The concrete client
@@ -150,7 +179,21 @@ extension JesseBridgeClient: TodayProviding {
     public func moveItem(id: String, op: TodayMoveOp, at: Date,
                          ifMatch: String) async throws -> TodayMutationResult {
         try await todayMutate("/jesse/today/items/\(Self.pathEscaped(id))/move",
-                              body: TodayMoveBody(op: op.rawValue, at: Self.isoInstant(at)),
+                              body: TodayMoveBody(op: op.wireOp,
+                                                  section: op.destinationSection,
+                                                  at: Self.isoInstant(at)),
+                              ifMatch: ifMatch)
+    }
+
+    public func postpone(id: String, deferred: Bool, at: Date,
+                         ifMatch: String) async throws -> TodayMutationResult {
+        // `atMs` is unix MILLISECONDS, like `glance` and unlike the two file
+        // mutations: nothing here reaches the vault, so it is a clock reading the
+        // defer store resolves concurrent claims with, not a stamp for a person to
+        // read in the day file.
+        try await todayMutate("/jesse/today/items/\(Self.pathEscaped(id))/defer",
+                              body: TodayDeferBody(deferred: deferred,
+                                                   atMs: Self.unixMillis(at)),
                               ifMatch: ifMatch)
     }
 
@@ -216,6 +259,13 @@ extension JesseBridgeClient: TodayProviding {
             return .preconditionRequired
         case 409:
             return .conflict(Self.bodyText(data))
+        case 404:
+            // The request named something this day does not have. Reported as the
+            // notice row, never as a removed row — see `TodayMutationResult`. The
+            // fallback sentence covers a bare router `404` from a bridge too old to
+            // know the route, which carries no body of its own.
+            let message = Self.bodyText(data)
+            return .conflict(message.isEmpty ? Self.notFoundNotice : message)
         default:
             throw JesseError.badResponse(http.statusCode, Self.bodyText(data))
         }
@@ -258,4 +308,9 @@ extension JesseBridgeClient: TodayProviding {
     static func bodyText(_ data: Data) -> String {
         String(data: data, encoding: .utf8) ?? ""
     }
+
+    /// What a `404` says when it carries no body of its own — which means the
+    /// bridge has no such route, not that the day has no such item.
+    static let notFoundNotice =
+        "Your bridge didn't recognise that action. Update it and try again."
 }

@@ -234,14 +234,35 @@ final class TodayWireDecodeTests: XCTestCase {
 
     // MARK: - The op spellings
 
-    /// The four wire spellings, exactly as `MoveOp::parse` reads them. A typo here is
-    /// a `400` from the bridge naming the four valid ops.
+    /// The five wire spellings, exactly as `MoveOp::parse` reads them. A typo here is
+    /// a `400` from the bridge naming the valid ops.
     func testMoveOpWireSpellings() {
-        XCTAssertEqual(TodayMoveOp.topOfSection.rawValue, "top_of_section")
-        XCTAssertEqual(TodayMoveOp.toDoNow.rawValue, "to_do_now")
-        XCTAssertEqual(TodayMoveOp.up.rawValue, "up")
-        XCTAssertEqual(TodayMoveOp.down.rawValue, "down")
-        XCTAssertEqual(TodayMoveOp.allCases.filter(\.crossesSections), [.toDoNow],
-                       "to_do_now is the ONLY op that can change an item's id")
+        XCTAssertEqual(TodayMoveOp.topOfSection.wireOp, "top_of_section")
+        XCTAssertEqual(TodayMoveOp.toDoNow.wireOp, "to_do_now")
+        XCTAssertEqual(TodayMoveOp.up.wireOp, "up")
+        XCTAssertEqual(TodayMoveOp.down.wireOp, "down")
+        XCTAssertEqual(TodayMoveOp.toSection("Errands").wireOp, "to_section")
+    }
+
+    /// The destination rides in its own field, and only for the op that has one —
+    /// which is what lets one request builder serve all five.
+    func testOnlyToSectionCarriesADestination() {
+        XCTAssertEqual(TodayMoveOp.toSection("Do Now (carried)").destinationSection,
+                       "Do Now (carried)")
+        for op in [TodayMoveOp.topOfSection, .toDoNow, .up, .down] {
+            XCTAssertNil(op.destinationSection)
+        }
+    }
+
+    /// The two ops that can change an item's id, and the three that cannot. A move
+    /// that crosses a section boundary re-hashes the id, so the client must re-key
+    /// every piece of state it holds under the old one.
+    func testExactlyTheCrossSectionOpsAreFlagged() {
+        for op in [TodayMoveOp.toDoNow, .toSection("Errands")] {
+            XCTAssertTrue(op.crossesSections, "\(op) changes the item's section")
+        }
+        for op in [TodayMoveOp.topOfSection, .up, .down] {
+            XCTAssertFalse(op.crossesSections, "\(op) stays inside one section")
+        }
     }
 }

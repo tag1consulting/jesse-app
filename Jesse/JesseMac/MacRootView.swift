@@ -15,17 +15,19 @@ import JesseSearch
 // the same code the iPhone uses. A scope control (all vs favorites) flips between the
 // full date-sectioned layout and the flat favorites list, and each row can be starred.
 
-// The window's top-level shell: a three-tab split between the vault's day file
-// (`MacTodayView`), the existing Chats experience (the NavigationSplitView, with all
-// its selection / ⌘N / ⌘R / ⌘, / favorites / archive / search behavior unchanged) and
-// the bridge-fed Health tab. Only this tab chrome is Mac-specific; each tab's content
-// is otherwise exactly what it was.
+// The window's top-level shell: a three-tab split between the existing Chats
+// experience (the NavigationSplitView, with all its selection / ⌘N / ⌘R / ⌘, /
+// favorites / archive / search behavior unchanged), the vault's day file
+// (`MacTodayView`) and the bridge-fed Health tab. Only this tab chrome is
+// Mac-specific; each tab's content is otherwise exactly what it was.
 //
-// TODAY COMES FIRST, matching the iPhone's tab bar (`RootTabView.Tab.allCases`): the
-// day file is what the app is for, and a shell that opens on Chats makes the user's
-// first act a tab switch. Each tab owns its own ⌘R, which is unambiguous because only
-// the selected tab's toolbar is live — the Health tab has worked that way since it
-// landed.
+// CHATS LEADS, TODAY IS SECOND, matching the iPhone's tab bar exactly
+// (`RootTabView.Tab.allCases`). The order is one decision for both platforms and is
+// asserted on the iPhone side, where the tabs are an enum a test can read; this
+// window is a hand-written list and must be kept in step with it by hand. The
+// glyphs are the iPhone's too — `sunrise` for Today, which is where the day gets
+// started. Each tab owns its own ⌘R, which is unambiguous because only the selected
+// tab's toolbar is live — the Health tab has worked that way since it landed.
 struct MacShellView: View {
     @Environment(MacCoordinator.self) private var coordinator
     /// Store-open failure banner, threaded down to the Chats tab.
@@ -33,10 +35,10 @@ struct MacShellView: View {
 
     var body: some View {
         TabView {
-            MacTodayView(configStore: coordinator.configStore)
-                .tabItem { Label("Today", systemImage: "sun.max") }
             MacRootView(storeError: storeError)
                 .tabItem { Label("Chats", systemImage: "bubble.left.and.bubble.right") }
+            MacTodayView(configStore: coordinator.configStore)
+                .tabItem { Label("Today", systemImage: "sunrise") }
             MacHealthView(configStore: coordinator.configStore)
                 .tabItem { Label("Health", systemImage: "heart.text.square") }
         }

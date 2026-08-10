@@ -190,6 +190,7 @@ public struct TodayItemRow: View {
     let onToggle: (Bool) -> Void
     let onMove: (TodayMoveOp) -> Void
     let onFocus: (TodayFocus) -> Void
+    let onPostpone: () -> Void
     let onOpen: () -> Void
     let onDiscuss: () -> Void
     let onPropagate: () -> Void
@@ -202,6 +203,7 @@ public struct TodayItemRow: View {
                 onToggle: @escaping (Bool) -> Void,
                 onMove: @escaping (TodayMoveOp) -> Void = { _ in },
                 onFocus: @escaping (TodayFocus) -> Void = { _ in },
+                onPostpone: @escaping () -> Void = {},
                 onOpen: @escaping () -> Void = {},
                 onDiscuss: @escaping () -> Void = {},
                 onPropagate: @escaping () -> Void = {},
@@ -215,6 +217,7 @@ public struct TodayItemRow: View {
         self.onToggle = onToggle
         self.onMove = onMove
         self.onFocus = onFocus
+        self.onPostpone = onPostpone
         self.onOpen = onOpen
         self.onDiscuss = onDiscuss
         self.onPropagate = onPropagate
@@ -248,7 +251,8 @@ public struct TodayItemRow: View {
             Spacer(minLength: 0)
             TodayItemMenu(item: item, availableMoves: availableMoves,
                           focusActions: focusActions, onMove: onMove, onFocus: onFocus,
-                          onDiscuss: onDiscuss, onPropagate: onPropagate)
+                          onPostpone: onPostpone, onDiscuss: onDiscuss,
+                          onPropagate: onPropagate)
         }
         .padding(.vertical, 4)
         // Tapping the row opens the item. A GESTURE rather than a `Button` or a
@@ -269,7 +273,8 @@ public struct TodayItemRow: View {
         .contextMenu {
             TodayItemActions(item: item, availableMoves: availableMoves,
                              focusActions: focusActions, onMove: onMove, onFocus: onFocus,
-                             onDiscuss: onDiscuss, onPropagate: onPropagate)
+                             onPostpone: onPostpone, onDiscuss: onDiscuss,
+                             onPropagate: onPropagate)
         }
         .accessibilityElement(children: .contain)
         .accessibilityAction(named: "Open item", onOpen)
@@ -290,8 +295,21 @@ public struct TodayItemRow: View {
     @ViewBuilder
     private var caption: some View {
         let dates = TodaySemantics.dateCaption(item)
-        if !item.project.isUnfiled || dates != nil {
+        if !item.project.isUnfiled || dates != nil || TodaySemantics.isPostponed(item) {
             HStack(spacing: 6) {
+                // The chip is the cue that survives. Dimming alone says "postponed"
+                // only to someone who can see the row beside an undimmed one, which
+                // is nobody using VoiceOver and nobody looking at a section where
+                // everything is set aside.
+                if TodaySemantics.isPostponed(item) {
+                    Text("Postponed")
+                        .font(.caption2)
+                        .padding(.horizontal, 6)
+                        .padding(.vertical, 1)
+                        .background(.quaternary, in: .capsule)
+                        .foregroundStyle(.secondary)
+                        .accessibilityLabel("Postponed until tomorrow")
+                }
                 if !item.project.isUnfiled {
                     Text(TodayProjectPalette.role(for: item.project).label)
                         .font(.caption2)
@@ -312,12 +330,24 @@ public struct TodayItemRow: View {
     /// paragraph rather than as two stacked blocks. A completed row is struck through
     /// and dimmed; the text stays readable because a done item is still evidence of
     /// what the day held.
+    ///
+    /// A POSTPONED row is dimmed and NOT struck through, and the distinction is the
+    /// whole reason postponing exists: a strikethrough says "done", and saying that
+    /// about work nobody did is exactly the lie a checkbox tap was being used to
+    /// tell. Set aside reads as set aside — quieter than the live rows, still there.
     private var text: some View {
         Text(attributed)
             .font(.body)
             .strikethrough(item.checked, color: .secondary)
-            .foregroundStyle(item.checked ? AnyShapeStyle(.secondary) : AnyShapeStyle(.primary))
+            .foregroundStyle(item.checked || item.deferred
+                             ? AnyShapeStyle(.secondary) : AnyShapeStyle(.primary))
             .fixedSize(horizontal: false, vertical: true)
+            // Prefixed rather than appended: a screen reader reaches the row's state
+            // before the sentence it applies to, which is the order the sighted cue
+            // arrives in too.
+            .accessibilityLabel(TodaySemantics.isPostponed(item)
+                                ? "Postponed until tomorrow. \(String(attributed.characters))"
+                                : String(attributed.characters))
     }
 
     /// One attributed string rather than two concatenated `Text`s, so the lead and
@@ -346,6 +376,7 @@ struct TodayItemActions: View {
     let focusActions: [TodayFocus]
     let onMove: (TodayMoveOp) -> Void
     let onFocus: (TodayFocus) -> Void
+    let onPostpone: () -> Void
     let onDiscuss: () -> Void
     let onPropagate: () -> Void
 
@@ -359,7 +390,19 @@ struct TodayItemActions: View {
                 Label(focus.label, systemImage: focus.symbol)
             }
         }
-        if !focusActions.isEmpty { Divider() }
+        // Beside the focus actions, and above the Discuss divider: postponing is a
+        // decision about the WORK ("not today"), which is the same kind of thing as
+        // "this next" and a different kind of thing from starting a conversation
+        // about it. The one slot says both halves of the toggle, because a row that
+        // is already set aside needs the way back more than it needs the way in.
+        Button { onPostpone() } label: {
+            Label(item.deferred ? "Bring back to today" : "Postpone until tomorrow",
+                  systemImage: item.deferred ? "arrow.uturn.backward" : "moon.zzz")
+        }
+        // Unconditional now: the postpone toggle above is offered for every row,
+        // including the standing lead item, so there is always something above this
+        // line to separate the conversation actions from.
+        Divider()
         Button { onDiscuss() } label: {
             Label("Discuss this item", systemImage: "bubble.left.and.text.bubble.right")
         }
@@ -377,12 +420,30 @@ struct TodayItemActions: View {
         // that offers both invites the reading that they differ.
         let focused = Set(focusActions.map(\.moveOp))
         let remaining = availableMoves.filter { !focused.contains($0) }
-        if !remaining.isEmpty {
+        // The cross-section moves are gathered into a submenu of their own: a day
+        // file has eight or nine headings, and nine more buttons in a flat list would
+        // bury the four that are about this row's own position.
+        let sections = remaining.filter { $0.destinationSection != nil }
+        let reorders = remaining.filter { $0.destinationSection == nil }
+        if !reorders.isEmpty || !sections.isEmpty {
             Divider()
-            ForEach(remaining, id: \.self) { op in
+            ForEach(reorders, id: \.self) { op in
                 Button { onMove(op) } label: {
                     Label(TodaySemantics.label(for: op),
                           systemImage: TodaySemantics.symbol(for: op))
+                }
+            }
+            if !sections.isEmpty {
+                Menu {
+                    // Each entry is its section's FULL name, verbatim. The day file
+                    // carries both a `Do Now` and a `Do Now (carried, owed replies and
+                    // decisions)`, so shortening them would produce two entries that
+                    // read alike and a menu nobody can use.
+                    ForEach(sections, id: \.self) { op in
+                        Button(TodaySemantics.label(for: op)) { onMove(op) }
+                    }
+                } label: {
+                    Label(TodaySemantics.moveToSectionLabel, systemImage: "folder")
                 }
             }
         }
@@ -395,6 +456,7 @@ struct TodayItemMenu: View {
     let focusActions: [TodayFocus]
     let onMove: (TodayMoveOp) -> Void
     let onFocus: (TodayFocus) -> Void
+    let onPostpone: () -> Void
     let onDiscuss: () -> Void
     let onPropagate: () -> Void
 
@@ -402,7 +464,8 @@ struct TodayItemMenu: View {
         Menu {
             TodayItemActions(item: item, availableMoves: availableMoves,
                              focusActions: focusActions, onMove: onMove, onFocus: onFocus,
-                             onDiscuss: onDiscuss, onPropagate: onPropagate)
+                             onPostpone: onPostpone, onDiscuss: onDiscuss,
+                             onPropagate: onPropagate)
         } label: {
             Image(systemName: "ellipsis")
                 .font(.footnote)

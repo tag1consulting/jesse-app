@@ -7964,6 +7964,323 @@ async fn today_glance_marks_a_report_row_seen_under_a_date_scoped_key() {
     let _ = std::fs::remove_dir_all(&vault);
 }
 
+// ---- POST /jesse/today/items/{id}/defer — postponed for today --------------
+//
+// The second mutation that touches no vault content. What these pin is the part
+// that makes postponement honest rather than a third checkbox state written into
+// the day: the file is byte-identical afterwards, a lead item can be dismissed
+// even though it can never be moved, and the flag is date-scoped so tomorrow
+// carries none of it.
+
+#[tokio::test]
+async fn today_defer_flags_an_item_and_writes_no_markdown_at_all() {
+    let (st, vault) = today_write_state();
+    let day = vault.join("vault/Today.md");
+    let before = std::fs::read_to_string(&day).unwrap();
+    let (snapshot, etag) = today_snapshot(&st).await;
+    let id = id_of(&snapshot, "Reply to Ada");
+
+    let resp = app(st.clone())
+        .oneshot(today_defer_request(
+            Some("Bearer test-token"),
+            &id,
+            Some(&etag),
+            r#"{"deferred":true,"atMs":1772000000000}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body: Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    assert!(
+        deferred_state(&body, "Reply to Ada"),
+        "the response is the whole fresh snapshot, with the item flagged"
+    );
+
+    // THE POINT OF THE WHOLE DESIGN: not one byte of the day file changed.
+    assert_eq!(
+        std::fs::read_to_string(&day).unwrap(),
+        before,
+        "postponing is client state about one day, never a markdown edit"
+    );
+    // And it is date-scoped, in its own store beside the glance store.
+    let stored = std::fs::read_to_string(vault.join("state/defer.json")).unwrap();
+    assert!(
+        stored.contains(&format!("2026-03-03/{id}")),
+        "the defer key is date-scoped: {stored}"
+    );
+
+    // A fresh GET carries the flag too, so it survives a relaunch.
+    let (after, after_etag) = today_snapshot(&st).await;
+    assert!(deferred_state(&after, "Reply to Ada"));
+
+    // Toggling back clears it.
+    let resp = app(st.clone())
+        .oneshot(today_defer_request(
+            Some("Bearer test-token"),
+            &id,
+            Some(&after_etag),
+            r#"{"deferred":false,"atMs":1772000001000}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let (back, _) = today_snapshot(&st).await;
+    assert!(!deferred_state(&back, "Reply to Ada"));
+    assert_eq!(std::fs::read_to_string(&day).unwrap(), before);
+
+    let _ = std::fs::remove_dir_all(&vault);
+}
+
+#[tokio::test]
+async fn today_defer_accepts_the_lead_item_that_no_move_can_touch() {
+    let (st, vault) = today_write_state();
+    let (snapshot, etag) = today_snapshot(&st).await;
+    let id = id_of(&snapshot, "TOP PRIORITY");
+
+    // The same item, through the two endpoints: move refuses it structurally,
+    // defer must not — it counts toward the badge, so it has to be dismissible
+    // without ticking off work that was not done.
+    let resp = app(st.clone())
+        .oneshot(today_move_request(
+            Some("Bearer test-token"),
+            &id,
+            Some(&etag),
+            r#"{"op":"to_do_now","at":"2026-03-03T09:30:00Z"}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CONFLICT);
+
+    let resp = app(st.clone())
+        .oneshot(today_defer_request(
+            Some("Bearer test-token"),
+            &id,
+            Some(&etag),
+            r#"{"deferred":true,"atMs":1772000000000}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body: Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    assert!(body["leadItems"][0]["deferred"].as_bool().unwrap());
+
+    let _ = std::fs::remove_dir_all(&vault);
+}
+
+#[tokio::test]
+async fn today_defer_is_404_for_an_id_that_is_not_in_the_day() {
+    let (st, vault) = today_write_state();
+    let (_, etag) = today_snapshot(&st).await;
+    let resp = app(st.clone())
+        .oneshot(today_defer_request(
+            Some("Bearer test-token"),
+            "deadbeef1234",
+            Some(&etag),
+            r#"{"deferred":true,"atMs":1772000000000}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    let _ = std::fs::remove_dir_all(&vault);
+}
+
+#[tokio::test]
+async fn today_defer_needs_a_bearer_and_a_fresh_if_match() {
+    let (st, vault) = today_write_state();
+    let (snapshot, etag) = today_snapshot(&st).await;
+    let id = id_of(&snapshot, "Reply to Ada");
+    let body = r#"{"deferred":true,"atMs":1772000000000}"#;
+
+    let resp = app(st.clone())
+        .oneshot(today_defer_request(None, &id, Some(&etag), body))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+    let resp = app(st.clone())
+        .oneshot(today_defer_request(
+            Some("Bearer test-token"),
+            &id,
+            None,
+            body,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::PRECONDITION_REQUIRED);
+
+    let resp = app(st.clone())
+        .oneshot(today_defer_request(
+            Some("Bearer test-token"),
+            &id,
+            Some("\"stale\""),
+            body,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::PRECONDITION_FAILED);
+    let _ = std::fs::remove_dir_all(&vault);
+}
+
+// ---- POST …/move with op: to_section ---------------------------------------
+
+#[tokio::test]
+async fn today_move_to_section_carries_an_item_out_of_do_now() {
+    let (st, vault) = today_write_state();
+    let (snapshot, etag) = today_snapshot(&st).await;
+    let id = id_of(&snapshot, "Reply to Ada");
+
+    let resp = app(st.clone())
+        .oneshot(today_move_request(
+            Some("Bearer test-token"),
+            &id,
+            Some(&etag),
+            r#"{"op":"to_section","section":"Errands","at":"2026-03-03T09:30:00Z"}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let (after, _) = today_snapshot(&st).await;
+    let errands = section_leads(&after, "Errands");
+    assert!(
+        errands[0].starts_with("Reply to Ada"),
+        "it lands at the TOP of the destination, got {errands:?}"
+    );
+    assert!(
+        !section_leads(&after, "Do Now")
+            .iter()
+            .any(|l| l.starts_with("Reply to Ada")),
+        "and it left Do Now"
+    );
+    let _ = std::fs::remove_dir_all(&vault);
+}
+
+#[tokio::test]
+async fn today_move_to_section_rejects_a_missing_or_unknown_destination() {
+    let (st, vault) = today_write_state();
+    let (snapshot, etag) = today_snapshot(&st).await;
+    let id = id_of(&snapshot, "Reply to Ada");
+
+    for body in [
+        r#"{"op":"to_section","at":"2026-03-03T09:30:00Z"}"#,
+        r#"{"op":"to_section","section":"","at":"2026-03-03T09:30:00Z"}"#,
+        r#"{"op":"to_section","section":"   ","at":"2026-03-03T09:30:00Z"}"#,
+    ] {
+        let resp = app(st.clone())
+            .oneshot(today_move_request(
+                Some("Bearer test-token"),
+                &id,
+                Some(&etag),
+                body,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::BAD_REQUEST,
+            "to_section without a destination is a client mistake: {body}"
+        );
+        assert!(
+            body_string(resp).await.contains("section"),
+            "and the message names the field"
+        );
+    }
+
+    let resp = app(st.clone())
+        .oneshot(today_move_request(
+            Some("Bearer test-token"),
+            &id,
+            Some(&etag),
+            r#"{"op":"to_section","section":"Someday Maybe","at":"2026-03-03T09:30:00Z"}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    let _ = std::fs::remove_dir_all(&vault);
+}
+
+#[tokio::test]
+async fn today_move_to_section_into_its_own_section_writes_nothing() {
+    let (st, vault) = today_write_state();
+    let day = vault.join("vault/Today.md");
+    let before = std::fs::read_to_string(&day).unwrap();
+    let (snapshot, etag) = today_snapshot(&st).await;
+    let id = id_of(&snapshot, "Reply to Ada");
+
+    let resp = app(st.clone())
+        .oneshot(today_move_request(
+            Some("Bearer test-token"),
+            &id,
+            Some(&etag),
+            r#"{"op":"to_section","section":"Do Now","at":"2026-03-03T09:30:00Z"}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "a no-op still answers 200");
+    assert_eq!(
+        std::fs::read_to_string(&day).unwrap(),
+        before,
+        "and writes nothing at all"
+    );
+    let _ = std::fs::remove_dir_all(&vault);
+}
+
+#[tokio::test]
+async fn today_move_to_section_on_the_lead_item_is_409() {
+    let (st, vault) = today_write_state();
+    let (snapshot, etag) = today_snapshot(&st).await;
+    let id = id_of(&snapshot, "TOP PRIORITY");
+    let resp = app(st.clone())
+        .oneshot(today_move_request(
+            Some("Bearer test-token"),
+            &id,
+            Some(&etag),
+            r#"{"op":"to_section","section":"Errands","at":"2026-03-03T09:30:00Z"}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::CONFLICT,
+        "the lead block stays structurally immovable, new op or not"
+    );
+    let _ = std::fs::remove_dir_all(&vault);
+}
+
+/// Whether one item of a snapshot body is flagged postponed.
+fn deferred_state(snapshot: &Value, lead_starts: &str) -> bool {
+    let mut items: Vec<&Value> = snapshot["leadItems"].as_array().unwrap().iter().collect();
+    for section in snapshot["sections"].as_array().unwrap() {
+        items.extend(section["items"].as_array().unwrap().iter());
+    }
+    items
+        .iter()
+        .find(|i| {
+            i["lead"]
+                .as_str()
+                .unwrap_or_default()
+                .starts_with(lead_starts)
+        })
+        .unwrap_or_else(|| panic!("no item starting {lead_starts:?}"))["deferred"]
+        .as_bool()
+        .unwrap()
+}
+
+/// The leads of one section's items, in file order.
+fn section_leads(snapshot: &Value, name: &str) -> Vec<String> {
+    snapshot["sections"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["name"] == name)
+        .unwrap_or_else(|| panic!("section {name:?} missing"))["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|i| i["lead"].as_str().unwrap_or_default().to_string())
+        .collect()
+}
+
 /// THE OTHER HALF OF THE RACE, and the one a lock cannot catch: a turn spends
 /// almost all of its life holding NO lock. It read the file early, is thinking,
 /// and writes minutes later from the copy it holds. A tap in that window is
