@@ -2086,6 +2086,106 @@ impl Config {
     }
 }
 
+/// Republish the LaunchAgent's `JESSE_*` credentials under the names the MCP servers
+/// actually read, and supply the non-secret settings they need, in the BRIDGE's own
+/// environment — before any child is spawned.
+///
+/// # Why this exists at all
+///
+/// The plist stores `JESSE_UNIFI_USERNAME`, `JESSE_GITHUB_PAT`, and so on: prefixed, so the
+/// bridge's environment stays legible and a stray `UNIFI_PASSWORD` in some other tool's
+/// scope cannot be mistaken for ours. Every server, though, reads the name its own vendor
+/// chose. Something has to bridge the two, and it has to be THIS process rather than either
+/// harness:
+///
+/// * Claude Code's MCP subprocesses inherit the bridge's environment wholesale, so a name
+///   published here is simply present.
+/// * Codex scrubs the subprocess environment down to a handful of variables and forwards
+///   only what [`crate::CODEX_MCP_ENV_PASSTHROUGH`] names — BY NAME, with no ability to
+///   rename in flight. It can only forward a variable that already exists here.
+///
+/// So one function serves both harnesses, and the passthrough table must name exactly what
+/// this publishes. A name in that table with no publisher here means the server starts and
+/// registers ZERO tools — the failure is silent, and it looks like a broken server rather
+/// than a missing variable.
+///
+/// # Never overwrite
+///
+/// Every write is conditional on the target being unset, so a deployment that already
+/// exports a vendor name wins. That keeps this from being a hidden second source of truth
+/// for a value an operator set deliberately.
+///
+/// # Paths are built at RUNTIME, never written as literals
+///
+/// `WORKSPACE_MCP_CREDENTIALS_DIR` and `ROUTEROS_DEVICES_CONFIG` are under `$HOME`. Writing
+/// them as literals would hard-code one home directory into a tracked file and trip
+/// `scripts/ci-guards.sh` (R5, personal infrastructure). Composing them from `HOME` at
+/// startup keeps the source machine-independent, which is the same property the bare-command
+/// MCP entries in [`crate::MAIN_CHILD_MCP_CONFIG`] preserve.
+///
+/// # Proxmox is absent on purpose
+///
+/// It reads `__dirname/../.env` relative to its own file, so it needs nothing from here and
+/// is not in the passthrough table either.
+pub fn export_mcp_server_env() {
+    fn set_if_unset(key: &str, value: &str) {
+        if std::env::var_os(key).is_none() && !value.is_empty() {
+            std::env::set_var(key, value);
+        }
+    }
+    fn map(from: &str, to: &str) {
+        if let Ok(v) = std::env::var(from) {
+            set_if_unset(to, &v);
+        }
+    }
+
+    // Credentials: plist name -> the name the server reads.
+    map("JESSE_GOOGLE_CLIENT_ID", "GOOGLE_OAUTH_CLIENT_ID");
+    map("JESSE_GOOGLE_SECRET", "GOOGLE_OAUTH_CLIENT_SECRET");
+    map("JESSE_GITHUB_PAT", "GITHUB_PERSONAL_ACCESS_TOKEN");
+    map("JESSE_JMAP_TOKEN", "JMAP_TOKEN");
+    map("JESSE_UNIFI_USERNAME", "UNIFI_USERNAME");
+    map("JESSE_UNIFI_PASSWORD", "UNIFI_PASSWORD");
+
+    // Non-secret settings the servers need. UniFi's controller is a UDM-PRO-SE speaking the
+    // UniFi OS proxy API, which is why `CONTROLLER_TYPE` is `proxy` and TLS verification is
+    // off (it serves a self-signed certificate on the LAN).
+    set_if_unset("UNIFI_HOST", "10.20.0.2");
+    set_if_unset("UNIFI_PORT", "443");
+    set_if_unset("UNIFI_CONTROLLER_TYPE", "proxy");
+    set_if_unset("UNIFI_VERIFY_SSL", "false");
+    set_if_unset("UNIFI_SITE", "default");
+    set_if_unset("JMAP_SESSION_URL", "https://api.fastmail.com/jmap/session");
+    // RouterOS SSH listens on 2324, not 22. The server tries `api` (8728) first, so this
+    // only matters for the fallback path — but a wrong port there turns a clean failure
+    // into a hang.
+    set_if_unset("ROUTEROS_SSH_PORT", "2324");
+
+    if let Some(home) = std::env::var_os("HOME") {
+        let home = std::path::PathBuf::from(home);
+        // The Google OAuth token cache MUST be persistent. A `/tmp` path survives until the
+        // next reboot and then forces an interactive re-consent, which a headless bridge
+        // turn cannot perform — the servers would simply stop answering one morning.
+        set_if_unset(
+            "WORKSPACE_MCP_CREDENTIALS_DIR",
+            &home.join(".config/jesse-google/creds").to_string_lossy(),
+        );
+        // Where the Google server writes attachments and downloaded Drive files. Pointed
+        // OUT of the working tree deliberately: MCP servers run outside the child's sandbox
+        // and default to writing into the cwd, which is the vault.
+        set_if_unset(
+            "WORKSPACE_ATTACHMENT_DIR",
+            &home.join(".config/jesse-google/attachments").to_string_lossy(),
+        );
+        // RouterOS reads its device list from a FILE rather than the environment, so what
+        // gets forwarded is the path, not a credential.
+        set_if_unset(
+            "ROUTEROS_DEVICES_CONFIG",
+            &home.join(".config/routeros-mcp/devices.yaml").to_string_lossy(),
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3238,105 +3338,5 @@ auth_token_env = "JESSE_TEST_FW_TOKEN"
                 None => std::env::remove_var(k),
             }
         }
-    }
-}
-
-/// Republish the LaunchAgent's `JESSE_*` credentials under the names the MCP servers
-/// actually read, and supply the non-secret settings they need, in the BRIDGE's own
-/// environment — before any child is spawned.
-///
-/// # Why this exists at all
-///
-/// The plist stores `JESSE_UNIFI_USERNAME`, `JESSE_GITHUB_PAT`, and so on: prefixed, so the
-/// bridge's environment stays legible and a stray `UNIFI_PASSWORD` in some other tool's
-/// scope cannot be mistaken for ours. Every server, though, reads the name its own vendor
-/// chose. Something has to bridge the two, and it has to be THIS process rather than either
-/// harness:
-///
-/// * Claude Code's MCP subprocesses inherit the bridge's environment wholesale, so a name
-///   published here is simply present.
-/// * Codex scrubs the subprocess environment down to a handful of variables and forwards
-///   only what [`crate::CODEX_MCP_ENV_PASSTHROUGH`] names — BY NAME, with no ability to
-///   rename in flight. It can only forward a variable that already exists here.
-///
-/// So one function serves both harnesses, and the passthrough table must name exactly what
-/// this publishes. A name in that table with no publisher here means the server starts and
-/// registers ZERO tools — the failure is silent, and it looks like a broken server rather
-/// than a missing variable.
-///
-/// # Never overwrite
-///
-/// Every write is conditional on the target being unset, so a deployment that already
-/// exports a vendor name wins. That keeps this from being a hidden second source of truth
-/// for a value an operator set deliberately.
-///
-/// # Paths are built at RUNTIME, never written as literals
-///
-/// `WORKSPACE_MCP_CREDENTIALS_DIR` and `ROUTEROS_DEVICES_CONFIG` are under `$HOME`. Writing
-/// them as literals would hard-code one home directory into a tracked file and trip
-/// `scripts/ci-guards.sh` (R5, personal infrastructure). Composing them from `HOME` at
-/// startup keeps the source machine-independent, which is the same property the bare-command
-/// MCP entries in [`crate::MAIN_CHILD_MCP_CONFIG`] preserve.
-///
-/// # Proxmox is absent on purpose
-///
-/// It reads `__dirname/../.env` relative to its own file, so it needs nothing from here and
-/// is not in the passthrough table either.
-pub fn export_mcp_server_env() {
-    fn set_if_unset(key: &str, value: &str) {
-        if std::env::var_os(key).is_none() && !value.is_empty() {
-            std::env::set_var(key, value);
-        }
-    }
-    fn map(from: &str, to: &str) {
-        if let Ok(v) = std::env::var(from) {
-            set_if_unset(to, &v);
-        }
-    }
-
-    // Credentials: plist name -> the name the server reads.
-    map("JESSE_GOOGLE_CLIENT_ID", "GOOGLE_OAUTH_CLIENT_ID");
-    map("JESSE_GOOGLE_SECRET", "GOOGLE_OAUTH_CLIENT_SECRET");
-    map("JESSE_GITHUB_PAT", "GITHUB_PERSONAL_ACCESS_TOKEN");
-    map("JESSE_JMAP_TOKEN", "JMAP_TOKEN");
-    map("JESSE_UNIFI_USERNAME", "UNIFI_USERNAME");
-    map("JESSE_UNIFI_PASSWORD", "UNIFI_PASSWORD");
-
-    // Non-secret settings the servers need. UniFi's controller is a UDM-PRO-SE speaking the
-    // UniFi OS proxy API, which is why `CONTROLLER_TYPE` is `proxy` and TLS verification is
-    // off (it serves a self-signed certificate on the LAN).
-    set_if_unset("UNIFI_HOST", "10.20.0.2");
-    set_if_unset("UNIFI_PORT", "443");
-    set_if_unset("UNIFI_CONTROLLER_TYPE", "proxy");
-    set_if_unset("UNIFI_VERIFY_SSL", "false");
-    set_if_unset("UNIFI_SITE", "default");
-    set_if_unset("JMAP_SESSION_URL", "https://api.fastmail.com/jmap/session");
-    // RouterOS SSH listens on 2324, not 22. The server tries `api` (8728) first, so this
-    // only matters for the fallback path — but a wrong port there turns a clean failure
-    // into a hang.
-    set_if_unset("ROUTEROS_SSH_PORT", "2324");
-
-    if let Some(home) = std::env::var_os("HOME") {
-        let home = std::path::PathBuf::from(home);
-        // The Google OAuth token cache MUST be persistent. A `/tmp` path survives until the
-        // next reboot and then forces an interactive re-consent, which a headless bridge
-        // turn cannot perform — the servers would simply stop answering one morning.
-        set_if_unset(
-            "WORKSPACE_MCP_CREDENTIALS_DIR",
-            &home.join(".config/jesse-google/creds").to_string_lossy(),
-        );
-        // Where the Google server writes attachments and downloaded Drive files. Pointed
-        // OUT of the working tree deliberately: MCP servers run outside the child's sandbox
-        // and default to writing into the cwd, which is the vault.
-        set_if_unset(
-            "WORKSPACE_ATTACHMENT_DIR",
-            &home.join(".config/jesse-google/attachments").to_string_lossy(),
-        );
-        // RouterOS reads its device list from a FILE rather than the environment, so what
-        // gets forwarded is the path, not a credential.
-        set_if_unset(
-            "ROUTEROS_DEVICES_CONFIG",
-            &home.join(".config/routeros-mcp/devices.yaml").to_string_lossy(),
-        );
     }
 }
