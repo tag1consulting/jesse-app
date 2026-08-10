@@ -498,8 +498,14 @@ fn app_completed(continuations: &[&str]) -> Option<AppCompleted> {
 
 /// An `HH:MM` clock, strictly.
 fn is_clock(s: &str) -> bool {
-    let _ = s;
-    false
+    let Some((h, m)) = s.split_once(':') else {
+        return false;
+    };
+    h.len() == 2
+        && m.len() == 2
+        && h.bytes().chain(m.bytes()).all(|c| c.is_ascii_digit())
+        && h.parse::<u32>().is_ok_and(|h| h < 24)
+        && m.parse::<u32>().is_ok_and(|m| m < 60)
 }
 
 // ---- Classification --------------------------------------------------------
@@ -875,8 +881,19 @@ impl GlanceStore {
     /// Best-effort and never fatal — a glance that fails to persist costs one
     /// re-read of a briefing row.
     pub fn record(state_dir: Option<&str>, date: &str, id: &str, glanced_ms: u64) {
-    let _ = (state_dir, date, id, glanced_ms);
-}
+        let Some(path) = glance_path(state_dir) else {
+            return;
+        };
+        let mut map = Self::load(state_dir).map;
+        let key = Self::key(date, id);
+        let entry = map.entry(key).or_default();
+        if glanced_ms > entry.seen_ms {
+            entry.seen = true;
+            entry.seen_ms = glanced_ms;
+        }
+        gc_glances(&mut map, date);
+        persist_glances(&path, &map);
+    }
 
     /// The stored rows. Tests and introspection only.
     pub fn len(&self) -> usize {
@@ -904,13 +921,42 @@ fn glance_path(state_dir: Option<&str>) -> Option<PathBuf> {
 /// legacy bare-id shape or something hand-written, and neither is ours to
 /// discard.
 fn gc_glances(map: &mut HashMap<String, GlanceFlag>, reference: &str) {
-    let _ = (map, reference);
+    let Some(today) = valid_iso_date(reference).map(civil_days) else {
+        return;
+    };
+    map.retain(|k, _| {
+        let Some((date, _)) = k.split_once('/') else {
+            return true;
+        };
+        match valid_iso_date(date).map(civil_days) {
+            Some(day) => today - day <= GLANCE_RETENTION_DAYS,
+            None => true,
+        }
+    });
 }
 
 /// Persist the glance map atomically (temp + rename), mode 0600 — the same
 /// discipline as [`persist_flags`]. Best-effort: a failure is logged, never fatal.
 fn persist_glances(path: &Path, map: &HashMap<String, GlanceFlag>) {
-    let _ = (path, map);
+    let tmp = path.with_extension("json.tmp");
+    let write = || -> std::io::Result<()> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&tmp)?;
+        f.write_all(serde_json::to_string(map).unwrap_or_default().as_bytes())?;
+        f.sync_all()?;
+        std::fs::rename(&tmp, path)
+    };
+    if let Err(e) = write() {
+        eprintln!("warning: could not persist the glance store: {e}");
+        let _ = std::fs::remove_file(&tmp);
+    }
 }
 
 /// Days since the civil epoch (1970-01-01) for a `(y, m, d)`, so two dates can be

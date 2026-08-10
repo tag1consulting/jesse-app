@@ -1374,6 +1374,114 @@ it in memory, and writes nothing — not the day file, not a cache, not a log li
   this endpoint. An absent, unreadable or malformed store reads as **empty**, not
   as an error.
 
+## Day file writes (`POST /jesse/today/...`)
+
+Bridge 0.71.0 gave the day file a write path: `POST /jesse/today/items/{id}/check`,
+`POST /jesse/today/items/{id}/move` and `POST /jesse/today/glance`. **This is the
+first thing in the bridge that writes the agent's own working files**, so it is
+worth being precise about exactly how much it can write, and what it cannot.
+
+- **Same two factors as every other endpoint.** Bearer auth plus the interface the
+  bridge binds to, and the shared rate limiter. An unauthenticated caller gets `401`
+  and changes nothing. No new credential, no new listener, no child process — these
+  are in-process file edits by the bridge itself.
+- **No containment-record change.** No MCP server, no tool grant, no agent
+  capability. The containment rows and the startup gate are untouched. The bridge's
+  own write is not an agent write and is not gated by the agent's allowlist — which
+  is precisely why the rest of this section exists.
+- **The bridge NEVER composes content.** Everything it can emit into the vault is
+  three checkbox bytes, the relocation of an existing block, and exactly one fixed
+  sub-line:
+
+      \t*(app-completed YYYY-MM-DD HH:MM: <evidence>)*
+
+  There is no markdown writer here and no path by which app input becomes arbitrary
+  document text. `evidence` is the only app-supplied string that ever reaches the
+  file: it is flattened to a single line (control characters and newlines become
+  spaces), capped at **500 characters**, and every character that could restructure
+  the document is backslash-escaped — `` \ * _ ` [ ] ( ) # ~ | < > ``. Escaping `)`
+  and `*` is what stops evidence from closing the wrapper early and continuing as
+  document content; a unit test feeds it `")* and now I am a heading\n# OWNED"` and
+  asserts the result is still one line, still inside the wrapper, and still parses
+  back as a continuation of its own item rather than as a document line.
+- **Line-level splices only, and no path traversal.** The file is
+  `<JESSE_VAULT>/<VAULT_SUBDIR>/Today.md`, composed from config by one function; the
+  only request-supplied value is an item **id**, which is looked up in a re-parse and
+  never used to build a path. An unknown id is `410`, not a filesystem probe.
+- **Whole-file atomic rename, never an in-place edit.** `Today.md` is watched by a
+  third-party sync tool. An in-place rewrite is observable half-written and would let
+  the syncer propagate a truncated day. Every write is staged in a temp file in the
+  same directory and lands with one `rename(2)`, so any reader sees the whole old
+  file or the whole new one. The temp file inherits the existing file's mode rather
+  than tightening it to `0600`: a checkbox tap must not silently re-permission a
+  vault file a person and an agent both read.
+- **Preconditioned.** Every mutation requires `If-Match` carrying the snapshot etag.
+  A stale one is `412` and **touches nothing** — not the file, not the journal — so a
+  client holding an out-of-date view refetches instead of editing blind. A missing one
+  is `428`. Items are re-found by re-parsing at write time, never by a byte offset
+  from a snapshot that may since have been rewritten.
+
+### The clobber race, and why the fix is a journal rather than a lock
+
+The bridge is not the only writer of this file. An agent turn reads it, thinks for
+minutes, and writes back a whole file composed from the copy it read. **A box checked
+in that window is silently reverted** when the turn's write lands: the checkbox pops
+back open and nothing records that it was ever ticked. That is a correctness and a
+trust problem — the user believes they completed something the vault no longer says
+they did.
+
+The obvious mitigation, making a mutation take the vault write lock, was rejected. A
+turn may legitimately run for minutes, and a checkbox tap that hangs for minutes is a
+broken UI; worse, it would couple the phone's responsiveness to the agent's slowest
+tool call. **So a mutation never blocks on the turn lock.** Instead:
+
+1. **Journal, then edit.** Every check and move intent is written to
+   `<state_dir>/today-intents.json` (atomic temp+rename, mode `0600`) *before* any
+   file edit. A crash between the two leaves an intent whose effect is absent, which
+   is exactly the state replay resolves — the tap is not lost.
+2. **Apply, or park.** If no write-enabled turn holds the lock on the day file, the
+   intent is applied immediately and pruned. If one does, it is parked, and
+   `GET /jesse/today` merges pending intents into the snapshot so the app still reads
+   its own writes.
+3. **Replay at turn completion.** The `TurnLockRelease` drop guard — which runs when
+   a turn ends *however* it ended, including a kill between hooks, a timeout, a panic
+   and the abort a cancel performs — re-parses the file and re-applies any journaled
+   intent whose effect is absent. The clobber still happens; it is repaired within
+   milliseconds of the turn ending, against whatever the agent actually wrote.
+
+An intent is recorded by **identity** (section, lead, `(Added …)` date — the identity
+contract's three real inputs), not by id or byte offset, so it survives the morning
+rebuild. Every journaled effect is **idempotent**: a move is never journaled as `up`
+or `down` (applying `up` twice moves an item two rows) but resolved at request time
+into an absolute landing that can be re-applied any number of times with the same
+result. Replay **never re-adds a vanished item** — if the morning routine retired the
+line, that is the agent's decision and a stale tap does not overrule it — and only
+replays intents dated the current file's date or newer, so yesterday's tap cannot
+re-apply itself to today's day. The journal is capped at 200 entries.
+
+**A short internal mutex** serializes the bridge's own writes so two taps arriving
+together cannot interleave read-modify-write cycles and lose one. It is deliberately
+not the turn lock and protects a different thing: the agent is a separate process, and
+the journal is what covers that race.
+
+### Residual risk, named
+
+- **With no state dir there is no journal.** The write path degrades to
+  apply-immediately, and a tap that races a running turn can still be clobbered with
+  nothing to replay it. This is the same degradation the job, title, flag and device
+  stores have; a real deploy configures a state dir.
+- **The repair window is visible.** Between the agent's clobbering write and the
+  turn's completion, the file on disk does not carry the tap. `GET /jesse/today`
+  papers over this for the app (the pending merge), but anything reading the file
+  directly in that window — the sync tool, another agent — sees the un-ticked line.
+- **The bridge never propagates a completion beyond `Today.md`.** Closing the item at
+  its source (a Dashboard, a project note) belongs to the agent and the morning
+  routine. The bridge does not re-implement close-at-source, and a check here is not
+  a claim that anything else was updated.
+- **The journal holds vault content.** Item leads and the app's evidence text live in
+  the state dir, so it stays out of logs, the metrics log and provenance — the same
+  handling as the context ledger.
+
 ## Session list (`GET /jesse/sessions`)
 
 `GET /jesse/sessions` lets the app show a history of conversations. It is

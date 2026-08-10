@@ -40,7 +40,6 @@
 //! design this deliberately avoids.
 
 use crate::*;
-#[allow(unused_imports)]
 use std::os::unix::fs::PermissionsExt;
 
 /// The longest evidence string the app may attach to a completion, in
@@ -167,7 +166,23 @@ impl MoveOp {
 /// a second line — a multi-line insertion would break the continuation block the
 /// parser uses to decide which lines belong to the item.
 pub fn escape_evidence(raw: &str) -> String {
-    raw.to_string()
+    let flat: String = raw
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect();
+    let collapsed = flat.split_whitespace().collect::<Vec<_>>().join(" ");
+    let capped: String = collapsed.chars().take(MAX_EVIDENCE_CHARS).collect();
+    let mut out = String::with_capacity(capped.len() + 8);
+    for c in capped.chars() {
+        if matches!(
+            c,
+            '\\' | '*' | '_' | '`' | '[' | ']' | '(' | ')' | '#' | '~' | '|' | '<' | '>'
+        ) {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out
 }
 
 /// **The frozen app-completed sub-line grammar.** One tab, then
@@ -182,8 +197,7 @@ pub fn escape_evidence(raw: &str) -> String {
 /// continuation of the item above it, so the sub-line travels with its item
 /// through every later move and is never mistaken for a document line.
 pub fn app_completed_sub_line(stamp: &str, escaped_evidence: &str) -> String {
-    let _ = (stamp, escaped_evidence);
-    String::new()
+    format!("\t*(app-completed {stamp}: {escaped_evidence})*\n")
 }
 
 /// Normalize a client ISO8601 instant to the sub-line's `YYYY-MM-DD HH:MM`.
@@ -193,8 +207,18 @@ pub fn app_completed_sub_line(stamp: &str, escaped_evidence: &str) -> String {
 /// replayed minutes later, and a silently substituted server time would be a
 /// quiet lie in the vault.
 pub fn stamp_from_iso(at: &str) -> Option<String> {
-    let _ = at;
-    None
+    let date = at.get(..10).filter(|d| valid_iso_date(d).is_some())?;
+    let sep = at.as_bytes().get(10)?;
+    if !matches!(sep, b'T' | b't' | b' ') {
+        return None;
+    }
+    let clock = at.get(11..16)?;
+    let (h, m) = clock.split_once(':')?;
+    let (h, m) = (h.parse::<u32>().ok()?, m.parse::<u32>().ok()?);
+    if h > 23 || m > 59 {
+        return None;
+    }
+    Some(format!("{date} {h:02}:{m:02}"))
 }
 
 // ---- Locating an item ------------------------------------------------------
@@ -251,8 +275,15 @@ pub fn apply_check(
     evidence: Option<&str>,
     stamp: &str,
 ) -> Result<String, SpliceError> {
-    let _ = (src, intent, checked, evidence, stamp);
-    Err(SpliceError::UnknownItem)
+    let snapshot = parse_today(src);
+    let located = locate_by_intent(&snapshot, intent).ok_or(SpliceError::UnknownItem)?;
+    let range = &located.item.range;
+    let rebuilt = rebuild_item_block(&src[range.start..range.end], checked, evidence, stamp)?;
+    let mut out = String::with_capacity(src.len() + rebuilt.len());
+    out.push_str(&src[..range.start]);
+    out.push_str(&rebuilt);
+    out.push_str(&src[range.end..]);
+    Ok(out)
 }
 
 /// Rebuild one item's block (its task line plus its continuation lines) with the
@@ -263,8 +294,40 @@ fn rebuild_item_block(
     evidence: Option<&str>,
     stamp: &str,
 ) -> Result<String, SpliceError> {
-    let _ = (block, checked, evidence, stamp);
-    Err(SpliceError::NotATaskLine)
+    // A file need not end with a newline, and an item at EOF must not gain one:
+    // that would be a byte of change outside the item.
+    let ends_with_newline = block.ends_with('\n');
+    let pieces: Vec<&str> = block.split_inclusive('\n').collect();
+    let first = *pieces.first().ok_or(SpliceError::NotATaskLine)?;
+    let mut kept: Vec<String> = Vec::with_capacity(pieces.len() + 1);
+    kept.push(flip_checkbox(first, checked).ok_or(SpliceError::NotATaskLine)?);
+    // Drop any sub-line already there — a re-check replaces it, an uncheck
+    // removes it. Continuations that are not ours travel untouched.
+    kept.extend(
+        pieces
+            .iter()
+            .skip(1)
+            .filter(|p| !p.contains("app-completed"))
+            .map(|p| (*p).to_string()),
+    );
+    if checked {
+        let escaped = evidence.map(escape_evidence).unwrap_or_default();
+        if !escaped.is_empty() {
+            if !kept[0].ends_with('\n') {
+                kept[0].push('\n');
+            }
+            let mut line = app_completed_sub_line(stamp, &escaped);
+            if kept.len() == 1 && !ends_with_newline {
+                line.pop();
+            }
+            kept.insert(1, line);
+        }
+    }
+    let mut out = kept.concat();
+    if !ends_with_newline && out.ends_with('\n') {
+        out.pop();
+    }
+    Ok(out)
 }
 
 /// Flip the three checkbox bytes of a task line, preserving its marker, its
@@ -274,8 +337,15 @@ fn rebuild_item_block(
 /// followed by a three-byte box. An indented checkbox is a continuation, not a
 /// task, and is deliberately not matched here either.
 fn flip_checkbox(line: &str, checked: bool) -> Option<String> {
-    let _ = (line, checked);
-    None
+    let body = line
+        .strip_prefix("* ")
+        .or_else(|| line.strip_prefix("- "))?;
+    let boxed = body.get(..3)?;
+    if !matches!(boxed, "[ ]" | "[x]" | "[X]") {
+        return None;
+    }
+    let want = if checked { "[x]" } else { "[ ]" };
+    Some(format!("{}{}{}", &line[..2], want, &body[3..]))
 }
 
 // ---- The move splice -------------------------------------------------------
@@ -291,29 +361,111 @@ pub fn apply_landing(
     to_section: &str,
     landing: &Landing,
 ) -> Result<String, SpliceError> {
-    let _ = (src, intent, to_section, landing);
-    Err(SpliceError::UnknownItem)
+    let snapshot = parse_today(src);
+    let located = locate_by_intent(&snapshot, intent).ok_or(SpliceError::UnknownItem)?;
+    // THE LEAD-BLOCK GUARD, source half: the standing top-priority item lives
+    // above every heading and is not the app's to reorder.
+    if located.section.is_none() {
+        return Err(SpliceError::LeadBlockImmutable);
+    }
+    let dest = snapshot
+        .sections
+        .iter()
+        .find(|s| s.name == to_section)
+        .ok_or(SpliceError::UnknownSection)?;
+    let insert_at = landing_offset(src, dest, located.item, landing);
+    // THE LEAD-BLOCK GUARD, destination half. Every offset above is derived from
+    // a section's own range, so this is belt-and-braces — and it is asserted
+    // rather than reasoned about because the cost of being wrong is an item
+    // spliced above the first heading, where the parser would read it as a
+    // standing item.
+    let first_heading = snapshot.sections.first().map_or(0, |s| s.range.start);
+    if insert_at < first_heading {
+        return Err(SpliceError::LeadBlockImmutable);
+    }
+    Ok(splice_block(
+        src,
+        located.item.range.start,
+        located.item.range.end,
+        insert_at,
+    ))
 }
 
 /// The byte offset a landing names, degrading `Above` to `Last` when its anchor
 /// is gone (the item still reaches the right section, which is the part that
 /// matters).
 fn landing_offset(src: &str, dest: &TodaySection, mover: &TodayItem, landing: &Landing) -> usize {
-    let _ = (src, dest, mover, landing);
-    0
+    if let Landing::Above { lead, added_date } = landing {
+        let anchor = dest.items.iter().find(|it| {
+            it.id != mover.id
+                && normalize_lead(&it.lead) == normalize_lead(lead)
+                && it.added_date.as_deref().unwrap_or_default() == added_date
+        });
+        if let Some(anchor) = anchor {
+            return anchor.range.start;
+        }
+    }
+    match dest.items.iter().rev().find(|it| it.id != mover.id) {
+        Some(last) => last.range.end,
+        // An empty destination section: just past its heading and any blank
+        // lines under it, so the item lands as the section's body rather than
+        // glued to the heading.
+        None => after_heading(src, dest),
+    }
 }
 
 /// The offset just past a section's heading line and any blank lines under it.
 fn after_heading(src: &str, dest: &TodaySection) -> usize {
-    let _ = (src, dest);
-    0
+    let end = dest.range.end;
+    let mut at = match src[dest.range.start..end].find('\n') {
+        Some(n) => dest.range.start + n + 1,
+        None => end,
+    };
+    while at < end {
+        let line_end = match src[at..end].find('\n') {
+            Some(n) => at + n + 1,
+            None => end,
+        };
+        if line_end > at && src[at..line_end].trim().is_empty() {
+            at = line_end;
+        } else {
+            break;
+        }
+    }
+    at
 }
 
 /// Cut `[start, end)` out and re-insert it at `insert_at`, an offset in the
 /// ORIGINAL source. Every other byte is carried across untouched.
 fn splice_block(src: &str, start: usize, end: usize, insert_at: usize) -> String {
-    let _ = (start, end, insert_at);
-    src.to_string()
+    if insert_at > start && insert_at < end {
+        return src.to_string(); // into itself — a no-op, not a corruption
+    }
+    // An item at EOF may have no trailing newline. Moving it anywhere else would
+    // then join it to the following line, so it gains one and the file's new
+    // last line gives one up — the byte count is unchanged.
+    let raw = &src[start..end];
+    let restore_eof = !raw.ends_with('\n');
+    let mut block = raw.to_string();
+    if restore_eof {
+        block.push('\n');
+    }
+    let mut out = String::with_capacity(src.len() + 1);
+    if insert_at <= start {
+        out.push_str(&src[..insert_at]);
+        out.push_str(&block);
+        out.push_str(&src[insert_at..start]);
+        out.push_str(&src[end..]);
+    } else {
+        out.push_str(&src[..start]);
+        out.push_str(&src[end..insert_at]);
+        out.push_str(&block);
+        out.push_str(&src[insert_at..]);
+    }
+    if restore_eof && out.ends_with('\n') {
+        out.pop();
+    }
+    out
 }
 
 /// Resolve a relative op into the absolute landing that gets journaled.
@@ -326,15 +478,51 @@ pub fn resolve_landing(
     located: &Located,
     op: MoveOp,
 ) -> Result<Option<(String, Landing)>, SpliceError> {
-    let _ = (snapshot, located, op);
-    Ok(None)
+    let section = located.section.ok_or(SpliceError::LeadBlockImmutable)?;
+    let resolved = match op {
+        MoveOp::ToDoNow => {
+            let dest = snapshot
+                .sections
+                .iter()
+                .find(|s| s.name.starts_with("Do Now"))
+                .ok_or(SpliceError::NoDoNowSection)?;
+            (dest.name.clone(), top_landing(dest, located.item))
+        }
+        MoveOp::TopOfSection => (section.name.clone(), top_landing(section, located.item)),
+        MoveOp::Up => {
+            if located.index == 0 {
+                return Ok(None);
+            }
+            (
+                section.name.clone(),
+                above(&section.items[located.index - 1]),
+            )
+        }
+        MoveOp::Down => {
+            if located.index + 1 >= section.items.len() {
+                return Ok(None);
+            }
+            let landing = match section.items.get(located.index + 2) {
+                Some(after_next) => above(after_next),
+                None => Landing::Last,
+            };
+            (section.name.clone(), landing)
+        }
+    };
+    // Already there? Then it is a no-op, whatever the op was called.
+    if resolved.0 == section.name && landing_is_satisfied(section, located.index, &resolved.1) {
+        return Ok(None);
+    }
+    Ok(Some(resolved))
 }
 
 /// "Above the first item that is not the mover", or `Last` for a section that
 /// holds nothing else — which is the same position.
 fn top_landing(dest: &TodaySection, mover: &TodayItem) -> Landing {
-    let _ = (dest, mover);
-    Landing::Last
+    match dest.items.iter().find(|it| it.id != mover.id) {
+        Some(first) => above(first),
+        None => Landing::Last,
+    }
 }
 
 fn above(anchor: &TodayItem) -> Landing {
@@ -348,8 +536,13 @@ fn above(anchor: &TodayItem) -> Landing {
 /// Shared with the journal's effect verification so the endpoint's idea of "no
 /// change needed" and replay's cannot drift apart.
 pub fn landing_is_satisfied(section: &TodaySection, index: usize, landing: &Landing) -> bool {
-    let _ = (section, index, landing);
-    false
+    match landing {
+        Landing::Last => index + 1 == section.items.len(),
+        Landing::Above { lead, added_date } => section.items.get(index + 1).is_some_and(|next| {
+            normalize_lead(&next.lead) == normalize_lead(lead)
+                && next.added_date.as_deref().unwrap_or_default() == added_date
+        }),
+    }
 }
 
 // ---- Writing the file ------------------------------------------------------
@@ -364,8 +557,30 @@ pub fn landing_is_satisfied(section: &TodaySection, index: usize, landing: &Land
 /// silently tightening its permissions on the first checkbox tap would be a
 /// surprising side effect of a UI action.
 pub fn write_day_file(path: &Path, contents: &str) -> std::io::Result<()> {
-    let _ = (path, contents);
-    Ok(())
+    let dir = path.parent().unwrap_or_else(|| Path::new("."));
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "Today.md".to_string());
+    let mode = std::fs::metadata(path)
+        .map(|m| m.permissions().mode() & 0o777)
+        .unwrap_or(0o600);
+    let tmp = dir.join(format!(".{name}.jesse-{}.tmp", random_hex()));
+    let write = || -> std::io::Result<()> {
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(mode)
+            .open(&tmp)?;
+        f.write_all(contents.as_bytes())?;
+        f.sync_all()?;
+        std::fs::rename(&tmp, path)
+    };
+    let result = write();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    result
 }
 
 // ---- The endpoints ---------------------------------------------------------
@@ -468,8 +683,99 @@ fn mutate(
     at: &str,
     build: impl FnOnce(&TodaySnapshot, &Located) -> Result<Option<Effect>, ApiError>,
 ) -> Result<Response, ApiError> {
-    let _ = (st, headers, id, at, build);
-    Err((StatusCode::NOT_IMPLEMENTED, "the day-file write path is not implemented yet".to_string()))
+    let if_match = required_if_match(headers)?;
+    let day = day_file_path(&st.cfg);
+    // Sampled BEFORE the mutex so the answer is about the agent, not about
+    // another tap: a tap we are queued behind is not a turn.
+    let turn_is_writing = st.broker.holds_write_on(&day);
+    let journal = st.cfg.today_intents_file();
+
+    let _guard = day_file_lock();
+
+    // CRASH RECOVERY, and the invariant the immediate-apply path rests on: with
+    // no turn mid-write, drain the journal first, so what is on disk and what a
+    // client is looking at are the same document. Intents left by a bridge that
+    // died before replay are resolved here rather than waiting for a turn that
+    // may never come.
+    if !turn_is_writing {
+        if let Some(j) = &journal {
+            replay_locked(&st.cfg, j);
+        }
+    }
+
+    let Ok(src) = std::fs::read_to_string(&day) else {
+        return Err(SpliceError::UnknownItem.into());
+    };
+    let pending = journal.as_deref().map(load_intents).unwrap_or_default();
+    let merged = merge_pending(&src, &pending);
+    let mut snapshot = parse_today(&merged);
+    GlanceStore::load(st.cfg.state_dir.as_deref()).merge_into(&mut snapshot);
+
+    // THE PRECONDITION, before anything is recorded or written. A `412` must
+    // touch nothing at all — not the file, not the journal — so that a client
+    // holding a stale view refetches instead of editing blind.
+    if !if_match_matches(&if_match, &snapshot_etag(&snapshot)) {
+        return Err((
+            StatusCode::PRECONDITION_FAILED,
+            "the day file changed since you read it — refetch GET /jesse/today".to_string(),
+        ));
+    }
+
+    let located =
+        locate_by_id(&snapshot, id).ok_or_else(|| ApiError::from(SpliceError::UnknownItem))?;
+    let Some(effect) = build(&snapshot, &located)? else {
+        // A legitimate no-op (already at the top, already last). Nothing is
+        // journaled and nothing is written; the caller still gets the snapshot.
+        return Ok(mutation_response(&snapshot, !pending.is_empty()));
+    };
+    let intent = Intent {
+        seq: 0,
+        id: located.item.id.clone(),
+        section: located.section.map(|s| s.name.clone()).unwrap_or_default(),
+        lead: located.item.lead.clone(),
+        added_date: located.item.added_date.clone().unwrap_or_default(),
+        date: snapshot.date.clone().unwrap_or_default(),
+        at: at.to_string(),
+        effect,
+    };
+
+    // JOURNAL BEFORE EDIT. A crash between these two lines leaves an intent whose
+    // effect is absent, which is exactly what replay repairs. The reverse order
+    // would lose the tap.
+    let seq = journal.as_deref().map(|j| append_intent(j, intent.clone()));
+
+    if !turn_is_writing {
+        match apply_intent(&src, &intent) {
+            Ok(next) => {
+                if let Err(e) = write_day_file(&day, &next) {
+                    if let (Some(j), Some(seq)) = (journal.as_deref(), seq) {
+                        prune_intent(j, seq);
+                    }
+                    return Err((
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!("could not write the day file: {e}"),
+                    ));
+                }
+                // Verified: the effect is in the file, so the intent has nothing
+                // left to say.
+                if let (Some(j), Some(seq)) = (journal.as_deref(), seq) {
+                    prune_intent(j, seq);
+                }
+            }
+            Err(e) => {
+                if let (Some(j), Some(seq)) = (journal.as_deref(), seq) {
+                    prune_intent(j, seq);
+                }
+                return Err(e.into());
+            }
+        }
+    }
+
+    // Re-read rather than reuse: after an apply the file is the truth, and after
+    // a park the journal is. Both are covered by rebuilding from scratch.
+    let (_, fresh) = build_snapshot(&st.cfg);
+    let parked = journal.as_deref().map(load_intents).unwrap_or_default();
+    Ok(mutation_response(&fresh, !parked.is_empty()))
 }
 
 /// `POST /jesse/today/items/{id}/check` — tick or untick one item, optionally
@@ -546,8 +852,33 @@ pub async fn jesse_today_glance(
     Json(body): Json<GlanceBody>,
 ) -> Result<Response, ApiError> {
     check_auth(&headers, &st.cfg.token)?;
-    let _ = body;
-    Err((StatusCode::NOT_IMPLEMENTED, "the glance write path is not implemented yet".to_string()))
+    if !st.limiter.allow() {
+        return Err((
+            StatusCode::TOO_MANY_REQUESTS,
+            "rate limit exceeded".to_string(),
+        ));
+    }
+    let id = body.id.trim();
+    if id.is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "`id` is required".to_string()));
+    }
+    let if_match = required_if_match(&headers)?;
+    let (_, mut snapshot) = build_snapshot(&st.cfg);
+    if !if_match_matches(&if_match, &snapshot_etag(&snapshot)) {
+        return Err((
+            StatusCode::PRECONDITION_FAILED,
+            "the day file changed since you read it — refetch GET /jesse/today".to_string(),
+        ));
+    }
+    // The snapshot's own date scopes the key, so yesterday's "seen" never marks
+    // today's re-emitted row as read.
+    let date = snapshot
+        .date
+        .clone()
+        .unwrap_or_else(|| date_from_ms(body.glanced_at));
+    GlanceStore::record(st.cfg.state_dir.as_deref(), &date, id, body.glanced_at);
+    GlanceStore::load(st.cfg.state_dir.as_deref()).merge_into(&mut snapshot);
+    Ok(mutation_response(&snapshot, false))
 }
 
 #[cfg(test)]

@@ -152,8 +152,16 @@ impl Intent {
 
 /// Whether an item currently satisfies a landing inside `section`.
 fn landing_satisfied(section: &TodaySection, item_index: usize, landing: &Landing) -> bool {
-    let _ = (section, item_index, landing);
-    false
+    match landing {
+        Landing::Last => item_index + 1 == section.items.len(),
+        Landing::Above { lead, added_date } => match section.items.get(item_index + 1) {
+            Some(next) => {
+                normalize_lead(&next.lead) == normalize_lead(lead)
+                    && next.added_date.as_deref().unwrap_or_default() == added_date
+            }
+            None => false,
+        },
+    }
 }
 
 /// Has this intent's effect already landed in the parsed file?
@@ -162,8 +170,41 @@ fn landing_satisfied(section: &TodaySection, item_index: usize, landing: &Landin
 /// one case replay must not repair: re-adding a line the morning routine
 /// deliberately removed would resurrect content the agent retired.
 pub fn effect_present(snapshot: &TodaySnapshot, intent: &Intent) -> Option<bool> {
-    let _ = (snapshot, intent);
-    None
+    // A move is judged in its DESTINATION section: once applied, that is where
+    // the item lives, and its id has legitimately changed with it.
+    let target = intent.target_section();
+    if let Effect::Move { landing, .. } = &intent.effect {
+        if let Some(section) = snapshot.sections.iter().find(|s| s.name == target) {
+            if let Some(i) = section
+                .items
+                .iter()
+                .position(|it| intent.matches(it, &section.name))
+            {
+                return Some(landing_satisfied(section, i, landing));
+            }
+        }
+        // Not in the destination yet — but is it still in the file at all?
+        return find_item(snapshot, intent).map(|_| false);
+    }
+    let item = find_item(snapshot, intent)?;
+    match &intent.effect {
+        Effect::Check {
+            checked: true,
+            evidence,
+            stamp,
+        } => {
+            let sub_line_needed = evidence
+                .as_deref()
+                .map(str::trim)
+                .is_some_and(|e| !e.is_empty());
+            let sub_line_present = item.text.contains(&format!("app-completed {stamp}"));
+            Some(item.checked && (!sub_line_needed || sub_line_present))
+        }
+        Effect::Check { checked: false, .. } => {
+            Some(!item.checked && !item.text.contains("app-completed"))
+        }
+        Effect::Move { .. } => unreachable!("handled above"),
+    }
 }
 
 /// Find the item an intent is about, anywhere in the document, by identity.
@@ -172,8 +213,32 @@ pub fn effect_present(snapshot: &TodaySnapshot, intent: &Intent) -> Option<bool>
 /// move's item may legitimately have been re-parented already. Lead items are
 /// searched too so a vanished-vs-moved distinction is never made wrongly.
 pub fn find_item<'a>(snapshot: &'a TodaySnapshot, intent: &Intent) -> Option<&'a TodayItem> {
-    let _ = (snapshot, intent);
-    None
+    for section in &snapshot.sections {
+        if let Some(it) = section
+            .items
+            .iter()
+            .find(|it| intent.matches(it, &section.name))
+        {
+            return Some(it);
+        }
+    }
+    snapshot
+        .lead_items
+        .iter()
+        .find(|it| intent.matches(it, ""))
+        .or_else(|| {
+            // Last resort: the same lead + Added date in ANY section. A move's
+            // item is legitimately re-parented, so its section no longer matches
+            // either the recorded source or (before the move) the destination.
+            snapshot
+                .sections
+                .iter()
+                .flat_map(|s| s.items.iter())
+                .find(|it| {
+                    normalize_lead(&it.lead) == normalize_lead(&intent.lead)
+                        && it.added_date.as_deref().unwrap_or_default() == intent.added_date
+                })
+        })
 }
 
 // ---- The journal file ------------------------------------------------------
@@ -185,8 +250,23 @@ pub fn find_item<'a>(snapshot: &'a TodaySnapshot, intent: &Intent) -> Option<&'a
 /// own bookkeeping is broken, and an unreadable journal costs at worst the
 /// repair of a tap that was already written to the file or already lost.
 pub fn load_intents(path: &Path) -> Vec<Intent> {
-    let _ = path;
-    Vec::new()
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return Vec::new();
+    };
+    let Ok(value) = serde_json::from_str::<Value>(&text) else {
+        return Vec::new();
+    };
+    let mut out: Vec<Intent> = value
+        .get("intents")
+        .and_then(|v| v.as_array())
+        .map(|rows| {
+            rows.iter()
+                .filter_map(|r| serde_json::from_value::<Intent>(r.clone()).ok())
+                .collect()
+        })
+        .unwrap_or_default();
+    out.sort_by_key(|i| i.seq);
+    out
 }
 
 /// Persist the journal atomically (temp + rename), mode 0600 — the same
@@ -197,7 +277,26 @@ pub fn load_intents(path: &Path) -> Vec<Intent> {
 /// a checkbox tap because a bookkeeping file could not be written, and the tap
 /// matters more than the record of it.
 pub fn persist_intents(path: &Path, intents: &[Intent]) {
-    let _ = (path, intents);
+    let value = json!({ "v": 1, "intents": intents });
+    let tmp = path.with_extension("json.tmp");
+    let write = || -> std::io::Result<()> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&tmp)?;
+        f.write_all(value.to_string().as_bytes())?;
+        f.sync_all()?;
+        std::fs::rename(&tmp, path)
+    };
+    if let Err(e) = write() {
+        eprintln!("warning: could not persist the day-file intent journal: {e}");
+        let _ = std::fs::remove_file(&tmp);
+    }
 }
 
 /// Append one intent, assigning it the next sequence number and enforcing
@@ -207,14 +306,31 @@ pub fn persist_intents(path: &Path, intents: &[Intent]) {
 /// ones the user just made and is still looking at, and an intent old enough to
 /// be pushed out by 200 newer ones has almost certainly been overtaken anyway.
 pub fn append_intent(path: &Path, mut intent: Intent) -> u64 {
-    let _ = (path, &mut intent);
-    0
+    let mut intents = load_intents(path);
+    let seq = intents.last().map_or(1, |i| i.seq + 1);
+    intent.seq = seq;
+    intents.push(intent);
+    let overflow = intents.len().saturating_sub(JOURNAL_CAP);
+    if overflow > 0 {
+        eprintln!(
+            "jesse-bridge: day-file intent journal is at its {JOURNAL_CAP}-entry cap; \
+             dropping the {overflow} oldest"
+        );
+        intents.drain(..overflow);
+    }
+    persist_intents(path, &intents);
+    seq
 }
 
 /// Drop one intent by `seq` — the "verified" prune, called once its effect is in
 /// the file.
 pub fn prune_intent(path: &Path, seq: u64) {
-    let _ = (path, seq);
+    let mut intents = load_intents(path);
+    let before = intents.len();
+    intents.retain(|i| i.seq != seq);
+    if intents.len() != before {
+        persist_intents(path, &intents);
+    }
 }
 
 /// The intents currently pending, oldest first. Empty when no state dir is
@@ -235,8 +351,17 @@ pub fn pending_intents(cfg: &Config) -> Vec<Intent> {
 /// by replay, and by the read-your-writes merge, so all three can never disagree
 /// about what an intent means.
 pub fn apply_intent(src: &str, intent: &Intent) -> Result<String, SpliceError> {
-    let _ = (src, intent);
-    Err(SpliceError::UnknownItem)
+    match &intent.effect {
+        Effect::Check {
+            checked,
+            evidence,
+            stamp,
+        } => apply_check(src, intent, *checked, evidence.as_deref(), stamp),
+        Effect::Move {
+            to_section,
+            landing,
+        } => apply_landing(src, intent, to_section, landing),
+    }
 }
 
 /// Merge the pending intents into a source document for READING.
@@ -247,8 +372,13 @@ pub fn apply_intent(src: &str, intent: &Intent) -> Result<String, SpliceError> {
 /// again. An intent that cannot be applied to the current text is skipped
 /// silently — this is a rendering path, and a snapshot is never worth failing.
 pub fn merge_pending(src: &str, intents: &[Intent]) -> String {
-    let _ = intents;
-    src.to_string()
+    let mut out = src.to_string();
+    for intent in intents {
+        if let Ok(next) = apply_intent(&out, intent) {
+            out = next;
+        }
+    }
+    out
 }
 
 /// Replay the journal against the day file. **The turn-completion hook.**
@@ -264,7 +394,17 @@ pub fn merge_pending(src: &str, intents: &[Intent]) -> String {
 /// an intent the file no longer has room for is a fact to record, not a task to
 /// retry.
 pub fn replay_after_turn(cfg: &Config) {
-    let _ = cfg;
+    let Some(journal) = cfg.today_intents_file() else {
+        return;
+    };
+    // Cheap pre-check OUTSIDE the file mutex: the journal is empty on the
+    // overwhelming majority of turns, and a turn ending must not queue behind an
+    // unrelated checkbox tap to learn that.
+    if load_intents(&journal).is_empty() {
+        return;
+    }
+    let _guard = day_file_lock();
+    replay_locked(cfg, &journal);
 }
 
 /// The replay body, with the day-file mutex ALREADY HELD.
@@ -274,7 +414,65 @@ pub fn replay_after_turn(cfg: &Config) {
 /// which is also the crash-recovery path: intents left by a killed bridge are
 /// drained by the next mutation rather than waiting for a turn that may not come.
 pub fn replay_locked(cfg: &Config, journal: &Path) {
-    let _ = (cfg, journal);
+    let intents = load_intents(journal);
+    if intents.is_empty() {
+        return;
+    }
+    let day = day_file_path(cfg);
+    let Ok(mut src) = std::fs::read_to_string(&day) else {
+        // No day file to replay into. The intents are kept: the morning routine
+        // may yet write one, and a tap is not lost because a file was briefly
+        // absent.
+        return;
+    };
+    let file_date = parse_today(&src).date.unwrap_or_default();
+    let mut changed = false;
+    for intent in intents {
+        // DATE SCOPING. ISO dates compare correctly as strings, so this is
+        // exactly "older than the file being replayed into". An intent from
+        // yesterday must never re-apply itself to today's rebuilt day: the
+        // morning routine's decision about what carries over is the agent's,
+        // not a stale tap's.
+        if !file_date.is_empty() && !intent.date.is_empty() && intent.date < file_date {
+            eprintln!(
+                "jesse-bridge: day-file intent {} ({}) is dated {} against a {} file; dropped",
+                intent.seq, intent.id, intent.date, file_date
+            );
+            continue;
+        }
+        let snapshot = parse_today(&src);
+        match effect_present(&snapshot, &intent) {
+            None => eprintln!(
+                "jesse-bridge: day-file intent {} ({}) refers to an item that is no longer in \
+                 the file; dropped",
+                intent.seq, intent.id
+            ),
+            Some(true) => {}
+            Some(false) => match apply_intent(&src, &intent) {
+                Ok(next) => {
+                    src = next;
+                    changed = true;
+                    eprintln!(
+                        "jesse-bridge: day-file intent {} ({}) was clobbered by a turn; re-applied",
+                        intent.seq, intent.id
+                    );
+                }
+                Err(e) => eprintln!(
+                    "jesse-bridge: day-file intent {} ({}) could not be re-applied ({e:?}); dropped",
+                    intent.seq, intent.id
+                ),
+            },
+        }
+    }
+    if changed {
+        if let Err(e) = write_day_file(&day, &src) {
+            // The journal is NOT drained when the write failed — the intents are
+            // still unapplied, and the next replay should try again.
+            eprintln!("warning: could not write the day file during intent replay: {e}");
+            return;
+        }
+    }
+    persist_intents(journal, &[]);
 }
 
 #[cfg(test)]
