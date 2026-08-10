@@ -526,6 +526,11 @@ pub struct TurnLockRelease {
     pub broker: Arc<LockBroker>,
     pub cfg: Arc<Config>,
     pub turn: String,
+    /// The conversation registry, consulted for one question only: is any OTHER
+    /// turn still in flight when this one ends? The day-file intent journal may
+    /// only forget an intent once nothing is left that could still clobber it, and
+    /// this is the registry that knows. See [`replay_after_turn`].
+    pub conversations: Arc<ConversationStore>,
 }
 
 impl Drop for TurnLockRelease {
@@ -545,7 +550,15 @@ impl Drop for TurnLockRelease {
         //
         // A no-op with an empty journal (the overwhelming majority of turns), which it
         // establishes with one cheap read before taking any lock.
-        replay_after_turn(&self.cfg);
+        //
+        // THIS turn's flight claim is already released here: `flight` is declared after
+        // the guard in `handlers::jesse` and locals drop in reverse, so what this reads
+        // is strictly the OTHER turns still running. If one is, the journal is repaired
+        // but not pruned — that turn's own stale write has not landed yet.
+        replay_after_turn(
+            &self.cfg,
+            !self.conversations.in_flight_conversations().is_empty(),
+        );
     }
 }
 

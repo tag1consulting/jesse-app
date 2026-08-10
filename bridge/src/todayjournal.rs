@@ -393,7 +393,7 @@ pub fn merge_pending(src: &str, intents: &[Intent]) -> String {
 /// survived a replay would be re-applied on every subsequent turn forever, and
 /// an intent the file no longer has room for is a fact to record, not a task to
 /// retry.
-pub fn replay_after_turn(cfg: &Config) {
+pub fn replay_after_turn(cfg: &Config, turns_still_in_flight: bool) {
     let Some(journal) = cfg.today_intents_file() else {
         return;
     };
@@ -404,16 +404,26 @@ pub fn replay_after_turn(cfg: &Config) {
         return;
     }
     let _guard = day_file_lock();
-    replay_locked(cfg, &journal);
+    // PRUNE ONLY WHEN NOTHING ELSE IS RUNNING. Another turn still in flight may be
+    // holding its own stale copy of the file, and dropping a verified intent while
+    // it runs would leave that turn's write unrepairable — the exact hole this
+    // machinery exists to close. Retention is bounded by JOURNAL_CAP either way.
+    replay_locked(cfg, &journal, !turns_still_in_flight);
 }
 
 /// The replay body, with the day-file mutex ALREADY HELD.
 ///
-/// Separated from [`replay_after_turn`] so the write path can drain the journal
-/// inside its own critical section without re-entering a non-reentrant mutex —
-/// which is also the crash-recovery path: intents left by a killed bridge are
-/// drained by the next mutation rather than waiting for a turn that may not come.
-pub fn replay_locked(cfg: &Config, journal: &Path) {
+/// Separated from [`replay_after_turn`] so the write path can run it inside its own
+/// critical section without re-entering a non-reentrant mutex — which is also the
+/// crash-recovery path: intents left unapplied by a killed bridge are repaired by
+/// the next mutation rather than waiting for a turn that may not come.
+///
+/// `prune` splits the two jobs this does. REPAIR — re-applying effects that are
+/// absent — is always safe and always runs. PRUNING is not: an intent may only be
+/// forgotten once nothing is left that could still clobber it, which means no turn
+/// in flight. Calling with `prune = false` repairs and keeps, so an already-applied
+/// intent stays available to repair a write that has not happened yet.
+pub fn replay_locked(cfg: &Config, journal: &Path, prune: bool) {
     let intents = load_intents(journal);
     if intents.is_empty() {
         return;
@@ -472,7 +482,9 @@ pub fn replay_locked(cfg: &Config, journal: &Path) {
             return;
         }
     }
-    persist_intents(journal, &[]);
+    if prune {
+        persist_intents(journal, &[]);
+    }
 }
 
 #[cfg(test)]
@@ -586,7 +598,7 @@ mod tests {
             true,
         );
         append_intent(&journal, intent);
-        replay_after_turn(&cfg);
+        replay_after_turn(&cfg, false);
 
         let after = std::fs::read_to_string(vault.join("vault/Today.md")).unwrap();
         let snap = parse_today(&after);
@@ -613,7 +625,7 @@ mod tests {
             check_intent("Collect the glaze order.", "Errands", "2026-03-02", true),
         );
         let before = std::fs::read_to_string(vault.join("vault/Today.md")).unwrap();
-        replay_after_turn(&cfg);
+        replay_after_turn(&cfg, false);
         let after = std::fs::read_to_string(vault.join("vault/Today.md")).unwrap();
         assert_eq!(before, after, "a verified intent rewrites nothing");
         assert!(load_intents(&journal).is_empty(), "…and is pruned");
@@ -628,7 +640,7 @@ mod tests {
             check_intent("An item the rebuild deleted", "Do Now", "2026-03-01", true),
         );
         let before = std::fs::read_to_string(vault.join("vault/Today.md")).unwrap();
-        replay_after_turn(&cfg);
+        replay_after_turn(&cfg, false);
         assert_eq!(
             std::fs::read_to_string(vault.join("vault/Today.md")).unwrap(),
             before,
@@ -654,7 +666,7 @@ mod tests {
         stale.date = "2026-03-02".to_string();
         append_intent(&journal, stale);
         let before = std::fs::read_to_string(vault.join("vault/Today.md")).unwrap();
-        replay_after_turn(&cfg);
+        replay_after_turn(&cfg, false);
         assert_eq!(
             std::fs::read_to_string(vault.join("vault/Today.md")).unwrap(),
             before,

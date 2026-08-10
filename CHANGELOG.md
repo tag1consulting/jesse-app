@@ -15,6 +15,37 @@ CI both run it). See the "Versioning" section of `bridge/README.md`.
 
 ## [Unreleased]
 
+## [Bridge 0.71.1] - 2026-08-10
+
+### Fixed
+
+- **A tap applied while a turn was *thinking* could still be clobbered.** 0.71.0 pruned
+  an intent as soon as it was applied to the file, which is correct only if nothing else
+  is about to write. It usually is not: a turn holds the write lock for the instant of a
+  tool call and spends the rest of its life holding nothing, having read the file early
+  and thinking. A tap in that window took the apply-immediately path (rightly — it must
+  not wait), the intent was pruned, and the turn's eventual write from its stale copy
+  reverted it with nothing left to repair it. The narrow case 0.71.0 did cover — a tap
+  arriving while the lock was genuinely held — was the *less* likely half of the race.
+
+  An intent is now retained until no turn is **in flight**, which is the question that
+  actually bounds "could something still clobber this", rather than whether a lock
+  happens to be held this millisecond. Replay is split accordingly: **repair** (re-apply
+  absent effects) always runs and is always safe; **pruning** only happens when the
+  conversation registry reports nothing in flight. With no turn running the journal goes
+  straight back to empty, so the common path is unchanged and `JOURNAL_CAP` still bounds
+  the rest.
+
+  Found by the manual deployed-bridge test in the 0.71.0 PR, where the tap landed while
+  the turn was thinking rather than writing. Covered by two integration tests: one drives
+  the full think → tap → clobber → turn-end → repair sequence, the other asserts the
+  journal is left empty when nothing is in flight.
+
+- **`pending` on a mutation response now means "not yet in the file"**, tested against
+  the file rather than inferred from the journal being non-empty. With intents retained
+  after they are applied, the old test would have reported a permanent "not saved yet"
+  for a change that was saved.
+
 ## [Bridge 0.71.0] - 2026-08-10
 
 ### Added

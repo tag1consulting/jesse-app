@@ -637,6 +637,30 @@ fn if_match_matches(header: &str, etag: &str) -> bool {
     if_none_match_matches(header, etag)
 }
 
+/// Whether any journaled intent is **not yet in the file**.
+///
+/// This is what `pending` on a mutation response means, and it is deliberately a
+/// question about the FILE rather than about the journal's length. Since an
+/// intent is retained after it is applied — until the turn that could clobber it
+/// finishes — a non-empty journal no longer implies anything is outstanding, and
+/// reporting `pending: true` for an intent already written would have the app
+/// showing a permanent "not saved yet" for a change that is saved.
+fn anything_unlanded(cfg: &Config, on_disk: Option<&str>) -> bool {
+    let intents = pending_intents(cfg);
+    if intents.is_empty() {
+        return false;
+    }
+    match on_disk {
+        Some(src) => {
+            let snapshot = parse_today(src);
+            intents
+                .iter()
+                .any(|i| effect_present(&snapshot, i) == Some(false))
+        }
+        None => true,
+    }
+}
+
 /// The body every mutation answers with: the fresh snapshot, its new etag, and
 /// whether this change is parked behind a running turn.
 ///
@@ -688,18 +712,27 @@ fn mutate(
     // Sampled BEFORE the mutex so the answer is about the agent, not about
     // another tap: a tap we are queued behind is not a turn.
     let turn_is_writing = st.broker.holds_write_on(&day);
+    // A TURN IN FLIGHT IS NOT THE SAME QUESTION as a turn mid-write, and this
+    // distinction is the whole correctness of the immediate-apply path.
+    //
+    // A turn spends almost all of its life holding NO lock: it read the file
+    // early, is thinking, and will write minutes later from the copy it holds.
+    // A tap in that window is applied immediately — correctly, it must not wait
+    // — but the turn's eventual write still clobbers it. So the intent has to
+    // OUTLIVE the apply, and the thing that says how long is whether any turn is
+    // still running, not whether one happens to hold a lock this millisecond.
+    let turns_in_flight = !st.conversations.in_flight_conversations().is_empty();
     let journal = st.cfg.today_intents_file();
 
     let _guard = day_file_lock();
 
-    // CRASH RECOVERY, and the invariant the immediate-apply path rests on: with
-    // no turn mid-write, drain the journal first, so what is on disk and what a
-    // client is looking at are the same document. Intents left by a bridge that
-    // died before replay are resolved here rather than waiting for a turn that
-    // may never come.
+    // CRASH RECOVERY: repair any intent whose effect never made it into the file
+    // — a bridge killed between journaling and writing — so what is on disk and
+    // what a client is looking at are the same document. Pruning is gated on
+    // nothing being in flight, for the reason above; repair is always safe.
     if !turn_is_writing {
         if let Some(j) = &journal {
-            replay_locked(&st.cfg, j);
+            replay_locked(&st.cfg, j, !turns_in_flight);
         }
     }
 
@@ -726,7 +759,10 @@ fn mutate(
     let Some(effect) = build(&snapshot, &located)? else {
         // A legitimate no-op (already at the top, already last). Nothing is
         // journaled and nothing is written; the caller still gets the snapshot.
-        return Ok(mutation_response(&snapshot, !pending.is_empty()));
+        return Ok(mutation_response(
+            &snapshot,
+            anything_unlanded(&st.cfg, Some(&src)),
+        ));
     };
     let intent = Intent {
         seq: 0,
@@ -756,10 +792,17 @@ fn mutate(
                         format!("could not write the day file: {e}"),
                     ));
                 }
-                // Verified: the effect is in the file, so the intent has nothing
-                // left to say.
-                if let (Some(j), Some(seq)) = (journal.as_deref(), seq) {
-                    prune_intent(j, seq);
+                // The effect is in the file — but that is NOT yet reason to
+                // forget it. A turn already in flight is holding a copy of this
+                // file from before the tap, and its write is still to come; the
+                // intent is what repairs that, and it is pruned when that turn
+                // completes. With nothing in flight there is no such write
+                // coming, so the intent is spent and the journal goes back to
+                // empty — which is the state it is in almost all of the time.
+                if !turns_in_flight {
+                    if let (Some(j), Some(seq)) = (journal.as_deref(), seq) {
+                        prune_intent(j, seq);
+                    }
                 }
             }
             Err(e) => {
@@ -773,9 +816,9 @@ fn mutate(
 
     // Re-read rather than reuse: after an apply the file is the truth, and after
     // a park the journal is. Both are covered by rebuilding from scratch.
-    let (_, fresh) = build_snapshot(&st.cfg);
-    let parked = journal.as_deref().map(load_intents).unwrap_or_default();
-    Ok(mutation_response(&fresh, !parked.is_empty()))
+    let (raw, fresh) = build_snapshot(&st.cfg);
+    let unlanded = anything_unlanded(&st.cfg, raw.as_deref());
+    Ok(mutation_response(&fresh, unlanded))
 }
 
 /// `POST /jesse/today/items/{id}/check` — tick or untick one item, optionally
