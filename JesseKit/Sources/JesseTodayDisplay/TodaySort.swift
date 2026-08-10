@@ -105,6 +105,17 @@ public enum TodayFocus: String, CaseIterable, Identifiable, Equatable, Hashable,
         }
     }
 
+    /// The same action in the width of a swipe slot. A menu row can afford the clause
+    /// that says which of the two positions it means; a swipe button is about four
+    /// characters wide, and a truncated "Focus — move to Do N…" says less than "Do Now"
+    /// does.
+    public var swipeLabel: String {
+        switch self {
+        case .doNow: return "Do Now"
+        case .topOfSection: return "Top"
+        }
+    }
+
     public var symbol: String {
         switch self {
         case .doNow: return "bolt.fill"
@@ -152,6 +163,26 @@ extension TodaySemantics {
         out.sections = out.sections.map { section in
             var s = section
             s.items = sorted(s.items, by: key)
+            return s
+        }
+        return out
+    }
+
+    /// The whole day, ordered for display, with **each section free to be on its own
+    /// lens**: `keys[sectionName]` when it has one, `default` otherwise.
+    ///
+    /// The per-section overload rather than a second sorting routine: everything that
+    /// makes the single-key version correct (stability, sections never crossing, the
+    /// lead block never sorted, counts untouched) has to hold here too, and the way to
+    /// guarantee that is to route both through the same per-section call.
+    public nonisolated static func sortedForDisplay(_ snapshot: TodaySnapshot,
+                                                    by keys: [String: TodaySortKey],
+                                                    default key: TodaySortKey) -> TodaySnapshot {
+        guard key.reorders || keys.values.contains(where: \.reorders) else { return snapshot }
+        var out = snapshot
+        out.sections = out.sections.map { section in
+            var s = section
+            s.items = sorted(s.items, by: keys[section.name] ?? key)
             return s
         }
         return out

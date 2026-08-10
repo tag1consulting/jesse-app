@@ -73,6 +73,40 @@ final class TodayProjectPaletteTests: XCTestCase {
         }
     }
 
+    // MARK: - The row accent
+
+    /// **The stripe down a row resolves from the same table as everything else.** The
+    /// failure this rules out is a view reaching for `.blue` because the accent "needed
+    /// to be a bit different": the second table is the one that disagrees with the
+    /// first on a phone in the dark.
+    func testEveryProjectsRowAccentIsItsOwnRolesColour() {
+        for project in TodayProject.allCases {
+            let accent = TodayProjectPalette.rowAccent(for: project)
+            XCTAssertEqual(accent.role, TodayProjectPalette.role(for: project),
+                           "\(project) drew its accent from somewhere other than the table")
+        }
+        // Distinct hues per project, restated at the accent: a stripe that is the same
+        // colour for two projects tells the reader nothing.
+        let lights = TodayProject.filed.map { TodayProjectPalette.rowAccent(for: $0).role.light }
+        XCTAssertEqual(Set(lights).count, lights.count)
+    }
+
+    /// `unfiled` is neutral AND faint. Neutral because "no project" is an absence, faint
+    /// because on the live day file a large minority of items are unfiled — a solid grey
+    /// rule down all of them would be the most repeated mark on the screen, and the eye
+    /// would learn to read the stripe as decoration and stop seeing the five that carry
+    /// meaning.
+    func testTheUnfiledAccentIsNeutralAndTheOnlyFaintOne() {
+        let unfiled = TodayProjectPalette.rowAccent(for: .unfiled)
+        XCTAssertTrue(unfiled.isNeutral)
+        XCTAssertLessThan(unfiled.opacity, 0.5)
+        for project in TodayProject.filed {
+            let accent = TodayProjectPalette.rowAccent(for: project)
+            XCTAssertFalse(accent.isNeutral, "\(project) is a real project and must carry a hue")
+            XCTAssertEqual(accent.opacity, 1, "\(project) must be drawn at full strength")
+        }
+    }
+
     // MARK: - Legibility
 
     func testEveryColourClearsTextContrastAgainstItsOwnBackground() {

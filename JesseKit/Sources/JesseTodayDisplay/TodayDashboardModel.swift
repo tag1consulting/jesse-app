@@ -53,7 +53,9 @@ public final class TodayDashboardModel {
     /// The most recent failure's message, for the banner. Cleared by the next success.
     public private(set) var lastErrorMessage: String?
 
-    /// The bridge's `409` message for a move it structurally refuses, surfaced once
+    /// The one line about an action that could not stand: the bridge's own `409`
+    /// message for a move it structurally refuses, a drag the day file's shape forbids
+    /// (`TodayReorderGuard`), or a row that left the file under the user. Surfaced once
     /// and cleared on the next action.
     public private(set) var lastConflictMessage: String?
 
@@ -107,13 +109,45 @@ public final class TodayDashboardModel {
     /// deliberately NOT persisted here: where a per-device preference lives is the
     /// shell's business, and a library that reached for storage would be making that
     /// decision for both platforms.
-    public var sortKey: TodaySortKey = .fileOrder
+    ///
+    /// Setting it CLEARS every per-section override, because "order the day like this"
+    /// is a statement about the whole document — a document-wide choice that left three
+    /// sections quietly on an older lens would not be the choice the user made.
+    public var sortKey: TodaySortKey = .fileOrder {
+        didSet { if sortKey != oldValue { sectionSortKeys.removeAll() } }
+    }
 
-    /// The document to DRAW: `snapshot` with the view sort applied. Counts and
+    /// Per-section overrides of the lens.
+    ///
+    /// A day file's sections are not alike: `Do Now` is a short hand-ordered list whose
+    /// order IS the argument, while an aging backlog is a pile the user wants to see
+    /// oldest-first without touching anything. One document-wide sort forces those two
+    /// to share an answer. Overrides are still lenses — nothing here writes.
+    public private(set) var sectionSortKeys: [String: TodaySortKey] = [:]
+
+    /// The lens in effect for one section: its own override, else the document's.
+    public func sortKey(for sectionName: String) -> TodaySortKey {
+        sectionSortKeys[sectionName] ?? sortKey
+    }
+
+    /// Point one section at a lens of its own.
+    public func setSortKey(_ key: TodaySortKey, for sectionName: String) {
+        sectionSortKeys[sectionName] = key
+    }
+
+    /// Whether ANY lens is reordering anything right now — what a screen asks before
+    /// saying "sorted" out loud at the document level.
+    public var isSorted: Bool {
+        sortKey.reorders || sectionSortKeys.values.contains(where: \.reorders)
+    }
+
+    /// The document to DRAW: `snapshot` with each section's lens applied. Counts and
     /// membership are identical to `snapshot` — a lens changes order, never what is in
     /// the day.
     public var displaySnapshot: TodaySnapshot? {
-        snapshot.map { TodaySemantics.sortedForDisplay($0, by: sortKey) }
+        snapshot.map {
+            TodaySemantics.sortedForDisplay($0, by: sectionSortKeys, default: sortKey)
+        }
     }
 
     /// The moves worth offering for one row, judged against the FILE order and filtered
@@ -121,7 +155,8 @@ public final class TodayDashboardModel {
     /// the pairing of "which snapshot" with "which sort" and gets it half right.
     public func availableMoves(for item: TodayItem) -> [TodayMoveOp] {
         guard let snapshot else { return [] }
-        return TodaySemantics.availableMoves(for: item, in: snapshot, sortedBy: sortKey)
+        return TodaySemantics.availableMoves(for: item, in: snapshot,
+                                             sortedBy: sortKey(for: item.sectionName))
     }
 
     /// The focus actions worth offering for one row. Unaffected by the lens: both are
@@ -155,6 +190,15 @@ public final class TodayDashboardModel {
     /// Open Do Now items plus the standing lead item.
     public var badgeCount: Int {
         snapshot.map(TodaySemantics.doNowOpenCount) ?? 0
+    }
+
+    /// **The checked items a Process-updates turn would close at source**, read off the
+    /// document the user is looking at — overlay included, so an item ticked ten
+    /// seconds ago and not yet confirmed is in the list the confirmation sheet shows.
+    /// That is the honest set: the user ticked it, so it is done, and the turn is about
+    /// to say so at source either way.
+    public var itemsToProcess: [TodayItem] {
+        snapshot.map(TodaySemantics.itemsToProcess) ?? []
     }
 
     /// Unseen glanceable rows across the briefing sections.
@@ -374,6 +418,88 @@ public final class TodayDashboardModel {
             try await client.moveItem(id: id, op: op, at: self.now(), ifMatch: tag)
         }
     }
+
+    /// **Land a dragged row**, as durable move ops.
+    ///
+    /// The gesture is the shell's; the WRITES are here, and they are the same writes
+    /// every other reorder makes. Each op goes through `move(id:op:)` — the same ETag,
+    /// the same optimistic overlay, the same `409`/`410`/`412` handling, the same
+    /// re-key after a cross-section landing. A drag that took a private path to the
+    /// bridge would be a second implementation of all of that, and the second one is
+    /// the one that reorders the file blind.
+    ///
+    /// Three things are refused outright, and each writes NOTHING (the row snaps back):
+    /// a landing the day file's structure forbids (`TodayReorderGuard`), a read-only
+    /// screen, and a drop that changed nothing. The plan is returned so a caller can
+    /// tell those apart without re-deriving them.
+    ///
+    /// The id is RE-DERIVED between ops rather than carried: `to_do_now` changes an
+    /// item's id, so the second op of a `[.toDoNow, .down]` plan would otherwise be
+    /// aimed at an id the file no longer has. Same rule as `settleMove`, applied to the
+    /// only other place several writes describe one intent.
+    @discardableResult
+    public func reorder(id: String, to target: TodayDropTarget) async -> TodayReorderPlan {
+        guard let snapshot, let item = snapshot.item(id: id) else {
+            let refusal = TodayReorderPlan.refused(TodayReorderGuard.vanishedMidDrag)
+            lastConflictMessage = TodayReorderGuard.vanishedMidDrag
+            return refusal
+        }
+        // The lens is the model's to know about, so the refusal is too. A landing other
+        // than "the top" is an index in the SORTED rows, and the file has no such
+        // position; index 0 is exempt because "the top of this section" means the same
+        // thing under every lens — the same argument `availableMoves` makes for keeping
+        // the two absolute ops and withholding `up`/`down`.
+        if target.index != 0, sortKey(for: target.sectionName).reorders {
+            lastConflictMessage = TodayReorderGuard.notWhileSorted
+            return .refused(TodayReorderGuard.notWhileSorted)
+        }
+        let plan = TodaySemantics.reorderPlan(for: item, to: target, in: snapshot)
+        switch plan {
+        case .unchanged:
+            return plan
+        case .refused(let message):
+            lastConflictMessage = message
+            return plan
+        case .ops(let ops):
+            // Asked BEFORE the first write, not between the second and the third: a
+            // multi-op plan that ran out of network halfway would leave the row in a
+            // position nobody asked for.
+            if refuseIfReadOnly() { return .refused(Self.readOnlyNotice) }
+            var current = id
+            for op in ops {
+                let known = Set(serverSnapshot?.allItems.map(\.id) ?? [])
+                await move(id: current, op: op)
+                // Stop at the first op that did not land. Piling the rest on would
+                // aim them at a document the bridge has already disagreed with.
+                guard lastConflictMessage == nil, !isReadOnly, let snap = serverSnapshot
+                else { break }
+                if snap.item(id: current) != nil { continue }
+                guard let next = TodaySemantics.rekeyed(item, in: snap, excluding: known)
+                else { break }
+                current = next
+            }
+            return plan
+        }
+    }
+
+    /// **This item is gone** — what a `410` from somewhere OTHER than a mutation means
+    /// for the list.
+    ///
+    /// The detail read is the case that matters: it is keyed by the same item id, so it
+    /// learns the row has left the file while the list is still drawing it. Take the
+    /// row off the screen now, say so once, and refetch for the rest — exactly what the
+    /// mutation path already does for its own `410`, rather than leaving the list
+    /// showing a row whose every tap will fail.
+    public func itemVanished(id: String) async {
+        overlay.settle(id)
+        overlay.removed.insert(id)
+        lastConflictMessage = Self.itemGoneNotice
+        await fetch(conditional: false)
+    }
+
+    /// The one-line notice for a row that left the day file under the user.
+    public static let itemGoneNotice =
+        "That item isn't in today's day file any more — a rebuild dropped it, or its wording changed."
 
     /// **Focus an item** — "work on this next", as a durable edit to the day file.
     ///

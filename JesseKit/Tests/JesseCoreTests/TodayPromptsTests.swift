@@ -152,6 +152,68 @@ final class TodayPromptsTests: XCTestCase {
         }
     }
 
+    // MARK: - Process updates
+
+    /// The batch embeds EVERY item verbatim, numbered, so "the items listed above" names
+    /// a countable set rather than a vague one.
+    func testProcessUpdatesEmbedsEveryItemVerbatimAndNumbered() {
+        let second = "* [x] **Return the borrowed clamps.** (Added 2026-03-02)"
+        let prompt = TodayProcessUpdates.prompt(items: [item, second])
+
+        XCTAssertTrue(prompt.contains("1. \(item)"))
+        XCTAssertTrue(prompt.contains("2. \(second)"))
+        XCTAssertTrue(prompt.contains("these 2 Today.md items"),
+                      "the count is stated up front, because it is the blast radius")
+    }
+
+    /// One item reads as one item. A prompt that opens "these 1 Today.md items" is a
+    /// prompt written by a machine, and the agent reads it as one.
+    func testProcessUpdatesSaysItemNotItemsForASingleItem() {
+        let prompt = TodayProcessUpdates.prompt(items: [item])
+        XCTAssertTrue(prompt.contains("these 1 Today.md item off"))
+        XCTAssertFalse(prompt.contains("Today.md items"))
+    }
+
+    /// The three writes the batch is FOR, spelled out: the project file, the Dashboard,
+    /// and the removal from Today.md with a refill if that leaves the day short. A
+    /// batch that only did the first two would leave every processed line on the screen.
+    func testProcessUpdatesSpellsOutAllThreeWrites() {
+        let prompt = TodayProcessUpdates.prompt(items: [item])
+        XCTAssertTrue(prompt.contains("(completed YYYY-MM-DD: <evidence>)"))
+        XCTAssertTrue(prompt.contains("close or remove the matching Dashboard entry"))
+        XCTAssertTrue(prompt.contains("remove those items from Today.md entirely"))
+        XCTAssertTrue(prompt.contains("refill it from the Dashboard"))
+        XCTAssertTrue(prompt.contains("adding the new items at the bottom"))
+    }
+
+    /// The bounding clauses, which matter MORE here than in a single propagation
+    /// because the blast radius is every ticked line at once.
+    func testProcessUpdatesBoundsItselfToTheListedItems() {
+        let prompt = TodayProcessUpdates.prompt(items: [item])
+        XCTAssertTrue(prompt.contains("exactly the items listed above and nothing else"))
+        XCTAssertTrue(prompt.contains("Never treat a roll-up line that summarizes many tasks as a bulk close"))
+    }
+
+    /// The same anti-routing rule the discuss prompt has, for the same reason: this
+    /// turn legitimately talks about refilling the day "the way start of day would",
+    /// and that phrase must never sit anywhere a keyword router could read as a request
+    /// to actually run it. It appears exactly once, and the negative sentence that
+    /// names the routine by name follows it.
+    func testProcessUpdatesForbidsTheMorningRoutinesByName() {
+        let prompt = TodayProcessUpdates.prompt(items: [item])
+        XCTAssertTrue(prompt.contains(
+            "Do not run start of day, scanners, currency, or cheatsheets"))
+        XCTAssertTrue(prompt.contains("do not rebuild the rest of Today.md"))
+        let occurrences = prompt.components(separatedBy: "start of day").count - 1
+        XCTAssertEqual(occurrences, 2, "the refill phrasing, and the refusal — nothing else")
+        guard let refusal = prompt.range(of: "Do not run start of day"),
+              let refill = prompt.range(of: "the way start of day would") else {
+            return XCTFail("both phrasings must be present")
+        }
+        XCTAssertTrue(refill.lowerBound < refusal.lowerBound,
+                      "the refusal is the LAST word on the subject")
+    }
+
     // MARK: - Attached context
 
     /// A discussion no longer fires on open: the prompt is ATTACHED to an empty

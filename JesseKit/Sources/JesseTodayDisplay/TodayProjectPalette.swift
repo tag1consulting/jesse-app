@@ -157,6 +157,69 @@ public enum TodayProjectPalette {
     public static func role(for item: TodayItem) -> TodayProjectRole {
         role(for: item.project)
     }
+
+    /// **What a task row is striped with.** One function so the row accent, and
+    /// anything else that wants the same edge, cannot disagree about how loud an
+    /// `unfiled` item should be.
+    public static func rowAccent(for project: TodayProject) -> TodayRowAccent {
+        let role = role(for: project)
+        // A real project is drawn at full strength; `unfiled` is drawn FAINT, not
+        // merely grey. On the live day file a large minority of items are unfiled, and
+        // a solid grey rule down all of them would be the most repeated mark on the
+        // screen — the eye would learn to read the stripe as decoration and stop
+        // seeing the five that carry meaning.
+        return TodayRowAccent(role: role, opacity: role.isNeutral ? 0.25 : 1)
+    }
+}
+
+// MARK: - The row accent
+
+/// The stripe down a task row's leading edge, as data.
+///
+/// Data rather than a `View` so the palette stays measurable: `Color` is opaque and a
+/// test cannot ask one what it is, which is how a stripe quietly ends up the same hue
+/// for two projects. Views render it through `TodayProjectAccentBar`.
+public struct TodayRowAccent: Equatable, Hashable, Sendable {
+    public var role: TodayProjectRole
+    /// How strongly to draw it. See `TodayProjectPalette.rowAccent(for:)`.
+    public var opacity: Double
+
+    public init(role: TodayProjectRole, opacity: Double) {
+        self.role = role
+        self.opacity = opacity
+    }
+
+    /// Whether this accent stands for the ABSENCE of a project.
+    public var isNeutral: Bool { role.isNeutral }
+
+    public func color(_ scheme: ColorScheme) -> Color { role.color(scheme) }
+}
+
+/// A project as a rule down the leading edge of a row.
+///
+/// A RULE, not a fill. A washed row background is what pushes body text under the
+/// contrast threshold the palette was chosen to clear, and it would have to wash an
+/// unfiled row grey — which reads as disabled. The same decision the detail view's
+/// header made, for the same reason.
+///
+/// Deliberately invisible to VoiceOver. The project's NAME is already on the row (the
+/// caption under the text), and a stripe that also announced it would make every row
+/// say its project twice. Colour is never the only cue here; it is the SECOND cue.
+public struct TodayProjectAccentBar: View {
+    @Environment(\.colorScheme) private var scheme
+    private let accent: TodayRowAccent
+
+    public init(project: TodayProject) {
+        self.accent = TodayProjectPalette.rowAccent(for: project)
+    }
+
+    public var body: some View {
+        Capsule()
+            .fill(accent.color(scheme))
+            .opacity(accent.opacity)
+            .frame(width: 3)
+            .accessibilityHidden(true)
+    }
 }
 
 // MARK: - The two shared views

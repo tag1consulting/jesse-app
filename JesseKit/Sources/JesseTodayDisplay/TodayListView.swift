@@ -8,29 +8,57 @@ import JesseNetworking
 // routine and hand-edited through the day, and its order is the day's own argument —
 // what comes first is what was decided to come first. A client that sorted by
 // "smart" criteria would silently overrule that every morning, so the only reordering
-// here is the one the user explicitly asks for through the move menu, which changes
-// the FILE.
+// here is the one the user explicitly asks for: a drag, a focus action, or a move from
+// the menu, each of which changes the FILE. The view sort is a lens and says so.
+//
+// ## The two ways a row is dragged, and why there are two
+//
+// **Long-press and drag** is the primary gesture and needs no edit mode: rows are
+// `.draggable` and every row (plus the Do Now heading) is a `.dropDestination`. That
+// pair, rather than the List's own `.onMove` reordering, because `.onMove` cannot
+// express a drag that leaves its section — and "drag it into Do Now" is the gesture
+// this screen exists for.
+//
+// **The edit-mode grip** is the accessible fallback, and it is `.onMove`. A precise
+// long drag is exactly the interaction that is hardest with a tremor, with Switch
+// Control, or one-handed on a phone; the grips give the same reorder as a short,
+// forgiving drag, and VoiceOver drives them directly. Both paths end in
+// `model.reorder(id:to:)`, so neither can develop its own idea of what a landing means.
 
-/// The screen. Everything it needs from the outside is the model plus a link handler,
-/// so the same view renders on a phone, in a Mac window, and in a preview.
+/// The screen. Everything it needs from the outside is the model plus a handful of
+/// closures, so the same view renders on a phone, in a Mac window, and in a preview.
 public struct TodayListView: View {
     @Bindable private var model: TodayDashboardModel
     private let onOpenLink: (TodayLinkOrigin) -> Void
+    private let onOpenDetail: (TodayItem) -> Void
     private let onDiscuss: (TodayItem) -> Void
     private let onPropagate: (TodayItem, String?) -> Void
+    private let onProcessUpdates: ([TodayItem]) -> Void
+    private let isProcessing: Bool
 
     /// Which item's evidence sheet is up, if any. Held by id rather than by value so
     /// a refresh landing mid-sheet cannot leave a stale copy of the row on screen.
     @State private var evidenceFor: EvidenceTarget?
 
+    /// Whether the Process-updates confirmation is up. The action is a TELL that
+    /// rewrites project files, the Dashboard and the day file, so it fires on an
+    /// explicit confirm and never on opening the sheet.
+    @State private var isConfirmingProcess = false
+
     public init(model: TodayDashboardModel,
+                isProcessing: Bool = false,
                 onOpenLink: @escaping (TodayLinkOrigin) -> Void = { _ in },
+                onOpenDetail: @escaping (TodayItem) -> Void = { _ in },
                 onDiscuss: @escaping (TodayItem) -> Void = { _ in },
-                onPropagate: @escaping (TodayItem, String?) -> Void = { _, _ in }) {
+                onPropagate: @escaping (TodayItem, String?) -> Void = { _, _ in },
+                onProcessUpdates: @escaping ([TodayItem]) -> Void = { _ in }) {
         self.model = model
+        self.isProcessing = isProcessing
         self.onOpenLink = onOpenLink
+        self.onOpenDetail = onOpenDetail
         self.onDiscuss = onDiscuss
         self.onPropagate = onPropagate
+        self.onProcessUpdates = onProcessUpdates
     }
 
     public var body: some View {
@@ -56,6 +84,12 @@ public struct TodayListView: View {
             // overflow "More" ellipsis on iOS, which is where a control goes to be
             // undiscoverable.
             ToolbarItem(placement: .primaryAction) {
+                TodayProcessButton(count: model.itemsToProcess.count,
+                                   isProcessing: isProcessing) {
+                    isConfirmingProcess = true
+                }
+            }
+            ToolbarItem(placement: .primaryAction) {
                 TodaySortMenu(selection: $model.sortKey)
             }
         }
@@ -63,6 +97,15 @@ public struct TodayListView: View {
         .refreshable { await model.refresh() }
         .sheet(item: $evidenceFor) { target in
             evidenceSheet(for: target.id)
+        }
+        .sheet(isPresented: $isConfirmingProcess) {
+            TodayProcessSheet(items: model.itemsToProcess,
+                              isReadOnly: model.isReadOnly,
+                              onConfirm: { items in
+                                  isConfirmingProcess = false
+                                  onProcessUpdates(items)
+                              },
+                              onCancel: { isConfirmingProcess = false })
         }
     }
 
@@ -81,23 +124,18 @@ public struct TodayListView: View {
                                   message: model.lastErrorMessage)
                     .listRowSeparator(.hidden)
             }
-            if model.sortKey.reorders {
-                // Said out loud, every time. The day file's order is the day's own
-                // argument, and a screen quietly showing a different one — with move
-                // buttons that write to the file — would have the user reasoning about
-                // an order nobody wrote.
-                Label(model.sortKey.caption, systemImage: model.sortKey.symbol)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .listRowSeparator(.hidden)
-            }
             if let narrative = snapshot.narrative, !narrative.isEmpty {
                 TodayNarrativeHeader(narrative: narrative)
                     .listRowSeparator(.hidden)
             }
             if !snapshot.leadItems.isEmpty {
                 Section {
+                    // No `.onMove`, no `.draggable`: the standing item sits above every
+                    // heading by construction and the bridge answers `409` for every op
+                    // on it. An affordance that always ends in a refusal is worse than
+                    // none.
                     ForEach(snapshot.leadItems) { row($0, in: snapshot) }
+                        .moveDisabled(true)
                 }
             }
             ForEach(snapshot.sections) { section in
@@ -117,6 +155,17 @@ public struct TodayListView: View {
                 // as one block keeps them readable as a timetable.
                 TodayScheduleBlock(section: section)
             } else {
+                if model.sortKey(for: section.name).reorders {
+                    // Said out loud, in the section it applies to. The day file's order
+                    // is the day's own argument, and a section quietly showing a
+                    // different one — while its rows still drag and write — would have
+                    // the user reasoning about an order nobody wrote.
+                    Label(model.sortKey(for: section.name).caption,
+                          systemImage: model.sortKey(for: section.name).symbol)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .listRowSeparator(.hidden)
+                }
                 // Keyed by POSITION, not by `range`. Two prose lines with the same
                 // source range are indistinguishable to `ForEach`, which then renders
                 // one of them twice and silently drops the other — a real failure mode
@@ -134,11 +183,31 @@ public struct TodayListView: View {
                                    onGlance: { Task { await model.glance(id: report.id) } },
                                    onOpenLink: onOpenLink)
                 }
-                ForEach(section.items) { row($0, in: snapshot) }
+                ForEach(section.items) { item in
+                    row(item, in: snapshot)
+                        .draggable(item.id)
+                        .dropDestination(for: String.self) { ids, _ in
+                            drop(ids, above: item)
+                        }
+                }
+                .onMove { source, destination in
+                    move(in: section, from: source, to: destination)
+                }
+                .moveDisabled(model.sortKey(for: section.name).reorders)
             }
         } header: {
             TodaySectionHeader(section: section,
-                               open: TodaySemantics.openCount(in: section))
+                               open: TodaySemantics.openCount(in: section),
+                               sort: model.sortKey(for: section.name),
+                               onSort: { model.setSortKey($0, for: section.name) })
+                // The Do Now heading is a drop target in its own right: "put this at
+                // the front of the day" is the one landing whose meaning does not
+                // depend on which row it was dropped near, and aiming at a heading is a
+                // far easier gesture than aiming at the first row of a section.
+                .dropDestination(for: String.self) { ids, _ in
+                    guard section.name.hasPrefix("Do Now") else { return }
+                    drop(ids, into: section.name, at: 0)
+                }
         }
     }
 
@@ -168,6 +237,7 @@ public struct TodayListView: View {
             },
             onMove: { op in Task { await model.move(id: item.id, op: op) } },
             onFocus: { focus in Task { await model.focus(id: item.id, focus) } },
+            onOpen: { onOpenDetail(item) },
             onDiscuss: { onDiscuss(item) },
             onPropagate: { onPropagate(item, model.evidence(for: item)) },
             onOpenLink: onOpenLink)
@@ -188,18 +258,59 @@ public struct TodayListView: View {
                 }
                 .tint(.green)
             }
-            if moves.contains(.toDoNow) {
-                Button { Task { await model.move(id: item.id, op: .toDoNow) } } label: {
-                    Label(TodaySemantics.label(for: .toDoNow),
-                          systemImage: TodaySemantics.symbol(for: .toDoNow))
+            // FOCUS, not a bare move — the same durable write, named for what the user
+            // means by it. Both focus ops are absolute, so they mean the same thing
+            // under every lens and are offered whatever the section is sorted by.
+            ForEach(focusActions) { focus in
+                Button { Task { await model.focus(id: item.id, focus) } } label: {
+                    Label(focus.swipeLabel, systemImage: focus.symbol)
                 }
-                .tint(.orange)
+                .tint(focus == .doNow ? .orange : .indigo)
             }
-            if moves.contains(.topOfSection) {
-                Button { Task { await model.move(id: item.id, op: .topOfSection) } } label: {
-                    Label("Top", systemImage: TodaySemantics.symbol(for: .topOfSection))
-                }
-            }
+        }
+    }
+
+    // MARK: - Landing a drag
+
+    /// A row dropped onto another row: land it where that row currently sits, in the
+    /// FILE's own index — the model judges every landing against the file, and the row
+    /// under the finger may be sitting somewhere a lens put it.
+    private func drop(_ ids: [String], above item: TodayItem) {
+        guard let file = model.snapshot,
+              let section = file.sections.first(where: { $0.name == item.sectionName }),
+              let index = section.items.firstIndex(where: { $0.id == item.id })
+        else { return }
+        drop(ids, into: item.sectionName, at: index)
+    }
+
+    /// The one place a drag becomes a write.
+    ///
+    /// Every judgement about whether the landing is legal — the lead block, a section
+    /// no op can reach, a section on a lens, a read-only day — belongs to
+    /// `model.reorder`, which answers with a plan and puts its refusal on the notice
+    /// row. This function's whole job is to turn a payload into an id and a target.
+    /// The one thing it decides for itself is whether the payload IS one of our rows:
+    /// the drag carries a plain string, so a drop from another app arrives here too and
+    /// must land nowhere rather than be interpreted.
+    private func drop(_ ids: [String], into sectionName: String, at index: Int) {
+        guard let id = ids.first, model.snapshot?.item(id: id) != nil else { return }
+        Task {
+            await model.reorder(id: id,
+                                to: TodayDropTarget(sectionName: sectionName, index: index))
+        }
+    }
+
+    /// The edit-mode grips. `.onMove` hands over an insertion index in the pre-removal
+    /// array, which `settledIndex` converts once — see `TodayReorder.swift`.
+    private func move(in section: TodaySection, from source: IndexSet, to destination: Int) {
+        guard source.count == 1, let first = source.first,
+              section.items.indices.contains(first)
+        else { return }
+        let item = section.items[first]
+        let settled = TodaySemantics.settledIndex(from: first, to: destination)
+        Task {
+            await model.reorder(id: item.id,
+                                to: TodayDropTarget(sectionName: section.name, index: settled))
         }
     }
 
@@ -222,7 +333,7 @@ public struct TodayListView: View {
 ///
 /// A LENS, and it says so: every option carries the line that says whether it touches
 /// the file (none of them do). The control is deliberately not called "Sort the day" —
-/// sorting the day is what the move menu does, one item at a time, in the file.
+/// sorting the day is what a drag and the move menu do, in the file.
 public struct TodaySortMenu: View {
     @Binding private var selection: TodaySortKey
 
@@ -246,7 +357,125 @@ public struct TodaySortMenu: View {
                   : "line.3.horizontal.decrease.circle")
         }
         .menuIndicator(.hidden)
-        .accessibilityLabel("Order: \(selection.label)")
+        .accessibilityLabel("Order every section: \(selection.label)")
+    }
+}
+
+// MARK: - Process updates
+
+/// The toolbar's Process-updates button.
+///
+/// It carries the COUNT, and it is absent when that count is zero: the action is
+/// "close everything I ticked off", so on a day with nothing ticked there is nothing
+/// for it to do and a button that opens a sheet saying so is a button that lies about
+/// having work. The count is also the honest warning about blast radius — the user
+/// sees "6" before they see the list.
+struct TodayProcessButton: View {
+    let count: Int
+    let isProcessing: Bool
+    let action: () -> Void
+
+    var body: some View {
+        if isProcessing {
+            ProgressView()
+                .controlSize(.small)
+                .accessibilityLabel("Processing updates")
+        } else if count > 0 {
+            Button(action: action) {
+                HStack(spacing: 3) {
+                    Image(systemName: "tray.and.arrow.up")
+                    Text("\(count)")
+                        .font(.caption)
+                        .monospacedDigit()
+                }
+                .contentShape(.rect)
+            }
+            .accessibilityLabel(count == 1 ? "Process 1 checked item"
+                                           : "Process \(count) checked items")
+        }
+    }
+}
+
+/// The confirmation: exactly what is about to be closed at source, and one button.
+///
+/// A confirmation rather than a fire-on-tap, and a LIST rather than a count. This turn
+/// writes to every named project file, to the Dashboard, and to the day file, and it
+/// removes the listed lines from `Today.md` — the sort of thing that must never happen
+/// because a thumb brushed a toolbar. Showing the actual lines is the difference
+/// between confirming a number and confirming a decision.
+public struct TodayProcessSheet: View {
+    /// What the sheet says when nothing is ticked. Reachable only by a caller that
+    /// presents it anyway — the toolbar button hides itself at zero — but stated rather
+    /// than left as an empty list, which reads as a loading failure.
+    public static let nothingToProcess =
+        "Nothing is checked off yet, so there's nothing to close at source."
+
+    private let items: [TodayItem]
+    private let isReadOnly: Bool
+    private let onConfirm: ([TodayItem]) -> Void
+    private let onCancel: () -> Void
+
+    public init(items: [TodayItem], isReadOnly: Bool = false,
+                onConfirm: @escaping ([TodayItem]) -> Void,
+                onCancel: @escaping () -> Void) {
+        self.items = items
+        self.isReadOnly = isReadOnly
+        self.onConfirm = onConfirm
+        self.onCancel = onCancel
+    }
+
+    public var body: some View {
+        NavigationStack {
+            List {
+                Section {
+                    ForEach(items) { item in
+                        HStack(alignment: .top, spacing: 10) {
+                            TodayProjectAccentBar(project: item.project)
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text(item.lead.isEmpty ? item.text : item.lead)
+                                    .font(.subheadline)
+                                    .fixedSize(horizontal: false, vertical: true)
+                                Text(item.sectionName.isEmpty ? "Standing item" : item.sectionName)
+                                    .font(.caption2)
+                                    .foregroundStyle(.secondary)
+                            }
+                        }
+                        .padding(.vertical, 2)
+                    }
+                    if items.isEmpty {
+                        Text(Self.nothingToProcess)
+                            .font(.footnote)
+                            .foregroundStyle(.secondary)
+                    }
+                } header: {
+                    Text("Will be closed at source")
+                }
+                // Not a `footer:` — a long footer ellipsises on macOS, and this is the
+                // sentence that says what the turn will actually do to the vault.
+                Section {
+                    Label("Each item's project file and Dashboard entry are updated, then the lines leave Today.md. If that leaves the day short, it's topped up from the Dashboard.",
+                          systemImage: "info.circle")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    if isReadOnly {
+                        Label("You're offline, so this can't run yet.",
+                              systemImage: "wifi.exclamationmark")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+            }
+            .navigationTitle("Process updates")
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("Cancel", action: onCancel)
+                }
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("Process") { onConfirm(items) }
+                        .disabled(items.isEmpty || isReadOnly)
+                }
+            }
+        }
     }
 }
 
@@ -302,12 +531,19 @@ struct TodayNarrativeHeader: View {
     }
 }
 
-/// A section heading with its open count. The count is shown only where it means
-/// something — a briefing section's task lines are incidental, and "0" next to a
-/// finished section is noise.
+/// A section heading with its open count and its own view sort. The count is shown
+/// only where it means something — a briefing section's task lines are incidental, and
+/// "0" next to a finished section is noise.
+///
+/// The sort lives HERE, per section, rather than only in the toolbar. A day file's
+/// sections are not alike: `Do Now` is a short hand-ordered list whose order is the
+/// point, while an aging backlog is a pile worth seeing oldest-first. One document-wide
+/// answer forces those two to share a lens they do not share a need for.
 struct TodaySectionHeader: View {
     let section: TodaySection
     let open: Int
+    let sort: TodaySortKey
+    let onSort: (TodaySortKey) -> Void
 
     var body: some View {
         HStack {
@@ -319,6 +555,30 @@ struct TodaySectionHeader: View {
                     .monospacedDigit()
                     .foregroundStyle(.secondary)
                     .accessibilityLabel("\(open) open")
+            }
+            if !section.isSchedule, !section.items.isEmpty {
+                Menu {
+                    // Buttons with a checkmark rather than a `Picker`: a picker wants a
+                    // `Binding`, and the binding this header could offer would be built
+                    // from a closure that crosses an isolation boundary on every
+                    // redraw. The rendered menu is the same either way.
+                    ForEach(TodaySortKey.allCases) { key in
+                        Button { onSort(key) } label: {
+                            Label(key.label,
+                                  systemImage: key == sort ? "checkmark" : key.symbol)
+                        }
+                    }
+                } label: {
+                    Image(systemName: sort.reorders
+                          ? "arrow.up.arrow.down.circle.fill"
+                          : "arrow.up.arrow.down.circle")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .frame(width: 24, height: 24)
+                        .contentShape(.rect)
+                }
+                .menuIndicator(.hidden)
+                .accessibilityLabel("Order \(section.name): \(sort.label)")
             }
         }
     }
@@ -350,7 +610,8 @@ struct TodayScheduleBlock: View {
 }
 
 /// The one-line answer to an action that did not happen: a move the bridge refused
-/// (`409`), or a tap made while the day is read-only.
+/// (`409`), a drag the day file's shape forbids, an item that vanished, or a tap made
+/// while the day is read-only.
 ///
 /// Inline at the top of the document rather than an alert, which is what this
 /// started as. An alert is a modal interruption that demands a dismissal before the

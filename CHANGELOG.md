@@ -15,6 +15,109 @@ CI both run it). See the "Versioning" section of `bridge/README.md`.
 
 ## [Unreleased]
 
+## [App 1.0 (98)] - 2026-08-10
+
+### Added
+
+- **The Today tab reads like a TODO list: every row is striped with its project's
+  colour.** A rule down the leading edge, resolved from the one `TodayProjectPalette`
+  table R2 introduced and from nowhere else — a view that wrote `.blue` for Tag1 would
+  have forked the taxonomy, and the second fork is the one that disagrees with the first
+  on a phone in the dark. A rule rather than a tinted row background: a full wash behind
+  body text is what pushes contrast under the threshold the palette was chosen to clear,
+  and an unfiled row would have to be washed grey, which reads as disabled. `unfiled` is
+  neutral AND faint (25%), because on the live day file it is a large minority of items
+  and a solid grey rule down all of them would be the most repeated mark on the screen —
+  the eye would learn to read the stripe as decoration and stop seeing the five that
+  mean something. Colour is never the only cue: the caption still names the project in
+  words, and the stripe is invisible to VoiceOver so no row announces its project twice.
+
+- **Tapping a row opens the note behind it.** `TodayDetailView` (built in R2, rendered by
+  nobody until now) is pushed onto the tab's own stack — navigation WITHIN the day
+  belongs there, with a back button and the edge-swipe that comes with it, unlike the two
+  conversation actions, which leave the day and so present modally. One `TodayDetailModel`
+  for the whole tab rather than one per push, so re-opening a note the user read thirty
+  seconds ago is a `304` and not a re-read. Loading, offline (the cached note, marked
+  stale), no-detail and `410` were already states rather than errors; the tab now wires
+  the last of them to the list, so an item that leaves the day file mid-read pops back
+  and takes its row with it (`TodayDashboardModel.itemVanished(id:)` — the same treatment
+  a `410` from a mutation already got, reached from the one other place that can learn
+  it). A tap on the checkbox, a link chip or the ellipsis still does its own thing: those
+  are `Button`s and handle the tap before the row's gesture ever sees it.
+
+- **Drag-and-drop reorder, primary gesture, no edit mode.** Rows are `.draggable` and
+  every row plus the Do Now heading is a `.dropDestination`; the day file's Do Now
+  section accepts a drop from anywhere and maps it to `to_do_now`. An `EditButton` and
+  the List's own `.onMove` grips are kept as the ACCESSIBLE FALLBACK — a precise long
+  drag is exactly the interaction that is hardest with a tremor, with Switch Control, or
+  one-handed, and VoiceOver drives the grips directly. Both paths end in
+  `model.reorder(id:to:)`, so neither can develop its own idea of what a landing means.
+
+  A finger lands somewhere; the bridge has four typed ops. `TodaySemantics.reorderPlan`
+  is that translation, pure and total: one `top_of_section`, or n × `up`/`down`, or
+  `to_do_now` followed by the `down`s that walk the row to where the finger actually
+  was. There is deliberately no "insert at index" on the wire — `Today.md` is a markdown
+  document the agent also writes, and an index-addressed splice would be a write against
+  a position nobody can see. Every op in a plan goes through the existing `move` path, so
+  a drag inherits the ETag, the optimistic overlay, and the re-key after a cross-section
+  landing; the id is re-derived BETWEEN ops, because `to_do_now` changes it and the
+  second op of a two-op plan would otherwise address a line the file no longer has.
+
+  Four landings are refused outright and write NOTHING: the standing lead item (the
+  bridge answers `409` for every op on it), anything dropped above it, a drop into a
+  section no op can reach (there is no "move to an arbitrary section" verb, and landing
+  the row somewhere approximate would be the screen inventing an intent the user did not
+  express), and a drop into a section that is on a view sort — under a lens the index the
+  finger picked is not an index the file has. The row snaps back and the notice row says
+  which rule it hit. Index 0 is exempt from the last one, because "the top of this
+  section" means the same thing under every lens.
+
+- **A view sort per section.** The R2 lens is unchanged in what it does — it reorders on
+  screen and writes nothing — but each section can now carry one of its own, from a menu
+  in its heading. A day file's sections are not alike: `Do Now` is a short hand-ordered
+  list whose order IS the argument, while an aging backlog is a pile worth seeing
+  oldest-first without touching anything, and one document-wide answer forced those two
+  to share a lens they do not share a need for. The toolbar menu still sets the whole
+  document and CLEARS every override when it does, because "order the day like this" is a
+  statement about the day. The "sorted, on screen only" caption moved from the top of the
+  list into the section it applies to.
+
+- **Focus, on a swipe.** The trailing swipe now offers the two `TodayFocus` actions
+  rather than the bare move ops they are spelled with — the same durable write, named for
+  what the user means by it, and offered under every lens because both are absolute.
+
+- **"Process updates": every item ticked today, closed at source in one turn.** A toolbar
+  button carrying the count (absent at zero), a sheet listing the actual rows, and one
+  `.tell` turn fired on an explicit confirm — never on opening the sheet. It sends
+  `TodayProcessUpdates.prompt`, a new frozen wording in JesseCore alongside
+  `TodayDiscuss` and `TodayPropagate`, which asks for each item's project file and
+  Dashboard entry to be written, the processed lines to be REMOVED from `Today.md`, and
+  the day topped up from the Dashboard if that leaves it short.
+
+  A batch prompt rather than `TodayPropagate` sent n times, for three reasons that are
+  all about what the vault ends up looking like: `Today.md` is one file, so n turns would
+  race to rewrite it each with a stale idea of what the others removed (the ETag path
+  protects the app's writes, not the agent's); the refill is a whole-file judgement that
+  is only true once every closure has landed; and a single propagation deliberately keeps
+  its row checked and in place, which is wrong for the end of a day's bookkeeping. The
+  same negative clauses guard it — exactly the listed items, never a roll-up line read as
+  a bulk close, no other routine — and they matter more here, because the blast radius is
+  every ticked line at once. Which is also why the sheet shows the lines and not a
+  number. When the turn settles the day is refetched unconditionally, whether or not the
+  tab is up: the batch removed rows and may have added others, so the tab BADGE is wrong
+  until the day is re-read, and the badge is visible from every tab.
+
+### Notes
+
+- Refresh and offline behaviour are unchanged from (95): no timers, refetch on
+  foreground / tab selection / turn completion / pull, and offline is read-only with taps
+  refused rather than queued. A drag is refused BEFORE its first write rather than
+  between the second and the third, so a multi-op plan can never run out of network
+  half-applied.
+- The `unfiled` project dot is gone from the row caption: the stripe carries the colour
+  now, and a dot beside the label would be the same claim made twice on every row.
+  `TodayProjectDot` stays in the palette for surfaces that want it.
+
 ## [App 1.0 (97)] - 2026-08-10
 
 ### Added

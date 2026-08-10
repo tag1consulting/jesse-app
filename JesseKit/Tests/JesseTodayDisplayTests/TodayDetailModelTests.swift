@@ -44,6 +44,41 @@ final class TodayDetailModelTests: XCTestCase {
         TodayDetailModel(makeClient: { client })
     }
 
+    // MARK: - Opening an item
+
+    /// **One tap, one read.** Opening a row asks the bridge for that row's note exactly
+    /// once — the detail view's `.task(id:)` is keyed to the item, so a redraw (a
+    /// refreshed day, a rotation, a re-render while the note is on screen) must not
+    /// re-fetch. The failure this rules out is a detail screen that hammers the vault
+    /// once per layout pass.
+    func testOpeningAnItemReadsItsNoteExactlyOnce() async {
+        let client = FakeDetailClient()
+        client.outcomes = [.result(.detail(widget))]
+        let m = model(client)
+
+        await m.load(id: "aaaaaaaaaaaa")
+
+        XCTAssertEqual(client.calls.count, 1)
+        XCTAssertEqual(client.calls.first?.id, "aaaaaaaaaaaa", "the tapped row's id, not another")
+        XCTAssertEqual(m.itemID, "aaaaaaaaaaaa")
+    }
+
+    /// Opening a DIFFERENT row asks about that row, and never leaves the previous note
+    /// on screen under the new title while it loads.
+    func testOpeningASecondItemAsksAboutTheSecondItem() async {
+        let client = FakeDetailClient()
+        client.outcomes = [.result(.detail(widget))]
+        let m = model(client)
+        await m.load(id: "aaaaaaaaaaaa")
+
+        client.outcomes = [.result(.noDetail(TodayNoDetail(id: "bbbbbbbbbbbb")))]
+        await m.load(id: "bbbbbbbbbbbb")
+
+        XCTAssertEqual(client.calls.map(\.id), ["aaaaaaaaaaaa", "bbbbbbbbbbbb"])
+        XCTAssertEqual(m.itemID, "bbbbbbbbbbbb")
+        XCTAssertNil(m.note, "the first item's note did not follow the second item's title")
+    }
+
     // MARK: - Loading
 
     func testALoadedNoteIsHeldWithItsItem() async {

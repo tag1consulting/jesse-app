@@ -180,6 +180,7 @@ public struct TodayItemRow: View {
     let onToggle: (Bool) -> Void
     let onMove: (TodayMoveOp) -> Void
     let onFocus: (TodayFocus) -> Void
+    let onOpen: () -> Void
     let onDiscuss: () -> Void
     let onPropagate: () -> Void
     let onOpenLink: (TodayLinkOrigin) -> Void
@@ -190,6 +191,7 @@ public struct TodayItemRow: View {
                 onToggle: @escaping (Bool) -> Void,
                 onMove: @escaping (TodayMoveOp) -> Void = { _ in },
                 onFocus: @escaping (TodayFocus) -> Void = { _ in },
+                onOpen: @escaping () -> Void = {},
                 onDiscuss: @escaping () -> Void = {},
                 onPropagate: @escaping () -> Void = {},
                 onOpenLink: @escaping (TodayLinkOrigin) -> Void = { _ in }) {
@@ -201,6 +203,7 @@ public struct TodayItemRow: View {
         self.onToggle = onToggle
         self.onMove = onMove
         self.onFocus = onFocus
+        self.onOpen = onOpen
         self.onDiscuss = onDiscuss
         self.onPropagate = onPropagate
         self.onOpenLink = onOpenLink
@@ -210,6 +213,9 @@ public struct TodayItemRow: View {
 
     public var body: some View {
         HStack(alignment: .top, spacing: 10) {
+            // The project, as a rule down the leading edge. Never the only cue: the
+            // caption under the text names the project in words.
+            TodayProjectAccentBar(project: item.project)
             TodayCheckbox(checked: item.checked, pending: pending) { onToggle(!item.checked) }
             VStack(alignment: .leading, spacing: 4) {
                 text
@@ -233,6 +239,15 @@ public struct TodayItemRow: View {
                           onDiscuss: onDiscuss, onPropagate: onPropagate)
         }
         .padding(.vertical, 4)
+        // Tapping the row opens the item. A GESTURE rather than a `Button` or a
+        // `NavigationLink` wrapping the row, because the row already contains three
+        // controls — the checkbox, the link chips, the ellipsis — and a button wrapping
+        // buttons either swallows their taps or renders them inert. A child `Button`
+        // handles its own tap before this ever sees it, which is exactly the division
+        // wanted: the checkbox ticks, a chip opens its link, the rest of the row opens
+        // the item.
+        .contentShape(.rect)
+        .onTapGesture(perform: onOpen)
         // The same actions the ellipsis menu offers, on a long press. Two ways in
         // rather than two menus: `TodayItemActions` is the single list, so an action
         // added to it appears in both without either falling behind the other.
@@ -242,27 +257,32 @@ public struct TodayItemRow: View {
                              onDiscuss: onDiscuss, onPropagate: onPropagate)
         }
         .accessibilityElement(children: .contain)
+        .accessibilityAction(named: "Open item", onOpen)
     }
 
     /// The bookkeeping line under a row: which project the item rolls up to, then its
     /// dates.
     ///
-    /// The project shows as a DOT plus its name, never as colour alone — the palette is
-    /// chosen to survive colour blindness, but no palette says anything to a screen
-    /// reader, and a row whose only project cue is a hue is a row that loses it under
-    /// Grayscale. An `unfiled` item shows nothing at all here: "no project" is an
-    /// absence, and a grey dot labelled "No project" on the large minority of items that
-    /// have none would be the loudest thing on the screen.
+    /// The project is named IN WORDS, never by colour alone — the palette is chosen to
+    /// survive colour blindness, but no palette says anything to a screen reader, and a
+    /// row whose only project cue is a hue is a row that loses it under Grayscale. The
+    /// stripe down the row's edge is the fast cue; this is the one that survives.
+    ///
+    /// No dot here any more: the stripe carries the colour, and a dot beside the label
+    /// would be the same claim made twice on every row. An `unfiled` item shows nothing
+    /// at all — "no project" is an absence, and the words "No project" under the large
+    /// minority of items that have none would be the most repeated text on the screen.
     @ViewBuilder
     private var caption: some View {
         let dates = TodaySemantics.dateCaption(item)
         if !item.project.isUnfiled || dates != nil {
             HStack(spacing: 6) {
                 if !item.project.isUnfiled {
-                    TodayProjectDot(project: item.project)
                     Text(TodayProjectPalette.role(for: item.project).label)
                         .font(.caption2)
                         .foregroundStyle(.secondary)
+                        .accessibilityLabel(
+                            TodayProjectPalette.role(for: item.project).accessibilityLabel)
                 }
                 if let dates {
                     Text(dates)
