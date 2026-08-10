@@ -15,6 +15,87 @@ CI both run it). See the "Versioning" section of `bridge/README.md`.
 
 ## [Unreleased]
 
+## [Bridge 0.72.0] - 2026-08-10
+
+### Added
+
+- **Every item in the `GET /jesse/today` snapshot now carries a `project` slug** —
+  one of `tag1`, `personal`, `network`, `via-con-me`, `perseido` or `unfiled`. The
+  bridge emits the **slug only**: the colour, label and ordering a client draws
+  from it are a client concern, and putting any of them on the wire would freeze a
+  rendering decision into the API.
+
+  Derivation is a pure, tested function of the item's links, its section heading
+  and the five `Dashboard/<Topic>.md` pages. A direct `[[…/Dashboard/<Topic>]]`
+  link is the item's declared home and wins outright; otherwise every topic page
+  that claims one of the item's linked notes is a candidate; one candidate is the
+  answer. Where two topic pages claim the same note — which is not exotic, seven
+  notes on the live vault are claimed twice, including the most-linked note in the
+  day file — the **section heading breaks the tie, but only among candidates the
+  item's own links already declared**. A heading never files an item that declared
+  nothing, and a heading naming two candidates or none leaves it `unfiled`.
+
+  **`unfiled` is the honest answer for a large minority of items and is expected.**
+  Measured on the live day file: 49 of 94 items resolve, 45 are `unfiled`, because
+  the morning routine groups by section rather than stamping each item — only 6 of
+  the 94 link a topic home directly and 37 carry no wiki link at all. The durable
+  fix is for the routine to stamp each item with its topic; the bridge does not
+  guess from prose to cover for that.
+
+  The slug folds into the snapshot ETag automatically (the tag is a hash of the
+  serialized snapshot), so a re-filing invalidates a client's cache.
+
+- **`GET /jesse/today/items/{id}/detail` serves the "more information" note behind
+  an item** — its markdown, the vault-relative path it resolved to, and a strong
+  ETag over `(path, bytes)` honouring `If-None-Match` with `304`. Bearer auth and
+  the shared rate limiter, like every other endpoint. `410 Gone` when the id is not
+  in the day file — the client had it from a snapshot, so the honest answer is that
+  the item is gone, not that the URL is wrong. An item that links nothing, or whose
+  links resolve to nothing, gets a **typed** `no-detail` answer rather than a `500`:
+  an item with no note is an ordinary item, and an error there would have the app
+  render a failure for a perfectly healthy day file.
+
+  The item is located by **re-parsing `Today.md` at request time**, never by a
+  stored offset — the file is rewritten in full every morning, so a remembered
+  position is wrong by construction. Until the day file designates a detail note
+  per item, the target is the first wiki link in source order that resolves to a
+  readable file.
+
+### Security
+
+- **This is the first read path that serves arbitrary vault content**, so the
+  sandbox is the substance of the change and the endpoint is the thin part. Detail
+  is keyed by **item id, never by a path** — the caller cannot name a file, so the
+  reachable set is exactly "notes linked from `Today.md`". **There is deliberately
+  no `?path=` vault reader**, and adding one later is a new security decision, not
+  an extension of this one.
+
+  Every target is confined to the notes root by two independent gates: it must be
+  relative with no `..`, root or prefix component, and — separately — the
+  **canonicalized** result must sit under the **canonicalized** root. The second is
+  what actually holds the boundary, because it is evaluated after every symlink is
+  resolved and so does not depend on having anticipated a spelling of `..`. A
+  symlink inside the vault pointing outside it is refused; one that stays inside is
+  still a vault note. Directories and devices are never served, at most 64 KiB + 1
+  byte ever enters memory (capped at the read, then truncated on a UTF-8 char
+  boundary), and every rejection reason collapses to the same answer so the
+  endpoint is not an oracle for what exists outside the vault. Paths on the wire
+  are vault-relative, never absolute. Nothing here opens a file for writing.
+
+  The link text is treated as untrusted even though no request supplies it: it is
+  agent-written into a hand-edited file, so a planted `[[/etc/passwd]]` gets a typed
+  "no detail", not a file. Covered by traversal, absolute-path, symlink-escape and
+  directory tests that assert the out-of-vault file is untouched and nothing leaks.
+  Full write-up in `SECURITY.md`.
+
+### Internal
+
+- **The post-parse snapshot composition is now one function** (`today::hydrate`),
+  called by both `build_snapshot` and the write path's `If-Match` check. Those two
+  had each been applying the glance merge separately; a stamping pass added to one
+  and not the other would have made every tag handed out by a `GET` fail the next
+  mutation's precondition and `412` it. They cannot drift now.
+
 ## [App 1.0 (96)] - 2026-08-10
 
 ### Changed

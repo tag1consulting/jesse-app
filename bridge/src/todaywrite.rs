@@ -742,7 +742,9 @@ fn mutate(
     let pending = journal.as_deref().map(load_intents).unwrap_or_default();
     let merged = merge_pending(&src, &pending);
     let mut snapshot = parse_today(&merged);
-    GlanceStore::load(st.cfg.state_dir.as_deref()).merge_into(&mut snapshot);
+    // The SAME post-parse composition the read path applies — see `today::hydrate`
+    // for why a difference here would 412 every mutation.
+    hydrate(&st.cfg, &mut snapshot);
 
     // THE PRECONDITION, before anything is recorded or written. A `412` must
     // touch nothing at all — not the file, not the journal — so that a client
