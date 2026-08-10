@@ -294,6 +294,17 @@ pub fn diet_request(auth: Option<&str>) -> Request<Body> {
     }
     b.body(Body::empty()).unwrap()
 }
+/// `GET /jesse/today` with optional auth and `If-None-Match`.
+pub fn today_request(auth: Option<&str>, if_none_match: Option<&str>) -> Request<Body> {
+    let mut b = Request::builder().method("GET").uri("/jesse/today");
+    if let Some(a) = auth {
+        b = b.header("authorization", a);
+    }
+    if let Some(inm) = if_none_match {
+        b = b.header("if-none-match", inm);
+    }
+    b.body(Body::empty()).unwrap()
+}
 /// `GET /jesse/diet?date=<date>` — the paged-history request.
 pub fn diet_request_date(auth: Option<&str>, date: &str) -> Request<Body> {
     let mut b = Request::builder()
