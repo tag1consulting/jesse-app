@@ -1489,6 +1489,57 @@ the journal is what covers that race.
   the state dir, so it stays out of logs, the metrics log and provenance — the same
   handling as the context ledger.
 
+## Item detail (`GET /jesse/today/items/{id}/detail`)
+
+Bridge 0.72.0 serves the "more information" note behind one day-file item. **This
+is the first read path that serves arbitrary vault content** — every earlier
+endpoint read a file whose path was a constant composed from config
+(`Today.md`, the diet files, the transcripts directory). It is **read-only**: the
+module opens files for reading only, and creates, writes and removes nothing.
+
+- **Same auth/rate/ETag posture as the rest.** Bearer-auth gated (`401` without or
+  with a wrong bearer), on the shared rate limiter (`429` on a burst), and a strong
+  ETag honouring `If-None-Match` with `304`.
+- **The reachable set is "notes linked from `Today.md`", by construction.** Detail
+  is keyed by **item id**, never by a path. The caller cannot name a file; it names
+  an item, and the bridge re-parses the day file to discover what that item links.
+  **There is deliberately no `?path=` vault reader.** Adding one later would change
+  what this endpoint *is* — from a fixed, file-derived set of notes into a general
+  vault reader behind a token — and must be treated as a new security decision, not
+  as an extension of this one.
+- **Vault-root confinement, two independent gates.** A target is refused unless it
+  is relative (no absolute path, no root or prefix component) and contains no `..`
+  component; and, separately, the **canonicalized** result must still sit under the
+  **canonicalized** notes root (`<JESSE_VAULT>/<VAULT_SUBDIR>`). The second gate is
+  the one that actually holds the boundary: it is evaluated after every symlink in
+  the chain is resolved, so it does not depend on having anticipated a spelling of
+  `..`. A symlink that lives in the vault and points outside it therefore resolves
+  outside the root and is **refused**; a symlink that stays inside is still a vault
+  note and is served.
+- **The link text is treated as untrusted.** No request supplies it, but it is
+  written into the day file by the agent and edited by hand, so it goes through the
+  same gates a request parameter would. Prompt injection that plants
+  `[[/etc/passwd]]` or `[[../../secrets]]` in the day file gets a typed "no detail",
+  not a file.
+- **Regular files only, and bounded.** A directory, fifo or device is never served.
+  At most **64 KiB + 1 byte** ever enters memory — the cap is applied to the read
+  itself, not after slurping the file — and the answer is truncated on a UTF-8 char
+  boundary with `truncated: true`, the same idiom as `MAX_OUTPUT_BYTES`.
+- **Rejections are indistinguishable.** Every refusal reason (outside the root,
+  missing, not a file, unreadable) collapses to the same `no-detail` answer, so the
+  endpoint is not an oracle for what exists outside the vault. The response carries
+  a vault-**relative** path, never an absolute one, so the bridge's own vault
+  location stays off the wire.
+- **An unknown id is `410`, not `404`.** The id came from a snapshot; the honest
+  answer is that the item it names is gone from the day file.
+- **No containment-record change.** No MCP server, no tool grant, no child process
+  — the containment rows and the startup gate are untouched.
+- **The project slug added to `GET /jesse/today` in the same release reads five
+  more files**, `Dashboard/<Topic>.md` for the five frozen topics. Those paths are
+  composed from a **constant table and the configured root**, so they are a fixed
+  set of five and not a path surface; an unreadable one contributes nothing rather
+  than erroring. The slug itself is a closed enum and carries no vault text.
+
 ## Session list (`GET /jesse/sessions`)
 
 `GET /jesse/sessions` lets the app show a history of conversations. It is

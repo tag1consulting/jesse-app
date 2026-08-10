@@ -96,6 +96,11 @@ pub struct TodayItem {
     pub updated_date: Option<String>,
     pub app_completed: Option<AppCompleted>,
     pub section_name: String,
+    /// The item's project slug — one of [`PROJECT_SLUGS`]. A **slug only**: the
+    /// colour, label and ordering a client draws from it are a client concern,
+    /// and putting any of them on the wire would freeze a rendering decision
+    /// into the API. See [`derive_project`] for how it is resolved.
+    pub project: &'static str,
     pub range: SourceRange,
 }
 
@@ -238,6 +243,245 @@ impl IdRegistry {
             format!("{base}-{n}")
         }
     }
+}
+
+// ---- The project slug ------------------------------------------------------
+
+/// The slug for an item whose topic home could not be resolved. **Not an error
+/// and not a guess** — it is the honest answer for an item that declares no
+/// lineage, and on the live day file it is a large minority of items (the
+/// morning routine groups by section rather than stamping each item). A client
+/// renders it as "no project", never as a sixth project.
+pub const PROJECT_UNFILED: &str = "unfiled";
+
+/// The frozen wire set, in Dashboard order. Anything outside it is a bug, and
+/// the app's decoder is entitled to treat it as closed.
+pub const PROJECT_SLUGS: [&str; 6] = [
+    "tag1",
+    "personal",
+    "network",
+    "via-con-me",
+    "perseido",
+    PROJECT_UNFILED,
+];
+
+/// The five Dashboard topic homes: `(file stem under `Dashboard/`, wire slug,
+/// the lowercased needle that identifies the topic in a section heading)`.
+///
+/// The stem is also the display name — `Dashboard/Via-Con-Me.md` — so one table
+/// drives the link mapping, the rollup loader and the heading tiebreak.
+const TOPICS: [(&str, &str, &str); 5] = [
+    ("Tag1", "tag1", "tag1"),
+    ("Personal", "personal", "personal"),
+    ("Network", "network", "network"),
+    ("Via-Con-Me", "via-con-me", "via con me"),
+    ("Perseido", "perseido", "perseido"),
+];
+
+/// A wiki target reduced to a comparable vault-relative note key: heading
+/// dropped, the vault-name prefix stripped, the `.md` suffix dropped, lowercased.
+///
+/// **`todo-list/` is a NAME, not a directory.** Every wiki link in the vault is
+/// written `[[todo-list/…]]` because that is the Obsidian vault's name and QMD's
+/// collection name; the notes actually live under [`crate::config::VAULT_SUBDIR`]
+/// (`vault/`) since the 2026-08-06 relocation. Both spellings are accepted here
+/// for the same reason [`crate::citations::normalize_candidates`] accepts both —
+/// do not "clean up" that tolerance.
+///
+/// The alias half of `[[target|alias]]` is already gone: [`extract_links`] keeps
+/// only the target. The heading half of `[[target#heading]]` is not, and is
+/// dropped here — a link to a section of a note is a link to that note.
+pub fn note_key(target: &str) -> String {
+    let rel = vault_relative(target);
+    rel.strip_suffix(".md").unwrap_or(&rel).to_lowercase()
+}
+
+/// A wiki target as a vault-relative path, **case preserved**: heading dropped,
+/// leading slashes and the vault-name prefix stripped, `.md` left alone.
+///
+/// [`note_key`] lowercases on top of this for comparison; a PATH must not be
+/// lowercased, because the notes root can sit on a case-sensitive filesystem
+/// where `projects/` and `Projects/` are different directories. The two callers
+/// share this so a future prefix (another rename) is one edit, not two.
+///
+/// This normalizes; it does NOT make a path safe. Confinement is
+/// [`crate::todaydetail::resolve_under_root`]'s job, and it does not trust this.
+pub fn vault_relative(target: &str) -> String {
+    let t = target.split('#').next().unwrap_or(target).trim();
+    let t = t.trim_start_matches('/');
+    let t = t
+        .strip_prefix("todo-list/")
+        .or_else(|| t.strip_prefix(&format!("{}/", crate::config::VAULT_SUBDIR)))
+        .unwrap_or(t);
+    t.trim_matches('/').to_string()
+}
+
+/// The slug for a key that IS a Dashboard topic home (`Dashboard/Tag1`).
+fn topic_home_slug(key: &str) -> Option<&'static str> {
+    let stem = key.strip_prefix("dashboard/")?;
+    TOPICS
+        .iter()
+        .find(|(name, _, _)| stem.eq_ignore_ascii_case(name))
+        .map(|(_, slug, _)| *slug)
+}
+
+/// Which topic files claim which notes, read from the five `Dashboard/<Topic>.md`
+/// files. This is the "rolls up to one topic" half of the derivation: an item
+/// that links a project note rather than a topic home inherits the topic whose
+/// Dashboard page links that note.
+///
+/// **It is not single-valued in practice.** Seven notes on the live vault are
+/// linked from more than one topic page — including `Projects/Tag1/HR-Finance`,
+/// the most-linked note in the day file, which both `Tag1` and `Personal` claim.
+/// A multi-valued rollup is resolved by the section heading or not at all; see
+/// [`derive_project`].
+///
+/// An absent or unreadable topic file contributes nothing rather than erroring,
+/// the same degradation as every other store here: a Dashboard mid-edit costs
+/// some items their slug for one request, never a failed day screen.
+#[derive(Default)]
+pub struct ProjectRollup {
+    map: HashMap<String, Vec<&'static str>>,
+}
+
+impl ProjectRollup {
+    /// Read the five topic pages under the configured vault root.
+    ///
+    /// The paths are composed from a constant table and the configured root —
+    /// **no part of them comes from a request** — so this reads a fixed set of
+    /// five files and is not a path surface. The link-keyed reader that IS one
+    /// lives in [`crate::todaydetail`], behind the sandbox.
+    pub fn load(cfg: &Config) -> Self {
+        let dashboard = notes_root(cfg).join("Dashboard");
+        let mut map: HashMap<String, Vec<&'static str>> = HashMap::new();
+        for (stem, slug, _) in TOPICS {
+            let Ok(src) = std::fs::read_to_string(dashboard.join(format!("{stem}.md"))) else {
+                continue;
+            };
+            for link in extract_links(&src) {
+                if link.kind != "wiki" {
+                    continue;
+                }
+                let key = note_key(&link.target);
+                if key.is_empty() {
+                    continue;
+                }
+                push_unique(map.entry(key).or_default(), slug);
+            }
+        }
+        Self { map }
+    }
+
+    /// Build a rollup directly from `(note key, topic slug)` pairs. Tests only —
+    /// it keeps the derivation testable without a vault on disk.
+    #[cfg(test)]
+    pub fn from_pairs(pairs: &[(&str, &str)]) -> Self {
+        let mut map: HashMap<String, Vec<&'static str>> = HashMap::new();
+        for (key, slug) in pairs {
+            let slug = PROJECT_SLUGS
+                .iter()
+                .find(|s| *s == slug)
+                .expect("a test rollup may only name a frozen slug");
+            push_unique(map.entry(note_key(key)).or_default(), slug);
+        }
+        Self { map }
+    }
+
+    fn topics_for(&self, key: &str) -> &[&'static str] {
+        self.map.get(key).map_or(&[], |v| v.as_slice())
+    }
+
+    /// Re-derive every item's project with this rollup in hand.
+    ///
+    /// The second pass exists because [`parse_today`] is a pure function of the
+    /// day file's own bytes and the rollup lives in five OTHER files. Parsing
+    /// resolves what the day file alone can settle (a direct topic-home link);
+    /// this fills in the rest. Both passes run the same [`derive_project`], so
+    /// there is one derivation, not two that could drift.
+    pub fn stamp_into(&self, snapshot: &mut TodaySnapshot) {
+        if self.map.is_empty() {
+            return;
+        }
+        for item in snapshot
+            .lead_items
+            .iter_mut()
+            .chain(snapshot.sections.iter_mut().flat_map(|s| s.items.iter_mut()))
+        {
+            item.project = derive_project(&item.links, &item.section_name, self);
+        }
+    }
+}
+
+fn push_unique(out: &mut Vec<&'static str>, slug: &'static str) {
+    if !out.contains(&slug) {
+        out.push(slug);
+    }
+}
+
+/// **The project derivation.** A pure function of an item's links, its section
+/// heading and the rollup table — no clock, no request, no server state.
+///
+/// In order:
+///
+/// 1. A direct `[[…/Dashboard/<Topic>]]` link is the item's declared home and
+///    wins outright.
+/// 2. Otherwise every topic page that claims one of the item's linked notes is a
+///    candidate.
+/// 3. Exactly one candidate → that slug.
+/// 4. More than one → the section heading breaks the tie, but **only among
+///    candidates the item's own links already declared**. A heading never files
+///    an item that declared nothing, and a heading that names two candidates (or
+///    none) leaves the item unfiled. This is the narrow use the heading is
+///    trustworthy for: it disambiguates a declared lineage, it does not invent one.
+/// 5. No candidates → [`PROJECT_UNFILED`].
+///
+/// Step 5 is the common case for a large minority of live items and that is
+/// deliberate: the durable fix is for the morning routine to stamp each item
+/// with its topic, not for the bridge to guess from prose.
+pub fn derive_project(
+    links: &[TodayLink],
+    section_name: &str,
+    rollup: &ProjectRollup,
+) -> &'static str {
+    let wiki = || links.iter().filter(|l| l.kind == "wiki");
+    let mut candidates: Vec<&'static str> = Vec::new();
+    for link in wiki() {
+        if let Some(slug) = topic_home_slug(&note_key(&link.target)) {
+            push_unique(&mut candidates, slug);
+        }
+    }
+    if candidates.is_empty() {
+        for link in wiki() {
+            for slug in rollup.topics_for(&note_key(&link.target)) {
+                push_unique(&mut candidates, slug);
+            }
+        }
+    }
+    match candidates.as_slice() {
+        [] => PROJECT_UNFILED,
+        [only] => only,
+        many => section_tiebreak(section_name, many),
+    }
+}
+
+/// The topic a section heading names, when it names exactly one of `candidates`.
+/// Hyphens read as spaces so `Via-Con-Me` and `Via Con Me` are one heading.
+fn section_tiebreak(section_name: &str, candidates: &[&'static str]) -> &'static str {
+    let hay = section_name.to_lowercase().replace('-', " ");
+    let mut hit: Option<&'static str> = None;
+    for slug in candidates {
+        let named = TOPICS
+            .iter()
+            .any(|(_, s, needle)| s == slug && hay.contains(needle));
+        if named {
+            if hit.is_some() {
+                // The heading names two of the candidates; it settles nothing.
+                return PROJECT_UNFILED;
+            }
+            hit = Some(slug);
+        }
+    }
+    hit.unwrap_or(PROJECT_UNFILED)
 }
 
 // ---- Line scanning ---------------------------------------------------------
@@ -700,6 +944,7 @@ fn build_item(
     let continuations: Vec<&str> = lines.iter().skip(1).map(|l| l.text).collect();
     let lead = lead_of(body);
     let added_date = trailer_date(&text, "(Added ");
+    let links = extract_links(&text);
     TodayItem {
         id: ids.assign(today_id(
             section_name,
@@ -708,7 +953,12 @@ fn build_item(
         )),
         checked,
         lead,
-        links: extract_links(&text),
+        // What the day file alone can settle: a direct topic-home link. The
+        // rollup half needs the Dashboard pages and is stamped on afterwards by
+        // [`ProjectRollup::stamp_into`], keeping this parse a pure function of
+        // its own source.
+        project: derive_project(&links, section_name, &ProjectRollup::default()),
+        links,
         updated_date: trailer_date(&text, "updated "),
         added_date,
         app_completed: app_completed(&continuations),
@@ -1051,9 +1301,14 @@ pub async fn jesse_today(
 /// surface on any of these endpoints, and this one function being the only way
 /// to name the file is what keeps that true as endpoints are added.
 pub fn day_file_path(cfg: &Config) -> PathBuf {
-    Path::new(&cfg.vault)
-        .join(crate::config::VAULT_SUBDIR)
-        .join(TODAY_FILE)
+    notes_root(cfg).join(TODAY_FILE)
+}
+
+/// The notes root: the configured vault repo plus [`crate::config::VAULT_SUBDIR`].
+/// The one place that composition is written, so the next relocation is one edit
+/// — and the one root every vault path is confined to (see [`crate::todaydetail`]).
+pub fn notes_root(cfg: &Config) -> PathBuf {
+    Path::new(&cfg.vault).join(crate::config::VAULT_SUBDIR)
 }
 
 /// The strong ETag for a snapshot: a hash of the exact serialized snapshot,
@@ -1086,8 +1341,23 @@ pub fn build_snapshot(cfg: &Config) -> (Option<String>, TodaySnapshot) {
             ..TodaySnapshot::default()
         },
     };
-    GlanceStore::load(cfg.state_dir.as_deref()).merge_into(&mut snapshot);
+    hydrate(cfg, &mut snapshot);
     (raw, snapshot)
+}
+
+/// Everything that happens to a snapshot AFTER the parse: the project rollup and
+/// the glance flags.
+///
+/// **One definition, because the etag depends on it.** `snapshot_etag` hashes the
+/// whole serialized snapshot, and the write path's `If-Match` check re-derives
+/// that tag from its own parse rather than from [`build_snapshot`] (it already
+/// holds the merged source). If a stamping pass ran on the read side and not the
+/// write side, every tag a client was handed by a `GET` would fail the very next
+/// `If-Match` and every mutation would `412`. Both sides call THIS, so the two
+/// documents cannot drift apart.
+pub fn hydrate(cfg: &Config, snapshot: &mut TodaySnapshot) {
+    ProjectRollup::load(cfg).stamp_into(snapshot);
+    GlanceStore::load(cfg.state_dir.as_deref()).merge_into(snapshot);
 }
 
 #[cfg(test)]
@@ -1450,6 +1720,243 @@ mod tests {
             "keeps snake_case identifiers intact",
             "underscores are vault identifiers, not emphasis"
         );
+    }
+
+    // ---- The project slug --------------------------------------------------
+
+    const PROJECTS: &str = include_str!("../tests/fixtures/today/projects.md");
+
+    /// The rollup the fixture is written against: one note claimed by a single
+    /// topic page, one claimed by two.
+    fn demo_rollup() -> ProjectRollup {
+        ProjectRollup::from_pairs(&[
+            ("todo-list/Projects/Demo/Claimed-Once", "tag1"),
+            ("todo-list/Projects/Demo/Claimed-Twice", "tag1"),
+            ("todo-list/Projects/Demo/Claimed-Twice", "personal"),
+        ])
+    }
+
+    /// The fixture, parsed and then stamped with `demo_rollup` — the same two
+    /// passes `build_snapshot` runs.
+    fn projects_snapshot() -> TodaySnapshot {
+        let mut snap = parse_today(PROJECTS);
+        demo_rollup().stamp_into(&mut snap);
+        snap
+    }
+
+    fn project_of(snap: &TodaySnapshot, section_name: &str, lead_starts: &str) -> &'static str {
+        item(section(snap, section_name), lead_starts).project
+    }
+
+    #[test]
+    fn each_topic_home_link_maps_to_its_slug() {
+        let snap = projects_snapshot();
+        for (lead, slug) in [
+            ("A Tag1 home link", "tag1"),
+            ("A Personal home link", "personal"),
+            ("A Network home link", "network"),
+            ("A Via-Con-Me home link", "via-con-me"),
+            ("A Perseido home link", "perseido"),
+        ] {
+            assert_eq!(project_of(&snap, "Do Now", lead), slug, "{lead}");
+        }
+        // The alias/heading and the `vault/` spelling of the prefix resolve too.
+        assert_eq!(
+            project_of(&snap, "Do Now", "An alias and a heading still resolve"),
+            "tag1"
+        );
+        assert_eq!(
+            project_of(&snap, "Do Now", "The vault-subdir spelling resolves too"),
+            "perseido"
+        );
+    }
+
+    #[test]
+    fn an_item_with_no_resolvable_home_is_unfiled() {
+        let snap = projects_snapshot();
+        for lead in [
+            "No link at all, so no declared home",
+            "A wiki link no topic page claims",
+            "A URL is not a lineage",
+        ] {
+            assert_eq!(project_of(&snap, "Do Now", lead), PROJECT_UNFILED, "{lead}");
+        }
+        // And the OTHER fixtures, whose links name no topic at all, are unfiled
+        // throughout — the derivation never invents a home.
+        let full = parse_today(FULL);
+        assert!(
+            full.lead_items
+                .iter()
+                .chain(full.sections.iter().flat_map(|s| s.items.iter()))
+                .all(|i| i.project == PROJECT_UNFILED),
+            "an unrelated day file files nothing"
+        );
+    }
+
+    #[test]
+    fn a_note_a_topic_page_claims_rolls_up_to_that_topic() {
+        let snap = projects_snapshot();
+        assert_eq!(
+            project_of(&snap, "Do Now", "A note one topic page claims"),
+            "tag1"
+        );
+        // …and without the rollup table, the same item is unfiled rather than
+        // guessed: the parse alone cannot know who claims that note.
+        let bare = parse_today(PROJECTS);
+        assert_eq!(
+            project_of(&bare, "Do Now", "A note one topic page claims"),
+            PROJECT_UNFILED
+        );
+        assert_eq!(
+            project_of(&bare, "Do Now", "A Tag1 home link"),
+            "tag1",
+            "a DIRECT home link needs no rollup"
+        );
+    }
+
+    #[test]
+    fn a_direct_home_link_outranks_a_rollup_link() {
+        assert_eq!(
+            project_of(
+                &projects_snapshot(),
+                "Do Now",
+                "A home link outranks a rollup link"
+            ),
+            "network",
+            "the declared home wins over the note that merely rolls up"
+        );
+    }
+
+    #[test]
+    fn a_two_topic_rollup_is_settled_by_the_heading_or_left_unfiled() {
+        let snap = projects_snapshot();
+        // Under a heading that names one of the two candidates, the tie resolves.
+        assert_eq!(
+            project_of(
+                &snap,
+                "Tag1 (owed replies and decisions)",
+                "A heading tie-break over a two-topic rollup"
+            ),
+            "tag1"
+        );
+        // Under a heading that names neither, it does not.
+        assert_eq!(
+            project_of(&snap, "Do Now", "A note two topic pages claim"),
+            PROJECT_UNFILED
+        );
+        // Two home links and a heading that names neither: still unfiled.
+        assert_eq!(
+            project_of(&snap, "Do Now", "Two home links with nothing to separate"),
+            PROJECT_UNFILED
+        );
+    }
+
+    #[test]
+    fn the_heading_only_disambiguates_and_never_files_on_its_own() {
+        let snap = projects_snapshot();
+        // A Tag1 heading over an item that declared no lineage at all.
+        assert_eq!(
+            project_of(
+                &snap,
+                "Tag1 (owed replies and decisions)",
+                "A heading never files an item that declared nothing"
+            ),
+            PROJECT_UNFILED,
+            "the heading is a tiebreak among declared candidates, not a source"
+        );
+        // A Personal heading does NOT override a single, unambiguous candidate.
+        assert_eq!(
+            project_of(
+                &snap,
+                "Personal, family and travel",
+                "A heading that names a candidate the links did not offer"
+            ),
+            "tag1"
+        );
+    }
+
+    #[test]
+    fn duplicate_and_reworded_items_each_keep_their_own_project() {
+        let snap = projects_snapshot();
+        let dupes: Vec<&TodayItem> = section(&snap, "Tag1 (owed replies and decisions)")
+            .items
+            .iter()
+            .filter(|i| i.lead.starts_with("A duplicate lead"))
+            .collect();
+        assert_eq!(dupes.len(), 2);
+        assert_ne!(dupes[0].id, dupes[1].id, "the ids still disambiguate");
+        assert!(
+            dupes.iter().all(|i| i.project == "tag1"),
+            "a duplicated item is filed like its twin"
+        );
+
+        // Rewording the lead mints a new id but must not move the project: the
+        // slug is a function of the links, not of the words.
+        let reworded = parse_today(
+            "# Today\n\n## Do Now\n\n* [ ] **Quite different words.** [[todo-list/Dashboard/Tag1]] (Added 2026-03-01)\n",
+        );
+        let original = item(section(&snap, "Do Now"), "A Tag1 home link");
+        let other = &section(&reworded, "Do Now").items[0];
+        assert_ne!(original.id, other.id);
+        assert_eq!(original.project, other.project);
+    }
+
+    #[test]
+    fn the_project_is_on_the_wire_and_folds_into_the_snapshot_etag() {
+        let snap = projects_snapshot();
+        let wire = serde_json::to_value(&snap).unwrap();
+        let first = &wire["sections"][0]["items"][0];
+        assert_eq!(first["project"], "tag1", "the slug is serialized");
+        assert!(
+            wire.to_string().find("via-con-me").is_some(),
+            "every resolved slug reaches the wire"
+        );
+        // A slug, and ONLY a slug: no colour or display string rides along.
+        for key in ["color", "colour", "hex", "projectName", "projectLabel"] {
+            assert!(
+                first.get(key).is_none(),
+                "{key} is a client concern and must not be on the wire"
+            );
+        }
+        for item in snap
+            .lead_items
+            .iter()
+            .chain(snap.sections.iter().flat_map(|s| s.items.iter()))
+        {
+            assert!(
+                PROJECT_SLUGS.contains(&item.project),
+                "{:?} is outside the frozen set",
+                item.project
+            );
+        }
+
+        // Changing only the project moves the etag, so a client's cache cannot
+        // survive a re-filing.
+        let before = snapshot_etag(&snap);
+        let mut moved = snap.clone();
+        moved.sections[0].items[0].project = "personal";
+        assert_ne!(before, snapshot_etag(&moved));
+
+        // The same document with a DIFFERENT rollup is a different etag too.
+        let unstamped = parse_today(PROJECTS);
+        assert_ne!(
+            before,
+            snapshot_etag(&unstamped),
+            "stamping the rollup must invalidate a cached snapshot"
+        );
+    }
+
+    #[test]
+    fn note_key_normalizes_the_prefix_heading_and_extension() {
+        assert_eq!(note_key("todo-list/Projects/A/B"), "projects/a/b");
+        assert_eq!(note_key("vault/Projects/A/B.md"), "projects/a/b");
+        assert_eq!(note_key("todo-list/Projects/A/B#Heading"), "projects/a/b");
+        assert_eq!(note_key("/todo-list/Projects/A/B"), "projects/a/b");
+        assert_eq!(note_key("Projects/A/B"), "projects/a/b");
+        // A path is NOT lowercased — the notes root may be case-sensitive.
+        assert_eq!(vault_relative("todo-list/Projects/A/B"), "Projects/A/B");
+        assert_eq!(vault_relative("todo-list/Projects/A/B.md"), "Projects/A/B.md");
+        assert_eq!(vault_relative("todo-list/Projects/A#H"), "Projects/A");
     }
 
     // ---- Byte-range fidelity ----------------------------------------------

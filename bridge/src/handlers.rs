@@ -1895,6 +1895,11 @@ pub fn app(state: AppState) -> Router {
         // The day file, read-only: the same snapshot posture as /jesse/diet, plus a
         // strong ETag so a poll that changes nothing costs one 304.
         .route("/jesse/today", get(jesse_today))
+        // The "more information" note behind one item — the first read path that
+        // serves arbitrary vault CONTENT. Keyed by item id and never by a path, so
+        // the reachable set is exactly "notes linked from Today.md"; every target
+        // is confined to the vault root. See `todaydetail` and SECURITY.md.
+        .route("/jesse/today/items/:id/detail", get(jesse_today_detail))
         // The day file's WRITE path — the first thing in the bridge that edits the
         // agent's own working files. Line-level splices only, journaled before the
         // edit and replayed at turn completion, and every mutation gated on an
