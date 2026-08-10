@@ -134,9 +134,15 @@ struct MacThreadDetailView: View {
         .padding(12)
     }
 
+    /// An empty composer is normally not a turn — except on a thread a screen OPENED
+    /// with context attached (the Today tab's Discuss). There, sending nothing is the
+    /// explicit "just look at it", and the attached item is what the turn carries. The
+    /// coordinator composes and re-checks either way; this only decides whether the
+    /// button is live.
     private var canSend: Bool {
         coordinator.configStore.isConfigured && !running
-            && !draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            && (!draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                || coordinator.attachedContext(for: thread.id) != nil)
     }
 
     private func send() {

@@ -4,76 +4,17 @@ import JesseCore
 import JesseNetworking
 import JesseTodayDisplay
 
-// How a Today-tab gesture becomes a turn.
+// How a Today-tab gesture becomes a turn ON iOS.
 //
-// Two small pieces, kept out of the view because all three are things a test should
-// be able to state: WHICH prompt an action sends (`TodayTurn`), that starting one
-// creates a NEW conversation rather than appending to whatever was last open, and
-// WHEN it is sent — on the tap for an execute action, on the user's own first
-// message for a discussion (`TodayThreadOpener`).
+// WHICH prompt an action sends is no longer here: `TodayTurn` moved into
+// JesseTodayDisplay when the Mac grew a Today tab, because "Discuss is an Ask
+// carrying the frozen discuss prompt" is a fact about the screen and not about a
+// platform, and the second copy of it would have been the one that drifted.
 //
-// The prompt text is never assembled here. `TodayDiscuss.prompt` and
-// `TodayPropagate.prompt` (JesseCore) are frozen wordings whose scope clauses are
-// what keep an item discussion from tripping the morning routine and a propagation
-// from closing work nobody did — see their file. This layer only chooses between
-// them and picks the mode.
-
-/// One Today action, resolved to the turn it sends.
-struct TodayTurn: Equatable {
-    let mode: JesseMode
-    let text: String
-
-    /// "Discuss this item with me."
-    ///
-    /// Its text is ATTACHED, not fired: a discussion opens on an empty composer and
-    /// sends this with the user's own first message (`TodayThreadOpener.stage`).
-    ///
-    /// ASK, not Tell. The turn's purpose is a conversation, and Ask carries the
-    /// floor that forbids task-work Jeremy did not request — which is exactly the
-    /// protection wanted around a screen whose whole content is a list of tasks. The
-    /// discuss prompt still asks, explicitly and in its own words, for Today.md and
-    /// the item's home to be updated IF the discussion changes the item; that is a
-    /// request, so the Ask floor does not stand in its way.
-    static func discuss(item: TodayItem) -> TodayTurn {
-        TodayTurn(mode: .ask, text: TodayDiscuss.prompt(item: item.text))
-    }
-
-    /// "I finished this — close it at source."
-    ///
-    /// TELL: it writes to the project file and the Dashboard. `evidence` is the line
-    /// the completion recorded (the user's own words, or the file's); nil produces
-    /// the builder's "none", never an empty quotation.
-    static func propagate(item: TodayItem, evidence: String?) -> TodayTurn {
-        TodayTurn(mode: .tell, text: TodayPropagate.prompt(item: item.text, evidence: evidence))
-    }
-
-    /// "Process the updates" — every item ticked today, closed at source in ONE turn.
-    ///
-    /// TELL, and the largest one this screen can send: it writes to each item's project
-    /// file, to the Dashboard, and to `Today.md` itself, from which the processed lines
-    /// are removed. Which is exactly why it is confirmed against a list of the actual
-    /// rows before it fires (`TodayProcessSheet`) and never on the toolbar tap.
-    ///
-    /// The RAW markdown of each item, like the two single-item prompts: the links are
-    /// how the agent finds each home and the `(Added …)` trailers are how it tells two
-    /// similarly-worded lines apart.
-    static func processUpdates(items: [TodayItem]) -> TodayTurn {
-        TodayTurn(mode: .tell, text: TodayProcessUpdates.prompt(items: items.map(\.text)))
-    }
-
-    /// What a tapped link chip should do, when the answer is "a conversation".
-    ///
-    /// A URL is not one — it opens in the browser through the system's own handling,
-    /// so this answers nil for it. A `[[wiki]]` target has no in-app viewer in v1
-    /// (noted as a follow-on), and the honest fallback is a discussion seeded with
-    /// the row that referenced the note: the agent can read the file, which the app
-    /// cannot. It reuses `TodayDiscuss.prompt` rather than introducing a second
-    /// wording for the same act.
-    static func openLink(_ origin: TodayLinkOrigin) -> TodayTurn? {
-        guard origin.link.isWiki else { return nil }
-        return TodayTurn(mode: .ask, text: TodayDiscuss.prompt(item: origin.sourceText))
-    }
-}
+// What remains is the half that touches this app's own coordinator and store: that
+// starting an action creates a NEW conversation rather than appending to whatever
+// was last open, and WHEN the turn is sent — on the tap for an execute action, on
+// the user's own first message for a discussion (`TodayThreadOpener`).
 
 /// Opens a Today action on a brand-new thread, in one of the two ways an action can
 /// reach a conversation.

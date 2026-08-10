@@ -29,6 +29,17 @@ import JesseNetworking
 /// closures, so the same view renders on a phone, in a Mac window, and in a preview.
 public struct TodayListView: View {
     @Bindable private var model: TodayDashboardModel
+    /// The selected row's item id, when the shell wants a SELECTABLE list.
+    ///
+    /// Optional, and nil by default, because selection is not free: on iOS a `List`
+    /// handed a selection binding shows selection circles in edit mode, which is
+    /// exactly where this screen puts its accessible reorder grips. The phone
+    /// therefore passes nothing and gets the list it had. A Mac window passes a
+    /// binding, and with it comes the thing selection is FOR — a keyboard: arrow keys
+    /// walk the day and space ticks the selected row, through the same code path as a
+    /// click on its checkbox (`toggle`), evidence sheet and all.
+    private let selection: Binding<String?>?
+    private let opensOnDoubleTap: Bool
     private let onOpenLink: (TodayLinkOrigin) -> Void
     private let onOpenDetail: (TodayItem) -> Void
     private let onDiscuss: (TodayItem) -> Void
@@ -47,6 +58,8 @@ public struct TodayListView: View {
 
     public init(model: TodayDashboardModel,
                 isProcessing: Bool = false,
+                selection: Binding<String?>? = nil,
+                opensOnDoubleTap: Bool = false,
                 onOpenLink: @escaping (TodayLinkOrigin) -> Void = { _ in },
                 onOpenDetail: @escaping (TodayItem) -> Void = { _ in },
                 onDiscuss: @escaping (TodayItem) -> Void = { _ in },
@@ -54,6 +67,8 @@ public struct TodayListView: View {
                 onProcessUpdates: @escaping ([TodayItem]) -> Void = { _ in }) {
         self.model = model
         self.isProcessing = isProcessing
+        self.selection = selection
+        self.opensOnDoubleTap = opensOnDoubleTap
         self.onOpenLink = onOpenLink
         self.onOpenDetail = onOpenDetail
         self.onDiscuss = onDiscuss
@@ -113,7 +128,7 @@ public struct TodayListView: View {
 
     @ViewBuilder
     private func content(_ snapshot: TodaySnapshot) -> some View {
-        List {
+        List(selection: selection) {
             if let notice = model.notice {
                 TodayNoticeRow(message: notice) { model.dismissNotice() }
                     .listRowSeparator(.hidden)
@@ -144,6 +159,22 @@ public struct TodayListView: View {
         }
         .listStyle(.plain)
         .navigationTitle(snapshot.title ?? "Today")
+        // Space ticks the selected row — the one keyboard gesture this screen really
+        // wants, and the reason the selection binding exists. It runs `toggle`, the
+        // SAME function the checkbox's own tap runs, so the read-only refusal, the
+        // evidence sheet and the no-note fast path are all inherited rather than
+        // re-stated: a second spelling of "what checking an item means" is exactly the
+        // one that would forget to ask for evidence.
+        //
+        // `.ignored` when nothing is selected, or when the selected row is not an item
+        // (a briefing report is selectable too and has no box to tick), so space keeps
+        // whatever meaning the platform gives it.
+        .onKeyPress(.space) {
+            guard let id = selection?.wrappedValue,
+                  let item = model.snapshot?.item(id: id) else { return .ignored }
+            toggle(item)
+            return .handled
+        }
     }
 
     @ViewBuilder
@@ -223,18 +254,8 @@ public struct TodayListView: View {
             evidence: model.evidence(for: item),
             availableMoves: moves,
             focusActions: focusActions,
-            onToggle: { wantsChecked in
-                // Read-only is answered HERE, before the sheet: the alternative is
-                // taking a line of evidence off the user and then refusing to write it.
-                guard !model.refuseInteractionIfReadOnly() else { return }
-                // Unchecking never asks for a note — there is nothing to record about
-                // undoing something, and the sheet would be pure friction.
-                if wantsChecked {
-                    evidenceFor = EvidenceTarget(id: item.id)
-                } else {
-                    Task { await model.check(id: item.id, checked: false) }
-                }
-            },
+            opensOnDoubleTap: opensOnDoubleTap,
+            onToggle: { _ in toggle(item) },
             onMove: { op in Task { await model.move(id: item.id, op: op) } },
             onFocus: { focus in Task { await model.focus(id: item.id, focus) } },
             onOpen: { onOpenDetail(item) },
@@ -267,6 +288,21 @@ public struct TodayListView: View {
                 }
                 .tint(focus == .doNow ? .orange : .indigo)
             }
+        }
+    }
+
+    /// **What ticking an item means**, in one place: the checkbox's tap and the space
+    /// key both land here, so neither can develop its own idea of it.
+    private func toggle(_ item: TodayItem) {
+        // Read-only is answered HERE, before the sheet: the alternative is taking a
+        // line of evidence off the user and then refusing to write it.
+        guard !model.refuseInteractionIfReadOnly() else { return }
+        // Unchecking never asks for a note — there is nothing to record about undoing
+        // something, and the sheet would be pure friction.
+        if item.checked {
+            Task { await model.check(id: item.id, checked: false) }
+        } else {
+            evidenceFor = EvidenceTarget(id: item.id)
         }
     }
 

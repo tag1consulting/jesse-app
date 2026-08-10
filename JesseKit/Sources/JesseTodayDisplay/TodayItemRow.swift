@@ -177,6 +177,16 @@ public struct TodayItemRow: View {
     let evidence: String?
     let availableMoves: [TodayMoveOp]
     let focusActions: [TodayFocus]
+    /// Whether opening the item takes TWO clicks instead of one.
+    ///
+    /// A parameter rather than a `#if os(macOS)`, because it is not really about the
+    /// operating system: it is about whether the list this row sits in has a
+    /// SELECTION. Where a single click selects a row (a Mac window, where selection is
+    /// what the keyboard then acts on), a single click cannot also open it — so the
+    /// open moves to the double click, which is what a Mac user reaches for anyway.
+    /// Where there is no selection, as on the phone, a single tap opens and this stays
+    /// false. The shell knows which of those it built; this file must not guess.
+    let opensOnDoubleTap: Bool
     let onToggle: (Bool) -> Void
     let onMove: (TodayMoveOp) -> Void
     let onFocus: (TodayFocus) -> Void
@@ -188,6 +198,7 @@ public struct TodayItemRow: View {
     public init(item: TodayItem, pending: Bool = false, evidence: String? = nil,
                 availableMoves: [TodayMoveOp] = [],
                 focusActions: [TodayFocus] = [],
+                opensOnDoubleTap: Bool = false,
                 onToggle: @escaping (Bool) -> Void,
                 onMove: @escaping (TodayMoveOp) -> Void = { _ in },
                 onFocus: @escaping (TodayFocus) -> Void = { _ in },
@@ -200,6 +211,7 @@ public struct TodayItemRow: View {
         self.evidence = evidence
         self.availableMoves = availableMoves
         self.focusActions = focusActions
+        self.opensOnDoubleTap = opensOnDoubleTap
         self.onToggle = onToggle
         self.onMove = onMove
         self.onFocus = onFocus
@@ -246,8 +258,11 @@ public struct TodayItemRow: View {
         // handles its own tap before this ever sees it, which is exactly the division
         // wanted: the checkbox ticks, a chip opens its link, the rest of the row opens
         // the item.
+        //
+        // One tap or two, per `opensOnDoubleTap`: in a selectable list the single click
+        // belongs to the selection, so the open moves to the second one.
         .contentShape(.rect)
-        .onTapGesture(perform: onOpen)
+        .onTapGesture(count: opensOnDoubleTap ? 2 : 1, perform: onOpen)
         // The same actions the ellipsis menu offers, on a long press. Two ways in
         // rather than two menus: `TodayItemActions` is the single list, so an action
         // added to it appears in both without either falling behind the other.

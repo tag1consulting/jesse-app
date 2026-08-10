@@ -171,6 +171,39 @@ final class MacCoordinator {
     /// Guards `refreshSessions` against overlapping runs, exactly as the phone does.
     private var isRefreshingSessions = false
 
+    /// Context held against a thread that was OPENED without firing a turn — today
+    /// only the Today tab's Discuss. There is nothing for the agent to do until Jeremy
+    /// has said what he wants, so the frozen `TodayDiscuss.prompt` (the item's markdown,
+    /// its links, and the sentence that keeps a discussion from tripping the morning
+    /// routine) waits here and rides his first message, composed by the SHARED
+    /// `TodayThreadContext.firstMessage` — the same composition the phone uses, because
+    /// a second spelling of it on this platform would be a second definition of what an
+    /// item discussion is scoped to.
+    ///
+    /// Deliberately OBSERVED (not `@ObservationIgnored`): the composer enables Send on an
+    /// empty input only while a context is attached, so the view has to re-evaluate when
+    /// the first send consumes it.
+    ///
+    /// In memory only. An attachment describes a thread that has never been sent to, and
+    /// such a thread is not in the store either — both die with the process, and the
+    /// Today tab drops the attachment when its sheet is dismissed.
+    private var attachedContexts: [UUID: String] = [:]
+
+    /// Hold `context` against a thread opened without firing; its first send carries it.
+    func attach(context: String, to threadID: UUID) {
+        attachedContexts[threadID] = context
+    }
+
+    /// The context waiting on this thread's first send, if any. nil once consumed —
+    /// which is also what tells the composer that an empty send is no longer a turn.
+    func attachedContext(for threadID: UUID) -> String? { attachedContexts[threadID] }
+
+    /// Drop an attachment that will never be sent (its sheet was dismissed). A no-op
+    /// once the first send has consumed it.
+    func clearAttachedContext(for threadID: UUID) {
+        attachedContexts[threadID] = nil
+    }
+
     /// Whether the bridge has ACCEPTED the running turn (its 202 came back), as opposed to the
     /// POST still being in flight. `isRunning` deliberately covers both, which is why it cannot
     /// answer this; the detail view's delivery caption reads `phase` below.
@@ -230,9 +263,29 @@ final class MacCoordinator {
 
     /// Send `text` in `thread`, streaming the reply. Creates an optimistic user turn
     /// immediately (cache-first), then appends the assistant turn when the run finishes.
+    ///
+    /// If the thread carries an ATTACHED context (a screen opened it without firing —
+    /// today only the Today tab's Discuss), this send is the one that spends it: the
+    /// context is composed AHEAD of whatever was typed and the attachment is dropped, so
+    /// it rides the first message and only the first. Composing HERE rather than in the
+    /// composer is what makes every send path honor it, and what makes an empty composer
+    /// with a context attached a real turn ("just look at it") instead of a silently
+    /// dropped one.
     func send(text: String, mode: JesseMode, thread: JesseThread, context: ModelContext) async {
-        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        let attached = attachedContexts[thread.id]
+        let trimmed = attached.map { TodayThreadContext.firstMessage(context: $0, typed: text) }
+            ?? text.trimmingCharacters(in: .whitespacesAndNewlines)
+        // The guards run on the COMPOSED text and before the attachment is spent, so a
+        // send refused because a turn is already running leaves the context attached for
+        // the send that does go through.
         guard !trimmed.isEmpty, !isRunning, configStore.isConfigured else { return }
+        attachedContexts[thread.id] = nil
+
+        // A staged thread is not in the store until its first send (the Chats list reaps
+        // empty thread-less threads on appear, which would otherwise delete a discussion
+        // out from under the open sheet). Insert it now so its turns persist and it
+        // shows in the list. A no-op for every other path, which inserts on creation.
+        if thread.modelContext == nil { context.insert(thread) }
 
         let userTurn = Turn(role: .user, text: trimmed)
         userTurn.thread = thread
