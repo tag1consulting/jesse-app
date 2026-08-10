@@ -15,7 +15,7 @@ import JesseNetworking
 /// so the same view renders on a phone, in a Mac window, and in a preview.
 public struct TodayListView: View {
     @Bindable private var model: TodayDashboardModel
-    private let onOpenLink: (TodayLink) -> Void
+    private let onOpenLink: (TodayLinkOrigin) -> Void
     private let onDiscuss: (TodayItem) -> Void
     private let onPropagate: (TodayItem, String?) -> Void
 
@@ -24,7 +24,7 @@ public struct TodayListView: View {
     @State private var evidenceFor: EvidenceTarget?
 
     public init(model: TodayDashboardModel,
-                onOpenLink: @escaping (TodayLink) -> Void = { _ in },
+                onOpenLink: @escaping (TodayLinkOrigin) -> Void = { _ in },
                 onDiscuss: @escaping (TodayItem) -> Void = { _ in },
                 onPropagate: @escaping (TodayItem, String?) -> Void = { _, _ in }) {
         self.model = model
@@ -63,8 +63,12 @@ public struct TodayListView: View {
     @ViewBuilder
     private func content(_ snapshot: TodaySnapshot) -> some View {
         List {
-            if model.isOffline || model.isPendingReplay {
-                TodayStatusBanner(isOffline: model.isOffline,
+            if let notice = model.notice {
+                TodayNoticeRow(message: notice) { model.dismissNotice() }
+                    .listRowSeparator(.hidden)
+            }
+            if model.isReadOnly || model.isPendingReplay {
+                TodayStatusBanner(isOffline: model.isReadOnly,
                                   isPendingReplay: model.isPendingReplay,
                                   message: model.lastErrorMessage)
                     .listRowSeparator(.hidden)
@@ -84,12 +88,6 @@ public struct TodayListView: View {
         }
         .listStyle(.plain)
         .navigationTitle(snapshot.title ?? "Today")
-        .alert("That move isn't possible",
-               isPresented: .constant(model.lastConflictMessage != nil)) {
-            Button("OK", role: .cancel) {}
-        } message: {
-            Text(model.lastConflictMessage ?? "")
-        }
     }
 
     @ViewBuilder
@@ -101,7 +99,13 @@ public struct TodayListView: View {
                 // as one block keeps them readable as a timetable.
                 TodayScheduleBlock(section: section)
             } else {
-                ForEach(section.prose, id: \.range) { prose in
+                // Keyed by POSITION, not by `range`. Two prose lines with the same
+                // source range are indistinguishable to `ForEach`, which then renders
+                // one of them twice and silently drops the other — a real failure mode
+                // for any producer whose ranges are not per-line (a synthetic snapshot,
+                // a future parser that stops carrying offsets). Position is unique by
+                // construction and the list is rebuilt whole on every snapshot anyway.
+                ForEach(Array(section.prose.enumerated()), id: \.offset) { _, prose in
                     Text(TodaySemantics.strippedMarkdown(prose.text))
                         .font(.footnote)
                         .foregroundStyle(.secondary)
@@ -121,12 +125,16 @@ public struct TodayListView: View {
     }
 
     private func row(_ item: TodayItem, in snapshot: TodaySnapshot) -> some View {
-        TodayItemRow(
+        let moves = TodaySemantics.availableMoves(for: item, in: snapshot)
+        return TodayItemRow(
             item: item,
             pending: model.isPending(item.id),
             evidence: model.evidence(for: item),
-            availableMoves: TodaySemantics.availableMoves(for: item, in: snapshot),
+            availableMoves: moves,
             onToggle: { wantsChecked in
+                // Read-only is answered HERE, before the sheet: the alternative is
+                // taking a line of evidence off the user and then refusing to write it.
+                guard !model.refuseInteractionIfReadOnly() else { return }
                 // Unchecking never asks for a note — there is nothing to record about
                 // undoing something, and the sheet would be pure friction.
                 if wantsChecked {
@@ -139,6 +147,36 @@ public struct TodayListView: View {
             onDiscuss: { onDiscuss(item) },
             onPropagate: { onPropagate(item, model.evidence(for: item)) },
             onOpenLink: onOpenLink)
+        // Swipe carries the actions worth a one-handed gesture; the long-press menu
+        // and the ellipsis carry the complete set including all four moves. A swipe
+        // slot cannot open a submenu, so putting every move here would mean four
+        // buttons competing for the width of a row.
+        .swipeActions(edge: .leading, allowsFullSwipe: false) {
+            Button { onDiscuss(item) } label: {
+                Label("Discuss", systemImage: "bubble.left.and.text.bubble.right")
+            }
+            .tint(.blue)
+        }
+        .swipeActions(edge: .trailing, allowsFullSwipe: false) {
+            if item.checked {
+                Button { onPropagate(item, model.evidence(for: item)) } label: {
+                    Label("Close at source", systemImage: "arrow.up.forward.square")
+                }
+                .tint(.green)
+            }
+            if moves.contains(.toDoNow) {
+                Button { Task { await model.move(id: item.id, op: .toDoNow) } } label: {
+                    Label(TodaySemantics.label(for: .toDoNow),
+                          systemImage: TodaySemantics.symbol(for: .toDoNow))
+                }
+                .tint(.orange)
+            }
+            if moves.contains(.topOfSection) {
+                Button { Task { await model.move(id: item.id, op: .topOfSection) } } label: {
+                    Label("Top", systemImage: TodaySemantics.symbol(for: .topOfSection))
+                }
+            }
+        }
     }
 
     @ViewBuilder
@@ -235,7 +273,9 @@ struct TodayScheduleBlock: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
-            ForEach(section.prose, id: \.range) { prose in
+            // Position-keyed for the same reason as the prose rows above: a repeated
+            // source range must not collapse two lines of the timetable into one.
+            ForEach(Array(section.prose.enumerated()), id: \.offset) { _, prose in
                 Label {
                     Text(TodaySemantics.strippedMarkdown(TodaySemantics.taskBody(prose.text)))
                         .font(.subheadline)
@@ -248,6 +288,47 @@ struct TodayScheduleBlock: View {
             }
         }
         .padding(.vertical, 2)
+    }
+}
+
+/// The one-line answer to an action that did not happen: a move the bridge refused
+/// (`409`), or a tap made while the day is read-only.
+///
+/// Inline at the top of the document rather than an alert, which is what this
+/// started as. An alert is a modal interruption that demands a dismissal before the
+/// user can look at the thing the message is about — for "that move isn't possible"
+/// the useful next act is to LOOK at the list and pick another one. The row states
+/// what happened, stays until the next action supersedes it, and can be dismissed
+/// without moving the user off the screen.
+struct TodayNoticeRow: View {
+    let message: String
+    let onDismiss: () -> Void
+
+    var body: some View {
+        HStack(alignment: .top, spacing: 8) {
+            Image(systemName: "info.circle")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            Text(message)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+            Spacer(minLength: 4)
+            Button(action: onDismiss) {
+                Image(systemName: "xmark")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .frame(width: 24, height: 24)
+                    .contentShape(.rect)
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel("Dismiss")
+        }
+        .padding(.vertical, 6)
+        .padding(.horizontal, 10)
+        .background(.quaternary, in: .rect(cornerRadius: 8))
+        .padding(.vertical, 4)
+        .accessibilityElement(children: .combine)
     }
 }
 

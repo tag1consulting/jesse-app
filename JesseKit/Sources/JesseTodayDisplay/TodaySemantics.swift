@@ -257,6 +257,18 @@ public enum TodaySemantics {
         snapshot.allReports.filter { !$0.seen }.count
     }
 
+    /// **The number on the tab.** Open Do Now work plus glanceable rows not yet seen.
+    ///
+    /// One function rather than a sum a view writes, because a tab badge is a single
+    /// claim — "this many things want you" — and the moment its two halves are added
+    /// up at the call site, each platform's shell owns a private definition of what
+    /// the badge means and they drift. `doNowOpenCount` and `unseenReportCount` stay
+    /// public because the section headers and the unseen dot need them separately;
+    /// this is the only thing the tab itself should read.
+    public nonisolated static func tabBadge(_ snapshot: TodaySnapshot) -> Int {
+        doNowOpenCount(snapshot) + unseenReportCount(snapshot)
+    }
+
     // MARK: - Row presentation
 
     /// The bold lead and the rest of an item's first line, split for rendering.
