@@ -26,8 +26,8 @@
 //! that is proven rather than assumed.
 
 use jesse_bridge::{
-    compare_results, parse_results, render_results, run_battery, BatteryOptions, Config,
-    ContainmentRow, Harness, McpSet,
+    compare_results, export_mcp_server_env, parse_results, render_results, run_battery,
+    BatteryOptions, Config, ContainmentRow, Harness, McpSet,
 };
 
 /// The committed record. Resolved against the crate root at COMPILE time so the binary always
@@ -69,6 +69,14 @@ fn usage() -> ! {
 
 #[tokio::main]
 async fn main() {
+    // THE BATTERY MUST SPAWN CHILDREN IN THE SAME ENVIRONMENT THE BRIDGE DOES, or it records
+    // a posture that was never actually probed. Without this the MCP servers that read a
+    // credential — Google, GitHub, Fastmail, UniFi — start, find nothing, and register ZERO
+    // tools; the run then looks clean while proving nothing about the servers it names, and
+    // the resulting record would vouch for a set the child never really loaded. Same call,
+    // same reason, as `main.rs`.
+    export_mcp_server_env();
+
     let args: Vec<String> = std::env::args().skip(1).collect();
     let mut opts = BatteryOptions::default();
     let mut write = false;

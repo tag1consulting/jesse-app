@@ -304,7 +304,60 @@ mcp__homeassistant__HassMediaSearchAndPlay,\
 mcp__homeassistant__HassListAddItem,mcp__homeassistant__HassListCompleteItem,\
 mcp__homeassistant__HassListRemoveItem,mcp__homeassistant__HassBroadcast,\
 mcp__roon__hifi_zones,mcp__roon__hifi_now_playing,mcp__roon__hifi_control,\
-mcp__roon__hifi_search,mcp__roon__hifi_play,mcp__roon__hifi_status";
+mcp__roon__hifi_search,mcp__roon__hifi_play,mcp__roon__hifi_status,\
+mcp__google__list_calendars,mcp__google__get_events,mcp__google__query_freebusy,\
+mcp__google__search_gmail_messages,mcp__google__get_gmail_message_content,\
+mcp__google__get_gmail_messages_content_batch,mcp__google__get_gmail_thread_content,\
+mcp__google__get_gmail_threads_content_batch,mcp__google__list_gmail_labels,\
+mcp__google__search_drive_files,mcp__google__get_drive_file_content,\
+mcp__google__get_drive_file_download_url,mcp__google__list_drive_items,\
+mcp__google__get_drive_file_permissions,mcp__google__check_drive_file_public_access,\
+mcp__google__get_drive_shareable_link,\
+mcp__github__actions_get,mcp__github__actions_list,mcp__github__get_commit,\
+mcp__github__get_file_contents,mcp__github__get_job_logs,mcp__github__get_latest_release,\
+mcp__github__get_release_by_tag,mcp__github__get_tag,mcp__github__list_branches,\
+mcp__github__list_commits,mcp__github__list_releases,\
+mcp__github__list_repository_collaborators,mcp__github__list_tags,mcp__github__search_code,\
+mcp__github__search_commits,mcp__github__search_repositories,\
+mcp__fastmail__get_mailboxes,mcp__fastmail__search_emails,mcp__fastmail__get_email_content,\
+mcp__unifi__unifi_tool_index,mcp__unifi__unifi_execute,mcp__unifi__unifi_batch,\
+mcp__unifi__unifi_batch_status,mcp__unifi__unifi_load_tools,\
+mcp__routeros__list_devices,mcp__routeros__system_info,mcp__routeros__interfaces,\
+mcp__routeros__ip_addresses,mcp__routeros__ip_routes,mcp__routeros__bridges,\
+mcp__routeros__neighbors,mcp__routeros__logs,mcp__routeros__config,mcp__routeros__ping,\
+mcp__proxmox__proxmox_get_nodes,mcp__proxmox__proxmox_get_node_status,\
+mcp__proxmox__proxmox_get_vms,mcp__proxmox__proxmox_get_vm_status,\
+mcp__proxmox__proxmox_execute_vm_command,mcp__proxmox__proxmox_get_storage,\
+mcp__proxmox__proxmox_get_cluster_status,mcp__proxmox__proxmox_list_templates,\
+mcp__proxmox__proxmox_create_lxc,mcp__proxmox__proxmox_create_vm,\
+mcp__proxmox__proxmox_get_next_vmid,mcp__proxmox__proxmox_start_lxc,\
+mcp__proxmox__proxmox_start_vm,mcp__proxmox__proxmox_stop_lxc,mcp__proxmox__proxmox_stop_vm,\
+mcp__proxmox__proxmox_delete_lxc,mcp__proxmox__proxmox_delete_vm,\
+mcp__proxmox__proxmox_reboot_lxc,mcp__proxmox__proxmox_reboot_vm,\
+mcp__proxmox__proxmox_shutdown_lxc,mcp__proxmox__proxmox_shutdown_vm,\
+mcp__proxmox__proxmox_pause_vm,mcp__proxmox__proxmox_resume_vm,\
+mcp__proxmox__proxmox_clone_lxc,mcp__proxmox__proxmox_clone_vm,\
+mcp__proxmox__proxmox_resize_lxc,mcp__proxmox__proxmox_resize_vm,\
+mcp__proxmox__proxmox_create_snapshot_lxc,mcp__proxmox__proxmox_create_snapshot_vm,\
+mcp__proxmox__proxmox_list_snapshots_lxc,mcp__proxmox__proxmox_list_snapshots_vm,\
+mcp__proxmox__proxmox_rollback_snapshot_lxc,mcp__proxmox__proxmox_rollback_snapshot_vm,\
+mcp__proxmox__proxmox_delete_snapshot_lxc,mcp__proxmox__proxmox_delete_snapshot_vm,\
+mcp__proxmox__proxmox_create_backup_lxc,mcp__proxmox__proxmox_create_backup_vm,\
+mcp__proxmox__proxmox_list_backups,mcp__proxmox__proxmox_restore_backup_lxc,\
+mcp__proxmox__proxmox_restore_backup_vm,mcp__proxmox__proxmox_delete_backup,\
+mcp__proxmox__proxmox_add_disk_vm,mcp__proxmox__proxmox_add_mountpoint_lxc,\
+mcp__proxmox__proxmox_resize_disk_vm,mcp__proxmox__proxmox_resize_disk_lxc,\
+mcp__proxmox__proxmox_remove_disk_vm,mcp__proxmox__proxmox_remove_mountpoint_lxc,\
+mcp__proxmox__proxmox_move_disk_vm,mcp__proxmox__proxmox_move_disk_lxc,\
+mcp__proxmox__proxmox_add_network_vm,mcp__proxmox__proxmox_add_network_lxc,\
+mcp__proxmox__proxmox_update_network_vm,mcp__proxmox__proxmox_update_network_lxc,\
+mcp__proxmox__proxmox_remove_network_vm,mcp__proxmox__proxmox_remove_network_lxc,\
+mcp__proxmox__proxmox_generate_terraform,mcp__proxmox__proxmox_get_task_status,\
+mcp__proxmox__proxmox_get_vm_config,mcp__proxmox__proxmox_whoami,\
+mcp__proxmox__proxmox_migrate_vm,mcp__proxmox__proxmox_get_guest_ips,\
+mcp__proxmox__proxmox_convert_to_template,mcp__proxmox__proxmox_set_cloudinit,\
+mcp__proxmox__proxmox_get_rrd_data,mcp__proxmox__proxmox_get_pools,\
+mcp__proxmox__proxmox_get_ha_resources,mcp__proxmox__proxmox_get_firewall_rules";
 
 // Defense-in-depth: tools that must never run from the bridge even if they slip
 // into the allowlist. Override with JESSE_DISALLOWED_TOOLS.
@@ -2030,6 +2083,110 @@ impl Config {
             )),
             model_registry,
         }
+    }
+}
+
+/// Republish the LaunchAgent's `JESSE_*` credentials under the names the MCP servers
+/// actually read, and supply the non-secret settings they need, in the BRIDGE's own
+/// environment — before any child is spawned.
+///
+/// # Why this exists at all
+///
+/// The plist stores `JESSE_UNIFI_USERNAME`, `JESSE_GITHUB_PAT`, and so on: prefixed, so the
+/// bridge's environment stays legible and a stray `UNIFI_PASSWORD` in some other tool's
+/// scope cannot be mistaken for ours. Every server, though, reads the name its own vendor
+/// chose. Something has to bridge the two, and it has to be THIS process rather than either
+/// harness:
+///
+/// * Claude Code's MCP subprocesses inherit the bridge's environment wholesale, so a name
+///   published here is simply present.
+/// * Codex scrubs the subprocess environment down to a handful of variables and forwards
+///   only what [`crate::CODEX_MCP_ENV_PASSTHROUGH`] names — BY NAME, with no ability to
+///   rename in flight. It can only forward a variable that already exists here.
+///
+/// So one function serves both harnesses, and the passthrough table must name exactly what
+/// this publishes. A name in that table with no publisher here means the server starts and
+/// registers ZERO tools — the failure is silent, and it looks like a broken server rather
+/// than a missing variable.
+///
+/// # Never overwrite
+///
+/// Every write is conditional on the target being unset, so a deployment that already
+/// exports a vendor name wins. That keeps this from being a hidden second source of truth
+/// for a value an operator set deliberately.
+///
+/// # Paths are built at RUNTIME, never written as literals
+///
+/// `WORKSPACE_MCP_CREDENTIALS_DIR` and `ROUTEROS_DEVICES_CONFIG` are under `$HOME`. Writing
+/// them as literals would hard-code one home directory into a tracked file and trip
+/// `scripts/ci-guards.sh` (R5, personal infrastructure). Composing them from `HOME` at
+/// startup keeps the source machine-independent, which is the same property the bare-command
+/// MCP entries in [`crate::MAIN_CHILD_MCP_CONFIG`] preserve.
+///
+/// # Proxmox is absent on purpose
+///
+/// It reads `__dirname/../.env` relative to its own file, so it needs nothing from here and
+/// is not in the passthrough table either.
+pub fn export_mcp_server_env() {
+    fn set_if_unset(key: &str, value: &str) {
+        if std::env::var_os(key).is_none() && !value.is_empty() {
+            std::env::set_var(key, value);
+        }
+    }
+    fn map(from: &str, to: &str) {
+        if let Ok(v) = std::env::var(from) {
+            set_if_unset(to, &v);
+        }
+    }
+
+    // Credentials: plist name -> the name the server reads.
+    map("JESSE_GOOGLE_CLIENT_ID", "GOOGLE_OAUTH_CLIENT_ID");
+    map("JESSE_GOOGLE_SECRET", "GOOGLE_OAUTH_CLIENT_SECRET");
+    map("JESSE_GITHUB_PAT", "GITHUB_PERSONAL_ACCESS_TOKEN");
+    map("JESSE_JMAP_TOKEN", "JMAP_TOKEN");
+    map("JESSE_UNIFI_USERNAME", "UNIFI_USERNAME");
+    map("JESSE_UNIFI_PASSWORD", "UNIFI_PASSWORD");
+
+    // Non-secret settings the servers need. UniFi's controller is a UDM-PRO-SE speaking the
+    // UniFi OS proxy API, which is why `CONTROLLER_TYPE` is `proxy` and TLS verification is
+    // off (it serves a self-signed certificate on the LAN).
+    set_if_unset("UNIFI_HOST", "10.20.0.2");
+    set_if_unset("UNIFI_PORT", "443");
+    set_if_unset("UNIFI_CONTROLLER_TYPE", "proxy");
+    set_if_unset("UNIFI_VERIFY_SSL", "false");
+    set_if_unset("UNIFI_SITE", "default");
+    set_if_unset("JMAP_SESSION_URL", "https://api.fastmail.com/jmap/session");
+    // RouterOS SSH listens on 2324, not 22. The server tries `api` (8728) first, so this
+    // only matters for the fallback path — but a wrong port there turns a clean failure
+    // into a hang.
+    set_if_unset("ROUTEROS_SSH_PORT", "2324");
+
+    if let Some(home) = std::env::var_os("HOME") {
+        let home = std::path::PathBuf::from(home);
+        // The Google OAuth token cache MUST be persistent. A `/tmp` path survives until the
+        // next reboot and then forces an interactive re-consent, which a headless bridge
+        // turn cannot perform — the servers would simply stop answering one morning.
+        set_if_unset(
+            "WORKSPACE_MCP_CREDENTIALS_DIR",
+            &home.join(".config/jesse-google/creds").to_string_lossy(),
+        );
+        // Where the Google server writes attachments and downloaded Drive files. Pointed
+        // OUT of the working tree deliberately: MCP servers run outside the child's sandbox
+        // and default to writing into the cwd, which is the vault.
+        set_if_unset(
+            "WORKSPACE_ATTACHMENT_DIR",
+            &home
+                .join(".config/jesse-google/attachments")
+                .to_string_lossy(),
+        );
+        // RouterOS reads its device list from a FILE rather than the environment, so what
+        // gets forwarded is the path, not a credential.
+        set_if_unset(
+            "ROUTEROS_DEVICES_CONFIG",
+            &home
+                .join(".config/routeros-mcp/devices.yaml")
+                .to_string_lossy(),
+        );
     }
 }
 

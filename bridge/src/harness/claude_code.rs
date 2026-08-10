@@ -500,10 +500,48 @@ macro_rules! home_assistant_mcp_url {
     };
 }
 
-pub const MAIN_CHILD_MCP_CONFIG: &str = concat!(
+/// qmd + Slack + browser + Home Assistant + Roon — the main turn's server set from bridge
+/// 0.67.0 until the morning-routine servers were added in 0.68.0. No shipped spawn site uses
+/// it today; retained for exactly the reason [`QMD_SLACK_BROWSER_MCP_CONFIG`] is, and it had
+/// to be SPLIT OUT rather than left as an alias of [`MAIN_CHILD_MCP_CONFIG`]: until 0.68.0
+/// the two were the same string, so growing the main set in place would have silently
+/// re-pointed the `qmd+slack+browser+homeassistant+roon` row label at a set that also reads
+/// Jeremy's mail and holds full control of the network and the hypervisor.
+pub const HOUSE_MCP_CONFIG: &str = concat!(
     r#"{"mcpServers":{"qmd":{"type":"stdio","command":"qmd","args":["mcp"]},"slack":{"type":"stdio","command":"npx","args":["-y","slack-mcp-server@latest","--transport","stdio"]},"browser":{"type":"stdio","command":"npx","args":["-y","@playwright/mcp@latest","--headless","--isolated","--output-dir","/tmp/jesse-browser","--output-max-size","104857600"]},"homeassistant":{"type":"http","url":""#,
     home_assistant_mcp_url!(),
     r#"","headers":{"Authorization":"Bearer ${HA_MCP_TOKEN}"}},"roon":{"type":"http","url":"http://10.40.0.2:8088/mcp"}}}"#
+);
+
+/// The house set PLUS the six morning-routine servers — every main turn on every harness
+/// from bridge 0.68.0.
+///
+/// **Every new server is `stdio` and every command is a BARE NAME**, resolved off the
+/// bridge's `PATH` exactly as `qmd` and `npx` already are. That is deliberate and it is what
+/// keeps this const machine-independent: the record commits this argv verbatim and compares
+/// it by strict equality at boot, so an absolute `/Users/...` path here would both fail
+/// `scripts/ci-guards.sh` (R5, personal infrastructure) and pin the posture to one home
+/// directory. Two of the six need a host launcher to be reachable that way — see the
+/// deployment notes in SECURITY.md — and that launcher is host setup, not repo content.
+///
+/// `mcp-proxmox` MUST be a launcher that `exec`s the real file rather than a symlink to it:
+/// the server loads its credentials from `__dirname/../.env`, and a symlinked entry point
+/// resolves `__dirname` to the link's own directory, which silently drops every `PROXMOX_*`
+/// value and leaves the server hanging at `initialize` with an EMPTY stderr. Measured
+/// 2026-08-09; it costs a battery row to rediscover.
+///
+/// **What these six add is READ REACH INTO JEREMY'S LIFE AND WRITE CONTROL OF HIS
+/// INFRASTRUCTURE**, which is a larger step than any previous set. Google, Fastmail and
+/// GitHub are read-only at the credential AND allowlist layers; RouterOS is read-only at the
+/// allowlist layer (its `command` tool is the one write path and is NOT granted). UniFi and
+/// Proxmox ship at FULL CONTROL on the operator's explicit decision — the credentials are
+/// write-capable by design and the granted tools include every mutator, up to
+/// `proxmox_execute_vm_command` (arbitrary command execution inside a guest). Read SECURITY.md
+/// before narrowing or widening this set.
+pub const MAIN_CHILD_MCP_CONFIG: &str = concat!(
+    r#"{"mcpServers":{"qmd":{"type":"stdio","command":"qmd","args":["mcp"]},"slack":{"type":"stdio","command":"npx","args":["-y","slack-mcp-server@latest","--transport","stdio"]},"browser":{"type":"stdio","command":"npx","args":["-y","@playwright/mcp@latest","--headless","--isolated","--output-dir","/tmp/jesse-browser","--output-max-size","104857600"]},"homeassistant":{"type":"http","url":""#,
+    home_assistant_mcp_url!(),
+    r#"","headers":{"Authorization":"Bearer ${HA_MCP_TOKEN}"}},"roon":{"type":"http","url":"http://10.40.0.2:8088/mcp"},"google":{"type":"stdio","command":"workspace-mcp","args":["--single-user","--read-only","--tools","calendar","gmail","drive"]},"github":{"type":"stdio","command":"github-mcp-server","args":["stdio","--read-only","--toolsets","repos,actions"]},"fastmail":{"type":"stdio","command":"npx","args":["-y","github:jeremyandrews/jmap-mcp-server"]},"unifi":{"type":"stdio","command":"unifi-network-mcp","args":[]},"routeros":{"type":"stdio","command":"routeros-mcp","args":[]},"proxmox":{"type":"stdio","command":"mcp-proxmox","args":[]}}}"#
 );
 
 /// qmd PLUS slack PLUS browser — the main turn's server set from bridge 0.66.0 until Home
@@ -1616,9 +1654,40 @@ mod tests {
             // loads the new set.
             assert_eq!(
                 servers.len(),
-                5,
-                "{label}: the main path must declare qmd, slack, browser, homeassistant and \
-                 roon and nothing else: {mcp:?}"
+                11,
+                "{label}: the main path must declare qmd, slack, browser, homeassistant, roon, \
+                 google, github, fastmail, unifi, routeros and proxmox and nothing else: {mcp:?}"
+            );
+            // THE GOOGLE SERVER MUST STAY READ-ONLY AT THE SERVER LAYER. `--read-only` is
+            // what deregisters its write tools (event create, send, Drive mutate) so they
+            // are absent at the root rather than merely ungranted, and `--tools` is what
+            // keeps the surface to the three services the morning routine reads. Asserted
+            // here because both live in a JSON string const, and dropping either would widen
+            // the set silently — the allowlist alone would still hide it from Claude Code
+            // while leaving the tools present for anything that bypassed the allowlist.
+            let google_args = servers["google"]["args"].as_array().expect("google args");
+            assert!(
+                google_args.iter().any(|a| a == "--read-only"),
+                "{label}: the Google server must run --read-only: {mcp:?}"
+            );
+            // THE GITHUB SERVER'S READ-ONLY POSTURE IS ITS ONLY LAYER. Its credential is a
+            // personal CLASSIC PAT carrying `repo` + `workflow` — write-capable — because a
+            // fine-grained PAT is single-owner and cannot reach org repos at all. So unlike
+            // every other read-only server here, nothing behind this flag stops a write.
+            let github_args = servers["github"]["args"].as_array().expect("github args");
+            assert!(
+                github_args.iter().any(|a| a == "--read-only"),
+                "{label}: the GitHub server must run --read-only — its PAT is write-capable \
+                 and this flag is the ONLY thing making the posture read-only: {mcp:?}"
+            );
+            // `checks` IS NOT A REAL TOOLSET and the server SILENTLY IGNORES unknown toolset
+            // names — measured 2026-08-09: passing a garbage name yields the same 16 tools
+            // and no warning. So a well-meaning "add checks for the Friday check-run read"
+            // would look applied, change nothing, and leave a row recorded against a
+            // toolset that never existed.
+            assert!(
+                !github_args.iter().any(|a| a == "checks"),
+                "{label}: `checks` is not a real GitHub toolset and is silently ignored: {mcp:?}"
             );
             // THE HOME ASSISTANT TOKEN MUST REACH THE CHILD UNEXPANDED. The whole reason
             // the credential is safe on this path is that the CLI resolves `${HA_MCP_TOKEN}`
@@ -2020,7 +2089,7 @@ mod tests {
     const GOLDEN_QMD_MCP: &str = concat!(
         r#"{"mcpServers":{"qmd":{"type":"stdio","command":"qmd","args":["mcp"]},"slack":{"type":"stdio","command":"npx","args":["-y","slack-mcp-server@latest","--transport","stdio"]},"browser":{"type":"stdio","command":"npx","args":["-y","@playwright/mcp@latest","--headless","--isolated","--output-dir","/tmp/jesse-browser","--output-max-size","104857600"]},"homeassistant":{"type":"http","url":""#,
         home_assistant_mcp_url!(),
-        r#"","headers":{"Authorization":"Bearer ${HA_MCP_TOKEN}"}},"roon":{"type":"http","url":"http://10.40.0.2:8088/mcp"}}}"#
+        r#"","headers":{"Authorization":"Bearer ${HA_MCP_TOKEN}"}},"roon":{"type":"http","url":"http://10.40.0.2:8088/mcp"},"google":{"type":"stdio","command":"workspace-mcp","args":["--single-user","--read-only","--tools","calendar","gmail","drive"]},"github":{"type":"stdio","command":"github-mcp-server","args":["stdio","--read-only","--toolsets","repos,actions"]},"fastmail":{"type":"stdio","command":"npx","args":["-y","github:jeremyandrews/jmap-mcp-server"]},"unifi":{"type":"stdio","command":"unifi-network-mcp","args":[]},"routeros":{"type":"stdio","command":"routeros-mcp","args":[]},"proxmox":{"type":"stdio","command":"mcp-proxmox","args":[]}}}"#
     );
     const GOLDEN_EMPTY_MCP: &str = r#"{"mcpServers":{}}"#;
 
