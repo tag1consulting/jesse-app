@@ -145,8 +145,13 @@ Read this before pairing a second device or running the bridge anywhere shared.
   is **queued** (up to `JESSE_MAX_QUEUED`, default 4); only load beyond the queue
   is shed with `429`. Set `JESSE_MAX_QUEUED=0` to restore immediate-`429`
   shedding.
-- **The token is never logged by the bridge** and is stored on the phone in the
-  **iOS Keychain** (not plaintext `UserDefaults`).
+- **The token is never written to the bridge's request logs**, and it is stored
+  on the phone in the **iOS Keychain** (not plaintext `UserDefaults`). One
+  caveat, closed in bridge 0.77.0: before that version the startup pairing QR —
+  which encodes the token — was printed to stdout unconditionally, so any
+  log-collected stdout (a container, launchd's `StandardOutPath`, `| tee`)
+  captured it on every restart. The QR is now printed only when stdout is a
+  terminal. **If your logs ever captured the QR, rotate `JESSE_TOKEN`.**
 
 ### Do not commit or share secrets
 
@@ -155,9 +160,13 @@ Read this before pairing a second device or running the bridge anywhere shared.
   (examples below generate a fresh one and never echo a literal).
 - **The startup pairing QR contains the token.** Do not screenshot, paste, or
   screen-share that terminal output. Anyone who can read it can drive your vault.
-  The plaintext `token=…` line is **hidden by default** so the raw token stays out
-  of scrollback and launchd logs; pass `--show-token` or set `JESSE_SHOW_TOKEN=1`
-  to also print it.
+  The plaintext `token=…` line is **hidden by default**, and since bridge 0.77.0
+  the QR itself prints **only when stdout is a terminal**, so neither reaches a
+  piped/collected stdout; pass `--show-token` or set `JESSE_SHOW_TOKEN=1` to also
+  print the plaintext line (that output then contains the token), `--show-qr` /
+  `JESSE_SHOW_QR=1` to force the QR onto a non-TTY stdout, or `JESSE_SHOW_QR=0`
+  to pin the QR off even on a terminal (for a PTY that is still log-collected,
+  e.g. `docker run -t`).
 - **To rotate the token**, restart the bridge with a new `JESSE_TOKEN` and
   re-pair the phone (Settings → Scan to pair). The old token stops working
   immediately.
@@ -188,8 +197,8 @@ export JESSE_ADVERTISE_HOST="<your-laptop>.<your-tailnet>.ts.net"
 cargo run --release
 ```
 
-On startup the bridge prints a **pairing QR** and a manual-entry fallback. The
-plaintext token line is hidden by default:
+On startup in a terminal the bridge prints a **pairing QR** and a manual-entry
+fallback. The plaintext token line is hidden by default:
 
 ```
 █▀▀▀▀▀█  …  █▀▀▀▀▀█
@@ -203,6 +212,13 @@ The QR encodes `jesse://pair?host=…&port=…&token=…`, so scanning still pai
 without the plaintext line. Run with `--show-token` (or `JESSE_SHOW_TOKEN=1`) to
 print `token=<token>` for manual entry — but that output then contains your token,
 so keep it on-screen only.
+
+When stdout is **not** a terminal (a pipe, a container, a service manager) the
+QR is suppressed, because there stdout is the log stream and the QR would write
+the token into it on every restart — you get only the manual-entry lines, plus
+a note on stderr naming the `--show-qr` / `JESSE_SHOW_QR` override. See the
+`JESSE_SHOW_QR` row in [`bridge/README.md`](bridge/README.md#knobs-env-vars)
+for the full tri-state behavior.
 
 Sanity-check it from the laptop before touching the phone:
 

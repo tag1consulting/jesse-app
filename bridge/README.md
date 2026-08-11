@@ -39,6 +39,28 @@ QR encodes `jesse://pair?host=…&port=…&token=…`, so scanning pairs without
 plaintext line. To also print `token=<token>` for manual entry, start the bridge
 with `--show-token` or `JESSE_SHOW_TOKEN=1` (that output then contains the token).
 
+Because the QR encodes the **full bearer token**, it is printed **only when
+stdout is a terminal**. When stdout is a pipe — a container, a service manager,
+`| tee` — stdout is the log stream, and the QR would republish the token into
+whatever log aggregation is attached on every restart. Headless runs therefore
+get only the manual-entry lines on stdout (token still hidden), plus a one-line
+note on **stderr** saying the QR was suppressed and how to get it back:
+
+```
+Pair from the app's Settings by entering these manually:
+  host=100.64.0.1  port=8765
+  (token hidden — it is the value of JESSE_TOKEN)
+```
+
+To force the QR onto a non-TTY stdout that a human is actually reading, start
+the bridge with `--show-qr` or `JESSE_SHOW_QR=1` (that output then encodes the
+token). The reverse also exists: `JESSE_SHOW_QR=0` **pins the QR off even on a
+terminal** — for the deployments where a PTY and a log stream are the same fd
+(`docker run -t`, a pod spec's `tty: true`, a `script(1)`/`unbuffer` wrapper),
+where "stdout is a terminal" does not mean "nobody is recording it". An
+explicit `0` beats both the TTY check and `--show-qr`, and also silences the
+stderr note.
+
 The advertised host defaults to `JESSE_BIND` (the tailnet IP, which is reliably
 reachable; the `ts.net` name can have DNS quirks). To put the MagicDNS hostname
 in the QR instead, set `JESSE_ADVERTISE_HOST`:
@@ -1391,6 +1413,8 @@ persona-rendered defaults so the app's cached "default" matches what a turn buil
 | `JESSE_MAX_QUEUED` | `4` | Depth of the wait queue in front of the concurrency limit. When no permit is free, up to this many turns **wait** for one (returning `202` immediately and streaming a "queued behind another turn" activity line while they wait); beyond the queue, load is shed with `429`. `0` disables the queue (an unavailable permit sheds `429` immediately — the pre-queue behavior) |
 | `JESSE_RATE_PER_MIN` | `30` | Accepted requests per rolling minute; bursts beyond it return `429` |
 | `JESSE_ADVERTISE_HOST` | value of `JESSE_BIND` | Host written into the pairing QR — set to the MagicDNS `ts.net` name to advertise that instead of the bound IP |
+| `JESSE_SHOW_QR` | (TTY-gated) | The pairing QR encodes the **full bearer token**, so by default it is printed only when stdout is a **terminal** — on a pipe (a container, a service manager) stdout is the log stream and the QR would republish the token into log aggregation on every restart. Tri-state: a truthy value (`1`/`true`/`yes`/`on`, or the `--show-qr` flag) forces the QR onto a non-TTY stdout a human is actually reading; an explicit falsy value (`0`/`false`/`no`/`off`) **pins the QR off even on a terminal**, beating `--show-qr` — the escape hatch for a PTY that is still log-collected (`docker run -t`, a pod's `tty: true`, `script(1)`); unset leaves the TTY check in charge. When suppressed by the TTY default, a one-line note goes to stderr naming the override |
+| `JESSE_SHOW_TOKEN` | (off) | Print the plaintext `token=<token>` manual-entry line at startup (same effect as the `--show-token` flag). Off by default so the raw token stays out of scrollback and launchd logs. **On a non-TTY stdout this writes the bearer token into the log stream** — prefer scanning the QR or reading `JESSE_TOKEN` from your own deployment config |
 | `JESSE_PORT` | `8765` | Port |
 | `JESSE_TIMEOUT` | `3600` | Per-request run limit (seconds), clamped to `1..=7200`. `0` is treated as the 7200s ceiling, not unlimited. On overrun the turn returns `504` with an actionable message naming this var |
 | `JESSE_JOB_TTL_SECS` | `86400` | How long a finished-but-**unfetched** reply stays retrievable (24h). The clock starts at first retrieval, not at completion |
