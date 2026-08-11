@@ -1,6 +1,6 @@
 [package]
 name = "jesse-bridge"
-version = "0.73.0"
+version = "0.74.1"
 edition = "2021"
 license = "Apache-2.0"
 
@@ -89,17 +89,15 @@ libc = "0.2"
 # Only reached when a text model is paired with a vision helper AND a turn carries
 # a PDF/image attachment; every non-vision path compiles and runs identically.
 #
-# pdfium-render: rasterize each PDF page to a bitmap before sending it to a VL
-# helper (a text model cannot read a PDF; the helper reads page images). Chosen over
-# mupdf because it binds to pdfium at RUNTIME (dlopen) rather than linking a C
-# library at build time — so `cargo build` and CI compile with NO native lib present
-# (the single-static-binary property is preserved for every deploy that never turns
-# vision on), and only a deploy that actually rasterizes needs libpdfium installed.
-# Rasterization tests are therefore gated behind JESSE_PDFIUM_LIB so CI stays green.
-# Default features only (no `bindgen`, no `static`): ships pre-generated bindings and
-# loads the lib dynamically. This is the "real library, not a fragile shell-out" the
-# design calls for.
-pdfium-render = "0.8"
+# There is NO PDF crate here, and that is the point. Rasterizing a PDF page used to mean
+# `pdfium-render`, picked because it binds libpdfium at RUNTIME (dlopen) so the build
+# needed no native library. True about the build, wrong about the deploy: libpdfium is not
+# on a stock Mac, so every PDF attachment failed with "pdfium library unavailable" unless
+# someone installed a native lib by hand and set JESSE_PDFIUM_LIB. The renderer that IS on
+# every Mac is Core Graphics' own, reached by direct FFI in `src/cgpdf.rs` — no crate, no
+# native install, no supply chain, and it addresses pages individually (which `sips`, the
+# other shell-out on the box, cannot: it converts only page 1).
+#
 # image: encode the rasterized PDF pages to PNG for the helper request, and decode /
 # downscale oversized raster inputs. Pure Rust (no C deps → static binary intact);
 # only the codecs the whitelist admits are enabled. PNG is the wire format sent to

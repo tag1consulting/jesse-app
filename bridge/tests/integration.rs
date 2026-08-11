@@ -5377,18 +5377,14 @@ async fn unpaired_model_reports_no_vision() {
     );
 }
 
+/// The full PDF path end to end: rasterize → one PNG per page → image block → mock helper
+/// → one per-page view. macOS-gated because the rasterizer is macOS's own renderer and the
+/// bridge's CI job is Linux; it needs NO environment variable, which is the difference from
+/// the pdfium version of this test — that one was gated on `JESSE_PDFIUM_LIB` and so never
+/// actually ran, anywhere.
 #[tokio::test]
-async fn vision_rasterizes_and_transcribes_a_pdf_when_pdfium_present() {
-    // GATED on JESSE_PDFIUM_LIB (CI has no pdfium → skips). Proves the full PDF path:
-    // rasterize → PNG page → image block → mock helper → per-page view.
-    if std::env::var("JESSE_PDFIUM_LIB")
-        .ok()
-        .filter(|s| !s.trim().is_empty())
-        .is_none()
-    {
-        eprintln!("skipping PDF vision test: JESSE_PDFIUM_LIB unset");
-        return;
-    }
+#[cfg(target_os = "macos")]
+async fn vision_rasterizes_and_transcribes_every_page_of_a_pdf() {
     let base = start_mock_helper().await;
     let cfg = test_config();
     let partner = ResolvedPartner {
@@ -5401,23 +5397,180 @@ async fn vision_rasterizes_and_transcribes_a_pdf_when_pdfium_present() {
     };
     let pdf = std::fs::read(concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/../eval/vision/fixtures/statement.pdf"
+        "/../eval/vision/fixtures/multipage.pdf"
     ))
     .unwrap();
     let input = VisionInput {
-        source: "statement.pdf".into(),
+        source: "multipage.pdf".into(),
         ext: "pdf".into(),
         bytes: pdf,
     };
     let client = vision_client();
     let results = transcribe_input(&client, &cfg, &partner, &input).await;
-    assert_eq!(results.len(), 1, "one-page PDF → one page result");
-    assert_eq!(results[0].page_no, Some(1));
-    assert_eq!(results[0].total_pages, Some(1));
+    assert_eq!(results.len(), 4, "a four-page PDF → four page results");
+    for (i, r) in results.iter().enumerate() {
+        assert_eq!(r.page_no, Some(i + 1));
+        assert_eq!(r.total_pages, Some(4));
+        assert!(!r.truncated);
+        assert!(r.error.is_none(), "page {}: {:?}", i + 1, r.error);
+        assert!(
+            r.text.contains("media=image/png"),
+            "page {} sent as PNG",
+            i + 1
+        );
+    }
+}
+
+/// THE VISION LAYER IS KEYED TO THE MODEL, NOT TO THE HARNESS — asserted, not assumed.
+///
+/// The helper layer is reached on the strength of the active model's vision partners
+/// alone (`attachment_route(had_attachments, vision_on)` names no harness), so a text
+/// model paired with a helper gets identical PDF and HEIC handling whether its child would
+/// have been a Claude Code or a Codex process. This runs the SAME multi-page PDF and the
+/// SAME HEIC photo through `preprocess` twice, changing only `harness`, and requires the
+/// framed blocks to be byte-identical. It is what stops a future per-harness attachment
+/// branch from landing quietly: the moment one exists, these two diverge.
+#[tokio::test]
+#[cfg(target_os = "macos")]
+async fn the_vision_path_is_identical_on_both_harnesses() {
+    let base = start_mock_helper().await;
+    let partner = VisionPartner {
+        id: "mock".into(),
+        role: VisionRole::Any,
+    };
+    let helper = RegistryModel {
+        id: "mock".into(),
+        label: "Mock VL".into(),
+        kind: ModelKind::Hosted,
+        backend: Some((base, "t".into(), "m".into())),
+        subagent_model: Some("m".into()),
+        configured: true,
+        level: Capability::Read,
+        harness: CLAUDE_CODE_ID.to_string(),
+        price: PriceDeck::ZERO,
+        health: HealthConfig::default(),
+        vision: Vec::new(),
+        vision_complementary: false,
+    };
+    let cfg = Config {
+        model_registry: ModelRegistry {
+            models: vec![helper],
+        },
+        ..test_config()
+    };
+
+    // A four-page PDF and a real HEIC photo, in one turn.
+    let dir = std::env::temp_dir().join(format!("jesse-xharness-{}", random_hex()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let heic = dir.join("photo.heic");
+    let ok = std::process::Command::new("/usr/bin/sips")
+        .args(["-s", "format", "heic"])
+        .arg(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../eval/vision/fixtures/chart.png"
+        ))
+        .arg("--out")
+        .arg(&heic)
+        .output()
+        .expect("run sips");
+    assert!(ok.status.success(), "sips could not write a HEIC fixture");
+    let inputs = vec![
+        VisionInput {
+            source: "multipage.pdf".into(),
+            ext: "pdf".into(),
+            bytes: std::fs::read(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../eval/vision/fixtures/multipage.pdf"
+            ))
+            .unwrap(),
+        },
+        VisionInput {
+            source: "IMG_0001.HEIC".into(),
+            ext: "heic".into(),
+            bytes: std::fs::read(&heic).unwrap(),
+        },
+    ];
+    let _ = std::fs::remove_dir_all(&dir);
+
+    let active_on = |harness: &str| ActiveModel {
+        id: "glm".into(),
+        kind: ModelKind::Hosted,
+        env: Some(("http://text".into(), "tt".into(), "tm".into())),
+        subagent_model: Some("tm".into()),
+        level: Capability::Read,
+        harness: harness.to_string(),
+        price: PriceDeck::ZERO,
+        vision: vec![partner.clone()],
+        vision_complementary: false,
+    };
+
+    let cc = jesse_bridge::preprocess(&cfg, &active_on(CLAUDE_CODE_ID), &inputs).await;
+    let codex = jesse_bridge::preprocess(&cfg, &active_on(CODEX_ID), &inputs).await;
+
+    // Five views either way: four PDF pages plus the photo, none of them an error.
+    assert_eq!(cc.views.len(), 5, "four PDF pages + one photo");
+    assert!(
+        cc.views.iter().all(|v| v.error.is_none()),
+        "{:?}",
+        cc.views.iter().map(|v| &v.error).collect::<Vec<_>>()
+    );
+    assert_eq!(codex.views.len(), cc.views.len());
+    assert_eq!(
+        frame_views(&codex.views),
+        frame_views(&cc.views),
+        "the two harnesses must see the same attachment views"
+    );
+}
+
+/// A HEIC photo reaches the helper as PNG rather than being refused. Every iPhone photo is
+/// HEIC and the Anthropic image surface does not take it, so before the transcode this was
+/// an error view for the single most ordinary upload the composer can produce.
+#[tokio::test]
+#[cfg(target_os = "macos")]
+async fn vision_transcodes_a_heic_photo_and_sends_it_as_png() {
+    let base = start_mock_helper().await;
+    let cfg = test_config();
+    let partner = ResolvedPartner {
+        id: "mock".into(),
+        role: VisionRole::General,
+        base_url: base,
+        token: "t".into(),
+        model: "m".into(),
+        price: PriceDeck::ZERO,
+    };
+
+    // A genuine HEIF-encoded file, made with the same `sips` that reads one back.
+    let dir = std::env::temp_dir().join(format!("jesse-heic-it-{}", random_hex()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let png_in = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../eval/vision/fixtures/chart.png"
+    );
+    let heic = dir.join("photo.heic");
+    let ok = std::process::Command::new("/usr/bin/sips")
+        .args(["-s", "format", "heic"])
+        .arg(png_in)
+        .arg("--out")
+        .arg(&heic)
+        .output()
+        .expect("run sips");
+    assert!(ok.status.success(), "sips could not write a HEIC fixture");
+
+    let input = VisionInput {
+        source: "IMG_0001.HEIC".into(),
+        ext: "heic".into(),
+        bytes: std::fs::read(&heic).unwrap(),
+    };
+    let client = vision_client();
+    let results = transcribe_input(&client, &cfg, &partner, &input).await;
+    let _ = std::fs::remove_dir_all(&dir);
+
+    assert_eq!(results.len(), 1, "one image → one result");
     assert!(results[0].error.is_none(), "{:?}", results[0].error);
     assert!(
         results[0].text.contains("media=image/png"),
-        "page sent as PNG"
+        "the photo reached the helper as PNG, got: {}",
+        results[0].text
     );
 }
 

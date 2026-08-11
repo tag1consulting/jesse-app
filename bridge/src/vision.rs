@@ -4,8 +4,10 @@
 //! [`crate::VisionPartner`]). When such a model is active and a turn carries attachments,
 //! this module:
 //!
-//!   1. rasterizes each PDF page to a PNG (a text model can't read a PDF; the helper
-//!      reads page images) and passes images through as-is;
+//!   1. rasterizes each PDF page to a PNG with macOS's own renderer ([`crate::cgpdf`]) —
+//!      a text model can't read a PDF, so the helper reads page images — and passes
+//!      images through as-is, transcoding only HEIC (which the Anthropic image surface
+//!      does not accept, and which is what an iPhone photo is);
 //!   2. routes each attachment to the right-role helper (doc / general / any) —
 //!      [`route`], a pure function;
 //!   3. calls the helper directly on the Anthropic `/v1/messages` surface (the same
@@ -34,7 +36,8 @@ use std::io::Cursor;
 /// type (see [`sniff_attachment`]) maps onto one of these.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AttachmentKind {
-    /// A raster image (png/jpeg/gif/webp/heic) sent to a helper directly.
+    /// A raster image (png/jpeg/gif/webp) sent to a helper directly; a heic is
+    /// transcoded to PNG on the way.
     Image,
     /// A PDF, rasterized to one PNG per page before sending.
     Pdf,
@@ -291,38 +294,19 @@ pub struct Rasterized {
     pub truncated: bool,
 }
 
-/// Rasterize up to `page_cap` pages of a PDF to PNG at `dpi`, using pdfium (bound at
-/// runtime — `JESSE_PDFIUM_LIB` names the shared library, else the system default). This
-/// is the one place a native lib is needed; if pdfium is absent it returns `Err` and the
-/// attachment becomes an error view (never a panic). BLOCKING (pdfium is synchronous) —
-/// the caller runs it in `spawn_blocking`.
+/// Rasterize up to `page_cap` pages of a PDF to PNG at `dpi`, using the renderer macOS
+/// itself ships ([`crate::cgpdf`]) — no native library to install and no third-party
+/// crate. On a host that cannot render (a non-macOS build) or a PDF that will not open, it
+/// returns `Err` and the attachment becomes an error view, never a panic and never a
+/// silent drop. BLOCKING (the renderer and the PNG encoder are synchronous) — the caller
+/// runs it in `spawn_blocking`.
 pub fn rasterize_pdf(bytes: &[u8], dpi: u32, page_cap: usize) -> Result<Rasterized, String> {
-    use pdfium_render::prelude::*;
-
-    let bindings = match std::env::var("JESSE_PDFIUM_LIB") {
-        Ok(p) if !p.trim().is_empty() => Pdfium::bind_to_library(p.trim()),
-        _ => Pdfium::bind_to_system_library(),
-    }
-    .map_err(|e| {
-        format!("pdfium library unavailable ({e}); set JESSE_PDFIUM_LIB to libpdfium's path")
-    })?;
-    let pdfium = Pdfium::new(bindings);
-    let doc = pdfium
-        .load_pdf_from_byte_slice(bytes, None)
-        .map_err(|e| format!("could not open PDF: {e}"))?;
-    let total_pages = doc.pages().len() as usize;
-    let scale = (dpi as f32 / 72.0).max(0.1);
-    let render_cfg = PdfRenderConfig::new().scale_page_by_factor(scale);
-
-    let mut pages = Vec::new();
-    for (i, page) in doc.pages().iter().enumerate() {
-        if i >= page_cap {
-            break;
-        }
-        let bitmap = page
-            .render_with_config(&render_cfg)
-            .map_err(|e| format!("could not render page {}: {e}", i + 1))?;
-        let img = bitmap.as_image();
+    let (rendered, total_pages) = cgpdf::render_pdf_pages(bytes, dpi, page_cap)?;
+    let mut pages = Vec::with_capacity(rendered.len());
+    for (i, page) in rendered.into_iter().enumerate() {
+        let img: image::RgbaImage =
+            image::ImageBuffer::from_raw(page.width, page.height, page.rgba)
+                .ok_or_else(|| format!("page {} rendered to an inconsistent buffer", i + 1))?;
         let mut buf = Cursor::new(Vec::new());
         img.write_to(&mut buf, image::ImageFormat::Png)
             .map_err(|e| format!("could not encode page {} to PNG: {e}", i + 1))?;
@@ -335,10 +319,73 @@ pub fn rasterize_pdf(bytes: &[u8], dpi: u32, page_cap: usize) -> Result<Rasteriz
     })
 }
 
+/// Transcode a HEIC photo to PNG with macOS's own `sips`, so it can be sent on the
+/// Anthropic image surface (which takes PNG/JPEG/GIF/WebP and NOT HEIC).
+///
+/// This is the single-image case `sips` is genuinely good at — one input, one output, no
+/// page semantics to get wrong — which is why the PDF path next door uses Core Graphics
+/// instead. Every photo out of an iPhone camera roll is HEIC and the composer uploads the
+/// picked photo's bytes verbatim, so without this EVERY text model with a vision helper
+/// answered "attachment type '.heic' is not supported" to the most ordinary upload there is.
+///
+/// `sips` works on files, so the bytes make a brief round trip through a 0700 scratch dir
+/// that is removed before returning on both the success and the failure path. BLOCKING
+/// (it spawns a process) — the caller runs it in `spawn_blocking`.
+pub fn transcode_heic_to_png(bytes: &[u8]) -> Result<Vec<u8>, String> {
+    let dir = std::env::temp_dir().join(format!("jesse-vision-{}", random_hex()));
+    std::fs::DirBuilder::new()
+        .mode(0o700)
+        .create(&dir)
+        .map_err(|e| format!("could not create a scratch dir: {e}"))?;
+    let out = transcode_heic_in(&dir, bytes);
+    // Best-effort: a leftover temp dir is not worth failing a turn over, and the error
+    // that matters is the transcode's own.
+    let _ = std::fs::remove_dir_all(&dir);
+    out
+}
+
+fn transcode_heic_in(dir: &Path, bytes: &[u8]) -> Result<Vec<u8>, String> {
+    let src = dir.join("in.heic");
+    let dst = dir.join("out.png");
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&src)
+        .map_err(|e| format!("could not stage the photo: {e}"))?;
+    f.write_all(bytes)
+        .map_err(|e| format!("could not stage the photo: {e}"))?;
+    drop(f);
+
+    let out = std::process::Command::new("/usr/bin/sips")
+        .args(["-s", "format", "png"])
+        .arg(&src)
+        .arg("--out")
+        .arg(&dst)
+        .output()
+        .map_err(|e| format!("could not run sips: {e}"))?;
+    if !out.status.success() {
+        return Err(format!(
+            "sips exited {}: {}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    // `sips` can exit 0 having written nothing useful, so the file is the proof — and so
+    // is its magic: a non-PNG here would be rejected by the helper surface instead.
+    let png = std::fs::read(&dst).map_err(|_| "sips wrote no output file".to_string())?;
+    if !png.starts_with(&[0x89, b'P', b'N', b'G']) {
+        return Err("sips produced something that is not a PNG".to_string());
+    }
+    Ok(png)
+}
+
 // ---- The helper HTTP call (Anthropic /v1/messages) ------------------------
 
 /// The Anthropic `image` media type for a raster extension, or `None` for a type the
-/// Anthropic surface does not accept (HEIC — a transcode-to-PNG follow-up).
+/// Anthropic surface does not accept. HEIC is deliberately `None` here: it never reaches
+/// the wire as HEIC, because [`transcribe_input`] transcodes it to PNG first
+/// ([`transcode_heic_to_png`]) and sends `image/png`.
 pub fn anthropic_media_type(ext: &str) -> Option<&'static str> {
     match ext.to_ascii_lowercase().as_str() {
         "png" => Some("image/png"),
@@ -481,25 +528,61 @@ pub async fn transcribe_input(
 
     match input.kind() {
         AttachmentKind::Image => {
-            let Some(media_type) = anthropic_media_type(&input.ext) else {
-                return vec![PageResult::err(
-                    partner,
-                    None,
-                    None,
-                    false,
-                    format!(
-                        "attachment type '.{}' is not yet supported by the vision surface \
-                         (convert HEIC to PNG/JPEG); follow-up: a transcode step",
-                        input.ext
-                    ),
-                    0,
-                )];
-            };
+            // HEIC is the iPhone camera roll's own format and the Anthropic image surface
+            // does not take it, so it is transcoded to PNG here rather than refused. Every
+            // other whitelisted raster type goes to the helper as its own bytes, untouched.
+            let (payload, media_type): (std::borrow::Cow<'_, [u8]>, &str) =
+                if input.ext.eq_ignore_ascii_case("heic") {
+                    let bytes = input.bytes.clone();
+                    match tokio::task::spawn_blocking(move || transcode_heic_to_png(&bytes)).await {
+                        Ok(Ok(png)) => (std::borrow::Cow::Owned(png), "image/png"),
+                        Ok(Err(e)) => {
+                            return vec![PageResult::err(
+                                partner,
+                                None,
+                                None,
+                                false,
+                                format!(
+                                    "could not convert the HEIC photo to PNG ({e}); the vision \
+                                     surface does not take HEIC. `sips` ships with macOS — check \
+                                     it is on the bridge's PATH."
+                                ),
+                                0,
+                            )];
+                        }
+                        Err(_) => {
+                            return vec![PageResult::err(
+                                partner,
+                                None,
+                                None,
+                                false,
+                                "HEIC transcode task failed".to_string(),
+                                0,
+                            )];
+                        }
+                    }
+                } else {
+                    let Some(media_type) = anthropic_media_type(&input.ext) else {
+                        return vec![PageResult::err(
+                            partner,
+                            None,
+                            None,
+                            false,
+                            format!(
+                                "attachment type '.{}' is not supported by the vision surface; \
+                                 convert it to a PNG or JPEG and attach that",
+                                input.ext
+                            ),
+                            0,
+                        )];
+                    };
+                    (std::borrow::Cow::Borrowed(&input.bytes), media_type)
+                };
             let started = Instant::now();
             let r = call_helper(
                 client,
                 partner,
-                &input.bytes,
+                &payload,
                 media_type,
                 instruction,
                 max_tokens,
@@ -1180,36 +1263,211 @@ mod tests {
         assert_eq!(r.output_tokens, 3);
     }
 
-    #[test]
-    fn rasterize_smoke_when_pdfium_present() {
-        // GATED: runs only when JESSE_PDFIUM_LIB names a real libpdfium — CI has none, so
-        // this is a no-op there (keeping the build green without the native dep) and a real
-        // end-to-end PDF→PNG check locally / on a deploy box that has pdfium installed.
-        if std::env::var("JESSE_PDFIUM_LIB")
-            .ok()
-            .filter(|s| !s.trim().is_empty())
-            .is_none()
-        {
-            eprintln!(
-                "skipping rasterize smoke: set JESSE_PDFIUM_LIB to libpdfium's path to run it"
-            );
-            return;
-        }
-        let path = concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../eval/vision/fixtures/statement.pdf"
+    // ---- Rasterization ----------------------------------------------------
+    //
+    // These run UNGATED on macOS: the renderer is the OS's own, so there is nothing to
+    // install and no environment variable to set — which is the whole point of the swap
+    // away from pdfium, whose tests were gated behind JESSE_PDFIUM_LIB and therefore never
+    // ran anywhere. They are cfg'd to macOS because the rasterizer is macOS-only by design
+    // (it returns Err elsewhere, the same shape the pdfium-absent path returned), and the
+    // bridge's CI job is Linux.
+
+    #[cfg(target_os = "macos")]
+    fn fixture(name: &str) -> Vec<u8> {
+        let path =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(format!("../eval/vision/{name}"));
+        std::fs::read(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()))
+    }
+
+    /// PNG dimensions straight from the IHDR chunk: bytes 16..24 of every PNG, big-endian
+    /// width then height. Read here rather than through a decoder so the assertion is about
+    /// what was ENCODED, independent of any decode path.
+    #[cfg(target_os = "macos")]
+    fn png_size(png: &[u8]) -> (u32, u32) {
+        assert!(
+            png.starts_with(&[0x89, b'P', b'N', b'G']),
+            "not a PNG at all"
         );
-        let bytes = std::fs::read(path).expect("read the committed PDF fixture");
-        let r = rasterize_pdf(&bytes, 150, 10).expect("rasterize the fixture");
+        let w = u32::from_be_bytes(png[16..20].try_into().unwrap());
+        let h = u32::from_be_bytes(png[20..24].try_into().unwrap());
+        (w, h)
+    }
+
+    /// THE REGRESSION THIS SWAP EXISTS FOR: EVERY page renders, not just page one.
+    ///
+    /// `sips` — the obvious macOS shell-out — converts only the first page of a PDF and has
+    /// no page-selection flag, so a rasterizer built on it returns one image for a
+    /// four-page statement and looks fine. Asserting the page count, each page's OWN pixel
+    /// size (which differs per page in the fixture) and that the images are not byte-equal
+    /// makes that failure impossible to pass.
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn rasterize_renders_every_page_at_its_own_size() {
+        let bytes = fixture("fixtures/multipage.pdf");
+        let r = rasterize_pdf(&bytes, 150, 10).expect("rasterize the multi-page fixture");
+        assert_eq!(r.total_pages, 4, "multipage.pdf is four pages");
+        assert_eq!(
+            r.pages.len(),
+            4,
+            "every page is rendered, not just the first"
+        );
+        assert!(
+            !r.truncated,
+            "four pages under a cap of ten is not truncated"
+        );
+
+        // 150 DPI = 150/72 px per point. Page 4 carries /Rotate 90, so its 612x792-point
+        // page is DISPLAYED (and must render) landscape.
+        let expected = [(1275, 1650), (1240, 1754), (1650, 1275), (1650, 1275)];
+        for (i, (png, want)) in r.pages.iter().zip(expected).enumerate() {
+            assert_eq!(
+                png_size(png),
+                want,
+                "page {} rendered at the wrong size",
+                i + 1
+            );
+            assert!(png.len() > 1_000, "page {} is a non-trivial PNG", i + 1);
+        }
+        for i in 1..r.pages.len() {
+            assert_ne!(
+                r.pages[0],
+                r.pages[i],
+                "page {} is byte-identical to page 1 — the renderer is repeating one page",
+                i + 1
+            );
+        }
+    }
+
+    /// The cap truncates and SAYS SO, and `total_pages` still reports the document's real
+    /// length so the per-page view can label "k of n" honestly.
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn rasterize_honours_the_page_cap_and_reports_truncation() {
+        let bytes = fixture("fixtures/multipage.pdf");
+        let r = rasterize_pdf(&bytes, 150, 2).expect("rasterize with a cap of two");
+        assert_eq!(r.pages.len(), 2);
+        assert_eq!(r.total_pages, 4, "the true length, not the capped one");
+        assert!(r.truncated);
+        assert_eq!(png_size(&r.pages[0]), (1275, 1650));
+        assert_eq!(png_size(&r.pages[1]), (1240, 1754));
+    }
+
+    /// The one-page fixture still behaves, and DPI actually reaches the output.
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn rasterize_a_one_page_pdf_at_two_dpis() {
+        let bytes = fixture("fixtures/statement.pdf");
+        let r = rasterize_pdf(&bytes, 150, 10).expect("rasterize the one-page fixture");
         assert_eq!(r.total_pages, 1, "statement.pdf is one page");
         assert_eq!(r.pages.len(), 1);
         assert!(!r.truncated);
-        assert!(
-            r.pages[0].starts_with(&[0x89, b'P', b'N', b'G']),
-            "each page rasterizes to a PNG"
+        assert_eq!(png_size(&r.pages[0]), (1275, 1650));
+
+        let low = rasterize_pdf(&bytes, 72, 10).expect("rasterize at 72 DPI");
+        assert_eq!(
+            png_size(&low.pages[0]),
+            (612, 792),
+            "72 DPI renders one pixel per point"
         );
-        // A real letter page at 150 DPI is a non-trivial PNG.
-        assert!(r.pages[0].len() > 1000, "rendered PNG is non-empty");
+    }
+
+    /// A PDF that will not open is an Err carrying a reason, never a panic and never an
+    /// empty success that would let the attachment vanish.
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn rasterize_refuses_a_broken_pdf() {
+        // `Rasterized` holds the page pixels and has no `Debug`, so the failure is read out
+        // by hand rather than through `expect_err`.
+        match rasterize_pdf(b"%PDF-1.7\n%\xE2\xE3\xCF\xD3\n1 0 obj\n", 150, 10) {
+            Ok(r) => panic!("a truncated PDF rendered {} page(s)", r.pages.len()),
+            Err(e) => assert!(!e.is_empty(), "a failure carries a reason"),
+        }
+    }
+
+    /// A REAL HEIC round-trips to PNG at its original size.
+    ///
+    /// The fixture is built here rather than committed: `sips` writes HEIC as readily as it
+    /// reads it, so the test makes a genuine HEIF-encoded file on the spot (`file(1)`
+    /// reports "ISO Media, HEIF Image HEVC") and no binary blob has to live in the repo.
+    /// The dimension check is what proves it decoded the photo rather than emitting a
+    /// placeholder that merely starts with the PNG magic.
+    /// The two transcode tests below both observe the shared temp dir, so they take turns:
+    /// the leak test counts `jesse-vision-*` staging dirs, and a concurrent transcode would
+    /// make that count race. Poisoning is ignored — a panic in one test should fail that
+    /// test, not cascade into the other.
+    #[cfg(target_os = "macos")]
+    static HEIC_TEMP_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn heic_transcodes_to_png() {
+        let _serial = HEIC_TEMP_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!("jesse-heic-test-{}", random_hex()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = dir.join("src.png");
+        let heic = dir.join("photo.heic");
+        image::RgbImage::from_fn(64, 48, |x, y| {
+            image::Rgb([(x * 4) as u8, (y * 5) as u8, 200])
+        })
+        .save(&src)
+        .unwrap();
+        let ok = std::process::Command::new("/usr/bin/sips")
+            .args(["-s", "format", "heic"])
+            .arg(&src)
+            .arg("--out")
+            .arg(&heic)
+            .output()
+            .expect("run sips");
+        assert!(ok.status.success(), "sips could not write a HEIC fixture");
+        let bytes = std::fs::read(&heic).unwrap();
+        assert!(
+            bytes.len() > 12 && &bytes[4..8] == b"ftyp",
+            "the fixture really is an ISO-BMFF/HEIF file"
+        );
+
+        let png = transcode_heic_to_png(&bytes).expect("transcode the HEIC");
+        assert_eq!(png_size(&png), (64, 48), "the photo, at its own size");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Bytes that are not a photo fail with a reason instead of reaching the helper as a
+    /// broken `image/png` block.
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn heic_transcode_refuses_non_image_bytes() {
+        let e = transcode_heic_to_png(b"\x00\x00\x00\x18ftypheic\x00\x00\x00\x00")
+            .expect_err("a stub HEIC header is not a decodable photo");
+        assert!(!e.is_empty());
+    }
+
+    /// The scratch dir the transcode stages through is removed on the failure path too —
+    /// a per-turn temp dir that survives every failed upload is a slow disk leak.
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn heic_transcode_leaves_no_temp_dir_behind() {
+        let _serial = HEIC_TEMP_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let before = temp_scratch_dirs();
+        let _ = transcode_heic_to_png(b"not a photo");
+        let leaked: Vec<_> = temp_scratch_dirs().difference(&before).cloned().collect();
+        assert!(
+            leaked.is_empty(),
+            "a staging dir outlived the failure: {leaked:?}"
+        );
+    }
+
+    /// The `jesse-vision-*` staging dirs currently in the temp dir, BY NAME. A set rather
+    /// than a count: the assertion that matters is "nothing new survived", and only that
+    /// direction is immune to whatever else on this machine is using the same temp dir.
+    #[cfg(target_os = "macos")]
+    fn temp_scratch_dirs() -> std::collections::HashSet<String> {
+        std::fs::read_dir(std::env::temp_dir())
+            .map(|d| {
+                d.filter_map(|e| e.ok())
+                    .map(|e| e.file_name().to_string_lossy().into_owned())
+                    .filter(|n| n.starts_with("jesse-vision-"))
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 
     #[test]
