@@ -13,6 +13,7 @@
 		B0D06D00000000000000D202 /* JesseTurnLiveActivity.swift in Sources */ = {isa = PBXBuildFile; fileRef = B0D06D00000000000000D102 /* JesseTurnLiveActivity.swift */; };
 		B0D06D00000000000000D203 /* JesseTurnActivityAttributes.swift in Sources */ = {isa = PBXBuildFile; fileRef = B0D06D00000000000000D103 /* JesseTurnActivityAttributes.swift */; };
 		B0D06D00000000000000D204 /* JesseTurnActivityAttributes.swift in Sources */ = {isa = PBXBuildFile; fileRef = B0D06D00000000000000D103 /* JesseTurnActivityAttributes.swift */; };
+		B0D072000000000000007231 /* JesseWatchWidgetsExtension.appex in Embed Foundation Extensions */ = {isa = PBXBuildFile; fileRef = B0D072000000000000007215 /* JesseWatchWidgetsExtension.appex */; settings = {ATTRIBUTES = (RemoveHeadersOnCopy, ); }; };
 		B0D0F1000000000000F10012 /* JesseCore in Frameworks */ = {isa = PBXBuildFile; productRef = B0D0F1000000000000F10011 /* JesseCore */; };
 		B0D0F1000000000000F10022 /* JesseCore in Frameworks */ = {isa = PBXBuildFile; productRef = B0D0F1000000000000F10021 /* JesseCore */; };
 		B0D0F1000000000000F10032 /* JesseCore in Frameworks */ = {isa = PBXBuildFile; productRef = B0D0F1000000000000F10031 /* JesseCore */; };
@@ -74,6 +75,13 @@
 			remoteGlobalIDString = B0D06E00000000000000E014;
 			remoteInfo = "Jesse Mac";
 		};
+		B0D072000000000000007241 /* PBXContainerItemProxy */ = {
+			isa = PBXContainerItemProxy;
+			containerPortal = B0D0680D2FE83E3F00C8C4B0 /* Project object */;
+			proxyType = 1;
+			remoteGlobalIDString = B0D072000000000000007214;
+			remoteInfo = JesseWatchWidgetsExtension;
+		};
 		B0D07100000000000000710B /* PBXContainerItemProxy */ = {
 			isa = PBXContainerItemProxy;
 			containerPortal = B0D0680D2FE83E3F00C8C4B0 /* Project object */;
@@ -106,6 +114,17 @@
 			name = "Embed Foundation Extensions";
 			runOnlyForDeploymentPostprocessing = 0;
 		};
+		B0D072000000000000007230 /* Embed Foundation Extensions */ = {
+			isa = PBXCopyFilesBuildPhase;
+			buildActionMask = 2147483647;
+			dstPath = "";
+			dstSubfolderSpec = 13;
+			files = (
+				B0D072000000000000007231 /* JesseWatchWidgetsExtension.appex in Embed Foundation Extensions */,
+			);
+			name = "Embed Foundation Extensions";
+			runOnlyForDeploymentPostprocessing = 0;
+		};
 /* End PBXCopyFilesBuildPhase section */
 
 /* Begin PBXFileReference section */
@@ -121,6 +140,7 @@
 		B0D06E00000000000000E015 /* Jesse Mac.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = "Jesse Mac.app"; sourceTree = BUILT_PRODUCTS_DIR; };
 		B0D070000000000000007015 /* Jesse MacTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = "Jesse MacTests.xctest"; sourceTree = BUILT_PRODUCTS_DIR; };
 		B0D071000000000000007115 /* JesseUITests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = JesseUITests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
+		B0D072000000000000007215 /* JesseWatchWidgetsExtension.appex */ = {isa = PBXFileReference; explicitFileType = "wrapper.app-extension"; includeInIndex = 0; path = JesseWatchWidgetsExtension.appex; sourceTree = BUILT_PRODUCTS_DIR; };
 /* End PBXFileReference section */
 
 /* Begin PBXFileSystemSynchronizedBuildFileExceptionSet section */
@@ -144,6 +164,24 @@
 				Info.plist,
 			);
 			target = B0D06E00000000000000E014 /* Jesse Mac */;
+		};
+		B0D07200000000000000722A /* Exceptions for "JesseWatchWidgets" folder in "JesseWatchWidgetsExtension" target */ = {
+			isa = PBXFileSystemSynchronizedBuildFileExceptionSet;
+			membershipExceptions = (
+				Info.plist,
+			);
+			target = B0D072000000000000007214 /* JesseWatchWidgetsExtension */;
+		};
+		B0D07200000000000000722B /* Exceptions for "JesseShared" folder in "JesseWatchWidgetsExtension" target */ = {
+			isa = PBXFileSystemSynchronizedBuildFileExceptionSet;
+			membershipExceptions = (
+				ReplyDeduper.swift,
+				SilenceDetector.swift,
+				WatchMessage.swift,
+				WatchTalkModel.swift,
+				WatchTodayModel.swift,
+			);
+			target = B0D072000000000000007214 /* JesseWatchWidgetsExtension */;
 		};
 /* End PBXFileSystemSynchronizedBuildFileExceptionSet section */
 
@@ -176,7 +214,18 @@
 		};
 		B0D06C00000000000000C009 /* JesseShared */ = {
 			isa = PBXFileSystemSynchronizedRootGroup;
+			exceptions = (
+				B0D07200000000000000722B /* Exceptions for "JesseShared" folder in "JesseWatchWidgetsExtension" target */,
+			);
 			path = JesseShared;
+			sourceTree = "<group>";
+		};
+		B0D072000000000000007217 /* JesseWatchWidgets */ = {
+			isa = PBXFileSystemSynchronizedRootGroup;
+			exceptions = (
+				B0D07200000000000000722A /* Exceptions for "JesseWatchWidgets" folder in "JesseWatchWidgetsExtension" target */,
+			);
+			path = JesseWatchWidgets;
 			sourceTree = "<group>";
 		};
 		B0D06E00000000000000E017 /* JesseMac */ = {
@@ -279,6 +328,13 @@
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
+		B0D072000000000000007212 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
 /* End PBXFrameworksBuildPhase section */
 
 /* Begin PBXGroup section */
@@ -293,6 +349,7 @@
 				B0D069000000000000000009 /* JesseTests */,
 				B0D071000000000000007117 /* JesseUITests */,
 				B0D06A00000000000000A017 /* JesseWatch */,
+				B0D072000000000000007217 /* JesseWatchWidgets */,
 				B0D06B00000000000000B017 /* JesseWatchTests */,
 				B0D068162FE83E3F00C8C4B0 /* Products */,
 			);
@@ -306,6 +363,7 @@
 				B0D071000000000000007115 /* JesseUITests.xctest */,
 				B0D06A00000000000000A015 /* Jesse Watch App.app */,
 				B0D06B00000000000000B015 /* Jesse Watch AppTests.xctest */,
+				B0D072000000000000007215 /* JesseWatchWidgetsExtension.appex */,
 				B0D06D00000000000000D015 /* JesseWidgetsExtension.appex */,
 				B0D06E00000000000000E015 /* Jesse Mac.app */,
 				B0D070000000000000007015 /* Jesse MacTests.xctest */,
@@ -395,10 +453,12 @@
 				B0D06A00000000000000A011 /* Sources */,
 				B0D06A00000000000000A012 /* Frameworks */,
 				B0D06A00000000000000A013 /* Resources */,
+				B0D072000000000000007230 /* Embed Foundation Extensions */,
 			);
 			buildRules = (
 			);
 			dependencies = (
+				B0D072000000000000007240 /* PBXTargetDependency */,
 			);
 			fileSystemSynchronizedGroups = (
 				B0D06A00000000000000A017 /* JesseWatch */,
@@ -531,6 +591,29 @@
 			productReference = B0D071000000000000007115 /* JesseUITests.xctest */;
 			productType = "com.apple.product-type.bundle.ui-testing";
 		};
+		B0D072000000000000007214 /* JesseWatchWidgetsExtension */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = B0D072000000000000007220 /* Build configuration list for PBXNativeTarget "JesseWatchWidgetsExtension" */;
+			buildPhases = (
+				B0D072000000000000007211 /* Sources */,
+				B0D072000000000000007212 /* Frameworks */,
+				B0D072000000000000007213 /* Resources */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+			);
+			fileSystemSynchronizedGroups = (
+				B0D072000000000000007217 /* JesseWatchWidgets */,
+				B0D06C00000000000000C009 /* JesseShared */,
+			);
+			name = JesseWatchWidgetsExtension;
+			packageProductDependencies = (
+			);
+			productName = JesseWatchWidgetsExtension;
+			productReference = B0D072000000000000007215 /* JesseWatchWidgetsExtension.appex */;
+			productType = "com.apple.product-type.app-extension";
+		};
 /* End PBXNativeTarget section */
 
 /* Begin PBXProject section */
@@ -557,6 +640,9 @@
 						TestTargetID = B0D06A00000000000000A014;
 					};
 					B0D06D00000000000000D014 = {
+						CreatedOnToolsVersion = 26.5;
+					};
+					B0D072000000000000007214 = {
 						CreatedOnToolsVersion = 26.5;
 					};
 					B0D06E00000000000000E014 = {
@@ -590,6 +676,7 @@
 				B0D071000000000000007101 /* JesseUITests */,
 				B0D06A00000000000000A014 /* Jesse Watch App */,
 				B0D06B00000000000000B014 /* Jesse Watch AppTests */,
+				B0D072000000000000007214 /* JesseWatchWidgetsExtension */,
 				B0D06D00000000000000D014 /* JesseWidgetsExtension */,
 				B0D06E00000000000000E014 /* Jesse Mac */,
 				B0D070000000000000007014 /* Jesse MacTests */,
@@ -648,6 +735,13 @@
 			runOnlyForDeploymentPostprocessing = 0;
 		};
 		B0D071000000000000007105 /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		B0D072000000000000007213 /* Resources */ = {
 			isa = PBXResourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
@@ -717,6 +811,13 @@
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
+		B0D072000000000000007211 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
 /* End PBXSourcesBuildPhase section */
 
 /* Begin PBXTargetDependency section */
@@ -749,6 +850,11 @@
 			isa = PBXTargetDependency;
 			target = B0D068142FE83E3F00C8C4B0 /* Jesse */;
 			targetProxy = B0D07100000000000000710B /* PBXContainerItemProxy */;
+		};
+		B0D072000000000000007240 /* PBXTargetDependency */ = {
+			isa = PBXTargetDependency;
+			target = B0D072000000000000007214 /* JesseWatchWidgetsExtension */;
+			targetProxy = B0D072000000000000007241 /* PBXContainerItemProxy */;
 		};
 /* End PBXTargetDependency section */
 
@@ -884,7 +990,7 @@
 				CLANG_ENABLE_MODULES = YES;
 				CODE_SIGN_ENTITLEMENTS = Jesse/Jesse.entitlements;
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 101;
+				CURRENT_PROJECT_VERSION = 102;
 				DEVELOPMENT_TEAM = C6RPS3BGXX;
 				ENABLE_PREVIEWS = YES;
 				GENERATE_INFOPLIST_FILE = YES;
@@ -920,7 +1026,7 @@
 				CLANG_ENABLE_MODULES = YES;
 				CODE_SIGN_ENTITLEMENTS = Jesse/Jesse.entitlements;
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 101;
+				CURRENT_PROJECT_VERSION = 102;
 				DEVELOPMENT_TEAM = C6RPS3BGXX;
 				ENABLE_PREVIEWS = YES;
 				GENERATE_INFOPLIST_FILE = YES;
@@ -952,7 +1058,7 @@
 			buildSettings = {
 				BUNDLE_LOADER = "$(TEST_HOST)";
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 101;
+				CURRENT_PROJECT_VERSION = 102;
 				DEVELOPMENT_TEAM = C6RPS3BGXX;
 				GENERATE_INFOPLIST_FILE = YES;
 				IPHONEOS_DEPLOYMENT_TARGET = 26.5;
@@ -971,7 +1077,7 @@
 			buildSettings = {
 				BUNDLE_LOADER = "$(TEST_HOST)";
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 101;
+				CURRENT_PROJECT_VERSION = 102;
 				DEVELOPMENT_TEAM = C6RPS3BGXX;
 				GENERATE_INFOPLIST_FILE = YES;
 				IPHONEOS_DEPLOYMENT_TARGET = 26.5;
@@ -991,8 +1097,9 @@
 				ASSETCATALOG_COMPILER_GENERATE_SWIFT_ASSET_SYMBOL_EXTENSIONS = YES;
 				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
 				CLANG_ENABLE_MODULES = YES;
+				CODE_SIGN_ENTITLEMENTS = JesseWatch/JesseWatch.entitlements;
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 101;
+				CURRENT_PROJECT_VERSION = 102;
 				DEVELOPMENT_TEAM = C6RPS3BGXX;
 				ENABLE_PREVIEWS = YES;
 				GENERATE_INFOPLIST_FILE = YES;
@@ -1025,8 +1132,9 @@
 				ASSETCATALOG_COMPILER_GENERATE_SWIFT_ASSET_SYMBOL_EXTENSIONS = YES;
 				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
 				CLANG_ENABLE_MODULES = YES;
+				CODE_SIGN_ENTITLEMENTS = JesseWatch/JesseWatch.entitlements;
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 101;
+				CURRENT_PROJECT_VERSION = 102;
 				DEVELOPMENT_TEAM = C6RPS3BGXX;
 				ENABLE_PREVIEWS = YES;
 				GENERATE_INFOPLIST_FILE = YES;
@@ -1059,7 +1167,7 @@
 			buildSettings = {
 				BUNDLE_LOADER = "$(TEST_HOST)";
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 101;
+				CURRENT_PROJECT_VERSION = 102;
 				DEVELOPMENT_TEAM = C6RPS3BGXX;
 				GENERATE_INFOPLIST_FILE = YES;
 				MARKETING_VERSION = 1.0;
@@ -1079,7 +1187,7 @@
 			buildSettings = {
 				BUNDLE_LOADER = "$(TEST_HOST)";
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 101;
+				CURRENT_PROJECT_VERSION = 102;
 				DEVELOPMENT_TEAM = C6RPS3BGXX;
 				GENERATE_INFOPLIST_FILE = YES;
 				MARKETING_VERSION = 1.0;
@@ -1101,7 +1209,7 @@
 				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
 				CLANG_ENABLE_MODULES = YES;
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 101;
+				CURRENT_PROJECT_VERSION = 102;
 				DEVELOPMENT_TEAM = C6RPS3BGXX;
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_FILE = JesseWidgets/Info.plist;
@@ -1133,7 +1241,7 @@
 				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
 				CLANG_ENABLE_MODULES = YES;
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 101;
+				CURRENT_PROJECT_VERSION = 102;
 				DEVELOPMENT_TEAM = C6RPS3BGXX;
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_FILE = JesseWidgets/Info.plist;
@@ -1168,7 +1276,7 @@
 				CLANG_ENABLE_MODULES = YES;
 				CODE_SIGN_STYLE = Automatic;
 				COMBINE_HIDPI_IMAGES = YES;
-				CURRENT_PROJECT_VERSION = 101;
+				CURRENT_PROJECT_VERSION = 102;
 				DEVELOPMENT_TEAM = C6RPS3BGXX;
 				ENABLE_PREVIEWS = YES;
 				GENERATE_INFOPLIST_FILE = YES;
@@ -1202,7 +1310,7 @@
 				CLANG_ENABLE_MODULES = YES;
 				CODE_SIGN_STYLE = Automatic;
 				COMBINE_HIDPI_IMAGES = YES;
-				CURRENT_PROJECT_VERSION = 101;
+				CURRENT_PROJECT_VERSION = 102;
 				DEVELOPMENT_TEAM = C6RPS3BGXX;
 				ENABLE_PREVIEWS = YES;
 				GENERATE_INFOPLIST_FILE = YES;
@@ -1232,7 +1340,7 @@
 			buildSettings = {
 				BUNDLE_LOADER = "$(TEST_HOST)";
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 101;
+				CURRENT_PROJECT_VERSION = 102;
 				DEVELOPMENT_TEAM = C6RPS3BGXX;
 				GENERATE_INFOPLIST_FILE = YES;
 				MACOSX_DEPLOYMENT_TARGET = 26.0;
@@ -1251,7 +1359,7 @@
 			buildSettings = {
 				BUNDLE_LOADER = "$(TEST_HOST)";
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 101;
+				CURRENT_PROJECT_VERSION = 102;
 				DEVELOPMENT_TEAM = C6RPS3BGXX;
 				GENERATE_INFOPLIST_FILE = YES;
 				MACOSX_DEPLOYMENT_TARGET = 26.0;
@@ -1269,7 +1377,7 @@
 			isa = XCBuildConfiguration;
 			buildSettings = {
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 101;
+				CURRENT_PROJECT_VERSION = 102;
 				DEVELOPMENT_TEAM = C6RPS3BGXX;
 				GENERATE_INFOPLIST_FILE = YES;
 				IPHONEOS_DEPLOYMENT_TARGET = 26.5;
@@ -1287,7 +1395,7 @@
 			isa = XCBuildConfiguration;
 			buildSettings = {
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 101;
+				CURRENT_PROJECT_VERSION = 102;
 				DEVELOPMENT_TEAM = C6RPS3BGXX;
 				GENERATE_INFOPLIST_FILE = YES;
 				IPHONEOS_DEPLOYMENT_TARGET = 26.5;
@@ -1298,6 +1406,73 @@
 				SWIFT_VERSION = 6.0;
 				TARGETED_DEVICE_FAMILY = "1,2";
 				TEST_TARGET_NAME = Jesse;
+			};
+			name = Release;
+		};
+		B0D072000000000000007221 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
+				CLANG_ENABLE_MODULES = YES;
+				CODE_SIGN_ENTITLEMENTS = JesseWatchWidgets/JesseWatchWidgets.entitlements;
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 102;
+				DEVELOPMENT_TEAM = C6RPS3BGXX;
+				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_FILE = JesseWatchWidgets/Info.plist;
+				INFOPLIST_KEY_CFBundleDisplayName = Today;
+				INFOPLIST_KEY_NSHumanReadableCopyright = "";
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+					"@executable_path/../../Frameworks",
+				);
+				MARKETING_VERSION = 1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = com.tag1.Jesse.watchkitapp.JesseWatchWidgets;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SDKROOT = watchos;
+				SKIP_INSTALL = YES;
+				SWIFT_APPROACHABLE_CONCURRENCY = YES;
+				SWIFT_DEFAULT_ACTOR_ISOLATION = MainActor;
+				SWIFT_EMIT_LOC_STRINGS = YES;
+				SWIFT_OPTIMIZATION_LEVEL = "-Onone";
+				SWIFT_VERSION = 6.0;
+				TARGETED_DEVICE_FAMILY = 4;
+				WATCHOS_DEPLOYMENT_TARGET = 11.0;
+			};
+			name = Debug;
+		};
+		B0D072000000000000007222 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
+				CLANG_ENABLE_MODULES = YES;
+				CODE_SIGN_ENTITLEMENTS = JesseWatchWidgets/JesseWatchWidgets.entitlements;
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 102;
+				DEVELOPMENT_TEAM = C6RPS3BGXX;
+				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_FILE = JesseWatchWidgets/Info.plist;
+				INFOPLIST_KEY_CFBundleDisplayName = Today;
+				INFOPLIST_KEY_NSHumanReadableCopyright = "";
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+					"@executable_path/../../Frameworks",
+				);
+				MARKETING_VERSION = 1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = com.tag1.Jesse.watchkitapp.JesseWatchWidgets;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SDKROOT = watchos;
+				SKIP_INSTALL = YES;
+				SWIFT_APPROACHABLE_CONCURRENCY = YES;
+				SWIFT_COMPILATION_MODE = wholemodule;
+				SWIFT_DEFAULT_ACTOR_ISOLATION = MainActor;
+				SWIFT_EMIT_LOC_STRINGS = YES;
+				SWIFT_VERSION = 6.0;
+				TARGETED_DEVICE_FAMILY = 4;
+				VALIDATE_PRODUCT = YES;
+				WATCHOS_DEPLOYMENT_TARGET = 11.0;
 			};
 			name = Release;
 		};
@@ -1381,6 +1556,15 @@
 			buildConfigurations = (
 				B0D071000000000000007107 /* Debug */,
 				B0D071000000000000007108 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+		B0D072000000000000007220 /* Build configuration list for PBXNativeTarget "JesseWatchWidgetsExtension" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				B0D072000000000000007221 /* Debug */,
+				B0D072000000000000007222 /* Release */,
 			);
 			defaultConfigurationIsVisible = 0;
 			defaultConfigurationName = Release;

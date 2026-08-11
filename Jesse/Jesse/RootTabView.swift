@@ -70,6 +70,14 @@ struct RootTabView: View {
     @State private var todayModel = TodayDashboardModel(
         makeClient: { JesseBridgeClient(config: ConfigStore.load()) })
 
+    /// The wrist's half of the day, built the first time this view appears.
+    ///
+    /// It lives HERE for the same reason `todayModel` does: there must be exactly one
+    /// day model, and the watch has to write through it rather than around it. Built
+    /// in `.task` rather than as an initialized `@State` because it needs
+    /// `todayModel`, and one `@State` cannot be initialized from another.
+    @State private var watchLink: TodayWatchLink?
+
     /// Non-nil only when the on-disk conversation store couldn't be opened and the
     /// app is running on the in-memory fallback (see `AppModelStore`). When set, a
     /// persistent banner tells the user their saved history couldn't be opened and
@@ -90,6 +98,31 @@ struct RootTabView: View {
                 StoreErrorBanner()
             }
         }
+        .task { connectTheWatch() }
+        // EVERY successful fetch and every mutation lands a new server snapshot, and
+        // each one is pushed. Not gated on the Today tab being selected: the wrist's
+        // list has to be right whichever tab the phone happens to be showing, and a
+        // context push is a dictionary written to a mailbox, not a network call.
+        .onChange(of: todayModel.serverSnapshot) { _, _ in watchLink?.pushCurrent() }
+    }
+
+    /// Build the wrist link once and point the WatchConnectivity delegate at it.
+    ///
+    /// The delegate is an app-lifetime singleton created at launch, long before this
+    /// view exists, so the wiring is done from here — the one place that holds the
+    /// day model the wrist must write through.
+    private func connectTheWatch() {
+        guard watchLink == nil else { return }
+        let link = TodayWatchLink(model: todayModel,
+                                  push: { PhoneWatchConnectivity.shared.pushToday($0) })
+        watchLink = link
+        PhoneWatchConnectivity.shared.onTodayCheck = { check in
+            Task { await link.apply(check) }
+        }
+        // A watch that has been waiting since before this launch gets the day as soon
+        // as there is one; if nothing is loaded yet this is a no-op and the `onChange`
+        // above covers the first fetch.
+        link.pushCurrent()
     }
 
     @ViewBuilder

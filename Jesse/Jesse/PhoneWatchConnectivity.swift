@@ -78,6 +78,55 @@ final class PhoneWatchConnectivity: NSObject {
     private let context: ModelContext
     private var session: WCSession?
 
+    /// Applies a check the user made on their wrist. Set by the app shell once the
+    /// Today model exists (`RootTabView`), because that model is the one the Today
+    /// tab drives and a wrist check must go through it rather than around it.
+    ///
+    /// A closure rather than a stored model reference: this delegate is an
+    /// app-lifetime singleton constructed at launch, and the day model is owned by a
+    /// view that appears later.
+    ///
+    /// Setting it FLUSHES anything that arrived in the meantime — see
+    /// `bufferedChecks`, which exists because that race is the normal case rather
+    /// than the exotic one.
+    var onTodayCheck: ((WatchTodayCheck) -> Void)? {
+        didSet { flushBufferedChecks() }
+    }
+
+    /// Wrist checks received before `onTodayCheck` was wired.
+    ///
+    /// The ordering here is not a rare race, it is the ordinary launch: a queued
+    /// intent is delivered as soon as the session activates (which happens in
+    /// `didFinishLaunchingWithOptions`), and the view that owns the day model does
+    /// not exist for another beat. Dropping them meant the exact case the reliable
+    /// queue is FOR — the user ticked something with their phone in another room —
+    /// was the one that silently did nothing.
+    ///
+    /// Bounded, because a phone that never shows its UI must not accumulate: the
+    /// window only has to cover one launch, and every intent is de-duplicated by id
+    /// downstream anyway.
+    private var bufferedChecks: [WatchTodayCheck] = []
+    private static let maxBufferedChecks = 32
+
+    private func flushBufferedChecks() {
+        guard let handler = onTodayCheck, !bufferedChecks.isEmpty else { return }
+        let queued = bufferedChecks
+        bufferedChecks.removeAll()
+        Log.run.notice("watch today: flushing \(queued.count) buffered wrist check(s)")
+        for check in queued { handler(check) }
+    }
+
+    /// Take one wrist check: apply it now, or hold it until there is something to
+    /// apply it to.
+    func receiveTodayCheck(_ check: WatchTodayCheck) {
+        if let handler = onTodayCheck {
+            handler(check)
+            return
+        }
+        bufferedChecks.append(check)
+        if bufferedChecks.count > Self.maxBufferedChecks { bufferedChecks.removeFirst() }
+    }
+
     /// Production init wires the on-device transcriber and a `WatchRelay` over a
     /// fresh coordinator, persisting into the app's shared SwiftData store so a
     /// relayed turn lands in the same history the UI shows.
@@ -120,6 +169,28 @@ final class PhoneWatchConnectivity: NSObject {
             session.sendMessage(dict, replyHandler: nil) { error in
                 Log.run.error("watch send failed: \(error.localizedDescription)")
             }
+        }
+    }
+
+    /// **Push the day to the wrist.** One-way, latest-wins, and cheap enough to do on
+    /// every snapshot the phone fetches.
+    ///
+    /// `updateApplicationContext` is the right transport and the only one: it keeps
+    /// exactly one payload, overwrites it in place, delivers it in the background, and
+    /// hands it to a watch app that launches hours later. Those are precisely the
+    /// semantics of "here is the day now" — where `sendMessage` needs the watch awake
+    /// and `transferUserInfo` would queue up every intermediate state of a day the
+    /// user only ever wants the latest of.
+    ///
+    /// A throw here means the dictionary was not property-list-safe (a coding bug the
+    /// wire tests cover) or the session was not activated. Neither is worth failing a
+    /// fetch over: the wrist keeps the previous context and the next push tries again.
+    func pushToday(_ summary: WatchTodaySummary) {
+        guard let session, session.activationState == .activated else { return }
+        do {
+            try session.updateApplicationContext(summary.encode())
+        } catch {
+            Log.run.error("watch today push failed: \(error.localizedDescription)")
         }
     }
 
@@ -184,16 +255,33 @@ extension PhoneWatchConnectivity: WCSessionDelegate {
     }
 
     nonisolated func session(_ session: WCSession, didReceiveMessage message: [String: Any]) {
-        guard case .request(let request)? = WatchMessage.decode(message) else { return }
-        Task { @MainActor in self.process(request, ackNow: true) }
+        dispatchIncoming(message, ackQueuedRequest: true)
     }
 
-    // Reliable/queued path: a request that rode `transferUserInfo` (e.g. sent while
-    // the phone was unreachable).
+    // Reliable/queued path.
     nonisolated func session(_ session: WCSession, didReceiveUserInfo userInfo: [String: Any]) {
-        guard case .request(let request)? = WatchMessage.decode(userInfo) else { return }
-        // The queued-redelivery path, which is exactly the one that used to get no ack.
-        Task { @MainActor in self.process(request, ackNow: true) }
+        dispatchIncoming(userInfo, ackQueuedRequest: true)
+    }
+
+    /// **The one watch-to-phone dispatcher.** THREE wires share these two transports —
+    /// a relayed chat turn, and a wrist check, arriving on either `sendMessage` or
+    /// `transferUserInfo` depending on whether the phone was listening when the user
+    /// acted. Dispatching in one place is what stops a payload being understood on
+    /// one transport and silently dropped on the other, which is exactly the bug
+    /// shape this file has had before.
+    ///
+    /// The two decoders reject each other's dictionaries (`WatchTodayWireTests`), so
+    /// the try-in-order below can never hand one to the wrong handler; the Today
+    /// decoder runs first only because it is the cheaper of the two.
+    private nonisolated func dispatchIncoming(_ payload: [String: Any],
+                                              ackQueuedRequest: Bool) {
+        if let check = WatchTodayCheck.decode(payload) {
+            Log.run.notice("watch today: wrist check for \(check.itemId) -> \(check.checked)")
+            Task { @MainActor in self.receiveTodayCheck(check) }
+            return
+        }
+        guard case .request(let request)? = WatchMessage.decode(payload) else { return }
+        Task { @MainActor in self.process(request, ackNow: ackQueuedRequest) }
     }
 
     // Audio delivered out-of-band as a file (clips too big for `sendMessage`).
