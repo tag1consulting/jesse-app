@@ -1,19 +1,31 @@
 #!/usr/bin/env bash
 #
-# pre-push — block a push that changes a component's sources without bumping that
-# component's version and updating CHANGELOG.md. It runs the SAME rule as CI
-# (scripts/version-guard.sh) against the commits being pushed, so an un-bumped
-# change never reaches the remote. Depends only on git and the in-repo script.
+# pre-push — the two checks that must pass before code leaves this machine.
+#
+#   1. VERSION GUARD (scripts/version-guard.sh). Blocks a push that changes a
+#      component's sources without bumping that component's version and updating
+#      CHANGELOG.md. Cheap, so it runs first. CI runs the same rule.
+#
+#   2. macOS CI (scripts/local-ci-macos.sh), only when the push touches Jesse/ or
+#      JesseKit/. This one is here because it is no longer anywhere else: the
+#      hosted macOS job stopped running on pull requests (10x Linux billing on
+#      four uncached builds and three simulators per PR was the whole Actions
+#      bill), and runs nightly against main instead. Without this hook the app
+#      has no pre-merge gate at all — the nightly reports up to a day late.
 #
 # Install with: scripts/install-hooks.sh  (sets core.hooksPath to scripts/hooks).
+#
+# ESCAPE HATCHES:
+#     git push --no-verify          skip BOTH checks. Blunt; you own whatever the
+#                                   nightly finds.
+#     JESSE_SKIP_MAC_CI=1 git push  skip only the slow macOS suite, keep the
+#                                   version guard. Use when you already ran
+#                                   scripts/local-ci-macos.sh by hand.
+#
+# Depends only on git and the in-repo scripts.
 set -euo pipefail
 
 ROOT="$(git rev-parse --show-toplevel)"
-GUARD="$ROOT/scripts/version-guard.sh"
-if [ ! -f "$GUARD" ]; then
-  echo "pre-push: $GUARD not found — skipping version check." >&2
-  exit 0
-fi
 
 ZERO="0000000000000000000000000000000000000000"
 
@@ -36,5 +48,53 @@ if [ -z "$base" ]; then
   base="HEAD~1"
 fi
 
-echo "pre-push: enforcing version bumps (base=$base)…"
-VERSION_GUARD_BASE="$base" bash "$GUARD"
+# --- 1. Version guard ------------------------------------------------------
+
+GUARD="$ROOT/scripts/version-guard.sh"
+if [ ! -f "$GUARD" ]; then
+  echo "pre-push: $GUARD not found — skipping version check." >&2
+else
+  echo "pre-push: enforcing version bumps (base=$base)…"
+  VERSION_GUARD_BASE="$base" bash "$GUARD"
+fi
+
+# --- 2. macOS CI, when the push touches the app ----------------------------
+
+MAC_CI="$ROOT/scripts/local-ci-macos.sh"
+if [ ! -f "$MAC_CI" ]; then
+  echo "pre-push: $MAC_CI not found — skipping the macOS checks." >&2
+  exit 0
+fi
+
+if [ -n "${JESSE_SKIP_MAC_CI:-}" ]; then
+  echo "pre-push: JESSE_SKIP_MAC_CI set — skipping the macOS checks."
+  echo "          The nightly ios-ci.yml run is now your only verification."
+  exit 0
+fi
+
+if [ "$(uname -s)" != "Darwin" ]; then
+  echo "pre-push: not macOS — cannot run the Swift checks here."
+  echo "          The nightly ios-ci.yml run is your only verification for this push."
+  exit 0
+fi
+
+# The SAME iOS-relevant path set the nightly's gate job uses (see
+# .github/workflows/ios-ci.yml). A pure bridge/docs/infra push spends nothing
+# here, exactly as it spends no macOS minute there.
+if git rev-parse --verify --quiet "${base}^{commit}" >/dev/null 2>&1; then
+  ios_changes="$(git diff --name-only "$base" HEAD -- 'Jesse/' 'JesseKit/' || true)"
+  if [ -z "$ios_changes" ]; then
+    echo "pre-push: no changes under Jesse/ or JesseKit/ — skipping the macOS checks."
+    exit 0
+  fi
+  echo "pre-push: $(printf '%s\n' "$ios_changes" | wc -l | tr -d ' ') file(s) changed under Jesse/ or JesseKit/."
+else
+  # No resolvable base means we cannot prove the push is app-free. Run the
+  # checks rather than wave the push through on an unanswerable question.
+  echo "pre-push: no resolvable diff base — running the macOS checks unconditionally."
+fi
+
+echo "pre-push: running the macOS CI suite (scripts/local-ci-macos.sh)."
+echo "          This is the app's pre-merge gate; the hosted macOS job is nightly-only."
+echo "          Skip just this step with: JESSE_SKIP_MAC_CI=1 git push"
+bash "$MAC_CI"

@@ -298,7 +298,10 @@ xcodebuild test -scheme Jesse \
   -destination 'platform=iOS Simulator,name=iPhone 17'
 ```
 
-(Adjust the simulator name to one your Xcode has installed.)
+(Adjust the simulator name to one your Xcode has installed.) To run everything CI
+runs — JesseKit, iOS, watch and Mac, with the same flags and a resolved simulator
+rather than a hardcoded name — use `scripts/local-ci-macos.sh` instead; see
+[Development](#development).
 
 Set `JESSE_MUTE=1` under the scheme's **Run > Environment Variables** to silence
 spoken (text-to-speech) replies during development — no audio and no ducking of
@@ -405,7 +408,48 @@ These are the things most likely to bite during setup, roughly in order:
 ## Development
 
 - **Bridge:** `cd bridge && cargo build --release` (and `cargo test`, `cargo clippy
-  -- -D warnings`). A clean release build is the gate.
-- **App:** `xcodebuild build` / `xcodebuild test` with the `Jesse` scheme. Keep the
-  test suite green and the build warning-free.
+  -- -D warnings`, `cargo fmt --all --check`). A clean release build is the gate.
+- **App:** run `scripts/local-ci-macos.sh` — see below.
 - See `CHANGELOG.md` for the per-version record of what changed in each component.
+
+### Where the checks run
+
+The two halves of CI are gated in different places, on purpose.
+
+| | Bridge (Rust) | App (Swift: JesseKit, iOS, watch, Mac) |
+|---|---|---|
+| Pre-merge gate | `ci.yml` on every PR (Linux) | `scripts/local-ci-macos.sh`, on **your Mac** |
+| Enforced by | GitHub required check | the **pre-push hook** |
+| Scheduled run | `audit.yml`, Mondays (CVEs) | `ios-ci.yml`, nightly against `main` |
+
+GitHub's hosted macOS runners bill at **10x** the Linux rate, and the Swift job
+is the expensive shape: four uncached `xcodebuild` builds and three booted
+simulators. Running it per-PR was essentially this repo's entire Actions spend,
+for a check that a Mac already on the desk runs for free. So it moved off the
+per-PR path:
+
+1. **Before pushing**, `scripts/local-ci-macos.sh` runs the same checks, in the
+   same order, with the same flags: JesseKit `swift build`/`swift test`
+   (warnings-as-errors), then iOS build + test, watch build + test, Mac build +
+   test, then the "did every suite actually run a test?" assertion. It stops at
+   the first failure and prints a PASS/FAIL summary.
+2. **The pre-push hook runs it for you** and refuses the push on failure. Install
+   once per clone: `scripts/install-hooks.sh`. It skips itself when the push
+   touches neither `Jesse/` nor `JesseKit/`, so a bridge-only or docs-only push
+   costs nothing.
+3. **The nightly is the backstop, not the gate.** `ios-ci.yml` runs at 06:00 UTC
+   against `main` and can also be dispatched by hand from the Actions tab. A
+   cheap Linux `gate` job first asks whether any commit in the last 25 hours
+   touched `Jesse/` or `JesseKit/`; if none did, the macOS runner never starts. A
+   manual dispatch always runs regardless.
+
+Escape hatches, both of which make the nightly your only verification:
+`git push --no-verify` skips every pre-push check (including the version guard);
+`JESSE_SKIP_MAC_CI=1 git push` skips only the Swift suite and keeps the version
+guard. Use the second one when you already ran the script by hand.
+
+**The trade this makes:** iOS breakage can reach `main` and sit there until the
+next nightly. If that is ever unacceptable, the fix is a **self-hosted macOS
+runner** (a Mac mini or spare Mac registered to the repo), which restores the
+per-PR gate at zero GitHub minutes — not putting `pull_request:` back in
+`ios-ci.yml`, which restores the bill along with it.
