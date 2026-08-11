@@ -500,6 +500,20 @@ pub fn today_move_request(
         json,
     )
 }
+/// `POST /jesse/today/items/{id}/defer` — postpone one item for the day.
+pub fn today_defer_request(
+    auth: Option<&str>,
+    id: &str,
+    if_match: Option<&str>,
+    json: &str,
+) -> Request<Body> {
+    today_post(
+        auth,
+        &format!("/jesse/today/items/{id}/defer"),
+        if_match,
+        json,
+    )
+}
 /// `POST /jesse/today/glance` — mark one report row seen.
 pub fn today_glance_request(
     auth: Option<&str>,

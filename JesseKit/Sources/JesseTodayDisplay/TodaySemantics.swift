@@ -37,19 +37,25 @@ public struct TodayOptimism: Equatable, Sendable {
     public var removed: Set<String> = []
     /// Report rows glanced at locally, so the unseen dot clears on tap.
     public var seen: Set<String> = []
+    /// Postponements the user set but the server has not confirmed, so the badge
+    /// drops on the tap rather than after the round trip. `false` is a real entry:
+    /// it is "bring this back to today", not the absence of a claim.
+    public var deferrals: [String: Bool] = [:]
 
     public init(checks: [String: Bool] = [:], evidence: [String: String] = [:],
                 moves: [String: TodayMoveOp] = [:], removed: Set<String> = [],
-                seen: Set<String> = []) {
+                seen: Set<String> = [], deferrals: [String: Bool] = [:]) {
         self.checks = checks
         self.evidence = evidence
         self.moves = moves
         self.removed = removed
         self.seen = seen
+        self.deferrals = deferrals
     }
 
     public var isEmpty: Bool {
-        checks.isEmpty && evidence.isEmpty && moves.isEmpty && removed.isEmpty && seen.isEmpty
+        checks.isEmpty && evidence.isEmpty && moves.isEmpty && removed.isEmpty
+            && seen.isEmpty && deferrals.isEmpty
     }
 
     /// Carry every entry keyed `old` over to `new`, leaving nothing behind.
@@ -64,6 +70,7 @@ public struct TodayOptimism: Equatable, Sendable {
         if let v = checks.removeValue(forKey: old) { checks[new] = v }
         if let v = evidence.removeValue(forKey: old) { evidence[new] = v }
         if let v = moves.removeValue(forKey: old) { moves[new] = v }
+        if let v = deferrals.removeValue(forKey: old) { deferrals[new] = v }
         if removed.remove(old) != nil { removed.insert(new) }
         if seen.remove(old) != nil { seen.insert(new) }
     }
@@ -74,6 +81,7 @@ public struct TodayOptimism: Equatable, Sendable {
         checks.removeValue(forKey: id)
         evidence.removeValue(forKey: id)
         moves.removeValue(forKey: id)
+        deferrals.removeValue(forKey: id)
     }
 }
 
@@ -115,7 +123,7 @@ public enum TodaySemantics {
         return out
     }
 
-    /// One item with its pending check and evidence folded in.
+    /// One item with its pending check, evidence and postponement folded in.
     private nonisolated static func applyItemOverlay(_ item: TodayItem,
                                                      _ overlay: TodayOptimism) -> TodayItem {
         var it = item
@@ -128,6 +136,14 @@ public enum TodaySemantics {
         if let note = overlay.evidence[item.id], !note.isEmpty {
             it.appCompleted = TodayAppCompleted(at: it.appCompleted?.at, evidence: note)
         }
+        if let deferred = overlay.deferrals[item.id] { it.deferred = deferred }
+        // DONE BEATS POSTPONED. A row cannot claim both: "I set this aside for
+        // today" and "I did it" are answers to the same question, and the second
+        // one supersedes the first. Stated here, as a rendering rule, rather than
+        // by having the check endpoint reach into the defer store — the store is
+        // still holding a decision about today, and a row that is un-ticked is a
+        // row whose postponement was never withdrawn.
+        if it.checked { it.deferred = false }
         return it
     }
 
@@ -180,13 +196,33 @@ public enum TodaySemantics {
             guard let to = out.sections.firstIndex(where: { $0.name.hasPrefix("Do Now") })
             else { return snapshot }
             if to == from && index == 0 { return snapshot }
-            var item = out.sections[from].items.remove(at: index)
-            // The section name is part of the item's own identity; keeping the stale
-            // one would make a re-key match by section rather than by the pair that
-            // actually survives the move.
-            item.sectionName = out.sections[to].name
-            out.sections[to].items.insert(item, at: 0)
+            out = splice(out, from: from, at: index, to: to)
+        case .toSection(let name):
+            // An EXACT name here too, because that is how the bridge resolves it: the
+            // day file carries both a `Do Now` and a `Do Now (carried, owed replies
+            // and decisions)`, and a prefix match would land the row optimistically in
+            // one section and really in the other.
+            guard let to = out.sections.firstIndex(where: { $0.name == name }), to != from
+            else { return snapshot }
+            out = splice(out, from: from, at: index, to: to)
         }
+        return out
+    }
+
+    /// Lift one item out of `from` and put it at the top of `to`, rewriting its
+    /// section name.
+    ///
+    /// Shared by the two ops that cross a boundary, because the name rewrite is the
+    /// part that is easy to forget and expensive to get wrong: the section name is
+    /// part of the item's own identity, so keeping the stale one would make the
+    /// later re-key match by section rather than by the `(lead, addedDate)` pair
+    /// that actually survives a move.
+    private nonisolated static func splice(_ snapshot: TodaySnapshot, from: Int, at index: Int,
+                                           to: Int) -> TodaySnapshot {
+        var out = snapshot
+        var item = out.sections[from].items.remove(at: index)
+        item.sectionName = out.sections[to].name
+        out.sections[to].items.insert(item, at: 0)
         return out
     }
 
@@ -229,9 +265,37 @@ public enum TodaySemantics {
                            reportsUnseen: snapshot.allReports.filter { !$0.seen }.count)
     }
 
-    /// Open (unchecked) items in one section.
+    /// **What "open" means on this screen**: not done, and not set aside for today.
+    ///
+    /// One predicate rather than the same two clauses written at each call site,
+    /// because the tab badge and every section header have to agree about it — the
+    /// moment a header says 6 and the badge says 4, the user is reasoning about a
+    /// number nobody defined.
+    public nonisolated static func isOpen(_ item: TodayItem) -> Bool {
+        !item.checked && !item.deferred
+    }
+
+    /// **Whether a row reads as postponed** — deferred, and not done.
+    ///
+    /// DONE BEATS POSTPONED, stated once so every reader of the rule agrees. The
+    /// overlay pass already collapses the pair for a tap made on this device, but a
+    /// snapshot can arrive carrying both from a SECOND device (postponed here,
+    /// ticked off there), and a row struck through as done while also wearing a
+    /// "Postponed" chip is two answers to one question.
+    public nonisolated static func isPostponed(_ item: TodayItem) -> Bool {
+        item.deferred && !item.checked
+    }
+
+    /// Open items in one section: unchecked, and not postponed.
     public nonisolated static func openCount(in section: TodaySection) -> Int {
-        section.items.filter { !$0.checked }.count
+        section.items.filter(isOpen).count
+    }
+
+    /// Postponed items in one section — the tally a header appends to its open
+    /// count, so the rows set aside are accounted for rather than silently missing
+    /// from the number.
+    public nonisolated static func postponedCount(in section: TodaySection) -> Int {
+        section.items.filter(isPostponed).count
     }
 
     /// Open items per section, keyed by section name, for the section headers.
@@ -247,9 +311,14 @@ public enum TodaySemantics {
     /// those would show a number nobody can act on and never reach zero. What the
     /// badge means is "things I said I would do today, still open" — the Do Now
     /// section plus the standing top-priority item that sits above every heading.
+    ///
+    /// Postponed rows are excluded, which is the whole point of postponing. Before
+    /// it existed, the only way to clear a badge for work that was not going to
+    /// happen today was to tick the item off — which is a lie, and one that
+    /// `Close it at source` would then propagate into the project files.
     public nonisolated static func doNowOpenCount(_ snapshot: TodaySnapshot) -> Int {
         let doNow = snapshot.sections.first { $0.name.hasPrefix("Do Now") }
-        return (doNow.map(openCount(in:)) ?? 0) + snapshot.leadItems.filter { !$0.checked }.count
+        return (doNow.map(openCount(in:)) ?? 0) + snapshot.leadItems.filter(isOpen).count
     }
 
     /// Unseen glanceable rows — the dot on the briefing sections.
@@ -412,16 +481,31 @@ public enum TodaySemantics {
         if index > 0 { ops.append(.topOfSection) }
         let doNow = snapshot.sections.first { $0.name.hasPrefix("Do Now") }
         if let doNow, !(doNow.name == section.name && index == 0) { ops.append(.toDoNow) }
+        // Every OTHER section, in file order. Not filtered down to "sensible"
+        // destinations, because there is no such judgement to make: the day file's
+        // sections are the day's own structure, and which of them a piece of work
+        // belongs in is exactly the thing only the user knows. The item's own
+        // section is left out because moving to where you already are writes
+        // nothing (the bridge treats it as a no-op) and reads as a broken button.
+        ops += snapshot.sections
+            .filter { $0.name != section.name }
+            .map { .toSection($0.name) }
         return ops
     }
 
     /// The menu label for an op.
+    ///
+    /// A `toSection` op labels itself with the destination's FULL name, verbatim. A
+    /// day file carries both a `Do Now` and a `Do Now (carried, owed replies and
+    /// decisions)`; shortened or prettified, those become two menu entries that
+    /// both read "Do Now" and the menu becomes unusable.
     public nonisolated static func label(for op: TodayMoveOp) -> String {
         switch op {
         case .up: return "Move up"
         case .down: return "Move down"
         case .topOfSection: return "Move to top"
         case .toDoNow: return "Move to Do Now"
+        case .toSection(let name): return name
         }
     }
 
@@ -432,8 +516,12 @@ public enum TodaySemantics {
         case .down: return "arrow.down"
         case .topOfSection: return "arrow.up.to.line"
         case .toDoNow: return "bolt"
+        case .toSection: return "folder"
         }
     }
+
+    /// The submenu heading the `toSection` ops are gathered under.
+    public static let moveToSectionLabel = "Move to section"
 
     /// The SF Symbol for a report row's `kind`, defaulting to a neutral glyph so an
     /// unrecognized kind still renders.

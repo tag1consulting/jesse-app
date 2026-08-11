@@ -272,6 +272,8 @@ private struct FakeStatic: TodayProviding {
                    ifMatch: String) async throws -> TodayMutationResult { .snapshot(snapshot) }
     func moveItem(id: String, op: TodayMoveOp, at: Date,
                   ifMatch: String) async throws -> TodayMutationResult { .snapshot(snapshot) }
+    func postpone(id: String, deferred: Bool, at: Date,
+                  ifMatch: String) async throws -> TodayMutationResult { .snapshot(snapshot) }
     func glance(id: String, at: Date,
                 ifMatch: String) async throws -> TodayMutationResult { .snapshot(snapshot) }
 }

@@ -39,11 +39,32 @@ enum Fixt {
                      added: String? = nil, updated: String? = nil,
                      text: String? = nil, links: [TodayLink] = [],
                      appCompleted: TodayAppCompleted? = nil,
-                     project: TodayProject = .unfiled) -> TodayItem {
+                     project: TodayProject = .unfiled,
+                     deferred: Bool = false) -> TodayItem {
         TodayItem(id: id, checked: checked, lead: lead,
                   text: text ?? "* [\(checked ? "x" : " ")] **\(lead)**",
                   links: links, addedDate: added, updatedDate: updated,
-                  appCompleted: appCompleted, sectionName: section, project: project)
+                  appCompleted: appCompleted, sectionName: section, project: project,
+                  deferred: deferred, deferredMs: deferred ? 1_772_000_000_000 : 0)
+    }
+
+    /// The same day with one item already flagged postponed by the bridge — what a
+    /// second device's postponement looks like on arrival, and what a relaunch reads
+    /// back out of the defer store.
+    static func snapshotWithPostponed(_ id: String,
+                                      etag: String = "\"tag-1\"") -> TodaySnapshot {
+        var snap = snapshot(etag: etag)
+        for i in snap.leadItems.indices where snap.leadItems[i].id == id {
+            snap.leadItems[i].deferred = true
+            snap.leadItems[i].deferredMs = 1_772_000_000_000
+        }
+        for s in snap.sections.indices {
+            for i in snap.sections[s].items.indices where snap.sections[s].items[i].id == id {
+                snap.sections[s].items[i].deferred = true
+                snap.sections[s].items[i].deferredMs = 1_772_000_000_000
+            }
+        }
+        return snap
     }
 
     static func report(_ id: String, title: String, section: String, kind: String,

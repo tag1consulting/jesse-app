@@ -19,9 +19,13 @@ import Foundation
 // item re-emitted with the same lead in the same section keeps its id, and every
 // piece of client state keyed on that id (a local check, a seen flag) survives the
 // night. The edge: the SECTION NAME is part of the hash, so an item that moves
-// between sections COMES BACK UNDER A DIFFERENT ID. `to_do_now` is the only op that
-// crosses sections, and the client must re-key its state when it does — see
-// `TodaySemantics.rekeyed(_:in:excluding:)`.
+// between sections COMES BACK UNDER A DIFFERENT ID. `to_do_now` and `to_section`
+// are the two ops that cross sections, and the client must re-key its state when
+// either lands — see `TodaySemantics.rekeyed(_:in:excluding:)`.
+//
+// It is also why a POSTPONEMENT is keyed by day and not written into the file. An
+// item re-emitted unchanged tomorrow keeps its id, so the id cannot be what
+// expires a decision that was only ever about today; the day can, and does.
 
 // MARK: - Nodes
 
@@ -100,12 +104,23 @@ public struct TodayItem: Decodable, Equatable, Hashable, Identifiable, Sendable 
     /// its section heading and the five Dashboard pages. `.unfiled` is the honest
     /// answer for an item that declares no lineage, and is common — see `TodayProject`.
     public var project: TodayProject
+    /// **Postponed for today**: the user set this item aside, so it drops out of
+    /// the tab badge and its section's open count until tomorrow. `deferredMs` is
+    /// the client clock the claim was made on, which is how two devices converge.
+    ///
+    /// Never a fact about the task and never in the markdown — the bridge keeps it
+    /// in a day-scoped store whose keys expire, which is precisely what brings the
+    /// item back tomorrow with nothing to unwind. A postponed row stays on screen:
+    /// a day that silently drops rows is a day the user stops trusting.
+    public var deferred: Bool
+    public var deferredMs: UInt64
     public var range: TodaySourceRange
 
     public init(id: String, checked: Bool = false, lead: String = "", text: String = "",
                 links: [TodayLink] = [], addedDate: String? = nil, updatedDate: String? = nil,
                 appCompleted: TodayAppCompleted? = nil, sectionName: String = "",
                 project: TodayProject = .unfiled,
+                deferred: Bool = false, deferredMs: UInt64 = 0,
                 range: TodaySourceRange = TodaySourceRange(start: 0, end: 0)) {
         self.id = id
         self.checked = checked
@@ -117,6 +132,8 @@ public struct TodayItem: Decodable, Equatable, Hashable, Identifiable, Sendable 
         self.appCompleted = appCompleted
         self.sectionName = sectionName
         self.project = project
+        self.deferred = deferred
+        self.deferredMs = deferredMs
         self.range = range
     }
 
@@ -128,7 +145,7 @@ public struct TodayItem: Decodable, Equatable, Hashable, Identifiable, Sendable 
     /// item it can render.
     private enum CodingKeys: String, CodingKey {
         case id, checked, lead, text, links, addedDate, updatedDate
-        case appCompleted, sectionName, project, range
+        case appCompleted, sectionName, project, deferred, deferredMs, range
     }
 
     public init(from decoder: any Decoder) throws {
@@ -143,6 +160,10 @@ public struct TodayItem: Decodable, Equatable, Hashable, Identifiable, Sendable 
         appCompleted = try c.decodeIfPresent(TodayAppCompleted.self, forKey: .appCompleted)
         sectionName = try c.decodeIfPresent(String.self, forKey: .sectionName) ?? ""
         project = try c.decodeIfPresent(TodayProject.self, forKey: .project) ?? .unfiled
+        // A bridge before 0.74.0 sends neither key, and "not postponed" is the
+        // correct reading of a bridge that has no idea what postponing is.
+        deferred = try c.decodeIfPresent(Bool.self, forKey: .deferred) ?? false
+        deferredMs = try c.decodeIfPresent(UInt64.self, forKey: .deferredMs) ?? 0
         range = try c.decodeIfPresent(TodaySourceRange.self, forKey: .range)
             ?? TodaySourceRange(start: 0, end: 0)
     }
@@ -329,20 +350,53 @@ public struct TodaySnapshot: Decodable, Equatable, Sendable {
 
 // MARK: - The move op
 
-/// The four reorderings the app may request, spelled exactly as the bridge parses
-/// them. `toDoNow` is the ONLY one that can cross a section boundary, and therefore
-/// the only one that can change an item's id.
-public enum TodayMoveOp: String, CaseIterable, Equatable, Hashable, Sendable {
+/// The reorderings the app may request, spelled exactly as the bridge parses them.
+///
+/// Two of them cross a section boundary, and they are deliberately different
+/// shapes. `toDoNow` NAMES NOTHING: the bridge resolves it to the first heading
+/// beginning `Do Now`, because "put this at the front of the day" is one gesture.
+/// `toSection` CARRIES its destination, because a general demotion has nothing to
+/// resolve against — an item id is a content hash over `(sectionName, lead,
+/// addedDate)` and so carries no memory of where the item was, and there is
+/// therefore no "back where it came from" to send it to. The user names the
+/// destination because nothing else can.
+///
+/// Not `RawRepresentable` any more, since one case carries a payload: `wireOp`
+/// and `destinationSection` are the two halves of a move body, and having them be
+/// functions rather than a raw value is what keeps the request builder from
+/// having to know which ops need a second field.
+public enum TodayMoveOp: Equatable, Hashable, Sendable {
     /// Above every other item of the item's own section.
-    case topOfSection = "top_of_section"
+    case topOfSection
     /// Above every other item of the first section named `Do Now…`.
-    case toDoNow = "to_do_now"
+    case toDoNow
+    /// Above every other item of the section with EXACTLY this name. The bridge
+    /// matches the name verbatim (unlike `toDoNow`'s prefix match), because this
+    /// name was read out of a snapshot rather than guessed.
+    case toSection(String)
     /// Swap with the item above it, within its section.
     case up
     /// Swap with the item below it, within its section.
     case down
 
+    /// The `op` field of a move body.
+    public var wireOp: String {
+        switch self {
+        case .topOfSection: return "top_of_section"
+        case .toDoNow: return "to_do_now"
+        case .toSection: return "to_section"
+        case .up: return "up"
+        case .down: return "down"
+        }
+    }
+
+    /// The `section` field of a move body, for the one op that has one.
+    public var destinationSection: String? {
+        if case .toSection(let name) = self { return name }
+        return nil
+    }
+
     /// Whether this op can move an item into a different section — and so whether
     /// the response may carry the item under a new id.
-    public var crossesSections: Bool { self == .toDoNow }
+    public var crossesSections: Bool { destinationSection != nil || self == .toDoNow }
 }

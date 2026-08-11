@@ -4,10 +4,10 @@
 //!
 //! **This module reads; it does not write.** The mutations — checking a box,
 //! moving an item, marking a glanceable seen — live in [`crate::todaywrite`],
-//! and the durability machinery behind them in [`crate::todayjournal`]. The one
-//! thing here that writes at all is [`GlanceStore::record`], which touches the
-//! state dir and never the vault. Pushing a change over SSE remains follow-on
-//! work.
+//! and the durability machinery behind them in [`crate::todayjournal`]. The only
+//! things here that write at all are [`GlanceStore::record`] and
+//! [`DeferStore::record`], which touch the state dir and never the vault.
+//! Pushing a change over SSE remains follow-on work.
 //!
 //! Same posture as the other snapshot endpoint, [`jesse_diet`]: bearer auth, the
 //! shared rate limiter, ids-and-values-only JSON, and a **pure function of file
@@ -101,6 +101,15 @@ pub struct TodayItem {
     /// and putting any of them on the wire would freeze a rendering decision
     /// into the API. See [`derive_project`] for how it is resolved.
     pub project: &'static str,
+    /// Whether the app has **postponed this item for the day**, and the client
+    /// millisecond clock that claim was made on.
+    ///
+    /// Client state about one day, not a fact about the task, so it comes from
+    /// [`DeferStore`] and NOT from the markdown — see that type for why the day
+    /// file is the wrong place to record it. Absent store, every item is open,
+    /// which is the correct cold-start answer.
+    pub deferred: bool,
+    pub deferred_ms: u64,
     pub range: SourceRange,
 }
 
@@ -964,6 +973,12 @@ fn build_item(
         added_date,
         app_completed: app_completed(&continuations),
         section_name: section_name.to_string(),
+        // Both are the day file's own answer: nothing in the markdown says an
+        // item is postponed, and nothing should. [`DeferStore::merge_into`]
+        // stamps them on afterwards, exactly as the glance store does for a
+        // report row's `seen`.
+        deferred: false,
+        deferred_ms: 0,
         range: span(lines),
         text,
     }
@@ -1165,13 +1180,23 @@ fn glance_path(state_dir: Option<&str>) -> Option<PathBuf> {
 
 /// Drop entries whose key names a day more than [`GLANCE_RETENTION_DAYS`] before
 /// `reference`.
-///
-/// Aged against the SNAPSHOT's date rather than the wall clock, so the store
-/// stays a pure function of what it is asked about — the same discipline the
-/// parser keeps. A key whose date does not parse is kept: it is either the
-/// legacy bare-id shape or something hand-written, and neither is ours to
-/// discard.
 fn gc_glances(map: &mut HashMap<String, GlanceFlag>, reference: &str) {
+    gc_day_scoped(map, reference, GLANCE_RETENTION_DAYS);
+}
+
+/// Drop entries whose `"YYYY-MM-DD/<id>"` key names a day more than `retention`
+/// days before `reference`.
+///
+/// Aged against the SNAPSHOT's date rather than the wall clock, so a store stays
+/// a pure function of what it is asked about — the same discipline the parser
+/// keeps. A key whose date does not parse is kept: it is either a legacy bare-id
+/// shape or something hand-written, and neither is ours to discard.
+///
+/// Generic over the value because both day-scoped stores here — glances and
+/// deferrals — expire on exactly this rule, and the one thing that must not
+/// happen is for the second store to grow its own slightly different idea of
+/// when a key about one day stops mattering.
+fn gc_day_scoped<V>(map: &mut HashMap<String, V>, reference: &str, retention: i64) {
     let Some(today) = valid_iso_date(reference).map(civil_days) else {
         return;
     };
@@ -1180,7 +1205,7 @@ fn gc_glances(map: &mut HashMap<String, GlanceFlag>, reference: &str) {
             return true;
         };
         match valid_iso_date(date).map(civil_days) {
-            Some(day) => today - day <= GLANCE_RETENTION_DAYS,
+            Some(day) => today - day <= retention,
             None => true,
         }
     });
@@ -1189,6 +1214,14 @@ fn gc_glances(map: &mut HashMap<String, GlanceFlag>, reference: &str) {
 /// Persist the glance map atomically (temp + rename), mode 0600 — the same
 /// discipline as [`persist_flags`]. Best-effort: a failure is logged, never fatal.
 fn persist_glances(path: &Path, map: &HashMap<String, GlanceFlag>) {
+    persist_day_store(path, map, "glance");
+}
+
+/// Persist one day-scoped store atomically (temp + rename), mode 0600 — the same
+/// discipline as [`persist_flags`]. Best-effort: a failure is logged, never
+/// fatal, because neither store holds anything a user cannot re-state with one
+/// tap.
+fn persist_day_store<V: serde::Serialize>(path: &Path, map: &HashMap<String, V>, what: &str) {
     let tmp = path.with_extension("json.tmp");
     let write = || -> std::io::Result<()> {
         if let Some(parent) = path.parent() {
@@ -1205,9 +1238,140 @@ fn persist_glances(path: &Path, map: &HashMap<String, GlanceFlag>) {
         std::fs::rename(&tmp, path)
     };
     if let Err(e) = write() {
-        eprintln!("warning: could not persist the glance store: {e}");
+        eprintln!("warning: could not persist the {what} store: {e}");
         let _ = std::fs::remove_file(&tmp);
     }
+}
+
+// ---- The defer store -------------------------------------------------------
+
+/// One item's postponement, as the defer store records it.
+#[derive(serde::Serialize, serde::Deserialize, Default, Clone)]
+pub struct DeferFlag {
+    #[serde(default)]
+    pub deferred: bool,
+    #[serde(default)]
+    pub deferred_ms: u64,
+}
+
+/// How long a postponement survives. The same window as a glance, and the same
+/// constant rather than a second one: both are claims about ONE DAY, and a store
+/// whose keys outlived the day they name would be holding a decision the user
+/// made about work that has since been rewritten.
+pub const DEFER_RETENTION_DAYS: i64 = GLANCE_RETENTION_DAYS;
+
+/// **Postponed-for-today state**, read from `<state_dir>/defer.json` and keyed
+/// `"YYYY-MM-DD/<item id>"`.
+///
+/// **Why this is a store and not a markdown edit.** Postponing is a decision
+/// about TODAY, not a fact about the task: nothing about the item changes, its
+/// project rollup is the same, and tomorrow it is simply open again. Writing it
+/// into `Today.md` would put it in front of the morning rebuild and in front of
+/// every agent that reads the day, and it would need unwinding tomorrow by
+/// something that remembered to. The store is the right home precisely because
+/// its keys EXPIRE: the day scope is what brings the item back, with no user
+/// action and no second write.
+///
+/// The date is part of the key for the reason [`GlanceStore`] gives, one step
+/// further: an item id is a content hash, so a task re-emitted unchanged
+/// tomorrow keeps its id — which is right (a check survives the rebuild) and is
+/// exactly why the DAY, not the item, has to be what expires a postponement.
+///
+/// Unlike the glance store there is no bare-id fallback on read. There is no
+/// earlier shape of this file to honour, and a bare-id key would be a
+/// postponement that never expires — the one thing this store must not be able
+/// to hold. An absent, unreadable or malformed store reads as EMPTY, never as an
+/// error; the day screen is never blocked by its own bookkeeping.
+#[derive(Default)]
+pub struct DeferStore {
+    map: HashMap<String, DeferFlag>,
+}
+
+impl DeferStore {
+    /// The composite key for one item on one day.
+    pub fn key(date: &str, id: &str) -> String {
+        format!("{date}/{id}")
+    }
+
+    /// Load the store, or an empty one.
+    pub fn load(state_dir: Option<&str>) -> Self {
+        let Some(path) = defer_path(state_dir) else {
+            return Self::default();
+        };
+        let map = std::fs::read_to_string(path)
+            .ok()
+            .and_then(|s| serde_json::from_str::<HashMap<String, DeferFlag>>(&s).ok())
+            .unwrap_or_default();
+        Self { map }
+    }
+
+    /// Stamp `deferred` / `deferredMs` onto the items the store knows about,
+    /// lead items included — a lead item counts toward the app's badge, so it
+    /// has to be dismissible like any other row.
+    ///
+    /// No `recount()` afterwards, unlike [`GlanceStore::merge_into`]: `counts`
+    /// tallies checked against unchecked, and a postponed item is neither done
+    /// nor stopped being in the day. What postponement takes out of a count is
+    /// the APP's badge, which the client computes over the rows it draws.
+    pub fn merge_into(&self, snapshot: &mut TodaySnapshot) {
+        if self.map.is_empty() {
+            return;
+        }
+        let date = snapshot.date.clone().unwrap_or_default();
+        let items = snapshot.lead_items.iter_mut().chain(
+            snapshot
+                .sections
+                .iter_mut()
+                .flat_map(|s| s.items.iter_mut()),
+        );
+        for item in items {
+            if let Some(flag) = self.map.get(&Self::key(&date, &item.id)) {
+                item.deferred = flag.deferred;
+                item.deferred_ms = flag.deferred_ms;
+            }
+        }
+    }
+
+    /// Record that one item was postponed (or brought back), last-writer-wins on
+    /// the client's millisecond timestamp, and GC everything older than
+    /// [`DEFER_RETENTION_DAYS`] in the same write.
+    ///
+    /// LWW exactly as [`GlanceStore::record`] does it: two devices postponing the
+    /// same row converge on the later claim whatever order the writes arrive in,
+    /// and a stale write loses rather than winning by being last. Note that the
+    /// comparison is `>`, not `>=`, so a replayed identical timestamp is inert.
+    ///
+    /// Best-effort and never fatal — a postponement that fails to persist costs
+    /// one re-tap.
+    pub fn record(state_dir: Option<&str>, date: &str, id: &str, deferred: bool, at_ms: u64) {
+        let Some(path) = defer_path(state_dir) else {
+            return;
+        };
+        let mut map = Self::load(state_dir).map;
+        let entry = map.entry(Self::key(date, id)).or_default();
+        if at_ms > entry.deferred_ms {
+            entry.deferred = deferred;
+            entry.deferred_ms = at_ms;
+        }
+        gc_day_scoped(&mut map, date, DEFER_RETENTION_DAYS);
+        persist_day_store(&path, &map, "defer");
+    }
+
+    /// The stored rows. Tests and introspection only.
+    pub fn len(&self) -> usize {
+        self.map.len()
+    }
+
+    /// Whether the store holds nothing.
+    pub fn is_empty(&self) -> bool {
+        self.map.is_empty()
+    }
+}
+
+/// `<state_dir>/defer.json`, or `None` with no state dir (then postponements are
+/// not recorded at all — the same degradation every other bridge store has).
+fn defer_path(state_dir: Option<&str>) -> Option<PathBuf> {
+    state_dir.map(|d| Path::new(d).join("defer.json"))
 }
 
 /// Days since the civil epoch (1970-01-01) for a `(y, m, d)`, so two dates can be
@@ -1346,8 +1510,8 @@ pub fn build_snapshot(cfg: &Config) -> (Option<String>, TodaySnapshot) {
     (raw, snapshot)
 }
 
-/// Everything that happens to a snapshot AFTER the parse: the project rollup and
-/// the glance flags.
+/// Everything that happens to a snapshot AFTER the parse: the project rollup,
+/// the glance flags and the postponements.
 ///
 /// **One definition, because the etag depends on it.** `snapshot_etag` hashes the
 /// whole serialized snapshot, and the write path's `If-Match` check re-derives
@@ -1359,6 +1523,7 @@ pub fn build_snapshot(cfg: &Config) -> (Option<String>, TodaySnapshot) {
 pub fn hydrate(cfg: &Config, snapshot: &mut TodaySnapshot) {
     ProjectRollup::load(cfg).stamp_into(snapshot);
     GlanceStore::load(cfg.state_dir.as_deref()).merge_into(snapshot);
+    DeferStore::load(cfg.state_dir.as_deref()).merge_into(snapshot);
 }
 
 #[cfg(test)]
@@ -2039,4 +2204,151 @@ mod tests {
         assert!(snap.sections.is_empty() && snap.lead_items.is_empty());
         assert_eq!(snap.counts, TodayCounts::default());
     }
+
+    // ---- The defer store ---------------------------------------------------
+    //
+    // The store is the whole mechanism of "postponed for today", so what is
+    // pinned here is what makes the feature honest: the key EXPIRES with the day
+    // (which is what brings the item back tomorrow), a stale device loses, and a
+    // store that cannot be read is empty rather than fatal.
+
+    /// A throwaway state dir. Removed on drop so a failing assertion cannot leave
+    /// one behind for the next run to read.
+    struct StateDir(PathBuf);
+
+    impl StateDir {
+        fn new() -> Self {
+            let d = std::env::temp_dir().join(format!("jesse-defer-{}", random_hex()));
+            std::fs::create_dir_all(&d).unwrap();
+            Self(d)
+        }
+
+        fn path(&self) -> String {
+            self.0.to_string_lossy().into_owned()
+        }
+    }
+
+    impl Drop for StateDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn a_defer_key_is_the_day_then_the_item_id() {
+        assert_eq!(DeferStore::key("2026-03-03", "abc123"), "2026-03-03/abc123");
+    }
+
+    #[test]
+    fn a_postponement_round_trips_and_toggling_back_clears_it() {
+        let dir = StateDir::new();
+        DeferStore::record(Some(&dir.path()), "2026-03-03", "abc123", true, 1_000);
+        let mut snap = parse_today(FULL_WITH_DATE);
+        snap.sections[0].items[0].id = "abc123".to_string();
+        DeferStore::load(Some(&dir.path())).merge_into(&mut snap);
+        assert!(snap.sections[0].items[0].deferred);
+        assert_eq!(snap.sections[0].items[0].deferred_ms, 1_000);
+
+        DeferStore::record(Some(&dir.path()), "2026-03-03", "abc123", false, 2_000);
+        let mut snap = parse_today(FULL_WITH_DATE);
+        snap.sections[0].items[0].id = "abc123".to_string();
+        DeferStore::load(Some(&dir.path())).merge_into(&mut snap);
+        assert!(
+            !snap.sections[0].items[0].deferred,
+            "bringing it back is the same write with deferred: false"
+        );
+    }
+
+    #[test]
+    fn the_later_client_clock_wins_whatever_order_the_writes_arrive_in() {
+        let dir = StateDir::new();
+        DeferStore::record(Some(&dir.path()), "2026-03-03", "abc", true, 5_000);
+        // A second device's write, stamped EARLIER, arriving later. It loses.
+        DeferStore::record(Some(&dir.path()), "2026-03-03", "abc", false, 4_000);
+        let mut snap = parse_today(FULL_WITH_DATE);
+        snap.sections[0].items[0].id = "abc".to_string();
+        DeferStore::load(Some(&dir.path())).merge_into(&mut snap);
+        assert!(
+            snap.sections[0].items[0].deferred,
+            "a stale write must not win by being last"
+        );
+        assert_eq!(snap.sections[0].items[0].deferred_ms, 5_000);
+    }
+
+    #[test]
+    fn keys_older_than_the_retention_window_are_dropped_against_the_snapshot_date() {
+        let dir = StateDir::new();
+        DeferStore::record(Some(&dir.path()), "2026-02-01", "old", true, 1);
+        DeferStore::record(Some(&dir.path()), "2026-02-25", "recent", true, 1);
+        // The GC runs against the date of the write that triggers it, never the
+        // wall clock — the same discipline the parser keeps.
+        DeferStore::record(Some(&dir.path()), "2026-03-03", "today", true, 1);
+        let store = DeferStore::load(Some(&dir.path()));
+        assert_eq!(
+            store.len(),
+            2,
+            "a key more than {DEFER_RETENTION_DAYS} days before the reference is dead weight"
+        );
+        assert!(!store.map.contains_key("2026-02-01/old"));
+        assert!(store.map.contains_key("2026-02-25/recent"));
+    }
+
+    #[test]
+    fn a_missing_or_malformed_store_reads_as_empty_and_never_as_an_error() {
+        let dir = StateDir::new();
+        assert!(
+            DeferStore::load(Some(&dir.path())).is_empty(),
+            "no file at all is an empty store"
+        );
+        std::fs::write(dir.0.join("defer.json"), "{not json at all").unwrap();
+        assert!(
+            DeferStore::load(Some(&dir.path())).is_empty(),
+            "the day screen is never blocked by its own bookkeeping"
+        );
+        assert!(
+            DeferStore::load(None).is_empty(),
+            "no state dir means postponements are simply not recorded"
+        );
+    }
+
+    #[test]
+    fn a_postponement_is_scoped_to_its_day_so_tomorrow_carries_none() {
+        let dir = StateDir::new();
+        let mut today = parse_today(FULL_WITH_DATE);
+        let id = today.sections[0].items[0].id.clone();
+        DeferStore::record(Some(&dir.path()), "2026-03-03", &id, true, 1_000);
+        DeferStore::load(Some(&dir.path())).merge_into(&mut today);
+        assert!(today.sections[0].items[0].deferred);
+
+        // THE SAME DOCUMENT under tomorrow's date: identical item ids (they hash
+        // the words, not the day), and no postponement at all.
+        let mut tomorrow = parse_today(&FULL_WITH_DATE.replace("March 3, 2026", "March 4, 2026"));
+        assert_eq!(tomorrow.sections[0].items[0].id, id, "the id is unchanged");
+        DeferStore::load(Some(&dir.path())).merge_into(&mut tomorrow);
+        assert!(
+            !tomorrow.sections[0].items[0].deferred,
+            "the badge comes back by itself: the DAY is what expires the postponement"
+        );
+    }
+
+    #[test]
+    fn a_lead_item_can_be_postponed() {
+        // The lead item counts toward the app's badge and can never be MOVED, so
+        // if it could not be postponed either there would be no way to clear the
+        // badge short of ticking work off that was not done.
+        let dir = StateDir::new();
+        let mut snap = parse_today(FULL_WITH_DATE);
+        let id = snap.lead_items[0].id.clone();
+        DeferStore::record(Some(&dir.path()), "2026-03-03", &id, true, 1);
+        DeferStore::load(Some(&dir.path())).merge_into(&mut snap);
+        assert!(snap.lead_items[0].deferred);
+    }
+
+    /// A minimal day with a dated H1, a lead item and a `Do Now` section — enough
+    /// to key a store against without dragging in the whole grammar fixture.
+    const FULL_WITH_DATE: &str = "# Today: Tuesday, March 3, 2026\n\n\
+* [ ] **TOP PRIORITY.** The standing item.\n\n\
+## Do Now\n\n\
+* [ ] **Reply to Ada.** About the date. (Added 2026-03-01)\n\
+* [ ] **Order the replacement.** (Added 2026-02-27)\n";
 }

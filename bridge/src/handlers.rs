@@ -1906,7 +1906,13 @@ pub fn app(state: AppState) -> Router {
         // `If-Match` carrying the snapshot etag. See `todaywrite` / `todayjournal`.
         .route("/jesse/today/items/:id/check", post(jesse_today_check))
         .route("/jesse/today/items/:id/move", post(jesse_today_move))
+        // The two mutations that touch NO vault content: a glanceable row marked
+        // seen, and an item postponed for the day. Both are claims about today
+        // rather than about the document, both live in day-scoped stores under
+        // the state dir, and both expire on their own — which is the whole reason
+        // neither is a markdown edit. See `today::GlanceStore` / `today::DeferStore`.
         .route("/jesse/today/glance", post(jesse_today_glance))
+        .route("/jesse/today/items/:id/defer", post(jesse_today_defer))
         // The conversation surface: the bridge's own thread identity, keyed on a stable
         // UUID registered at accept time rather than on a CLI transcript filename.
         .route("/jesse/conversations", get(jesse_conversations))
