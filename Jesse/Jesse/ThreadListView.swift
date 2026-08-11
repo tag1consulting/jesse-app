@@ -74,6 +74,13 @@ struct ThreadListView: View {
     // Live search text. Not persisted — a fresh launch starts with the full list.
     @State private var searchText = ""
 
+    @State private var confirmMorningRoutine = false
+    // The last local day (`yyyy-MM-dd`) this device fired the morning routine, shared
+    // by key with the Mac. It changes the confirmation's WORDING and nothing else:
+    // start of day may equally have run from the other device or from a scheduled task,
+    // which this app cannot see, so a second run for a delta stays one tap away.
+    @AppStorage(MorningRoutine.lastFiredDayKey) private var morningRoutineLastFiredDay = ""
+
     // Orchestrates the on-device expansion tier (debounce / gate / cache / cancel).
     // Injects the FoundationModels-backed expander in production; degrades silently
     // to Tier-1 when the model is unavailable or disabled.
@@ -170,9 +177,50 @@ struct ThreadListView: View {
                 Button(action: newThread) { Image(systemName: "square.and.pencil") }
                     .accessibilityLabel("New conversation")
             }
+            // The morning routine, as a button: the greeting Jeremy types by hand every
+            // morning to start it. A plain `ToolbarItem` at `.topBarTrailing`, never
+            // `.secondaryAction`, and never inside a conditional — that combination is
+            // how the Health tab's "Start new day" shipped as an inert ellipsis while CI
+            // stayed green (UIKit collapses secondary items into a "More" overflow, and
+            // an overflow item declared in a conditional gets an empty menu it won't
+            // present). A UI test asserts this one is a real navigation-bar button.
+            //
+            // `cup.and.saucer` rather than a third sun. `sun.horizon` is already the
+            // Health tab's "Start new day" AND the day screen's "the morning routine has
+            // not run yet" empty state, and `sunrise` is the Today tab's icon — visible
+            // in the tab bar at the same moment as this button. One glyph shape carrying
+            // three different claims on one screen is not a glyph, it is a guess.
+            ToolbarItem(placement: .topBarTrailing) {
+                Button { confirmMorningRoutine = true } label: {
+                    Image(systemName: "cup.and.saucer")
+                }
+                .accessibilityLabel(MorningRoutine.dialogTitle)
+                // NOT gated on `config.isConfigured`, deliberately. This view has no
+                // disabled-while-unpaired condition to match: the compose button beside
+                // it is ungated too, and the way this screen handles an unpaired user is
+                // the `pairBridge` empty state that replaces the list with a Scan-to-pair
+                // CTA. Disabling only this one button would be a new rule invented for
+                // one item, and it would present a dead control on the very screen that
+                // is already explaining how to pair. An unpaired tap ends the same way an
+                // unpaired compose-and-send does: a thread with an error on it.
+                // (The Mac's copy of this button IS disabled, because New Chat next to it
+                // is — same principle, opposite answer, because the neighbours differ.)
+            }
             ToolbarItem(placement: .topBarLeading) {
                 Button { showSettings = true } label: { Image(systemName: "gearshape") }
             }
+        }
+        // A tap starts a routine that runs for minutes, so confirm first. The leading
+        // action is start-of-day alone, which is the common case and reads as the
+        // default; folding in the health and diet refresh is the explicit second choice.
+        .confirmationDialog(MorningRoutine.dialogTitle, isPresented: $confirmMorningRoutine) {
+            Button(MorningRoutine.startAction) { startMorningRoutine(includeHealth: false) }
+            Button(MorningRoutine.includeHealthAction) { startMorningRoutine(includeHealth: true) }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text(MorningRoutine.confirmationMessage(lastFiredDay: morningRoutineLastFiredDay.isEmpty
+                                                        ? nil : morningRoutineLastFiredDay,
+                                                    now: .now))
         }
         .onAppear(perform: pruneEmpty)
     }
@@ -397,6 +445,27 @@ struct ThreadListView: View {
             Log.run.error("archive toggle save failed: \(error.localizedDescription)")
         }
         coordinator.pushArchivedChange(for: thread)
+    }
+
+    /// Fire the morning routine and OPEN the conversation it runs in.
+    ///
+    /// Deliberately unlike the Health tab's button, which fires and returns: that one's
+    /// output is a repainted dashboard the user is already looking at, whereas this
+    /// one's output IS the conversation — a long briefing Jeremy reads and then answers
+    /// in place. So this pushes the thread with the turn already running, exactly as
+    /// `newThread()` pushes an empty one.
+    private func startMorningRoutine(includeHealth: Bool) {
+        // Insert before appending to `path`, for the reason `newThread()` documents: a
+        // not-yet-inserted model's id changes on insert, which confuses the navigation
+        // path. Tell, like every other fixed prompt in the app — this is an instruction
+        // that does a large amount of work, not a question.
+        let thread = JesseThread(mode: .tell)
+        context.insert(thread)
+        coordinator.send(thread: thread,
+                         text: MorningRoutine.prompt(now: .now, includeHealthNewDay: includeHealth),
+                         voice: false, context: context)
+        path.append(thread)
+        morningRoutineLastFiredDay = MorningRoutine.dayStamp(.now)
     }
 
     private func newThread() {

@@ -59,6 +59,11 @@ struct MacRootView: View {
     @Environment(\.openSettings) private var openSettings
 
     @State private var selection: UUID?
+    @State private var confirmMorningRoutine = false
+    // The last local day (`yyyy-MM-dd`) this device fired the morning routine. Same key
+    // as the phone's, so the two spell "today" the same way; it changes the
+    // confirmation's wording only, never whether either action is offered.
+    @AppStorage(MorningRoutine.lastFiredDayKey) private var morningRoutineLastFiredDay = ""
     /// Scope (all / favorites / archived) + folder-expansion state + the two-tier
     /// search, wrapping the shared layout. The production on-device expander is
     /// injected HERE, in the view, on purpose: the view model defaults to the inert
@@ -200,6 +205,21 @@ struct MacRootView: View {
                 Button { newChat() } label: { Label("New Chat", systemImage: "square.and.pencil") }
                     .keyboardShortcut("n", modifiers: .command)
                     .disabled(!coordinator.configStore.isConfigured)
+                // The morning routine, as a button — the Mac half of the phone's Chats
+                // toolbar item, sending the same bytes from the same shared constant.
+                // `cup.and.saucer` because both sun glyphs are spoken for: `sun.horizon`
+                // is the Health tab's "Start new day" and `sunrise` is the Today tab.
+                //
+                // NO KEYBOARD SHORTCUT, unlike every other button in this group. The
+                // other four are cheap and reversible (a new chat, a refresh, a filter
+                // flip, an archive toggle); this one starts a routine that runs for
+                // minutes and rewrites the day file, and a shortcut is exactly how it
+                // would get fired by a mistyped ⌘-something.
+                Button { confirmMorningRoutine = true } label: {
+                    Label(MorningRoutine.dialogTitle, systemImage: "cup.and.saucer")
+                }
+                .help("Run the full start of day routine")
+                .disabled(!coordinator.configStore.isConfigured)
                 Button { Task { await coordinator.refreshSessions(context: context) } } label: {
                     Label("Refresh", systemImage: "arrow.clockwise")
                 }
@@ -228,6 +248,36 @@ struct MacRootView: View {
                 Button { openSettings() } label: { Label("Settings", systemImage: "gearshape") }
             }
         }
+        // Same confirmation as the phone, from the same shared copy: a click starts a
+        // routine that runs for minutes. Start-of-day alone leads and reads as the
+        // default; the health and diet refresh is the explicit second choice.
+        .confirmationDialog(MorningRoutine.dialogTitle, isPresented: $confirmMorningRoutine) {
+            Button(MorningRoutine.startAction) { startMorningRoutine(includeHealth: false) }
+            Button(MorningRoutine.includeHealthAction) { startMorningRoutine(includeHealth: true) }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text(MorningRoutine.confirmationMessage(lastFiredDay: morningRoutineLastFiredDay.isEmpty
+                                                        ? nil : morningRoutineLastFiredDay,
+                                                    now: .now))
+        }
+    }
+
+    /// Fire the morning routine and SELECT the conversation, so the briefing streams
+    /// into the detail column while it runs. `MacHealthView.startNewDay()` deliberately
+    /// does not select — its output is a dashboard on another tab — but this turn's
+    /// output IS the conversation, and it is the thing Jeremy is waiting to read.
+    private func startMorningRoutine(includeHealth: Bool) {
+        // `newChat()`'s insert-and-save, plus the Health tab's detached send. Selecting
+        // after the save keeps the sidebar row and the detail column agreeing on one
+        // identity. `pruneEmptyThreads` cannot take this thread: it runs once from the
+        // shell's `.task`, and it already excludes the thread whose turn is in flight.
+        let thread = JesseThread(mode: .tell)
+        context.insert(thread)
+        try? context.save()
+        selection = thread.id
+        let text = MorningRoutine.prompt(now: .now, includeHealthNewDay: includeHealth)
+        Task { await coordinator.send(text: text, mode: .tell, thread: thread, context: context) }
+        morningRoutineLastFiredDay = MorningRoutine.dayStamp(.now)
     }
 
     /// The scope control: a segmented picker matching the iPhone's tabs. All and

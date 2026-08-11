@@ -100,6 +100,50 @@ CI both run it). See the "Versioning" section of `bridge/README.md`.
   item is neither done nor out of the day, and what postponement takes out of a count is
   the app's badge, which the client computes over the rows it draws.
 
+## [App 1.0 (101)] - 2026-08-11
+
+### Added
+
+- **A "Good morning" button on the Chats tab**, on the iPhone and the Mac. The Studio-side
+  agent's start-of-day routine has always been started by opening a chat and typing a
+  greeting with the date in it — "good morning it's August 10th" — which fans out the
+  scanners over mail, chat, calendar and the vault and ends with one briefing. That typed
+  greeting is now a `cup.and.saucer` button in the Chats navigation bar (iPhone) and in the
+  sidebar toolbar next to New Chat (Mac).
+
+  **It opens the conversation**, unlike the Health tab's "Start new day", which fires and
+  returns. That one's output is a repainted dashboard the user is already looking at; this
+  one's output IS the conversation — a long briefing to read and then answer in place — so
+  the thread is pushed (or selected, on the Mac) with the turn already running.
+
+  **The health and diet refresh is an opt-in, and when opted into it runs FIRST.** The
+  confirmation offers `Start the day` (the leading action, and the common case) and
+  `Include health and diet first`. By default the prompt names the health and diet new-day
+  refresh and forbids it: that is the Health tab button's job and also runs as a scheduled
+  task, and without the clause one tap can roll the diet dashboard over twice in a morning.
+  When it IS opted into, that work goes at the head of the turn, finishes before start of
+  day begins, and reports the moment it lands on a line beginning `STILL RUNNING:` —
+  because until the rollover is done there is no logging food or exercise for the new day,
+  and start of day takes long enough that waiting it out is the whole problem. A test
+  asserts the ORDER of the two halves, not merely that both are present.
+
+  **The prompt carries the device's date**, spelled out as `Monday, August 10, 2026`,
+  formatted `en_US_POSIX` in the device's own time zone. The agent's idea of "today" comes
+  from a different machine in a different zone, and a phone set to Italian must not start
+  sending `lunedì`.
+
+  Both bodies clear the iOS health-keyword floor, so the turn still carries this morning's
+  weigh-in — which the routine's health check-in wants. A `morningRoutineLastFiredDay`
+  key, shared by both platforms, changes the confirmation's wording to note that this
+  device already ran it today; it never disables either action, because the routine may
+  equally have run from the other device or from a scheduled task.
+
+  New `MorningRoutine` in `JesseCore` holds the prompt and the confirmation copy, so the
+  two platforms send the same bytes and offer the same choice by construction. A new
+  `ChatsToolbarUITests` suite asserts the button is a real navigation-bar item rather than
+  one swallowed into a `.secondaryAction` overflow menu — the failure mode that shipped
+  the Health tab's button inert with CI green.
+
 ## [App 1.0 (100)] - 2026-08-11
 
 ### Added
