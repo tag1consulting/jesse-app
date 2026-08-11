@@ -14,6 +14,12 @@
       "question": "What was the South region's Q2 2026 revenue, and the full-year total?"
     },
     {
+      "file": "fixtures/multipage.pdf",
+      "kind": "multipage-pdf",
+      "ground_truth": ["PAGE ONE OF FOUR", "MP-2026-0001", "PAGE TWO OF FOUR", "EUR 1240.00", "PAGE THREE OF FOUR", "EUR 2203.00", "PAGE FOUR OF FOUR"],
+      "question": "How many pages does this document have, and what is the closing balance?"
+    },
+    {
       "file": "fixtures/chart.png",
       "kind": "chart-image",
       "ground_truth": ["bar"],

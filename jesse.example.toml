@@ -399,7 +399,8 @@ diet_keywords_extra = [
 #     JESSE_VISION_PDF_DPI=200         # rasterization DPI
 #     JESSE_VISION_MAX_TOKENS=4096     # helper output-token cap
 #     JESSE_VISION_TIMEOUT_SECS=60     # per-helper-call budget
-#     JESSE_PDFIUM_LIB=/path/to/libpdfium.{so,dylib}  # required for the PDF path
+#   The PDF path needs nothing installed: pages are rendered with macOS's own Core Graphics,
+#   and a HEIC photo is transcoded to PNG with `sips`. Both are macOS-only, by design.
 #
 # Vet a candidate helper before pairing it (no chat turn needed):
 #     vision-compare ./eval/vision/fixtures/statement.pdf paddleocr-vl,qwen3-vl

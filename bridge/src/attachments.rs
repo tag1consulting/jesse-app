@@ -499,8 +499,7 @@ pub fn prepare_attachments_for_harness(
                             StatusCode::INTERNAL_SERVER_ERROR,
                             format!(
                                 "attachment {label}: this harness cannot read a PDF directly, so \
-                                 the bridge must rasterize it, and that failed ({e}). Install \
-                                 libpdfium or set JESSE_PDFIUM_LIB to its path — or send the \
+                                 the bridge must rasterize it, and that failed ({e}). Send the \
                                  pages as images, or ask on a Claude Code model, whose Read tool \
                                  takes a PDF as-is."
                             ),
@@ -1033,9 +1032,11 @@ mod tests {
     /// Claude Code's `Read` takes a PDF directly (measured, unprompted, on 2.1.223), so it
     /// is passed through untouched. Codex never reaches `view_image` for one — it shells out
     /// to `pdftotext`/`strings`/`python3` — so the bridge must rasterize. That rasterizer is
-    /// `vision::rasterize_pdf`, which binds pdfium at RUNTIME; where pdfium is absent (this
-    /// deploy box, and CI) the route must fail LOUDLY with something actionable rather than
-    /// dropping the attachment, which is the half this asserts unconditionally.
+    /// `vision::rasterize_pdf`, on macOS's own Core Graphics. The staged bytes here are a
+    /// TRUNCATED PDF header, not a renderable document, so on macOS this exercises the
+    /// refusal path and on Linux the no-renderer path — either way the requirement is the
+    /// same and is what this asserts: LOUD, actionable, never a dropped attachment. Whole
+    /// real documents are rasterized in `vision`'s own tests, against a committed fixture.
     #[test]
     fn pdf_passes_through_on_claude_code_and_is_rasterized_or_refused_on_codex() {
         let cfg = test_config();
@@ -1050,7 +1051,7 @@ mod tests {
 
         let (s2, paths2) = staged("01-aa.pdf", PDF_BYTES);
         match prepare_attachments_for_harness(&cfg, &s2, &paths2, &CODEX_ATTACHMENTS) {
-            // pdfium present: every named path is a rendered page, never the PDF itself.
+            // Rendered: every named path is a page image, never the PDF itself.
             Ok(out) => {
                 assert!(!out.paths.is_empty(), "a rasterized PDF yields page images");
                 for p in &out.paths {
@@ -1061,11 +1062,11 @@ mod tests {
                     "the PDF itself is not named"
                 );
             }
-            // pdfium absent: LOUD, and the message must say what to do about it.
+            // Not rendered: LOUD, and the message must say what to do about it.
             Err((code, msg)) => {
                 assert_eq!(code, StatusCode::INTERNAL_SERVER_ERROR);
                 assert!(
-                    msg.contains("JESSE_PDFIUM_LIB") || msg.contains("libpdfium"),
+                    msg.contains("send the pages as images") || msg.contains("Claude Code"),
                     "a failure must name the fix, got: {msg}"
                 );
                 assert!(
@@ -1074,6 +1075,51 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// THE SAME SPLIT, ON A REAL FOUR-PAGE DOCUMENT.
+    ///
+    /// The test above stages a truncated header, so it can only assert the refusal half.
+    /// This one stages the committed multi-page fixture and pins what actually happens to a
+    /// whole document: Claude Code, which reads a PDF natively, is handed the FILE ITSELF —
+    /// no rasterization, no page images, byte-for-byte the path it always took — while Codex
+    /// gets one PNG per page, all four of them. macOS-gated because the rasterizer is.
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn a_whole_pdf_is_untouched_natively_and_fully_rasterized_otherwise() {
+        let cfg = test_config();
+        let pdf = std::fs::read(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../eval/vision/fixtures/multipage.pdf"
+        ))
+        .expect("the committed multi-page fixture");
+
+        let (s1, paths) = staged("01-aa.pdf", &pdf);
+        let native = prepare_attachments_for_harness(&cfg, &s1, &paths, &CLAUDE_CODE_ATTACHMENTS)
+            .expect("Claude Code reads a PDF directly");
+        assert_eq!(native.paths, paths, "the PDF itself, unconverted");
+        assert!(
+            native.notes.is_empty(),
+            "nothing to note when nothing is done"
+        );
+
+        let (s2, paths2) = staged("01-aa.pdf", &pdf);
+        let rasterized = prepare_attachments_for_harness(&cfg, &s2, &paths2, &CODEX_ATTACHMENTS)
+            .expect("Codex needs page images, and macOS can render them");
+        assert_eq!(rasterized.paths.len(), 4, "every page, not just the first");
+        for p in &rasterized.paths {
+            assert_eq!(p.extension().and_then(|e| e.to_str()), Some("png"));
+            assert!(
+                std::fs::read(p)
+                    .expect("page image")
+                    .starts_with(&[0x89, b'P', b'N', b'G']),
+                "each named path is a real PNG"
+            );
+        }
+        assert!(
+            rasterized.notes.is_empty(),
+            "four pages under the default cap is not truncation"
+        );
     }
 
     /// AN ATTACHMENT WITH NO ROUTE FAILS LOUDLY RATHER THAN VANISHING.

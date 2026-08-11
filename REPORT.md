@@ -113,22 +113,32 @@ bearer + `anthropic-version`, per-call timeout). Parses the Anthropic shape, wit
 fallback. Never logs the token, URL, or bytes. Every call is audited to stderr (helper,
 page, latency, tokens) so per-helper cost/quality is measurable after the fact.
 
-### Rasterization dependency — `pdfium-render`, and why
+### Rasterization — macOS's own renderer, no dependency at all
 
-`pdfium-render` over `mupdf` because it **binds to pdfium at runtime (`dlopen`)** rather
-than linking a C library at build time. Consequences:
+There is **no PDF crate**. `bridge/src/cgpdf.rs` calls Core Graphics' `CGPDF*` entry points
+directly and renders each page into an RGBA bitmap.
 
-- `cargo build` and CI compile with **no native lib present** — the bridge's
-  single-static-binary property holds for every deploy that never turns vision on.
-- Only a deploy that actually rasterizes needs libpdfium installed; `JESSE_PDFIUM_LIB`
-  points at it (else the system default).
-- Rasterization tests are env-gated behind `JESSE_PDFIUM_LIB`, so **CI stays green without
-  the lib** — and the path was verified end-to-end locally against a real pdfium (a
-  committed fixture PDF rasterizes to a valid PNG in ~0.4s).
+This replaced `pdfium-render`, which had been chosen because it binds libpdfium at runtime
+(`dlopen`) rather than linking a C library at build time. That reasoning was right about the
+build and wrong about the deploy: **libpdfium is not installed on a stock Mac**, so a PDF
+attachment failed with "pdfium library unavailable" unless somebody installed a native
+library by hand and set `JESSE_PDFIUM_LIB`. Nobody had. Consequences of the swap:
 
-`image` (pure Rust) encodes the rasterized pages to PNG — the wire format sent to the
-Anthropic image surface. HEIC is not yet accepted by that surface; it becomes an error view
-with a note (a transcode step is a follow-up).
+- No native install and no third-party crate; 21 crates left the dependency graph.
+- `sips(1)` was **not** an option: it converts only the first page of a PDF and has no
+  page-selection flag, so a rasterizer built on it silently drops pages 2..n.
+  `CGPDFDocument` addresses each page by number, which is the property this needs.
+- Rasterization tests run **ungated on macOS** against a committed four-page fixture
+  (`eval/vision/fixtures/multipage.pdf`), asserting the page count, each page's own pixel
+  size (including a `/Rotate 90` page) and that the images differ. The pdfium tests were
+  gated on `JESSE_PDFIUM_LIB` and therefore never ran anywhere. They are `cfg`'d to macOS
+  because the renderer is macOS-only by design and the bridge's CI job is Linux, where the
+  rasterizer returns `Err` — the same shape the pdfium-absent path returned.
+
+`image` (pure Rust) encodes the rendered pages to PNG — the wire format sent to the
+Anthropic image surface. **HEIC** is not accepted by that surface and is what every iPhone
+photo is, so it is transcoded to PNG with `sips` before the helper call (a single image is
+the case `sips` handles correctly); it used to be an error view.
 
 ### Handler integration
 
@@ -163,8 +173,11 @@ warnings` are **green**; `cargo audit` reports no advisories from the added crat
 - **Full live path over a mock `/v1/messages` server** (`integration.rs`, real loopback
   socket): the encoder sends a real base64 `image/png` block + instruction; `transcribe_input`
   and `preprocess` return a faithful view; frames are well-formed. A **PDF** variant
-  (rasterize → PNG page → mock helper → per-page view) runs when `JESSE_PDFIUM_LIB` is set.
-- **Rasterization** verified against real pdfium (env-gated; CI skips without the lib).
+  (rasterize → one PNG per page → mock helper → per-page view) and a **HEIC** variant
+  (transcode → `image/png` on the wire) run on macOS with nothing to configure.
+- **Rasterization** verified against the committed multi-page fixture: page count, per-page
+  pixel size, `/Rotate` handling, the page cap and its truncation flag, DPI, and refusal of
+  a PDF that will not open.
 
 **Deferred to the live pass** (needs a resolvable VL helper): the compare-harness numbers
 across registered helpers on the eval set, measured faithfulness, and measured latency/cost

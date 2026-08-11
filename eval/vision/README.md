@@ -12,6 +12,10 @@ transcription faithful?* and *what does it cost?*
   - `statement.pdf` — text-heavy PDF (an invoice). **Real text**, so its ground truth is a
     meaningful faithfulness check.
   - `table.pdf` — a values table PDF. **Real text.**
+  - `multipage.pdf` — four pages, three distinct page geometries and one `/Rotate 90` page.
+    **Real text**, one heading per page. This is also the rasterizer's regression fixture:
+    the bridge's own tests render it and assert the page count and each page's pixel size,
+    so a renderer that returns only page one cannot pass.
   - `chart.png`, `screenshot.png`, `photo.png` — **synthetic placeholders** (shapes/colors,
     little text). They exercise the image path end to end; swap in representative
     real-world images before the definitive fidelity call.
@@ -26,7 +30,8 @@ cargo run --bin vision-fixtures -- eval/vision/fixtures
 
 Both read the model registry from the bridge's env (the same `[[models]]` / `JESSE_MODEL_*`
 the running server reads), so what you measure is what production produces. The PDF path
-needs pdfium: set `JESSE_PDFIUM_LIB=/path/to/libpdfium.{so,dylib}`.
+needs nothing installed — pages are rendered with macOS's own Core Graphics — but it is
+macOS-only for the same reason.
 
 **Compare** one attachment across several helpers (side-by-side transcription + latency +
 cost):

@@ -1,7 +1,8 @@
 //! `vision-fixtures` — regenerate the fixed vision eval set under `eval/vision/fixtures/`.
 //! Deterministic and dependency-light: the PDFs are emitted with hand-computed xref
-//! offsets (valid, pdfium-loadable) and the images with the `image` crate. Run once and
-//! commit the output; `vision-eval` reads `eval/vision/manifest.json` against them.
+//! offsets (valid, and openable by any conforming reader) and the images with the `image`
+//! crate. Run once and commit the output; `vision-eval` reads `eval/vision/manifest.json`
+//! against them, and the bridge's rasterizer tests read `multipage.pdf` directly.
 //!
 //! The text/table PDFs carry REAL text, so their ground-truth strings are a meaningful
 //! faithfulness check. The chart/screenshot/photo PNGs are SYNTHETIC placeholders (shapes
@@ -71,6 +72,13 @@ fn main() {
     ]);
     write(dir.join("table.pdf"), &table);
 
+    // 2b. Multi-page PDF — the regression fixture for the rasterizer. Four pages, three
+    // distinct geometries, and a /Rotate 90 page: a renderer that only ever produces page
+    // one (`sips`) or that ignores /Rotate fails this on the page count and the sizes
+    // alone, without needing a model in the loop.
+    let multipage = multipage_pdf();
+    write(dir.join("multipage.pdf"), &multipage);
+
     // 3. Chart PNG — three labeled-by-color bars (no text; describable by shape/color).
     write_png(dir.join("chart.png"), bar_chart());
     // 4. Screenshot PNG — a UI-like mock: a title bar and two buttons.
@@ -78,7 +86,7 @@ fn main() {
     // 5. Photo PNG — a smooth diagonal gradient (a stand-in "photo").
     write_png(dir.join("photo.png"), gradient_photo());
 
-    println!("wrote 5 fixtures to {}", dir.display());
+    println!("wrote 6 fixtures to {}", dir.display());
 }
 
 fn write(path: std::path::PathBuf, bytes: &[u8]) {
@@ -137,6 +145,99 @@ fn text_pdf(lines: &[(f32, f32, f32, &str)]) -> Vec<u8> {
     }
     buf.extend_from_slice(
         format!("trailer\n<< /Size 6 /Root 1 0 R >>\nstartxref\n{xref_start}\n%%EOF\n").as_bytes(),
+    );
+    buf
+}
+
+/// Emit a FOUR-page PDF whose pages differ in size and rotation, each carrying its own
+/// heading. Same hand-computed xref as [`text_pdf`]; object numbering is
+/// `1` catalog, `2` page tree, `3` font, `4..` the page objects, then the content streams.
+fn multipage_pdf() -> Vec<u8> {
+    // (width, height, /Rotate, heading, second line)
+    let pages: [(f32, f32, i32, &str, &str); 4] = [
+        (
+            612.0,
+            792.0,
+            0,
+            "PAGE ONE OF FOUR - COVER",
+            "Letter portrait. Reference: MP-2026-0001.",
+        ),
+        (
+            595.0,
+            842.0,
+            0,
+            "PAGE TWO OF FOUR - DETAIL",
+            "A4 portrait. Amount carried forward: EUR 1240.00.",
+        ),
+        (
+            792.0,
+            612.0,
+            0,
+            "PAGE THREE OF FOUR - SUMMARY",
+            "Letter landscape. Closing balance: EUR 2203.00.",
+        ),
+        (
+            612.0,
+            792.0,
+            90,
+            "PAGE FOUR OF FOUR - APPENDIX",
+            "Letter portrait, rotated ninety degrees.",
+        ),
+    ];
+    let n = pages.len();
+
+    let mut bodies: Vec<String> = Vec::new();
+    let mut streams: Vec<Vec<u8>> = Vec::new();
+    bodies.push("<< /Type /Catalog /Pages 2 0 R >>".to_string());
+    let kids = (0..n)
+        .map(|i| format!("{} 0 R", 4 + i))
+        .collect::<Vec<_>>()
+        .join(" ");
+    bodies.push(format!("<< /Type /Pages /Kids [{kids}] /Count {n} >>"));
+    bodies.push("<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".to_string());
+    for (i, (w, h, rotate, _, _)) in pages.iter().enumerate() {
+        bodies.push(format!(
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 {w} {h}] /Rotate {rotate} \
+             /Resources << /Font << /F1 3 0 R >> >> /Contents {} 0 R >>",
+            4 + n + i
+        ));
+    }
+    for (_, h, _, heading, line) in pages.iter() {
+        let content = format!(
+            "BT /F1 22 Tf 72 {} Td ({}) Tj ET\nBT /F1 13 Tf 72 {} Td ({}) Tj ET\n",
+            h - 90.0,
+            escape_pdf_text(heading),
+            h - 120.0,
+            escape_pdf_text(line)
+        );
+        let bytes = content.into_bytes();
+        bodies.push(format!("<< /Length {} >>", bytes.len()));
+        streams.push(bytes);
+    }
+
+    let stream_first = bodies.len() - n;
+    let mut buf: Vec<u8> = Vec::new();
+    buf.extend_from_slice(b"%PDF-1.4\n");
+    let mut offsets = Vec::with_capacity(bodies.len());
+    for (i, body) in bodies.iter().enumerate() {
+        offsets.push(buf.len());
+        buf.extend_from_slice(format!("{} 0 obj\n{}\n", i + 1, body).as_bytes());
+        if i >= stream_first {
+            buf.extend_from_slice(b"stream\n");
+            buf.extend_from_slice(&streams[i - stream_first]);
+            buf.extend_from_slice(b"\nendstream\n");
+        }
+        buf.extend_from_slice(b"endobj\n");
+    }
+    let size = bodies.len() + 1;
+    let xref_start = buf.len();
+    buf.extend_from_slice(format!("xref\n0 {size}\n0000000000 65535 f \n").as_bytes());
+    for off in &offsets {
+        buf.extend_from_slice(format!("{off:010} 00000 n \n").as_bytes());
+    }
+    buf.extend_from_slice(
+        format!("trailer\n<< /Size {size} /Root 1 0 R >>\nstartxref\n{xref_start}\n%%EOF\n")
+            .as_bytes(),
     );
     buf
 }

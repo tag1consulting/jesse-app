@@ -1,0 +1,73 @@
+%PDF-1.4
+1 0 obj
+<< /Type /Catalog /Pages 2 0 R >>
+endobj
+2 0 obj
+<< /Type /Pages /Kids [4 0 R 5 0 R 6 0 R 7 0 R] /Count 4 >>
+endobj
+3 0 obj
+<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>
+endobj
+4 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Rotate 0 /Resources << /Font << /F1 3 0 R >> >> /Contents 8 0 R >>
+endobj
+5 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595 842] /Rotate 0 /Resources << /Font << /F1 3 0 R >> >> /Contents 9 0 R >>
+endobj
+6 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 792 612] /Rotate 0 /Resources << /Font << /F1 3 0 R >> >> /Contents 10 0 R >>
+endobj
+7 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Rotate 90 /Resources << /Font << /F1 3 0 R >> >> /Contents 11 0 R >>
+endobj
+8 0 obj
+<< /Length 129 >>
+stream
+BT /F1 22 Tf 72 702 Td (PAGE ONE OF FOUR - COVER) Tj ET
+BT /F1 13 Tf 72 672 Td (Letter portrait. Reference: MP-2026-0001.) Tj ET
+
+endstream
+endobj
+9 0 obj
+<< /Length 138 >>
+stream
+BT /F1 22 Tf 72 752 Td (PAGE TWO OF FOUR - DETAIL) Tj ET
+BT /F1 13 Tf 72 722 Td (A4 portrait. Amount carried forward: EUR 1240.00.) Tj ET
+
+endstream
+endobj
+10 0 obj
+<< /Length 139 >>
+stream
+BT /F1 22 Tf 72 522 Td (PAGE THREE OF FOUR - SUMMARY) Tj ET
+BT /F1 13 Tf 72 492 Td (Letter landscape. Closing balance: EUR 2203.00.) Tj ET
+
+endstream
+endobj
+11 0 obj
+<< /Length 132 >>
+stream
+BT /F1 22 Tf 72 702 Td (PAGE FOUR OF FOUR - APPENDIX) Tj ET
+BT /F1 13 Tf 72 672 Td (Letter portrait, rotated ninety degrees.) Tj ET
+
+endstream
+endobj
+xref
+0 12
+0000000000 65535 f 
+0000000009 00000 n 
+0000000058 00000 n 
+0000000133 00000 n 
+0000000203 00000 n 
+0000000339 00000 n 
+0000000475 00000 n 
+0000000612 00000 n 
+0000000750 00000 n 
+0000000930 00000 n 
+0000001119 00000 n 
+0000001310 00000 n 
+trailer
+<< /Size 12 /Root 1 0 R >>
+startxref
+1494
+%%EOF

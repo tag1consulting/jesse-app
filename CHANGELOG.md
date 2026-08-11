@@ -15,6 +15,90 @@ CI both run it). See the "Versioning" section of `bridge/README.md`.
 
 ## [Unreleased]
 
+## [Bridge 0.74.0] - 2026-08-11
+
+### Fixed
+
+- **A PDF attachment failed on every stock Mac, and an iPhone photo failed on every text
+  model. Root cause: the PDF rasterizer needed a native library that is not installed
+  anywhere, and the vision surface was handed HEIC, which it does not accept.**
+
+  Both defects live in the vision-helper layer (`vision.rs`) — the path a hosted TEXT model
+  takes when a turn carries attachments and the model is paired with a vision helper. That
+  layer is keyed to the MODEL, so both harnesses inherited both bugs.
+
+  - **PDF.** `rasterize_pdf` used `pdfium-render`, chosen because it binds libpdfium at
+    RUNTIME (`dlopen`) so no native library was needed to BUILD. True, and beside the point:
+    libpdfium is not present on a stock Mac, so at RUN time the bind failed and every PDF
+    came back as `pdfium library unavailable (…); set JESSE_PDFIUM_LIB to libpdfium's path`.
+    Nobody had installed it, on the Studio or anywhere else, so the PDF path had never
+    worked outside a box someone had hand-prepared. The tests could not have caught it: they
+    were gated on `JESSE_PDFIUM_LIB` being set, so they skipped in CI and skipped locally.
+  - **HEIC.** The image branch refused anything `anthropic_media_type` did not map, and the
+    Anthropic image surface takes PNG/JPEG/GIF/WebP but not HEIC. A photo straight out of an
+    iPhone camera roll IS HEIC and the composer uploads the picked photo's own bytes
+    verbatim, so the single most ordinary upload the app can produce answered with
+    `attachment type '.heic' is not yet supported`.
+
+### Changed
+
+- **PDF pages are now rendered by macOS itself** (`bridge/src/cgpdf.rs`, new): a direct FFI
+  binding to Core Graphics' `CGPDF*` and `CGBitmapContext*` entry points. Nothing to install,
+  no third-party crate, and it is present on every Mac at every version. Each page is drawn
+  onto opaque white at the requested DPI, honouring the crop box and `/Rotate`, then encoded
+  to PNG by the `image` crate exactly as before. `rasterize_pdf` keeps its signature, its
+  return shape and its `spawn_blocking` caller.
+
+  **`sips` is deliberately NOT the mechanism.** It is the obvious shell-out and it converts
+  only the FIRST page of a PDF, with no page-selection flag — so a rasterizer built on it
+  silently drops pages 2..n of every statement, letter and scanned form. `CGPDFDocument`
+  addresses pages individually, which is the property this layer actually needs.
+
+  Two bounds the pdfium version did not have: a page whose geometry would exceed 40 MP is
+  refused rather than allocated (a PDF declares its own page size and an attachment is
+  untrusted input), and a zero-page document is an `Err` rather than an empty success that
+  `prepare_attachments_for_harness` would have turned into a silently dropped attachment.
+
+- **A HEIC image is transcoded to PNG before the helper call**, with `sips` — the single
+  image case it handles correctly. The bytes round-trip through a 0700 scratch dir removed
+  on both the success and the failure path. The sniff and the whitelist are unchanged; every
+  other image type still goes to the helper as its own bytes, untouched.
+
+- **`prepare_attachments_for_harness`'s PDF failure message** no longer tells the operator to
+  install libpdfium; it names the two real remedies (send the pages as images, or ask on a
+  model whose `Read` takes a PDF).
+
+### Removed
+
+- **`pdfium-render`**, and with it 21 crates from the dependency graph (`libloading`,
+  `chrono`, `itertools`, the `windows-*` family, the wasm shims). `image` stays: it encodes
+  the rendered pages and decodes/downscales oversized raster inputs.
+- **`JESSE_PDFIUM_LIB`** — no longer read anywhere. Removed from `jesse.example.toml`,
+  `eval/vision/README.md` and `REPORT.md`.
+
+### Testing
+
+- **The rasterizer tests now RUN.** They are `cfg`'d to macOS (the renderer is macOS-only by
+  design and the bridge's CI job is Linux, where it returns `Err` — the same shape the
+  pdfium-absent path returned) and need no environment variable, which is the difference from
+  the pdfium tests that skipped everywhere.
+- **New fixture `eval/vision/fixtures/multipage.pdf`** — four pages, three distinct page
+  geometries and a `/Rotate 90` page, emitted by `vision-fixtures` alongside the rest. The
+  tests assert the page count, each page's own pixel size, that the four images are not
+  byte-identical, the page cap and its truncation flag, DPI (150 and 72), and refusal of a
+  PDF that will not open. A first-page-only renderer fails on the count and the sizes alone.
+- **`the_vision_path_is_identical_on_both_harnesses`** runs the same four-page PDF and the
+  same HEIC photo through `preprocess` twice, changing only `ActiveModel::harness`, and
+  requires the framed blocks to be byte-identical — so a future per-harness attachment branch
+  cannot land quietly.
+- **`a_whole_pdf_is_untouched_natively_and_fully_rasterized_otherwise`** pins the other half:
+  Claude Code, which reads a PDF natively, is handed the file itself with no rasterization,
+  while Codex gets one real PNG per page, all four.
+- Verified on the Mac against real inputs, not only fixtures: a genuine seven-page A4 PDF
+  rendered all seven pages at 1240x1754 in 86 ms (and reported `truncated` correctly under a
+  cap of three), and a 4032x3024 HEIC out of the iPhone camera roll transcoded to PNG in
+  521 ms.
+
 ## [Bridge 0.73.0] - 2026-08-10
 
 ### Added
