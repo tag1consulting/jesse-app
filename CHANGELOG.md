@@ -165,6 +165,70 @@ CI both run it). See the "Versioning" section of `bridge/README.md`.
   item is neither done nor out of the day, and what postponement takes out of a count is
   the app's badge, which the client computes over the rows it draws.
 
+## [App 1.0 (102)] - 2026-08-11
+
+### Added
+
+- **Today on the Apple Watch**: the day's short list on the wrist, and check-off from it.
+  A second page beside the existing talk screen shows the standing lead item first, then
+  open `Do Now` work capped at ten, then one footer line for everything else ("6 more on
+  your phone · 2 done today"). Tapping a row checks it off.
+
+  **The watch still never talks to the bridge and still holds no token.** Everything
+  relays through the phone over WatchConnectivity, exactly as the chat turns already do.
+  The phone pushes a compact summary with `updateApplicationContext` after every snapshot
+  it fetches or mutates — latest-wins, background-delivered, retained for a watch app that
+  launches hours later, which is precisely the semantics of "here is the day now". Checks
+  come back the other way over `sendMessage` when the phone is listening and
+  `transferUserInfo` when it is not, and the phone applies them through
+  `TodayDashboardModel.check` — the same call the Today tab makes, so the wrist inherits
+  the ETag handling, the optimistic overlay and the `409`/`410`/`412`/`428` recovery
+  rather than getting a second, weaker copy of them.
+
+  **No evidence entry on the wrist**, deliberately. Typing a note is a phone and Mac
+  affordance and an evidence-less check is fully valid downstream — the bridge writes no
+  sub-line for one. Moving, Discuss and Propagate are likewise phone-and-Mac only.
+
+  **A local check is a claim, not a fact**, because the watch cannot ask whether it
+  landed. It renders as pending (or "waiting for your phone" when the intent went onto the
+  reliable queue) until the next pushed context either agrees with it, contradicts it, or
+  drops the row — which for a ticked item is what success looks like, so the row becomes a
+  settled receipt at the foot of the list instead of vanishing under the finger. A context
+  that still shows the row open does NOT spring the box back open: that is a fetch that
+  raced the write, and the claim stands. None of this is persisted; a relaunched watch
+  starts from the retained context, which is the only thing that was ever authoritative.
+
+- **A Today complication and accessory widget** (circular, corner, inline, rectangular):
+  open `Do Now` count plus the top lead item. A new watchOS widget extension embedded in
+  the watch app, fed through an app group (`group.com.tag1.Jesse`) that the watch app
+  writes on every push before calling `WidgetCenter.reloadAllTimelines()`. The count is
+  carried on the wire rather than counted from the rows, because the rows are capped at
+  ten and a complication that undercounts is worse than none. The timeline has no refresh
+  policy and exactly two entries: now, and the instant the reading stops being today's.
+
+- **A stale guard.** A context the phone pushed more than eighteen hours ago renders under
+  a "From 2026-08-11 / Open Jesse on your phone to refresh" banner instead of quietly
+  passing for today — the failure being prevented is a wrist showing yesterday's Do Now
+  list, perfectly formatted, after a night with the phone in another room. The flag is
+  STORED and recomputed at the two moments that can change it (a fresh push, and the app
+  becoming active); computed over `now()` it would have read correctly and never fired,
+  because nothing would publish and SwiftUI would never redraw. There is no timer.
+
+### Fixed
+
+- **A wrist check that arrived before the phone's UI existed was dropped.** `WCSession`
+  activates in `didFinishLaunchingWithOptions` and a queued intent is delivered right
+  after, a beat before the view that owns the day model appears — so the ordinary case,
+  the one the reliable queue exists for, was the one that silently did nothing. Intents
+  are now held (bounded, FIFO) and flushed the moment the handler is wired.
+
+### Changed
+
+- The phone's two watch-to-phone transports (`sendMessage` and `transferUserInfo`) now
+  share ONE dispatcher. Three payload shapes ride those two paths and each decoder rejects
+  the others' dictionaries; dispatching in one place is what stops a payload being
+  understood on one transport and silently dropped on the other.
+
 ## [App 1.0 (101)] - 2026-08-11
 
 ### Added

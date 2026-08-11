@@ -1,5 +1,6 @@
 import Foundation
 import WatchConnectivity
+import WidgetKit
 
 // The watch half of the relay: sends a spoken turn to the phone over
 // WatchConnectivity and surfaces the phone's reply. It NEVER talks to the bridge
@@ -16,11 +17,14 @@ import WatchConnectivity
 // (immediacy); `WatchTalkModel` de-dupes by requestId so a reply renders once.
 
 @MainActor
-final class WatchConnectivityClient: NSObject, WatchRequestSending {
+final class WatchConnectivityClient: NSObject, WatchRequestSending, WatchTodaySending {
     static let shared = WatchConnectivityClient()
 
     var onReply: ((WatchReply) -> Void)?
     var onRegistered: ((WatchRegistered) -> Void)?
+    /// The phone pushed a fresh day. Latest-wins, so this always carries a whole
+    /// summary and never a delta.
+    var onTodayContext: ((WatchTodaySummary) -> Void)?
 
     private var session: WCSession?
 
@@ -32,6 +36,62 @@ final class WatchConnectivityClient: NSObject, WatchRequestSending {
         s.delegate = self
         s.activate()
         session = s
+        // The RETAINED context, read at activation rather than waited for.
+        //
+        // `updateApplicationContext` keeps its latest payload on the receiving side,
+        // so a watch app launched hours after the last push already has the day —
+        // but only if it asks. Without this the Today screen would render its empty
+        // state on every launch and stay there until the phone happened to fetch
+        // again, which on a wrist is most of the time.
+        let retained = s.receivedApplicationContext
+        if !retained.isEmpty, let summary = WatchTodaySummary.decode(retained) {
+            adopt(summary)
+        }
+    }
+
+    /// Take a pushed day: hand it to the screen, leave it where the complication can
+    /// find it, and ask WidgetKit to redraw.
+    ///
+    /// The store write and the reload are HERE rather than in `WatchTodayModel`
+    /// because the model is compiled into the phone too, and a phone reloading watch
+    /// complications would be reaching across a boundary it has no business
+    /// crossing. This file is watch-only.
+    private func adopt(_ summary: WatchTodaySummary) {
+        onTodayContext?(summary)
+        WatchTodayStore.save(summary)
+        WidgetCenter.shared.reloadAllTimelines()
+    }
+
+    /// Send one check made on the wrist.
+    ///
+    /// The SAME transport ladder a relayed chat turn climbs, and for the same
+    /// reasons: `sendMessage` when the phone is listening, because a check the user
+    /// can watch confirm within a second is the difference between trusting the
+    /// wrist and reaching for the phone to be sure; `transferUserInfo` otherwise,
+    /// because a check is a WRITE and must not evaporate because the phone was in
+    /// another room. The error handler covers the third case — reachable a moment
+    /// ago, gone by the time the message went out.
+    ///
+    /// Duplicates are free: every intent carries an `intentId` and the phone
+    /// de-duplicates on it, exactly as the chat wire does with `requestId`.
+    func send(_ check: WatchTodayCheck) {
+        guard let session else { return }
+        if session.isReachable {
+            session.sendMessage(check.encode(), replyHandler: nil) { [weak self] _ in
+                Task { @MainActor in self?.queue(check) }
+            }
+            return
+        }
+        queue(check)
+    }
+
+    /// The reliable half of `send(_ check:)`. A method rather than an inline call
+    /// because `transferUserInfo` RETURNS a non-`Sendable` transfer handle, and
+    /// making it the last expression of a `@MainActor` closure would carry that
+    /// handle across the isolation boundary. Discarding it here keeps the hop
+    /// carrying nothing but the `Sendable` intent.
+    private func queue(_ check: WatchTodayCheck) {
+        _ = session?.transferUserInfo(check.encode())
     }
 
     func send(_ request: WatchRequest) {
@@ -114,5 +174,14 @@ extension WatchConnectivityClient: WCSessionDelegate {
     // Reliable/background reply path (source of truth).
     nonisolated func session(_ session: WCSession, didReceiveUserInfo userInfo: [String: Any]) {
         deliver(WatchMessage.decode(userInfo))
+    }
+
+    // The pushed day. Decoded off the main actor (the decoder is `nonisolated` and
+    // returns a `Sendable` value) so the non-Sendable dictionary never crosses the
+    // isolation boundary — the same discipline `deliver` uses for the chat wire.
+    nonisolated func session(_ session: WCSession,
+                             didReceiveApplicationContext applicationContext: [String: Any]) {
+        guard let summary = WatchTodaySummary.decode(applicationContext) else { return }
+        Task { @MainActor in self.adopt(summary) }
     }
 }
