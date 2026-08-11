@@ -15,6 +15,21 @@ CI both run it). See the "Versioning" section of `bridge/README.md`.
 
 ## [Unreleased]
 
+## [Bridge 0.74.1] - 2026-08-11
+
+### Fixed
+
+- **`cgpdf::tests::empty_input_is_an_error_not_a_panic` failed on Linux CI.** Root cause: the
+  empty-input check sat INSIDE the macOS half of `render_pdf_pages`, so on any other target
+  empty bytes fell through to the "not running on macOS" message and the test's assertion on
+  the wording did not hold. The check now runs above the platform split, where it belongs —
+  "there is nothing to render" is not a macOS fact — so the message is the same everywhere
+  and the test is meaningful on both.
+
+  Found by CI rather than locally because the pre-push check of the non-macOS path only
+  compiled and linted it (`cargo check`, `cargo clippy` with the `cfg` forced off) and never
+  RAN its tests. It does now.
+
 ## [Bridge 0.74.0] - 2026-08-11
 
 ### Fixed

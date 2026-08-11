@@ -61,13 +61,19 @@ pub fn render_pdf_pages(
     dpi: u32,
     page_cap: usize,
 ) -> Result<(Vec<RenderedPage>, usize), String> {
+    // Checked HERE rather than in the macOS half so that "there is nothing to render" reads
+    // the same on every target: a caller (and a test) sees one message for empty input, not
+    // one on macOS and the no-renderer message everywhere else.
+    if pdf.is_empty() {
+        return Err("the PDF is empty".to_string());
+    }
     #[cfg(target_os = "macos")]
     {
         mac::render(pdf, dpi, page_cap)
     }
     #[cfg(not(target_os = "macos"))]
     {
-        let _ = (pdf, dpi, page_cap);
+        let _ = (dpi, page_cap);
         Err(
             "PDF rendering needs macOS's Core Graphics; this bridge is not running on macOS"
                 .to_string(),
@@ -177,9 +183,6 @@ mod mac {
         dpi: u32,
         page_cap: usize,
     ) -> Result<(Vec<RenderedPage>, usize), String> {
-        if pdf.is_empty() {
-            return Err("the PDF is empty".to_string());
-        }
         // SAFETY: the provider borrows `pdf`, which outlives every CG call below; the NULL
         // release callback is the documented way to say "the caller owns these bytes". Both
         // objects are released before this function returns, so nothing outlives the borrow.
