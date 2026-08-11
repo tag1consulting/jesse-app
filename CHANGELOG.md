@@ -15,6 +15,43 @@ CI both run it). See the "Versioning" section of `bridge/README.md`.
 
 ## [Unreleased]
 
+### Changed
+
+- **CI: the hosted macOS job no longer runs on pull requests.** GitHub's macOS
+  runners bill at 10x the Linux rate, and the `ios-app` job — four uncached
+  `xcodebuild` builds and three booted simulators, on every PR and every push to
+  main — was essentially the whole Actions bill. It moved out of `ci.yml` into a
+  new `.github/workflows/ios-ci.yml` that runs on `schedule` (06:00 UTC daily)
+  and `workflow_dispatch` only. Its steps are unchanged: same simulator
+  resolution, same warnings-as-errors, same coverage and result-bundle
+  reporting.
+
+  A cheap `ubuntu-latest` **gate** job runs first and answers, from git history
+  alone (no stored state), whether any commit in the last 25 hours touched
+  `Jesse/` or `JesseKit/`. If none did, the macOS runner never starts — a quiet
+  day, or a day of pure Rust/docs work, costs zero macOS minutes. A manual
+  dispatch always runs regardless of the gate. The 25h window is deliberately
+  wider than the 24h cron so a delayed run leaves no blind spot.
+
+  The **bridge job is untouched** and still gates every PR and every push to
+  main on Linux.
+
+- **The app's pre-merge gate is now local and enforced by the pre-push hook.**
+  New `scripts/local-ci-macos.sh` runs the same checks the macOS job runs, in the
+  same order and with the same flags (JesseKit `swift build`/`swift test` with
+  `-warnings-as-errors`, then iOS, watch and Mac build + test with
+  `CODE_SIGNING_ALLOWED=NO`, plus the "every suite actually ran a test"
+  assertion). It stops at the first failure and prints a PASS/FAIL summary.
+  `scripts/hooks/pre-push` runs it — after the existing version guard, and only
+  when the push touches `Jesse/` or `JesseKit/` — and blocks the push on failure.
+  Escape hatches: `git push --no-verify` skips everything, `JESSE_SKIP_MAC_CI=1`
+  skips only the Swift suite and keeps the version guard.
+
+  **The trade, stated plainly:** iOS breakage can now reach `main` and sit there
+  until the next nightly. The stronger alternative, if that is unacceptable, is a
+  self-hosted macOS runner, which restores the per-PR gate at zero GitHub
+  minutes; putting `pull_request:` back restores the bill with it.
+
 ## [Bridge 0.75.0] - 2026-08-11
 
 ### Added

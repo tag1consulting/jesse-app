@@ -1,0 +1,410 @@
+name: iOS CI
+
+# The Swift half of CI: the JesseKit package, the iOS app, the watch app and the
+# Mac app. It lives in its own file because it no longer shares a trigger with
+# the Linux job in ci.yml.
+#
+# WHY IT IS NOT ON PULL REQUESTS. GitHub's hosted macOS runners bill at 10x the
+# Linux rate, and this job is the whole bill: four uncached xcodebuild builds
+# and three booted simulators, on every PR and every push to main. Running it
+# per-PR was ~all of this repo's Actions spend, for a gate that a Mac already
+# sitting on the developer's desk can run for free.
+#
+# WHAT REPLACES IT AS THE GATE. `scripts/local-ci-macos.sh` runs these exact
+# checks, in this order, locally; the pre-push hook installed by
+# `scripts/install-hooks.sh` runs it and refuses the push on failure. That is
+# the pre-merge check now. This workflow is the BACKSTOP: it catches what a
+# `git push --no-verify` (or a push from a machine without Xcode) let through,
+# at most a day later.
+#
+# THE COST OF THAT TRADE, stated plainly: iOS breakage can reach main and sit
+# there until the next nightly. If that is ever unacceptable, the fix is a
+# self-hosted macOS runner (a Mac mini registered to the repo) — it restores the
+# per-PR gate at zero GitHub minutes. Do not restore `pull_request:` here
+# without also restoring the bill.
+#
+# SKIPPING. The `gate` job below decides whether the macOS runner starts at all:
+# on a quiet day, or a day of pure Rust/docs/infra work, nothing iOS-relevant
+# has landed and no macOS minute is spent. A manual `workflow_dispatch` always
+# runs, gate or no gate.
+
+on:
+  schedule:
+    # 06:00 UTC daily. The gate's lookback window (25h) is deliberately wider
+    # than this 24h interval so a delayed or skipped run leaves no blind spot.
+    - cron: '0 6 * * *'
+  workflow_dispatch:
+
+# No cancel-in-progress: there is nothing to supersede on a nightly, and a
+# half-finished macOS run is minutes already paid for. The group exists only so
+# two nightlies (or a nightly and a manual dispatch) can never overlap and
+# double the bill.
+concurrency:
+  group: ios-ci
+  cancel-in-progress: false
+
+jobs:
+  # A few seconds of Linux deciding whether to spend minutes of macOS.
+  #
+  # Stateless by construction: the question "did anything iOS-relevant change
+  # since the last run?" is answered from git history alone, with no stored
+  # cursor, no artifact and no last-successful-SHA lookup to go stale or need
+  # cleaning up.
+  gate:
+    name: gate (any iOS-relevant commits in the window?)
+    runs-on: ubuntu-latest
+    outputs:
+      should_run: ${{ steps.check.outputs.should_run }}
+    steps:
+      # fetch-depth: 0 — `git log --since` needs history, and the default depth-1
+      # checkout has exactly one commit to look at, which would make this gate
+      # answer "false" every single night. (ci.yml's version-guard was broken in
+      # precisely this way once; see its checkout comment.)
+      #
+      # `ref: main` because the question this job asks is about main's history.
+      # A manual dispatch from a branch therefore reads the "wrong" ref here, and
+      # that is harmless: the `if` below ignores this job's answer on dispatch,
+      # and ios-app's own checkout (unpinned) takes the dispatched ref, so
+      # dispatching from a branch really does test that branch.
+      - uses: actions/checkout@v7
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Any iOS-relevant commits in the last 25 hours?
+        id: check
+        run: |
+          set -euo pipefail
+          # THE iOS-RELEVANT PATH SET. Verified against the tree, not assumed:
+          #   Jesse/     the app, watch app, widgets, and all three test targets
+          #              — this also covers Jesse/Jesse.xcodeproj/project.pbxproj,
+          #              so no separate '*.pbxproj' glob is needed, and there is
+          #              no .xcworkspace in this repo to match.
+          #   JesseKit/  the local SwiftPM package (JesseCore/JesseNetworking/
+          #              JesseConversations) that the first step below builds.
+          # Plus the two files that define this check itself, so a change to the
+          # workflow or the local script gets exercised rather than trusted.
+          #
+          # Everything else — bridge/, eval/, scripts/, docs — is Rust or infra
+          # that ci.yml already gated on Linux, and is exactly what should never
+          # cost a macOS minute.
+          #
+          # --full-history: without it, git's default history simplification can
+          # drop a commit that touched these paths when a merge commit is
+          # involved. Erring toward running is the right direction for a gate.
+          commits="$(git log --since='25 hours ago' --full-history --oneline -- \
+            'Jesse/' 'JesseKit/' \
+            '.github/workflows/ios-ci.yml' 'scripts/local-ci-macos.sh')"
+
+          if [ -n "$commits" ]; then
+            echo "should_run=true" >> "$GITHUB_OUTPUT"
+            n="$(printf '%s\n' "$commits" | wc -l | tr -d ' ')"
+            echo "${n} iOS-relevant commit(s) in the window:"
+            printf '%s\n' "$commits"
+            {
+              echo "### iOS CI will run — ${n} iOS-relevant commit(s) in the last 25h"
+              echo '```'
+              printf '%s\n' "$commits"
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "should_run=false" >> "$GITHUB_OUTPUT"
+            echo "No iOS-relevant commits in the last 25 hours — skipping the macOS runner."
+            echo "### iOS CI skipped — no iOS-relevant commits in the last 25h" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+  ios-app:
+    name: ios-app (build, test, watch, mac, coverage)
+    needs: gate
+
+    # The gate decides scheduled runs; a manual dispatch overrides it. The OR is
+    # the whole point of the `workflow_dispatch` half: "nothing changed" is a
+    # reason to skip a nightly, never a reason to refuse a human who asked.
+    if: needs.gate.outputs.should_run == 'true' || github.event_name == 'workflow_dispatch'
+
+    # NO BUILD CACHE HERE, DELIBERATELY. Caching SwiftPM/DerivedData (keyed on
+    # Package.resolved + the pbxproj) would cut minutes off a run, and it was
+    # considered and rejected: this job is now the ONLY automated verification
+    # the app gets, and a restored DerivedData that Xcode wrongly judges current
+    # produces a GREEN run for code that does not build. A slow correct backstop
+    # beats a fast one that can lie. The economics also barely move — the gate
+    # below means this runs at most once a day and often not at all, so the
+    # saving is small and the failure mode is the expensive one. (The 10x saving
+    # already came from dropping the per-PR trigger, not from build time.)
+    #
+    # The app targets iOS 26, whose simulators only run on a macOS 26 (Tahoe)
+    # host — the macos-15 image can build but xcodebuild refuses to offer the
+    # iOS 26 simulators as destinations there.
+    runs-on: macos-26
+    defaults:
+      run:
+        working-directory: Jesse
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Select Xcode
+        uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: latest-stable
+
+      - name: Show toolchain
+        run: |
+          xcodebuild -version
+          xcode-select -p
+
+      # JesseKit local package: the JesseCore model layer AND the JesseNetworking
+      # bridge-client layer (config, wire types, the SSE parser, endpoint construction,
+      # error mapping, the diet snapshot models, and the one concrete client both apps
+      # share). `swift build`/`swift test` cover every target in the package, so this one
+      # step builds and tests both libraries and both their test suites. Built with
+      # warnings-as-errors symmetric with the app build below. These targets depend on
+      # SwiftData/Security (Apple-only), so this runs on the macOS runner rather than the
+      # Linux bridge job. Runs first for quick feedback before the longer app build/test.
+      - name: Build and test JesseKit package (JesseCore + JesseNetworking)
+        working-directory: ${{ github.workspace }}/JesseKit
+        run: |
+          set -euo pipefail
+          swift build -Xswiftc -warnings-as-errors
+          swift test -Xswiftc -warnings-as-errors
+
+      - name: Resolve simulator destination
+        id: sim
+        run: |
+          set -euo pipefail
+          # A hardcoded device name (the README used to say "iPhone 17") may not
+          # exist on the runner. Rather than hardcode one, pick the newest available
+          # iOS runtime and create a fresh iPhone simulator from one of that
+          # runtime's own supported device types. Creating the device (instead
+          # of trusting whatever `simctl` happens to list) guarantees xcodebuild
+          # has a concrete, matching destination id to build and test against.
+          xcrun simctl list runtimes available
+          read -r RUNTIME_ID RUNTIME_VER DEVTYPE DEV_NAME < <(
+            xcrun simctl list runtimes --json | jq -r '
+              .runtimes
+              | map(select(.platform == "iOS" and .isAvailable))
+              | map({
+                  id: .identifier,
+                  ver: .version,
+                  dt: (.supportedDeviceTypes | map(select(.productFamily == "iPhone")) | last)
+                })
+              | map(select(.dt != null))
+              | sort_by(.ver | split(".") | map(tonumber))
+              | last
+              | "\(.id) \(.ver) \(.dt.identifier) \(.dt.name)"
+            '
+          )
+          if [ -z "${RUNTIME_ID:-}" ] || [ -z "${DEVTYPE:-}" ]; then
+            echo "No available iOS runtime with an iPhone device type on the runner" >&2
+            exit 1
+          fi
+          UDID=$(xcrun simctl create "ci-iphone" "$DEVTYPE" "$RUNTIME_ID")
+          xcrun simctl boot "$UDID" || true
+          DEST="platform=iOS Simulator,id=${UDID}"
+          echo "Resolved: ${DEV_NAME} (iOS ${RUNTIME_VER}) -> ${DEST}"
+          echo "destination=${DEST}" >> "$GITHUB_OUTPUT"
+          # Pin the build's deployment target to the runtime we'll actually run
+          # on, so the app installs regardless of which iOS the runner ships.
+          echo "deployment_target=${RUNTIME_VER}" >> "$GITHUB_OUTPUT"
+
+      # Warnings are errors for PRODUCTION code — the Swift-side counterpart of the
+      # bridge's `cargo clippy --all-targets -- -D warnings`, though narrower than it:
+      # that one covers the bridge's test code too. The `build` action compiles the app and
+      # its embedded dependencies (watch app + widget extension) but not the
+      # XCTest bundle, so this fails on any warning in shipping code while leaving
+      # the (separately accumulated) test-only Swift-6-mode warnings out of scope.
+      # The app builds warning-free today, so this is green immediately.
+      - name: Build
+        run: |
+          set -euo pipefail
+          xcodebuild build \
+            -scheme Jesse \
+            -destination "${{ steps.sim.outputs.destination }}" \
+            -derivedDataPath build/DerivedData \
+            IPHONEOS_DEPLOYMENT_TARGET=${{ steps.sim.outputs.deployment_target }} \
+            SWIFT_TREAT_WARNINGS_AS_ERRORS=YES \
+            SWIFT_SUPPRESS_WARNINGS=NO \
+            CODE_SIGNING_ALLOWED=NO
+
+      - name: Test
+        run: |
+          set -euo pipefail
+          xcodebuild test \
+            -scheme Jesse \
+            -destination "${{ steps.sim.outputs.destination }}" \
+            -derivedDataPath build/DerivedData \
+            -resultBundlePath build/Result.xcresult \
+            -enableCodeCoverage YES \
+            IPHONEOS_DEPLOYMENT_TARGET=${{ steps.sim.outputs.deployment_target }} \
+            CODE_SIGNING_ALLOWED=NO
+
+      - name: Report test count
+        if: always()
+        run: |
+          set -euo pipefail
+          if [ ! -d build/Result.xcresult ]; then
+            echo "No result bundle produced" >&2
+            exit 1
+          fi
+          summary="$(xcrun xcresulttool get test-results summary --path build/Result.xcresult)"
+          total=$(printf '%s' "$summary" | jq -r '.totalTestCount')
+          passed=$(printf '%s' "$summary" | jq -r '.passedTests')
+          failed=$(printf '%s' "$summary" | jq -r '.failedTests')
+          skipped=$(printf '%s' "$summary" | jq -r '.skippedTests')
+          echo "JesseTests: total=${total} passed=${passed} failed=${failed} skipped=${skipped}"
+          echo "### ios-app: ${total} tests (passed ${passed}, failed ${failed}, skipped ${skipped})" >> "$GITHUB_STEP_SUMMARY"
+          if [ "${total}" -le 0 ]; then
+            echo "Expected the test suite to run at least one test, got ${total}" >&2
+            exit 1
+          fi
+
+      # Report-only, non-gating: print per-target coverage so a floor can be
+      # chosen later. Never fails the job.
+      - name: Coverage summary (iOS, report-only)
+        if: always()
+        continue-on-error: true
+        run: |
+          set -uo pipefail
+          if [ ! -d build/Result.xcresult ]; then
+            echo "No result bundle to read coverage from"; exit 0
+          fi
+          echo "### ios-app coverage (by target)" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          xcrun xccov view --report --only-targets build/Result.xcresult | tee -a "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+
+      # --- Watch app: the JesseWatchTests suite previously ran only locally.
+      # Resolve a watchOS simulator the same dynamic way as the iPhone above.
+      - name: Resolve watchOS simulator destination
+        id: watchsim
+        run: |
+          set -euo pipefail
+          xcrun simctl list runtimes available
+          read -r RUNTIME_ID RUNTIME_VER DEVTYPE DEV_NAME < <(
+            xcrun simctl list runtimes --json | jq -r '
+              .runtimes
+              | map(select(.platform == "watchOS" and .isAvailable))
+              | map({
+                  id: .identifier,
+                  ver: .version,
+                  dt: (.supportedDeviceTypes | map(select(.productFamily == "Apple Watch")) | last)
+                })
+              | map(select(.dt != null))
+              | sort_by(.ver | split(".") | map(tonumber))
+              | last
+              | "\(.id) \(.ver) \(.dt.identifier) \(.dt.name)"
+            '
+          )
+          if [ -z "${RUNTIME_ID:-}" ] || [ -z "${DEVTYPE:-}" ]; then
+            echo "No available watchOS runtime with an Apple Watch device type on the runner" >&2
+            exit 1
+          fi
+          UDID=$(xcrun simctl create "ci-watch" "$DEVTYPE" "$RUNTIME_ID")
+          xcrun simctl boot "$UDID" || true
+          xcrun simctl bootstatus "$UDID" -b || true
+          DEST="platform=watchOS Simulator,id=${UDID}"
+          echo "Resolved: ${DEV_NAME} (watchOS ${RUNTIME_VER}) -> ${DEST}"
+          echo "destination=${DEST}" >> "$GITHUB_OUTPUT"
+          echo "deployment_target=${RUNTIME_VER}" >> "$GITHUB_OUTPUT"
+
+      - name: Build (watch)
+        run: |
+          set -euo pipefail
+          xcodebuild build \
+            -scheme "Jesse Watch App" \
+            -destination "${{ steps.watchsim.outputs.destination }}" \
+            -derivedDataPath build/DerivedDataWatch \
+            SWIFT_TREAT_WARNINGS_AS_ERRORS=YES \
+            SWIFT_SUPPRESS_WARNINGS=NO \
+            CODE_SIGNING_ALLOWED=NO
+
+      - name: Test (watch)
+        run: |
+          set -euo pipefail
+          xcodebuild test \
+            -scheme "Jesse Watch App" \
+            -destination "${{ steps.watchsim.outputs.destination }}" \
+            -derivedDataPath build/DerivedDataWatch \
+            -resultBundlePath build/ResultWatch.xcresult \
+            CODE_SIGNING_ALLOWED=NO
+
+      - name: Report watch test count
+        if: always()
+        run: |
+          set -euo pipefail
+          if [ ! -d build/ResultWatch.xcresult ]; then
+            echo "No watch result bundle produced" >&2
+            exit 1
+          fi
+          summary="$(xcrun xcresulttool get test-results summary --path build/ResultWatch.xcresult)"
+          total=$(printf '%s' "$summary" | jq -r '.totalTestCount')
+          passed=$(printf '%s' "$summary" | jq -r '.passedTests')
+          failed=$(printf '%s' "$summary" | jq -r '.failedTests')
+          skipped=$(printf '%s' "$summary" | jq -r '.skippedTests')
+          echo "JesseWatchTests: total=${total} passed=${passed} failed=${failed} skipped=${skipped}"
+          echo "### watch: ${total} tests (passed ${passed}, failed ${failed}, skipped ${skipped})" >> "$GITHUB_STEP_SUMMARY"
+          if [ "${total}" -le 0 ]; then
+            echo "Expected the watch test suite to run at least one test, got ${total}" >&2
+            exit 1
+          fi
+
+      # --- Mac app: the JesseMacTests suite (pure client logic — SSE framing,
+      # host sanitizing, Markdown parsing, pair-link parsing). Native macOS, so
+      # there is no simulator to resolve: build for the host, warnings-as-errors
+      # symmetric with iOS/watch. The hosted unit tests run UNSIGNED — they only
+      # load the test host, so no signing identity is needed on the runner.
+      - name: Build (mac)
+        run: |
+          set -euo pipefail
+          xcodebuild build \
+            -scheme "Jesse Mac" \
+            -destination "platform=macOS" \
+            -derivedDataPath build/DerivedDataMac \
+            SWIFT_TREAT_WARNINGS_AS_ERRORS=YES \
+            SWIFT_SUPPRESS_WARNINGS=NO \
+            CODE_SIGNING_ALLOWED=NO
+
+      - name: Test (mac)
+        run: |
+          set -euo pipefail
+          xcodebuild test \
+            -scheme "Jesse Mac" \
+            -destination "platform=macOS" \
+            -derivedDataPath build/DerivedDataMac \
+            -resultBundlePath build/ResultMac.xcresult \
+            CODE_SIGNING_ALLOWED=NO
+
+      - name: Report mac test count
+        if: always()
+        run: |
+          set -euo pipefail
+          if [ ! -d build/ResultMac.xcresult ]; then
+            echo "No mac result bundle produced" >&2
+            exit 1
+          fi
+          summary="$(xcrun xcresulttool get test-results summary --path build/ResultMac.xcresult)"
+          total=$(printf '%s' "$summary" | jq -r '.totalTestCount')
+          passed=$(printf '%s' "$summary" | jq -r '.passedTests')
+          failed=$(printf '%s' "$summary" | jq -r '.failedTests')
+          skipped=$(printf '%s' "$summary" | jq -r '.skippedTests')
+          echo "JesseMacTests: total=${total} passed=${passed} failed=${failed} skipped=${skipped}"
+          echo "### mac: ${total} tests (passed ${passed}, failed ${failed}, skipped ${skipped})" >> "$GITHUB_STEP_SUMMARY"
+          if [ "${total}" -le 0 ]; then
+            echo "Expected the mac test suite to run at least one test, got ${total}" >&2
+            exit 1
+          fi
+
+      # A failed run otherwise leaves only log text. The result bundles make
+      # test failures and simulator flakes diagnosable in Xcode without
+      # re-running the job. `if-no-files-found: ignore` because a failure
+      # before the Test step produces no bundle at all.
+      - name: Upload result bundles on failure
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: xcresult-bundles
+          path: |
+            Jesse/build/Result.xcresult
+            Jesse/build/ResultWatch.xcresult
+            Jesse/build/ResultMac.xcresult
+          if-no-files-found: ignore
+          retention-days: 14
