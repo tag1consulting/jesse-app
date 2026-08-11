@@ -164,15 +164,30 @@ pub enum McpSet {
     /// the exposure is recorded and accepted rather than fixed. See SECURITY.md.
     ///
     /// Two lesser things also arrive here and are named so they are not lost behind the
-    /// first: iMessage needs **Full Disk Access**, a whole-home-directory read grant on the
-    /// `mac-messages-mcp` executable (macOS offers nothing narrower, and TCC attributes it to
-    /// the binary exec'd, never to `jesse-bridge`); and `google-perseido` is a SECOND Google
-    /// read surface — calendar, mail and Drive on a personal account — whose credential is a
-    /// mode-600 client-secret FILE rather than a plist variable, which is the one credential
-    /// in the whole set that does not sit in launchd's environment.
+    /// first: the iMessage half of this set changed servers in 0.76.0 (see below); and
+    /// `google-perseido` is a SECOND Google read surface — calendar, mail and Drive on a
+    /// personal account — whose credential is a mode-600 client-secret FILE rather than a
+    /// plist variable, which is the one credential in the whole set that does not sit in
+    /// launchd's environment.
     ///
-    /// THE ROW LABELS MOVED AGAIN AND IT COST THE CODEX SIGNATURES AGAIN — fourth time, same
-    /// mechanism as 0.66.0, 0.67.0 and 0.69.0. See [`CODEX_SHIPPED_ROWS`].
+    /// **THE iMESSAGE SERVER IS `imcp` FROM 0.76.0, AND THE FULL DISK ACCESS THIS DOC ONCE
+    /// CLAIMED IS GONE.** As shipped in 0.73.0 the server was `mac-messages-mcp` holding its
+    /// own FDA grant — a whole-home-directory read authorization — and it NEVER ONCE WORKED:
+    /// every read returned `Permission denied … chat.db`, because TCC attributes file access
+    /// to the responsible process in the exec chain (the harness binary), never to the leaf
+    /// binary that was granted. 0.76.0 replaced it with `imcp`, which proxies to the iMCP app
+    /// over Bonjour and lets the APP do the reading under its own identity through a
+    /// security-scoped grant on `~/Library/Messages`. No harness is in the file-access chain,
+    /// no FDA is required anywhere, and the old grant was revoked. **The net posture of this
+    /// set is NARROWER than 0.73.0 shipped**, and the read actually works.
+    ///
+    /// What does NOT change is the sentence above it: a message body is still written by
+    /// anyone who knows Jeremy's number, and read-only tools do not close a prompt-injection
+    /// surface. Read tools were never the mitigation.
+    ///
+    /// THE ROW LABELS MOVED AGAIN AND IT COST THE CODEX SIGNATURES AGAIN — fourth time in
+    /// 0.73.0 and a FIFTH in 0.76.0, when `+imessage+` became `+imcp+`. Same mechanism as
+    /// 0.66.0, 0.67.0 and 0.69.0. See [`CODEX_SHIPPED_ROWS`].
     Messages,
 }
 
@@ -184,7 +199,7 @@ pub enum McpSet {
 /// only for this set, which is exactly the row a startup gate needs to resolve. A `const` in
 /// a pattern position is structural-match and costs nothing.
 const MESSAGES_LABEL: &str = "qmd+slack+browser+homeassistant+roon+google+github+fastmail+\
-unifi+routeros+proxmox+whatsapp+imessage+google-perseido";
+unifi+routeros+proxmox+whatsapp+imcp+google-perseido";
 
 impl McpSet {
     /// The label used in the results file and on the command line.
@@ -411,8 +426,21 @@ impl McpSet {
     }
 
     /// Whether this set loads the iMessage server — same rule, never a `_` arm. Carries the
-    /// same attacker-authored-text property as [`McpSet::contains_whatsapp`], plus the Full
-    /// Disk Access grant the server needs to read `chat.db`.
+    /// same attacker-authored-text property as [`McpSet::contains_whatsapp`].
+    ///
+    /// NAMED FOR THE SOURCE, NOT THE SERVER, and deliberately not renamed when the server
+    /// changed. From 0.76.0 the server is `imcp` (a helper for the iMCP app) rather than
+    /// `mac-messages-mcp`; the question a caller is asking here — "can this set read messages
+    /// a stranger sent to Jeremy's phone?" — has the same answer either way, and that is the
+    /// property the predicate exists to report. The SERVER identity lives in the label (see
+    /// [`MESSAGES_LABEL`]), which is what the record and `--rows` are keyed on, so the two
+    /// cannot drift silently: swapping the server moved the label and orphaned the Codex
+    /// signatures, exactly as intended.
+    ///
+    /// **NO FULL DISK ACCESS IS IMPLIED BY A `true` HERE ANY MORE.** The predecessor needed
+    /// it and never worked with it (TCC blames the responsible process, which is the harness);
+    /// iMCP reads through a grant held by the app under its own identity. The old FDA grant
+    /// was revoked in the same change.
     pub fn contains_imessage(&self) -> bool {
         match self {
             McpSet::None
@@ -486,7 +514,7 @@ impl McpSet {
             out.push("whatsapp");
         }
         if self.contains_imessage() {
-            out.push("imessage");
+            out.push("imcp");
         }
         if self.contains_google_perseido() {
             out.push("google-perseido");

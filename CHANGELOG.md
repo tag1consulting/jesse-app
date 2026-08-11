@@ -52,6 +52,71 @@ CI both run it). See the "Versioning" section of `bridge/README.md`.
   self-hosted macOS runner, which restores the per-PR gate at zero GitHub
   minutes; putting `pull_request:` back restores the bill with it.
 
+## [Bridge 0.76.0] - 2026-08-11
+
+### Changed
+
+- **iMessage now reads through the iMCP app, and needs NO Full Disk Access.** The
+  `mac-messages-mcp` server is removed and replaced by `imcp`, a helper for
+  **iMCP.app**. This supersedes the iMessage arm of 0.73.0, which shipped **loaded,
+  granted, and inert** — every read returned `Permission denied … chat.db`.
+
+  The fix is a change of *who does the reading*. `imcp-server` opens no database: it
+  discovers iMCP.app over Bonjour (`_mcp._tcp` on `local.`) and proxies MCP to it, and the
+  **app** reads `chat.db` under its own identity through a security-scoped grant on the
+  `~/Library/Messages` **folder** (the folder, so the `-wal`/`-shm` sidecars are covered —
+  the newest message usually lives only in the WAL). No harness binary is anywhere in the
+  file-access chain, so there is nothing for TCC to hold responsible.
+
+  **Why the old one could never have worked:** TCC consults the **responsible process**, not
+  just the binary exec'd. Once `claude` or `codex` is in the chain it becomes responsible, and
+  it holds no FDA. No grant on a leaf binary can win that argument. The FDA grant 0.73.0
+  relied on has been **revoked**; it was a whole-home-directory read authorization serving a
+  server that never worked.
+
+  **The net posture is narrower than 0.73.0 shipped** — one read tool instead of ten, no
+  AddressBook reach, no Full Disk Access anywhere — and unlike 0.73.0 the read works.
+
+- **iMessage tool grants: 1 of 6, down from 10 of 11.** `mcp__imcp__messages_fetch` is the
+  only granted tool and the entire Messages surface. **iMCP advertises no send or compose
+  tool at all**, so sending is absent at the root rather than merely ungranted.
+
+  **The five omitted tools are Maps, and they are LIVE.** iMCP is configured with only its
+  Messages service enabled, but the running server still advertises `maps_search`,
+  `maps_directions`, `maps_explore`, `maps_eta` and `maps_generate`, and a live `maps_search`
+  returned real MapKit results — Maps touches no local user data, so the app's service toggle
+  does not gate it. The advertised surface is **not** the enabled surface, and the allowlist
+  is the only thing keeping Maps out of the child. A test pins the iMCP grant as an exact set
+  rather than a denylist, so a future version adding a send tool cannot pass silently.
+
+- **The Codex row labels moved for the fifth time**, `+imessage+` becoming `+imcp+` and
+  orphaning the two operator `[[accepted]]` blocks again (0.66.0, 0.67.0, 0.69.0, 0.73.0, now
+  0.76.0). Re-pointed by the owner against the emitted labels.
+
+- **`McpSet::contains_imessage` keeps its name** though the server changed. It answers "can
+  this set read messages a stranger sent to Jeremy's phone?", which is unchanged; the SERVER
+  identity lives in the label, which is what the record is keyed on.
+
+### Security
+
+- **The Full Disk Access claim in `SECURITY.md` is struck as FALSE.** iMessage no longer
+  requires it, and the grant is revoked.
+- **The prompt-injection surface is UNCHANGED.** An iMessage body is still written by anyone
+  who knows Jeremy's number and still lands in a child holding vault `Write`/`Edit`, a
+  browser, the house, the network and the hypervisor. Read-only tools never were the
+  mitigation — they bound what the SERVER can do, not what the child does with what it read.
+  The real mitigation remains the dedicated sandboxed unix user, still not implemented;
+  Jeremy accepts the exposure for the read reach.
+- **New operational dependency, accepted:** iMCP.app is a menubar app in the GUI login
+  session, not launchd-supervised. Quit it, or end the session, and iMessage reads go dark
+  until it is relaunched by hand. Accepted (Studio on UPS, manual restart, a temporarily
+  missing iMessage is not a safety problem).
+- **A launchd job is not a valid preflight — in a second form.** 0.73.0 was reported ready by
+  a bare launchd job that could not stand in for a harness turn. The same trap applies to
+  iMCP's Bonjour transport, where an interactive shell shares the GUI session and a launchd
+  child might not, so it was proven rather than assumed: a launchd-spawned job in the
+  `gui/501` Aqua domain discovered the service and completed a `messages_fetch`.
+
 ## [Bridge 0.75.0] - 2026-08-11
 
 ### Added

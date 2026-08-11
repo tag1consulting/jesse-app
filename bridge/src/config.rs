@@ -273,11 +273,12 @@ pub const DEFAULT_MAX_ATTACHMENTS_TOTAL_BYTES: usize = 20 * 1024 * 1024;
 //
 // WHATSAPP AND IMESSAGE HAVE NO CREDENTIAL TO SCOPE. Every other read-only server
 // here is read-only twice over — a token carrying no write scope AND a list naming
-// read tools only. These two read LOCAL FILES (a SQLite store the WhatsApp Go
-// bridge syncs; `~/Library/Messages/chat.db` under Full Disk Access), so there is
-// no scope to withhold. The omitted send tools below are not a second layer behind
-// the first; they ARE the first, and the only. Enumerated live on 2026-08-10
-// against the running servers, never a README.
+// read tools only. These two read LOCAL DATA (a SQLite store the WhatsApp Go
+// bridge syncs; `~/Library/Messages/chat.db`, reached for us by the iMCP app), so
+// there is no scope to withhold. The omitted tools below are not a second layer
+// behind the first; they ARE the first, and the only. WhatsApp was enumerated live
+// on 2026-08-10 and iMCP on 2026-08-11, each against the running server, never a
+// README.
 //
 // WHATSAPP: eight of twelve. Granted are the eight read tools above. The four
 // omitted, by name and reason:
@@ -293,17 +294,51 @@ pub const DEFAULT_MAX_ATTACHMENTS_TOTAL_BYTES: usize = 20 * 1024 * 1024;
 // send API of its own, and it is below this layer entirely — omitting the tools
 // stops this child, not anything else on the host. See SECURITY.md.
 //
-// IMESSAGE: ten of eleven. The one omitted is `tool_send_message`, for exactly the
-// reason WhatsApp's three are. Everything else the server advertises reads.
-// `tool_get_attachment` is granted and that is deliberate rather than an oversight
-// on the `download_media` reasoning above: it RESOLVES AN EXISTING PATH on disk and
-// returns it; it neither fetches nor writes. Checked against the source, because
-// the two names are close enough that the pair invites a wrong inference in both
-// directions.
-// FOUR OF THE TEN READ THE ADDRESSBOOK, NOT chat.db — `tool_find_contact`,
-// `tool_check_contacts`, `tool_check_addressbook`, and the contact resolution
-// inside `tool_get_recent_messages`. That is a second protected macOS path, and it
-// is why the Full Disk Access grant is not merely about messages.
+// IMESSAGE (`imcp`): ONE of SIX. The server is iMCP, not `mac-messages-mcp`, and
+// the shape of its surface is different enough that the old reasoning does not
+// carry over — re-decided against a live enumeration of the running 1.4.1 server
+// on 2026-08-11, not translated from the list it replaces.
+//
+// Granted: `messages_fetch` — the ONLY tool the Messages service advertises. It
+// takes a date range, a participant list, a substring query and a limit, and
+// returns message bodies. That single tool is the entire iMessage read surface.
+//
+// THERE IS NO SEND OR COMPOSE TOOL TO OMIT, and that is a genuine narrowing rather
+// than a gap in this list: `mac-messages-mcp` advertised `tool_send_message` and
+// the allowlist was the only thing holding it back. iMCP advertises no sending tool
+// at all, so on this path sending is ABSENT AT THE ROOT rather than merely
+// ungranted. Do not restate the old "its one send tool is not granted" line; it
+// describes a server this project no longer runs.
+//
+// THE FIVE OMITTED TOOLS ARE MAPS, AND THEY ARE OMITTED ON PURPOSE:
+// `maps_search`, `maps_directions`, `maps_explore`, `maps_eta`, `maps_generate`.
+// They are not a message surface and the morning routine does not want them.
+//
+// NAME THEM CAREFULLY, BECAUSE THE OPERATOR'S MENTAL MODEL AND THE WIRE DISAGREE.
+// iMCP is configured with only its Messages service switched on, and its stored
+// preferences carry `messagesEnabled = 1` and no key for any other service — so
+// the intent is "Messages only". The running server nevertheless ADVERTISES all
+// five Maps tools, and a live call to `maps_search` on 2026-08-11 RETURNED REAL
+// MAPKIT RESULTS. Maps needs no per-service grant because it touches no local
+// user data, so the app's service toggle does not gate it. The advertised surface
+// is therefore NOT the enabled surface, and this allowlist is the only thing
+// keeping Maps out of the child. Anyone tempted to trim this note because "only
+// Messages is enabled" should re-run the enumeration first.
+//
+// What they would cost is small but not nothing: all five are `openWorldHint:true`
+// — they leave the machine for Apple's map services, carrying an attacker-
+// influenceable query string out of a child that reads attacker-authored message
+// bodies. That is a low-bandwidth egress channel this set does not need.
+//
+// NO ADDRESSBOOK AND NO ATTACHMENT TOOLS EXIST HERE. The four Contacts readers and
+// the two attachment tools that `mac-messages-mcp` advertised have no iMCP
+// counterpart while only Messages is enabled, so the second protected macOS path
+// that grant reached is gone from this set entirely.
+//
+// EVERY ONE OF THE SIX IS ANNOTATED `readOnlyHint:true`, INCLUDING THE FIVE THAT
+// ARE NOT GRANTED — which is the standing reason annotations are not the boundary.
+// A tool that reaches Apple over the network and one that reads a local database
+// carry the identical hint; only this list tells them apart.
 //
 // GOOGLE-PERSEIDO: sixteen of eighteen — the SAME sixteen granted on the tag1
 // `google` server, chosen by mirroring rather than re-deciding, because the two
@@ -417,11 +452,7 @@ mcp__whatsapp__search_contacts,mcp__whatsapp__list_messages,mcp__whatsapp__list_
 mcp__whatsapp__get_chat,mcp__whatsapp__get_direct_chat_by_contact,\
 mcp__whatsapp__get_contact_chats,mcp__whatsapp__get_last_interaction,\
 mcp__whatsapp__get_message_context,\
-mcp__imessage__tool_get_recent_messages,mcp__imessage__tool_fuzzy_search_messages,\
-mcp__imessage__tool_get_chats,mcp__imessage__tool_find_contact,\
-mcp__imessage__tool_check_contacts,mcp__imessage__tool_check_addressbook,\
-mcp__imessage__tool_check_db_access,mcp__imessage__tool_check_imessage_availability,\
-mcp__imessage__tool_search_attachments,mcp__imessage__tool_get_attachment,\
+mcp__imcp__messages_fetch,\
 mcp__google-perseido__list_calendars,mcp__google-perseido__get_events,\
 mcp__google-perseido__query_freebusy,mcp__google-perseido__search_gmail_messages,\
 mcp__google-perseido__get_gmail_message_content,\

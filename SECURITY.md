@@ -729,21 +729,34 @@ has been the named residual mitigation since 0.69.0 and it remains deferred. Jer
 accepting this exposure knowingly in order to get the read reach; it is recorded here rather
 than gated, on the same basis as the Home Assistant and Proxmox decisions before it.
 
-### iMessage requires Full Disk Access, which is broader than the database
+### iMessage needs NO Full Disk Access — it reads through the iMCP app (0.76.0)
 
-`mac-messages-mcp` reads `chat.db` and the AddressBook, and macOS gates both behind **Full
-Disk Access** — a grant over the entire home directory. There is no narrower grant; macOS does
-not offer per-file TCC. So the executable holding it can read every file the user can, not
-merely the two databases it wants.
+**Earlier revisions of this file said iMessage required Full Disk Access. That is no longer
+true and the claim is struck.** From 0.76.0 the iMessage server is `imcp`, and the FDA grant
+the previous server held has been revoked.
 
-### iMessage is LOADED AND GRANTED BUT CANNOT READ TODAY
+The mechanism is a change of *who does the reading*. `imcp-server` opens no database. It
+discovers **iMCP.app** over Bonjour (`_mcp._tcp` on `local.`) and proxies MCP to it; the app
+reads `chat.db` under its own identity, through a **security-scoped bookmark** Jeremy granted
+to the `~/Library/Messages` folder from the app's own file picker. No harness binary is
+anywhere in the file-access chain, so there is nothing for TCC to hold responsible and no
+whole-home-directory grant in play. **The net posture is narrower than 0.73.0 shipped, and
+unlike 0.73.0 it works.**
 
-**This is the one part of 0.73.0 that does not work, and it is a TCC problem rather than a
-bridge one.** The server starts, its ten read tools are granted on both harnesses, and every
-single one returns `Permission denied when trying to read ~/Library/Messages/chat.db`.
-Verified from real bridge turns on **both** harnesses after deploying 0.73.0.
+Two mechanics are worth keeping written down:
 
-The mechanism, measured 2026-08-10 by walking the process chain one link at a time:
+- **The grant is on the FOLDER, not the file.** `~/Library/Messages` rather than `chat.db`
+  alone, so the `-wal` and `-shm` sidecars are covered. The newest message usually lives only
+  in the WAL, so a `chat.db`-only grant reads *stale* — which looks like a caching bug rather
+  than a permissions one. If reads ever go stale, check the grant's scope first.
+- **The bridge itself still does not need FDA and must not be given it.** Its cdhash changes
+  on every rebuild, so such a grant would silently lapse.
+
+### Why the previous server never worked: TCC blames the responsible process
+
+Kept because the rule outlived the server it killed. `mac-messages-mcp` was granted FDA and
+**still** returned `Permission denied … chat.db` on every read, from real bridge turns on both
+harnesses. Measured 2026-08-10 by walking the chain one link at a time:
 
 | Chain | Result |
 |---|---|
@@ -752,32 +765,54 @@ The mechanism, measured 2026-08-10 by walking the process chain one link at a ti
 | `jesse-bridge (launchd) → claude → mac-messages-mcp` | **denied** |
 | terminal `→ … → mac-messages-mcp` | **denied** |
 
-So "TCC attributes the grant to the binary exec'd" is **not the whole rule, and believing it
-is what made this look green**. TCC also consults the **responsible process** — the ancestor
-it holds accountable for the spawn — and once a harness binary is in the chain, that becomes
-the harness, which holds no FDA. The grant on the leaf Python interpreter is real and is why
-the direct launchd job works; it simply is not what gets consulted when the bridge spawns the
-server through `claude` or `codex`.
+"TCC attributes the grant to the binary exec'd" is **not the whole rule, and believing it is
+what made this look green**. TCC also consults the **responsible process** — the ancestor it
+holds accountable for the spawn — and once a harness binary is in the chain that becomes the
+harness, which holds no FDA. Nothing the bridge spawns can win that argument, which is why the
+fix was to move the reader out of the spawn chain entirely rather than to widen a grant.
 
-**A direct launchd job is therefore NOT a valid preflight for this server.** That is exactly
-the check that reported iMessage ready, and it passed while the thing it was standing in for
-does not work. Any future FDA-dependent server must be proven from a real turn through the
-harness, never from a bare launchd job.
+**A direct launchd job is NOT a valid preflight for a TCC-gated server.** That is exactly the
+check that reported iMessage ready in 0.73.0, and it passed while the thing it stood in for did
+not work. Any TCC-dependent server must be proven from a real turn *through the harness*.
 
-Closing it means one of:
+**The same trap has a second form, and 0.76.0 walked into it once before clearing it.** iMCP's
+transport is Bonjour + a local TCP connection, so the question "does this work under launchd?"
+had to be re-asked for a transport, not a file grant: an interactive shell shares the GUI login
+session with the app, and a launchd child may not. It was proven rather than assumed — a
+launchd-spawned job in the `gui/501` Aqua domain discovered the service and completed a
+`messages_fetch`, matching the interactive read exactly. Anything that changes the bridge's
+launchd domain invalidates that proof.
 
-- Granting Full Disk Access to the **harness** binaries (`claude`, `codex`). This is a large
-  widening — FDA on `claude` covers every claude-code invocation on the machine, not just the
-  bridge's — and it is a GUI grant nobody can script.
-- Reading a **copy** of `chat.db` refreshed out of band, so the server needs no FDA at all.
-  Already named below as a residual mitigation, and it is now the preferred route.
+### iMessage is only alive while iMCP.app is running — accepted
 
-Until one of those happens, iMessage is inert: granted, harmless, and returning errors. The
-grants are left in place rather than reverted so the posture, the record and the batteries all
-describe one set — but nothing should be built on top of iMessage reads yet.
+iMCP.app is a **menubar application in Jeremy's GUI login session**, not a launchd-supervised
+service. Nothing restarts it. If the app is quit, or the login session ends, **iMessage reads
+go dark** until it is relaunched by hand — the tool stays granted and simply stops returning
+data. This is accepted rather than fixed: the Studio is on a UPS, a manual restart is
+acceptable, and a temporarily-missing iMessage source is not a safety problem. It is recorded
+because a silent, unmonitored dependency on a GUI app is exactly the kind of thing that gets
+diagnosed as a bridge bug months later.
 
-One mechanic that does hold regardless: **the bridge itself does not need FDA and must not be
-given it.** Its cdhash changes on every rebuild, so the grant would silently lapse.
+### iMCP advertises Maps tools that are LIVE but ungranted
+
+iMCP is configured with only its **Messages** service switched on, and its stored preferences
+carry `messagesEnabled = 1` with no key for any other service. **The running server
+nevertheless advertises five Maps tools, and they work** — a live `maps_search` call returned
+real MapKit results on 2026-08-11. Maps touches no local user data, so the app's per-service
+toggle does not gate it.
+
+So on this server **the advertised surface is not the enabled surface**, and the bridge's
+allowlist is the only thing keeping Maps out of the child. Of the six tools iMCP advertises,
+one is granted (`messages_fetch`); the five Maps tools are omitted deliberately. They are
+`openWorldHint:true` — they leave the machine for Apple's services carrying a query string —
+which makes them a low-bandwidth egress channel from a child that reads attacker-authored
+message bodies. All six carry `readOnlyHint:true`, including the five that are not granted,
+which is the standing reason annotations are not the boundary.
+
+**iMCP advertises no send or compose tool at all.** Where `mac-messages-mcp` had
+`tool_send_message` and the allowlist was the only thing holding it back, sending is now
+absent at the root. A version bump could change that, so the grant is pinned as an exact set
+in a test rather than guarded by a denylist of names.
 
 ### The second Google account is a second read surface
 
@@ -802,7 +837,10 @@ flags for BOTH Google instances live in the bridge's own const, where a test ass
 - Run the bridge as a dedicated, sandboxed unix user rather than as Jeremy. **This is the one
   that matters for the message servers**, and it is still deferred.
 - Bind the WhatsApp Go bridge's REST port to loopback (it is lost on any re-clone).
-- Narrow iMessage to a copy of `chat.db` refreshed out of band, so the server needs no FDA.
+- ~~Narrow iMessage to a copy of `chat.db` refreshed out of band, so the server needs no
+  FDA.~~ **DONE in 0.76.0, by a different route than this line proposed**: iMCP reads the live
+  database through a grant held by the app, so no copy is needed and no FDA is involved. The
+  copy route would also have read stale (the newest message lives in the WAL).
 
 ## Diet child tool isolation (in-process boundary)
 

@@ -579,11 +579,31 @@ pub const MORNING_MCP_CONFIG: &str = concat!(
 /// launcher must exec the checkout's `main.py` rather than a copy. Its four sending and
 /// downloading tools are loaded but NOT granted; see [`crate::DEFAULT_ALLOWED_TOOLS`].
 ///
-/// `imessage` is `mac-messages-mcp`, reading `~/Library/Messages/chat.db` and the AddressBook
-/// directly. **It requires FULL DISK ACCESS**, which is a whole-home-directory read grant on
-/// the executable — far broader than the two databases it wants, and macOS offers no narrower
-/// grant. TCC attributes that grant to the binary actually exec'd, so it is held by
-/// `mac-messages-mcp` itself and never by `jesse-bridge`. Its one send tool is not granted.
+/// `imcp` is the iMessage source, and it is a GUI APPLICATION'S HELPER rather than an
+/// ordinary stdio server. `imcp-server` reads no files itself: it discovers iMCP.app over
+/// Bonjour (`_mcp._tcp` on `local.`) and proxies MCP over that connection, and the APP does
+/// the reading, under its own identity, through a security-scoped bookmark Jeremy granted to
+/// the `~/Library/Messages` FOLDER. **NO FULL DISK ACCESS IS INVOLVED ANYWHERE**, and that
+/// is the entire reason this server replaced `mac-messages-mcp` in 0.76.0.
+///
+/// THE PREDECESSOR WAS INERT AND THE REASON GENERALISES. `mac-messages-mcp` held its own FDA
+/// grant and still returned `Permission denied … chat.db` on every read, because TCC
+/// attributes a file access to the RESPONSIBLE PROCESS in the exec chain — the harness binary
+/// (`claude`/`codex`), which holds no FDA — and not to the leaf binary that was granted.
+/// Nothing the bridge spawns can win that argument. iMCP sidesteps it structurally: the
+/// reader is a separate long-running app that no harness is responsible for, so the harness
+/// never appears in the file-access chain at all.
+///
+/// TWO CONSEQUENCES WORTH WRITING DOWN, because neither is visible from this line:
+///   * THE GRANT IS ON THE FOLDER, NOT THE FILE. `~/Library/Messages` rather than `chat.db`
+///     alone, so the `-wal` and `-shm` sidecars are inside it. The newest message usually
+///     lives only in the WAL, so a `chat.db`-only grant reads stale and looks like a bug.
+///   * IT IS ONLY ALIVE WHILE THE APP IS. iMCP.app runs in Jeremy's GUI login session and is
+///     not launchd-supervised, so quitting it — or ending the session — takes iMessage dark
+///     until it is relaunched by hand. Accepted deliberately; see SECURITY.md.
+///
+/// Of the six tools it advertises, ONE is granted (`messages_fetch`); the five Maps tools are
+/// live but ungranted. There is no send tool to withhold. See [`crate::DEFAULT_ALLOWED_TOOLS`].
 ///
 /// `google-perseido` is a SECOND instance of the same `workspace-mcp` the `google` entry
 /// runs, against a different account. It is a second SERVER rather than a second account on
@@ -600,7 +620,7 @@ pub const MORNING_MCP_CONFIG: &str = concat!(
 pub const MAIN_CHILD_MCP_CONFIG: &str = concat!(
     r#"{"mcpServers":{"qmd":{"type":"stdio","command":"qmd","args":["mcp"]},"slack":{"type":"stdio","command":"npx","args":["-y","slack-mcp-server@latest","--transport","stdio"]},"browser":{"type":"stdio","command":"npx","args":["-y","@playwright/mcp@latest","--headless","--isolated","--output-dir","/tmp/jesse-browser","--output-max-size","104857600"]},"homeassistant":{"type":"http","url":""#,
     home_assistant_mcp_url!(),
-    r#"","headers":{"Authorization":"Bearer ${HA_MCP_TOKEN}"}},"roon":{"type":"http","url":"http://10.40.0.2:8088/mcp"},"google":{"type":"stdio","command":"workspace-mcp","args":["--single-user","--read-only","--tools","calendar","gmail","drive"]},"github":{"type":"stdio","command":"github-mcp-server","args":["stdio","--read-only","--toolsets","repos,actions"]},"fastmail":{"type":"stdio","command":"npx","args":["-y","github:jeremyandrews/jmap-mcp-server"]},"unifi":{"type":"stdio","command":"unifi-network-mcp","args":[]},"routeros":{"type":"stdio","command":"routeros-mcp","args":[]},"proxmox":{"type":"stdio","command":"mcp-proxmox","args":[]},"whatsapp":{"type":"stdio","command":"whatsapp-mcp","args":[]},"imessage":{"type":"stdio","command":"mac-messages-mcp","args":[]},"google-perseido":{"type":"stdio","command":"workspace-mcp-perseido","args":["--single-user","--read-only","--tools","calendar","gmail","drive"]}}}"#
+    r#"","headers":{"Authorization":"Bearer ${HA_MCP_TOKEN}"}},"roon":{"type":"http","url":"http://10.40.0.2:8088/mcp"},"google":{"type":"stdio","command":"workspace-mcp","args":["--single-user","--read-only","--tools","calendar","gmail","drive"]},"github":{"type":"stdio","command":"github-mcp-server","args":["stdio","--read-only","--toolsets","repos,actions"]},"fastmail":{"type":"stdio","command":"npx","args":["-y","github:jeremyandrews/jmap-mcp-server"]},"unifi":{"type":"stdio","command":"unifi-network-mcp","args":[]},"routeros":{"type":"stdio","command":"routeros-mcp","args":[]},"proxmox":{"type":"stdio","command":"mcp-proxmox","args":[]},"whatsapp":{"type":"stdio","command":"whatsapp-mcp","args":[]},"imcp":{"type":"stdio","command":"/Applications/iMCP.app/Contents/MacOS/imcp-server","args":[]},"google-perseido":{"type":"stdio","command":"workspace-mcp-perseido","args":["--single-user","--read-only","--tools","calendar","gmail","drive"]}}}"#
 );
 
 /// qmd PLUS slack PLUS browser — the main turn's server set from bridge 0.66.0 until Home
@@ -1752,7 +1772,7 @@ mod tests {
             // mistake worth failing a build over. The names are the live ones enumerated on
             // 2026-08-10 — `download_media` is in this list because it writes a file, not
             // because it sends.
-            for name in ["whatsapp", "imessage"] {
+            for name in ["whatsapp", "imcp"] {
                 assert!(
                     servers.contains_key(name),
                     "{label}: the main path declares the {name} server: {mcp:?}"
@@ -1766,7 +1786,6 @@ mod tests {
                 "mcp__whatsapp__send_file",
                 "mcp__whatsapp__send_audio_message",
                 "mcp__whatsapp__download_media",
-                "mcp__imessage__tool_send_message",
             ] {
                 assert!(
                     !granted.contains(&never),
@@ -1774,6 +1793,37 @@ mod tests {
                      or it is not shipped: {granted:?}"
                 );
             }
+            // THE iMCP GRANT IS PINNED AS AN EXACT SET rather than guarded by a denylist,
+            // and the asymmetry with WhatsApp above is deliberate. WhatsApp's dangerous tools
+            // have known names, so naming them is enough. iMCP's problem is the opposite: it
+            // advertises SIX tools of which only ONE is Messages, the other five are Maps and
+            // they are LIVE — a `maps_search` call returned real MapKit results on 2026-08-11
+            // even though only the Messages service is switched on in the app. A denylist
+            // would only ever catch the names we thought to write down. An exact set fails on
+            // ANYTHING new the server starts advertising, including a send tool a future
+            // version might add — the one addition that must never pass silently. iMCP has no
+            // sending tool today, and this assertion is what keeps that from changing quietly
+            // under a version bump.
+            // Stated as "never anything BUT `messages_fetch`" rather than "always exactly
+            // it", because the sites this loop covers do not all grant the message servers:
+            // the read-only main turn loads all fourteen servers and grants only qmd's four
+            // tools. An equality check would therefore assert a toolset that site does not
+            // have. A subset check still fails on every addition, which is the property
+            // being bought.
+            let imcp_granted: Vec<&str> = granted
+                .iter()
+                .copied()
+                .filter(|t| t.starts_with("mcp__imcp__"))
+                .collect();
+            assert!(
+                imcp_granted
+                    .iter()
+                    .all(|t| *t == "mcp__imcp__messages_fetch"),
+                "{label}: `messages_fetch` is the ONLY iMCP tool that may ever be granted — \
+                 the five Maps tools it also advertises are live and must stay ungranted, and \
+                 anything unrecognised here must be re-decided against a fresh enumeration: \
+                 {imcp_granted:?}"
+            );
             // THE GITHUB SERVER'S READ-ONLY POSTURE IS ITS ONLY LAYER. Its credential is a
             // personal CLASSIC PAT carrying `repo` + `workflow` — write-capable — because a
             // fine-grained PAT is single-owner and cannot reach org repos at all. So unlike
@@ -2193,7 +2243,7 @@ mod tests {
     const GOLDEN_QMD_MCP: &str = concat!(
         r#"{"mcpServers":{"qmd":{"type":"stdio","command":"qmd","args":["mcp"]},"slack":{"type":"stdio","command":"npx","args":["-y","slack-mcp-server@latest","--transport","stdio"]},"browser":{"type":"stdio","command":"npx","args":["-y","@playwright/mcp@latest","--headless","--isolated","--output-dir","/tmp/jesse-browser","--output-max-size","104857600"]},"homeassistant":{"type":"http","url":""#,
         home_assistant_mcp_url!(),
-        r#"","headers":{"Authorization":"Bearer ${HA_MCP_TOKEN}"}},"roon":{"type":"http","url":"http://10.40.0.2:8088/mcp"},"google":{"type":"stdio","command":"workspace-mcp","args":["--single-user","--read-only","--tools","calendar","gmail","drive"]},"github":{"type":"stdio","command":"github-mcp-server","args":["stdio","--read-only","--toolsets","repos,actions"]},"fastmail":{"type":"stdio","command":"npx","args":["-y","github:jeremyandrews/jmap-mcp-server"]},"unifi":{"type":"stdio","command":"unifi-network-mcp","args":[]},"routeros":{"type":"stdio","command":"routeros-mcp","args":[]},"proxmox":{"type":"stdio","command":"mcp-proxmox","args":[]},"whatsapp":{"type":"stdio","command":"whatsapp-mcp","args":[]},"imessage":{"type":"stdio","command":"mac-messages-mcp","args":[]},"google-perseido":{"type":"stdio","command":"workspace-mcp-perseido","args":["--single-user","--read-only","--tools","calendar","gmail","drive"]}}}"#
+        r#"","headers":{"Authorization":"Bearer ${HA_MCP_TOKEN}"}},"roon":{"type":"http","url":"http://10.40.0.2:8088/mcp"},"google":{"type":"stdio","command":"workspace-mcp","args":["--single-user","--read-only","--tools","calendar","gmail","drive"]},"github":{"type":"stdio","command":"github-mcp-server","args":["stdio","--read-only","--toolsets","repos,actions"]},"fastmail":{"type":"stdio","command":"npx","args":["-y","github:jeremyandrews/jmap-mcp-server"]},"unifi":{"type":"stdio","command":"unifi-network-mcp","args":[]},"routeros":{"type":"stdio","command":"routeros-mcp","args":[]},"proxmox":{"type":"stdio","command":"mcp-proxmox","args":[]},"whatsapp":{"type":"stdio","command":"whatsapp-mcp","args":[]},"imcp":{"type":"stdio","command":"/Applications/iMCP.app/Contents/MacOS/imcp-server","args":[]},"google-perseido":{"type":"stdio","command":"workspace-mcp-perseido","args":["--single-user","--read-only","--tools","calendar","gmail","drive"]}}}"#
     );
     const GOLDEN_EMPTY_MCP: &str = r#"{"mcpServers":{}}"#;
 
