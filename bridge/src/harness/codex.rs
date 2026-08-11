@@ -569,17 +569,23 @@ pub fn codex_mcp_args(
 /// itself from `__dirname/../.env`, relative to its own file rather than the cwd, so it needs
 /// nothing forwarded and forwarding anything would widen the subprocess for no gain.
 ///
-/// **`whatsapp`, `imessage` and `google-perseido` are ABSENT for the same class of reason,
+/// **`whatsapp`, `imcp` and `google-perseido` are ABSENT for the same class of reason,
 /// and each was confirmed rather than assumed** — an unforwarded secret means a server that
 /// starts, registers zero tools, and reports itself "not installed", so absence here is a
 /// claim that has to be checked:
 ///   * `whatsapp` reads a SQLite store it locates from its own `__file__`, and reaches the Go
 ///     bridge at a hard-coded `http://localhost:8080/api`. Neither is configurable by
 ///     environment, so there is nothing to name.
-///   * `imessage` reads `~/Library/Messages/chat.db` and the AddressBook through the Full
-///     Disk Access grant held by its own executable. That grant is a TCC property of the
-///     binary, not a variable — no environment can carry it, and `HOME` (which it does need)
-///     is already one of the eight Codex leaves in place.
+///   * `imcp` reads NOTHING ITSELF and holds no secret. It finds the iMCP app over Bonjour
+///     (`_mcp._tcp` on `local.`) and proxies MCP to it; the app does the reading, under its
+///     own identity, through a security-scoped grant on `~/Library/Messages`. There is no
+///     token to forward and no path to configure — the endpoint is DISCOVERED, not addressed
+///     — so `env_vars` for this server is correctly empty rather than merely unfilled.
+///     CONFIRMED against the running 1.4.1 server on 2026-08-11 rather than assumed: it was
+///     driven to a successful `messages_fetch` from a launchd-spawned job with an environment
+///     carrying nothing of its own. Note what this replaces: `mac-messages-mcp` needed a Full
+///     Disk Access grant, which was equally unforwardable (TCC is a property of a binary, not
+///     a variable) but ALSO never worked, because TCC blames the responsible process.
 ///   * `google-perseido` needs the SAME four variables the `google` entry forwards, and must
 ///     NOT be given them: they carry the tag1 client and the tag1 credentials directory, and
 ///     `workspace-mcp` resolves the client from the environment BEFORE its client-secret
