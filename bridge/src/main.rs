@@ -7,10 +7,10 @@ use std::path::Path;
 use jesse_bridge::{
     app, binary_exists, bind_broker, build_apns, detect_binary_drift, env_string, env_truthy,
     export_mcp_server_env, harness_bin_env, harness_default_bin, harnesses_in_use, is_bind_allowed,
-    load_local_models, manual_pairing_lines, pairing_payload, serve_broker,
-    settings_permission_drift, show_token_opt_in, spawn_eviction_task, spawn_session_gc_task,
-    start_health_prober, validate_model_config, AppState, Config, ConfigError, BINARY_DRIFT,
-    CONTAINMENT_RECORDS, SETTINGS_DRIFT,
+    load_local_models, manual_pairing_lines, pairing_payload, qr_env_tristate, serve_broker,
+    settings_permission_drift, show_qr_opt_in, show_token_opt_in, spawn_eviction_task,
+    spawn_session_gc_task, start_health_prober, validate_model_config, AppState, Config,
+    ConfigError, QrArt, TokenVisibility, BINARY_DRIFT, CONTAINMENT_RECORDS, SETTINGS_DRIFT,
 };
 
 #[tokio::main]
@@ -172,25 +172,70 @@ async fn main() {
     // The advertised host defaults to the bound IP (reliably reachable on the
     // tailnet; the ts.net name can have DNS quirks). Override with
     // JESSE_ADVERTISE_HOST to force the MagicDNS name into the QR instead.
+    //
+    // The QR encodes the FULL bearer token, so it is TTY-gated: printed only when
+    // stdout is a terminal (someone is there to scan it). When stdout is a pipe —
+    // a container, launchd — stdout is the log stream, and every restart would
+    // republish the token into whatever aggregation is attached. Force it back
+    // with `--show-qr` or JESSE_SHOW_QR=1; pin it OFF with JESSE_SHOW_QR=0 (for a
+    // PTY that is still log-collected — `docker run -t`, a pod's `tty: true`).
     let advertise_host =
         std::env::var("JESSE_ADVERTISE_HOST").unwrap_or_else(|_| state.cfg.bind.clone());
-    let payload = pairing_payload(&advertise_host, state.cfg.port, &state.cfg.token);
-    let code = qrcode::QrCode::new(payload.as_bytes()).expect("qr encode");
-    let art = code
-        .render::<qrcode::render::unicode::Dense1x2>()
-        .quiet_zone(true)
-        .build();
-    println!("{art}");
-    // Print the manual-pairing fallback under the QR. The plaintext token line is
-    // omitted by default so the raw token stays out of scrollback / launchd logs;
-    // the QR still encodes it. Opt in with `--show-token` or JESSE_SHOW_TOKEN=1.
     let args: Vec<String> = std::env::args().collect();
+    let qr_env = qr_env_tristate(env_string("JESSE_SHOW_QR").as_deref());
+    let show_qr = show_qr_opt_in(&args, qr_env, {
+        use std::io::IsTerminal;
+        std::io::stdout().is_terminal()
+    });
+    let mut qr = QrArt::Suppressed;
+    if show_qr {
+        let payload = pairing_payload(&advertise_host, state.cfg.port, &state.cfg.token);
+        // Log-and-degrade like every other startup fallibility in this file
+        // (build_apns, the broker bind): the QR is a convenience with its fallback
+        // printed right below, and DataTooLong is reachable — JESSE_ADVERTISE_HOST
+        // is operator-controlled and unbounded.
+        match qrcode::QrCode::new(payload.as_bytes()) {
+            Ok(code) => {
+                let art = code
+                    .render::<qrcode::render::unicode::Dense1x2>()
+                    .quiet_zone(true)
+                    .build();
+                println!("{art}");
+                qr = QrArt::Shown;
+            }
+            Err(e) => eprintln!(
+                "jesse-bridge: WARNING — could not render the pairing QR ({e}); pair \
+                 manually with the lines below. If JESSE_ADVERTISE_HOST is unusually \
+                 long, shortening it may help."
+            ),
+        }
+    } else if qr_env != Some(false) {
+        // The gate's decision is auditable, and the recovery hint lives on STDERR —
+        // never in the stdout pairing lines, which are exactly the log stream the
+        // hint must not push the token into. Silent when the operator pinned the QR
+        // off themselves: they already know.
+        eprintln!(
+            "jesse-bridge: pairing QR suppressed — stdout is not a terminal, so the QR \
+             (which encodes the bearer token) would land in the log stream. Pass \
+             --show-qr or set JESSE_SHOW_QR=1 to print it anyway; set JESSE_SHOW_QR=0 \
+             to silence this note."
+        );
+    }
+    // Print the manual-pairing fallback under the QR (or alone when the QR is
+    // suppressed or failed to render). The plaintext token line is omitted by
+    // default so the raw token stays out of scrollback / launchd logs; a shown QR
+    // still encodes it. Opt in with `--show-token` or JESSE_SHOW_TOKEN=1.
     let show_token = show_token_opt_in(&args, env_truthy("JESSE_SHOW_TOKEN"));
     for line in manual_pairing_lines(
         &advertise_host,
         state.cfg.port,
         &state.cfg.token,
-        show_token,
+        if show_token {
+            TokenVisibility::Shown
+        } else {
+            TokenVisibility::Hidden
+        },
+        qr,
     ) {
         println!("{line}");
     }

@@ -52,6 +52,54 @@ CI both run it). See the "Versioning" section of `bridge/README.md`.
   self-hosted macOS runner, which restores the per-PR gate at zero GitHub
   minutes; putting `pull_request:` back restores the bill with it.
 
+## [Bridge 0.77.0] - 2026-08-11
+
+### Security
+
+- **The startup pairing QR is now TTY-gated — it no longer leaks the bearer token
+  into log aggregation.** The QR encodes `jesse://pair?host=…&port=…&token=…`,
+  i.e. the FULL bearer token, and it was printed to stdout unconditionally. A QR
+  is an encoding, not an obfuscation: paste the Unicode art into any decoder and
+  the token falls out. On a laptop that is scrollback-grade exposure; in a
+  container **stdout is the log stream**, so every restart republished the sole
+  auth credential into whatever aggregation is attached (observed live:
+  `kubectl logs` → Loki, queryable for the whole retention window). This defeated
+  the existing `JESSE_SHOW_TOKEN` hygiene, which hides only the plaintext
+  `token=` line — and no flag suppressed the QR.
+
+  The QR (and its "scan the QR above" wording) is now printed only when stdout
+  **is a terminal** (`std::io::IsTerminal`) — where someone is present to scan it.
+  Interactive use is byte-for-byte unchanged. Headless runs (a pipe, a container,
+  a service manager) get only the manual-entry lines, reworded so they don't
+  reference a QR that isn't there, with the token still hidden — plus one stderr
+  line saying the QR was suppressed and naming the override, so a missing QR is a
+  logged decision rather than a mystery. `--show-qr` / `JESSE_SHOW_QR=1` forces
+  the QR onto a non-TTY stdout a human is actually reading — mirroring the
+  `--show-token` / `JESSE_SHOW_TOKEN` pattern. Secure-by-default over
+  secure-by-remembering-a-flag: the operator most exposed (headless logs) is
+  exactly the one least likely to be reading startup output where an opt-out
+  would be documented.
+
+  A terminal is a *heuristic* for "not collected", not a guarantee — a PTY inside
+  a container is a terminal **and** the log stream (`docker run -t`, a pod spec's
+  `tty: true`, a `script(1)`/`unbuffer` wrapper). For those deployments
+  `JESSE_SHOW_QR` is read tri-state: an explicit `0`/`false`/`no`/`off` **pins
+  the QR off even on a terminal**, beating `--show-qr`.
+
+  Two adjacent hardenings in the same block, both found in review: the
+  suppressed-QR fallback no longer suggests `--show-token` / `JESSE_SHOW_TOKEN`
+  (that branch prints precisely when stdout is a log stream — the one place the
+  plaintext token must not be advertised into; the recovery hint lives on stderr
+  instead, and a test now pins the absence). And a QR render failure no longer
+  panics the bridge via `.expect("qr encode")` — it logs a warning and falls
+  through to the manual-entry lines, matching every other startup fallibility
+  here (`DataTooLong` is reachable: `JESSE_ADVERTISE_HOST` is unbounded).
+  `manual_pairing_lines` also trades its two adjacent `bool` parameters for
+  `TokenVisibility`/`QrArt` enums, so transposing "show the token" and "QR was
+  shown" is now a compile error instead of a silent token print.
+
+  Deployments whose logs already captured a QR should rotate `JESSE_TOKEN`.
+
 ## [Bridge 0.76.0] - 2026-08-11
 
 ### Changed
