@@ -73,6 +73,10 @@ pub(crate) fn test_config() -> Config {
             .to_string_lossy()
             .into_owned(),
         shadow_timeout_secs: 120,
+        // No scheduled jobs in the fixture: the tick task is never started and the
+        // scheduler is inert, so every existing test is byte-for-byte unaffected. Tests
+        // that exercise the scheduler build their own `Schedule`.
+        schedule: Arc::new(Schedule::default()),
         // Generic default persona (owner "the user"): the fresh-clone identity, so
         // every existing prompt/gate assertion is byte-for-byte the generic form.
         // Tests that exercise a named owner or extra diet vocab set this explicitly.

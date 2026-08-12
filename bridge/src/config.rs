@@ -690,6 +690,12 @@ pub struct Config {
     // local file resolves to the generic default ("the user"), so no personal fact
     // is ever compiled in — personalization is pure runtime DATA.
     pub persona: Persona,
+    // The built-in scheduler's validated `[[schedule]]` jobs, read from the SAME overlay
+    // file the persona and the model registry come from. An `Arc` because the scheduler
+    // task holds it for the life of the process and every turn's config clone must not
+    // copy it. Empty for a deploy that declares no jobs, which is exactly the pre-0.79.0
+    // bridge: no tick task is started at all. See [`crate::schedule`].
+    pub schedule: Arc<Schedule>,
     // The set of models the CONVERSATION (main turn + its subagents) can be switched
     // onto, built once from `JESSE_MODEL_*` env at startup (see [`ModelRegistry`]).
     // Always holds the ambient `opus` default; `glm-5.2` / `kimi-k3` / `local` are
@@ -755,6 +761,17 @@ impl Config {
         self.state_dir
             .as_deref()
             .map(|d| PathBuf::from(d).join("titles.json"))
+    }
+
+    /// The file the scheduler's per-job record is persisted to (a sibling of
+    /// `flags.json`), or `None` when persistence is disabled — in which case a restart
+    /// loses every last-run time, so a missed fire cannot be caught up and the first
+    /// occurrence after a restart is resolved forward from boot. Holds ids, timestamps,
+    /// outcomes and reasons; never a prompt, a reply, or a secret.
+    pub fn schedule_file(&self) -> Option<PathBuf> {
+        self.state_dir
+            .as_deref()
+            .map(|d| PathBuf::from(d).join("schedule.json"))
     }
 
     /// The file the per-session favorite / archived flags are persisted to (a
@@ -2214,6 +2231,13 @@ impl Config {
             // Resolved once at startup against the captured HOME (used to find the
             // state-dir config location for a launchd service outside the repo).
             persona: Persona::load(&home),
+            // The built-in scheduler's jobs, read from the SAME overlay file and validated
+            // here. Validation NEVER fails this constructor: a bad entry is disabled
+            // individually (`Schedule::invalid`) and a duplicate id or `after` cycle is
+            // collected in `Schedule::fatal` for `main` to refuse the boot on — the same
+            // shape as the model gate, so config problems are decided in one place and
+            // reported before the socket opens.
+            schedule: Arc::new(validate_schedule(&load_schedule(&home))),
             // The selectable-model registry, MERGED from the built-in ambient opus, the
             // JESSE_MODEL_* env triples, and the declarative `[[models]]` config file (see
             // ModelRegistry::from_env). Always includes the ambient opus default; the other

@@ -1,6 +1,6 @@
 [package]
 name = "jesse-bridge"
-version = "0.78.1"
+version = "0.79.0"
 edition = "2021"
 license = "Apache-2.0"
 
@@ -103,6 +103,33 @@ libc = "0.2"
 # only the codecs the whitelist admits are enabled. PNG is the wire format sent to
 # the Anthropic image-block surface; the sniffed input types map onto these decoders.
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp"] }
+# --- The built-in scheduler (`[[schedule]]`) -----------------------------------
+#
+# chrono: LOCAL WALL-CLOCK date math with a real DST implementation. A scheduled job is
+# declared as "02:30 local", and the two days a year that phrase is not a single instant
+# are exactly the days a hand-rolled `next_fire` gets wrong: on the spring-forward day
+# 02:30 does not exist (naive arithmetic silently skips the job for that day), and on the
+# fall-back day it happens twice (naive arithmetic runs it twice). Nothing else in this
+# graph knows what a time zone is — `toml_datetime` only parses, and the rest of the bridge
+# works in unix millis — so this is the one place a date crate earns its place.
+#
+# `clock` is what supplies `Local` (the host's zone, read from the OS); `std` keeps it off
+# `alloc`-only. NO `serde` feature: the schedule's times are parsed from `"HH:MM"` strings
+# by hand and the persisted state file stores unix millis, so no chrono type is ever
+# serialized. `default-features = false` drops `oldtime`/`wasmbind` and their baggage.
+#
+# What is used: `NaiveTime`/`NaiveDate`, `TimeZone::from_local_datetime` (whose
+# `LocalResult::{None,Ambiguous}` arms ARE the two DST cases above), and `Weekday`.
+chrono = { version = "0.4.45", default-features = false, features = ["clock", "std"] }
 
 [dev-dependencies]
+# chrono-tz: a BUNDLED tz database, for the DST tests only — never in the serving binary.
+#
+# `next_fire` is generic over `chrono::TimeZone` precisely so production can pass `Local`
+# while a test passes a named zone with known transitions (`America/New_York`) and asserts
+# the spring-forward / fall-back behavior deterministically. Doing that with `Local` would
+# mean mutating `TZ` in a process-global, which is racy under `cargo test`'s default
+# parallelism; doing it against `/usr/share/zoneinfo` would make the suite depend on the
+# host having a tz database. The bundled table has neither problem.
+chrono-tz = { version = "0.10.4", default-features = false }
 tower = { version = "0.5", features = ["util"] }   # ServiceExt::oneshot

@@ -295,6 +295,15 @@ impl ApnsClient {
     /// the token), anything else (other non-2xx, JWT-mint failure, transport
     /// error) → `Failed` (swallowed). Never errors out of band.
     pub async fn push(&self, device_token: &str, job_id: &str) -> PushOutcome {
+        self.push_payload(device_token, build_apns_payload(job_id))
+            .await
+    }
+
+    /// Send an already-built payload. The seam [`push`](Self::push) is written in terms
+    /// of, so the scheduler's alert — which must NAME the job and its outcome, and may
+    /// have no turn to deep-link to at all (a skipped run) — travels the identical
+    /// client, JWT cache, topic and status interpretation rather than a second push path.
+    pub async fn push_payload(&self, device_token: &str, payload: Vec<u8>) -> PushOutcome {
         let jwt = match self.jwt() {
             Ok(j) => j,
             Err(e) => return PushOutcome::Failed(format!("apns jwt: {e}")),
@@ -304,7 +313,7 @@ impl ApnsClient {
             path: format!("/3/device/{device_token}"),
             jwt,
             topic: self.cfg.topic.clone(),
-            payload: build_apns_payload(job_id),
+            payload,
         };
         match self.transport.post(req).await {
             Ok(status) if (200..300).contains(&status) => PushOutcome::Sent,
@@ -392,6 +401,43 @@ pub fn build_apns_payload(job_id: &str) -> Vec<u8> {
     })
     .to_string()
     .into_bytes()
+}
+
+/// Longest reason text carried into a scheduled-run alert. APNs caps the payload at 4KB
+/// and a lock-screen alert shows far less; a reason is a sentence, not a stack trace.
+pub const MAX_PUSH_REASON_CHARS: usize = 180;
+
+/// The APNs payload for a `[[schedule]]` run: the job's id and what happened to it, plus
+/// the turn's `job_id` WHEN THERE IS ONE so the tap opens the finished turn exactly as a
+/// completion push does. A skipped run has no turn, so it carries the alert alone.
+///
+/// The body always names the outcome, and a failure or skip always names its reason —
+/// "Jesse finished" would be worse than useless for the failure this feature exists to
+/// make visible.
+pub fn build_scheduled_payload(
+    schedule_id: &str,
+    outcome: &str,
+    reason: &str,
+    job_id: Option<&str>,
+) -> Vec<u8> {
+    let reason: String = reason.trim().chars().take(MAX_PUSH_REASON_CHARS).collect();
+    let body = if reason.is_empty() {
+        format!("{schedule_id} {outcome}")
+    } else {
+        format!("{schedule_id} {outcome} — {reason}")
+    };
+    let mut payload = json!({
+        "aps": {
+            "alert": { "title": "Jesse schedule", "body": body },
+            "sound": "default"
+        },
+        "schedule_id": schedule_id,
+        "outcome": outcome,
+    });
+    if let Some(id) = job_id {
+        payload["job_id"] = json!(id);
+    }
+    payload.to_string().into_bytes()
 }
 
 /// Whether a flagged, terminal job should fire a push: only a `Done` or `Failed`

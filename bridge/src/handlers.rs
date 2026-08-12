@@ -83,6 +83,36 @@ pub struct JesseRequest {
     model: Option<String>,
 }
 
+impl JesseRequest {
+    /// The request a `[[schedule]]` job submits: a mode, the prompt text, and nothing
+    /// else. Every other field takes its absent-field default, which is what makes a
+    /// scheduled turn identical to the simplest possible client turn.
+    ///
+    /// `session_id`/`conversation_id` are deliberately absent, so each fire is a FRESH
+    /// conversation rather than an ever-growing thread resumed forever: a routine that
+    /// runs every night should start from the vault, not from three months of its own
+    /// previous transcripts. The push carries the new turn's job id, so the phone still
+    /// opens the finished turn.
+    pub fn scheduled(mode: &str, text: String) -> Self {
+        JesseRequest {
+            mode: mode.to_string(),
+            text,
+            session_id: None,
+            conversation_id: None,
+            voice: false,
+            instructions: None,
+            floor_override: None,
+            attachments: Vec::new(),
+            health_context: None,
+            health_context_requested: None,
+            health_context_unavailable: None,
+            meal_corrections_ack: None,
+            request_id: None,
+            model: None,
+        }
+    }
+}
+
 /// Validate a POST /jesse idempotency `request_id`: at most 64 characters, ASCII
 /// alphanumerics and hyphens only, non-empty. Returns a one-line error message on
 /// rejection (the handler surfaces it as a `400`). Pure so it is unit-tested in
@@ -422,12 +452,59 @@ pub async fn jesse_prompts(
     })))
 }
 
+/// What [`start_turn`] decided. Either the turn was accepted (and is now running on its
+/// own task), or the request was rejected by one of the two validators that answer in the
+/// `{"error": …}` JSON shape rather than the plain-text [`ApiError`] one.
+pub enum TurnStart {
+    Accepted {
+        job_id: String,
+        conversation_id: String,
+    },
+    Invalid {
+        status: StatusCode,
+        message: String,
+    },
+}
+
 pub async fn jesse(
     State(st): State<AppState>,
     headers: HeaderMap,
     Json(req): Json<JesseRequest>,
 ) -> Result<Response, ApiError> {
     check_auth(&headers, &st.cfg.token)?;
+    match start_turn(&st, req, None).await? {
+        TurnStart::Accepted {
+            job_id,
+            conversation_id,
+        } => Ok(accepted_running(&job_id, &conversation_id)),
+        TurnStart::Invalid { status, message } => {
+            Ok((status, Json(json!({ "error": message }))).into_response())
+        }
+    }
+}
+
+/// THE TURN PATH, from an authenticated request to a job id.
+///
+/// Split out of [`jesse`] so that a turn the BRIDGE ITSELF originates — today, a
+/// `[[schedule]]` job (see [`crate::scheduler`]) — starts on exactly the same path a
+/// client request takes: same rate limiter, same conversation registration, same model
+/// resolution, same admission and slots, same job store, same retry and failure
+/// classification, same live stream, same terminal frame. A scheduled turn is therefore
+/// retrievable at `GET /jesse/result/{id}` like any other, and there is no second
+/// implementation of "run a turn" to drift.
+///
+/// `timeout_override` is the per-job `timeout_secs` from a schedule entry, still subject
+/// to the existing clamp; `None` (every client request) uses the global limit and is
+/// byte-for-byte the previous behavior.
+///
+/// Auth is the CALLER's business: `jesse` checks the bearer token before calling this, and
+/// the scheduler is inside the trust boundary already.
+pub async fn start_turn(
+    st: &AppState,
+    req: JesseRequest,
+    timeout_override: Option<u64>,
+) -> Result<TurnStart, ApiError> {
+    let st = st.clone();
 
     // Meal-corrections ack (JESSE_MEAL_LOG v2): if this turn carries the highest
     // `corrections_seq` the app has APPLIED, prune every queued batch at/below it before
@@ -455,7 +532,10 @@ pub async fn jesse(
     // a bad `request_id` already uses.
     if let Some(cid) = req.conversation_id.as_deref() {
         if let Err(msg) = validate_conversation_id(cid) {
-            return Ok((StatusCode::BAD_REQUEST, Json(json!({ "error": msg }))).into_response());
+            return Ok(TurnStart::Invalid {
+                status: StatusCode::BAD_REQUEST,
+                message: msg,
+            });
         }
     }
     let now_ms = system_time_to_ms(SystemTime::now());
@@ -488,10 +568,16 @@ pub async fn jesse(
         if let Err(msg) = validate_request_id(rid) {
             // A one-line JSON error, distinct from a plain-text ApiError so the shape
             // matches the JSON the client already parses on every other response.
-            return Ok((StatusCode::BAD_REQUEST, Json(json!({ "error": msg }))).into_response());
+            return Ok(TurnStart::Invalid {
+                status: StatusCode::BAD_REQUEST,
+                message: msg,
+            });
         }
         if let Some(existing) = st.jobs.dedup_lookup(rid) {
-            return Ok(accepted_running(&existing, &conversation_id));
+            return Ok(TurnStart::Accepted {
+                job_id: existing,
+                conversation_id,
+            });
         }
     }
 
@@ -690,7 +776,10 @@ pub async fn jesse(
     let job_id = match st.jobs.create_with_request_id(req.request_id.clone()) {
         CreateOutcome::Created(id) => id,
         CreateOutcome::Duplicate(existing) => {
-            return Ok(accepted_running(&existing, &conversation_id))
+            return Ok(TurnStart::Accepted {
+                job_id: existing,
+                conversation_id,
+            })
         }
     };
     // Open the live stream before spawning so a phone that opens
@@ -700,7 +789,19 @@ pub async fn jesse(
     // Run the turn on its OWN task that owns the child. Dropping this request
     // future (the phone suspends, the socket drops) does not cancel a spawned
     // tokio task, so the turn always runs to completion and lands in the store.
-    let cfg = st.cfg.clone();
+    // THE PER-TURN RUN LIMIT. A `[[schedule]]` job may override it (an overnight
+    // reindex needs longer than a phone turn), so the task gets a config whose
+    // `timeout_secs` is that override, clamped by the same `clamp_timeout_secs` the
+    // global one passes through — a per-job value can widen the limit within the hard
+    // ceiling, never past it. `None` (every client request) shares the global `Arc`
+    // and is byte-for-byte unchanged.
+    let cfg = match timeout_override {
+        Some(secs) => Arc::new(Config {
+            timeout_secs: clamp_timeout_secs(secs),
+            ..(*st.cfg).clone()
+        }),
+        None => st.cfg.clone(),
+    };
     let jobs = st.jobs.clone();
     let jid = job_id.clone();
     let sid = req.session_id.clone();
@@ -1534,7 +1635,10 @@ pub async fn jesse(
     // phone never saw — unavoidably unrecoverable without an id. That window is
     // now one round-trip instead of a multi-second hold, which is the whole point
     // of delivering the id eagerly.
-    Ok(accepted_running(&job_id, &conversation_id))
+    Ok(TurnStart::Accepted {
+        job_id,
+        conversation_id,
+    })
 }
 
 /// Fetch a turn's state by job id. This is what the app polls after a dropped
@@ -1983,6 +2087,10 @@ pub fn app(state: AppState) -> Router {
         // active model, and set a model's write permission (Phase 2 wires the effect).
         .route("/jesse/models", get(jesse_models))
         .route("/jesse/model", post(jesse_set_model))
+        // The built-in scheduler's ledger: every configured job, what it is, when it
+        // next fires, and what happened the last time it came due — so "did the morning
+        // routine run today, and how long did it take" is ONE request.
+        .route("/jesse/schedule", get(jesse_schedule))
         .layer(DefaultBodyLimit::max(body_limit))
         .with_state(state)
 }

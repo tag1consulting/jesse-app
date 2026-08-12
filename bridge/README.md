@@ -92,6 +92,9 @@ change lives in one focused module:
 | `sessions` | the conversation list, hydration, delete and flags handlers, plus the projects-dir scan, the transcript-turn parser, and the GC sweep |
 | `state` / `handlers` / `sse` | shared `AppState`, the Axum handlers + router, and the SSE body/forwarder |
 | `startup` | pairing-QR payload + the `binary_exists`/bind startup checks |
+| `schedule` | the `[[schedule]]` config: parse, validate (per-entry disable vs. startup error), and DST-correct next-fire / catch-up resolution. Pure — no clock of its own |
+| `schedstate` | the scheduler's persisted per-job record (`<state-dir>/schedule.json`): last due/fire/completion, outcome, reason, duration, job id |
+| `scheduler` | the tick task, chain execution under the one-scheduled-turn-at-a-time lock, single flight, the push, and `GET /jesse/schedule` |
 | `containment` | the containment RECORD: the `(capability, MCP set)` rows, the verdict/scoring rules, and the committed file's TOML shape (`bridge/containment.toml`). Always compiled — the startup gate reads it |
 | `probe` | the LIVE battery behind it: the adversarial probes, their ground-truth checks, the scratch worlds and the runner. Behind the `containment-probe` feature, so none of it is compiled into the serving binary; run by the `containment-probe` bin |
 
@@ -1402,6 +1405,47 @@ cargo run --release
 > device and a real APNs round-trip. The unit tests cover JWT signing, the payload
 > shape, the completion→push decision, and that a push failure can't disturb a
 > stored result, all without contacting Apple.
+
+## Scheduled turns (`[[schedule]]`, `GET /jesse/schedule`)
+
+The bridge fires recurring turns itself. Nothing else has to be running: no
+desktop app open, no GUI account signed in, no cron or launchd job. Jobs are
+declared in the same `jesse.local.toml` the persona and the model registry come
+from — every key is documented, with two worked chains, in
+[`jesse.example.toml`](../jesse.example.toml).
+
+**The design is a reaction to a specific failure.** The jobs this replaced lived
+in a desktop scheduler that silently stopped firing, and it went unnoticed for a
+month. So a scheduled job that does not run is *loud*, and the state that proves
+whether it ran is one request away:
+
+```bash
+curl -sH "authorization: Bearer $JESSE_TOKEN" http://127.0.0.1:8765/jesse/schedule | jq
+```
+
+That answers "did the morning routine run today, and how long did it take" —
+per job: head or link and what it hangs off, next expected fire, last fire, last
+completion, last outcome + reason, last duration, and the **job id of the last
+run**, so `GET /jesse/result/{id}` hands back the turn itself. Entries that
+failed validation are listed under `invalid` rather than quietly missing.
+
+Two invariants are worth knowing before you write a job:
+
+- **Chains, not clock times.** These jobs write the same working tree, so a job
+  hangs off another with `after` and starts only once that job's turn has *fully
+  completed*. At most **one** scheduled turn runs at any moment across all
+  chains, enforced by a scheduler-owned lock independent of the request
+  concurrency limit. A scheduled turn also yields to an interactive one: if the
+  model's slots are saturated by app turns it waits briefly, then skips.
+- **Every due occurrence ends with an outcome** — `ran`, `failed` or `skipped` —
+  a skip always carries its reason, and (unless `notify = false`) it is pushed.
+  A missed fire runs late if it is within `catch_up_secs` and is recorded as
+  skipped, with the delay, if it is not. `last_due_ms` is written *before* a turn
+  starts, so a restart can never double-fire an occurrence.
+
+A scheduled turn goes through the same path a phone request takes, so it appears
+in the job store, streams, retries and fails identically, and each fire is a
+fresh conversation rather than an ever-growing resumed thread.
 
 ## Prereqs
 

@@ -104,6 +104,13 @@ pub struct AppState {
     // simply not mirrored (no backlog — the sample is large enough). Always present;
     // inert unless `cfg.shadow_backend` is set. See [`shadow`].
     pub shadow_slot: Arc<Semaphore>,
+    // THE BUILT-IN SCHEDULER: the validated `[[schedule]]` jobs, their persisted
+    // last-run record, the one-scheduled-turn-at-a-time lock, and which chains are in
+    // flight. Always present so `GET /jesse/schedule` answers on every deploy (with an
+    // empty job list where nothing is configured); the tick task is spawned by `main`
+    // only when at least one job exists, so an unscheduled bridge runs no extra task.
+    // See [`scheduler`].
+    pub scheduler: Arc<Scheduler>,
 }
 
 impl AppState {
@@ -141,6 +148,7 @@ impl AppState {
                 .collect(),
         });
         let slots = Arc::new(SlotTable::new(&plan, cfg.max_queued));
+        let scheduler = Scheduler::new(cfg.schedule.clone(), cfg.schedule_file());
         let hook_helper = resolve_hook_helper();
         let limiter = Arc::new(RateLimiter::new(cfg.rate_per_min));
         // Seed the health cache from the registry (configured non-ambient models → optimistic
@@ -170,6 +178,7 @@ impl AppState {
             timings,
             // One shadow child at a time; separate from the production permit.
             shadow_slot: Arc::new(Semaphore::new(1)),
+            scheduler,
         };
         st.bootstrap_conversations();
         st

@@ -405,3 +405,170 @@ diet_keywords_extra = [
 # Vet a candidate helper before pairing it (no chat turn needed):
 #     vision-compare ./eval/vision/fixtures/statement.pdf paddleocr-vl,qwen3-vl
 #     vision-eval    ./eval/vision/manifest.json paddleocr-vl
+
+# =============================================================================
+# [[schedule]] — recurring turns, fired by the bridge itself
+# =============================================================================
+#
+# The bridge runs these on its own. No desktop app has to be open, no GUI account
+# has to be signed in, and no cron or launchd job is involved: the always-on
+# service that answers your phone is the thing that fires them.
+#
+# WHY IT IS BUILT LIKE THIS. The jobs this replaced lived in a desktop scheduler
+# that silently stopped firing, and nobody noticed for a month. So:
+#
+#   * every due job ends with an outcome — ran, failed or skipped — and a skip
+#     ALWAYS says why;
+#   * each of those is logged, recorded in <state-dir>/schedule.json, and pushed
+#     to the phone (see `notify`);
+#   * GET /jesse/schedule answers "did the morning routine run today, and how
+#     long did it take" in ONE authenticated request. Use it. That is the whole
+#     point of the endpoint:
+#         curl -sH "authorization: Bearer $JESSE_TOKEN" \
+#              http://127.0.0.1:8765/jesse/schedule | jq
+#
+# CHAINS, NOT A LIST OF CLOCK TIMES. These jobs all write the same working tree,
+# so two of them overlapping produces real conflicts. Rather than spacing them at
+# wall-clock times and hoping the estimates hold — estimates rot, and the day a
+# job runs long is the day you get a conflict — a job hangs off another with
+# `after` and starts only once that job's turn has FULLY completed.
+#
+# At most ONE scheduled turn runs at any moment, across every chain. If a second
+# chain's head comes due while another chain is running, it waits; if it is still
+# waiting when its `catch_up_secs` expires it is skipped and recorded. A scheduled
+# turn also yields to YOU: if the request concurrency limit is saturated by turns
+# from the app, it waits briefly and then skips rather than queueing behind you.
+#
+# Each fire is a fresh conversation and a normal turn — it lands in the job store
+# with a job id, retries and fails exactly like a phone turn, and is retrievable
+# at GET /jesse/result/{id} (the schedule endpoint reports that id as
+# `last_job_id`, and the push carries it so the tap opens the finished turn).
+#
+# ---------------------------------------------------------------------------
+# The keys
+# ---------------------------------------------------------------------------
+#
+#   id             REQUIRED, unique, stable. It is the state key and the handle
+#                  `after` refers to, so renaming one forgets its history. Two
+#                  entries sharing an id is a STARTUP ERROR (which one is
+#                  "nightly"? — the intent is unknowable).
+#   enabled        default true. `false` keeps the entry and stops it firing. A
+#                  disabled job breaks an `after_on = "success"` chain behind it,
+#                  which is the documented meaning of switching one off.
+#   at             LOCAL wall-clock "HH:MM". A job with `at` is a chain HEAD.
+#                  DST is handled properly: on the spring-forward day a time that
+#                  does not exist fires when the clock jumps past it (02:30 runs
+#                  at 03:00) rather than being silently skipped, and on the
+#                  fall-back day a time that happens twice fires exactly once.
+#   after          the `id` of another job. A job with `after` is a chain LINK: it
+#                  fires when that job finishes, never at a clock time.
+#                  EXACTLY ONE of `at` / `after` is required. Both, or neither,
+#                  disables that entry (and only that entry). A cycle in the
+#                  `after` graph is a STARTUP ERROR that prints the cycle.
+#   after_on       "success" (default) | "any". With "success" the link does not
+#                  run if its predecessor failed, was skipped, or was disabled,
+#                  and the whole rest of that chain is recorded as skipped naming
+#                  the job that broke it. With "any" it runs regardless — for the
+#                  report or cleanup step you most want when the step before it
+#                  went wrong. Only valid on a link.
+#   days           weekday names, default all seven ("mon".."sun", or full names).
+#                  Applies to HEADS AND LINKS alike, so a link can be narrower
+#                  than its head — a Monday-only job hanging off a daily chain.
+#   prompt         inline text for the turn, OR
+#   prompt_file    a path to a file holding it. Exactly one is required.
+#                  A RELATIVE path resolves against the vault root; an absolute
+#                  path is used as given. It is READ AT FIRE TIME and never
+#                  cached, so editing a prompt needs no restart. A missing or
+#                  unreadable file at fire time is a FAILED run carrying that
+#                  reason — never a crash, never a silently empty turn.
+#   mode           "tell" (default) | "ask" — the same modes a normal turn takes.
+#                  Scheduled work usually acts, hence the default.
+#   timeout_secs   per-job override of the global per-turn run limit
+#                  (JESSE_TIMEOUT), still clamped to the same hard ceiling. For
+#                  the one long job in a chain of short ones.
+#   notify         default true — push the outcome to the phone. A failure or an
+#                  unexpected skip pushes with its reason named; a chain that
+#                  breaks pushes ONCE for the break, not once per skipped link.
+#                  Two things deliberately do not push (they are what you asked
+#                  for, not news): a link skipped by its own `days` filter, and a
+#                  disabled entry. Set false to silence a job entirely — but note
+#                  that silence is exactly the failure this feature exists to fix.
+#   catch_up_secs  default 3600. HEADS ONLY (a link has no clock to be late
+#                  against; setting it on one disables that entry). If the host
+#                  was asleep or the service was down when the job was due, it
+#                  still runs when the service comes back — provided the delay is
+#                  within this window. Past it, the run is SKIPPED and the skip
+#                  records how late it was. Raise it for a job worth running
+#                  late; lower it for one that is worthless off its hour.
+#
+# A misconfiguration never takes the bridge down. An entry that fails validation
+# (both or neither of `at`/`after`, an unknown `after` target, `catch_up_secs` on
+# a link, an unparseable time or weekday, an unrecognized key) is logged with its
+# id, disabled ON ITS OWN, and listed under `invalid` on GET /jesse/schedule —
+# while every other job still runs. Only a duplicate id and an `after` cycle
+# refuse to start, because both make your intent unknowable.
+#
+# ---------------------------------------------------------------------------
+# Worked example 1 — an overnight chain: one head, three links
+# ---------------------------------------------------------------------------
+#
+# Head at 02:30 local, then three jobs each waiting for the one before it. The
+# third is Fridays only, so on any other day it is skipped (and its own tail with
+# it) while the rest of the chain runs normally.
+
+# [[schedule]]
+# id = "overnight-tidy"                  # the chain HEAD
+# at = "02:30"                           # local wall clock
+# prompt_file = "prompts/overnight-tidy.md"
+# catch_up_secs = 7200                   # still worth running up to 2h late
+#
+# [[schedule]]
+# id = "overnight-index"                 # runs when overnight-tidy has FINISHED
+# after = "overnight-tidy"
+# prompt_file = "prompts/overnight-index.md"
+#
+# [[schedule]]
+# id = "overnight-digest"
+# after = "overnight-index"
+# prompt_file = "prompts/overnight-digest.md"
+#
+# [[schedule]]
+# id = "overnight-archive"               # the weekly one, on a daily chain
+# after = "overnight-digest"
+# days = ["fri"]
+# prompt_file = "prompts/overnight-archive.md"
+
+# ---------------------------------------------------------------------------
+# Worked example 2 — a morning chain anchored to a real-world event
+# ---------------------------------------------------------------------------
+#
+# The head's `at` is chosen to line up with something in the world (here: the
+# household's alarm, so the briefing is ready when the phone is picked up). Its
+# catch-up window is short on purpose — a "good morning" briefing delivered at
+# lunchtime is worse than one that visibly did not run, and the skip says so.
+#
+# The last link is the long one: a weekly deep pass that needs far more than the
+# global per-turn limit, so it names its own. It runs on `after_on = "any"` so a
+# failure earlier in the chain does not cost you the weekly pass as well.
+
+# [[schedule]]
+# id = "morning-brief"                   # anchored to the 06:45 alarm
+# at = "06:45"
+# days = ["mon", "tue", "wed", "thu", "fri"]
+# prompt_file = "prompts/morning-brief.md"
+# catch_up_secs = 900                    # 15 min: after that it is not "morning"
+#
+# [[schedule]]
+# id = "morning-inbox"
+# after = "morning-brief"
+# prompt_file = "prompts/morning-inbox.md"
+# mode = "tell"                          # the default; shown for completeness
+#
+# [[schedule]]
+# id = "weekly-deep-pass"                # the long one
+# after = "morning-inbox"
+# after_on = "any"                       # run it even if the inbox pass failed
+# days = ["mon"]
+# prompt_file = "prompts/weekly-deep-pass.md"
+# timeout_secs = 5400                    # 90 min, well past the usual turn limit
+# notify = true                          # the default; this one you want to hear

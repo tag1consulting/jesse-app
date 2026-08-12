@@ -13,6 +13,99 @@ Every commit that changes a component **must** bump that component's version and
 add an entry here — enforced by `scripts/version-guard.sh` (the pre-push hook and
 CI both run it). See the "Versioning" section of `bridge/README.md`.
 
+## [Bridge 0.79.0] - 2026-08-12
+
+### Added
+
+- **The bridge schedules its own recurring turns (`[[schedule]]`).** Jobs fire
+  from the always-on service itself: no desktop app open, no GUI account signed
+  in, no cron or launchd job in the loop. Declared in the same
+  `jesse.local.toml` the persona and the model registry come from, and documented
+  key by key — with two worked chains — in `jesse.example.toml`.
+
+  **This is a reaction to a specific failure.** The jobs it replaces lived in a
+  desktop scheduler that silently stopped firing, and nobody noticed for a month.
+  Everything below follows from that: a scheduled job that does not run is loud,
+  and the state that proves whether it ran is one request away.
+
+  **Chains, not spaced clock times.** These jobs all mutate the same working
+  tree, and two turns writing it at once already produces real conflicts. So a
+  job hangs off another (`after = "<id>"`) and starts only once that job's turn
+  has *fully completed and landed in the job store* — not at a wall-clock time
+  chosen from an estimate that will rot. Only a chain HEAD carries `at`. At most
+  **one** scheduled turn runs at any moment across every chain, enforced by a
+  scheduler-owned lock that is deliberately **not** the request concurrency
+  semaphore: that one bounds load and is sized by the operator, this one keeps
+  two agents off one working tree and is always exactly one. A second chain that
+  comes due meanwhile waits for it; if it is still waiting when its
+  `catch_up_secs` expires it is skipped and recorded, never started hours late.
+
+  `after_on = "success"` (the default) stops a chain when its predecessor failed,
+  was skipped, or was disabled, and records the rest of that chain as skipped
+  **naming the job that actually broke it** — not merely the link above it, which
+  would send someone looking in the wrong place. `after_on = "any"` is the
+  cleanup/report step you most want exactly when the step before it went wrong.
+  `days` applies to heads and links alike, so a Monday-only job can hang off a
+  daily chain.
+
+  **Nothing is silent.** Every due occurrence ends as `ran`, `failed` or
+  `skipped`; a skip always carries its reason; each is logged, recorded in
+  `<state-dir>/schedule.json`, and pushed to the phone (`notify`, default true)
+  through the same APNs path a completed detached turn uses — carrying the turn's
+  job id so the tap opens it. A chain that breaks pushes **once** for the break
+  rather than once per skipped link, and the two skips the operator explicitly
+  asked for — a `days` filter that excludes today, and a disabled entry — are
+  recorded but not pushed, because a channel that cries every Tuesday is a
+  channel nobody reads, which is how the original failure went unnoticed.
+
+  **Missed fires.** Per-job last-due / last-fire / last-completion / outcome are
+  persisted atomically. A fire missed while the host slept or the service was
+  down still runs if the delay is within `catch_up_secs` (default 3600), and is
+  skipped-with-the-delay-named if it is not. The occurrence is claimed *before*
+  any turn starts, so a crash or a restart mid-window can never replay it; a
+  multi-day outage collapses to the most recent occurrence rather than replaying
+  a week of "morning routine" at once, and says how many it collapsed.
+
+  **Single flight and no starvation.** A chain still running when its head comes
+  due again skips the new fire and records why, rather than queueing it. And a
+  scheduled turn never starves an interactive one: if the model's slots are
+  saturated by client turns it waits briefly (60s) and then skips.
+
+  **DST is handled, not hoped over.** `at` is local wall clock, resolved with
+  `chrono` (the one new runtime dependency; `chrono-tz` is dev-only, for
+  deterministic tests against a named zone). On a spring-forward day a time that
+  does not exist fires when the clock jumps past it — 02:30 runs at 03:00 —
+  rather than being silently skipped; on a fall-back day a time that happens
+  twice fires exactly once.
+
+  **A misconfiguration cannot take the service down.** An entry that fails
+  validation — both or neither of `at`/`after`, an unknown `after` target,
+  `catch_up_secs` on a link, an unparseable time or weekday, or an unrecognized
+  key — is logged with its id, disabled *on its own*, and surfaced under
+  `invalid` on the new endpoint, while every other job runs. The two exceptions
+  are a duplicate `id` and a cycle in the `after` graph: both make the operator's
+  intent unknowable, so they join the existing startup gate and refuse the boot,
+  naming the duplicate or printing the cycle.
+
+- **`GET /jesse/schedule`** (authenticated). Every configured job with: whether
+  it is a head or a link and what it hangs off, next expected fire, last fire,
+  last completion, last outcome and reason, last duration, and the **job id of
+  the last run** — so `GET /jesse/result/{id}` hands back the turn itself. "Did
+  the morning routine run today, and how long did it take" is now one request
+  instead of a hunt through file timestamps.
+
+### Changed
+
+- **`POST /jesse`'s body is now a reusable `start_turn`.** The handler is
+  auth + `start_turn`, and a scheduled turn calls the same function — so it takes
+  the identical path a client request takes (same rate limiter, conversation
+  registration, model resolution, admission and slots, job store, retry and
+  failure classification, live stream, terminal frame) and there is no second
+  implementation of "run a turn" to drift. Response shapes are unchanged. It also
+  gained a per-turn run-limit override, used only by a `[[schedule]]` job's
+  `timeout_secs` and still passed through the existing `clamp_timeout_secs`
+  ceiling; every client request passes `None` and is byte-for-byte unchanged.
+
 ## [Unreleased]
 
 ### Changed

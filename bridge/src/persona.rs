@@ -198,6 +198,14 @@ struct LocalConfig {
     /// the model registry down with it).
     #[serde(default)]
     concurrency: HashMap<String, toml::Value>,
+    /// The built-in scheduler's `[[schedule]]` entries (see [`crate::schedule`]).
+    ///
+    /// Kept RAW here — every field optional, unknown keys captured — so a mistyped entry
+    /// reaches the validator, which disables that one entry by name, instead of failing
+    /// the parse of this whole file and silently taking the persona and the model
+    /// registry down with it.
+    #[serde(default)]
+    schedule: Vec<ScheduleToml>,
 }
 
 /// Resolve the local overlay file, first existing wins:
@@ -270,6 +278,16 @@ pub fn load_concurrency(home: &str) -> ConcurrencySettings {
         }
     }
     out
+}
+
+/// Read the `[[schedule]]` array from the same overlay file (same search order, same
+/// soft-fail: a missing or malformed file yields an empty schedule and the bridge runs
+/// with no scheduled jobs at all). Validation is [`validate_schedule`]'s job, not this
+/// one's — a partial entry is reported there, by name.
+pub fn load_schedule(home: &str) -> Vec<ScheduleToml> {
+    load_local_config(home)
+        .map(|c| c.schedule)
+        .unwrap_or_default()
 }
 
 /// Read the `offload_order` list from the same overlay file, blank ids dropped. Absent or
@@ -454,6 +472,94 @@ diet_keywords_extra = ["tacos", "elote"]
         std::env::remove_var("JESSE_CONFIG");
         std::env::remove_var("JESSE_OWNER_NAME");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The `[[schedule]]` array reaches the validator through the real TOML reader —
+    /// including the `extra` catch-all, which is what turns a mistyped key into a named,
+    /// individually-disabled entry instead of a key that silently does nothing.
+    #[test]
+    fn load_reads_the_schedule_array_including_a_mistyped_key() {
+        let _g = ENV_LOCK.lock_ok();
+        for k in ["JESSE_CONFIG", "JESSE_STATE_DIR"] {
+            std::env::remove_var(k);
+        }
+        let dir = std::env::temp_dir().join(format!("jesse-schedule-cfg-{}", random_hex()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("jesse.local.toml");
+        std::fs::write(
+            &file,
+            r#"
+[persona]
+owner_name = "Alex Example"
+
+[[schedule]]
+id = "overnight"
+at = "02:30"
+prompt_file = "prompts/overnight.md"
+days = ["mon", "tue", "wed", "thu", "fri"]
+catch_up_secs = 7200
+
+[[schedule]]
+id = "overnight-report"
+after = "overnight"
+after_on = "any"
+prompt = "Summarise what the overnight pass changed."
+mode = "tell"
+timeout_secs = 900
+notify = false
+
+[[schedule]]
+id = "typo"
+at = "06:00"
+prompt = "x"
+catchup_secs = 60
+"#,
+        )
+        .unwrap();
+        std::env::set_var("JESSE_CONFIG", &file);
+
+        let raw = load_schedule("");
+        assert_eq!(raw.len(), 3);
+        let s = validate_schedule(&raw);
+        assert!(s.fatal.is_empty(), "{:?}", s.fatal);
+
+        // The two good entries survive, with every field carried through.
+        assert_eq!(s.jobs.len(), 2);
+        let head = s.get("overnight").unwrap();
+        assert_eq!(head.at_label().as_deref(), Some("02:30"));
+        assert_eq!(head.days.names(), vec!["mon", "tue", "wed", "thu", "fri"]);
+        assert_eq!(head.catch_up_secs, 7200);
+        assert_eq!(head.mode, "tell"); // the acting default
+        assert!(head.notify);
+        let link = s.get("overnight-report").unwrap();
+        assert_eq!(link.after(), Some("overnight"));
+        assert_eq!(link.after_on(), AfterOn::Any);
+        assert_eq!(link.timeout_secs, Some(900));
+        assert!(!link.notify);
+        assert_eq!(s.chain("overnight"), vec!["overnight", "overnight-report"]);
+
+        // The mistyped key disables ONLY its own entry, and says which key it was.
+        assert_eq!(s.invalid.len(), 1);
+        assert_eq!(s.invalid[0].id, "typo");
+        assert!(s.invalid[0].reason.contains("catchup_secs"));
+
+        // And the rest of the overlay file still loaded.
+        assert_eq!(Persona::load("").owner_name, "Alex Example");
+
+        std::env::remove_var("JESSE_CONFIG");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A file with NO `[[schedule]]` is a bridge with no scheduled jobs — not an error,
+    /// and not a tick task.
+    #[test]
+    fn an_absent_schedule_array_is_an_empty_schedule() {
+        let _g = ENV_LOCK.lock_ok();
+        std::env::set_var("JESSE_CONFIG", "/nonexistent/jesse.local.toml");
+        assert!(load_schedule("").is_empty());
+        let s = validate_schedule(&[]);
+        assert!(s.jobs.is_empty() && s.invalid.is_empty() && !s.is_fatal());
+        std::env::remove_var("JESSE_CONFIG");
     }
 
     #[test]

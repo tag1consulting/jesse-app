@@ -9,8 +9,8 @@ use jesse_bridge::{
     export_mcp_server_env, harness_bin_env, harness_default_bin, harnesses_in_use, is_bind_allowed,
     load_local_models, manual_pairing_lines, pairing_payload, qr_env_tristate, serve_broker,
     settings_permission_drift, show_qr_opt_in, show_token_opt_in, spawn_eviction_task,
-    spawn_session_gc_task, start_health_prober, validate_model_config, AppState, Config,
-    ConfigError, QrArt, TokenVisibility, BINARY_DRIFT, CONTAINMENT_RECORDS, SETTINGS_DRIFT,
+    spawn_scheduler, spawn_session_gc_task, start_health_prober, validate_model_config, AppState,
+    Config, ConfigError, QrArt, TokenVisibility, BINARY_DRIFT, CONTAINMENT_RECORDS, SETTINGS_DRIFT,
 };
 
 #[tokio::main]
@@ -56,6 +56,16 @@ async fn main() {
             message,
         }));
     }
+    // The `[[schedule]]` table joins the same gate for the TWO problems that make an
+    // operator's intent unknowable rather than merely wrong: two entries sharing an `id`
+    // (which one is "nightly"?) and a cycle in the `after` graph (which link runs first?).
+    // Every OTHER scheduler misconfiguration is deliberately not here — it disables that
+    // one entry, logs it by name, and leaves the rest of the schedule running (see
+    // `spawn_scheduler`), because a bad job must never take the service down.
+    errors.extend(cfg.schedule.fatal.iter().map(|message| ConfigError {
+        model: None,
+        message: message.clone(),
+    }));
     if !errors.is_empty() {
         eprintln!(
             "jesse-bridge: refusing to start — {} configuration problem(s):",
@@ -304,6 +314,11 @@ async fn main() {
              broker socket. The vault write lock is DISARMED."
         ),
     }
+    // THE SCHEDULER'S TICK. Started last, once every other subsystem the turn path needs
+    // is up, because a scheduled turn runs through exactly the same path a phone request
+    // takes. A deploy with no `[[schedule]]` entries starts no task at all; entries that
+    // failed validation are logged here, by name, and their neighbours still run.
+    spawn_scheduler(state.clone());
     axum::serve(listener, app(state))
         .await
         .expect("server error");
