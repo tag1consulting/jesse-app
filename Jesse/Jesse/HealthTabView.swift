@@ -28,14 +28,16 @@ struct HealthTabView: View {
     var body: some View {
         NavigationStack {
             HealthDashboardContent(model: model)
+                // DECLARATION ORDER IS LEFT-TO-RIGHT, and the trailing items are ordered
+                // by how often they are tapped: quick log runs several times a day and is
+                // cheap and repeatable, so it is declared LAST and sits farthest right.
+                // "Start new day" fires once a day, runs for minutes and rewrites the day
+                // file, so it moves inward and away from the mis-tap slot. See README,
+                // "UI conventions".
                 .toolbar {
                     // Quick log and "Start new day" are both today-only (they act on
                     // today), so they're hidden while paging back through a past day.
                     if HistoryUI.showsQuickLog(isHistorical: model.snapshot?.isHistorical ?? false) {
-                        ToolbarItem(placement: .primaryAction) {
-                            Button { showQuickLog = true } label: { Image(systemName: "plus") }
-                                .accessibilityLabel("Quick log")
-                        }
                         // BOTH items must be `.primaryAction`. `.secondaryAction` (which
                         // this one shipped as) does NOT mean "the second button" on iOS:
                         // UIKit collapses secondary items into a "More" overflow ellipsis.
@@ -46,6 +48,10 @@ struct HealthTabView: View {
                         ToolbarItem(placement: .primaryAction) {
                             Button { confirmNewDay = true } label: { Image(systemName: "sun.horizon") }
                                 .accessibilityLabel("Start new day")
+                        }
+                        ToolbarItem(placement: .primaryAction) {
+                            Button { showQuickLog = true } label: { Image(systemName: "plus") }
+                                .accessibilityLabel("Quick log")
                         }
                     }
                 }

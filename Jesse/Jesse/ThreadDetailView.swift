@@ -123,7 +123,31 @@ struct ThreadDetailView: View {
         .onAppear {
             if attachedContext != nil && turns.isEmpty { inputFocused = true }
         }
+        // DECLARATION ORDER IS LEFT-TO-RIGHT, ordered by taps per day: the star is a
+        // one-tap toggle that undoes itself, so it is declared LAST and sits farthest
+        // right; the model picker is set once for a conversation and rarely touched
+        // again; Share is the rarest of the three and the only one that leaves the app,
+        // so it is farthest from the mis-tap slot. See README, "UI conventions".
         .toolbar {
+            ToolbarItem(placement: .topBarTrailing) {
+                // Share the whole conversation as a role-labeled Markdown
+                // transcript. ShareLink gives Copy + the system share sheet for
+                // free. Hidden until there's something to share.
+                if !turns.isEmpty {
+                    ShareLink(item: thread.sharedTranscript) {
+                        Label("Share conversation", systemImage: "square.and.arrow.up")
+                    }
+                }
+            }
+            ToolbarItem(placement: .topBarTrailing) {
+                // The PER-CONVERSATION model picker, one tap from the thread: shows the model
+                // THIS conversation will send its next turn on and lets you change it without
+                // leaving the thread. The choice is local — per thread and per device — so it
+                // never affects another conversation or another device. Hidden on an older
+                // bridge (no models route). The next turn uses the new model; earlier turns
+                // keep the model that served them (each reply's chip is authoritative).
+                ModelPickerMenu(thread: thread)
+            }
             ToolbarItem(placement: .topBarTrailing) {
                 Button {
                     thread.toggleFavorite()
@@ -140,25 +164,6 @@ struct ThreadDetailView: View {
                           systemImage: thread.isFavorite ? "star.fill" : "star")
                 }
                 .tint(thread.isFavorite ? .yellow : nil)
-            }
-            ToolbarItem(placement: .topBarTrailing) {
-                // The PER-CONVERSATION model picker, one tap from the thread: shows the model
-                // THIS conversation will send its next turn on and lets you change it without
-                // leaving the thread. The choice is local — per thread and per device — so it
-                // never affects another conversation or another device. Hidden on an older
-                // bridge (no models route). The next turn uses the new model; earlier turns
-                // keep the model that served them (each reply's chip is authoritative).
-                ModelPickerMenu(thread: thread)
-            }
-            ToolbarItem(placement: .topBarTrailing) {
-                // Share the whole conversation as a role-labeled Markdown
-                // transcript. ShareLink gives Copy + the system share sheet for
-                // free. Hidden until there's something to share.
-                if !turns.isEmpty {
-                    ShareLink(item: thread.sharedTranscript) {
-                        Label("Share conversation", systemImage: "square.and.arrow.up")
-                    }
-                }
             }
         }
     }

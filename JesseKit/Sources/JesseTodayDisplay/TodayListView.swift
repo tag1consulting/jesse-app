@@ -94,6 +94,12 @@ public struct TodayListView: View {
                 content(snapshot)
             }
         }
+        // DECLARATION ORDER IS LEFT-TO-RIGHT. Process updates is declared FIRST and the
+        // sort menu second, so the sort menu takes the rightmost slot even though it is
+        // touched less often: processing closes checked items at source, rewriting every
+        // named project file, the Dashboard and the day file, and a heavy action never
+        // takes the slot a mis-tap lands in. Changing the sort is cheap and repeatable,
+        // which is exactly what that slot is for. See README, "UI conventions".
         .toolbar {
             // `.primaryAction`, not `.secondaryAction`: the latter collapses into an
             // overflow "More" ellipsis on iOS, which is where a control goes to be

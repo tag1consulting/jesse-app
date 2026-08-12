@@ -200,37 +200,24 @@ struct MacRootView: View {
         .onChange(of: listModel.searchText) { _, _ in driveSearch() }
         .onChange(of: searchExpansionEnabled) { _, _ in driveSearch() }
         .navigationTitle("Jesse")
+        // DECLARATION ORDER IS LEFT-TO-RIGHT, ordered by taps per day exactly as on the
+        // iPhone: New Chat is the most-used action here so it is declared LAST and sits
+        // farthest right, the morning routine is next, and the rest work inward through
+        // Refresh, the favorites filter, Archive, and Settings, which is opened least of
+        // all. See README, "UI conventions".
+        //
+        // ONE MAC-ONLY CONSEQUENCE, measured rather than assumed: this group renders
+        // above the SIDEBAR, so its width is the sidebar's, not the window's, and at the
+        // default sidebar width only three of the six items are laid out. The rest go
+        // into the "more toolbar items" overflow, and NSToolbar clips from the trailing
+        // end. Every keyboard shortcut in this group still works while clipped, and
+        // widening the sidebar reveals more items.
         .toolbar {
             ToolbarItemGroup {
-                Button { newChat() } label: { Label("New Chat", systemImage: "square.and.pencil") }
-                    .keyboardShortcut("n", modifiers: .command)
-                    .disabled(!coordinator.configStore.isConfigured)
-                // The morning routine, as a button — the Mac half of the phone's Chats
-                // toolbar item, sending the same bytes from the same shared constant.
-                // `cup.and.saucer` because both sun glyphs are spoken for: `sun.horizon`
-                // is the Health tab's "Start new day" and `sunrise` is the Today tab.
-                //
-                // NO KEYBOARD SHORTCUT, unlike every other button in this group. The
-                // other four are cheap and reversible (a new chat, a refresh, a filter
-                // flip, an archive toggle); this one starts a routine that runs for
-                // minutes and rewrites the day file, and a shortcut is exactly how it
-                // would get fired by a mistyped ⌘-something.
-                Button { confirmMorningRoutine = true } label: {
-                    Label(MorningRoutine.dialogTitle, systemImage: "cup.and.saucer")
-                }
-                .help("Run the full start of day routine")
-                .disabled(!coordinator.configStore.isConfigured)
-                Button { Task { await coordinator.refreshSessions(context: context) } } label: {
-                    Label("Refresh", systemImage: "arrow.clockwise")
-                }
-                .keyboardShortcut("r", modifiers: .command)
-                // Toggle the favorites filter. ⌘⇧F flips scope even with no visible
-                // control focused; the segmented picker below mirrors the same state.
-                Button { listModel.toggleFavoritesScope() } label: {
-                    Label("Show Favorites",
-                          systemImage: listModel.scope == .favorites ? "star.fill" : "star")
-                }
-                .keyboardShortcut("f", modifiers: [.command, .shift])
+                // Opens the shared Settings scene. The scene owns the standard ⌘, shortcut
+                // globally, so this button carries none of its own (a second ⌘, binding
+                // would just shadow the system one).
+                Button { openSettings() } label: { Label("Settings", systemImage: "gearshape") }
                 // Archive / restore the selected conversation. ⌘⇧A works with only a
                 // sidebar selection (no visible control focused); the row's context
                 // menu and trailing swipe mirror the same action. Disabled with no
@@ -242,10 +229,36 @@ struct MacRootView: View {
                 }
                 .keyboardShortcut("a", modifiers: [.command, .shift])
                 .disabled(selectedThread == nil)
-                // Opens the shared Settings scene. The scene owns the standard ⌘, shortcut
-                // globally, so this button carries none of its own (a second ⌘, binding
-                // would just shadow the system one).
-                Button { openSettings() } label: { Label("Settings", systemImage: "gearshape") }
+                // Toggle the favorites filter. ⌘⇧F flips scope even with no visible
+                // control focused; the segmented picker below mirrors the same state.
+                Button { listModel.toggleFavoritesScope() } label: {
+                    Label("Show Favorites",
+                          systemImage: listModel.scope == .favorites ? "star.fill" : "star")
+                }
+                .keyboardShortcut("f", modifiers: [.command, .shift])
+                Button { Task { await coordinator.refreshSessions(context: context) } } label: {
+                    Label("Refresh", systemImage: "arrow.clockwise")
+                }
+                .keyboardShortcut("r", modifiers: .command)
+                // The morning routine, as a button — the Mac half of the phone's Chats
+                // toolbar item, sending the same bytes from the same shared constant.
+                // `cup.and.saucer` because both sun glyphs are spoken for: `sun.horizon`
+                // is the Health tab's "Start new day" and `sunrise` is the Today tab.
+                //
+                // NO KEYBOARD SHORTCUT, unlike every other button in this group. The
+                // other four are cheap and reversible (a new chat, a refresh, a filter
+                // flip, an archive toggle); this one starts a routine that runs for
+                // minutes and rewrites the day file, and a shortcut is exactly how it
+                // would get fired by a mistyped ⌘-something. Being heavy is also why it
+                // sits inward of New Chat rather than in the rightmost, mis-click slot.
+                Button { confirmMorningRoutine = true } label: {
+                    Label(MorningRoutine.dialogTitle, systemImage: "cup.and.saucer")
+                }
+                .help("Run the full start of day routine")
+                .disabled(!coordinator.configStore.isConfigured)
+                Button { newChat() } label: { Label("New Chat", systemImage: "square.and.pencil") }
+                    .keyboardShortcut("n", modifiers: .command)
+                    .disabled(!coordinator.configStore.isConfigured)
             }
         }
         // Same confirmation as the phone, from the same shared copy: a click starts a

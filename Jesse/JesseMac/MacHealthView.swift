@@ -43,13 +43,19 @@ struct MacHealthView: View {
     var body: some View {
         NavigationStack {
             HealthDashboardContent(model: model)
+                // DECLARATION ORDER IS LEFT-TO-RIGHT, ordered by clicks per day. Refresh
+                // is the cheap, safe, repeatable one and takes the rightmost slot, which
+                // is the slot a mis-click lands in; "Start new day" runs for minutes and
+                // rewrites the day file, so it sits inward, in the same position it holds
+                // on the iPhone (there the rightmost item is quick log, which this shell
+                // does not have); Settings is opened least often and is farthest inward.
+                // See README, "UI conventions".
                 .toolbar {
                     ToolbarItem {
-                        Button { Task { await model.refresh() } } label: {
-                            Label("Refresh", systemImage: "arrow.clockwise")
+                        Button { openSettings() } label: {
+                            Label("Settings", systemImage: "gearshape")
                         }
-                        .keyboardShortcut("r", modifiers: .command)
-                        .help("Refresh the day on screen")
+                        .help("Pair with your bridge, or change the connection")
                     }
                     ToolbarItem {
                         Button { confirmNewDay = true } label: {
@@ -58,10 +64,11 @@ struct MacHealthView: View {
                         .help("Start a new health day")
                     }
                     ToolbarItem {
-                        Button { openSettings() } label: {
-                            Label("Settings", systemImage: "gearshape")
+                        Button { Task { await model.refresh() } } label: {
+                            Label("Refresh", systemImage: "arrow.clockwise")
                         }
-                        .help("Pair with your bridge, or change the connection")
+                        .keyboardShortcut("r", modifiers: .command)
+                        .help("Refresh the day on screen")
                     }
                 }
                 // A tap could kick off the long morning routine, so confirm first.

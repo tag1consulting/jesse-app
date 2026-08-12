@@ -140,6 +140,25 @@ final class ChatsToolbarUITests: XCTestCase {
                       "the compose button pushed an empty conversation")
     }
 
+    /// The toolbar is ordered by taps per day, most-used farthest right (README, "UI
+    /// conventions"). New conversation is the most-tapped action on this screen and is
+    /// cheap and reversible, so it holds the rightmost slot; "Good morning" fires once a
+    /// day and starts a routine that runs for minutes, so it sits inward, away from
+    /// where a mis-tap lands. Order is a rendering fact no unit test can see: both
+    /// declaration orders compile and behave identically everywhere else.
+    func testNewConversationSitsRightOfGoodMorning() {
+        let app = XCUIApplication()
+        app.launch()
+        openChatsTab(app)
+
+        let newConversation = app.navigationBars.buttons["New conversation"]
+        let goodMorning = app.navigationBars.buttons["Good morning"]
+        XCTAssertTrue(goodMorning.waitForExistence(timeout: 10), "Good morning is in the navigation bar")
+
+        XCTAssertGreaterThan(newConversation.frame.minX, goodMorning.frame.minX,
+                             "New conversation is the rightmost item; Good morning sits inward of it")
+    }
+
     /// iOS 26 anchors a `confirmationDialog` as a popover with no explicit Cancel row
     /// (tap-outside dismisses), while the sheet form has one. Handle both rather than
     /// assuming either, exactly as `HealthToolbarUITests` does.
