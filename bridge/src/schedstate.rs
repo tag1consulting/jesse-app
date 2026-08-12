@@ -94,6 +94,24 @@ pub struct JobRecord {
     /// ran.
     #[serde(default)]
     pub last_job_id: Option<String>,
+    /// AN OCCURRENCE THAT IS STILL ELIGIBLE TO RUN, unix millis — set when a fire was
+    /// skipped for a TRANSIENT reason that will very likely be gone in seconds (today:
+    /// the model's slots were saturated by client turns).
+    ///
+    /// It exists because those two situations are not the same thing, even though both
+    /// end in "skipped":
+    ///
+    ///   * the host was asleep at 02:30 — the moment is gone, and whether to run late is
+    ///     exactly what `catch_up_secs` decides;
+    ///   * someone was mid-conversation with Jesse for ninety seconds — nothing about the
+    ///     occurrence is stale, the bridge was simply busy, and dropping the run until
+    ///     tomorrow costs a day for a collision that cost seconds.
+    ///
+    /// So a transient skip re-arms here and the next tick retries the SAME occurrence,
+    /// for as long as it stays inside the head's `catch_up_secs`. `last_due_ms` is left
+    /// alone throughout — the anti-double-fire anchor is never rolled backwards.
+    #[serde(default)]
+    pub retry_due_ms: Option<u64>,
 }
 
 impl JobRecord {
@@ -153,8 +171,25 @@ impl ScheduleStateStore {
 
     /// CLAIM an occurrence: stamp `last_due_ms` before anything runs, so a crash or a
     /// restart between here and the turn's completion cannot replay it.
+    ///
+    /// Also clears any pending retry: this attempt supersedes it. If the attempt is
+    /// itself skipped transiently, [`arm_retry`](Self::arm_retry) sets a fresh one.
     pub fn claim(&self, id: &str, due_ms: u64) {
-        self.update(id, |r| r.last_due_ms = Some(due_ms));
+        self.update(id, |r| {
+            r.last_due_ms = Some(due_ms);
+            r.retry_due_ms = None;
+        });
+    }
+
+    /// Mark this occurrence still eligible after a TRANSIENT skip, so the next tick
+    /// retries it. Deliberately does NOT touch `last_due_ms` — see the field's note.
+    pub fn arm_retry(&self, id: &str, due_ms: u64) {
+        self.update(id, |r| r.retry_due_ms = Some(due_ms));
+    }
+
+    /// Drop a pending retry (its window closed, or a newer occurrence superseded it).
+    pub fn clear_retry(&self, id: &str) {
+        self.update(id, |r| r.retry_due_ms = None);
     }
 
     /// A turn started for this id.
@@ -305,6 +340,35 @@ mod tests {
     }
 
     #[test]
+    fn a_retry_arms_clears_and_never_moves_the_anti_double_fire_anchor() {
+        let s = ScheduleStateStore::new(None);
+        s.claim("nightly", 1000);
+        assert_eq!(s.get("nightly").retry_due_ms, None);
+
+        // A transient skip re-arms the SAME occurrence…
+        s.finished("nightly", Outcome::Skipped, "saturated", 1100, None);
+        s.arm_retry("nightly", 1000);
+        let rec = s.get("nightly");
+        assert_eq!(rec.retry_due_ms, Some(1000));
+        assert_eq!(
+            rec.last_due_ms,
+            Some(1000),
+            "arming a retry must NOT roll the anchor backwards"
+        );
+
+        // …and claiming it again (the retry attempt) clears the pending retry, so a
+        // successful attempt cannot leave one behind to fire a third time.
+        s.claim("nightly", 1000);
+        assert_eq!(s.get("nightly").retry_due_ms, None);
+        assert_eq!(s.get("nightly").last_due_ms, Some(1000));
+
+        // And it can be dropped outright when its window closes.
+        s.arm_retry("nightly", 1000);
+        s.clear_retry("nightly");
+        assert_eq!(s.get("nightly").retry_due_ms, None);
+    }
+
+    #[test]
     fn state_survives_a_simulated_restart() {
         let path = temp_state_path();
         {
@@ -321,6 +385,9 @@ mod tests {
                 1_700_000_100_100,
                 None,
             );
+            // A pending retry must survive the restart too, or a transient skip taken
+            // moments before a restart would silently become a dropped occurrence.
+            s.arm_retry("weekly", 1_700_000_100_000);
         }
         // A fresh store over the same file is the restart.
         let s = ScheduleStateStore::new(Some(path.clone()));
@@ -332,6 +399,11 @@ mod tests {
         let w = s.get("weekly");
         assert_eq!(w.outcome(), Some(Outcome::Skipped));
         assert_eq!(w.last_reason, "predecessor 'nightly' failed");
+        assert_eq!(
+            w.retry_due_ms,
+            Some(1_700_000_100_000),
+            "a pending retry must survive a restart"
+        );
         // An id that never came due reads as a blank record, not an error.
         assert_eq!(s.get("never"), JobRecord::default());
         let _ = std::fs::remove_dir_all(path.parent().unwrap());

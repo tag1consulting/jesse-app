@@ -1442,6 +1442,13 @@ Two invariants are worth knowing before you write a job:
   A missed fire runs late if it is within `catch_up_secs` and is recorded as
   skipped, with the delay, if it is not. `last_due_ms` is written *before* a turn
   starts, so a restart can never double-fire an occurrence.
+- **A skip caused by *you* is retried, not dropped.** Downtime and a slot
+  collision both end in "skipped", but they are not the same thing: after an
+  outage the moment is genuinely stale, whereas a fire that yielded to your own
+  turns is an occurrence nothing happened to. The latter stays eligible
+  (`retry_due_ms` on the endpoint) and the next tick runs it, bounded by the same
+  `catch_up_secs`. Only a chain head retries — replaying a chain whose earlier
+  members already succeeded would redo their work against the vault.
 
 A scheduled turn goes through the same path a phone request takes, so it appears
 in the job store, streams, retries and fails identically, and each fire is a

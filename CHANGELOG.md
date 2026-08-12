@@ -13,6 +13,35 @@ Every commit that changes a component **must** bump that component's version and
 add an entry here — enforced by `scripts/version-guard.sh` (the pre-push hook and
 CI both run it). See the "Versioning" section of `bridge/README.md`.
 
+## [Bridge 0.80.0] - 2026-08-12
+
+### Changed
+
+- **A scheduled fire skipped because the bridge was busy serving *you* is now
+  retried, not dropped until tomorrow.** Downtime and a slot collision both ended
+  in `skipped` in 0.79.0, and treating them alike was wrong: after an outage the
+  moment is genuinely stale, and whether to run late is exactly what
+  `catch_up_secs` decides — but a fire that yielded to a person's own turns is an
+  occurrence nothing happened to. The bridge was busy for ninety seconds; losing
+  the day's run over that is a bad trade.
+
+  So a saturation skip now leaves the occurrence **eligible** (`retry_due_ms` in
+  the state file and on `GET /jesse/schedule`) and the next tick retries the same
+  occurrence, for as long as it is inside the head's `catch_up_secs`. Past that
+  edge it is skipped for good with the delay named, exactly as a missed fire is —
+  a transient collision buys minutes, not licence to run the morning routine at
+  lunchtime. Every other skip is unchanged: a `days` filter, a disabled entry, a
+  broken chain, an expired catch-up window and a still-running chain all consume
+  their occurrence as before.
+
+  Two invariants keep this safe. `last_due_ms` — the anti-double-fire anchor — is
+  **never rolled backwards**; the retry is a separate field, so a crash mid-retry
+  still cannot replay a fire. And **only a chain head re-arms**: a retry replays
+  the whole chain, so re-arming a link whose predecessors already succeeded would
+  redo their work against the vault. A link skipped mid-chain is still recorded
+  and pushed, just not retried — resuming a chain from its middle would need
+  per-member progress state the scheduler deliberately does not keep.
+
 ## [Bridge 0.79.1] - 2026-08-12
 
 ### Added

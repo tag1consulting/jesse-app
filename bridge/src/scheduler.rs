@@ -99,6 +99,10 @@ struct RunResult {
     reason: String,
     job_id: Option<String>,
     duration_ms: Option<u64>,
+    /// This skip was TRANSIENT — the bridge was momentarily busy, nothing about the
+    /// occurrence went stale — so the occurrence stays eligible and a later tick may
+    /// retry it. See [`retry_should_arm`].
+    transient: bool,
 }
 
 impl RunResult {
@@ -108,6 +112,15 @@ impl RunResult {
             reason: reason.into(),
             job_id: None,
             duration_ms: None,
+            transient: false,
+        }
+    }
+
+    /// A skip the next tick should retry (the slot table was saturated by client turns).
+    fn transient(reason: impl Into<String>) -> Self {
+        RunResult {
+            transient: true,
+            ..RunResult::skipped(reason)
         }
     }
 
@@ -117,8 +130,26 @@ impl RunResult {
             reason: reason.into(),
             job_id: None,
             duration_ms: None,
+            transient: false,
         }
     }
+}
+
+/// Whether a finished job re-arms its occurrence for a retry on a later tick.
+///
+/// TWO CONDITIONS, and the second is the one that keeps this safe.
+///
+/// It must be a TRANSIENT skip: the bridge was busy for a moment, so nothing about the
+/// occurrence is stale and the only cost of retrying is a few seconds' delay.
+///
+/// And it must be the chain HEAD. A retry re-runs the WHOLE chain, and re-running a
+/// chain whose earlier members already succeeded would re-apply their work against the
+/// vault. A head that was skipped ran nothing — every link behind it cascade-skipped —
+/// so replaying from the head is replaying nothing. A link skipped mid-chain is
+/// therefore recorded and pushed, but not retried; resuming a chain from its middle
+/// needs per-member progress state this deliberately does not keep.
+fn retry_should_arm(job: &ScheduleJob, result: &RunResult) -> bool {
+    result.transient && job.is_head()
 }
 
 impl Scheduler {
@@ -183,11 +214,34 @@ impl Scheduler {
                 continue; // off means off — not "due and skipped" every 20 seconds.
             }
             let anchor = self.anchor_for(&head.id);
-            let Some(due) = due_occurrence(&Local, head, anchor, now_ms) else {
-                continue;
+            let fresh = due_occurrence(&Local, head, anchor, now_ms);
+            // A PENDING RETRY: the previous attempt was skipped because the bridge was
+            // momentarily busy, so this occurrence never became stale. It takes
+            // precedence over nothing — a genuinely NEWER occurrence supersedes it (only
+            // reachable with a catch-up window wider than the gap between fires), and
+            // that supersession is recorded rather than silently dropped.
+            let retry = self.state.get(&head.id).retry_due_ms;
+            let due = match (retry, fresh) {
+                (Some(retry_ms), Some(f)) if f.due_ms > retry_ms => {
+                    let reason = format!(
+                        "superseded by the {} occurrence before its retry could run",
+                        human_ms(f.due_ms.saturating_sub(retry_ms))
+                    );
+                    self.finish_job(st, head, Outcome::Skipped, &reason, None, None, false);
+                    f
+                }
+                (Some(retry_ms), _) => DueFire {
+                    due_ms: retry_ms,
+                    lateness_ms: now_ms.saturating_sub(retry_ms),
+                    missed_earlier: 0,
+                },
+                (None, Some(f)) => f,
+                (None, None) => continue,
             };
             // Claim it FIRST, before anything can fail: a claimed occurrence never comes
             // due again, so a crash between here and the outcome cannot replay the turn.
+            // This also clears the pending retry — the attempt below supersedes it, and
+            // re-arms only if it too is skipped transiently.
             self.state.claim(&head.id, due.due_ms);
 
             if due.missed_earlier > 0 {
@@ -420,6 +474,22 @@ async fn run_chain(sched: Arc<Scheduler>, st: AppState, head_id: String, due: Du
             result.duration_ms,
             cascaded,
         );
+        // A TRANSIENT skip of the HEAD leaves this occurrence eligible: the next tick
+        // retries it, for as long as it is still inside the catch-up window. A slot
+        // collision with a person using the bridge should cost minutes, not the day's
+        // run. See [`retry_should_arm`] for why only the head re-arms.
+        if retry_should_arm(job, &result) {
+            sched.state.arm_retry(&id, due.due_ms);
+            eprintln!(
+                "jesse-bridge: schedule RETRY-ARMED id={} due_ms={} — still eligible for {}",
+                id,
+                due.due_ms,
+                human_ms(
+                    (due.due_ms + job.catch_up_secs.saturating_mul(1000))
+                        .saturating_sub(system_time_to_ms(SystemTime::now()))
+                ),
+            );
+        }
     }
     drop(permit);
 }
@@ -442,9 +512,13 @@ async fn run_one(sched: &Arc<Scheduler>, st: &AppState, job: &ScheduleJob) -> Ru
     let waited = Instant::now();
     while st.slots.free_for(&model) == 0 || st.slots.ceiling_free() == 0 {
         if waited.elapsed() >= sched.slot_wait {
-            return RunResult::skipped(format!(
+            // TRANSIENT: nothing about this occurrence went stale, the bridge was simply
+            // busy serving a person. Recorded and pushed like any skip, but the
+            // occurrence stays eligible so a later tick can still run it.
+            return RunResult::transient(format!(
                 "model {model:?} was saturated by client turns for {}s — a scheduled turn \
-                 yields to an interactive one rather than queueing",
+                 yields to an interactive one rather than queueing, and will retry while \
+                 it is still inside catch_up_secs",
                 sched.slot_wait.as_secs()
             ));
         }
@@ -500,6 +574,7 @@ async fn run_one(sched: &Arc<Scheduler>, st: &AppState, job: &ScheduleJob) -> Ru
                     reason: String::new(),
                     job_id: Some(job_id),
                     duration_ms: Some(started.elapsed().as_millis() as u64),
+                    transient: false,
                 }
             }
             Some(JobState::Failed { error, .. }) => {
@@ -508,6 +583,7 @@ async fn run_one(sched: &Arc<Scheduler>, st: &AppState, job: &ScheduleJob) -> Ru
                     reason: error,
                     job_id: Some(job_id),
                     duration_ms: Some(started.elapsed().as_millis() as u64),
+                    transient: false,
                 }
             }
             Some(JobState::Cancelled) => {
@@ -516,6 +592,7 @@ async fn run_one(sched: &Arc<Scheduler>, st: &AppState, job: &ScheduleJob) -> Ru
                     reason: "the turn was cancelled".to_string(),
                     job_id: Some(job_id),
                     duration_ms: Some(started.elapsed().as_millis() as u64),
+                    transient: false,
                 }
             }
             // Running, or evicted out from under us (only possible for an absurdly long
@@ -531,6 +608,7 @@ async fn run_one(sched: &Arc<Scheduler>, st: &AppState, job: &ScheduleJob) -> Ru
                 ),
                 job_id: Some(job_id),
                 duration_ms: Some(started.elapsed().as_millis() as u64),
+                transient: false,
             };
         }
         tokio::time::sleep(SCHEDULED_POLL).await;
@@ -689,6 +767,11 @@ fn schedule_row(sched: &Scheduler, job: &ScheduleJob) -> Value {
             .heads()
             .any(|h| sched.is_running(&h.id) && sched.schedule.chain(&h.id).contains(&job.id)),
         "next_fire_ms": sched.next_fire_for(job),
+        // An occurrence that was skipped because the bridge was momentarily busy and is
+        // STILL ELIGIBLE: the next tick retries it while it is inside `catch_up_secs`.
+        // Present here so "it said skipped — is it coming back?" is answerable from the
+        // same request as everything else.
+        "retry_due_ms": rec.retry_due_ms,
         "last_fire_ms": rec.last_fire_ms,
         "last_completion_ms": rec.last_completion_ms,
         "last_outcome": (!rec.last_outcome.is_empty()).then_some(rec.last_outcome.clone()),
@@ -801,6 +884,49 @@ mod tests {
         );
         assert!(!should_push(&j, Outcome::Skipped, CALENDAR_SKIP, false));
         assert!(!should_push(&j, Outcome::Skipped, DISABLED_SKIP, false));
+    }
+
+    /// A link is deliberately NOT retried — re-running a chain would re-apply the work of
+    /// members that already succeeded. This is the rule that keeps the retry safe.
+    #[test]
+    fn only_a_transient_skip_of_the_head_re_arms() {
+        let s = validate_schedule(&[
+            ScheduleToml {
+                id: Some("head".into()),
+                at: Some("02:30".into()),
+                prompt: Some("go".into()),
+                ..Default::default()
+            },
+            ScheduleToml {
+                id: Some("link".into()),
+                after: Some("head".into()),
+                prompt: Some("go".into()),
+                ..Default::default()
+            },
+        ]);
+        let head = s.get("head").unwrap();
+        let link = s.get("link").unwrap();
+
+        let transient = RunResult::transient("saturated");
+        assert!(retry_should_arm(head, &transient), "the head re-arms");
+        assert!(
+            !retry_should_arm(link, &transient),
+            "a link must NOT re-arm — a retry replays the whole chain"
+        );
+
+        // And no other outcome re-arms, whatever it is.
+        for r in [
+            RunResult::skipped("missed by 3h (catch_up_secs = 3600s)"),
+            RunResult::skipped(CALENDAR_SKIP),
+            RunResult::skipped(DISABLED_SKIP),
+            RunResult::failed("boom"),
+        ] {
+            assert!(
+                !retry_should_arm(head, &r),
+                "only a transient skip re-arms, not {:?}",
+                r.reason
+            );
+        }
     }
 
     #[test]

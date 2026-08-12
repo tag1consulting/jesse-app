@@ -617,6 +617,147 @@ async fn a_saturated_request_limit_makes_a_scheduled_turn_skip_rather_than_starv
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+#[tokio::test]
+async fn a_saturation_skip_stays_eligible_and_the_next_tick_runs_it() {
+    // A TRANSIENT collision must cost minutes, not the day's run. The slots were busy for
+    // one tick; the occurrence never went stale, so it stays eligible and the next tick
+    // runs it — the same occurrence, not tomorrow's.
+    //
+    // FAILING-FIRST: before the retry existed, the occurrence was consumed by the skip
+    // and the second tick below started nothing at all.
+    let dir = temp_state_dir();
+    let log = dir.join("runs.log");
+    let fake = logging_claude(&log, "0.05");
+    // Due ~now, with a wide window so the retry is unambiguously inside it.
+    let (at, anchor) = due_at(0);
+    let mut st = state_with(vec![head("one", &at), link("two", "one")], &fake, &dir);
+    st.scheduler = Scheduler::new_with(
+        st.cfg.schedule.clone(),
+        st.cfg.schedule_file(),
+        Duration::from_secs(1),
+    );
+    st.scheduler.state.claim("one", anchor);
+
+    // Tick 1: every slot held by "client turns" → the scheduled turn yields.
+    let mut held = Vec::new();
+    while st.slots.free_for("opus") > 0 {
+        match st.slots.admit("opus", false) {
+            Some(TurnAdmission::Ready { model, ceiling, .. }) => held.push((model, ceiling)),
+            _ => panic!("a free slot must admit Ready"),
+        }
+    }
+    tick_and_wait(&st, now_ms()).await;
+
+    let rec = st.scheduler.state.get("one");
+    assert_eq!(rec.outcome(), Some(Outcome::Skipped));
+    assert!(
+        rec.last_reason.contains("saturated"),
+        "{:?}",
+        rec.last_reason
+    );
+    let armed = rec.retry_due_ms.expect("the occurrence must stay eligible");
+    assert_eq!(
+        rec.last_due_ms,
+        Some(armed),
+        "the anti-double-fire anchor must not have moved backwards"
+    );
+    assert!(
+        log_lines(&log).is_empty(),
+        "nothing ran on the skipped tick"
+    );
+    // It is visible as pending on the endpoint, not merely in the record.
+    assert_eq!(row(&schedule_body(&st).await, "one")["retry_due_ms"], armed);
+
+    // Tick 2: the person is done, the slots are free again.
+    drop(held);
+    tick_and_wait(&st, now_ms()).await;
+
+    assert_eq!(
+        log_lines(&log),
+        vec![
+            "start MARKER-one",
+            "end MARKER-one",
+            "start MARKER-two",
+            "end MARKER-two",
+        ],
+        "the retried occurrence runs the whole chain"
+    );
+    let rec = st.scheduler.state.get("one");
+    assert_eq!(rec.outcome(), Some(Outcome::Ran));
+    assert_eq!(
+        rec.retry_due_ms, None,
+        "a completed retry must not stay armed and fire a third time"
+    );
+    assert_eq!(st.scheduler.state.get("two").outcome(), Some(Outcome::Ran));
+
+    // And a third tick does nothing — the occurrence really is consumed.
+    tick_and_wait(&st, now_ms()).await;
+    assert_eq!(log_lines(&log).len(), 4, "no double fire after the retry");
+
+    let _ = std::fs::remove_file(&fake);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn a_pending_retry_stops_at_the_edge_of_the_catch_up_window() {
+    // The retry is bounded by the same window a missed fire is. Past it, the occurrence
+    // is skipped with the delay named — a transient collision buys minutes, not licence
+    // to run the morning routine at lunchtime.
+    let dir = temp_state_dir();
+    let log = dir.join("runs.log");
+    let fake = logging_claude(&log, "0.05");
+    let (at, anchor) = due_at(0);
+    let mut st = state_with(
+        vec![ScheduleToml {
+            catch_up_secs: Some(300), // five minutes of eligibility
+            ..head("one", &at)
+        }],
+        &fake,
+        &dir,
+    );
+    st.scheduler = Scheduler::new_with(
+        st.cfg.schedule.clone(),
+        st.cfg.schedule_file(),
+        Duration::from_secs(1),
+    );
+    st.scheduler.state.claim("one", anchor);
+
+    // Tick 1 with the slots held → transient skip, retry armed.
+    let mut held = Vec::new();
+    while st.slots.free_for("opus") > 0 {
+        match st.slots.admit("opus", false) {
+            Some(TurnAdmission::Ready { model, ceiling, .. }) => held.push((model, ceiling)),
+            _ => panic!("a free slot must admit Ready"),
+        }
+    }
+    tick_and_wait(&st, now_ms()).await;
+    assert!(st.scheduler.state.get("one").retry_due_ms.is_some());
+
+    // Tick 2 TEN MINUTES LATER, with the slots free again: the window has closed, so the
+    // retry must not run even though a slot is now available.
+    drop(held);
+    tick_and_wait(&st, now_ms() + 10 * 60_000).await;
+
+    let rec = st.scheduler.state.get("one");
+    assert_eq!(rec.outcome(), Some(Outcome::Skipped));
+    assert!(
+        rec.last_reason.contains("missed by") && rec.last_reason.contains("catch_up_secs = 300s"),
+        "the expiry must name the delay and the window: {:?}",
+        rec.last_reason
+    );
+    assert_eq!(
+        rec.retry_due_ms, None,
+        "an expired retry must be dropped, not left pending forever"
+    );
+    assert!(
+        log_lines(&log).is_empty(),
+        "nothing may run past the catch-up window"
+    );
+
+    let _ = std::fs::remove_file(&fake);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 // ---- Catch-up + persistence ---------------------------------------------------
 
 #[tokio::test]

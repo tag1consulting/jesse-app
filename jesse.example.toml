@@ -501,6 +501,18 @@ diet_keywords_extra = [
 #                  records how late it was. Raise it for a job worth running
 #                  late; lower it for one that is worthless off its hour.
 #
+#                  IT ALSO BOUNDS A RETRY. If a fire is skipped because the
+#                  bridge was momentarily busy serving YOU (every model slot
+#                  taken by app turns), that is not a stale occurrence — nothing
+#                  about it went out of date, the bridge was just busy — so it
+#                  stays eligible and the next tick runs it, for as long as it is
+#                  inside this window. A transient collision costs minutes, not
+#                  the day's run. Past the window it is skipped for good, with
+#                  the delay named. Only a chain HEAD retries: replaying a chain
+#                  whose earlier members already succeeded would redo their work.
+#                  A pending retry shows up as `retry_due_ms` on
+#                  GET /jesse/schedule.
+#
 # A misconfiguration never takes the bridge down. An entry that fails validation
 # (both or neither of `at`/`after`, an unknown `after` target, `catch_up_secs` on
 # a link, an unparseable time or weekday, an unrecognized key) is logged with its
