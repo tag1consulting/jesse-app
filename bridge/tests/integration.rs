@@ -13,6 +13,86 @@ use std::sync::Arc;
 use std::time::Duration;
 use tower::ServiceExt;
 
+// ---- Waiting for an async outcome ------------------------------------------
+//
+// These tests drive a real turn through the router and then wait on something the
+// turn does asynchronously: a job reaching a terminal state, a permit coming back, a
+// fake-`claude` child writing its pid or its transcript. Every such wait used to be a
+// fixed iteration count — `for _ in 0..80 { sleep(50ms) }`, ~4s of hard wall clock —
+// which made the assertion a race against machine load rather than against behavior.
+// A fully-parallel `cargo test` on a busy box failed a dozen of them purely on
+// scheduling, and that was briefly mistaken for a product timing limit. It never was:
+// the driver waits on the real `timeout_secs` while reading stdout, so nothing in the
+// bridge assumes a child schedules promptly. Only the tests did.
+//
+// So the budget here is WALL CLOCK, not iterations. A green run never pays it — the
+// probe succeeds on its first or second pass — and only a genuinely broken test waits
+// the deadline out.
+
+/// Wall-clock budget for a wait whose assertion is THAT something happens, never how
+/// fast. Deliberately far past any plausible scheduling delay.
+const WAIT_DEADLINE: Duration = Duration::from_secs(60);
+
+/// How often a wait re-probes.
+const WAIT_POLL: Duration = Duration::from_millis(50);
+
+/// Poll `probe` until it yields `Some`, or `deadline` of wall clock passes.
+///
+/// Takes an explicit deadline for the few tests whose MEANING is a bound — where the
+/// window has to stay under some other clock for the assertion to prove anything (a run
+/// limit, a child's `sleep`). Those call sites name the bound they sit under and why.
+/// Everything else wants [`wait_for`].
+async fn wait_for_within<T, F, Fut>(deadline: Duration, what: &str, mut probe: F) -> T
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Option<T>>,
+{
+    let started = std::time::Instant::now();
+    loop {
+        if let Some(v) = probe().await {
+            return v;
+        }
+        assert!(
+            started.elapsed() < deadline,
+            "timed out after {deadline:?} waiting for {what}"
+        );
+        tokio::time::sleep(WAIT_POLL).await;
+    }
+}
+
+/// [`wait_for_within`] at the default [`WAIT_DEADLINE`] — the right call for almost
+/// every wait in this file.
+async fn wait_for<T, F, Fut>(what: &str, probe: F) -> T
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Option<T>>,
+{
+    wait_for_within(WAIT_DEADLINE, what, probe).await
+}
+
+/// Wait for `job_id` to reach `status`, and hand back the whole result body.
+async fn wait_for_status(st: &AppState, job_id: &str, status: &str) -> Value {
+    wait_for_status_within(WAIT_DEADLINE, st, job_id, status).await
+}
+
+/// [`wait_for_status`] under an explicit deadline (see [`wait_for_within`]).
+async fn wait_for_status_within(
+    deadline: Duration,
+    st: &AppState,
+    job_id: &str,
+    status: &str,
+) -> Value {
+    wait_for_within(
+        deadline,
+        &format!("job {job_id} to reach status {status}"),
+        move || async move {
+            let v = result_status(st, job_id).await;
+            (v["status"] == status).then_some(v)
+        },
+    )
+    .await
+}
+
 /// The ambient routed pick: applies no backend env, which is what every routed job
 /// resolves to when `offload_order` is empty.
 fn ambient_pick() -> RoutedPick {
@@ -341,15 +421,12 @@ async fn cancel_running_turn_kills_child_and_frees_slot() {
     assert_eq!(resp.status(), StatusCode::NO_CONTENT);
 
     // The abort drops the task asynchronously; wait for the permit to come back.
-    let mut freed = false;
-    for _ in 0..50 {
-        if st.slots.ceiling_free() == 1 {
-            freed = true;
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
-    assert!(freed, "aborting the turn must free its concurrency slot");
+    let slots = &st.slots;
+    wait_for(
+        "the aborted turn to free its concurrency slot",
+        move || async move { (slots.ceiling_free() == 1).then_some(()) },
+    )
+    .await;
 
     // The job reads as cleanly cancelled, and the child never hit its marker.
     let v = result_status(&st, &job_id).await;
@@ -401,18 +478,9 @@ async fn turn_survives_client_disconnect() {
     assert_eq!(body["status"], "running");
     let job_id = body["job_id"].as_str().unwrap().to_string();
 
-    // The POST future is now dropped (client "disconnected"). Poll until the
-    // detached turn completes — it must, despite the dropped connection.
-    let mut done = None;
-    for _ in 0..50 {
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        let v = result_status(&st, &job_id).await;
-        if v["status"] == "done" {
-            done = Some(v);
-            break;
-        }
-    }
-    let done = done.expect("turn must complete despite client disconnect");
+    // The POST future is now dropped (client "disconnected"). Wait for the detached
+    // turn to complete — it must, despite the dropped connection.
+    let done = wait_for_status(&st, &job_id, "done").await;
     assert_eq!(done["response"], "slow ok");
     assert_eq!(done["session_id"], "sess-slow");
     assert!(
@@ -441,10 +509,12 @@ async fn streaming_completes_on_result_line_not_child_exit() {
     let fake = write_fake_claude(script);
     let cfg = Config {
         claude_bin: fake.to_string_lossy().into_owned(),
-        // Generous run limit so CPU starvation under a fully-parallel test run
-        // can't race the wall clock; the poll window below is what proves Done
-        // comes from the result line (near-instant) and not the child exiting.
-        timeout_secs: 20,
+        // The run limit and the wait below are a PAIR: the wait must stay under this
+        // limit for the test to prove anything, so both scale together. They are set
+        // far above any plausible scheduling delay because a passing run never spends
+        // them — Done arrives on the result line almost immediately — while a
+        // regression to read-to-EOF spends the whole limit and is caught by the wait.
+        timeout_secs: 60,
         ..test_config()
     };
     let st = AppState::new(cfg);
@@ -460,21 +530,11 @@ async fn streaming_completes_on_result_line_not_child_exit() {
     let body: Value = serde_json::from_str(&body_string(resp).await).unwrap();
     let job_id = body["job_id"].as_str().unwrap().to_string();
 
-    // Poll up to ~3s — far under the 20s run limit. Completion is driven by
-    // the result line (near-instant), so `done` lands well inside this window;
-    // if completion still waited on child stdout EOF the turn would sit
-    // `running` for the full 20s and this window would expire with no `done`.
-    let mut done = None;
-    for _ in 0..60 {
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        let v = result_status(&st, &job_id).await;
-        if v["status"] == "done" {
-            done = Some(v);
-            break;
-        }
-    }
-    let done =
-        done.expect("turn must reach done on the result line, not block on child stdout EOF");
+    // BOUNDED ON PURPOSE: this wait must stay under the fixture's 60s run limit or it
+    // proves nothing. Completion is driven by the result line (near-instant), so `done`
+    // lands almost at once; if it still waited on child stdout EOF the turn would sit
+    // `running` for the full 60s and this 45s wait would expire with no `done`.
+    let done = wait_for_status_within(Duration::from_secs(45), &st, &job_id, "done").await;
     assert_eq!(done["response"], "the answer");
     assert_eq!(done["session_id"], "sess-rl");
 
@@ -498,9 +558,12 @@ async fn a_turn_killed_at_the_run_limit_returns_how_far_it_got() {
     let fake = write_fake_claude(script);
     let cfg = Config {
         claude_bin: fake.to_string_lossy().into_owned(),
-        // Short enough that the limit really fires inside the poll window, long enough
-        // that the child's three instant lines are never racing the spawn under load.
-        timeout_secs: 5,
+        // This test is the one place a run limit must genuinely FIRE, so the turn really
+        // does spend this budget — but the child has to get its three instant lines out
+        // before it does, and under a fully-parallel run the spawn itself can take
+        // seconds. 12s keeps that race un-losable while keeping the test short; the
+        // elapsed assertions below scale with it.
+        timeout_secs: 12,
         ..test_config()
     };
     let st = AppState::new(cfg);
@@ -516,17 +579,8 @@ async fn a_turn_killed_at_the_run_limit_returns_how_far_it_got() {
     let body: Value = serde_json::from_str(&body_string(resp).await).unwrap();
     let job_id = body["job_id"].as_str().unwrap().to_string();
 
-    // Poll well past the 5s limit — the kill converts the turn to `failed`.
-    let mut failed = None;
-    for _ in 0..250 {
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        let v = result_status(&st, &job_id).await;
-        if v["status"] == "failed" {
-            failed = Some(v);
-            break;
-        }
-    }
-    let failed = failed.expect("the run limit must convert the turn to failed");
+    // Well past the 5s limit — the kill converts the turn to `failed`.
+    let failed = wait_for_status(&st, &job_id, "failed").await;
 
     // The error is UNCHANGED — same wording, same classification, so retry behavior is
     // exactly what it was. The partial rides beside it, not instead of it.
@@ -547,7 +601,7 @@ async fn a_turn_killed_at_the_run_limit_returns_how_far_it_got() {
     );
     assert_eq!(partial["tool_calls"], 1, "the tool calls observed");
     assert!(
-        partial["elapsed_secs"].as_u64().unwrap() >= 4,
+        partial["elapsed_secs"].as_u64().unwrap() >= 10,
         "elapsed seconds, roughly the run limit: {partial}"
     );
 
@@ -561,7 +615,7 @@ async fn a_turn_killed_at_the_run_limit_returns_how_far_it_got() {
         timing["tools"][0]["ms"].as_u64().is_some(),
         "each tool call carries its duration: {timing}"
     );
-    assert!(timing["elapsed_ms"].as_u64().unwrap() >= 4_000, "{timing}");
+    assert!(timing["elapsed_ms"].as_u64().unwrap() >= 10_000, "{timing}");
 
     let _ = std::fs::remove_file(&fake);
 }
@@ -595,16 +649,7 @@ async fn every_turn_appends_a_timing_record_that_is_pruned_at_seven_days() {
     let body: Value = serde_json::from_str(&body_string(resp).await).unwrap();
     let job_id = body["job_id"].as_str().unwrap().to_string();
 
-    let mut done = None;
-    for _ in 0..100 {
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        let v = result_status(&st, &job_id).await;
-        if v["status"] == "done" {
-            done = Some(v);
-            break;
-        }
-    }
-    let done = done.expect("the turn must complete");
+    let done = wait_for_status(&st, &job_id, "done").await;
     assert_eq!(done["response"], "found it");
     // The record reaches the client on the existing result endpoint.
     assert_eq!(done["timing"]["status"], "done");
@@ -612,14 +657,16 @@ async fn every_turn_appends_a_timing_record_that_is_pruned_at_seven_days() {
 
     // …and the same record is on disk, one line, content-free.
     let path = state_parent.join("turn-timings.jsonl");
-    let mut on_disk = String::new();
-    for _ in 0..40 {
-        on_disk = std::fs::read_to_string(&path).unwrap_or_default();
-        if on_disk.contains(&job_id) {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
+    let path_ref = &path;
+    let job_ref = job_id.as_str();
+    let on_disk = wait_for(
+        "the turn's timing line to reach the log on disk",
+        move || async move {
+            let s = std::fs::read_to_string(path_ref).unwrap_or_default();
+            s.contains(job_ref).then_some(s)
+        },
+    )
+    .await;
     assert!(on_disk.contains(&job_id), "a line for this turn: {on_disk}");
     assert_eq!(on_disk.trim().lines().count(), 1, "one line per turn");
     assert!(
@@ -703,15 +750,7 @@ async fn wrapped_prompt_carries_a_live_clock_header_end_to_end() {
     let job_id = body["job_id"].as_str().unwrap().to_string();
 
     // Wait for completion so the prompt has certainly been written.
-    let mut done = false;
-    for _ in 0..60 {
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        if result_status(&st, &job_id).await["status"] == "done" {
-            done = true;
-            break;
-        }
-    }
-    assert!(done, "turn must complete");
+    wait_for_status(&st, &job_id, "done").await;
 
     let prompt = std::fs::read_to_string(&promptfile).expect("fake claude must record the prompt");
     // The clock leads the whole wrapped prompt.
@@ -811,30 +850,16 @@ async fn streaming_reaps_child_after_result_line() {
     let job_id = body["job_id"].as_str().unwrap().to_string();
 
     // The turn lands Done on the result line (same as above).
-    let mut done = false;
-    for _ in 0..60 {
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        if result_status(&st, &job_id).await["status"] == "done" {
-            done = true;
-            break;
-        }
-    }
-    assert!(done, "turn must reach done on the result line");
+    wait_for_status(&st, &job_id, "done").await;
 
     // Read the child's pid (written before it printed the result line).
-    let pid: i32 = {
-        let mut p = None;
-        for _ in 0..20 {
-            if let Ok(s) = std::fs::read_to_string(&pidfile) {
-                if let Ok(n) = s.trim().parse() {
-                    p = Some(n);
-                    break;
-                }
-            }
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        }
-        p.expect("fake claude must record its pid")
-    };
+    let pidfile_ref = &pidfile;
+    let pid: i32 = wait_for("the fake claude to record its pid", move || async move {
+        std::fs::read_to_string(pidfile_ref)
+            .ok()
+            .and_then(|s| s.trim().parse().ok())
+    })
+    .await;
 
     // The background reap kills the lingering child within its bound (5s).
     // Give it that bound plus a margin; the child must be gone, even though
@@ -1010,16 +1035,7 @@ async fn post_returns_202_immediately_even_for_a_fast_turn() {
         .to_string();
 
     // The detached turn finishes; the reply is retrievable by id.
-    let mut done = None;
-    for _ in 0..50 {
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        let v = result_status(&st, &job_id).await;
-        if v["status"] == "done" {
-            done = Some(v);
-            break;
-        }
-    }
-    let done = done.expect("a fast turn still lands in the job store, fetchable by id");
+    let done = wait_for_status(&st, &job_id, "done").await;
     assert_eq!(done["response"], "quick");
     assert_eq!(done["session_id"], "sess-fast");
 
@@ -1207,15 +1223,7 @@ async fn health_context_block_reaches_claude_verbatim_after_the_clock() {
         assert_eq!(resp.status(), StatusCode::ACCEPTED);
         let body: Value = serde_json::from_str(&body_string(resp).await).unwrap();
         let job_id = body["job_id"].as_str().unwrap().to_string();
-        let mut done = false;
-        for _ in 0..60 {
-            tokio::time::sleep(Duration::from_millis(50)).await;
-            if result_status(&st, &job_id).await["status"] == "done" {
-                done = true;
-                break;
-            }
-        }
-        assert!(done, "turn must complete");
+        wait_for_status(&st, &job_id, "done").await;
         let prompt =
             std::fs::read_to_string(&promptfile).expect("fake claude must record the prompt");
         let _ = std::fs::remove_file(&fake);
@@ -1607,10 +1615,12 @@ async fn turn_completes_when_claude_eofs_but_does_not_exit() {
     // exiting (the grandchild-holding-the-pipe shape). The post-read
     // child.wait()/stderr drain are bounded (H4), so the turn completes and
     // frees its permit on the already-authoritative result — long before the
-    // child's 60s sleep ends.
+    // child's sleep ends. That sleep and the wait below are a PAIR (see the wait):
+    // both are far longer than any real scheduling delay, and a passing run spends
+    // neither.
     let script = "#!/bin/sh\n\
              printf '%s\\n' '{\"type\":\"result\",\"is_error\":false,\"result\":\"done fast\",\"session_id\":\"sess-h4\"}'\n\
-             sleep 60\n";
+             sleep 600\n";
     let fake = write_fake_claude(script);
     let cfg = Config {
         claude_bin: fake.to_string_lossy().into_owned(),
@@ -1630,22 +1640,21 @@ async fn turn_completes_when_claude_eofs_but_does_not_exit() {
     let body: Value = serde_json::from_str(&body_string(resp).await).unwrap();
     let job_id = body["job_id"].as_str().unwrap().to_string();
 
-    // Within a few seconds (≪ the 60s sleep) the turn is Done and the permit
-    // is back — proof the reap is bounded, not pinned by the lingering child.
-    let mut done = false;
-    for _ in 0..50 {
-        if st.slots.ceiling_free() == 1 {
-            if result_status(&st, &job_id).await["status"] == "done" {
-                done = true;
-                break;
-            }
-        }
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
-    assert!(
-        done,
-        "turn must complete and free its permit without waiting for the child to exit"
-    );
+    // BOUNDED ON PURPOSE: this wait must stay under the child's `sleep 600` or it
+    // proves nothing. Done AND the permit back inside 120s is the proof that the reap
+    // is bounded rather than pinned by the lingering child.
+    let st_ref = &st;
+    let job_ref = job_id.as_str();
+    wait_for_within(
+        Duration::from_secs(120),
+        "the turn to complete and free its permit without waiting for the child to exit",
+        move || async move {
+            (st_ref.slots.ceiling_free() == 1
+                && result_status(st_ref, job_ref).await["status"] == "done")
+                .then_some(())
+        },
+    )
+    .await;
     let v = result_status(&st, &job_id).await;
     assert_eq!(v["response"], "done fast");
     let _ = std::fs::remove_file(&fake);
@@ -1678,15 +1687,9 @@ async fn run_turn_emitting(req_json: &str, stdout_line: &str) -> (AppState, Stri
     assert_eq!(resp.status(), StatusCode::ACCEPTED);
     let body: Value = serde_json::from_str(&body_string(resp).await).unwrap();
     let job_id = body["job_id"].as_str().unwrap().to_string();
-    for _ in 0..80 {
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        if result_status(&st, &job_id).await["status"] == "done" {
-            let _ = std::fs::remove_file(&fake);
-            return (st, job_id);
-        }
-    }
+    wait_for_status(&st, &job_id, "done").await;
     let _ = std::fs::remove_file(&fake);
-    panic!("turn did not complete");
+    (st, job_id)
 }
 
 #[tokio::test]
@@ -1783,15 +1786,9 @@ async fn run_badged_turn_emitting(
     assert_eq!(resp.status(), StatusCode::ACCEPTED);
     let body: Value = serde_json::from_str(&body_string(resp).await).unwrap();
     let job_id = body["job_id"].as_str().unwrap().to_string();
-    for _ in 0..80 {
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        if result_status(&st, &job_id).await["status"] == "done" {
-            let _ = std::fs::remove_file(&fake);
-            return (st, job_id);
-        }
-    }
+    wait_for_status(&st, &job_id, "done").await;
     let _ = std::fs::remove_file(&fake);
-    panic!("turn did not complete");
+    (st, job_id)
 }
 
 #[tokio::test]
@@ -2098,13 +2095,8 @@ async fn run_turn_on(st: &AppState, req_json: &str) -> String {
     assert_eq!(resp.status(), StatusCode::ACCEPTED);
     let body: Value = serde_json::from_str(&body_string(resp).await).unwrap();
     let job_id = body["job_id"].as_str().unwrap().to_string();
-    for _ in 0..80 {
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        if result_status(st, &job_id).await["status"] == "done" {
-            return job_id;
-        }
-    }
-    panic!("turn did not complete");
+    wait_for_status(st, &job_id, "done").await;
+    job_id
 }
 
 /// POST a v2 batch to the corrections endpoint and return (status, body).
@@ -2372,12 +2364,7 @@ async fn captured_turn_prompt(req_json: &str) -> String {
     assert_eq!(resp.status(), StatusCode::ACCEPTED);
     let body: Value = serde_json::from_str(&body_string(resp).await).unwrap();
     let job_id = body["job_id"].as_str().unwrap().to_string();
-    for _ in 0..80 {
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        if result_status(&st, &job_id).await["status"] == "done" {
-            break;
-        }
-    }
+    wait_for_status(&st, &job_id, "done").await;
     let prompt = std::fs::read_to_string(&promptfile).expect("fake claude records the prompt");
     let _ = std::fs::remove_file(&fake);
     let _ = std::fs::remove_file(&promptfile);
@@ -3284,15 +3271,7 @@ async fn two_overlapping_turns_serialize_and_both_complete() {
 
     // Wait for both to finish.
     for id in &ids {
-        let mut done = false;
-        for _ in 0..80 {
-            tokio::time::sleep(Duration::from_millis(100)).await;
-            if result_status(&st, id).await["status"] == "done" {
-                done = true;
-                break;
-            }
-        }
-        assert!(done, "both queued turns must complete");
+        wait_for_status(&st, id, "done").await;
     }
 
     // The spawns did not overlap: the log is exactly START,END,START,END.
@@ -3353,20 +3332,16 @@ async fn queued_turn_returns_202_immediately_and_stream_reflects_the_wait() {
     let queued_id = body["job_id"].as_str().unwrap().to_string();
 
     // The queued turn's stream carries the "queued behind another turn" activity.
-    let mut saw_queue_activity = false;
-    for _ in 0..30 {
-        if let Some((_text, activity, _rx)) = st.jobs.stream_subscribe(&queued_id) {
-            if activity.as_ref().map(|a| a.name.as_str()) == Some(QUEUED_ACTIVITY) {
-                saw_queue_activity = true;
-                break;
-            }
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-    assert!(
-        saw_queue_activity,
-        "a queued turn's stream must reflect the wait"
-    );
+    let jobs = &st.jobs;
+    let queued_ref = queued_id.as_str();
+    wait_for(
+        "a queued turn's stream to reflect the wait",
+        move || async move {
+            let (_text, activity, _rx) = jobs.stream_subscribe(queued_ref)?;
+            (activity.as_ref().map(|a| a.name.as_str()) == Some(QUEUED_ACTIVITY)).then_some(())
+        },
+    )
+    .await;
 
     // Clean up: cancel the queued turn so the fake claude sleep doesn't linger.
     let _ = app(st.clone())
@@ -3415,20 +3390,16 @@ async fn cancelling_a_queued_turn_frees_its_slot_and_never_spawns_claude() {
 
     // Wait until A's claude has actually spawned (its one "spawn" line lands), so
     // the count assertion below is deterministic rather than timing-dependent.
-    let mut a_spawned = false;
-    for _ in 0..50 {
-        if std::fs::read_to_string(&log)
+    let log_ref = &log;
+    wait_for("the running turn A to spawn claude", move || async move {
+        (std::fs::read_to_string(log_ref)
             .unwrap_or_default()
             .lines()
             .count()
-            >= 1
-        {
-            a_spawned = true;
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
-    assert!(a_spawned, "the running turn A must spawn claude");
+            >= 1)
+            .then_some(())
+    })
+    .await;
 
     // B: queued (202) behind A; it must NOT spawn claude.
     let b = app(st.clone())
@@ -3789,15 +3760,7 @@ async fn run_vaultqa_turn(cfg: Config, ask_text: &str) -> Value {
     assert_eq!(resp.status(), StatusCode::ACCEPTED);
     let b: Value = serde_json::from_str(&body_string(resp).await).unwrap();
     let job_id = b["job_id"].as_str().unwrap().to_string();
-    // Generous poll window (~12s): under a fully-parallel test run the fake-`claude`
-    // subprocess can be slow to schedule, so a tight window flakes (STATUS §Q/§T1).
-    for _ in 0..120 {
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        if result_status(&st, &job_id).await["status"] == "done" {
-            return result_status(&st, &job_id).await;
-        }
-    }
-    panic!("vault-QA turn did not complete");
+    wait_for_status(&st, &job_id, "done").await
 }
 
 #[tokio::test]
@@ -3991,13 +3954,7 @@ async fn carry_post_and_wait(st: &AppState, body: &str) -> Value {
     assert_eq!(resp.status(), StatusCode::ACCEPTED);
     let b: Value = serde_json::from_str(&body_string(resp).await).unwrap();
     let job_id = b["job_id"].as_str().unwrap().to_string();
-    for _ in 0..120 {
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        if result_status(st, &job_id).await["status"] == "done" {
-            return result_status(st, &job_id).await;
-        }
-    }
-    panic!("context-carry turn did not complete");
+    wait_for_status(st, &job_id, "done").await
 }
 
 #[tokio::test]
@@ -4279,14 +4236,7 @@ fn counter_path() -> std::path::PathBuf {
 }
 
 async fn wait_for_done(st: &AppState, job_id: &str) -> Value {
-    for _ in 0..100 {
-        let v = result_status(st, job_id).await;
-        if v["status"] == "done" {
-            return v;
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-    panic!("turn {job_id} never reached done");
+    wait_for_status(st, job_id, "done").await
 }
 
 #[tokio::test]
@@ -4572,16 +4522,9 @@ async fn post_ask_and_wait_done(st: &AppState, text: &str) -> Value {
     assert_eq!(resp.status(), StatusCode::ACCEPTED);
     let body: Value = serde_json::from_str(&body_string(resp).await).unwrap();
     let job_id = body["job_id"].as_str().unwrap().to_string();
-    for _ in 0..80 {
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        let v = result_status(st, &job_id).await;
-        if v["status"] == "done" {
-            let mut v = v;
-            v["job_id"] = Value::String(job_id);
-            return v;
-        }
-    }
-    panic!("turn never reached done");
+    let mut v = wait_for_status(st, &job_id, "done").await;
+    v["job_id"] = Value::String(job_id);
+    v
 }
 
 /// Poll the shadow log for the pair belonging to `turn_id`, up to ~4s.
@@ -4651,15 +4594,13 @@ async fn shadow_armed_mirrors_an_eligible_ask_and_logs_a_complete_pair() {
     assert_eq!(done["response"], "hosted answer text");
     let job_id = done["job_id"].as_str().unwrap().to_string();
 
-    let mut pair = None;
-    for _ in 0..80 {
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        if let Some(p) = read_pair(&log, &job_id) {
-            pair = Some(p);
-            break;
-        }
-    }
-    let pair = pair.expect("an eligible ask must produce a shadow pair line");
+    let log_ref = &log;
+    let job_ref = job_id.as_str();
+    let pair = wait_for(
+        "an eligible ask to produce a shadow pair line",
+        move || async move { read_pair(log_ref, job_ref) },
+    )
+    .await;
     assert_eq!(pair.outcome, "complete");
     // Hosted text is the delivered (pre-badge) answer, captured from the jobstore seam.
     assert_eq!(pair.hosted_text, "hosted answer text");
@@ -4704,15 +4645,13 @@ async fn shadow_child_error_records_an_incomplete_pair_and_leaves_the_turn_intac
     );
     let job_id = done["job_id"].as_str().unwrap().to_string();
 
-    let mut pair = None;
-    for _ in 0..80 {
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        if let Some(p) = read_pair(&log, &job_id) {
-            pair = Some(p);
-            break;
-        }
-    }
-    let pair = pair.expect("a shadow error still records an (incomplete) pair");
+    let log_ref = &log;
+    let job_ref = job_id.as_str();
+    let pair = wait_for(
+        "a shadow error to still record an (incomplete) pair",
+        move || async move { read_pair(log_ref, job_ref) },
+    )
+    .await;
     assert_eq!(pair.outcome, "error");
     assert!(
         pair.shadow_text.is_none(),
@@ -4742,12 +4681,7 @@ async fn shadow_never_mirrors_a_tell() {
         .unwrap();
     let body: Value = serde_json::from_str(&body_string(resp).await).unwrap();
     let job_id = body["job_id"].as_str().unwrap().to_string();
-    for _ in 0..40 {
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        if result_status(&st, &job_id).await["status"] == "done" {
-            break;
-        }
-    }
+    wait_for_status(&st, &job_id, "done").await;
     // Give any (erroneous) shadow task time to run, then assert the log is absent.
     tokio::time::sleep(Duration::from_millis(300)).await;
     assert!(!log.exists(), "a Tell must never be mirrored");
@@ -5172,14 +5106,7 @@ async fn drive_turn_to_done(st: &AppState, req_json: &str) -> Value {
         .as_str()
         .unwrap()
         .to_string();
-    for _ in 0..80 {
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        let v = result_status(st, &job_id).await;
-        if v["status"] == "done" {
-            return v;
-        }
-    }
-    panic!("turn did not complete");
+    wait_for_status(st, &job_id, "done").await
 }
 
 #[tokio::test]
@@ -5971,12 +5898,11 @@ async fn a_deduped_repost_returns_the_same_job_and_the_same_conversation() {
     );
     // The 202 returns before the detached task spawns the child, so wait for the first
     // spawn to land before asserting there was only ever one.
-    for _ in 0..100 {
-        if spawn_count(&counter) >= 1 {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
+    let counter_ref = &counter;
+    wait_for("the first turn to spawn its child", move || async move {
+        (spawn_count(counter_ref) >= 1).then_some(())
+    })
+    .await;
     assert_eq!(spawn_count(&counter), 1, "and only one turn ever spawned");
     let _ = std::fs::remove_file(&counter);
     let _ = std::fs::remove_file(&fake);
@@ -6803,15 +6729,12 @@ async fn in_flight_transcript_produces_no_row_then_binds_on_terminal() {
 
     // Wait until the transcript really is on disk, so this test asserts the suppression
     // and not a race it happened to win.
-    let mut appeared = false;
-    for _ in 0..200 {
-        if proj.join("sess-mid.jsonl").exists() {
-            appeared = true;
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-    assert!(appeared, "the fake CLI wrote its transcript mid-turn");
+    let proj_ref = &proj;
+    wait_for(
+        "the fake CLI to write its transcript mid-turn",
+        move || async move { proj_ref.join("sess-mid.jsonl").exists().then_some(()) },
+    )
+    .await;
 
     // MID-TURN list refresh, twice, as backgrounding and reopening the app does.
     for _ in 0..2 {
@@ -7015,17 +6938,14 @@ async fn a_failed_turn_still_binds_the_transcript_it_created() {
     )
     .await;
     let job_id = body["job_id"].as_str().unwrap().to_string();
-    let mut terminal = false;
-    for _ in 0..200 {
-        let v = result_status(&st, &job_id).await;
-        if v["status"] != "running" {
-            assert_eq!(v["status"], "failed", "the turn really failed: {v}");
-            terminal = true;
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-    assert!(terminal, "the turn reached a terminal state");
+    let st_ref = &st;
+    let job_ref = job_id.as_str();
+    let v = wait_for("the turn to reach a terminal state", move || async move {
+        let v = result_status(st_ref, job_ref).await;
+        (v["status"] != "running").then_some(v)
+    })
+    .await;
+    assert_eq!(v["status"], "failed", "the turn really failed: {v}");
 
     assert_eq!(
         st.conversations

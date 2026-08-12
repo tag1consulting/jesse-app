@@ -52,6 +52,49 @@ CI both run it). See the "Versioning" section of `bridge/README.md`.
   self-hosted macOS runner, which restores the per-PR gate at zero GitHub
   minutes; putting `pull_request:` back restores the bill with it.
 
+## [Bridge 0.78.1] - 2026-08-12
+
+### Fixed
+
+- **The integration suite is green at `cargo test`'s default parallelism again.** A
+  fully-parallel run on a busy machine failed a dozen tests at a time — 12 and 22 on one
+  commit, 16 and 17 on the next — which looked like a regression and was not one. Every
+  such failure came from the tests' own waiting: a fixed ITERATION COUNT
+  (`for _ in 0..80 { sleep(50ms) }`, ~4s of hard wall clock) standing in for "wait until
+  the turn finishes". Under CPU contention the fake-`claude` child took longer than that
+  to be scheduled, the poll window expired, and the assertion died — classically as
+  `fake claude records the prompt: Os { code: 2, kind: NotFound }`, the script never
+  having run. Running with `--test-threads=4` hid it; nothing was fixed by that.
+
+  **No product timing assumption was ever involved**: the driver waits on the real
+  `timeout_secs` while reading the child's stdout, so nothing in the bridge requires a
+  child to start promptly. Only the tests did.
+
+  The **30** affected loops now wait on a WALL-CLOCK deadline through one helper
+  (`wait_for` / `wait_for_within`, default 60s), so they are insensitive to machine load
+  by construction. A passing run never spends the budget — the probe succeeds on its
+  first or second pass, and the suite still finishes in ~12.5s — while a genuinely stuck
+  turn now names itself (`timed out after 60s waiting for job … to reach status done`)
+  instead of failing as a missing file three frames away from the cause.
+
+  Four loops were deliberately **left alone**: the bounded-reap assertion (a real 5s
+  upper bound — widening it would let an unbounded reap pass) and three fixed-count
+  loops that are not waits at all (filling a cap, writing 25 transcripts, refreshing a
+  list twice). The two `elapsed < N` timing assertions are untouched.
+
+  Three tests wait against a bound that gives their assertion its meaning, and there the
+  bound and the fixture it sits under are now scaled **as a pair**, so headroom grew
+  without the proof weakening: done-on-the-result-line (45s wait under a 60s run limit,
+  was 3s under 20s), the permit freed before the child exits (120s under a `sleep 600`,
+  was 5s under `sleep 60`), and the run-limit cutoff, whose child has to emit before the
+  limit fires (12s limit, was 5s). That last one's elapsed assertions moved 4→10s and
+  4000→10000ms, i.e. **tightened** in proportion (83% of the limit, was 80%).
+
+  Verified by running the suite at default parallelism, no `--test-threads` flag: 8
+  consecutive green runs, plus 16 green runs of two concurrent suites — a configuration
+  that previously failed in 2 rounds out of 3. No existing assertion was weakened to get
+  there.
+
 ## [Bridge 0.78.0] - 2026-08-12
 
 A turn was killed at the hour mark after ~60 minutes of real work. The client got one line —
