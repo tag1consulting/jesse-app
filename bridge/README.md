@@ -252,12 +252,47 @@ Fetch the result later by id:
 curl -s http://127.0.0.1:8765/jesse/result/<job_id> \
   -H "Authorization: Bearer $JESSE_TOKEN"
 # → { "status": "running" }
-#   { "status": "done", "response": "...", "session_id": "..." }
-#   { "status": "failed", "error": "..." }
-#   { "status": "cancelled" }
+#   { "status": "done", "response": "...", "session_id": "...", "timing": {...} }
+#   { "status": "failed", "error": "...", "partial": {...}|null, "timing": {...} }
+#   { "status": "cancelled", "timing": {...} }
 ```
 
 Same bearer auth as `/jesse`. An unknown or evicted id → **`404`**.
+
+#### `partial` — a turn that was cut off, not a turn that failed
+
+A turn killed at its run limit (`JESSE_TIMEOUT`) carries **`partial`** beside the
+unchanged `error`, so the client can render *"the turn was cut off, here is how far it
+got"* rather than a bare failure banner:
+
+```json
+{ "text": "I refactored the parser. …", "elapsed_secs": 5400, "tool_calls": 37,
+  "truncated": true }
+```
+
+`text` is the retained tail of the visible answer — the last `JESSE_PARTIAL_BLOCKS`
+blocks, capped at `JESSE_PARTIAL_BYTES`; `truncated` says whether anything was dropped.
+`null` on every other failure: a turn that failed for a reason has a cause, not a cutoff.
+The error string and its status are untouched, so failure classification (and therefore
+retry behavior) is exactly what it was.
+
+#### `timing` — where the turn's time went
+
+Every turn writes one JSON line to `<state_dir>/turn-timings.jsonl` (pruned to 7 days at
+startup) and serves it back here:
+
+```json
+{ "v": 1, "job_id": "…", "started_at": "2026-08-12T09:00:00Z",
+  "ended_at": "2026-08-12T10:30:00Z", "elapsed_ms": 5400000, "status": "failed",
+  "tool_calls": 37, "tools": [ { "tool": "Read", "ms": 812 }, … ] }
+```
+
+Content-free — tool names, counts and durations, never the question or the answer. This is
+what makes the next slow turn diagnosable in one command:
+
+```bash
+jq 'select(.elapsed_ms > 600000)' ~/.jesse-bridge/turn-timings.jsonl
+```
 
 ### Idempotency key — safely re-send a `POST /jesse` (`request_id`)
 
@@ -1416,11 +1451,13 @@ persona-rendered defaults so the app's cached "default" matches what a turn buil
 | `JESSE_SHOW_QR` | (TTY-gated) | The pairing QR encodes the **full bearer token**, so by default it is printed only when stdout is a **terminal** — on a pipe (a container, a service manager) stdout is the log stream and the QR would republish the token into log aggregation on every restart. Tri-state: a truthy value (`1`/`true`/`yes`/`on`, or the `--show-qr` flag) forces the QR onto a non-TTY stdout a human is actually reading; an explicit falsy value (`0`/`false`/`no`/`off`) **pins the QR off even on a terminal**, beating `--show-qr` — the escape hatch for a PTY that is still log-collected (`docker run -t`, a pod's `tty: true`, `script(1)`); unset leaves the TTY check in charge. When suppressed by the TTY default, a one-line note goes to stderr naming the override |
 | `JESSE_SHOW_TOKEN` | (off) | Print the plaintext `token=<token>` manual-entry line at startup (same effect as the `--show-token` flag). Off by default so the raw token stays out of scrollback and launchd logs. **On a non-TTY stdout this writes the bearer token into the log stream** — prefer scanning the QR or reading `JESSE_TOKEN` from your own deployment config |
 | `JESSE_PORT` | `8765` | Port |
-| `JESSE_TIMEOUT` | `3600` | Per-request run limit (seconds), clamped to `1..=7200`. `0` is treated as the 7200s ceiling, not unlimited. On overrun the turn returns `504` with an actionable message naming this var |
+| `JESSE_TIMEOUT` | `5400` | Per-request run limit (seconds), clamped to `1..=7200`. `0` is treated as the 7200s ceiling, not unlimited. On overrun the turn returns `504` with an actionable message naming this var — and, since 0.78.0, the retained tail of what the turn had already said (`partial`), so a cut-off turn is not a bare error banner |
+| `JESSE_PARTIAL_BLOCKS` | `8` | How many assistant text blocks the cut-off turn's partial-answer ring retains (floored at 1). A block is a run of text uninterrupted by a tool call |
+| `JESSE_PARTIAL_BYTES` | `16384` | Byte cap on that retained text. `0` keeps the counts and drops the text |
 | `JESSE_JOB_TTL_SECS` | `86400` | How long a finished-but-**unfetched** reply stays retrievable (24h). The clock starts at first retrieval, not at completion |
 | `JESSE_RETRIEVAL_GRACE_SECS` | `600` | How much longer a reply is kept **after** its first retrieval (a short re-poll window) instead of the full TTL |
 | `JESSE_SESSION_TTL_DAYS` | `90` | Age (days) past which the background session GC sweep reclaims a vault-project Claude Code session jsonl. The sweep keys on file mtime, and resuming a session touches it, so an actively-used thread is never reclaimed — only orphans older than this. Runs once at startup, then every 6h; scoped to the vault project only. See [Session GC sweep](#session-gc-sweep-jesse_session_ttl_days) |
-| `JESSE_STATE_DIR` | `~/.jesse-bridge` | Where completed results are persisted (`<dir>/jobs`) and the device token (`<dir>/device.json`, 0600), so a restart doesn't lose a reply or the token. Empty disables persistence |
+| `JESSE_STATE_DIR` | `~/.jesse-bridge` | Where completed results are persisted (`<dir>/jobs`), the device token (`<dir>/device.json`, 0600) and the per-turn timing log (`<dir>/turn-timings.jsonl`), so a restart doesn't lose a reply, the token, or the record of where a turn's time went. Empty disables persistence (timing records stay in memory) |
 | `JESSE_CLAUDE_BIN` | `claude` | Path to the `claude` binary |
 | `JESSE_CONFIG` | _(search path)_ | Explicit path to the `jesse.local.toml` persona overlay. When unset the bridge looks for `./jesse.local.toml`, then `<state-dir>/jesse.local.toml`. See [Persona / personalization](#persona--personalization) |
 | `JESSE_OWNER_NAME` | `the user` | Owner label rendered into the Ask/Tell wrappers. Overrides the `[persona] owner_name` from `jesse.local.toml` |

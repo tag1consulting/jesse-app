@@ -440,9 +440,14 @@ pub async fn run_vaultqa_child(
 ///
 /// `harness` names the agent program: it builds the child `Command` and supplies the
 /// per-attempt line parser. Everything else here is harness-independent.
+///
+/// `trace` is the turn's observation point ([`TurnTrace`]): it sees the same stream events
+/// this loop already reads, so a turn killed at the run limit can hand back the text it
+/// had produced and a record of where its time went. Purely observational — it never
+/// changes what is returned.
 // Over the lint's ceiling, and each is a distinct collaborator the turn needs (config,
 // prompt, resume target, job store + id, model, harness, session recorder, write lock,
-// attachment dir). A params struct would only rename the same ten.
+// attachment dir, trace). A params struct would only rename the same eleven.
 #[allow(clippy::too_many_arguments)]
 pub async fn run_claude_streaming(
     cfg: &Config,
@@ -455,6 +460,7 @@ pub async fn run_claude_streaming(
     spawned: &SpawnedSessions,
     write_lock: Option<&WriteLockChild>,
     attachment_dir: Option<&Path>,
+    trace: &TurnTrace,
 ) -> Result<(String, Option<String>, ShadowUsage), ApiError> {
     const MAX_ATTEMPTS: u32 = 3; // 1 try + 2 retries
 
@@ -594,8 +600,17 @@ pub async fn run_claude_streaming(
                     .map_err(|e| (StatusCode::BAD_GATEWAY, format!("claude io error: {e}")))?;
                 let Some(line) = next else { break };
                 match parser.on_line(&line) {
-                    StreamEvent::TextDelta(t) => jobs.stream_push_delta(job_id, &t),
-                    StreamEvent::ToolActivity(a) => jobs.stream_push_activity(job_id, a),
+                    StreamEvent::TextDelta(t) => {
+                        // The trace sees the SAME delta the live stream does, into its own
+                        // bounded ring — the stream accumulator is unbounded-per-turn and
+                        // dies with the job, while this is what a cut-off turn hands back.
+                        trace.note_delta(&t);
+                        jobs.stream_push_delta(job_id, &t)
+                    }
+                    StreamEvent::ToolActivity(a) => {
+                        trace.note_tool(&a.name);
+                        jobs.stream_push_activity(job_id, a)
+                    }
                     // The child named its session. Record it the moment it arrives, so a
                     // turn that dies after this line has still told us what it owns.
                     StreamEvent::SessionId(id) => spawned.record(&id),
@@ -619,18 +634,30 @@ pub async fn run_claude_streaming(
 
         // kill_on_drop reaps the child if this future is dropped (timeout / task abort).
         let terminal = if unlimited {
-            read_lines.await?
+            let t = read_lines.await?;
+            trace.note_end();
+            t
         } else {
             match timeout(Duration::from_secs(cfg.timeout_secs), read_lines).await {
-                Ok(r) => r?,
+                Ok(r) => {
+                    trace.note_end();
+                    r?
+                }
                 Err(_) => {
+                    // THE GUILLOTINE. The child is killed (kill_on_drop) and everything it
+                    // had already said would vanish with it — so mark the trace CUT OFF
+                    // first. The turn task reads the retained text back off it and lands
+                    // it on the job beside this error, which is deliberately unchanged in
+                    // both status and wording: failure classification (and therefore retry
+                    // behavior) must not shift because the body got richer.
+                    trace.mark_cutoff();
                     return Err((
                         StatusCode::GATEWAY_TIMEOUT,
                         format!(
                         "Jesse hit the {}s run limit. Raise JESSE_TIMEOUT to allow longer turns.",
                         cfg.timeout_secs
                     ),
-                    ))
+                    ));
                 }
             }
         };
@@ -736,8 +763,11 @@ pub async fn run_claude_streaming(
                          {attempt}/{MAX_ATTEMPTS}): {message} — retrying"
                     );
                     // The whole prompt re-runs; clear any partial accumulation so
-                    // a reconnecting subscriber doesn't see a doubled buffer.
+                    // a reconnecting subscriber doesn't see a doubled buffer. The trace
+                    // resets with it, for the same reason: the discarded attempt's text
+                    // and tool calls describe work no client will ever be shown.
                     jobs.stream_reset(job_id);
+                    trace.reset();
                     // Short linear backoff: 1s after attempt 1, 2s after attempt 2.
                     tokio::time::sleep(Duration::from_secs(attempt as u64)).await;
                     continue;

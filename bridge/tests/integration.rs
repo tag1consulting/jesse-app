@@ -481,6 +481,184 @@ async fn streaming_completes_on_result_line_not_child_exit() {
     let _ = std::fs::remove_file(&fake);
 }
 #[tokio::test]
+async fn a_turn_killed_at_the_run_limit_returns_how_far_it_got() {
+    // THE BARE-ERROR-BANNER FIX. A turn that overruns its run limit used to surface as
+    // nothing but `{"status":"failed","error":"Jesse hit the …s run limit"}` — everything
+    // the agent had already said (and already written to disk) died with the child.
+    //
+    // A fake claude that says something, uses a tool, says something else, and then hangs
+    // forever without a terminal result — i.e. exactly the shape of the real overrun.
+    //
+    // FAILING-FIRST: without the trace, the failure body has no `partial` at all.
+    let script = "#!/bin/sh\n\
+             printf '%s\\n' '{\"type\":\"stream_event\",\"event\":{\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\"I refactored the parser. \"}}}'\n\
+             printf '%s\\n' '{\"type\":\"stream_event\",\"event\":{\"type\":\"content_block_start\",\"index\":2,\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu_1\",\"name\":\"Read\",\"input\":{}}}}'\n\
+             printf '%s\\n' '{\"type\":\"stream_event\",\"event\":{\"type\":\"content_block_delta\",\"index\":3,\"delta\":{\"type\":\"text_delta\",\"text\":\"Now the tests.\"}}}'\n\
+             sleep 600\n";
+    let fake = write_fake_claude(script);
+    let cfg = Config {
+        claude_bin: fake.to_string_lossy().into_owned(),
+        // Short enough that the limit really fires inside the poll window, long enough
+        // that the child's three instant lines are never racing the spawn under load.
+        timeout_secs: 5,
+        ..test_config()
+    };
+    let st = AppState::new(cfg);
+
+    let resp = app(st.clone())
+        .oneshot(jesse_request(
+            Some("Bearer test-token"),
+            r#"{"mode":"ask","text":"do the big refactor"}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::ACCEPTED);
+    let body: Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    let job_id = body["job_id"].as_str().unwrap().to_string();
+
+    // Poll well past the 5s limit — the kill converts the turn to `failed`.
+    let mut failed = None;
+    for _ in 0..250 {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let v = result_status(&st, &job_id).await;
+        if v["status"] == "failed" {
+            failed = Some(v);
+            break;
+        }
+    }
+    let failed = failed.expect("the run limit must convert the turn to failed");
+
+    // The error is UNCHANGED — same wording, same classification, so retry behavior is
+    // exactly what it was. The partial rides beside it, not instead of it.
+    let err = failed["error"].as_str().unwrap();
+    assert!(err.contains("run limit"), "error unchanged: {err}");
+    assert!(err.contains("JESSE_TIMEOUT"), "still actionable: {err}");
+
+    let partial = &failed["partial"];
+    assert!(!partial.is_null(), "a cut-off turn carries a partial");
+    let text = partial["text"].as_str().unwrap();
+    assert!(
+        text.contains("I refactored the parser."),
+        "the text it produced before the tool call: {text}"
+    );
+    assert!(
+        text.contains("Now the tests."),
+        "and the text after it: {text}"
+    );
+    assert_eq!(partial["tool_calls"], 1, "the tool calls observed");
+    assert!(
+        partial["elapsed_secs"].as_u64().unwrap() >= 4,
+        "elapsed seconds, roughly the run limit: {partial}"
+    );
+
+    // And the timing record for the same turn, on the same response.
+    let timing = &failed["timing"];
+    assert_eq!(timing["status"], "failed");
+    assert_eq!(timing["job_id"], job_id);
+    assert_eq!(timing["tool_calls"], 1);
+    assert_eq!(timing["tools"][0]["tool"], "Read");
+    assert!(
+        timing["tools"][0]["ms"].as_u64().is_some(),
+        "each tool call carries its duration: {timing}"
+    );
+    assert!(timing["elapsed_ms"].as_u64().unwrap() >= 4_000, "{timing}");
+
+    let _ = std::fs::remove_file(&fake);
+}
+#[tokio::test]
+async fn every_turn_appends_a_timing_record_that_is_pruned_at_seven_days() {
+    // The other half of "no record anywhere of where the hour went": one JSONL line per
+    // turn under the state dir, keyed by job id, with the tool calls and their durations —
+    // and a startup prune so the file can't grow without bound.
+    //
+    // FAILING-FIRST: with no timing log, `turn-timings.jsonl` never appears.
+    let state_parent = std::env::temp_dir().join(format!("jesse-timing-state-{}", random_hex()));
+    let script = "#!/bin/sh\n\
+             printf '%s\\n' '{\"type\":\"stream_event\",\"event\":{\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu_1\",\"name\":\"Grep\",\"input\":{}}}}'\n\
+             printf '%s\\n' '{\"type\":\"result\",\"is_error\":false,\"result\":\"found it\",\"session_id\":\"sess-t\"}'\n";
+    let fake = write_fake_claude(script);
+    let cfg = Config {
+        claude_bin: fake.to_string_lossy().into_owned(),
+        state_dir: Some(state_parent.to_string_lossy().into_owned()),
+        timeout_secs: 30,
+        ..test_config()
+    };
+    let st = AppState::new(cfg);
+
+    let resp = app(st.clone())
+        .oneshot(jesse_request(
+            Some("Bearer test-token"),
+            r#"{"mode":"ask","text":"find the thing"}"#,
+        ))
+        .await
+        .unwrap();
+    let body: Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    let job_id = body["job_id"].as_str().unwrap().to_string();
+
+    let mut done = None;
+    for _ in 0..100 {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let v = result_status(&st, &job_id).await;
+        if v["status"] == "done" {
+            done = Some(v);
+            break;
+        }
+    }
+    let done = done.expect("the turn must complete");
+    assert_eq!(done["response"], "found it");
+    // The record reaches the client on the existing result endpoint.
+    assert_eq!(done["timing"]["status"], "done");
+    assert_eq!(done["timing"]["tools"][0]["tool"], "Grep");
+
+    // …and the same record is on disk, one line, content-free.
+    let path = state_parent.join("turn-timings.jsonl");
+    let mut on_disk = String::new();
+    for _ in 0..40 {
+        on_disk = std::fs::read_to_string(&path).unwrap_or_default();
+        if on_disk.contains(&job_id) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(on_disk.contains(&job_id), "a line for this turn: {on_disk}");
+    assert_eq!(on_disk.trim().lines().count(), 1, "one line per turn");
+    assert!(
+        !on_disk.contains("found it") && !on_disk.contains("find the thing"),
+        "the timing log carries no question or answer text: {on_disk}"
+    );
+
+    // THE PRUNE. Plant a record from 8 days ago beside the fresh one and restart the
+    // bridge over the same state dir: startup drops the stale line and keeps the fresh.
+    let stale = r#"{"v":1,"job_id":"job-from-last-week","started_at":"2020-01-01T00:00:00Z","ended_at":"2020-01-01T00:00:01Z","elapsed_ms":1000,"status":"done","tool_calls":0,"tools":[]}"#;
+    {
+        use std::io::Write as _;
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        writeln!(f, "{stale}").unwrap();
+    }
+    let cfg2 = Config {
+        state_dir: Some(state_parent.to_string_lossy().into_owned()),
+        ..test_config()
+    };
+    let st2 = AppState::new(cfg2);
+    let after = std::fs::read_to_string(&path).unwrap();
+    assert!(
+        !after.contains("job-from-last-week"),
+        "older than 7 days → pruned at startup: {after}"
+    );
+    assert!(
+        after.contains(&job_id),
+        "the fresh record survives: {after}"
+    );
+    // The surviving record is still served after the restart.
+    assert!(st2.timings.get(&job_id).is_some());
+
+    let _ = std::fs::remove_file(&fake);
+    let _ = std::fs::remove_dir_all(&state_parent);
+}
+#[tokio::test]
 async fn wrapped_prompt_carries_a_live_clock_header_end_to_end() {
     // Drive the bridge exactly as the App does (POST /jesse) and capture the
     // prompt that actually reaches `claude` — its `-p` argument, i.e. $2. Then

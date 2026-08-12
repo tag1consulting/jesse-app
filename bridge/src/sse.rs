@@ -176,7 +176,7 @@ pub async fn jesse_stream(
                     }),
                 )));
             }
-            Some(JobState::Failed { error }) => {
+            Some(JobState::Failed { error, .. }) => {
                 let _ = tx.try_send(Ok(sse_event("error", json!({ "error": error }))));
             }
             Some(JobState::Cancelled) => {

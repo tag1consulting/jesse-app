@@ -221,6 +221,7 @@ pub async fn run_ask_hosted_or_emergency(
     spawned: &SpawnedSessions,
     write_lock: Option<&WriteLockChild>,
     attachment_dir: Option<&Path>,
+    trace: &TurnTrace,
 ) -> AskResult {
     let now = Instant::now();
     // Which model would answer an emergency ask: the same routing rule the routine route
@@ -292,6 +293,7 @@ pub async fn run_ask_hosted_or_emergency(
             spawned,
             write_lock,
             attachment_dir,
+            trace,
         )
         .await,
     );
@@ -862,6 +864,23 @@ pub async fn jesse(
         // Turn wall clock starts here (after the permit — queued time doesn't count).
         let turn_start = Instant::now();
 
+        // THE TURN'S OBSERVATION POINT, started on the same clock. It watches the driver's
+        // stream events and answers two questions the bridge previously could not: what
+        // had a killed turn already produced, and where did its time go. See
+        // [`crate::turntrace`].
+        let trace = Arc::new(TurnTrace::from_cfg(&cfg));
+        // WRITES THE TIMING RECORD WHEN THE TURN ENDS — however it ends. A Drop guard for
+        // the same reason `TurnLockRelease` is one: a CANCEL aborts this task outright, so
+        // any code placed after `complete` below would simply never run for a cancelled
+        // turn and the record for the very turns most worth diagnosing would be the ones
+        // missing. Drop runs on success, on error, on timeout, on panic, and on abort.
+        let _timing = TurnTimingRecorder {
+            trace: trace.clone(),
+            timings: st.timings.clone(),
+            jobs: jobs.clone(),
+            job_id: jid.clone(),
+        };
+
         // Where the driver records the session id each spawned child reports on its first
         // line. THE authority on which sessions this turn owns — the terminal step binds
         // exactly these, rather than inferring ownership from a directory diff.
@@ -987,6 +1006,7 @@ pub async fn jesse(
                     &spawned,
                     write_lock.as_ref(),
                     attachment_dir.as_deref(),
+                    &trace,
                 )
                 .await,
             );
@@ -1161,6 +1181,7 @@ pub async fn jesse(
                         &spawned,
                         write_lock.as_ref(),
                         attachment_dir.as_deref(),
+                        &trace,
                     )
                     .await;
                     route = r.route;
@@ -1194,6 +1215,7 @@ pub async fn jesse(
                 &spawned,
                 write_lock.as_ref(),
                 attachment_dir.as_deref(),
+                &trace,
             )
             .await;
             route = r.route;
@@ -1439,7 +1461,12 @@ pub async fn jesse(
             err => err,
         };
 
-        jobs.complete_with_provenance(&jid, outcome, provenance);
+        // `trace.partial()` is `Some` ONLY when the run limit cut this turn off, and the
+        // store attaches it only to a FAILURE — so a hosted turn that timed out and was
+        // then served by the emergency fallback delivers its answer with nothing extra,
+        // while a turn that really died at the limit carries out the text it had already
+        // produced, its elapsed seconds and its tool count.
+        jobs.complete_full(&jid, outcome, provenance, trace.partial());
         // Close the live stream with the frame matching the state that actually
         // landed. `complete` is write-once, so a cancel that won the race already
         // set `Cancelled` (and `cancel` already emitted that frame + removed the
@@ -1512,12 +1539,23 @@ pub async fn jesse(
 
 /// Fetch a turn's state by job id. This is what the app polls after a dropped
 /// socket. Same bearer auth as `/jesse`. Unknown/expired id → 404.
+///
+/// Two fields ride along on every terminal state:
+///
+///   * `partial` — present ONLY on a turn the run limit cut off ([`PartialTurn`]): the
+///     retained tail of what it had already said, the seconds it ran, the tool calls it
+///     made. A distinct field, beside the unchanged `error`, so the client can render "the
+///     turn was cut off, here is how far it got" instead of a bare failure banner.
+///   * `timing` — this turn's [`TurnTiming`] record: start, end, status, and one entry per
+///     tool call with its duration. `null` for a turn that finished before the record
+///     existed or has aged out of the log.
 pub async fn jesse_result(
     State(st): State<AppState>,
     UrlPath(job_id): UrlPath<String>,
     headers: HeaderMap,
 ) -> Result<Json<Value>, ApiError> {
     check_auth(&headers, &st.cfg.token)?;
+    let timing = timing_to_value(st.timings.get(&job_id).as_ref());
     // get_retrieving (not get) so a terminal result's first fetch starts the
     // short post-fetch grace; until then it's held the full TTL.
     match st.jobs.get_retrieving(&job_id) {
@@ -1533,9 +1571,15 @@ pub async fn jesse_result(
             "session_id": session_id,
             "directives": directives_to_value(&directives),
             "provenance": provenance_to_value(provenance.as_deref()),
+            "timing": timing,
         }))),
-        Some(JobState::Failed { error }) => Ok(Json(json!({ "status": "failed", "error": error }))),
-        Some(JobState::Cancelled) => Ok(Json(json!({ "status": "cancelled" }))),
+        Some(JobState::Failed { error, partial }) => Ok(Json(json!({
+            "status": "failed",
+            "error": error,
+            "partial": partial_to_value(partial.as_deref()),
+            "timing": timing,
+        }))),
+        Some(JobState::Cancelled) => Ok(Json(json!({ "status": "cancelled", "timing": timing }))),
         None => Err((
             StatusCode::NOT_FOUND,
             "unknown or expired job id".to_string(),

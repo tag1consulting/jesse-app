@@ -47,6 +47,15 @@ pub enum JobState {
     },
     Failed {
         error: String,
+        // How far the turn got before its RUN LIMIT killed it: the retained tail of the
+        // visible answer, the seconds it ran, the tool calls observed. `None` for every
+        // other failure — a turn that failed for a reason has a cause, not a cutoff.
+        //
+        // It rides beside `error` rather than replacing it so the client can render "the
+        // turn was cut off, here is how far it got" while the error string and its status
+        // stay exactly what `failclass` has always seen. Boxed to keep this terminal
+        // variant small next to `Running`, mirroring `Done`'s `provenance`.
+        partial: Option<Box<PartialTurn>>,
     },
     // The client asked to stop the turn (`POST /jesse/cancel/{id}`). The running
     // task was aborted — dropping its `Child` (kill_on_drop) kills `claude` and
@@ -174,7 +183,7 @@ pub fn ms_to_system_time(ms: u64) -> SystemTime {
 /// and timing metadata; never any secret.
 pub fn job_to_value(id: &str, job: &Job) -> Option<Value> {
     let completed_at = job.completed_at?;
-    let (status, response, session_id, directives, provenance, error) = match &job.state {
+    let (status, response, session_id, directives, provenance, error, partial) = match &job.state {
         JobState::Done {
             response,
             session_id,
@@ -187,16 +196,26 @@ pub fn job_to_value(id: &str, job: &Job) -> Option<Value> {
             directives_to_value(directives),
             provenance_to_value(provenance.as_deref()),
             None,
+            Value::Null,
         ),
-        JobState::Failed { error } => (
+        JobState::Failed { error, partial } => (
             "failed",
             None,
             None,
             Value::Null,
             Value::Null,
             Some(error.clone()),
+            partial_to_value(partial.as_deref()),
         ),
-        JobState::Cancelled => ("cancelled", None, None, Value::Null, Value::Null, None),
+        JobState::Cancelled => (
+            "cancelled",
+            None,
+            None,
+            Value::Null,
+            Value::Null,
+            None,
+            Value::Null,
+        ),
         JobState::Running => return None,
     };
     Some(json!({
@@ -208,6 +227,9 @@ pub fn job_to_value(id: &str, job: &Job) -> Option<Value> {
         "directives": directives,
         "provenance": provenance,
         "error": error,
+        // How far a CUT-OFF turn got, so a restart still serves it. Null on every other
+        // state and on any job file written before this field existed.
+        "partial": partial,
         "completed_at_ms": system_time_to_ms(completed_at),
         "first_retrieved_at_ms": job.first_retrieved_at.map(system_time_to_ms),
         // The idempotency key, so a POST /jesse dedup mapping survives a restart
@@ -254,6 +276,14 @@ pub fn value_to_job(v: &Value) -> Option<(String, Job)> {
                 .and_then(|e| e.as_str())
                 .unwrap_or("Jesse couldn't complete that.")
                 .to_string(),
+            // Absent/null/malformed → None (a persisted failure from before this field,
+            // or any failure that wasn't a run-limit cutoff). The error still stands on
+            // its own, exactly as it did before the field existed.
+            partial: v
+                .get("partial")
+                .filter(|p| !p.is_null())
+                .and_then(|p| serde_json::from_value::<PartialTurn>(p.clone()).ok())
+                .map(Box::new),
         },
         "cancelled" => JobState::Cancelled,
         _ => return None,
@@ -599,6 +629,24 @@ impl JobStore {
         outcome: Result<(String, Option<String>, Option<Directives>), ApiError>,
         provenance: Option<Provenance>,
     ) {
+        self.complete_full(id, outcome, provenance, None);
+    }
+
+    /// Land the outcome, its provenance, AND — for a turn the run limit cut off — how far
+    /// it got ([`PartialTurn`]). Identical to
+    /// [`complete_with_provenance`](Self::complete_with_provenance) in every other respect.
+    ///
+    /// The partial attaches ONLY to a failure: a turn that produced an answer delivers the
+    /// answer, whatever its trace also retained (a hosted turn can time out and still be
+    /// served by the emergency fallback, and that turn did not get cut off from the
+    /// client's point of view). `None` for every ordinary failure.
+    pub fn complete_full(
+        &self,
+        id: &str,
+        outcome: Result<(String, Option<String>, Option<Directives>), ApiError>,
+        provenance: Option<Provenance>,
+        partial: Option<PartialTurn>,
+    ) {
         // The turn is over — drop its abort handle so the map can't leak. Done in
         // its own statement so the `aborts` lock is released before taking `jobs`.
         self.aborts.lock_ok().remove(id);
@@ -610,7 +658,10 @@ impl JobStore {
                 // Box on store — keeps the terminal variant small (see the field docs).
                 provenance: provenance.map(Box::new),
             },
-            Err((_code, error)) => JobState::Failed { error },
+            Err((_code, error)) => JobState::Failed {
+                error,
+                partial: partial.map(Box::new),
+            },
         };
         let mut guard = self.jobs.lock_ok();
         let Some(job) = guard.jobs.get_mut(id) else {
@@ -720,7 +771,9 @@ impl JobStore {
                     provenance,
                 },
             ),
-            Some(JobState::Failed { error }) => self.stream_finish(id, StreamFrame::Error(error)),
+            Some(JobState::Failed { error, .. }) => {
+                self.stream_finish(id, StreamFrame::Error(error))
+            }
             Some(JobState::Cancelled) => self.stream_finish(id, StreamFrame::Cancelled),
             // Still Running or gone — nothing terminal to emit.
             _ => {}
@@ -947,7 +1000,7 @@ mod tests {
             Err((StatusCode::BAD_GATEWAY, "upstream boom".to_string())),
         );
         match store.get(&bad) {
-            Some(JobState::Failed { error }) => assert!(error.contains("boom")),
+            Some(JobState::Failed { error, .. }) => assert!(error.contains("boom")),
             other => panic!("expected Failed, got {:?}", other.map(|_| ())),
         }
     }
@@ -1119,7 +1172,7 @@ mod tests {
         };
         let restarted = JobStore::new(ttl, grace, Some(dir.clone()));
         match restarted.get(&id) {
-            Some(JobState::Failed { error }) => assert!(error.contains("run limit")),
+            Some(JobState::Failed { error, .. }) => assert!(error.contains("run limit")),
             other => panic!("reloaded job should be Failed, got {:?}", other.map(|_| ())),
         }
         let _ = std::fs::remove_dir_all(&dir);

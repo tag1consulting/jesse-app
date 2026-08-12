@@ -52,6 +52,97 @@ CI both run it). See the "Versioning" section of `bridge/README.md`.
   self-hosted macOS runner, which restores the per-PR gate at zero GitHub
   minutes; putting `pull_request:` back restores the bill with it.
 
+## [Bridge 0.78.0] - 2026-08-12
+
+A turn was killed at the hour mark after ~60 minutes of real work. The client got one line —
+`Jesse hit the 3600s run limit. Raise JESSE_TIMEOUT to allow longer turns.` — and everything
+the turn had produced was invisible, though most of it was already on disk. Nothing anywhere
+recorded where the hour had gone, so working that out meant reading git commit timestamps by
+hand. This release fixes the hour, the silence, and the amnesia.
+
+### Changed
+
+- **The per-turn run limit defaults to 5400s (90 minutes), up from 3600s.** The hard ceiling
+  is **unchanged at 7200s** and so is the clamp: `JESSE_TIMEOUT=0` still means the ceiling,
+  over-ceiling values are still capped, and the floor is still 1s. An hour is under, not over,
+  what a deep refactor or a full vault sweep takes; two hours remains the bound a single
+  request may pin a child and a concurrency permit for. Every doc comment and README row that
+  claimed 3600 now says 5400, and the default lives in one named constant
+  (`DEFAULT_TIMEOUT_SECS`) rather than a literal at the call site.
+
+- **A turn killed at the run limit now returns how far it got.** The driver keeps a bounded
+  ring of the assistant text blocks it has streamed — the last `JESSE_PARTIAL_BLOCKS` (default
+  8), capped at `JESSE_PARTIAL_BYTES` (default 16 KiB) — and when the limit fires, that text
+  rides out on the job as a new **`partial`** field of `GET /jesse/result/{id}`:
+
+  ```json
+  { "text": "…", "elapsed_secs": 5400, "tool_calls": 37, "truncated": true }
+  ```
+
+  Its own field, **beside** the error rather than instead of it, so a client can render "the
+  turn was cut off, here is how far it got" instead of a hard failure. A *block* is a run of
+  text uninterrupted by a tool call — the harness reports no block boundary of its own, and a
+  tool call is exactly where the visible answer pauses. Over the byte cap the **tail** is
+  kept, on a char boundary: a cut-off turn's most recent words are the ones worth showing.
+
+  **Failure classification is deliberately untouched.** Same `504`, same wording, so
+  `failclass` sees exactly what it always saw and retry behavior does not shift because the
+  body got richer. `partial` is `null` for every failure that is not a run-limit cutoff, and
+  absent from a turn that produced an answer — a hosted turn that times out and is then served
+  by the emergency fallback delivers its answer with nothing extra. It persists with the job,
+  so a bridge restart still serves it.
+
+- **Every turn now writes a timing record**, one JSON line to
+  `<state_dir>/turn-timings.jsonl`, keyed by job id: start, end, elapsed, terminal status,
+  total tool calls, and one entry per tool call with its name and duration. Pruned to **7
+  days at startup** (crash-atomic temp + rename), appended `O_APPEND` one `writeln!` per
+  record so two turns finishing at once can never interleave, and served back on the existing
+  result endpoint under a new **`timing`** field. The next slow turn is one command:
+
+  ```bash
+  jq 'select(.elapsed_ms > 600000)' ~/.jesse-bridge/turn-timings.jsonl
+  ```
+
+  The record is written from a **Drop guard**, not a line after `complete`: a cancel *aborts*
+  the turn task, so anything placed after the completion call would never run for a cancelled
+  turn — and the turns an operator killed are exactly the ones worth having a record of. Drop
+  runs on success, error, timeout, panic and abort alike. With no state dir the log degrades
+  to in-memory (records still reach the endpoint for the life of the process), the same
+  degradation the job/title/device stores have.
+
+  **The timing log is content-free** — tool names, counts and durations, never the question,
+  the answer, or the retained partial text. A test asserts it; the partial text is content and
+  lives only on the job, next to the reply it belongs to.
+
+### Investigated, not implemented
+
+- **A soft budget that warns the agent before the guillotine is NOT POSSIBLE on this harness,
+  so it was not faked.** The plan was: at a fraction of the run limit, inject one message
+  telling the agent to stop starting new work, deliver what it has, and say what it did not
+  get to. That needs the running child to accept a message mid-turn.
+
+  Measured against `claude` 2.1.228 with `--input-format stream-json --output-format
+  stream-json`, stdin held open: a first user message started a long answer; a second was
+  written at **t+8.01s**, while text deltas were still arriving. The first turn ran to
+  completion **unaffected**, emitting its `result` at **t+46.69s**. Only then did the CLI read
+  the second message — a fresh `system`/`init` at t+46.70s, i.e. a **new turn** — and answer it
+  at t+48.41s.
+
+  So the CLI **queues** stdin messages and delivers them between turns, never into one. A
+  message that arrives only after the turn ends cannot ask a turn to wrap up; by then the
+  bridge has already killed the child. Nothing short of stopping the child mid-turn would
+  reach it, and stopping it is what the run limit already does — without the chance to
+  deliver partial work, which is precisely the gap `partial` above now covers instead.
+
+  Adopting stream-json input would also have changed the argv of **every** turn (the prompt
+  moves from `-p <prompt>` to a stdin message), which is a containment-record and battery
+  change — cost that buys nothing here, given the measurement.
+
+### Added
+
+- `JESSE_PARTIAL_BLOCKS` (default 8, floored at 1) and `JESSE_PARTIAL_BYTES` (default 16384;
+  `0` keeps the counts and drops the text) — the caps on the retained partial answer.
+
 ## [Bridge 0.77.0] - 2026-08-11
 
 ### Security

@@ -5,8 +5,18 @@ use crate::*;
 // Hard upper bound on any single turn, regardless of JESSE_TIMEOUT. A request
 // cannot pin a `claude` child (and a concurrency permit) for longer than this.
 // Raised to 2h so a long agent turn (a big refactor, a deep vault sweep) can run
-// to completion; the per-request JESSE_TIMEOUT (default 1h) still applies under it.
+// to completion; the per-request JESSE_TIMEOUT (default 90m) still applies under it.
 pub const HARD_TIMEOUT_CEILING: u64 = 7200;
+
+// Default per-turn run limit (env `JESSE_TIMEOUT`), clamped to
+// [1, HARD_TIMEOUT_CEILING] by `clamp_timeout_secs`.
+//
+// Raised 3600 → 5400 after a real turn was killed at the hour mark with ~60 minutes of
+// finished work already on disk: an hour is under, not over, what a deep refactor or a
+// full vault sweep takes, and the ceiling above still bounds the worst case. A turn that
+// DOES hit the limit no longer dies silently — it returns what it had (see
+// [`crate::turntrace`]).
+pub const DEFAULT_TIMEOUT_SECS: u64 = 5400;
 
 // How long a finished-but-unretrieved reply is held before TTL eviction. Raised
 // to 24h so a reply that completes while the phone is away (suspended, off the
@@ -68,7 +78,7 @@ pub const VAULT_SUBDIR: &str = "vault";
 pub const EMERGENCY_TIMEOUT_SECS: u64 = 120;
 
 // Short, fixed timeout for the stateless title endpoint (`POST /jesse/title`).
-// Much tighter than a turn's JESSE_TIMEOUT (default 3600s) because a title is
+// Much tighter than a turn's JESSE_TIMEOUT (default 5400s) because a title is
 // interactive UI latency, not a full agent turn: on overrun the app just
 // degrades to its own derived title. Deliberately a const, not env-tunable — it
 // bounds a UX nicety, not an operator-managed workload.
@@ -521,7 +531,18 @@ pub struct Config {
     /// It governs ONLY routed jobs. A main turn runs on the model the chip selected or it
     /// fails; see [`crate::routing`] for why that boundary matters and what erodes it.
     pub offload_order: Vec<String>,
+    /// The per-turn run limit in seconds (`JESSE_TIMEOUT`, default
+    /// [`DEFAULT_TIMEOUT_SECS`], clamped to `[1, HARD_TIMEOUT_CEILING]`).
     pub timeout_secs: u64,
+    /// How many assistant text blocks the cut-off turn's partial-answer ring retains
+    /// (`JESSE_PARTIAL_BLOCKS`, default [`DEFAULT_PARTIAL_BLOCKS`], floored at 1).
+    /// See [`crate::turntrace`].
+    pub partial_blocks: usize,
+    /// Byte cap on that retained text (`JESSE_PARTIAL_BYTES`, default
+    /// [`DEFAULT_PARTIAL_BYTES`]). Zero is honoured — it retains the counts and drops the
+    /// text, which is a legitimate posture for a deployment that wants no answer text on a
+    /// failure body.
+    pub partial_bytes: usize,
     // Comma-separated tool allowlist passed to `claude --allowedTools`.
     pub allowed_tools: String,
     // Comma-separated tool denylist passed to `claude --disallowedTools`.
@@ -715,6 +736,16 @@ impl Config {
         self.state_dir
             .as_deref()
             .map(|d| PathBuf::from(d).join("device.json"))
+    }
+
+    /// The append-only per-turn timing log (a sibling of `device.json`), or `None` when
+    /// persistence is disabled — then timing records are in-memory only for the life of
+    /// the process, the same degradation the job/title/device stores have. One JSON line
+    /// per turn; pruned to [`TIMING_RETENTION_DAYS`] at startup. See [`crate::turntrace`].
+    pub fn turn_timing_file(&self) -> Option<PathBuf> {
+        self.state_dir
+            .as_deref()
+            .map(|d| PathBuf::from(d).join(TURN_TIMING_FILE))
     }
 
     /// The file the server-side session titles are persisted to (sibling of the
@@ -2080,8 +2111,13 @@ impl Config {
             claude_bin: env_string("JESSE_CLAUDE_BIN").unwrap_or_else(|| "claude".to_string()),
             codex_bin: env_string("JESSE_CODEX_BIN").unwrap_or_else(|| "codex".to_string()),
             offload_order: load_offload_order(&home),
-            // 1h default; clamped to [1, HARD_TIMEOUT_CEILING].
-            timeout_secs: clamp_timeout_secs(env_parse("JESSE_TIMEOUT", 3600)),
+            // 90m default; clamped to [1, HARD_TIMEOUT_CEILING].
+            timeout_secs: clamp_timeout_secs(env_parse("JESSE_TIMEOUT", DEFAULT_TIMEOUT_SECS)),
+            // The cut-off turn's partial-answer ring. Blocks are floored at 1 (a
+            // zero-block ring could retain nothing at all, which is what `partial_bytes: 0`
+            // is for and says more clearly).
+            partial_blocks: env_parse("JESSE_PARTIAL_BLOCKS", DEFAULT_PARTIAL_BLOCKS).max(1),
+            partial_bytes: env_parse("JESSE_PARTIAL_BYTES", DEFAULT_PARTIAL_BYTES),
             allowed_tools: env_string("JESSE_ALLOWED_TOOLS")
                 .unwrap_or_else(|| DEFAULT_ALLOWED_TOOLS.to_string()),
             disallowed_tools: env_string("JESSE_DISALLOWED_TOOLS")
@@ -2427,6 +2463,8 @@ mod tests {
             "JESSE_PORT",
             "JESSE_CLAUDE_BIN",
             "JESSE_TIMEOUT",
+            "JESSE_PARTIAL_BLOCKS",
+            "JESSE_PARTIAL_BYTES",
             "JESSE_MAX_CONCURRENCY",
             "JESSE_MAX_QUEUED",
             "JESSE_JOB_TTL_SECS",
@@ -2449,7 +2487,11 @@ mod tests {
         assert_eq!(cfg.bind, "127.0.0.1");
         assert_eq!(cfg.port, 8765);
         assert_eq!(cfg.claude_bin, "claude");
-        assert_eq!(cfg.timeout_secs, 3600);
+        assert_eq!(cfg.timeout_secs, DEFAULT_TIMEOUT_SECS);
+        assert_eq!(cfg.timeout_secs, 5400, "90m, raised from the old 1h");
+        // The cut-off turn's partial-answer ring: 8 blocks / 16 KB unless overridden.
+        assert_eq!(cfg.partial_blocks, DEFAULT_PARTIAL_BLOCKS);
+        assert_eq!(cfg.partial_bytes, DEFAULT_PARTIAL_BYTES);
         // Single-writer default: one turn runs at a time; a burst of up to
         // DEFAULT_MAX_QUEUED waits behind it rather than being rejected.
         assert_eq!(cfg.concurrency.legacy_max_concurrency, None);
@@ -2503,6 +2545,50 @@ mod tests {
         );
         assert_eq!(clamp_timeout_secs(1800), 1800);
         assert_eq!(clamp_timeout_secs(1), 1);
+        // The raised DEFAULT still sits UNDER the unchanged ceiling and passes through.
+        const _: () = assert!(DEFAULT_TIMEOUT_SECS < HARD_TIMEOUT_CEILING);
+        assert_eq!(clamp_timeout_secs(DEFAULT_TIMEOUT_SECS), 5400);
+        assert_eq!(HARD_TIMEOUT_CEILING, 7200, "the ceiling is unchanged");
+    }
+    #[test]
+    fn timeout_env_override_still_clamps_at_the_ceiling() {
+        let _guard = ENV_LOCK.lock_ok();
+        let saved = std::env::var("JESSE_TIMEOUT").ok();
+        // An operator asking for more than the ceiling gets the ceiling, not the ask.
+        std::env::set_var("JESSE_TIMEOUT", "99999");
+        assert_eq!(Config::from_env().timeout_secs, HARD_TIMEOUT_CEILING);
+        // An explicit in-range value still wins over the raised default.
+        std::env::set_var("JESSE_TIMEOUT", "600");
+        assert_eq!(Config::from_env().timeout_secs, 600);
+        match saved {
+            Some(v) => std::env::set_var("JESSE_TIMEOUT", v),
+            None => std::env::remove_var("JESSE_TIMEOUT"),
+        }
+    }
+    #[test]
+    fn partial_ring_caps_come_from_env() {
+        let _guard = ENV_LOCK.lock_ok();
+        let saved: Vec<(&str, Option<String>)> = ["JESSE_PARTIAL_BLOCKS", "JESSE_PARTIAL_BYTES"]
+            .iter()
+            .map(|k| (*k, std::env::var(k).ok()))
+            .collect();
+        std::env::set_var("JESSE_PARTIAL_BLOCKS", "3");
+        std::env::set_var("JESSE_PARTIAL_BYTES", "512");
+        let cfg = Config::from_env();
+        assert_eq!(cfg.partial_blocks, 3);
+        assert_eq!(cfg.partial_bytes, 512);
+        // Blocks are floored at 1 — a zero-block ring is not a posture, `bytes: 0` is.
+        std::env::set_var("JESSE_PARTIAL_BLOCKS", "0");
+        std::env::set_var("JESSE_PARTIAL_BYTES", "0");
+        let cfg = Config::from_env();
+        assert_eq!(cfg.partial_blocks, 1);
+        assert_eq!(cfg.partial_bytes, 0);
+        for (k, v) in saved {
+            match v {
+                Some(val) => std::env::set_var(k, val),
+                None => std::env::remove_var(k),
+            }
+        }
     }
     #[test]
     fn config_zero_timeout_clamps_to_ceiling() {

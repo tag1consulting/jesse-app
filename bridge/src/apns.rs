@@ -616,7 +616,8 @@ mod tests {
             provenance: None
         }));
         assert!(job_state_is_pushable(&JobState::Failed {
-            error: "x".into()
+            error: "x".into(),
+            partial: None
         }));
         assert!(!job_state_is_pushable(&JobState::Cancelled));
         assert!(!job_state_is_pushable(&JobState::Running));

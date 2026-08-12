@@ -24,6 +24,8 @@ pub fn test_config() -> Config {
         claude_bin: "claude".to_string(),
         codex_bin: "codex".to_string(),
         timeout_secs: 1800,
+        partial_blocks: DEFAULT_PARTIAL_BLOCKS,
+        partial_bytes: DEFAULT_PARTIAL_BYTES,
         allowed_tools: DEFAULT_ALLOWED_TOOLS.to_string(),
         disallowed_tools: DEFAULT_DISALLOWED_TOOLS.to_string(),
         concurrency: ConcurrencySettings::uniform(2, &["opus"]),

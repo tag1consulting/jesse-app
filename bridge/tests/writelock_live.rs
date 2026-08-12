@@ -179,7 +179,17 @@ async fn turn(
     let spawned = SpawnedSessions::new();
     let harness = cfg.harnesses.serving(model);
     let out = run_claude_streaming(
-        cfg, prompt, None, &jobs, jid, model, harness, &spawned, wl, None,
+        cfg,
+        prompt,
+        None,
+        &jobs,
+        jid,
+        model,
+        harness,
+        &spawned,
+        wl,
+        None,
+        &TurnTrace::from_cfg(cfg),
     )
     .await;
     jobs.stream_finish(jid, StreamFrame::Cancelled);

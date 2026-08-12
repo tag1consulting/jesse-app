@@ -173,7 +173,7 @@ mod tests {
     fn timeouts_are_transport() {
         let c = classify_hosted_failure(&err(
             StatusCode::GATEWAY_TIMEOUT,
-            "Jesse hit the 3600s run limit. Raise JESSE_TIMEOUT to allow longer turns.",
+            "Jesse hit the 5400s run limit. Raise JESSE_TIMEOUT to allow longer turns.",
         ));
         assert_eq!(c, HostedFailureClass::Timeout);
         assert!(c.is_transport());

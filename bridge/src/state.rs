@@ -90,6 +90,13 @@ pub struct AppState {
     // follow-up. Persisted to `<state_dir>/context.json`. Inert (a total no-op) unless
     // `cfg.context_carry` is on — with carry off every path is byte-for-byte today's.
     pub context: Arc<ContextLedger>,
+    // The per-turn timing log: start/end/status/tool-call timings for every turn,
+    // appended one JSON line per turn to `<state_dir>/turn-timings.jsonl` (in-memory only
+    // with no state dir) and pruned to 7 days at startup. Read by
+    // `GET /jesse/result/{id}` under `timing`. This is the record that makes the next
+    // slow turn diagnosable in one command rather than an hour of forensics — see
+    // [`crate::turntrace`].
+    pub timings: Arc<TurnTimingLog>,
     // AT-MOST-ONE guard for the opt-in shadow-comparison child (JESSE_SHADOW_*). A
     // permit of ONE, entirely separate from `sem` (the production permit), so a
     // background shadow mirror can never occupy or delay a phone turn's slot. A
@@ -118,6 +125,9 @@ impl AppState {
         let context_file = cfg.context_file();
         let context_enabled = cfg.context_carry;
         let meal_corrections = Arc::new(MealCorrectionsQueue::from_cfg(&cfg));
+        // Loads the timing log and PRUNES it to the 7-day retention window — the startup
+        // half of the per-turn timing record. In-memory only when no state dir is set.
+        let timings = Arc::new(TurnTimingLog::from_cfg(&cfg));
         // `main` has already run the startup gate, so a plan is guaranteed to resolve here.
         // The fallback is the SAFE one rather than a panic: one slot per model reproduces the
         // pre-0.60.0 single-writer posture.
@@ -157,6 +167,7 @@ impl AppState {
             breaker: Arc::new(CircuitBreaker::new()),
             meal_corrections,
             context: Arc::new(ContextLedger::new(context_file, context_enabled)),
+            timings,
             // One shadow child at a time; separate from the production permit.
             shadow_slot: Arc::new(Semaphore::new(1)),
         };

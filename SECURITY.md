@@ -1501,8 +1501,16 @@ To keep a single client (or a runaway turn) from exhausting the host:
 - **Rate** — `JESSE_RATE_PER_MIN` (default 30) caps accepted requests per
   rolling minute; bursts beyond it get `429`.
 - **Timeout ceiling** — every turn is bounded by `HARD_TIMEOUT_CEILING` (7200s).
-  `JESSE_TIMEOUT=0` is treated as the ceiling, not "unlimited," in release
-  builds. An unbounded-wait affordance exists only in debug builds.
+  `JESSE_TIMEOUT` (default 5400s) applies under it; `JESSE_TIMEOUT=0` is treated
+  as the ceiling, not "unlimited," in release builds. An unbounded-wait
+  affordance exists only in debug builds.
+- **Cut-off turn body** — a turn killed at the run limit returns the retained tail
+  of its own visible answer (`partial.text`, capped at `JESSE_PARTIAL_BYTES`,
+  default 16 KiB) on the same bearer-gated result endpoint that already serves the
+  full reply. No new reader and no new surface: it is the turn's own output,
+  bounded. The per-turn timing log (`<state_dir>/turn-timings.jsonl`) is
+  content-free — tool names, counts and durations only, never the question, the
+  answer, or that retained text.
 - **Output cap** — captured agent stdout is truncated (a few MB) before parsing
   so one pathological run can't balloon memory.
 - **Title endpoint** — `POST /jesse/title` is stateless and bearer-auth gated like
