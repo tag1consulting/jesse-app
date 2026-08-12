@@ -49,6 +49,14 @@ nonisolated enum TodayWatchSummary {
     /// its own. `at` is the phone's clock, and it becomes the stamp the watch's stale
     /// guard measures against — deliberately the PHONE's, because the phone is the
     /// one that knows when it last heard from the bridge.
+    ///
+    /// The row selection below is DELIBERATELY not `TodaySemantics.badgeItems`, which
+    /// is the one definition of what the badge counts and what the phone's badge filter
+    /// shows. The wrist wants a different set for a stated reason: it carries the
+    /// standing lead item even when it is already ticked (unticking from the wrist is
+    /// the point), and it caps the Do Now rows at ten. The one number that must agree
+    /// with the phone, `doNowOpenCount`, is read from that function below, so the two
+    /// devices cannot disagree about how much is left.
     static func build(from snapshot: TodaySnapshot, etag: String?, at now: Date) -> WatchTodaySummary {
         let leadRows = snapshot.leadItems
             .filter { !TodaySemantics.isPostponed($0) }

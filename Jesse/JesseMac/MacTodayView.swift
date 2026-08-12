@@ -15,9 +15,11 @@ import JesseTodayDisplay
 // Mac-only persistence, and no second idea of which rows are checked: check, move and
 // glance all go through the shared model to the same bridge endpoints the phone writes
 // to, so with both apps open the later action wins on the next refresh (the glance
-// flags are last-writer-wins bridge-side by construction). The only durable per-device
-// thing on this screen is the view sort, which the shared model deliberately does not
-// persist for either platform.
+// flags are last-writer-wins bridge-side by construction). The one durable per-device
+// thing on this screen is the badge filter, kept in this Mac's own defaults through
+// `TodayViewPreferences`: the shared model holds view state but no storage, so which
+// preferences survive a relaunch is each shell's own decision. The view sort is
+// deliberately not one of them, on either platform.
 //
 // NO POLLING, exactly as on the phone. The screen refetches on the four things that can
 // actually have changed it: the shared view's own load-on-appear, ⌘R, the app becoming
@@ -56,6 +58,11 @@ struct MacTodayView: View {
 
     /// The outstanding Process-updates batch, if any.
     @State private var processRun = MacTodayProcessRun()
+
+    /// Per-device view state for this screen. The badge filter is remembered on this
+    /// Mac and never sent to the bridge, exactly as the iPhone remembers its own:
+    /// which view of the day a device is showing is a fact about the device.
+    @State private var viewPreferences = TodayViewPreferences()
 
     /// The conversation a Discuss / Propagate / wiki-chip action started.
     ///
@@ -148,10 +155,18 @@ struct MacTodayView: View {
         // A new day file means every cached note may now resolve to a different file:
         // the item ids are content hashes, and a rebuild re-points what they link.
         .onChange(of: model.etag) { _, _ in detailModel.invalidate() }
+        // The filter is restored once, on the first appearance, and written back on every
+        // change. The model holds no storage of its own, the same line it holds for the
+        // view sort, so the shell is where the preference becomes durable.
+        .task { model.isBadgeFilterOn = viewPreferences.isBadgeFilterOn }
+        .onChange(of: model.isBadgeFilterOn) { _, on in viewPreferences.isBadgeFilterOn = on }
         // Becoming active covers the overnight case: a window left open on this tab has
         // already run its `.task`, so without this it keeps rendering yesterday's day.
         .onChange(of: scenePhase) { _, phase in
             guard phase == .active else { return }
+            // Coming back to the window is a fresh entry into the view, so the filtered
+            // list lets go of the rows it was holding from the last one.
+            model.repinBadgeFilter()
             Task { await model.load() }
         }
     }

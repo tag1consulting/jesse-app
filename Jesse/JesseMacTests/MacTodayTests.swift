@@ -236,6 +236,38 @@ final class MacTodayTests: XCTestCase {
         XCTAssertFalse(run.isRunning)
     }
 
+    // MARK: - Per-device view state
+
+    /// **The badge filter is remembered on this Mac**, which is the whole of what the tab
+    /// does with it: read the preference on appear, hand it to the model, write it back
+    /// on every change. A fresh store over the same defaults domain is what the next
+    /// launch reads.
+    ///
+    /// Per DEVICE, deliberately. The phone keeps its own answer in its own defaults, and
+    /// neither goes near the bridge: which view of the day a window is showing is a fact
+    /// about the window, not about the day.
+    func testTheBadgeFilterSurvivesARelaunchOnThisMac() async throws {
+        let name = "jesse-mac-today-view-state-tests"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: name))
+        defaults.removePersistentDomain(forName: name)
+        defer { defaults.removePersistentDomain(forName: name) }
+
+        let stub = StubTodayClient(day: Self.day())
+        let model = TodayDashboardModel(makeClient: { stub })
+        await model.load()
+
+        model.isBadgeFilterOn = TodayViewPreferences(defaults: defaults).isBadgeFilterOn
+        XCTAssertFalse(model.isBadgeFilterOn, "the day opens whole")
+
+        model.isBadgeFilterOn = true
+        TodayViewPreferences(defaults: defaults).isBadgeFilterOn = model.isBadgeFilterOn
+
+        let relaunched = TodayDashboardModel(makeClient: { stub })
+        relaunched.isBadgeFilterOn = TodayViewPreferences(defaults: defaults).isBadgeFilterOn
+        XCTAssertTrue(relaunched.isBadgeFilterOn)
+        XCTAssertEqual(stub.checkCount, 0, "and none of this touched the day")
+    }
+
     // MARK: - Read-only
 
     /// A click made while the day is read-only is REFUSED, not queued: nothing reaches

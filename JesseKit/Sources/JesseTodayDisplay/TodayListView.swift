@@ -91,15 +91,25 @@ public struct TodayListView: View {
                                 title: "Can't reach the bridge",
                                 message: message)
             case .content(let snapshot):
-                content(snapshot)
+                // The filtered day with nothing in it is an ANSWER, not an empty list:
+                // the user asked which rows the badge counts, and none is the useful
+                // reply. Never a silent fall back to the full day, which would tell
+                // them the question was refused.
+                if model.isBadgeFilterEmpty {
+                    TodayBadgeFilterEmptyState { model.isBadgeFilterOn = false }
+                } else {
+                    content(snapshot)
+                }
             }
         }
-        // DECLARATION ORDER IS LEFT-TO-RIGHT. Process updates is declared FIRST and the
-        // sort menu second, so the sort menu takes the rightmost slot even though it is
-        // touched less often: processing closes checked items at source, rewriting every
-        // named project file, the Dashboard and the day file, and a heavy action never
-        // takes the slot a mis-tap lands in. Changing the sort is cheap and repeatable,
-        // which is exactly what that slot is for. See README, "UI conventions".
+        // DECLARATION ORDER IS LEFT-TO-RIGHT, ordered by taps per day. Process updates
+        // is declared FIRST: it closes checked items at source, rewriting every named
+        // project file, the Dashboard and the day file, and a heavy action never takes
+        // the slot a mis-tap lands in. Then the sort menu, then the badge filter, which
+        // takes the rightmost slot because it is the most-tapped of the three: "show me
+        // what's left" is the loop this screen exists for, while the sort is set once and
+        // left alone for hours. Both are cheap, safe and instantly reversible, which is
+        // what that slot is for. See README, "UI conventions".
         .toolbar {
             // `.primaryAction`, not `.secondaryAction`: the latter collapses into an
             // overflow "More" ellipsis on iOS, which is where a control goes to be
@@ -113,8 +123,16 @@ public struct TodayListView: View {
             ToolbarItem(placement: .primaryAction) {
                 TodaySortMenu(selection: $model.sortKey)
             }
+            ToolbarItem(placement: .primaryAction) {
+                TodayBadgeFilterButton(count: model.badgeCount, isOn: $model.isBadgeFilterOn)
+            }
         }
-        .task { await model.load() }
+        // Entering the screen is one of the two moments the filter drops the rows it was
+        // holding for a previous viewing. The other is a pull-to-refresh.
+        .task {
+            model.repinBadgeFilter()
+            await model.load()
+        }
         .refreshable { await model.refresh() }
         .sheet(item: $evidenceFor) { target in
             evidenceSheet(for: target.id)
@@ -145,8 +163,20 @@ public struct TodayListView: View {
                                   message: model.lastErrorMessage)
                     .listRowSeparator(.hidden)
             }
-            if let narrative = snapshot.narrative, !narrative.isEmpty {
+            // The narrative is a paragraph about the shape of the whole day, and the
+            // filtered view is the opposite of that: a short list of what is left. It
+            // comes back with the full day, unchanged.
+            if let narrative = snapshot.narrative, !narrative.isEmpty, !model.isBadgeFilterOn {
                 TodayNarrativeHeader(narrative: narrative)
+                    .listRowSeparator(.hidden)
+            }
+            // The count, where the day itself is, so the filter is discoverable without
+            // opening a toolbar and the number the badge shows is a thing you can press
+            // rather than a thing you have to interpret.
+            if model.badgeCount > 0 || model.isBadgeFilterOn {
+                TodayBadgeFilterPill(count: model.badgeCount,
+                                     showing: snapshot.allItems.count,
+                                     isOn: $model.isBadgeFilterOn)
                     .listRowSeparator(.hidden)
             }
             if !snapshot.leadItems.isEmpty {
@@ -432,6 +462,145 @@ public struct TodaySortMenu: View {
         }
         .menuIndicator(.hidden)
         .accessibilityLabel("Order every section: \(selection.label)")
+    }
+}
+
+// MARK: - The badge filter
+
+/// The wording the badge filter uses, in one place.
+///
+/// Three controls say the same thing (a toolbar button, a pill in the day, and an
+/// empty state) and they have to say it the SAME way on both platforms. A phrase
+/// written out three times is three phrases the next edit can leave disagreeing.
+enum TodayBadgeFilterWording {
+    /// The label, with the count the tab badge is showing.
+    static func label(_ count: Int) -> String { "Needs action (\(count))" }
+
+    /// What a screen reader hears for the control, count included.
+    static func accessibilityLabel(_ count: Int) -> String {
+        count == 1 ? "Needs action, 1 item" : "Needs action, \(count) items"
+    }
+
+    /// What the filtered list announces about itself, so a screen reader user knows a
+    /// short list is short because it is filtered rather than because the day is.
+    ///
+    /// `held` is the rows still on screen that have LEFT the badge set, because they
+    /// were just ticked or postponed. They are counted separately rather than folded
+    /// in: a line reading "4 need action" over a list whose fourth row is struck
+    /// through would be the one number on this screen that lies.
+    static func showing(_ count: Int, held: Int = 0) -> String {
+        let live = count == 1 ? "Showing 1 item that needs action"
+                              : "Showing \(count) items that need action"
+        guard held > 0 else { return live }
+        return held == 1 ? "\(live), plus 1 you just handled"
+                         : "\(live), plus \(held) you just handled"
+    }
+
+    static let fullDay = "Show the full day"
+    static let hint = "Shows only the items the Today badge counts."
+    static let allClearTitle = "Nothing left that needs action"
+    static let allClearMessage =
+        "Every Do Now item and standing item is done or set aside for today."
+}
+
+/// The toolbar toggle: the badge's own number, and a filter you can press.
+///
+/// The glyph is a `bolt`, not the funnel the sort menu already wears. Two funnels in
+/// one toolbar would be two controls claiming to be the same kind of thing, and this
+/// app already spells "Do Now" as a bolt everywhere else (the move op's icon, the
+/// focus action's icon), which is exactly what the badge set is.
+///
+/// The number is on the button rather than only in a menu, because the whole point is
+/// to connect this control to the red number on the tab.
+struct TodayBadgeFilterButton: View {
+    let count: Int
+    @Binding var isOn: Bool
+
+    var body: some View {
+        Button {
+            isOn.toggle()
+        } label: {
+            HStack(spacing: 3) {
+                Image(systemName: isOn ? "bolt.circle.fill" : "bolt.circle")
+                Text("\(count)")
+                    .font(.caption)
+                    .monospacedDigit()
+            }
+            .contentShape(.rect)
+        }
+        .help(TodayBadgeFilterWording.label(count) + ". " + TodayBadgeFilterWording.hint)
+        .accessibilityLabel(TodayBadgeFilterWording.accessibilityLabel(count))
+        .accessibilityValue(isOn ? "Filter on" : "Filter off")
+        .accessibilityHint(TodayBadgeFilterWording.hint)
+        .accessibilityAddTraits(isOn ? [.isSelected] : [])
+    }
+}
+
+/// The same filter, in the day itself.
+///
+/// A control in a toolbar is a control the user has to go looking for, and the number
+/// it refers to is on the other side of the screen. This pill sits where the day
+/// starts, carries the same words and the same count, and turns the filter on when
+/// pressed. With the filter already on it says what is on screen instead, and offers
+/// the way back: the filtered view must never be a room with no door.
+struct TodayBadgeFilterPill: View {
+    let count: Int
+    /// How many rows the filtered list is actually drawing. Larger than `count`
+    /// whenever a row is being held after being ticked or postponed, and saying both
+    /// numbers is the honest way to explain that row's presence.
+    let showing: Int
+    @Binding var isOn: Bool
+
+    var body: some View {
+        HStack(spacing: 8) {
+            if isOn {
+                Label(TodayBadgeFilterWording.showing(count, held: max(0, showing - count)),
+                      systemImage: "bolt.circle.fill")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                Spacer(minLength: 4)
+                Button(TodayBadgeFilterWording.fullDay) { isOn = false }
+                    .font(.caption)
+                    .buttonStyle(.plain)
+                    .foregroundStyle(.tint)
+            } else {
+                Button {
+                    isOn = true
+                } label: {
+                    Label(TodayBadgeFilterWording.label(count), systemImage: "bolt.circle")
+                        .font(.caption)
+                        .padding(.vertical, 4)
+                        .padding(.horizontal, 8)
+                        .background(.quaternary, in: .capsule)
+                        .contentShape(.capsule)
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel(TodayBadgeFilterWording.accessibilityLabel(count))
+                .accessibilityHint(TodayBadgeFilterWording.hint)
+                Spacer(minLength: 4)
+            }
+        }
+        .padding(.vertical, 2)
+    }
+}
+
+/// The filtered day with nothing left in it.
+///
+/// An accomplishment, in one line, and not an error: the day still has rows, they are
+/// just done or set aside. The way back to the full day is a button here rather than
+/// an automatic fall back, because the user asked a question and "none" is the answer
+/// to it, and quietly showing them forty rows instead would look like the filter broke.
+struct TodayBadgeFilterEmptyState: View {
+    let onShowFullDay: () -> Void
+
+    var body: some View {
+        ContentUnavailableView {
+            Label(TodayBadgeFilterWording.allClearTitle, systemImage: "checkmark.circle")
+        } description: {
+            Text(TodayBadgeFilterWording.allClearMessage)
+        } actions: {
+            Button(TodayBadgeFilterWording.fullDay, action: onShowFullDay)
+        }
     }
 }
 

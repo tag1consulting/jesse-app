@@ -493,6 +493,64 @@ hand. This release fixes the hour, the silence, and the amnesia.
   item is neither done nor out of the day, and what postponement takes out of a count is
   the app's badge, which the client computes over the rows it draws.
 
+## [App 1.0 (104)] - 2026-08-12
+
+### Added
+
+- **A view of the Today screen showing only the items the badge counts.** The red number
+  on the tab said there was work without saying what it was: on a full day the counted
+  rows are scattered through eight sections of open work, postponed work, done work and
+  briefing lines, and there was no way to see which of them were keeping it red. The new
+  filter narrows the day to exactly that set, so the number and the rows become one
+  answer.
+
+  **One membership rule, not two.** `TodaySemantics.badgeItems` is now the single
+  definition of what the badge means (every open lead item, then the open items of the
+  first `Do Now…` section), and `doNowOpenCount` is defined as its size while the
+  filtered view is defined as its contents. Nothing re-derives that rule anywhere, which
+  is the only reason the count and the list cannot drift apart. What the badge counts is
+  unchanged: this makes it visible, it does not redefine it.
+
+  The control is in the Today toolbar on both platforms, in the rightmost slot, carrying
+  the badge's own number. That is the frequency rule from (103) applied to a new button
+  rather than an exception to it: "show me what's left" is the loop this screen exists
+  for, while the sort is set once and left alone for hours, so the sort menu moves one
+  place inward. Both are cheap and instantly reversible, which is what that slot is for.
+  The same `Needs action (n)` pill sits at the top of the day itself, so the feature is
+  discoverable without opening a toolbar and the count is a thing you can press. The
+  glyph is a bolt, which is already how this app spells "Do Now" (the move op, the focus
+  action), rather than a second funnel next to the sort menu's.
+
+  **A row you act on does not vanish under your thumb.** Ticking or postponing an item
+  takes it out of the badge immediately, which is the feedback the tap was after, but
+  the row stays where it was, struck through or chipped as postponed exactly as the full
+  day draws it, until the next pull-to-refresh or the next entry into the screen. A list
+  that deletes rows as you tap them is a list you cannot correct.
+
+  With nothing left, the screen says so in one line and offers the way back to the full
+  day. It never unfilters itself: the user asked which items the badge counts, and none
+  is the answer to that question.
+
+  Everything else is unchanged by construction. The filter writes no markdown and sends
+  no request (asserted: the raw day, every line of it, is identical after toggling), it
+  works while the day is read-only because it is a view, and every row action (check,
+  postpone, move, focus, discuss, close at source) is the same action it is in the full
+  day. The optimistic overlay is applied before the filter, so an in-flight tap decides
+  membership at once, and the pins follow an item's id through the re-key a cross-section
+  move causes. No bridge change: no route, no wire field, no snapshot change.
+
+  The state is remembered per device, in each shell's own defaults through
+  `TodayViewPreferences`. Which view of the day a device shows is a fact about the
+  device, and it never goes near the bridge. The view sort is still deliberately not
+  persisted on either platform.
+
+  Seventeen tests in `JesseTodayDisplayTests` pin the behaviour, including the list-is-
+  the-badge-set claim over six shapes of day (none, lead only, `Do Now` only, both,
+  everything postponed, and two sections whose names both begin `Do Now`). A new
+  `TodayToolbarUITests` asserts through the running app that the filter is a real
+  navigation bar button right of the sort menu and that it announces its state, which is
+  the placement blind spot (66) shipped through.
+
 ## [App 1.0 (103)] - 2026-08-12
 
 ### Changed
