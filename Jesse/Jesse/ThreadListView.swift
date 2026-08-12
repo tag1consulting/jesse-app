@@ -172,11 +172,13 @@ struct ThreadListView: View {
             driveSearchExpansion(for: searchText)
         }
         .navigationTitle("Jesse")
+        // DECLARATION ORDER IS LEFT-TO-RIGHT, and the trailing items are ordered by how
+        // often they are tapped: the most-used sits farthest right, nearest the thumb.
+        // New conversation is the most-tapped action on this screen, so it is declared
+        // LAST; the morning routine fires once a day and moves inward. See README,
+        // "UI conventions". A new button is inserted at its frequency position rather
+        // than appended to whichever end is convenient.
         .toolbar {
-            ToolbarItem(placement: .topBarTrailing) {
-                Button(action: newThread) { Image(systemName: "square.and.pencil") }
-                    .accessibilityLabel("New conversation")
-            }
             // The morning routine, as a button: the greeting Jeremy types by hand every
             // morning to start it. A plain `ToolbarItem` at `.topBarTrailing`, never
             // `.secondaryAction`, and never inside a conditional — that combination is
@@ -190,6 +192,10 @@ struct ThreadListView: View {
             // not run yet" empty state, and `sunrise` is the Today tab's icon — visible
             // in the tab bar at the same moment as this button. One glyph shape carrying
             // three different claims on one screen is not a glyph, it is a guess.
+            //
+            // It is also the screen's one heavy action (minutes of work, rewrites the day
+            // file), which is the second reason it is not the rightmost item: the
+            // rightmost slot is where a mis-tap lands.
             ToolbarItem(placement: .topBarTrailing) {
                 Button { confirmMorningRoutine = true } label: {
                     Image(systemName: "cup.and.saucer")
@@ -205,6 +211,10 @@ struct ThreadListView: View {
                 // unpaired compose-and-send does: a thread with an error on it.
                 // (The Mac's copy of this button IS disabled, because New Chat next to it
                 // is — same principle, opposite answer, because the neighbours differ.)
+            }
+            ToolbarItem(placement: .topBarTrailing) {
+                Button(action: newThread) { Image(systemName: "square.and.pencil") }
+                    .accessibilityLabel("New conversation")
             }
             ToolbarItem(placement: .topBarLeading) {
                 Button { showSettings = true } label: { Image(systemName: "gearshape") }

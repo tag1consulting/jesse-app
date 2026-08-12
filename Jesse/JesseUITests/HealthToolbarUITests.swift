@@ -95,4 +95,24 @@ final class HealthToolbarUITests: XCTestCase {
             XCTAssertTrue(app.buttons[option].exists, "Quick log offers \(option)")
         }
     }
+
+    /// The toolbar is ordered by taps per day, most-used farthest right (README, "UI
+    /// conventions"). Quick log runs several times a day and is cheap and repeatable, so
+    /// it holds the rightmost slot; "Start new day" fires once, runs for minutes and
+    /// rewrites the day file, so it sits inward, away from where a mis-tap lands. Only a
+    /// running app can say which is where: order is a rendering fact, and swapping the
+    /// two declarations compiles and passes every unit test either way.
+    func testQuickLogSitsRightOfStartNewDay() {
+        let app = XCUIApplication()
+        app.launch()
+        openHealthTabOnToday(app)
+
+        let quickLog = app.navigationBars.buttons["Quick log"]
+        let newDay = app.navigationBars.buttons["Start new day"]
+        XCTAssertTrue(quickLog.waitForExistence(timeout: 10), "Quick log is in the navigation bar")
+        XCTAssertTrue(newDay.waitForExistence(timeout: 10), "Start new day is in the navigation bar")
+
+        XCTAssertGreaterThan(quickLog.frame.minX, newDay.frame.minX,
+                             "Quick log is the rightmost item; Start new day sits inward of it")
+    }
 }

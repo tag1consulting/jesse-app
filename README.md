@@ -428,6 +428,20 @@ These are the things most likely to bite during setup, roughly in order:
 - **App:** run `scripts/local-ci-macos.sh` — see below.
 - See `CHANGELOG.md` for the per-version record of what changed in each component.
 
+### UI conventions
+
+**Toolbar order.** On every screen the top-right toolbar is ordered by how often a
+button gets used. The most-used action sits farthest right, closest to the thumb, and
+less-used actions work inward toward the center. Frequency means expected taps per day
+in normal use, not importance: a button that matters a lot but fires once a day is not a
+frequent button. A heavy or hard-to-undo action never takes the rightmost slot even when
+it is used often, because that slot is where a mis-tap lands, so it belongs to a cheap,
+safe, repeatable action. The order is the same on iOS and macOS, and where one platform
+has a button the other lacks, the remaining buttons keep their relative order. A new
+toolbar button is inserted at its frequency position, never appended to whichever end is
+convenient. In SwiftUI, declaration order within a `.toolbar` is left to right, so the
+rightmost button is the one declared last.
+
 ### Where the checks run
 
 The two halves of CI are gated in different places, on purpose.

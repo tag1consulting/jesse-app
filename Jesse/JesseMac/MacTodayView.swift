@@ -96,19 +96,27 @@ struct MacTodayView: View {
                           onDiscuss: { discuss(.discuss(item: $0)) },
                           onPropagate: { execute(.propagate(item: $0, evidence: $1)) },
                           onProcessUpdates: processUpdates)
+                // DECLARATION ORDER IS LEFT-TO-RIGHT, ordered by clicks per day: Settings
+                // is opened least often, Refresh far more, so Refresh sits to its right.
+                // These two are the shell's half of this screen's toolbar and always
+                // render to the LEFT of the shared list's own items (process updates,
+                // then the sort menu), which is measured, not assumed: a toolbar declared
+                // on a child view lands after the one declared on it from outside. That
+                // is what keeps the process/sort pair in the same relative order here as
+                // on the iPhone. See README, "UI conventions".
                 .toolbar {
+                    ToolbarItem {
+                        Button { openSettings() } label: {
+                            Label("Settings", systemImage: "gearshape")
+                        }
+                        .help("Pair with your bridge, or change the connection")
+                    }
                     ToolbarItem {
                         Button { Task { await model.refresh() } } label: {
                             Label("Refresh", systemImage: "arrow.clockwise")
                         }
                         .keyboardShortcut("r", modifiers: .command)
                         .help("Re-read today's day file")
-                    }
-                    ToolbarItem {
-                        Button { openSettings() } label: {
-                            Label("Settings", systemImage: "gearshape")
-                        }
-                        .help("Pair with your bridge, or change the connection")
                     }
                 }
                 .navigationDestination(item: $openedItem) { item in

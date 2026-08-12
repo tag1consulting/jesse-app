@@ -304,6 +304,45 @@ hand. This release fixes the hour, the silence, and the amnesia.
   item is neither done nor out of the day, and what postponement takes out of a count is
   the app's badge, which the client computes over the rows it draws.
 
+## [App 1.0 (103)] - 2026-08-12
+
+### Changed
+
+- **Top-right toolbars are now ordered by how often a button gets used**, on every screen
+  and on both platforms. The most-used action sits farthest right, nearest the thumb, and
+  less-used actions work inward. Frequency here means expected taps per day, not
+  importance, and a heavy or hard-to-undo action never takes the rightmost slot even when
+  it is used often: that slot is where a mis-tap lands, so it belongs to something cheap,
+  safe and repeatable. Nothing was added, removed, renamed or rewired. Order only.
+
+  Chats now reads (left to right) `Good morning`, `New conversation`; Health reads
+  `Start new day`, `Quick log`; a conversation reads `Share`, model picker, favorite. On
+  the Mac, Chats reads `Settings`, `Archive`, `Show Favorites`, `Refresh`,
+  `Good morning`, `New Chat`; Health reads `Settings`, `Start new day`, `Refresh`; Today
+  reads `Settings`, `Refresh`, then the shared list's process-updates and sort items.
+  Today's own pair is unchanged on both platforms: processing rewrites every named
+  project file, the Dashboard and the day file, so the cheap sort menu keeps the
+  rightmost slot.
+
+  The rule is written down in `README.md` under "UI conventions", including the part that
+  matters for the next button: it is inserted at its frequency position, never appended
+  to whichever end is convenient.
+
+  Two XCUITests now assert the rendered order on the phone (`New conversation` right of
+  `Good morning`, `Quick log` right of `Start new day`). Order is a rendering fact that
+  compiles and unit-tests identically either way, which is the same blind spot that let a
+  `.secondaryAction` item ship as an inert ellipsis in (66).
+
+  **One measured Mac consequence, called out because it is visible.** The Chats group
+  renders above the sidebar, so its width is the sidebar's rather than the window's, and
+  at the default sidebar width only three of its six items are laid out; NSToolbar puts
+  the rest behind the "more toolbar items" overflow and clips from the trailing end.
+  Before this change the clipped three were `Show Favorites`, `Archive` and `Settings`;
+  now they are `Refresh`, `Good morning` and `New Chat`. Every keyboard shortcut in the
+  group still works while clipped (⌘N, ⌘R, ⌘⇧F, ⌘⇧A), and widening the sidebar reveals
+  more items. Widening the window does not: it was measured at 1000 and 1800 points wide
+  with the same three visible.
+
 ## [App 1.0 (102)] - 2026-08-11
 
 ### Added
