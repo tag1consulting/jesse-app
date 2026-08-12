@@ -13,6 +13,30 @@ Every commit that changes a component **must** bump that component's version and
 add an entry here — enforced by `scripts/version-guard.sh` (the pre-push hook and
 CI both run it). See the "Versioning" section of `bridge/README.md`.
 
+## [Bridge 0.79.1] - 2026-08-12
+
+### Added
+
+- **A test that pins down which lock the scheduler actually holds.**
+  `an_interactive_turn_runs_mid_chain_without_waiting_on_the_scheduler_lock`
+  starts a chain, waits until a member's turn is genuinely in flight, then fires
+  an ordinary `POST /jesse` and asserts three things: the scheduled turn is
+  holding ONE ordinary slot rather than the whole table, the interactive turn is
+  admitted and answers **while the chain is still running**, and its child
+  overlaps the in-flight member rather than slipping into a gap between members.
+
+  `Scheduler::turn_lock` serializes chain against chain; every turn — scheduled or
+  interactive — is admitted by the shared `SlotTable`, and the two are not the
+  same gate. That was true in 0.79.0 and described in prose, which is not the
+  same as being asserted: the failure it guards against (a future change routing
+  scheduled turns through a lock a person's turn also needs) would have been
+  invisible to the suite. Both new assertions were verified to fail when the slot
+  table is deliberately narrowed to one slot.
+
+  The converse — a scheduled turn yielding rather than queueing when clients hold
+  every slot — was already covered by
+  `a_saturated_request_limit_makes_a_scheduled_turn_skip_rather_than_starve_a_client`.
+
 ## [Bridge 0.79.0] - 2026-08-12
 
 ### Added

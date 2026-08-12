@@ -112,6 +112,21 @@ fn failing_claude(log: &std::path::Path, fail_marker: &str) -> PathBuf {
     ))
 }
 
+/// A fake `claude` for the interleave test: a SLOW turn for a chain member and a fast one
+/// for the interactive turn, so the interactive child can start, finish, and be asserted on
+/// while a chain member is provably still in flight.
+fn interleave_claude(log: &std::path::Path) -> PathBuf {
+    write_fake_claude(&format!(
+        "#!/bin/sh\n\
+         m=$(printf '%s' \"$2\" | grep -o 'MARKER-[a-z0-9-]*' | head -1)\n\
+         echo \"start $m\" >> '{log}'\n\
+         if [ \"$m\" = 'MARKER-interactive' ]; then sleep 0.05; else sleep 3; fi\n\
+         echo \"end $m\" >> '{log}'\n\
+         printf '%s\\n' '{{\"type\":\"result\",\"is_error\":false,\"result\":\"ok\",\"session_id\":\"sess-sched\"}}'\n",
+        log = log.display(),
+    ))
+}
+
 fn log_lines(log: &std::path::Path) -> Vec<String> {
     std::fs::read_to_string(log)
         .unwrap_or_default()
@@ -439,6 +454,118 @@ async fn a_still_running_chain_skips_its_next_fire_instead_of_queueing_it() {
         vec!["start MARKER-one", "end MARKER-one"],
         "the skipped fire must never have spawned a second turn"
     );
+    let _ = std::fs::remove_file(&fake);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn an_interactive_turn_runs_mid_chain_without_waiting_on_the_scheduler_lock() {
+    // THE TWO LOCKS ARE NOT THE SAME LOCK, and this is the assertion that says so.
+    //
+    // `Scheduler::turn_lock` is held for a whole chain and serializes CHAIN AGAINST CHAIN.
+    // A person's turn never touches it — it is admitted by the ordinary `SlotTable`, the
+    // same gate every turn passes — so a chain running at 03:00 must not make an
+    // interactive turn wait for the chain, or even for the member in flight.
+    //
+    // FAILING-FIRST: were the scheduler serializing on the shared turn-admission path
+    // instead, the POST below could not be admitted `Ready` while a member holds it, and
+    // the interactive turn could not finish before the chain does.
+    let dir = temp_state_dir();
+    let log = dir.join("runs.log");
+    let fake = interleave_claude(&log);
+    let (at, anchor) = due_at(5);
+    let st = state_with(vec![head("one", &at), link("two", "one")], &fake, &dir);
+    st.scheduler.state.claim("one", anchor);
+
+    // Start the chain, but do NOT wait for it — the point is to act while it runs.
+    let handles = st.scheduler.tick(&st, now_ms());
+    assert_eq!(handles.len(), 1);
+
+    // Wait until a chain member's turn is genuinely in flight (its child has started and
+    // is inside its 3s sleep), so what follows is measured against a busy chain.
+    let started = std::time::Instant::now();
+    while !log_lines(&log).iter().any(|l| l == "start MARKER-one") {
+        assert!(started.elapsed() < WAIT_DEADLINE, "the chain never started");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(
+        st.scheduler.is_running("one"),
+        "the chain holds the scheduler lock for its whole life"
+    );
+    assert!(
+        st.slots.free_for("opus") >= 1,
+        "a scheduled turn takes ONE ordinary slot, not the whole table"
+    );
+
+    // The interactive turn. Admission must be immediate — `Ready`, not queued behind the
+    // chain — so the POST returns its 202 without waiting out the 3s member.
+    let posted = std::time::Instant::now();
+    let resp = app(st.clone())
+        .oneshot(jesse_request(
+            Some("Bearer test-token"),
+            r#"{"mode":"ask","text":"answer me now MARKER-interactive"}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::ACCEPTED);
+    let admit = posted.elapsed();
+    assert!(
+        admit < Duration::from_secs(2),
+        "admission took {admit:?} — an interactive turn must not queue behind a chain member"
+    );
+    let body: Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    let job_id = body["job_id"].as_str().unwrap().to_string();
+
+    // It must COMPLETE while the chain is still running. That is the property: the
+    // interactive turn neither waited for the chain nor for the member in flight.
+    let done = std::time::Instant::now();
+    loop {
+        let v = result_status(&st, &job_id).await;
+        if v["status"] == "done" {
+            assert_eq!(v["response"], "ok");
+            break;
+        }
+        assert!(
+            done.elapsed() < WAIT_DEADLINE,
+            "the interactive turn never finished"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(
+        st.scheduler.is_running("one"),
+        "the interactive turn finished while the chain was still running — it never waited \
+         on the scheduler's lock"
+    );
+    // And it really did overlap the member in flight, rather than slipping into a gap:
+    // its child started before that member's child finished.
+    let lines = log_lines(&log);
+    let interactive_start = lines.iter().position(|l| l == "start MARKER-interactive");
+    let member_end = lines.iter().position(|l| l == "end MARKER-one");
+    assert!(
+        interactive_start.is_some() && (member_end.is_none() || interactive_start < member_end),
+        "the interactive turn must run CONCURRENTLY with the in-flight chain member: {lines:?}"
+    );
+
+    // THE CHAIN RESUMES CORRECTLY after an interactive turn ran alongside it.
+    for h in handles {
+        h.await.unwrap();
+    }
+    let chain: Vec<String> = log_lines(&log)
+        .into_iter()
+        .filter(|l| l.ends_with("MARKER-one") || l.ends_with("MARKER-two"))
+        .collect();
+    assert_eq!(
+        chain,
+        vec![
+            "start MARKER-one",
+            "end MARKER-one",
+            "start MARKER-two",
+            "end MARKER-two"
+        ],
+        "the chain must still run in order, with no member overlapping another"
+    );
+    assert_eq!(st.scheduler.state.get("one").outcome(), Some(Outcome::Ran));
+    assert_eq!(st.scheduler.state.get("two").outcome(), Some(Outcome::Ran));
     let _ = std::fs::remove_file(&fake);
     let _ = std::fs::remove_dir_all(&dir);
 }
