@@ -378,6 +378,9 @@ mod tests {
             potassium_mg: None,
             calcium_mg: None,
             magnesium_mg: None,
+            cholesterol_mg: None,
+            selenium_ug: None,
+            vitamin_d_ug: None,
         }
     }
 

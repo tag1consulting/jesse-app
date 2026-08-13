@@ -1600,6 +1600,24 @@ The fill class is what completion keys on:
 * `MarineOnly` (`Omega3_mg`) — marine long-chain EPA+DHA only, never plant ALA. A blank
   is the normal, correct state for most foods, so it is never counted as incomplete and
   **never** filled by completion. It has no HealthKit type and so no meal-wire field.
+* `EstimatedRisk` (`Cholesterol_mg`, `TransFat_g`, `AddedSugar_g`, `Purines_mg`,
+  `Mercury_ug`, `Selenium_ug`, `VitaminD_ug`) — the risk nutrients almost no label
+  prints. The local extract fills one from a label that happens to state it or from a
+  confident value for that food, and omits it otherwise, so a blank is a normal outcome
+  rather than incomplete data: these are outside the completeness denominator and are
+  **never** filled by hosted completion. Each carries its own `guidance` bullet in the
+  extract prompt — which is also where the one nuance lives: for several of them a `0`
+  is a **known fact** (no cholesterol in a plant food, no mercury outside seafood, no
+  added sugar in whole fruit, no vitamin D in most unfortified plants) and must be
+  written, while a blank still means nobody knew. The plumbing below the prompt is
+  unaware of that distinction and treats absent as unknown, everywhere.
+
+  Only three have a HealthKit type and therefore a meal-wire field: `cholesterol_mg`,
+  `selenium_ug`, `vitamin_d_ug` (`dietaryCholesterol`/`dietarySelenium`/
+  `dietaryVitaminD`). Trans fat, purines and mercury have no HealthKit quantity, and
+  HealthKit's only sugar quantity is TOTAL `dietarySugar` — already carried by
+  `sugar_g` — so added sugar deliberately stays off the wire rather than being written
+  to a different measure.
 
 **Which flag owns which behavior.** `JESSE_DIET_PROBATION` owns the verify **gate**
 (mandatory, blocking, every entry, before anything is appended).
