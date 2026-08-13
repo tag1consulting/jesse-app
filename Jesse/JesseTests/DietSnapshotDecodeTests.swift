@@ -417,6 +417,156 @@ final class DietSnapshotDecodeTests: XCTestCase {
         XCTAssertEqual(series[0].nutrients["cal"]?.sum, 2000, "the rest still decodes")
     }
 
+    // MARK: - The risk/trace nutrients (per-item snapshot fields) and rolling7
+
+    func testAllSevenRiskNutrientsDecodeFromAnItem() throws {
+        // The GAUGE wire: seven per-item fields on `DietItem`. These are a DIFFERENT
+        // surface from the JESSE_MEAL_LOG meal block (which carries only the three with a
+        // HealthKit type) — conflating the two is the known silent-failure trap.
+        let json = """
+        {
+          "asOf": "2026-07-09T14:50:55Z",
+          "today": {
+            "date": "2026-07-09",
+            "meals": [ { "name": "Dinner", "time": "19:00", "items": [
+              { "item": "Tuna steak", "cal": 300, "chol": 60, "tfat": 0, "asug": 0,
+                "pur": 290, "hg": 34.5, "se": 92, "vd": 5.7 }
+            ] } ],
+            "targets": { "calories": 2100, "transfat": 0, "addedsugar": 40,
+                         "vitamind": 20, "selenium": { "floor": 55, "ceiling": 300 } }
+          },
+          "errors": []
+        }
+        """
+        let s = try decode(json)
+        let item = try XCTUnwrap(s.today.meals.first?.items.first)
+        XCTAssertEqual(item.chol, 60)
+        XCTAssertEqual(item.tfat, 0, "a written zero is a KNOWN zero, not an absence")
+        XCTAssertEqual(item.asug, 0)
+        XCTAssertEqual(item.pur, 290)
+        XCTAssertEqual(item.hg, 34.5)
+        XCTAssertEqual(item.se, 92)
+        XCTAssertEqual(item.vd, 5.7)
+        // ...and the four new targets, three of them spelled all-lowercase on the wire.
+        XCTAssertEqual(s.today.targets.transFat, 0)
+        XCTAssertEqual(s.today.targets.addedSugar, 40)
+        XCTAssertEqual(s.today.targets.vitaminD, 20)
+        XCTAssertEqual(s.today.targets.selenium?.floor, 55)
+        XCTAssertEqual(s.today.targets.selenium?.ceiling, 300)
+        XCTAssertEqual(s.today.targets.selenium?.edges?.ceiling, 300)
+        // The pre-existing targets still decode under their own (unchanged) keys.
+        XCTAssertEqual(s.today.targets.calories, 2100)
+    }
+
+    func testAbsentRiskNutrientsDecodeToNilNeverZero() throws {
+        // An older generator omits all seven. Each must be nil — UNKNOWN — because a 0
+        // would read as "this food supplied none", which the log never claimed.
+        let s = try decode(full)
+        let item = try XCTUnwrap(s.today.meals.first?.items.first)
+        XCTAssertNil(item.chol)
+        XCTAssertNil(item.tfat)
+        XCTAssertNil(item.asug)
+        XCTAssertNil(item.pur)
+        XCTAssertNil(item.hg)
+        XCTAssertNil(item.se)
+        XCTAssertNil(item.vd)
+        XCTAssertNil(s.today.targets.transFat)
+        XCTAssertNil(s.today.targets.addedSugar)
+        XCTAssertNil(s.today.targets.selenium)
+        XCTAssertNil(s.today.targets.vitaminD)
+    }
+
+    func testRolling7DecodesTheGeneratorsRealShape() throws {
+        // The shape is copied FIELD-FOR-FIELD from what the vault generator actually emits
+        // (values invented, structure verbatim), because three things about it are not what
+        // the rest of the payload would lead you to guess, and each was wrong on the first
+        // pass:
+        //   * it rides INSIDE `today`, not beside it;
+        //   * `nutrients` is keyed by LOG COLUMN key (`mercury_ug`), not the short app key
+        //     (`hg`) every per-item field uses;
+        //   * `known` is the SUMMED VALUE, and the counts are `knownCount`/`unknownCount` —
+        //     so reading `known` as a count would render an item tally as a dose.
+        let json = """
+        {
+          "asOf": "2026-08-13T17:40:00Z",
+          "today": {
+            "date": "2026-08-13", "meals": [], "targets": {},
+            "rolling7": {
+              "days": 7, "from": "2026-08-07", "to": "2026-08-13",
+              "nutrients": {
+                "mercury_ug": { "known": 4, "knownCount": 17, "unknownCount": 129 },
+                "omega3_mg": { "known": 10292, "knownCount": 22, "unknownCount": 124 }
+              }
+            }
+          },
+          "errors": []
+        }
+        """
+        let w = try XCTUnwrap(try decode(json).today.rolling7)
+        XCTAssertEqual(w.days, 7)
+        XCTAssertEqual(w.from, "2026-08-07")
+        XCTAssertEqual(w.to, "2026-08-13")
+        XCTAssertEqual(w.nutrients["mercury_ug"],
+                       RollingNutrientTotal(known: 4, knownCount: 17, unknownCount: 129))
+        XCTAssertEqual(w.nutrients["omega3_mg"]?.known, 10292, "the SUM, not a count")
+        XCTAssertEqual(w.nutrients["omega3_mg"]?.knownCount, 22)
+        XCTAssertNil(w.nutrients["selenium_ug"],
+                     "a nutrient nothing measured is ABSENT, never a 0 row")
+        XCTAssertNil(w.nutrients["hg"], "the short app key is NOT this block's namespace")
+    }
+
+    func testAbsentRolling7StillDecodesTheWholeSnapshot() throws {
+        // The graceful-degrade contract: no `rolling7` → nil, and nothing else is affected.
+        let s = try decode(full)
+        XCTAssertNil(s.today.rolling7)
+        XCTAssertEqual(s.today.date, "2026-07-09")
+        XCTAssertEqual(s.today.meals.count, 1)
+    }
+
+    func testAMalformedRolling7NeverTakesTheWholeSnapshotDown() throws {
+        // The failure mode that matters more than the feature: `decodeIfPresent` THROWS on
+        // a present-but-malformed value, so a reshaped optional section would fail the
+        // entire `GET /jesse/diet` decode and blank the Health tab. Every member here is
+        // tolerant, so a wrong-shaped block degrades to "no window" and the day still loads.
+        let json = """
+        {
+          "asOf": "x",
+          "today": {
+            "date": "2026-08-13", "meals": [], "targets": {},
+            "rolling7": { "nutrients": { "mercury_ug": { "sum": 4, "known": 17 } } }
+          },
+          "errors": []
+        }
+        """
+        let today = try decode(json).today
+        XCTAssertEqual(today.date, "2026-08-13", "the day still decodes")
+        let w = try XCTUnwrap(today.rolling7)
+        XCTAssertEqual(w.days, 7, "a block that omits its length IS the 7-day one")
+        XCTAssertNil(w.from)
+        // The unrecognised inner shape reads as zero KNOWN CONTRIBUTORS, which is the
+        // "nothing measured" state the row hides on — never a phantom total.
+        XCTAssertEqual(w.nutrients["mercury_ug"]?.knownCount, 0)
+    }
+
+    func testTheWeeklyAndPurineTargetsDecode() throws {
+        // Two numbers that were hardcoded constants on the first pass and are in fact on
+        // the wire, under all-lowercase / snake_case keys of their own.
+        let json = """
+        {
+          "asOf": "x",
+          "today": {
+            "date": "2026-08-13", "meals": [],
+            "targets": { "purines": 500, "mercury_weekly": 105, "vitamind": 20 }
+          },
+          "errors": []
+        }
+        """
+        let t = try decode(json).today.targets
+        XCTAssertEqual(t.purines, 500)
+        XCTAssertEqual(t.mercuryWeekly, 105)
+        XCTAssertEqual(t.vitaminD, 20)
+    }
+
     // MARK: - decodeDiet status mapping
 
     private func resp(_ code: Int) -> HTTPURLResponse {

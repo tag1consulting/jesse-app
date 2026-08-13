@@ -99,8 +99,12 @@ enum Explainers {
     /// reads "not tracked yet"; a target frames the number by the nutrient's semantics
     /// (ceiling for sodium/saturated fat, floor for potassium); no target shows the value
     /// only; and total sugars stays informational — never a judgment.
+    /// The title and identity come from the GAUGE's label rather than the nutrient's name,
+    /// so a rolling-window row ("Mercury (7-day)") titles its sheet with the window it
+    /// actually describes and gets its own sheet identity — the one place the window must
+    /// not be lost is the header of the screen explaining the number.
     static func micronutrient(_ n: Micronutrient, gauge g: MetricGauge) -> Explainer {
-        Explainer(id: "micro-\(n.displayName)", title: n.displayName,
+        Explainer(id: "micro-\(g.label)", title: g.label,
                   valueLine: microLine(g), paragraphs: microParagraphs(n, g),
                   note: n.education)
     }
@@ -108,12 +112,18 @@ enum Explainers {
     /// The micronutrient header line, mirroring the gauge's own value language: "≥" when
     /// the total is a floor, the value/target and its remaining wording when a target is
     /// present, and the neutral "not tracked yet" when no item carried the value.
+    ///
+    /// A BAND row drops the "/ target" half deliberately. Its `target` is the band's
+    /// CEILING (the bar's reference), and "120 / 300µg" at the top of the sheet reads as a
+    /// ceiling of 300 — precisely the misreading a band exists to avoid. The remaining
+    /// phrase already names both edges, so it carries the goal on its own.
     private static func microLine(_ g: MetricGauge) -> String {
         guard (g.knownItemCount ?? 0) > 0 else { return DietSemantics.notTrackedCaption }
         let prefix = g.partial ? "≥" : ""
         let v = DietSemantics.fmt(g.value)
+        let rem = g.remaining.isEmpty ? "" : " — \(g.remaining)"
+        if g.goal == .band { return "\(prefix)\(v)\(g.unit)\(rem)" }
         if let t = g.target {
-            let rem = g.remaining.isEmpty ? "" : " — \(g.remaining)"
             return "\(prefix)\(v) / \(DietSemantics.fmt(t))\(g.unit)\(rem)"
         }
         return "\(prefix)\(v)\(g.unit)"
@@ -138,15 +148,46 @@ enum Explainers {
             paras.append("Omega-3 is a floor — hit it or beat it. This counts the marine EPA and DHA in oily fish, shellfish, and roe, not the plant ALA in flax or walnuts.")
         case .magnesium:
             paras.append("Magnesium is a floor — hit it or beat it. Nuts, seeds, beans, whole grains, and leafy greens carry most of it, and it supports muscle, nerve, and sleep function.")
+        case .cholesterol:
+            paras.append("Cholesterol here is shown for context only — there's no target and no red or green. What you eat moves your blood numbers far less than saturated fat, trans fat, and fiber do, and all three of those are already tracked with real goals.")
+        case .transFat:
+            paras.append("Trans fat is a ceiling of zero — not a small budget, none. It's the one fat that raises LDL and lowers HDL at the same time, so the goal is to see this row sit at zero rather than to keep it low.")
+        case .addedSugar:
+            paras.append("Added sugar is a ceiling — stay at or under target. It counts only what was added, not the sugar that came with fruit or milk, which is exactly why it can carry a goal where total sugars can't.")
+        case .selenium:
+            paras.append("Selenium is a range, not a floor: reach the low edge, stay under the high one. It's one of the few nutrients where more is genuinely worse — two Brazil nuts can cover a whole day, and a handful can overshoot it.")
+        case .vitaminD:
+            paras.append("Vitamin D is a floor — hit it or beat it. This counts food only: oily fish, egg yolk, and fortified milk. Sun and supplements don't appear here, so a low number means low intake from food, not necessarily a low level in you.")
+        case .purines:
+            paras.append("Purines are shown for context only — no target, no red or green. They become uric acid, which matters if gout does and mostly doesn't otherwise; for most people the body makes far more than the diet supplies.")
+        case .mercury:
+            paras.append("Mercury is judged over a rolling 7-day window, never on a single day — that's the timescale your body clears it on. One tuna steak is not a problem; one every day is what the weekly number is watching for.")
         }
+        // A window row says WHAT it is measuring before anything else about the number:
+        // the scope is the thing most easily misread here, and the sheet is where a reader
+        // goes to settle exactly that.
+        if let window = g.rollingWindow {
+            let span = window.range.map { " (\($0))" } ?? ""
+            paras.append("This is the total across the last \(window.days) days\(span), not today's.")
+        }
+
         // The unknown-aware caveat: what "≥" and "not tracked yet" mean, so the number is
-        // never misread as complete.
+        // never misread as complete. The scope word follows the row's own scope, so a
+        // window row never says "today".
+        let scope = g.rollingWindow == nil ? "today" : "in this window"
         if (g.knownItemCount ?? 0) == 0 {
-            paras.append("No food logged today lists a \(n.displayName.lowercased()) value yet, so there's nothing to total — every item is under \"Not estimated\" below.")
+            paras.append("No food logged \(scope) lists a \(n.displayName.lowercased()) value yet, so there's nothing to total — every item is under \"Not estimated\" below.")
         } else if g.partial {
             paras.append("Some logged foods don't list their \(n.displayName.lowercased()), so this total is a floor — the real number is at least this much. Those items are listed under \"Not estimated\" below, never counted as zero.")
         }
-        if g.target == nil {
+
+        // A BAND names both edges rather than "a target": it has two, and saying "no
+        // target" of a row that is clearly judging something would be worse than silence.
+        if g.goal == .band {
+            if g.goalStatus == .noGoal, g.partial {
+                paras.append("Part of the day isn't estimated, so being under the low edge here proves nothing — the foods that weren't measured could carry it well past. The row says what IS known: at least this much so far.")
+            }
+        } else if g.target == nil {
             paras.append("No target is set for it, so it's shown as a plain value with no goal to judge against.")
         }
         return paras

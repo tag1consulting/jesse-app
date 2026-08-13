@@ -131,7 +131,7 @@ struct NutrientTrendDetail: View {
     private var ruleColor: Color {
         switch nutrient.dayGoal {
         case .floor: return .green
-        case .ceiling, .window: return .orange
+        case .ceiling, .window, .band: return .orange
         case nil: return .secondary
         }
     }
@@ -388,7 +388,7 @@ struct NutrientTrendDetail: View {
         switch nutrient.dayGoal {
         case .floor: return "floor"
         case .ceiling: return "ceiling"
-        case .window: return "cap"
+        case .window, .band: return "cap"
         case nil: return "ref"
         }
     }

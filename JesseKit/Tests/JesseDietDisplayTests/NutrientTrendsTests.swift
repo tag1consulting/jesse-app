@@ -295,9 +295,9 @@ final class NutrientTrendsTests: XCTestCase {
 
     // MARK: - Labels (all thirteen, unabbreviated)
 
-    func testAllThirteenFullNamesPresentAndUnabbreviated() {
+    func testAllTwentyFullNamesPresentAndUnabbreviated() {
         let names = Dictionary(uniqueKeysWithValues: TrendNutrient.allCases.map { ($0, $0.fullName) })
-        XCTAssertEqual(TrendNutrient.allCases.count, 13)
+        XCTAssertEqual(TrendNutrient.allCases.count, 20)
         XCTAssertEqual(names[.cal], "Calories")
         XCTAssertEqual(names[.p], "Protein")
         XCTAssertEqual(names[.f], "Fat")
@@ -311,6 +311,19 @@ final class NutrientTrendsTests: XCTestCase {
         XCTAssertEqual(names[.o3], "Omega-3 (EPA+DHA)")
         XCTAssertEqual(names[.mg], "Magnesium")
         XCTAssertEqual(names[.unsat], "Unsaturated Fat")
+        XCTAssertEqual(names[.chol], "Cholesterol")
+        XCTAssertEqual(names[.tfat], "Trans Fat")
+        XCTAssertEqual(names[.asug], "Added Sugar")
+        XCTAssertEqual(names[.pur], "Purines")
+        XCTAssertEqual(names[.hg], "Mercury")
+        XCTAssertEqual(names[.se], "Selenium")
+        XCTAssertEqual(names[.vd], "Vitamin D")
+        // Every trend name matches the display name its `Micronutrient` twin spells, so a
+        // nutrient can never be called two things on two screens.
+        for n in Micronutrient.allCases {
+            XCTAssertEqual(TrendNutrient(metric: .micronutrient(n)).fullName, n.displayName,
+                           "\(n) is named differently by the trend engine")
+        }
         // None is a bare abbreviation.
         for n in TrendNutrient.allCases {
             XCTAssertGreaterThan(n.fullName.count, 2, "\(n.rawValue) name must be a real word")
@@ -319,7 +332,7 @@ final class NutrientTrendsTests: XCTestCase {
 
     // MARK: - Insight content
 
-    func testInsightContentPresentForAllThirteen() {
+    func testInsightContentPresentForEveryNutrient() {
         for n in TrendNutrient.allCases {
             XCTAssertFalse(n.whyItMatters.isEmpty, "\(n.fullName) missing whyItMatters")
             XCTAssertFalse(n.goodSources.isEmpty, "\(n.fullName) missing goodSources")
@@ -467,6 +480,11 @@ final class NutrientTrendsTests: XCTestCase {
             .ca: .rolling(days: 30), .o3: .rolling(days: 30),
             .mg: .rolling(days: 30), .k: .rolling(days: 30),
             .sug: .daily, .unsat: .daily,
+            // The risk/trace nutrients: the three with a single-number day goal are judged
+            // on the day; the rest are never judged here at all (informational, a band, or
+            // a weekly window sum, none of which a median answers).
+            .tfat: .daily, .asug: .daily, .vd: .daily,
+            .chol: .daily, .pur: .daily, .se: .daily, .hg: .daily,
         ]
         XCTAssertEqual(expected.count, TrendNutrient.allCases.count)
         for n in TrendNutrient.allCases {
@@ -474,6 +492,13 @@ final class NutrientTrendsTests: XCTestCase {
         }
         XCTAssertNil(TrendNutrient.sug.dayGoal, "informational — no verdict to window")
         XCTAssertNil(TrendNutrient.unsat.dayGoal)
+        for n in [TrendNutrient.chol, .pur] {
+            XCTAssertNil(n.dayGoal, "\(n.fullName) is informational — no per-day verdict")
+        }
+        XCTAssertNil(TrendNutrient.se.dayGoal,
+                     "selenium's goal is a BAND — a per-day series carries one number, not two")
+        XCTAssertNil(TrendNutrient.hg.dayGoal,
+                     "mercury's limit is weekly — a per-day verdict is a category error")
     }
 
     // MARK: - Rolling verdict (the gauge's colour)

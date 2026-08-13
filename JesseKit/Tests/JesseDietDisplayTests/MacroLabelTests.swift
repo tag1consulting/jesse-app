@@ -39,11 +39,22 @@ final class MacroLabelTests: XCTestCase {
         XCTAssertEqual(Micronutrient.calcium.displayName, "Calcium")
         XCTAssertEqual(Micronutrient.omega3.displayName, "Omega-3 (EPA+DHA)")
         XCTAssertEqual(Micronutrient.magnesium.displayName, "Magnesium")
+        XCTAssertEqual(Micronutrient.cholesterol.displayName, "Cholesterol")
+        XCTAssertEqual(Micronutrient.transFat.displayName, "Trans Fat")
+        XCTAssertEqual(Micronutrient.addedSugar.displayName, "Added Sugar")
+        XCTAssertEqual(Micronutrient.purines.displayName, "Purines")
+        XCTAssertEqual(Micronutrient.mercury.displayName, "Mercury")
+        XCTAssertEqual(Micronutrient.selenium.displayName, "Selenium")
+        XCTAssertEqual(Micronutrient.vitaminD.displayName, "Vitamin D")
     }
 
     func testMicronutrientNamesCarryNoAbbreviation() {
         // No wire key or chemical symbol ever surfaces as a user-facing name.
-        let banned: Set<String> = ["Na", "K", "SatFat", "Sat Fat", "Sugars", "Sugar", "na", "satf", "sug", "k"]
+        let banned: Set<String> = ["Na", "K", "SatFat", "Sat Fat", "Sugars", "Sugar",
+                                   "na", "satf", "sug", "k",
+                                   // The new wire keys and chemical symbols, likewise.
+                                   "Chol", "TFat", "ASug", "Pur", "Hg", "Se", "VD",
+                                   "chol", "tfat", "asug", "pur", "hg", "se", "vd"]
         for n in Micronutrient.allCases {
             XCTAssertFalse(banned.contains(n.displayName),
                            "\(n) still renders the abbreviation \(n.displayName)")
@@ -53,11 +64,20 @@ final class MacroLabelTests: XCTestCase {
 
     func testMicronutrientCanonicalOrderAndUnits() {
         XCTAssertEqual(Micronutrient.allCases.map(\.displayName),
-                       ["Sodium", "Saturated Fat", "Unsaturated Fat", "Total Sugars",
-                        "Potassium", "Calcium", "Omega-3 (EPA+DHA)", "Magnesium"])
-        // Minerals and omega-3 in mg, the fats and sugars in g.
+                       ["Sodium",
+                        "Saturated Fat", "Trans Fat", "Unsaturated Fat", "Cholesterol",
+                        "Total Sugars", "Added Sugar",
+                        "Potassium", "Calcium", "Omega-3 (EPA+DHA)", "Magnesium",
+                        "Selenium", "Vitamin D", "Purines", "Mercury"])
+        // Bulk minerals, omega-3, cholesterol and purines in mg; the fats and sugars in g;
+        // the trace nutrients (selenium, vitamin D, mercury) in µg — milligrams would
+        // round every one of those to "0".
         XCTAssertEqual(Micronutrient.allCases.map(\.unit),
-                       ["mg", "g", "g", "g", "mg", "mg", "mg", "mg"])
+                       ["mg",
+                        "g", "g", "g", "mg",
+                        "g", "g",
+                        "mg", "mg", "mg", "mg",
+                        "µg", "µg", "mg", "µg"])
     }
 
     // MARK: - Canonical display order (fiber is a subset of carbs → sits after it)

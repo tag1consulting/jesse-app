@@ -137,6 +137,14 @@ enum JudgmentSource: Equatable, Sendable {
 /// looks a day up directly.
 enum TrendNutrient: String, CaseIterable, Identifiable, Sendable {
     case cal, p, f, c, fiber, na, satf, sug, k, ca, o3, mg, unsat
+    // The risk/trace nutrients. Their keys follow the same convention and will appear in
+    // `nutrientSeries` automatically once the generator logs the columns (the bridge
+    // derives the series' column list from its one nutrient table). Until then every
+    // consumer here reads them as a nutrient with no known day, which is the same
+    // graceful-degrade path an unlogged nutrient has always taken: the trend, the streak,
+    // the Sources list and the window switcher all filter on data presence, so none of
+    // them shows an empty row for a nutrient the log has never carried.
+    case chol, tfat, asug, pur, hg, se, vd
 
     var id: String { rawValue }
 
@@ -160,6 +168,13 @@ enum TrendNutrient: String, CaseIterable, Identifiable, Sendable {
         case .o3: return "Omega-3 (EPA+DHA)"
         case .mg: return "Magnesium"
         case .unsat: return "Unsaturated Fat"
+        case .chol: return "Cholesterol"
+        case .tfat: return "Trans Fat"
+        case .asug: return "Added Sugar"
+        case .pur: return "Purines"
+        case .hg: return "Mercury"
+        case .se: return "Selenium"
+        case .vd: return "Vitamin D"
         }
     }
 
@@ -168,8 +183,9 @@ enum TrendNutrient: String, CaseIterable, Identifiable, Sendable {
     var unit: String {
         switch self {
         case .cal: return "kcal"
-        case .na, .k, .ca, .o3, .mg: return "mg"
-        case .p, .f, .c, .fiber, .satf, .sug, .unsat: return "g"
+        case .na, .k, .ca, .o3, .mg, .chol, .pur: return "mg"
+        case .p, .f, .c, .fiber, .satf, .sug, .unsat, .tfat, .asug: return "g"
+        case .se, .vd, .hg: return "µg"
         }
     }
 
@@ -177,9 +193,13 @@ enum TrendNutrient: String, CaseIterable, Identifiable, Sendable {
     var kind: TrendKind {
         switch self {
         case .cal, .f, .c: return .target
-        case .p, .fiber, .k, .ca, .o3, .mg: return .floor
-        case .na, .satf: return .ceiling
-        case .sug, .unsat: return .informational
+        case .p, .fiber, .k, .ca, .o3, .mg, .vd: return .floor
+        case .na, .satf, .tfat, .asug: return .ceiling
+        // Cholesterol and purines carry no judgment at all; selenium's goal is a BAND,
+        // which a single per-day number cannot express, so history plots it without a
+        // verdict rather than judging it against one edge; mercury's limit exists only
+        // over a rolling week, so a per-day verdict is a category error.
+        case .sug, .unsat, .chol, .pur, .se, .hg: return .informational
         }
     }
 
@@ -194,10 +214,10 @@ enum TrendNutrient: String, CaseIterable, Identifiable, Sendable {
     /// `dayGoal` answers "was this day good?", `kind` answers "which way is it drifting?".
     var dayGoal: DietSemantics.Goal? {
         switch self {
-        case .p, .fiber, .c, .k, .ca, .o3, .mg: return .floor
-        case .cal, .na, .satf: return .ceiling
+        case .p, .fiber, .c, .k, .ca, .o3, .mg, .vd: return .floor
+        case .cal, .na, .satf, .tfat, .asug: return .ceiling
         case .f: return .window
-        case .sug, .unsat: return nil
+        case .sug, .unsat, .chol, .pur, .se, .hg: return nil
         }
     }
 
@@ -209,8 +229,9 @@ enum TrendNutrient: String, CaseIterable, Identifiable, Sendable {
     /// direction, never a verdict; the colour is what an informational row withholds.
     var displayGoal: DietSemantics.Goal {
         switch self {
-        case .sug: return .ceiling
+        case .sug, .chol, .pur, .hg: return .ceiling
         case .unsat: return .floor
+        case .se: return .band
         default: return dayGoal ?? .floor
         }
     }
@@ -246,7 +267,11 @@ enum TrendNutrient: String, CaseIterable, Identifiable, Sendable {
         case .p, .fiber, .cal, .c: return .daily
         case .satf, .na, .f: return .rolling(days: 7)
         case .ca, .o3, .mg, .k: return .rolling(days: 30)
-        case .sug, .unsat: return .daily // informational — never judged, never consulted
+        case .tfat, .asug, .vd: return .daily
+        // Never judged here at all (see `kind`): cholesterol and purines carry no verdict,
+        // selenium's is a band, and mercury's is the `rolling7` window sum, which is a
+        // different statistic from any median this file computes.
+        case .sug, .unsat, .chol, .pur, .se, .hg: return .daily
         }
     }
 
@@ -281,7 +306,12 @@ enum TrendNutrient: String, CaseIterable, Identifiable, Sendable {
         case .ca: return t.calcium
         case .o3: return t.omega3
         case .mg: return t.magnesium
-        case .unsat: return nil
+        case .tfat: return t.transFat
+        case .asug: return t.addedSugar
+        case .vd: return t.vitaminD
+        // No single number to plot against: informational (cholesterol, purines), a band
+        // (selenium), or a weekly window ceiling rather than a day target (mercury).
+        case .unsat, .chol, .pur, .se, .hg: return nil
         }
     }
 
@@ -333,6 +363,13 @@ enum TrendNutrient: String, CaseIterable, Identifiable, Sendable {
         case .o3: return item.o3
         case .mg: return item.mg
         case .unsat: return item.satf.map { (item.f ?? 0) - $0 }
+        case .chol: return item.chol
+        case .tfat: return item.tfat
+        case .asug: return item.asug
+        case .pur: return item.pur
+        case .hg: return item.hg
+        case .se: return item.se
+        case .vd: return item.vd
         }
     }
 
@@ -353,6 +390,13 @@ enum TrendNutrient: String, CaseIterable, Identifiable, Sendable {
         case .o3: return .micronutrient(.omega3)
         case .mg: return .micronutrient(.magnesium)
         case .unsat: return .micronutrient(.unsaturatedFat)
+        case .chol: return .micronutrient(.cholesterol)
+        case .tfat: return .micronutrient(.transFat)
+        case .asug: return .micronutrient(.addedSugar)
+        case .pur: return .micronutrient(.purines)
+        case .hg: return .micronutrient(.mercury)
+        case .se: return .micronutrient(.selenium)
+        case .vd: return .micronutrient(.vitaminD)
         }
     }
 
@@ -375,6 +419,13 @@ enum TrendNutrient: String, CaseIterable, Identifiable, Sendable {
         case .f: return "Too low hurts hormones and satiety; keep most of it unsaturated."
         case .c: return "Carbs are the endurance runner's fuel; too low tanks long runs."
         case .unsat: return "The good-fat share of total fat; a higher share is better."
+        case .chol: return "Dietary cholesterol moves blood cholesterol far less than saturated and trans fat do."
+        case .tfat: return "Trans fat raises LDL and lowers HDL at once; there is no safe amount."
+        case .asug: return "Added sugar crowds out nutrition and drives energy swings in a deficit."
+        case .pur: return "High purine intake feeds uric acid, which matters only if gout does."
+        case .hg: return "Methylmercury accumulates over weeks; a steady high intake is the risk, not one meal."
+        case .se: return "Too little impairs thyroid and antioxidant function; too much is genuinely toxic."
+        case .vd: return "Low vitamin D means poor calcium absorption, which matters under high-impact running at 51."
         }
     }
 
@@ -396,6 +447,13 @@ enum TrendNutrient: String, CaseIterable, Identifiable, Sendable {
         case .f: return ["olive oil", "nuts", "avocado", "fish", "seeds"]
         case .c: return ["grains", "potatoes", "fruit", "legumes"]
         case .unsat: return ["olive oil", "nuts", "avocado", "oily fish"]
+        case .chol: return ["eggs", "shellfish", "organ meat", "dairy fat"]
+        case .tfat: return ["partially hydrogenated oil", "some fried food", "some baked goods"]
+        case .asug: return ["sweets", "sweetened drinks", "sauces", "breakfast cereal"]
+        case .pur: return ["organ meat", "anchovies", "sardines", "shellfish", "game"]
+        case .hg: return ["swordfish", "king mackerel", "bigeye tuna", "shark"]
+        case .se: return ["Brazil nuts", "tuna", "sardines", "eggs", "whole grains"]
+        case .vd: return ["oily fish", "egg yolk", "fortified milk", "UV-grown mushrooms"]
         }
     }
 
@@ -420,6 +478,13 @@ enum TrendNutrient: String, CaseIterable, Identifiable, Sendable {
         case .micronutrient(.omega3): self = .o3
         case .micronutrient(.magnesium): self = .mg
         case .micronutrient(.unsaturatedFat): self = .unsat
+        case .micronutrient(.cholesterol): self = .chol
+        case .micronutrient(.transFat): self = .tfat
+        case .micronutrient(.addedSugar): self = .asug
+        case .micronutrient(.purines): self = .pur
+        case .micronutrient(.mercury): self = .hg
+        case .micronutrient(.selenium): self = .se
+        case .micronutrient(.vitaminD): self = .vd
         }
     }
 }
@@ -813,6 +878,10 @@ public enum NutrientTrends {
             // proven bad when even the known-only floor already clears the hard cap.
             let s = DietSemantics.fatWindowStatus(grams: value)
             return isPartial ? (value > DietSemantics.fatHardCap ? .red : .suspended) : s
+        case .band:
+            // A band needs both edges and this path carries one target; plot it neutral
+            // rather than colour it against half a goal.
+            return .suspended
         }
     }
 
@@ -828,13 +897,16 @@ public enum NutrientTrends {
             return nil
         case .green:
             switch goal { case .floor: return "at or above floor"
-                          case .ceiling: return "under ceiling"; case .window: return "in range" }
+                          case .ceiling: return "under ceiling"
+                          case .window, .band: return "in range" }
         case .yellow:
             switch goal { case .floor: return "near floor"
-                          case .ceiling: return "near ceiling"; case .window: return "near cap" }
+                          case .ceiling: return "near ceiling"
+                          case .window, .band: return "near cap" }
         case .red:
             switch goal { case .floor: return "under floor"
-                          case .ceiling: return "over ceiling"; case .window: return "out of range" }
+                          case .ceiling: return "over ceiling"
+                          case .window, .band: return "out of range" }
         }
     }
 
@@ -885,6 +957,10 @@ public enum NutrientTrends {
             return (DietSemantics.fatWindowStatus(grams: value),
                     DietSemantics.fatWindowGoalStatus(grams: value),
                     value > DietSemantics.fatHardCap)
+        case .band:
+            // Unreachable today, and no claim if it ever is: a band is two numbers and
+            // this path is handed one, so judging here would judge a range against a point.
+            return (.suspended, .noGoal, false)
         }
     }
 

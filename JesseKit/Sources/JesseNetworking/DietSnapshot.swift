@@ -13,8 +13,9 @@ import Foundation
 /// One food item inside a meal (or a proposed meal idea). `fiber` is written by
 /// the generator (0 when unknown); the rest may be absent on older files.
 ///
-/// `na`/`satf`/`sug`/`k` (bridge ≥ 0.12.x) and `ca`/`o3`/`mg` (bridge ≥ 0.18.0) are the
-/// tracked micronutrients. UNLIKE `fiber` — which the generator always fills, so
+/// `na`/`satf`/`sug`/`k` (bridge ≥ 0.12.x), `ca`/`o3`/`mg` (bridge ≥ 0.18.0) and
+/// `chol`/`tfat`/`asug`/`pur`/`hg`/`se`/`vd` are the tracked micronutrients. UNLIKE
+/// `fiber` — which the generator always fills, so
 /// nil-coalescing it to 0 is harmless — these are absent for MANY items. A missing value
 /// is UNKNOWN, never zero: it must never be summed or shown as 0. They therefore live
 /// OUTSIDE the `MacroTotals` / `total(of:)` path (which coalesces nil→0 for cal/p/f/c/fiber)
@@ -29,10 +30,14 @@ public struct DietItem: Decodable, Equatable, Sendable {
     public init(item: String, amount: String? = nil, cal: Double? = nil, p: Double? = nil,
                 f: Double? = nil, c: Double? = nil, fiber: Double? = nil, na: Double? = nil,
                 satf: Double? = nil, sug: Double? = nil, k: Double? = nil, ca: Double? = nil,
-                o3: Double? = nil, mg: Double? = nil) {
+                o3: Double? = nil, mg: Double? = nil, chol: Double? = nil,
+                tfat: Double? = nil, asug: Double? = nil, pur: Double? = nil,
+                hg: Double? = nil, se: Double? = nil, vd: Double? = nil) {
         self.item = item; self.amount = amount; self.cal = cal; self.p = p; self.f = f
         self.c = c; self.fiber = fiber; self.na = na; self.satf = satf; self.sug = sug
         self.k = k; self.ca = ca; self.o3 = o3; self.mg = mg
+        self.chol = chol; self.tfat = tfat; self.asug = asug; self.pur = pur
+        self.hg = hg; self.se = se; self.vd = vd
     }
     public var item: String
     public var amount: String?
@@ -55,6 +60,24 @@ public struct DietItem: Decodable, Equatable, Sendable {
     public var o3: Double? = nil
     /// Magnesium, milligrams. Absent (nil) = unknown, not zero.
     public var mg: Double? = nil
+    /// Dietary cholesterol, milligrams. Absent (nil) = unknown, not zero. INFORMATIONAL:
+    /// it carries no target and is never judged (see `Micronutrient.cholesterol`).
+    public var chol: Double? = nil
+    /// Trans fat, grams. Absent (nil) = unknown, not zero.
+    public var tfat: Double? = nil
+    /// Added sugar, grams — the added share only, NOT the `sug` total. Absent (nil) =
+    /// unknown, not zero.
+    public var asug: Double? = nil
+    /// Purines, milligrams. Absent (nil) = unknown, not zero. A species-average estimate
+    /// with wide within-species spread, so it is informational and never judged.
+    public var pur: Double? = nil
+    /// Methylmercury, MICROgrams. Absent (nil) = unknown, not zero. Judged only over a
+    /// trailing 7-day window (see `rolling7`), never on one day.
+    public var hg: Double? = nil
+    /// Selenium, micrograms. Absent (nil) = unknown, not zero.
+    public var se: Double? = nil
+    /// Vitamin D, micrograms. Absent (nil) = unknown, not zero.
+    public var vd: Double? = nil
 }
 
 /// A logged meal: a name, an optional `HH:MM` time, and its items.
@@ -119,11 +142,17 @@ public struct DietTargets: Decodable, Equatable, Sendable {
                 carbs: Double? = nil, carbsBase: Double? = nil, fiber: Double? = nil,
                 sodium: Double? = nil, satFat: Double? = nil, potassium: Double? = nil,
                 sugar: Double? = nil, calcium: Double? = nil, omega3: Double? = nil,
-                magnesium: Double? = nil) {
+                magnesium: Double? = nil, transFat: Double? = nil,
+                addedSugar: Double? = nil, selenium: DietBandTarget? = nil,
+                vitaminD: Double? = nil, purines: Double? = nil,
+                mercuryWeekly: Double? = nil) {
         self.calories = calories; self.protein = protein; self.fat = fat; self.carbs = carbs
         self.carbsBase = carbsBase; self.fiber = fiber; self.sodium = sodium
         self.satFat = satFat; self.potassium = potassium; self.sugar = sugar
         self.calcium = calcium; self.omega3 = omega3; self.magnesium = magnesium
+        self.transFat = transFat; self.addedSugar = addedSugar; self.selenium = selenium
+        self.vitaminD = vitaminD; self.purines = purines
+        self.mercuryWeekly = mercuryWeekly
     }
     public var calories: Double?
     public var protein: Double?
@@ -145,6 +174,59 @@ public struct DietTargets: Decodable, Equatable, Sendable {
     public var omega3: Double?
     /// Magnesium floor, milligrams.
     public var magnesium: Double?
+    /// Trans-fat ceiling, grams. Emitted as `0` — the one nutrient whose ideal is
+    /// literally none, which is a REAL ceiling and not the "no usable target" state the
+    /// other nutrients' zero would be (see `Micronutrient.zeroIsTheGoal`).
+    public var transFat: Double?
+    /// Added-sugar ceiling, grams. Distinct from `sugar`, which is the informational
+    /// total-sugars reference line.
+    public var addedSugar: Double?
+    /// Selenium's BAND: a floor to reach AND a ceiling to stay under, in micrograms.
+    /// Selenium is the one tracked nutrient with a real upper limit close enough to the
+    /// floor that a single number cannot express the goal.
+    public var selenium: DietBandTarget?
+    /// Vitamin D floor, micrograms.
+    public var vitaminD: Double?
+    /// The purine level, milligrams for the day, above which the row adds its NEUTRAL
+    /// note. Emitted as a target for convenience of transport; it is NOT a ceiling and
+    /// purines are never judged — see `Micronutrient.purines`.
+    public var purines: Double?
+    /// Methylmercury's ceiling over the rolling WEEK, micrograms. A week's number, never
+    /// divided into a per-day seventh.
+    public var mercuryWeekly: Double?
+
+    // Explicit keys, because four of the new ones are spelled all-lowercase on the wire
+    // while their Swift names stay camelCase. Every pre-existing key is listed with the
+    // exact spelling the synthesized coder used, so nothing about the old payload's
+    // decoding changes.
+    enum CodingKeys: String, CodingKey {
+        case calories, protein, fat, carbs, carbsBase, fiber
+        case sodium, satFat, potassium, sugar, calcium, omega3, magnesium
+        case transFat = "transfat"
+        case addedSugar = "addedsugar"
+        case selenium
+        case vitaminD = "vitamind"
+        case purines
+        case mercuryWeekly = "mercury_weekly"
+    }
+}
+
+/// A BAND target: a floor to reach and a ceiling to stay under, both in the nutrient's
+/// own unit. Both members are optional because an archive (or an older generator) may
+/// record one edge and not the other; a band VERDICT needs both, and a half-band shows
+/// the value with no judgment rather than silently judging against the edge it happens
+/// to have — see `DietSemantics.bandGoalStatus`.
+public struct DietBandTarget: Decodable, Equatable, Sendable {
+    public var floor: Double?
+    public var ceiling: Double?
+    public init(floor: Double? = nil, ceiling: Double? = nil) {
+        self.floor = floor; self.ceiling = ceiling
+    }
+    /// The complete band, or nil when either edge is missing.
+    public var edges: (floor: Double, ceiling: Double)? {
+        guard let floor, let ceiling else { return nil }
+        return (floor, ceiling)
+    }
 }
 
 /// `DIET_TODAY` — the normalized snapshot of today.
@@ -156,11 +238,17 @@ public struct DietToday: Decodable, Equatable, Sendable {
     public var exercise: [DietExercise]
     public var meals: [DietMeal]
     public var targets: DietTargets
+    /// The trailing-window aggregate for the nutrients whose limit is defined over a week
+    /// rather than a day (see `DietRollingWindow`). It rides INSIDE `DIET_TODAY` because
+    /// that is where the generator writes it — the bridge passes the day literal through
+    /// verbatim — so it is a member of the day, not a sibling of it. Absent → nil → the
+    /// rolling gauges hide entirely.
+    public var rolling7: DietRollingWindow?
 
     // Tolerate a generator that omits the collections entirely (older files) by
     // defaulting them to empty rather than failing the whole decode.
     enum CodingKeys: String, CodingKey {
-        case date, dayStyle, dayType, weight, exercise, meals, targets
+        case date, dayStyle, dayType, weight, exercise, meals, targets, rolling7
     }
     public init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
@@ -171,15 +259,17 @@ public struct DietToday: Decodable, Equatable, Sendable {
         exercise = try c.decodeIfPresent([DietExercise].self, forKey: .exercise) ?? []
         meals = try c.decodeIfPresent([DietMeal].self, forKey: .meals) ?? []
         targets = try c.decodeIfPresent(DietTargets.self, forKey: .targets) ?? DietTargets()
+        rolling7 = try c.decodeIfPresent(DietRollingWindow.self, forKey: .rolling7)
     }
     // A memberwise init for tests/previews (the custom decoder suppresses the
     // synthesized one).
     public init(date: String, dayStyle: String? = nil, dayType: String? = nil,
          weight: DietWeight? = nil, exercise: [DietExercise] = [],
-         meals: [DietMeal] = [], targets: DietTargets = DietTargets()) {
+         meals: [DietMeal] = [], targets: DietTargets = DietTargets(),
+         rolling7: DietRollingWindow? = nil) {
         self.date = date; self.dayStyle = dayStyle; self.dayType = dayType
         self.weight = weight; self.exercise = exercise; self.meals = meals
-        self.targets = targets
+        self.targets = targets; self.rolling7 = rolling7
     }
 }
 
@@ -453,6 +543,80 @@ public struct SourceItem: Decodable, Equatable, Sendable {
     }
 }
 
+/// `rolling7` — the TRAILING-WINDOW aggregate the generator emits INSIDE `DIET_TODAY`,
+/// the one thing a per-day series structurally cannot answer cheaply: a nutrient whose
+/// limit is defined over a WEEK (methylmercury) needs the week's total, not seven day
+/// totals the app would have to re-add across the series' gaps.
+///
+/// NOTE THE KEY NAMESPACE, which is NOT the one the rest of the payload uses. `nutrients`
+/// is keyed by the LOG COLUMN key (`mercury_ug`, `omega3_mg`) — the generator's own
+/// column names — while every per-item field and every `nutrientSeries` day is keyed by
+/// the short app key (`hg`, `o3`). Both are the same nutrient; only the spelling differs
+/// by surface, so the lookup goes through `Micronutrient.logKey`.
+///
+/// The same UNKNOWN-IS-NOT-ZERO discipline as everywhere else, at ITEM granularity inside
+/// the window. A nutrient with no known contributor in the window is OMITTED entirely —
+/// the app then renders "not tracked yet" rather than a phantom zero week.
+///
+/// Absent on an older generator, and every member is tolerant of omission, so a partial or
+/// reshaped block degrades to "no window" instead of failing the WHOLE snapshot decode
+/// (`decodeIfPresent` throws on a present-but-malformed value, which would take the entire
+/// Health tab down over one optional section).
+public struct DietRollingWindow: Decodable, Equatable, Sendable {
+    /// The window's length in days, named on the wire so the label and the chip come from
+    /// the data rather than from a constant the app assumes.
+    public var days: Int
+    /// The window's first and last day (`yyyy-MM-dd`), when the generator names them.
+    public var from: String?
+    public var to: String?
+    /// Per-nutrient aggregates over the window, keyed by LOG COLUMN key (see above).
+    public var nutrients: [String: RollingNutrientTotal]
+
+    enum CodingKeys: String, CodingKey { case days, from, to, nutrients }
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        // A `rolling7` block that omits its own length is by definition the 7-day one.
+        days = try c.decodeIfPresent(Int.self, forKey: .days) ?? 7
+        from = try c.decodeIfPresent(String.self, forKey: .from)
+        to = try c.decodeIfPresent(String.self, forKey: .to)
+        // `try?` on the whole lookup, not `decodeIfPresent` alone: a `nutrients` map whose
+        // VALUES are off-shape must degrade to "no window" rather than throw, which would
+        // take the entire snapshot decode — and with it the Health tab — down with it.
+        nutrients = (try? c.decode([String: RollingNutrientTotal].self,
+                                   forKey: .nutrients)) ?? [:]
+    }
+    public init(days: Int = 7, from: String? = nil, to: String? = nil,
+                nutrients: [String: RollingNutrientTotal] = [:]) {
+        self.days = days; self.from = from; self.to = to; self.nutrients = nutrients
+    }
+}
+
+/// One nutrient's aggregate over the rolling window.
+///
+/// `known` is the SUMMED VALUE of the items that carried one — NOT a count, despite the
+/// name, which is why the counts beside it are spelled `knownCount`/`unknownCount`. Getting
+/// that backwards would render an item count as a dose, so the field names are mirrored
+/// from the generator exactly and renamed nowhere.
+public struct RollingNutrientTotal: Decodable, Equatable, Sendable {
+    /// The summed value of the KNOWN contributors in the window, in the nutrient's unit.
+    public var known: Double
+    /// How many items in the window carried a value, and how many did not. An item that did
+    /// not is UNKNOWN, never a zero, so any `unknownCount > 0` makes `known` a floor.
+    public var knownCount: Int
+    public var unknownCount: Int
+
+    enum CodingKeys: String, CodingKey { case known, knownCount, unknownCount }
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        known = try c.decodeIfPresent(Double.self, forKey: .known) ?? 0
+        knownCount = try c.decodeIfPresent(Int.self, forKey: .knownCount) ?? 0
+        unknownCount = try c.decodeIfPresent(Int.self, forKey: .unknownCount) ?? 0
+    }
+    public init(known: Double, knownCount: Int, unknownCount: Int) {
+        self.known = known; self.knownCount = knownCount; self.unknownCount = unknownCount
+    }
+}
+
 /// One day in `sourceSeries` (bridge ≥ 0.28.0): an ISO `yyyy-MM-dd` date and that day's
 /// logged food items in logged order, each with its KNOWN nutrient contributions. This
 /// is what `nutrientSeries` structurally cannot answer — not "how much magnesium that
@@ -550,7 +714,8 @@ public struct DietSnapshot: Decodable, Equatable, Sendable {
 
     enum CodingKeys: String, CodingKey {
         case asOf, todayMtime, today, proposed, progress, coach, weightSeries, errors
-        case nutrientSeries, sourceSeries, exerciseSeries, availableDays, historical, fidelity
+        case nutrientSeries, sourceSeries, exerciseSeries
+        case availableDays, historical, fidelity
     }
     public init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)

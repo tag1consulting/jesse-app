@@ -760,6 +760,328 @@ final class DietSemanticsTests: XCTestCase {
         XCTAssertTrue(na.blowout, "1.7x the ceiling — a same-day signal that needs no history")
     }
 
+    // MARK: - BAND gauge (selenium): three states, and the partial-day asymmetry
+    //
+    // The asymmetry is the point of the whole shape and is tested in BOTH directions: a
+    // partial day CAN prove a ceiling breach (unknowns only add), and can NEVER prove a
+    // floor miss (unknowns could carry it over).
+
+    private func seleniumDay(_ items: [DietItem], floor: Double? = 55,
+                             ceiling: Double? = 300) -> DietToday {
+        microDay(items, targets: DietTargets(
+            selenium: DietBandTarget(floor: floor, ceiling: ceiling)))
+    }
+    private func se(_ value: Double?) -> DietItem { DietItem(item: "food", se: value) }
+    private func seleniumGauge(_ today: DietToday) -> MetricGauge {
+        S.micronutrientGauge(.selenium, meals: today.meals, targets: today.targets, hour: 20)
+    }
+
+    func testBandGaugeInsideTheRangeIsMet() {
+        let g = seleniumGauge(seleniumDay([se(60), se(50)]))   // 110 µg
+        XCTAssertEqual(g.goal, .band)
+        XCTAssertEqual(g.value, 110)
+        XCTAssertEqual(g.goalStatus, .met)
+        XCTAssertEqual(g.status, .green)
+        XCTAssertEqual(g.tone, .onTrack)
+        XCTAssertEqual(g.remaining, "in the 55–300µg range")
+        XCTAssertEqual(g.unit, "µg")
+    }
+
+    func testBandGaugeCompleteDayBelowTheFloorIsShort() {
+        // Every item measured, so the shortfall is REAL and is stated as one.
+        let g = seleniumGauge(seleniumDay([se(20), se(10)]))   // 30 µg
+        XCTAssertEqual(g.goalStatus, .short(25))
+        XCTAssertEqual(g.remaining, "25µg to the 55µg floor")
+        XCTAssertEqual(g.status, .yellow, "30/55 is 55% — the floor band's middle step")
+        XCTAssertFalse(g.partial)
+    }
+
+    func testBandGaugeAboveTheCeilingIsOver() {
+        let g = seleniumGauge(seleniumDay([se(300), se(90)]))  // 390 µg — Brazil nuts
+        XCTAssertEqual(g.goalStatus, .over(90))
+        XCTAssertEqual(g.status, .red)
+        XCTAssertEqual(g.remaining, "90µg above the range")
+    }
+
+    // --- The asymmetry, direction 1: a partial day CAN trip the ceiling ---
+
+    func testPartialBandDayStillProvesACeilingBreach() {
+        // Two measured items already clear 300 µg on their own. Whatever the unmeasured
+        // item holds, it can only ADD — so the breach is proven and IS asserted.
+        let g = seleniumGauge(seleniumDay([se(300), se(90), se(nil)]))
+        XCTAssertTrue(g.partial)
+        XCTAssertEqual(g.value, 390, "the unknown item is excluded, never summed as 0")
+        XCTAssertEqual(g.goalStatus, .over(90), "a lower bound past the ceiling IS past it")
+        XCTAssertEqual(g.status, .red)
+        XCTAssertEqual(g.remaining, "90µg above the range")
+    }
+
+    // --- The asymmetry, direction 2: a partial day can NEVER prove a floor miss ---
+
+    func testPartialBandDayUnderTheFloorClaimsNoShortfall() {
+        // 30 µg known, one item unmeasured. That item could hold 200 µg, so "short" would
+        // assert a shortfall nobody measured. No claim, no colour, and the words say what
+        // IS known.
+        let g = seleniumGauge(seleniumDay([se(20), se(10), se(nil)]))
+        XCTAssertTrue(g.partial)
+        XCTAssertEqual(g.value, 30)
+        XCTAssertEqual(g.goalStatus, .noGoal, "a lower bound under a floor proves nothing")
+        XCTAssertEqual(g.status, .suspended, "and so claims no colour")
+        XCTAssertEqual(g.tone, .inProgress)
+        XCTAssertEqual(g.remaining, "at least 30µg so far")
+        XCTAssertFalse(g.remaining.contains("short"),
+                       "an unproven shortfall must never be worded as one")
+    }
+
+    func testTheSameNumberReadsDifferentlyCompleteVersusPartial() {
+        // The single clearest statement of the asymmetry: identical known sum, identical
+        // floor, opposite verdicts — because one day measured everything and one did not.
+        let complete = seleniumGauge(seleniumDay([se(30)]))
+        let partial = seleniumGauge(seleniumDay([se(30), se(nil)]))
+        XCTAssertEqual(complete.value, partial.value)
+        XCTAssertEqual(complete.goalStatus, .short(25))
+        XCTAssertEqual(partial.goalStatus, .noGoal)
+    }
+
+    func testBandEvaluatorDirectlyAtItsEdges() {
+        // The boundaries, straight through the evaluator: at the floor and at the ceiling
+        // are both INSIDE (inclusive), and partiality changes only the below-floor case.
+        XCTAssertEqual(S.bandGoalStatus(value: 55, floor: 55, ceiling: 300, partial: false), .met)
+        XCTAssertEqual(S.bandGoalStatus(value: 300, floor: 55, ceiling: 300, partial: false), .met)
+        XCTAssertEqual(S.bandGoalStatus(value: 301, floor: 55, ceiling: 300, partial: true), .over(1))
+        XCTAssertEqual(S.bandGoalStatus(value: 54, floor: 55, ceiling: 300, partial: false), .short(1))
+        XCTAssertEqual(S.bandGoalStatus(value: 54, floor: 55, ceiling: 300, partial: true), .noGoal)
+        // A nonsense band makes no claim rather than judging against one edge.
+        XCTAssertEqual(S.bandGoalStatus(value: 100, floor: 0, ceiling: 300, partial: false), .noGoal)
+        XCTAssertEqual(S.bandGoalStatus(value: 100, floor: 300, ceiling: 55, partial: false), .noGoal)
+    }
+
+    func testHalfARecordedBandIsNotJudgedAtAll() {
+        // One edge recorded is not a band. The row shows the value and judges nothing,
+        // rather than silently treating the edge it has as the whole goal.
+        for day in [seleniumDay([se(500)], ceiling: nil), seleniumDay([se(10)], floor: nil)] {
+            let g = seleniumGauge(day)
+            XCTAssertEqual(g.goalStatus, .noGoal)
+            XCTAssertEqual(g.status, .suspended)
+        }
+    }
+
+    func testBandAllUnknownIsNotTracked() {
+        let g = seleniumGauge(seleniumDay([se(nil), se(nil)]))
+        XCTAssertEqual(g.knownItemCount, 0)
+        XCTAssertEqual(g.remaining, S.notTrackedCaption)
+        XCTAssertEqual(g.status, .suspended)
+    }
+
+    // MARK: - ZERO CEILING (trans fat): "none" is a real goal, not a missing one
+
+    private func tfatGauge(_ items: [DietItem], target: Double? = 0) -> MetricGauge {
+        let today = microDay(items, targets: DietTargets(transFat: target))
+        return S.micronutrientGauge(.transFat, meals: today.meals, targets: today.targets, hour: 20)
+    }
+
+    func testZeroCeilingAtZeroIsMet() {
+        let g = tfatGauge([DietItem(item: "oats", tfat: 0)])
+        XCTAssertEqual(g.value, 0)
+        XCTAssertEqual(g.goalStatus, .met, "a measured zero is the goal reached, not missing data")
+        XCTAssertEqual(g.status, .green)
+        XCTAssertEqual(g.tone, .onTrack)
+        XCTAssertEqual(g.remaining, "none — ideal")
+        XCTAssertEqual(g.fraction, 0)
+    }
+
+    func testZeroCeilingAboveZeroIsOverByTheWholeAmount() {
+        let g = tfatGauge([DietItem(item: "pastry", tfat: 1.5), DietItem(item: "oats", tfat: 0)])
+        XCTAssertEqual(g.goalStatus, .over(1.5))
+        XCTAssertEqual(g.status, .red)
+        XCTAssertEqual(g.tone, .nudge, "firm but never an alarm over a trace amount")
+        XCTAssertEqual(g.remaining, "2g logged")
+        XCTAssertEqual(g.fraction, 1, "against a ceiling of none there is no headroom to draw")
+    }
+
+    func testAZeroTargetStaysNoGoalForEveryOtherNutrient() {
+        // The reason the zero ceiling is opt-in: a 0 elsewhere means "no usable target",
+        // and reading it as a ceiling would call an untargeted day a failure.
+        let today = microDay([micro(na: 1500)], targets: DietTargets(sodium: 0))
+        let g = S.micronutrientGauge(.sodium, meals: today.meals, targets: today.targets, hour: 20)
+        XCTAssertEqual(g.goalStatus, .noGoal)
+        XCTAssertEqual(g.status, .suspended)
+        XCTAssertTrue(Micronutrient.transFat.zeroIsTheGoal)
+        for n in Micronutrient.allCases where n != .transFat {
+            XCTAssertFalse(n.zeroIsTheGoal, "\(n) must not treat a 0 target as a real ceiling")
+        }
+    }
+
+    func testZeroCeilingWithNoTargetAtAllShowsValueOnly() {
+        let g = tfatGauge([DietItem(item: "pastry", tfat: 1.5)], target: nil)
+        XCTAssertEqual(g.goalStatus, .noGoal)
+        XCTAssertEqual(g.status, .suspended)
+    }
+
+    // MARK: - Cholesterol and purines: informational, never a judgment
+
+    func testCholesterolIsInformationalWithNoTargetAndNoJudgment() {
+        XCTAssertFalse(Micronutrient.cholesterol.judged)
+        let today = microDay([DietItem(item: "eggs", chol: 400),
+                              DietItem(item: "liver", chol: 500)])
+        let g = S.micronutrientGauge(.cholesterol, meals: today.meals,
+                                     targets: today.targets, hour: 20)
+        XCTAssertEqual(g.value, 900)
+        XCTAssertNil(g.target)
+        XCTAssertEqual(g.status, .suspended, "however high, never red or green")
+        XCTAssertEqual(g.goalStatus, .noGoal)
+        XCTAssertNil(g.note)
+    }
+
+    func testPurinesAddANeutralNoteAboveTheThresholdOnly() {
+        XCTAssertFalse(Micronutrient.purines.judged)
+        let under = microDay([DietItem(item: "chicken", pur: 500)])
+        let over = microDay([DietItem(item: "sardines", pur: 400),
+                             DietItem(item: "liver", pur: 200)])   // 600
+        let gUnder = S.micronutrientGauge(.purines, meals: under.meals,
+                                          targets: under.targets, hour: 20)
+        let gOver = S.micronutrientGauge(.purines, meals: over.meals,
+                                         targets: over.targets, hour: 20)
+        XCTAssertNil(gUnder.note, "exactly at the threshold is not above it")
+        XCTAssertEqual(S.informationalNote(.purines, value: 600, unit: "mg",
+                                           targets: DietTargets(purines: 900)), nil,
+                       "the DAY's own line wins over the standing fallback")
+        XCTAssertEqual(gOver.note, "above 500mg for the day — worth a glance, not a limit")
+        // The note is context, NOT a verdict: it moves no colour and no goal status.
+        for g in [gUnder, gOver] {
+            XCTAssertEqual(g.status, .suspended)
+            XCTAssertEqual(g.goalStatus, .noGoal)
+            XCTAssertEqual(g.tone, .inProgress)
+        }
+    }
+
+    // MARK: - ROLLING WINDOW gauge (mercury; omega-3 as context)
+
+    /// Keyed by LOG COLUMN key (`mercury_ug`), the namespace `rolling7` actually uses —
+    /// NOT the short app key the per-item fields use.
+    private func window(_ nutrients: [String: RollingNutrientTotal], days: Int = 7,
+                        from: String? = "2026-07-03",
+                        to: String? = "2026-07-09") -> DietRollingWindow {
+        DietRollingWindow(days: days, from: from, to: to, nutrients: nutrients)
+    }
+    private func windowDay(_ w: DietRollingWindow, targets: DietTargets = DietTargets()) -> DietToday {
+        DietToday(date: "2026-07-09", meals: [], targets: targets, rolling7: w)
+    }
+
+    func testMercuryWindowUnderTheWeeklyCeilingIsMet() {
+        let w = window(["mercury_ug": RollingNutrientTotal(known: 62, knownCount: 9, unknownCount: 0)])
+        let g = S.rollingWindowGauge(.mercury, window: w, targets: DietTargets())!
+        XCTAssertEqual(g.label, "Mercury (7-day)", "the span is in the name, not only the chip")
+        XCTAssertEqual(g.value, 62, "the window's SUM, never a median and never today's")
+        XCTAssertEqual(g.target, S.mercuryWeeklyCeiling)
+        XCTAssertEqual(g.goalStatus, .met)
+        XCTAssertEqual(g.tone, .onTrack)
+        XCTAssertEqual(g.rollingWindow?.chip, "7d")
+        XCTAssertFalse(g.partial)
+    }
+
+    func testMercuryWindowOverTheWeeklyCeiling() {
+        let w = window(["mercury_ug": RollingNutrientTotal(known: 150, knownCount: 12, unknownCount: 0)])
+        let g = S.rollingWindowGauge(.mercury, window: w, targets: DietTargets())!
+        XCTAssertEqual(g.goalStatus, .over(45))
+        XCTAssertEqual(g.status, .red)
+        XCTAssertEqual(g.tone, .takeNote,
+                       "a settled week well past the ceiling is judged at the settled hour")
+    }
+
+    func testPartialMercuryWindowIsAFloorAndSaysSo() {
+        let w = window(["mercury_ug": RollingNutrientTotal(known: 40, knownCount: 5, unknownCount: 6)])
+        let g = S.rollingWindowGauge(.mercury, window: w, targets: DietTargets())!
+        XCTAssertTrue(g.partial)
+        XCTAssertEqual(g.value, 40, "unmeasured foods are never summed as 0")
+        XCTAssertEqual(g.unknownItemCount, 6)
+        let note = S.rollingWindowNote(g.rollingWindow!)
+        XCTAssertTrue(note.contains("not today's number"), note)
+        XCTAssertTrue(note.contains("6 foods are not estimated"), note)
+        XCTAssertTrue(note.contains("floor"), note)
+    }
+
+    func testACompleteWindowNoteStillNamesTheSpan() {
+        let w = window(["mercury_ug": RollingNutrientTotal(known: 40, knownCount: 5, unknownCount: 0)])
+        let g = S.rollingWindowGauge(.mercury, window: w, targets: DietTargets())!
+        let note = S.rollingWindowNote(g.rollingWindow!)
+        XCTAssertEqual(note, "7-day total, Jul 3–Jul 9 — not today's number.")
+    }
+
+    func testOmega3WindowIsContextWithNoVerdict() {
+        // Omega-3's verdict already lives on its day row's 30-day colour; the window row
+        // beside it states the week and claims nothing.
+        let w = window(["omega3_mg": RollingNutrientTotal(known: 2400, knownCount: 4, unknownCount: 2)])
+        let g = S.rollingWindowGauge(.omega3, window: w, targets: DietTargets())!
+        XCTAssertEqual(g.label, "Omega-3 (EPA+DHA) (7-day)")
+        XCTAssertNil(g.target)
+        XCTAssertNil(g.fraction)
+        XCTAssertEqual(g.goalStatus, .noGoal)
+        XCTAssertEqual(g.status, .suspended)
+        XCTAssertEqual(g.remaining, "7-day total")
+    }
+
+    func testAWindowThatMeasuredNothingRendersNoRow() {
+        // Absent key, and a key present with zero known contributors, are both "nothing
+        // measured" — a hidden row, never a phantom zero week.
+        XCTAssertNil(S.rollingWindowGauge(.mercury, window: window([:]), targets: DietTargets()))
+        XCTAssertNil(S.rollingWindowGauge(.mercury, window: window(
+            ["mercury_ug": RollingNutrientTotal(known: 0, knownCount: 0, unknownCount: 4)]),
+            targets: DietTargets()))
+    }
+
+    func testNoRollingBlockAtAllYieldsNoWindowRows() {
+        // The graceful-degrade path: a generator that sends no `rolling7` simply has no
+        // window section.
+        XCTAssertTrue(S.rollingWindowGauges(for: DietToday(date: "d")).isEmpty)
+        XCTAssertTrue(S.rollingWindowGauges(for: windowDay(window([:]))).isEmpty)
+        let both = S.rollingWindowGauges(for: windowDay(window([
+            "mercury_ug": RollingNutrientTotal(known: 60, knownCount: 3, unknownCount: 0),
+            "omega3_mg": RollingNutrientTotal(known: 900, knownCount: 2, unknownCount: 1),
+        ])))
+        XCTAssertEqual(both.map(\.nutrient), [.omega3, .mercury], "canonical order")
+    }
+
+    func testTheWindowLengthComesFromThePayloadNotAConstant() {
+        let w = window(["mercury_ug": RollingNutrientTotal(known: 20, knownCount: 2, unknownCount: 0)], days: 14)
+        let g = S.rollingWindowGauge(.mercury, window: w, targets: DietTargets())!
+        XCTAssertEqual(g.label, "Mercury (14-day)")
+        XCTAssertEqual(g.rollingWindow?.chip, "14d")
+    }
+
+    // MARK: - Vitamin D: an ordinary floor, in micrograms
+
+    func testVitaminDIsAFloorInMicrograms() {
+        let today = microDay([DietItem(item: "salmon", vd: 12),
+                              DietItem(item: "egg", vd: 2)],
+                             targets: DietTargets(vitaminD: 20))
+        let g = S.micronutrientGauge(.vitaminD, meals: today.meals,
+                                     targets: today.targets, hour: 20)
+        XCTAssertEqual(g.goal, .floor)
+        XCTAssertEqual(g.value, 14)
+        XCTAssertEqual(g.unit, "µg")
+        XCTAssertEqual(g.goalStatus, .short(6))
+        XCTAssertEqual(g.remaining, "6µg to go")
+    }
+
+    // MARK: - Added sugar: a real ceiling, distinct from the total-sugars reference
+
+    func testAddedSugarIsJudgedWhereTotalSugarsIsNot() {
+        let today = microDay([DietItem(item: "cola", sug: 60, asug: 60),
+                              DietItem(item: "apple", sug: 20, asug: 0)],
+                             targets: DietTargets(sugar: 80, addedSugar: 40))
+        let added = S.micronutrientGauge(.addedSugar, meals: today.meals,
+                                         targets: today.targets, hour: 20)
+        let total = S.micronutrientGauge(.totalSugars, meals: today.meals,
+                                         targets: today.targets, hour: 20)
+        XCTAssertEqual(added.value, 60)
+        XCTAssertEqual(added.goalStatus, .over(20), "the ADDED share carries a real ceiling")
+        XCTAssertEqual(added.status, .red)
+        XCTAssertEqual(total.value, 80)
+        XCTAssertEqual(total.goalStatus, .noGoal, "the total stays informational")
+        XCTAssertEqual(total.status, .suspended)
+    }
+
     func testInformationalNutrientsNeverGainAWindow() {
         let today = microDay([micro(satf: 5, sug: 200, f: 40)], targets: DietTargets(sugar: 50))
         let series = history("sug", Array(repeating: 200, count: 30))

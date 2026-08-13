@@ -22,6 +22,26 @@ enum DietSemantics {
     static let fatHardCap = 70.0
     /// Carb-load calorie window: the low edge as a fraction of target.
     static let carbLoadLowFraction = 0.92
+    /// Methylmercury's ceiling over a rolling 7 days, in micrograms — the standing weekly
+    /// reference for an adult of Jeremy's body weight. A WEEK's number, deliberately never
+    /// divided into a per-day one: methylmercury's clearance half-life is what makes the
+    /// week the meaningful unit, so a daily seventh would judge a tuna steak as a failure
+    /// and a week of them as fine.
+    ///
+    /// A FALLBACK, not the source of truth. The day's own `targets.mercury_weekly` wins
+    /// when it carries one (the generator emits it); this is what a day that recorded none
+    /// is read against, on the same principle as `defaultFiberTarget` — the weekly
+    /// reference is a standing physiological number rather than a per-day plan, so losing
+    /// it should not silently drop the only judgment this row makes.
+    static let mercuryWeeklyCeiling = 105.0
+
+    /// The purine level, in milligrams for one day, above which the row adds a NEUTRAL
+    /// note. NOT a ceiling: purines carry no judgment here, because the uric-acid response
+    /// is individual and the body's own production dwarfs the dietary share for most
+    /// people. This is the line above which the number is worth a glance — a fallback for
+    /// a day whose `targets.purines` says nothing.
+    static let purineNoteThreshold = 500.0
+
     /// The after-hour at/after which a still-unfinished floor turns from the neutral
     /// "coming along" tone into a gentle "worth a nudge" — and the gated "low" flags
     /// surface. Before this hour an unfilled floor is simply in progress, never a problem.
@@ -95,14 +115,22 @@ enum DietSemantics {
     }
 
     /// How a metric is judged, for its glyph and explainer.
+    ///
+    /// `window` and `band` are deliberately DISTINCT despite drawing the same glyph. A
+    /// `window` is total fat's fixed 50–65 g range, judged on a complete sum. A `band` is
+    /// a floor-and-ceiling pair whose two edges are NOT symmetric under partial data: a
+    /// known-only sum is a LOWER BOUND, so it can prove a ceiling was crossed but can
+    /// never prove a floor was missed (see `bandGoalStatus`). Collapsing the two would put
+    /// that asymmetry back in the view, which is exactly where it must not live.
     enum Goal: Equatable, Sendable {
-        case floor, ceiling, window
-        /// The goal glyph shown on a gauge: floor ≥, ceiling ≤, window ↕.
+        case floor, ceiling, window, band
+        /// The goal glyph shown on a gauge: floor ≥, ceiling ≤, window and band ↕ (both
+        /// mean "keep it inside a range" to a reader; the difference is in the math).
         var glyph: String {
             switch self {
             case .floor: return "≥"
             case .ceiling: return "≤"
-            case .window: return "↕"
+            case .window, .band: return "↕"
             }
         }
     }
@@ -140,6 +168,45 @@ enum DietSemantics {
     static func ceilingGoalStatus(value: Double, target: Double) -> GoalStatus {
         guard target > 0 else { return .noGoal }
         return value <= target ? .met : .over(value - target)
+    }
+
+    /// ZERO CEILING: the ceiling whose target is literally 0 — trans fat, where "none" is
+    /// the goal rather than "some amount is fine". It needs its own entry point because
+    /// `ceilingGoalStatus` treats a 0 target as NO usable target, and that is right for
+    /// every other metric: a missing calorie target arrives as `t.calories ?? 0`, and
+    /// reading that as "over by everything you ate" would be a lie. Only a nutrient that
+    /// DECLARES zero is its goal (`Micronutrient.zeroIsTheGoal`) routes here, so a
+    /// stray/absent 0 elsewhere keeps its old, safe meaning.
+    ///
+    /// A genuine 0 is `met` — you ate none, which is the goal reached, not an absence of
+    /// data. Anything above is over by the whole amount.
+    static func zeroCeilingGoalStatus(value: Double) -> GoalStatus {
+        value <= 0 ? .met : .over(value)
+    }
+
+    /// BAND: a floor to reach AND a ceiling to stay under, unknown-aware.
+    ///
+    /// THE ASYMMETRY, which is the whole reason this is not two calls to the floor and
+    /// ceiling helpers. `value` is the sum of the KNOWN contributors only, so on a partial
+    /// day it is a LOWER BOUND, and a lower bound proves exactly one direction:
+    ///
+    /// * ABOVE THE CEILING is PROVEN. Unmeasured items can only add more, so a
+    ///   known-only sum already past the ceiling is past it whatever the unknowns hold.
+    ///   A partial day therefore CAN legitimately trip the ceiling.
+    /// * BELOW THE FLOOR is NOT PROVEN on a partial day. The unmeasured items could carry
+    ///   it over the floor several times, so calling it `short` would assert a shortfall
+    ///   nobody measured — the same error as reading a gap as a zero. It resolves to
+    ///   `noGoal`: no claim, and the row says "at least X so far" rather than "short".
+    ///   A COMPLETE day below the floor is a real, measured shortfall and reads `short`.
+    /// * INSIDE THE BAND is proven on a partial day too — the lower bound has already
+    ///   cleared the floor — but note it can still rise past the ceiling later, which is
+    ///   what makes this `met` for the day so far and not a promise about the day's end.
+    static func bandGoalStatus(value: Double, floor: Double, ceiling: Double,
+                               partial: Bool) -> GoalStatus {
+        guard floor > 0, ceiling > floor else { return .noGoal }
+        if value > ceiling { return .over(value - ceiling) }   // proven by the lower bound
+        if value >= floor { return .met }                      // proven by the lower bound
+        return partial ? .noGoal : .short(floor - value)       // provable only when complete
     }
 
     /// FAT WINDOW (normal day): short of the 50g floor below it, met inside 50–65g,
@@ -280,6 +347,25 @@ enum DietSemantics {
         return .red
     }
 
+    /// ZERO CEILING (trans fat): a measured 0 is green, anything above it is red. There is
+    /// no yellow — there is no "nearly none".
+    static func zeroCeilingStatus(value: Double) -> Status {
+        value <= 0 ? .green : .red
+    }
+
+    /// BAND (selenium): green inside the band, red above the ceiling, and BELOW the floor
+    /// the floor's own three-step band (under 50% red, 50–79% yellow, 80%+ green — the
+    /// same "basically there" softening every floor gets). A PARTIAL day below the floor
+    /// is `suspended`: the lower bound proves nothing there, so no colour is claimed —
+    /// the mirror of `bandGoalStatus`'s `noGoal`.
+    static func bandStatus(value: Double, floor: Double, ceiling: Double,
+                           partial: Bool) -> Status {
+        guard floor > 0, ceiling > floor else { return .suspended }
+        if value > ceiling { return .red }
+        if value >= floor { return .green }
+        return partial ? .suspended : floorStatus(value: value, target: floor)
+    }
+
     /// CALORIE WINDOW (carb-load day): under 92% red, 92–100% green, over 100% red.
     static func calorieWindowStatus(value: Double, target: Double) -> Status {
         guard target > 0 else { return .suspended }
@@ -316,6 +402,28 @@ enum DietSemantics {
         if grams < fatFloor { return "\(fmt(fatFloor - grams))g to the 50g floor" }
         if grams <= fatCap { return "in range" }
         return "\(fmt(grams - fatCap))g above the range"
+    }
+
+    /// zero ceiling (trans fat): "none — ideal" at a measured zero, else the amount, said
+    /// plainly. No "room for X" language: there is no room, and no headroom to spend.
+    static func zeroCeilingRemaining(value: Double, unit: String = "") -> String {
+        value <= 0 ? "none — ideal" : "\(fmt(value))\(unit) logged"
+    }
+
+    /// band: "Xu to the Yu floor" / "in the Y–Zu range" / "Xu above the range" — and, on a
+    /// PARTIAL day whose known-only sum sits under the floor, "at least Xu so far".
+    ///
+    /// That last phrase is the words half of `bandGoalStatus`'s asymmetry, and it is the
+    /// point of this function: an unfinished, partly-unmeasured day under the floor has
+    /// not been shown to be short of anything, so it says what IS known ("at least this
+    /// much") instead of a shortfall that was never measured.
+    static func bandRemaining(value: Double, floor: Double, ceiling: Double,
+                              partial: Bool, unit: String = "") -> String {
+        guard floor > 0, ceiling > floor else { return "" }
+        if value > ceiling { return "\(fmt(value - ceiling))\(unit) above the range" }
+        if value >= floor { return "in the \(fmt(floor))–\(fmt(ceiling))\(unit) range" }
+        if partial { return "at least \(fmt(value))\(unit) so far" }
+        return "\(fmt(floor - value))\(unit) to the \(fmt(floor))\(unit) floor"
     }
 
     /// calorie window (carb-load day): "X more to go" / "in window" / "X over". "X more to
@@ -486,9 +594,11 @@ enum DietSemantics {
     /// magnesium, and omega-3 are floors; total sugars and unsaturated fat are
     /// informational (never judged); an absent target shows the value only, with no
     /// judgment.
+    /// Mercury is absent: its limit exists only over a rolling week, so it has no day
+    /// gauge at all (see `Micronutrient.dayScoped` and `rollingWindowGauge`).
     static func micronutrientGauges(for today: DietToday, hour: Int = 12,
                                     series: [NutrientDay]? = nil) -> [MetricGauge] {
-        Micronutrient.allCases.map {
+        Micronutrient.allCases.filter(\.dayScoped).map {
             micronutrientGauge($0, meals: today.meals, targets: today.targets,
                                hour: hour, series: series)
         }
@@ -526,12 +636,55 @@ enum DietSemantics {
             return g
         }
 
-        // Total sugars is informational only: show the value (and a reference bar if a
-        // target is present) but NEVER a red/green judgment — modeled like suspended
-        // fiber.
+        // An informational nutrient (total sugars, unsaturated fat, cholesterol, purines)
+        // shows the value — and a reference bar if a target is present — but NEVER a
+        // red/green judgment, modeled like suspended fiber. Purines add their neutral
+        // above-500mg note here, which is a note and not a verdict: it changes no colour,
+        // no goal status, and no bar.
         if !n.judged {
             g.fraction = fraction(value, target ?? 0)
             g.remaining = target == nil ? "" : "reference \(fmt(target!))\(unit)"
+            g.note = informationalNote(n, value: value, unit: unit, targets: targets)
+            return g
+        }
+
+        // BAND (selenium): a floor AND a ceiling, and the one shape where partiality is
+        // ASYMMETRIC — see `bandGoalStatus`. A half-recorded band (one edge only) is not a
+        // band and stays value-only rather than judging against whichever edge it happens
+        // to have. Returns here rather than falling through to the rolling-window buffer
+        // below: a band has no defined median semantics, and borrowing the single-number
+        // ones would judge a range against a point.
+        if n.goal == .band {
+            guard let edges = n.band(in: targets)?.edges else { return g }
+            g.target = edges.ceiling
+            g.fraction = fraction(value, edges.ceiling)
+            g.status = bandStatus(value: value, floor: edges.floor,
+                                  ceiling: edges.ceiling, partial: agg.partial)
+            g.remaining = bandRemaining(value: value, floor: edges.floor,
+                                        ceiling: edges.ceiling, partial: agg.partial,
+                                        unit: unit)
+            g.goalStatus = bandGoalStatus(value: value, floor: edges.floor,
+                                          ceiling: edges.ceiling, partial: agg.partial)
+            g.tone = tone(goalStatus: g.goalStatus, hour: hour, target: edges.ceiling,
+                          nearGoal: g.status == .green)
+            return g
+        }
+
+        // ZERO CEILING (trans fat): "none" is the goal, so a 0 target is a real ceiling
+        // here and not the no-usable-target state the guard below treats it as everywhere
+        // else. Also returns early — a rolling median of a zero ceiling says nothing a
+        // day's number doesn't already say, and the buffered path would read the 0 target
+        // as "no goal" and wipe the verdict out.
+        if n.zeroIsTheGoal, let zero = n.target(in: targets), zero == 0 {
+            g.status = zeroCeilingStatus(value: value)
+            g.remaining = zeroCeilingRemaining(value: value, unit: unit)
+            g.goalStatus = zeroCeilingGoalStatus(value: value)
+            // Any amount pegs the bar: against a ceiling of none there is no headroom to
+            // draw a proportion of.
+            g.fraction = value > 0 ? 1 : 0
+            // No target passed to `tone`: the late-day escalation is a fraction OF the
+            // target, and a fraction of zero would make every trace reading "take note".
+            g.tone = tone(goalStatus: g.goalStatus, hour: hour, target: nil)
             return g
         }
 
@@ -548,8 +701,8 @@ enum DietSemantics {
             g.status = floorStatus(value: value, target: target)
             g.remaining = floorRemaining(value: value, target: target, unit: unit)
             g.goalStatus = floorGoalStatus(value: value, target: target)
-        case .window:
-            break // not used by any micronutrient
+        case .window, .band:
+            break // handled above (band) / not used by any micronutrient (window)
         }
         // The buffered nutrients' COLOR comes from their trailing window's median; the
         // number, the remaining phrase and the goal outcome above stay today's. A daily
@@ -569,6 +722,112 @@ enum DietSemantics {
 
     /// The neutral caption for a nutrient no item that day carried a value for.
     static let notTrackedCaption = "not tracked yet"
+
+    /// The neutral note an INFORMATIONAL nutrient may add beside its value, or nil. It is
+    /// a note and never a verdict: it changes no colour, no goal status and no bar, and
+    /// the wording carries no good/bad language. Only purines has one — above
+    /// `purineNoteThreshold` the number is worth a glance and nothing more.
+    static func informationalNote(_ n: Micronutrient, value: Double, unit: String,
+                                  targets: DietTargets) -> String? {
+        guard n == .purines else { return nil }
+        let line = targets.purines ?? purineNoteThreshold
+        guard line > 0, value > line else { return nil }
+        return "above \(fmt(line))\(unit) for the day — worth a glance, not a limit"
+    }
+
+    // MARK: - Rolling-window gauges (a limit defined over days, not a day)
+
+    /// ONE nutrient's aggregate over the snapshot's trailing window, or nil when nothing in
+    /// the window measured it (the row then does not render at all, rather than showing a
+    /// phantom zero week). Reads the window's own `days` rather than assuming 7, and takes
+    /// the nutrient's series key from `TrendNutrient` so there is no second key table.
+    static func rollingWindowTotal(_ n: Micronutrient,
+                                   in window: DietRollingWindow) -> RollingWindowTotal? {
+        // Keyed by LOG COLUMN key, not the short app key — see `Micronutrient.logKey`.
+        guard let v = window.nutrients[n.logKey], v.knownCount >= 1 else { return nil }
+        return RollingWindowTotal(days: window.days, knownSum: v.known,
+                                  knownItemCount: v.knownCount,
+                                  unknownItemCount: v.unknownCount,
+                                  from: window.from, to: window.to)
+    }
+
+    /// ONE nutrient's trailing-WINDOW gauge, or nil when the window measured nothing for
+    /// it. The number is the window's KNOWN SUM — never a median, and never today's total
+    /// wearing a week's label — and it is judged against the nutrient's own window ceiling
+    /// (mercury's 105 µg per 7 days). A nutrient with no window ceiling (omega-3) renders
+    /// the same row with NO verdict: the window is context beside its day row, not a
+    /// second judgment competing with it.
+    ///
+    /// Partiality reads exactly as it does on the daily gauges: unmeasured items are never
+    /// summed as 0, so `partial` makes the number a floor the row renders "≥". Note that
+    /// for a ceiling this cuts the honest way round without any special case — a lower
+    /// bound already past the ceiling is past it, and a lower bound under it has simply
+    /// not been shown to breach.
+    ///
+    /// The tone is derived at `settledHour` because a window speaks to days already over:
+    /// a week's excess is not "still in progress, come back later".
+    static func rollingWindowGauge(_ n: Micronutrient, window: DietRollingWindow,
+                                   targets: DietTargets) -> MetricGauge? {
+        guard let total = rollingWindowTotal(n, in: window) else { return nil }
+        let ceiling = n.rollingWindowCeiling(in: targets)
+        var g = MetricGauge(
+            label: rollingWindowLabel(n, days: total.days),
+            goal: n.goal, value: total.knownSum, target: ceiling,
+            status: .suspended, remaining: "", goalStatus: .noGoal,
+            flag: nil, unit: n.unit,
+            fraction: ceiling.flatMap { fraction(total.knownSum, $0) },
+            partial: total.partial, unknownItemCount: total.unknownItemCount,
+            knownItemCount: total.knownItemCount,
+            rollingWindow: total)
+
+        // No window ceiling → the context row: the week's total, stated, judged by nothing.
+        guard let ceiling, ceiling > 0 else {
+            g.remaining = "\(total.days)-day total"
+            return g
+        }
+        g.status = ceilingStatus(value: total.knownSum, target: ceiling)
+        g.remaining = ceilingRemaining(value: total.knownSum, target: ceiling, unit: n.unit)
+        g.goalStatus = ceilingGoalStatus(value: total.knownSum, target: ceiling)
+        g.tone = tone(goalStatus: g.goalStatus, hour: settledHour, target: ceiling)
+        return g
+    }
+
+    /// The label a window row carries. The window length is IN THE NAME, not only in the
+    /// chip beside it, because this is the one row on the screen whose number is not
+    /// today's and misreading it as today's is the specific failure to design against.
+    static func rollingWindowLabel(_ n: Micronutrient, days: Int) -> String {
+        "\(n.displayName) (\(days)-day)"
+    }
+
+    /// The one-line footnote under a window row, spelling out what the number is and is
+    /// not — so the label and the chip are not the only signals (accessibility, and plain
+    /// honesty). Names the coverage the window rests on.
+    static func rollingWindowNote(_ total: RollingWindowTotal) -> String {
+        let span = total.range.map { "\(total.days)-day total, \($0)" }
+            ?? "\(total.days)-day total"
+        return total.partial
+            ? "\(span) — not today's number. \(total.unknownItemCount) "
+                + "\(total.unknownItemCount == 1 ? "food is" : "foods are") not estimated, "
+                + "so this is a floor."
+            : "\(span) — not today's number."
+    }
+
+    /// The one-line footnote under the window section, said once per screen rather than
+    /// per row: what these numbers are, and the fact that they are totals rather than the
+    /// medians every OTHER window on the Health tab shows.
+    static let rollingWindowFootnote =
+        "These are running totals over the last several days, not today's numbers — some "
+        + "limits are defined over a week rather than a day. A food that wasn't measured is "
+        + "a gap, never a zero, so a total with gaps is a floor."
+
+    /// Every rolling-window gauge the snapshot can build, in canonical order. Empty when
+    /// the generator sends no `rolling7` block at all, which is the graceful-degrade path.
+    static func rollingWindowGauges(for today: DietToday) -> [(nutrient: Micronutrient, gauge: MetricGauge)] {
+        guard let window = today.rolling7 else { return [] }
+        return NutrientOrder.rollingWindowed.compactMap { n in
+            rollingWindowGauge(n, window: window, targets: today.targets).map { (n, $0) }
+        }
+    }
 
     /// The window chip a BUFFERED row shows beside its label — "7d" / "30d". Present only
     /// when the color really is that window's median, so a green color sitting next to a
@@ -756,6 +1015,41 @@ struct MicronutrientTotal: Equatable, Sendable {
     var tracked: Bool { knownItemCount > 0 }
 }
 
+/// One nutrient's aggregate over a TRAILING WINDOW of days rather than a single day —
+/// the shape the `rolling7` block decodes into. Structurally the same unknown-preserving
+/// bargain as `MicronutrientTotal` (a sum over only the items that carried a value, plus
+/// the counts behind it), at a different scale: the counts are items across the whole
+/// window, not items in one day.
+///
+/// Deliberately NOT a median, and deliberately not derived from a day: a weekly limit is
+/// a limit on the WEEK'S TOTAL, so a median would answer a question nobody asked and a
+/// single day multiplied by seven would be a fabrication.
+struct RollingWindowTotal: Equatable, Sendable {
+    /// The window's length in days, taken from the payload rather than assumed.
+    var days: Int
+    var knownSum: Double
+    var knownItemCount: Int
+    var unknownItemCount: Int
+    /// The window's first and last day, when the generator names them.
+    var from: String?
+    var to: String?
+
+    /// The span in words ("Aug 7–13"), or nil when the payload named no dates.
+    var range: String? {
+        guard let from = DietSemantics.displayDate(from),
+              let to = DietSemantics.displayDate(to) else { return nil }
+        return "\(from)–\(to)"
+    }
+
+    /// True when at least one item in the window lacked the value, making `knownSum` a
+    /// floor the row must render "≥".
+    var partial: Bool { unknownItemCount > 0 }
+    /// True when at least one item in the window carried the value.
+    var tracked: Bool { knownItemCount > 0 }
+    /// The window chip beside the label ("7d").
+    var chip: String { "\(days)d" }
+}
+
 /// The micronutrients shown alongside the macros. The single source of truth for their
 /// user-facing display names — full, unabbreviated, spelled in one place so no view
 /// invents a short form (guarded by `MacroLabelTests`). Case order is the canonical
@@ -767,46 +1061,138 @@ struct MicronutrientTotal: Equatable, Sendable {
 /// partial, never zero). Like total sugars it is informational — a value only, never a
 /// red/green judgment (see `judged`).
 enum Micronutrient: CaseIterable {
-    case sodium, saturatedFat, unsaturatedFat, totalSugars, potassium, calcium, omega3, magnesium
+    // Case order IS the canonical display order, and it drives BOTH the sub-entry order
+    // under a parent and the standalone order in the Micronutrients section. The fat
+    // sub-entries run in US-label order (saturated, trans, then the derived unsaturated
+    // share, then cholesterol); added sugar sits under total sugars the way a label reads
+    // "Total Sugars / Includes Xg Added Sugars".
+    case sodium
+    case saturatedFat, transFat, unsaturatedFat, cholesterol
+    case totalSugars, addedSugar
+    case potassium, calcium, omega3, magnesium, selenium, vitaminD, purines, mercury
 
     /// The full, unabbreviated user-facing name — the ONLY place these are spelled.
     var displayName: String {
         switch self {
         case .sodium: return "Sodium"
         case .saturatedFat: return "Saturated Fat"
+        case .transFat: return "Trans Fat"
         case .unsaturatedFat: return "Unsaturated Fat"
+        case .cholesterol: return "Cholesterol"
         case .totalSugars: return "Total Sugars"
+        case .addedSugar: return "Added Sugar"
         case .potassium: return "Potassium"
         case .calcium: return "Calcium"
         case .omega3: return "Omega-3 (EPA+DHA)"
         case .magnesium: return "Magnesium"
+        case .selenium: return "Selenium"
+        case .vitaminD: return "Vitamin D"
+        case .purines: return "Purines"
+        case .mercury: return "Mercury"
         }
     }
 
-    /// The display unit: the minerals and omega-3 in milligrams, the fats and sugars in grams.
+    /// The display unit: the bulk minerals and omega-3 in milligrams, the fats and sugars
+    /// in grams, and the trace nutrients (selenium, vitamin D, mercury) in micrograms —
+    /// they are dosed three orders of magnitude below the others, so milligrams would
+    /// render every one of them as "0".
     var unit: String {
         switch self {
-        case .sodium, .potassium, .calcium, .omega3, .magnesium: return "mg"
-        case .saturatedFat, .unsaturatedFat, .totalSugars: return "g"
+        case .sodium, .potassium, .calcium, .omega3, .magnesium, .cholesterol, .purines:
+            return "mg"
+        case .saturatedFat, .transFat, .unsaturatedFat, .totalSugars, .addedSugar:
+            return "g"
+        case .selenium, .vitaminD, .mercury:
+            return "µg"
         }
     }
 
-    /// How the nutrient is judged: sodium and saturated fat are ceilings (don't exceed);
-    /// potassium, calcium, magnesium, and omega-3 are floors (reach them); total sugars
-    /// and unsaturated fat are informational (a directional glyph but NEVER a color
-    /// judgment — see `judged`). Unsaturated fat is the healthy fat, so it reads as a
-    /// floor glyph (≥) even though it carries no judgment.
+    /// How the nutrient is judged: sodium, saturated fat, trans fat and added sugar are
+    /// ceilings (don't exceed); potassium, calcium, magnesium, omega-3 and vitamin D are
+    /// floors (reach them); selenium is a BAND (a floor AND a ceiling, close enough
+    /// together that one number cannot express the goal); total sugars, unsaturated fat,
+    /// cholesterol and purines are informational (a directional glyph but NEVER a colour
+    /// judgment — see `judged`); mercury reads as a ceiling because that is what its
+    /// weekly limit is, but it is judged only over the rolling window, never on one day.
+    ///
+    /// A glyph is a DIRECTION, never a verdict — the same rule total sugars has always
+    /// followed. Cholesterol and purines draw ≤ because down is the direction anyone
+    /// reading them cares about, and withhold every colour, which is where the absence of
+    /// judgment actually lives.
     var goal: DietSemantics.Goal {
         switch self {
-        case .sodium, .saturatedFat: return .ceiling
-        case .totalSugars: return .ceiling
-        case .potassium, .calcium, .omega3, .magnesium, .unsaturatedFat: return .floor
+        case .sodium, .saturatedFat, .transFat, .addedSugar, .mercury: return .ceiling
+        case .totalSugars, .cholesterol, .purines: return .ceiling
+        case .selenium: return .band
+        case .potassium, .calcium, .omega3, .magnesium, .vitaminD, .unsaturatedFat:
+            return .floor
         }
     }
 
-    /// Whether the nutrient carries a red/green judgment. Total sugars and unsaturated
-    /// fat are informational only — shown plain like suspended fiber, never judged.
-    var judged: Bool { self != .totalSugars && self != .unsaturatedFat }
+    /// Whether the nutrient carries a red/green judgment. Total sugars, unsaturated fat,
+    /// cholesterol and purines are informational only — shown plain like suspended fiber,
+    /// never judged. Mercury IS judged, but only by the rolling-window gauge; its
+    /// day-scoped self is never rendered (see `dayScoped`).
+    var judged: Bool {
+        switch self {
+        case .totalSugars, .unsaturatedFat, .cholesterol, .purines: return false
+        default: return true
+        }
+    }
+
+    /// The one nutrient whose target is legitimately ZERO — trans fat, where "none" is the
+    /// goal rather than a budget to spend. Everywhere else a 0 target means "no usable
+    /// target" and shows the value with no judgment, and that default must stay: a missing
+    /// calorie target arrives as 0 and reading it as a ceiling would be a lie. Only a
+    /// nutrient that declares this routes to `DietSemantics.zeroCeilingGoalStatus`.
+    var zeroIsTheGoal: Bool { self == .transFat }
+
+    /// Whether this nutrient renders a DAY-scoped row at all. False for mercury alone: its
+    /// limit is defined over a week, so a daily row would invite exactly the reading —
+    /// "today's mercury is fine / too high" — that the rolling gauge exists to prevent.
+    /// Mercury's day total is still aggregated (the drill-down and the window need it); it
+    /// simply never gets a day gauge of its own.
+    var dayScoped: Bool { self != .mercury }
+
+    /// Whether this nutrient ALSO renders a trailing-window row built from the snapshot's
+    /// `rolling7` block. Mercury, because that is the only scale its limit exists at; and
+    /// omega-3 as a SECONDARY display — its verdict already lives on the day row's 30-day
+    /// buffered colour, so the window row there is context, never a second judgment.
+    var showsRollingWindow: Bool { self == .mercury || self == .omega3 }
+
+    /// This nutrient's ceiling over the rolling window, in its own unit, or nil when the
+    /// window row is context only (omega-3). Mercury reads the day's own
+    /// `targets.mercury_weekly` and falls back to the standing weekly reference — a WEEK's
+    /// number either way, never divided into a daily one.
+    func rollingWindowCeiling(in t: DietTargets) -> Double? {
+        guard self == .mercury else { return nil }
+        return t.mercuryWeekly ?? DietSemantics.mercuryWeeklyCeiling
+    }
+
+    /// This nutrient's LOG COLUMN key — the generator's own column name, which is the
+    /// namespace the `rolling7` block is keyed by (`mercury_ug`, `omega3_mg`). Distinct
+    /// from the short app key (`hg`, `o3`) that every per-item field and every
+    /// `nutrientSeries` day uses: same nutrient, different spelling per surface, and
+    /// looking one up with the other finds nothing at all.
+    var logKey: String {
+        switch self {
+        case .sodium: return "sodium_mg"
+        case .saturatedFat: return "satfat_g"
+        case .transFat: return "trans_fat_g"
+        case .unsaturatedFat: return "unsat_g"   // derived; the log has no column for it
+        case .cholesterol: return "cholesterol_mg"
+        case .totalSugars: return "sugar_g"
+        case .addedSugar: return "added_sugar_g"
+        case .potassium: return "potassium_mg"
+        case .calcium: return "calcium_mg"
+        case .omega3: return "omega3_mg"
+        case .magnesium: return "magnesium_mg"
+        case .selenium: return "selenium_ug"
+        case .vitaminD: return "vitamin_d_ug"
+        case .purines: return "purines_mg"
+        case .mercury: return "mercury_ug"
+        }
+    }
 
     /// This nutrient's per-item value (nil = unknown for that item). Unsaturated fat is
     /// DERIVED — `fat − saturated fat`, but only for an item whose saturated fat is known;
@@ -815,50 +1201,89 @@ enum Micronutrient: CaseIterable {
         switch self {
         case .sodium: return item.na
         case .saturatedFat: return item.satf
+        case .transFat: return item.tfat
         case .unsaturatedFat: return item.satf.map { (item.f ?? 0) - $0 }
+        case .cholesterol: return item.chol
         case .totalSugars: return item.sug
+        case .addedSugar: return item.asug
         case .potassium: return item.k
         case .calcium: return item.ca
         case .omega3: return item.o3
         case .magnesium: return item.mg
+        case .selenium: return item.se
+        case .vitaminD: return item.vd
+        case .purines: return item.pur
+        case .mercury: return item.hg
         }
     }
 
-    /// This nutrient's day target, or nil when the day carries no reference for it.
-    /// Unsaturated fat is informational and derived — it never carries a target.
+    /// This nutrient's SINGLE day target, or nil when the day carries no reference for it.
+    /// Unsaturated fat is informational and derived; cholesterol and purines carry no
+    /// target by design; selenium's goal is a band and lives in `band(in:)`, not here;
+    /// mercury's is a weekly window ceiling, not a day number.
     func target(in t: DietTargets) -> Double? {
         switch self {
         case .sodium: return t.sodium
         case .saturatedFat: return t.satFat
+        case .transFat: return t.transFat
         case .unsaturatedFat: return nil
+        case .cholesterol: return nil
         case .totalSugars: return t.sugar
+        case .addedSugar: return t.addedSugar
         case .potassium: return t.potassium
         case .calcium: return t.calcium
         case .omega3: return t.omega3
         case .magnesium: return t.magnesium
+        case .selenium: return nil
+        case .vitaminD: return t.vitaminD
+        case .purines: return nil
+        case .mercury: return nil
         }
     }
 
-    /// The macro this micronutrient hangs off as a nutrition-label sub-entry, or nil for
-    /// a standalone entry. A food label declares "of which sugars" and "of which fibre"
-    /// under Carbohydrate and "of which saturates" under Fat, so total sugars renders as
-    /// a sub-entry of carbs (beside fiber), and saturated fat AND the derived unsaturated
-    /// fat as sub-entries of fat. Sodium, potassium, calcium, magnesium, and omega-3 have
-    /// no parent and stay in the Micronutrients section (omega-3 is a fat but, like the
-    /// minerals, is tracked as a standalone floor). Drives the sub-entry identity color,
-    /// the label type treatment, and the leading indent, exactly as `Macro.parent` does
-    /// for fiber.
-    var parent: Macro? {
+    /// This nutrient's BAND target (a floor and a ceiling), or nil for every nutrient
+    /// whose goal is a single number. Selenium alone: its floor and its upper limit sit
+    /// close enough together that either edge on its own would be the wrong goal.
+    func band(in t: DietTargets) -> DietBandTarget? {
+        self == .selenium ? t.selenium : nil
+    }
+
+    /// The nutrient this one hangs off as a nutrition-label sub-entry, or nil for a
+    /// standalone entry. A food label declares "of which sugars" and "of which fibre"
+    /// under Carbohydrate and "of which saturates" under Fat, so total sugars renders as a
+    /// sub-entry of carbs (beside fiber), and the fat components as sub-entries of fat.
+    ///
+    /// The parent may itself be a micronutrient, which is what added sugar needs: a label
+    /// reads "Total Sugars / Includes Xg Added Sugars", so added sugar is a sub-entry of
+    /// total sugars, one level deeper than total sugars is under carbs. Drives the
+    /// sub-entry identity colour, the label type treatment, and the leading indent —
+    /// exactly as `Macro.parent` does for fiber, now over two levels rather than one.
+    var parent: NutrientParent? {
         switch self {
-        case .totalSugars: return .carbs
-        case .saturatedFat, .unsaturatedFat: return .fat
-        case .sodium, .potassium, .calcium, .omega3, .magnesium: return nil
+        case .totalSugars: return .macro(.carbs)
+        case .addedSugar: return .micronutrient(.totalSugars)
+        case .saturatedFat, .transFat, .unsaturatedFat, .cholesterol: return .macro(.fat)
+        case .sodium, .potassium, .calcium, .omega3, .magnesium,
+             .selenium, .vitaminD, .purines, .mercury:
+            return nil
         }
     }
 
-    /// True when this micronutrient renders as an indented sub-entry beneath a macro
-    /// (total sugars, saturated fat), rather than standalone in the Micronutrients section.
+    /// True when this micronutrient renders as an indented sub-entry beneath another
+    /// nutrient, rather than standalone in the Micronutrients section.
     var isSubEntry: Bool { parent != nil }
+
+    /// How many levels deep this row sits in the nutrition-label tree: 0 standalone,
+    /// 1 under a macro, 2 under a micronutrient that is itself under a macro (added
+    /// sugar). Drives the leading indent, and only that — the type treatment stays
+    /// binary (sub-entry or not), because a third type step would fall off the ramp.
+    var depth: Int {
+        switch parent {
+        case .none: return 0
+        case .macro: return 1
+        case .micronutrient(let p): return p.depth + 1
+        }
+    }
 
     /// A short, FIXED, plain-language teaching blurb — what the nutrient is and how to
     /// read its gauge — surfaced subordinately in the drill-down sheet. Editorial copy,
@@ -883,8 +1308,31 @@ enum Micronutrient: CaseIterable {
             return "Omega-3 here is the marine EPA and DHA in oily fish, shellfish, and roe — the heart- and brain-supporting fats, counted as a floor to reach. It does NOT include the plant ALA in flax, walnuts, or chia. Most foods leave it off the label, so a low or \"not tracked yet\" reading usually means it couldn't be measured."
         case .magnesium:
             return "Magnesium is a floor to reach, not a limit — it supports muscle and nerve function, blood sugar, and sleep. Nuts, seeds, beans, whole grains, and leafy greens are loaded with it. Labels often leave it out, so a low or \"not tracked yet\" reading usually means it couldn't be measured, not that you ate none."
+        case .cholesterol:
+            return "Food contains no HDL and no LDL — those are the carriers your blood makes, not something on a plate, so no meal is \"good\" or \"bad\" cholesterol. Dietary cholesterol moves blood cholesterol far less than we once thought, which is why there's no target here and no red or green. The levers that do move your LDL are the three already tracked: saturated fat, trans fat, and fiber. This number comes from a solid database lookup, so it's a good estimate, and it's here for context only."
+        case .transFat:
+            return "Trans fat has no safe amount — the goal is literally none, which is why the target is zero rather than a budget to spend. It raises LDL and lowers HDL at once, the only fat that does both. It's declared on labels and near-exact when it's there, so a reading above zero is real: partially hydrogenated oil, some fried food, a few baked goods."
+        case .addedSugar:
+            return "This is the added share ONLY — the sugar put in, not the sugar that came with the fruit or the milk. That's what makes it judgeable where total sugars isn't: 40g is a real ceiling, and there's no natural-sugar confusion hiding inside it. It's label-derived and near-exact, so what you see is close to what you ate."
+        case .selenium:
+            return "Selenium is a range, not a floor: 55µg is the amount to reach, and 300µg is a real upper limit — one of the few nutrients where more is genuinely worse, not just wasted. Two Brazil nuts can clear the whole day. Read the number loosely: selenium in food tracks the selenium in the soil it grew in, and that varies by an order of magnitude between regions, so a database figure is the right ballpark and not a measurement of what you actually ate."
+        case .vitaminD:
+            return "Vitamin D is a floor to reach — it's what lets you absorb the calcium you eat, and it matters more under high-impact running. Oily fish, egg yolk, and fortified milk carry most of the dietary share; sun does the rest, and none of that sun shows up here. The food number is a solid database lookup, so a low reading means low intake FROM FOOD, which is not the same as a low blood level."
+        case .purines:
+            return "Purines break down into uric acid, which is what gout is about. There's no target and no red or green here: the response is individual, and for most people the diet share is a fraction of what the body makes on its own. Above roughly 500mg in a day the number is worth a glance, nothing more. Treat it as a rough species average — organ meat, anchovies, sardines, and some shellfish are high, but the spread WITHIN any one food is wide, so read the order of magnitude, never the exact figure."
+        case .mercury:
+            return "Mercury is judged over a rolling 7-day window, never on one day, because that's the timescale your body clears it on — one tuna steak isn't a problem, one every day is. The reference is 105µg a week. Treat the number as a rough species average: mercury varies enormously between individual fish of the same species, by size and by where it was caught, so this is the order of magnitude and never a precise figure. Big predators (swordfish, king mackerel, bigeye tuna) carry the most; salmon, sardines, and shrimp carry very little."
         }
     }
+}
+
+/// The nutrient a sub-entry hangs off in the nutrition-label tree — either a macro or
+/// another micronutrient. The second case is what a two-level tree needs: added sugar is
+/// a sub-entry of total sugars, which is itself a sub-entry of carbs, exactly as a label
+/// prints "Total Sugars / Includes Xg Added Sugars".
+enum NutrientParent: Equatable, Hashable, Sendable {
+    case macro(Macro)
+    case micronutrient(Micronutrient)
 }
 
 /// The four macronutrients the Health tab tracks. The single source of truth for
@@ -935,12 +1383,21 @@ enum NutrientEntry: Equatable, Hashable {
     case macro(Macro)
     case micronutrient(Micronutrient)
 
-    /// Whether this row renders as an indented sub-entry of a parent macro — driven by
+    /// Whether this row renders as an indented sub-entry of a parent nutrient — driven by
     /// the same `parent`/`isSubEntry` model on both enums.
     var isSubEntry: Bool {
         switch self {
         case .macro(let m): return m.isSubEntry
         case .micronutrient(let n): return n.isSubEntry
+        }
+    }
+
+    /// How deep the row sits in the tree (0 top-level, 1 under a macro, 2 under a
+    /// micronutrient). Drives the leading indent alone; the type treatment stays binary.
+    var depth: Int {
+        switch self {
+        case .macro(let m): return m.isSubEntry ? 1 : 0
+        case .micronutrient(let n): return n.depth
         }
     }
 }
@@ -951,26 +1408,43 @@ enum NutrientEntry: Equatable, Hashable {
 enum NutrientOrder {
     /// The macro area's rows in canonical nutrition-label order: each top-level macro
     /// followed immediately by its sub-entries — macro sub-entries first (fiber), then
-    /// micronutrient sub-entries (total sugars, saturated fat). For the current tree that
-    /// is Protein, Carbs, Fiber, Total Sugars, Fat, Saturated Fat. Standalone minerals
-    /// (sodium, potassium) are NOT here — they live in the Micronutrients section.
+    /// micronutrient sub-entries, each of which is itself followed by ITS sub-entries.
+    /// For the current tree that is Protein, Carbs, Fiber, Total Sugars, Added Sugar,
+    /// Fat, Saturated Fat, Trans Fat, Unsaturated Fat, Cholesterol. Standalone
+    /// micronutrients are NOT here — they live in the Micronutrients section.
+    ///
+    /// The recursion is what carries the second level: added sugar is discovered as a
+    /// child of total sugars rather than listed by hand, so a future third level costs
+    /// nothing and no view keeps an order of its own.
     static let macroArea: [NutrientEntry] = {
         var out: [NutrientEntry] = []
+        func appendChildren(of parent: NutrientParent) {
+            for n in Micronutrient.allCases where n.parent == parent {
+                out.append(.micronutrient(n))
+                appendChildren(of: .micronutrient(n))
+            }
+        }
         for macro in Macro.allCases where macro.parent == nil {
             out.append(.macro(macro))
             for sub in Macro.allCases where sub.parent == macro {
                 out.append(.macro(sub))
             }
-            for n in Micronutrient.allCases where n.parent == macro {
-                out.append(.micronutrient(n))
-            }
+            appendChildren(of: .macro(macro))
         }
         return out
     }()
 
-    /// The standalone minerals shown in the Micronutrients section — the micronutrients
-    /// with no macro parent (sodium, potassium), in canonical order.
-    static let minerals: [Micronutrient] = Micronutrient.allCases.filter { $0.parent == nil }
+    /// The standalone micronutrients shown in the Micronutrients section — those with no
+    /// parent, in canonical order, minus the ones that carry no day-scoped reading at all
+    /// (mercury, whose limit exists only over a week — see `Micronutrient.dayScoped`).
+    static let minerals: [Micronutrient] =
+        Micronutrient.allCases.filter { $0.parent == nil && $0.dayScoped }
+
+    /// The nutrients that render a trailing-window row from the snapshot's `rolling7`
+    /// block, in canonical order: mercury (whose only meaningful scale is the week) and
+    /// omega-3 (context alongside its day row, never a second verdict).
+    static let rollingWindowed: [Micronutrient] =
+        Micronutrient.allCases.filter(\.showsRollingWindow)
 }
 
 /// Builds the labeled macro line shown under food-journal items, meal subtotals,
@@ -1029,6 +1503,11 @@ struct MetricGauge: Equatable, Sendable {
     var tone: DietSemantics.Tone = .inProgress
     /// The gated "low" nag (protein/fat), surfaced only at/after 16:00. Nil otherwise.
     var flag: String?
+    /// A NEUTRAL note beside the row — currently purines' above-500mg line. Distinct from
+    /// `flag` in both meaning and rendering: a flag is a gentle nudge to act and draws
+    /// attention, a note is context on a row that is judging nothing, and it never carries
+    /// a colour or an alert glyph.
+    var note: String? = nil
     var unit: String
     /// Bar fill fraction (value/target-ish), nil when there's no usable reference.
     var fraction: Double?
@@ -1062,6 +1541,17 @@ struct MetricGauge: Equatable, Sendable {
     /// today's and whose COLOUR came from a window, which is the buffered-nutrient design.
     /// This describes a row where the number is the window's too.
     var windowRead: NutrientWindowRead? = nil
+    /// Set ONLY on a row built from the snapshot's `rolling7` block, where BOTH the number
+    /// and the goal belong to a trailing window of days rather than to today (mercury's
+    /// weekly ceiling; omega-3's context row).
+    ///
+    /// A third window-ish field, and the distinctions are load-bearing. `judgment` is a row
+    /// whose NUMBER is today's and whose COLOUR came from a window's median.
+    /// `windowRead` is the window switcher's row, whose number is that window's MEDIAN.
+    /// This is a row whose number is the window's SUM — a different statistic answering a
+    /// different question, and the only one of the three that can be compared against a
+    /// weekly limit.
+    var rollingWindow: RollingWindowTotal? = nil
     /// Today blew through a ceiling: at/over `NutrientTrends.blowoutMultiplier` × the day's
     /// target, or over a defined daily hard cap (total fat's 70 g). A SEPARATE signal that
     /// never touches `status`/`tone` — a green rolling color and this marker coexist by

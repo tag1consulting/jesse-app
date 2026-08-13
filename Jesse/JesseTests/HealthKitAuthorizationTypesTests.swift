@@ -16,13 +16,16 @@ import HealthKit
 @MainActor
 final class HealthKitAuthorizationTypesTests: XCTestCase {
 
-    /// The share (write) set is EXACTLY the eleven dietary quantity types a meal may
-    /// carry — the five macros plus the six HealthKit-bound micronutrients (sodium,
-    /// saturated fat, sugar, potassium, calcium, magnesium) — no more, no fewer, and
-    /// specifically no correlation container, and specifically NOT omega-3 (gauge-only,
-    /// no HealthKit EPA+DHA type). Every quantity type a `.food` sample uses must be
-    /// authorized to share, or the save fails.
-    func testShareSetIsExactlyTheElevenDietaryQuantityTypes() {
+    /// The share (write) set is EXACTLY the fourteen dietary quantity types a meal may
+    /// carry — the five macros plus the nine HealthKit-bound micronutrients (sodium,
+    /// saturated fat, sugar, potassium, calcium, magnesium, cholesterol, selenium,
+    /// vitamin D) — no more, no fewer, and specifically no correlation container. The
+    /// gauge-only nutrients are absent because HealthKit has no type meaning the same
+    /// thing: omega-3 (no EPA+DHA type), trans fat, purines, mercury, and added sugar
+    /// (`dietarySugar` is TOTAL sugar, so writing the added share into it would understate
+    /// the real total). Every quantity type a `.food` sample uses must be authorized to
+    /// share, or the save fails.
+    func testShareSetIsExactlyTheFourteenDietaryQuantityTypes() {
         let expected: Set<String> = Set([
             HKQuantityTypeIdentifier.dietaryEnergyConsumed,
             .dietaryProtein,
@@ -35,10 +38,13 @@ final class HealthKitAuthorizationTypesTests: XCTestCase {
             .dietaryPotassium,
             .dietaryCalcium,
             .dietaryMagnesium,
+            .dietaryCholesterol,
+            .dietarySelenium,
+            .dietaryVitaminD,
         ].map(\.rawValue))
         let actual = Set(HealthKitMealWriter.shareTypes.map(\.identifier))
         XCTAssertEqual(actual, expected,
-                       "share set must be exactly the eleven dietary quantity types")
+                       "share set must be exactly the fourteen dietary quantity types")
     }
 
     /// The READ set must contain no dietary type. This is NOT what makes the meal

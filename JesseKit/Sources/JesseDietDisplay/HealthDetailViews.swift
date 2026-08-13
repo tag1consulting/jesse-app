@@ -43,6 +43,10 @@ struct MacrosCaloriesDetail: View {
     /// historical and always gets the full series above; the buffered gauges' rolling COLOR
     /// must not be, so a past day judges on its own numbers alone (see `judgeSeries`).
     var isHistorical: Bool = false
+    /// The per-item food history, passed through so a rolling-window row's drill-down can
+    /// list the WINDOW's contributors rather than today's. Nil on an older bridge → that
+    /// drill-down opens with its honest "nothing measured" state.
+    var sourceSeries: [SourceDay]? = nil
     @State private var explainer: Explainer?
 
     /// The history the buffered gauges take their color from — today's day only.
@@ -65,6 +69,12 @@ struct MacrosCaloriesDetail: View {
     /// Only surface the Micronutrients section when a mineral carries a known value that
     /// day — otherwise there is nothing to show but "not tracked yet" rows.
     private var hasMinerals: Bool { minerals.contains { ($0.gauge.knownItemCount ?? 0) > 0 } }
+    /// The rolling-window rows the snapshot can build (mercury's weekly ceiling; omega-3
+    /// as context). Empty when no `rolling7` block arrived or nothing in the window was
+    /// measured — the section then hides entirely rather than showing a phantom zero week.
+    private var windowRows: [(nutrient: Micronutrient, gauge: MetricGauge)] {
+        DietSemantics.rollingWindowGauges(for: today)
+    }
 
     var body: some View {
         Group {
@@ -89,6 +99,7 @@ struct MacrosCaloriesDetail: View {
                 }
             }
             micronutrientSection
+            rollingWindowSection
             Section("Net calories") {
                 NetCalorieBar(net: g.net)
                     .onTapGesture { explainer = Explainers.netCalories(g.net) }
@@ -115,7 +126,7 @@ struct MacrosCaloriesDetail: View {
             if isTracked(n) {
                 let gauge = microGauge(n)
                 bar(gauge, Explainers.micronutrient(n, gauge: gauge),
-                    metric: .micronutrient(n), isSubEntry: true)
+                    metric: .micronutrient(n), isSubEntry: true, depth: n.depth)
             }
         }
     }
@@ -137,6 +148,7 @@ struct MacrosCaloriesDetail: View {
                 Text(NeutralMode.noTargetsCaption)
             }
             micronutrientSection
+            rollingWindowSection
             if net.burned > 0 {
                 Section("Net calories") {
                     totalRow("Eaten", "\(DietSemantics.fmt(net.intake))")
@@ -147,15 +159,15 @@ struct MacrosCaloriesDetail: View {
         }
     }
 
-    private func totalRow(_ title: String, _ value: String, isSubEntry: Bool = false) -> some View {
+    private func totalRow(_ title: String, _ value: String, depth: Int = 0) -> some View {
         HStack {
             Text(title)
-                .font(isSubEntry ? .footnote : .body)
-                .foregroundStyle(isSubEntry ? AnyShapeStyle(.tertiary) : AnyShapeStyle(.secondary))
+                .font(depth > 0 ? .footnote : .body)
+                .foregroundStyle(depth > 0 ? AnyShapeStyle(.tertiary) : AnyShapeStyle(.secondary))
             Spacer()
             Text(value).font(.body.monospacedDigit())
         }
-        .padding(.leading, NutrientRowLayout.indent(isSubEntry: isSubEntry))
+        .padding(.leading, NutrientRowLayout.indent(depth: depth))
     }
 
     // One row of the neutral (no-targets) nutrient tree. A macro is a plain gram total;
@@ -166,19 +178,19 @@ struct MacrosCaloriesDetail: View {
         switch entry {
         case .macro(let m):
             totalRow(m.displayName, "\(DietSemantics.fmt(totals.grams(for: m)))g",
-                     isSubEntry: m.isSubEntry)
+                     depth: m.isSubEntry ? 1 : 0)
         case .micronutrient(let n):
             if isTracked(n) {
                 let gauge = microGauge(n)
                 let prefix = gauge.partial ? "≥" : ""
                 totalRow(n.displayName, "\(prefix)\(DietSemantics.fmt(gauge.value))\(n.unit)",
-                         isSubEntry: true)
+                         depth: n.depth)
             }
         }
     }
 
     private func bar(_ gauge: MetricGauge, _ ex: Explainer, metric: ContributionMetric,
-                     isSubEntry: Bool = false) -> some View {
+                     isSubEntry: Bool = false, depth: Int? = nil) -> some View {
         // Attach the "what fed this" drill-down to the row's explainer, so the same
         // tap that opens the explanation also carries the contributing foods and the
         // grounding for the on-device insight — the same shared builder the Today rings
@@ -187,7 +199,42 @@ struct MacrosCaloriesDetail: View {
         withFoods.drilldown = FoodDrilldown.build(meals: today.meals, metric: metric,
                                                   gauge: gauge, isCarbLoad: g.isCarbLoad,
                                                   series: nutrientSeries, targets: today.targets)
-        return MetricBarRow(gauge: gauge, isSubEntry: isSubEntry) { explainer = withFoods }
+        return MetricBarRow(gauge: gauge, isSubEntry: isSubEntry, depth: depth) {
+            explainer = withFoods
+        }
+    }
+
+    // The trailing-window rows, whose number is a span of days rather than today. They sit
+    // in their OWN section, below the day-scoped ones, because mixing a weekly total into
+    // a list of day totals is exactly how a weekly number gets read as a daily one — the
+    // section header, the row label, the chip and the footnote all say the same thing four
+    // different ways. Tapping opens the same shared sheet, with the WINDOW's contributors.
+    @ViewBuilder private var rollingWindowSection: some View {
+        let rows = windowRows
+        if !rows.isEmpty {
+            Section("Over the last week") {
+                ForEach(rows, id: \.nutrient) { entry in
+                    windowBar(entry.nutrient, entry.gauge)
+                }
+                // The scope caveat is a ROW, not a `footer:`. A footer this long
+                // ellipsises on macOS (the Mac app renders this same view), and a caveat
+                // that truncates is worse than one that isn't there.
+                Text(DietSemantics.rollingWindowFootnote)
+                    .font(.caption).foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+    }
+
+    private func windowBar(_ n: Micronutrient, _ gauge: MetricGauge) -> some View {
+        var ex = Explainers.micronutrient(n, gauge: gauge)
+        if let window = gauge.rollingWindow {
+            ex.drilldown = FoodDrilldown.buildWindow(
+                sourceSeries: sourceSeries, nutrient: n, gauge: gauge, window: window,
+                through: today.rolling7?.to, isCarbLoad: g.isCarbLoad)
+        }
+        let sheet = ex
+        return MetricBarRow(gauge: gauge) { explainer = sheet }
     }
 
     // The Micronutrients section — now the two standalone MINERALS (sodium, potassium)
@@ -225,7 +272,7 @@ struct MacrosCaloriesDetail: View {
         HStack(spacing: 14) {
             legendItem("≥", "floor")
             legendItem("≤", "ceiling")
-            legendItem("↕", "window")
+            legendItem("↕", "range")
         }
         .font(.caption).foregroundStyle(.secondary)
         .frame(maxWidth: .infinity)

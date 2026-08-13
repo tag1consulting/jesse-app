@@ -199,4 +199,91 @@ enum FoodContributions {
                              contributions: contributions, reconciliationNote: note,
                              unknownFoods: unknowns)
     }
+
+    // MARK: - Range breakdown (a nutrient whose number is a window's, not a day's)
+
+    /// The trailing `count` CALENDAR days of a `sourceSeries`, ending at `through` (or at
+    /// the last date present when the payload doesn't name one). Ascending in, ascending
+    /// out; a row whose date doesn't parse is dropped rather than guessed at.
+    ///
+    /// Calendar days, not "the last N entries": a rest day or an unlogged day is ABSENT
+    /// from the series, so counting entries would silently reach back further than the
+    /// window the header's number was computed over.
+    static func trailing(_ days: [SourceDay], count: Int, through: String?) -> [SourceDay] {
+        let parser = NutrientTrends.dayParser
+        let dated = days.compactMap { d in parser.date(from: d.date).map { (day: d, date: $0) } }
+            .sorted { $0.date < $1.date }
+        guard count > 0, let anchor = through.flatMap({ parser.date(from: $0) }) ?? dated.last?.date
+        else { return [] }
+        var cal = Calendar(identifier: .gregorian)
+        cal.timeZone = TimeZone(identifier: "UTC")!
+        guard let cutoff = cal.date(byAdding: .day, value: -(count - 1), to: anchor) else { return [] }
+        return dated.filter { $0.date >= cutoff && $0.date <= anchor }.map(\.day)
+    }
+
+    /// The foods that fed a metric across a RANGE of logged days, from the per-item
+    /// `sourceSeries`, with exactly the semantics the single-day breakdown has: known
+    /// contributors ranked most-impact first, a measured zero excluded as a
+    /// non-contributor, an item that carries NO value for the nutrient surfaced in the
+    /// "Not estimated" group rather than dropped, and shares taken against `total` — the
+    /// number the row's header is actually showing.
+    ///
+    /// TWO deliberate differences from the day builder, both forced by the scale:
+    ///
+    /// * Same-named foods are SUMMED across the range rather than listed once per meal.
+    ///   Over a week "Tuna sandwich" three times is one contributor with three times the
+    ///   impact, which is the question a window row is asked; three near-identical rows
+    ///   would bury it.
+    /// * The reconciliation note IS live here, where it is suppressed for a day-scoped
+    ///   micronutrient. On a day the header and the list come from the same per-item
+    ///   fields and reconcile by construction. Here they do not: the header is the
+    ///   generator's own window aggregate and the list is the per-item series, two
+    ///   producers with two coverage caps, so a shortfall between them is real
+    ///   information and is said out loud instead of papered over.
+    static func breakdown(sourceDays: [SourceDay], metric: ContributionMetric,
+                          key: String, total: Double) -> FoodBreakdown {
+        let items = sourceDays.flatMap(\.items)
+
+        // Sum the known contributions by food name, keeping first-appearance order for a
+        // stable tie-break; collect the names that carry no value at all as the unknowns.
+        var totals: [String: Double] = [:]
+        var order: [String] = []
+        var unknownNames: [String] = []
+        var seenUnknown: Set<String> = []
+        for item in items {
+            if let v = item.n[key] {
+                guard v > 0 else { continue }        // a measured 0 is a non-contributor
+                if totals[item.name] == nil { order.append(item.name) }
+                totals[item.name, default: 0] += v
+            } else if seenUnknown.insert(item.name).inserted {
+                unknownNames.append(item.name)
+            }
+        }
+
+        let rank = Dictionary(uniqueKeysWithValues: order.enumerated().map { ($0.element, $0.offset) })
+        let denom = total > 0 ? total : 0
+        let contributions = order
+            .map { (name: $0, value: totals[$0]!) }
+            .sorted { a, b in a.value != b.value ? a.value > b.value : rank[a.name]! < rank[b.name]! }
+            .enumerated()
+            .map { index, r in
+                FoodContribution(id: index, name: r.name, amount: nil, value: r.value,
+                                 share: denom > 0 ? min(r.value / denom, 1) : 0)
+            }
+        // A food both measured on one day and unmeasured on another is a contributor —
+        // it appears in the list with what IS known and never in both groups at once.
+        let unknownFoods = unknownNames
+            .filter { totals[$0] == nil }
+            .enumerated()
+            .map { UnknownFood(id: contributions.count + $0.offset, name: $0.element, amount: nil) }
+
+        let listedSum = totals.values.reduce(0, +)
+        let note = total > 0 && total - listedSum > reconcileTolerance
+            ? "The food detail behind this covers fewer days than the total does, so the list above may not add up to it."
+            : nil
+
+        return FoodBreakdown(metric: metric, total: total, itemCount: items.count,
+                             contributions: contributions, reconciliationNote: note,
+                             unknownFoods: unknownFoods)
+    }
 }

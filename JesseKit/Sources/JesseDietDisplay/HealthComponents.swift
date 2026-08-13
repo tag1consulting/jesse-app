@@ -68,7 +68,11 @@ struct GoalChip: View {
             .accessibilityLabel(goalName)
     }
     private var goalName: String {
-        switch goal { case .floor: return "at least"; case .ceiling: return "at most"; case .window: return "within range" }
+        switch goal {
+        case .floor: return "at least"
+        case .ceiling: return "at most"
+        case .window, .band: return "within range"
+        }
     }
 }
 
@@ -480,10 +484,16 @@ func macroCaptionText(_ totals: MacroTotals, includeFiber: Bool = true, units: B
 /// proportional subdivision of a parent's bar: an EU label's declared carbohydrate
 /// excludes fibre, so a child is its own independent line, never a slice of the parent.
 enum NutrientRowLayout {
-    /// The leading indent (points) a sub-entry row is inset by. One value, no
+    /// The leading indent (points) ONE level of nesting insets a row by. One value, no
     /// per-nutrient copies.
     static let subEntryIndent: CGFloat = 16
-    static func indent(isSubEntry: Bool) -> CGFloat { isSubEntry ? subEntryIndent : 0 }
+    static func indent(isSubEntry: Bool) -> CGFloat { indent(depth: isSubEntry ? 1 : 0) }
+    /// The indent for a row at a given tree depth — one step per level, so added sugar
+    /// (under total sugars, under carbs) sits two steps in and reads as belonging to the
+    /// row above it rather than as a peer of it. The TYPE treatment stays binary: a second
+    /// smaller step would fall off the bottom of the type ramp, so nesting past the first
+    /// level is carried by position alone.
+    static func indent(depth: Int) -> CGFloat { CGFloat(max(depth, 0)) * subEntryIndent }
 }
 
 /// A full-width bar row for the macros-and-calories detail screen: goal chip,
@@ -497,12 +507,17 @@ struct MetricBarRow: View {
     /// indent so it sits inside its parent. The bar, the value, and its status color are
     /// untouched — only the label's type and the row's indent change.
     var isSubEntry: Bool = false
+    /// How deep in the nutrient tree the row sits, for the leading indent alone. Defaults
+    /// to nil, which means "derive it from `isSubEntry`" — so every existing call site is
+    /// unchanged and only a second-level row (added sugar) passes it.
+    var depth: Int? = nil
     /// The explainer tap. Nil for a micronutrient row (no explainer wired): the row
     /// then renders identically minus the info-circle affordance and the button wrap.
     var onTap: (() -> Void)? = nil
 
     var body: some View {
-        let indented = content.padding(.leading, NutrientRowLayout.indent(isSubEntry: isSubEntry))
+        let indented = content.padding(
+            .leading, NutrientRowLayout.indent(depth: depth ?? (isSubEntry ? 1 : 0)))
         if let onTap {
             Button(action: onTap) { indented }.buttonStyle(.plain)
         } else {
@@ -579,6 +594,22 @@ struct MetricBarRow: View {
                     Label(DietSemantics.blowoutCaption, systemImage: "flame")
                         .font(.caption2.weight(.semibold)).foregroundStyle(.orange)
                 }
+                // A window row states its scope in words as well as in its chip and its
+                // label — three signals, because "this is not today's number" is the one
+                // thing a reader must not miss here.
+                if let window = gauge.rollingWindow {
+                    Text(DietSemantics.rollingWindowNote(window))
+                        .font(.caption2).foregroundStyle(.tertiary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                // A NEUTRAL note (purines above 500mg): context on a row that judges
+                // nothing, so no colour and no alert glyph — the visual difference from
+                // `flag` below is the point.
+                if let note = gauge.note {
+                    Text(note)
+                        .font(.caption2).foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
                 if let flag = gauge.flag {
                     Label(flag, systemImage: "clock.badge.exclamationmark")
                         .font(.caption).foregroundStyle(.orange)
@@ -595,7 +626,9 @@ struct MetricBarRow: View {
     /// number is today's, the colour is the window's) or the switcher's reframed-row chip
     /// (both are the window's). A row is never both, so one accessor covers them.
     private var windowChip: String? {
-        gauge.windowRead?.chip ?? DietSemantics.rollingChip(gauge.judgment)
+        gauge.rollingWindow?.chip
+            ?? gauge.windowRead?.chip
+            ?? DietSemantics.rollingChip(gauge.judgment)
     }
 
     private var valueTarget: String {
@@ -680,7 +713,8 @@ struct FoodDrilldown: Equatable, Sendable {
             dayStyle: isCarbLoad ? "carb-load day" : "ordinary day",
             contributions: breakdown.contributions,
             partial: gauge.partial, knownItemCount: gauge.knownItemCount ?? 0,
-            unknownItemCount: gauge.unknownItemCount, informational: informational)
+            unknownItemCount: gauge.unknownItemCount, informational: informational,
+            unprovenShortfall: unprovenShortfall(gauge))
         // Attach the per-nutrient trend only when the bridge sent history — otherwise the
         // sheet shows the facts alone, exactly as before.
         let trend: NutrientTrendContext? = {
@@ -690,6 +724,50 @@ struct FoodDrilldown: Equatable, Sendable {
                                         sourceSeries: sourceSeries)
         }()
         return FoodDrilldown(breakdown: breakdown, insightInput: input, trend: trend)
+    }
+
+    /// Whether the gauge is a BAND sitting under its floor on a partly-measured day — the
+    /// one state where "below the floor" has NOT been established, because the unmeasured
+    /// foods could carry it well past. Read straight off the gauge rather than recomputed:
+    /// `DietSemantics.bandGoalStatus` resolves exactly this case to `.noGoal`, so the model
+    /// is told what the row itself concluded and the two can never disagree.
+    private static func unprovenShortfall(_ gauge: MetricGauge) -> Bool {
+        gauge.goal == .band && gauge.partial && gauge.goalStatus == .noGoal
+    }
+
+    /// The drill-down for a ROLLING-WINDOW row — the same sheet, the same unknown-aware
+    /// semantics, and the same grounded insight as every other nutrient, over a different
+    /// span of food. The contributors come from the trailing `window.days` of the per-item
+    /// `sourceSeries`, NOT from today's meals: the header is a week's total, so a list of
+    /// today's foods under it would answer a question nobody asked and imply the week was
+    /// one day long.
+    ///
+    /// The grounding carries the scope explicitly (`windowDays`), so the model is told the
+    /// number is several days combined and the guard discards any generation that calls it
+    /// today's.
+    ///
+    /// No trend rides along: the trend chart plots ONE DAY per point from `nutrientSeries`,
+    /// which is a different statistic from this row's window sum, and offering it here
+    /// would put a per-day chart behind a per-week number.
+    static func buildWindow(sourceSeries: [SourceDay]?, nutrient: Micronutrient,
+                            gauge: MetricGauge, window: RollingWindowTotal,
+                            through: String?, isCarbLoad: Bool) -> FoodDrilldown {
+        let metric = ContributionMetric.micronutrient(nutrient)
+        let key = TrendNutrient(metric: metric).key
+        let days = FoodContributions.trailing(sourceSeries ?? [], count: window.days,
+                                              through: through)
+        let breakdown = FoodContributions.breakdown(sourceDays: days, metric: metric,
+                                                    key: key, total: gauge.value)
+        let informational = metric.isInformational
+        let input = HealthInsight.input(
+            metric: metric, total: gauge.value, goal: informational ? nil : gauge.target,
+            goalStatus: gauge.goalStatus, goalPhrase: HealthInsight.goalPhrase(gauge.goal),
+            dayStyle: isCarbLoad ? "carb-load day" : "ordinary day",
+            contributions: breakdown.contributions,
+            partial: gauge.partial, knownItemCount: gauge.knownItemCount ?? 0,
+            unknownItemCount: gauge.unknownItemCount, informational: informational,
+            windowDays: window.days)
+        return FoodDrilldown(breakdown: breakdown, insightInput: input, trend: nil)
     }
 }
 
@@ -971,16 +1049,30 @@ struct ContributionRow: View {
 /// apart from the macro palette. One place, so no view hardcodes a color.
 enum MicronutrientColor {
     static func color(for n: Micronutrient) -> Color {
-        if let parent = n.parent {
-            return MacroColor.shade(ofSubEntry: MacroColor.color(for: parent))
-        }
-        // The standalone entries — the cases with no macro parent — each a distinct hue.
-        switch n {
-        case .potassium: return .mint
-        case .calcium: return .cyan
-        case .omega3: return .pink
-        case .magnesium: return .purple
-        default: return .blue // sodium (and any future standalone default)
+        switch n.parent {
+        case .macro(let m):
+            return MacroColor.shade(ofSubEntry: MacroColor.color(for: m))
+        case .micronutrient(let p):
+            // A second-level sub-entry (added sugar under total sugars) takes a shade of
+            // its own parent's shade — paler again, which is exactly the read the tree
+            // wants: carbs, its paler kin, and that one's paler kin.
+            return MacroColor.shade(ofSubEntry: color(for: p))
+        case nil:
+            // The standalone entries — the cases with no parent — each a distinct hue.
+            switch n {
+            case .potassium: return .mint
+            case .calcium: return .cyan
+            case .omega3: return .pink
+            case .magnesium: return .purple
+            case .selenium: return .brown
+            case .vitaminD: return .yellow
+            case .purines: return .gray
+            // Mercury is the contaminant row; red is free as an IDENTITY hue because the
+            // tone palette never uses pure red (see `toneColor`), so it cannot be confused
+            // for a verdict colour.
+            case .mercury: return .red
+            default: return .blue // sodium (and any future standalone default)
+            }
         }
     }
 }

@@ -170,6 +170,58 @@ final class MealWireDecodeTests: XCTestCase {
         XCTAssertEqual(meal.potassiumMg, 800)
     }
 
+    func testMealBlockDecodesTheThreeHealthKitBoundRiskNutrients() throws {
+        // cholesterol_mg / selenium_ug / vitamin_d_ug parse like every other unit-suffixed
+        // key. This is the MEAL wire, which is NOT the snapshot's gauge wire: trans fat,
+        // added sugar, purines and mercury have no HealthKit type that means the same
+        // thing and are deliberately absent here.
+        let json = """
+        {"status":"done","response":"ok","session_id":"s",
+         "directives":{"meal_log":{"meals":[
+           {"id":"a","consumedAt":"2026-07-04T12:30:00+02:00","name":"Tuna plate",
+            "cholesterol_mg":95,"selenium_ug":92,"vitamin_d_ug":5.7,
+            "sodium_mg":600}]}}}
+        """
+        let meal = try XCTUnwrap(try decodeResult(json).directives?.mealLog?.meals.first)
+        XCTAssertEqual(meal.cholesterolMg, 95)
+        XCTAssertEqual(meal.seleniumUg, 92)
+        XCTAssertEqual(meal.vitaminDUg, 5.7)
+        XCTAssertEqual(meal.sodiumMg, 600, "the existing keys are unaffected")
+    }
+
+    func testMealBlockIgnoresTheGaugeOnlyRiskNutrients() throws {
+        // A block that (wrongly) carried the gauge-only nutrients decodes cleanly and
+        // simply ignores them — an unknown key has never failed this decoder, and this
+        // pins that the four are not silently picked up under some other name.
+        let json = """
+        {"status":"done","response":"ok","session_id":"s",
+         "directives":{"meal_log":{"meals":[
+           {"id":"a","consumedAt":"2026-07-04T12:30:00+02:00","name":"Snack",
+            "transfat_g":2,"added_sugar_g":40,"purines_mg":300,"mercury_ug":34,
+            "cholesterol_mg":95}]}}}
+        """
+        let meal = try XCTUnwrap(try decodeResult(json).directives?.mealLog?.meals.first)
+        XCTAssertEqual(meal.cholesterolMg, 95)
+        XCTAssertNil(meal.seleniumUg)
+        XCTAssertNil(meal.vitaminDUg)
+        // And the validated domain meal carries only what the wire type models.
+        let m = try XCTUnwrap(MealLogParser.meal(from: meal))
+        XCTAssertEqual(m.cholesterolMg, 95)
+        XCTAssertNil(m.seleniumUg)
+    }
+
+    func testMealBlockOmittingTheThreeRiskNutrientsDecodesToNil() throws {
+        let json = """
+        {"status":"done","response":"ok","session_id":"s",
+         "directives":{"meal_log":{"meals":[
+           {"id":"a","consumedAt":"2026-07-04T12:30:00+02:00","name":"Apple","kcal":95}]}}}
+        """
+        let meal = try XCTUnwrap(try decodeResult(json).directives?.mealLog?.meals.first)
+        XCTAssertNil(meal.cholesterolMg)
+        XCTAssertNil(meal.seleniumUg)
+        XCTAssertNil(meal.vitaminDUg)
+    }
+
     func testMealBlockOmittingCalciumMagnesiumDecodesToNil() throws {
         // An older bridge (or a meal with no known calcium/magnesium) omits both → nil,
         // never a summed 0.

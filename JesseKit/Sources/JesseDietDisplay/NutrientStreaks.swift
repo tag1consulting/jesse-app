@@ -152,6 +152,11 @@ enum NutrientStreaks {
             // floor already clears the hard cap; below that, the unknowns leave it open.
             if isPartial { return value > DietSemantics.fatHardCap ? .missed : .undecided }
             return DietSemantics.fatWindowGoalStatus(grams: value).isMet ? .met : .missed
+        case .band:
+            // Unreachable today (no nutrient answers `.band` from `dayGoal`) and left
+            // deliberately undecided rather than guessed: a band needs BOTH edges, and
+            // `nutrientSeries` carries one target number per nutrient per day.
+            return .undecided
         }
     }
 

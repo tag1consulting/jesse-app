@@ -125,4 +125,51 @@ final class DrilldownShareTests: XCTestCase {
         XCTAssertTrue(text.contains("• Rice (1 cup)"))
         XCTAssertTrue(text.contains("• Egg"))
     }
+
+    // MARK: - A rolling-window row's export
+
+    func testWindowRowExportsRangeContributorsAndNeverAZeroForAnUnmeasuredFood() {
+        // The same plain-text carrier, over a WINDOW's foods: summed per food across the
+        // range, and the unmeasured ones listed by name with no number at all — which is
+        // what makes the "≥" in the header honest when it is pasted somewhere else.
+        let days = [
+            SourceDay(date: "2026-07-08", items: [
+                SourceItem(name: "Tuna steak", n: ["hg": 30]),
+                SourceItem(name: "Bread", n: ["na": 400]),
+            ]),
+            SourceDay(date: "2026-07-09", items: [
+                SourceItem(name: "Tuna steak", n: ["hg": 20]),
+            ]),
+        ]
+        let bd = FoodContributions.breakdown(sourceDays: days,
+                                             metric: .micronutrient(.mercury),
+                                             key: "hg", total: 50)
+        let out = DrilldownShare.plainText(title: "Mercury (7-day)",
+                                           valueLine: "≥50 / 105µg — room for 55µg",
+                                           breakdown: bd, insight: nil)
+        XCTAssertTrue(out.hasPrefix("Mercury (7-day) — ≥50 / 105µg — room for 55µg"), out)
+        XCTAssertTrue(out.contains("• Tuna steak: 50 µg — 100%"), out)
+        XCTAssertTrue(out.contains("Not estimated (1 item not estimated):"), out)
+        XCTAssertTrue(out.contains("• Bread"), out)
+        XCTAssertFalse(out.contains("Bread: 0"), "an unmeasured food is never exported as a 0")
+    }
+
+    func testBandRowExportsItsPartialHeaderVerbatim() {
+        // A partial band under its floor exports the "at least ... so far" wording rather
+        // than a shortfall it never established.
+        let today = DietToday(date: "2026-07-09", meals: [DietMeal(
+            name: "all", time: nil,
+            items: [DietItem(item: "Eggs", se: 30), DietItem(item: "Soup")])],
+            targets: DietTargets(selenium: DietBandTarget(floor: 55, ceiling: 300)))
+        let g = DietSemantics.micronutrientGauge(.selenium, meals: today.meals,
+                                                 targets: today.targets, hour: 20)
+        let ex = Explainers.micronutrient(.selenium, gauge: g)
+        let bd = FoodContributions.breakdown(today.meals, metric: .micronutrient(.selenium),
+                                             total: g.value)
+        let out = DrilldownShare.plainText(title: ex.title, valueLine: ex.valueLine,
+                                           breakdown: bd, insight: nil)
+        XCTAssertTrue(out.contains("at least 30µg so far"), out)
+        XCTAssertFalse(out.lowercased().contains("short"), out)
+        XCTAssertTrue(out.contains("• Soup"), "the unmeasured food is named, with no number")
+    }
 }

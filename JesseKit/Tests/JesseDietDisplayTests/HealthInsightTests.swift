@@ -290,4 +290,137 @@ private struct ErroringInsightStub: HealthInsightGenerating {
     func insight(for input: HealthInsightInput) -> AsyncStream<String> {
         AsyncStream { $0.finish() }
     }
+
+    // MARK: - Window scope (a total that covers days, not a day)
+
+    private func windowInput(days: Int = 7) -> HealthInsightInput {
+        HealthInsight.input(
+            metric: .micronutrient(.mercury), total: 62, goal: 105,
+            goalStatus: .met, goalPhrase: "a ceiling to stay under",
+            dayStyle: "ordinary day",
+            contributions: [FoodContribution(id: 0, name: "Tuna steak", amount: nil,
+                                             value: 50, share: 0.8)],
+            knownItemCount: 9, windowDays: days)
+    }
+
+    func testWindowScopeIsGroundedAsAnAuthoritativeFact() {
+        let input = windowInput()
+        let fact = input.scopeFact
+        XCTAssertNotNil(fact)
+        XCTAssertTrue(fact!.contains("last 7 DAYS COMBINED"), fact!)
+        XCTAssertTrue(fact!.contains("not today"), fact!)
+        // It reaches the prompt as its own authoritative line.
+        let prompt = HealthInsightPrompt.make(input)
+        XCTAssertTrue(prompt.contains("SCOPE (authoritative)"), prompt)
+    }
+
+    func testADayScopedMetricAddsNoScopeLineAtAll() {
+        // The day path must be untouched: no scope fact, and no scope line in the prompt.
+        let input = HealthInsight.input(
+            metric: .macro(.protein), total: 93, goal: 140, goalStatus: .short(47),
+            goalPhrase: "a floor to hit or beat", dayStyle: "ordinary day", contributions: [])
+        XCTAssertNil(input.scopeFact)
+        XCTAssertNil(input.unprovenShortfallFact)
+        XCTAssertFalse(HealthInsightPrompt.make(input).contains("SCOPE"))
+    }
+
+    func testAGenerationThatCallsAWindowTotalTodaysIsDiscarded() {
+        let input = windowInput()
+        for text in ["You've had 62µg of mercury today, mostly from tuna.",
+                     "Tuna drove today's mercury.",
+                     "That's 62µg for the day.",
+                     "Your daily total is comfortably under the limit."] {
+            XCTAssertTrue(HealthInsightGuard.claimsToday(text), text)
+            XCTAssertTrue(HealthInsightGuard.contradicts(text, input: input), text)
+        }
+    }
+
+    func testAWindowGenerationThatNamesTheSpanSurvives() {
+        let input = windowInput()
+        for text in ["Over the last 7 days, tuna supplied most of your 62µg — comfortably under the weekly reference.",
+                     "Across the week that's 62µg, mostly tuna."] {
+            XCTAssertFalse(HealthInsightGuard.contradicts(text, input: input), text)
+        }
+    }
+
+    func testTheTodayGuardOnlyAppliesToWindowMetrics() {
+        // A day metric may of course say "today" — the check is scoped, not global.
+        let day = HealthInsight.input(
+            metric: .macro(.protein), total: 93, goal: 140, goalStatus: .short(47),
+            goalPhrase: "a floor to hit or beat", dayStyle: "ordinary day", contributions: [])
+        let text = "You're at 93g of protein today."
+        XCTAssertTrue(HealthInsightGuard.claimsToday(text))
+        XCTAssertFalse(HealthInsightGuard.contradicts(text, input: day))
+    }
+
+    // MARK: - Unproven shortfall (a partial band under its floor)
+
+    private func unprovenBandInput() -> HealthInsightInput {
+        HealthInsight.input(
+            metric: .micronutrient(.selenium), total: 30, goal: 300,
+            goalStatus: .noGoal,
+            goalPhrase: "a range with a floor to reach and a ceiling to stay under",
+            dayStyle: "ordinary day", contributions: [],
+            partial: true, knownItemCount: 2, unknownItemCount: 1,
+            unprovenShortfall: true)
+    }
+
+    func testUnprovenShortfallIsGroundedAsAnAuthoritativeFact() {
+        let input = unprovenBandInput()
+        let fact = input.unprovenShortfallFact
+        XCTAssertNotNil(fact)
+        XCTAssertTrue(fact!.contains("NO shortfall has been established"), fact!)
+        XCTAssertTrue(HealthInsightPrompt.make(input).contains("SHORTFALL (authoritative)"))
+    }
+
+    func testAGenerationClaimingAShortfallOnAPartialBandIsDiscarded() {
+        let input = unprovenBandInput()
+        for text in ["Your selenium is short today.",
+                     "You're below the selenium floor.",
+                     "That's too low — you need more selenium.",
+                     "Selenium is running under the range."] {
+            XCTAssertTrue(HealthInsightGuard.claimsShortfall(text), text)
+            XCTAssertTrue(HealthInsightGuard.contradicts(text, input: input), text)
+        }
+    }
+
+    func testStatingWhatIsKnownOnAPartialBandSurvives() {
+        let input = unprovenBandInput()
+        let text = "At least 30µg of selenium so far, from the eggs; one food wasn't estimated."
+        XCTAssertFalse(HealthInsightGuard.contradicts(text, input: input), text)
+    }
+
+    func testTheShortfallGuardIsScopedToTheUnprovenCase() {
+        // A genuinely measured shortfall must still be reportable — the guard fires only
+        // where the facts say no shortfall was established.
+        let proven = HealthInsight.input(
+            metric: .micronutrient(.selenium), total: 30, goal: 300, goalStatus: .short(25),
+            goalPhrase: "a range with a floor to reach and a ceiling to stay under",
+            dayStyle: "ordinary day", contributions: [])
+        XCTAssertFalse(HealthInsightGuard.contradicts("Selenium is short of the range's floor.",
+                                                     input: proven))
+    }
+
+    // MARK: - Informational risk nutrients ground with no judgment
+
+    func testCholesterolAndPurinesGroundAsInformational() {
+        for n in [Micronutrient.cholesterol, .purines] {
+            XCTAssertTrue(ContributionMetric.micronutrient(n).isInformational,
+                          "\(n.displayName) must ground without a judgment")
+        }
+        let input = HealthInsight.input(
+            metric: .micronutrient(.cholesterol), total: 900, goal: nil,
+            goalStatus: .noGoal, goalPhrase: "a ceiling to stay under",
+            dayStyle: "ordinary day", contributions: [], informational: true)
+        XCTAssertTrue(HealthInsightGuard.contradicts("That's too high — cut back on eggs.",
+                                                    input: input))
+        XCTAssertFalse(HealthInsightGuard.contradicts(
+            "Most of that came from the eggs and the liver.", input: input))
+    }
+
+    func testBandGoalPhraseNamesBothEdges() {
+        let phrase = HealthInsight.goalPhrase(.band)
+        XCTAssertTrue(phrase.contains("floor"), phrase)
+        XCTAssertTrue(phrase.contains("ceiling"), phrase)
+    }
 }
