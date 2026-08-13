@@ -141,13 +141,64 @@ public final class TodayDashboardModel {
         sortKey.reorders || sectionSortKeys.values.contains(where: \.reorders)
     }
 
-    /// The document to DRAW: `snapshot` with each section's lens applied. Counts and
-    /// membership are identical to `snapshot` — a lens changes order, never what is in
-    /// the day.
+    /// **The badge-only view.** When on, the screen shows exactly the items the tab
+    /// badge counts and nothing else.
+    ///
+    /// A LENS like the sort, not an edit: it writes nothing, it works while the day is
+    /// read-only, and turning it off gives the day back whole. What it changes is which
+    /// rows are drawn, which is why it is the one lens that changes membership.
+    ///
+    /// Settable and deliberately NOT persisted here, exactly as `sortKey` is not: where
+    /// a per-device preference lives is the shell's business (both shells use
+    /// `TodayViewPreferences`). Toggling drops the pins, because turning the filter on
+    /// is the start of a fresh viewing.
+    public var isBadgeFilterOn = false {
+        didSet { if isBadgeFilterOn != oldValue { pinnedBadgeIDs = [] } }
+    }
+
+    /// Rows the filtered view is holding on screen even though they have left the
+    /// badge set.
+    ///
+    /// A row that vanished the instant it was ticked would be a list nobody could
+    /// correct: tick the wrong item and it is gone before you can untick it. So the
+    /// ids on screen are pinned at the moment the user acts, and the row stays where it
+    /// was, struck through or chipped as postponed exactly as the full day would draw
+    /// it. The BADGE is unaffected: a pinned row has already left the count, which is
+    /// the whole feedback the tap was after.
+    ///
+    /// Cleared by `repinBadgeFilter()`, which is the next explicit refresh or the next
+    /// entry into the view.
+    public private(set) var pinnedBadgeIDs: Set<String> = []
+
+    /// Start a fresh viewing of the filtered day: everything that has left the badge
+    /// set goes.
+    ///
+    /// Called by a pull-to-refresh (`refresh()`) and by the screen when it appears. Not
+    /// by an ordinary `load()`, which fires on a tab switch, a foregrounding and every
+    /// settled turn. Rows disappearing because a background turn finished is exactly
+    /// the "list that edits itself under you" this pinning exists to prevent.
+    public func repinBadgeFilter() {
+        pinnedBadgeIDs = []
+    }
+
+    /// Hold whatever the filtered view is currently drawing, before an action changes
+    /// what belongs in it. A no-op unless the filter is on.
+    private func pinRowsOnScreen() {
+        guard isBadgeFilterOn, let snapshot else { return }
+        pinnedBadgeIDs.formUnion(TodaySemantics.badgeItems(snapshot).map(\.id))
+    }
+
+    /// The document to DRAW: `snapshot` with each section's lens applied, then narrowed
+    /// to the badge set when the filter is on. Counts and membership are identical to
+    /// `snapshot` under the sort alone, because a lens changes order and never what is
+    /// in the day. The filter is the one exception, which is why it is applied last and
+    /// says so on screen.
     public var displaySnapshot: TodaySnapshot? {
-        snapshot.map {
-            TodaySemantics.sortedForDisplay($0, by: sectionSortKeys, default: sortKey)
-        }
+        guard let snapshot else { return nil }
+        let sorted = TodaySemantics.sortedForDisplay(snapshot, by: sectionSortKeys,
+                                                     default: sortKey)
+        guard isBadgeFilterOn else { return sorted }
+        return TodaySemantics.badgeFiltered(sorted, keeping: pinnedBadgeIDs)
     }
 
     /// The moves worth offering for one row, judged against the FILE order and filtered
@@ -187,9 +238,28 @@ public final class TodayDashboardModel {
         return .loading
     }
 
-    /// Open Do Now items plus the standing lead item.
+    /// Open Do Now items plus the standing lead item: the number on the tab, and the
+    /// number the badge filter shows. Read off the WHOLE day, never off the filtered
+    /// view: the filtered view can be holding a pinned row the count has already let
+    /// go of, and the day is the only document that can answer what is left in it.
     public var badgeCount: Int {
         snapshot.map(TodaySemantics.doNowOpenCount) ?? 0
+    }
+
+    /// The badge set, as rows. What the filter shows, from the same function the count
+    /// is the size of.
+    public var badgeItems: [TodayItem] {
+        snapshot.map(TodaySemantics.badgeItems) ?? []
+    }
+
+    /// **Nothing is left that needs action**, with the filter on and a day loaded.
+    ///
+    /// The screen's cue to say so rather than draw an empty list, and deliberately not
+    /// a reason to unfilter: the user asked which items the badge counts, and "none"
+    /// is the useful answer to that question.
+    public var isBadgeFilterEmpty: Bool {
+        guard isBadgeFilterOn, let day = snapshot, !day.missing else { return false }
+        return displaySnapshot?.allItems.isEmpty ?? false
     }
 
     /// **The checked items a Process-updates turn would close at source**, read off the
@@ -240,7 +310,11 @@ public final class TodayDashboardModel {
 
     /// Pull-to-refresh: fetch unconditionally, so a user who suspects the screen is
     /// wrong can force a full answer rather than be told nothing changed.
+    ///
+    /// This is the EXPLICIT refresh the badge filter drops its pins on: the user asked
+    /// for the day as it now stands, so the rows they have already dealt with go.
     public func refresh() async {
+        repinBadgeFilter()
         await fetch(conditional: false)
     }
 
@@ -388,6 +462,9 @@ public final class TodayDashboardModel {
         }
         if refuseIfReadOnly() { return }
         lastConflictMessage = nil
+        // Before the box flips: ticking an item takes it out of the badge set, and the
+        // row must not leave the filtered view under the finger that ticked it.
+        pinRowsOnScreen()
         overlay.checks[id] = checked
         let note = evidence?.trimmingCharacters(in: .whitespacesAndNewlines)
         if checked, let note, !note.isEmpty {
@@ -419,6 +496,7 @@ public final class TodayDashboardModel {
         let before = serverSnapshot
         let knownIds = Set(before?.allItems.map(\.id) ?? [])
         let item = snapshot?.item(id: id) ?? before?.item(id: id)
+        pinRowsOnScreen()
         overlay.moves[id] = op
 
         await perform(id: id, adopting: { [weak self] snap in
@@ -546,6 +624,9 @@ public final class TodayDashboardModel {
         }
         if refuseIfReadOnly() { return }
         lastConflictMessage = nil
+        // Same reason as `check`: postponing is the other way a row leaves the badge
+        // set, and it has to stay readable long enough to be undone.
+        pinRowsOnScreen()
         overlay.deferrals[id] = deferred
         await perform(id: id) { client in
             try await client.postpone(id: id, deferred: deferred, at: self.now(), ifMatch: tag)
@@ -634,5 +715,12 @@ public final class TodayDashboardModel {
               newId != id
         else { return }
         overlay.rekey(from: id, to: newId)
+        // The badge filter's pins are keyed by id too, so they follow the same rule the
+        // overlay does: a pin left under the old id would hold a row that no longer
+        // exists, and the row it was actually holding would be judged on membership
+        // alone. A row moved OUT of Do Now still leaves the filtered view, because it is
+        // not in the badge set and no longer in the section the view draws. That is the
+        // honest reading of "I moved this somewhere else".
+        if pinnedBadgeIDs.remove(id) != nil { pinnedBadgeIDs.insert(newId) }
     }
 }

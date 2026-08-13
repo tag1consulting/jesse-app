@@ -33,6 +33,12 @@ struct TodayTabView: View {
     /// goes read-only BEFORE a tap rather than after one fails.
     @State private var reachability = BridgeReachabilityModel()
 
+    /// Per-device view state for this screen. The badge filter is a preference about
+    /// this phone, so it is remembered on this phone and never sent to the bridge:
+    /// which view of the day a device is showing is nobody else's business, and a
+    /// filter that followed the user to the Mac would be a view choice made for them.
+    @State private var viewPreferences = TodayViewPreferences()
+
     /// The note behind whichever item is open, if any.
     ///
     /// ONE model for the whole tab, not one per pushed screen: it holds the per-item
@@ -132,9 +138,17 @@ struct TodayTabView: View {
         // A new day file means every cached note may now resolve to a different file:
         // the item ids are content hashes, and a rebuild re-points what they link.
         .onChange(of: model.etag) { _, _ in detailModel.invalidate() }
+        // The filter is restored once, on the first appearance, and written back on
+        // every change. The model holds no storage of its own, the same line it holds
+        // for the view sort, so the shell is where the preference becomes durable.
+        .task { model.isBadgeFilterOn = viewPreferences.isBadgeFilterOn }
+        .onChange(of: model.isBadgeFilterOn) { _, on in viewPreferences.isBadgeFilterOn = on }
         .onChange(of: isActive) { _, active in
             guard active else { return }
             probe()
+            // Coming back to the tab is a fresh entry into the view, so the filtered
+            // list lets go of the rows it was holding from the last one.
+            model.repinBadgeFilter()
             Task { await model.load() }
         }
         // Foregrounding covers the overnight case: parked on this tab with the app

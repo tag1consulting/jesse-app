@@ -349,6 +349,38 @@ final class TodayTabTests: XCTestCase {
         XCTAssertNil(run.threadID)
     }
 
+    // MARK: - Per-device view state
+
+    /// **The badge filter is remembered on this phone**, which is the whole of what the
+    /// tab does with it: read the preference on appear, hand it to the model, write it
+    /// back on every change. A fresh store over the same defaults domain is exactly what
+    /// the next launch reads.
+    ///
+    /// Nothing about it reaches the bridge. Which view of the day a device is showing is
+    /// a fact about the device, and a filter that followed the user to the Mac would be
+    /// a view choice made for them.
+    func testTheBadgeFilterSurvivesARelaunchOnThisDevice() async throws {
+        let name = "jesse-ios-today-view-state-tests"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: name))
+        defaults.removePersistentDomain(forName: name)
+        defer { defaults.removePersistentDomain(forName: name) }
+
+        let stub = StubTodayClient(day: Self.day())
+        let model = TodayDashboardModel(makeClient: { stub })
+        await model.load()
+
+        model.isBadgeFilterOn = TodayViewPreferences(defaults: defaults).isBadgeFilterOn
+        XCTAssertFalse(model.isBadgeFilterOn, "the day opens whole")
+
+        model.isBadgeFilterOn = true
+        TodayViewPreferences(defaults: defaults).isBadgeFilterOn = model.isBadgeFilterOn
+
+        let relaunched = TodayDashboardModel(makeClient: { stub })
+        relaunched.isBadgeFilterOn = TodayViewPreferences(defaults: defaults).isBadgeFilterOn
+        XCTAssertTrue(relaunched.isBadgeFilterOn)
+        XCTAssertEqual(stub.checkCount, 0, "and none of this touched the day")
+    }
+
     // MARK: - Offline
 
     /// The tab hands its own reachability probe to the model, so the day goes

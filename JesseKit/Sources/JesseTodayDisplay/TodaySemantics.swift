@@ -303,8 +303,8 @@ public enum TodaySemantics {
         Dictionary(uniqueKeysWithValues: snapshot.sections.map { ($0.name, openCount(in: $0)) })
     }
 
-    /// **The tab badge.** Open items in the first `Do Now…` section, plus every open
-    /// LEAD item.
+    /// **The badge set**: every open LEAD item, then the open items of the first
+    /// `Do Now…` section, in the order the screen draws them.
     ///
     /// Not `counts.open`, which tallies the whole document: Done Today, the aging
     /// list and every briefing section carry task lines too, and a badge counting
@@ -316,9 +316,31 @@ public enum TodaySemantics {
     /// it existed, the only way to clear a badge for work that was not going to
     /// happen today was to tick the item off — which is a lie, and one that
     /// `Close it at source` would then propagate into the project files.
-    public nonisolated static func doNowOpenCount(_ snapshot: TodaySnapshot) -> Int {
+    ///
+    /// **This is the one definition of what the badge means.** `doNowOpenCount` is
+    /// the size of this list and the badge-only view is its contents, so the number
+    /// on the tab and the rows the filter shows have nothing to disagree about. A
+    /// filter that re-derived the membership rule would be a second definition, and
+    /// the second one is the one that drifts on the next change to the first.
+    public nonisolated static func badgeItems(_ snapshot: TodaySnapshot) -> [TodayItem] {
         let doNow = snapshot.sections.first { $0.name.hasPrefix("Do Now") }
-        return (doNow.map(openCount(in:)) ?? 0) + snapshot.leadItems.filter(isOpen).count
+        return snapshot.leadItems.filter(isOpen) + (doNow?.items.filter(isOpen) ?? [])
+    }
+
+    /// Whether one item is part of what the badge counts.
+    ///
+    /// Asked of the SNAPSHOT rather than of the item alone, because membership is not
+    /// a property an item carries: "the first section named `Do Now…`" is a fact about
+    /// the document, and a day file holding both a `Do Now` and a `Do Now (carried)`
+    /// has two sections whose items look alike and only one of which counts.
+    public nonisolated static func countsTowardBadge(_ item: TodayItem,
+                                                     in snapshot: TodaySnapshot) -> Bool {
+        badgeItems(snapshot).contains { $0.id == item.id }
+    }
+
+    /// **The tab badge**, as a number: the size of the badge set.
+    public nonisolated static func doNowOpenCount(_ snapshot: TodaySnapshot) -> Int {
+        badgeItems(snapshot).count
     }
 
     /// Unseen glanceable rows — the dot on the briefing sections.
