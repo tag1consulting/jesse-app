@@ -374,6 +374,13 @@ mod tests {
                 calcium_mg: None,
                 omega3_mg: None,
                 magnesium_mg: None,
+                cholesterol_mg: None,
+                trans_fat_g: None,
+                added_sugar_g: None,
+                purines_mg: None,
+                mercury_ug: None,
+                selenium_ug: None,
+                vitamin_d_ug: None,
                 notes: Some("queued during outage".to_string()),
             })],
         }

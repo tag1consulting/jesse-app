@@ -13,6 +13,53 @@ Every commit that changes a component **must** bump that component's version and
 add an entry here — enforced by `scripts/version-guard.sh` (the pre-push hook and
 CI both run it). See the "Versioning" section of `bridge/README.md`.
 
+## [Bridge 0.81.0] - 2026-08-13
+
+### Added
+
+- **Seven risk nutrients — cholesterol, trans fat, added sugar, purines, mercury,
+  selenium and vitamin D — now travel the whole diet path.** `food-log.csv` grows
+  from 22 to 29 columns, the extract schema gains seven keys, the appended row
+  gains seven cells, `GET /jesse/diet` gains seven per-item gauges
+  (`chol`/`tfat`/`asug`/`pur`/`hg`/`se`/`vd`), and the three with a HealthKit type
+  ride the meal wire. Each is one row in `NUTRIENT_COLUMNS`, so header, schema,
+  prompt, row builder, mirror and app snapshot all follow from the same table.
+
+  **Unknown is still not zero.** A value the message and the label never
+  established stays absent at every stage: omitted extract key, `None`, blank CSV
+  cell, omitted wire field. What is new is the other half of the distinction —
+  for several of these a `0` is a *known fact* rather than a shrug: no cholesterol
+  in any plant food, no mercury outside seafood, no added sugar in whole fruit, no
+  vitamin D in most unfortified plants. The extractor is now told to write that 0.
+  That rule lives entirely in the extract PROMPT, as a per-nutrient bullet on the
+  table row; the plumbing below it is unchanged and still treats absent as
+  unknown. So `Mercury_ug` blank and `Mercury_ug` 0 mean genuinely different
+  things, and the reader keeps them apart (`opt_num` → JSON `null`, never `0.0`).
+
+  Each nutrient carries its own guidance because the sourcing rules differ:
+  added sugar is free sugars only and never the intrinsic sugar of fruit; vitamin
+  D is MICROgrams, so an IU label is divided by 40; mercury comes from FDA means
+  for a NAMED species and is omitted rather than guessed for a generic "fish";
+  purines are a class-based estimate from published tables; selenium notes the
+  Brazil-nut extreme (~68-91 ug per nut) and an order-of-magnitude soil variance.
+
+  **Only three reach Apple Health**: `cholesterol_mg`, `selenium_ug` and
+  `vitamin_d_ug`, which map to `dietaryCholesterol`, `dietarySelenium` and
+  `dietaryVitaminD`. Trans fat, purines and mercury have no HealthKit type, and
+  HealthKit's only sugar quantity is TOTAL `dietarySugar` — already carried by
+  `sugar_g` — so mirroring added sugar there would corrupt a different measure.
+  The four stay CSV-and-app-only, and remain unknown keys on the meal wire.
+
+### Changed
+
+- **A third fill class, `EstimatedRisk`.** Almost no label prints these seven, so
+  a blank one is a normal outcome rather than incomplete data. They are therefore
+  outside the completeness figure's denominator and outside the hosted
+  micronutrient completion pass: `micros=n/7` still counts the same seven expected
+  columns it counted before, the audit's hand-repair list is unchanged, and a
+  value a verifier volunteers for a risk column is ignored rather than written.
+  The local extract child fills them, from the guidance above.
+
 ## [Bridge 0.80.0] - 2026-08-12
 
 ### Changed

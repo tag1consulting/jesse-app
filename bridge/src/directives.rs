@@ -170,6 +170,20 @@ pub struct Meal {
     pub calcium_mg: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub magnesium_mg: Option<f64>,
+    /// The three HealthKit-bound RISK nutrients, same pre-summed / omit-when-unknown
+    /// discipline: `cholesterol_mg` (mg → `dietaryCholesterol`), `selenium_ug` and
+    /// `vitamin_d_ug` (MICROgrams → `dietarySelenium`, `dietaryVitaminD`).
+    ///
+    /// The other four risk nutrients have NO HealthKit type and so deliberately have no
+    /// field here: there is no trans-fat, purine or mercury quantity, and HealthKit's
+    /// only sugar quantity is TOTAL `dietarySugar` (already carried by `sugar_g`), so
+    /// mirroring added sugar would write it to the wrong measure.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cholesterol_mg: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selenium_ug: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vitamin_d_ug: Option<f64>,
 }
 
 /// The parsed payload of a `JESSE_MEAL_LOG` directive, plus the corrections-queue
@@ -780,6 +794,9 @@ fn parse_meal(item: &Value) -> Result<Meal, String> {
         potassium_mg: optional_macro(m, "potassium_mg")?,
         calcium_mg: optional_macro(m, "calcium_mg")?,
         magnesium_mg: optional_macro(m, "magnesium_mg")?,
+        cholesterol_mg: optional_macro(m, "cholesterol_mg")?,
+        selenium_ug: optional_macro(m, "selenium_ug")?,
+        vitamin_d_ug: optional_macro(m, "vitamin_d_ug")?,
     })
 }
 
@@ -1045,6 +1062,9 @@ mod tests {
                     potassium_mg: None,
                     calcium_mg: Some(60.0),
                     magnesium_mg: None,
+                    cholesterol_mg: None,
+                    selenium_ug: None,
+                    vitamin_d_ug: None,
                 }],
                 retract: Vec::new(),
                 corrections_seq: None,
@@ -1121,6 +1141,49 @@ mod tests {
             meal_log(o3).is_none(),
             "omega3_mg is not a meal field — rejected as an unknown key"
         );
+    }
+
+    #[test]
+    fn meal_log_parses_the_three_healthkit_bound_risk_nutrients() {
+        // Of the seven risk nutrients only these three have a HealthKit type
+        // (dietaryCholesterol / dietarySelenium / dietaryVitaminD), so only these three
+        // are meal-wire fields. Adding them to the allowlist is not optional: an
+        // unknown key makes the WHOLE block malformed-passthrough, a silent failure.
+        let reply =
+            "JESSE_MEAL_LOG v1 {\"meals\":[{\"id\":\"a\",\"consumedAt\":\"t\",\"name\":\"Salmon\",\
+            \"cholesterol_mg\":63,\"selenium_ug\":48,\"vitamin_d_ug\":13.1}]}";
+        let m = meal_log(reply).unwrap().meals.remove(0);
+        assert_eq!(m.cholesterol_mg, Some(63.0));
+        assert_eq!(m.selenium_ug, Some(48.0));
+        assert_eq!(m.vitamin_d_ug, Some(13.1));
+
+        // A measured zero rides the wire as 0 (cholesterol in a plant food is a fact).
+        let zero = "JESSE_MEAL_LOG v1 {\"meals\":[{\"id\":\"a\",\"consumedAt\":\"t\",\"name\":\"Banana\",\"cholesterol_mg\":0}]}";
+        let mz = meal_log(zero).unwrap().meals.remove(0);
+        assert_eq!(mz.cholesterol_mg, Some(0.0));
+        // …and the two it did not state stay absent, never null-padded or zeroed.
+        assert!(mz.selenium_ug.is_none() && mz.vitamin_d_ug.is_none());
+
+        // v2 accepts them identically (same parse_meal path).
+        let v2 = "JESSE_MEAL_LOG v2 {\"meals\":[{\"id\":\"a\",\"consumedAt\":\"t\",\"name\":\"n\",\
+            \"cholesterol_mg\":30,\"selenium_ug\":12,\"vitamin_d_ug\":2}],\"retract\":[\"old\"]}";
+        let mv2 = meal_log(v2).unwrap().meals.remove(0);
+        assert_eq!(mv2.cholesterol_mg, Some(30.0));
+        assert_eq!(mv2.selenium_ug, Some(12.0));
+        assert_eq!(mv2.vitamin_d_ug, Some(2.0));
+
+        // Serialization: known values ride under their exact wire names; a meal that
+        // knows none of them omits all three keys rather than null-padding.
+        let v = serde_json::to_value(&m).unwrap();
+        assert_eq!(v["cholesterol_mg"], 63.0);
+        assert_eq!(v["selenium_ug"], 48.0);
+        assert_eq!(v["vitamin_d_ug"], 13.1);
+        let bare =
+            "JESSE_MEAL_LOG v1 {\"meals\":[{\"id\":\"a\",\"consumedAt\":\"t\",\"name\":\"n\"}]}";
+        let vb = serde_json::to_value(meal_log(bare).unwrap().meals.remove(0)).unwrap();
+        for key in ["cholesterol_mg", "selenium_ug", "vitamin_d_ug"] {
+            assert!(vb.get(key).is_none(), "absent {key} omitted, not null");
+        }
     }
 
     #[test]
@@ -1460,10 +1523,23 @@ mod tests {
             "JESSE_MEAL_LOG v1 {\"meals\":[{\"id\":\"a\",\"consumedAt\":\"t\"}]}",
             // empty (blank) required field
             "JESSE_MEAL_LOG v1 {\"meals\":[{\"id\":\"  \",\"consumedAt\":\"t\",\"name\":\"n\"}]}",
-            // unknown meal field (a schema key like sodium_mg/calcium_mg would now parse,
-            // but omega3_mg has no HealthKit type so it stays unknown → malformed)
+            // unknown meal field (a schema key like sodium_mg/calcium_mg/cholesterol_mg
+            // parses, but a nutrient with NO HealthKit type has no wire field and stays
+            // unknown → malformed). `added_sugar_g` is deliberately among them: HealthKit
+            // carries only TOTAL `dietarySugar`.
             "JESSE_MEAL_LOG v1 {\"meals\":[{\"id\":\"a\",\"consumedAt\":\"t\",\"name\":\"n\",\"added_sugar_g\":5}]}",
+            "JESSE_MEAL_LOG v1 {\"meals\":[{\"id\":\"a\",\"consumedAt\":\"t\",\"name\":\"n\",\"trans_fat_g\":0.5}]}",
+            "JESSE_MEAL_LOG v1 {\"meals\":[{\"id\":\"a\",\"consumedAt\":\"t\",\"name\":\"n\",\"purines_mg\":170}]}",
+            "JESSE_MEAL_LOG v1 {\"meals\":[{\"id\":\"a\",\"consumedAt\":\"t\",\"name\":\"n\",\"mercury_ug\":13}]}",
             "JESSE_MEAL_LOG v1 {\"meals\":[{\"id\":\"a\",\"consumedAt\":\"t\",\"name\":\"n\",\"omega3_mg\":50}]}",
+            // the three HealthKit-bound risk nutrients: negative and explicit null are
+            // rejected exactly like the older micros
+            "JESSE_MEAL_LOG v1 {\"meals\":[{\"id\":\"a\",\"consumedAt\":\"t\",\"name\":\"n\",\"cholesterol_mg\":-1}]}",
+            "JESSE_MEAL_LOG v1 {\"meals\":[{\"id\":\"a\",\"consumedAt\":\"t\",\"name\":\"n\",\"selenium_ug\":-1}]}",
+            "JESSE_MEAL_LOG v1 {\"meals\":[{\"id\":\"a\",\"consumedAt\":\"t\",\"name\":\"n\",\"vitamin_d_ug\":-0.5}]}",
+            "JESSE_MEAL_LOG v1 {\"meals\":[{\"id\":\"a\",\"consumedAt\":\"t\",\"name\":\"n\",\"cholesterol_mg\":null}]}",
+            "JESSE_MEAL_LOG v1 {\"meals\":[{\"id\":\"a\",\"consumedAt\":\"t\",\"name\":\"n\",\"selenium_ug\":null}]}",
+            "JESSE_MEAL_LOG v1 {\"meals\":[{\"id\":\"a\",\"consumedAt\":\"t\",\"name\":\"n\",\"vitamin_d_ug\":null}]}",
             // negative micronutrient
             "JESSE_MEAL_LOG v1 {\"meals\":[{\"id\":\"a\",\"consumedAt\":\"t\",\"name\":\"n\",\"sodium_mg\":-5}]}",
             "JESSE_MEAL_LOG v1 {\"meals\":[{\"id\":\"a\",\"consumedAt\":\"t\",\"name\":\"n\",\"calcium_mg\":-5}]}",

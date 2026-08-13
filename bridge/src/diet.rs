@@ -1723,9 +1723,66 @@ mod tests {
         assert!(item["ca"].is_null(), "missing Calcium_mg cell → null");
         assert!(item["o3"].is_null(), "missing Omega3_mg cell → null");
         assert!(item["mg"].is_null(), "missing Magnesium_mg cell → null");
+        // …and the same for the seven risk columns, which every historical row predates.
+        for key in ["chol", "tfat", "asug", "pur", "hg", "se", "vd"] {
+            assert!(
+                item[key].is_null(),
+                "missing risk column → {key} null, not 0"
+            );
+        }
         // The row still reconstructs its existing fields fine.
         assert_eq!(item["fiber"], 3.0);
         assert_eq!(item["cal"], 180.0);
+    }
+
+    #[test]
+    fn risk_nutrients_populated_yield_their_numbers() {
+        // The seven trailing risk cells, in header order:
+        // Cholesterol_mg,TransFat_g,AddedSugar_g,Purines_mg,Mercury_ug,Selenium_ug,VitaminD_ug
+        let csv = format!(
+            "{h}\n\
+             2026-08-13,Dinner,Sardines,1,tin,,,190,23,11,0,,19:30,Dinner,0,510,3,0,400,380,1480,39,142,0.1,0,345,13,53,7\n",
+            h = food_header()
+        );
+        let (meals, errs) = reconstruct_meals(&csv, "2026-08-13");
+        assert!(errs.is_empty(), "clean row: {errs:?}");
+        let item = &meals[0]["items"][0];
+        assert_eq!(item["chol"], 142.0);
+        assert_eq!(item["tfat"], 0.1);
+        assert_eq!(item["asug"], 0.0, "a written 0 is a KNOWN zero, and kept");
+        assert_eq!(item["pur"], 345.0);
+        assert_eq!(item["hg"], 13.0);
+        assert_eq!(item["se"], 53.0);
+        assert_eq!(item["vd"], 7.0);
+        // The eight older micros are untouched by the seven new cells.
+        assert_eq!(item["na"], 510.0);
+        assert_eq!(item["o3"], 1480.0);
+        assert_eq!(item["mg"], 39.0);
+    }
+
+    #[test]
+    fn risk_nutrients_blank_cells_are_null_not_zero() {
+        // Present-but-blank risk cells mean UNKNOWN → null, NEVER 0.0. The distinction
+        // matters most here: a real 0 (no mercury in a banana) is a FACT the extractor
+        // writes, so a blank collapsing to 0 would forge one.
+        let csv = format!(
+            "{h}\n\
+             2026-08-13,Lunch,Soup,1,bowl,,,220,8,6,30,,12:00,Lunch,7,480,2.5,9,610,120,,45,,,,,,,\n",
+            h = food_header()
+        );
+        let (meals, errs) = reconstruct_meals(&csv, "2026-08-13");
+        assert!(
+            errs.is_empty(),
+            "blank risk cells are not an error: {errs:?}"
+        );
+        let item = &meals[0]["items"][0];
+        for key in ["chol", "tfat", "asug", "pur", "hg", "se", "vd"] {
+            assert!(item[key].is_null(), "blank risk cell → {key} null, not 0");
+            assert_ne!(item[key], json!(0.0), "{key} must NOT read back as 0");
+        }
+        // The known cells on the same row still carry their numbers.
+        assert_eq!(item["na"], 480.0);
+        assert_eq!(item["mg"], 45.0);
     }
 
     // ---- nutrient_series ---------------------------------------------------

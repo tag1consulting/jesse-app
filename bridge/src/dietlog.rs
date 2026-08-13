@@ -86,6 +86,14 @@ pub enum FillClass {
     /// is the NORMAL, correct state for everything else, so it is never counted as
     /// incomplete and never filled by hosted completion.
     MarineOnly,
+    /// A RISK nutrient almost no label prints (trans fat outside the US, added sugar,
+    /// purines, mercury): fillable only from a label that happens to state it or from a
+    /// confident class-based estimate, so a blank cell is a normal outcome rather than
+    /// incomplete data. Never counted by the completeness figure and never filled by
+    /// hosted completion — the per-nutrient guidance on the table row is what teaches
+    /// the extract child when a REAL 0 is the answer (mercury in non-seafood, added
+    /// sugar in whole fruit) and when to omit.
+    EstimatedRisk,
 }
 
 /// One nutrient column, described once. `getter`/`setter` are the field accessors on
@@ -103,10 +111,16 @@ pub struct NutrientCol {
     pub wire: Option<&'static str>,
     /// The short key the app's diet snapshot uses (`GET /jesse/diet`).
     pub app_key: &'static str,
-    /// `mg` or `g` — stated in the prompt so the child cannot mix units.
+    /// `mg`, `g` or `ug` — stated in the prompt so the child cannot mix units.
     pub unit: &'static str,
     /// Whether a blank cell means "incomplete" or "correctly absent".
     pub fill: FillClass,
+    /// This nutrient's OWN bullet in the extract prompt's NUTRIENTS section, when the
+    /// class paragraphs don't say enough: where the value comes from, and — for the
+    /// risk nutrients — when `0` is a KNOWN fact rather than an absence. `None` for a
+    /// nutrient the class paragraphs already cover (the label/whole-food micros).
+    /// Rendered as `- \`key\` (unit): <guidance>` in table order.
+    pub guidance: Option<&'static str>,
     getter: fn(&FoodEntry) -> Option<f64>,
     setter: fn(&mut FoodEntry, Option<f64>),
     wire_setter: Option<fn(&mut Meal, Option<f64>)>,
@@ -149,9 +163,19 @@ impl std::fmt::Debug for NutrientCol {
     }
 }
 
-/// The nutrient columns, in CSV order. Seven are [`FillClass::ExpectedWhenKnowable`];
-/// omega-3 alone is [`FillClass::MarineOnly`] (marine EPA+DHA, never plant ALA) and is
-/// also the one nutrient with no meal-wire field.
+/// The nutrient columns, in CSV order.
+///
+///   * Seven are [`FillClass::ExpectedWhenKnowable`] — the label/whole-food micros the
+///     completeness figure and hosted completion are defined over.
+///   * Omega-3 alone is [`FillClass::MarineOnly`] (marine EPA+DHA, never plant ALA).
+///   * The seven newest are [`FillClass::EstimatedRisk`] — the risk nutrients almost no
+///     label prints. Each carries its own `guidance` bullet, because for several of them
+///     a `0` is a KNOWN fact (cholesterol in any plant food, mercury outside seafood,
+///     added sugar in whole fruit) rather than the "did not know" a blank means.
+///
+/// Five nutrients have no meal-wire field — omega-3, trans fat, added sugar, purines
+/// and mercury have no HealthKit type (HealthKit carries only TOTAL `dietarySugar`, so
+/// an added-sugar sum would be written to the wrong quantity).
 pub const NUTRIENT_COLUMNS: &[NutrientCol] = &[
     NutrientCol {
         csv: "Fiber_g",
@@ -160,6 +184,7 @@ pub const NUTRIENT_COLUMNS: &[NutrientCol] = &[
         app_key: "fiber",
         unit: "g",
         fill: FillClass::ExpectedWhenKnowable,
+        guidance: None,
         getter: |f| f.fiber_g,
         setter: |f, v| f.fiber_g = v,
         wire_setter: Some(|m, v| m.fiber_g = v),
@@ -171,6 +196,7 @@ pub const NUTRIENT_COLUMNS: &[NutrientCol] = &[
         app_key: "na",
         unit: "mg",
         fill: FillClass::ExpectedWhenKnowable,
+        guidance: None,
         getter: |f| f.sodium_mg,
         setter: |f, v| f.sodium_mg = v,
         wire_setter: Some(|m, v| m.sodium_mg = v),
@@ -182,6 +208,7 @@ pub const NUTRIENT_COLUMNS: &[NutrientCol] = &[
         app_key: "satf",
         unit: "g",
         fill: FillClass::ExpectedWhenKnowable,
+        guidance: None,
         getter: |f| f.satfat_g,
         setter: |f, v| f.satfat_g = v,
         wire_setter: Some(|m, v| m.satfat_g = v),
@@ -193,6 +220,7 @@ pub const NUTRIENT_COLUMNS: &[NutrientCol] = &[
         app_key: "sug",
         unit: "g",
         fill: FillClass::ExpectedWhenKnowable,
+        guidance: None,
         getter: |f| f.sugar_g,
         setter: |f, v| f.sugar_g = v,
         wire_setter: Some(|m, v| m.sugar_g = v),
@@ -204,6 +232,7 @@ pub const NUTRIENT_COLUMNS: &[NutrientCol] = &[
         app_key: "k",
         unit: "mg",
         fill: FillClass::ExpectedWhenKnowable,
+        guidance: None,
         getter: |f| f.potassium_mg,
         setter: |f, v| f.potassium_mg = v,
         wire_setter: Some(|m, v| m.potassium_mg = v),
@@ -215,6 +244,7 @@ pub const NUTRIENT_COLUMNS: &[NutrientCol] = &[
         app_key: "ca",
         unit: "mg",
         fill: FillClass::ExpectedWhenKnowable,
+        guidance: None,
         getter: |f| f.calcium_mg,
         setter: |f, v| f.calcium_mg = v,
         wire_setter: Some(|m, v| m.calcium_mg = v),
@@ -228,6 +258,11 @@ pub const NUTRIENT_COLUMNS: &[NutrientCol] = &[
         app_key: "o3",
         unit: "mg",
         fill: FillClass::MarineOnly,
+        guidance: Some(
+            "marine long-chain omega-3 (EPA+DHA) ONLY: fish, shellfish, roe, and the \
+small amounts in eggs and dairy. NEVER the plant ALA in walnuts, flax, chia or \
+vegetable oils. OMIT the key for a plant-ALA-only food.",
+        ),
         getter: |f| f.omega3_mg,
         setter: |f, v| f.omega3_mg = v,
         wire_setter: None,
@@ -239,9 +274,135 @@ pub const NUTRIENT_COLUMNS: &[NutrientCol] = &[
         app_key: "mg",
         unit: "mg",
         fill: FillClass::ExpectedWhenKnowable,
+        guidance: None,
         getter: |f| f.magnesium_mg,
         setter: |f, v| f.magnesium_mg = v,
         wire_setter: Some(|m, v| m.magnesium_mg = v),
+    },
+    NutrientCol {
+        csv: "Cholesterol_mg",
+        key: "cholesterol_mg",
+        // HealthKit `dietaryCholesterol`.
+        wire: Some("cholesterol_mg"),
+        app_key: "chol",
+        unit: "mg",
+        fill: FillClass::EstimatedRisk,
+        guidance: Some(
+            "dietary cholesterol. Write 0 for ALL plant foods — fruit, vegetables, \
+grains, legumes, nuts, seeds, oils: that 0 is a KNOWN fact, not an absence. Animal \
+foods carry it (egg yolk, offal and shellfish most), so fill it from the label or from \
+standard composition values, scaled to the amount logged.",
+        ),
+        getter: |f| f.cholesterol_mg,
+        setter: |f, v| f.cholesterol_mg = v,
+        wire_setter: Some(|m, v| m.cholesterol_mg = v),
+    },
+    NutrientCol {
+        csv: "TransFat_g",
+        key: "trans_fat_g",
+        // No HealthKit trans-fat quantity.
+        wire: None,
+        app_key: "tfat",
+        unit: "g",
+        fill: FillClass::EstimatedRisk,
+        guidance: Some(
+            "industrial AND natural trans fat. Write 0 for whole unprocessed plant \
+foods (a known fact). Ruminant dairy and beef carry small natural amounts — about 2-5% \
+of their fat. When the ingredient list shows partially hydrogenated oil, ESTIMATE \
+rather than omitting: that is the case the column exists for.",
+        ),
+        getter: |f| f.trans_fat_g,
+        setter: |f, v| f.trans_fat_g = v,
+        wire_setter: None,
+    },
+    NutrientCol {
+        csv: "AddedSugar_g",
+        key: "added_sugar_g",
+        // HealthKit has only TOTAL `dietarySugar` (already mirrored by `sugar_g`);
+        // writing added sugar there would corrupt the total, hence no wire field.
+        wire: None,
+        app_key: "asug",
+        unit: "g",
+        fill: FillClass::EstimatedRisk,
+        guidance: Some(
+            "FREE/ADDED sugars only — never the intrinsic sugar in whole fruit, \
+vegetables or plain milk (that is `sugar_g`). Write 0 for an unprocessed whole food: a \
+banana has 0 added sugar, a known fact, even though its `sugar_g` is high. Juice, \
+concentrate, honey and syrup COUNT as added.",
+        ),
+        getter: |f| f.added_sugar_g,
+        setter: |f, v| f.added_sugar_g = v,
+        wire_setter: None,
+    },
+    NutrientCol {
+        csv: "Purines_mg",
+        key: "purines_mg",
+        // No HealthKit purine quantity.
+        wire: None,
+        app_key: "pur",
+        unit: "mg",
+        fill: FillClass::EstimatedRisk,
+        guidance: Some(
+            "total purines, a CLASS-BASED estimate from published purine tables \
+(offal very high; anchovies, sardines and mussels high; other meat and fish moderate; \
+legumes and some vegetables low-moderate), scaled to the grams logged. Near 0 for \
+fruit, dairy, eggs and refined grains.",
+        ),
+        getter: |f| f.purines_mg,
+        setter: |f, v| f.purines_mg = v,
+        wire_setter: None,
+    },
+    NutrientCol {
+        csv: "Mercury_ug",
+        key: "mercury_ug",
+        // No HealthKit mercury quantity.
+        wire: None,
+        app_key: "hg",
+        unit: "ug",
+        fill: FillClass::EstimatedRisk,
+        guidance: Some(
+            "methylmercury, from the FDA mean for the NAMED species, scaled to the \
+grams logged (swordfish, shark and king mackerel highest; tuna moderate and varying by \
+kind; salmon, sardines, shrimp and scallops very low). Write 0 for any non-seafood — a \
+known fact. Do NOT guess for an unnamed generic \"fish\": OMIT the key instead.",
+        ),
+        getter: |f| f.mercury_ug,
+        setter: |f, v| f.mercury_ug = v,
+        wire_setter: None,
+    },
+    NutrientCol {
+        csv: "Selenium_ug",
+        key: "selenium_ug",
+        // HealthKit `dietarySelenium`.
+        wire: Some("selenium_ug"),
+        app_key: "se",
+        unit: "ug",
+        fill: FillClass::EstimatedRisk,
+        guidance: Some(
+            "selenium. Brazil nuts are the extreme — about 68-91 ug in ONE nut, so \
+scale carefully. Seafood, offal and eggs are good sources; plant foods vary with soil \
+selenium by an ORDER OF MAGNITUDE, so treat a plant value as approximate.",
+        ),
+        getter: |f| f.selenium_ug,
+        setter: |f, v| f.selenium_ug = v,
+        wire_setter: Some(|m, v| m.selenium_ug = v),
+    },
+    NutrientCol {
+        csv: "VitaminD_ug",
+        key: "vitamin_d_ug",
+        // HealthKit `dietaryVitaminD`.
+        wire: Some("vitamin_d_ug"),
+        app_key: "vd",
+        unit: "ug",
+        fill: FillClass::EstimatedRisk,
+        guidance: Some(
+            "vitamin D in MICROGRAMS, never IU: a label in IU must be DIVIDED BY 40 \
+(400 IU = 10 ug). Oily fish, egg yolk, liver and fortified milk or cereal carry it. \
+Write 0 for most unfortified plant foods — a known fact.",
+        ),
+        getter: |f| f.vitamin_d_ug,
+        setter: |f, v| f.vitamin_d_ug = v,
+        wire_setter: Some(|m, v| m.vitamin_d_ug = v),
     },
 ];
 
@@ -347,6 +508,21 @@ pub struct FoodEntry {
     pub calcium_mg: Option<f64>,
     pub omega3_mg: Option<f64>,
     pub magnesium_mg: Option<f64>,
+    // The seven RISK nutrients ([`FillClass::EstimatedRisk`]) — the same
+    // unknown-is-not-zero discipline, with one nuance the extract PROMPT (never this
+    // plumbing) encodes: for several of them a real `Some(0.0)` is a KNOWN fact —
+    // cholesterol in any plant food, mercury outside seafood, added sugar in whole
+    // fruit, vitamin D in most unfortified plants. `None` still means the message and
+    // the label established nothing: a blank CSV cell and an omitted wire field.
+    // `cholesterol_mg`/`purines_mg` are milligrams, `trans_fat_g`/`added_sugar_g`
+    // grams, `mercury_ug`/`selenium_ug`/`vitamin_d_ug` MICROgrams.
+    pub cholesterol_mg: Option<f64>,
+    pub trans_fat_g: Option<f64>,
+    pub added_sugar_g: Option<f64>,
+    pub purines_mg: Option<f64>,
+    pub mercury_ug: Option<f64>,
+    pub selenium_ug: Option<f64>,
+    pub vitamin_d_ug: Option<f64>,
     pub notes: Option<String>,
     /// The extract child's "I cannot identify this composite" signal: an unnamed
     /// restaurant dish, an unknown sauce — something whose nutrients cannot be looked
@@ -390,6 +566,12 @@ pub struct WeightEntry {
 /// structs carry a `kind` field of their own, so the tag is unambiguous.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "kind", rename_all = "lowercase")]
+// `Food` is the big variant (one `Option<f64>` per nutrient column, and the table keeps
+// growing), so clippy flags the size gap. Boxing it would buy nothing here: a turn holds
+// at most [`MAX_DIET_ENTRIES`] of these in one short-lived Vec, and the indirection would
+// cost a pointer chase on every nutrient read in exchange for a few hundred bytes that
+// never leave the stack of one request.
+#[allow(clippy::large_enum_variant)]
 pub enum DietEntry {
     Food(FoodEntry),
     Exercise(ExerciseEntry),
@@ -661,6 +843,13 @@ fn parse_food(m: &serde_json::Map<String, Value>) -> Result<FoodEntry, String> {
         calcium_mg: None,
         omega3_mg: None,
         magnesium_mg: None,
+        cholesterol_mg: None,
+        trans_fat_g: None,
+        added_sugar_g: None,
+        purines_mg: None,
+        mercury_ug: None,
+        selenium_ug: None,
+        vitamin_d_ug: None,
         notes: opt_str_field(m, "notes"),
         unknowable_composite: opt_bool_field(m, "unknowable_composite")?,
     };
@@ -1307,6 +1496,9 @@ pub fn build_meal_log_from_food_rows(
                 potassium_mg: None,
                 calcium_mg: None,
                 magnesium_mg: None,
+                cholesterol_mg: None,
+                selenium_ug: None,
+                vitamin_d_ug: None,
             };
             // Nutrients summed the same way, driven by the table: only the rows that
             // stated a value contribute, and a group where none did omits the field
@@ -2023,8 +2215,15 @@ pub fn diet_extract_schema() -> &'static str {
 /// from labels so usually omitted". The child obeyed, so every locally-logged row
 /// arrived with three or more knowable columns blank. The branches below tell it the
 /// opposite for a food it can identify, while keeping the honest-omission rule for
-/// the one case where nobody can know (an unidentifiable composite) and for the one
-/// nutrient that is genuinely absent from most foods (marine omega-3).
+/// the one case where nobody can know (an unidentifiable composite), for the one
+/// nutrient that is genuinely absent from most foods (marine omega-3), and for the
+/// [`FillClass::EstimatedRisk`] columns almost no label prints.
+///
+/// Each column may also carry its OWN bullet ([`NutrientCol::guidance`]) — where its
+/// value comes from and, for the risk nutrients, when `0` is a KNOWN fact rather than
+/// the "did not know" a blank means. That distinction lives HERE, in the prompt, never
+/// in the plumbing: every stage below still treats absent as unknown and writes a
+/// blank cell.
 ///
 /// Worded for a small local model: short sentences, imperative, no hedging.
 fn build_nutrient_rules(cols: &[NutrientCol]) -> String {
@@ -2057,12 +2256,32 @@ egg, a chicken breast: you know these values. Write them.\n\
 - SODIUM is the food's own intrinsic sodium, plus label salt, plus restaurant \
 seasoning. Never add a \"probably salted it\" amount to a home-cooked item.\n",
     );
-    for c in list(FillClass::MarineOnly) {
+    // The risk columns: estimate-or-omit, stated ONCE for the class, then per-nutrient
+    // below. Their `0` cases are the guidance bullets' job.
+    let risk = list(FillClass::EstimatedRisk);
+    if !risk.is_empty() {
+        s.push_str("- ESTIMATE THESE, or omit them — ");
+        s.push_str(
+            &risk
+                .iter()
+                .map(|c| format!("`{}` ({})", c.key, c.unit))
+                .collect::<Vec<_>>()
+                .join(", "),
+        );
+        s.push_str(
+            ": almost no label prints them. Fill one from a label that DOES state it, \
+or from a confident value for that food; omit it when you cannot source either. Where \
+a bullet below says to write 0, that 0 is a KNOWN fact about the food and you MUST \
+write it — it is not a placeholder for \"I don't know\".\n",
+        );
+    }
+    // Each column's own bullet, in table order.
+    for c in cols.iter().filter(|c| c.guidance.is_some()) {
         s.push_str(&format!(
-            "- `{}` ({}) is marine long-chain omega-3 (EPA+DHA) ONLY: fish, shellfish, \
-roe, and the small amounts in eggs and dairy. NEVER the plant ALA in walnuts, flax, \
-chia or vegetable oils. OMIT the key for a plant-ALA-only food.\n",
-            c.key, c.unit
+            "- `{}` ({}) is {}\n",
+            c.key,
+            c.unit,
+            c.guidance.expect("filtered to Some")
         ));
     }
     s.push_str(
@@ -2868,6 +3087,91 @@ mod tests {
     }
 
     #[test]
+    fn parses_food_risk_nutrients_all_some_or_none() {
+        // The seven risk nutrients are optional in exactly the same way: all present, a
+        // subset present, or none at all must all parse, and an omitted one is None —
+        // NEVER 0. A written 0 (no mercury in a banana, no added sugar in whole fruit)
+        // is a KNOWN fact and survives as Some(0.0).
+        let json = r#"{"entries":[
+            {"kind":"food","name":"Sardines","meal":"Dinner","time":"19:30","kcal":190,"cholesterol_mg":142,"trans_fat_g":0.1,"added_sugar_g":0,"purines_mg":345,"mercury_ug":13,"selenium_ug":53,"vitamin_d_ug":7},
+            {"kind":"food","name":"Banana","meal":"Snack","time":"10:00","kcal":105,"cholesterol_mg":0,"added_sugar_g":0,"mercury_ug":0},
+            {"kind":"food","name":"Soup","meal":"Lunch","time":"12:00","kcal":220}
+        ]}"#;
+        let ex = parse_diet_entries(json).expect("all three parse");
+        let foods: Vec<&FoodEntry> = ex
+            .entries
+            .iter()
+            .filter_map(|e| match e {
+                DietEntry::Food(f) => Some(f),
+                _ => None,
+            })
+            .collect();
+        // All seven present.
+        assert_eq!(foods[0].cholesterol_mg, Some(142.0));
+        assert_eq!(foods[0].trans_fat_g, Some(0.1));
+        assert_eq!(foods[0].added_sugar_g, Some(0.0), "measured zero");
+        assert_eq!(foods[0].purines_mg, Some(345.0));
+        assert_eq!(foods[0].mercury_ug, Some(13.0));
+        assert_eq!(foods[0].selenium_ug, Some(53.0));
+        assert_eq!(foods[0].vitamin_d_ug, Some(7.0));
+        // A subset: the KNOWN zeros are kept as zeros, the unstated ones stay None.
+        assert_eq!(
+            foods[1].cholesterol_mg,
+            Some(0.0),
+            "0 in a plant food is a fact"
+        );
+        assert_eq!(
+            foods[1].added_sugar_g,
+            Some(0.0),
+            "whole fruit: 0 added sugar"
+        );
+        assert_eq!(foods[1].mercury_ug, Some(0.0), "non-seafood: 0 mercury");
+        assert_eq!(foods[1].trans_fat_g, None);
+        assert_eq!(foods[1].purines_mg, None);
+        assert_eq!(foods[1].selenium_ug, None);
+        assert_eq!(foods[1].vitamin_d_ug, None);
+        // None present — all seven absent, none defaulted to 0.
+        assert!(
+            foods[2].cholesterol_mg.is_none()
+                && foods[2].trans_fat_g.is_none()
+                && foods[2].added_sugar_g.is_none()
+                && foods[2].purines_mg.is_none()
+                && foods[2].mercury_ug.is_none()
+                && foods[2].selenium_ug.is_none()
+                && foods[2].vitamin_d_ug.is_none()
+        );
+    }
+
+    #[test]
+    fn parse_rejects_negative_or_non_finite_risk_nutrient() {
+        // Each risk nutrient shares the finite/non-negative discipline of the macros.
+        for key in [
+            "cholesterol_mg",
+            "trans_fat_g",
+            "added_sugar_g",
+            "purines_mg",
+            "mercury_ug",
+            "selenium_ug",
+            "vitamin_d_ug",
+        ] {
+            let body = format!(
+                r#"{{"entries":[{{"kind":"food","name":"n","meal":"Snack","time":"09:00","{key}":-1}}]}}"#
+            );
+            assert!(
+                parse_diet_entries(&body).is_err(),
+                "a negative {key} must be rejected"
+            );
+            // …while an explicit 0 and a normal value both parse.
+            for good in ["0", "12.5"] {
+                let body = format!(
+                    r#"{{"entries":[{{"kind":"food","name":"n","meal":"Snack","time":"09:00","{key}":{good}}}]}}"#
+                );
+                assert!(parse_diet_entries(&body).is_ok(), "{key}={good} must parse");
+            }
+        }
+    }
+
+    #[test]
     fn parse_rejects_negative_micronutrient() {
         // A micronutrient shares the finite/non-negative discipline of the macros —
         // including the three newest ones.
@@ -2913,6 +3217,13 @@ mod tests {
             calcium_mg: None,
             omega3_mg: None,
             magnesium_mg: None,
+            cholesterol_mg: None,
+            trans_fat_g: None,
+            added_sugar_g: None,
+            purines_mg: None,
+            mercury_ug: None,
+            selenium_ug: None,
+            vitamin_d_ug: None,
             notes: None,
         };
         let csv = format!("{}\n{}\n", food_log_header(), food_row(&e, "2026-07-13"));
@@ -2956,6 +3267,13 @@ mod tests {
             calcium_mg: Some(8.0),
             omega3_mg: Some(40.0),
             magnesium_mg: Some(20.0),
+            cholesterol_mg: None,
+            trans_fat_g: None,
+            added_sugar_g: None,
+            purines_mg: None,
+            mercury_ug: None,
+            selenium_ug: None,
+            vitamin_d_ug: None,
             notes: None,
         };
         let csv = format!("{}\n{}\n", food_log_header(), food_row(&e, "2026-07-13"));
@@ -3025,6 +3343,13 @@ mod tests {
                 calcium_mg: None,
                 omega3_mg: None,
                 magnesium_mg: None,
+                cholesterol_mg: None,
+                trans_fat_g: None,
+                added_sugar_g: None,
+                purines_mg: None,
+                mercury_ug: None,
+                selenium_ug: None,
+                vitamin_d_ug: None,
                 notes: None,
             }),
             DietEntry::Food(FoodEntry {
@@ -3046,6 +3371,13 @@ mod tests {
                 calcium_mg: None,
                 omega3_mg: None,
                 magnesium_mg: None,
+                cholesterol_mg: None,
+                trans_fat_g: None,
+                added_sugar_g: None,
+                purines_mg: None,
+                mercury_ug: None,
+                selenium_ug: None,
+                vitamin_d_ug: None,
                 notes: None,
             }),
         ];
@@ -3121,7 +3453,10 @@ mod tests {
             r#"{"entries":[{"kind":"food"}]}"#, // missing name/meal (time is now optional)
             r#"{"entries":[{"kind":"food","name":"n","meal":"Snack","time":"t","kcal":-5}]}"#, // negative
             r#"{"entries":[{"kind":"bogus"}]}"#,
-            r#"{"entries":[{"kind":"food","name":"n","meal":"Snack","time":"t","added_sugar_g":5}]}"#, // still-unknown key (a schema field like sodium_mg/calcium_mg/omega3_mg now parses)
+            // A still-unknown nutrient-SHAPED key must still fail loudly. `added_sugar_g`
+            // used to serve as the example and is now a real schema key, so the example
+            // moved to `iron_mg`, which is in no table row.
+            r#"{"entries":[{"kind":"food","name":"n","meal":"Snack","time":"t","iron_mg":5}]}"#,
             r#"{"extra":1,"entries":[]}"#, // unknown top-level
         ] {
             assert!(parse_diet_entries(bad).is_err(), "should reject: {bad}");
@@ -3319,6 +3654,13 @@ mod tests {
             calcium_mg: None,
             omega3_mg: None,
             magnesium_mg: None,
+            cholesterol_mg: None,
+            trans_fat_g: None,
+            added_sugar_g: None,
+            purines_mg: None,
+            mercury_ug: None,
+            selenium_ug: None,
+            vitamin_d_ug: None,
             notes: None,
         })
     }
@@ -3397,6 +3739,13 @@ mod tests {
             calcium_mg: Some(45.0),
             omega3_mg: Some(30.0),
             magnesium_mg: None,
+            cholesterol_mg: None,
+            trans_fat_g: None,
+            added_sugar_g: None,
+            purines_mg: None,
+            mercury_ug: None,
+            selenium_ug: None,
+            vitamin_d_ug: None,
             notes: None,
         });
         match resolve_verdict(&e, &verdict(Verdict::Correct, Some(140.0))) {
@@ -3417,6 +3766,40 @@ mod tests {
                     "known omega-3 carried through untouched"
                 );
                 assert_eq!(f.magnesium_mg, None, "absent magnesium stays absent");
+            }
+            other => panic!("expected correction, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn correction_carries_risk_nutrients_through_untouched() {
+        // The verifier corrects the five macros and NOTHING else, so the seven risk
+        // columns ride the `..f.clone()` spread: a known mercury survives a kcal
+        // correction, a known zero stays 0, and an absent one is not invented.
+        let mut f = blank_food("Swordfish");
+        f.kcal = Some(120.0);
+        f.mercury_ug = Some(147.0);
+        f.selenium_ug = Some(48.0);
+        f.cholesterol_mg = Some(66.0);
+        f.added_sugar_g = Some(0.0); // a KNOWN zero
+        f.trans_fat_g = None; // never sourced
+        f.purines_mg = None;
+        f.vitamin_d_ug = None;
+        let e = DietEntry::Food(f);
+        match resolve_verdict(&e, &verdict(Verdict::Correct, Some(160.0))) {
+            Some(DietEntry::Food(f)) => {
+                assert_eq!(f.kcal, Some(160.0), "kcal corrected");
+                assert_eq!(
+                    f.mercury_ug,
+                    Some(147.0),
+                    "known mercury carried through untouched"
+                );
+                assert_eq!(f.selenium_ug, Some(48.0), "known selenium untouched");
+                assert_eq!(f.cholesterol_mg, Some(66.0), "known cholesterol untouched");
+                assert_eq!(f.added_sugar_g, Some(0.0), "a KNOWN zero stays 0");
+                assert_eq!(f.trans_fat_g, None, "absent trans fat stays absent");
+                assert_eq!(f.purines_mg, None, "absent purines stay absent");
+                assert_eq!(f.vitamin_d_ug, None, "absent vitamin D stays absent");
             }
             other => panic!("expected correction, got {other:?}"),
         }
@@ -3471,10 +3854,17 @@ mod tests {
             calcium_mg: Some(15.0),  // canned salmon (with bones) carries some calcium
             omega3_mg: Some(1400.0), // marine EPA+DHA — a real fish source
             magnesium_mg: None,      // absent on the label → blank cell, never 0
+            cholesterol_mg: None,
+            trans_fat_g: None,
+            added_sugar_g: None,
+            purines_mg: None,
+            mercury_ug: None,
+            selenium_ug: None,
+            vitamin_d_ug: None,
             notes: Some("drained, with salt".into()),
         };
         let row = food_row(&e, "2026-07-13");
-        // RFC-4180: the item's comma forces quoting; the row parses back to 22 fields.
+        // RFC-4180: the item's comma forces quoting; the row parses back to 29 fields.
         let mut rdr = csv::ReaderBuilder::new()
             .has_headers(false)
             .from_reader(row.as_bytes());
@@ -3482,7 +3872,7 @@ mod tests {
         assert_eq!(
             rec.len(),
             food_log_header().split(',').count(),
-            "22 columns"
+            "29 columns"
         );
         assert_eq!(&rec[0], "2026-07-13");
         assert_eq!(&rec[1], "Breakfast");
@@ -3500,6 +3890,81 @@ mod tests {
         assert_eq!(&rec[19], "15", "calcium_mg into Calcium_mg");
         assert_eq!(&rec[20], "1400", "omega3_mg into Omega3_mg");
         assert_eq!(&rec[21], "", "magnesium_mg absent → blank cell, not 0");
+    }
+
+    #[test]
+    fn food_row_places_every_risk_nutrient_in_its_own_cell() {
+        // The whole 29-cell row, asserted literally: a nutrient written one column off
+        // corrupts the log silently, so the placement is pinned rather than counted.
+        // Known zeros (mercury in a plant food) render `0`; unknowns render blank.
+        let mut e = blank_food("Salmon");
+        e.notes = None;
+        e.fiber_g = Some(0.0);
+        e.sodium_mg = Some(340.0);
+        e.satfat_g = Some(0.5);
+        e.sugar_g = Some(0.0);
+        e.potassium_mg = Some(420.0);
+        e.calcium_mg = Some(15.0);
+        e.omega3_mg = Some(1400.0);
+        e.magnesium_mg = Some(29.0);
+        e.cholesterol_mg = Some(63.0);
+        e.trans_fat_g = Some(0.0); // whole unprocessed food → a KNOWN zero
+        e.added_sugar_g = Some(0.0); // ditto: nothing was added
+        e.purines_mg = Some(170.0);
+        e.mercury_ug = Some(2.0);
+        e.selenium_ug = None; // soil variance, not sourced → stays UNKNOWN
+        e.vitamin_d_ug = Some(13.1);
+
+        let cells: Vec<&str> = "2026-08-13,Snack,Salmon,1 medium (~118g),serving,,,105,1.3,\
+0.4,27,,10:40,Snack,0,340,0.5,0,420,15,1400,29,63,0,0,170,2,,13.1"
+            .split(',')
+            .collect();
+        assert_eq!(
+            food_row(&e, "2026-08-13"),
+            cells.join(","),
+            "every cell in header order"
+        );
+        assert_eq!(cells.len(), food_log_header().split(',').count());
+        // Spot-check the tail against the header by NAME, so a future reorder is caught.
+        let header: Vec<&str> = food_log_header().split(',').collect();
+        for (name, want) in [
+            ("Cholesterol_mg", "63"),
+            ("TransFat_g", "0"),
+            ("AddedSugar_g", "0"),
+            ("Purines_mg", "170"),
+            ("Mercury_ug", "2"),
+            ("Selenium_ug", ""),
+            ("VitaminD_ug", "13.1"),
+        ] {
+            let i = header
+                .iter()
+                .position(|h| *h == name)
+                .expect("column exists");
+            assert_eq!(cells[i], want, "{name} cell");
+        }
+    }
+
+    #[test]
+    fn blank_risk_nutrient_round_trips_to_unknown_not_zero() {
+        // Write → read: an unsourced risk nutrient is a blank cell that reads back as
+        // JSON null, while a KNOWN zero on the same row reads back as 0. The two must
+        // never converge, which is the entire point of the column.
+        let mut e = blank_food("Banana");
+        e.mercury_ug = Some(0.0); // non-seafood: a known fact
+        e.added_sugar_g = Some(0.0); // whole fruit: a known fact
+        e.selenium_ug = None; // not sourced: unknown
+        e.purines_mg = None; // not sourced: unknown
+        let csv = format!("{}\n{}\n", food_log_header(), food_row(&e, "2026-08-13"));
+        let (meals, errors) = crate::diet::reconstruct_meals(&csv, "2026-08-13");
+        assert!(errors.is_empty(), "clean row: {errors:?}");
+        let item = &meals[0]["items"][0];
+        assert_eq!(item["hg"], 0.0, "a KNOWN zero survives as 0");
+        assert_eq!(item["asug"], 0.0, "a KNOWN zero survives as 0");
+        assert!(item["se"].is_null(), "unsourced selenium reads back null");
+        assert!(item["pur"].is_null(), "unsourced purines read back null");
+        for key in ["chol", "tfat", "vd"] {
+            assert!(item[key].is_null(), "{key} was never set → null");
+        }
     }
 
     #[test]
@@ -3523,6 +3988,13 @@ mod tests {
             calcium_mg: None,
             omega3_mg: None,
             magnesium_mg: None,
+            cholesterol_mg: None,
+            trans_fat_g: None,
+            added_sugar_g: None,
+            purines_mg: None,
+            mercury_ug: None,
+            selenium_ug: None,
+            vitamin_d_ug: None,
             notes: None,
         };
         let row = food_row(&e, "2026-07-13");
@@ -3533,7 +4005,7 @@ mod tests {
         assert_eq!(
             rec.len(),
             food_log_header().split(',').count(),
-            "22 columns"
+            "29 columns"
         );
         assert_eq!(&rec[7], "", "absent kcal → empty cell, not 0");
         assert_eq!(&rec[14], "", "absent fiber → empty cell");
@@ -3597,6 +4069,13 @@ mod tests {
             calcium_mg: None,
             omega3_mg: None,
             magnesium_mg: None,
+            cholesterol_mg: None,
+            trans_fat_g: None,
+            added_sugar_g: None,
+            purines_mg: None,
+            mercury_ug: None,
+            selenium_ug: None,
+            vitamin_d_ug: None,
             notes: None,
         };
         assert_eq!(
@@ -3685,6 +4164,13 @@ mod tests {
             calcium_mg: None,
             omega3_mg: None,
             magnesium_mg: None,
+            cholesterol_mg: None,
+            trans_fat_g: None,
+            added_sugar_g: None,
+            purines_mg: None,
+            mercury_ug: None,
+            selenium_ug: None,
+            vitamin_d_ug: None,
             notes: None,
         }
     }
@@ -3779,6 +4265,13 @@ mod tests {
             calcium_mg: ca,
             omega3_mg: None,
             magnesium_mg: None,
+            cholesterol_mg: None,
+            trans_fat_g: None,
+            added_sugar_g: None,
+            purines_mg: None,
+            mercury_ug: None,
+            selenium_ug: None,
+            vitamin_d_ug: None,
             notes: None,
         };
         // One row carries calcium 100 / fiber 4 / sodium 300, the other carries none.
@@ -3835,6 +4328,13 @@ mod tests {
             calcium_mg: None,
             omega3_mg: None,
             magnesium_mg: None,
+            cholesterol_mg: None,
+            trans_fat_g: None,
+            added_sugar_g: None,
+            purines_mg: None,
+            mercury_ug: None,
+            selenium_ug: None,
+            vitamin_d_ug: None,
             notes: None,
         };
         let ml = build_meal_log_from_food_rows(&[e], "2026-07-13", "+02:00")
@@ -3872,6 +4372,13 @@ mod tests {
             calcium_mg: Some(11.0),
             omega3_mg: Some(50.0), // known on the row, but has no Meal field to carry it
             magnesium_mg: None,
+            cholesterol_mg: None,
+            trans_fat_g: None,
+            added_sugar_g: None,
+            purines_mg: None,
+            mercury_ug: None,
+            selenium_ug: None,
+            vitamin_d_ug: None,
             notes: None,
         };
         let ml = build_meal_log_from_food_rows(&[e], "2026-07-13", "+02:00")
@@ -3918,6 +4425,73 @@ mod tests {
             meal.get("omega3_mg").is_none(),
             "omega-3 is never a meal wire field (no HealthKit type)"
         );
+    }
+
+    #[test]
+    fn mirror_sums_the_three_healthkit_bound_risk_nutrients_over_known_rows() {
+        // Off-phone logging must mirror to Health too: the three HealthKit-bound risk
+        // nutrients are summed per MEAL over the rows that KNOW them (a None row
+        // contributes nothing), and a nutrient no row knows produces no wire field.
+        // The four with no HealthKit type never reach the wire at all.
+        let mut a = blank_food("Salmon");
+        a.meal = "Dinner".into();
+        a.time = Some("19:30".into());
+        a.cholesterol_mg = Some(63.0);
+        a.selenium_ug = Some(48.0);
+        a.vitamin_d_ug = Some(13.1);
+        a.mercury_ug = Some(2.0); // known on the row, but no HealthKit type
+        a.purines_mg = Some(170.0);
+        let mut b = blank_food("Rice");
+        b.meal = "Dinner".into();
+        b.time = Some("19:30".into());
+        b.cholesterol_mg = Some(0.0); // a plant food: a KNOWN zero, and it must count
+        b.selenium_ug = Some(11.0);
+        b.vitamin_d_ug = None; // unknown → contributes nothing to the sum
+
+        let ml = build_meal_log_from_food_rows(&[a, b], "2026-08-13", "+02:00")
+            .unwrap()
+            .unwrap();
+        assert_eq!(ml.meals.len(), 1, "same slot + time → one mirror meal");
+        let m = &ml.meals[0];
+        assert_eq!(m.cholesterol_mg, Some(63.0), "63 + a known 0");
+        assert_eq!(m.selenium_ug, Some(59.0), "48 + 11");
+        assert_eq!(
+            m.vitamin_d_ug,
+            Some(13.1),
+            "the unknown row contributes nothing, it does not zero the sum"
+        );
+
+        let v = directives_to_value(&Some(Directives {
+            needs_health: None,
+            meal_log: Some(ml),
+        }));
+        let meal = &v["meal_log"]["meals"][0];
+        assert_eq!(meal["cholesterol_mg"], 63.0);
+        assert_eq!(meal["selenium_ug"], 59.0);
+        assert_eq!(meal["vitamin_d_ug"], 13.1);
+        for key in ["trans_fat_g", "added_sugar_g", "purines_mg", "mercury_ug"] {
+            assert!(
+                meal.get(key).is_none(),
+                "{key} has no HealthKit type → never a wire field"
+            );
+        }
+
+        // A meal whose rows know NONE of the three omits all three keys — never a 0.
+        let bare = build_meal_log_from_food_rows(&[blank_food("Water")], "2026-08-13", "+02:00")
+            .unwrap()
+            .unwrap();
+        let m = &bare.meals[0];
+        assert!(m.cholesterol_mg.is_none() && m.selenium_ug.is_none() && m.vitamin_d_ug.is_none());
+        let v = directives_to_value(&Some(Directives {
+            needs_health: None,
+            meal_log: Some(bare),
+        }));
+        for key in ["cholesterol_mg", "selenium_ug", "vitamin_d_ug"] {
+            assert!(
+                v["meal_log"]["meals"][0].get(key).is_none(),
+                "no known {key} → no wire field (never 0)"
+            );
+        }
     }
 
     #[test]
@@ -4233,6 +4807,13 @@ mod tests {
             calcium_mg: None,
             omega3_mg: None,
             magnesium_mg: None,
+            cholesterol_mg: None,
+            trans_fat_g: None,
+            added_sugar_g: None,
+            purines_mg: None,
+            mercury_ug: None,
+            selenium_ug: None,
+            vitamin_d_ug: None,
             notes: None,
             unknowable_composite: false,
         }
@@ -4260,16 +4841,26 @@ mod tests {
     }
 
     #[test]
-    fn header_is_the_22_canonical_columns_in_table_order() {
+    fn header_is_the_29_canonical_columns_in_table_order() {
         // The canonical contract, spelled out ONCE here so a reordering or rename in
         // the table is caught by a failing test rather than by a corrupted log.
         assert_eq!(
             food_log_header(),
             "Date,Meal,Item,Amount,Unit,Cal_per_100g,Grams,Calories,Protein_g,Fat_g,\
 Carbs_g,Notes,Time,Meal_Type,Fiber_g,Sodium_mg,SatFat_g,Sugar_g,Potassium_mg,\
-Calcium_mg,Omega3_mg,Magnesium_mg"
+Calcium_mg,Omega3_mg,Magnesium_mg,Cholesterol_mg,TransFat_g,AddedSugar_g,Purines_mg,\
+Mercury_ug,Selenium_ug,VitaminD_ug"
         );
-        assert_eq!(food_log_header().split(',').count(), 22, "22 columns");
+        assert_eq!(food_log_header().split(',').count(), 29, "29 columns");
+        // The header and the row builder MUST agree on the count, or every appended row
+        // is silently off by a column.
+        assert_eq!(
+            food_row(&blank_food("Banana"), "2026-08-13")
+                .split(',')
+                .count(),
+            food_log_header().split(',').count(),
+            "row builder and header agree at 29 cells"
+        );
     }
 
     #[test]
@@ -4296,18 +4887,26 @@ Calcium_mg,Omega3_mg,Magnesium_mg"
             .expect("schema carries a food line");
         for key in food_line
             .split('"')
-            .filter(|t| t.ends_with("_g") || t.ends_with("_mg"))
+            .filter(|t| t.ends_with("_g") || t.ends_with("_mg") || t.ends_with("_ug"))
         {
             let known = NUTRIENT_COLUMNS.iter().any(|c| c.key == key)
                 || ["protein_g", "carbs_g", "fat_g"].contains(&key);
             assert!(known, "schema key {key:?} resolves to no table entry");
         }
-        // The unit is stated for every nutrient, so the child cannot mix mg and g.
+        // The unit is stated for every nutrient, so the child cannot mix g, mg and ug.
         for c in NUTRIENT_COLUMNS {
             assert!(
-                matches!(c.unit, "g" | "mg"),
+                matches!(c.unit, "g" | "mg" | "ug"),
                 "nutrient {:?} needs a real unit",
                 c.key
+            );
+            // A key's suffix must match its unit — the mistake that would silently log
+            // micrograms of vitamin D as milligrams.
+            assert!(
+                c.key.ends_with(&format!("_{}", c.unit)),
+                "nutrient key {:?} must end in its unit {:?}",
+                c.key,
+                c.unit
             );
         }
     }
@@ -4330,7 +4929,7 @@ Calcium_mg,Omega3_mg,Magnesium_mg"
     }
 
     #[test]
-    fn food_row_emits_22_cells_with_nutrients_in_table_order() {
+    fn food_row_emits_29_cells_with_nutrients_in_table_order() {
         // Give each nutrient a DISTINCT value, then assert cell N+14 is the table's
         // N-th nutrient — the row builder's order is the table's order, not a
         // hand-written sequence.
@@ -4343,7 +4942,7 @@ Calcium_mg,Omega3_mg,Magnesium_mg"
             .has_headers(false)
             .from_reader(row.as_bytes());
         let rec = rdr.records().next().unwrap().unwrap();
-        assert_eq!(rec.len(), 22, "22 cells");
+        assert_eq!(rec.len(), 29, "29 cells");
         for (i, c) in NUTRIENT_COLUMNS.iter().enumerate() {
             assert_eq!(
                 &rec[14 + i],
@@ -4357,51 +4956,127 @@ Calcium_mg,Omega3_mg,Magnesium_mg"
 
     #[test]
     fn synthetic_nutrient_flows_through_header_schema_and_prompt() {
-        // The anti-hardcoding proof: a NINTH table entry changes the header, the schema
+        // The anti-hardcoding proof: ONE more table entry changes the header, the schema
         // AND the prompt together. Nothing downstream carries its own copy of the list.
+        // The synthetic column must name a nutrient the real table does NOT carry, or it
+        // would prove nothing about derivation.
         let synthetic = NutrientCol {
-            csv: "Selenium_ug",
-            key: "selenium_ug",
-            wire: Some("selenium_ug"),
-            app_key: "se",
+            csv: "Iodine_ug",
+            key: "iodine_ug",
+            wire: Some("iodine_ug"),
+            app_key: "iod",
             unit: "ug",
             fill: FillClass::ExpectedWhenKnowable,
+            guidance: None,
             // Accessors are irrelevant to the generated TEXT; reuse fiber's.
             getter: |f| f.fiber_g,
             setter: |f, v| f.fiber_g = v,
             wire_setter: Some(|m, v| m.fiber_g = v),
         };
+        assert!(
+            !NUTRIENT_COLUMNS.iter().any(|c| c.key == synthetic.key),
+            "the synthetic nutrient must not be a real one"
+        );
         let mut cols: Vec<NutrientCol> = NUTRIENT_COLUMNS.to_vec();
         cols.push(synthetic);
 
         let header = build_food_log_header(&cols);
         assert_eq!(
             header.split(',').count(),
-            23,
-            "the ninth nutrient extends it"
+            30,
+            "one more nutrient extends the 29-column header"
         );
         assert!(
-            header.ends_with(",Selenium_ug"),
+            header.ends_with(",Iodine_ug"),
             "appended in table order: {header}"
         );
 
         let schema = build_extract_schema(&cols);
         assert!(
-            schema.contains("\"selenium_ug\": <number, ug>"),
+            schema.contains("\"iodine_ug\": <number, ug>"),
             "schema gains the new key with its unit: {schema}"
         );
 
         let rules = build_nutrient_rules(&cols);
         assert!(
-            rules.contains("`selenium_ug` (ug)"),
+            rules.contains("`iodine_ug` (ug)"),
             "the prompt's EXPECTED list gains it: {rules}"
         );
 
+        // A synthetic column with its OWN guidance renders its own bullet.
+        let mut with_guidance = synthetic;
+        with_guidance.guidance = Some("a synthetic bullet nobody else states.");
+        let mut cols2: Vec<NutrientCol> = NUTRIENT_COLUMNS.to_vec();
+        cols2.push(with_guidance);
+        assert!(
+            build_nutrient_rules(&cols2)
+                .contains("- `iodine_ug` (ug) is a synthetic bullet nobody else states."),
+            "per-nutrient guidance is rendered from the table, not hardcoded"
+        );
+
         // And the production table is untouched by the test's local copy.
-        assert_eq!(food_log_header().split(',').count(), 22);
+        assert_eq!(food_log_header().split(',').count(), 29);
     }
 
     // ---- Phase 2: the extract prompt now INSTRUCTS filling, not omission -----
+
+    #[test]
+    fn extract_prompt_states_the_risk_nutrient_rules() {
+        // The risk columns are only as good as the guidance the child gets: the
+        // estimate-or-omit rule for the class, and — for each — where the value comes
+        // from and when a `0` is a KNOWN fact rather than a placeholder for unknown.
+        let p = build_diet_extract_prompt("ate a tin of sardines", "the user");
+        for fragment in [
+            // The class rule.
+            "ESTIMATE THESE, or omit them",
+            "it is not a placeholder for \"I don't know\"",
+            // Added sugar: free sugars only, 0 for whole food, juice counts.
+            "FREE/ADDED sugars only",
+            "never the intrinsic sugar in whole fruit",
+            "a banana has 0 added sugar",
+            "Juice, concentrate, honey and syrup COUNT as added",
+            // Trans fat: 0 for whole plants, ruminant amounts, estimate on PHO.
+            "Write 0 for whole unprocessed plant foods",
+            "Ruminant dairy and beef carry small natural amounts",
+            "partially hydrogenated oil, ESTIMATE rather than omitting",
+            // Purines: class-based, scaled, near 0 for the light classes.
+            "CLASS-BASED estimate from published purine tables",
+            "Near 0 for fruit, dairy, eggs and refined grains",
+            // Mercury: FDA means by species, 0 for non-seafood, no generic guess.
+            "FDA mean for the NAMED species",
+            "Write 0 for any non-seafood",
+            "Do NOT guess for an unnamed generic \"fish\": OMIT the key instead",
+            // Selenium: the Brazil-nut extreme and soil variance.
+            "Brazil nuts are the extreme — about 68-91 ug in ONE nut",
+            "ORDER OF MAGNITUDE",
+            // Vitamin D: micrograms, IU ÷ 40.
+            "vitamin D in MICROGRAMS, never IU",
+            "DIVIDED BY 40 (400 IU = 10 ug)",
+            // Cholesterol: 0 for plants.
+            "Write 0 for ALL plant foods",
+            // Everything is scaled to what was logged.
+            "scaled to the amount logged",
+            "scaled to the grams logged",
+        ] {
+            assert!(
+                p.contains(fragment),
+                "extract prompt must state: {fragment}"
+            );
+        }
+        // The seven keys and their columns are both in the prompt (schema + header).
+        for c in NUTRIENT_COLUMNS
+            .iter()
+            .filter(|c| c.fill == FillClass::EstimatedRisk)
+        {
+            assert!(p.contains(c.key), "prompt must name {:?}", c.key);
+            assert!(p.contains(c.csv), "inlined header must carry {:?}", c.csv);
+            assert!(
+                c.guidance.is_some(),
+                "every risk nutrient owns a guidance bullet: {:?}",
+                c.key
+            );
+        }
+    }
 
     #[test]
     fn extract_prompt_states_every_nutrient_branch() {
@@ -4442,6 +5117,11 @@ Calcium_mg,Omega3_mg,Magnesium_mg"
         // The defect, asserted gone: the old contract said a nutrient came only from a
         // label "or a confident estimate" and that potassium/calcium/magnesium are
         // "usually absent" from labels so "usually omitted". The child obeyed.
+        //
+        // This guard is about the EXPECTED micros. The EstimatedRisk columns state their
+        // own estimate-or-omit rule in their own words ("ESTIMATE THESE, or omit them"),
+        // which is correct for nutrients no label prints — it must not be reworded back
+        // into the phrases below.
         let p = build_diet_extract_prompt("ate a banana", "the user");
         for gone in [
             "usually absent",
@@ -4651,6 +5331,46 @@ Calcium_mg,Omega3_mg,Magnesium_mg"
     }
 
     #[test]
+    fn completion_and_completeness_ignore_the_risk_nutrients() {
+        // The seven risk columns are EstimatedRisk, not ExpectedWhenKnowable: the local
+        // extract fills them from its own guidance, and the hosted completion pass is
+        // deliberately left as it was — it neither fills them nor counts a blank one as
+        // incomplete, so the probation completeness figure keeps its old denominator.
+        let mut e = blank_food("Banana");
+        let mut c = banana_completion();
+        for key in [
+            "cholesterol_mg",
+            "trans_fat_g",
+            "added_sugar_g",
+            "purines_mg",
+            "mercury_ug",
+            "selenium_ug",
+            "vitamin_d_ug",
+        ] {
+            c.values.insert(key.into(), 1.0);
+        }
+        let filled = complete_food_micros(&mut e, &c);
+        assert_eq!(
+            filled,
+            expected_nutrient_count(),
+            "only the EXPECTED columns are completed"
+        );
+        assert!(
+            NUTRIENT_COLUMNS
+                .iter()
+                .filter(|c| c.fill == FillClass::EstimatedRisk)
+                .all(|c| c.get(&e).is_none()),
+            "a value volunteered for a risk column is ignored, not written"
+        );
+        assert!(
+            missing_expected_nutrients(&e).is_empty(),
+            "blank risk columns are not incomplete data"
+        );
+        let (filled, expected) = nutrient_completeness(std::slice::from_ref(&e));
+        assert_eq!((filled, expected), (7, 7), "the denominator is unchanged");
+    }
+
+    #[test]
     fn an_unknowable_composite_row_is_skipped_entirely() {
         let mut e = blank_food("House sauce");
         e.unknowable_composite = true;
@@ -4851,13 +5571,13 @@ Calcium_mg,Omega3_mg,Magnesium_mg"
             "one line: {notes:?}"
         );
         assert_eq!(notes, "USDA SR Legacy 09040 banana raw, scaled to 118 g");
-        // The comma still forces RFC-4180 quoting, and the row keeps 22 fields.
+        // The comma still forces RFC-4180 quoting, and the row keeps 29 fields.
         let row = food_row(&e, "2026-07-25");
         let mut rdr = csv::ReaderBuilder::new()
             .has_headers(false)
             .from_reader(row.as_bytes());
         let rec = rdr.records().next().unwrap().unwrap();
-        assert_eq!(rec.len(), 22);
+        assert_eq!(rec.len(), 29);
         assert_eq!(&rec[11], &notes, "Notes cell round-trips intact");
     }
 
