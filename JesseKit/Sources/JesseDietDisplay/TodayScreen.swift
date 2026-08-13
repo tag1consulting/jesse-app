@@ -378,7 +378,8 @@ struct TodayScreen: View {
             NavigationLink {
                 MacrosCaloriesDetail(today: today, hour: hour, neutral: isNeutral,
                                      nutrientSeries: snapshot.nutrientSeries,
-                                     isHistorical: snapshot.isHistorical)
+                                     isHistorical: snapshot.isHistorical,
+                                     sourceSeries: snapshot.sourceSeries)
             } label: {
                 NavRow(title: "Macros & calories", icon: "chart.bar.fill",
                        subtitle: macrosSubtitle)

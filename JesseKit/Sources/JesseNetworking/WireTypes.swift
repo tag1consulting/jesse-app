@@ -607,17 +607,25 @@ public struct JesseMeal: Decodable, Equatable, Sendable {
     public let fiberGrams: Double?
     // The HealthKit-bound micronutrients, each pre-summed by the bridge over only the
     // meal's items that carried a known value (absent when none did — never a summed 0).
+    // Only the nutrients with a real HealthKit type ride this wire: trans fat, added sugar,
+    // purines and mercury are gauge-only (no clean type — `dietarySugar` is TOTAL sugar,
+    // which added sugar is not) and are deliberately absent here.
     public let sodiumMg: Double?
     public let satFatGrams: Double?
     public let sugarGrams: Double?
     public let potassiumMg: Double?
     public let calciumMg: Double?
     public let magnesiumMg: Double?
+    public let cholesterolMg: Double?
+    public let seleniumUg: Double?
+    public let vitaminDUg: Double?
     public init(id: String, consumedAt: String, name: String, kcal: Double?,
                 proteinGrams: Double?, carbGrams: Double?, fatGrams: Double?,
                 fiberGrams: Double?, sodiumMg: Double? = nil, satFatGrams: Double? = nil,
                 sugarGrams: Double? = nil, potassiumMg: Double? = nil,
-                calciumMg: Double? = nil, magnesiumMg: Double? = nil) {
+                calciumMg: Double? = nil, magnesiumMg: Double? = nil,
+                cholesterolMg: Double? = nil, seleniumUg: Double? = nil,
+                vitaminDUg: Double? = nil) {
         self.id = id
         self.consumedAt = consumedAt
         self.name = name
@@ -632,6 +640,9 @@ public struct JesseMeal: Decodable, Equatable, Sendable {
         self.potassiumMg = potassiumMg
         self.calciumMg = calciumMg
         self.magnesiumMg = magnesiumMg
+        self.cholesterolMg = cholesterolMg
+        self.seleniumUg = seleniumUg
+        self.vitaminDUg = vitaminDUg
     }
     enum CodingKeys: String, CodingKey {
         case id, consumedAt, name, kcal
@@ -645,6 +656,9 @@ public struct JesseMeal: Decodable, Equatable, Sendable {
         case potassiumMg = "potassium_mg"
         case calciumMg = "calcium_mg"
         case magnesiumMg = "magnesium_mg"
+        case cholesterolMg = "cholesterol_mg"
+        case seleniumUg = "selenium_ug"
+        case vitaminDUg = "vitamin_d_ug"
     }
 }
 

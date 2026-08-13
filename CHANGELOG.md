@@ -13,6 +13,88 @@ Every commit that changes a component **must** bump that component's version and
 add an entry here — enforced by `scripts/version-guard.sh` (the pre-push hook and
 CI both run it). See the "Versioning" section of `bridge/README.md`.
 
+## [App 1.0 (105)] - 2026-08-13
+
+### Added
+
+- **Seven more tracked nutrients, and two gauge shapes the Health tab did not have.**
+  Cholesterol, trans fat, added sugar, purines, mercury, selenium and vitamin D now ride
+  the per-item snapshot (`chol`/`tfat`/`asug`/`pur`/`hg`/`se`/`vd`), each with the same
+  unknown-aware treatment every micronutrient already had: an unmeasured food is UNKNOWN,
+  never zero, so a partial total renders "≥", carries its "N items not estimated" caption,
+  and lists those items under "Not estimated" in the drill-down rather than dropping them.
+
+  Trans fat and added sugar are ceilings, vitamin D a floor, cholesterol and purines are
+  informational and never judged, and two of them needed shapes that did not exist:
+
+  **BAND** (selenium, 55–300 µg). A range with a floor to reach and a ceiling to stay
+  under, and the first goal on the tab whose two edges are not symmetric under partial
+  data. A known-only sum is a LOWER BOUND, and a lower bound proves exactly one direction:
+  it CAN establish that the ceiling was crossed (the unmeasured foods can only add more),
+  and it can NEVER establish that the floor was missed (they could carry it well past). So
+  a partly-measured day above the ceiling is judged, and a partly-measured day under the
+  floor claims nothing at all — it reads "at least 30µg so far", not "short". The identical
+  number on a fully-measured day reads "25µg to the 55µg floor", because there the
+  shortfall was actually measured. That asymmetry lives in `DietSemantics.bandGoalStatus`,
+  not in a view, and the model is told about it too: the insight grounding carries an
+  authoritative "no shortfall has been established" fact and the discard guard throws away
+  any generation that reports one anyway.
+
+  **ROLLING WINDOW** (mercury, 105 µg per 7 days; omega-3 alongside it as context). Some
+  limits are defined over a week, and methylmercury's is — one tuna steak is not a problem,
+  one every day is. The row reads the generator's own `rolling7` block (a window SUM plus
+  its known/unknown item counts) rather than fabricating a week out of one day, which would
+  be today's number wearing a week's label. Mercury has no daily row anywhere as a result.
+  The span is stated four ways — a section of its own, "(7-day)" in the row's name, a `7d`
+  chip, and a footnote — the grounding hands the model the scope as ground truth, and the
+  guard discards any insight that calls the number today's. Its drill-down lists the
+  trailing seven days' contributors from `sourceSeries`, summed per food, not today's meals.
+
+  Three things about that block are not what the rest of the payload would lead you to
+  guess, and all three are now pinned by a decode test written against the generator's real
+  output: it rides INSIDE `today` rather than beside it; its `nutrients` map is keyed by LOG
+  COLUMN key (`mercury_ug`, `omega3_mg`) rather than the short app key (`hg`, `o3`) every
+  per-item field uses; and its `known` is the SUMMED VALUE, with the counts spelled
+  `knownCount`/`unknownCount`. Every member decodes tolerantly, because `decodeIfPresent`
+  throws on a present-but-malformed value — an optional section getting its shape wrong
+  would otherwise fail the whole `GET /jesse/diet` decode and blank the Health tab.
+
+- **Cholesterol says the thing worth saying.** Food contains no HDL and no LDL — those are
+  carriers the blood makes — so there is no target, no colour, and the education copy names
+  the levers that DO move LDL and are already tracked: saturated fat, trans fat, fiber.
+
+- **Every nutrient's education names its accuracy class**, because these are not equally
+  good estimates and reading a species average with a label's confidence is its own error:
+  label-derived and near-exact (added sugar, trans fat), a solid database lookup
+  (cholesterol, vitamin D), high natural variance (selenium, an order of magnitude with the
+  soil), and a species average with a wide within-species spread (purines, mercury) that is
+  explicitly not to be read as a precise figure.
+
+- **Cholesterol, selenium and vitamin D reach Apple Health**; the other four do not.
+  `cholesterol_mg` / `selenium_ug` / `vitamin_d_ug` join the `JESSE_MEAL_LOG` meal block
+  under the same id, idempotency and additive rules as dietary fiber — summed over known
+  values only, no sample when nothing was measured, and a genuine measured 0 written
+  because that is a fact rather than an absence. Trans fat, purines and mercury have no
+  HealthKit type; added sugar deliberately does not borrow `dietarySugar`, which is TOTAL
+  sugar and would understate the real total in Health. The correction path already deleted
+  a correlation's contained samples by ENUMERATING them rather than assuming a count, so
+  the three new types flow through it with no change to that code.
+
+- **The nutrient tree grew a second level.** Added sugar nests under total sugars the way a
+  label prints "Total Sugars / Includes Xg Added Sugars", so `Micronutrient.parent` is now a
+  nutrient rather than only a macro, and the canonical order is built by recursion instead
+  of a hand-kept list. Cholesterol and trans fat nest under Fat.
+
+- **Two numbers that looked like constants are on the wire.** `targets.mercury_weekly` and
+  `targets.purines` are emitted per day, so the weekly mercury ceiling and the purine
+  note line are read from the day rather than compiled in. The standing values (105 µg,
+  500 mg) remain as documented fallbacks for a day that recorded neither, on the same
+  principle as fiber's 38 g default.
+
+### Notes
+
+- Every field added here is additive and decodes absent → nil, so a generator that does not
+  emit one changes nothing: the row simply does not appear.
 ## [Bridge 0.81.0] - 2026-08-13
 
 ### Added

@@ -63,12 +63,14 @@ final class MealHealthWriterTests: XCTestCase {
     private final class AckCapture { var seqs: [Int] = [] }
 
     private func meal(_ id: String, kcal: Double? = 100, sodiumMg: Double? = nil,
-                      calciumMg: Double? = nil, at: TimeInterval = 1_780_000_000) -> Meal {
+                      calciumMg: Double? = nil, cholesterolMg: Double? = nil,
+                      at: TimeInterval = 1_780_000_000) -> Meal {
         Meal(id: id, consumedAt: Date(timeIntervalSince1970: at),
              name: "Meal \(id)", kcal: kcal, proteinGrams: nil, carbGrams: nil,
              fatGrams: nil, fiberGrams: nil, sodiumMg: sodiumMg,
              satFatGrams: nil, sugarGrams: nil, potassiumMg: nil,
-             calciumMg: calciumMg, magnesiumMg: nil)
+             calciumMg: calciumMg, magnesiumMg: nil,
+             cholesterolMg: cholesterolMg, seleniumUg: nil, vitaminDUg: nil)
     }
 
     private func batch(_ upserts: [Meal] = [], retract: [String] = [], seq: Int? = nil) -> MealBatch {
@@ -296,12 +298,14 @@ final class MealHealthWriterTests: XCTestCase {
     private func fullMeal(kcal: Double? = 100, sodiumMg: Double? = nil,
                           satFatGrams: Double? = nil, sugarGrams: Double? = nil,
                           potassiumMg: Double? = nil, calciumMg: Double? = nil,
-                          magnesiumMg: Double? = nil) -> Meal {
+                          magnesiumMg: Double? = nil, cholesterolMg: Double? = nil,
+                          seleniumUg: Double? = nil, vitaminDUg: Double? = nil) -> Meal {
         Meal(id: "m", consumedAt: Date(timeIntervalSince1970: 1_780_000_000),
              name: "M", kcal: kcal, proteinGrams: 20, carbGrams: 30, fatGrams: 10,
              fiberGrams: 5, sodiumMg: sodiumMg, satFatGrams: satFatGrams,
              sugarGrams: sugarGrams, potassiumMg: potassiumMg,
-             calciumMg: calciumMg, magnesiumMg: magnesiumMg)
+             calciumMg: calciumMg, magnesiumMg: magnesiumMg,
+             cholesterolMg: cholesterolMg, seleniumUg: seleniumUg, vitaminDUg: vitaminDUg)
     }
 
     private func samples(of meal: Meal, _ id: HKQuantityTypeIdentifier) -> [HKQuantitySample] {
@@ -340,7 +344,7 @@ final class MealHealthWriterTests: XCTestCase {
     }
 
     func testMealWithNoMicronutrientsWritesOnlyTheFiveMacroSamples() {
-        let m = fullMeal()   // all six micronutrients nil
+        let m = fullMeal()   // all nine micronutrients nil
         let count = HealthKitMealWriter.samples(for: m).count
         XCTAssertEqual(count, 5, "no micronutrient values ⇒ only the five macro samples")
     }
@@ -366,12 +370,104 @@ final class MealHealthWriterTests: XCTestCase {
                       "an all-unknown magnesium writes no sample")
     }
 
-    func testMealWithEveryMicronutrientWritesElevenSamplesAndNoOmega3() {
-        // Five macros + six HealthKit micros = eleven; omega-3 and unsaturated fat are
-        // NOT written (no HealthKit type / gauge-only), so there is no twelfth sample.
+    func testMealWithEveryMicronutrientWritesFourteenSamplesAndNoGaugeOnlyOnes() {
+        // Five macros + nine HealthKit micros = fourteen. The gauge-only nutrients —
+        // omega-3, unsaturated fat, trans fat, added sugar, purines, mercury — are NOT
+        // written (no HealthKit type that means the same thing), so there is no fifteenth.
         let m = fullMeal(sodiumMg: 800, satFatGrams: 3, sugarGrams: 12, potassiumMg: 500,
-                         calciumMg: 250, magnesiumMg: 90)
-        XCTAssertEqual(HealthKitMealWriter.samples(for: m).count, 11,
-                       "five macros plus the six HealthKit-bound micronutrients")
+                         calciumMg: 250, magnesiumMg: 90, cholesterolMg: 95,
+                         seleniumUg: 92, vitaminDUg: 5.7)
+        XCTAssertEqual(HealthKitMealWriter.samples(for: m).count, 14,
+                       "five macros plus the nine HealthKit-bound micronutrients")
+    }
+
+    // MARK: - The three risk nutrients that DO reach Apple Health
+
+    func testCholesterolSeleniumAndVitaminDWriteFromTheirKnownSums() {
+        let m = fullMeal(cholesterolMg: 95, seleniumUg: 92, vitaminDUg: 5.7)
+        let chol = samples(of: m, .dietaryCholesterol)
+        XCTAssertEqual(chol.count, 1)
+        XCTAssertEqual(chol[0].quantity.doubleValue(for: .gramUnit(with: .milli)), 95,
+                       accuracy: 0.001, "cholesterol in milligrams")
+        let se = samples(of: m, .dietarySelenium)
+        XCTAssertEqual(se.count, 1)
+        XCTAssertEqual(se[0].quantity.doubleValue(for: .gramUnit(with: .micro)), 92,
+                       accuracy: 0.001, "selenium in MICROgrams — milligrams would be 1000x off")
+        let vd = samples(of: m, .dietaryVitaminD)
+        XCTAssertEqual(vd.count, 1)
+        XCTAssertEqual(vd[0].quantity.doubleValue(for: .gramUnit(with: .micro)), 5.7,
+                       accuracy: 0.001, "vitamin D in micrograms")
+    }
+
+    func testAllUnknownRiskNutrientsWriteNoSampleAtAll() {
+        // nil ⇒ no item in the meal carried a value ⇒ NO sample. Never a 0 guess: a zero
+        // sample in Health would read as "this meal supplied none", which nobody measured.
+        let m = fullMeal(sodiumMg: 800)   // the three risk nutrients nil
+        XCTAssertTrue(samples(of: m, .dietaryCholesterol).isEmpty)
+        XCTAssertTrue(samples(of: m, .dietarySelenium).isEmpty)
+        XCTAssertTrue(samples(of: m, .dietaryVitaminD).isEmpty)
+    }
+
+    func testAGenuineZeroDoesWriteASample() {
+        // The other half of the rule, and the reason nil and 0 are kept distinct all the
+        // way down: a MEASURED zero is a fact about the meal, so it is written.
+        let m = fullMeal(cholesterolMg: 0, seleniumUg: 0, vitaminDUg: 0)
+        for id in [HKQuantityTypeIdentifier.dietaryCholesterol, .dietarySelenium, .dietaryVitaminD] {
+            let s = samples(of: m, id)
+            XCTAssertEqual(s.count, 1, "a known 0 is a fact and must be written: \(id.rawValue)")
+            XCTAssertEqual(s[0].quantity.doubleValue(for: .gramUnit(with: .micro)), 0)
+        }
+    }
+
+    func testTheGaugeOnlyRiskNutrientsReachNoHealthKitTypeAtAll() {
+        // Trans fat, added sugar, purines and mercury are not on the meal wire and have no
+        // field on `Meal`, so no sample can carry them. The check that matters is that
+        // added sugar did NOT get folded into `dietarySugar`, which is TOTAL sugar: a meal
+        // with a known total sugar writes exactly that number and nothing else.
+        let m = fullMeal(sugarGrams: 12)
+        XCTAssertEqual(samples(of: m, .dietarySugar).count, 1)
+        XCTAssertEqual(samples(of: m, .dietarySugar)[0].quantity.doubleValue(for: .gram()), 12)
+        XCTAssertEqual(HealthKitMealWriter.samples(for: m).count, 6,
+                       "five macros plus the one known micronutrient — nothing invented")
+    }
+
+    // MARK: - The correction path enumerates the samples it rewrites
+
+    func testTheCorrectionPathRewritesEverySampleTypeByEnumeration() async {
+        // The upsert/correction path is delete-then-write, and the delete side removes the
+        // correlation TOGETHER WITH `correlation.objects` — an ENUMERATION of whatever
+        // samples are present, never a hardcoded count. This asserts the property that
+        // makes it additive: the sample set for a meal is exactly what `samples(for:)`
+        // produces for that meal's present nutrients, so the three new types flow through
+        // the same enumeration the existing eleven do, with no change to the delete code.
+        let before = fullMeal(sodiumMg: 800)
+        let after = fullMeal(sodiumMg: 800, cholesterolMg: 95, seleniumUg: 92, vitaminDUg: 5.7)
+        XCTAssertNotEqual(before.contentHash, after.contentHash,
+                          "gaining the three nutrients must change the hash, or no rewrite fires")
+        XCTAssertEqual(HealthKitMealWriter.samples(for: before).count, 6)
+        XCTAssertEqual(HealthKitMealWriter.samples(for: after).count, 9,
+                       "the rewritten correlation carries all three new types")
+
+        // And the writer really does perform the delete-then-write for that change.
+        let w = FakeMealWriter(); let p = InMemoryPending(); let ack = AckCapture()
+        let store = InMemoryWrittenStore()
+        store.records["m"] = WrittenMealRecord(contentHash: before.contentHash, tombstoned: false)
+        await makeWriter(w, p, ack).apply(batch([after], seq: 1), written: store)
+        let log = await w.log()
+        XCTAssertEqual(log, [.delete("m"), .write("m")],
+                       "a meal that gained the new nutrients is deleted and rewritten once")
+        XCTAssertEqual(store.record(for: "m")?.contentHash, after.contentHash)
+    }
+
+    func testTheContentHashDistinguishesAbsentFromZeroForTheNewNutrients() {
+        // The canonical hash EXCLUDES an absent nutrient, so a meal gaining its first
+        // selenium estimate hashes differently and triggers exactly one rewrite — while a
+        // measured 0 is present and hashes as such.
+        let absent = fullMeal()
+        let zero = fullMeal(seleniumUg: 0)
+        let known = fullMeal(seleniumUg: 92)
+        XCTAssertNotEqual(absent.contentHash, zero.contentHash)
+        XCTAssertNotEqual(zero.contentHash, known.contentHash)
+        XCTAssertEqual(absent.contentHash, fullMeal().contentHash, "and it is stable")
     }
 }

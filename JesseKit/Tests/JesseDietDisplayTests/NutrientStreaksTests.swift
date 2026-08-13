@@ -238,7 +238,18 @@ final class NutrientStreaksTests: XCTestCase {
         XCTAssertTrue(NutrientStreaks.judgedNutrients.contains(.p))
         XCTAssertTrue(NutrientStreaks.judgedNutrients.contains(.na))
         XCTAssertTrue(NutrientStreaks.judgedNutrients.contains(.f))
-        XCTAssertEqual(NutrientStreaks.judgedNutrients.count, 11)
+        // The three risk nutrients with a single-number day goal DO hold a streak; the
+        // four that carry no per-day verdict (cholesterol and purines are informational,
+        // selenium's goal is a band, mercury's is weekly) never can.
+        for n in [TrendNutrient.tfat, .asug, .vd] {
+            XCTAssertTrue(NutrientStreaks.judgedNutrients.contains(n),
+                          "\(n.fullName) has a day goal and so has a streak")
+        }
+        for n in [TrendNutrient.chol, .pur, .se, .hg] {
+            XCTAssertFalse(NutrientStreaks.judgedNutrients.contains(n),
+                           "\(n.fullName) carries no per-day verdict, so no streak")
+        }
+        XCTAssertEqual(NutrientStreaks.judgedNutrients.count, 14)
 
         // Even with a target and plenty of measured days, an informational nutrient produces
         // no decided day and so never appears in the list.

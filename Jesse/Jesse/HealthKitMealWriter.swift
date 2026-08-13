@@ -23,9 +23,11 @@ nonisolated struct HealthKitMealWriter: MealWriting {
     /// `NSInvalidArgumentException` at the `requestAuthorization` call if one appears
     /// here. Saving the `.food` `HKCorrelation` needs no container grant — share
     /// authorization for every sample it contains is sufficient, so each quantity type
-    /// a meal may carry (the five macros plus the six HealthKit-bound micronutrients)
-    /// must be in this set. Omega-3 is gauge-only (no HealthKit EPA+DHA type) and so is
-    /// absent here. Guarded by `HealthKitAuthorizationTypesTests`.
+    /// a meal may carry (the five macros plus the nine HealthKit-bound micronutrients)
+    /// must be in this set. The gauge-only nutrients are absent here because HealthKit has
+    /// no type that means the same thing: omega-3 (no EPA+DHA type), trans fat, purines,
+    /// mercury, and added sugar (`dietarySugar` is TOTAL sugar, not the added share).
+    /// Guarded by `HealthKitAuthorizationTypesTests`.
     static let shareTypes: Set<HKSampleType> = [
         HKQuantityType(.dietaryEnergyConsumed),
         HKQuantityType(.dietaryProtein),
@@ -38,6 +40,9 @@ nonisolated struct HealthKitMealWriter: MealWriting {
         HKQuantityType(.dietaryPotassium),
         HKQuantityType(.dietaryCalcium),
         HKQuantityType(.dietaryMagnesium),
+        HKQuantityType(.dietaryCholesterol),
+        HKQuantityType(.dietarySelenium),
+        HKQuantityType(.dietaryVitaminD),
     ]
 
     /// The representative type whose share status stands for "meal writing" (they
@@ -48,9 +53,12 @@ nonisolated struct HealthKitMealWriter: MealWriting {
     /// present micronutrient — as a pure function so the sample set is unit-testable
     /// without a save (`MealHealthWriterTests`). A nil / negative / non-finite value
     /// writes NO sample (never a zero), so a micronutrient with no known value across
-    /// the meal (nil on the `Meal`) is simply omitted. The existing five macro samples
-    /// are unchanged; the six micronutrients are additive — sodium/potassium/calcium/
-    /// magnesium in milligrams (`HKUnit` gram-milli), saturated fat and sugars in grams.
+    /// the meal (nil on the `Meal`) is simply omitted. A genuine measured 0 DOES
+    /// write a sample — it is a fact ("this meal supplied none"), not an absence of data,
+    /// and the two are told apart upstream by nil vs 0. The existing five macro samples
+    /// are unchanged; the nine micronutrients are additive — sodium/potassium/calcium/
+    /// magnesium/cholesterol in milligrams (`HKUnit` gram-milli), saturated fat and sugars
+    /// in grams, selenium and vitamin D in micrograms.
     static func samples(for meal: Meal) -> Set<HKSample> {
         var samples: Set<HKSample> = []
         func add(_ id: HKQuantityTypeIdentifier, _ unit: HKUnit, _ value: Double?) {
@@ -70,6 +78,9 @@ nonisolated struct HealthKitMealWriter: MealWriting {
         add(.dietaryPotassium, .gramUnit(with: .milli), meal.potassiumMg)
         add(.dietaryCalcium, .gramUnit(with: .milli), meal.calciumMg)
         add(.dietaryMagnesium, .gramUnit(with: .milli), meal.magnesiumMg)
+        add(.dietaryCholesterol, .gramUnit(with: .milli), meal.cholesterolMg)
+        add(.dietarySelenium, .gramUnit(with: .micro), meal.seleniumUg)
+        add(.dietaryVitaminD, .gramUnit(with: .micro), meal.vitaminDUg)
         return samples
     }
 
@@ -152,8 +163,10 @@ nonisolated struct HealthKitMealWriter: MealWriting {
     /// Selection is `deletePredicate(id:)` — this app's own food correlations carrying
     /// that external id — and each match is deleted **together with its `.objects`** (the
     /// contained samples), because correlation deletion does not cascade and there are up
-    /// to eleven quantity types per meal, so we enumerate the present samples rather than
-    /// assume a count. A correlation's contained samples were saved with it, so scoping
+    /// to fourteen quantity types per meal, so we enumerate the present samples rather than
+    /// assume a count. Enumeration — not a count — is what makes this additive: every
+    /// nutrient added since has flowed through `correlation.objects` with no change here,
+    /// and the three newest do too. A correlation's contained samples were saved with it, so scoping
     /// the correlation to this app's source scopes its objects too.
     ///
     /// Idempotent by contract: an id matching nothing returns `true` (already absent), so

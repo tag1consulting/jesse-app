@@ -46,22 +46,37 @@ struct HealthInsightInput: Equatable, Sendable {
     /// behind the "N items not estimated" caption. Both 0 for a macro/calorie.
     let knownItemCount: Int
     let unknownItemCount: Int
-    /// Informational-only metric (total sugars): grounded with composition and top
-    /// contributors, NEVER a judgment. The prompt forbids over/too-much language and the
-    /// guard discards a generation that renders one. Always false for a macro/calorie.
+    /// Informational-only metric (total sugars, unsaturated fat, cholesterol, purines):
+    /// grounded with composition and top contributors, NEVER a judgment. The prompt forbids
+    /// over/too-much language and the guard discards a generation that renders one. Always
+    /// false for a macro/calorie.
     let informational: Bool
+    /// Set when `total` is a TRAILING-WINDOW total rather than today's (mercury's 7-day
+    /// sum): the number of days it covers. The prompt states the scope as ground truth and
+    /// the guard discards a generation that calls it today's — a weekly total misread as a
+    /// day's is the single worst thing this row could be made to say. Nil on every
+    /// day-scoped metric.
+    let windowDays: Int?
+    /// Set ONLY on a BAND metric whose known-only total sits under the floor on a PARTIAL
+    /// day. The lower bound proves nothing there — the unmeasured foods could carry it well
+    /// past the floor — so no shortfall exists to report, and the guard discards a
+    /// generation that reports one anyway. This is the model-facing half of
+    /// `DietSemantics.bandGoalStatus`'s asymmetry.
+    let unprovenShortfall: Bool
 
     // Defaulted memberwise init so a macro/calorie caller (and existing tests) build an
     // input without naming the micronutrient-only fields; a micronutrient caller sets them.
     init(metricLabel: String, unit: String, total: Double, goal: Double?,
          goalStatus: DietSemantics.GoalStatus, goalPhrase: String, dayStyle: String,
          foods: [FoodFact], partial: Bool = false, knownItemCount: Int = 0,
-         unknownItemCount: Int = 0, informational: Bool = false) {
+         unknownItemCount: Int = 0, informational: Bool = false,
+         windowDays: Int? = nil, unprovenShortfall: Bool = false) {
         self.metricLabel = metricLabel; self.unit = unit; self.total = total
         self.goal = goal; self.goalStatus = goalStatus; self.goalPhrase = goalPhrase
         self.dayStyle = dayStyle; self.foods = foods; self.partial = partial
         self.knownItemCount = knownItemCount; self.unknownItemCount = unknownItemCount
         self.informational = informational
+        self.windowDays = windowDays; self.unprovenShortfall = unprovenShortfall
     }
 
     /// The authoritative goal-status fact fed to the model — a single ground-truth line
@@ -88,6 +103,21 @@ struct HealthInsightInput: Equatable, Sendable {
         guard partial else { return nil }
         let items = "\(unknownItemCount) of \(knownItemCount + unknownItemCount) logged item\(unknownItemCount + knownItemCount == 1 ? "" : "s")"
         return "This total is PARTIAL — \(items) carry no measured \(metricLabel.lowercased()) value, so \(DietSemantics.fmt(total)) \(unit) is a floor (AT LEAST this much), never the complete total. Never state or imply it is the full/complete/entire total; if you name the number, say \"at least\"."
+    }
+
+    /// The authoritative SCOPE fact, present only on a window metric: what span the total
+    /// covers, and the standing instruction never to call it today's. Nil on a day metric,
+    /// so the prompt adds no scope line at all and reads exactly as it always has.
+    var scopeFact: String? {
+        guard let windowDays else { return nil }
+        return "This total covers the last \(windowDays) DAYS COMBINED, not today. Never say or imply it is today's amount, what they ate today, or a single day's figure; if you name the span, say \"over the last \(windowDays) days\"."
+    }
+
+    /// The authoritative fact for a band whose partial total sits under its floor: there is
+    /// no measured shortfall to report. Nil in every other state.
+    var unprovenShortfallFact: String? {
+        guard unprovenShortfall else { return nil }
+        return "The known total sits under the low edge of the range, but the day is only partly measured, so NO shortfall has been established. Never say they are short, low, under, below, deficient, or need more; say only that at least this much is known so far."
     }
 }
 
@@ -135,7 +165,9 @@ enum HealthInsight {
                       dayStyle: String,
                       contributions: [FoodContribution],
                       partial: Bool = false, knownItemCount: Int = 0,
-                      unknownItemCount: Int = 0, informational: Bool = false) -> HealthInsightInput {
+                      unknownItemCount: Int = 0, informational: Bool = false,
+                      windowDays: Int? = nil,
+                      unprovenShortfall: Bool = false) -> HealthInsightInput {
         let foods = contributions.prefix(groundingFoodCount).map {
             FoodFact(name: $0.name, value: $0.value, sharePct: Int(($0.share * 100).rounded()))
         }
@@ -144,7 +176,8 @@ enum HealthInsight {
             goal: goal, goalStatus: goalStatus, goalPhrase: goalPhrase,
             dayStyle: dayStyle, foods: Array(foods),
             partial: partial, knownItemCount: knownItemCount,
-            unknownItemCount: unknownItemCount, informational: informational)
+            unknownItemCount: unknownItemCount, informational: informational,
+            windowDays: windowDays, unprovenShortfall: unprovenShortfall)
     }
 
     /// How a metric is judged, in plain words for the insight grounding — the shared
@@ -155,6 +188,7 @@ enum HealthInsight {
         case .floor: return "a floor to hit or beat"
         case .ceiling: return "a ceiling to stay under"
         case .window: return "a target window"
+        case .band: return "a range with a floor to reach and a ceiling to stay under"
         }
     }
 }
@@ -178,6 +212,11 @@ enum HealthInsightPrompt {
         // An authoritative partiality line, present only when the total is a floor, so
         // the model states "at least" and never claims completeness.
         let partialLine = input.partialFact.map { "\nPARTIALITY (authoritative): \($0)" } ?? ""
+        // Scope and the unproven-shortfall rule ride as their own authoritative lines,
+        // present only when they apply, so a day-scoped metric's prompt is byte-identical
+        // to what it has always been.
+        let scopeLine = input.scopeFact.map { "\nSCOPE (authoritative): \($0)" } ?? ""
+        let unprovenLine = input.unprovenShortfallFact.map { "\nSHORTFALL (authoritative): \($0)" } ?? ""
         // For an informational metric (total sugars) the closing instruction forbids
         // any judgment — composition and top contributors only.
         let judgmentRule = input.informational
@@ -191,7 +230,7 @@ enum HealthInsightPrompt {
         Metric: \(input.metricLabel) — \(input.goalPhrase).
         Consumed so far: \(DietSemantics.fmt(input.total)) \(input.unit). \(goalLine)
         GOAL STATUS (authoritative — treat this as ground truth and never contradict \
-        it): \(input.goalStatusFact)\(partialLine)
+        it): \(input.goalStatusFact)\(partialLine)\(scopeLine)\(unprovenLine)
         Top contributing foods:
         \(foodLines)
 
@@ -278,15 +317,50 @@ enum HealthInsightGuard {
         return judgmentWords.contains(where: t.contains)
     }
 
+    /// Phrases that pin a number to TODAY — flagged on a window metric, whose total covers
+    /// several days combined. Negation-unaware on purpose, like the completeness check: a
+    /// weekly total is never today's, so any today-phrasing about it is wrong however it
+    /// is framed.
+    private static let todayClaims = [
+        " today", " today's", " so far today", " this morning", " this afternoon",
+        " this evening", " for the day", " on the day", " day's total", " daily total",
+    ]
+
+    /// Phrases that assert a SHORTFALL — flagged when the grounded facts say no shortfall
+    /// has been established (a partial band under its floor). The direction is what makes
+    /// this safe to check bluntly: the row is allowed to say what is known, and forbidden
+    /// only from claiming the goal was missed.
+    private static let shortfallClaims = [
+        " short", " shortfall", " low ", " too low", " below", " under the", " deficient",
+        " deficiency", " not enough", " need more", " needs more", " fall short", " lacking",
+    ]
+
+    /// Whether `text` presents the total as today's — the signal to discard on a window
+    /// metric, where the number covers several days combined.
+    static func claimsToday(_ text: String) -> Bool {
+        let t = " " + text.lowercased().replacingOccurrences(of: "’", with: "'") + " "
+        return todayClaims.contains(where: t.contains)
+    }
+
+    /// Whether `text` asserts a shortfall — the signal to discard when the facts say none
+    /// has been established.
+    static func claimsShortfall(_ text: String) -> Bool {
+        let t = " " + text.lowercased() + " "
+        return shortfallClaims.contains(where: t.contains)
+    }
+
     /// The full discard decision for a generation, given the grounded `input`: a
     /// generation is discarded when it (a) claims the goal was reached against a
-    /// non-met status, (b) claims the total is complete on a partial day, or (c)
-    /// renders a judgment for an informational metric. Any one is enough — a wrong
-    /// insight is worse than none.
+    /// non-met status, (b) claims the total is complete on a partial day, (c)
+    /// renders a judgment for an informational metric, (d) presents a WINDOW total as
+    /// today's, or (e) asserts a shortfall the facts have not established. Any one is
+    /// enough — a wrong insight is worse than none.
     static func contradicts(_ text: String, input: HealthInsightInput) -> Bool {
         if contradicts(text, status: input.goalStatus) { return true }
         if input.partial, claimsCompleteTotal(text) { return true }
         if input.informational, rendersJudgment(text) { return true }
+        if input.windowDays != nil, claimsToday(text) { return true }
+        if input.unprovenShortfall, claimsShortfall(text) { return true }
         return false
     }
 }

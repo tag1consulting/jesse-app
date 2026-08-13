@@ -358,4 +358,102 @@ final class FoodContributionsTests: XCTestCase {
         XCTAssertEqual(drill.insightInput.goalStatus, .noGoal)
         XCTAssertTrue(drill.insightInput.partial)
     }
+
+    // MARK: - Range breakdown (a rolling-window row's contributors)
+    //
+    // The window rows (mercury's weekly total) drill into the trailing days of the
+    // per-item `sourceSeries`, not into today's meals — a week's header over a day's
+    // food list would imply the week was one day long.
+
+    private func src(_ name: String, _ n: [String: Double]) -> SourceItem {
+        SourceItem(name: name, n: n)
+    }
+    private func srcDay(_ date: String, _ items: [SourceItem]) -> SourceDay {
+        SourceDay(date: date, items: items)
+    }
+
+    func testRangeBreakdownSumsSameNamedFoodsAcrossDays() {
+        let days = [
+            srcDay("2026-07-07", [src("Tuna steak", ["hg": 30]), src("Rice", ["hg": 0])]),
+            srcDay("2026-07-08", [src("Tuna steak", ["hg": 20]), src("Sardines", ["hg": 2])]),
+        ]
+        let bd = FoodContributions.breakdown(sourceDays: days, metric: .micronutrient(.mercury),
+                                             key: "hg", total: 52)
+        XCTAssertEqual(bd.contributions.map(\.name), ["Tuna steak", "Sardines"],
+                       "one row per food, summed across the range, most impact first")
+        XCTAssertEqual(bd.contributions.first?.value, 50)
+        XCTAssertEqual(bd.contributions.first?.share ?? 0, 50.0 / 52.0, accuracy: 0.0001)
+        XCTAssertFalse(bd.contributions.contains { $0.name == "Rice" },
+                       "a MEASURED zero is a non-contributor, never a 0 row")
+        XCTAssertTrue(bd.unknownFoods.isEmpty)
+        XCTAssertNil(bd.reconciliationNote)
+    }
+
+    func testRangeBreakdownSurfacesUnmeasuredFoodsOnceEach() {
+        let days = [
+            srcDay("2026-07-07", [src("Tuna", ["hg": 30]), src("Bread", ["na": 400])]),
+            srcDay("2026-07-08", [src("Bread", ["na": 400]), src("Soup", ["na": 900])]),
+        ]
+        let bd = FoodContributions.breakdown(sourceDays: days, metric: .micronutrient(.mercury),
+                                             key: "hg", total: 30)
+        XCTAssertTrue(bd.isPartial)
+        XCTAssertEqual(bd.unknownFoods.map(\.name), ["Bread", "Soup"],
+                       "an unmeasured food is listed ONCE however many days it appears on")
+        XCTAssertEqual(Set(bd.unknownFoods.map(\.id)).count, bd.unknownFoods.count,
+                       "ids stay unique so ForEach identity holds")
+    }
+
+    func testAFoodMeasuredOnOneDayAndNotAnotherIsAContributorNotAnUnknown() {
+        let days = [
+            srcDay("2026-07-07", [src("Tuna", ["hg": 30])]),
+            srcDay("2026-07-08", [src("Tuna", ["na": 20])]),   // no hg that day
+        ]
+        let bd = FoodContributions.breakdown(sourceDays: days, metric: .micronutrient(.mercury),
+                                             key: "hg", total: 30)
+        XCTAssertEqual(bd.contributions.map(\.name), ["Tuna"])
+        XCTAssertTrue(bd.unknownFoods.isEmpty,
+                      "it appears with what IS known, never in both groups at once")
+    }
+
+    func testRangeBreakdownSaysSoWhenTheListCannotAddUpToTheHeader() {
+        // The header is the generator's window aggregate; the list is the per-item series,
+        // which is capped to fewer days. A shortfall between two producers is real
+        // information — the day builder suppresses this note because there the two come
+        // from the same fields and reconcile by construction.
+        let days = [srcDay("2026-07-08", [src("Tuna", ["hg": 30])])]
+        let bd = FoodContributions.breakdown(sourceDays: days, metric: .micronutrient(.mercury),
+                                             key: "hg", total: 90)
+        XCTAssertNotNil(bd.reconciliationNote)
+        XCTAssertTrue(bd.reconciliationNote!.contains("fewer days"), bd.reconciliationNote!)
+    }
+
+    func testRangeBreakdownOnAnEmptySeriesIsHonestlyEmpty() {
+        let bd = FoodContributions.breakdown(sourceDays: [], metric: .micronutrient(.mercury),
+                                             key: "hg", total: 0)
+        XCTAssertTrue(bd.isEmpty)
+        XCTAssertEqual(bd.itemCount, 0)
+        XCTAssertFalse(bd.hasFoodButNoContributors)
+    }
+
+    // MARK: - The trailing-days window the range breakdown reads over
+
+    func testTrailingTakesCalendarDaysNotEntries() {
+        // Two logged days a fortnight apart: a 7-day window must reach back seven CALENDAR
+        // days, so the older one is out. Counting ENTRIES would have pulled it in and
+        // silently widened the span the header's number was computed over.
+        let days = [srcDay("2026-06-25", [src("Old", ["hg": 99])]),
+                    srcDay("2026-07-08", [src("New", ["hg": 10])])]
+        let kept = FoodContributions.trailing(days, count: 7, through: "2026-07-09")
+        XCTAssertEqual(kept.map(\.date), ["2026-07-08"])
+    }
+
+    func testTrailingIsInclusiveOnBothEndsAndFallsBackToTheLastDate() {
+        let days = (3...9).map { srcDay(String(format: "2026-07-%02d", $0), [src("f", ["hg": 1])]) }
+        XCTAssertEqual(FoodContributions.trailing(days, count: 7, through: "2026-07-09").count, 7)
+        XCTAssertEqual(FoodContributions.trailing(days, count: 7, through: nil).map(\.date).last,
+                       "2026-07-09", "no through-date given → anchor on the last date present")
+        XCTAssertEqual(FoodContributions.trailing(days, count: 2, through: "2026-07-09")
+                        .map(\.date), ["2026-07-08", "2026-07-09"])
+        XCTAssertTrue(FoodContributions.trailing(days, count: 0, through: nil).isEmpty)
+    }
 }
