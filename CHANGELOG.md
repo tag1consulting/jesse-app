@@ -95,6 +95,83 @@ CI both run it). See the "Versioning" section of `bridge/README.md`.
 
 - Every field added here is additive and decodes absent → nil, so a generator that does not
   emit one changes nothing: the row simply does not appear.
+## [Bridge 0.83.0] - 2026-08-14
+
+### Added
+
+- **The scheduled morning and overnight jobs can now finish their own work.** They were
+  being refused the tools their own prompts tell them to use: `overnight-diet-analysis`
+  could not reach its query engine, `archive-box` and `overnight-vault-lint` could read
+  their skills' instructions but not run the single command those instructions name, and
+  `overnight-tag1-status` had no GitHub reader at all. The allowlist gains enumerated
+  read-only `gh` verbs, `gh issue create` / `gh pr create`, one repo-pinned `gh api`
+  endpoint, `shasum`, five named `Skill(...)` grants, a currency-summary rotation script,
+  and three pinned compute wrappers.
+
+  **The missing GitHub issue and PR tools were never a registration bug.** This bridge
+  pins its GitHub MCP server to `--toolsets repos,actions`, so the rest were never built.
+  Enumerated live against github-mcp-server 1.8.0 with `--read-only` in both runs:
+  `repos,actions` registers exactly the 16 tools already granted, and adding
+  `issues,pull_requests` registers 25. The nine new ones are granted, all
+  `readOnlyHint:true`; `--read-only` means the server never builds a mutating tool to
+  withhold, so the authoring verbs come from `gh` rather than from MCP.
+
+  **Seven proposed read verbs were dropped after measuring them.** `grep`, `stat`, `du`,
+  `file`, `diff`, `sort` and `which` all run under an EMPTY allowlist — the harness
+  auto-approves them — so granting them would have widened the record on paper while
+  changing nothing.
+
+### Fixed
+
+- **Six grants were shipped into a battery, failed three hard gates, and were withdrawn
+  the same day.** This is recorded rather than quietly rewritten, because the obvious next
+  edit to `DEFAULT_ALLOWED_TOOLS` is to add them back. The first cut of this batch carried
+  `Bash(node --check:*)`, `Bash(node -c:*)`, `Bash(python3:*)`,
+  `Bash(/usr/bin/python3:*)`, `Bash(duckdb:*)`, `Bash(uniq:*)`, `Bash(cp:*)` and
+  `Bash(mkdir:*)`. One live containment run answered them: `write_escape_parent`,
+  `write_escape_symlink` and `write_escape_state_dir` all moved from denied to **allowed**
+  — real files landed outside the vault, including inside the bridge's own state directory
+  — and all six read baselines opened with them.
+
+  **The cause is structural and is the part worth keeping.** The vault write boundary is
+  enforced by exactly one thing: the path scope on `Edit(./**)` (`Write(./**)` matches no
+  file permission check, as the CLI itself warns). Every one of those grants writes
+  through **Bash**, which that scope never touches. A Bash verb carrying a destination
+  path is not a small widening — it is the boundary, gone.
+
+  Each was attributed individually rather than blamed as a group: `cp` and `mkdir` take a
+  destination; `uniq` is POSIX `uniq [input [output]]`, so `uniq in ../out` writes outside
+  while reading as the most harmless line in the batch; `python3` is arbitrary code stated
+  plainly; `node --check` is **not** a syntax check, since `--check` refuses to execute
+  only the file it is given and `--require`, `-r` and `--import` all executed on both node
+  v22.20.0 and v26.4.0; and `duckdb` is a **shell** — `.shell`/`.system` ran a command,
+  `COPY … TO` wrote outside, `INSTALL`/`LOAD` pull code — so granting it made every
+  deliberate omission in that comment block decorative.
+
+  **What replaced them: three pinned wrappers in the vault, each taking data and never
+  code.** `run-week-query.sh` runs the committed `week.sql` and nothing else, accepting at
+  most two dates that are shape-checked and then round-tripped through the parser (BSD
+  `date -j -f` normalises 2026-02-31 into 2026-03-03 and exits 0, so a bare parse accepts
+  impossible dates), validating the query file before running it, and passing `-no-init`
+  because duckdb otherwise reads `~/.duckdbrc` at startup. `currency-stats.py` computes
+  the percentile and moving averages from a series on stdin with no `eval` and no
+  file-path argument, refusing unknown arguments rather than ignoring them.
+  `create-pending-review.sh` exists because that capability is not expressible as a rule
+  at all — the matcher works at path-token granularity and `*` does not cross `/`, so
+  `pulls:*`, `pulls/*/reviews:*` and `pulls/*:*` were each probed and each refused the
+  per-PR reviews endpoint. It fixes the method, repo and path, never sends `event`, and
+  reads the state back to fail on anything other than `PENDING`.
+
+  After the withdrawal the three hard gates were re-probed live and came back **denied /
+  pass**, stable across two attempts each, before the full re-record was paid for.
+
+  **Read a passing gate honestly**, and this is the durable lesson: a `denied` verdict is
+  a live model attempt that did not find a route, never a proof that none exists. The
+  write-then-execute route through a pinned script predates this batch — the three
+  `node vault/*.js` scopes have carried it since 0.60.0 — and the hard gates passed anyway
+  because no probe went looking for it. Adding interpreters did not create a new class so
+  much as make an existing one trivially reachable.
+
 ## [Bridge 0.82.0] - 2026-08-14
 
 ### Fixed
