@@ -359,7 +359,7 @@ struct NutrientTrendDetail: View {
                     .foregroundStyle(ruleColor.opacity(0.7))
                     .lineStyle(StrokeStyle(lineWidth: 1, dash: [4, 3]))
                     .annotation(position: .top, alignment: .leading) {
-                        Text("\(NutrientTrends.fmt(target)) \(nutrient.unit) \(kindWord)")
+                        Text("\(NutrientTrends.fmt(target, nutrient)) \(nutrient.unit) \(kindWord)")
                             .font(.caption2).foregroundStyle(ruleColor)
                     }
             }
@@ -407,7 +407,7 @@ struct NutrientTrendDetail: View {
                                              isPartial: p.isPartial, target: basis)
         return VStack(alignment: .leading, spacing: 2) {
             Text(p.id).font(.caption2).foregroundStyle(.secondary)
-            Text("\(p.isPartial ? "≥" : "")\(NutrientTrends.fmt(p.value)) \(nutrient.unit)")
+            Text("\(p.isPartial ? "≥" : "")\(NutrientTrends.fmt(p.value, nutrient)) \(nutrient.unit)")
                 .font(.caption.weight(.semibold).monospacedDigit())
                 .foregroundStyle(p.dayTarget == nil || status == .suspended
                                  ? Color.primary : statusColor(status))
@@ -415,7 +415,7 @@ struct NutrientTrendDetail: View {
             // it — the one number a reader of this chart actually wants.
             if let d = p.dayTarget {
                 Text("\(NutrientTrends.deltaWords(d.delta(p.value), nutrient.unit))"
-                     + " \(NutrientTrends.basisNoun(nutrient)) (\(NutrientTrends.fmt(d.value)))")
+                     + " \(NutrientTrends.basisNoun(nutrient)) (\(NutrientTrends.fmt(d.value, nutrient)))")
                     .font(.caption2).foregroundStyle(.secondary)
             } else {
                 Text("no target recorded that day").font(.caption2).foregroundStyle(.secondary)

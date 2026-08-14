@@ -27,7 +27,7 @@ enum HealthRing {
     /// The compact grams shown in a macro ring's center ("142g"); calories pass an
     /// empty unit so it's just the number.
     static func centerLabel(_ gauge: MetricGauge) -> String {
-        "\(DietSemantics.fmt(gauge.value))\(gauge.unit)"
+        "\(DietSemantics.fmt(gauge.value, decimals: gauge.decimals))\(gauge.unit)"
     }
 
     /// A ring's spoken label. Color is never the only signal, so a buffered ring says which

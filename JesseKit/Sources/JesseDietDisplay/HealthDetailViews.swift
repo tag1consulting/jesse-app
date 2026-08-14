@@ -183,7 +183,8 @@ struct MacrosCaloriesDetail: View {
             if isTracked(n) {
                 let gauge = microGauge(n)
                 let prefix = gauge.partial ? "≥" : ""
-                totalRow(n.displayName, "\(prefix)\(DietSemantics.fmt(gauge.value))\(n.unit)",
+                totalRow(n.displayName,
+                         "\(prefix)\(DietSemantics.fmt(gauge.value, decimals: gauge.decimals))\(n.unit)",
                          depth: n.depth)
             }
         }

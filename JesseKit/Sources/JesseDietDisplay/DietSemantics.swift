@@ -170,19 +170,14 @@ enum DietSemantics {
         return value <= target ? .met : .over(value - target)
     }
 
-    /// ZERO CEILING: the ceiling whose target is literally 0 — trans fat, where "none" is
-    /// the goal rather than "some amount is fine". It needs its own entry point because
-    /// `ceilingGoalStatus` treats a 0 target as NO usable target, and that is right for
-    /// every other metric: a missing calorie target arrives as `t.calories ?? 0`, and
-    /// reading that as "over by everything you ate" would be a lie. Only a nutrient that
-    /// DECLARES zero is its goal (`Micronutrient.zeroIsTheGoal`) routes here, so a
-    /// stray/absent 0 elsewhere keeps its old, safe meaning.
-    ///
-    /// A genuine 0 is `met` — you ate none, which is the goal reached, not an absence of
-    /// data. Anything above is over by the whole amount.
-    static func zeroCeilingGoalStatus(value: Double) -> GoalStatus {
-        value <= 0 ? .met : .over(value)
-    }
+    // A ZERO CEILING — a goal of literally none — used to live here for trans fat, and it
+    // is gone deliberately (see `Micronutrient.transFat`). A ceiling of 0 g is unreachable
+    // for anyone who eats dairy or beef: the ruminant trans fat in milk fat is two to five
+    // percent of it, the food logger estimates that fraction, and so the goal failed by
+    // design on every yogurt day, forever. A goal that cannot be met is not a goal, and a
+    // permanently red gauge teaches its reader to ignore the row. Trans fat is now an
+    // ordinary ceiling judged against a numeric target, and a target of 0 or none means
+    // NO USABLE TARGET on that path, exactly as it does for every other nutrient.
 
     /// BAND: a floor to reach AND a ceiling to stay under, unknown-aware.
     ///
@@ -347,12 +342,6 @@ enum DietSemantics {
         return .red
     }
 
-    /// ZERO CEILING (trans fat): a measured 0 is green, anything above it is red. There is
-    /// no yellow — there is no "nearly none".
-    static func zeroCeilingStatus(value: Double) -> Status {
-        value <= 0 ? .green : .red
-    }
-
     /// BAND (selenium): green inside the band, red above the ceiling, and BELOW the floor
     /// the floor's own three-step band (under 50% red, 50–79% yellow, 80%+ green — the
     /// same "basically there" softening every floor gets). A PARTIAL day below the floor
@@ -380,20 +369,27 @@ enum DietSemantics {
     /// floor: "Xg to go" / "there — nice". Action-first and kind: what's left, not what's
     /// missing. The tone (color) says whether that's a calm "coming along" or a gentle
     /// evening nudge; these words just carry the amount and direction.
-    static func floorRemaining(value: Double, target: Double, unit: String = "g") -> String {
+    ///
+    /// `decimals` is the NUTRIENT's display precision (0 for a macro/calorie, and for every
+    /// nutrient dosed above 1 in its own unit). It rides on every remaining phrase for the
+    /// same reason it rides on the headline: a sub-unit nutrient whose shortfall or excess
+    /// is rounded to a whole unit reports zero of something real.
+    static func floorRemaining(value: Double, target: Double, unit: String = "g",
+                               decimals: Int = 0) -> String {
         guard target > 0 else { return "" }
         if value >= target { return "there — nice" }
-        return "\(fmt(target - value))\(unit) to go"
+        return "\(fmt(target - value, decimals: decimals))\(unit) to go"
     }
 
     /// ceiling: "room for X" / "right on target" / "X over". Frames headroom as room to
     /// use, not a limit to fear; "over" without "limit"/"breach" — the tone carries how
     /// much it matters.
-    static func ceilingRemaining(value: Double, target: Double, unit: String = "") -> String {
+    static func ceilingRemaining(value: Double, target: Double, unit: String = "",
+                                 decimals: Int = 0) -> String {
         guard target > 0 else { return "" }
-        if value < target { return "room for \(fmt(target - value))\(unit)" }
+        if value < target { return "room for \(fmt(target - value, decimals: decimals))\(unit)" }
         if value == target { return "right on target" }
-        return "\(fmt(value - target))\(unit) over"
+        return "\(fmt(value - target, decimals: decimals))\(unit) over"
     }
 
     /// fat window: "Xg to the 50g floor" / "in range" / "Xg above the range" (working
@@ -404,12 +400,6 @@ enum DietSemantics {
         return "\(fmt(grams - fatCap))g above the range"
     }
 
-    /// zero ceiling (trans fat): "none — ideal" at a measured zero, else the amount, said
-    /// plainly. No "room for X" language: there is no room, and no headroom to spend.
-    static func zeroCeilingRemaining(value: Double, unit: String = "") -> String {
-        value <= 0 ? "none — ideal" : "\(fmt(value))\(unit) logged"
-    }
-
     /// band: "Xu to the Yu floor" / "in the Y–Zu range" / "Xu above the range" — and, on a
     /// PARTIAL day whose known-only sum sits under the floor, "at least Xu so far".
     ///
@@ -418,12 +408,17 @@ enum DietSemantics {
     /// not been shown to be short of anything, so it says what IS known ("at least this
     /// much") instead of a shortfall that was never measured.
     static func bandRemaining(value: Double, floor: Double, ceiling: Double,
-                              partial: Bool, unit: String = "") -> String {
+                              partial: Bool, unit: String = "", decimals: Int = 0) -> String {
         guard floor > 0, ceiling > floor else { return "" }
-        if value > ceiling { return "\(fmt(value - ceiling))\(unit) above the range" }
-        if value >= floor { return "in the \(fmt(floor))–\(fmt(ceiling))\(unit) range" }
-        if partial { return "at least \(fmt(value))\(unit) so far" }
-        return "\(fmt(floor - value))\(unit) to the \(fmt(floor))\(unit) floor"
+        if value > ceiling {
+            return "\(fmt(value - ceiling, decimals: decimals))\(unit) above the range"
+        }
+        if value >= floor {
+            return "in the \(fmt(floor, decimals: decimals))–\(fmt(ceiling, decimals: decimals))\(unit) range"
+        }
+        if partial { return "at least \(fmt(value, decimals: decimals))\(unit) so far" }
+        return "\(fmt(floor - value, decimals: decimals))\(unit) to the "
+            + "\(fmt(floor, decimals: decimals))\(unit) floor"
     }
 
     /// calorie window (carb-load day): "X more to go" / "in window" / "X over". "X more to
@@ -619,6 +614,10 @@ enum DietSemantics {
         let value = agg.knownSum
         let target = n.target(in: targets)
         let unit = n.unit
+        // The nutrient's own display precision, carried on the gauge so every surface that
+        // turns this value into text — the row, the sheet header, the contributor list, the
+        // insight — renders it at the same precision, and a sub-unit nutrient never reads 0.
+        let decimals = n.displayDecimals
 
         // Base gauge shared by every branch — value-only, no judgment. The branches
         // below layer a status/remaining/goalStatus on top when there's a real target.
@@ -627,7 +626,7 @@ enum DietSemantics {
             status: .suspended, remaining: "", goalStatus: .noGoal,
             flag: nil, unit: unit, fraction: nil,
             partial: agg.partial, unknownItemCount: agg.unknownItemCount,
-            knownItemCount: agg.knownItemCount)
+            knownItemCount: agg.knownItemCount, decimals: decimals)
 
         // No item that day carried the nutrient → the neutral "not tracked yet" state,
         // regardless of whether a target exists.
@@ -643,7 +642,7 @@ enum DietSemantics {
         // no goal status, and no bar.
         if !n.judged {
             g.fraction = fraction(value, target ?? 0)
-            g.remaining = target == nil ? "" : "reference \(fmt(target!))\(unit)"
+            g.remaining = target == nil ? "" : "reference \(fmt(target!, decimals: decimals))\(unit)"
             g.note = informationalNote(n, value: value, unit: unit, targets: targets)
             return g
         }
@@ -662,7 +661,7 @@ enum DietSemantics {
                                   ceiling: edges.ceiling, partial: agg.partial)
             g.remaining = bandRemaining(value: value, floor: edges.floor,
                                         ceiling: edges.ceiling, partial: agg.partial,
-                                        unit: unit)
+                                        unit: unit, decimals: decimals)
             g.goalStatus = bandGoalStatus(value: value, floor: edges.floor,
                                           ceiling: edges.ceiling, partial: agg.partial)
             g.tone = tone(goalStatus: g.goalStatus, hour: hour, target: edges.ceiling,
@@ -670,36 +669,31 @@ enum DietSemantics {
             return g
         }
 
-        // ZERO CEILING (trans fat): "none" is the goal, so a 0 target is a real ceiling
-        // here and not the no-usable-target state the guard below treats it as everywhere
-        // else. Also returns early — a rolling median of a zero ceiling says nothing a
-        // day's number doesn't already say, and the buffered path would read the 0 target
-        // as "no goal" and wipe the verdict out.
-        if n.zeroIsTheGoal, let zero = n.target(in: targets), zero == 0 {
-            g.status = zeroCeilingStatus(value: value)
-            g.remaining = zeroCeilingRemaining(value: value, unit: unit)
-            g.goalStatus = zeroCeilingGoalStatus(value: value)
-            // Any amount pegs the bar: against a ceiling of none there is no headroom to
-            // draw a proportion of.
-            g.fraction = value > 0 ? 1 : 0
-            // No target passed to `tone`: the late-day escalation is a fraction OF the
-            // target, and a fraction of zero would make every trace reading "take note".
-            g.tone = tone(goalStatus: g.goalStatus, hour: hour, target: nil)
+        // Judged nutrients (ceiling / floor) need a usable target; without one they
+        // stay value-only. Trans fat reaches here like any other ceiling: a target of 0
+        // (or none at all) is NO usable target, so the row shows the number and judges
+        // nothing — the graceful degradation that stands until the day data carries a
+        // real, reachable trans fat ceiling. It is deliberately NOT a permanent failure.
+        //
+        // The unusable target is DROPPED rather than carried: every surface renders a
+        // present target as "value / target", and "0.05 / 0.00g" reads as precisely the
+        // ceiling of none this work removed. It also rides into the insight grounding as
+        // the target, which would hand the model a goal the row itself refuses to judge.
+        guard let target, target > 0 else {
+            g.target = nil
             return g
         }
-
-        // Judged nutrients (ceiling / floor) need a usable target; without one they
-        // stay value-only.
-        guard let target, target > 0 else { return g }
         g.fraction = fraction(value, target)
         switch n.goal {
         case .ceiling:
             g.status = ceilingStatus(value: value, target: target)
-            g.remaining = ceilingRemaining(value: value, target: target, unit: unit)
+            g.remaining = ceilingRemaining(value: value, target: target, unit: unit,
+                                           decimals: decimals)
             g.goalStatus = ceilingGoalStatus(value: value, target: target)
         case .floor:
             g.status = floorStatus(value: value, target: target)
-            g.remaining = floorRemaining(value: value, target: target, unit: unit)
+            g.remaining = floorRemaining(value: value, target: target, unit: unit,
+                                         decimals: decimals)
             g.goalStatus = floorGoalStatus(value: value, target: target)
         case .window, .band:
             break // handled above (band) / not used by any micronutrient (window)
@@ -732,7 +726,8 @@ enum DietSemantics {
         guard n == .purines else { return nil }
         let line = targets.purines ?? purineNoteThreshold
         guard line > 0, value > line else { return nil }
-        return "above \(fmt(line))\(unit) for the day — worth a glance, not a limit"
+        return "above \(fmt(line, decimals: n.displayDecimals))\(unit) for the day — "
+            + "worth a glance, not a limit"
     }
 
     // MARK: - Rolling-window gauges (a limit defined over days, not a day)
@@ -777,7 +772,7 @@ enum DietSemantics {
             flag: nil, unit: n.unit,
             fraction: ceiling.flatMap { fraction(total.knownSum, $0) },
             partial: total.partial, unknownItemCount: total.unknownItemCount,
-            knownItemCount: total.knownItemCount,
+            knownItemCount: total.knownItemCount, decimals: n.displayDecimals,
             rollingWindow: total)
 
         // No window ceiling → the context row: the week's total, stated, judged by nothing.
@@ -786,7 +781,8 @@ enum DietSemantics {
             return g
         }
         g.status = ceilingStatus(value: total.knownSum, target: ceiling)
-        g.remaining = ceilingRemaining(value: total.knownSum, target: ceiling, unit: n.unit)
+        g.remaining = ceilingRemaining(value: total.knownSum, target: ceiling, unit: n.unit,
+                                       decimals: n.displayDecimals)
         g.goalStatus = ceilingGoalStatus(value: total.knownSum, target: ceiling)
         g.tone = tone(goalStatus: g.goalStatus, hour: settledHour, target: ceiling)
         return g
@@ -871,8 +867,39 @@ enum DietSemantics {
         return value / target
     }
 
-    /// Round to a whole number and drop the decimal point ("need 12g more").
+    /// Round to a whole number and drop the decimal point ("need 12g more"). The
+    /// whole-unit formatter for calories, weights and the macros, whose working ranges
+    /// are all far above 1 — a NUTRIENT's value goes through `fmt(_:decimals:)` instead,
+    /// at that nutrient's own precision.
     static func fmt(_ x: Double) -> String { String(Int(x.rounded())) }
+
+    /// A NUTRIENT's value at that nutrient's own display precision, with one rule that is
+    /// the point of this function: A VALUE THAT IS NOT ZERO IS NEVER RENDERED AS ZERO.
+    ///
+    /// The bug this exists for: trans fat's whole working range sits below 1 g (the natural
+    /// ruminant fraction of a dairy portion is hundredths of a gram), so whole-gram rounding
+    /// turned every real reading into "0 g" — a headline, a contributor row and an insight
+    /// all stating the user consumed none of something they measurably did. Precision alone
+    /// does not fix it, because any fixed precision has a value small enough to round away;
+    /// so when rounding at `decimals` would produce a zero from a NONZERO input, this emits
+    /// the below-threshold form ("<0.01", "<1") instead of a false zero. A future nutrient
+    /// arriving in a smaller unit inherits that protection for free.
+    ///
+    /// A true zero — a measured none — still reads "0", because that is not a false zero:
+    /// it is the fact.
+    static func fmt(_ x: Double, decimals: Int) -> String {
+        let places = max(decimals, 0)
+        // Round half AWAY from zero, matching `fmt`'s `.rounded()` — printf alone rounds
+        // half to even, which would make the two formatters disagree on 2.5.
+        let scale = pow(10.0, Double(places))
+        let rounded = (x * scale).rounded() / scale
+        // Rounding erased a real amount → say it is below the threshold, never "0".
+        if x != 0, rounded == 0 {
+            let threshold = String(format: "%.\(places)f", 1 / scale)
+            return x < 0 ? ">-\(threshold)" : "<\(threshold)"
+        }
+        return String(format: "%.\(places)f", rounded)
+    }
 
     /// One-decimal format for a pace ("needs 2.2 lb/wk") — rounding a required
     /// pace to a whole number would lie, so this keeps the tenths.
@@ -1140,12 +1167,21 @@ enum Micronutrient: CaseIterable {
         }
     }
 
-    /// The one nutrient whose target is legitimately ZERO — trans fat, where "none" is the
-    /// goal rather than a budget to spend. Everywhere else a 0 target means "no usable
-    /// target" and shows the value with no judgment, and that default must stay: a missing
-    /// calorie target arrives as 0 and reading it as a ceiling would be a lie. Only a
-    /// nutrient that declares this routes to `DietSemantics.zeroCeilingGoalStatus`.
-    var zeroIsTheGoal: Bool { self == .transFat }
+    /// How many decimal places this nutrient's value is DISPLAYED with, everywhere it is
+    /// turned into text. Zero for all but one: the bulk minerals are in milligrams and the
+    /// trace nutrients in micrograms precisely so their numbers land above 1 in their own
+    /// unit, and a whole number is what a reader wants there.
+    ///
+    /// TRANS FAT IS THE EXCEPTION, and the reason this property exists. Its entire working
+    /// range sits below a gram — the natural ruminant fraction of a dairy portion is
+    /// hundredths of a gram — so whole-gram rounding rendered every real reading as "0 g"
+    /// and every surface downstream then reported a false zero. Two decimal places in grams
+    /// rather than a switch to milligrams: grams is the unit the food labels, the log
+    /// column (`trans_fat_g`) and the other fats all use, and one nutrient silently
+    /// switching units under the Fat heading is a worse read than two decimal places.
+    /// `DietSemantics.fmt(_:decimals:)` guarantees no precision can render a nonzero
+    /// amount as a zero.
+    var displayDecimals: Int { self == .transFat ? 2 : 0 }
 
     /// Whether this nutrient renders a DAY-scoped row at all. False for mercury alone: its
     /// limit is defined over a week, so a daily row would invite exactly the reading —
@@ -1311,7 +1347,7 @@ enum Micronutrient: CaseIterable {
         case .cholesterol:
             return "Food contains no HDL and no LDL — those are the carriers your blood makes, not something on a plate, so no meal is \"good\" or \"bad\" cholesterol. Dietary cholesterol moves blood cholesterol far less than we once thought, which is why there's no target here and no red or green. The levers that do move your LDL are the three already tracked: saturated fat, trans fat, and fiber. This number comes from a solid database lookup, so it's a good estimate, and it's here for context only."
         case .transFat:
-            return "Trans fat has no safe amount — the goal is literally none, which is why the target is zero rather than a budget to spend. It raises LDL and lowers HDL at once, the only fat that does both. It's declared on labels and near-exact when it's there, so a reading above zero is real: partially hydrogenated oil, some fried food, a few baked goods."
+            return "Trans fat comes in two kinds. The industrial kind, from partially hydrogenated oil in fried food and some baked goods, has no safe amount — it raises LDL and lowers HDL at once, the only fat that does both. The ruminant kind occurs naturally in milk fat and beef, at a few percent of that fat, and doesn't carry the same risk at the doses a normal diet delivers. The number here is both together: label-derived and near-exact where a label declares it, estimated where it's the natural dairy share. So a small reading on a yogurt or cheese day is expected rather than a failure — no industrial trans fat is the goal worth acting on, and the ceiling covers your total."
         case .addedSugar:
             return "This is the added share ONLY — the sugar put in, not the sugar that came with the fruit or the milk. That's what makes it judgeable where total sugars isn't: 40g is a real ceiling, and there's no natural-sugar confusion hiding inside it. It's label-derived and near-exact, so what you see is close to what you ate."
         case .selenium:
@@ -1521,6 +1557,12 @@ struct MetricGauge: Equatable, Sendable {
     var partial: Bool = false
     var unknownItemCount: Int = 0
     var knownItemCount: Int? = nil
+    /// How many decimal places this metric's value is rendered with — the nutrient's own
+    /// display precision (`Micronutrient.displayDecimals`), carried on the gauge so the
+    /// row, the sheet header, the contributor rows and the insight all agree. 0 for
+    /// calories, the macros, and every nutrient dosed above 1 in its own unit; 2 for trans
+    /// fat, whose whole working range is a fraction of a gram.
+    var decimals: Int = 0
     /// Where this row's COLOR came from (see `JudgmentSource`). `.daily` — today's number,
     /// which is every gauge on an older bridge and always protein/fiber/calories/carbs.
     /// `.rolling` — the buffered nutrients (saturated fat, sodium, total fat over 7 days;

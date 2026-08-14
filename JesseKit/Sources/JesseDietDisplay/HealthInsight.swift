@@ -63,6 +63,13 @@ struct HealthInsightInput: Equatable, Sendable {
     /// generation that reports one anyway. This is the model-facing half of
     /// `DietSemantics.bandGoalStatus`'s asymmetry.
     let unprovenShortfall: Bool
+    /// The metric's display precision (`MetricGauge.decimals`), so EVERY number in the
+    /// grounding renders exactly as the screen renders it. This is load-bearing, not
+    /// cosmetic: a sub-gram nutrient rounded to whole grams handed the model a
+    /// self-contradicting ground truth ("OVER by 0g", "consumed 0 g"), and it resolved the
+    /// contradiction the friendly way — by congratulating the user on a limit they had
+    /// exceeded.
+    let decimals: Int
 
     // Defaulted memberwise init so a macro/calorie caller (and existing tests) build an
     // input without naming the micronutrient-only fields; a micronutrient caller sets them.
@@ -70,14 +77,18 @@ struct HealthInsightInput: Equatable, Sendable {
          goalStatus: DietSemantics.GoalStatus, goalPhrase: String, dayStyle: String,
          foods: [FoodFact], partial: Bool = false, knownItemCount: Int = 0,
          unknownItemCount: Int = 0, informational: Bool = false,
-         windowDays: Int? = nil, unprovenShortfall: Bool = false) {
+         windowDays: Int? = nil, unprovenShortfall: Bool = false, decimals: Int = 0) {
         self.metricLabel = metricLabel; self.unit = unit; self.total = total
         self.goal = goal; self.goalStatus = goalStatus; self.goalPhrase = goalPhrase
         self.dayStyle = dayStyle; self.foods = foods; self.partial = partial
         self.knownItemCount = knownItemCount; self.unknownItemCount = unknownItemCount
         self.informational = informational
         self.windowDays = windowDays; self.unprovenShortfall = unprovenShortfall
+        self.decimals = decimals
     }
+
+    /// One number, rendered exactly as the screen renders this metric's numbers.
+    func fmt(_ x: Double) -> String { DietSemantics.fmt(x, decimals: decimals) }
 
     /// The authoritative goal-status fact fed to the model — a single ground-truth line
     /// derived from the deterministic `goalStatus`, so the model states the goal exactly
@@ -87,9 +98,9 @@ struct HealthInsightInput: Equatable, Sendable {
         case .met:
             return "MET — the goal is satisfied."
         case .short(let by):
-            return "NOT met — still \(DietSemantics.fmt(by))\(unit) short of the goal."
+            return "NOT met — still \(fmt(by))\(unit) short of the goal."
         case .over(let by):
-            return "OVER — \(DietSemantics.fmt(by))\(unit) past the limit."
+            return "OVER — \(fmt(by))\(unit) past the limit."
         case .noGoal:
             return "no target is set for this metric — do not state any goal status."
         }
@@ -102,7 +113,7 @@ struct HealthInsightInput: Equatable, Sendable {
     var partialFact: String? {
         guard partial else { return nil }
         let items = "\(unknownItemCount) of \(knownItemCount + unknownItemCount) logged item\(unknownItemCount + knownItemCount == 1 ? "" : "s")"
-        return "This total is PARTIAL — \(items) carry no measured \(metricLabel.lowercased()) value, so \(DietSemantics.fmt(total)) \(unit) is a floor (AT LEAST this much), never the complete total. Never state or imply it is the full/complete/entire total; if you name the number, say \"at least\"."
+        return "This total is PARTIAL — \(items) carry no measured \(metricLabel.lowercased()) value, so \(fmt(total)) \(unit) is a floor (AT LEAST this much), never the complete total. Never state or imply it is the full/complete/entire total; if you name the number, say \"at least\"."
     }
 
     /// The authoritative SCOPE fact, present only on a window metric: what span the total
@@ -167,7 +178,8 @@ enum HealthInsight {
                       partial: Bool = false, knownItemCount: Int = 0,
                       unknownItemCount: Int = 0, informational: Bool = false,
                       windowDays: Int? = nil,
-                      unprovenShortfall: Bool = false) -> HealthInsightInput {
+                      unprovenShortfall: Bool = false,
+                      decimals: Int = 0) -> HealthInsightInput {
         let foods = contributions.prefix(groundingFoodCount).map {
             FoodFact(name: $0.name, value: $0.value, sharePct: Int(($0.share * 100).rounded()))
         }
@@ -177,7 +189,8 @@ enum HealthInsight {
             dayStyle: dayStyle, foods: Array(foods),
             partial: partial, knownItemCount: knownItemCount,
             unknownItemCount: unknownItemCount, informational: informational,
-            windowDays: windowDays, unprovenShortfall: unprovenShortfall)
+            windowDays: windowDays, unprovenShortfall: unprovenShortfall,
+            decimals: decimals)
     }
 
     /// How a metric is judged, in plain words for the insight grounding — the shared
@@ -204,10 +217,10 @@ enum HealthInsightPrompt {
             foodLines = "- (none logged)"
         } else {
             foodLines = input.foods.map {
-                "- \($0.name): \(DietSemantics.fmt($0.value)) \(input.unit) (\($0.sharePct)% of the day's \(metric))"
+                "- \($0.name): \(input.fmt($0.value)) \(input.unit) (\($0.sharePct)% of the day's \(metric))"
             }.joined(separator: "\n")
         }
-        let goalLine = input.goal.map { "Target: \(DietSemantics.fmt($0)) \(input.unit)." }
+        let goalLine = input.goal.map { "Target: \(input.fmt($0)) \(input.unit)." }
             ?? "Target: none set."
         // An authoritative partiality line, present only when the total is a floor, so
         // the model states "at least" and never claims completeness.
@@ -228,7 +241,7 @@ enum HealthInsightPrompt {
         return """
         Day type: \(input.dayStyle).
         Metric: \(input.metricLabel) — \(input.goalPhrase).
-        Consumed so far: \(DietSemantics.fmt(input.total)) \(input.unit). \(goalLine)
+        Consumed so far: \(input.fmt(input.total)) \(input.unit). \(goalLine)
         GOAL STATUS (authoritative — treat this as ground truth and never contradict \
         it): \(input.goalStatusFact)\(partialLine)\(scopeLine)\(unprovenLine)
         Top contributing foods:
@@ -262,11 +275,14 @@ enum HealthInsightGuard {
     /// only costs one insight, which the feature is designed to drop silently.
     static func claimsGoalReached(_ text: String) -> Bool {
         let t = text.lowercased().replacingOccurrences(of: "’", with: "'")
+        // The verb list carries the -ING forms as well as the past tense, because the
+        // generation that got past this guard said "congratulations on REACHING your trans
+        // fat goal" — grammatically a gerund, semantically the same false claim.
         let patterns = [
-            #"\byou'?ve\s+(already\s+)?(hit|met|reached|achieved|nailed|smashed|crushed)\b"#,
-            #"\b(hit|met|reached|achieved|nailed|smashed|crushed)(\s+\w+){0,4}\s+(goal|target)\b"#,
+            #"\byou'?ve\s+(already\s+)?(hit|met|reached|achieved|satisfied|nailed|smashed|crushed)\b"#,
+            #"\b(hit|hitting|met|meeting|reached|reaching|achieved|achieving|satisfied|satisfying|nailed|smashed|crushed)(\s+\w+){0,4}\s+(goal|target|limit)\b"#,
             #"\bon\s+track\s+to\s+(hit|meet|reach)\b"#,
-            #"\b(goal|target)(\s+\w+){0,3}\s+(met|reached|achieved|hit|done|complete)\b"#,
+            #"\b(goal|target)(\s+\w+){0,3}\s+(met|reached|achieved|hit|satisfied|done|complete)\b"#,
         ]
         for p in patterns {
             guard let r = t.range(of: p, options: .regularExpression) else { continue }
@@ -279,11 +295,58 @@ enum HealthInsightGuard {
         return false
     }
 
+    /// Words that CELEBRATE — flagged when the goal was not merely missed but exceeded.
+    /// A congratulation on a day past the limit is the same error as a completion claim
+    /// wearing different clothes, and it is what the model actually produced when handed
+    /// a self-contradicting ground truth ("OVER by 0g" / "consumed 0 grams"): it opened
+    /// with "Congratulations on reaching your trans fat goal for the day!".
+    private static let celebrations = [
+        " congratulations", " congrats", " well done", " nicely done", " great job",
+        " good job", " nice work", " way to go", " you nailed", " you crushed",
+    ]
+
+    /// Whether `text` congratulates the user. Checked ONLY against an `over` status,
+    /// where any celebration is wrong however it is phrased — praise for a limit that was
+    /// exceeded is a false report, not a matter of tone.
+    static func celebrates(_ text: String) -> Bool {
+        let t = " " + text.lowercased().replacingOccurrences(of: "’", with: "'") + " "
+        return celebrations.contains(where: t.contains)
+    }
+
+    /// Phrases that assert a LIMIT or TARGET EXISTS as a number — flagged when the facts
+    /// say none is set. Seen live on the trans fat row the day its unreachable ceiling was
+    /// removed: told "Target: none set." and "no target is set for this metric", the model
+    /// wrote "0.05 g of trans fat, which is exactly 100% of your daily limit". There is no
+    /// limit; the percentage is invented whole.
+    ///
+    /// Deliberately narrow — the possessive/definite forms that assert a quantity to
+    /// measure against, never the bare words. A row with no target is still free to say
+    /// what was eaten and what fed it, which is the whole of what it knows.
+    private static let targetClaims = [
+        "% of your", "% of the", "your daily limit", "your limit", "your daily target",
+        "your target", "the daily limit", "of the limit", "over the limit",
+        "under the limit", "within your", "of your allowance",
+    ]
+
+    /// Whether `text` asserts a limit/target the facts have not set.
+    static func claimsATarget(_ text: String) -> Bool {
+        let t = " " + text.lowercased().replacingOccurrences(of: "’", with: "'") + " "
+        return targetClaims.contains(where: t.contains)
+    }
+
     /// True when `text` makes a goal-completion claim the deterministic `status`
     /// contradicts — the signal to discard the insight. A genuinely met goal is never
     /// flagged; every other status (short, over, or no goal at all) is.
+    ///
+    /// PAST A CEILING the bar is higher: a prompt instruction ("never say they met the
+    /// goal unless the status line says MET") did not hold and never will hold with
+    /// certainty, so an `over` day additionally discards any generation that celebrates.
+    /// A discarded generation produces NO insight, exactly like every other rejection —
+    /// the facts stand alone, with no placeholder and no apology.
     static func contradicts(_ text: String, status: DietSemantics.GoalStatus) -> Bool {
         guard !status.isMet else { return false }
+        if case .over = status, celebrates(text) { return true }
+        if case .noGoal = status, claimsATarget(text) { return true }
         return claimsGoalReached(text)
     }
 

@@ -174,9 +174,13 @@ public struct DietTargets: Decodable, Equatable, Sendable {
     public var omega3: Double?
     /// Magnesium floor, milligrams.
     public var magnesium: Double?
-    /// Trans-fat ceiling, grams. Emitted as `0` — the one nutrient whose ideal is
-    /// literally none, which is a REAL ceiling and not the "no usable target" state the
-    /// other nutrients' zero would be (see `Micronutrient.zeroIsTheGoal`).
+    /// Trans-fat ceiling, grams. The generator currently emits `0`, which the app reads
+    /// as NO USABLE TARGET like any other nutrient's zero — the row then shows the number
+    /// and judges nothing. It was once a real ceiling of "none", and that goal was
+    /// unreachable for anyone who eats dairy or beef (their milk fat carries a natural
+    /// ruminant trans fat fraction, which the food logger estimates), so it failed by
+    /// construction every day. A reachable nonzero ceiling from the day data reinstates
+    /// the judgment with no app change.
     public var transFat: Double?
     /// Added-sugar ceiling, grams. Distinct from `sugar`, which is the informational
     /// total-sugars reference line.

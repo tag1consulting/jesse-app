@@ -634,8 +634,10 @@ struct MetricBarRow: View {
     private var valueTarget: String {
         // A partial total is a floor: prefix "≥" so it's never shown as complete.
         let prefix = gauge.partial ? "≥" : ""
-        let v = DietSemantics.fmt(gauge.value)
-        if let t = gauge.target { return "\(prefix)\(v) / \(DietSemantics.fmt(t))\(gauge.unit)" }
+        let v = DietSemantics.fmt(gauge.value, decimals: gauge.decimals)
+        if let t = gauge.target {
+            return "\(prefix)\(v) / \(DietSemantics.fmt(t, decimals: gauge.decimals))\(gauge.unit)"
+        }
         return "\(prefix)\(v)\(gauge.unit)"
     }
     private var percent: String? {
@@ -714,7 +716,7 @@ struct FoodDrilldown: Equatable, Sendable {
             contributions: breakdown.contributions,
             partial: gauge.partial, knownItemCount: gauge.knownItemCount ?? 0,
             unknownItemCount: gauge.unknownItemCount, informational: informational,
-            unprovenShortfall: unprovenShortfall(gauge))
+            unprovenShortfall: unprovenShortfall(gauge), decimals: gauge.decimals)
         // Attach the per-nutrient trend only when the bridge sent history — otherwise the
         // sheet shows the facts alone, exactly as before.
         let trend: NutrientTrendContext? = {
@@ -766,7 +768,7 @@ struct FoodDrilldown: Equatable, Sendable {
             contributions: breakdown.contributions,
             partial: gauge.partial, knownItemCount: gauge.knownItemCount ?? 0,
             unknownItemCount: gauge.unknownItemCount, informational: informational,
-            windowDays: window.days)
+            windowDays: window.days, decimals: gauge.decimals)
         return FoodDrilldown(breakdown: breakdown, insightInput: input, trend: nil)
     }
 }
@@ -891,7 +893,9 @@ enum DrilldownShare {
             for c in breakdown.contributions {
                 let amount = c.amount.map { " (\($0))" } ?? ""
                 let share = Int((c.share * 100).rounded())
-                lines.append("• \(c.name)\(amount): \(DietSemantics.fmt(c.value)) \(breakdown.metric.unit) — \(share)%")
+                lines.append("• \(c.name)\(amount): "
+                    + "\(DietSemantics.fmt(c.value, decimals: breakdown.metric.decimals)) "
+                    + "\(breakdown.metric.unit) — \(share)%")
             }
             if let note = breakdown.reconciliationNote {
                 lines.append(note)
@@ -1022,7 +1026,7 @@ struct ContributionRow: View {
                     Text(amount).font(.caption).foregroundStyle(.secondary)
                 }
                 Spacer()
-                Text("\(DietSemantics.fmt(contribution.value)) \(metric.unit)")
+                Text("\(DietSemantics.fmt(contribution.value, decimals: metric.decimals)) \(metric.unit)")
                     .font(.subheadline.monospacedDigit())
             }
             HStack(spacing: 8) {

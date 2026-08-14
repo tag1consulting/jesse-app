@@ -369,10 +369,30 @@ final class NutrientTreeTests: XCTestCase {
         XCTAssertTrue(copy.contains("105µg a week"), copy)
     }
 
-    func testTransFatEducationSaysZeroIsTheGoalNotABudget() {
+    func testTransFatEducationNamesBothKindsAndNeverClaimsZeroIsReachable() {
+        // The copy that justified the unreachable ceiling told the user any reading above
+        // zero was real industrial trans fat. It is not: the ruminant fraction of dairy
+        // and beef is in every one of these numbers, which is why the goal is stated as
+        // "no industrial trans fat" and never as a literal zero.
         let copy = education(.transFat)
+        XCTAssertTrue(copy.contains("industrial"), copy)
+        XCTAssertTrue(copy.contains("ruminant"), copy)
         XCTAssertTrue(copy.contains("no safe amount"), copy)
-        XCTAssertTrue(copy.contains("goal is literally none"), copy)
+        XCTAssertTrue(copy.contains("expected"), "a small reading must read as expected: \(copy)")
+        for banned in ["goal is literally none", "target is zero", "sit at zero"] {
+            XCTAssertFalse(copy.contains(banned), "unreachable-goal language survives: \(banned)")
+        }
+    }
+
+    func testTransFatSheetProseNamesBothKindsToo() {
+        // The sheet's own paragraph, not just the teaching note — it carried the same
+        // "a ceiling of zero, not a small budget" claim.
+        let today = day([DietItem(item: "Greek yogurt (full-fat)", tfat: 0.05)])
+        let prose = Explainers.micronutrient(.transFat, gauge: gauge(today, .transFat))
+            .paragraphs.joined(separator: " ").lowercased()
+        XCTAssertTrue(prose.contains("industrial"), prose)
+        XCTAssertTrue(prose.contains("dairy and beef"), prose)
+        XCTAssertFalse(prose.contains("ceiling of zero"), prose)
     }
 
     // MARK: - All seven open the SAME shared drill-down
