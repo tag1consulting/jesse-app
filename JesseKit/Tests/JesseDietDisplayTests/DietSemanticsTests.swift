@@ -890,6 +890,10 @@ final class DietSemanticsTests: XCTestCase {
         XCTAssertEqual(g.status, .suspended)
         XCTAssertEqual(g.tone, .inProgress, "shown plain, never a standing red")
         XCTAssertNil(g.fraction, "no usable target, so no proportion to draw")
+        XCTAssertNil(g.target, "an unusable 0 target is dropped, not rendered as '/ 0.00g'")
+        XCTAssertEqual(g.remaining, "", "no judgment, so no remaining phrase")
+        // The whole rendered header, which is what the sheet shows.
+        XCTAssertEqual(Explainers.micronutrient(.transFat, gauge: g).valueLine, "0.05g")
     }
 
     /// A historical day whose archived targets carry a 0 must degrade the same way — this

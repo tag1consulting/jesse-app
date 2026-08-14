@@ -59,6 +59,12 @@ CI both run it). See the "Versioning" section of `bridge/README.md`.
   failure, and frame the actionable goal as no industrial trans fat with the numeric ceiling
   covering total intake.
 
+  **The unusable target is dropped, not displayed.** Every surface renders a present target
+  as "value / target", so a row with a 0 target read `0.05 / 0.00g` — the ceiling of none,
+  back again through the display layer — and handed the same 0 to the insight as the
+  metric's goal. A judged nutrient with no usable target now clears the target on its gauge,
+  so the header reads `0.05g` and the model is grounded with "Target: none set."
+
   **The guard.** The insight prompt already carried an authoritative goal-status line and
   the instruction never to claim the goal was met unless that line said MET. It did not
   hold — handed the self-contradicting "OVER by 0g / consumed 0 g" ground truth, the model
@@ -67,6 +73,13 @@ CI both run it). See the "Versioning" section of `bridge/README.md`.
   that claims the goal was met, hit, reached or satisfied — or that congratulates at all,
   in any phrasing, including the gerund the shipped generation used — is thrown away and no
   insight is shown, matching every other rejection case (no placeholder, no apology).
+
+  Running the fixed sheet on the simulator turned up the sibling of that bug and it is fixed
+  the same way: on a row with NO target, grounded with "Target: none set." and "no target is
+  set for this metric", the model still wrote "0.05 g of trans fat, which is exactly 100% of
+  your daily limit". There is no limit and the percentage is invented whole, so a no-goal row
+  now also discards a generation that asserts a limit or target exists. It may still say what
+  was eaten and what fed it, which is the whole of what such a row knows.
 
 - **Fifteen insight tests that had never run.** A missing brace in `HealthInsightTests`
   had swallowed the window-scope, unproven-shortfall and informational-nutrient tests into

@@ -313,6 +313,27 @@ enum HealthInsightGuard {
         return celebrations.contains(where: t.contains)
     }
 
+    /// Phrases that assert a LIMIT or TARGET EXISTS as a number — flagged when the facts
+    /// say none is set. Seen live on the trans fat row the day its unreachable ceiling was
+    /// removed: told "Target: none set." and "no target is set for this metric", the model
+    /// wrote "0.05 g of trans fat, which is exactly 100% of your daily limit". There is no
+    /// limit; the percentage is invented whole.
+    ///
+    /// Deliberately narrow — the possessive/definite forms that assert a quantity to
+    /// measure against, never the bare words. A row with no target is still free to say
+    /// what was eaten and what fed it, which is the whole of what it knows.
+    private static let targetClaims = [
+        "% of your", "% of the", "your daily limit", "your limit", "your daily target",
+        "your target", "the daily limit", "of the limit", "over the limit",
+        "under the limit", "within your", "of your allowance",
+    ]
+
+    /// Whether `text` asserts a limit/target the facts have not set.
+    static func claimsATarget(_ text: String) -> Bool {
+        let t = " " + text.lowercased().replacingOccurrences(of: "’", with: "'") + " "
+        return targetClaims.contains(where: t.contains)
+    }
+
     /// True when `text` makes a goal-completion claim the deterministic `status`
     /// contradicts — the signal to discard the insight. A genuinely met goal is never
     /// flagged; every other status (short, over, or no goal at all) is.
@@ -325,6 +346,7 @@ enum HealthInsightGuard {
     static func contradicts(_ text: String, status: DietSemantics.GoalStatus) -> Bool {
         guard !status.isMet else { return false }
         if case .over = status, celebrates(text) { return true }
+        if case .noGoal = status, claimsATarget(text) { return true }
         return claimsGoalReached(text)
     }
 

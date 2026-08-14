@@ -496,6 +496,46 @@ final class HealthInsightFactsTests: XCTestCase {
                                                      input: met))
     }
 
+    // MARK: - No target set: the model may not invent one
+
+    private func noTargetInput() -> HealthInsightInput {
+        HealthInsight.input(metric: .micronutrient(.transFat), total: 0.05, goal: nil,
+                            goalStatus: .noGoal, goalPhrase: "a ceiling to stay under",
+                            dayStyle: "ordinary day",
+                            contributions: [FoodContribution(id: 0, name: "Greek yogurt (full-fat)",
+                                                             amount: "2 tbsp (~30g)",
+                                                             value: 0.05, share: 1)],
+                            decimals: 2)
+    }
+
+    func testTheInventedLimitFromTheSimulatorWalkThroughIsDiscarded() {
+        // Verbatim from the device, with "Target: none set." in its prompt.
+        let generated = "You've consumed 0.05 g of trans fat so far today, which is "
+            + "exactly 100% of your daily limit."
+        XCTAssertTrue(HealthInsightGuard.contradicts(generated, input: noTargetInput()),
+                      "there is no limit — a percentage of one is invented whole")
+    }
+
+    func testANoTargetRowMayStillSayWhatWasEaten() {
+        let input = noTargetInput()
+        for text in [
+            "The full-fat Greek yogurt is the only food carrying trans fat today, at 0.05g.",
+            "That 0.05g is the natural dairy share rather than anything industrial.",
+        ] {
+            XCTAssertFalse(HealthInsightGuard.contradicts(text, input: input),
+                           "wrongly discarded: \(text)")
+        }
+    }
+
+    func testTheInventedTargetGuardIsScopedToNoGoalRows() {
+        // A row WITH a target may of course talk about it.
+        let withTarget = HealthInsight.input(
+            metric: .macro(.protein), total: 120, goal: 140, goalStatus: .short(20),
+            goalPhrase: "a floor to hit or beat", dayStyle: "ordinary day", contributions: [])
+        XCTAssertFalse(HealthInsightGuard.contradicts(
+            "You're at 86% of your target with dinner still to come.", input: withTarget))
+    }
+
     // MARK: - Sub-gram grounding (the false zero the model was handed)
 
     func testTheGroundingNeverStatesAFalseZeroForASubGramNutrient() {

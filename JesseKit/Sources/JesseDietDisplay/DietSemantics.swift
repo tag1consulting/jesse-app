@@ -674,7 +674,15 @@ enum DietSemantics {
         // (or none at all) is NO usable target, so the row shows the number and judges
         // nothing — the graceful degradation that stands until the day data carries a
         // real, reachable trans fat ceiling. It is deliberately NOT a permanent failure.
-        guard let target, target > 0 else { return g }
+        //
+        // The unusable target is DROPPED rather than carried: every surface renders a
+        // present target as "value / target", and "0.05 / 0.00g" reads as precisely the
+        // ceiling of none this work removed. It also rides into the insight grounding as
+        // the target, which would hand the model a goal the row itself refuses to judge.
+        guard let target, target > 0 else {
+            g.target = nil
+            return g
+        }
         g.fraction = fraction(value, target)
         switch n.goal {
         case .ceiling:
