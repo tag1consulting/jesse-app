@@ -149,7 +149,16 @@ pub enum HookRequest {
         /// Whether this call also touches git (so the git lock is taken inside the file lock).
         git: bool,
     },
-    /// The tool finished (or errored, or was denied). Release, and record any read baseline.
+    /// The tool RAN and finished. Release, and record what it leaves this conversation
+    /// looking at.
+    ///
+    /// A DENIED call never reaches here, and that is load-bearing rather than incidental:
+    /// measured on claude 2.1.231, a `PreToolUse` hook exiting 2 stops the tool AND its
+    /// `PostToolUse` hook, so only `PRE-FIRED` is logged. That is what makes it safe to take
+    /// the file's post-call bytes as the new baseline — the Pre check has already passed, the
+    /// lock was held across the call, so the only writer in that window was this call itself.
+    /// If a denial DID deliver a post, this would adopt the other turn's bytes as our baseline
+    /// and silently drop the conflict.
     ///
     /// Release must not depend on the happy path: the broker also releases on turn end and on
     /// the hold timeout, so a post that never arrives costs a delay, never a stuck vault.
@@ -157,8 +166,15 @@ pub enum HookRequest {
         turn: String,
         conversation: String,
         tool_use_id: String,
-        /// A file this call READ, whose content hash becomes the compare-and-swap baseline.
-        read: Option<String>,
+        /// The file this call leaves this conversation looking at — one it READ, or one it
+        /// successfully WROTE. Its content hash becomes the compare-and-swap baseline.
+        ///
+        /// `serde(alias = "read")` keeps an OLD `jesse-hook` binary's payload parsing against
+        /// a NEW broker. The two ship in one crate and deploy together, but a child spawned
+        /// before the restart outlives it, and that window is exactly when a rename would
+        /// otherwise turn every in-flight post into a parse error — which fails CLOSED.
+        #[serde(alias = "read")]
+        baseline: Option<String>,
     },
 }
 
@@ -197,8 +213,19 @@ struct Held {
 struct BrokerInner {
     /// The locks currently held.
     held: HashMap<LockKey, Held>,
-    /// Per-CONVERSATION read baselines: path → content hash at the time this conversation
-    /// last read it.
+    /// Per-CONVERSATION baselines: path → content hash as this conversation last LEFT it,
+    /// whether by reading it or by writing it.
+    ///
+    /// A CONVERSATION, NOT A SESSION, AND THAT SPANS SUBAGENTS — a deliberate choice, not an
+    /// accident of what the payload happens to carry. The hook command line bakes in one
+    /// `--conversation` per turn, and a subagent inherits the same settings file, so a
+    /// subagent's reads and writes land on this same map. That is what we want: a subagent is
+    /// the conversation doing its own work, not a foreign writer, and treating it as foreign
+    /// would refuse the parent's next edit after every subagent write — 4 of the 7 false
+    /// conflicts observed on 2026-08-14 were inside subagents. `HookPayload::session_id` WOULD
+    /// separate them; it is deliberately not used here. The residual cost is named rather than
+    /// hidden: two subagents writing the SAME file in parallel are indistinguishable at this
+    /// layer, and the per-file lock — not this map — is what serialises them.
     ///
     /// Keyed on the conversation rather than on the harness's own session or home directory,
     /// and that is load-bearing: a Codex turn gets a FRESH `CODEX_HOME` every turn, so a
@@ -363,7 +390,7 @@ impl LockBroker {
         self.inner.lock_ok().baselines.remove(conversation);
     }
 
-    /// Record what a conversation last saw in a file.
+    /// Record what a conversation last left in a file — after a read OR after its own write.
     fn record_baseline(&self, conversation: &str, path: &Path) {
         if let Some(hash) = hash_file(path) {
             self.inner
@@ -375,7 +402,14 @@ impl LockBroker {
         }
     }
 
-    /// The compare-and-swap: has this file changed since this conversation read it?
+    /// The compare-and-swap: has this file changed since this conversation last read OR WROTE
+    /// it?
+    ///
+    /// "or wrote" is the 0.82.0 fix and it is the difference between a check and a nuisance.
+    /// Recording only on READ meant a conversation's own successful write left the baseline
+    /// at the pre-write hash, so its very next edit to that path compared fresh bytes against
+    /// stale ones and was refused — the conversation invalidated itself. It was not rare: 414
+    /// such denials sit in the vault transcripts, 50 on `Today.md` alone.
     ///
     /// `Ok(())` when it is safe to write. A per-file lock stops two writes landing at once; it
     /// does NOT stop a lost update, where turn A reads, turn B writes, and turn A then writes
@@ -410,8 +444,9 @@ impl LockBroker {
             None => Ok(()),
             Some(now) if now == recorded => Ok(()),
             Some(_) => Err(format!(
-                "{} changed on disk since this conversation read it — another turn wrote it \
-                 first. Re-read the file and redo this edit against its current contents.",
+                "{} changed on disk since this conversation last read or wrote it — another \
+                 writer got there first. Re-read the file and redo this edit against its \
+                 current contents.",
                 path.display()
             )),
         }
@@ -469,9 +504,12 @@ impl LockBroker {
                 turn,
                 conversation,
                 tool_use_id,
-                read,
+                baseline,
             } => {
-                if let Some(p) = read {
+                // Re-hashing AFTER the call is the whole fix for the self-conflict: a call that
+                // read the file records what it read, and a call that wrote it records what it
+                // wrote, so the conversation is never stale against its own work.
+                if let Some(p) = baseline {
                     self.record_baseline(&conversation, Path::new(&p));
                 }
                 self.release_call(&turn, &tool_use_id);
@@ -695,12 +733,28 @@ mod tests {
         }
     }
 
-    fn post(turn: &str, tool: &str, read: Option<&str>) -> HookRequest {
+    fn post(turn: &str, tool: &str, baseline: Option<&str>) -> HookRequest {
+        post_in("c1", turn, tool, baseline)
+    }
+
+    /// A post from a named conversation, for the tests that care which one.
+    fn post_in(conv: &str, turn: &str, tool: &str, baseline: Option<&str>) -> HookRequest {
         HookRequest::Post {
             turn: turn.into(),
-            conversation: "c1".into(),
+            conversation: conv.into(),
             tool_use_id: tool.into(),
-            read: read.map(|p| p.to_string()),
+            baseline: baseline.map(|p| p.to_string()),
+        }
+    }
+
+    /// A pre from a named conversation.
+    fn pre_in(conv: &str, turn: &str, tool: &str, path: Option<&str>) -> HookRequest {
+        HookRequest::Pre {
+            turn: turn.into(),
+            conversation: conv.into(),
+            tool_use_id: tool.into(),
+            target: Some(path.map(|p| p.to_string())),
+            git: false,
         }
     }
 
@@ -774,6 +828,116 @@ mod tests {
         let p = f.display().to_string();
         b.handle(post("t1", "read1", Some(&p))).await;
         assert!(b.handle(pre("t1", "write1", Some(&p))).await.allow);
+    }
+
+    /// THE 0.82.0 REGRESSION: a conversation must not invalidate itself.
+    ///
+    /// Read, write, then edit the same path again with no re-read in between. Before the fix
+    /// the second edit was refused, because the post hook recorded a baseline only for `Read`
+    /// and the conversation's own write left that baseline at the pre-write bytes.
+    #[tokio::test]
+    async fn a_conversations_own_write_does_not_stale_its_next_edit() {
+        let b = Arc::new(LockBroker::new());
+        let d = tmpdir();
+        let f = d.join("a.txt");
+        std::fs::write(&f, "original").unwrap();
+        let p = f.display().to_string();
+
+        // Read: baseline is "original".
+        b.handle(post("t1", "read1", Some(&p))).await;
+
+        // First edit: allowed, and it changes the bytes on disk.
+        assert!(b.handle(pre("t1", "write1", Some(&p))).await.allow);
+        std::fs::write(&f, "first edit").unwrap();
+        b.handle(post("t1", "write1", Some(&p))).await;
+
+        // Second edit, no re-read. This is the one that used to fail.
+        let r = b.handle(pre("t1", "write2", Some(&p))).await;
+        assert!(
+            r.allow,
+            "a conversation's own write must refresh its baseline: {:?}",
+            r.reason
+        );
+    }
+
+    /// The other half: refreshing on write must NOT blind the check to a real foreign write.
+    #[tokio::test]
+    async fn a_foreign_write_after_our_own_write_is_still_caught() {
+        let b = Arc::new(LockBroker::new());
+        let d = tmpdir();
+        let f = d.join("a.txt");
+        std::fs::write(&f, "original").unwrap();
+        let p = f.display().to_string();
+
+        b.handle(post("t1", "read1", Some(&p))).await;
+        assert!(b.handle(pre("t1", "write1", Some(&p))).await.allow);
+        std::fs::write(&f, "our edit").unwrap();
+        b.handle(post("t1", "write1", Some(&p))).await;
+
+        // Somebody outside this conversation rewrites it.
+        std::fs::write(&f, "clobbered by another turn").unwrap();
+
+        let r = b.handle(pre("t1", "write2", Some(&p))).await;
+        assert!(!r.allow, "a genuine foreign write must still be refused");
+        assert!(r.reason.unwrap().contains("Re-read"));
+    }
+
+    /// THE PINNED SUBAGENT DECISION: baselines are keyed per CONVERSATION, so a subagent —
+    /// which inherits the same `--conversation` from the turn's settings file — shares them.
+    ///
+    /// On the wire a subagent call is just another `tool_use_id` under the same conversation,
+    /// which is what this asserts: its write refreshes the baseline the parent's next edit
+    /// checks, so the parent is not refused. A DIFFERENT conversation is still foreign.
+    #[tokio::test]
+    async fn a_subagents_write_refreshes_the_same_conversations_baseline() {
+        let b = Arc::new(LockBroker::new());
+        let d = tmpdir();
+        let f = d.join("a.txt");
+        std::fs::write(&f, "original").unwrap();
+        let p = f.display().to_string();
+
+        // The parent reads; a subagent of the same conversation writes.
+        b.handle(post_in("conv-A", "t1", "read1", Some(&p))).await;
+        assert!(
+            b.handle(pre_in("conv-A", "t1", "sub-write", Some(&p)))
+                .await
+                .allow
+        );
+        std::fs::write(&f, "written by the subagent").unwrap();
+        b.handle(post_in("conv-A", "t1", "sub-write", Some(&p)))
+            .await;
+
+        // The parent's next edit must not be refused by its own subagent's work.
+        assert!(
+            b.handle(pre_in("conv-A", "t1", "parent-edit", Some(&p)))
+                .await
+                .allow,
+            "a subagent shares the conversation, so its write is not foreign"
+        );
+
+        // ...but a genuinely different conversation that had read the OLD bytes is still stale.
+        b.handle(post_in("conv-B", "t2", "read-old", Some(&p)))
+            .await;
+        std::fs::write(&f, "changed again").unwrap();
+        assert!(
+            !b.handle(pre_in("conv-B", "t2", "write-b", Some(&p)))
+                .await
+                .allow,
+            "a different conversation must still get the compare-and-swap"
+        );
+    }
+
+    /// The wire compatibility that keeps a pre-restart child alive across a deploy.
+    #[test]
+    fn an_old_hooks_read_field_still_parses_as_baseline() {
+        let raw = r#"{"op":"post","turn":"t1","conversation":"c1","tool_use_id":"x","read":"/tmp/a.txt"}"#;
+        let req: HookRequest = serde_json::from_str(raw).expect("old payload must still parse");
+        match req {
+            HookRequest::Post { baseline, .. } => {
+                assert_eq!(baseline.as_deref(), Some("/tmp/a.txt"))
+            }
+            _ => panic!("expected a post"),
+        }
     }
 
     #[tokio::test]

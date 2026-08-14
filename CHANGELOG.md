@@ -95,6 +95,62 @@ CI both run it). See the "Versioning" section of `bridge/README.md`.
 
 - Every field added here is additive and decodes absent → nil, so a generator that does not
   emit one changes nothing: the row simply does not appear.
+## [Bridge 0.82.0] - 2026-08-14
+
+### Fixed
+
+- **A conversation invalidated itself: the write lock recorded a compare-and-swap
+  baseline on `Read` only, so a turn's own successful write left that baseline at
+  the pre-write bytes and the very next edit to the same path was refused.** The
+  symptom read as a phantom conflict — "changed on disk since this conversation
+  read it — another turn wrote it first" — when no other turn had touched
+  anything; re-reading cleared it, and the next edit tripped it again. The root
+  cause was one predicate: `hook_read_target` returned a path only when
+  `tool_name == "Read"`, so the `PostToolUse` hook that fires after a write
+  recorded nothing and the stale hash survived the write that invalidated it.
+
+  It was not rare, and it landed on exactly the files the morning chain writes:
+  **414 such denials sit in the vault transcripts, 50 of them on `Today.md` and 12
+  on `Start-of-Day-Routine.md`.** A refusal a re-read clears is cheap for a person
+  at a keyboard and expensive for an unattended 03:30 turn, which has nobody to
+  re-read on its behalf.
+
+  The fix records a baseline for whatever file a call leaves the conversation
+  looking at — one it read, or one it just successfully wrote — and it is one
+  expression in `jesse-hook`, so BOTH harnesses are fixed by it: each already
+  implements `hook_write_target` for the lock itself, so nothing new had to learn
+  either payload shape.
+
+  **Taking the post-call bytes is safe for a measured reason, not an assumed one.**
+  A denied call never delivers a `PostToolUse` at all — verified on claude 2.1.231
+  with a `PreToolUse` hook exiting 2, which logged `PRE-FIRED` and nothing else —
+  so by the time a post arrives the compare-and-swap has already passed and the
+  lock has been held across the call, leaving this call as the only writer in that
+  window. Had a denial delivered a post, this would have adopted the other turn's
+  bytes as our baseline and dropped the conflict silently. The check is not
+  weakened: a genuine foreign write is still caught, with a regression test in each
+  direction.
+
+  **The subagent question is now decided rather than incidental.** Baselines stay
+  keyed per CONVERSATION, which spans subagents — a subagent inherits the turn's
+  settings file and therefore its `--conversation`, so its writes are the
+  conversation's own work and not foreign. Treating them as foreign would refuse
+  the parent's next edit after every subagent write (4 of the 7 false conflicts
+  observed on 2026-08-14 were inside subagents). `HookPayload::session_id` would
+  separate them and is deliberately not used. The residual cost is named in the
+  code rather than hidden: two subagents writing one file in parallel are
+  indistinguishable at that layer, and the per-file lock — not the baseline map —
+  is what serialises them.
+
+  The mtime hypothesis was ruled out rather than left open: the comparison has
+  always been a content hash, so an external toucher moving mtime was never capable
+  of producing this.
+
+  **No argv changes, so the containment record is untouched** — the write lock's
+  hooks travel in a settings file, not in `capability_args`, and the wire field
+  rename carries `serde(alias = "read")` so a child spawned before the restart
+  still parses against the new broker.
+
 ## [Bridge 0.81.0] - 2026-08-13
 
 ### Added

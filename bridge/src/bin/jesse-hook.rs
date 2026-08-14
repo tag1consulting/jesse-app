@@ -157,8 +157,20 @@ fn main() {
             turn: args.turn.clone(),
             conversation: args.conversation.clone(),
             tool_use_id: payload.tool_use_id.clone(),
-            read: harness
+            // What this call leaves the conversation looking at: the file it READ, or — and
+            // this is the 0.82.0 fix — the file it just successfully WROTE.
+            //
+            // Both harnesses are fixed by this one expression, because both already implement
+            // `hook_write_target` for the lock itself; nothing new has to learn either payload
+            // shape. A `WriteTarget::Global` (a shell command, an unrecognised tool) names no
+            // file, so it records nothing rather than guessing — the same conservative default
+            // `hook_read_target` documents.
+            baseline: harness
                 .hook_read_target(&payload)
+                .or_else(|| match harness.hook_write_target(&payload) {
+                    WriteTarget::Path(p) => Some(p),
+                    WriteTarget::Global | WriteTarget::None => None,
+                })
                 .map(|p| p.display().to_string()),
         },
         other => deny(
