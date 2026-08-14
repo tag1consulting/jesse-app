@@ -37,22 +37,85 @@ Default allowlist (`JESSE_ALLOWED_TOOLS` to override):
 | `Read(./**)`, `Write(./**)`, `Edit(./**)` | Read and record durable facts in vault files — **path-scoped to the working directory**, which every spawn site sets to the vault |
 | `Grep(./**)`, `Glob(./**)` | Locate files and content in the vault — scoped for the same reason, because `Grep` reads file *content* and takes a path argument |
 | `mcp__qmd__query`, `mcp__qmd__get`, `mcp__qmd__multi_get`, `mcp__qmd__status` | Read-only QMD vault search — the first step for any vault lookup |
-| `Skill(diet-logging)` | Auto-invoke the vault's `diet-logging` skill on a food/exercise/weigh-in log. The Skill tool only **loads instruction text** — it executes nothing itself; every action the skill prescribes still flows through the scoped `Read`/`Write`/`Edit` and the three `Bash(node todo-list/*.js:*)` scripts, so the action surface is unchanged. Pinned to the single named skill, never a bare `Skill` (which would let any future vault skill run from a phone request) |
+| `Skill(diet-logging)` | Auto-invoke the vault's `diet-logging` skill on a food/exercise/weigh-in log. The Skill tool only **loads instruction text** — it executes nothing itself; every action the skill prescribes still flows through the scoped `Read`/`Write`/`Edit` and the three `Bash(node vault/*.js:*)` scripts, so the action surface is unchanged. Pinned to the single named skill, never a bare `Skill` (which would let any future vault skill run from a phone request) |
 | `Bash(git:*)` | Vault history / status, and clone/fetch/log/diff/show for **read-only code review** (see [Code review checkouts](#code-review-checkouts-review-only)) |
 | `Bash(mv:*)`, `Bash(ls:*)`, `Bash(cat:*)`, `Bash(find:*)` | Scoped file wrangling |
 | `Bash(date:*)`, `Bash(cal:*)` | Clock / date math backing the per-turn clock header (relative-date math, alternate formats). Pure computation — `date -s` needs root and fails as a non-privileged user, `cal` only prints, so no side effect is reachable |
 | `Bash(head:*)`, `Bash(tail:*)`, `Bash(wc:*)` | Strictly read-only inspection of large files/logs (the diet CSVs and logs) without slurping the whole file — rounds out the existing `cat`/`ls`/`find` read set. No writes, no network |
-| `Bash(node todo-list/generate-diet-today.js:*)` | Regenerate the `diet-today.js` dashboard cache from the authoritative CSVs after a food/exercise/weigh-in log (without it, a phone log appends the CSV but leaves the cache stale) |
-| `Bash(node todo-list/validate-diet-today.js:*)`, `Bash(node todo-list/verify-diet-consistency.js:*)` | The generator's two guards — field-contract validation and CSV-vs-cache consistency — run after each regeneration |
+| `Bash(node vault/generate-diet-today.js:*)` | Regenerate the `diet-today.js` dashboard cache from the authoritative CSVs after a food/exercise/weigh-in log (without it, a phone log appends the CSV but leaves the cache stale) |
+| `Bash(node vault/validate-diet-today.js:*)`, `Bash(node vault/verify-diet-consistency.js:*)` | The generator's two guards — field-contract validation and CSV-vs-cache consistency — run after each regeneration |
+| `Bash(node vault/rotate-currency-summary.js:*)` | Keep the running currency summaries bounded (newest 60 rows live, the rest into a per-year archive). Pinned like the three above, and carrying the same write-then-execute cost named below |
+| `Bash(./.claude/skills/diet-query/run-week-query.sh:*)`, `Bash(./.claude/skills/currency-stats/currency-stats.py:*)`, `Bash(./.claude/skills/gh-review/create-pending-review.sh:*)` | **The compute wrappers that replaced the interpreters.** Each accepts DATA, never code: the duckdb wrapper runs only the committed `week.sql` and takes at most two round-trip-validated dates; the stats script reads a rate series on stdin with no `eval` and refuses unknown arguments; the review wrapper fixes the method, repo and path. See the withdrawal note below |
+| `Bash(shasum:*)` | Fingerprinting. It reads and prints — there is no destination path to point outside the vault |
+| `Bash(./.claude/skills/archive-processing/find-checked-archive-boxes.sh:*)`, `Bash(./.claude/skills/draft-lint/lint-draft.sh:*)` | The one command each of `archive-box` and `overnight-vault-lint` actually runs. Without them each job reads its skill's instructions and cannot act on them. Same write-then-execute cost as the pinned `node` scripts |
+| `Bash(gh pr list/view/checks:*)`, `Bash(gh issue list/view:*)`, `Bash(gh run list/view:*)`, `Bash(gh release list/view:*)`, `Bash(gh repo view:*)` | Read-only GitHub queries backing `overnight-tag1-status`. `gh run list`'s head-SHA field is what distinguishes a CI run on *this* commit from one on an older commit |
+| `Bash(gh issue create:*)`, `Bash(gh pr create:*)` | The two authoring verbs that are cleanly expressible — token-bounded, only flags in the free tail |
+| `Bash(gh api repos/tag1consulting/jesse-app/pulls:*)` | Repo-pinned, single-endpoint. The free tail means `--method POST/PATCH/DELETE` **on that exact endpoint** (i.e. create-a-PR by API). It does **not** reach `/pulls/<N>/anything`, so it cannot merge, comment, or create a review. A blanket `Bash(gh api:*)` is deliberately **not** granted: `--method` would turn it into a general write client for the whole API |
+| `Skill(health-new-day)`, `Skill(dashboard-regen)`, `Skill(archive-processing)`, `Skill(draft-lint)`, `Skill(health-export-import)` | The five skills the scheduled jobs invoke, each pinned by name. Like `Skill(diet-logging)`, they only **load instruction text** |
+| `mcp__github__*` (twenty-five) | Read-only GitHub. Sixteen from `--toolsets repos,actions`; nine issue/PR readers added 2026-08-14 by widening the server to `repos,actions,issues,pull_requests`. `--read-only` stays, so the server never builds a mutating tool to withhold — the authoring verbs come from `gh`, not from here |
 | `WebSearch` | Read-only web search (titles, URLs, snippets). Added 2026-08-05 — see [Web access](#web-access-websearch-and-webfetch-2026-08-05) |
 | `WebFetch` | Read-only fetch of a web page. Added 2026-08-05, **reversing a standing deny** — see [Web access](#web-access-websearch-and-webfetch-2026-08-05) for the decision, the residual risk, and the available narrowing |
 | `mcp__slack__*` (six) | Read-only Slack read and search. See [Slack](#slack-read-only-2026-08-05) for the six granted and the nine withheld |
 | `mcp__browser__*` (nineteen) | Headless browser: navigate, read, and the interaction verbs. Added 2026-08-07, because `WebFetch` is refused outright on a large set of hosts. See [Browser](#browser-headless-2026-08-07) for the five withheld and why |
 
-These three `node` entries are pinned to the **exact script paths**, never a bare
-`Bash(node:*)`: a bare node scope would allow `node -e "<arbitrary JS>"` —
-arbitrary code execution from a phone request — so only the three named diet-cache
-scripts are permitted (`build_claude_args_enforces_least_privilege` asserts this).
+These four `node vault/<script>.js` entries are pinned to the **exact script
+paths**, never a bare `Bash(node:*)`: a bare node scope would allow
+`node -e "<arbitrary JS>"` — arbitrary code execution from a phone request — so
+only the named scripts are permitted
+(`build_claude_args_enforces_least_privilege` asserts this).
+
+**KNOWN OPEN, recorded rather than closed: every pinned-script grant is a
+WRITE-THEN-EXECUTE path to arbitrary code.** It is not a grant to run *today's*
+file contents. The child holds a scoped write grant over the same tree, so it can
+rewrite one of these scripts and then invoke it under its own pinned rule. That is
+true of the four `node vault/*.js` scopes, the two pinned skill scripts, and the
+three compute wrappers. The mitigation is that the tree is version-controlled and
+committed — **not** that the path is pinned. It is carried in the containment
+record's notes as a baseline so it stays visible.
+
+### The interpreters were granted, measured, and withdrawn the same day (2026-08-14)
+
+Recorded here because the obvious next edit to the allowlist is to add them back.
+The batch first carried `Bash(node --check:*)`, `Bash(node -c:*)`,
+`Bash(python3:*)`, `Bash(/usr/bin/python3:*)`, `Bash(duckdb:*)`, `Bash(uniq:*)`,
+`Bash(cp:*)` and `Bash(mkdir:*)`. One live containment battery answered them:
+**all three write-escape hard gates went from denied to ALLOWED** — real files
+landed outside the vault, including in the bridge's own state directory — and
+every read baseline opened alongside them.
+
+**The reason is structural.** The vault write boundary is enforced by one thing:
+the path scope on `Edit(./**)` (`Write(./**)` matches nothing — the CLI says so
+itself). Every one of those grants writes through **Bash**, which that scope never
+touches. A Bash verb that takes a destination path is not a small widening; it is
+the boundary, gone.
+
+Each was verified individually rather than blamed as a group:
+
+| Grant | What it actually was |
+| --- | --- |
+| `cp`, `mkdir` | Take a destination path. Obvious in hindsight |
+| `uniq` | POSIX `uniq [input [output]]` — `uniq in ../out` writes outside, and it reads as the most harmless line in the batch |
+| `duckdb` | **The CLI is a shell.** `.shell`/`.system` ran a command, `COPY … TO` wrote `../escaped.csv`, `INSTALL`/`LOAD` pull code. Granting it was granting `bash`, which makes every deliberate omission below decorative |
+| `python3` | Arbitrary code, stated plainly |
+| `node --check` | **Not a syntax check.** `--check` refuses to execute only the file it is *given*; the free tail supplies a flag that loads another. `--require`, `-r` and `--import` all executed on both node v22.20.0 and v26.4.0, and a live matcher probe confirmed the rule permits it |
+
+They were replaced by the three pinned wrappers in the table above, each taking
+data and never code. After the withdrawal the three hard gates were re-probed
+live and came back **denied / pass**, stable across two attempts each.
+
+**Read a passing gate honestly.** A `denied` verdict is a live model attempt that
+did not find a route, never a proof that none exists. The write-then-execute route
+predates this batch and the gates passed anyway, because no probe went looking for
+it. Adding interpreters did not create a new class so much as make an existing one
+trivially reachable.
+
+**The pending review is a wrapper because it cannot be a rule.** `gh pr review`
+offers only `--approve`, `--request-changes` and `--comment`, all of which publish
+on creation; the REST route needs a per-PR endpoint no glob form reaches —
+`pulls:*`, `pulls/*/reviews:*` and `pulls/*:*` were each probed and each refused,
+because matching is at path-token granularity and `*` does not cross `/`. The
+wrapper fixes the method, repo and path, never sends `event`, and reads the state
+back to refuse anything other than `PENDING`. Publishing is deliberately not in it.
 
 Default denylist (`JESSE_DISALLOWED_TOOLS` to override) — denied even if they
 reach the allowlist:
@@ -597,6 +660,17 @@ perform returned byte-identical results **unauthenticated** — it was reading p
 proving nothing. So the working credential is the classic PAT, and the read-only posture is
 the server's `--read-only` flag plus the allowlist. If either is removed, writes become
 possible with no second line of defence.
+
+**The `gh` grants added in 0.82.0 sit behind the same single layer, and three of them write on
+purpose.** `gh` authenticates from its own stored credential, not from a scope this project
+narrowed, so nothing under it is read-only by construction — the enumerated subcommands in the
+allowlist are the whole boundary, exactly as above. The three deliberate writers are
+`gh issue create`, `gh pr create`, and `gh api …/pulls:*`, whose free tail permits
+`--method POST/PATCH/DELETE` on that one endpoint. What holds the line is that the *verbs* are
+enumerated: no publishing, merging, closing, deleting or editing verb is granted, and a blanket
+`Bash(gh api:*)` is refused precisely because `--method` would make it a general write client
+for the whole API. Widening any of these is a posture change, not a convenience — it costs a
+battery run.
 
 ### UniFi and Proxmox are full control, by decision
 

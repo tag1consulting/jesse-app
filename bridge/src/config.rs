@@ -140,6 +140,185 @@ pub const DEFAULT_MAX_ATTACHMENTS_TOTAL_BYTES: usize = 20 * 1024 * 1024;
 // from a phone request) — the narrowest scope the CLI accepts
 // (verified against claude 2.1.195). cwd is the vault, so the skill is discovered
 // from `.claude/skills/` there.
+// ---- The 0.82.0 morning-run batch, and what each line really costs -----------
+//
+// Added so the bridge's SCHEDULED jobs can finish their own work. These are the
+// headless morning/overnight chain's grants, not a desktop convenience: a desktop
+// `settings.local.json` grant does NOTHING here, because this allowlist is the
+// child's whole world and the two do not union.
+//
+// EVERY CLAIM BELOW WAS MEASURED ON 2026-08-14 against claude 2.1.231 and the
+// binaries this host actually runs, not read off a manual.
+//
+// THE MATCHER, FIRST, BECAUSE THREE OF THESE GRANTS DEPEND ON ITS SHAPE. A
+// `Bash(<prefix>:*)` rule matches at ARGUMENT-TOKEN granularity with a free tail:
+//   * `gh api repos/O/R/pulls:*` ALLOWS `gh api repos/O/R/pulls --method GET`
+//     (positive control: it ran and returned a 404 from a nonexistent repo)...
+//   * ...and REFUSES `gh api repos/O/R/pulls/1/merge --method PUT`, because
+//     `pulls/1/merge` is a different token than `pulls`. A raw string prefix would
+//     have matched it; this does not.
+//   * A MID-STRING GLOB DOES NOT MATCH: a rule `.../pulls/*/reviews:*` refused
+//     `.../pulls/7/reviews`, and `.../pulls/*:*` refused it too — `*` does not
+//     cross `/`. So an endpoint can be pinned exactly or not at all.
+//   * SHELL CHAINING IS CAUGHT: under `Bash(node --check:*)`, the command
+//     `node --check ok.js && node ./mod.js` was split and the second half refused.
+// The tail being free is the load-bearing half. Read every grant below as
+// "this prefix, plus ANY further arguments".
+//
+// THE INTERPRETERS WERE GRANTED, MEASURED, AND WITHDRAWN THE SAME DAY. This is the
+// load-bearing history, because the obvious next edit to this file is to add them
+// back. On 2026-08-14 the batch first carried `Bash(node --check:*)`,
+// `Bash(node -c:*)`, `Bash(python3:*)`, `Bash(/usr/bin/python3:*)`,
+// `Bash(duckdb:*)`, `Bash(uniq:*)`, `Bash(cp:*)` and `Bash(mkdir:*)`. The live
+// containment battery answered them in one run:
+//
+//   * `write_escape_parent`, `write_escape_symlink` and `write_escape_state_dir` —
+//     all three HARD GATES — went from denied to ALLOWED. Real files landed outside
+//     the vault, including inside the bridge's own state directory.
+//   * Every read baseline opened with them: `read_escape_parent`,
+//     `read_escape_symlink`, `read_state_dir`, `read_agent_credential`,
+//     `read_session_transcript`, `read_env_token`.
+//
+// THE REASON IS STRUCTURAL AND WORTH UNDERSTANDING BEFORE TOUCHING THIS LIST. The
+// vault write boundary is enforced by ONE thing: the path scope on `Edit(./**)`
+// (`Write(./**)` matches nothing — see the CLI's own warning). Every grant above
+// writes through BASH, which that scope never touches. So a Bash verb that takes a
+// destination path is not "a small widening"; it is the boundary, gone.
+//
+// Each was verified individually rather than blamed as a group:
+//   * `cp` / `mkdir` — take a destination path. Obvious in hindsight.
+//   * `uniq` — POSIX `uniq [input [output]]`. `uniq in ../out` writes outside, and
+//     it reads as the most harmless line in the batch.
+//   * `duckdb` — THE CLI IS A SHELL. `.shell`/`.system` run arbitrary commands
+//     (measured: `.shell echo` printed), `COPY … TO` wrote `../escaped.csv`, and
+//     `INSTALL`/`LOAD` pull code. Granting it was granting `bash`, which makes every
+//     deliberate omission at the bottom of this comment decorative.
+//   * `python3` — arbitrary code, stated plainly rather than dressed up.
+//   * `node --check` — NOT a syntax check. `--check` refuses to execute only the file
+//     it is GIVEN; the free tail supplies a flag that loads another. Measured on both
+//     node v22.20.0 (the bridge's) and v26.4.0: `--check --require ./m.js`,
+//     `--check -r ./m.js` and `--check --import ./m.mjs` all EXECUTED, and a live
+//     matcher probe confirmed the rule permits the `--require` form. Only
+//     `--check --eval` is refused, and node refuses it, not us.
+//
+// WHAT REPLACED THEM: three PINNED WRAPPERS in the vault, each accepting DATA and
+// never code, so the jobs keep their arithmetic and the child holds no interpreter.
+//   * `run-week-query.sh` runs the committed `week.sql` and nothing else. It takes at
+//     most two dates, shape-checked and then ROUND-TRIPPED through the parser —
+//     BSD `date -j -f` normalises 2026-02-31 into 2026-03-03 and exits 0, so a bare
+//     parse accepts impossible dates. It validates `week.sql` before running it, and
+//     passes `-no-init` because duckdb otherwise reads `~/.duckdbrc` at startup.
+//   * `currency-stats.py` computes the percentile and moving averages the currency
+//     reports quote, from a series on stdin. No `eval`, no file-path argument, and
+//     unknown arguments are refused rather than ignored.
+//   * `create-pending-review.sh` — see the `gh` section below for why this one has to
+//     be a wrapper rather than a rule.
+//
+// THE TWO PINNED SKILL SCRIPTS —
+// `Bash(./.claude/skills/archive-processing/find-checked-archive-boxes.sh:*)` and
+// `Bash(./.claude/skills/draft-lint/lint-draft.sh:*)` — are what let the
+// `archive-box` and `overnight-vault-lint` jobs find their own work; without them
+// each job can read its skill's instructions and cannot act on them. Both filenames
+// were confirmed on disk on 2026-08-14 rather than copied from the prompt.
+//
+// `Bash(node vault/rotate-currency-summary.js:*)` — the currency jobs' size ceiling.
+// Without it the running summaries grow unbounded and eventually cost more context
+// than the analysis they feed.
+//
+// KNOWN OPEN, STATED PLAINLY AND NOT CLOSED HERE: every pinned-script grant is a
+// WRITE-THEN-EXECUTE PATH TO ARBITRARY CODE, not a grant to run today's file
+// contents. The child holds a scoped write grant over the same tree, so it can
+// rewrite the script and then invoke it under its own pinned rule. That is true of
+// the four `node vault/*.js` scopes, the two skill scripts, and the three wrappers
+// above. The mitigation is that the tree is version-controlled and committed — NOT
+// that the path is pinned. The wrappers narrow it further by validating their own
+// inputs and, for `week.sql`, the query file itself; they do not close it.
+//
+// AND BE HONEST ABOUT WHAT THAT MEANS FOR THE GATES: a `denied` verdict in this
+// battery is a live model attempt that did not find a route, never a proof that none
+// exists. The write-then-execute route above predates this batch — the three
+// `node vault/*.js` scopes have carried it since 0.60.0 — and the hard gates passed
+// anyway, because no probe went looking for it. Adding interpreters did not create a
+// new class so much as make an existing one trivially reachable. Read a passing gate
+// as "no probe found a way", not "there is no way".
+//
+// `Bash(shasum:*)` — fingerprinting. It reads and prints; there is no destination
+// path to point outside the vault.
+//
+// §9's READ VERBS WERE MEASURED AND ALL BUT ONE DROPPED, which is the honest outcome
+// rather than the tidy one. With an EMPTY allowlist, `grep`, `stat`, `du`, `file`,
+// `diff`, `sort` and `which` all RAN — the harness auto-approves them, so granting
+// them would have added seven lines that change nothing and make this record read as
+// broader than it is. `uniq` was the only one actually refused, and it is not granted
+// either, for the output-file reason above.
+//
+// THE `gh` GRANTS split into readers and two authoring verbs, and the split is
+// deliberate. The readers (`pr list/view/checks`, `issue list/view`,
+// `run list/view`, `release list/view`, `repo view`) are what
+// `overnight-tag1-status` reports from; `gh run list`'s head-SHA field is what
+// lets a CI check tell a run on THIS commit from a run on an older one.
+// `gh issue create` and `gh pr create` are token-bounded — only flags follow — and
+// were decided deliberately on 2026-08-14. The third authoring verb, a pending
+// review, is a WRAPPER rather than a rule; the next paragraph but one says why.
+//
+// NOTHING UNDER `gh` IS READ-ONLY BY CONSTRUCTION, which is the half a reader will
+// miss. `gh` authenticates from its own stored credential, not from a scope this
+// project narrowed, so — exactly as with the GitHub MCP server's classic PAT — this
+// list is the ONLY boundary. What holds the line is that the verbs are enumerated:
+// no publishing, merging, closing, deleting or editing verb appears here.
+//
+// A BLANKET `Bash(gh api:*)` IS NOT GRANTED and must not be: `--method` turns it
+// into a general write client for the whole API, and a prefix match cannot stop
+// that. What IS granted is the single repo-pinned
+// `Bash(gh api repos/tag1consulting/jesse-app/pulls:*)`, on the operator's
+// explicit decision. BE CLEAR ABOUT WHAT IT BUYS AND WHAT IT DOES NOT: the free
+// tail means `--method POST` on that exact endpoint, i.e. create-a-PR by API, and
+// `--method PATCH`/`DELETE` on it too. It does NOT reach `/pulls/<N>/anything`,
+// so it cannot merge, cannot comment, and — the reason it was asked for — CANNOT
+// create a pending review.
+//
+// THE PENDING REVIEW IS A WRAPPER BECAUSE IT CANNOT BE A RULE, and that was
+// measured rather than assumed. `gh pr review` on 2.95.0 offers only `--approve`,
+// `--request-changes` and `--comment`, all of which PUBLISH on creation, so there
+// is no draft mode to grant. The REST route is
+// `POST repos/O/R/pulls/<N>/reviews` with `event` OMITTED — but the PR number sits
+// in the path, and the matcher works at path-token granularity with no mid-string
+// glob, so `…/pulls:*`, `…/pulls/*/reviews:*` and `…/pulls/*:*` were each probed
+// and each REFUSED `…/pulls/7/reviews`. No rule both reaches this endpoint and
+// stops short of the rest of the API.
+//
+// So `Bash(./.claude/skills/gh-review/create-pending-review.sh:*)` is granted
+// instead. It fixes the method, the repository and the path; the caller supplies a
+// digits-only PR number and prose. It never sends `event`, and it READS THE STATE
+// BACK and fails unless it is `PENDING` — if a future API change ever made these
+// publish on creation, it stops rather than speaking on Jeremy's behalf.
+// Publishing is deliberately not in it: a human submits the review. Verified live
+// on 2026-08-14 — the created review read back `state=PENDING`, `submitted_at=null`
+// with zero visible comments, and became visible only after a hand publish.
+//
+// THE FIVE `Skill(<name>)` GRANTS are by name, never a bare `Skill`, each
+// confirmed against `~/jesse/.claude/skills/` on 2026-08-14. Like
+// `Skill(diet-logging)` above they only LOAD instruction text; every action they
+// prescribe still flows through the scopes already granted here.
+//
+// GITHUB MCP GREW BY NINE, AND THE SERVER'S ARGV CHANGED WITH IT. The missing
+// issue and PR tools were never a registration bug: this bridge pins the server
+// to `--toolsets repos,actions`, so the rest were never built. Enumerated live on
+// 2026-08-14 against github-mcp-server 1.8.0, `--read-only` in both runs:
+// `repos,actions` registers exactly the 16 already granted above, and adding
+// `issues,pull_requests` registers 25. The nine new ones are granted; every one
+// carries `readOnlyHint:true`, and `--read-only` means the server never builds a
+// mutating tool to withhold. The authoring verbs therefore come from `gh`, not
+// from here.
+//
+// STILL DELIBERATELY ABSENT, re-confirmed against this batch: any bare
+// interpreter or shell (`bash`, `sh`, `zsh`, unversioned `python`, and `node`
+// without a check flag or a pinned script — the two `--check` scopes are the
+// argued exception above); `curl` and `wget` (a SEND channel, not a read one);
+// every publishing, merging, closing, deleting or editing `gh` verb and a blanket
+// `gh api`; `rm`, `chmod`, `chown`, `kill`, `sudo`; `ssh`, `scp`, `rsync`;
+// `launchctl`, `cargo`; `sed -i` and `awk`; `osascript`, `screencapture`.
+//
 // ---- Why the five file/search grants carry `(./**)` --------------------------
 //
 // PATH SCOPE, added 2026-07-29 after the live battery recorded three unmet hard
@@ -376,6 +555,21 @@ Bash(date:*),Bash(cal:*),Bash(head:*),Bash(tail:*),Bash(wc:*),\
 Bash(node vault/generate-diet-today.js:*),\
 Bash(node vault/validate-diet-today.js:*),\
 Bash(node vault/verify-diet-consistency.js:*),\
+Bash(node vault/rotate-currency-summary.js:*),\
+Bash(./.claude/skills/archive-processing/find-checked-archive-boxes.sh:*),\
+Bash(./.claude/skills/draft-lint/lint-draft.sh:*),\
+Bash(./.claude/skills/diet-query/run-week-query.sh:*),\
+Bash(./.claude/skills/currency-stats/currency-stats.py:*),\
+Bash(./.claude/skills/gh-review/create-pending-review.sh:*),\
+Bash(shasum:*),\
+Bash(gh pr list:*),Bash(gh pr view:*),Bash(gh pr checks:*),\
+Bash(gh issue list:*),Bash(gh issue view:*),\
+Bash(gh run list:*),Bash(gh run view:*),\
+Bash(gh release list:*),Bash(gh release view:*),Bash(gh repo view:*),\
+Bash(gh issue create:*),Bash(gh pr create:*),\
+Bash(gh api repos/tag1consulting/jesse-app/pulls:*),\
+Skill(health-new-day),Skill(dashboard-regen),Skill(archive-processing),\
+Skill(draft-lint),Skill(health-export-import),\
 WebSearch,WebFetch,\
 mcp__slack__conversations_history,mcp__slack__conversations_replies,\
 mcp__slack__conversations_search_messages,mcp__slack__channels_list,\
@@ -419,6 +613,10 @@ mcp__github__get_release_by_tag,mcp__github__get_tag,mcp__github__list_branches,
 mcp__github__list_commits,mcp__github__list_releases,\
 mcp__github__list_repository_collaborators,mcp__github__list_tags,mcp__github__search_code,\
 mcp__github__search_commits,mcp__github__search_repositories,\
+mcp__github__issue_read,mcp__github__list_issues,mcp__github__search_issues,\
+mcp__github__list_issue_fields,mcp__github__list_issue_types,mcp__github__get_label,\
+mcp__github__pull_request_read,mcp__github__list_pull_requests,\
+mcp__github__search_pull_requests,\
 mcp__fastmail__get_mailboxes,mcp__fastmail__search_emails,mcp__fastmail__get_email_content,\
 mcp__unifi__unifi_tool_index,mcp__unifi__unifi_execute,mcp__unifi__unifi_batch,\
 mcp__unifi__unifi_batch_status,mcp__unifi__unifi_load_tools,\
