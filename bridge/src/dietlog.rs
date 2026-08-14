@@ -3289,6 +3289,60 @@ mod tests {
     }
 
     #[test]
+    fn sub_gram_trans_fat_survives_write_read_and_serve_unrounded() {
+        // The ruminant trans fat in a dairy portion is HUNDREDTHS of a gram, and that is
+        // the whole magnitude the column ever carries outside a fried-food day. Nothing
+        // on the path from the food log to the served snapshot may round it: the app is
+        // what decides display precision, and a 0.05 flattened to 0 here would be a false
+        // zero no display precision downstream could undo.
+        let e = FoodEntry {
+            unknowable_composite: false,
+            name: "Greek yogurt (full-fat)".into(),
+            meal: "Breakfast".into(),
+            time: Some("08:00".into()),
+            amount: Some("2 tbsp (~30g)".into()),
+            unit: None,
+            kcal: Some(29.0),
+            protein_g: None,
+            carbs_g: None,
+            fat_g: Some(1.5),
+            fiber_g: None,
+            sodium_mg: None,
+            satfat_g: Some(1.0),
+            sugar_g: None,
+            potassium_mg: None,
+            calcium_mg: None,
+            omega3_mg: None,
+            magnesium_mg: None,
+            cholesterol_mg: None,
+            trans_fat_g: Some(0.05),
+            added_sugar_g: None,
+            purines_mg: None,
+            mercury_ug: None,
+            selenium_ug: None,
+            vitamin_d_ug: None,
+            notes: None,
+        };
+        let row = food_row(&e, "2026-08-14");
+        assert!(
+            row.split(',').any(|c| c == "0.05"),
+            "the CSV cell is written verbatim, not rounded: {row}"
+        );
+        let csv = format!("{}\n{row}\n", food_log_header());
+
+        // Read back as one day's items…
+        let (meals, errors) = crate::diet::reconstruct_meals(&csv, "2026-08-14");
+        assert!(errors.is_empty(), "clean row: {errors:?}");
+        assert_eq!(meals[0]["items"][0]["tfat"], 0.05);
+
+        // …and through the per-day series the app's trends read, which aggregates the
+        // same column by a different path.
+        let series = crate::diet::nutrient_series(&csv);
+        assert_eq!(series[0]["nutrients"]["tfat"]["sum"], 0.05);
+        assert_eq!(series[0]["nutrients"]["tfat"]["known"], 1);
+    }
+
+    #[test]
     fn no_loggable_content_flag_parses() {
         let ex = parse_diet_entries(r#"{"no_loggable_content":true,"entries":[]}"#).unwrap();
         assert!(ex.no_loggable_content);

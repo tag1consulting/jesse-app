@@ -873,49 +873,91 @@ final class DietSemanticsTests: XCTestCase {
         XCTAssertEqual(g.status, .suspended)
     }
 
-    // MARK: - ZERO CEILING (trans fat): "none" is a real goal, not a missing one
+    // MARK: - TRANS FAT: an ordinary ceiling, at sub-gram precision
 
     private func tfatGauge(_ items: [DietItem], target: Double? = 0) -> MetricGauge {
         let today = microDay(items, targets: DietTargets(transFat: target))
         return S.micronutrientGauge(.transFat, meals: today.meals, targets: today.targets, hour: 20)
     }
 
-    func testZeroCeilingAtZeroIsMet() {
-        let g = tfatGauge([DietItem(item: "oats", tfat: 0)])
-        XCTAssertEqual(g.value, 0)
-        XCTAssertEqual(g.goalStatus, .met, "a measured zero is the goal reached, not missing data")
-        XCTAssertEqual(g.status, .green)
-        XCTAssertEqual(g.tone, .onTrack)
-        XCTAssertEqual(g.remaining, "none — ideal")
-        XCTAssertEqual(g.fraction, 0)
+    /// The unreachable-ceiling fix: a target of 0 is NO USABLE TARGET here, exactly as it
+    /// is for every other nutrient. It used to be a real ceiling of "none", which the
+    /// ruminant trans fat in any dairy day failed by construction, forever.
+    func testAZeroTransFatTargetIsNoUsableTargetNotAPermanentFailure() {
+        let g = tfatGauge([DietItem(item: "Greek yogurt (full-fat)", tfat: 0.05)])
+        XCTAssertEqual(g.value, 0.05)
+        XCTAssertEqual(g.goalStatus, .noGoal, "a 0 ceiling judges nothing — it cannot be met")
+        XCTAssertEqual(g.status, .suspended)
+        XCTAssertEqual(g.tone, .inProgress, "shown plain, never a standing red")
+        XCTAssertNil(g.fraction, "no usable target, so no proportion to draw")
     }
 
-    func testZeroCeilingAboveZeroIsOverByTheWholeAmount() {
-        let g = tfatGauge([DietItem(item: "pastry", tfat: 1.5), DietItem(item: "oats", tfat: 0)])
-        XCTAssertEqual(g.goalStatus, .over(1.5))
-        XCTAssertEqual(g.status, .red)
-        XCTAssertEqual(g.tone, .nudge, "firm but never an alarm over a trace amount")
-        XCTAssertEqual(g.remaining, "2g logged")
-        XCTAssertEqual(g.fraction, 1, "against a ceiling of none there is no headroom to draw")
+    /// A historical day whose archived targets carry a 0 must degrade the same way — this
+    /// is the case that rendered as a permanently failed goal on 2026-08-14.
+    func testAMeasuredZeroWithNoUsableTargetStillJudgesNothing() {
+        let g = tfatGauge([DietItem(item: "oats", tfat: 0)])
+        XCTAssertEqual(g.value, 0)
+        XCTAssertEqual(g.goalStatus, .noGoal)
+        XCTAssertEqual(g.status, .suspended)
+    }
+
+    /// With a real, reachable ceiling it is an ordinary ceiling in every respect.
+    func testTransFatWithARealCeilingIsJudgedLikeAnyOtherCeiling() {
+        let under = tfatGauge([DietItem(item: "Greek yogurt (full-fat)", tfat: 0.05)], target: 2)
+        XCTAssertEqual(under.goalStatus, .met)
+        XCTAssertEqual(under.status, .green)
+        XCTAssertEqual(under.remaining, "room for 1.95g")
+
+        let over = tfatGauge([DietItem(item: "pastry", tfat: 2.5)], target: 2)
+        XCTAssertEqual(over.goalStatus, .over(0.5))
+        XCTAssertEqual(over.status, .red)
+        XCTAssertEqual(over.remaining, "0.50g over")
+    }
+
+    /// The precision half of the 2026-08-14 defect: the day's one logged food carries
+    /// 0.05 g, and NOTHING the row renders may state a zero.
+    func testTransFatRendersItsRealMagnitudeNeverAZero() {
+        let g = tfatGauge([DietItem(item: "Greek yogurt (full-fat)", amount: "2 tbsp (~30g)",
+                                    tfat: 0.05)])
+        XCTAssertEqual(g.decimals, 2, "trans fat's working range is below a gram")
+        XCTAssertEqual(S.fmt(g.value, decimals: g.decimals), "0.05")
+        XCTAssertNotEqual(S.fmt(g.value, decimals: g.decimals), "0")
     }
 
     func testAZeroTargetStaysNoGoalForEveryOtherNutrient() {
-        // The reason the zero ceiling is opt-in: a 0 elsewhere means "no usable target",
-        // and reading it as a ceiling would call an untargeted day a failure.
+        // A 0 target means "no usable target" on every nutrient without exception now —
+        // reading it as a ceiling would call an untargeted day a failure.
         let today = microDay([micro(na: 1500)], targets: DietTargets(sodium: 0))
         let g = S.micronutrientGauge(.sodium, meals: today.meals, targets: today.targets, hour: 20)
         XCTAssertEqual(g.goalStatus, .noGoal)
         XCTAssertEqual(g.status, .suspended)
-        XCTAssertTrue(Micronutrient.transFat.zeroIsTheGoal)
-        for n in Micronutrient.allCases where n != .transFat {
-            XCTAssertFalse(n.zeroIsTheGoal, "\(n) must not treat a 0 target as a real ceiling")
-        }
     }
 
-    func testZeroCeilingWithNoTargetAtAllShowsValueOnly() {
+    func testTransFatWithNoTargetAtAllShowsValueOnly() {
         let g = tfatGauge([DietItem(item: "pastry", tfat: 1.5)], target: nil)
         XCTAssertEqual(g.goalStatus, .noGoal)
         XCTAssertEqual(g.status, .suspended)
+    }
+
+    // MARK: - Display precision (the never-a-false-zero formatter)
+
+    func testTransFatIsTheOnlyNutrientNeedingSubUnitPrecision() {
+        XCTAssertEqual(Micronutrient.transFat.displayDecimals, 2)
+        for n in Micronutrient.allCases where n != .transFat {
+            XCTAssertEqual(n.displayDecimals, 0,
+                           "\(n) is dosed above 1 in its own unit — whole numbers are right")
+        }
+    }
+
+    func testANonzeroValueIsNeverFormattedAsZero() {
+        // The rule that outlives trans fat: any precision, any nutrient, a real amount
+        // rounded away says it is below the threshold rather than claiming none.
+        XCTAssertEqual(S.fmt(0.004, decimals: 2), "<0.01")
+        XCTAssertEqual(S.fmt(0.4, decimals: 0), "<1")
+        XCTAssertEqual(S.fmt(0, decimals: 2), "0.00", "a measured none is not a false zero")
+        XCTAssertEqual(S.fmt(0.05, decimals: 2), "0.05")
+        XCTAssertEqual(S.fmt(2.5, decimals: 0), "3", "rounds half away from zero, like fmt")
+        XCTAssertEqual(S.fmt(-0.004, decimals: 2), ">-0.01")
     }
 
     // MARK: - Cholesterol and purines: informational, never a judgment

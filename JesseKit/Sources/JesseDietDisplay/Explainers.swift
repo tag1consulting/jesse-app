@@ -8,8 +8,10 @@ import JesseNetworking
 
 enum Explainers {
     private static func line(_ g: MetricGauge) -> String {
-        let v = DietSemantics.fmt(g.value)
-        if let t = g.target { return "\(v) / \(DietSemantics.fmt(t))\(g.unit) — \(g.remaining)" }
+        let v = DietSemantics.fmt(g.value, decimals: g.decimals)
+        if let t = g.target {
+            return "\(v) / \(DietSemantics.fmt(t, decimals: g.decimals))\(g.unit) — \(g.remaining)"
+        }
         return "\(v)\(g.unit) — \(g.remaining)"
     }
 
@@ -120,11 +122,11 @@ enum Explainers {
     private static func microLine(_ g: MetricGauge) -> String {
         guard (g.knownItemCount ?? 0) > 0 else { return DietSemantics.notTrackedCaption }
         let prefix = g.partial ? "≥" : ""
-        let v = DietSemantics.fmt(g.value)
+        let v = DietSemantics.fmt(g.value, decimals: g.decimals)
         let rem = g.remaining.isEmpty ? "" : " — \(g.remaining)"
         if g.goal == .band { return "\(prefix)\(v)\(g.unit)\(rem)" }
         if let t = g.target {
-            return "\(prefix)\(v) / \(DietSemantics.fmt(t))\(g.unit)\(rem)"
+            return "\(prefix)\(v) / \(DietSemantics.fmt(t, decimals: g.decimals))\(g.unit)\(rem)"
         }
         return "\(prefix)\(v)\(g.unit)"
     }
@@ -151,7 +153,7 @@ enum Explainers {
         case .cholesterol:
             paras.append("Cholesterol here is shown for context only — there's no target and no red or green. What you eat moves your blood numbers far less than saturated fat, trans fat, and fiber do, and all three of those are already tracked with real goals.")
         case .transFat:
-            paras.append("Trans fat is a ceiling of zero — not a small budget, none. It's the one fat that raises LDL and lowers HDL at the same time, so the goal is to see this row sit at zero rather than to keep it low.")
+            paras.append("Trans fat is a ceiling, and it counts two different fats at once: the industrial trans fat from partially hydrogenated oil, which has no safe amount, and the ruminant trans fat that occurs naturally in dairy and beef. Any day with yogurt, cheese, or butter carries a little of the natural kind, so a small number here is expected rather than a failure — the industrial share is what's worth avoiding.")
         case .addedSugar:
             paras.append("Added sugar is a ceiling — stay at or under target. It counts only what was added, not the sugar that came with fruit or milk, which is exactly why it can carry a goal where total sugars can't.")
         case .selenium:

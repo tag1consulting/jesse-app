@@ -290,6 +290,17 @@ private struct ErroringInsightStub: HealthInsightGenerating {
     func insight(for input: HealthInsightInput) -> AsyncStream<String> {
         AsyncStream { $0.finish() }
     }
+}
+
+/// The grounding facts and the discard guard for the shapes added after the first
+/// insight work: a window total, a band's unproven shortfall, the informational risk
+/// nutrients, and a ceiling that was exceeded.
+///
+/// These lived inside `ErroringInsightStub` until a missing brace was found on
+/// 2026-08-14 — methods on a private struct compile fine and NEVER RUN, so every test
+/// below had been silently dormant. They are a real XCTestCase now.
+@MainActor
+final class HealthInsightFactsTests: XCTestCase {
 
     // MARK: - Window scope (a total that covers days, not a day)
 
@@ -422,5 +433,88 @@ private struct ErroringInsightStub: HealthInsightGenerating {
         let phrase = HealthInsight.goalPhrase(.band)
         XCTAssertTrue(phrase.contains("floor"), phrase)
         XCTAssertTrue(phrase.contains("ceiling"), phrase)
+    }
+
+    // MARK: - Over the limit: no congratulation may survive (2026-08-14)
+    //
+    // The prompt already carried an authoritative goal-status line and the instruction
+    // never to claim the goal was met unless it said MET. The instruction did not hold,
+    // and no prompt instruction ever holds with certainty — so the mechanism that already
+    // discards a generation contradicting an authoritative fact covers this too.
+
+    private func overInput(decimals: Int = 2) -> HealthInsightInput {
+        HealthInsight.input(metric: .micronutrient(.transFat), total: 0.05, goal: 0.02,
+                            goalStatus: .over(0.03), goalPhrase: "a ceiling to stay under",
+                            dayStyle: "ordinary day",
+                            contributions: [FoodContribution(id: 0, name: "Greek yogurt (full-fat)",
+                                                             amount: "2 tbsp (~30g)",
+                                                             value: 0.05, share: 1)],
+                            decimals: decimals)
+    }
+
+    func testTheCongratulatoryGenerationThatShippedIsDiscarded() {
+        let generated = "Congratulations on reaching your trans fat goal for the day! "
+            + "You've successfully consumed 0 grams of trans fat, thanks to the full-fat "
+            + "Greek yogurt."
+        XCTAssertTrue(HealthInsightGuard.contradicts(generated, input: overInput()),
+                      "a congratulation on a day past the limit must produce NO insight")
+    }
+
+    func testEveryFlavourOfGoalClaimIsDiscardedWhenOver() {
+        let input = overInput()
+        for text in [
+            "Nice work — you met your trans fat goal today.",
+            "You've hit your target for trans fat.",
+            "Great job hitting your goal!",
+            "Your goal was satisfied for the day.",
+            "Congrats, that's your trans fat target reached.",
+            "Well done keeping it down.",
+        ] {
+            XCTAssertTrue(HealthInsightGuard.contradicts(text, input: input),
+                          "survived the guard: \(text)")
+        }
+    }
+
+    func testAnHonestOverInsightStillSurvives() {
+        let input = overInput()
+        for text in [
+            "You're 0.03g past the trans fat ceiling, almost all of it the full-fat Greek yogurt.",
+            "The Greek yogurt is the only trans fat contributor today, at 0.05g.",
+            "You have not met the trans fat goal today.",
+        ] {
+            XCTAssertFalse(HealthInsightGuard.contradicts(text, input: input),
+                           "wrongly discarded: \(text)")
+        }
+    }
+
+    func testCelebrationIsOnlyDiscardedAgainstAnOverStatus() {
+        // A met goal is allowed to be celebrated — that is the whole point of `met`.
+        let met = HealthInsight.input(metric: .macro(.protein), total: 150, goal: 140,
+                                      goalStatus: .met, goalPhrase: "a floor to hit or beat",
+                                      dayStyle: "ordinary day", contributions: [])
+        XCTAssertFalse(HealthInsightGuard.contradicts("Congratulations, you hit your protein goal!",
+                                                     input: met))
+    }
+
+    // MARK: - Sub-gram grounding (the false zero the model was handed)
+
+    func testTheGroundingNeverStatesAFalseZeroForASubGramNutrient() {
+        let prompt = HealthInsightPrompt.make(overInput())
+        XCTAssertTrue(prompt.contains("0.05 g"), prompt)
+        XCTAssertTrue(prompt.contains("OVER — 0.03g past the limit."), prompt)
+        XCTAssertFalse(prompt.contains("0 g"), "the model was told it consumed zero: \(prompt)")
+        XCTAssertFalse(prompt.contains("by 0g"), prompt)
+    }
+
+    func testAWholeUnitMetricGroundsExactlyAsItAlwaysHas() {
+        // decimals defaults to 0, so every existing metric's prompt is byte-identical.
+        let prompt = HealthInsightPrompt.make(HealthInsight.input(
+            metric: .macro(.carbs), total: 250, goal: 290, goalStatus: .short(40),
+            goalPhrase: "a floor to hit or beat", dayStyle: "ordinary day",
+            contributions: [FoodContribution(id: 0, name: "Pasta", amount: nil,
+                                             value: 80, share: 0.32)]))
+        XCTAssertTrue(prompt.contains("80 g"), prompt)
+        XCTAssertTrue(prompt.contains("250 g"), prompt)
+        XCTAssertFalse(prompt.contains("80.0"), prompt)
     }
 }

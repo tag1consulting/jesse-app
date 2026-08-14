@@ -178,6 +178,12 @@ enum TrendNutrient: String, CaseIterable, Identifiable, Sendable {
         }
     }
 
+    /// How many decimal places this nutrient's value is DISPLAYED with, mirroring
+    /// `Micronutrient.displayDecimals` for the nutrients the two enums share. Trans fat
+    /// alone is nonzero: its whole working range sits below a gram, so whole-gram rounding
+    /// reported a real reading as none. Guarded by a test that pins the two enums together.
+    var displayDecimals: Int { self == .tfat ? 2 : 0 }
+
     /// The display unit: energy in kcal, the minerals and omega-3 in milligrams, the
     /// macros/fats/sugars in grams.
     var unit: String {
@@ -1078,12 +1084,12 @@ public enum NutrientTrends {
         let parts = hits.map { b -> String in
             // "Fat" alone would read as a macro row; the same-day cap is on the TOTAL.
             let name = b.nutrient == .f ? "total fat" : b.nutrient.fullName.lowercased()
-            let amount = "\(name) \(fmt(b.value)) \(b.nutrient.unit)"
+            let amount = "\(name) \(fmt(b.value, b.nutrient)) \(b.nutrient.unit)"
             if let m = b.multiple, m >= blowoutMultiplier, let t = b.target {
-                return "\(amount) (\(String(format: "%.1f", m))x the \(fmt(t)) \(b.nutrient.unit) target)"
+                return "\(amount) (\(String(format: "%.1f", m))x the \(fmt(t, b.nutrient)) \(b.nutrient.unit) target)"
             }
             if let cap = b.nutrient.dailyHardCap, b.overHardCap {
-                return "\(amount) (over the \(fmt(cap)) \(b.nutrient.unit) cap)"
+                return "\(amount) (over the \(fmt(cap, b.nutrient)) \(b.nutrient.unit) cap)"
             }
             return amount
         }
@@ -1117,8 +1123,17 @@ public enum NutrientTrends {
     // MARK: - Formatting helpers
 
     /// Round to a whole number (matching `DietSemantics.fmt`), so displayed values never
-    /// disagree with the rest of the Health tab.
+    /// disagree with the rest of the Health tab. For a NUTRIENT's own value use the
+    /// precision-carrying overload below rather than this one.
     static func fmt(_ x: Double) -> String { String(Int(x.rounded())) }
+
+    /// One nutrient's value at that nutrient's own display precision, and never a nonzero
+    /// amount rendered as zero — `DietSemantics.fmt(_:decimals:)`, reached through the
+    /// nutrient so the trend copy, the chart and the Sources list read exactly as the day
+    /// row does. Whole grams here turned trans fat's real 0.05 g days into "Median 0 g".
+    static func fmt(_ x: Double, _ nutrient: TrendNutrient) -> String {
+        DietSemantics.fmt(x, decimals: nutrient.displayDecimals)
+    }
 
     /// A signed distance in plain words: "190 kcal over", "45 g under", or "level with"
     /// when it rounds to nothing — so a 0.4 kcal delta never prints the bare "0 over" that
@@ -1177,14 +1192,14 @@ public enum NutrientTrends {
         }
 
         var out = "\(name): known on \(t.daysKnown) of \(window)."
-        let rawMedian = "Median \(fmt(median)) \(t.unit)"
+        let rawMedian = "Median \(fmt(median, t.nutrient)) \(t.unit)"
 
         // Distribution / basis line, then the count line — both driven by the days that
         // carried their own target, never by today's.
         switch t.kind {
         case .informational:
             if let lo = t.minKnown, let hi = t.maxKnown, lo != hi {
-                out += " \(rawMedian) (range \(fmt(lo))–\(fmt(hi)) \(t.unit))."
+                out += " \(rawMedian) (range \(fmt(lo, t.nutrient))–\(fmt(hi, t.nutrient)) \(t.unit))."
             } else {
                 out += " \(rawMedian)."
             }
@@ -1193,7 +1208,7 @@ public enum NutrientTrends {
             // number. The raw median rides along as context and never as a verdict.
             if let md = t.medianDelta {
                 out += " Median \(deltaWords(md, t.unit)) \(basisNoun(t.nutrient))"
-                out += " (raw median \(fmt(median)) \(t.unit))."
+                out += " (raw median \(fmt(median, t.nutrient)) \(t.unit))."
                 out += t.nutrient == .c
                     ? " Under the base on \(t.countUnderTarget) of \(t.daysJudged) judged days."
                     : " Over on \(t.countOverTarget) of \(t.daysJudged) judged days,"
@@ -1208,7 +1223,7 @@ public enum NutrientTrends {
                 break
             }
             if let one = t.singleJudgedTarget {
-                out += " \(rawMedian) vs a \(fmt(one)) \(t.unit) \(word)."
+                out += " \(rawMedian) vs a \(fmt(one, t.nutrient)) \(t.unit) \(word)."
             } else {
                 out += " \(rawMedian), against each day's own \(word)."
             }
@@ -1303,7 +1318,7 @@ public enum NutrientTrends {
                 : "\(nutrient.fullName) (delta vs that day's own target)"
         case .floor, .ceiling:
             if let one = widest.singleJudgedTarget {
-                prefix = "\(nutrient.fullName) (\(kindLabel(nutrient.kind)) \(fmt(one)) \(nutrient.unit))"
+                prefix = "\(nutrient.fullName) (\(kindLabel(nutrient.kind)) \(fmt(one, nutrient)) \(nutrient.unit))"
             } else if widest.hasJudgedDays {
                 prefix = "\(nutrient.fullName) (\(kindLabel(nutrient.kind)), that day's own, \(nutrient.unit))"
             } else {
@@ -1321,7 +1336,7 @@ public enum NutrientTrends {
                 // the numbers — the signed median distance, the count over the days that
                 // were actually judged, and the measurement coverage behind it.
                 guard let md = t.medianDelta else {
-                    return "\(w) raw median \(fmt(median)) known \(t.daysKnown)/\(t.daysInWindow),"
+                    return "\(w) raw median \(fmt(median, t.nutrient)) known \(t.daysKnown)/\(t.daysInWindow),"
                         + " no day recorded its own target"
                 }
                 var s = "\(w) median \(signedDelta(md)) \(t.unit)"
@@ -1335,7 +1350,7 @@ public enum NutrientTrends {
                 if t.daysTargetUnknown > 0 { s += ", targets known \(t.daysJudged)/\(t.daysKnown)" }
                 return s
             }
-            var s = "\(w) median \(fmt(median)) known \(t.daysKnown)/\(t.daysInWindow)"
+            var s = "\(w) median \(fmt(median, t.nutrient)) known \(t.daysKnown)/\(t.daysInWindow)"
             switch t.kind {
             case .floor where t.hasJudgedDays:
                 s += " under \(t.countUnderTarget)/\(t.daysJudged)"

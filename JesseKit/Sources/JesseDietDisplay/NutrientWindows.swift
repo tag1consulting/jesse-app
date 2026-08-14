@@ -171,7 +171,7 @@ enum NutrientWindows {
             target: reference, status: .suspended, remaining: caption(read),
             goalStatus: .noGoal, tone: .inProgress, flag: nil, unit: nutrient.unit,
             fraction: read.median.flatMap { m in reference.flatMap { DietSemantics.fraction(m, $0) } },
-            windowRead: read)
+            decimals: nutrient.displayDecimals, windowRead: read)
 
         // No known day in the window → the row's "nothing measured" state, captioned by
         // the read. Never a 0 bar, because unknown is not zero.
@@ -198,7 +198,8 @@ enum NutrientWindows {
     private static func caption(_ read: NutrientWindowRead) -> String {
         guard read.nutrient.dayGoal == nil, let lo = read.minKnown, let hi = read.maxKnown,
               lo != hi else { return read.coverage }
-        return "range \(NutrientTrends.fmt(lo))–\(NutrientTrends.fmt(hi)) \(read.nutrient.unit) · \(read.coverage)"
+        return "range \(NutrientTrends.fmt(lo, read.nutrient))–\(NutrientTrends.fmt(hi, read.nutrient)) "
+            + "\(read.nutrient.unit) · \(read.coverage)"
     }
 
     /// The nutrients a rolling mode lists, in canonical `TrendNutrient` order: every

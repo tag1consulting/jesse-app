@@ -233,7 +233,7 @@ struct NutrientSourcesDetail: View {
                 .font(.caption.weight(.semibold)).foregroundStyle(.secondary)
                 .textCase(.uppercase)
             Spacer()
-            Text("\(r.isPartial ? "≥" : "")\(NutrientTrends.fmt(r.knownTotal)) \(nutrient.unit)")
+            Text("\(r.isPartial ? "≥" : "")\(NutrientTrends.fmt(r.knownTotal, nutrient)) \(nutrient.unit)")
                 .font(.subheadline.weight(.semibold).monospacedDigit())
         }
     }
@@ -251,7 +251,7 @@ struct NutrientSourceRow: View {
             HStack(alignment: .firstTextBaseline, spacing: 6) {
                 Text(entry.name).font(.subheadline)
                 Spacer()
-                Text("\(NutrientTrends.fmt(entry.value)) \(nutrient.unit)")
+                Text("\(NutrientTrends.fmt(entry.value, nutrient)) \(nutrient.unit)")
                     .font(.subheadline.monospacedDigit())
             }
             HStack(spacing: 8) {
@@ -265,7 +265,7 @@ struct NutrientSourceRow: View {
                 .font(.caption2).foregroundStyle(.tertiary)
         }
         .accessibilityElement(children: .combine)
-        .accessibilityLabel("\(entry.name): \(NutrientTrends.fmt(entry.value)) \(nutrient.unit), "
+        .accessibilityLabel("\(entry.name): \(NutrientTrends.fmt(entry.value, nutrient)) \(nutrient.unit), "
                             + "\(NutrientSources.pct(entry.share)) of the measured total, "
                             + "on \(entry.days) \(entry.days == 1 ? "day" : "days")")
     }

@@ -49,6 +49,16 @@ enum ContributionMetric: Equatable, Sendable {
         }
     }
 
+    /// How many decimal places a contribution to this metric is rendered with — the
+    /// nutrient's own display precision (`Micronutrient.displayDecimals`), 0 for calories
+    /// and the macros. It rides on the metric so a contributor row is formatted exactly as
+    /// the headline above it: a trans fat row rendered at whole grams read "0 g" beside a
+    /// 100% bar, which is the false zero this carries the precision to prevent.
+    var decimals: Int {
+        if case .micronutrient(let n) = self { return n.displayDecimals }
+        return 0
+    }
+
     /// Whether this metric preserves unknowns: a micronutrient's absent per-item value
     /// is UNKNOWN (surfaced in a "Not estimated" group), never coalesced to a
     /// non-contributor. False for calories/macros, whose per-item fields are treated as
