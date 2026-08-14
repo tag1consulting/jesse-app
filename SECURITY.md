@@ -1458,6 +1458,17 @@ treated as disclosed and rotated — `JESSE_TOKEN`, both Fireworks tokens, and
 `SLACK_MCP_XOXP_TOKEN` once it is added. Re-run the checks above before trusting
 this paragraph; it records a state verified on one date, not a standing property.
 
+**The startup pairing QR leaked the bearer token until bridge 0.77.0; rotate if
+your logs captured it.** The QR was printed to stdout every time the bridge
+started, and it encodes `jesse://pair?host=…&port=…&token=…`, the full bearer
+token. A QR is an encoding, not a secret, so anything that captured stdout
+captured the token: a container whose stdout is the log stream, a service manager
+writing its stdout to a file, a pipe into `tee`. Every restart wrote it again. If
+a deployment ran a pre-0.77.0 bridge anywhere its stdout was collected, treat
+`JESSE_TOKEN` as exposed and rotate it: restart the bridge with a new
+`JESSE_TOKEN` and re-pair the phone. The old token stops working at once. Fixed
+in [PR #95](https://github.com/tag1consulting/jesse-app/pull/95).
+
 **The tool allowlist is not deployment configuration.** `JESSE_ALLOWED_TOOLS` and
 `JESSE_DISALLOWED_TOOLS` exist, and they look like the seam for granting a tool.
 They are not. `validate_toolset_argv` compares the argv this deployment *would*
