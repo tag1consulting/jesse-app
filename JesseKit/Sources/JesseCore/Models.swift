@@ -357,6 +357,12 @@ public final class Turn {
     @Relationship(deleteRule: .cascade, inverse: \TurnAttachment.turn)
     public var attachments: [TurnAttachment] = []
 
+    // Files JESSE returned on this turn — the other direction from `attachments`. Cascade
+    // for the same reason, empty by default so this additive to-many relationship
+    // lightweight-migrates. Metadata plus a cache path only: see `TurnArtifact`.
+    @Relationship(deleteRule: .cascade, inverse: \TurnArtifact.turn)
+    public var artifacts: [TurnArtifact] = []
+
     public init(role: TurnRole, text: String, createdAt: Date = Date()) {
         self.id = UUID()
         self.role = role.rawValue
@@ -370,6 +376,14 @@ public final class Turn {
     /// Attachment previews in a stable order (the relationship itself is unordered).
     public var orderedAttachments: [TurnAttachment] {
         attachments.sorted { $0.createdAt < $1.createdAt }
+    }
+
+    /// Returned files in the order the bridge swept them (`sortIndex`), which is the
+    /// order the reply's `artifacts` array named them. The relationship itself is
+    /// unordered, and `createdAt` is not enough here: every artifact of one turn is
+    /// created in the same save, so their timestamps can tie.
+    public var orderedArtifacts: [TurnArtifact] {
+        artifacts.sorted { ($0.sortIndex, $0.id.uuidString) < ($1.sortIndex, $1.id.uuidString) }
     }
 }
 
@@ -404,6 +418,86 @@ public final class TurnAttachment {
 
     public var isImage: Bool { mime.hasPrefix("image/") }
     public var isPDF: Bool { mime == "application/pdf" }
+}
+
+/// One file JESSE returned on a `Turn`, as history holds it.
+///
+/// The same shape as `TurnAttachment` with ONE deliberate difference: it stores metadata
+/// plus a local cache PATH, never the bytes. A 20 MB PDF inside SwiftData would be loaded
+/// into memory on every fetch of the turn that owns it — including every scroll that
+/// touches the row — which is exactly the cost the bridge's metadata-only wire was
+/// designed to avoid, undone one layer down.
+///
+/// Belongs to exactly one `Turn` and is cascade-deleted with it (and, via `JesseThread`'s
+/// own cascade, with a whole thread). Every property is defaulted and the relationship is
+/// additive, so existing stores lightweight-migrate with no migration code — matching how
+/// `TurnAttachment` and the outbox models were added. Registered in `AppModelContainer`
+/// through `JesseSchemaV3`.
+@Model
+public final class TurnArtifact {
+    public var id: UUID = UUID()
+    /// The BRIDGE's artifact id — the fetch key for `GET /jesse/artifact/{id}` and the
+    /// cache filename. Distinct from `id`, which is this row's local identity.
+    public var artifactID: String = ""
+    /// The model's own filename, for display. Never used as a path component: the cache
+    /// file is named from `artifactID`, which the bridge guarantees is hex.
+    public var filename: String = ""
+    /// The mime the bridge sniffed from the bytes.
+    public var mime: String = ""
+    public var byteCount: Int = 0
+    /// Hex SHA-256 of the content, so a cached file can be validated against the metadata
+    /// rather than trusted because it exists.
+    public var sha256: String = ""
+    /// Position in the reply's `artifacts` array, so history renders them in the order the
+    /// turn produced them even though the relationship is unordered.
+    public var sortIndex: Int = 0
+    /// Whether the bridge has told us this file is permanently gone (a `404` whose reason
+    /// was `expired`). Sticky: once set, the view renders "expired" and NEVER fetches this
+    /// id again — otherwise every appearance of the row would re-ask for a dead id, for
+    /// the life of the thread.
+    public var isExpired: Bool = false
+    public var createdAt: Date = Date()
+    /// The owning turn; nil only transiently before insert. `Turn.artifacts` is the
+    /// cascade side.
+    public var turn: Turn?
+
+    public init(artifactID: String, filename: String, mime: String, byteCount: Int,
+                sha256: String, sortIndex: Int = 0, createdAt: Date = Date()) {
+        self.id = UUID()
+        self.artifactID = artifactID
+        self.filename = filename
+        self.mime = mime
+        self.byteCount = byteCount
+        self.sha256 = sha256
+        self.sortIndex = sortIndex
+        self.createdAt = createdAt
+    }
+
+    /// Renders inline as a picture. SVG is deliberately excluded — it is markup and a
+    /// rendering surface, so it goes behind the same explicit tap a PDF is behind.
+    public var isInlineImage: Bool { mime == "image/png" || mime == "image/jpeg" }
+    public var isPDF: Bool { mime == "application/pdf" }
+
+    /// A short human size for the chip ("18 KB", "2.4 MB").
+    public var displaySize: String {
+        let f = ByteCountFormatter()
+        f.countStyle = .file
+        f.allowedUnits = [.useKB, .useMB]
+        return f.string(fromByteCount: Int64(byteCount))
+    }
+
+    /// An SF Symbol for the file's kind, so a chip reads at a glance.
+    public var typeIcon: String {
+        if isInlineImage || mime == "image/svg+xml" { return "photo" }
+        if isPDF { return "doc.richtext" }
+        switch mime {
+        case "text/csv": return "tablecells"
+        case "application/json": return "curlybraces"
+        case "text/html": return "globe"
+        case "text/markdown": return "doc.plaintext"
+        default: return "doc"
+        }
+    }
 }
 
 /// The delivery state of an `OutboxItem`. `sending` while its transmit is in

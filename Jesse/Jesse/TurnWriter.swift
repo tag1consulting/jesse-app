@@ -92,6 +92,16 @@ struct TurnWriter {
         // chip on relaunch/scroll. `recordedText` above is already badge-stripped via
         // `reply.displayText`, so the bubble text and the chip never double-show it.
         turn.provenanceJSON = reply.provenance?.jsonString
+        // Files this turn returned, as METADATA rows. The bytes are downloaded lazily on
+        // first display and land in the on-device cache, never in the store — see
+        // `TurnArtifact` and `ArtifactCache`. `sortIndex` preserves the order the bridge
+        // swept them in, because the relationship is unordered and every row here is
+        // created in the same save (so `createdAt` alone can tie).
+        for (i, a) in reply.artifacts.enumerated() {
+            turn.artifacts.append(TurnArtifact(artifactID: a.id, filename: a.filename,
+                                               mime: a.mime, byteCount: Int(a.bytes),
+                                               sha256: a.sha256, sortIndex: i))
+        }
         target.turns.append(turn)
         target.sessionId = reply.sessionId ?? target.sessionId
         target.updatedAt = Date()

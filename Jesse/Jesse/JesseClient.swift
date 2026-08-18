@@ -147,6 +147,12 @@ protocol JesseClientProtocol: FlagSyncing, Sendable {
                         instructions: String?, floorOverride: String?,
                         model: String?) async throws -> JesseSendResult
     func result(jobId: String) async throws -> JesseResultState
+    /// Fetch ONE returned file's bytes (`GET /jesse/artifact/{id}`). The reply carries
+    /// only metadata, so this is the one call content moves on. Throws an
+    /// `ArtifactFetchError`; `.expired` is the permanent verdict the UI records and never
+    /// retries. Defaulted in the extension to `.unknown`, so a fake that does not model
+    /// the artifact channel behaves exactly like a bridge that has never stored one.
+    func artifact(id: String) async throws -> Data
     /// Fetch the diet snapshot (`GET /jesse/diet`) for the Health tab. Throws a
     /// `DietFetchError` distinguishing offline / auth / an older bridge / a bad date /
     /// a broken diet-today / a decode failure.
@@ -210,6 +216,11 @@ extension JesseClientProtocol {
         -> (turns: [HydratedTurn], nextCursor: String) {
         throw JesseError.badResponse(404, "")
     }
+    // Default "never stored here": a fake that doesn't model the artifact channel behaves
+    // exactly like a bridge that has no such id. Deliberately `.unknown` and NOT
+    // `.expired` — `.expired` is the permanent verdict a view writes onto the store and
+    // never revisits, and a default must never be able to reach it.
+    func artifact(id: String) async throws -> Data { throw ArtifactFetchError.unknown }
     // Default "no title": a fake that doesn't opt into titling degrades exactly like a
     // bridge without the endpoint (the row keeps its derived title).
     func title(forDigest digest: String, conversationId: String?) async -> String? { nil }
@@ -370,6 +381,10 @@ struct JesseClient: JesseClientProtocol {
 
     func result(jobId: String) async throws -> JesseResultState {
         try await bridge.result(jobId: jobId)
+    }
+
+    func artifact(id: String) async throws -> Data {
+        try await bridge.artifact(id: id)
     }
 
     func health() async throws -> BridgeHealth {

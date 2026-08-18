@@ -1894,6 +1894,58 @@ Files attached to a turn are untrusted input and handled defensively:
   directory when the turn ends — success, error, or timeout — and survives the
   internal retry loop, so decoded files never outlive the turn.
 
+## Artifacts (`GET /jesse/artifact/{id}`)
+
+Files the AGENT returns are the reverse direction of Attachments, and they carry a
+different risk: the content is produced by the model, and the bytes are later opened on a
+phone. Handled with the same posture.
+
+- **The staging directory is inside the vault, and it has to be.** On both harnesses the
+  only writable location is the turn's own working directory: Claude Code's `--add-dir`
+  grants reads and confers no write (measured on 2.1.223 — with `Write(./**)` allowed and
+  the directory added, a write into it was still refused), and Codex's
+  `sandbox_workspace_write.writable_roots` is exactly the cwd with `/tmp` and `$TMPDIR`
+  excluded. So `<vault>/.jesse-artifacts/<job_id>/` (mode `0700`) it is. **No containment
+  record moves and no grant widens:** that directory is already writable at
+  `Capability::Write`, which is the only capability that gets one. A `Read` or `Basic`
+  turn gets no staging directory and no prompt fragment at all.
+- **It cannot enter the vault's git history.** `.jesse-artifacts/` carries a `.gitignore`
+  whose entire content is `*`. Verified against the live vault (`git status --porcelain`
+  byte-identical with a file staged; `git check-ignore -v` naming that file as the rule)
+  and held by a test that builds a scratch repository.
+- **Type is sniffed, not believed.** The allowlist is PNG, JPEG, PDF, SVG, plain text,
+  CSV, JSON, Markdown and HTML, decided from the bytes; anything unrecognized is
+  rejected. **Executables are refused** — Mach-O (all four magics plus both fat
+  wrappers), ELF, and `#!` scripts, which matter most because a script is valid text and
+  would otherwise pass the text branch — and everything stored is created fresh at `0600`,
+  so no execute bit survives. **Symlinks are never followed** (`symlink_metadata` decides
+  "regular file"), so a staged link out of the directory is skipped rather than swept.
+- **No model filename touches disk.** Stored bytes are named `<artifact_id>.<sniffed
+  ext>` under a fresh random hex id. The model's filename is display-only: it rides the
+  wire, it is sanitized into the `Content-Disposition` (RFC 6266, both forms, stripped of
+  anything that could forge a header), sanitized again into any user-visible note, into
+  the push alert body, and into the watch reply — and it never becomes a path component
+  anywhere, including on the device.
+- **The id is the traversal guard.** `GET /jesse/artifact/{id}` rejects anything but
+  lowercase hex with a `400` before the store is touched: `..`, a slash and a NUL are all
+  non-hex. The app re-applies the identical check, because that is the layer that turns
+  the id into a path on the phone.
+- **Served as an attachment, never as a page.** The route is behind the same bearer auth
+  as everything else and always answers `Content-Disposition: attachment` plus
+  `X-Content-Type-Options: nosniff`. It serves SVG and HTML, both of which are
+  script-execution surfaces in any viewer that renders them as a document, and neither
+  should ever be treated as a page from the bridge's own origin.
+- **Staging is always cleaned up.** A `Drop` guard removes the per-job directory on every
+  exit path — success, error, timeout, panic, and the task abort a cancel performs.
+- **Bounded on disk, in three independent places.** Per turn (10 files / 25 MB each /
+  50 MB total, first breach stops the sweep), per server (a 30-day TTL and a 2 GB
+  high-water mark, evicting oldest-first on the existing eviction timer), and per device
+  (a 256 MB LRU cache). Deleting a conversation cascades to its artifacts. Eviction logs
+  counts and bytes, **never filenames**.
+- **Nothing is dropped silently.** A rejected or capped file appends a line to the reply
+  the user sees. A dropped artifact the user is not told about is a wrong answer they
+  cannot detect.
+
 ## Recent-workouts context (`health_context`)
 
 A turn may carry an optional `health_context` field: a compact, device-reported

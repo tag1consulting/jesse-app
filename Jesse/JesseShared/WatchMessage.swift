@@ -62,9 +62,19 @@ public nonisolated struct WatchReply: Equatable, Sendable {
     public let sessionId: String?
     public let threadId: UUID?
     public let error: String?
+    /// The NAMES of any files this turn returned, and nothing else about them — no id, no
+    /// mime, no size, and above all no bytes.
+    ///
+    /// The watch link is a low-bandwidth, best-effort channel with a hard payload ceiling
+    /// (see `maxInlineAudioBytes`), and a returned artifact can be 25 MB. Moving one over
+    /// it would fail the whole reply, not just the file. So the watch learns that a chart
+    /// exists and what it is called; opening it is the phone's job. Bounded by
+    /// `maxArtifactNames` and sanitized on decode — the filename is the MODEL's.
+    public let artifactNames: [String]
 
     public nonisolated init(requestId: UUID, ok: Bool, displayText: String = "", spokenText: String = "",
-                            sessionId: String? = nil, threadId: UUID? = nil, error: String? = nil) {
+                            sessionId: String? = nil, threadId: UUID? = nil, error: String? = nil,
+                            artifactNames: [String] = []) {
         self.requestId = requestId
         self.ok = ok
         self.displayText = displayText
@@ -72,6 +82,7 @@ public nonisolated struct WatchReply: Equatable, Sendable {
         self.sessionId = sessionId
         self.threadId = threadId
         self.error = error
+        self.artifactNames = artifactNames
     }
 }
 
@@ -143,6 +154,7 @@ public extension WatchMessage {
         nonisolated static let threadId = "threadId"
         nonisolated static let error = "error"
         nonisolated static let conversationId = "conversationId"
+        nonisolated static let artifactNames = "artifactNames"
     }
     private enum Kind {
         nonisolated static let request = "request"
@@ -173,6 +185,10 @@ public extension WatchMessage {
             if let sessionId = r.sessionId { dict[Key.sessionId] = sessionId }
             if let threadId = r.threadId { dict[Key.threadId] = threadId.uuidString }
             if let error = r.error { dict[Key.error] = error }
+            // Names only, and only when there are any — so a reply from a turn that
+            // returned nothing is byte-for-byte the dictionary it has always been, and an
+            // older watch simply ignores a key it does not read.
+            if !r.artifactNames.isEmpty { dict[Key.artifactNames] = r.artifactNames }
         case .ack(let a):
             dict[Key.type] = Kind.ack
             dict[Key.requestId] = a.requestId.uuidString
@@ -225,9 +241,14 @@ public extension WatchMessage {
                 threadId = parsed
             }
             let error = boundedText(dict[Key.error])
+            // A missing / wrong-typed key is simply "no files", never a decode failure:
+            // the reply's TEXT is what the watch exists to show, and losing it because a
+            // filename was malformed would be a far worse trade.
+            let names = sanitizedArtifactNames(dict[Key.artifactNames])
             return .reply(WatchReply(requestId: requestId, ok: ok, displayText: display,
                                      spokenText: spoken, sessionId: sessionId,
-                                     threadId: threadId, error: error))
+                                     threadId: threadId, error: error,
+                                     artifactNames: names))
 
         case Kind.ack:
             guard let accepted = dict[Key.ok] as? Bool else { return nil }
@@ -251,5 +272,31 @@ public extension WatchMessage {
         guard let s = value as? String else { return nil }
         guard s.utf8.count <= Self.maxTextBytes else { return nil }
         return s
+    }
+
+    /// The most returned-file names one reply carries to the watch. A watch reply is a
+    /// glance; ten filenames is a list nobody reads on that screen.
+    nonisolated static let maxArtifactNames = 4
+
+    /// Returned filenames, made safe for a watch screen: strings only, control characters
+    /// stripped, each name length-bounded, empties dropped, and the list capped.
+    ///
+    /// These names came from the MODEL and travelled through the bridge as display-only
+    /// metadata, so they are sanitized at the point they become UI rather than trusted for
+    /// having survived the trip.
+    private nonisolated static func sanitizedArtifactNames(_ value: Any?) -> [String] {
+        guard let raw = value as? [String] else { return [] }
+        return raw
+            .map { name in
+                // `Character` has no `isControl`; the scalar-level check is the one that
+                // actually covers newlines, tabs and the C0/C1 ranges a crafted filename
+                // would use to forge extra lines on a watch screen.
+                String(name.filter { c in
+                    !c.unicodeScalars.contains { $0.properties.generalCategory == .control }
+                }.prefix(60))
+            }
+            .filter { !$0.trimmingCharacters(in: .whitespaces).isEmpty }
+            .prefix(maxArtifactNames)
+            .map { $0 }
     }
 }

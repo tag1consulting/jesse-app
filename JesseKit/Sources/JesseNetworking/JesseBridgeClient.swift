@@ -31,6 +31,10 @@ public protocol BridgeClientProtocol: FlagSyncing, Sendable {
               attachments: [JesseRequest.Attachment], requestId: String,
               model: String?) async throws -> JesseSendResult
     func result(jobId: String) async throws -> JesseResultState
+    /// Fetch ONE returned file's bytes. The reply carries only metadata, so this is the
+    /// one call content moves on. A `404` is an `ArtifactFetchError.expired` or
+    /// `.unknown` — the app renders those differently, and neither is retryable.
+    func artifact(id: String) async throws -> Data
     func stream(jobId: String) -> AsyncThrowingStream<JesseStreamEvent, Error>
     func listConversations(since: UInt64?, etag: String?) async throws -> ConversationsResult
     /// Hydrate a conversation's history across every transcript bound to it. `after` is the
@@ -44,6 +48,17 @@ public protocol BridgeClientProtocol: FlagSyncing, Sendable {
     func health() async throws -> BridgeHealth
     func fetchDietSnapshot(date: String?) async throws -> DietSnapshot
     func fetchPrompts() async throws -> PromptDefaults
+}
+
+public extension BridgeClientProtocol {
+    /// Default "never stored here": a conformer that does not model the artifact channel
+    /// behaves exactly like a bridge that has no such id, so an existing fake keeps
+    /// compiling and renders the same empty state a bridge without the channel would.
+    ///
+    /// Deliberately `.unknown` and NOT `.expired` — `.expired` is the PERMANENT verdict a
+    /// view writes onto the store and never revisits, and a default must never be able to
+    /// reach it.
+    func artifact(id: String) async throws -> Data { throw ArtifactFetchError.unknown }
 }
 
 public struct JesseBridgeClient: BridgeClientProtocol {
@@ -166,6 +181,45 @@ public struct JesseBridgeClient: BridgeClientProtocol {
             throw JesseError.from(error, host: config.normalizedHost)
         }
         return try Self.decodeResult(data: data, resp: resp)
+    }
+
+    // MARK: - Artifacts
+
+    /// `GET /jesse/artifact/{id}` — the bytes of one file a turn returned.
+    public func artifact(id: String) async throws -> Data {
+        guard let req = authorized("/jesse/artifact/\(id)", method: "GET") else {
+            throw JesseError.notConfigured
+        }
+        let data: Data, resp: URLResponse
+        do {
+            (data, resp) = try await session.data(for: req)
+        } catch {
+            throw JesseError.from(error, host: config.normalizedHost)
+        }
+        return try Self.decodeArtifact(data: data, resp: resp)
+    }
+
+    /// Map an artifact fetch response to its bytes, or to the error the UI renders.
+    ///
+    /// The `404` split is the load-bearing part. `expired` is PERMANENT — the file is
+    /// gone from the server and no amount of retrying brings it back — so the caller
+    /// records it once and never asks again. Anything else may be transient.
+    public static func decodeArtifact(data: Data, resp: URLResponse) throws -> Data {
+        guard let http = resp as? HTTPURLResponse else { throw ArtifactFetchError.decodeFailed }
+        switch http.statusCode {
+        case 200..<300:
+            return data
+        case 401:
+            throw ArtifactFetchError.authFailed
+        case 404:
+            // The body names which of the two it is. A body we cannot read is treated as
+            // `unknown` rather than `expired`: `expired` is the permanent verdict, and
+            // reaching it by guessing would strand a file that is actually still there.
+            let reason = (try? JSONDecoder().decode(ArtifactMissBody.self, from: data))?.reason
+            throw reason == "expired" ? ArtifactFetchError.expired : ArtifactFetchError.unknown
+        default:
+            throw ArtifactFetchError.server(http.statusCode)
+        }
     }
 
     // MARK: - Health
@@ -628,7 +682,8 @@ public struct JesseBridgeClient: BridgeClientProtocol {
         case "done":
             guard let text = obj.response else { throw JesseError.decoding }
             return .done(JesseReply(text: text, sessionId: obj.sessionId,
-                                    directives: obj.directives, provenance: obj.provenance))
+                                    directives: obj.directives, provenance: obj.provenance,
+                                    artifacts: obj.artifacts ?? []))
         case "failed":
             return .failed(obj.error ?? "Jesse couldn't complete that.")
         case "cancelled":

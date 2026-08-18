@@ -797,6 +797,19 @@ final class RunCoordinator {
         }
     }
 
+    /// A client for fetching a returned file's bytes, or `nil` when the app is not
+    /// paired.
+    ///
+    /// It lives here rather than in the view because `configProvider` and `makeClient`
+    /// are the coordinator's injected seams — the same two a test already replaces — so
+    /// an artifact fetch in a test goes through the same fake every other turn does.
+    @MainActor
+    func artifactClient() -> (any JesseClientProtocol)? {
+        let cfg = configProvider()
+        guard !cfg.normalizedHost.isEmpty, !cfg.token.isEmpty else { return nil }
+        return makeClient(cfg)
+    }
+
     /// Apply the shared reconciler's plan to the local store, in FOUR passes whose order is
     /// load-bearing.
     ///
@@ -1065,11 +1078,17 @@ final class RunCoordinator {
                 case let .bind(existingIndex):
                     guard existingIndex < existing.count, !t.turnKey.isEmpty else { break }
                     existing[existingIndex].sourceKey = t.turnKey
+                    // A BOUND turn is one this device already delivered, so it already
+                    // holds its own artifact rows and must not gain a second set.
                     bound += 1
                 case .insert:
                     let turn = Turn(role: TranscriptMerge.role(for: t.role), text: t.text,
                                     createdAt: TranscriptMerge.timestamp(t.timestamp))
                     turn.sourceKey = t.turnKey.isEmpty ? nil : t.turnKey
+                    // A turn this device never saw — hydrated from another device's send,
+                    // or after a reinstall. The bridge re-attached its returned files, so
+                    // history shows the chart instead of silently losing it.
+                    Self.attach(t.artifacts, to: turn)
                     turn.thread = thread
                     context.insert(turn)
                     inserted += 1
@@ -1086,6 +1105,18 @@ final class RunCoordinator {
             // Conversation gone server-side (gc'd / deleted): leave the cached copy.
         } catch {
             Log.run.debug("hydrate failed: \(error.localizedDescription)")
+        }
+    }
+
+    /// Copy a hydrated turn's returned-file metadata onto a newly inserted `Turn`, in the
+    /// order the bridge served them. Metadata only — the bytes are downloaded lazily on
+    /// first display, exactly as they are for a turn delivered live.
+    @MainActor
+    static func attach(_ artifacts: [JesseArtifact], to turn: Turn) {
+        for (i, a) in artifacts.enumerated() {
+            turn.artifacts.append(TurnArtifact(artifactID: a.id, filename: a.filename,
+                                               mime: a.mime, byteCount: Int(a.bytes),
+                                               sha256: a.sha256, sortIndex: i))
         }
     }
 

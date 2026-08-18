@@ -61,8 +61,11 @@ public struct SSEParser: Sendable {
         case "activity":
             return .activity(ToolActivity(name: obj?.name ?? "", refused: obj?.refused ?? false))
         case "done":
+            // `artifacts` absent/null → empty, which is both "this turn returned nothing"
+            // and "this bridge has no artifact channel". They mean the same thing here.
             return .done(JesseReply(text: obj?.response ?? "", sessionId: obj?.sessionId,
-                                    directives: obj?.directives, provenance: obj?.provenance))
+                                    directives: obj?.directives, provenance: obj?.provenance,
+                                    artifacts: obj?.artifacts ?? []))
         case "error": return .failed(obj?.error ?? "Jesse couldn't complete that.")
         case "cancelled": return .cancelled
         default: return nil

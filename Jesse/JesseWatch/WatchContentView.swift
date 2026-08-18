@@ -79,9 +79,29 @@ struct WatchContentView: View {
             Text("Will send when your phone is reachable.")
                 .font(.footnote).foregroundStyle(.secondary)
                 .multilineTextAlignment(.center)
-        case .reply(let display, _):
+        case .reply(let display, _, let files):
             ScrollView {
-                Text(display).font(.body)
+                VStack(alignment: .leading, spacing: 8) {
+                    Text(display).font(.body)
+                    // Files the turn returned, BY NAME ONLY. No bytes cross the watch
+                    // link — a returned file can be 25 MB and the link has a hard payload
+                    // ceiling, so moving one would fail the whole reply rather than just
+                    // the file. The watch says a chart exists; the phone opens it.
+                    if !files.isEmpty {
+                        Divider()
+                        ForEach(files, id: \.self) { name in
+                            Label(name, systemImage: "doc")
+                                .font(.caption2)
+                                .foregroundStyle(.secondary)
+                                .lineLimit(1)
+                                .truncationMode(.middle)
+                        }
+                        Text("Open on your phone to view.")
+                            .font(.caption2)
+                            .foregroundStyle(.tertiary)
+                    }
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
             }
         case .error(let message):
             ScrollView {

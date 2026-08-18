@@ -34,6 +34,11 @@ struct RelayResult: Equatable {
     let spokenText: String
     let sessionId: String?
     let threadId: UUID
+    /// The NAMES of any files the turn returned, and nothing else about them. The watch
+    /// link is low-bandwidth with a hard payload ceiling and a returned file can be 25 MB,
+    /// so moving one over it would fail the whole reply rather than just the file. The
+    /// watch learns a chart exists and what it is called; opening it is the phone's job.
+    var artifactNames: [String] = []
 }
 
 /// The outcome of a relay call. Always a value — the entry point NEVER throws into
@@ -151,7 +156,9 @@ final class WatchRelay {
                 return .delivered(RelayResult(displayText: last?.text ?? "",
                                               spokenText: last?.text ?? "",
                                               sessionId: existing.sessionId,
-                                              threadId: existing.id))
+                                              threadId: existing.id,
+                                              artifactNames: (last?.orderedArtifacts ?? [])
+                                                  .map(\.filename)))
             }
             // The record survived but its thread did not (the user deleted it). Nothing to
             // resurrect and nothing to duplicate: report it rather than starting a new turn.
@@ -209,7 +216,8 @@ final class WatchRelay {
             return .delivered(RelayResult(displayText: reply.displayText,
                                           spokenText: reply.spokenText,
                                           sessionId: thread.sessionId,
-                                          threadId: thread.id))
+                                          threadId: thread.id,
+                                          artifactNames: reply.artifacts.map(\.filename)))
         case .failure(let message):
             return .failure(message: message, threadId: thread.id)
         }

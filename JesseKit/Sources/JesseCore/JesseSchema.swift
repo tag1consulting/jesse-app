@@ -40,6 +40,9 @@ import SwiftData
 //   • `Turn.attachments` → `TurnAttachment` (to-many, cascade, empty default)
 //   • the `WrittenMeal` entity, then its `contentHash` / `tombstoned` fields
 //   • the `OutboxItem` / `OutboxAttachment` entities (the send outbox)
+//   • `Turn.artifacts` → `TurnArtifact` (to-many, cascade, empty default)  ← the artifact
+//     return channel. Metadata plus a cache path, never bytes: a 20 MB PDF inside
+//     SwiftData would be loaded into memory on every fetch of the turn that owns it
 //   • `JesseThread.conversationId` (String?), `JesseThread.registeredAt` (Date?), and
 //     `Turn.sourceKey` (String?)  ← bridge-registered conversation identity: the
 //     cross-device sync key, the first-ACK stamp behind the delivery caption, and the
@@ -96,8 +99,21 @@ public enum JesseSchemaV2: VersionedSchema {
     }
 }
 
+/// The current entity set, adding `TurnArtifact` (the artifact return channel) to V2.
+/// Additive in exactly the way the header describes — a new entity plus a new to-many
+/// relationship with an empty default — so it lightweight-migrates with no migration
+/// code, and `AppModelContainerMigrationTests` opens a V2-shaped store to prove it.
+public enum JesseSchemaV3: VersionedSchema {
+    public static let versionIdentifier = Schema.Version(3, 0, 0)
+
+    public static var models: [any PersistentModel.Type] {
+        [JesseThread.self, Turn.self, TurnAttachment.self, WrittenMeal.self,
+         OutboxItem.self, OutboxAttachment.self, TurnArtifact.self]
+    }
+}
+
 /// The app's live schema, derived from the current `VersionedSchema`. The container
 /// and every migration-test open the store through THIS value so they can never drift
 /// from the model list. Opened with automatic lightweight migration (no staged plan);
 /// see the header note and `AppModelContainer.load`.
-public var jesseCurrentSchema: Schema { Schema(versionedSchema: JesseSchemaV2.self) }
+public var jesseCurrentSchema: Schema { Schema(versionedSchema: JesseSchemaV3.self) }

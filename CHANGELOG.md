@@ -13,6 +13,61 @@ Every commit that changes a component **must** bump that component's version and
 add an entry here — enforced by `scripts/version-guard.sh` (the pre-push hook and
 CI both run it). See the "Versioning" section of `bridge/README.md`.
 
+## [App 1.0 (107)] - 2026-08-18
+
+### Added
+
+- **Files Jesse returns now arrive on the phone and the Mac.** The other half of bridge
+  0.84.0's artifact return channel. A turn that renders a chart, exports a CSV or writes
+  a PDF hands the file back, and the app shows it under the reply instead of describing
+  it in prose.
+
+  **`TurnArtifact`, and what it deliberately does not hold.** A new `@Model` alongside
+  `TurnAttachment` with the same shape and one deliberate difference: it stores metadata
+  plus a local cache path, **never the bytes**. A 20 MB PDF inside SwiftData would be
+  loaded into memory on every fetch of the turn that owns it — including every scroll
+  that touches the row — which is exactly the cost the bridge's metadata-only wire was
+  designed to avoid, undone one layer down. Every property is defaulted and the
+  relationship is additive, so existing stores lightweight-migrate with no migration
+  code; `JesseSchemaV3` registers it, and a test opens a store written under the previous
+  schema and asserts every prior row survives.
+
+  **Rendering.** A PNG or JPEG renders inline at a bounded size, tappable to full screen;
+  everything else renders as a chip carrying the filename, a type icon and the size,
+  opening in QuickLook with a share sheet (Reveal in Finder on the Mac). SVG is
+  deliberately in the second group even though it is an image: it is markup and a
+  rendering surface, so it goes behind the same explicit tap a PDF is behind rather than
+  being drawn into a transcript automatically. Downloads are **lazy** — on first display,
+  never on delivery — because a thread may hold dozens of files the user never opens.
+
+  **The expired state is permanent, and that is the point.** The bridge's store is
+  bounded, so an artifact in an old thread will eventually stop existing, and the fetch
+  route says which kind of `404` it is. A view that treated `expired` as an ordinary
+  failure would re-download on every appearance of the row — every scroll into view,
+  every relaunch, forever, for a file that will never be there. So the verdict is written
+  onto the row and checked before anything else, and the state renders with no retry
+  button because there is nothing to retry. `unknown` is deliberately **not** sticky: it
+  can also mean the device is pointed at a different bridge, which the user can fix.
+
+  **A third disk budget, on the device.** `ArtifactCache` holds downloaded bytes in the
+  caches directory under a 256 MB cap with least-recently-used eviction evaluated after
+  every download, where "recently used" counts reading and not only writing. It is
+  deliberately not derived from the bridge's numbers — a phone has far less room than the
+  laptop running the bridge. The bridge's hex-only id guard is re-applied here, because
+  this is the layer that turns a string into a path on this device.
+
+  **A reloaded transcript keeps its files.** Hydration attaches the bridge's re-attached
+  artifact metadata to a newly inserted turn, so a thread rebuilt on a second device — or
+  after a reinstall — shows the chart rather than silently losing it. A turn the merge
+  *binds* rather than inserts is skipped: it already holds its own rows.
+
+  **The Watch and push carry the filename and nothing else.** No bytes cross the watch
+  link: it has a hard payload ceiling and a returned file can be 25 MB, so moving one
+  would fail the whole reply rather than just the file. The watch reply carries up to
+  four names — sanitized and length-bounded at the point they become UI, because they
+  came from the model — and the screen says to open the file on the phone. The
+  completion push names them in its alert body the same way.
+
 ## [bridge 0.84.0] - 2026-08-18
 
 ### Added

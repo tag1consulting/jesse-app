@@ -61,7 +61,8 @@ final class WatchTurnHandler {
         case .delivered(let result):
             return WatchReply(requestId: request.requestId, ok: true,
                               displayText: result.displayText, spokenText: result.spokenText,
-                              sessionId: result.sessionId, threadId: result.threadId)
+                              sessionId: result.sessionId, threadId: result.threadId,
+                              artifactNames: result.artifactNames)
         case .failure(let message, let threadId):
             return WatchReply(requestId: request.requestId, ok: false,
                               threadId: threadId, error: message)

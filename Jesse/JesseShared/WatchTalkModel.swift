@@ -55,7 +55,10 @@ final class WatchTalkModel {
         /// the answer is coming even if the phone is put away. Distinct from `.thinking`,
         /// which only means the phone took the request off the watch.
         case received
-        case reply(display: String, spoken: String)
+        /// `files` are the NAMES of anything the turn returned, and nothing else — no
+        /// bytes ever cross the watch link (see `WatchReply.artifactNames`). Empty for
+        /// nearly every reply, so the view renders exactly what it always has.
+        case reply(display: String, spoken: String, files: [String] = [])
         case error(String)
         /// Sent while the phone was unreachable — it'll be relayed once the phone is
         /// back, never silently dropped.
@@ -143,7 +146,8 @@ final class WatchTalkModel {
     private func receive(_ reply: WatchReply) {
         guard deduper.shouldDeliver(reply.requestId) else { return }
         if reply.ok {
-            state = .reply(display: reply.displayText, spoken: reply.spokenText)
+            state = .reply(display: reply.displayText, spoken: reply.spokenText,
+                           files: reply.artifactNames)
             haptic()
             if !reply.spokenText.isEmpty { speaker.speak(reply.spokenText) }
         } else {

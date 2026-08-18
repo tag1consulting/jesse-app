@@ -14,6 +14,50 @@ import Foundation
 /// structured sidecars (directives + provenance) a terminal frame/result may carry.
 /// The iOS-only accessors that validate directives into HealthKit/meal actions live in
 /// an app-side extension; the Mac app reads only `text`/`sessionId`.
+/// ONE file a turn returned, as the reply carries it: identity, display metadata, and a
+/// content hash. Matches the bridge's `Artifact` exactly.
+///
+/// **It never carries the bytes.** The bridge deliberately keeps binary content out of
+/// the job JSON, the persisted job file, the SSE frame and the conversation store, so
+/// the content is fetched separately from `GET /jesse/artifact/{id}` — see
+/// `BridgeClientProtocol.artifact(id:)`. `sha256` doubles as that route's `ETag`.
+public struct JesseArtifact: Decodable, Equatable, Sendable, Identifiable {
+    /// Opaque, unguessable, and the fetch key. Also the cache filename on the device.
+    public let id: String
+    /// The model's own filename, for DISPLAY only — the bridge never used it as a path
+    /// component and neither does the app.
+    public let filename: String
+    /// The mime the bridge sniffed FROM THE BYTES (never from the extension).
+    public let mime: String
+    public let bytes: UInt64
+    /// Hex SHA-256 of the content, so a cached copy can be validated and a re-fetch is
+    /// one `304`.
+    public let sha256: String
+
+    public init(id: String, filename: String, mime: String, bytes: UInt64, sha256: String) {
+        self.id = id
+        self.filename = filename
+        self.mime = mime
+        self.bytes = bytes
+        self.sha256 = sha256
+    }
+
+    /// Whether this renders inline as a picture. SVG is deliberately EXCLUDED: it is
+    /// markup, a rendering surface, and it belongs behind the same explicit tap a PDF is
+    /// behind rather than being drawn automatically into a transcript.
+    public var isInlineImage: Bool {
+        mime == "image/png" || mime == "image/jpeg"
+    }
+
+    /// A short human size for the chip ("18 KB", "2.4 MB").
+    public var displaySize: String {
+        let f = ByteCountFormatter()
+        f.countStyle = .file
+        f.allowedUnits = [.useKB, .useMB]
+        return f.string(fromByteCount: Int64(bytes))
+    }
+}
+
 public struct JesseReply: Equatable, Sendable {
     public let text: String         // raw response from the bridge
     public let sessionId: String?   // carry into the next call to continue the thread
@@ -25,13 +69,19 @@ public struct JesseReply: Equatable, Sendable {
     // bubble shows a clean body and a native chip renders it instead. Nil on an older
     // bridge / badges-off turn → the text is shown verbatim.
     public var provenance: JesseProvenance?
+    // The files this turn returned — METADATA ONLY (see `JesseArtifact`). Empty for the
+    // overwhelming majority of turns, and empty against any bridge that predates the
+    // field, which is the same thing: there is nothing for a reader to distinguish.
+    public var artifacts: [JesseArtifact]
 
     public init(text: String, sessionId: String?,
-                directives: JesseDirectives? = nil, provenance: JesseProvenance? = nil) {
+                directives: JesseDirectives? = nil, provenance: JesseProvenance? = nil,
+                artifacts: [JesseArtifact] = []) {
         self.text = text
         self.sessionId = sessionId
         self.directives = directives
         self.provenance = provenance
+        self.artifacts = artifacts
     }
 
     private static let marker = "SPOKEN:"
@@ -281,15 +331,23 @@ public struct HydratedTurn: Decodable, Sendable, Equatable {
     /// what `TranscriptMerge` keys on. Empty only against the deprecated single-session
     /// route, which predates the field; the merge treats an empty key as "unkeyed".
     public let turnKey: String
-    public init(role: String, text: String, timestamp: String?, turnKey: String = "") {
+    /// The files this turn returned, re-attached by the bridge from its artifact store.
+    /// A reloaded transcript therefore still shows an older turn's chart or PDF instead
+    /// of silently losing it. Empty on a user turn, on a turn that returned nothing, and
+    /// against a bridge that predates the field.
+    public let artifacts: [JesseArtifact]
+    public init(role: String, text: String, timestamp: String?, turnKey: String = "",
+                artifacts: [JesseArtifact] = []) {
         self.role = role
         self.text = text
         self.timestamp = timestamp
         self.turnKey = turnKey
+        self.artifacts = artifacts
     }
     enum CodingKeys: String, CodingKey {
         case role, text, timestamp
         case turnKey = "turn_key"
+        case artifacts
     }
     // Custom decode so `turn_key` DEFAULTS rather than failing the whole hydrate against
     // the deprecated route (which omits it), the same additive-forward-compatible pattern
@@ -300,6 +358,7 @@ public struct HydratedTurn: Decodable, Sendable, Equatable {
         text = try c.decode(String.self, forKey: .text)
         timestamp = try c.decodeIfPresent(String.self, forKey: .timestamp)
         turnKey = try c.decodeIfPresent(String.self, forKey: .turnKey) ?? ""
+        artifacts = try c.decodeIfPresent([JesseArtifact].self, forKey: .artifacts) ?? []
     }
 }
 
@@ -555,11 +614,14 @@ public struct JesseResultResponse: Decodable {
     public let sessionId: String?
     public let directives: JesseDirectives?
     public let provenance: JesseProvenance?
+    /// Absent or `null` against a bridge with no artifact channel, and on every turn that
+    /// returned no file — both decode to nil and are read as "none".
+    public let artifacts: [JesseArtifact]?
     public let error: String?
     enum CodingKeys: String, CodingKey {
         case status, response
         case sessionId = "session_id"
-        case directives, provenance, error
+        case directives, provenance, artifacts, error
     }
 }
 
@@ -717,11 +779,14 @@ public struct JesseStreamFrameData: Decodable {
     public let sessionId: String?
     public let directives: JesseDirectives?
     public let provenance: JesseProvenance?
+    /// Present only on a `done` frame for a turn that returned a file; `null` otherwise
+    /// and absent from any bridge that predates the field.
+    public let artifacts: [JesseArtifact]?
     public let error: String?
     enum CodingKeys: String, CodingKey {
         case text, name, refused, response
         case sessionId = "session_id"
-        case directives, provenance, error
+        case directives, provenance, artifacts, error
     }
 }
 
