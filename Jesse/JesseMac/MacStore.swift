@@ -18,8 +18,12 @@ enum MacModelContainer {
     /// The Mac schema: the conversation models only (no send-outbox / meal-mirror
     /// entities — those are iOS concerns). A fresh store on the laptop, independent of
     /// the phone's; the bridge is what the two share, not a store file.
+    ///
+    /// `TurnArtifact` is here because `Turn.artifacts` points at it: a relationship whose
+    /// destination the container does not name is the one way this list can be wrong, and
+    /// it fails at RUNTIME on the laptop rather than at compile time here.
     static var schema: Schema {
-        Schema([JesseThread.self, Turn.self, TurnAttachment.self])
+        Schema([JesseThread.self, Turn.self, TurnAttachment.self, TurnArtifact.self])
     }
 
     /// Open the on-disk store, falling back to a flagged in-memory store if it can't be

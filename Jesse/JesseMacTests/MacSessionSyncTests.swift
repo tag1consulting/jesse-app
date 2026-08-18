@@ -52,7 +52,7 @@ final class MacSessionSyncTests: XCTestCase {
     @MainActor
     private func makeContext() throws -> ModelContext {
         let container = try ModelContainer(
-            for: JesseThread.self, Turn.self, TurnAttachment.self,
+            for: JesseThread.self, Turn.self, TurnAttachment.self, TurnArtifact.self,
             configurations: ModelConfiguration(isStoredInMemoryOnly: true))
         return ModelContext(container)
     }
