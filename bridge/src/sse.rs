@@ -63,6 +63,7 @@ pub fn frame_to_event(frame: &StreamFrame) -> Event {
             session_id,
             directives,
             provenance,
+            artifacts,
         } => sse_event(
             "done",
             json!({
@@ -70,6 +71,10 @@ pub fn frame_to_event(frame: &StreamFrame) -> Event {
                 "session_id": session_id,
                 "directives": directives_to_value(directives),
                 "provenance": provenance_to_value(provenance.as_deref()),
+                // `null` when the turn returned no file, so the `done` frame a
+                // no-artifact turn emits is byte-for-byte the frame it emitted before
+                // this field existed and an older client is unaffected.
+                "artifacts": artifacts_to_value(artifacts),
             }),
         ),
         StreamFrame::Error(error) => sse_event("error", json!({ "error": error })),
@@ -159,22 +164,28 @@ pub async fn jesse_stream(
         // the matching frame and close. `get_retrieving` so an already-`done`
         // job opened only via the stream still starts its post-fetch grace.
         match st.jobs.get_retrieving(&job_id) {
+            // ONE encoder for the terminal `done` frame, shared with the live path:
+            // this arm used to hand-build the same JSON object, which is how a
+            // late-opening subscriber came to be told something different from one
+            // that was already attached. Rebuilding the frame and running it through
+            // `frame_to_event` makes that impossible by construction — and it is what
+            // made the `artifacts` sidecar a one-line change here rather than a second
+            // place to remember.
             Some(JobState::Done {
                 response,
                 session_id,
                 directives,
                 provenance,
+                artifacts,
             }) => {
                 let _ = tx.try_send(Ok(sse_reset(&response)));
-                let _ = tx.try_send(Ok(sse_event(
-                    "done",
-                    json!({
-                        "response": response,
-                        "session_id": session_id,
-                        "directives": directives_to_value(&directives),
-                        "provenance": provenance_to_value(provenance.as_deref()),
-                    }),
-                )));
+                let _ = tx.try_send(Ok(frame_to_event(&StreamFrame::Done {
+                    response,
+                    session_id,
+                    directives,
+                    provenance,
+                    artifacts,
+                })));
             }
             Some(JobState::Failed { error, .. }) => {
                 let _ = tx.try_send(Ok(sse_event("error", json!({ "error": error }))));
@@ -239,6 +250,7 @@ mod tests {
                 session_id: None,
                 directives: None,
                 provenance: None,
+                artifacts: Vec::new(),
             },
         );
 

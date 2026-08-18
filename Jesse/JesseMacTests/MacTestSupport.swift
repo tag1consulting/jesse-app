@@ -157,7 +157,7 @@ enum MacTestFixtures {
     /// A fresh in-memory `ModelContext` over the Mac schema.
     static func context() throws -> ModelContext {
         let container = try ModelContainer(
-            for: JesseThread.self, Turn.self, TurnAttachment.self,
+            for: JesseThread.self, Turn.self, TurnAttachment.self, TurnArtifact.self,
             configurations: ModelConfiguration(isStoredInMemoryOnly: true))
         return ModelContext(container)
     }

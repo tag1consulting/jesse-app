@@ -111,6 +111,13 @@ pub struct AppState {
     // only when at least one job exists, so an unscheduled bridge runs no extra task.
     // See [`scheduler`].
     pub scheduler: Arc<Scheduler>,
+    // THE ARTIFACT RETURN CHANNEL's store: the bounded, on-disk home for files a turn
+    // wrote into its staging directory, plus the index that makes them fetchable by id.
+    // Always present so `GET /jesse/artifact/{id}` answers on every deploy; INERT
+    // (`is_available()` false) with no state dir, which is what makes `artifact_route`
+    // return `None` and leaves every turn byte-for-byte what it is today. See
+    // [`crate::artifacts`].
+    pub artifacts: Arc<ArtifactStore>,
 }
 
 impl AppState {
@@ -155,6 +162,10 @@ impl AppState {
         // healthy). The live prober is spawned separately in `main` so tests never touch the
         // network — they get the seeded cache and can inject explicit statuses.
         let health = Arc::new(HealthStore::seeded(&cfg.model_registry));
+        // Loads the artifact index left by a previous run (empty when there is no state
+        // dir, in which case the whole channel is off). The startup eviction pass and the
+        // usage log run in `main`, beside the other startup work, not here.
+        let artifacts = Arc::new(ArtifactStore::from_cfg(&cfg));
         let st = AppState {
             cfg: Arc::new(cfg),
             jobs: Arc::new(JobStore::new(job_ttl, retrieval_grace, jobs_dir)),
@@ -179,6 +190,7 @@ impl AppState {
             // One shadow child at a time; separate from the production permit.
             shadow_slot: Arc::new(Semaphore::new(1)),
             scheduler,
+            artifacts,
         };
         st.bootstrap_conversations();
         st

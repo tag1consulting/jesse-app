@@ -45,6 +45,57 @@ final class WatchMessageCodecTests: XCTestCase {
         XCTAssertEqual(decoded, original)
     }
 
+    /// A turn that returned files carries their NAMES to the watch and nothing else — no
+    /// id, no mime, no size, and above all no bytes. The watch link has a hard payload
+    /// ceiling and a returned file can be 25 MB, so moving one would fail the whole reply
+    /// rather than just the file.
+    func testReplyCarriesArtifactNamesOnlyAndNothingElse() {
+        let original = WatchMessage.reply(
+            WatchReply(requestId: UUID(), ok: true, displayText: "here they are",
+                       spokenText: "here they are", sessionId: "s1", threadId: UUID(),
+                       artifactNames: ["chart.png", "data.csv"]))
+        let dict = original.encode()
+        XCTAssertEqual(WatchMessage.decode(dict), original)
+        // The wire carries the names and only the names.
+        let flat = "\(dict)"
+        XCTAssertTrue(flat.contains("chart.png"))
+        XCTAssertFalse(flat.contains("sha256"))
+        XCTAssertFalse(flat.contains("image/png"))
+    }
+
+    /// A reply with no files encodes exactly the dictionary it always did, so an older
+    /// watch is unaffected — and a missing or wrong-typed key decodes to "no files"
+    /// rather than failing the whole reply, whose TEXT is the point.
+    func testAbsentArtifactNamesDecodeAsNoneRatherThanFailing() {
+        let plain = WatchReply(requestId: UUID(), ok: true, displayText: "just words")
+        XCTAssertNil(WatchMessage.reply(plain).encode()["artifactNames"],
+                     "no key at all when there are no files")
+        var dict = WatchMessage.reply(plain).encode()
+        dict["artifactNames"] = 42   // hostile / corrupt
+        guard case let .reply(decoded)? = WatchMessage.decode(dict) else {
+            return XCTFail("a malformed names field must not lose the reply")
+        }
+        XCTAssertEqual(decoded.displayText, "just words")
+        XCTAssertTrue(decoded.artifactNames.isEmpty)
+    }
+
+    /// Names are sanitized and BOUNDED at the point they become UI: they came from the
+    /// model, and a watch screen is not the place to discover that.
+    func testArtifactNamesAreSanitizedAndCapped() {
+        let many = (0..<8).map { "file\($0).png" }
+        var dict = WatchMessage.reply(
+            WatchReply(requestId: UUID(), ok: true, artifactNames: many)).encode()
+        guard case let .reply(capped)? = WatchMessage.decode(dict) else { return XCTFail() }
+        XCTAssertEqual(capped.artifactNames.count, WatchMessage.maxArtifactNames)
+
+        dict["artifactNames"] = ["a\nb\rc.png", "   ", String(repeating: "x", count: 200)]
+        guard case let .reply(clean)? = WatchMessage.decode(dict) else { return XCTFail() }
+        XCTAssertEqual(clean.artifactNames.count, 2, "the blank name is dropped")
+        XCTAssertFalse(clean.artifactNames[0].contains("\n"))
+        XCTAssertFalse(clean.artifactNames[0].contains("\r"))
+        XCTAssertLessThanOrEqual(clean.artifactNames[1].count, 60)
+    }
+
     func testFailureReplyRoundTrips() {
         let original = WatchMessage.reply(
             WatchReply(requestId: UUID(), ok: false, error: "Couldn't reach your phone."))

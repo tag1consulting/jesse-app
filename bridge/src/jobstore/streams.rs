@@ -31,6 +31,10 @@ pub enum StreamFrame {
         directives: Option<Directives>,
         // Boxed to match `JobState::Done` — keeps this large terminal frame small.
         provenance: Option<Box<Provenance>>,
+        // The metadata for any files this turn returned — never the bytes. Mirrors
+        // `JobState::Done`'s field so a streamed terminal frame and a polled result
+        // carry the identical value; empty on nearly every turn.
+        artifacts: Vec<Artifact>,
     },
     /// Terminal: the turn failed. Carries the human-readable cause.
     Error(String),

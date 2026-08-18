@@ -800,6 +800,12 @@ private struct TurnRow: View {
                 TurnAttachmentsView(attachments: turn.orderedAttachments)
             }
             bubble
+            // Files JESSE returned on this turn — the other direction from the
+            // attachments above. Nothing renders for the overwhelming majority of turns.
+            if !turn.artifacts.isEmpty {
+                TurnArtifactsView(artifacts: turn.orderedArtifacts)
+                    .padding(.top, 4)
+            }
             // Native provenance chip under a Jesse reply that carried structured
             // provenance (the badge text is already stripped from `turn.text`). Absent
             // for user turns and older/badges-off replies — nothing renders there.

@@ -13,6 +13,161 @@ Every commit that changes a component **must** bump that component's version and
 add an entry here — enforced by `scripts/version-guard.sh` (the pre-push hook and
 CI both run it). See the "Versioning" section of `bridge/README.md`.
 
+## [App 1.0 (107)] - 2026-08-18
+
+### Added
+
+- **Files Jesse returns now arrive on the phone and the Mac.** The other half of bridge
+  0.84.0's artifact return channel. A turn that renders a chart, exports a CSV or writes
+  a PDF hands the file back, and the app shows it under the reply instead of describing
+  it in prose.
+
+  **`TurnArtifact`, and what it deliberately does not hold.** A new `@Model` alongside
+  `TurnAttachment` with the same shape and one deliberate difference: it stores metadata
+  plus a local cache path, **never the bytes**. A 20 MB PDF inside SwiftData would be
+  loaded into memory on every fetch of the turn that owns it — including every scroll
+  that touches the row — which is exactly the cost the bridge's metadata-only wire was
+  designed to avoid, undone one layer down. Every property is defaulted and the
+  relationship is additive, so existing stores lightweight-migrate with no migration
+  code; `JesseSchemaV3` registers it, and a test opens a store written under the previous
+  schema and asserts every prior row survives.
+
+  **Rendering.** A PNG or JPEG renders inline at a bounded size, tappable to full screen;
+  everything else renders as a chip carrying the filename, a type icon and the size,
+  opening in QuickLook with a share sheet (Reveal in Finder on the Mac). SVG is
+  deliberately in the second group even though it is an image: it is markup and a
+  rendering surface, so it goes behind the same explicit tap a PDF is behind rather than
+  being drawn into a transcript automatically. Downloads are **lazy** — on first display,
+  never on delivery — because a thread may hold dozens of files the user never opens.
+
+  **The expired state is permanent, and that is the point.** The bridge's store is
+  bounded, so an artifact in an old thread will eventually stop existing, and the fetch
+  route says which kind of `404` it is. A view that treated `expired` as an ordinary
+  failure would re-download on every appearance of the row — every scroll into view,
+  every relaunch, forever, for a file that will never be there. So the verdict is written
+  onto the row and checked before anything else, and the state renders with no retry
+  button because there is nothing to retry. `unknown` is deliberately **not** sticky: it
+  can also mean the device is pointed at a different bridge, which the user can fix.
+
+  **A third disk budget, on the device.** `ArtifactCache` holds downloaded bytes in the
+  caches directory under a 256 MB cap with least-recently-used eviction evaluated after
+  every download, where "recently used" counts reading and not only writing. It is
+  deliberately not derived from the bridge's numbers — a phone has far less room than the
+  laptop running the bridge. The bridge's hex-only id guard is re-applied here, because
+  this is the layer that turns a string into a path on this device.
+
+  **A reloaded transcript keeps its files.** Hydration attaches the bridge's re-attached
+  artifact metadata to a newly inserted turn, so a thread rebuilt on a second device — or
+  after a reinstall — shows the chart rather than silently losing it. A turn the merge
+  *binds* rather than inserts is skipped: it already holds its own rows.
+
+  **The Watch and push carry the filename and nothing else.** No bytes cross the watch
+  link: it has a hard payload ceiling and a returned file can be 25 MB, so moving one
+  would fail the whole reply rather than just the file. The watch reply carries up to
+  four names — sanitized and length-bounded at the point they become UI, because they
+  came from the model — and the screen says to open the file on the phone. The
+  completion push names them in its alert body the same way.
+
+## [bridge 0.84.0] - 2026-08-18
+
+### Added
+
+- **A generic artifact return channel: a turn can hand a file back.** Files moved in
+  exactly one direction. The phone could attach a photo or a PDF and the child could read
+  it, but the reply was a *string* — so a turn that rendered a chart, exported a CSV or
+  wrote a PDF either described the work in prose or lost it. This adds the other
+  direction, with no new model and no new backend: both harnesses can already write
+  files, and the whole job is carrying what they write back to the phone and bounding
+  what that costs in disk.
+
+  **Where the staging directory has to live.** On *both* harnesses the only writable
+  location is the turn's own working directory — `--add-dir` grants reads and confers no
+  write (measured on claude 2.1.223: with `Write(./**)` allowed and the directory added,
+  a write into it was still refused and the file never created), and Codex's
+  `sandbox_workspace_write.writable_roots` is exactly the cwd with `/tmp` and `$TMPDIR`
+  excluded. So a staging directory beside the attachment scratch dir under the system
+  temp dir cannot work, and this one is *inside* the working directory:
+  `<working_dir>/.jesse-artifacts/<job_id>/`, mode 0700, created only on a
+  `Capability::Write` turn and only when a state dir exists. **No containment record
+  moves** — that directory is already writable at the only capability that gets one. A
+  `Read` or `Basic` turn gets no directory and no prompt fragment, so its prompt is
+  byte-for-byte unchanged.
+
+  **It cannot pollute the vault's git history.** `.jesse-artifacts/` carries a
+  `.gitignore` whose entire content is `*` — a directory that ignores itself, needing no
+  change to any file in the vault repository. Verified against the real vault:
+  `git status --porcelain` byte-identical with a file staged, and `git check-ignore -v`
+  naming that same `.gitignore` as the matching rule. A test builds a scratch repository
+  and asserts it, so a regression is caught without a vault.
+
+  **The sweep.** When the turn ends — success, error, or run-limit timeout — the staging
+  directory is swept before the job reaches its terminal state. Types are sniffed from
+  the *bytes* against a fail-closed allowlist (PNG, JPEG, PDF by signature; SVG, HTML and
+  JSON by shape, with JSON *parsed* rather than guessed from a leading brace; plain text,
+  CSV and Markdown as verified UTF-8 text). Executables are refused — Mach-O in all four
+  magics plus both fat wrappers, ELF, and `#!` scripts, which matter most because a shell
+  script is valid text and would otherwise sail through. Symlinks are never followed.
+  Content is SHA-256'd, identical content is stored once and referenced twice, and each
+  file is moved to `<state_dir>/artifacts/<job_id>/<artifact_id>.<ext>` under a fresh
+  random hex id. The staging directory is removed by a `Drop` guard on every exit path
+  including panic and cancel-abort, so a failed turn never leaves files in the git tree.
+
+  **Rejections are never silent.** A dropped or capped file appends a line to the reply
+  the user sees, the way the PDF page cap already does — a dropped artifact the user is
+  not told about is a wrong answer they cannot detect.
+
+  **On the wire, metadata only.** `artifacts` rides as a third sidecar exactly where
+  `directives` and `provenance` already do: `JobState::Done`, `StreamFrame::Done`, the
+  persisted job file, the SSE `done` event, `GET /jesse/result/{job_id}`, and the
+  conversation hydrate route. Each element carries id, filename, mime, byte length and
+  hash — **never the bytes**, because inlining base64 would push binary content into the
+  job JSON, the persisted file, the SSE frame and the conversation store all at once. An
+  empty list serializes as `null`, so a turn that returns nothing is byte-for-byte the
+  reply an older bridge sent, and a job file written before this field loads with it
+  empty.
+
+  **`GET /jesse/artifact/{id}`** serves the bytes behind the same bearer auth: `400` for
+  a non-hex id (the traversal guard — `..`, a slash and a NUL are all non-hex), `404`
+  distinguishing `unknown` from `expired`, `304` on a matching `If-None-Match`, and
+  otherwise the bytes with the recorded mime, a hash `ETag`, and
+  `Content-Disposition: attachment` (never `inline`) plus `X-Content-Type-Options:
+  nosniff`, because this route serves SVG and HTML and neither should be treated as a
+  page from the bridge's own origin.
+
+  **Disk is a first-class requirement.** Three budgets that do not substitute for each
+  other: per turn (10 files / 25 MB each / 50 MB total, and the first file to breach a
+  cap stops the sweep with everything already accepted kept), per server (a 30-day TTL
+  and a 2 GB high-water mark evicting oldest-first, run at startup and on the *same*
+  60-second timer as job eviction rather than a second one), and per device (the app's
+  own LRU cap). Deleting a conversation **cascades** to its artifacts. The store logs its
+  file count and total bytes at startup and after every eviction, counts and bytes only,
+  never filenames.
+
+  **Hydration binds on the text.** A hydrated turn is reconstructed from the harness's
+  own transcript and has no job id, so artifacts are re-attached by the SHA-256 of the
+  delivered assistant text — the same invariant hydration already documents and the app
+  already depends on. Two character-identical replies in one conversation hash the same,
+  so each artifact is attached to the first match and consumed.
+
+  With **no state dir** the whole channel degrades to off — no staging directory, no
+  fragment, no metadata — the same degradation every other store already has.
+
+### Changed
+
+- **The SSE handler's terminal `done` frame now goes through `frame_to_event`.** The
+  late-subscriber path hand-built the same JSON object the live path encodes, which is
+  how a client that opened the stream a beat late could be told something different from
+  one already attached. One encoder now, matching what `sse_activity` already does.
+
+- **`LockBroker::forget_paths`.** A child writing into its staging directory takes an
+  ordinary per-file lock and records an ordinary baseline — correct, and *not* a trip of
+  the self-conflict 0.82.0 repaired (the key is a per-job path no other turn can name, so
+  a staged write can never make a vault file look changed). What it left was litter: one
+  baseline per returned file per turn, naming a path deleted seconds later, held for the
+  life of the conversation. The sweep now clears them with the files they describe.
+  Regression tests at the write-lock layer cover the lock/release, the same-path rewrite,
+  and that a vault file's baseline is untouched by any of it.
+
 ## [App 1.0 (106)] - 2026-08-14
 
 ### Fixed

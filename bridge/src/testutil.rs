@@ -34,6 +34,13 @@ pub(crate) fn test_config() -> Config {
         max_attachments: DEFAULT_MAX_ATTACHMENTS,
         max_attachment_bytes: DEFAULT_MAX_ATTACHMENT_BYTES,
         max_attachments_total_bytes: DEFAULT_MAX_ATTACHMENTS_TOTAL_BYTES,
+        // Shipped artifact caps in the fixture: the cap tests override the one they
+        // exercise, so a default that differs from production would only hide drift.
+        max_artifacts: DEFAULT_MAX_ARTIFACTS,
+        max_artifact_bytes: DEFAULT_MAX_ARTIFACT_BYTES,
+        max_artifacts_total_bytes: DEFAULT_MAX_ARTIFACTS_TOTAL_BYTES,
+        artifact_ttl_days: DEFAULT_ARTIFACT_TTL_DAYS,
+        artifact_store_max_bytes: DEFAULT_ARTIFACT_STORE_MAX_BYTES,
         scratch_dir: None,
         // No title-backend override by default — tests that need one set it
         // explicitly, mirroring an unconfigured (ambient-backend) deploy.

@@ -294,8 +294,13 @@ impl ApnsClient {
     /// status to a `PushOutcome`: 2xx → `Sent`, 410 → `DeadToken` (caller clears
     /// the token), anything else (other non-2xx, JWT-mint failure, transport
     /// error) → `Failed` (swallowed). Never errors out of band.
-    pub async fn push(&self, device_token: &str, job_id: &str) -> PushOutcome {
-        self.push_payload(device_token, build_apns_payload(job_id))
+    pub async fn push(
+        &self,
+        device_token: &str,
+        job_id: &str,
+        artifacts: &[Artifact],
+    ) -> PushOutcome {
+        self.push_payload(device_token, build_apns_payload(job_id, artifacts))
             .await
     }
 
@@ -391,16 +396,56 @@ pub fn mint_apns_jwt(
 
 /// The APNs payload for a finished turn: a short alert plus the `job_id` so the
 /// tap routes to the right thread and re-attaches.
-pub fn build_apns_payload(job_id: &str) -> Vec<u8> {
+///
+/// A turn that returned files NAMES them, and carries nothing else about them — no id, no
+/// size, and certainly no bytes. A push is a lock-screen line: "Jesse finished — chart.png"
+/// is the whole useful difference between it and "Jesse finished", and everything else the
+/// app already has (or fetches) once the tap opens the thread.
+///
+/// The list is bounded so a ten-file turn cannot push the alert past what a lock screen
+/// shows, and each name is stripped of control characters: the filename is the MODEL's,
+/// and this one reaches a notification.
+pub fn build_apns_payload(job_id: &str, artifacts: &[Artifact]) -> Vec<u8> {
     json!({
         "aps": {
-            "alert": { "title": "Jesse", "body": "Jesse finished" },
+            "alert": { "title": "Jesse", "body": push_body(artifacts) },
             "sound": "default"
         },
         "job_id": job_id
     })
     .to_string()
     .into_bytes()
+}
+
+/// How many returned filenames one alert names before it says "and N more".
+pub const MAX_PUSH_ARTIFACT_NAMES: usize = 3;
+
+/// The alert body for a finished turn.
+fn push_body(artifacts: &[Artifact]) -> String {
+    if artifacts.is_empty() {
+        return "Jesse finished".to_string();
+    }
+    let names: Vec<String> = artifacts
+        .iter()
+        .take(MAX_PUSH_ARTIFACT_NAMES)
+        .map(|a| {
+            a.filename
+                .chars()
+                .filter(|c| !c.is_control())
+                .take(60)
+                .collect::<String>()
+        })
+        .filter(|n| !n.trim().is_empty())
+        .collect();
+    if names.is_empty() {
+        return "Jesse finished".to_string();
+    }
+    let extra = artifacts.len().saturating_sub(names.len());
+    if extra > 0 {
+        format!("Jesse finished — {} and {extra} more", names.join(", "))
+    } else {
+        format!("Jesse finished — {}", names.join(", "))
+    }
 }
 
 /// Longest reason text carried into a scheduled-run alert. APNs caps the payload at 4KB
@@ -464,10 +509,16 @@ pub async fn notify_if_complete(
     job_id: &str,
 ) {
     let Some(apns) = apns else { return };
-    match jobs.get(job_id) {
-        Some(state) if job_state_is_pushable(&state) => {}
+    // The returned files' NAMES, for the alert body. Read from the same terminal state the
+    // pushability check reads, so the alert can never name a file a different state
+    // produced.
+    let artifacts = match jobs.get(job_id) {
+        Some(state) if job_state_is_pushable(&state) => match state {
+            JobState::Done { artifacts, .. } => artifacts,
+            _ => Vec::new(),
+        },
         _ => return, // running / cancelled / gone — nothing to push (yet)
-    }
+    };
     if !notify.take(job_id) {
         return; // not flagged, or another path already pushed
     }
@@ -475,7 +526,7 @@ pub async fn notify_if_complete(
         eprintln!("push: job {job_id} flagged but no device registered — skipping");
         return;
     };
-    match apns.push(&token, job_id).await {
+    match apns.push(&token, job_id, &artifacts).await {
         PushOutcome::Sent => eprintln!("push: completion alert sent for job {job_id}"),
         PushOutcome::DeadToken => {
             // APNs reports the token is dead (410). Clear it so it isn't retried
@@ -646,12 +697,50 @@ mod tests {
     }
     #[test]
     fn apns_payload_has_alert_and_job_id() {
-        let payload = build_apns_payload("job-xyz");
+        let payload = build_apns_payload("job-xyz", &[]);
         let v: Value = serde_json::from_slice(&payload).unwrap();
         assert_eq!(v["aps"]["alert"]["title"], "Jesse");
         assert_eq!(v["aps"]["alert"]["body"], "Jesse finished");
         assert_eq!(v["aps"]["sound"], "default");
         assert_eq!(v["job_id"], "job-xyz");
+    }
+    /// A turn that returned files NAMES them on the lock screen, and carries nothing else
+    /// about them — no id, no size, no bytes. The list is bounded and control characters
+    /// are stripped, because the filename is the MODEL's and this one reaches a
+    /// notification.
+    #[test]
+    fn payload_names_returned_files_and_nothing_more() {
+        let art = |name: &str| Artifact {
+            id: random_hex(),
+            filename: name.to_string(),
+            mime: "image/png".into(),
+            bytes: 1,
+            sha256: "ff".into(),
+        };
+        let one = build_apns_payload("j", &[art("chart.png")]);
+        let v: Value = serde_json::from_slice(&one).unwrap();
+        assert_eq!(v["aps"]["alert"]["body"], "Jesse finished — chart.png");
+        // Nothing about the artifact rides the push except its name.
+        let s = String::from_utf8(one).unwrap();
+        assert!(!s.contains("sha256") && !s.contains("image/png") && !s.contains("bytes"));
+
+        let many: Vec<Artifact> = (0..5).map(|i| art(&format!("f{i}.png"))).collect();
+        let v: Value = serde_json::from_slice(&build_apns_payload("j", &many)).unwrap();
+        assert_eq!(
+            v["aps"]["alert"]["body"], "Jesse finished — f0.png, f1.png, f2.png and 2 more",
+            "the list is bounded so one turn cannot overrun a lock-screen alert"
+        );
+
+        // A crafted filename cannot forge extra lines in the alert.
+        let v: Value =
+            serde_json::from_slice(&build_apns_payload("j", &[art("a\nb\rc.png")])).unwrap();
+        let body = v["aps"]["alert"]["body"].as_str().unwrap();
+        assert!(!body.contains('\n') && !body.contains('\r'), "{body:?}");
+
+        // A name that sanitizes to nothing degrades to the plain line rather than a
+        // dangling em dash.
+        let v: Value = serde_json::from_slice(&build_apns_payload("j", &[art("\u{7}")])).unwrap();
+        assert_eq!(v["aps"]["alert"]["body"], "Jesse finished");
     }
     #[test]
     fn pushable_only_for_done_or_failed() {
@@ -659,7 +748,8 @@ mod tests {
             response: "x".into(),
             session_id: None,
             directives: None,
-            provenance: None
+            provenance: None,
+            artifacts: Vec::new(),
         }));
         assert!(job_state_is_pushable(&JobState::Failed {
             error: "x".into(),

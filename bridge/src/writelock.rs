@@ -390,6 +390,32 @@ impl LockBroker {
         self.inner.lock_ok().baselines.remove(conversation);
     }
 
+    /// Forget the baselines for every path UNDER `prefix`, for one conversation.
+    ///
+    /// The artifact return channel is what needs this. A child writing into its staging
+    /// directory takes an ordinary per-file lock and records an ordinary baseline — the
+    /// hook layer neither knows nor cares that the path is a staging path. Both of those
+    /// are correct and neither trips the self-conflict the 0.82.0 fix repaired: the key
+    /// is a per-JOB path no other turn can name, so a staged write can never make a vault
+    /// file look changed, and a second write to the same staged path is refreshed by the
+    /// post hook exactly like any other.
+    ///
+    /// What it does leave is LITTER. The staging directory is removed when the turn ends,
+    /// so every baseline it recorded describes a path that no longer exists, and nothing
+    /// else would ever clear them — one entry per returned file per turn, held for the
+    /// life of the conversation. So the sweep clears them with the files they describe.
+    ///
+    /// Returns how many were dropped, purely so a test can assert on it.
+    pub fn forget_paths(&self, conversation: &str, prefix: &Path) -> usize {
+        let mut g = self.inner.lock_ok();
+        let Some(map) = g.baselines.get_mut(conversation) else {
+            return 0;
+        };
+        let before = map.len();
+        map.retain(|p, _| !p.starts_with(prefix));
+        before - map.len()
+    }
+
     /// Record what a conversation last left in a file — after a read OR after its own write.
     fn record_baseline(&self, conversation: &str, path: &Path) {
         if let Some(hash) = hash_file(path) {
@@ -858,6 +884,113 @@ mod tests {
             "a conversation's own write must refresh its baseline: {:?}",
             r.reason
         );
+    }
+
+    /// THE ARTIFACT STAGING DIRECTORY, at the write-lock layer.
+    ///
+    /// A child writing a file it means to return takes an ordinary per-file lock on an
+    /// ordinary path — the hook layer does not know a staging path from a vault path, and
+    /// it should not. What this asserts is that the interaction is boring in all three of
+    /// the ways it could stop being boring:
+    ///
+    ///   1. the lock is TAKEN and RELEASED normally, so a second staged write is not
+    ///      blocked by the first;
+    ///   2. writing a staged file does NOT trip the 0.82.0 self-conflict — a second write
+    ///      to the same staged path, with no re-read between, is still allowed;
+    ///   3. it does not disturb the baseline of a REAL vault file the same conversation
+    ///      is editing, which is the one that would have turned every artifact-producing
+    ///      turn into a mysterious "changed on disk" refusal.
+    #[tokio::test]
+    async fn a_staged_artifact_write_locks_normally_and_leaves_vault_baselines_alone() {
+        let b = Arc::new(LockBroker::new());
+        let work = tmpdir();
+        let vault_file = work.join("Today.md");
+        std::fs::write(&vault_file, "original").unwrap();
+        let vp = vault_file.display().to_string();
+        let staging = work.join(STAGING_DIR_NAME).join("job-1");
+        std::fs::create_dir_all(&staging).unwrap();
+        let chart = staging.join("chart.png");
+        let cp = chart.display().to_string();
+
+        // The conversation reads the vault file: baseline recorded.
+        std::fs::write(&chart, "v1").unwrap();
+        b.handle(post("t1", "read1", Some(&vp))).await;
+
+        // (1) Stage a file: the lock is taken, then released by the post hook, so a
+        // second staged write is not blocked behind the first.
+        assert!(b.handle(pre("t1", "w1", Some(&cp))).await.allow);
+        assert!(
+            !b.try_take(&LockKey::Path(chart.clone()), "t2", "other"),
+            "the staged path IS locked while held"
+        );
+        std::fs::write(&chart, "v2").unwrap();
+        b.handle(post("t1", "w1", Some(&cp))).await;
+
+        // (2) A second write to the same staged path, no re-read: the 0.82.0 property
+        // holds here exactly as it does for a vault file.
+        let again = b.handle(pre("t1", "w2", Some(&cp))).await;
+        assert!(
+            again.allow,
+            "a staged file's own rewrite must not invalidate itself: {:?}",
+            again.reason
+        );
+        std::fs::write(&chart, "v3").unwrap();
+        b.handle(post("t1", "w2", Some(&cp))).await;
+
+        // (3) The vault file's baseline is untouched by any of that — it was never
+        // re-read and never written, so its edit is still allowed.
+        let vault_edit = b.handle(pre("t1", "w3", Some(&vp))).await;
+        assert!(
+            vault_edit.allow,
+            "staging a file must not stale a vault file's baseline: {:?}",
+            vault_edit.reason
+        );
+    }
+
+    /// The sweep clears the dead baselines the staged writes left, and ONLY those.
+    ///
+    /// Without this, a conversation accumulates one baseline entry per returned file per
+    /// turn, each naming a path that was deleted seconds later, for as long as the
+    /// conversation lives.
+    #[tokio::test]
+    async fn forget_paths_drops_only_the_staged_baselines() {
+        let b = Arc::new(LockBroker::new());
+        let work = tmpdir();
+        let vault_file = work.join("Today.md");
+        std::fs::write(&vault_file, "original").unwrap();
+        let staging = work.join(STAGING_DIR_NAME).join("job-1");
+        std::fs::create_dir_all(&staging).unwrap();
+        let a = staging.join("a.png");
+        let c = staging.join("b.pdf");
+        std::fs::write(&a, "1").unwrap();
+        std::fs::write(&c, "2").unwrap();
+
+        for p in [&vault_file, &a, &c] {
+            b.handle(post("t1", "w", Some(&p.display().to_string())))
+                .await;
+        }
+        assert_eq!(
+            b.forget_paths("c1", &staging),
+            2,
+            "both staged baselines are dropped"
+        );
+        assert_eq!(
+            b.forget_paths("c1", &staging),
+            0,
+            "and dropping them is idempotent"
+        );
+        // The vault file's baseline SURVIVED: it is still the compare-and-swap key, so a
+        // foreign write to it is still caught.
+        std::fs::write(&vault_file, "somebody else was here").unwrap();
+        let r = b
+            .handle(pre("t1", "w9", Some(&vault_file.display().to_string())))
+            .await;
+        assert!(
+            !r.allow,
+            "the vault baseline must still be armed after a staging sweep"
+        );
+        // An unknown conversation is simply a no-op.
+        assert_eq!(b.forget_paths("nope", &staging), 0);
     }
 
     /// The other half: refreshing on write must NOT blind the check to a real foreign write.

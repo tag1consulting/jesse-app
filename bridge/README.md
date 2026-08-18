@@ -1266,6 +1266,130 @@ curl -s -X POST http://127.0.0.1:8765/jesse/conversation/<conversation_id>/flags
 - **`404`** for an unknown conversation, **`400`** for a malformed id.
 - Persisted to `<state_dir>/flags.json`, keyed on the conversation id.
 
+## Artifact return channel (`GET /jesse/artifact/{id}`)
+
+Files used to move in exactly one direction. A turn that rendered a chart, exported a
+CSV or wrote a PDF either described the work in prose or lost it, because the reply is a
+string. This is the other direction.
+
+### The constraint that decides the shape
+
+On **both** harnesses the only writable location is the turn's own working directory:
+
+* **Claude Code** — `--add-dir` grants READS inside the named directory and confers no
+  write. Measured against claude 2.1.223: with `Write(./**)` allowed and the directory
+  added, a write *into* it was still refused and the file was never created.
+* **Codex** — `sandbox_workspace_write.writable_roots` is exactly the turn's cwd, with
+  `/tmp` and `$TMPDIR` excluded so a write cannot be laundered through a world-writable
+  path.
+
+So the staging directory is **inside the working directory** and the bridge moves files
+out of it the moment the turn ends. No containment record moves for any of this: that
+directory is already writable at `Capability::Write`, which is the only capability that
+gets a staging directory at all.
+
+### Per turn
+
+On a turn whose capability is `Write` — and only then, and only when a state dir is
+configured — the bridge creates `<working_dir>/.jesse-artifacts/<job_id>/` (mode 0700)
+and appends one sentence to the prompt naming it. A `Read` or `Basic` turn gets neither:
+it cannot write, so promising it an artifact channel would be a lie. A turn with no
+staging directory has a **byte-for-byte unchanged** prompt.
+
+`.jesse-artifacts/` carries a `.gitignore` whose entire content is `*`. The working
+directory is a git repository committed by an automatic timer, so an artifact that landed
+in that history would be there permanently and on a remote; a directory that ignores
+itself needs no change to any file in the vault repo. Verified against the real vault:
+`git status --porcelain` is byte-identical with a file staged, and `git check-ignore -v`
+names the staging dir's own `.gitignore` as the matching rule. The property is held by a
+test that builds a scratch repository and asserts the same thing.
+
+### The sweep
+
+When the turn ends — success, error, or run-limit timeout — the staging directory is
+swept before the job reaches its terminal state. For each regular file, in name order:
+
+1. **Type is sniffed from the bytes.** PNG, JPEG and PDF by signature; SVG, HTML and JSON
+   by recognizable text shape (JSON is *parsed*, not guessed from a leading brace);
+   plain text, CSV and Markdown as verified UTF-8 text with the extension picking only
+   the display label among those three. Anything else is **rejected**, not guessed at —
+   fail-closed on purpose, so a real new type fails loudly in testing and is added
+   deliberately.
+2. **Executables are refused** — Mach-O (all four magics plus both fat wrappers), ELF and
+   `#!` scripts — and the execute bit is cleared on everything that survives (the file is
+   created fresh at 0600 rather than moved with its staged permissions).
+3. **The three per-turn caps are enforced.** The first file to breach one stops the
+   sweep; everything already accepted is kept.
+4. **The content is SHA-256'd**, and identical content produced twice is stored once and
+   referenced twice.
+5. **It is moved** to `<state_dir>/artifacts/<job_id>/<artifact_id>.<ext>`, where the id
+   is fresh random hex (it reaches a URL, so it must be unguessable, and it is
+   re-validated as hex on the way back in).
+
+A symlink is never followed: `symlink_metadata` is what decides "regular file", so a
+staged link pointing outside the staging directory is skipped rather than swept.
+
+**Rejections are never silent.** A dropped or capped file appends a line to the reply the
+user sees, the same way the PDF page cap already does. A dropped artifact the user is not
+told about is a wrong answer they cannot detect.
+
+The staging directory is removed by a `Drop` guard on **every** exit path including panic
+and the task abort a cancel performs, so a failed turn never leaves files in the git
+tree. A **cancelled** turn is the one case that discards what it staged rather than
+sweeping it — the task is aborted before the sweep runs, which is what "stop" means.
+
+### On the wire
+
+`artifacts` rides as a third sidecar exactly where `directives` and `provenance` already
+do: `JobState::Done`, `StreamFrame::Done`, the persisted job file, the SSE `done` event,
+`GET /jesse/result/{job_id}`, and the conversation hydrate route. Each element carries
+`id`, `filename`, `mime`, `bytes` and `sha256`.
+
+**It never carries the bytes.** Inlining base64 would push binary content into the job
+JSON, the persisted job file, the SSE frame and the conversation store all at once, which
+is the failure this design exists to avoid. An empty list serializes as `null`, so a turn
+that returns nothing is byte-for-byte the reply an older bridge sent.
+
+On the hydrate route, artifacts are re-attached to the turn that produced them by the
+**SHA-256 of the delivered assistant text** (trimmed, post-`delivered_text`, pre-badge).
+Hydration reconstructs a turn from the harness's own transcript and has no job id to bind
+on; what it does have is the invariant hydration already documents and the app already
+depends on — *the assistant text hydration returns is the text delivery produced*. Two
+character-identical replies in one conversation hash the same, so each artifact is
+attached to the first match and consumed.
+
+### Fetching the bytes
+
+```
+GET /jesse/artifact/{id}
+Authorization: Bearer <token>
+```
+
+* **`400`** for an id that is not lowercase hex — the traversal guard. `..`, a slash and
+  a NUL are all non-hex, so this one check keeps every request inside the artifacts
+  directory.
+* **`404`** with `{"reason": "unknown"}` or `{"reason": "expired"}`. The app renders those
+  differently: one is a client bug, the other is a budget working as designed.
+* **`304`** when `If-None-Match` matches the content hash.
+* **`200`** with the recorded mime, an `ETag` carrying the hash, and
+  `Content-Disposition: attachment` naming the display filename (RFC 6266, both forms,
+  both stripped of anything that could forge a header). Always `attachment`, never
+  `inline`, plus `X-Content-Type-Options: nosniff`: this route serves SVG and HTML, and
+  neither should ever be treated as a page from the bridge's own origin.
+
+### Disk
+
+Three budgets that do not substitute for each other — per turn (`JESSE_MAX_ARTIFACTS*`),
+per server (`JESSE_ARTIFACT_TTL_DAYS` + `JESSE_ARTIFACT_STORE_MAX_BYTES`), and per device
+(the app's own LRU cache cap). Deleting a conversation **cascades** to its artifacts: one
+that outlives the conversation it belonged to is unreachable and pure cost. The store
+logs its file count and total bytes at startup and after every eviction, so the growth is
+observable before it is a problem.
+
+With **no state dir** there is no artifact store, and the channel degrades to off: no
+staging directory, no prompt fragment, no metadata. That is the same degradation every
+other store in the bridge already has.
+
 ## Session GC sweep (`JESSE_SESSION_TTL_DAYS`)
 
 A background task reclaims **orphaned** vault-project sessions — one whose remote
@@ -1509,6 +1633,11 @@ persona-rendered defaults so the app's cached "default" matches what a turn buil
 | `JESSE_RETRIEVAL_GRACE_SECS` | `600` | How much longer a reply is kept **after** its first retrieval (a short re-poll window) instead of the full TTL |
 | `JESSE_SESSION_TTL_DAYS` | `90` | Age (days) past which the background session GC sweep reclaims a vault-project Claude Code session jsonl. The sweep keys on file mtime, and resuming a session touches it, so an actively-used thread is never reclaimed — only orphans older than this. Runs once at startup, then every 6h; scoped to the vault project only. See [Session GC sweep](#session-gc-sweep-jesse_session_ttl_days) |
 | `JESSE_STATE_DIR` | `~/.jesse-bridge` | Where completed results are persisted (`<dir>/jobs`), the device token (`<dir>/device.json`, 0600) and the per-turn timing log (`<dir>/turn-timings.jsonl`), so a restart doesn't lose a reply, the token, or the record of where a turn's time went. Empty disables persistence (timing records stay in memory) |
+| `JESSE_MAX_ARTIFACTS` | `10` | Max files one turn may return through the [artifact return channel](#artifact-return-channel-get-jesseartifactid). Files are swept in a stable order and the first to breach a cap **stops the sweep**; everything already accepted is kept and the reply names what was dropped |
+| `JESSE_MAX_ARTIFACT_BYTES` | `26214400` (25 MB) | Max size of any one returned file |
+| `JESSE_MAX_ARTIFACTS_TOTAL_BYTES` | `52428800` (50 MB) | Max combined size of one turn's returned files. Three budgets, and none substitutes for the others: a count, a per-file size, and a total |
+| `JESSE_ARTIFACT_TTL_DAYS` | `30` | How long a stored artifact is kept before the eviction sweep removes it. Runs at startup and on the same 60s cadence as job eviction — one timer, not two |
+| `JESSE_ARTIFACT_STORE_MAX_BYTES` | `2147483648` (2 GB) | Total-size high-water mark for `<state_dir>/artifacts`. Over it, **oldest-first** eviction runs until the total is back under. Every eviction pass logs counts and bytes, never filenames |
 | `JESSE_CLAUDE_BIN` | `claude` | Path to the `claude` binary |
 | `JESSE_CONFIG` | _(search path)_ | Explicit path to the `jesse.local.toml` persona overlay. When unset the bridge looks for `./jesse.local.toml`, then `<state-dir>/jesse.local.toml`. See [Persona / personalization](#persona--personalization) |
 | `JESSE_OWNER_NAME` | `the user` | Owner label rendered into the Ask/Tell wrappers. Overrides the `[persona] owner_name` from `jesse.local.toml` |

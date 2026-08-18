@@ -28,7 +28,7 @@ final class TurnAttachmentPersistenceTests: XCTestCase {
     func testAttachmentPersistsAndReloadsAcrossContainerReopen() throws {
         let url = tempStoreURL()
         defer { removeStore(url) }
-        let schema = Schema([JesseThread.self, Turn.self, TurnAttachment.self])
+        let schema = Schema([JesseThread.self, Turn.self, TurnAttachment.self, TurnArtifact.self])
         let thumb = Data([0xFF, 0xD8, 0xFF, 0x01, 0x02])
 
         // Write, then fully release the container.
@@ -64,7 +64,7 @@ final class TurnAttachmentPersistenceTests: XCTestCase {
 
     private func inMemoryContext() throws -> ModelContext {
         let container = try ModelContainer(
-            for: JesseThread.self, Turn.self, TurnAttachment.self,
+            for: JesseThread.self, Turn.self, TurnAttachment.self, TurnArtifact.self,
             configurations: ModelConfiguration(isStoredInMemoryOnly: true))
         return ModelContext(container)
     }
@@ -136,7 +136,8 @@ final class TurnAttachmentPersistenceTests: XCTestCase {
         }
 
         // "After": reopen with the full schema including TurnAttachment.
-        let newSchema = Schema([JesseThread.self, Turn.self, TurnAttachment.self])
+        let newSchema = Schema([JesseThread.self, Turn.self, TurnAttachment.self,
+                                TurnArtifact.self])
         let container = try ModelContainer(for: newSchema,
             configurations: ModelConfiguration(url: url))
         let ctx = ModelContext(container)

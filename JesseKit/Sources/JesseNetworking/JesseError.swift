@@ -80,3 +80,27 @@ public enum DietFetchError: Error, Equatable, Sendable {
     case decodeFailed           // 2xx but the body didn't decode
     case server(Int)            // any other non-2xx
 }
+
+/// Why a `GET /jesse/artifact/{id}` fetch failed, distinguished because the app renders
+/// the two `404` shapes very differently.
+///
+/// `expired` is the only PERMANENT case: the file is gone from the bridge's store — aged
+/// out past its TTL, evicted over the high-water mark, or removed by the cascade when its
+/// conversation was deleted — and no retry will bring it back. A view that gets it must
+/// record the state and stop asking, or it will re-fetch a dead id on every appearance
+/// for the life of the thread. Everything else is transient and may be retried.
+public enum ArtifactFetchError: Error, Equatable, Sendable {
+    case notConfigured          // no host/token — never paired
+    case unreachable(String)    // offline / DNS / connection dropped (message names the host)
+    case authFailed             // 401 — token wrong
+    case unknown                // 404, reason "unknown" — this id was never stored here
+    case expired                // 404, reason "expired" — stored once, gone now. PERMANENT.
+    case decodeFailed           // a response we could not read at all
+    case server(Int)            // any other non-2xx
+}
+
+/// The small JSON body a `404` from the artifact route carries, whose `reason` separates
+/// "never existed" from "expired".
+struct ArtifactMissBody: Decodable {
+    let reason: String?
+}

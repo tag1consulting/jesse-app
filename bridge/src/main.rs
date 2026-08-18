@@ -258,9 +258,24 @@ async fn main() {
     let listener = tokio::net::TcpListener::bind(&addr)
         .await
         .expect("bind failed");
+    // THE ARTIFACT STORE'S STARTUP PASS: one eviction before serving, then the usage
+    // line. The line is here rather than only after an eviction because the number worth
+    // watching is the one at boot — a store that has been growing for a month is visible
+    // in the log the morning it matters, not the day it fills the disk.
+    state.artifacts.evict();
+    if state.artifacts.is_available() {
+        let usage = state.artifacts.usage();
+        eprintln!(
+            "jesse-bridge: artifact store: {} file(s), {} MB (ttl {}d, high-water {} MB)",
+            usage.files,
+            usage.bytes / (1024 * 1024),
+            state.cfg.artifact_ttl_days,
+            state.cfg.artifact_store_max_bytes / (1024 * 1024),
+        );
+    }
     // Evict expired jobs on a periodic background task rather than on the request
     // hot path (H3), so a sweep's file unlinks never delay a turn.
-    spawn_eviction_task(state.jobs.clone());
+    spawn_eviction_task(state.jobs.clone(), state.artifacts.clone());
     // Reclaim orphaned vault-project Claude Code sessions older than
     // JESSE_SESSION_TTL_DAYS on a background sweep (one run at startup, then
     // periodic). Scoped to the vault project only; an actively-resumed session

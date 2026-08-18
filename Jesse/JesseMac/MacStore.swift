@@ -18,8 +18,12 @@ enum MacModelContainer {
     /// The Mac schema: the conversation models only (no send-outbox / meal-mirror
     /// entities — those are iOS concerns). A fresh store on the laptop, independent of
     /// the phone's; the bridge is what the two share, not a store file.
+    ///
+    /// `TurnArtifact` is here because `Turn.artifacts` points at it: a relationship whose
+    /// destination the container does not name is the one way this list can be wrong, and
+    /// it fails at RUNTIME on the laptop rather than at compile time here.
     static var schema: Schema {
-        Schema([JesseThread.self, Turn.self, TurnAttachment.self])
+        Schema([JesseThread.self, Turn.self, TurnAttachment.self, TurnArtifact.self])
     }
 
     /// Open the on-disk store, falling back to a flagged in-memory store if it can't be
@@ -257,6 +261,15 @@ final class MacCoordinator {
 
     private var client: any BridgeClientProtocol { makeClient(configStore.config) }
 
+    /// A client for fetching a returned file's bytes, or `nil` when this Mac is not
+    /// paired. Goes through the SAME injected `makeClient` seam every turn does, so an
+    /// artifact fetch in a test uses the same fake.
+    func artifactClient() -> (any BridgeClientProtocol)? {
+        let cfg = configStore.config
+        guard !cfg.normalizedHost.isEmpty, !cfg.token.isEmpty else { return nil }
+        return makeClient(cfg)
+    }
+
     func isRunning(_ threadID: UUID) -> Bool { isRunning && activeThreadID == threadID }
 
     // MARK: Sending a turn
@@ -439,6 +452,15 @@ final class MacCoordinator {
         let fields = Self.turnFields(from: reply, streamedText: streamedText)
         let jesseTurn = Turn(role: .jesse, text: fields.text)
         jesseTurn.provenanceJSON = fields.provenanceJSON
+        // Files this turn returned, as METADATA rows — the bytes are downloaded lazily on
+        // first display and cached on disk, never held in the store. `sortIndex` keeps the
+        // order the bridge swept them in, because the relationship is unordered and every
+        // row here is created in the same save. Mirrors the iOS `TurnWriter`.
+        for (i, a) in reply.artifacts.enumerated() {
+            jesseTurn.artifacts.append(TurnArtifact(artifactID: a.id, filename: a.filename,
+                                                    mime: a.mime, byteCount: Int(a.bytes),
+                                                    sha256: a.sha256, sortIndex: i))
+        }
         jesseTurn.thread = thread
         context.insert(jesseTurn)
         thread.updatedAt = Date()
@@ -504,6 +526,16 @@ final class MacCoordinator {
                     let turn = Turn(role: TranscriptMerge.role(for: t.role), text: t.text,
                                     createdAt: TranscriptMerge.timestamp(t.timestamp))
                     turn.sourceKey = t.turnKey.isEmpty ? nil : t.turnKey
+                    // A turn this Mac never saw — hydrated from the phone's send, or
+                    // after a fresh install. The bridge re-attached its returned files, so
+                    // history shows the chart instead of silently losing it. Metadata
+                    // only; the bytes download lazily on first display. A BOUND turn is
+                    // skipped here on purpose: it already holds its own rows.
+                    for (i, a) in t.artifacts.enumerated() {
+                        turn.artifacts.append(TurnArtifact(artifactID: a.id, filename: a.filename,
+                                                           mime: a.mime, byteCount: Int(a.bytes),
+                                                           sha256: a.sha256, sortIndex: i))
+                    }
                     turn.thread = thread
                     context.insert(turn)
                     thread.updatedAt = Date()

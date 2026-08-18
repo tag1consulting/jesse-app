@@ -867,6 +867,12 @@ pub struct HydratedTurn {
     /// the deprecated single-session route, which predates it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub turn_key: Option<String>,
+    /// The files this turn returned, re-attached from the artifact store. OMITTED when
+    /// empty, so a hydrate of a conversation that never produced one is byte-for-byte
+    /// what it was. See [`attach_artifacts`] for how the binding is made — hydration has
+    /// no job id, so it cannot be the obvious one.
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub artifacts: Vec<Artifact>,
 }
 
 /// Shape one transcript jsonl line into a renderable turn, or `None` to skip it.
@@ -904,6 +910,7 @@ fn shape_turn_line(line: &str, turn_key: Option<String>) -> Option<HydratedTurn>
                 text: text.to_string(),
                 timestamp: ts,
                 turn_key,
+                artifacts: Vec::new(),
             })
         }
         Some("assistant") => {
@@ -920,6 +927,7 @@ fn shape_turn_line(line: &str, turn_key: Option<String>) -> Option<HydratedTurn>
                 text: text.to_string(),
                 timestamp: ts,
                 turn_key,
+                artifacts: Vec::new(),
             })
         }
         _ => None,
@@ -1111,6 +1119,58 @@ pub struct ConversationHydrateQuery {
     pub after: Option<String>,
 }
 
+/// Re-attach a conversation's stored artifacts to the hydrated turns that produced them.
+///
+/// # Why this is a text match and not a job id
+///
+/// Hydration reconstructs a turn from the HARNESS's own transcript, which knows nothing
+/// about this bridge's jobs: there is no job id on a hydrated turn to look an artifact up
+/// by, and inventing one would mean writing bridge state into a file the CLI owns.
+///
+/// What a hydrated turn does have is the invariant `hydrate_conversation_in` already
+/// documents and the app already depends on — *the assistant text hydration returns IS
+/// the text delivery produced* — so that text is the key. The sweep hashes it at
+/// completion (trimmed, after `delivered_text`, before the badge and before any note the
+/// sweep itself appends), and this matches on the same hash computed the same way.
+///
+/// # The one imprecision, stated rather than hidden
+///
+/// Two turns of one conversation whose replies are character-for-character identical
+/// hash the same. Each artifact is therefore attached to the FIRST matching turn only and
+/// consumed, so N identical replies that each returned a file get one file each in order
+/// rather than N files on the first. That is the best available answer, and it is
+/// exactly right in the overwhelming case where the replies differ at all.
+///
+/// Artifacts whose turn is not in this hydrate window (or which predate the hash field)
+/// are simply not attached — they remain reachable by id from the reply that delivered
+/// them, and from `GET /jesse/artifact/{id}`.
+pub fn attach_artifacts(turns: &mut [HydratedTurn], stored: &[ArtifactRecord]) {
+    if stored.is_empty() {
+        return;
+    }
+    // hash → the artifacts recorded under it, in store order.
+    let mut by_text: HashMap<&str, Vec<&ArtifactRecord>> = HashMap::new();
+    for r in stored {
+        if let Some(h) = r.turn_text_sha256.as_deref() {
+            by_text.entry(h).or_default().push(r);
+        }
+    }
+    if by_text.is_empty() {
+        return;
+    }
+    for turn in turns.iter_mut() {
+        if turn.role != "assistant" {
+            continue;
+        }
+        let hash = sha256_hex(turn.text.trim().as_bytes());
+        // `remove`, not `get`: consuming the entry is what stops two identical replies
+        // from both claiming the same file.
+        if let Some(records) = by_text.remove(hash.as_str()) {
+            turn.artifacts = records.iter().map(|r| r.to_artifact(&r.filename)).collect();
+        }
+    }
+}
+
 /// `GET /jesse/conversations/{conversation_id}/transcript` hydrates a conversation's
 /// whole history into ordered, client-renderable turns, across every transcript bound
 /// to it. Same bearer auth and rate limiter as the list.
@@ -1152,13 +1212,18 @@ pub async fn jesse_conversation_hydrate(
     let start = parse_hydrate_cursor(params.after.as_deref())
         .map_err(|msg| (StatusCode::BAD_REQUEST, msg))?;
     let dirs = st.transcript_dirs();
-    let (turns, next_cursor) =
-        hydrate_conversation_in(&dirs, &rec.session_ids, start).map_err(|e| {
+    let (mut turns, next_cursor) = hydrate_conversation_in(&dirs, &rec.session_ids, start)
+        .map_err(|e| {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 format!("could not read conversation transcript: {e}"),
             )
         })?;
+    // A RELOADED TRANSCRIPT STILL SHOWS ITS ARTIFACTS. Without this, a device that
+    // rebuilt a thread from the bridge would render every older turn's returned file as
+    // if it had never existed — the file would still be in the store, still fetchable,
+    // and completely invisible. See `attach_artifacts` for the binding.
+    attach_artifacts(&mut turns, &st.artifacts.for_conversation(&conversation_id));
     let body = serde_json::to_string(&json!({
         "conversation_id": conversation_id,
         "turns": turns,
@@ -1227,13 +1292,20 @@ fn delete_conversation_core(st: &AppState, conversation_id: &str) -> Result<Stat
     // titles.json / flags.json and resurrect a stale title or favorite.
     st.titles.remove(conversation_id);
     st.flags.remove(conversation_id);
+    // THE ARTIFACT CASCADE. Files a turn of this conversation returned are unreachable
+    // the moment the conversation is gone — nothing left names their ids — so keeping
+    // them is pure cost against the store's high-water mark. The fetch route then
+    // reports them EXPIRED rather than unknown, which is what the app renders.
+    let artifacts_removed = st.artifacts.forget_conversation(conversation_id);
     // A user-intent delete, so a device that adopted this conversation must learn to
     // drop it. Only the explicit delete route records here; age-based GC never does.
     st.deletions.record(conversation_id, now_ms);
     st.conversations.forget(conversation_id);
     eprintln!(
-        "jesse-bridge: deleted conversation {conversation_id} ({} transcript(s))",
-        session_ids.len()
+        "jesse-bridge: deleted conversation {conversation_id} ({} transcript(s), {} \
+         artifact(s))",
+        session_ids.len(),
+        artifacts_removed,
     );
     Ok(StatusCode::NO_CONTENT)
 }

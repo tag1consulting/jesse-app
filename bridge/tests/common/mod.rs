@@ -40,6 +40,15 @@ pub fn test_config() -> Config {
         max_attachments: DEFAULT_MAX_ATTACHMENTS,
         max_attachment_bytes: DEFAULT_MAX_ATTACHMENT_BYTES,
         max_attachments_total_bytes: DEFAULT_MAX_ATTACHMENTS_TOTAL_BYTES,
+        // The shipped artifact caps. `state_dir: None` above is what actually keeps the
+        // channel off in the fixture (no store → `ArtifactRoute::None`), so every
+        // existing turn assertion is byte-for-byte unaffected; the artifact tests set a
+        // state dir explicitly.
+        max_artifacts: DEFAULT_MAX_ARTIFACTS,
+        max_artifact_bytes: DEFAULT_MAX_ARTIFACT_BYTES,
+        max_artifacts_total_bytes: DEFAULT_MAX_ARTIFACTS_TOTAL_BYTES,
+        artifact_ttl_days: DEFAULT_ARTIFACT_TTL_DAYS,
+        artifact_store_max_bytes: DEFAULT_ARTIFACT_STORE_MAX_BYTES,
         scratch_dir: None,
         // No title-backend override in tests — ambient-backend behavior.
         // No diet-extract backend override in tests — the pipeline is dormant

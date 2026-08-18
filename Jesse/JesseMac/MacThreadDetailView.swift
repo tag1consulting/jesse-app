@@ -263,6 +263,11 @@ struct MacTurnBubble: View {
                 jesseGlyph
                 VStack(alignment: .leading, spacing: 4) {
                     MacMarkdownView(text: turn.text)
+                    // Files JESSE returned on this turn. Nothing renders for the
+                    // overwhelming majority of turns. Mirrors iOS.
+                    if !turn.artifacts.isEmpty {
+                        MacTurnArtifactsView(artifacts: turn.orderedArtifacts)
+                    }
                     // Native provenance chip under a Jesse reply that carried structured
                     // provenance (the badge text is already stripped from `turn.text` when
                     // the reply was ingested). Absent for older / badges-off replies —

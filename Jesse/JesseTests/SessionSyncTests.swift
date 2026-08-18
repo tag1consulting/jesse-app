@@ -93,7 +93,8 @@ final class SessionSyncTests: XCTestCase {
     @MainActor
     private func makeContext() throws -> ModelContext {
         let container = try ModelContainer(
-            for: JesseThread.self, Turn.self, TurnAttachment.self, OutboxItem.self, OutboxAttachment.self,
+            for: JesseThread.self, Turn.self, TurnAttachment.self, TurnArtifact.self,
+            OutboxItem.self, OutboxAttachment.self,
             configurations: ModelConfiguration(isStoredInMemoryOnly: true))
         return ModelContext(container)
     }
