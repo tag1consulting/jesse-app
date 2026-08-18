@@ -782,6 +782,18 @@ pub struct Config {
     pub max_attachments: usize,
     pub max_attachment_bytes: usize,
     pub max_attachments_total_bytes: usize,
+    // PER-TURN artifact caps (see the DEFAULT_MAX_ARTIFACT* consts in `artifacts`):
+    // how many files one turn may return, how big any one may be, and how big they may
+    // be combined. Three budgets, none of which substitutes for the others. On-disk
+    // sizes — nothing about this channel is base64.
+    pub max_artifacts: usize,
+    pub max_artifact_bytes: u64,
+    pub max_artifacts_total_bytes: u64,
+    // SERVER-SIDE artifact budgets: how long a stored artifact is kept, and the total
+    // size high-water mark past which oldest-first eviction runs. Enforced by
+    // `ArtifactStore::evict`, on the same cadence as `JobStore::evict_expired`.
+    pub artifact_ttl_days: u64,
+    pub artifact_store_max_bytes: u64,
     // Base directory for per-request attachment scratch dirs. None → the system
     // temp dir. Set JESSE_SCRATCH_DIR to point this at a sandbox-mounted path if
     // the bridge is ever confined so it can't read the system temp dir.
@@ -932,6 +944,21 @@ impl Config {
         self.state_dir
             .as_deref()
             .map(|d| PathBuf::from(d).join("jobs"))
+    }
+
+    /// The directory the artifact return channel stores returned files under
+    /// (`<state_dir>/artifacts`, a sibling of `jobs/`), or `None` when persistence is
+    /// disabled.
+    ///
+    /// `None` is the CHANNEL'S KILL SWITCH, not a degraded mode with a workaround: with
+    /// nowhere to move a swept file to, [`artifact_route`] returns
+    /// [`ArtifactRoute::None`], no staging directory is created, no prompt fragment is
+    /// added and no reply carries metadata. That is the same degradation the job / title
+    /// / device / flag stores already have.
+    pub fn artifacts_dir(&self) -> Option<PathBuf> {
+        self.state_dir
+            .as_deref()
+            .map(|d| PathBuf::from(d).join("artifacts"))
     }
 
     /// The file the registered APNs device token is persisted to (sibling of the
@@ -2380,6 +2407,17 @@ impl Config {
             max_attachments_total_bytes: env_parse(
                 "JESSE_MAX_ATTACHMENTS_TOTAL_BYTES",
                 DEFAULT_MAX_ATTACHMENTS_TOTAL_BYTES,
+            ),
+            max_artifacts: env_parse("JESSE_MAX_ARTIFACTS", DEFAULT_MAX_ARTIFACTS),
+            max_artifact_bytes: env_parse("JESSE_MAX_ARTIFACT_BYTES", DEFAULT_MAX_ARTIFACT_BYTES),
+            max_artifacts_total_bytes: env_parse(
+                "JESSE_MAX_ARTIFACTS_TOTAL_BYTES",
+                DEFAULT_MAX_ARTIFACTS_TOTAL_BYTES,
+            ),
+            artifact_ttl_days: env_parse("JESSE_ARTIFACT_TTL_DAYS", DEFAULT_ARTIFACT_TTL_DAYS),
+            artifact_store_max_bytes: env_parse(
+                "JESSE_ARTIFACT_STORE_MAX_BYTES",
+                DEFAULT_ARTIFACT_STORE_MAX_BYTES,
             ),
             scratch_dir: env_string("JESSE_SCRATCH_DIR"),
             // Micronutrient completion defaults to TRUE (same truthiness convention as

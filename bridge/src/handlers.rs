@@ -782,6 +782,44 @@ pub async fn start_turn(
             })
         }
     };
+    // THE ARTIFACT RETURN CHANNEL. A per-job staging directory INSIDE the turn's working
+    // directory — the only place either harness can write (see `artifacts`) — plus the
+    // one-sentence fragment that tells the model files written there come back.
+    //
+    // Created here rather than earlier because it is keyed on the job id, and before the
+    // spawn because the fragment has to reach the prompt the task builds from. A turn
+    // that takes `ArtifactRoute::None` — every `Read`/`Basic` turn, and every turn on a
+    // bridge with no state dir — gets no directory and no fragment, so its prompt is
+    // byte-for-byte what it has always been.
+    //
+    // A creation failure is NOT a turn failure: the working directory could be
+    // read-only, or the sweep of a previous run could have left something odd, and
+    // refusing to answer at all because a file could not have been returned would be a
+    // far worse outcome than answering without the channel. It is logged and the turn
+    // runs as an `ArtifactRoute::None` turn would.
+    let artifact_caps = ArtifactCaps::from_cfg(&st.cfg);
+    // The SAME derivation the child's toolset uses (`build_write_lock_child` reads it
+    // too), so a turn that is granted a staging directory is exactly a turn whose
+    // harness flags let it write. Asking `turn_capability` here rather than inventing a
+    // second rule is what keeps the two from drifting.
+    let capability = turn_capability(&active);
+    let (prompt, staging) = match artifact_route(capability, st.artifacts.is_available()) {
+        ArtifactRoute::None => (prompt, None),
+        ArtifactRoute::Staged => match StagingDir::create(Path::new(&st.cfg.vault), &job_id) {
+            Ok(dir) => {
+                let suffix = artifact_prompt_suffix(&dir.path, &artifact_caps);
+                (format!("{prompt}{suffix}"), Some(dir))
+            }
+            Err(e) => {
+                eprintln!(
+                    "jesse-bridge: could not create the artifact staging dir for job {job_id}: \
+                     {e} — this turn runs without the return channel"
+                );
+                (prompt, None)
+            }
+        },
+    };
+
     // Open the live stream before spawning so a phone that opens
     // `GET /jesse/stream/{job_id}` immediately finds the broadcast channel.
     st.jobs.stream_register(&job_id);
@@ -865,6 +903,12 @@ pub async fn start_turn(
         // files therefore survive run_claude's internal retries and are cleaned
         // exactly once, here.
         let _scratch = scratch;
+        // Hold the artifact staging dir for the whole turn too. Its `Drop` removes the
+        // directory on every exit path — success, error, timeout, panic, and the task
+        // abort a cancel performs — so a failed turn never leaves files inside the
+        // working directory's git tree. The SWEEP that moves what it holds into the
+        // store runs further down, on the completion path.
+        let staging = staging;
         // THE DIRECTORY THOSE FILES ARE IN, for the child that must read them. `Some` only
         // when this turn actually wrote a scratch dir, which is exactly when it had
         // attachments AND the vision helper did not take them: the gate above returns
@@ -1505,6 +1549,77 @@ pub async fn start_turn(
             _ => None,
         };
 
+        // ---- THE ARTIFACT SWEEP ---------------------------------------------------
+        //
+        // Move whatever this turn staged into the artifact store, BEFORE the job reaches
+        // its terminal state, so the metadata rides the same `Done` the reply does.
+        //
+        // WHY HERE, at this exact seam:
+        //
+        //   * AFTER the outcome is resolved, so the delivered text is known — that text
+        //     is the hydration binding (see `ArtifactRecord::turn_text_sha256`), and it
+        //     must be hashed BEFORE anything the bridge appends. `delivered_text` is
+        //     applied first, and is the same function the hydration path funnels every
+        //     turn through, so the two sides cannot compute a different key.
+        //   * BEFORE the badge, so the notes below and the badge land in one order at
+        //     one place rather than racing each other for the end of the reply.
+        //
+        // Every exit path that reaches `complete_full` also reaches here: success, an
+        // error, and a run-limit timeout all resolve `outcome` above. A CANCEL does not —
+        // it aborts this task outright — and that is deliberate: `StagingDir`'s `Drop`
+        // still removes the directory, so a stopped turn leaves nothing behind and
+        // returns nothing, which is what "stop" means.
+        let artifacts = match &staging {
+            None => SweepOutcome::default(),
+            Some(dir) => {
+                let turn_text_sha256 = match &outcome {
+                    Ok((text, _, _)) => {
+                        let delivered = directives::delivered_text(text);
+                        (!delivered.trim().is_empty())
+                            .then(|| sha256_hex(delivered.trim().as_bytes()))
+                    }
+                    Err(_) => None,
+                };
+                let swept = st.artifacts.sweep(
+                    &SweepContext {
+                        job_id: &jid,
+                        conversation_id: &cid,
+                        session_id: match &outcome {
+                            Ok((_, sid, _)) => sid.as_deref(),
+                            Err(_) => None,
+                        },
+                        turn_text_sha256,
+                        caps: artifact_caps,
+                    },
+                    &dir.path,
+                );
+                if !swept.artifacts.is_empty() {
+                    eprintln!(
+                        "jesse-bridge: turn {jid} returned {} artifact(s)",
+                        swept.artifacts.len()
+                    );
+                }
+                // THE WRITE LOCK'S BASELINES FOR THE STAGED PATHS ARE NOW DEAD. Each
+                // write into the staging directory recorded one (keyed on a path that
+                // is about to stop existing), and nothing else would ever clear them —
+                // ten per turn, for the life of the conversation. They cannot cause a
+                // wrong refusal (the key is a per-job path no other turn can name), but
+                // an entry per staged file per turn is a leak, so it is swept with the
+                // files it describes. See `LockBroker::forget_paths`.
+                broker.forget_paths(&cid, &dir.path);
+                swept
+            }
+        };
+        // NEVER SILENT. A rejected or truncated file produces a line the user sees,
+        // exactly the way the PDF page cap already appends one — a dropped artifact the
+        // user is not told about is a wrong answer they have no way to detect.
+        let outcome = match (outcome, artifacts.note_suffix()) {
+            (Ok((text, sid_out, directives)), Some(note)) if !text.trim().is_empty() => {
+                Ok((format!("{text}{note}"), sid_out, directives))
+            }
+            (other, _) => other,
+        };
+
         // Finalize the delivered reply: append the model badge (display only) at this
         // single point, so BOTH the poll result and the SSE `done` frame carry it.
         let outcome = finalize_reply_badge(outcome, &cfg, &st.health, badge_source, &hosted_badge);
@@ -1567,7 +1682,13 @@ pub async fn start_turn(
         // then served by the emergency fallback delivers its answer with nothing extra,
         // while a turn that really died at the limit carries out the text it had already
         // produced, its elapsed seconds and its tool count.
-        jobs.complete_full(&jid, outcome, provenance, trace.partial());
+        jobs.complete_full(
+            &jid,
+            outcome,
+            provenance,
+            trace.partial(),
+            artifacts.artifacts,
+        );
         // Close the live stream with the frame matching the state that actually
         // landed. `complete` is write-once, so a cancel that won the race already
         // set `Cancelled` (and `cancel` already emitted that frame + removed the
@@ -1669,12 +1790,17 @@ pub async fn jesse_result(
             session_id,
             directives,
             provenance,
+            artifacts,
         }) => Ok(Json(json!({
             "status": "done",
             "response": response,
             "session_id": session_id,
             "directives": directives_to_value(&directives),
             "provenance": provenance_to_value(provenance.as_deref()),
+            // The files this turn returned, as metadata only — `null` when there are
+            // none, so this response is byte-for-byte what it was for every turn that
+            // returns nothing. The bytes come from `GET /jesse/artifact/{id}`.
+            "artifacts": artifacts_to_value(&artifacts),
             "timing": timing,
         }))),
         Some(JobState::Failed { error, partial }) => Ok(Json(json!({
@@ -1689,6 +1815,93 @@ pub async fn jesse_result(
             "unknown or expired job id".to_string(),
         )),
     }
+}
+
+/// `GET /jesse/artifact/{id}` — the BYTES of one file a turn returned.
+///
+/// Same bearer auth as every other route. The metadata rode the reply as the
+/// `artifacts` sidecar; this is the only place the content itself moves, which is what
+/// keeps binary content out of the job JSON, the persisted job file, the SSE frame and
+/// the conversation store.
+///
+///   * **`400`** for an id that is not lowercase hex. THE TRAVERSAL GUARD: `..`, a
+///     slash and a NUL are all non-hex, so no request can address anything outside the
+///     artifacts directory. Rejected before the store is touched at all.
+///   * **`404`** with a body distinguishing `"unknown"` from `"expired"` — the app
+///     renders those two differently, because one is a client bug and the other is the
+///     server-side budget working as designed.
+///   * **`304`** when the `If-None-Match` matches the content hash, so a re-fetch of an
+///     artifact the device already cached costs one empty response.
+///
+/// The response is always `Content-Disposition: attachment`, never `inline`, and carries
+/// `X-Content-Type-Options: nosniff`. This route serves SVG and HTML, both of which are
+/// script-execution surfaces in any viewer that renders them as a document; nothing on
+/// this path should ever be treated as a page from the bridge's own origin.
+pub async fn jesse_artifact(
+    State(st): State<AppState>,
+    UrlPath(id): UrlPath<String>,
+    headers: HeaderMap,
+) -> Result<Response, ApiError> {
+    check_auth(&headers, &st.cfg.token)?;
+    if !is_valid_artifact_id(&id) {
+        return Err((StatusCode::BAD_REQUEST, "malformed artifact id".to_string()));
+    }
+    let (record, path) = match st.artifacts.get(&id) {
+        Ok(found) => found,
+        Err(miss) => {
+            let (reason, message) = match miss {
+                ArtifactMiss::Expired => (
+                    "expired",
+                    "this file is no longer stored — it aged out or its conversation was \
+                     deleted",
+                ),
+                ArtifactMiss::Unknown => ("unknown", "no such artifact"),
+            };
+            return Ok((
+                StatusCode::NOT_FOUND,
+                Json(json!({ "error": message, "reason": reason })),
+            )
+                .into_response());
+        }
+    };
+    let etag = format!("\"{}\"", record.sha256);
+    if let Some(inm) = headers
+        .get(axum::http::header::IF_NONE_MATCH)
+        .and_then(|v| v.to_str().ok())
+    {
+        if if_none_match_matches(inm, &etag) {
+            return Ok(
+                (StatusCode::NOT_MODIFIED, [(axum::http::header::ETAG, etag)]).into_response(),
+            );
+        }
+    }
+    // The index says it exists and the bytes do not: the store and the disk disagreed,
+    // which is a server fault, not a client one. Reported as such rather than as a 404
+    // that would tell the app to give up on a file that may still be recoverable.
+    let bytes = std::fs::read(&path).map_err(|e| {
+        eprintln!("jesse-bridge: artifact {id} is indexed but unreadable: {e}");
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "the artifact could not be read".to_string(),
+        )
+    })?;
+    Ok((
+        StatusCode::OK,
+        [
+            (axum::http::header::ETAG, etag),
+            (axum::http::header::CONTENT_TYPE, record.mime.clone()),
+            (
+                axum::http::header::CONTENT_DISPOSITION,
+                content_disposition(&record.filename),
+            ),
+            (
+                axum::http::header::HeaderName::from_static("x-content-type-options"),
+                "nosniff".to_string(),
+            ),
+        ],
+        bytes,
+    )
+        .into_response())
 }
 
 /// Cancel a running turn by job id (`POST /jesse/cancel/{id}`). Same bearer auth
@@ -2079,6 +2292,9 @@ pub fn app(state: AppState) -> Router {
         .route("/jesse/title", post(jesse_title))
         .route("/jesse/meal-corrections", post(jesse_meal_corrections))
         .route("/jesse/result/:job_id", get(jesse_result))
+        // The BYTES of one returned file. The reply carries only metadata; this is the
+        // one route content moves on, and it is behind the same bearer auth as the rest.
+        .route("/jesse/artifact/:id", get(jesse_artifact))
         .route("/jesse/stream/:job_id", get(jesse_stream))
         .route("/jesse/cancel/:job_id", post(jesse_cancel))
         .route("/jesse/device", post(jesse_device))

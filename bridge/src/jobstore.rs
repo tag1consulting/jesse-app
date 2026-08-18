@@ -44,6 +44,15 @@ pub enum JobState {
         // (the provenance object is present only on a badged reply — a heap hop on that
         // rare terminal path, never on the hot `Running` state).
         provenance: Option<Box<Provenance>>,
+        // The files this turn wrote into its staging directory and the sweep moved into
+        // the artifact store: identity, display metadata and a content hash, NEVER the
+        // bytes. Carried on the terminal state so BOTH the poll result and the SSE
+        // `done` frame surface the same value — the third sidecar, threaded exactly
+        // where `directives` and `provenance` are. Empty for the overwhelming majority
+        // of turns (and for every turn below `Capability::Write`), which is why it is a
+        // plain `Vec` rather than an `Option`: empty and absent mean the same thing and
+        // there is nothing for a reader to distinguish.
+        artifacts: Vec<Artifact>,
     },
     Failed {
         error: String,
@@ -183,41 +192,46 @@ pub fn ms_to_system_time(ms: u64) -> SystemTime {
 /// and timing metadata; never any secret.
 pub fn job_to_value(id: &str, job: &Job) -> Option<Value> {
     let completed_at = job.completed_at?;
-    let (status, response, session_id, directives, provenance, error, partial) = match &job.state {
-        JobState::Done {
-            response,
-            session_id,
-            directives,
-            provenance,
-        } => (
-            "done",
-            Some(response.clone()),
-            session_id.clone(),
-            directives_to_value(directives),
-            provenance_to_value(provenance.as_deref()),
-            None,
-            Value::Null,
-        ),
-        JobState::Failed { error, partial } => (
-            "failed",
-            None,
-            None,
-            Value::Null,
-            Value::Null,
-            Some(error.clone()),
-            partial_to_value(partial.as_deref()),
-        ),
-        JobState::Cancelled => (
-            "cancelled",
-            None,
-            None,
-            Value::Null,
-            Value::Null,
-            None,
-            Value::Null,
-        ),
-        JobState::Running => return None,
-    };
+    let (status, response, session_id, directives, provenance, artifacts, error, partial) =
+        match &job.state {
+            JobState::Done {
+                response,
+                session_id,
+                directives,
+                provenance,
+                artifacts,
+            } => (
+                "done",
+                Some(response.clone()),
+                session_id.clone(),
+                directives_to_value(directives),
+                provenance_to_value(provenance.as_deref()),
+                artifacts_to_value(artifacts),
+                None,
+                Value::Null,
+            ),
+            JobState::Failed { error, partial } => (
+                "failed",
+                None,
+                None,
+                Value::Null,
+                Value::Null,
+                Value::Null,
+                Some(error.clone()),
+                partial_to_value(partial.as_deref()),
+            ),
+            JobState::Cancelled => (
+                "cancelled",
+                None,
+                None,
+                Value::Null,
+                Value::Null,
+                Value::Null,
+                None,
+                Value::Null,
+            ),
+            JobState::Running => return None,
+        };
     Some(json!({
         "v": 1,
         "job_id": id,
@@ -226,6 +240,11 @@ pub fn job_to_value(id: &str, job: &Job) -> Option<Value> {
         "session_id": session_id,
         "directives": directives,
         "provenance": provenance,
+        // The artifact metadata this reply owns, so a returned file survives a bridge
+        // restart along with the reply it belongs to. Null on every other state and on
+        // any job file written before this field existed — which is exactly how
+        // `value_to_job` reads it back.
+        "artifacts": artifacts,
         "error": error,
         // How far a CUT-OFF turn got, so a restart still serves it. Null on every other
         // state and on any job file written before this field existed.
@@ -269,6 +288,10 @@ pub fn value_to_job(v: &Value) -> Option<(String, Job)> {
                 .filter(|p| !p.is_null())
                 .and_then(|p| serde_json::from_value::<Provenance>(p.clone()).ok())
                 .map(Box::new),
+            // Absent/null/malformed persisted artifacts → EMPTY, which is how every job
+            // file written before this field existed loads: the reply is served exactly
+            // as it always was, with no artifact chips. See `artifacts_from_value`.
+            artifacts: artifacts_from_value(v.get("artifacts")),
         },
         "failed" => JobState::Failed {
             error: v
@@ -629,7 +652,7 @@ impl JobStore {
         outcome: Result<(String, Option<String>, Option<Directives>), ApiError>,
         provenance: Option<Provenance>,
     ) {
-        self.complete_full(id, outcome, provenance, None);
+        self.complete_full(id, outcome, provenance, None, Vec::new());
     }
 
     /// Land the outcome, its provenance, AND — for a turn the run limit cut off — how far
@@ -646,6 +669,7 @@ impl JobStore {
         outcome: Result<(String, Option<String>, Option<Directives>), ApiError>,
         provenance: Option<Provenance>,
         partial: Option<PartialTurn>,
+        artifacts: Vec<Artifact>,
     ) {
         // The turn is over — drop its abort handle so the map can't leak. Done in
         // its own statement so the `aborts` lock is released before taking `jobs`.
@@ -657,6 +681,7 @@ impl JobStore {
                 directives,
                 // Box on store — keeps the terminal variant small (see the field docs).
                 provenance: provenance.map(Box::new),
+                artifacts,
             },
             Err((_code, error)) => JobState::Failed {
                 error,
@@ -762,6 +787,7 @@ impl JobStore {
                 session_id,
                 directives,
                 provenance,
+                artifacts,
             }) => self.stream_finish(
                 id,
                 StreamFrame::Done {
@@ -769,6 +795,7 @@ impl JobStore {
                     session_id,
                     directives,
                     provenance,
+                    artifacts,
                 },
             ),
             Some(JobState::Failed { error, .. }) => {
@@ -945,7 +972,7 @@ pub const EVICTION_INTERVAL: Duration = Duration::from_secs(60);
 /// Spawn the periodic eviction sweep. Runs on its own Tokio task for the life of
 /// the process so a slow disk during a sweep can't touch a request. Replaces the
 /// old opportunistic `evict_expired()` calls at the top of the request handlers.
-pub fn spawn_eviction_task(jobs: Arc<JobStore>) {
+pub fn spawn_eviction_task(jobs: Arc<JobStore>, artifacts: Arc<ArtifactStore>) {
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(EVICTION_INTERVAL);
         // Skip the immediate first tick's burst on a missed deadline; correctness
@@ -954,6 +981,12 @@ pub fn spawn_eviction_task(jobs: Arc<JobStore>) {
         loop {
             tick.tick().await;
             jobs.evict_expired();
+            // The ARTIFACT store's own budgets (30-day TTL + a 2 GB high-water mark)
+            // ride this same timer rather than a second one. Both are "unlink what is
+            // past its window", both must stay off the request hot path for the same
+            // reason (H3), and one task is one thing to reason about on shutdown. A
+            // no-op when there is no state dir.
+            artifacts.evict();
         }
     });
 }
@@ -1296,6 +1329,7 @@ mod tests {
                     session_id: Some("s".into()),
                     directives: None,
                     provenance: None,
+                    artifacts: Vec::new(),
                 },
                 completed_at: Some(SystemTime::now()),
                 first_retrieved_at: None,
@@ -1536,6 +1570,7 @@ mod tests {
                 session_id: None,
                 directives: None,
                 provenance: None,
+                artifacts: Vec::new(),
             },
             completed_at: Some(SystemTime::now()),
             first_retrieved_at: None,

@@ -74,6 +74,7 @@ pub(crate) use tokio::time::timeout;
 // ---- Modules --------------------------------------------------------------
 
 mod apns;
+mod artifacts;
 mod attachments;
 mod audit;
 mod auth;
@@ -139,6 +140,7 @@ mod writelock;
 // Flat internal namespace: every module's items reachable crate-wide by bare
 // name (so `use crate::*` in each module works exactly like the old single file).
 pub use apns::*;
+pub use artifacts::*;
 pub use attachments::*;
 pub use audit::*;
 pub use auth::*;

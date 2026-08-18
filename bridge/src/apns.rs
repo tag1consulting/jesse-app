@@ -659,7 +659,8 @@ mod tests {
             response: "x".into(),
             session_id: None,
             directives: None,
-            provenance: None
+            provenance: None,
+            artifacts: Vec::new(),
         }));
         assert!(job_state_is_pushable(&JobState::Failed {
             error: "x".into(),

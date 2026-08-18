@@ -8483,3 +8483,443 @@ async fn today_a_tap_with_no_turn_running_leaves_the_journal_empty() {
     );
     let _ = std::fs::remove_dir_all(&vault);
 }
+
+// ---- The artifact return channel -------------------------------------------
+//
+// The staging directory, the sweep, the wire sidecar and the fetch route, driven
+// end-to-end through the real router with a fake `claude` that writes files exactly
+// where the prompt tells it to.
+
+/// A state whose vault and state dir are both fresh temp dirs, so the channel is armed
+/// (a store exists) and the staging directory has a working directory to live in.
+/// Returns the state plus both paths, which the caller removes.
+fn artifact_state(script: &str) -> (AppState, std::path::PathBuf, std::path::PathBuf) {
+    let n = JOB_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let vault = std::env::temp_dir().join(format!("jesse-art-vault-{}-{n}", std::process::id()));
+    let state_dir =
+        std::env::temp_dir().join(format!("jesse-art-state-{}-{n}", std::process::id()));
+    std::fs::create_dir_all(&vault).unwrap();
+    std::fs::create_dir_all(&state_dir).unwrap();
+    let fake = write_fake_claude(script);
+    let cfg = Config {
+        claude_bin: fake.to_string_lossy().into_owned(),
+        vault: vault.to_string_lossy().into_owned(),
+        state_dir: Some(state_dir.to_string_lossy().into_owned()),
+        ..test_config()
+    };
+    (AppState::new(cfg), vault, state_dir)
+}
+
+/// A fake `claude` that writes `files` into whatever staging directory the turn made,
+/// then answers. It finds the directory by GLOB rather than by parsing the prompt, which
+/// keeps the script trivial and still proves the directory is (a) there, (b) inside the
+/// child's cwd, and (c) writable by the child.
+fn artifact_script(files: &[(&str, &str)]) -> String {
+    let mut s = String::from(
+        "#!/bin/sh\n\
+         dir=$(ls -d .jesse-artifacts/*/ 2>/dev/null | head -1)\n\
+         if [ -z \"$dir\" ]; then \
+             printf '%s' '{\"type\":\"result\",\"is_error\":false,\"result\":\"NO STAGING DIR\"}'; \
+             exit 0; \
+         fi\n",
+    );
+    for (name, body) in files {
+        s.push_str(&format!("printf '%b' '{body}' > \"$dir/{name}\"\n"));
+    }
+    s.push_str(
+        "printf '%s' '{\"type\":\"result\",\"is_error\":false,\"result\":\"here they are\"}'\n",
+    );
+    s
+}
+
+/// A minimal but genuinely valid PNG header, as a printf escape string.
+const PNG_ESCAPES: &str = "\\x89PNG\\r\\n\\x1a\\n\\x00\\x00\\x00\\x0dIHDR";
+
+/// THE END-TO-END CASE: a turn writes two files, both come back on the reply, and both
+/// are fetchable by id.
+#[tokio::test]
+async fn artifacts_a_turn_that_writes_two_files_returns_them_both() {
+    let (st, vault, state_dir) = artifact_state(&artifact_script(&[
+        ("chart.png", PNG_ESCAPES),
+        ("data.csv", "a,b\\n1,2\\n"),
+    ]));
+
+    let resp = app(st.clone())
+        .oneshot(jesse_request(
+            Some("Bearer test-token"),
+            r#"{"mode":"tell","text":"make me a chart"}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::ACCEPTED);
+    let body: Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    let job_id = body["job_id"].as_str().unwrap().to_string();
+    let done = wait_for_status(&st, &job_id, "done").await;
+
+    assert_eq!(
+        done["response"].as_str().unwrap(),
+        "here they are",
+        "nothing was appended: no file was dropped, so there is no note"
+    );
+    let arts = done["artifacts"]
+        .as_array()
+        .expect("the sidecar is present");
+    assert_eq!(arts.len(), 2, "both files came back: {arts:?}");
+    // Stable order: the staging dir is swept sorted by name.
+    assert_eq!(arts[0]["filename"], "chart.png");
+    assert_eq!(arts[0]["mime"], "image/png");
+    assert_eq!(arts[1]["filename"], "data.csv");
+    assert_eq!(arts[1]["mime"], "text/csv");
+    // NEVER THE BYTES. This is the whole point of the design.
+    for a in arts {
+        assert!(a.get("data").is_none() && a.get("data_base64").is_none());
+        assert!(a["sha256"].as_str().unwrap().len() == 64);
+    }
+
+    // The staging directory is GONE — the turn left nothing inside the working dir.
+    assert!(
+        !vault.join(".jesse-artifacts").join(&job_id).exists(),
+        "the per-job staging dir is removed when the turn ends"
+    );
+
+    // …and the bytes are fetchable, with the recorded mime and a hash ETag.
+    let id = arts[0]["id"].as_str().unwrap();
+    let resp = app(st.clone())
+        .oneshot(
+            Request::builder()
+                .uri(format!("/jesse/artifact/{id}"))
+                .header("authorization", "Bearer test-token")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(resp.headers()["content-type"], "image/png");
+    assert_eq!(resp.headers()["x-content-type-options"], "nosniff");
+    let etag = resp.headers()["etag"].to_str().unwrap().to_string();
+    assert_eq!(etag, format!("\"{}\"", arts[0]["sha256"].as_str().unwrap()));
+    assert!(resp.headers()["content-disposition"]
+        .to_str()
+        .unwrap()
+        .starts_with("attachment; filename=\"chart.png\""));
+    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert!(bytes.starts_with(b"\x89PNG\r\n\x1a\n"), "the real bytes");
+
+    // A re-fetch under the same ETag costs one empty 304.
+    let resp = app(st.clone())
+        .oneshot(
+            Request::builder()
+                .uri(format!("/jesse/artifact/{id}"))
+                .header("authorization", "Bearer test-token")
+                .header("if-none-match", &etag)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_MODIFIED);
+
+    let _ = std::fs::remove_dir_all(&vault);
+    let _ = std::fs::remove_dir_all(&state_dir);
+}
+
+/// A turn that returns nothing is byte-for-byte the turn it has always been: no
+/// `artifacts` on the wire, and nothing appended to the reply.
+#[tokio::test]
+async fn artifacts_a_turn_that_writes_nothing_carries_no_sidecar() {
+    let (st, vault, state_dir) = artifact_state(
+        "#!/bin/sh\nprintf '%s' '{\"type\":\"result\",\"is_error\":false,\"result\":\"just words\"}'\n",
+    );
+    let resp = app(st.clone())
+        .oneshot(jesse_request(
+            Some("Bearer test-token"),
+            r#"{"mode":"ask","text":"hello"}"#,
+        ))
+        .await
+        .unwrap();
+    let body: Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    let job_id = body["job_id"].as_str().unwrap().to_string();
+    let done = wait_for_status(&st, &job_id, "done").await;
+    assert_eq!(done["response"], "just words");
+    assert!(
+        done["artifacts"].is_null(),
+        "an empty sidecar is null, exactly as it was before the field existed"
+    );
+    let _ = std::fs::remove_dir_all(&vault);
+    let _ = std::fs::remove_dir_all(&state_dir);
+}
+
+/// A rejected file is NEVER SILENT: it comes back as a line in the reply, and the good
+/// file beside it still returns.
+#[tokio::test]
+async fn artifacts_a_rejected_file_is_reported_in_the_reply() {
+    let (st, vault, state_dir) = artifact_state(&artifact_script(&[
+        ("01-bad.zip", "PK\\x03\\x04\\x00\\x00\\x00\\x00"),
+        ("02-good.png", PNG_ESCAPES),
+    ]));
+    let resp = app(st.clone())
+        .oneshot(jesse_request(
+            Some("Bearer test-token"),
+            r#"{"mode":"tell","text":"zip it"}"#,
+        ))
+        .await
+        .unwrap();
+    let body: Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    let job_id = body["job_id"].as_str().unwrap().to_string();
+    let done = wait_for_status(&st, &job_id, "done").await;
+    let text = done["response"].as_str().unwrap();
+    assert!(
+        text.starts_with("here they are"),
+        "the model's own answer is untouched: {text:?}"
+    );
+    assert!(
+        text.contains("01-bad.zip") && text.contains("does not carry"),
+        "the user is TOLD what was dropped: {text:?}"
+    );
+    assert_eq!(
+        done["artifacts"].as_array().unwrap().len(),
+        1,
+        "and the good file still came back"
+    );
+    let _ = std::fs::remove_dir_all(&vault);
+    let _ = std::fs::remove_dir_all(&state_dir);
+}
+
+/// A turn below `Capability::Write` gets no staging directory, so its model is never
+/// told about a channel it cannot use. Asserted through the CHILD: the fake reports
+/// whether the directory existed.
+#[tokio::test]
+async fn artifacts_a_read_level_turn_gets_no_staging_directory() {
+    let n = JOB_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let vault = std::env::temp_dir().join(format!("jesse-art-ro-{}-{n}", std::process::id()));
+    let state_dir = std::env::temp_dir().join(format!("jesse-art-ros-{}-{n}", std::process::id()));
+    std::fs::create_dir_all(&vault).unwrap();
+    std::fs::create_dir_all(&state_dir).unwrap();
+    let fake = write_fake_claude(
+        "#!/bin/sh\n\
+         if ls -d .jesse-artifacts/*/ >/dev/null 2>&1; then r=STAGED; else r=NONE; fi\n\
+         printf '{\"type\":\"result\",\"is_error\":false,\"result\":\"%s\"}' \"$r\"\n",
+    );
+    // A registry whose only model is READ level, and which is the default.
+    let mut registry = ModelRegistry::opus_only();
+    registry.models[0].level = Capability::Read;
+    let cfg = Config {
+        claude_bin: fake.to_string_lossy().into_owned(),
+        vault: vault.to_string_lossy().into_owned(),
+        state_dir: Some(state_dir.to_string_lossy().into_owned()),
+        model_registry: registry,
+        ..test_config()
+    };
+    let st = AppState::new(cfg);
+    let resp = app(st.clone())
+        .oneshot(jesse_request(
+            Some("Bearer test-token"),
+            r#"{"mode":"ask","text":"read only"}"#,
+        ))
+        .await
+        .unwrap();
+    let body: Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    let job_id = body["job_id"].as_str().unwrap().to_string();
+    let done = wait_for_status(&st, &job_id, "done").await;
+    assert_eq!(
+        done["response"], "NONE",
+        "a turn that cannot write must not be offered an artifact channel"
+    );
+    assert!(done["artifacts"].is_null());
+    let _ = std::fs::remove_dir_all(&vault);
+    let _ = std::fs::remove_dir_all(&state_dir);
+}
+
+/// THE TRAVERSAL GUARD and the two shapes of 404, on the live route.
+#[tokio::test]
+async fn artifacts_the_fetch_route_guards_its_id_and_distinguishes_its_misses() {
+    let (st, vault, state_dir) = artifact_state(&artifact_script(&[("c.png", PNG_ESCAPES)]));
+    let fetch = |st: AppState, id: String, auth: bool| async move {
+        let mut b = Request::builder().uri(format!("/jesse/artifact/{id}"));
+        if auth {
+            b = b.header("authorization", "Bearer test-token");
+        }
+        app(st)
+            .oneshot(b.body(Body::empty()).unwrap())
+            .await
+            .unwrap()
+    };
+
+    // No token: the same bearer auth as every other route, checked before anything else.
+    assert_eq!(
+        fetch(st.clone(), "abc123".into(), false).await.status(),
+        StatusCode::UNAUTHORIZED
+    );
+    // A non-hex id never reaches the filesystem.
+    for bad in ["..", "%2e%2e", "not-hex", "ABCDEF", ""] {
+        let resp = fetch(st.clone(), bad.to_string(), true).await;
+        assert!(
+            matches!(
+                resp.status(),
+                StatusCode::BAD_REQUEST | StatusCode::NOT_FOUND
+            ),
+            "{bad:?} must never be served: {}",
+            resp.status()
+        );
+    }
+    // A well-formed id that was never stored: UNKNOWN.
+    let resp = fetch(st.clone(), "00112233445566ff".into(), true).await;
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    let body: Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    assert_eq!(body["reason"], "unknown");
+
+    // Now store one, delete its conversation, and fetch again: EXPIRED, which the app
+    // renders differently.
+    let resp = app(st.clone())
+        .oneshot(jesse_request(
+            Some("Bearer test-token"),
+            r#"{"mode":"tell","text":"chart please"}"#,
+        ))
+        .await
+        .unwrap();
+    let body: Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    let job_id = body["job_id"].as_str().unwrap().to_string();
+    let conversation_id = body["conversation_id"].as_str().unwrap().to_string();
+    let done = wait_for_status(&st, &job_id, "done").await;
+    let id = done["artifacts"][0]["id"].as_str().unwrap().to_string();
+    assert_eq!(
+        fetch(st.clone(), id.clone(), true).await.status(),
+        StatusCode::OK
+    );
+
+    let resp = app(st.clone())
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri(format!("/jesse/conversation/{conversation_id}"))
+                .header("authorization", "Bearer test-token")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    let resp = fetch(st.clone(), id, true).await;
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    let body: Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    assert_eq!(
+        body["reason"], "expired",
+        "the cascade tombstones it — 'gone because you deleted it' is not 'never existed'"
+    );
+    let _ = std::fs::remove_dir_all(&vault);
+    let _ = std::fs::remove_dir_all(&state_dir);
+}
+
+/// A reloaded transcript still shows an older turn's artifacts. Hydration has no job id
+/// to bind on, so this is the assertion that the text binding actually works end to end.
+#[tokio::test]
+async fn artifacts_survive_a_hydrate_of_the_conversation() {
+    let (st, vault, state_dir) = artifact_state(&artifact_script(&[("c.png", PNG_ESCAPES)]));
+    let resp = app(st.clone())
+        .oneshot(jesse_request(
+            Some("Bearer test-token"),
+            r#"{"mode":"tell","text":"chart please"}"#,
+        ))
+        .await
+        .unwrap();
+    let body: Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    let job_id = body["job_id"].as_str().unwrap().to_string();
+    let conversation_id = body["conversation_id"].as_str().unwrap().to_string();
+    let done = wait_for_status(&st, &job_id, "done").await;
+    let id = done["artifacts"][0]["id"].as_str().unwrap().to_string();
+
+    // The fake `claude` writes no transcript, so hydration returns an empty turn list —
+    // which is the documented degradation, and means the binding cannot be asserted
+    // through the route here. Assert it directly against the function instead, with the
+    // hydrated turn the transcript WOULD have produced (the delivered text).
+    let mut turns = vec![
+        HydratedTurn {
+            role: "user".into(),
+            text: "chart please".into(),
+            timestamp: None,
+            turn_key: None,
+            artifacts: Vec::new(),
+        },
+        HydratedTurn {
+            role: "assistant".into(),
+            text: "here they are".into(),
+            timestamp: None,
+            turn_key: None,
+            artifacts: Vec::new(),
+        },
+    ];
+    attach_artifacts(&mut turns, &st.artifacts.for_conversation(&conversation_id));
+    assert!(turns[0].artifacts.is_empty(), "never on a user turn");
+    assert_eq!(turns[1].artifacts.len(), 1, "re-attached to its own reply");
+    assert_eq!(turns[1].artifacts[0].id, id);
+
+    // A turn whose text does not match gets nothing — the binding is the text, not
+    // "whatever the conversation has".
+    let mut other = vec![HydratedTurn {
+        role: "assistant".into(),
+        text: "something else entirely".into(),
+        timestamp: None,
+        turn_key: None,
+        artifacts: Vec::new(),
+    }];
+    attach_artifacts(&mut other, &st.artifacts.for_conversation(&conversation_id));
+    assert!(other[0].artifacts.is_empty());
+
+    // And the hydrate ROUTE serves the field without breaking (no transcript → no turns).
+    let resp = app(st.clone())
+        .oneshot(
+            Request::builder()
+                .uri(format!("/jesse/conversations/{conversation_id}/transcript"))
+                .header("authorization", "Bearer test-token")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let _ = std::fs::remove_dir_all(&vault);
+    let _ = std::fs::remove_dir_all(&state_dir);
+}
+
+/// A job file written by an OLDER bridge — no `artifacts` key at all — loads cleanly and
+/// serves its reply exactly as it always did.
+#[tokio::test]
+async fn artifacts_an_older_job_file_with_no_field_loads_cleanly() {
+    let old = serde_json::json!({
+        "v": 1,
+        "job_id": "old-job",
+        "status": "done",
+        "response": "an answer from before this field existed",
+        "session_id": "sess-1",
+        "directives": Value::Null,
+        "provenance": Value::Null,
+        "error": Value::Null,
+        "completed_at_ms": 1_700_000_000_000u64,
+    });
+    let (id, job) = value_to_job(&old).expect("an older job file still parses");
+    assert_eq!(id, "old-job");
+    match &job.state {
+        JobState::Done {
+            response,
+            artifacts,
+            ..
+        } => {
+            assert_eq!(response, "an answer from before this field existed");
+            assert!(
+                artifacts.is_empty(),
+                "absent reads as none, never as an error"
+            );
+        }
+        other => panic!(
+            "expected Done, got {:?}",
+            matches!(other, JobState::Running)
+        ),
+    }
+    // …and re-serializing it emits the field as null, so a NEWER app decoding it sees
+    // exactly what it sees for any turn that returned nothing.
+    let v = job_to_value(&id, &job).expect("serializes");
+    assert!(v["artifacts"].is_null());
+}
