@@ -8532,8 +8532,14 @@ fn artifact_script(files: &[(&str, &str)]) -> String {
     s
 }
 
-/// A minimal but genuinely valid PNG header, as a printf escape string.
-const PNG_ESCAPES: &str = "\\x89PNG\\r\\n\\x1a\\n\\x00\\x00\\x00\\x0dIHDR";
+/// A minimal but genuinely valid PNG header, as a `printf '%b'` escape string.
+///
+/// OCTAL, not hex, and that is not a style choice: `\xNN` is a bash extension. Under
+/// Linux's `/bin/sh` (dash) `printf '%b'` emits the six characters `\x89` literally, so
+/// the "PNG" the fake harness wrote was plain text — which the sniffer correctly refused
+/// to call an image, failing this suite on CI while passing on macOS. `\0ddd` is what
+/// POSIX specifies for `%b` and it behaves identically on both.
+const PNG_ESCAPES: &str = "\\0211PNG\\015\\012\\032\\012\\000\\000\\000\\015IHDR";
 
 /// THE END-TO-END CASE: a turn writes two files, both come back on the reply, and both
 /// are fetchable by id.
@@ -8657,7 +8663,7 @@ async fn artifacts_a_turn_that_writes_nothing_carries_no_sidecar() {
 #[tokio::test]
 async fn artifacts_a_rejected_file_is_reported_in_the_reply() {
     let (st, vault, state_dir) = artifact_state(&artifact_script(&[
-        ("01-bad.zip", "PK\\x03\\x04\\x00\\x00\\x00\\x00"),
+        ("01-bad.zip", "PK\\003\\004\\000\\000\\000\\000"),
         ("02-good.png", PNG_ESCAPES),
     ]));
     let resp = app(st.clone())
