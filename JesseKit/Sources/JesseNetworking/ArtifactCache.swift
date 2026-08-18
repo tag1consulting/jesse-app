@@ -1,4 +1,5 @@
 import Foundation
+import JesseCore
 
 /// The DEVICE's own budget for files Jesse returned.
 ///
@@ -23,10 +24,16 @@ import Foundation
 /// Least-recently-used, evaluated after every download. "Recently used" is the file's
 /// modification date, which [`touch`](Self.touch(_:)) bumps on every cache hit — so a
 /// file the user keeps opening survives and one they downloaded once in March does not.
+///
+/// # Naming
+///
+/// One flat directory of `<id>.<ext>`, where the id is the bridge's (guaranteed lowercase
+/// hex, re-validated here) and the extension comes from the sniffed mime through
+/// `ArtifactFileType` — never from the model's filename, which reaches no path anywhere in
+/// this system. The extension is not cosmetic: it is the ONLY thing that tells QuickLook
+/// what a file is, and its absence is why every non-image used to open to a blank preview.
 public struct ArtifactCache: Sendable {
-    /// Where cached bytes live. One flat directory: the file name IS the bridge's
-    /// artifact id, which the bridge guarantees is lowercase hex and this type
-    /// re-validates, so no name can escape the directory.
+    /// Where cached bytes live.
     public let directory: URL
 
     /// The device-side high-water mark. Over it, least-recently-used files are removed
@@ -60,7 +67,35 @@ public struct ArtifactCache: Sendable {
     }
 
     /// The on-disk location for an id, or `nil` if the id is not a safe file name.
-    public func url(for id: String) -> URL? {
+    ///
+    /// An unrecognized or empty mime yields the bare id, exactly as before — a file whose
+    /// type we cannot name confidently gets no name guessed for it.
+    public func url(for id: String, mime: String) -> URL? {
+        guard Self.isValidID(id) else { return nil }
+        guard let ext = ArtifactFileType.fileExtension(for: mime) else {
+            return directory.appendingPathComponent(id, isDirectory: false)
+        }
+        return directory.appendingPathComponent("\(id).\(ext)", isDirectory: false)
+    }
+
+    /// Where builds before this one put the same bytes: the bare id, no extension.
+    ///
+    /// # Why migrate on hit rather than sweep at startup
+    ///
+    /// Renaming the cache orphans every file already downloaded. Two ways to deal with
+    /// that, and this is the one chosen: a lookup that misses the extended name looks
+    /// under the legacy one, and MOVES a hit into place. The alternative — sweeping every
+    /// extensionless entry once at launch — throws away bytes this device already paid a
+    /// network round trip for, and needs a launch hook wired into two apps that would then
+    /// exist forever to serve one release.
+    ///
+    /// Migrating on hit costs one `stat` on a cache miss, converts a legacy entry the
+    /// first time it is displayed, and leaves the rest to the LRU. NOTE, against the
+    /// suspicion that raised this: legacy entries are not invisible to eviction.
+    /// `entries()` enumerates the directory, so it counts and evicts extensionless files
+    /// like any other. What migration prevents is subtler — an orphan whose modification
+    /// date can never be refreshed, holding budget against files that are live.
+    private func legacyURL(for id: String) -> URL? {
         guard Self.isValidID(id) else { return nil }
         return directory.appendingPathComponent(id, isDirectory: false)
     }
@@ -75,31 +110,64 @@ public struct ArtifactCache: Sendable {
     ///
     /// A hit bumps the file's modification date, which is what makes eviction LRU rather
     /// than "oldest download first".
-    public func cached(id: String, expectedBytes: Int) -> URL? {
-        guard let url = url(for: id) else { return nil }
-        guard let size = try? url.resourceValues(forKeys: [.fileSizeKey]).fileSize,
-              size == expectedBytes else { return nil }
-        touch(url)
-        return url
+    public func cached(id: String, mime: String, expectedBytes: Int) -> URL? {
+        guard let url = url(for: id, mime: mime) else { return nil }
+        if isIntact(url, expectedBytes: expectedBytes) {
+            touch(url)
+            return url
+        }
+        // A miss under the current name may still be a hit under the pre-extension one.
+        // See `legacyURL(for:)` for why this converts rather than re-downloads.
+        guard let legacy = legacyURL(for: id), legacy != url,
+              isIntact(legacy, expectedBytes: expectedBytes) else { return nil }
+        // Anything sitting at the destination failed the size check above, so it is a
+        // truncated write and not something to preserve — clear it, or the move throws.
+        try? FileManager.default.removeItem(at: url)
+        do {
+            try FileManager.default.moveItem(at: legacy, to: url)
+            touch(url)
+            return url
+        } catch {
+            // The bytes are here and correct even if they cannot be renamed. Serve them
+            // rather than re-downloading; this file keeps the old blank-preview behavior
+            // and nothing else does.
+            touch(legacy)
+            return legacy
+        }
+    }
+
+    /// Whether a file exists and is the size the metadata promised.
+    private func isIntact(_ url: URL, expectedBytes: Int) -> Bool {
+        (try? url.resourceValues(forKeys: [.fileSizeKey]).fileSize) == expectedBytes
     }
 
     /// Write bytes for an id and return where they landed, then bring the cache back
     /// under its cap. Throws only if the directory or the file cannot be written.
     @discardableResult
-    public func store(id: String, data: Data) throws -> URL {
-        guard let url = url(for: id) else {
+    public func store(id: String, mime: String, data: Data) throws -> URL {
+        guard let url = url(for: id, mime: mime) else {
             throw CocoaError(.fileWriteInvalidFileName)
         }
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         try data.write(to: url, options: .atomic)
+        // A fresh download supersedes any pre-extension copy of the same id, which is now
+        // dead weight holding budget against live files.
+        if let legacy = legacyURL(for: id), legacy != url {
+            try? FileManager.default.removeItem(at: legacy)
+        }
         evictIfNeeded()
         return url
     }
 
-    /// Remove one cached file (a no-op if it was never there).
-    public func remove(id: String) {
-        guard let url = url(for: id) else { return }
-        try? FileManager.default.removeItem(at: url)
+    /// Remove one cached file (a no-op if it was never there). Takes the legacy copy with
+    /// it, so "forget this artifact" leaves nothing of it behind.
+    public func remove(id: String, mime: String) {
+        if let url = url(for: id, mime: mime) {
+            try? FileManager.default.removeItem(at: url)
+        }
+        if let legacy = legacyURL(for: id) {
+            try? FileManager.default.removeItem(at: legacy)
+        }
     }
 
     /// Total bytes currently held.
@@ -194,8 +262,13 @@ public enum ArtifactResolver {
     ///   verdict for this artifact. A cached copy still wins over it — the file is right
     ///   here, and "the bridge no longer has it" is no reason to refuse to show what this
     ///   device already downloaded.
+    /// - Parameter mime: the type the bridge sniffed from the bytes. It names the cached
+    ///   file's extension and nothing else — see `ArtifactFileType`. Passing a mime this
+    ///   build does not recognize is not an error; the file is simply cached unnamed, as
+    ///   every artifact was before.
     public static func resolve(
         id: String,
+        mime: String,
         byteCount: Int,
         filename: String,
         isExpired: Bool,
@@ -205,7 +278,7 @@ public enum ArtifactResolver {
         // which is itself `Sendable`, so this costs nothing and states the fact.
         fetch: @Sendable (String) async throws -> Data
     ) async -> ArtifactLoadState {
-        if let url = cache?.cached(id: id, expectedBytes: byteCount) {
+        if let url = cache?.cached(id: id, mime: mime, expectedBytes: byteCount) {
             return .ready(url)
         }
         if isExpired { return .expired }
@@ -214,13 +287,14 @@ public enum ArtifactResolver {
             guard let cache else {
                 // No caches directory at all: write to a temporary file so the viewer
                 // still has a URL. Reclaimed by the OS like any other temp file, and the
-                // bytes are always re-fetchable.
+                // bytes are always re-fetchable. It carries the extension too — this path
+                // feeds the same QuickLook that the cache path does.
                 let tmp = FileManager.default.temporaryDirectory
-                    .appendingPathComponent(sanitizedTempName(id), isDirectory: false)
+                    .appendingPathComponent(sanitizedTempName(id, mime: mime), isDirectory: false)
                 try data.write(to: tmp, options: .atomic)
                 return .ready(tmp)
             }
-            return .ready(try cache.store(id: id, data: data))
+            return .ready(try cache.store(id: id, mime: mime, data: data))
         } catch ArtifactFetchError.expired {
             return .expired
         } catch let error as ArtifactFetchError {
@@ -252,8 +326,11 @@ public enum ArtifactResolver {
     }
 
     /// The no-cache fallback still turns an id into a path, so it gets the same guard the
-    /// cache applies rather than trusting the id because it came from the bridge.
-    private static func sanitizedTempName(_ id: String) -> String {
-        ArtifactCache.isValidID(id) ? id : "jesse-artifact"
+    /// cache applies rather than trusting the id because it came from the bridge — and the
+    /// same extension rule, from the mime and never from the filename.
+    private static func sanitizedTempName(_ id: String, mime: String) -> String {
+        let stem = ArtifactCache.isValidID(id) ? id : "jesse-artifact"
+        guard let ext = ArtifactFileType.fileExtension(for: mime) else { return stem }
+        return "\(stem).\(ext)"
     }
 }
