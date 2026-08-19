@@ -13,6 +13,25 @@ Every commit that changes a component **must** bump that component's version and
 add an entry here — enforced by `scripts/version-guard.sh` (the pre-push hook and
 CI both run it). See the "Versioning" section of `bridge/README.md`.
 
+## [bridge 0.84.1] - 2026-08-19
+
+### Security
+
+- **`h2` 0.4.15 → 0.4.16, closing RUSTSEC-2026-0258 ("unbounded empty DATA frames").** A
+  peer can hold an HTTP/2 stream open sending empty DATA frames indefinitely; `h2` counted
+  no budget against them, so a remote peer could pin server resources without ever sending
+  payload. Denial of service, no data exposure.
+
+  Transitive, reached twice: `hyper` (the bridge's own server) and `reqwest` (its outbound
+  client). The server path is the one that matters, since it is the side that accepts
+  frames from a peer it does not control.
+
+  Not caused by anything in this branch — the advisory landed in the RustSec database
+  after the branch was cut, which is why CI went red on a commit whose own tests all pass.
+  Fixed by upgrading rather than by an `--ignore` entry, per the standing rule in
+  `.github/workflows/ci.yml`: never silently pin to a vulnerable version. Lockfile-only,
+  one package, no API change and no other dependency moved.
+
 ## [App 1.0 (108)] - 2026-08-18
 
 ### Fixed
