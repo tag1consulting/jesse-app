@@ -1,4 +1,5 @@
 import Foundation
+import JesseCore
 
 // The bridge HTTP contract, modeled once. Every wire key ("job_id"/"session_id"/
 // "response"/"status"/…) is a single CodingKey shared by encode and decode — not a
@@ -42,11 +43,11 @@ public struct JesseArtifact: Decodable, Equatable, Sendable, Identifiable {
         self.sha256 = sha256
     }
 
-    /// Whether this renders inline as a picture. SVG is deliberately EXCLUDED: it is
-    /// markup, a rendering surface, and it belongs behind the same explicit tap a PDF is
-    /// behind rather than being drawn automatically into a transcript.
+    /// Whether this renders inline as a picture. SVG is INCLUDED, having previously been
+    /// excluded as "markup and a rendering surface"; `ArtifactFileType.isInlineImage`
+    /// holds the one rule and the reasoning that changed it.
     public var isInlineImage: Bool {
-        mime == "image/png" || mime == "image/jpeg"
+        ArtifactFileType.isInlineImage(mime)
     }
 
     /// A short human size for the chip ("18 KB", "2.4 MB").

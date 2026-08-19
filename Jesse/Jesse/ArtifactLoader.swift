@@ -39,12 +39,12 @@ struct ArtifactLoader {
             // downloaded is shown from the cache rather than hidden behind a settings
             // error it has no need for.
             return await ArtifactResolver.resolve(
-                id: artifact.artifactID, byteCount: artifact.byteCount,
+                id: artifact.artifactID, mime: artifact.mime, byteCount: artifact.byteCount,
                 filename: artifact.filename, isExpired: artifact.isExpired, cache: cache,
                 fetch: { _ in throw ArtifactFetchError.notConfigured })
         }
         let state = await ArtifactResolver.resolve(
-            id: artifact.artifactID, byteCount: artifact.byteCount,
+            id: artifact.artifactID, mime: artifact.mime, byteCount: artifact.byteCount,
             filename: artifact.filename, isExpired: artifact.isExpired, cache: cache,
             fetch: { try await client.artifact(id: $0) })
         if case .expired = state { artifact.isExpired = true }

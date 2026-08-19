@@ -81,16 +81,15 @@ final class ArtifactWireTests: XCTestCase {
         XCTAssertEqual(without.turnKey, "", "the pre-existing default still holds")
     }
 
-    /// A `JesseArtifact` renders as an inline image only for the two RASTER types. SVG is
-    /// deliberately excluded: it is markup and a rendering surface, so it goes behind the
-    /// same explicit tap a PDF is behind.
-    func testOnlyRasterImagesRenderInline() {
+    /// A `JesseArtifact` renders as an inline image for the three IMAGE types, SVG now
+    /// among them, and for nothing else.
+    func testImageMimesRenderInline() {
         func art(_ mime: String) -> JesseArtifact {
             JesseArtifact(id: "a", filename: "f", mime: mime, bytes: 1, sha256: "x")
         }
         XCTAssertTrue(art("image/png").isInlineImage)
         XCTAssertTrue(art("image/jpeg").isInlineImage)
-        XCTAssertFalse(art("image/svg+xml").isInlineImage)
+        XCTAssertTrue(art("image/svg+xml").isInlineImage)
         XCTAssertFalse(art("application/pdf").isInlineImage)
         XCTAssertFalse(art("text/html").isInlineImage)
     }
@@ -150,8 +149,8 @@ final class ArtifactWireTests: XCTestCase {
 
         let cache = tempCache()
         defer { try? FileManager.default.removeItem(at: cache.directory) }
-        XCTAssertNil(cache.url(for: "../escape"))
-        XCTAssertThrowsError(try cache.store(id: "../escape", data: Data([1])))
+        XCTAssertNil(cache.url(for: "../escape", mime: "image/png"))
+        XCTAssertThrowsError(try cache.store(id: "../escape", mime: "image/png", data: Data([1])))
     }
 
     /// Store, hit, and the size check that catches a truncated write rather than trusting
@@ -160,14 +159,14 @@ final class ArtifactWireTests: XCTestCase {
         let cache = tempCache()
         defer { try? FileManager.default.removeItem(at: cache.directory) }
         let bytes = Data(repeating: 7, count: 100)
-        let url = try cache.store(id: "aa11", data: bytes)
+        let url = try cache.store(id: "aa11", mime: "image/png", data: bytes)
         XCTAssertEqual(try Data(contentsOf: url), bytes)
-        XCTAssertNotNil(cache.cached(id: "aa11", expectedBytes: 100))
-        XCTAssertNil(cache.cached(id: "aa11", expectedBytes: 99),
+        XCTAssertNotNil(cache.cached(id: "aa11", mime: "image/png", expectedBytes: 100))
+        XCTAssertNil(cache.cached(id: "aa11", mime: "image/png", expectedBytes: 99),
                      "a size mismatch is a truncated write, not a cache hit")
-        XCTAssertNil(cache.cached(id: "bb22", expectedBytes: 100))
-        cache.remove(id: "aa11")
-        XCTAssertNil(cache.cached(id: "aa11", expectedBytes: 100))
+        XCTAssertNil(cache.cached(id: "bb22", mime: "image/png", expectedBytes: 100))
+        cache.remove(id: "aa11", mime: "image/png")
+        XCTAssertNil(cache.cached(id: "aa11", mime: "image/png", expectedBytes: 100))
     }
 
     /// THE DEVICE BUDGET: least-recently-used files go first, and a file the user keeps
@@ -176,24 +175,26 @@ final class ArtifactWireTests: XCTestCase {
         let cache = tempCache(maxBytes: 250)
         defer { try? FileManager.default.removeItem(at: cache.directory) }
         for id in ["aa", "bb", "cc"] {
-            try cache.store(id: id, data: Data(repeating: 1, count: 100))
+            try cache.store(id: id, mime: "image/png", data: Data(repeating: 1, count: 100))
             // Distinct modification dates, so "least recently used" is a real order.
             Thread.sleep(forTimeInterval: 0.02)
         }
         // Three 100-byte files = 300 > 250, so the store above already evicted one — and
         // it must be the oldest.
         XCTAssertLessThanOrEqual(cache.totalBytes(), 250)
-        XCTAssertNil(cache.cached(id: "aa", expectedBytes: 100), "the oldest went first")
-        XCTAssertNotNil(cache.cached(id: "cc", expectedBytes: 100), "the newest survives")
+        XCTAssertNil(cache.cached(id: "aa", mime: "image/png", expectedBytes: 100),
+                     "the oldest went first")
+        XCTAssertNotNil(cache.cached(id: "cc", mime: "image/png", expectedBytes: 100),
+                        "the newest survives")
 
         // A HIT on "bb" makes it the most recent, so the next arrival evicts "cc".
         Thread.sleep(forTimeInterval: 0.02)
-        XCTAssertNotNil(cache.cached(id: "bb", expectedBytes: 100))
+        XCTAssertNotNil(cache.cached(id: "bb", mime: "image/png", expectedBytes: 100))
         Thread.sleep(forTimeInterval: 0.02)
-        try cache.store(id: "dd", data: Data(repeating: 1, count: 100))
-        XCTAssertNotNil(cache.cached(id: "bb", expectedBytes: 100),
+        try cache.store(id: "dd", mime: "image/png", data: Data(repeating: 1, count: 100))
+        XCTAssertNotNil(cache.cached(id: "bb", mime: "image/png", expectedBytes: 100),
                         "reading a file counts as using it — that is what makes this LRU")
-        XCTAssertNil(cache.cached(id: "cc", expectedBytes: 100))
+        XCTAssertNil(cache.cached(id: "cc", mime: "image/png", expectedBytes: 100))
     }
 
     // MARK: - The resolver
@@ -203,16 +204,18 @@ final class ArtifactWireTests: XCTestCase {
     func testResolverPrefersTheCacheAndHonoursTheStickyVerdict() async throws {
         let cache = tempCache()
         defer { try? FileManager.default.removeItem(at: cache.directory) }
-        try cache.store(id: "aa11", data: Data(repeating: 3, count: 40))
+        try cache.store(id: "aa11", mime: "image/png", data: Data(repeating: 3, count: 40))
 
         let hit = await ArtifactResolver.resolve(
-            id: "aa11", byteCount: 40, filename: "c.png", isExpired: false, cache: cache,
+            id: "aa11", mime: "image/png", byteCount: 40, filename: "c.png",
+            isExpired: false, cache: cache,
             fetch: { _ in XCTFail("a cache hit must not fetch"); return Data() })
         guard case let .ready(url) = hit else { return XCTFail("expected ready, got \(hit)") }
         XCTAssertEqual(try Data(contentsOf: url).count, 40)
 
         let expiredButCached = await ArtifactResolver.resolve(
-            id: "aa11", byteCount: 40, filename: "c.png", isExpired: true, cache: cache,
+            id: "aa11", mime: "image/png", byteCount: 40, filename: "c.png",
+            isExpired: true, cache: cache,
             fetch: { _ in XCTFail("must not fetch"); return Data() })
         guard case .ready = expiredButCached else {
             return XCTFail("a cached copy still shows: the bridge's TTL is not this device's")
@@ -221,7 +224,8 @@ final class ArtifactWireTests: XCTestCase {
         // No cached copy AND already expired: the permanent verdict, with NO network call.
         // This is the check that stops the retry loop.
         let expired = await ArtifactResolver.resolve(
-            id: "bb22", byteCount: 10, filename: "c.png", isExpired: true, cache: cache,
+            id: "bb22", mime: "image/png", byteCount: 10, filename: "c.png",
+            isExpired: true, cache: cache,
             fetch: { _ in XCTFail("an expired artifact must never reach the network"); return Data() })
         XCTAssertEqual(expired, .expired)
     }
@@ -232,18 +236,22 @@ final class ArtifactWireTests: XCTestCase {
         defer { try? FileManager.default.removeItem(at: cache.directory) }
 
         let fetched = await ArtifactResolver.resolve(
-            id: "cc33", byteCount: 5, filename: "c.png", isExpired: false, cache: cache,
+            id: "cc33", mime: "image/png", byteCount: 5, filename: "c.png",
+            isExpired: false, cache: cache,
             fetch: { _ in Data([1, 2, 3, 4, 5]) })
         guard case .ready = fetched else { return XCTFail("expected ready, got \(fetched)") }
-        XCTAssertNotNil(cache.cached(id: "cc33", expectedBytes: 5), "and it was cached")
+        XCTAssertNotNil(cache.cached(id: "cc33", mime: "image/png", expectedBytes: 5),
+                        "and it was cached")
 
         let expired = await ArtifactResolver.resolve(
-            id: "dd44", byteCount: 5, filename: "c.png", isExpired: false, cache: cache,
+            id: "dd44", mime: "image/png", byteCount: 5, filename: "c.png",
+            isExpired: false, cache: cache,
             fetch: { _ in throw ArtifactFetchError.expired })
         XCTAssertEqual(expired, .expired)
 
         let unknown = await ArtifactResolver.resolve(
-            id: "ee55", byteCount: 5, filename: "chart.png", isExpired: false, cache: cache,
+            id: "ee55", mime: "image/png", byteCount: 5, filename: "chart.png",
+            isExpired: false, cache: cache,
             fetch: { _ in throw ArtifactFetchError.unknown })
         guard case let .failed(message) = unknown else {
             return XCTFail("unknown is TRANSIENT — it must not become the permanent verdict")

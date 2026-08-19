@@ -13,6 +13,107 @@ Every commit that changes a component **must** bump that component's version and
 add an entry here — enforced by `scripts/version-guard.sh` (the pre-push hook and
 CI both run it). See the "Versioning" section of `bridge/README.md`.
 
+## [bridge 0.84.1] - 2026-08-19
+
+### Security
+
+- **`h2` 0.4.15 → 0.4.16, closing RUSTSEC-2026-0258 ("unbounded empty DATA frames").** A
+  peer can hold an HTTP/2 stream open sending empty DATA frames indefinitely; `h2` counted
+  no budget against them, so a remote peer could pin server resources without ever sending
+  payload. Denial of service, no data exposure.
+
+  Transitive, reached twice: `hyper` (the bridge's own server) and `reqwest` (its outbound
+  client). The server path is the one that matters, since it is the side that accepts
+  frames from a peer it does not control.
+
+  Not caused by anything in this branch — the advisory landed in the RustSec database
+  after the branch was cut, which is why CI went red on a commit whose own tests all pass.
+  Fixed by upgrading rather than by an `--ignore` entry, per the standing rule in
+  `.github/workflows/ci.yml`: never silently pin to a vulnerable version. Lockfile-only,
+  one package, no API change and no other dependency moved.
+
+## [App 1.0 (108)] - 2026-08-18
+
+### Fixed
+
+- **Every returned file that was not a PNG or JPEG opened to a blank preview.** Tapping a
+  returned PDF, CSV, JSON, Markdown, HTML page or SVG opened QuickLook onto nothing, on
+  iOS and on the Mac alike.
+
+  **Root cause: the device threw away the file's type.** The bridge sniffs a mime from the
+  bytes and stores its own copy as `<id>.<ext>` — but `ArtifactCache.url(for:)` named the
+  cached copy with the bare hex artifact id and no extension at all. QuickLook has no
+  other way to decide what it is holding: it resolves a previewer from the file's UTI, a
+  UTI comes from the extension, and an extensionless file has none. So the previewer
+  opened with nothing to open with. PNG and JPEG appeared to work only because they never
+  reached QuickLook — they were decoded inline by `UIImage`/`NSImage`, which sniff bytes
+  themselves. The extension was lost on the device side only; the bridge had it right all
+  along.
+
+  **The fix.** `ArtifactFileType` (JesseCore) holds one fixed mime → extension table,
+  mirroring the bridge's `sniff_artifact` entry for entry, and every caller goes through
+  it. The extension comes from the sniffed mime and from nowhere else — never from the
+  model's `filename`, which reaches no path anywhere in this system — and an unrecognized
+  or absent mime falls back to no extension rather than to a guess. The hex-only id guard
+  is unchanged. Deriving the extension from `UTType.preferredFilenameExtension` would have
+  been one line and wrong: it yields `jpeg` where the bridge writes `jpg`, and two halves
+  of one system disagreeing about a file's name is the bug being closed here.
+
+  **Files already cached under the old name are converted, not abandoned.** A lookup that
+  misses the extended name looks under the legacy one and moves a size-checked hit into
+  place. The alternative, sweeping every extensionless entry at launch, would discard
+  bytes this device already paid a network round trip for. (Legacy entries were never
+  invisible to eviction — the LRU sweep enumerates the directory and counted them all
+  along — but an orphan's modification date can never be refreshed, so it holds budget
+  against files that are live.)
+
+### Added
+
+- **Images are a first-class citizen of the transcript, SVG among them.** SVG was excluded
+  from the inline path on the reasoning that it is markup and a rendering surface, so it
+  belonged behind the same explicit tap a PDF is behind. That was answering a real concern
+  with the wrong instrument: what makes SVG safe to draw is the sandbox around the
+  renderer, not the number of taps in front of it. A chart the model drew as vector is a
+  picture, and it now reads as one.
+
+  **Two renderers, each the platform's own.** macOS draws SVG through `NSImage`'s vector
+  representation — a parser, not a browser. iOS has no such thing (`UIImage` returns nil
+  for SVG from `Data` and from a file, with or without the extension, verified against
+  this SDK rather than assumed) and the CoreSVG entry point `NSImage` uses is not public,
+  so iOS uses a `WKWebView` behind four independent limits: JavaScript off at the WebKit
+  level, a `default-src 'none'` Content-Security-Policy, a navigation delegate that
+  cancels everything after the initial load, and an opaque `about:blank` origin rather
+  than a `file://` base that would grant the document read access to a real directory.
+  Either way, an SVG that fails to parse falls back to the chip — never an empty box.
+
+- **`ArtifactPreviewItem`, so a preview knows what it is showing.** Both apps handed
+  QuickLook a bare `URL` through SwiftUI's `.quickLookPreview`, which cannot carry a
+  title, so a previewer that did open was titled with the hex id. Both platforms now drive
+  QuickLook directly (`QLPreviewController` on iOS, `QLPreviewView` on macOS) with a
+  `QLPreviewItem` carrying the URL and the model's display filename. Note for anyone
+  extending this: there is **no** `previewItemContentType` to set — `QLPreviewItem`
+  declares only `previewItemURL`, `previewItemTitle` and `previewItemDisplayState` on both
+  platforms, and QuickLook's `contentType` belongs to `QLPreviewReply`, the provider side.
+  The extension is the whole mechanism. The resolved `UTType` is carried anyway and used
+  where the platform genuinely takes one: the Mac's new Save As panel.
+
+- **Full screen is a real viewer.** iOS gets pinch-to-zoom, double-tap-to-zoom at the point
+  touched, pan while zoomed (a `UIScrollView`, so the limits and rubber-banding are the
+  system's), share, and **Save to Photos** through the add-only Photos authorization,
+  writing the original cached bytes rather than a re-encoded `UIImage`. The Mac keeps
+  QuickLook and Reveal in Finder and gains **Save As**.
+
+- **Bounded frames that cannot degenerate into a sliver.** An inline picture is still
+  capped (240 points on iOS, 280 × 460 on the Mac) with its correct aspect ratio, rounded
+  corners and hairline border. A 60 × 4000 drawing fitted into that box would be four
+  points wide — the right ratio and useless — so below a 44-point minimum side the frame
+  takes the minimum and the image fills and clips instead.
+
+  Fetching policy is untouched throughout: lazy on first display, the LRU cache, the
+  sticky expired verdict and the size check against the metadata all behave exactly as
+  before. `isInlineImage` is computed from the existing `mime`, so no stored property was
+  added and no store migrates.
+
 ## [App 1.0 (107)] - 2026-08-18
 
 ### Added

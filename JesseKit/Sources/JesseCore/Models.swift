@@ -473,10 +473,18 @@ public final class TurnArtifact {
         self.createdAt = createdAt
     }
 
-    /// Renders inline as a picture. SVG is deliberately excluded — it is markup and a
-    /// rendering surface, so it goes behind the same explicit tap a PDF is behind.
-    public var isInlineImage: Bool { mime == "image/png" || mime == "image/jpeg" }
+    /// Renders inline as a picture. SVG used to be excluded here as "markup and a
+    /// rendering surface"; `ArtifactFileType.isInlineImage` is now the one rule for both
+    /// this and the wire type, and carries the reasoning that changed it.
+    ///
+    /// Computed from `mime`, never stored. A stored property would need a default and a
+    /// backfill for every row already in the store, to hold a fact the row already has.
+    public var isInlineImage: Bool { ArtifactFileType.isInlineImage(mime) }
     public var isPDF: Bool { mime == "application/pdf" }
+
+    /// The extension the cached copy of this file carries, or `nil` for a mime this build
+    /// does not know. From the mime and NEVER from `filename` — see `ArtifactFileType`.
+    public var cacheFileExtension: String? { ArtifactFileType.fileExtension(for: mime) }
 
     /// A short human size for the chip ("18 KB", "2.4 MB").
     public var displaySize: String {
@@ -488,7 +496,7 @@ public final class TurnArtifact {
 
     /// An SF Symbol for the file's kind, so a chip reads at a glance.
     public var typeIcon: String {
-        if isInlineImage || mime == "image/svg+xml" { return "photo" }
+        if isInlineImage { return "photo" }
         if isPDF { return "doc.richtext" }
         switch mime {
         case "text/csv": return "tablecells"
