@@ -18,6 +18,23 @@ import Foundation
 // read it as a request to run start-of-day and the item discussion would become a
 // full morning rebuild.
 //
+// WHO THE PROMPT IS ABOUT. These wordings name the person the work belongs to, and
+// that name is NOT the app's to know. It is deployment data, held on the bridge host
+// in `jesse.local.toml` (or `JESSE_OWNER_NAME` / `JESSE_OWNER_PRONOUN`) and nowhere
+// else, so a fresh clone belongs to whoever installed it. The prompts therefore carry
+// the bridge's persona placeholders verbatim:
+//
+//   * `{Owner}` — the owner's name, capitalized for a sentence start;
+//   * `{owner}` — the same name mid-sentence;
+//   * `{owner_pronoun}` — the owner's POSSESSIVE pronoun ("their"/"his"/"her"/…).
+//
+// The bridge renders them once, while it assembles the turn, at the same point it
+// renders its own Ask/Tell wrappers — so the wrapper and the body can never name two
+// different people. A deployment that configures nothing degrades to the generic
+// default the persona layer documents: "The user wants to discuss…", "their questions".
+// Nothing here interpolates a name locally, and a placeholder that reaches the agent
+// unrendered would mean the bridge did not build the turn.
+//
 // ISOLATION. This target compiles with `defaultIsolation(MainActor.self)` (it holds
 // the @Model layer, which was authored against the app's MainActor default), so
 // everything here would be MainActor-isolated by default. Both builders are marked
@@ -38,11 +55,11 @@ public enum TodayDiscuss {
     /// first, and the dates are how it tells a stale item from a fresh one.
     public nonisolated static func prompt(item: String) -> String {
         """
-        Jeremy wants to discuss this Today.md item:
+        {Owner} wants to discuss this Today.md item:
 
         \(item)
 
-        Read the files it links first, then engage with his questions and clarifications. If the discussion changes the item (its priority, its scope, or whether it is done), update Today.md and the item's Dashboard or project home to match. Scope: this one item only. Do not run start of day, scanners, currency, or cheatsheets, and do not rebuild Today.md.
+        Read the files it links first, then engage with {owner_pronoun} questions and clarifications. If the discussion changes the item (its priority, its scope, or whether it is done), update Today.md and the item's Dashboard or project home to match. Scope: this one item only. Do not run start of day, scanners, currency, or cheatsheets, and do not rebuild Today.md.
         """
     }
 }
@@ -63,7 +80,7 @@ public enum TodayDiscuss {
 public enum TodayThreadContext {
     /// The label the typed message is filed under, so a multi-line message can never
     /// be read as more instruction.
-    public nonisolated static let messageLabel = "Jeremy's message:"
+    public nonisolated static let messageLabel = "{Owner}'s message:"
 
     /// Compose the held `context` with the user's first `typed` message.
     ///
@@ -98,11 +115,17 @@ public enum TodayPropagate {
     /// Today.md legitimately carries lines that SUMMARIZE many tasks ("four scanners
     /// and the workshop sweep"), and reading one of those as a completion would close
     /// every task it names at source in a single turn.
+    ///
+    /// "Evidence he gave" keeps its SUBJECT pronoun. The persona layer renders a name
+    /// and a POSSESSIVE pronoun and nothing else, so there is no placeholder that fits
+    /// here, and spelling one would either change the current owner's rendered bytes or
+    /// add a persona key every existing deployment would have to set. Left as a known
+    /// gap rather than papered over.
     public nonisolated static func prompt(item: String, evidence: String?) -> String {
         let note = evidence?.trimmingCharacters(in: .whitespacesAndNewlines)
         let given = (note?.isEmpty ?? true) ? noEvidence : note!
         return """
-        Jeremy completed this Today.md item in the Jesse App and wants it propagated now:
+        {Owner} completed this Today.md item in the Jesse App and wants it propagated now:
 
         \(item)
 
@@ -143,7 +166,7 @@ public enum TodayProcessUpdates {
             .map { "\($0.offset + 1). \($0.element)" }
             .joined(separator: "\n\n")
         return """
-        Jeremy checked these \(items.count) Today.md item\(items.count == 1 ? "" : "s") off in the Jesse App and wants them all processed now:
+        {Owner} checked these \(items.count) Today.md item\(items.count == 1 ? "" : "s") off in the Jesse App and wants them all processed now:
 
         \(listed)
 

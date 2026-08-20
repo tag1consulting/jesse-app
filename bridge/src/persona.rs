@@ -60,20 +60,55 @@ impl Default for Persona {
 }
 
 impl Persona {
-    /// Substitute the persona placeholders in a wrapper/floor template:
+    /// Substitute the persona placeholders in a template:
     ///   * `{Owner}` → the owner name with its first letter capitalized (sentence
     ///     starts — `"the user"` → `"The user"`, a real name is unchanged);
     ///   * `{owner}` → the owner name verbatim (mid-sentence);
     ///   * `{owner_pronoun}` → the possessive pronoun.
     ///
-    /// A template with no placeholders (an app-supplied override) is returned
-    /// unchanged. This is the ONLY substitution machinery — the wrappers stay plain
-    /// strings, not `format!` call sites.
+    /// A template with no placeholders is returned unchanged. This is the ONLY
+    /// substitution machinery — the wrappers stay plain strings, not `format!` call
+    /// sites — and it renders the app-authored prompt BODY as well as the bridge's own
+    /// wrappers (see [`prompt::build_prompt_at`], the single call site).
+    ///
+    /// SINGLE PASS, and that is a correctness property rather than a performance one.
+    /// This used to be three chained `str::replace` calls, which rescan the output of
+    /// the previous call: an owner name of `"{owner_pronoun}"` was substituted for
+    /// `{Owner}` and then the third pass expanded the result again, so a value could
+    /// reach the agent as a DIFFERENT persona field. The scanner below copies each
+    /// substituted value straight to the output and resumes AFTER it, so a rendered
+    /// value is never itself scanned — whatever a name contains, braces included, is
+    /// what the agent reads. An unmatched `{` is literal and is copied through.
     pub fn render(&self, template: &str) -> String {
-        template
-            .replace("{Owner}", &capitalize_first(&self.owner_name))
-            .replace("{owner}", &self.owner_name)
-            .replace("{owner_pronoun}", &self.owner_pronoun)
+        // Longest first, so a shorter placeholder can never shadow a longer one that
+        // starts with it. (None of the three does today; the ordering keeps that true
+        // if a fourth is ever added.)
+        let owner_capitalized = capitalize_first(&self.owner_name);
+        let placeholders: [(&str, &str); 3] = [
+            ("{owner_pronoun}", self.owner_pronoun.as_str()),
+            ("{Owner}", owner_capitalized.as_str()),
+            ("{owner}", self.owner_name.as_str()),
+        ];
+        let mut out = String::with_capacity(template.len());
+        let mut rest = template;
+        while let Some(open) = rest.find('{') {
+            out.push_str(&rest[..open]);
+            rest = &rest[open..];
+            match placeholders.iter().find(|(name, _)| rest.starts_with(name)) {
+                Some((name, value)) => {
+                    out.push_str(value);
+                    rest = &rest[name.len()..];
+                }
+                // Not a placeholder: emit the brace and carry on from the next byte, so
+                // a literal `{` in prose (or in an item's markdown) survives untouched.
+                None => {
+                    out.push('{');
+                    rest = &rest[1..];
+                }
+            }
+        }
+        out.push_str(rest);
+        out
     }
 
     /// Load the persona: generic defaults → `jesse.local.toml` `[persona]` → env.
@@ -372,6 +407,77 @@ mod tests {
             p.render("Custom wrapper, no tokens."),
             "Custom wrapper, no tokens."
         );
+    }
+
+    /// A rendered VALUE is never scanned again. An owner whose configured name is
+    /// itself a placeholder used to come out as a different persona field entirely:
+    /// the chained-`replace` implementation substituted `{Owner}` → `{owner_pronoun}`
+    /// and then the pronoun pass expanded that, so the agent was told the owner is
+    /// called "her". One pass over the template fixes it by construction.
+    #[test]
+    fn render_never_re_expands_a_substituted_value() {
+        let p = Persona {
+            owner_name: "{owner_pronoun}".into(),
+            owner_pronoun: "her".into(),
+            languages: vec!["en".into()],
+            diet_keywords_extra: vec![],
+        };
+        assert_eq!(p.render("{Owner} asks."), "{owner_pronoun} asks.");
+        assert_eq!(p.render("{owner} asks."), "{owner_pronoun} asks.");
+        // The genuine pronoun placeholder still renders — only the SUBSTITUTED text is
+        // out of scope for further substitution.
+        assert_eq!(
+            p.render("{owner} on {owner_pronoun} phone"),
+            "{owner_pronoun} on her phone"
+        );
+
+        // The other direction: a pronoun that spells the name placeholder.
+        let q = Persona {
+            owner_name: "Alex".into(),
+            owner_pronoun: "{Owner}".into(),
+            languages: vec!["en".into()],
+            diet_keywords_extra: vec![],
+        };
+        assert_eq!(q.render("{owner_pronoun} phone"), "{Owner} phone");
+
+        // And a name that would recurse forever under any rescanning scheme.
+        let r = Persona {
+            owner_name: "{owner}".into(),
+            owner_pronoun: "their".into(),
+            languages: vec!["en".into()],
+            diet_keywords_extra: vec![],
+        };
+        assert_eq!(r.render("{owner} and {owner}"), "{owner} and {owner}");
+    }
+
+    /// Braces that are not one of the three placeholders are prose, not syntax — an
+    /// item's markdown, a code snippet, a JSON blob the user pasted. They survive
+    /// byte for byte, including a lone `{` at the very end of the text.
+    #[test]
+    fn render_passes_unknown_braces_through_unchanged() {
+        let p = Persona {
+            owner_name: "Alex".into(),
+            owner_pronoun: "her".into(),
+            languages: vec!["en".into()],
+            diet_keywords_extra: vec![],
+        };
+        for template in [
+            "{}",
+            "{ owner }",
+            "{OWNER}",
+            "{owner_name}",
+            "{{owner}}",
+            "fn f() { g(); }",
+            "trailing brace {",
+            "{owner_pronounX}",
+        ] {
+            let expected = template
+                .replace("{owner}", "Alex")
+                .replace("{owner_pronoun}", "her");
+            assert_eq!(p.render(template), expected, "template: {template:?}");
+        }
+        // `{{owner}}` is a literal brace around a real placeholder, not an escape.
+        assert_eq!(p.render("{{owner}}"), "{Alex}");
     }
 
     #[test]

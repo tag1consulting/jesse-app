@@ -17,14 +17,17 @@
 
 [persona]
 
-# How the assistant refers to you in the prompt wrappers. Rendered into the
-# built-in Ask/Tell framing wherever it says "{owner}"/"{Owner}". Default:
-# "the user" (so a fresh clone reads "The user is ASKING you a question…").
+# How the assistant refers to you. Rendered into the built-in Ask/Tell framing
+# wherever it says "{owner}"/"{Owner}" — and into the app's OWN prompt text at the
+# same point, so the Today tab's "{Owner} wants to discuss this Today.md item:"
+# names you too. Default: "the user" (so a fresh clone reads "The user is ASKING
+# you a question…" and "The user wants to discuss…").
 owner_name = "Alex Example"
 
 # Your POSSESSIVE pronoun ("their"/"his"/"her"/…), rendered wherever the wrappers
-# say "{owner_pronoun} phone" / "{owner_pronoun} permission". Optional; default
-# "their" (which reads correctly for any name).
+# or the app's prompts say "{owner_pronoun} phone" / "{owner_pronoun} permission" /
+# "engage with {owner_pronoun} questions". Optional; default "their" (which reads
+# correctly for any name).
 owner_pronoun = "their"
 
 # The languages you write in (informational; e.g. English + Spanish). Not injected

@@ -13,6 +13,93 @@ Every commit that changes a component **must** bump that component's version and
 add an entry here — enforced by `scripts/version-guard.sh` (the pre-push hook and
 CI both run it). See the "Versioning" section of `bridge/README.md`.
 
+## [bridge 0.88.0] - 2026-08-21
+
+### Changed
+
+- **Persona placeholders are now rendered on the INBOUND prompt text, not just on the
+  bridge's own wrappers.** `build_prompt_at` renders `{Owner}` / `{owner}` /
+  `{owner_pronoun}` through the active `Persona` in every piece of prompt TEXT it
+  assembles — the mode floor, the mode wrapper (built-in const *or* app-supplied
+  override), and the user's `text` — at one point, in one pass.
+
+  **Why the app needed it.** The app authors prompt bodies of its own: the Today tab's
+  Discuss, Propagate and Process-updates turns are frozen wordings built in JesseKit and
+  sent as `text`. Those wordings name the person the work belongs to, and until now they
+  named him with a string literal, so a second person installing from a fresh clone got
+  an agent told that somebody else wanted the work done. The name is not the app's to
+  know — it is deployment data on the bridge host (`jesse.local.toml`,
+  `JESSE_OWNER_NAME` / `JESSE_OWNER_PRONOUN`) — so the app now ships the placeholders and
+  the bridge resolves them. See the App 1.0 (109) entry for the other half.
+
+  **The seam is `prompt.rs`, not `persona.rs`.** `persona.rs` owns the substitution
+  *mechanism* and knows nothing about turns; `build_prompt_at` is where a turn's text is
+  assembled and where the wrappers were already rendered. Doing the body there means the
+  frame and the body are rendered from the same persona in the same breath and cannot
+  name two different people — a second call site elsewhere is exactly how they would
+  drift apart.
+
+  **What is NOT rendered: the data blocks.** The framed health block and any spliced
+  catch-up block are untrusted DEVICE/CONTEXT data the turn quotes, not text the turn
+  speaks. Substituting into them would be an injection surface rather than a
+  personalization, and a test pins that a health block containing `{owner}` comes back
+  verbatim.
+
+  **Behaviour is unchanged for a configured deployment.** Rendering is a no-op on text
+  that holds no placeholder, so every existing turn — including every wrapper override
+  the Settings screen produces, which `/jesse/prompts` already hands over
+  *already-rendered* — builds the same bytes as before. `a_configured_owner_reproduces_
+  the_previous_prompt_byte_for_byte` pins the Today discuss body against the exact text
+  that shipped before the app was parameterized.
+
+### Fixed
+
+- **`Persona::render` could expand a value it had just substituted.** It was three
+  chained `str::replace` calls, and each one rescans the output of the previous: an owner
+  name of `{owner_pronoun}` was substituted for `{Owner}` and then expanded again by the
+  pronoun pass, so a configured value reached the agent as a *different* persona field
+  — an owner called "her". Only reachable through a deliberately odd `owner_name`
+  today, but it becomes a live ordering hazard the moment app-authored text is rendered
+  too, which is the change above.
+
+  Now a single pass: the scanner walks the template once, copies each substituted value
+  straight to the output and resumes *after* it, so a rendered value is never itself
+  scanned. Whatever a name contains, braces included, is what the agent reads. An
+  unmatched `{` stays literal, so an item's markdown, a pasted code snippet or a JSON
+  blob in the user's text survives byte for byte.
+
+## [App 1.0 (109)] - 2026-08-20
+
+### Fixed
+
+- **The Today tab's prompts hardcoded one person's first name, so a fresh clone told the
+  agent that somebody else wanted the work done.** Four agent-facing strings in
+  `JesseKit/Sources/JesseCore/TodayPrompts.swift` — the discuss prompt body, the typed
+  message's label, the single-item propagate prompt and the batch propagate prompt —
+  opened by naming the owner, and one of them used his possessive pronoun. The name and
+  the pronoun are deployment data held on the bridge host; nothing shipped in this
+  repository should know them.
+
+  They now carry the persona placeholders the bridge already renders into its own Ask /
+  Tell wrappers — `{Owner}` at a sentence start, `{owner}` mid-sentence,
+  `{owner_pronoun}` for the possessive — and bridge 0.85.0 renders them on the inbound
+  text at the same point it renders the wrappers, so the frame and the body can never
+  name two different people. A deployment with a `jesse.local.toml` produces the same
+  bytes it always did; a fresh clone with no config degrades to the generic default the
+  persona layer documents ("The user wants to discuss this Today.md item…", "engage with
+  their questions"), not to an empty string and not to a leftover literal.
+
+  **The morning greeting needed no change**, and that is worth recording rather than
+  leaving to be re-derived: `MorningRoutine.prompt` is written in the first person
+  ("give me the briefing", "I cannot log today's food"), so it names nobody. Both of its
+  bodies are now pinned byte for byte, alongside the discuss prompt, so a reword cannot
+  quietly reintroduce a name.
+
+  **Known gap, left deliberately.** The propagate prompt still reads "Evidence he gave".
+  That is a SUBJECT pronoun, and the persona layer renders a name and a POSSESSIVE
+  pronoun and nothing else; spelling a new placeholder would either change the current
+  owner's rendered bytes or add a persona key every existing deployment would have to
+  set. Recorded in the source next to the string rather than papered over.
 ## [bridge 0.87.0] - 2026-08-21
 
 ### Fixed
