@@ -1,4 +1,6 @@
 use crate::*;
+use chrono::{Local, SecondsFormat};
+use serde_json::json;
 
 // ---- The scheduler's persisted record ---------------------------------------
 //
@@ -124,6 +126,9 @@ impl JobRecord {
 /// The whole persisted schedule state, keyed by schedule id.
 pub struct ScheduleStateStore {
     path: Option<PathBuf>,
+    /// The append-only fire ledger, or `None` to keep no history (tests, and any deploy
+    /// with no vault). See [`Config::schedule_ledger_file`].
+    ledger: Option<PathBuf>,
     map: Mutex<HashMap<String, JobRecord>>,
 }
 
@@ -135,13 +140,27 @@ impl ScheduleStateStore {
         let map = path.as_deref().map(load_schedule_state).unwrap_or_default();
         ScheduleStateStore {
             path,
+            ledger: None,
             map: Mutex::new(map),
         }
+    }
+
+    /// Attach the append-only fire ledger. Separate from [`new`](Self::new) so the dozen
+    /// state-machine tests below keep their two-line construction and stay silent on
+    /// disk; production wires it in [`crate::scheduler::Scheduler::new_with`].
+    pub fn with_ledger(mut self, ledger: Option<PathBuf>) -> Self {
+        self.ledger = ledger;
+        self
     }
 
     /// Whether this store survives a restart.
     pub fn is_persistent(&self) -> bool {
         self.path.is_some()
+    }
+
+    /// The state file this store was built over, so a caller can rebuild one like it.
+    pub fn file_path(&self) -> Option<PathBuf> {
+        self.path.clone()
     }
 
     /// One job's record (a default — "never came due" — when there is none).
@@ -227,6 +246,73 @@ impl ScheduleStateStore {
                 r.last_duration_ms = None;
             }
         });
+        // AFTER the record, and deliberately last: the ledger is observability, and a
+        // failure to append it must never cost us the anti-double-fire state above.
+        self.append_ledger(id, outcome, reason, completion_ms, duration_ms);
+    }
+
+    /// Append one line to the fire ledger. Best effort in the strongest sense: every
+    /// error is swallowed, because a scheduler that stopped working when a log file was
+    /// unwritable would be a worse bug than the blindness this fixes.
+    fn append_ledger(
+        &self,
+        id: &str,
+        outcome: Outcome,
+        reason: &str,
+        completion_ms: u64,
+        duration_ms: Option<u64>,
+    ) {
+        let Some(path) = &self.ledger else { return };
+        let rec = self.get(id);
+        let line = json!({
+            // Local wall-clock, because every question asked of this file is a wall-clock
+            // question ("did it run last night"), and the millis are kept beside it so
+            // nothing has to parse the string back.
+            "at": Local::now().to_rfc3339_opts(SecondsFormat::Secs, false),
+            "at_ms": completion_ms,
+            "job": id,
+            "outcome": ledger_label(outcome, reason),
+            "reason": reason,
+            "fired_at_ms": rec.last_fire_ms,
+            "duration_ms": duration_ms,
+            "job_id": rec.last_job_id,
+        });
+        let Ok(mut text) = serde_json::to_string(&line) else {
+            return;
+        };
+        text.push('\n');
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let _ = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .and_then(|mut f| f.write_all(text.as_bytes()));
+    }
+}
+
+/// The ledger's outcome vocabulary, which is NOT [`Outcome::label`].
+///
+/// The four labels the roll-up reads are `fired`, `day-skipped`, `no-prompt` and
+/// `failed`, and the split that matters is inside `Outcome::Failed`: a job whose
+/// `prompt_file` cannot be read is not a job that ran and failed, it is a job that never
+/// existed as a turn, and it is the ONLY failure that leaves no trace anywhere else.
+/// Folding the two together is what let a retired `morning-health-export` sit in the
+/// config for six days looking like ordinary noise.
+///
+/// A SKIP THAT IS NOT A DAY-SKIP KEEPS ITS OWN LABEL rather than being forced into one of
+/// the four. "The catch-up window expired", "the previous run was still going" and "the
+/// chain's predecessor broke it" are all real, all actionable, and all completely unlike
+/// "it is not Friday". Reporting a missed catch-up as `day-skipped` would tell the
+/// morning roll-up that nothing was wrong on precisely the mornings something was.
+fn ledger_label(outcome: Outcome, reason: &str) -> &'static str {
+    match outcome {
+        Outcome::Ran => "fired",
+        Outcome::Failed if reason.starts_with(crate::schedule::PROMPT_READ_FAILED) => "no-prompt",
+        Outcome::Failed => "failed",
+        Outcome::Skipped if reason == crate::scheduler::CALENDAR_SKIP => "day-skipped",
+        Outcome::Skipped => "skipped",
     }
 }
 
@@ -290,6 +376,84 @@ pub fn persist_schedule_state(path: &Path, jobs: &HashMap<String, JobRecord>) {
 
 #[cfg(test)]
 mod tests {
+
+    /// REGRESSION, 2026-08-21. The ledger's vocabulary is NOT `Outcome::label`. The split
+    /// that matters is inside `Failed`: an unreadable `prompt_file` never became a turn,
+    /// leaves no transcript and writes no output, so it is the one failure with no other
+    /// evidence anywhere. And a non-calendar skip must keep its own label rather than be
+    /// reported as "it is not Friday".
+    #[test]
+    fn the_ledger_splits_no_prompt_from_failed_and_day_skip_from_skip() {
+        assert_eq!(ledger_label(Outcome::Ran, ""), "fired");
+        assert_eq!(
+            ledger_label(
+                Outcome::Failed,
+                "could not read prompt_file /v/p.md: No such file or directory (os error 2)"
+            ),
+            "no-prompt"
+        );
+        assert_eq!(
+            ledger_label(Outcome::Failed, "turn rejected (429): rate limited"),
+            "failed"
+        );
+        assert_eq!(
+            ledger_label(Outcome::Skipped, crate::scheduler::CALENDAR_SKIP),
+            "day-skipped"
+        );
+        assert_eq!(
+            ledger_label(Outcome::Skipped, "the catch-up window had expired"),
+            "skipped"
+        );
+    }
+
+    /// The ledger APPENDS: a job that ran last night and was skipped tonight must leave
+    /// two lines, because "has this fired at all this week" is the question
+    /// `schedule.json` cannot answer and the whole reason this file exists.
+    #[test]
+    fn the_ledger_appends_one_line_per_outcome() {
+        let ledger = std::env::temp_dir().join(format!(
+            "jesse-ledger-{}/Inbox/scheduled-jobs-ledger.jsonl",
+            random_hex()
+        ));
+        let s = ScheduleStateStore::new(None).with_ledger(Some(ledger.clone()));
+
+        s.started("overnight-vault-lint", 1_000, "job-a");
+        s.finished("overnight-vault-lint", Outcome::Ran, "", 2_000, Some(1_000));
+        s.finished(
+            "overnight-tag1-status",
+            Outcome::Skipped,
+            crate::scheduler::CALENDAR_SKIP,
+            2_100,
+            None,
+        );
+
+        let text = std::fs::read_to_string(&ledger).unwrap();
+        let lines: Vec<_> = text.lines().collect();
+        assert_eq!(lines.len(), 2, "one line per outcome: {text}");
+
+        let a: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
+        assert_eq!(a["job"], "overnight-vault-lint");
+        assert_eq!(a["outcome"], "fired");
+        assert_eq!(a["duration_ms"], 1_000);
+        assert_eq!(a["fired_at_ms"], 1_000);
+        assert_eq!(a["job_id"], "job-a");
+
+        let b: serde_json::Value = serde_json::from_str(lines[1]).unwrap();
+        assert_eq!(b["job"], "overnight-tag1-status");
+        assert_eq!(b["outcome"], "day-skipped");
+        assert_eq!(b["reason"], crate::scheduler::CALENDAR_SKIP);
+        // A skip fired nothing, so it must not carry a stale fire stamp.
+        assert!(b["fired_at_ms"].is_null(), "{b}");
+    }
+
+    /// No ledger configured must stay silent rather than fail: the ledger is
+    /// observability and must never be able to break the scheduler.
+    #[test]
+    fn no_ledger_configured_is_not_an_error() {
+        let s = ScheduleStateStore::new(None);
+        s.finished("x", Outcome::Ran, "", 1, Some(1));
+    }
+
     use super::*;
 
     fn temp_state_path() -> PathBuf {

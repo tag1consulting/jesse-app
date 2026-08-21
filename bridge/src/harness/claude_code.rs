@@ -37,14 +37,17 @@ impl ClaudeCode {
         let settings = req
             .write_lock
             .and_then(|wl| install_write_lock_settings(cfg, wl));
-        cmd.args(build_claude_args(
-            cfg,
-            req.prompt,
-            req.session_id,
-            req.capability,
-            req.mcp_config,
-            settings.as_deref(),
-            req.attachment_dir,
+        cmd.args(fill_workspace(
+            build_claude_args(
+                cfg,
+                req.prompt,
+                req.session_id,
+                req.capability,
+                req.mcp_config,
+                settings.as_deref(),
+                req.attachment_dir,
+            ),
+            &req.cwd,
         ))
         .current_dir(&req.cwd)
         .stdout(Stdio::piped())
@@ -816,10 +819,14 @@ pub const BASIC_DISALLOWED_TOOLS: &str =
 /// unit-tested without a registry. The MCP server set ([`mcp_args`]), the working directory,
 /// and any env override stay with the caller.
 ///
-/// This argv is host-independent as written: every path scope is cwd-relative (`Read(./**)`),
-/// so no [`WORKSPACE_TOKEN`] appears in it. That is a property of Claude Code's scopes, not a
-/// rule this function follows — the rule is that a host-varying scope must be tokenised, and
-/// this harness happens to have none.
+/// This argv is host-independent as written, and since 2026-08-21 that is achieved the same
+/// way Codex achieves it: the `Capability::Write` path scopes are ABSOLUTE and name the
+/// turn's working directory with [`WORKSPACE_TOKEN`], filled in by [`fill_workspace`] when
+/// the child is built. They used to be cwd-relative (`Read(./**)`), which was
+/// host-independent for free but was a live defect: a `cd` inside any Bash call re-rooted
+/// the scope and silently revoked the turn's write grant. See the note above
+/// [`crate::DEFAULT_ALLOWED_TOOLS`] for the failure it caused and the reproduction. The `Read` capability's scopes below are
+/// still relative, and that is safe because a read child has no Bash to `cd` with.
 ///
 /// # Why these exact flags
 ///
@@ -1075,6 +1082,30 @@ pub fn build_claude_args(
 /// The matchers are the two halves of the mechanism. `PreToolUse` covers the tools that WRITE
 /// (plus `Bash`, which writes through a command string this cannot parse); `PostToolUse` adds
 /// `Read`, whose only job is to record the compare-and-swap baseline.
+/// Replace [`WORKSPACE_TOKEN`] with the turn's real working directory.
+///
+/// The Codex twin ([`crate::harness::codex::fill_workspace`]) has to TOML-quote what it
+/// substitutes because its token sits inside a `-c key=value` override. This one does not:
+/// the token sits in a plain argv element (`--allowedTools`), passed to the child without a
+/// shell, so no quoting layer can misread it.
+///
+/// THE ONE CHARACTER THAT WOULD BREAK THIS IS A COMMA, because `--allowedTools` is a
+/// comma-separated list and a working directory containing one would split a single rule
+/// into two malformed halves. That is not defended against here, deliberately: silently
+/// mangling the path would be worse, and a comma in the vault path would break far more of
+/// this deployment than the allowlist. If it ever happens, it fails loudly at the child.
+fn fill_workspace(args: Vec<String>, cwd: &Path) -> Vec<String> {
+    // The `//` prefix belongs to the RULE, and an absolute cwd brings its own leading `/`,
+    // so the cwd's is stripped before it is joined. Emitting `///Users/...` happens to be
+    // accepted today, but two slashes is the documented spelling and is the form the
+    // reproduction was run against; do not let this drift back to three.
+    let real = cwd.display().to_string();
+    let real = real.trim_start_matches('/');
+    args.into_iter()
+        .map(|a| a.replace(WORKSPACE_TOKEN, real))
+        .collect()
+}
+
 pub fn install_write_lock_settings(cfg: &Config, wl: &WriteLockChild) -> Option<PathBuf> {
     let dir = cfg
         .state_dir
@@ -1194,6 +1225,62 @@ pub fn apply_routed_env(cmd: &mut Command, pick: &RoutedPick) {
 
 #[cfg(test)]
 mod tests {
+
+    /// REGRESSION, 2026-08-21. The RECORDED argv must keep the token: the containment
+    /// record commits it verbatim and the startup gate compares by strict equality, so a
+    /// real path here boots on one machine and fails on every other.
+    #[test]
+    fn the_recorded_write_argv_names_the_workspace_by_token() {
+        let mut cfg = crate::testutil::test_config();
+        cfg.allowed_tools = format!("{DEFAULT_ALLOWED_TOOLS}Bash(git:*)");
+        let args = ClaudeCode.capability_args(&cfg, Capability::Write);
+        let joined = args.join(" ");
+        assert!(joined.contains(WORKSPACE_TOKEN), "{joined}");
+        assert!(!joined.contains("/Users/"), "{joined}");
+    }
+
+    /// ...and the SPAWNED argv must have the real directory in it, or the grant names a
+    /// path that does not exist and every write is refused.
+    #[test]
+    fn the_spawned_write_argv_has_the_real_workspace_substituted() {
+        let args = fill_workspace(
+            vec![
+                "--allowedTools".to_string(),
+                format!("{DEFAULT_ALLOWED_TOOLS}Bash(git:*)"),
+            ],
+            Path::new("/Users/x/jesse"),
+        );
+        let joined = args.join(" ");
+        assert!(
+            joined.contains("Edit(//Users/x/jesse/**)"),
+            "exactly two slashes, then the path: {joined}"
+        );
+        assert!(
+            !joined.contains(WORKSPACE_TOKEN),
+            "no token may survive: {joined}"
+        );
+        assert!(
+            !joined.contains("(///"),
+            "three slashes is not the spelling: {joined}"
+        );
+    }
+
+    /// Substitution uses the TURN'S OWN cwd, not the vault. The side children run outside
+    /// the vault, and granting them the vault's tree would be both wrong and a widening.
+    #[test]
+    fn the_substituted_workspace_follows_the_child_not_the_vault() {
+        let args = fill_workspace(
+            vec![DEFAULT_ALLOWED_TOOLS.to_string()],
+            Path::new("/tmp/scratch"),
+        );
+        assert!(args[0].contains("Edit(//tmp/scratch/**)"), "{}", args[0]);
+        assert!(
+            !args[0].contains("Edit(//Users/"),
+            "the vault root must not leak into a child spawned elsewhere: {}",
+            args[0]
+        );
+    }
+
     use super::*;
     use crate::testutil::*;
 

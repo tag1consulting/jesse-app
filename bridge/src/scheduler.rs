@@ -159,6 +159,29 @@ impl Scheduler {
         Self::new_with(schedule, state_file, SCHEDULED_SLOT_WAIT)
     }
 
+    /// [`new`](Self::new) plus the append-only fire ledger. This is what production
+    /// builds; the plain constructor stays ledger-free so the tests write one file, not
+    /// two. See [`Config::schedule_ledger_file`] for why the ledger exists at all.
+    pub fn new_with_ledger(
+        schedule: Arc<Schedule>,
+        state_file: Option<PathBuf>,
+        ledger_file: Option<PathBuf>,
+    ) -> Arc<Self> {
+        let sched = Self::new_with(schedule, state_file, SCHEDULED_SLOT_WAIT);
+        // The store is behind an Arc by the time `new_with` returns, so the ledger is
+        // attached by rebuilding that one field rather than mutating through the Arc.
+        Arc::new(Scheduler {
+            schedule: sched.schedule.clone(),
+            state: Arc::new(
+                ScheduleStateStore::new(sched.state.file_path()).with_ledger(ledger_file),
+            ),
+            turn_lock: sched.turn_lock.clone(),
+            running: Mutex::new(Vec::new()),
+            boot_ms: sched.boot_ms,
+            slot_wait: sched.slot_wait,
+        })
+    }
+
     /// [`new`](Self::new) with an explicit slot-starvation patience. The shipped value is
     /// [`SCHEDULED_SLOT_WAIT`]; a shorter one lets a test prove the yield-to-a-client
     /// behavior without spending a minute waiting for it.
@@ -372,7 +395,7 @@ fn should_push(job: &ScheduleJob, outcome: Outcome, reason: &str, cascaded: bool
 
 /// The reason text for a link the `days` filter excluded today. Compared by value in
 /// [`should_push`], so it is a const rather than a formatted string.
-const CALENDAR_SKIP: &str = "not scheduled on this weekday";
+pub const CALENDAR_SKIP: &str = "not scheduled on this weekday";
 /// The reason text for a link that is `enabled = false`.
 const DISABLED_SKIP: &str = "disabled";
 

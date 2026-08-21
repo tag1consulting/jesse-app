@@ -13,6 +13,83 @@ Every commit that changes a component **must** bump that component's version and
 add an entry here — enforced by `scripts/version-guard.sh` (the pre-push hook and
 CI both run it). See the "Versioning" section of `bridge/README.md`.
 
+## [bridge 0.87.0] - 2026-08-21
+
+### Fixed
+
+- **A scheduled turn could silently lose its write grant the moment it ran `cd`.** The
+  `Capability::Write` path scopes were cwd-relative (`Read(./**)`, `Edit(./**)`, …), and
+  Claude Code's Bash tool keeps ONE persistent shell per turn — so a single `cd` in any
+  Bash call re-rooted every path rule for the REST OF THE TURN. There is no warning at
+  spawn, nothing in the bridge log, and the scheduler still records the job as `ran`; the
+  child simply cannot write its output.
+
+  **What it cost.** On the night of 2026-08-21 `overnight-vault-lint` fired on time, ran
+  its whole lint for 621 seconds at $4.61, and then could not write a single byte: it had
+  cd'd into `vault/Projects/drafts/2026-08-14-scolta-maintenance-docs` to count em dashes,
+  and every `Write` after that was refused. Its three chain-mates the same night never
+  cd'd and every one of their writes landed, which is why this read as a flaky, unlucky
+  night rather than as a config error, and why it survived weeks of intermittent
+  "Inbox writes were denied again" reports.
+
+  **A second defect was hiding underneath it.** `Write(...)` rules are INERT: the CLI
+  matches file-editing tools against `Edit(path)` rules only, and prints
+  "Write(./**) is not matched by file permission checks" on every spawn that passes one.
+  So `Write(./**)` had never granted anything, and the entire write posture rested on the
+  single `Edit(./**)` beside it. `Write` is not re-added in any spelling; `Edit` covers
+  Write, Edit and NotebookEdit.
+
+  **The fix** is `WORKSPACE_PATH_GRANTS`: the four path scopes are now ABSOLUTE and name
+  the turn's own working directory with `${WORKSPACE}`, substituted by a new
+  `claude_code::fill_workspace` when the child is built — the same token-and-substitute
+  mechanism Codex's writable root already used. Scope is unchanged (it is the same tree
+  `./**` was meant to grant); it simply cannot be moved out from under the child by a
+  `cd`. The token keeps the recorded argv host-independent, so the containment record
+  stays comparable by strict equality on every machine.
+
+  **The double slash is load-bearing.** `//` is how a Claude Code permission rule spells
+  "absolute path"; a bare single leading slash is not treated as absolute and fails
+  exactly like the relative form. Four live runs against the pinned CLI (2.1.235) pinned
+  the whole thing: `Edit(./**)` without a `cd` passes, `Edit(./**)` after a `cd` is
+  DENIED, `Edit(//<abs>/**)` after a `cd` passes, `Edit(/<abs>/**)` after a `cd` is
+  DENIED. Regression tests cover the inert-`Write` shape, the slash count in both the
+  recorded and the substituted argv, and that substitution follows the CHILD's cwd rather
+  than the vault (the side children run outside it).
+
+  The containment battery was re-run and `bridge/containment.toml` re-recorded, because
+  the posture argv changed.
+
+### Added
+
+- **A fire ledger: `<vault>/Inbox/scheduled-jobs-ledger.jsonl`.** One append-only JSON
+  line per scheduled occurrence that reaches an outcome, carrying the job id, the local
+  timestamp, the outcome, the reason, the fire stamp, the duration and the job id of the
+  turn.
+
+  **Why `schedule.json` was not enough.** It keeps exactly ONE record per job and
+  overwrites it on the next fire, so it can answer "what happened last time" and can never
+  answer "has this job run at all this month". That gap is not theoretical: it is how
+  `overnight-tag1-status` went four consecutive Fridays without firing while nobody
+  noticed, because start-of-day's live fallback kept writing the same output file the
+  scheduled job would have written. Nothing on disk recorded the NON-event, and the only
+  evidence of a job was the output it produced — which is precisely what is absent for the
+  runs you most need to see. The ledger lives beside the outputs so a morning roll-up can
+  read fires and outputs together, and it is authoritative over inferring a fire from an
+  mtime.
+
+  **Its vocabulary is not `Outcome::label`.** The split that matters is inside `Failed`: a
+  job whose `prompt_file` cannot be read never became a turn, leaves no transcript and
+  writes no output, so it is the one failure with no other evidence anywhere — it is
+  recorded as `no-prompt`, not `failed`. And a skip that is not a calendar skip keeps its
+  own `skipped` label rather than being forced into `day-skipped`: "the catch-up window
+  expired" and "it is not Friday" must not read the same in the roll-up. Both
+  classifications key on shared consts (`PROMPT_READ_FAILED`, `CALENDAR_SKIP`) rather than
+  on copied literals, so the message and the classifier cannot drift.
+
+  Appending is best-effort in the strongest sense and happens strictly AFTER the state
+  record is persisted: a scheduler that stopped working because a log file was unwritable
+  would be a worse bug than the blindness this fixes.
+
 ## [bridge 0.86.1] - 2026-08-21
 
 ### Fixed
