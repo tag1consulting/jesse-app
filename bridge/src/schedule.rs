@@ -27,6 +27,15 @@ use chrono::{DateTime, Datelike, LocalResult, NaiveDate, NaiveTime, TimeZone, Ut
 /// a "morning routine" that starts at 4pm is worse than one that visibly did not run.
 pub const DEFAULT_CATCH_UP_SECS: u64 = 3600;
 
+/// The opening of the failure reason a job gets when its `prompt_file` cannot be read.
+///
+/// SHARED WITH THE FIRE LEDGER, which classifies this failure as `no-prompt` rather than
+/// the generic `failed`. Keying that on a const rather than on a copied string literal is
+/// the point: the missing-prompt case is the one failure that produces NOTHING anywhere
+/// else — no child, no transcript, no output file — so a silent drift between the message
+/// and the classifier would make the single most invisible failure invisible again.
+pub const PROMPT_READ_FAILED: &str = "could not read prompt_file";
+
 /// Default `mode` for a scheduled turn. Scheduled work ACTS (it writes the vault, files
 /// the day, runs the routine), so it takes the acting mode rather than the asking one.
 pub const DEFAULT_SCHEDULE_MODE: &str = "tell";
@@ -200,7 +209,7 @@ impl PromptSource {
                     vault.join(p)
                 };
                 let text = std::fs::read_to_string(&path)
-                    .map_err(|e| format!("could not read prompt_file {}: {e}", path.display()))?;
+                    .map_err(|e| format!("{PROMPT_READ_FAILED} {}: {e}", path.display()))?;
                 if text.trim().is_empty() {
                     return Err(format!("prompt_file {} is empty", path.display()));
                 }

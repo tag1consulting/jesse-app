@@ -155,7 +155,11 @@ impl AppState {
                 .collect(),
         });
         let slots = Arc::new(SlotTable::new(&plan, cfg.max_queued));
-        let scheduler = Scheduler::new(cfg.schedule.clone(), cfg.schedule_file());
+        let scheduler = Scheduler::new_with_ledger(
+            cfg.schedule.clone(),
+            cfg.schedule_file(),
+            cfg.schedule_ledger_file(),
+        );
         let hook_helper = resolve_hook_helper();
         let limiter = Arc::new(RateLimiter::new(cfg.rate_per_min));
         // Seed the health cache from the registry (configured non-ambient models → optimistic

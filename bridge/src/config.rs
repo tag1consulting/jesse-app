@@ -547,6 +547,68 @@ pub const DEFAULT_MAX_ATTACHMENTS_TOTAL_BYTES: usize = 20 * 1024 * 1024;
 // (a deliberately bad value still errored, so the key was really being read).
 // `granted_mcp_tools` splits on the `mcp__<server>__` prefix, so `google` and
 // `google-perseido` cannot bleed into one another in either direction.
+// THE FOUR FILE-PATH GRANTS AT THE HEAD OF THIS CONST are rooted absolutely at the turn's
+// own working directory, named by `WORKSPACE_TOKEN` and filled in by
+// `claude_code::fill_workspace` when the child is spawned.
+//
+// TWO DEFECTS LIVED IN THE OLD SPELLING `Read(./**),Write(./**),Edit(./**),Grep(./**),
+// Glob(./**)`, and either one alone was enough to lose a night's work. Both were pinned
+// against the installed Claude Code (2.1.235) on 2026-08-21, not reasoned about.
+//
+// 1. **`Write(...)` IS INERT.** The CLI matches file-editing tools against `Edit(path)`
+//    rules ONLY, and says so on every spawn that passes one: "Write(./**) is not matched
+//    by file permission checks, only Edit(path) rules are." The entire write grant rested
+//    on the single `Edit(./**)` beside it. `Write` is therefore not re-added in any
+//    spelling; `Edit` covers Write, Edit and NotebookEdit.
+//
+// 2. **A RELATIVE RULE IS RESOLVED AGAINST THE SHELL'S CURRENT DIRECTORY, NOT THE SESSION
+//    ROOT.** Claude Code's Bash tool keeps ONE persistent shell per turn, so a single
+//    `cd` in any Bash call re-roots `./**` for the REST OF THE TURN and silently revokes
+//    the write grant. No warning at spawn, nothing in the bridge log, and the scheduler
+//    still records the job as `ran` — the child simply cannot write its output. That is
+//    how `overnight-vault-lint` burned $4.61 on the night of 2026-08-21, completed its
+//    whole lint, and lost the report: it had cd'd into
+//    `vault/Projects/drafts/2026-08-14-scolta-maintenance-docs` to count em dashes, and
+//    every `Write` after that was refused. Its chain-mates the same night never cd'd and
+//    every one of their writes landed, which is why this looked intermittent for weeks
+//    rather than looking like a config error.
+//
+// The reproduction, four runs at `--permission-mode default` in headless `-p`:
+//
+// | grant              | cd first | Write  |
+// |--------------------|----------|--------|
+// | `Edit(./**)`       | no       | ok     |
+// | `Edit(./**)`       | yes      | DENIED |
+// | `Edit(//<abs>/**)` | yes      | ok     |
+// | `Edit(/<abs>/**)`  | yes      | DENIED |
+//
+// THE DOUBLE SLASH IS LOAD-BEARING AND IS NOT A TYPO. `//` is how a Claude Code
+// permission rule spells "absolute path"; a bare single leading slash is NOT treated as
+// absolute and fails exactly like the relative form (row four). Anyone tidying the
+// apparent double slash out of this const reintroduces the bug. The token carries no
+// leading slash of its own for the same reason: `//` plus the substituted path is
+// exactly two.
+//
+// WHY THE TOKEN AND NOT `cfg.vault`. The containment record commits this argv verbatim
+// and the startup gate compares it by STRICT EQUALITY with no normalization, so an
+// absolute host path baked in here would boot on this machine and fail on every other
+// (`levelgate::the_record_carries_no_absolute_host_paths` forbids exactly that). Naming
+// the scope by token and substituting at spawn is the mechanism this project already
+// uses for Codex's writable root. It is also simply more correct: the substitution uses
+// the turn's OWN cwd, so the side children that run outside the vault get their own
+// directory rather than the vault's.
+//
+// THEY LIVE IN THIS CONST AND ARE NOT SPLICED IN BY `Config::from_env`, and that is not a
+// style choice. `probe.rs::run_battery` rebuilds the SHIPPED posture as
+// `cfg.allowed_tools = DEFAULT_ALLOWED_TOOLS` so the record describes what the project
+// ships rather than what this host's env sets. Holding the grants anywhere else splits the
+// shipped allowlist in two, and the battery then probes a posture with NO write grant at
+// all: the `write_vault_file` hard gate fails, and the record it writes vouches for a
+// posture nobody runs. Tokenising made this possible — a host-independent grant has no
+// reason to be assembled at runtime.
+//
+// SCOPE IS UNCHANGED, ONLY ITS ANCHOR. This grants the same tree `./**` was meant to
+// grant. It widens nothing; it just cannot be moved out from under the child by a `cd`.
 // THE TWO `mcp__build__*` ENTRIES ARE THE ONLY GRANT HERE THAT RUNS CODE, and they are
 // named INDIVIDUALLY rather than as `mcp__build__*` on purpose: a wildcard would grant
 // whatever that server advertises next, and this is precisely the server where "whatever it
@@ -563,7 +625,9 @@ pub const DEFAULT_MAX_ATTACHMENTS_TOTAL_BYTES: usize = 20 * 1024 * 1024;
 // the child can edit the checkout and then cause that checkout to be compiled and run, so
 // this is a write-then-execute path BY CONSTRUCTION. The mitigation is the macOS sandbox the
 // build runs inside (see `buildsvc::build_sandbox_profile`), not the shape of the tool.
-pub const DEFAULT_ALLOWED_TOOLS: &str = "Read(./**),Write(./**),Edit(./**),Grep(./**),Glob(./**),\
+pub const DEFAULT_ALLOWED_TOOLS: &str = "\
+Read(//${WORKSPACE}/**),Edit(//${WORKSPACE}/**),\
+Grep(//${WORKSPACE}/**),Glob(//${WORKSPACE}/**),\
 mcp__qmd__query,mcp__qmd__get,mcp__qmd__multi_get,mcp__qmd__status,\
 Skill(diet-logging),\
 Bash(git:*),Bash(mv:*),Bash(ls:*),Bash(cat:*),Bash(find:*),\
@@ -1014,6 +1078,27 @@ impl Config {
         self.state_dir
             .as_deref()
             .map(|d| PathBuf::from(d).join("schedule.json"))
+    }
+
+    /// The APPEND-ONLY fire ledger: one line per scheduled occurrence that reached an
+    /// outcome, at `$JESSE_VAULT/<VAULT_SUBDIR>/Inbox/scheduled-jobs-ledger.jsonl`. Note the
+    /// `VAULT_SUBDIR` hop: `cfg.vault` is the REPO root, and the notes live one level down.
+    ///
+    /// IN THE VAULT, NOT THE STATE DIR, AND THAT IS THE WHOLE POINT. `schedule.json` keeps
+    /// exactly ONE record per job and overwrites it on the next fire, so it can answer
+    /// "what happened last time" and can never answer "has this job run at all this
+    /// month". That gap is how `overnight-tag1-status` went four Fridays without firing
+    /// and `overnight-vault-lint` broke a seven-night streak, both unnoticed: nothing on
+    /// disk recorded a NON-event, and the only evidence of a job was the output file it
+    /// wrote, which is absent for exactly the runs you most need to see. The ledger lives
+    /// beside the outputs so the morning roll-up can read fires and outputs together, and
+    /// it is authoritative over inferring a fire from an output file's mtime.
+    pub fn schedule_ledger_file(&self) -> Option<PathBuf> {
+        (!self.vault.is_empty()).then(|| {
+            PathBuf::from(&self.vault)
+                .join(VAULT_SUBDIR)
+                .join("Inbox/scheduled-jobs-ledger.jsonl")
+        })
     }
 
     /// The file the per-session favorite / archived flags are persisted to (a
@@ -2360,11 +2445,12 @@ impl Config {
         // Built BEFORE the struct literal so the harness registry below can be built from
         // the harnesses this config actually names. Nothing else about it changed.
         let model_registry = ModelRegistry::from_env(&home);
+        let vault = env_string("JESSE_VAULT").unwrap_or_else(|| format!("{home}/vault"));
         Config {
             token: env_string("JESSE_TOKEN").unwrap_or_default(),
             // Capture HOME once — session-path lookups read `cfg.home`, not the env.
             home: home.clone(),
-            vault: env_string("JESSE_VAULT").unwrap_or_else(|| format!("{home}/vault")),
+            vault,
             bind: env_string("JESSE_BIND").unwrap_or_else(|| "127.0.0.1".to_string()),
             port: env_parse("JESSE_PORT", 8765),
             claude_bin: env_string("JESSE_CLAUDE_BIN").unwrap_or_else(|| "claude".to_string()),
@@ -2629,6 +2715,84 @@ pub fn export_mcp_server_env() {
 
 #[cfg(test)]
 mod tests {
+
+    /// REGRESSION, 2026-08-21. `Write(...)` rules are inert: Claude Code matches
+    /// file-editing tools against `Edit(path)` ONLY and prints a notice saying so. A
+    /// `Write(...)` rule creeping back in would look like a write grant and grant nothing.
+    #[test]
+    fn the_path_grants_never_use_an_inert_write_rule() {
+        assert!(
+            !DEFAULT_ALLOWED_TOOLS.contains("Write("),
+            "{DEFAULT_ALLOWED_TOOLS}"
+        );
+        assert!(DEFAULT_ALLOWED_TOOLS.contains("Edit(//${WORKSPACE}/**)"));
+    }
+
+    /// REGRESSION, 2026-08-21. THE DOUBLE SLASH IS THE FIX. A relative rule is resolved
+    /// against the shell's cwd, so one `cd` in a Bash call silently revoked the write
+    /// grant for the rest of the turn; a single leading slash is not treated as absolute
+    /// and fails the same way. Only `//` survives a `cd`.
+    #[test]
+    fn the_path_grants_are_absolute_and_double_slashed() {
+        for tool in ["Read", "Edit", "Grep", "Glob"] {
+            assert!(
+                DEFAULT_ALLOWED_TOOLS.contains(&format!("{tool}(//${{WORKSPACE}}/**)")),
+                "{tool} must be rooted absolutely with the double-slash prefix: \
+                 {DEFAULT_ALLOWED_TOOLS}"
+            );
+            assert!(
+                !DEFAULT_ALLOWED_TOOLS.contains(&format!("{tool}(./**)")),
+                "{tool} must not be cwd-relative: {DEFAULT_ALLOWED_TOOLS}"
+            );
+        }
+        assert!(
+            !DEFAULT_ALLOWED_TOOLS.contains("(/$") && !DEFAULT_ALLOWED_TOOLS.contains("(///"),
+            "exactly two leading slashes before the token: {DEFAULT_ALLOWED_TOOLS}"
+        );
+    }
+
+    /// The grants must stay HOST-INDEPENDENT: the containment record commits this argv and
+    /// the startup gate compares it by strict equality, so a real path here would boot on
+    /// one machine and fail on every other.
+    #[test]
+    fn the_path_grants_name_the_workspace_by_token_not_by_path() {
+        assert!(
+            !DEFAULT_ALLOWED_TOOLS.contains("/Users/"),
+            "{DEFAULT_ALLOWED_TOOLS}"
+        );
+        assert!(
+            !DEFAULT_ALLOWED_TOOLS.contains("/home/"),
+            "{DEFAULT_ALLOWED_TOOLS}"
+        );
+        assert_eq!(
+            DEFAULT_ALLOWED_TOOLS
+                .matches(crate::harness::WORKSPACE_TOKEN)
+                .count(),
+            4,
+            "every one of the four grants names the workspace"
+        );
+    }
+
+    /// The ledger belongs beside the OUTPUTS, in the vault Inbox — not in the state dir
+    /// next to the single-record `schedule.json` it exists to compensate for.
+    #[test]
+    fn the_fire_ledger_lands_in_the_vault_inbox() {
+        let mut cfg = crate::testutil::test_config();
+        cfg.vault = "/Users/x/jesse".to_string();
+        // The `vault/` hop is the point of this assertion: `cfg.vault` is the repo root,
+        // so joining "Inbox/..." straight onto it puts the ledger a level above the notes,
+        // beside the repo rather than beside the outputs it describes. That is exactly what
+        // shipped on the first try and was caught only by a live fire.
+        assert_eq!(
+            cfg.schedule_ledger_file(),
+            Some(PathBuf::from(
+                "/Users/x/jesse/vault/Inbox/scheduled-jobs-ledger.jsonl"
+            ))
+        );
+        cfg.vault = String::new();
+        assert_eq!(cfg.schedule_ledger_file(), None);
+    }
+
     use super::*;
     use crate::testutil::*;
 
