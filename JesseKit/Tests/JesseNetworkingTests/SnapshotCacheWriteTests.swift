@@ -67,6 +67,10 @@ final class SnapshotCacheWriteTests: XCTestCase {
         super.tearDown()
     }
 
+    /// Seeds are stamped with the REAL clock, not a fixed instant: `load()` defaults to
+    /// `Date()`, and an entry stamped six months ago is correctly dropped as past the
+    /// cache's 30-day ceiling. Staleness itself is `SnapshotCacheTests`' subject; this
+    /// file is about what reaches disk.
     private func client(cache: SnapshotCache?) -> JesseBridgeClient {
         let c = URLSessionConfiguration.ephemeral
         c.protocolClasses = [CacheStubURLProtocol.self]
@@ -147,7 +151,7 @@ final class SnapshotCacheWriteTests: XCTestCase {
     func testANotModifiedLeavesTheCachedDayAlone() async throws {
         let body = try todayBody()
         cache.store(body, key: SnapshotCacheKey.today, etag: "\"day-7\"",
-                    fetchedAt: Date(timeIntervalSince1970: 1_772_530_200))
+                    fetchedAt: Date())
         CacheStubURLProtocol.replies["/jesse/today"] = .init(status: 304, body: Data())
 
         let result = try await client(cache: cache).getToday(ifNoneMatch: "\"day-7\"")
@@ -162,7 +166,7 @@ final class SnapshotCacheWriteTests: XCTestCase {
         let body = todayBodyWithoutETag
         cache.store(Data(#"{"title":"stale","date":"2026-08-20"}"#.utf8),
                     key: SnapshotCacheKey.today, etag: "\"day-6\"",
-                    fetchedAt: Date(timeIntervalSince1970: 1_772_530_200))
+                    fetchedAt: Date())
         CacheStubURLProtocol.replies["/jesse/today/items/abc123/check"] =
             .init(status: 200, body: body, headers: ["Etag": "\"day-8\""])
 
@@ -179,7 +183,7 @@ final class SnapshotCacheWriteTests: XCTestCase {
     func testAFailedDayFetchDoesNotTouchTheCache() async throws {
         let body = try todayBody()
         cache.store(body, key: SnapshotCacheKey.today, etag: "\"day-7\"",
-                    fetchedAt: Date(timeIntervalSince1970: 1_772_530_200))
+                    fetchedAt: Date())
         CacheStubURLProtocol.replies["/jesse/today"] =
             .init(status: 500, body: Data("boom".utf8))
 

@@ -48,19 +48,23 @@ final class TodayOfflineCacheTests: XCTestCase {
     /// does not fail loudly — it fails as `JesseError.decoding` three layers away, which
     /// is exactly how a wrong fixture reads as a broken feature.
     /// `testTheFixtureIsAValidWireBody` below is the guard against that.
+    ///
+    /// A RAW literal (`#"""`), because JSON is full of quotes: inside an ordinary Swift
+    /// multiline literal a `\\"` unescapes to a bare `"` and the emitted document is not
+    /// JSON at all.
     private func cachedDayBody(title: String = "Today: Friday, August 21, 2026",
                                lead: String = "Fire the bisque load") -> Data {
-        Data("""
-        {"title":"\(title)","date":"2026-08-21","narrative":"A quiet one.",
+        Data(#"""
+        {"title":"\#(title)","date":"2026-08-21","narrative":"A quiet one.",
          "leadItems":[],
          "sections":[
            {"name":"Do Now","kind":"tasks","prose":[],
-            "items":[{"id":"6d1e3c9a0001","checked":false,"lead":"\(lead)",
-                      "text":"* [ ] **\(lead)**","links":[],"sectionName":"Do Now"}],
+            "items":[{"id":"6d1e3c9a0001","checked":false,"lead":"\#(lead)",
+                      "text":"* [ ] **\#(lead)**","links":[],"sectionName":"Do Now"}],
             "reports":[],"range":{"start":0,"end":1}}],
          "counts":{"open":1,"done":0,"reportsUnseen":0},
          "missing":false,"etag":"\"cached-tag\""}
-        """.utf8)
+        """#.utf8)
     }
 
     private func model(_ fake: FakeClient, cache: SnapshotCache? = nil) -> TodayDashboardModel {
