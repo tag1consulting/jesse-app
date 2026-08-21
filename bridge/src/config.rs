@@ -221,6 +221,30 @@ pub const DEFAULT_MAX_ATTACHMENTS_TOTAL_BYTES: usize = 20 * 1024 * 1024;
 // each job can read its skill's instructions and cannot act on them. Both filenames
 // were confirmed on disk on 2026-08-14 rather than copied from the prompt.
 //
+// `Bash(bin/vault-links:*)` AND ITS `./` SPELLING — the vault's link-graph tool, which
+// CLAUDE.md makes mandatory: after a QMD hit, a turn is required to expand the primary
+// note through the link graph before answering a question about its context. Without the
+// grant that rule is unfollowable from a bridge child, which is why it had been papered
+// over with a `permissions.allow` entry in the vault's own `.claude/settings.json` —
+// exactly the uncovered path `settings_permission_drift` exists to shout about, and it
+// shouted at every startup from 2026-08-19 until this commit. Recording it here is what
+// that warning asks for; the vault entry is deleted in the same change, because the drift
+// check reports every entry it finds and does not cross-check the record.
+//
+// BOTH RELATIVE SPELLINGS, AND DELIBERATELY NOT THE THIRD. The vault settings also carried
+// `Bash(~/jesse/bin/vault-links:*)`. That one is not reproduced: a shipped const must not
+// name one operator's home directory, and the child's cwd is the vault root, so the two
+// relative forms are the ones that can actually be typed.
+//
+// ITS WRITE-THEN-EXECUTE STORY IS WORSE THAN ITS NEIGHBOURS', AND THAT IS NOT GLOSSED.
+// `bin/vault-links` is a tracked SYMLINK to `tools/vault-links/target/release/vault-links`,
+// and `/tools/vault-links/target/` is gitignored. So the source is version-controlled and
+// the ARTIFACT THAT ACTUALLY RUNS IS NOT. The mitigation the note below leans on for the
+// `.sh` and `.js` grants — that a tampered script shows up in `git status` — does not hold
+// for this one. The path is unchanged in kind (the child already holds a write grant over
+// the same tree and could rewrite any of them), but it is weaker in evidence, and anyone
+// re-reading that note should not assume it covers this line too.
+//
 // `Bash(node vault/rotate-currency-summary.js:*)` — the currency jobs' size ceiling.
 // Without it the running summaries grow unbounded and eventually cost more context
 // than the analysis they feed.
@@ -637,6 +661,7 @@ Bash(node vault/validate-diet-today.js:*),\
 Bash(node vault/verify-diet-consistency.js:*),\
 Bash(node vault/rotate-currency-summary.js:*),\
 Bash(./.claude/skills/archive-processing/find-checked-archive-boxes.sh:*),\
+Bash(bin/vault-links:*),Bash(./bin/vault-links:*),\
 Bash(./.claude/skills/draft-lint/lint-draft.sh:*),\
 Bash(./.claude/skills/diet-query/run-week-query.sh:*),\
 Bash(./.claude/skills/currency-stats/currency-stats.py:*),\
@@ -2715,6 +2740,31 @@ pub fn export_mcp_server_env() {
 
 #[cfg(test)]
 mod tests {
+
+    /// REGRESSION, 2026-08-21. CLAUDE.md makes the link-graph expansion mandatory after a
+    /// QMD hit, so a bridge child that cannot run `bin/vault-links` cannot follow its own
+    /// rules. It had been granted through the vault's `.claude/settings.json`, which the
+    /// containment record cannot see; that is the drift `settings_permission_drift` warned
+    /// about at every startup for two days.
+    #[test]
+    fn the_vault_links_grant_is_recorded_not_left_to_vault_settings() {
+        assert!(DEFAULT_ALLOWED_TOOLS.contains("Bash(bin/vault-links:*)"));
+        assert!(DEFAULT_ALLOWED_TOOLS.contains("Bash(./bin/vault-links:*)"));
+    }
+
+    /// A shipped const must never name one operator's home directory: the containment
+    /// record commits this argv verbatim and is compared by strict equality, so a `~/jesse`
+    /// spelling would describe a posture only this machine runs. The vault settings carried
+    /// exactly that third spelling; it is deliberately not reproduced here.
+    #[test]
+    fn no_grant_names_an_operator_home_directory() {
+        for bad in ["~/jesse", "/Users/", "$HOME"] {
+            assert!(
+                !DEFAULT_ALLOWED_TOOLS.contains(bad),
+                "the shipped allowlist must stay host-independent, found {bad:?}"
+            );
+        }
+    }
 
     /// REGRESSION, 2026-08-21. `Write(...)` rules are inert: Claude Code matches
     /// file-editing tools against `Edit(path)` ONLY and prints a notice saying so. A
