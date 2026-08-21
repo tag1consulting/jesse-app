@@ -40,16 +40,26 @@ final class TodayOfflineCacheTests: XCTestCase {
 
     /// The bridge's own wire shape for a one-item day, so the cache holds what the
     /// endpoint would really have put there.
+    ///
+    /// Every REQUIRED key is present, and that is not decoration. `TodaySnapshot` and
+    /// `TodayItem` decode tolerantly (a bridge that predates a field must still render),
+    /// but `TodaySection`, `TodayCounts` and `TodaySourceRange` use the SYNTHESIZED
+    /// decoder, so each of their non-optional fields is mandatory. A fixture missing one
+    /// does not fail loudly — it fails as `JesseError.decoding` three layers away, which
+    /// is exactly how a wrong fixture reads as a broken feature.
+    /// `testTheFixtureIsAValidWireBody` below is the guard against that.
     private func cachedDayBody(title: String = "Today: Friday, August 21, 2026",
                                lead: String = "Fire the bisque load") -> Data {
         Data("""
         {"title":"\(title)","date":"2026-08-21","narrative":"A quiet one.",
          "leadItems":[],
-         "sections":[{"name":"Do Now","items":[
-            {"id":"6d1e3c9a0001","checked":false,"lead":"\(lead)",
-             "text":"* [ ] **\(lead)**","links":[],"sectionName":"Do Now"}],
-           "reports":[]}],
-         "counts":{},"missing":false,"etag":"\\"cached-tag\\""}
+         "sections":[
+           {"name":"Do Now","kind":"tasks","prose":[],
+            "items":[{"id":"6d1e3c9a0001","checked":false,"lead":"\(lead)",
+                      "text":"* [ ] **\(lead)**","links":[],"sectionName":"Do Now"}],
+            "reports":[],"range":{"start":0,"end":1}}],
+         "counts":{"open":1,"done":0,"reportsUnseen":0},
+         "missing":false,"etag":"\"cached-tag\""}
         """.utf8)
     }
 
@@ -65,6 +75,17 @@ final class TodayOfflineCacheTests: XCTestCase {
         let f = FakeClient()
         f.fetches = [.error(.cannotConnect("laptop"))]
         return f
+    }
+
+    /// The fixture above is a real wire body. Asserted directly, because every other
+    /// test in this file reaches it through the cache and a decode failure there
+    /// surfaces as "nothing rendered" rather than as "your JSON is wrong".
+    func testTheFixtureIsAValidWireBody() throws {
+        let snap = try TodaySnapshot.decode(from: cachedDayBody())
+        XCTAssertEqual(snap.date, "2026-08-21")
+        XCTAssertEqual(snap.allItems.map(\.id), ["6d1e3c9a0001"])
+        XCTAssertEqual(snap.etag, "\"cached-tag\"")
+        XCTAssertFalse(snap.missing)
     }
 
     // MARK: - Cold launch, offline, with a cache
