@@ -25,16 +25,17 @@ final class TodayOfflineCacheTests: XCTestCase {
     /// the wall clock.
     private let now = Date(timeIntervalSince1970: 1_772_530_200)
 
-    override func setUp() {
-        super.setUp()
+    // The `async throws` overrides, not the synchronous ones: a synchronous `setUp()`
+    // is nonisolated, and this class is `@MainActor`, so it cannot touch the two stored
+    // properties below.
+    override func setUp() async throws {
         dir = FileManager.default.temporaryDirectory
             .appendingPathComponent("TodayOffline-\(UUID().uuidString)", isDirectory: true)
         cache = SnapshotCache(directory: dir)
     }
 
-    override func tearDown() {
+    override func tearDown() async throws {
         try? FileManager.default.removeItem(at: dir)
-        super.tearDown()
     }
 
     /// The bridge's own wire shape for a one-item day, so the cache holds what the

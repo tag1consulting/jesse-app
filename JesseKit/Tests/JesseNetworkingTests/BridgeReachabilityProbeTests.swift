@@ -45,15 +45,13 @@ final class BridgeReachabilityProbeTests: XCTestCase {
 
     private let cfg = JesseConfig(host: "laptop", port: 8765, token: "tok")
 
-    override func setUp() {
-        super.setUp()
+    override func setUp() async throws {
         HealthProbeStubURLProtocol.reset()
         HealthProbeStubURLProtocol.isEnabled = true
     }
 
-    override func tearDown() {
+    override func tearDown() async throws {
         HealthProbeStubURLProtocol.reset()
-        super.tearDown()
     }
 
     private func model() -> BridgeReachabilityModel {
