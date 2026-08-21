@@ -13,6 +13,45 @@ Every commit that changes a component **must** bump that component's version and
 add an entry here — enforced by `scripts/version-guard.sh` (the pre-push hook and
 CI both run it). See the "Versioning" section of `bridge/README.md`.
 
+## [bridge 0.86.1] - 2026-08-21
+
+### Fixed
+
+- **`test_bridge` reported a red suite on a green tree.** The build sandbox denied every
+  socket, and the bridge's own integration suite stands up mock HTTP helpers on
+  `127.0.0.1:0` — so five vision tests failed with `PermissionDenied` on a checkout that is
+  green everywhere else. A verdict tool that always says FAILED is worse than no tool: it
+  trains its reader to ignore it. Caught by running the tool against the real vault checkout
+  after deploy; 0.86.0 had only ever verified the *lib* suite under the sandbox, never the
+  *integration* suite.
+
+  Sockets are now granted **per operation**. A compile still gets none — nothing about
+  compiling needs one, and `--offline --locked` means it could not use one. A test run gets
+  `network-bind`, `network-inbound` and `network-outbound`, all scoped to `localhost`.
+
+  Two measured facts are recorded in `SECURITY.md` and in the code, because both read the
+  opposite way from how they behave:
+
+  - **`localhost` in a sandbox filter means any address belonging to this host, not
+    `127.0.0.1`** — a connection to this machine's tailnet address succeeded under a
+    `localhost`-scoped rule. What the grant really buys is *no exfiltration off-box*
+    (`1.1.1.1:443` is refused under both postures), not "loopback only".
+  - **`(allow network* (local ip "localhost:*") (remote ip "localhost:*"))` reached the open
+    internet** when probed, while the three individual verbs carrying the same filters did
+    not. The obvious one-line "simplification" of this rule set is wide open.
+
+  All three verbs are required: with `bind` and `outbound` alone, `bind()` still fails with
+  `EPERM` — `network-inbound` is what `accept()` needs.
+
+  A second widening was needed for the same reason and is recorded the same way: a test run
+  also gets the shared `/private/tmp`, because the write-lock tests hardcode
+  `/tmp/jwl-<pid>-<nanos>` (a unix socket `sun_path` is capped at ~104 bytes and the per-user
+  Darwin temp dir exceeds that on its own) and never consult `TMPDIR`. A compile gets neither
+  widening.
+
+  `bridge/tests/buildsvc_sandbox.rs` now pins all of it live: a compile can open no socket, a
+  test run can bind and accept on loopback, and a test run still cannot reach off-box.
+
 ## [bridge 0.86.0] - 2026-08-21
 
 ### Added

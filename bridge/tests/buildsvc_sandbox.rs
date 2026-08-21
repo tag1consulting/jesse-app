@@ -27,7 +27,7 @@ use std::process::Command;
 /// reason must not read as containment.
 fn touch_under_sandbox(target: &Path) -> bool {
     let _ = std::fs::remove_file(target);
-    let profile = build_sandbox_profile(Path::new(BUILD_SCRATCH_ROOT), &[]);
+    let profile = build_sandbox_profile(Path::new(BUILD_SCRATCH_ROOT), &[], false, false);
     let status = Command::new("/usr/bin/sandbox-exec")
         .arg("-p")
         .arg(&profile)
@@ -101,14 +101,23 @@ fn a_build_cannot_write_into_the_checkout_it_compiles() {
     );
 }
 
-/// Network is denied, and it is checked by ATTEMPTING one rather than by reading the profile.
-///
-/// `(deny default)` is what denies it, so this also fails if someone reorders the profile so
-/// that a later blanket allow lands underneath. A build with network is a build that can
-/// exfiltrate everything `file-read*` lets it read.
+/// The shared-`/tmp` widening belongs to the TEST posture only. A compile must keep the
+/// tighter boundary — if this ever passes, the two postures have been collapsed into one.
 #[test]
-fn a_build_cannot_reach_the_network() {
-    let profile = build_sandbox_profile(Path::new(BUILD_SCRATCH_ROOT), &[]);
+fn a_compile_still_cannot_write_to_shared_tmp() {
+    // `touch_under_sandbox` builds the COMPILE profile, so this is the tight posture.
+    assert!(
+        !touch_under_sandbox(&PathBuf::from("/tmp/jesse-compile-tmp-escape")),
+        "the compile posture gained the test posture's /tmp grant"
+    );
+}
+
+/// A COMPILE gets no socket at all, checked by ATTEMPTING one rather than by reading the
+/// profile. `(deny default)` is what denies it, so this also fails if someone reorders the
+/// profile so a later blanket allow lands underneath.
+#[test]
+fn a_compile_cannot_open_any_socket() {
+    let profile = build_sandbox_profile(Path::new(BUILD_SCRATCH_ROOT), &[], false, false);
     // `nc -z` needs no DNS and no payload; loopback is enough to prove the class is denied,
     // and it cannot be confused with a network being merely unreachable.
     let out = Command::new("/usr/bin/sandbox-exec")
@@ -120,6 +129,53 @@ fn a_build_cannot_reach_the_network() {
         .expect("run nc under the sandbox");
     assert!(
         !out.status.success(),
-        "a socket was opened under the build profile — network is not denied"
+        "a socket was opened under the compile profile — network is not denied"
+    );
+}
+
+/// A TEST RUN can bind and accept on loopback — the property the bridge's own integration
+/// suite needs, and whose absence made `test_bridge` report a red suite on a green tree.
+///
+/// The probe is a ONE-LINER on purpose: a `-c` program with indented blocks has to survive
+/// Rust string escaping, and getting that wrong fails the test for a reason that has nothing
+/// to do with the sandbox.
+#[test]
+fn a_test_run_can_bind_and_accept_on_loopback() {
+    let profile = build_sandbox_profile(Path::new(BUILD_SCRATCH_ROOT), &[], true, true);
+    let out = Command::new("/usr/bin/sandbox-exec")
+        .arg("-p")
+        .arg(&profile)
+        .arg("/usr/bin/python3")
+        .arg("-c")
+        .arg(
+            "import socket; s=socket.socket(); s.bind(('127.0.0.1',0)); s.listen(1); \
+             c=socket.socket(); c.settimeout(2); c.connect(s.getsockname()); s.accept(); \
+             print('ok')",
+        )
+        .output()
+        .expect("run python under the sandbox");
+    assert!(
+        out.status.success(),
+        "a test run could not stand up a loopback mock server: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// …and STILL cannot leave the machine. This is the half of the socket grant that matters:
+/// "local" reaches every address this host owns, but nothing beyond it, so a hostile test
+/// cannot exfiltrate what `file-read*` let it read.
+#[test]
+fn a_test_run_still_cannot_reach_off_box() {
+    let profile = build_sandbox_profile(Path::new(BUILD_SCRATCH_ROOT), &[], true, true);
+    let out = Command::new("/usr/bin/sandbox-exec")
+        .arg("-p")
+        .arg(&profile)
+        .arg("/usr/bin/nc")
+        .args(["-z", "-w", "3", "1.1.1.1", "443"])
+        .output()
+        .expect("run nc under the sandbox");
+    assert!(
+        !out.status.success(),
+        "a test run reached the open internet — the socket grant is not host-scoped"
     );
 }
