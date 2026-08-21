@@ -159,6 +159,51 @@ final class MorningRoutineTests: XCTestCase {
                        "the opt-in body is its own string, not that constant plus a suffix")
     }
 
+    // MARK: - The owner, and the exact bytes
+
+    /// The greeting is written in the FIRST PERSON — "give me the briefing", "I cannot
+    /// log today's food" — so it names nobody, and it needed no persona placeholder
+    /// when the Today prompts got theirs. This pins that: a reword that reintroduces a
+    /// name (or reaches for a `{...}` token the app cannot render) breaks here.
+    func testTheGreetingNamesNobody() {
+        for prompt in [MorningRoutine.prompt(now: instant, calendar: calendar("Europe/Rome")),
+                       optIn()] {
+            XCTAssertFalse(prompt.contains("Jeremy"))
+            XCTAssertFalse(prompt.contains("{"), "no placeholder is needed, so none is spelled")
+        }
+    }
+
+    /// THE GOLDEN PIN. Both bodies, whole, byte for byte. The keyword classifier reads
+    /// this text, the vault's routing reads this text, and four separate properties of
+    /// the wording are load-bearing — so it is pinned as a whole string rather than as
+    /// a list of `contains` that a reword could satisfy while changing the meaning.
+    func testBothGreetingsAreExactlyThis() {
+        XCTAssertEqual(
+            MorningRoutine.prompt(now: instant, calendar: calendar("Europe/Rome")),
+            """
+            Good morning. It is Monday, August 10, 2026. Run the full start of day routine now: \
+            the scanners, the inbox, the calendar, the currency check, whatever else today's day \
+            of the week calls for, then rebuild Today.md and give me the briefing at the end. If \
+            start of day already ran today, give me the delta rather than a full rerun. Do not run \
+            the health and diet new day refresh: the Health tab button owns that one and it may \
+            already have run.
+            """)
+
+        XCTAssertEqual(optIn(), """
+            Good morning. It is Monday, August 10, 2026. Two things, in this order. FIRST, the \
+            health and diet new day refresh, finished completely before anything else starts: \
+            audit yesterday's diet logging and fix any errors, write yesterday's diet journal, \
+            roll the diet dashboard over to today, log this morning's weigh-in from my health \
+            data, then regenerate the fancy dashboard. The moment that part is done, send one \
+            short line beginning STILL RUNNING: saying so, before you go on, because I cannot log \
+            today's food or exercise until it has landed and I do not want to wait out the rest \
+            of the turn. SECOND, the full start of day routine: the scanners, the inbox, the \
+            calendar, the currency check, whatever else today's day of the week calls for, then \
+            rebuild Today.md and give me the briefing at the end. If start of day already ran \
+            today, give me the delta rather than a full rerun.
+            """)
+    }
+
     // MARK: - The confirmation copy
 
     /// The stamp only ever changes the message. The routine may have run from the other

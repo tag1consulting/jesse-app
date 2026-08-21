@@ -23,6 +23,10 @@ pub struct JesseRequest {
     // When present and non-empty, `build_prompt` uses it in place of the built-in
     // Ask/Tell const (the `mode` above selects which); VOICE_SUFFIX/PHONE_FORMAT
     // are still appended. Absent/empty reproduces today's behavior exactly.
+    // Persona-rendered like every other piece of prompt text, so an override may
+    // spell `{Owner}` / `{owner_pronoun}` too; one that carries no placeholder — which
+    // is every override the app's Settings produces, since `/jesse/prompts` hands it
+    // an ALREADY-rendered default to edit — is passed through unchanged.
     #[serde(default)]
     instructions: Option<String>,
     // Optional per-request override of the active mode's *safety floor* wording.
@@ -41,7 +45,8 @@ pub struct JesseRequest {
     // exactly (backward compatible — old app builds simply omit it). When present
     // it is capped (`MAX_HEALTH_CONTEXT_BYTES` → 413), control-stripped, and framed
     // as untrusted DEVICE DATA after the clock line by `build_prompt`. Same trust
-    // class as `text`: attacker-controlled only if the phone is.
+    // class as `text`: attacker-controlled only if the phone is. Unlike `text` it is
+    // NOT persona-rendered — it is data the turn quotes, not text the turn speaks.
     #[serde(default)]
     health_context: Option<String>,
     // This turn is a retry answering a prior `JESSE_NEEDS_HEALTH` directive: the

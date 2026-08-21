@@ -12,6 +12,12 @@ import XCTest
 //     sitting anywhere in the positive half of the instruction would read as a
 //     REQUEST to run start-of-day: a discussion about one line would rebuild the
 //     entire day file underneath the screen the user is looking at.
+//  3. The owner is a PLACEHOLDER, never a name. `{Owner}` / `{owner_pronoun}` are
+//     rendered by the bridge from `jesse.local.toml`, so a fresh clone belongs to
+//     whoever installed it. The bridge side of that contract — that the rendered
+//     bytes are unchanged for the owner this repo was written for, and that a
+//     brace-bearing name is not re-expanded — is pinned in `bridge/src/prompt.rs`
+//     and `bridge/src/persona.rs`; this file pins the templates those tests render.
 
 final class TodayPromptsTests: XCTestCase {
 
@@ -37,7 +43,7 @@ final class TodayPromptsTests: XCTestCase {
 
     func testDiscussOpensByNamingWhatItIs() {
         XCTAssertTrue(TodayDiscuss.prompt(item: item)
-            .hasPrefix("Jeremy wants to discuss this Today.md item:"))
+            .hasPrefix("{Owner} wants to discuss this Today.md item:"))
     }
 
     func testDiscussScopesItselfToTheOneItem() {
@@ -81,7 +87,7 @@ final class TodayPromptsTests: XCTestCase {
         XCTAssertTrue(prompt.contains(item))
         XCTAssertTrue(prompt.contains(#"Evidence he gave: "ordered two, TC-4417"."#))
         XCTAssertTrue(prompt
-            .hasPrefix("Jeremy completed this Today.md item in the Jesse App and wants it propagated now:"))
+            .hasPrefix("{Owner} completed this Today.md item in the Jesse App and wants it propagated now:"))
     }
 
     /// Absent evidence becomes the literal word, so the sentence reads the same either
@@ -247,5 +253,77 @@ final class TodayPromptsTests: XCTestCase {
         let composed = TodayThreadContext.firstMessage(context: "CONTEXT", typed: "  ask me\n\n")
         XCTAssertTrue(composed.hasSuffix("ask me"))
         XCTAssertFalse(composed.contains("  ask me"))
+    }
+
+    // MARK: - The owner is data, not a literal
+
+    /// The three placeholders the bridge's persona layer knows, and the only three
+    /// these prompts may spell. A fourth would be rendered by nothing and would reach
+    /// the agent as a literal `{...}`.
+    private static let knownPlaceholders = ["{Owner}", "{owner}", "{owner_pronoun}"]
+
+    /// Every agent-facing string this file produces, for the sweeps below.
+    private var everyPrompt: [String] {
+        [TodayDiscuss.prompt(item: item),
+         TodayPropagate.prompt(item: item, evidence: "shipped it"),
+         TodayPropagate.prompt(item: item, evidence: nil),
+         TodayProcessUpdates.prompt(items: [item]),
+         TodayThreadContext.messageLabel,
+         TodayThreadContext.firstMessage(context: TodayDiscuss.prompt(item: item),
+                                         typed: "is this still worth doing?")]
+    }
+
+    /// THE DEFECT THIS GUARDS. A hardcoded first name in prompt text means a second
+    /// person installing from a fresh clone gets an agent told that somebody else
+    /// wants the work done. The name is deployment data on the bridge host; nothing
+    /// the app sends may name a person.
+    func testNoPromptNamesAPersonLiterally() {
+        for prompt in everyPrompt {
+            XCTAssertFalse(prompt.contains("Jeremy"),
+                           "an owner's name must never be a literal in prompt text")
+        }
+    }
+
+    /// Every brace sequence in these prompts is one the bridge actually renders. A
+    /// typo (`{owner_name}`, `{OWNER}`) would survive substitution and be read by the
+    /// agent as literal punctuation.
+    func testEveryPlaceholderIsOneTheBridgeRenders() {
+        for prompt in everyPrompt {
+            var rest = Substring(prompt)
+            while let open = rest.firstIndex(of: "{") {
+                let candidate = rest[open...]
+                let known = Self.knownPlaceholders.first { candidate.hasPrefix($0) }
+                XCTAssertNotNil(known, "unknown placeholder at: \(candidate.prefix(24))")
+                rest = candidate.dropFirst(known?.count ?? 1)
+            }
+        }
+    }
+
+    /// The typed half of a discussion is filed under the owner's name in its
+    /// possessive form, and that is one word — not "{Owner} 's".
+    func testTheMessageLabelIsTheOwnersPossessive() {
+        XCTAssertEqual(TodayThreadContext.messageLabel, "{Owner}'s message:")
+        XCTAssertTrue(TodayThreadContext
+            .firstMessage(context: "CONTEXT", typed: "ask me")
+            .contains("\n\n{Owner}'s message:\n\n"))
+    }
+
+    /// THE GOLDEN PIN. The discuss prompt, whole, byte for byte. Parameterizing the
+    /// owner changed WHO the sentence names and nothing else, and the bridge test
+    /// `a_configured_owner_reproduces_the_previous_prompt_byte_for_byte` renders this
+    /// exact template back to the text that shipped before. A reword that reaches here
+    /// has to be deliberate enough to update both.
+    func testTheDiscussPromptIsExactlyThis() {
+        let short = "* [ ] **Order the replacement thermocouple.** (Added 2026-03-01)"
+        XCTAssertEqual(TodayDiscuss.prompt(item: short), """
+        {Owner} wants to discuss this Today.md item:
+
+        \(short)
+
+        Read the files it links first, then engage with {owner_pronoun} questions and clarifications. \
+        If the discussion changes the item (its priority, its scope, or whether it is done), update \
+        Today.md and the item's Dashboard or project home to match. Scope: this one item only. Do not \
+        run start of day, scanners, currency, or cheatsheets, and do not rebuild Today.md.
+        """)
     }
 }

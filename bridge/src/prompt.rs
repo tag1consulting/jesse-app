@@ -15,7 +15,8 @@ use crate::*;
 // variant inside their own wrapper.
 //
 // `{owner}` / `{owner_pronoun}` are persona placeholders rendered at prompt-build
-// time (see [`Persona::render`]); with the generic default persona this reads
+// time (see [`Persona::render`], applied to the floor, the wrapper and the app's own
+// prompt body alike); with the generic default persona this reads
 // "…the user didn't ask for…never needs their permission." The floor is
 // non-overridable in the sense that it is ALWAYS prepended and cannot be dropped —
 // its wording is personalized (owner label/pronoun) but not the app's to remove.
@@ -313,6 +314,10 @@ pub const REVIEW_CAPABILITY_MARKER: &str = "\n\n(Capability: you are running on 
 /// [`TELL_PREAMBLE`], [`ASK_FOLLOWUP`], [`TELL_FOLLOWUP`]). The user's text begins
 /// immediately after whichever one leads it. The `{Owner}` placeholder only appears
 /// BEFORE these tails, so the tails are persona-independent and match any owner.
+///
+/// This still holds now that the BODY is persona-rendered too: rendering happens
+/// during assembly, so a wrapped prompt contains substituted names, never placeholders,
+/// and these delimiters are unaffected by what the owner is called.
 const PREAMBLE_DELIMITERS: [&str; 4] = [
     "\n\nQuestion: ",                             // ASK_PREAMBLE tail (fresh)
     "\n\nMessage: ",                              // TELL_PREAMBLE tail (fresh)
@@ -581,6 +586,11 @@ pub(crate) fn civil_from_days(days: i64) -> (i64, u32, u32) {
 /// unambiguous even if `claude` injects its own lesser date. This is a thin
 /// wrapper over the pure [`build_prompt_at`] that reads the clock; tests use
 /// `build_prompt_at` for a deterministic clock.
+///
+/// Every piece of prompt text — the floor, the wrapper, and `text` itself — is
+/// rendered through `persona` exactly once during assembly, so app-authored prompt
+/// bodies can carry `{Owner}` / `{owner}` / `{owner_pronoun}` and never have to know
+/// the owner's name. See [`build_prompt_at`].
 #[allow(clippy::too_many_arguments)]
 pub fn build_prompt(
     mode: &str,
@@ -673,7 +683,8 @@ pub fn splice_catchup(
 /// or blank reproduces the const-only output byte-for-byte; oversized is a hard
 /// `413` (see [`frame_health_context`]); otherwise it is control-stripped and
 /// framed as untrusted DEVICE DATA, inserted right AFTER the clock header and
-/// ahead of the floor.
+/// ahead of the floor. It is DATA, so — unlike the floor, the wrapper and `text` —
+/// it is never persona-rendered.
 #[allow(clippy::too_many_arguments)]
 pub fn build_prompt_at(
     clock: &str,
@@ -692,7 +703,9 @@ pub fn build_prompt_at(
     // off): tell the agent to answer from vault data and not re-request.
     health_context_unavailable: bool,
     // The resolved personalization. Its `owner_name`/`owner_pronoun` are rendered
-    // into the built-in default wrapper/floor (never into an app override).
+    // into every piece of prompt TEXT this function assembles — the floor, the wrapper
+    // (built-in or app-supplied) and the user's own body — and into none of the DATA
+    // blocks (health, catch-up).
     persona: &Persona,
 ) -> Result<String, ApiError> {
     // Validate the mode and pick both the built-in wrapper and the default floor —
@@ -709,21 +722,40 @@ pub fn build_prompt_at(
             ))
         }
     };
-    // An app-supplied override is used VERBATIM (it is the app's own text, already
-    // personalized there); only the built-in default has its `{owner}` placeholders
-    // rendered from the persona. So a fresh clone reads "The user is ASKING…" and a
-    // local `jesse.local.toml` restores the owner's name, all without editing source.
-    let preamble = match instructions {
-        Some(s) if !s.trim().is_empty() => s.to_string(),
-        _ => persona.render(default_preamble),
+    // ---- Persona rendering: ONE pass, over every piece of PROMPT TEXT, here ----
+    //
+    // The bridge's own wrappers are not the only text that talks about the owner. The
+    // app authors prompt bodies too ("{Owner} wants to discuss this Today.md item:"),
+    // and it has no business knowing whose deployment it is talking to — the name is
+    // host data (`jesse.local.toml` / `JESSE_OWNER_NAME`), which is exactly why those
+    // strings ship as placeholders. So the body is rendered through the SAME persona,
+    // in the same breath as the wrapper that frames it: the two cannot name different
+    // people, because there is one substitution and one place it happens.
+    //
+    // WHAT IS RENDERED: the mode floor, the mode wrapper (built-in const or app
+    // override — an override is prompt text like any other, and one that carries no
+    // placeholder is returned unchanged), and the user's text.
+    //
+    // WHAT IS NOT: the health block and any spliced catch-up block. Those are DATA,
+    // framed as untrusted, and substituting into them would be an injection surface
+    // rather than a personalization. `Persona::render` is single-pass, so nothing here
+    // is scanned twice and a rendered value cannot be re-expanded — see its doc.
+    let preamble_template = match instructions {
+        Some(s) if !s.trim().is_empty() => s,
+        _ => default_preamble,
     };
+    let preamble = persona.render(preamble_template);
     // The floor still LEADS every turn. An override changes only its wording;
-    // blank/absent falls back to the built-in const (persona-rendered), so there is
-    // never a turn with no floor at all.
-    let floor = match floor_override {
-        Some(s) if !s.trim().is_empty() => s.to_string(),
-        _ => persona.render(default_floor),
+    // blank/absent falls back to the built-in const, so there is never a turn with no
+    // floor at all.
+    let floor_template = match floor_override {
+        Some(s) if !s.trim().is_empty() => s,
+        _ => default_floor,
     };
+    let floor = persona.render(floor_template);
+    // The app-authored body plus whatever the user typed. Rendered once, here, so an
+    // assembled prompt holds no unrendered placeholder anywhere in it.
+    let text = persona.render(text);
     // Validate + frame the optional recent-workouts block. Oversized is a hard
     // 413 here (ahead of the concurrency permit in the handler); absent/blank
     // yields None so the const-only path stays byte-for-byte identical.
@@ -888,6 +920,207 @@ mod tests {
         // The generic labels are gone once a name is configured.
         assert!(!p.contains("the user"));
         assert!(!p.contains("{owner"));
+    }
+
+    // ---- Persona rendering of the INBOUND prompt body ----------------------
+    //
+    // The app authors prompt text of its own (the Today tab's Discuss / Propagate /
+    // Process-updates turns, JesseKit `Sources/JesseCore/TodayPrompts.swift`) and must
+    // not hardcode whose deployment it is talking to. Those strings ship carrying the
+    // same placeholders the wrappers use, and `build_prompt_at` renders them in the
+    // same breath as the wrapper — so the frame and the body cannot name two different
+    // people, and a fresh clone with no `jesse.local.toml` reads generically.
+
+    // A named owner, as a `jesse.local.toml` would supply one.
+    fn named(name: &str, pronoun: &str) -> Persona {
+        Persona {
+            owner_name: name.into(),
+            owner_pronoun: pronoun.into(),
+            languages: vec!["en".into()],
+            diet_keywords_extra: vec![],
+        }
+    }
+
+    // A fresh Ask carrying `text`, built with `persona` and the fixed test clock.
+    fn bp_persona(text: &str, persona: &Persona) -> String {
+        build_prompt_at(
+            TEST_CLOCK, "ask", text, false, false, None, None, None, false, false, persona,
+        )
+        .unwrap()
+    }
+
+    // The Today tab's discuss prompt as JesseCore now ships it, and the text it used to
+    // ship — the literal that was in the Swift source before it was parameterized. The
+    // second is the regression target: for the owner this repo was written for, the
+    // rendered turn must be the SAME BYTES it was.
+    const DISCUSS_ITEM: &str = "* [ ] **Order the replacement thermocouple.** (Added 2026-03-01)";
+    fn discuss_template() -> String {
+        format!(
+            "{{Owner}} wants to discuss this Today.md item:\n\n{DISCUSS_ITEM}\n\nRead the \
+files it links first, then engage with {{owner_pronoun}} questions and clarifications. If \
+the discussion changes the item (its priority, its scope, or whether it is done), update \
+Today.md and the item's Dashboard or project home to match. Scope: this one item only. Do \
+not run start of day, scanners, currency, or cheatsheets, and do not rebuild Today.md."
+        )
+    }
+    fn discuss_as_it_read_before() -> String {
+        format!(
+            "Jeremy wants to discuss this Today.md item:\n\n{DISCUSS_ITEM}\n\nRead the \
+files it links first, then engage with his questions and clarifications. If the discussion \
+changes the item (its priority, its scope, or whether it is done), update Today.md and the \
+item's Dashboard or project home to match. Scope: this one item only. Do not run start of \
+day, scanners, currency, or cheatsheets, and do not rebuild Today.md."
+        )
+    }
+
+    /// THE BEHAVIOR-PRESERVATION PIN. With the owner configured as the person this
+    /// repo was written for, the app's parameterized discuss prompt renders to exactly
+    /// the bytes the hardcoded string produced. Not a `contains` — the whole body.
+    #[test]
+    fn a_configured_owner_reproduces_the_previous_prompt_byte_for_byte() {
+        let p = bp_persona(&discuss_template(), &named("Jeremy", "his"));
+        let before = discuss_as_it_read_before();
+        let start = p
+            .find(&before)
+            .unwrap_or_else(|| panic!("the rendered body is not present verbatim in:\n{p}"));
+        // And it sits exactly where the user's text goes: right after the wrapper's
+        // delimiter, and immediately before the always-appended capability note.
+        assert!(p[..start].ends_with("\n\nQuestion: "));
+        assert!(p[start + before.len()..].starts_with(REVIEW_CAPABILITY));
+    }
+
+    /// A fresh clone — no `jesse.local.toml`, no `JESSE_OWNER_*` — degrades to the
+    /// generic label the persona layer documents. Not an empty string, and above all
+    /// not somebody else's name.
+    #[test]
+    fn a_fresh_clone_renders_the_app_body_generically() {
+        let p = bp_persona(&discuss_template(), &Persona::default());
+        assert!(p.contains("The user wants to discuss this Today.md item:"));
+        assert!(p.contains("engage with their questions and clarifications"));
+        assert!(!p.contains("Jeremy"));
+        assert!(
+            !p.contains("{owner"),
+            "no placeholder survives into the turn"
+        );
+        assert!(!p.contains("{Owner"));
+    }
+
+    /// The body and the wrapper are rendered from the same persona at the same point,
+    /// so they cannot disagree about who the owner is.
+    #[test]
+    fn the_wrapper_and_the_body_name_the_same_owner() {
+        let persona = named("Alex Example", "her");
+        let p = bp_persona(&discuss_template(), &persona);
+        assert!(p.contains("Alex Example is ASKING you a question from her phone"));
+        assert!(p.contains("Alex Example wants to discuss this Today.md item:"));
+        assert!(p.contains("engage with her questions and clarifications"));
+        assert_eq!(
+            p.matches("Alex Example").count(),
+            3,
+            "floor, wrapper and body — every mention rendered, none left as a token"
+        );
+        assert!(!p.contains("{owner"));
+        assert!(!p.contains("{Owner"));
+    }
+
+    /// The typed half of a Today discussion travels under a label the app also
+    /// parameterized (`TodayThreadContext.messageLabel`), and the possessive form
+    /// renders as one word, not "Alex Example 's".
+    #[test]
+    fn the_message_label_renders_in_its_possessive_form() {
+        let body = "context\n\n{Owner}'s message:\n\nis this still worth doing?";
+        assert!(bp_persona(body, &named("Jeremy", "his")).contains("Jeremy's message:"));
+        assert!(bp_persona(body, &Persona::default()).contains("The user's message:"));
+    }
+
+    /// ORDERING. The body is rendered ONCE, and a substituted value is never scanned
+    /// again — so an owner name that is itself a brace sequence reaches the agent as
+    /// written instead of being expanded into a different persona field. (The unit of
+    /// this rule lives on `Persona::render`; this pins it through the real assembly
+    /// path, which is where a second pass would be introduced by accident.)
+    #[test]
+    fn an_owner_name_containing_a_placeholder_is_not_re_expanded_in_the_body() {
+        let persona = named("{owner_pronoun}", "her");
+        let p = bp_persona(
+            "{Owner} wants this. Ask {owner} on {owner_pronoun} phone.",
+            &persona,
+        );
+        assert!(p.contains("{owner_pronoun} wants this. Ask {owner_pronoun} on her phone."));
+        // If the body were rendered twice, both names would have become "her".
+        assert!(!p.contains("her wants this"));
+    }
+
+    /// Braces in the user's own text are prose, not syntax: an item's markdown, a
+    /// pasted snippet, a JSON blob. They survive the render untouched.
+    #[test]
+    fn braces_in_the_users_text_are_left_alone() {
+        let body = "why does `fn f() { g(); }` fail, and what is {this} for?";
+        let p = bp_persona(body, &named("Jeremy", "his"));
+        assert!(p.contains(body));
+    }
+
+    /// An app-supplied WRAPPER override is prompt text too, so it renders from the
+    /// same persona — and one with no placeholder in it (which is every override the
+    /// Settings screen produces, since `/jesse/prompts` hands it an already-rendered
+    /// default to edit) is passed through byte for byte, exactly as before.
+    #[test]
+    fn an_override_is_rendered_and_a_placeholder_free_one_is_unchanged() {
+        let persona = named("Alex Example", "her");
+        let rendered = build_prompt_at(
+            TEST_CLOCK,
+            "ask",
+            "the question",
+            false,
+            false,
+            Some("{Owner} asks from {owner_pronoun} phone. Question: "),
+            Some("Do nothing {owner} did not ask for."),
+            None,
+            false,
+            false,
+            &persona,
+        )
+        .unwrap();
+        assert!(rendered.contains("Alex Example asks from her phone. Question: "));
+        assert!(rendered.contains("Do nothing Alex Example did not ask for."));
+
+        let literal = "Custom ask wrapper, no tokens. Question: ";
+        let plain = build_prompt_at(
+            TEST_CLOCK,
+            "ask",
+            "the question",
+            false,
+            false,
+            Some(literal),
+            None,
+            None,
+            false,
+            false,
+            &persona,
+        )
+        .unwrap();
+        assert!(plain.contains(literal));
+    }
+
+    /// The DATA blocks are not prompt text and are never substituted into. A phone
+    /// that attaches a health block containing a placeholder gets it back verbatim —
+    /// personalizing quoted device data would be an injection surface, not a feature.
+    #[test]
+    fn the_health_data_block_is_not_persona_rendered() {
+        let p = build_prompt_at(
+            TEST_CLOCK,
+            "ask",
+            "how did I do?",
+            false,
+            false,
+            None,
+            None,
+            Some("Swim 1200m — logged by {owner}"),
+            false,
+            false,
+            &named("Jeremy", "his"),
+        )
+        .unwrap();
+        assert!(p.contains("Swim 1200m — logged by {owner}"));
     }
 
     #[test]
