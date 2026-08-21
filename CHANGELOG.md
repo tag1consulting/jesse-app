@@ -13,6 +13,42 @@ Every commit that changes a component **must** bump that component's version and
 add an entry here — enforced by `scripts/version-guard.sh` (the pre-push hook and
 CI both run it). See the "Versioning" section of `bridge/README.md`.
 
+## [bridge 0.89.0] - 2026-08-21
+
+### Changed
+
+- **The `bin/vault-links` grant moved from the vault's `.claude/settings.json` into the
+  recorded allowlist, and the battery was re-run to cover it.** The startup gate had been
+  shouting about it at every boot since 2026-08-19:
+
+  > WARNING — 3 permission entr(ies) in .../.claude/settings.json are granted to every turn
+  > but are NOT in the containment record and NOT checked by the startup gate.
+
+  That warning is the whole point of `settings_permission_drift`, and it was right. The
+  vault's project settings are loaded by every child (`--setting-sources user,project`),
+  so a `permissions.allow` entry there is a live grant the record cannot see. It is also
+  not a grant anyone can drop: CLAUDE.md makes the link-graph expansion mandatory after a
+  QMD hit, so a child without `bin/vault-links` cannot follow its own instructions.
+
+  **Both halves were needed.** `settings_permission_drift` reports every entry it finds
+  and does NOT cross-check the record, so adding the grant to `DEFAULT_ALLOWED_TOOLS`
+  alone would have left the warning in place. The vault entries are removed in the same
+  change; they now live in `.claude/settings.local.json`, which is gitignored, is for
+  machine-local convenience, and is out of a bridge child's reach by construction.
+
+  **Two spellings, not three.** `Bash(bin/vault-links:*)` and its `./` form are recorded.
+  The vault also carried `Bash(~/jesse/bin/vault-links:*)`; that one is deliberately not
+  reproduced, because the record is compared by strict equality on every host and a
+  shipped const must not name one operator's home directory. A test now pins that.
+
+  **Its write-then-execute story is worse than its neighbours', and the note says so.**
+  `bin/vault-links` is a tracked symlink to `tools/vault-links/target/release/vault-links`,
+  and `/tools/vault-links/target/` is gitignored: the source is version-controlled and the
+  artifact that actually runs is not. The mitigation the existing pinned-script note leans
+  on — that a tampered script shows up in `git status` — does not hold for this one. The
+  path is unchanged in kind, since the child already holds a write grant over the same
+  tree, but it is weaker in evidence and is not folded silently into that note.
+
 ## [bridge 0.88.0] - 2026-08-21
 
 ### Changed
