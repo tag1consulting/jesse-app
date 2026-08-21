@@ -254,16 +254,50 @@ denied unless named.
 - the two per-user Darwin scratch directories (`confstr` `_CS_DARWIN_USER_TEMP_DIR` and
   `_CS_DARWIN_USER_CACHE_DIR`).
 - `/dev/null`, `/dev/tty`, `/dev/dtracehelper`.
+- **a test run only:** the shared `/private/tmp`. The write-lock tests build a unix domain
+  socket path, `sun_path` is capped at ~104 bytes, and the per-user Darwin temp directory is
+  long enough to blow through that by itself — so those tests hardcode `/tmp/jwl-<pid>-<nanos>`
+  on purpose, and `TMPDIR` does not redirect them because they never read it. This is the
+  looser of the two postures and is named plainly rather than folded into the list above: a
+  test run can drop files anywhere other processes on this machine also use `/tmp`.
 
 **What a build CANNOT do:**
 
 - write to the vault, the checkout it is compiling, the bridge's state directory, or anywhere
   in the home directory. Verified live, not assumed: `touch` into `/tmp`, into `$HOME`, and
   into the checkout each returned `Operation not permitted` and left no file.
-- **reach the network at all.** There is no `network*` allowance anywhere in the profile, so
-  a build can neither fetch a dependency nor phone home.
+- **leave the machine.** A connection to `1.1.1.1:443` is refused with `EPERM` under both
+  postures, so a build can neither fetch a dependency nor exfiltrate what it read.
 
-Three details in that profile are load-bearing and each cost a debugging cycle to find:
+**The two postures differ, and the compile one is the tight one.** A compile writes only to
+its scratch root and the Darwin directories, and opens no socket. A test run additionally gets
+the shared `/private/tmp` and host-scoped sockets. Both are pinned by
+`bridge/tests/buildsvc_sandbox.rs`, including an assertion that the compile posture has *not*
+picked up either widening.
+
+**Sockets are granted PER OPERATION, and the difference is deliberate.** A compile gets no
+socket of any kind. A test run gets three rules — `network-bind`, `network-inbound` and
+`network-outbound`, all scoped to `localhost` — because the bridge's own integration suite
+stands up mock HTTP helpers on `127.0.0.1:0` and five vision tests fail with `PermissionDenied`
+without them. That is not a cosmetic failure: it made `test_bridge` report a RED suite on a
+tree that is green everywhere else, which is worse than useless.
+
+Two measured facts about that grant, both of which read wrong from the documentation:
+
+- **`localhost` in a sandbox filter does NOT mean `127.0.0.1`. It means any address belonging
+  to this host** — a connection to this machine's *tailnet* address succeeded under a
+  `localhost`-scoped rule. So a test run can reach services listening on this box on any of
+  its interfaces. It still cannot leave the machine, and that — **no exfiltration off-box** —
+  is the boundary being claimed, rather than the "loopback only" it superficially resembles.
+- **`(allow network* (local ip "localhost:*") (remote ip "localhost:*"))` REACHED THE OPEN
+  INTERNET** when probed, while the three individual verbs carrying the same filters did not.
+  The wildcard form looks tighter and is wide open. It is called out here because it is the
+  obvious "simplification" of those three lines.
+
+All three rules are required: with `bind` and `outbound` alone, `bind()` on `127.0.0.1` still
+fails with `EPERM` — `network-inbound` is what `accept()` needs.
+
+Three further details in that profile are load-bearing and each cost a debugging cycle to find:
 
 - The scratch path is spelled `/private/tmp/...`, not `/tmp/...`. `/tmp` is a symlink and the
   sandbox matches **canonical** paths, so the `/tmp` spelling matches nothing and every write

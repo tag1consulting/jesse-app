@@ -43,9 +43,14 @@ use crate::*;
 // The build runs under a macOS sandbox profile ([`build_sandbox_profile`]) that DENIES ALL
 // FILE WRITES except to the scratch root and the two per-user Darwin scratch directories.
 // The vault, the checkout being built, the bridge's state directory and the whole home
-// directory are read-only to it, verified live (see SECURITY.md). Network is denied outright
-// by `(deny default)` with no `network*` allowance, so a build can neither fetch a dependency
-// nor phone home — which is also why every operation passes `--offline --locked`.
+// directory are read-only to it, verified live (see SECURITY.md).
+//
+// NETWORK IS PER OPERATION, and the distinction is load-bearing. A COMPILE gets no socket at
+// all, which is why every operation also passes `--offline --locked` — it could not reach a
+// registry even if it tried. A TEST RUN gets sockets scoped to THIS HOST, because the
+// integration suite stands up mock HTTP helpers on `127.0.0.1` and cannot run without them.
+// Neither can leave the machine. See [`build_sandbox_profile`] for what "this host" really
+// covers, which is more than `127.0.0.1`.
 //
 // The dedicated non-privileged unix user, which would be the stronger boundary, is NOT what
 // this implements; it needs a local account and a sudoers rule, both of which are root-owned
@@ -200,6 +205,44 @@ impl BuildOp {
         match self {
             BuildOp::BuildBridge => Duration::from_secs(900),
             BuildOp::TestBridge => Duration::from_secs(1_800),
+        }
+    }
+
+    /// Whether this operation needs to open sockets ON THIS MACHINE.
+    ///
+    /// A COMPILE NEVER DOES, and gets no network at all. A TEST RUN does: the bridge's own
+    /// integration suite stands up mock HTTP helpers on `127.0.0.1:0` and talks to them, and
+    /// with sockets denied five vision tests fail with `PermissionDenied` — which made
+    /// `test_bridge` report a RED suite on a tree that is green everywhere else. That is
+    /// worse than useless: a verdict tool that always says FAILED trains its reader to
+    /// ignore it.
+    ///
+    /// Split per operation rather than granted globally so the compile path keeps the
+    /// stronger boundary it can afford. See [`build_sandbox_profile`] for exactly how far
+    /// "local" reaches, which is further than the word suggests.
+    pub fn needs_local_sockets(&self) -> bool {
+        match self {
+            BuildOp::BuildBridge => false,
+            BuildOp::TestBridge => true,
+        }
+    }
+
+    /// Whether this operation needs the SHARED `/private/tmp`, not just its own scratch root.
+    ///
+    /// A COMPILE DOES NOT. A test run does, and for a reason that cannot be configured away:
+    /// the write-lock tests build a unix domain socket path, `sun_path` is capped at ~104
+    /// bytes, and the per-user Darwin temp directory is long enough to blow through that on
+    /// its own. So those tests hardcode `/tmp/jwl-<pid>-<nanos>` deliberately, with a comment
+    /// saying why. `TMPDIR` does not redirect them, because they never consult it.
+    ///
+    /// This is the LOOSER of the two postures and it is worth naming plainly: a test run can
+    /// drop files anywhere under `/private/tmp`, which other processes on this machine also
+    /// use. It is still not the vault, the checkout, the bridge state directory or the home
+    /// directory — those stay denied under both postures.
+    pub fn needs_shared_tmp(&self) -> bool {
+        match self {
+            BuildOp::BuildBridge => false,
+            BuildOp::TestBridge => true,
         }
     }
 }
@@ -419,7 +462,30 @@ fn sb_quote(p: &Path) -> String {
 ///
 /// Writes are denied everywhere except `scratch` and `darwin`. The vault, the checkout, the
 /// bridge state directory and the home directory are all read-only to a build.
-pub fn build_sandbox_profile(scratch: &Path, darwin: &[PathBuf]) -> String {
+///
+/// # `local_sockets` — what "local" actually means here
+///
+/// With it FALSE (a compile) there is no network allowance of any kind and every socket
+/// operation fails. With it TRUE (a test run) three rules are added, scoped to `localhost`.
+///
+/// **`localhost` in a sandbox filter does NOT mean `127.0.0.1`. It means any address
+/// belonging to THIS HOST** — measured, not assumed: under a `localhost`-scoped outbound rule
+/// a connection to this machine's tailnet address succeeded. So a test run can reach services
+/// listening on this box, on any of its own interfaces. What it still cannot do is leave the
+/// machine: a connection to `1.1.1.1:443` is refused with EPERM. That is the boundary this
+/// buys — **no exfiltration off-box** — and it is stated in those terms rather than as
+/// "loopback only", which would be false.
+///
+/// **Do not "simplify" these three rules into `(allow network* (local ip "localhost:*")
+/// (remote ip "localhost:*"))`.** That spelling was probed alongside them and it REACHED THE
+/// INTERNET — the wildcard verb does not carry the filters the way the individual verbs do.
+/// It looks tighter, reads tighter, and is wide open.
+pub fn build_sandbox_profile(
+    scratch: &Path,
+    darwin: &[PathBuf],
+    local_sockets: bool,
+    shared_tmp: bool,
+) -> String {
     let mut p = String::new();
     p.push_str("(version 1)\n");
     p.push_str("(deny default)\n");
@@ -431,6 +497,9 @@ pub fn build_sandbox_profile(scratch: &Path, darwin: &[PathBuf]) -> String {
         "(allow file-write* (subpath \"{}\"))\n",
         sb_quote(scratch)
     ));
+    if shared_tmp {
+        p.push_str("(allow file-write* (subpath \"/private/tmp\"))\n");
+    }
     for d in darwin {
         p.push_str(&format!(
             "(allow file-write* (subpath \"{}\"))\n",
@@ -441,6 +510,14 @@ pub fn build_sandbox_profile(scratch: &Path, darwin: &[PathBuf]) -> String {
         "(allow file-write-data (literal \"/dev/null\") (literal \"/dev/tty\") \
          (literal \"/dev/dtracehelper\"))\n",
     );
+    if local_sockets {
+        // ALL THREE ARE REQUIRED and that was measured, not read: with `network-bind` and
+        // `network-outbound` alone a `bind()` on 127.0.0.1 still fails with EPERM —
+        // `network-inbound` is what `accept()` needs.
+        p.push_str("(allow network-bind (local ip \"localhost:*\"))\n");
+        p.push_str("(allow network-inbound (local ip \"localhost:*\"))\n");
+        p.push_str("(allow network-outbound (remote ip \"localhost:*\"))\n");
+    }
     p
 }
 
@@ -502,7 +579,12 @@ pub async fn run_build_op(op: BuildOp, vault: &str, home: &str) -> BuildOutcome 
         return BuildOutcome::unattempted(op, format!("cannot create scratch dir: {e}"));
     }
 
-    let profile = build_sandbox_profile(&scratch, &darwin_scratch_dirs());
+    let profile = build_sandbox_profile(
+        &scratch,
+        &darwin_scratch_dirs(),
+        op.needs_local_sockets(),
+        op.needs_shared_tmp(),
+    );
     let argv = op.argv();
 
     // `sandbox-exec -p <profile>` rather than `-f <file>`: a file would be one more thing to
@@ -645,13 +727,16 @@ mod tests {
 
     /// The profile denies by default, never allows network, and confines writes to the
     /// directories it was given. This is the boundary in one assertion.
+    /// A COMPILE gets no socket of any kind. This is the tighter of the two postures and the
+    /// one that must not drift: nothing about compiling needs the network, so any `network`
+    /// line appearing on this path is a mistake.
     #[test]
-    fn the_profile_denies_by_default_and_grants_no_network() {
-        let p = build_sandbox_profile(Path::new("/private/tmp/jesse-build"), &[]);
+    fn the_profile_denies_by_default_and_a_compile_gets_no_network() {
+        let p = build_sandbox_profile(Path::new("/private/tmp/jesse-build"), &[], false, false);
         assert!(p.contains("(deny default)"));
         assert!(
             !p.contains("network"),
-            "the profile must never allow network:\n{p}"
+            "a compile must never allow network:\n{p}"
         );
         // Exactly one write grant when no Darwin dirs are supplied, and it is the scratch.
         let writes: Vec<&str> = p
@@ -665,7 +750,12 @@ mod tests {
     /// A path that tries to close the string literal early is escaped rather than obeyed.
     #[test]
     fn a_quote_in_a_path_cannot_break_out_of_the_profile() {
-        let p = build_sandbox_profile(Path::new("/tmp/a\") (allow file-write* (subpath \"/"), &[]);
+        let p = build_sandbox_profile(
+            Path::new("/tmp/a\") (allow file-write* (subpath \"/"),
+            &[],
+            false,
+            false,
+        );
         // The injected `(allow ...)` must not appear as its own rule.
         let writes: Vec<&str> = p
             .lines()
@@ -680,6 +770,37 @@ mod tests {
             p.contains("\\\""),
             "the quote should have been escaped:\n{p}"
         );
+    }
+
+    /// A TEST RUN gets exactly three socket rules, all `localhost`-scoped, and NEVER the
+    /// `network*` wildcard form — which was measured to reach the open internet despite
+    /// carrying the same-looking filters.
+    #[test]
+    fn a_test_run_gets_local_sockets_and_never_the_wildcard_form() {
+        let p = build_sandbox_profile(Path::new("/private/tmp/jesse-build"), &[], true, true);
+        for verb in ["network-bind", "network-inbound", "network-outbound"] {
+            assert!(p.contains(verb), "{verb} missing:\n{p}");
+        }
+        assert!(
+            !p.contains("(allow network* "),
+            "the wildcard network verb does not carry its filters — it reached the internet \
+             when probed. Never use it here:\n{p}"
+        );
+        // Every network rule must be localhost-scoped; an unscoped one would be off-box reach.
+        for line in p.lines().filter(|l| l.contains("network")) {
+            assert!(
+                line.contains("localhost:*"),
+                "unscoped network rule {line:?} — this must never leave the machine"
+            );
+        }
+    }
+
+    /// The two operations differ in exactly one way, and it is deliberate. If a compile ever
+    /// starts asking for sockets, that is a change worth failing a test over.
+    #[test]
+    fn only_the_test_operation_asks_for_sockets() {
+        assert!(!BuildOp::BuildBridge.needs_local_sockets());
+        assert!(BuildOp::TestBridge.needs_local_sockets());
     }
 
     /// The environment is the explicit five, and carries NO credential the bridge holds.
