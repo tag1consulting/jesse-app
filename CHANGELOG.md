@@ -13,6 +13,54 @@ Every commit that changes a component **must** bump that component's version and
 add an entry here — enforced by `scripts/version-guard.sh` (the pre-push hook and
 CI both run it). See the "Versioning" section of `bridge/README.md`.
 
+## [bridge 0.86.0] - 2026-08-21
+
+### Added
+
+- **The agent can compile and test the bridge — as two typed MCP tools, not a shell grant.**
+  A phone turn could write a complete, correct patch and had no way to build it: `cargo`,
+  `swift`, `xcodebuild` and `npm` are all denied, so it could never reach this project's own
+  definition of done. `mcp__build__build_bridge` and `mcp__build__test_bridge` close that.
+
+  They are deliberately **not** a narrower `Bash(cargo:*)`. A build verb takes destination
+  paths (`--target-dir`) and executes arbitrary code by design (`build.rs`, proc macros, test
+  targets), so granting one is granting `bash` — the same finding that withdrew the whole
+  interpreter batch on 2026-08-14. Instead each tool advertises an **empty argument object**
+  and the server never reads `params.arguments`; the program, subcommand, flags, target
+  directory and working directory are compile-time constants reached from a closed `BuildOp`
+  enum. There is no free tail, which is a structural difference rather than a smaller string.
+
+  The build runs under a `sandbox-exec` profile that denies every file write outside a scratch
+  root plus the two per-user Darwin scratch directories, and denies the network outright — so
+  the vault, the checkout being compiled, the bridge state directory and the home directory
+  are read-only to it. It is spawned with `env_clear()` and five variables, so it inherits
+  none of the MCP credentials the bridge holds. Output is bounded to a 16 KB tail per stream,
+  one build runs at a time, and a wall-clock ceiling kills the whole process group.
+
+  **Known open, recorded rather than closed:** the child can edit the checkout and then have
+  it compiled and run, so this is a code-execution path by construction. No shape of tool
+  removes that; the sandbox is the boundary. `bridge/tests/buildsvc_sandbox.rs` probes it
+  live (writes outside the scratch, and the network, are attempted and must fail).
+
+  **`build_app` / `test_app` are absent, and that is a measured blocker.** `xcodebuild` cannot
+  run inside the sandbox at all: SwiftPM evaluates `Package.swift` inside its *own*
+  `sandbox-exec`, and macOS refuses to nest sandboxes (`sandbox_apply: Operation not
+  permitted`), with no flag to disable the inner one. Running it unsandboxed is the
+  `bash`-equivalent grant this design exists to avoid, so it is not offered; the app's route
+  stays "push the branch and read CI". See SECURITY.md.
+
+### Changed
+
+- **Claude Code's main turn now loads fifteen MCP servers; Codex still loads fourteen.** The
+  `build` server is Claude Code's only. Giving it to Codex would move Codex's containment row
+  labels, orphan the two operator `[[accepted]]` blocks keyed by them, and require a live
+  Codex battery this change does not run — and Codex is not armed at `write` here. Codex's
+  `main_mcp_config` now names `MESSAGES_MCP_CONFIG` explicitly so the other harness's set can
+  grow without silently re-keying its record.
+- **`bridge/containment.toml` re-recorded** against the new row labels
+  (`read|write/…+build`). Recorded with claude **2.1.235**, up from 2.1.231 — the pinned CLI
+  moved on the host, and the record now names the binary it was actually taken with.
+
 ## [bridge 0.84.1] - 2026-08-19
 
 ### Security

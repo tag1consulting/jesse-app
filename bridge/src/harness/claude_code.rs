@@ -616,11 +616,55 @@ pub const MORNING_MCP_CONFIG: &str = concat!(
 /// and points the client and credentials directory at the Perseido ones. NOTE both instances
 /// carry `--read-only` and the same `--tools` here rather than inside the launcher, so this
 /// const — the thing the record commits and the tests check — is where the read-only posture
-/// is written for both.
-pub const MAIN_CHILD_MCP_CONFIG: &str = concat!(
+/// is written for both.///
+/// # Why this const exists separately from [`MAIN_CHILD_MCP_CONFIG`]
+///
+/// It was SPLIT OUT when the build server landed, for the reason every one of its predecessors
+/// was split out: until then the two were the same string, so growing the main set in place
+/// would have silently re-pointed the `…+google-perseido` row label at a set that can also
+/// COMPILE AND RUN CODE. Unlike its predecessors this is NOT a retired label —
+/// [`crate::CODEX_SHIPPED_ROWS`] still names it, because Codex's record was taken against
+/// exactly these fourteen servers and nothing here has re-probed it. See
+/// [`crate::CodexHarness::main_mcp_config`].
+pub const MESSAGES_MCP_CONFIG: &str = concat!(
     r#"{"mcpServers":{"qmd":{"type":"stdio","command":"qmd","args":["mcp"]},"slack":{"type":"stdio","command":"npx","args":["-y","slack-mcp-server@latest","--transport","stdio"]},"browser":{"type":"stdio","command":"npx","args":["-y","@playwright/mcp@latest","--headless","--isolated","--output-dir","/tmp/jesse-browser","--output-max-size","104857600"]},"homeassistant":{"type":"http","url":""#,
     home_assistant_mcp_url!(),
     r#"","headers":{"Authorization":"Bearer ${HA_MCP_TOKEN}"}},"roon":{"type":"http","url":"http://10.40.0.2:8088/mcp"},"google":{"type":"stdio","command":"workspace-mcp","args":["--single-user","--read-only","--tools","calendar","gmail","drive"]},"github":{"type":"stdio","command":"github-mcp-server","args":["stdio","--read-only","--toolsets","repos,actions,issues,pull_requests"]},"fastmail":{"type":"stdio","command":"npx","args":["-y","github:jeremyandrews/jmap-mcp-server"]},"unifi":{"type":"stdio","command":"unifi-network-mcp","args":[]},"routeros":{"type":"stdio","command":"routeros-mcp","args":[]},"proxmox":{"type":"stdio","command":"mcp-proxmox","args":[]},"whatsapp":{"type":"stdio","command":"whatsapp-mcp","args":[]},"imcp":{"type":"stdio","command":"/Applications/iMCP.app/Contents/MacOS/imcp-server","args":[]},"google-perseido":{"type":"stdio","command":"workspace-mcp-perseido","args":["--single-user","--read-only","--tools","calendar","gmail","drive"]}}}"#
+);
+
+/// The fourteen-server set PLUS **`build`** — every **Claude Code** main turn from bridge
+/// 0.86.0. Fifteen servers.
+///
+/// # What is new is that a turn can now EXECUTE THE SOURCE IT JUST EDITED
+///
+/// Every server before this one read something, wrote something, or actuated something. This
+/// one compiles and runs code out of the checkout — and the child holds a write grant over
+/// that same checkout. That is a write-then-execute path BY CONSTRUCTION, not a defect in the
+/// tool's shape, and no narrowing of the tool closes it: building source someone can edit is
+/// arbitrary code execution however the build is spelled.
+///
+/// The mitigation is therefore NOT the shape of the tool but the ISOLATION BOUNDARY around
+/// it: the build runs under a macOS sandbox profile that denies every file write outside a
+/// scratch directory and denies the network outright, and it is handed an explicit
+/// five-variable environment rather than the bridge's own (which carries every MCP
+/// credential). See [`crate::buildsvc`] for the profile and SECURITY.md for what it does and
+/// does not contain.
+///
+/// **THIS SET IS CLAUDE CODE'S ONLY.** [`Harness::main_mcp_config`] is per harness precisely
+/// so one harness gaining a server cannot silently change another's posture, and that matters
+/// here more than it ever has: Codex stays on [`MESSAGES_MCP_CONFIG`]. Giving Codex a build
+/// tool would move ITS row labels, orphan the two operator `[[accepted]]` blocks in
+/// `containment-codex.toml`, and demand a live Codex battery — none of which this change
+/// runs. The asymmetry is deliberate and is recorded rather than quietly introduced.
+///
+/// `jesse-build-mcp` is a BARE NAME resolved from the child's `PATH`, like every other stdio
+/// command here, so this const reads identically on every deployment. Unlike the others it is
+/// THIS repository's own binary; installing it on the bridge's `PATH` is host setup,
+/// documented in SECURITY.md.
+pub const MAIN_CHILD_MCP_CONFIG: &str = concat!(
+    r#"{"mcpServers":{"qmd":{"type":"stdio","command":"qmd","args":["mcp"]},"slack":{"type":"stdio","command":"npx","args":["-y","slack-mcp-server@latest","--transport","stdio"]},"browser":{"type":"stdio","command":"npx","args":["-y","@playwright/mcp@latest","--headless","--isolated","--output-dir","/tmp/jesse-browser","--output-max-size","104857600"]},"homeassistant":{"type":"http","url":""#,
+    home_assistant_mcp_url!(),
+    r#"","headers":{"Authorization":"Bearer ${HA_MCP_TOKEN}"}},"roon":{"type":"http","url":"http://10.40.0.2:8088/mcp"},"google":{"type":"stdio","command":"workspace-mcp","args":["--single-user","--read-only","--tools","calendar","gmail","drive"]},"github":{"type":"stdio","command":"github-mcp-server","args":["stdio","--read-only","--toolsets","repos,actions,issues,pull_requests"]},"fastmail":{"type":"stdio","command":"npx","args":["-y","github:jeremyandrews/jmap-mcp-server"]},"unifi":{"type":"stdio","command":"unifi-network-mcp","args":[]},"routeros":{"type":"stdio","command":"routeros-mcp","args":[]},"proxmox":{"type":"stdio","command":"mcp-proxmox","args":[]},"whatsapp":{"type":"stdio","command":"whatsapp-mcp","args":[]},"imcp":{"type":"stdio","command":"/Applications/iMCP.app/Contents/MacOS/imcp-server","args":[]},"google-perseido":{"type":"stdio","command":"workspace-mcp-perseido","args":["--single-user","--read-only","--tools","calendar","gmail","drive"]},"build":{"type":"stdio","command":"jesse-build-mcp","args":[]}}}"#
 );
 
 /// qmd PLUS slack PLUS browser — the main turn's server set from bridge 0.66.0 until Home
@@ -1733,10 +1777,29 @@ mod tests {
             // loads the new set.
             assert_eq!(
                 servers.len(),
-                14,
+                15,
                 "{label}: the main path must declare qmd, slack, browser, homeassistant, roon, \
-                 google, github, fastmail, unifi, routeros, proxmox, whatsapp, imessage and \
-                 google-perseido and nothing else: {mcp:?}"
+                 google, github, fastmail, unifi, routeros, proxmox, whatsapp, imessage, \
+                 google-perseido and build and nothing else: {mcp:?}"
+            );
+            // THE BUILD SERVER IS THE ONE THAT RUNS CODE, so it is asserted BY NAME on top of
+            // the count above. The count alone would be satisfied by any fifteenth server;
+            // this pins which one, and it is the one whose absence would silently take the
+            // compile-and-test capability away from every phone turn.
+            assert!(
+                servers.contains_key("build"),
+                "{label}: the main path declares the build server: {mcp:?}"
+            );
+            // It takes NO ARGUMENTS, and that is the property the whole capability rests on:
+            // the tools it advertises have empty input schemas, so nothing a turn says
+            // reaches a command line. A flag appearing here would be the first sign that
+            // something configurable had crept in.
+            assert!(
+                servers["build"]["args"]
+                    .as_array()
+                    .expect("args")
+                    .is_empty(),
+                "{label}: the build server takes no arguments: {mcp:?}"
             );
             // BOTH GOOGLE SERVERS MUST STAY READ-ONLY AT THE SERVER LAYER. `--read-only` is
             // what deregisters their write tools (event create, send, Drive mutate) so they
@@ -2239,11 +2302,15 @@ mod tests {
     /// the `ci-guards.sh` personal-infrastructure scan BY LINE, and a second copy here would
     /// need a second exemption — which is how a narrow exemption quietly becomes a broad
     /// one. Everything else the child is spawned with is still pinned literally, including
-    /// the token placeholder, the browser's `--output-dir`, and the full server set.
+    /// the token placeholder, the browser's `--output-dir`, and the full server set —
+    /// including `build`, whose EMPTY `args` array is pinned here on purpose: that empty
+    /// array is the machine-checkable form of "the build server takes no configuration", and
+    /// a flag appearing in it would mean something tunable had reached the one server that
+    /// compiles and runs code.
     const GOLDEN_QMD_MCP: &str = concat!(
         r#"{"mcpServers":{"qmd":{"type":"stdio","command":"qmd","args":["mcp"]},"slack":{"type":"stdio","command":"npx","args":["-y","slack-mcp-server@latest","--transport","stdio"]},"browser":{"type":"stdio","command":"npx","args":["-y","@playwright/mcp@latest","--headless","--isolated","--output-dir","/tmp/jesse-browser","--output-max-size","104857600"]},"homeassistant":{"type":"http","url":""#,
         home_assistant_mcp_url!(),
-        r#"","headers":{"Authorization":"Bearer ${HA_MCP_TOKEN}"}},"roon":{"type":"http","url":"http://10.40.0.2:8088/mcp"},"google":{"type":"stdio","command":"workspace-mcp","args":["--single-user","--read-only","--tools","calendar","gmail","drive"]},"github":{"type":"stdio","command":"github-mcp-server","args":["stdio","--read-only","--toolsets","repos,actions,issues,pull_requests"]},"fastmail":{"type":"stdio","command":"npx","args":["-y","github:jeremyandrews/jmap-mcp-server"]},"unifi":{"type":"stdio","command":"unifi-network-mcp","args":[]},"routeros":{"type":"stdio","command":"routeros-mcp","args":[]},"proxmox":{"type":"stdio","command":"mcp-proxmox","args":[]},"whatsapp":{"type":"stdio","command":"whatsapp-mcp","args":[]},"imcp":{"type":"stdio","command":"/Applications/iMCP.app/Contents/MacOS/imcp-server","args":[]},"google-perseido":{"type":"stdio","command":"workspace-mcp-perseido","args":["--single-user","--read-only","--tools","calendar","gmail","drive"]}}}"#
+        r#"","headers":{"Authorization":"Bearer ${HA_MCP_TOKEN}"}},"roon":{"type":"http","url":"http://10.40.0.2:8088/mcp"},"google":{"type":"stdio","command":"workspace-mcp","args":["--single-user","--read-only","--tools","calendar","gmail","drive"]},"github":{"type":"stdio","command":"github-mcp-server","args":["stdio","--read-only","--toolsets","repos,actions,issues,pull_requests"]},"fastmail":{"type":"stdio","command":"npx","args":["-y","github:jeremyandrews/jmap-mcp-server"]},"unifi":{"type":"stdio","command":"unifi-network-mcp","args":[]},"routeros":{"type":"stdio","command":"routeros-mcp","args":[]},"proxmox":{"type":"stdio","command":"mcp-proxmox","args":[]},"whatsapp":{"type":"stdio","command":"whatsapp-mcp","args":[]},"imcp":{"type":"stdio","command":"/Applications/iMCP.app/Contents/MacOS/imcp-server","args":[]},"google-perseido":{"type":"stdio","command":"workspace-mcp-perseido","args":["--single-user","--read-only","--tools","calendar","gmail","drive"]},"build":{"type":"stdio","command":"jesse-build-mcp","args":[]}}}"#
     );
     const GOLDEN_EMPTY_MCP: &str = r#"{"mcpServers":{}}"#;
 

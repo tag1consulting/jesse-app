@@ -1104,8 +1104,17 @@ impl Harness for Codex {
     /// second half was true and is exactly what happened: the record was re-run and the two
     /// acceptances were re-signed under the new row labels. The first half was the gap the
     /// standing rule now forbids — a capability lands on every harness in the same change.
+    /// Codex stays on the FOURTEEN-server set, deliberately.
+    ///
+    /// Claude Code's main turn gained a fifteenth server (`build`) in 0.86.0; Codex does not
+    /// get it in that change. Giving it one would move Codex's row labels, orphan the two
+    /// operator `[[accepted]]` blocks in `containment-codex.toml` that are keyed by those
+    /// labels, and require a live Codex battery to re-record — and Codex is not armed at
+    /// `write` on this deployment in any case. Naming [`MESSAGES_MCP_CONFIG`] explicitly (rather
+    /// than tracking whatever `MAIN_CHILD_MCP_CONFIG` happens to be) is what keeps this
+    /// harness's recorded posture true as the other harness's set grows.
     fn main_mcp_config(&self) -> &'static str {
-        MAIN_CHILD_MCP_CONFIG
+        MESSAGES_MCP_CONFIG
     }
 
     fn shipped_rows(&self) -> &'static [ContainmentRow] {

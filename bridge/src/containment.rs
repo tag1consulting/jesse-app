@@ -189,6 +189,22 @@ pub enum McpSet {
     /// 0.73.0 and a FIFTH in 0.76.0, when `+imessage+` became `+imcp+`. Same mechanism as
     /// 0.66.0, 0.67.0 and 0.69.0. See [`CODEX_SHIPPED_ROWS`].
     Messages,
+    /// The messages set PLUS the **build** server ([`MAIN_CHILD_MCP_CONFIG`]): every **Claude
+    /// Code** main turn from bridge 0.86.0. Fifteen servers. Codex stays on
+    /// [`McpSet::Messages`] — see [`crate::CODEX_SHIPPED_ROWS`].
+    ///
+    /// **WHAT IS NEW IS CODE EXECUTION FROM THE TURN ITSELF.** Every server before this one
+    /// read, wrote, or actuated; this one COMPILES AND RUNS the checkout, which the child can
+    /// edit. That is a write-then-execute path by construction and no shape of tool removes
+    /// it — so the containment story for this row is not the toolset but the macOS sandbox
+    /// profile the build runs under (writes confined to a scratch directory, network denied
+    /// outright, an explicit five-variable environment carrying none of the bridge's MCP
+    /// credentials). See [`crate::buildsvc`] and SECURITY.md.
+    ///
+    /// THE LABEL MOVED FOR CLAUDE CODE ONLY, so — for the first time in this file's history —
+    /// **no Codex signature was orphaned.** That is the reason the two harnesses were given
+    /// separate row lists in 0.57.0, working as intended.
+    MessagesBuild,
 }
 
 /// The label for [`McpSet::Messages`], written ONCE.
@@ -200,6 +216,12 @@ pub enum McpSet {
 /// a pattern position is structural-match and costs nothing.
 const MESSAGES_LABEL: &str = "qmd+slack+browser+homeassistant+roon+google+github+fastmail+\
 unifi+routeros+proxmox+whatsapp+imcp+google-perseido";
+
+/// The label for [`McpSet::MessagesBuild`], written ONCE for the reason [`MESSAGES_LABEL`] is:
+/// at fifteen servers the string is long enough that a typo in the `parse` arm would fail the
+/// round trip for exactly the row a startup gate needs to resolve.
+const MESSAGES_BUILD_LABEL: &str = "qmd+slack+browser+homeassistant+roon+google+github+fastmail+\
+unifi+routeros+proxmox+whatsapp+imcp+google-perseido+build";
 
 impl McpSet {
     /// The label used in the results file and on the command line.
@@ -214,6 +236,7 @@ impl McpSet {
                 "qmd+slack+browser+homeassistant+roon+google+github+fastmail+unifi+routeros+proxmox"
             }
             McpSet::Messages => MESSAGES_LABEL,
+            McpSet::MessagesBuild => MESSAGES_BUILD_LABEL,
         }
     }
 
@@ -229,6 +252,7 @@ impl McpSet {
                 Some(McpSet::Morning)
             }
             MESSAGES_LABEL => Some(McpSet::Messages),
+            MESSAGES_BUILD_LABEL => Some(McpSet::MessagesBuild),
             _ => None,
         }
     }
@@ -245,7 +269,8 @@ impl McpSet {
             McpSet::QmdSlackBrowser => QMD_SLACK_BROWSER_MCP_CONFIG,
             McpSet::House => HOUSE_MCP_CONFIG,
             McpSet::Morning => MORNING_MCP_CONFIG,
-            McpSet::Messages => MAIN_CHILD_MCP_CONFIG,
+            McpSet::Messages => MESSAGES_MCP_CONFIG,
+            McpSet::MessagesBuild => MAIN_CHILD_MCP_CONFIG,
         }
     }
 
@@ -273,7 +298,8 @@ impl McpSet {
             | McpSet::QmdSlackBrowser
             | McpSet::House
             | McpSet::Morning
-            | McpSet::Messages => true,
+            | McpSet::Messages
+            | McpSet::MessagesBuild => true,
         }
     }
 
@@ -295,7 +321,8 @@ impl McpSet {
             | McpSet::QmdSlackBrowser
             | McpSet::House
             | McpSet::Morning
-            | McpSet::Messages => true,
+            | McpSet::Messages
+            | McpSet::MessagesBuild => true,
         }
     }
 
@@ -304,7 +331,11 @@ impl McpSet {
     pub fn contains_browser(&self) -> bool {
         match self {
             McpSet::None | McpSet::Qmd | McpSet::QmdSlack => false,
-            McpSet::QmdSlackBrowser | McpSet::House | McpSet::Morning | McpSet::Messages => true,
+            McpSet::QmdSlackBrowser
+            | McpSet::House
+            | McpSet::Morning
+            | McpSet::Messages
+            | McpSet::MessagesBuild => true,
         }
     }
 
@@ -318,7 +349,7 @@ impl McpSet {
     pub fn contains_homeassistant(&self) -> bool {
         match self {
             McpSet::None | McpSet::Qmd | McpSet::QmdSlack | McpSet::QmdSlackBrowser => false,
-            McpSet::House | McpSet::Morning | McpSet::Messages => true,
+            McpSet::House | McpSet::Morning | McpSet::Messages | McpSet::MessagesBuild => true,
         }
     }
 
@@ -327,7 +358,7 @@ impl McpSet {
     pub fn contains_roon(&self) -> bool {
         match self {
             McpSet::None | McpSet::Qmd | McpSet::QmdSlack | McpSet::QmdSlackBrowser => false,
-            McpSet::House | McpSet::Morning | McpSet::Messages => true,
+            McpSet::House | McpSet::Morning | McpSet::Messages | McpSet::MessagesBuild => true,
         }
     }
 
@@ -340,7 +371,7 @@ impl McpSet {
             | McpSet::QmdSlack
             | McpSet::QmdSlackBrowser
             | McpSet::House => false,
-            McpSet::Morning | McpSet::Messages => true,
+            McpSet::Morning | McpSet::Messages | McpSet::MessagesBuild => true,
         }
     }
 
@@ -352,7 +383,7 @@ impl McpSet {
             | McpSet::QmdSlack
             | McpSet::QmdSlackBrowser
             | McpSet::House => false,
-            McpSet::Morning | McpSet::Messages => true,
+            McpSet::Morning | McpSet::Messages | McpSet::MessagesBuild => true,
         }
     }
 
@@ -364,7 +395,7 @@ impl McpSet {
             | McpSet::QmdSlack
             | McpSet::QmdSlackBrowser
             | McpSet::House => false,
-            McpSet::Morning | McpSet::Messages => true,
+            McpSet::Morning | McpSet::Messages | McpSet::MessagesBuild => true,
         }
     }
 
@@ -378,7 +409,7 @@ impl McpSet {
             | McpSet::QmdSlack
             | McpSet::QmdSlackBrowser
             | McpSet::House => false,
-            McpSet::Morning | McpSet::Messages => true,
+            McpSet::Morning | McpSet::Messages | McpSet::MessagesBuild => true,
         }
     }
 
@@ -391,7 +422,7 @@ impl McpSet {
             | McpSet::QmdSlack
             | McpSet::QmdSlackBrowser
             | McpSet::House => false,
-            McpSet::Morning | McpSet::Messages => true,
+            McpSet::Morning | McpSet::Messages | McpSet::MessagesBuild => true,
         }
     }
 
@@ -405,7 +436,7 @@ impl McpSet {
             | McpSet::QmdSlack
             | McpSet::QmdSlackBrowser
             | McpSet::House => false,
-            McpSet::Morning | McpSet::Messages => true,
+            McpSet::Morning | McpSet::Messages | McpSet::MessagesBuild => true,
         }
     }
 
@@ -421,7 +452,7 @@ impl McpSet {
             | McpSet::QmdSlackBrowser
             | McpSet::House
             | McpSet::Morning => false,
-            McpSet::Messages => true,
+            McpSet::Messages | McpSet::MessagesBuild => true,
         }
     }
 
@@ -449,7 +480,7 @@ impl McpSet {
             | McpSet::QmdSlackBrowser
             | McpSet::House
             | McpSet::Morning => false,
-            McpSet::Messages => true,
+            McpSet::Messages | McpSet::MessagesBuild => true,
         }
     }
 
@@ -468,7 +499,28 @@ impl McpSet {
             | McpSet::QmdSlackBrowser
             | McpSet::House
             | McpSet::Morning => false,
-            McpSet::Messages => true,
+            McpSet::Messages | McpSet::MessagesBuild => true,
+        }
+    }
+
+    /// Whether this set loads the **build** server — same exhaustiveness rule as its
+    /// siblings, and never a `_` arm.
+    ///
+    /// THIS IS THE ONLY PREDICATE HERE THAT REPORTS A CODE-EXECUTION SURFACE. Every other one
+    /// answers "can this row read/write/actuate X". A `true` here means a turn on this row can
+    /// COMPILE AND RUN the checkout it can also edit. It is the reason `McpSet::MessagesBuild`
+    /// exists as a distinct row rather than being folded into [`McpSet::Messages`]: the
+    /// containment record must be able to say which rows had it and which did not.
+    pub fn contains_build(&self) -> bool {
+        match self {
+            McpSet::None
+            | McpSet::Qmd
+            | McpSet::QmdSlack
+            | McpSet::QmdSlackBrowser
+            | McpSet::House
+            | McpSet::Morning
+            | McpSet::Messages => false,
+            McpSet::MessagesBuild => true,
         }
     }
 
@@ -518,6 +570,9 @@ impl McpSet {
         }
         if self.contains_google_perseido() {
             out.push("google-perseido");
+        }
+        if self.contains_build() {
+            out.push("build");
         }
         out
     }
@@ -589,11 +644,11 @@ pub const CLAUDE_CODE_SHIPPED_ROWS: [ContainmentRow; 4] = [
     },
     ContainmentRow {
         capability: Capability::Read,
-        mcp: McpSet::Messages,
+        mcp: McpSet::MessagesBuild,
     },
     ContainmentRow {
         capability: Capability::Write,
-        mcp: McpSet::Messages,
+        mcp: McpSet::MessagesBuild,
     },
 ];
 
@@ -1265,23 +1320,26 @@ mod tests {
         // The corrected row key: `Read` names TWO containments (the main read-only turn with
         // qmd, the vault-QA child with no servers), so one `Read` row would describe a
         // posture that was never probed.
+        // Claude Code's main rows carry the BUILD set; Codex's carry the fourteen-server set.
+        // The asymmetry is the point of the assertion: one harness gaining a code-execution
+        // server must not silently re-key the other harness's recorded rows.
         let cc: Vec<String> = CLAUDE_CODE_SHIPPED_ROWS.iter().map(|r| r.label()).collect();
         assert_eq!(
             cc,
             vec![
                 "basic/none",
                 "read/none",
-                &format!("read/{MESSAGES_LABEL}"),
-                &format!("write/{MESSAGES_LABEL}")
+                &format!("read/{MESSAGES_BUILD_LABEL}"),
+                &format!("write/{MESSAGES_BUILD_LABEL}")
             ]
         );
 
-        // Codex spawns the SAME fourteen-server set from 0.73.0. The two lists are still
-        // asserted SEPARATELY and deliberately: they agree today, and the moment one harness
-        // gains a server the other does not, this is where that shows up. A shared assertion
-        // would hide exactly the drift the split exists to catch — and these labels are what
-        // the operator `[[accepted]]` blocks are keyed on, so a change here orphans a
-        // signature.
+        // Codex stays on the fourteen-server set. The two lists were identical from 0.73.0
+        // until the build server landed on Claude Code alone, and THIS IS THE ASSERTION THAT
+        // KEEPS THAT HONEST: a shared assertion would have quietly re-keyed Codex's rows when
+        // the other harness grew, orphaning the two operator `[[accepted]]` blocks that are
+        // keyed by these labels and invalidating a record nobody re-ran. Codex is not armed at
+        // `write` on this deployment and gains no build tool; see `CodexHarness::main_mcp_config`.
         let cx: Vec<String> = CODEX_SHIPPED_ROWS.iter().map(|r| r.label()).collect();
         assert_eq!(
             cx,
