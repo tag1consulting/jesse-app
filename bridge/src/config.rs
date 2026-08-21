@@ -547,6 +547,22 @@ pub const DEFAULT_MAX_ATTACHMENTS_TOTAL_BYTES: usize = 20 * 1024 * 1024;
 // (a deliberately bad value still errored, so the key was really being read).
 // `granted_mcp_tools` splits on the `mcp__<server>__` prefix, so `google` and
 // `google-perseido` cannot bleed into one another in either direction.
+// THE TWO `mcp__build__*` ENTRIES ARE THE ONLY GRANT HERE THAT RUNS CODE, and they are
+// named INDIVIDUALLY rather than as `mcp__build__*` on purpose: a wildcard would grant
+// whatever that server advertises next, and this is precisely the server where "whatever it
+// advertises next" must be a deliberate decision. They exist because the child could write a
+// correct patch and never compile it, so no code change could be finished from the phone.
+//
+// They are NOT a smaller `Bash(cargo:*)`. The difference is structural rather than one of
+// degree: each tool takes an EMPTY argument object, so no value from the child reaches a
+// command line, and the program, subcommand, flags, target directory and working directory
+// are all compile-time constants in `buildsvc`. A Bash verb would carry a free tail, which is
+// exactly what withdrew the interpreter batch on 2026-08-14.
+//
+// What they cost is stated plainly in SECURITY.md and is not removable by narrowing them:
+// the child can edit the checkout and then cause that checkout to be compiled and run, so
+// this is a write-then-execute path BY CONSTRUCTION. The mitigation is the macOS sandbox the
+// build runs inside (see `buildsvc::build_sandbox_profile`), not the shape of the tool.
 pub const DEFAULT_ALLOWED_TOOLS: &str = "Read(./**),Write(./**),Edit(./**),Grep(./**),Glob(./**),\
 mcp__qmd__query,mcp__qmd__get,mcp__qmd__multi_get,mcp__qmd__status,\
 Skill(diet-logging),\
@@ -671,7 +687,8 @@ mcp__google-perseido__list_gmail_labels,mcp__google-perseido__search_drive_files
 mcp__google-perseido__get_drive_file_content,mcp__google-perseido__get_drive_file_download_url,\
 mcp__google-perseido__list_drive_items,mcp__google-perseido__get_drive_file_permissions,\
 mcp__google-perseido__check_drive_file_public_access,\
-mcp__google-perseido__get_drive_shareable_link";
+mcp__google-perseido__get_drive_shareable_link,\
+mcp__build__build_bridge,mcp__build__test_bridge";
 
 // Defense-in-depth: tools that must never run from the bridge even if they slip
 // into the allowlist. Override with JESSE_DISALLOWED_TOOLS.

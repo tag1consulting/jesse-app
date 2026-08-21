@@ -57,6 +57,7 @@ Default allowlist (`JESSE_ALLOWED_TOOLS` to override):
 | `WebFetch` | Read-only fetch of a web page. Added 2026-08-05, **reversing a standing deny** — see [Web access](#web-access-websearch-and-webfetch-2026-08-05) for the decision, the residual risk, and the available narrowing |
 | `mcp__slack__*` (six) | Read-only Slack read and search. See [Slack](#slack-read-only-2026-08-05) for the six granted and the nine withheld |
 | `mcp__browser__*` (nineteen) | Headless browser: navigate, read, and the interaction verbs. Added 2026-08-07, because `WebFetch` is refused outright on a large set of hosts. See [Browser](#browser-headless-2026-08-07) for the five withheld and why |
+| `mcp__build__build_bridge`, `mcp__build__test_bridge` | **Compile and run the Rust bridge out of the review checkout.** This is the only grant in this table that EXECUTES CODE. Each tool takes an EMPTY argument object — the program, subcommand, flags, target directory and working directory are compile-time constants in `bridge/src/buildsvc.rs`, so nothing a turn says reaches a command line. That is the whole difference from the `Bash(cargo:*)` grant it replaces, and it is structural rather than a matter of degree. It does **not** make the capability safe: the child can edit that checkout and then have it compiled and run, which is arbitrary code execution by construction. What bounds it is the sandbox the build runs inside, not the shape of the tool. Named individually, never `mcp__build__*`. Added 2026-08-21 — see [The build capability](#the-build-capability-typed-tools-inside-a-sandbox-2026-08-21) |
 
 These four `node vault/<script>.js` entries are pinned to the **exact script
 paths**, never a bare `Bash(node:*)`: a bare node scope would allow
@@ -188,6 +189,164 @@ takes unrestricted arguments, which is a verb question rather than a path questi
 it remains the route behind the two known-open baselines below (outbound network, a
 process that outlives the turn). Narrowing it is a separate decision with its own cost
 to the vault workflows.
+
+### The build capability: typed tools inside a sandbox (2026-08-21)
+
+The child could write a complete, correct patch and could not compile it. `xcodebuild`,
+`swift`, `cargo` and `npm` were all denied, so it could never satisfy this project's own
+definition of done — a green build — and no code change could be finished from the phone at
+all.
+
+**The fix is not a Bash grant, and no narrowing of one would have worked.** A build verb is
+strictly worse than everything on the withdrawn interpreter list above: it takes destination
+paths directly (`--target-dir`, `-derivedDataPath`, and for `xcodebuild` any `SETTING=value`
+override such as `SYMROOT`), and it executes arbitrary code **by design** — `build.rs`, proc
+macros, a `Package.swift` (which is an executable Swift program), package plugins and test
+targets all run as the invoking user during an ordinary build. `Bash(cargo:*)` is a grant of
+`bash`. Pinning a wrapper does not help either: the pinned-script grants are already recorded
+above as write-then-execute paths, and a build wrapper is worse still, because **building
+source the child can edit IS arbitrary code execution with no rewrite of the wrapper needed.**
+
+So the capability was not made safe by narrowing a string. It was given a shape with no
+string to narrow, and an isolation boundary around it.
+
+#### What shipped
+
+Two MCP tools, served by `jesse-build-mcp` (this repository's own binary, `bridge/src/bin/`),
+over the same inline `--mcp-config` + `--strict-mcp-config` channel every other server uses.
+The logic is Rust in the bridge crate (`bridge/src/buildsvc.rs`); the binary is transport.
+
+| Tool | What it actually runs |
+| --- | --- |
+| `mcp__build__build_bridge` | `cargo build --offline --locked --target-dir /private/tmp/jesse-build/bridge-target` in `<vault>/Code/github.com/tag1consulting/jesse-app/bridge` |
+| `mcp__build__test_bridge` | the same, `cargo test` |
+
+Every one of those tokens is a compile-time constant reached from a variant of a closed
+`BuildOp` enum. **The tools advertise an empty `inputSchema` (`additionalProperties: false`)
+and the server never reads `params.arguments`** — there is no free tail, which is the one
+structural difference from the shell verb. `--offline` and `--locked` mean a change that adds
+or updates a dependency is **not buildable through this tool**; that is a deliberate limit,
+not an oversight.
+
+Also fixed by construction: a build is spawned with `env_clear()` and exactly five variables
+(`PATH`, `HOME`, `TMPDIR`, `CARGO_TERM_COLOR`, `LANG`). The bridge's own environment carries
+every MCP credential it forwards, and a build is arbitrary code; it does not get them.
+
+Output is bounded to the last 16 KB of each stream (the tail, because that is where a
+build's verdict is), the operation is serialized to one at a time, and a wall-clock ceiling
+kills the whole **process group** on expiry — `cargo` spawns `rustc` and test binaries, and
+killing only the leader would leave them holding the target directory.
+
+#### The isolation is a sandbox profile, NOT a dedicated user
+
+**Option 1, the dedicated non-privileged account, is not implemented, and the reason is that
+it is not repo content.** It needs `sysadminctl` to create the account and a sudoers rule to
+let the bridge run work as it — both root-owned host provisioning, and this machine has no
+passwordless `sudo`. It remains the stronger boundary and the one to aim for.
+
+What is implemented is option 2: every build runs under `sandbox-exec` with a profile built in
+`buildsvc::build_sandbox_profile`. It is `(deny default)` first, so every operation class is
+denied unless named.
+
+**What a build CAN write** — and nothing else:
+
+- `/private/tmp/jesse-build` — the scratch root (target directories, temp files).
+- the two per-user Darwin scratch directories (`confstr` `_CS_DARWIN_USER_TEMP_DIR` and
+  `_CS_DARWIN_USER_CACHE_DIR`).
+- `/dev/null`, `/dev/tty`, `/dev/dtracehelper`.
+
+**What a build CANNOT do:**
+
+- write to the vault, the checkout it is compiling, the bridge's state directory, or anywhere
+  in the home directory. Verified live, not assumed: `touch` into `/tmp`, into `$HOME`, and
+  into the checkout each returned `Operation not permitted` and left no file.
+- **reach the network at all.** There is no `network*` allowance anywhere in the profile, so
+  a build can neither fetch a dependency nor phone home.
+
+Three details in that profile are load-bearing and each cost a debugging cycle to find:
+
+- The scratch path is spelled `/private/tmp/...`, not `/tmp/...`. `/tmp` is a symlink and the
+  sandbox matches **canonical** paths, so the `/tmp` spelling matches nothing and every write
+  is refused while the rule looks correct. The same trap applies to `/var` → `/private/var`,
+  which is why the `confstr` directories are canonicalized before use.
+- `iokit-open` and `ipc-posix-shm*` are allowed because of **one test**: the vision suite
+  shells out to `sips` for a HEIC fixture, and `sips` encodes HEIC on the hardware HEVC
+  encoder, which it reaches through IOKit. Without those two lines `cargo test` fails one test
+  and `test_bridge` reports a red suite on a tree that is actually green.
+- The per-user Darwin directories are writable because `sips` writes into them and **nothing
+  can redirect it**: that path comes from `confstr`, not from `TMPDIR`. They are per-user
+  scratch, not the vault and not the state directory — but they are a write outside the
+  scratch root, and they are named here rather than buried.
+
+`file-read*` is **unrestricted**, and that is a decision rather than an omission. Restricting
+it was attempted and abandoned as fragile (the toolchain reads from too many places), and it
+buys little here: the allowlist already grants the child unscoped `Bash(cat:*)`, `Bash(head:*)`
+and `Bash(tail:*)`, so a build introduces no read class the child did not already have. What
+it does mean is that a build can read any file the bridge user can read and surface it through
+the tool's 16 KB output tail. Recorded as open, below.
+
+#### What could NOT be contained: the app targets
+
+`build_app` and `test_app` were asked for and are **deliberately absent**. `xcodebuild` cannot
+be run inside this sandbox at all, and the blocker is structural rather than a matter of
+tuning the profile:
+
+- **SwiftPM evaluates `Package.swift` inside its own `sandbox-exec` invocation, and macOS
+  refuses to nest one sandbox inside another.** The build dies at package resolution with
+  `sandbox-exec: sandbox_apply: Operation not permitted`, and `xcodebuild` exposes no flag to
+  disable that inner sandbox.
+- Getting that far already required allowing writes into `~/Library/Caches/org.swift.swiftpm`
+  and `~/Library/org.swift.swiftpm`, which **cannot be redirected**: SwiftPM resolves them from
+  the real home, ignoring `HOME`, `SWIFTPM_CACHE_DIR` and `SWIFTPM_CUSTOM_CACHE_DIR` (all three
+  measured). A cache an unsandboxed Xcode later reads is a confused-deputy escape, so that
+  widening would not have been acceptable even if nesting had worked.
+
+The app scheme builds fine on this host **unsandboxed** (`** BUILD SUCCEEDED **`, measured), so
+this is a containment limit, not a broken toolchain. Running it unsandboxed is exactly the
+`bash`-equivalent grant this whole design exists to avoid, so it is not offered. **The route
+that remains open to the app is the one that already exists: push the branch and let CI build
+and test it** — the child can already read run status through `Bash(gh run list/view:*)` and
+`mcp__github__actions_*`.
+
+#### KNOWN OPEN: a build capability is a code-execution path by construction
+
+**The child can edit the checkout and then cause that checkout to be compiled and run.** That
+is not a defect in the tool's shape and no narrowing of the tool closes it — building source
+someone can edit is arbitrary code execution however the build is spelled. It is the same
+write-then-execute class already recorded above for the pinned `node vault/*.js` scripts and
+the compute wrappers, except that here it is the *point* of the tool rather than a side effect.
+
+The mitigation is **the isolation boundary, not the shape of the tool**: the sandbox above.
+Read honestly, that means a hostile build is confined to a scratch directory with no network —
+it is not prevented from running.
+
+Residual risks, none of which the sandbox closes:
+
+- **Reads are unrestricted** (above). A build can read what the bridge user can read and echo
+  it into the turn through the output tail.
+- **The two per-user Darwin scratch directories are writable**, so a build can leave state
+  there that a later build — or another program running as that user — picks up.
+- **`sandbox-exec` is deprecated by Apple.** It works on macOS 15.7.7 and is what the record
+  was taken against, but it carries no forward guarantee, and there is no supported
+  replacement for this use. This is the strongest argument for finishing option 1.
+- **The dedicated unix user is still not implemented** — the same gap named for the message
+  servers above, now load-bearing for a second capability.
+
+#### Codex does not get this
+
+`Harness::main_mcp_config` is per harness, and Claude Code's main turn is the only one that
+gained the `build` server. Codex stays on the fourteen-server set (`MESSAGES_MCP_CONFIG`).
+Giving it a build tool would move Codex's row labels, orphan the two operator `[[accepted]]`
+blocks in `containment-codex.toml` that are keyed by those labels, and require a live Codex
+battery that this change does not run — and Codex is not armed at `write` on this deployment
+in any case. The asymmetry is deliberate and is recorded rather than introduced quietly.
+
+#### Deployment
+
+`jesse-build-mcp` must be on the bridge's `PATH` (the launchers directory, alongside
+`whatsapp-mcp` and the rest). Unlike those, it is built from this repository:
+`cargo build --release --bin jesse-build-mcp`. If it is absent the server simply fails to
+start and the two tools are missing from the turn; nothing else degrades.
 
 ### Web access (`WebSearch` and `WebFetch`, 2026-08-05)
 
