@@ -73,11 +73,24 @@ public struct JesseBridgeClient: BridgeClientProtocol {
     /// from the short calls, so a stalled stream can never make the completion poll wait.
     public let streamSession: URLSession
 
+    /// Where a successful read of the two BROWSABLE documents (the day file and the diet
+    /// snapshot) leaves its body, so a later launch with no network has something true
+    /// to draw. `nil` — the default — means this client caches nothing, which is what
+    /// every client but the two tabs' own wants: a probe, a send, or a test has no
+    /// business writing the screen's fallback.
+    ///
+    /// The WRITE lives here, at the one place the bridge's own bytes exist, rather than
+    /// in the display models: the models are handed decoded values, and re-encoding them
+    /// would mean a second definition of the wire format. See `SnapshotCache`.
+    public let snapshotCache: SnapshotCache?
+
     public init(config: JesseConfig,
                 session: URLSession = JesseBridgeClient.boundedSession,
-                streamSession: URLSession? = nil) {
+                streamSession: URLSession? = nil,
+                snapshotCache: SnapshotCache? = nil) {
         self.config = config
         self.session = session
+        self.snapshotCache = snapshotCache
         if let streamSession {
             self.streamSession = streamSession
         } else if session === JesseBridgeClient.boundedSession {
@@ -588,7 +601,15 @@ public struct JesseBridgeClient: BridgeClientProtocol {
             let je = JesseError.from(error, host: config.normalizedHost)
             throw DietFetchError.unreachable(je.errorDescription ?? "Couldn't reach the bridge.")
         }
-        return try Self.decodeDiet(data: data, resp: resp)
+        let snapshot = try Self.decodeDiet(data: data, resp: resp)
+        // Only a decoded 2xx reaches here, so the cache never holds a body the display
+        // could not render. The key is the REQUESTED date (nil = the live day), not the
+        // snapshot's own, so a bridge that ignores the query parameter cannot overwrite
+        // the live day's entry with a copy of itself.
+        if let cache = snapshotCache, let key = SnapshotCacheKey.diet(date: date) {
+            cache.store(data, key: key, fetchedAt: Date())
+        }
+        return snapshot
     }
 
     // MARK: - Pure encode/decode (unit-testable without a server)

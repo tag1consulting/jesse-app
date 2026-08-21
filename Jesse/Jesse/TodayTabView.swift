@@ -206,6 +206,12 @@ struct TodayTabView: View {
     /// Propagate and wiki chips: an explicit "do this now", so the turn goes out on
     /// the tap and the sheet opens onto a conversation already running.
     private func execute(_ turn: TodayTurn) {
+        // Refused while the day is read-only, exactly as a checkbox tap is, and for the
+        // same reason: this FIRES a turn, and a turn fired at an unreachable bridge is a
+        // request that looks sent and is not. Discuss is deliberately NOT gated here —
+        // it starts nothing, and the conversation it opens is the one screen in this app
+        // where the send outbox and its per-message Retry are visible.
+        guard !model.refuseInteractionIfReadOnly() else { return }
         openedThread = TodayThreadOpener.run(turn, coordinator: coordinator, context: context)
     }
 

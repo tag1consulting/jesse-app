@@ -152,6 +152,13 @@ struct MacRootView: View {
             pruneEmptyThreads()
             await coordinator.refreshSessions(context: context)
         }
+        // The sidebar's half of the wake story. A Mac that slept holds a dead socket and
+        // a `lastError` from the first request that noticed; without a re-pull on wake
+        // the list stays stale and the window stays red until someone hits the refresh
+        // button. See `MacWake`.
+        .onReconnect {
+            Task { await coordinator.refreshSessions(context: context) }
+        }
     }
 
     /// Delete never-used empty threads: no turns, never sent (no session), and not the one

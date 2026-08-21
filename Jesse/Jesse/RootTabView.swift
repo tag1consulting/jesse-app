@@ -67,8 +67,15 @@ struct RootTabView: View {
     /// item's badge and the screen must read the same number. Injected through the
     /// same narrow `TodayProviding` seam the Health tab uses for diet data — the
     /// shared `JesseBridgeClient`, rebuilt per call so a re-pairing is picked up.
+    /// The client CARRIES the cache (it holds the bridge's own response bytes, so it is
+    /// where a successful read is written) and the model READS it (at launch, before any
+    /// network call). Two halves of one feature, wired at the one place that owns the
+    /// day model — see `SnapshotCache`.
     @State private var todayModel = TodayDashboardModel(
-        makeClient: { JesseBridgeClient(config: ConfigStore.load()) })
+        makeClient: {
+            JesseBridgeClient(config: ConfigStore.load(), snapshotCache: SnapshotCache.shared)
+        },
+        cache: SnapshotCache.shared)
 
     /// The wrist's half of the day, built the first time this view appears.
     ///
@@ -98,7 +105,14 @@ struct RootTabView: View {
                 StoreErrorBanner()
             }
         }
-        .task { connectTheWatch() }
+        .task {
+            // The badge is read from every tab, so the day has to be restored at LAUNCH
+            // rather than when the Today tab is first opened — otherwise a cold launch
+            // with no network shows a badge of zero for a day the device already has.
+            // A no-op once anything has loaded, so it cannot fight a live fetch.
+            todayModel.primeFromCache()
+            connectTheWatch()
+        }
         // EVERY successful fetch and every mutation lands a new server snapshot, and
         // each one is pushed. Not gated on the Today tab being selected: the wrist's
         // list has to be right whichever tab the phone happens to be showing, and a

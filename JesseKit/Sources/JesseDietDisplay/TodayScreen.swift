@@ -79,6 +79,11 @@ struct TodayScreen: View {
 
     var body: some View {
         List {
+            // The offline strip, first, because it qualifies everything under it. Same
+            // claim and same voice as the day tab's `TodayStatusBanner`: what you are
+            // reading may be out of date, here is how out of date, and nothing you do
+            // here is queued.
+            if model.isReadOnly { offlineSection }
             // Paging is a DAY control: a rolling window is anchored on the data, not on the
             // day you happen to be reading, so it has nothing to page.
             if windowMode == .day { pagingSection }
@@ -344,6 +349,26 @@ struct TodayScreen: View {
                     .font(.subheadline).lineLimit(2).truncationMode(.tail)
                     .foregroundStyle(.secondary)
             }
+        }
+    }
+
+    /// The offline strip. Deliberately NOT an error style: the numbers under it are
+    /// real, they are just not the newest ones, and painting them red would train the
+    /// reader to distrust a dashboard that is mostly right.
+    @ViewBuilder
+    private var offlineSection: some View {
+        Section {
+            VStack(alignment: .leading, spacing: 4) {
+                Label("You're offline, so logging is paused.",
+                      systemImage: "wifi.exclamationmark")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                if let line = model.stalenessLine {
+                    Text(line).font(.caption).foregroundStyle(.tertiary)
+                }
+            }
+            .accessibilityElement(children: .combine)
+            .listRowBackground(Color.clear)
         }
     }
 
@@ -736,7 +761,13 @@ public struct HealthDashboardContent: View {
 
     public var body: some View {
         content
-            .task { await model.load() }
+            .task {
+                // The last dashboard this device was given, drawn BEFORE the fetch, so a
+                // cold launch with no network shows the day instead of a spinner that
+                // resolves into an error.
+                model.primeFromCache()
+                await model.load()
+            }
     }
 
     @ViewBuilder

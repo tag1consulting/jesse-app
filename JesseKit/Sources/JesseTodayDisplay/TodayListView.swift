@@ -90,6 +90,14 @@ public struct TodayListView: View {
                 TodayEmptyState(symbol: "wifi.exclamationmark",
                                 title: "Can't reach the bridge",
                                 message: message)
+            case .offline:
+                // Nothing cached and no network: a fresh install on a plane. Say that,
+                // rather than spinning or reporting a transport string — and never the
+                // pairing CTA, which would tell a paired user to pair again.
+                TodayEmptyState(
+                    symbol: "wifi.slash",
+                    title: "You're offline",
+                    message: "This device hasn't loaded a day file yet, so there's nothing to show. It'll be here the next time the bridge is reachable.")
             case .content(let snapshot):
                 // The filtered day with nothing in it is an ANSWER, not an empty list:
                 // the user asked which rows the badge counts, and none is the useful
@@ -131,6 +139,10 @@ public struct TodayListView: View {
         // holding for a previous viewing. The other is a pull-to-refresh.
         .task {
             model.repinBadgeFilter()
+            // The last day this device was given, drawn BEFORE the fetch. On a reachable
+            // launch it costs nothing visible (the conditional GET it primes the ETag for
+            // answers `304`); on an unreachable one it is the whole feature.
+            model.primeFromCache()
             await model.load()
         }
         .refreshable { await model.refresh() }
@@ -160,7 +172,8 @@ public struct TodayListView: View {
             if model.isReadOnly || model.isPendingReplay {
                 TodayStatusBanner(isOffline: model.isReadOnly,
                                   isPendingReplay: model.isPendingReplay,
-                                  message: model.lastErrorMessage)
+                                  message: model.lastErrorMessage,
+                                  staleness: model.stalenessLine)
                     .listRowSeparator(.hidden)
             }
             // The narrative is a paragraph about the shape of the whole day, and the
@@ -918,6 +931,12 @@ struct TodayStatusBanner: View {
     let isOffline: Bool
     let isPendingReplay: Bool
     let message: String?
+    /// "Showing the last day loaded — last updated 12 minutes ago." Present whenever the
+    /// screen knows when its document arrived, which after this change is always: the
+    /// day is either from this session's fetch or from the on-disk cache, and both are
+    /// stamped. It is a SECOND line rather than a replacement for the transport message,
+    /// because "why can't you reach it" and "how old is this" are different questions.
+    let staleness: String?
 
     var body: some View {
         VStack(alignment: .leading, spacing: 4) {
@@ -926,6 +945,11 @@ struct TodayStatusBanner: View {
                       systemImage: "wifi.exclamationmark")
                     .font(.caption)
                     .foregroundStyle(.secondary)
+                if let staleness {
+                    Text(staleness)
+                        .font(.caption)
+                        .foregroundStyle(.tertiary)
+                }
             }
             if isPendingReplay {
                 Label("Your change is saved and will land when the current turn finishes.",

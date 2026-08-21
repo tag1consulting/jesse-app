@@ -66,6 +66,24 @@ public enum JesseError: LocalizedError, Sendable {
             return .transport(ns.localizedDescription)
         }
     }
+
+    /// Whether this failure means **the bridge could not be reached**, as opposed to it
+    /// answering with something we did not like.
+    ///
+    /// The distinction is what lets a screen with nothing cached say "you're offline"
+    /// instead of printing a URL-loading string at the user. A `badResponse` is
+    /// deliberately NOT unreachable: the bridge answered, so the device has a network
+    /// and the problem is a different one. `.notConfigured` is not either — an unpaired
+    /// app is not offline, and the pairing CTA is the right screen for it.
+    public var isUnreachable: Bool {
+        switch self {
+        case .cannotFindHost, .cannotConnect, .timedOut, .insecureBlocked,
+             .connectionLost, .transport:
+            return true
+        case .notConfigured, .badResponse, .decoding:
+            return false
+        }
+    }
 }
 
 /// Why a `GET /jesse/diet` fetch failed, distinguished so the Health tab can show

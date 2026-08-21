@@ -354,6 +354,15 @@ see the ATS note in [Known installation problems](#known-installation-problems).
   turn alive; the reply re-attaches when you reopen the app.
 - **Voice / Siri** — "Ask Jesse…" and "Tell Jesse…" Siri phrases route into a new
   thread and read the reply aloud (on-device text-to-speech).
+- **Offline** — Today and Health keep the last thing the bridge sent them on disk,
+  so both tabs still render after a cold launch with no network, behind a banner
+  saying how old what you are reading is. Browsing works; **changing does not**.
+  A checkbox, a move, a postpone, a Quick log, a Start new day or a Propagate is
+  refused with a one-line notice, and **nothing is queued**: the day file is
+  rewritten in full every morning, so a change held through an outage would replay
+  against a document that has since moved on. Chats are the exception — a message
+  sent while the bridge is unreachable is held in the send outbox with a per-message
+  Retry, exactly as before. Everything catches up on the next successful refresh.
 
 ---
 

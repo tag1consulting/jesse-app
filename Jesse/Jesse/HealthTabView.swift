@@ -21,9 +21,15 @@ struct HealthTabView: View {
     // The display model fetches through the narrow `DietSnapshotProviding` seam; iOS
     // injects its own `JesseClient` (which layers per-turn health context on top),
     // preserving the exact client the tab used before the display layer moved out.
-    @State private var model = HealthDashboardModel(makeClient: { JesseClient(config: ConfigStore.load()) })
+    @State private var model = HealthDashboardModel(
+        makeClient: { JesseClient(config: ConfigStore.load(), snapshotCache: SnapshotCache.shared) },
+        cache: SnapshotCache.shared)
     @State private var showQuickLog = false
     @State private var confirmNewDay = false
+
+    /// The same probe the Today tab and the Chats list use, asked here so the dashboard
+    /// goes read-only BEFORE a tap rather than after a turn is fired into a void.
+    @State private var reachability = BridgeReachabilityModel()
 
     var body: some View {
         NavigationStack {
@@ -37,6 +43,13 @@ struct HealthTabView: View {
                 .toolbar {
                     // Quick log and "Start new day" are both today-only (they act on
                     // today), so they're hidden while paging back through a past day.
+                    //
+                    // Both are DISABLED, not queued, while the bridge is unreachable.
+                    // Each fires a fresh `.tell` turn on a thread this tab never
+                    // navigates to, so a failure offline lands as a `.failed` outbox row
+                    // carrying a manual Retry the user is never shown — a log that looks
+                    // sent and is not. The offline strip on the dashboard says why. See
+                    // the CHANGELOG entry for why the chat outbox is not reused here.
                     if HistoryUI.showsQuickLog(isHistorical: model.snapshot?.isHistorical ?? false) {
                         // BOTH items must be `.primaryAction`. `.secondaryAction` (which
                         // this one shipped as) does NOT mean "the second button" on iOS:
@@ -48,15 +61,20 @@ struct HealthTabView: View {
                         ToolbarItem(placement: .primaryAction) {
                             Button { confirmNewDay = true } label: { Image(systemName: "sun.horizon") }
                                 .accessibilityLabel("Start new day")
+                                .disabled(model.isReadOnly)
                         }
                         ToolbarItem(placement: .primaryAction) {
                             Button { showQuickLog = true } label: { Image(systemName: "plus") }
                                 .accessibilityLabel("Quick log")
+                                .disabled(model.isReadOnly)
                         }
                     }
                 }
                 .sheet(isPresented: $showQuickLog) {
                     QuickLogSheet { text in
+                        // Belt and braces with the disabled button above: the sheet may
+                        // have been opened while the bridge was still reachable.
+                        guard !model.isReadOnly else { return }
                         let thread = JesseThread(mode: .tell)
                         context.insert(thread)
                         coordinator.send(thread: thread, text: text, voice: false, context: context)
@@ -78,21 +96,44 @@ struct HealthTabView: View {
             if new < old && isActive { Task { await model.load() } }
         }
         .onChange(of: isActive) { _, active in
-            if active { Task { await model.load() } }
+            guard active else { return }
+            probe()
+            Task { await model.load() }
         }
         // Foregrounding is the third trigger, and the one that covers the overnight
         // case: parked on this tab, the app suspended, `.task` already fired and
         // `isActive` never changed — so without this the screen keeps rendering the
         // snapshot it loaded yesterday, meals and all, until a manual pull-to-refresh.
         .onChange(of: scenePhase) { _, phase in
-            if phase == .active && isActive { Task { await model.load() } }
+            guard phase == .active, isActive else { return }
+            probe()
+            Task { await model.load() }
         }
+        .task { probe() }
+        .onChange(of: reachability.state) { _, _ in applyReachability() }
+    }
+
+    // MARK: - Reachability
+
+    private func probe() {
+        reachability.refresh(config: ConfigStore.load())
+    }
+
+    /// Feed the probe's answer to the model, which is what turns the two turn actions
+    /// off and the offline strip on. Same gate as every other screen's banner: an
+    /// UNPAIRED app is not offline, it is unconfigured, and the pairing empty state
+    /// covers that.
+    private func applyReachability() {
+        model.isNetworkUnreachable = shouldShowOfflineBanner(
+            isConfigured: ConfigStore.load().isConfigured,
+            reachability: reachability.state)
     }
 
     /// Fire the fixed morning refresh on a fresh Tell thread, then return — the
     /// long-running routine runs in the background and the after-turn refresh above
     /// repaints the dashboard when it lands. Mirrors the Quick log send path.
     private func startNewDay() {
+        guard !model.isReadOnly else { return }
         let thread = JesseThread(mode: .tell)
         context.insert(thread)
         coordinator.send(thread: thread, text: HealthNewDay.prompt, voice: false, context: context)
