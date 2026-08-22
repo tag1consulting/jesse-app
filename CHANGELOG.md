@@ -104,6 +104,97 @@ CI both run it). See the "Versioning" section of `bridge/README.md`.
   unmatched `{` stays literal, so an item's markdown, a pasted code snippet or a JSON
   blob in the user's text survives byte for byte.
 
+## [App 1.0 (110)] - 2026-08-21
+
+### Added
+
+- **Today and Health now work offline, from a cold launch, on iOS and on macOS.** Both
+  tabs are pure renders of one `GET` each, and both kept their answer IN MEMORY ONLY. A
+  failed *refresh* never blanked the screen — that invariant has been there for months —
+  but a failed *launch* had nothing to keep. Kill the app on a plane and the day you read
+  an hour ago was gone: a spinner, then an error, for data the device had already been
+  given. The Mac was worse again: its Health tab could dead-end at a "pair with your
+  bridge" prompt for a user who was paired and merely offline.
+
+  The last successful body of `GET /jesse/today` and `GET /jesse/diet` is now written to
+  disk, and both screens draw it BEFORE any network call. Offline with a cache, the day
+  and the dashboard render immediately behind a banner that says how stale they are.
+  Offline with no cache — a fresh install that has never been online — each says so
+  plainly instead of spinning or asking a paired user to pair again.
+
+  **It stores the bridge's own BYTES, not the decoded models.** `TodaySnapshot` and
+  `DietSnapshot` are `Decodable` only, and deliberately so: nearly every type in them has
+  a hand-written `init(from:)` that tolerates a missing or renamed field rather than
+  failing the whole document. Adding `Encodable` would mean hand-writing the mirror of
+  each and keeping the two in step forever — a second, silent definition of the wire
+  format, which is the class of drift the package boundary exists to end. Caching the
+  response body means the restored document is decoded by the SAME decoder the live one
+  is, so a cache hit and a `200` cannot disagree about what the day says. The write
+  therefore lives in `JesseBridgeClient`, the one place those bytes exist; the display
+  models only READ.
+
+  The cached day carries its ETag, which makes the ONLINE cold launch cheaper too: the
+  first fetch goes out conditional and the common answer is a `304` that confirms what is
+  already on screen. A day-file MUTATION refreshes the cache as well, so a kill right
+  after a tick cannot leave the cache one tap behind.
+
+  Twelve entries, 30-day ceiling, oldest-write-first eviction, in Application Support
+  rather than the caches directory: unlike `ArtifactCache`, this is read only when the
+  bridge CANNOT be reached, so the moment the OS reclaimed it would be the moment it was
+  needed. Re-pairing to a different bridge forgets it outright — a cached day describes
+  the vault it came from, and no staleness line can qualify that.
+
+- **The Mac has a reachability probe for the first time.** `BridgeReachability` was an
+  iOS-target file, so the Mac had no offline banner, no read-only day, and no way to
+  notice the bridge had come back. It now lives in `JesseNetworking` and both apps drive
+  it, so the two platforms cannot answer "are we online" differently.
+
+### Changed
+
+- **The turn actions are disabled offline rather than queued, and this was the one
+  judgment call in the change.** Quick log, Start new day, Propagate and the wiki chips
+  each fire a fresh `.tell` turn on a thread the tab never navigates to. The existing
+  chat outbox is NOT a send-when-back-online queue: a pre-ACK failure flips the item to
+  `.failed` and waits for a MANUAL, per-message Retry, and there is no drain on
+  reconnect anywhere. Routing these through it would leave a log that looks sent sitting
+  behind a Retry button the user is never shown, and building the drain would be new
+  machinery on a path with no `request_id` reconciliation of its own. So they are refused
+  with the same one-line notice a refused checkbox gets, which says in as many words that
+  nothing is waiting to send.
+
+  **Discuss is deliberately not gated.** It fires nothing; it opens a conversation, and
+  a conversation is the one screen in this app where the send outbox and its per-message
+  Retry are actually visible. Blocking it would remove working behavior.
+
+- **Today's edits are unchanged: still refused offline, still never queued.** A queued
+  check would be a promise about a document rewritten in full every morning and gated on
+  an `If-Match` ETag that an outage invalidates. That reasoning is unchanged; what is new
+  is that the day being refused about is now on screen at all after a cold launch.
+
+### Fixed
+
+- **A single transient failure painted the Mac permanently "disconnected".**
+  `MacCoordinator.lastError` was cleared by `send` and by nothing else, so a session sync
+  that failed at 2am was still showing red at 9. `refreshSessions` and `hydrate` now clear
+  it on success — including the two answers that are easy to miss and are the common ones:
+  a `304` session list and an empty hydrate.
+
+- **A woken Mac never re-probed, so it stayed offline until someone hit refresh.** iOS
+  gets this free — the app suspends and `scenePhase` swings back to `.active` — but a Mac
+  left open on a desk never leaves `.active`: the lid closes, every socket dies, and
+  nothing in SwiftUI changes. Worse, the short client session sets
+  `waitsForConnectivity = false`, so the first request after a wake fails instantly. The
+  Today, Health and Chats screens now refresh on `NSWorkspace.didWakeNotification` as well
+  as on a real return to the foreground — both, because waking with the window already
+  frontmost produces no phase change and switching windows on a machine that never slept
+  produces no wake notification.
+
+- **A partial session adopt could wedge every later pull into a cheap `304`.** The
+  session-list ETag was stored BEFORE `upsert` applied the list it described, so a kill
+  (or a sleep) part-way through left the new tag recorded against threads this device
+  never finished adopting — permanently missing rows the bridge believed were delivered.
+  The tag is now written last; the worst case is one redundant full pull.
+
 ## [App 1.0 (109)] - 2026-08-20
 
 ### Fixed

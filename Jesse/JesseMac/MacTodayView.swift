@@ -32,7 +32,6 @@ struct MacTodayView: View {
     @Environment(MacCoordinator.self) private var coordinator
     @Environment(\.modelContext) private var context
     @Environment(\.openURL) private var openURL
-    @Environment(\.scenePhase) private var scenePhase
 
     private let configStore: MacConfigStore
 
@@ -79,11 +78,19 @@ struct MacTodayView: View {
     /// before calling `onDismiss`, so the id has to be held separately.
     @State private var stagedThreadID: UUID?
 
+    /// The Mac's half of the offline story, which until now it did not have at all: no
+    /// probe, no banner, no read-only day, and no way to notice it had come back. The
+    /// same shared `BridgeReachabilityModel` the phone drives.
+    @State private var reachability = BridgeReachabilityModel()
+
     init(configStore: MacConfigStore) {
         self.configStore = configStore
+        // The client CARRIES the on-disk cache (it holds the bridge's own bytes) and the
+        // model READS it at launch, so a Mac opened with the Studio asleep still draws
+        // the last day it was given. See `SnapshotCache`.
         _model = State(initialValue: TodayDashboardModel(makeClient: {
-            JesseBridgeClient(config: configStore.config)
-        }))
+            JesseBridgeClient(config: configStore.config, snapshotCache: SnapshotCache.shared)
+        }, cache: SnapshotCache.shared))
         _detailModel = State(initialValue: TodayDetailModel(makeClient: {
             JesseBridgeClient(config: configStore.config)
         }))
@@ -160,15 +167,34 @@ struct MacTodayView: View {
         // view sort, so the shell is where the preference becomes durable.
         .task { model.isBadgeFilterOn = viewPreferences.isBadgeFilterOn }
         .onChange(of: model.isBadgeFilterOn) { _, on in viewPreferences.isBadgeFilterOn = on }
-        // Becoming active covers the overnight case: a window left open on this tab has
+        // Coming back covers the overnight case: a window left open on this tab has
         // already run its `.task`, so without this it keeps rendering yesterday's day.
-        .onChange(of: scenePhase) { _, phase in
-            guard phase == .active else { return }
+        // A Mac that SLEPT never leaves `.active`, which is why this is `onReconnect`
+        // and not a bare `scenePhase` check — see `MacWake`.
+        .onReconnect {
             // Coming back to the window is a fresh entry into the view, so the filtered
             // list lets go of the rows it was holding from the last one.
             model.repinBadgeFilter()
+            probe()
             Task { await model.load() }
         }
+        .task { probe() }
+        .onChange(of: reachability.state) { _, _ in applyReachability() }
+    }
+
+    // MARK: - Reachability
+
+    private func probe() {
+        reachability.refresh(config: configStore.config)
+    }
+
+    /// Feed the probe's answer to the model, which is what turns clicks into a refusal
+    /// instead of a failed write. Same gate as every other screen: an UNPAIRED app is
+    /// not offline, it is unconfigured, and Settings is the answer to that.
+    private func applyReachability() {
+        model.isNetworkUnreachable = shouldShowOfflineBanner(
+            isConfigured: configStore.isConfigured,
+            reachability: reachability.state)
     }
 
     // MARK: - Actions
@@ -199,6 +225,11 @@ struct MacTodayView: View {
     /// Propagate and wiki chips: an explicit "do this now", so the turn goes out on the
     /// click and the sheet opens onto a conversation already running.
     private func execute(_ turn: TodayTurn) {
+        // Refused while the day is read-only, exactly as a checkbox click is, and for the
+        // same reason: this FIRES a turn, and a turn fired at an unreachable bridge is a
+        // request that looks sent and is not. Discuss is deliberately NOT gated here —
+        // it starts nothing.
+        guard !model.refuseInteractionIfReadOnly() else { return }
         openedThread = MacTodayThreadOpener.run(turn, coordinator: coordinator,
                                                 context: context)
     }

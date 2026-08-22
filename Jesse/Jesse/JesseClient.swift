@@ -262,9 +262,14 @@ struct JesseClient: JesseClientProtocol {
          healthProvider: any HealthContextProviding = HealthContextProvider(),
          isHealthContextEnabled: @escaping @Sendable () -> Bool = { HealthContextSettings.isEnabled },
          healthClassifier: any HealthRelevanceClassifying = UnionHealthClassifier(),
-         mealCorrectionsAck: @escaping @Sendable () -> Int? = { MealCorrectionsAckStore.pendingSeq }) {
+         mealCorrectionsAck: @escaping @Sendable () -> Int? = { MealCorrectionsAckStore.pendingSeq },
+         // Only the Health tab passes one: a client built for a send, a probe, or a
+         // per-turn context read has no business writing the screen's offline fallback.
+         snapshotCache: SnapshotCache? = nil) {
         self.config = config
-        self.bridge = JesseBridgeClient(config: config, session: session, streamSession: streamSession)
+        self.bridge = JesseBridgeClient(config: config, session: session,
+                                        streamSession: streamSession,
+                                        snapshotCache: snapshotCache)
         self.healthProvider = healthProvider
         self.isHealthContextEnabled = isHealthContextEnabled
         self.healthClassifier = healthClassifier
@@ -570,8 +575,19 @@ enum ConfigStore {
 
     /// Persist the config. Returns `false` if any field's write failed (e.g. the Keychain
     /// was locked), so a caller can surface "couldn't save the token".
+    ///
+    /// A pairing that actually CHANGES forgets the offline cache. The cached day and
+    /// dashboard describe the vault of the bridge they came from; rendering them under a
+    /// new pairing would be a lie the "last updated" line cannot qualify, and it would
+    /// survive until the new bridge answered. A re-save of the same connection (the
+    /// common case — the Settings screen writes on every edit) keeps it.
     @discardableResult
-    static func save(_ c: JesseConfig) -> Bool { store.save(c) }
+    static func save(_ c: JesseConfig) -> Bool {
+        let previous = load()
+        let ok = store.save(c)
+        if ok, !previous.isSameBridge(as: c) { SnapshotCache.shared?.removeAll() }
+        return ok
+    }
 }
 
 // MARK: - Version surfacing

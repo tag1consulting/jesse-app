@@ -135,3 +135,42 @@ final class JesseConfigTests: XCTestCase {
         XCTAssertNil(JesseConfig.fromPairing("jesse://pair?host=&token=abc123"))
     }
 }
+
+// MARK: - Same-bridge comparison (the offline cache's invalidation rule)
+
+/// `isSameBridge` decides whether a save is a RE-PAIRING (which forgets the offline
+/// snapshot cache, because a cached day describes the vault of the bridge it came from)
+/// or just another write of the same connection.
+///
+/// The Settings screen saves on every edit, so a plain `!=` here would drop the cache
+/// every time the host field is retyped — which on a device with no network is the one
+/// moment the cache is the whole screen.
+final class JesseConfigSameBridgeTests: XCTestCase {
+
+    func testTheSameConnectionSpelledTwoWaysIsOneBridge() {
+        let embedded = JesseConfig(host: "studio:8765", port: 9999, token: "tok")
+        let explicit = JesseConfig(host: "studio", port: 8765, token: "tok")
+        XCTAssertTrue(embedded.isSameBridge(as: explicit))
+        XCTAssertTrue(explicit.isSameBridge(as: embedded))
+    }
+
+    func testAnIdenticalReSaveIsTheSameBridge() {
+        let c = JesseConfig(host: "studio", port: 8765, token: "tok")
+        XCTAssertTrue(c.isSameBridge(as: c))
+    }
+
+    func testADifferentHostPortOrTokenIsADifferentBridge() {
+        let base = JesseConfig(host: "studio", port: 8765, token: "tok")
+        XCTAssertFalse(base.isSameBridge(as: JesseConfig(host: "laptop", port: 8765, token: "tok")))
+        XCTAssertFalse(base.isSameBridge(as: JesseConfig(host: "studio", port: 8766, token: "tok")))
+        XCTAssertFalse(base.isSameBridge(as: JesseConfig(host: "studio", port: 8765, token: "other")))
+    }
+
+    /// Pairing for the first time is a change, so the (empty) cache is cleared — which
+    /// matters because a never-paired install may still hold entries from a previous
+    /// pairing that was cleared out of Settings.
+    func testPairingFromNothingIsAChange() {
+        let empty = JesseConfig(host: "", port: 8765, token: "")
+        XCTAssertFalse(empty.isSameBridge(as: JesseConfig(host: "studio", port: 8765, token: "tok")))
+    }
+}

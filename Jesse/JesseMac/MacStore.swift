@@ -504,7 +504,11 @@ final class MacCoordinator {
         let after = MacCursorStore.cursor(cid)
         do {
             let (turns, next) = try await client.hydrate(conversationId: cid, after: after)
-            guard !turns.isEmpty else { MacCursorStore.setCursor(cid, next); return }
+            guard !turns.isEmpty else {
+                MacCursorStore.setCursor(cid, next)
+                lastError = nil
+                return
+            }
 
             let existing = thread.orderedTurns
             let plan = TranscriptMerge.plan(
@@ -544,6 +548,10 @@ final class MacCoordinator {
             }
             if changed { try? context.save() }
             MacCursorStore.setCursor(cid, next)
+            // Same rule as `refreshSessions`: a success is what clears the error, not
+            // only a send. Opening a thread that hydrates cleanly should take the red off
+            // the window.
+            lastError = nil
         } catch JesseError.badResponse(404, _) {
             // The conversation is gone server-side (GC'd / deleted): the shared client
             // surfaces an unknown transcript as a 404. Leave the cached copy.
@@ -572,10 +580,23 @@ final class MacCoordinator {
         do {
             switch try await cli.listConversations(since: nil, etag: sessionsETag) {
             case .notModified:
+                // A completed round trip, so whatever red the window is painting is about
+                // a world that no longer exists. Clearing here and in the adopt path
+                // below is what stops ONE transient failure from leaving a permanent
+                // "disconnected" banner: `send` cleared this flag and nothing else did,
+                // so a Mac that failed a sync at 2am still looked broken at 9.
+                lastError = nil
                 return
             case let .conversations(list, deleted, etag):
-                sessionsETag = etag
                 await upsert(list, deleted: deleted, client: cli, context: context)
+                // The ETag is written AFTER the adopt, never before. A partial or
+                // throwing `upsert` with the tag already stored would wedge every later
+                // pull into a cheap `304` describing a list this device never finished
+                // applying — the local store permanently missing threads the bridge
+                // believes were delivered. Storing it last means the worst case is one
+                // redundant full pull.
+                sessionsETag = etag
+                lastError = nil
             }
         } catch {
             lastError = Self.friendly(error)

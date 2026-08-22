@@ -182,9 +182,28 @@ final class TodayDashboardModelTests: XCTestCase {
         }
     }
 
-    func testAFailureBeforeAnyLoadIsAnEmptyState() async {
+    /// A failure before anything has loaded is an empty state — and WHICH empty state
+    /// now depends on whether the bridge answered.
+    ///
+    /// A transport failure means the device could not reach it, and the honest screen
+    /// says "you're offline" rather than printing a URL-loading string at someone who
+    /// already knows they are on a plane. This used to be `.unavailable` too; it was
+    /// split when the tabs learned to render from an on-disk cache, because "nothing
+    /// cached AND no network" is a distinct thing to say.
+    func testAnUnreachableBridgeBeforeAnyLoadIsTheOfflineState() async {
         let fake = FakeClient()
         fake.fetches = [.error(.cannotFindHost("studio"))]
+        let m = model(fake)
+        await m.load()
+        XCTAssertEqual(m.displayState, .offline)
+        XCTAssertEqual(m.badgeCount, 0)
+    }
+
+    /// A bridge that ANSWERS is not an offline bridge: the device has a network and the
+    /// problem is a different one, so its message is shown rather than swallowed.
+    func testABridgeThatAnsweredBadlyBeforeAnyLoadIsStillUnavailable() async {
+        let fake = FakeClient()
+        fake.fetches = [.error(.badResponse(500, "boom"))]
         let m = model(fake)
         await m.load()
         guard case .unavailable = m.displayState else { return XCTFail("expected unavailable") }

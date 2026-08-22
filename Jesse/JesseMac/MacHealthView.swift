@@ -31,13 +31,19 @@ struct MacHealthView: View {
     @State private var model: HealthDashboardModel
     @State private var confirmNewDay = false
 
+    /// The Mac's reachability probe — the same shared model the phone drives, and the
+    /// thing this tab previously had no version of.
+    @State private var reachability = BridgeReachabilityModel()
+
     init(configStore: MacConfigStore) {
         self.configStore = configStore
         // The client is rebuilt from the store on every load, so re-pairing in Settings
         // is picked up on the next refresh (the same factory contract the iPhone uses).
+        // It also carries the on-disk cache it writes; the model reads that cache at
+        // launch, so a Mac opened with the Studio asleep still draws the last dashboard.
         _model = State(initialValue: HealthDashboardModel(makeClient: {
-            JesseBridgeClient(config: configStore.config)
-        }))
+            JesseBridgeClient(config: configStore.config, snapshotCache: SnapshotCache.shared)
+        }, cache: SnapshotCache.shared))
     }
 
     var body: some View {
@@ -62,6 +68,11 @@ struct MacHealthView: View {
                             Label("Start new day", systemImage: "sun.horizon")
                         }
                         .help("Start a new health day")
+                        // Disabled, not queued, while the bridge is unreachable: this
+                        // fires a `.tell` turn, and a turn fired at nothing is a morning
+                        // routine that looks started and never ran. The dashboard's
+                        // offline strip says why.
+                        .disabled(model.isReadOnly)
                     }
                     ToolbarItem {
                         Button { Task { await model.refresh() } } label: {
@@ -79,6 +90,26 @@ struct MacHealthView: View {
                     Text("Audit yesterday, log your weigh-in, and refresh the dashboard?")
                 }
         }
+        // A Mac that slept never leaves `.active`, so the scene phase alone would never
+        // re-probe after a lid-open — see `MacWake`.
+        .onReconnect {
+            probe()
+            Task { await model.load() }
+        }
+        .task { probe() }
+        .onChange(of: reachability.state) { _, _ in applyReachability() }
+    }
+
+    // MARK: - Reachability
+
+    private func probe() {
+        reachability.refresh(config: configStore.config)
+    }
+
+    private func applyReachability() {
+        model.isNetworkUnreachable = shouldShowOfflineBanner(
+            isConfigured: configStore.isConfigured,
+            reachability: reachability.state)
     }
 
     /// Fire the fixed morning refresh on a fresh Tell thread. The thread shows up in the
@@ -86,6 +117,7 @@ struct MacHealthView: View {
     /// notification when it lands; hit Refresh (or ⌘R) to repaint the dashboard. No tab
     /// switch.
     private func startNewDay() {
+        guard !model.isReadOnly else { return }
         let thread = JesseThread(mode: .tell)
         context.insert(thread)
         try? context.save()

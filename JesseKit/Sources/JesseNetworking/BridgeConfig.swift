@@ -103,6 +103,21 @@ public struct JesseConfig: Sendable, Equatable {
     /// authorization (don't ask before Jesse is even configured) and registration.
     public var isConfigured: Bool { !normalizedHost.isEmpty && !token.isEmpty }
 
+    /// Whether two configs point at the SAME bridge — the effective host, port and token,
+    /// compared after sanitizing so `"studio:8765"` and `("studio", 8765)` are one answer.
+    ///
+    /// Distinct from `==` on the stored fields, and the distinction is the point: the
+    /// Settings screen writes on every edit, so a plain inequality would treat retyping
+    /// the same host as a re-pairing. The one caller is the config store, deciding whether
+    /// to forget the offline snapshot cache: a cached day describes the vault of the
+    /// bridge it came from, and rendering it under a NEW pairing would be a lie no
+    /// staleness line can qualify.
+    public func isSameBridge(as other: JesseConfig) -> Bool {
+        normalizedHost == other.normalizedHost
+            && effectivePort == other.effectivePort
+            && token == other.token
+    }
+
     /// Parse a `jesse://pair?host=…&port=…&token=…` pairing payload (printed as a
     /// QR by the bridge on startup). Returns nil for anything that isn't a
     /// well-formed pairing URL with a non-empty host and token. Port defaults to

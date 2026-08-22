@@ -76,13 +76,62 @@ public final class TodayDashboardModel {
     /// the tap is safe, it is just not on disk yet.
     public private(set) var isPendingReplay = false
 
+    /// When the day on screen was last confirmed against the bridge — the fetch that
+    /// produced it, or, for a document restored from disk, the fetch that produced THAT.
+    /// What the stale banner's "last updated" reads.
+    public private(set) var lastFetchedAt: Date?
+
+    /// Whether what is on screen came off DISK and has not been confirmed live since.
+    ///
+    /// Distinct from `isReadOnly`, which is about whether a tap can be sent. A cached
+    /// day may be perfectly current (the app was killed a minute ago) and a live day may
+    /// be read-only (the probe just failed); the screen says both things separately
+    /// because they are separately true.
+    public private(set) var isShowingCachedSnapshot = false
+
+    /// Whether the last failure was "could not reach the bridge" rather than "the bridge
+    /// said no". Only the first is worth an offline empty state.
+    private var lastFailureWasUnreachable = false
+
     private let makeClient: @MainActor () -> any TodayProviding
     private let now: @Sendable () -> Date
 
+    /// The on-disk last-good day, or `nil` to keep the pre-cache behavior (which is what
+    /// every test that does not care about caching gets).
+    private let cache: SnapshotCache?
+
     public init(makeClient: @escaping @MainActor () -> any TodayProviding,
-                now: @escaping @Sendable () -> Date = { Date() }) {
+                now: @escaping @Sendable () -> Date = { Date() },
+                cache: SnapshotCache? = nil) {
         self.makeClient = makeClient
         self.now = now
+        self.cache = cache
+    }
+
+    // MARK: - The cache
+
+    /// Render the last day this device was given, before any network call.
+    ///
+    /// Called by the shell as the screen is built, so a COLD LAUNCH WITH NO NETWORK
+    /// draws the day immediately instead of a spinner that resolves into an error. A
+    /// no-op once anything has loaded — a cache must never overwrite a live answer.
+    ///
+    /// The cached ETag is adopted with it, which is what makes the ONLINE cold launch
+    /// cheap too: the first `load()` sends `If-None-Match` and the common answer is a
+    /// `304` that confirms what is already drawn.
+    public func primeFromCache() {
+        guard serverSnapshot == nil, let cache,
+              let entry = cache.load(key: SnapshotCacheKey.today, now: now()),
+              var snap = try? TodaySnapshot.decode(from: entry.body) else { return }
+        if snap.etag == nil || snap.etag?.isEmpty == true { snap.etag = entry.etag }
+        serverSnapshot = snap
+        if let tag = snap.etag, !tag.isEmpty { etag = tag }
+        // Deliberately NOT `isPendingReplay`: that flag describes a turn that was
+        // mid-write when the snapshot was taken, and whether it is still mid-write now
+        // is not something a file on disk can answer.
+        isPendingReplay = false
+        lastFetchedAt = entry.fetchedAt
+        isShowingCachedSnapshot = true
     }
 
     // MARK: - What the views read
@@ -228,14 +277,37 @@ public final class TodayDashboardModel {
         case noDayFile
         /// Nothing loaded and the last attempt failed.
         case unavailable(String)
+        /// **Nothing cached and the bridge cannot be reached.** A fresh install on a
+        /// plane. Deliberately its own state and not `unavailable`: there is no error to
+        /// report and nothing to retry until the network comes back, and the honest
+        /// screen says so rather than printing a URL-loading string or spinning forever.
+        case offline
     }
 
     public var displayState: DisplayState {
         if let snap = displaySnapshot {
             return snap.missing ? .noDayFile : .content(snap)
         }
+        // Order matters: "you are offline" outranks whichever transport string the
+        // failed call happened to produce, and it is reachable BEFORE the first call
+        // finishes (the shell's probe is faster than a 30s timeout).
+        if isNetworkUnreachable || lastFailureWasUnreachable { return .offline }
         if let message = lastErrorMessage { return .unavailable(message) }
         return .loading
+    }
+
+    /// The one line a screen puts under the offline banner: what is on screen and how
+    /// old it is.
+    ///
+    /// Present in exactly two situations, and `nil` otherwise. Either the document came
+    /// off DISK and has not been confirmed live since, or the screen is read-only and the
+    /// document — however it arrived — can no longer be refreshed. A live document on a
+    /// reachable bridge carries no stale stamp, which is what stops the line flashing up
+    /// during the ordinary online launch.
+    public var stalenessLine: String? {
+        guard isShowingCachedSnapshot || isReadOnly, lastFetchedAt != nil else { return nil }
+        return OfflineStamp.cachedLine("Showing the last day loaded",
+                                       fetchedAt: lastFetchedAt, now: now())
     }
 
     /// Open Do Now items plus the standing lead item: the number on the tab, and the
@@ -326,7 +398,10 @@ public final class TodayDashboardModel {
             switch result {
             case .notModified:
                 // Nothing changed, so nothing to reconcile — but the round trip DID
-                // succeed, which is what clears a stale banner.
+                // succeed, which is what clears a stale banner. It also CONFIRMS a
+                // primed cache: the bridge was asked about this exact ETag and said the
+                // document still stands, so the day on screen is live, not stale.
+                confirmFresh()
                 clearFailure()
             case .snapshot(let snap):
                 adopt(snap)
@@ -350,7 +425,16 @@ public final class TodayDashboardModel {
         if let tag = snap.etag, !tag.isEmpty { etag = tag }
         isPendingReplay = snap.pending ?? false
         reconcile(against: snap)
+        confirmFresh()
         clearFailure()
+    }
+
+    /// Mark what is on screen as confirmed against the bridge just now. The cache WRITE
+    /// is the client's (it holds the bridge's own bytes); this is only the model's note
+    /// of when that happened.
+    private func confirmFresh() {
+        lastFetchedAt = now()
+        isShowingCachedSnapshot = false
     }
 
     private func reconcile(against snap: TodaySnapshot) {
@@ -384,6 +468,7 @@ public final class TodayDashboardModel {
 
     private func clearFailure() {
         isOffline = false
+        lastFailureWasUnreachable = false
         lastErrorMessage = nil
         // A completed round trip to the day-file endpoints outranks the shell's
         // `GET /health` probe about whether the bridge is reachable: it is the same
@@ -396,6 +481,7 @@ public final class TodayDashboardModel {
 
     private func fail(_ error: any Error) {
         isOffline = true
+        lastFailureWasUnreachable = (error as? JesseError)?.isUnreachable ?? false
         lastErrorMessage = (error as? LocalizedError)?.errorDescription
             ?? error.localizedDescription
     }

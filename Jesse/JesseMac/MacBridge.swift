@@ -91,13 +91,19 @@ final class MacConfigStore {
 
     /// Persist a new config: sanitize the host, lift an embedded port, and store all three
     /// fields through the shared Keychain seam.
+    ///
+    /// A pairing that actually CHANGES forgets the offline cache, for the same reason the
+    /// phone's does: the cached day and dashboard describe the vault of the bridge they
+    /// came from.
     func save(host rawHost: String, port rawPort: Int?, token: String) {
         let (host, liftedPort) = JesseConfig.sanitize(rawHost)
         let port = liftedPort ?? rawPort ?? JesseConfig.defaultPort
         let trimmedToken = token.trimmingCharacters(in: .whitespacesAndNewlines)
         let cfg = JesseConfig(host: host, port: port, token: trimmedToken)
+        let previous = config
         store.save(cfg)
         config = cfg
+        if !previous.isSameBridge(as: cfg) { SnapshotCache.shared?.removeAll() }
     }
 
     // MARK: - Legacy migration (pre App 1.0 (61))

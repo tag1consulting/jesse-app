@@ -61,17 +61,88 @@ public final class HealthDashboardModel {
     /// day renders instantly on return.
     private var cache: [String: DietSnapshot] = [:]
 
+    /// Set by the platform shell when its reachability probe says the bridge is
+    /// unreachable, so the tab goes read-only — and its turn actions go quiet — BEFORE a
+    /// tap rather than after one fails. Settable and not derived for exactly the reason
+    /// `TodayDashboardModel.isNetworkUnreachable` is: the probe belongs to the shell,
+    /// and a library that reached for one of its own would be a second answer to the
+    /// same question.
+    public var isNetworkUnreachable = false
+
+    /// When the day on screen was last confirmed against the bridge. For a document
+    /// restored from disk this is when the fetch that produced it happened, which is
+    /// what the "last updated" line reads.
+    public private(set) var lastFetchedAt: Date?
+
+    /// Whether what is on screen came off DISK and has not been confirmed live since.
+    public private(set) var isShowingCachedSnapshot = false
+
+    /// Whether this tab can still start anything. Read-only means either the shell's
+    /// probe came back unreachable or our own last fetch could not reach the bridge; in
+    /// both cases the honest screen is the last snapshot, rendered and readable, with
+    /// the turn actions disabled rather than fired into a void. NOTHING IS QUEUED —
+    /// see `readOnlyNotice`.
+    public var isReadOnly: Bool {
+        if isNetworkUnreachable { return true }
+        if case .unreachable = lastError { return true }
+        return false
+    }
+
+    /// The wording a refused action gets, matching the day tab's word for word so the
+    /// two tabs cannot describe the same situation two ways.
+    public static let readOnlyNotice =
+        "You're offline, so logging is paused. Nothing was sent and nothing is waiting to send — try again once the bridge is reachable."
+
+    /// The message shown under an empty Health tab that has never been able to load.
+    /// Carried as `DietFetchError.unreachable`'s payload so it reaches the SAME empty
+    /// state a failed fetch would, rather than a second one that has to be kept in step.
+    public static let offlineEmptyNote =
+        "This device hasn't loaded your dashboard yet, so there's nothing to show. It'll be here the next time the bridge is reachable."
+
+    /// The one line a screen puts under the offline banner.
+    ///
+    /// Present in exactly two situations, and `nil` otherwise — the same rule the day tab
+    /// applies. Either the dashboard came off DISK and has not been confirmed live since,
+    /// or the tab is read-only and what is on screen can no longer be refreshed. A live
+    /// dashboard on a reachable bridge carries no stale stamp.
+    public var stalenessLine: String? {
+        guard isShowingCachedSnapshot || isReadOnly, lastFetchedAt != nil else { return nil }
+        return OfflineStamp.cachedLine("Showing the last dashboard loaded",
+                                       fetchedAt: lastFetchedAt, now: now())
+    }
+
     private let makeClient: @MainActor () -> any DietSnapshotProviding
     public let now: () -> Date
+
+    /// The on-disk last-good dashboard, or `nil` to keep the pre-cache behavior.
+    private let snapshotCache: SnapshotCache?
 
     /// The client is a required injection (no iOS-specific default now that the model
     /// lives in the shared package): iOS passes its `JesseClient`, the Mac a
     /// `JesseBridgeClient`, tests/previews a fake. Both concrete clients satisfy the
     /// narrow `DietSnapshotProviding` seam.
     public init(makeClient: @escaping @MainActor () -> any DietSnapshotProviding,
-                now: @escaping () -> Date = { Date() }) {
+                now: @escaping () -> Date = { Date() },
+                cache: SnapshotCache? = nil) {
         self.makeClient = makeClient
         self.now = now
+        self.snapshotCache = cache
+    }
+
+    /// Render the last dashboard this device was given, before any network call, so a
+    /// COLD LAUNCH WITH NO NETWORK draws it immediately instead of a spinner that
+    /// resolves into an error. A no-op once anything has loaded.
+    ///
+    /// Only the LIVE day is primed. A paged-back day is a deliberate navigation, and
+    /// restoring one on launch would open the tab on a day the user last looked at
+    /// three weeks ago; the dated entries in the cache serve `goBack()` instead.
+    public func primeFromCache() {
+        guard snapshot == nil, let snapshotCache,
+              let entry = snapshotCache.load(key: SnapshotCacheKey.liveDiet, now: now()),
+              let snap = try? DietSnapshot.decode(from: entry.body) else { return }
+        apply(snap, date: nil)
+        lastFetchedAt = entry.fetchedAt
+        isShowingCachedSnapshot = true
     }
 
     /// What the tab root renders. `.content` wins whenever a snapshot exists, so a
@@ -85,6 +156,11 @@ public final class HealthDashboardModel {
     public var displayState: DisplayState {
         if let snapshot { return .content(snapshot) }
         if let lastError { return .empty(lastError) }
+        // Nothing cached and the shell's probe already says the bridge is unreachable.
+        // Reported as the SAME `.unreachable` empty state a failed fetch produces
+        // ("Can't reach the bridge", never the pairing CTA), reached before the fetch's
+        // own 30s timeout can resolve — otherwise a cold launch on a plane spins.
+        if isNetworkUnreachable { return .empty(.unreachable(Self.offlineEmptyNote)) }
         return .loading
     }
 
@@ -158,6 +234,17 @@ public final class HealthDashboardModel {
             historyUnsupported = false
             return
         }
+        // Offline, and the day being asked for is not in memory. A dated day may still
+        // be on disk from a previous session; the LIVE day never is served this way,
+        // because `primeFromCache` has already offered it and a second read would put a
+        // stale day back on screen after a successful one.
+        if isReadOnly, let restored = restoreFromDisk(date: date) {
+            apply(restored.snapshot, date: date)
+            lastFetchedAt = restored.fetchedAt
+            isShowingCachedSnapshot = true
+            historyUnsupported = false
+            return
+        }
         isLoading = true
         defer { isLoading = false }
         do {
@@ -171,11 +258,28 @@ public final class HealthDashboardModel {
             historyUnsupported = false
             apply(snap, date: date)
             lastError = nil
+            lastFetchedAt = now()
+            isShowingCachedSnapshot = false
+            // A completed round trip to the diet endpoint outranks a `GET /health` probe
+            // from thirty seconds ago about whether the bridge is reachable — the same
+            // precedence the day tab applies, so one successful refresh restores the
+            // tab's actions instead of leaving them disabled until the next probe.
+            isNetworkUnreachable = false
         } catch let e as DietFetchError {
             lastError = e
         } catch {
             lastError = .unreachable(error.localizedDescription)
         }
+    }
+
+    /// A dated day held on disk from an earlier session, when there is no way to fetch
+    /// one now. The live day is deliberately excluded — see the call site.
+    private func restoreFromDisk(date: String?) -> (snapshot: DietSnapshot, fetchedAt: Date)? {
+        guard let date, let snapshotCache,
+              let key = SnapshotCacheKey.diet(date: date),
+              let entry = snapshotCache.load(key: key, now: now()),
+              let snap = try? DietSnapshot.decode(from: entry.body) else { return nil }
+        return (snap, entry.fetchedAt)
     }
 
     /// Commit a fetched snapshot: pin the view, cache it, and learn today/available.

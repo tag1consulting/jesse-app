@@ -161,7 +161,9 @@ extension JesseBridgeClient: TodayProviding {
         guard (200..<300).contains(http.statusCode) else {
             throw JesseError.badResponse(http.statusCode, Self.bodyText(data))
         }
-        return .snapshot(try Self.decodeToday(data: data, http: http))
+        let snapshot = try Self.decodeToday(data: data, http: http)
+        cacheToday(body: data, snapshot: snapshot)
+        return .snapshot(snapshot)
     }
 
     public func checkItem(id: String, checked: Bool, evidence: String?, at: Date,
@@ -250,7 +252,12 @@ extension JesseBridgeClient: TodayProviding {
         let (data, http) = try await todaySend(req)
         switch http.statusCode {
         case 200..<300:
-            return .snapshot(try Self.decodeToday(data: data, http: http))
+            // A mutation answers with the WHOLE fresh day, so it is as good a cache
+            // write as a `GET` is — and it is the one that matters after a tick, since
+            // a kill before the next poll would otherwise leave the cache one tap behind.
+            let snapshot = try Self.decodeToday(data: data, http: http)
+            cacheToday(body: data, snapshot: snapshot)
+            return .snapshot(snapshot)
         case 410:
             return .itemGone
         case 412:
@@ -275,6 +282,17 @@ extension JesseBridgeClient: TodayProviding {
     /// the header. The bridge writes the same value into both; the body copy exists
     /// so a client that stored the payload need not also keep headers, and the header
     /// fallback covers a proxy that rewrote the body's framing but not its content.
+    /// Persist one day-file body, with the ETag the model will need to send back.
+    ///
+    /// The ETag is taken from the DECODED snapshot rather than from the body, because
+    /// `decodeToday` lifts it out of the `Etag` header when the JSON omits it — so the
+    /// body alone is not always enough to reconstruct it, and a cache that lost the tag
+    /// would make the first conditional `GET` after a cold launch a full refetch.
+    private func cacheToday(body: Data, snapshot: TodaySnapshot) {
+        guard let cache = snapshotCache else { return }
+        cache.store(body, key: SnapshotCacheKey.today, etag: snapshot.etag, fetchedAt: Date())
+    }
+
     static func decodeToday(data: Data, http: HTTPURLResponse) throws -> TodaySnapshot {
         guard var snap = try? TodaySnapshot.decode(from: data) else { throw JesseError.decoding }
         if snap.etag == nil || snap.etag?.isEmpty == true {
