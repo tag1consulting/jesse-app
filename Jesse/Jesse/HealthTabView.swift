@@ -110,11 +110,6 @@ struct HealthTabView: View {
                         }
                     }
                 }
-                // Every askable card, row and chart on the dashboard and its sub-pages
-                // reaches the chat through this one injection — the environment carries it
-                // down the whole navigation stack, so a screen added later is askable the
-                // moment it uses `.askable`.
-                .environment(\.healthAsk, HealthAskAction { openAsk($0) })
                 .sheet(item: $askThread, onDismiss: dropUnsentAsk) { thread in
                     // `hidesTabBar: false`: a sheet already covers the tab bar, and asking
                     // the detail view to hide it would leave it hidden after dismissal.
@@ -138,6 +133,16 @@ struct HealthTabView: View {
                     Text("Audit yesterday, log your weigh-in, and refresh the dashboard?")
                 }
         }
+        // Every askable card, row and chart on the dashboard AND ON ITS PUSHED SUB-PAGES
+        // reaches the chat through this one injection.
+        //
+        // It sits on the NavigationStack rather than on its root content, and that is the
+        // whole point: a view pushed by a `NavigationLink` is presented BY the stack, not
+        // rendered as a child of the root, so an environment value attached to the root
+        // does not reliably reach it. Attached here it covers the root and every
+        // destination alike — Macros & calories, Food journal, Exercise, the charts, and
+        // anything pushed later.
+        .environment(\.healthAsk, HealthAskAction { openAsk($0) })
         // Load-on-appear lives in the shared `HealthDashboardContent`; the shell adds
         // only the iOS-specific after-turn and tab-activation refresh triggers.
         .onChange(of: coordinator.inFlight.count) { old, new in

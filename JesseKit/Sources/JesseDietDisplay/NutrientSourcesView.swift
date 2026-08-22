@@ -229,6 +229,12 @@ struct NutrientSourcesDetail: View {
                         NavRow(title: "\(nutrient.fullName) trend", icon: "chart.xyaxis.line",
                                subtitle: "how much, day by day")
                     }
+                    .askable(HealthAsk.trend(
+                        NutrientTrends.analyze(nutrientSeries, nutrient: nutrient,
+                                               targets: targets,
+                                               windowDays: windowDays == 7 ? 7 : 30),
+                        rangeLabel: "the last \(windowDays == 7 ? 7 : 30) days",
+                        anchor: anchor, scope: .section))
                 }
             }
         }

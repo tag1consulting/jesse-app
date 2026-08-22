@@ -13,6 +13,51 @@ Every commit that changes a component **must** bump that component's version and
 add an entry here — enforced by `scripts/version-guard.sh` (the pre-push hook and
 CI both run it). See the "Versioning" section of `bridge/README.md`.
 
+## [App 1.0 (112)] - 2026-08-22
+
+### Fixed
+
+- **"Ask about this" never reached the Health tab's SUB-PAGES.** The `\.healthAsk` action
+  was injected onto the NavigationStack's ROOT CONTENT rather than onto the stack, and a
+  view pushed by a `NavigationLink` is presented *by* the stack rather than rendered as a
+  child of the root — so the action did not reach it. Every askable view below the
+  dashboard root was wired and inert: the nutrient rows on Macros & calories, the meals
+  and foods in the Food journal, the workout cards, the Sources rows, the charts. Moved
+  to the `NavigationStack` on both platforms, which covers the root and every destination
+  alike.
+
+### Added
+
+- **The metric drill-down sheet is askable, row by row.** Tapping Calories (or any
+  nutrient row) opens the "What fed this" list; each contributing food now carries its own
+  ask, with its contribution, its share, and the ranking it sits in — which is what makes
+  "why is this so caloric" and "what's a lighter swap" answerable about one food rather
+  than about the day. The **Not estimated** rows are askable too, with their own starters
+  ("roughly how much would this have?", "what would I log to make it measurable?"), because
+  an unmeasured food raises a different question from a measured one. The block's header
+  asks about the metric as a whole.
+
+- **The remaining unwired rows.** The rebuilt-day (neutral) rows on Macros & calories —
+  the one row type on the tab with no ask at all — and the two cross-link nav rows between
+  a nutrient's trend and its sources, so those behave like every other nav row.
+
+  75 ask sites, up from 63.
+
+### Changed
+
+- **A context menu no longer silently removes press-and-hold text selection.**
+  `.contextMenu` takes that gesture over, so attaching an ask to a row that had
+  `.textSelection(.enabled)` would have quietly cost the user their Copy. The new
+  `.askable(_:copyText:)` variant puts a **Copy** item in the menu beside the ask, and it
+  is used exactly where selection existed: the drill-down's food and Not-estimated rows,
+  and the trend chart's verdict sentence. `DrilldownShare.contributionLine` was extracted
+  so a row's Copy and the sheet's ShareLink export produce the identical line rather than
+  two spellings of it.
+
+  The sheet's prose paragraphs, its value line and the on-device insight are deliberately
+  NOT askable and keep their plain text selection; the ShareLink in the sheet's toolbar is
+  untouched.
+
 ## [App 1.0 (111)] - 2026-08-22
 
 ### Added

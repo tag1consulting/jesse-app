@@ -84,24 +84,35 @@ enum HealthAskGlyph {
 private struct AskableModifier: ViewModifier {
     @Environment(\.healthAsk) private var ask
     let context: () -> HealthAskContext
+    /// Text this view could previously have its long press COPY (it had
+    /// `.textSelection(.enabled)`), or nil where there was nothing to preserve.
+    let copyText: (() -> String)?
 
     func body(content: Content) -> some View {
         if let ask {
             // No `.contextMenu(menuItems:preview:)`: the system's free preview of the view
             // being pressed is exactly right, and a hand-built one would be a second
             // rendering of the same card to keep in step.
-            content.contextMenu { item(ask) }
+            content.contextMenu { items(ask) }
         } else {
             content
         }
     }
 
-    /// A single item, worded for what was actually pressed ("Ask about this meal").
-    /// Deliberately text-only — a glyph here would put an icon inside every row's menu
-    /// for a menu that has exactly one entry.
-    private func item(_ ask: HealthAskAction) -> some View {
+    /// The menu. One item where the view had no long-press behavior of its own — worded
+    /// for what was actually pressed ("Ask about this meal"), and text-only, because a
+    /// glyph in a one-item menu is decoration.
+    ///
+    /// TWO items where the view DID have one. Attaching a `contextMenu` replaces the
+    /// system's press-and-hold text selection, so a row that could be selected and copied
+    /// gets its Copy back here rather than silently losing it.
+    @ViewBuilder
+    private func items(_ ask: HealthAskAction) -> some View {
         let context = self.context()
-        return Button(context.menuLabel) { ask(context) }
+        Button(context.menuLabel) { ask(context) }
+        if let copyText {
+            Button("Copy") { PlatformPasteboard.copy(copyText()) }
+        }
     }
 }
 
@@ -146,7 +157,18 @@ public extension View {
     /// `@autoclosure` so a call site stays one expression; the context is built during
     /// this view's own body evaluation, alongside the numbers it serializes.
     func askable(_ context: @autoclosure @escaping () -> HealthAskContext) -> some View {
-        modifier(AskableModifier(context: context))
+        modifier(AskableModifier(context: context, copyText: nil))
+    }
+
+    /// Askable, for a view that ALREADY had a long press.
+    ///
+    /// `.textSelection(.enabled)` gives press-and-hold selection with a Copy callout, and
+    /// a `contextMenu` takes that gesture over. Rather than quietly removing an
+    /// affordance, those views pass the text their selection would have yielded and the
+    /// menu carries a Copy of its own beside the ask.
+    func askable(_ context: @autoclosure @escaping () -> HealthAskContext,
+                 copyText: @autoclosure @escaping () -> String) -> some View {
+        modifier(AskableModifier(context: context, copyText: copyText))
     }
 
     /// Give this page its own Ask entry in the toolbar, covering everything visible on it

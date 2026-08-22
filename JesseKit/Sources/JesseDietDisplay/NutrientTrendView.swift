@@ -220,11 +220,14 @@ struct NutrientTrendDetail: View {
         Section {
             // The plain-language verdict from the engine — coverage first, a judgment only
             // where the kind allows, and a hedge when coverage is thin.
+            // `copyText:` because this line is `.textSelection(.enabled)` and a context
+            // menu takes that gesture over — the verdict is the most quotable sentence on
+            // the screen, so the Copy it used to offer comes along in the menu.
             Text(NutrientTrends.verdict(trend))
                 .font(.callout)
                 .textSelection(.enabled)
                 .fixedSize(horizontal: false, vertical: true)
-                .askable(ask)
+                .askable(ask, copyText: NutrientTrends.verdict(trend))
 
             // The static consequence copy, so no health claim is invented.
             Label {
@@ -238,7 +241,7 @@ struct NutrientTrendDetail: View {
             // Where it is coming from — the real top-contributing foods the app has for
             // this range. Shown only when a known contributor exists (never a guess).
             if !topSources.isEmpty {
-                sourcesRow
+                sourcesRow.askable(ask)
             }
             // The line above covers only the LOADED day's meals; when the bridge sends the
             // per-item history, the range-wide ranking is one tap away. This is the whole
@@ -254,6 +257,10 @@ struct NutrientTrendDetail: View {
                     NavRow(title: "Where it comes from", icon: "list.bullet.rectangle",
                            subtitle: "top foods over the last 7 or 30 days")
                 }
+                .askable(HealthAsk.sourceRanking(
+                    NutrientSources.rank(sourceSeries, nutrient: nutrient,
+                                         windowDays: range == .d7 ? 7 : 30),
+                    anchor: sourceSeries.last?.date ?? "", scope: .section))
             }
             if let raiseHint {
                 Text(raiseHint)

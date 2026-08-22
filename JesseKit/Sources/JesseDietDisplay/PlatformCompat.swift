@@ -16,6 +16,26 @@ import AppKit
 public typealias PlatformColor = NSColor
 #endif
 
+// MARK: - Pasteboard
+
+/// Copy plain text to the system pasteboard.
+///
+/// It exists for ONE reason: `.contextMenu` replaces the system's press-and-hold text
+/// selection on any view it is attached to. Where the Health tab already offered
+/// selection (the drill-down's food rows, the trend verdict), an ask menu that simply
+/// took that away would be a net loss, so those menus carry their own Copy and the
+/// capability survives the change. See `View.askable(_:copyText:)`.
+enum PlatformPasteboard {
+    static func copy(_ text: String) {
+        #if canImport(UIKit)
+        UIPasteboard.general.string = text
+        #elseif canImport(AppKit)
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(text, forType: .string)
+        #endif
+    }
+}
+
 // MARK: - Dynamic (per color scheme) colors
 
 extension Color {
