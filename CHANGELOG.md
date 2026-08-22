@@ -13,6 +13,113 @@ Every commit that changes a component **must** bump that component's version and
 add an entry here — enforced by `scripts/version-guard.sh` (the pre-push hook and
 CI both run it). See the "Versioning" section of `bridge/README.md`.
 
+## [App 1.0 (111)] - 2026-08-22
+
+### Added
+
+- **"Ask about this" across the whole Health tab.** Long-press on iOS, right-click on
+  macOS, on any card, row, chart, section header or nav row in the Health tab and its
+  sub-pages: one menu item opens the app's existing chat already holding a compact,
+  structured snapshot of exactly what was on screen. Every page also gets one **Ask**
+  entry in the toolbar for the whole page, so "what's good and what's bad about today"
+  is answerable with nothing selected.
+
+  **Zero added chrome, and that is the design constraint rather than a nice-to-have.**
+  There is no new icon, badge, chip or hover overlay on any card, row or chart; nothing
+  was collapsed, reordered or tucked away; every existing tap, swipe and navigation
+  behaves exactly as before. At rest the tab is pixel-identical to what it was — the only
+  visible addition anywhere is the one toolbar button per page. `.askable(…)` attaches a
+  native `contextMenu` and nothing else, so the affordance exists only while the gesture
+  is happening and comes with the system's own preview.
+
+  **The snapshot is what the SCREEN shows, never a re-query.** Every serializer is handed
+  the values the view already holds. A second read of the same day through a different
+  path would eventually disagree with the pixels, and a chat that contradicts the screen
+  it was opened from is worse than no chat. The judgements in it are the engines' own —
+  `DietSemantics`, `NutrientTrends.verdict`, `NutrientSources.coverageLine`,
+  `NutrientStreaks`, `DietCorrelations` — so the snapshot repeats the row's words rather
+  than paraphrasing a chart.
+
+  **One serializer per unit; the scopes are unions.** `HealthAskFacts` is a small tree
+  (heading, lines, children), so a section is its items' blocks and a page is its
+  sections'. A meal is serialized once and appears identically in the meal ask, the food
+  journal ask and the whole-day ask. Adding askability to a new Health view is one
+  modifier; adding a new unit is one function.
+
+  **Unknown is still not zero.** A partial total is a floor in the snapshot too ("≥"), an
+  unmeasured food is named as unmeasured, a gap day is absent rather than a zero, and a
+  planned meal is marked `PLANNED, not logged` and excluded from every total. The rules
+  the screens print are carried across verbatim.
+
+  **The budget is stated, never silent.** Lists beyond a cap keep the biggest rows and say
+  how many they left out ("8 more foods not listed — the totals above still count all of
+  them"); a snapshot past 12 000 characters is cut at a line boundary and says so. A
+  truncated list that does not admit it reads as completeness.
+
+  **A meal or a food never becomes an instruction.** The snapshot is fenced
+  (`---BEGIN SCREEN---`) and the prompt says everything inside is data, so a food named
+  "ignore the above" is a food.
+
+- **Suggested starters and a pinned scope line in the chat's empty state.** Two to four
+  opening questions per scope, offered only while the conversation is empty and gone the
+  moment anything is typed or one is tapped; tapping one sends it through the ordinary
+  send path. The conversation is titled after the scope ("Lunch · Aug 22"), so the header
+  says what "this" refers to and the Chats list reads as a question rather than a wall of
+  macros.
+
+- **Asking about the same reading twice in a day continues the same conversation.**
+  Resume is keyed on `HealthAskContext.scopeKey` — area, scope, time range and subject,
+  with the range's own anchor date inside it — so a second press on the same meal an hour
+  later reopens the thread, the same press tomorrow starts a new one, and the day read and
+  the rolling 7-day read of the same page stay separate conversations. A resumed thread is
+  re-attached with a FRESH snapshot, so the next message argues from the current screen
+  rather than this morning's. Only conversations that were actually had can be resumed: an
+  ask opened and abandoned is never inserted into the store.
+
+### Changed
+
+- **A screen's attached context is no longer pasted into the visible transcript.** `Turn`
+  gained `displayText` and `contextLabel` (additive optionals, so SwiftData
+  lightweight-migrates). `Turn.text` is unchanged and still carries the composed turn —
+  it is the turn's identity for the outbox, for hydration and for the bridge's own
+  transcript — but the bubble now renders `visibleText`, the user's own half, under a
+  small "paperclip" caption naming what was attached. A Health snapshot is a page of
+  numbers; rendering it as something the user typed was both unreadable and untrue. The
+  Today tab's Discuss gets the same treatment through the same seam.
+
+- **`RunCoordinator` / `MacCoordinator` hold an `AttachedContext` rather than a bare
+  `String`.** The new shared value type (JesseCore) carries the body, the scope title and
+  the starters. `attach(context:to:)` and `attachedContext(for:)` keep their exact old
+  behavior, so the Today tab's Discuss is untouched: it attaches a title-less,
+  starter-less value and renders exactly as before.
+
+- **An ask is the one READ-ONLY Health turn, and the prompt says so.** `HealthAskPrompt`
+  (JesseCore, beside `TodayDiscuss` and `HealthNewDay`) is frozen wording with the same
+  scope discipline: it names its own scope positively and names the routines it must not
+  trigger negatively and by name. That matters more here than for the Today prompts —
+  this turn's body is a screenful of diet numbers containing "weigh-in", "new day" and
+  "dashboard", which are exactly the keywords the vault's routines route on. It forbids
+  logging a meal, a weigh-in or a workout, editing the diet log, rewriting the dashboard,
+  touching `Today.md`, and running start of day, the new-day health refresh, the scanners,
+  currency or cheatsheets. Tests pin that both routine phrases appear exactly once and
+  only inside the "do not run …" sentence.
+
+- **Three `Section("Title")` headers on Macros & calories became `Section { … } header:
+  { Text("Title") }`** so the section itself can carry the gesture. The two spellings
+  render identically; this one takes a modifier.
+
+### Notes
+
+- **macOS gets right-click and nothing on hover, deliberately.** This app has no
+  hover-reveal affordance anywhere — there is not one `onHover` in either shell — so
+  inventing one for this feature would be exactly the clutter the design rules out.
+  Right-click is the Mac's own gesture for "what can I do with this".
+
+- **Discoverability rests on the gesture plus the per-page toolbar entry.** No per-item
+  icon was added for it. If long-press turns out to go unnoticed on the item level, the
+  toolbar Ask is still there on every page, and the fix would be onboarding copy rather
+  than an icon on every card.
+
 ## [bridge 0.89.0] - 2026-08-21
 
 ### Changed

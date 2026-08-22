@@ -191,16 +191,31 @@ final class MacCoordinator {
     /// In memory only. An attachment describes a thread that has never been sent to, and
     /// such a thread is not in the store either — both die with the process, and the
     /// Today tab drops the attachment when its sheet is dismissed.
-    private var attachedContexts: [UUID: String] = [:]
+    ///
+    /// Widened from a bare `String` to `AttachedContext` for the Health tab's "Ask about
+    /// this" — which needs the scope TITLE (so the chat can say what "this" refers to
+    /// without pasting a page of numbers into the transcript) and the STARTERS its empty
+    /// state offers. The shared type lives in JesseCore, so the phone and this Mac cannot
+    /// grow two ideas of what a screen attached.
+    private var attachedContexts: [UUID: AttachedContext] = [:]
 
     /// Hold `context` against a thread opened without firing; its first send carries it.
     func attach(context: String, to threadID: UUID) {
+        attachedContexts[threadID] = AttachedContext(body: context)
+    }
+
+    /// Hold a titled attachment (the Health tab's ask) against a thread.
+    func attach(_ context: AttachedContext, to threadID: UUID) {
         attachedContexts[threadID] = context
     }
 
     /// The context waiting on this thread's first send, if any. nil once consumed —
     /// which is also what tells the composer that an empty send is no longer a turn.
-    func attachedContext(for threadID: UUID) -> String? { attachedContexts[threadID] }
+    func attachedContext(for threadID: UUID) -> String? { attachedContexts[threadID]?.body }
+
+    /// The whole attachment — title and starters included — for the composer's pinned
+    /// scope line and its opening questions.
+    func attachment(for threadID: UUID) -> AttachedContext? { attachedContexts[threadID] }
 
     /// Drop an attachment that will never be sent (its sheet was dismissed). A no-op
     /// once the first send has consumed it.
@@ -286,8 +301,9 @@ final class MacCoordinator {
     /// dropped one.
     func send(text: String, mode: JesseMode, thread: JesseThread, context: ModelContext) async {
         let attached = attachedContexts[thread.id]
-        let trimmed = attached.map { TodayThreadContext.firstMessage(context: $0, typed: text) }
-            ?? text.trimmingCharacters(in: .whitespacesAndNewlines)
+        let typed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        let trimmed = attached.map { TodayThreadContext.firstMessage(context: $0.body, typed: text) }
+            ?? typed
         // The guards run on the COMPOSED text and before the attachment is spent, so a
         // send refused because a turn is already running leaves the context attached for
         // the send that does go through.
@@ -301,6 +317,14 @@ final class MacCoordinator {
         if thread.modelContext == nil { context.insert(thread) }
 
         let userTurn = Turn(role: .user, text: trimmed)
+        // `trimmed` is what the MODEL is sent and stays the turn's identity; what the
+        // TRANSCRIPT shows is the user's own half. A Health snapshot is a page of numbers,
+        // and rendering it as something they typed would be unreadable and untrue. Mirrors
+        // the phone, through the same shared `Turn.visibleText`.
+        if let attached {
+            userTurn.displayText = typed
+            userTurn.contextLabel = attached.contextLabel
+        }
         userTurn.thread = thread
         context.insert(userTurn)
         thread.updatedAt = Date()

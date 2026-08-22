@@ -95,7 +95,13 @@ final class RunCoordinator {
     // In memory only. An attachment describes a thread that has never been sent to,
     // and such a thread is not persisted either — both die together with the process,
     // and `TodayTabView` drops the attachment when its sheet is dismissed.
-    private var attachedContexts: [UUID: String] = [:]
+    //
+    // Widened from a bare `String` to `AttachedContext` for the Health tab's "Ask about
+    // this", which needs two more things the string could not carry: the SCOPE TITLE (so
+    // the chat can say what "this" refers to without pasting a page of numbers into the
+    // transcript) and the STARTERS the empty state offers. The Today tab's Discuss is
+    // untouched: it attaches a title-less, starter-less value through the same call.
+    private var attachedContexts: [UUID: AttachedContext] = [:]
 
     // Not observed by views — just lifecycle bookkeeping.
     @ObservationIgnored private var tasks: [UUID: Task<Void, Never>] = [:]
@@ -436,12 +442,22 @@ final class RunCoordinator {
     /// Hold `context` against a thread that was OPENED without firing a turn; the
     /// thread's first send will carry it. Replaces any previous attachment.
     func attach(context: String, to threadID: UUID) {
+        attachedContexts[threadID] = AttachedContext(body: context)
+    }
+
+    /// Hold a titled attachment (the Health tab's ask) against a thread. Replaces any
+    /// previous one, exactly as the string form does.
+    func attach(_ context: AttachedContext, to threadID: UUID) {
         attachedContexts[threadID] = context
     }
 
+    /// The whole attachment waiting on this thread's next send — title and starters
+    /// included. The composer reads this to pin the scope line and offer the starters.
+    func attachment(for threadID: UUID) -> AttachedContext? { attachedContexts[threadID] }
+
     /// The context waiting on this thread's first send, if any. nil once consumed —
     /// which is also what tells the composer that an empty send is no longer a turn.
-    func attachedContext(for threadID: UUID) -> String? { attachedContexts[threadID] }
+    func attachedContext(for threadID: UUID) -> String? { attachedContexts[threadID]?.body }
 
     /// Drop an attachment that will never be sent (its screen was dismissed). A no-op
     /// once the first send has consumed it.
@@ -465,8 +481,9 @@ final class RunCoordinator {
               attachments: [JesseAttachment] = []) {
         let threadID = thread.id
         let attached = attachedContexts[threadID]
-        let trimmed = attached.map { TodayThreadContext.firstMessage(context: $0, typed: text) }
-            ?? text.trimmingCharacters(in: .whitespacesAndNewlines)
+        let typed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        let trimmed = attached.map { TodayThreadContext.firstMessage(context: $0.body, typed: text) }
+            ?? typed
         // The guards run on the COMPOSED text and before the attachment is spent, so a
         // send refused because a turn is already running leaves the context attached
         // for the send that does go through.
@@ -499,6 +516,16 @@ final class RunCoordinator {
         // Attachments are shown as persisted thumbnail previews (see `attachPreviews`)
         // rather than an appended "📎 Attached:" text line.
         let userTurn = Turn(role: .user, text: trimmed)
+        // `trimmed` is what the MODEL is sent — the screen's context composed ahead of
+        // whatever was typed — and it stays that, because it is the turn's identity for
+        // the outbox and for hydration. What the TRANSCRIPT shows is the user's own half:
+        // a Health snapshot is a page of numbers, and pasting it into their message bubble
+        // would both drown the conversation and claim they typed it. An empty typed half
+        // is the explicit "just look at it" send and renders as the context label alone.
+        if let attached {
+            userTurn.displayText = typed
+            userTurn.contextLabel = attached.contextLabel
+        }
         thread.turns.append(userTurn)
         if thread.title.isEmpty {
             thread.title = JesseThread.deriveTitle(from: trimmed)

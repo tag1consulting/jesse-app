@@ -23,6 +23,8 @@ struct NutrientStreaksDetail: View {
         NutrientStreaks.all(series: series, targets: targets)
     }
 
+    private var anchor: String { series.last?.date ?? "" }
+
     var body: some View {
         List {
             if streaks.isEmpty {
@@ -43,9 +45,11 @@ struct NutrientStreaksDetail: View {
                         } label: {
                             StreakRow(streak: streak)
                         }
+                        .askable(HealthAsk.streak(streak, anchor: anchor))
                     }
                 } header: {
                     Text("Streaks")
+                        .askable(HealthAsk.consistency(streaks, anchor: anchor, scope: .section))
                 } footer: {
                     Text(NutrientStreaks.gapRule)
                 }
@@ -53,6 +57,7 @@ struct NutrientStreaksDetail: View {
         }
         .navigationTitle("Consistency")
         .dietNavTitle(.inline)
+        .askPageToolbar(HealthAsk.consistency(streaks, anchor: anchor, scope: .page))
     }
 }
 

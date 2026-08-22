@@ -167,6 +167,23 @@ public final class JesseThread {
     // defaulted property → lightweight migration; a pre-sync row reads 0.
     public var archivedUpdatedMs: Int = 0
 
+    // The Health tab's "Ask about this" scope this conversation was opened for — a
+    // stable key over (area, scope, time range, subject), e.g.
+    // `health/foodJournal/item/d:2026-08-22/lunch`. It exists for ONE behavior: a second
+    // ask about the same thing on the same day RESUMES this conversation instead of
+    // starting a parallel one, which is what keeps a day of poking at the dashboard from
+    // becoming nine near-identical threads in the list.
+    //
+    // Nil on every thread that did not come from that gesture, which is almost all of
+    // them. Additive optional property → SwiftData lightweight-migrates existing stores
+    // with no migration code (matching `origin` / `aiTitle` / `lastDeliveredJobId`).
+    public var askScopeKey: String?
+    // The human scope title that key stands for ("Lunch · Aug 22"). Stored beside the key
+    // rather than re-derived, because the reading it named may be gone by the time the
+    // thread is read again (a meal edited, a window rolled), and the conversation is still
+    // about what it was about. Doubles as the thread's list title for an ask.
+    public var askScopeTitle: String?
+
     @Relationship(deleteRule: .cascade, inverse: \Turn.thread)
     public var turns: [Turn] = []
 
@@ -363,6 +380,28 @@ public final class Turn {
     @Relationship(deleteRule: .cascade, inverse: \TurnArtifact.turn)
     public var artifacts: [TurnArtifact] = []
 
+    // What the TRANSCRIPT shows for this turn, when that is not the whole of `text`.
+    //
+    // A screen can attach context to a conversation (the Today tab's Discuss, the Health
+    // tab's "Ask about this"), and the coordinator composes that context AHEAD of whatever
+    // the user typed — so `text` is what the model was actually sent and must stay so:
+    // it is the turn's identity for hydration matching, for the outbox, and for the
+    // bridge's own transcript. But a Health snapshot is a page of numbers, and pasting it
+    // into the user's own message bubble makes the transcript unreadable and claims they
+    // typed it.
+    //
+    // So `text` keeps the composed turn and this keeps the user's half. Nil means "there
+    // is nothing hidden — show `text`", which is every ordinary message. An EMPTY string
+    // is meaningful and distinct from nil: it is the explicit empty send ("just look at
+    // it"), where the whole turn was the context and there is no typed half to show.
+    // Additive optional property → SwiftData lightweight-migrates.
+    public var displayText: String?
+    // The scope that context named ("Lunch · Aug 22"), for the compact label the
+    // transcript puts above such a turn. Nil for turns that carried no attached context,
+    // and for one that carried an untitled one (which reads as the generic label — see
+    // `AttachedContext.contextLabel`).
+    public var contextLabel: String?
+
     public init(role: TurnRole, text: String, createdAt: Date = Date()) {
         self.id = UUID()
         self.role = role.rawValue
@@ -372,6 +411,15 @@ public final class Turn {
 
     public var roleValue: TurnRole { TurnRole(rawValue: role) ?? .user }
     public var isUser: Bool { roleValue == .user }
+
+    /// What a transcript renders for this turn: the user's own half when a screen's
+    /// context was composed into `text`, else `text` itself. Asked here rather than in
+    /// each bubble view so the phone and the Mac cannot answer it two ways.
+    public var visibleText: String { displayText ?? text }
+
+    /// Whether this turn carried context a screen attached — i.e. `text` holds more than
+    /// the transcript is showing. Drives the small "what this was about" label.
+    public var hasAttachedContext: Bool { displayText != nil }
 
     /// Attachment previews in a stable order (the relationship itself is unordered).
     public var orderedAttachments: [TurnAttachment] {

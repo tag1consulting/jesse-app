@@ -23,6 +23,15 @@ struct TodayScreen: View {
     /// judges on its own numbers alone (the same fallback an older bridge gets).
     private var judgeSeries: [NutrientDay]? { snapshot.isHistorical ? nil : snapshot.nutrientSeries }
     private var totals: MacroTotals { DietSemantics.dayTotals(today.meals) }
+    /// Which day every ask on this screen is about, and whether it is the live one.
+    private var askDay: HealthAskDay {
+        HealthAskDay(iso: today.date, isToday: !snapshot.isHistorical)
+    }
+    /// The ranked contributing foods behind a metric — the SAME builder the drill-down
+    /// sheet uses, so an ask and a tap agree about what fed a number.
+    private func askBreakdown(_ metric: ContributionMetric, _ gauge: MetricGauge) -> FoodBreakdown {
+        FoodContributions.breakdown(today.meals, metric: metric, total: gauge.value)
+    }
     private var net: NetCalories { NetCalories(intake: totals.cal, burned: DietSemantics.burnedCalories(today.exercise)) }
     // A reconstructed day renders with NO judgment; live/archived render full.
     private var mode: HistoryUI.Mode { HistoryUI.mode(fidelity: snapshot.fidelityKind) }
@@ -147,9 +156,11 @@ struct TodayScreen: View {
                 } label: {
                     MetricBarRow(gauge: row.gauge)
                 }
+                .askable(HealthAsk.metric(row.gauge, area: .macros, day: askDay))
             }
         } header: {
             Text("Last \(windowDays) days")
+                .askable(HealthAsk.rollingRead(rows, windowDays: windowDays, day: askDay))
         } footer: {
             Text(NutrientWindows.coverageFootnote)
         }
@@ -237,6 +248,8 @@ struct TodayScreen: View {
                         }
                         .buttonStyle(.plain)
                         .accessibilityLabel("Day type: \(DayStyleExplain.headline(dayStyle: today.dayStyle, isCarbLoad: gauges.isCarbLoad)). What this changes.")
+                        .askable(HealthAsk.dayStyle(today.dayStyle, isCarbLoad: gauges.isCarbLoad,
+                                                    gauges: gauges, day: askDay))
                     }
 
                     if model.historyUnsupported {
@@ -266,8 +279,10 @@ struct TodayScreen: View {
     private var summarySection: some View {
         if !isNeutral {
             Section {
-                DaySummaryCard(summary: DaySummary.make(gauges: gauges, hour: hour,
-                                                        hasFood: !today.meals.isEmpty))
+                let summary = DaySummary.make(gauges: gauges, hour: hour,
+                                              hasFood: !today.meals.isEmpty)
+                DaySummaryCard(summary: summary)
+                    .askable(HealthAsk.daySummary(summary, gauges: gauges, day: askDay))
             }
         }
     }
@@ -286,6 +301,9 @@ struct TodayScreen: View {
                 }
                 .padding(.vertical, 8)
                 .listRowBackground(Color.clear)
+                // A rebuilt day has no targets, so the honest ask about its calories is
+                // the food that produced them — never a gauge that would imply a goal.
+                .askable(HealthAsk.foodJournalSection(today: today, day: askDay))
             } else {
                 CaloriesHeroRing(gauge: gauges.calories, net: gauges.net) {
                     openDrilldown(Explainers.calories(gauges.calories, isCarbLoad: gauges.isCarbLoad),
@@ -293,6 +311,8 @@ struct TodayScreen: View {
                 }
                 .padding(.vertical, 8)
                 .listRowBackground(Color.clear)
+                .askable(HealthAsk.metric(gauges.calories, area: .calories, day: askDay,
+                                          breakdown: askBreakdown(.calories, gauges.calories)))
             }
         }
     }
@@ -309,9 +329,12 @@ struct TodayScreen: View {
                 HStack(alignment: .top, spacing: 8) {
                     ForEach(Macro.allCases, id: \.self) { macro in
                         NeutralMacroRing(label: macro.displayName, grams: totals.grams(for: macro))
+                            .askable(HealthAsk.metric(gauges.gauge(for: macro), area: .macros,
+                                                      day: askDay))
                     }
                 }
                 .listRowBackground(Color.clear)
+                .askable(HealthAsk.macroRings(gauges, day: askDay))
             } else {
                 HStack(alignment: .top, spacing: 8) {
                     ForEach(gauges.orderedMacros, id: \.macro) { entry in
@@ -319,9 +342,15 @@ struct TodayScreen: View {
                             openDrilldown(Explainers.macro(entry.macro, gauges: gauges),
                                           metric: .macro(entry.macro), gauge: entry.gauge)
                         }
+                        // Per-ring first, the row of rings second: a press on a ring means
+                        // that macro, a press on the space around them means the set.
+                        .askable(HealthAsk.metric(entry.gauge, area: .macros, day: askDay,
+                                                  breakdown: askBreakdown(.macro(entry.macro),
+                                                                          entry.gauge)))
                     }
                 }
                 .listRowBackground(Color.clear)
+                .askable(HealthAsk.macroRings(gauges, day: askDay))
             }
         }
     }
@@ -337,17 +366,19 @@ struct TodayScreen: View {
                 } label: {
                     WeightCardView(card: card)
                 }
+                .askable(HealthAsk.weightCard(card, day: askDay))
             }
         }
     }
 
     @ViewBuilder
     private var coachHeadlineSection: some View {
-        if let note = snapshot.coach?.notes.first {
+        if let coach = snapshot.coach, let note = coach.notes.first {
             Section {
                 Text(CoachHTML.plainText(note))
                     .font(.subheadline).lineLimit(2).truncationMode(.tail)
                     .foregroundStyle(.secondary)
+                    .askable(HealthAsk.coach(coach, scope: .section, day: askDay))
             }
         }
     }
@@ -409,6 +440,12 @@ struct TodayScreen: View {
                 NavRow(title: "Macros & calories", icon: "chart.bar.fill",
                        subtitle: macrosSubtitle)
             }
+            // A nav row IS its section's entry point, so long-pressing one asks about the
+            // section it leads to. That is what gives every area a section-level ask
+            // without a single new control on the screen.
+            .askable(HealthAsk.macrosSection(today: today, gauges: gauges, hour: hour,
+                                             judgeSeries: judgeSeries, neutral: isNeutral,
+                                             day: askDay))
 
             // Consistency: not "what is a typical day" (that is the rolling median above)
             // but "is this being held" — a run of days meeting each goal. A nav row rather
@@ -424,6 +461,7 @@ struct TodayScreen: View {
                     } label: {
                         NavRow(title: "Consistency", icon: "flame", subtitle: subtitle)
                     }
+                    .askable(HealthAsk.consistency(streaks, anchor: today.date, scope: .section))
                 }
             }
 
@@ -440,6 +478,9 @@ struct TodayScreen: View {
                     NavRow(title: "Sources", icon: "list.bullet.rectangle",
                            subtitle: sourcesSubtitle)
                 }
+                .askable(HealthAsk.sourcesOverview(
+                    NutrientSources.overview(sources, windowDays: sourcesRange),
+                    windowDays: sourcesRange, anchor: today.date, scope: .section))
             }
 
             // Patterns: what moved together across weight, training and intake. Guarded hard
@@ -457,29 +498,37 @@ struct TodayScreen: View {
                     } label: {
                         NavRow(title: "Patterns", icon: "chart.dots.scatter", subtitle: subtitle)
                     }
+                    .askable(HealthAsk.patterns(report, anchor: today.date, scope: .section))
                 }
             }
 
             NavigationLink {
-                FoodJournalDetail(today: today, proposed: snapshot.proposed)
+                FoodJournalDetail(today: today, proposed: snapshot.proposed, day: askDay)
             } label: {
                 NavRow(title: "Food journal", icon: "fork.knife",
                        subtitle: "\(today.meals.count) \(today.meals.count == 1 ? "meal" : "meals") · \(DietSemantics.fmt(DietSemantics.dayTotals(today.meals).cal)) cal")
             }
+            .askable(HealthAsk.foodJournalSection(today: today, day: askDay))
 
             NavigationLink {
-                ExerciseDetail(exercise: today.exercise)
+                ExerciseDetail(exercise: today.exercise, day: askDay)
             } label: {
                 NavRow(title: "Exercise", icon: "figure.run",
                        subtitle: "\(today.exercise.count) \(today.exercise.count == 1 ? "session" : "sessions") · \(DietSemantics.fmt(DietSemantics.burnedCalories(today.exercise))) cal")
             }
+            .askable(HealthAsk.exerciseSection(today.exercise, day: askDay))
 
             // Weight & trend stays reachable on a past day — the chart is inherently
             // historical.
             unavailableOr(section: snapshot.weightSeries?.isEmpty == false ? snapshot.weightSeries : nil,
                           label: "Weight", errors: snapshot.errors,
                           icon: "scalemass", title: "Weight & trend",
-                          subtitle: weightSubtitle) { series in
+                          subtitle: weightSubtitle,
+                          ask: { series in
+                              HealthAsk.weightTrend(series: series, progress: snapshot.progress,
+                                                    rangeLabel: "the full history",
+                                                    rangeDays: nil, scope: .section)
+                          }) { series in
                 WeightTrendDetail(series: series, progress: snapshot.progress)
             }
 
@@ -488,14 +537,21 @@ struct TodayScreen: View {
             if HistoryUI.showsCurrentStateRows(isHistorical: snapshot.isHistorical) {
                 unavailableOr(section: snapshot.progress, label: "Progress", errors: snapshot.errors,
                               icon: "target", title: "Progress & pace",
-                              subtitle: snapshot.progress?.trajectory) { progress in
-                    ProgressPaceDetail(progress: progress, today: today, series: snapshot.weightSeries)
+                              subtitle: snapshot.progress?.trajectory,
+                              ask: { progress in
+                                  HealthAsk.progress(progress, today: today,
+                                                     series: snapshot.weightSeries,
+                                                     scope: .section, day: askDay)
+                              }) { progress in
+                    ProgressPaceDetail(progress: progress, today: today,
+                                       series: snapshot.weightSeries, day: askDay)
                 }
 
                 unavailableOr(section: snapshot.coach, label: "Coach", errors: snapshot.errors,
                               icon: "quote.bubble", title: "Coach's notes",
-                              subtitle: snapshot.coach?.title) { coach in
-                    CoachDetail(coach: coach)
+                              subtitle: snapshot.coach?.title,
+                              ask: { HealthAsk.coach($0, scope: .section, day: askDay) }) { coach in
+                    CoachDetail(coach: coach, day: askDay)
                 }
             }
         }
@@ -518,16 +574,22 @@ struct TodayScreen: View {
 
     /// A nav row that pushes `destination(value)` when `section` is present, else a
     /// muted "unavailable" row surfaced from `errors` (never hidden).
+    ///
+    /// `ask` is the section context the row's long-press offers — nil for a row whose
+    /// section could not be read, where there is no reading to ask about and the muted row
+    /// already says why.
     @ViewBuilder
     private func unavailableOr<Value, Destination: View>(
         section: Value?, label: String, errors: [String],
         icon: String, title: String, subtitle: String?,
+        ask: @escaping (Value) -> HealthAskContext,
         @ViewBuilder destination: @escaping (Value) -> Destination
     ) -> some View {
         if let value = section {
             NavigationLink { destination(value) } label: {
                 NavRow(title: title, icon: icon, subtitle: subtitle)
             }
+            .askable(ask(value))
         } else {
             NavRow(title: title, icon: icon,
                    subtitle: unavailableReason(label: label, errors: errors), muted: true)
