@@ -42,6 +42,10 @@ struct NutrientSourcesOverview: View {
         NutrientSources.overview(series, windowDays: windowDays)
     }
 
+    /// The range's last logged day — the anchor every Sources ask is dated from, so two
+    /// asks about "the last 30 days" a week apart are two different readings.
+    private var anchor: String { series.last?.date ?? "" }
+
     var body: some View {
         List {
             Section {
@@ -65,6 +69,7 @@ struct NutrientSourcesOverview: View {
                         } label: {
                             NutrientSourceSummaryRow(ranking: r)
                         }
+                        .askable(HealthAsk.sourceRanking(r, anchor: anchor))
                     }
                 } header: {
                     Text("Last \(windowDays) days")
@@ -74,6 +79,8 @@ struct NutrientSourcesOverview: View {
         }
         .navigationTitle("Sources")
         .dietNavTitle(.inline)
+        .askPageToolbar(HealthAsk.sourcesOverview(rankings, windowDays: windowDays,
+                                                  anchor: anchor, scope: .page))
     }
 }
 
@@ -171,6 +178,8 @@ struct NutrientSourcesDetail: View {
         NutrientSources.rank(series, nutrient: nutrient, windowDays: windowDays)
     }
 
+    private var anchor: String { series.last?.date ?? "" }
+
     var body: some View {
         let r = ranking
         return List {
@@ -196,9 +205,11 @@ struct NutrientSourcesDetail: View {
                 Section {
                     ForEach(r.entries) { entry in
                         NutrientSourceRow(entry: entry, nutrient: nutrient)
+                            .askable(HealthAsk.sourceEntry(entry, in: r, anchor: anchor))
                     }
                 } header: {
                     Text("Top sources")
+                        .askable(HealthAsk.sourceRanking(r, anchor: anchor, scope: .section))
                 }
                 Section { CaveatRow(text: NutrientSources.unknownRule) }
             }
@@ -223,6 +234,7 @@ struct NutrientSourcesDetail: View {
         }
         .navigationTitle("\(nutrient.fullName) sources")
         .dietNavTitle(.inline)
+        .askPageToolbar(HealthAsk.sourceRanking(ranking, anchor: anchor, scope: .page))
     }
 
     /// The measured total the shares are taken against, marked "≥" whenever an unmeasured

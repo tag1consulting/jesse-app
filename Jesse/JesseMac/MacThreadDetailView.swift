@@ -86,11 +86,42 @@ struct MacThreadDetailView: View {
         }
     }
 
+    /// The attachment a screen is holding against this conversation — its scope title
+    /// and its starters as well as its body. Fully populated by the Health tab's "Ask
+    /// about this"; body-only for the Today tab's Discuss, whose two extra affordances
+    /// below then simply don't render.
+    private var attachment: AttachedContext? { coordinator.attachment(for: thread.id) }
+
     private var composer: some View {
         VStack(spacing: 8) {
             if let error = coordinator.lastError {
                 Text(error).font(.caption).foregroundStyle(.red)
                     .frame(maxWidth: .infinity, alignment: .leading)
+            }
+            // Says why the composer is empty and why Send works with nothing typed — and,
+            // for an ask, NAMES the reading it is about, so "this" is never ambiguous. One
+            // small caption, not a banner; the scope is also the window's title.
+            if let attachment, thread.orderedTurns.isEmpty {
+                Label(attachment.title.map { "Asking about \($0). Send an empty message to have Jesse just read it." }
+                        ?? "This item is attached. Ask about it, or send an empty message to have Jesse just read it.",
+                      systemImage: "paperclip")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
+            // Opening questions, in the EMPTY state only: gone the moment anything is
+            // typed, one is clicked, or the conversation has a turn. Clicking one sends it
+            // through the same `send` path as anything typed.
+            if let starters = attachment?.starters, !starters.isEmpty,
+               thread.orderedTurns.isEmpty, draft.isEmpty, !running {
+                HStack(spacing: 8) {
+                    ForEach(starters, id: \.self) { starter in
+                        Button(starter) { draft = starter; send() }
+                            .font(.caption)
+                            .buttonStyle(.bordered)
+                    }
+                    Spacer(minLength: 0)
+                }
             }
             HStack(alignment: .bottom, spacing: 10) {
                 Picker("", selection: $mode) {
@@ -252,11 +283,25 @@ struct MacTurnBubble: View {
         if turn.isUser {
             HStack {
                 Spacer(minLength: 60)
-                Text(turn.text)
-                    .textSelection(.enabled)
-                    .padding(10)
-                    .background(.tint.opacity(0.85), in: .rect(cornerRadius: 12))
-                    .foregroundStyle(.white)
+                VStack(alignment: .trailing, spacing: 2) {
+                    // What a screen attached to this turn, when it attached something.
+                    // One caption naming the scope — never the snapshot itself, which
+                    // `turn.text` still carries for the model. Mirrors iOS.
+                    if turn.hasAttachedContext, let label = turn.contextLabel {
+                        Label(label, systemImage: "paperclip")
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                    }
+                    // An ask sent on an empty composer has no typed half to draw — the
+                    // caption above is the whole turn.
+                    if !turn.visibleText.isEmpty {
+                        Text(turn.visibleText)
+                            .textSelection(.enabled)
+                            .padding(10)
+                            .background(.tint.opacity(0.85), in: .rect(cornerRadius: 12))
+                            .foregroundStyle(.white)
+                    }
+                }
             }
         } else {
             HStack(alignment: .top, spacing: 10) {

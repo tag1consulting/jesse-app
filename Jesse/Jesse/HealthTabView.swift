@@ -27,6 +27,19 @@ struct HealthTabView: View {
     @State private var showQuickLog = false
     @State private var confirmNewDay = false
 
+    /// The conversation an "Ask about this" opened.
+    ///
+    /// Presented MODALLY from this tab rather than pushed into the Chats stack, for the
+    /// reasons the Today tab already writes down: there is no precedent for one tab
+    /// driving another's navigation, `ContentView` owns its `path` privately (and in two
+    /// different shapes on iPhone and iPad), and a sheet keeps the user where they were —
+    /// dismissing it returns them to the card they pressed.
+    @State private var askThread: JesseThread?
+    /// The thread an ask STAGED, remembered only so its attached context can be dropped if
+    /// the sheet is dismissed without a send. `.sheet(item:)` nils its binding before
+    /// calling `onDismiss`, so the id has to be held separately.
+    @State private var stagedAskID: UUID?
+
     /// The same probe the Today tab and the Chats list use, asked here so the dashboard
     /// goes read-only BEFORE a tap rather than after a turn is fired into a void.
     @State private var reachability = BridgeReachabilityModel()
@@ -41,6 +54,33 @@ struct HealthTabView: View {
                 // file, so it moves inward and away from the mis-tap slot. See README,
                 // "UI conventions".
                 .toolbar {
+                    // "Ask" is declared FIRST, so it sits innermost — farthest from the
+                    // rightmost slot a mis-tap lands in, which belongs to quick log. It is
+                    // declared HERE rather than inside the dashboard because a toolbar item
+                    // declared on a child view lands AFTER the ones declared on it from
+                    // outside, which would have put Ask in exactly that slot. See README,
+                    // "UI conventions", and `HealthDashboardModel.pageAskContext`.
+                    //
+                    // Present on every day, past or live: reading a past day is precisely
+                    // when a question comes up, and an ask starts no turn and writes
+                    // nothing, so it is not gated on reachability either — the composer it
+                    // opens is the one screen with a visible outbox and a per-message Retry.
+                    //
+                    // The context is built INSIDE the action, not beside the label: a
+                    // page context is the union of every section on the day, and building
+                    // one on every render of a screen nobody has asked about yet is work
+                    // for nothing. The button's presence is gated on the cheap question
+                    // (is anything loaded?) instead.
+                    if model.snapshot != nil {
+                        ToolbarItem(placement: .primaryAction) {
+                            Button {
+                                if let ask = model.pageAskContext { openAsk(ask) }
+                            } label: {
+                                Image(systemName: "text.bubble")
+                            }
+                            .accessibilityLabel("Ask about this page")
+                        }
+                    }
                     // Quick log and "Start new day" are both today-only (they act on
                     // today), so they're hidden while paging back through a past day.
                     //
@@ -69,6 +109,16 @@ struct HealthTabView: View {
                                 .disabled(model.isReadOnly)
                         }
                     }
+                }
+                // Every askable card, row and chart on the dashboard and its sub-pages
+                // reaches the chat through this one injection — the environment carries it
+                // down the whole navigation stack, so a screen added later is askable the
+                // moment it uses `.askable`.
+                .environment(\.healthAsk, HealthAskAction { openAsk($0) })
+                .sheet(item: $askThread, onDismiss: dropUnsentAsk) { thread in
+                    // `hidesTabBar: false`: a sheet already covers the tab bar, and asking
+                    // the detail view to hide it would leave it hidden after dismissal.
+                    NavigationStack { ThreadDetailView(thread: thread, hidesTabBar: false) }
                 }
                 .sheet(isPresented: $showQuickLog) {
                     QuickLogSheet { text in
@@ -127,6 +177,26 @@ struct HealthTabView: View {
         model.isNetworkUnreachable = shouldShowOfflineBanner(
             isConfigured: ConfigStore.load().isConfigured,
             reachability: reachability.state)
+    }
+
+    // MARK: - Ask about this
+
+    /// Open the chat about whatever was pressed: today's conversation about that exact
+    /// reading if there is one, else a fresh one carrying the snapshot.
+    private func openAsk(_ context: HealthAskContext) {
+        let thread = HealthAskOpener.open(context, coordinator: coordinator,
+                                          modelContext: self.context)
+        // Only a STAGED thread has an attachment worth dropping on dismissal; a resumed
+        // one is already in the store and its re-attachment is spent by the next send.
+        stagedAskID = thread.modelContext == nil ? thread.id : nil
+        askThread = thread
+    }
+
+    /// Dismissing an ask without sending drops its context with it — a no-op once the
+    /// first send has consumed it.
+    private func dropUnsentAsk() {
+        if let id = stagedAskID { coordinator.clearAttachedContext(for: id) }
+        stagedAskID = nil
     }
 
     /// Fire the fixed morning refresh on a fresh Tell thread, then return — the

@@ -51,6 +51,10 @@ struct MacrosCaloriesDetail: View {
 
     /// The history the buffered gauges take their color from — today's day only.
     private var judgeSeries: [NutrientDay]? { isHistorical ? nil : nutrientSeries }
+    /// Which day every ask on this page is about.
+    private var askDay: HealthAskDay {
+        HealthAskDay(iso: today.date, isToday: !isHistorical)
+    }
     private var g: DietGauges { DietSemantics.gauges(for: today, hour: hour, series: judgeSeries) }
     private var totals: MacroTotals { DietSemantics.dayTotals(today.meals) }
     private var net: NetCalories { NetCalories(intake: totals.cal, burned: DietSemantics.burnedCalories(today.exercise)) }
@@ -82,6 +86,9 @@ struct MacrosCaloriesDetail: View {
         }
         .navigationTitle("Macros & calories")
         .dietNavTitle(.inline)
+        .askPageToolbar(HealthAsk.macrosPage(today: today, gauges: g, hour: hour,
+                                             judgeSeries: judgeSeries, neutral: neutral,
+                                             day: askDay))
         .sheet(item: $explainer) { ExplainerSheet(explainer: $0) }
     }
 
@@ -100,9 +107,13 @@ struct MacrosCaloriesDetail: View {
             }
             micronutrientSection
             rollingWindowSection
-            Section("Net calories") {
+            Section {
                 NetCalorieBar(net: g.net)
                     .onTapGesture { explainer = Explainers.netCalories(g.net) }
+                    .askable(HealthAsk.netCalories(g.net, day: askDay))
+            } header: {
+                Text("Net calories")
+                    .askable(HealthAsk.netCalories(g.net, day: askDay))
             }
             Section {
                 legend
@@ -200,9 +211,13 @@ struct MacrosCaloriesDetail: View {
         withFoods.drilldown = FoodDrilldown.build(meals: today.meals, metric: metric,
                                                   gauge: gauge, isCarbLoad: g.isCarbLoad,
                                                   series: nutrientSeries, targets: today.targets)
+        // The ask reuses the drill-down's OWN ranked contributors — one builder, so the
+        // long-press and the tap can never disagree about what fed the number.
+        let breakdown = withFoods.drilldown?.breakdown
         return MetricBarRow(gauge: gauge, isSubEntry: isSubEntry, depth: depth) {
             explainer = withFoods
         }
+        .askable(HealthAsk.metric(gauge, area: .macros, day: askDay, breakdown: breakdown))
     }
 
     // The trailing-window rows, whose number is a span of days rather than today. They sit
@@ -213,7 +228,7 @@ struct MacrosCaloriesDetail: View {
     @ViewBuilder private var rollingWindowSection: some View {
         let rows = windowRows
         if !rows.isEmpty {
-            Section("Over the last week") {
+            Section {
                 ForEach(rows, id: \.nutrient) { entry in
                     windowBar(entry.nutrient, entry.gauge)
                 }
@@ -223,6 +238,11 @@ struct MacrosCaloriesDetail: View {
                 Text(DietSemantics.rollingWindowFootnote)
                     .font(.caption).foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
+            } header: {
+                // A `Text` header rather than `Section("…")` so the section itself is
+                // askable. The two spellings render identically; this one takes a modifier.
+                Text("Over the last week")
+                    .askable(HealthAsk.rollingWindowSection(rows.map(\.gauge), day: askDay))
             }
         }
     }
@@ -235,7 +255,9 @@ struct MacrosCaloriesDetail: View {
                 through: today.rolling7?.to, isCarbLoad: g.isCarbLoad)
         }
         let sheet = ex
+        let breakdown = ex.drilldown?.breakdown
         return MetricBarRow(gauge: gauge) { explainer = sheet }
+            .askable(HealthAsk.metric(gauge, area: .macros, day: askDay, breakdown: breakdown))
     }
 
     // The Micronutrients section — now the two standalone MINERALS (sodium, potassium)
@@ -247,11 +269,14 @@ struct MacrosCaloriesDetail: View {
     // neither mineral carries a known value that day.
     @ViewBuilder private var micronutrientSection: some View {
         if hasMinerals {
-            Section("Micronutrients") {
+            Section {
                 ForEach(minerals, id: \.nutrient) { entry in
                     bar(entry.gauge, Explainers.micronutrient(entry.nutrient, gauge: entry.gauge),
                         metric: .micronutrient(entry.nutrient))
                 }
+            } header: {
+                Text("Micronutrients")
+                    .askable(HealthAsk.mineralsSection(minerals.map(\.gauge), day: askDay))
             }
         }
     }
@@ -319,6 +344,9 @@ struct NetCalorieBar: View {
 struct FoodJournalDetail: View {
     let today: DietToday
     let proposed: DietProposed?
+    /// The day this journal belongs to, so an ask about a meal names the right date
+    /// rather than assuming today.
+    let day: HealthAskDay
 
     private var meals: [DietMeal] { DietSemantics.sortedMeals(today.meals) }
     private var grand: MacroTotals { DietSemantics.dayTotals(today.meals) }
@@ -336,6 +364,7 @@ struct FoodJournalDetail: View {
         .listStyle(.plain)
         .navigationTitle("Food journal")
         .dietNavTitle(.inline)
+        .askPageToolbar(HealthAsk.foodJournalPage(today: today, proposed: proposed, day: day))
     }
 
     // A day-summary card: total calories large, one stacked bar of where they came
@@ -357,6 +386,7 @@ struct FoodJournalDetail: View {
                 }
             }
             .cardRow()
+            .askable(HealthAsk.foodJournalSection(today: today, day: day))
         }
     }
 
@@ -372,13 +402,17 @@ struct FoodJournalDetail: View {
                             .font(.subheadline.weight(.semibold).monospacedDigit())
                     }
                     ForEach(Array(meal.items.enumerated()), id: \.offset) { _, it in
+                        // The food's own ask sits INSIDE the meal's: a press on a row means
+                        // that food, a press anywhere else on the card means the meal.
                         itemRow(it)
+                            .askable(HealthAsk.food(it, in: meal, day: day))
                     }
                     Divider()
                     subtotalRow(DietSemantics.subtotal(of: meal))
                 }
             }
             .cardRow()
+            .askable(HealthAsk.meal(meal, day: day))
         }
     }
 
@@ -440,6 +474,7 @@ struct FoodJournalDetail: View {
                     }
                 }
                 .cardRow()
+                .askable(HealthAsk.idea(idea, day: day))
             }
             if let source = proposed.source {
                 Text("Source: \(source)").font(.caption2).foregroundStyle(.tertiary)
@@ -471,6 +506,9 @@ private extension View {
 
 struct ExerciseDetail: View {
     let exercise: [DietExercise]
+    /// The day these sessions belong to — an ask about a workout on a paged-back day must
+    /// name that day, not today.
+    let day: HealthAskDay
     private var sessions: [DietExercise] { DietSemantics.sortedExercise(exercise) }
 
     private let columns = [GridItem(.flexible(), alignment: .topLeading),
@@ -486,11 +524,13 @@ struct ExerciseDetail: View {
             }
             ForEach(Array(sessions.enumerated()), id: \.offset) { _, ex in
                 card(ex).cardRow()
+                    .askable(HealthAsk.workout(ex, day: day, alongside: sessions))
             }
         }
         .listStyle(.plain)
         .navigationTitle("Exercise")
         .dietNavTitle(.inline)
+        .askPageToolbar(HealthAsk.exercisePage(exercise, day: day))
     }
 
     private func card(_ ex: DietExercise) -> some View {
@@ -541,8 +581,16 @@ struct ProgressPaceDetail: View {
     let progress: DietProgress
     let today: DietToday
     let series: [WeightPoint]?
+    let day: HealthAskDay
 
     @State private var explainer: Explainer?
+
+    /// This page's one ask context — the whole progress picture. Every section on the
+    /// page offers the same one: pace, goals and body composition are one reading, and
+    /// splitting them would hand the agent a third of the story.
+    private var ask: HealthAskContext {
+        HealthAsk.progress(progress, today: today, series: series, scope: .page, day: day)
+    }
 
     private var currentWeight: Double? {
         HealthDisplay.weightCard(today: today, series: series)?.lbs
@@ -557,12 +605,13 @@ struct ProgressPaceDetail: View {
         List {
             goalsSection
             if let t = DietSemantics.countdownTarget(targets), let text = DietSemantics.countdownText(t) {
-                Section { countdownRow(t, text: text) }
+                Section { countdownRow(t, text: text).askable(ask) }
             }
             if !targets.isEmpty {
                 Section("Toward targets") {
                     ForEach(targets) { t in
                         progressBar(to: t.weight, label: t.barLabel, title: t.title)
+                            .askable(ask)
                     }
                 }
             }
@@ -578,22 +627,26 @@ struct ProgressPaceDetail: View {
                     }
                 }
                 .listRowInsets(EdgeInsets(top: 8, leading: 16, bottom: 8, trailing: 16))
+                .askable(ask)
             }
             if let traj = progress.trajectory {
                 Section {
                     Label(traj, systemImage: "point.topleft.down.to.point.bottomright.curvepath")
                         .font(.subheadline)
                         .padding(.vertical, 4)
+                        .askable(ask)
                 }
             }
             if let bf = today.weight?.bf, let lbs = today.weight?.lbs {
                 Section("Body composition (today)") {
                     BodyCompBar(totalLbs: lbs, bfPct: bf)
+                        .askable(ask)
                 }
             }
         }
         .navigationTitle("Progress & pace")
         .dietNavTitle(.inline)
+        .askPageToolbar(ask)
         .sheet(item: $explainer) { ExplainerSheet(explainer: $0) }
     }
 
@@ -612,6 +665,7 @@ struct ProgressPaceDetail: View {
                     }
                 }
                 .listRowInsets(EdgeInsets(top: 8, leading: 16, bottom: 8, trailing: 16))
+                .askable(ask)
             }
         }
     }
@@ -714,16 +768,23 @@ struct BodyCompBar: View {
 
 struct CoachDetail: View {
     let coach: DietCoach
+    let day: HealthAskDay
+
+    /// One reading, so one context: the notes, what's ahead and the quote are the coach's
+    /// single message about the day, and an ask on any of them carries all of it.
+    private var ask: HealthAskContext {
+        HealthAsk.coach(coach, scope: .page, day: day)
+    }
 
     var body: some View {
         List {
             if let title = coach.title {
-                Section { Text(title).font(.headline) }
+                Section { Text(title).font(.headline).askable(ask) }
             }
             if !coach.notes.isEmpty {
                 Section("Notes") {
                     ForEach(Array(coach.notes.enumerated()), id: \.offset) { _, note in
-                        Text(CoachHTML.attributed(note)).font(.body)
+                        Text(CoachHTML.attributed(note)).font(.body).askable(ask)
                     }
                 }
             }
@@ -731,6 +792,7 @@ struct CoachDetail: View {
                 Section("What's ahead") {
                     ForEach(Array(coach.ahead.enumerated()), id: \.offset) { _, item in
                         Label { Text(CoachHTML.attributed(item)) } icon: { Image(systemName: "arrow.right.circle") }
+                            .askable(ask)
                     }
                 }
             }
@@ -747,10 +809,12 @@ struct CoachDetail: View {
                     }
                     .frame(maxWidth: .infinity)
                     .multilineTextAlignment(.center)
+                    .askable(ask)
                 }
             }
         }
         .navigationTitle("Coach's notes")
         .dietNavTitle(.inline)
+        .askPageToolbar(ask)
     }
 }

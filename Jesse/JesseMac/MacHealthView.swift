@@ -31,6 +31,19 @@ struct MacHealthView: View {
     @State private var model: HealthDashboardModel
     @State private var confirmNewDay = false
 
+    /// The conversation an "Ask about this" opened.
+    ///
+    /// Presented MODALLY from this tab rather than selected in the Chats tab's sidebar,
+    /// for the reason the Mac's Today tab already writes down: the two tabs are separate
+    /// view trees and `MacRootView` owns its `selection` privately, so reaching across
+    /// would mean lifting that binding into the shell and switching tabs under the user
+    /// mid-gesture. The conversation is a real thread in the store, so it is in the
+    /// sidebar afterwards either way.
+    @State private var askThread: JesseThread?
+    /// The thread an ask STAGED, remembered only so its attached context can be dropped if
+    /// the sheet is closed without a send.
+    @State private var stagedAskID: UUID?
+
     /// The Mac's reachability probe — the same shared model the phone drives, and the
     /// thing this tab previously had no version of.
     @State private var reachability = BridgeReachabilityModel()
@@ -57,6 +70,22 @@ struct MacHealthView: View {
                 // does not have); Settings is opened least often and is farthest inward.
                 // See README, "UI conventions".
                 .toolbar {
+                    // Declared FIRST, so Ask sits leftmost — inward of Refresh, which is
+                    // the cheap repeatable one that owns the rightmost slot. It is declared
+                    // in the shell rather than inside the dashboard because a toolbar item
+                    // declared on a child view lands AFTER the ones declared from outside,
+                    // which would have put Ask in exactly that slot. Mirrors the phone.
+                    // The context is built INSIDE the action — see the phone's note.
+                    if model.snapshot != nil {
+                        ToolbarItem {
+                            Button {
+                                if let ask = model.pageAskContext { openAsk(ask) }
+                            } label: {
+                                Label("Ask", systemImage: "text.bubble")
+                            }
+                            .help("Ask Jesse about this page")
+                        }
+                    }
                     ToolbarItem {
                         Button { openSettings() } label: {
                             Label("Settings", systemImage: "gearshape")
@@ -81,6 +110,13 @@ struct MacHealthView: View {
                         .keyboardShortcut("r", modifiers: .command)
                         .help("Refresh the day on screen")
                     }
+                }
+                // Every askable card, row and chart on the dashboard and its sub-pages
+                // reaches the chat through this one injection — the environment carries it
+                // down the whole navigation stack.
+                .environment(\.healthAsk, HealthAskAction { openAsk($0) })
+                .sheet(item: $askThread, onDismiss: dropUnsentAsk) { thread in
+                    MacHealthAskSheet(thread: thread) { askThread = nil }
                 }
                 // A tap could kick off the long morning routine, so confirm first.
                 .confirmationDialog("Start new day", isPresented: $confirmNewDay) {
@@ -112,6 +148,25 @@ struct MacHealthView: View {
             reachability: reachability.state)
     }
 
+    // MARK: - Ask about this
+
+    /// Open the chat about whatever was right-clicked: today's conversation about that
+    /// exact reading if there is one, else a fresh one carrying the snapshot.
+    private func openAsk(_ ask: HealthAskContext) {
+        let thread = MacHealthAskOpener.open(ask, coordinator: coordinator,
+                                             modelContext: context)
+        // Only a STAGED thread has an attachment worth dropping on dismissal.
+        stagedAskID = thread.modelContext == nil ? thread.id : nil
+        askThread = thread
+    }
+
+    /// Closing an ask without sending drops its context with it — a no-op once the first
+    /// send has consumed it.
+    private func dropUnsentAsk() {
+        if let id = stagedAskID { coordinator.clearAttachedContext(for: id) }
+        stagedAskID = nil
+    }
+
     /// Fire the fixed morning refresh on a fresh Tell thread. The thread shows up in the
     /// Chats sidebar and the coordinator's `onTurnFinished` posts the completion
     /// notification when it lands; hit Refresh (or ⌘R) to repaint the dashboard. No tab
@@ -122,5 +177,25 @@ struct MacHealthView: View {
         context.insert(thread)
         try? context.save()
         Task { await coordinator.send(text: HealthNewDay.prompt, mode: .tell, thread: thread, context: context) }
+    }
+}
+
+
+/// The conversation an ask opens, in a sheet sized like the Today tab's — one window
+/// shape for "a conversation opened from a tab", not two.
+private struct MacHealthAskSheet: View {
+    let thread: JesseThread
+    let onDone: () -> Void
+
+    var body: some View {
+        NavigationStack {
+            MacThreadDetailView(thread: thread)
+                .toolbar {
+                    ToolbarItem(placement: .confirmationAction) {
+                        Button("Done", action: onDone)
+                    }
+                }
+        }
+        .frame(minWidth: 640, idealWidth: 760, minHeight: 520, idealHeight: 620)
     }
 }

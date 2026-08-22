@@ -25,6 +25,12 @@ struct DietCorrelationsDetail: View {
                                 exercise: exerciseSeries)
     }
 
+    /// The last day any of the three histories reaches — what dates a Patterns ask.
+    private var anchor: String {
+        [weightSeries.last?.date, nutrientSeries.last?.date, exerciseSeries.last?.date]
+            .compactMap { $0 }.max() ?? ""
+    }
+
     var body: some View {
         let r = report
         return List {
@@ -38,9 +44,11 @@ struct DietCorrelationsDetail: View {
                 Section {
                     ForEach(r.associations) { a in
                         AssociationRow(association: a)
+                            .askable(HealthAsk.association(a, anchor: anchor))
                     }
                 } header: {
                     Text("Moved together")
+                        .askable(HealthAsk.patterns(r, anchor: anchor, scope: .section))
                 }
             }
             // The standing caveat rides directly under the findings, in both states.
@@ -60,6 +68,7 @@ struct DietCorrelationsDetail: View {
                         }
                         .accessibilityElement(children: .combine)
                         .accessibilityLabel("\(m.title): \(m.reasonText)")
+                        .askable(HealthAsk.patternMiss(m, anchor: anchor))
                     }
                     CaveatRow(text: "A pair needs \(DietCorrelations.minPairs) days with both "
                               + "sides measured before any number is worth showing. A day "
@@ -71,6 +80,7 @@ struct DietCorrelationsDetail: View {
         }
         .navigationTitle("Patterns")
         .dietNavTitle(.inline)
+        .askPageToolbar(HealthAsk.patterns(r, anchor: anchor, scope: .page))
     }
 
     private func emptyMessage(_ r: DietCorrelationReport) -> String {

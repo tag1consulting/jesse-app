@@ -170,6 +170,36 @@ public final class HealthDashboardModel {
         snapshot != nil ? lastError : nil
     }
 
+    // MARK: - "Ask about this"
+
+    /// The whole-page ask context for whatever this model currently has on screen, or nil
+    /// before anything has loaded.
+    ///
+    /// It lives HERE rather than on `TodayScreen` because of where the tab's Ask BUTTON
+    /// has to sit. The Health tab's trailing toolbar group is ordered left-to-right by how
+    /// often each item is tapped (see README, "UI conventions"), and a toolbar item
+    /// declared on a child view lands AFTER the ones declared on it from outside — so an
+    /// Ask declared inside the dashboard would land in the rightmost slot, which belongs
+    /// to quick log. Declaring it in the shell keeps that order intact, and the shell has
+    /// the model but not the dashboard's derivations. This is that seam.
+    ///
+    /// Every derivation below mirrors `TodayScreen`'s own, line for line — the engine
+    /// hour, the past-day judging rule, and the window clamp — so the page-level ask and
+    /// the screen it describes cannot come from two different readings of the same day.
+    public var pageAskContext: HealthAskContext? {
+        guard let snapshot else { return nil }
+        let clockHour = Calendar.current.component(.hour, from: now())
+        let hour = HistoryRender.engineHour(isHistorical: snapshot.isHistorical,
+                                            clockHour: clockHour)
+        // A past day judges on its own numbers alone, never on a window ending after it.
+        let judgeSeries = snapshot.isHistorical ? nil : snapshot.nutrientSeries
+        let gauges = DietSemantics.gauges(for: snapshot.today, hour: hour, series: judgeSeries)
+        let mode = NutrientTrends.isAvailable(judgeSeries) ? nutrientWindow : .day
+        return HealthAsk.day(
+            snapshot: snapshot, gauges: gauges, hour: hour, windowMode: mode,
+            day: HealthAskDay(iso: snapshot.today.date, isToday: !snapshot.isHistorical))
+    }
+
     // MARK: - Paging surface (all derived from availableDays + the viewed date)
 
     /// Whether the user is on today (vs a paged-back day).

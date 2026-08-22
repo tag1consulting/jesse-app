@@ -79,6 +79,29 @@ struct WeightTrendDetail: View {
         return points.min { abs($0.date.timeIntervalSince(scrubDate)) < abs($1.date.timeIntervalSince(scrubDate)) }
     }
 
+    /// The scrubbed point as the LOGGED row it came from, so an ask can name the day the
+    /// user has their finger on. The chart's own point type carries a parsed `Date`; the
+    /// snapshot wants the series row.
+    private var scrubbedRow: WeightPoint? {
+        guard let scrubbed else { return nil }
+        let iso = Self.dayParser.string(from: scrubbed.date)
+        return series.first { $0.date == iso }
+    }
+
+    /// The ask for this chart: the range currently shown, plus whatever point is under
+    /// the user's finger. The gesture applies to the chart AS A WHOLE — there are no
+    /// per-point menus, and the selection rides along instead.
+    private var ask: HealthAskContext {
+        HealthAsk.weightTrend(series: filteredWeightPoints(), progress: progress,
+                              rangeLabel: rangeLabelText, rangeDays: range.days,
+                              selection: scrubbedRow)
+    }
+
+    /// "the last 90 days" / "the full history" — the range in the words the prompt uses.
+    private var rangeLabelText: String {
+        range.days.map { "the last \($0) days" } ?? "the full history"
+    }
+
     var body: some View {
         List {
             Section {
@@ -90,6 +113,7 @@ struct WeightTrendDetail: View {
                 weightChart
                     .frame(height: 240)
                     .listRowSeparator(.hidden)
+                    .askable(ask)
             }
             // Body fat renders whenever any weigh-in in the series carries a BF
             // reading — no toggle. When none do, no BF UI exists at all. The
@@ -97,12 +121,14 @@ struct WeightTrendDetail: View {
             if HealthDisplay.hasBodyFat(series) {
                 Section("Body fat %") {
                     bfChart.frame(height: 140).listRowSeparator(.hidden)
+                        .askable(ask)
                 }
             }
             if let progress { paceSection(progress) }
         }
         .navigationTitle("Weight & trend")
         .dietNavTitle(.inline)
+        .askPageToolbar(ask)
         .sheet(item: $explainer) { ExplainerSheet(explainer: $0) }
     }
 

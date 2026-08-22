@@ -354,6 +354,15 @@ see the ATS note in [Known installation problems](#known-installation-problems).
   turn alive; the reply re-attaches when you reopen the app.
 - **Voice / Siri** — "Ask Jesse…" and "Tell Jesse…" Siri phrases route into a new
   thread and read the reply aloud (on-device text-to-speech).
+- **Ask about this (Health tab)** — long-press (iOS) or right-click (macOS) any card,
+  row, chart or section on the Health tab and its sub-pages to open a chat that already
+  holds exactly what was on screen: the meal and its foods, the nutrient row and what fed
+  it, the trend and the point you were scrubbing. Each page also has an **Ask** button in
+  its toolbar for the whole page ("what's good and what's bad about today?" works with
+  nothing selected). The chat is the ordinary one; it opens on an empty composer and
+  starts nothing until you send. Asking about the same thing twice in a day continues the
+  same conversation. An ask never writes — no meal, weigh-in or workout is logged from
+  one, and no routine is started.
 - **Offline** — Today and Health keep the last thing the bridge sent them on disk,
   so both tabs still render after a cold launch with no network, behind a banner
   saying how old what you are reading is. Browsing works; **changing does not**.

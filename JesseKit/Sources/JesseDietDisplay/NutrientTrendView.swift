@@ -165,6 +165,21 @@ struct NutrientTrendDetail: View {
         }
     }
 
+    /// The ask for this chart. The chart is asked about AS A WHOLE, with the current
+    /// range and whatever point is being scrubbed carried in the context — no per-point
+    /// menus, exactly as the brief requires.
+    private var ask: HealthAskContext {
+        HealthAsk.trend(trend, rangeLabel: rangeLabelText,
+                        anchor: trend.points.last?.date ?? "",
+                        selection: scrubbed.flatMap { p in
+                            trend.points.first { $0.date == p.id }
+                        })
+    }
+
+    private var rangeLabelText: String {
+        range.days.map { "the last \($0) days" } ?? "the full history"
+    }
+
     private var topSources: [NutrientSource] {
         NutrientTrends.topSources(nutrient, meals: context.meals, limit: 3)
     }
@@ -189,12 +204,14 @@ struct NutrientTrendDetail: View {
                     emptyChart
                 } else {
                     chart.frame(height: 240).listRowSeparator(.hidden)
+                        .askable(ask)
                 }
             }
             summarySection
         }
         .navigationTitle(nutrient.fullName)
         .dietNavTitle(.inline)
+        .askPageToolbar(ask)
     }
 
     // MARK: - Summary band
@@ -207,6 +224,7 @@ struct NutrientTrendDetail: View {
                 .font(.callout)
                 .textSelection(.enabled)
                 .fixedSize(horizontal: false, vertical: true)
+                .askable(ask)
 
             // The static consequence copy, so no health claim is invented.
             Label {

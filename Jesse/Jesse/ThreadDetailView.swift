@@ -55,6 +55,11 @@ struct ThreadDetailView: View {
     /// makes an empty composer sendable here and nowhere else.
     private var attachedContext: String? { coordinator.attachedContext(for: thread.id) }
 
+    /// The whole attachment — its scope title and its starters as well as its body. The
+    /// Health tab's "Ask about this" fills all three; the Today tab's Discuss fills only
+    /// the body, and the two extra affordances below simply don't render for it.
+    private var attachment: AttachedContext? { coordinator.attachment(for: thread.id) }
+
     /// The `.failed` outbox item for a given user turn, if any — drives the compact
     /// per-message "Not delivered" line with Retry/Discard under that bubble.
     private func failedItem(for turnID: UUID) -> OutboxItem? {
@@ -347,6 +352,30 @@ struct ThreadDetailView: View {
 
     // MARK: - Composer
 
+    /// The tappable opening questions under an empty ask. A wrapping row of plain
+    /// bordered buttons — the app's own control vocabulary, no new chrome.
+    private func starterRow(_ starters: [String]) -> some View {
+        ScrollView(.horizontal, showsIndicators: false) {
+            HStack(spacing: 8) {
+                ForEach(starters, id: \.self) { starter in
+                    Button(starter) { sendStarter(starter) }
+                        .font(.caption)
+                        .buttonStyle(.bordered)
+                        .buttonBorderShape(.capsule)
+                }
+            }
+            .padding(.horizontal, 1)
+        }
+        .scrollClipDisabled()
+    }
+
+    /// A tapped starter IS the user's first message — it goes through the same `send`
+    /// path as anything typed, so the attachment is composed ahead of it exactly once.
+    private func sendStarter(_ starter: String) {
+        input = starter
+        send()
+    }
+
     private var composer: some View {
         VStack(spacing: 10) {
             // Mode is fixed once the thread has turns — hide the control then.
@@ -369,15 +398,30 @@ struct ThreadDetailView: View {
             }
 
             // Says why the composer is empty and why Send works with nothing typed.
-            // Without it, a discussion opened from Today looks like a blank new chat
-            // that has somehow forgotten which item it is about.
-            if attachedContext != nil && turns.isEmpty {
-                Label("This item is attached. Ask about it, or send an empty message to have Jesse just read it.",
+            // Without it, a conversation opened from Today or Health looks like a blank
+            // new chat that has somehow forgotten what it is about.
+            //
+            // A titled attachment (a Health ask) NAMES its scope here — the pinned context
+            // line — so "this" is never ambiguous. It is one small caption, not a banner:
+            // the scope is also the conversation's title in the navigation bar.
+            if let attachment, turns.isEmpty {
+                Label(attachment.title.map { "Asking about \($0). Send an empty message to have Jesse just read it." }
+                        ?? "This item is attached. Ask about it, or send an empty message to have Jesse just read it.",
                       systemImage: "paperclip")
                     .font(.caption)
                     .foregroundStyle(.secondary)
                     .frame(maxWidth: .infinity, alignment: .leading)
                     .accessibilityElement(children: .combine)
+            }
+
+            // Opening questions, in the EMPTY state only: they disappear the moment the
+            // user types a character, taps one, or the conversation has any turn at all.
+            // Tapping one sends it — a starter that only filled the field would be a
+            // suggestion the user then has to confirm, which is a worse offer than a
+            // question they can simply ask.
+            if let starters = attachment?.starters, !starters.isEmpty,
+               turns.isEmpty, input.isEmpty, !running {
+                starterRow(starters)
             }
 
             if !attachments.isEmpty {
@@ -799,7 +843,17 @@ private struct TurnRow: View {
             if !turn.attachments.isEmpty {
                 TurnAttachmentsView(attachments: turn.orderedAttachments)
             }
-            bubble
+            // What a screen attached to this turn, when it attached something. One
+            // caption, above the bubble, naming the scope — never the snapshot itself.
+            if turn.hasAttachedContext, let label = turn.contextLabel {
+                Label(label, systemImage: "paperclip")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .accessibilityLabel("Context attached: \(label)")
+            }
+            // An ask sent on an empty composer has no typed half to draw — the caption
+            // above is the whole turn.
+            if !turn.visibleText.isEmpty { bubble }
             // Files JESSE returned on this turn — the other direction from the
             // attachments above. Nothing renders for the overwhelming majority of turns.
             if !turn.artifacts.isEmpty {
@@ -820,9 +874,13 @@ private struct TurnRow: View {
     @ViewBuilder private var bubble: some View {
         if turn.isUser {
             // User text is shown verbatim (as typed); the UITextView gives native
-            // word/sentence selection within the bubble.
+            // word/sentence selection within the bubble. `visibleText` is that typed
+            // half: when a screen attached context, `turn.text` also holds the snapshot
+            // that was composed ahead of it, and showing a page of numbers as something
+            // the user "said" would be both unreadable and untrue. The label above says
+            // what was attached.
             SelectableText(attributed: NSAttributedString(
-                string: turn.text,
+                string: turn.visibleText,
                 attributes: [.font: UIFont.preferredFont(forTextStyle: .body),
                              .foregroundColor: UIColor.label]))
                 .padding(.horizontal, 12)
