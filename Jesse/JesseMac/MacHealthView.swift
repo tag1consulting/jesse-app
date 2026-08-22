@@ -111,10 +111,6 @@ struct MacHealthView: View {
                         .help("Refresh the day on screen")
                     }
                 }
-                // Every askable card, row and chart on the dashboard and its sub-pages
-                // reaches the chat through this one injection — the environment carries it
-                // down the whole navigation stack.
-                .environment(\.healthAsk, HealthAskAction { openAsk($0) })
                 .sheet(item: $askThread, onDismiss: dropUnsentAsk) { thread in
                     MacHealthAskSheet(thread: thread) { askThread = nil }
                 }
@@ -126,6 +122,11 @@ struct MacHealthView: View {
                     Text("Audit yesterday, log your weigh-in, and refresh the dashboard?")
                 }
         }
+        // On the STACK, not on its root content: a view pushed by a `NavigationLink` is
+        // presented by the stack rather than rendered as a child of the root, so an
+        // environment value attached to the root does not reliably reach the sub-pages.
+        // Same placement as the phone.
+        .environment(\.healthAsk, HealthAskAction { openAsk($0) })
         // A Mac that slept never leaves `.active`, so the scene phase alone would never
         // re-probe after a lid-open — see `MacWake`.
         .onReconnect {

@@ -176,6 +176,11 @@ struct TodayScreen: View {
                                                  gauge: gauge, isCarbLoad: gauges.isCarbLoad,
                                                  series: snapshot.nutrientSeries, targets: today.targets,
                                                  sourceSeries: historySources)
+        // The scope an ask made INSIDE the sheet is about — each contributing food, and
+        // the metric as a whole. Without it the sheet's rows keep plain text selection
+        // and offer no ask.
+        enriched.askDay = askDay
+        enriched.askGauge = gauge
         explainer = enriched
     }
 

@@ -148,6 +148,7 @@ struct MacrosCaloriesDetail: View {
         List {
             Section {
                 totalRow("Calories", "\(DietSemantics.fmt(totals.cal))")
+                    .askable(HealthAsk.metric(g.calories, area: .calories, day: askDay))
                 // The nutrient tree in canonical order (Protein, Carbs, Fiber, Total
                 // Sugars, Fat, Saturated Fat) as plain indented gram totals — a
                 // reconstructed day has no targets to judge against. A tracked
@@ -166,6 +167,7 @@ struct MacrosCaloriesDetail: View {
                     totalRow("Burned", "\(DietSemantics.fmt(net.burned))")
                     totalRow("Net", "\(DietSemantics.fmt(net.net))")
                 }
+                .askable(HealthAsk.netCalories(net, day: askDay))
             }
         }
     }
@@ -188,8 +190,11 @@ struct MacrosCaloriesDetail: View {
     @ViewBuilder private func neutralNutrientRow(_ entry: NutrientEntry) -> some View {
         switch entry {
         case .macro(let m):
+            // A rebuilt day has no targets, so the gauge carries none either — the ask
+            // reports the grams and says nothing was judged, which is what the row shows.
             totalRow(m.displayName, "\(DietSemantics.fmt(totals.grams(for: m)))g",
                      depth: m.isSubEntry ? 1 : 0)
+                .askable(HealthAsk.metric(g.gauge(for: m), area: .macros, day: askDay))
         case .micronutrient(let n):
             if isTracked(n) {
                 let gauge = microGauge(n)
@@ -197,6 +202,7 @@ struct MacrosCaloriesDetail: View {
                 totalRow(n.displayName,
                          "\(prefix)\(DietSemantics.fmt(gauge.value, decimals: gauge.decimals))\(n.unit)",
                          depth: n.depth)
+                    .askable(HealthAsk.metric(gauge, area: .macros, day: askDay))
             }
         }
     }
@@ -211,6 +217,9 @@ struct MacrosCaloriesDetail: View {
         withFoods.drilldown = FoodDrilldown.build(meals: today.meals, metric: metric,
                                                   gauge: gauge, isCarbLoad: g.isCarbLoad,
                                                   series: nutrientSeries, targets: today.targets)
+        // The scope an ask made INSIDE the sheet is about — see `TodayScreen.openDrilldown`.
+        withFoods.askDay = askDay
+        withFoods.askGauge = gauge
         // The ask reuses the drill-down's OWN ranked contributors — one builder, so the
         // long-press and the tap can never disagree about what fed the number.
         let breakdown = withFoods.drilldown?.breakdown
@@ -253,6 +262,8 @@ struct MacrosCaloriesDetail: View {
             ex.drilldown = FoodDrilldown.buildWindow(
                 sourceSeries: sourceSeries, nutrient: n, gauge: gauge, window: window,
                 through: today.rolling7?.to, isCarbLoad: g.isCarbLoad)
+            ex.askDay = askDay
+            ex.askGauge = gauge
         }
         let sheet = ex
         let breakdown = ex.drilldown?.breakdown

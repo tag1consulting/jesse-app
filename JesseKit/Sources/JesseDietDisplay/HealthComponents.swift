@@ -673,6 +673,11 @@ struct Explainer: Identifiable, Equatable {
     /// then render exactly as before.
     var note: String?
     var drilldown: FoodDrilldown?
+    /// The day and the gauge an ask made INSIDE this sheet is scoped to. Set wherever a
+    /// drill-down is attached (the Today rings, the Macros & calories rows); nil for an
+    /// explainer that carries no drill-down, whose sheet is then not askable.
+    var askDay: HealthAskDay?
+    var askGauge: MetricGauge?
 }
 
 /// What a metric tap adds to its explainer: the ranked contributing foods (the facts,
@@ -816,7 +821,8 @@ struct ExplainerSheet: View {
                     }
                     if let drilldown = explainer.drilldown {
                         Divider()
-                        ContributingFoodsView(breakdown: drilldown.breakdown)
+                        ContributingFoodsView(breakdown: drilldown.breakdown,
+                                              day: explainer.askDay, gauge: explainer.askGauge)
                         // The insight is secondary to the facts: it appears below and
                         // fills in after them, and renders nothing when the model is
                         // unavailable.
@@ -891,11 +897,7 @@ enum DrilldownShare {
             }
         } else {
             for c in breakdown.contributions {
-                let amount = c.amount.map { " (\($0))" } ?? ""
-                let share = Int((c.share * 100).rounded())
-                lines.append("• \(c.name)\(amount): "
-                    + "\(DietSemantics.fmt(c.value, decimals: breakdown.metric.decimals)) "
-                    + "\(breakdown.metric.unit) — \(share)%")
+                lines.append("• " + contributionLine(c, metric: breakdown.metric))
             }
             if let note = breakdown.reconciliationNote {
                 lines.append(note)
@@ -923,6 +925,19 @@ enum DrilldownShare {
         }
         return lines.joined(separator: "\n")
     }
+
+    /// ONE contributing food as text: name, amount, contribution, share.
+    ///
+    /// Extracted so the share export and a row's own Copy produce the same line. The row
+    /// needs a Copy because the ask menu takes over the press-and-hold that used to select
+    /// it (see `View.askable(_:copyText:)`), and two spellings of "this food, as text"
+    /// would be two things to keep in step.
+    static func contributionLine(_ c: FoodContribution, metric: ContributionMetric) -> String {
+        let amount = c.amount.map { " (\($0))" } ?? ""
+        let share = Int((c.share * 100).rounded())
+        return "\(c.name)\(amount): "
+            + "\(DietSemantics.fmt(c.value, decimals: metric.decimals)) \(metric.unit) — \(share)%"
+    }
 }
 
 // MARK: - Contributing foods (the drill-down facts)
@@ -933,13 +948,15 @@ enum DrilldownShare {
 /// note; never invents a 0-impact row.
 struct ContributingFoodsView: View {
     let breakdown: FoodBreakdown
+    /// The scope an ask made in here is about. Nil where the drill-down was built without
+    /// one (previews, older call sites), in which case nothing here is askable — the
+    /// rows then keep their plain text selection exactly as before.
+    var day: HealthAskDay?
+    var gauge: MetricGauge?
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
-            Text("What fed this")
-                .font(.caption.weight(.semibold))
-                .foregroundStyle(.secondary)
-                .textCase(.uppercase)
+            header
 
             if breakdown.isEmpty {
                 Text(emptyMessage)
@@ -947,7 +964,11 @@ struct ContributingFoodsView: View {
                     .foregroundStyle(.secondary)
             } else {
                 ForEach(breakdown.contributions) { c in
-                    ContributionRow(contribution: c, metric: breakdown.metric)
+                    // Each food is askable in its own right — "why is this so caloric",
+                    // "what's a lighter swap" — carrying its share and the ranking it sits
+                    // in. `copyText:` because these rows had press-and-hold selection and a
+                    // context menu takes that gesture over; the Copy keeps what it did.
+                    contributionRow(c)
                 }
                 if let note = breakdown.reconciliationNote {
                     Text(note)
@@ -985,18 +1006,54 @@ struct ContributingFoodsView: View {
                 }
             }
             ForEach(breakdown.unknownFoods) { u in
-                HStack(alignment: .firstTextBaseline, spacing: 6) {
-                    Text(u.name).font(.subheadline).foregroundStyle(.secondary)
-                    if let amount = u.amount {
-                        Text(amount).font(.caption).foregroundStyle(.tertiary)
-                    }
-                    Spacer()
-                    // No number, ever — a dash marks "unknown", distinct from a 0.
-                    Text("—").font(.subheadline).foregroundStyle(.tertiary)
-                }
+                unknownRow(u)
             }
         }
         .padding(.top, 2)
+    }
+
+    /// The block's heading, and the ask for the metric as a whole.
+    @ViewBuilder
+    private var header: some View {
+        let text = Text("What fed this")
+            .font(.caption.weight(.semibold))
+            .foregroundStyle(.secondary)
+            .textCase(.uppercase)
+        if let day, let gauge {
+            text.askable(HealthAsk.drilldown(breakdown, gauge: gauge, day: day))
+        } else {
+            text
+        }
+    }
+
+    @ViewBuilder
+    private func contributionRow(_ c: FoodContribution) -> some View {
+        let row = ContributionRow(contribution: c, metric: breakdown.metric)
+        if let day {
+            row.askable(HealthAsk.contribution(c, in: breakdown, day: day),
+                        copyText: DrilldownShare.contributionLine(c, metric: breakdown.metric))
+        } else {
+            row
+        }
+    }
+
+    @ViewBuilder
+    private func unknownRow(_ u: UnknownFood) -> some View {
+        let row = HStack(alignment: .firstTextBaseline, spacing: 6) {
+            Text(u.name).font(.subheadline).foregroundStyle(.secondary)
+            if let amount = u.amount {
+                Text(amount).font(.caption).foregroundStyle(.tertiary)
+            }
+            Spacer()
+            // No number, ever — a dash marks "unknown", distinct from a 0.
+            Text("—").font(.subheadline).foregroundStyle(.tertiary)
+        }
+        if let day {
+            row.askable(HealthAsk.unmeasuredFood(u, in: breakdown, day: day),
+                        copyText: u.name + (u.amount.map { " \($0)" } ?? ""))
+        } else {
+            row
+        }
     }
 
     private var emptyMessage: String {

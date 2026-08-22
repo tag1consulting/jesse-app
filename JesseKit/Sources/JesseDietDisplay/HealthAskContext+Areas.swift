@@ -356,6 +356,69 @@ enum HealthAsk {
                                  "Is this better or worse than usual?"])
     }
 
+    /// ONE food inside a metric's drill-down — the row you get after tapping Calories
+    /// and seeing what fed it.
+    ///
+    /// Its context is the food's contribution PLUS the ranking it sits in, because "why is
+    /// this so caloric" and "is that a lot" are the same question asked from two ends, and
+    /// a row torn out of its ranking can only answer the first.
+    static func contribution(_ c: FoodContribution, in breakdown: FoodBreakdown,
+                             day: HealthAskDay) -> HealthAskContext {
+        let metric = breakdown.metric
+        let amount = c.amount.map { " (\($0))" } ?? ""
+        var lines = [
+            "\(c.name)\(amount) contributed "
+                + "\(DietSemantics.fmt(c.value, decimals: metric.decimals)) \(metric.unit) "
+                + "of \(day.possessive) \(metric.label.lowercased())",
+            "that is \(NutrientSources.pct(c.share)) of the day's "
+                + "\(breakdown.isPartial ? "measured " : "")total "
+                + "(\(DietSemantics.fmt(breakdown.total, decimals: metric.decimals)) \(metric.unit))",
+        ]
+        if c.amount == nil {
+            lines.append("no amount was logged for this row, so the estimate rests on the name alone")
+        }
+        return HealthAskContext(
+            scope: .item, area: metric.isMicronutrient ? .macros : .calories,
+            timeRange: day.range,
+            title: "\(c.name) · \(metric.label)", subject: "this food",
+            subjectKey: "contribution-\(metric.label)-\(c.name)",
+            facts: HealthAskFacts(
+                lines: lines,
+                children: [AskFacts.contributors(breakdown, decimals: metric.decimals,
+                                                 unit: metric.unit)]),
+            suggestedQuestions: HealthAskStarters.food)
+    }
+
+    /// A food the log carries NO value for on this metric — the "Not estimated" group.
+    /// Its question is a different one, so its starters are too.
+    static func unmeasuredFood(_ u: UnknownFood, in breakdown: FoodBreakdown,
+                               day: HealthAskDay) -> HealthAskContext {
+        let metric = breakdown.metric
+        let amount = u.amount.map { " (\($0))" } ?? ""
+        return HealthAskContext(
+            scope: .item, area: .macros, timeRange: day.range,
+            title: "\(u.name) · \(metric.label) not estimated",
+            subject: "this unmeasured food",
+            subjectKey: "unmeasured-\(metric.label)-\(u.name)",
+            facts: HealthAskFacts(lines: [
+                "\(u.name)\(amount) carries NO measured \(metric.label.lowercased()) value",
+                "it is UNKNOWN, not zero — it is left out of the day's total rather than "
+                    + "counted as nothing, which is why that total reads as a floor",
+                "\(breakdown.unknownFoods.count) of the day's logged foods are in this state "
+                    + "for \(metric.label.lowercased())",
+            ]),
+            suggestedQuestions: ["Roughly how much would this have?",
+                                 "Does this change the day's picture?",
+                                 "What would I log to make it measurable?"])
+    }
+
+    /// The drill-down's "what fed this" block as a whole.
+    static func drilldown(_ breakdown: FoodBreakdown, gauge: MetricGauge,
+                          day: HealthAskDay) -> HealthAskContext {
+        metric(gauge, area: breakdown.metric.isMicronutrient ? .macros : .calories,
+               day: day, breakdown: breakdown)
+    }
+
     /// The four macro rings, as one section.
     static func macroRings(_ gauges: DietGauges, day: HealthAskDay) -> HealthAskContext {
         HealthAskContext(
