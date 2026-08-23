@@ -165,6 +165,112 @@ CI both run it). See the "Versioning" section of `bridge/README.md`.
   toolbar Ask is still there on every page, and the fix would be onboarding copy rather
   than an icon on every card.
 
+## [bridge 0.90.0] - 2026-08-23
+
+### Fixed
+
+- **A chain's later members were judged against the wrong day.** `run_chain` read
+  `SystemTime::now()` afresh as it reached each member and evaluated that member's `days`
+  filter against it. A chain is ONE occurrence, but the run can outlive the minute it was
+  scheduled for — a long earlier member, a catch-up run after an outage, a wait on the
+  one-turn-at-a-time lock — so a chain that started at 23:50, or that ran late into the
+  next day, judged its last links against a day the occurrence was never scheduled for and
+  recorded them as `day-skipped`, "not scheduled on this weekday", on precisely the day
+  they *were* scheduled for. The occurrence's instant is now captured once, at the top of
+  the run (`ChainRun::calendar_ms`), and every member's calendar is evaluated against it.
+
+  The whole per-member gate is now a pure function (`member_decision`), so the production
+  chain can be walked against a fixed instant in a test rather than against whatever day
+  the suite happens to run on.
+
+- **The zone every `"HH:MM"` was read in was `chrono::Local`, at a dozen call sites.** A
+  scheduler that asks the wall clock separately in `tick`, in `run_chain`, in
+  `next_fire_for` and on the endpoint has a dozen different answers to "what day is it"
+  over the life of one chain. There is now one `SchedulerClock` — an instant and a zone —
+  owned by the `Scheduler` and threaded through every calendar decision, injectable in
+  tests. `GET /jesse/schedule` reports the zone's IANA name (`tz`) beside the UTC offset it
+  already carried, because `+02:00` is Rome in August and something else in January.
+
+- **A retired head with a deleted `prompt_file` failed every morning and took nothing down
+  with it.** `morning-health-export` sat in the config for six days after its prompt was
+  deleted: every link behind it is `after_on = "any"`, so the chain ran, and the only
+  evidence was one `no-prompt` line a night among the ordinary noise. A HEAD whose
+  `prompt_file` does not exist at load is now disabled by name (`prompt file missing: …`)
+  and its first link is PROMOTED into the clock slot it vacated, inheriting its `at`,
+  `catch_up_secs` and `days` and reporting `promoted_from`; a second link of the same dead
+  head is re-pointed at the promoted one rather than being deleted by the orphan pass. A
+  LINK with a missing prompt is unchanged — it fails at fire time, which costs one turn
+  rather than a chain's start.
+
+- **A `days` key on a LINK was invisible everywhere but the file itself.** The boot output
+  named chain HEADS only, so the key that decides whether the second, third and fourth job
+  of a chain run tonight had no representation in the log, at startup, or anywhere else.
+  Boot (and every reload) now prints one table row per job — id, kind, trigger, resolved
+  days by name, next fire in the scheduler's zone, enabled — which is the line a misplaced
+  `days` shows up in.
+
+- **A turn that ran and wrote nothing was recorded as `ran`.** True about the turn and
+  useless about the job: `overnight-vault-lint` exists to produce a note, and a night
+  without the note is a night the routine did not happen however cleanly the child exited.
+  Nothing on disk recorded that non-event, which is the same blindness the fire ledger was
+  added for. A job may now declare `expect_output` — vault-relative globs, with `{date}`,
+  `{year}`, `{month}` and `{day}` expanded from the occurrence in the scheduler's zone —
+  and the outcome tells the truth in both directions: a fire whose output is already fresh
+  is skipped (`output fresh`, quiet, so a catch-up run is idempotent), and a fire that
+  produced nothing is the new `fired-no-output` outcome, which is pushed, ledgered, and is
+  NOT a success, so it breaks an `after_on = "success"` chain. Traversal out of the vault
+  is refused at validation, by name, rather than as a silent non-match at 03:30. The
+  matcher is ~40 lines over directory listings; no glob crate was added.
+
+- **Nothing said "this is the third night running".** Every signal the scheduler kept was
+  about ONE occurrence, so a nightly "failed" push arrived every night and stopped being
+  read. `JobRecord` now carries `consecutive_failures` — reset by a success, incremented by
+  a failure or a `fired-no-output`, untouched by a skip, so a Monday-only job does not bank
+  a failure every other day of the week — and a HEAD that reaches 3, 6, 12 or 24 pushes
+  once at each. Nothing is ever auto-disabled.
+
+### Added
+
+- **`POST /jesse/schedule/{id}/fire`** — run the chain from `{id}` now: the named member
+  and everything after it, on the same path a due occurrence takes. `404` for an unknown
+  id, `409` while the chain containing it is running (single flight is keyed on the head,
+  so it is refused by whichever member is named), `202 {"chain": [...], "started_ms"}`
+  otherwise. The calendar is evaluated at now; `expect_output` freshness is honoured — so
+  pressing it twice is safe — unless the body says `{"force": true}`. The member NAMED does
+  not consult a predecessor that never ran in this run, which is what makes the endpoint
+  usable for repairing one broken link rather than replaying a night.
+
+- **`POST /jesse/schedule/{id}/enable`** — `{"enabled": bool, "until": "<RFC3339>"|null}`,
+  persisted on the `JobRecord` and surviving a restart, because "off until Sunday" is a
+  statement that has to outlive the restart that will certainly happen in between. It
+  outranks the config file while it is live and then expires: a disabled job is silent by
+  design, so a standing override nobody remembers is a job that never runs again. A member
+  disabled by override skips with exactly the reason a config `enabled = false` produces,
+  and therefore breaks an `after_on = "success"` chain the same way.
+
+- **`POST /jesse/schedule/reload`, and an mtime watch on every tick** — re-read the
+  `[[schedule]]` array from the config file the bridge loaded at boot, without a restart.
+  Only that array: everything else is wired into a running server in ways a swap cannot
+  honestly reproduce, and half-reloading a process is worse than not reloading it.
+  `JobRecord`s are kept by id, so a swap never rolls the anti-double-fire anchor backwards;
+  a head the old schedule did not have is anchored at the RELOAD rather than at this
+  process's boot, so adding a 04:00 job at 14:00 does not immediately record a missed
+  occurrence for it. A file that does not validate KEEPS THE OLD SCHEDULE and pushes the
+  first error — a typo must not be able to silently retire the schedule, and an unparseable
+  file must not read as "no jobs". The reload appends a `reloaded` line to the fire ledger
+  and reprints the boot table.
+
+- **Per-job `model = "<registry id>"`** — validated at load against the model registry, so a
+  typo disables that entry by name instead of failing one turn a night later. It takes
+  exactly the path a phone turn's `model` field takes (`resolve_requested_model`), backing
+  only that turn and never touching the stored global default; unset — every job today —
+  is byte-for-byte the previous behaviour. A model that validated at load but is unhealthy
+  at fire time is a failure, not a silent fall-back onto a different model.
+
+- **`GET /jesse/schedule` rows** gained `consecutive_failures`, `expect_output`,
+  `last_output_path`, `model`, `promoted_from`, `override` and `enabled_config` (the file's
+  own answer, beside the effective `enabled`), and the body gained the top-level `tz`.
+
 ## [bridge 0.89.0] - 2026-08-21
 
 ### Changed

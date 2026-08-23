@@ -680,13 +680,14 @@ checksum = "8f42a60cbdf9a97f5d2305f08a87dc4e09308d1276d28c869c684d7777685682"
 
 [[package]]
 name = "jesse-bridge"
-version = "0.89.0"
+version = "0.90.0"
 dependencies = [
  "axum",
  "chrono",
  "chrono-tz",
  "csv",
  "futures-core",
+ "iana-time-zone",
  "image",
  "json5",
  "libc",

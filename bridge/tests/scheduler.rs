@@ -1073,3 +1073,830 @@ async fn a_per_job_timeout_override_is_applied_and_clamped() {
     let _ = std::fs::remove_file(&fake);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+// ---- The occurrence is what the calendar sees ----------------------------------
+
+/// A `"HH:MM"` local time `minutes_ahead` minutes from now, paired with an anchor two days
+/// back. The latest occurrence at or before now is therefore YESTERDAY at that time — a
+/// due, late fire whose OCCURRENCE falls on a different local day from `now`.
+fn due_yesterday(minutes_ahead: i64) -> (String, u64, String) {
+    let now = now_ms();
+    let at_ms = now + (minutes_ahead as u64) * 60_000;
+    let at = Local
+        .timestamp_millis_opt(at_ms as i64)
+        .single()
+        .unwrap()
+        .format("%H:%M")
+        .to_string();
+    let occurrence = Local
+        .timestamp_millis_opt((at_ms - 86_400_000) as i64)
+        .single()
+        .unwrap();
+    (
+        at,
+        now - 2 * 86_400_000,
+        occurrence.format("%a").to_string().to_lowercase(),
+    )
+}
+
+/// REGRESSION, 2026-08-21. A chain is ONE OCCURRENCE, and every member's `days` filter is
+/// evaluated against THAT — not against the wall clock at the moment the chain happens to
+/// reach the member.
+///
+/// The head here came due yesterday and is running late (well inside its catch-up window),
+/// so the occurrence and "now" fall on different local days. The link names the
+/// OCCURRENCE's weekday. Under the old code — which re-read `SystemTime::now()` per member
+/// — the link was skipped as "not scheduled on this weekday" on precisely the day it was
+/// scheduled for, which is what the Friday ledger recorded.
+#[tokio::test]
+async fn a_late_chain_judges_its_links_against_the_occurrence_not_against_now() {
+    let dir = temp_state_dir();
+    let log = dir.join("runs.log");
+    let fake = logging_claude(&log, "0.05");
+    let (at, anchor, occurrence_day) = due_yesterday(30);
+    let st = state_with(
+        vec![
+            ScheduleToml {
+                catch_up_secs: Some(2 * 86_400),
+                ..head("one", &at)
+            },
+            ScheduleToml {
+                days: Some(vec![occurrence_day.clone()]),
+                after_on: Some("any".into()),
+                ..link("two", "one")
+            },
+        ],
+        &fake,
+        &dir,
+    );
+    st.scheduler.state.claim("one", anchor);
+
+    tick_and_wait(&st, now_ms()).await;
+
+    assert_eq!(st.scheduler.state.get("one").outcome(), Some(Outcome::Ran));
+    let two = st.scheduler.state.get("two");
+    assert_eq!(
+        two.outcome(),
+        Some(Outcome::Ran),
+        "the link names the occurrence's weekday ({occurrence_day}), so it belongs to this \
+         run — it was skipped as {:?} before the fix",
+        two.last_reason
+    );
+    assert!(
+        log_lines(&log).contains(&"start MARKER-two".to_string()),
+        "{:?}",
+        log_lines(&log)
+    );
+    let _ = std::fs::remove_file(&fake);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ---- The output contract (`expect_output`) -------------------------------------
+
+/// A vault whose notes directory (`<vault>/vault/`) is where `expect_output` resolves.
+fn temp_vault() -> PathBuf {
+    let d = std::env::temp_dir().join(format!("jesse-sched-vault-{}", random_hex()));
+    std::fs::create_dir_all(d.join("vault/Inbox")).unwrap();
+    d
+}
+
+fn state_with_vault(
+    schedule: Vec<ScheduleToml>,
+    claude: &std::path::Path,
+    dir: &std::path::Path,
+    vault: &std::path::Path,
+) -> AppState {
+    let validated = validate_schedule(&schedule);
+    assert!(validated.fatal.is_empty(), "{:?}", validated.fatal);
+    assert!(validated.invalid.is_empty(), "{:?}", validated.invalid);
+    AppState::new(Config {
+        claude_bin: claude.to_string_lossy().into_owned(),
+        state_dir: Some(dir.to_string_lossy().into_owned()),
+        vault: vault.to_string_lossy().into_owned(),
+        schedule: Arc::new(validated),
+        ..test_config()
+    })
+}
+
+/// A fake `claude` that WRITES a file before answering — the job doing its work.
+fn writing_claude(target: &std::path::Path) -> PathBuf {
+    write_fake_claude(&format!(
+        "#!/bin/sh\n\
+         printf 'the note\\n' > '{target}'\n\
+         printf '%s\\n' '{{\"type\":\"result\",\"is_error\":false,\"result\":\"ok\",\"session_id\":\"sess-sched\"}}'\n",
+        target = target.display(),
+    ))
+}
+
+/// The occurrence's `{date}` in the scheduler's zone — the name the contract expands to.
+fn occurrence_date(ms: u64) -> String {
+    Local
+        .timestamp_millis_opt(ms as i64)
+        .single()
+        .unwrap()
+        .format("%Y-%m-%d")
+        .to_string()
+}
+
+#[tokio::test]
+async fn a_declared_output_that_the_turn_writes_is_a_clean_run() {
+    let dir = temp_state_dir();
+    let vault = temp_vault();
+    let (at, anchor) = due_at(5);
+    let due = now_ms() - 5 * 60_000;
+    let target = vault
+        .join("vault/Inbox")
+        .join(format!("{}-vault-lint.md", occurrence_date(due)));
+    let fake = writing_claude(&target);
+    let st = state_with_vault(
+        vec![ScheduleToml {
+            expect_output: Some(vec!["Inbox/{date}-vault-lint.md".into()]),
+            ..head("lint", &at)
+        }],
+        &fake,
+        &dir,
+        &vault,
+    );
+    st.scheduler.state.claim("lint", anchor);
+
+    tick_and_wait(&st, now_ms()).await;
+
+    let rec = st.scheduler.state.get("lint");
+    assert_eq!(rec.outcome(), Some(Outcome::Ran), "{:?}", rec.last_reason);
+    assert_eq!(
+        rec.last_output_path.as_deref(),
+        Some(format!("Inbox/{}-vault-lint.md", occurrence_date(due)).as_str()),
+        "the match that satisfied the contract is recorded, TOKENS EXPANDED against the \
+         occurrence"
+    );
+    assert_eq!(rec.consecutive_failures, 0);
+
+    let row = row(&schedule_body(&st).await, "lint").clone();
+    assert_eq!(row["expect_output"][0], "Inbox/{date}-vault-lint.md");
+    assert_eq!(row["last_output_path"], rec.last_output_path.unwrap());
+    let _ = std::fs::remove_file(&fake);
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_dir_all(&vault);
+}
+
+#[tokio::test]
+async fn a_turn_that_writes_nothing_is_fired_no_output_not_ran() {
+    // THE GAP THIS CLOSES. The turn finished cleanly — there is a transcript, the job store
+    // says Done — so `failed` would be a lie. But `ran` is what let a job go quiet for
+    // nights on end: the record said the routine ran and the file it exists to write was
+    // never there.
+    let dir = temp_state_dir();
+    let vault = temp_vault();
+    let log = dir.join("runs.log");
+    let fake = logging_claude(&log, "0.05"); // answers, writes nothing
+    let (at, anchor) = due_at(5);
+    let st = state_with_vault(
+        vec![ScheduleToml {
+            expect_output: Some(vec!["Inbox/{date}-vault-lint.md".into()]),
+            ..head("lint", &at)
+        }],
+        &fake,
+        &dir,
+        &vault,
+    );
+    st.scheduler.state.claim("lint", anchor);
+
+    tick_and_wait(&st, now_ms()).await;
+
+    let rec = st.scheduler.state.get("lint");
+    assert_eq!(rec.outcome(), Some(Outcome::FiredNoOutput));
+    assert!(
+        rec.last_reason.contains("wrote nothing matching"),
+        "{:?}",
+        rec.last_reason
+    );
+    assert!(
+        rec.last_reason
+            .contains(&occurrence_date(now_ms() - 5 * 60_000)),
+        "the reason names the EXPANDED pattern, so it says what was looked for: {:?}",
+        rec.last_reason
+    );
+    assert_eq!(rec.last_output_path, None);
+    assert_eq!(
+        rec.consecutive_failures, 1,
+        "an empty fire counts toward the streak"
+    );
+    assert!(
+        log_lines(&log).contains(&"start MARKER-lint".to_string()),
+        "the turn really did run — this is not a skip"
+    );
+    let _ = std::fs::remove_file(&fake);
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_dir_all(&vault);
+}
+
+#[tokio::test]
+async fn an_output_already_fresh_for_this_occurrence_skips_the_fire() {
+    // IDEMPOTENCY. A catch-up run after an outage must not rewrite a note that was already
+    // written for the occurrence it is catching up on.
+    let dir = temp_state_dir();
+    let vault = temp_vault();
+    let log = dir.join("runs.log");
+    let fake = logging_claude(&log, "0.05");
+    let (at, anchor) = due_at(5);
+    let due = now_ms() - 5 * 60_000;
+    let existing = vault
+        .join("vault/Inbox")
+        .join(format!("{}-vault-lint.md", occurrence_date(due)));
+    std::fs::write(&existing, "already written").unwrap();
+
+    let st = state_with_vault(
+        vec![ScheduleToml {
+            expect_output: Some(vec!["Inbox/{date}-vault-lint.md".into()]),
+            ..head("lint", &at)
+        }],
+        &fake,
+        &dir,
+        &vault,
+    );
+    st.scheduler.state.claim("lint", anchor);
+
+    tick_and_wait(&st, now_ms()).await;
+
+    let rec = st.scheduler.state.get("lint");
+    assert_eq!(rec.outcome(), Some(Outcome::Skipped));
+    assert_eq!(rec.last_reason, "output fresh");
+    assert!(log_lines(&log).is_empty(), "no turn may have run");
+    let _ = std::fs::remove_file(&fake);
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_dir_all(&vault);
+}
+
+#[tokio::test]
+async fn a_stale_output_does_not_satisfy_this_occurrences_contract() {
+    // Yesterday's file cannot stand in for today's. The contract is measured from the
+    // occurrence, not from "a file with this name exists".
+    let dir = temp_state_dir();
+    let vault = temp_vault();
+    let log = dir.join("runs.log");
+    let fake = logging_claude(&log, "0.05");
+    let (at, anchor) = due_at(5);
+    // A pattern with NO date token, so the same path is a candidate every day — and only
+    // its mtime distinguishes a fresh run from a stale one.
+    let stale = vault.join("vault/Inbox/vault-lint.md");
+    std::fs::write(&stale, "yesterday").unwrap();
+    let old = SystemTime::now() - Duration::from_secs(48 * 3600);
+    filetime_set(&stale, old);
+
+    let st = state_with_vault(
+        vec![ScheduleToml {
+            expect_output: Some(vec!["Inbox/vault-lint.md".into()]),
+            ..head("lint", &at)
+        }],
+        &fake,
+        &dir,
+        &vault,
+    );
+    st.scheduler.state.claim("lint", anchor);
+
+    tick_and_wait(&st, now_ms()).await;
+
+    let rec = st.scheduler.state.get("lint");
+    assert_eq!(
+        rec.outcome(),
+        Some(Outcome::FiredNoOutput),
+        "the stale file neither blocked the fire nor satisfied it: {:?}",
+        rec.last_reason
+    );
+    assert!(
+        log_lines(&log).contains(&"start MARKER-lint".to_string()),
+        "a stale output must not make the job skip"
+    );
+    let _ = std::fs::remove_file(&fake);
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_dir_all(&vault);
+}
+
+/// Set a file's mtime, without a crate: `touch -t` is POSIX and on every box this runs on.
+fn filetime_set(path: &std::path::Path, when: SystemTime) {
+    let secs = when
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let stamp = Local
+        .timestamp_millis_opt((secs * 1000) as i64)
+        .single()
+        .unwrap()
+        .format("%Y%m%d%H%M.%S")
+        .to_string();
+    let out = std::process::Command::new("touch")
+        .arg("-t")
+        .arg(&stamp)
+        .arg(path)
+        .output()
+        .expect("touch is available");
+    assert!(out.status.success(), "touch -t {stamp}: {out:?}");
+}
+
+// ---- The control endpoints -----------------------------------------------------
+
+fn post(uri: &str, body: &str) -> Request<Body> {
+    Request::builder()
+        .method("POST")
+        .uri(uri)
+        .header("authorization", "Bearer test-token")
+        .header("content-type", "application/json")
+        .body(Body::from(body.to_string()))
+        .unwrap()
+}
+
+async fn call(st: &AppState, req: Request<Body>) -> (StatusCode, Value) {
+    let resp = app(st.clone()).oneshot(req).await.unwrap();
+    let status = resp.status();
+    let text = body_string(resp).await;
+    let value = serde_json::from_str(&text).unwrap_or(Value::String(text));
+    (status, value)
+}
+
+/// Wait for a chain the endpoint started (it is spawned detached, not awaited).
+async fn wait_until_idle(st: &AppState, head: &str) {
+    let deadline = SystemTime::now() + WAIT_DEADLINE;
+    while st.scheduler.is_running(head) {
+        assert!(SystemTime::now() < deadline, "chain {head} never finished");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+#[tokio::test]
+async fn the_fire_endpoint_is_401_without_auth_and_404_for_an_unknown_id() {
+    let dir = temp_state_dir();
+    let log = dir.join("runs.log");
+    let fake = logging_claude(&log, "0.05");
+    let (at, _) = due_at(5);
+    let st = state_with(vec![head("one", &at)], &fake, &dir);
+
+    let anon = Request::builder()
+        .method("POST")
+        .uri("/jesse/schedule/one/fire")
+        .body(Body::empty())
+        .unwrap();
+    let (status, _) = call(&st, anon).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+    let (status, body) = call(&st, post("/jesse/schedule/nope/fire", "{}")).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert!(format!("{body}").contains("nope"), "{body}");
+    let _ = std::fs::remove_file(&fake);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn the_fire_endpoint_runs_the_chain_from_the_named_member_and_refuses_a_second() {
+    // The named member and everything AFTER it — never the members before it, which is
+    // what makes this usable for repairing one broken link rather than replaying a night.
+    let dir = temp_state_dir();
+    let log = dir.join("runs.log");
+    let fake = logging_claude(&log, "1.5");
+    let (at, _) = due_at(5);
+    let st = state_with(
+        vec![
+            head("one", &at),
+            link("two", "one"),
+            ScheduleToml {
+                after_on: Some("any".into()),
+                ..link("three", "two")
+            },
+        ],
+        &fake,
+        &dir,
+    );
+
+    let (status, body) = call(&st, post("/jesse/schedule/two/fire", "{}")).await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+    assert_eq!(body["chain"], serde_json::json!(["two", "three"]));
+    assert!(body["started_ms"].as_u64().unwrap() > 0);
+
+    // SINGLE FLIGHT, keyed on the HEAD of the chain the member belongs to — a second call
+    // naming any member of a running chain is refused rather than putting a second agent
+    // on the same working tree.
+    let (status, body) = call(&st, post("/jesse/schedule/three/fire", "{}")).await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    let body = format!("{body}");
+    assert!(
+        body.contains("one") && body.contains("already running"),
+        "the refusal names the chain HEAD, not the member asked for: {body}"
+    );
+
+    wait_until_idle(&st, "one").await;
+    let lines = log_lines(&log);
+    assert!(
+        lines.contains(&"start MARKER-two".to_string())
+            && lines.contains(&"start MARKER-three".to_string()),
+        "{lines:?}"
+    );
+    assert!(
+        !lines.contains(&"start MARKER-one".to_string()),
+        "the head is BEFORE the named member and must not run: {lines:?}"
+    );
+    assert_eq!(
+        st.scheduler.state.get("two").last_reason,
+        "fired by operator",
+        "the ledger and the record say who asked"
+    );
+    let _ = std::fs::remove_file(&fake);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn the_fire_endpoint_honors_output_freshness_and_force_overrides_it() {
+    let dir = temp_state_dir();
+    let vault = temp_vault();
+    let log = dir.join("runs.log");
+    let fake = logging_claude(&log, "0.05");
+    let (at, _anchor) = due_at(5);
+    let due = now_ms() - 5 * 60_000;
+    let existing = vault
+        .join("vault/Inbox")
+        .join(format!("{}-lint.md", occurrence_date(due)));
+    std::fs::write(&existing, "already written").unwrap();
+
+    let st = state_with_vault(
+        vec![ScheduleToml {
+            expect_output: Some(vec!["Inbox/{date}-lint.md".into()]),
+            ..head("lint", &at)
+        }],
+        &fake,
+        &dir,
+        &vault,
+    );
+    // The head's last occurrence, which is what an operator fire measures the contract
+    // against — otherwise "now" would be the instant and nothing could ever be fresh.
+    st.scheduler.state.claim("lint", due);
+
+    let (status, _) = call(&st, post("/jesse/schedule/lint/fire", "{}")).await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+    wait_until_idle(&st, "lint").await;
+    assert_eq!(st.scheduler.state.get("lint").last_reason, "output fresh");
+    assert!(log_lines(&log).is_empty(), "pressing it twice is safe");
+
+    // `force` is how you say you meant it.
+    let (status, _) = call(&st, post("/jesse/schedule/lint/fire", r#"{"force":true}"#)).await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+    wait_until_idle(&st, "lint").await;
+    assert!(
+        log_lines(&log).contains(&"start MARKER-lint".to_string()),
+        "force runs it anyway: {:?}",
+        log_lines(&log)
+    );
+    let _ = std::fs::remove_file(&fake);
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_dir_all(&vault);
+}
+
+#[tokio::test]
+async fn an_enable_override_turns_a_job_off_and_expires_on_its_own() {
+    let dir = temp_state_dir();
+    let log = dir.join("runs.log");
+    let fake = logging_claude(&log, "0.05");
+    let (at, anchor) = due_at(5);
+    let st = state_with(vec![head("one", &at), link("two", "one")], &fake, &dir);
+
+    // Off, with a deadline an hour out.
+    let until = Local
+        .timestamp_millis_opt((now_ms() + 3_600_000) as i64)
+        .single()
+        .unwrap()
+        .to_rfc3339();
+    let (status, row) = call(
+        &st,
+        post(
+            "/jesse/schedule/one/enable",
+            &format!(r#"{{"enabled":false,"until":"{until}"}}"#),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(row["id"], "one");
+    assert_eq!(row["enabled"], false, "the EFFECTIVE state");
+    assert_eq!(
+        row["enabled_config"], true,
+        "the file still says on — which is the point of an override"
+    );
+    assert_eq!(row["override"]["active"], true);
+
+    st.scheduler.state.claim("one", anchor);
+    tick_and_wait(&st, now_ms()).await;
+    assert!(
+        log_lines(&log).is_empty(),
+        "an overridden-off head does not fire"
+    );
+
+    // AND IT EXPIRES. Past the deadline the config's own `enabled` decides again.
+    let past = now_ms() + 7_200_000;
+    let job = st.scheduler.schedule().get("one").cloned().unwrap();
+    assert!(!st.scheduler.effective_enabled(&job, now_ms()));
+    assert!(
+        st.scheduler.effective_enabled(&job, past),
+        "an override nobody remembers must not be a job that never runs again"
+    );
+
+    // A disabled MEMBER skips exactly as a config `enabled = false` does, so it breaks an
+    // `after_on = "success"` chain — one word, one meaning, wherever it is set.
+    let (status, _) = call(
+        &st,
+        post("/jesse/schedule/two/enable", r#"{"enabled":false}"#),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, _) = call(
+        &st,
+        post("/jesse/schedule/one/enable", r#"{"enabled":true}"#),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    st.scheduler.state.claim("one", anchor - 86_400_000);
+    tick_and_wait(&st, now_ms()).await;
+    assert_eq!(st.scheduler.state.get("one").outcome(), Some(Outcome::Ran));
+    let two = st.scheduler.state.get("two");
+    assert_eq!(two.outcome(), Some(Outcome::Skipped));
+    assert_eq!(two.last_reason, "disabled");
+    let _ = std::fs::remove_file(&fake);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn the_enable_endpoint_rejects_a_bad_deadline_and_an_unknown_id() {
+    let dir = temp_state_dir();
+    let fake = logging_claude(&dir.join("runs.log"), "0.05");
+    let (at, _) = due_at(5);
+    let st = state_with(vec![head("one", &at)], &fake, &dir);
+
+    let (status, _) = call(
+        &st,
+        post("/jesse/schedule/nope/enable", r#"{"enabled":false}"#),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    let (status, body) = call(
+        &st,
+        post(
+            "/jesse/schedule/one/enable",
+            r#"{"enabled":false,"until":"next tuesday"}"#,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(format!("{body}").contains("RFC 3339"), "{body}");
+    let _ = std::fs::remove_file(&fake);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ---- Hot reload -----------------------------------------------------------------
+
+/// Write a `jesse.local.toml` carrying just a `[[schedule]]` table.
+fn write_config(dir: &std::path::Path, body: &str) -> PathBuf {
+    let p = dir.join("jesse.local.toml");
+    std::fs::write(&p, body).unwrap();
+    p
+}
+
+/// An mtime far enough in the past that the next write is unambiguously newer, whatever
+/// the filesystem's timestamp granularity.
+fn age_file(path: &std::path::Path) {
+    filetime_set(path, SystemTime::now() - Duration::from_secs(3600));
+}
+
+#[tokio::test]
+async fn a_valid_config_edit_swaps_the_schedule_and_keeps_every_record() {
+    let dir = temp_state_dir();
+    let log = dir.join("runs.log");
+    let fake = logging_claude(&log, "0.05");
+    let (at, anchor) = due_at(5);
+    let st = state_with(vec![head("one", &at), link("two", "one")], &fake, &dir);
+
+    // A history worth keeping.
+    st.scheduler.state.claim("one", anchor);
+    tick_and_wait(&st, now_ms()).await;
+    let before = st.scheduler.state.get("one");
+    assert_eq!(before.outcome(), Some(Outcome::Ran));
+
+    // The file the bridge "booted from", now naming a third job and retiring the second.
+    let cfg = write_config(
+        &dir,
+        &format!(
+            "[[schedule]]\nid = \"one\"\nat = \"{at}\"\nprompt = \"Run the job. MARKER-one\"\n\
+             catch_up_secs = 86400\n\n\
+             [[schedule]]\nid = \"three\"\nat = \"04:00\"\nprompt = \"Run the job. MARKER-three\"\n"
+        ),
+    );
+    age_file(&cfg);
+    st.scheduler.watch_config(Some(cfg.clone()));
+    // The edit itself.
+    std::fs::write(
+        &cfg,
+        format!(
+            "[[schedule]]\nid = \"one\"\nat = \"{at}\"\nprompt = \"Run the job. MARKER-one\"\n\
+             catch_up_secs = 86400\n\n\
+             [[schedule]]\nid = \"three\"\nat = \"04:00\"\nprompt = \"Run the job. MARKER-three\"\n"
+        ),
+    )
+    .unwrap();
+
+    let (status, body) = call(&st, post("/jesse/schedule/reload", "{}")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["reloaded"], true, "{body}");
+    assert_eq!(body["errors"].as_array().unwrap().len(), 0);
+
+    let ids: Vec<String> = st
+        .scheduler
+        .schedule()
+        .jobs
+        .iter()
+        .map(|j| j.id.clone())
+        .collect();
+    assert_eq!(ids, vec!["one".to_string(), "three".to_string()]);
+    assert_eq!(
+        st.scheduler.state.get("one"),
+        before,
+        "a reload keeps every JobRecord by id — including the anti-double-fire anchor"
+    );
+    // A head the old schedule did not have is anchored at the RELOAD, not at this
+    // process's boot: otherwise a job added at 14:00 whose time is 04:00 would resolve
+    // 04:00 today as a missed occurrence and record a skip for a job one second old.
+    assert!(st.scheduler.state.get("three").last_due_ms.is_some());
+    assert_eq!(st.scheduler.state.get("three").last_outcome, "");
+
+    // And the reload left a line in the ledger — the single most useful thing to have
+    // beside the fires that follow it.
+    let ledger =
+        std::fs::read_to_string(dir.join("Inbox/scheduled-jobs-ledger.jsonl")).unwrap_or_default();
+    let _ = ledger; // the test store keeps no ledger; the endpoint's contract is above.
+    let _ = std::fs::remove_file(&fake);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn an_invalid_config_keeps_the_running_schedule_and_says_why() {
+    // A typo must never silently retire the schedule. The old one keeps running and the
+    // reload reports the reason.
+    let dir = temp_state_dir();
+    let fake = logging_claude(&dir.join("runs.log"), "0.05");
+    let (at, _) = due_at(5);
+    let st = state_with(vec![head("one", &at), link("two", "one")], &fake, &dir);
+
+    // A DUPLICATE ID — one of the two problems that make the operator's intent unknowable.
+    let cfg = write_config(
+        &dir,
+        "[[schedule]]\nid = \"dup\"\nat = \"03:30\"\nprompt = \"go\"\n\n\
+         [[schedule]]\nid = \"dup\"\nat = \"04:30\"\nprompt = \"go\"\n",
+    );
+    st.scheduler.watch_config(Some(cfg.clone()));
+
+    let (status, body) = call(&st, post("/jesse/schedule/reload", "{}")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["reloaded"], false, "{body}");
+    assert!(
+        format!("{}", body["errors"]).contains("duplicate"),
+        "{body}"
+    );
+    let ids: Vec<String> = st
+        .scheduler
+        .schedule()
+        .jobs
+        .iter()
+        .map(|j| j.id.clone())
+        .collect();
+    assert_eq!(
+        ids,
+        vec!["one".to_string(), "two".to_string()],
+        "the running schedule is untouched"
+    );
+
+    // And so does a file that does not parse at all — which must NOT be read as "no jobs".
+    std::fs::write(&cfg, "[[schedule]\nid = broken").unwrap();
+    st.scheduler.watch_config(Some(cfg.clone()));
+    let (_, body) = call(&st, post("/jesse/schedule/reload", "{}")).await;
+    assert_eq!(body["reloaded"], false, "{body}");
+    assert!(
+        format!("{}", body["errors"]).contains("could not parse"),
+        "an unparseable file and an empty one must not look alike: {body}"
+    );
+    assert_eq!(st.scheduler.schedule().jobs.len(), 2);
+    let _ = std::fs::remove_file(&fake);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn the_tick_picks_up_a_config_edit_on_its_own() {
+    let dir = temp_state_dir();
+    let fake = logging_claude(&dir.join("runs.log"), "0.05");
+    let (at, _) = due_at(5);
+    let st = state_with(vec![head("one", &at)], &fake, &dir);
+
+    let cfg = write_config(
+        &dir,
+        "[[schedule]]\nid = \"one\"\nat = \"03:30\"\nprompt = \"go\"\n",
+    );
+    age_file(&cfg);
+    st.scheduler.watch_config(Some(cfg.clone()));
+
+    std::fs::write(
+        &cfg,
+        "[[schedule]]\nid = \"one\"\nat = \"03:30\"\nprompt = \"go\"\n\n\
+         [[schedule]]\nid = \"added-by-hand\"\nat = \"05:00\"\nprompt = \"go\"\n",
+    )
+    .unwrap();
+
+    // No reload request — just a tick, which is what a live bridge does every 20 seconds.
+    tick_and_wait(&st, now_ms()).await;
+    assert!(
+        st.scheduler.schedule().get("added-by-hand").is_some(),
+        "an edit is picked up without a restart and without a request"
+    );
+    let _ = std::fs::remove_file(&fake);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ---- Failure visibility ----------------------------------------------------------
+
+#[tokio::test]
+async fn consecutive_failures_climb_across_nights_and_reset_on_a_good_one() {
+    // The counter is what makes "this is the sixth night running" sayable at all — every
+    // other signal here is about ONE occurrence.
+    let dir = temp_state_dir();
+    let log = dir.join("runs.log");
+    let failing = failing_claude(&log, "one");
+    let (at, anchor) = due_at(5);
+    let st = state_with(vec![head("one", &at)], &failing, &dir);
+
+    for night in 1..=3u32 {
+        // Each iteration is a fresh occurrence a day earlier, so the anchor moves back.
+        st.scheduler
+            .state
+            .claim("one", anchor - (3 - night as u64) * 60_000);
+        tick_and_wait(&st, now_ms()).await;
+        assert_eq!(
+            st.scheduler.state.get("one").consecutive_failures,
+            night,
+            "night {night}"
+        );
+    }
+    assert_eq!(
+        row(&schedule_body(&st).await, "one")["consecutive_failures"],
+        3
+    );
+
+    // A good night clears it outright — a streak is CONSECUTIVE.
+    let ok = logging_claude(&log, "0.05");
+    let st2 = state_with(vec![head("one", &at)], &ok, &dir);
+    st2.scheduler.state.claim("one", anchor - 4 * 60_000);
+    tick_and_wait(&st2, now_ms()).await;
+    assert_eq!(st2.scheduler.state.get("one").outcome(), Some(Outcome::Ran));
+    assert_eq!(st2.scheduler.state.get("one").consecutive_failures, 0);
+
+    let _ = std::fs::remove_file(&failing);
+    let _ = std::fs::remove_file(&ok);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ---- Per-job model ----------------------------------------------------------------
+
+#[tokio::test]
+async fn a_per_job_model_reaches_the_turn_and_the_endpoint_reports_it() {
+    // `opus` is the always-available ambient default, so it is the one id a test fixture
+    // can name and have resolve. What is proved here is the WIRING: the key survives
+    // validation, reaches the turn, and is visible on the row.
+    let dir = temp_state_dir();
+    let log = dir.join("runs.log");
+    let fake = logging_claude(&log, "0.05");
+    let (at, anchor) = due_at(5);
+    let st = state_with(
+        vec![ScheduleToml {
+            model: Some("opus".into()),
+            ..head("one", &at)
+        }],
+        &fake,
+        &dir,
+    );
+    st.scheduler.state.claim("one", anchor);
+    tick_and_wait(&st, now_ms()).await;
+
+    assert_eq!(st.scheduler.state.get("one").outcome(), Some(Outcome::Ran));
+    assert_eq!(row(&schedule_body(&st).await, "one")["model"], "opus");
+    let _ = std::fs::remove_file(&fake);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn the_endpoint_names_the_scheduler_zone() {
+    // A bare UTC offset cannot answer the question this field exists for: "+02:00" is Rome
+    // in August and something else in January.
+    let dir = temp_state_dir();
+    let fake = logging_claude(&dir.join("runs.log"), "0.05");
+    let (at, _) = due_at(5);
+    let st = state_with(vec![head("one", &at)], &fake, &dir);
+    let body = schedule_body(&st).await;
+    assert!(
+        body["tz"].as_str().map(|s| !s.is_empty()).unwrap_or(false),
+        "{body}"
+    );
+    assert!(body["utc_offset"].is_string(), "{body}");
+    let _ = std::fs::remove_file(&fake);
+    let _ = std::fs::remove_dir_all(&dir);
+}

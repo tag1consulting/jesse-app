@@ -1,6 +1,6 @@
 [package]
 name = "jesse-bridge"
-version = "0.89.0"
+version = "0.90.0"
 edition = "2021"
 license = "Apache-2.0"
 
@@ -121,6 +121,13 @@ image = { version = "0.25", default-features = false, features = ["png", "jpeg",
 # What is used: `NaiveTime`/`NaiveDate`, `TimeZone::from_local_datetime` (whose
 # `LocalResult::{None,Ambiguous}` arms ARE the two DST cases above), and `Weekday`.
 chrono = { version = "0.4.45", default-features = false, features = ["clock", "std"] }
+# iana-time-zone: ONE call — the host zone's IANA NAME, for `GET /jesse/schedule`'s `tz`
+# field. A bare UTC offset cannot answer the question that field exists for ("does 03:30
+# mean what I think it does"): `+02:00` is Rome in August and something else in January,
+# and the app, the away profile and the sentinel all need to name the zone rather than
+# describe today's offset. Already in the lock — `chrono`'s `clock` feature reaches the OS
+# zone through exactly this crate — so naming it directly pulls no new compiled code.
+iana-time-zone = "0.1"
 
 [dev-dependencies]
 # chrono-tz: a BUNDLED tz database, for the DST tests only — never in the serving binary.

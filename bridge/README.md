@@ -94,7 +94,7 @@ change lives in one focused module:
 | `startup` | pairing-QR payload + the `binary_exists`/bind startup checks |
 | `schedule` | the `[[schedule]]` config: parse, validate (per-entry disable vs. startup error), and DST-correct next-fire / catch-up resolution. Pure — no clock of its own |
 | `schedstate` | the scheduler's persisted per-job record (`<state-dir>/schedule.json`): last due/fire/completion, outcome, reason, duration, job id |
-| `scheduler` | the tick task, chain execution under the one-scheduled-turn-at-a-time lock, single flight, the push, and `GET /jesse/schedule` |
+| `scheduler` | the tick task, the `SchedulerClock` (the one instant + zone every calendar decision reads), chain execution under the one-scheduled-turn-at-a-time lock, single flight, the `expect_output` contract, the pushes, hot reload, and the `/jesse/schedule` routes |
 | `containment` | the containment RECORD: the `(capability, MCP set)` rows, the verdict/scoring rules, and the committed file's TOML shape (`bridge/containment.toml`). Always compiled — the startup gate reads it |
 | `probe` | the LIVE battery behind it: the adversarial probes, their ground-truth checks, the scratch worlds and the runner. Behind the `containment-probe` feature, so none of it is compiled into the serving binary; run by the `containment-probe` bin |
 
@@ -1574,9 +1574,131 @@ Two invariants are worth knowing before you write a job:
   `catch_up_secs`. Only a chain head retries — replaying a chain whose earlier
   members already succeeded would redo their work against the vault.
 
+- **A chain is ONE occurrence.** Every member's `days` filter, `{date}` token and
+  output-freshness check is evaluated against the *occurrence* — the instant the
+  head came due — not against the wall clock at the moment the chain reaches that
+  member. A chain that starts at 23:50, or that runs late after an outage, must
+  not judge its last link against tomorrow. All of it goes through one
+  `SchedulerClock`, whose zone is reported by name as `tz` on the endpoint.
+
 A scheduled turn goes through the same path a phone request takes, so it appears
 in the job store, streams, retries and fails identically, and each fire is a
 fresh conversation rather than an ever-growing resumed thread.
+
+### The boot table
+
+At startup — and again after every reload — the bridge prints **one row per job**,
+links included:
+
+```
+jesse-bridge: schedule TABLE — 17 job(s), zone Europe/Rome (+02:00)
+jesse-bridge: schedule | id                    kind  trigger                 days       next fire             enabled
+jesse-bridge: schedule | overnight-vault-lint  head  at 03:30                mon,…,sun  fri 2026-08-22 03:30  true
+jesse-bridge: schedule | overnight-currency    link  after …-vault-lint (any) mon,…,sun -                     true
+jesse-bridge: schedule | overnight-tag1-status link  after …-philosophy (any) fri       -                     true
+```
+
+The `ARMED` lines above it name **heads only**, which is why this exists: a `days`
+key on a *link* decides whether the second, third and fourth job of a chain run
+tonight, and before this table it appeared nowhere but the config file itself.
+
+### The output contract (`expect_output`)
+
+A turn that runs cleanly and writes nothing is recorded as `ran`. That is true
+about the turn and useless about the job. A job can declare what it writes:
+
+```toml
+[[schedule]]
+id = "overnight-vault-lint"
+at = "03:30"
+prompt_file = "vault/prompts/scheduled/overnight-vault-lint.md"
+expect_output = ["Inbox/{date}-vault-lint.md"]
+```
+
+- Patterns are **vault-relative** — they resolve under `<vault>/vault/`, the notes
+  directory, the same hop the fire ledger makes. A pattern that could leave it
+  (`..`, an absolute path, `~`) is **refused at validation**, by name, rather than
+  silently never matching at 03:30.
+- Tokens `{date}` (`YYYY-MM-DD`), `{year}`, `{month}`, `{day}` expand from the
+  **occurrence** in the scheduler's zone.
+- Globbing is `*` and `?` **within one path segment**, over directory listings.
+  There is no `**`, and saying so beats half-supporting it.
+- **Before the fire:** if anything matching is already at or after the
+  occurrence's instant, the fire is skipped with reason `output fresh` — quiet
+  (it is the config working), so a catch-up run after an outage is idempotent.
+- **After the fire:** if nothing matching is at or after *this fire*, the outcome
+  is `fired-no-output` rather than `ran`. It is pushed, ledgered as
+  `fired-no-output`, counts toward `consecutive_failures`, and is **not** a
+  success — so it breaks an `after_on = "success"` chain.
+- It applies to links exactly as to heads. `last_output_path` on the row is the
+  match that satisfied the contract.
+
+### Per-job `model`
+
+```toml
+model = "glm-5.2"     # any id from GET /jesse/models
+```
+
+Validated **at load** against the model registry, so a typo disables that one entry
+by name instead of failing one turn a night later. It takes exactly the path a
+phone turn's `model` field takes: it backs only that turn and never touches the
+stored global default. Unset (every job today) uses the globally active model. A
+model that validated at load but is unhealthy at fire time is a **failure**, not a
+silent fall-back onto a different model.
+
+### Failure visibility
+
+`consecutive_failures` on each row is reset by a `ran`, incremented by a `failed`
+or a `fired-no-output`, and left alone by a skip (so a Monday-only job does not
+bank a failure every other day of the week). A **head** that reaches **3, 6, 12 or
+24** pushes once at each — widening, not repeating, because a nightly "failed" that
+arrives every night is one that stops being read. Nothing is ever auto-disabled.
+
+### A retired head, and promotion
+
+A **head** whose `prompt_file` does not exist *at load* is disabled by name
+(`prompt file missing: <path>`) and its **first link becomes the head**, inheriting
+its `at`, `catch_up_secs` and `days` and reporting `promoted_from` on its row; a
+second link of the same dead head is re-pointed at the promoted one rather than
+being deleted as an orphan. One line goes to the log:
+
+```
+jesse-bridge: schedule: promoted morning-health-audit to head (prompt missing on morning-health-export)
+```
+
+This is the `morning-health-export` case: the job was retired and its prompt
+deleted, every link behind it is `after_on = "any"`, so the chain kept running and
+the only evidence was one `no-prompt` line a night. A **link** with a missing
+prompt is unchanged — it fails at fire time, which costs one turn rather than a
+chain's start.
+
+### Runtime control
+
+Three POSTs, all under the same bearer auth and the same rate limiter as `/jesse`.
+
+| Route | Body | Does |
+|---|---|---|
+| `POST /jesse/schedule/{id}/fire` | `{"force": bool}` (optional) | Runs the chain **from `{id}`**: that member and everything after it. `404` unknown id; `409` while the chain containing it is running (single flight is keyed on the **head**, so any member of a busy chain is refused); `202 {"chain": [...], "started_ms"}` otherwise. Calendar evaluated at **now**; `expect_output` freshness **honoured** unless `force`. The member named does not consult a predecessor that never ran in this run — the endpoint is for repairing one link, not for replaying a night. Records/ledgers the reason `fired by operator`. |
+| `POST /jesse/schedule/{id}/enable` | `{"enabled": bool, "until": "<RFC3339>"\|null}` | Persists an override on the `JobRecord` (it survives a restart). It outranks the config file while live, then **expires** — a disabled job is silent by design, so a standing override nobody remembers is a job that never runs again. A member disabled this way skips with exactly the reason a config `enabled = false` gives, and therefore breaks an `after_on = "success"` chain the same way. Returns the row. |
+| `POST /jesse/schedule/reload` | — | Re-reads the `[[schedule]]` array. Returns `{reloaded, errors, schedule}`. |
+
+### Hot reload
+
+Every tick stats the config file the bridge loaded at boot; a changed mtime
+reloads it, and `POST /jesse/schedule/reload` does the same on demand.
+
+- **Only the `[[schedule]]` array is reloaded.** Everything else is wired into a
+  running server — sockets, semaphores, spawned children — in ways a swap cannot
+  honestly reproduce, and half-reloading a process is worse than not reloading it.
+- **`JobRecord`s are kept by id**, so a swap never rolls the anti-double-fire
+  anchor backwards. A head the old schedule did not have is anchored at the
+  **reload**, not at this process's boot, so adding an 04:00 job at 14:00 does not
+  immediately record a missed occurrence for it.
+- **A file that does not validate keeps the old schedule** and pushes the first
+  error. A typo must not be able to silently retire the schedule — and an
+  *unparseable* file must not read as "no jobs".
+- A successful reload appends `{"outcome":"reloaded"}` to the fire ledger and
+  reprints the boot table.
 
 ## Prereqs
 

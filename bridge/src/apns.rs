@@ -485,6 +485,47 @@ pub fn build_scheduled_payload(
     payload.to_string().into_bytes()
 }
 
+/// The CONSECUTIVE-FAILURE escalation payload: "this is the third night running", which is
+/// a different statement from "last night failed" and the one that gets acted on.
+pub fn build_escalation_payload(schedule_id: &str, streak: u32, reason: &str) -> Vec<u8> {
+    let reason: String = reason.trim().chars().take(MAX_PUSH_REASON_CHARS).collect();
+    let body = if reason.is_empty() {
+        format!("{schedule_id} failed {streak} times running")
+    } else {
+        format!("{schedule_id} failed {streak} times running, last: {reason}")
+    };
+    json!({
+        "aps": {
+            "alert": { "title": "Jesse schedule", "body": body },
+            "sound": "default"
+        },
+        "schedule_id": schedule_id,
+        "outcome": "escalation",
+        "consecutive_failures": streak,
+    })
+    .to_string()
+    .into_bytes()
+}
+
+/// The CONFIG RELOAD FAILURE payload. The old schedule keeps running — which is the safe
+/// behaviour and also the completely silent one, so this is the only thing that says the
+/// file someone just edited is not the file the bridge is using.
+pub fn build_reload_failure_payload(error: &str) -> Vec<u8> {
+    let error: String = error.trim().chars().take(MAX_PUSH_REASON_CHARS).collect();
+    json!({
+        "aps": {
+            "alert": {
+                "title": "Jesse schedule",
+                "body": format!("config reload failed: {error}")
+            },
+            "sound": "default"
+        },
+        "outcome": "reload-failed",
+    })
+    .to_string()
+    .into_bytes()
+}
+
 /// Whether a flagged, terminal job should fire a push: only a `Done` or `Failed`
 /// turn (a `Cancelled` turn means the user is present and chose to stop). Pure.
 pub fn job_state_is_pushable(state: &JobState) -> bool {

@@ -36,6 +36,17 @@ pub enum Outcome {
     /// run of the same id was still going, the chain's predecessor broke it, the day was
     /// not in `days`, or the job is disabled.
     Skipped,
+    /// THE TURN RAN AND FINISHED CLEANLY, AND THE JOB'S OUTPUT IS NOT THERE. Only reachable
+    /// for a job that declared `expect_output`: none of its patterns matched a file whose
+    /// mtime is at or after this fire.
+    ///
+    /// It is deliberately NOT `Ran`, and deliberately not `Failed` either. The turn did not
+    /// fail — there is a transcript, the model answered, the job store says `Done` — so
+    /// calling it a failure would misreport what happened and send someone looking for an
+    /// error that does not exist. But `ran` is the outcome that let a job go quiet for
+    /// nights on end: the record said the routine ran, and the file it exists to write was
+    /// never there. This is its own outcome so both facts survive.
+    FiredNoOutput,
 }
 
 impl Outcome {
@@ -45,6 +56,7 @@ impl Outcome {
             Outcome::Ran => "ran",
             Outcome::Failed => "failed",
             Outcome::Skipped => "skipped",
+            Outcome::FiredNoOutput => "fired-no-output",
         }
     }
 
@@ -58,6 +70,7 @@ impl Outcome {
             "ran" => Some(Outcome::Ran),
             "failed" => Some(Outcome::Failed),
             "skipped" => Some(Outcome::Skipped),
+            "fired-no-output" => Some(Outcome::FiredNoOutput),
             _ => None,
         }
     }
@@ -114,6 +127,54 @@ pub struct JobRecord {
     /// alone throughout — the anti-double-fire anchor is never rolled backwards.
     #[serde(default)]
     pub retry_due_ms: Option<u64>,
+    /// HOW MANY TIMES IN A ROW THIS JOB HAS NOT DELIVERED — reset to 0 by any `ran`,
+    /// incremented by `failed` and by `fired-no-output`. A skip leaves it alone: a skip is
+    /// a decision not to run, not a run that went wrong, and folding the two together
+    /// would let a Monday-only job accumulate a "failure" every other day of the week.
+    ///
+    /// It exists because every other signal here is about ONE occurrence. `last_outcome`
+    /// says last night failed; nothing said it was the sixth night in a row, and a nightly
+    /// push that says "failed" every night is a push that stops being read. The escalation
+    /// in [`crate::scheduler`] keys on this counter, not on the outcome.
+    #[serde(default)]
+    pub consecutive_failures: u32,
+    /// The `expect_output` match that satisfied the contract on the last fire, as a
+    /// vault-relative path, or `None` (no contract, or nothing matched). Reported by the
+    /// endpoint so "it says it ran — what did it write?" is answerable there.
+    #[serde(default)]
+    pub last_output_path: Option<String>,
+    /// A RUNTIME ENABLE/DISABLE that outranks the config file, set through
+    /// `POST /jesse/schedule/{id}/enable`. `None` means the TOML's `enabled` decides.
+    #[serde(default)]
+    pub r#override: Option<EnableOverride>,
+}
+
+/// A runtime override of one job's `enabled` state.
+///
+/// PERSISTED RATHER THAN HELD IN MEMORY, because the thing it is for is "turn the morning
+/// chain off, I am away until Sunday" — a statement that has to survive the restart that
+/// will certainly happen in between. And EXPIRING rather than sticky, because the failure
+/// mode of a manual disable is forgetting to undo it: a disabled job is silent by design
+/// ([`crate::scheduler::should_push`] does not push a configured skip), so an override with
+/// no end date is a job that quietly never runs again.
+#[derive(serde::Serialize, serde::Deserialize, Clone, Debug, PartialEq)]
+pub struct EnableOverride {
+    /// What the override says the job's `enabled` is.
+    pub enabled: bool,
+    /// When it stops applying (unix millis), or `None` for "until it is changed".
+    #[serde(default)]
+    pub until_ms: Option<u64>,
+    /// When it was set (unix millis) — so the endpoint can show how old a standing
+    /// override is, which is the question someone asks about one they have forgotten.
+    #[serde(default)]
+    pub set_ms: u64,
+}
+
+impl EnableOverride {
+    /// Whether this override still applies at `now_ms`.
+    pub fn active_at(&self, now_ms: u64) -> bool {
+        self.until_ms.map(|u| now_ms < u).unwrap_or(true)
+    }
 }
 
 impl JobRecord {
@@ -211,6 +272,52 @@ impl ScheduleStateStore {
         self.update(id, |r| r.retry_due_ms = None);
     }
 
+    /// Stamp `last_due_ms` ONLY IF THE JOB HAS NEVER COME DUE.
+    ///
+    /// Used by the config reload for a head the running schedule did not have: anchoring it
+    /// at the reload rather than at the process's boot is what stops "I added a 10:00 job at
+    /// 14:00" from immediately resolving 10:00 as a missed occurrence and recording a skip
+    /// for a job that has existed for a second. A head with a record is never touched — its
+    /// history is the whole reason the record exists.
+    pub fn anchor_if_absent(&self, id: &str, ms: u64) {
+        self.update(id, |r| {
+            if r.last_due_ms.is_none() {
+                r.last_due_ms = Some(ms);
+            }
+        });
+    }
+
+    /// Record which `expect_output` match satisfied this job's contract (or that none did).
+    pub fn set_output_path(&self, id: &str, path: Option<String>) {
+        self.update(id, |r| r.last_output_path = path);
+    }
+
+    /// Set or clear the runtime enable override. `None` hands the decision back to the
+    /// config file.
+    pub fn set_override(&self, id: &str, ov: Option<EnableOverride>) {
+        self.update(id, |r| r.r#override = ov);
+    }
+
+    /// Append one SCHEDULE-LEVEL line to the fire ledger — an event about the schedule
+    /// itself rather than about one occurrence (today: a config reload).
+    ///
+    /// It goes in the same file as the fires on purpose. The question the ledger answers is
+    /// "what happened to this schedule, in order"; a reload that changed which jobs exist is
+    /// the single most useful line to have next to the fires that follow it, and putting it
+    /// in a second file would mean interleaving two files by hand to get it.
+    pub fn ledger_event(&self, job: &str, outcome: &str, reason: &str, at_ms: u64) {
+        self.write_ledger_line(json!({
+            "at": Local::now().to_rfc3339_opts(SecondsFormat::Secs, false),
+            "at_ms": at_ms,
+            "job": job,
+            "outcome": outcome,
+            "reason": reason,
+            "fired_at_ms": Value::Null,
+            "duration_ms": Value::Null,
+            "job_id": Value::Null,
+        }));
+    }
+
     /// A turn started for this id.
     pub fn started(&self, id: &str, fire_ms: u64, job_id: &str) {
         self.update(id, |r| {
@@ -245,6 +352,15 @@ impl ScheduleStateStore {
                 r.last_job_id = None;
                 r.last_duration_ms = None;
             }
+            // The streak counter. A skip is neither a success nor a failure, so it is the
+            // one outcome that leaves the count exactly as it was.
+            match outcome {
+                Outcome::Ran => r.consecutive_failures = 0,
+                Outcome::Failed | Outcome::FiredNoOutput => {
+                    r.consecutive_failures = r.consecutive_failures.saturating_add(1)
+                }
+                Outcome::Skipped => {}
+            }
         });
         // AFTER the record, and deliberately last: the ledger is observability, and a
         // failure to append it must never cost us the anti-double-fire state above.
@@ -262,7 +378,9 @@ impl ScheduleStateStore {
         completion_ms: u64,
         duration_ms: Option<u64>,
     ) {
-        let Some(path) = &self.ledger else { return };
+        if self.ledger.is_none() {
+            return;
+        }
         let rec = self.get(id);
         let line = json!({
             // Local wall-clock, because every question asked of this file is a wall-clock
@@ -277,6 +395,14 @@ impl ScheduleStateStore {
             "duration_ms": duration_ms,
             "job_id": rec.last_job_id,
         });
+        self.write_ledger_line(line);
+    }
+
+    /// Append one already-built JSON object as a line. Shared by the per-occurrence append
+    /// and the schedule-level events so both obey the same best-effort discipline: a ledger
+    /// that could break the scheduler would be a worse bug than the blindness it fixes.
+    fn write_ledger_line(&self, line: Value) {
+        let Some(path) = &self.ledger else { return };
         let Ok(mut text) = serde_json::to_string(&line) else {
             return;
         };
@@ -309,6 +435,7 @@ impl ScheduleStateStore {
 fn ledger_label(outcome: Outcome, reason: &str) -> &'static str {
     match outcome {
         Outcome::Ran => "fired",
+        Outcome::FiredNoOutput => "fired-no-output",
         Outcome::Failed if reason.starts_with(crate::schedule::PROMPT_READ_FAILED) => "no-prompt",
         Outcome::Failed => "failed",
         Outcome::Skipped if reason == crate::scheduler::CALENDAR_SKIP => "day-skipped",

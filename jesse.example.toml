@@ -477,6 +477,13 @@ diet_keywords_extra = [
 #   days           weekday names, default all seven ("mon".."sun", or full names).
 #                  Applies to HEADS AND LINKS alike, so a link can be narrower
 #                  than its head — a Monday-only job hanging off a daily chain.
+#                  A CHAIN IS ONE OCCURRENCE: every member's `days` is evaluated
+#                  against the instant the HEAD came due, not against the clock
+#                  at the moment the chain reaches that member. A chain that
+#                  starts at 23:50, or that runs late after an outage, must not
+#                  judge its last link against tomorrow.
+#                  Every job's resolved days are printed in the boot table, so a
+#                  `days` key on the wrong entry is visible at startup.
 #   prompt         inline text for the turn, OR
 #   prompt_file    a path to a file holding it. Exactly one is required.
 #                  A RELATIVE path resolves against the vault root; an absolute
@@ -515,6 +522,30 @@ diet_keywords_extra = [
 #                  whose earlier members already succeeded would redo their work.
 #                  A pending retry shows up as `retry_due_ms` on
 #                  GET /jesse/schedule.
+#   expect_output  OPTIONAL list of vault-relative globs this job is expected to
+#                  WRITE, e.g. ["Inbox/{date}-vault-lint.md"]. Heads and links
+#                  alike. Paths resolve under <vault>/vault/ (the notes dir) and
+#                  one that could leave it — `..`, absolute, `~` — disables that
+#                  entry at validation rather than silently never matching at
+#                  03:00. Tokens {date} (YYYY-MM-DD), {year}, {month}, {day}
+#                  expand from the OCCURRENCE in the scheduler's zone. Globbing
+#                  is `*` and `?` within one path segment; there is no `**`.
+#
+#                  IT CHANGES THE OUTCOME IN BOTH DIRECTIONS. Before the fire: if
+#                  anything matching is already at or after this occurrence, the
+#                  fire is skipped with reason "output fresh" (quiet — it is the
+#                  config working), which is what makes a catch-up run after an
+#                  outage idempotent. After the fire: if nothing matching is at or
+#                  after THIS fire, the outcome is `fired-no-output` rather than
+#                  `ran` — pushed, ledgered, counted toward the failure streak,
+#                  and NOT a success, so it breaks an `after_on = "success"`
+#                  chain. A turn that talked to the model and wrote nothing is
+#                  not a job that did its work.
+#   model          OPTIONAL registry id (anything GET /jesse/models lists), e.g.
+#                  "glm-5.2". Validated AT LOAD — a typo disables that entry by
+#                  name instead of failing one turn a night later. It backs only
+#                  this job's turns and never touches the global active model.
+#                  Unset uses whatever is globally active.
 #
 # A misconfiguration never takes the bridge down. An entry that fails validation
 # (both or neither of `at`/`after`, an unknown `after` target, `catch_up_secs` on
@@ -522,6 +553,22 @@ diet_keywords_extra = [
 # id, disabled ON ITS OWN, and listed under `invalid` on GET /jesse/schedule —
 # while every other job still runs. Only a duplicate id and an `after` cycle
 # refuse to start, because both make your intent unknowable.
+#
+# A HEAD whose `prompt_file` does not exist at load is disabled the same way —
+# and its FIRST LINK IS PROMOTED into the clock slot it vacated, inheriting the
+# head's `at`, `catch_up_secs` and `days` and reporting `promoted_from` on the
+# endpoint. A retired job whose prompt was deleted otherwise fails every single
+# night while the chain behind it runs on `after_on = "any"`, which is exactly
+# how one sat in a live config for six days unnoticed. A LINK with a missing
+# prompt is unchanged: it fails at fire time, which costs one turn rather than a
+# chain's start.
+#
+# YOU DO NOT NEED TO RESTART TO EDIT THIS TABLE. The bridge stats this file every
+# tick and reloads the `[[schedule]]` array when it changes (POST
+# /jesse/schedule/reload does it on demand). Only this array is reloaded —
+# everything else stays as booted. A file that does not validate KEEPS THE
+# RUNNING SCHEDULE and pushes the first error, so a typo cannot silently retire
+# your jobs. Per-job records are kept by id across the swap.
 #
 # ---------------------------------------------------------------------------
 # Worked example 1 — an overnight chain: one head, three links
