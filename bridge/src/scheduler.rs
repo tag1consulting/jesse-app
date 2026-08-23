@@ -3530,6 +3530,21 @@ mod profile_tests {
         }
     }
 
+    /// Put the scheduler in `tz` and let it observe the move, returning the anchor that
+    /// survived it.
+    ///
+    /// **BOTH ENDS OF EVERY TRANSITION BELOW ARE NAMED ZONES**, never `Host`, and that is
+    /// not incidental. `Host` is `Europe/Rome` on the deployment and `Etc/UTC` on a CI
+    /// runner, so a test that used it to stand for "home" would assert a different thing in
+    /// the two places and pass in exactly one — which is the same reason `next_fire` is
+    /// generic over `TimeZone` rather than reaching for `Local`. Rome plays the part of the
+    /// home zone here; the property is about any two zones an hour apart.
+    fn move_to(sched: &Arc<Scheduler>, store: &ProfileStore, tz: &str, now_ms: u64) -> Option<u64> {
+        store.set_away(away_until(tz, now_ms, utc(2026, 9, 7, 22, 59)));
+        sched.observe_profile_change(&crate::testutil::test_state(), now_ms);
+        sched.state.get("start-of-day").last_due_ms
+    }
+
     /// GOING AWAY MUST NOT RE-RUN THE DAY. Rome's 06:05 has already fired for the 26th
     /// (04:05Z). Moving to London — one hour behind — makes "06:05 on the 26th" 05:05Z,
     /// which is still ahead of the anchor, so without the re-anchor today's occurrence
@@ -3540,19 +3555,17 @@ mod profile_tests {
         let sched = sched_with(store.clone());
         let job = head_0605();
 
-        // Tick 1, at home: today's Rome occurrence has run.
+        // Tick 1, in the home zone (Rome — see `move_to`): today's occurrence has run.
+        move_to(&sched, &store, "Europe/Rome", utc(2026, 8, 26, 0, 0));
         let rome_fire = at(&zone_rome(), 2026, 8, 26, 6, 5);
         sched.state.claim("start-of-day", rome_fire);
         assert_eq!(rome_fire, utc(2026, 8, 26, 4, 5));
 
         // 04:30Z — after the Rome fire, before the London one — the phone declares away.
-        let now = utc(2026, 8, 26, 4, 30);
-        store.set_away(away_until("Europe/London", now, utc(2026, 9, 7, 22, 59)));
-        let st = crate::testutil::test_state();
-        sched.observe_profile_change(&st, now);
+        let anchor = move_to(&sched, &store, "Europe/London", utc(2026, 8, 26, 4, 30))
+            .expect("the head has a record");
 
         // The anchor is now the SAME OCCURRENCE expressed in London: 06:05 on the 26th.
-        let anchor = sched.state.get("start-of-day").last_due_ms.unwrap();
         assert_eq!(
             anchor,
             utc(2026, 8, 26, 5, 5),
@@ -3579,21 +3592,16 @@ mod profile_tests {
         let store = Arc::new(ProfileStore::new(None));
         let sched = sched_with(store.clone());
         let job = head_0605();
-        let st = crate::testutil::test_state();
 
         // Away in London, and yesterday's occurrence is the anchor.
-        let start = utc(2026, 8, 20, 0, 0);
-        store.set_away(away_until("Europe/London", start, utc(2026, 9, 7, 22, 59)));
-        sched.observe_profile_change(&st, start);
+        move_to(&sched, &store, "Europe/London", utc(2026, 8, 20, 0, 0));
         let yesterday = at(&zone_london(), 2026, 8, 25, 6, 5);
         sched.state.claim("start-of-day", yesterday);
 
-        // 04:30Z on the 26th: home early. Rome's occurrence for today was 04:05Z.
+        // 04:30Z on the 26th: back in the home zone, early. Rome's occurrence for today
+        // was 04:05Z — already past, and never run.
         let now = utc(2026, 8, 26, 4, 30);
-        store.go_home(now);
-        sched.observe_profile_change(&st, now);
-
-        let anchor = sched.state.get("start-of-day").last_due_ms.unwrap();
+        let anchor = move_to(&sched, &store, "Europe/Rome", now).expect("the head has a record");
         assert_eq!(
             anchor,
             at(&zone_rome(), 2026, 8, 25, 6, 5),
@@ -3615,13 +3623,11 @@ mod profile_tests {
     fn a_pending_retry_moves_with_the_anchor() {
         let store = Arc::new(ProfileStore::new(None));
         let sched = sched_with(store.clone());
-        let st = crate::testutil::test_state();
+        move_to(&sched, &store, "Europe/Rome", utc(2026, 8, 26, 0, 0));
         sched
             .state
             .arm_retry("start-of-day", at(&zone_rome(), 2026, 8, 26, 6, 5));
-        let now = utc(2026, 8, 26, 4, 30);
-        store.set_away(away_until("Europe/London", now, utc(2026, 9, 7, 22, 59)));
-        sched.observe_profile_change(&st, now);
+        move_to(&sched, &store, "Europe/London", utc(2026, 8, 26, 4, 30));
         assert_eq!(
             sched.state.get("start-of-day").retry_due_ms,
             Some(at(&zone_london(), 2026, 8, 26, 6, 5))
@@ -3634,9 +3640,11 @@ mod profile_tests {
         let store = Arc::new(ProfileStore::new(None));
         let sched = sched_with(store.clone());
         let st = crate::testutil::test_state();
+        move_to(&sched, &store, "Europe/Rome", utc(2026, 8, 26, 0, 0));
         let anchor = at(&zone_rome(), 2026, 8, 26, 6, 5);
         sched.state.claim("start-of-day", anchor);
-        sched.observe_profile_change(&st, utc(2026, 8, 26, 5, 0));
+        // Re-posting the SAME zone, twice.
+        move_to(&sched, &store, "Europe/Rome", utc(2026, 8, 26, 5, 0));
         sched.observe_profile_change(&st, utc(2026, 8, 26, 5, 1));
         assert_eq!(sched.state.get("start-of-day").last_due_ms, Some(anchor));
     }
