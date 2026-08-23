@@ -1,6 +1,6 @@
 [package]
 name = "jesse-bridge"
-version = "0.92.0"
+version = "0.93.0"
 edition = "2021"
 license = "Apache-2.0"
 
@@ -28,6 +28,19 @@ required-features = ["containment-probe"]
 [[test]]
 name = "containment"
 required-features = ["containment-probe"]
+
+# THE SENTINEL. Declared so the artifact is `jesse-sentinel` — the name the launchd plist,
+# the installer and `~/.local/bin` all use — rather than `sentinel`, which is what
+# auto-discovery would derive from the file name. The file stays at `src/bin/sentinel.rs`
+# beside its `src/sentinel/` module tree; naming a target's path here simply takes it out of
+# auto-discovery, so there is no duplicate.
+#
+# It is NOT behind a feature. Unlike `containment-probe`, this binary is part of a deploy:
+# `cargo build --release` is what the install script builds with, and a sentinel that only
+# existed under a non-default feature would be a sentinel nobody has when they need it.
+[[bin]]
+name = "jesse-sentinel"
+path = "src/bin/sentinel.rs"
 
 [dependencies]
 axum = "0.7"

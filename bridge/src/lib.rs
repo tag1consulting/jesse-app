@@ -121,6 +121,20 @@ mod routing;
 mod schedstate;
 mod schedule;
 mod scheduler;
+// THE SENTINEL (`src/bin/sentinel.rs`), namespaced rather than flattened.
+//
+// Every other module above is glob re-exported into one flat crate namespace, which is what
+// lets the bridge's files see each other by bare name. The sentinel is deliberately NOT:
+// it is a second, separate service with its own token, its own port and its own vocabulary,
+// and forty more bare names — `tick`, `status`, `restart`, `Probe` — in the namespace the
+// turn path lives in would be an invitation to reach across the boundary by accident. It is
+// reached as `jesse_bridge::sentinel::…`, by the one binary that is allowed to.
+//
+// It is compiled into the library on the default feature set (unlike `probe`) because the
+// deploy build IS `cargo build --release`, and that is what has to produce the sentinel
+// binary. Nothing on the bridge's turn path references it.
+pub mod sentinel;
+
 mod sessions;
 mod shadow;
 mod slots;

@@ -2335,6 +2335,85 @@ with the `JESSE_APNS_*` vars unset, none of this is active.
   pushed to (and the phone re-registers on its next foreground). Other push
   failures are transient and leave the token in place.
 
+## The sentinel (an operator process on the tailnet)
+
+`jesse-sentinel` is a **second process**, built from this crate
+(`bridge/src/bin/sentinel.rs`, `bridge/src/sentinel/`) and run as its own launchd
+job. It exists because `launchctl`, `cargo` and `xcodebuild` are permanently
+refused to a model turn — each is a write-then-execute escape out of the
+containment record — and yet a wedged bridge has to be restartable from a phone.
+See [`bridge/README.md`](bridge/README.md#the-sentinel-jesse-sentinel-a-second-process)
+for the verb table and the watchdog rules.
+
+- **It is not a tool, and it is not reachable from a turn.** Nothing was added to
+  `DEFAULT_ALLOWED_TOOLS`, to `MAIN_CHILD_MCP_CONFIG`, or to any containment
+  record; no MCP server was added or changed. The sentinel is a separate binary on
+  a separate port that no child process is told about and no allowlist grants. The
+  agent cannot call it, and the containment posture is byte-for-byte what it was.
+- **What it can do.** Restart the five launchd jobs this deployment names,
+  `bootout`/`bootstrap` the bridge from its plist, delete a provably-stale
+  `.git/index.lock`, delete artifact directories older than seven days, and
+  forward two of the bridge's own scheduler control verbs. After P5 it will also
+  **replace the bridge binary**. That is a genuinely privileged set, and the
+  boundaries below are what contain it.
+- **What it cannot do.** It has no model, runs no agent, reads no vault content,
+  and executes nothing a caller names. Its external commands are a **fixed list**
+  (`launchctl`, `tailscale`, `git`, `df`, `pgrep`, `qmd`, `node`), each resolved to
+  an **absolute path once at startup**, each invoked with a **literal argument
+  vector** and never through a shell. There is no verb that takes a command, a
+  path, a launchd label, or a shell string.
+- **The two tokens are disjoint, and that is enforced.** `JESSE_SENTINEL_TOKEN`
+  must be set and must **not** equal `JESSE_TOKEN`; the process refuses to start
+  otherwise. This is the boundary, not hygiene: the bridge's token travels on every
+  request the phone makes, so a shared value would mean any leak of it also grants
+  `launchctl kickstart` on the host. The two can be revoked independently. The
+  bearer check itself is the bridge's own constant-time `check_auth`, and the
+  integration test asserts the refusal **in both directions** over a real socket.
+- **The verb table is closed.** `POST /sentinel/restart/{service}` takes one of
+  five fixed slugs — never a launchd label — and the labels those map to are
+  deployment configuration. A caller cannot name a job the configuration did not
+  name; anything else is a `404`. The two proxy verbs validate their `{id}` against
+  an alphabet (`[A-Za-z0-9_-]`, 1–64) **and then** against the bridge's live
+  schedule before forwarding, and nothing else from the request reaches the bridge.
+- **Mutation is gated three ways and always audited.** Bearer token, then a
+  10-per-minute rate limit, then single flight (one mutating verb at a time,
+  `409` otherwise). Every outcome — including a refusal, including an
+  unauthenticated attempt — appends a line to `<state dir>/sentinel.log`:
+  timestamp, caller IP, verb, outcome. **No token, no request body, and no
+  caller-supplied string that failed validation** is ever written there; a unit
+  test asserts that neither token appears in the file.
+- **`git/unlock` refuses unless it can prove the lock is dead.** The file must be
+  older than 180 s *and* `pgrep -u <uid> -x git` must report no match. `pgrep`
+  exiting anything other than 1 ("no match") is treated as "cannot prove", and the
+  verb refuses — acting on a probe that did not work is how a stuck commit becomes
+  a broken repository. It deletes exactly that one path and never recurses.
+- **`artifacts/prune` deletes only immediate child directories** of
+  `<bridge state dir>/artifacts` that are older than seven days, and skips
+  symlinks (`symlink_metadata`, never followed) — a link out of the store is the
+  one way that verb could reach something that is not an artifact.
+- **Bind safety is the bridge's rule, reused.** Loopback or `100.64.0.0/10` only,
+  through the same `is_bind_allowed`, with the same `JESSE_ALLOW_PUBLIC_BIND`
+  override. Refused before the socket opens.
+- **It never writes the bridge's device token.** `~/.jesse-bridge/device.json` is
+  read on every push (the phone re-registers on foreground) and never written, not
+  even on a `410 Gone` — the bridge owns that record, and clearing it from two
+  processes is how it gets lost. Sentinel pushes carry a short alert and a `kind`;
+  no vault content, and no `job_id`.
+- **The rendered plist is a secret and is treated as one.** It carries both bearer
+  tokens. `scripts/install-sentinel.sh` writes it to `~/Library/LaunchAgents/` at
+  mode `0600` under `umask 077`, keeps any previous copy at the same mode, and
+  **never writes a token into the repository** — the tracked template carries only
+  placeholders. The installer **never runs `launchctl`**; it prints the bootstrap
+  line for a person to run.
+- **The watchdog's automatic actions are bounded.** At most five bridge kickstarts
+  in a rolling hour and then it stops and says so; `tailscale up` once per outage;
+  the unlock verb only under the proof above. It never resolves a git conflict and
+  never repairs `qmd` — both need a decision, and a process with no model has no
+  business making one.
+- **The token is never printed.** Not at startup, not in the status document, not
+  in the audit log. The bridge's pairing QR can carry it (`stoken=`) under exactly
+  the same TTY gate and `--show-token` rule that protects the bridge's own token.
+
 ## Reporting
 
 This is a single-user personal bridge; there is no formal disclosure process.

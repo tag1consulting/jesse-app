@@ -1,0 +1,117 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  jesse-sentinel — the model-free operator process (bridge/src/bin/sentinel.rs).
+
+  THIS FILE IS A TEMPLATE, NOT A PLIST. Every doubled-at placeholder below is substituted by
+  scripts/install-sentinel.sh, which writes the result into ~/Library/LaunchAgents/ with
+  mode 0600 and never into this repository — the rendered file carries two bearer tokens.
+  (That script refuses to install a rendering in which any placeholder survived, so this
+  comment carries no example of one.)
+
+  The five service labels below are the launchd labels of the jobs the sentinel may restart.
+  They are configuration, not defaults compiled into the binary: the compiled defaults sit in
+  the documented `com.example.` namespace, and the sentinel warns at startup, by name, about
+  any that are still placeholders.
+
+  KeepAlive is on, because the watchdog is the point: a sentinel that stayed down after a
+  crash would leave nothing watching the thing it exists to watch.
+-->
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>@@LABEL@@</string>
+
+	<key>ProgramArguments</key>
+	<array>
+		<string>@@BIN@@</string>
+	</array>
+
+	<key>RunAtLoad</key>
+	<true/>
+	<key>KeepAlive</key>
+	<true/>
+	<!-- launchd's floor on respawns; below 10s it starts refusing to restart a flapping job. -->
+	<key>ThrottleInterval</key>
+	<integer>10</integer>
+
+	<key>StandardOutPath</key>
+	<string>@@LOG@@</string>
+	<key>StandardErrorPath</key>
+	<string>@@LOG@@</string>
+
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>PATH</key>
+		<string>@@PATH@@</string>
+		<key>TZ</key>
+		<string>@@TZ@@</string>
+
+		<!-- The sentinel's OWN bearer token. MUST NOT equal JESSE_TOKEN; the sentinel
+		     refuses to start if it does. -->
+		<key>JESSE_SENTINEL_TOKEN</key>
+		<string>@@SENTINEL_TOKEN@@</string>
+		<!-- The BRIDGE's token, for the proxied reads and the two proxy verbs. -->
+		<key>JESSE_TOKEN</key>
+		<string>@@BRIDGE_TOKEN@@</string>
+
+		<key>JESSE_SENTINEL_BIND</key>
+		<string>@@SENTINEL_BIND@@</string>
+		<key>JESSE_SENTINEL_PORT</key>
+		<string>@@SENTINEL_PORT@@</string>
+		<key>JESSE_SENTINEL_BRIDGE_URL</key>
+		<string>@@BRIDGE_URL@@</string>
+
+		<key>JESSE_SENTINEL_STATE_DIR</key>
+		<string>@@STATE_DIR@@</string>
+		<key>JESSE_SENTINEL_BRIDGE_STATE_DIR</key>
+		<string>@@BRIDGE_STATE_DIR@@</string>
+		<key>JESSE_SENTINEL_VAULT_REPO</key>
+		<string>@@VAULT_REPO@@</string>
+		<key>JESSE_SENTINEL_LEDGER</key>
+		<string>@@LEDGER@@</string>
+		<key>JESSE_SENTINEL_AUTOCOMMIT_LOG</key>
+		<string>@@AUTOCOMMIT_LOG@@</string>
+
+		<!-- The bridge's own plist, for POST /sentinel/bridge/reload-env. That verb does
+		     bootout + bootstrap, which is the ONLY way a plist environment change takes
+		     effect: `kickstart -k` re-execs with the old environment. -->
+		<key>JESSE_SENTINEL_BRIDGE_PLIST</key>
+		<string>@@BRIDGE_PLIST@@</string>
+
+		<!-- A COPY OF THE BRIDGE CHILD'S PATH. `qmd status` is probed with this, so the
+		     probe resolves the same node a turn would; qmd is a native-addon Node program
+		     and dies with ERR_DLOPEN_FAILED under a mismatched ABI. Probing it with
+		     launchd's minimal PATH would report healthy while every turn's search is
+		     broken. -->
+		<key>JESSE_SENTINEL_CHILD_PATH</key>
+		<string>@@CHILD_PATH@@</string>
+
+		<!-- The launchd labels of the five jobs the restart verbs address. -->
+		<key>JESSE_SENTINEL_LABEL_BRIDGE</key>
+		<string>@@LABEL_BRIDGE@@</string>
+		<key>JESSE_SENTINEL_LABEL_AUTOCOMMIT</key>
+		<string>@@LABEL_AUTOCOMMIT@@</string>
+		<key>JESSE_SENTINEL_LABEL_LOCK_REAPER</key>
+		<string>@@LABEL_LOCK_REAPER@@</string>
+		<key>JESSE_SENTINEL_LABEL_QMD_UPDATE</key>
+		<string>@@LABEL_QMD_UPDATE@@</string>
+		<key>JESSE_SENTINEL_LABEL_MINISERVE</key>
+		<string>@@LABEL_MINISERVE@@</string>
+
+		<!-- Push. The same four-plus-one variables the bridge uses, pushing to the same
+		     device the bridge has registered (~/.jesse-bridge/device.json, read-only here).
+		     Leave them empty and every alert logs instead of pushing. -->
+		<key>JESSE_APNS_KEY_PATH</key>
+		<string>@@APNS_KEY_PATH@@</string>
+		<key>JESSE_APNS_KEY_ID</key>
+		<string>@@APNS_KEY_ID@@</string>
+		<key>JESSE_APNS_TEAM_ID</key>
+		<string>@@APNS_TEAM_ID@@</string>
+		<key>JESSE_APNS_TOPIC</key>
+		<string>@@APNS_TOPIC@@</string>
+		<key>JESSE_APNS_ENV</key>
+		<string>@@APNS_ENV@@</string>
+	</dict>
+</dict>
+</plist>

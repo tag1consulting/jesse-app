@@ -18,15 +18,80 @@ pub fn percent_encode(value: &str) -> String {
     out
 }
 
+/// The SENTINEL's coordinates, when this deployment runs one beside the bridge.
+///
+/// The sentinel is a separate service on a separate port with a separate token (see
+/// `crate::sentinel`), and pairing it by hand would mean typing a second host, port and
+/// 48-character token into the phone — on a trip, which is exactly when it is needed and
+/// exactly when nobody will do it. So the bridge, which already prints a pairing QR, carries
+/// the sentinel's coordinates in the same code.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SentinelAdvert {
+    pub host: String,
+    pub port: u16,
+    pub token: String,
+}
+
+/// Read the sentinel's coordinates out of the BRIDGE's environment, or `None` when this
+/// deployment has no sentinel.
+///
+/// `JESSE_SENTINEL_TOKEN` and `JESSE_SENTINEL_PORT` must BOTH be present: the token is what
+/// makes the advert usable and the port is what makes it reachable, and advertising one
+/// without the other would put a token in a QR that pairs nothing. A token with no port is a
+/// half-configured deployment and says so rather than silently omitting the keys — the
+/// silent version is a bug someone finds on the trip.
+///
+/// The host defaults to the bridge's own advertise host, which is right for the normal
+/// deployment (one machine, two ports) and overridable for any other.
+pub fn sentinel_advert(bridge_advertise_host: &str) -> Option<SentinelAdvert> {
+    let token = env_string("JESSE_SENTINEL_TOKEN");
+    let port = env_string("JESSE_SENTINEL_PORT").and_then(|p| p.parse::<u16>().ok());
+    match (token, port) {
+        (Some(token), Some(port)) => Some(SentinelAdvert {
+            host: env_string("JESSE_SENTINEL_ADVERTISE_HOST")
+                .unwrap_or_else(|| bridge_advertise_host.to_string()),
+            port,
+            token,
+        }),
+        (Some(_), None) => {
+            eprintln!(
+                "jesse-bridge: WARNING — JESSE_SENTINEL_TOKEN is set but JESSE_SENTINEL_PORT \
+                 is not (or is not a port number), so the pairing QR carries NO sentinel \
+                 coordinates. Set both, or neither."
+            );
+            None
+        }
+        (None, _) => None,
+    }
+}
+
 /// Build the `jesse://pair?…` payload the app scans. MUST match the app's
 /// `JesseConfig.fromPairing` parser exactly.
-pub fn pairing_payload(host: &str, port: u16, token: &str) -> String {
-    format!(
+///
+/// `sentinel` appends `shost`/`sport`/`stoken`. Those three keys are ADDITIVE: the parser
+/// looks its four keys up by name and ignores everything else, so an older app scanning a
+/// newer QR pairs the bridge exactly as it always did.
+pub fn pairing_payload(
+    host: &str,
+    port: u16,
+    token: &str,
+    sentinel: Option<&SentinelAdvert>,
+) -> String {
+    let mut out = format!(
         "jesse://pair?host={}&port={}&token={}",
         percent_encode(host),
         port,
         percent_encode(token)
-    )
+    );
+    if let Some(s) = sentinel {
+        out.push_str(&format!(
+            "&shost={}&sport={}&stoken={}",
+            percent_encode(&s.host),
+            s.port,
+            percent_encode(&s.token)
+        ));
+    }
+    out
 }
 
 /// Whether the plaintext bearer token should be printed at startup. Off by default
@@ -107,12 +172,17 @@ pub enum QrArt {
 /// scrollback, launchd logs, or a container's log stream. With the QR shown it
 /// still encodes the token, so pairing is unaffected; without it, the operator
 /// already holds the token (they set `JESSE_TOKEN`).
+///
+/// A `sentinel` advert adds one more line in the same shape, under the same rule: its token
+/// is a second secret, on a service that can restart this machine's jobs, so it is hidden by
+/// default exactly as the bridge's is.
 pub fn manual_pairing_lines(
     host: &str,
     port: u16,
     token: &str,
     token_line: TokenVisibility,
     qr: QrArt,
+    sentinel: Option<&SentinelAdvert>,
 ) -> Vec<String> {
     let mut lines = vec![match qr {
         QrArt::Shown => "Pair by scanning the QR above, or enter manually:".to_string(),
@@ -139,6 +209,17 @@ pub fn manual_pairing_lines(
                 }
             });
         }
+    }
+    if let Some(s) = sentinel {
+        lines.push(match token_line {
+            TokenVisibility::Shown => format!(
+                "  sentinel host={}  port={}  token={}",
+                s.host, s.port, s.token
+            ),
+            TokenVisibility::Hidden => {
+                format!("  sentinel host={}  port={}", s.host, s.port)
+            }
+        });
     }
     lines
 }
@@ -217,6 +298,7 @@ mod tests {
             "deadbeef",
             TokenVisibility::Hidden,
             QrArt::Shown,
+            None,
         );
         let joined = lines.join("\n");
         assert!(
@@ -241,6 +323,7 @@ mod tests {
             "deadbeef",
             TokenVisibility::Shown,
             QrArt::Shown,
+            None,
         );
         let joined = lines.join("\n");
         assert!(
@@ -260,6 +343,7 @@ mod tests {
             "deadbeef",
             TokenVisibility::Hidden,
             QrArt::Suppressed,
+            None,
         );
         let joined = lines.join("\n");
         assert!(
@@ -287,6 +371,7 @@ mod tests {
             "deadbeef",
             TokenVisibility::Shown,
             QrArt::Suppressed,
+            None,
         );
         assert!(shown.join("\n").contains("token=deadbeef"));
     }
@@ -346,14 +431,139 @@ mod tests {
 
     #[test]
     fn pairing_payload_matches_app_format() {
-        let p = pairing_payload("100.64.0.1", 8765, "deadbeef");
+        let p = pairing_payload("100.64.0.1", 8765, "deadbeef", None);
         assert_eq!(p, "jesse://pair?host=100.64.0.1&port=8765&token=deadbeef");
     }
     #[test]
     fn pairing_payload_percent_encodes_reserved() {
         // A host with a reserved char must be escaped, not left raw.
-        let p = pairing_payload("a b/c", 80, "t&k");
+        let p = pairing_payload("a b/c", 80, "t&k", None);
         assert!(p.contains("host=a%20b%2Fc"));
         assert!(p.contains("token=t%26k"));
+    }
+
+    #[test]
+    fn pairing_payload_appends_the_sentinel_keys() {
+        let s = SentinelAdvert {
+            host: "100.64.0.1".to_string(),
+            port: 8766,
+            token: "s3nt".to_string(),
+        };
+        let p = pairing_payload("100.64.0.1", 8765, "deadbeef", Some(&s));
+        // The bridge's own three keys come FIRST and are byte-for-byte what they were, so
+        // an app that parses positionally (none does, but) or one that only knows the old
+        // keys pairs the bridge exactly as before.
+        assert!(
+            p.starts_with("jesse://pair?host=100.64.0.1&port=8765&token=deadbeef"),
+            "{p}"
+        );
+        assert!(
+            p.ends_with("&shost=100.64.0.1&sport=8766&stoken=s3nt"),
+            "{p}"
+        );
+        // The sentinel token is percent-encoded on the same rules as the bridge's.
+        let odd = SentinelAdvert {
+            host: "a b".to_string(),
+            port: 1,
+            token: "t&k".to_string(),
+        };
+        let p = pairing_payload("h", 2, "t", Some(&odd));
+        assert!(
+            p.contains("shost=a%20b") && p.contains("stoken=t%26k"),
+            "{p}"
+        );
+    }
+
+    #[test]
+    fn manual_lines_add_a_sentinel_line_under_the_same_token_rule() {
+        let s = SentinelAdvert {
+            host: "100.64.0.1".to_string(),
+            port: 8766,
+            token: "s3ntinel".to_string(),
+        };
+        let hidden = manual_pairing_lines(
+            "100.64.0.1",
+            8765,
+            "deadbeef",
+            TokenVisibility::Hidden,
+            QrArt::Shown,
+            Some(&s),
+        )
+        .join("\n");
+        assert!(
+            hidden.contains("sentinel host=100.64.0.1  port=8766"),
+            "{hidden}"
+        );
+        // The sentinel's token grants `launchctl kickstart` on this host. It is hidden by
+        // exactly the rule that hides the bridge's, not by a weaker one.
+        assert!(!hidden.contains("s3ntinel"), "{hidden}");
+
+        let shown = manual_pairing_lines(
+            "100.64.0.1",
+            8765,
+            "deadbeef",
+            TokenVisibility::Shown,
+            QrArt::Shown,
+            Some(&s),
+        )
+        .join("\n");
+        assert!(shown.contains("token=s3ntinel"), "{shown}");
+
+        // With no sentinel configured the output is unchanged — no empty line, no mention.
+        let none = manual_pairing_lines(
+            "100.64.0.1",
+            8765,
+            "deadbeef",
+            TokenVisibility::Hidden,
+            QrArt::Shown,
+            None,
+        )
+        .join("\n");
+        assert!(!none.contains("sentinel"), "{none}");
+    }
+
+    #[test]
+    fn sentinel_advert_needs_both_token_and_port() {
+        let _guard = ENV_LOCK.lock_ok();
+        for v in [
+            "JESSE_SENTINEL_TOKEN",
+            "JESSE_SENTINEL_PORT",
+            "JESSE_SENTINEL_ADVERTISE_HOST",
+        ] {
+            std::env::remove_var(v);
+        }
+        // Nothing set: no sentinel, no warning, no keys.
+        assert_eq!(sentinel_advert("100.64.0.1"), None);
+
+        // A token with no port is HALF-configured and must not advertise: a QR carrying a
+        // token that pairs nothing is worse than a QR carrying neither.
+        std::env::set_var("JESSE_SENTINEL_TOKEN", "s3nt");
+        assert_eq!(sentinel_advert("100.64.0.1"), None);
+        // …and a port that is not a port is the same case.
+        std::env::set_var("JESSE_SENTINEL_PORT", "not-a-port");
+        assert_eq!(sentinel_advert("100.64.0.1"), None);
+
+        std::env::set_var("JESSE_SENTINEL_PORT", "8766");
+        assert_eq!(
+            sentinel_advert("100.64.0.1"),
+            Some(SentinelAdvert {
+                // The host defaults to the bridge's advertise host: one machine, two ports.
+                host: "100.64.0.1".to_string(),
+                port: 8766,
+                token: "s3nt".to_string(),
+            })
+        );
+        std::env::set_var("JESSE_SENTINEL_ADVERTISE_HOST", "host.tailnet.ts.net");
+        assert_eq!(
+            sentinel_advert("100.64.0.1").unwrap().host,
+            "host.tailnet.ts.net"
+        );
+        for v in [
+            "JESSE_SENTINEL_TOKEN",
+            "JESSE_SENTINEL_PORT",
+            "JESSE_SENTINEL_ADVERTISE_HOST",
+        ] {
+            std::env::remove_var(v);
+        }
     }
 }
