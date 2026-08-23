@@ -87,6 +87,27 @@
 		<key>JESSE_SENTINEL_CHILD_PATH</key>
 		<string>@@CHILD_PATH@@</string>
 
+		<!-- REMOTE DEPLOY. The clone the deploy verb builds in (never a checkout a
+		     person works in — every deploy leaves it on a detached head), the directory
+		     holding the three symlinks it repoints, and a FINE-GRAINED READ-ONLY GitHub
+		     token with Actions:read + Contents:read. The token cannot merge, push or
+		     dispatch anything; the only question the sentinel asks GitHub is what CI
+		     concluded about a commit. Leave it empty and POST /sentinel/deploy refuses,
+		     because a deploy that cannot verify CI is not one this service performs. -->
+		<key>JESSE_SENTINEL_DEPLOY_CLONE</key>
+		<string>@@DEPLOY_CLONE@@</string>
+		<key>JESSE_SENTINEL_BIN_DIR</key>
+		<string>@@BIN_DIR@@</string>
+		<key>JESSE_SENTINEL_GITHUB_TOKEN</key>
+		<string>@@GITHUB_TOKEN@@</string>
+		<key>JESSE_SENTINEL_GITHUB_REPO</key>
+		<string>@@GITHUB_REPO@@</string>
+
+		<!-- `cargo` is not on a launchd job's PATH. Pinned rather than resolved, so a
+		     deploy does not depend on which toolchain happened to be first. -->
+		<key>JESSE_SENTINEL_CARGO_BIN</key>
+		<string>@@CARGO_BIN@@</string>
+
 		<!-- The launchd labels of the five jobs the restart verbs address. -->
 		<key>JESSE_SENTINEL_LABEL_BRIDGE</key>
 		<string>@@LABEL_BRIDGE@@</string>

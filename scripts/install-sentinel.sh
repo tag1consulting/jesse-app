@@ -129,6 +129,39 @@ LABEL_LOCK_REAPER="${LABEL_LOCK_REAPER:-${LABEL_BRIDGE%-bridge}-lock-reaper}"
 LABEL_QMD_UPDATE="${LABEL_QMD_UPDATE:-com.qmd.update}"
 LABEL_MINISERVE="${LABEL_MINISERVE:-${LABEL_BRIDGE%-bridge}-miniserve-diet-dashboard}"
 
+# ---- Remote deploy ---------------------------------------------------------------------
+
+# The clone the deploy verb builds in. NEVER a checkout someone works in: every deploy leaves
+# it on a detached head, and doing that to a working tree mid-edit is not a thing a background
+# service does.
+DEPLOY_CLONE="${SENTINEL_DEPLOY_CLONE:-$HOME/deploy/jesse-app}"
+# Where the three symlinks live. The same directory this script installs jesse-sentinel into.
+BIN_DIR_DEPLOY="${SENTINEL_BIN_DIR:-$BIN_DIR}"
+BUILD_STORE="$BIN_DIR_DEPLOY/jesse-bridge.d"
+DEPLOYS_DIR="$STATE_DIR/deploys"
+
+# owner/repo, whose `bridge` CI job vouches for a commit. Derived from this repository's own
+# `origin` so a fork does not silently check the upstream's CI.
+GITHUB_REPO="${SENTINEL_GITHUB_REPO:-}"
+if [ -z "$GITHUB_REPO" ]; then
+  origin_url="$(git -C "$ROOT" remote get-url origin 2>/dev/null || true)"
+  # Both forms: git@host:owner/repo.git and https://host/owner/repo.git
+  GITHUB_REPO="$(printf '%s' "$origin_url" | sed -e 's|^.*[:/]\([^/:]*/[^/]*\)$|\1|' -e 's|\.git$||')"
+fi
+[ -n "$GITHUB_REPO" ] || die "could not derive the GitHub repo from this checkout's origin — \
+set SENTINEL_GITHUB_REPO=owner/repo."
+
+# A FINE-GRAINED, READ-ONLY token (Actions: read, Contents: read). Reused from a previous
+# install if this is a re-install, so it is typed once.
+GITHUB_TOKEN="${JESSE_SENTINEL_GITHUB_TOKEN:-}"
+if [ -z "$GITHUB_TOKEN" ] && [ -f "$PLIST_OUT" ]; then
+  GITHUB_TOKEN="$(plist_value "$PLIST_OUT" EnvironmentVariables.JESSE_SENTINEL_GITHUB_TOKEN)"
+fi
+
+# cargo. Not on a launchd job's PATH, so it is pinned rather than resolved.
+CARGO_BIN="${SENTINEL_CARGO_BIN:-$(command -v cargo || true)}"
+[ -n "$CARGO_BIN" ] || CARGO_BIN="$HOME/.cargo/bin/cargo"
+
 # The sentinel's own token. Generated if not supplied — and printed ONCE at the end, because
 # it also has to go into the bridge's plist for the pairing QR to carry it.
 GENERATED_TOKEN=0
@@ -206,6 +239,11 @@ subst LEDGER             "$LEDGER"
 subst AUTOCOMMIT_LOG     "$AUTOCOMMIT_LOG"
 subst BRIDGE_PLIST       "$BRIDGE_PLIST"
 subst CHILD_PATH         "$CHILD_PATH"
+subst DEPLOY_CLONE       "$DEPLOY_CLONE"
+subst BIN_DIR            "$BIN_DIR_DEPLOY"
+subst GITHUB_TOKEN       "$GITHUB_TOKEN"
+subst GITHUB_REPO        "$GITHUB_REPO"
+subst CARGO_BIN          "$CARGO_BIN"
 subst LABEL_BRIDGE       "$LABEL_BRIDGE"
 subst LABEL_AUTOCOMMIT   "$LABEL_AUTOCOMMIT"
 subst LABEL_LOCK_REAPER  "$LABEL_LOCK_REAPER"
@@ -233,6 +271,60 @@ chmod 600 "$PLIST_OUT"
 plutil -lint "$PLIST_OUT" >/dev/null || die "the rendered plist does not parse: $PLIST_OUT"
 note "rendered $PLIST_OUT (mode 0600)"
 
+# ---- Remote deploy: the clone, the build store, and the rollback record ------------------
+
+mkdir -p "$BUILD_STORE" "$DEPLOYS_DIR"
+chmod 700 "$DEPLOYS_DIR"
+
+if [ ! -d "$DEPLOY_CLONE/.git" ]; then
+  origin_url="$(git -C "$ROOT" remote get-url origin 2>/dev/null || true)"
+  if [ -n "$origin_url" ]; then
+    mkdir -p "$(dirname "$DEPLOY_CLONE")"
+    note "cloning $origin_url into $DEPLOY_CLONE (first install only)"
+    git clone --quiet "$origin_url" "$DEPLOY_CLONE" \
+      || die "could not clone $origin_url into $DEPLOY_CLONE. Create it by hand, or set \
+SENTINEL_DEPLOY_CLONE to a clone that already exists."
+  else
+    note "WARNING: no origin remote in $ROOT, so no deploy clone was created. \
+POST /sentinel/deploy will refuse until $DEPLOY_CLONE exists."
+  fi
+else
+  note "deploy clone already present at $DEPLOY_CLONE"
+fi
+
+# THE ROLLBACK RECORD FOR THE FIRST DEPLOY. Before this feature the bridge's plist named a
+# built binary directly; the first deploy replaces ~/.local/bin/<name> with a symlink, and
+# `deploys/previous` is the only thing that says where to go back to. Written here ONLY if it
+# does not already exist — overwriting it on a re-install would throw away the record of a
+# deployment that is currently live.
+PREVIOUS="$DEPLOYS_DIR/previous"
+if [ -f "$PREVIOUS" ]; then
+  note "keeping the existing rollback record $PREVIOUS"
+else
+  # The path the bridge's plist runs today: ProgramArguments[0].
+  BRIDGE_PROGRAM="$(plist_value "$BRIDGE_PLIST" ProgramArguments.0)"
+  if [ -n "$BRIDGE_PROGRAM" ] && [ -e "$BRIDGE_PROGRAM" ]; then
+    BRIDGE_PROGRAM_DIR="$(cd "$(dirname "$BRIDGE_PROGRAM")" && pwd)"
+    {
+      printf '{\n'
+      first=1
+      for b in jesse-bridge jesse-hook jesse-build-mcp; do
+        [ -e "$BRIDGE_PROGRAM_DIR/$b" ] || continue
+        [ "$first" -eq 1 ] || printf ',\n'
+        printf '  "%s": "%s"' "$b" "$BRIDGE_PROGRAM_DIR/$b"
+        first=0
+      done
+      printf '\n}\n'
+    } > "$PREVIOUS"
+    chmod 600 "$PREVIOUS"
+    note "recorded the current binaries in $PREVIOUS (the first deploy's rollback target)"
+  else
+    note "WARNING: could not read ProgramArguments[0] from $BRIDGE_PLIST, so no rollback \
+record was written. The FIRST deploy will have nothing to roll back to; every one after it \
+will."
+  fi
+fi
+
 # ---- What to do next --------------------------------------------------------------------
 
 UID_NOW="$(id -u)"
@@ -257,7 +349,45 @@ Services it will address:
     lock-reaper  $LABEL_LOCK_REAPER
     qmd-update   $LABEL_QMD_UPDATE
     miniserve    $LABEL_MINISERVE
+
+Remote deploy:
+    clone        $DEPLOY_CLONE
+    build store  $BUILD_STORE
+    repo         $GITHUB_REPO
+    cargo        $CARGO_BIN
+    CI token     $([ -n "$GITHUB_TOKEN" ] && echo "set" || echo "NOT SET — POST /sentinel/deploy will refuse")
 EOF
+
+# ---- The one plist edit this script will not make for you -------------------------------
+
+BRIDGE_PROGRAM_NOW="$(plist_value "$BRIDGE_PLIST" ProgramArguments.0)"
+case "$BRIDGE_PROGRAM_NOW" in
+  "$BIN_DIR_DEPLOY/jesse-bridge")
+    note "the bridge plist already runs $BIN_DIR_DEPLOY/jesse-bridge — nothing to change"
+    ;;
+  *)
+    cat <<EOF
+
+THE BRIDGE PLIST STILL RUNS A BINARY PATH, NOT THE SYMLINK.
+
+    now: ${BRIDGE_PROGRAM_NOW:-(could not read ProgramArguments.0)}
+    needs to be: $BIN_DIR_DEPLOY/jesse-bridge
+
+Until it does, a deploy will swap the symlink and restart a bridge that re-execs the OLD
+binary — the version check will not match and every deploy will roll itself back.
+
+This script does not edit the bridge's plist. Run these yourself:
+
+    plutil -replace ProgramArguments.0 -string "$BIN_DIR_DEPLOY/jesse-bridge" "$BRIDGE_PLIST"
+
+    launchctl bootout gui/$UID_NOW/$LABEL_BRIDGE
+    launchctl bootstrap gui/$UID_NOW "$BRIDGE_PLIST"
+
+(bootout + bootstrap, not kickstart: a plist change only takes effect on a fresh
+service record.)
+EOF
+    ;;
+esac
 
 if [ "$GENERATED_TOKEN" -eq 1 ]; then
   cat <<EOF

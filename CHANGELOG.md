@@ -13,6 +13,92 @@ Every commit that changes a component **must** bump that component's version and
 add an entry here — enforced by `scripts/version-guard.sh` (the pre-push hook and
 CI both run it). See the "Versioning" section of `bridge/README.md`.
 
+## [bridge 0.94.0] - 2026-08-23
+
+### Added
+
+- **The owner can now ship a merged fix from a phone.** The sentinel could restart
+  the bridge; it could not fix it. The pipeline this closes is: a coding session
+  opens a bridge PR, CI goes green, the PR is merged from the GitHub app, and the
+  owner taps **Deploy** — the sentinel builds the commit, swaps the binaries,
+  restarts, verifies, and **rolls back on any failure**.
+
+  `POST /sentinel/deploy` takes `{"ref": "main" | "<40 hex>", "force": bool}`,
+  answers `202 {deploy_id}` and runs seven phases in a task, because the work is a
+  twenty-minute build:
+
+  - `resolve` — `git fetch` in a clone of its own, then **refuse unless
+    `git merge-base --is-ancestor <sha> origin/main`**. Only something that was
+    merged is deployable.
+  - `ci` — require a completed, successful workflow run for that exact sha whose
+    jobs listing contains a job named **`bridge`** that also concluded `success`.
+    `force` does **not** bypass this. The job is matched against the **display**
+    name GitHub reports (this repository's renders as
+    `bridge (build, test, clippy, guards, audit, coverage)`), not the workflow
+    key, because the jobs API only returns the former — an equality test would
+    have refused every deploy against a run that was in fact green.
+  - `build` — `git checkout --detach`, then
+    `cargo build --release --locked` for the three binaries, 20-minute ceiling,
+    both streams to `deploys/<id>.log` **as they arrive**.
+  - `stage` — copy into `<bin dir>/jesse-bridge.d/<sha>/`, record where the links
+    pointed, then repoint three symlinks by **atomic `rename`** so the path
+    launchd runs never stops existing.
+  - `restart` — `kickstart -k`, then poll `/health` for 90 s. Success needs `ok`,
+    **the version the commit's `Cargo.toml` declares**, and no harness newly
+    `containment_stale`.
+  - `rollback` — anything else: back to the previous symlinks, restart, poll
+    again. `rolled_back`, or **`rolled_back_unhealthy`** when the old one does not
+    come up either, which pushes urgently and says the host needs hands.
+  - `finish` — prune the store to three builds, push the outcome, record
+    `running_sha`.
+
+  **The version check is the point.** "It answered `/health`" is not "the new
+  binary is running": a symlink swap that silently did nothing looks identical at
+  a heartbeat, and without this a deploy that changed nothing would report
+  success.
+
+  `GET /sentinel/deploy/status` returns the record, `running: {version, sha}` and
+  `origin_main: {sha, version, ci, checked_ms}` — refreshed at most every five
+  minutes, and a failed or skipped refresh returns the **cached** value marked
+  `stale` with a reason rather than a silently old one. `ci` is `green`/`red`/
+  `pending`/`none`, because "CI has not run yet" and "CI failed" are the same red
+  light and completely different problems. The app lights **Deploy** only when
+  `origin_main.sha != running.sha` and `ci == "green"` — the same two conditions
+  the verb enforces, from the same code.
+
+  **The containment posture is unchanged.** Nothing was added to
+  `DEFAULT_ALLOWED_TOOLS`, `MAIN_CHILD_MCP_CONFIG`, the containment records or any
+  MCP list. `cargo` is still permanently refused to a model turn; it is run here by
+  a process that has no model in it, on a commit a human merged. The one new
+  credential is a **fine-grained, read-only** GitHub token (Actions: read,
+  Contents: read) that cannot merge, push or dispatch anything.
+
+  **`main`'s branch protection is now part of the deployment boundary** — the set
+  of commits this can install is exactly the set that reaches `main`. `SECURITY.md`
+  says so explicitly.
+
+  One deploy at a time, via `<state dir>/deploy.lock`: the service's own
+  single-flight permit is released with the `202`, so it cannot serialise a
+  twenty-minute pipeline. A lock naming a **dead** pid is reclaimed — a sentinel
+  killed mid-build leaves exactly that, and without reclamation every later deploy
+  would refuse until someone reached the host. Without `force`, a `[[schedule]]`
+  chain that is `running` is a `409`: a deploy kills the bridge, and a turn that
+  dies mid-chain is lost invisibly.
+
+### Changed
+
+- **`scripts/install-sentinel.sh` sets up the deploy path**, creating the clone
+  (`~/deploy/jesse-app`) and `~/.local/bin/jesse-bridge.d/`, and writing
+  `deploys/previous` from the bridge plist's current `ProgramArguments[0]` — the
+  rollback target for the *first* deploy, before any symlink exists. It **prints,
+  and does not run**, the one `plutil` line that points the bridge's
+  `ProgramArguments` at the symlink plus the `bootout`/`bootstrap` pair that makes
+  it take effect. Until that edit is made, a deploy swaps the symlink and restarts
+  a bridge that re-execs the old binary, so every deploy would roll itself back.
+  `running_sha` is empty until the first deploy after install: nothing on the host
+  records which commit an existing binary came from, and the card shows `null`
+  rather than a guess.
+
 ## [bridge 0.93.0] - 2026-08-23
 
 ### Added

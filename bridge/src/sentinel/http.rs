@@ -24,11 +24,8 @@ pub fn sentinel_app(sen: Arc<Sentinel>) -> Router {
         .route("/sentinel/artifacts/prune", post(prune_artifacts))
         .route("/sentinel/jobs/:id/fire", post(job_fire))
         .route("/sentinel/jobs/:id/enable", post(job_enable))
-        // P5 fills these in. They are declared NOW, answering 501, so the app and the
-        // installer can be written against the final route table and a client can tell
-        // "this sentinel is too old" from "that is not a route".
-        .route("/sentinel/deploy/status", get(deploy_unimplemented))
-        .route("/sentinel/deploy", post(deploy_unimplemented))
+        .route("/sentinel/deploy/status", get(deploy_status))
+        .route("/sentinel/deploy", post(deploy))
         // A small ceiling: the only bodies here are `{"force":true}` and
         // `{"enabled":false,"until":"…"}`.
         .layer(DefaultBodyLimit::max(8 * 1024))
@@ -229,19 +226,35 @@ fn verb_slug(v: JobVerb) -> &'static str {
     }
 }
 
-/// P5's two routes, declared and refusing. Bearer-gated so an unauthenticated caller cannot
-/// even learn that a deploy surface exists here.
-async fn deploy_unimplemented(
+/// `GET /sentinel/deploy/status` — the app's Deploy card.
+///
+/// A read, so it is gated exactly like `/sentinel/status`: bearer only, no rate limit and no
+/// single flight. The one moment someone hammers refresh is the twenty minutes a build is
+/// running, and its cost is bounded by the five-minute `origin/main` cache rather than by a
+/// limiter that would shed the poll the phone depends on.
+async fn deploy_status(
     State(sen): State<Arc<Sentinel>>,
     headers: HeaderMap,
+) -> Result<Json<Value>, ApiError> {
+    check_auth(&headers, &sen.cfg.token)?;
+    Ok(Json(deploy_status_document(&sen).await))
+}
+
+/// `POST /sentinel/deploy` — build a merged commit, swap the binaries, restart, roll back on
+/// any failure.
+///
+/// It passes the same three gates as every other mutating verb, and then holds a FOURTH lock of
+/// its own for the whole pipeline: the single-flight permit is released when this returns `202`,
+/// twenty minutes before the deploy is over, so it cannot be what serialises deploys.
+async fn deploy(
+    State(sen): State<Arc<Sentinel>>,
+    connect: Option<ConnectInfo<SocketAddr>>,
+    headers: HeaderMap,
+    body: Option<Json<Value>>,
 ) -> (StatusCode, Json<Value>) {
-    if let Err((status, message)) = check_auth(&headers, &sen.cfg.token) {
-        return (status, Json(json!({ "error": message })));
-    }
-    (
-        StatusCode::NOT_IMPLEMENTED,
-        Json(json!({ "error": "deploy not built yet" })),
-    )
+    let who = caller(connect.as_ref());
+    let body = body.map(|Json(v)| v).unwrap_or_else(|| json!({}));
+    guarded(&sen, &headers, &who, "deploy", verb_deploy(&sen, body)).await
 }
 
 #[cfg(test)]
@@ -347,24 +360,33 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// The two deploy routes are LIVE, and the read half answers a document rather than a
+    /// refusal. The write half is not exercised here — it starts a pipeline, and the pipeline
+    /// belongs to the integration test that can give it shims.
     #[tokio::test]
-    async fn deploy_is_declared_and_refuses_until_p5() {
+    async fn deploy_status_answers_a_document() {
         let dir = scratch();
         let sen = wired(&dir);
-        for (method, path) in [
-            ("GET", "/sentinel/deploy/status"),
-            ("POST", "/sentinel/deploy"),
-        ] {
-            let (status, body) = call(
-                sentinel_app(sen.clone()),
-                method,
-                path,
-                Some("sentinel-token"),
-            )
-            .await;
-            assert_eq!(status, 501, "{method} {path}");
-            assert_eq!(body, json!({ "error": "deploy not built yet" }));
-        }
+        let (status, body) = call(
+            sentinel_app(sen.clone()),
+            "GET",
+            "/sentinel/deploy/status",
+            Some("sentinel-token"),
+        )
+        .await;
+        assert_eq!(status, 200);
+        // Nothing has ever been deployed on this scratch state, and the shape says so
+        // explicitly rather than omitting the fields.
+        assert_eq!(body["deploy"], Value::Null);
+        assert_eq!(body["running"]["sha"], Value::Null);
+        // The clone does not exist, so the card is the cached-nothing view, marked stale with
+        // a reason — never a silent "no".
+        assert_eq!(body["origin_main"]["ci"], json!("none"));
+        assert_eq!(body["origin_main"]["stale"], json!(true));
+        assert!(
+            body["origin_main"]["stale_reason"].is_string(),
+            "a stale card must say why: {body}"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -25,9 +25,10 @@ pub enum AlertKind {
     Tailscale,
     Qmd,
     Silence,
+    Deploy,
 }
 
-pub const ALERT_KINDS: [AlertKind; 7] = [
+pub const ALERT_KINDS: [AlertKind; 8] = [
     AlertKind::BridgeDown,
     AlertKind::Autocommit,
     AlertKind::Lock,
@@ -35,6 +36,7 @@ pub const ALERT_KINDS: [AlertKind; 7] = [
     AlertKind::Tailscale,
     AlertKind::Qmd,
     AlertKind::Silence,
+    AlertKind::Deploy,
 ];
 
 impl AlertKind {
@@ -47,6 +49,7 @@ impl AlertKind {
             AlertKind::Tailscale => "tailscale",
             AlertKind::Qmd => "qmd",
             AlertKind::Silence => "silence",
+            AlertKind::Deploy => "deploy",
         }
     }
 }
@@ -94,6 +97,15 @@ pub struct WatchState {
     pub tailscale_up_ms: Option<u64>,
     /// Last push per [`AlertKind::key`], for the per-kind dedupe windows.
     pub last_push_ms: HashMap<String, u64>,
+    /// The most recent deploy, running or finished. Survives a sentinel restart so a phone
+    /// that reconnects after the build sees what happened rather than an empty card.
+    pub deploy: Option<DeployRecord>,
+    /// The commit the running bridge was deployed from. `None` until the first successful
+    /// deploy — nothing else on this host records which commit a binary was built from, and
+    /// inventing one would be worse than admitting the gap.
+    pub running_sha: Option<String>,
+    /// The cached view of `origin/main` behind the deploy card.
+    pub origin_main: Option<OriginMain>,
 }
 
 impl WatchState {
