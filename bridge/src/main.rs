@@ -7,10 +7,11 @@ use std::path::Path;
 use jesse_bridge::{
     app, binary_exists, bind_broker, build_apns, detect_binary_drift, env_string, env_truthy,
     export_mcp_server_env, harness_bin_env, harness_default_bin, harnesses_in_use, is_bind_allowed,
-    load_local_models, manual_pairing_lines, pairing_payload, qr_env_tristate, serve_broker,
-    settings_permission_drift, show_qr_opt_in, show_token_opt_in, spawn_eviction_task,
-    spawn_scheduler, spawn_session_gc_task, start_health_prober, validate_model_config, AppState,
-    Config, ConfigError, QrArt, TokenVisibility, BINARY_DRIFT, CONTAINMENT_RECORDS, SETTINGS_DRIFT,
+    load_local_models, manual_pairing_lines, pairing_payload, qr_env_tristate, sentinel_advert,
+    serve_broker, settings_permission_drift, show_qr_opt_in, show_token_opt_in,
+    spawn_eviction_task, spawn_scheduler, spawn_session_gc_task, start_health_prober,
+    validate_model_config, AppState, Config, ConfigError, QrArt, TokenVisibility, BINARY_DRIFT,
+    CONTAINMENT_RECORDS, SETTINGS_DRIFT,
 };
 
 #[tokio::main]
@@ -191,6 +192,10 @@ async fn main() {
     // PTY that is still log-collected — `docker run -t`, a pod's `tty: true`).
     let advertise_host =
         std::env::var("JESSE_ADVERTISE_HOST").unwrap_or_else(|_| state.cfg.bind.clone());
+    // The SENTINEL's coordinates, when this deployment runs one (see `crate::sentinel`).
+    // Read once, here, so the QR and the manual lines cannot disagree about whether there is
+    // a second service to pair.
+    let sentinel = sentinel_advert(&advertise_host);
     let args: Vec<String> = std::env::args().collect();
     let qr_env = qr_env_tristate(env_string("JESSE_SHOW_QR").as_deref());
     let show_qr = show_qr_opt_in(&args, qr_env, {
@@ -199,7 +204,12 @@ async fn main() {
     });
     let mut qr = QrArt::Suppressed;
     if show_qr {
-        let payload = pairing_payload(&advertise_host, state.cfg.port, &state.cfg.token);
+        let payload = pairing_payload(
+            &advertise_host,
+            state.cfg.port,
+            &state.cfg.token,
+            sentinel.as_ref(),
+        );
         // Log-and-degrade like every other startup fallibility in this file
         // (build_apns, the broker bind): the QR is a convenience with its fallback
         // printed right below, and DataTooLong is reachable — JESSE_ADVERTISE_HOST
@@ -246,6 +256,7 @@ async fn main() {
             TokenVisibility::Hidden
         },
         qr,
+        sentinel.as_ref(),
     ) {
         println!("{line}");
     }

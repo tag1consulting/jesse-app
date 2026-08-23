@@ -13,6 +13,67 @@ Every commit that changes a component **must** bump that component's version and
 add an entry here — enforced by `scripts/version-guard.sh` (the pre-push hook and
 CI both run it). See the "Versioning" section of `bridge/README.md`.
 
+## [bridge 0.93.0] - 2026-08-23
+
+### Added
+
+- **A second process, so a wedged bridge can be fixed from a phone.** The owner is
+  away for two weeks with nothing but an iPhone, and the bridge has never been
+  restartable from it: `launchctl`, `cargo` and `xcodebuild` are permanently
+  refused to a model turn (each is a write-then-execute escape out of the
+  containment record), and the only other repair is an ssh session on a machine
+  that is a thousand miles away.
+
+  **`jesse-sentinel`** is the answer — a model-free operator process with a fixed
+  verb table, on its own port with its own token. Built by the same
+  `cargo build --release` (`bridge/src/bin/sentinel.rs`, `bridge/src/sentinel/`),
+  installed by `scripts/install-sentinel.sh`.
+
+  - `GET /sentinel/status` — one document from **independent probes running
+    concurrently**, each under a 5 s ceiling: the bridge's own `/health`, the five
+    launchd jobs (`launchctl print`), tailscale, disk and artifact-store size, git
+    and the last autocommit line, `qmd`, the scheduler's ledger tail, and the
+    bridge's schedule. A probe that does not finish degrades to `unknown` rather
+    than failing the call, and `ok` is a **tristate** — `true`/`false`/`null` —
+    because "I could not find out whether the disk is full" is not "the disk is
+    not full".
+  - **Eight mutating verbs**: restart each of the five services (the bridge one
+    then polls `/health` and reports `{restarted, healthy, version}`),
+    `bridge/reload-env` (`bootout` + `bootstrap` — the only way a plist
+    environment change takes effect), `git/unlock`, `artifacts/prune`, and
+    `jobs/{id}/fire` and `/enable` proxied to the bridge. `deploy` and
+    `deploy/status` answer `501` until P5.
+  - **A watchdog** on a 60 s tick with seven rules and persisted state: kickstart
+    the bridge after three missed health checks and **stop after more than five in
+    a rolling hour**; push (never fix) on a stuck or conflicted autocommit; clear a
+    provably-stale `index.lock`; prune artifacts when free space drops under 10 GB;
+    `tailscale up` once per outage; push once a day on a failing `qmd`; push when
+    nothing has fired in 26 hours. Alerts reuse the bridge's APNs client and the
+    device it has registered.
+
+  **The containment posture is unchanged.** Nothing was added to
+  `DEFAULT_ALLOWED_TOOLS`, `MAIN_CHILD_MCP_CONFIG`, the containment records, or any
+  MCP list. The sentinel is not a tool the model can call — that is the whole
+  point.
+
+  **The two tokens are disjoint and it is enforced:** `JESSE_SENTINEL_TOKEN` must
+  be set and must not equal `JESSE_TOKEN`, or the process refuses to start. The
+  bridge's token travels on every request the phone makes; a shared value would
+  mean any leak of it also granted `launchctl kickstart` on the host. Every
+  mutating verb passes bearer auth, a 10-per-minute limit and a single-flight lock,
+  and is audited to `<state dir>/sentinel.log` — refusals included, tokens never.
+
+### Changed
+
+- **The pairing QR can carry the sentinel.** When the bridge's environment has
+  `JESSE_SENTINEL_TOKEN` and `JESSE_SENTINEL_PORT`, `jesse://pair?…` gains
+  `&shost=&sport=&stoken=` and the manual-entry block gains a `sentinel host=…
+  port=…` line, with the sentinel's token hidden under the same `--show-token`
+  rule as the bridge's. The three keys are **additive** — the app's
+  `JesseConfig.fromPairing` looks its four up by name and ignores the rest — so an
+  older app scanning a newer QR pairs the bridge exactly as it always did. A token
+  set without a port advertises nothing and warns.
+
 ## [bridge 0.92.0] - 2026-08-23
 
 ### Fixed

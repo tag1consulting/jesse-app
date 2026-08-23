@@ -1980,6 +1980,189 @@ reloads it, and `POST /jesse/schedule/reload` does the same on demand.
 - A successful reload appends `{"outcome":"reloaded"}` to the fire ledger and
   reprints the boot table.
 
+## The sentinel (`jesse-sentinel`, a second process)
+
+The owner is away with a phone. The bridge wedges. There is nothing to do about
+it — `launchctl`, `cargo` and `xcodebuild` are permanently refused to a model
+turn because each is a write-then-execute escape out of the containment record,
+and the only other repair is an ssh session on a machine that is a thousand
+miles away.
+
+The sentinel is the answer: **a second process, with no model, no free text, and
+a fixed verb table**, listening on its own port with its own token. It can
+restart this deployment's launchd jobs, reload the bridge's plist environment,
+clear a stale git index lock, prune the artifact store, and forward the
+scheduler's two control verbs. It cannot read the vault, cannot run a model, and
+cannot accept a command that is not in the table below. It is **not** a tool the
+agent can call, and nothing on a turn's path can reach it.
+
+Built by the same `cargo build --release` the bridge is
+(`bridge/src/bin/sentinel.rs`, `bridge/src/sentinel/`), installed by
+`scripts/install-sentinel.sh`.
+
+### Install
+
+```bash
+cd bridge && cargo build --release            # 1. build (produces jesse-sentinel)
+cd .. && scripts/install-sentinel.sh          # 2. render the plist + install the binary
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/<label>.plist   # 3. you run this
+```
+
+The installer **never runs `launchctl`** — bootstrapping a service that can
+restart every other service on the box is a decision a person makes, not a side
+effect of an install script — and **never writes a token into the repository**.
+It reads the values that must agree with the bridge (its token, the child PATH,
+the APNs settings, the bind host) out of the bridge's own LaunchAgent rather
+than having them retyped, renders
+`scripts/jesse-sentinel.plist.template` into `~/Library/LaunchAgents/` at mode
+`0600`, copies the binary to `~/.local/bin/jesse-sentinel`, and prints the
+bootstrap line. Every default is overridable by an environment variable; see the
+header of the script.
+
+### The verb table
+
+| Route | What it does |
+| --- | --- |
+| `GET /sentinel/status` | The whole picture, in one document. See below. |
+| `POST /sentinel/restart/{bridge\|autocommit\|lock-reaper\|qmd-update\|miniserve}` | `launchctl kickstart -k gui/<uid>/<label>`. For `bridge`, then polls `/health` for 60 s and answers `{restarted, healthy, version}`. |
+| `POST /sentinel/bridge/reload-env` | `bootout` + `bootstrap` from the bridge's plist, then the same health poll. **The only way a plist environment change takes effect** — `kickstart -k` re-execs with the old environment. |
+| `POST /sentinel/git/unlock` | Removes `~/jesse/.git/index.lock` **only** if it is older than 180 s *and* `pgrep -u <uid> -x git` finds nothing, then kicks the autocommit. Otherwise `409` naming which condition failed. |
+| `POST /sentinel/artifacts/prune` | Deletes artifact directories older than 7 days; answers with the bytes freed. |
+| `POST /sentinel/jobs/{id}/fire` | Validates `{id}` against the bridge's live schedule, then forwards to `POST /jesse/schedule/{id}/fire` with the bridge token. |
+| `POST /sentinel/jobs/{id}/enable` | The same, for `/enable`. |
+| `GET /sentinel/deploy/status`, `POST /sentinel/deploy` | `501 {"error":"deploy not built yet"}`. Declared now so clients can be written against the final route table; P5 fills them in. |
+
+The `{service}` segment is one of **five fixed slugs**, never a launchd label:
+the labels are deployment configuration (`JESSE_SENTINEL_LABEL_*`), so there is
+no way for a caller to name a job the configuration did not name. Anything else
+is a `404` that lists the five.
+
+Every mutating verb passes three gates in order — the bearer token
+(constant-time, the bridge's own `check_auth`), a **10-per-minute** rate limit,
+and **single flight** (one mutating verb at a time across the service, `409`
+otherwise) — and is then **audited** to `<state dir>/sentinel.log`: timestamp,
+caller IP, verb, outcome. Refusals are audited too. Tokens never are. The
+watchdog takes the same single-flight permit for its own actions (it waits rather
+than returning `409`), so an automatic kickstart can never land in the middle of a
+hand-run `reload-env`.
+
+```bash
+S=http://<host>:8766
+curl -s -H "Authorization: Bearer $JESSE_SENTINEL_TOKEN" $S/sentinel/status
+curl -s -X POST -H "Authorization: Bearer $JESSE_SENTINEL_TOKEN" $S/sentinel/restart/bridge
+# → { "service":"bridge", "label":"…", "restarted":true, "healthy":true, "version":"0.93.0" }
+curl -s -X POST -H "Authorization: Bearer $JESSE_SENTINEL_TOKEN" $S/sentinel/git/unlock
+# → 409 { "removed":false, "reason":"index.lock is 12s old — under the 180s floor, …" }
+```
+
+### `GET /sentinel/status`
+
+One JSON document assembled from **independent probes that run concurrently**,
+each under a 5 s ceiling. A probe that does not finish degrades to `unknown`
+rather than failing the call, so the whole document still answers when the thing
+you are looking at is the thing that is wedged. Every block is
+`{ok, state, detail, error}` where `ok` is a **tristate**: `true`, `false`, or
+`null` for `unknown` (`state` spells the same thing: `ok` / `failed` /
+`unknown`). "I could not find out whether the disk is full" is not "the disk is
+not full", and the shape says so.
+
+| Block | `detail` |
+| --- | --- |
+| `sentinel` | `{version, uptime_secs, now_ms, watchdog:{last_tick_ms, bridge_misses, kickstarts_last_hour, gave_up_ms, last_error}}` (not a probe — it is this process) |
+| `bridge` | `{reachable, status, latency_ms, health}` — `health` is the bridge's own `GET /health` verbatim, fetched with its bearer token, so version, the drift arrays and the active profile all come through |
+| `services` | one row per slug: `{label, state, pid, last_exit_code, runs}`, parsed from `launchctl print gui/<uid>/<label>` |
+| `tailscale` | `{online, ips[], dns_name}` from `tailscale status --json` |
+| `disk` | `{volumes:[{path, free_bytes, total_bytes}], free_bytes_min, floor_bytes, artifacts_bytes, artifacts_files, artifacts_complete}` |
+| `git` | `{repo, branch, ahead, behind, dirty, index_lock_age_secs, conflicts[], last_autocommit_line}` |
+| `qmd` | `{exit_code, first_stderr_line, child_path_set, node_version}` |
+| `ledger_tail` | the last 20 parsed lines of the scheduler's fire ledger |
+| `schedule` | the bridge's `GET /jesse/schedule`, verbatim |
+
+Two of those deserve a note.
+
+**`qmd` is probed with the BRIDGE CHILD's PATH** (`JESSE_SENTINEL_CHILD_PATH` —
+copy the bridge plist's `PATH` there). `qmd` is a Node program with a native
+addon and dies with `ERR_DLOPEN_FAILED` under a mismatched Node ABI, so probing
+it with launchd's minimal `PATH` tests a resolution no turn performs and can
+report healthy while every turn's search is broken. The node that `PATH`
+resolves to is reported beside the result, because when the answer *is* a dlopen
+failure that is the value you need.
+
+**`last exit code = (never exited)` is reported as absent, not as `0`.** For a
+`KeepAlive` job those are opposite facts.
+
+### The watchdog
+
+One task, a 60 s tick, seven rules, state persisted to `<state dir>/state.json`
+after every tick — so a sentinel that is itself restarted does not forget its
+windows, and in particular does not forget that it had already **given up**.
+
+| Condition | Action |
+| --- | --- |
+| `/health` failed **3 consecutive ticks** | kickstart the bridge |
+| more than **5 kickstarts in a rolling hour** | **stop restarting it**, push *"bridge keeps dying, stopped restarting it; last error …"*, at most hourly |
+| autocommit's last status line is `UNPUBLISHED:` or carries `CONFLICT` for over **2 h** | push, at most once per 12 h. **Never resolves a conflict.** |
+| `index.lock` older than **10 min** with no git process | run the unlock verb; push if it recurs within the hour |
+| free space under **10 GB** | prune artifacts; push if still under |
+| tailnet offline **5 min** | run `tailscale up` **once**; push |
+| `qmd status` failing | push, at most once per 24 h. **No auto-fix** — the repair is choosing a Node version, which is a decision. |
+| no `fired` ledger line in **26 h** | push *"no scheduled job has fired in 26 h"* |
+
+Every automatic action is bounded, because a watchdog that can restart something
+forever is a worse outage than the one it is responding to. The two rules with
+no automatic action (conflict, `qmd`) are the two whose repair needs a decision.
+
+Pushes reuse the bridge's APNs client, the same `JESSE_APNS_*` variables and the
+device the bridge has registered — `~/.jesse-bridge/device.json` is read on every
+push (the phone re-registers on foreground) and is **never written**: the bridge
+owns that record. The payload is
+
+```json
+{"aps":{"alert":{"title":"Jesse sentinel","body":"…"},"sound":"default"},
+ "sentinel":{"kind":"bridge-down|autocommit|lock|disk|tailscale|qmd|silence"}}
+```
+
+with no `job_id`, because a sentinel alert has no turn to deep-link into.
+
+### Pairing
+
+When the bridge's own environment carries `JESSE_SENTINEL_TOKEN` and
+`JESSE_SENTINEL_PORT`, its startup QR gains `&shost=&sport=&stoken=` and the
+manual-entry block gains a `sentinel host=… port=…` line. The three keys are
+**additive** — the app's `JesseConfig.fromPairing` looks its four up by name and
+ignores the rest, so an older app scanning a newer QR pairs the bridge exactly as
+it always did. The sentinel's token is hidden under the same `--show-token` rule
+as the bridge's; it grants `launchctl kickstart` on the host, so it is not a
+weaker secret. `JESSE_SENTINEL_ADVERTISE_HOST` defaults to the bridge's advertise
+host. Setting the token without the port advertises **nothing** and warns: a QR
+carrying a token that pairs nothing is worse than one carrying neither.
+
+### Knobs
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `JESSE_SENTINEL_TOKEN` | — | **Required.** Refused at startup if unset, or if equal to `JESSE_TOKEN`. |
+| `JESSE_TOKEN` | — | The bridge's token, for the proxied reads and the two proxy verbs. Absent → those degrade and say so. |
+| `JESSE_SENTINEL_BIND` | `127.0.0.1` | Loopback or `100.64.0.0/10` only (same rule and same `JESSE_ALLOW_PUBLIC_BIND` override as the bridge). |
+| `JESSE_SENTINEL_PORT` | `8766` | |
+| `JESSE_SENTINEL_BRIDGE_URL` | `http://127.0.0.1:8765` | Where the bridge is. |
+| `JESSE_SENTINEL_STATE_DIR` | `~/.jesse-sentinel` | `state.json` + `sentinel.log`. |
+| `JESSE_SENTINEL_BRIDGE_PLIST` | — | Needed by `reload-env`; that verb refuses without it. |
+| `JESSE_SENTINEL_CHILD_PATH` | — | Copy the bridge plist's `PATH` here. |
+| `JESSE_SENTINEL_VAULT_REPO` | `~/jesse` | The vault git repo. |
+| `JESSE_SENTINEL_BRIDGE_STATE_DIR` | `~/.jesse-bridge` | Where `artifacts/` and `device.json` live. |
+| `JESSE_SENTINEL_LEDGER` | `<vault repo>/vault/Inbox/scheduled-jobs-ledger.jsonl` | |
+| `JESSE_SENTINEL_AUTOCOMMIT_LOG` | read from the autocommit job's plist | |
+| `JESSE_SENTINEL_LABEL_{BRIDGE,AUTOCOMMIT,LOCK_REAPER,QMD_UPDATE,MINISERVE}` | `com.example.*` placeholders (except `com.qmd.update`) | The launchd labels the restart verbs address. **Any still on a placeholder is named, loudly, at startup** — a label in someone's reverse-DNS namespace is personal infrastructure and cannot be a compiled-in default (`scripts/ci-guards.sh` §5). |
+| `JESSE_SENTINEL_ADVERTISE_HOST` | the bridge's advertise host | Read by the **bridge**, for the QR. |
+| `JESSE_SENTINEL_<NAME>_BIN` | resolved from `PATH`, then well-known locations | Pins one external command (`LAUNCHCTL`, `TAILSCALE`, `GIT`, `DF`, `PGREP`, `QMD`, `NODE`). Every command is resolved to an **absolute path once at startup**; a shim here is how the tests drive it. |
+| `JESSE_APNS_*` | — | The bridge's five push variables, unchanged. |
+
+A missing binary, an unnamed label, an absent bridge token: each costs its own
+verbs and **nothing else**. An operator process that refuses to boot is the
+failure this service exists to prevent, so everything except "no token" and "the
+same token as the bridge" is degraded-and-named rather than fatal.
+
 ## Prereqs
 
 - Rust toolchain (`rustup`, stable).
