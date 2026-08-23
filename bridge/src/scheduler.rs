@@ -1480,43 +1480,94 @@ async fn push_alert(st: &AppState, schedule_id: &str, payload: Vec<u8>, what: &s
 /// gets a row and every row carries its resolved days by name.
 pub fn boot_table(sched: &Scheduler) -> Vec<String> {
     let schedule = sched.schedule();
-    let mut rows = vec![format!(
-        "{:<28} {:<5} {:<26} {:<28} {:<21} {}",
-        "id", "kind", "trigger", "days", "next fire", "enabled"
-    )];
-    for job in &schedule.jobs {
-        let trigger = match job.at_label() {
-            Some(at) => format!("at {at}"),
-            None => format!(
-                "after {} ({})",
-                job.after().unwrap_or_default(),
-                job.after_on().label()
-            ),
-        };
-        let next = sched
-            .next_fire_for(job)
-            .map(|ms| sched.clock.short_local(ms))
-            .unwrap_or_else(|| "-".to_string());
-        let enabled = sched.effective_enabled(job, sched.clock.now_ms());
-        rows.push(format!(
-            "{:<28} {:<5} {:<26} {:<28} {:<21} {}{}{}",
-            job.id,
-            if job.is_head() { "head" } else { "link" },
-            trigger,
-            job.days.names().join(","),
-            next,
-            enabled,
-            job.promoted_from
-                .as_deref()
-                .map(|p| format!("  promoted-from={p}"))
-                .unwrap_or_default(),
-            job.model
-                .as_deref()
-                .map(|m| format!("  model={m}"))
-                .unwrap_or_default(),
-        ));
+    let now = sched.clock.now_ms();
+
+    // COLUMN WIDTHS ARE MEASURED, NOT GUESSED. Fixed widths were wrong the first time
+    // they met the production schedule: `after overnight-vault-lint (any)` is 32
+    // characters against a 26-wide column, so every link row pushed the columns after it
+    // out of alignment — and the column it pushed was `days`, which is the one this table
+    // exists to make readable. Ids and job names are operator-chosen and unbounded, so any
+    // constant here is a constant waiting to be exceeded.
+    let cells: Vec<[String; 6]> = schedule
+        .jobs
+        .iter()
+        .map(|job| {
+            let trigger = match job.at_label() {
+                Some(at) => format!("at {at}"),
+                None => format!(
+                    "after {} ({})",
+                    job.after().unwrap_or_default(),
+                    job.after_on().label()
+                ),
+            };
+            let next = sched
+                .next_fire_for(job)
+                .map(|ms| sched.clock.short_local(ms))
+                .unwrap_or_else(|| "-".to_string());
+            // The two rare annotations ride on the LAST column, so a single promoted job
+            // cannot widen a column for all seventeen rows.
+            let enabled = format!(
+                "{}{}{}",
+                sched.effective_enabled(job, now),
+                job.promoted_from
+                    .as_deref()
+                    .map(|p| format!("  promoted-from={p}"))
+                    .unwrap_or_default(),
+                job.model
+                    .as_deref()
+                    .map(|m| format!("  model={m}"))
+                    .unwrap_or_default(),
+            );
+            [
+                job.id.clone(),
+                if job.is_head() { "head" } else { "link" }.to_string(),
+                trigger,
+                job.days.names().join(","),
+                next,
+                enabled,
+            ]
+        })
+        .collect();
+
+    let header = [
+        "id".to_string(),
+        "kind".to_string(),
+        "trigger".to_string(),
+        "days".to_string(),
+        "next fire".to_string(),
+        "enabled".to_string(),
+    ];
+    // Character counts, not byte lengths: an id with a non-ASCII character would otherwise
+    // pad short by exactly the bytes it is wide.
+    let mut widths = [0usize; 6];
+    for row in std::iter::once(&header).chain(cells.iter()) {
+        for (i, cell) in row.iter().enumerate() {
+            widths[i] = widths[i].max(cell.chars().count());
+        }
     }
-    rows
+
+    std::iter::once(&header)
+        .chain(cells.iter())
+        .map(|row| render_row(row, &widths))
+        .collect()
+}
+
+/// One table row, each cell padded to its measured column width. The LAST column is never
+/// padded — trailing whitespace on every line of a log is noise.
+fn render_row(row: &[String; 6], widths: &[usize; 6]) -> String {
+    let mut out = String::new();
+    for (i, cell) in row.iter().enumerate() {
+        if i > 0 {
+            out.push_str("  ");
+        }
+        out.push_str(cell);
+        if i + 1 < row.len() {
+            for _ in 0..widths[i].saturating_sub(cell.chars().count()) {
+                out.push(' ');
+            }
+        }
+    }
+    out
 }
 
 /// Print the boot table, prefixed so it is greppable in a log that carries everything else
@@ -2850,5 +2901,71 @@ mod output_tests {
             "THE LINE THAT WOULD HAVE CAUGHT THE FRIDAY BUG — a link's days, by name: \
              {friday}"
         );
+    }
+
+    /// THE COLUMNS LINE UP, whatever the ids are called.
+    ///
+    /// REGRESSION, first boot of 0.90.0. The widths were constants, and the production
+    /// schedule exceeded the `trigger` one on its very first run: `after
+    /// overnight-vault-lint (any)` is 32 characters against a 26-wide column, so every
+    /// link row shifted the columns after it — and the first column it shifted was `days`,
+    /// which is the one this table exists to make readable. Widths are measured from the
+    /// content now, so this asserts the property rather than any particular number.
+    #[test]
+    fn the_boot_table_columns_line_up_however_long_the_ids_are() {
+        let schedule = validate_schedule(&[
+            ScheduleToml {
+                id: Some("a".into()),
+                at: Some("03:30".into()),
+                prompt: Some("go".into()),
+                ..Default::default()
+            },
+            ScheduleToml {
+                // Deliberately far longer than any constant would have allowed for.
+                id: Some("a-very-long-scheduled-job-identifier-indeed".into()),
+                after: Some("a".into()),
+                after_on: Some("any".into()),
+                days: Some(vec!["fri".into()]),
+                prompt: Some("go".into()),
+                ..Default::default()
+            },
+            ScheduleToml {
+                id: Some("c".into()),
+                after: Some("a-very-long-scheduled-job-identifier-indeed".into()),
+                prompt: Some("go".into()),
+                ..Default::default()
+            },
+        ]);
+        let sched = Scheduler::new(Arc::new(schedule), None);
+        let rows = boot_table(&sched);
+
+        // Every column starts at the same character offset on every row — which is what
+        // "the columns line up" means, and what a fixed width silently stopped delivering.
+        let starts = |row: &str| -> Vec<usize> {
+            let chars: Vec<char> = row.chars().collect();
+            let mut out = Vec::new();
+            let mut i = 0;
+            while i < chars.len() {
+                if chars[i] != ' ' && (i == 0 || (chars[i - 1] == ' ' && chars[i - 2] == ' ')) {
+                    out.push(i);
+                }
+                i += 1;
+            }
+            out
+        };
+        let header = starts(&rows[0]);
+        assert_eq!(header.len(), 6, "six columns: {:?}", rows[0]);
+        for row in &rows[1..] {
+            assert_eq!(
+                starts(row),
+                header,
+                "every column must start at the header's offset\nheader: {:?}\nrow:    {row:?}",
+                rows[0]
+            );
+        }
+        // And no row carries trailing whitespace into the log.
+        for row in &rows {
+            assert_eq!(row.trim_end(), row, "trailing whitespace: {row:?}");
+        }
     }
 }
