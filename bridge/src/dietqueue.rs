@@ -44,6 +44,14 @@ pub struct QueuedEntry {
     pub queued_ts: String,
     pub date: String,
     pub offset: String,
+    /// The EFFECTIVE ZONE the entries were stamped in, IANA (or a `±HH:MM` fixed offset).
+    /// Each entry already carries its own `eaten_at`; this is the zone those instants are
+    /// rendered in when the replay derives a row's `Date`, `Time` and `TZ` cells, so a
+    /// queue that drains the next morning writes the day its owner ate on rather than the
+    /// day the host woke up on. `#[serde(default)]` so an entry queued by an older bridge
+    /// still loads — it falls back to `date`/the process zone, which is what it meant.
+    #[serde(default)]
+    pub tz: Option<String>,
     pub utterance: String,
     pub entries: Vec<DietEntry>,
 }
@@ -197,21 +205,48 @@ pub fn classify_replay(item: &QueuedEntry, verify: &Result<String, ApiError>) ->
 pub async fn append_verified_entries(
     cfg: &Config,
     entries: &[DietEntry],
-    date: &str,
+    fallback_day: &str,
+    zone: &SchedulerZone,
 ) -> Result<usize, String> {
-    let (food, exercise, weight) = split_entries(entries);
-    let food_rows: Vec<String> = food.iter().map(|f| food_row(f, date)).collect();
-    let ex_rows: Vec<String> = exercise.iter().map(|x| exercise_row(x, date)).collect();
-    let wt_rows: Vec<String> = weight.iter().map(|w| weight_row(w, date)).collect();
+    let tz = tz_label(zone);
+    // Each row's day comes from its OWN stored `eaten_at`; `fallback_day` covers an entry
+    // queued by a bridge that predates the field. Sorting is what makes the hooks
+    // regenerate the EARLIEST day the batch touched.
+    let mut days: Vec<String> = entries
+        .iter()
+        .map(|e| entry_diet_day(e, zone, fallback_day))
+        .collect();
+    let mut food_rows = Vec::new();
+    let mut ex_rows = Vec::new();
+    let mut wt_rows = Vec::new();
+    for (i, e) in entries.iter().enumerate() {
+        let day = days
+            .get(i)
+            .cloned()
+            .unwrap_or_else(|| fallback_day.to_string());
+        match e {
+            DietEntry::Food(f) => food_rows.push(food_row(f, &day, &tz)),
+            DietEntry::Exercise(x) => ex_rows.push(exercise_row(x, &day, &tz)),
+            DietEntry::Weight(w) => wt_rows.push(weight_row(w, &day, &tz)),
+        }
+    }
+    days.sort();
+    days.dedup();
+    let date = days
+        .first()
+        .cloned()
+        .unwrap_or_else(|| fallback_day.to_string());
     let logs_dir = Path::new(&cfg.vault).join("diet-logs");
     let vault = Path::new(&cfg.vault);
     let snapshot =
         append_rows_atomic(&logs_dir, &food_rows, &ex_rows, &wt_rows).map_err(|e| e.to_string())?;
-    if let Err(e) = run_diet_hooks(vault).await {
+    // A replay is a LOG, never a roll — the same rule the live path follows, and it
+    // rebuilds every day the batch touched rather than only the oldest.
+    if let Err(e) = run_diet_hooks_for_days(vault, &days).await {
         snapshot.rollback();
         return Err(e);
     }
-    if let Err(e) = commit_diet_logs(vault, date, &local_hhmm()).await {
+    if let Err(e) = commit_diet_logs(vault, &date, &commit_stamp_in(zone)).await {
         snapshot.rollback();
         return Err(e);
     }
@@ -266,7 +301,13 @@ pub async fn replay_diet_queue(cfg: &Config, health: &HealthStore, queue: &DietQ
         .await;
         match classify_replay(&item, &verify) {
             ReplayDisposition::Approved { entries, .. } => {
-                match append_verified_entries(cfg, &entries, &item.date).await {
+                // The zone the entry was stamped in, not the zone the host is in now.
+                let zone = item
+                    .tz
+                    .as_deref()
+                    .map(parse_row_zone)
+                    .unwrap_or(SchedulerZone::Host);
+                match append_verified_entries(cfg, &entries, &item.date, &zone).await {
                     Ok(_) => {
                         eprintln!("{}", format_replayed_provenance(&item.id, "approved"));
                     }
@@ -348,14 +389,95 @@ mod tests {
         d
     }
 
+    /// AN OUTAGE MUST NOT MOVE A MEAL. The entry is stamped BEFORE it is queued, so the
+    /// instant it was eaten survives the file round-trip and the replay re-derives the
+    /// same diet day — even when the queue drains the next morning, in a different zone,
+    /// on a host whose calendar has long since turned over.
+    #[test]
+    fn a_queued_entry_keeps_its_eaten_at_across_the_file() {
+        let dir = tmp_dir();
+        let q = DietQueue::from_dir(&dir);
+        let rome = SchedulerZone::Named(chrono_tz::Europe::Rome);
+
+        let mut entries = parse_diet_entries(
+            r#"{"entries":[{"kind":"food","name":"pasta","meal":"Dinner","kcal":600}]}"#,
+        )
+        .unwrap()
+        .entries;
+        // Sent at 00:20 — the dinner belongs to the evening that just ended.
+        stamp_entry_clocks(&mut entries, "2026-09-04T00:20:00+02:00", &rome);
+        let item = QueuedEntry {
+            id: "q1".into(),
+            queued_ts: "2026-09-04T00:20:00Z".into(),
+            date: "2026-09-03".into(),
+            offset: "+02:00".into(),
+            tz: Some(tz_label(&rome)),
+            utterance: "a bowl of pasta".into(),
+            entries,
+        };
+        q.enqueue(&item).unwrap();
+
+        let back = q.dequeue_oldest().expect("the entry comes back");
+        assert_eq!(
+            back.tz.as_deref(),
+            Some("Europe/Rome"),
+            "the zone rides along"
+        );
+        let stored = match &back.entries[0] {
+            DietEntry::Food(f) => f.eaten_at.clone(),
+            _ => panic!("expected a food entry"),
+        };
+        assert_eq!(
+            stored.as_deref(),
+            Some("2026-09-04T00:20:00+02:00"),
+            "the INSTANT survives the round-trip"
+        );
+        // Replayed hours later, in the zone it was stamped in, it still files on the 3rd.
+        let zone = back.tz.as_deref().map(parse_row_zone).unwrap();
+        assert_eq!(
+            entry_diet_day(&back.entries[0], &zone, "2026-12-25"),
+            "2026-09-03",
+            "the replay never re-dates the row to the day the queue drained"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// An entry queued by a bridge that predates the field still loads and still replays:
+    /// it falls back to the `date` it was queued with, which is exactly what it meant.
+    #[test]
+    fn a_pre_eaten_at_queue_line_still_loads() {
+        let dir = tmp_dir();
+        let q = DietQueue::from_dir(&dir);
+        let legacy = r#"{"id":"old","queued_ts":"2026-07-15T09:00:00Z","date":"2026-07-15",
+            "offset":"+02:00","utterance":"a banana","entries":[
+            {"kind":"food","name":"Banana","meal":"Snack","time":"10:00","kcal":105,
+             "unknowable_composite":false}]}"#
+            .replace('\n', "")
+            .replace("            ", "");
+        std::fs::write(dir.join(DIET_QUEUE_FILE), format!("{legacy}\n")).unwrap();
+        let back = q.dequeue_oldest().expect("a legacy line still parses");
+        assert!(
+            back.tz.is_none(),
+            "no zone was recorded, and that is not an error"
+        );
+        assert_eq!(
+            entry_diet_day(&back.entries[0], &SchedulerZone::Host, &back.date),
+            "2026-07-15",
+            "it falls back to the day it was queued with"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     fn food_item(name: &str) -> QueuedEntry {
         QueuedEntry {
+            tz: None,
             id: format!("id-{name}"),
             queued_ts: "2026-07-15T09:00:00Z".to_string(),
             date: "2026-07-15".to_string(),
             offset: "+02:00".to_string(),
             utterance: format!("ate a {name}"),
             entries: vec![DietEntry::Food(FoodEntry {
+                eaten_at: None,
                 unknowable_composite: false,
                 name: name.to_string(),
                 meal: "Snack".to_string(),

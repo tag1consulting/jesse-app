@@ -1009,7 +1009,9 @@ pub async fn jesse_diet(
     let logs = Path::new(&st.cfg.vault).join("diet-logs");
     let days_dir = logs.join("days");
 
-    // Validate the optional date early: a malformed value is a 400 before any IO.
+    // Validate the optional date early: a malformed value is a 400 before any IO. A
+    // `date=` is a DIET DAY, not a calendar date — it is compared against `today_date`
+    // and looked up in the archives, both of which are keyed on the diet day.
     let requested = match q.date.as_deref() {
         Some(d) => {
             if valid_iso_date(d).is_none() {
@@ -1046,17 +1048,23 @@ pub async fn jesse_diet(
     // and overriding it with a clock date would serve a day the data is not for.
     //
     // The CLOCK is the fallback for a file that carries no date at all, and there the
-    // EFFECTIVE zone is what matters: at 23:30 in London it is already tomorrow in Rome,
-    // and answering with the host's date would page the owner to a day that has not started
-    // where they are standing. It also decides `is_today` and the future-date `404` below.
+    // question is which DIET DAY it is ([`diet_day_of`]) rather than which calendar date:
+    // at 02:00 the answer is yesterday, because the meal someone is still digesting belongs
+    // to the evening they ate it. The EFFECTIVE zone is what the rule is applied in — at
+    // 23:30 in London it is already tomorrow in Rome, and answering with the host's date
+    // would page the owner to a day that has not started where they are standing. It also
+    // decides `is_today` and the future-date `404` below.
     let zone = request_zone(&st, q.client_tz.as_deref(), "GET /jesse/diet");
+    let diet_day =
+        diet_day_of(&now_rfc3339_in(&zone), &zone).unwrap_or_else(|| local_today_in(&zone));
+    let tz = tz_label(&zone);
     let today_date = today
         .get("date")
         .and_then(|v| v.as_str())
         .map(str::trim)
         .filter(|d| valid_iso_date(d).is_some())
         .map(str::to_string)
-        .unwrap_or_else(|| local_today_in(&zone));
+        .unwrap_or_else(|| diet_day.clone());
     let today_mtime = std::fs::metadata(&today_path)
         .and_then(|m| m.modified())
         .ok()
@@ -1210,6 +1218,12 @@ pub async fn jesse_diet(
 
         return Ok(Json(json!({
             "asOf": rfc3339_utc(SystemTime::now()),
+            // The diet day it is RIGHT NOW where the caller is standing, and the zone that
+            // was resolved in. `asOf` is an instant and stays one; this is the day, and the
+            // two answer different questions — at 02:00 they name different dates on
+            // purpose. A client that wants "what day am I logging into" reads `dietDay`.
+            "dietDay": diet_day,
+            "tz": tz,
             "todayMtime": today_mtime,
             "today": today,
             "proposed": proposed,
@@ -1285,6 +1299,8 @@ pub async fn jesse_diet(
     // describe the CURRENT state, so attaching them to a past date would be wrong.
     Ok(Json(json!({
         "asOf": rfc3339_utc(SystemTime::now()),
+        "dietDay": diet_day,
+        "tz": tz,
         "todayMtime": hist_mtime,
         "today": today_section,
         "proposed": Value::Null,

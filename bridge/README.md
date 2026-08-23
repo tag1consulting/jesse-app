@@ -719,6 +719,118 @@ bridge default" and the field is omitted. In the app the floor is **unlockable**
 locked by default, editable only behind an explicit "not recommended" gate — so no
 one reweakens it by accident.
 
+## The diet day
+
+**The diet day of an entry is the calendar date, in the effective timezone, of the moment
+it was eaten MINUS FOUR HOURS.** A 00:30 snack belongs to the day that just ended; a 04:00
+coffee starts the new one. One function decides it — `dietlog::diet_day_of` — and every
+date on the diet path is derived through it.
+
+It replaces two things that were never the same question. "Today" used to mean the host's
+calendar date, read at append time from `date +%F`:
+
+- **Midnight was the boundary.** Three nights running, a food log after midnight rolled
+  `vault/diet-today.js` to the new day and blanked the evening that had just been logged:
+  the CSV row was correct and the cache was rebuilt for the wrong day. Four in the morning
+  is where the boundary belongs, because nobody is eating there.
+- **The host's zone was the zone.** With the host in `Europe/Rome` and the owner in
+  `Europe/London`, a London clock and a Rome clock disagree about which day it is for one
+  hour in every twenty-four — and at the 04:00 boundary that hour is decisive. The zone is
+  now the *effective* one (`profile::effective_tz`: the request's `client_tz`, then the away
+  profile, then the process zone), so the day follows the person eating.
+
+### `sent_at` — when the phone says it sent the turn
+
+`POST /jesse` takes an optional **`sent_at`**, RFC3339 with an offset
+(`"2026-09-03T13:10:00+01:00"`). Absent — every app build before it learns to send one, and
+every non-app caller — the bridge uses its own clock, which is byte-for-byte the previous
+behaviour. It matters for one thing: an entry the message gave no time for is dated from
+when it was *sent*, not from when a queued, retried or slowly-delivered turn happened to
+reach the pipeline.
+
+```bash
+curl -s http://127.0.0.1:8765/jesse \
+  -H "Authorization: Bearer $JESSE_TOKEN" -H "Content-Type: application/json" \
+  -d '{"mode":"tell","text":"a bowl of pasta",
+       "client_tz":"Europe/London","sent_at":"2026-09-03T23:20:00+01:00"}'
+```
+
+### `eaten_at` — the instant, and the one field the row is derived from
+
+Each extracted entry (food, exercise, weigh-in) carries an optional **`eaten_at`**, RFC3339
+with an offset. The extract child fills it **only** from something the message actually
+said — an explicit clock time ("at 1pm") or a relative phrase ("this morning", "last
+night") — resolved against a `NOW: <sent_at>` line the pipeline prepends to the prompt.
+The child has no clock of its own and must never invent one.
+
+A leading stamp of the form `(eaten at 2026-09-03T13:10:00+01:00)` in the utterance is
+**authoritative**: the prompt tells the child to copy it verbatim, and trusted Rust reads it
+independently. Resolution order, in `dietlog::resolve_eaten_at`:
+
+1. the entry's own `eaten_at`;
+2. its legacy `time` (`HH:MM`), read as the most recent occurrence of that wall clock in the
+   effective zone at or before the reference — so "at 11pm" said at 00:20 is last night;
+3. the reference itself: the stamp when the utterance carried one, else `sent_at`, else now.
+
+The old `time` key stays accepted, and once `eaten_at` is resolved `time` is **derived** from
+it rather than preserved, so a row's cells cannot disagree with each other. The verify child
+sees `eaten_at` in the candidate JSON and judges it like any other field — an instant that
+contradicts the message is a rejection, because it misfiles the whole row.
+
+### The `TZ` column
+
+All three logs gained a **`TZ`** column, **last** in the header:
+
+| File | Header |
+|---|---|
+| `food-log.csv` | …`,Time,Meal_Type,`*(nutrients)*`,TZ` |
+| `exercise-log.csv` | …`,Notes,Start_Time,TZ` |
+| `weight-log.csv` | `Date,Weight_lbs,Weight_kg,Phase,BodyFat_pct,MuscleMass_lbs,Notes,TZ` |
+
+A row's `Date` is its diet day, its `Time` is the wall clock a person in `TZ` read, and `TZ`
+is that zone's IANA name (or a `±HH:MM` offset for a fixed-offset zone). The three together
+recover the instant, which is what makes a row repairable. **A blank cell is not a defect:**
+it means "written before the column existed", and `dietlog::parse_row_zone` reads it as the
+process zone — which is in fact the zone those rows were written in.
+
+Every reader addresses columns by NAME (`csv` crate, `flexible(true)`), so the old and new
+headers both parse and a short row is not an error. The **writer** migrates: before
+appending, `append_rows_atomic` checks each log's header against its canonical form
+(`dietlog::canonical_header`) and rewrites it if it differs — logging what it found, never
+touching a row, and preserving the file's own line terminator, so a CRLF file stays CRLF.
+That last point matters: `food-log.csv` is CRLF *throughout*, which is RFC 4180's own line
+ending and not a defect; what the check catches is a carriage return left inside the header
+TEXT, a renamed column, or a header written before `TZ` existed. The repair rides inside the
+same rollback snapshot as the rows, so a hook failure restores both.
+
+### The script contract
+
+`run_diet_hooks(vault, diet_day, roll_to)` runs the three pinned scripts and now NAMES the
+day:
+
+```
+node vault/generate-diet-today.js  --day <diet day> [--roll-to <date>]
+node vault/validate-diet-today.js  --day <diet day>
+node vault/verify-diet-consistency.js --day <diet day>
+```
+
+- **`--day` is required on the generator**, which exits `2` on a bare call. That is
+  deliberate: a caller on the old contract must fail loudly rather than silently rebuild
+  whatever day the host thinks it is.
+- `--day` rewrites `vault/diet-today.js` **only** when it names the day that file already
+  holds. Any other day rebuilds that day's archive under `diet-logs/days/<day>.js` and
+  leaves `diet-today.js` **byte-identical** — which is what lets a post-midnight or
+  late-replayed row land on the day it belongs to without disturbing the day in progress.
+- **`--roll-to` is the only thing that moves the day, and the bridge never sends it.**
+  Rolling belongs to the `health-new-day` skill's audit-and-roll step, which goes through a
+  Tell turn; `run_diet_hooks` takes the parameter so the rule is in the signature rather than
+  in a comment.
+
+`vault/repair-diet-days.js --from <date> --to <date> [--dry-run]` re-derives a range's days
+under the same rule and rebuilds their caches. It uses `TZ` to tell the conventions apart: a
+row with a blank `TZ` was written under the old host-calendar rule and is a candidate, a row
+that names its zone is left alone — which also makes it safe to run twice.
+
 ## Diet snapshot (`GET /jesse/diet`)
 
 **`GET /jesse/diet`** — reads the vault's generated diet data files and returns one
@@ -766,9 +878,17 @@ to `proposed: null` and is **not** recorded as an error.
 
 Response shape (all keys camelCase; unknown generator fields pass through):
 
+The snapshot's default day, and any `date=` it is given, are **diet days**: at 02:00 the
+default is yesterday, because the meal still being digested belongs to the evening it was
+eaten. The response carries `dietDay` (the diet day it is right now, where the caller is
+standing) and `tz` (the effective zone it was resolved in). `asOf` is unchanged — it is an
+*instant*, not a day, and at 02:00 the two deliberately name different dates.
+
 ```jsonc
 {
-  "asOf": "2026-07-09T13:20:00Z",       // RFC3339 server time
+  "asOf": "2026-07-09T13:20:00Z",       // RFC3339 server time (an INSTANT)
+  "dietDay": "2026-07-09",              // the diet day now, in `tz`
+  "tz": "Europe/Rome",                  // the effective zone it was resolved in
   "todayMtime": "2026-07-09T06:12:41Z", // RFC3339 mtime of diet-today.js
   "today": { /* normalized DIET_TODAY */ },
   "proposed": { /* PROPOSED_DIET */ } | null,

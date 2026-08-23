@@ -13,6 +13,92 @@ Every commit that changes a component **must** bump that component's version and
 add an entry here — enforced by `scripts/version-guard.sh` (the pre-push hook and
 CI both run it). See the "Versioning" section of `bridge/README.md`.
 
+## [bridge 0.92.0] - 2026-08-23
+
+### Fixed
+
+- **A food log after midnight rolled the day and blanked the evening it had just
+  recorded.** Three nights running. The CSV row was appended correctly; what broke was
+  the cache. `run_diet_hooks` ran `node vault/generate-diet-today.js` with no argument,
+  and that script keyed "today" on the HOST'S SYSTEM DATE — so a 00:20 log rebuilt
+  `vault/diet-today.js` for the day that had just started, which had no rows in it yet,
+  and the evening's meals disappeared from the Health tab until the next morning's
+  regeneration put them back.
+
+  **Root cause: "today" was the host's calendar date, and a diet day is neither the
+  host's nor a calendar date.** The fix is one definition — the **diet day** of an entry
+  is the calendar date, in the effective timezone, of `eaten_at` minus four hours
+  (`dietlog::diet_day_of`) — and every date on the diet path is now derived through it.
+  Four in the morning is where the boundary belongs, because nobody is eating there;
+  midnight is the middle of an evening, not the end of one.
+
+- **The second root cause, which had not bitten yet: the host's zone was treated as the
+  owner's.** With the host in `Europe/Rome` and the owner about to be in `Europe/London`,
+  a 23:20 London dinner is 00:20 in Rome. Under the old rule it was filed on TOMORROW,
+  before midnight had arrived where the person eating it was standing. Dates now resolve
+  in the effective zone (`profile::effective_tz` — the request's `client_tz`, then the
+  away profile, then the process zone), so the day follows the person rather than the
+  machine. At the 04:00 boundary the zone is decisive, and there is a test for exactly
+  that instant.
+
+- **`local_today()` no longer chooses a day.** It asked the host's calendar a question
+  only the eater's clock can answer. What is left of it is the honest remainder: a
+  host-clock stamp, and the last-resort fallback for an entry with no recoverable instant.
+
+### Added
+
+- **`sent_at` on `POST /jesse`** — RFC3339 with an offset, optional and advisory like
+  `client_tz`. Absent (every app build before it learns to send one, every non-app
+  caller) the bridge uses its own clock, byte-for-byte the previous behaviour. It matters
+  for one thing: an entry the message gave no time for is dated from when it was *sent*,
+  not from when a queued or slowly-delivered turn happened to reach the pipeline.
+
+- **`eaten_at` on every extracted entry** — RFC3339 with an offset, and the one field a
+  row's `Date`, `Time` and `TZ` cells are all derived from. The extract child fills it
+  only from something the message actually said, resolved against a `NOW:` line the
+  pipeline prepends; a leading `(eaten at …)` stamp in the utterance is authoritative and
+  is read by trusted Rust as well as copied by the model. The old `time` key stays
+  accepted and is now DERIVED from `eaten_at`, so a row's cells cannot disagree with each
+  other. The verify child sees the field and judges it like any other — an instant that
+  contradicts the message misfiles the whole row.
+
+- **A `TZ` column, last in all three diet logs.** A row's `Date` is its diet day, its
+  `Time` is the wall clock a person in `TZ` read, and the three together recover the
+  instant — which is what makes a row repairable. Readers address columns by name and
+  accept the old header unchanged; a blank cell is not a defect, it means "written before
+  the column existed" and reads as the process zone. The WRITER migrates: before
+  appending, `append_rows_atomic` checks each header against its canonical form and
+  rewrites one that fails, logging what it found, **never touching a row**, and preserving
+  the file's own line terminator. `food-log.csv` is CRLF throughout — which is RFC 4180's
+  own line ending and not a defect — so what the check catches is a carriage return left
+  inside the header TEXT, a renamed column, or a header written before `TZ` existed.
+
+- **One turn may span two diet days.** "Dinner at nine and a snack just now", sent at
+  00:20, is one message about two days. The day is per ROW, the mirror groups on it, and
+  the hooks are told the EARLIEST day the turn touched.
+
+### Changed
+
+- **`run_diet_hooks(vault, diet_day, roll_to)` names the day, and a log never rolls it.**
+  All three scripts now take `--day`; the generator requires it and exits 2 on a bare
+  call, so a caller on the old contract fails loudly instead of rebuilding a day of its
+  own choosing. `--day` rewrites `vault/diet-today.js` only when it names the day that
+  file already holds — any other day rebuilds that day's archive and leaves the live file
+  byte-identical. `--roll-to` is the only thing that moves the day and belongs to the
+  `health-new-day` audit-and-roll step alone; the bridge never sends it. The parameter is
+  in the signature so the rule is stated rather than commented.
+
+- **`GET /jesse/diet` answers in diet days.** The default day and any `date=` are diet
+  days (at 02:00 the default is yesterday), and the snapshot gained `dietDay` and `tz`.
+  `asOf` is unchanged: it is an instant, not a day, and at 02:00 the two deliberately name
+  different dates.
+
+- **The emergency queue carries the instant.** A queued entry is stamped BEFORE it is
+  persisted and records the zone it was stamped in, so a replay after an overnight outage
+  writes the day its owner ate on rather than the day the host woke up on, and Apple Health
+  gets the real `consumedAt` instead of the moment the queue drained. A line written by an
+  older bridge still loads and falls back to the day it was queued with.
+
 ## [App 1.0 (112)] - 2026-08-22
 
 ### Fixed
