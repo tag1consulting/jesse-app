@@ -37,6 +37,7 @@
 //! ([`run_diet_pipeline`]) is a thin sequencer over the tested stages.
 
 use crate::*;
+use chrono::{LocalResult, TimeZone};
 use std::sync::LazyLock;
 
 // ---- Bounds ---------------------------------------------------------------
@@ -441,6 +442,15 @@ const FOOD_LOG_CORE_COLUMNS: &[&str] = &[
     "Meal_Type",
 ];
 
+/// The zone column every log gained with the diet day. It is LAST in every header —
+/// appended rather than inserted — so a reader that addresses columns by NAME sees one
+/// new column and a reader that predates it sees the file it always saw.
+///
+/// A blank cell is not a defect on a historical row: it means "written before the column
+/// existed", which [`parse_row_zone`] reads as the process zone, because that is in fact
+/// the zone those rows were written in.
+pub const TZ_COLUMN: &str = "TZ";
+
 /// Build the food header for an arbitrary nutrient table (the parameterized form the
 /// synthetic-ninth-nutrient test drives; production calls [`food_log_header`]).
 fn build_food_log_header(cols: &[NutrientCol]) -> String {
@@ -448,6 +458,7 @@ fn build_food_log_header(cols: &[NutrientCol]) -> String {
         .iter()
         .copied()
         .chain(cols.iter().map(|c| c.csv))
+        .chain(std::iter::once(TZ_COLUMN))
         .collect::<Vec<_>>()
         .join(",")
 }
@@ -462,9 +473,20 @@ pub fn food_log_header() -> &'static str {
 }
 
 pub const EXERCISE_LOG_HEADER: &str =
-    "Date,Type,Description,Distance_km,Duration,Pace_min_per_km,Elevation_m,Avg_HR,Cadence,Calories,Plan_Source,Notes,Start_Time";
+    "Date,Type,Description,Distance_km,Duration,Pace_min_per_km,Elevation_m,Avg_HR,Cadence,Calories,Plan_Source,Notes,Start_Time,TZ";
 pub const WEIGHT_LOG_HEADER: &str =
-    "Date,Weight_lbs,Weight_kg,Phase,BodyFat_pct,MuscleMass_lbs,Notes";
+    "Date,Weight_lbs,Weight_kg,Phase,BodyFat_pct,MuscleMass_lbs,Notes,TZ";
+
+/// The canonical header for one log file name, or `None` for a name this module does not
+/// own. The header-repair path ([`repair_log_header`]) is driven entirely by this.
+pub fn canonical_header(file_name: &str) -> Option<&'static str> {
+    match file_name {
+        "food-log.csv" => Some(food_log_header()),
+        "exercise-log.csv" => Some(EXERCISE_LOG_HEADER),
+        "weight-log.csv" => Some(WEIGHT_LOG_HEADER),
+        _ => None,
+    }
+}
 
 // ---- Extracted entry schema -----------------------------------------------
 
@@ -480,6 +502,15 @@ pub const WEIGHT_LOG_HEADER: &str =
 pub struct FoodEntry {
     pub name: String,
     pub meal: String, // Breakfast | Lunch | Dinner | Snack
+    /// **THE INSTANT THE THING HAPPENED** — RFC3339 with an offset
+    /// (`2026-09-03T13:10:00+01:00`), and the ONE field the row's `Date`, `Time` and `TZ`
+    /// cells are all derived from ([`diet_day_of`], [`clock_hhmm_in`]). Optional in the
+    /// model's output: the extract child fills it only from an explicit clock time or a
+    /// relative phrase in the message, resolved against the `NOW:` line the pipeline
+    /// prepends; otherwise the bridge resolves it ([`resolve_eaten_at`]) and the model
+    /// never invents one. Always `Some` by the time a row is built.
+    #[serde(default)]
+    pub eaten_at: Option<String>,
     // `HH:MM` — the clock time the item was eaten, but ONLY when the utterance
     // stated one explicitly ("lunch at 12"). The toolless extract child has no
     // clock, so an unstated time is `None`; the bridge fills it with the turn's
@@ -540,7 +571,16 @@ pub struct FoodEntry {
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct ExerciseEntry {
     pub activity: String,
-    pub time: Option<String>, // Start_Time HH:MM
+    /// **THE INSTANT THE THING HAPPENED** — RFC3339 with an offset
+    /// (`2026-09-03T13:10:00+01:00`), and the ONE field the row's `Date`, `Time` and `TZ`
+    /// cells are all derived from ([`diet_day_of`], [`clock_hhmm_in`]). Optional in the
+    /// model's output: the extract child fills it only from an explicit clock time or a
+    /// relative phrase in the message, resolved against the `NOW:` line the pipeline
+    /// prepends; otherwise the bridge resolves it ([`resolve_eaten_at`]) and the model
+    /// never invents one. Always `Some` by the time a row is built.
+    #[serde(default)]
+    pub eaten_at: Option<String>,
+    pub time: Option<String>, // Start_Time HH:MM, DERIVED from `eaten_at` in the effective zone
     pub description: Option<String>,
     pub distance_km: Option<f64>,
     pub duration: Option<String>,
@@ -553,6 +593,15 @@ pub struct ExerciseEntry {
 /// One extracted weigh-in reading.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct WeightEntry {
+    /// **THE INSTANT THE THING HAPPENED** — RFC3339 with an offset
+    /// (`2026-09-03T13:10:00+01:00`), and the ONE field the row's `Date`, `Time` and `TZ`
+    /// cells are all derived from ([`diet_day_of`], [`clock_hhmm_in`]). Optional in the
+    /// model's output: the extract child fills it only from an explicit clock time or a
+    /// relative phrase in the message, resolved against the `NOW:` line the pipeline
+    /// prepends; otherwise the bridge resolves it ([`resolve_eaten_at`]) and the model
+    /// never invents one. Always `Some` by the time a row is built.
+    #[serde(default)]
+    pub eaten_at: Option<String>,
     pub weight_lbs: f64,
     pub weight_kg: Option<f64>,
     pub body_fat_pct: Option<f64>,
@@ -736,6 +785,28 @@ fn opt_str_field(m: &serde_json::Map<String, Value>, key: &str) -> Option<String
         .map(str::to_string)
 }
 
+/// An optional RFC3339-with-offset instant, TOLERANT of the extract child's ways of
+/// saying "I could not tell": absent, `null`, blank, and — deliberately — an
+/// unparseable string all mean `None`.
+///
+/// Unparseable is not a schema violation HERE for the same reason an empty `time` stopped
+/// being one: a strict parser on this field is a route straight back to the rung-2 rate
+/// this pipeline already paid once, and the cost of the tolerance is nil — an entry with
+/// no usable instant falls to [`resolve_eaten_at`]'s next source, which is exactly what an
+/// omitted field does. The one thing it must never do is pass a malformed value THROUGH,
+/// because every date downstream is derived from it.
+fn opt_instant_field(m: &serde_json::Map<String, Value>, key: &str) -> Option<String> {
+    let raw = opt_str_field(m, key)?;
+    if chrono::DateTime::parse_from_rfc3339(&raw).is_ok() {
+        return Some(raw);
+    }
+    eprintln!(
+        "jesse-bridge: diet extract returned an unparseable `{key}` (not RFC3339 with an \
+         offset) — falling back to the turn's own instant for that entry"
+    );
+    None
+}
+
 /// An optional macro/number: absent → None; present → a finite, non-negative number
 /// (an explicit `null` is a violation — this strict form is what the hosted VERIFY
 /// verdict parser uses, so verify-gate behavior is unchanged). The EXTRACT parsers use
@@ -783,6 +854,7 @@ const FOOD_CORE_KEYS: &[&str] = &[
     "kind",
     "name",
     "meal",
+    "eaten_at",
     "time",
     "amount",
     "unit",
@@ -826,7 +898,8 @@ fn parse_food(m: &serde_json::Map<String, Value>) -> Result<FoodEntry, String> {
     let mut f = FoodEntry {
         name,
         meal: req_str(m, "meal")?,
-        // Optional: the bridge owns the received-at fallback (see the field docs).
+        eaten_at: opt_instant_field(m, "eaten_at"),
+        // Optional: the bridge owns the fallback (see the field docs).
         time: opt_str_field(m, "time"),
         amount: opt_str_field(m, "amount"),
         unit: opt_str_field(m, "unit"),
@@ -862,6 +935,7 @@ fn parse_food(m: &serde_json::Map<String, Value>) -> Result<FoodEntry, String> {
 const EXERCISE_KEYS: &[&str] = &[
     "kind",
     "activity",
+    "eaten_at",
     "time",
     "description",
     "distance_km",
@@ -880,6 +954,7 @@ fn parse_exercise(m: &serde_json::Map<String, Value>) -> Result<ExerciseEntry, S
     }
     Ok(ExerciseEntry {
         activity: req_str(m, "activity")?,
+        eaten_at: opt_instant_field(m, "eaten_at"),
         time: opt_str_field(m, "time"),
         description: opt_str_field(m, "description"),
         distance_km: opt_extract_num_field(m, "distance_km")?,
@@ -893,6 +968,7 @@ fn parse_exercise(m: &serde_json::Map<String, Value>) -> Result<ExerciseEntry, S
 
 const WEIGHT_KEYS: &[&str] = &[
     "kind",
+    "eaten_at",
     "weight_lbs",
     "weight_kg",
     "body_fat_pct",
@@ -916,6 +992,7 @@ fn parse_weight(m: &serde_json::Map<String, Value>) -> Result<WeightEntry, Strin
         (None, None) => return Err("weight entry has neither weight_lbs nor weight_kg".into()),
     };
     Ok(WeightEntry {
+        eaten_at: opt_instant_field(m, "eaten_at"),
         weight_lbs,
         weight_kg: kg,
         body_fat_pct: opt_extract_num_field(m, "body_fat_pct")?,
@@ -1317,11 +1394,14 @@ fn num_cell(n: Option<f64>) -> String {
     }
 }
 
-/// Build one `food-log.csv` row for a verified food item at `date`. Follows the
-/// vault fill convention: `Unit` defaults to `serving`, `Cal_per_100g`/`Grams` are
-/// left BLANK, and the absolute macros go into `Calories,Protein_g,Fat_g,Carbs_g`
-/// (+ `Fiber_g`). `Meal_Type` mirrors `Meal`.
-pub fn food_row(e: &FoodEntry, date: &str) -> String {
+/// Build one `food-log.csv` row for a verified food item on the DIET DAY `date`, whose
+/// wall clock was read in `tz`. Follows the vault fill convention: `Unit` defaults to
+/// `serving`, `Cal_per_100g`/`Grams` are left BLANK, and the absolute macros go into
+/// `Calories,Protein_g,Fat_g,Carbs_g` (+ `Fiber_g`). `Meal_Type` mirrors `Meal`.
+///
+/// `date`, `e.time` and `tz` are three renderings of the entry's one `eaten_at`
+/// ([`stamp_entry_clocks`] derives all three), never three independent claims.
+pub fn food_row(e: &FoodEntry, date: &str, tz: &str) -> String {
     // The 14 core cells, then one nutrient cell per NUTRIENT_COLUMNS entry IN TABLE
     // ORDER — the same order `food_log_header()` names them, so the two cannot drift.
     // Every nutrient cell is blank when unknown, never 0.
@@ -1342,11 +1422,13 @@ pub fn food_row(e: &FoodEntry, date: &str) -> String {
         csv_field(&e.meal), // Meal_Type mirrors Meal
     ];
     cols.extend(NUTRIENT_COLUMNS.iter().map(|c| num_cell(c.get(e))));
+    cols.push(csv_field(tz)); // TZ — last, matching `food_log_header()`
     cols.join(",")
 }
 
-/// Build one `exercise-log.csv` row for a verified exercise session at `date`.
-pub fn exercise_row(e: &ExerciseEntry, date: &str) -> String {
+/// Build one `exercise-log.csv` row for a verified exercise session on the diet day
+/// `date`, whose `Start_Time` was read in `tz`.
+pub fn exercise_row(e: &ExerciseEntry, date: &str, tz: &str) -> String {
     let cols = [
         date.to_string(),
         csv_field(&e.activity),
@@ -1361,6 +1443,7 @@ pub fn exercise_row(e: &ExerciseEntry, date: &str) -> String {
         String::new(), // Plan_Source
         csv_field(e.notes.as_deref().unwrap_or("")),
         csv_field(e.time.as_deref().unwrap_or("")),
+        csv_field(tz),
     ];
     cols.join(",")
 }
@@ -1368,7 +1451,7 @@ pub fn exercise_row(e: &ExerciseEntry, date: &str) -> String {
 /// Build one `weight-log.csv` row for a verified weigh-in at `date`. `Phase` is left
 /// blank (the pipeline doesn't infer it); `BodyFat_pct`/`MuscleMass_lbs` blank when
 /// unmeasured (the honest "not measured" signal, never `0`).
-pub fn weight_row(e: &WeightEntry, date: &str) -> String {
+pub fn weight_row(e: &WeightEntry, date: &str, tz: &str) -> String {
     let cols = [
         date.to_string(),
         num_cell(Some(e.weight_lbs)),
@@ -1377,6 +1460,7 @@ pub fn weight_row(e: &WeightEntry, date: &str) -> String {
         num_cell(e.body_fat_pct),
         num_cell(e.muscle_mass_lbs),
         csv_field(e.notes.as_deref().unwrap_or("")),
+        csv_field(tz),
     ];
     cols.join(",")
 }
@@ -1428,40 +1512,71 @@ fn sum_known(vals: impl Iterator<Item = Option<f64>>) -> Option<f64> {
 /// caller maps that to rung 5: keep the committed CSV, omit the mirror).
 pub fn build_meal_log_from_food_rows(
     rows: &[FoodEntry],
-    date: &str,
-    offset: &str,
+    zone: &SchedulerZone,
+    fallback_day: &str,
 ) -> Result<Option<MealLog>, String> {
     if rows.is_empty() {
         return Ok(None);
     }
 
-    // Group the turn's rows by (meal slot, HHMM), preserving first-appearance order so
-    // the mirror is deterministic. The grouping KEY is the same (slug, HHMM) the id is
-    // built from, so two rows that would compute the same id always land in one group —
-    // ids are unique across meals by construction.
+    // Group the turn's rows by (DIET DAY, meal slot, HHMM), preserving first-appearance
+    // order so the mirror is deterministic. The grouping KEY is the same (day, slug, HHMM)
+    // the id is built from, so two rows that would compute the same id always land in one
+    // group — ids are unique across meals by construction.
+    //
+    // The day is now PER ROW rather than per turn, because one turn can legitimately span
+    // two of them: a 00:20 message that logs "dinner at 21:00 and a snack just now" puts
+    // the dinner on yesterday's diet day and the snack on the same one, while a 04:30
+    // message logging last night's dinner and this morning's coffee splits across two.
     struct Group<'a> {
+        day: String,
         slug: String,
         hhmm: String,
-        // The first row's raw `time`/`meal` drive the group's consumed-at + display
-        // label; every row in the group shares the same (slug, HHMM).
-        time: String,
+        // The first row's `eaten_at`/`meal` drive the group's consumed-at + display
+        // label; every row in the group shares the same (day, slug, HHMM).
+        consumed_at: String,
         meal_label: String,
         rows: Vec<&'a FoodEntry>,
     }
     let mut groups: Vec<Group> = Vec::new();
     for r in rows {
-        // By the time a row reaches the mirror the pipeline has stamped any missing
-        // time (received-at), so `time` is Some; default defensively. `hhmm` is the
-        // digits of the clock time — the SAME fallback the id has always used.
+        // By the time a row reaches the mirror the pipeline has stamped every entry
+        // ([`stamp_entry_clocks`]), so `eaten_at` is Some and `time` is derived from it;
+        // both fallbacks below are defensive only.
+        let day = r
+            .eaten_at
+            .as_deref()
+            .and_then(|at| diet_day_of(at, zone))
+            .unwrap_or_else(|| fallback_day.to_string());
         let time = r.time.as_deref().unwrap_or("");
         let hhmm: String = time.chars().filter(|c| c.is_ascii_digit()).collect();
         let slug = meal_slug(&r.meal);
-        match groups.iter_mut().find(|g| g.slug == slug && g.hhmm == hhmm) {
+        // THE INSTANT APPLE HEALTH IS TOLD, and it is the stored one rather than a
+        // reconstruction: a queued entry replayed after an overnight outage mirrors the
+        // moment it was eaten, not the moment the queue drained.
+        let consumed_at = r.eaten_at.clone().unwrap_or_else(|| {
+            // Defensive only: an entry that reached here unstamped (a queue item from an
+            // older bridge) still gets a real instant, by reading its `Date`/`Time` cells
+            // back as a wall clock in `zone` — the same reconstruction the CSV supports.
+            parse_hhmm(time)
+                .and_then(|(h, m)| {
+                    chrono::NaiveDate::parse_from_str(&day, "%Y-%m-%d")
+                        .ok()
+                        .and_then(|d| wall_clock_on(d, h, m, zone))
+                })
+                .map(|dt| dt.to_rfc3339_opts(chrono::SecondsFormat::Secs, false))
+                .unwrap_or_else(|| format!("{day}T{time}:00"))
+        });
+        match groups
+            .iter_mut()
+            .find(|g| g.day == day && g.slug == slug && g.hhmm == hhmm)
+        {
             Some(g) => g.rows.push(r),
             None => groups.push(Group {
+                day,
                 slug,
                 hhmm,
-                time: time.to_string(),
+                consumed_at,
                 meal_label: r.meal.clone(),
                 rows: vec![r],
             }),
@@ -1478,9 +1593,11 @@ pub fn build_meal_log_from_food_rows(
         .map(|g| {
             let names: Vec<&str> = g.rows.iter().map(|r| r.name.as_str()).collect();
             let mut meal = Meal {
-                // The deterministic hosted-contract id: `<date>-<slug>-<HHMM>`, no seq.
-                id: format!("{date}-{}-{}", g.slug, g.hhmm),
-                consumed_at: format!("{date}T{}:00{offset}", g.time),
+                // The deterministic hosted-contract id: `<diet day>-<slug>-<HHMM>`, no
+                // seq — recomputable from the row's own `Date` and `Time` cells alone,
+                // which is exactly what a later hosted correction recomputes.
+                id: format!("{}-{}-{}", g.day, g.slug, g.hhmm),
+                consumed_at: g.consumed_at.clone(),
                 name: format!("{}: {}", g.meal_label, names.join(", ")),
                 // Macros summed over the group in trusted Rust (unknown-is-not-zero).
                 kcal: sum_known(g.rows.iter().map(|r| r.kcal)),
@@ -1877,6 +1994,55 @@ impl AppendSnapshot {
     }
 }
 
+/// A STRICT check of one log's header line against its canonical form, returning the
+/// repaired content when it fails and `None` when it already passes.
+///
+/// The check is on the header's CONTENT: the bytes before the first line terminator, with
+/// the terminator's own `\r` (a CRLF file — `food-log.csv` is one throughout, and that is
+/// RFC 4180's own line ending, not a defect) removed. Anything else that differs — a
+/// STRAY carriage return inside the header, a renamed column, or a header written before
+/// the `TZ` column existed — is a header this writer will not append under, so it is
+/// rewritten.
+///
+/// **Rows are never touched.** Only the bytes before the first terminator change, and the
+/// terminator itself is preserved, so a CRLF file stays a CRLF file and every row keeps
+/// the exact bytes it was committed with. That restraint is the whole point: the header is
+/// a schema declaration the writer owns, the rows are the owner's data and are not this
+/// code's to normalise.
+pub fn repair_log_header(content: &str, canonical: &str) -> Option<String> {
+    let (first_line, rest) = match content.find('\n') {
+        Some(nl) => (&content[..nl], &content[nl..]),
+        None => (content, ""),
+    };
+    let terminated_crlf = first_line.ends_with('\r');
+    let found = first_line.strip_suffix('\r').unwrap_or(first_line);
+    if found == canonical {
+        return None;
+    }
+    let terminator = if terminated_crlf { "\r" } else { "" };
+    Some(format!("{canonical}{terminator}{rest}"))
+}
+
+/// Rewrite `path`'s header when it fails [`repair_log_header`], logging what changed.
+/// A missing or empty file is left alone — the append below creates it with the canonical
+/// header. Returns the file's content as it now stands, so the caller reads the disk once.
+fn ensure_log_header(path: &Path, canonical: &str, original: Option<String>) -> Option<String> {
+    let content = original?;
+    if content.trim().is_empty() {
+        return Some(content);
+    }
+    let repaired = repair_log_header(&content, canonical)?;
+    let found = content.lines().next().unwrap_or("");
+    eprintln!(
+        "jesse-bridge: rewrote the header of {} — it read {:?} and the canonical header is \
+         {:?}. Rows were not touched.",
+        path.display(),
+        truncate_chars(found, 400),
+        truncate_chars(canonical, 400),
+    );
+    Some(repaired)
+}
+
 /// Append one file's rows, preserving the single-trailing-newline convention.
 fn appended_content(original: &str, rows: &[String]) -> String {
     let mut out = original.to_string();
@@ -1922,7 +2088,17 @@ pub fn append_rows_atomic(
                 return Err(format!("cannot read {}: {e}", path.display()));
             }
         };
-        let new_content = appended_content(original.as_deref().unwrap_or(""), rows);
+        // HEADER FIRST, and only ever the header. The rows about to be appended carry a
+        // `TZ` cell, so a file still declaring the pre-`TZ` header would describe a schema
+        // it no longer holds; the same check catches a stray carriage return or a renamed
+        // column. The repair rides inside the SAME snapshot as the append, so a later hook
+        // failure rolls the header back with the rows.
+        let canonical = canonical_header(name);
+        let base = match canonical.and_then(|c| ensure_log_header(&path, c, original.clone())) {
+            Some(repaired) => repaired,
+            None => original.clone().unwrap_or_default(),
+        };
+        let new_content = appended_content(&base, rows);
         // Snapshot BEFORE writing so a rollback restores this file too.
         snapshot.restores.push((path.clone(), original));
         if let Err(e) = std::fs::write(&path, new_content) {
@@ -1936,18 +2112,36 @@ pub fn append_rows_atomic(
 // ---- Node hooks + git commit -----------------------------------------------
 
 /// Run the three pinned node scripts (generate → validate → verify) in the vault, in
-/// order. Any non-zero exit (or spawn failure) is an `Err` the caller maps to rung 4
-/// (rollback, no commit, hosted turn). These are the SAME scripts the vault's
-/// PostToolUse hook runs on the agent path; on the local pipeline there is no agent
-/// Edit to trigger that hook, so the bridge runs them itself.
-pub async fn run_diet_hooks(vault: &Path) -> Result<(), String> {
+/// order, FOR ONE NAMED DIET DAY. Any non-zero exit (or spawn failure) is an `Err` the
+/// caller maps to rung 4 (rollback, no commit, hosted turn). These are the SAME scripts
+/// the vault's PostToolUse hook runs on the agent path; on the local pipeline there is no
+/// agent Edit to trigger that hook, so the bridge runs them itself.
+///
+/// **`--day` is passed on every call and `--roll-to` on none of them.** That split is the
+/// containment of the bug this whole change exists to fix: the generator used to key
+/// "today" on the host's system date, so a 00:20 log silently rolled `diet-today.js` to
+/// the new day and blanked the evening it had just recorded. Naming the day removes the
+/// generator's own clock from the decision, and WHO MAY ROLL is now a separate question
+/// with a single answer — the `health-new-day` skill's audit-and-roll step, through a Tell
+/// turn, passing `--roll-to` itself. A log never rolls. `roll_to` is threaded here only so
+/// the signature states that rule rather than leaving it to a comment.
+pub async fn run_diet_hooks(
+    vault: &Path,
+    diet_day: &str,
+    roll_to: Option<&str>,
+) -> Result<(), String> {
     for script in [
         "vault/generate-diet-today.js",
         "vault/validate-diet-today.js",
         "vault/verify-diet-consistency.js",
     ] {
-        let out = Command::new("node")
-            .arg(script)
+        let mut cmd = Command::new("node");
+        cmd.arg(script).arg("--day").arg(diet_day);
+        // Only the generator understands the roll; the two guards read the day it wrote.
+        if let (Some(day), true) = (roll_to, script.ends_with("generate-diet-today.js")) {
+            cmd.arg("--roll-to").arg(day);
+        }
+        let out = cmd
             .current_dir(vault)
             .output()
             .await
@@ -1955,10 +2149,21 @@ pub async fn run_diet_hooks(vault: &Path) -> Result<(), String> {
         if !out.status.success() {
             let stderr = String::from_utf8_lossy(&out.stderr);
             return Err(format!(
-                "node {script} failed: {}",
+                "node {script} --day {diet_day} failed: {}",
                 truncate_chars(stderr.trim(), 300)
             ));
         }
+    }
+    Ok(())
+}
+
+/// Run the hooks for EVERY day a turn touched, oldest first. One turn can legitimately
+/// span two diet days — "dinner at nine and a snack just now", sent at 00:20 — and
+/// regenerating only one of them would leave the other's cache stale. The first failure
+/// stops the pass and is returned, so the caller rolls the whole turn back.
+pub async fn run_diet_hooks_for_days(vault: &Path, days: &[String]) -> Result<(), String> {
+    for day in days {
+        run_diet_hooks(vault, day, None).await?;
     }
     Ok(())
 }
@@ -1997,8 +2202,13 @@ pub async fn commit_diet_logs(vault: &Path, date: &str, hhmm: &str) -> Result<()
 // ---- Local clock helpers (impure edges) ------------------------------------
 
 /// Today's local date `YYYY-MM-DD` via `date +%F`, falling back to a std-only UTC
-/// computation so it is never absent. The zone is the host's, matching the vault's
-/// per-log convention.
+/// computation so it is never absent. The zone is the host's.
+///
+/// **THIS NO LONGER CHOOSES A DIET DAY.** It used to be what "today" meant on the append
+/// path, which is the defect: it asked the host's calendar a question only the eater's
+/// clock can answer. Every row's day now comes from [`diet_day_of`]. What is left is the
+/// legitimate remainder — a HOST-clock stamp, and the last-resort fallback for an entry
+/// with no recoverable instant.
 pub fn local_today() -> String {
     local_today_in(&SchedulerZone::Host)
 }
@@ -2052,6 +2262,10 @@ pub fn local_offset() -> String {
 
 /// Local `HH:MM` via `date +%H:%M`, for the commit message timestamp. `pub(crate)`
 /// so the emergency diet-queue replay ([`dietqueue`]) can stamp its own commit.
+///
+/// A commit message is the one place a HOST wall clock is still the honest answer: it
+/// records when the write happened on this machine, not when the food was eaten. Use
+/// [`commit_stamp_in`] where the stamp should follow the owner instead.
 pub(crate) fn local_hhmm() -> String {
     std::process::Command::new("date")
         .env("LC_ALL", "C")
@@ -2063,6 +2277,13 @@ pub(crate) fn local_hhmm() -> String {
         .map(|s| s.trim().to_string())
         .filter(|s| s.len() == 5)
         .unwrap_or_else(|| "00:00".to_string())
+}
+
+/// The `HH:MM` a commit message carries, rendered in the EFFECTIVE zone rather than the
+/// host's — so a log written from London is stamped with the hour its owner saw, matching
+/// the `Time` cell in the row the same commit contains.
+pub(crate) fn commit_stamp_in(zone: &SchedulerZone) -> String {
+    clock_hhmm_in(&now_rfc3339_in(zone), zone).unwrap_or_else(local_hhmm)
 }
 
 /// Normalize a `date +%z` compact `±HHMM` to `±HH:MM` (colonized), passing an
@@ -2080,6 +2301,239 @@ fn normalize_offset_pub(raw: &str) -> String {
         return format!("{}:{}", &raw[..3], &raw[3..]);
     }
     "+00:00".to_string()
+}
+
+// ---- THE DIET DAY ----------------------------------------------------------
+//
+// Three nights running, a food log after midnight rolled `vault/diet-today.js` to the
+// new day and blanked the evening that had just been logged. The cause was that
+// "today" was the HOST's calendar date, read at append time from `date +%F`: a 00:20
+// dinner is a new calendar day and nothing anywhere said it was still last night's
+// meal. The second half of the same defect is spatial rather than temporal — with the
+// host in `Europe/Rome` and the owner in `Europe/London`, a 23:20 London dinner is
+// 00:20 Rome, so it landed on TOMORROW before midnight had even arrived where the
+// person eating it was standing.
+//
+// Both are the same missing definition, and everything below derives from it.
+
+/// The hour a diet day begins, in the effective zone. A 00:30 snack belongs to the day
+/// that just ended; a 04:00 coffee starts the new one.
+///
+/// Four rather than zero because the boundary has to fall where nobody is eating.
+/// Midnight is the middle of an evening, not the end of one.
+pub const DIET_DAY_START_HOUR: i64 = 4;
+
+/// **THE ONE DEFINITION OF A DIET DAY**: the calendar date, in `zone`, of `eaten_at`
+/// minus [`DIET_DAY_START_HOUR`].
+///
+/// `eaten_at` is an RFC3339 instant WITH an offset, so the answer never depends on the
+/// host's clock or the host's zone — only on when the thing was eaten and where its
+/// owner was standing ([`effective_tz`]). Returns `None` for anything that is not a
+/// parseable RFC3339 instant; every caller has a defined fallback rather than a guess.
+pub fn diet_day_of(eaten_at: &str, zone: &SchedulerZone) -> Option<String> {
+    let instant = chrono::DateTime::parse_from_rfc3339(eaten_at.trim()).ok()?;
+    Some(
+        (instant.with_timezone(zone) - chrono::Duration::hours(DIET_DAY_START_HOUR))
+            .format("%Y-%m-%d")
+            .to_string(),
+    )
+}
+
+/// `eaten_at` as the wall-clock `HH:MM` a person in `zone` would have read off a clock —
+/// the CSV `Time` cell. Paired with [`diet_day_of`] and the `TZ` cell, these three are
+/// enough to recover the instant, which is what makes the row repairable.
+pub fn clock_hhmm_in(eaten_at: &str, zone: &SchedulerZone) -> Option<String> {
+    let instant = chrono::DateTime::parse_from_rfc3339(eaten_at.trim()).ok()?;
+    Some(instant.with_timezone(zone).format("%H:%M").to_string())
+}
+
+/// The `TZ` cell for `zone`: its IANA name, or — for a fixed-offset zone, which has no
+/// name — the offset itself (`+02:00`). [`parse_row_zone`] reads both back.
+pub fn tz_label(zone: &SchedulerZone) -> String {
+    match zone {
+        SchedulerZone::Fixed(f) => f.to_string(),
+        other => other.iana_name().unwrap_or_else(|| "UTC".to_string()),
+    }
+}
+
+/// Read a `TZ` cell back into a zone: an IANA name, a `±HH:MM` fixed offset, or —
+/// for a BLANK cell, which is every row written before the column existed — the
+/// process zone, which is the zone those rows were in fact written in.
+pub fn parse_row_zone(tz: &str) -> SchedulerZone {
+    let raw = tz.trim();
+    if raw.is_empty() {
+        return SchedulerZone::Host;
+    }
+    if let Some(zone) = parse_iana(raw) {
+        return zone;
+    }
+    if let Some(fixed) = chrono::DateTime::parse_from_rfc3339(&format!("2000-01-01T00:00:00{raw}"))
+        .ok()
+        .map(|dt| *dt.offset())
+    {
+        return SchedulerZone::Fixed(fixed);
+    }
+    SchedulerZone::Host
+}
+
+/// Now, as an RFC3339 instant carrying `zone`'s offset. The `sent_at` a request did not
+/// supply, and the reference every relative phrase in an utterance resolves against.
+pub fn now_rfc3339_in(zone: &SchedulerZone) -> String {
+    chrono::DateTime::<chrono::Utc>::from(SystemTime::now())
+        .with_timezone(zone)
+        .to_rfc3339_opts(chrono::SecondsFormat::Secs, false)
+}
+
+/// The leading `(eaten at <RFC3339>)` stamp, which is AUTHORITATIVE when present.
+///
+/// It exists so a caller that already knows when something was eaten — a phone replaying
+/// a photo taken hours earlier, an operator repairing a row — can say so in the one place
+/// every path reads, without the extract model having to infer it. Only a LEADING stamp
+/// counts: a parenthetical further into the sentence is the owner's prose, not a header.
+/// The value must parse as RFC3339 with an offset; a malformed stamp is simply not a
+/// stamp, and the ordinary precedence takes over.
+pub fn eaten_at_stamp(utterance: &str) -> Option<String> {
+    let rest = utterance.trim_start().strip_prefix('(')?;
+    let (inner, _) = rest.split_once(')')?;
+    let inner = inner.trim();
+    const LABEL: &str = "eaten at ";
+    let head = inner.get(..LABEL.len())?;
+    if !head.eq_ignore_ascii_case(LABEL) {
+        return None;
+    }
+    let value = inner[LABEL.len()..].trim();
+    chrono::DateTime::parse_from_rfc3339(value).ok()?;
+    Some(value.to_string())
+}
+
+/// Resolve one entry's instant, in the precedence the design fixes:
+///
+///   1. the entry's own `eaten_at` — the model read an explicit clock time or a relative
+///      phrase out of the message and resolved it against the `NOW:` line;
+///   2. its legacy `time` (`HH:MM`), which carries no date: read as the most recent
+///      occurrence of that wall clock in `zone` at or before `reference`, so "at 11pm"
+///      said at 00:20 is last night rather than twenty-three hours from now. THIS ARM IS
+///      WHY THE OLD KEY IS STILL ACCEPTED: without it, an extract that filled only `time`
+///      would silently lose a stated time to the turn's arrival clock;
+///   3. `reference` itself — the stamp when the utterance carried one, else the turn's
+///      `sent_at`, else now. The bridge owns this fallback; the model never invents one.
+pub fn resolve_eaten_at(
+    entry_eaten_at: Option<&str>,
+    entry_time: Option<&str>,
+    reference: &str,
+    zone: &SchedulerZone,
+) -> String {
+    if let Some(raw) = entry_eaten_at.map(str::trim).filter(|s| !s.is_empty()) {
+        if chrono::DateTime::parse_from_rfc3339(raw).is_ok() {
+            return raw.to_string();
+        }
+    }
+    if let Some(from_clock) = entry_time
+        .and_then(parse_hhmm)
+        .and_then(|(h, m)| most_recent_wall_clock(h, m, reference, zone))
+    {
+        return from_clock;
+    }
+    reference.to_string()
+}
+
+/// `HH:MM` (tolerating a leading `~` and a single-digit hour, as the vault's own rows do).
+fn parse_hhmm(raw: &str) -> Option<(u32, u32)> {
+    let s = raw.trim().trim_start_matches('~').trim();
+    let (h, m) = s.split_once(':')?;
+    let h: u32 = h.trim().parse().ok()?;
+    let m: u32 = m.get(..2)?.parse().ok()?;
+    (h <= 23 && m <= 59).then_some((h, m))
+}
+
+/// The most recent instant at which the wall clock in `zone` read `h:m`, at or before
+/// `reference`. Returns `None` when `reference` is not a parseable instant.
+fn most_recent_wall_clock(h: u32, m: u32, reference: &str, zone: &SchedulerZone) -> Option<String> {
+    let at = chrono::DateTime::parse_from_rfc3339(reference.trim())
+        .ok()?
+        .with_timezone(zone);
+    let mut day = at.date_naive();
+    for _ in 0..2 {
+        if let Some(candidate) = wall_clock_on(day, h, m, zone) {
+            if candidate <= at {
+                return Some(candidate.to_rfc3339_opts(chrono::SecondsFormat::Secs, false));
+            }
+        }
+        day = day.pred_opt()?;
+    }
+    None
+}
+
+/// The instant at which the wall clock in `zone` reads `h:m` on `day`, resolving the two
+/// days a year that phrase is not a single instant the way the scheduler already does:
+/// the EARLIER of an ambiguous pair, and — inside a spring-forward gap, where the time
+/// never happens — the first minute that does exist after it.
+fn wall_clock_on(
+    day: chrono::NaiveDate,
+    h: u32,
+    m: u32,
+    zone: &SchedulerZone,
+) -> Option<chrono::DateTime<SchedulerZone>> {
+    let naive = day.and_hms_opt(h, m, 0)?;
+    match zone.from_local_datetime(&naive) {
+        LocalResult::Single(dt) => Some(dt),
+        LocalResult::Ambiguous(earliest, _) => Some(earliest),
+        LocalResult::None => {
+            for step in 1..=180 {
+                let probe = naive.checked_add_signed(chrono::Duration::minutes(step))?;
+                match zone.from_local_datetime(&probe) {
+                    LocalResult::Single(dt) => return Some(dt),
+                    LocalResult::Ambiguous(earliest, _) => return Some(earliest),
+                    LocalResult::None => continue,
+                }
+            }
+            None
+        }
+    }
+}
+
+/// Resolve and stamp every entry in the turn: fill each one's `eaten_at` through
+/// [`resolve_eaten_at`], then DERIVE its `time` cell from that instant in `zone`.
+///
+/// Deriving rather than preserving is the point — after this runs, an entry's `time` and
+/// its `eaten_at` cannot disagree, so the CSV `Date`/`Time`/`TZ` triple and the mirror's
+/// `consumedAt` are three renderings of one fact instead of three independent claims.
+/// Runs at APPEND, before rows are built, so the filled instant flows through the normal
+/// row + mirror + dashboard path.
+pub fn stamp_entry_clocks(entries: &mut [DietEntry], reference: &str, zone: &SchedulerZone) {
+    for e in entries.iter_mut() {
+        let (eaten_at, time) = match e {
+            DietEntry::Food(f) => (&mut f.eaten_at, Some(&mut f.time)),
+            DietEntry::Exercise(x) => (&mut x.eaten_at, Some(&mut x.time)),
+            // A weigh-in has no clock column in `weight-log.csv`, so it carries the
+            // instant (which decides its DAY) and renders no `Time`.
+            DietEntry::Weight(w) => (&mut w.eaten_at, None),
+        };
+        let resolved = resolve_eaten_at(
+            eaten_at.as_deref(),
+            time.as_ref().and_then(|t| t.as_deref()),
+            reference,
+            zone,
+        );
+        if let Some(slot) = time {
+            *slot = clock_hhmm_in(&resolved, zone);
+        }
+        *eaten_at = Some(resolved);
+    }
+}
+
+/// One entry's diet day, from its stamped `eaten_at`. `fallback` covers an entry that
+/// somehow reached here unstamped (a queue item written by an older bridge) — never a
+/// silent guess at the host's calendar.
+pub fn entry_diet_day(e: &DietEntry, zone: &SchedulerZone, fallback: &str) -> String {
+    let eaten_at = match e {
+        DietEntry::Food(f) => f.eaten_at.as_deref(),
+        DietEntry::Exercise(x) => x.eaten_at.as_deref(),
+        DietEntry::Weight(w) => w.eaten_at.as_deref(),
+    };
+    eaten_at
+        .and_then(|at| diet_day_of(at, zone))
+        .unwrap_or_else(|| fallback.to_string())
 }
 
 // ---- Rung-2 reason codes ---------------------------------------------------
@@ -2203,9 +2657,9 @@ fn build_extract_schema(cols: &[NutrientCol]) -> String {
         r#"{{
   "no_loggable_content": <boolean: true if the message logs nothing NEW to eat/drink, no workout, no weight — OR if it AMENDS/corrects/moves/deletes something already logged instead of reporting new consumption; in either case return an empty entries array>,
   "entries": [
-    {{ "kind": "food", "name": "<ONE food item, never a combined meal>", "meal": "Breakfast|Lunch|Dinner|Snack", "time": "<HH:MM ONLY if the message states a clock time, else null/omit — never invent one>", "amount": "<e.g. 1 medium (~118g)>", "unit": "serving", "kcal": <number>, "protein_g": <number>, "carbs_g": <number>, "fat_g": <number>, {nutrients}, "unknowable_composite": <boolean, optional, default false: true ONLY for a composite you cannot identify>, "notes": "<optional>" }},
-    {{ "kind": "exercise", "activity": "Run|Walk|Swim|Strength/Weights|...", "time": "<HH:MM ONLY if stated, else null/omit>", "description": "<optional>", "distance_km": <number>, "duration": "<e.g. 56:58>", "pace": "<e.g. 7:07>", "avg_hr": <number>, "calories": <number>, "notes": "<optional>" }},
-    {{ "kind": "weight", "weight_lbs": <number>, "weight_kg": <number>, "body_fat_pct": <number>, "muscle_mass_lbs": <number>, "notes": "<optional>" }}
+    {{ "kind": "food", "name": "<ONE food item, never a combined meal>", "meal": "Breakfast|Lunch|Dinner|Snack", "eaten_at": "<RFC3339 with offset, ONLY if the message says when — else null/omit>", "time": "<HH:MM, same rule; omit when you set eaten_at>", "amount": "<e.g. 1 medium (~118g)>", "unit": "serving", "kcal": <number>, "protein_g": <number>, "carbs_g": <number>, "fat_g": <number>, {nutrients}, "unknowable_composite": <boolean, optional, default false: true ONLY for a composite you cannot identify>, "notes": "<optional>" }},
+    {{ "kind": "exercise", "activity": "Run|Walk|Swim|Strength/Weights|...", "eaten_at": "<RFC3339 with offset, ONLY if stated — else null/omit>", "time": "<HH:MM, same rule>", "description": "<optional>", "distance_km": <number>, "duration": "<e.g. 56:58>", "pace": "<e.g. 7:07>", "avg_hr": <number>, "calories": <number>, "notes": "<optional>" }},
+    {{ "kind": "weight", "eaten_at": "<RFC3339 with offset, ONLY if stated — else null/omit>", "weight_lbs": <number>, "weight_kg": <number>, "body_fat_pct": <number>, "muscle_mass_lbs": <number>, "notes": "<optional>" }}
   ]
 }}"#
     )
@@ -2321,7 +2775,7 @@ pub fn diet_nutrient_rules() -> &'static str {
 /// header consts the append path targets — the parity source of truth), the per-item
 /// anti-aggregation rule, the schema, and the JSON-only instruction. The raw
 /// utterance is appended. The child holds no tools, so everything it needs is here.
-pub fn build_diet_extract_prompt(utterance: &str, owner: &str) -> String {
+pub fn build_diet_extract_prompt(utterance: &str, owner: &str, sent_at: &str) -> String {
     let food_header = food_log_header();
     let nutrient_rules = diet_nutrient_rules();
     let schema = diet_extract_schema();
@@ -2336,12 +2790,21 @@ CONTRACT (the vault's diet logs; you are parsing INTO these columns):\n\
 - Macros are per-ITEM absolute grams/kcal. Omit any macro you don't know — NEVER \
 guess and NEVER write 0 as a placeholder (0 means a real measured zero).\n\
 {nutrient_rules}\
-- `time` is the clock time the thing happened (HH:MM), but ONLY when the message \
-states one (\"at 12:30\", \"this morning\" is NOT a clock time). You have NO clock and \
-MUST NOT invent, guess, or infer a time — if the message gives no explicit clock time, \
-set `time` to null or omit it, and the bridge stamps the real received-at time. `meal` \
-is the meal slot that fits the stated hour, or your best slot from the wording when no \
-time is given.\n\
+- WHEN IT HAPPENED. You have NO clock of your own. The ONLY clock you have is the \
+`NOW:` line below, which is the exact moment this message was sent, RFC3339 with its \
+offset. Set `eaten_at` ONLY when the message itself says when — an explicit clock time \
+(\"at 1pm\", \"at 12:30\") or a relative phrase (\"this morning\", \"last night\", \"an hour \
+ago\") — and resolve it against `NOW:`, keeping the SAME offset `NOW:` carries. \"last \
+night\" and \"at 11pm\" said just after midnight are YESTERDAY. If the message says \
+nothing about when, OMIT `eaten_at` (or set it to null): the bridge fills it with the \
+turn's own instant. NEVER invent, guess, or round a time you were not given.\n\
+- IF THE MESSAGE BEGINS WITH A STAMP of the form `(eaten at 2026-09-03T13:10:00+01:00)`, \
+that stamp is AUTHORITATIVE and is the answer: copy it VERBATIM into `eaten_at` on every \
+entry, and ignore `NOW:` for those entries.\n\
+- `time` (HH:MM) is the OLD form of the same fact and is still accepted. Prefer \
+`eaten_at`; when you set `eaten_at`, omit `time`.\n\
+- `meal` is the meal slot that fits the stated hour, or your best slot from the wording \
+when no time is given.\n\
 \n\
 PER-ITEM RULE (the 2026-07-13 schema decision — enforce it):\n\
 - Emit ONE food entry PER DISTINCT FOOD, each with its OWN per-item macros. NEVER a \
@@ -2361,6 +2824,8 @@ to an existing one, treat it as an amendment (omit it).\n\
 \n\
 SCHEMA (return exactly this shape):\n\
 {schema}\n\
+\n\
+NOW: {sent_at}\n\
 \n\
 MESSAGE:\n{utterance}"
     )
@@ -2424,8 +2889,11 @@ For EACH candidate, in order, emit one verdict:\n\
 kcal/protein_g/carbs_g/fat_g/fiber_g you believe are right. Only correct numbers; \
 never change what the item IS.\n\
 - \"reject\": the entry is wrong in a way a number fix can't cure — it aggregates \
-several foods, invents an item the message didn't mention, has the wrong item, or \
-its macros are a whole-meal total rather than a per-item value.\n\
+several foods, invents an item the message didn't mention, has the wrong item, its \
+macros are a whole-meal total rather than a per-item value, or its `eaten_at` \
+contradicts the message (a \"last night\" resolved to this afternoon, an invented time \
+the message never gave). Judge `eaten_at` exactly as you judge every other field: it \
+decides which DAY the entry lands on, so a wrong one misfiles the whole row.\n\
 \n\
 TOLERANCE: treat a macro as out of band (needs \"correct\") when your estimate \
 differs from the candidate by MORE than the larger of 20% and 75 kcal per item; \
@@ -2454,7 +2922,12 @@ fn entry_to_value(e: &DietEntry) -> Value {
     match e {
         DietEntry::Food(f) => {
             let mut v = json!({
-                "kind": "food", "name": f.name, "meal": f.meal, "time": f.time,
+                "kind": "food", "name": f.name, "meal": f.meal,
+                // `eaten_at` rides along so the VERIFY child can judge it like any other
+                // field — an instant that contradicts the message ("last night" resolved
+                // to this afternoon) is a wrong entry, and this is the gate that sees the
+                // message and the candidate side by side.
+                "eaten_at": f.eaten_at, "time": f.time,
                 "amount": f.amount, "kcal": f.kcal, "protein_g": f.protein_g,
                 "carbs_g": f.carbs_g, "fat_g": f.fat_g,
             });
@@ -2475,11 +2948,13 @@ fn entry_to_value(e: &DietEntry) -> Value {
             v
         }
         DietEntry::Exercise(x) => json!({
-            "kind": "exercise", "activity": x.activity, "time": x.time,
+            "kind": "exercise", "activity": x.activity,
+            "eaten_at": x.eaten_at, "time": x.time,
             "distance_km": x.distance_km, "duration": x.duration, "calories": x.calories,
         }),
         DietEntry::Weight(w) => json!({
-            "kind": "weight", "weight_lbs": w.weight_lbs, "weight_kg": w.weight_kg,
+            "kind": "weight", "eaten_at": w.eaten_at,
+            "weight_lbs": w.weight_lbs, "weight_kg": w.weight_kg,
             "body_fat_pct": w.body_fat_pct, "muscle_mass_lbs": w.muscle_mass_lbs,
         }),
     }
@@ -2600,29 +3075,11 @@ pub enum DietPipelineOutcome {
         entries: Vec<DietEntry>,
         date: String,
         offset: String,
+        /// The effective zone the entries were stamped in, so a replay after an overnight
+        /// outage re-derives each row's day from its OWN `eaten_at` in the zone its owner
+        /// was standing in — not from whatever zone the host is in when the queue drains.
+        tz: String,
     },
-}
-
-/// Stamp every food entry that carries no explicitly-stated `time` with the turn's
-/// received-at wall clock (`HH:MM`). The bridge — never the model — owns the fallback
-/// time: the toolless extract child has no clock and returns a time ONLY when the
-/// utterance states one, so an absent/blank time here means "not stated" and is filled
-/// with `received_hhmm`. An explicitly-stated time is left untouched (it always wins).
-/// Runs at APPEND, so the filled time flows through the normal row + mirror path and
-/// leaves the derived dashboard/Apple-Health re-derivation unchanged.
-pub fn stamp_missing_food_times(entries: &mut [DietEntry], received_hhmm: &str) {
-    for e in entries.iter_mut() {
-        if let DietEntry::Food(f) = e {
-            let stated = f
-                .time
-                .as_deref()
-                .map(str::trim)
-                .is_some_and(|t| !t.is_empty());
-            if !stated {
-                f.time = Some(received_hhmm.to_string());
-            }
-        }
-    }
 }
 
 /// Split validated entries by kind (used by both the orchestrator and its tests).
@@ -2653,6 +3110,8 @@ pub async fn run_diet_pipeline(
     cfg: &Config,
     health: &HealthStore,
     utterance: &str,
+    zone: &SchedulerZone,
+    turn_sent_at: &str,
 ) -> DietPipelineOutcome {
     // Who extracts, per the routing rule at `Basic`.
     let extract_pick = route_job(cfg, health, RoutedJob::DietExtract, None, None);
@@ -2660,10 +3119,15 @@ pub async fn run_diet_pipeline(
         Some((b, _t, m)) => (b.clone(), m.clone()),
         None => (String::new(), extract_pick.id.clone()),
     };
-    // The turn's received-at wall clock (`HH:MM`), captured as the pipeline receives
-    // the turn. The bridge stamps this onto any food entry whose time the utterance
-    // never stated (see [`stamp_missing_food_times`]); the model never invents a time.
-    let received_hhmm = local_hhmm();
+    // THE TURN'S REFERENCE INSTANT. A leading `(eaten at …)` stamp in the utterance is
+    // authoritative and wins outright; otherwise it is the moment the phone says it sent
+    // the message (`sent_at`), or — for a client too old to say — now. Every relative
+    // phrase the extract child resolves, and every entry the child said nothing about,
+    // resolves against this one value. The model never supplies it.
+    let reference = eaten_at_stamp(utterance).unwrap_or_else(|| turn_sent_at.to_string());
+    // The last-resort day, used only for an entry whose instant is somehow unrecoverable.
+    let fallback_day = diet_day_of(&reference, zone).unwrap_or_else(|| local_today_in(zone));
+    let tz = tz_label(zone);
     // A fall-through provenance line: no rows were appended, so there is no nutrient
     // completeness to report (`micros` is omitted).
     let prov = |local: bool, rung: Option<u8>, verify: &str, rows: usize, mirror: bool| {
@@ -2701,7 +3165,7 @@ pub async fn run_diet_pipeline(
     // Stage 1 — extract.
     let extract_raw = match run_diet_extract(
         cfg,
-        &build_diet_extract_prompt(utterance, &cfg.persona.owner_name),
+        &build_diet_extract_prompt(utterance, &cfg.persona.owner_name, &reference),
         DIET_EXTRACT_TIMEOUT_SECS,
         &extract_pick,
     )
@@ -2800,12 +3264,20 @@ pub async fn run_diet_pipeline(
                 // extract so an emergency caller can queue it. A non-emergency caller maps
                 // this straight back to a hosted fall-through (Verify rung).
                 prov(false, Some(3), "unavailable", extract.entries.len(), false);
+                // Stamp BEFORE queueing: the entry is persisted with the instant it was
+                // eaten, so a replay hours later re-derives the same day and the same
+                // `consumedAt` rather than re-dating the row to the moment hosted came
+                // back. That is the whole difference between a queue that preserves a log
+                // and one that quietly moves it to the next morning.
+                let mut queued = extract.entries;
+                stamp_entry_clocks(&mut queued, &reference, zone);
                 return DietPipelineOutcome::VerifyUnavailable {
                     err: e,
                     utterance: utterance.to_string(),
-                    entries: extract.entries,
-                    date: local_today(),
+                    entries: queued,
+                    date: fallback_day.clone(),
                     offset: local_offset(),
+                    tz: tz.clone(),
                 };
             }
         };
@@ -2875,15 +3347,42 @@ pub async fn run_diet_pipeline(
         }
     }
 
-    // Stage 3 — append + hooks + commit (atomic per turn). Fill any unstated food
-    // time with the turn's received-at wall clock BEFORE building rows, so the time
-    // flows through the normal row + mirror path (bridge owns received-at).
-    stamp_missing_food_times(&mut verified, &received_hhmm);
-    let (food, exercise, weight) = split_entries(&verified);
-    let date = local_today();
-    let food_rows: Vec<String> = food.iter().map(|f| food_row(f, &date)).collect();
-    let ex_rows: Vec<String> = exercise.iter().map(|x| exercise_row(x, &date)).collect();
-    let wt_rows: Vec<String> = weight.iter().map(|w| weight_row(w, &date)).collect();
+    // Stage 3 — append + hooks + commit (atomic per turn). Resolve every entry's
+    // `eaten_at` and DERIVE its `Time` cell from it BEFORE building rows, so the row's
+    // `Date`, `Time` and `TZ` are three renderings of one instant.
+    stamp_entry_clocks(&mut verified, &reference, zone);
+    // Only the food rows are needed as a collection here (the mirror and the day's
+    // completeness figure read them); the CSV rows themselves are built per entry below,
+    // because each one carries its own diet day.
+    let (food, _, _) = split_entries(&verified);
+    // ONE TURN CAN SPAN TWO DIET DAYS — "dinner at 9 and a snack just now" sent at 00:20
+    // is one message about two days — so the day is per ROW, and the day the HOOKS are
+    // told about is the EARLIEST of them: regenerating the oldest day is what pulls a
+    // post-midnight row back onto the evening it belongs to.
+    let mut days: Vec<String> = verified
+        .iter()
+        .map(|e| entry_diet_day(e, zone, &fallback_day))
+        .collect();
+    let row_day = |i: usize| days.get(i).cloned().unwrap_or_else(|| fallback_day.clone());
+    let mut food_rows = Vec::new();
+    let mut ex_rows = Vec::new();
+    let mut wt_rows = Vec::new();
+    for (i, e) in verified.iter().enumerate() {
+        let day = row_day(i);
+        match e {
+            DietEntry::Food(f) => food_rows.push(food_row(f, &day, &tz)),
+            DietEntry::Exercise(x) => ex_rows.push(exercise_row(x, &day, &tz)),
+            DietEntry::Weight(w) => wt_rows.push(weight_row(w, &day, &tz)),
+        }
+    }
+    days.sort();
+    days.dedup();
+    // The commit message names the earliest day the turn touched; the hooks below rebuild
+    // EVERY day it touched, because a turn that spans two of them leaves two caches stale.
+    let date = days
+        .first()
+        .cloned()
+        .unwrap_or_else(|| fallback_day.clone());
     let logs_dir = Path::new(&cfg.vault).join("diet-logs");
     let vault = Path::new(&cfg.vault);
 
@@ -2898,7 +3397,8 @@ pub async fn run_diet_pipeline(
             };
         }
     };
-    if let Err(e) = run_diet_hooks(vault).await {
+    // NEVER `--roll-to` on a log. Rolling belongs to the morning audit alone.
+    if let Err(e) = run_diet_hooks_for_days(vault, &days).await {
         eprintln!("jesse-bridge: diet hooks failed: {e}");
         snapshot.rollback();
         prov(false, Some(4), verify_word, verified.len(), false);
@@ -2907,7 +3407,7 @@ pub async fn run_diet_pipeline(
             reason: None,
         };
     }
-    if let Err(e) = commit_diet_logs(vault, &date, &local_hhmm()).await {
+    if let Err(e) = commit_diet_logs(vault, &date, &commit_stamp_in(zone)).await {
         eprintln!("jesse-bridge: diet commit failed: {e}");
         snapshot.rollback();
         prov(false, Some(4), verify_word, verified.len(), false);
@@ -2952,7 +3452,7 @@ pub async fn run_diet_pipeline(
         );
     };
 
-    match build_meal_log_from_food_rows(&food, &date, &local_offset()) {
+    match build_meal_log_from_food_rows(&food, zone, &fallback_day) {
         Ok(Some(meal_log)) => {
             prov_local(None, true);
             DietPipelineOutcome::Logged {
@@ -2990,6 +3490,675 @@ pub async fn run_diet_pipeline(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The zone the row/mirror fixtures below are read in. NAMED rather than the host's,
+    /// so a suite run on a machine in another zone asserts the same bytes — the property
+    /// this whole change exists to give the production path.
+    fn test_zone() -> SchedulerZone {
+        SchedulerZone::Named(chrono_tz::Europe::Rome)
+    }
+
+    /// A zone by IANA name, for the two-zone diet-day cases.
+    fn zone(name: &str) -> SchedulerZone {
+        parse_iana(name).expect("a zone the bundled tz database knows")
+    }
+
+    // ---- THE DIET DAY ------------------------------------------------------
+
+    /// The boundary itself, at the four instants that define it, in two zones. These are
+    /// the assertions the whole change is for: nothing below is a matter of taste.
+    #[test]
+    fn the_diet_day_boundary_is_0400_in_the_effective_zone() {
+        let rome = zone("Europe/Rome");
+        let london = zone("Europe/London");
+        // Rome, summer (+02:00).
+        for (at, expect, why) in [
+            (
+                "2026-09-03T23:59:00+02:00",
+                "2026-09-03",
+                "late evening is its own day",
+            ),
+            (
+                "2026-09-04T00:00:00+02:00",
+                "2026-09-03",
+                "midnight is still last night",
+            ),
+            (
+                "2026-09-04T03:59:00+02:00",
+                "2026-09-03",
+                "03:59 is the tail of last night",
+            ),
+            (
+                "2026-09-04T04:00:00+02:00",
+                "2026-09-04",
+                "04:00 starts the new day",
+            ),
+        ] {
+            assert_eq!(
+                diet_day_of(at, &rome).as_deref(),
+                Some(expect),
+                "Rome: {why}"
+            );
+        }
+        // London, summer (+01:00) — the same four wall clocks, a different instant each.
+        for (at, expect, why) in [
+            (
+                "2026-09-03T23:59:00+01:00",
+                "2026-09-03",
+                "late evening is its own day",
+            ),
+            (
+                "2026-09-04T00:00:00+01:00",
+                "2026-09-03",
+                "midnight is still last night",
+            ),
+            (
+                "2026-09-04T03:59:00+01:00",
+                "2026-09-03",
+                "03:59 is the tail of last night",
+            ),
+            (
+                "2026-09-04T04:00:00+01:00",
+                "2026-09-04",
+                "04:00 starts the new day",
+            ),
+        ] {
+            assert_eq!(
+                diet_day_of(at, &london).as_deref(),
+                Some(expect),
+                "London: {why}"
+            );
+        }
+    }
+
+    /// THE SECOND HALF OF THE DEFECT: the host is in Rome, the owner is in London, and a
+    /// 23:30 London dinner must land on the London date.
+    ///
+    /// The old rule was the host's CALENDAR date, and that is what this pins: the same
+    /// instant is 00:30 in Rome, so the row was filed on TOMORROW — before midnight had
+    /// arrived where the person eating it was standing. Note that the 04:00 rule alone
+    /// would have saved this particular dinner even read in the wrong zone; the zone is
+    /// what saves it at the boundary, which the next test asserts.
+    #[test]
+    fn a_london_evening_on_a_rome_host_lands_on_the_london_date() {
+        let dinner = "2026-09-03T23:30:00+01:00";
+        assert_eq!(
+            diet_day_of(dinner, &zone("Europe/London")).as_deref(),
+            Some("2026-09-03"),
+            "the owner's zone decides"
+        );
+        // THE OLD RULE, written out: the host's calendar date for the same instant.
+        let host_calendar_date = chrono::DateTime::parse_from_rfc3339(dinner)
+            .unwrap()
+            .with_timezone(&zone("Europe/Rome"))
+            .format("%Y-%m-%d")
+            .to_string();
+        assert_eq!(
+            host_calendar_date, "2026-09-04",
+            "this is the wrong answer three nights running"
+        );
+        // And the row's own cells say which zone was read.
+        assert_eq!(
+            clock_hhmm_in(dinner, &zone("Europe/London")).as_deref(),
+            Some("23:30")
+        );
+        assert_eq!(tz_label(&zone("Europe/London")), "Europe/London");
+    }
+
+    /// Where the ZONE, not the four-hour shift, is what decides: an instant whose wall
+    /// clocks straddle 04:00 in the two zones. 03:30 in London is 04:30 in Rome, so the
+    /// owner is still finishing the 3rd while the host has started the 4th.
+    #[test]
+    fn the_effective_zone_decides_at_the_boundary() {
+        let late = "2026-09-04T03:30:00+01:00";
+        assert_eq!(
+            diet_day_of(late, &zone("Europe/London")).as_deref(),
+            Some("2026-09-03"),
+            "03:30 in London is still the 3rd"
+        );
+        assert_eq!(
+            diet_day_of(late, &zone("Europe/Rome")).as_deref(),
+            Some("2026-09-04"),
+            "the same instant is 04:30 in Rome, which is the 4th"
+        );
+    }
+
+    /// A day is a day even across a DST transition, where a naive `-4h` on a wall clock
+    /// would be an hour out. Rome springs forward on 2026-03-29 at 02:00.
+    #[test]
+    fn the_boundary_survives_a_dst_transition() {
+        let rome = zone("Europe/Rome");
+        // 01:30 CET, before the jump — still the 28th's diet day.
+        assert_eq!(
+            diet_day_of("2026-03-29T01:30:00+01:00", &rome).as_deref(),
+            Some("2026-03-28")
+        );
+        // 04:30 CEST, after it — the 29th has begun.
+        assert_eq!(
+            diet_day_of("2026-03-29T04:30:00+02:00", &rome).as_deref(),
+            Some("2026-03-29")
+        );
+    }
+
+    #[test]
+    fn a_malformed_instant_is_no_day_at_all() {
+        for bad in ["", "not a date", "2026-09-03", "2026-09-03T13:10:00"] {
+            assert!(
+                diet_day_of(bad, &test_zone()).is_none(),
+                "{bad:?} carries no offset, so it names no instant"
+            );
+        }
+    }
+
+    // ---- The authoritative stamp -------------------------------------------
+
+    #[test]
+    fn a_leading_eaten_at_stamp_is_read_verbatim() {
+        assert_eq!(
+            eaten_at_stamp("(eaten at 2026-09-03T13:10:00+01:00) two eggs").as_deref(),
+            Some("2026-09-03T13:10:00+01:00")
+        );
+        // Case and surrounding whitespace are not the contract.
+        assert_eq!(
+            eaten_at_stamp("  (EATEN AT 2026-09-03T13:10:00+01:00)  toast").as_deref(),
+            Some("2026-09-03T13:10:00+01:00")
+        );
+    }
+
+    #[test]
+    fn only_a_leading_well_formed_stamp_counts() {
+        for not_a_stamp in [
+            "two eggs (eaten at 2026-09-03T13:10:00+01:00)", // not leading — it is prose
+            "(eaten at yesterday) two eggs",                 // not an instant
+            "(eaten at 2026-09-03T13:10:00) two eggs",       // no offset
+            "(at 2026-09-03T13:10:00+01:00) two eggs",       // not the label
+            "(eaten at 2026-09-03T13:10:00+01:00 two eggs",  // unclosed
+            "two eggs",
+        ] {
+            assert!(
+                eaten_at_stamp(not_a_stamp).is_none(),
+                "{not_a_stamp:?} must not be read as a stamp"
+            );
+        }
+    }
+
+    // ---- `eaten_at` precedence ---------------------------------------------
+
+    #[test]
+    fn eaten_at_precedence_is_entry_then_clock_then_reference() {
+        let rome = test_zone();
+        let reference = "2026-09-03T21:00:00+02:00";
+        // 1. The entry's own instant wins outright.
+        assert_eq!(
+            resolve_eaten_at(
+                Some("2026-09-03T13:10:00+02:00"),
+                Some("19:00"),
+                reference,
+                &rome
+            ),
+            "2026-09-03T13:10:00+02:00"
+        );
+        // 2. No instant, but a stated wall clock: read in the effective zone, at or before
+        //    the reference. This is the compatibility arm — without it a `time`-only
+        //    extract would silently lose the time the message stated.
+        assert_eq!(
+            resolve_eaten_at(None, Some("19:00"), reference, &rome),
+            "2026-09-03T19:00:00+02:00"
+        );
+        // 3. Neither: the turn's own instant, owned by the bridge.
+        assert_eq!(resolve_eaten_at(None, None, reference, &rome), reference);
+        // An unparseable entry instant is not a claim — fall through, never propagate it.
+        assert_eq!(
+            resolve_eaten_at(Some("sometime"), None, reference, &rome),
+            reference
+        );
+    }
+
+    /// "at 11pm", said at 00:20, is LAST night. The wall clock carries no date, so the
+    /// only defensible reading is the most recent occurrence at or before the message.
+    #[test]
+    fn a_stated_wall_clock_after_midnight_reaches_back_to_yesterday() {
+        let rome = test_zone();
+        let sent_after_midnight = "2026-09-04T00:20:00+02:00";
+        let at = resolve_eaten_at(None, Some("23:00"), sent_after_midnight, &rome);
+        assert_eq!(at, "2026-09-03T23:00:00+02:00", "yesterday, not tomorrow");
+        assert_eq!(
+            diet_day_of(&at, &rome).as_deref(),
+            Some("2026-09-03"),
+            "and it files on the evening it was eaten"
+        );
+    }
+
+    /// The stamp is the reference every entry resolves against, so a stamped utterance
+    /// dates the whole turn even when the model said nothing about when.
+    #[test]
+    fn a_stamped_utterance_dates_every_entry_in_the_turn() {
+        let rome = test_zone();
+        let utterance = "(eaten at 2026-09-03T21:40:00+02:00) a bowl of pasta";
+        let reference = eaten_at_stamp(utterance).expect("a stamp");
+        let mut entries = parse_diet_entries(
+            r#"{"entries":[{"kind":"food","name":"pasta","meal":"Dinner","kcal":400}]}"#,
+        )
+        .unwrap()
+        .entries;
+        stamp_entry_clocks(&mut entries, &reference, &rome);
+        match &entries[0] {
+            DietEntry::Food(f) => {
+                assert_eq!(f.eaten_at.as_deref(), Some("2026-09-03T21:40:00+02:00"));
+                assert_eq!(
+                    f.time.as_deref(),
+                    Some("21:40"),
+                    "Time is DERIVED, not stated"
+                );
+            }
+            _ => panic!("expected a food entry"),
+        }
+        assert_eq!(
+            entry_diet_day(&entries[0], &rome, "2026-01-01"),
+            "2026-09-03"
+        );
+    }
+
+    /// The post-midnight case end to end at the row layer: a 00:20 message logs an item
+    /// with no stated time, and the row must carry YESTERDAY's date with a 00:20 clock.
+    #[test]
+    fn a_post_midnight_log_writes_yesterdays_date_with_todays_clock() {
+        let rome = test_zone();
+        let mut entries = parse_diet_entries(
+            r#"{"entries":[{"kind":"food","name":"crackers","meal":"Snack","kcal":90}]}"#,
+        )
+        .unwrap()
+        .entries;
+        stamp_entry_clocks(&mut entries, "2026-09-04T00:20:00+02:00", &rome);
+        let day = entry_diet_day(&entries[0], &rome, "2026-09-04");
+        assert_eq!(
+            day, "2026-09-03",
+            "a 00:20 snack belongs to the evening before"
+        );
+        let (food, _, _) = split_entries(&entries);
+        let row = food_row(&food[0], &day, &tz_label(&rome));
+        let cells: Vec<&str> = row.split(',').collect();
+        assert_eq!(cells[0], "2026-09-03", "Date is the DIET day");
+        assert_eq!(cells[12], "00:20", "Time is the wall clock actually read");
+        assert_eq!(cells[29], "Europe/Rome", "TZ names the zone that was read");
+    }
+
+    /// A single turn can legitimately span two diet days, and the mirror must not merge
+    /// them: "dinner at nine and a snack just now", sent at 00:20, is two meals on two
+    /// days — with two distinct ids, because the id begins with the day.
+    #[test]
+    fn one_turn_can_span_two_diet_days() {
+        let rome = test_zone();
+        let mut entries = parse_diet_entries(
+            r#"{"entries":[
+                 {"kind":"food","name":"pasta","meal":"Dinner","time":"21:00","kcal":600},
+                 {"kind":"food","name":"crackers","meal":"Snack","kcal":90}
+               ]}"#,
+        )
+        .unwrap()
+        .entries;
+        stamp_entry_clocks(&mut entries, "2026-09-04T00:20:00+02:00", &rome);
+        let days: Vec<String> = entries
+            .iter()
+            .map(|e| entry_diet_day(e, &rome, "2026-09-04"))
+            .collect();
+        assert_eq!(days, vec!["2026-09-03", "2026-09-03"]);
+        let (food, _, _) = split_entries(&entries);
+        let ml = build_meal_log_from_food_rows(&food, &rome, "2026-09-04")
+            .unwrap()
+            .unwrap();
+        assert_eq!(ml.meals.len(), 2, "two slots, two mirror meals");
+        assert_eq!(ml.meals[0].id, "2026-09-03-dinner-2100");
+        assert_eq!(ml.meals[1].id, "2026-09-03-snack-0020");
+        assert_eq!(ml.meals[0].consumed_at, "2026-09-03T21:00:00+02:00");
+        assert_eq!(
+            ml.meals[1].consumed_at, "2026-09-04T00:20:00+02:00",
+            "the mirror carries the real INSTANT even though the day is the 3rd"
+        );
+    }
+
+    // ---- `eaten_at` on the wire --------------------------------------------
+
+    #[test]
+    fn the_extract_schema_accepts_and_validates_eaten_at() {
+        let e = parse_diet_entries(
+            r#"{"entries":[{"kind":"food","name":"soup","meal":"Lunch",
+                 "eaten_at":"2026-09-03T13:10:00+01:00","kcal":200}]}"#,
+        )
+        .unwrap();
+        match &e.entries[0] {
+            DietEntry::Food(f) => {
+                assert_eq!(f.eaten_at.as_deref(), Some("2026-09-03T13:10:00+01:00"))
+            }
+            _ => panic!("expected a food entry"),
+        }
+        // Every kind takes it.
+        for json in [
+            r#"{"entries":[{"kind":"exercise","activity":"Run","eaten_at":"2026-09-03T07:00:00+01:00"}]}"#,
+            r#"{"entries":[{"kind":"weight","weight_lbs":180,"eaten_at":"2026-09-03T07:00:00+01:00"}]}"#,
+        ] {
+            assert!(parse_diet_entries(json).is_ok(), "{json}");
+        }
+    }
+
+    /// Tolerant on the way in, strict about what gets through: null, blank and an
+    /// unparseable string all mean "the model could not tell", which is what an omitted
+    /// key means. A strict parser here is a route straight back to the rung-2 rate this
+    /// pipeline already paid once — and it would buy nothing, because the fallback is the
+    /// same either way.
+    #[test]
+    fn an_unusable_eaten_at_is_absent_rather_than_a_rejection() {
+        for raw in ["null", "\"\"", "\"   \"", "\"sometime this morning\""] {
+            let json = format!(
+                r#"{{"entries":[{{"kind":"food","name":"soup","meal":"Lunch","eaten_at":{raw},"kcal":200}}]}}"#
+            );
+            let parsed = parse_diet_entries(&json).unwrap_or_else(|e| panic!("{raw}: {e}"));
+            match &parsed.entries[0] {
+                DietEntry::Food(f) => assert!(f.eaten_at.is_none(), "{raw} → None"),
+                _ => panic!("expected a food entry"),
+            }
+        }
+    }
+
+    /// The verify child cannot judge a field it never sees.
+    #[test]
+    fn the_verify_shape_carries_eaten_at() {
+        let entries = parse_diet_entries(
+            r#"{"entries":[{"kind":"food","name":"soup","meal":"Lunch",
+                 "eaten_at":"2026-09-03T13:10:00+01:00","kcal":200}]}"#,
+        )
+        .unwrap()
+        .entries;
+        let json = entries_to_json(&entries);
+        assert!(json.contains("2026-09-03T13:10:00+01:00"), "{json}");
+        let prompt = build_diet_verify_prompt("soup at 1", &json, "the user", false);
+        assert!(
+            prompt.contains("`eaten_at`"),
+            "the verify contract must name the field"
+        );
+    }
+
+    /// The extract prompt has to give the toolless child a clock, and tell it the stamp
+    /// outranks that clock.
+    #[test]
+    fn the_extract_prompt_carries_now_and_the_stamp_rule() {
+        let p = build_diet_extract_prompt(
+            "(eaten at 2026-09-03T21:40:00+02:00) pasta",
+            "the user",
+            "2026-09-03T21:40:00+02:00",
+        );
+        assert!(p.contains("NOW: 2026-09-03T21:40:00+02:00"), "{p}");
+        assert!(p.contains("AUTHORITATIVE"), "the stamp rule is stated");
+        assert!(p.contains("eaten_at"), "the schema names the field");
+    }
+
+    // ---- Header migration + repair -----------------------------------------
+
+    /// The pre-`TZ` header is not a broken file — it is the file every row before this
+    /// change was written under — so the readers keep working and the WRITER migrates it.
+    #[test]
+    fn the_writer_migrates_a_pre_tz_header_and_leaves_rows_alone() {
+        let old_header = food_log_header()
+            .strip_suffix(",TZ")
+            .expect("the canonical header ends with TZ");
+        let content = format!("{old_header}\n2026-09-01,Snack,Banana,,serving\n");
+        let repaired = repair_log_header(&content, food_log_header()).expect("a migration");
+        assert_eq!(
+            repaired,
+            format!("{}\n2026-09-01,Snack,Banana,,serving\n", food_log_header())
+        );
+        // The row is byte-identical.
+        assert_eq!(
+            repaired.lines().nth(1),
+            content.lines().nth(1),
+            "rows are never touched"
+        );
+        // And the migrated header is now canonical, so a second pass is a no-op.
+        assert!(repair_log_header(&repaired, food_log_header()).is_none());
+    }
+
+    /// A CRLF file is not a defect — RFC 4180 says CRLF — so the terminator is preserved
+    /// and a canonical header under it passes untouched. A STRAY carriage return inside
+    /// the header is a different thing, and it is repaired.
+    #[test]
+    fn crlf_is_preserved_and_a_stray_carriage_return_is_repaired() {
+        let canonical = food_log_header();
+        // A canonical header with a CRLF terminator: nothing to do.
+        let crlf = format!("{canonical}\r\n2026-09-01,Snack,Banana\r\n");
+        assert!(
+            repair_log_header(&crlf, canonical).is_none(),
+            "a CRLF terminator is the file's line ending, not a stray CR"
+        );
+        // A doubled carriage return leaves one INSIDE the header — repaired, terminator
+        // and rows kept exactly as they were.
+        let stray = format!("{canonical}\r\r\n2026-09-01,Snack,Banana\r\n");
+        let fixed = repair_log_header(&stray, canonical).expect("a repair");
+        assert_eq!(
+            fixed, crlf,
+            "the CR terminator survives; the stray one does not"
+        );
+    }
+
+    #[test]
+    fn every_log_declares_a_canonical_header_and_tz_is_last() {
+        for name in ["food-log.csv", "exercise-log.csv", "weight-log.csv"] {
+            let h = canonical_header(name).unwrap_or_else(|| panic!("{name}"));
+            assert!(
+                h.ends_with(",TZ"),
+                "{name}: TZ must be the last column — {h}"
+            );
+        }
+        assert!(canonical_header("daily-targets.csv").is_none(), "not ours");
+    }
+
+    /// The migration happens on the APPEND path, inside the same snapshot as the rows, so
+    /// a later hook failure rolls the header back with them.
+    #[test]
+    fn appending_migrates_the_header_in_place_and_rolls_back_with_the_rows() {
+        let dir = std::env::temp_dir().join(format!("jesse-hdr-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let old_header = food_log_header().strip_suffix(",TZ").unwrap().to_string();
+        let before = format!("{old_header}\n2026-09-01,Snack,Banana\n");
+        std::fs::write(dir.join("food-log.csv"), &before).unwrap();
+
+        let snapshot =
+            append_rows_atomic(&dir, &["2026-09-03,Snack,Crackers".to_string()], &[], &[]).unwrap();
+        let after = std::fs::read_to_string(dir.join("food-log.csv")).unwrap();
+        assert_eq!(
+            after,
+            format!(
+                "{}\n2026-09-01,Snack,Banana\n2026-09-03,Snack,Crackers\n",
+                food_log_header()
+            )
+        );
+        // Rung-4 rollback restores the pre-append file EXACTLY, header included.
+        snapshot.rollback();
+        assert_eq!(
+            std::fs::read_to_string(dir.join("food-log.csv")).unwrap(),
+            before
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_tz_cell_reads_back_as_the_zone_that_wrote_it() {
+        assert_eq!(
+            parse_row_zone("Europe/London").iana_name().as_deref(),
+            Some("Europe/London")
+        );
+        // A fixed-offset zone has no name, so it writes and reads the offset.
+        let fixed = SchedulerZone::hours_east(2);
+        assert_eq!(tz_label(&fixed), "+02:00");
+        assert!(matches!(parse_row_zone("+02:00"), SchedulerZone::Fixed(_)));
+        // A BLANK cell is every row written before the column existed: those rows were
+        // written in the process zone, so that is what it means.
+        assert!(matches!(parse_row_zone(""), SchedulerZone::Host));
+        assert!(matches!(
+            parse_row_zone("Mars/Olympus"),
+            SchedulerZone::Host
+        ));
+    }
+
+    // ---- The node hooks ----------------------------------------------------
+
+    /// A shim `node` on PATH that records its argv and then behaves like the generator's
+    /// write rule: it rewrites `vault/diet-today.js` ONLY when `--day` names the day that
+    /// file already records. That is enough for the bridge side of the contract — the
+    /// generator's own half is pinned by `vault/test/diet-day.test.js`.
+    fn node_shim(dir: &Path) -> PathBuf {
+        let bin = dir.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let node = bin.join("node");
+        std::fs::write(
+            &node,
+            "#!/bin/sh\n\
+             echo \"$@\" >> \"$JESSE_TEST_ARGV\"\n\
+             script=\"$1\"; shift\n\
+             day=\"\"\n\
+             while [ $# -gt 0 ]; do\n\
+             \x20 case \"$1\" in --day) day=\"$2\"; shift 2 ;; *) shift ;; esac\n\
+             done\n\
+             case \"$script\" in *generate-diet-today.js) ;; *) exit 0 ;; esac\n\
+             current=$(sed -n 's/.*date: \"\\([0-9-]*\\)\".*/\\1/p' vault/diet-today.js)\n\
+             [ \"$day\" = \"$current\" ] || exit 0\n\
+             printf 'window.DIET_TODAY = { date: \"%s\", regenerated: true };\\n' \"$day\" \\\n\
+             \x20 > vault/diet-today.js\n",
+        )
+        .unwrap();
+        let mut perms = std::fs::metadata(&node).unwrap().permissions();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o755);
+        std::fs::set_permissions(&node, perms).unwrap();
+        bin
+    }
+
+    /// Synchronous on purpose, driving the async hooks on a local runtime: the `PATH`
+    /// override below is PROCESS-global, so the lock that serialises it has to span the
+    /// whole test — and a std guard must not be held across an `.await` in an async test.
+    #[test]
+    fn a_log_names_its_day_to_the_hooks_and_never_rolls() {
+        let _g = crate::testutil::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let vault = std::env::temp_dir().join(format!("jesse-hooks-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(vault.join("vault")).unwrap();
+        let today = "window.DIET_TODAY = { date: \"2026-09-04\" };\n";
+        std::fs::write(vault.join("vault/diet-today.js"), today).unwrap();
+        let bin = node_shim(&vault);
+        let argv = vault.join("argv.txt");
+
+        let original_path = std::env::var("PATH").unwrap_or_default();
+        let path = format!("{}:{original_path}", bin.display());
+        // SAFETY: the whole suite serialises env mutation on ENV_LOCK, held for the
+        // duration of this test.
+        unsafe {
+            std::env::set_var("PATH", &path);
+            std::env::set_var("JESSE_TEST_ARGV", &argv);
+        }
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        // A LOG of an EARLIER day. The bridge names that day and passes no `--roll-to`.
+        rt.block_on(run_diet_hooks(&vault, "2026-09-03", None))
+            .unwrap();
+
+        let recorded = std::fs::read_to_string(&argv).unwrap();
+        let lines: Vec<&str> = recorded.lines().collect();
+        assert_eq!(lines.len(), 3, "generate, validate, verify: {recorded}");
+        for (line, script) in lines.iter().zip([
+            "vault/generate-diet-today.js",
+            "vault/validate-diet-today.js",
+            "vault/verify-diet-consistency.js",
+        ]) {
+            assert!(line.starts_with(script), "{line}");
+            assert!(
+                line.contains("--day 2026-09-03"),
+                "every script is told the day: {line}"
+            );
+            assert!(
+                !line.contains("--roll-to"),
+                "A LOG NEVER ROLLS THE DAY — only the morning audit does: {line}"
+            );
+        }
+        // And the day file is byte-identical: the log did not roll it, blank it, or
+        // rewrite it. This is the three-nights-running defect, asserted.
+        assert_eq!(
+            std::fs::read_to_string(vault.join("vault/diet-today.js")).unwrap(),
+            today,
+            "an earlier-day log leaves diet-today.js untouched"
+        );
+
+        // The same-day log DOES regenerate it — the ordinary path still works.
+        rt.block_on(run_diet_hooks(&vault, "2026-09-04", None))
+            .unwrap();
+        assert!(std::fs::read_to_string(vault.join("vault/diet-today.js"))
+            .unwrap()
+            .contains("regenerated: true"));
+
+        // SAFETY: still under ENV_LOCK; restore what the process had.
+        unsafe {
+            std::env::set_var("PATH", &original_path);
+            std::env::remove_var("JESSE_TEST_ARGV");
+        }
+        std::fs::remove_dir_all(&vault).ok();
+    }
+
+    /// A turn that spans two diet days must rebuild BOTH caches. Rebuilding only the
+    /// oldest would leave the other stale, which is the same class of bug as rolling the
+    /// wrong one — a day whose rows are on disk but whose cache does not show them.
+    #[test]
+    fn a_two_day_turn_rebuilds_both_days() {
+        let _g = crate::testutil::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let vault = std::env::temp_dir().join(format!("jesse-hooks2-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(vault.join("vault")).unwrap();
+        std::fs::write(
+            vault.join("vault/diet-today.js"),
+            "window.DIET_TODAY = { date: \"2026-09-04\" };\n",
+        )
+        .unwrap();
+        let bin = node_shim(&vault);
+        let argv = vault.join("argv.txt");
+        let original_path = std::env::var("PATH").unwrap_or_default();
+        // SAFETY: the whole suite serialises env mutation on ENV_LOCK, held for the
+        // duration of this test.
+        unsafe {
+            std::env::set_var("PATH", format!("{}:{original_path}", bin.display()));
+            std::env::set_var("JESSE_TEST_ARGV", &argv);
+        }
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(run_diet_hooks_for_days(
+            &vault,
+            &["2026-09-03".to_string(), "2026-09-04".to_string()],
+        ))
+        .unwrap();
+
+        let recorded = std::fs::read_to_string(&argv).unwrap();
+        assert_eq!(
+            recorded.lines().count(),
+            6,
+            "three scripts, twice: {recorded}"
+        );
+        assert_eq!(
+            recorded.matches("--day 2026-09-03").count(),
+            3,
+            "the older day is rebuilt too"
+        );
+        assert_eq!(recorded.matches("--day 2026-09-04").count(), 3);
+        assert!(!recorded.contains("--roll-to"), "still never a roll");
+
+        // SAFETY: still under ENV_LOCK; restore what the process had.
+        unsafe {
+            std::env::set_var("PATH", &original_path);
+            std::env::remove_var("JESSE_TEST_ARGV");
+        }
+        std::fs::remove_dir_all(&vault).ok();
+    }
 
     // ---- Anti-aggregation --------------------------------------------------
 
@@ -3214,6 +4383,7 @@ mod tests {
         // empty, and reading that row back through the shipped CSV reader yields JSON
         // null (unknown) for `na` — never 0.
         let e = FoodEntry {
+            eaten_at: None,
             unknowable_composite: false,
             name: "Banana".into(),
             meal: "Snack".into(),
@@ -3241,7 +4411,11 @@ mod tests {
             vitamin_d_ug: None,
             notes: None,
         };
-        let csv = format!("{}\n{}\n", food_log_header(), food_row(&e, "2026-07-13"));
+        let csv = format!(
+            "{}\n{}\n",
+            food_log_header(),
+            food_row(&e, "2026-07-13", "Europe/Rome")
+        );
         let (meals, _errors) = crate::diet::reconstruct_meals(&csv, "2026-07-13");
         let item = &meals[0]["items"][0];
         assert!(
@@ -3264,6 +4438,7 @@ mod tests {
         // The mirror image: a KNOWN sodium survives the row build and reads back as its
         // number (proving the write column lands where the reader expects it).
         let e = FoodEntry {
+            eaten_at: None,
             unknowable_composite: false,
             name: "Prosciutto".into(),
             meal: "Lunch".into(),
@@ -3291,7 +4466,11 @@ mod tests {
             vitamin_d_ug: None,
             notes: None,
         };
-        let csv = format!("{}\n{}\n", food_log_header(), food_row(&e, "2026-07-13"));
+        let csv = format!(
+            "{}\n{}\n",
+            food_log_header(),
+            food_row(&e, "2026-07-13", "Europe/Rome")
+        );
         let (meals, _errors) = crate::diet::reconstruct_meals(&csv, "2026-07-13");
         let item = &meals[0]["items"][0];
         assert_eq!(item["na"], 900.0);
@@ -3311,6 +4490,7 @@ mod tests {
         // what decides display precision, and a 0.05 flattened to 0 here would be a false
         // zero no display precision downstream could undo.
         let e = FoodEntry {
+            eaten_at: None,
             unknowable_composite: false,
             name: "Greek yogurt (full-fat)".into(),
             meal: "Breakfast".into(),
@@ -3338,7 +4518,7 @@ mod tests {
             vitamin_d_ug: None,
             notes: None,
         };
-        let row = food_row(&e, "2026-08-14");
+        let row = food_row(&e, "2026-08-14", "Europe/Rome");
         assert!(
             row.split(',').any(|c| c == "0.05"),
             "the CSV cell is written verbatim, not rounded: {row}"
@@ -3394,6 +4574,7 @@ mod tests {
         // append; an explicitly-stated time always wins and is left untouched.
         let mut entries = vec![
             DietEntry::Food(FoodEntry {
+                eaten_at: None,
                 unknowable_composite: false,
                 name: "almond".into(),
                 meal: "Snack".into(),
@@ -3422,6 +4603,7 @@ mod tests {
                 notes: None,
             }),
             DietEntry::Food(FoodEntry {
+                eaten_at: None,
                 unknowable_composite: false,
                 name: "toast".into(),
                 meal: "Breakfast".into(),
@@ -3450,15 +4632,20 @@ mod tests {
                 notes: None,
             }),
         ];
-        stamp_missing_food_times(&mut entries, "17:44");
+        stamp_entry_clocks(&mut entries, "2026-07-16T17:44:00+02:00", &test_zone());
         match (&entries[0], &entries[1]) {
             (DietEntry::Food(a), DietEntry::Food(b)) => {
                 assert_eq!(
                     a.time.as_deref(),
                     Some("17:44"),
-                    "unstated time gets received-at"
+                    "unstated time takes the turn's own instant"
                 );
                 assert_eq!(b.time.as_deref(), Some("07:15"), "stated time is preserved");
+                assert_eq!(
+                    b.eaten_at.as_deref(),
+                    Some("2026-07-16T07:15:00+02:00"),
+                    "the stated wall clock becomes a real instant in the effective zone"
+                );
             }
             _ => panic!("expected two food entries"),
         }
@@ -3474,20 +4661,20 @@ mod tests {
         )
         .unwrap()
         .entries;
-        stamp_missing_food_times(&mut entries, "17:44");
+        stamp_entry_clocks(&mut entries, "2026-07-16T17:44:00+02:00", &test_zone());
         let (food, _, _) = split_entries(&entries);
-        // CSV Time column (13th field) is the received-at time.
-        let row = food_row(&food[0], "2026-07-16");
+        // CSV Time column (13th field) is the turn's own wall clock.
+        let row = food_row(&food[0], "2026-07-16", "Europe/Rome");
         assert_eq!(
             row.split(',').nth(12),
             Some("17:44"),
-            "Time cell = received-at: {row}"
+            "Time cell = the turn's instant: {row}"
         );
-        // Mirror consumedAt derives from the same filled time.
-        let mirror = build_meal_log_from_food_rows(&food, "2026-07-16", "+00:00")
+        // Mirror consumedAt is the STORED instant, not a reconstruction.
+        let mirror = build_meal_log_from_food_rows(&food, &test_zone(), "2026-07-16")
             .unwrap()
             .expect("a food row yields a mirror");
-        assert_eq!(mirror.meals[0].consumed_at, "2026-07-16T17:44:00+00:00");
+        assert_eq!(mirror.meals[0].consumed_at, "2026-07-16T17:44:00+02:00");
     }
 
     #[test]
@@ -3500,18 +4687,18 @@ mod tests {
         .entries;
         // No stamping needed, but even if append runs it, the stated time wins.
         let mut e2 = entries.clone();
-        stamp_missing_food_times(&mut e2, "17:44");
+        stamp_entry_clocks(&mut e2, "2026-07-16T17:44:00+02:00", &test_zone());
         let (food, _, _) = split_entries(&e2);
-        let row = food_row(&food[0], "2026-07-16");
+        let row = food_row(&food[0], "2026-07-16", "Europe/Rome");
         assert_eq!(
             row.split(',').nth(12),
             Some("12:30"),
             "stated Time cell preserved: {row}"
         );
-        let mirror = build_meal_log_from_food_rows(&food, "2026-07-16", "+00:00")
+        let mirror = build_meal_log_from_food_rows(&food, &test_zone(), "2026-07-16")
             .unwrap()
             .unwrap();
-        assert_eq!(mirror.meals[0].consumed_at, "2026-07-16T12:30:00+00:00");
+        assert_eq!(mirror.meals[0].consumed_at, "2026-07-16T12:30:00+02:00");
     }
 
     #[test]
@@ -3705,6 +4892,7 @@ mod tests {
 
     fn food(kcal: f64) -> DietEntry {
         DietEntry::Food(FoodEntry {
+            eaten_at: None,
             unknowable_composite: false,
             name: "Banana".into(),
             meal: "Snack".into(),
@@ -3790,6 +4978,7 @@ mod tests {
         // `..f.clone()` spread untouched. A kcal correction must not disturb a known
         // sodium/calcium value (nor invent one on an absent potassium/magnesium).
         let e = DietEntry::Food(FoodEntry {
+            eaten_at: None,
             unknowable_composite: false,
             name: "Crackers".into(),
             meal: "Snack".into(),
@@ -3905,6 +5094,7 @@ mod tests {
     #[test]
     fn food_row_follows_fill_convention_and_quotes() {
         let e = FoodEntry {
+            eaten_at: None,
             unknowable_composite: false,
             name: "Salmon sockeye (Fiorfiore, canned)".into(),
             meal: "Breakfast".into(),
@@ -3932,8 +5122,8 @@ mod tests {
             vitamin_d_ug: None,
             notes: Some("drained, with salt".into()),
         };
-        let row = food_row(&e, "2026-07-13");
-        // RFC-4180: the item's comma forces quoting; the row parses back to 29 fields.
+        let row = food_row(&e, "2026-07-13", "Europe/Rome");
+        // RFC-4180: the item's comma forces quoting; the row parses back to 30 fields.
         let mut rdr = csv::ReaderBuilder::new()
             .has_headers(false)
             .from_reader(row.as_bytes());
@@ -3941,7 +5131,7 @@ mod tests {
         assert_eq!(
             rec.len(),
             food_log_header().split(',').count(),
-            "29 columns"
+            "30 columns"
         );
         assert_eq!(&rec[0], "2026-07-13");
         assert_eq!(&rec[1], "Breakfast");
@@ -3963,7 +5153,7 @@ mod tests {
 
     #[test]
     fn food_row_places_every_risk_nutrient_in_its_own_cell() {
-        // The whole 29-cell row, asserted literally: a nutrient written one column off
+        // The whole 30-cell row, asserted literally: a nutrient written one column off
         // corrupts the log silently, so the placement is pinned rather than counted.
         // Known zeros (mercury in a plant food) render `0`; unknowns render blank.
         let mut e = blank_food("Salmon");
@@ -3985,11 +5175,11 @@ mod tests {
         e.vitamin_d_ug = Some(13.1);
 
         let cells: Vec<&str> = "2026-08-13,Snack,Salmon,1 medium (~118g),serving,,,105,1.3,\
-0.4,27,,10:40,Snack,0,340,0.5,0,420,15,1400,29,63,0,0,170,2,,13.1"
+0.4,27,,10:40,Snack,0,340,0.5,0,420,15,1400,29,63,0,0,170,2,,13.1,Europe/Rome"
             .split(',')
             .collect();
         assert_eq!(
-            food_row(&e, "2026-08-13"),
+            food_row(&e, "2026-08-13", "Europe/Rome"),
             cells.join(","),
             "every cell in header order"
         );
@@ -4023,7 +5213,11 @@ mod tests {
         e.added_sugar_g = Some(0.0); // whole fruit: a known fact
         e.selenium_ug = None; // not sourced: unknown
         e.purines_mg = None; // not sourced: unknown
-        let csv = format!("{}\n{}\n", food_log_header(), food_row(&e, "2026-08-13"));
+        let csv = format!(
+            "{}\n{}\n",
+            food_log_header(),
+            food_row(&e, "2026-08-13", "Europe/Rome")
+        );
         let (meals, errors) = crate::diet::reconstruct_meals(&csv, "2026-08-13");
         assert!(errors.is_empty(), "clean row: {errors:?}");
         let item = &meals[0]["items"][0];
@@ -4039,6 +5233,7 @@ mod tests {
     #[test]
     fn food_row_blank_macros_are_empty_cells() {
         let e = FoodEntry {
+            eaten_at: None,
             unknowable_composite: false,
             name: "Water".into(),
             meal: "Snack".into(),
@@ -4066,7 +5261,7 @@ mod tests {
             vitamin_d_ug: None,
             notes: None,
         };
-        let row = food_row(&e, "2026-07-13");
+        let row = food_row(&e, "2026-07-13", "Europe/Rome");
         let mut rdr = csv::ReaderBuilder::new()
             .has_headers(false)
             .from_reader(row.as_bytes());
@@ -4074,7 +5269,7 @@ mod tests {
         assert_eq!(
             rec.len(),
             food_log_header().split(',').count(),
-            "29 columns"
+            "30 columns"
         );
         assert_eq!(&rec[7], "", "absent kcal → empty cell, not 0");
         assert_eq!(&rec[14], "", "absent fiber → empty cell");
@@ -4095,7 +5290,7 @@ mod tests {
         // the row builders target, so the described contract can never drift from
         // what the append path writes. Assert the prompt carries each header verbatim
         // AND that each row builder emits exactly that many columns.
-        let p = build_diet_extract_prompt("hi", "the user");
+        let p = build_diet_extract_prompt("hi", "the user", "2026-07-13T12:30:00+02:00");
         assert!(
             p.contains(food_log_header()),
             "extract prompt must inline the food header"
@@ -4120,6 +5315,7 @@ mod tests {
                 .len()
         };
         let f = FoodEntry {
+            eaten_at: None,
             unknowable_composite: false,
             name: "n".into(),
             meal: "Snack".into(),
@@ -4148,10 +5344,11 @@ mod tests {
             notes: None,
         };
         assert_eq!(
-            count(&food_row(&f, "2026-07-13")),
+            count(&food_row(&f, "2026-07-13", "Europe/Rome")),
             food_log_header().split(',').count()
         );
         let x = ExerciseEntry {
+            eaten_at: None,
             activity: "Run".into(),
             time: Some("06:00".into()),
             description: None,
@@ -4163,10 +5360,11 @@ mod tests {
             notes: None,
         };
         assert_eq!(
-            count(&exercise_row(&x, "2026-07-13")),
+            count(&exercise_row(&x, "2026-07-13", "Europe/Rome")),
             EXERCISE_LOG_HEADER.split(',').count()
         );
         let w = WeightEntry {
+            eaten_at: None,
             weight_lbs: 198.0,
             weight_kg: None,
             body_fat_pct: None,
@@ -4174,7 +5372,7 @@ mod tests {
             notes: None,
         };
         assert_eq!(
-            count(&weight_row(&w, "2026-07-13")),
+            count(&weight_row(&w, "2026-07-13", "Europe/Rome")),
             WEIGHT_LOG_HEADER.split(',').count()
         );
     }
@@ -4185,8 +5383,11 @@ mod tests {
         // child to classify a correction/amendment as `no_loggable_content` (routing it
         // to the hosted path), and the schema's `no_loggable_content` description must
         // say so too — so the child never re-logs a correction as a fresh entry.
-        let p =
-            build_diet_extract_prompt("actually lunch was two bowls, about 700 kcal", "the user");
+        let p = build_diet_extract_prompt(
+            "actually lunch was two bowls, about 700 kcal",
+            "the user",
+            "2026-07-13T12:30:00+02:00",
+        );
         assert!(
             p.contains("CORRECTIONS ARE NOT NEW LOGS"),
             "extract prompt must carry the amendment rule"
@@ -4215,6 +5416,7 @@ mod tests {
 
     fn f(name: &str, meal: &str, time: &str, kcal: f64) -> FoodEntry {
         FoodEntry {
+            eaten_at: None,
             unknowable_composite: false,
             name: name.into(),
             meal: meal.into(),
@@ -4253,7 +5455,7 @@ mod tests {
             f("Banana", "Snack", "10:40", 105.0),
             f("Almonds", "Snack", "10:40", 116.0),
         ];
-        let ml = build_meal_log_from_food_rows(&rows, "2026-07-13", "+02:00")
+        let ml = build_meal_log_from_food_rows(&rows, &test_zone(), "2026-07-13")
             .unwrap()
             .expect("two rows → a mirror");
         assert_eq!(
@@ -4283,7 +5485,7 @@ mod tests {
             f("Rice", "Lunch", "12:30", 200.0),
             f("Apple", "Snack", "15:00", 95.0), // same slot as row 0, different time
         ];
-        let ml = build_meal_log_from_food_rows(&rows, "2026-07-13", "+02:00")
+        let ml = build_meal_log_from_food_rows(&rows, &test_zone(), "2026-07-13")
             .unwrap()
             .expect("three distinct groups → a mirror");
         assert_eq!(ml.meals.len(), 3, "three distinct (slot,time) groups");
@@ -4304,7 +5506,7 @@ mod tests {
         // The exact id string a grouped meal gets MUST equal the hosted format
         // `<date>-<slot lowercased>-<HHMM>` (the example the contract documents).
         let rows = vec![f("Sandwich", "Lunch", "12:30", 450.0)];
-        let ml = build_meal_log_from_food_rows(&rows, "2026-07-04", "+02:00")
+        let ml = build_meal_log_from_food_rows(&rows, &test_zone(), "2026-07-04")
             .unwrap()
             .unwrap();
         assert_eq!(ml.meals[0].id, "2026-07-04-lunch-1230");
@@ -4316,6 +5518,7 @@ mod tests {
         // known value alone (unknown contributes nothing); a group where NO row carries
         // the micro serializes no key at all — same shape for fiber and every micro.
         let with = |ca: Option<f64>, fib: Option<f64>, na: Option<f64>| FoodEntry {
+            eaten_at: None,
             unknowable_composite: false,
             name: "x".into(),
             meal: "Lunch".into(),
@@ -4348,7 +5551,7 @@ mod tests {
             with(Some(100.0), Some(4.0), Some(300.0)),
             with(None, None, None),
         ];
-        let ml = build_meal_log_from_food_rows(&rows, "2026-07-13", "+02:00")
+        let ml = build_meal_log_from_food_rows(&rows, &test_zone(), "2026-07-13")
             .unwrap()
             .unwrap();
         assert_eq!(ml.meals.len(), 1, "same slot+time → one meal");
@@ -4379,6 +5582,7 @@ mod tests {
     #[test]
     fn mirror_omits_unknown_macros_never_null_pads() {
         let e = FoodEntry {
+            eaten_at: None,
             unknowable_composite: false,
             name: "Toast".into(),
             meal: "Breakfast".into(),
@@ -4406,7 +5610,7 @@ mod tests {
             vitamin_d_ug: None,
             notes: None,
         };
-        let ml = build_meal_log_from_food_rows(&[e], "2026-07-13", "+02:00")
+        let ml = build_meal_log_from_food_rows(&[e], &test_zone(), "2026-07-13")
             .unwrap()
             .unwrap();
         let m = &ml.meals[0];
@@ -4423,6 +5627,7 @@ mod tests {
         // magnesium) produce NO wire field — never a 0. Omega-3 is NOT a Meal field at
         // all (no HealthKit type), so it never reaches the wire even when the row has it.
         let e = FoodEntry {
+            eaten_at: None,
             unknowable_composite: false,
             name: "Prosciutto".into(),
             meal: "Lunch".into(),
@@ -4450,7 +5655,7 @@ mod tests {
             vitamin_d_ug: None,
             notes: None,
         };
-        let ml = build_meal_log_from_food_rows(&[e], "2026-07-13", "+02:00")
+        let ml = build_meal_log_from_food_rows(&[e], &test_zone(), "2026-07-13")
             .unwrap()
             .unwrap();
         let m = &ml.meals[0];
@@ -4517,7 +5722,7 @@ mod tests {
         b.selenium_ug = Some(11.0);
         b.vitamin_d_ug = None; // unknown → contributes nothing to the sum
 
-        let ml = build_meal_log_from_food_rows(&[a, b], "2026-08-13", "+02:00")
+        let ml = build_meal_log_from_food_rows(&[a, b], &test_zone(), "2026-08-13")
             .unwrap()
             .unwrap();
         assert_eq!(ml.meals.len(), 1, "same slot + time → one mirror meal");
@@ -4546,9 +5751,10 @@ mod tests {
         }
 
         // A meal whose rows know NONE of the three omits all three keys — never a 0.
-        let bare = build_meal_log_from_food_rows(&[blank_food("Water")], "2026-08-13", "+02:00")
-            .unwrap()
-            .unwrap();
+        let bare =
+            build_meal_log_from_food_rows(&[blank_food("Water")], &test_zone(), "2026-08-13")
+                .unwrap()
+                .unwrap();
         let m = &bare.meals[0];
         assert!(m.cholesterol_mg.is_none() && m.selenium_ug.is_none() && m.vitamin_d_ug.is_none());
         let v = directives_to_value(&Some(Directives {
@@ -4565,9 +5771,11 @@ mod tests {
 
     #[test]
     fn mirror_none_when_no_food_rows() {
-        assert!(build_meal_log_from_food_rows(&[], "2026-07-13", "+02:00")
-            .unwrap()
-            .is_none());
+        assert!(
+            build_meal_log_from_food_rows(&[], &test_zone(), "2026-07-13")
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
@@ -4578,7 +5786,7 @@ mod tests {
             .map(|i| f(&format!("Item{i}"), "Snack", &format!("10:{i:02}"), 100.0))
             .collect();
         assert!(
-            build_meal_log_from_food_rows(&rows, "2026-07-13", "+02:00").is_err(),
+            build_meal_log_from_food_rows(&rows, &test_zone(), "2026-07-13").is_err(),
             "more groups than the cap → Err (rung 5)"
         );
         // At the cap exactly (MAX_MEALS distinct groups) it still builds.
@@ -4586,7 +5794,7 @@ mod tests {
             .map(|i| f(&format!("Item{i}"), "Snack", &format!("10:{i:02}"), 100.0))
             .collect();
         assert_eq!(
-            build_meal_log_from_food_rows(&ok, "2026-07-13", "+02:00")
+            build_meal_log_from_food_rows(&ok, &test_zone(), "2026-07-13")
                 .unwrap()
                 .unwrap()
                 .meals
@@ -4604,7 +5812,7 @@ mod tests {
         let rows: Vec<FoodEntry> = (0..MAX_MEALS + 5)
             .map(|i| f(&format!("Item{i}"), "Dinner", "19:00", 50.0))
             .collect();
-        let ml = build_meal_log_from_food_rows(&rows, "2026-07-13", "+02:00")
+        let ml = build_meal_log_from_food_rows(&rows, &test_zone(), "2026-07-13")
             .unwrap()
             .expect("one group → one meal, well under the cap");
         assert_eq!(ml.meals.len(), 1);
@@ -4859,6 +6067,7 @@ mod tests {
     /// completion tests.
     fn blank_food(name: &str) -> FoodEntry {
         FoodEntry {
+            eaten_at: None,
             name: name.into(),
             meal: "Snack".into(),
             time: Some("10:40".into()),
@@ -4910,7 +6119,7 @@ mod tests {
     }
 
     #[test]
-    fn header_is_the_29_canonical_columns_in_table_order() {
+    fn header_is_the_30_canonical_columns_in_table_order() {
         // The canonical contract, spelled out ONCE here so a reordering or rename in
         // the table is caught by a failing test rather than by a corrupted log.
         assert_eq!(
@@ -4918,17 +6127,17 @@ mod tests {
             "Date,Meal,Item,Amount,Unit,Cal_per_100g,Grams,Calories,Protein_g,Fat_g,\
 Carbs_g,Notes,Time,Meal_Type,Fiber_g,Sodium_mg,SatFat_g,Sugar_g,Potassium_mg,\
 Calcium_mg,Omega3_mg,Magnesium_mg,Cholesterol_mg,TransFat_g,AddedSugar_g,Purines_mg,\
-Mercury_ug,Selenium_ug,VitaminD_ug"
+Mercury_ug,Selenium_ug,VitaminD_ug,TZ"
         );
-        assert_eq!(food_log_header().split(',').count(), 29, "29 columns");
+        assert_eq!(food_log_header().split(',').count(), 30, "30 columns");
         // The header and the row builder MUST agree on the count, or every appended row
         // is silently off by a column.
         assert_eq!(
-            food_row(&blank_food("Banana"), "2026-08-13")
+            food_row(&blank_food("Banana"), "2026-08-13", "Europe/Rome")
                 .split(',')
                 .count(),
             food_log_header().split(',').count(),
-            "row builder and header agree at 29 cells"
+            "row builder and header agree at 30 cells"
         );
     }
 
@@ -4982,7 +6191,7 @@ Mercury_ug,Selenium_ug,VitaminD_ug"
 
     #[test]
     fn generated_prompt_names_every_expected_nutrient_column() {
-        let p = build_diet_extract_prompt("ate a banana", "the user");
+        let p = build_diet_extract_prompt("ate a banana", "the user", "2026-07-13T12:30:00+02:00");
         for c in NUTRIENT_COLUMNS.iter().filter(|c| c.expected()) {
             assert!(
                 p.contains(c.key),
@@ -4998,7 +6207,7 @@ Mercury_ug,Selenium_ug,VitaminD_ug"
     }
 
     #[test]
-    fn food_row_emits_29_cells_with_nutrients_in_table_order() {
+    fn food_row_emits_30_cells_with_nutrients_in_table_order_then_tz() {
         // Give each nutrient a DISTINCT value, then assert cell N+14 is the table's
         // N-th nutrient — the row builder's order is the table's order, not a
         // hand-written sequence.
@@ -5006,12 +6215,12 @@ Mercury_ug,Selenium_ug,VitaminD_ug"
         for (i, c) in NUTRIENT_COLUMNS.iter().enumerate() {
             c.set(&mut e, Some((i + 1) as f64));
         }
-        let row = food_row(&e, "2026-07-25");
+        let row = food_row(&e, "2026-07-25", "Europe/Rome");
         let mut rdr = csv::ReaderBuilder::new()
             .has_headers(false)
             .from_reader(row.as_bytes());
         let rec = rdr.records().next().unwrap().unwrap();
-        assert_eq!(rec.len(), 29, "29 cells");
+        assert_eq!(rec.len(), 30, "30 cells");
         for (i, c) in NUTRIENT_COLUMNS.iter().enumerate() {
             assert_eq!(
                 &rec[14 + i],
@@ -5052,11 +6261,11 @@ Mercury_ug,Selenium_ug,VitaminD_ug"
         let header = build_food_log_header(&cols);
         assert_eq!(
             header.split(',').count(),
-            30,
-            "one more nutrient extends the 29-column header"
+            31,
+            "one more nutrient extends the 30-column header, and TZ stays last"
         );
         assert!(
-            header.ends_with(",Iodine_ug"),
+            header.ends_with(",Iodine_ug,TZ"),
             "appended in table order: {header}"
         );
 
@@ -5084,7 +6293,7 @@ Mercury_ug,Selenium_ug,VitaminD_ug"
         );
 
         // And the production table is untouched by the test's local copy.
-        assert_eq!(food_log_header().split(',').count(), 29);
+        assert_eq!(food_log_header().split(',').count(), 30);
     }
 
     // ---- Phase 2: the extract prompt now INSTRUCTS filling, not omission -----
@@ -5094,7 +6303,11 @@ Mercury_ug,Selenium_ug,VitaminD_ug"
         // The risk columns are only as good as the guidance the child gets: the
         // estimate-or-omit rule for the class, and — for each — where the value comes
         // from and when a `0` is a KNOWN fact rather than a placeholder for unknown.
-        let p = build_diet_extract_prompt("ate a tin of sardines", "the user");
+        let p = build_diet_extract_prompt(
+            "ate a tin of sardines",
+            "the user",
+            "2026-07-13T12:30:00+02:00",
+        );
         for fragment in [
             // The class rule.
             "ESTIMATE THESE, or omit them",
@@ -5149,7 +6362,7 @@ Mercury_ug,Selenium_ug,VitaminD_ug"
 
     #[test]
     fn extract_prompt_states_every_nutrient_branch() {
-        let p = build_diet_extract_prompt("ate a banana", "the user");
+        let p = build_diet_extract_prompt("ate a banana", "the user", "2026-07-13T12:30:00+02:00");
         for fragment in [
             // Packaged food with a panel.
             "PACKAGED FOOD WITH A NUTRITION PANEL IN THE MESSAGE",
@@ -5191,7 +6404,7 @@ Mercury_ug,Selenium_ug,VitaminD_ug"
         // own estimate-or-omit rule in their own words ("ESTIMATE THESE, or omit them"),
         // which is correct for nutrients no label prints — it must not be reworded back
         // into the phrases below.
-        let p = build_diet_extract_prompt("ate a banana", "the user");
+        let p = build_diet_extract_prompt("ate a banana", "the user", "2026-07-13T12:30:00+02:00");
         for gone in [
             "usually absent",
             "usually omitted",
@@ -5363,7 +6576,7 @@ Mercury_ug,Selenium_ug,VitaminD_ug"
             "and it is REPORTED as missing"
         );
         // The blank reaches the CSV as an empty cell, never a 0.
-        let row = food_row(&e, "2026-07-25");
+        let row = food_row(&e, "2026-07-25", "Europe/Rome");
         let mut rdr = csv::ReaderBuilder::new()
             .has_headers(false)
             .from_reader(row.as_bytes());
@@ -5640,13 +6853,13 @@ Mercury_ug,Selenium_ug,VitaminD_ug"
             "one line: {notes:?}"
         );
         assert_eq!(notes, "USDA SR Legacy 09040 banana raw, scaled to 118 g");
-        // The comma still forces RFC-4180 quoting, and the row keeps 29 fields.
-        let row = food_row(&e, "2026-07-25");
+        // The comma still forces RFC-4180 quoting, and the row keeps 30 fields.
+        let row = food_row(&e, "2026-07-25", "Europe/Rome");
         let mut rdr = csv::ReaderBuilder::new()
             .has_headers(false)
             .from_reader(row.as_bytes());
         let rec = rdr.records().next().unwrap().unwrap();
-        assert_eq!(rec.len(), 29);
+        assert_eq!(rec.len(), 30);
         assert_eq!(&rec[11], &notes, "Notes cell round-trips intact");
     }
 
@@ -5661,7 +6874,11 @@ Mercury_ug,Selenium_ug,VitaminD_ug"
         c.values.remove("calcium_mg");
         complete_food_micros(&mut e, &c);
 
-        let csv = format!("{}\n{}\n", food_log_header(), food_row(&e, "2026-07-25"));
+        let csv = format!(
+            "{}\n{}\n",
+            food_log_header(),
+            food_row(&e, "2026-07-25", "Europe/Rome")
+        );
         // Read path (GET /jesse/diet): declined → null, filled → the number, never 0.
         let (meals, errs) = crate::diet::reconstruct_meals(&csv, "2026-07-25");
         assert!(errs.is_empty(), "{errs:?}");
@@ -5672,7 +6889,7 @@ Mercury_ug,Selenium_ug,VitaminD_ug"
         assert!(item["o3"].is_null(), "marine-only, never completed → null");
 
         // Derived mirror: the declined nutrients are OMITTED from the wire.
-        let log = build_meal_log_from_food_rows(&[e], "2026-07-25", "+02:00")
+        let log = build_meal_log_from_food_rows(&[e], &test_zone(), "2026-07-25")
             .unwrap()
             .unwrap();
         let wire = serde_json::to_value(&log.meals[0]).unwrap();

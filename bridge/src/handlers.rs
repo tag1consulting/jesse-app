@@ -95,6 +95,19 @@ pub struct JesseRequest {
     // still take its turn.
     #[serde(default)]
     client_tz: Option<String>,
+    // WHEN THE PHONE SAYS IT SENT THIS TURN — RFC3339 with an offset
+    // (`2026-09-03T13:10:00+01:00`). Optional and advisory, exactly like `client_tz`:
+    // absent (every build before the app learns to send it, and every non-app caller)
+    // means the bridge uses its own clock, which is byte-for-byte today's behaviour.
+    //
+    // It matters for one thing, and it is not cosmetic: a diet log's day is derived from
+    // when the food was EATEN, and the closest thing to that the bridge can know for an
+    // unstated time is when the message was sent — not when a queued, retried, or slowly
+    // delivered turn finally reached the pipeline. A `sent_at` that fails to parse is
+    // ignored in favour of now, for the same reason an unparseable `client_tz` is: a
+    // stale client must still be able to log its dinner.
+    #[serde(default)]
+    sent_at: Option<String>,
     // ONE EXTRA LINE for the clock header, set by the scheduler's `[profile].on_return`
     // fire and by nothing else. `#[serde(skip)]` so it is NOT part of the wire contract:
     // it injects text directly into the prompt lead, and a field a client could set would
@@ -133,6 +146,9 @@ impl JesseRequest {
             // A scheduled turn HAS no client, so there is no `client_tz` to take: it
             // derives its dates from the profile, which is exactly the intent.
             client_tz: None,
+            // Nor is there a `sent_at`: a scheduled fire IS its own instant, so the
+            // bridge's clock is the honest answer rather than a second-hand claim.
+            sent_at: None,
             // Set afterwards, and only by the `[profile].on_return` fire — see
             // `JesseRequest::set_return_line`.
             return_line: None,
@@ -693,6 +709,15 @@ pub async fn start_turn(
         }
     }
     let zone = effective_tz(req.client_tz.as_deref(), &st.profile, now_ms);
+    // THE TURN'S INSTANT, carried into the diet pipeline with the zone above. The phone's
+    // own `sent_at` when it sent one that parses, else now in the effective zone.
+    let turn_sent_at = req
+        .sent_at
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| chrono::DateTime::parse_from_rfc3339(s).is_ok())
+        .map(str::to_string)
+        .unwrap_or_else(|| now_rfc3339_in(&zone));
     let clock = clock_header(
         &zone,
         st.profile.current(now_ms).as_ref(),
@@ -1264,7 +1289,7 @@ pub async fn start_turn(
 
         let (mut outcome, badge_source) = if try_diet {
             // Local diet pipeline: extract → verify → append → derive mirror.
-            match run_diet_pipeline(&cfg, &st.health, &raw_text).await {
+            match run_diet_pipeline(&cfg, &st.health, &raw_text, &zone, &turn_sent_at).await {
                 DietPipelineOutcome::Logged {
                     dashboard,
                     directives,
@@ -1293,6 +1318,7 @@ pub async fn start_turn(
                     entries,
                     date,
                     offset,
+                    tz,
                 } => {
                     let cls = classify_hosted_failure(&err);
                     // Emergency: hosted verify unreachable → the BRIDGE queues the
@@ -1304,6 +1330,7 @@ pub async fn start_turn(
                             queued_ts: rfc3339_utc(SystemTime::now()),
                             date,
                             offset,
+                            tz: Some(tz),
                             utterance,
                             entries,
                         };
