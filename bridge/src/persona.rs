@@ -241,6 +241,11 @@ struct LocalConfig {
     /// registry down with it.
     #[serde(default)]
     schedule: Vec<ScheduleToml>,
+    /// The optional top-level `[profile]` table — today just `on_return`. A table rather
+    /// than a key on an entry because it is a statement about the schedule as a whole; see
+    /// [`crate::schedule::ProfileToml`].
+    #[serde(default)]
+    profile: Option<ProfileToml>,
 }
 
 /// Resolve the local overlay file, first existing wins:
@@ -325,6 +330,13 @@ pub fn load_schedule(home: &str) -> Vec<ScheduleToml> {
         .unwrap_or_default()
 }
 
+/// Read the optional top-level `[profile]` table from the same overlay file (same search
+/// order, same soft-fail). Absent → `None` → no return chain, which is every deploy that
+/// has not asked for one.
+pub fn load_profile_table(home: &str) -> Option<ProfileToml> {
+    load_local_config(home).and_then(|c| c.profile)
+}
+
 /// The overlay file the bridge actually loaded, or `None` when there is none.
 ///
 /// Public so the scheduler can WATCH the same file the config was read from — the watch and
@@ -334,18 +346,22 @@ pub fn loaded_config_path(home: &str) -> Option<PathBuf> {
     local_config_path(home)
 }
 
-/// Read the `[[schedule]]` array from ONE NAMED FILE, reporting a parse failure instead of
-/// swallowing it.
+/// Read the `[[schedule]]` array AND the `[profile]` table from ONE NAMED FILE, reporting a
+/// parse failure instead of swallowing it.
+///
+/// Both together, in one read, because a reload swaps both: `on_return` names a schedule
+/// entry, so reading the two from separate parses of a file that may have changed between
+/// them is how they would come to disagree about which entries exist.
 ///
 /// The boot loader ([`load_schedule`]) soft-fails to an empty list on purpose: a malformed
 /// overlay must not stop the service from starting. A RELOAD needs the opposite — an empty
 /// list and an unparseable file look identical from the outside, and swapping "no jobs" in
 /// for "I could not read your file" would silently retire the whole schedule on a typo.
-pub fn load_schedule_from(path: &Path) -> Result<Vec<ScheduleToml>, String> {
+pub fn load_schedule_from(path: &Path) -> Result<(Vec<ScheduleToml>, Option<ProfileToml>), String> {
     let text = std::fs::read_to_string(path)
         .map_err(|e| format!("could not read {}: {e}", path.display()))?;
     toml::from_str::<LocalConfig>(&text)
-        .map(|c| c.schedule)
+        .map(|c| (c.schedule, c.profile))
         .map_err(|e| format!("could not parse {}: {e}", path.display()))
 }
 

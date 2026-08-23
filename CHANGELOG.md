@@ -165,6 +165,124 @@ CI both run it). See the "Versioning" section of `bridge/README.md`.
   toolbar Ask is still there on every page, and the fix would be onboarding copy rather
   than an icon on every card.
 
+## [bridge 0.91.0] - 2026-08-23
+
+### Fixed
+
+- **Every `app-completed` stamp written between local midnight and the UTC offset
+  carried the wrong day.** The app sends the Today write bodies' `at` in UTC
+  (`TodayProviding.isoInstant` pins `secondsFromGMT: 0`) and `stamp_from_iso` took the
+  first sixteen characters of that string verbatim — so a box ticked at 00:30 in Rome was
+  spliced into `Today.md` as `22:30` **on the previous day**, every night, for every tap
+  in that window. The stamp is not decoration: its grammar is a contract with the day
+  file's own parser and with the morning routine, which reads those lines when it decides
+  what to carry over, so a wrong date there silently mis-files work. An `at` that carries
+  a zone (a `Z` or a `±HH:MM` offset) now names an *instant* and is rendered in the
+  effective zone; an `at` with no zone designator is a wall clock the client already
+  rendered and is still taken verbatim, because re-interpreting it would invent a claim
+  the sender never made.
+
+  The pre-existing test asserted the old behaviour — `…09:30:15+01:00` → `09:30` — which
+  is the bug written down. It now pins the corrected conversion in three zones, and the
+  end-to-end tests name the zone they expect rather than depending on the zone the suite
+  happens to run in.
+
+### Added
+
+- **The away profile (`GET`/`POST /jesse/profile`).** One piece of bridge state the phone
+  can set and that **expires by itself**, for the fortnight its owner is in another
+  country with only a phone. It does three mechanical things and knows nothing else about
+  what "away" means: it moves the zone every date is derived in, it takes the
+  `profiles`-excluded jobs out of the schedule, and it adds one line to every prompt.
+  Everything else — what a working day looks like from a hotel, which routines to soften —
+  is vault-side prompt text branching on that line; teaching the bridge the *semantics* of
+  being away would mean redeploying a Rust service to change one's mind about a routine.
+
+  `away` requires a valid IANA zone and a **future** `until`. Neither is a formality: a
+  zone the tz database does not know would leave the bridge reporting "away" while quietly
+  deriving host-zone dates, which is the one wrong answer that looks right; and the failure
+  mode of a manual switch is forgetting to switch back, so an unbounded profile is a bridge
+  left in the wrong zone until somebody notices — the same reasoning that made the
+  schedule's `enable` override expire. State is `<state-dir>/profile.json`, 0600, atomic
+  writes, and holds a zone name, two instants and a short label — never a secret.
+  `GET /health` and `GET /jesse/schedule` both carry the active profile, so the phone and
+  the sentinel never need a second call.
+
+- **`PROFILE:` on every prompt's clock line** — `PROFILE: home`, or
+  `PROFILE: away (Europe/London) until 2026-09-07, note: Scotland`. Byte-stable, because
+  the vault's prompts match on it; the wording is a contract with a file in another
+  repository rather than a formatting choice, and a test asserts the exact bytes. Dates
+  render in the **effective** zone, `until` included — telling someone in the UK their trip
+  ends on the 8th because the host is in Italy is precisely the off-by-one being removed.
+  The header is composed as one string before `build_prompt_at` sees it, because
+  `splice_catchup` locates the safety floor by recomputing that header's length: adding
+  lines inside the builder would have landed the hosted catch-up block mid-prompt.
+
+- **`client_tz`** on `POST /jesse`, the Today write bodies, and as a query parameter on
+  `GET /jesse/today` and `GET /jesse/diet`. Precedence is client → profile → process zone;
+  the client outranks the profile because it is the more specific claim, and a scheduled
+  turn has no client so it uses the profile. A value the tz database does not know is
+  logged and ignored rather than refused — a stale app build must still be able to tick a
+  checkbox — and omitting it reproduces the previous behaviour byte-for-byte.
+
+- **`profiles = ["home", "away"]` on a `[[schedule]]` entry**, defaulting to both, so every
+  entry written before the key existed is untouched by it. Heads and links alike, exactly
+  like `days`; an unknown name or an empty list disables that entry by name. A member the
+  active profile excludes skips with reason `not scheduled under this profile`, recorded
+  and never pushed — and, **unlike a disabled member, it does not break an
+  `after_on = "success"` chain**. That difference is the whole reason it is a separate
+  word: disabling a job is a statement about *that job*, and a chain stopping there is its
+  documented meaning, while excluding it by profile says the member does not apply this
+  fortnight — so it is simply absent and everything behind it consults the job it would
+  have followed. Marking one report home-only must not silently retire the four jobs after
+  it. A *head* the profile excludes still claims and records its occurrence: leaving a
+  fortnight of them unclaimed would have them all come due the moment the profile ends and
+  be skipped in a burst as "missed by 13 days".
+
+- **`[profile].on_return = "<job id>"`** — the chain that runs **once** when an away period
+  ends, on the same path `POST /jesse/schedule/{id}/fire` uses, with
+  `RETURN: first day back after N days away` injected under the `PROFILE:` line. It fires
+  whichever way the period ended — a `home` post, an expiry a tick noticed, or one that
+  went by while the host was asleep — because the trigger is a "return owed" flag in the
+  store rather than an event, and expiry is applied on read. The flag is on disk beside the
+  period, so a restart does not replay it. An `on_return` naming nothing valid is reported
+  under `invalid` rather than refusing the boot.
+
+- **`GET /jesse/schedule`** gained the top-level `profile` and `on_return`, and `profiles`
+  on every row; the boot table gained a `profiles` column and is reprinted whenever the
+  zone moves, because every `next fire` in the previous table is wrong once it does.
+
+### Changed
+
+- **The scheduler's zone is read from the profile store on every tick, and a change
+  re-anchors every head.** This is the whole correctness of switching zones. Nothing caches
+  a next fire — `due_occurrence` resolves one from `last_due_ms` on every pass — so moving
+  the zone would otherwise reinterpret an anchor that is an *absolute instant* as though it
+  named the same wall clock in the new zone, and it does not: for a head at `06:05` moving
+  Rome → London, the anchor is 04:05Z and the next fire strictly after it in London is
+  05:05Z, which is **today's occurrence, a second time**. Moving the other way at 04:30Z,
+  today's Rome occurrence at 04:05Z is already past and must run *late* rather than be
+  skipped. Both come out right from one rule: an anchor names an occurrence, and an
+  occurrence is a local wall clock on a local date — so each anchor (and any pending
+  `retry_due_ms`, which is an occurrence too) is re-read as a wall clock in the old zone
+  and re-resolved in the new one. `POST /jesse/profile` re-anchors synchronously before it
+  returns, so the caller's next `GET /jesse/schedule` already shows the new zone's times.
+
+- **`SchedulerZone::Named` is a production arm and `chrono-tz` is a real dependency.** Both
+  were deliberately test-only, on the reasoning that the serving binary has no business
+  carrying a tz database when the host's zone is what production wants. The away profile is
+  exactly the case that stopped being true: it names its zone as an IANA string, the phone
+  may name one per request, and a fortnight-long trip crosses a DST transition in one zone
+  and not the other — which a bare UTC offset cannot express. `SchedulerZone::Host` remains
+  the default, so a bridge with no profile and no `client_tz` resolves every date exactly
+  as it did.
+
+- **`GET /jesse/diet`'s default day falls back to the effective zone** when
+  `diet-today.js` carries no `date`. The vault file remains the authority when it has one —
+  it is written by the vault-side jobs and is the truth about which day the page is for —
+  but at 23:30 in London it is already tomorrow in Rome, and paging the owner to a day that
+  has not started where they are standing is the bug the fallback closes.
+
 ## [bridge 0.90.1] - 2026-08-23
 
 ### Fixed

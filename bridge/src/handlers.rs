@@ -86,9 +86,31 @@ pub struct JesseRequest {
     // older app build or non-app caller that omits the field.
     #[serde(default)]
     model: Option<String>,
+    // THE ZONE THIS DEVICE IS STANDING IN, IANA (`"Europe/London"`). Optional and
+    // advisory: when present and resolvable it outranks the away profile for THIS request
+    // only (see `effective_tz`), because the phone's own zone is a more specific claim than
+    // a fortnight-long declaration. Unparseable or absent falls through to the profile and
+    // then to the process zone — an old app build that never sends it gets byte-for-byte
+    // today's behaviour, and a stale one sending a name this tz database does not know can
+    // still take its turn.
+    #[serde(default)]
+    client_tz: Option<String>,
+    // ONE EXTRA LINE for the clock header, set by the scheduler's `[profile].on_return`
+    // fire and by nothing else. `#[serde(skip)]` so it is NOT part of the wire contract:
+    // it injects text directly into the prompt lead, and a field a client could set would
+    // be a hole in the framing the floor and the health block are so careful about.
+    #[serde(skip)]
+    return_line: Option<String>,
 }
 
 impl JesseRequest {
+    /// Attach the scheduler's `RETURN:` line to this request. Crate-internal by
+    /// construction — the field it sets is `serde(skip)`, so there is no route from the
+    /// wire to it.
+    pub fn set_return_line(&mut self, line: Option<String>) {
+        self.return_line = line;
+    }
+
     /// The request a `[[schedule]]` job submits: a mode, the prompt text, and nothing
     /// else. Every other field takes its absent-field default, which is what makes a
     /// scheduled turn identical to the simplest possible client turn.
@@ -108,6 +130,12 @@ impl JesseRequest {
             mode: mode.to_string(),
             text,
             model,
+            // A scheduled turn HAS no client, so there is no `client_tz` to take: it
+            // derives its dates from the profile, which is exactly the intent.
+            client_tz: None,
+            // Set afterwards, and only by the `[profile].on_return` fire — see
+            // `JesseRequest::set_return_line`.
+            return_line: None,
             session_id: None,
             conversation_id: None,
             voice: false,
@@ -422,6 +450,19 @@ pub async fn health(State(st): State<AppState>, headers: HeaderMap) -> Json<Valu
         // common case; present = the record describes an agent binary that is not the one
         // installed, and the battery should be re-run. Auth-gated with the rest of the
         // operator detail: it names local binary versions.
+        // THE ACTIVE PROFILE, so the phone and the sentinel see it without a second call.
+        // Always present (`home` when nothing is in force) rather than omitted, because an
+        // absent field and "I am home" are the same shape to a reader and only one of them
+        // means the bridge understood the question.
+        let now_ms = system_time_to_ms(SystemTime::now());
+        let profile = st.profile.current(now_ms);
+        body["profile"] = json!({
+            "name": profile.as_ref().map(|_| "away").unwrap_or("home"),
+            "tz": effective_tz(None, &st.profile, now_ms)
+                .iana_name()
+                .unwrap_or_else(|| "UTC".to_string()),
+            "until_ms": profile.as_ref().and_then(|p| p.until_ms),
+        });
         if let Some(g) = SETTINGS_DRIFT.get().filter(|g| !g.is_empty()) {
             body["settings_grants_unrecorded"] = json!(g);
         }
@@ -637,7 +678,26 @@ pub async fn start_turn(
     // clock can recompute the floor boundary when the hosted catch-up block is spliced
     // in under the permit (context carry, Piece 3). `build_prompt` reads the clock
     // itself; `build_prompt_at` takes it explicitly, so we capture it.
-    let clock = clock_line();
+    // THE CLOCK HEADER, in the EFFECTIVE zone, with the profile line under it. Computed
+    // ONCE here and threaded, so the same header can recompute the floor boundary when the
+    // hosted catch-up block is spliced in under the permit (context carry, Piece 3).
+    let now_ms = system_time_to_ms(SystemTime::now());
+    if let Some(raw) = req
+        .client_tz
+        .as_deref()
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+    {
+        if parse_iana(raw).is_none() {
+            log_bad_client_tz("POST /jesse", raw);
+        }
+    }
+    let zone = effective_tz(req.client_tz.as_deref(), &st.profile, now_ms);
+    let clock = clock_header(
+        &zone,
+        st.profile.current(now_ms).as_ref(),
+        req.return_line.as_deref(),
+    );
     let prompt = build_prompt_at(
         &clock,
         &mode,
@@ -2313,6 +2373,10 @@ pub fn app(state: AppState) -> Router {
         // active model, and set a model's write permission (Phase 2 wires the effect).
         .route("/jesse/models", get(jesse_models))
         .route("/jesse/model", post(jesse_set_model))
+        // THE AWAY PROFILE: bridge state the phone can set and that expires by itself. It
+        // moves the zone every date is derived in, takes the `profiles`-excluded jobs out of
+        // the schedule, and adds one line to every prompt — and nothing else. See `profile`.
+        .route("/jesse/profile", get(jesse_profile).post(jesse_set_profile))
         // The built-in scheduler's ledger: every configured job, what it is, when it
         // next fires, and what happened the last time it came due — so "did the morning
         // routine run today, and how long did it take" is ONE request.

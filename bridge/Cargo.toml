@@ -1,6 +1,6 @@
 [package]
 name = "jesse-bridge"
-version = "0.90.1"
+version = "0.91.0"
 edition = "2021"
 license = "Apache-2.0"
 
@@ -128,15 +128,21 @@ chrono = { version = "0.4.45", default-features = false, features = ["clock", "s
 # describe today's offset. Already in the lock — `chrono`'s `clock` feature reaches the OS
 # zone through exactly this crate — so naming it directly pulls no new compiled code.
 iana-time-zone = "0.1"
+# chrono-tz: a BUNDLED tz database. A DEV-dependency until 0.91.0, on the reasoning that
+# the serving binary has no business carrying a tz table when the host's zone is what
+# production wants — which stopped being true the moment the bridge had to answer dates for
+# an owner standing in a DIFFERENT zone from the host. The away profile names its zone as
+# an IANA string (`Europe/London`) and the phone may name one per request (`client_tz`);
+# resolving either needs the table, and a bare UTC offset cannot substitute for it because
+# a fortnight-long trip crosses a DST transition in one zone and not the other.
+#
+# `default-features = false` drops the `filter-by-regex`/serde extras; what is used is
+# `str::parse::<Tz>()`, `Tz::name()`, and the `TimeZone` impl the DST-correct resolver in
+# `schedule::resolve_local` already drives generically. It is also still what the tests
+# pin zones with — `next_fire` stays generic over `chrono::TimeZone` so the spring-forward
+# and fall-back cases are asserted against `America/New_York` rather than against whatever
+# zone the machine running `cargo test` happens to be in.
+chrono-tz = { version = "0.10.4", default-features = false }
 
 [dev-dependencies]
-# chrono-tz: a BUNDLED tz database, for the DST tests only — never in the serving binary.
-#
-# `next_fire` is generic over `chrono::TimeZone` precisely so production can pass `Local`
-# while a test passes a named zone with known transitions (`America/New_York`) and asserts
-# the spring-forward / fall-back behavior deterministically. Doing that with `Local` would
-# mean mutating `TZ` in a process-global, which is racy under `cargo test`'s default
-# parallelism; doing it against `/usr/share/zoneinfo` would make the suite depend on the
-# host having a tz database. The bundled table has neither problem.
-chrono-tz = { version = "0.10.4", default-features = false }
 tower = { version = "0.5", features = ["util"] }   # ServiceExt::oneshot

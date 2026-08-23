@@ -104,6 +104,14 @@ pub struct AppState {
     // simply not mirrored (no backlog — the sample is large enough). Always present;
     // inert unless `cfg.shadow_backend` is set. See [`shadow`].
     pub shadow_slot: Arc<Semaphore>,
+    // THE AWAY PROFILE: which profile is in force, the zone it declares, and when it
+    // expires. Persisted to `<state_dir>/profile.json` (in-memory when no state dir, in
+    // which case a restart brings the bridge home). Read by `effective_tz` on every path
+    // that derives a date, by the scheduler on every tick, and by `build_prompt` for the
+    // `PROFILE:` line. Always present; a store with nothing in it IS "home", so an
+    // unconfigured bridge behaves exactly as it did before profiles existed. See
+    // [`crate::profile`].
+    pub profile: Arc<ProfileStore>,
     // THE BUILT-IN SCHEDULER: the validated `[[schedule]]` jobs, their persisted
     // last-run record, the one-scheduled-turn-at-a-time lock, and which chains are in
     // flight. Always present so `GET /jesse/schedule` answers on every deploy (with an
@@ -155,10 +163,13 @@ impl AppState {
                 .collect(),
         });
         let slots = Arc::new(SlotTable::new(&plan, cfg.max_queued));
+        // Built BEFORE the scheduler, which takes its clock's zone from it.
+        let profile = Arc::new(ProfileStore::new(cfg.profile_file()));
         let scheduler = Scheduler::new_with_ledger(
             cfg.schedule.clone(),
             cfg.schedule_file(),
             cfg.schedule_ledger_file(),
+            profile.clone(),
         );
         let hook_helper = resolve_hook_helper();
         let limiter = Arc::new(RateLimiter::new(cfg.rate_per_min));
@@ -193,6 +204,7 @@ impl AppState {
             timings,
             // One shadow child at a time; separate from the production permit.
             shadow_slot: Arc::new(Semaphore::new(1)),
+            profile,
             scheduler,
             artifacts,
         };

@@ -1146,6 +1146,17 @@ impl Config {
             .map(|d| PathBuf::from(d).join("model.json"))
     }
 
+    /// The file the AWAY PROFILE is persisted to (a sibling of `model.json`), or `None`
+    /// when persistence is disabled — then the profile is in-memory only and a restart
+    /// brings the bridge home, which is the safe direction to fail: the wrong zone for one
+    /// restart beats the wrong zone until someone notices. Holds a zone name, two instants
+    /// and a short label; never a secret.
+    pub fn profile_file(&self) -> Option<PathBuf> {
+        self.state_dir
+            .as_deref()
+            .map(|d| PathBuf::from(d).join("profile.json"))
+    }
+
     /// The file the per-session deletion tombstones are persisted to (a sibling of
     /// `flags.json`), or `None` when persistence is disabled (then tombstones are
     /// in-memory only), the same degradation the job / title / device / flag stores
@@ -2471,6 +2482,10 @@ impl Config {
         // the harnesses this config actually names. Nothing else about it changed.
         let model_registry = ModelRegistry::from_env(&home);
         let vault = env_string("JESSE_VAULT").unwrap_or_else(|| format!("{home}/vault"));
+        // The optional `[profile]` table, read from the same overlay file. Collected before
+        // the literal for the same reason the model ids are: the schedule is validated
+        // inside the literal and borrows it.
+        let profile_table = load_profile_table(&home);
         // The ids the `[[schedule]]` `model` key is validated against. Collected before the
         // literal for the same reason the registry itself is: the schedule is built inside
         // it and cannot borrow a field of the struct being built.
@@ -2615,6 +2630,7 @@ impl Config {
                 &ValidationContext {
                     vault: (!vault.is_empty()).then(|| Path::new(&vault)),
                     model_ids: Some(&model_ids),
+                    profile: profile_table.as_ref(),
                 },
             )),
             // The selectable-model registry, MERGED from the built-in ambient opus, the

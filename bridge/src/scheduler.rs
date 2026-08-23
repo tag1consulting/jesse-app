@@ -48,22 +48,26 @@ use chrono::{
 // instant is now carried into every decision, and the ZONE it is read in is this one
 // object's, not `Local`'s, so a test can pin both.
 
-/// The zone the scheduler interprets `"HH:MM"`, `days` and `{date}` in.
+/// The zone a date is derived in — by the scheduler for `"HH:MM"`, `days` and `{date}`,
+/// and (since the away profile) by every other path that has to say what day it is.
 ///
-/// A hand-rolled two-arm `TimeZone` rather than `chrono_tz::Tz`, because `chrono-tz` is a
-/// DEV-dependency here: it bundles a whole tz database, and the serving binary has no
-/// business carrying one when the host's zone is what production actually wants. `Host` is
-/// `chrono::Local` — the OS's zone, which under launchd is whatever `TZ` says
-/// (`Europe/Rome` in this deployment). `Fixed` is what a test injects.
+/// `Host` is `chrono::Local` — the OS's zone, which under launchd is whatever `TZ` says
+/// (`Europe/Rome` in this deployment) — and stays the default, so a bridge with no profile
+/// and no `client_tz` resolves every date exactly as it did before this type had a third
+/// production arm. `Fixed` is what a test injects. `Named` was `#[cfg(test)]` until 0.91.0
+/// on the reasoning that production only ever wants the host's zone; the away profile is
+/// precisely the case that stopped being true, so it is now a production arm and
+/// `chrono-tz` is a real dependency (see `Cargo.toml` for why the bundled table earns its
+/// place).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SchedulerZone {
-    /// The host's zone, read from the OS. Production, always.
+    /// The host's zone, read from the OS. The default, and what every path used before
+    /// profiles existed.
     Host,
     /// A fixed UTC offset — deterministic, and enough to pin a date and a weekday.
     Fixed(FixedOffset),
-    /// A named zone from the bundled tz table. Unit tests only; see the note above for
-    /// why this is not a production arm.
-    #[cfg(test)]
+    /// A named zone from the bundled tz table: an away profile's `tz`, a request's
+    /// `client_tz`, or a test's pinned zone.
     Named(chrono_tz::Tz),
 }
 
@@ -71,6 +75,20 @@ impl SchedulerZone {
     /// A fixed-offset zone from whole hours east of UTC, for fixtures.
     pub fn hours_east(h: i32) -> SchedulerZone {
         SchedulerZone::Fixed(FixedOffset::east_opt(h * 3600).expect("a representable offset"))
+    }
+
+    /// This zone's IANA name, or `None` for a fixed offset (which has none).
+    ///
+    /// `Host` answers through `iana-time-zone` — the same crate `chrono`'s `clock` feature
+    /// already uses to find the host zone — so naming the host costs no extra code. Used
+    /// to render the profile line, to set `TZ` for the clock header, and by
+    /// [`SchedulerClock::tz_name`].
+    pub fn iana_name(&self) -> Option<String> {
+        match self {
+            SchedulerZone::Host => iana_time_zone::get_timezone().ok(),
+            SchedulerZone::Fixed(_) => None,
+            SchedulerZone::Named(t) => Some(t.name().to_string()),
+        }
     }
 }
 
@@ -87,7 +105,6 @@ impl TimeZone for SchedulerZone {
         match self {
             SchedulerZone::Host => Local.offset_from_local_date(local).map(|o| o.fix()),
             SchedulerZone::Fixed(f) => f.offset_from_local_date(local),
-            #[cfg(test)]
             SchedulerZone::Named(t) => t.offset_from_local_date(local).map(|o| o.fix()),
         }
     }
@@ -96,7 +113,6 @@ impl TimeZone for SchedulerZone {
         match self {
             SchedulerZone::Host => Local.offset_from_local_datetime(local).map(|o| o.fix()),
             SchedulerZone::Fixed(f) => f.offset_from_local_datetime(local),
-            #[cfg(test)]
             SchedulerZone::Named(t) => t.offset_from_local_datetime(local).map(|o| o.fix()),
         }
     }
@@ -105,7 +121,6 @@ impl TimeZone for SchedulerZone {
         match self {
             SchedulerZone::Host => Local.offset_from_utc_date(utc).fix(),
             SchedulerZone::Fixed(f) => f.offset_from_utc_date(utc),
-            #[cfg(test)]
             SchedulerZone::Named(t) => t.offset_from_utc_date(utc).fix(),
         }
     }
@@ -114,7 +129,6 @@ impl TimeZone for SchedulerZone {
         match self {
             SchedulerZone::Host => Local.offset_from_utc_datetime(utc).fix(),
             SchedulerZone::Fixed(f) => f.offset_from_utc_datetime(utc),
-            #[cfg(test)]
             SchedulerZone::Named(t) => t.offset_from_utc_datetime(utc).fix(),
         }
     }
@@ -176,14 +190,7 @@ impl SchedulerClock {
     /// else entirely in January. `iana-time-zone` is what `chrono`'s `clock` feature
     /// already uses to find the host zone, so naming it directly adds no compiled code.
     pub fn tz_name(&self) -> String {
-        match &self.zone {
-            SchedulerZone::Host => {
-                iana_time_zone::get_timezone().unwrap_or_else(|_| self.utc_offset())
-            }
-            SchedulerZone::Fixed(_) => self.utc_offset(),
-            #[cfg(test)]
-            SchedulerZone::Named(t) => t.name().to_string(),
-        }
+        self.zone.iana_name().unwrap_or_else(|| self.utc_offset())
     }
 
     /// The zone's CURRENT UTC offset as `"+02:00"` — the fallback when no IANA name is
@@ -283,8 +290,16 @@ pub struct Scheduler {
     /// `Arc` gives. Read it with [`Scheduler::schedule`].
     schedule: Mutex<Arc<Schedule>>,
     pub state: Arc<ScheduleStateStore>,
-    /// The one source of "what time is it, in what zone" — see [`SchedulerClock`].
-    pub clock: SchedulerClock,
+    /// THE ZONE'S SOURCE. Read on every tick and never cached across one, because the whole
+    /// point of an away profile is that it starts and stops without a restart — a zone
+    /// resolved once at construction would mean the phone could set a profile the scheduler
+    /// never sees. It is a `Mutex<Option<Profile>>` read behind an `Arc`, so re-reading it
+    /// per tick costs nothing worth caching for.
+    pub profile: Arc<ProfileStore>,
+    /// The zone THE LAST TICK RAN IN, so a change between two ticks is observable rather
+    /// than merely true. This is what triggers the re-anchor in [`Scheduler::reanchor`];
+    /// `None` before the first tick.
+    last_zone: Mutex<Option<SchedulerZone>>,
     /// The config file the schedule was loaded from and the mtime it had when it was, so
     /// the tick can notice an edit. `None` when no config file was found at boot (nothing
     /// to watch, so nothing reloads).
@@ -323,6 +338,53 @@ fn mtime_ms(path: &Path) -> Option<u64> {
         .and_then(|m| m.modified())
         .ok()
         .map(system_time_to_ms)
+}
+
+/// Re-read `ms` as a LOCAL WALL CLOCK in `from`, and return the instant that same wall
+/// clock names in `to`. See [`Scheduler::observe_profile_change`] for why an anchor moves
+/// this way rather than staying put.
+///
+/// A wall clock that does not exist in the target zone (the hour a spring-forward skips)
+/// keeps the original instant: the anchor's only job is to be strictly before the next
+/// fire, and inventing a time the clock never showed would be worse than being an hour off
+/// once.
+fn shift_wall_clock(ms: u64, from: &SchedulerZone, to: &SchedulerZone) -> u64 {
+    let Some(local) =
+        DateTime::from_timestamp_millis(ms as i64).map(|t| t.with_timezone(from).naive_local())
+    else {
+        return ms;
+    };
+    match to.from_local_datetime(&local) {
+        // Fall back: the same rule `resolve_local` uses — the EARLIER of the two instants,
+        // always, so a candidate is never accepted twice for one wall clock.
+        LocalResult::Single(t) => t.timestamp_millis().max(0) as u64,
+        LocalResult::Ambiguous(earliest, _) => earliest.timestamp_millis().max(0) as u64,
+        LocalResult::None => ms,
+    }
+}
+
+/// A zone for a log line: its IANA name, or its current offset when it has none.
+fn zone_label(zone: &SchedulerZone) -> String {
+    zone.iana_name()
+        .unwrap_or_else(|| SchedulerClock::in_zone(*zone).utc_offset())
+}
+
+/// The `reason` a `profile-change` ledger line carries — the same sentence whether the
+/// change was a phone request, an expiry a tick noticed, or a return.
+pub fn profile_change_reason(profile: Option<&Profile>) -> String {
+    match profile {
+        Some(p) => format!(
+            "away until {} ({})",
+            p.until_ms
+                .map(
+                    |u| SchedulerClock::in_zone(p.zone().unwrap_or(SchedulerZone::Host))
+                        .short_local(u)
+                )
+                .unwrap_or_else(|| "further notice".to_string()),
+            p.tz,
+        ),
+        None => "home".to_string(),
+    }
 }
 
 /// Releases a chain's single-flight claim however the run ends — including a panic.
@@ -411,8 +473,9 @@ impl Scheduler {
         schedule: Arc<Schedule>,
         state_file: Option<PathBuf>,
         ledger_file: Option<PathBuf>,
+        profile: Arc<ProfileStore>,
     ) -> Arc<Self> {
-        let sched = Self::new_with(schedule, state_file, SCHEDULED_SLOT_WAIT);
+        let sched = Self::new_full(schedule, state_file, SCHEDULED_SLOT_WAIT, profile);
         // The store is behind an Arc by the time `new_with` returns, so the ledger is
         // attached by rebuilding that one field rather than mutating through the Arc.
         Arc::new(Scheduler {
@@ -420,7 +483,8 @@ impl Scheduler {
             state: Arc::new(
                 ScheduleStateStore::new(sched.state.file_path()).with_ledger(ledger_file),
             ),
-            clock: sched.clock.clone(),
+            profile: sched.profile.clone(),
+            last_zone: Mutex::new(None),
             reload: Mutex::new(None),
             turn_lock: sched.turn_lock.clone(),
             running: Mutex::new(Vec::new()),
@@ -437,17 +501,54 @@ impl Scheduler {
         state_file: Option<PathBuf>,
         slot_wait: Duration,
     ) -> Arc<Self> {
-        let clock = SchedulerClock::host();
+        Self::new_full(
+            schedule,
+            state_file,
+            slot_wait,
+            Arc::new(ProfileStore::new(None)),
+        )
+    }
+
+    /// [`new_with`](Self::new_with) plus the away-profile store the clock's zone comes
+    /// from. This is what `AppState` builds; every other constructor hands in a fresh
+    /// in-memory store, which is permanently home and therefore byte-for-byte the
+    /// pre-profile behaviour.
+    pub fn new_full(
+        schedule: Arc<Schedule>,
+        state_file: Option<PathBuf>,
+        slot_wait: Duration,
+        profile: Arc<ProfileStore>,
+    ) -> Arc<Self> {
         Arc::new(Scheduler {
             schedule: Mutex::new(schedule),
             state: Arc::new(ScheduleStateStore::new(state_file)),
-            boot_ms: clock.now_ms(),
-            clock,
+            boot_ms: system_time_to_ms(SystemTime::now()),
+            // Seeded from the store rather than left empty, so the FIRST observation is a
+            // comparison rather than a seed — otherwise a profile set in the twenty seconds
+            // between boot and the first tick would swap the zone with no re-anchor.
+            last_zone: Mutex::new(Some(profile.zone(system_time_to_ms(SystemTime::now())))),
+            profile,
             reload: Mutex::new(None),
             turn_lock: Arc::new(Semaphore::new(1)),
             running: Mutex::new(Vec::new()),
             slot_wait,
         })
+    }
+
+    /// THE CLOCK, resolved fresh from the profile store.
+    ///
+    /// A METHOD RATHER THAN A FIELD since 0.91.0, and that is the whole of the zone
+    /// plumbing: every call site that used to read `sched.clock` now reads
+    /// `sched.clock()`, and gets a clock whose zone is the away profile's if one is in
+    /// force. A tick that has to be internally consistent captures it ONCE at the top and
+    /// threads that value — see [`Scheduler::tick`].
+    pub fn clock(&self) -> SchedulerClock {
+        SchedulerClock::in_zone(self.profile.zone(system_time_to_ms(SystemTime::now())))
+    }
+
+    /// The profile in force right now, or `None` for home.
+    pub fn active_profile(&self) -> Option<Profile> {
+        self.profile.current(system_time_to_ms(SystemTime::now()))
     }
 
     /// Point this scheduler at the config file it was loaded from, so the tick can notice
@@ -521,10 +622,150 @@ impl Scheduler {
     /// The next fire a head is waiting for, for the observability endpoint. `None` for a
     /// link, a disabled job, or an unresolvable one.
     pub fn next_fire_for(&self, job: &ScheduleJob) -> Option<u64> {
-        if !self.effective_enabled(job, self.clock.now_ms()) || !job.is_head() {
+        if !self.effective_enabled(job, self.clock().now_ms()) || !job.is_head() {
             return None;
         }
-        job.next_fire_ms(self.clock.tz(), self.anchor_for(&job.id))
+        job.next_fire_ms(self.clock().tz(), self.anchor_for(&job.id))
+    }
+
+    /// OBSERVE THE ZONE, AND RE-ANCHOR IF IT MOVED.
+    ///
+    /// Called at the top of every tick and again the moment `POST /jesse/profile` returns,
+    /// so a profile set from the phone takes effect at once rather than up to twenty
+    /// seconds later.
+    ///
+    /// THE RE-ANCHOR IS THE WHOLE CORRECTNESS OF SWITCHING ZONES. Nothing caches a next
+    /// fire — `due_occurrence` resolves one from `last_due_ms` on every pass — so moving
+    /// the zone would otherwise reinterpret an anchor that is an ABSOLUTE INSTANT as though
+    /// it named the same wall-clock time in the new zone, and it does not. Concretely, for
+    /// a head at 06:05 moving Rome → London: the anchor is 04:05Z (Rome 06:05 today), the
+    /// next fire strictly after it in London is 05:05Z (London 06:05 TODAY), and today's
+    /// occurrence runs a second time. Moving the other way, London → Rome at 04:30Z, the
+    /// anchor is yesterday's 05:05Z and today's Rome occurrence at 04:05Z is already in the
+    /// past, so it must run late rather than be skipped.
+    ///
+    /// Both come out right from one rule: an anchor names an OCCURRENCE, and an occurrence
+    /// is a local wall-clock time on a local date. So each anchor is read as a wall clock
+    /// in the OLD zone and re-resolved to the instant that same wall clock names in the NEW
+    /// one. `last_due_ms` and any pending `retry_due_ms` move together — a retry is an
+    /// occurrence too.
+    ///
+    /// A change that spans a RESTART is not re-anchored (the process cannot know which zone
+    /// the anchors on disk were written in). That direction is safe: coming home, the
+    /// re-read anchor is later than the host zone's occurrence for the same day, so the day
+    /// is treated as done — which it is.
+    pub fn observe_profile_change(self: &Arc<Self>, st: &AppState, now_ms: u64) {
+        let zone = self.profile.zone(now_ms);
+        let previous = self.last_zone.lock_ok().replace(zone);
+        let Some(previous) = previous.filter(|p| *p != zone) else {
+            return;
+        };
+        let schedule = self.schedule();
+        for head in schedule.heads() {
+            self.state.update(&head.id, |r| {
+                r.last_due_ms = r
+                    .last_due_ms
+                    .map(|ms| shift_wall_clock(ms, &previous, &zone));
+                r.retry_due_ms = r
+                    .retry_due_ms
+                    .map(|ms| shift_wall_clock(ms, &previous, &zone));
+            });
+        }
+        let reason = profile_change_reason(self.profile.current(now_ms).as_ref());
+        eprintln!(
+            "jesse-bridge: schedule PROFILE-CHANGE — {reason}; the scheduler zone moved {} \
+             -> {}, and {} head anchor(s) were re-read as occurrences in the new zone",
+            zone_label(&previous),
+            zone_label(&zone),
+            schedule.heads().count(),
+        );
+        self.state
+            .ledger_event("(profile)", "profile-change", &reason, now_ms);
+        // The boot table again, because every `next fire` in the old one is now wrong. This
+        // is the one line that makes a zone change checkable from the log rather than only
+        // from the endpoint.
+        print_boot_table(self);
+        let _ = st;
+    }
+
+    /// FIRE THE `[profile].on_return` CHAIN, ONCE, WHEN AN AWAY PERIOD ENDS.
+    ///
+    /// The trigger is the STORE, not an event, and that is deliberate: an away period can
+    /// end three ways — the phone posts `home`, the `until` passes while the bridge is
+    /// running, or the `until` passes while the host is asleep — and only a store that
+    /// records "a return is owed" catches all three with one piece of code. The flag is
+    /// cleared BEFORE the chain is spawned, so a crash mid-run costs the return rather than
+    /// replaying it every twenty seconds forever.
+    ///
+    /// It takes exactly the operator-fire path (`ChainRun` + `run_chain`), so the return
+    /// chain gets the same single-flight guard, the same gates and the same records a fire
+    /// from the phone would. The calendar is evaluated at NOW — a person is back today —
+    /// and the freshness contract is honoured, so a return that lands after the day's
+    /// ordinary run does not redo it.
+    fn fire_return_if_owed(
+        self: &Arc<Self>,
+        st: &AppState,
+        now_ms: u64,
+    ) -> Vec<tokio::task::JoinHandle<()>> {
+        let Some((run, schedule)) = self.return_fire_plan(now_ms) else {
+            return Vec::new();
+        };
+        self.running.lock_ok().push(run.head.clone());
+        let sched = self.clone();
+        let st2 = st.clone();
+        vec![tokio::spawn(async move {
+            run_chain(sched, st2, schedule, run).await;
+        })]
+    }
+
+    /// THE DECIDING HALF of [`fire_return_if_owed`], split out so the once-only property
+    /// can be asserted without spawning a turn. It performs every state change — clearing
+    /// the owed flag, writing the ledger line — and hands back the run to start, or `None`
+    /// when there is nothing to do.
+    fn return_fire_plan(self: &Arc<Self>, now_ms: u64) -> Option<(ChainRun, Arc<Schedule>)> {
+        let ended = self.profile.return_owed(now_ms)?;
+        let schedule = self.schedule();
+        let Some(on_return) = schedule.on_return.clone() else {
+            // Nothing configured to run. The return is still MARKED, so declaring
+            // `on_return` later does not fire a chain for a trip that ended a month ago.
+            self.profile.mark_returned(now_ms);
+            return None;
+        };
+        let head = match self.head_of(&schedule, &on_return) {
+            Some(h) => h,
+            None => {
+                self.profile.mark_returned(now_ms);
+                return None;
+            }
+        };
+        if self.is_running(&head) {
+            // Leave it owed: the next tick tries again, twenty seconds later, rather than
+            // silently dropping the one run this whole mechanism exists to produce.
+            return None;
+        }
+        self.profile.mark_returned(now_ms);
+        let days = ended.days_away(now_ms).max(0);
+        let return_line = format!(
+            "RETURN: first day back after {days} day{} away",
+            if days == 1 { "" } else { "s" }
+        );
+        eprintln!("jesse-bridge: schedule RETURN-FIRE id={on_return} head={head} — {return_line}");
+        self.state
+            .ledger_event("(profile)", "profile-change", &return_line, now_ms);
+        let run = ChainRun {
+            start_at: on_return,
+            due: DueFire {
+                due_ms: now_ms,
+                lateness_ms: 0,
+                missed_earlier: 0,
+            },
+            calendar_ms: now_ms,
+            contract_ms: self.contract_anchor(&head, now_ms),
+            head,
+            operator: Some(OperatorFire { force: false }),
+            return_line: Some(return_line),
+        };
+        Some((run, schedule))
     }
 
     /// ONE PASS over the heads. Anything due is claimed and its chain is spawned; the
@@ -536,14 +777,24 @@ impl Scheduler {
         // re-timed a head must take effect on THIS pass rather than one tick later, so an
         // edit made a few seconds before a fire is honoured rather than missed by 20s.
         self.reload_if_config_changed(st, now_ms);
+        // THE PROFILE, before anything is judged due, and in this order. The observation
+        // re-anchors if the zone moved (including the case where a profile lapsed while the
+        // host was asleep, since expiry is applied on read); the return fire is owed only
+        // once the profile is no longer in force, so it must come after.
+        self.observe_profile_change(st, now_ms);
+        let mut started = self.fire_return_if_owed(st, now_ms);
+        // THE ZONE FOR THIS PASS, read once. Every head below is judged in the same zone,
+        // so a profile that expires mid-pass cannot have one head resolved in Rome and the
+        // next in London.
+        let zone = self.profile.zone(now_ms);
+        let active = profile_in_force(&self.profile, now_ms);
         let schedule = self.schedule();
-        let mut started = Vec::new();
         for head in schedule.heads() {
             if !self.effective_enabled(head, now_ms) {
                 continue; // off means off — not "due and skipped" every 20 seconds.
             }
             let anchor = self.anchor_for(&head.id);
-            let fresh = due_occurrence(self.clock.tz(), head, anchor, now_ms);
+            let fresh = due_occurrence(&zone, head, anchor, now_ms);
             // A PENDING RETRY: the previous attempt was skipped because the bridge was
             // momentarily busy, so this occurrence never became stale. It takes
             // precedence over nothing — a genuinely NEWER occurrence supersedes it (only
@@ -572,6 +823,22 @@ impl Scheduler {
             // This also clears the pending retry — the attempt below supersedes it, and
             // re-arms only if it too is skipped transiently.
             self.state.claim(&head.id, due.due_ms);
+
+            // A HEAD THIS PROFILE EXCLUDES. Claimed and recorded (nothing is silent — a due
+            // occurrence always ends as ran, failed or skipped) but not pushed, because it
+            // is the config working. Claiming matters as much as recording: leaving a
+            // fortnight of occurrences unclaimed would have them all come due the moment the
+            // profile ends, and be skipped in a burst as "missed by 13 days".
+            //
+            // The chain behind it is recorded as skipped too. `profiles` makes a member
+            // ABSENT rather than failed — which is why a LINK it excludes does not break the
+            // chain — but a head has no predecessor to be transparent to: without its clock
+            // there is no occurrence for the links to belong to.
+            if !head.profiles.contains(active) {
+                self.finish_job(st, head, Outcome::Skipped, PROFILE_SKIP, None, None, false);
+                self.skip_rest_of_chain(st, &head.id, &head.id, Outcome::Skipped);
+                continue;
+            }
 
             if due.missed_earlier > 0 {
                 eprintln!(
@@ -710,7 +977,10 @@ fn should_push(job: &ScheduleJob, outcome: Outcome, reason: &str, cascaded: bool
         return false;
     }
     if outcome == Outcome::Skipped
-        && (reason == CALENDAR_SKIP || reason == DISABLED_SKIP || reason == OUTPUT_FRESH_SKIP)
+        && (reason == CALENDAR_SKIP
+            || reason == DISABLED_SKIP
+            || reason == OUTPUT_FRESH_SKIP
+            || reason == PROFILE_SKIP)
     {
         return false;
     }
@@ -735,6 +1005,34 @@ pub const CALENDAR_SKIP: &str = "not scheduled on this weekday";
 /// override that behaved differently from the config key would be a second, silent
 /// semantics for the same word.
 pub const DISABLED_SKIP: &str = "disabled";
+
+/// The reason text for a member the ACTIVE PROFILE excludes (`profiles = ["home"]` while
+/// away, or the reverse).
+///
+/// NOT PUSHED, for the same reason a `days` skip is not: it is the config working, and
+/// "your tag1 status report did not run" every night of a fortnight is how a notification
+/// channel becomes noise.
+///
+/// AND — unlike [`DISABLED_SKIP`] — IT DOES NOT BREAK AN `after_on = "success"` CHAIN. The
+/// two words mean different things and the difference is the whole reason this is a
+/// separate const. Disabling a member is a statement about THAT MEMBER ("do not run this"),
+/// and a chain stopping there is the documented consequence. Excluding it by profile is a
+/// statement about the PROFILE ("this member does not apply while I am away"), so the
+/// member is simply absent: everything behind it consults the predecessor it would have had,
+/// exactly as if the entry were not in the file this fortnight. A member that broke the
+/// chain instead would mean marking one report as home-only silently retired the four jobs
+/// behind it.
+pub const PROFILE_SKIP: &str = "not scheduled under this profile";
+
+/// The profile in force for a decision at `now_ms` — [`ProfileName::Away`] while a period
+/// is live, [`ProfileName::Home`] otherwise. The one place the store's `Option` is
+/// collapsed to the two-valued thing `profiles` is matched against.
+pub fn profile_in_force(store: &ProfileStore, now_ms: u64) -> ProfileName {
+    match store.current(now_ms) {
+        Some(_) => ProfileName::Away,
+        None => ProfileName::Home,
+    }
+}
 
 /// The reason text for a fire skipped because the job's `expect_output` is ALREADY FRESH —
 /// something at or after this occurrence's instant already matches its contract.
@@ -772,6 +1070,15 @@ pub struct ChainRun {
     contract_ms: u64,
     /// `Some` when a person asked for this run through `POST /jesse/schedule/{id}/fire`.
     operator: Option<OperatorFire>,
+    /// ONE EXTRA PROMPT LINE for every member of this run — today only the
+    /// `RETURN: first day back after N days away` of an `[profile].on_return` fire.
+    ///
+    /// It rides on the CLOCK HEADER (right under the `PROFILE:` line) rather than being
+    /// glued onto the prompt text, so the job's own `prompt_file` needs no return-aware
+    /// wording and a vault-side prompt matches it exactly where it already matches
+    /// `PROFILE: away`. `None` for every ordinary run, which is byte-for-byte the prompt
+    /// those runs built before.
+    return_line: Option<String>,
 }
 
 /// The two things that differ about an operator-initiated run.
@@ -793,6 +1100,7 @@ impl ChainRun {
             contract_ms: due.due_ms,
             due,
             operator: None,
+            return_line: None,
         }
     }
 
@@ -842,8 +1150,21 @@ pub fn member_decision(
     start_at: &str,
     enabled: bool,
     weekday: Option<Weekday>,
+    profile: ProfileName,
 ) -> MemberDecision {
-    // 1. The predecessor gate — skipped for the member the run starts at.
+    // 1. THE PROFILE, ahead of everything including the predecessor gate. A member this
+    //    profile excludes is ABSENT, and an absent member has no opinion about what ran
+    //    before it — judging it against a broken predecessor would report the break as the
+    //    reason it did not run, which is a different and wrong fact. `run_chain` makes the
+    //    skip transparent to everything behind it; see [`PROFILE_SKIP`].
+    if !job.profiles.contains(profile) {
+        return MemberDecision::Skip {
+            reason: PROFILE_SKIP.to_string(),
+            cascaded: false,
+            breaker: job.id.clone(),
+        };
+    }
+    // 2. The predecessor gate — skipped for the member the run starts at.
     if job.id != start_at {
         if let Some(parent) = job.after() {
             let parent_outcome = outcomes.get(parent).copied().unwrap_or(Outcome::Skipped);
@@ -860,7 +1181,7 @@ pub fn member_decision(
             }
         }
     }
-    // 2. Disabled — in the config or by a live override.
+    // 3. Disabled — in the config or by a live override.
     if !enabled {
         return MemberDecision::Skip {
             reason: DISABLED_SKIP.to_string(),
@@ -868,7 +1189,7 @@ pub fn member_decision(
             breaker: job.id.clone(),
         };
     }
-    // 3. The weekday filter, which applies to links as much as to heads — a Monday-only
+    // 4. The weekday filter, which applies to links as much as to heads — a Monday-only
     //    job on a daily chain is the reason `days` is not a head-only key. An
     //    unrepresentable instant lets the job run rather than silently dropping it.
     if !weekday.map(|w| job.days.contains(w)).unwrap_or(true) {
@@ -899,7 +1220,7 @@ async fn run_chain(sched: Arc<Scheduler>, st: AppState, schedule: Arc<Schedule>,
     // that keeps two agents off the same working tree. The wait is bounded by what is
     // left of this head's catch-up window: a chain that is still queued when its window
     // expires is skipped and recorded, never started hours late.
-    let now = sched.clock.now_ms();
+    let now = sched.clock().now_ms();
     let deadline_ms = due.due_ms + head.catch_up_secs.saturating_mul(1000);
     let wait = Duration::from_millis(deadline_ms.saturating_sub(now));
     let permit = match timeout(wait, sched.turn_lock.clone().acquire_owned()).await {
@@ -926,14 +1247,26 @@ async fn run_chain(sched: Arc<Scheduler>, st: AppState, schedule: Arc<Schedule>,
 
     // THE CALENDAR INSTANT IS READ ONCE, HERE, and it is the OCCURRENCE's — not the wall
     // clock at the moment the chain reaches each member. See `ChainRun::calendar_ms`.
-    let weekday = sched.clock.weekday_at(run.calendar_ms);
+    // THE PROFILE IS READ ONCE HERE TOO, and for exactly the same reason: a chain is one
+    // occurrence, so a profile that lapses while a long chain is mid-run must not have its
+    // first half judged away and its second half judged home.
+    let weekday = sched.clock().weekday_at(run.calendar_ms);
+    let profile = profile_in_force(&sched.profile, sched.clock().now_ms());
 
     for id in schedule.chain(&run.start_at) {
         let Some(job) = schedule.get(&id) else {
             continue;
         };
-        let enabled = sched.effective_enabled(job, sched.clock.now_ms());
-        let decision = member_decision(job, &outcomes, &broken_by, &run.start_at, enabled, weekday);
+        let enabled = sched.effective_enabled(job, sched.clock().now_ms());
+        let decision = member_decision(
+            job,
+            &outcomes,
+            &broken_by,
+            &run.start_at,
+            enabled,
+            weekday,
+            profile,
+        );
         let mut cascaded = false;
         let result = match decision {
             MemberDecision::Skip {
@@ -945,7 +1278,7 @@ async fn run_chain(sched: Arc<Scheduler>, st: AppState, schedule: Arc<Schedule>,
                 broken_by.insert(id.clone(), breaker);
                 RunResult::skipped(reason)
             }
-            // 4. The OUTPUT CONTRACT, checked here rather than in the pure gate because it
+            // 5. The OUTPUT CONTRACT, checked here rather than in the pure gate because it
             //    is the one that reads the disk: a job whose declared output is already at
             //    or after this occurrence's instant has nothing to do.
             MemberDecision::Run => match output_already_fresh(&sched, &st, job, &run) {
@@ -963,8 +1296,27 @@ async fn run_chain(sched: Arc<Scheduler>, st: AppState, schedule: Arc<Schedule>,
             },
         };
 
-        outcomes.insert(id.clone(), result.outcome);
-        if !result.outcome.is_success() && !broken_by.contains_key(&id) {
+        // THE TRANSPARENCY RULE, and it lives here rather than in the pure gate because it
+        // is about what the NEXT member sees, not about this one. A member the profile
+        // excludes is absent for this profile, so it passes its predecessor's verdict
+        // through unchanged: a link behind it consults the job that actually ran, and an
+        // `after_on = "success"` chain survives a member being out of scope. Everything
+        // else — the record, the log, the ledger — still says `profile-skip`, so the
+        // absence is visible; it is only the CHAIN that sees through it.
+        //
+        // A head is never transparent (a head has no predecessor); the tick refuses the
+        // whole chain there instead.
+        let effective = if result.reason == PROFILE_SKIP && !job.is_head() {
+            let parent = job.after().unwrap_or_default();
+            if let Some(breaker) = broken_by.get(parent) {
+                broken_by.insert(id.clone(), breaker.clone());
+            }
+            outcomes.get(parent).copied().unwrap_or(Outcome::Ran)
+        } else {
+            result.outcome
+        };
+        outcomes.insert(id.clone(), effective);
+        if !effective.is_success() && !broken_by.contains_key(&id) {
             broken_by.insert(id.clone(), id.clone());
         }
         sched.finish_job(
@@ -988,7 +1340,7 @@ async fn run_chain(sched: Arc<Scheduler>, st: AppState, schedule: Arc<Schedule>,
                 due.due_ms,
                 human_ms(
                     (due.due_ms + job.catch_up_secs.saturating_mul(1000))
-                        .saturating_sub(sched.clock.now_ms())
+                        .saturating_sub(sched.clock().now_ms())
                 ),
             );
         }
@@ -1052,7 +1404,8 @@ async fn run_one(
 
     let started = Instant::now();
     let start_ms = system_time_to_ms(SystemTime::now());
-    let req = JesseRequest::scheduled(&job.mode, prompt, job.model.clone());
+    let mut req = JesseRequest::scheduled(&job.mode, prompt, job.model.clone());
+    req.set_return_line(run.return_line.clone());
     // A REJECTION HERE IS A FAILURE, NOT A SKIP — and the line between the two is
     // whose decision it was. The slot wait above is the SCHEDULER deciding to stand
     // down, which is a skip. Everything below is the turn path refusing a turn the
@@ -1301,7 +1654,7 @@ fn newest_match_since(
     let root = output_root(st)?;
     let mut best: Option<(String, u64)> = None;
     for pattern in &job.expect_output {
-        let expanded = sched.clock.expand_tokens(pattern, token_ms);
+        let expanded = sched.clock().expand_tokens(pattern, token_ms);
         for (path, mtime) in glob_matches(&root, &expanded) {
             if mtime < since_ms {
                 continue;
@@ -1357,7 +1710,7 @@ fn verify_output(
         None => OutputVerdict::Missing(
             job.expect_output
                 .iter()
-                .map(|p| sched.clock.expand_tokens(p, run.contract_ms))
+                .map(|p| sched.clock().expand_tokens(p, run.contract_ms))
                 .collect::<Vec<_>>()
                 .join(", "),
         ),
@@ -1480,7 +1833,7 @@ async fn push_alert(st: &AppState, schedule_id: &str, payload: Vec<u8>, what: &s
 /// gets a row and every row carries its resolved days by name.
 pub fn boot_table(sched: &Scheduler) -> Vec<String> {
     let schedule = sched.schedule();
-    let now = sched.clock.now_ms();
+    let now = sched.clock().now_ms();
 
     // COLUMN WIDTHS ARE MEASURED, NOT GUESSED. Fixed widths were wrong the first time
     // they met the production schedule: `after overnight-vault-lint (any)` is 32
@@ -1488,7 +1841,7 @@ pub fn boot_table(sched: &Scheduler) -> Vec<String> {
     // out of alignment — and the column it pushed was `days`, which is the one this table
     // exists to make readable. Ids and job names are operator-chosen and unbounded, so any
     // constant here is a constant waiting to be exceeded.
-    let cells: Vec<[String; 6]> = schedule
+    let cells: Vec<[String; 7]> = schedule
         .jobs
         .iter()
         .map(|job| {
@@ -1502,7 +1855,7 @@ pub fn boot_table(sched: &Scheduler) -> Vec<String> {
             };
             let next = sched
                 .next_fire_for(job)
-                .map(|ms| sched.clock.short_local(ms))
+                .map(|ms| sched.clock().short_local(ms))
                 .unwrap_or_else(|| "-".to_string());
             // The two rare annotations ride on the LAST column, so a single promoted job
             // cannot widen a column for all seventeen rows.
@@ -1523,6 +1876,12 @@ pub fn boot_table(sched: &Scheduler) -> Vec<String> {
                 if job.is_head() { "head" } else { "link" }.to_string(),
                 trigger,
                 job.days.names().join(","),
+                // THE SAME ARGUMENT THE `days` COLUMN WON. A `profiles` key decides whether
+                // a member of the chain runs for the next fortnight, so it must be visible
+                // in the log rather than only in the file — and it is printed for every row,
+                // resolved, rather than only where it differs from the default, because
+                // "which of these are home-only" is the question a reader has.
+                job.profiles.names().join(","),
                 next,
                 enabled,
             ]
@@ -1534,12 +1893,13 @@ pub fn boot_table(sched: &Scheduler) -> Vec<String> {
         "kind".to_string(),
         "trigger".to_string(),
         "days".to_string(),
+        "profiles".to_string(),
         "next fire".to_string(),
         "enabled".to_string(),
     ];
     // Character counts, not byte lengths: an id with a non-ASCII character would otherwise
     // pad short by exactly the bytes it is wide.
-    let mut widths = [0usize; 6];
+    let mut widths = [0usize; 7];
     for row in std::iter::once(&header).chain(cells.iter()) {
         for (i, cell) in row.iter().enumerate() {
             widths[i] = widths[i].max(cell.chars().count());
@@ -1554,7 +1914,7 @@ pub fn boot_table(sched: &Scheduler) -> Vec<String> {
 
 /// One table row, each cell padded to its measured column width. The LAST column is never
 /// padded — trailing whitespace on every line of a log is noise.
-fn render_row(row: &[String; 6], widths: &[usize; 6]) -> String {
+fn render_row(row: &[String; 7], widths: &[usize; 7]) -> String {
     let mut out = String::new();
     for (i, cell) in row.iter().enumerate() {
         if i > 0 {
@@ -1647,8 +2007,8 @@ impl Scheduler {
                 ],
             };
         };
-        let raw = match load_schedule_from(&path) {
-            Ok(raw) => raw,
+        let (raw, profile_table) = match load_schedule_from(&path) {
+            Ok(both) => both,
             Err(e) => {
                 return ReloadOutcome {
                     reloaded: false,
@@ -1669,6 +2029,9 @@ impl Scheduler {
             &ValidationContext {
                 vault: (!st.cfg.vault.is_empty()).then_some(vault.as_path()),
                 model_ids: Some(&model_ids),
+                // Reloaded WITH the array, from the same parse of the same file, so
+                // `on_return` is always validated against the entries it shipped beside.
+                profile: profile_table.as_ref(),
             },
         );
         if next.is_fatal() {
@@ -1780,7 +2143,7 @@ pub fn spawn_scheduler(st: AppState) {
         }
     }
     for job in schedule.heads() {
-        if !sched.effective_enabled(job, sched.clock.now_ms()) {
+        if !sched.effective_enabled(job, sched.clock().now_ms()) {
             continue;
         }
         eprintln!(
@@ -1802,14 +2165,14 @@ pub fn spawn_scheduler(st: AppState) {
     eprintln!(
         "jesse-bridge: schedule TABLE — {} job(s), zone {} ({})",
         schedule.jobs.len(),
-        sched.clock.tz_name(),
-        sched.clock.utc_offset(),
+        sched.clock().tz_name(),
+        sched.clock().utc_offset(),
     );
     print_boot_table(&sched);
     tokio::spawn(async move {
         loop {
             let sched = st.scheduler.clone();
-            let now = sched.clock.now_ms();
+            let now = sched.clock().now_ms();
             sched.tick(&st, now);
             tokio::time::sleep(SCHEDULER_TICK).await;
         }
@@ -1821,7 +2184,7 @@ pub fn spawn_scheduler(st: AppState) {
 /// One job's row.
 fn schedule_row(sched: &Scheduler, schedule: &Schedule, job: &ScheduleJob) -> Value {
     let rec = sched.state.get(&job.id);
-    let now = sched.clock.now_ms();
+    let now = sched.clock().now_ms();
     json!({
         "id": job.id,
         // The EFFECTIVE state — the runtime override while it is live, else the config's.
@@ -1836,6 +2199,10 @@ fn schedule_row(sched: &Scheduler, schedule: &Schedule, job: &ScheduleJob) -> Va
         "after_on": job.after().map(|_| job.after_on().label()),
         "at": job.at_label(),
         "days": job.days.names(),
+        // THE PROFILES THIS JOB IS IN SCOPE FOR. Always both unless the entry says
+        // otherwise, so an older client reading this field sees `["home","away"]` for every
+        // job it knew about.
+        "profiles": job.profiles.names(),
         "mode": job.mode,
         "prompt": job.prompt.label(),
         "notify": job.notify,
@@ -1911,14 +2278,29 @@ fn schedule_snapshot(st: &AppState) -> Value {
         .iter()
         .map(|e| json!({ "id": e.id, "reason": e.reason }))
         .collect();
+    let now = sched.clock().now_ms();
+    let profile = sched.profile.current(now);
     json!({
-        "now_ms": sched.clock.now_ms(),
+        "now_ms": now,
+        // THE ACTIVE PROFILE, at the top level rather than per row, because it is the one
+        // fact that reinterprets every `tz`, every `next_fire_ms` and every `profiles`
+        // below it. `name` is `"home"` whenever no period is in force, which is the same
+        // answer `GET /health` gives.
+        "profile": json!({
+            "name": profile.as_ref().map(|_| "away").unwrap_or("home"),
+            "tz": sched.clock().tz_name(),
+            "until_ms": profile.as_ref().and_then(|p| p.until_ms),
+            "note": profile.as_ref().map(|p| p.note.clone()).unwrap_or_default(),
+        }),
+        // `[profile].on_return`: the job whose chain runs once when an away period ends,
+        // or null when the config declares none.
+        "on_return": schedule.on_return,
         // THE ZONE, BY NAME. Every "HH:MM", every `days`, every `{date}` is resolved in it,
         // and a UTC offset alone cannot answer the question this field exists for: "+02:00"
         // is Rome in August and something else in January.
-        "tz": sched.clock.tz_name(),
+        "tz": sched.clock().tz_name(),
         // Kept beside it (and unchanged in shape) so nothing that already read it breaks.
-        "utc_offset": sched.clock.utc_offset(),
+        "utc_offset": sched.clock().utc_offset(),
         "persistent": sched.state.is_persistent(),
         "jobs": rows,
         // Entries disabled individually by validation, so a typo is VISIBLE here rather
@@ -1996,7 +2378,7 @@ pub async fn jesse_schedule_fire(
         ));
     }
 
-    let now = sched.clock.now_ms();
+    let now = sched.clock().now_ms();
     let chain = schedule.chain(&id);
     let run = ChainRun {
         head: head.clone(),
@@ -2013,6 +2395,7 @@ pub async fn jesse_schedule_fire(
         // would be the only usable mode of this endpoint.
         contract_ms: sched.contract_anchor(&head, now),
         operator: Some(OperatorFire { force }),
+        return_line: None,
     };
     sched.running.lock_ok().push(head.clone());
     eprintln!(
@@ -2081,7 +2464,7 @@ pub async fn jesse_schedule_enable(
                 .max(0) as u64,
         ),
     };
-    let now = sched.clock.now_ms();
+    let now = sched.clock().now_ms();
     sched.state.set_override(
         &id,
         Some(EnableOverride {
@@ -2094,7 +2477,7 @@ pub async fn jesse_schedule_enable(
         "jesse-bridge: schedule OVERRIDE id={id} enabled={} until={}",
         body.enabled,
         until_ms
-            .map(|u| sched.clock.short_local(u))
+            .map(|u| sched.clock().short_local(u))
             .unwrap_or_else(|| "(none)".to_string())
     );
     Ok(Json(schedule_row(sched, &schedule, job)))
@@ -2112,7 +2495,7 @@ pub async fn jesse_schedule_reload(
 ) -> Result<Json<Value>, ApiError> {
     admit(&st, &headers)?;
     let sched = st.scheduler.clone();
-    let now = sched.clock.now_ms();
+    let now = sched.clock().now_ms();
     // Re-stamp the watch either way, so a hand reload and the tick's watch agree about
     // what has been seen and a failed file is not re-reported every 20 seconds.
     if let Some(w) = sched.reload.lock_ok().as_mut() {
@@ -2398,19 +2781,52 @@ prompt_file = "PROMPTS/archive-box.md"
         head: &str,
         calendar_ms: u64,
     ) -> Vec<(String, MemberDecision)> {
+        walk_as(schedule, clock, head, calendar_ms, ProfileName::Home)
+    }
+
+    /// [`walk`] under a named profile, so the `profiles` gate and its chain transparency
+    /// can be walked the same way. It reproduces `run_chain`'s transparency rule — a
+    /// profile-skipped LINK passes its predecessor's verdict through — because that rule is
+    /// what "does not break the chain" means, and asserting it anywhere else would be
+    /// asserting it about a different program.
+    fn walk_as(
+        schedule: &Schedule,
+        clock: &SchedulerClock,
+        head: &str,
+        calendar_ms: u64,
+        profile: ProfileName,
+    ) -> Vec<(String, MemberDecision)> {
         let weekday = clock.weekday_at(calendar_ms);
         let mut outcomes: HashMap<String, Outcome> = HashMap::new();
         let mut broken_by: HashMap<String, String> = HashMap::new();
         let mut out = Vec::new();
         for id in schedule.chain(head) {
             let job = schedule.get(&id).expect("a chain member exists");
-            let decision = member_decision(job, &outcomes, &broken_by, head, job.enabled, weekday);
+            let decision = member_decision(
+                job,
+                &outcomes,
+                &broken_by,
+                head,
+                job.enabled,
+                weekday,
+                profile,
+            );
             // A member that runs is assumed to succeed — the fake turn that "completes
             // instantly"; a skipped one records its breaker, so the links behind it are
             // judged the way the real run would judge them.
             match &decision {
                 MemberDecision::Run => {
                     outcomes.insert(id.clone(), Outcome::Ran);
+                }
+                // Transparent: absent for this profile, so the next member consults the
+                // predecessor this one would have had.
+                MemberDecision::Skip { reason, .. } if reason == PROFILE_SKIP && !job.is_head() => {
+                    let parent = job.after().unwrap_or_default();
+                    if let Some(b) = broken_by.get(parent).cloned() {
+                        broken_by.insert(id.clone(), b);
+                    }
+                    let inherited = outcomes.get(parent).copied().unwrap_or(Outcome::Ran);
+                    outcomes.insert(id.clone(), inherited);
                 }
                 MemberDecision::Skip { breaker, .. } => {
                     outcomes.insert(id.clone(), Outcome::Skipped);
@@ -2954,7 +3370,7 @@ mod output_tests {
             out
         };
         let header = starts(&rows[0]);
-        assert_eq!(header.len(), 6, "six columns: {:?}", rows[0]);
+        assert_eq!(header.len(), 7, "seven columns: {:?}", rows[0]);
         for row in &rows[1..] {
             assert_eq!(
                 starts(row),
@@ -2967,5 +3383,540 @@ mod output_tests {
         for row in &rows {
             assert_eq!(row.trim_end(), row, "trailing whitespace: {row:?}");
         }
+    }
+}
+
+// ---- The away profile: the zone, the gate, and the return -------------------
+
+#[cfg(test)]
+mod profile_tests {
+    use super::*;
+    use chrono::Utc;
+    use chrono_tz::Europe::{London, Rome};
+
+    fn zone_rome() -> SchedulerZone {
+        SchedulerZone::Named(Rome)
+    }
+
+    fn zone_london() -> SchedulerZone {
+        SchedulerZone::Named(London)
+    }
+
+    /// The instant of a local wall clock in `zone`.
+    fn at(zone: &SchedulerZone, y: i32, mo: u32, d: u32, h: u32, mi: u32) -> u64 {
+        zone.with_ymd_and_hms(y, mo, d, h, mi, 0)
+            .single()
+            .expect("an unambiguous fixture instant")
+            .timestamp_millis() as u64
+    }
+
+    fn utc(y: i32, mo: u32, d: u32, h: u32, mi: u32) -> u64 {
+        Utc.with_ymd_and_hms(y, mo, d, h, mi, 0)
+            .single()
+            .unwrap()
+            .timestamp_millis() as u64
+    }
+
+    /// A `[[schedule]]` fixture, parsed as the bridge parses it.
+    fn parse_schedule(toml_text: &str) -> Vec<ScheduleToml> {
+        #[derive(serde::Deserialize)]
+        struct Wrapper {
+            #[serde(default)]
+            schedule: Vec<ScheduleToml>,
+        }
+        toml::from_str::<Wrapper>(toml_text)
+            .expect("the fixture must parse")
+            .schedule
+    }
+
+    /// Walk one chain's per-member gates under a named profile, exactly as `run_chain`
+    /// does — INCLUDING the transparency rule, which is what "does not break the chain"
+    /// means and would be untested if it were reproduced any other way. Nothing here
+    /// touches a clock, a socket or a disk.
+    fn walk_as(
+        schedule: &Schedule,
+        clock: &SchedulerClock,
+        head: &str,
+        calendar_ms: u64,
+        profile: ProfileName,
+    ) -> Vec<(String, MemberDecision)> {
+        let weekday = clock.weekday_at(calendar_ms);
+        let mut outcomes: HashMap<String, Outcome> = HashMap::new();
+        let mut broken_by: HashMap<String, String> = HashMap::new();
+        let mut out = Vec::new();
+        for id in schedule.chain(head) {
+            let job = schedule.get(&id).expect("a chain member exists");
+            let decision = member_decision(
+                job,
+                &outcomes,
+                &broken_by,
+                head,
+                job.enabled,
+                weekday,
+                profile,
+            );
+            match &decision {
+                MemberDecision::Run => {
+                    outcomes.insert(id.clone(), Outcome::Ran);
+                }
+                MemberDecision::Skip { reason, .. } if reason == PROFILE_SKIP && !job.is_head() => {
+                    let parent = job.after().unwrap_or_default();
+                    if let Some(b) = broken_by.get(parent).cloned() {
+                        broken_by.insert(id.clone(), b);
+                    }
+                    let inherited = outcomes.get(parent).copied().unwrap_or(Outcome::Ran);
+                    outcomes.insert(id.clone(), inherited);
+                }
+                MemberDecision::Skip { breaker, .. } => {
+                    outcomes.insert(id.clone(), Outcome::Skipped);
+                    broken_by.insert(id.clone(), breaker.clone());
+                }
+            }
+            out.push((id, decision));
+        }
+        out
+    }
+
+    /// One head at 06:05, every day — the shape the start-of-day job has.
+    fn head_0605() -> ScheduleJob {
+        let raw = parse_schedule(
+            "[[schedule]]\nid = \"start-of-day\"\nat = \"06:05\"\nprompt = \"go\"\n",
+        );
+        let s = validate_schedule(&raw);
+        assert!(s.fatal.is_empty() && s.invalid.is_empty(), "{s:?}");
+        s.jobs.into_iter().next().unwrap()
+    }
+
+    // ---- The zone a head's "HH:MM" resolves in -------------------------------
+
+    /// THE HEADLINE CLAIM: the same `at = "06:05"` is a different instant in each zone, and
+    /// which one it is comes from the profile.
+    #[test]
+    fn a_head_at_0605_fires_at_0505_utc_in_london_and_0405_utc_in_rome() {
+        let job = head_0605();
+        // An anchor in the small hours of the 26th, so "the next 06:05" is later the same
+        // day in both zones.
+        let anchor = utc(2026, 8, 26, 0, 0);
+        assert_eq!(
+            job.next_fire_ms(&zone_london(), anchor),
+            Some(utc(2026, 8, 26, 5, 5)),
+            "06:05 BST is 05:05Z"
+        );
+        assert_eq!(
+            job.next_fire_ms(&zone_rome(), anchor),
+            Some(utc(2026, 8, 26, 4, 5)),
+            "06:05 CEST is 04:05Z"
+        );
+    }
+
+    // ---- Switching zones between two ticks -----------------------------------
+
+    /// A `Scheduler` over one 06:05 head, with an away profile store attached.
+    fn sched_with(profile: Arc<ProfileStore>) -> Arc<Scheduler> {
+        let schedule = Schedule {
+            jobs: vec![head_0605()],
+            ..Default::default()
+        };
+        Scheduler::new_full(Arc::new(schedule), None, SCHEDULED_SLOT_WAIT, profile)
+    }
+
+    fn away_until(tz: &str, since_ms: u64, until_ms: u64) -> Profile {
+        Profile {
+            name: ProfileName::Away,
+            tz: tz.to_string(),
+            since_ms,
+            until_ms: Some(until_ms),
+            note: String::new(),
+        }
+    }
+
+    /// GOING AWAY MUST NOT RE-RUN THE DAY. Rome's 06:05 has already fired for the 26th
+    /// (04:05Z). Moving to London — one hour behind — makes "06:05 on the 26th" 05:05Z,
+    /// which is still ahead of the anchor, so without the re-anchor today's occurrence
+    /// comes due a second time an hour later.
+    #[test]
+    fn switching_zones_between_two_ticks_never_double_fires_the_same_occurrence() {
+        let store = Arc::new(ProfileStore::new(None));
+        let sched = sched_with(store.clone());
+        let job = head_0605();
+
+        // Tick 1, at home: today's Rome occurrence has run.
+        let rome_fire = at(&zone_rome(), 2026, 8, 26, 6, 5);
+        sched.state.claim("start-of-day", rome_fire);
+        assert_eq!(rome_fire, utc(2026, 8, 26, 4, 5));
+
+        // 04:30Z — after the Rome fire, before the London one — the phone declares away.
+        let now = utc(2026, 8, 26, 4, 30);
+        store.set_away(away_until("Europe/London", now, utc(2026, 9, 7, 22, 59)));
+        let st = crate::testutil::test_state();
+        sched.observe_profile_change(&st, now);
+
+        // The anchor is now the SAME OCCURRENCE expressed in London: 06:05 on the 26th.
+        let anchor = sched.state.get("start-of-day").last_due_ms.unwrap();
+        assert_eq!(
+            anchor,
+            utc(2026, 8, 26, 5, 5),
+            "the anchor names the occurrence, re-read in the new zone"
+        );
+        // So nothing is due at 05:05Z, and the next fire is TOMORROW's 06:05 London.
+        assert_eq!(
+            due_occurrence(&zone_london(), &job, anchor, utc(2026, 8, 26, 5, 5)),
+            None,
+            "today's occurrence must not run twice"
+        );
+        assert_eq!(
+            job.next_fire_ms(&zone_london(), anchor),
+            Some(utc(2026, 8, 27, 5, 5))
+        );
+    }
+
+    /// COMING HOME MUST NOT SWALLOW THE DAY. In London the 26th's 06:05 has not fired yet
+    /// (it is 05:05Z) when, at 04:30Z, the profile ends. Rome's 06:05 for the 26th was
+    /// 04:05Z — already past — so the occurrence fell in the gap between the two zones and
+    /// must run, late, rather than be skipped.
+    #[test]
+    fn switching_zones_never_skips_an_occurrence_that_fell_in_the_gap() {
+        let store = Arc::new(ProfileStore::new(None));
+        let sched = sched_with(store.clone());
+        let job = head_0605();
+        let st = crate::testutil::test_state();
+
+        // Away in London, and yesterday's occurrence is the anchor.
+        let start = utc(2026, 8, 20, 0, 0);
+        store.set_away(away_until("Europe/London", start, utc(2026, 9, 7, 22, 59)));
+        sched.observe_profile_change(&st, start);
+        let yesterday = at(&zone_london(), 2026, 8, 25, 6, 5);
+        sched.state.claim("start-of-day", yesterday);
+
+        // 04:30Z on the 26th: home early. Rome's occurrence for today was 04:05Z.
+        let now = utc(2026, 8, 26, 4, 30);
+        store.go_home(now);
+        sched.observe_profile_change(&st, now);
+
+        let anchor = sched.state.get("start-of-day").last_due_ms.unwrap();
+        assert_eq!(
+            anchor,
+            at(&zone_rome(), 2026, 8, 25, 6, 5),
+            "yesterday's occurrence, re-read as a Rome wall clock"
+        );
+        let due = due_occurrence(&zone_rome(), &job, anchor, now)
+            .expect("today's Rome occurrence is in the gap and must still run");
+        assert_eq!(due.due_ms, utc(2026, 8, 26, 4, 5));
+        assert_eq!(due.missed_earlier, 0, "one occurrence, not a backlog");
+        assert_eq!(
+            due.lateness_ms,
+            25 * 60 * 1000,
+            "25 minutes late, and it runs"
+        );
+    }
+
+    /// A pending transient retry names an occurrence too, so it moves with the anchor.
+    #[test]
+    fn a_pending_retry_moves_with_the_anchor() {
+        let store = Arc::new(ProfileStore::new(None));
+        let sched = sched_with(store.clone());
+        let st = crate::testutil::test_state();
+        sched
+            .state
+            .arm_retry("start-of-day", at(&zone_rome(), 2026, 8, 26, 6, 5));
+        let now = utc(2026, 8, 26, 4, 30);
+        store.set_away(away_until("Europe/London", now, utc(2026, 9, 7, 22, 59)));
+        sched.observe_profile_change(&st, now);
+        assert_eq!(
+            sched.state.get("start-of-day").retry_due_ms,
+            Some(at(&zone_london(), 2026, 8, 26, 6, 5))
+        );
+    }
+
+    /// A zone that did not move re-anchors nothing — an idempotent POST is a no-op.
+    #[test]
+    fn observing_an_unchanged_zone_leaves_every_anchor_alone() {
+        let store = Arc::new(ProfileStore::new(None));
+        let sched = sched_with(store.clone());
+        let st = crate::testutil::test_state();
+        let anchor = at(&zone_rome(), 2026, 8, 26, 6, 5);
+        sched.state.claim("start-of-day", anchor);
+        sched.observe_profile_change(&st, utc(2026, 8, 26, 5, 0));
+        sched.observe_profile_change(&st, utc(2026, 8, 26, 5, 1));
+        assert_eq!(sched.state.get("start-of-day").last_due_ms, Some(anchor));
+    }
+
+    // ---- `profiles` on an entry ----------------------------------------------
+
+    fn chain_with_profiles() -> Schedule {
+        let raw = parse_schedule(
+            r#"
+[[schedule]]
+id = "overnight"
+at = "03:30"
+prompt = "go"
+
+[[schedule]]
+id = "overnight-tag1-status"
+after = "overnight"
+profiles = ["home"]
+prompt = "go"
+
+[[schedule]]
+id = "overnight-wrapup"
+after = "overnight-tag1-status"
+prompt = "go"
+"#,
+        );
+        let s = validate_schedule(&raw);
+        assert!(s.fatal.is_empty() && s.invalid.is_empty(), "{s:?}");
+        s
+    }
+
+    fn decision(walked: &[(String, MemberDecision)], id: &str) -> MemberDecision {
+        walked
+            .iter()
+            .find(|(i, _)| i == id)
+            .map(|(_, d)| d.clone())
+            .unwrap_or_else(|| panic!("{id} is in the chain"))
+    }
+
+    /// THE WHOLE POINT OF A SEPARATE CONST. A home-only member is skipped while away —
+    /// and the job behind it, an ordinary `after_on = "success"` link, STILL RUNS.
+    #[test]
+    fn a_profile_skip_neither_pushes_nor_cascades() {
+        let schedule = chain_with_profiles();
+        let clock = SchedulerClock::frozen(zone_rome(), 0);
+        let occurrence = at(&zone_rome(), 2026, 8, 26, 3, 30);
+
+        let away = walk_as(
+            &schedule,
+            &clock,
+            "overnight",
+            occurrence,
+            ProfileName::Away,
+        );
+        assert_eq!(decision(&away, "overnight"), MemberDecision::Run);
+        match decision(&away, "overnight-tag1-status") {
+            MemberDecision::Skip {
+                reason, cascaded, ..
+            } => {
+                assert_eq!(reason, PROFILE_SKIP);
+                assert!(!cascaded, "it is its own decision, not a cascade");
+            }
+            d => panic!("expected a profile skip, got {d:?}"),
+        }
+        assert_eq!(
+            decision(&away, "overnight-wrapup"),
+            MemberDecision::Run,
+            "the member behind an ABSENT one still runs — this is the DISABLED_SKIP difference"
+        );
+
+        // At home every member runs, which is what "the default is both" has to mean.
+        let home = walk_as(
+            &schedule,
+            &clock,
+            "overnight",
+            occurrence,
+            ProfileName::Home,
+        );
+        for id in ["overnight", "overnight-tag1-status", "overnight-wrapup"] {
+            assert_eq!(decision(&home, id), MemberDecision::Run, "{id} at home");
+        }
+    }
+
+    /// A DISABLED member, by contrast, breaks the chain — the behaviour `profiles` had to
+    /// be a different word for.
+    #[test]
+    fn a_disabled_member_still_breaks_the_chain_that_a_profile_skip_does_not() {
+        let mut schedule = chain_with_profiles();
+        for job in schedule.jobs.iter_mut() {
+            if job.id == "overnight-tag1-status" {
+                job.enabled = false;
+                job.profiles = Profiles::ALL;
+            }
+        }
+        let clock = SchedulerClock::frozen(zone_rome(), 0);
+        let walked = walk_as(
+            &schedule,
+            &clock,
+            "overnight",
+            at(&zone_rome(), 2026, 8, 26, 3, 30),
+            ProfileName::Home,
+        );
+        match decision(&walked, "overnight-wrapup") {
+            MemberDecision::Skip { cascaded, .. } => assert!(cascaded),
+            d => panic!("a disabled predecessor must break the chain, got {d:?}"),
+        }
+    }
+
+    #[test]
+    fn a_profiles_list_rejects_an_unknown_name_and_an_empty_one() {
+        assert!(Profiles::parse(&["home".into(), "away".into()]).is_ok());
+        assert_eq!(
+            Profiles::parse(&["home".into()]).unwrap().names(),
+            vec!["home"]
+        );
+        assert!(Profiles::parse(&["holiday".into()])
+            .unwrap_err()
+            .contains("holiday"));
+        assert!(Profiles::parse(&[]).unwrap_err().contains("empty"));
+        // Absent means both, so every entry written before the key existed is untouched.
+        assert!(Profiles::default().is_all());
+    }
+
+    /// An entry naming a profile that does not exist is disabled INDIVIDUALLY, by name.
+    #[test]
+    fn a_bad_profiles_key_disables_only_that_entry() {
+        let s = validate_schedule(&parse_schedule(
+            r#"
+[[schedule]]
+id = "good"
+at = "03:30"
+prompt = "go"
+
+[[schedule]]
+id = "bad"
+at = "04:30"
+profiles = ["holiday"]
+prompt = "go"
+"#,
+        ));
+        assert!(s.fatal.is_empty());
+        assert_eq!(s.jobs.len(), 1);
+        assert_eq!(s.jobs[0].id, "good");
+        assert_eq!(s.invalid.len(), 1);
+        assert_eq!(s.invalid[0].id, "bad");
+        assert!(s.invalid[0].reason.contains("holiday"));
+    }
+
+    // ---- `[profile].on_return` -----------------------------------------------
+
+    fn with_on_return(id: &str) -> Schedule {
+        let raw = parse_schedule(
+            r#"
+[[schedule]]
+id = "start-of-day"
+at = "06:05"
+prompt = "go"
+"#,
+        );
+        validate_schedule_with(
+            &raw,
+            &ValidationContext {
+                profile: Some(&ProfileToml {
+                    on_return: Some(id.to_string()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+        )
+    }
+
+    #[test]
+    fn on_return_must_name_an_entry_that_exists() {
+        let good = with_on_return("start-of-day");
+        assert_eq!(good.on_return.as_deref(), Some("start-of-day"));
+        assert!(good.invalid.is_empty());
+
+        let bad = with_on_return("no-such-job");
+        assert_eq!(bad.on_return, None, "an unknown id sets nothing");
+        assert!(bad.fatal.is_empty(), "and never refuses the boot");
+        assert_eq!(bad.invalid.len(), 1);
+        assert_eq!(bad.invalid[0].id, "[profile]");
+        assert!(bad.invalid[0].reason.contains("no-such-job"));
+    }
+
+    /// THE RETURN FIRES ONCE. Not once per tick for the rest of the fortnight, and not
+    /// again after a restart — which is why the flag is on disk beside the period.
+    #[test]
+    fn the_return_is_owed_once_and_survives_a_store_reload() {
+        let dir = std::env::temp_dir().join(format!("jesse-return-{}", random_hex()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("profile.json");
+
+        let start = utc(2026, 8, 25, 6, 0);
+        let end = utc(2026, 9, 7, 22, 59);
+        let back = end + 60_000;
+        {
+            let store = Arc::new(ProfileStore::new(Some(path.clone())));
+            store.set_away(away_until("Europe/London", start, end));
+            let sched = sched_with(store.clone());
+            *sched.schedule.lock_ok() = Arc::new(with_on_return("start-of-day"));
+
+            // Before the expiry: nothing owed, nothing planned.
+            assert!(store.return_owed(end - 1).is_none());
+            assert!(sched.return_fire_plan(end - 1).is_none());
+
+            // After it: exactly one run, carrying the RETURN line, and the flag is cleared
+            // in the same breath.
+            let (run, _) = sched.return_fire_plan(back).expect("the return is owed");
+            assert_eq!(run.head, "start-of-day");
+            assert!(run
+                .return_line
+                .as_deref()
+                .unwrap()
+                .starts_with("RETURN: first day back after "));
+            assert!(store.returned_ms().is_some());
+            assert!(
+                sched.return_fire_plan(back + 60_000).is_none(),
+                "a second tick must not fire it again"
+            );
+        }
+        // A restart re-reads the flag rather than the period alone.
+        let reloaded = Arc::new(ProfileStore::new(Some(path.clone())));
+        let sched = sched_with(reloaded.clone());
+        *sched.schedule.lock_ok() = Arc::new(with_on_return("start-of-day"));
+        assert!(
+            sched.return_fire_plan(back + 3_600_000).is_none(),
+            "the return survived the restart as ALREADY DONE"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The `RETURN:` line counts calendar days in the away zone and is grammatical at one.
+    #[test]
+    fn the_return_line_names_how_many_days_were_away() {
+        let start = at(&zone_london(), 2026, 8, 25, 18, 0);
+        let back = at(&zone_london(), 2026, 9, 7, 9, 0);
+        let p = away_until("Europe/London", start, back);
+        assert_eq!(p.days_away(back), 13);
+        let one = away_until(
+            "Europe/London",
+            start,
+            at(&zone_london(), 2026, 8, 26, 9, 0),
+        );
+        assert_eq!(one.days_away(at(&zone_london(), 2026, 8, 26, 9, 0)), 1);
+    }
+
+    /// With no `[profile].on_return` configured the return is still MARKED, so declaring
+    /// the key later does not fire a chain for a trip that ended a month ago.
+    #[test]
+    fn a_return_with_nothing_configured_is_marked_rather_than_left_owed() {
+        let store = Arc::new(ProfileStore::new(None));
+        let sched = sched_with(store.clone());
+        let end = utc(2026, 9, 7, 22, 59);
+        store.set_away(away_until("Europe/London", utc(2026, 8, 25, 6, 0), end));
+        assert!(sched.return_fire_plan(end + 1000).is_none());
+        assert!(store.returned_ms().is_some(), "marked, not left owed");
+    }
+
+    // ---- The boot table and the endpoint --------------------------------------
+
+    #[test]
+    fn every_boot_table_row_names_the_profiles_it_is_in_scope_for() {
+        let schedule = chain_with_profiles();
+        let sched = Scheduler::new(Arc::new(schedule), None);
+        let rows = boot_table(&sched);
+        assert!(rows[0].contains("profiles"), "{}", rows[0]);
+        let status = rows
+            .iter()
+            .find(|r| r.starts_with("overnight-tag1-status"))
+            .expect("the home-only member has a row");
+        assert!(status.contains("home"), "{status}");
+        assert!(
+            !status.contains("home,away"),
+            "a home-only job must not read as both: {status}"
+        );
+        let wrapup = rows
+            .iter()
+            .find(|r| r.starts_with("overnight-wrapup"))
+            .unwrap();
+        assert!(wrapup.contains("home,away"), "{wrapup}");
     }
 }

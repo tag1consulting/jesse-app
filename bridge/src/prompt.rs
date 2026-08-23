@@ -464,7 +464,24 @@ fn strip_wrapping_quotes(s: &str) -> &str {
 /// whole point. Impure (reads the clock); the formatting is factored into the
 /// pure `format_clock_line` so the wording is unit-testable.
 pub fn clock_line() -> String {
-    if let Some(line) = clock_line_from_date() {
+    clock_line_in(&SchedulerZone::Host)
+}
+
+/// The clock header rendered in `zone` — the host's, an away profile's, or the one a
+/// request's `client_tz` named.
+///
+/// IT SETS `TZ` ON THE `date` CHILD rather than reformatting an instant with `chrono`, and
+/// that is the point: the zone ABBREVIATION (`CEST`, `BST`) is what makes this line worth
+/// having, `date` is already how it is read, and reproducing the same string through a
+/// second mechanism is how the two would come to disagree. `SchedulerZone::Host` sets
+/// nothing at all, so a bridge with no profile and no `client_tz` builds the identical
+/// bytes it always did.
+pub fn clock_line_in(zone: &SchedulerZone) -> String {
+    let name = match zone {
+        SchedulerZone::Host => None,
+        other => other.iana_name(),
+    };
+    if let Some(line) = clock_line_from_date(name.as_deref()) {
         return line;
     }
     let (weekday, ymd, hm, abbrev, offset) = utc_now_fields();
@@ -473,9 +490,14 @@ pub fn clock_line() -> String {
 
 /// Read the local clock via `date` and format the header, or `None` if `date`
 /// can't be run or emits an unusable line. A single pipe-delimited call keeps
-/// parsing trivial and locale-proof.
-fn clock_line_from_date() -> Option<String> {
-    let out = std::process::Command::new("date")
+/// parsing trivial and locale-proof. `tz` names the zone to read it in, or `None` for the
+/// host's (which leaves the child's `TZ` exactly as the bridge inherited it).
+fn clock_line_from_date(tz: Option<&str>) -> Option<String> {
+    let mut cmd = std::process::Command::new("date");
+    if let Some(tz) = tz {
+        cmd.env("TZ", tz);
+    }
+    let out = cmd
         .env("LC_ALL", "C")
         .arg("+%A|%Y-%m-%d|%H:%M|%Z|%z")
         .output()
@@ -492,6 +514,65 @@ fn clock_line_from_date() -> Option<String> {
         }
     }
     None
+}
+
+/// THE PROFILE LINE, one per turn, byte-stable.
+///
+/// `PROFILE: home` when nothing is in force, otherwise
+/// `PROFILE: away (Europe/London) until 2026-09-07, note: Scotland` — with the `, note:`
+/// clause omitted when there is no note. Dates render in the profile's OWN zone, because a
+/// return date shown in the host's zone is exactly the off-by-one this feature exists to
+/// remove.
+///
+/// **The wording is a contract with the vault's prompts**, which branch on `PROFILE: away`.
+/// Changing the spelling is a breaking change to text that lives in another repository, not
+/// a formatting choice — which is why this is a pure function with its exact output
+/// asserted in a test.
+pub fn profile_line(profile: Option<&Profile>) -> String {
+    let Some(p) = profile else {
+        return "PROFILE: home".to_string();
+    };
+    let until = p
+        .until_ms
+        .and_then(|ms| {
+            chrono::DateTime::from_timestamp_millis(ms as i64).map(|t| {
+                t.with_timezone(&p.zone().unwrap_or(SchedulerZone::Host))
+                    .format("%Y-%m-%d")
+                    .to_string()
+            })
+        })
+        .unwrap_or_else(|| "further notice".to_string());
+    let note = p.note.trim();
+    let note = if note.is_empty() {
+        String::new()
+    } else {
+        format!(", note: {note}")
+    };
+    format!("PROFILE: away ({}) until {until}{note}", p.tz)
+}
+
+/// THE WHOLE CLOCK HEADER: the date/time line, the profile line under it, and — on an
+/// `[profile].on_return` fire only — the `RETURN:` line under that.
+///
+/// Composed HERE rather than inside [`build_prompt_at`] because the header is one opaque
+/// string to everything downstream: [`prompt_lead`] emits it verbatim and
+/// [`splice_catchup`] finds the floor boundary by recomputing that lead's LENGTH from the
+/// same string. Adding lines inside `build_prompt_at` would leave the splice measuring a
+/// header the builder no longer produced, and the catch-up block would land mid-prompt.
+/// Composing first keeps the one-string invariant, and keeps both functions pure.
+pub fn clock_header(
+    zone: &SchedulerZone,
+    profile: Option<&Profile>,
+    return_line: Option<&str>,
+) -> String {
+    let mut header = clock_line_in(zone);
+    header.push('\n');
+    header.push_str(&profile_line(profile));
+    if let Some(line) = return_line.map(str::trim).filter(|l| !l.is_empty()) {
+        header.push('\n');
+        header.push_str(line);
+    }
+    header
 }
 
 /// Assemble the clock header from its already-extracted fields. Pure (reads no
@@ -1931,5 +2012,149 @@ user while running local commands. DO NOT respond.</local-command-caveat>\n\
         let line = format_clock_line(&weekday, &ymd, &hm, &abbrev, &offset);
         assert!(line.starts_with("Current date/time: "));
         assert!(line.ends_with("(UTC+00:00)."));
+    }
+}
+
+// ---- The PROFILE line -------------------------------------------------------
+
+#[cfg(test)]
+mod profile_line_tests {
+    use super::*;
+
+    fn away(tz: &str, until_ms: Option<u64>, note: &str) -> Profile {
+        Profile {
+            name: ProfileName::Away,
+            tz: tz.to_string(),
+            since_ms: 0,
+            until_ms,
+            note: note.to_string(),
+        }
+    }
+
+    /// 2026-09-07T22:59:00Z — 23:59 on the 7th in London, and 00:59 on the EIGHTH in Rome.
+    /// The instant the trip's `until` actually names; the two zones' dates differ, which is
+    /// the whole point of the second test below.
+    const UNTIL: u64 = 1_788_821_940_000;
+
+    /// **THE BYTE-STABLE CONTRACT.** The vault's prompts match on this text; these two
+    /// strings are the contract, and changing either is a breaking change to a file in
+    /// another repository rather than a formatting preference.
+    #[test]
+    fn the_profile_line_is_exactly_these_bytes() {
+        assert_eq!(profile_line(None), "PROFILE: home");
+        assert_eq!(
+            profile_line(Some(&away("Europe/London", Some(UNTIL), "Scotland"))),
+            "PROFILE: away (Europe/London) until 2026-09-07, note: Scotland"
+        );
+        // No note → no trailing clause, rather than an empty one.
+        assert_eq!(
+            profile_line(Some(&away("Europe/London", Some(UNTIL), "   "))),
+            "PROFILE: away (Europe/London) until 2026-09-07"
+        );
+    }
+
+    /// THE DATE RENDERS IN THE PROFILE'S OWN ZONE. The same instant is the 7th in London
+    /// and the 8th in Rome, and telling someone in the UK their trip ends on the 8th
+    /// because the host is in Italy is precisely the off-by-one this feature removes.
+    #[test]
+    fn the_until_date_renders_in_the_profiles_zone_not_the_hosts() {
+        assert!(profile_line(Some(&away("Europe/London", Some(UNTIL), "")))
+            .contains("until 2026-09-07"));
+        assert!(
+            profile_line(Some(&away("Europe/Rome", Some(UNTIL), ""))).contains("until 2026-09-08"),
+            "the same instant is already the 8th in Rome"
+        );
+    }
+
+    /// A record with no expiry says so rather than rendering an epoch date.
+    #[test]
+    fn an_unbounded_period_says_further_notice() {
+        assert_eq!(
+            profile_line(Some(&away("Europe/London", None, ""))),
+            "PROFILE: away (Europe/London) until further notice"
+        );
+    }
+
+    /// The header is the clock line, then the profile line, then — only on a return fire —
+    /// the RETURN line. Nothing else, and in that order.
+    #[test]
+    fn the_header_stacks_clock_profile_and_return_in_that_order() {
+        let zone = SchedulerZone::Named(chrono_tz::Europe::London);
+        let header = clock_header(&zone, None, None);
+        let lines: Vec<&str> = header.lines().collect();
+        assert_eq!(lines.len(), 2, "{header:?}");
+        assert!(lines[0].starts_with("Current date/time: "));
+        assert_eq!(lines[1], "PROFILE: home");
+
+        let with_return = clock_header(
+            &zone,
+            Some(&away("Europe/London", Some(UNTIL), "Scotland")),
+            Some("RETURN: first day back after 13 days away"),
+        );
+        let lines: Vec<&str> = with_return.lines().collect();
+        assert_eq!(lines.len(), 3, "{with_return:?}");
+        assert_eq!(
+            lines[1],
+            "PROFILE: away (Europe/London) until 2026-09-07, note: Scotland"
+        );
+        assert_eq!(lines[2], "RETURN: first day back after 13 days away");
+
+        // A blank return line adds nothing rather than a blank line.
+        assert_eq!(clock_header(&zone, None, Some("   ")).lines().count(), 2);
+    }
+
+    /// THE HEADER IS ONE STRING to everything downstream, and `splice_catchup` finds the
+    /// floor by recomputing its LENGTH. A multi-line header must therefore still splice at
+    /// exactly the floor boundary — this is the invariant that decided where the profile
+    /// line is composed.
+    #[test]
+    fn a_multi_line_header_still_splices_the_catchup_block_at_the_floor() {
+        let zone = SchedulerZone::Named(chrono_tz::Europe::London);
+        let header = clock_header(
+            &zone,
+            Some(&away("Europe/London", Some(UNTIL), "Scotland")),
+            None,
+        );
+        let persona = Persona::default();
+        let prompt = build_prompt_at(
+            &header,
+            "ask",
+            "what is on today?",
+            false,
+            false,
+            None,
+            None,
+            None,
+            false,
+            false,
+            &persona,
+        )
+        .unwrap();
+        let spliced = splice_catchup(&prompt, "CATCH-UP BLOCK", &header, None);
+        assert_eq!(
+            spliced,
+            format!(
+                "{header}\n\nCATCH-UP BLOCK\n\n{}",
+                &prompt[header.len() + 2..]
+            ),
+            "the block lands immediately before the floor, whatever the header's shape"
+        );
+    }
+
+    /// The clock line itself renders in the effective zone — and the HOST arm is left
+    /// byte-for-byte alone, which is what makes a bridge with no profile unchanged.
+    #[test]
+    fn the_clock_line_reads_the_zone_it_is_given() {
+        let utc = clock_line_in(&SchedulerZone::Named(chrono_tz::UTC));
+        assert!(utc.ends_with("(UTC+00:00)."), "{utc}");
+        assert!(
+            utc.contains(" UTC "),
+            "the abbreviation comes from the zone: {utc}"
+        );
+        // The host arm sets no TZ at all, so it is the same call `clock_line` always made.
+        assert_eq!(
+            clock_line().split(", ").next(),
+            clock_line_in(&SchedulerZone::Host).split(", ").next()
+        );
     }
 }

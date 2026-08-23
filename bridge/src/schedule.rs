@@ -151,6 +151,76 @@ pub fn parse_hhmm(raw: &str) -> Result<NaiveTime, String> {
     NaiveTime::from_hms_opt(h, m, 0).ok_or_else(bad)
 }
 
+/// The profiles a job is in scope for — a two-bit set over [`ProfileName`], defaulting to
+/// both.
+///
+/// IT APPLIES TO HEADS AND LINKS ALIKE, exactly as `days` does, and for the same reason:
+/// "the overnight tag1 status report is pointless while I am on holiday" is a statement
+/// about one member of a chain whose other members still matter.
+///
+/// The default is BOTH, so every entry that existed before this key did behaves exactly as
+/// it did. Declaring the key is how a job opts OUT of a profile; there is no way to write
+/// an entry that runs under neither, because a job that can never fire is a typo rather
+/// than an intention (the same rule `days` enforces for an empty weekday list).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Profiles(u8);
+
+impl Default for Profiles {
+    fn default() -> Self {
+        Profiles::ALL
+    }
+}
+
+impl Profiles {
+    /// Both profiles — the default when `profiles` is absent.
+    pub const ALL: Profiles = Profiles(0b11);
+
+    fn bit(p: ProfileName) -> u8 {
+        match p {
+            ProfileName::Home => 0b01,
+            ProfileName::Away => 0b10,
+        }
+    }
+
+    /// Whether this job is in scope under `p`.
+    pub fn contains(self, p: ProfileName) -> bool {
+        self.0 & Profiles::bit(p) != 0
+    }
+
+    /// Whether this is the unrestricted set (used to keep the config echo and the boot
+    /// table terse).
+    pub fn is_all(self) -> bool {
+        self == Profiles::ALL
+    }
+
+    /// The canonical names, home first, for the observability endpoint and the boot table.
+    pub fn names(self) -> Vec<&'static str> {
+        [ProfileName::Home, ProfileName::Away]
+            .into_iter()
+            .filter(|p| self.contains(*p))
+            .map(ProfileName::label)
+            .collect()
+    }
+
+    /// Build a set from configured names. An unrecognized name is an error naming it (the
+    /// entry is then disabled individually); an empty list is an error too.
+    pub fn parse(names: &[String]) -> Result<Profiles, String> {
+        let mut bits = 0u8;
+        for raw in names {
+            let p = ProfileName::parse(raw)
+                .ok_or_else(|| format!("`profiles` contains an unknown profile {raw:?}"))?;
+            bits |= Profiles::bit(p);
+        }
+        if bits == 0 {
+            return Err(
+                "`profiles` is empty — a job that can never fire is a typo, not an intention"
+                    .to_string(),
+            );
+        }
+        Ok(Profiles(bits))
+    }
+}
+
 // ---- The validated entry ----------------------------------------------------
 
 /// What makes a job's predecessor "good enough" to run this link.
@@ -306,6 +376,10 @@ pub struct ScheduleJob {
     /// clock slot — the id of the head it replaced. Reported on `GET /jesse/schedule` so
     /// the promotion is a visible fact rather than a log line someone has to have seen.
     pub promoted_from: Option<String>,
+    /// THE PROFILES THIS JOB IS IN SCOPE FOR. Both by default, so an entry written before
+    /// the key existed is untouched by it. See [`Profiles`] and
+    /// [`crate::scheduler::PROFILE_SKIP`].
+    pub profiles: Profiles,
 }
 
 impl ScheduleJob {
@@ -370,6 +444,11 @@ pub struct Schedule {
     /// — so unlike everything else here they refuse the boot rather than degrading. Main
     /// prints these and exits; see `Schedule::is_fatal`.
     pub fatal: Vec<String>,
+    /// `[profile].on_return`: the job whose chain runs ONCE when an away period ends,
+    /// validated to name an entry that exists. `None` when the key is absent, or when it
+    /// named nothing valid (which is reported in `invalid` rather than being fatal — a
+    /// return chain that cannot be found must not stop the bridge from booting).
+    pub on_return: Option<String>,
 }
 
 impl Schedule {
@@ -446,6 +525,22 @@ pub struct ScheduleToml {
     pub catch_up_secs: Option<u64>,
     pub expect_output: Option<Vec<String>>,
     pub model: Option<String>,
+    pub profiles: Option<Vec<String>>,
+    #[serde(flatten)]
+    pub extra: HashMap<String, toml::Value>,
+}
+
+/// The optional top-level `[profile]` table, exactly as it appears in the config file.
+///
+/// Separate from the `[[schedule]]` array because it is a statement about the SCHEDULE,
+/// not about one job: "when I get back, run this". Unknown keys are captured for the same
+/// reason they are on an entry — a misspelled key that quietly does nothing is the failure
+/// class this whole feature exists to end.
+#[derive(Deserialize, Default, Clone, Debug)]
+pub struct ProfileToml {
+    /// The id of the job whose chain runs ONCE when an away period ends. See
+    /// [`Schedule::on_return`].
+    pub on_return: Option<String>,
     #[serde(flatten)]
     pub extra: HashMap<String, toml::Value>,
 }
@@ -463,6 +558,10 @@ pub struct ValidationContext<'a> {
     pub vault: Option<&'a Path>,
     /// Every id the model registry knows. `Some` enables `model` validation.
     pub model_ids: Option<&'a [String]>,
+    /// The config file's `[profile]` table, if it has one. `None` means the file declared
+    /// none — which is every deploy that has not asked for a return chain — and leaves
+    /// [`Schedule::on_return`] unset.
+    pub profile: Option<&'a ProfileToml>,
 }
 
 /// Reject an `expect_output` pattern that could name a file outside the vault's notes
@@ -575,6 +674,11 @@ fn validate_entry(t: &ScheduleToml, ctx: &ValidationContext) -> Result<ScheduleJ
         None => Days::ALL,
     };
 
+    let profiles = match &t.profiles {
+        Some(names) => Profiles::parse(names)?,
+        None => Profiles::ALL,
+    };
+
     let mode = match t.mode.as_deref().map(str::trim) {
         None | Some("") => DEFAULT_SCHEDULE_MODE.to_string(),
         Some(m) => {
@@ -625,6 +729,7 @@ fn validate_entry(t: &ScheduleToml, ctx: &ValidationContext) -> Result<ScheduleJ
         expect_output,
         model,
         promoted_from: None,
+        profiles,
     })
 }
 
@@ -716,6 +821,33 @@ pub fn validate_schedule_with(raw: &[ScheduleToml], ctx: &ValidationContext) -> 
              with an `at`",
             cycle.join(" -> ")
         ));
+    }
+
+    // `[profile].on_return`, LAST, so it is checked against the entries that survived every
+    // pass above — including a promotion, which can rename the head of the chain it points
+    // at. A key that names nothing is DISABLED and reported by name rather than being
+    // fatal: a return chain nobody can find is a job that does not run, which is bad, and
+    // a bridge that refuses to boot is worse.
+    if let Some(t) = ctx.profile {
+        if let Some(key) = t.extra.keys().min() {
+            out.invalid.push(InvalidEntry {
+                id: "[profile]".to_string(),
+                reason: format!("unknown key `{key}`"),
+            });
+        }
+        match t
+            .on_return
+            .as_deref()
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+        {
+            None => {}
+            Some(id) if out.get(id).is_some() => out.on_return = Some(id.to_string()),
+            Some(id) => out.invalid.push(InvalidEntry {
+                id: "[profile]".to_string(),
+                reason: format!("`on_return` names {id:?}, which is not a valid schedule entry"),
+            }),
+        }
     }
 
     out
@@ -1768,5 +1900,109 @@ mod contract_tests {
         ]);
         assert!(s.get("export").is_some());
         assert!(!s.get("audit").unwrap().is_head());
+    }
+}
+
+#[cfg(test)]
+mod profile_config_tests {
+    use super::*;
+
+    fn parse(toml_text: &str) -> Vec<ScheduleToml> {
+        #[derive(serde::Deserialize)]
+        struct Wrapper {
+            #[serde(default)]
+            schedule: Vec<ScheduleToml>,
+        }
+        toml::from_str::<Wrapper>(toml_text)
+            .expect("the fixture must parse")
+            .schedule
+    }
+
+    /// The default is BOTH, so every entry written before the key existed is untouched by
+    /// it — which is what makes this an additive change rather than a schedule rewrite.
+    #[test]
+    fn an_entry_with_no_profiles_key_is_in_scope_for_both() {
+        let s = validate_schedule(&parse(
+            "[[schedule]]\nid = \"a\"\nat = \"03:30\"\nprompt = \"go\"\n",
+        ));
+        assert!(s.jobs[0].profiles.is_all());
+        assert!(s.jobs[0].profiles.contains(ProfileName::Home));
+        assert!(s.jobs[0].profiles.contains(ProfileName::Away));
+        assert_eq!(s.jobs[0].profiles.names(), vec!["home", "away"]);
+    }
+
+    #[test]
+    fn a_home_only_entry_is_out_of_scope_while_away() {
+        let s = validate_schedule(&parse(
+            "[[schedule]]\nid = \"a\"\nat = \"03:30\"\nprofiles = [\"home\"]\nprompt = \"go\"\n",
+        ));
+        assert!(s.invalid.is_empty(), "{:?}", s.invalid);
+        assert!(s.jobs[0].profiles.contains(ProfileName::Home));
+        assert!(!s.jobs[0].profiles.contains(ProfileName::Away));
+    }
+
+    /// An empty list is a job that can never fire — a typo, not an intention, and refused
+    /// by exactly the rule `days` uses for the same shape.
+    #[test]
+    fn an_empty_profiles_list_disables_the_entry_by_name() {
+        let s = validate_schedule(&parse(
+            "[[schedule]]\nid = \"a\"\nat = \"03:30\"\nprofiles = []\nprompt = \"go\"\n",
+        ));
+        assert!(s.jobs.is_empty());
+        assert_eq!(s.invalid.len(), 1);
+        assert_eq!(s.invalid[0].id, "a");
+        assert!(s.invalid[0].reason.contains("empty"), "{:?}", s.invalid[0]);
+    }
+
+    /// An unknown key in `[profile]` names itself, for the same reason one in a
+    /// `[[schedule]]` entry does: a misspelling that quietly does nothing is the failure
+    /// class this whole feature exists to end.
+    #[test]
+    fn an_unknown_key_in_the_profile_table_is_reported_by_name() {
+        let table = ProfileToml {
+            on_return: None,
+            extra: [("on_retrun".to_string(), toml::Value::String("x".into()))]
+                .into_iter()
+                .collect(),
+        };
+        let s = validate_schedule_with(
+            &parse("[[schedule]]\nid = \"a\"\nat = \"03:30\"\nprompt = \"go\"\n"),
+            &ValidationContext {
+                profile: Some(&table),
+                ..Default::default()
+            },
+        );
+        assert!(s.fatal.is_empty());
+        assert_eq!(s.invalid.len(), 1);
+        assert_eq!(s.invalid[0].id, "[profile]");
+        assert!(s.invalid[0].reason.contains("on_retrun"));
+    }
+
+    /// `on_return` is resolved AFTER promotion, so it names the entry that actually ends up
+    /// holding the chain rather than the one the file named.
+    #[test]
+    fn on_return_is_validated_against_the_entries_that_survived_every_pass() {
+        let dir = std::env::temp_dir().join(format!("jesse-onreturn-{}", random_hex()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // The head's prompt file is missing, so it is disabled and its link is promoted.
+        let raw = parse(
+            "[[schedule]]\nid = \"dead-head\"\nat = \"03:30\"\nprompt_file = \"gone.md\"\n\
+             \n[[schedule]]\nid = \"heir\"\nafter = \"dead-head\"\nprompt = \"go\"\n",
+        );
+        let table = ProfileToml {
+            on_return: Some("heir".to_string()),
+            ..Default::default()
+        };
+        let s = validate_schedule_with(
+            &raw,
+            &ValidationContext {
+                vault: Some(&dir),
+                profile: Some(&table),
+                ..Default::default()
+            },
+        );
+        assert_eq!(s.on_return.as_deref(), Some("heir"));
+        assert_eq!(s.jobs[0].promoted_from.as_deref(), Some("dead-head"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
