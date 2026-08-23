@@ -36,6 +36,19 @@ pub const DEFAULT_CATCH_UP_SECS: u64 = 3600;
 /// and the classifier would make the single most invisible failure invisible again.
 pub const PROMPT_READ_FAILED: &str = "could not read prompt_file";
 
+/// The opening of the reason a HEAD is disabled with when its `prompt_file` does not
+/// exist AT LOAD TIME.
+///
+/// A HEAD ONLY, and the asymmetry is the point. A link with a missing prompt keeps the
+/// old behaviour — it fails at fire time with [`PROMPT_READ_FAILED`], which is loud and
+/// costs one turn's worth of nothing. A HEAD with a missing prompt costs the WHOLE CHAIN:
+/// `morning-health-export` was retired, its prompt file deleted, and for six days the
+/// four-job morning chain reported a `no-prompt` failure every single morning while every
+/// member behind it ran only because each one is `after_on = "any"`. One retired job must
+/// not be able to make its chain's start invisible, so the head is disabled by NAME here
+/// and its first link is PROMOTED into the clock slot it vacated.
+pub const PROMPT_MISSING: &str = "prompt file missing";
+
 /// Default `mode` for a scheduled turn. Scheduled work ACTS (it writes the vault, files
 /// the day, runs the routine), so it takes the acting mode rather than the asking one.
 pub const DEFAULT_SCHEDULE_MODE: &str = "tell";
@@ -218,6 +231,23 @@ impl PromptSource {
         }
     }
 
+    /// Where this prompt would be READ FROM, resolved against the vault root exactly as
+    /// [`load`](Self::load) resolves it. `None` for an inline prompt (there is no file).
+    ///
+    /// Split out of `load` so the loader can ask "does this exist?" without reading the
+    /// text — which is what the head promotion in [`validate_schedule_with`] needs, and
+    /// what the boot table reports.
+    pub fn resolved_path(&self, vault: &Path) -> Option<PathBuf> {
+        match self {
+            PromptSource::Inline(_) => None,
+            PromptSource::File(p) => Some(if p.is_absolute() {
+                p.clone()
+            } else {
+                vault.join(p)
+            }),
+        }
+    }
+
     /// The configured path, for the observability endpoint (never the prompt TEXT — the
     /// endpoint reports what a job is, not what it says).
     pub fn label(&self) -> String {
@@ -250,6 +280,32 @@ pub struct ScheduleJob {
     /// has no clock to be late against), so setting it on one is a config error for that
     /// entry rather than a key that quietly does nothing.
     pub catch_up_secs: u64,
+    /// THE JOB'S OUTPUT CONTRACT: vault-relative globs this job is expected to write.
+    /// Empty (the default) means "no contract" and every behaviour below is absent.
+    ///
+    /// WHY A CONTRACT AND NOT JUST AN OUTCOME. A scheduled turn that starts, talks to the
+    /// model, and returns without writing anything is recorded as `ran`. That is what the
+    /// job store saw and it is not a lie, but it is not the question anyone is asking: the
+    /// vault-lint job exists to produce `Inbox/<date>-vault-lint.md`, and a night where the
+    /// note is absent is a night the job did not do its work, however cleanly the turn
+    /// exited. Declaring the file closes the gap in BOTH directions — a fire whose output
+    /// is already fresh is skipped instead of redone, and a fire that produced nothing is
+    /// [`Outcome::FiredNoOutput`] instead of `ran`.
+    ///
+    /// Tokens (`{date}`, `{year}`, `{month}`, `{day}`) are expanded against the
+    /// OCCURRENCE's instant in the scheduler zone, never against "now": a chain that
+    /// crosses local midnight must still look for the day it was scheduled for. Paths
+    /// resolve under `<vault>/vault/` and are rejected at validation if they could leave
+    /// it. Applies to links exactly as to heads.
+    pub expect_output: Vec<String>,
+    /// Per-job model (a registry id). `None` uses the globally active model, which is
+    /// today's behaviour for every job. Validated at LOAD against the registry, so a typo
+    /// disables that entry by name rather than failing one turn a night later.
+    pub model: Option<String>,
+    /// Set when this entry was a LINK in the config and was promoted into a missing head's
+    /// clock slot — the id of the head it replaced. Reported on `GET /jesse/schedule` so
+    /// the promotion is a visible fact rather than a log line someone has to have seen.
+    pub promoted_from: Option<String>,
 }
 
 impl ScheduleJob {
@@ -388,8 +444,54 @@ pub struct ScheduleToml {
     pub timeout_secs: Option<u64>,
     pub notify: Option<bool>,
     pub catch_up_secs: Option<u64>,
+    pub expect_output: Option<Vec<String>>,
+    pub model: Option<String>,
     #[serde(flatten)]
     pub extra: HashMap<String, toml::Value>,
+}
+
+/// What the validator is allowed to check BEYOND the entry's own text.
+///
+/// Both checks need something `[[schedule]]` does not carry — the vault root, and the set
+/// of model ids that exist — and both are optional so the module stays testable (and
+/// `validate_schedule` stays callable) without a filesystem or a registry behind it.
+/// `None` means "do not perform this check", never "the check failed".
+#[derive(Default, Clone, Copy)]
+pub struct ValidationContext<'a> {
+    /// The vault ROOT (`cfg.vault`), against which a relative `prompt_file` resolves.
+    /// `Some` enables the missing-prompt head disablement and link promotion.
+    pub vault: Option<&'a Path>,
+    /// Every id the model registry knows. `Some` enables `model` validation.
+    pub model_ids: Option<&'a [String]>,
+}
+
+/// Reject an `expect_output` pattern that could name a file outside the vault's notes
+/// directory, or that could never match anything.
+///
+/// Traversal is refused at VALIDATION rather than at match time on purpose: a job whose
+/// contract points outside the vault is a config mistake, and a config mistake must be
+/// visible at boot (in `invalid`, by name) rather than as a silent non-match at 03:30.
+fn validate_output_pattern(raw: &str) -> Result<String, String> {
+    let pat = raw.trim();
+    if pat.is_empty() {
+        return Err("`expect_output` contains an empty pattern".to_string());
+    }
+    if pat.starts_with('/') || pat.starts_with('~') {
+        return Err(format!(
+            "`expect_output` pattern {pat:?} is absolute — patterns are relative to the \
+             vault's notes directory"
+        ));
+    }
+    if Path::new(pat)
+        .components()
+        .any(|c| matches!(c, std::path::Component::ParentDir))
+    {
+        return Err(format!(
+            "`expect_output` pattern {pat:?} contains `..` — a contract must stay inside \
+             the vault"
+        ));
+    }
+    Ok(pat.to_string())
 }
 
 /// Validate one raw entry into a [`ScheduleJob`], or the reason it is disabled.
@@ -397,7 +499,7 @@ pub struct ScheduleToml {
 /// Everything checkable without looking at the other entries happens here; the
 /// cross-entry checks (unknown `after` target, duplicate ids, cycles) are in
 /// [`validate_schedule`].
-fn validate_entry(t: &ScheduleToml) -> Result<ScheduleJob, String> {
+fn validate_entry(t: &ScheduleToml, ctx: &ValidationContext) -> Result<ScheduleJob, String> {
     if let Some(key) = t.extra.keys().min() {
         return Err(format!("unknown key `{key}`"));
     }
@@ -484,6 +586,32 @@ fn validate_entry(t: &ScheduleToml) -> Result<ScheduleJob, String> {
         }
     };
 
+    let expect_output = match &t.expect_output {
+        Some(pats) => pats
+            .iter()
+            .map(|p| validate_output_pattern(p))
+            .collect::<Result<Vec<_>, _>>()?,
+        None => Vec::new(),
+    };
+
+    // A model id is checked against the REGISTRY, not against a syntax rule: the whole
+    // value of the key is that it names a backend that exists, and "opus5" for "opus" is
+    // exactly the typo that would otherwise surface as a failed turn at 03:30.
+    let model = match t.model.as_deref().map(str::trim).filter(|m| !m.is_empty()) {
+        None => None,
+        Some(m) => {
+            if let Some(known) = ctx.model_ids {
+                if !known.iter().any(|k| k == m) {
+                    return Err(format!(
+                        "`model` names {m:?}, which is not in the model registry (known: {})",
+                        known.join(", ")
+                    ));
+                }
+            }
+            Some(m.to_string())
+        }
+    };
+
     Ok(ScheduleJob {
         id,
         enabled: t.enabled.unwrap_or(true),
@@ -494,6 +622,9 @@ fn validate_entry(t: &ScheduleToml) -> Result<ScheduleJob, String> {
         timeout_secs: t.timeout_secs,
         notify: t.notify.unwrap_or(true),
         catch_up_secs: t.catch_up_secs.unwrap_or(DEFAULT_CATCH_UP_SECS),
+        expect_output,
+        model,
+        promoted_from: None,
     })
 }
 
@@ -505,11 +636,19 @@ fn validate_entry(t: &ScheduleToml) -> Result<ScheduleJob, String> {
 /// `after` graph: both mean the config no longer names one unambiguous thing, so
 /// continuing would mean GUESSING which job the operator meant. Those refuse the boot.
 pub fn validate_schedule(raw: &[ScheduleToml]) -> Schedule {
+    validate_schedule_with(raw, &ValidationContext::default())
+}
+
+/// [`validate_schedule`] plus the two checks that need something outside the entry: the
+/// vault (a head whose `prompt_file` is missing) and the model registry (an unknown
+/// `model` id). See [`ValidationContext`]; with the default context this is exactly
+/// [`validate_schedule`].
+pub fn validate_schedule_with(raw: &[ScheduleToml], ctx: &ValidationContext) -> Schedule {
     let mut out = Schedule::default();
 
     // Pass 1: per-entry validation.
     for (i, t) in raw.iter().enumerate() {
-        match validate_entry(t) {
+        match validate_entry(t, ctx) {
             Ok(job) => out.jobs.push(job),
             Err(reason) => out.invalid.push(InvalidEntry {
                 id: t
@@ -542,6 +681,15 @@ pub fn validate_schedule(raw: &[ScheduleToml]) -> Schedule {
         ));
     }
 
+    // Pass 1b: A HEAD WHOSE PROMPT FILE IS GONE. Only reachable with a vault to resolve
+    // against, and only for heads — see [`PROMPT_MISSING`] for why the two are not the
+    // same failure. Runs after the duplicate-id check (a promotion needs `after` targets
+    // to name one unambiguous entry) and before the orphan pass (so a re-pointed link is
+    // still attached by the time that pass looks).
+    if let Some(vault) = ctx.vault {
+        promote_over_missing_heads(&mut out, vault);
+    }
+
     // Pass 2: an `after` that names nothing valid. The target may be absent entirely or
     // may itself have been disabled above; either way this link can never fire, and
     // saying so by name beats leaving it quietly inert.
@@ -571,6 +719,72 @@ pub fn validate_schedule(raw: &[ScheduleToml]) -> Schedule {
     }
 
     out
+}
+
+/// Disable every HEAD whose `prompt_file` does not exist, and hand its clock slot to its
+/// first link.
+///
+/// THE RULE. A head with a missing prompt can never do anything but fail, so it is moved
+/// into [`Schedule::invalid`] by name with [`PROMPT_MISSING`]. Its FIRST direct link (in
+/// config order) becomes a head carrying the vacated `at`, `catch_up_secs` and `days`, and
+/// records `promoted_from`. Any OTHER direct link of the dead head is re-pointed at that
+/// promoted link, keeping its own `after_on`: leaving them pointing at an entry that no
+/// longer exists would have the orphan pass below delete them, which is the silent
+/// disappearance this whole pass exists to prevent.
+///
+/// A head with NO links is simply disabled — there is nothing to promote, and inventing a
+/// new head would be inventing a job.
+///
+/// Only entries declared as heads are considered. A LINK with a missing prompt keeps the
+/// old behaviour and fails at fire time; promotion does not cascade.
+fn promote_over_missing_heads(out: &mut Schedule, vault: &Path) {
+    let missing: Vec<(String, NaiveTime, Days, u64)> = out
+        .jobs
+        .iter()
+        .filter_map(|j| match &j.trigger {
+            Trigger::At(at) => {
+                let path = j.prompt.resolved_path(vault)?;
+                (!path.is_file()).then(|| (j.id.clone(), *at, j.days, j.catch_up_secs))
+            }
+            Trigger::After { .. } => None,
+        })
+        .collect();
+
+    for (dead, at, days, catch_up_secs) in missing {
+        let path = out
+            .get(&dead)
+            .and_then(|j| j.prompt.resolved_path(vault))
+            .map(|p| p.display().to_string())
+            .unwrap_or_default();
+        out.jobs.retain(|j| j.id != dead);
+        out.invalid.push(InvalidEntry {
+            id: dead.clone(),
+            reason: format!("{PROMPT_MISSING}: {path}"),
+        });
+
+        let links: Vec<String> = out
+            .jobs
+            .iter()
+            .filter(|j| j.after() == Some(dead.as_str()))
+            .map(|j| j.id.clone())
+            .collect();
+        let Some(heir) = links.first().cloned() else {
+            continue;
+        };
+        for job in out.jobs.iter_mut() {
+            if job.id == heir {
+                job.trigger = Trigger::At(at);
+                job.days = days;
+                job.catch_up_secs = catch_up_secs;
+                job.promoted_from = Some(dead.clone());
+            } else if job.after() == Some(dead.as_str()) {
+                if let Trigger::After { job: target, .. } = &mut job.trigger {
+                    *target = heir.clone();
+                }
+            }
+        }
+        eprintln!("jesse-bridge: schedule: promoted {heir} to head (prompt missing on {dead})");
+    }
 }
 
 /// Every distinct cycle in the `after` graph, each rendered as the node ids in walk
@@ -1222,5 +1436,337 @@ mod tests {
             "absolute"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod contract_tests {
+    use super::*;
+
+    fn toml_for(id: &str) -> ScheduleToml {
+        ScheduleToml {
+            id: Some(id.to_string()),
+            prompt: Some("go".to_string()),
+            ..Default::default()
+        }
+    }
+
+    fn temp_vault() -> PathBuf {
+        let d = std::env::temp_dir().join(format!("jesse-sched-vault-{}", crate::random_hex()));
+        std::fs::create_dir_all(d.join("prompts")).unwrap();
+        d
+    }
+
+    fn write_prompt(vault: &Path, name: &str) -> String {
+        let rel = format!("prompts/{name}");
+        std::fs::write(vault.join(&rel), "do the thing").unwrap();
+        rel
+    }
+
+    // ---- `expect_output` validation -----------------------------------------
+
+    #[test]
+    fn an_output_contract_is_kept_verbatim_including_its_tokens() {
+        let s = validate_schedule(&[ScheduleToml {
+            at: Some("03:30".into()),
+            expect_output: Some(vec![
+                "Inbox/{date}-vault-lint.md".into(),
+                " reports/{year}/{month}/*.md ".into(),
+            ]),
+            ..toml_for("lint")
+        }]);
+        assert!(s.invalid.is_empty(), "{:?}", s.invalid);
+        assert_eq!(
+            s.get("lint").unwrap().expect_output,
+            vec![
+                "Inbox/{date}-vault-lint.md".to_string(),
+                // Trimmed, but never expanded: the tokens are part of what the operator
+                // wrote and the endpoint reports them as written.
+                "reports/{year}/{month}/*.md".to_string(),
+            ]
+        );
+    }
+
+    /// A contract that could name a file outside the vault is refused AT VALIDATION, by
+    /// name, rather than silently never matching at 03:30.
+    #[test]
+    fn an_output_contract_that_escapes_the_vault_is_refused() {
+        for bad in [
+            "../outside.md",
+            "Inbox/../../etc/passwd",
+            "/etc/passwd",
+            "~/secrets.md",
+            "",
+        ] {
+            let s = validate_schedule(&[ScheduleToml {
+                at: Some("03:30".into()),
+                expect_output: Some(vec![bad.to_string()]),
+                ..toml_for("lint")
+            }]);
+            assert!(s.jobs.is_empty(), "{bad:?} must not produce a runnable job");
+            assert_eq!(s.invalid.len(), 1, "{bad:?}");
+            assert!(
+                s.invalid[0].reason.contains("expect_output"),
+                "{bad:?} -> {}",
+                s.invalid[0].reason
+            );
+        }
+    }
+
+    // ---- per-job `model` -----------------------------------------------------
+
+    #[test]
+    fn a_per_job_model_resolves_when_the_registry_knows_it() {
+        let ids = ["opus".to_string(), "glm-5.2".to_string()];
+        let s = validate_schedule_with(
+            &[ScheduleToml {
+                at: Some("03:30".into()),
+                model: Some(" glm-5.2 ".into()),
+                ..toml_for("lint")
+            }],
+            &ValidationContext {
+                model_ids: Some(&ids),
+                ..Default::default()
+            },
+        );
+        assert!(s.invalid.is_empty(), "{:?}", s.invalid);
+        assert_eq!(s.get("lint").unwrap().model.as_deref(), Some("glm-5.2"));
+    }
+
+    #[test]
+    fn an_unknown_model_id_invalidates_that_entry_and_no_other() {
+        let ids = ["opus".to_string()];
+        let s = validate_schedule_with(
+            &[
+                ScheduleToml {
+                    at: Some("03:30".into()),
+                    model: Some("opus5".into()),
+                    ..toml_for("typo")
+                },
+                ScheduleToml {
+                    at: Some("04:30".into()),
+                    ..toml_for("neighbour")
+                },
+            ],
+            &ValidationContext {
+                model_ids: Some(&ids),
+                ..Default::default()
+            },
+        );
+        assert_eq!(s.invalid.len(), 1);
+        assert_eq!(s.invalid[0].id, "typo");
+        assert!(
+            s.invalid[0].reason.contains("model") && s.invalid[0].reason.contains("opus5"),
+            "{}",
+            s.invalid[0].reason
+        );
+        assert!(
+            s.get("neighbour").is_some(),
+            "a bad entry never takes its neighbours down"
+        );
+    }
+
+    /// With no registry to check against — the pure `validate_schedule` — the key is
+    /// accepted as written. That is what keeps this module testable without a config
+    /// behind it, and it is why the production path always passes the registry.
+    #[test]
+    fn a_model_id_is_kept_when_there_is_no_registry_to_check_it_against() {
+        let s = validate_schedule(&[ScheduleToml {
+            at: Some("03:30".into()),
+            model: Some("anything".into()),
+            ..toml_for("lint")
+        }]);
+        assert_eq!(s.get("lint").unwrap().model.as_deref(), Some("anything"));
+    }
+
+    // ---- promotion over a missing head ---------------------------------------
+
+    /// THE `morning-health-export` CASE. A head whose `prompt_file` was deleted when the
+    /// job was retired fails every single morning and, because every link is
+    /// `after_on = "any"`, takes nothing else down — so the chain runs and the record says
+    /// it failed, six days running, with nobody the wiser. The head is disabled by name and
+    /// its first link inherits the clock slot, so the chain keeps its time and the retired
+    /// job stops pretending to be one.
+    #[test]
+    fn a_head_with_a_missing_prompt_hands_its_clock_slot_to_its_first_link() {
+        let vault = temp_vault();
+        let audit = write_prompt(&vault, "audit.md");
+        let weigh = write_prompt(&vault, "weigh.md");
+        let raw = vec![
+            ScheduleToml {
+                at: Some("06:05".into()),
+                catch_up_secs: Some(7200),
+                days: Some(vec!["mon".into(), "tue".into()]),
+                prompt_file: Some("prompts/gone.md".into()),
+                prompt: None,
+                ..toml_for("export")
+            },
+            ScheduleToml {
+                after: Some("export".into()),
+                after_on: Some("any".into()),
+                prompt_file: Some(audit),
+                prompt: None,
+                ..toml_for("audit")
+            },
+            ScheduleToml {
+                after: Some("audit".into()),
+                after_on: Some("any".into()),
+                prompt_file: Some(weigh),
+                prompt: None,
+                ..toml_for("weigh")
+            },
+        ];
+        let s = validate_schedule_with(
+            &raw,
+            &ValidationContext {
+                vault: Some(&vault),
+                ..Default::default()
+            },
+        );
+
+        assert!(s.get("export").is_none(), "the dead head is gone");
+        let invalid = s
+            .invalid
+            .iter()
+            .find(|e| e.id == "export")
+            .expect("and is reported by name");
+        assert!(
+            invalid.reason.starts_with(PROMPT_MISSING),
+            "{}",
+            invalid.reason
+        );
+
+        let heir = s.get("audit").expect("the first link survives");
+        assert!(heir.is_head(), "and is now a head");
+        assert_eq!(heir.at_label().as_deref(), Some("06:05"));
+        assert_eq!(heir.catch_up_secs, 7200);
+        assert_eq!(heir.days.names(), vec!["mon", "tue"]);
+        assert_eq!(heir.promoted_from.as_deref(), Some("export"));
+
+        // The chain behind it is intact and still in order.
+        assert_eq!(s.chain("audit"), vec!["audit", "weigh"]);
+        let _ = std::fs::remove_dir_all(&vault);
+    }
+
+    /// A dead head with NO links has nothing to promote — it is disabled and that is all.
+    /// Inventing a head would be inventing a job.
+    #[test]
+    fn a_head_with_a_missing_prompt_and_no_links_is_simply_disabled() {
+        let vault = temp_vault();
+        let s = validate_schedule_with(
+            &[ScheduleToml {
+                at: Some("06:05".into()),
+                prompt_file: Some("prompts/gone.md".into()),
+                prompt: None,
+                ..toml_for("lonely")
+            }],
+            &ValidationContext {
+                vault: Some(&vault),
+                ..Default::default()
+            },
+        );
+        assert!(s.jobs.is_empty());
+        assert_eq!(s.invalid.len(), 1);
+        assert_eq!(s.invalid[0].id, "lonely");
+        let _ = std::fs::remove_dir_all(&vault);
+    }
+
+    /// Two links hanging off one dead head: the first is promoted and the SECOND is
+    /// re-pointed at it. Leaving it aimed at an entry that no longer exists would have the
+    /// orphan pass delete it — the silent disappearance this pass exists to prevent.
+    #[test]
+    fn a_second_link_of_a_dead_head_is_re_pointed_at_the_promoted_one() {
+        let vault = temp_vault();
+        let a = write_prompt(&vault, "a.md");
+        let b = write_prompt(&vault, "b.md");
+        let s = validate_schedule_with(
+            &[
+                ScheduleToml {
+                    at: Some("06:05".into()),
+                    prompt_file: Some("prompts/gone.md".into()),
+                    prompt: None,
+                    ..toml_for("dead")
+                },
+                ScheduleToml {
+                    after: Some("dead".into()),
+                    after_on: Some("any".into()),
+                    prompt_file: Some(a),
+                    prompt: None,
+                    ..toml_for("first")
+                },
+                ScheduleToml {
+                    after: Some("dead".into()),
+                    after_on: Some("any".into()),
+                    prompt_file: Some(b),
+                    prompt: None,
+                    ..toml_for("second")
+                },
+            ],
+            &ValidationContext {
+                vault: Some(&vault),
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            s.get("first").unwrap().promoted_from.as_deref(),
+            Some("dead")
+        );
+        assert_eq!(s.get("second").unwrap().after(), Some("first"));
+        assert_eq!(s.chain("first"), vec!["first", "second"]);
+        let _ = std::fs::remove_dir_all(&vault);
+    }
+
+    /// A LINK with a missing prompt keeps today's behaviour: it stays in the schedule and
+    /// fails at fire time with `PROMPT_READ_FAILED`. Promotion is a head-only rule, and it
+    /// does not cascade.
+    #[test]
+    fn a_link_with_a_missing_prompt_is_left_alone() {
+        let vault = temp_vault();
+        let head = write_prompt(&vault, "head.md");
+        let s = validate_schedule_with(
+            &[
+                ScheduleToml {
+                    at: Some("03:30".into()),
+                    prompt_file: Some(head),
+                    prompt: None,
+                    ..toml_for("head")
+                },
+                ScheduleToml {
+                    after: Some("head".into()),
+                    prompt_file: Some("prompts/gone.md".into()),
+                    prompt: None,
+                    ..toml_for("link")
+                },
+            ],
+            &ValidationContext {
+                vault: Some(&vault),
+                ..Default::default()
+            },
+        );
+        assert!(s.invalid.is_empty(), "{:?}", s.invalid);
+        assert!(s.get("link").is_some());
+        assert!(s.get("link").unwrap().promoted_from.is_none());
+        let _ = std::fs::remove_dir_all(&vault);
+    }
+
+    /// Without a vault in the context nothing is promoted — the pure validator behaves
+    /// exactly as it did before this pass existed.
+    #[test]
+    fn no_vault_in_the_context_means_no_promotion() {
+        let s = validate_schedule(&[
+            ScheduleToml {
+                at: Some("06:05".into()),
+                prompt_file: Some("prompts/gone.md".into()),
+                prompt: None,
+                ..toml_for("export")
+            },
+            ScheduleToml {
+                after: Some("export".into()),
+                prompt: Some("go".into()),
+                ..toml_for("audit")
+            },
+        ]);
+        assert!(s.get("export").is_some());
+        assert!(!s.get("audit").unwrap().is_head());
     }
 }

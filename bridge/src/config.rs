@@ -2471,11 +2471,15 @@ impl Config {
         // the harnesses this config actually names. Nothing else about it changed.
         let model_registry = ModelRegistry::from_env(&home);
         let vault = env_string("JESSE_VAULT").unwrap_or_else(|| format!("{home}/vault"));
+        // The ids the `[[schedule]]` `model` key is validated against. Collected before the
+        // literal for the same reason the registry itself is: the schedule is built inside
+        // it and cannot borrow a field of the struct being built.
+        let model_ids: Vec<String> = model_registry.models.iter().map(|m| m.id.clone()).collect();
         Config {
             token: env_string("JESSE_TOKEN").unwrap_or_default(),
             // Capture HOME once — session-path lookups read `cfg.home`, not the env.
             home: home.clone(),
-            vault,
+            vault: vault.clone(),
             bind: env_string("JESSE_BIND").unwrap_or_else(|| "127.0.0.1".to_string()),
             port: env_parse("JESSE_PORT", 8765),
             claude_bin: env_string("JESSE_CLAUDE_BIN").unwrap_or_else(|| "claude".to_string()),
@@ -2601,7 +2605,18 @@ impl Config {
             // collected in `Schedule::fatal` for `main` to refuse the boot on — the same
             // shape as the model gate, so config problems are decided in one place and
             // reported before the socket opens.
-            schedule: Arc::new(validate_schedule(&load_schedule(&home))),
+            // Validated against the VAULT and the MODEL REGISTRY, not just against itself:
+            // a head whose `prompt_file` no longer exists is disabled by name here (and its
+            // first link promoted into the clock slot it vacated — see
+            // `promote_over_missing_heads`), and a `model` that names nothing in the
+            // registry disables that entry rather than failing one turn a night later.
+            schedule: Arc::new(validate_schedule_with(
+                &load_schedule(&home),
+                &ValidationContext {
+                    vault: (!vault.is_empty()).then(|| Path::new(&vault)),
+                    model_ids: Some(&model_ids),
+                },
+            )),
             // The selectable-model registry, MERGED from the built-in ambient opus, the
             // JESSE_MODEL_* env triples, and the declarative `[[models]]` config file (see
             // ModelRegistry::from_env). Always includes the ambient opus default; the other

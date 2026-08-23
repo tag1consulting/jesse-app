@@ -251,7 +251,7 @@ struct LocalConfig {
 ///      whose cwd is not the repo.
 ///
 /// Returns `None` when no candidate exists (the generic-default path).
-fn local_config_path(home: &str) -> Option<PathBuf> {
+pub fn local_config_path(home: &str) -> Option<PathBuf> {
     if let Some(explicit) = env_string("JESSE_CONFIG") {
         let p = PathBuf::from(explicit);
         if p.is_file() {
@@ -323,6 +323,30 @@ pub fn load_schedule(home: &str) -> Vec<ScheduleToml> {
     load_local_config(home)
         .map(|c| c.schedule)
         .unwrap_or_default()
+}
+
+/// The overlay file the bridge actually loaded, or `None` when there is none.
+///
+/// Public so the scheduler can WATCH the same file the config was read from — the watch and
+/// the load resolving the path independently is how they would come to disagree about which
+/// file is authoritative, so there is one resolver and both go through it.
+pub fn loaded_config_path(home: &str) -> Option<PathBuf> {
+    local_config_path(home)
+}
+
+/// Read the `[[schedule]]` array from ONE NAMED FILE, reporting a parse failure instead of
+/// swallowing it.
+///
+/// The boot loader ([`load_schedule`]) soft-fails to an empty list on purpose: a malformed
+/// overlay must not stop the service from starting. A RELOAD needs the opposite — an empty
+/// list and an unparseable file look identical from the outside, and swapping "no jobs" in
+/// for "I could not read your file" would silently retire the whole schedule on a typo.
+pub fn load_schedule_from(path: &Path) -> Result<Vec<ScheduleToml>, String> {
+    let text = std::fs::read_to_string(path)
+        .map_err(|e| format!("could not read {}: {e}", path.display()))?;
+    toml::from_str::<LocalConfig>(&text)
+        .map(|c| c.schedule)
+        .map_err(|e| format!("could not parse {}: {e}", path.display()))
 }
 
 /// Read the `offload_order` list from the same overlay file, blank ids dropped. Absent or

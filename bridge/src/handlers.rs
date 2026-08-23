@@ -98,10 +98,16 @@ impl JesseRequest {
     /// runs every night should start from the vault, not from three months of its own
     /// previous transcripts. The push carries the new turn's job id, so the phone still
     /// opens the finished turn.
-    pub fn scheduled(mode: &str, text: String) -> Self {
+    /// `model` is the entry's optional per-job `model` key: it takes exactly the path a
+    /// phone turn's `model` field takes (validated by `resolve_requested_model`, backing
+    /// only this turn, never touching the stored global default), so a scheduled turn and a
+    /// phone turn resolve a model the same way or not at all. `None` — every job today —
+    /// falls through to the globally active model, byte-for-byte the previous behaviour.
+    pub fn scheduled(mode: &str, text: String, model: Option<String>) -> Self {
         JesseRequest {
             mode: mode.to_string(),
             text,
+            model,
             session_id: None,
             conversation_id: None,
             voice: false,
@@ -113,7 +119,6 @@ impl JesseRequest {
             health_context_unavailable: None,
             meal_corrections_ack: None,
             request_id: None,
-            model: None,
         }
     }
 }
@@ -2312,6 +2317,13 @@ pub fn app(state: AppState) -> Router {
         // next fires, and what happened the last time it came due — so "did the morning
         // routine run today, and how long did it take" is ONE request.
         .route("/jesse/schedule", get(jesse_schedule))
+        // The scheduler's THREE CONTROL VERBS. Everything above answers questions about the
+        // schedule; these are what let someone act on the answer without an ssh session and
+        // a restart — run a chain now, turn one job off until Sunday, and pick up an edit to
+        // the config file. All three take the same bearer auth and the same rate limiter.
+        .route("/jesse/schedule/reload", post(jesse_schedule_reload))
+        .route("/jesse/schedule/:id/fire", post(jesse_schedule_fire))
+        .route("/jesse/schedule/:id/enable", post(jesse_schedule_enable))
         .layer(DefaultBodyLimit::max(body_limit))
         .with_state(state)
 }
