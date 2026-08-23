@@ -165,6 +165,21 @@ CI both run it). See the "Versioning" section of `bridge/README.md`.
   toolbar Ask is still there on every page, and the fix would be onboarding copy rather
   than an icon on every card.
 
+## [bridge 0.90.1] - 2026-08-23
+
+### Fixed
+
+- **The boot table's columns did not line up, on the very first schedule it met.** Its
+  column widths were constants, and `after overnight-vault-lint (any)` is 32 characters
+  against a 26-wide `trigger` column — so every link row shifted the columns after it, and
+  the first one it shifted was `days`, which is the column the whole table exists to make
+  readable. Ids and job names are operator-chosen and unbounded, so any constant there was
+  a constant waiting to be exceeded. Widths are now measured from the content (by character
+  count, not byte length), the rare `promoted-from` / `model` annotations ride on the last
+  column so a single job cannot widen a column for every row, and no row carries trailing
+  whitespace into the log. The regression test asserts that every column starts at the same
+  offset on every row, rather than asserting any particular width.
+
 ## [bridge 0.90.0] - 2026-08-23
 
 ### Fixed
