@@ -259,13 +259,36 @@ pub fn app_completed_sub_line(stamp: &str, escaped_evidence: &str) -> String {
     format!("\t*(app-completed {stamp}: {escaped_evidence})*\n")
 }
 
-/// Normalize a client ISO8601 instant to the sub-line's `YYYY-MM-DD HH:MM`.
+/// Normalize a client ISO8601 instant to the sub-line's `YYYY-MM-DD HH:MM`, rendered in
+/// `zone`.
 ///
 /// Strict, and rejected with a `400` rather than defaulted to the bridge's own
 /// clock: the stamp records when the USER tapped, which matters when a tap is
 /// replayed minutes later, and a silently substituted server time would be a
 /// quiet lie in the vault.
-pub fn stamp_from_iso(at: &str) -> Option<String> {
+///
+/// **THE ZONE IS NOT COSMETIC, AND THIS USED TO BE WRONG.** The stamp is a wall clock
+/// written into the vault and read back by two other programs, so it has to be the wall
+/// clock the person was looking at. Until 0.91.0 this took the first sixteen characters of
+/// `at` verbatim — and the app sends `at` in UTC (`TodayProviding.isoInstant` pins
+/// `secondsFromGMT: 0`), so a checkbox ticked at 00:30 in Rome was written into `Today.md`
+/// as `22:30` **on the previous day**. Every tap between local midnight and the UTC offset
+/// landed on the wrong date, every night, and the morning routine reads these lines when it
+/// decides what to carry over.
+///
+/// So an `at` that CARRIES A ZONE (a `Z` or a `±HH:MM` offset) names an instant, and the
+/// instant is converted into `zone`. An `at` with NO zone designator is a naive local wall
+/// clock the client already rendered, and its fields are taken verbatim exactly as before —
+/// re-interpreting a wall clock the sender never claimed was UTC would be inventing a fact.
+pub fn stamp_from_iso(at: &str, zone: &SchedulerZone) -> Option<String> {
+    if let Ok(instant) = chrono::DateTime::parse_from_rfc3339(at.trim()) {
+        return Some(
+            instant
+                .with_timezone(zone)
+                .format("%Y-%m-%d %H:%M")
+                .to_string(),
+        );
+    }
     let date = at.get(..10).filter(|d| valid_iso_date(d).is_some())?;
     let sep = at.as_bytes().get(10)?;
     if !matches!(sep, b'T' | b't' | b' ') {
@@ -665,6 +688,16 @@ pub fn write_day_file(path: &Path, contents: &str) -> std::io::Result<()> {
 
 // ---- The endpoints ---------------------------------------------------------
 
+/// What `client_tz` is for, once, since three bodies and two query strings carry it.
+///
+/// It names the zone the DEVICE is standing in, IANA (`"Europe/London"`), and it outranks
+/// the away profile for that one request — the phone's own zone is a more specific claim
+/// than a fortnight-long declaration, and when they disagree the phone is where the person
+/// is. Absent, blank, or naming a zone this tz database does not know falls through to the
+/// profile and then to the process zone, so an older app build that never sends it behaves
+/// exactly as it always did.
+pub const CLIENT_TZ_NOTE: &str = "the zone the requesting device is in, IANA";
+
 /// `POST /jesse/today/items/{id}/check` — tick or untick one item.
 #[derive(Deserialize)]
 pub struct CheckBody {
@@ -673,6 +706,9 @@ pub struct CheckBody {
     pub evidence: Option<String>,
     #[serde(default)]
     pub at: String,
+    /// The zone this device is standing in, IANA. Optional; see [`CLIENT_TZ_NOTE`].
+    #[serde(default)]
+    pub client_tz: Option<String>,
 }
 
 /// `POST /jesse/today/items/{id}/move` — reorder one item.
@@ -687,6 +723,9 @@ pub struct MoveBody {
     pub section: Option<String>,
     #[serde(default)]
     pub at: String,
+    /// The zone this device is standing in, IANA. Optional; see [`CLIENT_TZ_NOTE`].
+    #[serde(default)]
+    pub client_tz: Option<String>,
 }
 
 /// `POST /jesse/today/items/{id}/defer` — postpone one item for the day.
@@ -701,6 +740,12 @@ pub struct DeferBody {
     /// a number rather than an ISO instant, exactly as `glance` is.
     #[serde(default)]
     pub at_ms: u64,
+    /// The zone this device is standing in, IANA. Accepted for symmetry with the other two
+    /// mutations — a client sends one body shape, not three — though a defer writes no date
+    /// anywhere: it is a day-scoped store entry, not a line in the document. See
+    /// [`CLIENT_TZ_NOTE`].
+    #[serde(default)]
+    pub client_tz: Option<String>,
 }
 
 /// `POST /jesse/today/glance` — mark one report row seen.
@@ -791,6 +836,18 @@ fn mutation_response(snapshot: &TodaySnapshot, pending: bool) -> Response {
         serde_json::to_string(&value).unwrap_or_default(),
     )
         .into_response()
+}
+
+/// Resolve the zone one request derives its dates in, logging a `client_tz` that named
+/// nothing. The one call every endpoint makes, so the precedence rule lives in exactly one
+/// place ([`effective_tz`]).
+pub fn request_zone(st: &AppState, client_tz: Option<&str>, where_: &str) -> SchedulerZone {
+    if let Some(raw) = client_tz.map(str::trim).filter(|t| !t.is_empty()) {
+        if parse_iana(raw).is_none() {
+            log_bad_client_tz(where_, raw);
+        }
+    }
+    effective_tz(client_tz, &st.profile, system_time_to_ms(SystemTime::now()))
 }
 
 /// The shared body of both file-mutating endpoints.
@@ -937,7 +994,8 @@ pub async fn jesse_today_check(
             "rate limit exceeded".to_string(),
         ));
     }
-    let stamp = stamp_from_iso(&body.at).ok_or((
+    let zone = request_zone(&st, body.client_tz.as_deref(), "POST /jesse/today/…/check");
+    let stamp = stamp_from_iso(&body.at, &zone).ok_or((
         StatusCode::BAD_REQUEST,
         "`at` must be an ISO8601 instant (YYYY-MM-DDTHH:MM…)".to_string(),
     ))?;
@@ -966,7 +1024,10 @@ pub async fn jesse_today_move(
         ));
     }
     let op = MoveOp::parse(body.op.trim(), body.section.as_deref())?;
-    if stamp_from_iso(&body.at).is_none() {
+    // A move writes no stamp into the document — this is a VALIDATION of `at`, so that a
+    // client cannot journal an intent carrying a timestamp a later replay would choke on.
+    let zone = request_zone(&st, body.client_tz.as_deref(), "POST /jesse/today/…/move");
+    if stamp_from_iso(&body.at, &zone).is_none() {
         return Err((
             StatusCode::BAD_REQUEST,
             "`at` must be an ISO8601 instant (YYYY-MM-DDTHH:MM…)".to_string(),
@@ -1309,14 +1370,23 @@ mod tests {
         assert_eq!(multi, "first line second line and a tab");
     }
 
+    /// UTC, for the stamp tests that want the zone out of the way.
+    fn utc_zone() -> SchedulerZone {
+        SchedulerZone::hours_east(0)
+    }
+
+    fn rome() -> SchedulerZone {
+        SchedulerZone::Named(chrono_tz::Europe::Rome)
+    }
+
+    fn london() -> SchedulerZone {
+        SchedulerZone::Named(chrono_tz::Europe::London)
+    }
+
     #[test]
     fn a_stamp_is_parsed_strictly_from_iso8601() {
         assert_eq!(
-            stamp_from_iso("2026-03-03T09:30:15Z").as_deref(),
-            Some("2026-03-03 09:30")
-        );
-        assert_eq!(
-            stamp_from_iso("2026-03-03T09:30:15+01:00").as_deref(),
+            stamp_from_iso("2026-03-03T09:30:15Z", &utc_zone()).as_deref(),
             Some("2026-03-03 09:30")
         );
         for bad in [
@@ -1326,7 +1396,50 @@ mod tests {
             "2026-03-03",
             "2026-03-03T99:99:00Z",
         ] {
-            assert_eq!(stamp_from_iso(bad), None, "{bad:?} must be rejected");
+            assert_eq!(
+                stamp_from_iso(bad, &utc_zone()),
+                None,
+                "{bad:?} must be rejected"
+            );
+        }
+    }
+
+    /// THE REGRESSION. The app sends `at` in UTC, and this used to take the string's first
+    /// sixteen characters verbatim — so a box ticked at 00:30 in Rome (23:30Z the day
+    /// before) was written into the vault as `22:30` on the WRONG DATE. Both halves of the
+    /// stamp now come from the effective zone.
+    #[test]
+    fn a_utc_instant_is_stamped_in_the_effective_zone_not_verbatim() {
+        // 2026-03-03T23:30:00Z is 00:30 on the 4th in Rome, and 23:30 on the 3rd in London.
+        let at = "2026-03-03T23:30:00Z";
+        assert_eq!(
+            stamp_from_iso(at, &rome()).as_deref(),
+            Some("2026-03-04 00:30"),
+            "the Rome tap belongs to the 4th"
+        );
+        assert_eq!(
+            stamp_from_iso(at, &london()).as_deref(),
+            Some("2026-03-03 23:30"),
+            "the same instant is still the 3rd in London"
+        );
+        // An `at` that already carries an OFFSET names an instant just as `Z` does, so it
+        // is converted too rather than having its prefix copied out.
+        assert_eq!(
+            stamp_from_iso("2026-03-03T09:30:15+01:00", &utc_zone()).as_deref(),
+            Some("2026-03-03 08:30")
+        );
+    }
+
+    /// An `at` with NO zone designator is a wall clock the client already rendered. Its
+    /// fields are taken verbatim — re-interpreting it would be inventing a claim the sender
+    /// never made — so this path is byte-for-byte what it always was.
+    #[test]
+    fn a_naive_at_keeps_its_wall_clock_whatever_the_zone() {
+        for zone in [utc_zone(), rome(), london()] {
+            assert_eq!(
+                stamp_from_iso("2026-03-03T09:30", &zone).as_deref(),
+                Some("2026-03-03 09:30")
+            );
         }
     }
 

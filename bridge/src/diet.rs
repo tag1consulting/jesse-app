@@ -1040,11 +1040,23 @@ pub async fn jesse_diet(
                 .into_response());
         }
     };
+    // TODAY'S DATE, and where it comes from is deliberate. The vault's own
+    // `diet-today.js` carries a `date`, and it — not the bridge's clock — is the authority
+    // on which day the diet page is showing: the file is written by the vault-side jobs,
+    // and overriding it with a clock date would serve a day the data is not for.
+    //
+    // The CLOCK is the fallback for a file that carries no date at all, and there the
+    // EFFECTIVE zone is what matters: at 23:30 in London it is already tomorrow in Rome,
+    // and answering with the host's date would page the owner to a day that has not started
+    // where they are standing. It also decides `is_today` and the future-date `404` below.
+    let zone = request_zone(&st, q.client_tz.as_deref(), "GET /jesse/diet");
     let today_date = today
         .get("date")
         .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .to_string();
+        .map(str::trim)
+        .filter(|d| valid_iso_date(d).is_some())
+        .map(str::to_string)
+        .unwrap_or_else(|| local_today_in(&zone));
     let today_mtime = std::fs::metadata(&today_path)
         .and_then(|m| m.modified())
         .ok()
@@ -1294,6 +1306,10 @@ pub async fn jesse_diet(
 #[derive(Deserialize)]
 pub struct DietQuery {
     pub date: Option<String>,
+    /// The zone this device is standing in, IANA. See
+    /// [`crate::todaywrite::CLIENT_TZ_NOTE`].
+    #[serde(default)]
+    pub client_tz: Option<String>,
 }
 
 #[cfg(test)]

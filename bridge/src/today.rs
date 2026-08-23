@@ -1448,6 +1448,7 @@ fn today_response(headers: &HeaderMap, snapshot: &TodaySnapshot) -> Response {
 /// the phone should render an empty day rather than an error.
 pub async fn jesse_today(
     State(st): State<AppState>,
+    Query(q): Query<ClientTzQuery>,
     headers: HeaderMap,
 ) -> Result<Response, ApiError> {
     check_auth(&headers, &st.cfg.token)?;
@@ -1457,8 +1458,21 @@ pub async fn jesse_today(
             "rate limit exceeded".to_string(),
         ));
     }
+    // Resolved (and a bad value logged) even though the day file is undated by design and
+    // this read derives no date of its own: the parameter is part of the endpoint's
+    // contract, and accepting one silently without ever looking at it is how a client comes
+    // to believe it is being honoured somewhere it is not.
+    let _zone = request_zone(&st, q.client_tz.as_deref(), "GET /jesse/today");
     let (_, snapshot) = build_snapshot(&st.cfg);
     Ok(today_response(&headers, &snapshot))
+}
+
+/// The `?client_tz=` query parameter, shared by the read endpoints that take nothing else.
+/// See [`crate::todaywrite::CLIENT_TZ_NOTE`].
+#[derive(Deserialize, Default)]
+pub struct ClientTzQuery {
+    #[serde(default)]
+    pub client_tz: Option<String>,
 }
 
 /// The day file's absolute path: a constant filename joined onto the configured

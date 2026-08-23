@@ -546,6 +546,26 @@ diet_keywords_extra = [
 #                  name instead of failing one turn a night later. It backs only
 #                  this job's turns and never touches the global active model.
 #                  Unset uses whatever is globally active.
+#   profiles       which AWAY PROFILES this job is in scope for. Default both,
+#                  i.e. `["home", "away"]`, so every entry written before this key
+#                  existed is untouched by it. Heads and links alike, exactly like
+#                  `days`. An unknown name, or an empty list (a job that can never
+#                  fire is a typo, not an intention), disables that entry by name.
+#
+#                  DECLARING IT IS HOW A JOB OPTS OUT. `profiles = ["home"]` on
+#                  the work-week status report means that report does not run
+#                  while you are away — and the members BEHIND it in the chain
+#                  still do. This is the one way in which it differs from
+#                  `enabled = false`, and the difference is deliberate: disabling
+#                  a job says "do not run THIS", and a chain stopping there is
+#                  what you asked for; excluding it by profile says "this does not
+#                  APPLY this fortnight", so the member is simply absent and
+#                  everything behind it consults the job it would have followed.
+#                  The skip is recorded (reason "not scheduled under this
+#                  profile") and never pushed — it is the config working.
+#
+#                  Each job's resolved profiles are printed in the boot table and
+#                  reported on GET /jesse/schedule, beside the active profile.
 #
 # A misconfiguration never takes the bridge down. An entry that fails validation
 # (both or neither of `at`/`after`, an unknown `after` target, `catch_up_secs` on
@@ -570,6 +590,56 @@ diet_keywords_extra = [
 # RUNNING SCHEDULE and pushes the first error, so a typo cannot silently retire
 # your jobs. Per-job records are kept by id across the swap.
 #
+# =============================================================================
+# [profile] — the away profile's one schedule-level key
+# =============================================================================
+#
+# The AWAY PROFILE is runtime state, not config: you set it from the phone with
+# POST /jesse/profile and it EXPIRES BY ITSELF. It does exactly three things and
+# knows nothing else about what "away" means —
+#
+#   * it moves the zone every date is derived in (the scheduler's "HH:MM", the
+#     app-completed stamps, the diet page's default day, the prompt's clock line);
+#   * it takes the `profiles`-excluded jobs above out of the schedule;
+#   * it adds ONE line to every prompt, which your vault's own prompts branch on:
+#
+#         PROFILE: home
+#         PROFILE: away (Europe/London) until 2026-09-07, note: Scotland
+#
+# Set it, and come back, like this:
+#
+#   curl -sX POST http://127.0.0.1:8765/jesse/profile \
+#        -H "authorization: Bearer $JESSE_TOKEN" \
+#        -H 'content-type: application/json' \
+#        -d '{"name":"away","tz":"Europe/London",
+#             "until":"2026-09-07T23:59:00+01:00","note":"Scotland"}'
+#
+#   curl -sX POST http://127.0.0.1:8765/jesse/profile \
+#        -H "authorization: Bearer $JESSE_TOKEN" \
+#        -H 'content-type: application/json' -d '{"name":"home"}'
+#
+# `away` REQUIRES a valid IANA zone and a FUTURE `until`. Neither is a formality:
+# a zone the tz database does not know would leave the bridge reporting "away"
+# while quietly deriving host-zone dates, and an unbounded profile is a bridge
+# left in the wrong zone until somebody notices — the failure mode of a manual
+# switch is forgetting to switch back.
+#
+#   on_return      OPTIONAL job id. When an away period ENDS — you post `home`,
+#                  or `until` passes, whether the bridge was running at the time
+#                  or asleep — that job's chain is fired ONCE, on the same path
+#                  POST /jesse/schedule/{id}/fire uses. The turn's prompt carries
+#                  an extra line under the PROFILE one:
+#
+#                      RETURN: first day back after 13 days away
+#
+#                  It fires exactly once, and the fact that it has fired is on
+#                  disk, so a restart does not replay it. Name a job that exists;
+#                  one that does not is reported under `invalid` on
+#                  GET /jesse/schedule rather than refusing the boot.
+
+# [profile]
+# on_return = "morning-brief"
+
 # ---------------------------------------------------------------------------
 # Worked example 1 — an overnight chain: one head, three links
 # ---------------------------------------------------------------------------
@@ -599,6 +669,17 @@ diet_keywords_extra = [
 # after = "overnight-digest"
 # days = ["fri"]
 # prompt_file = "prompts/overnight-archive.md"
+#
+# [[schedule]]
+# id = "overnight-work-status"           # pointless while you are away…
+# after = "overnight-archive"
+# profiles = ["home"]
+# prompt_file = "prompts/overnight-work-status.md"
+#
+# [[schedule]]
+# id = "overnight-wrapup"                # …and this still runs when it is absent
+# after = "overnight-work-status"
+# prompt_file = "prompts/overnight-wrapup.md"
 
 # ---------------------------------------------------------------------------
 # Worked example 2 — a morning chain anchored to a real-world event

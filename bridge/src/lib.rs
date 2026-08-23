@@ -113,6 +113,7 @@ mod persona;
 // `containment` and are always compiled — the startup gate reads them.
 #[cfg(feature = "containment-probe")]
 mod probe;
+mod profile;
 mod prompt;
 mod queue;
 mod ratelimit;
@@ -177,6 +178,7 @@ pub use modelstore::*;
 pub use persona::*;
 #[cfg(feature = "containment-probe")]
 pub use probe::*;
+pub use profile::*;
 pub use prompt::*;
 pub use queue::*;
 pub use ratelimit::*;

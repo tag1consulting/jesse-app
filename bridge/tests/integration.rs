@@ -7667,7 +7667,7 @@ async fn today_check_get_uncheck_get_round_trips_the_file() {
             Some("Bearer test-token"),
             &id,
             Some(&etag),
-            r#"{"checked":true,"evidence":"sent Ada the date","at":"2026-03-03T09:30:00Z"}"#,
+            r#"{"checked":true,"evidence":"sent Ada the date","at":"2026-03-03T09:30:00Z","client_tz":"UTC"}"#,
         ))
         .await
         .unwrap();
@@ -7901,7 +7901,7 @@ async fn today_a_tap_during_a_turn_parks_reads_back_and_replays_at_turn_end() {
             Some("Bearer test-token"),
             &id,
             Some(&etag),
-            r#"{"checked":true,"evidence":"tapped mid-turn","at":"2026-03-03T09:30:00Z"}"#,
+            r#"{"checked":true,"evidence":"tapped mid-turn","at":"2026-03-03T09:30:00Z","client_tz":"UTC"}"#,
         ))
         .await
         .unwrap();
@@ -8408,7 +8408,7 @@ async fn today_a_tap_applied_while_a_turn_thinks_is_repaired_after_the_turn_clob
             Some("Bearer test-token"),
             &id,
             Some(&etag),
-            r#"{"checked":true,"evidence":"tapped while thinking","at":"2026-03-03T09:30:00Z"}"#,
+            r#"{"checked":true,"evidence":"tapped while thinking","at":"2026-03-03T09:30:00Z","client_tz":"UTC"}"#,
         ))
         .await
         .unwrap();
@@ -8928,4 +8928,389 @@ async fn artifacts_an_older_job_file_with_no_field_loads_cleanly() {
     // exactly what it sees for any turn that returned nothing.
     let v = job_to_value(&id, &job).expect("serializes");
     assert!(v["artifacts"].is_null());
+}
+
+// ---- The away profile: the endpoints, and what `client_tz` moves ------------
+
+/// `POST /jesse/profile` with a JSON body.
+fn profile_post(auth: Option<&str>, body: &str) -> Request<Body> {
+    let mut b = Request::builder()
+        .method("POST")
+        .uri("/jesse/profile")
+        .header("content-type", "application/json");
+    if let Some(a) = auth {
+        b = b.header("authorization", a);
+    }
+    b.body(Body::from(body.to_string())).unwrap()
+}
+
+fn profile_get(auth: Option<&str>) -> Request<Body> {
+    let mut b = Request::builder().method("GET").uri("/jesse/profile");
+    if let Some(a) = auth {
+        b = b.header("authorization", a);
+    }
+    b.body(Body::empty()).unwrap()
+}
+
+async fn post_profile(st: &AppState, body: &str) -> (StatusCode, String) {
+    let resp = app(st.clone())
+        .oneshot(profile_post(Some("Bearer test-token"), body))
+        .await
+        .unwrap();
+    let status = resp.status();
+    (status, body_string(resp).await)
+}
+
+/// An RFC 3339 instant a good way into the future, so these tests never rot.
+fn far_future() -> String {
+    let ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64
+        + 14 * 86_400_000;
+    chrono::DateTime::from_timestamp_millis(ms)
+        .unwrap()
+        .to_rfc3339()
+}
+
+#[tokio::test]
+async fn profile_endpoints_require_auth() {
+    let st = test_state();
+    assert_eq!(
+        app(st.clone())
+            .oneshot(profile_get(None))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        app(st.clone())
+            .oneshot(profile_post(None, r#"{"name":"home"}"#))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::UNAUTHORIZED
+    );
+}
+
+/// A bridge nobody has told anything is HOME, and says so — rather than 404ing because the
+/// interesting case is absent.
+#[tokio::test]
+async fn a_bridge_with_no_profile_reports_home() {
+    let st = test_state();
+    let resp = app(st.clone())
+        .oneshot(profile_get(Some("Bearer test-token")))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body: Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    assert_eq!(body["name"], "home");
+    assert_eq!(body["effective"], false);
+    assert_eq!(body["until_ms"], Value::Null);
+    assert_eq!(body["note"], "");
+    assert_eq!(
+        body["tz"], body["process_tz"],
+        "with nothing in force the effective zone IS the process zone"
+    );
+}
+
+/// EVERY WAY OF GETTING `away` WRONG IS A 400 THAT NAMES THE FIELD.
+#[tokio::test]
+async fn setting_away_validates_the_zone_the_deadline_and_the_note() {
+    let st = test_state();
+    let future = far_future();
+
+    // An unknown profile name.
+    let (status, body) = post_profile(&st, r#"{"name":"holiday"}"#).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(body.contains("holiday"), "{body}");
+
+    // A zone this tz database does not know — refused rather than half-honoured, because a
+    // bridge reporting "away" while deriving host-zone dates is the one wrong answer that
+    // looks right.
+    let (status, body) = post_profile(
+        &st,
+        &format!(r#"{{"name":"away","tz":"Mars/Olympus","until":"{future}"}}"#),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(body.contains("IANA"), "{body}");
+
+    // A missing zone.
+    let (status, _) = post_profile(&st, &format!(r#"{{"name":"away","until":"{future}"}}"#)).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+
+    // A deadline that is not RFC 3339.
+    let (status, body) = post_profile(
+        &st,
+        r#"{"name":"away","tz":"Europe/London","until":"next Tuesday"}"#,
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(body.contains("RFC 3339"), "{body}");
+
+    // A deadline in the PAST — an away profile expires by itself, so it must end later
+    // than it starts.
+    let (status, body) = post_profile(
+        &st,
+        r#"{"name":"away","tz":"Europe/London","until":"2020-01-01T00:00:00Z"}"#,
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(body.contains("in the past"), "{body}");
+
+    // A note past the cap — it rides on every prompt, so it is a label, not a paragraph.
+    let long = "x".repeat(81);
+    let (status, body) = post_profile(
+        &st,
+        &format!(r#"{{"name":"away","tz":"Europe/London","until":"{future}","note":"{long}"}}"#),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(body.contains("81"), "{body}");
+
+    // Nothing above changed anything.
+    let resp = app(st.clone())
+        .oneshot(profile_get(Some("Bearer test-token")))
+        .await
+        .unwrap();
+    let body: Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    assert_eq!(
+        body["name"], "home",
+        "a rejected POST must leave the store alone"
+    );
+}
+
+/// The round trip: away, seen everywhere, then home again.
+#[tokio::test]
+async fn an_away_profile_round_trips_through_the_endpoint_the_schedule_and_health() {
+    let st = test_state();
+    let future = far_future();
+    let (status, body) = post_profile(
+        &st,
+        &format!(r#"{{"name":"away","tz":"Europe/London","until":"{future}","note":"Scotland"}}"#),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let body: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(body["name"], "away");
+    assert_eq!(body["tz"], "Europe/London");
+    assert_eq!(body["note"], "Scotland");
+    assert_eq!(body["effective"], true);
+    assert!(body["until_ms"].as_u64().is_some());
+    assert_eq!(body["returned_ms"], Value::Null, "the return is still owed");
+    assert_ne!(
+        body["process_tz"], "Europe/London",
+        "the fixture host is not in London, which is what makes this test mean anything"
+    );
+
+    // `GET /health` carries it, so the phone and the sentinel see it without a second call.
+    let resp = app(st.clone())
+        .oneshot(
+            Request::builder()
+                .uri("/health")
+                .header("authorization", "Bearer test-token")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let health: Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    assert_eq!(health["profile"]["name"], "away");
+    assert_eq!(health["profile"]["tz"], "Europe/London");
+    assert!(health["profile"]["until_ms"].as_u64().is_some());
+
+    // …and so does `GET /jesse/schedule`, whose every fire time it reinterprets.
+    let resp = app(st.clone())
+        .oneshot(
+            Request::builder()
+                .uri("/jesse/schedule")
+                .header("authorization", "Bearer test-token")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let sched: Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    assert_eq!(sched["profile"]["name"], "away");
+    assert_eq!(
+        sched["tz"], "Europe/London",
+        "the SCHEDULER's zone moved too"
+    );
+
+    // Home again, early.
+    let (status, body) = post_profile(&st, r#"{"name":"home"}"#).await;
+    assert_eq!(status, StatusCode::OK);
+    let body: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(body["name"], "home");
+    assert_eq!(body["effective"], false);
+    assert_eq!(
+        body["tz"], body["process_tz"],
+        "dates are derived in the host's zone again"
+    );
+    // The record is KEPT, ended rather than erased, because `on_return` must still fire.
+    assert!(
+        body["since_ms"].as_u64().is_some(),
+        "the ended period is still on record: {body}"
+    );
+
+    // `/health` agrees immediately.
+    let resp = app(st.clone())
+        .oneshot(
+            Request::builder()
+                .uri("/health")
+                .header("authorization", "Bearer test-token")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let health: Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    assert_eq!(health["profile"]["name"], "home");
+}
+
+/// An unauthenticated `/health` must not gain a new field that says where its owner is.
+#[tokio::test]
+async fn health_does_not_leak_the_profile_to_an_unauthenticated_caller() {
+    let st = test_state();
+    let future = far_future();
+    post_profile(
+        &st,
+        &format!(r#"{{"name":"away","tz":"Europe/London","until":"{future}","note":"Scotland"}}"#),
+    )
+    .await;
+    let resp = app(st.clone())
+        .oneshot(
+            Request::builder()
+                .uri("/health")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let body: Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    assert!(
+        body.get("profile").is_none(),
+        "where the owner is is operator detail: {body}"
+    );
+}
+
+/// A `client_tz` naming a zone the tz database does not know must not fail the request —
+/// a stale app build has to be able to tick a checkbox.
+#[tokio::test]
+async fn an_unparseable_client_tz_is_ignored_rather_than_refused() {
+    let (st, vault) = today_state();
+    let day = vault.join("vault/Today.md");
+    let (snapshot, etag) = today_snapshot(&st).await;
+    let id = id_of(&snapshot, "Reply to Ada");
+    let resp = app(st.clone())
+        .oneshot(today_check_request(
+            Some("Bearer test-token"),
+            &id,
+            Some(&etag),
+            r#"{"checked":true,"evidence":"tapped","at":"2026-03-03T09:30:00Z","client_tz":"Mars/Olympus"}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "the tap still lands");
+    assert!(std::fs::read_to_string(&day)
+        .unwrap()
+        .contains("app-completed 2026-03-03 "));
+}
+
+/// THE STAMP FOLLOWS THE CLIENT'S ZONE. The same UTC instant is two different dates in two
+/// zones, and what goes into the vault is the wall clock the person was looking at.
+#[tokio::test]
+async fn the_app_completed_stamp_is_written_in_the_client_zone() {
+    for (tz, expected) in [
+        ("Europe/London", "2026-03-03 23:30"),
+        ("Europe/Rome", "2026-03-04 00:30"),
+        ("America/New_York", "2026-03-03 18:30"),
+    ] {
+        let (st, vault) = today_state();
+        let day = vault.join("vault/Today.md");
+        let (snapshot, etag) = today_snapshot(&st).await;
+        let id = id_of(&snapshot, "Reply to Ada");
+        let resp = app(st.clone())
+            .oneshot(today_check_request(
+                Some("Bearer test-token"),
+                &id,
+                Some(&etag),
+                &format!(
+                    r#"{{"checked":true,"evidence":"tapped","at":"2026-03-03T23:30:00Z","client_tz":"{tz}"}}"#
+                ),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let on_disk = std::fs::read_to_string(&day).unwrap();
+        assert!(
+            on_disk.contains(&format!("app-completed {expected}:")),
+            "{tz} must stamp {expected}, got:\n{on_disk}"
+        );
+    }
+}
+
+/// THE DIET PAGE'S DEFAULT DAY, when the vault file does not name one, comes from the
+/// EFFECTIVE zone — because at 23:30 in London it is already tomorrow in Rome, and paging
+/// the owner to a day that has not started where they are standing is the whole bug.
+///
+/// Pinned with two zones that are 25 hours apart, so they are on different calendar dates
+/// at every instant. Asserting "23:30 London on a Rome host" directly would need the wall
+/// clock frozen, which this path (a `date` child) does not offer — the property is the
+/// same one either way.
+#[tokio::test]
+async fn the_diet_default_date_follows_the_client_zone_when_the_vault_names_none() {
+    let vault = make_diet_vault();
+    // The same fixture with its `date` key removed: the file no longer names a day, so the
+    // clock is the fallback. (With a date present the FILE wins — it is the authority on
+    // which day the page is for, and a clock date would serve a day the data is not.)
+    write_vault_file(
+        &vault,
+        "vault/diet-today.js",
+        "window.DIET_TODAY = {\n  dayStyle: 'normal',\n  meals: [],\n};\n",
+    );
+    write_vault_file(&vault, "diet-logs/weight-log.csv", FIX_WEIGHT_CSV);
+    let st = AppState::new(Config {
+        vault: vault.to_string_lossy().into_owned(),
+        ..test_config()
+    });
+
+    let day_in = |tz: &str| {
+        let st = st.clone();
+        let tz = tz.to_string();
+        async move {
+            let resp = app(st)
+                .oneshot(
+                    Request::builder()
+                        .method("GET")
+                        .uri(format!("/jesse/diet?client_tz={tz}"))
+                        .header("authorization", "Bearer test-token")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+            let body: Value = serde_json::from_str(&body_string(resp).await).unwrap();
+            body["availableDays"]
+                .as_array()
+                .unwrap()
+                .last()
+                .unwrap()
+                .as_str()
+                .unwrap()
+                .to_string()
+        }
+    };
+
+    // +14 and -11: never the same calendar date, at any instant.
+    let east = day_in("Pacific/Kiritimati").await;
+    let west = day_in("Pacific/Niue").await;
+    assert_ne!(
+        east, west,
+        "the default day must come from the requesting zone, not the host's"
+    );
+    let _ = std::fs::remove_dir_all(&vault);
 }

@@ -1530,6 +1530,113 @@ cargo run --release
 > shape, the completion→push decision, and that a push failure can't disturb a
 > stored result, all without contacting Apple.
 
+## The away profile (`GET`/`POST /jesse/profile`, `client_tz`)
+
+The bridge runs under launchd with a fixed `TZ`. When its owner is somewhere
+else for a fortnight with only a phone, three things are wrong at once: every
+date is derived in the wrong zone, part of the job set produces work nobody can
+act on, and no prompt says any of it. The **away profile** is one piece of bridge
+state, settable from the phone and **expiring by itself**, that fixes exactly
+those three and nothing more.
+
+**The bridge does not know what "away" means.** It knows three mechanical
+consequences:
+
+1. **the zone every date is derived in** — the scheduler's `"HH:MM"`, the
+   `app-completed` stamps written into `Today.md`, the diet page's default day,
+   and the prompt's clock line;
+2. **which `[[schedule]]` members are absent** — see `profiles` below;
+3. **one line in every prompt.**
+
+Everything else — what a working day looks like from a hotel, which routines to
+soften — is vault-side prompt text branching on that line. Teaching the bridge the
+*semantics* of being away would mean redeploying a Rust service to change one's
+mind about a routine.
+
+### Setting it
+
+```bash
+# Away, in the UK, until the evening of the 7th.
+curl -sX POST http://127.0.0.1:8765/jesse/profile \
+     -H "authorization: Bearer $JESSE_TOKEN" \
+     -H 'content-type: application/json' \
+     -d '{"name":"away","tz":"Europe/London",
+          "until":"2026-09-07T23:59:00+01:00","note":"Scotland"}'
+
+# Back early.
+curl -sX POST http://127.0.0.1:8765/jesse/profile \
+     -H "authorization: Bearer $JESSE_TOKEN" \
+     -H 'content-type: application/json' -d '{"name":"home"}'
+
+curl -sH "authorization: Bearer $JESSE_TOKEN" http://127.0.0.1:8765/jesse/profile | jq
+```
+
+```json
+{ "name": "away", "tz": "Europe/London", "since_ms": 1756080000000,
+  "until_ms": 1788821940000, "note": "Scotland", "effective": true,
+  "process_tz": "Europe/Rome", "returned_ms": null }
+```
+
+`away` **requires** a valid IANA `tz` and a **future** `until`; anything else is a
+`400` naming the field, and `note` is capped at 80 characters because it rides on
+every prompt. Neither requirement is a formality: a zone the tz database does not
+know would leave the bridge reporting "away" while quietly deriving host-zone
+dates — the one wrong answer that looks right — and an unbounded profile is a
+bridge left in the wrong zone until somebody notices. The failure mode of a manual
+switch is forgetting to switch back, which is why the schedule's `enable` override
+expires too.
+
+`GET /health` (authenticated) carries `profile: {name, tz, until_ms}` so the phone
+and the sentinel see it without a second call; `GET /jesse/schedule` carries the
+same under `profile`, beside the `tz` it reinterprets.
+
+State lives in `<state-dir>/profile.json`, mode 0600, atomic writes — a zone name,
+two instants and a short label, never a secret. With no state dir it is in-memory
+only and a restart brings the bridge home, which is the safe direction to fail.
+
+### The clock line
+
+Every turn's prompt already leads with a clock header. It now carries a second
+line, **byte-stable because the vault's prompts match on it**:
+
+```
+Current date/time: Wednesday, 2026-08-26 07:16 BST (UTC+01:00).
+PROFILE: away (Europe/London) until 2026-09-07, note: Scotland
+```
+
+```
+Current date/time: Wednesday, 2026-08-26 08:16 CEST (UTC+02:00).
+PROFILE: home
+```
+
+Both lines render in the **effective** zone, `until` included — telling someone in
+the UK their trip ends on the 8th because the host is in Italy is exactly the
+off-by-one this removes. On an `[profile].on_return` fire a third line follows:
+`RETURN: first day back after 13 days away`.
+
+### `client_tz`
+
+Every date-deriving endpoint accepts the zone the requesting device is standing
+in: as a field on `POST /jesse` and the Today write bodies (`check`, `move`,
+`defer`), and as a `?client_tz=` query parameter on `GET /jesse/today` and
+`GET /jesse/diet`.
+
+Precedence is **client → profile → process zone**. The client outranks the profile
+because it is the more specific claim — the profile says where its owner is this
+fortnight, the phone says what zone it is in right now — and a *scheduled* turn has
+no client, so it uses the profile. A value naming a zone the tz database does not
+know is logged and **ignored**, never a `400`: a stale app build must still be able
+to tick a checkbox. Omitting it entirely reproduces the previous behaviour exactly.
+
+> **This closed a live bug.** The app sends the Today write bodies' `at` in UTC,
+> and the `app-completed` stamp used to be the first sixteen characters of that
+> string. A box ticked at 00:30 in Rome was therefore written into `Today.md` as
+> `22:30` **on the previous day** — every tap between local midnight and the UTC
+> offset, every night — and the morning routine reads those lines when it decides
+> what to carry over. The stamp is now rendered in the effective zone. An `at`
+> carrying no zone designator is still taken verbatim: that is a wall clock the
+> client already rendered, and re-interpreting it would invent a claim.
+
 ## Scheduled turns (`[[schedule]]`, `GET /jesse/schedule`)
 
 The bridge fires recurring turns itself. Nothing else has to be running: no
@@ -1592,15 +1699,68 @@ links included:
 
 ```
 jesse-bridge: schedule TABLE — 17 job(s), zone Europe/Rome (+02:00)
-jesse-bridge: schedule | id                    kind  trigger                 days       next fire             enabled
-jesse-bridge: schedule | overnight-vault-lint  head  at 03:30                mon,…,sun  fri 2026-08-22 03:30  true
-jesse-bridge: schedule | overnight-currency    link  after …-vault-lint (any) mon,…,sun -                     true
-jesse-bridge: schedule | overnight-tag1-status link  after …-philosophy (any) fri       -                     true
+jesse-bridge: schedule | id                    kind  trigger                  days       profiles   next fire             enabled
+jesse-bridge: schedule | overnight-vault-lint  head  at 03:30                 mon,…,sun  home,away  fri 2026-08-22 03:30  true
+jesse-bridge: schedule | overnight-currency    link  after …-vault-lint (any)  mon,…,sun  home,away  -                     true
+jesse-bridge: schedule | overnight-tag1-status link  after …-philosophy (any)  fri        home       -                     true
 ```
 
 The `ARMED` lines above it name **heads only**, which is why this exists: a `days`
 key on a *link* decides whether the second, third and fourth job of a chain run
-tonight, and before this table it appeared nowhere but the config file itself.
+tonight, and before this table it appeared nowhere but the config file itself. The
+`profiles` column is there for the same reason, and is reprinted whenever the away
+profile changes — every `next fire` in the previous table is wrong once the zone
+moves.
+
+### Profiles (`profiles`, `[profile].on_return`)
+
+A job declares which away profiles it is in scope for. The default is both, so
+every entry written before the key existed is untouched by it:
+
+```toml
+[[schedule]]
+id = "overnight-tag1-status"
+after = "overnight-philosophy"
+profiles = ["home"]            # pointless from a hotel
+prompt_file = "PROMPTS/tag1-status.md"
+```
+
+A member the active profile excludes is skipped with reason **`not scheduled
+under this profile`**, recorded and never pushed (it is the config working). It
+differs from `enabled = false` in exactly one way, and the difference is the
+reason it is a separate word: **a profile skip does not break an `after_on =
+"success"` chain.** Disabling a job is a statement about *that job*, and a chain
+stopping there is its documented meaning; excluding it by profile is a statement
+about the *profile*, so the member is simply absent for the fortnight and
+everything behind it consults the job it would have followed. Marking one report
+home-only must not silently retire the four jobs after it.
+
+A **head** the profile excludes is different: without its clock there is no
+occurrence for its links to belong to, so the occurrence is claimed, recorded, and
+the chain behind it recorded as skipped. Claiming matters as much as recording —
+an unclaimed fortnight of occurrences would all come due the moment the profile
+ends and be skipped in a burst as "missed by 13 days".
+
+One optional top-level table names the chain that runs when a trip ends:
+
+```toml
+[profile]
+on_return = "morning-brief"
+```
+
+It fires **once**, on the same path `POST /jesse/schedule/{id}/fire` uses,
+whichever way the period ended — you posted `home`, `until` passed while the
+bridge was running, or it passed while the host was asleep (expiry is applied on
+read, so all three converge). The turn's prompt carries an extra line under the
+`PROFILE:` one:
+
+```
+RETURN: first day back after 13 days away
+```
+
+That it has fired is recorded on disk beside the period, so a restart does not
+replay it. An `on_return` naming a job that does not exist is listed under
+`invalid` rather than refusing the boot.
 
 ### The output contract (`expect_output`)
 

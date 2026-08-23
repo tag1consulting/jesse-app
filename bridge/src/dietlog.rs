@@ -2000,7 +2000,22 @@ pub async fn commit_diet_logs(vault: &Path, date: &str, hhmm: &str) -> Result<()
 /// computation so it is never absent. The zone is the host's, matching the vault's
 /// per-log convention.
 pub fn local_today() -> String {
-    if let Some(d) = std::process::Command::new("date")
+    local_today_in(&SchedulerZone::Host)
+}
+
+/// Today's date `YYYY-MM-DD` in `zone` — the effective zone for a request, the host's for
+/// the diet pipeline (whose logs follow the vault's per-log host-zone convention). Sets
+/// `TZ` on the `date` child for the same reason [`clock_line_in`] does: one mechanism reads
+/// the local calendar, so two of them cannot disagree.
+pub fn local_today_in(zone: &SchedulerZone) -> String {
+    let mut cmd = std::process::Command::new("date");
+    if let Some(name) = match zone {
+        SchedulerZone::Host => None,
+        other => other.iana_name(),
+    } {
+        cmd.env("TZ", name);
+    }
+    if let Some(d) = cmd
         .env("LC_ALL", "C")
         .arg("+%F")
         .output()
@@ -5697,5 +5712,27 @@ Mercury_ug,Selenium_ug,VitaminD_ug"
         assert_eq!(food.len(), 1);
         assert_eq!(exercise.len(), 1);
         assert_eq!(weight.len(), 1);
+    }
+}
+
+#[cfg(test)]
+mod local_today_tests {
+    use super::*;
+
+    /// TWO ZONES 25 HOURS APART are on different calendar dates at every instant, so this
+    /// pins "the date follows the zone" without freezing a clock the `date` child reads.
+    #[test]
+    fn todays_date_follows_the_zone_it_is_asked_for() {
+        let east = local_today_in(&SchedulerZone::Named(chrono_tz::Pacific::Kiritimati));
+        let west = local_today_in(&SchedulerZone::Named(chrono_tz::Pacific::Niue));
+        assert!(valid_iso_date(&east).is_some(), "{east}");
+        assert!(valid_iso_date(&west).is_some(), "{west}");
+        assert_ne!(east, west, "+14 and -11 are never on the same date");
+        assert!(
+            east > west,
+            "the eastern zone is the later date: {east} vs {west}"
+        );
+        // The host arm sets no TZ and is exactly the call `local_today` always made.
+        assert_eq!(local_today(), local_today_in(&SchedulerZone::Host));
     }
 }
