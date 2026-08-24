@@ -69,22 +69,108 @@ final class BridgeReachabilityProbeTests: XCTestCase {
 
     /// **The woken-laptop case.** One probe fails (the Studio was asleep), the next
     /// succeeds, and the model moves back on its own — no relaunch, no manual refresh.
+    ///
+    /// The clock is passed explicitly because probes are now THROTTLED to one per
+    /// `probeInterval`: a second probe a moment after the first would be skipped, which is
+    /// the whole point of the throttle and is asserted separately below.
     func testAnUnreachableProbeBecomesReachableOnTheNextOne() async {
         let m = model()
+        let t0 = Date(timeIntervalSince1970: 1_000_000)
 
         HealthProbeStubURLProtocol.isReachable = false
-        m.refresh(config: cfg)
+        m.refresh(config: cfg, now: t0)
         await m.settled()
         XCTAssertEqual(m.state, .unreachable)
         XCTAssertTrue(shouldShowOfflineBanner(isConfigured: true, reachability: m.state))
 
         // The lid opens; the wake notification fires a second probe.
         HealthProbeStubURLProtocol.isReachable = true
-        m.refresh(config: cfg)
+        m.refresh(config: cfg, now: t0.addingTimeInterval(BridgeReachabilityModel.probeInterval))
         await m.settled()
         XCTAssertEqual(m.state, .reachable)
         XCTAssertFalse(shouldShowOfflineBanner(isConfigured: true, reachability: m.state),
                        "the banner must clear itself, not wait for a relaunch")
+    }
+
+    // MARK: - The throttle
+
+    /// Three tabs, a scene-phase change and a settings dismissal all ask for a refresh on
+    /// one return to the app. Before the throttle that was five `GET /health` calls, every
+    /// one of them answering the same thing.
+    func testRepeatedRefreshesInsideTheIntervalProbeOnce() async {
+        let m = model()
+        HealthProbeStubURLProtocol.isReachable = true
+        let t0 = Date(timeIntervalSince1970: 2_000_000)
+        for offset in [0.0, 1.0, 5.0, 29.0] {
+            m.refresh(config: cfg, now: t0.addingTimeInterval(offset))
+            await m.settled()
+        }
+        XCTAssertEqual(HealthProbeStubURLProtocol.probeCount, 1)
+
+        // Past the interval it probes again.
+        m.refresh(config: cfg, now: t0.addingTimeInterval(31))
+        await m.settled()
+        XCTAssertEqual(HealthProbeStubURLProtocol.probeCount, 2)
+    }
+
+    /// `force` is for the two events that are real news rather than a repeated question: a
+    /// re-pairing (a different bridge entirely) and the network coming back. In both the
+    /// last answer is known to be about something else.
+    func testForceBypassesTheThrottle() async {
+        let m = model()
+        HealthProbeStubURLProtocol.isReachable = true
+        let t0 = Date(timeIntervalSince1970: 3_000_000)
+        m.refresh(config: cfg, now: t0)
+        await m.settled()
+        m.refresh(config: cfg, force: true, now: t0.addingTimeInterval(1))
+        await m.settled()
+        XCTAssertEqual(HealthProbeStubURLProtocol.probeCount, 2)
+    }
+
+    // MARK: - Learning from real requests
+
+    /// The cheap half of the whole feature: a real bridge call that answered is better
+    /// evidence than a `GET /health` will ever be, so the app largely stops needing to
+    /// probe at all.
+    func testARealRequestOutcomeSetsTheStateAndCountsAsAProbe() async {
+        let m = model()
+        let t0 = Date(timeIntervalSince1970: 4_000_000)
+
+        m.noteRequestOutcome(succeeded: false, now: t0)
+        XCTAssertEqual(m.state, .unreachable)
+
+        // It also satisfies the throttle — there is no point probing something we just
+        // asked directly.
+        HealthProbeStubURLProtocol.isReachable = true
+        m.refresh(config: cfg, now: t0.addingTimeInterval(1))
+        await m.settled()
+        XCTAssertEqual(HealthProbeStubURLProtocol.probeCount, 0)
+        XCTAssertEqual(m.state, .unreachable)
+
+        m.noteRequestOutcome(succeeded: true, now: t0.addingTimeInterval(2))
+        XCTAssertEqual(m.state, .reachable)
+    }
+
+    /// The network coming back re-probes by itself, forced past the throttle — which is
+    /// what makes the offline banner clear without anyone switching tabs.
+    func testFollowingTheMonitorReprobesOnRecovery() async {
+        let m = model()
+        let monitor = ConnectivityMonitor(source: DeadPathSource())
+        m.follow(monitor) { self.cfg }
+        defer { m.unfollow() }
+        await Task.yield()
+
+        HealthProbeStubURLProtocol.isReachable = true
+        monitor.apply(NetworkPathSnapshot(isSatisfied: false, isExpensive: false,
+                                          isConstrained: false, interfaceKind: .unknown))
+        monitor.apply(NetworkPathSnapshot(isSatisfied: true, isExpensive: false,
+                                          isConstrained: false, interfaceKind: .wifi))
+        for _ in 0..<200 where HealthProbeStubURLProtocol.probeCount == 0 {
+            try? await Task.sleep(for: .milliseconds(5))
+        }
+        await m.settled()
+        XCTAssertEqual(HealthProbeStubURLProtocol.probeCount, 1)
+        XCTAssertEqual(m.state, .reachable)
     }
 
     /// An UNPAIRED app is not offline, it is unconfigured — and the pairing screen, not
@@ -110,5 +196,12 @@ final class BridgeReachabilityProbeTests: XCTestCase {
 
         m.adopt(.reachable)
         XCTAssertEqual(m.state, .reachable)
+    }
+}
+
+/// A source that never yields — the monitor's own `apply` is what the test drives.
+private struct DeadPathSource: NetworkPathSource {
+    func paths() -> AsyncStream<NetworkPathSnapshot> {
+        AsyncStream { _ in }
     }
 }

@@ -81,7 +81,7 @@ struct MacTodayView: View {
     /// The Mac's half of the offline story, which until now it did not have at all: no
     /// probe, no banner, no read-only day, and no way to notice it had come back. The
     /// same shared `BridgeReachabilityModel` the phone drives.
-    @State private var reachability = BridgeReachabilityModel()
+    private let reachability = BridgeReachabilityModel.shared
 
     init(configStore: MacConfigStore) {
         self.configStore = configStore

@@ -358,8 +358,15 @@ see the ATS note in [Known installation problems](#known-installation-problems).
 - **Cancel** — every turn runs on the laptop and the app polls (and streams) for
   the result by job id; the bridge hands that id back immediately. Cancel returns
   the thread to idle at once and discards the in-flight result.
-- **Backgrounding** — if you background the app mid-turn, the bridge keeps the
-  turn alive; the reply re-attaches when you reopen the app.
+- **Backgrounding** — a reply that finishes while the phone is in your pocket is
+  **delivered then**, not when you next open the app. The bridge's push wakes Jesse
+  for a few seconds, it fetches the reply and writes it into the conversation, and
+  the notification you see on the lock screen is a notification about something
+  that has already landed. Tapping it opens a thread that is already finished.
+  Nothing is lost if the push never arrives — a periodic background refresh picks
+  up anything still in flight, and reopening the app re-attaches exactly as before.
+  The morning run's push also refreshes the day file and the health snapshot, so
+  the Today tab is current the first time you look at it rather than after a spinner.
 - **Voice / Siri** — "Ask Jesse…" and "Tell Jesse…" Siri phrases route into a new
   thread and read the reply aloud (on-device text-to-speech).
 - **Ask about this (Health tab)** — long-press (iOS) or right-click (macOS) any card,
@@ -413,9 +420,27 @@ see the ATS note in [Known installation problems](#known-installation-problems).
   A checkbox, a move, a postpone, a Quick log, a Start new day or a Propagate is
   refused with a one-line notice, and **nothing is queued**: the day file is
   rewritten in full every morning, so a change held through an outage would replay
-  against a document that has since moved on. Chats are the exception — a message
-  sent while the bridge is unreachable is held in the send outbox with a per-message
-  Retry, exactly as before. Everything catches up on the next successful refresh.
+  against a document that has since moved on.
+
+  Chats are the exception, and they now recover **by themselves**. Jesse watches the
+  network, so the moment the phone is back on one it re-attaches to any turn still
+  running on the laptop, re-sends anything waiting in the send outbox, and refreshes
+  the two cached documents — no tab switch, no Re-check, no per-message Retry tap. A
+  message that cannot be delivered is re-sent on a backoff (5s, 30s, 2min, 10min) and
+  then, after five automatic tries, handed back to its per-message **Retry** button;
+  re-sending is safe because every message carries an idempotency key the bridge
+  dedups on, so a send that actually landed can never become two. Losing signal in
+  the middle of a turn no longer ends in an error at all: Jesse waits for the network
+  instead of blaming the laptop, because the turn is still running there regardless.
+  **Re-check** is still on the screen — it is just no longer the only way back.
+
+- **Frugal mode** — on cellular, and in Low Data Mode, Jesse spends fewer bytes: photos
+  go out at 1280px, it checks for the reply less often, it reuses the health summary it
+  already has rather than fetching a new one, and Settings stops re-polling the model
+  list while it is open. A small leaf appears beside the composer's attach button while
+  this is in force; tap it to see what is being saved and why. Nothing is ever refused —
+  sending, replies, attachments and the day file all work exactly the same, they just
+  cost less. **Settings → Data → "Frugal on cellular"** does the same on every network.
 
 ---
 

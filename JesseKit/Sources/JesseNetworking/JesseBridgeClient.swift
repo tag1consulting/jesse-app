@@ -73,6 +73,10 @@ public struct JesseBridgeClient: BridgeClientProtocol {
     /// from the short calls, so a stalled stream can never make the completion poll wait.
     public let streamSession: URLSession
 
+    /// The URLSession `POST /jesse` goes through — a third session, because a send is the
+    /// one call whose failure LOSES something. See `sendingSession`.
+    public let sendSession: URLSession
+
     /// Where a successful read of the two BROWSABLE documents (the day file and the diet
     /// snapshot) leaves its body, so a later launch with no network has something true
     /// to draw. `nil` — the default — means this client caches nothing, which is what
@@ -102,7 +106,21 @@ public struct JesseBridgeClient: BridgeClientProtocol {
             // through that same stub so one stub serves all endpoints.
             self.streamSession = session
         }
+        // Same rule for the send session, and for the same reason: a test that injects one
+        // stub expects every endpoint — sends included — to go through it.
+        self.sendSession = session === JesseBridgeClient.boundedSession
+            ? JesseBridgeClient.sendingSession
+            : session
+        // Only a client on the PRODUCTION sessions is evidence about the real bridge. A
+        // test's `URLProtocol` stub answers whatever the test scripted, so letting it
+        // drive the app-wide reachability state would make one test's fixture the next
+        // test's starting condition.
+        self.reportsReachability = session === JesseBridgeClient.boundedSession
     }
+
+    /// Whether this client's request outcomes feed `BridgeReachabilityModel.shared`.
+    /// True only for a client built on the production session — see `init`.
+    public let reportsReachability: Bool
 
     // The short request/response calls get a BOUNDED per-request deadline and do NOT
     // wait for connectivity, so each one always either answers or throws — the
@@ -112,6 +130,24 @@ public struct JesseBridgeClient: BridgeClientProtocol {
         c.timeoutIntervalForRequest = 30
         c.timeoutIntervalForResource = 60
         c.waitsForConnectivity = false
+        return URLSession(configuration: c)
+    }()
+
+    // A SEND is the one call whose failure loses something: the reply is on the other
+    // side of it, and the message is in the outbox until it is ACKed. So unlike every
+    // other short call it WAITS for connectivity rather than failing fast — walking into a
+    // tunnel with a message half-sent should mean the send completes on the far side, not
+    // a "Not delivered" line the user has to notice and tap.
+    //
+    // The resource timeout is the real bound: `waitsForConnectivity` suspends the request
+    // timer until there IS a path, so `timeoutIntervalForRequest` alone would never fire
+    // in airplane mode. 120s caps the whole thing, after which the outbox's own backoff
+    // takes over — which is the right owner of a wait measured in minutes.
+    public static let sendingSession: URLSession = {
+        let c = URLSessionConfiguration.default
+        c.timeoutIntervalForRequest = 30
+        c.timeoutIntervalForResource = 120
+        c.waitsForConnectivity = true
         return URLSession(configuration: c)
     }()
 
@@ -153,6 +189,47 @@ public struct JesseBridgeClient: BridgeClientProtocol {
         return req
     }
 
+    // MARK: - Performing a request
+
+    /// Perform one short call, map a transport failure to a `JesseError` naming the host,
+    /// and tell the shared reachability model what just happened.
+    ///
+    /// The twelve endpoints below each used to spell this out for themselves. Collapsing
+    /// them is not tidying: "the last request outcome" only means anything if EVERY
+    /// request reports it, and twelve copies is twelve chances for the next endpoint to
+    /// be the one that does not.
+    private func perform(_ req: URLRequest, on session: URLSession? = nil) async throws
+        -> (Data, URLResponse) {
+        do {
+            let out = try await (session ?? self.session).data(for: req)
+            noteReachability(true)
+            return out
+        } catch {
+            noteReachability(reachedBridge: false, error: error)
+            throw JesseError.from(error, host: config.normalizedHost)
+        }
+    }
+
+    /// Report a completed exchange. `true` means THE BRIDGE ANSWERED — not that it liked
+    /// the request. A `404` for an unknown job id is as good a proof of reachability as a
+    /// reply, so status codes are deliberately not consulted here.
+    private func noteReachability(_ reachedBridge: Bool) {
+        guard reportsReachability else { return }
+        Task { @MainActor in
+            BridgeReachabilityModel.shared.noteRequestOutcome(succeeded: reachedBridge)
+        }
+    }
+
+    /// The failure half, which has one exception: a CANCELLED load says nothing about the
+    /// network. The user tapped Cancel, or a racing sibling task won — treating that as
+    /// "the bridge is unreachable" would put an offline banner on the screen every time
+    /// someone stops a turn.
+    private func noteReachability(reachedBridge: Bool, error: Error) {
+        let ns = error as NSError
+        guard !(ns.domain == NSURLErrorDomain && ns.code == NSURLErrorCancelled) else { return }
+        noteReachability(reachedBridge)
+    }
+
     // MARK: - Send
 
     /// Send a health-free turn. The bridge treats an omitted `health_context` as an
@@ -177,21 +254,75 @@ public struct JesseBridgeClient: BridgeClientProtocol {
 
     /// Encode + POST a fully-built `/jesse` request body and decode the send result. The
     /// seam the iOS layer uses to send a turn carrying the `health_context` block.
+    ///
+    /// # The device stamps
+    ///
+    /// THE ONE PLACE a turn's `client_tz` and `sent_at` are set. Stamped here rather than
+    /// by each caller: the iOS layer builds its own health-laden `JesseRequest` and calls
+    /// straight into this method, so a per-caller stamp would be one build away from a
+    /// turn whose dates are derived in the wrong zone — or from the wrong instant.
+    ///
+    /// `sent_at` is stamped ONCE, before the first attempt, and the re-send below reuses
+    /// it. That is the whole point of the field: an entry the message gave no time for is
+    /// dated from when the phone SENT it, so a turn that waited two minutes for a tunnel
+    /// to end must not be dated from the far side of the tunnel.
+    ///
+    /// # The re-send
+    ///
+    /// A transport failure here is ambiguous in the one way that matters: the body may
+    /// already have reached the bridge, and a turn may already be running. Retrying is
+    /// safe BY CONSTRUCTION rather than by hope — the request carries a `request_id`, the
+    /// bridge dedups on it, and a re-send of a POST that landed returns the SAME job id
+    /// with no second turn spawned (see "Idempotency key" in `bridge/README.md`). One
+    /// retry, not a loop: past that the send outbox owns it, on a schedule measured in
+    /// minutes rather than in socket timeouts.
+    ///
+    /// A request with NO `request_id` is not retried. There is no such caller today, and
+    /// if one ever appears, a duplicate turn is a worse outcome than a surfaced error.
     public func sendPrepared(_ request: JesseRequest) async throws -> JesseSendResult {
         guard var req = authorized("/jesse", method: "POST") else { throw JesseError.notConfigured }
         req.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        // THE ONE PLACE a turn's `client_tz` is set. Stamped here rather than by each
-        // caller: the iOS layer builds its own health-laden `JesseRequest` and calls
-        // straight into this method, so a per-caller stamp would be one build away from a
-        // turn whose dates are derived in the wrong zone.
-        req.httpBody = try Self.encodeBody(request.withClientTz(Self.clientTimeZone))
-        let data: Data, resp: URLResponse
+        let stamped = request.stamped(clientTz: Self.clientTimeZone, sentAt: Self.sentAtStamp())
+        req.httpBody = try Self.encodeBody(stamped)
         do {
-            (data, resp) = try await session.data(for: req)
-        } catch {
-            throw JesseError.from(error, host: config.normalizedHost)
+            let (data, resp) = try await perform(req, on: sendSession)
+            return try Self.decodeSend(data: data, resp: resp)
+        } catch let error as JesseError where Self.isResendable(error, request: stamped) {
+            let (data, resp) = try await perform(req, on: sendSession)
+            return try Self.decodeSend(data: data, resp: resp)
         }
-        return try Self.decodeSend(data: data, resp: resp)
+    }
+
+    /// Whether a failed send may be re-sent on the same `request_id`.
+    ///
+    /// Only a TRANSPORT failure: the bridge either never saw the request or saw it and
+    /// could not answer, and its dedup covers both. A `badResponse` is the bridge
+    /// answering — a 401, a 429, a 413 — and re-sending it would repeat a request that was
+    /// understood and refused. `notConfigured` and `decoding` never reached the wire.
+    static func isResendable(_ error: JesseError, request: JesseRequest) -> Bool {
+        guard let id = request.requestId, !id.isEmpty else { return false }
+        switch error {
+        case .cannotFindHost, .cannotConnect, .timedOut, .connectionLost, .transport:
+            return true
+        // ATS refused the load locally; the bytes never left the device and never will,
+        // so a retry is a second identical refusal.
+        case .insecureBlocked, .notConfigured, .badResponse, .decoding:
+            return false
+        }
+    }
+
+    /// The instant this device says it sent the turn: RFC3339 with the DEVICE's offset,
+    /// not UTC.
+    ///
+    /// The offset is the load-bearing half. The bridge derives a diet day from
+    /// `sent_at` minus four hours in the effective zone, and an offset-less stamp would
+    /// hand it an instant with no statement about which clock the person was reading.
+    /// `.withInternetDateTime` already includes the colon separator RFC3339 requires.
+    static func sentAtStamp(_ date: Date = Date()) -> String {
+        let f = ISO8601DateFormatter()
+        f.timeZone = .current
+        f.formatOptions = [.withInternetDateTime]
+        return f.string(from: date)
     }
 
     // MARK: - Poll
@@ -202,12 +333,7 @@ public struct JesseBridgeClient: BridgeClientProtocol {
         guard let req = authorized("/jesse/result/\(jobId)", method: "GET") else {
             throw JesseError.notConfigured
         }
-        let data: Data, resp: URLResponse
-        do {
-            (data, resp) = try await session.data(for: req)
-        } catch {
-            throw JesseError.from(error, host: config.normalizedHost)
-        }
+        let (data, resp) = try await perform(req)
         return try Self.decodeResult(data: data, resp: resp)
     }
 
@@ -218,12 +344,7 @@ public struct JesseBridgeClient: BridgeClientProtocol {
         guard let req = authorized("/jesse/artifact/\(id)", method: "GET") else {
             throw JesseError.notConfigured
         }
-        let data: Data, resp: URLResponse
-        do {
-            (data, resp) = try await session.data(for: req)
-        } catch {
-            throw JesseError.from(error, host: config.normalizedHost)
-        }
+        let (data, resp) = try await perform(req)
         return try Self.decodeArtifact(data: data, resp: resp)
     }
 
@@ -259,12 +380,7 @@ public struct JesseBridgeClient: BridgeClientProtocol {
         guard let req = authorized("/health", method: "GET", requireToken: false) else {
             throw JesseError.notConfigured
         }
-        let data: Data, resp: URLResponse
-        do {
-            (data, resp) = try await session.data(for: req)
-        } catch {
-            throw JesseError.from(error, host: config.normalizedHost)
-        }
+        let (data, resp) = try await perform(req)
         return try Self.decodeHealth(data: data, resp: resp)
     }
 
@@ -304,12 +420,7 @@ public struct JesseBridgeClient: BridgeClientProtocol {
             archivedUpdatedMs: archived.map { UInt64(max(0, $0.updatedMs)) })
         req.setValue("application/json", forHTTPHeaderField: "Content-Type")
         req.httpBody = try Self.encodeBody(body)
-        let data: Data, resp: URLResponse
-        do {
-            (data, resp) = try await session.data(for: req)
-        } catch {
-            throw JesseError.from(error, host: config.normalizedHost)
-        }
+        let (data, resp) = try await perform(req)
         guard let http = resp as? HTTPURLResponse else { throw JesseError.decoding }
         if (200..<300).contains(http.statusCode) || http.statusCode == 404 { return }
         throw JesseError.badResponse(http.statusCode, String(data: data, encoding: .utf8) ?? "")
@@ -325,12 +436,7 @@ public struct JesseBridgeClient: BridgeClientProtocol {
         guard let req = authorized("/jesse/models", method: "GET") else {
             throw JesseError.notConfigured
         }
-        let data: Data, resp: URLResponse
-        do {
-            (data, resp) = try await session.data(for: req)
-        } catch {
-            throw JesseError.from(error, host: config.normalizedHost)
-        }
+        let (data, resp) = try await perform(req)
         guard let http = resp as? HTTPURLResponse else { throw JesseError.decoding }
         guard (200..<300).contains(http.statusCode) else {
             throw JesseError.badResponse(http.statusCode, String(data: data, encoding: .utf8) ?? "")
@@ -378,12 +484,7 @@ public struct JesseBridgeClient: BridgeClientProtocol {
         guard var req = authorized("/jesse/device", method: "POST") else { throw JesseError.notConfigured }
         req.setValue("application/json", forHTTPHeaderField: "Content-Type")
         req.httpBody = try Self.encodeBody(JesseDeviceRegistration(token: token))
-        let data: Data, resp: URLResponse
-        do {
-            (data, resp) = try await session.data(for: req)
-        } catch {
-            throw JesseError.from(error, host: config.normalizedHost)
-        }
+        let (data, resp) = try await perform(req)
         guard let http = resp as? HTTPURLResponse else { throw JesseError.decoding }
         guard (200..<300).contains(http.statusCode) else {
             throw JesseError.badResponse(http.statusCode, String(data: data, encoding: .utf8) ?? "")
@@ -402,12 +503,7 @@ public struct JesseBridgeClient: BridgeClientProtocol {
     /// act on) both mean success, and only a genuine transport/auth/5xx failure throws.
     func idempotentCall(_ path: String, method: String) async throws {
         guard let req = authorized(path, method: method) else { throw JesseError.notConfigured }
-        let data: Data, resp: URLResponse
-        do {
-            (data, resp) = try await session.data(for: req)
-        } catch {
-            throw JesseError.from(error, host: config.normalizedHost)
-        }
+        let (data, resp) = try await perform(req)
         guard let http = resp as? HTTPURLResponse else { throw JesseError.decoding }
         if (200..<300).contains(http.statusCode) || http.statusCode == 404 { return }
         throw JesseError.badResponse(http.statusCode, String(data: data, encoding: .utf8) ?? "")
@@ -437,12 +533,7 @@ public struct JesseBridgeClient: BridgeClientProtocol {
         req.setValue("Bearer \(config.token)", forHTTPHeaderField: "Authorization")
         if let etag { req.setValue(etag, forHTTPHeaderField: "If-None-Match") }
 
-        let data: Data, resp: URLResponse
-        do {
-            (data, resp) = try await session.data(for: req)
-        } catch {
-            throw JesseError.from(error, host: config.normalizedHost)
-        }
+        let (data, resp) = try await perform(req)
         guard let http = resp as? HTTPURLResponse else { throw JesseError.decoding }
         if http.statusCode == 304 { return .notModified }
         guard (200..<300).contains(http.statusCode) else {
@@ -483,12 +574,7 @@ public struct JesseBridgeClient: BridgeClientProtocol {
         req.httpMethod = "GET"
         req.setValue("Bearer \(config.token)", forHTTPHeaderField: "Authorization")
 
-        let data: Data, resp: URLResponse
-        do {
-            (data, resp) = try await session.data(for: req)
-        } catch {
-            throw JesseError.from(error, host: config.normalizedHost)
-        }
+        let (data, resp) = try await perform(req)
         guard let http = resp as? HTTPURLResponse else { throw JesseError.decoding }
         guard (200..<300).contains(http.statusCode) else {
             throw JesseError.badResponse(http.statusCode, String(data: data, encoding: .utf8) ?? "")
@@ -518,7 +604,18 @@ public struct JesseBridgeClient: BridgeClientProtocol {
         req.setValue("Bearer \(config.token)", forHTTPHeaderField: "Authorization")
         req.httpBody = body
 
-        guard let (data, resp) = try? await session.data(for: req),
+        // A title that cannot be minted is not an error the user is ever shown, so this
+        // still swallows everything — but the round trip is real, so it is reported like
+        // any other (and a CANCELLED one is not, which is why this is a `catch` and no
+        // longer a `try?`).
+        var attempt: (Data, URLResponse)?
+        do {
+            attempt = try await session.data(for: req)
+            noteReachability(true)
+        } catch {
+            noteReachability(reachedBridge: false, error: error)
+        }
+        guard let (data, resp) = attempt,
               let http = resp as? HTTPURLResponse,
               (200..<300).contains(http.statusCode),
               let obj = try? JSONDecoder().decode(JesseTitleResponse.self, from: data),
@@ -578,12 +675,7 @@ public struct JesseBridgeClient: BridgeClientProtocol {
     /// Fetch the bridge's built-in Ask/Tell wrapper defaults (`GET /jesse/prompts`).
     public func fetchPrompts() async throws -> PromptDefaults {
         guard let req = authorized("/jesse/prompts", method: "GET") else { throw JesseError.notConfigured }
-        let data: Data, resp: URLResponse
-        do {
-            (data, resp) = try await session.data(for: req)
-        } catch {
-            throw JesseError.from(error, host: config.normalizedHost)
-        }
+        let (data, resp) = try await perform(req)
         return try Self.decodePrompts(data: data, resp: resp)
     }
 
@@ -610,7 +702,11 @@ public struct JesseBridgeClient: BridgeClientProtocol {
         let data: Data, resp: URLResponse
         do {
             (data, resp) = try await session.data(for: req)
+            noteReachability(true)
         } catch {
+            // Its own error taxonomy (the Health tab renders each case differently), but
+            // the same reachability report — this is a real round trip like any other.
+            noteReachability(reachedBridge: false, error: error)
             let je = JesseError.from(error, host: config.normalizedHost)
             throw DietFetchError.unreachable(je.errorDescription ?? "Couldn't reach the bridge.")
         }

@@ -24,6 +24,15 @@ struct JesseApp: App {
         WindowGroup {
             RootTabView(storeError: store.openFailure)
                 .environment(coordinator)
+                .task {
+                    // Let the background worker reach the live coordinator, so a reply
+                    // fetched while the app was in a pocket also clears the spinner and
+                    // ends the Live Activity rather than waiting for the next foreground
+                    // poll to discover it. A push can also launch the app straight into
+                    // the background, where this never runs — which is why
+                    // `BackgroundDelivery` works without a coordinator too.
+                    AppDelegate.delivery.attach(coordinator: coordinator)
+                }
         }
         .modelContainer(store.container)
     }

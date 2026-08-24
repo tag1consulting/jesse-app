@@ -40,6 +40,21 @@ struct ThreadDetailView: View {
     @State private var showFileImporter = false
     @State private var showCamera = false
     @State private var attachError: String?
+    // Whether the composer's frugal glyph has been tapped for its explanation.
+    @State private var showFrugalExplanation = false
+
+    /// The frugal decision this composer is drawing: the live path plus the Settings
+    /// toggle.
+    ///
+    /// It reads `ConnectivityMonitor.shared.path` directly rather than going through
+    /// `FrugalSettings`, so this view RE-RENDERS when the path changes: the monitor is
+    /// `@Observable`, and the off-main mirror the rest of the app reads is a plain value,
+    /// which cannot be observed. Computed (not stored) so the memberwise initializer stays
+    /// internal — a stored property with a default makes it private, and two other screens
+    /// construct this view.
+    private var frugalPolicy: FrugalPolicy {
+        FrugalPolicy.decide(path: ConnectivityMonitor.shared.path, forcedOn: FrugalSettings.isForced)
+    }
 
     // Every persisted outbox record; filtered per-turn below. Small (only messages
     // in flight or failed live here), and observed so a message flipping to `.failed`
@@ -443,12 +458,14 @@ struct ThreadDetailView: View {
 
             HStack {
                 attachButton
+                if frugalPolicy.isActive { frugalGlyph }
                 SendButton(
                     running: running,
                     startDate: coordinator.startDate(for: thread.id),
                     title: turns.isEmpty ? thread.modeValue.label : "Follow up",
                     disabled: sendDisabled,
-                    action: send
+                    action: send,
+                    fps: frugalPolicy.sendSweepFPS
                 )
                 if running {
                     Button("Cancel") { coordinator.cancel(thread.id) }
@@ -473,6 +490,33 @@ struct ThreadDetailView: View {
             CameraPicker(onCapture: handleCameraCapture,
                          onCancel: { showCamera = false })
                 .ignoresSafeArea()
+        }
+    }
+
+    /// The one visible sign that frugal mode is in force: a small leaf beside the attach
+    /// button. Tapping it says what is being saved and why.
+    ///
+    /// A glyph and not a banner, deliberately. Nothing is being refused — every decision
+    /// frugal mode makes is "cheaper", never "not allowed" — so a bar across the composer
+    /// would be announcing a problem that does not exist. What it has to do is answer the
+    /// one question a person actually asks: "why did that photo look soft?"
+    private var frugalGlyph: some View {
+        Button {
+            showFrugalExplanation = true
+        } label: {
+            Image(systemName: "leaf")
+                .font(.body)
+                .foregroundStyle(.secondary)
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel("Frugal mode is on")
+        .accessibilityHint("Explains what Jesse is doing to use less data.")
+        .popover(isPresented: $showFrugalExplanation) {
+            Text(frugalPolicy.explanation)
+                .font(.callout)
+                .padding()
+                .frame(maxWidth: 320)
+                .presentationCompactAdaptation(.popover)
         }
     }
 
@@ -694,7 +738,8 @@ struct ThreadDetailView: View {
         // output is always JPEG, so the display name gets a `.jpg` extension.
         var data = data
         var suggestedName = suggestedName
-        if let fitted = AttachmentDownscaler.fitToCap(data, cap: AttachmentLimits.maxBytesPerFile) {
+        if let fitted = AttachmentDownscaler.fitToCap(data, cap: AttachmentLimits.maxBytesPerFile,
+                                                     frugal: FrugalSettings.current()) {
             data = fitted
             suggestedName = suggestedName.map(AttachmentDownscaler.jpegFilename(from:))
         }
@@ -974,10 +1019,20 @@ enum SendButtonCadence {
     nonisolated static let sweepInterval: TimeInterval = 1.0 / 30.0
     /// Frame interval once the sweep is complete: only the whole-second counter changes.
     nonisolated static let settledInterval: TimeInterval = 1
+    /// The sweep's frame rate off the frugal path — the `sweepInterval` above, as an FPS.
+    nonisolated static let defaultFPS: Double = 1.0 / sweepInterval
 
     /// How long to wait before the next tick, for a turn that started `elapsed` ago.
-    nonisolated static func tickInterval(elapsed: TimeInterval) -> TimeInterval {
-        elapsed < fillSweepSeconds ? sweepInterval : settledInterval
+    ///
+    /// `fps` is the sweep's frame rate, which frugal mode drops to 1 — at which point the
+    /// sweep and the settled counter have the same cadence and the button simply stops
+    /// animating. That is the right trade on a metered link: the sweep is decoration on a
+    /// screen whose content is not changing, and the phone is better off asleep between
+    /// whole seconds.
+    nonisolated static func tickInterval(elapsed: TimeInterval, fps: Double = 30) -> TimeInterval {
+        guard elapsed < fillSweepSeconds else { return settledInterval }
+        guard fps > 0 else { return settledInterval }
+        return min(1.0 / fps, settledInterval)
     }
 }
 
@@ -991,6 +1046,8 @@ enum SendButtonCadence {
 struct SendButtonSchedule: TimelineSchedule {
     /// When the running turn started; `nil` when nothing is running (→ a static button).
     let turnStart: Date?
+    /// The sweep's frame rate. Frugal mode passes 1; see `SendButtonCadence.tickInterval`.
+    var fps: Double = SendButtonCadence.defaultFPS
 
     func entries(from startDate: Date, mode: TimelineScheduleMode) -> AnyIterator<Date> {
         guard let turnStart else {
@@ -1012,7 +1069,7 @@ struct SendButtonSchedule: TimelineSchedule {
             let elapsed = entry.timeIntervalSince(turnStart)
             next = entry.addingTimeInterval(
                 lowPower ? SendButtonCadence.settledInterval
-                         : SendButtonCadence.tickInterval(elapsed: elapsed))
+                         : SendButtonCadence.tickInterval(elapsed: elapsed, fps: fps))
             return entry
         }
     }
@@ -1026,13 +1083,16 @@ struct SendButton: View {
     let title: String
     let disabled: Bool
     let action: () -> Void
+    /// The sweep's frame rate. Defaulted so every existing caller and every preview is
+    /// unchanged; the composer passes the frugal policy's value.
+    var fps: Double = SendButtonCadence.defaultFPS
 
     /// Seconds for the left→right "thinking" fill to sweep fully across, and the
     /// threshold past which the elapsed-seconds counter is shown.
     private static let fillSweepSeconds: Double = SendButtonCadence.fillSweepSeconds
 
     var body: some View {
-        TimelineView(SendButtonSchedule(turnStart: running ? startDate : nil)) { context in
+        TimelineView(SendButtonSchedule(turnStart: running ? startDate : nil, fps: fps)) { context in
             let elapsed = (running ? startDate.map { context.date.timeIntervalSince($0) } : nil) ?? 0
             let secs = Int(elapsed)
             Button(action: action) {

@@ -577,9 +577,16 @@ public enum OutboxState: String {
 /// per-message Retry re-runs the transmit with the SAME `id`, so the bridge dedups
 /// if the original POST actually landed).
 ///
+/// A `.failed` item is ALSO retried automatically now, on a bounded backoff
+/// (`OutboxRetrySchedule`) and on the network coming back — five automatic sends, then it
+/// is the button's again. The two fields that drive it (`automaticAttempts`, `nextRetryAt`)
+/// live here rather than in memory so a relaunch resumes the same schedule rather than
+/// granting a fresh budget.
+///
 /// `id` IS the wire `request_id` (the bridge's idempotency key). All properties are
 /// defaulted so existing stores lightweight-migrate, matching how `TurnAttachment`
-/// was added. Registered in `AppModelContainer` via `JesseSchemaV2`.
+/// was added — including the two above, which is what makes this a lightweight migration
+/// and not a migration plan. Registered in `AppModelContainer` via `JesseSchemaV2`.
 @Model
 public final class OutboxItem {
     // This IS the wire `request_id` sent as `request_id` on `POST /jesse`.
@@ -601,6 +608,19 @@ public final class OutboxItem {
     // How many times a transmit of this message has failed pre-ACK.
     public var attempts: Int = 0
     public var createdAt: Date = Date()
+    // How many times the app has re-sent this message BY ITSELF (a path recovery, or a
+    // backoff coming due) — distinct from `attempts`, which counts every failure including
+    // the ones a human asked for. The cap in `OutboxRetrySchedule` is against this one, so
+    // tapping Retry never spends the automatic budget and hitting the automatic cap never
+    // disables the button. Reset to 0 on a manual Retry: a human saying "try again" is a
+    // statement that the situation has changed, and the schedule should believe them.
+    public var automaticAttempts: Int = 0
+    // When the next automatic send becomes due, or nil when there is not going to be one
+    // (never failed, or the automatic budget is spent). Persisted rather than held in a
+    // timer so a relaunch resumes the same schedule instead of restarting it — a message
+    // that has already used four of its five attempts must not get five more because the
+    // app was killed.
+    public var nextRetryAt: Date?
 
     @Relationship(deleteRule: .cascade, inverse: \OutboxAttachment.item)
     public var attachments: [OutboxAttachment] = []

@@ -3,6 +3,7 @@ import SwiftData
 import SwiftUI
 import UIKit
 import JesseCore
+import JesseNetworking
 
 // App-scoped run manager. Lives above the views (owned by `JesseApp`) so a run
 // keeps going while you navigate back to the list and start another. Keyed by
@@ -183,6 +184,12 @@ final class RunCoordinator {
     // asserts this stays ≪ the delta count (the coalescing win); production ignores it.
     @ObservationIgnored private(set) var partialPublishCount = 0
 
+    // The subscription to path changes that drives `recoverAfterNetworkReturned`.
+    @ObservationIgnored private var connectivityTask: Task<Void, Never>?
+    // The single armed wakeup for the next due automatic outbox retry. One for the whole
+    // outbox (re-armed to the earliest due date), not one per message.
+    @ObservationIgnored private var outboxRetryTask: Task<Void, Never>?
+
     // threadIDs that have already spent their ONE health-fulfillment retry for the
     // current user message (a reply carried JESSE_NEEDS_HEALTH → we fulfilled + re-
     // sent). Cleared at the start of each new `send`, so the retry is at most once
@@ -224,6 +231,21 @@ final class RunCoordinator {
     // UNUserNotificationCenter.
     private let onFirstSuccess: @MainActor () -> Void
 
+    // The current frugal decision, read at each of the sites that spends bytes. Injected
+    // so a test drives the table without a radio; production reads the live path plus the
+    // Settings toggle.
+    private let frugal: @MainActor () -> FrugalPolicy
+    // Whether this device currently has a usable network. Distinct from "the bridge is
+    // reachable" — see `ConnectivityMonitor` — and consulted at exactly one place: the
+    // poll loop, deciding whether a transport error is "the bridge is asleep" (surface
+    // Re-check) or "we are in a tunnel" (wait).
+    private let pathIsSatisfied: @MainActor () -> Bool
+    // Wait for the network to come back, bounded. Returns whether it did.
+    private let awaitPath: @MainActor (TimeInterval) async -> Bool
+    // Replays whatever an offline intent queue is holding, on every recovery. A no-op
+    // until P8 lands one — see `IntentReplaying`.
+    private let intentReplayer: any IntentReplaying
+
     // Drives the in-flight-turn Live Activity (Lock Screen / Dynamic Island). A
     // thin ActivityKit seam so this file never imports ActivityKit and the test
     // suite injects a no-op — the device-only Live Activity runtime is never
@@ -246,6 +268,11 @@ final class RunCoordinator {
          mealWriter: MealHealthWriter? = nil,
          sessionDeletionStore: PendingSessionDeletionStore? = nil,
          hydrationCursorStore: HydrationCursorStore? = nil,
+         frugal: @escaping @MainActor () -> FrugalPolicy = { FrugalSettings.current() },
+         pathIsSatisfied: @escaping @MainActor () -> Bool = { ConnectivityMonitor.shared.path.isSatisfied },
+         awaitPath: @escaping @MainActor (TimeInterval) async -> Bool
+             = { await ConnectivityMonitor.shared.awaitSatisfied(timeout: $0) },
+         intentReplayer: (any IntentReplaying)? = nil,
          onFirstSuccess: @escaping @MainActor () -> Void = {}) {
         // Resolve the default on the main actor (in the init body), not in the
         // default argument — a default arg is evaluated off the actor and the
@@ -277,6 +304,12 @@ final class RunCoordinator {
         // under this module's MainActor default isolation, mirroring the stores above.
         self.sessionDeletionStore = sessionDeletionStore ?? PendingSessionDeletionStore()
         self.hydrationCursorStore = hydrationCursorStore ?? HydrationCursorStore()
+        self.frugal = frugal
+        self.pathIsSatisfied = pathIsSatisfied
+        self.awaitPath = awaitPath
+        // Resolved in the body rather than as a default argument: the type is MainActor-
+        // isolated, mirroring the stores above.
+        self.intentReplayer = intentReplayer ?? NoIntentReplayer()
         self.onFirstSuccess = onFirstSuccess
         self.inFlight = resolvedInFlightStore.load()
     }
@@ -301,6 +334,23 @@ final class RunCoordinator {
     /// the ceiling. Pure, for direct testing. From `pollInterval`: 2 → 10 → 30 → 30…
     nonisolated static func nextPollInterval(after current: TimeInterval) -> TimeInterval {
         min(current * pollBackoffFactor, pollIntervalCeiling)
+    }
+
+    /// The longest the poll loop waits for the network to come back before trying the
+    /// request again anyway. Matched to the poll ceiling: the loop's slowest cadence is
+    /// already 30s, so waiting for a path costs nothing a quiet turn was not spending.
+    nonisolated static let networkWaitCeiling: TimeInterval = pollIntervalCeiling
+
+    /// Whether a poll failure is the kind that means "this device could not get onto the
+    /// network", as opposed to the bridge answering with something we did not like.
+    ///
+    /// Pure and separate from `JesseError.isUnreachable` because it answers a narrower
+    /// question — the caller has ALREADY established that the path is unsatisfied, and
+    /// what it needs to know is whether this particular error is consistent with that. A
+    /// `badResponse` is not: the bridge answered, so the phone plainly had a network a
+    /// moment ago and something else is wrong.
+    nonisolated static func isWaitForNetwork(_ error: Error) -> Bool {
+        (error as? JesseError)?.isUnreachable ?? false
     }
 
     /// Bump the stream-activity counter for a thread — called by the display stream
@@ -713,6 +763,12 @@ final class RunCoordinator {
         item.stateRaw = OutboxState.failed.rawValue
         item.lastError = message
         item.attempts += 1
+        // Record when this message may try itself again, and stop recording once the
+        // automatic budget is spent — `nil` is what turns the per-message Retry button
+        // back into the only way forward. Persisted on the item rather than held in a
+        // timer, so a relaunch resumes this schedule instead of granting a fresh one.
+        item.nextRetryAt = OutboxRetrySchedule.nextDue(after: now(),
+                                                       automaticAttempts: item.automaticAttempts)
         do {
             try context.save()
         } catch {
@@ -722,6 +778,10 @@ final class RunCoordinator {
         clearPartial(threadID)
         activity[threadID] = nil
         syncLiveActivity(threadID)
+        // The due date was just written; this is the moment to wait for it. Arming here
+        // rather than in the retry loop's tail is what makes a failed AUTOMATIC retry
+        // schedule the next one instead of ending the sequence.
+        scheduleOutboxRetry(context: context)
         if speakFailure, voice { Speaker.shared.speak("Sorry, that didn't work. " + message) }
     }
 
@@ -1229,12 +1289,116 @@ final class RunCoordinator {
               let thread = fetchThread(item.threadID, context: context) else { return }
         item.stateRaw = OutboxState.sending.rawValue
         item.lastError = nil
+        // A human saying "try again" is a statement that the situation has changed —
+        // they are back on Wi-Fi, they just woke the laptop — so the automatic budget
+        // starts over. Tapping Retry therefore never *spends* an automatic attempt, and
+        // exhausting the automatic attempts never disables the button.
+        item.automaticAttempts = 0
+        item.nextRetryAt = nil
         do {
             try context.save()
         } catch {
             Log.run.error("outbox retry flip save failed: \(error.localizedDescription)")
         }
         transmit(item: item, thread: thread, context: context)
+    }
+
+    /// Send every `.failed` outbox message that is due, on its own schedule.
+    ///
+    /// # Why automatic retry is safe here and was not before
+    ///
+    /// Re-sending a message the bridge may already have is the one thing that could
+    /// duplicate a turn, and it is safe by construction rather than by timing: the item's
+    /// `id` IS the wire `request_id`, the bridge dedups on it, and a re-send of a POST
+    /// that landed returns the same job with no second turn spawned. That has been true
+    /// since the outbox shipped; what was missing was anything that acted on it without a
+    /// human tap.
+    ///
+    /// # Why it is bounded
+    ///
+    /// Five automatic sends, then the message is the button's again
+    /// (`OutboxRetrySchedule`). A message that cannot be delivered is usually a laptop
+    /// that is asleep, and a phone that retries that forever is a phone with a flat
+    /// battery and nothing to show for it.
+    ///
+    /// `pathJustRecovered` skips the backoff wait: the delays exist to avoid hammering a
+    /// network that is not there, and a network that just came back is exactly the case
+    /// that reasoning does not apply to. The attempt cap still applies, so a flapping
+    /// connection cannot use it to retry without end.
+    func retryDueOutbox(context: ModelContext, pathJustRecovered: Bool = false) {
+        let failed = OutboxState.failed.rawValue
+        let descriptor = FetchDescriptor<OutboxItem>(
+            predicate: #Predicate { $0.stateRaw == failed })
+        guard let items = try? context.fetch(descriptor), !items.isEmpty else { return }
+        let stamp = now()
+        var due: [OutboxItem] = []
+        for item in items where tasks[item.threadID] == nil && !isRunning(item.threadID) {
+            guard OutboxRetrySchedule.isDue(automaticAttempts: item.automaticAttempts,
+                                            nextDue: item.nextRetryAt,
+                                            now: stamp,
+                                            pathJustRecovered: pathJustRecovered) else { continue }
+            due.append(item)
+        }
+        guard !due.isEmpty else { return }
+        for item in due {
+            item.automaticAttempts += 1
+            item.stateRaw = OutboxState.sending.rawValue
+            item.lastError = nil
+            item.nextRetryAt = nil
+        }
+        do {
+            try context.save()
+        } catch {
+            Log.run.error("outbox auto-retry flip save failed: \(error.localizedDescription)")
+        }
+        // Transmit AFTER the save, so a crash between the two leaves items marked
+        // `.sending` with no live task — which is precisely the state `reconcile`
+        // already resolves on the next launch.
+        for item in due {
+            guard let thread = fetchThread(item.threadID, context: context) else { continue }
+            transmit(item: item, thread: thread, context: context)
+        }
+    }
+
+    /// Arm the next automatic outbox retry, so a message due in 30 seconds is sent in 30
+    /// seconds rather than whenever something else happens to call `retryDueOutbox`.
+    ///
+    /// One timer for the whole outbox, armed to the EARLIEST due date. A timer per message
+    /// would be N wakeups for a queue that is almost always one message long, and N
+    /// chances to leak one.
+    func scheduleOutboxRetry(context: ModelContext) {
+        outboxRetryTask?.cancel()
+        outboxRetryTask = nil
+        guard let earliest = earliestOutboxRetry(context) else { return }
+        let wait = max(0, earliest.timeIntervalSince(now()))
+        outboxRetryTask = Task { [weak self] in
+            await self?.pollSleep(wait)
+            guard let self, !Task.isCancelled else { return }
+            self.outboxRetryTask = nil
+            self.retryDueOutbox(context: context)
+            // Re-arm ONLY if the outbox's earliest due date has actually moved. It has,
+            // whenever this wakeup did its job — the message it was armed for is now
+            // sending, or its budget is spent. It has NOT if the wait somehow ended
+            // early, and re-arming for an instant we have already waited out would be a
+            // spin rather than a timer. (A retry that goes on to FAIL arms the next one
+            // from `failOutbox`, which is where the new due date is written.)
+            if self.earliestOutboxRetry(context) != earliest {
+                self.scheduleOutboxRetry(context: context)
+            }
+        }
+    }
+
+    /// The soonest moment any `.failed` outbox message may be sent again, or nil when
+    /// none may be — every message delivered, or every automatic budget spent.
+    private func earliestOutboxRetry(_ context: ModelContext) -> Date? {
+        let failed = OutboxState.failed.rawValue
+        let descriptor = FetchDescriptor<OutboxItem>(
+            predicate: #Predicate { $0.stateRaw == failed })
+        guard let items = try? context.fetch(descriptor) else { return nil }
+        return items.compactMap { item in
+            OutboxRetrySchedule.mayRetry(automaticAttempts: item.automaticAttempts)
+                ? item.nextRetryAt : nil
+        }.min()
     }
 
     /// Discard a failed outbox message: delete the item and its optimistic user
@@ -1349,6 +1513,83 @@ final class RunCoordinator {
         for (threadID, job) in inFlight where tasks[threadID] == nil {
             reattach(threadID: threadID, job: job, context: context)
         }
+        // Whatever is in the outbox and due goes now, and the next one is armed. On
+        // foreground this is usually a no-op; when it is not, it is a message the user
+        // sent before walking out of range and has been assuming was delivered.
+        retryDueOutbox(context: context)
+        scheduleOutboxRetry(context: context)
+        // A queued intent (P8) replays alongside the two above rather than on a timer of
+        // its own, so the three recoveries cannot race each other. A no-op today.
+        replayQueuedIntents()
+    }
+
+    // MARK: - Recovery on a network change
+
+    /// Start watching the network, so coming back onto it recovers everything that was
+    /// waiting — without anything on screen having to notice.
+    ///
+    /// # Why this exists
+    ///
+    /// Every recovery in this app used to be a human one. A failed poll ended in a manual
+    /// "Re-check". The send outbox retried only on a tap. The phone knew the whole time
+    /// that it had walked back into signal, and nothing asked it. This is the ask.
+    ///
+    /// Idempotent — the app calls it at launch and could call it again on activation.
+    func startConnectivityRecovery(context: ModelContext,
+                                   monitor: ConnectivityMonitor = .shared) {
+        guard connectivityTask == nil else { return }
+        monitor.start()
+        let stream = monitor.paths()
+        connectivityTask = Task { [weak self] in
+            var previous: NetworkPathSnapshot?
+            for await snapshot in stream {
+                guard let self else { return }
+                defer { previous = snapshot }
+                // Only a genuine came-back transition. `NWPathMonitor` reports every
+                // interface event, and a Wi-Fi → cellular swap with both satisfied is not
+                // a recovery: nothing was waiting on it, and treating it as one turns a
+                // walk past the front door into a burst of re-attaches and refetches.
+                guard let previous, pathDidRecover(from: previous, to: snapshot) else { continue }
+                self.recoverAfterNetworkReturned(context: context)
+            }
+        }
+    }
+
+    /// Stop watching. The app never calls this — connectivity is an app-lifetime concern
+    /// — but a test tearing down a coordinator must.
+    func stopConnectivityRecovery() {
+        connectivityTask?.cancel()
+        connectivityTask = nil
+        outboxRetryTask?.cancel()
+        outboxRetryTask = nil
+    }
+
+    /// The four things a recovered network makes possible, in the order that matters.
+    ///
+    /// Internal rather than private so a test can drive it directly, without a radio and
+    /// without waiting on a stream.
+    func recoverAfterNetworkReturned(context: ModelContext) {
+        // 1. Resolve any message killed mid-POST BEFORE re-sending anything, so a
+        //    delivered-but-unacked item is deleted rather than re-sent.
+        reconcile(context: context)
+        // 2. Re-attach every persisted in-flight job. The turn kept running on the
+        //    laptop the whole time; this is the app catching up with it.
+        for (threadID, job) in inFlight where tasks[threadID] == nil {
+            reattach(threadID: threadID, job: job, context: context)
+        }
+        // 3. Drain the send outbox, skipping the backoff — a network that just came back
+        //    is exactly the case the delays exist to avoid, so they do not apply.
+        retryDueOutbox(context: context, pathJustRecovered: true)
+        scheduleOutboxRetry(context: context)
+        // 4. And whatever an offline intent queue is holding (P8; a no-op today).
+        replayQueuedIntents()
+    }
+
+    /// Kick the intent queue. Detached so a slow replay never delays the re-attach and
+    /// outbox drain it rides alongside.
+    private func replayQueuedIntents() {
+        let replayer = intentReplayer
+        Task { await replayer.replayAll() }
     }
 
     /// Manual "Re-check" for one thread: re-attach to its retained job and fetch
@@ -1616,10 +1857,29 @@ final class RunCoordinator {
             } catch {
                 // A user-initiated cancel surfaces here as a cancelled URL load
                 // (mapped to `.transport`). Treat any cancellation as a clean stop
-                // — the run was already cleared by `cancel`. Otherwise every client
-                // error in the poll path is recoverable: the job stays retained and
-                // the reply retrievable, shown with Re-check.
+                // — the run was already cleared by `cancel`.
                 if Task.isCancelled { return nil }
+                // A transport error while THIS DEVICE HAS NO NETWORK is not a failed
+                // turn. It is a tunnel, a lift, a plane — and the turn is still running
+                // on the laptop, which never noticed. Surfacing "tap Re-check" there was
+                // the app blaming the bridge for the phone's own radio, and it made the
+                // manual button the only way back even though the phone knew perfectly
+                // well when it had returned. So: WAIT for the path, bounded, then poll
+                // again. The job is untouched, the spinner keeps spinning, and nothing
+                // about the turn has changed.
+                //
+                // With a satisfied path the same error means something entirely
+                // different — the laptop is asleep, or the bridge is down — and that IS
+                // a recoverable failure with a visible Re-check, exactly as before.
+                if Self.isWaitForNetwork(error), !pathIsSatisfied() {
+                    let returned = await awaitPath(Self.networkWaitCeiling)
+                    if Task.isCancelled { return nil }
+                    // Whether or not it came back inside the ceiling, loop and let the
+                    // next request produce the evidence — an unbounded wait is how a
+                    // spinner becomes permanent.
+                    _ = returned
+                    continue
+                }
                 let message = (error as? JesseError)?.localizedDescription
                     ?? error.localizedDescription
                 return .failed(message)
@@ -1637,7 +1897,9 @@ final class RunCoordinator {
                     interval = Self.pollInterval
                     lastTick = tick
                 }
-                await pollSleep(interval)
+                // On a metered link the floor overrides even the snap-back: the stream is
+                // already delivering the tokens the poll would only be confirming.
+                await pollSleep(max(interval, frugal().pollFloorSeconds))
                 interval = Self.nextPollInterval(after: interval)
             case .done(let reply):
                 return .done(reply)
@@ -1755,6 +2017,25 @@ final class RunCoordinator {
             let jobId = job.jobId
             Task { try? await client.notifyOnComplete(jobId: jobId) }
         }
+    }
+
+    /// A reply for `jobId` was fetched and written while the app was in the BACKGROUND.
+    ///
+    /// The write already happened, through the same `TurnWriter` (see
+    /// `BackgroundDelivery`); this is only the in-memory half the background path cannot
+    /// reach — the spinner, the retained job, the Live Activity. Without it a foregrounded
+    /// app would still show a running turn for a reply already sitting in its transcript,
+    /// and would poll once more to find that out.
+    ///
+    /// Guarded on the job id: a stale notification for a job this thread has since
+    /// replaced (a new turn supersedes the old one in `send`) must not clear the run of
+    /// the turn that replaced it.
+    func noteBackgroundDelivery(threadID: UUID, jobId: String) {
+        guard inFlight[threadID]?.jobId == jobId else { return }
+        errors[threadID] = nil
+        tasks[threadID]?.cancel()
+        tasks[threadID] = nil
+        clearRun(threadID)
     }
 
     /// The thread whose in-flight job has this id — used to route a notification

@@ -535,11 +535,18 @@ public struct JesseRequest: Encodable, Equatable, Sendable {
     // uses its stored default (byte-for-byte today's behavior for an older client).
     public let model: String?
     // The IANA zone the DEVICE is standing in ("Europe/London"), stamped onto every turn by
-    // `JesseBridgeClient.sendPrepared` rather than by each caller — see `withClientTz`. The
-    // bridge lets it outrank the away profile for that one request, because the phone's own
+    // `JesseBridgeClient.sendPrepared` rather than by each caller — see `stamped(clientTz:sentAt:)`.
+    // The bridge lets it outrank the away profile for that one request, because the phone's own
     // zone is a more specific claim than a fortnight-long declaration. `private(set)` so the
     // stamp is the only way it is set.
     public private(set) var clientTz: String?
+    // When the PHONE says it sent this turn: RFC3339 with the device's offset
+    // ("2026-09-03T13:10:00+01:00"). Stamped in the same one place as `clientTz`, and for
+    // a related reason — the bridge dates an entry the message gave no time for from when
+    // it was SENT, so a turn that was queued, retried, or slowly delivered must not be
+    // dated from whenever it happened to arrive. Omitted (nil) is the bridge's own clock,
+    // which is byte-for-byte what every build before this one did.
+    public private(set) var sentAt: String?
 
     public init(mode: String, text: String, sessionId: String?, conversationId: String? = nil,
                 voice: Bool?,
@@ -562,15 +569,21 @@ public struct JesseRequest: Encodable, Equatable, Sendable {
         self.requestId = requestId
         self.model = model
         self.clientTz = nil
+        self.sentAt = nil
     }
 
-    /// The same request, carrying the zone this device is in. The ONE place a turn's
-    /// `client_tz` is set: every caller (the Mac's plain send, the iOS layer's
-    /// health-laden `sendPrepared`) goes through the client, and the client stamps it, so
-    /// there is no path that can build a turn body without it.
-    public func withClientTz(_ tz: String) -> JesseRequest {
+    /// The same request, carrying the two facts only the DEVICE knows: the zone it is
+    /// standing in and the instant it says it sent this turn.
+    ///
+    /// The ONE place either is set. Every caller (the Mac's plain send, the iOS layer's
+    /// health-laden one) goes through `JesseBridgeClient.sendPrepared`, and that stamps
+    /// here, so there is no path that can build a turn body without them. A blank value
+    /// omits its field rather than sending an empty string, which the bridge would have to
+    /// parse and reject.
+    public func stamped(clientTz: String, sentAt: String) -> JesseRequest {
         var copy = self
-        copy.clientTz = tz.isEmpty ? nil : tz
+        copy.clientTz = clientTz.isEmpty ? nil : clientTz
+        copy.sentAt = sentAt.isEmpty ? nil : sentAt
         return copy
     }
 
@@ -603,6 +616,7 @@ public struct JesseRequest: Encodable, Equatable, Sendable {
         case requestId = "request_id"
         case model
         case clientTz = "client_tz"
+        case sentAt = "sent_at"
     }
 }
 

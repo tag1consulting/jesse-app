@@ -42,7 +42,8 @@ struct HealthTabView: View {
 
     /// The same probe the Today tab and the Chats list use, asked here so the dashboard
     /// goes read-only BEFORE a tap rather than after a turn is fired into a void.
-    @State private var reachability = BridgeReachabilityModel()
+    // The one shared model (see `BridgeReachabilityModel.shared`) — not this tab's own.
+    private let reachability = BridgeReachabilityModel.shared
 
     var body: some View {
         NavigationStack {

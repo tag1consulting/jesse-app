@@ -32,7 +32,8 @@ struct TodayTabView: View {
 
     /// The same probe the Chats list's offline banner uses, asked here so the day
     /// goes read-only BEFORE a tap rather than after one fails.
-    @State private var reachability = BridgeReachabilityModel()
+    // The one shared model (see `BridgeReachabilityModel.shared`) — not this tab's own.
+    private let reachability = BridgeReachabilityModel.shared
 
     /// Per-device view state for this screen. The badge filter is a preference about
     /// this phone, so it is remembered on this phone and never sent to the bridge:

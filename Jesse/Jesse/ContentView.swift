@@ -25,7 +25,11 @@ struct ContentView: View {
     @Environment(\.horizontalSizeClass) private var sizeClass
     @State private var columnVisibility: NavigationSplitViewVisibility = .automatic
     // Probes the bridge so the list can warn "offline" before the user composes.
-    @State private var reachability = BridgeReachabilityModel()
+    // THE shared model, not one of this screen's own: three tabs each used to stand up
+    // an instance and fire a `GET /health` on every activation, and two of them could
+    // disagree — one showing an offline banner while the next rendered the day it had
+    // just fetched. See `BridgeReachabilityModel.shared`.
+    private let reachability = BridgeReachabilityModel.shared
 
     /// The list-level offline banner shows only when paired AND a probe came back
     /// unreachable (pure `shouldShowOfflineBanner`).
@@ -83,12 +87,18 @@ struct ContentView: View {
         .sheet(isPresented: $showSettings, onDismiss: {
             pairViaScanner = false
             // Pairing may have changed host/token — re-probe so the banner reflects
-            // the new config.
-            reachability.refresh(config: config)
+            // the new config. FORCED past the 30s throttle: a re-pairing points at a
+            // different bridge entirely, so the last answer is about something else.
+            reachability.refresh(config: config, force: true)
         }) {
             SettingsView(config: $config, autoPresentScanner: pairViaScanner)
         }
         .onAppear {
+            // The app-wide network monitor, and the recovery it drives: re-attach every
+            // in-flight job, drain the send outbox and replay queued intents the moment the
+            // phone is back on a network. Idempotent, so a second appearance is free.
+            coordinator.startConnectivityRecovery(context: context)
+            BridgeReachabilityModel.shared.follow(ConnectivityMonitor.shared) { ConfigStore.load() }
             coordinator.resume(context: context)
             // Pull the session list and reconcile favorite/archive flags across devices
             // (cache-first; a star/archive made on the Mac lands here). Best-effort.
@@ -338,6 +348,7 @@ struct SettingsView: View {
     // then flipped on. Same UserDefaults key `JesseClient` reads at send time
     // (`HealthContextSettings`). `connectingHealth` gates the connect row.
     @AppStorage(HealthContextSettings.enabledKey) private var attachHealthContext = false
+    @AppStorage(FrugalSettings.forcedKey) private var frugalOnCellular = false
     @State private var connectingHealth = false
 
     // "Write meals to Apple Health" — default OFF until write access is granted, then
@@ -457,6 +468,14 @@ struct SettingsView: View {
                 floorSection(for: .tell)
 
                 modelSwitchSection
+
+                Section {
+                    Toggle("Frugal on cellular", isOn: $frugalOnCellular)
+                } header: {
+                    Text("Data")
+                } footer: {
+                    Text("Jesse already does this by itself on cellular and in Low Data Mode: photos are sent smaller, it checks for the reply less often, and it reuses the health summary it already has instead of fetching a new one. Turn this on to do the same on every network. Nothing is ever refused — sending, replies and the day file all work exactly the same, they just cost less.")
+                }
 
                 Section {
                     Toggle("Smart search expansion", isOn: $searchExpansionEnabled)
@@ -733,9 +752,16 @@ struct SettingsView: View {
     /// Settings closes). Skips a poll mid-swap so a background refresh can't clobber an
     /// in-flight selection.
     private func pollModelsWhileVisible() async {
-        while !Task.isCancelled {
-            if !switchingModel { await loadModels() }
+        // Always load ONCE — the section is hidden until the list arrives, and frugal mode
+        // is about spending less, never about showing less.
+        if !switchingModel { await loadModels() }
+        // The repeat is what frugal mode drops: a round trip every 25 seconds, for the
+        // duration of a settings visit, to catch a health change that almost never happens
+        // while someone is looking at the screen.
+        while !Task.isCancelled, FrugalSettings.current().modelListPollingEnabled {
             try? await Task.sleep(for: Self.modelPollInterval)
+            guard !Task.isCancelled else { return }
+            if !switchingModel { await loadModels() }
         }
     }
 
