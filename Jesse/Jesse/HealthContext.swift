@@ -172,6 +172,208 @@ nonisolated enum SleepClassifier {
     }
 }
 
+// MARK: - Sleep reduction (pure, tested)
+
+/// One `sleepAnalysis` sample flattened to plain values: its span, its stage as an
+/// `HKCategoryValueSleepAnalysis` raw value, and the bundle identifier of the app
+/// that wrote it. `HealthContextProvider` maps `HKCategorySample` into this and does
+/// nothing else with sleep, so every rule below is reachable from a unit test.
+nonisolated struct SleepSample: Equatable, Sendable {
+    var start: Date
+    var end: Date
+    /// `HKCategoryValueSleepAnalysis.<case>.rawValue`. Kept as an `Int` so this type
+    /// stays Foundation-only; `SleepStage` names the values this code acts on.
+    var value: Int
+    /// `HKSource.bundleIdentifier` — which app wrote the sample. Used ONLY to keep
+    /// one source's stage classifications from being mixed with another's; the
+    /// total never looks at it.
+    var sourceID: String
+
+    init(start: Date, end: Date, value: Int, sourceID: String) {
+        self.start = start
+        self.end = end
+        self.value = value
+        self.sourceID = sourceID
+    }
+}
+
+/// The `HKCategoryValueSleepAnalysis` raw values this code acts on, named so the
+/// pure layer does not have to import HealthKit. These are Apple's fixed API
+/// values, not our numbering.
+nonisolated enum SleepStage {
+    static let inBed = 0
+    static let asleepUnspecified = 1
+    static let awake = 2
+    static let asleepCore = 3
+    static let asleepDeep = 4
+    static let asleepREM = 5
+
+    /// Every value that counts as being asleep. Bare "in bed" is not sleep, and
+    /// `awake` is tracked separately and excluded from the total.
+    static let asleep: Set<Int> = [asleepUnspecified, asleepCore, asleepDeep, asleepREM]
+    /// The values that represent an actual STAGE classification, as opposed to
+    /// "asleep, stage unknown". Only these decide which source stages a session.
+    static let staged: Set<Int> = [asleepCore, asleepDeep, asleepREM]
+}
+
+/// Reduces raw `sleepAnalysis` samples to reported minutes.
+///
+/// THE RULE THAT MATTERS: sleep minutes are the wall-clock minutes covered by at
+/// least one matching sample — an interval UNION — never the sum of sample
+/// durations. Two apps that both write sleep for the same night (an Apple Watch
+/// writing staged samples and, say, AutoSleep writing its own session record over
+/// the same hours) otherwise have every shared minute counted once per writer, which
+/// is exactly the double count this replaced.
+///
+/// Union is deliberately source-agnostic: no bundle identifier is special-cased and
+/// there is no "preferred source" setting, so it stays correct for one writer, for
+/// three, and for whatever the user installs next.
+nonisolated enum SleepReducer {
+    /// Gap between adjacent samples that ends a session, in seconds.
+    static let sessionGap: TimeInterval = 3600
+
+    // MARK: Interval union
+
+    /// Total seconds covered by at least one span. Sorts by start, then walks the
+    /// list coalescing anything that overlaps OR abuts the run in progress. Empty
+    /// and inverted spans contribute nothing.
+    static func unionSeconds(_ spans: [(start: Date, end: Date)]) -> TimeInterval {
+        let sorted = spans.filter { $0.end > $0.start }.sorted { $0.start < $1.start }
+        guard let first = sorted.first else { return 0 }
+        var total: TimeInterval = 0
+        var runStart = first.start
+        var runEnd = first.end
+        for span in sorted.dropFirst() {
+            if span.start > runEnd {          // a real gap: close the run out
+                total += runEnd.timeIntervalSince(runStart)
+                runStart = span.start
+                runEnd = span.end
+            } else {                          // overlaps or abuts: extend the run
+                runEnd = max(runEnd, span.end)
+            }
+        }
+        return total + runEnd.timeIntervalSince(runStart)
+    }
+
+    /// Unioned minutes across every sample whose stage is in `values`.
+    private static func unionMinutes(_ samples: [SleepSample], values: Set<Int>) -> Double {
+        unionSeconds(samples.filter { values.contains($0.value) }
+            .map { (start: $0.start, end: $0.end) }) / 60
+    }
+
+    // MARK: Last night
+
+    /// Reduce samples to the most recent contiguous session's minutes, or nil when
+    /// that session holds no actual sleep.
+    ///
+    /// Sessions are grouped newest-first with a one-hour gap rule, unchanged. The
+    /// TOTAL is the union of every asleep sample from every source. The stage
+    /// breakdown comes from ONE source — the one contributing the most distinct
+    /// stage values — because two sources classifying the same minutes differently
+    /// are not addable: AutoSleep's "deep" is its own low-movement/low-heart-rate
+    /// classifier, and on a night it called 2h53m deep the Watch called 30m deep.
+    /// Those numbers describe different things and must never be mixed.
+    ///
+    /// CONSEQUENCE, stated plainly: the stage minutes may sum to LESS than the
+    /// total, because the total includes minutes that only a non-staging source
+    /// covered. That is correct and intended — the stage breakdown is not a
+    /// partition of the total. When no source reports stages at all, the stage
+    /// fields stay nil and the total is reported alone.
+    static func reduce(_ samples: [SleepSample], timeZone: TimeZone = .current) -> SleepSummary? {
+        let session = newestSession(samples)
+        guard !session.isEmpty else { return nil }
+
+        // Total: every source, unioned. This is the number the double count broke.
+        let total = unionMinutes(session, values: SleepStage.asleep)
+        guard total > 0 else { return nil }
+
+        // Stages: one source only, still unioned — a single source can emit
+        // adjacent or duplicated samples for the same minutes.
+        var deep: Double?, rem: Double?, core: Double?, awake: Double?
+        if let stagingSource = stagingSource(in: session) {
+            let own = session.filter { $0.sourceID == stagingSource }
+            let d = unionMinutes(own, values: [SleepStage.asleepDeep])
+            let r = unionMinutes(own, values: [SleepStage.asleepREM])
+            let c = unionMinutes(own, values: [SleepStage.asleepCore])
+            let a = unionMinutes(own, values: [SleepStage.awake])
+            deep = d > 0 ? d : nil
+            rem = r > 0 ? r : nil
+            core = c > 0 ? c : nil
+            awake = a > 0 ? a : nil
+        } else {
+            // Nobody staged the session, so there is no classifier to be
+            // inconsistent with — union awake across all sources rather than drop
+            // a non-staging writer's awake time.
+            let a = unionMinutes(session, values: [SleepStage.awake])
+            awake = a > 0 ? a : nil
+        }
+
+        let sStart = session.map(\.start).min() ?? Date()
+        let sEnd = session.map(\.end).max() ?? Date()
+        let midpoint = Date(timeIntervalSince1970:
+            (sStart.timeIntervalSince1970 + sEnd.timeIntervalSince1970) / 2)
+        return SleepSummary(
+            totalMinutes: total,
+            deepMinutes: deep,
+            remMinutes: rem,
+            coreMinutes: core,
+            awakeMinutes: awake,
+            isNap: SleepClassifier.isNap(totalMinutes: total, midpoint: midpoint, timeZone: timeZone))
+    }
+
+    /// The newest contiguous run of samples: walk newest-first by end date and stop
+    /// at the first sample that ends more than an hour before the run's earliest
+    /// start. Bare "in bed" samples take part in this grouping (they always did) and
+    /// are then ignored by every minutes calculation.
+    private static func newestSession(_ samples: [SleepSample]) -> [SleepSample] {
+        var session: [SleepSample] = []
+        var boundary: Date?
+        for s in samples.sorted(by: { $0.end > $1.end }) {
+            if let b = boundary, b.timeIntervalSince(s.end) > sessionGap { break }
+            session.append(s)
+            boundary = min(boundary ?? s.start, s.start)
+        }
+        return session
+    }
+
+    /// The source that stages this session: the one contributing the most DISTINCT
+    /// stage values (deep / REM / core). In practice the Apple Watch, which reports
+    /// all three, beats a session-only writer, which reports none. Ties break on
+    /// unioned staged minutes and then on the identifier, so the choice is
+    /// deterministic. Returns nil when no source reported a stage at all.
+    private static func stagingSource(in session: [SleepSample]) -> String? {
+        var distinct: [String: Set<Int>] = [:]
+        for s in session where SleepStage.staged.contains(s.value) {
+            distinct[s.sourceID, default: []].insert(s.value)
+        }
+        return distinct.keys.max { a, b in
+            let (na, nb) = (distinct[a]!.count, distinct[b]!.count)
+            if na != nb { return na < nb }
+            let (ma, mb) = (unionMinutes(session.filter { $0.sourceID == a }, values: SleepStage.staged),
+                            unionMinutes(session.filter { $0.sourceID == b }, values: SleepStage.staged))
+            if ma != mb { return ma < mb }
+            return a < b
+        }
+    }
+
+    // MARK: Multi-day series
+
+    /// One point per day: the unioned asleep minutes for that day, across every
+    /// source. Each sample is attributed to the day its END falls in, unchanged.
+    /// The same union rule as `reduce` — a multi-day history was inflated by two
+    /// writers in exactly the same way a single night was. Sorted by date so the
+    /// result is deterministic.
+    static func dailyMinutes(_ samples: [SleepSample], calendar: Calendar) -> [MetricSeriesPoint] {
+        var byDay: [Date: [SleepSample]] = [:]
+        for s in samples where SleepStage.asleep.contains(s.value) {
+            byDay[calendar.startOfDay(for: s.end), default: []].append(s)
+        }
+        return byDay
+            .map { MetricSeriesPoint(date: $0.key, value: unionMinutes($0.value, values: SleepStage.asleep)) }
+            .sorted { $0.date < $1.date }
+    }
+}
+
 /// Maps an Apple Walking Steadiness percentage to its classification band. Apple's
 /// Health app buckets steadiness as OK / Low / Very Low; the thresholds here mirror
 /// the published bands (Low below 40%, Very Low below 20%).

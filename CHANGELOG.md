@@ -13,6 +13,53 @@ Every commit that changes a component **must** bump that component's version and
 add an entry here — enforced by `scripts/version-guard.sh` (the pre-push hook and
 CI both run it). See the "Versioning" section of `bridge/README.md`.
 
+## [App 1.0 (116)] - 2026-08-24
+
+### Fixed
+
+- **Sleep totals no longer double count when two apps write to HealthKit.** The daily
+  health summary reported 16.6h of sleep for a night of 8h26m, on a line whose own stage
+  breakdown — 30m deep, 134m REM, 324m core — added up to 8h08m. The total did not
+  reconcile with its parts because it was, near enough, both of them added together.
+
+  The cause is two writers, not a sync fault. An Apple Watch writes native staged
+  `sleepAnalysis` samples for the night; AutoSleep writes its own session record over the
+  same wall clock. `HealthContextProvider` **summed every sample's duration** with no
+  source filtering and no interval union, so every minute both apps covered was counted
+  once per writer: 506 minutes (AutoSleep) plus 488 (the Watch stages) is 994, which is
+  the 16.6h that was printed. It recurred every night both apps stayed installed.
+
+  It was invisible because AutoSleep's contribution lands in `asleepUnspecified`, which
+  the total folded in but no rendered field reports — so the line carried ~500 minutes a
+  reader had no way to account for.
+
+  **Both call sites had it.** `reduceSleep` (last night's summary) and
+  `dailySleepMinutes` (every point of a multi-day `sleepAnalysis` history) each summed
+  durations over the same samples, so a history request was inflated the same way.
+
+  Sleep minutes are now the wall clock covered by **at least one** asleep sample — an
+  interval union: sort by start, coalesce anything that overlaps or abuts, total the
+  merged spans. This is deliberately source-agnostic. No bundle identifier is
+  special-cased and no "preferred source" setting was added, because union is already
+  correct for one writer, for three, and for whatever gets installed next.
+
+  Stage minutes take a different rule, because two sources classifying the same minutes
+  are not addable — AutoSleep's "deep" is its own low-movement classifier and called
+  2h53m deep on the night the Watch called 30m. The **total** comes from the all-source
+  union; the **stage breakdown** comes from a single source, the one contributing the
+  most distinct stage values, unioned within that source too. With no staging source the
+  stage fields stay nil and the total is reported alone. Stage minutes may therefore sum
+  to less than the total, by the minutes only a non-staging source saw; that is intended,
+  and the breakdown is not a partition of the total.
+
+  The reduction moved out of HealthKit's reach to make it testable, which is the other
+  half of why this survived: `reduceSleep` was `private static` over `[HKCategorySample]`,
+  a type a unit test cannot build meaningfully. `SleepReducer.reduce` and
+  `SleepReducer.dailyMinutes` are now pure functions over a plain `SleepSample` value
+  type, and the provider does nothing but run the query and map into it. Session grouping
+  (the one-hour gap rule, the 36h lookback), the ignoring of bare "in bed", the exclusion
+  of awake from the total, and nap classification are all unchanged.
+
 ## [App 1.0 (115)] - 2026-08-24
 
 ### Added

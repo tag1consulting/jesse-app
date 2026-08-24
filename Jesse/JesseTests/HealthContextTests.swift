@@ -1,4 +1,5 @@
 import XCTest
+import HealthKit
 @testable import Jesse
 import JesseDietDisplay
 import JesseNetworking
@@ -203,6 +204,193 @@ final class HealthContextTests: XCTestCase {
         // Long is always the night regardless of hour.
         XCTAssertFalse(SleepClassifier.isNap(totalMinutes: 300,
                                              midpoint: date(2026, 7, 4, 14, 0), timeZone: utc))
+    }
+
+    // MARK: - Sleep reduction: the two-writer double count
+
+    // The night this was written for: 16.6h reported against 8h26m actually slept,
+    // because an Apple Watch and AutoSleep both write sleepAnalysis for the same
+    // hours and every shared minute was counted once per writer.
+
+    private static let autoSleepID = "com.tantsissa.AutoSleep"
+    private static let watchID = "com.apple.health.watch"
+
+    private func sample(_ start: Date, _ minutes: Double, _ value: Int,
+                        _ source: String) -> SleepSample {
+        SleepSample(start: start, end: start.addingTimeInterval(minutes * 60),
+                    value: value, sourceID: source)
+    }
+
+    /// Lay out abutting blocks from `start`, as a staging source actually writes them.
+    private func blocks(from start: Date, _ spec: [(Double, Int)],
+                        source: String) -> [SleepSample] {
+        var cursor = start
+        return spec.map { minutes, value in
+            let s = sample(cursor, minutes, value, source)
+            cursor = s.end
+            return s
+        }
+    }
+
+    /// The Apple Watch's night: 30m deep, 134m REM, 324m core (488m asleep) plus 36m
+    /// awake interleaved, so a 524-minute span. Its asleep extremes (23:04 → 07:24)
+    /// sit inside AutoSleep's block, which is what makes the union exactly 506.
+    private func watchNight() -> [SleepSample] {
+        blocks(from: date(2026, 7, 3, 22, 52), [
+            (12, SleepStage.awake),
+            (60, SleepStage.asleepCore), (15, SleepStage.asleepDeep),
+            (60, SleepStage.asleepCore), (40, SleepStage.asleepREM),
+            (54, SleepStage.asleepCore),
+            (12, SleepStage.awake),
+            (15, SleepStage.asleepDeep), (54, SleepStage.asleepREM),
+            (90, SleepStage.asleepCore), (40, SleepStage.asleepREM),
+            (60, SleepStage.asleepCore),
+            (12, SleepStage.awake),
+        ], source: Self.watchID)
+    }
+
+    /// AutoSleep's one continuous 506-minute (8h26m) session over the same night.
+    private func autoSleepNight() -> SleepSample {
+        sample(date(2026, 7, 3, 23, 0), 506, SleepStage.asleepUnspecified, Self.autoSleepID)
+    }
+
+    /// The reported bug, exactly: 506 (AutoSleep) + 488 (Watch) = 994 = 16.6h.
+    /// The total must be the union — the wall clock actually covered — not the sum.
+    func testTwoWritersSameNightUnionsRatherThanDoubleCounts() throws {
+        let samples = watchNight() + [autoSleepNight()]
+
+        // Sanity on the fixture: it really does reproduce 506 + 488 = 994.
+        let asleepDurations = samples
+            .filter { SleepStage.asleep.contains($0.value) }
+            .reduce(0.0) { $0 + $1.end.timeIntervalSince($1.start) / 60 }
+        XCTAssertEqual(asleepDurations, 994, accuracy: 0.001,
+                       "fixture should sum to the 994 minutes that were reported")
+
+        let s = try XCTUnwrap(SleepReducer.reduce(samples, timeZone: utc))
+        XCTAssertEqual(s.totalMinutes, 506, accuracy: 0.001)
+        XCTAssertLessThan(s.totalMinutes, 520)
+        // The stage breakdown comes from the Watch alone — AutoSleep contributes no
+        // stage values and its "deep" would not be comparable anyway.
+        XCTAssertEqual(s.deepMinutes, 30)
+        XCTAssertEqual(s.remMinutes, 134)
+        XCTAssertEqual(s.coreMinutes, 324)
+        XCTAssertEqual(s.awakeMinutes, 36)
+        XCTAssertFalse(s.isNap)
+        // The stages sum to less than the total, by the minutes only AutoSleep saw.
+        // That is intended: the breakdown is not a partition of the total.
+        XCTAssertEqual((s.deepMinutes ?? 0) + (s.remMinutes ?? 0) + (s.coreMinutes ?? 0), 488)
+    }
+
+    /// Two sources that overlap without coinciding: the answer is the covered
+    /// envelope, which is neither the sum nor either source on its own.
+    func testPartiallyOverlappingSourcesReportTheCoveredEnvelope() throws {
+        let a = sample(date(2026, 7, 3, 23, 0), 240, SleepStage.asleepUnspecified, "app.a")
+        let b = sample(date(2026, 7, 4, 1, 0), 300, SleepStage.asleepUnspecified, "app.b")
+
+        let s = try XCTUnwrap(SleepReducer.reduce([a, b], timeZone: utc))
+        XCTAssertEqual(s.totalMinutes, 420, accuracy: 0.001)   // 23:00 → 06:00
+        XCTAssertNotEqual(s.totalMinutes, 540)                 // not the sum
+        XCTAssertNotEqual(s.totalMinutes, 300)                 // not the longer source
+        XCTAssertNil(s.deepMinutes)                            // neither source stages
+    }
+
+    /// The common case must not move: one staging source, same numbers as before.
+    func testSingleStagingSourceIsUnchanged() throws {
+        let s = try XCTUnwrap(SleepReducer.reduce(watchNight(), timeZone: utc))
+        XCTAssertEqual(s.totalMinutes, 488, accuracy: 0.001)
+        XCTAssertEqual(s.deepMinutes, 30)
+        XCTAssertEqual(s.remMinutes, 134)
+        XCTAssertEqual(s.coreMinutes, 324)
+        XCTAssertEqual(s.awakeMinutes, 36)
+        XCTAssertFalse(s.isNap)
+    }
+
+    /// One source can still emit abutting or duplicated samples; union handles both.
+    func testAdjacentAndDuplicateSamplesFromOneSourceCountOnce() throws {
+        let first = sample(date(2026, 7, 3, 23, 0), 60, SleepStage.asleepCore, "app.a")
+        let abutting = sample(date(2026, 7, 4, 0, 0), 60, SleepStage.asleepCore, "app.a")
+        let duplicate = first
+
+        let s = try XCTUnwrap(SleepReducer.reduce([first, abutting, duplicate], timeZone: utc))
+        XCTAssertEqual(s.totalMinutes, 120, accuracy: 0.001)   // not 180
+        XCTAssertEqual(s.coreMinutes, 120)
+    }
+
+    /// No source reported a stage: the total stands alone and every stage field is nil.
+    func testUnspecifiedOnlyReportsTotalWithNoStages() throws {
+        let a = sample(date(2026, 7, 3, 23, 0), 480, SleepStage.asleepUnspecified, "app.a")
+
+        let s = try XCTUnwrap(SleepReducer.reduce([a], timeZone: utc))
+        XCTAssertEqual(s.totalMinutes, 480, accuracy: 0.001)
+        XCTAssertNil(s.deepMinutes)
+        XCTAssertNil(s.remMinutes)
+        XCTAssertNil(s.coreMinutes)
+        XCTAssertNil(s.awakeMinutes)
+    }
+
+    /// `isNap` reads the total, so the total changing could reclassify a nap. Two
+    /// writers over one afternoon nap sum to 130 minutes — past the 120 cutoff, so
+    /// the doubled total called it the night. The 70-minute union is still a nap.
+    func testShortOffHoursSessionIsStillANapAfterUnioning() throws {
+        let a = sample(date(2026, 7, 4, 14, 0), 65, SleepStage.asleepUnspecified, "app.a")
+        let b = sample(date(2026, 7, 4, 14, 5), 65, SleepStage.asleepUnspecified, "app.b")
+
+        let s = try XCTUnwrap(SleepReducer.reduce([a, b], timeZone: utc))
+        XCTAssertEqual(s.totalMinutes, 70, accuracy: 0.001)
+        XCTAssertTrue(s.isNap)
+    }
+
+    /// A session with no actual sleep in it still returns nil.
+    func testSessionWithoutSleepReturnsNil() {
+        let inBed = sample(date(2026, 7, 3, 23, 0), 480, SleepStage.inBed, "app.a")
+        let awake = sample(date(2026, 7, 3, 23, 30), 20, SleepStage.awake, "app.a")
+        XCTAssertNil(SleepReducer.reduce([inBed, awake], timeZone: utc))
+        XCTAssertNil(SleepReducer.reduce([], timeZone: utc))
+    }
+
+    /// The multi-day series had the identical defect: every point was inflated once
+    /// per extra writer. Three nights, two writers, each point the union for its day.
+    func testDailySleepMinutesUnionsPerDay() {
+        var cal = Calendar(identifier: .gregorian)
+        cal.timeZone = utc
+        let samples = [
+            // Night ending Jul 2: 23:00 → 06:00 union = 420 (sum would be 780).
+            sample(date(2026, 7, 1, 23, 0), 420, SleepStage.asleepUnspecified, "app.a"),
+            sample(date(2026, 7, 1, 23, 30), 360, SleepStage.asleepCore, "app.b"),
+            // Night ending Jul 3: exact duplicates, union = 480 (sum would be 960).
+            sample(date(2026, 7, 2, 22, 0), 480, SleepStage.asleepUnspecified, "app.a"),
+            sample(date(2026, 7, 2, 22, 0), 480, SleepStage.asleepCore, "app.b"),
+            // Night ending Jul 4: partial overlap, 23:00 → 07:00 union = 480 (sum 720).
+            sample(date(2026, 7, 3, 23, 0), 360, SleepStage.asleepUnspecified, "app.a"),
+            sample(date(2026, 7, 4, 1, 0), 360, SleepStage.asleepCore, "app.b"),
+            // Never counted, on any day.
+            sample(date(2026, 7, 3, 23, 0), 60, SleepStage.inBed, "app.a"),
+            sample(date(2026, 7, 4, 2, 0), 30, SleepStage.awake, "app.b"),
+        ]
+
+        let points = SleepReducer.dailyMinutes(samples, calendar: cal)
+        XCTAssertEqual(points.map(\.date), [date(2026, 7, 2, 0, 0),
+                                            date(2026, 7, 3, 0, 0),
+                                            date(2026, 7, 4, 0, 0)])
+        XCTAssertEqual(points.map(\.value), [420, 480, 480])
+    }
+
+    /// `SleepStage` hardcodes Apple's `HKCategoryValueSleepAnalysis` raw values so
+    /// the reducer can stay Foundation-only. This is the guard that they still match.
+    func testSleepStageRawValuesMatchHealthKit() {
+        XCTAssertEqual(SleepStage.inBed, HKCategoryValueSleepAnalysis.inBed.rawValue)
+        XCTAssertEqual(SleepStage.asleepUnspecified,
+                       HKCategoryValueSleepAnalysis.asleepUnspecified.rawValue)
+        XCTAssertEqual(SleepStage.awake, HKCategoryValueSleepAnalysis.awake.rawValue)
+        XCTAssertEqual(SleepStage.asleepCore, HKCategoryValueSleepAnalysis.asleepCore.rawValue)
+        XCTAssertEqual(SleepStage.asleepDeep, HKCategoryValueSleepAnalysis.asleepDeep.rawValue)
+        XCTAssertEqual(SleepStage.asleepREM, HKCategoryValueSleepAnalysis.asleepREM.rawValue)
+        XCTAssertEqual(SleepStage.asleep, Set([
+            HKCategoryValueSleepAnalysis.asleepUnspecified.rawValue,
+            HKCategoryValueSleepAnalysis.asleepCore.rawValue,
+            HKCategoryValueSleepAnalysis.asleepDeep.rawValue,
+            HKCategoryValueSleepAnalysis.asleepREM.rawValue,
+        ]))
     }
 
     func testWalkingSteadinessBands() {
