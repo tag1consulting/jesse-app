@@ -698,6 +698,57 @@ pub fn write_day_file(path: &Path, contents: &str) -> std::io::Result<()> {
 /// exactly as it always did.
 pub const CLIENT_TZ_NOTE: &str = "the zone the requesting device is in, IANA";
 
+/// What `day` is for, once, since all three mutation bodies carry it.
+///
+/// It names the day the change was MADE against — the `date` of the snapshot the user
+/// was looking at, `YYYY-MM-DD` — and it exists for exactly one caller: a phone
+/// replaying a tap it captured while it had no network. See [`day_mismatch`].
+pub const DAY_GUARD_NOTE: &str = "the day the change was made against, YYYY-MM-DD";
+
+/// **The day guard.** Refuse a mutation aimed at a day the file no longer is.
+///
+/// `Today.md` is rewritten in full every morning, and the item ids are content hashes
+/// over `(section, lead, added date)` — so an id captured yesterday can still RESOLVE
+/// today, against a line the user never saw. That is the one way a replayed tap can
+/// land somewhere nobody asked for, and an `If-Match` does not close it: a client that
+/// refetched (as a replaying one must, to have a fresh etag at all) is holding a
+/// perfectly current tag for the wrong day.
+///
+/// So the client says which day it meant, and this refuses when the file has moved on.
+/// The refusal is a `409` carrying `{"reason":"day-mismatch","live_date":"…"}` — a
+/// distinct, machine-readable answer rather than the `412` a stale tag gets, because
+/// the two need opposite client behaviour: a `412` means "refetch and try again", and
+/// this means "stop; the thing you were acting on is gone".
+///
+/// **Absent, blank, or matching is a no-op**, which is what keeps every ordinary tap —
+/// and every older app build — behaving exactly as it always did. A day file with no
+/// date of its own (there is no file yet) matches nothing, deliberately: a replay that
+/// cannot confirm the day it was made against must not be applied to whatever is there.
+///
+/// Returns the ready refusal, or `None` when there is nothing to refuse.
+pub fn day_mismatch(requested: Option<&str>, live: Option<&str>) -> Option<Response> {
+    let want = requested.map(str::trim).filter(|d| !d.is_empty())?;
+    let live = live.map(str::trim).unwrap_or("");
+    if want == live {
+        return None;
+    }
+    Some(
+        (
+            StatusCode::CONFLICT,
+            [(
+                axum::http::header::CONTENT_TYPE,
+                "application/json".to_string(),
+            )],
+            serde_json::to_string(&json!({
+                "reason": "day-mismatch",
+                "live_date": live,
+            }))
+            .unwrap_or_default(),
+        )
+            .into_response(),
+    )
+}
+
 /// `POST /jesse/today/items/{id}/check` — tick or untick one item.
 #[derive(Deserialize)]
 pub struct CheckBody {
@@ -709,6 +760,9 @@ pub struct CheckBody {
     /// The zone this device is standing in, IANA. Optional; see [`CLIENT_TZ_NOTE`].
     #[serde(default)]
     pub client_tz: Option<String>,
+    /// The day this tap was MADE against, `YYYY-MM-DD`. Optional; see [`DAY_GUARD_NOTE`].
+    #[serde(default)]
+    pub day: Option<String>,
 }
 
 /// `POST /jesse/today/items/{id}/move` — reorder one item.
@@ -726,6 +780,10 @@ pub struct MoveBody {
     /// The zone this device is standing in, IANA. Optional; see [`CLIENT_TZ_NOTE`].
     #[serde(default)]
     pub client_tz: Option<String>,
+    /// The day this reorder was MADE against, `YYYY-MM-DD`. Optional; see
+    /// [`DAY_GUARD_NOTE`].
+    #[serde(default)]
+    pub day: Option<String>,
 }
 
 /// `POST /jesse/today/items/{id}/defer` — postpone one item for the day.
@@ -746,6 +804,10 @@ pub struct DeferBody {
     /// [`CLIENT_TZ_NOTE`].
     #[serde(default)]
     pub client_tz: Option<String>,
+    /// The day this postponement was MADE against, `YYYY-MM-DD`. Optional; see
+    /// [`DAY_GUARD_NOTE`].
+    #[serde(default)]
+    pub day: Option<String>,
 }
 
 /// `POST /jesse/today/glance` — mark one report row seen.
@@ -861,6 +923,7 @@ fn mutate(
     headers: &HeaderMap,
     id: &str,
     at: &str,
+    day_claim: Option<&str>,
     build: impl FnOnce(&TodaySnapshot, &Located) -> Result<Option<Effect>, ApiError>,
 ) -> Result<Response, ApiError> {
     let if_match = required_if_match(headers)?;
@@ -901,6 +964,15 @@ fn mutate(
     // The SAME post-parse composition the read path applies — see `today::hydrate`
     // for why a difference here would 412 every mutation.
     hydrate(&st.cfg, &mut snapshot);
+
+    // THE DAY GUARD, ahead of the etag precondition and for the same reason it is
+    // ahead of everything else: it touches nothing. It is asked FIRST because a
+    // replay that raced the morning rebuild would otherwise get the `412` its stale
+    // tag also earns, which tells it to refetch and try again — and trying again is
+    // exactly the wrong move when the day underneath has been replaced.
+    if let Some(refusal) = day_mismatch(day_claim, snapshot.date.as_deref()) {
+        return Ok(refusal);
+    }
 
     // THE PRECONDITION, before anything is recorded or written. A `412` must
     // touch nothing at all — not the file, not the journal — so that a client
@@ -1000,7 +1072,8 @@ pub async fn jesse_today_check(
         "`at` must be an ISO8601 instant (YYYY-MM-DDTHH:MM…)".to_string(),
     ))?;
     let at = body.at.clone();
-    mutate(&st, &headers, &id, &at, move |_, _| {
+    let day = body.day.clone();
+    mutate(&st, &headers, &id, &at, day.as_deref(), move |_, _| {
         Ok(Some(Effect::Check {
             checked: body.checked,
             evidence: body.evidence.clone(),
@@ -1034,13 +1107,21 @@ pub async fn jesse_today_move(
         ));
     }
     let at = body.at.clone();
-    mutate(&st, &headers, &id, &at, move |snapshot, located| {
-        let resolved = resolve_landing(snapshot, located, &op)?;
-        Ok(resolved.map(|(to_section, landing)| Effect::Move {
-            to_section,
-            landing,
-        }))
-    })
+    let day = body.day.clone();
+    mutate(
+        &st,
+        &headers,
+        &id,
+        &at,
+        day.as_deref(),
+        move |snapshot, located| {
+            let resolved = resolve_landing(snapshot, located, &op)?;
+            Ok(resolved.map(|(to_section, landing)| Effect::Move {
+                to_section,
+                landing,
+            }))
+        },
+    )
 }
 
 /// `POST /jesse/today/glance` — record that a report row was seen.
@@ -1120,6 +1201,12 @@ pub async fn jesse_today_defer(
     }
     let if_match = required_if_match(&headers)?;
     let (_, mut snapshot) = build_snapshot(&st.cfg);
+    // Asked before the etag, exactly as in `mutate` and for the same reason: a replayed
+    // postponement that raced the morning rebuild needs "the day moved on", not "refetch
+    // and try again". Neither answer touches the store.
+    if let Some(refusal) = day_mismatch(body.day.as_deref(), snapshot.date.as_deref()) {
+        return Ok(refusal);
+    }
     if !if_match_matches(&if_match, &snapshot_etag(&snapshot)) {
         return Err((
             StatusCode::PRECONDITION_FAILED,
@@ -1441,6 +1528,53 @@ mod tests {
                 Some("2026-03-03 09:30")
             );
         }
+    }
+
+    // ---- The day guard -----------------------------------------------------
+
+    /// A stamp minutes old and a stamp hours old are the same code path — which is the
+    /// whole point, because a replayed check is just a check with an old `at`. Nothing
+    /// here consults a clock, so there is no window in which the bridge's own time
+    /// could substitute itself for the user's.
+    #[test]
+    fn a_replayed_stamp_is_the_users_hour_however_late_it_arrives() {
+        assert_eq!(
+            stamp_from_iso("2026-03-03T07:05:00Z", &london()).as_deref(),
+            Some("2026-03-03 07:05"),
+            "an `at` from this morning still reads as this morning"
+        );
+        assert_eq!(
+            stamp_from_iso("2026-03-02T21:40:00Z", &london()).as_deref(),
+            Some("2026-03-02 21:40"),
+            "and one from last night still reads as last night"
+        );
+    }
+
+    #[test]
+    fn the_day_guard_refuses_only_a_day_that_actually_moved() {
+        // Absent: every ordinary tap. Nothing to compare, nothing to refuse.
+        assert!(day_mismatch(None, Some("2026-03-03")).is_none());
+        // Blank is absent — an older client sending an empty field must not be broken.
+        assert!(day_mismatch(Some(""), Some("2026-03-03")).is_none());
+        assert!(day_mismatch(Some("   "), Some("2026-03-03")).is_none());
+        // Named and matching (whitespace tolerated on the way in).
+        assert!(day_mismatch(Some("2026-03-03"), Some("2026-03-03")).is_none());
+        assert!(day_mismatch(Some(" 2026-03-03 "), Some("2026-03-03")).is_none());
+        // Named and different: refused.
+        assert_eq!(
+            day_mismatch(Some("2026-03-02"), Some("2026-03-03"))
+                .map(|r| r.status())
+                .unwrap(),
+            StatusCode::CONFLICT
+        );
+        // A day file with no date of its own can confirm nothing, so a replay that
+        // names a day is refused rather than applied to whatever is there.
+        assert_eq!(
+            day_mismatch(Some("2026-03-03"), None)
+                .map(|r| r.status())
+                .unwrap(),
+            StatusCode::CONFLICT
+        );
     }
 
     // ---- Moves -------------------------------------------------------------
