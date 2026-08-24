@@ -85,7 +85,7 @@ public protocol TodayProviding: Sendable {
     /// recording one line of evidence beneath it. Evidence is capped and escaped
     /// bridge-side; unchecking removes any sub-line a previous check wrote.
     func checkItem(id: String, checked: Bool, evidence: String?, at: Date,
-                   ifMatch: String) async throws -> TodayMutationResult
+                   day: String?, ifMatch: String) async throws -> TodayMutationResult
 
     /// `POST /jesse/today/items/{id}/move` — reorder one item. For the two ops that
     /// cross a section boundary (`.toDoNow`, `.toSection`) the returned snapshot may
@@ -93,7 +93,7 @@ public protocol TodayProviding: Sendable {
     /// response is authoritative and the caller must re-key any state it holds under
     /// the old one.
     func moveItem(id: String, op: TodayMoveOp, at: Date,
-                  ifMatch: String) async throws -> TodayMutationResult
+                  day: String?, ifMatch: String) async throws -> TodayMutationResult
 
     /// `POST /jesse/today/items/{id}/defer` — postpone one item for the day, or
     /// bring it back.
@@ -104,7 +104,7 @@ public protocol TodayProviding: Sendable {
     /// unwind. Unlike a move, the standing lead item MAY be postponed: it counts
     /// toward the badge, so it has to be dismissible.
     func postpone(id: String, deferred: Bool, at: Date,
-                  ifMatch: String) async throws -> TodayMutationResult
+                  day: String?, ifMatch: String) async throws -> TodayMutationResult
 
     /// `POST /jesse/today/glance` — mark one report row seen. The only mutation that
     /// never touches `Today.md`: glance state is the app's read-tracking, kept in the
@@ -124,12 +124,15 @@ struct TodayCheckBody: Encodable {
     var checked: Bool
     var evidence: String?
     var at: String
+    /// The day this tap was MADE against — see `TodayDayGuard`. Omitted (and so inert)
+    /// for every live tap; sent only by a replay.
+    var day: String?
     /// The zone this device is standing in, IANA. The bridge derives the date it stamps into
     /// `Today.md` in it, so a tick made abroad lands on the day the person is living.
     var clientTz: String = JesseBridgeClient.clientTimeZone
 
     enum CodingKeys: String, CodingKey {
-        case checked, evidence, at
+        case checked, evidence, at, day
         case clientTz = "client_tz"
     }
 }
@@ -140,11 +143,13 @@ struct TodayMoveBody: Encodable {
     /// as a `400` when it is absent or blank.
     var section: String?
     var at: String
+    /// The day this reorder was MADE against — see `TodayCheckBody.day`.
+    var day: String?
     /// The zone this device is standing in, IANA — see `TodayCheckBody.clientTz`.
     var clientTz: String = JesseBridgeClient.clientTimeZone
 
     enum CodingKeys: String, CodingKey {
-        case op, section, at
+        case op, section, at, day
         case clientTz = "client_tz"
     }
 }
@@ -157,13 +162,15 @@ struct TodayGlanceBody: Encodable {
 struct TodayDeferBody: Encodable {
     var deferred: Bool
     var atMs: UInt64
+    /// The day this postponement was MADE against — see `TodayCheckBody.day`.
+    var day: String?
     /// Accepted for symmetry with `check` and `move` — one body shape, not three — though a
     /// defer writes no date anywhere. `POST /jesse/today/glance` is the one write that has no
     /// such field at all (`GlanceBody` in `bridge/src/todaywrite.rs`), so it is not sent one.
     var clientTz: String = JesseBridgeClient.clientTimeZone
 
     enum CodingKeys: String, CodingKey {
-        case deferred, atMs
+        case deferred, atMs, day
         case clientTz = "client_tz"
     }
 }
@@ -194,35 +201,38 @@ extension JesseBridgeClient: TodayProviding {
     }
 
     public func checkItem(id: String, checked: Bool, evidence: String?, at: Date,
-                          ifMatch: String) async throws -> TodayMutationResult {
+                          day: String?, ifMatch: String) async throws -> TodayMutationResult {
         // The bridge caps and escapes evidence itself; blank collapses to an omitted
         // field so a bare check writes no sub-line at all.
         let note = evidence?.trimmingCharacters(in: .whitespacesAndNewlines)
         let body = TodayCheckBody(checked: checked,
                                   evidence: (note?.isEmpty ?? true) ? nil : note,
-                                  at: Self.isoInstant(at))
+                                  at: Self.isoInstant(at),
+                                  day: day)
         return try await todayMutate("/jesse/today/items/\(Self.pathEscaped(id))/check",
                                      body: body, ifMatch: ifMatch)
     }
 
     public func moveItem(id: String, op: TodayMoveOp, at: Date,
-                         ifMatch: String) async throws -> TodayMutationResult {
+                         day: String?, ifMatch: String) async throws -> TodayMutationResult {
         try await todayMutate("/jesse/today/items/\(Self.pathEscaped(id))/move",
                               body: TodayMoveBody(op: op.wireOp,
                                                   section: op.destinationSection,
-                                                  at: Self.isoInstant(at)),
+                                                  at: Self.isoInstant(at),
+                                                  day: day),
                               ifMatch: ifMatch)
     }
 
     public func postpone(id: String, deferred: Bool, at: Date,
-                         ifMatch: String) async throws -> TodayMutationResult {
+                         day: String?, ifMatch: String) async throws -> TodayMutationResult {
         // `atMs` is unix MILLISECONDS, like `glance` and unlike the two file
         // mutations: nothing here reaches the vault, so it is a clock reading the
         // defer store resolves concurrent claims with, not a stamp for a person to
         // read in the day file.
         try await todayMutate("/jesse/today/items/\(Self.pathEscaped(id))/defer",
                               body: TodayDeferBody(deferred: deferred,
-                                                   atMs: Self.unixMillis(at)),
+                                                   atMs: Self.unixMillis(at),
+                                                   day: day),
                               ifMatch: ifMatch)
     }
 

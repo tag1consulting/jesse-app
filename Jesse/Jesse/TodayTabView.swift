@@ -25,6 +25,11 @@ struct TodayTabView: View {
     /// screen does. One model, one number, no second definition of "how many".
     @Bindable var model: TodayDashboardModel
 
+    /// Drain the offline capture queue NOW. Owned by `RootTabView` (which holds the
+    /// replayer) and reached from here for the one trigger this screen knows about: a
+    /// per-row Retry, which has to look like it did something.
+    var onReplay: () -> Void = {}
+
     @Environment(RunCoordinator.self) private var coordinator
     @Environment(\.scenePhase) private var scenePhase
     @Environment(\.modelContext) private var context
@@ -84,7 +89,9 @@ struct TodayTabView: View {
                           onOpenDetail: { openedItem = $0 },
                           onDiscuss: { discuss(.discuss(item: $0)) },
                           onPropagate: { execute(.propagate(item: $0, evidence: $1)) },
-                          onProcessUpdates: processUpdates)
+                          onProcessUpdates: processUpdates,
+                          onRetryPending: retryPending,
+                          onTellFallback: tellFallback)
                 // The day file's own title is a sentence ("Today: Monday, August 10,
                 // 2026"), which a large title truncates to "Today: Monday, Augus…" on
                 // a phone. Inline fits it and buys back the vertical space the list
@@ -182,9 +189,14 @@ struct TodayTabView: View {
     /// instead of a queued write. Same gate as the Chats list's banner: an UNPAIRED
     /// app is not offline, it is unconfigured, and the pairing CTA covers that.
     private func applyReachability() {
+        let wasUnreachable = model.isNetworkUnreachable
         model.isNetworkUnreachable = shouldShowOfflineBanner(
             isConfigured: ConfigStore.load().isConfigured,
             reachability: reachability.state)
+        // The probe going from unreachable to reachable is one of the four replay
+        // triggers — the one that covers a bridge that woke up on a network this device
+        // never left, which no path event would ever report.
+        if wasUnreachable && !model.isNetworkUnreachable { onReplay() }
     }
 
     // MARK: - Actions
@@ -233,6 +245,31 @@ struct TodayTabView: View {
         guard !model.refuseInteractionIfReadOnly() else { return }
         openedThread = processRun.start(items: items, coordinator: coordinator,
                                         context: context)
+    }
+
+    /// **Try one refused change again.** Put it back in the queue, then run the queue —
+    /// a Retry that only did the first would sit there looking inert until the next
+    /// network event, which may be hours away on a boat.
+    private func retryPending(_ intent: PendingIntentRecord) {
+        model.retryPending(id: intent.id)
+        onReplay()
+    }
+
+    /// **Hand a refused check to the agent instead**, as a plain sentence naming the
+    /// task, the day and the hour.
+    ///
+    /// This is what stops a refusal being a loss. The app can no longer find the line —
+    /// the day was rebuilt and the words moved — but the agent reads the vault and can:
+    /// it knows what yesterday held and can close the thing at source. So the row offers
+    /// a conversation rather than an apology, and the intent is discarded once the turn
+    /// is on its way, because the fact has been delivered by another route.
+    private func tellFallback(_ intent: PendingIntentRecord) {
+        guard let text = intent.tellFallback else { return }
+        let thread = JesseThread(mode: .tell)
+        context.insert(thread)
+        coordinator.send(thread: thread, text: text, voice: false, context: context)
+        model.discardPending(id: intent.id)
+        openedThread = thread
     }
 
     /// Dismissing a staged discussion without sending drops the context with it — a

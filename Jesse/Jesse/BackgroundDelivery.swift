@@ -99,7 +99,11 @@ final class BackgroundDelivery {
     /// The live coordinator, when the app's UI is actually running. Weak and optional
     /// because a push can launch the app straight into the background, where no scene has
     /// been built and there is no coordinator to tell — delivery must work either way.
-    private weak var coordinator: RunCoordinator?
+    ///
+    /// Readable (rather than private) so the in-place Siri capture can reach the SAME
+    /// coordinator the composer uses when the app happens to be running, instead of
+    /// standing up a second one whose in-flight map the UI would never see.
+    private(set) weak var coordinator: RunCoordinator?
 
     init(makeClient: @escaping @MainActor () -> (any JesseClientProtocol)? = {
              let cfg = ConfigStore.load()
@@ -163,6 +167,11 @@ final class BackgroundDelivery {
     /// anything still in flight. Deliberately the same two operations the push path does,
     /// because the task exists for the case where no push arrived at all.
     func periodicRefresh() async -> BackgroundWorkOutcome {
+        // The offline capture queue's fourth trigger, and the one that covers the case
+        // no other does: a phone that came back onto a network while nothing was on
+        // screen and no push arrived. Fired first so a queued change is in the vault
+        // BEFORE the snapshot refresh below reads the day back.
+        await replayQueuedIntents()
         let jobs = inFlightStore.load()
         async let snapshots = refresh([.today, .diet])
         async let replies: BackgroundWorkOutcome = {
@@ -173,6 +182,17 @@ final class BackgroundDelivery {
             return outcome
         }()
         return Self.combine(await snapshots, await replies)
+    }
+
+    /// Drain the offline capture queue, if this process has one wired up.
+    ///
+    /// Reached through the coordinator rather than held here, because the replayer needs
+    /// the two dashboard models and this type deliberately has neither — it is the
+    /// no-UI path. When the app is fully cold there is no coordinator and this is a
+    /// no-op, which is correct: the replay then happens on the next foreground, where
+    /// there is a screen to show its result on.
+    private func replayQueuedIntents() async {
+        await coordinator?.replayQueuedIntentsNow()
     }
 
     // MARK: - Delivering a finished reply

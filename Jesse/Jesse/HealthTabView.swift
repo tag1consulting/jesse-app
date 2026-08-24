@@ -2,6 +2,8 @@ import SwiftUI
 import SwiftData
 import JesseCore
 import JesseDietDisplay
+import JesseNetworking
+import JesseTodayDisplay
 
 // The iOS Health tab: a thin shell around the SHARED dashboard (`HealthDashboardContent`
 // in JesseDietDisplay, rendered identically on the Mac). Everything platform-specific
@@ -15,17 +17,24 @@ struct HealthTabView: View {
     /// a background turn doesn't refetch while the user is in Chats.
     let isActive: Bool
 
+    /// Owned by `RootTabView`. It moved out of this view when the offline capture queue
+    /// landed, for one reason: the replayer has to read the live diet day to decide
+    /// whether a queued Start-new-day is still worth running, and it must be able to do
+    /// that while the user is looking at Chats.
+    @Bindable var model: HealthDashboardModel
+
+    /// Drain the offline capture queue NOW — see `TodayTabView.onReplay`.
+    var onReplay: () -> Void = {}
+
     @Environment(RunCoordinator.self) private var coordinator
     @Environment(\.scenePhase) private var scenePhase
     @Environment(\.modelContext) private var context
-    // The display model fetches through the narrow `DietSnapshotProviding` seam; iOS
-    // injects its own `JesseClient` (which layers per-turn health context on top),
-    // preserving the exact client the tab used before the display layer moved out.
-    @State private var model = HealthDashboardModel(
-        makeClient: { JesseClient(config: ConfigStore.load(), snapshotCache: SnapshotCache.shared) },
-        cache: SnapshotCache.shared)
     @State private var showQuickLog = false
     @State private var confirmNewDay = false
+
+    /// The one line about a log that was held (or could not be). Transient by design:
+    /// it describes one action, not a state of the dashboard.
+    @State private var queuedNotice: String?
 
     /// The conversation an "Ask about this" opened.
     ///
@@ -85,12 +94,15 @@ struct HealthTabView: View {
                     // Quick log and "Start new day" are both today-only (they act on
                     // today), so they're hidden while paging back through a past day.
                     //
-                    // Both are DISABLED, not queued, while the bridge is unreachable.
-                    // Each fires a fresh `.tell` turn on a thread this tab never
-                    // navigates to, so a failure offline lands as a `.failed` outbox row
-                    // carrying a manual Retry the user is never shown — a log that looks
-                    // sent and is not. The offline strip on the dashboard says why. See
-                    // the CHANGELOG entry for why the chat outbox is not reused here.
+                    // Offline they are QUEUED, not disabled — which they were, on the
+                    // argument that a failure would land as a `.failed` outbox row
+                    // carrying a Retry the user is never shown. That argument was about
+                    // the CHAT outbox, which this tab does not navigate to; the capture
+                    // queue is visible on this screen, so the objection no longer holds.
+                    //
+                    // They are still disabled when nothing can be captured — no queue, or
+                    // no `dietDay` from the bridge to date a log against. A log with no
+                    // day behind it is the one thing worse than a refused one.
                     if HistoryUI.showsQuickLog(isHistorical: model.snapshot?.isHistorical ?? false) {
                         // BOTH items must be `.primaryAction`. `.secondaryAction` (which
                         // this one shipped as) does NOT mean "the second button" on iOS:
@@ -102,12 +114,12 @@ struct HealthTabView: View {
                         ToolbarItem(placement: .primaryAction) {
                             Button { confirmNewDay = true } label: { Image(systemName: "sun.horizon") }
                                 .accessibilityLabel("Start new day")
-                                .disabled(model.isReadOnly)
+                                .disabled(model.isReadOnly && !model.capturesOffline)
                         }
                         ToolbarItem(placement: .primaryAction) {
                             Button { showQuickLog = true } label: { Image(systemName: "plus") }
                                 .accessibilityLabel("Quick log")
-                                .disabled(model.isReadOnly)
+                                .disabled(model.isReadOnly && !model.capturesOffline)
                         }
                     }
                 }
@@ -117,16 +129,32 @@ struct HealthTabView: View {
                     NavigationStack { ThreadDetailView(thread: thread, hidesTabBar: false) }
                 }
                 .sheet(isPresented: $showQuickLog) {
-                    QuickLogSheet { text in
-                        // Belt and braces with the disabled button above: the sheet may
-                        // have been opened while the bridge was still reachable.
-                        guard !model.isReadOnly else { return }
-                        let thread = JesseThread(mode: .tell)
-                        context.insert(thread)
-                        coordinator.send(thread: thread, text: text, voice: false, context: context)
-                    }
+                    QuickLogSheet { text in quickLog(text) }
                 }
                 // A tap could kick off the long morning routine, so confirm first.
+                // The queue, where the day is — above the dashboard, because its whole
+                // claim is "these logs are not in the vault yet".
+                .safeAreaInset(edge: .top, spacing: 0) {
+                    VStack(spacing: 0) {
+                        if let queuedNotice {
+                            HStack(spacing: 8) {
+                                Image(systemName: "arrow.up.circle").foregroundStyle(.secondary)
+                                Text(queuedNotice).font(.footnote)
+                                Spacer(minLength: 0)
+                                Button("Dismiss") { self.queuedNotice = nil }.font(.caption)
+                            }
+                            .padding(.horizontal, 16).padding(.vertical, 8)
+                            .background(.thinMaterial)
+                        }
+                        if !model.pendingIntents.isEmpty {
+                            TodayPendingSection(intents: model.pendingIntents,
+                                                onRetry: retryPending,
+                                                onDiscard: { model.discardPending(id: $0.id) })
+                                .padding(.horizontal, 16).padding(.vertical, 6)
+                                .background(.thinMaterial)
+                        }
+                    }
+                }
                 .confirmationDialog("Start new day", isPresented: $confirmNewDay) {
                     Button("Start new day") { startNewDay() }
                     Button("Cancel", role: .cancel) {}
@@ -180,9 +208,11 @@ struct HealthTabView: View {
     /// UNPAIRED app is not offline, it is unconfigured, and the pairing empty state
     /// covers that.
     private func applyReachability() {
+        let wasUnreachable = model.isNetworkUnreachable
         model.isNetworkUnreachable = shouldShowOfflineBanner(
             isConfigured: ConfigStore.load().isConfigured,
             reachability: reachability.state)
+        if wasUnreachable && !model.isNetworkUnreachable { onReplay() }
     }
 
     // MARK: - Ask about this
@@ -209,9 +239,40 @@ struct HealthTabView: View {
     /// long-running routine runs in the background and the after-turn refresh above
     /// repaints the dashboard when it lands. Mirrors the Quick log send path.
     private func startNewDay() {
-        guard !model.isReadOnly else { return }
+        if model.isReadOnly {
+            // Held rather than fired. A queued Start-new-day is refused on replay if the
+            // day has already rolled without it — see `IntentReplayer`.
+            if model.captureStartNewDay() { queuedNotice = HealthDashboardModel.queuedNotice }
+            else { queuedNotice = HealthDashboardModel.readOnlyNotice }
+            return
+        }
         let thread = JesseThread(mode: .tell)
         context.insert(thread)
         coordinator.send(thread: thread, text: HealthNewDay.prompt, voice: false, context: context)
+    }
+
+    /// **Log something, or hold it.**
+    ///
+    /// A held quick log is the safest thing in the queue: it names no item and depends on
+    /// no document, and replay dates it with a leading `(eaten at …)` stamp the diet
+    /// pipeline treats as authoritative. A lunch logged on a boat is a lunch eaten at
+    /// lunchtime whenever it finally reaches the laptop.
+    private func quickLog(_ text: String) {
+        if model.isReadOnly {
+            queuedNotice = model.captureQuickLog(text)
+                ? HealthDashboardModel.queuedNotice
+                : HealthDashboardModel.readOnlyNotice
+            return
+        }
+        let thread = JesseThread(mode: .tell)
+        context.insert(thread)
+        coordinator.send(thread: thread, text: text, voice: false, context: context)
+    }
+
+    /// **Try one refused action again** — put it back and run the queue, so the tap does
+    /// something visible rather than waiting on the next network event.
+    private func retryPending(_ intent: PendingIntentRecord) {
+        model.retryPending(id: intent.id)
+        onReplay()
     }
 }

@@ -1,5 +1,6 @@
 import Foundation
 import Observation
+import JesseCore
 import JesseNetworking
 
 // The Health tab's view model. Owns the currently-viewed snapshot, the fetch state,
@@ -88,10 +89,16 @@ public final class HealthDashboardModel {
         return false
     }
 
-    /// The wording a refused action gets, matching the day tab's word for word so the
-    /// two tabs cannot describe the same situation two ways.
+    /// The wording a refused action gets when there is nothing to capture it with —
+    /// no queue wired in, or no diet day on screen to date it against. Matches the day
+    /// tab's word for word so the two tabs cannot describe the same situation two ways.
     public static let readOnlyNotice =
         "You're offline, so logging is paused. Nothing was sent and nothing is waiting to send — try again once the bridge is reachable."
+
+    /// The wording a CAPTURED action gets. Identical to the day tab's, for the same
+    /// reason the refusal is.
+    public static let queuedNotice =
+        "Saved offline, will apply when the bridge is back."
 
     /// The message shown under an empty Health tab that has never been able to load.
     /// Carried as `DietFetchError.unreachable`'s payload so it reaches the SAME empty
@@ -117,16 +124,120 @@ public final class HealthDashboardModel {
     /// The on-disk last-good dashboard, or `nil` to keep the pre-cache behavior.
     private let snapshotCache: SnapshotCache?
 
+    /// **The offline capture queue**, or `nil` for the pre-queue behaviour. Optional for
+    /// the same reason `TodayDashboardModel`'s is: a shell with no store must keep the
+    /// honest refusal rather than promise to save something nowhere.
+    private let pending: (any PendingIntentStoring)?
+
+    /// The zone a captured log records. It is not decoration — a quick log replays with
+    /// a `(eaten at <RFC3339 with offset>)` stamp, and the offset that means anything is
+    /// the one the person was living in when they ate.
+    private let zone: @Sendable () -> String
+
     /// The client is a required injection (no iOS-specific default now that the model
     /// lives in the shared package): iOS passes its `JesseClient`, the Mac a
     /// `JesseBridgeClient`, tests/previews a fake. Both concrete clients satisfy the
     /// narrow `DietSnapshotProviding` seam.
     public init(makeClient: @escaping @MainActor () -> any DietSnapshotProviding,
                 now: @escaping () -> Date = { Date() },
-                cache: SnapshotCache? = nil) {
+                cache: SnapshotCache? = nil,
+                pending: (any PendingIntentStoring)? = nil,
+                zone: @escaping @Sendable () -> String = { TimeZone.current.identifier }) {
         self.makeClient = makeClient
         self.now = now
         self.snapshotCache = cache
+        self.pending = pending
+        self.zone = zone
+    }
+
+    // MARK: - Capture
+
+    /// **The day a log written right now belongs to**, as the bridge resolved it.
+    ///
+    /// `dietDay` and not `today.date`, and the difference is the whole reason the field
+    /// exists: the diet day runs to 04:00 local, so a snack at 01:00 belongs to
+    /// yesterday's log even though the calendar has turned over. A capture dated by the
+    /// calendar would put it on the wrong day, and the replay's start-new-day guard
+    /// would then compare the wrong two things.
+    ///
+    /// `nil` on a bridge too old to send it — capture is off rather than guessing, for
+    /// the same reason `TodayDashboardModel.captureDay` is nil without a snapshot date.
+    public var captureDay: String? {
+        guard let day = snapshot?.dietDay, !day.isEmpty else { return nil }
+        return day
+    }
+
+    /// Whether an action taken right now would be held rather than sent or refused.
+    public var capturesOffline: Bool { pending != nil && captureDay != nil }
+
+    /// The queue as this tab shows it — its OWN kinds only.
+    ///
+    /// The two tabs share one store and one replayer, and each shows the half it is
+    /// about: a checkbox held for the day file has nothing to do with the Health tab,
+    /// and a list that showed both would be telling each screen about the other's work.
+    public private(set) var pendingIntents: [PendingIntentRecord] = []
+
+    /// Re-read the queue. Called after a capture and by the shell once a replay has run.
+    public func refreshPending() {
+        pendingIntents = (pending?.outstanding() ?? [])
+            .filter { $0.kind == .quickLog || $0.kind == .startNewDay }
+    }
+
+    /// **Hold a quick log.** Returns whether it was captured; `false` means the caller
+    /// must fall back to the refusal.
+    ///
+    /// A quick log is the SAFEST thing in the whole queue to hold, and it is worth
+    /// saying why: it names no item id and depends on no document. Replay sends it as an
+    /// ordinary Tell carrying a leading `(eaten at …)` stamp, which the diet pipeline
+    /// treats as authoritative — so a lunch captured on a boat is dated when it was
+    /// eaten, whenever it eventually arrives.
+    @discardableResult
+    public func captureQuickLog(_ text: String) -> Bool {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let pending, let day = captureDay, !trimmed.isEmpty else { return false }
+        pending.append(PendingIntentRecord(kind: .quickLog, dayDate: day,
+                                           payload: PendingIntentPayload(text: trimmed),
+                                           createdAt: now(), tz: zone()))
+        refreshPending()
+        return true
+    }
+
+    /// **Hold a Start-new-day.** Returns whether it was captured.
+    ///
+    /// At most ONE is ever held. The routine is not additive — it audits yesterday and
+    /// builds today — so two of them queued is one of them running against a day the
+    /// other just created, and a second tap during an outage means "did that go?" rather
+    /// than "do it twice".
+    @discardableResult
+    public func captureStartNewDay() -> Bool {
+        guard let pending, let day = captureDay else { return false }
+        let alreadyHeld = pending.outstanding().contains {
+            $0.kind == .startNewDay && $0.state != .refused
+        }
+        guard !alreadyHeld else {
+            refreshPending()
+            return true
+        }
+        pending.append(PendingIntentRecord(kind: .startNewDay, dayDate: day,
+                                           createdAt: now(), tz: zone()))
+        refreshPending()
+        return true
+    }
+
+    /// Forget one captured action, at the user's word.
+    public func discardPending(id: UUID) {
+        pending?.delete(id: id)
+        refreshPending()
+    }
+
+    /// Put a refused action back in the queue so the next replay tries it again.
+    public func retryPending(id: UUID) {
+        guard let pending, var record = pendingIntents.first(where: { $0.id == id }),
+              record.state == .refused else { return }
+        record.state = .queued
+        record.refusalReason = nil
+        pending.update(record)
+        refreshPending()
     }
 
     /// Render the last dashboard this device was given, before any network call, so a

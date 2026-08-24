@@ -53,6 +53,8 @@ import SwiftData
 //     `conversationId` carries no `.unique` attribute either: a unique constraint on an
 //     optional String across two separate stores buys nothing, and uniqueness is enforced
 //     by the sync's merge pass instead.
+//   • the `PendingIntent` entity (the offline capture queue) — one new entity with every
+//     property defaulted and no relationship to anything that already exists
 //
 // Each is a new property with a default, a new optional/relationship, or a new entity:
 // nothing renamed, retyped, or dropped. A store written before any of them opens under
@@ -84,9 +86,8 @@ public enum JesseSchemaV1: VersionedSchema {
     }
 }
 
-/// The current entity set, adding the send outbox (`OutboxItem` + `OutboxAttachment`)
-/// to V1. `jesseCurrentSchema` is derived from this so the container and the migration
-/// test can never drift from the model list. Additive property changes (favorites,
+/// V2: the send outbox (`OutboxItem` + `OutboxAttachment`) added to V1. Additive property
+/// changes (favorites,
 /// origin, the archive fields, and the favorite/archive LWW-sync clocks) live on these
 /// same entities and migrate automatically; they do not get their own version (see the
 /// header note).
@@ -99,7 +100,7 @@ public enum JesseSchemaV2: VersionedSchema {
     }
 }
 
-/// The current entity set, adding `TurnArtifact` (the artifact return channel) to V2.
+/// V3: `TurnArtifact` (the artifact return channel) added to V2.
 /// Additive in exactly the way the header describes — a new entity plus a new to-many
 /// relationship with an empty default — so it lightweight-migrates with no migration
 /// code, and `AppModelContainerMigrationTests` opens a V2-shaped store to prove it.
@@ -112,8 +113,31 @@ public enum JesseSchemaV3: VersionedSchema {
     }
 }
 
+/// **The current entity set**: `PendingIntent` (the OFFLINE CAPTURE QUEUE) added to V3.
+/// `jesseCurrentSchema` is derived from this, so the container and every migration test
+/// can never drift from the model list.
+///
+/// Additive in exactly the way the header describes — one new entity, every property
+/// defaulted, no relationship to anything that already exists — so it lightweight-
+/// migrates with no migration code, and `AppModelContainerMigrationTests` opens a
+/// V3-shaped store to prove it.
+///
+/// It deliberately holds NO relationship to `JesseThread` or `Turn`, even though a
+/// replayed quick log ends up creating both. A queued intent is a fact about a day file
+/// or a diet day, not about a conversation, and the conversation it eventually produces
+/// is downstream of the replay rather than part of the capture — wiring the two together
+/// would mean a discarded intent could cascade-delete a thread the user is reading.
+public enum JesseSchemaV4: VersionedSchema {
+    public static let versionIdentifier = Schema.Version(4, 0, 0)
+
+    public static var models: [any PersistentModel.Type] {
+        [JesseThread.self, Turn.self, TurnAttachment.self, WrittenMeal.self,
+         OutboxItem.self, OutboxAttachment.self, TurnArtifact.self, PendingIntent.self]
+    }
+}
+
 /// The app's live schema, derived from the current `VersionedSchema`. The container
 /// and every migration-test open the store through THIS value so they can never drift
 /// from the model list. Opened with automatic lightweight migration (no staged plan);
 /// see the header note and `AppModelContainer.load`.
-public var jesseCurrentSchema: Schema { Schema(versionedSchema: JesseSchemaV3.self) }
+public var jesseCurrentSchema: Schema { Schema(versionedSchema: JesseSchemaV4.self) }

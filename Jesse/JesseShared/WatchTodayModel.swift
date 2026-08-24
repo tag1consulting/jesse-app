@@ -167,7 +167,19 @@ final class WatchTodayModel {
     func isPending(_ id: String) -> Bool { claims[id] != nil }
 
     private func state(for row: WatchTodayRow) -> RowState {
-        if let claim = claims[row.id] { return claim.queued ? .queued : .pending }
+        if let claim = claims[row.id] {
+            // The PHONE's answer outranks this watch's own guess about the trip, and it
+            // has to: `claim.queued` records only whether the watch could reach the
+            // phone at the moment of the tap. A phone that took the check and then found
+            // no bridge is holding it just as surely, and until it said so the row read
+            // "sending" for the whole outage.
+            if summary?.queuedIds.contains(row.id) == true { return .queued }
+            return claim.queued ? .queued : .pending
+        }
+        // A check made on the PHONE while it was offline has no claim on this watch at
+        // all, and the row would otherwise draw as open — which is the wrist disagreeing
+        // with the screen the person just used.
+        if summary?.queuedIds.contains(row.id) == true { return .queued }
         return row.checked ? .done : .open
     }
 

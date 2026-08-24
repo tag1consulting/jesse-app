@@ -41,22 +41,37 @@ public struct TodayOptimism: Equatable, Sendable {
     /// drops on the tap rather than after the round trip. `false` is a real entry:
     /// it is "bring this back to today", not the absence of a claim.
     public var deferrals: [String: Bool] = [:]
+    /// **Ids whose claim is QUEUED rather than in flight** — captured while the bridge
+    /// was unreachable and held for replay.
+    ///
+    /// A parallel set rather than a case on each entry, because it says nothing about
+    /// WHAT is claimed and everything about how the claim is travelling: the same id can
+    /// carry a check and a postponement, and both are queued together or neither is.
+    /// The overlay applies identically either way — the day renders as the user left it
+    /// — and this only changes how the row DESCRIBES itself, which is the honest
+    /// difference between "sending" and "saved, waiting for the bridge".
+    public var queued: Set<String> = []
 
     public init(checks: [String: Bool] = [:], evidence: [String: String] = [:],
                 moves: [String: TodayMoveOp] = [:], removed: Set<String> = [],
-                seen: Set<String> = [], deferrals: [String: Bool] = [:]) {
+                seen: Set<String> = [], deferrals: [String: Bool] = [:],
+                queued: Set<String> = []) {
         self.checks = checks
         self.evidence = evidence
         self.moves = moves
         self.removed = removed
         self.seen = seen
         self.deferrals = deferrals
+        self.queued = queued
     }
 
     public var isEmpty: Bool {
         checks.isEmpty && evidence.isEmpty && moves.isEmpty && removed.isEmpty
             && seen.isEmpty && deferrals.isEmpty
     }
+
+    /// Whether this id's claim is being held for replay rather than sent.
+    public func isQueued(_ id: String) -> Bool { queued.contains(id) }
 
     /// Carry every entry keyed `old` over to `new`, leaving nothing behind.
     ///
@@ -73,6 +88,7 @@ public struct TodayOptimism: Equatable, Sendable {
         if let v = deferrals.removeValue(forKey: old) { deferrals[new] = v }
         if removed.remove(old) != nil { removed.insert(new) }
         if seen.remove(old) != nil { seen.insert(new) }
+        if queued.remove(old) != nil { queued.insert(new) }
     }
 
     /// Forget everything about one id — what a confirmed round trip does, since the
@@ -82,6 +98,7 @@ public struct TodayOptimism: Equatable, Sendable {
         evidence.removeValue(forKey: id)
         moves.removeValue(forKey: id)
         deferrals.removeValue(forKey: id)
+        queued.remove(id)
     }
 }
 

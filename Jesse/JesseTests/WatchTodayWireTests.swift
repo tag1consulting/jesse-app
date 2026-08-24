@@ -57,6 +57,40 @@ final class WatchTodayWireTests: XCTestCase {
         XCTAssertEqual(WatchTodaySummary.decode(summary.encode()), summary)
     }
 
+    /// **The queued markers survive the trip**, and they are the wrist's only evidence
+    /// that the PHONE is sitting on a check rather than waiting on the bridge.
+    func testQueuedIdsRoundTrip() {
+        let summary = WatchTodaySummary(
+            date: "2026-08-11", etag: nil,
+            pushedAt: Date(timeIntervalSince1970: 1_786_000_000),
+            rows: [WatchTodayRow(id: "aaa", lead: "x", checked: true, section: "Do Now")],
+            openCount: 1, doneCount: 0, doNowOpenCount: 1, queuedIds: ["aaa"])
+        XCTAssertEqual(WatchTodaySummary.decode(summary.encode()), summary)
+        XCTAssertTrue(PropertyListSerialization.propertyList(summary.encode(),
+                                                             isValidFor: .binary),
+                      "a Set has to cross as an Array or WatchConnectivity throws at runtime")
+    }
+
+    /// A phone that predates the field sends no such key, and "the phone is holding
+    /// nothing" is the correct reading of its absence — not a decode failure.
+    func testAPayloadWithoutQueuedIdsDecodesToNone() {
+        var dict = WatchTodaySummary(date: nil, etag: nil, pushedAt: Date(),
+                                     rows: [], openCount: 1, doneCount: 0,
+                                     queuedIds: ["aaa"]).encode()
+        dict["queued"] = nil
+        XCTAssertEqual(WatchTodaySummary.decode(dict)?.queuedIds, [])
+    }
+
+    /// Clamped like the rows: a corrupt dictionary must not be able to force a
+    /// pathological allocation, and a queued marker is decoration on a row.
+    func testAnOverlongQueuedListIsClamped() {
+        var dict = WatchTodaySummary(date: nil, etag: nil, pushedAt: Date(),
+                                     rows: [], openCount: 0, doneCount: 0).encode()
+        dict["queued"] = (0..<100).map { "id-\($0)" }
+        XCTAssertEqual(WatchTodaySummary.decode(dict)?.queuedIds.count,
+                       WatchTodayWire.maxDecodedRows)
+    }
+
     /// A context from a phone that predates the complication carries no Do Now count.
     /// Zero is the right reading of that, not a decode failure — the list still
     /// renders and only the complication's number is missing.

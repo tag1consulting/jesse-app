@@ -370,13 +370,15 @@ final class ClientTimeZoneWireTests: XCTestCase {
         CapturingProtocol.body = Data("{}".utf8)
         let c = client()
         _ = try? await c.checkItem(id: "abc", checked: true, evidence: nil, at: Date(),
-                                   ifMatch: "\"etag\"")
+                                   day: nil, ifMatch: "\"etag\"")
         XCTAssertEqual(try lastBody()["client_tz"] as? String, TimeZone.current.identifier)
 
-        _ = try? await c.moveItem(id: "abc", op: .toDoNow, at: Date(), ifMatch: "\"etag\"")
+        _ = try? await c.moveItem(id: "abc", op: .toDoNow, at: Date(), day: nil,
+                                  ifMatch: "\"etag\"")
         XCTAssertEqual(try lastBody()["client_tz"] as? String, TimeZone.current.identifier)
 
-        _ = try? await c.postpone(id: "abc", deferred: true, at: Date(), ifMatch: "\"etag\"")
+        _ = try? await c.postpone(id: "abc", deferred: true, at: Date(), day: nil,
+                                  ifMatch: "\"etag\"")
         XCTAssertEqual(try lastBody()["client_tz"] as? String, TimeZone.current.identifier)
     }
 

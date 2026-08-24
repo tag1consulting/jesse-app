@@ -1,4 +1,5 @@
 import SwiftUI
+import JesseCore
 import JesseNetworking
 
 // The Today screen itself: the collapsible narrative header, the schedule block, and
@@ -46,6 +47,14 @@ public struct TodayListView: View {
     private let onPropagate: (TodayItem, String?) -> Void
     private let onProcessUpdates: ([TodayItem]) -> Void
     private let isProcessing: Bool
+    /// Try one refused change again NOW. The shell owns the replayer, so it owns this:
+    /// the model can only put the row back in the queue, and a Retry that merely did
+    /// that would look inert until the next network event.
+    private let onRetryPending: (PendingIntentRecord) -> Void
+    /// Hand a refused check to the agent instead — see `PendingIntentRecord.tellFallback`.
+    /// `nil` in a shell with no conversation to send into, where the button is not
+    /// offered rather than offered and inert.
+    private let onTellFallback: ((PendingIntentRecord) -> Void)?
 
     /// Which item's evidence sheet is up, if any. Held by id rather than by value so
     /// a refresh landing mid-sheet cannot leave a stale copy of the row on screen.
@@ -64,7 +73,9 @@ public struct TodayListView: View {
                 onOpenDetail: @escaping (TodayItem) -> Void = { _ in },
                 onDiscuss: @escaping (TodayItem) -> Void = { _ in },
                 onPropagate: @escaping (TodayItem, String?) -> Void = { _, _ in },
-                onProcessUpdates: @escaping ([TodayItem]) -> Void = { _ in }) {
+                onProcessUpdates: @escaping ([TodayItem]) -> Void = { _ in },
+                onRetryPending: ((PendingIntentRecord) -> Void)? = nil,
+                onTellFallback: ((PendingIntentRecord) -> Void)? = nil) {
         self.model = model
         self.isProcessing = isProcessing
         self.selection = selection
@@ -74,6 +85,11 @@ public struct TodayListView: View {
         self.onDiscuss = onDiscuss
         self.onPropagate = onPropagate
         self.onProcessUpdates = onProcessUpdates
+        // The default puts the row back in the queue and leaves the sending to whatever
+        // recovery comes next — correct, and what a shell with no replayer can honestly
+        // offer. iOS passes one that also runs the replay immediately.
+        self.onRetryPending = onRetryPending ?? { [model] record in model.retryPending(id: record.id) }
+        self.onTellFallback = onTellFallback
     }
 
     public var body: some View {
@@ -176,6 +192,13 @@ public struct TodayListView: View {
                                   staleness: model.stalenessLine)
                     .listRowSeparator(.hidden)
             }
+            // Above the day, because its whole claim is "these changes are not in the
+            // vault yet" — a block you had to go and look for would not be making it.
+            TodayPendingSection(intents: model.pendingIntents,
+                                onRetry: onRetryPending,
+                                onDiscard: { model.discardPending(id: $0.id) },
+                                onTell: onTellFallback)
+                .listRowSeparator(.hidden)
             // The narrative is a paragraph about the shape of the whole day, and the
             // filtered view is the opposite of that: a short list of what is left. It
             // comes back with the full day, unchanged.
@@ -310,6 +333,7 @@ public struct TodayListView: View {
         return TodayItemRow(
             item: item,
             pending: model.isPending(item.id),
+            queued: model.isQueued(item.id),
             evidence: model.evidence(for: item),
             availableMoves: moves,
             focusActions: focusActions,

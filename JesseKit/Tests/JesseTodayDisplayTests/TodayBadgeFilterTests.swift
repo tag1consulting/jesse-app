@@ -457,11 +457,11 @@ final class TodayBadgeFilterTests: XCTestCase {
 private struct FakeNever: TodayProviding {
     func getToday(ifNoneMatch: String?) async throws -> TodayFetchResult { .notModified }
     func checkItem(id: String, checked: Bool, evidence: String?, at: Date,
-                   ifMatch: String) async throws -> TodayMutationResult { .itemGone }
+                   day: String?, ifMatch: String) async throws -> TodayMutationResult { .itemGone }
     func moveItem(id: String, op: TodayMoveOp, at: Date,
-                  ifMatch: String) async throws -> TodayMutationResult { .itemGone }
+                  day: String?, ifMatch: String) async throws -> TodayMutationResult { .itemGone }
     func postpone(id: String, deferred: Bool, at: Date,
-                  ifMatch: String) async throws -> TodayMutationResult { .itemGone }
+                  day: String?, ifMatch: String) async throws -> TodayMutationResult { .itemGone }
     func glance(id: String, at: Date,
                 ifMatch: String) async throws -> TodayMutationResult { .itemGone }
 }

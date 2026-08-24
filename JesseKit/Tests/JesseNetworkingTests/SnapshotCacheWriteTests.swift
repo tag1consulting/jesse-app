@@ -172,7 +172,7 @@ final class SnapshotCacheWriteTests: XCTestCase {
 
         _ = try await client(cache: cache).checkItem(id: "abc123", checked: true,
                                                      evidence: nil, at: Date(),
-                                                     ifMatch: "\"day-6\"")
+                                                     day: nil, ifMatch: "\"day-6\"")
 
         let entry = try XCTUnwrap(cache.load(key: SnapshotCacheKey.today))
         XCTAssertEqual(entry.body, body)

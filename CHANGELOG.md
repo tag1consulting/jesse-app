@@ -13,6 +13,95 @@ Every commit that changes a component **must** bump that component's version and
 add an entry here — enforced by `scripts/version-guard.sh` (the pre-push hook and
 CI both run it). See the "Versioning" section of `bridge/README.md`.
 
+## [App 1.0 (115)] - 2026-08-24
+
+### Added
+
+- **Jesse now saves what you do offline, and sends it later.** Today and Health have
+  rendered from disk without a network for a while, but they refused every *change* and
+  queued nothing. The reasoning was written into the code: `Today.md` is rewritten in
+  full every morning, so a checkbox held through an outage would replay against a
+  document that has since moved on.
+
+  That is true of a *blind* replay, and it was never a reason to drop the capture. A
+  checked box and a logged lunch are facts about the day they happened. They can be
+  replayed safely if the replay carries **the day** they were made against and **the
+  identity** of what they were made about — and refuses when either no longer resolves.
+  On a boat with no signal for hours, that is the difference between a usable app and a
+  read-only one.
+
+  So a tap with no bridge now ticks the box, holds the change, and says so: a dotted
+  ring on the row, a "Queued" chip beside it, and a **Pending (n)** block at the top of
+  the day listing everything waiting. The queue drains itself on four triggers — the
+  network coming back, the reachability probe recovering, any successful fetch, and the
+  periodic background refresh — so nothing needs a tap. The tab badge already agrees,
+  because an item checked offline is done from the user's point of view and the overlay
+  it renders through is the same one a live tap uses.
+
+  Checks, un-checks, postpones, single moves, Quick log and Start new day are captured.
+  Two things deliberately are not. **Process updates** fires one long turn over the set
+  of items ticked at that moment, and running it hours later would run it over a
+  different set. A **drag** is a plan of several writes whose later ops are aimed at ids
+  the earlier ones change, so half a plan replayed tomorrow is worse than a row that
+  snaps back.
+
+- **A replayed change carries the hour you made it.** The bridge stamps
+  `*(app-completed …)*` from the request's own `at`, so a check made at 07:05 and sent
+  at noon is written into the vault as 07:05 — and a quick log replays with a leading
+  `(eaten at <RFC3339 with your offset>)` stamp the diet pipeline treats as
+  authoritative, which is what keeps a meal on the right day either side of the diet
+  day's 04:00 boundary. Quick logs replay one at a time, oldest first, and stop at the
+  first that does not land: a day's meals arriving out of order would read as a
+  different day's.
+
+- **It refuses out loud, and a refusal is never a loss.** Every replayed write carries
+  the day it was made against, and the bridge refuses one aimed at a day that has moved
+  on (bridge 0.96.0). Client-side, a change whose day rolled over is re-found by its
+  WORDS among the items still open — tolerating exactly what a rebuild does to them
+  (case, re-wrapping, a re-stamped `(Added …)` trailer) and nothing else, and refusing
+  outright when two open tasks are worded alike. When it cannot be re-found, the row
+  says *"Today moved on; item not found."* and offers **Tell Jesse**, which sends
+  *"I completed "…" on 2026-08-24 at 07:05 (logged offline)"*. The agent reads the vault
+  and can close it at source. Refused rows also carry **Retry** and **Discard**, and are
+  never swept — a change the app took and could not deliver must not disappear quietly.
+  Delivered ones are kept as receipts for a day and then go.
+
+- **The wrist knows the difference.** The watch already had a "queued" state, but it
+  could only ever describe its own half of the trip: a phone that took the check and
+  then found no bridge looked, from the wrist, exactly like a phone that had sent it and
+  was waiting, and the row read "sending" for the whole outage. The pushed day now names
+  the ids the phone is holding, so the same word covers both halves. A wrist check made
+  offline is stored under the WATCH's own `intentId`, which is what makes a redelivered
+  intent land once even across a phone relaunch — `transferUserInfo` redelivers across
+  exactly the boundary that empties the in-memory de-duper.
+
+- **"Capture to Jesse" — a Siri phrase that does not open the app.** The three existing
+  phrases all foreground it, which is right for an Ask (the answer needs somewhere to
+  go) and wrong for the commonest thing anyone says to this assistant: a note. This one
+  runs in the app's own process, stages the turn and its outbox row exactly as typing
+  would, answers "Captured", and speaks nothing. Unreachable, the row waits in the send
+  outbox and the existing auto-retry drains it.
+
+### Changed
+
+- The Health tab's Quick log and Start new day are queued offline rather than disabled.
+  They were disabled on the argument that a failure would land as a `.failed` chat
+  outbox row carrying a Retry the user is never shown — an argument about a screen this
+  tab does not navigate to. The capture queue is visible on this screen, so it no longer
+  holds. They are still disabled when nothing can be captured: no queue, or no `dietDay`
+  from the bridge to date a log against.
+- `DietSnapshot` now decodes `dietDay`, the diet day the bridge resolved for the caller.
+  It is not `asOf` and not `today.date`: the diet day runs to 04:00 local, so at 02:00
+  those name different dates on purpose, and the log a meal belongs to is this one.
+- The day-file writes send an optional `day` alongside `client_tz`. Live taps omit it
+  and behave exactly as before; only a replay carries one.
+- `RunCoordinator.send` takes an optional `onAck`, fired once with whether the bridge
+  accepted the message. It exists for the quick-log replay's ordering and nothing else.
+- Schema V4 adds the `PendingIntent` entity — one new entity, every property defaulted,
+  no relationship to anything that already exists, so it lightweight-migrates with no
+  migration code. A V3 store is opened under it in a test rather than assumed to work,
+  because this app has shipped a store-open break before.
+
 ## [App 1.0 (114)] - 2026-08-24
 
 ### Added

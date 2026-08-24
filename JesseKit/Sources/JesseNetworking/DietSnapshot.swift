@@ -683,6 +683,18 @@ public enum DietFidelity: String, Equatable, Sendable {
 /// optional so an older bridge's payload (which omits them) still decodes cleanly.
 public struct DietSnapshot: Decodable, Equatable, Sendable {
     public var asOf: String
+    /// **The diet day the bridge resolved for the caller** (`YYYY-MM-DD`), which is NOT
+    /// the same question as `asOf`.
+    ///
+    /// `asOf` is an instant; this is the day a log written right now would land on. They
+    /// differ by design in the small hours: the diet day runs to 04:00 local, so at 02:00
+    /// `asOf` names today's date and `dietDay` still names yesterday's — and yesterday's
+    /// is the one a meal belongs to.
+    ///
+    /// Optional because a bridge before 0.90.0 does not send it. A client that needs a day
+    /// and does not get one must fall back rather than guess a date from `asOf`, which
+    /// would be wrong for exactly the four hours the field exists to get right.
+    public var dietDay: String?
     public var todayMtime: String?
     public var today: DietToday
     public var proposed: DietProposed?
@@ -717,13 +729,14 @@ public struct DietSnapshot: Decodable, Equatable, Sendable {
     public var fidelity: String?
 
     enum CodingKeys: String, CodingKey {
-        case asOf, todayMtime, today, proposed, progress, coach, weightSeries, errors
+        case asOf, dietDay, todayMtime, today, proposed, progress, coach, weightSeries, errors
         case nutrientSeries, sourceSeries, exerciseSeries
         case availableDays, historical, fidelity
     }
     public init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         asOf = try c.decodeIfPresent(String.self, forKey: .asOf) ?? ""
+        dietDay = try c.decodeIfPresent(String.self, forKey: .dietDay)
         todayMtime = try c.decodeIfPresent(String.self, forKey: .todayMtime)
         today = try c.decode(DietToday.self, forKey: .today)
         proposed = try c.decodeIfPresent(DietProposed.self, forKey: .proposed)
@@ -740,14 +753,16 @@ public struct DietSnapshot: Decodable, Equatable, Sendable {
     }
     // A memberwise init for tests/previews (the custom decoder suppresses the
     // synthesized one).
-    public init(asOf: String = "", todayMtime: String? = nil, today: DietToday,
+    public init(asOf: String = "", dietDay: String? = nil,
+         todayMtime: String? = nil, today: DietToday,
          proposed: DietProposed? = nil, progress: DietProgress? = nil,
          coach: DietCoach? = nil, weightSeries: [WeightPoint]? = nil,
          errors: [String] = [], nutrientSeries: [NutrientDay]? = nil,
          sourceSeries: [SourceDay]? = nil, exerciseSeries: [ExerciseDay]? = nil,
          availableDays: [String]? = nil,
          historical: Bool? = nil, fidelity: String? = nil) {
-        self.asOf = asOf; self.todayMtime = todayMtime; self.today = today
+        self.asOf = asOf; self.dietDay = dietDay
+        self.todayMtime = todayMtime; self.today = today
         self.proposed = proposed; self.progress = progress; self.coach = coach
         self.weightSeries = weightSeries; self.errors = errors
         self.nutrientSeries = nutrientSeries

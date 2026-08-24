@@ -286,11 +286,58 @@ final class WatchTodayModelTests: XCTestCase {
 
     // MARK: Fixtures
 
+    // MARK: The phone is holding it
+
+    /// **The gap this closes.** A phone that took the check and then found no bridge
+    /// looked, from the wrist, exactly like a phone that had sent it and was waiting —
+    /// the claim stayed `pending` for the whole outage, because the watch cannot ask
+    /// anyone. Now the phone says which ones it is sitting on, and the row says so.
+    func testAClaimThePhoneIsHoldingReadsAsQueuedNotPending() {
+        let (model, sender) = makeModel(reachable: true)
+        sender.push(Self.day())
+        model.toggle("open-a")
+        XCTAssertEqual(model.rows.first { $0.id == "open-a" }?.state, .pending,
+                       "the watch reached the phone, so its own half of the trip went")
+
+        sender.push(Self.day(queuedIds: ["open-a"]))
+
+        XCTAssertEqual(model.rows.first { $0.id == "open-a" }?.state, .queued,
+                       "and now the phone has said it cannot get any further")
+    }
+
+    /// A check made on the PHONE while it was offline has no claim on this watch at all.
+    /// Drawing it as open would be the wrist disagreeing with the screen the person just
+    /// used.
+    func testACheckMadeOnThePhoneOfflineStillShowsAsQueuedHere() {
+        let (model, sender) = makeModel()
+        sender.push(Self.day(queuedIds: ["open-b"]))
+        let row = model.rows.first { $0.id == "open-b" }
+        XCTAssertEqual(row?.state, .queued)
+        XCTAssertTrue(row?.showsChecked == true, "and its box is drawn ticked")
+    }
+
+    /// Once the phone lands the change the marker goes with it, and the claim settles
+    /// exactly as it always did.
+    func testTheQueuedMarkerClearsWhenThePhoneLandsIt() {
+        let (model, sender) = makeModel()
+        sender.push(Self.day())
+        model.toggle("open-a")
+        sender.push(Self.day(queuedIds: ["open-a"]))
+        XCTAssertEqual(model.rows.first { $0.id == "open-a" }?.state, .queued)
+
+        // The replay landed: the row comes back ticked and carries no marker.
+        sender.push(Self.day(rowIds: ["lead", "open-b"], queuedIds: []))
+
+        XCTAssertEqual(model.rows.last?.state, .confirmed,
+                       "confirmed by absence, as a landed check always was")
+    }
+
     private static func day(date: String = "2026-08-11",
                             leadChecked: Bool = false,
                             rowIds: [String] = ["lead", "open-a", "open-b"],
                             openCount: Int = 3,
                             doneCount: Int = 0,
+                            queuedIds: Set<String> = [],
                             pushedAt: Date = Date(timeIntervalSince1970: 1_786_000_000))
         -> WatchTodaySummary {
         let all: [String: WatchTodayRow] = [
@@ -303,6 +350,7 @@ final class WatchTodayModelTests: XCTestCase {
         ]
         return WatchTodaySummary(date: date, etag: "\"tag\"", pushedAt: pushedAt,
                                  rows: rowIds.compactMap { all[$0] },
-                                 openCount: openCount, doneCount: doneCount)
+                                 openCount: openCount, doneCount: doneCount,
+                                 queuedIds: queuedIds)
     }
 }
