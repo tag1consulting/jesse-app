@@ -1775,6 +1775,44 @@ to tick a checkbox. Omitting it entirely reproduces the previous behaviour exact
 > carrying no zone designator is still taken verbatim: that is a wall clock the
 > client already rendered, and re-interpreting it would invent a claim.
 
+### The day guard (`day`)
+
+All three Today write bodies (`check`, `move`, `defer`) accept an optional
+`day` — `YYYY-MM-DD`, the date of the snapshot the change was **made against**.
+When it is present and names a different day from the one the live `Today.md`
+carries, the request is refused with `409` and this body, **before any edit, any
+journal entry and any store write**:
+
+```json
+{ "reason": "day-mismatch", "live_date": "2026-03-04" }
+```
+
+| | |
+|---|---|
+| Absent / blank | No-op. Every live tap, and every app build older than 0.96.0, behaves exactly as before. |
+| Present and matching | No-op. |
+| Present and different | `409 day-mismatch`, nothing touched. |
+| Present, and the file has no date at all | `409 day-mismatch` with `"live_date": ""` — a replay that cannot confirm its day is not applied to whatever happens to be there. |
+
+**It exists for one caller: a phone replaying a change it captured offline.**
+`Today.md` is rewritten in full every morning and an item id is a content hash
+over `(section, lead, added date)`, so an id captured yesterday can still
+*resolve* today — against a line the person never saw. `If-Match` does not close
+that gap: a replaying client has just refetched, so its etag is perfectly
+current and perfectly about the wrong day.
+
+The guard is asked **before** the `If-Match` precondition, deliberately. The two
+statuses ask for opposite client behaviour — a `412` means "refetch and try
+again", and a day mismatch means "stop, the thing you were acting on is gone" —
+and a replay that raced the morning rebuild would otherwise be told to try
+again.
+
+The `at` on a replayed request is the moment the **user** acted, and the
+`app-completed` stamp is rendered from it in the effective zone, never from the
+bridge's clock (`stamp_from_iso`; a missing or malformed `at` is a `400`, never a
+substituted server time). That is what lets a check made at 07:05 and sent at
+noon still read `07:05` in the vault.
+
 ## Scheduled turns (`[[schedule]]`, `GET /jesse/schedule`)
 
 The bridge fires recurring turns itself. Nothing else has to be running: no
